@@ -251,6 +251,27 @@ func (c *HTTPClient) ResumeRunNow(ctx context.Context, id string) (apitypes.RunD
 	return env.Run, nil
 }
 
+// ResumePolicyHold resumes a run held by a Codex policy hold (issue #3607): POST
+// /api/runs/{id}/resume-now {mode, expected_episode_id, guidance}. Unlike ResumeRunNow it carries
+// a body; guidance is always sent (an empty guidance is valid). replay is true when the server
+// reports the same request was already applied. The exit-code mapping (409 messages such as a
+// changed hold or different guidance included) comes from statusError/postJSON.
+func (c *HTTPClient) ResumePolicyHold(ctx context.Context, id, mode, episodeID, guidance string) (apitypes.RunDTO, bool, error) {
+	body := struct {
+		Mode              string `json:"mode"`
+		ExpectedEpisodeID string `json:"expected_episode_id"`
+		Guidance          string `json:"guidance"`
+	}{Mode: mode, ExpectedEpisodeID: episodeID, Guidance: guidance}
+	var env struct {
+		Run    apitypes.RunDTO `json:"run"`
+		Replay bool            `json:"replay"`
+	}
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/resume-now", body, &env); err != nil {
+		return apitypes.RunDTO{}, false, err
+	}
+	return env.Run, env.Replay, nil
+}
+
 // SetRunCredentialOverride is the wire shape of PRD #1247 M4's `uzi run set-token` body:
 // {mode, secret_id?}. Mode is one of "pinned"/"auto"/"default"/"inherit"; SecretID is set
 // ONLY for a pinned choice (the label is resolved to an anthropic_token id CLIENT-SIDE,

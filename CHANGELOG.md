@@ -96,6 +96,42 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A lost forge-park reply no longer retries forever on a refused ownership check ([#3856](https://github.com/vtmocanu/uzi/pull/3856), [#4062](https://github.com/vtmocanu/uzi/pull/4062)).**
   When a forge-park report's reply is lost and the follow-up ownership check is permanently refused (any client error except not found, timeout or rate limiting), or the resend is (any client error except timeout or rate limiting; a bad-request resend still fails the run as before), the worker now stops retrying instead of looping, reports nothing, keeps a resumable session and any publication record, and leaves custody unsettled.
 
+- **Shell commands run again after a pause that did not park ([#4090](https://github.com/vtmocanu/uzi/pull/4090), [#4094](https://github.com/vtmocanu/uzi/pull/4094)).**
+  When an owner `now` pause or a wall pause was declined or refused and a Claude run continued in place, every later guarded shell command was refused as cancelled; they now run. If another pause, cancel or credential switch arrived while the first was still being handled, guarded commands stay refused for the rest of that run, as before.
+
+- **A queued run that needs both repo agent sources and a requested agent source no longer reads as waiting for a free worker when the two capabilities sit on different workers ([#4005](https://github.com/vtmocanu/uzi/pull/4005), [#4035](https://github.com/vtmocanu/uzi/pull/4035)).**
+  Its health reason now says no single online worker supports both `repo_agent_source_v1` and `agent_source_request_v1`, matching the claim rule that one worker must carry both.
+
+- **Shell commands run again after a credential switch could not complete ([#4076](https://github.com/vtmocanu/uzi/pull/4076), [#4081](https://github.com/vtmocanu/uzi/pull/4081)).**
+  When a switch gave up and a Claude run continued on its old token, guarded shell commands in the retried turn were refused as cancelled; they now run, while cancel, shutdown and memory-pressure stops still stop them.
+
+- **Codex Plan cross-checks request the expected JSON verdict schema ([#4103](https://github.com/vtmocanu/uzi/pull/4103), [#4112](https://github.com/vtmocanu/uzi/pull/4112)).**
+  The exact shared schema guides output while unchanged validators enforce UTF-8 byte caps; malformed final text adds shape diagnostics without logging content, and hosted live checker acceptance remains pending.
+
+- **The guarded command tool accepts a `timeout` sent as a decimal string ([#4039](https://github.com/vtmocanu/uzi/pull/4039)).**
+  A Claude agent's `mcp__uzi_cmd__bash` call with `timeout: "300000"` used to be refused with an input validation error, costing a round trip; it now runs with that deadline. Every other non-integer or out-of-range value is still refused, and the tool's advertised schema is unchanged.
+
+- **A CI fix now publishes against the one pull request it was created for ([#4079](https://github.com/vtmocanu/uzi/pull/4079), [#4087](https://github.com/vtmocanu/uzi/pull/4087)).**
+  Creation binds the fix to the single open PR among those uzi recorded for the branch; it refuses (manual 409/502, automatic retried or skipped) when that cannot be determined or verified, and older fixes behave as before.
+
+- **Turning on a repo creates its board columns ([#3760](https://github.com/vtmocanu/uzi/pull/3760)).**
+  A repo enabled through the API now gets the four default columns and their forge labels at enable time, so its cards reach Human Review; before, the columns appeared only on the first board open. The startup seed (`UZI_SEED_FORGE_REPOS`) does the same; when the forge refuses the labels, it logs the refusal and leaves that repo disabled, and `/server setup` enables it once the forge access is fixed.
+
+- **Worker shutdown now waits for its own settlements and reports a clear result ([#4066](https://github.com/vtmocanu/uzi/pull/4066), [#4073](https://github.com/vtmocanu/uzi/pull/4073)).**
+  On SIGTERM the worker finishes its already-authorized authority work, then logs one `worker_shutdown_result` (`drained` or `incomplete`) within 35 s and exits 1 on `incomplete`, leaving an unresolved record refused as before; compose and hosted worker pods now allow a 40 s stop grace, so upgrading the controller rolls each hosted worker once through the paced roll.
+
+- **A budgeted maintenance helper's timeout or cancel no longer recurses when its kill is refused under the uid split ([#4089](https://github.com/vtmocanu/uzi/pull/4089), [#4092](https://github.com/vtmocanu/uzi/pull/4092)).**
+  The helper is killed through its own uid and the original timeout or cancellation is reported, with the helper joined until it exits.
+
+- **A plan-gate re-entry no longer re-presents a gate whose acknowledgement is in flight ([#3854](https://github.com/vtmocanu/uzi/pull/3854), [#4118](https://github.com/vtmocanu/uzi/pull/4118)).**
+  Concurrent callers of the same human plan gate now share one presentation, epoch decision and verdict wait.
+
+- **Reduced motion stops the connect-form sync flash ([#3986](https://github.com/vtmocanu/uzi/pull/3986), [#4025](https://github.com/vtmocanu/uzi/pull/4025)).**
+  The base-URL and forge-type highlight no longer animates for users who ask their system for reduced motion.
+
+- **A successor reclaiming a source under secret-scan remediation now holds for its owner instead of failing ([#4058](https://github.com/vtmocanu/uzi/pull/4058), [#4072](https://github.com/vtmocanu/uzi/pull/4072)).**
+  The worker refuses before touching the predecessor, explains that the agent did not start, and parks at `recovery_wait` / `retained_recovery_adoption_failed`; Resume holds again and adds admission-counted custody holds, Cancel ends the run, and no remediation disposal route is added.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -131,6 +167,30 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Admins can issue a one-time account reset link for a user who forgot their password ([#3989](https://github.com/vtmocanu/uzi/pull/3989), [#4054](https://github.com/vtmocanu/uzi/pull/4054)).**
   Redeeming it sets a new password, ends the user's browser sessions and deletes their model credentials, Codex logins and vault; the account is left protected and the next password login creates a fresh vault. Users with no password (SSO-only) get a link that asks for no password, ends their sessions, refuses approved CLI login requests and deletes the same credentials and vault; after SSO sign-in the app banner asks for a new vault passphrase. The seed admin and the issuing admin's own account cannot be reset by link. Runs already executing keep their credential. Claude and chat runs created before the reset pause with the hold reason `credentials_reset` instead of failing and resume when a credential is added, while Codex runs created before it fail and need a new run.
 
+- **Hosted Docker workers contain a pod-epoch attempt-tree deletion phase that ships switched off ([#3431](https://github.com/vtmocanu/uzi/pull/3431), [#4032](https://github.com/vtmocanu/uzi/pull/4032)).**
+  The `pod_epoch_reclaim` log gains `deleted`, `deleted_bytes`, `settled`, `kept_*` and `reclaim_bytes_state` fields and the `reclaim_complete` and `reclaim_partial` reasons, but the deletion ships switched off, so production deletes nothing until a separate owner decision; the worker also advertises `recovery_run_open_holds_v1` for the run-wide open-hold count the phase requires.
+
+- **The Overview preview Capacity rail shows worker problems, gauges, runs and version on each worker row ([#4078](https://github.com/vtmocanu/uzi/pull/4078), [#4088](https://github.com/vtmocanu/uzi/pull/4088)).**
+  Collapsed rows badge quarantine, lost memory authority, a failed or blocked upgrade and disk at the gauge danger tone; expanded rows add tone-coloured gauges, the runs and HOME sizes on the worker, notes and a version and uptime footer. No API change.
+
+- **`/server setup` connects a forge, enables repos and creates the first worker from a script ([#3760](https://github.com/vtmocanu/uzi/pull/3760)).**
+  Run it inside the deployment with `docker compose exec` or `kubectl exec -i`: it reuses the web UI checks (least-privilege token, protected default branch, board columns), reads the API's own database URL and secret key (plain or `_FILE`, a regular file), reads the forge token from a file or stdin, writes one JSON report and exits 0, 1, 2 or 3. With `--worker-name` it creates the first self-hosted worker and prints the join token once, on stdout only; an existing worker gives exit 3 and no token.
+
+- **Overview preview: the Issue work run chip shows cross-check state ([#4082](https://github.com/vtmocanu/uzi/pull/4082), [#4093](https://github.com/vtmocanu/uzi/pull/4093)).**
+  A run whose plan or code cross-check is in flight reads "cross-checking", and a plan the cross-check sent to your review says why (revise, blocked or unavailable).
+
+- **The Overview "Needs your decision" card shows the question an input-waiting run is asking ([#4040](https://github.com/vtmocanu/uzi/pull/4040), [#4074](https://github.com/vtmocanu/uzi/pull/4074)).**
+  Your own awaiting_input runs show a one-line excerpt of the newest pending question under the title, capped at 280 characters plus a "(+N more)" count; it is not shown on the admin all-users list, the collapsed group preview or follow-ups.
+
+- **Planning uses the repo's agents when you request them ([#3914](https://github.com/vtmocanu/uzi/pull/3914), [#4053](https://github.com/vtmocanu/uzi/pull/4053)).**
+  With repo agents requested for a run and a roster at its recorded revision, the plan turn delegates to the repo's agents before you review the plan: Claude planning agents lose their file-write tools and Codex refuses planning file-write requests, but the shell stays available on both, so shell commands can still change files; the lead treats their output as unverified. A recorded choice of your templates keeps planning on them, and the run page and `uzi run get` show which agents planned the run.
+
+- **`uzi settings get` shows the harness, models and efforts a manual start would use ([#3254](https://github.com/vtmocanu/uzi/pull/3254), [#4075](https://github.com/vtmocanu/uzi/pull/4075)).**
+  A read-only effective-settings view (`GET /api/me/effective-settings`) reports each value's source and whether it is fixed at create or at claim, and `POST /api/me/effective-settings/start-preview` validates a harness and token choice without creating a run, with per-alternative refusals when the harness is chosen at create. `POST /api/me/effective-settings/schedule-preview` and `uzi settings get --schedule <id>` do the same for a saved or draft schedule, applying the save step then the fire step; the top-level refusal is set only for a failure before a harness is decided or when every alternative refuses for the same reason, and alternatives appear only for an unpinned, override-free issue or sweep schedule.
+
+- **Admins see who is using uzi right now from a People chip on the Overview preview ([#4042](https://github.com/vtmocanu/uzi/pull/4042), [#4084](https://github.com/vtmocanu/uzi/pull/4084)).**
+  The chip shows "N active now of M" with an avatar stack, and its popover lists each active person's runs, recent sign-ins, idle accounts and this week's usage, with a shortcut to the By user usage table; the status sentence also says how many people own the executing runs.
+
 ### Changed
 
 - **The Overview preview shows your capacity and held work in a right-hand rail ([#3880](https://github.com/vtmocanu/uzi/pull/3880), [#3971](https://github.com/vtmocanu/uzi/pull/3971)).**
@@ -163,10 +223,22 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A run whose retained recovery was refused only for data volume capacity is now held for the owner ([#4046](https://github.com/vtmocanu/uzi/pull/4046), [#4065](https://github.com/vtmocanu/uzi/pull/4065)).**
   Such a window no longer spends a counted park or a retry timer; the run keeps its worker and source custody until the owner chooses Resume (one more window) or Cancel, so freeing headroom alone no longer auto-resumes it. Mixed or deadline-only windows keep today's park rules, and a worker talking to an API without the new capability sends today's report.
 
+- **Refresh publication refusals point at held publication and recovery ([#4080](https://github.com/vtmocanu/uzi/pull/4080), [#4083](https://github.com/vtmocanu/uzi/pull/4083)).**
+  The refusal status line now names `uzi run held` and `uzi run recovery`, and the completion-hold doc links the failed-run recovery order.
+
+- **The code cross-checker is told not to report missing evidence of the worker's own command runs ([#4120](https://github.com/vtmocanu/uzi/pull/4120)).**
+  The checker never receives gate, test or red/green logs, so a check whose only findings said it could not see them cost the lead a repair turn with no code change; claimed run results stay unverified and a criterion that itself requires a run result gets a minor Coverage uncertainty: finding.
+
 ### Security
 
 - **A run can no longer rewrite the repo agents its later claims use ([#3913](https://github.com/vtmocanu/uzi/pull/3913), [#3940](https://github.com/vtmocanu/uzi/pull/3940)).**
   The repo-agent roster is read from git objects at the commit of the repository's configured default branch, recorded on the run's first claim, never from the working tree; a branch-seeded `mr_rework` or `ci_fix` run gets the default-branch agents. No agent turn starts until the server confirms the recorded commit. A default branch that cannot be resolved, a revision that cannot be recorded or read holds the run, and a hold keeps the resolved commit for the claim after a resume. Only a worker reporting `repo_agent_source_v1` claims a run that reads repo agents, its first claim included. The run view shows the revision.
+
+- **GitLab merge-request reuse is limited to the project's own merge requests (97e4c6222).**
+  When a create reports an existing merge request, the worker now adopts only an open merge request from the same project on the same branches.
+
+- **GitLab merge-request reuse test coverage is extended (572893ef8).**
+  The forge test double now records each merge request's source project.
 
 ## [0.86.1] - 2026-11-05
 

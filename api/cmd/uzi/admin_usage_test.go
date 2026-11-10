@@ -25,6 +25,10 @@ func renderUsageToString(t *testing.T, u apitypes.AdminUsageDTO) string {
 // TestRenderAdminUsageOutcomes covers the PRD #1293 M3 CLI additions: the factory
 // line's finished/failed/fail_rate fields and the reordered per-user table columns
 // (EMAIL RUNS FAILED FAIL% SINCE INPUT CACHE_READ CACHE_CREATION OUTPUT COST), mirroring the web column order (D8).
+// One deliberate deviation (issue #3876): the web CLAUDE/CODEX column is last, but the CLI
+// inserts it after RUNS when the API sends the split, because the COST cell carries a long
+// disclosure string that would push a trailing column off screen. Without the split, the
+// header stays exactly as asserted here.
 func TestRenderAdminUsageOutcomes(t *testing.T) {
 	u := apitypes.AdminUsageDTO{
 		Factory: apitypes.SelfUsageDTO{

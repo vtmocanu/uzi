@@ -1,5 +1,5 @@
 import { it } from "node:test";
-import type { InventorySourceBoundaryContext, InventorySourceDiagnostic } from "../src/recovery.js";
+import { inventoryCloneKey, type InventorySourceBoundaryContext, type InventorySourceDiagnostic } from "../src/recovery.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -289,4 +289,74 @@ for (const mode of ["boot", "live"] as const) for (const source of ["dirty-unver
     assert.equal(fs.existsSync(clone), true);
     assert.equal(finals,0,"unverified or dirty clone must retain generation hold after recovery");
   }
+});
+
+// ── issue #3885: the operator's Case B record-disposition proof ─────────────────────────────────────────────────
+
+it("#3885 recordDisposition: only cleanliness is skipped; identity, liveness and quiescence still refuse", {
+  skip: process.platform !== "linux" && "physical source proof deliberately refuses non-Linux before sibling quiescence",
+}, async () => {
+  const clones = [{ clonePath: "/fixture/repo/issue-1", branch: "task", runId: "run-1", head: "a".repeat(40), identity: "1:10" }];
+  const expectedClones = inventoryCloneKey(clones)!;
+  const run = async (opts: { expected?: string; live?: boolean; dirty?: boolean; unreadable?: boolean; drift?: boolean;
+    before?: boolean; after?: boolean; withRecord?: boolean }) => {
+    const sites: string[] = [], diagnostics: InventorySourceDiagnostic[] = [], statusCalls: string[] = [], options: unknown[] = [];
+    let reads = 0;
+    const r = runner({ run: async () => { throw new Error("unreached"); } }, fakeGitlab().gitlab, undefined, { quiesceRun: async req => {
+      sites.push(req.site!);
+      const refuse = req.site === "inventory_source" ? opts.before : opts.after;
+      return { process: { state: refuse ? "unverified" : "quiescent", processes: [], killed: [], detail: "" },
+        docker: { state: "not_wired", removed: [], detail: "" } };
+    } });
+    const boundary = r as unknown as BoundaryRunner;
+    boundary.liveAttempts.isLivePath = () => opts.live === true;
+    git.readInventoryCloneHeads = (async (_bare: string, _run: string, o?: unknown) => {
+      options.push(o);
+      reads++;
+      return { kind: "verified", heads: ["a".repeat(40)], foreignOwners: [],
+        clones: clones.map(c => ({ ...c, ...(opts.drift && reads > 1 ? { identity: "1:11" } : {}) })) };
+    }) as never;
+    git.worktreeStatus = (async (clone: string) => { statusCalls.push(clone); return opts.unreadable ? null : opts.dirty ? ["dirty"] : []; }) as never;
+    let proved = 0;
+    const result = await boundary.withInventorySourceBoundary({
+      runId: "run-1", generation: 7, barePath: "/fixture/repo.git", reportDiagnostic: d => diagnostics.push(d),
+      ...(opts.withRecord === false ? {} : { recordDisposition: { expectedClones: opts.expected ?? expectedClones } }),
+    }, async prove => { if (await prove()) proved++; });
+    return { result, diagnostics, sites, statusCalls, options, proved };
+  };
+
+  // Control: the confirmed, dirty source passes without ever asking for its worktree status.
+  const ok = await run({ dirty: true });
+  assert.equal(ok.result, "passed");
+  assert.equal(ok.proved, 1);
+  assert.deepEqual(ok.diagnostics, []);
+  assert.deepEqual(ok.statusCalls, [], "cleanliness is not read");
+  assert.ok(ok.options.length >= 2, "the boundary reads clone identities before and after the runner's git");
+  assert.ok(ok.options.every(o => (o as { cloneIdentity?: boolean })?.cloneIdentity === true), "every read asks for the clone identity");
+  // The boundary proves once before the action and once inside it: quiescence before and after the runner's git, each time.
+  assert.deepEqual(ok.sites, ["inventory_source", "inventory_source:after_runner_git", "inventory_source", "inventory_source:after_runner_git"]);
+  // Without the record disposition the same dirty source is refused (the ordinary FINAL proof is unchanged).
+  const ordinary = await run({ dirty: true, withRecord: false });
+  assert.equal(ordinary.result, "retained");
+  assert.deepEqual(ordinary.diagnostics, [{ check: "worktree_status_dirty" }]);
+  assert.deepEqual(ordinary.statusCalls, ["/fixture/repo/issue-1"]);
+
+  const wrong = await run({ expected: JSON.stringify([["/fixture/repo/issue-1", "task", "a".repeat(40), "1:99"]]) });
+  assert.equal(wrong.result, "retained");
+  assert.deepEqual(wrong.diagnostics, [{ check: "source_identity_changed" }]);
+  assert.deepEqual(wrong.sites, [], "an unconfirmed source is refused before any quiescence");
+
+  const drift = await run({ drift: true });
+  assert.equal(drift.result, "retained");
+  assert.deepEqual(drift.diagnostics, [{ check: "source_identity_changed" }]);
+
+  const live = await run({ live: true });
+  assert.deepEqual([live.result, live.diagnostics], ["retained", [{ check: "live_attempt_path" }]]);
+  const before = await run({ before: true });
+  assert.equal(before.result, "retained");
+  assert.equal(before.diagnostics[0]?.check, "process_not_quiescent_before_git");
+  assert.deepEqual(before.statusCalls, []);
+  const after = await run({ after: true });
+  assert.equal(after.result, "retained");
+  assert.equal(after.diagnostics[0]?.check, "process_not_quiescent_after_git");
 });

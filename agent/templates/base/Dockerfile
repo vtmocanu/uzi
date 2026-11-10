@@ -234,9 +234,10 @@ RUN SQLC_PIN="$(awk -F '"' '/^SQLC_LINUX_AMD64_VERSION=/{print $2}' /tmp/worker-
 # toolchain ENV above; GOBIN=/usr/local/bin puts the binary on the image PATH (agent-browser is
 # installed there too and used). GOFLAGS=-buildvcs=false avoids VCS stamping. The trailing
 # `gitleaks version` is a fail-closed BUILD-time check (mirrors the toolchain guard idiom) so a
-# broken install fails the BUILD, not every run. Pinned to v8.30.1 to match the repo's gate:repo
-# scan (Taskfile.yml:913 / scripts/scan-secrets.sh). CI-verified: this image build cannot run in
+# broken install fails the BUILD, not every run. Pinned to the same version as the repo's gate:repo
+# scan (Taskfile.yml GITLEAKS_VERSION / scripts/scan-secrets.sh; Renovate moves all three). CI-verified: this image build cannot run in
 # the worker itself. MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep in lockstep.
+# renovate: datasource=github-releases depName=gitleaks/gitleaks
 RUN GOFLAGS=-buildvcs=false GOBIN=/usr/local/bin go install github.com/zricethezav/gitleaks/v8@v8.30.1 && gitleaks version
 
 # Yarn Classic for repos with a yarn.lock (agent/src/js-deps.ts). node:24-alpine shipped
@@ -431,7 +432,7 @@ RUN chmod -R a+rX /nix \
 # manifest field or an unsupported arch BEFORE installing. assert-codex.sh is the
 # build-time runner-uid guard: it execs `codex --version` as the cap-less `runner` uid
 # (setpriv --reuid runner, fresh throwaway HOME, replaced env, bounded timeout), asserting EXACTLY
-# `codex-cli 0.164.0` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
+# `codex-cli 0.166.0` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
 # sibling — so a broken binary/loader or a missing host fails the BUILD, not a run. The
 # helpers + lock are removed after (no residue); NO auth/config/session state is baked.
 # MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep the two in lockstep.
@@ -619,7 +620,7 @@ RUN mkdir /tmp/uzi-epoch-bootstrap \
 COPY --chown=0:0 --chmod=0644 agent/templates/pod-epoch-init.cjs /usr/local/lib/uzi/pod-epoch-init.cjs
 COPY --chown=0:0 --chmod=0644 agent/templates/pod-epoch-init.cjs /app/templates/pod-epoch-init.cjs
 # COPY --chmod can synthesize the parent as 0644; restore traversal after COPY.
-RUN chown root:root /app/templates && chmod 0755 /app/templates
+RUN chown root:root /app/templates && chmod 0755 /app/templates && chmod g-s /app/templates
 COPY --chmod=0755 agent/templates/entrypoint.sh /usr/local/sbin/uzi-entrypoint
 # /data persists the clone cache + devbox/nix per-user metadata; /nix persists the
 # nix store (warm-start). Compose backs these with the agentdata + agentnix volumes.

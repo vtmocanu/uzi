@@ -1355,6 +1355,13 @@ chain in the diagram above, with no intervening `running`.
   paths in CLI/TUI/web run detail, not identify the requester; missing evidence
   leaves the label neutral (see [pause labels](docs/run-pause.md#reading-the-pause-label)).
 
+- **claimed or running → paused (Codex policy hold)** (`hold_reason=codex_policy_hold`, issue #3607).
+  A root Codex provider policy refusal on an eligible run pauses it with work and custody
+  preserved; the owner resumes per exact episode, and rollback is drain-only. Decisions,
+  residual limits and the guarded migration Downs (00423 and 00422) are in
+  [ADR-3607](adr/3607-compact-policy-hold-m1-isolation.md#consent-and-continuity-m2m3);
+  owner behaviour is in [docs/run-pause.md](docs/run-pause.md#held-on-a-codex-policy-refusal).
+
 - **running → paused (structural completion hold)** ([PRD #1226](prds/done/1226-structural-completion-interlock.md),
   rollout switch `completion_interlock_rollout`, **on by default** for a new `issue`
   run resolved to the `claude` harness). A distinct reason a
@@ -1754,7 +1761,8 @@ chain in the diagram above, with no intervening `running`.
   identity commit before the bounded API forge proof. The server derives the
   branch from `agentIssueBranch(issue)`, frozen MR-rework `pipeline_ref`, or
   `selfImproveBranch(runID)` (`uzi/self-improve/<run-id>`), respectively;
-  tracking issues, self-improvement pipelines and worker-reported branches
+  `prompt` runs, checkpoint-eligible under `uzi/prompt-<run-id>` since #4116,
+  are not on this path (deferred); tracking issues, self-improvement pipelines and worker-reported branches
   are not proof authority. The recorded MR in the own repository must name
   that branch; BranchHead H must equal MR HeadSHA and CompareAncestry must
   prove H contains or equals the durably reported final SHA. A matching

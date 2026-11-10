@@ -2,10 +2,12 @@
 
 **Status:** Accepted narrow M1 repair contract; partial checkpoint through
 d7b03dae276ebc2c54681a47a5205c2903654140. Initial R1/R2 reviewed; R3 INCOMPLETE.
-Final merged validation, integration review and exact-head CI are pending.
+Superseded in part (2026-11-07): M2/M3 deliver owner Resume (see Consent and
+continuity below); Policy Stop remains omitted. Final merged validation,
+integration review and exact-head CI are pending.
 **Date:** 2026-10-31
 **Issue:** [#3607](https://github.com/vtmocanu/uzi/issues/3607)
-**PRD:** [Compact policy-refusal hold](../prds/3607-compact-policy-refusal-hold.md#decision-log)
+**PRD:** [Compact policy-refusal hold](../prds/done/3607-compact-policy-refusal-hold.md#decision-log)
 
 ## Context and authority
 
@@ -29,6 +31,9 @@ validation. The owner consented to this acceptance on 2026-10-31, conditional on
 buddy agreement, which was given. It is independent of the single unreleased
 policy contract
 `provider_policy_hold_v1`, which remains unadvertised by the API.
+
+*Note (2026-11-07): since #3607 M2/M3 the API advertises
+`provider_policy_hold_v1`; the sentence above records the M1 decision.*
 
 A worker-only relaxation cannot supply the server's scoped overflow exception;
 reusing policy readiness would couple generic pending-source protection to a
@@ -316,8 +321,8 @@ or custody disposal.
 [ADR-2009](2009-pending-outcome-identities.md) receive scoped amendments for this
 claim-only exception. Their earlier decisions remain historical records.
 
-M2/M3/I1 remain deferred under the formal owner partial decision. Policy Resume
-and Stop are unavailable. F5's eventual flag clearing belongs to M2: clear solely
+M2/M3/I1 were deferred under the formal owner partial decision at M1; M2/M3 have
+since delivered Policy Resume (2026-11-07), Policy Stop remains omitted, and I1 stays deferred. F5's flag clearing was delivered with M2 (`RetentionFlag`, `releasePolicyAdmission`): it clears solely
 successful policy-admission retention while preserving independent vetoes, including
 `retainedEpisode` and `predecessorCapture`. Optional m3 historic-head hardening stays
 deferred: current report-path 40/64-hex validation and React escaping do not validate
@@ -341,8 +346,8 @@ then use task migration:renumber above the fetched live head and fix reported
 references. Changed runtime, API, SQL and package inputs require renewed validation;
 no history rewrite, manual dependency installation or object reconstruction is allowed.
 
-The [PRD validation record](../prds/3607-compact-policy-refusal-hold.md#deferred-scope-and-final-validation)
-records the successful current-branch strict agent, Codex M4 and complete seven-package
+The PRD's earlier M1 validation record (in git history before the 2026-11-07 rewrite; see PR #3676)
+recorded the successful current-branch strict agent, Codex M4 and complete seven-package
 LiveDB gates at 5b8a14f8, including the shared claim-route fixture. The API component
 inputs remain unchanged from its recorded successful gate. The expanded 125-file
 affected-agent selection also passed at f6240187. A small matched common-check
@@ -398,3 +403,126 @@ track that predecessor and the new policy version. Earlier 00386/00388 reference
 describe historical numbers. Local targeted validation passed as inventoried in
 the PRD. Published-head review and complete exact-head CI remain required;
 no worker-provisioning, full-suite or LiveDB result follows from a local merge.
+
+## Consent and continuity (M2/M3)
+
+M2/M3 deliver the owner Resume path for a `codex_policy_hold`. The user-facing
+behaviour is in [Held on a Codex policy refusal](../docs/run-pause.md#held-on-a-codex-policy-refusal)
+and [Codex policy hold](../docs/cli.md#codex-policy-hold). This section records the
+decisions and what was rejected. The M1 deferral of Resume above is superseded for
+the modes below; Policy Stop and revise-turn admission at `awaiting_approval`
+remain approved omissions.
+
+### Episode-bound consent, not grant arithmetic
+
+Resume names its mode and the exact episode (`expected_episode_id`). The server
+compares that episode with the current hold; an exact replay returns 200 with
+`replay: true`, different guidance for the same episode is a 409 and is not
+recorded, and consent for an older episode cannot resolve a newer one. `set-token`
+cannot consent. Rejected: `ClaimRun` grant arithmetic and generation-wide grants
+(the latter deferred to a follow-up). Binding every action to
+`expected_episode_id` is what stops a replay from authorizing a later refusal;
+later ordinary pickups are the chosen baseline behaviour, not reuse of old
+consent. Only the optional compatible-lane one-claim Fresh uses a pending intent,
+below.
+
+### Resume context before the first model turn
+
+Root initial planning must see the owner's Resume correction too. The worker
+waits for input delivery, then places the bounded live batch and any earlier
+owner history in the existing untrusted fences on the first policy planning
+request. Inclusion is reported once, only on evidence of model processing;
+pre-evidence retries keep the batch. Ordinary planning still leaves queued
+follow-ups for implementation. Seeded policy continuations retain their existing
+owner-plan framing and replay earlier history without inventing a planning turn.
+
+The optional claim marker `policy_resume_context_pending` is derived from a
+resolved episode with no reported session, and retires when the session is
+reported. `policy_resume_inputs_pending` covers only this episode's unresolved
+follow-up delivery: modern applied-but-unincluded rows remain pending until
+inclusion, excluding superseded rows and blank-only bodies under
+`String.prototype.trim` semantics. The markers grant no plan approval, Fresh
+start, session reuse or broader scope. They add no schema or capability; older
+workers ignore them and older APIs omit them, so both updated sides are needed.
+
+Owner decision (2026-11-08, option B): over-budget owner history, or a live backlog
+whose first bounded batch could omit the current correction, ends as a distinct
+terminal refusal before a model request. The worker retains the source, recovery
+journal and custody, and sends no inclusion receipt. The terminal run's HOME and
+model-session artifacts are disposable, not recovery exports or successor session
+inputs. Both HOME reclaimers can remove them without traversing the retained clone
+or bare journal. The owner must arrange a
+smaller successor and carry guidance over manually; another run does not inherit
+these input rows automatically. This adds no pause authority, schema or wire
+field, and never disguises the refusal as a provider, idle or credential failure.
+
+Unavailable history remains a transient read failure that can self-heal, with a
+distinct worker status message and Cancel advice. Ordinary recovery has no
+lifetime retry bound: the default backoff is 1, 2, 4, 8, 16, then 30 minutes per
+park, plus 5 to 30 seconds of jitter. Operators can configure those durations.
+Each claim can repeat capture, checkpoint publication and custody work; it is not
+an owner-only hold or a journal-only retry. The owner can Cancel to stop retries.
+Work and unincluded inputs remain preserved; the worker never silently plans from
+truncated or unknown owner context. A dedicated bounded context hold is deferred.
+
+### R/VG/VH continuity: the required head moves only on verified publication
+
+A recorded required saved-work head is superseded only by a published report whose
+checkpoint contains the latest head, at the same claim generation the worker
+verified. Before any provider work the worker proves the recovered clone contains
+the required head; otherwise it re-holds `saved_work_missing` with nothing started.
+After `fresh_from_saved_work` the requirement persists until the claiming worker
+verifies it at the current claim generation. Residual: clearing relies on the
+claiming worker's local proof, not on publication.
+
+### One-claim Fresh is consumed in ClaimRun
+
+`fresh_one_claim` is consumed inside the `ClaimRun` transaction and restored only
+on server-known non-delivery. A start that is never confirmed re-holds as
+`fresh_start_uncertain` and is never repeated, because a provider conversation may
+already exist. A released worker image that advertises
+`provider_policy_hold_v1` but predates this support would consume the grant and
+re-hold as `session_missing` without starting a conversation, so the API rolls
+first and capable workers follow.
+
+### Guarded Downs (migrations 00420 and 00419, "Shape A")
+
+00419 adds the recorded hold cause and the required-head and recovery-verification
+columns, 00420 the one-claim Fresh generation columns and a `NOT VALID` shape check, and 00421 validates it. The
+Downs are guarded and run one version at a time from 00421: 00420 and 00419 refuse
+live or orphan rows and convert paused or queued active rows to failed, and refuse
+any other live row (claimed, running, `recovery_wait`, `limit_wait`, `pool_wait`,
+`awaiting_*`) that still carries an active policy requirement; live rows without
+policy state do not block. 00419 also refuses any live row where
+`policy_preserve_required AND policy_resolved_at IS NOT NULL`, even with no head
+(the normal state after a `preserve` or `fresh_one_claim` resume). Each is one transaction, so a `RAISE` rolls back fully;
+each holds `ACCESS EXCLUSIVE` on `runs`. 00419's Down is destructive for the hold
+cause and recovery identity columns of every row. Rollback is drain-only; the
+operator procedure is in
+[Rolling back](../docs/run-pause.md#rolling-back). Rejected: quiescing workers
+alone, which leaves an old API able to resume rows it does not understand.
+
+### Mcv not added
+
+A separate validation migration for the 00419 check (an "Mcv") was not added. The
+dba judged it optional: the API is a single Recreate-strategy instance, and the
+check cannot fail on the new all-NULL columns.
+
+### Residuals
+
+- Server enforcement covers applied refusals; local pending evidence protects only
+  its surviving worker.
+- An absent worker or journal beyond the existing pending lease, or the
+  wall-release race before delivery, can leave another claim unconstrained.
+- Retained custody still counts toward the per-owner custody admission limit
+  (default 8); no force-clear or capacity exception exists.
+- Held assigned workers can defer idle-only rolls indefinitely (#3103).
+- Policy journals survive a worker process crash, not storage or power loss.
+
+### #3153 map cell
+
+The runner-shared PVC subPath mount (controller render test
+`TestDockerWorkerSharesTheRunWorkdirWithDindButNotSecrets`) and the agent
+replacement test (`agent/test/runner-policy-saved-work.test.ts`) cover this cell: a
+replacement worker over the same data volume recovers present saved work and
+re-holds when it is absent.

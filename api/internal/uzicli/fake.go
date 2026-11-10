@@ -294,6 +294,11 @@ type FakeClient struct {
 	ResumedRun      apitypes.RunDTO
 	ResumeRunNowErr error
 
+	// ResumePolicyHold capture (issue #3607): the arguments of the last call, the canned replay
+	// flag and the reply (ResumedRun, ResumeRunNowErr / Err as for ResumeRunNow).
+	LastPolicyResume   PolicyResumeCall
+	PolicyResumeReplay bool
+
 	// SetRunCredential capture (PRD #1247 M4). LastSetTokenRunID is the run id `uzi run
 	// set-token` targeted; LastSetTokenOverride is the resolved override it sent (a label
 	// resolved CLIENT-SIDE to {pinned, secret_id}; auto/default/inherit as a bare mode), so

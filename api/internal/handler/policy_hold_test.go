@@ -50,9 +50,11 @@ func TestPolicyHoldRouteHasNoRateLimiter(t *testing.T) {
 	}
 }
 
-func TestPolicyHoldNotReady(t *testing.T) {
-	if slices.Contains(protocolFeatures(true, true, true, true), capability.ProviderPolicyHoldV1) {
-		t.Fatal("incomplete policy continuation advertised ready")
+func TestPolicyHoldAdvertised(t *testing.T) {
+	for _, flags := range [][4]bool{{true, true, true, true}, {false, false, false, false}} {
+		if !slices.Contains(protocolFeatures(flags[0], flags[1], flags[2], flags[3]), capability.ProviderPolicyHoldV1) {
+			t.Fatalf("policy hold not advertised unconditionally with flags %v", flags)
+		}
 	}
 }
 

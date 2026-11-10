@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import http from "node:http";
-import { mkdtemp, mkdir, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolve, join } from "node:path";
-import { runPodEpochShadow, readPodEpochProjection, PodEpochSettlementError } from "../src/pod-epoch-reclaim.js";
+import { runPodEpochShadow, readPodEpochProjection, PodEpochSettlementError, EPOCH_RECLAIM_DELETION_ENABLED } from "../src/pod-epoch-reclaim.js";
+import { PodEpochDaemonError } from "../src/pod-epoch-daemon.js";
 import { WorkerClient } from "../src/client.js";
+import { buildPodEpochDeletionDeps } from "../src/main.js";
 import { nullLogger } from "./helpers.js";
+import { daemon, ENABLE_DELETION_FOR_TEST } from "./pod-epoch-reclaim-support.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
 import type { RetainedSourceEvidence } from "../src/git.js";
+import type { RecoveryHoldsResponse } from "../src/protocol.js";
 
 const bytes = await readFile(new URL("../../fixtures/pod-epoch/v2/positive.json", import.meta.url));
 const evidence = JSON.parse(bytes.toString());
@@ -61,38 +66,13 @@ function clock(options: Options, initial = 0) {
     timers,
   };
 }
-async function daemon() {
-  let events: http.ServerResponse | undefined;
-  const requests: string[] = [];
-  const server = http.createServer((req, res) => {
-    requests.push(req.method + " " + req.url);
-    if (req.url?.startsWith("/events")) { events = res; res.writeHead(200); res.flushHeaders(); return; }
-    const body = req.url === "/_ping" ? "OK" : JSON.stringify(
-      req.url === "/info" ? { Swarm: { LocalNodeState: "inactive" }, LiveRestoreEnabled: false } :
-      req.url === "/volumes" ? { Volumes: [] } : []);
-    res.end(body);
-  });
-  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
-  return {
-    host: "tcp://127.0.0.1:" + address.port,
-    requests,
-    veto: () => events!.write('{"Type":"container"}\n'),
-    close: async () => {
-      events?.destroy();
-      server.closeAllConnections();
-      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    },
-  };
-}
 function source(path: string, runId: string, protectedSource = false): RetainedSourceEvidence {
   return {
     barePath: "/bare", runId, branch: "branch", key: "key", kind: "attempt", generation: 1,
-    attempt: "attempt", ledgerState: "abandoned", journalState: "none", markerState: "none",
+    attempt: "attempt", ledgerState: "live", journalState: "none", markerState: "none",
     presence: "present", descriptor: "fresh", allocatedBytes: 4096, bytesState: "measured",
     sources: [{ clonePath: path, attempt: "attempt", generation: 1, presence: "present",
-      ledgerState: "abandoned", live: false, allocatedBytes: 4096 }],
+      ledgerState: "live", live: false, allocatedBytes: 4096 }],
     consumers: [], localRecords: [], holds: { state: "read", ids: [] },
     disposition: { kind: protectedSource ? "local_protected_discard" : "local_discard" },
   };
@@ -1043,4 +1023,687 @@ test("#3775 shadow grouping selector and legacy fallback causes preserve candida
       assert.equal(result.kept, result.would_delete ? 0 : 1);
     }
   } finally { await d.close(); }
+});
+
+// ---- M1b deletion phase, exercised through runPodEpochShadow with fake collaborators ----
+type Discard = Awaited<ReturnType<NonNullable<Options["deletion"]>["git"]["discardStoppedSource"]>>;
+const DESCRIPTOR = "0".repeat(64);
+function deletionWorld(count: number, tune?: (w: ReturnType<typeof makeWorld>) => void) { return makeWorld(count, tune); }
+function makeWorld(count: number, tune?: (w: any) => void) {
+  const { options, calls, parent } = setup();
+  const events: string[] = [];
+  const spies = { proofs: [] as any[], discards: [] as any[], ended: [] as Array<{ paths: string[]; options: unknown }>,
+    reserved: [] as string[], journalReads: [] as string[], begins: 0, finishes: 0 };
+  const world = {
+    options, calls, parent, events, spies, groups: [] as Array<{ barePath: string; selector: { runId: string; generation: number; attempt: string }; paths: string[] }>,
+    pending: 0, stopped: false, eligible: true, activeTx: undefined as object | undefined,
+    reserveRefused: false, finishThrows: false, proofThrows: false,
+    /** Mirrors GitCache's process-wide unsettled-delete map being non-empty. */
+    unsettled: false,
+    holds: (run_id: string): RecoveryHoldsResponse => ({ run_id, holds: [], run_open_holds: { run_id, count: 0 } }),
+    ownership: (): { status: string } => ({ status: "completed" }),
+    journal: (_branch: string, path: string, runId: string): Array<string | null> =>
+      [JSON.stringify({ attemptId: "attempt", clonePath: path, runId })],
+    mutateSource: (_s: RetainedSourceEvidence, _i: number) => {},
+    discard: (_opts: any, path: string): Discard => ({ kind: "done", sources: [{ clonePath: path, outcome: "removed" }],
+      metadata: "retired", tookOver: true }),
+  };
+  const groups = Array.from({ length: count }, (_, i) => ({
+    barePath: "/bare", selector: { runId: "run" + i, generation: 1, attempt: "attempt" }, paths: ["/tree/" + i],
+  }));
+  world.groups = groups;
+  options.git.discoverEpochRetainedSources = async () => ({
+    groups, inventoryComplete: true, physicalPaths: count, overflow: 0, overflowExact: true, unreadable: 0 });
+  options.git.inspectRetainedSources = async opts => {
+    const i = Number(opts.selector!.runId.slice(3));
+    const group = groups[i]!;
+    for (const p of group.paths) opts.beforeTree!(p);
+    const s = source(group.paths[0]!, group.selector.runId);
+    s.branch = "b" + i; s.descriptor = DESCRIPTOR;
+    s.sources = group.paths.map(path => ({ ...s.sources[0]!, clonePath: path }));
+    world.mutateSource(s, i);
+    return { sources: [s], partial: false, unreadable: 0, sampledAt: "" };
+  };
+  options.client.listRecoveryHolds = async run_id => world.holds(run_id);
+  options.client.getRunOwnership = async () => world.ownership();
+  const scope = {
+    assertExclusive() {}, get pendingMutations() { return world.pending; },
+    beginMutation() { return { settle() {} }; }, inheritStdio: (s: any) => s,
+    stop() { world.stopped = true; }, stopped: () => world.stopped, assertSettled() {},
+    finish() { events.push("finish"); spies.finishes++; if (world.finishThrows) throw new Error("finish"); },
+  };
+  options.ownership = { ...options.ownership,
+    beginReclaim: () => { events.push("begin"); spies.begins++; return scope as never; },
+    reacquireShared: async () => { events.push("handover"); calls.handovers++; } };
+  const tx = {};
+  options.deletion = {
+    enableForTest: ENABLE_DELETION_FOR_TEST,
+    authority: {
+      withTransaction: async (fn: (t: unknown) => Promise<unknown>) => {
+        world.activeTx = tx;
+        try { return await fn(tx); } finally { world.activeTx = undefined; }
+      },
+      active: () => world.activeTx,
+      endSourceUse: async (paths: Iterable<string>, opts: unknown) => {
+        spies.ended.push({ paths: [...paths], options: opts }); return { ended: [...paths], kept: [], endedSlots: [] };
+      },
+    } as never,
+    reserve: (async (runId: string, action: (eligible: () => boolean) => Promise<unknown>) => {
+      spies.reserved.push(runId);
+      return world.reserveRefused ? undefined : action(() => world.eligible);
+    }) as never,
+    quiesce: async () => true,
+    git: {
+      assertNoUnsettledDeletes: () => { if (world.unsettled) throw new Error("unsettled runner delete outstanding"); },
+      readEpochJournalVector: async (_bare: string, branch: string) => {
+        spies.journalReads.push(branch);
+        const i = Number(branch.slice(1));
+        return world.journal(branch, "/tree/" + i, "run" + i);
+      },
+      createEpochDiscardProof: (input: any) => {
+        if (world.proofThrows) throw new Error("invalid epoch discard proof");
+        spies.proofs.push(input); return { input } as never;
+      },
+      discardStoppedSource: async (opts: any) => {
+        const input = opts.epochProof.input;
+        const liveDuring = (() => { try { input.checkLive(); return true; } catch { return false; } })();
+        const holdsSeen = opts.holds;
+        spies.discards.push({ opts, liveDuring, holdsSeen });
+        return world.discard(opts, input.paths[0]);
+      },
+    },
+  };
+  tune?.(world);
+  return world;
+}
+async function withDeletion(count: number, tune: ((w: ReturnType<typeof makeWorld>) => void) | undefined,
+    check: (w: ReturnType<typeof makeWorld>, result: NonNullable<Awaited<ReturnType<typeof runPodEpochShadow>>>) => void | Promise<void>) {
+  const d = await daemon();
+  try {
+    const w = deletionWorld(count, tune);
+    w.options.dockerHost = d.host;
+    await check(w, (await runPodEpochShadow(w.options))!);
+  } finally { await d.close(); }
+}
+const noMutation = (w: ReturnType<typeof makeWorld>) => {
+  assert.equal(w.spies.proofs.length, 0); assert.equal(w.spies.discards.length, 0);
+  assert.equal(w.spies.ended.length, 0); assert.equal(w.spies.reserved.length, 0);
+};
+
+test("with the production flag value no scope, proof or mutation exists even for an eligible attested pass", async () => {
+  assert.equal(EPOCH_RECLAIM_DELETION_ENABLED, false);
+  await withDeletion(2, w => { delete (w.options.deletion as { enableForTest?: symbol }).enableForTest; }, (w, result) => {
+    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "shadow_complete");
+    assert.equal(result.authority.result, "attested"); assert.equal(result.would_delete, 2);
+    noMutation(w); assert.equal(w.spies.begins, 0); assert.equal(w.spies.journalReads.length, 0);
+    assert.equal(result.deleted + result.settled + result.kept_after_refusal + result.kept_residue, 0);
+    assert.equal(result.reclaim_bytes_state, "unknown");
+    assert.deepEqual(w.events, ["handover"]);
+  });
+});
+test("nothing under agent/src references the deletion override, which only pod-epoch-reclaim.ts defines", async () => {
+  const root = fileURLToPath(new URL("../src/", import.meta.url));
+  const files = (await readdir(root, { recursive: true })).filter(f => /\.(ts|mts|cts|js|mjs|cjs)$/.test(f));
+  assert.ok(files.length > 50);
+  const referencing: string[] = [];
+  for (const f of files) {
+    const text = await readFile(join(root, f), "utf8");
+    if (/enableForTest|ENABLE_DELETION_FOR_TEST|enable-deletion/.test(text)) referencing.push(f);
+  }
+  assert.deepEqual(referencing, ["pod-epoch-reclaim.ts"]);
+  const main = await readFile(join(root, "main.ts"), "utf8");
+  assert.ok(!main.includes("enableForTest"));
+  const definition = await readFile(join(root, "pod-epoch-reclaim.ts"), "utf8");
+  assert.equal(definition.match(/enableForTest\s*===\s*TEST_ENABLE_DELETION\b/g)?.length, 1,
+    "exactly one comparison of enableForTest against the sentinel");
+  assert.equal(definition.match(/TEST_ENABLE_DELETION\b/g)?.length, 2, "the sentinel is defined once and compared once");
+  const built = buildPodEpochDeletionDeps({ authority: {} as never, runner: { withSourceReservation: async () => undefined },
+    git: {} as never, dockerHost: undefined });
+  assert.equal("enableForTest" in built, false, "the deps object main.ts builds has no enableForTest key");
+  assert.equal(definition.match(/export const EPOCH_RECLAIM_DELETION_ENABLED: boolean = false;/g)?.length, 1);
+});
+test("an eligible attested pass with the override deletes present sources, settles missing ones, then finishes before handover", async () => {
+  await withDeletion(3, w => {
+    w.mutateSource = (s, i) => { if (i === 1) { s.presence = "missing"; s.sources[0]!.presence = "missing"; s.sources[0]!.allocatedBytes = null; } };
+    w.discard = (_o, path) => ({ kind: "done", sources: [{ clonePath: path, outcome: path === "/tree/1" ? "missing" : "removed" }],
+      metadata: "retired", tookOver: true });
+  }, (w, result) => {
+    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+    assert.equal(result.deleted, 2); assert.equal(result.deleted_bytes, 8192); assert.equal(result.settled, 1);
+    assert.equal(result.reclaim_bytes_state, "measured");
+    // The shadow fields keep their shadow values.
+    assert.equal(result.would_delete, 2); assert.equal(result.would_settle, 1); assert.equal(result.would_delete_bytes, 8192);
+    assert.deepEqual(w.events, ["begin", "finish", "handover"]);
+    assert.deepEqual(w.spies.reserved, ["run0", "run1", "run2"]);
+    assert.deepEqual(w.spies.ended.map(e => e.paths), [["/tree/0"], ["/tree/1"], ["/tree/2"]]);
+    assert.deepEqual(w.spies.ended[0]!.options, { skipFlightOwned: true });
+    for (const proof of w.spies.proofs) {
+      assert.deepEqual(proof.decision, { eligible: true, attested: true });
+      assert.equal(proof.confirm, DESCRIPTOR); assert.equal(proof.paths.length, 1);
+      assert.deepEqual(JSON.parse(proof.expectedRawJournal), { attemptId: "attempt", clonePath: proof.paths[0], runId: proof.selector.runId });
+    }
+    assert.ok(w.spies.discards.every(x => x.liveDuring), "checkLive holds inside the reservation and transaction");
+    assert.deepEqual(w.spies.discards[0]!.holdsSeen, { state: "read", holds: [] });
+  });
+});
+test("checkLive fails when the reservation is revoked or the transaction ended", async () => {
+  await withDeletion(1, w => {
+    const base = w.discard;
+    w.discard = (o, path) => { w.eligible = false; return base(o, path); };
+  }, async w => {
+    const input = w.spies.proofs[0];
+    assert.throws(() => input.checkLive(), /reservation or transaction lost/);
+    w.eligible = true;
+    assert.throws(() => input.checkLive(), /reservation or transaction lost/, "no transaction is active after the run");
+  });
+});
+test("the reclaim phase runs only for eligible, attested, intact passes with a native scope and deps", async () => {
+  const cases: Array<[string, (w: ReturnType<typeof makeWorld>) => void | Promise<void>]> = [
+    ["shadow-only (no deletion deps)", w => { delete w.options.deletion; }],
+    ["beginReclaim absent", w => { delete (w.options.ownership as { beginReclaim?: unknown }).beginReclaim; }],
+    ["undeclared runtime", w => { w.options.bootstrap = { ...w.options.bootstrap, firstMode: "shared", reason: "runtime_not_declared" }; }],
+    ["legacy evidence", async w => { const raw = await fixture("valid/positive.json"); w.options.readEvidence = async () => raw; }],
+    ["contradicted attestation", async w => { const raw = await fixture("v2/valid/contradicted.json"); w.options.readEvidence = async () => raw; }],
+    ["partial inventory", w => {
+      const discover = w.options.git.discoverEpochRetainedSources;
+      w.options.git.discoverEpochRetainedSources = async o => ({ ...await discover(o), inventoryComplete: false, unreadable: 1 });
+    }],
+    ["partial inspection", w => {
+      const inspect = w.options.git.inspectRetainedSources;
+      w.options.git.inspectRetainedSources = async o => ({ ...await inspect(o), partial: true });
+    }],
+    ["unsupported filesystem", w => { w.options.ownership = { ...w.options.ownership, mode: "unsupported" }; }],
+  ];
+  for (const [label, tune] of cases) {
+    const d = await daemon();
+    try {
+      const w = deletionWorld(2); await tune(w); w.options.dockerHost = d.host;
+      const result = (await runPodEpochShadow(w.options))!;
+      noMutation(w); assert.equal(w.spies.begins, 0, label); assert.equal(w.spies.journalReads.length, 0, label);
+      assert.equal(result.deleted + result.settled, 0, label); assert.notEqual(result.reason, "reclaim_complete", label);
+    } finally { await d.close(); }
+  }
+});
+test("a daemon veto or an invalidated pass never starts the reclaim phase", async () => {
+  const d = await daemon();
+  try {
+    const w = deletionWorld(1); w.options.dockerHost = d.host;
+    const inner = w.options.git.inspectRetainedSources;
+    w.options.git.inspectRetainedSources = async o => { d.veto(); await tick(); await tick(); return inner(o); };
+    const result = (await runPodEpochShadow(w.options))!;
+    noMutation(w); assert.equal(w.spies.begins, 0); assert.equal(result.authority.reason, "daemon_veto");
+  } finally { await d.close(); }
+});
+
+test("deletion needs a terminal run, an empty holds list and a matching run_open_holds of exactly zero", async () => {
+  const cases: Array<[string, (w: ReturnType<typeof makeWorld>) => void]> = [
+    ["non-terminal on the fresh read", w => { let n = 0; w.ownership = () => ({ status: ++n === 1 ? "completed" : "running" }); }],
+    ["unknown holds (malformed response)", w => { let n = 0; w.holds = id => ++n === 1 ? ({ run_id: id, holds: [], run_open_holds: { run_id: id, count: 0 } }) : ({ run_id: "wrong", holds: [] } as never); }],
+    ["a hold of this worker", w => { w.holds = id => ({ run_id: id, holds: [{ hold_id: "h", generation: 1 } as never], run_open_holds: { run_id: id, count: 0 } }); }],
+    ["a run-wide hold elsewhere (count > 0)", w => { w.holds = id => ({ run_id: id, holds: [], run_open_holds: { run_id: id, count: 1 } }); }],
+    ["absent run_open_holds", w => { w.holds = id => ({ run_id: id, holds: [] }); }],
+    ["mismatched run_open_holds run", w => { w.holds = id => ({ run_id: id, holds: [], run_open_holds: { run_id: "other", count: 0 } }); }],
+    ["non-numeric count", w => { w.holds = id => ({ run_id: id, holds: [], run_open_holds: { run_id: id, count: "0" as never } }); }],
+    ["negative count", w => { w.holds = id => ({ run_id: id, holds: [], run_open_holds: { run_id: id, count: -1 } }); }],
+    ["failed fresh read", w => { let n = 0; w.holds = id => { if (++n > 1) throw new Error("read failed"); return ({ run_id: id, holds: [], run_open_holds: { run_id: id, count: 0 } }); }; }],
+  ];
+  for (const [label, tune] of cases) {
+    // The first read is the shadow's and the later ones are the deletion-side fresh reads.
+    await withDeletion(1, tune, (w, result) => {
+      noMutation(w); assert.equal(result.deleted, 0, label);
+      if (label === "a hold of this worker") {
+        // Not even a shadow candidate: the shadow rule is unchanged and keeps it.
+        assert.equal(result.would_delete, 0, label); assert.equal(result.kept_after_refusal, 0, label);
+        return;
+      }
+      assert.equal(result.would_delete, 1, label + ": the shadow verdict is unchanged");
+      assert.equal(result.kept_after_refusal, 1, label);
+      assert.equal(result.verdict, "partial", label); assert.equal(result.reason, "reclaim_partial", label);
+      assert.equal(w.events.at(-1), "handover", label);
+    });
+  }
+});
+test("an old api (no run_open_holds anywhere) keeps every source while the shadow verdict is unchanged", async () => {
+  await withDeletion(3, w => { w.holds = id => ({ run_id: id, holds: [] }); }, (w, result) => {
+    noMutation(w);
+    assert.equal(result.would_delete, 3); assert.equal(result.authority.result, "attested");
+    assert.equal(result.kept_after_refusal, 3); assert.equal(result.deleted, 0);
+    assert.equal(result.verdict, "partial"); assert.equal(result.reason, "reclaim_partial");
+    assert.deepEqual(w.events, ["begin", "finish", "handover"]);
+  });
+});
+test("a definitive exact ownership 404 keeps only that run's sources and does not make the pass partial", async () => {
+  const d = await daemon();
+  try {
+    const w = deletionWorld(2); w.options.dockerHost = d.host;
+    const requests: string[] = [];
+    w.options.client = new WorkerClient("http://example.invalid", "inert", "test", nullLogger(), {
+      fetch: async (url, init) => {
+        assert.equal(init?.method, "GET");
+        const path = new URL(String(url)).pathname; requests.push(path);
+        if (path.endsWith("/runs/run0/ownership"))
+          return new Response(JSON.stringify({ error: "run not found for this worker" }), { status: 404 });
+        if (path.endsWith("/ownership")) return new Response(JSON.stringify({ status: "completed" }));
+        const run_id = path.split("/").at(-2)!;
+        return new Response(JSON.stringify({ run_id, holds: [], run_open_holds: { run_id, count: 0 } }));
+      },
+    });
+    const result = (await runPodEpochShadow(w.options))!;
+    assert.deepEqual(result.partial_causes, {});
+    assert.equal(result.would_delete, 1); assert.equal(result.kept, 1);
+    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+    assert.equal(result.deleted, 1); assert.deepEqual(w.spies.reserved, ["run1"]);
+    assert.equal(requests.filter(p => p.includes("/runs/run0/")).every(p => p.endsWith("/ownership")), true,
+      "no holds read for the 404 run");
+    assert.equal(requests.filter(p => p.includes("/runs/run0/")).length, 1);
+  } finally { await d.close(); }
+});
+test("a 404 with any other body, or on holds, is still a partial pass", async () => {
+  for (const [stage, body] of [["ownership", { error: "not found" }], ["ownership", { error: "run not found for this worker", extra: 1 }], ["holds", { error: "run not found for this worker" }]] as const) {
+    const d = await daemon();
+    try {
+      const w = deletionWorld(1); w.options.dockerHost = d.host;
+      w.options.client = new WorkerClient("http://example.invalid", "inert", "test", nullLogger(), {
+        fetch: async url => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("/ownership") && stage === "holds") return new Response(JSON.stringify({ status: "completed" }));
+          return new Response(JSON.stringify(body), { status: 404 });
+        },
+      });
+      const result = (await runPodEpochShadow(w.options))!;
+      assert.equal(result.verdict, "partial", stage + JSON.stringify(body)); noMutation(w);
+      assert.equal(Object.keys(result.partial_causes).length, 1);
+    } finally { await d.close(); }
+  }
+});
+test("a refused reservation or a missing transaction keeps the source and admits nothing", async () => {
+  await withDeletion(1, w => { w.reserveRefused = true; }, (w, result) => {
+    assert.deepEqual(w.spies.reserved, ["run0"]); assert.equal(w.spies.proofs.length, 0); assert.equal(w.spies.discards.length, 0);
+    assert.equal(result.kept_after_refusal, 1); assert.equal(result.verdict, "partial");
+    assert.deepEqual(w.events, ["begin", "finish", "handover"]);
+  });
+  await withDeletion(1, w => {
+    (w.options.deletion!.authority as { withTransaction: unknown }).withTransaction = async () => { throw new Error("authority lock timeout"); };
+  }, (w, result) => {
+    noMutation(w); assert.equal(result.kept_after_refusal, 1); assert.equal(result.reason, "reclaim_partial");
+    assert.deepEqual(w.events, ["begin", "finish", "handover"]);
+  });
+  await withDeletion(1, w => { w.proofThrows = true; }, (w, result) => {
+    assert.equal(w.spies.discards.length, 0); assert.equal(result.kept_after_refusal, 1); assert.equal(result.verdict, "partial");
+  });
+});
+test("a pre-effect refusal keeps its source, calls no end for it, and the pass continues to the next source", async () => {
+  await withDeletion(2, w => {
+    w.discard = (_o, path) => path === "/tree/0" ? { kind: "refused", reason: "not_quiescent", consumers: [] } :
+      { kind: "done", sources: [{ clonePath: path, outcome: "removed" }], metadata: "retired", tookOver: true };
+  }, (w, result) => {
+    assert.equal(result.kept_after_refusal, 1); assert.equal(result.deleted, 1);
+    assert.equal(result.verdict, "partial"); assert.equal(result.reason, "reclaim_partial");
+    assert.deepEqual(w.spies.ended.map(e => e.paths), [["/tree/1"]]);
+    assert.deepEqual(w.events, ["begin", "finish", "handover"]);
+  });
+  // A refusal after a takeover still ends the takeover.
+  await withDeletion(1, w => { w.discard = () => ({ kind: "refused", reason: "x", consumers: [], tookOver: true }); }, (w, result) => {
+    assert.deepEqual(w.spies.ended.map(e => e.paths), [["/tree/0"]]); assert.equal(result.kept_after_refusal, 1);
+  });
+});
+test("a settled residue failure keeps the source as kept_residue; a settled incomplete never throws", async () => {
+  await withDeletion(2, w => {
+    w.discard = (_o, path) => path === "/tree/0" ?
+      { kind: "incomplete", sources: [{ clonePath: path, outcome: "retained" }], metadata: "kept", tookOver: true } :
+      { kind: "done", sources: [{ clonePath: path, outcome: "removed" }], metadata: "retired", tookOver: true };
+  }, (w, result) => {
+    assert.equal(result.kept_residue, 1); assert.equal(result.deleted, 1);
+    assert.equal(result.verdict, "partial"); assert.equal(result.reason, "reclaim_partial");
+    assert.deepEqual(w.events, ["begin", "finish", "handover"]);
+  });
+});
+test("structural keeps never reach the authority path and do not downgrade the verdict", async () => {
+  const reads = { ownership: 0, holds: 0 };
+  await withDeletion(4, w => {
+    w.groups[3]!.paths = ["/tree/3", "/tree/3b"];
+    w.mutateSource = (s, i) => {
+      if (i === 0) s.disposition = { kind: "local_protected_discard" };
+      if (i === 1) s.kind = "canonical";
+    };
+    w.journal = (_branch, path, runId) => _branch === "b2" ? [] : [JSON.stringify({ attemptId: "attempt", clonePath: path, runId })];
+    // Count the api reads; the shadow phase makes exactly one of each per group (4 groups).
+    const ownership = w.options.client.getRunOwnership, holds = w.options.client.listRecoveryHolds;
+    w.options.client.getRunOwnership = async (...args: Parameters<typeof ownership>) => { reads.ownership++; return ownership(...args); };
+    w.options.client.listRecoveryHolds = async (...args: Parameters<typeof holds>) => { reads.holds++; return holds(...args); };
+  }, (w, result) => {
+    assert.equal(reads.ownership, 4, "no deletion-phase ownership read for a structural keep");
+    assert.equal(reads.holds, 4, "no deletion-phase holds read for a structural keep");
+    assert.equal(result.would_delete, 5, "the shadow counts every candidate path");
+    assert.equal(result.kept_protected, 1);
+    assert.equal(result.kept_unrecoverable_shape, 4, "canonical, a no-key attempt and both parts of a two-part source");
+    assert.equal(w.spies.proofs.length, 0); assert.equal(w.spies.discards.length, 0); assert.equal(w.spies.reserved.length, 0);
+    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+    assert.equal(result.deleted + result.settled, 0);
+  });
+});
+test("journal shapes other than the exact strict string or [\"\"] are refused before any proof", async () => {
+  const raw = (path: string, runId: string, extra: object = {}) => JSON.stringify({ attemptId: "attempt", clonePath: path, runId, ...extra });
+  type Tune = (s: RetainedSourceEvidence) => void;
+  const ledger = (state: string, missing = false): Tune => s => {
+    s.ledgerState = state as never; s.sources[0]!.ledgerState = state as never;
+    if (missing) { s.presence = "missing"; s.sources[0]!.presence = "missing"; s.sources[0]!.allocatedBytes = null; }
+  };
+  const strict = (_b: string, p: string, r: string) => [raw(p, r)];
+  const empty = () => [""];
+  const shapes: Array<[string, (b: string, p: string, r: string) => Array<string | null>, boolean, Tune?]> = [
+    ["no key", () => [], false], ["valueless", () => [null], false], ["duplicate", (_b, p, r) => [raw(p, r), raw(p, r)], false],
+    ["extra field", (_b, p, r) => [raw(p, r, { restoreTip: "x" })], false], ["wrong run", (_b, p) => [raw(p, "other")], false],
+    ["wrong path", (_b, _p, r) => [raw("/elsewhere", r)], false], ["non-canonical json", (_b, p, r) => [raw(p, r) + " "], false],
+    ["not json", () => ["{"], false], ["array", () => ["[]"], false],
+    // (a) live + strict, present or missing
+    ["strict string, ledger live", strict, true], ["strict string, live, missing", strict, true, ledger("live", true)],
+    // (c) retired + strict + missing footprint; (b) retired + [""] + missing footprint
+    ["strict, retired, missing", strict, true, ledger("retired", true)],
+    ["explicit empty, retired, missing", empty, true, ledger("retired", true)],
+    // every other ledger/footprint combination is an unrecoverable shape
+    ["strict, retired, present", strict, false, ledger("retired")],
+    ["explicit empty, retired, present", empty, false, ledger("retired")],
+    ["explicit empty, ledger live", empty, false], ["explicit empty, live, missing", empty, false, ledger("live", true)],
+    ["explicit empty, reclaimed", empty, false, ledger("reclaimed")], ["explicit empty, reclaimed, missing", empty, false, ledger("reclaimed", true)],
+    ["explicit empty, abandoned", empty, false, ledger("abandoned")],
+    ["strict, reclaimed", strict, false, ledger("reclaimed")], ["strict, abandoned", strict, false, ledger("abandoned")],
+    ["strict, ledger none", strict, false, ledger("none")],
+  ];
+  for (const [label, journal, proceeds, tune] of shapes) {
+    await withDeletion(1, w => { w.journal = journal; if (tune) w.mutateSource = s => tune(s); }, (w, result) => {
+      if (!proceeds) assert.equal(w.spies.reserved.length, 0, label + ": no reservation for a structural keep");
+      assert.equal(w.spies.proofs.length, proceeds ? 1 : 0, label);
+      assert.equal(result.kept_unrecoverable_shape, proceeds ? 0 : 1, label);
+      assert.equal(result.deleted, proceeds ? 1 : 0, label);
+      assert.equal(result.verdict, "eligible", label); assert.equal(result.reason, "reclaim_complete", label);
+    });
+  }
+});
+test("a no-key attempt on a first roll (no run_open_holds) is a structural keep before any authority read and never downgrades", async () => {
+  const reads = { ownership: 0, holds: 0 };
+  await withDeletion(1, w => {
+    w.journal = () => [];
+    // The api reads the predecessor's capabilities on the first roll, so there is no run_open_holds count.
+    w.holds = run_id => ({ run_id, holds: [] });
+    const ownership = w.options.client.getRunOwnership, holds = w.options.client.listRecoveryHolds;
+    w.options.client.getRunOwnership = async (...args: Parameters<typeof ownership>) => { reads.ownership++; return ownership(...args); };
+    w.options.client.listRecoveryHolds = async (...args: Parameters<typeof holds>) => { reads.holds++; return holds(...args); };
+  }, (w, result) => {
+    assert.equal(result.kept_unrecoverable_shape, 1); assert.equal(result.kept_after_refusal, 0);
+    assert.equal(reads.ownership, 1, "only the shadow read"); assert.equal(reads.holds, 1, "only the shadow read");
+    assert.equal(w.spies.proofs.length, 0); assert.equal(w.spies.reserved.length, 0); assert.equal(w.spies.discards.length, 0);
+    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+  });
+  // A strict attempt on the same first roll is still an authority refusal (not a shape keep) and downgrades.
+  await withDeletion(1, w => { w.holds = run_id => ({ run_id, holds: [] }); }, (w, result) => {
+    assert.equal(result.kept_unrecoverable_shape, 0); assert.equal(result.kept_after_refusal, 1);
+    assert.equal(result.verdict, "partial"); assert.equal(w.spies.proofs.length, 0);
+  });
+});
+test("fatal outcomes throw PodEpochSettlementError, keep EX and never reach the shared handover", async () => {
+  const sources = (path: string) => [{ clonePath: path, outcome: "unknown" as const }];
+  const cases: Array<[string, (w: ReturnType<typeof makeWorld>) => void]> = [
+    ["unknown result", w => { w.discard = (_o, path) => ({ kind: "unknown", sources: sources(path), metadata: "kept", tookOver: true }); }],
+    ["pending child after done", w => { w.discard = (_o, path) => { w.pending = 1; return { kind: "done", sources: [{ clonePath: path, outcome: "removed" }], metadata: "retired", tookOver: true }; }; }],
+    ["stop latch after refusal", w => { w.discard = () => { w.stopped = true; return { kind: "refused", reason: "x", consumers: [] }; }; }],
+    ["stop latch after incomplete", w => { w.discard = (_o, path) => { w.stopped = true; return { kind: "incomplete", sources: [{ clonePath: path, outcome: "retained" }], metadata: "kept", tookOver: true }; }; }],
+    ["done with no outcome", w => { w.discard = () => ({ kind: "done", sources: [], metadata: "retired" }); }],
+    ["discard throws after effects", w => { w.discard = () => { throw new Error("boom"); }; }],
+    ["scope.finish throws", w => { w.finishThrows = true; }],
+  ];
+  for (const [label, tune] of cases) {
+    const d = await daemon();
+    // A fatal refusal deliberately leaves the daemon guard open (the process exits in production); release its
+    // timers here so the test process can.
+    const timers: Array<() => void> = [];
+    try {
+      const w = deletionWorld(2); tune(w); w.options.dockerHost = d.host;
+      w.options.schedule = (callback, ms) => { const t = setTimeout(callback, ms); const c = () => clearTimeout(t); timers.push(c); return c; };
+      await assert.rejects(runPodEpochShadow(w.options), PodEpochSettlementError, label);
+      assert.equal(w.calls.handovers, 0, label); assert.ok(!w.events.includes("handover"), label);
+      if (label !== "scope.finish throws") assert.equal(w.spies.proofs.length, 1, label + ": no second source after a fatal one");
+    } finally { for (const cancel of timers) cancel(); await d.close(); }
+  }
+});
+test("the coordinator itself is fatal for a pending child or stop latch after a discard, even when finish would succeed", async () => {
+  for (const latch of ["pending", "stopped"] as const) {
+    const w = deletionWorld(2, world => {
+      world.discard = (_o, path) => {
+        if (latch === "pending") world.pending = 1; else world.stopped = true;
+        return { kind: "done", sources: [{ clonePath: path, outcome: "removed" }], metadata: "retired", tookOver: true };
+      };
+    });
+    const d = await daemon(); w.options.dockerHost = d.host;
+    const timers: Array<() => void> = [];
+    w.options.schedule = (callback, ms) => { const t = setTimeout(callback, ms); const c = () => clearTimeout(t); timers.push(c); return c; };
+    try {
+      await assert.rejects(runPodEpochShadow(w.options), PodEpochSettlementError, latch);
+      assert.equal(w.spies.finishes, 0, latch + ": finish is never reached");
+      assert.equal(w.calls.handovers, 0, latch); assert.ok(!w.events.includes("handover"), latch);
+      assert.deepEqual(w.spies.reserved, ["run0"], latch + ": the second source never starts");
+      assert.equal(w.spies.discards.length, 1, latch);
+    } finally { for (const cancel of timers) cancel(); await d.close(); }
+  }
+});
+// A stop latched during a REFUSED re-inspect (the descriptor changed, so the source is kept) must still be fatal
+// at once: the refusal path may not skip the settlement check.
+async function refusedReinspectWithLatch(count: number) {
+  const w = deletionWorld(count, world => {
+    const seen = new Map<number, number>();
+    world.mutateSource = (s, i) => {
+      const n = (seen.get(i) ?? 0) + 1; seen.set(i, n);
+      if (i === 0 && n === 2) { world.stopped = true; s.descriptor = "1".repeat(64); }
+    };
+  });
+  const d = await daemon(); w.options.dockerHost = d.host;
+  const timers: Array<() => void> = [];
+  w.options.schedule = (callback, ms) => { const t = setTimeout(callback, ms); const c = () => clearTimeout(t); timers.push(c); return c; };
+  try {
+    await assert.rejects(runPodEpochShadow(w.options), PodEpochSettlementError);
+    assert.equal(w.spies.finishes, 0, "finish is never reached");
+    assert.equal(w.calls.handovers, 0); assert.ok(!w.events.includes("handover"));
+    return w;
+  } finally { for (const cancel of timers) cancel(); await d.close(); }
+}
+// A Git delete left unsettled before the pass (GitCache's process-wide unsettled map; defence in depth for any
+// delete the process records before or during the pass) is fatal for the pass even when every candidate is only
+// refused or settled by metadata, which never consult that map themselves.
+test("an unsettled Git delete is fatal: EX kept, no finish, no handover", async () => {
+  const missing = (s: RetainedSourceEvidence) => {
+    s.ledgerState = "retired" as never; s.sources[0]!.ledgerState = "retired" as never;
+    s.presence = "missing"; s.sources[0]!.presence = "missing"; s.sources[0]!.allocatedBytes = null;
+  };
+  // `before` marks the cases where the delete is outstanding when the deletion phase starts: the pre-scope check
+  // alone must end the pass, so no scope opens and nothing is proved, discarded or quiesced.
+  const cases: Array<[string, (w: ReturnType<typeof makeWorld>) => void, number?]> = [
+    ["outstanding before a pre-effect refusal", w => { w.unsettled = true; w.ownership = (() => { let n = 0; return () => ({ status: ++n === 1 ? "completed" : "running" }); })(); }],
+    ["outstanding before a metadata-only repair", w => {
+      w.unsettled = true; w.journal = () => [""]; w.mutateSource = missing;
+      w.discard = (_o, path) => ({ kind: "done", sources: [{ clonePath: path, outcome: "missing" }], metadata: "retired" });
+    }],
+    ["outstanding before a pass with zero admitted candidates", w => { w.unsettled = true; }, 0],
+    ["raised during a refusal, found at finish", w => {
+      w.discard = () => { w.unsettled = true; return { kind: "refused", reason: "x", consumers: [] }; };
+    }],
+    ["raised during a metadata-only repair, found at finish", w => {
+      w.journal = () => [""]; w.mutateSource = missing;
+      w.discard = (_o, path) => { w.unsettled = true; return { kind: "done", sources: [{ clonePath: path, outcome: "missing" }], metadata: "retired" }; };
+    }],
+  ];
+  for (const [label, tune, count = 1] of cases) {
+    const d = await daemon();
+    const timers: Array<() => void> = [];
+    try {
+      const w = deletionWorld(count, tune); w.options.dockerHost = d.host;
+      let quiesces = 0;
+      w.options.deletion!.quiesce = async () => { quiesces++; return true; };
+      w.options.schedule = (callback, ms) => { const t = setTimeout(callback, ms); const c = () => clearTimeout(t); timers.push(c); return c; };
+      await assert.rejects(runPodEpochShadow(w.options), PodEpochSettlementError, label);
+      assert.equal(w.spies.finishes, 0, label + ": finish is never reached");
+      assert.equal(w.calls.handovers, 0, label); assert.ok(!w.events.includes("handover"), label);
+      if (label.startsWith("outstanding before")) {
+        noMutation(w);
+        assert.equal(w.spies.begins, 0, label + ": no scope opened"); assert.equal(quiesces, 0, label + ": no quiesce");
+      }
+    } finally { for (const cancel of timers) cancel(); await d.close(); }
+  }
+});
+test("a stop latched during a refused re-inspect is fatal, with no finish and no handover", async () => {
+  const w = await refusedReinspectWithLatch(1);
+  noMutation(w);
+});
+test("after a refusal latches a stop, the next source is never reserved, proved or discarded", async () => {
+  const w = await refusedReinspectWithLatch(2);
+  noMutation(w);
+  assert.deepEqual(w.spies.reserved, []);
+});
+test("shutdown mid-pass starts no new source and leaves the handover to the process exit", async () => {
+  const reads: string[] = [];
+  await withDeletion(3, w => {
+    const base = w.discard;
+    w.discard = (o, path) => { w.parent.abort(); return base(o, path); };
+    const own = w.options.client.getRunOwnership;
+    w.options.client.getRunOwnership = (run, o) => { if (w.spies.begins > 0) reads.push(run); return own(run, o); };
+  }, (w, result) => {
+    // The soft stop is checked at the loop top: the second source is neither kept nor read.
+    assert.equal(result.kept_after_refusal, 0); assert.ok(reads.length > 0 && reads.every(run => run === "run0"), "no authority read for the second source: " + reads.join());
+    assert.equal(w.spies.proofs.length, 1); assert.equal(result.deleted, 1);
+    assert.equal(result.verdict, "partial"); assert.equal(result.reason, "shutdown");
+    assert.deepEqual(w.events, ["begin", "finish"]);
+  });
+});
+test("a path or entry change between the shadow and the recheck keeps the source", async () => {
+  await withDeletion(1, w => {
+    let n = 0;
+    w.mutateSource = s => { if (++n > 1) s.descriptor = "1".repeat(64); };
+  }, (w, result) => {
+    noMutation(w); assert.equal(result.kept_after_refusal, 1); assert.equal(result.verdict, "partial");
+  });
+  await withDeletion(1, w => {
+    let n = 0;
+    w.mutateSource = s => { if (++n > 1) s.sources[0]!.live = true; };
+  }, (w, result) => { noMutation(w); assert.equal(result.kept_after_refusal, 1); });
+});
+
+test("#3851 a deletion re-inspection that is locally short but not partial refuses that source only", async () => {
+  await withDeletion(2, w => {
+    const inspections = [0, 0];
+    w.mutateSource = (s, i) => {
+      // The second inspection of source 0 is the deletion re-inspection: a tree-local shortfall leaves
+      // the inspection non-partial, yet the present source is no longer byte-measured.
+      if (++inspections[i]! === 2 && i === 0) {
+        s.bytesState = "unknown"; s.allocatedBytes = null;
+        s.sources[0]!.allocatedBytes = null; s.sources[0]!.measurementShortfall = "eacces";
+      }
+    };
+  }, (w, result) => {
+    assert.equal(result.would_delete, 2, "the shadow pass saw both sources as measured candidates");
+    assert.equal(result.kept_after_refusal, 1);
+    assert.equal(result.deleted, 1);
+    assert.deepEqual(w.spies.proofs.map(p => p.paths), [["/tree/1"]]);
+    assert.deepEqual(w.spies.discards.map(x => x.opts.epochProof.input.paths), [["/tree/1"]]);
+    assert.ok(w.spies.reserved.every(run => run !== "run0"), "no reservation was taken for the refused source");
+    assert.ok(w.spies.ended.every(e => !e.paths.includes("/tree/0")));
+  });
+});
+
+test("an eligible attested pass with zero admitted candidates reports reclaim_complete without opening a scope", async () => {
+  await withDeletion(0, undefined, (w, result) => {
+    noMutation(w);
+    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+    assert.equal(result.reclaim_bytes_state, "measured"); assert.equal(w.spies.begins, 0);
+    assert.deepEqual(w.events, ["handover"]);
+  });
+  // A source that is not a candidate (live) leaves admits empty too.
+  await withDeletion(1, w => { w.mutateSource = s => { s.sources[0]!.live = true; }; }, (w, result) => {
+    noMutation(w);
+    assert.equal(result.would_delete, 0); assert.equal(result.kept, 1);
+    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+    assert.equal(w.spies.begins, 0); assert.deepEqual(w.events, ["handover"]);
+  });
+});
+test("a takeover whose source use was not ended still counts as deleted, is counted and warns with fixed tokens", async () => {
+  for (const ended of [{ ended: [], kept: ["/tree/0"], endedSlots: [] }, { ended: [], kept: [], endedSlots: [] }]) {
+    const warnings: Array<[string, unknown]> = [];
+    await withDeletion(2, w => {
+      w.options.log = { warn: (message, fields) => { warnings.push([message, fields]); } };
+      const auth = w.options.deletion!.authority as { endSourceUse: unknown };
+      const base = auth.endSourceUse as (p: Iterable<string>, o: unknown) => Promise<unknown>;
+      auth.endSourceUse = async (paths: Iterable<string>, o: unknown) => {
+        const list = [...paths];
+        return list[0] === "/tree/0" ? ended : base(list, o);
+      };
+    }, (_w, result) => {
+      assert.equal(result.deleted, 2, "the delete is not dropped"); assert.equal(result.source_use_not_ended, 1);
+      assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+      assert.deepEqual(warnings, [["pod epoch reclaim: source use not ended after a takeover", { cause: "source_use_not_ended" }]]);
+    });
+  }
+});
+test("a mid-deletion daemon veto stops the loop with the daemon reason and keeps nothing for the unreached sources", async () => {
+  const d = await daemon();
+  try {
+    const w = deletionWorld(3); w.options.dockerHost = d.host;
+    const inner = w.options.git.inspectRetainedSources;
+    let second = 0;
+    w.options.git.inspectRetainedSources = async o => {
+      // The deletion-phase re-inspect of run1 (its shadow inspection was the first).
+      if (o.selector!.runId === "run1" && ++second === 2) { d.veto(); await tick(); await tick(); }
+      return inner(o);
+    };
+    const result = (await runPodEpochShadow(w.options))!;
+    assert.equal(result.deleted, 1, "run0 was deleted before the veto");
+    assert.equal(result.verdict, "partial"); assert.equal(result.reason, "daemon_event");
+    assert.equal(result.kept_after_refusal, 0, "a veto is not a per-source keep");
+    assert.deepEqual(w.spies.reserved, ["run0"], "no later source reaches the reservation");
+    assert.equal(w.spies.proofs.length, 1);
+  } finally { await d.close(); }
+});
+test("a daemon error from a guard that has not aborted still ends the pass with its reason, not a per-source keep", async () => {
+  const w = deletionWorld(3);
+  let armed = false;
+  const guard = { signal: new AbortController().signal, close: async () => {},
+    assertHealthy() { if (armed) throw new PodEpochDaemonError("daemon_event"); } };
+  w.options.openDaemonGuard = async () => guard;
+  const inner = w.options.git.inspectRetainedSources;
+  let second = 0;
+  w.options.git.inspectRetainedSources = async o => {
+    // The deletion-phase re-inspect of run1 (its shadow inspection was the first).
+    if (o.selector!.runId === "run1" && ++second === 2) armed = true;
+    return inner(o);
+  };
+  const result = (await runPodEpochShadow(w.options))!;
+  assert.equal(guard.signal.aborted, false, "the guard never aborted, so no veto listener fired");
+  assert.equal(result.reason, "daemon_event");
+  assert.equal(result.deleted, 1, "run0 was deleted before the error");
+  assert.equal(result.kept_after_refusal, 0, "a daemon error is not a per-source keep");
+  assert.deepEqual(w.spies.reserved, ["run0"], "no later source reaches the reservation");
+  assert.equal(w.spies.discards.length, 1);
+});
+test("a path observed in two groups with a different bare path or selector is demoted and never deleted", async () => {
+  const variants: Array<[string, { barePath: string; attempt: string; runId?: string; generation?: number }]> = [
+    ["bare path", { barePath: "/bare2", attempt: "attempt" }], ["selector", { barePath: "/bare", attempt: "other" }],
+    // A source's run id must equal its group's selector run id to be eligible, so the run id is never the ONLY
+    // demoter: the `priorAdmit.selector.runId` clause is defence in depth behind that eligibility rule and the
+    // `previous.run_id` comparison, and no input isolates it.
+    ["run id only", { barePath: "/bare", attempt: "attempt", runId: "run1" }],
+    ["generation only", { barePath: "/bare", attempt: "attempt", generation: 2 }],
+  ];
+  for (const [label, second] of variants) {
+    await withDeletion(1, w => {
+      w.groups.push({ barePath: second.barePath,
+        selector: { runId: second.runId ?? "run0", generation: second.generation ?? 1, attempt: second.attempt }, paths: ["/tree/0"] });
+      const inner = w.options.git.inspectRetainedSources;
+      w.options.git.inspectRetainedSources = async o => {
+        const r = await inner(o);
+        for (const src of r.sources) src.barePath = o.barePath!;
+        return r;
+      };
+    }, (w, result) => {
+      noMutation(w);
+      assert.equal(result.would_delete, 0, label); assert.equal(result.deleted, 0, label);
+      assert.equal(result.kept, 1, label); assert.equal(w.spies.journalReads.length, 0, label);
+    });
+  }
 });

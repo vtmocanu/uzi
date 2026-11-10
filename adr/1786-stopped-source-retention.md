@@ -158,6 +158,21 @@ below). It returns `covered` only if these checks pass (AI-synced 2026-10-24):
   `.git/modules` store or an index gitlink whose path holds anything but nothing or an empty
   directory is `not_covered`, including under `ignore=all` (set in `.gitmodules` or config),
   since the parent proof says nothing about a submodule's own files, commits or refs;
+- the legacy (non-automatic) proof's hardened `git status --porcelain` read and its
+  `for-each-ref` read of the clone's local refs both leave stderr empty. Any nonempty stderr
+  from either read is `not_covered` (AI-synced 2026-11-10, #4141): Git exits 0 with empty
+  stdout and only warns when it cannot read part of the worktree (`warning: could not open
+  directory 'x/': Permission denied`) or a loose ref (`warning: ignoring broken ref`), so an
+  empty status alone is not proof of a clean tree. No warning text is matched and there is no
+  allowlist, so a benign warning retains conservatively: `core.fsyncObjectFiles=true` in the
+  clone's config (a deprecation warning) makes a clean clone `not_covered` and kept. A
+  CRLF-conversion warning, if `status` emits one, likewise makes the clone `not_covered` and
+  kept; no `core.safecrlf` override is added. The status read still pins
+  `core.excludesFile=/dev/null` but uses capture's HOME and attribute inputs. An unreadable
+  `~/.config/git/attributes` under that HOME can warn when status consults attributes (for
+  example for a stat-dirty tracked file), making even a clean clone `not_covered` and kept. Residual: Git silently
+  omits refs inside an unreadable refs directory (no stderr), so that case is not detected by
+  this rule. The automatic mode, `worktreeStatus` (exit captures) and custody are unchanged;
 - where the final process scan runs, it reaped no writer: a writer reaped after
   the byte checks invalidates them. A writer that writes and exits between reads
   and that scan remains invisible; Codex release instead requires C's live witness;
@@ -196,7 +211,9 @@ Status reads on a kept clone run with `GIT_OPTIONAL_LOCKS=0`, so they never rewr
 index stat cache.
 
 Anything else (unknown, changed, unanchored, unreadable, blocked) is `not_covered` and the
-source is retained. The accepted residuals are stated in `docs/run-recovery.md`: gitignored
+source is retained; on a terminal `record: "none"` exit the clone, its keep flag and the plain
+journal remain, with no stopped marker (AI-synced 2026-11-10, #4141: this includes a read that
+reports a problem on stderr, per the stderr bullet above). The accepted residuals are stated in `docs/run-recovery.md`: gitignored
 files are not covered by any capture; commits reachable only from the reflog (for example
 after `git reset --hard`) are not counted as source; and a bare ref that justified coverage
 can later move (a forge force-push, pin settlement). Refs that exist only because the seed
@@ -256,7 +273,10 @@ positive server evidence that its run is terminal; an absent or released hold is
 - **Actively parked, and the lifecycle evidence for a marker-less source.** An open hold of the
   run means the run is still parked, so `owner_hold_discard` refuses and deletes nothing: this
   is the actively-parked refusal. A local record (`resolve_local_record`) or a live flight also
-  refuses. An absent or released hold is not proof the run is terminal: a hold can be released
+  refuses. Guarded Case B records can now be resolved with `resolve-local-record --case-b`
+  ([ADR-2417](2417-guarded-local-retention.md#amendment-2026-11-10-case-b-local-record-disposition-3885));
+  retiring the record alone grants no source disposal, and the source still needs its own
+  `inspect` disposition and `discard`. An absent or released hold is not proof the run is terminal: a hold can be released
   (claim released, capture available) or never opened (`paused` and `limit_wait` parks,
   recovery-disabled workers) while the run is still parked. Discard of a marker-less canonical
   source therefore requires positive lifecycle evidence (maintainer decision 3, 2026-10-12): the
@@ -511,3 +531,33 @@ Every case keeps the source. What a later run sees depends on where the failure 
 - Operator procedure: `docs/run-recovery.md`, "When a run is stopped by a stale or fenced
   claim" and "Retained sources with no open hold (worker-local inspect and discard)".
 - **Go scratch (#3870).** A Claude run's managed Go work leaf (`<run HOME>/.uzi-go-work/g<N>`) lives inside the run HOME, so terminal HOME cleanup removes the Go-work root with the HOME. This adds no retention gate and changes no source or custody rule here; the leaf is disposable scratch, not a retained source. See the [ADR-1809 amendment](1809-per-run-cache-bounds.md#amendment-3870-park-only-go-scratch).
+
+## Amendment 2026-11-06 — PRD #3431 M1b: the plain discard as the verified-epoch disposal core
+
+Refs [PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b. The invariant above is unchanged:
+a stopped generation's source is kept until disposal, and nothing here broadens the
+operator channel. What changes is that the plain discard (`discardStoppedSource`) is also
+the single disposal core of a gated first-process deletion at a verified pod epoch. The
+mechanism, its crash table and its R9 limits are recorded in the
+[ADR-1783 amendment of the same date](1783-run-quiescence-and-attempt-clone-paths.md).
+
+- **Off by default.** `EPOCH_RECLAIM_DELETION_ENABLED` is `false`, so production startup
+  is shadow-only and every retained source stays as this ADR describes. Activation needs a
+  separate owner co-sign; hosted acceptance is pending.
+- **Plain only.** With an epoch proof, `discardRetainedSource` refuses any mode but
+  `plain`; a `local_protected_discard` source is counted `kept_protected` and keeps the
+  protected operator route.
+- **Attempts only.** The proof names one attempt: `createEpochDiscardProof` refuses a
+  canonical selector and an absent (`[]`) journal before granting a proof (R5). A
+  marker-less kept canonical clone, and any no-key attempt, is `kept_unrecoverable_shape`,
+  so the cross-worker reclaim follow-up under Consequences stays open. A successor's
+  journal is never cleared.
+- **Admitted shapes.** The strict three-key journal `{runId, clonePath, attemptId}` with
+  the ledger `live` (footprint present or missing) or `retired` (footprint missing; the
+  retry skips the retired append), and the explicitly valued `[""]` repair (metadata only).
+  The epoch disposal also refuses non-live/non-retired ledger states (`reclaimed`,
+  `abandoned`), and `[""]` requires the exact retired-empty-journal repair.
+- **Same holds rule, stricter.** Besides a terminal lifecycle and an empty hold list, the
+  epoch path needs a run-wide `run_open_holds` count of exactly 0 for the run.
+- **Process crash only.** No storage or power-loss durability is claimed; the residual
+  window inside the `beginDestructive` save keeps the source retained, with no resolver.

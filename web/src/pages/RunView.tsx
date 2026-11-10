@@ -107,6 +107,7 @@ import { CheckerActivitySummary } from "../components/CheckerActivitySummary";
 import { CodeCrossCheck } from "../components/CodeCrossCheck";
 import { Markdown } from "../components/Markdown";
 import { JobResultPanel } from "./runView/JobResultPanel";
+import { PolicyHoldPanel, isPolicyHeld } from "./runView/PolicyHoldPanel";
 import { Alert, Badge, Button, Card, PageHeader, StatusPill, cx, type BadgeTone } from "../components/ui";
 import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
@@ -456,44 +457,12 @@ export function HealthFlag({ run }: { run: Run }) {
   );
 }
 
-// Only the run state confirms a hold. Delivery telemetry blocks continuation controls;
-// it does not establish a paused state, preservation evidence, or consent.
-function isPolicyHeld(run: Run): boolean {
-  return run.status === "paused" && run.hold_reason === "codex_policy_hold";
-}
-
 function isPolicyPending(run: Run): boolean {
   return !isTerminalRun(run.status) && run.outcome_pending?.reason === "codex_policy_hold_pending";
 }
 
 function policyBlocksContinuation(run: Run): boolean {
   return isPolicyHeld(run) || isPolicyPending(run);
-}
-
-function PolicyHoldPanel({ run }: { run: Run }) {
-  if (!isPolicyHeld(run)) return null;
-  const hold = run.policy_hold;
-  const head = hold?.captured_head;
-  const preservation = head
-    ? hold?.published === true
-      ? "Worker-reported published checkpoint"
-      : "Verified local checkpoint; publication is not confirmed"
-    : hold?.published === false
-      ? "Local-only retention; checkpoint capture is unverified"
-      : "Preservation is unverified";
-  return <Card className="p-4">
-    <h2 className="text-sm font-semibold text-warn">Codex policy hold</h2>
-    <p className="mt-1 text-xs text-muted">{preservation}{head ? <>: <span className="font-mono">{head}</span></> : "."} Preservation evidence was last reported by the worker.</p>
-    <p className="mt-1 text-xs text-muted">
-      {hold?.continuation_mode === "same_conversation"
-        ? "Continuation requires preserving the provider session."
-        : hold?.continuation_mode === "fresh_from_saved_work"
-          ? "Any future continuation would use a fresh conversation from the saved work."
-          : "Continuation requirements are unverified."}
-      {" "}The provider conversation's availability and ability to resume are not confirmed.
-    </p>
-    <p className="mt-1 text-xs text-muted">Resume and policy-specific Stop are unavailable. Cancel remains available to the run owner.</p>
-  </Card>;
 }
 
 // CompletionStatePanel shows bounded server completion fields, with untrusted text
@@ -2525,7 +2494,7 @@ export function RunView() {
     setResumeAnnounce("");
     setParkAnnounce(
       parkKey === "codex_policy_hold"
-        ? "Codex policy hold. Resume and policy-specific Stop are unavailable. The owner can Cancel."
+        ? "Codex policy hold. The owner can choose how to continue, or Cancel. Stop is not available for a policy hold."
         : parkKey === "codex_policy_hold_pending"
           ? "Policy report delivery pending. The server has not confirmed a policy hold. Continuation is blocked pending delivery."
         : parkKey === "followup"
@@ -3100,7 +3069,7 @@ export function RunView() {
       )}
 
 
-      <PolicyHoldPanel run={run} />
+      <PolicyHoldPanel run={run} canSteer={canSteer} refreshRun={refreshRun} />
       {!policyBlocked && <CompletionDecisionPanel
         run={run}
         canSteer={canSteer}

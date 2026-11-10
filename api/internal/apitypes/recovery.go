@@ -250,10 +250,10 @@ const (
 // every SHA must be a 40-char lowercase hex commit id. The answer is a RecoverySettleResponse.
 //
 // Choosing Target: RecoverySettleTargetBranch applies to task runs, the one kind whose
-// runs.branch is set at creation. issue and self_improve runs use
-// RecoverySettleTargetCheckpoint. Every other kind (prompt, ci_fix, mr_rework, ...) leaves
-// runs.branch NULL while live and has no checkpoint target, so it answers retained/not_eligible
-// while live and settles on completion instead.
+// runs.branch is set at creation. issue, self_improve and (since #4116) prompt runs use
+// RecoverySettleTargetCheckpoint, though the worker defers live settle for prompt runs. Every
+// other kind (ci_fix, mr_rework, ...) leaves runs.branch NULL while live and has no checkpoint
+// target, so it answers retained/not_eligible while live and settles on completion instead.
 type RecoveryLiveSettleRequest struct {
 	PredecessorGeneration int64  `json:"predecessor_generation"`
 	SuccessorGeneration   int64  `json:"successor_generation"`
@@ -299,6 +299,17 @@ type RecoveryHoldDTO struct {
 type RecoveryHoldsResponse struct {
 	RunID string            `json:"run_id"`
 	Holds []RecoveryHoldDTO `json:"holds"`
+	// RunOpenHolds is the run-wide count of open holds across every worker and
+	// generation (issue #3431). Present only for a worker that advertised
+	// recovery_run_open_holds_v1 and only when the count was read for a run the caller's
+	// owner owns; absent otherwise (never 0 as a stand-in for unknown).
+	RunOpenHolds *RecoveryRunOpenHolds `json:"run_open_holds,omitempty"`
+}
+
+// RecoveryRunOpenHolds is the run-wide open custody hold count carried by RecoveryHoldsResponse.
+type RecoveryRunOpenHolds struct {
+	RunID string `json:"run_id"`
+	Count int64  `json:"count"`
 }
 
 // RecoveryExactHoldsResponse is the V2-only observation branch of the worker hold endpoint.

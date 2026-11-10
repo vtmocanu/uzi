@@ -1469,3 +1469,183 @@ describe("RunRunner — park, resume, park again (issue #2753)", () => {
     }
   });
 });
+
+// ── Issue #4116 — prompt-kind checkpoint key `uzi/prompt-<run-id>` ──────────────────────────
+//
+// CHARACTERIZATION tests: the worker already clones prompt runs on `uzi/prompt-<run-id>` and
+// publishes their checkpoints, so these are expected to pass on base too. They pin the pause-park
+// and fresh-worker recovery behaviour that the server-side checkpoint key for prompt runs relies on.
+describe("RunRunner — prompt-kind pause park and recovery (issue #4116, characterization)", () => {
+  const rd = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+  const isAncestor = (dir: string, a: string, d: string): boolean => {
+    try { rd(dir, "merge-base", "--is-ancestor", a, d); return true; } catch { return false; }
+  };
+  const promptClaim = (n: number, extra: Record<string, unknown> = {}) =>
+    gitlabClaim(n, { kind: "prompt", issue_iid: null, issue_description: "Do the prompt task.", ...extra });
+  const refFor = (runId: string): string => `refs/uzi-checkpoints/uzi/prompt-${runId}`;
+  const del = (ref: string): void => {
+    try { rd(fx.originPath, "update-ref", "-d", ref); } catch { /* absent */ }
+  };
+
+  /** Publish stub: records the call and the states already reported at publish time, applies the
+   *  pack to the origin at the prompt checkpoint ref when it answers published. */
+  function promptPublish(runId: string, answer: "published" | "unsupported") {
+    const calls: Array<{ tipOid: string; statusesAtPublish: string[] }> = [];
+    const orig = client.publishCheckpoint.bind(client);
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      id: string, tipOid: string, pack: Readable,
+    ) => {
+      const bytes = await drain(pack);
+      calls.push({ tipOid, statusesAtPublish: stateStatuses(id) });
+      if (answer === "unsupported") return { ok: true, body: { published: false, ref: "", skipped: "unsupported" } };
+      execFileSync("git", ["-C", fx.originPath, "index-pack", "--stdin", "--fix-thin"], { env: GIT_ENV, input: bytes });
+      rd(fx.originPath, "update-ref", refFor(runId), tipOid);
+      return { ok: true, body: { published: true, ref: refFor(runId) } };
+    };
+    return { calls, restore: () => { (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig; } };
+  }
+
+  for (const mode of ["now", "milestone"] as const) {
+    for (const answer of ["published", "unsupported"] as const) {
+      it(`${mode} pause: ${answer === "published" ? "reports paused only after the publish" : "an unsupported publish reports pause_failed and the run continues"}`, async () => {
+        const { gitlab, calls: mrCalls } = fakeGitlab();
+        const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-4116-pause-"));
+        const claim = promptClaim(4116_100 + (mode === "now" ? 0 : 1) + (answer === "published" ? 0 : 2));
+        const pub = promptPublish(claim.run_id, answer);
+        const seen: { branch?: string; tip?: string; parked?: boolean } = {};
+        try {
+          const factory: ExecutorFactory = (runId) => ({
+            homeDir: path.join(homeRoot, runId),
+            executor: { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+              seen.branch = ctx.branch;
+              commitInTree(ctx.worktreePath, "WORK.txt", `${mode} prompt work\n`);
+              if (mode === "milestone") await ctx.checkpoint?.({ reap: false });
+              seen.tip = rd(ctx.worktreePath, "rev-parse", "HEAD");
+              const at = mode === "now" ? { completedCount: 0 } : { completedCount: 2, total: 3 };
+              seen.parked = await ctx.parkForPause?.(at);
+              return seen.parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+            } },
+          });
+          await runnerWithGit(factory, gitlab).execute(claim);
+
+          assert.equal(seen.branch, `uzi/prompt-${claim.run_id}`);
+          const statuses = stateStatuses(claim.run_id);
+          assert.equal(pub.calls.length >= 1, true, "the pause tried to publish a checkpoint first");
+          assert.equal(pub.calls[0]!.tipOid, seen.tip, "the checkpoint carries the work committed before the pause");
+          assert.equal(pub.calls[0]!.statusesAtPublish.includes("paused"), false, "nothing is reported paused before the publish");
+          if (answer === "published") {
+            assert.equal(seen.parked, true);
+            assert.equal(mrCalls.length, 0, "a parked run opens no merge request");
+            assert.ok(statuses.includes("paused"));
+            assert.ok(!statuses.includes("pause_failed") && !statuses.includes("completed") && !statuses.includes("failed"));
+            assert.equal(rd(fx.originPath, "rev-parse", refFor(claim.run_id)), seen.tip, "published to uzi/prompt-<run-id>");
+          } else {
+            assert.equal(seen.parked, false, "no durable checkpoint, so no park");
+            assert.ok(statuses.includes("pause_failed"), `got ${JSON.stringify(statuses)}`);
+            assert.ok(!statuses.includes("paused"));
+            assert.ok(statuses.includes("completed"), "the run continued and finalized");
+          }
+        } finally {
+          pub.restore();
+          del(refFor(claim.run_id));
+          del(`refs/heads/uzi/prompt-${claim.run_id}`); // the continued run finalizes and pushes its branch
+          fs.rmSync(homeRoot, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+
+  /** A first park's wip(park) marker M (parent R) published at the prompt checkpoint ref, no origin branch. */
+  function seedMarker(runId: string, homeRoot: string): { r: string; m: string; ref: string; branch: string; key: string } {
+    const ref = refFor(runId);
+    const seedDir = path.join(homeRoot, "seed");
+    execFileSync("git", ["clone", "-q", fx.originPath, seedDir], { env: GIT_ENV });
+    const r = rd(seedDir, "rev-parse", "HEAD");
+    fs.writeFileSync(path.join(seedDir, "wip.txt"), "parked prompt work\n");
+    rd(seedDir, "add", "-A");
+    rd(seedDir, ...IDENT, "commit", "-m", "wip(park): interrupted work auto-saved (test)");
+    const m = rd(seedDir, "rev-parse", "HEAD");
+    rd(seedDir, "push", "-q", "origin", `${m}:${ref}`);
+    return { r, m, ref, branch: `uzi/prompt-${runId}`, key: `uzi-prompt-${runId}` };
+  }
+
+  async function freshWorker(homeRoot: string, label: string) {
+    const data = path.join(homeRoot, label);
+    fs.mkdirSync(data, { recursive: true });
+    const g = new GitCache(data, nullLogger(), undefined, testGitCacheOptions());
+    return { g, bare: await g.ensureClone(fx.originPath) };
+  }
+
+  it("a fresh worker resuming a prompt run with no origin branch seeds from the checkpoint and restores the parked work uncommitted at R", async () => {
+    const runId = "41160000-0000-4000-8000-00000000a001";
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-4116-resume-"));
+    try {
+      const s = seedMarker(runId, homeRoot);
+      const { g, bare } = await freshWorker(homeRoot, "worker-b");
+      const rc = await g.runnerCloneForBranch(bare, s.branch, s.key, noProofReseed, runId, true, s.m);
+      assert.equal(rc.seededFrom, "checkpoint");
+      assert.equal(rd(rc.path, "rev-parse", "HEAD"), s.r, "HEAD is the marker's recovered parent R");
+      assert.match(rd(rc.path, "status", "--porcelain"), /wip\.txt/, "the parked work is uncommitted");
+      assert.equal(fs.readFileSync(path.join(rc.path, "wip.txt"), "utf8"), "parked prompt work\n");
+      assert.equal(isAncestor(bare, s.m, rd(rc.path, "rev-parse", "HEAD")), false, "the marker is not in the branch history");
+    } finally {
+      del(refFor(runId));
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("boundary: a checkpoint ref disjoint from the default history is ignored", async () => {
+    const runId = "41160000-0000-4000-8000-00000000a002";
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-4116-disjoint-"));
+    try {
+      const ref = refFor(runId);
+      const tree = rd(fx.originPath, "hash-object", "-t", "tree", "-w", "--stdin");
+      const orphan = execFileSync("git", ["-C", fx.originPath, ...IDENT, "commit-tree", tree, "-m", "unrelated root"],
+        { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+      rd(fx.originPath, "update-ref", ref, orphan);
+      const { g, bare } = await freshWorker(homeRoot, "worker-b");
+      const rc = await g.runnerCloneForBranch(bare, `uzi/prompt-${runId}`, `uzi-prompt-${runId}`, noProofReseed, runId, true, orphan);
+      assert.equal(rc.seededFrom, "default", "seeds off the default branch");
+      assert.equal(rd(rc.path, "rev-parse", "HEAD"), rd(fx.originPath, "rev-parse", "HEAD"), "HEAD is the default tip");
+    } finally {
+      del(refFor(runId));
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("boundary: an owner anchor that differs from the checkpoint ref is not adopted", async () => {
+    const runId = "41160000-0000-4000-8000-00000000a003";
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-4116-anchor-"));
+    try {
+      const s = seedMarker(runId, homeRoot);
+      const { g, bare } = await freshWorker(homeRoot, "worker-b");
+      const rc = await g.runnerCloneForBranch(bare, s.branch, s.key, noProofReseed, runId, true, s.r);
+      assert.notEqual(rc.seededFrom, "checkpoint");
+      assert.equal(rd(rc.path, "rev-parse", "HEAD"), s.r);
+      assert.equal(fs.existsSync(path.join(rc.path, "wip.txt")), false, "the foreign checkpoint's work is not restored");
+    } finally {
+      del(refFor(runId));
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("boundary: an origin uzi/prompt-<id> branch equal to the checkpoint falls through to the origin seed", async () => {
+    const runId = "41160000-0000-4000-8000-00000000a004";
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-4116-origin-"));
+    const branch = `uzi/prompt-${runId}`;
+    try {
+      const s = seedMarker(runId, homeRoot);
+      rd(fx.originPath, "update-ref", `refs/heads/${branch}`, s.m);
+      const { g, bare } = await freshWorker(homeRoot, "worker-b");
+      const rc = await g.runnerCloneForBranch(bare, branch, s.key, noProofReseed, runId, true, s.m);
+      assert.equal(rc.seededFrom, "origin");
+      assert.equal(rd(rc.path, "rev-parse", "HEAD"), s.m, "the published branch wins; nothing is unwrapped from the equal checkpoint");
+    } finally {
+      del(refFor(runId));
+      del(`refs/heads/${branch}`);
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});

@@ -125,7 +125,8 @@ practice this means an issue run whose branch (keyed on the issue) a later
 run on the same issue reuses; a self-improve run's checkpoint branch is
 keyed on its own run id (`uzi/self-improve/<run-id>`), so no two
 self-improve runs ever share a branch and supersession never triggers for
-that kind. Under the old run's retention lock:
+that kind (the same holds for prompt runs, keyed `uzi/prompt-<run-id>` since
+#4116). Under the old run's retention lock:
 
 1. **persist the intent first**: `retained` → `superseding`, recording the
    recovery ref name `refs/uzi-recovery/<old-run-id>` and the expected tip,
@@ -183,7 +184,8 @@ retained checkpoint. A migration-00266 (draft number; renumbered at merge)
 `checkpoint_retentions` row in the SAME transaction as every terminal
 transition — `retained` while a custody hold is open, else `settling`, the
 branch derived exactly as `checkpointBranch` does (kind first: an issue run
-with an iid, or a self-improve run keyed on its own run id) — so any reader
+with an iid, or a self-improve run keyed on its own run id; since #4116 also a
+prompt run keyed `uzi/prompt-<run-id>`) — so any reader
 that observes the terminal status also observes the row, with no writer
 able to skip it. Because no new issue run exists until the old one is
 terminal (`uq_runs_one_active_per_issue`, migration 00170), no branch lock

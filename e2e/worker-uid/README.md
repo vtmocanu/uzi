@@ -1,7 +1,7 @@
 # Worker UID test lane
 
 `task test:agent:worker-uid` builds the base worker image and runs the ownership and cleanup
-leaves from ten test files through its root entrypoint, which drops to the worker UID with runner
+leaves from eleven test files through its root entrypoint, which drops to the worker UID with runner
 group membership and the production ambient capabilities. It runs offline, with
 disposable data and Nix mounts, and removes only its own containers and their
 anonymous volumes and its two named tool volumes after checking exact resource
@@ -99,7 +99,9 @@ An eighth file, `e2e/worker-uid/claude-command-real.test.mts`, contributes twelv
 
 A tenth file, `agent/test/code-cross-check-replay-uid-split.test.ts`, contributes one `INIT_SKIP`-gated leaf for the offline code cross-check replay (issue #3357): the real Codex fileop helper, launched as the command uid, stats and reads a file of the replay snapshot, while uid 10003 and the runner uid are denied (DAC) on the records file (created through the CLI's own helper), on listing the replay run directory, and on the replay-work repository. It calls no provider or model.
 
-The default inventory retains the five old files and adds the retained recovery file, the claude-command-launcher file (its three literal leaves above), the claude-command-real file (its twelve), the ninth file `codex-capture-reaper-real` and the tenth file `code-cross-check-replay-uid-split`; `node e2e/worker-uid/inventory.mjs command` emits the separate command
+An eleventh file, `agent/test/stopped-source-unreadable-uid.test.ts`, contributes eight literal leaves under the single `INIT_SKIP`-gated suite `stopped-source legacy proof with entries the runner cannot read` (issue #4141). Each leaf builds a fresh covered fixture with a real `GitCache`: the worker bare, a runner-owned canonical clone seeded by the production path, its plain journal and a runner-made commit fetched back so the head is anchored. It then calls `verifyStoppedSourceCovered` with a quiescence callback that answers true. Four negative leaves must be `not_covered` and log the stderr warning with a nonempty `stderr` field: a nonignored untracked directory the runner made unreadable (which also checks that the status read is dispatched through the runner setpriv wrapper, not a worker-boundary or command identity), a modified tracked file in a runner-unreadable tracked directory, a nonignored mode 0700 directory created by the command uid 10003 inside the clone, and a runner-unreadable loose ref naming a commit only the clone holds. Three controls must stay `covered` with no stderr warning: a stat-dirty tracked file with unchanged content under the image-provided HOME, and an unreadable directory matched by a committed `.gitignore` or by `.git/info/exclude`. One more leaf appends a deprecated config key to the clone and expects the conservative `not_covered` with its warning. The inventory requires exactly one UID gate and all eight literals under that suite; a missing, renamed, nonliteral, nested, duplicate or ungated leaf fails closed.
+
+The default inventory retains the five old files and adds the retained recovery file, the claude-command-launcher file (its three literal leaves above), the claude-command-real file (its twelve), the ninth file `codex-capture-reaper-real`, the tenth file `code-cross-check-replay-uid-split` and the eleventh file `stopped-source-unreadable-uid`; `node e2e/worker-uid/inventory.mjs command` emits the separate command
 inventory and `node e2e/worker-uid/inventory.mjs single` the single-uid inventory. `expected.json` / `results.xml`, `command-expected.json` /
 `command-results.xml` and `single-expected.json` / `single-<n>-results.xml` are checked separately. The JUnit
 checker requires each leaf exactly once and

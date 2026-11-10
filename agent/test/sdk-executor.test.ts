@@ -5581,8 +5581,8 @@ describe("plan-turn write-tool subtraction (#203)", () => {
     // is wrong: implementOptions spreads baseOptions, so it would deny the write tools
     // for the whole run. Pinning BOTH turns is what makes that a red rather than a
     // silently-passing alternative implementation.
-    assert.deepStrictEqual(plan.disallowedTools, ["ScheduleWakeup", "CronCreate"]);
-    assert.deepStrictEqual(impl.disallowedTools, ["ScheduleWakeup", "CronCreate"]);
+    assert.deepStrictEqual(plan.disallowedTools, ["ScheduleWakeup", "CronCreate", "AskUserQuestion"]);
+    assert.deepStrictEqual(impl.disallowedTools, ["ScheduleWakeup", "CronCreate", "AskUserQuestion"]);
   });
 
   it("a REVISE round is a planning turn too: the second plan turn carries the same subtraction", async () => {

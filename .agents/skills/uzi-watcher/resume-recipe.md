@@ -129,7 +129,7 @@ cd <the repo>                              # your normal checkout; work happens 
    git log  --name-only origin/main..HEAD -- .github/workflows/
    git diff --name-only origin/main..HEAD -- api/internal/store/migrations/   # renumber if non-empty (task migration:renumber)
    git rev-list --count origin/main..HEAD                                     # the range length: must be > 0, and must equal the scan's "N commits scanned" line below
-   go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --log-opts="origin/main..HEAD" --no-banner --ignore-gitleaks-allow   # EVERY commit in the range (push protection scans them all); pinned like scripts/scan-secrets.sh
+   go run "github.com/zricethezav/gitleaks/v8@$(sed -n 's/^  GITLEAKS_VERSION: "\(.*\)"$/\1/p' Taskfile.yml)" git --log-opts="origin/main..HEAD" --no-banner --ignore-gitleaks-allow   # EVERY commit in the range (push protection scans them all); pinned like scripts/scan-secrets.sh
    ```
    Read the scan by its two lines, not by its exit code: `N commits scanned.` must match the
    `rev-list` count (measured on 8.30.1: an unresolved `origin/main` prints a git `fatal`,

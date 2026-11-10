@@ -478,6 +478,16 @@ the next gate.
 [CLI](./cli.md#plan-cross-check-evidence) shows the reason and findings;
 [Slack](./slack.md#using-it) shows the reason without findings.
 
+## Codex Plan verdict output
+
+The Codex Plan checker requests a JSON verdict using the expected schema.
+The worker still validates the complete final text: prose, Markdown fences,
+invalid verdicts and results over the UTF-8 byte caps fail as malformed. The
+schema does not replace those checks or add retries, rounds or fallback.
+Code checks and the Claude policy below are unchanged. See
+[ADR-2149's #4103 amendment](../adr/2149-cross-check.md#amendment-2026-11-09--4103-codex-plan-output-schema)
+for the evidence and pending hosted owner acceptance.
+
 ## Claude checker isolation
 
 The Claude checker's repository access tools are `Read`, `Grep` and `Glob`: no
@@ -915,6 +925,12 @@ then report missing or partly delivered criteria:
 - Use minor `Coverage uncertainty:` findings for hosted, live or maintainer-only
   verification. Grade missing worker-deliverable implementation or regression
   tests by impact.
+- The worker's own command results (gate, build, lint, test, red/green and
+  mutation runs, and their logs) are not supplied to the checker. Their absence
+  alone is neither a defect nor a criterion finding, and run results claimed in
+  committed text or the plan are unverified claims, not evidence. A criterion
+  that itself requires a run result gets a minor `Coverage uncertainty:`
+  finding. Tests and validation are judged from the committed code.
 - Treat a missing requirement stated by the issue as a safety, security or
   data-integrity constraint as a critical or major defect, without either prefix.
   Defect titles must not use criterion prefixes.

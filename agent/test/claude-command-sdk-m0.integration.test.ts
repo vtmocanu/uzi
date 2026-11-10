@@ -219,6 +219,10 @@ interface Scenario {
   abortAfterHandler?: boolean;
   /** Control scenario: no guardedCommand, no sentinel server, native Bash runs (calibrates the marker). */
   control?: boolean;
+  /** Issue #4149: set an allow-all canUseTool (the condition under which the CLI offers native AskUserQuestion). */
+  canUseTool?: true;
+  /** Issue #4149: edit the production query-level disallowedTools by exactly these entries. */
+  denyDelta?: { add?: string[]; remove?: string[] };
 }
 
 const DENY_MARK = "DENYME";
@@ -342,6 +346,11 @@ async function runScenario(sc: Scenario, roots: string[]): Promise<ScenarioResul
   };
   const controller = new AbortController();
   const options: Options = { ...buildSdkOptions(cfg), abortController: controller };
+  if (sc.canUseTool) options.canUseTool = async (_name, input) => ({ behavior: "allow", updatedInput: input });
+  if (sc.denyDelta) {
+    const drop = new Set(sc.denyDelta.remove ?? []);
+    options.disallowedTools = [...(options.disallowedTools ?? []).filter((t) => !drop.has(t)), ...(sc.denyDelta.add ?? [])];
+  }
   // The skills plugin needs a materialized plugin dir; irrelevant to routing, so leave it out.
   delete options.plugins;
   const budget = setTimeout(() => controller.abort(), DRIVE_BUDGET_MS);
@@ -421,6 +430,12 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
     { name: "INHERIT", agents: pick(shapedRoster, "coder"), serverTimeout: 120_000, behave: okBehave, script: subScript("coder", "INHERIT", false) },
     { name: "EXPLICIT", agents: pick(shapedRoster, "reviewer"), serverTimeout: 120_000, behave: okBehave, script: subScript("reviewer", "EXPLICIT", true) },
     { name: "PLAN", agents: pick(planRoster, "architect"), serverTimeout: 120_000, behave: okBehave, script: subScript("architect", "PLAN", false) },
+    // Issue #4149 calibration pairs: each differs from its partner by exactly one deny entry.
+    // INHERIT and EXPLICIT above are the production-option baselines of the two subagent pairs.
+    { name: "AUQ_LEAD_BASE", canUseTool: true, denyDelta: { remove: ["AskUserQuestion"] }, serverTimeout: 120_000, behave: okBehave, script: () => ({ kind: "text", text: "lead done" }) },
+    { name: "AUQ_LEAD_PROD", canUseTool: true, serverTimeout: 120_000, behave: okBehave, script: () => ({ kind: "text", text: "lead done" }) },
+    { name: "INHERIT_DENY", agents: pick(shapedRoster, "coder"), denyDelta: { add: ["Write"] }, serverTimeout: 120_000, behave: okBehave, script: subScript("coder", "INHERIT_DENY", false) },
+    { name: "EXPLICIT_DENY", agents: pick(shapedRoster, "reviewer"), denyDelta: { add: ["WebFetch"] }, serverTimeout: 120_000, behave: okBehave, script: subScript("reviewer", "EXPLICIT_DENY", true) },
     {
       name: "ABORT",
       serverTimeout: 120_000,
@@ -501,8 +516,8 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
     result("1-cli", { sdkInit: lead.initVersion });
     // A bump of either pin invalidates this proof: re-run M0 for the new SDK before changing the pins.
     const sdkPkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "node_modules", "@anthropic-ai", "claude-agent-sdk", "package.json"), "utf8")) as { version: string };
-    assert.equal(sdkPkg.version, "0.3.310", "installed SDK package version changed: re-run M0 for the new SDK");
-    assert.equal(lead.initVersion, "2.1.310", "bundled CLI version changed: re-run M0 for the new SDK");
+    assert.equal(sdkPkg.version, "0.3.316", "installed SDK package version changed: re-run M0 for the new SDK");
+    assert.equal(lead.initVersion, "2.1.316", "bundled CLI version changed: re-run M0 for the new SDK");
     for (const r of [lead, inherit, explicit]) {
       result("1-offered", {
         scenario: r.name,
@@ -698,5 +713,34 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
       head: text.slice(0, 200),
     });
     assert.ok(obs, `the CJK result never reached the model${diag(r)}`);
+  });
+
+  // Issue #4149: the run lane denies native AskUserQuestion at query level. The lead pair is
+  // calibrated on AskUserQuestion itself (offered once canUseTool is set). The pinned CLI never
+  // offers it to a subagent, so subagent propagation of a query-level deny is calibrated on
+  // stand-in native tools: Write for the inherit-all coder, the explicitly granted WebFetch for
+  // the reviewer (read from the offered roster only, never called). Version-agnostic on purpose.
+  it("item 10: query-level disallowedTools removes native AskUserQuestion from the lead and reaches both subagent kinds", { timeout: 120_000 }, () => {
+    const pairs = [
+      { who: "lead", tool: "AskUserQuestion", base: get("AUQ_LEAD_BASE").offered.lead, deny: get("AUQ_LEAD_PROD").offered.lead },
+      { who: "inherit-all subagent", tool: "Write", base: get("INHERIT").offered.sub, deny: get("INHERIT_DENY").offered.sub },
+      { who: "explicit-grant subagent", tool: "WebFetch", base: get("EXPLICIT").offered.sub, deny: get("EXPLICIT_DENY").offered.sub },
+    ];
+    const subs = { INHERIT: get("INHERIT").offered.sub, EXPLICIT: get("EXPLICIT").offered.sub };
+    result("10", {
+      pairs: pairs.map((p) => ({ who: p.who, tool: p.tool, offeredWithoutDeny: p.base?.includes(p.tool), offeredWithDeny: p.deny?.includes(p.tool) })),
+      // Tripwire, uncalibrated: the pinned CLI never offers AskUserQuestion to a subagent.
+      askUserQuestionOfferedToSubagent: Object.fromEntries(Object.entries(subs).map(([k, v]) => [k, v?.includes("AskUserQuestion")])),
+    });
+    for (const p of pairs) {
+      assert.ok(p.base, `${p.who}: the baseline made no request`);
+      assert.ok(p.base.includes(p.tool), `${p.who}: ${p.tool} not offered without the deny, so its absence would prove nothing: ${p.base.join(",")}`);
+      assert.ok(p.deny, `${p.who}: the deny run made no request`);
+      assert.ok(!p.deny.includes(p.tool), `${p.who}: ${p.tool} still offered under the query-level deny: ${p.deny.join(",")}`);
+    }
+    for (const [name, tools] of Object.entries(subs)) {
+      assert.ok(tools, `${name}: the subagent made no request`);
+      assert.ok(!tools.includes("AskUserQuestion"), `${name}: AskUserQuestion offered to a subagent under production options: ${tools.join(",")}`);
+    }
   });
 });

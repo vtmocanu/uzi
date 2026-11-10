@@ -228,7 +228,7 @@
     "eligible": false
   },
   {
-    "name": "unsupported",
+    "name": "prompt",
     "nodes": [
       {
         "id": "11111111-1111-4111-8111-111111111111",
@@ -236,9 +236,9 @@
         "branch": null
       }
     ],
-    "work_branch": null,
-    "checkpoint_key": null,
-    "eligible": false
+    "work_branch": "uzi/prompt-11111111-1111-4111-8111-111111111111",
+    "checkpoint_key": "uzi/prompt-11111111-1111-4111-8111-111111111111",
+    "eligible": true
   },
   {
     "name": "mismatched issue branch",

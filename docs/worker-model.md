@@ -144,7 +144,7 @@ preference until you save a change; there is no new CLI command.
 
 ## Custom Codex model
 
-Codex's dropdown offers the curated `gpt-6-astra`, `gpt-5.6-sol` and
+Codex's dropdown offers the curated `gpt-6-astra`, `gpt-5.6-sol`,
 `gpt-6-sol` and `gpt-6.1-sol`, plus **Other (custom model ID)**, the same escape hatch
 Claude has always had. uzi validates the string for length and unsafe
 characters but makes no provider call at save time; an unavailable or
@@ -291,7 +291,7 @@ Where to see it:
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.164.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.166.0 and defaults to `gpt-6.1-sol`
 when no schedule model, worker-model override or lead Codex pin is set.
 Explicit model preferences remain unchanged. Both harnesses inherit medium
 reasoning effort; Claude and Codex keep separate overrides, and each can

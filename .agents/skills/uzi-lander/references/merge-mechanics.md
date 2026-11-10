@@ -55,7 +55,7 @@ stop rather than forcing.
   - `main` is not red. No required check on its current tip has failed. Its latest
     completed, non-cancelled required CI result passed, judged across the whole required
     check set, not a single green job or a partial dispatch. An in-progress tip does not
-    block (main CI cancels in-progress runs on every push). Any observed required-check
+    block: it has no verdict yet, so the latest completed result decides. Any observed required-check
     failure does, except for the fix itself, even while sibling jobs still run. A later-finishing rerun on
     an older SHA never hides a failure on a newer `main` commit. If the result cannot be
     established, wait. Leave at least 5 minutes between merges to `main`, and follow a merge

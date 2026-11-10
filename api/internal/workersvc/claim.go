@@ -70,9 +70,35 @@ type ClaimPayload struct {
 	// it under a per-prompt nonce fence (M4).
 	ReviewComments *ReviewCommentsSnapshot `json:"review_comments,omitempty"`
 	Status         string                  `json:"status"`
-	Branch         *string                 `json:"branch"`                   // resume: attach existing branch
-	SessionID      *string                 `json:"session_id"`               // resume: continue SDK session
-	CheckpointTip  *string                 `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
+	Branch         *string                 `json:"branch"`     // resume: attach existing branch
+	SessionID      *string                 `json:"session_id"` // resume: continue SDK session
+	// PolicyPreserveOnly is true iff the run still carries the compact policy preserving
+	// constraint (runs.policy_preserve_required). PolicyExpectedHead is the required recovery
+	// head (runs.policy_required_head) when that constraint holds and a head is recorded. Both
+	// are omitted otherwise, so an unconstrained claim stays byte-identical to today's wire.
+	PolicyPreserveOnly bool    `json:"policy_preserve_only,omitempty"`
+	PolicyExpectedHead *string `json:"policy_expected_head,omitempty"`
+	// PolicyResumeInputsPending selects the initial input-delivery barrier while a resolved policy
+	// episode still has Resume guidance owed, even with no captured head. Modern applied-but-unincluded
+	// rows remain owed. It grants no session/Fresh authority; omitted once included or on ordinary claims.
+	PolicyResumeInputsPending bool `json:"policy_resume_inputs_pending,omitempty"`
+	// PolicyResumeContextPending carries earlier owner history into a resolved policy episode's
+	// fresh conversation until a session is reported. It is context only, never Fresh authority.
+	PolicyResumeContextPending bool `json:"policy_resume_context_pending,omitempty"`
+	// PolicySavedWorkHead is the required recovery head of a run that is NOT preserving (its
+	// episode was resolved fresh_from_saved_work) but whose saved work must still be proven to
+	// contain it. Lowercase 40/64-hex; omitted otherwise. Mutually exclusive with PolicyExpectedHead.
+	PolicySavedWorkHead *string `json:"policy_saved_work_head,omitempty"`
+	// PolicyFreshSession is true only for the one claim that consumed a compatible-lane one-claim
+	// Fresh authorization and whose new conversation no current-generation report has confirmed yet
+	// (runs.policy_fresh_consumed_generation = this claim's generation, confirmed distinct, still
+	// preserving). The agent may start exactly one new conversation for it. Omitted otherwise.
+	PolicyFreshSession bool `json:"policy_fresh_session,omitempty"`
+	// PolicyFreshUnconfirmed is true on a LATER claim of a preserving run whose earlier claim consumed
+	// the one-claim Fresh authorization and never confirmed a new conversation: a new conversation may
+	// already exist, so the agent re-holds as fresh_start_uncertain instead of resuming or starting one.
+	PolicyFreshUnconfirmed bool    `json:"policy_fresh_unconfirmed,omitempty"`
+	CheckpointTip          *string `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
 	// CheckpointAttestedSource (issue #3194) is the source OID a flight of THIS run published
 	// after its --require-base guard strictly accepted (runs.checkpoint_attested_source, set-only).
 	// A continuation may adopt exactly this source. nil (omitted) for legacy, unattested and

@@ -2,6 +2,7 @@ import {
   type AdminUsage,
   type AgentSelectionInput,
   type MilestoneResetOptions,
+  type PolicyHoldResumeRequest,
   type CredentialEpoch,
   type CredentialOverride,
   type Harness,
@@ -356,7 +357,8 @@ function mockAdminListRuns(params?: {
   view?: "summary";
 }): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {
   const items = listRunsFor()
-    .filter((r) => r.kind !== "chat" && r.kind !== "cross_check")
+    // Like the real ListActiveRunsAll: no chat, judge or cross-check runs (#3987).
+    .filter((r) => !["chat", "judge", "cross_check"].includes(r.kind))
     .filter((r) => !["completed", "failed", "cancelled"].includes(r.status))
     // Owner attribution: the mock's owner column is mockOtherRunOwners; every
     // other run belongs to the session admin. Before this map existed, EVERY
@@ -682,6 +684,8 @@ export const runsApi = {
           last7_run_count: 7,
           pr_count: 24,
           last7_pr_count: 5,
+          harness_runs: { claude: 22, codex: 9 },
+          last7_harness_runs: { claude: 5, codex: 2 },
           last7_subscription_run_count: 3,
           last7_unreported_run_count: 0,
           last7_outcomes: { finished: 9, completed: 7, cancelled: 0, plan_rejected: 1, base_diverged: 0, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
@@ -692,6 +696,8 @@ export const runsApi = {
           last7_run_count: 6,
           pr_count: 18,
           last7_pr_count: 4,
+          harness_runs: { claude: 15, codex: 8 },
+          last7_harness_runs: { claude: 4, codex: 2 },
           last7_subscription_run_count: 2,
           last7_unreported_run_count: 1,
           last7_outcomes: { finished: 8, completed: 6, cancelled: 1, plan_rejected: 0, base_diverged: 0, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
@@ -702,6 +708,8 @@ export const runsApi = {
           last7_run_count: 6,
           pr_count: 14,
           last7_pr_count: 4,
+          harness_runs: { claude: 12, codex: 7 },
+          last7_harness_runs: { claude: 3, codex: 3 },
           last7_subscription_run_count: 0,
           last7_unreported_run_count: 0,
           last7_outcomes: { finished: 7, completed: 6, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 1, needs_landing: 0, fail_origins: {"run_timeout": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
@@ -712,6 +720,9 @@ export const runsApi = {
           last7_run_count: 1,
           pr_count: 5,
           last7_pr_count: 1,
+          // Claude-only: the share bar is solid Claude, 100 / 0.
+          harness_runs: { claude: 6, codex: 0 },
+          last7_harness_runs: { claude: 1, codex: 0 },
           last7_subscription_run_count: 0,
           last7_unreported_run_count: 0,
           last7_outcomes: { finished: 1, completed: 1, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 0, needs_landing: 0, fail_origins: {}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
@@ -1029,6 +1040,24 @@ export const runsApi = {
       throw new ApiError(409, "run is not waiting for a pooled token");
     patchRun(id, { status: "queued", updated_at: new Date().toISOString() });
     return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
+  // Issue #3607: the owner's choice on a Codex policy hold. Mirrors the server's fences:
+  // the run must be paused on that hold, the mode must be one the episode offers, and
+  // expected_episode_id must name the current episode; otherwise the 409 the panel shows.
+  resumePolicyHold: async (id: string, body: PolicyHoldResumeRequest) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    const hold = run.policy_hold;
+    if (run.status !== "paused" || run.hold_reason !== "codex_policy_hold" || !hold ||
+      hold.outcome_id !== body.expected_episode_id || !(hold.resume_modes ?? []).includes(body.mode))
+      throw new ApiError(409, "policy hold changed or does not match this mode; refresh the run and choose again");
+    const now = new Date().toISOString();
+    patchRun(id, { status: "queued", hold_reason: null, updated_at: now, status_since: now,
+      policy_hold: { ...hold, resolved_at: now, resume_modes: [],
+        pending_fresh: body.mode === "fresh_one_claim",
+        continuation_mode: body.mode === "preserve" ? "same_conversation" : "fresh_from_saved_work" } });
+    return delay({ run: { ...getRun(id)! } }, 120);
   },
 
   // PRD #1190: request a pause / withdraw one. Route through the engine's handleInput so

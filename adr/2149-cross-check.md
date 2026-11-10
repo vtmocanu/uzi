@@ -392,6 +392,18 @@ inputs and baseline hashes are unchanged; only revised brief hashes are repinned
 M1 baseline and M3b replay/hosted verification remain maintainer follow-ups; this
 amendment claims neither detection improvement nor hosted acceptance.
 
+#### Worker run evidence (2026-11-09, self-improvement)
+
+The code brief now states that the worker's own command results (gate, build,
+lint, test, red/green and mutation runs, and their logs) are not supplied. Their
+absence alone is neither a defect nor a criterion finding; run results claimed in
+committed text or the plan are unverified claims, not evidence. A criterion that
+itself requires a run result gets a minor Coverage uncertainty: finding, and
+tests are judged from the committed code. Motive: findings that only reported
+invisible run evidence cost a repair turn without a code change. Supplying gate
+records stays parked (PRD #3167 "Gate evidence parked"). Only the revised brief
+hashes are repinned; frozen replay inputs and baseline hashes are unchanged.
+
 ## Amendment 2026-10-31 (#3708)
 
 [PRD #3708](../prds/3708-gated-plan-cross-check.md) revisits the "Human-gated runs"
@@ -762,8 +774,25 @@ silently. Decisions:
 - The verdict is taken from the result's `structured_output` and still passes the unchanged validators, which remain authoritative. Structured output is a retry aid, not a trust boundary.
 - The Code schema leaves coverage unconstrained, because the validator accepts any coverage and the normalizer degrades it.
 - If the SDK exhausts its retries the check fails `malformed` with log subreason `structured_output_retries` and a fixed message.
-- The Codex checker is unchanged.
+- The Codex checker was unchanged by #4038; [#4103 below](#amendment-2026-11-09--4103-codex-plan-output-schema) subsequently adds a Plan-only output schema.
 
-**Evidence.** `agent/test/fixtures/claude-structured-output-0.3.310.json` was captured from the pinned SDK with scripted model turns. Replay tests in `agent/test/claude-structured-output-replay.test.ts` and `agent/test/claude-structured-output.test.ts` exercise it.
+**Evidence.** `agent/test/fixtures/claude-structured-output-0.3.316.json` was recaptured on 2026-11-10 from SDK 0.3.316 / CLI 2.1.316 with scripted model turns. Replay tests in `agent/test/claude-structured-output-replay.test.ts` and `agent/test/claude-structured-output.test.ts` exercise it.
 
 **Rejected alternative.** A manual follow-up turn asking the model to re-emit only the JSON would add a resume path and separate usage accounting; the SDK retry stays inside one session.
+
+## Amendment 2026-11-09 — #4103: Codex Plan output schema
+
+**Context.** A Codex Plan checker could return prose or fenced JSON that failed verdict validation after the review. The #4038 amendment above addressed Claude's verdict carrier; this amendment addresses Codex Plan output separately.
+
+**Decision.** The Codex checker's `turn/start` sends `outputSchema: PLAN_VERDICT_SCHEMA` for the Plan stage in `agent/src/codex/cross-check.ts`. It sends the exact shared schema, retaining `maxLength` (4096 for the summary, 2048 for finding strings) and `maxItems` (20 findings). Code-stage output is unchanged. There is no added retry, checker round or fallback, and Claude's structured-output policy is unchanged.
+
+- The unchanged `validateVerdict` remains authoritative: the summary is capped at 4096 UTF-8 bytes, each serialized finding at 2048 bytes, and the sum of serialized finding sizes at 32 KiB. Schema character limits do not enforce these byte limits. Prose, fences and invalid or oversized verdicts still fail as `malformed`.
+- Only a complete final text rejected at the Codex Plan `validateVerdict` seam gets shape diagnostics attached to the same `CrossCheckMalformedError`, preserving its message and subreason. `final_text_bytes` is its UTF-8 byte length; `final_text_empty` tests exact emptiness; `final_text_starts_with_code_fence` uses the literal `startsWith` test for three backticks, without trimming. Leading whitespace before a fence therefore yields false.
+- The existing malformed-verdict warning in `agent/src/cross-check-runner.ts` is the only production reader of these fields. This diagnostic stores and logs no final text or snippet. Lifecycle, partial-output, cleanup and runner parse/key failures get no shape fields, nor do Claude or Code checks.
+
+**Evidence and limits.** These are separate evidence sources:
+
+- **M1 capture and replay.** [The committed fixture](../agent/test/fixtures/codex-plan-output-schema-0.164.0.json) captures the real pinned Codex 0.164.0 app-server through checker callbacks, including a usable Read, with a scripted Responses provider and an OS identity exception (direct spawn under the capturing identity). Its capture-local adapter injected the schema before production wiring and selected the scripted provider. It proves schema propagation and callback/replay behavior, not live-provider acceptance of schema keywords or operating-system confinement. [Replay tests](../agent/test/codex-plan-output-schema-replay.test.ts) exercise the capture; [validation derivatives](../agent/test/codex-plan-output-schema-validation.test.ts) exercise malformed text, byte caps and the shape fields. The historical fixture is not evidence that production sent the schema at capture time.
+- **Production wiring.** [Checker tests](../agent/test/codex-cross-check.test.ts) cover the Plan `turn/start` schema without the capture adapter and its omission for Code. The production wiring landed in PR #4112; the M1 capture remains unchanged.
+- **Owner-reported direct live probes.** The owner reports that Codex 0.164.0 with `gpt-6.1-sol`, outside the checker, accepted the exact schema including its length and item constraints, returned bare JSON despite a request for fenced prose, and returned a long summary of exactly 4096 ASCII bytes. These are owner-reported observations, not probes repeated for this documentation change or evidence of the confined checker path.
+- **Owner acceptance pending.** A hosted live Plan check through the confined checker on the final candidate remains pending and not verified. The owner must run that check and inspect its result; neither the scripted capture nor the direct live probes satisfy it. Delivery for #4103 is non-closing while this owner acceptance remains outstanding.

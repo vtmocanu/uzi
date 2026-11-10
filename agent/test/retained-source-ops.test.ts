@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { createLogger } from "../src/log.js";
 import { attemptGeneration, formatAttemptId } from "../src/attempt-path.js";
 import {
   GitCache,
@@ -721,6 +722,274 @@ describe("verifyStoppedSourceCovered", () => {
       assert.equal(await verify(a, head), "covered");
       fs.writeFileSync(path.join(a.path, "sub", "stray.txt"), "x\n");
       assert.equal(await verify(a, head), "not_covered", "a file in the gitlink directory is not provable");
+    });
+  });
+
+  describe("Git reads that warn on stderr instead of failing (#4141)", () => {
+    const UNREADABLE_SKIP = LINUX_ONLY || (process.getuid?.() === 0 ? "root bypasses mode-000 permission checks" : false);
+    const stderrWarns = (rec: { lines: unknown[] }, msg: string) =>
+      (rec.lines as Array<{ level?: string; msg?: string; stderr?: string }>).filter((l) => l.level === "warn" && l.msg === msg);
+
+    /** Like captured(), with extra committed files, on a GitCache whose log lines are recorded. */
+    async function capturedWith(files: Record<string, string>) {
+      const rec = recordingLogger();
+      git = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions());
+      const a = await seedAttempt("run-v", 1);
+      fs.writeFileSync(path.join(a.path, "work.txt"), "captured\n");
+      gitIn(a.path, ["add", "work.txt"]);
+      for (const [rel, body] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(a.path, rel)), { recursive: true });
+        fs.writeFileSync(path.join(a.path, rel), body);
+        gitIn(a.path, ["add", rel]);
+      }
+      gitIn(a.path, ["commit", "-m", "milestone"]);
+      await fixtureFetchTracking(git, bare, a.path, a.branch, a.runId, 1);
+      const head = gitIn(a.path, ["rev-parse", "HEAD"]);
+      assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "precondition: clean at the captured head");
+      return { a, head, rec };
+    }
+    const STATUS_MSG = "stopped source status reported a problem on stderr; not provable";
+    const REFS_MSG = "stopped source local refs read reported a problem on stderr; not provable";
+
+    it("a nonignored mode-000 untracked directory is not covered", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      const dir = path.join(a.path, "secret");
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "key.txt"), "worker-only\n");
+      fs.chmodSync(dir, 0o000);
+      try {
+        assert.equal(await verify(a, head), "not_covered");
+        const warns = stderrWarns(rec, STATUS_MSG);
+        assert.equal(warns.length, 1, "the stderr problem is logged");
+        assert.match(warns[0]!.stderr ?? "", /Permission denied/);
+      } finally {
+        fs.chmodSync(dir, 0o700);
+      }
+    });
+
+    it("a modified tracked file inside a mode-000 tracked directory is not covered", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({ "tracked/inner.txt": "original\n" });
+      const dir = path.join(a.path, "tracked");
+      fs.writeFileSync(path.join(dir, "inner.txt"), "modified worker-only bytes\n");
+      fs.chmodSync(dir, 0o000);
+      try {
+        assert.equal(await verify(a, head), "not_covered");
+        const warns = stderrWarns(rec, STATUS_MSG);
+        assert.equal(warns.length, 1, "the stderr problem is logged");
+        assert.match(warns[0]!.stderr ?? "", /Permission denied/);
+      } finally {
+        fs.chmodSync(dir, 0o700);
+      }
+    });
+
+    it("a mode-000 loose ref naming a local-only commit is not covered", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      gitIn(a.path, ["checkout", "-q", "-b", "side"]);
+      fs.writeFileSync(path.join(a.path, "side.txt"), "only on a side branch\n");
+      gitIn(a.path, ["add", "side.txt"]);
+      gitIn(a.path, ["commit", "-m", "side work"]);
+      gitIn(a.path, ["checkout", "-q", "--detach", head]);
+      const ref = path.join(a.path, ".git", "refs", "heads", "side");
+      fs.chmodSync(ref, 0o000);
+      try {
+        assert.equal(await verify(a, head), "not_covered");
+        const warns = stderrWarns(rec, REFS_MSG);
+        assert.equal(warns.length, 1, "the stderr problem is logged");
+        assert.match(warns[0]!.stderr ?? "", /broken ref/);
+      } finally {
+        fs.chmodSync(ref, 0o600);
+      }
+    });
+
+    it("stays covered for a stat-dirty tracked file whose content is unchanged", { skip: LINUX_ONLY }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      fs.writeFileSync(path.join(a.path, "work.txt"), "captured\n");
+      const when = new Date(Date.now() + 5000);
+      fs.utimesSync(path.join(a.path, "work.txt"), when, when);
+      assert.equal(await verify(a, head), "covered");
+      assert.equal(stderrWarns(rec, STATUS_MSG).length, 0);
+    });
+
+    it("stays covered for a mode-000 directory matched by a committed .gitignore", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({ ".gitignore": "/secret/\n" });
+      const dir = path.join(a.path, "secret");
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "key.txt"), "ignored\n");
+      fs.chmodSync(dir, 0o000);
+      try {
+        assert.equal(await verify(a, head), "covered");
+        assert.equal(stderrWarns(rec, STATUS_MSG).length, 0);
+      } finally {
+        fs.chmodSync(dir, 0o700);
+      }
+    });
+
+    it("stays covered for a mode-000 directory matched by .git/info/exclude", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      fs.appendFileSync(path.join(a.path, ".git", "info", "exclude"), "/secret/\n");
+      const dir = path.join(a.path, "secret");
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "key.txt"), "excluded\n");
+      fs.chmodSync(dir, 0o000);
+      try {
+        assert.equal(await verify(a, head), "covered");
+        assert.equal(stderrWarns(rec, STATUS_MSG).length, 0);
+      } finally {
+        fs.chmodSync(dir, 0o700);
+      }
+    });
+
+    it("retains conservatively when Git warns about a benign deprecated config key", { skip: LINUX_ONLY }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      fs.appendFileSync(path.join(a.path, ".git", "config"), "[core]\n\tfsyncObjectFiles = true\n");
+      assert.equal(await verify(a, head), "not_covered");
+      const warns = stderrWarns(rec, STATUS_MSG);
+      assert.equal(warns.length, 1, "the benign warning is logged as a stderr problem");
+      assert.match(warns[0]!.stderr ?? "", /fsyncObjectFiles/);
+    });
+
+    for (const [name, capturedStderr] of [
+      ["captured stderr", "warning: \u001b[31m" + "private".repeat(80)],
+      ["fallback error", ""],
+    ] as const) {
+      it("warns and retains when a legacy local-ref read fails with " + name, async t => {
+        const { a, head, rec } = await capturedWith({});
+        const reader = git as unknown as { runGitAsRunner: (cwd: string | undefined, args: string[],
+          opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => Promise<string> };
+        const original = reader.runGitAsRunner.bind(git);
+        let reached = 0;
+        t.mock.method(reader, "runGitAsRunner", async (cwd: string | undefined, args: string[],
+          opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => {
+          if (cwd === a.path && args.includes("for-each-ref")) {
+            reached++;
+            if (capturedStderr) opts?.onStderr?.(capturedStderr);
+            throw new Error("local-ref read fallback diagnostic");
+          }
+          return original(cwd, args, opts);
+        });
+        assert.equal(await git["localRefsReachableFrom"](bare, a.path, head), false);
+        assert.equal(reached, 1, "the local-ref read reached the failed Git call");
+        const warns = rec.lines as Array<{ level?: string; msg?: string; stderr?: string; error?: string }>;
+        const warn = warns.find(line => line.level === "warn" && line.msg === "stopped source local refs could not be proven held");
+        assert.ok(warn, "the failed local-ref read logs a warning");
+        if (capturedStderr) {
+          assert.match(warn.stderr ?? "", /^warning:/);
+          assert.ok((warn.stderr ?? "").length <= 256);
+          assert.ok(!(warn.stderr ?? "").includes("\u001b"), "stderr is sanitized");
+        } else {
+          assert.match(warn.error ?? "", /local-ref read fallback diagnostic/);
+        }
+      });
+    }
+
+    for (const [name, capturedStderr] of [
+      ["captured stderr", "warning: \u001b[31m" + "private".repeat(80)],
+      ["fallback error", ""],
+    ] as const) {
+      it("warns and retains when a legacy status read fails with " + name, async t => {
+        const { a, rec } = await capturedWith({});
+        // macOS initializes this fixture with core.ignorecase=true, which the proof
+        // correctly refuses before status; isolate the failed-status seam here.
+        gitIn(a.path, ["config", "--local", "core.ignoreCase", "false"]);
+        const reader = git as unknown as { runGitAsRunner: (cwd: string | undefined, args: string[],
+          opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => Promise<string> };
+        const original = reader.runGitAsRunner.bind(git);
+        let reached = 0;
+        const fallbackError = "status read fallback diagnostic \u001b[31m" + "private".repeat(80);
+        t.mock.method(reader, "runGitAsRunner", async (cwd: string | undefined, args: string[],
+          opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => {
+          if (args.includes("status")) {
+            reached++;
+            if (capturedStderr) opts?.onStderr?.(capturedStderr);
+            throw new Error(fallbackError);
+          }
+          return original(cwd, args, opts);
+        });
+        assert.equal(await git["worktreeCleanHardened"](a.path), false);
+        assert.equal(reached, 1, "the status read reached the failed Git call");
+        const warns = rec.lines as Array<{ level?: string; msg?: string; stderr?: string; error?: string }>;
+        const warn = warns.find(line => line.level === "warn" && line.msg === "stopped source status could not be proven clean");
+        assert.ok(warn, "the failed status read logs a warning");
+        if (capturedStderr) {
+          assert.match(warn.stderr ?? "", /^warning:/);
+          assert.ok((warn.stderr ?? "").length <= 256);
+          assert.ok(!(warn.stderr ?? "").includes("\u001b"), "stderr is sanitized");
+        } else {
+          assert.match(warn.error ?? "", /status read fallback diagnostic/);
+          assert.ok((warn.error ?? "").length <= 259, "sanitizeForLog adds a three-character truncation marker");
+          assert.ok((warn.error ?? "").endsWith("..."), "the long fallback is truncated");
+          assert.ok(!(warn.error ?? "").includes("\u001b"), "fallback error is sanitized");
+        }
+      });
+    }
+
+    for (const site of ["refs", "status"] as const) {
+      for (const mode of ["stderr", "fallback"] as const) {
+        it("redacts a registered secret before bounding failed " + site + " " + mode + " diagnostics", async t => {
+          const { a, head } = await capturedWith({});
+          if (site === "status") gitIn(a.path, ["config", "--local", "core.ignoreCase", "false"]);
+          const secret = "registered-secret-" + "0123456789abcdef".repeat(2);
+          const raw = "warning:" + "x".repeat(220) + secret;
+          const logger = createLogger("warn");
+          logger.addSecret(secret);
+          const warnings: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+          t.mock.method(logger, "warn", (msg: string, fields?: Record<string, unknown>) => { warnings.push({ msg, fields }); });
+          git = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions());
+          const reader = git as unknown as { runGitAsRunner: (cwd: string | undefined, args: string[],
+            opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => Promise<string> };
+          const original = reader.runGitAsRunner.bind(git);
+          let reached = 0;
+          t.mock.method(reader, "runGitAsRunner", async (cwd: string | undefined, args: string[],
+            opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => {
+            if (args.includes(site === "refs" ? "for-each-ref" : "status")) {
+              reached++;
+              if (mode === "stderr") opts?.onStderr?.(raw);
+              throw new Error(mode === "fallback" ? raw : "injected Git failure");
+            }
+            return original(cwd, args, opts);
+          });
+          const covered = site === "refs" ? await git["localRefsReachableFrom"](bare, a.path, head) :
+            await git["worktreeCleanHardened"](a.path);
+          assert.equal(covered, false);
+          assert.equal(reached, 1, "the target Git read was reached");
+          const message = site === "refs" ? "stopped source local refs could not be proven held" :
+            "stopped source status could not be proven clean";
+          const warning = warnings.find(w => w.msg === message);
+          assert.ok(warning, "the failed read emits a warning");
+          const detail = warning.fields?.[mode === "stderr" ? "stderr" : "error"];
+          assert.equal(typeof detail, "string");
+          assert.ok((detail as string).length <= 256, "the diagnostic is bounded");
+          assert.ok((detail as string).includes("***REDACTED***"), "the logger registry scrubbed the full secret");
+          assert.ok(!(detail as string).includes(secret.slice(0, 8)), "no long secret prefix survives the bound");
+        });
+      }
+    }
+
+    // The legacy proof uses capture's HOME and attribute inputs. Git warns when it cannot
+    // read an attributes file under that HOME, so an otherwise clean source stays retained.
+    it("is not covered when the HOME attributes file is unreadable and a tracked file is stat-dirty", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-home-4141-"));
+      const attrs = path.join(home, ".config", "git", "attributes");
+      fs.mkdirSync(path.dirname(attrs), { recursive: true });
+      fs.writeFileSync(attrs, "* text\n");
+      fs.chmodSync(attrs, 0o000);
+      const oldHome = process.env.HOME;
+      process.env.HOME = home;
+      try {
+        fs.writeFileSync(path.join(a.path, "work.txt"), "captured\n");
+        const when = new Date(Date.now() + 5000);
+        fs.utimesSync(path.join(a.path, "work.txt"), when, when);
+        assert.equal(await verify(a, head), "not_covered");
+        const warns = stderrWarns(rec, STATUS_MSG);
+        assert.equal(warns.length, 1);
+        assert.match(warns[0]!.stderr ?? "", /Permission denied/);
+      } finally {
+        if (oldHome === undefined) delete process.env.HOME;
+        else process.env.HOME = oldHome;
+        fs.chmodSync(attrs, 0o600);
+        fs.rmSync(home, { recursive: true, force: true });
+      }
     });
   });
 

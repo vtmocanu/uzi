@@ -36,7 +36,7 @@ for (const alias of ["ordinary", "unknown", "policy-unknown", "settled", "settle
     const upper = run.toUpperCase();
     const policy = {
       outcome_id: other, source_generation: 7, claim_generation: 7,
-      detail: "refused" as const, continuation_mode: "same_conversation" as const,
+      detail: "refused" as const, cause: "refused" as const, continuation_mode: "same_conversation" as const,
       published: false, tag: "cyberPolicy" as const, phase: "implementation" as const,
       correlation_id: "pr-" + "a".repeat(32) + "-1",
     };

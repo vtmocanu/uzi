@@ -10,7 +10,7 @@ import (
 func policyHoldFixture() PolicyHoldRequest {
 	tag, phase, correlation := "cyberPolicy", "planning", "pr-00000000000000000000000000000000-1"
 	return PolicyHoldRequest{OutcomeID: uuid.NewString(), SourceGeneration: 1, ClaimGeneration: 1,
-		Detail: "refused", ContinuationMode: "same_conversation", PolicyTag: &tag, Phase: &phase, CorrelationID: &correlation}
+		Detail: "refused", Cause: "refused", ContinuationMode: "same_conversation", PolicyTag: &tag, Phase: &phase, CorrelationID: &correlation}
 }
 
 func TestPolicyHoldValidation(t *testing.T) {
@@ -24,21 +24,32 @@ func TestPolicyHoldValidation(t *testing.T) {
 			}
 		}
 	}
+	// fresh_start_uncertain is the re-hold of a one-claim Fresh that never confirmed a conversation.
+	uncertain := policyHoldFixture()
+	uncertain.Detail, uncertain.Cause, uncertain.PolicyTag, uncertain.Phase, uncertain.CorrelationID = "resume_rejected", "fresh_start_uncertain", nil, nil, nil
+	if err := uncertain.Validate(); err != nil {
+		t.Fatalf("fresh_start_uncertain re-hold rejected: %v", err)
+	}
 	for name, change := range map[string]func(*PolicyHoldRequest){
-		"zero uuid":                    func(r *PolicyHoldRequest) { r.OutcomeID = uuid.Nil.String() },
-		"uppercase uuid":               func(r *PolicyHoldRequest) { r.OutcomeID = "ABCDEFAB-0000-4000-8000-000000000001" },
-		"noncanonical uuid":            func(r *PolicyHoldRequest) { r.OutcomeID = strings.ReplaceAll(r.OutcomeID, "-", "") },
-		"zero source":                  func(r *PolicyHoldRequest) { r.SourceGeneration = 0 },
-		"future source":                func(r *PolicyHoldRequest) { r.SourceGeneration = 2 },
-		"unsafe generation":            func(r *PolicyHoldRequest) { r.ClaimGeneration = 9007199254740992 },
-		"unknown detail":               func(r *PolicyHoldRequest) { r.Detail = "failed" },
-		"unknown mode":                 func(r *PolicyHoldRequest) { r.ContinuationMode = "fresh" },
-		"missing tag":                  func(r *PolicyHoldRequest) { r.PolicyTag = nil },
-		"missing phase":                func(r *PolicyHoldRequest) { r.Phase = nil },
-		"missing correlation":          func(r *PolicyHoldRequest) { r.CorrelationID = nil },
-		"provider prose":               func(r *PolicyHoldRequest) { s := "refused for policy"; r.PolicyTag = &s },
-		"child phase":                  func(r *PolicyHoldRequest) { s := "review"; r.Phase = &s },
-		"correlation trailing newline": func(r *PolicyHoldRequest) { s := *r.CorrelationID + "\n"; r.CorrelationID = &s },
+		"zero uuid":                     func(r *PolicyHoldRequest) { r.OutcomeID = uuid.Nil.String() },
+		"uppercase uuid":                func(r *PolicyHoldRequest) { r.OutcomeID = "ABCDEFAB-0000-4000-8000-000000000001" },
+		"noncanonical uuid":             func(r *PolicyHoldRequest) { r.OutcomeID = strings.ReplaceAll(r.OutcomeID, "-", "") },
+		"zero source":                   func(r *PolicyHoldRequest) { r.SourceGeneration = 0 },
+		"future source":                 func(r *PolicyHoldRequest) { r.SourceGeneration = 2 },
+		"unsafe generation":             func(r *PolicyHoldRequest) { r.ClaimGeneration = 9007199254740992 },
+		"unknown detail":                func(r *PolicyHoldRequest) { r.Detail = "failed" },
+		"missing cause":                 func(r *PolicyHoldRequest) { r.Cause = "" },
+		"unknown cause":                 func(r *PolicyHoldRequest) { r.Cause = "because" },
+		"refused cause on re-hold":      func(r *PolicyHoldRequest) { r.Detail = "resume_rejected" },
+		"re-hold cause on refusal":      func(r *PolicyHoldRequest) { r.Cause = "session_missing" },
+		"fresh start uncertain refusal": func(r *PolicyHoldRequest) { r.Cause = "fresh_start_uncertain" },
+		"unknown mode":                  func(r *PolicyHoldRequest) { r.ContinuationMode = "fresh" },
+		"missing tag":                   func(r *PolicyHoldRequest) { r.PolicyTag = nil },
+		"missing phase":                 func(r *PolicyHoldRequest) { r.Phase = nil },
+		"missing correlation":           func(r *PolicyHoldRequest) { r.CorrelationID = nil },
+		"provider prose":                func(r *PolicyHoldRequest) { s := "refused for policy"; r.PolicyTag = &s },
+		"child phase":                   func(r *PolicyHoldRequest) { s := "review"; r.Phase = &s },
+		"correlation trailing newline":  func(r *PolicyHoldRequest) { s := *r.CorrelationID + "\n"; r.CorrelationID = &s },
 		"correlation unsafe counter": func(r *PolicyHoldRequest) {
 			s := "pr-00000000000000000000000000000000-9007199254740992"
 			r.CorrelationID = &s
@@ -60,6 +71,7 @@ func TestPolicyHoldValidation(t *testing.T) {
 	}
 	r := policyHoldFixture()
 	r.Detail = "resume_rejected"
+	r.Cause = "attempt_path"
 	r.PolicyTag = nil
 	r.Phase = nil
 	r.CorrelationID = nil

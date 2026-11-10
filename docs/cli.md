@@ -163,6 +163,8 @@ uzi run extend <id> --by <duration>
 uzi run pause <id> [--now|--cancel]
 uzi run resume <id>
 uzi run resume-now <id>
+uzi run resume-now <id> --policy-mode <preserve|fresh_from_saved_work|fresh_one_claim> --episode <uuid>
+                [--guidance <text> | --guidance-file <path>] [--yes]
 uzi run decide <id> (--continue [--guidance <text>] | --partial <ids> --reason <text> | --accept <ids> --reason <text>)
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
@@ -264,8 +266,13 @@ A few worth knowing:
   `$0.00` for metered zero and discloses runs without a cost estimate and
   unreported runs. Incomplete totals include recorded partial costs.
   Recoverable work may already have been landed.
+  The table's `CLAUDE/CODEX` column shows the selected window's runs by
+  harness (the same runs as `RUNS`, so the two numbers sum to it; cross-check
+  runs count under the harness they ran on). The column is omitted against an
+  older API without the split.
   `--json` returns the complete API response with both windows and additive
-  per-user seven-day fields; the flag selects only the human report. Invalid
+  per-user seven-day fields, plus `harness_runs` / `last7_harness_runs` per
+  user; the flag selects only the human report. Invalid
   window values are rejected before a request, including with `--json`.
   With an older API missing a user's `last_7_days`, the CLI returns an
   upgrade error before printing a seven-day human report; lifetime and JSON
@@ -1543,7 +1550,8 @@ uzi run recovery <run-id> [--json]
   a newer run using that key superseded it, `refs/uzi-recovery/<run-id>`. `--json` carries
   the same information as `checkpoint_ref`, `checkpoint_tip`, and `checkpoint_state` on each
   hold. A hold with no retained checkpoint ref omits the line (and the `--json` fields are
-  absent). The key keeps the exact legacy issue/self-improvement spelling; an enrolled
+  absent). The key keeps the exact legacy issue/self-improvement spelling, a prompt
+  run uses `uzi/prompt-<run-id>`, and an enrolled
   task uses `uzi/task/<its-own-run-id>`, even when its work branch belongs to a root
   task. See [task checkpoint recovery](./run-recovery.md#task-checkpoint-recovery).
 
@@ -4088,6 +4096,43 @@ set written explicitly. Ordinary recovery waits continue as before.
 `uzi run logs <id> --follow` reports a change to this cause even when the
 status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
 owner actions, counts and historical evidence, without a self-retry countdown.
+
+### Codex policy hold
+
+A run paused on a confirmed `codex_policy_hold` shows, in `uzi run get`, the
+cause, the resume modes this episode accepts, a pending one-claim fresh start
+and whether the required recovery head is verified. Cancel is the only other
+action; there is no Stop. `--json` carries the same fields under `policy_hold`
+(`hold_cause`, `resume_modes`, `pending_fresh`, `outcome_id`).
+
+Resume it with the existing verb plus the policy flags:
+
+```
+uzi run resume-now <id> --policy-mode <mode> --episode <outcome_id> \
+    [--guidance <text> | --guidance-file <path>] [--yes]
+```
+
+- `--policy-mode` is one of `preserve`, `fresh_from_saved_work`,
+  `fresh_one_claim`; any other value is refused before a request is sent.
+- `--episode` is required and must be the hold's `policy_hold.outcome_id` (a
+  UUID). If the hold changed since you read it, the server answers 409
+  "policy hold changed or does not match this mode; refresh the run and choose
+  again"; run `uzi run get` again and choose again.
+- `--guidance` and `--guidance-file` are mutually exclusive, optional, at most
+  16000 bytes of UTF-8 with no NUL byte. Resending the same request after it was
+  applied prints "already resumed (this request was applied earlier)"; the same
+  request with different guidance is a 409 and the new guidance is not recorded.
+- The mode's label and consequence are printed to stderr, then you confirm on a
+  terminal. `--yes` skips the prompt; without a terminal and without `--yes`
+  the command refuses and sends nothing.
+
+| Mode | Label | Consequence |
+|---|---|---|
+| `preserve` | Resume the preserved conversation | Continues the same conversation with your guidance. If the conversation is missing or rejected, the run is held again; it never starts a new conversation. |
+| `fresh_from_saved_work` | Fresh conversation from the saved work | Starts a fresh conversation from the saved work and resolves this refusal. Any earlier requirement to preserve the old conversation ends for the rest of the run, until a new refusal. |
+| `fresh_one_claim` | Fresh conversation for one pickup | Lets exactly the next pickup start one new conversation from the saved work. Later pickups preserve that new conversation again; a fresh start that is never confirmed is held, not repeated. |
+
+Without `--policy-mode`, `uzi run resume-now <id>` is unchanged.
 
 ### Codex idle stalls
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -58,6 +59,15 @@ func (h *Handler) SetRunCredential(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.wsvc.SetRunCredential(r.Context(), user.ID, runID, req.Mode, secretID)
 	if err != nil {
+		// The Codex refusal is unchanged. For a run in an unresolved policy episode only, name the
+		// continuation that does apply, so the owner is not left at a dead end (issue #3607).
+		if errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported) {
+			if held, rerr := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID}); rerr == nil && blocksOrdinaryResume(held) {
+				httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported on the codex harness."+
+					" Resume this policy hold with POST /api/runs/"+runID.String()+"/resume-now, an explicit mode and expected_episode_id.")
+				return
+			}
+		}
 		h.writeSetRunCredentialError(w, err)
 		return
 	}

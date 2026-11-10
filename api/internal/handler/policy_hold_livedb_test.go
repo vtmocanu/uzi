@@ -53,7 +53,7 @@ func testPolicyHoldWorkerRoute(t *testing.T, name string) {
 	run := uuid.New()
 	cliMustExec(t, pool, `INSERT INTO runs(id,user_id,repo_id,issue_iid,issue_title,issue_description,kind,status,harness,worker_id,claim_generation,session_id) VALUES($1,$2,$3,3607,'policy fixture','desc','issue','running','codex',$4,1,'original-session')`, run, owner, repo, worker.ID)
 	tag, phase, corr := "cyberPolicy", "implementation", "pr-00000000000000000000000000000000-1"
-	req := workersvc.PolicyHoldRequest{OutcomeID: uuid.NewString(), SourceGeneration: 1, ClaimGeneration: 1, Detail: "refused", ContinuationMode: "same_conversation", PolicyTag: &tag, Phase: &phase, CorrelationID: &corr}
+	req := workersvc.PolicyHoldRequest{OutcomeID: uuid.NewString(), SourceGeneration: 1, ClaimGeneration: 1, Detail: "refused", Cause: "refused", ContinuationMode: "same_conversation", PolicyTag: &tag, Phase: &phase, CorrelationID: &corr}
 	b, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
@@ -90,9 +90,12 @@ func testPolicyHoldWorkerRoute(t *testing.T, name string) {
 		if err := pool.QueryRow(ctx, "SELECT COALESCE(jsonb_agg(to_jsonb(i) ORDER BY id), '[]'::jsonb)::text FROM run_user_inputs i WHERE run_id=$1", run).Scan(&beforeInputs); err != nil {
 			t.Fatal(err)
 		}
-		for _, body := range []string{"", `{"mode":"fresh","guidance":"owner guidance"}`} {
+		// An empty request is a legacy resume (409); an unknown mode is rejected as malformed (400).
+		// Neither mutates the episode; the shipped modes are covered by TestCompactPolicyResumeAuthMountLiveDB.
+		for body, want := range map[string]int{"": http.StatusConflict,
+			`{"mode":"fresh","expected_episode_id":"` + req.OutcomeID + `","guidance":"owner guidance"}`: http.StatusBadRequest} {
 			r := cookieReq(t, router, http.MethodPost, "/api/runs/"+run.String()+"/resume-now", jwt, body)
-			if r.Code != http.StatusConflict {
+			if r.Code != want {
 				t.Fatalf("generic owner Resume = %d: %s", r.Code, r.Body.String())
 			}
 			after, err := h.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: run, UserID: owner})

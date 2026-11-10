@@ -12,7 +12,7 @@ const other = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const worker = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const request = {
   outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 7, claim_generation: 7,
-  detail: "refused" as const, continuation_mode: "same_conversation" as const,
+  detail: "refused" as const, cause: "refused" as const, continuation_mode: "same_conversation" as const,
   tag: "cyberPolicy" as const, phase: "implementation" as const,
   correlation_id: "pr-" + "a".repeat(32) + "-1", session_id: "s".repeat(128), head: "a".repeat(40),
   published: true, checkpoint_contains_latest: true,

@@ -802,7 +802,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         title: "Iteration limit reached. Only the owner can Resume with a fresh finite iteration allowance, or Cancel. Extend time first only if the remaining wall budget is spent; Extend does not resume the run." };
     case "codex_policy_hold":
       return { kind: "badge", label: PARK_LABELS.codex_policy_hold, tone: "warning", pulse: false,
-        title: "The run waits for its owner. Resume and policy-specific Stop are unavailable; open the run to inspect preservation evidence or Cancel." };
+        title: "The run waits for its owner. Open the run to see why it is held and choose how to continue, or Cancel. Stop is not available for a policy hold." };
     case "provider_unavailable":
       return { kind: "badge", label: PARK_LABELS.provider_unavailable, tone: "warning", pulse: false,
         title: "Automatic provider retries have stopped. The run waits for its owner; open the run for Resume, Stop availability and Cancel." };

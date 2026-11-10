@@ -6,6 +6,9 @@
  * and binding failures. measureAllocated owns entry/pending/depth/deadline and
  * filesystem failures, including read and finally-close as independent events.
  * runPodEpochShadow owns grouping/selector and ownership/holds read failures.
+ * Measurement EACCES/EPERM (opendir or entry lstat below the parent) and the entry, depth and
+ * pending caps are tree-local in epoch inspection: their counters may appear on an eligible pass.
+ * Counters stay diagnostic and grant nothing.
  */
 const helperSuffixes = ["entry_cap", "bare_cap", "metadata_byte_cap", "metadata_record_cap", "source_record_cap"] as const;
 const readSuffixes = ["http_1xx", "http_2xx", "http_3xx", "http_4xx", "http_5xx", "timeout", "transport", "other"] as const;

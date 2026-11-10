@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { perUserRows } from "./usageByUser";
+import { harnessShare, perUserRows } from "./usageByUser";
+import { mockApi } from "../mocks/mockApi";
 import { failureAgo } from "../components/usageParts";
 import { UsageCard } from "../components/UsageCards";
 import type { AdminUsage, AdminUsageUser, RunOutcomes, RunUsage, SelfUsage } from "./api";
@@ -139,6 +140,78 @@ describe("perUserRows", () => {
     admin.users.find((u) => u.user_id === "c")!.last_7_days = { ...bundle(7, 99), output_tokens: 1 };
     admin.users.find((u) => u.user_id === "b")!.last_7_days = bundle(7, 100);
     expect(perUserRows(admin, "last_7_days").rows.map((r) => r.user_id)).toEqual(["c", "b", "a"]);
+  });
+});
+
+describe("harnessShare (#3876)", () => {
+  it("splits 7 Claude / 3 Codex as 70 / 30", () => {
+    expect(harnessShare({ claude: 7, codex: 3 })).toEqual({ claude: 70, codex: 30 });
+  });
+
+  it("rounds 1 Claude / 2 Codex to 33 / 67, summing to 100", () => {
+    const share = harnessShare({ claude: 1, codex: 2 })!;
+    expect(share).toEqual({ claude: 33, codex: 67 });
+    expect(share.claude + share.codex).toBe(100);
+  });
+
+  it("is null for a window with no runs or no split", () => {
+    expect(harnessShare({ claude: 0, codex: 0 })).toBeNull();
+    expect(harnessShare(undefined)).toBeNull();
+  });
+
+  it("gives Codex the rounding remainder on a half-way tie (1 Claude / 7 Codex, 12.5%, is 13 / 87, not 13 / 88)", () => {
+    expect(harnessShare({ claude: 1, codex: 7 })).toEqual({ claude: 13, codex: 87 });
+  });
+
+  it("rounds 1 Codex run of 201 to 100 / 0", () => {
+    expect(harnessShare({ claude: 200, codex: 1 })).toEqual({ claude: 100, codex: 0 });
+  });
+});
+
+describe("perUserRows harness split (#3876)", () => {
+  const withHarness = (admin: AdminUsage) => admin.users.forEach((u, i) => {
+    u.harness_runs = { claude: u.run_count - i, codex: i };
+    u.last7_harness_runs = { claude: u.last7_run_count! - i, codex: i };
+  });
+
+  it("shows the column when every row reports the selected window's split", () => {
+    const { admin } = fixture();
+    withHarness(admin);
+    for (const w of ["lifetime", "last_7_days"] as const) {
+      const r = perUserRows(admin, w);
+      expect(r.showHarness).toBe(true);
+      for (const row of r.rows) {
+        const u = admin.users.find((x) => x.user_id === row.user_id)!;
+        expect(row.selectedHarness).toBe(w === "lifetime" ? u.harness_runs : u.last7_harness_runs);
+      }
+    }
+  });
+
+  it("hides it when one row lacks the selected window's split, judging each window on its own", () => {
+    const { admin } = fixture();
+    withHarness(admin);
+    delete admin.users[0].last7_harness_runs;
+    expect(perUserRows(admin, "last_7_days").showHarness).toBe(false);
+    expect(perUserRows(admin, "lifetime").showHarness).toBe(true);
+    withHarness(admin);
+    delete admin.users[2].harness_runs;
+    expect(perUserRows(admin, "lifetime").showHarness).toBe(false);
+    expect(perUserRows(admin, "last_7_days").showHarness).toBe(true);
+  });
+
+  it("hides it on an older API without the split", () => {
+    const { admin } = fixture();
+    expect(perUserRows(admin, "lifetime").showHarness).toBe(false);
+    expect(perUserRows(admin, "last_7_days").showHarness).toBe(false);
+  });
+
+  it("gives every mock user a split summing to their run counts, one of them Claude-only", async () => {
+    const admin = await mockApi.getAdminUsage();
+    for (const u of admin.users) {
+      expect(u.harness_runs!.claude + u.harness_runs!.codex).toBe(u.run_count);
+      expect(u.last7_harness_runs!.claude + u.last7_harness_runs!.codex).toBe(u.last7_run_count);
+    }
+    expect(admin.users.some((u) => u.harness_runs!.codex === 0 && u.last7_harness_runs!.codex === 0)).toBe(true);
   });
 });
 

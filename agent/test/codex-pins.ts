@@ -20,6 +20,8 @@ const PIN_SCAN_EXCLUDES = [
   ":(exclude)adr/**", ":(exclude)prds/**", ":(exclude)CHANGELOG.md", ":(exclude)changelog.d/**",
   // Recorded execution evidence, not the current worker contract.
   ":(exclude)e2e/worker-uid/issue-2397-investigation.md",
+  // A recorded frame tape is historical evidence, not a live deployment pin.
+  ":(exclude)agent/test/fixtures/codex-plan-output-schema-0.164.0.json",
   // Synthetic version output deliberately includes mismatches to test the verifier.
   ":(exclude)e2e/codex-m4/provision.test.ts",
 ];

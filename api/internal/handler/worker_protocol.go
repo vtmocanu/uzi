@@ -430,6 +430,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		{"worker_memory_authority_claim_v1"}, // issue #3142: this api accepts the run-lane claim body's memory_authority member
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
 		{capability.RecoveryBindinglessClosedV1}, // Historical reads are independent of publication write switches.
+		{capability.RecoveryRunOpenHoldsV1},      // Issue #3431: the worker holds read may carry the run-wide open-hold count.
 		{"heartbeat_outbox"},                     // PRD #1391 M5, Run A
 		{"heartbeat_outbox_root_unusable"},       // optional worker-global diagnostic
 		{"worker_residue_quarantine"},            // issue #2213: this api accepts the heartbeat's residue_quarantine member
@@ -502,6 +503,11 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// awaiting_approval gate. Advertised UNCONDITIONALLY: a worker sends the report ONLY after
 		// seeing this token, because an older api 400s the unknown state and field.
 		{"clarification_revision_settlement_v1"},
+		// Issue #3607: this api accepts the compact provider policy hold report and the owner
+		// policy Resume. Advertised UNCONDITIONALLY; a worker negotiates the protocol by
+		// registering the same capability, and the claim SQL fences policy-held runs to workers
+		// that registered it.
+		{capability.ProviderPolicyHoldV1},
 	}
 	if publicationResumeEnabled {
 		// Issue #1324: this api accepts NEW publication intents. Omitted when

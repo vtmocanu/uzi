@@ -12,8 +12,8 @@
 | #3879 (`prds/done/3879-overview-issue-line.md`) | The issue-work line, filtering the runs widget | #3878 |
 | #3880 (`prds/done/3880-overview-capacity-held-work.md`) | Capacity rail and Held work; retires the worker-load card and custody banner on the preview | #3878 |
 | #3881 (`prds/done/3881-overview-usage-by-user.md`) | Usage card with the You / Factory toggle and the admin by-user table | #3878 |
-| #3875 (`prds/3875-command-menu.md`) | The Cmd K command menu | #3878, #3880 |
-| #3876 (`prds/3876-usage-harness-split.md`) | Per-user Claude / Codex split in admin usage (API, CLI, table column) | #3881 |
+| #3875 (`prds/done/3875-command-menu.md`) | The Cmd K command menu | #3878, #3880 |
+| #3876 (`prds/done/3876-usage-harness-split.md`) | Per-user Claude / Codex split in admin usage (API, CLI, table column) | #3881 |
 | #4052 (issue) | Issue work: an admin-only You \| All users scope toggle pinned right (same as the usage card, default You, remembered per browser), and no Show all button; target mock `prds/mockups/3873-overview-issue-work-scope.html` | #3881 |
 | #4041 (issue) | Needs your decision: group same-kind decisions and PR reviews into expandable rows, kind icons, plan milestone line, two-column rule; target mock `prds/mockups/4041-needs-decision-after.html` | #3881 |
 | #4040 (`prds/done/4040-overview-pending-question.md`) | The pending question quoted inline in Needs your decision (owner-scoped server excerpt) | #3881, #4041 |
@@ -75,7 +75,7 @@ The page keeps today's shell and content column (`max-w-[68rem]`, `web/src/compo
 3. **Issue work**, the production line (the signature element): stations Queued, Planning, Plan review (drawn as a gate), Building, PR open; bays below for Asking you, Parked and Other work. Clicking a station or bay filters the Runs list. **Scope:** a normal user's line counts their own runs; an admin's counts every user's active runs (the factory floor), and other users' pips carry the owner. PR open stays the viewer's own (see Run populations). Another user's run waiting at the gate shows on the line with no action.
 4. **Two columns.** Runs: today's Recent-runs row anatomy (title, "now" line, repo and issue, iteration and milestone badges, `StatusPill`) plus the stage filter and a stalled badge, **grouped like today's Runs page**: "Yours" first, then for admins only "Other users (admin)" with other users' active runs and the owner's email in the meta line (masked in demo mode). That is today's `RunsList` pattern (`web/src/pages/RunsList.tsx:664`: `adminListRuns` rows whose `owner_email` differs from the viewer's); the Runs page keeps its "Factory status (admin)" title because that card also lists workers. The stage filter applies to both groups; an empty group hides. Capacity rail: run slots in use / closed / open, then workers (online, runs x/y and draining badges as today, cpu / mem / disk behind a disclosure), then Held work with today's custody pips and three separate figures.
 5. **Usage** card: You / Factory (admins) as a toggle instead of side-by-side columns, All time / Last 7 days as today; cost (API-equivalent), PRs opened and cost per PR, failed-run rate, tokens; the finished-run outcome bar; top causes; latest failure (all time). No cost-over-time chart.
-   - **By user** (Factory scope only): today's `PerUserUsageTable` (`web/src/components/UsageCards.tsx:321`) trimmed to User, Runs, PRs, Failed, Fail rate, Last failure and Cost, sorted by cost, with a Factory total row, following the same window toggle. Fail rate divides by finished runs, not by Runs (`run_count` counts usage-bearing runs, a different population). Last failure ("3h ago") is lifetime-only (`last_failed_at`, `apiTypes.ts:4306`), so it shows the same value in both windows; the header tooltip says so. A **Claude / Codex split** per user is **Proposed**: per-user usage is one aggregate today (`AdminUsageUser`), so it needs a per-user aggregate by harness. Today's Tokens, Out and Cost share columns drop from the Overview (they could live on an admin usage page).
+   - **By user** (Factory scope only): today's `PerUserUsageTable` (`web/src/components/UsageCards.tsx:321`) trimmed to User, Runs, PRs, Failed, Fail rate, Last failure and Cost, sorted by cost, with a Factory total row, following the same window toggle. Fail rate divides by finished runs, not by Runs (`run_count` counts usage-bearing runs, a different population). Last failure ("3h ago") is lifetime-only (`last_failed_at`, `apiTypes.ts:4306`), so it shows the same value in both windows; the header tooltip says so. A **Claude / Codex split** per user was Proposed here and is delivered by #3876 (`harness_runs` / `last7_harness_runs` on `AdminUsageUser`). Today's Tokens, Out and Cost share columns drop from the Overview (they could live on an admin usage page).
 
 The sidebar stays exactly as today, including the account usage meters under the user block (`web/src/components/SidebarUsageLimits.tsx`).
 
@@ -116,7 +116,7 @@ The mocks were checked against these; the real build needs a test per rule.
 | Slots, workers, cpu / mem / disk | `api.listWorkers()` through `useOverviewData`; preview currently renders `WorkerLoadCard` only for workers with stats | #3880 must list every owner worker; closed slots derive from cordon, drain or an in-progress hosted upgrade, with offline and unknown-cap workers outside the bar |
 | Outcome figures and causes | `SelfUsage` (`apiTypes.ts:4326`) and the admin usage response | none |
 | By user: runs, PRs, failed, fail rate, last failure, cost, both windows | `AdminUsage.users` (`AdminUsageUser`: `run_count` / `last7_run_count`, `outcomes` / `last7_outcomes` incl. lifetime `last_failed_at`, `pr_count` / `last7_pr_count`, `usage` / `last_7_days`) | none |
-| By user: Claude / Codex split | none | needs a per-user aggregate by harness (Proposed); check CLI parity (`uzi admin usage`) |
+| By user: Claude / Codex split | `AdminUsageUser.harness_runs` / `last7_harness_runs` (delivered by #3876, with the `uzi admin usage` CLAUDE/CODEX column) | none |
 | ⌘K search | none | v1 is navigation plus needs-you actions; global search is a separate feature |
 | Health chip | `HealthStatusProvider` (`web/src/components/AppShell.tsx:1319`) | none |
 
@@ -183,13 +183,13 @@ Build from what exists; do not re-implement these. The original anchors were che
 - **D10** Keep the existing themes, typeface and components, and keep the account usage meters in the sidebar (maintainer call). The exploration's palette, Archivo, top bar and rail quota card are dropped; its structure is ported.
 - **D11** The decisions card replaces the custody banner only with full state coverage (blocked runs, capacity reached, decisions); the onboarding checklist and the non-admin health platform line stay. Parked splits automatic from owner-action by the run's own evidence (hold reason, recovery fields), not raw status. (ported-mock review)
 - **D12** No cost-per-day or cost-per-month chart (maintainer call); this also drops the only usage time-series dependency.
-- **D13** The Factory scope shows per-user Runs, PRs, Failed, Fail rate, Last failure (lifetime value) and Cost, in that order, plus a Proposed Claude / Codex split (maintainer call); provider, not model.
+- **D13** The Factory scope shows per-user Runs, PRs, Failed, Fail rate, Last failure (lifetime value) and Cost, in that order, plus a Claude / Codex split (maintainer call; Proposed here, delivered by #3876); provider, not model.
 - **D14** The decisions card self-hides when empty (maintainer call).
 - **D15** App-wide banners (vault, maintenance, update escalation, health danger and attention) keep their components, order and behaviour, and the sidebar vault chip stays; the Overview never duplicates them.
 - **D16** PR open lists only PRs opened by the viewer's own uzi runs, for admins too (the admin list carries no completed runs); human and bot PRs are out of scope.
 - **D17** Run scope follows today's Runs page: a normal user sees only their runs; an admin also sees every other user's runs, as a separate "Other users (admin)" group (maintainer call on the name), and the line counts them. Needs your decision stays the viewer's own (maintainer call). A behaviour change from today's Overview, which lists only the viewer's own runs even for admins.
 - **D18** On the Overview the banner stack sits under the page header, between the greeting and Needs your decision (maintainer call). Its all-pages variant is superseded by D20.
-- **D19** The Search button lives only in the Overview header; the Cmd K shortcut opens the menu on every page (recommendation; the maintainer leaned Overview-only, confirm before dispatching #3875).
+- **D19** The Search button lives only in the Overview header; the Cmd K shortcut opens the menu on every signed-in page (confirmed by the maintainer 2026-11-10; no sidebar entry).
 - **D20** Banners render under the header on the Overview only; other pages keep the shell slot (maintainer call). One shared component, so placement differs but code does not.
 - **D21** ci_fix and mr_rework runs sit in Other work: they maintain an existing PR, they are not issue lifecycle stages.
 - **D22** Shadow markers: `data-attention` on the decisions card, `data-live` on the issue-work card.
@@ -199,9 +199,7 @@ Build from what exists; do not re-implement these. The original anchors were che
 ## Open decisions
 
 1. After the trial: promote the preview and delete the old Overview (B), or keep both behind a per-user setting (C)? Decided at #3877.
-2. Confirm the Cmd K shortcut works on every page (D19's recommendation) rather than only on the Overview.
-
-Resolved since the issue was filed: ci_fix and mr_rework placement (D21), Shadow markers (D22), provider split by runs (D23), banners Overview-only (D20).
+Resolved since the issue was filed: ci_fix and mr_rework placement (D21), Shadow markers (D22), provider split by runs (D23), banners Overview-only (D20), Cmd K on every signed-in page with the button on the Overview only (D19).
 
 ## Inspiration (patterns borrowed, not visuals)
 

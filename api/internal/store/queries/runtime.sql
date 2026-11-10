@@ -1144,6 +1144,7 @@ WITH checker_template_pins AS MATERIALIZED (
     SELECT * FROM workers WHERE id = @worker_id FOR UPDATE
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id,
+           r.policy_pending_fresh,
            fo.connection_id AS forge_connection_id, fo.origin AS forge_origin, fc.incarnation AS forge_incarnation,
            fc.observation_version AS forge_observation_version,
            fo.api_origin AS forge_api_origin, fca.incarnation AS forge_api_incarnation,
@@ -1384,7 +1385,7 @@ WITH checker_template_pins AS MATERIALIZED (
       AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(@worker_protocol_caps::text[]))
       AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(@worker_protocol_caps::text[]))
-      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
       -- completion-protocol clause directly above. A CODEX-INDICATING run may be claimed ONLY by a
@@ -1666,7 +1667,7 @@ WITH checker_template_pins AS MATERIALIZED (
                 AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(p.protocol_capabilities))
                 AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(p.protocol_capabilities))
                 AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(p.protocol_capabilities))
-      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(p.protocol_capabilities))
+      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(p.protocol_capabilities))
                 AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(p.protocol_capabilities))
                 -- PRD #1332 M5A (D3): MIRROR the non-bypassable Codex-harness clause for the peer, or
                 -- fleet-spread could DEFER a CODEX-INDICATING run to an INCAPABLE peer that could never
@@ -1977,6 +1978,16 @@ hold AS (
       -- push), so it never opens a custody hold, whatever the claiming worker advertises.
       AND t.egress_profile_id IS NULL
     RETURNING 1
+), fresh_consumed AS (
+    -- Compatible-lane one-claim Fresh (#3607 Mf): the consumption audit commits in the SAME statement
+    -- as the claim UPDATE below, keyed on the locked target carrying the pending authorization.
+    -- 'resume' is a server-only input kind that is never delivered to a worker.
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT t.id, 'resume',
+           '{"policy_fresh":"consumed","generation":' || (t.claim_generation + 1)::text || '}'
+    FROM forge_admitted t
+    WHERE t.policy_pending_fresh
+    RETURNING 1
 )
 UPDATE runs SET
     forge_admission = jsonb_build_object('generation', runs.claim_generation + 1, 'worker_id', @worker_id::uuid,
@@ -1991,6 +2002,12 @@ UPDATE runs SET
     -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
     -- claim. Returned in the claim payload; the hold above binds the identical value.
     claim_generation = runs.claim_generation + 1,
+    -- Compatible-lane one-claim Fresh (#3607 Mf): a pending authorization is consumed by exactly this
+    -- claim, which records the generation it spent it on; RETURNING projects it for this claim only.
+    -- Every right-hand side reads the PRE-update row.
+    policy_fresh_consumed_generation = CASE WHEN runs.policy_pending_fresh
+        THEN runs.claim_generation + 1 ELSE runs.policy_fresh_consumed_generation END,
+    policy_pending_fresh = false,
     -- #2988 reverses PRD #1147's provisional-requeue revocation: every successful
     -- fresh claim supersedes the old capability atomically, even for the same worker.
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
@@ -2098,6 +2115,23 @@ SELECT
 -- structural reason the other two are: it is true only while plan_md is the reviewed
 -- (here: create-time-supplied) text.
 SELECT r.checkpoint_tip,
+       -- A resolved policy episode's first fresh context still owes earlier owner history.
+       -- Retire on the new session report; this is prompt context, never Fresh/session authority.
+       (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NOT NULL
+        AND r.session_id IS NULL)::boolean AS policy_resume_context_pending,
+       -- #3607: a headless fresh_from_saved_work continuation has no preserving/head flags.
+       -- Wait for Resume guidance since this episode's resolution until it is applied and, for a
+       -- modern inclusion-reporting worker, actually included. Blank filtering mirrors String.prototype.trim()
+       -- in SteeringChannel.route/requeueUnincludedFollowUps, including Unicode whitespace and line
+       -- terminators. This is input ordering only, never session or Fresh-start authority.
+       (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NOT NULL AND EXISTS (
+           SELECT 1 FROM run_user_inputs i
+           WHERE i.run_id = r.id AND i.kind = 'follow_up'
+             AND i.created_at >= r.policy_resolved_at
+             AND i.disposition IS DISTINCT FROM 'superseded'
+             AND (i.applied_at IS NULL OR (i.inclusion_reported AND i.included_at IS NULL
+                  AND i.body !~ '^[\u0009-\u000D\u0020\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*$'))
+       ))::boolean AS policy_resume_inputs_pending,
        rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.forge_project_id,
@@ -2407,6 +2441,18 @@ UPDATE runs SET
     first_started_at = COALESCE(first_started_at, now()),
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
+    -- Compatible-lane one-claim Fresh confirmation (#3607 Mf): a running report carrying a session id
+    -- confirms the new conversation only when the report's authenticated claim generation equals the
+    -- generation that consumed the authorization AND is still the row's current generation. Anything
+    -- else leaves the stamp alone. Never clears preserve_required or the saved-work head.
+    policy_fresh_confirmed_generation = CASE
+        WHEN sqlc.narg('fresh_confirm_generation')::bigint IS NOT NULL
+             AND NULLIF(sqlc.narg('session_id')::text, '') IS NOT NULL
+             AND runs.policy_fresh_consumed_generation = sqlc.narg('fresh_confirm_generation')::bigint
+             AND runs.claim_generation = sqlc.narg('fresh_confirm_generation')::bigint
+             AND runs.policy_fresh_confirmed_generation IS NULL
+            THEN runs.policy_fresh_consumed_generation
+        ELSE runs.policy_fresh_confirmed_generation END,
     repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),
     repo_agent_source_commit = COALESCE(repo_agent_source_commit, sqlc.narg('repo_agent_source_commit')::text),
     agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
@@ -4314,9 +4360,11 @@ WITH candidates AS MATERIALIZED (
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
   AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
-  AND NOT runs.policy_preserve_required AND NOT runs.policy_pending_fresh
-  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
-  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
+  -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
+  -- touches no policy column.
+  AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold' OR runs.policy_pending_fresh
+           OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
@@ -4408,9 +4456,11 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
   AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
-  AND NOT runs.policy_preserve_required AND NOT runs.policy_pending_fresh
-  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
-  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
+  -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
+  -- touches no policy column.
+  AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold' OR runs.policy_pending_fresh
+           OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
@@ -4450,6 +4500,20 @@ WITH parked AS (
     UPDATE runs SET status = 'paused', status_since = now(),
         hold_reason = 'iteration_budget_exhausted',
         hold_captured_head = sqlc.narg('hold_captured_head'),
+        -- #3607 M2a: supersede the required recovery head only with publication evidence persisted in THIS
+        -- statement, bound to the verification record for this claim generation and the current head.
+        policy_required_head = CASE WHEN runs.policy_preserve_required AND sqlc.arg('published')::boolean
+              AND COALESCE(sqlc.narg('checkpoint_contains_latest')::boolean, false)
+              AND sqlc.narg('hold_captured_head')::text ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+              AND runs.policy_recovery_verified_generation = sqlc.arg('claim_generation')::bigint
+              AND runs.policy_recovery_verified_head = runs.policy_required_head
+            THEN sqlc.narg('hold_captured_head')::text ELSE runs.policy_required_head END,
+        policy_recovery_verified_head = CASE WHEN runs.policy_preserve_required AND sqlc.arg('published')::boolean
+              AND COALESCE(sqlc.narg('checkpoint_contains_latest')::boolean, false)
+              AND sqlc.narg('hold_captured_head')::text ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+              AND runs.policy_recovery_verified_generation = sqlc.arg('claim_generation')::bigint
+              AND runs.policy_recovery_verified_head = runs.policy_required_head
+            THEN sqlc.narg('hold_captured_head')::text ELSE runs.policy_recovery_verified_head END,
         pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
         health = 'ok', health_reason = NULL, health_since = NULL, updated_at = now()
     WHERE runs.id = @id AND runs.worker_id = @worker_id
@@ -4541,6 +4605,22 @@ UPDATE runs SET
     session_id         = COALESCE(sqlc.narg('session_id'), runs.session_id),
     hold_reason        = 'budget_exhausted',
     hold_captured_head = sqlc.narg('hold_captured_head'),
+    -- #3607 M2a: supersede the required recovery head only with publication evidence persisted in THIS
+    -- statement, bound to the verification record for this claim generation and the current head.
+    policy_required_head = CASE WHEN runs.policy_preserve_required AND sqlc.arg('published')::boolean
+          AND COALESCE(sqlc.narg('checkpoint_contains_latest')::boolean, false)
+          AND sqlc.narg('hold_captured_head')::text ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+          AND sqlc.narg('claim_generation')::bigint IS NOT NULL
+          AND runs.policy_recovery_verified_generation = runs.claim_generation
+          AND runs.policy_recovery_verified_head = runs.policy_required_head
+        THEN sqlc.narg('hold_captured_head')::text ELSE runs.policy_required_head END,
+    policy_recovery_verified_head = CASE WHEN runs.policy_preserve_required AND sqlc.arg('published')::boolean
+          AND COALESCE(sqlc.narg('checkpoint_contains_latest')::boolean, false)
+          AND sqlc.narg('hold_captured_head')::text ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+          AND sqlc.narg('claim_generation')::bigint IS NOT NULL
+          AND runs.policy_recovery_verified_generation = runs.claim_generation
+          AND runs.policy_recovery_verified_head = runs.policy_required_head
+        THEN sqlc.narg('hold_captured_head')::text ELSE runs.policy_recovery_verified_head END,
     pause_requested_at = NULL,
     pause_mode         = NULL,
     pause_after_count  = NULL,
@@ -5234,6 +5314,8 @@ UPDATE runs SET
     finished_at        = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -5327,6 +5409,8 @@ UPDATE runs SET
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
   AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -5386,6 +5470,8 @@ WITH failed AS (
         credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
         -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
         health = 'ok', health_reason = NULL, health_since = NULL,
+        -- #3607 M2a: a terminal run carries no required-recovery identity.
+        policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
         updated_at         = now()
     WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
@@ -5441,6 +5527,8 @@ UPDATE runs SET
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE id = @id
   AND status NOT IN ('completed', 'failed', 'cancelled');
@@ -5490,6 +5578,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
@@ -5574,6 +5664,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
@@ -5666,6 +5758,8 @@ UPDATE runs SET
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -5726,6 +5820,8 @@ WITH candidates AS MATERIALIZED (
         credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
         -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
         health = 'ok', health_reason = NULL, health_since = NULL,
+        -- #3607 M2a: a terminal run carries no required-recovery identity.
+        policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
         updated_at         = now()
     WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
       AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -5796,6 +5892,8 @@ UPDATE runs SET
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
@@ -6240,7 +6338,24 @@ WHERE runs.id = @id AND runs.status = 'claimed'
 -- ParkQueuedCodexAccountUnavailablePage's plus one extra
 -- column: this exact-claim park also rewrites worker_id to the newest open custody holder (D4),
 -- while the queued park leaves worker_id alone.
+WITH fresh_restored AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT r.id, 'resume', '{"policy_fresh":"restored","generation":' || r.claim_generation::text || '}'
+    FROM runs r
+    WHERE r.id = @id AND r.worker_id = @worker_id AND r.claim_generation = @claim_generation
+      AND r.status = 'claimed' AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework', 'cross_check')
+      AND r.policy_fresh_consumed_generation = @claim_generation::bigint
+      AND r.policy_fresh_confirmed_generation IS NULL AND r.policy_preserve_required
+    RETURNING 1
+)
 UPDATE runs SET
+    -- One-claim Fresh restore (#3607 Mf): this writer proves the claim payload was never delivered, so an
+    -- authorization the exact claim consumed and no report confirmed is restored to pending. Only
+    -- server-known non-delivery restores; stale requeue, snapshot recovery and the sweeper never do.
+    policy_pending_fresh = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN true ELSE runs.policy_pending_fresh END,
+    policy_fresh_consumed_generation = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN NULL ELSE runs.policy_fresh_consumed_generation END,
     status = 'recovery_wait', recovery_wait_cause = 'codex_account_unavailable',
     status_since = now(), recovery_retry_not_before = NULL,
     started_at = NULL, budget_paused_seconds = 0,
@@ -6592,8 +6707,24 @@ WITH candidates AS MATERIALIZED (
     SELECT DISTINCT mapping.run_id
     FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+), fresh_restored AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT r.id, 'resume', '{"policy_fresh":"restored","generation":' || r.claim_generation::text || '}'
+    FROM runs r
+    WHERE r.id = @id AND r.id IN (SELECT run_id FROM eligible_candidates) AND r.worker_id = @worker_id AND r.claim_generation = @claim_generation
+      AND r.status = 'claimed'
+      AND r.policy_fresh_consumed_generation = @claim_generation::bigint
+      AND r.policy_fresh_confirmed_generation IS NULL AND r.policy_preserve_required
+    RETURNING 1
 )
 UPDATE runs SET
+    -- One-claim Fresh restore (#3607 Mf): this writer proves the claim payload was never delivered, so an
+    -- authorization the exact claim consumed and no report confirmed is restored to pending. Only
+    -- server-known non-delivery restores; stale requeue, snapshot recovery and the sweeper never do.
+    policy_pending_fresh = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN true ELSE runs.policy_pending_fresh END,
+    policy_fresh_consumed_generation = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN NULL ELSE runs.policy_fresh_consumed_generation END,
     status = CASE WHEN @pool_wait::boolean THEN 'pool_wait' ELSE 'queued' END,
     status_since = now(),
     started_at = CASE WHEN @pool_wait::boolean THEN NULL ELSE runs.started_at END,
@@ -9223,7 +9354,14 @@ SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.output_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_output_tokens,
     COALESCE(SUM(t.cost_usd) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
     count(*) FILTER (WHERE t.cost_status = 'subscription' AND r.created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
-    count(*) FILTER (WHERE t.cost_status = 'unreported' AND r.created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count
+    count(*) FILTER (WHERE t.cost_status = 'unreported' AND r.created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
+    -- Runs by harness (issue #3876), the same population as run_count / last7_run_count.
+    -- runs.harness is NOT NULL with CHECK (harness IN ('claude','codex')) (migrations
+    -- 00226/00227), so per window claude + codex == run_count.
+    count(t.run_id) FILTER (WHERE r.harness = 'claude')::bigint AS claude_run_count,
+    count(t.run_id) FILTER (WHERE r.harness = 'codex')::bigint AS codex_run_count,
+    count(t.run_id) FILTER (WHERE r.harness = 'claude' AND r.created_at >= now() - interval '7 days')::bigint AS last7_claude_run_count,
+    count(t.run_id) FILTER (WHERE r.harness = 'codex' AND r.created_at >= now() - interval '7 days')::bigint AS last7_codex_run_count
 FROM run_usage_totals t
 JOIN runs r ON r.id = t.run_id
 JOIN users u ON u.id = r.user_id
@@ -11139,7 +11277,7 @@ WHERE run.id = @run_id
   AND (NOT run.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
   AND ((NOT run.repo_agent_source_required AND run.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
   AND (run.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
-      AND (NOT (run.policy_preserve_required OR run.policy_pending_fresh OR (run.policy_outcome_id IS NOT NULL AND run.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (run.policy_preserve_required OR run.policy_pending_fresh OR (run.policy_outcome_id IS NOT NULL AND run.policy_resolved_at IS NULL) OR run.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.kind = 'prompt' AND run.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = run.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
@@ -11668,7 +11806,7 @@ WHERE r.status = 'queued'
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
-      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
@@ -11916,7 +12054,7 @@ WHERE r.status = 'queued'
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
-      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
@@ -12003,7 +12141,7 @@ WHERE r.status = 'queued'
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
-      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))

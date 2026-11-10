@@ -28,7 +28,7 @@ it("every isolated lane disables the SDK builtin plugin-authoring plugin", () =>
 
 // Real offline captures with the production checker options and dummy auth, aborted at init.
 // These captures predate the structured-output request (built without outputSchema); the
-// carrier-bearing init is covered by test/fixtures/claude-structured-output-0.3.310.json.
+// carrier-bearing init is covered by test/fixtures/claude-structured-output-0.3.316.json.
 // Native CLI 2.1.287 (deployed SDK 0.3.287) and 2.1.290 (SDK 0.3.290), 2026-10-13.
 // Only surface/version fields are retained. Each version was captured before and after disabling
 // cc-plugin-plugin-authoring@builtin. The separate .probe.ts repeats the real CLI experiment.

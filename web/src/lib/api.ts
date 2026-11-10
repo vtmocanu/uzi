@@ -37,6 +37,8 @@ import type {
   AdminWorker,
   AgentSelectionInput,
   MilestoneResetOptions,
+  PolicyHoldResumeRequest,
+  PolicyHoldResumeResponse,
   AgentSourceApplyResult,
   AgentSourceView,
   AgentTemplate,
@@ -1610,6 +1612,17 @@ const realApi = {
    */
   resumeRun: (id: string) =>
     request<{ run: Run }>("POST", `/runs/${id}/resume-now`),
+
+  /**
+   * Issue #3607: the owner's choice on a Codex policy hold, posted to the same
+   * /runs/{id}/resume-now endpoint WITH a body naming the mode and the episode it was
+   * chosen for (resumeRun / resumeRunNow stay body-less for every other hold). 200 carries
+   * `replay: true` when this exact request was applied before (a lost response). 409 when
+   * the hold changed or does not offer the mode, or when the run was already resumed with
+   * different guidance; 400 for a bad body. Owner-scoped (404 otherwise).
+   */
+  resumePolicyHold: (id: string, body: PolicyHoldResumeRequest) =>
+    request<PolicyHoldResumeResponse>("POST", `/runs/${id}/resume-now`, body),
 
   /**
    * PRD #320 M6: bump THIS run to the front of the queue (`expedite: true`) or clear

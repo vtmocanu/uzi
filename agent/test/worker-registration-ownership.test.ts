@@ -19,7 +19,7 @@ const config = { dockerWiring: {}, workerName: "registration", workerTemplate: "
   chatSessions: 0, gapFillMax: 1000, outboxTerminalMaxBytes: 1 << 20 } as Config;
 const runner = { resumePendingRecoveries: async () => {} } as unknown as RunRunner;
 function outbox(entries: PendingTerminal[]): Outbox {
-  return { listPendingTerminals: () => entries, listPendingOutcomeSources: () => entries,
+  return { isDisabled: () => false, listPendingTerminals: () => entries, listPendingOutcomeSources: () => entries,
     listPendingFinalizes: () => [], listPublicationRegisterEntries: () => [], uncleanRuns: () => [], depths: () => [],
     runsWithPending: () => [], unclassifiedPolicyRunIds: () => [], depthFor: () => undefined,
     drain: async () => {}, hasUndrainedMessages: () => false } as unknown as Outbox;
@@ -42,6 +42,7 @@ it(`registration and heartbeat precede ${count} slow ownership reads (coverage=$
   const held = new Promise<void>(resolve => { release = resolve; });
   let requests = 0, beats = 0, claims = 0;
   let initial: ActiveSnapshot | undefined;
+  let capabilities: string[] | undefined;
   const client = {
     hasFeature: (feature: string) => feature === "active_run_snapshot",
     supportsScopedPendingClaim: false,
@@ -51,6 +52,7 @@ it(`registration and heartbeat precede ${count} slow ownership reads (coverage=$
       return { status: "running", claim_generation: 1, claim_released: false };
     },
     register: async (...args: unknown[]) => {
+      capabilities = args[4] as string[];
       initial = args.find(arg => arg && typeof arg === "object" && "snapshot_epoch" in arg) as ActiveSnapshot | undefined;
       registered.resolve(); return { worker_id: id(9999) };
     },
@@ -68,6 +70,8 @@ it(`registration and heartbeat precede ${count} slow ownership reads (coverage=$
   try {
     const first = await Promise.race([registered.promise.then(() => "registered"), ownership.promise.then(() => "ownership"), timeout]);
     assert.equal(first, "registered", "ownership GET must not precede registration");
+    assert.ok(capabilities?.includes("provider_policy_hold_v1"),
+      "a usable outbox and registry advertise policy holds before ownership reads settle");
     await Promise.race([Promise.all([ownership.promise, heartbeats.promise]), timeout]);
     assert.ok(requests > 0, "post-registration reconciliation is still performed");
     assert.ok(beats >= 2, "heartbeat remains independent of slow ownership reads");

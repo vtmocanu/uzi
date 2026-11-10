@@ -892,6 +892,7 @@ func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO, window string
 			row.RunCount = row.Last7RunCount
 			row.SubscriptionRunCount = row.Last7SubscriptionRunCount
 			row.UnreportedRunCount = row.Last7UnreportedRunCount
+			row.HarnessRuns = row.Last7HarnessRuns
 			runs += row.RunCount
 		}
 	}
@@ -913,15 +914,31 @@ func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO, window string
 		return nil
 	}
 	p.Println()
+	// CLAUDE/CODEX (issue #3876) appears only when every row carries the selected window's
+	// split; an older server omits the fields, and a partial column would mislead.
+	showHarness := true
+	for _, row := range users {
+		if row.HarnessRuns == nil {
+			showHarness = false
+			break
+		}
+	}
+	header := []string{"EMAIL", "RUNS"}
+	if showHarness {
+		header = append(header, "CLAUDE/CODEX")
+	}
+	header = append(header, "FAILED", "FAIL%", "SINCE", "INPUT", "CACHE_READ", "CACHE_CREATION", "OUTPUT", "COST")
 	rows := make([][]string, 0, len(users))
 	for _, row := range users {
 		outcomes := row.Outcomes
 		if window == "last_7_days" {
 			outcomes = row.Last7Outcomes
 		}
-		rows = append(rows, []string{
-			row.Email,
-			fmt.Sprintf("%d", row.RunCount),
+		cells := []string{row.Email, fmt.Sprintf("%d", row.RunCount)}
+		if showHarness {
+			cells = append(cells, fmt.Sprintf("%d/%d", row.HarnessRuns.Claude, row.HarnessRuns.Codex))
+		}
+		rows = append(rows, append(cells,
 			// FAILED carries the same inline needs-landing sub-cut as the factory line, so the
 			// per-user row and the total read the split the same way (no new column).
 			failedFigure(outcomes.Failed, outcomes.NeedsLanding),
@@ -932,9 +949,9 @@ func renderAdminUsage(p *uzicli.Printer, u apitypes.AdminUsageDTO, window string
 			fmt.Sprintf("%d", row.Usage.CacheCreationTokens),
 			fmt.Sprintf("%d", row.Usage.OutputTokens),
 			adminUsageCost(row.Usage.CostUSD, row.SubscriptionRunCount, row.UnreportedRunCount),
-		})
+		))
 	}
-	return p.Table([]string{"EMAIL", "RUNS", "FAILED", "FAIL%", "SINCE", "INPUT", "CACHE_READ", "CACHE_CREATION", "OUTPUT", "COST"}, rows)
+	return p.Table(header, rows)
 }
 
 func adminUsageCost(cost float64, subscription, unreported int64) string {

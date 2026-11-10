@@ -115,9 +115,12 @@ new version can break uzi or ship capabilities uzi should adopt.
   `enhancement` issue, separate from the bump; never implement it in the bump PR. Report
   what you found, or "nothing actionable", at batch end.
 
-## Worker-toolchain bump PRs (devbox, not Renovate)
+## Worker-toolchain bump PRs
 
-`agent/devbox-global` (go, gcc, python3, chromium, semgrep, helm, …) is not Renovate-covered.
+Renovate proposes the explicit worker Go nixpkgs digest, but does not repair its lock metadata.
+Follow `docs/worker-tools.md` for fresh Nix evaluation of the new Go pin and Linux outputs;
+`scripts/check-worker-toolchain.py --restore-go-metadata` only reuses an unchanged pin.
+The other `agent/devbox-global` tools (gcc, python3, chromium, semgrep, helm, …) are not Renovate-covered.
 The weekly `.github/workflows/devbox-update.yml` re-resolves it against nixpkgs and opens
 `chore(deps): refresh devbox worker toolchain` (branch `chore/devbox-toolchain-update`).
 Treat it as Renovate-class, plus:

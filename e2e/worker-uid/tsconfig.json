@@ -14,6 +14,7 @@
     "../../agent/test/git-planning-diff.test.ts",
     "../../agent/test/git-retained-permissions.test.ts",
     "../../agent/test/code-cross-check-replay-uid-split.test.ts",
+    "../../agent/test/stopped-source-unreadable-uid.test.ts",
     "../../agent/test/claude-command-launcher.test.ts",
     "./**/*.mts"
   ],

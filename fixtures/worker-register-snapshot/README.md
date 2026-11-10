@@ -74,7 +74,9 @@ This is deterministic test setup, not a change to production nonce generation or
 the nonce, epoch and ownership fences. Fixed runs are deleted at test cleanup.
 
 `pending_outcome_scoped_claim_v1` is negotiated independently of provider policy
-hold readiness; `provider_policy_hold_v1` is not advertised. The agent also
+hold readiness; the API now advertises `provider_policy_hold_v1` (since #3607
+M2/M3), negotiated independently, and `pending_outcome_scoped_claim_v1` stays
+independent of it. The agent also
 re-registers without the scoped feature and verifies the real serializer omits
 `pending_policy_protection` while retaining overflow and source identities, and
 the registry pauses claims. Grouping is protection evidence only: it grants no

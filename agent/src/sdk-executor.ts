@@ -2005,9 +2005,11 @@ export class SdkExecutor implements Executor {
     //   frozen at construction, so it must be the same list the `agents` map holds, or
     //   the guard admits an Agent call the SDK cannot resolve. The implement turns
     //   rebuild this with the selected roster (PRD #37). The adapter also injects the
-    //   run-wide disallowedTools (ASYNC_DEFERRAL_TOOLS): block the deferral tools so the
-    //   lead can't background work to a future turn the per-turn reap would only wake to
-    //   a killed subagent (#34); delegation is forced synchronous by the Agent guard hook.
+    //   run-wide disallowedTools (ASYNC_DEFERRAL_TOOLS plus native AskUserQuestion, #4149):
+    //   block the deferral tools so the lead can't background work to a future turn the
+    //   per-turn reap would only wake to a killed subagent (#34); delegation is forced
+    //   synchronous by the Agent guard hook. Native AskUserQuestion is denied because
+    //   clarification goes through uzi's MCP ask_user (PRD #88).
     //
     // `leadModel` is computed above (before the plan-turn copy) so the PRD #305 own-roster
     // override can use it; here it only drives the top-level lead model. PRD #617 effort

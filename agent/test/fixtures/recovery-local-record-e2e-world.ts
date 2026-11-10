@@ -7,6 +7,7 @@ import { formatAttemptId } from "../../src/attempt-path.js";
 import { DindPruneGate } from "../../src/dind-prune.js";
 import { GitCache, type OwedCandidate, type PositiveOwedCandidateContext } from "../../src/git.js";
 import type { Logger } from "../../src/log.js";
+import { Outbox } from "../../src/outbox.js";
 import { RetainedSourceServer } from "../../src/ops/retained-source-server.js";
 import type { RecoveryExactHold, RecoveryHoldsResponse, RunOwnershipResponse } from "../../src/protocol.js";
 import type { RecoveryCoordinator, RecoveryRecord } from "../../src/recovery.js";
@@ -59,6 +60,8 @@ export class E2EClient {
   allowFinal = false;
   runStatus = "completed";
   posts: Post[] = [];
+  /** Every api WRITE the coordinator attempted (reserve, upload, release, held publication), in order: a Case B disposition makes none. */
+  writes: string[] = [];
   /** Late-bound: the coordinator's authenticated view of a run's records (set once the runner exists). */
   records: (runId: string) => Promise<RecoveryRecord[]> = async () => [];
   hasFeature = (): boolean => true;
@@ -72,13 +75,16 @@ export class E2EClient {
     return { status: this.runStatus, claim_generation: claim, inventory_guarded: true } as RunOwnershipResponse;
   }
   async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
-    return { run_id: runId, holds: [...this.gens.values()].filter(g => g.runId === runId && g.open).map(g => ({
-      hold_id: g.holdId, generation: g.generation, inventory_guarded: true, has_available_capture: false })) } as RecoveryHoldsResponse;
+    const holds = [...this.gens.values()].filter(g => g.runId === runId && g.open).map(g => ({
+      hold_id: g.holdId, generation: g.generation, inventory_guarded: true, has_available_capture: false }));
+    return { run_id: runId, holds, run_open_holds: { run_id: runId, count: holds.length } } as RecoveryHoldsResponse;
   }
   async reserveRecoveryCapture(): Promise<{ capture_id: string; state: "preparing" }> {
+    this.writes.push("reserve");
     return { capture_id: this.producing!.captureId, state: "preparing" };
   }
   async uploadRecoveryBundle(_run: string, _capture: string, _manifest: unknown, stream: AsyncIterable<unknown>) {
+    this.writes.push("upload");
     for await (const chunk of stream) assert.ok(chunk);
     return { capture_id: this.producing!.captureId, state: "available" as const, manifest_bound: true };
   }
@@ -88,11 +94,14 @@ export class E2EClient {
       byte_size: record?.byteSize, expires_at: "2099-01-01T00:00:00Z" };
   }
   async releaseRecoveryCustody(runId: string, generation?: number, evidence?: string, disposition?: unknown) {
+    this.writes.push("release");
     this.posts.push({ runId, generation, evidence, disposition });
     if (!this.allowFinal) throw new Error("fixture: lost FINAL ACK");
     return { run_id: runId, generation, released: true, holds_released: 1 };
   }
-  async publishHeld(): Promise<never> { throw new Error("unexpected held publication"); }
+  async publishHeld(): Promise<never> {
+    this.writes.push("publishHeld");
+    throw new Error("unexpected held publication"); }
   async getExactRecoveryHold(runId: string, generation: number): Promise<RecoveryExactHold | undefined> {
     return this.of(runId, generation)?.exact;
   }
@@ -124,6 +133,9 @@ export interface WorldOptions {
   serverLog?: Logger;
   /** Test-scoped overrides of the channel server's cooperative deadline and shutdown wait. */
   serverTimeouts?: { resolveDeadlineMs?: number; shutdownSettleMs?: number };
+  /** Wire a REAL, initialised Outbox (under `<dir>/outbox`) into the real RunRunner: its `pendingGenerationReport`
+   *  then reads the outbox's own terminal / policy / finalize state instead of answering false. */
+  outbox?: boolean;
 }
 
 export interface Episode { branch: string; key: string; tip: string; sourcePath: string; successorPath: string }
@@ -136,6 +148,8 @@ export interface World {
   bare: string;
   client: E2EClient;
   runner: RunRunner;
+  /** The runner's real outbox when the world was created with `outbox: true`. */
+  outbox: Outbox | undefined;
   coordinator: RecoveryCoordinator;
   server: RetainedSourceServer;
   gate: DindPruneGate;
@@ -240,8 +254,15 @@ export async function createWorld(opts: WorldOptions): Promise<World> {
   fs.chmodSync(bare, 0o700);
   fs.chmodSync(path.join(bare, "config"), 0o600);
   const client = new E2EClient();
+  let outbox: Outbox | undefined;
+  if (opts.outbox) {
+    outbox = new Outbox({ root: path.join(dir, "outbox"), log: nullLogger(), runMaxBytes: 64 * 1024 * 1024,
+      maxBytes: 512 * 1024 * 1024, retentionMs: 7 * 86_400_000 });
+    await outbox.init();
+    assert.equal(outbox.isDisabled(), false, "the fixture outbox must be usable");
+  }
   const runner = new RunRunner(client as unknown as ConstructorParameters<typeof RunRunner>[0], git, () => { throw new Error("no executor"); },
-    nullLogger(), 20, WORKER_TOKEN, { pollMs: 5 });
+    nullLogger(), 20, WORKER_TOKEN, { pollMs: 5, ...(outbox ? { outbox } : {}) });
   const coordinator = runner["recovery"] as RecoveryCoordinator;
   client.records = runId => coordinator.inspect(runId);
   const gens = new Map<number, GenInfo>();
@@ -280,6 +301,7 @@ export async function createWorld(opts: WorldOptions): Promise<World> {
     }
   }
   client.posts.length = 0;
+  client.writes.length = 0;
   client.allowFinal = true;
   for (const g of gens.values()) g.open = false;
   const gate = new DindPruneGate();
@@ -295,17 +317,19 @@ export async function createWorld(opts: WorldOptions): Promise<World> {
   const served = server.serve(ac.signal);
   await server.ready;
   assert.ok(server.listening, "the retained-source channel must be listening");
-  return { dir, fx, git, bare, client, runner, coordinator, server, gate, sock: server.path, flags, gens, episode, other,
+  return { dir, fx, git, bare, client, runner, outbox, coordinator, server, gate, sock: server.path, flags, gens, episode, other,
     stop: async () => { ac.abort(); await served; fx.cleanup(); fs.rmSync(dir, { recursive: true, force: true }); } };
 }
 
 /** A path -> "mode sha256" digest of every entry under `root` (symlinks by target), for byte-equality comparisons. */
-export function treeDigest(root: string): string[] {
+export function treeDigest(root: string, skip: (rel: string) => boolean = () => false): string[] {
   const lines: string[] = [];
   const visit = (rel: string): void => {
+    if (rel !== "." && skip(rel)) return;
     const full = path.join(root, rel);
     const st = fs.lstatSync(full);
-    if (st.isSymbolicLink()) lines.push(`${rel} link ${fs.readlinkSync(full)}`);
+    if (!st.isSymbolicLink() && !st.isDirectory() && !st.isFile()) lines.push(`${rel} special`);
+    else if (st.isSymbolicLink()) lines.push(`${rel} link ${fs.readlinkSync(full)}`);
     else if (st.isDirectory()) {
       lines.push(`${rel} dir ${st.mode & 0o7777}`);
       for (const name of fs.readdirSync(full).sort()) visit(path.join(rel, name));

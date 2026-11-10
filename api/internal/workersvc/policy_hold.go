@@ -33,6 +33,7 @@ type PolicyHoldRequest struct {
 	SourceGeneration         int64   `json:"source_generation"`
 	ClaimGeneration          int64   `json:"claim_generation"`
 	Detail                   string  `json:"detail"`
+	Cause                    string  `json:"cause"`
 	ContinuationMode         string  `json:"continuation_mode"`
 	PolicyTag                *string `json:"tag,omitempty"`
 	Phase                    *string `json:"phase,omitempty"`
@@ -65,13 +66,16 @@ func (r *PolicyHoldRequest) UnmarshalJSON(data []byte) error {
 	}
 	for key := range fields {
 		switch key {
-		case "outcome_id", "source_generation", "claim_generation", "detail", "continuation_mode", "tag", "phase", "correlation_id", "session_id", "head", "published", "checkpoint_contains_latest":
+		case "outcome_id", "source_generation", "claim_generation", "detail", "cause", "continuation_mode", "tag", "phase", "correlation_id", "session_id", "head", "published", "checkpoint_contains_latest":
 		default:
 			return fmt.Errorf("%w: unknown policy field", ErrInvalidState)
 		}
 	}
 	if _, ok := fields["published"]; !ok {
 		return fmt.Errorf("%w: published required", ErrInvalidState)
+	}
+	if _, ok := fields["cause"]; !ok {
+		return fmt.Errorf("%w: cause required", ErrInvalidState)
 	}
 	for _, raw := range fields {
 		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
@@ -105,6 +109,21 @@ func (r PolicyHoldRequest) Validate() error {
 	}
 	if r.Detail != "refused" && r.Detail != "resume_rejected" {
 		return fmt.Errorf("%w: invalid policy detail", ErrInvalidState)
+	}
+	// The closed owner-facing cause. "refused" is the actual provider refusal; every other value
+	// describes a re-hold. fresh_start_uncertain is the re-hold of a one-claim Fresh whose consumed
+	// authorization never confirmed a new conversation.
+	switch r.Cause {
+	case "refused":
+		if r.Detail != "refused" {
+			return fmt.Errorf("%w: cause refused requires detail refused", ErrInvalidState)
+		}
+	case "attempt_path", "saved_work_missing", "session_missing", "transcript_unknown", "provider_resume_rejected", "pending_conversion", "fresh_start_uncertain":
+		if r.Detail != "resume_rejected" {
+			return fmt.Errorf("%w: re-hold cause requires detail resume_rejected", ErrInvalidState)
+		}
+	default:
+		return fmt.Errorf("%w: invalid policy cause", ErrInvalidState)
 	}
 	if r.ContinuationMode != "same_conversation" && r.ContinuationMode != "fresh_from_saved_work" {
 		return fmt.Errorf("%w: invalid continuation mode", ErrInvalidState)
@@ -164,10 +183,16 @@ func (s *Service) RunPolicyOutcomePending(r store.Run) bool {
 	return true
 }
 
-func activePolicyHold(r store.Run) bool {
-	return r.PolicyPreserveRequired || r.PolicyPendingFresh ||
+// unresolvedPolicyEpisode is the continuation fence: only a still-open episode blocks ordinary
+// writers. A resolved preserving run (policy_preserve_required kept true) continues through the
+// ordinary paths and keeps its constraint; the constraint is enforced at claim and by the worker.
+func unresolvedPolicyEpisode(r store.Run) bool {
+	return (r.HoldReason.Valid && r.HoldReason.String == "codex_policy_hold") || r.PolicyPendingFresh ||
 		(r.PolicyOutcomeID.Valid && !r.PolicyResolvedAt.Valid)
 }
+
+// UnresolvedPolicyEpisode exposes the same predicate to the owner handlers.
+func UnresolvedPolicyEpisode(r store.Run) bool { return unresolvedPolicyEpisode(r) }
 
 // ReportPolicyHold owns a worker/run transaction. Reconciliation precedes state
 // mutation so lost ACK replay cannot undo an intervening owner action.
@@ -314,7 +339,7 @@ func (s *Service) ReportPolicyHold(ctx context.Context, worker store.Worker, run
 		ContinuationMode: pgconv.TextPtr(&req.ContinuationMode), ActualRefusal: actual,
 		PolicyTag: pgconv.TextPtr(req.PolicyTag), Phase: pgconv.TextPtr(req.Phase), CorrelationID: pgconv.TextPtr(req.CorrelationID),
 		SessionID: pgconv.TextPtr(req.SessionID), Head: pgconv.TextPtr(req.Head),
-		Published: req.Published, CheckpointContainsLatest: pgconv.BoolPtr(req.CheckpointContainsLatest),
+		Cause: req.Cause, Published: req.Published, CheckpointContainsLatest: pgconv.BoolPtr(req.CheckpointContainsLatest),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pending("transition_refused")

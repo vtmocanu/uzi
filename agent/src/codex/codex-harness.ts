@@ -117,6 +117,7 @@ import type {
 import {
   admitPolicyTurn,
   isPolicyRefusalTag,
+  PolicyContinuationRejected,
   ProviderPolicyRefusal,
   validatePolicyRefusal,
 } from "../provider-policy-refusal.js";
@@ -1330,6 +1331,17 @@ export class CodexHarness implements RunHarness {
       // 2. Start (or resume) the thread with the explicit untrusted / doc-max config —
       //    and NEVER a hook-trust bypass. Reused across turns once established.
       if (this.threadId === undefined) {
+        // The single authoritative fresh-thread branch: a preserve-only turn with no session to resume
+        // must re-hold, never start a new conversation (no thread/start is sent).
+        if (request.preserveConversation === true && request.resumeSessionId === undefined) {
+          // Only the claim's one-claim Fresh allowance may start a conversation, exactly once: it is spent
+          // BEFORE thread/start, so a failure after the send can never admit a second new conversation.
+          const allowance = request.policyFreshAllowance;
+          if (allowance === undefined) throw new PolicyContinuationRejected("session_missing");
+          // A spent allowance means a thread/start may already have been sent: do not assert none started.
+          if (allowance.remaining !== 1) throw new PolicyContinuationRejected("fresh_start_uncertain");
+          allowance.remaining = 0;
+        }
         const resumed = request.resumeSessionId !== undefined;
         this.resumedRoot = resumed;
         this.threadId = resumed

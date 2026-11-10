@@ -47,6 +47,8 @@ it("absence preserves legacy equal pairs and never authorizes a task from its br
   assert.equal(checkpointCoordinatesForClaim(makeClaim({ kind: "issue", issue_iid: 42 }))?.checkpoint_key, "agent/issue-42");
   assert.equal(checkpointCoordinatesForClaim(makeClaim({ run_id: ROOT, kind: "self_improve" }))?.checkpoint_key,
     "uzi/self-improve/11111111-1111-4111-8111-111111111111");
+  assert.equal(checkpointCoordinatesForClaim(makeClaim({ run_id: ROOT, kind: "prompt", issue_iid: null }))?.checkpoint_key,
+    "uzi/prompt-11111111-1111-4111-8111-111111111111");
 });
 
 it("a missing descriptor cannot discard a task checkpoint anchor or unresolved write", () => {

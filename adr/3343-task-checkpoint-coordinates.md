@@ -28,6 +28,8 @@ share the root branch but have distinct keys. The broker publishes under
 
 The exact legacy issue key `agent/issue-<iid>` and self-improvement key
 `uzi/self-improve/<run-id>` remain unchanged. Other run kinds gain no eligibility.
+(Amended 2026-11-09, #4116: prompt runs later gained the server-derived key
+`uzi/prompt-<run-id>`, equal to their clone branch, without task-style enrollment.)
 Legacy active tasks are not converted in place. Unenrolled tasks keep their
 legacy branch execution without task checkpoint publication; old workers receive
 no descriptor and cannot claim or readopt enrolled tasks.

@@ -379,7 +379,7 @@ export function selfImproveMrSection(guardHits: readonly string[] | null, checks
   if (guardWarning.length > 0) lines.push({ fixed: "" }, ...guardWarning);
 
   if (checks.length > 0) {
-    lines.push({ fixed: "" }, { fixed: "**Test evidence** (run by the worker — this repo has no CI):" }, { fixed: "" });
+    lines.push({ fixed: "" }, { fixed: "**Test evidence** (run by the worker before the push; the PR's own CI is separate):" }, { fixed: "" });
     for (const c of checks) lines.push({ check: c });
     // A skipped check proves NOTHING. Say so plainly, so a reviewer never reads a
     // wall of "skipped" as a wall of "passed" (M8): the worker image may lack the
@@ -391,7 +391,7 @@ export function selfImproveMrSection(guardHits: readonly string[] | null, checks
         { fixed: `> ⚠️ **${skipped.length} of ${checks.length} checks were SKIPPED — skipped is NOT passed.**` },
         { fixed: "> Those suites did not run here (the worker lacks the toolchain or the freshly cloned" },
         { fixed: "> worktree has no installed dependencies), so this MR carries NO evidence for them." },
-        { fixed: "> Run them yourself before merging." },
+        { fixed: "> Their proof must come from the PR's required exact-head CI before merging." },
       );
     }
   }

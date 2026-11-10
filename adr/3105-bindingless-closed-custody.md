@@ -45,6 +45,9 @@ repeated uploads, storage growth or source loss.
    before capture-status lookup; mint admission, retained-claim rules and early
    `heldCreateUncertain` denial remain separate. Existing ACKs and independently
    validated completion receipts still reach their own guarded closeout paths.
+   The operator Case B disposition ([ADR-2417](2417-guarded-local-retention.md#amendment-2026-11-10-case-b-local-record-disposition-3885))
+   does not change this: it never learns or transplants a binding and uses only an
+   `exactHoldBinding` already persisted on the record.
 5. Filter only persisted refusals from redundant discovery/materialization and
    live work. A context skip requires complete authenticated provenance, a canonical
    context match and no relevant unsettled/unknown sibling, matching replay or

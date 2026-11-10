@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode, type Ref } from "react";
-import type { SelfUsage, AdminUsage, RunOutcomes } from "../lib/api";
+import type { SelfUsage, AdminUsage, HarnessRuns, RunOutcomes } from "../lib/api";
 import { formatTokens } from "../lib/formatTokens";
 import { aggregateDisclosure } from "../lib/costStatus";
 import { useDemoMode } from "../lib/demoMode";
@@ -7,7 +7,7 @@ import { maskEmail } from "../lib/demoMask";
 import { overviewScope, USAGE_SCOPE_KEY } from "../lib/prefs";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
-import { breakdown, perUserRows } from "../lib/usageByUser";
+import { breakdown, harnessShare, perUserRows } from "../lib/usageByUser";
 import { Card, SectionTitle } from "./ui";
 import type { UsageWindow } from "./UsageCards";
 import {
@@ -58,13 +58,35 @@ function CostCell({ cost, disclosure, total }: { cost: number; disclosure: Retur
   );
 }
 
-// PRD #3881 M2: the Factory scope's per-user table. Columns are fixed on every API version;
-// a PR count the API does not report reads "—", never 0.
+const HARNESS_TITLE =
+  "Share of each user's runs by harness, the same runs as the Runs column; cross-check runs count under the harness they ran on";
+
+// Issue #3876: a user's Claude / Codex share as a two-segment bar plus its figures. A window
+// with no runs reads "—".
+function HarnessCell({ runs }: { runs: HarnessRuns }) {
+  const share = harnessShare(runs);
+  if (!share) return <Td variant="preview">—</Td>;
+  return (
+    <Td variant="preview" title={`${runs.claude.toLocaleString("en-US")} Claude, ${runs.codex.toLocaleString("en-US")} Codex runs`}>
+      <span className="inline-flex items-center gap-2">
+        <span aria-hidden="true" className="flex h-1.5 w-[72px] overflow-hidden rounded-[3px] bg-raised">
+          <span className="block h-full bg-brand-claude" style={{ width: `${share.claude}%` }} />
+          <span className="block h-full bg-muted" style={{ width: `${share.codex}%` }} />
+        </span>
+        <span className="min-w-12 text-right text-[11px] font-normal tabular-nums text-faint">{share.claude} / {share.codex}</span>
+      </span>
+    </Td>
+  );
+}
+
+// PRD #3881 M2: the Factory scope's per-user table. The columns are fixed on every API version,
+// except Claude / Codex (issue #3876), which appears only when the API sends every row's
+// harness split for the window; a PR count the API does not report reads "—", never 0.
 // The section takes focus (tabIndex -1) when the People chip's "Usage by user" lands here.
 function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; window: UsageWindow; viewerId: string; ref: Ref<HTMLElement> }) {
   const now = useNow(30_000);
   const demo = useDemoMode();
-  const { available, rows, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure } = perUserRows(admin, window);
+  const { available, rows, showHarness, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure } = perUserRows(admin, window);
   const recent = window === "last_7_days";
   return (
     <section ref={ref} id="overview-usage-by-user" tabIndex={-1} aria-label="By user" className="mt-5 border-t border-edge pt-4 scroll-mt-20 rounded-md outline-hidden focus:ring-2 focus:ring-ring">
@@ -80,7 +102,8 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
         <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
       ) : (
         <div data-testid="by-user-scroll" role="region" aria-label="By user, scrollable" className="mt-2 overflow-x-auto">
-          <table aria-label="By user" className="w-full min-w-[640px] border-collapse text-[13px]">
+          {/* The Claude / Codex column (#3876) widens the floor to the mock's 780px; without it the table keeps 640px. */}
+          <table aria-label="By user" className={`w-full ${showHarness ? "min-w-[780px]" : "min-w-[640px]"} border-collapse text-[13px]`}>
             <thead>
               <tr>
                 <Th variant="preview" left>User</Th>
@@ -90,6 +113,7 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
                 <Th variant="preview" title="Failed of finished runs in the period">Fail rate</Th>
                 <Th variant="preview" title={LAST_FAILURE_TITLE}>Last failure</Th>
                 <Th variant="preview">Cost</Th>
+                {showHarness && <Th variant="preview" title={HARNESS_TITLE}>Claude / Codex</Th>}
               </tr>
             </thead>
             <tbody>
@@ -105,6 +129,7 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
                   <FailRateCell outcomes={u.selectedOutcomes} />
                   <Td variant="preview">{failureAgo(u.outcomes, now)}</Td>
                   <CostCell cost={u.b.cost} disclosure={aggregateDisclosure(u.subscription, u.unreported)} />
+                  {showHarness && <HarnessCell runs={u.selectedHarness!} />}
                 </tr>
               ))}
             </tbody>
@@ -117,6 +142,7 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
                 <FailRateCell outcomes={factoryOutcomes} total />
                 <Td variant="preview" total>{failureAgo(admin.factory.outcomes.lifetime, now)}</Td>
                 <CostCell cost={factory.cost} disclosure={factoryDisclosure} total />
+                {showHarness && <Td variant="preview" total />}
               </tr>
             </tfoot>
           </table>

@@ -870,6 +870,28 @@ void _releaseCheckStatusFull;
   const extra12: never = null as unknown as Exclude<keyof typeof value12, keyof AdminUsageUser>;
   const full12: Widen<AdminUsageUser> = value12;
   void missing12; void extra12; void full12;
+  // Issue #3876: the per-user harness split, in both windows and on the list endpoint's rows.
+  type Harness = NonNullable<AdminUsageUser["harness_runs"]>;
+  const value13 = adminUserUsageFull.harness_runs;
+  const missing13: never = null as unknown as Exclude<keyof Harness, keyof typeof value13>;
+  const extra13: never = null as unknown as Exclude<keyof typeof value13, keyof Harness>;
+  const full13: Widen<Harness> = value13;
+  void missing13; void extra13; void full13;
+  const value14 = adminUserUsageFull.last7_harness_runs;
+  const missing14: never = null as unknown as Exclude<keyof Harness, keyof typeof value14>;
+  const extra14: never = null as unknown as Exclude<keyof typeof value14, keyof Harness>;
+  const full14: Widen<Harness> = value14;
+  void missing14; void extra14; void full14;
+  const value15 = adminUsageFull.users[0].harness_runs;
+  const missing15: never = null as unknown as Exclude<keyof Harness, keyof typeof value15>;
+  const extra15: never = null as unknown as Exclude<keyof typeof value15, keyof Harness>;
+  const full15: Widen<Harness> = value15;
+  void missing15; void extra15; void full15;
+  const value16 = adminUsageFull.users[0].last7_harness_runs;
+  const missing16: never = null as unknown as Exclude<keyof Harness, keyof typeof value16>;
+  const extra16: never = null as unknown as Exclude<keyof typeof value16, keyof Harness>;
+  const full16: Widen<Harness> = value16;
+  void missing16; void extra16; void full16;
   // Fixture-only nulls: AdminUsage allocates users; runOutcomes normalizes origins;
   // the new per-user handler always allocates last_7_days, even for zero usage.
   type OutcomeZero = ZeroOf<RunOutcomes, "fail_origins">;

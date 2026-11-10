@@ -32,12 +32,15 @@ function readJournal(bare: string, branch: string): any {
   }).trim());
 }
 
-async function seed(iid = 3995, overrides: Record<string, unknown> = {}) {
-  const claim = gitlabClaim(iid, { claim_generation: 2, session_id: "predecessor-session", ...overrides });
+async function seed(iid = 3995, overrides: Record<string, unknown> = {}, prompt = false) {
+  const claim = gitlabClaim(iid, { claim_generation: 2, session_id: "predecessor-session",
+    ...(prompt ? { kind: "prompt", issue_iid: null } : {}), ...overrides });
   const bare = await git.ensureClone(fx.originPath);
   fs.chmodSync(path.dirname(bare), 0o700);
   fs.chmodSync(bare, 0o700);
-  const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, claim.run_id);
+  const clone = prompt
+    ? await git.runnerCloneForBranch(bare, `uzi/prompt-${claim.run_id}`, `uzi-prompt-${claim.run_id}`, noProofReseed, claim.run_id)
+    : await git.createOrAttachRunnerClone(bare, iid, noProofReseed, claim.run_id);
   await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
   fs.writeFileSync(path.join(clone.path, "retained.txt"), "only local dirty work\n");
   api.setOwnershipStatus(claim.run_id, "running", 2);
@@ -74,6 +77,8 @@ interface Rig {
 }
 interface RigOptions {
   iid?: number;
+  /** Seed and claim a `prompt`-kind run (branch uzi/prompt-<run-id>, no issue iid). */
+  prompt?: boolean;
   failPublish?: boolean;
   claim?: Record<string, unknown>;
   /** Route an owner `now` pause inside the recovery window (first recovery reservation). */
@@ -99,7 +104,7 @@ interface RigOptions {
 
 /** Build a runner over a seeded retained clone. `deliver` runs once, at the chosen seam, with the live flight. */
 async function rig(hook: Hook, deliver: (flight: any, runner: any) => void, opts: RigOptions = {}): Promise<Rig> {
-  const { claim, bare, clone } = await seed(opts.iid ?? 3995, opts.claim);
+  const { claim, bare, clone } = await seed(opts.iid ?? 3995, opts.claim, opts.prompt === true);
   client.protocolFeatures = opts.protocolFeatures ?? ["claim_generation_fence"];
   const retainedHome = path.join(homeDir, claim.run_id);
   fs.mkdirSync(retainedHome, { recursive: true });
@@ -265,6 +270,34 @@ it("control: a run with no pause reaches the model after one recovery reservatio
   assert.equal(rg.models, 1);
   assert.equal(rg.reserves, 1);
   assert.equal(pausedReports(rg), 0);
+});
+
+// Issue #4116 (characterization: expected to pass on base too). A prompt run's checkpoint key is
+// uzi/prompt-<run-id>; the deferred owner `now` pause must behave exactly as for an issue run.
+it("prompt kind: a deferred now pause waits for retained recovery, then parks once with a published checkpoint and no model call", async () => {
+  const rg = await rig("reserve", flight => route(flight, "pause", "now"), { prompt: true });
+  assert.equal(rg.clone.branch, `uzi/prompt-${rg.claim.run_id}`);
+  await rg.runner.execute(rg.claim);
+  assert.equal(rg.fired, 1, "the pause was delivered inside recovery");
+  assert.equal(pausedReports(rg), 1, "exactly one paused report");
+  assert.equal(rg.flight.parked, true);
+  assert.equal(rg.models, 0, "no model call after the owner pause");
+  assert.equal(rg.reserves, 1, "recovery completed (one reservation) before the park");
+  assert.equal(rg.publishes >= 1, true, "the pause park published a checkpoint first");
+  assert.equal(statuses(rg).includes("pause_failed" as any), false);
+  assert.equal(statuses(rg).includes("failed"), false);
+});
+
+it("prompt kind: a refused paused ACK is not a parked run and keeps custody", async () => {
+  const rg = await rig("reserve", flight => route(flight, "pause", "now"), {
+    prompt: true,
+    report: async (body, original) => body.status === "paused" ? ({ status: "running" } as any) : original(),
+  });
+  await rg.runner.execute(rg.claim);
+  assert.equal(rg.pauseParks, 1);
+  assert.equal(rg.flight.parked === true, false);
+  assert.equal(rg.models, 0);
+  assert.ok(custodyKept(rg));
 });
 
 const SEAM_LABEL = { reserve: "before capture", capture: "during the predecessor capture", successor: "after the successor handoff" } as const;
@@ -658,9 +691,10 @@ it("production SdkExecutor: a pre-approved claim parks on the deferred pause wit
   assert.equal(rg.summaryCalls, 0);
 });
 
-it("required-base validation holds an unattested retained successor before a deferred pause can publish", async t => {
+for (const prompt of [false, true]) it(`${prompt ? "prompt kind (issue #4116, characterization): " : ""}required-base validation holds an unattested retained successor before a deferred pause can publish`, async t => {
   const planned = gitOut(fx.originPath, "rev-parse", "HEAD");
   const rg = await rig("reserve", flight => route(flight, "pause", "now"), {
+    prompt,
     production: true,
     claim: { plan_md: "# Plan\n- preserve the planned base", plan_approved: true, plan_source: "seeded",
       planned_base_commit: planned, require_base_match: true },

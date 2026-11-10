@@ -1,3 +1,4 @@
+import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { countPartialCause, mergePartialCauses, type PartialCause, type PartialCauses } from "./pod-epoch-partial-causes.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { isCheckpointBoundaryFailure, CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "./checkpoint-stop.js";
@@ -8,13 +9,13 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { constants as fsConstants, createReadStream, createWriteStream, type Stats } from "node:fs";
+import { lstatSync, constants as fsConstants, createReadStream, createWriteStream, type Stats } from "node:fs";
 import os from "node:os";
 import { isUtf8 } from "node:buffer";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { finished, pipeline } from "node:stream/promises";
-import { crc32, deflateSync } from "node:zlib";
+import { crc32, createInflate, deflateSync, inflateSync } from "node:zlib";
 import { PassThrough, Readable, Transform, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { RUN_KINDS, type RunKind } from "./protocol.js";
@@ -26,7 +27,8 @@ import { CheckpointChildStartupTimeoutError } from "./harness.js";
 import type { CredentialFreeCaptureContext } from "./harness.js";
 import type { CommandSandboxMode } from "./config.js";
 import { validateCaptureGitRequest } from "./credential-free-capture.js";
-import { RUNNER_UID, WORKER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
+import { processGroupAlive } from "./tick-spawner.js";
+import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
@@ -43,6 +45,7 @@ import {
   parseAttemptPath,
   parseRetainedArtifactName,
 } from "./attempt-path.js";
+import { GitIndexError, indexUnchanged, readBoundedIndex, readSmallRegularFile, statSignature, withClosingHandle, type BoundedIndex } from "./git-index.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { parseSourceFence, serializeSourceFence, type CompletionSourceFence } from "./completion-source.js";
 import {
@@ -1335,9 +1338,98 @@ const PROOF_READ_ENV: NodeJS.ProcessEnv = {
 };
 /** Read-only `status` of a kept clone: GIT_OPTIONAL_LOCKS=0 stops git rewriting the clone's .git/index stat cache. */
 const READ_ONLY_STATUS = { env: { ...NO_REPLACE_ENV, GIT_OPTIONAL_LOCKS: "0" } as NodeJS.ProcessEnv };
+/** The empty tree. `--attr-source` set to it makes Git read gitattributes from no tree at all, so
+ *  neither the worktree's nor the index's `.gitattributes` (nor `attr.tree`) can select a filter. */
+const EPOCH_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/** Config overrides carried by every clone-side native read of the automatic worktree proof
+ *  (`core.worktree=<clone>` is added per launch). They outrank every config file the clone's
+ *  agent can write. Shared by the launcher and by `preflightEpochNative`'s admission, which
+ *  permits exactly these `-c` values (plus `core.worktree`). `execEpochNative` splices every one of
+ *  them (and `--attr-source`) into every Git launch of the epoch native scope, bare reads included,
+ *  and `requireEpochNativePins` refuses a launch that lacks one. */
+const EPOCH_CLONE_READ_PINS: readonly string[] = [
+  "core.fsmonitor=false", "core.excludesFile=/dev/null", "core.trustctime=true", "core.checkStat=default",
+  "core.fileMode=true", "core.ignoreCase=false", "core.untrackedCache=false", "core.attributesFile=/dev/null",
+  "core.autocrlf=false", "core.eol=lf", "core.safecrlf=false", "core.symlinks=true", "core.sparseCheckout=false",
+  "index.sparse=false", "core.splitIndex=false", "core.preloadIndex=false", "core.bigFileThreshold=1m",
+  // No hook directory and no external diff driver: neither is reachable from an admitted
+  // subcommand, so these are belt and braces for any future widening of the admitted shapes.
+  "core.hooksPath=/dev/null", "diff.external=/bin/false",
+];
+/**
+ * The only keys the automatic worktree proof admits in a runner clone's `.git/config`. This is
+ * exactly what uzi writes into a seeded clone (verified by dumping a clone made by
+ * `runnerCloneForBranch`): `git clone` itself writes `core.repositoryformatversion`, `core.filemode`,
+ * `core.bare`, `core.logallrefupdates`, `remote.origin.url`, `remote.origin.fetch` (unset again by
+ * the seed, "issue #363") and `branch.<default>.remote|merge`; `disableAutoMaintenance` writes
+ * `maintenance.auto`, `gc.auto` and `core.fsmonitor`; the clone's committer identity writes
+ * `user.name`, `user.email` and `commit.gpgsign`. Anything else (filters, hooks, includes,
+ * attributes, worktree, extensions, sparse, split index, ...) is a keep, not a thing to override.
+ * The recovery-journal keys (`uzi-recovery.*` and the like) live in the BARE, never in a clone.
+ */
+const EPOCH_CLONE_CONFIG_KEYS: ReadonlySet<string> = new Set([
+  "core.repositoryformatversion", "core.filemode", "core.bare", "core.logallrefupdates", "core.fsmonitor",
+  "maintenance.auto", "gc.auto", "remote.origin.url", "remote.origin.fetch", "user.name", "user.email",
+  "commit.gpgsign",
+]);
+/**
+ * The only top-level entries of a settled runner clone's `.git` that the automatic worktree proof
+ * admits (verified by listing a clone made by `runnerCloneForBranch` after a commit). Anything else
+ * (`sequencer/`, `rebase-merge/`, `rebase-apply/`, `MERGE_*`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
+ * `BISECT_*`, `AUTO_MERGE`, `modules`, `worktrees`, `sharedindex.*`, `reftable`, ...) is an in-progress
+ * operation or state the proof cannot account for, and is a settled keep. In the full proof `shallow` and
+ * `commondir` are classified earlier, as UNKNOWN, and so is a reftable ref store once `extensions.refstorage`
+ * selects it; a stray `reftable` entry without it, `worktrees` and the rest stay keeps here. Each
+ * admitted entry is typed by lstat (a real directory or a regular file, never a FIFO or link) before
+ * Git runs; the files are charged to the metadata budget. The contents of `refs/` are not listed
+ * here: the shape stage walks that tree itself (real directories, regular files of at most
+ * `EPOCH_REF_FILE_MAX_BYTES`, every entry charged), and `info` and `objects/info` are checked entry by entry.
+ */
+const EPOCH_GIT_DIR_DIRECTORIES: ReadonlySet<string> = new Set(["branches", "hooks", "info", "logs", "objects", "refs"]);
+const EPOCH_GIT_DIR_FILES: ReadonlySet<string> = new Set([
+  "HEAD", "config", "description", "index", "packed-refs", "COMMIT_EDITMSG", "ORIG_HEAD", "FETCH_HEAD",
+]);
+/** A `.git/HEAD` or loose ref file is a line of at most this many bytes. */
+const EPOCH_REF_FILE_MAX_BYTES = 1024;
+/** A reflog file or FETCH_HEAD/ORIG_HEAD read for the object ids it names is at most this many bytes. */
+const EPOCH_NAMED_FILE_MAX_BYTES = 256 * 1024;
+/** Levels of non-ignored untracked directories the automatic proof will expand (each is one `check-ignore`). */
+const EPOCH_UNTRACKED_EXPANSION_DEPTH = 32;
+const EPOCH_CLONE_CONFIG_KEY_PATTERNS: readonly RegExp[] = [/^branch\..+\.(?:remote|merge)$/];
+/** Values that must be exact where the key is admitted (git lowercases section and variable names). */
+const EPOCH_CLONE_CONFIG_EXACT_VALUES: ReadonlyMap<string, string> = new Map([
+  ["core.repositoryformatversion", "0"], ["core.bare", "false"], ["core.fsmonitor", "false"],
+]);
+/** Does one `config --null --list` row claim case-folding in any form git reads as true (true/yes/on,
+ *  any non-zero integer with an optional k/m/g suffix, or a bare key)? Such a clone is not provable:
+ *  it could hide a tracked `readme` behind an untracked `README`. */
+function configClaimsCaseFolding(entry: string): boolean {
+  const nl = entry.indexOf("\n");
+  const key = (nl === -1 ? entry : entry.slice(0, nl)).toLowerCase();
+  if (key !== "core.ignorecase") return false;
+  if (nl === -1) return true; // a bare key is boolean true
+  const v = entry.slice(nl + 1).trim().toLowerCase();
+  if (v === "true" || v === "yes" || v === "on") return true;
+  return /^[+-]?(0x[0-9a-f]+|[0-9]+)[kmg]?$/.test(v) && !/^[+-]?(0x)?0+[kmg]?$/.test(v);
+}
 /** Bounds for the stopped-source ref proof: shas per rev-list argv, and refs beyond which coverage is not claimed. */
 const LOCAL_REF_REVLIST_CHUNK = 500;
+/** The legacy, non-epoch stopped-source cap. It is deliberately unchanged: the ordinary stopped-source proof is
+ *  outside R9's epoch scope (owner answer seq 1162, 2026-11-06 (R9)); the epoch occurrence cap is
+ *  {@link EPOCH_MAX_OBJECT_OCCURRENCES}. */
 const MAX_LOCAL_REF_SHAS = 20000;
+/** Epoch automatic proof only: the most physical object occurrences one object-store snapshot may hold
+ *  (owner answer seq 1162, 2026-11-06 (R9)). The legacy stopped-source proof keeps {@link MAX_LOCAL_REF_SHAS}. */
+const EPOCH_MAX_OBJECT_OCCURRENCES = 131072;
+/** Most per-tip `rev-list` launches the epoch mirror-ref proof spends isolating tips after a chunk failed. */
+const MIRROR_SPLIT_LAUNCHES = 64;
+/** Tips per mirror-ref `rev-list` launch; the epoch native allowlist admits at most 128 operands. */
+const MIRROR_TIP_CHUNK = 128;
+/** Git's own `core.deltaBaseCacheLimit` default. The cache only holds delta bases in a Git child's memory, so
+ *  it changes speed, never a verdict; it is deliberately NOT the 4 GiB object-store budget, which would let
+ *  every child hold that much memory (that budget counts logical work, and the Node-side observation streams
+ *  through fixed windows, see OBSERVE_READ_WINDOW). A smaller cache re-inflates bases (R9: delta work dominates cost). */
+const EPOCH_DELTA_BASE_CACHE_BYTES = 96 * 1024 * 1024;
 
 /** How long an aborted prepared ref transaction may take to exit on its own before it is killed. */
 const PREPARED_ABORT_GRACE_MS = 5_000;
@@ -1947,7 +2039,11 @@ function unionPeeledMarkers(...lists: Array<readonly string[] | undefined>): str
 // `reclaimed` when the terminal-orphan reclaim released a FOREIGN owner's attempt in place WITHOUT
 // capturing it: the clone may be the only copy of that run's work, so it is retained FOREVER (the
 // attempt-path twin of the unwired worker's foreign quarantine, `discard:false`) — never counted
-// toward the abandoned cap and never deleted. Each seed compacts the key to its last value per
+// toward the abandoned cap and never deleted by any AUTOMATIC path. That includes the verified-epoch
+// disposal (PRD #3431, gated off in production): its settlement admits only a `live` attempt with an
+// exact strict-plain journal, or a `retired` entry for the exact retired/empty-journal repair
+// (see exactPlainAttemptJournal). Only an operator discard (#1786) disposes of a `reclaimed` tree.
+// Each seed compacts the key to its last value per
 // attemptId (see compactAttemptLedger).
 // The watcher's backup script (.agents/skills/uzi-watcher/scripts/backup-runs.sh) reads exactly
 // this key and these field names: keep them byte-for-byte. It reads `state` in three places: an
@@ -2370,7 +2466,9 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
 // ─── issue #1786 — retained stopped sources ────────────────────────────────────────────────
 //
 // A stopped generation's clone is kept, not discarded, until an operator
-// explicitly disposes of it. An ATTEMPT clone is retained through the ledger's never-deleted
+// explicitly disposes of it (the one automatic exception is the verified-epoch disposal of PRD #3431,
+// off in production, which admits only a strict-plain `live` attempt or the exact `retired` repair, never
+// `reclaimed`). An ATTEMPT clone is retained through the ledger's never-deleted
 // `reclaimed` state (see attemptLedgerKey); a CANONICAL clone, which has no ledger identity, through
 // the bounded multi-valued bare-config marker `uzi-stopped.<runId>.entry` below. The marker grants
 // no capture, adoption or release authority: it only refuses reuse of the path it names.
@@ -2491,7 +2589,13 @@ export interface RetainedSourcePart {
   ledgerState: AttemptLedgerState | "none";
   live: boolean;
   allocatedBytes: number | null;
+  /** Epoch inspections only; diagnostic, grants nothing. Names why this present part could not be
+   *  measured when the stop was confined to its own tree (permission denied at the root or below,
+   *  or a measurement cap). `allocatedBytes` stays null, so the source is never byte-complete. */
+  measurementShortfall?: "eacces" | "eperm" | "entry_cap" | "depth_cap" | "pending_cap";
 }
+
+type MeasurementShortfall = NonNullable<RetainedSourcePart["measurementShortfall"]>;
 
 /** Content-free evidence for one retained source (or one protected episode of several). */
 export interface RetainedSourceEvidence {
@@ -2520,7 +2624,7 @@ export interface RetainedSourceEvidence {
   localRecords: RetainedLocalRecord[];
   holds: { state: "read" | "unknown" | "not_read"; ids: string[] };
   disposition: RetainedDisposition | undefined;
-  /** Epoch inspections only: the disposition under the strict-plain basis. Defined only when the caller's lifecycle verdict is `terminal`, zero open holds are required for `local_discard` (an open or unknown hold yields another disposition), and a `live` ledger attempt is named solely by an active journal whose raw text equals `JSON.stringify` of its parse (any key order; duplicates and whitespace variants are rejected), with no other non-retired ledger entry on the same clone key. Never set for operator inspection. */
+  /** Epoch inspections only: the disposition under the strict-plain basis. Defined only when the caller's lifecycle verdict is `terminal`, zero open holds are required for `local_discard` (an open or unknown hold yields another disposition), and either a fully validated retired attempt has an exactly valued empty journal and absent footprint (metadata barriers only), or a `live` ledger attempt is named solely by an active journal whose raw text equals `JSON.stringify` of its parse (any key order; duplicates and whitespace variants are rejected), with no other non-retired ledger entry on the same clone key. Never set for operator inspection. */
   epochSettlement?: { basis: "strict_plain"; disposition: RetainedDisposition };
   /** Epoch inspections only, report-only: a marker-less canonical source under a plain active journal
    *  (`journalState: "plain"`, `markerState: "none"`) whose journal, read in the same lock-held snapshot as
@@ -2539,12 +2643,17 @@ export type RetainedLifecycleSnapshot =
   | { state: "unknown" };
 
 export interface EpochRetainedLimits {
-  /** Test seams may lower, but never raise, the production limits. */
+  /** Test seams may lower, but never raise, the production limits (owner answer seq 1162, 2026-11-06 (R9)). */
   maxDirectoryEntries?: number;
   maxBares?: number;
+  /** Metadata: Git output, index, config, packed-refs, refs, reflogs, pseudo-refs and HEAD. */
   maxMetadataBytes?: number;
   maxMetadataRecords?: number;
   maxSeenPaths?: number;
+  /** Tracked worktree content hashed by the automatic proof (regular sizes and link lengths). */
+  maxWorktreeContentBytes?: number;
+  /** Object-store snapshot bytes (loose, pack spans, inflated records, delta-generated bytes), PER snapshot. */
+  maxObjectStoreBytes?: number;
 }
 
 export interface EpochRetainedDiscoveryOptions {
@@ -2606,7 +2715,291 @@ export interface RetainedInspectResult {
 /** issue #3644: what a retained-home marker must record for a restore exit to treat it as evidence about THIS bare. */
 export interface RetainedHomeBinding { barePath: string; attemptId: string }
 
+/** Worker-only capability; copied objects and JSON carry no registered authority. */
+declare const epochDiscardProofBrand: unique symbol;
+export interface EpochDiscardProof {
+  readonly [epochDiscardProofBrand]: true;
+}
+
+export interface EpochDiscardProofOptions {
+  readonly decision: { readonly eligible: true; readonly attested: true };
+  readonly scope: PodEpochReclaimScope;
+  readonly selector: Readonly<RetainedSourceSelector>;
+  readonly barePath: string;
+  readonly paths: readonly string[];
+  readonly confirm: string;
+  /** Exact strict three-key journal, or `[""]` for the explicit empty-journal repair. `[]` is refused. */
+  readonly expectedRawJournal: string | readonly string[];
+  /** Throws when the caller's reservation, epoch or source binding is no longer live. */
+  readonly checkLive: () => void;
+  /** Trusted epoch-entry and GET-only daemon observation; denial throws. */
+  readonly beforeEffect: () => Promise<void>;
+  readonly signal: AbortSignal;
+  readonly deadline: number;
+}
+
+type EpochDiscardProofState = Omit<EpochDiscardProofOptions, "decision">;
+
+/** Internal content-proof mode; epoch inspection alone never selects it. */
+class AutomaticCompletenessUnknown extends Error {}
+/** A positively identified, pre-effect finite-limit overflow (owner answer seq 1162, 2026-11-06 (R9)): the source is
+ *  kept with `epoch_content_unproven` and nothing else stops. Thrown ONLY at an actual limit comparison and
+ *  deliberately not a subclass of {@link AutomaticCompletenessUnknown}: an unreadable, incomplete or indirect
+ *  store, an unresolved execution and a timeout or abort stay UNKNOWN and are never converted into this. */
+class AutomaticBoundExceeded extends Error {}
+/** Errors raised by Git output or metadata limits outside this file's own comparisons. */
+const BOUND_OVERFLOW_ERRORS = new WeakSet<object>();
+/** True for {@link AutomaticBoundExceeded}, for an epoch metadata limit raised by `checkEpochMetadata` on a Git
+ *  stdout that finished, and for a joined Git child whose STDOUT overran the epoch output cap. A stderr overrun
+ *  (a failing Git is noisy), an unjoined child and a bare `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` without those
+ *  facts stay unknown: only a positively identified stdout size is a limit. */
+function isBoundOverflow(error: unknown): boolean {
+  if (error instanceof AutomaticBoundExceeded) return true;
+  if (typeof error !== "object" || error === null) return false;
+  if (BOUND_OVERFLOW_ERRORS.has(error)) return true;
+  const e = error as { outputExceeded?: unknown; outputStream?: unknown; epochProcessJoined?: unknown };
+  return e.outputExceeded === true && e.outputStream === "stdout" && e.epochProcessJoined === true;
+}
+/** Whether a failed Git child captured any stderr. Callers such as the clone refs read treat stderr as a
+ *  skipped-item signal, so a wrapper must not turn such an error into a settled limit. */
+function hasChildStderr(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const stderr = (error as { stderr?: unknown }).stderr;
+  return (typeof stderr === "string" || Buffer.isBuffer(stderr)) && stderr.length > 0;
+}
+// A fully observed, explicitly forbidden source setting is a settled keep;
+// it is not an incomplete observation of an admitted object store.
+class AutomaticContentRefusal extends Error {}
+/** Unknown errors the clone shape stage raised for an INDIRECTION-BEARING input it cannot account for: a clone
+ *  `.git/objects` or `objects/info` entry (a non-directory, an unlisted name, unreadable, indirect or past the
+ *  budget), the clone's `.git/config` (an UNKNOWN-class key, a file that is missing, not regular or past the budget),
+ *  and whatever `afterIndirection` (the Node-only topology of the object stores: entry types and names, commondir,
+ *  shallow, grafts, replace refs) raises. An overflow while reading such an input is UNKNOWN, never a keep (the rule recorded
+ *  above {@link GitCache.automaticContentPreserved}). {@link GitCache.automaticCloneShape} rethrows these instead of
+ *  returning false. */
+const SHAPE_INDIRECTION_UNKNOWN = new WeakSet<Error>();
+/** A `git config --list` key of a promisor remote (any remote name; Git lowercases the section and variable only). */
+const PROMISOR_KEY_RE = /^remote\..*\.(?:promisor|partialclonefilter)$/i;
+/** The first clone-config key (Git reads names case-insensitively) that the object-store observation treats as
+ *  UNKNOWN: it changes where objects or refs live or pulls in more config, so the physical observation cannot account
+ *  for it. This is a Node-only scan of the bytes of `.git/config`, a superset of that observation's `git config` key
+ *  checks: a key can only start a line or follow the `]` of a header on the same line, and every line start counts,
+ *  including a continuation line, so no key Git would read can be missed (a false positive only keeps the answer
+ *  UNKNOWN, the safe direction). `extensions.objectformat` is admitted only as the literal `sha1`. Includes are not
+ *  listed: the shape stage reports them as UNKNOWN itself, right after this scan (see the comment where it does). */
+function cloneConfigIndirection(config: Buffer): string | undefined {
+  const text = config.toString("latin1");
+  const keyAt = (name: string) => new RegExp(`(?:^|\\])[ \\t\\r\\f\\v]*${name}(?![A-Za-z0-9-])`, "im");
+  // `promisor` and `partialclonefilter` are the keys a modern partial clone writes under `[remote "<name>"]`
+  // (`git clone --filter=...`, no `extensions.partialclone`): it lazily fetches missing objects from another repo.
+  for (const key of ["partialclone", "partialclonefilter", "promisor", "refstorage", "compatobjectformat",
+    "worktreeconfig", "worktree"])
+    if (keyAt(key).test(text)) return key;
+  // The capture runs to the end of the LINE (`\n`), so a lone `\r` inside the value is part of it and fails the
+  // `sha1` match; only a final `\r` (CRLF) is dropped.
+  for (const found of text.matchAll(/(?:^|\])[ \t\r\f\v]*objectformat(?![A-Za-z0-9-])([^\n]*)/gim))
+    if (!/^[ \t]*=[ \t]*sha1[ \t]*(?:[#;].*)?$/.test(found[1]!.replace(/\r$/, ""))) return "objectformat";
+  return undefined;
+}
+
+// The object-store observation of the automatic content proof streams: its memory is bounded by the windows
+// below, never by the (logical, 4 GiB) work budget `maxObjectStoreBytes`, which counts bytes produced or consumed.
+/** One positioned read window over a pack, idx or loose file. */
+const OBSERVE_READ_WINDOW = 8 * 1024 * 1024;
+/** zlib's output window: the most inflated bytes alive at once for a streaming record. */
+const OBSERVE_INFLATE_WINDOW = 256 * 1024;
+/** Compressed input handed to zlib per write. */
+const OBSERVE_INPUT_PIECE = 1024 * 1024;
+/** A span this small, expected to inflate to at most {@link OBSERVE_SYNC_OUTPUT}, takes the one-shot inflater. */
+const OBSERVE_SYNC_SPAN = 256 * 1024;
+const OBSERVE_SYNC_OUTPUT = 1024 * 1024;
+
+/** A bounded one-shot inflate; `undefined` when the output would pass `cap` (the caller then streams instead). */
+function inflateSmall(span: Buffer, cap: number): { buffer: Buffer; consumed: number } | undefined {
+  try {
+    // Node returns the zlib result envelope for info:true; its declarations expose only Buffer.
+    const result = inflateSync(span, { maxOutputLength: cap, info: true }) as unknown as
+      { buffer: Buffer; engine: { bytesWritten: number } };
+    return { buffer: result.buffer, consumed: result.engine.bytesWritten };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Incremental zlib inflate of `pieces`: every output buffer (at most {@link OBSERVE_INFLATE_WINDOW}) goes to `sink`
+ * as it is produced, and a throw from `sink` stops the inflater at once. Returns how many input bytes the engine
+ * consumed (a stream that ends early leaves the rest unconsumed). A corrupt or truncated stream rejects with the
+ * zlib error. `consumed` is told, after each write, how many input bytes the engine took from it; the inflater is
+ * not fed again once it has ended inside a piece. The caller must not touch the pieces' memory until the returned
+ * promise settles.
+ */
+async function inflateStream(pieces: AsyncIterable<Buffer>, sink: (out: Buffer) => void,
+  consumed: (n: number) => void): Promise<number> {
+  const inflate = createInflate({ chunkSize: OBSERVE_INFLATE_WINDOW });
+  let failure: unknown;
+  const failed = new Promise<never>((_, reject) => inflate.once("error", reject));
+  failed.catch(() => {});
+  inflate.on("data", (out: Buffer) => {
+    if (failure !== undefined) return;
+    try { sink(out); } catch (error) { failure = error; inflate.destroy(); }
+  });
+  inflate.on("error", error => { failure ??= error; });
+  try {
+    for await (const piece of pieces) {
+      const before = inflate.bytesWritten;
+      await Promise.race([new Promise<void>((resolve, reject) =>
+        inflate.write(piece, error => error ? reject(error) : resolve())), failed]);
+      if (failure !== undefined) break;
+      const took = inflate.bytesWritten - before;
+      consumed(took);
+      // zlib takes all of a piece unless the stream ended inside it: what follows is never fed or charged.
+      if (took < piece.length) break;
+    }
+    if (failure === undefined) { inflate.end(); await Promise.race([finished(inflate), failed]); }
+  } catch (error) { failure ??= error; }
+  finally { inflate.destroy(); }
+  if (failure !== undefined) throw failure;
+  return inflate.bytesWritten;
+}
+
+/** A sliding window over one open file: sequential positions, one positioned read per window refill. */
+class ObservedWindow {
+  private readonly buf: Buffer;
+  private from = 0;
+  private to = 0;
+  constructor(private readonly size: number,
+    private readonly pull: (into: Buffer, intoOffset: number, position: number, length: number) => Promise<number>) {
+    this.buf = Buffer.allocUnsafe(Math.max(1, Math.min(OBSERVE_READ_WINDOW, size)));
+  }
+  /** Make `[position, position + need)` (clamped to the end of the file) readable through {@link view}. */
+  async ensure(position: number, need: number): Promise<void> {
+    const wanted = Math.min(need, this.size - position);
+    if (wanted > this.buf.length) throw new AutomaticCompletenessUnknown("object window request");
+    if (position >= this.from && position + wanted <= this.to) return;
+    const keep = position >= this.from && position < this.to ? this.to - position : 0;
+    if (keep) this.buf.copyWithin(0, position - this.from, this.to - this.from);
+    this.from = position; this.to = position + keep;
+    while (this.to - this.from < wanted) {
+      const length = Math.min(this.buf.length - (this.to - this.from), this.size - this.to);
+      const got = await this.pull(this.buf, this.to - this.from, this.to, length);
+      if (!got) throw new AutomaticCompletenessUnknown("short object metadata");
+      this.to += got;
+    }
+  }
+  /** Bytes already ensured at `position`, at most `length` of them. */
+  view(position: number, length: number): Buffer {
+    return this.buf.subarray(position - this.from, position - this.from + Math.min(length, this.to - position));
+  }
+  /** The compressed input `[position, position + length)` in pieces; each stays valid until the next is requested.
+   *  A piece never passes `room()` (the budget still unspent, at least one byte), so an unread tail past the budget is
+   *  only ever charged for the bytes zlib actually takes from it. */
+  async *pieces(position: number, length: number, room: () => number): AsyncGenerator<Buffer> {
+    for (let at = position; at < position + length;) {
+      await this.ensure(at, 1);
+      const piece = this.view(at, Math.min(OBSERVE_INPUT_PIECE, position + length - at, Math.max(1, room())));
+      yield piece; at += piece.length;
+    }
+  }
+}
+
+/**
+ * Resumable parser of a pack delta program, fed the inflated bytes piece by piece (an instruction may straddle
+ * pieces). It charges the content each instruction generates AS it executes, and checks every copy against the
+ * delta's declared base length, which the caller verifies against the actual base (see `onHeader`).
+ */
+class PackDeltaParser {
+  baseLength = 0;
+  logical = 0;
+  generated = 0;
+  private programBytes = 0;
+  private state: "base" | "logical" | "opcode" | "args" | "insert" = "base";
+  private value = 0;
+  private factor = 1;
+  private opcode = 0;
+  private argBit = 0;
+  private offset = 0;
+  private length = 0;
+  private insertLeft = 0;
+  constructor(private readonly hooks: { unknown: (message: string) => never; charge: (n: number) => void;
+    onHeader: () => void }) {}
+  feed(buf: Buffer): void {
+    this.programBytes += buf.length;
+    for (let i = 0; i < buf.length; i++) {
+      if (this.state === "insert") {
+        const take = Math.min(this.insertLeft, buf.length - i);
+        this.hooks.charge(take); this.generated += take; this.insertLeft -= take; i += take - 1;
+        if (!this.insertLeft) this.state = "opcode";
+        continue;
+      }
+      const byte = buf[i]!;
+      switch (this.state) {
+        case "base": case "logical": {
+          this.value += (byte & 127) * this.factor;
+          if (!Number.isSafeInteger(this.value) || !Number.isSafeInteger(this.factor)) this.hooks.unknown("delta integer overflow");
+          this.factor *= 128;
+          if (byte & 128) break;
+          if (this.state === "base") { this.baseLength = this.value; this.state = "logical"; }
+          else { this.logical = this.value; this.state = "opcode"; this.hooks.onHeader(); }
+          this.value = 0; this.factor = 1;
+          break;
+        }
+        case "opcode": {
+          this.opcode = byte;
+          if (byte & 128) { this.argBit = 0; this.offset = 0; this.length = 0; this.nextArg(); break; }
+          // Git's patch_delta: a zero opcode is reserved; an insert of n bytes follows the opcode.
+          if (!byte) this.hooks.unknown("invalid delta insert");
+          if (byte > this.logical - this.generated) this.hooks.unknown("delta generated size mismatch");
+          this.insertLeft = byte; this.state = "insert";
+          break;
+        }
+        case "args": {
+          if (this.argBit < 4) this.offset += byte * 2 ** (8 * this.argBit);
+          else this.length += byte * 2 ** (8 * (this.argBit - 4));
+          this.argBit++; this.nextArg();
+          break;
+        }
+      }
+    }
+  }
+  private nextArg(): void {
+    while (this.argBit < 7 && !(this.opcode & (1 << this.argBit))) this.argBit++;
+    if (this.argBit < 7) { this.state = "args"; return; }
+    if (!this.length) this.length = 65536;
+    if (this.offset > this.baseLength || this.length > this.baseLength - this.offset) this.hooks.unknown("delta copy outside base");
+    if (this.length > this.logical - this.generated) this.hooks.unknown("delta generated size mismatch");
+    this.hooks.charge(this.length); this.generated += this.length;
+    this.state = "opcode";
+  }
+  /** The program ended: it must end between instructions and have generated exactly the declared result. */
+  finish(): void {
+    if (this.programBytes < 4) this.hooks.unknown("short delta program");
+    if (this.state === "base" || this.state === "logical" || this.state === "args") this.hooks.unknown("truncated delta instruction");
+    if (this.state === "insert") this.hooks.unknown("invalid delta insert");
+    if (this.generated !== this.logical) this.hooks.unknown("delta generated size mismatch");
+  }
+}
+
+interface AutomaticPreservation {
+  checkLive: () => void;
+  roots: readonly string[];
+  owedBytes?: number;
+  finalStoreCheck?: () => Promise<void>;
+  objectCoverage?: (head: string) => Promise<boolean>;
+  /** Stage one of the worktree proof ({@link GitCache.automaticCloneShape}); set before any Git launch. */
+  shape?: AutomaticCloneShape;
+}
+interface AutomaticCloneShape {
+  ctx: ReturnType<GitCache["automaticProofContext"]>;
+  index: BoundedIndex;
+  /** Object ids named by the clone's reflogs, ORIG_HEAD and FETCH_HEAD (zero ids excluded). */
+  namedIds: ReadonlySet<string>;
+}
+
 export interface RetainedDiscardOptions {
+  /** In-process worker authority only; never deserialize from an operator request. */
+  epochProof?: EpochDiscardProof;
   selector: RetainedSourceSelector;
   /** The descriptor digest inspect reported; the exact value, or nothing is deleted. */
   confirm: string;
@@ -2634,7 +3027,7 @@ export interface RetainedDiscardOptions {
 export type RetainedSourceOutcome = "removed" | "retained" | "missing" | "unknown";
 
 export type RetainedDiscardResult =
-  | { kind: "refused"; reason: string; consumers: string[]; disposition?: RetainedDisposition }
+  | { kind: "refused"; reason: string; consumers: string[]; disposition?: RetainedDisposition; tookOver?: true }
   | {
       /** done: every path is gone and the metadata retired; incomplete: something remains;
        *  unknown: an error or the deadline interrupted the operation (everything not proven gone stays). */
@@ -2643,7 +3036,12 @@ export type RetainedDiscardResult =
       metadata: "retired" | "kept";
       /** Amendment 14: the name of the rc.2 holding directory that still holds a released predecessor's bytes (never touched). */
       holding?: string;
+      /** Epoch discards only: see the `refused` member. */
+      tookOver?: true;
     };
+// `tookOver` is set on an epoch discard only, for ANY result kind, once admitSource(..., "discard") succeeded for
+// a source: the discard took over that source's authority slot, so the caller that opened the authority
+// transaction owes the matching endSourceUse. It is never set by an operator discard, and absent means no takeover.
 
 /** The inspect budget (ms), the descriptor cap and the destructive operation deadline (ms). */
 const RETAINED_INSPECT_BUDGET_MS = 5_000;
@@ -2933,6 +3331,10 @@ export interface RunnerClone {
    *  new floor, so the materialized content is no single adopted source. `--require-base` refuses
    *  this shape. */
   wipCherryPicked?: boolean;
+  /** The recovered `wip(park)` marker whose uncommitted content this seed restored: the adopted marker on the
+   *  `reset --soft` leg, the cherry-picked checkpoint marker on the diverged leg. Absent when no WIP marker was
+   *  recovered. A preserve-only claim accepts it as proof of the held head (or a descendant of it). */
+  recoveredMarkerSha?: string;
 }
 
 /**
@@ -3146,6 +3548,8 @@ interface GatheredRecord {
   markerState: RetainedSourceEvidence["markerState"];
   /** Epoch gathers only: see {@link RetainedSourceEvidence.epochJournalExtraFields}. */
   epochJournalExtraFields?: true;
+  /** Rebuilt under B in epoch gathers only; never projected or accepted as proof. */
+  epochRetiredEmptyJournal?: true;
   markerRaw: string | undefined;
   ledgerRaw: string | undefined;
   digest: string;
@@ -3279,6 +3683,472 @@ export class GitCache {
   }
 
   private readonly epochRetained = new AsyncLocalStorage<Required<EpochRetainedLimits>>();
+  private readonly epochDiscardProofs = new WeakMap<EpochDiscardProof, EpochDiscardProofState>();
+  // Native options never enter boundary, capture, SDK or run request objects.
+  private readonly epochNative = new AsyncLocalStorage<EpochDiscardProofState & {
+    allowedIndices?: Set<string>;
+    configMutation?: readonly string[];
+    beforeLaunch?: () => Promise<void>;
+    /** Whether the installed Git takes `--attr-source`; set by the automatic proof before its first read. */
+    attrSource?: boolean;
+  }>();
+  private epochSettlementFault?: (step: string) => Promise<void>;
+  private epochNativeTestDependencies?: {
+    spawn: typeof spawn;
+    alive: typeof processGroupAlive;
+    kill: (pid: number, identity: BoundaryProcessRequest["identity"]) => void;
+    joinMs: number;
+  };
+
+  /** The validated automatic discard branch owns this bounded native read scope. */
+  private withEpochNativeReads<T>(proof: EpochDiscardProof, action: () => Promise<T>): Promise<T> {
+    const state = this.epochDiscardProofs.get(proof);
+    if (!state) throw new Error("unregistered epoch discard proof");
+    if (this.boundaryProcesses.getStore() || this.epochNative.getStore())
+      throw new Error("epoch native process scope overlap");
+    this.checkEpochDiscardLive(state);
+    return this.epochNative.run({ ...state, allowedIndices: new Set() }, action);
+  }
+
+  private epochNativePaths(): string[] {
+    return this.epochNative.getStore()!.paths.flatMap(p =>
+      [p, path.join(path.dirname(p), `.uzi-skills-${path.basename(p)}`)]);
+  }
+
+  /** Read graph plus an exact core-minted config mutation in the current async context.
+   * Transports and configurable wrappers never enter this scope. */
+  private preflightEpochNative(command: string, args: string[], env: NodeJS.ProcessEnv,
+    identity: BoundaryProcessRequest["identity"]): NodeJS.ProcessEnv {
+    const refuse = (): never => { throw new Error("epoch native executable chain unaudited"); };
+    const unwrap = (wrapped: { command: string; args: string[] }): string[] | undefined =>
+      command === wrapped.command && wrapped.args.every((arg, i) => args[i] === arg)
+        ? args.slice(wrapped.args.length) : undefined;
+    const git = command === GIT_BIN ? args : unwrap(runnerCommand(GIT_BIN, []));
+    const rm = unwrap(runnerCommand(RETENTION_RM_BIN, [], true));
+    if (rm?.length === 3 && rm[0] === "-rf" && rm[1] === "--" &&
+        this.epochNativePaths().includes(rm[2]!) && identity === "command" &&
+        Object.entries(env).every(([k, v]) => v === undefined || k === "PATH" && v === "/usr/bin:/bin")) return env;
+    if (!git) return refuse();
+    // Accept only values the existing credential-free builders actually emit.
+    // No credential pair, config override, loader variable or caller-selected path
+    // is admitted. The automatic replacement below then pins HOME/PATH and disables global/system config.
+    const base = gitEnv();
+    const allowed = new Map<string, Set<string | undefined>>();
+    const variants = [base, workerSpawnEnv(base), unmarkedSpawnEnv(base),
+      { ...base, PATH: runnerPath(), TMPDIR: runnerTmpdir() ?? base.TMPDIR }];
+    for (const variant of variants) for (const [key, value] of Object.entries(variant)) {
+      if (!allowed.has(key)) allowed.set(key, new Set());
+      allowed.get(key)!.add(value);
+    }
+    for (const [key, value] of Object.entries({ GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0",
+      GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL, GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null" })) {
+      allowed.set(key, new Set([value]));
+    }
+    if (Object.entries(env).some(([key, value]) => value !== undefined && !allowed.get(key)?.has(value)))
+      throw new Error("epoch native environment unaudited");
+    const state = this.epochNative.getStore()!;
+    let rest = [...git];
+    let cwd: string | undefined;
+    if (rest[0] === "-C") { cwd = rest[1]; rest = rest.slice(2); }
+    if (cwd !== undefined && cwd !== (identity === "command" ? state.paths[0] : state.barePath)) return refuse();
+    const pins = new Set([...EPOCH_CLONE_READ_PINS, `core.worktree=${state.paths[0]}`]);
+    while (rest[0] === "--no-replace-objects" || rest[0] === "--no-optional-locks" || rest[0] === "-c" ||
+        rest[0] === `--attr-source=${EPOCH_EMPTY_TREE_OID}`) {
+      if (rest[0] === "-c") { if (!pins.has(rest[1]!)) return refuse(); rest = rest.slice(2); }
+      else rest = rest.slice(1);
+    }
+    const shape = JSON.stringify(rest);
+    const operand = (v: string) => /^(HEAD|refs\/[A-Za-z0-9_./-]+|[0-9a-f]{40})(\^\{commit\})?$/.test(v);
+    const exact = (...v: string[]) => shape === JSON.stringify(v);
+    const [sub, ...tail] = rest;
+    let admitted = exact("version") || exact("--version") ||
+      exact("config", "--file", "-", "--no-includes", "--null", "--list");
+    if (cwd) admitted ||= (
+      sub === "config" && [
+        ["--local", "--null", "--list"], ["--local", "--no-includes", "--null", "--list"],
+        ["--local", "--no-includes", "--name-only", "--list"], ["--null", "--list"],
+      ].some(v => JSON.stringify(v) === JSON.stringify(tail)) ||
+      sub === "rev-parse" && (exact(sub, "--is-bare-repository") || exact(sub, "--is-shallow-repository") ||
+        tail.length >= 2 && tail.slice(0, -1).every(v => ["--verify", "--quiet"].includes(v)) && operand(tail.at(-1)!)) ||
+      sub === "for-each-ref" && tail.length >= 1 && tail.length <= 2 &&
+        ["--format=%(refname)", "--format=%(refname) %(objectname)", "--format=%(objectname) %(refname)",
+          "--format=%(objectname) %(refname) %(symref)"].includes(tail[0]!) &&
+        (tail.length === 1 || operand(tail[1]!)) ||
+      sub === "symbolic-ref" && exact(sub, "refs/remotes/origin/HEAD") ||
+      sub === "check-ref-format" && tail.length === 1 && operand(tail[0]!) ||
+      sub === "cat-file" && tail.length === 2 && tail[0] === "-t" && /^[0-9a-f]{40}$/.test(tail[1]!) ||
+      // The automatic worktree proof's content reads. Untracked listing takes no exclude option
+      // (it must not read any ignore file). There is no `status` shape: worktree-versus-index is
+      // hashed in Node.
+      sub === "ls-files" && exact(sub, "--others", "--directory", "-z") ||
+      // Index-versus-HEAD: the flattened HEAD tree, compared with the Node-parsed index entries.
+      // `ls-tree` never consults the index's cache-tree, which a forged index can lie through.
+      sub === "ls-tree" && exact(sub, "-r", "-z", "--full-tree", "HEAD") ||
+      sub === "check-ignore" && exact(sub, "--no-index", "--stdin", "-z") ||
+      sub === "rev-list" && tail[0] === "--objects" && tail[1] === "-n" && tail[2] === "1" &&
+        tail.slice(3).filter(v => v !== "--not").every(v => /^[0-9a-f]{40}$/.test(v)) && tail.includes("--not")
+    );
+    admitted ||= (cwd === state.paths[0] && identity === "command" ||
+      cwd === state.barePath && identity === "worker_pat") &&
+      exact("cat-file", "--batch-all-objects", "--batch-check=%(objectname)");
+    // The mirror-ref proof reads exactly the bare's branch and tag refs (see automaticMirrorRefs).
+    admitted ||= cwd === state.barePath && identity === "worker_pat" &&
+      exact("for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/");
+    admitted ||= cwd === state.barePath && identity === "worker_pat" &&
+      sub === "verify-pack" && tail.length === 2 && tail[0] === "--" &&
+      state.allowedIndices?.has(tail[1]!) === true;
+    admitted ||= cwd === state.barePath && identity === "worker_pat" &&
+      sub === "rev-list" && tail[0] === "--objects" && tail[1] === "--no-object-names" &&
+      tail.length >= 3 && tail.length <= 130 && tail.slice(2).every(v => SHA40_RE.test(v));
+    admitted ||= cwd === state.barePath && identity !== "command" &&
+      shape === JSON.stringify(this.epochNative.getStore()?.configMutation);
+    if (!admitted) return refuse();
+    return { ...base, TMPDIR: identity === "command" ? runnerTmpdir() ?? base.TMPDIR : base.TMPDIR,
+      PATH: "/usr/bin:/bin", HOME: "/", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null",
+      // No system gitattributes; with --attr-source and core.attributesFile pinned, no attribute
+      // source remains that could name a clean filter.
+      GIT_ATTR_NOSYSTEM: "1", GIT_CONFIG_NOSYSTEM: "1" };
+  }
+
+  /** The `-c` pins every Git launch of the epoch native scope carries; `core.worktree` only for a clone-side read. */
+  private epochNativePins(cwd: string | undefined, state: { paths: readonly string[] }): string[] {
+    return [...EPOCH_CLONE_READ_PINS, ...(cwd !== undefined && cwd === state.paths[0] ? [`core.worktree=${cwd}`] : [])];
+  }
+
+  /** Refuse a spliced Git launch that lacks any pin, `--attr-source` included once Git is known to take it. */
+  private requireEpochNativePins(args: string[], gitPosition: number,
+    state: { paths: readonly string[]; attrSource?: boolean }, bareSubcommand: boolean): void {
+    const global = args.slice(gitPosition);
+    const cwd = global[0] === "-C" ? global[1] : undefined;
+    const have = new Set<string>();
+    for (let i = 0; i < global.length; i++) if (global[i] === "-c") have.add(global[i + 1]!);
+    const missing = this.epochNativePins(cwd, state).filter(pin => !have.has(pin));
+    if (missing.length || state.attrSource === true && !bareSubcommand &&
+        !global.includes(`--attr-source=${EPOCH_EMPTY_TREE_OID}`))
+      throw new Error("epoch native read lacks its pins");
+  }
+
+  /** `git version` is the one launch that cannot carry `--attr-source` (older Git rejects the option). */
+  private async epochGitSupportsAttrSource(): Promise<boolean> {
+    const version = await this.execScoped("git", ["version"], { env: gitEnv(), timeout: 10_000 });
+    const parts = /^git version (\d+)\.(\d+)/.exec(version.stdout);
+    return !!parts && !(Number(parts[1]) < 2 || Number(parts[1]) === 2 && Number(parts[2]) < 40);
+  }
+
+  private async execEpochNative(
+    command: string, args: string[],
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer;
+      bytes?: true; encoding?: "latin1" },
+    identity: BoundaryProcessRequest["identity"], signal?: AbortSignal,
+  ): Promise<{ stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer }> {
+    const state = this.epochNative.getStore()!;
+    if (this.boundaryProcesses.getStore()) throw new Error("epoch native process scope overlap");
+    this.checkEpochDiscardLive(state);
+    signal?.throwIfAborted();
+    options = { ...options, env: this.preflightEpochNative(command, args, options.env, identity) };
+    const wrappedGit = runnerCommand(GIT_BIN, []);
+    if (command === GIT_BIN || command === wrappedGit.command && wrappedGit.args.every((arg, i) => args[i] === arg)) {
+      args = [...args];
+      const gitPosition = command === GIT_BIN ? 0 : runnerCommand(GIT_BIN, []).args.length;
+      const position = gitPosition + (args[gitPosition] === "-C" ? 2 : 0);
+      const versionOnly = args[position] === "version" || args[position] === "--version";
+      const cwd = args[gitPosition] === "-C" ? args[gitPosition + 1] : undefined;
+      const present = new Set(args.flatMap((arg, i) => arg === "-c" ? [args[i + 1]!] : []));
+      const attr = `--attr-source=${EPOCH_EMPTY_TREE_OID}`;
+      args.splice(position, 0, ...(state.attrSource === true && !versionOnly && !args.includes(attr) ? [attr] : []),
+        ...this.epochNativePins(cwd, state).filter(pin => !present.has(pin)).flatMap(pin => ["-c", pin]));
+      this.requireEpochNativePins(args, gitPosition, state, versionOnly);
+      args.splice(position, 0, "-c", "core.multiPackIndex=false", "-c", "core.commitGraph=false",
+        "-c", "pack.writeReverseIndex=false", "-c", "pack.readReverseIndex=false",
+        "-c", "pack.useBitmaps=false", "-c", "pack.threads=1", "-c", "index.threads=1",
+        "-c", `core.deltaBaseCacheLimit=${Math.min(this.epochRetained.getStore()?.maxObjectStoreBytes ?? Infinity,
+          EPOCH_DELTA_BASE_CACHE_BYTES)}`);
+    }
+    if (args.includes("config") && !args.includes("--no-includes")) {
+      args = [...args]; args.splice(args.indexOf("config") + 1, 0, "--no-includes");
+    }
+    if ((command === "/bin/setpriv" && identity !== "command") ||
+        (uidSplitActive() && identity === "command" && command !== "/bin/setpriv"))
+      throw new Error("epoch native group identity mismatch");
+    if (state.configMutation && args.includes("config") && !args.includes("--list") || args.includes("-rf")) {
+      await this.epochObservation(state, state.beforeEffect);
+      this.checkEpochDiscardLive(state);
+      await state.beforeLaunch?.();
+      this.checkEpochDiscardLive(state);
+    }
+    assertNoCredentialedGitWhileQuarantined(options.env);
+    MaintenanceResources.consumeIfActive("launches", 1);
+    const ticket = state.scope.beginMutation();
+    const deps = this.epochNativeTestDependencies;
+    let child: ChildProcess;
+    try {
+      const stdio = state.scope.inheritStdio(["pipe", "pipe", "pipe"]);
+      child = (deps?.spawn ?? spawn)(command, args, {
+        env: options.env, cwd: options.cwd, detached: true, stdio,
+      });
+    } catch (error) { state.scope.stop(); throw error; }
+    const pid = child.pid;
+    const alive = () => {
+      if (!Number.isSafeInteger(pid) || pid! <= 0) throw new Error("epoch process group unknown");
+      return deps ? deps.alive(pid!, identity) : processGroupAlive(pid!, identity, true);
+    };
+    const kill = () => {
+      if (deps) { deps.kill(pid!, identity); return; }
+      if (identity === "command") {
+        if (!killRunnerGroupOnly(pid!, true) && alive()) throw new Error("epoch group signal unconfirmed");
+        return;
+      }
+      try { process.kill(-pid!, "SIGKILL"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    };
+    const chunks = { stdout: [] as Buffer[], stderr: [] as Buffer[] };
+    const cap = options.maxBuffer ?? 1024 * 1024;
+    let failure: unknown, cleanup: Promise<void> | undefined;
+    let direct = false, closed = false, ioJoined = false;
+    let code: number | null = null;
+    const joinMs = deps?.joinMs ?? 1_000;
+    // One bounded cleanup per launch; failure does not settle sibling tickets.
+    const startCleanup = () => cleanup ??= (async () => {
+      const until = Date.now() + joinMs;
+      try {
+        // Normal exit permits one bounded grace; errors cancel immediately. Only
+        // positive group absence plus direct and IO joins can settle this ticket.
+        const grace = Date.now() + (failure ? 0 : joinMs);
+        while (alive() && Date.now() < grace && !failure)
+          await new Promise<void>(resolve => setTimeout(resolve, 10));
+        if (alive()) kill();
+        const joinedUntil = Math.max(until, Date.now() + joinMs);
+        for (;;) {
+          if (direct && closed && ioJoined && !alive()) return;
+          if (Date.now() >= joinedUntil) throw new Error("epoch native group or IO join unconfirmed");
+          await new Promise<void>(resolve => setTimeout(resolve, 10));
+        }
+      } catch (error) { state.scope.stop(); throw error; }
+    })();
+    let notifyCleanup!: () => void;
+    const cleanupStarted = new Promise<void>(resolve => { notifyCleanup = resolve; });
+    const clean = () => { void startCleanup().catch(() => undefined); notifyCleanup(); };
+    const fail = (error: unknown) => { failure ??= error; clean(); };
+    const io: Promise<unknown>[] = [];
+    for (const name of ["stdout", "stderr"] as const) {
+      const source = child[name];
+      if (!source) { state.scope.stop(); fail(new Error("epoch native output missing")); continue; }
+      const joinedSource = finished(source);
+      void joinedSource.catch(() => undefined);
+      io.push(joinedSource);
+      const output = this.meteredGitOutput(source, "metadataBytes",
+        () => fail(new Error("epoch native output cancelled")));
+      if (output !== source) {
+        const joinedOutput = finished(output);
+        void joinedOutput.catch(() => undefined);
+        io.push(joinedOutput);
+      }
+      let bytes = 0;
+      output.on("data", (value: Buffer | string) => {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        if (failure) return;
+        if (chunk.length > cap - bytes) {
+          fail(this.retainedCause(Object.assign(new Error("git subprocess maxBuffer exceeded"),
+            { outputExceeded: true, outputStream: name, code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }), "metadata_byte_cap"));
+        } else { chunks[name].push(chunk); bytes += chunk.length; }
+      });
+      output.on("error", fail);
+    }
+    // stdin EPIPE remains an ordinary child outcome; child close joins its handle.
+    if (!child.stdin) { state.scope.stop(); fail(new Error("epoch native input missing")); }
+    else {
+      child.stdin.on("error", () => undefined);
+      try { child.stdin.end(options.input); }
+      catch (error) { state.scope.stop(); fail(error); }
+    }
+    void Promise.all(io).then(() => { ioJoined = io.length >= 2; }, fail);
+    child.once("exit", value => { direct = true; code = value; clean(); });
+    child.once("error", error => { direct = true; fail(error); });
+    child.once("close", () => { closed = true; });
+    const abortSignal = AbortSignal.any([state.signal, ...(signal ? [signal] : [])]);
+    const abort = () => fail(abortSignal.reason ?? new Error(GIT_OUTPUT_ABORT_MESSAGE));
+    abortSignal.addEventListener("abort", abort, { once: true });
+    const timeout = Math.max(1, Math.min(options.timeout ?? Infinity, state.deadline - Date.now()));
+    const timer = setTimeout(() => fail(Object.assign(new Error("git subprocess timed out"), { killed: true })), timeout);
+    if (abortSignal.aborted) abort();
+    try {
+      await cleanupStarted;
+      await cleanup;
+      if (state.scope.stopped()) throw new Error("epoch native scope stopped");
+      ticket.settle();
+      const stdoutBytes = Buffer.concat(chunks.stdout);
+      const stderrBytes = Buffer.concat(chunks.stderr);
+      const result = { stdout: stdoutBytes.toString(options.encoding), stderr: stderrBytes.toString(),
+        ...(options.bytes ? { stdoutBytes, stderrBytes } : {}) };
+      if (failure || code !== 0) throw Object.assign(
+        failure instanceof Error ? failure : new Error(result.stderr || "git subprocess failed"),
+        result, { ...(failure && typeof failure === "object" && "code" in failure ? {} : { code }),
+          epochProcessJoined: true, ...(child.signalCode ? { signal: child.signalCode } : {}) });
+      this.checkRecoveryInterruption();
+      MaintenanceResources.checkIfActive();
+      return result;
+    } finally {
+      clearTimeout(timer);
+      abortSignal.removeEventListener("abort", abort);
+    }
+  }
+
+  private async runEpochRunnerUidDelete(target: string): Promise<void> {
+    const state = this.epochNative.getStore()!;
+    this.checkEpochDiscardLive(state);
+    if (this.boundaryProcesses.getStore() || !this.epochNativePaths().includes(target))
+      throw new Error("epoch native delete scope refused");
+    const ticket = state.scope.beginMutation();
+    const key = path.resolve(target);
+    this.unsettledDeletes.set(key, (this.unsettledDeletes.get(key) ?? 0) + 1);
+    let settlement: AuthoritySettlement | undefined;
+    let joined = true, settlingSuccess = false;
+    try {
+      settlement = await this.beginDestructive([target], "runner-uid-delete");
+      if (this.retentionDeleteSeam) throw new Error("epoch native legacy delete seam refused");
+      if (uidSplitActive()) {
+        joined = false;
+        const wrapped = runnerCommand(RETENTION_RM_BIN, ["-rf", "--", target], true);
+        try {
+          await this.execEpochNative(wrapped.command, wrapped.args,
+            { env: { PATH: "/usr/bin:/bin" }, cwd: "/", timeout: RETENTION_RM_TIMEOUT_MS }, "command");
+          joined = true;
+        } catch (error) {
+          joined = (error as { epochProcessJoined?: boolean }).epochProcessJoined === true;
+          throw error;
+        }
+      } else {
+        // fs.rm is independently awaited; a rejected operation is a joined refusal.
+        await this.epochObservation(state, state.beforeEffect);
+        this.checkEpochDiscardLive(state);
+        await state.beforeLaunch?.();
+        this.checkEpochDiscardLive(state);
+        try { await fs.rm(target, { recursive: true, force: true }); }
+        finally { joined = true; }
+      }
+      try { this.checkEpochDiscardLive(state); }
+      catch (error) { state.scope.stop(); throw error; }
+      settlingSuccess = true;
+      await settlement?.settle({ ok: true });
+    } catch (error) {
+      if (settlingSuccess) { state.scope.stop(); throw error; }
+      if (!joined || state.scope.stopped()) { state.scope.stop(); throw error; }
+      try { await settlement?.settle({ ok: false, residue: [target] }); }
+      catch { state.scope.stop(); throw error; }
+      if (undeletableCode(error) !== undefined)
+        throw Object.assign(error as object, { epochDeleteJoined: true });
+      throw error;
+    } finally {
+      if (joined && !state.scope.stopped()) {
+        const pending = (this.unsettledDeletes.get(key) ?? 1) - 1;
+        if (pending) this.unsettledDeletes.set(key, pending);
+        else this.unsettledDeletes.delete(key);
+        ticket.settle();
+      }
+    }
+  }
+
+  /**
+   * Registers a copied, immutable binding for the worker coordinator. Raw journal bytes stay
+   * private, outside the capability and inspect output. Registration alone permits no effects.
+   */
+  createEpochDiscardProof(input: EpochDiscardProofOptions): EpochDiscardProof {
+    const invalid = (): never => { throw new Error("invalid epoch discard proof"); };
+    if (!input || input.decision?.eligible !== true || input.decision.attested !== true ||
+        !input.selector || typeof input.selector.runId !== "string" ||
+        !/^[A-Za-z0-9_-]{1,160}$/.test(input.selector.runId) || typeof input.selector.attempt !== "string" ||
+        (input.selector.generation !== "none" && (!Number.isSafeInteger(input.selector.generation) || input.selector.generation < 0)) ||
+        // An epoch proof names one attempt; the canonical selector is never an epoch proof issuer.
+        !ATTEMPT_ID_RE.test(input.selector.attempt) ||
+        typeof input.barePath !== "string" || !path.isAbsolute(input.barePath) ||
+        path.resolve(input.barePath) !== input.barePath ||
+        !Array.isArray(input.paths) || input.paths.length !== 1 ||
+        input.paths.some(p => typeof p !== "string" || !path.isAbsolute(p) || path.resolve(p) !== p) ||
+        typeof input.confirm !== "string" || !/^[0-9a-f]{64}$/.test(input.confirm) ||
+        // The exact strict journal, or the explicit empty-journal repair `[""]`; an absent journal (`[]`) is refused.
+        !(typeof input.expectedRawJournal === "string" || Array.isArray(input.expectedRawJournal) &&
+          input.expectedRawJournal.length === 1 && input.expectedRawJournal[0] === "") ||
+        Buffer.byteLength(JSON.stringify(input.expectedRawJournal)) > STOPPED_MARKER_MAX_BYTES ||
+        typeof input.checkLive !== "function" || typeof input.beforeEffect !== "function" || !(input.signal instanceof AbortSignal) ||
+        !Number.isFinite(input.deadline) || input.deadline <= Date.now()) return invalid();
+    const scope = input.scope;
+    if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped", "assertSettled", "finish"]
+      .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function")) return invalid();
+    if (typeof input.expectedRawJournal === "string") {
+      let raw: unknown;
+      try { raw = JSON.parse(input.expectedRawJournal); } catch { return invalid(); }
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return invalid();
+      const journal = raw as Record<string, unknown>;
+      const attempt = input.selector.attempt;
+      if (JSON.stringify(Object.keys(journal).sort()) !== JSON.stringify(["attemptId", "clonePath", "runId"]) ||
+          journal.runId !== input.selector.runId || journal.clonePath !== input.paths[0] ||
+          journal.attemptId !== attempt || JSON.stringify(journal) !== input.expectedRawJournal) return invalid();
+    }
+    const attempt = input.selector.attempt;
+    const state: EpochDiscardProofState = Object.freeze({
+      selector: Object.freeze({ runId: input.selector.runId, generation: input.selector.generation, attempt }),
+      barePath: input.barePath, paths: Object.freeze([...input.paths]), confirm: input.confirm,
+      expectedRawJournal: typeof input.expectedRawJournal === "string" ? input.expectedRawJournal : Object.freeze([...input.expectedRawJournal]), scope, checkLive: input.checkLive, beforeEffect: input.beforeEffect,
+      signal: input.signal, deadline: input.deadline,
+    });
+    this.checkEpochDiscardLive(state);
+    scope.assertSettled();
+    if (scope.pendingMutations !== 0) return invalid();
+    const proof = Object.freeze({}) as EpochDiscardProof;
+    this.epochDiscardProofs.set(proof, state);
+    return proof;
+  }
+
+  /** One deadline-bounded deny-only observation; a timed-out callback grants no later effect. */
+  private async epochObservation<T>(state: EpochDiscardProofState, observe: () => Promise<T>): Promise<T> {
+    this.checkEpochDiscardLive(state);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abort!: () => void;
+    const denied = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(state.signal.reason ?? new Error("epoch observation aborted"));
+      state.signal.addEventListener("abort", abort, { once: true });
+      timer = setTimeout(() => reject(new Error("epoch observation deadline")), Math.max(1, state.deadline - Date.now()));
+    });
+    try {
+      const result = await Promise.race([Promise.resolve().then(observe), denied]);
+      this.checkEpochDiscardLive(state);
+      return result;
+    } finally {
+      clearTimeout(timer);
+      state.signal.removeEventListener("abort", abort);
+    }
+  }
+
+  private checkEpochDiscardLive(state: EpochDiscardProofState): void {
+    state.signal.throwIfAborted();
+    if (Date.now() >= state.deadline) throw new Error("epoch discard deadline exhausted");
+    state.scope.assertExclusive();
+    if (state.scope.stopped() || residueQuarantine() !== undefined) throw new Error("epoch discard stopped");
+    state.checkLive();
+  }
+
+  /** Call before finishing the reclaim scope; this never releases or settles a ticket. */
+  assertEpochDiscardSettled(proof: EpochDiscardProof): void {
+    const state = this.epochDiscardProofs.get(proof);
+    if (!state) throw new Error("unregistered epoch discard proof");
+    this.checkEpochDiscardLive(state);
+    for (const pending of this.unsettledDeletes.keys()) {
+      if (state.paths.some(p => [p, path.join(path.dirname(p), `.uzi-skills-${path.basename(p)}`)]
+        .some(target => isWithinPath(pending, target) || isWithinPath(target, pending)))) {
+        throw new Error("epoch discard has unsettled deletes");
+      }
+    }
+    state.scope.assertSettled();
+    if (state.scope.pendingMutations !== 0) throw new Error("epoch discard has pending mutations");
+  }
+
+  /** Throws while any runner delete in this process is unsettled (its child has not closed). The epoch
+   *  reclaim pass calls it so an unresolved delete, wherever it began, is fatal rather than a handover. */
+  assertNoUnsettledDeletes(): void {
+    if (this.unsettledDeletes.size > 0) throw new Error("unsettled runner delete outstanding");
+  }
 
   private epochLimits(limits: EpochRetainedLimits = {}): Required<EpochRetainedLimits> {
     const cap = (value: number | undefined, maximum: number): number => {
@@ -3287,11 +4157,13 @@ export class GitCache {
       return value ?? maximum;
     };
     return {
-      maxDirectoryEntries: cap(limits.maxDirectoryEntries, 4096),
+      maxDirectoryEntries: cap(limits.maxDirectoryEntries, 16384),
       maxBares: cap(limits.maxBares, 1024),
-      maxMetadataBytes: cap(limits.maxMetadataBytes, 8 * 1024 * 1024),
-      maxMetadataRecords: cap(limits.maxMetadataRecords, 4096),
+      maxMetadataBytes: cap(limits.maxMetadataBytes, 16 * 1024 * 1024),
+      maxMetadataRecords: cap(limits.maxMetadataRecords, 131072),
       maxSeenPaths: cap(limits.maxSeenPaths, 4096),
+      maxWorktreeContentBytes: cap(limits.maxWorktreeContentBytes, 512 * 1024 * 1024),
+      maxObjectStoreBytes: cap(limits.maxObjectStoreBytes, 4 * 1024 * 1024 * 1024),
     };
   }
 
@@ -3373,6 +4245,12 @@ export class GitCache {
                   const g = await this.gatherRetainedUnderLock(bare);
                   for (const rec of g.records) {
                     this.checkRecoveryInterruption();
+                    // The append-only retired ledger and empty journal also describe a clear whose
+                    // durability barrier was interrupted. Skip a completed pair before the path cap
+                    // only when its exact path has the authenticated retired authority tombstone,
+                    // written after the barriers and source-use end. Unknown stays counted for repair.
+                    if (rec.epochRetiredEmptyJournal && this.authority?.isRetiredSource &&
+                        await this.retainedIO(() => this.authority!.isRetiredSource!(rec.parts[0]!.clonePath))) continue;
                     const paths = [...new Set(rec.parts.map(p => p.clonePath))];
                     const fresh = paths.filter(p => !seen.has(p));
                     if (seen.size + fresh.length > limits.maxSeenPaths) {
@@ -3597,6 +4475,7 @@ export class GitCache {
     action: () => Promise<T>,
     hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number; now?: () => number } = {},
   ): Promise<T> {
+    if (this.epochNative.getStore()) throw new Error("epoch native process scope overlap");
     if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture spawner cannot be replaced");
     return this.boundaryProcesses.run(
       { spawn: spawner, signal, ...hooks },
@@ -3606,6 +4485,7 @@ export class GitCache {
 
   /** Bind the opaque safety context privately. The runner supplies no command spawner. */
   withCredentialFreeCapture<T>(context: CredentialFreeCaptureContext, action: () => Promise<T>): Promise<T> {
+    if (this.epochNative.getStore()) throw new Error("epoch native process scope overlap");
     if (this.boundaryProcesses.getStore()) throw new Error("capture scope cannot overlay a process scope");
     const base = gitEnv();
     // Enumerate only worker-owned, fixed decorations used by the capture readers.
@@ -5049,6 +5929,7 @@ export class GitCache {
    *  {@link freeCanonicalClonePath}): runner-uid under the split, in-process single-uid. */
   private async runRunnerUidDelete(target: string): Promise<void> {
     if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture cannot run an unsupervised delete");
+    if (this.epochNative.getStore()) return this.runEpochRunnerUidDelete(target);
     const split = this.retentionDeleteSeam?.split ?? uidSplitActive();
     // issue #3404 M2: registered BEFORE the first byte can go; a refusal deletes nothing.
     const settlement = await this.beginDestructive([target], "runner-uid-delete");
@@ -5832,8 +6713,12 @@ export class GitCache {
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
+      // The marker whose content this seed recovered: baseSha on the reset --soft leg (the adopted tip IS the
+      // marker), the cherry-picked checkpoint marker on the diverged leg, none otherwise.
+      const recoveredMarkerSha = willRecoverMarker ? baseSha : recoveredCheckpointMarkerSha;
       return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered,
-        adoptedSource: baseSha, ...(recoveredCheckpointMarkerSha !== "" ? { wipCherryPicked: true } : {}) };
+        adoptedSource: baseSha, ...(recoveredCheckpointMarkerSha !== "" ? { wipCherryPicked: true } : {}),
+        ...(wipRecovered && recoveredMarkerSha !== "" ? { recoveredMarkerSha } : {}) };
     }
   }
 
@@ -6671,6 +7556,26 @@ export class GitCache {
       })
     ).trim();
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+
+  /**
+   * True only when `ancestor` names a commit the runner clone can resolve and `descendant` descends from
+   * it (equal counts), read as the RUNNER uid like every clone read. Both must be full 40/64-hex object
+   * ids, except `descendant` may be `HEAD`. Any git error, a missing object or malformed input answers
+   * false, never a guess: the caller treats "not proven" as "not recovered". A hard boundary abort still
+   * propagates, as in {@link worktreeHead}.
+   */
+  async cloneHasAncestor(clonePath: string, ancestor: string, descendant: string): Promise<boolean> {
+    const id = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+    if (!id.test(ancestor) || (descendant !== "HEAD" && !id.test(descendant))) return false;
+    try {
+      await this.runGitAsRunner(clonePath, ["merge-base", "--is-ancestor", ancestor, descendant]);
+      return true;
+    } catch (cause: unknown) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return false;
+    }
   }
 
   /**
@@ -8292,16 +9197,35 @@ export class GitCache {
   /** fsync `<bare>/config`, fsync the bare directory, then require the journal's raw value to read back as exactly `want`. */
   private async syncJournalAndReadBack(barePath: string, branch: string, want: string | undefined, opts: MemoryParkDurability,
     expected?: { runId: string; clonePath: string; attemptId?: string }): Promise<void> {
+    await this.syncConfigAndVerify(barePath, async () => {
+      // A composite stores S in its restore key; the ordinary epoch path still verifies the active key.
+      const read = expected === undefined ? () => this.readRecoveryCaptureRaw(barePath, branch)
+        : async () => (await this.readJournalFor(barePath, branch, expected))?.raw;
+      const back = opts.readback ? await opts.readback(read) : await read();
+      if (back !== want) throw new Error("memory park read-back differs");
+    }, opts);
+  }
+
+  private async syncConfigAndVerify(barePath: string, verify: () => Promise<void>, opts: MemoryParkDurability = {},
+    step: (name: string) => Promise<void> = async () => {}): Promise<void> {
     const sync = opts.sync ?? (async (h: { sync(): Promise<void> }) => { await h.sync(); });
-    const config = await fs.open(path.join(barePath, "config"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    try { await sync(config, "config"); } finally { await config.close(); }
-    const dir = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
-    try { await sync(dir, "directory"); } finally { await dir.close(); }
-    // issue #3644: the key that holds `expected` (S's restore key when composite and S matches, else P's).
-    const read = expected === undefined ? () => this.readRecoveryCaptureRaw(barePath, branch)
-      : async () => (await this.readJournalFor(barePath, branch, expected))?.raw;
-    const back = opts.readback ? await opts.readback(read) : await read();
-    if (back !== want) throw new Error("memory park read-back differs");
+    for (const kind of ["config", "directory"] as const) {
+      await step(kind + ":before-open");
+      const handle = await fs.open(kind === "config" ? path.join(barePath, "config") : barePath,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | (kind === "directory" ? fsConstants.O_DIRECTORY : 0));
+      try {
+        await step(kind + ":after-open");
+        await step(kind + ":before-sync");
+        await sync(handle, kind);
+        await step(kind + ":after-sync");
+      } finally {
+        // A fault before close still joins the close; no opened descriptor is abandoned.
+        try { await step(kind + ":before-close"); }
+        finally { await handle.close(); }
+      }
+      await step(kind + ":after-close");
+    }
+    await verify();
   }
 
   /**
@@ -10441,7 +11365,8 @@ export class GitCache {
 
   /**
    * issue #1786 — retain a stopped ATTEMPT clone (Docker-wired or recovery-enabled) under the ledger's
-   * never-deleted `reclaimed` state, in ONE bare-lock section with no nested lock. Validates that
+   * `reclaimed` state (never deleted automatically, including by the verified-epoch disposal, which does not
+   * admit this state; only an operator discard disposes of it), in ONE bare-lock section with no nested lock. Validates that
    * the source is this run's `live` (or already `reclaimed`) attempt at exactly this path, a real
    * directory with a real `.git`; appends ledger `reclaimed` (even when the active journal now names
    * another source, so an unjournaled `live` entry never becomes a sweep candidate); then clears
@@ -10672,6 +11597,914 @@ export class GitCache {
     return false;
   }
 
+  /** Join each read before observing revocation; never launch a sibling after failure. */
+  private async automaticPreservationRead<T>(automatic: AutomaticPreservation | undefined, action: () => Promise<T>): Promise<T> {
+    if (!automatic) return action();
+    this.checkReportProof();
+    this.checkRecoveryInterruption();
+    automatic.checkLive();
+    try { return await action(); }
+    finally {
+      this.checkReportProof();
+      this.checkRecoveryInterruption();
+      automatic.checkLive();
+    }
+  }
+
+  /** Revocation never skips a close; its uncancellable work is always joined. */
+  private async automaticPreservationClose(automatic: AutomaticPreservation | undefined, close: () => Promise<void>): Promise<void> {
+    if (!automatic) return close();
+    const check = () => {
+      this.checkReportProof();
+      this.checkRecoveryInterruption();
+      automatic.checkLive();
+    };
+    try { check(); }
+    finally {
+      try { await close(); }
+      finally { check(); }
+    }
+  }
+
+  private automaticCollection(out: string, separator: string): void {
+    const limits = this.epochRetained.getStore()!;
+    let count = 0;
+    for (const char of out) {
+      if (char === separator && ++count > limits.maxMetadataRecords) throw new AutomaticBoundExceeded("automatic content record limit");
+    }
+    if (out && !out.endsWith(separator) && ++count > limits.maxMetadataRecords) throw new AutomaticBoundExceeded("automatic content record limit");
+  }
+
+  /** One entry at most, one joined close. Only absence before opening may mean empty. */
+  private async automaticDirectoryEmpty(dir: string, automatic: AutomaticPreservation, missing: boolean): Promise<boolean> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    try {
+      const before = await read(() => fs.lstat(dir)).catch((err: NodeJS.ErrnoException) => {
+        if (missing && err.code === "ENOENT") return undefined;
+        throw err;
+      });
+      if (!before) return true;
+      if (!before.isDirectory() || before.isSymbolicLink() || await read(() => fs.realpath(dir)) !== dir) return false;
+      automatic.checkLive();
+      this.checkRecoveryInterruption();
+      const handle = await fs.opendir(dir, { bufferSize: 1 });
+      let empty: boolean;
+      try {
+        automatic.checkLive();
+        this.checkRecoveryInterruption();
+        empty = await read(() => handle.read()) === null;
+      } finally {
+        // Close must still be joined when a read or liveness check failed.
+        await handle.close();
+      }
+      automatic.checkLive();
+      this.checkRecoveryInterruption();
+      const after = await read(() => fs.lstat(dir));
+      return empty && after.isDirectory() && !after.isSymbolicLink() &&
+        before.dev === after.dev && before.ino === after.ino &&
+        await read(() => fs.realpath(dir)) === dir;
+    } catch { return false; }
+  }
+
+  /**
+   * Default history and validated own-run owed roots; arbitrary refs prove no preservation.
+   *
+   * THE RULE (lead decision applying owner answer seq 1162, 2026-11-06 (R9): over-limit is a settled keep, indirect
+   * stores stay UNKNOWN). An INDIRECTION is anything that lets some OTHER source's deletion break the work this
+   * source retains: an alternate into another store, a partialclone/promisor, another ref or object format, a
+   * worktree or common-directory redirect, a config include, a symlinked or noncanonical object path or config.
+   * Residual: a nested `.git` inside an untracked worktree directory is refused (a settled keep) by the worktree
+   * stage, after its own bulk budgets; it is not classified as an indirection. An indirection
+   * stops the whole epoch scope (UNKNOWN). A budget overflow, by contrast, is a settled keep of only this source. If
+   * bulk data an attacker controls could use up a budget before an indirection input was classified, the attacker
+   * would hide the indirection behind a keep. Therefore, in EVERY stage of this proof (the clone shape stage
+   * {@link GitCache.automaticCloneShape}, the object-store snapshot's topology and content stages in
+   * {@link GitCache.automaticObserveStores}, and the worktree stage {@link GitCache.worktreeCleanHardened}), every
+   * INDIRECTION-BEARING input is read and classified BEFORE anything else charges a budget it shares, and an
+   * overflow while reading such an input is UNKNOWN, never a keep. The indirection-bearing inputs are: each store's
+   * and the clone's `config` (every UNKNOWN-class key), `objects/info/*` (alternates, http-alternates, packs,
+   * commit-graphs), every object-path entry's NAME and TYPE (`objects/`, `pack/`, a loose fan-out directory), and
+   * the `.git` entries the code treats as UNKNOWN. The non-indirection bulk data (reflogs, packed-refs, refs, the
+   * index, the bytes of loose objects and packs, worktree content, Git inventories) may overflow into a keep, but
+   * only after every indirection input of its stage has been classified. The worktree stage has no input of its own
+   * that this code treats as UNKNOWN: its one indirection-bearing input, the clone config, was classified by the
+   * shape stage (Node bytes, before anything is charged) and again by the object-store topology (Git's own parse)
+   * before the worktree stage starts, and every file of it is re-checked at its end.
+   */
+  private async automaticContentPreserved(epoch: EpochDiscardProofState): Promise<boolean> {
+    const automatic: AutomaticPreservation = { roots: [], checkLive: () => this.checkEpochDiscardLive(epoch) };
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    const cwd = epoch.paths[0]!;
+    const skills = path.join(path.dirname(cwd), `.uzi-skills-${path.basename(cwd)}`);
+    // A `commondir` or a redirected `.git` shares another store: an indirection, so UNKNOWN (the rule above), never
+    // a settled keep.
+    const standalone = async () => {
+      try { await read(() => fs.lstat(path.join(cwd, ".git", "commondir"))); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
+      throw new AutomaticCompletenessUnknown("common-directory redirect");
+    };
+    // A gitfile, a symlinked `.git` or one that resolves elsewhere is the same redirect.
+    const ownGitDir = async () => {
+      const st = await read(() => fs.lstat(path.join(cwd, ".git")));
+      // Both callers have just verified `realpath(cwd) === cwd`, so a `.git` that lstat reports as a real directory
+      // resolves to `cwd/.git`: no separate realpath of it is needed.
+      if (st.isSymbolicLink() || st.isFile()) throw new AutomaticCompletenessUnknown("redirected .git");
+      return true;
+    };
+    try {
+      const presence = await read(() => this.clonePresence(cwd));
+      // Skills are generated, attributed footprint, not another Git worktree. Their
+      // content need not be empty; the discard core still validates their path before removal.
+      const skillsPresence = await read(() => this.clonePresence(skills));
+      if (skillsPresence.presence === "unsafe" ||
+          skillsPresence.presence === "present" && await read(() => fs.realpath(skills)) !== skills) return false;
+      for (const ancestor of [path.resolve(this.runnerRoot), path.dirname(cwd)]) {
+        const st = await read(() => fs.lstat(ancestor));
+        if (!st.isDirectory() || st.isSymbolicLink() || await read(() => fs.realpath(ancestor)) !== ancestor) return false;
+      }
+      if (presence.presence === "missing") return true;
+      if (presence.presence !== "present" || await read(() => fs.realpath(cwd)) !== cwd) return false;
+      await ownGitDir();
+      await standalone();
+      if (!(await read(() => this.realCloneDir(cwd)))) return false;
+      // Node-only shape checks first: no Git may launch in a clone whose `.git` was not typed and bounded. The shape
+      // stage classifies every other indirection input of the clone before any bulk input (see its afterIndirection).
+      if (!await this.automaticCloneShape(cwd, automatic,
+        async () => { await this.automaticObserveStores(epoch.barePath, cwd, automatic, true); })) return false;
+      const native = this.epochNative.getStore()!;
+      native.attrSource = await read(() => this.epochGitSupportsAttrSource());
+      if (!native.attrSource) return false;
+      automatic.objectCoverage = await this.automaticObserveStores(epoch.barePath, cwd, automatic);
+      // Resolve the trusted default using the existing lookup, but reject its HEAD-only fallback.
+      const db = await read(() => this.defaultBranchName(epoch.barePath));
+      if (!db || !(await read(() => this.isPlainBranchName(epoch.barePath, db)))) return false;
+      let rootRef: string | undefined;
+      for (const ref of db ? [`refs/remotes/origin/${db}`, `refs/heads/${db}`] : []) {
+        if (await read(() => this.refExists(epoch.barePath, ref))) { rootRef = ref; break; }
+      }
+      const root = async () => rootRef ? (await read(() => this.runGitWithEnv(epoch.barePath,
+        ["rev-parse", "--verify", `${rootRef}^{commit}`], NO_REPLACE_ENV))).trim() : undefined;
+      const rootSha = await root();
+      if (rootSha !== undefined && !SHA40_RE.test(rootSha)) return false;
+      const owedRoots = async () => (await this.enumerateOwedUnderLock(epoch.barePath,
+        epoch.selector.runId, undefined, automatic)).map(candidate => candidate.sha);
+      const owed = await owedRoots();
+      automatic.roots = [...new Set([...(rootSha ? [rootSha] : []), ...owed])];
+      if (!automatic.roots.length || automatic.roots.length > Math.min(128,
+        this.epochRetained.getStore()!.maxMetadataRecords)) return false;
+      const head = await read(() => this.worktreeHead(cwd));
+      if (!head || !SHA40_RE.test(head)) return false;
+      if (!(await this.localRefsReachableFrom(epoch.barePath, cwd, head, automatic)) ||
+          !(await this.worktreeCleanHardened(cwd, automatic))) return false;
+      if (await read(() => this.worktreeHead(cwd)) !== head || await root() !== rootSha ||
+          JSON.stringify(await owedRoots()) !== JSON.stringify(owed)) return false;
+      const after = await read(() => this.clonePresence(cwd));
+      const unchanged = after.presence === "present" && after.devIno === presence.devIno;
+      if (unchanged) await standalone();
+      const stillReal = unchanged && await read(() => this.realCloneDir(cwd)) &&
+        await read(() => fs.realpath(cwd)) === cwd;
+      if (stillReal) await ownGitDir();
+      await automatic.finalStoreCheck?.();
+      return stillReal;
+    } catch (error) {
+      if (error instanceof AutomaticCompletenessUnknown) throw error;
+      return false;
+    }
+  }
+
+  /** Read-only physical inventory. Every loop is capped by the existing epoch limits;
+   * one failure aborts the observation and no later native sibling is launched. */
+  private async automaticObjectCoverage(barePath: string, cwd: string, head: string,
+    automatic: AutomaticPreservation): Promise<boolean> {
+    const coverage = automatic.objectCoverage ?? await this.automaticObserveStores(barePath, cwd, automatic);
+    return coverage(head);
+  }
+
+  private async automaticObserveStores(barePath: string, cwd: string,
+    automatic: AutomaticPreservation, classifyOnly = false): Promise<(head: string) => Promise<boolean>> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    const unknown = (message: string): never => { throw new AutomaticCompletenessUnknown(message); };
+    // Only at an actual limit comparison: the settled keep (owner answer seq 1162, 2026-11-06 (R9)).
+    const exceeded = (message: string): never => { throw new AutomaticBoundExceeded(message); };
+    const limits = this.epochRetained.getStore()!;
+    const native = this.epochNative.getStore()!;
+    const source = path.join(cwd, ".git", "objects"), bare = path.join(barePath, "objects");
+    const same = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every(id => b.has(id));
+    const signature = (st: import("node:fs").BigIntStats) =>
+      [st.dev, st.ino, st.mode, st.nlink, st.uid, st.gid, st.size, st.mtimeNs, st.ctimeNs].join(":");
+    // One observation of every store. The TOPOLOGY comes first: every store's config, object root, `info` and `pack`
+    // names, the whole alternate graph, and then the TYPE of every loose fan-out leaf (a symlink or any non-regular
+    // file is UNKNOWN) are read and classified before any object content is charged, so an UNKNOWN-class indirection
+    // or an illegal name can never be hidden behind a content overflow (and a name is classified as it is read,
+    // before it is counted). ANY overflow during the topology stage, whatever its kind (byte, entry, edge, store
+    // count, config listing, more loose leaves than the record limit), is UNKNOWN: the part of the
+    // topology past the limit (an alternate line, a pack member, a config key, a leaf that is a symlink) was never
+    // read and may hold an indirection. Overflows are settled keeps only in the content stage, which reads bytes of
+    // objects already typed (and in the shape/worktree budgets, after their indirection inputs). Residual: a content-stage overflow in one
+    // store ends the observation, so corruption in a LATER store's content is never reached; accepted, because the
+    // source is kept either way. Likewise corrupt bytes beyond the point where a content budget ended the observation
+    // were never handed to zlib or parsed; every byte up to that point was inspected before it was charged.
+    // `topologyOnly` is the Node-only classification pass the clone shape stage runs BEFORE it charges any bulk input
+    // (see automaticCloneShape): the same topology walk, with the config judged by a byte scan instead of a Git
+    // launch, and nothing of the content stage.
+    const snapshot = async (afterTopology?: () => Promise<void>, topologyOnly = false) => {
+      let entries = 0, looseLeaves = 0, bytes = 0, occurrences = 0, edges = 0;
+      let topologyStage = true;
+      const rows = new Map<string, string>();
+      type Store = { ids: Set<string>; alternates: string[]; names: string[]; pack?: string[];
+        /** Fan-out directory name to its loose-object file names, each typed by the topology stage. */
+        loose: Map<string, string[]> };
+      const stores = new Map<string, Store>();
+      const pairs = new Set<string>();
+      const over = (message: string): never => topologyStage ? unknown(message) : exceeded(message);
+      // `bytes` is local to one snapshot: the budget resets for each of the proof's snapshots. It counts bytes
+      // actually inspected: metadata read and parsed, input zlib took, output it produced, content a delta instruction
+      // generated. Never a size a file declares and never a read-ahead window that was not yet inspected.
+      const charge = (n: number) => { if ((bytes += n) > limits.maxObjectStoreBytes) over("object metadata byte limit"); };
+      const contentCharge = (n: number) => {
+        charge(n); MaintenanceResources.consumeIfActive("metadataBytes", n);
+      };
+      const tick = () => { automatic.checkLive(); this.checkRecoveryInterruption(); };
+      const stat = async (p: string, optional = false) => {
+        try {
+          const st = await read(() => fs.lstat(p, { bigint: true }));
+          if (st.isSymbolicLink() || await read(() => fs.realpath(p)) !== p) unknown("noncanonical object path");
+          rows.set(p, signature(st)); charge(Buffer.byteLength(p) + 128);
+          return st;
+        } catch (error) {
+          if (optional && (error as NodeJS.ErrnoException).code === "ENOENT") {
+            rows.set(p, "absent"); charge(Buffer.byteLength(p)); return undefined;
+          }
+          throw error;
+        }
+      };
+      // Each name is classified (`classify` throws UNKNOWN for an illegal one, and may type the entry) as it is read,
+      // before it is counted.
+      // `leaves` marks a loose fan-out directory: its object files are objects, so they count against the record
+      // limit (`maxMetadataRecords`, which also caps object occurrences) and not against the snapshot-wide
+      // directory entry limit, which a run committing many files would otherwise cross (R9 lead decision). Every
+      // other listing (the fan-out directories themselves, `pack`, `info`, ...) counts against the entry limit.
+      const directory = async (p: string, classify?: (name: string) => void | Promise<void>, leaves = false) => {
+        const st = await stat(p);
+        if (!st?.isDirectory()) unknown("object directory type");
+        let handle: import("node:fs").Dir | undefined;
+        const names: string[] = [];
+        try {
+          await read(async () => { handle = await fs.opendir(p, { bufferSize: 1 }); });
+          for (;;) {
+            const entry = await read(() => handle!.read());
+            if (!entry) break;
+            await classify?.(entry.name);
+            if (leaves) { if (++looseLeaves > limits.maxMetadataRecords) over("loose object leaf limit"); }
+            else if (++entries > limits.maxDirectoryEntries) over("object directory entry limit");
+            MaintenanceResources.consumeIfActive("adminEntries", 1);
+            charge(Buffer.byteLength(entry.name)); names.push(entry.name);
+          }
+        } finally { if (handle) await this.automaticPreservationClose(automatic, () => handle!.close()); }
+        rows.set(p + "/", JSON.stringify(names.sort()));
+        return { names };
+      };
+      type Opened = {
+        size: number;
+        /** One positioned read of at most `length` bytes; returns the bytes read. Nothing is charged to the object-store
+         *  budget: the caller charges what it actually inspects (a read-ahead window is not inspected yet). */
+        fill(into: Buffer, intoOffset: number, position: number, length: number): Promise<number>;
+        readInto(into: Buffer, intoOffset: number, position: number, length: number): Promise<void>;
+      };
+      // Observation does not mutate the inode. Participating writers are excluded through aliases by the epoch
+      // contract; fingerprints never replace that exclusion. Mutation-specific hardlink guards elsewhere remain
+      // unchanged. The file is never read whole unless the caller bounded it: it is read through `fill`.
+      const withFile = async <T>(p: string, use: (f: Opened) => Promise<T>): Promise<T> => {
+        const st = await stat(p);
+        if (!st?.isFile()) unknown("object file type");
+        const size = Number(st!.size);
+        if (!Number.isSafeInteger(size)) unknown("object file size");
+        let handle: import("node:fs/promises").FileHandle | undefined;
+        try {
+          await read(async () => { handle = await fs.open(p, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); });
+          if (signature(await read(() => handle!.stat({ bigint: true }))) !== signature(st!)) unknown("object file replaced");
+          const fill: Opened["fill"] = async (into, intoOffset, position, length) => {
+            const result = await read(() => handle!.read(into, intoOffset, length, position));
+            MaintenanceResources.consumeIfActive("metadataBytes", result.bytesRead);
+            return result.bytesRead;
+          };
+          // At most `length` nonempty reads; EOF before `length` is incomplete. The exact bytes read are parsed.
+          const readInto: Opened["readInto"] = async (into, intoOffset, position, length) => {
+            for (let done = 0; done < length;) {
+              const got = await fill(into, intoOffset + done, position + done, length - done);
+              if (!got) unknown("short object metadata");
+              charge(got);
+              done += got;
+            }
+          };
+          const result = await use({ size, fill, readInto });
+          if (signature(await read(() => handle!.stat({ bigint: true }))) !== signature(st!)) unknown("object file changed");
+          return result;
+        } finally { if (handle) await this.automaticPreservationClose(automatic, () => handle!.close()); }
+      };
+      // Config and alternates are read whole, bounded by the existing metadata byte limit. They are topology: a file
+      // past the limit is never read, so the indirection it may hold (an alternate, an extension) cannot be observed
+      // and the answer is UNKNOWN, never a keep.
+      const small = (p: string): Promise<Buffer> => withFile(p, async f => {
+        if (f.size > limits.maxMetadataBytes) unknown("object metadata read byte limit");
+        const out = Buffer.alloc(f.size);
+        await f.readInto(out, 0, 0, f.size);
+        return out;
+      });
+      const add = (ids: Set<string>, id: string) => {
+        if (++occurrences > Math.min(EPOCH_MAX_OBJECT_OCCURRENCES, limits.maxMetadataRecords)) over("physical object occurrence limit");
+        ids.add(id);
+      };
+      const managed = (root: string) => path.dirname(path.dirname(root)) === path.resolve(this.reposRoot) && path.basename(root) === "objects";
+
+      // ---- Stage one: topology. Nothing here charges object content. ----
+      const topologyInfo = async (root: string, store: Store) => {
+        const p = path.join(root, "info");
+        const { names: members } = await directory(p, member => {
+          if (!["commit-graphs", "commit-graph", "packs", "alternates"].includes(member)) unknown("unsupported object info entry");
+        });
+        for (const member of members) {
+          const full = path.join(p, member);
+          if (member === "commit-graphs") {
+            const children = await directory(full, child => {
+              if (child !== "commit-graph-chain" && !/^graph-[0-9a-f]{40}\.graph$/.test(child)) unknown("unsupported commit graph entry");
+            });
+            for (const child of children.names)
+              if (!(await stat(path.join(full, child)))?.isFile()) unknown("commit graph type");
+          } else if (["commit-graph", "packs"].includes(member)) {
+            if (!(await stat(full))?.isFile()) unknown("object info type");
+          } else {
+            const data = await small(full);
+            if (!isUtf8(data)) unknown("alternate encoding");
+            rows.set(full + ":bytes", data.toString("hex"));
+            const text = data.toString("utf8");
+            if (text && !text.endsWith("\n")) unknown("unterminated alternates");
+            for (const line of text ? text.slice(0, -1).split("\n") : []) {
+              if (!/^[!-~]+$/.test(line) || /["\\]/.test(line)) unknown("unsupported alternate syntax");
+              const target = path.resolve(root, line);
+              // EX covers managed stores only. Fingerprints alone do not exclude outside writers.
+              if (target !== source && target !== bare && !managed(target)) unknown("alternate writer exclusion unavailable");
+              if (++edges > limits.maxMetadataRecords) over("alternate edge limit");
+              store.alternates.push(target);
+            }
+          }
+        }
+        for (const absent of ["alternates", "http-alternates", "commit-graph", "commit-graphs"])
+          if (!members.includes(absent)) await stat(path.join(p, absent), true);
+      };
+      const topologyPack = async (root: string, store: Store) => {
+        const p = path.join(root, "pack");
+        const listing = await directory(p, member => {
+          if (member !== "multi-pack-index.d" && member !== "multi-pack-index" &&
+              !/^multi-pack-index-[0-9a-f]{40}\.(rev|bitmap)$/.test(member) &&
+              !/^pack-[0-9a-f]{40}\.(pack|idx|keep|promisor|rev|bitmap|mtimes)$/.test(member)) unknown("unsupported pack entry");
+        });
+        store.pack = listing.names;
+        const present = new Set(listing.names);
+        for (const member of listing.names) {
+          const full = path.join(p, member);
+          if (member === "multi-pack-index.d") {
+            const children = await directory(full, child => {
+              if (child !== "multi-pack-index-chain" && !/^multi-pack-index-[0-9a-f]{40}\.(midx|rev|bitmap)$/.test(child))
+                unknown("unsupported incremental MIDX");
+            });
+            for (const child of children.names)
+              if (!(await stat(path.join(full, child)))?.isFile()) unknown("MIDX type");
+            continue;
+          }
+          if (member === "multi-pack-index" || /^multi-pack-index-[0-9a-f]{40}\.(rev|bitmap)$/.test(member)) {
+            if (!(await stat(full))?.isFile()) unknown("MIDX type");
+            continue;
+          }
+          const match = /^(pack-[0-9a-f]{40})\.(?:pack|idx|keep|promisor|rev|bitmap|mtimes)$/.exec(member);
+          if (!match || !(await stat(full))?.isFile()) unknown("unsupported pack entry");
+          if (!present.has(match![1] + ".pack") || !present.has(match![1] + ".idx")) unknown("incomplete pack pair");
+        }
+      };
+      /** One store's config as Git lists it (`git config --file -`, the bytes on stdin, no file of the store opened). */
+      const configListing = async (configBytes: Buffer) => {
+        let listing: string;
+        try {
+          const parsed = await read(() => this.execScoped("git",
+            ["config", "--file", "-", "--no-includes", "--null", "--list"],
+            { env: gitEnv(), input: configBytes, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER }));
+          listing = parsed.stdout;
+          this.automaticCollection(listing, "\0");
+        } catch (error) {
+          // A config listing whose stdout overran the byte cap or the record limit is UNKNOWN: the indirection it may
+          // hold (an alternate, partialclone, a config include) cannot be observed past the limit. The other topology
+          // reads (entry, edge, store and byte limits) raise UNKNOWN through `over` while `topologyStage` holds.
+          if (isBoundOverflow(error)) unknown("object topology listing exceeds the observation limit");
+          throw error;
+        }
+        for (const row of listing.split("\0")) {
+          const [key, value] = row.split("\n");
+          if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
+              key === "extensions.refstorage" || key === "extensions.worktreeconfig" || key === "extensions.partialclone" ||
+              key === "core.worktree" || key !== undefined && PROMISOR_KEY_RE.test(key) || key?.startsWith("include.") || key?.startsWith("includeif."))
+            unknown("object format or config indirection unsupported");
+        }
+      };
+      /** The loose fan-out directories of one store: every leaf name is classified, and its TYPE read (a symlink or any
+       *  other non-regular file is UNKNOWN), as the leaf is listed and before it is counted. */
+      const topologyLoose = async (root: string) => {
+        const store = stores.get(root)!;
+        for (const name of store.names) {
+          if (!/^[0-9a-f]{2}$/.test(name)) continue;
+          const p = path.join(root, name);
+          const listing = await directory(p, async leaf => {
+            if (!/^[0-9a-f]{38}$/.test(leaf)) unknown("unsupported loose object");
+            if (!(await stat(path.join(p, leaf)))?.isFile()) unknown("unsupported loose object");
+          }, true);
+          store.loose.set(name, listing.names);
+        }
+      };
+      const topology = async (root: string): Promise<void> => {
+        if (stores.has(root)) return;
+        if (stores.size >= limits.maxMetadataRecords) over("object store limit");
+        // EX covers managed stores only. Fingerprints alone do not exclude outside writers.
+        const managedBare = managed(root);
+        if (root !== source && root !== bare && !managedBare) unknown("alternate writer exclusion unavailable");
+        for (const parent of [path.dirname(path.dirname(root)), path.dirname(root)]) {
+          if (!(await stat(parent))?.isDirectory()) unknown("object ancestor type");
+        }
+        if (managedBare) {
+          const owner = await stat(path.dirname(root));
+          if (owner!.uid !== BigInt(process.getuid!()) || (owner!.mode & 0o022n) !== 0n) unknown("unowned alternate store");
+        }
+        const config = path.join(path.dirname(root), "config");
+        const configBytes = await small(config);
+        rows.set(config + ":bytes", configBytes.toString("hex"));
+        if (topologyOnly) {
+          // No Git here: the config bytes are classified directly (a superset of the key checks of `configListing`).
+          // The clone's own include was already reported UNKNOWN by the shape stage, which calls this pass only
+          // afterwards; an include in any other store's config is judged here.
+          if (cloneConfigIndirection(configBytes) !== undefined || /\[\s*include/i.test(configBytes.toString("latin1")))
+            unknown("object format or config indirection unsupported");
+        } else await configListing(configBytes);
+        for (const name of ["commondir", "shallow", "info/grafts", "refs/replace"]) {
+          if (await stat(path.join(path.dirname(root), name), true)) unknown("unsupported object topology");
+        }
+        const store: Store = { ids: new Set<string>(), alternates: [], names: [], loose: new Map() };
+        stores.set(root, store);
+        store.names = (await directory(root, name => {
+          if (!/^[0-9a-f]{2}$/.test(name) && name !== "pack" && name !== "info") unknown("unsupported object root entry");
+        })).names;
+        if (store.names.includes("info")) await topologyInfo(root, store);
+        if (store.names.includes("pack")) await topologyPack(root, store);
+        for (const absent of ["pack", "info"]) if (!store.names.includes(absent)) await stat(path.join(root, absent), true);
+        for (const alternate of store.alternates) await topology(alternate);
+      };
+
+      // ---- Stage two: content, streamed through bounded windows. Every name and type it meets was fixed by stage one. ----
+      /** Inflates `length` compressed bytes at `position` of `win` into `sink`; returns the bytes consumed. */
+      const inflateSpan = async (win: ObservedWindow, position: number, length: number,
+        sink: (out: Buffer) => void): Promise<number> => {
+        if (length <= OBSERVE_SYNC_SPAN) {
+          await win.ensure(position, length);
+          tick();
+          const small = inflateSmall(win.view(position, length),
+            Math.max(1, Math.min(OBSERVE_SYNC_OUTPUT, limits.maxObjectStoreBytes - bytes)));
+          // The output is judged first (a contradiction is UNKNOWN), then the input zlib actually took is charged.
+          if (small) { sink(small.buffer); charge(small.consumed); return small.consumed; }
+        }
+        return inflateStream(win.pieces(position, length, () => limits.maxObjectStoreBytes - bytes), sink, charge);
+      };
+      // Overflow rule for a loose object: the output is charged as it is produced, and it is an overflow only when
+      // the object's own header declares at least what was produced (a stream that outgrows its declared size, or
+      // whose header cannot be read, is corrupt: UNKNOWN).
+      const looseObject = (file: string, id: string, store: Store) => withFile(file, async f => {
+        const win = new ObservedWindow(f.size, f.fill);
+        const hash = createHash("sha1");
+        let produced = 0, uncharged = 0, head = Buffer.alloc(0);
+        const header: { declared?: number } = {};
+        const sink = (out: Buffer) => {
+          tick();
+          produced += out.length;
+          hash.update(out);
+          if (header.declared === undefined) {
+            head = Buffer.concat([head, out.subarray(0, 48 - head.length)]);
+            const nul = head.indexOf(0);
+            if (nul >= 0) {
+              const match = /^(?:blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(head.toString("latin1", 0, nul));
+              if (!match || !Number.isSafeInteger(Number(match[1]))) unknown("invalid loose object");
+              header.declared = Number(match![1]) + nul + 1;
+            } else if (head.length >= 48) unknown("invalid loose object");
+          }
+          // Nothing is charged before the header is read: an overrun is only ever counted against a declaration.
+          if (header.declared === undefined) { uncharged += out.length; return; }
+          // Produced bytes that pass the declared size contradict the header: corrupt, not over budget.
+          if (produced > header.declared) unknown("invalid loose object");
+          const n = uncharged + out.length;
+          uncharged = 0;
+          if (bytes + n > limits.maxObjectStoreBytes) exceeded("loose output byte limit");
+          contentCharge(n);
+        };
+        if (await inflateSpan(win, 0, f.size, sink) !== f.size) unknown("trailing loose input");
+        if (header.declared === undefined || produced !== header.declared || hash.digest("hex") !== id) unknown("invalid loose object");
+        tick();
+        add(store.ids, id);
+      });
+      type PackRecord = { logical: number; baseLength?: number; base?: number; state: number };
+      /** The pack's 12-byte header must name this idx's object count: a mismatch is a corrupt pair (UNKNOWN). */
+      const packHeader = (packPath: string, count: number) => withFile(packPath, async f => {
+        if (f.size < 32) unknown("pack header mismatch");
+        const header = Buffer.alloc(12);
+        await f.readInto(header, 0, 0, 12);
+        if (header.toString("ascii", 0, 4) !== "PACK" || ![2, 3].includes(header.readUInt32BE(4)) ||
+            header.readUInt32BE(8) !== count) unknown("pack header mismatch");
+      });
+      const packIndex = (idxPath: string, packPath: string, store: Store) => withFile(idxPath, async f => {
+        const size = f.size;
+        const headLength = Math.min(size, 8 + 1024);
+        const head = Buffer.alloc(headLength);
+        await f.readInto(head, 0, 0, headLength);
+        const v2 = size >= 8 && head.readUInt32BE(0) === 0xff744f63;
+        if (v2 && head.readUInt32BE(4) !== 2) unknown("unsupported pack index version");
+        const base = v2 ? 8 : 0;
+        if (size < base + 1024 + 40) unknown("short pack index");
+        let previous = 0;
+        for (let i = 0; i < 256; i++) {
+          const count = head.readUInt32BE(base + 4 * i);
+          if (count < previous) unknown("pack fanout limit or order");
+          previous = count;
+        }
+        const count = previous, table = base + 1024;
+        // The declared count is compared with the limit only once the file size accounts for it exactly.
+        const floor = table + (v2 ? 28 : 24) * count + 40;
+        if (size < floor) unknown(v2 ? "short v2 index tables" : "pack index size");
+        if (v2 ? size > floor + 8 * count : size !== floor) unknown("pack index size");
+        if (count > limits.maxMetadataRecords) {
+          if (v2) {
+            let large = 0;
+            const piece = Buffer.alloc(Math.min(OBSERVE_INPUT_PIECE, 4 * count));
+            for (let at = 0; at < 4 * count; at += piece.length) {
+              const n = Math.min(piece.length, 4 * count - at);
+              await f.readInto(piece, 0, table + 24 * count + at, n);
+              for (let k = 0; k < n; k += 4) if (piece.readUInt32BE(k) >= 0x80000000) large++;
+            }
+            if (size !== floor + 8 * large) unknown("pack index size");
+          }
+          // Only a pair whose pack agrees with the idx count is an overflow; a pack that does not is corrupt.
+          await packHeader(packPath, count);
+          exceeded("pack index object count limit");
+        }
+        // Here the idx is at most about 36 bytes per object of a count within the limit: read it whole.
+        const idx = Buffer.alloc(size);
+        head.copy(idx);
+        await f.readInto(idx, headLength, headLength, size - headLength);
+        let large = 0;
+        if (v2) {
+          const slots = new Set<number>();
+          for (let i = 0; i < count; i++) {
+            const off = idx.readUInt32BE(table + 24 * count + 4 * i);
+            if (off >= 0x80000000) { large++; slots.add(off - 0x80000000); }
+          }
+          if (slots.size !== large || [...slots].some(slot => slot >= large)) unknown("invalid large offset table");
+        }
+        if (idx.length !== table + (v2 ? 28 : 24) * count + 8 * large + 40) unknown("pack index size");
+        let last = "";
+        const fanout = Array<number>(256).fill(0);
+        const offsets = new Map<string, number>();
+        for (let i = 0; i < count; i++) {
+          const offset = table + (v2 ? 20 * i : 24 * i + 4);
+          const oid = idx.subarray(offset, offset + 20).toString("hex");
+          if (oid <= last) unknown("pack OID table order");
+          last = oid; fanout[idx[offset]!]!++; add(store.ids, oid);
+          const rawOffset = idx.readUInt32BE(v2 ? table + 24 * count + 4 * i : table + 24 * i);
+          const physical = v2 && rawOffset >= 0x80000000
+            ? idx.readBigUInt64BE(table + 28 * count + 8 * (rawOffset - 0x80000000))
+            : BigInt(rawOffset);
+          if (physical > BigInt(Number.MAX_SAFE_INTEGER)) unknown("pack offset overflow");
+          offsets.set(oid, Number(physical));
+        }
+        let total = 0;
+        for (let i = 0; i < 256; i++) if ((total += fanout[i]!) !== idx.readUInt32BE(base + 4 * i)) unknown("pack fanout mismatch");
+        return { count, offsets };
+      });
+      // Each span and instruction is bounded by the shared observation budget, charged as it is produced. A failure
+      // aborts before any pair verifier. That before-verifier guarantee relies on the epoch writer-exclusion
+      // contract: the pack and idx are not re-checked between this snapshot and each verify-pack launch, and
+      // finalStoreCheck refuses a change afterwards.
+      const packRecords = (packPath: string, count: number, offsets: Map<string, number>) => withFile(packPath, async f => {
+        const size = f.size;
+        if (size < 32) unknown("pack header mismatch");
+        const win = new ObservedWindow(size, f.fill);
+        await win.ensure(0, 12);
+        const header = win.view(0, 12);
+        if (header.toString("ascii", 0, 4) !== "PACK" || ![2, 3].includes(header.readUInt32BE(4)) ||
+            header.readUInt32BE(8) !== count) unknown("pack header mismatch");
+        charge(12);
+        const starts = [...offsets.values()].sort((a, b) => a - b);
+        if (new Set(starts).size !== count || (count ? starts[0] !== 12 : size !== 32) ||
+            starts.some(start => start < 12 || start >= size - 20)) unknown("invalid pack offsets");
+        const records = new Map<number, PackRecord>();
+        for (let i = 0; i < starts.length; i++) {
+          tick();
+          const start = starts[i]!, end = starts[i + 1] ?? size - 20;
+          const avail = Math.min(64, end - start);
+          await win.ensure(start, avail);
+          const bytesOfHeader = win.view(start, avail);
+          let pos = start;
+          const byte = () => { if (pos >= start + avail) unknown("truncated pack record"); return bytesOfHeader[pos++ - start]!; };
+          let b = byte(), declared = b & 15, scale = 16;
+          const type = (b >> 4) & 7;
+          while (b & 128) {
+            if (!Number.isSafeInteger(scale)) unknown("pack entry size integer overflow");
+            b = byte(); declared += (b & 127) * scale;
+            if (!Number.isSafeInteger(declared)) unknown("pack entry size integer overflow");
+            scale *= 128;
+          }
+          if (![1, 2, 3, 4, 6, 7].includes(type)) unknown("unsupported pack record type");
+          let baseOffset: number | undefined;
+          if (type === 6) {
+            b = byte(); let distance = b & 127;
+            while (b & 128) {
+              b = byte(); distance = (distance + 1) * 128 + (b & 127);
+              if (!Number.isSafeInteger(distance) || distance > start) unknown("OFS offset overflow");
+            }
+            baseOffset = start - distance;
+            if (!distance || !records.has(baseOffset)) unknown("OFS base is not an earlier record");
+          } else if (type === 7) {
+            if (end - pos < 20 || pos + 20 > start + avail) unknown("truncated REF base");
+            baseOffset = offsets.get(bytesOfHeader.subarray(pos - start, pos - start + 20).toString("hex")); pos += 20;
+            if (baseOffset === undefined) unknown("missing same-pack REF base");
+          }
+          charge(pos - start);
+          // The declared size is never compared with the budget: only the bytes actually produced are, and a
+          // stream that disagrees with its declared size is corrupt (UNKNOWN), however large either is.
+          const record: PackRecord = { logical: declared, base: baseOffset, state: 0 };
+          let produced = 0, unverifiedBase = false;
+          const parser: PackDeltaParser | undefined = type === 6 || type === 7 ? new PackDeltaParser({
+            unknown,
+            // Generated content is checked against the declared base length. For a base that is not yet verified (a
+            // REF base later in the pack), an overflow cannot be told from the effect of a lying base length: UNKNOWN.
+            charge: n => {
+              if (bytes + n > limits.maxObjectStoreBytes) {
+                if (unverifiedBase) unknown("delta base length not yet verified");
+                exceeded("delta generated byte limit");
+              }
+              contentCharge(n);
+            },
+            onHeader: () => {
+              record.baseLength = parser!.baseLength; record.logical = parser!.logical;
+              const baseRecord = baseOffset === undefined ? undefined : records.get(baseOffset);
+              if (baseRecord) { if (record.baseLength !== baseRecord.logical) unknown("delta base length mismatch"); }
+              else unverifiedBase = true;
+            },
+          }) : undefined;
+          const sink = (out: Buffer) => {
+            tick();
+            produced += out.length;
+            if (produced > declared) unknown("pack compressed span or size");
+            if (bytes + out.length > limits.maxObjectStoreBytes) exceeded("pack inflated byte limit");
+            contentCharge(out.length);
+            parser?.feed(out);
+          };
+          const consumed = await inflateSpan(win, pos, end - pos, sink);
+          if (consumed !== end - pos || produced !== declared) unknown("pack compressed span or size");
+          parser?.finish();
+          records.set(start, record);
+        }
+        // The functional graph visits each record at most twice. IDX lookup
+        // is unverified here, so reject cycles before Git collision reads.
+        for (const start of starts) {
+          const stack: PackRecord[] = [];
+          let current = records.get(start);
+          while (current && current.state !== 2) {
+            tick();
+            if (current.state === 1) unknown("cyclic pack delta graph");
+            current.state = 1; stack.push(current);
+            if (current.base === undefined) break;
+            const target = records.get(current.base);
+            if (!target || current.baseLength !== target.logical) unknown("delta base length mismatch");
+            current = target;
+          }
+          for (const record of stack) record.state = 2;
+        }
+      });
+      const content = async (root: string) => {
+        const store = stores.get(root)!;
+        for (const name of store.names) {
+          const p = path.join(root, name);
+          if (/^[0-9a-f]{2}$/.test(name)) {
+            for (const leaf of store.loose.get(name) ?? []) await looseObject(path.join(p, leaf), name + leaf, store);
+          } else if (name === "pack") {
+            for (const member of store.pack ?? []) {
+              const match = /^(pack-[0-9a-f]{40})\.idx$/.exec(member);
+              if (!match) continue;
+              const full = path.join(p, member);
+              const packPath = path.join(p, match[1] + ".pack");
+              const { count, offsets } = await packIndex(full, packPath, store);
+              await packRecords(packPath, count, offsets);
+              pairs.add(full);
+            }
+          }
+        }
+      };
+      await topology(source); await topology(bare);
+      for (const root of stores.keys()) await topologyLoose(root);
+      // The classification pass has no result of its own: its only product is the UNKNOWN it raises.
+      if (topologyOnly) return undefined as never;
+      await afterTopology?.();
+      topologyStage = false;
+      for (const root of stores.keys()) await content(root);
+      const expected = (root: string) => {
+        const seen = new Set<string>(), ids = new Set<string>();
+        const walk = (p: string) => {
+          if (seen.has(p)) return;
+          seen.add(p);
+          for (const id of stores.get(p)!.ids) ids.add(id);
+          for (const alt of stores.get(p)!.alternates) walk(alt);
+        };
+        walk(root); return ids;
+      };
+      return { fingerprint: JSON.stringify([...rows].sort(([a], [b]) => a.localeCompare(b))),
+        source: expected(source), own: new Set(stores.get(source)!.ids), bare: expected(bare),
+        // The bare's OWN store alone (no alternate): where a mirror ref's closure must live.
+        bareOwn: new Set(stores.get(bare)!.ids), pairs };
+    };
+    try {
+      // Part of the topology, so it runs before any content is charged. Any overflow of these listings is UNKNOWN
+      // (lead decision, see the topology config listing above): the indirection a listing may hold cannot be observed
+      // past the limit.
+      const configChecks = async () => {
+        for (const runner of [true, false]) {
+          try {
+            const args = ["config", "--local", "--no-includes", "--null", "--list"];
+            const config = await read(() => runner ? this.runGitAsRunner(cwd, args,
+              { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } })
+              : this.runGitWithEnv(barePath, args, NO_REPLACE_ENV));
+            for (const row of config.split("\0")) {
+              const [key, value] = row.split("\n");
+              // refstorage (reftable) and partialclone (promisor objects fetched lazily) change where refs
+              // and objects live, which the physical-store observation below cannot account for.
+              if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
+                  key === "extensions.refstorage" || key === "extensions.partialclone" ||
+                  key !== undefined && PROMISOR_KEY_RE.test(key) || key?.startsWith("include.") || key?.startsWith("includeif.")) unknown("object format or config indirection unsupported");
+            }
+            // The count check runs after the classification loop only so that an UNKNOWN-class key is named as such;
+            // an overflow is UNKNOWN too, so the order changes the message, not the outcome.
+            this.automaticCollection(config, "\0");
+          } catch (error) {
+            if (isBoundOverflow(error)) unknown("object config listing exceeds the observation limit");
+            throw error;
+          }
+        }
+      };
+      if (classifyOnly) { await snapshot(undefined, true); return async () => false; }
+      const initial = await snapshot(configChecks);
+      for (const idx of initial.pairs) {
+        native.allowedIndices!.add(idx);
+        try { await read(() => this.runGitWithEnv(barePath, ["verify-pack", "--", idx], NO_REPLACE_ENV)); }
+        finally { native.allowedIndices!.delete(idx); }
+      }
+      // A re-read repeats an observation whose first instance fit every limit. A limit overflow now means the
+      // store is no longer what was observed: UNKNOWN, never a settled keep.
+      const reread = async <T>(action: () => Promise<T>): Promise<T> => {
+        try { return await action(); }
+        catch (error) {
+          if (isBoundOverflow(error)) throw new AutomaticCompletenessUnknown("object observations changed", { cause: error });
+          throw error;
+        }
+      };
+      automatic.finalStoreCheck = () => reread(async () => {
+        if ((await snapshot()).fingerprint !== initial.fingerprint) unknown("object topology changed");
+      });
+      return async (head: string) => {
+        try {
+          const parse = (out: string) => {
+            this.automaticCollection(out, "\n");
+            if (out && !out.endsWith("\n")) unknown("unterminated object inventory");
+            const ids = new Set<string>();
+            for (const id of out ? out.slice(0, -1).split("\n") : []) {
+              if (!SHA40_RE.test(id) || ids.has(id)) unknown("invalid object inventory");
+              ids.add(id);
+            }
+            return ids;
+          };
+          const inventory = async (runner: boolean) => parse(await read(() => runner
+            ? this.runGitAsRunner(cwd, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+              { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } })
+            : this.runGitWithEnv(barePath, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"], NO_REPLACE_ENV)));
+          // Any stderr (a broken or ignored ref, say) means Git skipped something: unknown, never clean.
+          // `%(symref)` is empty for an ordinary ref; it lets `refs/remotes/origin/HEAD` be handled explicitly.
+          const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname) %(symref)"],
+            { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+              onStderr: text => { if (text !== "") unknown("for-each-ref reported a problem"); } }));
+          const closure = async () => parse(await read(() => this.runGitWithEnv(barePath,
+            ["rev-list", "--objects", "--no-object-names", ...automatic.roots], NO_REPLACE_ENV)));
+          const sourceIds = await inventory(true), bareIds = await inventory(false);
+          if (!same(sourceIds, initial.source) || !same(bareIds, initial.bare)) unknown("physical and native inventory disagree");
+          const out = await refs();
+          this.automaticCollection(out, "\n");
+          if (out && !out.endsWith("\n")) unknown("unterminated refs");
+          const cloneRefs: { id: string; name: string; symref: string }[] = [];
+          let stash = false;
+          for (const line of out ? out.slice(0, -1).split("\n") : []) {
+            const match = /^([0-9a-f]{40}) (refs\/[^\s]+) ([^\s]*)$/.exec(line);
+            if (!match) unknown("invalid refs");
+            stash ||= match![2] === "refs/stash";
+            cloneRefs.push({ id: match![1]!, name: match![2]!, symref: match![3]! });
+          }
+          const held = await closure();
+          // Mirror refs (owner answer seq 1162, 2026-11-06 (R9)): a clone ref the trusted roots do not already hold
+          // may still be satisfied by an exact bare ref, see mirrorRefs below.
+          const unheld = cloneRefs.filter(ref => !held.has(ref.id));
+          const mirrors = await this.automaticMirrorRefs(barePath, unheld, initial.bareOwn, parse, read, unknown);
+          // Required: the clone's own objects, HEAD, every ref value and every id its reflogs,
+          // ORIG_HEAD and FETCH_HEAD name (read in the shape stage). Each must be reachable from the
+          // trusted roots. An object that has left the clone's own store (repack -a -d -l, gc) can
+          // sit in a bare pack no ref reaches; a clone pointer naming it is then the last pointer
+          // to it, so merely existing in the bare or its alternates is not enough. The one exception
+          // is a mirror ref that `automaticMirrorRefs` proved.
+          const required = new Set(initial.own); required.add(head);
+          for (const id of automatic.shape?.namedIds ?? []) required.add(id);
+          for (const ref of cloneRefs) if (!mirrors.satisfied.has(ref.name)) required.add(ref.id);
+          if (await reread(async () => !same(sourceIds, await inventory(true)) || !same(bareIds, await inventory(false)) ||
+              !same(held, await closure()) || out !== await refs() ||
+              mirrors.proof !== (await this.automaticMirrorRefs(barePath, unheld, initial.bareOwn, parse, read, unknown)).proof))
+            unknown("object observations changed");
+          await automatic.finalStoreCheck!();
+          return !stash && [...required].every(id => held.has(id));
+        } catch (error) {
+          if (error instanceof AutomaticCompletenessUnknown || error instanceof AutomaticBoundExceeded) throw error;
+          // A Git child that overran the epoch output cap is a limit, not an unreadable store.
+          if (isBoundOverflow(error)) throw new AutomaticBoundExceeded("object coverage output limit", { cause: error });
+          throw new AutomaticCompletenessUnknown("object coverage unavailable", { cause: error });
+        }
+      };
+    } catch (error) {
+      if (error instanceof AutomaticCompletenessUnknown || error instanceof AutomaticContentRefusal ||
+          error instanceof AutomaticBoundExceeded) throw error;
+      if (isBoundOverflow(error)) throw new AutomaticBoundExceeded("object completeness output limit", { cause: error });
+      throw new AutomaticCompletenessUnknown("object completeness unavailable", { cause: error });
+    }
+  }
+
+  /**
+   * Which clone refs the bare provably still preserves by an exact mirror (owner answer seq 1162, 2026-11-06 (R9))?
+   * Only two namespaces qualify, each by one explicit clone-to-bare mapping with full object-id equality:
+   * `refs/remotes/origin/<name>` with the bare's `refs/heads/<name>`, and `refs/tags/<tag>` with the bare's
+   * `refs/tags/<tag>` (an annotated tag compares the TAG object id, never the peeled commit). On top of
+   * equality, the whole closure of the target (`rev-list --objects` in the bare) must lie in the bare's OWN
+   * object store, not the clone's and not another alternate's, so the bare alone keeps the objects. A ref
+   * that fails any of this is simply not satisfied here and stays required as before. `refs/remotes/origin/HEAD`
+   * is a symref that only repeats its target: it is satisfied exactly when its symref names another
+   * `refs/remotes/origin/<name>` that is itself satisfied; a differently shaped or dangling one stays required.
+   * Every other namespace, the clone's own branches, HEAD, stash, reflog and pseudo-ref ids are not handled
+   * here at all. The bare refs are read bounded and `proof` is the exact text the caller re-reads at its final
+   * re-check, so a concurrent change of either side is `unknown`, not a proof.
+   */
+  private async automaticMirrorRefs(barePath: string, unheld: { id: string; name: string; symref: string }[],
+    bareOwn: ReadonlySet<string>, parse: (out: string) => Set<string>, read: <T>(action: () => Promise<T>) => Promise<T>,
+    unknown: (message: string) => never): Promise<{ satisfied: Set<string>; proof: string }> {
+    const satisfied = new Set<string>();
+    const bareName = (name: string): string | undefined => {
+      if (name.startsWith("refs/tags/")) return name;
+      const origin = /^refs\/remotes\/origin\/(.+)$/.exec(name)?.[1];
+      return origin !== undefined && origin !== "HEAD" ? `refs/heads/${origin}` : undefined;
+    };
+    if (!unheld.some(ref => bareName(ref.name) !== undefined)) return { satisfied, proof: "" };
+    const bareOut = await read(() => this.runGitWithEnv(barePath,
+      ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/"], NO_REPLACE_ENV));
+    this.automaticCollection(bareOut, "\n");
+    if (bareOut && !bareOut.endsWith("\n")) unknown("unterminated bare refs");
+    const bareRefs = new Map<string, string>();
+    for (const line of bareOut ? bareOut.slice(0, -1).split("\n") : []) {
+      const match = /^([0-9a-f]{40}) (refs\/(?:heads|tags)\/[^\s]+)$/.exec(line);
+      if (!match) unknown("invalid bare refs");
+      bareRefs.set(match![2]!, match![1]!);
+    }
+    const equal = unheld.filter(ref => {
+      const target = bareName(ref.name);
+      return target !== undefined && bareRefs.get(target) === ref.id;
+    });
+    // The closure of every equal target must be in the bare's own store. One launch per chunk of tips; a
+    // failing chunk is split per tip, at most MIRROR_SPLIT_LAUNCHES launches in all, and a tip beyond that
+    // stays required (the safe direction). A failed or unreadable Git read throws and is never a proof.
+    const inOwnStore = async (tips: string[]) =>
+      [...parse(await read(() => this.runGitWithEnv(barePath,
+        ["rev-list", "--objects", "--no-object-names", ...tips], NO_REPLACE_ENV)))].every(id => bareOwn.has(id));
+    const proved = new Set<string>();
+    const tips = [...new Set(equal.map(ref => ref.id))];
+    let splits = 0;
+    for (let i = 0; i < tips.length; i += MIRROR_TIP_CHUNK) {
+      const chunk = tips.slice(i, i + MIRROR_TIP_CHUNK);
+      if (await inOwnStore(chunk)) { for (const tip of chunk) proved.add(tip); continue; }
+      for (const tip of chunk) {
+        if (++splits > MIRROR_SPLIT_LAUNCHES) break;
+        if (await inOwnStore([tip])) proved.add(tip);
+      }
+    }
+    for (const ref of equal) if (proved.has(ref.id)) satisfied.add(ref.name);
+    for (const ref of unheld) {
+      const target = ref.name === "refs/remotes/origin/HEAD" ? /^refs\/remotes\/origin\/(.+)$/.exec(ref.symref)?.[1] : undefined;
+      if (target !== undefined && target !== "HEAD" && satisfied.has(ref.symref)) satisfied.add(ref.name);
+    }
+    return { satisfied, proof: JSON.stringify([bareOut, [...satisfied].sort()]) };
+  }
+
   /**
    * Is every local ref of the clone, in every namespace (heads, tags, notes, `refs/remotes/` and
    * any other), already held by the worker bare, and is there no stash? A ref value is acceptable
@@ -10686,6 +12519,9 @@ export class GitCache {
    * means "not covered". The `refs/stash` refusal is a belt: stash commits are never reachable
    * from the bare. Any failed read is `false`.
    *
+   * Any stderr from the `for-each-ref` read (e.g. `ignoring broken ref` for an unreadable loose ref,
+   * which Git reports with exit 0 and omits) is not provable and returns `false`.
+   *
    * The transient {@link RECOVERY_BUNDLE_REF} is excluded from `--all`: an aborted bundle pass may
    * leave it behind, and it only retains objects, never proves a side ref held.
    *
@@ -10698,16 +12534,38 @@ export class GitCache {
    * bare ref (the forge or other flows keep their own copy), whereas the head anchor in
    * {@link verifyStoppedSourceCovered} must be owned by this run and generation, be an owed pin, or be an ancestor of the bare's default-branch ref.
    */
-  private async localRefsReachableFrom(barePath: string, cwd: string, head: string): Promise<boolean> {
+  private async localRefsReachableFrom(barePath: string, cwd: string, head: string, automatic?: AutomaticPreservation): Promise<boolean> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    let refsStderr = "";
+    let refsStderrOversized = false;
     try {
       // Per-worktree HEADs and refs of a linked worktree are invisible to for-each-ref and status,
       // so any `.git/worktrees/` entry (or an unreadable directory) makes coverage unprovable.
-      const wt = await fs.readdir(path.join(cwd, ".git", "worktrees")).then((n) => n, (err: NodeJS.ErrnoException) => {
+      if (automatic && !(await this.automaticDirectoryEmpty(path.join(cwd, ".git", "worktrees"), automatic, true))) return false;
+      const wt = automatic ? [] : await fs.readdir(path.join(cwd, ".git", "worktrees")).then((n) => n, (err: NodeJS.ErrnoException) => {
         if (err.code === "ENOENT") return [] as string[];
         throw err;
       });
       if (wt.length > 0) return false;
-      const out = await this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
+      if (automatic && automatic.roots.length === 0) return false;
+      if (automatic?.roots.length) {
+        return await this.automaticObjectCoverage(barePath, cwd, head, automatic);
+      }
+      const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], {
+        env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+        onStderr: (text) => {
+          if (refsStderrOversized || text === "") return;
+          if (refsStderr.length + text.length > 4096) { refsStderr = ""; refsStderrOversized = true; }
+          else refsStderr += text;
+        },
+      }));
+      const out = await refs();
+      if (refsStderr !== "" || refsStderrOversized) {
+        this.log.warn("stopped source local refs read reported a problem on stderr; not provable", { cwd,
+          stderr: refsStderrOversized ? "[diagnostic omitted: oversized]" : boundedGitDiagnostic(this.log, refsStderr) });
+        return false;
+      }
+      if (automatic) this.automaticCollection(out, "\n");
       const shas = new Set<string>();
       for (const line of out.split("\n")) {
         if (line === "") continue;
@@ -10717,16 +12575,25 @@ export class GitCache {
         if (ref === "refs/stash") return false;
         shas.add(sha);
       }
-      if (shas.size > MAX_LOCAL_REF_SHAS) return false;
+      if (automatic) shas.add(head);
+      if (shas.size > Math.min(MAX_LOCAL_REF_SHAS, automatic ? this.epochRetained.getStore()!.maxMetadataRecords : Infinity)) return false;
       const all = [...shas];
       for (let i = 0; i < all.length; i += LOCAL_REF_REVLIST_CHUNK) {
         const chunk = all.slice(i, i + LOCAL_REF_REVLIST_CHUNK);
-        const extra = await this.runGitWithEnv(barePath, ["rev-list", "--objects", "-n", "1", ...chunk, "--not", head, `--exclude=${RECOVERY_BUNDLE_REF}`, "--all"], NO_REPLACE_ENV);
+        const roots = automatic ? [...automatic.roots] : [head, `--exclude=${RECOVERY_BUNDLE_REF}`, "--all"];
+        if (automatic && roots.length === 0) return false;
+        const extra = await read(() => this.runGitWithEnv(barePath, ["rev-list", "--objects", "-n", "1", ...chunk, "--not", ...roots], NO_REPLACE_ENV));
         if (extra.trim() !== "") return false;
       }
+      if (automatic && await refs() !== out) return false;
       return true;
     } catch (err) {
-      this.log.debug("stopped source local refs could not be proven held", { cwd, error: gitErrorMessage(err) });
+      if (err instanceof AutomaticCompletenessUnknown) throw err;
+      if (automatic) this.log.debug("stopped source local refs could not be proven held", { cwd, error: gitErrorMessage(err) });
+      else this.log.warn("stopped source local refs could not be proven held", { cwd,
+        ...(refsStderr !== "" || refsStderrOversized ?
+          { stderr: refsStderrOversized ? "[diagnostic omitted: oversized]" : boundedGitDiagnostic(this.log, refsStderr) } :
+          { error: boundedGitDiagnostic(this.log, gitErrorMessage(err)) }) });
       return false;
     }
   }
@@ -10745,55 +12612,60 @@ export class GitCache {
    * the ignore rules of the tree's `.gitignore` files and of `.git/info/exclude`, which define the
    * scope the WIP capture's `git add -A` honours too, so an ignored file is outside both. Any
    * such flag, any status entry, or any failed read is `false`. Submodules: `status` runs with
-   * `--ignore-submodules=none`, and a `.git/modules` store or a populated (non-empty or non-directory)
+   * `--ignore-submodules=none`. A `.git/modules` store or a populated (non-empty or non-directory)
    * gitlink path is `false`, since the parent proof cannot cover a submodule's own files, commits and refs.
+   *
+   * Any stderr from the `status` read is not provable: Git exits 0 with empty stdout and a warning for
+   * an unreadable directory, so the omission would otherwise read as clean. Benign warnings (a
+   * deprecated config key, CRLF warnings included) therefore retain conservatively. Status uses
+   * capture's HOME and attribute inputs; an unreadable HOME attributes file also retains.
+   *
+   * This is the LEGACY proof. With `automatic` it delegates to {@link worktreeProvenCleanAutomatic},
+   * which does not run `status` over anything it has not first bounded and typed itself; the
+   * code below never sees `automatic`.
    */
-  private async worktreeCleanHardened(cwd: string): Promise<boolean> {
+  private async worktreeCleanHardened(cwd: string, automatic?: AutomaticPreservation): Promise<boolean> {
+    if (automatic) return this.worktreeProvenCleanAutomatic(cwd, automatic);
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(undefined, action);
     const hardened = [
       "-c", "core.excludesFile=/dev/null", "-c", `core.worktree=${cwd}`, "-c", "core.trustctime=true",
       "-c", "core.checkStat=default", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
       "-c", "status.showUntrackedFiles=all", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false",
     ];
+    let statusStderr = "";
+    let statusStderrOversized = false;
     try {
-      const attributes = await fs.lstat(path.join(cwd, ".git", "info", "attributes")).then(() => true, (err: NodeJS.ErrnoException) => {
+      const attributes = await read(() => fs.lstat(path.join(cwd, ".git", "info", "attributes"))).then(() => true, (err: NodeJS.ErrnoException) => {
         if (err.code === "ENOENT") return false;
         throw err;
       });
       if (attributes) return false;
       // Scope-less read (global/system are pinned to /dev/null): it follows include/includeIf and
       // config.worktree exactly as `status` does, which `--local` would not.
-      const config = await this.runGitAsRunner(cwd, ["config", "--null", "--list"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
+      const config = await read(() => this.runGitAsRunner(cwd, ["config", "--null", "--list"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
       const entries = config.split("\0");
       if (entries.some((e) => /^(filter\.|include\.|includeif\.|extensions\.worktreeconfig|core\.attributesfile)/i.test(e))) return false;
       // A case-folding clone could hide a tracked `readme` behind an untracked `README`. The
       // `core.ignoreCase=false` override above makes status case-sensitive; this refusal is the
       // second, independent defense: a clone that claims case-folding in any form git reads as true
       // (true/yes/on, any non-zero integer with an optional k/m/g suffix, or a bare key) is not provable.
-      for (const e of entries) {
-        const nl = e.indexOf("\n");
-        const key = (nl === -1 ? e : e.slice(0, nl)).toLowerCase();
-        if (key !== "core.ignorecase") continue;
-        if (nl === -1) return false; // a bare key is boolean true
-        const v = e.slice(nl + 1).trim().toLowerCase();
-        if (v === "true" || v === "yes" || v === "on") return false;
-        if (/^[+-]?(0x[0-9a-f]+|[0-9]+)[kmg]?$/.test(v) && !/^[+-]?(0x)?0+[kmg]?$/.test(v)) return false;
-      }
+      if (entries.some(configClaimsCaseFolding)) return false;
       // Submodules: `.gitmodules` / config `ignore = all` would hide a dirty or newer submodule from
-      // `status`, so it runs with `--ignore-submodules=none`. The parent proof still says nothing about
+      // `status`. The parent proof says nothing about
       // a populated submodule's own files, commits or refs, so any trace of one is not provable: a
       // `.git/modules` store, or an index gitlink (mode 160000) whose worktree path holds anything but
       // nothing or an empty real directory (an uninitialized submodule).
-      const modules = await fs.lstat(path.join(cwd, ".git", "modules")).then(() => true, (err: NodeJS.ErrnoException) => {
+      const modules = await read(() => fs.lstat(path.join(cwd, ".git", "modules"))).then(() => true, (err: NodeJS.ErrnoException) => {
         if (err.code === "ENOENT") return false;
         throw err;
       });
       if (modules) return false;
-      const staged = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
+      const staged = await read(() => this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
       for (const entry of staged.split("\0")) {
         const m = /^160000 [0-9a-f]+ [0-3]\t([\s\S]+)$/.exec(entry);
         if (!m) continue;
         const gitlink = path.join(cwd, m[1]!);
-        const st = await fs.lstat(gitlink).catch((err: NodeJS.ErrnoException) => {
+        const st = await read(() => fs.lstat(gitlink)).catch((err: NodeJS.ErrnoException) => {
           if (err.code === "ENOENT") return undefined;
           throw err;
         });
@@ -10801,9 +12673,21 @@ export class GitCache {
         if (!st.isDirectory() || st.isSymbolicLink()) return false;
         if ((await fs.readdir(gitlink)).length > 0) return false;
       }
-      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], { env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
+      const status = await read(() => this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], {
+        env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+        onStderr: (text) => {
+          if (statusStderrOversized || text === "") return;
+          if (statusStderr.length + text.length > 4096) { statusStderr = ""; statusStderrOversized = true; }
+          else statusStderr += text;
+        },
+      }));
+      if (statusStderr !== "" || statusStderrOversized) {
+        this.log.warn("stopped source status reported a problem on stderr; not provable", { cwd,
+          stderr: statusStderrOversized ? "[diagnostic omitted: oversized]" : boundedGitDiagnostic(this.log, statusStderr) });
+        return false;
+      }
       if (status.split("\n").some((l) => l.length > 0)) return false;
-      const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
+      const flags = await read(() => this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
       for (const entry of flags.split("\0")) {
         if (entry.length === 0) continue;
         // `H` is a normal entry; a lowercase tag is assume-unchanged and `S`/`s` is skip-worktree.
@@ -10811,7 +12695,719 @@ export class GitCache {
       }
       return true;
     } catch (err) {
-      this.log.debug("stopped source status could not be proven clean", { cwd, error: gitErrorMessage(err) });
+      if (err instanceof AutomaticCompletenessUnknown) throw err;
+      this.log.warn("stopped source status could not be proven clean", { cwd,
+        ...(statusStderr !== "" || statusStderrOversized ?
+          { stderr: statusStderrOversized ? "[diagnostic omitted: oversized]" : boundedGitDiagnostic(this.log, statusStderr) } :
+          { error: boundedGitDiagnostic(this.log, gitErrorMessage(err)) }) });
+      return false;
+    }
+  }
+
+  /** Counters, charge helpers and typed-read helpers shared by the two stages of the automatic worktree proof. */
+  private automaticProofContext(automatic: AutomaticPreservation) {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    const limits = this.epochRetained.getStore();
+    if (!limits || !this.epochNative.getStore()) throw new Error("automatic worktree proof outside the epoch native scope");
+    const refusal = (why: string) => new AutomaticContentRefusal(why);
+    const unknown = (why: string) => new AutomaticCompletenessUnknown(why);
+    const exceeded = (why: string) => new AutomaticBoundExceeded(why);
+    const counters = { metadataBytes: 0, worktreeContentBytes: 0,
+      pathRecords: { index: 0, directory: 0, untracked: 0 } };
+    const chargeMetadata = (n: number, what: string) => {
+      if ((counters.metadataBytes += n) > limits.maxMetadataBytes) throw exceeded(`${what}: metadata byte limit`);
+    };
+    const chargeContent = (n: number, what: string) => {
+      if ((counters.worktreeContentBytes += n) > limits.maxWorktreeContentBytes) throw exceeded(`${what}: tracked content byte limit`);
+    };
+    const chargeRecords = (kind: keyof typeof counters.pathRecords, n: number, what: string) => {
+      if ((counters.pathRecords[kind] += n) > limits.maxMetadataRecords) throw exceeded(`${what}: path record limit`);
+    };
+    // Every path whose lstat signature is re-checked at the end, keyed by a unique label.
+    const fixed = new Map<string, { target: string | Buffer; signature: string }>();
+    const remember = (key: string, target: string | Buffer, st: import("node:fs").BigIntStats) =>
+      fixed.set(key, { target, signature: statSignature(st) });
+    const lstatPath = (p: string | Buffer) => read(() => fs.lstat(p, { bigint: true }));
+    // Entry names stay raw bytes (`encoding: "buffer"`); every entry is charged before it is visited.
+    const listDirectory = async (dir: string | Buffer, visit?: (name: Buffer) => void, charged = true): Promise<void> => {
+      await withClosingHandle(read, () => fs.opendir(dir, { encoding: "buffer" as BufferEncoding }), async handle => {
+        for (;;) {
+          const entry = await read(() => handle.read());
+          if (entry === null) break;
+          if (charged) chargeRecords("directory", 1, "directory entry");
+          visit?.(entry.name as unknown as Buffer);
+        }
+      });
+    };
+    return { read, limits, refusal, unknown, exceeded, counters, chargeMetadata, chargeContent, chargeRecords, fixed, remember,
+      lstatPath, listDirectory };
+  }
+
+  /**
+   * Stage one of the automatic worktree proof: everything that needs no Git. First its indirection inputs
+   * (`.git/objects`, `objects/info` and `.git/config`, classified before anything is charged: see the rule above
+   * {@link automaticContentPreserved}), then the shape of `.git` (allowlist, typed and charged), exclude rules, HEAD
+   * and the loose ref, and the bounded index parse. It runs BEFORE any Git launch of the automatic content
+   * proof ({@link automaticContentPreserved}), so a hostile FIFO or oversized file is refused by
+   * type or size before Git can open, hang on or read it. The result is kept in `automatic.shape`
+   * for {@link worktreeProvenCleanAutomatic}, which keeps the final re-check. False is a settled keep.
+   */
+  private async automaticCloneShape(cwd: string, automatic: AutomaticPreservation,
+    afterIndirection?: () => Promise<void>): Promise<boolean> {
+    try {
+      const ctx = this.automaticProofContext(automatic);
+      const { read, limits, refusal, exceeded, counters, chargeMetadata, chargeRecords, fixed, remember, lstatPath,
+        listDirectory } = ctx;
+      // 0. Shape of `.git`.
+      const gitDir = path.join(cwd, ".git");
+      if (!(await lstatPath(gitDir)).isDirectory()) throw refusal(".git is not a real directory");
+      const regular = async (file: string, required: boolean, what: string) => {
+        let st: import("node:fs").BigIntStats;
+        try { st = await lstatPath(file); }
+        catch (error) { if (!required && (error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+        if (!st.isFile()) throw refusal(`${what} is not a regular file`);
+        chargeMetadata(Number(st.size), what);
+        remember("f:" + file, file, st);
+      };
+      // INDIRECTION INPUTS FIRST (the rule recorded above automaticContentPreserved; owner answer seq 1162, 2026-11-06
+      // (R9)). This stage reads and classifies, in this order and before any bulk input charges the shared counters:
+      // `.git/objects` and `objects/info` (the names, their types, the alternates lines), then `.git/config` (every
+      // UNKNOWN-class key). An overflow of anything read here is UNKNOWN: the part past the limit was never read and
+      // may hold the indirection. Only afterwards do the bulk inputs (the sizes of `packs`/`commit-graph`, the `.git`
+      // listing, refs, reflogs, packed-refs, exclude, HEAD, the index) charge, and only those may end in a keep.
+      // `objects/info` is read by Git at startup too. `alternates` (which `clone --shared` writes) is read and judged
+      // whole; `packs` and a `commit-graph` file are typed, their sizes charged later; a `commit-graphs` directory is
+      // typed only (every launch pins `core.commitGraph=false`, so Git never opens either). Any other entry,
+      // `http-alternates` included, is UNKNOWN.
+      const objectsDir = path.join(gitDir, "objects");
+      const deferredCharges: (() => void)[] = [];
+      try {
+        let objectsStat: import("node:fs").BigIntStats | undefined;
+        try { objectsStat = await lstatPath(objectsDir); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        // A linked or non-directory `.git/objects` is an object path that is not the clone's own store: UNKNOWN.
+        if (objectsStat && !objectsStat.isDirectory()) throw refusal(".git/objects is not a real directory");
+        const objectsInfo = path.join(objectsDir, "info");
+        let infoStat: import("node:fs").BigIntStats | undefined;
+        if (objectsStat) {
+          try { infoStat = await lstatPath(objectsInfo); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        }
+        if (infoStat) {
+          if (!infoStat.isDirectory()) throw refusal(".git/objects/info is not a real directory");
+          remember("d:" + objectsInfo, objectsInfo, infoStat);
+          // A fixed set of four legal names: each is classified as it is read and before it is counted, so a fifth
+          // (or any illegal) name is UNKNOWN by construction and never a keep. The count is charged afterwards.
+          const names: string[] = [];
+          await listDirectory(objectsInfo, name => {
+            const text = name.toString("latin1");
+            if (!["alternates", "packs", "commit-graph", "commit-graphs"].includes(text))
+              throw refusal("unsupported object info entry");
+            names.push(text);
+          }, false);
+          // Type every entry before any is charged.
+          const typed: { name: string; file: string; st: import("node:fs").BigIntStats }[] = [];
+          for (const name of names) {
+            const file = path.join(objectsInfo, name);
+            const st = await lstatPath(file);
+            if (name === "commit-graphs" ? !st.isDirectory() : !st.isFile())
+              throw refusal(name === "commit-graphs" ? ".git/objects/info/commit-graphs is not a real directory"
+                : `.git/objects/info/${name} is not a regular file`);
+            typed.push({ name, file, st });
+          }
+          // `alternates` is read, whole, and its lines judged BEFORE a byte of it is charged (an outside store, a bad
+          // line or a bad encoding is UNKNOWN whatever else overflows); a file past the budget cannot be judged and
+          // is UNKNOWN too. The object-store observation applies the same rules.
+          for (const { name, file } of typed) {
+            if (name !== "alternates") continue;
+            let got: Awaited<ReturnType<typeof readSmallRegularFile>>;
+            try { got = await readSmallRegularFile(file, limits.maxMetadataBytes - counters.metadataBytes, read); }
+            catch (error) {
+              if (error instanceof GitIndexError) throw refusal(`.git/objects/info/alternates: ${error.message}`);
+              throw error;
+            }
+            if (!isUtf8(got.bytes)) throw refusal("alternates encoding");
+            const text = got.bytes.toString("utf8");
+            if (text && !text.endsWith("\n")) throw refusal("unterminated alternates");
+            for (const line of text ? text.slice(0, -1).split("\n") : []) {
+              if (!/^[!-~]+$/.test(line) || /["\\]/.test(line)) throw refusal("unsupported alternate syntax");
+              const target = path.resolve(objectsDir, line);
+              if (target !== objectsDir && !(path.dirname(path.dirname(target)) === path.resolve(this.reposRoot) &&
+                  path.basename(target) === "objects")) throw refusal("alternate writer exclusion unavailable");
+            }
+            fixed.set("f:" + file, { target: file, signature: got.signature });
+            chargeMetadata(got.bytes.length, ".git/objects/info/alternates");
+          }
+          chargeRecords("directory", names.length, "directory entry");
+          // The sizes of the other legal files are bulk: charged after the config below has been classified.
+          for (const { name, file, st } of typed) {
+            if (name === "alternates") continue;
+            if (name === "commit-graphs") { remember("d:" + file, file, st); continue; }
+            remember("f:" + file, file, st);
+            deferredCharges.push(() => chargeMetadata(Number(st.size), `.git/objects/info/${name}`));
+          }
+        }
+      } catch (error) {
+        // A typed refusal, any non-ENOENT filesystem error (an unreadable directory, say) and an exceeded bound all
+        // leave the object store unaccounted for: UNKNOWN. Everything charged inside this block is an indirection
+        // input, so its overflow is UNKNOWN too (the part past the limit was never read).
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        const fsError = typeof code === "string" && /^E[A-Z0-9]+$/.test(code) && code !== "ENOENT";
+        if (fsError || error instanceof AutomaticContentRefusal || error instanceof AutomaticCompletenessUnknown ||
+            error instanceof AutomaticBoundExceeded) {
+          const unknownInfo = new AutomaticCompletenessUnknown((error as Error).message, { cause: error });
+          SHAPE_INDIRECTION_UNKNOWN.add(unknownInfo);
+          throw unknownInfo;
+        }
+        throw error;
+      }
+
+      // The clone's `.git/config`: the other indirection input of this stage. It is read FIRST among the files of
+      // `.git`, whole, and every UNKNOWN-class key in it (partialclone, refstorage, the object formats, worktreeconfig,
+      // core.worktree) is classified before anything bulk is charged, so neither a reflog nor a packed-refs can use
+      // up the budget it needs, and no later keep of this stage can stand in front of the key. A config past the
+      // budget cannot be classified and is UNKNOWN; so is one that is not a regular file (a config redirect) or is missing.
+      const configFile = path.join(gitDir, "config");
+      let configBytes: Buffer;
+      try {
+        const got = await readSmallRegularFile(configFile, limits.maxMetadataBytes - counters.metadataBytes, read);
+        configBytes = got.bytes;
+        fixed.set("f:" + configFile, { target: configFile, signature: got.signature });
+      } catch (error) {
+        // A config that cannot be read as a regular file of the budgeted size (a symlink or other non-regular file, a
+        // missing file, one past the budget) is a config redirect or an unclassifiable one: UNKNOWN. Ending the stage
+        // here as a keep would run before `afterIndirection` and hide the object-path indirections it classifies.
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        if (error instanceof GitIndexError || typeof code === "string" && /^E[A-Z0-9]+$/.test(code)) {
+          const unknownConfig = new AutomaticCompletenessUnknown(`.git/config: ${(error as Error).message}`, { cause: error });
+          SHAPE_INDIRECTION_UNKNOWN.add(unknownConfig);
+          throw unknownConfig;
+        }
+        throw error;
+      }
+      const indirect = cloneConfigIndirection(configBytes);
+      if (indirect !== undefined) {
+        const unknownKey = new AutomaticCompletenessUnknown(
+          `object format or config indirection unsupported (.git/config names ${indirect})`);
+        SHAPE_INDIRECTION_UNKNOWN.add(unknownKey);
+        throw unknownKey;
+      }
+      // A config include is an indirection too: its target can carry any key (a promisor remote, say) that is never
+      // classified, because Git opens every `include.path` target while it starts up in the clone, even for a read
+      // that asks for no includes (a FIFO target hangs it, a huge one is read uncharged), so the target is never read
+      // here. The scan is deliberately coarse: any `[include` section opener, in any case and spacing, anywhere in the
+      // file. UNKNOWN, before any Git launch and before anything bulk is charged.
+      if (/\[\s*include/i.test(configBytes.toString("latin1"))) {
+        const unknownInclude = new AutomaticCompletenessUnknown("object format or config indirection unsupported (.git/config names an include)");
+        SHAPE_INDIRECTION_UNKNOWN.add(unknownInclude);
+        throw unknownInclude;
+      }
+      chargeMetadata(configBytes.length, ".git/config");
+      // The rest of the clone's indirection inputs: `afterIndirection` (the whole proof passes the Node-only topology
+      // classification here) types every entry of `.git/objects` and the special `.git` entries before any bulk input
+      // below can end the proof as a keep. Its errors are UNKNOWN by construction.
+      if (afterIndirection) {
+        try { await afterIndirection(); }
+        catch (error) {
+          if (error instanceof AutomaticCompletenessUnknown) SHAPE_INDIRECTION_UNKNOWN.add(error);
+          throw error;
+        }
+      }
+      for (const charge of deferredCharges) charge();
+
+      // Allowlist, not denylist: every top-level entry must be a known one of the right type, so
+      // no state file `status` or `ls-tree` might read (a sequencer todo, a rebase head-name, a
+      // merge head, ...) goes untyped or uncharged. The files charged below are charged once.
+      const gitEntries: Buffer[] = [];
+      await listDirectory(gitDir, name => gitEntries.push(name));
+      const chargedElsewhere = new Set(["config", "packed-refs", "index"]);
+      for (const raw of gitEntries) {
+        const entry = raw.toString("latin1");
+        const label = `.git/${sanitizeForLog(entry, 64)}`;
+        const isDirectory = EPOCH_GIT_DIR_DIRECTORIES.has(entry);
+        if (!isDirectory && !EPOCH_GIT_DIR_FILES.has(entry)) throw refusal(`${label} is not an admitted .git entry`);
+        const file = path.join(gitDir, entry);
+        if (isDirectory) {
+          const st = await lstatPath(file);
+          if (!st.isDirectory()) throw refusal(`${label} is not a real directory`);
+          // Only the directories Git resolves refs and excludes through are re-checked at the end.
+          if (entry === "refs" || entry === "info") remember("d:" + file, file, st);
+        } else if (!chargedElsewhere.has(entry)) {
+          // `description` is never read by Git here; it is typed but not charged.
+          if (entry === "description") {
+            const st = await lstatPath(file);
+            if (!st.isFile()) throw refusal(`${label} is not a regular file`);
+            remember("f:" + file, file, st);
+          } else await regular(file, true, label);
+        }
+      }
+      // `refs/` is read in full by Git (`for-each-ref`, `rev-parse`), so it is walked here first:
+      // every directory real, every entry charged as a record, every file a small regular file.
+      // A link, FIFO, socket or oversized ref is a keep, and each entry is re-checked at the end.
+      if (gitEntries.some(raw => raw.toString("latin1") === "refs")) {
+        const walkRefs = async (dir: Buffer): Promise<void> => {
+          const names: Buffer[] = [];
+          await listDirectory(dir, name => names.push(Buffer.from(name)));
+          for (const name of names) {
+            const file = Buffer.concat([dir, Buffer.from("/"), name]);
+            if (file.length >= 4096) throw refusal("ref path exceeds PATH_MAX");
+            const st = await lstatPath(file);
+            remember("r:" + file.toString("latin1"), file, st);
+            if (st.isDirectory()) { await walkRefs(file); continue; }
+            if (!st.isFile()) throw refusal("a ref entry is not a regular file or real directory");
+            if (st.size > BigInt(EPOCH_REF_FILE_MAX_BYTES)) throw refusal("a loose ref file is oversized");
+            chargeMetadata(Number(st.size), "loose ref file");
+          }
+        };
+        await walkRefs(Buffer.from(path.join(gitDir, "refs")));
+      }
+      // Reflogs and the pseudo-refs name objects only the clone may still hold (an ORIG_HEAD or a
+      // logged old tip whose commit has left the clone's own store). Every named id is collected
+      // here, in Node, and must later be reachable from the trusted roots; anything unparseable,
+      // oversized or not a regular file is a keep.
+      const namedIds = new Set<string>();
+      const readNamed = async (file: string | Buffer, what: string): Promise<string> => {
+        try {
+          const got = await readSmallRegularFile(file as string, Math.min(EPOCH_NAMED_FILE_MAX_BYTES,
+            limits.maxMetadataBytes - counters.metadataBytes), read);
+          chargeMetadata(got.bytes.length, what);
+          fixed.set("n:" + file.toString("latin1"), { target: file, signature: got.signature });
+          return got.bytes.toString("latin1");
+        } catch (error) {
+          if (error instanceof GitIndexError) throw refusal(`${what}: ${error.message}`);
+          throw error;
+        }
+      };
+      const nameIds = (text: string, what: string, pattern: RegExp) => {
+        if (text !== "" && !text.endsWith("\n")) throw refusal(`${what} is unterminated`);
+        for (const line of text === "" ? [] : text.slice(0, -1).split("\n")) {
+          const match = pattern.exec(line);
+          if (!match) throw refusal(`${what} holds an unparseable line`);
+          for (const id of match.slice(1)) if (!/^0{40}$/.test(id)) namedIds.add(id);
+        }
+      };
+      for (const pseudo of ["ORIG_HEAD", "FETCH_HEAD"]) {
+        if (!gitEntries.some(raw => raw.toString("latin1") === pseudo)) continue;
+        nameIds(await readNamed(path.join(gitDir, pseudo), `.git/${pseudo}`), `.git/${pseudo}`,
+          pseudo === "ORIG_HEAD" ? /^([0-9a-f]{40})$/ : /^([0-9a-f]{40})(?:[\t ].*)?$/);
+      }
+      if (gitEntries.some(raw => raw.toString("latin1") === "logs")) {
+        const walkLogs = async (dir: Buffer): Promise<void> => {
+          const names: Buffer[] = [];
+          await listDirectory(dir, name => names.push(Buffer.from(name)));
+          for (const name of names) {
+            const file = Buffer.concat([dir, Buffer.from("/"), name]);
+            if (file.length >= 4096) throw refusal("log path exceeds PATH_MAX");
+            const st = await lstatPath(file);
+            remember("l:" + file.toString("latin1"), file, st);
+            if (st.isDirectory()) { await walkLogs(file); continue; }
+            if (!st.isFile()) throw refusal("a log entry is not a regular file or real directory");
+            nameIds(await readNamed(file, "reflog file"), "reflog file", /^([0-9a-f]{40}) ([0-9a-f]{40}) /);
+          }
+        };
+        const logsRoot = path.join(gitDir, "logs");
+        remember("l:" + logsRoot, logsRoot, await lstatPath(logsRoot));
+        await walkLogs(Buffer.from(logsRoot));
+      }
+      const infoDir = path.join(gitDir, "info");
+      if (gitEntries.some(raw => raw.toString("latin1") === "info")) {
+        // Only the clone's own exclude file: `attributes` and `sparse-checkout` steer Git.
+        await listDirectory(infoDir, name => {
+          if (name.toString("latin1") !== "exclude") throw refusal(".git/info holds an unadmitted entry");
+        });
+      }
+      // Read the bytes in Node, bounded by what is left of the metadata budget, and remembered for
+      // the final re-check. `readSmallRegularFile` types the file (a FIFO or link is refused
+      // without blocking) and verifies the descriptor and size around the read.
+      const readBounded = async (file: string, required: boolean, what: string): Promise<Buffer | undefined> => {
+        try {
+          const got = await readSmallRegularFile(file, limits.maxMetadataBytes - counters.metadataBytes, read);
+          chargeMetadata(got.bytes.length, what);
+          fixed.set("f:" + file, { target: file, signature: got.signature });
+          return got.bytes;
+        } catch (error) {
+          if (!required && (error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+          if (error instanceof GitIndexError) throw error.kind === "limit" ? exceeded(`${what}: ${error.message}`) : refusal(`${what}: ${error.message}`);
+          throw error;
+        }
+      };
+      // `.git/info/exclude` is agent-written and decides what counts as ignored, so only the
+      // worker-source baseline is trusted: the exact `/.uzi/scratch/` line, column-zero comments and
+      // blank lines. This is the same rule the owner-cancel proof (`CANCEL_CONTENT_HELPER`) applies.
+      const excludeBytes = await readBounded(path.join(infoDir, "exclude"), false, ".git/info/exclude");
+      if (excludeBytes !== undefined) {
+        if (!isUtf8(excludeBytes) || excludeBytes.includes(0)) throw refusal(".git/info/exclude encoding");
+        const lines = excludeBytes.toString("utf8").split("\n");
+        for (const [i, raw] of lines.entries()) {
+          const line = i < lines.length - 1 && raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+          if (line.includes("\r") || !(line.startsWith("#") || /^ *$/.test(line) || line === "/.uzi/scratch/"))
+            throw refusal(".git/info/exclude holds a rule beyond the worker-source baseline");
+        }
+      }
+      await regular(path.join(gitDir, "packed-refs"), false, ".git/packed-refs");
+      // HEAD names the one loose ref `ls-tree` resolves. Both it and that ref are
+      // small regular files read here through a bounded descriptor; a symbolic indirection, a
+      // link or a FIFO is a keep.
+      const headFile = await readSmallRegularFile(path.join(gitDir, "HEAD"), EPOCH_REF_FILE_MAX_BYTES, read)
+        .catch((error: unknown) => { throw error instanceof GitIndexError ? refusal(`.git/HEAD: ${error.message}`) : error; });
+      chargeMetadata(headFile.bytes.length, ".git/HEAD");
+      const headText = headFile.bytes.toString("latin1");
+      const symbolic = /^ref: (refs\/heads\/[A-Za-z0-9._/-]+)\n$/.exec(headText);
+      if (!symbolic && !/^[0-9a-f]{40}\n$/.test(headText)) throw refusal(".git/HEAD is neither a branch ref nor an object id");
+      fixed.set("f:HEAD", { target: path.join(gitDir, "HEAD"), signature: headFile.signature });
+      if (symbolic) {
+        const ref = symbolic[1]!;
+        const parts = ref.split("/");
+        if (parts.some(part => part === "" || part.startsWith(".") || part.endsWith(".lock") || part.includes("..")) || ref.endsWith("."))
+          throw refusal(".git/HEAD names an unsafe ref");
+        // Walk down from `.git`: every ancestor must be a real directory before the loose ref is
+        // looked at (a symlinked ancestor would hide a FIFO); a missing one means "packed".
+        let current = gitDir;
+        let looseRef: string | undefined;
+        for (const [i, part] of parts.entries()) {
+          current = path.join(current, part);
+          let st: import("node:fs").BigIntStats;
+          try { st = await lstatPath(current); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") break; throw error; }
+          if (i < parts.length - 1) {
+            if (!st.isDirectory()) throw refusal("a ref ancestor is not a real directory");
+            remember("d:" + current, current, st);
+          } else looseRef = current;
+        }
+        if (looseRef) {
+          const loose = await readSmallRegularFile(looseRef, EPOCH_REF_FILE_MAX_BYTES, read)
+            .catch((error: unknown) => { throw error instanceof GitIndexError ? refusal(`loose ref: ${error.message}`) : error; });
+          chargeMetadata(loose.bytes.length, "loose ref");
+          if (!/^[0-9a-f]{40}\n$/.test(loose.bytes.toString("latin1"))) throw refusal("loose ref is not an object id");
+          fixed.set("f:" + looseRef, { target: looseRef, signature: loose.signature });
+        }
+      }
+
+      // 1. The index, parsed by us before Git reads it.
+      const indexPath = path.join(gitDir, "index");
+      let index: BoundedIndex;
+      try {
+        index = await readBoundedIndex(indexPath, { maxBytes: limits.maxMetadataBytes - counters.metadataBytes,
+          maxEntries: limits.maxMetadataRecords, step: read });
+      } catch (error) {
+        if (error instanceof GitIndexError) throw error.kind === "limit" ? exceeded(`index: ${error.message}`) : refusal(`index: ${error.message}`);
+        throw error;
+      }
+      chargeMetadata(index.size, ".git/index");
+      chargeRecords("index", index.entries.length, "index entry");
+
+      automatic.shape = { ctx, index, namedIds };
+      return true;
+    } catch (err) {
+      if (err instanceof AutomaticCompletenessUnknown && SHAPE_INDIRECTION_UNKNOWN.has(err)) throw err;
+      this.log.debug("stopped source clone shape could not be proven", { cwd, error: gitErrorMessage(err) });
+      return false;
+    }
+  }
+
+
+  /**
+   * The automatic epoch worktree proof: is the clone's tracked and untracked non-ignored state
+   * provably empty, without letting Git be the first reader of anything unbounded or hostile?
+   *
+   * Git's own `status` hashes any stat-dirty or racily-clean tracked file, runs clean filters named
+   * by attributes, reads ignore files and `.gitattributes`, detects renames by reading blobs and
+   * follows a split index, `commondir` and the clone's config. So everything that can steer or
+   * enlarge that work is bounded and typed in Node FIRST, on raw-byte paths. The order of the whole
+   * automatic content proof ({@link automaticContentPreserved}) is: the Node-only shape stage
+   * ({@link automaticCloneShape}: items 0, 1 and 1b below, no Git launch), then `git version`, the
+   * object-store observation, ref reachability, and only then this stage (items 2 onward, whose
+   * tracked-path lstat, hashing and directory listing are also Node-only and precede its own first
+   * Git launch). A failure of the shape stage keeps the source before any Git launch of the proof;
+   * a failure here keeps it before this stage's own Git launches:
+   *  0. `.git` is a real directory whose every top-level entry is on an allowlist (see
+   *     `EPOCH_GIT_DIR_FILES`/`EPOCH_GIT_DIR_DIRECTORIES`; no `commondir`, `modules`, `reftable`,
+   *     `sharedindex.*`, sequencer or merge/rebase state) and typed, `info` holds only `exclude`;
+   *     the files are regular and charged; `refs/` is walked recursively (every directory real,
+   *     every entry charged as a record, every file a regular file of at most
+   *     `EPOCH_REF_FILE_MAX_BYTES`), because Git reads every loose ref; `HEAD` is a small regular file naming a branch ref (or
+   *     an object id) and that loose ref, when present, a small regular file holding an object id;
+   *  1. `.git/index` is read once through a bounded descriptor and parsed ({@link readBoundedIndex}:
+   *     SHA-1, version 2, 3 or 4, no link/sdir/UNTR/FSMN extension, no assume-valid, skip-worktree,
+   *     intent-to-add, staged or odd-mode entry);
+   *  1b. `.git/config` is read in Node, classified for every UNKNOWN-class key (partialclone, refstorage, the
+   *     object formats, worktreeconfig, core.worktree: UNKNOWN, also when the file is past the budget) and
+   *     UNKNOWN if it names an include (Git opens include targets at startup, so the target is never read and could
+   *     carry any indirection key, a promisor remote included; thrown before anything bulk is charged);
+   *     `.git/info/exclude` is read in Node and must hold only the worker-source
+   *     baseline; `.git/objects/info` holds at most `alternates` (read and judged whole), `packs` and
+   *     `commit-graph` (typed, their sizes charged after the config) and a `commit-graphs` directory (typed only);
+   *     any other entry (`http-alternates` included), an unreadable one or an alternates file past the budget is
+   *     UNKNOWN, while an over-budget `packs` or `commit-graph` is a settled keep. `objects/info` and the config are
+   *     classified FIRST, before item 0 charges anything of `.git` (packed-refs, refs, reflogs), so an outside
+   *     alternate or a partialclone is never hidden behind an overflow of another file;
+   *  2. every tracked path (and each of its directories) is lstat'd by raw bytes and must have
+   *     the type its mode names; regular sizes and link lengths are charged to the worktree-content
+   *     counter; every tracked regular file and symlink is hashed here as a Git blob (never more
+   *     bytes than were charged) and compared with its index entry, and the owner execute bit must
+   *     match the mode, so the index's forgeable stat cache is never trusted; a gitlink keeps the
+   *     empty-directory rule; each tracked directory is listed under a cumulative entry cap;
+   * and only then Git runs, every launch carrying the attribute/config pins and
+   * `GIT_ATTR_NOSYSTEM`: a version check, the clone's config (strict key allowlist), the untracked
+   * listing (no exclude option; an untracked `.gitignore`, `.gitattributes` or `.gitmodules` is a
+   * keep), a level-by-level `check-ignore` (each level asks about exactly the entries Node listed on disk; a non-ignored directory is expanded one level and asked about again, and a non-ignored file is a keep), and `ls-tree -r` of HEAD
+   * compared exactly with the parsed index entries (the index-versus-HEAD half, which `status`
+   * would answer from a forgeable cache-tree). There is no `status` launch. Finally the index and
+   * every recorded path are re-read: a change is a keep.
+   *
+   * Three counters, each with its own limit: `metadataBytes`
+   * (config, index, exclude, packed-refs and every Git output; limit `maxMetadataBytes`),
+   * `pathRecords` (index entries, directory entries, untracked records; each limited to
+   * `maxMetadataRecords`) and `worktreeContentBytes` (tracked regular sizes and link lengths;
+   * limit `maxWorktreeContentBytes`, owner answer seq 1162, 2026-11-06 (R9)).
+   *
+   * Outcome: every failure here, an exceeded bound included, returns `false`, except that the shape
+   * stage rethrows a {@link SHAPE_INDIRECTION_UNKNOWN} error for an indirection input it cannot
+   * account for (an `objects/info` entry, the config (missing, not regular, an UNKNOWN-class key, an include or past the budget),
+   * an object-path entry type or name, commondir, shallow, grafts or replace refs). An exceeded bound is thrown internally as
+   * {@link AutomaticBoundExceeded} and a hostile or unsupported source
+   * as {@link AutomaticContentRefusal}, but this method's catch converts both to `false`, so the
+   * discard core records `epoch_content_unproven` (a settled keep that does not stop the epoch
+   * scope). Only the object-store observation and those indirection inputs let
+   * AutomaticCompletenessUnknown escape to the discard's `unknown` outcome.
+   */
+  private async worktreeProvenCleanAutomatic(cwd: string, automatic: AutomaticPreservation): Promise<boolean> {
+    // The object-store observation (which sets both) must already have run: it is what makes the
+    // clone's object stores and alternates safe for the Git launches below. Not established: keep.
+    // Likewise the clone shape (stage one) must have been proven before any Git launched.
+    if (!automatic.objectCoverage || !automatic.finalStoreCheck || !automatic.shape) return false;
+    const { ctx, index } = automatic.shape;
+    const { read, refusal, unknown, exceeded, chargeMetadata, chargeContent, chargeRecords, fixed, remember, lstatPath,
+      listDirectory } = ctx;
+    const steersGit = (name: string) => name === ".gitignore" || name === ".gitattributes" || name === ".gitmodules";
+    const indexPath = path.join(cwd, ".git", "index");
+    try {
+
+      // 2. Typed lstat of every tracked path by raw bytes, before any Git command.
+      const slash = Buffer.from("/");
+      const root = Buffer.from(cwd);
+      const absolute = (rel: Buffer) => rel.length ? Buffer.concat([root, slash, rel]) : root;
+      const directories = new Map<string, Buffer>([["", Buffer.alloc(0)]]);
+      for (const entry of index.entries) {
+        // A path longer than PATH_MAX cannot exist; refusing it first keeps prefix building bounded.
+        if (root.length + 1 + entry.path.length >= 4096) throw refusal("tracked path exceeds PATH_MAX");
+        for (let at = entry.path.indexOf(0x2f); at >= 0; at = entry.path.indexOf(0x2f, at + 1)) {
+          const key = entry.path.toString("latin1", 0, at);
+          if (directories.has(key)) continue;
+          chargeRecords("directory", 1, "tracked directory");
+          directories.set(key, Buffer.from(entry.path.subarray(0, at)));
+        }
+      }
+      // A parent is always shorter than its children, so this lstats every ancestor first and a
+      // symlinked ancestor is refused before any path beneath it is resolved.
+      const ordered = [...directories].sort(([a], [b]) => a.length - b.length);
+      for (const [key, rel] of ordered) {
+        const st = await lstatPath(absolute(rel));
+        if (!st.isDirectory()) throw refusal("tracked directory is not a real directory");
+        remember("d:" + key, absolute(rel), st);
+      }
+      const gitBlobOid = (data: Buffer) => createHash("sha1").update(`blob ${data.length}\0`).update(data).digest("hex");
+      // Worktree versus index is decided here, from the bytes: `status` would trust the index's stat
+      // cache, which the clone's agent can forge, and would hash racy content uncharged. The file is
+      // read through one descriptor (no link followed, no blocking open) whose identity and size
+      // must match the lstat just charged, at most that many bytes, and must be unchanged afterwards.
+      const hashRegularFile = async (file: Buffer, st: import("node:fs").BigIntStats): Promise<string> => {
+        return withClosingHandle(read, () => fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK), async handle => {
+          const opened = await read(() => handle.stat({ bigint: true }));
+          if (!opened.isFile() || opened.dev !== st.dev || opened.ino !== st.ino || opened.size !== st.size)
+            throw refusal("tracked file changed while opening");
+          const size = Number(st.size);
+          const hash = createHash("sha1").update(`blob ${size}\0`);
+          const chunk = Buffer.allocUnsafe(Math.max(1, Math.min(size, 65536)));
+          for (let done = 0; done < size;) {
+            const { bytesRead } = await read(() => handle.read(chunk, 0, Math.min(chunk.length, size - done), done));
+            if (bytesRead === 0) throw refusal("tracked file truncated while reading");
+            hash.update(chunk.subarray(0, bytesRead));
+            done += bytesRead;
+          }
+          if ((await read(() => handle.read(Buffer.alloc(1), 0, 1, size))).bytesRead !== 0) throw refusal("tracked file grew while reading");
+          if (statSignature(await read(() => handle.stat({ bigint: true }))) !== statSignature(opened))
+            throw refusal("tracked file changed while reading");
+          return hash.digest("hex");
+        });
+      };
+      const gitlinks: Buffer[] = [];
+      for (const entry of index.entries) {
+        const st = await lstatPath(absolute(entry.path));
+        const key = "p:" + entry.path.toString("latin1");
+        if (entry.mode === 0o160000) {
+          if (!st.isDirectory()) throw refusal("gitlink path is not a real directory");
+          gitlinks.push(entry.path);
+        } else if (entry.mode === 0o120000) {
+          if (!st.isSymbolicLink()) throw refusal("tracked symlink is not a symlink");
+          chargeContent(Number(st.size), "tracked symlink");
+          // The target bytes, as Git hashes a symlink blob.
+          const target = await read(() => fs.readlink(absolute(entry.path), { encoding: "buffer" }));
+          if (BigInt(target.length) !== st.size) throw refusal("tracked symlink changed while reading");
+          if (gitBlobOid(target) !== entry.sha) throw refusal("worktree differs from the index");
+        } else {
+          if (!st.isFile()) throw refusal("tracked file is not a regular file");
+          chargeContent(Number(st.size), "tracked file");
+          // `core.fileMode=true`: Git compares only the owner execute bit.
+          if (((st.mode & 0o100n) !== 0n) !== (entry.mode === 0o100755)) throw refusal("worktree differs from the index");
+          if (await hashRegularFile(absolute(entry.path), st) !== entry.sha) throw refusal("worktree differs from the index");
+        }
+        remember(key, absolute(entry.path), st);
+      }
+      // Every entry of every tracked directory is listed here, whatever its type, so a file Git
+      // would read as an ignore, attributes or submodules file is seen even when `ls-files` omits
+      // it (a FIFO, say). Only a tracked, already typed path may carry one of those names.
+      const tracked = new Set(index.entries.map(entry => entry.path.toString("latin1")));
+      // Git's untracked listing probes every top-level untracked directory for a nested repository
+      // (it reads `<dir>/.git` as a gitfile, up to 1 MiB uncharged, and opens `<gitdir>/HEAD`, which
+      // blocks on a FIFO). So an untracked child directory that holds any `.git` entry, of any
+      // type, is refused here before the listing is launched; a `.git` inside a tracked directory
+      // other than the root is refused the same way. `--directory` does not descend further.
+      for (const [key, rel] of ordered) {
+        const children: Buffer[] = [];
+        await listDirectory(absolute(rel), name => {
+          const text = name.toString("latin1");
+          const childKey = key === "" ? text : `${key}/${text}`;
+          if (steersGit(text) && !tracked.has(childKey)) throw refusal("untracked entry steers Git");
+          if (text === ".git" && key !== "") throw refusal("nested .git entry");
+          if (!tracked.has(childKey) && !(key === "" && text === ".git")) children.push(Buffer.from(name));
+        });
+        for (const name of children) {
+          const child = Buffer.concat([rel, rel.length ? slash : Buffer.alloc(0), name]);
+          chargeRecords("directory", 1, "nested repository probe");
+          const st = await lstatPath(absolute(child));
+          if (!st.isDirectory()) continue;
+          chargeRecords("directory", 1, "nested repository probe");
+          try { await lstatPath(Buffer.concat([absolute(child), slash, Buffer.from(".git")])); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+          throw refusal("untracked directory holds a .git entry");
+        }
+      }
+      for (const rel of gitlinks) {
+        // The Buffer to string round trip must be exact: a lossy name could name another directory.
+        const text = rel.toString("utf8");
+        if (!Buffer.from(text).equals(rel)) throw refusal("gitlink path is not UTF-8");
+        if (!(await this.automaticDirectoryEmpty(path.join(cwd, text), automatic, false))) throw refusal("populated gitlink");
+      }
+
+      // From here Git runs. Every launch carries the attribute source and config pins.
+      const native = this.epochNative.getStore()!;
+      native.attrSource ??= await read(() => this.epochGitSupportsAttrSource());
+      if (!native.attrSource) throw unknown("git lacks --attr-source");
+      const pins = [`--attr-source=${EPOCH_EMPTY_TREE_OID}`,
+        ...EPOCH_CLONE_READ_PINS.flatMap(pin => ["-c", pin]), "-c", `core.worktree=${cwd}`];
+      const git = (args: string[], env: NodeJS.ProcessEnv, extra: { input?: Buffer; encoding?: "latin1" } = {}) =>
+        read(() => this.runGitAsRunner(cwd, [...pins, ...args],
+          { env: { ...env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL }, ...extra }));
+
+      // Strict allowlist of the keys uzi itself writes into `.git/config`; a value Git would parse
+      // some other way (a filter, a hooks path, an extension) is a keep, never something
+      // to override. `--local` lists the file alone: the launch environment's own command-line pins
+      // (safe.directory, core.hooksPath, ...) are not the clone's content, and an include or
+      // `config.worktree` can only matter through keys that the allowlist already refuses.
+      const config = await git(["config", "--local", "--null", "--list"], NO_REPLACE_ENV);
+      chargeMetadata(Buffer.byteLength(config), "config output");
+      this.automaticCollection(config, "\0");
+      for (const row of config.split("\0")) {
+        if (row === "") continue;
+        if (configClaimsCaseFolding(row)) throw refusal("clone claims case-folding");
+        const nl = row.indexOf("\n");
+        const key = nl === -1 ? row : row.slice(0, nl);
+        const value = nl === -1 ? undefined : row.slice(nl + 1);
+        if (!EPOCH_CLONE_CONFIG_KEYS.has(key) && !EPOCH_CLONE_CONFIG_KEY_PATTERNS.some(re => re.test(key)))
+          throw refusal(`clone config key ${sanitizeForLog(key, 64)} is not admitted`);
+        const exact = EPOCH_CLONE_CONFIG_EXACT_VALUES.get(key);
+        if (exact !== undefined && value !== exact) throw refusal(`clone config ${key} has an unadmitted value`);
+      }
+
+      // Index versus HEAD, from the entries themselves. `status` cannot be trusted for this half:
+      // it consults the index's cache-tree extension, and a forged one that claims a subtree equals
+      // HEAD's makes a staged change vanish from its output. `ls-tree` never reads the cache-tree.
+      // Every entry must match, byte for byte and in order, the flattened HEAD tree (gitlinks print
+      // as `commit`, symlinks as 120000).
+      const headTree = await git(["ls-tree", "-r", "-z", "--full-tree", "HEAD"], NO_REPLACE_ENV, { encoding: "latin1" });
+      chargeMetadata(headTree.length, "ls-tree output");
+      this.automaticCollection(headTree, "\0");
+      if (headTree !== "" && !headTree.endsWith("\0")) throw refusal("unterminated ls-tree output");
+      const headRows = headTree === "" ? [] : headTree.slice(0, -1).split("\0");
+      if (headRows.length !== index.entries.length) throw refusal("index differs from HEAD");
+      for (const [i, row] of headRows.entries()) {
+        const m = /^([0-7]{6}) (blob|commit) ([0-9a-f]{40})\t([\s\S]*)$/.exec(row);
+        const entry = index.entries[i]!;
+        if (!m || m[1] !== entry.mode.toString(8).padStart(6, "0") || m[3] !== entry.sha ||
+            !Buffer.from(m[4]!, "latin1").equals(entry.path)) throw refusal("index differs from HEAD");
+      }
+
+      // Untracked entries: listed without any exclude option, so no ignore file is read here. A
+      // collapsed untracked directory is one record. A record that is not itself ignored (a clone
+      // always has `.uzi/`, whose only content is the ignored `scratch`) is expanded one level at a
+      // time by listing its entries in Node, so what `check-ignore` is asked about is exactly what
+      // is on disk and every entry name is known before Git may read an ignore file for it.
+      const listing = await git(["ls-files", "--others", "--directory", "-z"], NO_REPLACE_ENV, { encoding: "latin1" });
+      chargeMetadata(listing.length, "untracked listing");
+      if (listing !== "" && !listing.endsWith("\0")) throw refusal("unterminated untracked listing");
+      let frontier = (listing === "" ? [] : listing.slice(0, -1).split("\0"))
+        .map(record => ({ name: record.endsWith("/") ? record.slice(0, -1) : record, directory: record.endsWith("/") }));
+      for (let depth = 0; frontier.length; depth++) {
+        if (depth > EPOCH_UNTRACKED_EXPANSION_DEPTH) throw exceeded("untracked expansion depth limit");
+        chargeRecords("untracked", frontier.length, "untracked record");
+        for (const { name } of frontier) {
+          // These files steer Git (ignore rules, attributes, submodules); they are never trusted
+          // untracked. A leading ':' would be parsed by check-ignore as pathspec magic.
+          if (name === "" || name.startsWith(":") || steersGit(name.slice(name.lastIndexOf("/") + 1)))
+            throw refusal("untracked entry steers Git or is not addressable");
+        }
+        // The bare name (not `name/`) matches directory-only patterns by lstat yet never reads an
+        // ignore file inside that directory itself.
+        const input = Buffer.from(frontier.map(f => f.name).join("\0") + "\0", "latin1");
+        chargeMetadata(input.length, "check-ignore input");
+        let ignored: string;
+        try {
+          ignored = await git(["check-ignore", "--no-index", "--stdin", "-z"], NO_REPLACE_ENV, { input, encoding: "latin1" });
+        } catch (error) {
+          // Exit status 1 is "nothing ignored": every record stays, which the code below decides.
+          if ((error as { code?: unknown }).code !== 1) throw error;
+          ignored = "";
+        }
+        chargeMetadata(ignored.length, "check-ignore output");
+        if (ignored !== "" && !ignored.endsWith("\0")) throw refusal("unterminated check-ignore output");
+        const matched = new Set(ignored === "" ? [] : ignored.slice(0, -1).split("\0"));
+        const next: typeof frontier = [];
+        for (const { name, directory } of frontier) {
+          if (matched.has(name)) continue;
+          // A file that is not ignored is untracked content. A directory that is not ignored is
+          // clean only if everything inside it is ignored (an empty directory is listed too and expands to nothing).
+          if (!directory) throw refusal("an untracked file is not ignored");
+          const dir = Buffer.from(name, "latin1");
+          const before = await lstatPath(absolute(dir));
+          if (!before.isDirectory()) throw refusal("untracked directory changed type");
+          remember("u:" + name, absolute(dir), before);
+          await withClosingHandle(read, () => fs.opendir(absolute(dir), { encoding: "buffer" as BufferEncoding }), async handle => {
+            for (;;) {
+              const entry = await read(() => handle.read());
+              if (entry === null) break;
+              chargeRecords("untracked", 1, "untracked directory entry");
+              const child = Buffer.concat([dir, slash, entry.name as unknown as Buffer]);
+              const st = await lstatPath(absolute(child));
+              next.push({ name: child.toString("latin1"), directory: st.isDirectory() });
+            }
+          });
+        }
+        frontier = next;
+      }
+
+      // No `status` launch: worktree-versus-index was decided from the hashed bytes above.
+
+      // Nothing we proved may have moved while Git ran.
+      // The second bounded read of the index is charged like the first.
+      chargeMetadata(index.size, ".git/index re-read");
+      if (!(await indexUnchanged(indexPath, index, read))) throw unknown("index changed during the proof");
+      for (const { target, signature } of fixed.values()) {
+        if (statSignature(await lstatPath(target)) !== signature) throw unknown("worktree changed during the proof");
+      }
+      return true;
+    } catch (err) {
+      this.log.debug("stopped source worktree could not be proven clean", { cwd, error: gitErrorMessage(err) });
       return false;
     }
   }
@@ -10859,6 +13455,8 @@ export class GitCache {
     const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
     const ledgerRaw = new Map<string, string>();
     const ledgerPaths = new Map<string, Set<string>>();
+    const rawLedger: Array<[string, string]> = [];
+    const rawJournals = new Map<string, Array<string | null>>();
     const active = new Map<string, { raw: string; journal: RecoveryJournalEntry | undefined }>();
     const descriptorRaw = new Map<string, string>();
     const bareProblems: string[] = [];
@@ -10866,9 +13464,23 @@ export class GitCache {
     const basisPaths = new Set<string>();
     for (const item of list) {
       const nl = item.indexOf("\n");
-      if (nl < 0) continue;
-      const k = item.slice(0, nl);
-      const v = item.slice(nl + 1);
+      const k = nl < 0 ? item : item.slice(0, nl);
+      const v = nl < 0 ? "" : item.slice(nl + 1);
+      const journalKey = /^uzi-recovery\.(.+)\.clone$/.exec(k);
+      if (journalKey) {
+        const values = rawJournals.get(journalKey[1]!) ?? [];
+        values.push(nl < 0 ? null : v);
+        rawJournals.set(journalKey[1]!, values);
+      }
+      if (nl < 0) {
+        if (this.epochRetained.getStore() && /^uzi-attempts\.(.+)\.entry$/.test(k))
+          throw new Error("unreadable epoch attempt ledger");
+        if (restoreKeyBranch(k) !== undefined) {
+          if (this.epochRetained.getStore()) throw new Error("unreadable epoch restore entry");
+          bareProblems.push("restore_entry_unreadable");
+        }
+        continue;
+      }
       if (restoreKeyBranch(k) !== undefined) {
         if (v === "") continue;
         try { basisPaths.add(parseRestoreValue(v).basis.predecessor.clonePath); }
@@ -10880,6 +13492,7 @@ export class GitCache {
       }
       let m = /^uzi-attempts\.(.+)\.entry$/.exec(k);
       if (m) {
+        rawLedger.push([m[1]!, v]);
         const e = parseAttemptLedgerEntry(v);
         if (!e && this.epochRetained.getStore()) throw new Error("unreadable epoch attempt ledger");
         if (e) {
@@ -11044,7 +13657,7 @@ export class GitCache {
 
     // Attempt sources: the ledger's last value per attempt id, not owned by a protected record.
     for (const e of ledger.values()) {
-      if (e.state === "retired" || owned.has(e.clonePath)) continue;
+      if (owned.has(e.clonePath) || e.state === "retired" && !this.epochRetained.getStore()) continue;
       const parsed = parseAttemptPath(e.clonePath, runnerRoot);
       const problems = runProblems(e.runId);
       const key = parsed?.key ?? "";
@@ -11059,13 +13672,24 @@ export class GitCache {
       const a = active.get(e.branch);
       const plainNames = a?.journal !== undefined && !a.journal.recovery && !a.journal.retainedSources?.length &&
         sameRecoverySource(a.journal, { runId: e.runId, clonePath: e.clonePath, attemptId: e.attemptId });
-      records.push({
+      const record: GatheredRecord = {
         kind: "attempt", runId: e.runId, branch: e.branch, key, parts: [p], journal: undefined,
         activeRaw: a?.raw, descriptorRaw: undefined, descriptorSnapshot: undefined,
         journalState: plainNames ? "plain" : "none", markerState: "none", markerRaw: undefined,
         ledgerRaw: ledgerRaw.get(e.attemptId), problems, namers,
         digest: sha256Hex(["retained-source-v1", "attempt", ledgerRaw.get(e.attemptId) ?? "", p.devIno].join("\n")),
-      });
+      };
+      if (e.state === "retired") {
+        if (p.presence !== "missing" ||
+            (await this.clonePresence(path.join(path.dirname(e.clonePath), `.uzi-skills-${path.basename(e.clonePath)}`))).presence !== "missing") continue;
+        if (this.exactRetiredEmptyJournal(record, rawLedger, rawJournals.get(e.branch)) &&
+            await this.epochMissingFootprint(record)) {
+          await this.runGit(barePath, ["check-ref-format", `refs/heads/${record.branch}`]);
+          record.epochRetiredEmptyJournal = true;
+        }
+        else if (!this.exactPlainAttemptJournal({ barePath, ledger, records }, record, "retired")) continue;
+      }
+      records.push(record);
     }
     // A path the ledger names under two attempt ids is shared evidence: flag every record on it.
     for (const r of records) {
@@ -11145,8 +13769,12 @@ export class GitCache {
    * hold rules (open or unknown holds never yield `local_discard`).
    */
   private strictPlainJournal(g: GatheredBare, rec: GatheredRecord): boolean {
+    return this.exactPlainAttemptJournal(g, rec, "live");
+  }
+
+  private exactPlainAttemptJournal(g: GatheredBare, rec: GatheredRecord, state: "live" | "retired"): boolean {
     const part = rec.parts[0]!;
-    if (part.ledgerState !== "live" || part.attemptId === undefined || typeof rec.activeRaw !== "string") return false;
+    if (part.ledgerState !== state || part.attemptId === undefined || typeof rec.activeRaw !== "string") return false;
     let parsed: unknown;
     try {
       parsed = JSON.parse(rec.activeRaw);
@@ -11165,6 +13793,50 @@ export class GitCache {
     const keyOf = cloneKeyOf(part.clonePath).cloneKey;
     for (const e of g.ledger.values()) {
       if (e.attemptId !== part.attemptId && e.state !== "retired" && cloneKeyOf(e.clonePath).cloneKey === keyOf) return false;
+    }
+    return true;
+  }
+
+  /** At most the path depth plus two leaves, charged to the epoch read budget; no retry.
+   * Missing ancestors and symlinks cannot prove an absent footprint. */
+  private async epochMissingFootprint(rec: GatheredRecord): Promise<boolean> {
+    const clone = rec.parts[0]!.clonePath;
+    const parent = path.dirname(clone);
+    const root = path.parse(parent).root;
+    let current = root;
+    for (const component of parent.slice(root.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, component);
+      if ((await this.clonePresence(current)).presence !== "present") return false;
+    }
+    for (const target of [clone, path.join(parent, `.uzi-skills-${path.basename(clone)}`)]) {
+      if ((await this.clonePresence(target)).presence !== "missing") return false;
+    }
+    return true;
+  }
+
+  /** Narrow metadata-only retry evidence, from the complete ordered raw snapshot under B.
+   * One pass over the bounded snapshot; any ambiguity refuses the whole pair. */
+  private exactRetiredEmptyJournal(rec: GatheredRecord, snapshot: Array<[string, string]>, journal: readonly (string | null)[] | undefined): boolean {
+    const p = rec.parts[0]!;
+    if (!this.epochRetained.getStore() || rec.kind !== "attempt" || rec.problems.length ||
+        p.ledgerState !== "retired" || !p.attemptId || p.generation === null ||
+        journal?.length !== 1 || journal[0] !== "" || rec.namers.get(p.clonePath)?.length) return false;
+    const key = cloneKeyOf(p.clonePath).cloneKey;
+    const own: Array<[string, AttemptLedgerEntry]> = [];
+    const latest = new Map<string, AttemptLedgerEntry>();
+    for (const [branch, raw] of snapshot) {
+      const e = parseAttemptLedgerEntry(raw);
+      if (!e || raw !== attemptLedgerValue(e)) return false;
+      if (e.attemptId === p.attemptId) {
+        if (branch !== rec.branch || e.runId !== rec.runId || e.clonePath !== p.clonePath) return false;
+        own.push([raw, e]);
+      } else if (e.clonePath === p.clonePath) return false;
+      latest.set(e.attemptId, e);
+    }
+    const retired = own.filter(([, e]) => e.state === "retired");
+    if (retired.length !== 1 || retired[0] !== own.at(-1)) return false;
+    for (const e of latest.values()) {
+      if (e.attemptId !== p.attemptId && e.state !== "retired" && cloneKeyOf(e.clonePath).cloneKey === key) return false;
     }
     return true;
   }
@@ -11312,12 +13984,18 @@ export class GitCache {
       if (bl.length > 0) return { kind: "refused", consumers: bl };
       return rec.kind === "protected" ? { kind: "local_protected_discard" } : { kind: "local_discard" };
     };
-    const disposition = decide(uniq);
+    const disposition = rec.epochRetiredEmptyJournal ? undefined : decide(uniq);
     let epochSettlement: RetainedSourceEvidence["epochSettlement"];
     if (this.epochRetained.getStore() && rec.kind === "attempt" && ctx.lifecycle?.state === "terminal" &&
-        ownLedgerLive !== undefined && !pinConsumers && this.strictPlainJournal(g, rec)) {
+        !pinConsumers && (ownLedgerLive !== undefined && this.strictPlainJournal(g, rec) ||
+          rec.parts[0]!.ledgerState === "retired" && this.exactPlainAttemptJournal(g, rec, "retired"))) {
       const discounted = new Set([ownLedgerLive, ownNamed]);
       const settled = decide(uniq.filter((b) => !discounted.has(b)));
+      if (settled !== undefined) epochSettlement = { basis: "strict_plain", disposition: settled };
+    }
+    if (rec.epochRetiredEmptyJournal && ctx.lifecycle?.state === "terminal" &&
+        holds?.state === "read" && open.length === 0 && !pinConsumers) {
+      const settled = decide(uniq);
       if (settled !== undefined) epochSettlement = { basis: "strict_plain", disposition: settled };
     }
     return { blockers: uniq, consumers, localRecords, live, holdsView, disposition, epochSettlement };
@@ -11338,15 +14016,35 @@ export class GitCache {
    *  deadline of the injected clock, or at a cap on the entries visited, the pending-directory stack
    *  or the directory depth (the tree is runner-written and hostile), and then reports
    *  `complete: false`, never a total of zero and never a total claimed complete.
+   *  `local` is set only on an incomplete result whose stop was confined to this tree (permission
+   *  denied at the root or below, or an entry, depth or pending-directory cap) while the deadline had
+   *  not passed; a passed deadline is counted as `measurement_deadline` and carries no `local`.
    *  `partialOnIoError` (default off): a directory read or close error carrying a string `code` returns
    *  the partial total with `complete: false` instead of throwing; an interruption still propagates. */
   private async measureAllocated(
     root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
     skip?: (rel: string) => boolean, partialOnIoError = false,
-  ): Promise<{ bytes: number; entries: number; complete: boolean }> {
+  ): Promise<{ bytes: number; entries: number; complete: boolean; local?: MeasurementShortfall }> {
     const filesystem = async <T>(action: () => Promise<T>): Promise<T> => {
       try { return await action(); }
       catch (error) { countPartialCause(causes, "measurement_filesystem_error"); throw error; }
+    };
+    type Local = MeasurementShortfall;
+    // A stop confined to this tree (permission denied at the root or below, or a cap) is reported as `local`.
+    // A deadline that has already passed outranks it: the stop is then a pass-wide budget stop, so it
+    // is counted as the deadline and carries no `local`. Read the clock only on this stop path.
+    const stopped = (reportBytes: number, reportEntries: number, local: Local): { bytes: number; entries: number; complete: false; local?: Local } => {
+      if (now() >= deadline) {
+        countPartialCause(causes, "measurement_deadline");
+        return { bytes: reportBytes, entries: reportEntries, complete: false };
+      }
+      return { bytes: reportBytes, entries: reportEntries, complete: false, local };
+    };
+    const permissionCode = (error: unknown): "eacces" | "eperm" | undefined => {
+      try {
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        return code === "EACCES" ? "eacces" : code === "EPERM" ? "eperm" : undefined;
+      } catch { return undefined; }
     };
     const maxEntries = caps.maxEntries ?? RETAINED_MEASURE_MAX_ENTRIES;
     const maxPending = caps.maxPending ?? RETAINED_MEASURE_MAX_PENDING;
@@ -11366,11 +14064,12 @@ export class GitCache {
       try {
         this.checkRecoveryInterruption();
         handle = await filesystem(() => fs.opendir(dir));
-      } catch {
+      } catch (openError) {
         this.checkRecoveryInterruption();
-        return { bytes, entries: visited + 1, complete: false };
+        const denied = permissionCode(openError);
+        return denied ? stopped(bytes, visited + 1, denied) : { bytes, entries: visited + 1, complete: false };
       }
-      type Walk = { bytes: number; entries: number; complete: boolean };
+      type Walk = { bytes: number; entries: number; complete: boolean; local?: Local };
       const walk = async (): Promise<Walk | undefined> => {
         this.checkRecoveryInterruption();
         for (;;) {
@@ -11384,7 +14083,7 @@ export class GitCache {
             return { bytes, entries: visited + 1, complete: false };
           }
           if (!ent) break;
-          if (++visited > maxEntries) { countPartialCause(causes, "measurement_entry_cap"); return { bytes, entries: visited + 1, complete: false }; }
+          if (++visited > maxEntries) { countPartialCause(causes, "measurement_entry_cap"); return stopped(bytes, visited + 1, "entry_cap"); }
           const p = path.join(dir, ent.name);
           let st: Stats;
           try {
@@ -11399,16 +14098,20 @@ export class GitCache {
             });
           } catch (err) {
             this.checkRecoveryInterruption();
-            if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
-            return { bytes, entries: visited + 1, complete: false };
+            let vanished = false;
+            try { vanished = (err as NodeJS.ErrnoException | undefined)?.code === "ENOENT"; } catch { /* Treat an unreadable code as not vanished. */ }
+            if (vanished) continue;
+            const denied = permissionCode(err);
+            return denied ? stopped(bytes, visited + 1, denied) : { bytes, entries: visited + 1, complete: false };
           }
           bytes += st.blocks * 512;
           const childRel = rel === "" ? ent.name : `${rel}/${ent.name}`;
           // A skipped directory is lstat-counted above but never descended into.
           if (st.isDirectory() && !st.isSymbolicLink() && !skip?.(childRel)) {
             if (depth + 1 > maxDepth || stack.length >= maxPending) {
-              countPartialCause(causes, depth + 1 > maxDepth ? "measurement_depth_cap" : "measurement_pending_cap");
-              return { bytes, entries: visited + 1, complete: false };
+              const depthCap = depth + 1 > maxDepth;
+              countPartialCause(causes, depthCap ? "measurement_depth_cap" : "measurement_pending_cap");
+              return stopped(bytes, visited + 1, depthCap ? "depth_cap" : "pending_cap");
             }
             stack.push({ dir: p, depth: depth + 1, rel: childRel });
           }
@@ -11564,7 +14267,8 @@ export class GitCache {
       found.length = maxDescriptors;
     }
     const sources: RetainedSourceEvidence[] = [];
-    const measurements = new Map<string, { bytes: number; complete: boolean }>();
+    type Shortfall = MeasurementShortfall;
+    const measurements = new Map<string, { bytes: number; complete: boolean; local?: Shortfall }>();
     let bindingFailed = false;
     for (const { g, rec, ev } of found) {
       const parts: RetainedSourcePart[] = [];
@@ -11573,9 +14277,10 @@ export class GitCache {
       let total = 0;
       for (const p of rec.parts) {
         let bytes: number | null = null;
+        let shortfall: Shortfall | undefined;
         if (p.presence === "missing") bytes = 0;
         else if (p.presence === "present") {
-          let m = { bytes: 0, complete: false };
+          let m: { bytes: number; complete: boolean; local?: Shortfall } = { bytes: 0, complete: false };
           try {
             if (bindingFailed) throw new Error("retained tree binding check failed");
             m = (opts.epoch ? measurements.get(p.clonePath) : undefined) ??
@@ -11599,7 +14304,18 @@ export class GitCache {
             if (!stopped) unreadable++;
           }
           bytes = m.complete ? m.bytes : null;
-          if (!m.complete) partial = true;
+          // An epoch inspection keeps a tree-local shortfall (permission denied at the root or below, or a
+          // measurement cap) out of the pass-wide `partial`: the part stays unmeasured and the source is
+          // not byte-complete, so nothing is granted for it. Only a live signal, absolute deadline and
+          // inspection budget qualify. The budget is re-read here, and only on this local-stop path,
+          // because the walk's own check precedes its directory close and a cache hit reuses an earlier
+          // decision: a budget spent since then makes the stop pass-wide.
+          if (!m.complete) {
+            if (opts.epoch && m.local !== undefined && opts.signal?.aborted !== true && Date.now() < (opts.deadline ?? Infinity)) {
+              if (now() < deadline) shortfall = m.local;
+              else { countPartialCause(partialCauses, "inspection_budget"); partial = true; }
+            } else partial = true;
+          }
         }
         if (bytes === null) unmeasured++;
         else {
@@ -11609,6 +14325,7 @@ export class GitCache {
         parts.push({
           clonePath: p.clonePath, attempt: p.attemptId ?? "canonical", generation: p.generation ?? "none",
           presence: p.presence, ledgerState: p.ledgerState, live: ev.live.get(p.clonePath) ?? false, allocatedBytes: bytes,
+          ...(shortfall ? { measurementShortfall: shortfall } : {}),
         });
       }
       const head = rec.parts[0]!;
@@ -11637,7 +14354,8 @@ export class GitCache {
   }
 
   /**
-   * issue #1786 — operator discard of a PLAIN retained source: an attempt in ledger state `reclaimed`
+   * issue #1786 — operator discard of a PLAIN retained source (also the entry the gated verified-epoch
+   * deletion calls, with an epoch proof; see {@link discardRetainedSource}): an attempt in ledger state `reclaimed`
    * or `abandoned` that no journal names, or a canonical source whose marker is bound to its plain journal or detached
    * (no active journal names it; a successor's journal is never cleared), or a marker-less canonical
    * source left under its plain journal (the journal is cleared with the clone), or a `gx` attempt (confirmed with generation `none`). See
@@ -11669,6 +14387,15 @@ export class GitCache {
    * partial failure keeps the descriptor and every path not proven gone. One deadline covers the
    * whole operation; exhausting it keeps whatever is not yet proven gone and reports `unknown`.
    *
+   * With `opts.epochProof` (a worker-issued {@link EpochDiscardProof} from createEpochDiscardProof, mode `plain`
+   * only) this is also the single disposal core of the verified-epoch reclaim (PRD #3431). The proof admits an
+   * exact strict three-key journal with the ledger `live`, the same journal with the ledger `retired` and the
+   * footprint missing, or the explicit `[""]` empty-journal repair; the canonical selector and an absent
+   * (`[]`) journal are refused at construction. It additionally requires a positively terminal lifecycle,
+   * a read zero-hold response, the clean content proof ({@link automaticContentPreserved}; a settled
+   * over-limit keeps the source as `epoch_content_unproven`) and a GET-only epoch observation before any
+   * effect. Production deletion stays off (`EPOCH_RECLAIM_DELETION_ENABLED` in pod-epoch-reclaim.ts).
+   *
    * The pre-lock hold-read invariant belongs to the caller, not to this method: the holds snapshot
    * is only as current as the caller's proof that nothing can open a new hold on the run between the
    * read and the end of the disposal. The operator channel gives that proof (claim gate closed,
@@ -11679,6 +14406,16 @@ export class GitCache {
     const sel = opts.selector;
     const refused = (reason: string, consumers: string[] = [], disposition?: RetainedDisposition): RetainedDiscardResult =>
       ({ kind: "refused", reason, consumers, ...(disposition ? { disposition } : {}) });
+    const proof = opts.epochProof;
+    const epoch = proof === undefined ? undefined : this.epochDiscardProofs.get(proof);
+    if (proof !== undefined) {
+      if (!epoch || mode !== "plain" || opts.barePath !== epoch.barePath || opts.confirm !== epoch.confirm ||
+          sel.runId !== epoch.selector.runId || sel.generation !== epoch.selector.generation ||
+          sel.attempt !== epoch.selector.attempt) return refused("invalid_epoch_proof");
+      try { this.checkEpochDiscardLive(epoch); } catch { return refused("stale_epoch_proof"); }
+      if (opts.holds?.state !== "read" || !Array.isArray(opts.holds.holds) || opts.holds.holds.length !== 0 ||
+          opts.lifecycle?.state !== "terminal") return refused("epoch_authority_refused");
+    }
     if (!/^[A-Za-z0-9_-]{1,160}$/.test(sel.runId) || !/^[0-9a-f]{64}$/.test(opts.confirm) ||
         (sel.generation !== "none" && (!Number.isSafeInteger(sel.generation) || sel.generation < 0)) ||
         (sel.attempt !== "canonical" && !ATTEMPT_ID_RE.test(sel.attempt))) return refused("invalid_request");
@@ -11688,185 +14425,429 @@ export class GitCache {
     }
     const outcomes: Array<{ clonePath: string; outcome: RetainedSourceOutcome }> = [];
     let metadata: "retired" | "kept" = "kept";
+    let tookOver = false;
+    let epochWork: ReturnType<PodEpochReclaimScope["beginMutation"]> | undefined;
     const wantKinds = mode === "protected" ? ["protected"] : ["attempt", "canonical"];
-    try {
-      return await this.withRecoveryOperation(opts.signal ?? new AbortController().signal,
-        Date.now() + (opts.deadlineMs ?? RETAINED_OP_DEADLINE_MS), async () => {
-          // Locate the bare. With `opts.barePath` (what inspect reports) the destructive section
-          // below is the ONLY bare-lock entry; without it each candidate bare is gathered under its
-          // own short lock first, released before that section.
-          let bare = opts.barePath;
-          if (bare === undefined) {
-            const matches: string[] = [];
-            for (const candidate of await this.retainedBares()) {
-              const g = await this.withLock(candidate, () => this.gatherRetainedUnderLock(candidate)).catch(() => undefined);
-              if (g?.records.some((r) => wantKinds.includes(r.kind) && this.matchesRetainedSelector(r, sel))) matches.push(candidate);
-            }
-            if (matches.length === 0) return refused("not_found");
-            if (matches.length > 1) return refused("ambiguous", ["multiple_bares"]);
-            bare = matches[0]!;
-          }
-          const lockedBare = bare;
-          return this.withLock(lockedBare, async () => {
-            const bare = lockedBare;
-            const g = await this.gatherRetainedUnderLock(bare);
-            const candidates = g.records.filter((r) => this.matchesRetainedSelector(r, sel));
-            if (candidates.length === 0 && mode === "plain" && sel.attempt !== "canonical" &&
-                await this.finishOrphanRestoreMarker(g, sel.runId, opts)) {
-              // A completed P exit whose marker removal was interrupted: the retry has now made the metadata durable and removed it.
-              return { kind: "done", sources: [], metadata: "retired" };
-            }
-            if (candidates.length !== 1) return refused(candidates.length === 0 ? "not_found" : "ambiguous");
-            const rec = candidates[0]!;
-            // issue #3644: a restore entry on this branch keeps P and S until the restore-aware exit (plan 3.5), which is S's own
-            // guarded discard and then P's; anything else the entry holds is refused here before quiescence or any delete.
-            const plan = await this.planRestoreExit(g, rec, mode, opts.hasRetainedHomeMarker);
-            const restoreExit = plan.kind === "none" ? undefined : plan;
-            if (!wantKinds.includes(rec.kind)) return refused("wrong_discard_kind", [rec.kind]);
-            if (rec.digest !== opts.confirm) return refused("descriptor_changed");
-            if (restoreExit) {
-              const decided = await this.decideRestoreExit(g, rec, restoreExit, opts);
-              if (decided) return decided;
-            } else {
-              const ev = await this.evaluateRetained(g, rec, {
-                holds: opts.holds, ...(opts.lifecycle ? { lifecycle: opts.lifecycle } : {}), isLivePath: opts.isLivePath,
-              });
-              const want = mode === "protected" ? "local_protected_discard" : "local_discard";
-              if (ev.disposition?.kind !== want) {
-                return refused(ev.disposition?.kind ?? "refused",
-                  ev.disposition?.kind === "refused" ? ev.disposition.consumers : ev.blockers, ev.disposition);
+    // An exact empty-journal proof may name a metadata repair. If its binding
+    // disappears before B, do not downgrade uncertainty to a settled not-found.
+    const emptyJournalProof = epoch !== undefined && Array.isArray(epoch.expectedRawJournal) &&
+      epoch.expectedRawJournal.length === 1 && epoch.expectedRawJournal[0] === "";
+    const pairMismatch = (message: string): never => {
+      epochWork ??= epoch!.scope.beginMutation();
+      throw new Error(message);
+    };
+    const execute = async (): Promise<RetainedDiscardResult> => {
+      try {
+        const signal = epoch ? AbortSignal.any([epoch.signal, ...(opts.signal ? [opts.signal] : [])])
+          : opts.signal ?? new AbortController().signal;
+        const deadline = epoch ? Math.min(epoch.deadline, opts.deadlineMs === undefined ? Infinity : Date.now() + opts.deadlineMs)
+          : Date.now() + (opts.deadlineMs ?? RETAINED_OP_DEADLINE_MS);
+        return await this.withRecoveryOperation(signal, deadline, async () => {
+            // Locate the bare. With `opts.barePath` (what inspect reports) the destructive section
+            // below is the ONLY bare-lock entry; without it each candidate bare is gathered under its
+            // own short lock first, released before that section.
+            let bare = opts.barePath;
+            if (bare === undefined) {
+              const matches: string[] = [];
+              for (const candidate of await this.retainedBares()) {
+                const g = await this.withLock(candidate, () => this.gatherRetainedUnderLock(candidate)).catch(() => undefined);
+                if (g?.records.some((r) => wantKinds.includes(r.kind) && this.matchesRetainedSelector(r, sel))) matches.push(candidate);
               }
+              if (matches.length === 0) return refused("not_found");
+              if (matches.length > 1) return refused("ambiguous", ["multiple_bares"]);
+              bare = matches[0]!;
             }
-            // The existing protected-source checks, then the exclusivity ones (evaluateRetained).
-            let snapshot: { descriptor: string | undefined; active: string | undefined } | undefined;
-            if (rec.kind === "protected") {
-              const journal = rec.journal!;
-              const expected = recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
-                ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) });
-              const missingSome = rec.parts.some((p) => p.presence === "missing");
-              await this.checkedRecovery(bare, rec.branch, rec.key, expected, missingSome, rec.descriptorRaw === undefined ? undefined : journal);
-              await this.attributedRecovery(bare, rec.branch, rec.key, expected, rec.descriptorRaw === undefined ? undefined : journal);
-              await this.protectedRecoveries(bare, rec.runId);
-              snapshot = { descriptor: rec.descriptorSnapshot, active: rec.activeRaw };
-            }
-            for (const p of rec.parts) outcomes.push({ clonePath: p.clonePath, outcome: "retained" });
-            const paths = rec.parts.flatMap((p) => [p.clonePath, path.join(path.dirname(p.clonePath), `.uzi-skills-${path.basename(p.clonePath)}`)]);
-            // S's own discard skips the quiesce when nothing ran in S: its path is absent, or it is still `seeding` with no `.git`
-            // (the seed never finished, so no agent ever started there).
-            let quiesceNeeded = true;
-            if (restoreExit?.kind === "successor") {
-              const sPath = rec.parts[0]!.clonePath;
-              const absent = !(await this.pathPresent(sPath));
-              const noGit = restoreExit.composite.stage === "seeding" && !absent && !(await this.pathPresent(path.join(sPath, ".git")));
-              quiesceNeeded = !(absent || noGit);
-            }
-            if (quiesceNeeded && !(await opts.quiesce(paths))) return refused("not_quiescent", ["writers_not_proven_gone"]);
-            // A latch that landed during the caller's quiescence, or at any later point, keeps the
-            // remaining sources and every record: nothing further is deleted or retired.
-            const stopped = (): RetainedDiscardResult => ({ kind: "unknown", sources: outcomes, metadata });
-            if (residueQuarantine() !== undefined) return stopped();
-            // Amendment 14: a released predecessor is re-proven under this lock after the caller's quiescence and before any
-            // authority is taken or byte deleted; a changed holding directory or P's path having reappeared refuses here.
-            const releasedPlan = restoreExit?.composite?.kind === "released" ? restoreExit.composite : undefined;
-            if (releasedPlan) {
-              const again = await this.resolveExitJournal(bare, rec.branch).catch(() => undefined);
-              if (!again || !this.sameReleased(again, releasedPlan)) return refused("restore_state_changed", ["restore_state_changed"]);
-            }
-            // issue #3404 M2 U5: the operator-discard takeover of the authority slots comes LAST, after every refusal
-            // above (protected-source checks, quiescence, latch) and immediately before the first delete. A refused
-            // discard therefore rewrites no durable authority, and a crashed worker's foreign `active` epoch keeps
-            // guarding a source this discard never touched. A refusal here (a running pending record, ...) deletes nothing.
-            try { for (const p of rec.parts) await this.admitSource(p.clonePath, "discard"); }
-            catch { return refused("source_use_refused", ["authority"]); }
-            for (const [i, p] of rec.parts.entries()) {
+            const lockedBare = bare;
+            return this.withLock(lockedBare, async () => {
+              const bare = lockedBare;
+              const g = await this.gatherRetainedUnderLock(bare);
+              const candidates = g.records.filter((r) => this.matchesRetainedSelector(r, sel));
+              if (!epoch && candidates.length === 0 && mode === "plain" && sel.attempt !== "canonical" &&
+                  await this.finishOrphanRestoreMarker(g, sel.runId, opts)) {
+                return { kind: "done", sources: [], metadata: "retired" };
+              }
+              if (candidates.length !== 1) {
+                if (emptyJournalProof) pairMismatch("epoch pair disappeared or became ambiguous");
+                return refused(candidates.length === 0 ? "not_found" : "ambiguous");
+              }
+              const rec = candidates[0]!;
+              if (!wantKinds.includes(rec.kind)) {
+                if (emptyJournalProof) pairMismatch("epoch pair owner changed");
+                return refused("wrong_discard_kind", [rec.kind]);
+              }
+              if (rec.digest !== opts.confirm) {
+                if (emptyJournalProof) pairMismatch("epoch pair descriptor changed");
+                return refused("descriptor_changed");
+              }
+              // Epoch proof is not restore-disposal authority. P/S remain on their separate guarded exit.
+              if (epoch && this.restoreHolder(await this.configEntries(bare), rec.branch) !== undefined)
+                return refused("restore_entry_retained");
+              const plan = epoch ? { kind: "none" as const } : await this.planRestoreExit(g, rec, mode, opts.hasRetainedHomeMarker);
+              const restoreExit = plan.kind === "none" ? undefined : plan;
+              if (epoch) {
+                this.checkEpochDiscardLive(epoch);
+                if (rec.kind === "protected" || rec.markerState !== "none") {
+                  if (emptyJournalProof) pairMismatch("epoch pair protection changed");
+                  return refused("wrong_discard_kind");
+                }
+                if (rec.parts.length !== epoch.paths.length || rec.parts.some((p, i) => p.clonePath !== epoch.paths[i])) {
+                  if (emptyJournalProof) pairMismatch("epoch pair footprint binding changed");
+                  return refused("invalid_epoch_proof");
+                }
+                const wantJournal = typeof epoch.expectedRawJournal === "string" ? [epoch.expectedRawJournal] : epoch.expectedRawJournal;
+                if (JSON.stringify(await this.epochJournalVector(bare, rec.branch)) !== JSON.stringify(wantJournal)) {
+                  if (emptyJournalProof) pairMismatch("epoch pair journal changed");
+                  return refused("epoch_journal_changed");
+                }
+                // Only the three admitted epoch shapes may proceed: (a) ledger live with the strict journal,
+                // (c) ledger retired with the strict journal and a missing footprint, (b) ledger retired with
+                // the explicit `[""]` repair and an absent footprint (metadata only). Any other ledger state
+                // (reclaimed, abandoned) is refused before any effect, whatever the journal says.
+                const only = rec.parts[0]!;
+                const state = only.ledgerState;
+                if (rec.kind !== "attempt" || rec.parts.length !== 1 || only.attemptId === undefined) return refused("epoch_source_refused");
+                if (emptyJournalProof) {
+                  if (state !== "retired") return refused("epoch_source_refused");
+                  if (!rec.epochRetiredEmptyJournal || only.presence !== "missing") pairMismatch("epoch pair binding changed");
+                } else if (!(state === "live" || state === "retired" && only.presence === "missing")) {
+                  return refused("epoch_source_refused");
+                }
+              }
+              if (restoreExit) {
+                const decided = await this.decideRestoreExit(g, rec, restoreExit, opts);
+                if (decided) return decided;
+              } else {
+                const ev = await this.evaluateRetained(g, rec, {
+                  holds: opts.holds, ...(opts.lifecycle ? { lifecycle: opts.lifecycle } : {}), isLivePath: opts.isLivePath,
+                });
+                const want = mode === "protected" ? "local_protected_discard" : "local_discard";
+                const disposition = epoch ? ev.epochSettlement?.disposition : ev.disposition;
+                if (disposition?.kind !== want) {
+                  return refused(epoch ? "epoch_source_refused" : ev.disposition?.kind ?? "refused",
+                    ev.disposition?.kind === "refused" ? ev.disposition.consumers : ev.blockers, ev.disposition);
+                }
+              }
+              const epochParent = epoch ? await fs.lstat(path.dirname(epoch.paths[0]!)).catch(() => undefined) : undefined;
+              if (epoch && !epochParent) {
+                if (rec.epochRetiredEmptyJournal) pairMismatch("epoch pair parent disappeared");
+                return refused("epoch_parent_unproven");
+              }
+              if (epochParent && (!epochParent.isDirectory() || epochParent.isSymbolicLink())) {
+                if (rec.epochRetiredEmptyJournal) pairMismatch("epoch pair parent became unsafe");
+                return refused("epoch_parent_unsafe");
+              }
+              if (epoch && !await this.automaticContentPreserved(epoch)) {
+                try { this.checkEpochDiscardLive(epoch); } catch { return refused("stale_epoch_proof"); }
+                if (rec.epochRetiredEmptyJournal) pairMismatch("epoch pair footprint changed");
+                return refused("epoch_content_unproven");
+              }
+              const epochSnapshot = epoch ? await this.readAllAttemptLedgerRaw(bare) : undefined;
+              if (epochSnapshot && (!this.epochRetirementAttribution(rec, epochSnapshot) ||
+                  rec.epochRetiredEmptyJournal && !this.exactRetiredEmptyJournal(rec, epochSnapshot, await this.epochJournalVector(bare, rec.branch)))) {
+                if (emptyJournalProof) pairMismatch("epoch pair ledger changed");
+                return refused("epoch_ledger_conflict");
+              }
+              // The existing protected-source checks, then the exclusivity ones (evaluateRetained).
+              let snapshot: { descriptor: string | undefined; active: string | undefined } | undefined;
+              if (rec.kind === "protected") {
+                const journal = rec.journal!;
+                const expected = recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
+                  ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) });
+                const missingSome = rec.parts.some((p) => p.presence === "missing");
+                await this.checkedRecovery(bare, rec.branch, rec.key, expected, missingSome, rec.descriptorRaw === undefined ? undefined : journal);
+                await this.attributedRecovery(bare, rec.branch, rec.key, expected, rec.descriptorRaw === undefined ? undefined : journal);
+                await this.protectedRecoveries(bare, rec.runId);
+                snapshot = { descriptor: rec.descriptorSnapshot, active: rec.activeRaw };
+              }
+              for (const p of rec.parts) outcomes.push({ clonePath: p.clonePath, outcome: "retained" });
+              const paths = rec.parts.flatMap((p) => [p.clonePath, path.join(path.dirname(p.clonePath), `.uzi-skills-${path.basename(p.clonePath)}`)]);
+              // An unstarted partial S has no producers to quiesce; never broaden this exception to P or epoch deletion.
+              let quiesceNeeded = true;
+              if (restoreExit?.kind === "successor") {
+                const sPath = rec.parts[0]!.clonePath;
+                const absent = !(await this.pathPresent(sPath));
+                const noGit = restoreExit.composite.stage === "seeding" && !absent && !(await this.pathPresent(path.join(sPath, ".git")));
+                quiesceNeeded = !(absent || noGit);
+              }
+              if (quiesceNeeded && !(epoch ? await this.epochObservation(epoch, () => opts.quiesce(paths)) : await opts.quiesce(paths)))
+                return refused("not_quiescent", ["writers_not_proven_gone"]);
+              // A latch that landed during the caller's quiescence, or at any later point, keeps the
+              // remaining sources and every record: nothing further is deleted or retired.
+              const stopped = (): RetainedDiscardResult => {
+                epoch?.scope.stop();
+                return { kind: "unknown", sources: outcomes, metadata };
+              };
+              if (residueQuarantine() !== undefined) return stopped();
+              const releasedPlan = restoreExit?.composite?.kind === "released" ? restoreExit.composite : undefined;
+              if (releasedPlan) {
+                const again = await this.resolveExitJournal(bare, rec.branch).catch(() => undefined);
+                if (!again || !this.sameReleased(again, releasedPlan)) return refused("restore_state_changed", ["restore_state_changed"]);
+              }
+              // issue #3404 M2 U5: the operator-discard takeover of the authority slots comes LAST, after every refusal
+              // above (protected-source checks, quiescence, latch) and immediately before the first delete. A refused
+              // discard therefore rewrites no durable authority, and a crashed worker's foreign `active` epoch keeps
+              // guarding a source this discard never touched. A refusal here (a running pending record, ...) deletes nothing.
+              try { for (const p of rec.parts) { await this.admitSource(p.clonePath, "discard"); tookOver = true; } }
+              catch { return refused("source_use_refused", ["authority"]); }
+              if (epoch) {
+                this.checkEpochDiscardLive(epoch);
+                const parent = path.dirname(epoch.paths[0]!);
+                const bound = epochParent!;
+                if (!bound.isDirectory() || bound.isSymbolicLink()) throw new Error("epoch parent unsafe");
+                const context = this.epochNative.getStore()!;
+                context.beforeLaunch = async () => {
+                  const want = typeof epoch.expectedRawJournal === "string" ? [epoch.expectedRawJournal] : epoch.expectedRawJournal;
+                  if (JSON.stringify(await this.epochJournalVector(bare, rec.branch)) !== JSON.stringify(want))
+                    throw new Error("epoch journal changed before launch");
+                  this.checkEpochDiscardLive(epoch);
+                  const current = lstatSync(parent);
+                  if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== bound.dev || current.ino !== bound.ino)
+                    throw new Error("epoch parent changed before launch");
+                };
+                epochWork = epoch.scope.beginMutation();
+              }
+              for (const [i, p] of rec.parts.entries()) {
+                if (epoch) this.checkEpochDiscardLive(epoch);
+                if (epoch && p.ledgerState === "retired") { outcomes[i]!.outcome = "missing"; continue; }
+                this.checkRecoveryInterruption();
+                if (residueQuarantine() !== undefined) return stopped();
+                const parent = path.dirname(p.clonePath);
+                const base = path.basename(p.clonePath);
+                const skills = `.uzi-skills-${base}`;
+                try {
+                  // The skills sibling first (see deleteRetainedArtifact): a failed clone delete then
+                  // orphans nothing.
+                  if (!(await this.deleteRetainedArtifact(parent, path.join(parent, skills), (n) => n === skills, epoch ? { strictValidation: true } : {}))) {
+                    outcomes[i]!.outcome = "retained";
+                    continue;
+                  }
+                  // A latch that landed during the skills delete keeps the clone itself.
+                  if (residueQuarantine() !== undefined) return stopped();
+                  if (!(await this.deleteRetainedArtifact(parent, p.clonePath, (n) => n === base, epoch ? { strictValidation: true } : {}))) {
+                    outcomes[i]!.outcome = "retained";
+                    continue;
+                  }
+                } catch (err) {
+                  if (epoch) {
+                    if ((err as { epochDeleteJoined?: boolean }).epochDeleteJoined === true &&
+                        !epoch.scope.stopped() && this.unsettledDeletes.size === 0) {
+                      outcomes[i]!.outcome = "retained";
+                      continue;
+                    }
+                    throw err;
+                  }
+                  outcomes[i]!.outcome = "unknown";
+                  this.log.warn("retained source delete could not be settled; it and its records are kept", { clone: p.clonePath, error: gitErrorMessage(err) });
+                  break;
+                }
+                const after = await this.clonePresence(p.clonePath);
+                outcomes[i]!.outcome = after.presence !== "missing" ? "unknown" : p.presence === "missing" ? "missing" : "removed";
+              }
+              if (!outcomes.every((o) => o.outcome === "removed" || o.outcome === "missing")) {
+                if (epoch) {
+                  this.checkEpochDiscardLive(epoch);
+                  if (outcomes.some(o => o.outcome === "unknown") || this.unsettledDeletes.size ||
+                      epoch.scope.pendingMutations !== 1) return stopped();
+                  epochWork!.settle();
+                }
+                return { kind: "incomplete", sources: outcomes, metadata };
+              }
               this.checkRecoveryInterruption();
               if (residueQuarantine() !== undefined) return stopped();
-              const parent = path.dirname(p.clonePath);
-              const base = path.basename(p.clonePath);
-              const skills = `.uzi-skills-${base}`;
-              try {
-                // The skills sibling first (see deleteRetainedArtifact): a failed clone delete then
-                // orphans nothing.
-                if (!(await this.deleteRetainedArtifact(parent, path.join(parent, skills), (n) => n === skills))) {
-                  outcomes[i]!.outcome = "retained";
-                  continue;
-                }
-                // A latch that landed during the skills delete keeps the clone itself.
-                if (residueQuarantine() !== undefined) return stopped();
-                if (!(await this.deleteRetainedArtifact(parent, p.clonePath, (n) => n === base))) {
-                  outcomes[i]!.outcome = "retained";
-                  continue;
-                }
-              } catch (err) {
-                outcomes[i]!.outcome = "unknown";
-                this.log.warn("retained source delete could not be settled; it and its records are kept", { clone: p.clonePath, error: gitErrorMessage(err) });
-                break;
-              }
-              const after = await this.clonePresence(p.clonePath);
-              outcomes[i]!.outcome = after.presence !== "missing" ? "unknown" : p.presence === "missing" ? "missing" : "removed";
-            }
-            if (!outcomes.every((o) => o.outcome === "removed" || o.outcome === "missing")) {
-              return { kind: "incomplete", sources: outcomes, metadata };
-            }
-            this.checkRecoveryInterruption();
-            if (residueQuarantine() !== undefined) return stopped();
-            // Every path is gone; retire the metadata inside the same critical section.
-            if (restoreExit) {
-              await this.finishRestoreExit(bare, rec, restoreExit, opts.removeRetainedHomeMarker, () => { metadata = "retired"; });
-            } else if (rec.kind === "protected") {
-              const journal = rec.journal!;
-              await this.discardRetainedRecoveryUnderLock(bare, rec.branch, rec.key,
-                recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
-                  ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) }), snapshot);
-            } else if (rec.kind === "canonical") {
-              // Only a journal that names exactly this source (bound) is cleared, and only while its
-              // raw is unchanged; a detached marker never touches a successor's journal.
-              if (rec.markerState === "bound" && (await this.readRecoveryCaptureRaw(bare, rec.branch)) === rec.activeRaw) {
-                await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
-              } else if (rec.markerState === "none") {
-                // A plain-journal source: clear the journal only while its raw is unchanged AND it
-                // still names exactly this (runId, clonePath) plain canonical source.
-                const raw = await this.readRecoveryCaptureRaw(bare, rec.branch);
-                if (raw !== undefined && raw === rec.activeRaw) {
-                  let still = false;
-                  try {
-                    const j = parseRecoveryJournal(raw);
-                    still = j.attemptId === undefined && !j.recovery && !j.retainedSources?.length &&
-                      sameRecoverySource(j, { runId: rec.runId, clonePath: rec.parts[0]!.clonePath });
-                  } catch {
-                    still = false;
+              if (epoch) {
+                await this.settleEpochMetadata(epoch, rec, epochSnapshot!, () => {
+                  this.checkEpochDiscardLive(epoch);
+                  if (epoch.paths.some(p => opts.isLivePath(p))) throw new Error("epoch source became live");
+                  const current = lstatSync(path.dirname(epoch.paths[0]!));
+                  if (!current.isDirectory() || current.isSymbolicLink() ||
+                      current.dev !== epochParent!.dev || current.ino !== epochParent!.ino)
+                    throw new Error("epoch settled parent identity changed");
+                  for (const target of paths) {
+                    try { lstatSync(target); }
+                    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+                    throw new Error("epoch settled footprint reappeared");
                   }
-                  if (still) await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
+                });
+                epochWork!.settle();
+                metadata = "retired";
+                return { kind: "done", sources: outcomes, metadata };
+              }
+              // Every path is gone; retain each route's own metadata settlement and source authority.
+              if (restoreExit) {
+                await this.finishRestoreExit(bare, rec, restoreExit, opts.removeRetainedHomeMarker, () => { metadata = "retired"; });
+              } else if (rec.kind === "protected") {
+                const journal = rec.journal!;
+                await this.discardRetainedRecoveryUnderLock(bare, rec.branch, rec.key,
+                  recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
+                    ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) }), snapshot);
+              } else if (rec.kind === "canonical") {
+                // Only a journal that names exactly this source (bound) is cleared, and only while its
+                // raw is unchanged; a detached marker never touches a successor's journal.
+                if (rec.markerState === "bound" && (await this.readRecoveryCaptureRaw(bare, rec.branch)) === rec.activeRaw) {
+                  await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
+                } else if (rec.markerState === "none") {
+                  // A plain-journal source: clear the journal only while its raw is unchanged AND it
+                  // still names exactly this (runId, clonePath) plain canonical source.
+                  const raw = await this.readRecoveryCaptureRaw(bare, rec.branch);
+                  if (raw !== undefined && raw === rec.activeRaw) {
+                    let still = false;
+                    try {
+                      const j = parseRecoveryJournal(raw);
+                      still = j.attemptId === undefined && !j.recovery && !j.retainedSources?.length &&
+                        sameRecoverySource(j, { runId: rec.runId, clonePath: rec.parts[0]!.clonePath });
+                    } catch {
+                      still = false;
+                    }
+                    if (still) await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
+                  }
                 }
               }
-            }
-            for (const p of restoreExit ? [] : rec.parts) {
-              if (p.attemptId !== undefined && p.ledgerState !== "none" && p.ledgerState !== "retired") {
-                await this.appendAttemptLedger(bare, g.ledger.get(p.attemptId)?.branch ?? rec.branch,
-                  { attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
-              }
-            }
-            if (rec.kind === "canonical" && rec.markerState !== "none") {
-              const target = rec.parts[0]!.clonePath;
-              // The exact marker value, or one whose PARSED path is exactly this source's; a malformed
-              // value is never matched by text (a path that is a prefix of another is not a match).
-              await this.removeStoppedMarkers(bare, rec.runId, (raw) => {
-                if (raw === rec.markerRaw) return true;
-                try {
-                  return (JSON.parse(raw) as { clonePath?: unknown } | null)?.clonePath === target;
-                } catch {
-                  return false;
+              for (const p of restoreExit ? [] : rec.parts) {
+                if (p.attemptId !== undefined && p.ledgerState !== "none" && p.ledgerState !== "retired") {
+                  await this.appendAttemptLedger(bare, g.ledger.get(p.attemptId)?.branch ?? rec.branch,
+                    { attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
                 }
-              });
-            }
-            metadata = "retired";
-            return { kind: "done", sources: outcomes, metadata, ...(restoreExit?.kind === "predecessor" && releasedPlan?.holding !== undefined ? { holding: releasedPlan.holding } : {}) };
+              }
+              if (rec.kind === "canonical" && rec.markerState !== "none") {
+                const target = rec.parts[0]!.clonePath;
+                // The exact marker value, or one whose PARSED path is exactly this source's; a malformed
+                // value is never matched by text (a path that is a prefix of another is not a match).
+                await this.removeStoppedMarkers(bare, rec.runId, (raw) => {
+                  if (raw === rec.markerRaw) return true;
+                  try {
+                    return (JSON.parse(raw) as { clonePath?: unknown } | null)?.clonePath === target;
+                  } catch {
+                    return false;
+                  }
+                });
+              }
+              metadata = "retired";
+              return { kind: "done", sources: outcomes, metadata,
+                ...(restoreExit?.kind === "predecessor" && releasedPlan?.holding !== undefined ? { holding: releasedPlan.holding } : {}) };
+            });
           });
-        });
-    } catch (err) {
-      this.log.warn("retained source discard was interrupted; whatever is not proven gone stays", { error: gitErrorMessage(err) });
-      return { kind: "unknown", sources: outcomes.map((o) => (o.outcome === "removed" || o.outcome === "missing" ? o : { ...o, outcome: o.outcome === "unknown" ? "unknown" : "retained" })), metadata };
+      } catch (err) {
+        epoch?.scope.stop();
+        this.log.warn("retained source discard was interrupted; whatever is not proven gone stays", { error: gitErrorMessage(err) });
+        return { kind: "unknown", sources: outcomes.map((o) => (o.outcome === "removed" || o.outcome === "missing" ? o : { ...o, outcome: o.outcome === "unknown" ? "unknown" : "retained" })), metadata };
+      }
+    };
+    if (!epoch) return execute();
+    return this.epochRetained.run(this.epochLimits(), () => this.withEpochNativeReads(proof!, async () => {
+      const result = await execute();
+      return tookOver ? { ...result, tookOver: true as const } : result;
+    }));
+  }
+
+  /**
+   * Worker epoch reclaim only: the exact valued/valueless raw journal vector for `branch`, read WITHOUT the bare
+   * lock (the discard re-verifies it under the lock, so this is a pre-proof observation, never an authority). A
+   * no-key journal is `[]`, a valueless key is `[null]`, an emptied journal is `[""]`.
+   */
+  readEpochJournalVector(bare: string, branch: string): Promise<Array<string | null>> {
+    return this.epochJournalVector(bare, branch);
+  }
+
+  /** Exact valued/valueless journal vector; unlike readRecoveryCaptureRaw this preserves empty keys. */
+  private async epochJournalVector(bare: string, branch: string): Promise<Array<string | null>> {
+    const key = recoveryCaptureKey(branch);
+    const values: Array<string | null> = [];
+    for (const item of (await this.runGit(bare, ["config", "--local", "--null", "--list"])).split("\0")) {
+      const nl = item.indexOf("\n");
+      if ((nl < 0 ? item : item.slice(0, nl)) === key) values.push(nl < 0 ? null : item.slice(nl + 1));
     }
+    return values;
+  }
+
+  private epochRetirementAttribution(rec: GatheredRecord, snapshot: Array<[string, string]>): boolean {
+    const p = rec.parts[0]!;
+    if (!p.attemptId) return rec.kind === "canonical";
+    const canonical = attemptLedgerValue({ attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
+    const own = snapshot.filter(([, raw]) => parseAttemptLedgerEntry(raw)?.attemptId === p.attemptId);
+    const last = own.at(-1);
+    if (!last || last[0] !== rec.branch || !sameRecoverySource(parseAttemptLedgerEntry(last[1])!,
+      { runId: rec.runId, clonePath: p.clonePath, attemptId: p.attemptId })) return false;
+    const retired = own.filter(([, raw]) => parseAttemptLedgerEntry(raw)?.state === "retired");
+    return retired.length === 0 || retired.length === 1 && retired[0] === last && last[1] === canonical;
+  }
+
+  /** One bounded metadata transaction under B. A failed await leaves the EX ticket pending. */
+  private async settleEpochMetadata(epoch: EpochDiscardProofState, rec: GatheredRecord,
+    snapshot: Array<[string, string]>, checkSource: () => void): Promise<void> {
+    const ticket = epoch.scope.beginMutation();
+    const step = async (name: string) => { await this.epochSettlementFault?.(name); this.checkEpochDiscardLive(epoch); };
+    const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    const journal = typeof epoch.expectedRawJournal === "string" ? [epoch.expectedRawJournal] : [...epoch.expectedRawJournal];
+    const expected = [...snapshot];
+    const p = rec.parts[0]!;
+    const mutate = async (args: string[]) => {
+      this.checkEpochDiscardLive(epoch);
+      const context = this.epochNative.getStore()!;
+      await this.epochNative.run({ ...context, configMutation: args }, () => this.runGit(epoch.barePath, args));
+    };
+    const verify = async (want: readonly (string | null)[]) => {
+      await step("rawverify");
+      checkSource();
+      if (rec.epochRetiredEmptyJournal) {
+        checkSource();
+        if (!await this.epochMissingFootprint(rec)) throw new Error("epoch pair footprint changed");
+        const fresh = await this.gatherRetainedUnderLock(epoch.barePath);
+        const matches = fresh.records.filter(r => this.matchesRetainedSelector(r, epoch.selector));
+        if (matches.length !== 1 || !matches[0]!.epochRetiredEmptyJournal || matches[0]!.digest !== rec.digest)
+          throw new Error("epoch pair attribution changed");
+      }
+      if (!equal(await this.readAllAttemptLedgerRaw(epoch.barePath), expected) ||
+          !equal(await this.epochJournalVector(epoch.barePath, rec.branch), want)) throw new Error("epoch metadata raw mismatch");
+      checkSource();
+    };
+    const barrier = async (boundary: string, want: readonly (string | null)[]) => {
+      await step(boundary + ":before");
+      await this.syncConfigAndVerify(epoch.barePath, async () => {
+        await step(boundary + ":before-rawverify");
+        await verify(want);
+        await step(boundary + ":after-rawverify");
+      }, {}, name => step(boundary + ":" + name));
+      await step(boundary + ":after");
+    };
+    try {
+      await verify(journal);
+      if (p.attemptId !== undefined) {
+        const value = attemptLedgerValue({ attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
+        const entries = snapshot.filter(([, raw]) => parseAttemptLedgerEntry(raw)?.attemptId === p.attemptId);
+        const last = entries.at(-1);
+        const retired = entries.filter(([, raw]) => parseAttemptLedgerEntry(raw)?.state === "retired");
+        if (retired.length && (retired.length !== 1 || last?.[0] !== rec.branch || last[1] !== value || retired[0] !== last))
+          throw new Error("conflicting epoch retired evidence");
+        if (!retired.length) {
+          if (!last || last[0] !== rec.branch || !sameRecoverySource(parseAttemptLedgerEntry(last[1])!,
+            { runId: rec.runId, clonePath: p.clonePath, attemptId: p.attemptId })) throw new Error("epoch ledger attribution changed");
+          await step("before-retiredappend");
+          await mutate(["config", "--local", "--add", attemptLedgerKey(rec.branch), value]);
+          let index = expected.length;
+          for (let i = expected.length - 1; i >= 0; i--) if (expected[i]![0] === rec.branch) { index = i + 1; break; }
+          expected.splice(index, 0, [rec.branch, value]);
+          await step("after-retiredappend");
+        }
+      }
+      await barrier("retired", journal);
+      this.checkEpochDiscardLive(epoch);
+      checkSource();
+      for (const target of [p.clonePath, path.join(path.dirname(p.clonePath), `.uzi-skills-${path.basename(p.clonePath)}`)]) {
+        if ((await this.clonePresence(target)).presence !== "missing") throw new Error("epoch footprint reappeared");
+      }
+      await verify(journal);
+      if (typeof epoch.expectedRawJournal === "string") {
+        await step("before-clear");
+        await mutate(["config", "--local", recoveryCaptureKey(rec.branch), ""]);
+        await step("after-clear");
+        await barrier("clear", [""]);
+      }
+      if (rec.epochRetiredEmptyJournal) await barrier("clear", [""]);
+      await verify(typeof epoch.expectedRawJournal === "string" ? [""] : journal);
+      this.checkEpochDiscardLive(epoch);
+      checkSource();
+      ticket.settle();
+    } catch (error) { epoch.scope.stop(); throw error; }
   }
 
   /**
@@ -13346,7 +16327,8 @@ export class GitCache {
    * retireRunnerClone after a VERIFIED capture (`state` `abandoned`: its work is in the tracking ref,
    * and automatic retention keeps it), and for a terminal FOREIGN owner's attempt in
    * the orphan reclaim, which captures nothing (`state` `reclaimed`: retained forever, never
-   * disposable — see attemptLedgerKey). Under the bare lock it re-validates that the journal still
+   * disposed of by an automatic path, the verified-epoch disposal included; only an operator discard
+   * (#1786) can — see attemptLedgerKey). Under the bare lock it re-validates that the journal still
    * names this exact (runId, clonePath) and refuses otherwise (nothing written), appends the ledger
    * state, and only THEN clears the journal (the caller calls this only once any capture is
    * verified — the #1197 rule). The ledger goes first so the journal never stops protecting a path
@@ -20731,21 +23713,28 @@ try {
     return output;
   }
 
-  private checkEpochMetadata(args: string[], stdout: string): void {
+  private checkEpochMetadata(args: string[], stdout: string, stderr = ""): void {
     const limits = this.epochRetained.getStore();
     if (!limits) return;
     this.checkRecoveryInterruption();
-    if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw this.retainedCause(new Error("epoch metadata byte limit"), "metadata_byte_cap");
+    const overflow = (message: string, suffix: "metadata_byte_cap" | "metadata_record_cap"): Error => {
+      const error = this.retainedCause(new Error(message), suffix);
+      // A child that wrote any stderr is not a settled limit: callers read stderr as a skipped-item signal
+      // (for-each-ref warnings), and this throw happens before they can see it.
+      if (stderr === "") BOUND_OVERFLOW_ERRORS.add(error);
+      return error;
+    };
+    if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw overflow("epoch metadata byte limit", "metadata_byte_cap");
     const config = args.includes("config") && (args.includes("--list") || args.includes("--get-regexp"));
     const refs = args.includes("for-each-ref") || args.includes("show-ref");
     if (!config && !refs) return;
     const separator = config && (args.includes("--null") || args.includes("-z")) ? "\0" : "\n";
     let count = 0;
     for (let i = 0; i < stdout.length; i++) {
-      if (stdout[i] === separator && ++count > limits.maxMetadataRecords) throw this.retainedCause(new Error("epoch metadata record limit"), "metadata_record_cap");
+      if (stdout[i] === separator && ++count > limits.maxMetadataRecords) throw overflow("epoch metadata record limit", "metadata_record_cap");
     }
     if (stdout.length && !stdout.endsWith(separator) && ++count > limits.maxMetadataRecords)
-      throw this.retainedCause(new Error("epoch metadata record limit"), "metadata_record_cap");
+      throw overflow("epoch metadata record limit", "metadata_record_cap");
     if (config && separator === "\0" && args.includes("--list")) {
       let start = 0;
       let sources = 0;
@@ -20771,7 +23760,8 @@ try {
   private async execScoped(
     command: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer; bytes?: true },
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer;
+      bytes?: true; encoding?: "latin1" },
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
   ): Promise<{ stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer }> {
     const boundary = this.boundaryProcesses.getStore();
@@ -20786,13 +23776,18 @@ try {
     const operationSignal = operationSignals.length ? AbortSignal.any(operationSignals) : undefined;
     if (recovery) options = { ...options, timeout: Math.min(options.timeout ?? Infinity, this.recoveryRemaining(recovery)) };
     const { input, bytes: wantBytes, ...execOptions } = options;
+    if (this.epochNative.getStore()) {
+      const result = await this.execEpochNative(command === "git" ? GIT_BIN : command, args, options, identity, operationSignal);
+      this.checkEpochMetadata(args, result.stdout, result.stderr);
+      return result;
+    }
     if (!boundary) {
       // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
       // before the child is created (nothing awaits between this and execFileAsync).
       assertNoCredentialedGitWhileQuarantined(options.env);
       if (MaintenanceResources.active()) {
         const result = await this.execMeteredNative(command, args, options, operationSignal);
-        this.checkEpochMetadata(args, result.stdout);
+        this.checkEpochMetadata(args, result.stdout, String(result.stderr ?? ""));
         return result;
       }
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
@@ -20814,7 +23809,7 @@ try {
         const result = await pending;
         this.checkRecoveryInterruption();
         const stdout = String(result.stdout);
-        this.checkEpochMetadata(args, stdout);
+        this.checkEpochMetadata(args, stdout, String(result.stderr));
         return { stdout, stderr: String(result.stderr),
           ...(wantBytes ? { stdoutBytes: Buffer.from(result.stdout), stderrBytes: Buffer.from(result.stderr) } : {}) };
       } catch (error) {
@@ -20972,7 +23967,7 @@ try {
     if (settled[1].status === "rejected") throw this.boundaryAbortError(settled[1].reason) ?? settled[1].reason;
     stdout = settled[0].value;
     stderr = settled[1].value;
-    const out = Buffer.concat(stdout.chunks).toString();
+    const out = Buffer.concat(stdout.chunks).toString(options.encoding);
     const err = Buffer.concat(stderr.chunks).toString();
     if (stdout.oversized || stderr.oversized || terminal.code !== 0) {
       const failure = new Error(
@@ -20991,7 +23986,7 @@ try {
       failure.stderr = err;
       throw failure;
     }
-    this.checkEpochMetadata(args, out);
+    this.checkEpochMetadata(args, out, err);
     return { stdout: out, stderr: err,
       ...(wantBytes ? { stdoutBytes: Buffer.concat(stdout.chunks), stderrBytes: Buffer.concat(stderr.chunks) } : {}) };
   }
@@ -21121,18 +24116,27 @@ try {
     this.assertCaptureDecoration(extraEnv);
     const env = { ...gitEnv(), ...extraEnv };
     this.log.debug("git (env)", { cwd, args });
+    const quietVerify = this.epochNative.getStore() !== undefined && args.length === 3 &&
+      args[0] === "verify-pack" && args[1] === "--";
     try {
-      const { stdout } = await this.execScoped("git", withDir(cwd, [...args]), {
+      const { stdout, stderr } = await this.execScoped("git", withDir(cwd, [...args]), {
         env,
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
       });
+      if (quietVerify && (stdout !== "" || stderr !== ""))
+        throw new AutomaticCompletenessUnknown("quiet pack verification emitted output");
       return stdout;
     } catch (err) {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
+      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
+      // The wrapper drops the overflow facts; carry a positively identified stdout overflow to isBoundOverflow,
+      // except when the child wrote stderr (a skipped-item signal) or the call is a quiet pack verification
+      // (any output is UNKNOWN there).
+      if (isBoundOverflow(err) && !hasChildStderr(err) && !quietVerify) BOUND_OVERFLOW_ERRORS.add(failure);
+      throw failure;
     }
   }
 
@@ -21516,20 +24520,32 @@ try {
    * benign keys (e.g. GIT_NO_REPLACE_OBJECTS) and never GIT_CONFIG_* or any other
    * security-relevant key.
    */
-  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string } = {}): Promise<string> {
+  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string | Buffer; encoding?: "latin1"; onStderr?: (stderr: string) => void } = {}): Promise<string> {
     const { env, wrapped } = this.runnerGitInvocation(cwd, args, opts.env);
     this.log.debug("git (runner uid)", { cwd, args });
+    let result: { stdout: string; stderr: string };
     try {
-      const { stdout } = await this.execScoped(wrapped.command, wrapped.args, {
+      result = await this.execScoped(wrapped.command, wrapped.args, {
         env,
         timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
         ...(opts.input !== undefined ? { input: opts.input } : {}),
+        ...(opts.encoding !== undefined ? { encoding: opts.encoding } : {}),
       }, "command");
-      return stdout;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      // A joined Git child may warn on stderr and then exit nonzero. The epoch
+      // refs reader must see that warning before the generic failure wrapper.
+      const stderr = (err as { stderr?: unknown } | null)?.stderr;
+      if (typeof stderr === "string") opts.onStderr?.(stderr);
+      else if (Buffer.isBuffer(stderr)) opts.onStderr?.(stderr.toString());
       throw this.runnerGitFailure(err, args);
     }
+    // Keep caller classification outside the Git-failure catch. A successful
+    // for-each-ref can still warn that it skipped a broken ref.
+    opts.onStderr?.(result.stderr);
+    return result.stdout;
   }
 
   /**
@@ -21591,7 +24607,7 @@ try {
     // cap-less uid would fail (and would try to cross identities twice).
     const wrapped = this.boundaryProcesses.getStore()
       ? { command: GIT_BIN, args: withDir(cwd, args) }
-      : runnerCommand("git", withDir(cwd, args));
+      : runnerCommand(this.epochNative.getStore() ? GIT_BIN : "git", withDir(cwd, args));
     return { env, wrapped };
   }
 
@@ -21602,6 +24618,7 @@ try {
     // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
     // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
     const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+    if (isBoundOverflow(err) && !hasChildStderr(err)) BOUND_OVERFLOW_ERRORS.add(failure);
     const code = (err as { code?: unknown }).code;
     if (typeof code === "number") (failure as { code?: number }).code = code;
     return failure;
@@ -21875,34 +24892,41 @@ try {
     return false;
   }
 
-  /** Canonical caches do not borrow object stores. Git 2.56 initializes alternates
-   * even for metadata probes, so refuse controls without opening or following them. */
-  private async assertCanonicalAlternatesAbsent(barePath: string): Promise<void> {
+  /** Ordinary canonical-cache callers refuse alternate controls without following
+   * them. An explicit automatic reader requires an already completed store observation;
+   * this does not authorize deletion or change the ordinary caller contract. */
+  private async assertCanonicalAlternatesAbsent(barePath: string, automatic?: AutomaticPreservation): Promise<void> {
     for (const name of ["alternates", "http-alternates"]) {
       try {
-        await this.retainedIO(() => fs.lstat(path.join(barePath, "objects", "info", name)));
+        await this.automaticPreservationRead(automatic, () => this.retainedIO(() => fs.lstat(path.join(barePath, "objects", "info", name))));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
+      }
+      if (automatic) {
+        if (name !== "alternates" || !automatic.objectCoverage || !automatic.finalStoreCheck)
+          throw new AutomaticCompletenessUnknown("bare alternate precondition not established");
+        await automatic.finalStoreCheck();
+        continue;
       }
       throw new Error("maintenance_source_layout_unsupported");
     }
   }
 
   /** Worker-only directories are the ownership root; runner-provided Git config is not. */
-  private async assertOwedBare(barePath: string, readOptions?: BoundedReadOptions): Promise<void> {
+  private async assertOwedBare(barePath: string, readOptions?: BoundedReadOptions, automatic?: AutomaticPreservation): Promise<void> {
     const root = path.resolve(this.reposRoot);
     if (typeof barePath !== "string" || path.dirname(barePath) !== root || path.resolve(barePath) !== barePath) {
       throw new Error("owed candidates require a known worker bare path");
     }
     for (const dir of [root, barePath]) {
-      const st = await this.retainedIO(() => fs.lstat(dir));
+      const st = await this.automaticPreservationRead(automatic, () => this.retainedIO(() => fs.lstat(dir)));
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() ||
           (st.mode & 0o002) !== 0 ||
           ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() ||
             (uidSplitActive() && st.gid === RUNNER_UID)))) throw new Error("unsafe worker bare directory");
     }
-    await this.assertCanonicalAlternatesAbsent(barePath);
+    await this.assertCanonicalAlternatesAbsent(barePath, automatic);
     const args = ["rev-parse", "--is-bare-repository"];
     const read = readOptions ? await this.readBare(barePath, args, readOptions) : undefined;
     if (read?.truncated || (read ? read.text : await this.runGit(barePath, args)).trim() !== "true") {
@@ -22092,7 +25116,7 @@ try {
   }
 
   private async validateOwedContext(barePath: string, branch: string, c: StoredOwedContext,
-    historical = false, stored = false): Promise<void> {
+    historical = false, stored = false, automatic?: AutomaticPreservation): Promise<void> {
     const raw = c as unknown as Record<string, unknown>;
     const isHistorical = raw?.origin === "historical";
     const expectedKeys = isHistorical
@@ -22115,10 +25139,10 @@ try {
           !c.defaultIdentity.ref.startsWith("refs/") || typeof c.defaultIdentity.sha !== "string" || !OWED_OID.test(c.defaultIdentity.sha)))) {
       throw new Error("invalid owed candidate context");
     }
-    await this.assertOwedBare(barePath);
-    if (!(await this.isPlainBranchName(barePath, branch))) throw new Error("invalid owed branch");
+    await this.automaticPreservationRead(automatic, () => this.assertOwedBare(barePath, undefined, automatic));
+    if (!(await this.automaticPreservationRead(automatic, () => this.isPlainBranchName(barePath, branch)))) throw new Error("invalid owed branch");
     if (c.defaultIdentity) {
-      await this.runGit(barePath, ["check-ref-format", c.defaultIdentity.ref]);
+      await this.automaticPreservationRead(automatic, () => this.runGit(barePath, ["check-ref-format", c.defaultIdentity!.ref]));
       if (!stored) {
         const name = this.contextName(c);
         const record = await this.readOwedFile(barePath, name);
@@ -22176,10 +25200,15 @@ try {
   }
 
   /** ENOENT alone means absent. Bounded regular-file no-follow read, worker ownership required. */
-  private async readOwedFile(barePath: string, name: string, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<unknown | undefined> {
+  private async readOwedFile(barePath: string, name: string, directoryName: LocalMetadataDirectory = "uzi-owed",
+    automatic?: AutomaticPreservation): Promise<unknown | undefined> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    const cap = automatic ? Math.min(65536, this.epochRetained.getStore()!.maxMetadataBytes -
+      (automatic.owedBytes ?? 0)) : 65536;
+    if (cap < 1) throw new Error("automatic owed byte limit");
     const dir = this.owedDirectory(barePath, directoryName);
     try {
-      const st = await fs.lstat(dir);
+      const st = await read(() => fs.lstat(dir));
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
         throw new Error("unsafe owed metadata directory");
       }
@@ -22187,39 +25216,45 @@ try {
       if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw cause;
     }
-    let file: import("node:fs/promises").FileHandle;
+    let file: import("node:fs/promises").FileHandle | undefined;
     try {
-      file = await fs.open(path.join(dir, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
-    } catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      throw cause;
-    }
-    try {
-      const st = await file.stat();
-      if (!st.isFile() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0 || st.size > 65536) {
+      try {
+        await read(async () => { file = await fs.open(path.join(dir, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); });
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw cause;
+      }
+      const opened = file!;
+      const st = await read(() => opened.stat());
+      if (!st.isFile() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0 || st.size > cap) {
         throw new Error("unsafe owed metadata file");
       }
-      const before = await file.stat({ bigint: true });
-      const buf = Buffer.alloc(65537);
+      const before = await read(() => opened.stat({ bigint: true }));
+      const buf = Buffer.alloc(cap + 1);
       let length = 0;
       // At most cap+1 nonempty reads; only complete EOF permits JSON parsing.
       while (length < buf.length) {
         this.checkReportProof();
-        const { bytesRead } = await file.read(buf, length, buf.length - length, null);
+        const { bytesRead } = await read(() => opened.read(buf, length, buf.length - length, null));
         if (!bytesRead) break;
         MaintenanceResources.consumeIfActive("metadataBytes", bytesRead);
         length += bytesRead;
+        if (automatic) {
+          automatic.owedBytes = (automatic.owedBytes ?? 0) + bytesRead;
+          if (automatic.owedBytes > this.epochRetained.getStore()!.maxMetadataBytes)
+            throw new Error("automatic owed byte limit");
+        }
         const budget = this.reportProofs.getStore();
         if (budget && (budget.owedBytes += bytesRead) > 32 * 1024 * 1024) throw new Error("owed byte budget");
       }
-      if (length > 65536) throw new Error("oversized owed metadata");
-      const after = await file.stat({ bigint: true });
-      const named = await fs.lstat(path.join(dir, name), { bigint: true });
+      if (length > cap) throw new Error("oversized owed metadata");
+      const after = await read(() => opened.stat({ bigint: true }));
+      const named = await read(() => fs.lstat(path.join(dir, name), { bigint: true }));
       if (before.dev !== named.dev || before.ino !== named.ino || named.isSymbolicLink() ||
           before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
           before.mtimeNs !== named.mtimeNs || before.ctimeNs !== named.ctimeNs) throw new Error("owed metadata changed");
       return JSON.parse(buf.toString("utf8", 0, length)) as unknown;
-    } finally { await file.close(); }
+    } finally { if (file) await this.automaticPreservationClose(automatic, () => file!.close()); }
   }
 
   /** Temp is exclusive/no-follow, synced before rename; rename and directory sync precede readback. */
@@ -22277,7 +25312,7 @@ try {
     await this.writeOwedFile(c.barePath, name, record);
   }
 
-  private async parseOwedContext(barePath: string, value: unknown): Promise<StoredOwedContext> {
+  private async parseOwedContext(barePath: string, value: unknown, automatic?: AutomaticPreservation): Promise<StoredOwedContext> {
     const v = value as StoredOwedContext & { version?: unknown };
     const keys = v && Object.keys(v).sort().join(",");
     const expected = v && "origin" in v
@@ -22290,7 +25325,7 @@ try {
       throw new Error("invalid owed context record");
     }
     const { version: _version, ...c } = v;
-    await this.validateOwedContext(barePath, c.branch, c, true, true);
+    await this.validateOwedContext(barePath, c.branch, c, true, true, automatic);
     return c;
   }
 
@@ -22659,30 +25694,39 @@ try {
     return this.withLock(barePath, () => this.enumerateOwedUnderLock(barePath, runId));
   }
 
-  private async owedMetadataNames(barePath: string): Promise<string[]> {
+  private async owedMetadataNames(barePath: string, automatic?: AutomaticPreservation): Promise<string[]> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
     const dir = this.owedDirectory(barePath);
+    let observed = false;
     try {
-      const st = await fs.lstat(dir);
+      const st = await read(() => fs.lstat(dir));
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
         throw new Error("unsafe owed discovery directory");
       }
+      observed = true;
       const names: string[] = [];
-      if (this.epochRetained.getStore() || this.reportProofs.getStore() || MaintenanceResources.active()) {
-        const directory = await fs.opendir(dir);
+      if (automatic || this.epochRetained.getStore() || this.reportProofs.getStore() || MaintenanceResources.active()) {
+        let directory: import("node:fs").Dir | undefined;
         try {
+          await read(async () => { directory = await fs.opendir(dir, automatic ? { bufferSize: 1 } : undefined); });
+          const opened = directory!;
           for (;;) {
             this.checkReportProof();
             this.checkRecoveryInterruption();
             MaintenanceResources.checkIfActive();
-            const entry = await this.retainedIO(() => directory.read());
+            const entry = await read(() => this.retainedIO(() => opened.read()));
             if (!entry) break;
             MaintenanceResources.consumeIfActive("adminEntries", 1);
             MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
-            if (names.length >= 1024) throw new Error("owed entry budget");
+            if (automatic) {
+              automatic.owedBytes = (automatic.owedBytes ?? 0) + Buffer.byteLength(entry.name);
+              if (automatic.owedBytes > this.epochRetained.getStore()!.maxMetadataBytes) throw new Error("automatic owed byte limit");
+            }
+            if (names.length >= (automatic ? Math.min(1024, this.epochRetained.getStore()!.maxMetadataRecords) : 1024)) throw new Error("owed entry budget");
             names.push(entry.name);
           }
-        } finally { await directory.close(); }
-        const after = await fs.lstat(dir);
+        } finally { if (directory) await this.automaticPreservationClose(automatic, () => directory!.close()); }
+        const after = await read(() => fs.lstat(dir));
         if (st.dev !== after.dev || st.ino !== after.ino || st.mtimeMs !== after.mtimeMs ||
             st.ctimeMs !== after.ctimeMs) throw new Error("owed directory changed");
       } else names.push(...await fs.readdir(dir));
@@ -22692,7 +25736,7 @@ try {
       }
       return names.sort();
     } catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT" && (!automatic || !observed)) return [];
       throw cause;
     }
   }
@@ -22700,17 +25744,17 @@ try {
   /** Read and validate EVERY owed context and candidate file once. Callers that enumerate several
    *  runs of one bare (boot/live discovery) share one result instead of rereading per run or per
    *  context. Any unreadable or malformed entry throws: nothing here ever skips a bad file. */
-  private async readOwedMetadataUnderLock(barePath: string): Promise<OwedMetadata> {
-    const names = await this.owedMetadataNames(barePath);
+  private async readOwedMetadataUnderLock(barePath: string, automatic?: AutomaticPreservation): Promise<OwedMetadata> {
+    const names = await this.owedMetadataNames(barePath, automatic);
     const contexts = new Map<string, StoredOwedContext>();
     const records: OwedMetadata["records"] = [];
     for (const name of names.filter((n) => n.startsWith("context-"))) {
-      const c = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, name));
+      const c = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, name, "uzi-owed", automatic), automatic);
       if (name !== this.contextName(c)) throw new Error("owed context filename mismatch");
       contexts.set(name, c);
     }
     for (const name of names.filter((n) => n.startsWith("candidate-"))) {
-      const v = await this.readOwedFile(barePath, name) as { version: number; runId: string; context: string; sha: string };
+      const v = await this.readOwedFile(barePath, name, "uzi-owed", automatic) as { version: number; runId: string; context: string; sha: string };
       if (!v || v.version !== 1 || Object.keys(v).sort().join(",") !== "context,runId,sha,version" ||
           typeof v.runId !== "string" || !OWED_RUN_ID.test(v.runId) || typeof v.sha !== "string" || !OWED_OID.test(v.sha) ||
           typeof v.context !== "string" || !/^context-[0-9a-f]{64}\.json$/.test(v.context) ||
@@ -22722,17 +25766,18 @@ try {
     return { names, contexts, records };
   }
 
-  async enumerateOwedUnderLock(barePath: string, runId: string, metadata?: OwedMetadata): Promise<OwedCandidate[]> {
-    const loaded = metadata ?? await this.readOwedMetadataUnderLock(barePath);
+  async enumerateOwedUnderLock(barePath: string, runId: string, metadata?: OwedMetadata, automatic?: AutomaticPreservation): Promise<OwedCandidate[]> {
+    const loaded = metadata ?? await this.readOwedMetadataUnderLock(barePath, automatic);
     const records = loaded.records.filter((r) => r.runId === runId);
-    const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${runId}/`]);
+    const out = await this.automaticPreservationRead(automatic, () => this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${runId}/`]));
+    if (automatic) this.automaticCollection(out, "\n");
     const result: OwedCandidate[] = [];
     MaintenanceResources.consumeMetadataEntriesIfActive(out, "\n");
     for (const line of out.trim().split("\n").filter(Boolean)) {
       const m = /^refs\/uzi-owed\/([^/]+)\/([0-9a-f]{40}) ([0-9a-f]{40})$/.exec(line);
       if (!m || m[1] !== runId || m[2] !== m[3]) throw new Error("malformed owed pin");
       const sha = m[2]!;
-      await this.requireOwedCommit(barePath, sha);
+      await this.automaticPreservationRead(automatic, () => this.requireOwedCommit(barePath, sha));
       const producing = records.filter((r) => r.sha === sha).map((r) => r.c).sort((a, b) =>
         a.generation === null ? (b.generation === null ? this.contextName(a).localeCompare(this.contextName(b)) : -1)
           : b.generation === null ? 1 : a.generation - b.generation || this.contextName(a).localeCompare(this.contextName(b)));
@@ -25375,6 +28420,13 @@ function gitErrorMessage(err: unknown): string {
   const stderr = typeof e.stderr === "string" ? e.stderr.trim() : "";
   if (stderr) return stderr;
   return typeof e.message === "string" ? e.message : String(err);
+}
+
+/** A diagnostic is scrubbed with the logger's live registry before it is shortened.
+ * Missing redaction support or an oversized raw value yields no attacker-supplied text. */
+function boundedGitDiagnostic(log: Logger, raw: string): string {
+  if (raw.length > 4096) return "[diagnostic omitted: oversized]";
+  return sanitizeForLog(log.redactDiagnostic?.(raw) ?? "[diagnostic omitted: redactor unavailable]", 253);
 }
 
 /** issue #1769: the env materializeRunnerClone runs its runner-uid git under — `base` (the

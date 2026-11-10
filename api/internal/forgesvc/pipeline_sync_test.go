@@ -129,6 +129,17 @@ func TestSyncPipelinesNoCISkipsUpsert(t *testing.T) {
 	if len(st.pipelineDeletes[0].KeepRefs) != 0 {
 		t.Fatalf("no-CI default branch must not be kept, keep-set = %v", st.pipelineDeletes[0].KeepRefs)
 	}
+	// The empty keep-set must be non-nil: pgx sends a nil slice as SQL NULL, and
+	// `ref <> ALL(NULL)` evicts nothing, so the stale row would survive.
+	if st.pipelineDeletes[0].KeepRefs == nil {
+		t.Fatal("pipeline eviction keep-set is nil (SQL NULL deletes nothing); want an empty non-nil slice")
+	}
+	if len(st.autofixEvicts) != 1 {
+		t.Fatalf("expected one ci_autofix ledger eviction on the reconcile tick, got %d", len(st.autofixEvicts))
+	}
+	if st.autofixEvicts[0].KeepRefs == nil {
+		t.Fatal("ci_autofix eviction keep-set is nil (SQL NULL deletes nothing); want an empty non-nil slice")
+	}
 }
 
 func TestSyncPipelinesEvictsUnwatchedOnReconcile(t *testing.T) {

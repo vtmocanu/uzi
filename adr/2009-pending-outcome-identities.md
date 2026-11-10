@@ -24,6 +24,9 @@ a group identifies a separately proven positive current owner generation. There
 is no fabricated historical lease or new policy-readiness capability. The API
 does not advertise `provider_policy_hold_v1` readiness.
 
+*Note (2026-11-07): since #3607 M2/M3 the API advertises `provider_policy_hold_v1`;
+the sentence above records the original decision.*
+
 Two-sided negotiation and the locked worker's capability, a freshly applied
 nonce/epoch and worker → ordered parents → frozen targets locks are required in
 the snapshot-carrying claim transaction. Fresh rows must still be owned, unreleased
