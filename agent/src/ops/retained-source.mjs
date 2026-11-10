@@ -9,7 +9,10 @@
 //     discard --run <uuid> --generation <n|none> --attempt <id|canonical> --confirm <digest> [--protected]
 //
 //   ... retained-source.mjs local-records --run <id>
-//   ... retained-source.mjs resolve-local-record --run <id> --generation <n> --confirm <digest>
+//   ... retained-source.mjs resolve-local-record --run <id> --generation <n> --confirm <digest> [--case-b]
+//
+// --case-b (resolve-local-record only, a flag without a value) asks the coordinator for the Case B
+// disposition; it must match the class local-records reported for that generation.
 //
 // It connects to the worker's Unix socket, sends ONE NDJSON request line, prints the response line
 // and exits non-zero on a refusal, an unknown outcome or any error. It has no filesystem logic.
@@ -35,7 +38,7 @@ function usage(message) {
     "usage: retained-source.mjs inspect [--run <id> --generation <n|none> --attempt <id|canonical>] [--socket <path>]\n" +
     "       retained-source.mjs discard --run <id> --generation <n|none> --attempt <id|canonical> --confirm <digest> [--protected] [--socket <path>]\n" +
     "       retained-source.mjs local-records --run <id> [--socket <path>]\n" +
-    "       retained-source.mjs resolve-local-record --run <id> --generation <n> --confirm <digest> [--socket <path>]\n");
+    "       retained-source.mjs resolve-local-record --run <id> --generation <n> --confirm <digest> [--case-b] [--socket <path>]\n");
   process.exit(2);
 }
 
@@ -43,6 +46,11 @@ function parseLocalRecordArgs(op, rest) {
   const flags = {};
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
+    if (arg === "--case-b") {
+      if (op !== "resolve-local-record") usage("--case-b applies to resolve-local-record only");
+      flags.caseB = true;
+      continue;
+    }
     if (!["--run", "--generation", "--confirm", "--socket"].includes(arg)) usage(`unknown argument ${arg}`);
     const value = rest[++i];
     if (value === undefined || value.startsWith("--")) usage(`${arg} needs a value`);
@@ -55,6 +63,7 @@ function parseLocalRecordArgs(op, rest) {
     if (!/^[0-9]+$/.test(flags.generation) || !Number.isSafeInteger(Number(flags.generation)) || Number(flags.generation) < 1) usage("--generation must be a positive integer");
     request.generation = Number(flags.generation);
     request.confirm = flags.confirm;
+    if (flags.caseB) request.action = "case_b";
   } else if (flags.generation !== undefined || flags.confirm !== undefined) {
     usage("--generation and --confirm apply to resolve-local-record only");
   }

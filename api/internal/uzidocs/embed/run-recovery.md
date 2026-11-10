@@ -2338,7 +2338,7 @@ unknown measurement does not mean zero.
 | Disposition | Meaning and next step |
 |---|---|
 | `owner_hold_discard <hold-id>` | A server hold still owns the source. Use `uzi run discard <run-id> --hold <hold-id> --yes`. |
-| `resolve_local_record` | A local recovery, settlement or terminal record still protects the source. A guarded recovery record whose closed hold was released with a receipt matching the saved FINAL request (whether or not its FINAL ACK is already saved) can be resolved with the [local-record commands](#resolving-guarded-local-records) below. A discarded hold (even with an ACK saved), a release without the matching receipt (Case B), settlement and terminal records, and unbound files remain blocked and need owner handling ([#3885](https://github.com/vtmocanu/uzi/issues/3885) stays open for Case B). An empty open-hold list never makes deletion safe. |
+| `resolve_local_record` | A local recovery, settlement or terminal record still protects the source. A guarded recovery record whose closed hold was released with a receipt matching the saved FINAL request (whether or not its FINAL ACK is already saved) can be resolved with the [local-record commands](#resolving-guarded-local-records) below (Case A). A discarded hold, a release without the matching receipt, or a generation with no saved FINAL (Case B) can be resolved only by an explicit `--case-b` request, which retires the local records alone ([Case B](#case-b-operator-confirmed-record-disposition)). An acknowledged generation with a discarded or mismatched hold stays refused (`ack_evidence_inconsistent`), and a merged-predecessor discard stays refused (`policy_discard_retained`). Settlement and terminal records and unbound files remain blocked and need owner handling. An empty open-hold list never makes deletion safe. |
 | `local_discard` / `local_protected_discard` | Nothing else holds the source; it may be discarded with the command below (protected for episode or protected sources). |
 | `refused` | Named consumers still use the source. The output lists them. |
 
@@ -2543,8 +2543,9 @@ above (Compose, single-UID or split-UID), with the subcommand and flags changed:
   local-records --run <run-id>
 
 # 2. Retire one generation, confirming the digest step 1 printed
+#    (add --case-b only for a generation step 1 classified case_b_*)
 /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
-  resolve-local-record --run <run-id> --generation <n> --confirm <digest>
+  resolve-local-record --run <run-id> --generation <n> --confirm <digest> [--case-b]
 
 # 3. Re-inspect the source
 /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
@@ -2555,16 +2556,26 @@ above (Compose, single-UID or split-UID), with the subcommand and flags changed:
    FINAL acknowledgement is already saved and the closed hold was released with the
    matching receipt. `case_a_replay` means the saved FINAL's
    closed hold carries a matching receipt but the local acknowledgement never landed.
-   Both come with a `digest`. Any other value is a named blocker (below), and run-level
+   `case_b_owner_discard` means the hold was discarded with release evidence
+   `owner_discard`; `case_b_released_mismatch` means it was released without a receipt
+   matching the saved FINAL, or no FINAL was saved. Each comes with a `digest`; a Case B
+   entry also prints `action: "case_b"` and `laterCleanup: [{generation, before, after}]`
+   (see [Case B consequences](#case-b-consequences-and-follow-on-disposal)).
+   Any other value is a named blocker (below), and run-level
    blockers (`inventory_incomplete`, `record_unverified`, `generation_missing`) appear in `blockers`.
 2. `resolve-local-record` recomputes the digest under the journal lock and refuses
    `descriptor_changed` if anything drifted. For `case_a_ack` it runs the existing
    local cleanup. For `case_a_replay` it first sends **one** release replay of the
    identical saved request (no replacement request, no new decision, no new upload), then
    the acknowledgement that makes the generation `case_a_ack`, then the same cleanup.
+   For a Case B class it removes the generation's local records and bundles only
+   ([Case B](#case-b-operator-confirmed-record-disposition)). `--case-b` is required for
+   Case B and refused for Case A: a Case B digest without it is
+   `case_b_disposition_required`, and `--case-b` on a Case A generation is
+   `case_b_action_mismatch`. A worker that predates this change answers `invalid_request`.
 3. When inspect then reports `local_protected_discard`, finish with `discard … --protected`
-   as above. Resolution retires only that generation's local recovery refs, bundles and records;
-   it does not discard the retained source.
+   as above. Resolution retires only that generation's local recovery records and bundles
+   (Case A also its refs); it does not discard the retained source.
 
 Outcomes that reach the remember step appear in inspect's `lastDiscards` with attempt
 `local-record`. Admission refusals (`shutting_down`, `busy`, `no_claim_gate`) return before it
@@ -2575,8 +2586,8 @@ record files left for the run), `refused` (nothing was touched) and `partial` (t
 no return was crossed and the end state is not known to be complete, for example a
 deadline, shutdown or `acknowledged_cleanup_refused:<reason>` after the replay's
 acknowledgement). After `partial`, run `local-records` again before doing anything else.
-A client that disconnects before the first mutation (the cleanup, or the replay's
-release POST) ends the request `client_disconnected` with nothing touched; afterwards the
+A client that disconnects before the first mutation (the cleanup, the replay's
+release POST, or the Case B first unlink) ends the request `client_disconnected` with nothing touched; afterwards the
 request runs to completion or to its deadline.
 
 **Refusals and blockers.**
@@ -2584,15 +2595,28 @@ request runs to completion or to its deadline.
 | Group | Names |
 |---|---|
 | Channel admission | `busy`, `shutting_down`, `no_claim_gate`, `claims_not_drained`, `worker_not_idle`, `client_disconnected` |
-| Request and coordinator | `invalid_request`, `recovery_disabled`, `authority_busy`, `cycle_busy`, `executing`, `worker_quarantined`, `deadline_exhausted`, `descriptor_changed`, `cleanup_failed` |
-| Journal and records | `not_found`, `inventory_incomplete`, `record_unverified`, `unbound_artifact:<name>`, `settlement_record_unsupported`, `terminal_protection`, `not_guarded`, `non_ordinary_origin`, `completion_receipt_generation`, `cleanup_pending`, `final_ack_unknown`, `replay_refused_persisted`, `binding_missing`, `binding_inconsistent`, `bare_mismatch` |
-| Server evidence | `holds_unknown`, `hold_open`, `pending_generation_report`, `exact_evidence_unavailable`, `evidence_deadline`, `run_state_not_terminal`, `case_b_pending_owner_review` |
+| Request and coordinator | `invalid_request`, `recovery_disabled`, `authority_busy`, `cycle_busy`, `executing`, `worker_quarantined`, `deadline_exhausted`, `descriptor_changed`, `cleanup_failed`, `case_b_disposition_required`, `case_b_action_mismatch` |
+| Journal and records | `not_found`, `inventory_incomplete`, `record_unverified`, `unbound_artifact:<name>`, `settlement_record_unsupported`, `terminal_protection`, `not_guarded`, `non_ordinary_origin`, `completion_receipt_generation`, `cleanup_pending`, `final_ack_unknown`, `replay_refused_persisted`, `binding_missing`, `binding_inconsistent`, `bare_mismatch`, `bundle_path_unknown` |
+| Server evidence | `holds_unknown`, `hold_open`, `run_hold_open`, `pending_generation_report`, `exact_evidence_unavailable`, `evidence_deadline`, `run_state_not_terminal`, `ack_evidence_inconsistent`, `settlement_evidence_inconsistent`, `policy_discard_retained`, `case_b_discard_evidence_unsupported` |
+| Source evidence (Case B) | `source_evidence_unavailable`, `source_evidence_incomplete`, `source_evidence_empty`, `source_missing`, `source_enumeration_mismatch`, `source_not_exclusive:<blocker>`, `inventory_source_not_quiescent:<check>` |
 | Source proof and replay | `source_identity_unavailable`, `bare_mutation_unresolved`, `replay_failed_before_post`, `replay_precondition_unmet:<reason>`, `replay_failed`, `internal_error` |
+
+`run_hold_open`, `settlement_evidence_inconsistent`, `policy_discard_retained`,
+`case_b_discard_evidence_unsupported` and the source-evidence rows
+are raised on the Case B path only (Case A keeps its own-generation `hold_open` check).
+`holds_unknown` is shared; for Case B it also covers a holds response whose run-wide
+`run_open_holds` count is absent or malformed, because an absent count is never read as
+zero. `case_b_pending_owner_review` no longer exists: an acknowledged generation whose
+exact hold is discarded or released without the matching receipt is now
+`ack_evidence_inconsistent`.
 
 The table is not exhaustive. Other replay and cleanup reasons can appear, for example
 `source_boundary_retained`, `no_saved_final`, `replay_ack_mismatch`, `replay_failed:<reason>`,
-`held_fallback_required:<why>`, and cleanup outcomes such as `cleanup_retained` and
-`source_protected`. Re-run `local-records` or `inspect` before retrying.
+`held_fallback_required:<why>`, `dispose_failed` and `dispose_failed_before_mutation`
+(a Case B failure after, and before, the first unlink), `rmdir_failed` and
+`remaining_unreadable` (a Case B `partial` when removing the empty run directory or
+counting the remaining records fails unexpectedly after the records were retired), and cleanup outcomes such as
+`cleanup_retained` and `source_protected`. Re-run `local-records` or `inspect` before retrying.
 
 An unbound `*.tmp` file or orphan bundle in the run's record directory is retained and
 refuses the whole run's generations as `unbound_artifact:<name>`; a
@@ -2611,14 +2635,105 @@ for inspect even though the client left. The claim gate reopens only once that w
 settled. Re-inspect before retrying: the digest changes after any mutation, so a stale
 `--confirm` is refused with `descriptor_changed`.
 
-**What this does not do.** It handles Case A only (the closed hold was released with a
-receipt matching this record's saved FINAL request, with or without the ACK already saved).
-A discarded hold, or custody released without this record's matching receipt, is refused
-(typically `case_b_pending_owner_review`; the first failing check wins, so an earlier
-blocker such as `cleanup_pending`, `binding_missing` or `holds_unknown` can be reported instead);
-no supported resolver exists for it, and it is [proposed, not accepted](../adr/2417-guarded-local-retention.md#proposed-not-accepted-case-b-local-record-disposition-3885).
-The tested failure model is an abrupt process kill; storage or power-loss behaviour is
-unspecified (record writes are rename-atomic, not fsynced).
+##### Case B: operator-confirmed record disposition
+
+Case B is a generation where no record has its FINAL acknowledged and the closed hold
+is no preservation proof for the record. The `--case-b` request retires that
+generation's **local records and canonical bundles only**. Decision and rationale:
+[ADR-2417, Case B amendment](../adr/2417-guarded-local-retention.md#amendment-2026-11-10-case-b-local-record-disposition-3885).
+
+**Eligibility.** Only a generation where no record has `finalAcknowledged`, in one of
+three shapes:
+
+- one saved FINAL with a persisted settlement that does not match it;
+- one saved FINAL whose fresh exact hold read is discarded (release evidence
+  `owner_discard`) or released with a non-matching receipt;
+- no saved FINAL and exactly one guarded frozen aggregate.
+
+A replay-refused anchor (`final_retry_refused`, `credential_rejected`) qualifies only
+with a persisted non-matching settlement; otherwise it stays `replay_refused_persisted`.
+The first failing check wins, so an earlier blocker such as `cleanup_pending`,
+`binding_missing` or `holds_unknown` can be reported instead of a Case B class.
+
+**Retained even when confirmed.**
+
+- A merged-predecessor discard (`policy_discard_retained`).
+- Any generation (including a released mismatch) whose anchor has no persisted hold
+  binding, or whose saved FINAL has an archive disposition with a missing or mismatched
+  server capture id (`binding_missing`).
+- A run with no clone and no retained source (`source_evidence_empty`).
+- A replay-refused anchor without a persisted settlement (`replay_refused_persisted`).
+
+**Source evidence.** The request reads the clone inventory (each clone's path, branch,
+HEAD and `dev:ino`) and a worker-wide retained-source inspection. It refuses
+`source_evidence_unavailable` when either cannot be read, and `source_evidence_incomplete`
+when the inventory is not verified or the inspection is partial or has any unreadable
+source. The inspection's `partialCauses` are diagnostic only and never decide
+eligibility. The run's own sources must be present (`source_missing`), the two reads must
+name the same clones (`source_enumeration_mismatch`), and no other consumer may use the
+source (`source_not_exclusive:<blocker>`; the run's own local records are not a blocker).
+The evidence is part of the digest.
+
+**Sequence.** Claim gate, authority lock, capture cycle (skip), journal pre-check
+(released), the inventory source boundary in record-disposition mode, the journal again
+with a fresh full re-assessment and digest equality, the source proof, then the first
+unlink. The proof keeps the execution tail and reservation, the live-attempt path check,
+quiescence before and after, and the clone identity (path, branch, HEAD, `dev:ino`) equal
+to what describe printed. It skips only the worktree cleanliness check, because the tree
+is left in place. A writer the proof cannot rule out refuses
+`inventory_source_not_quiescent:<check>` and nothing is touched.
+
+**Deletion.** Canonical bundles first, then records without a hold binding, then other
+binding-carrying records, then the anchor record last, then the run directory if empty.
+Quarantine and executing state, a pending generation report and terminal protection are
+re-read before every unlink. An unexpected bundle path is refused `bundle_path_unknown`
+before anything is removed. After the first unlink a failure is `partial`, never a
+refusal. There is no autonomous retry: run `local-records` again and confirm the new
+digest with `--case-b`.
+
+**What it never does.** It never deletes tree bytes, refs, pins, server archives, other
+generations' data or unbound files, and never releases, uploads or acknowledges anything
+(no API write). It does not implement automatic reclamation (#4007) and does not clear Git
+journals or recovery-owner metadata. Settlement-root entries and terminal protection still
+refuse (`settlement_record_unsupported`, `terminal_protection`).
+
+**Failure model.** Tested for an abrupt process kill only: a real `SIGKILL` at each unlink
+step of three Case B scenarios, each followed by a fresh process that re-describes the
+generation as the same class; the digest changes once any file was removed (the old digest
+is then refused `descriptor_changed`) and is unchanged if nothing was removed; `not_found`
+once the anchor is gone. Storage or
+power-loss behaviour is unspecified (record writes are rename-atomic, not fsynced).
+
+**Trust model.** The local socket proves access to the pod, not the owner's identity.
+The owner binding is the run id plus the server's owner- and run-authorized,
+original-worker-scoped exact read of the hold; the deployment operator confirms each
+request for the owner. A server `owner_discard` event alone, or a stale digest, never
+authorizes the request. For an owner-discarded source the owner accepted abandonment of
+dirty or unpublished local work. For a released mismatch no bytes are treated as
+abandoned. Either way Case B removes no tree bytes.
+
+##### Case B consequences and follow-on disposal
+
+- **Later generations.** Retiring generation N can change a later generation M's
+  ACK-cleanup state (for example `pending` to `acknowledged`); `local-records` lists it in
+  `laterCleanup`. The request never retires M. The existing autonomous ACK cleanup, or a
+  Case A resolve, may retire M afterwards.
+- **Pins stay.** Each later maintenance pass may therefore spend one holds-list call on
+  generation N's leftover owed contexts. This follows from the design and has not been measured.
+- **Source disposal is separate.** After retirement `inspect` may show `local_discard`;
+  the existing [epoch reclaim](#verified-epoch-reclaim-prd-3431) then acts only if its own
+  strict-plain shape, byte measurement, custody and writer predicates pass (and that
+  deletion phase is gated off in production). It may instead show `local_protected_discard`,
+  which the epoch deletion recheck refuses; the ordinary operator `discard --protected`
+  runs its own checks. Record retirement guarantees neither outcome and grants no source
+  disposal.
+- **Known limit.** The completeness inspection covers every repository on the worker within
+  the inspect budget. A large or unreadable unrelated retained source can make every Case B
+  request refuse `source_evidence_incomplete`, even when the run's own source is fine.
+  Repair that source, or leave the records in place.
+
+The tested failure model for all resolutions is an abrupt process kill; storage or
+power-loss behaviour is unspecified.
 
 What the channel does not promise:
 

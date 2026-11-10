@@ -61,7 +61,7 @@ import type {
   RecoveryUploadManifest,
   RunKind,
 } from "./protocol.js";
-import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, RecoveryCoverageReuseRefused, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidateContext, type HistoricalOwedContext, type OwedCandidate, type RecoveryCoverage, type RecoveryCoverageClaim, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
+import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, RecoveryCoverageReuseRefused, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidateContext, type HistoricalOwedContext, type OwedCandidate, type RecoveryCoverage, type RecoveryCoverageClaim, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache, type RetainedSourceEvidence } from "./git.js";
 
 type RemediationRestrictionFacts = Awaited<ReturnType<GitCache["readRemediationRestrictionFacts"]>>;
 
@@ -683,6 +683,21 @@ export interface InventorySourceBoundaryContext {
   /** The opaque {@link PredecessorOperation.boundary} token, present only for a boundary entered under a predecessor
    *  scope that names this run and generation. Selects the runner's predecessor boundary; absent for every other caller. */
   predecessor?: object;
+  /** Operator Case B record disposition (issue #3885): the boundary proves the physical sources are quiescent and
+   *  UNCHANGED against `expectedClones` (the {@link inventoryCloneKey} the operator confirmed) and, unlike the
+   *  ordinary FINAL proof, does not require them clean: the sources are left in place. */
+  recordDisposition?: { expectedClones: string };
+}
+
+/** Canonical key of a clone set's [clonePath, branch, head, dev:ino] tuples, or undefined when any head/identity is
+ *  absent. The ONE definition shared by the runner's boundaries and the operator's Case B source descriptor. */
+export function inventoryCloneKey(clones: ReadonlyArray<{ clonePath: string; branch: string; head?: string; identity?: string }>): string | undefined {
+  const tuples: string[][] = [];
+  for (const c of clones) {
+    if (typeof c.head !== "string" || typeof c.identity !== "string") return undefined;
+    tuples.push([c.clonePath, c.branch, c.head, c.identity]);
+  }
+  return JSON.stringify(tuples.sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0)));
 }
 
 export function inventoryReadCause(inventory: unknown): InventoryReadCause {
@@ -809,6 +824,10 @@ export interface LocalRecordGeneration {
   holdId?: string;
   repoId?: string;
   captureIds: string[];
+  /** Present only for Case B (`case_b_owner_discard`, `case_b_released_mismatch`): the resolve request must carry it. */
+  action?: "case_b";
+  /** Case B only: each later guarded generation whose cleanup state differs with and without this generation's records. */
+  laterCleanup?: Array<{ generation: number; before: string; after: string }>;
 }
 export type DescribeLocalRecordsResult =
   | { kind: "described"; runId: string; generations: LocalRecordGeneration[]; blockers: string[] }
@@ -836,11 +855,41 @@ interface OperatorIO extends OperatorRequestSignals {
   readonly budget: MaintenanceBudget;
   readonly journal: { signal: AbortSignal; deadline: number };
 }
-interface OperatorObserved { settlementNames: string[]; terminal: boolean; holds: "unknown" | ReadonlySet<number> }
+interface OperatorObserved {
+  settlementNames: string[]; terminal: boolean; holds: "unknown" | ReadonlySet<number>;
+  /** The run-wide open-hold count when the api reported it (absent is unknown, never zero). */
+  runOpenHolds?: number;
+}
+type OperatorCase = "case_a_ack" | "case_a_replay" | "case_b_owner_discard" | "case_b_released_mismatch";
 type OperatorVerdict =
   | { ok: false; classification: string }
-  | { ok: true; case: "case_a_ack" | "case_a_replay"; digest: string; anchor: RecoveryRecord; bare: string;
-      holdId: string; repoId: string; captureIds: string[]; exact: RecoveryExactHold };
+  | { ok: true; case: OperatorCase; digest: string; anchor: RecoveryRecord; bare: string;
+      holdId: string; repoId: string; captureIds: string[]; exact: RecoveryExactHold;
+      /** Case B only: the {@link inventoryCloneKey} the source boundary must find unchanged, and the later-generation effect. */
+      expectedClones?: string; laterCleanup?: Array<{ generation: number; before: string; after: string }> };
+
+/** The Case B source evidence an operator request reads: the clone inventory (E1, with per-clone identity) and the
+ *  worker-wide retained-source inspection (E2, no selector and no bare filter). */
+export interface OperatorSourceEvidence {
+  e1: Awaited<ReturnType<GitCache["readInventoryCloneHeads"]>>;
+  e2: Awaited<ReturnType<GitCache["inspectRetainedSources"]>>;
+}
+
+/** The fields of a closed-hold observation that can never change once the hold is closed. Mutable fields (run status,
+ *  claim generation, claim released, run worker, recovery wait cause) are deliberately absent. */
+function immutableExact(exact: RecoveryExactHold): Record<string, unknown> {
+  return {
+    hold_id: exact.hold_id, repo_id: exact.repo_id, generation: exact.generation, inventory_guarded: exact.inventory_guarded,
+    state: exact.state, release_evidence: exact.release_evidence ?? null, final_receipt: exact.final_receipt ?? null,
+    completed_publication_receipt: exact.completed_publication_receipt ?? null,
+    original_worker_id: exact.original_worker_id, original_worker_identity: exact.original_worker_identity,
+  };
+}
+
+/** A named refusal raised inside the Case B disposition: before the first unlink it refuses, after it the request is partial. */
+class OperatorDisposeRefusal extends Error {
+  constructor(readonly reason: string) { super(reason); this.name = "OperatorDisposeRefusal"; }
+}
 /**
  * The opt-in scope of an operator replay (case A2): the existing saved-FINAL finalizer run with every
  * fallback turned into a named refusal and every write before the single release POST withheld. Outside it
@@ -876,6 +925,13 @@ function receiptMatches(observed: RecoveryExactHold, request: NonNullable<Recove
 export interface RecoveryCoordinatorOptions {
   /** Test seam (never set in production): awaited inside the journal lock of an operator resolution, before its expectation. */
   onForgetJournalLockedForTest?: () => void | Promise<void>;
+  /** Test seam (never set in production): awaited immediately before and after every unlink and the final rmdir of an
+   *  operator Case B record disposition, after the destructive boundary was crossed for the first of them. */
+  onOperatorDisposeStepForTest?: (step: { kind: "bundle" | "record" | "anchor" | "rmdir"; path: string;
+    phase: "before" | "after" }) => void | Promise<void>;
+  /** Operator Case B source evidence (issue #3885). Absent: every Case B classification refuses `source_evidence_unavailable`.
+   *  The runner wires readInventoryCloneHeads(bare, run, { cloneIdentity: true }) and an UNFILTERED inspectRetainedSources. */
+  operatorSourceEvidence?: (runId: string, bare: string, signal?: AbortSignal) => Promise<OperatorSourceEvidence>;
   /** issue #3404 M2: opens (or borrows) the authority transaction A. Every capture cycle that can
    *  reach a hooked Git effect is entered inside it, so A is taken BEFORE the cycle lock C, the
    *  source reservation S, the journal lock J and the bare lock B (order A -> C -> S -> J -> B).
@@ -1417,6 +1473,8 @@ const recoveryJournalLocks = new RunDiskLocks();
 export class RecoveryCoordinator {
   private readonly authority: AuthorityScope | undefined;
   private readonly onForgetJournalLockedForTest: RecoveryCoordinatorOptions["onForgetJournalLockedForTest"];
+  private readonly onOperatorDisposeStepForTest: RecoveryCoordinatorOptions["onOperatorDisposeStepForTest"];
+  private readonly operatorSourceEvidence: RecoveryCoordinatorOptions["operatorSourceEvidence"];
   private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
   private readonly withCompletionSourceBoundary: RecoveryCoordinatorOptions["withCompletionSourceBoundary"];
   private readonly onCompletionSourceForgotten: RecoveryCoordinatorOptions["onCompletionSourceForgotten"];
@@ -1626,6 +1684,8 @@ export class RecoveryCoordinator {
   constructor(opts: RecoveryCoordinatorOptions) {
     this.authority = opts.authority;
     this.onForgetJournalLockedForTest = opts.onForgetJournalLockedForTest;
+    this.onOperatorDisposeStepForTest = opts.onOperatorDisposeStepForTest;
+    this.operatorSourceEvidence = opts.operatorSourceEvidence;
     this.withTerminalSourceBoundary = opts.withTerminalSourceBoundary;
     this.writerExclusion = opts.writerExclusion;
     this.terminalSettlementConfirmed = opts.terminalSettlementConfirmed;
@@ -6283,19 +6343,22 @@ export class RecoveryCoordinator {
     this.operatorCheckpoint(io);
     const terminal = this.terminalRecordProtection ? await ownedRecoveryIO(() => this.terminalRecordProtection!(runId)) : false;
     let holds: OperatorObserved["holds"] = "unknown";
+    let runOpenHolds: number | undefined;
     try {
       if (this.client.hasFeature?.("recovery_inventory_v1")) {
         const response = await this.operatorRpc(io, signal => this.client.listRecoveryHolds(runId, signal));
         if (response?.run_id === runId && Array.isArray(response.holds) &&
             response.holds.every(h => typeof h === "object" && h !== null && Number.isSafeInteger(h.generation))) {
           holds = new Set(response.holds.map(h => h.generation));
+          const wide = response.run_open_holds;
+          if (wide?.run_id === runId && Number.isSafeInteger(wide.count) && wide.count >= 0) runOpenHolds = wide.count;
         }
       }
     } catch (err) {
       if (err instanceof OperatorCancelledBeforeMutation || io.shutdownSignal.aborted || io.budget.signal.aborted) throw err;
       holds = "unknown";
     }
-    return { settlementNames, terminal, holds };
+    return { settlementNames, terminal, holds, ...(runOpenHolds === undefined ? {} : { runOpenHolds }) };
   }
 
   /** The ONE classification shared by describe and resolve (so a digest described is the digest accepted).
@@ -6316,11 +6379,13 @@ export class RecoveryCoordinator {
     if (selected.some(r => r.completionReceipt !== undefined || r.completionSource !== undefined)) return no("completion_receipt_generation");
     const state = await this.cleanupStateOf(journal.records, generation);
     const ackRecord = guarded.find(r => r.finalAcknowledged === true && r.finalRequest && r.coverageDigest);
-    let kind: "case_a_ack" | "case_a_replay";
+    // a1: the FINAL ACK is persisted. a2: one saved FINAL, no ACK, whose closed hold may carry the matching receipt
+    // (replay) and otherwise becomes Case B. b: Case B already by the record evidence.
+    let track: "a1" | "a2" | "b";
     let anchor: RecoveryRecord;
     if (replayed && state !== "acknowledged") return no("final_ack_unknown");
     if (state === "acknowledged") {
-      kind = "case_a_ack";
+      track = "a1";
       anchor = ackRecord!;
     } else if (!ackRecord && guarded.some(r => r.finalAcknowledged === true)) {
       return no("final_ack_unknown");
@@ -6328,24 +6393,39 @@ export class RecoveryCoordinator {
       return no("cleanup_pending");
     } else {
       const saved = guarded.filter(r => r.finalRequest && r.coverageDigest);
-      if (saved.length !== 1) return no("cleanup_pending");
-      anchor = saved[0]!;
-      if (anchor.reason === "final_retry_refused" || anchor.reason === "credential_rejected") return no("replay_refused_persisted");
-      const settled = anchor.holdSettlement;
-      if (settled !== undefined && !receiptMatches(settled, anchor.finalRequest!)) return no("case_b_pending_owner_review");
-      kind = "case_a_replay";
+      if (saved.length > 1) return no("cleanup_pending");
+      if (saved.length === 1) {
+        anchor = saved[0]!;
+        const settled = anchor.holdSettlement;
+        if (settled !== undefined && !receiptMatches(settled, anchor.finalRequest!)) track = "b";
+        else if (anchor.reason === "final_retry_refused" || anchor.reason === "credential_rejected") return no("replay_refused_persisted");
+        else track = "a2";
+      } else {
+        // No saved FINAL: exactly one guarded frozen aggregate is the anchor. A producer-origin record never is
+        // (the origin check above refuses the generation).
+        if (guarded.some(r => r.finalRequest)) return no("cleanup_pending");
+        const frozen = guarded.filter(r => r.coverageDigest);
+        if (frozen.length !== 1) return no("cleanup_pending");
+        anchor = frozen[0]!;
+        track = "b";
+      }
     }
     const binding = anchor.exactHoldBinding;
-    const disposition = anchor.finalRequest!.disposition;
-    if (!binding || (disposition.kind === "archive" &&
-        (!anchor.serverCaptureId || disposition.capture_id !== anchor.serverCaptureId))) return no("binding_missing");
+    const request = anchor.finalRequest;
+    if (!binding || (request?.disposition.kind === "archive" &&
+        (!anchor.serverCaptureId || request.disposition.capture_id !== anchor.serverCaptureId))) return no("binding_missing");
     if (selected.some(r => r.exactHoldBinding && canonicalJson(r.exactHoldBinding) !== canonicalJson(binding))) return no("binding_inconsistent");
     const context = anchor.coverageContext;
     if (!context || context.runId !== runId || context.generation !== generation || !anchor.bareDir) return no("bare_mismatch");
     const bare = await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(anchor.bareDir!));
     if (!bare || bare !== context.barePath) return no("bare_mismatch");
     if (observed.holds === "unknown") return no("holds_unknown");
-    if (observed.holds.has(generation)) return no("hold_open");
+    // Case B: no open hold of the run at ANY generation. Case A keeps its own-generation check.
+    // The api omits the run-wide count when it is unknown: absent is never zero, so Case B refuses it as unknown holds.
+    const runHolds = (): string | undefined => observed.holds === "unknown" || observed.holds.size > 0 || (observed.runOpenHolds ?? 0) > 0
+      ? "run_hold_open" : observed.runOpenHolds === undefined ? "holds_unknown" : undefined;
+    if (track === "b") { const refusal = runHolds(); if (refusal) return no(refusal); }
+    else if (observed.holds.has(generation)) return no("hold_open");
     if (this.pendingGenerationReport?.(runId, generation)) return no("pending_generation_report");
     if (!this.client.getExactRecoveryHold) return no("exact_evidence_unavailable");
     if (io.budget.signal.aborted || io.budget.remainingMs() <= 0) return no("evidence_deadline");
@@ -6360,11 +6440,53 @@ export class RecoveryCoordinator {
     if (exact.state === "open") return no("hold_open");
     if (exact.state !== "released" && exact.state !== "discarded") return no("exact_evidence_unavailable");
     if (!OPERATOR_TERMINAL_STATUSES.has(exact.run_status)) return no("run_state_not_terminal");
-    if (exact.state !== "released" || !receiptMatches(exact, anchor.finalRequest!)) return no("case_b_pending_owner_review");
+    const matching = request !== undefined && receiptMatches(exact, request);
+    if (track === "a1" && !matching) return no("ack_evidence_inconsistent");
+    if (track === "a2" && !matching) {
+      // The saved FINAL's hold is discarded, or released without its receipt: not a replay.
+      track = "b";
+      const refusal = runHolds();
+      if (refusal) return no(refusal);
+    }
+    let caseB: "case_b_owner_discard" | "case_b_released_mismatch" | undefined;
+    let sourceEvidence: { expectedClones: string; descriptor: unknown } | undefined;
+    if (track === "b") {
+      // Every persisted settlement of the generation must agree with the fresh read on what a closed hold cannot change.
+      const fresh = canonicalJson(immutableExact(exact));
+      if (selected.some(r => r.holdSettlement !== undefined && canonicalJson(immutableExact(r.holdSettlement)) !== fresh)) {
+        return no("settlement_evidence_inconsistent");
+      }
+      if (exact.state === "discarded") {
+        if (exact.release_evidence === "merged_predecessor_discard") return no("policy_discard_retained");
+        if (exact.release_evidence !== "owner_discard") return no("case_b_discard_evidence_unsupported");
+        caseB = "case_b_owner_discard";
+      } else caseB = "case_b_released_mismatch";
+      const source = await this.operatorSourceDescriptor(io, runId, bare);
+      if ("classification" in source) return no(source.classification);
+      sourceEvidence = source;
+    }
     if (!this.git.recoveryRefSnapshot) return no("source_identity_unavailable");
     let snapshot: { devIno: string; refs: string[] };
     try { snapshot = await ownedRecoveryIO(() => this.git.recoveryRefSnapshot!(bare, runId, generation)); }
     catch { io.budget.check(); return no("source_identity_unavailable"); }
+    if (caseB !== undefined) {
+      // Every authenticated record of the run, not only this generation's: a later generation's cleanup depends on them.
+      const all = journal.records.slice().sort((a, b) => a.captureId < b.captureId ? -1 : a.captureId > b.captureId ? 1 : 0)
+        .map(r => createHash("sha256").update(canonicalJson(r)).digest("hex"));
+      const later = await this.operatorLaterCleanup(journal.records, generation);
+      const digest = createHash("sha256").update(canonicalJson([
+        "retained-local-record-case-b-v1", runId, generation, caseB, binding.holdId, binding.repoId, anchor.captureId,
+        anchor.serverCaptureId ?? null,
+        { hold_id: exact.hold_id, repo_id: exact.repo_id, generation: exact.generation, state: exact.state,
+          release_evidence: exact.release_evidence ?? null, final_receipt: exact.final_receipt ?? null, run_status: exact.run_status,
+          completed_publication_receipt: exact.completed_publication_receipt ?? null, inventory_guarded: exact.inventory_guarded,
+          original_worker_id: exact.original_worker_id, original_worker_identity: exact.original_worker_identity },
+        snapshot.devIno, bare, snapshot.refs, journal.names, observed.settlementNames, all, sourceEvidence!.descriptor, later,
+      ])).digest("hex");
+      return { ok: true, case: caseB, digest, anchor, bare, holdId: binding.holdId, repoId: binding.repoId,
+        captureIds: selected.map(r => r.captureId).sort(), exact, expectedClones: sourceEvidence!.expectedClones, laterCleanup: later };
+    }
+    const kind: "case_a_ack" | "case_a_replay" = track === "a1" ? "case_a_ack" : "case_a_replay";
     // For the replay case the ACK the resolution itself will persist is normalised away, so the digest
     // described before the replay equals the one re-checked after it.
     const digestKind = replayed ? "case_a_replay" : kind;
@@ -6383,6 +6505,83 @@ export class RecoveryCoordinator {
     ])).digest("hex");
     return { ok: true, case: kind, digest, anchor, bare, holdId: binding.holdId, repoId: binding.repoId,
       captureIds: selected.map(r => r.captureId).sort(), exact };
+  }
+
+  /** Each later guarded generation M whose cleanup state differs between the full journal and the journal without
+   *  this generation's records: what retiring this generation would change for it. A NEW array, so its memo is distinct. */
+  private async operatorLaterCleanup(records: RecoveryRecord[], generation: number):
+    Promise<Array<{ generation: number; before: string; after: string }>> {
+    const later = [...new Set(records.filter(r => r.inventoryGuarded === true && Number.isSafeInteger(r.generation) && r.generation! > generation)
+      .map(r => r.generation!))].sort((a, b) => a - b);
+    if (!later.length) return [];
+    const without = records.filter(r => r.generation !== generation);
+    const out: Array<{ generation: number; before: string; after: string }> = [];
+    for (const m of later) {
+      const before = await this.cleanupStateOf(records, m);
+      const after = await this.cleanupStateOf(without, m);
+      if (before !== after) out.push({ generation: m, before, after });
+    }
+    return out;
+  }
+
+  /**
+   * The Case B source evidence: E1 (the clone inventory with per-clone identity) and E2 (the worker-wide retained-source
+   * inspection, filtered to this run and bare). Every shape question refuses; `partialCauses` is diagnostic only and is
+   * never consulted for eligibility or the descriptor. The descriptor is bound into the Case B digest.
+   */
+  private async operatorSourceDescriptor(io: OperatorIO, runId: string, bare: string):
+    Promise<{ classification: string } | { expectedClones: string; descriptor: unknown }> {
+    const read = this.operatorSourceEvidence;
+    if (!read) return { classification: "source_evidence_unavailable" };
+    this.operatorCheckpoint(io);
+    let evidence: OperatorSourceEvidence;
+    try { evidence = await this.operatorRpc(io, signal => read(runId, bare, signal)); }
+    catch (err) {
+      if (err instanceof OperatorCancelledBeforeMutation || io.shutdownSignal.aborted) throw err;
+      return { classification: io.budget.signal.aborted ? "evidence_deadline" : "source_evidence_unavailable" };
+    }
+    this.operatorCheckpoint(io);
+    const incomplete = { classification: "source_evidence_incomplete" };
+    const isText = (v: unknown): v is string => typeof v === "string";
+    const e1 = evidence?.e1, e2 = evidence?.e2;
+    if (!e1 || e1.kind !== "verified" || !Array.isArray(e1.clones)) return incomplete;
+    for (const c of e1.clones) {
+      if (!c || !isText(c.clonePath) || !isText(c.branch) || !isText(c.head) || !isText(c.identity)) return incomplete;
+    }
+    // Completeness is exactly `partial === false` and `unreadable === 0`; anything missing or malformed is incomplete.
+    if (!e2 || !Array.isArray(e2.sources) || e2.partial !== false || typeof e2.unreadable !== "number" ||
+        !Number.isSafeInteger(e2.unreadable) || e2.unreadable < 0) return incomplete;
+    if (e2.unreadable !== 0) return incomplete;
+    const mine: RetainedSourceEvidence[] = [];
+    for (const source of e2.sources) {
+      if (!source || !isText(source.runId) || !isText(source.barePath)) return incomplete;
+      if (source.runId === runId && source.barePath === bare) mine.push(source);
+    }
+    for (const source of mine) {
+      if (!Array.isArray(source.sources) || source.sources.length === 0 ||
+          !Array.isArray(source.consumers) || !source.consumers.every(isText) ||
+          !isText(source.descriptor) || !isText(source.kind) || !isText(source.key) || !isText(source.attempt) ||
+          !isText(source.journalState) || !isText(source.markerState) ||
+          !source.sources.every(p => p && isText(p.clonePath) && isText(p.presence))) return incomplete;
+    }
+    if (mine.some(s => s.presence !== "present" || s.sources.some(p => p.presence !== "present"))) return { classification: "source_missing" };
+    const unique = (values: string[]): string[] => [...new Set(values)].sort();
+    const inventoried = unique(e1.clones.map(c => c.clonePath));
+    const inspected = unique(mine.flatMap(s => s.sources.map(p => p.clonePath)));
+    if (!inventoried.length || !inspected.length) return { classification: "source_evidence_empty" };
+    if (JSON.stringify(inventoried) !== JSON.stringify(inspected)) return { classification: "source_enumeration_mismatch" };
+    // The aggregate view reports the run's own local records in `localRecords`, never as a blocker: any blocker refuses.
+    const blockers = unique(mine.flatMap(s => s.consumers.filter(c => c.startsWith("blocker:"))));
+    if (blockers.length) return { classification: "source_not_exclusive:" + blockers[0]!.slice("blocker:".length).replace(/[^A-Za-z0-9._:+-]/g, "_").slice(0, 96) };
+    const expectedClones = inventoryCloneKey(e1.clones);
+    if (expectedClones === undefined) return incomplete;
+    const retained = mine.map(s => ({
+      descriptor: s.descriptor, kind: s.kind, key: s.key, generation: s.generation, attempt: s.attempt, presence: s.presence,
+      journalState: s.journalState, markerState: s.markerState,
+      parts: s.sources.map(p => [p.clonePath, p.presence]).sort((a, b) => a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0),
+      consumers: s.consumers.slice().sort(), disposition: s.disposition?.kind ?? null,
+    })).sort((a, b) => a.descriptor < b.descriptor ? -1 : a.descriptor > b.descriptor ? 1 : 0);
+    return { expectedClones, descriptor: { clones: JSON.parse(expectedClones) as unknown, foreignOwners: unique(e1.foreignOwners ?? []), retained } };
   }
 
   /** Read-only: classify every local record generation of one run. One bounded journal read under J (then
@@ -6424,7 +6623,8 @@ export class RecoveryCoordinator {
           const verdict = await this.operatorAssess(io, runId, generation, journal, observed);
           views.push(verdict.ok
             ? { generation, classification: verdict.case, digest: verdict.digest, holdId: verdict.holdId, repoId: verdict.repoId,
-              captureIds: verdict.captureIds }
+              captureIds: verdict.captureIds,
+              ...(verdict.laterCleanup === undefined ? {} : { action: "case_b" as const, laterCleanup: verdict.laterCleanup }) }
             : { generation, classification: verdict.classification, captureIds });
         }
         return { kind: "described", runId, generations: views, blockers };
@@ -6458,13 +6658,14 @@ export class RecoveryCoordinator {
    * client there ends the request with nothing touched). After it, only the deadline and shutdown can
    * interrupt, and they end the request `partial`.
    */
-  async resolveLocalRecord(input: OperatorRequestSignals & { runId: string; generation: number; confirm: string }):
+  async resolveLocalRecord(input: OperatorRequestSignals & { runId: string; generation: number; confirm: string; action?: "case_b" }):
     Promise<ResolveLocalRecordResult> {
     const refused = (reason: string): ResolveLocalRecordResult => ({ kind: "refused", reason });
     if (!this.enabled) return refused("recovery_disabled");
-    const { runId, generation, confirm } = input;
+    const { runId, generation, confirm, action } = input;
     if (!OPERATOR_RUN_ID.test(runId) || !Number.isSafeInteger(generation) || generation <= 0 ||
-        typeof confirm !== "string" || !/^[0-9a-f]{64}$/.test(confirm)) return refused("invalid_request");
+        typeof confirm !== "string" || !/^[0-9a-f]{64}$/.test(confirm) ||
+        (action !== undefined && action !== "case_b")) return refused("invalid_request");
     let crossed = false;
     try {
       return await this.withOperatorBudget(input, async (io): Promise<ResolveLocalRecordResult> => {
@@ -6474,7 +6675,7 @@ export class RecoveryCoordinator {
           entered = true;
           // The cycle key of a guarded generation, computed without any journal listing.
           const cycle = await runCaptureCycle(path.resolve(this.runDir(runId), `generation-${generation}`), "skip",
-            () => this.operatorResolveInCycle(io, runId, generation, confirm, () => { crossed = true; }));
+            () => this.operatorResolveInCycle(io, runId, generation, confirm, action, () => { crossed = true; }));
           return cycle.ran ? cycle.value : refused("cycle_busy");
         };
         if (!this.authority) return body();
@@ -6501,7 +6702,7 @@ export class RecoveryCoordinator {
   }
 
   private async operatorResolveInCycle(io: OperatorIO, runId: string, generation: number, confirm: string,
-    markCrossed: () => void): Promise<ResolveLocalRecordResult> {
+    action: "case_b" | undefined, markCrossed: () => void): Promise<ResolveLocalRecordResult> {
     const refused = (reason: string): ResolveLocalRecordResult => ({ kind: "refused", reason });
     // Pre-checks outside J, each preceded by an explicit client checkpoint.
     this.operatorCheckpoint(io);
@@ -6516,6 +6717,11 @@ export class RecoveryCoordinator {
     const verdict = await this.operatorAssess(io, runId, generation, journal, observed);
     if (!verdict.ok) return refused(verdict.classification);
     if (verdict.digest !== confirm) return refused("descriptor_changed");
+    // Case B discards records of a generation whose archive was never settled: it needs its own explicit action.
+    const caseB = verdict.case === "case_b_owner_discard" || verdict.case === "case_b_released_mismatch";
+    if (caseB && action !== "case_b") return refused("case_b_disposition_required");
+    if (!caseB && action === "case_b") return refused("case_b_action_mismatch");
+    if (caseB) return this.operatorDisposeInCycle(io, runId, generation, confirm, verdict, markCrossed);
     if (verdict.case === "case_a_replay") return this.operatorReplayInCycle(io, runId, generation, confirm, verdict, markCrossed);
     this.operatorCheckpoint(io);
     let refusal: string | undefined;
@@ -6533,6 +6739,136 @@ export class RecoveryCoordinator {
     if (outcome === "operator_refused") return refused(refusal ?? "operator_refused");
     if (outcome === "forgotten") return { kind: "retired", generation, remaining: await this.operatorRemaining(runId) };
     return crossed ? { kind: "partial", reason: outcome } : refused(outcome);
+  }
+
+  /**
+   * Case B disposition (issue #3885): the generation's archive was never settled (its hold is discarded, or closed
+   * without the saved FINAL's receipt, or the FINAL was never saved), so there is no ACK to retire it under. The
+   * operator drops the generation's LOCAL RECORDS and bundles only: no refs, pins, clones or archive are touched,
+   * nothing is reported to the api, and no cleanup, redundancy or completion-witness path runs.
+   *
+   * Lock order: A -> C (`skip`) -> [J pre-check, released] -> S (inventory source boundary, recordDisposition) -> J
+   * (fresh read, full re-assessment incl. the source evidence, `prove()`) -> deletions under J and S. The first bundle
+   * unlink is the first mutation. Bundle paths are validated with the canonical rule of forgetGenerationWithinCycle
+   * before anything is removed; then bundles, records without a binding, the other binding carriers and the anchor
+   * last (so a binding stays on disk until the end), then the run directory if it is empty.
+   */
+  private async operatorDisposeInCycle(io: OperatorIO, runId: string, generation: number, confirm: string,
+    verdict: Extract<OperatorVerdict, { ok: true }>, markCrossed: () => void): Promise<ResolveLocalRecordResult> {
+    const refused = (reason: string): ResolveLocalRecordResult => ({ kind: "refused", reason });
+    const partial = (reason: string): ResolveLocalRecordResult => ({ kind: "partial", reason });
+    if (verdict.expectedClones === undefined) return refused("source_evidence_incomplete");
+    const confirmedExact = canonicalJson(immutableExact(verdict.exact));
+    const diagnostics = this.inventorySourceDiagnostics({ runId, generation, barePath: verdict.bare,
+      recordDisposition: { expectedClones: verdict.expectedClones } }, verdict.anchor.captureId);
+    let crossed = false;
+    let entered = false;
+    let outcome: ResolveLocalRecordResult | undefined;
+    // An error the runner's source boundary swallows (it answers "retained") keeps its cause here.
+    let failure: { error: unknown } | undefined;
+    const fail = (err: unknown): ResolveLocalRecordResult => {
+      failure ??= { error: err };
+      if (err instanceof OperatorDisposeRefusal) return crossed ? partial(err.reason) : refused(err.reason);
+      const named = this.operatorFailure(err, io);
+      if (crossed) return partial(named && named.reason !== "client_disconnected" ? named.reason : "dispose_failed");
+      return named ?? refused("dispose_failed_before_mutation");
+    };
+    const step = async (kind: "bundle" | "record" | "anchor" | "rmdir", file: string, phase: "before" | "after"): Promise<void> => {
+      await this.onOperatorDisposeStepForTest?.({ kind, path: file, phase });
+    };
+    // The protection that must hold before EVERY unlink and the rmdir, re-read each time.
+    const openRefusal = async (): Promise<string | undefined> => {
+      const live = this.operatorLiveGate(runId);
+      if (live) return live;
+      if (this.pendingGenerationReport?.(runId, generation)) return "pending_generation_report";
+      if (this.terminalRecordProtection && await ownedRecoveryIO(() => this.terminalRecordProtection!(runId))) return "terminal_protection";
+      return undefined;
+    };
+    const unlink = async (kind: "bundle" | "record" | "anchor", file: string): Promise<void> => {
+      const reason = await openRefusal();
+      if (reason) throw new OperatorDisposeRefusal(reason);
+      io.budget.check();
+      if (!crossed) {
+        // The last client checkpoint: after this returns requestSignal is never consulted again.
+        if (io.requestSignal.aborted) throw new OperatorCancelledBeforeMutation();
+        crossed = true;
+        markCrossed();
+      }
+      await step(kind, file, "before");
+      try { await ownedRecoveryIO(() => fs.unlink(file)); }
+      catch (err) { MaintenanceBudget.current()?.check(); if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+      await step(kind, file, "after");
+    };
+    const action = async (prove: () => Promise<boolean>): Promise<void> => {
+      entered = true;
+      try {
+        outcome = await this.withJournalLock(runId, async (): Promise<ResolveLocalRecordResult> => {
+          this.operatorCheckpoint(io);
+          const journal = await this.operatorJournal(runId, io.journal);
+          if (journal.kind !== "ok") return refused(journal.kind);
+          this.operatorCheckpoint(io);
+          const live = this.operatorLiveGate(runId);
+          if (live) return refused(live);
+          const observed = await this.operatorObserve(io, runId);
+          this.operatorCheckpoint(io);
+          const again = await this.operatorAssess(io, runId, generation, journal, observed);
+          if (!again.ok) return refused(again.classification);
+          if (again.case !== verdict.case || again.digest !== confirm ||
+              canonicalJson(immutableExact(again.exact)) !== confirmedExact) return refused("descriptor_changed");
+          this.operatorCheckpoint(io);
+          if (!await prove()) { diagnostics.retained(); return refused(diagnostics.reason()); }
+          this.operatorCheckpoint(io);
+          const selected = journal.records.filter(r => r.generation === generation);
+          const runDir = path.resolve(this.runDir(runId));
+          const bundles = new Set<string>();
+          // Positive ownership is the canonical capture filename, as in forgetGenerationWithinCycle.
+          for (const record of selected) {
+            const canonical = path.resolve(this.bundlePath(record));
+            if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return refused("bundle_path_unknown");
+            if (path.dirname(canonical) !== runDir) return refused("bundle_path_unknown");
+            try {
+              const st = await fs.lstat(canonical);
+              if (!st.isFile() || st.isSymbolicLink()) return refused("bundle_path_unknown");
+            } catch (err) { MaintenanceBudget.current()?.check();
+              if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+            }
+            bundles.add(canonical);
+          }
+          const anchor = again.anchor;
+          const others = selected.filter(r => r.captureId !== anchor.captureId);
+          for (const bundle of bundles) await unlink("bundle", bundle);
+          for (const record of others.filter(r => !r.exactHoldBinding)) await unlink("record", this.recordPath(record));
+          for (const record of others.filter(r => r.exactHoldBinding)) await unlink("record", this.recordPath(record));
+          await unlink("anchor", this.recordPath(anchor));
+          const reason = await openRefusal();
+          if (reason) throw new OperatorDisposeRefusal(reason);
+          io.budget.check();
+          await step("rmdir", runDir, "before");
+          try { await ownedRecoveryIO(() => fs.rmdir(runDir)); }
+          catch (err) {
+            MaintenanceBudget.current()?.check();
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") return partial("rmdir_failed");
+          }
+          await step("rmdir", runDir, "after");
+          let remaining: number;
+          try { remaining = (await ownedRecoveryIO(() => fs.readdir(runDir))).filter(name => name.endsWith(".json")).length; }
+          catch (err) {
+            MaintenanceBudget.current()?.check();
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") return partial("remaining_unreadable");
+            remaining = 0;
+          }
+          return { kind: "retired", generation, remaining };
+        });
+      } catch (err) { outcome = fail(err); }
+    };
+    let boundary: "passed" | "retained" | undefined;
+    try { boundary = await this.inventorySourceBoundary(diagnostics.context, action); }
+    catch (err) { outcome ??= fail(err); }
+    if (outcome) return outcome;
+    if (!entered || boundary === "retained") diagnostics.retained();
+    if (failure) return fail(failure.error);
+    return crossed ? partial("source_boundary_retained") : refused(diagnostics.reason());
   }
 
   /** The expectation forget awaits under J with its one bounded read: everything again, freshly observed, and

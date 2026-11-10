@@ -51,16 +51,18 @@ by an orphan reclaim. No retirement, rebind or discard authority is added, and t
 
 ## Amendment 2026-11-04: operator local-record resolution (#3885)
 
-A worker-local operator command can now retire guarded local recovery records,
-but only for Case A: the exact closed hold was released with a receipt matching the saved
+This amendment added a worker-local operator command that retires guarded local
+recovery records, and it covered Case A only: the exact closed hold was released with a receipt matching the saved
 FINAL request, with or without the FINAL ACK already saved (an ACK with a
 discarded hold is refused). The binding, lock order, retention exclusions and
 failure model are in the
 [ADR-2417 amendment](2417-guarded-local-retention.md#amendment-2026-11-04-operator-resolution-of-guarded-local-records-3885).
 The owner-disposition surface (D6) is unchanged, and no new server authority is
 added. Case B (a discarded hold, or a release without this record's matching
-receipt) remains owner-pending and is refused (typically `case_b_pending_owner_review`);
-its proposed contract is recorded in that ADR and is not accepted.
+receipt) was not part of this amendment; it is now handled by an explicit,
+operator-confirmed `--case-b` record-only disposition, recorded in the
+[ADR-2417 Case B amendment](2417-guarded-local-retention.md#amendment-2026-11-10-case-b-local-record-disposition-3885)
+(the former `case_b_pending_owner_review` refusal no longer exists).
 
 ## Amendment 2026-10-30 — same-issue witness policy
 

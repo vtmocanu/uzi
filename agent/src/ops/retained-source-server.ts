@@ -80,7 +80,7 @@ export interface RetainedSourceRunnerPort {
   /** issue #3885: operator resolution of one guarded local record generation. The coordinator takes
    *  authority A itself, so the channel must call it outside any authority transaction. */
   resolveLocalRecord(
-    input: OperatorRequestSignals & { runId: string; generation: number; confirm: string },
+    input: OperatorRequestSignals & { runId: string; generation: number; confirm: string; action?: "case_b" },
   ): Promise<ResolveLocalRecordResult>;
 }
 
@@ -124,7 +124,7 @@ export interface RetainedSourceServerDeps {
 type Request =
   | { op: "inspect"; selector: RetainedSourceSelector | undefined }
   | { op: "local-records"; run: string }
-  | { op: "resolve-local-record"; run: string; generation: number; confirm: string }
+  | { op: "resolve-local-record"; run: string; generation: number; confirm: string; action?: "case_b" }
   | { op: "discard"; selector: RetainedSourceSelector; confirm: string; protectedSource: boolean };
 
 interface LastDisposition {
@@ -153,12 +153,19 @@ function parseRequest(line: string): Request | string {
   // issue #3885: the local-record ops take a bare run id (no attempt), so they branch off first.
   if (o.op === "local-records" || o.op === "resolve-local-record") {
     const keys = o.op === "local-records" ? ["op", "run"] : ["op", "run", "generation", "confirm"];
-    if (Object.keys(o).length !== keys.length || Object.keys(o).some((k) => !keys.includes(k))) return "invalid_request";
+    // `action` is an optional extra key of resolve-local-record only, and its sole legal value is "case_b".
+    const hasAction = o.op === "resolve-local-record" && Object.prototype.hasOwnProperty.call(o, "action");
+    const expected = hasAction ? [...keys, "action"] : keys;
+    if (Object.keys(o).length !== expected.length || Object.keys(o).some((k) => !expected.includes(k))) return "invalid_request";
     if (typeof o.run !== "string" || !OPERATOR_RUN_ID_RE.test(o.run)) return "invalid_request";
     if (o.op === "local-records") return { op: "local-records", run: o.run };
     const g = o.generation;
     if (!(typeof g === "number" && Number.isSafeInteger(g) && g > 0)) return "invalid_request";
     if (typeof o.confirm !== "string" || !CONFIRM_RE.test(o.confirm)) return "invalid_request";
+    if (hasAction) {
+      if (o.action !== "case_b") return "invalid_request";
+      return { op: "resolve-local-record", run: o.run, generation: g, confirm: o.confirm, action: "case_b" };
+    }
     return { op: "resolve-local-record", run: o.run, generation: g, confirm: o.confirm };
   }
   const allowed = ["op", "run", "generation", "attempt", "confirm", "protected"];
@@ -458,6 +465,7 @@ export class RetainedSourceServer {
         // (it would make the coordinator borrow it), and no withRetainedSourceBoundary.
         result = await this.deps.runner.resolveLocalRecord({
           runId: req.run, generation: req.generation, confirm: req.confirm,
+          ...(req.action ? { action: req.action } : {}),
           requestSignal, shutdownSignal: this.shutdown.signal, deadlineAt: now() + (this.deps.resolveDeadlineMs ?? RESOLVE_DEADLINE_MS),
         });
       } catch (err) {

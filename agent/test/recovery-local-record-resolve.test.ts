@@ -11,6 +11,7 @@ import { RecoveryCoordinator, type RecoveryRecord } from "../src/recovery.js";
 import type { RecoveryExactHold } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { binding, closed, environment, fixture, git, inventory, patch, type Variant } from "./fixtures/recovery-bindingless-compat.js";
+import { fakeSourceEvidence } from "./fixtures/recovery-case-b-evidence.js";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }); });
@@ -230,17 +231,25 @@ test("describe: a replay refused persistently is replay_refused_persisted", asyn
   assert.equal(await w.classification(), "replay_refused_persisted");
 });
 
-test("describe: a discarded hold, or a receipt that does not match, is Case B and is never resolved", async () => {
+test("describe: a discarded hold, or a receipt that does not match, is never resolved as Case A", async () => {
   for (const variant of ["acknowledged", "saved-final"] as const) {
     const w = await world(variant);
-    w.exact = closed(w.f);
-    assert.equal(await w.classification(), "case_b_pending_owner_review");
+    // A saved FINAL without ACK is Case B by this evidence (issue #3885): it needs source evidence and its own action.
+    Object.assign(w.coordinator, { operatorSourceEvidence: async () => fakeSourceEvidence(w.runId, w.bare) });
+    const ackd = variant === "acknowledged";
     const before = await inventory(w.root);
     const refs = w.refs();
-    assert.deepEqual(await w.resolve("a".repeat(64)), { kind: "refused", reason: "case_b_pending_owner_review" });
-    w.exact = released(w, { final_receipt: { kind: "settled", coverage_digest: "b".repeat(64) } });
-    assert.equal(await w.classification(), "case_b_pending_owner_review");
-    assert.deepEqual(await w.resolve("a".repeat(64)), { kind: "refused", reason: "case_b_pending_owner_review" });
+    for (const [exact, caseB] of [[closed(w.f), "case_b_owner_discard"],
+      [released(w, { final_receipt: { kind: "settled", coverage_digest: "b".repeat(64) } }), "case_b_released_mismatch"]] as const) {
+      w.exact = exact;
+      const expected = ackd ? "ack_evidence_inconsistent" : caseB;
+      assert.equal(await w.classification(), expected);
+      assert.deepEqual(await w.resolve("a".repeat(64)), { kind: "refused", reason: ackd ? "ack_evidence_inconsistent" : "descriptor_changed" });
+      if (!ackd) {
+        const digest = await w.digest();
+        assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "case_b_disposition_required" });
+      }
+    }
     assert.equal(w.refs(), refs);
     assert.deepEqual(await inventory(w.root), before);
   }
@@ -248,6 +257,7 @@ test("describe: a discarded hold, or a receipt that does not match, is Case B an
 
 test("describe and resolve: a matching receipt with different release evidence is Case B, with nothing touched", async () => {
   const w = await world("saved-final");
+  Object.assign(w.coordinator, { operatorSourceEvidence: async () => fakeSourceEvidence(w.runId, w.bare) });
   const request = w.f.record.finalRequest!;
   w.f.record = await patch(w.coordinator, w.f.record, { finalRequest: { ...request, evidence: "operator_evidence" } });
   w.exact = released(w);
@@ -255,11 +265,12 @@ test("describe and resolve: a matching receipt with different release evidence i
   assert.equal(await w.classification(), "case_a_replay", "the same evidence is resolvable");
   w.exact = released(w, { release_evidence: "some_other_evidence" });
   assert.deepEqual(w.exact?.final_receipt, w.f.record.finalRequest!.disposition, "the receipt itself matches");
-  assert.equal(await w.classification(), "case_b_pending_owner_review");
+  assert.equal(await w.classification(), "case_b_released_mismatch");
   w.e.state.allowFinal = true;
   const before = await inventory(w.root);
   const refs = w.refs();
-  assert.deepEqual(await w.resolve("a".repeat(64)), { kind: "refused", reason: "case_b_pending_owner_review" });
+  assert.deepEqual(await w.resolve("a".repeat(64)), { kind: "refused", reason: "descriptor_changed" });
+  assert.deepEqual(await w.resolve(await w.digest()), { kind: "refused", reason: "case_b_disposition_required" });
   assert.equal(w.refs(), refs);
   assert.deepEqual(await inventory(w.root), before);
   assert.equal(w.e.calls.final, 0, "no release POST");
@@ -315,7 +326,8 @@ test("describe: the other record classes", async () => {
   const receipt = await world("completion-receipt");
   assert.equal(await receipt.classification(), "completion_receipt_generation");
   const pending = await world("uploaded");
-  assert.equal(await pending.classification(), "cleanup_pending");
+  // One guarded aggregate and no saved FINAL is the Case B anchor (issue #3885); this fixture serves no exact hold.
+  assert.equal(await pending.classification(), "exact_evidence_unavailable");
   const protectedRun = await world();
   Object.assign(protectedRun.coordinator, { terminalRecordProtection: async () => true });
   assert.equal(await protectedRun.classification(), "terminal_protection");
@@ -1001,8 +1013,10 @@ for (const kind of ["settled", "held_publication"] as const) {
         }
         const bytes = await inventory(w.root);
         const refs = w.refs();
-        assert.equal(await w.classification(), "case_b_pending_owner_review");
-        assert.deepEqual(await w.resolve(confirm), { kind: "refused", reason: "case_b_pending_owner_review" });
+        // The acknowledged generation's evidence is inconsistent; the unacknowledged one is Case B (its Case A digest is stale).
+        Object.assign(w.coordinator, { operatorSourceEvidence: async () => fakeSourceEvidence(w.runId, w.bare) });
+        assert.equal(await w.classification(), acknowledged ? "ack_evidence_inconsistent" : "case_b_released_mismatch");
+        assert.deepEqual(await w.resolve(confirm), { kind: "refused", reason: acknowledged ? "ack_evidence_inconsistent" : "descriptor_changed" });
         await assertByteNeutral(w, bytes, refs);
         assert.equal(w.cleanupArgs.length, 0);
         assert.equal(w.e.calls.reserve + w.e.calls.upload + w.e.calls.produce + w.e.calls.held, 0);
