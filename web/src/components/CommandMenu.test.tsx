@@ -606,27 +606,36 @@ describe("Needs you group", () => {
   const fixtureRuns = () => [
     runOf({ id: "run-plan", status: "awaiting_approval", issue_iid: 418, status_since: T(9) }),
     runOf({ id: "run-ask", status: "awaiting_input", issue_iid: 409, status_since: T(10) }),
+    // An owner-disposition park: a plain pause is moved only by the owner.
+    runOf({ id: "run-park", status: "paused", issue_iid: 305, status_since: T(10) }),
     runOf({
       id: "run-pr",
       status: "completed",
-      issue_iid: 77,
-      mr_iid: 12,
+      forge_type: "gitlab",
+      issue_iid: 543,
+      mr_iid: 1043,
       mr_state: "opened",
       repo_id: "r-net",
       finished_at: T(11),
     }),
   ];
 
-  it("lists a plan, a question and a PR with the mock's labels and hints, and a plan choice opens the run page", async () => {
+  it("lists a plan, a question, a park and a PR with the mock's labels and hints, and a plan choice opens the run page", async () => {
     listRunsMock.mockResolvedValue({ runs: fixtureRuns() });
     renderShell();
     await openByShortcut();
     await screen.findByText("Review plan for #418");
     expect(screen.getByRole("group", { name: "Needs you" })).toBeTruthy();
-    expect(optionLabels().slice(0, 3)).toEqual(["Review plan for #418", "Answer #409", "Review PR #77"]);
+    expect(optionLabels().slice(0, 4)).toEqual([
+      "Review plan for #418",
+      "Answer #409",
+      "Resume #305",
+      "Review PR !1043",
+    ]);
     expect(hintOf("Review plan for #418")).toBe("Plan review");
     expect(hintOf("Answer #409")).toBe("Question");
-    expect(hintOf("Review PR #77")).toBe("Pull request");
+    expect(hintOf("Resume #305")).toBe("Parked");
+    expect(hintOf("Review PR !1043")).toBe("Pull request");
     expect(mockApi.listRuns).toHaveBeenCalledWith({ view: "summary" });
     fireEvent.click(optionByLabel("Review plan for #418"));
     expect(path()).toBe("/runs/run-plan");
@@ -641,9 +650,55 @@ describe("Needs you group", () => {
     fireEvent.click(optionByLabel("Answer #409"));
     expect(path()).toBe("/runs/run-ask");
     press(document.body, CTRL_K);
-    await screen.findByText("Review PR #77");
-    fireEvent.click(optionByLabel("Review PR #77"));
+    await screen.findByText("Review PR !1043");
+    fireEvent.click(optionByLabel("Review PR !1043"));
     expect(path()).toBe("/runs/run-pr");
+  });
+
+  it("labels a PR by the forge's MR reference, or by its issue when there is no MR number", () => {
+    const pr = (over: Partial<RunSummaryItem>) =>
+      runOf({ id: "p", status: "completed", mr_state: "opened", repo_id: "r", issue_iid: 543, ...over });
+    const labels = (run: RunSummaryItem) => decisionCommandItems(overviewDecisions([run])).map((i) => i.label);
+    expect(labels(pr({ forge_type: "gitlab", mr_iid: 1043 }))).toEqual(["Review PR !1043"]);
+    expect(labels(pr({ forge_type: "github", mr_iid: 1043 }))).toEqual(["Review PR #1043"]);
+    // overviewDecisions only yields PRs that have an MR, so build the no-MR case directly.
+    expect(
+      decisionCommandItems([
+        { kind: "pr", verb: "Review PR", since: T(1), run: pr({ forge_type: "gitlab", mr_iid: null }) },
+      ]).map((i) => i.label),
+    ).toEqual(["Review PR for #543"]);
+  });
+
+  it("keeps an explicit highlight on its Go to item when decisions arrive above it, and Enter goes there", async () => {
+    let resolveRuns: (v: { runs: RunSummaryItem[] }) => void = () => {};
+    listRunsMock.mockReturnValue(new Promise((r) => (resolveRuns = r)));
+    mockApi.listRepos.mockReturnValue(new Promise(() => {}));
+    renderShell();
+    await openByShortcut();
+    expect(optionLabels().slice(0, 3)).toEqual(["Start a chat", "Overview", "Repos"]);
+    fireEvent.keyDown(input(), { key: "ArrowDown" });
+    fireEvent.keyDown(input(), { key: "ArrowDown" });
+    await act(async () => {
+      resolveRuns({ runs: [fixtureRuns()[0]] });
+    });
+    await screen.findByText("Review plan for #418");
+    const selected = screen.getAllByRole("option").filter((o) => o.getAttribute("aria-selected") === "true");
+    expect(selected.map((o) => o.querySelector("span.truncate")?.textContent)).toEqual(["Repos"]);
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect(path()).toBe("/repos");
+  });
+
+  it("with no arrow pressed, Enter goes to the first Needs you item once decisions arrive", async () => {
+    let resolveRuns: (v: { runs: RunSummaryItem[] }) => void = () => {};
+    listRunsMock.mockReturnValue(new Promise((r) => (resolveRuns = r)));
+    renderShell();
+    await openByShortcut();
+    await act(async () => {
+      resolveRuns({ runs: [fixtureRuns()[0]] });
+    });
+    await screen.findByText("Review plan for #418");
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect(path()).toBe("/runs/run-plan");
   });
 
   it("lists held work with a Custody hint, adding the count above one", async () => {
@@ -714,23 +769,32 @@ describe("Needs you group", () => {
     expect(within(menu() as HTMLElement).getByRole("status").textContent).toContain("Boards unavailable");
   });
 
-  it("fetches runs and holds once per open and drops a response that lands after unmount", async () => {
-    let resolveRuns: (v: { runs: RunSummaryItem[] }) => void = () => {};
-    listRunsMock.mockReturnValue(new Promise((r) => (resolveRuns = r)));
-    const { unmount } = render(
-      <MemoryRouter>
-        <CommandMenu onClose={() => {}} isAdmin={false} />
-      </MemoryRouter>,
-    );
+  it("fetches runs and holds once per open; a late response after unmount throws and a reopen shows only its own decisions", async () => {
+    let resolveFirst: (v: { runs: RunSummaryItem[] }) => void = () => {};
+    listRunsMock.mockReturnValueOnce(new Promise((r) => (resolveFirst = r)));
+    const mount = () =>
+      render(
+        <MemoryRouter>
+          <CommandMenu onClose={() => {}} isAdmin={false} />
+        </MemoryRouter>,
+      );
+    const first = mount();
     expect(mockApi.listRuns).toHaveBeenCalledTimes(1);
     expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(1);
-    unmount();
-    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
-    await act(async () => {
-      resolveRuns({ runs: fixtureRuns() });
+    first.unmount();
+    listRunsMock.mockResolvedValueOnce({
+      runs: [runOf({ id: "run-fresh", status: "awaiting_approval", issue_iid: 2, status_since: T(9) })],
     });
-    expect(errors).not.toHaveBeenCalled();
-    errors.mockRestore();
+    mount();
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(2);
+    await screen.findByText("Review plan for #2");
+    await act(async () => {
+      resolveFirst({
+        runs: [runOf({ id: "run-stale", status: "awaiting_approval", issue_iid: 1, status_since: T(9) })],
+      });
+    });
+    expect(screen.queryByText("Review plan for #1")).toBeNull();
+    expect(screen.getByText("Review plan for #2")).toBeTruthy();
   });
 
   it("shows no Needs you rows while the decisions are still loading", async () => {
@@ -761,11 +825,12 @@ describe("Needs you group", () => {
     expect(within(screen.getByRole("group", { name: "Needs you" })).getAllByRole("option")).toHaveLength(
       decisions.length,
     );
-    expect(optionLabels().slice(0, 4)).toEqual([
+    expect(optionLabels().slice(0, 5)).toEqual([
       "Review held work",
       "Review plan for #418",
       "Answer #409",
-      "Review PR #77",
+      "Resume #305",
+      "Review PR !1043",
     ]);
   });
 

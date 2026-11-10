@@ -1,5 +1,6 @@
 // The command menu (PRD #3875): Cmd/Ctrl K opens a modal palette that lists the viewer's
-// destinations ("Go to") and a few actions, filtered by typing. Choosing an item only
+// pending decisions ("Needs you"), destinations ("Go to") and a few actions, filtered by
+// typing. Choosing an item only
 // NAVIGATES; nothing is executed in place. Built on Modal for focus move, Tab trap, Escape
 // and focus restore. The input is focused from this component's own effect (not autoFocus
 // or a ref callback) so Modal's child effect runs first and records the opener.
@@ -9,21 +10,14 @@ import { useNavigate } from "react-router-dom";
 import { api, type Repo, type RecoveryCustodyHolds, type RunSummaryItem } from "../lib/api";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
+import { mrRefSymbol } from "../lib/forgeNoun";
 import { overviewDecisions, type DecisionItem } from "../lib/overview";
 import { stripUnsafeChars } from "../lib/safeText";
 import { HELD_WORK_HREF } from "./HeldWorkCard";
 import { Modal } from "./Modal";
-import {
-  BoardIcon,
-  BranchIcon,
-  ChatIcon,
-  FileTextIcon,
-  PlayIcon,
-  SearchIcon,
-  ShieldIcon,
-  ThoughtIcon,
-} from "./icons";
+import { BoardIcon, ChatIcon, SearchIcon } from "./icons";
 import { visibleNavItems } from "./navItems";
+import { KindIcon } from "./NeedsDecisionCard";
 
 export type CommandGroup = "needs" | "actions" | "goto";
 
@@ -83,10 +77,10 @@ export function filterCommandItems(items: CommandItem[], query: string): Command
 }
 
 const RUN_DECISION_VIEW = {
-  plan: { hint: "Plan review", icon: <FileTextIcon /> },
-  question: { hint: "Question", icon: <ThoughtIcon /> },
-  park: { hint: "Resume", icon: <PlayIcon /> },
-  pr: { hint: "Pull request", icon: <BranchIcon /> },
+  plan: { hint: "Plan review", icon: <KindIcon kind="plan" /> },
+  question: { hint: "Question", icon: <KindIcon kind="question" /> },
+  park: { hint: "Parked", icon: <KindIcon kind="park" /> },
+  pr: { hint: "Pull request", icon: <KindIcon kind="pr" /> },
 } as const;
 
 // The Needs you items for a set of decisions (overviewDecisions' output). Every target
@@ -100,15 +94,19 @@ export function decisionCommandItems(decisions: ReadonlyArray<DecisionItem>): Co
         label: d.verb,
         hint: d.count > 1 ? `Custody · ${d.count}` : "Custody",
         to: HELD_WORK_HREF,
-        icon: <ShieldIcon />,
+        icon: <KindIcon kind="held" />,
         title: d.label === null ? undefined : stripUnsafeChars(d.label),
       };
     }
     const run = d.run;
     const view = RUN_DECISION_VIEW[d.kind];
     let label: string;
-    if (run.issue_iid != null) {
-      label = d.kind === "plan" ? `Review plan for #${run.issue_iid}` : `${d.verb} #${run.issue_iid}`;
+    if (d.kind === "pr" && run.mr_iid != null) {
+      // The card's reference: the MR number with the forge's symbol, not the issue's.
+      label = `${d.verb} ${mrRefSymbol(run.forge_type)}${run.mr_iid}`;
+    } else if (run.issue_iid != null) {
+      label =
+        d.kind === "plan" || d.kind === "pr" ? `${d.verb} for #${run.issue_iid}` : `${d.verb} #${run.issue_iid}`;
     } else {
       const name = stripUnsafeChars(run.title || run.issue_title || "");
       label = name ? `${d.verb}: ${name}` : d.verb;
@@ -134,7 +132,8 @@ export function CommandMenu({
 }: {
   onClose: () => void;
   isAdmin: boolean;
-  // Further items (the Needs you decisions) merged with the built-in groups.
+  // A seam for additional items merged with the built-in groups. Its only caller today is
+  // the test; the render-time strip covers whatever text it carries.
   extraItems?: CommandItem[];
 }) {
   const navigate = useNavigate();
@@ -145,8 +144,9 @@ export function CommandMenu({
   const optionId = (i: number) => `${uid}-opt-${i}`;
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
-  // The active option is tracked by item id, so rows inserted above it (the repos arriving)
-  // do not shift the highlight to a different command. null: the first visible item.
+  // A null highlight follows the list's first item (so Enter runs the first match, even when
+  // decisions arrive above it); an explicit highlight (arrows or hover) is kept by item id,
+  // so rows inserted above it do not shift it to a different command.
   const [activeId, setActiveId] = useState<string | null>(null);
   const [repoState, setRepoState] = useState<RepoState>({ status: "loading" });
   const [decisionState, setDecisionState] = useState<DecisionState>({ status: "loading" });
@@ -162,7 +162,7 @@ export function CommandMenu({
     let alive = true;
     void Promise.allSettled([api.listRuns({ view: "summary" }), api.getRecoveryHolds()]).then(
       ([runsResult, holdsResult]) => {
-        if (!alive) return;
+        if (!alive) return; // defensive: setState after unmount is a no-op in React 19
         if (runsResult.status !== "fulfilled" || holdsResult.status !== "fulfilled") {
           setDecisionState({ status: "error" });
           return;
