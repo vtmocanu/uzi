@@ -1824,7 +1824,9 @@ const SCRATCH_CENSUS_LIMITS = { rootEntries: 4096, leafEntries: 200_000, totalEn
  * walks `lstat`-only through pinned descriptors (a symlink is never followed, a directory is descended
  * only after an `O_NOFOLLOW` re-pin whose identity equals the `lstat`; a directory on another st_dev is
  * reported, never entered) and prints one JSON line per top-level entry:
- * `{name,type:"dir"|"other"|"absent",dev,ino,uid,fsdiff,fuid,bytes,shared,ctime,inc}` (`dev`/`ino`
+ * `{name,type:"dir"|"other"|"absent"|"unreadable",dev,ino,uid,fsdiff,fuid,bytes,shared,ctime,inc}`
+ * (`unreadable` = an lstat error other than ENOENT; names are read as bytes, and one that is not valid
+ * UTF-8 is reported as a lone surrogate plus its hex bytes; `dev`/`ino`
  * decimal strings; `bytes` = allocated bytes of directories and `nlink==1` entries, `shared` = those of
  * `nlink>1` entries; `ctime` = the newest ctime in ms over the whole subtree including the entry itself;
  * `fsdiff` = any subtree entry on another st_dev; `fuid` = any entry whose uid is not the root's; `inc` = a
@@ -1846,6 +1848,10 @@ if (parts.length === 0 || parts.some((x) => x === "" || x === "." || x === "..")
 if (leafArg !== "-" && (leafArg === "" || leafArg === "." || leafArg === ".." || leafArg.includes("/") || leafArg.includes("\\0"))) process.exit(6);
 const deadline = Date.now() + budgetMs;
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+// Entry names are bytes: every path below is a Buffer, so a name that is not valid UTF-8 is examined
+// as itself and never aliases another name through U+FFFD replacement.
+const atb = (fd, nameBuf) => Buffer.concat([Buffer.from(FD + fd + "/"), nameBuf]);
+const strict = new TextDecoder("utf-8", { fatal: true });
 let rootPin;
 try {
   rootPin = fs.openSync("/", PIN);
@@ -1876,20 +1882,21 @@ function room(L) {
 }
 function walk(L, dirFd, depth) {
   let dir;
-  try { dir = fs.opendirSync(FD + dirFd); } catch { L.inc = true; return; }
+  try { dir = fs.opendirSync(FD + dirFd, { encoding: "buffer" }); } catch { L.inc = true; return; }
   try {
     for (;;) {
       let e;
       try { e = dir.readSync(); } catch { L.inc = true; return; }
       if (e === null || !room(L)) return;
+      const ep = atb(dirFd, Buffer.from(e.name));
       let st;
-      try { st = fs.lstatSync(at(dirFd, e.name), { bigint: true }); } catch { L.inc = true; continue; }
+      try { st = fs.lstatSync(ep, { bigint: true }); } catch { L.inc = true; continue; }
       note(L, st);
       if (!st.isDirectory() || st.dev !== rst.dev) continue;
       if (depth + 1 > maxDepth) { L.inc = true; continue; }
       let child;
       try {
-        const pin = fs.openSync(at(dirFd, e.name), PIN);
+        const pin = fs.openSync(ep, PIN);
         try {
           const ps = fs.fstatSync(pin, { bigint: true });
           if (ps.dev !== st.dev || ps.ino !== st.ino) { L.inc = true; continue; }
@@ -1902,12 +1909,19 @@ function walk(L, dirFd, depth) {
     dir.closeSync();
   }
 }
-function entry(name) {
+// The reported name: the string when the bytes are valid UTF-8, else a lone surrogate plus the hex
+// bytes (no valid name decodes to a lone surrogate, so it can neither collide nor be mistaken for one).
+function reportName(nameBuf) {
+  try { return strict.decode(nameBuf); } catch { return "\\ud800" + nameBuf.toString("hex"); }
+}
+function entry(nameBuf) {
+  const name = reportName(nameBuf);
   const L = { count: 0, ctime: 0, bytes: 0, shared: 0, fsdiff: false, fuid: false, inc: false };
+  const ep = atb(rootFd, nameBuf);
   let st;
-  try { st = fs.lstatSync(at(rootFd, name), { bigint: true }); } catch (e) {
+  try { st = fs.lstatSync(ep, { bigint: true }); } catch (e) {
     if (e.code === "ENOENT") { out({ name, type: "absent" }); return; }
-    out({ name, type: "other", dev: "0", ino: "0", uid: -1, fsdiff: false, fuid: false, bytes: 0, shared: 0, ctime: 0, inc: true });
+    out({ name, type: "unreadable", dev: "0", ino: "0", uid: -1, fsdiff: false, fuid: false, bytes: 0, shared: 0, ctime: 0, inc: true });
     return;
   }
   total++;
@@ -1916,7 +1930,7 @@ function entry(name) {
   if (total > maxTotal || Date.now() > deadline) L.inc = true;
   else if (isDir && st.dev === rst.dev) {
     try {
-      const pin = fs.openSync(at(rootFd, name), PIN);
+      const pin = fs.openSync(ep, PIN);
       let child;
       try {
         const ps = fs.fstatSync(pin, { bigint: true });
@@ -1930,10 +1944,10 @@ function entry(name) {
     fsdiff: L.fsdiff, fuid: L.fuid, bytes: L.bytes, shared: L.shared, ctime: L.ctime, inc: L.inc });
 }
 let seen = 0, overflow = false;
-if (leafArg !== "-") { entry(leafArg); seen = 1; }
+if (leafArg !== "-") { entry(Buffer.from(leafArg)); seen = 1; }
 else {
   let dir;
-  try { dir = fs.opendirSync(FD + rootFd); } catch { process.exit(7); }
+  try { dir = fs.opendirSync(FD + rootFd, { encoding: "buffer" }); } catch { process.exit(7); }
   try {
     for (;;) {
       let e;
@@ -1941,7 +1955,7 @@ else {
       if (e === null) break;
       if (seen >= maxRoot) { overflow = true; break; }
       seen++;
-      entry(e.name);
+      entry(Buffer.from(e.name));
     }
   } finally { dir.closeSync(); }
 }

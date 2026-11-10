@@ -58,12 +58,14 @@ const BIND_LIMIT = 256;
  * shape was not fully understood: a non-array Mounts, a bind without a string Source, Binds that
  * is neither null nor an array of strings. Named volumes (a non-absolute Binds source) are ignored. */
 function bindSourcesOf(inspected: Record<string, unknown>, hostConfig: Record<string, unknown>):
-    { sources: string[]; unknown: boolean } {
+    { sources: string[]; unknown: boolean; entries: number } {
   const sources: string[] = [];
   let unknown = false;
+  let entries = 0;
   const mounts = inspected.Mounts;
   if (!Array.isArray(mounts)) unknown = true;
   else for (const m of mounts) {
+    entries++;
     if (!record(m)) { unknown = true; continue; }
     if (m.Type !== "bind") continue;
     if (typeof m.Source === "string") sources.push(m.Source); else unknown = true;
@@ -72,6 +74,7 @@ function bindSourcesOf(inspected: Record<string, unknown>, hostConfig: Record<st
   if (hostMounts !== undefined && hostMounts !== null) {
     if (!Array.isArray(hostMounts)) unknown = true;
     else for (const m of hostMounts) {
+      entries++;
       if (!record(m)) { unknown = true; continue; }
       if (m.Type !== "bind") continue;
       if (typeof m.Source === "string") sources.push(m.Source); else unknown = true;
@@ -81,13 +84,14 @@ function bindSourcesOf(inspected: Record<string, unknown>, hostConfig: Record<st
   if (binds !== undefined && binds !== null) {
     if (!Array.isArray(binds)) unknown = true;
     else for (const b of binds) {
+      entries++;
       if (typeof b !== "string") { unknown = true; continue; }
       if (!b.startsWith("/")) continue;
       const colon = b.indexOf(":");
       sources.push(colon < 0 ? b : b.slice(0, colon));
     }
   }
-  return { sources, unknown };
+  return { sources, unknown, entries };
 }
 function stopped(v: unknown): boolean {
   return record(v) && v.Running === false && v.Restarting === false && v.Paused === false &&
@@ -227,7 +231,7 @@ export async function openPodEpochDaemonBarrier(
     })();
     return closed;
   };
-  type Seen = { state: string; sources: string[]; unknown: boolean };
+  type Seen = { state: string; sources: string[]; unknown: boolean; entries: number };
   /** One full list-and-inspect pass; the first runs at open, later ones from refreshInventory. */
   const scan = async (): Promise<Map<string, Seen>> => {
     const containers = await get("/containers/json?all=1");
@@ -275,7 +279,7 @@ export async function openPodEpochDaemonBarrier(
     let total = 0;
     for (const v of baseline.values()) {
       if (v.unknown) return { state: "unknown" };
-      total += v.sources.length;
+      total += v.entries;
       for (const source of v.sources) all.add(source);
     }
     return total > BIND_LIMIT ? { state: "unknown" } : { state: "read", sources: [...all].sort() };

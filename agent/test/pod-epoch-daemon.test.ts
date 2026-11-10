@@ -350,6 +350,9 @@ test("bindSources is unknown for every unrecognised mount shape", async t => {
     ["HostConfig.Mounts not an array", { Mounts: [], HostConfig: { Mounts: "x" } }],
     ["Binds not an array", { Mounts: [], HostConfig: { Binds: "/a:/b" } }],
     ["Binds element not a string", { Mounts: [], HostConfig: { Binds: [1] } }],
+    ["more than 256 non-bind Mounts entries", { Mounts: Array.from({ length: 257 }, (_, n) => ({ Type: "volume", Name: "v" + n })) }],
+    ["more than 256 mounts across Mounts, HostConfig.Mounts and named-volume Binds", { Mounts: Array.from({ length: 100 }, () => ({ Type: "tmpfs" })),
+      HostConfig: { Mounts: Array.from({ length: 100 }, () => ({ Type: "tmpfs" })), Binds: Array.from({ length: 57 }, (_, n) => "vol" + n + ":/m") } }],
     ["more than 256 binds", { Mounts: [], HostConfig: { Binds: Array.from({ length: 257 }, (_, n) => "/p" + n + ":/m") } }],
   ];
   for (const [name, spec] of shapes) await t.test(name, async sub => {

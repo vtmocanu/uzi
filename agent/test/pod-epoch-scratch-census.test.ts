@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { GitCache } from "../src/git.js";
-import { parseScratchCensus } from "../src/pod-epoch-scratch.js";
+import { classifyScratchCensus, parseScratchCensus, postCensusOf } from "../src/pod-epoch-scratch.js";
 import { SCRATCH_CENSUS_SCRIPT, censusScratchRoot, runAgentHelper } from "../src/rmtree.js";
 import { runnerCommand } from "../src/runner-uid.js";
 
@@ -131,6 +131,48 @@ test("depth, per-leaf, total and root-entry caps mark the leaf incomplete or the
   assert.deepEqual(limited.at(-1), { end: true, entries: 2, overflow: true });
   assert.deepEqual(rows((await raw(root, {})).stdout).at(-1), { end: true, entries: 3, overflow: false });
   assert.equal(byName((await raw(root, { budgetMs: 0 })).stdout).get("deep")!.inc, true, "an exhausted time budget is a lower bound");
+});
+
+const bytesPath = (...parts: Array<string | Buffer>) => Buffer.concat(parts.map(p => (typeof p === "string" ? Buffer.from(p) : p)));
+const sleepMs = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+test("names that collide under UTF-8 replacement are all examined (U+FFFD file vs 0xFF directory)", async t => {
+  const root = tmp(t);
+  const leaf = path.join(root, "leaf");
+  fs.mkdirSync(leaf);
+  fs.writeFileSync(bytesPath(leaf, "/", Buffer.from([0xef, 0xbf, 0xbd])), "x");
+  fs.mkdirSync(bytesPath(leaf, "/", Buffer.from([0xff])));
+  sleepMs(40);
+  const nested = bytesPath(leaf, "/", Buffer.from([0xff]), "/late");
+  fs.writeFileSync(nested, Buffer.alloc(MIB, 1));
+  const e = entries((await census(root)).parsed).get("leaf")!;
+  assert.equal(e.incomplete, false);
+  assert.ok(e.maxCtimeMs >= fs.statSync(nested).ctimeMs - 1, "the write inside the 0xFF directory raised the leaf ctime");
+  assert.ok(e.bytes >= MIB, "and its bytes were counted: " + e.bytes);
+});
+
+test("top-level names that are not valid UTF-8 are reported distinctly and refused by name", async t => {
+  const root = tmp(t);
+  fs.mkdirSync(bytesPath(root, "/", Buffer.from([0xfe])));
+  fs.mkdirSync(bytesPath(root, "/", Buffer.from([0xfd])));
+  fs.mkdirSync(path.join(root, "good"));
+  const { result, parsed } = await census(root);
+  assert.equal(result.code, 0);
+  assert.ok(!("refused" in parsed), JSON.stringify(parsed));
+  assert.equal(parsed.entries.length, 3);
+  const classified = classifyScratchCensus({ census: parsed, t0Ms: Infinity, mountedLeaves: new Set(), boundLeaves: new Set(),
+    protectedLeaves: new Set(), heldLeaves: new Set() });
+  assert.equal(classified.kept.name_refused, 2);
+  assert.deepEqual(classified.admitted.map(l => l.name), ["good"]);
+});
+
+test("a single-leaf lstat error other than ENOENT is unreadable, not another inode", async t => {
+  const root = tmp(t);
+  const { parsed } = await census(root, undefined, "a".repeat(300));
+  const e = entries(parsed).get("a".repeat(300))!;
+  assert.equal(e.type, "unreadable");
+  assert.equal(e.incomplete, true);
+  assert.deepEqual(postCensusOf(e, "1:1"), { state: "unreadable" });
 });
 
 test("the census never writes: the tree is byte-for-byte unchanged", async t => {

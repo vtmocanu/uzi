@@ -265,6 +265,15 @@ const vanished = (e: unknown): boolean => {
   return code === "ENOENT" || code === "ESRCH";
 };
 
+const RUNNER_PREFIX = "/data/runner/";
+const SHARED_PREFIX = "/data/runner-shared/";
+
+/** The worker container mounts the whole data PVC at /data and its runner-shared subPath at
+ * /data/runner, so the same scratch inodes are also reachable under /data/runner-shared. */
+function rootsWithAlias(root: string): string[] {
+  return root.startsWith(RUNNER_PREFIX) ? [root, SHARED_PREFIX + root.slice(RUNNER_PREFIX.length)] : [root];
+}
+
 function allWorkerIds(status: string, label: "Uid" | "Gid"): boolean {
   const line = status.split("\n").find(l => l.startsWith(label + ":"));
   if (!line) return false;
@@ -284,7 +293,7 @@ export function scanScratchProcesses(root: string, leafNames: readonly string[],
   } catch { return { refused: "not_idle" }; }
   if (pids.length > MAX_PIDS) return { refused: "not_idle" };
   const held = new Set<string>();
-  const leaves = leafNames.map(name => [name, path.posix.join(root, name)] as const);
+  const leaves = rootsWithAlias(root).flatMap(r => leafNames.map(name => [name, path.posix.join(r, name)] as const));
   const note = (target: string) => {
     const link = target.replace(/ \(deleted\)$/, "");
     for (const [name, full] of leaves) if (link === full || link.startsWith(full + "/")) held.add(name);
@@ -314,12 +323,15 @@ type LstatLike = { isDirectory(): boolean; isSymbolicLink(): boolean };
 
 /** Classifies the daemon's bind sources against the root. Normal form is absolute, `normalize`d and
  * without a trailing slash. A source at the root or above it refuses the phase (`bind_ancestor`); one
- * inside a leaf keeps that leaf (`bind_referenced`); a source whose first component under the root is
- * a symlink, a file or missing is `bind_unknown`. Sources elsewhere are unrelated. */
+ * inside a leaf keeps that leaf (`bind_referenced`); a source with a symlink component at or under the
+ * root, or one outside it that resolves to or across the root, or whose first component under the root
+ * is a file or missing, is `bind_unknown`. Sources elsewhere are unrelated. */
 export function classifyBindSources(input: {
   sources: readonly string[]; root: string;
   lstat?: (p: string) => LstatLike | undefined;
+  realpath?: (p: string) => string;
 }): { refused: "bind_unknown" | "bind_ancestor" } | { referenced: Set<string> } {
+  const realpath = input.realpath ?? ((p: string) => fs.realpathSync(p));
   const lstat = input.lstat ?? ((p: string) => {
     try { return fs.lstatSync(p); } catch (e) { if (vanished(e)) return undefined; throw e; }
   });
@@ -328,6 +340,24 @@ export function classifyBindSources(input: {
   for (const source of input.sources) {
     if (!path.posix.isAbsolute(source) || path.posix.normalize(source) !== source || (source.length > 1 && source.endsWith("/")))
       return { refused: "bind_unknown" };
+    // Every component, inside or outside the root, must not be a symlink: one would let the source
+    // resolve into a leaf its literal path does not name. A missing component ends the walk (nothing
+    // below it can be a symlink); the literal path then decides.
+    let prefix = "";
+    for (const part of source.split("/").filter(Boolean)) {
+      prefix += "/" + part;
+      let component: LstatLike | undefined;
+      try { component = lstat(prefix); } catch { return { refused: "bind_unknown" }; }
+      if (!component) break;
+      if (component.isSymbolicLink()) {
+        // Inside the root it is never acceptable. Outside, it only matters when it resolves to or
+        // across the root (an ordinary /var/run -> /run does not).
+        if (within(input.root, prefix)) return { refused: "bind_unknown" };
+        let real: string;
+        try { real = realpath(prefix); } catch { return { refused: "bind_unknown" }; }
+        if (within(input.root, real) || within(real, input.root)) return { refused: "bind_unknown" };
+      }
+    }
     if (within(source, input.root)) { ancestor = true; continue; }
     if (!source.startsWith(input.root + "/")) continue;
     const leaf = source.slice(input.root.length + 1).split("/")[0]!;
@@ -346,12 +376,15 @@ export function classifyBindSources(input: {
 export function protectedLeaves(paths: Iterable<string>, root: string, leafNames: readonly string[]): Set<string> {
   const leaves = new Set(leafNames);
   const kept = new Set<string>();
+  const roots = rootsWithAlias(root);
   for (const recorded of paths) {
     if (!path.isAbsolute(recorded)) continue;
     const resolved = path.resolve(recorded);
-    if (!resolved.startsWith(root + "/")) continue;
-    const leaf = resolved.slice(root.length + 1).split("/")[0]!;
-    if (leaves.has(leaf)) kept.add(leaf);
+    for (const r of roots) {
+      if (!resolved.startsWith(r + "/")) continue;
+      const leaf = resolved.slice(r.length + 1).split("/")[0]!;
+      if (leaves.has(leaf)) kept.add(leaf);
+    }
   }
   return kept;
 }
@@ -492,7 +525,7 @@ export async function readProtectedStores(roots: readonly string[], opts: { inte
 
 export interface CensusEntry {
   name: string;
-  type: "dir" | "other" | "absent";
+  type: "dir" | "other" | "absent" | "unreadable";
   devIno: string;
   uid: number;
   fsDiffers: boolean;
@@ -534,10 +567,11 @@ export function parseScratchCensus(result: { code: number; stdout: string }, roo
   for (const item of parsed.slice(1, -1)) {
     const { name, type } = item;
     if (typeof name !== "string" || name === "" || name.includes("/") || name.includes("\0") || names.has(name)) return bad;
-    if (type !== "dir" && type !== "other" && type !== "absent") return bad;
+    if (type !== "dir" && type !== "other" && type !== "absent" && type !== "unreadable") return bad;
     names.add(name);
-    if (type === "absent") {
-      entries.push({ name, type, devIno: "", uid: -1, fsDiffers: false, foreignUid: false, bytes: 0, sharedBytes: 0, maxCtimeMs: 0, incomplete: false });
+    if (type === "absent" || type === "unreadable") {
+      entries.push({ name, type, devIno: "", uid: -1, fsDiffers: false, foreignUid: false, bytes: 0, sharedBytes: 0, maxCtimeMs: 0,
+        incomplete: type === "unreadable" });
       continue;
     }
     if (!isDecimal(item.dev) || !isDecimal(item.ino) || typeof item.uid !== "number" || !Number.isSafeInteger(item.uid) ||
@@ -630,6 +664,15 @@ export interface SettlementInput {
   postCensus: PostCensus;
   /** Allocated bytes the pre-delete re-census revalidated. */
   bytesBefore: number;
+}
+
+/** Maps a single-leaf census entry to the settlement input. A missing entry or one the helper could
+ * not lstat (`unreadable`) is never read as "another inode". */
+export function postCensusOf(entry: CensusEntry | undefined, expect: string): PostCensus {
+  if (!entry || entry.type === "unreadable") return { state: "unreadable" };
+  if (entry.type === "absent") return { state: "absent" };
+  if (entry.type === "dir" && entry.devIno === expect) return { state: "same", bytes: entry.bytes, complete: !entry.incomplete };
+  return { state: "other" };
 }
 
 export type Settlement =

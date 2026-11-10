@@ -8,7 +8,7 @@ import { test } from "node:test";
 import {
   KEPT_REASONS, MAX_ADMITTED_LEAVES, absorbBareConfigValue, absorbJsonPaths, checkScratchFilesystem, classifyBindSources,
   classifyScratchCensus, classifyScratchSettlement, censusEntryUnchanged, devToMajorMinor, evaluateScratchMounts,
-  newPathSink, parseScratchCensus, pinScratchRoot, protectedLeaves, readPodEntryFence, readProtectedStores,
+  newPathSink, parseScratchCensus, pinScratchRoot, postCensusOf, protectedLeaves, readPodEntryFence, readProtectedStores,
   readScratchMounts, repinScratchRoot, scanScratchProcesses, scratchFilesystemOf, scratchLayout,
 } from "../src/pod-epoch-scratch.js";
 import type { CensusEntry, ParsedCensus, ScratchIo, ScratchLayout, SettlementInput } from "../src/pod-epoch-scratch.js";
@@ -318,6 +318,16 @@ test("scanScratchProcesses keeps leaves held by a cwd or descriptor, including d
   assert.deepEqual(scanScratchProcesses(SPLIT_ROOT, ["alpha", "beta", "gamma", "alphabet2"], fs, proc), { held: new Set(["alpha", "beta"]) });
 });
 
+test("scanScratchProcesses also matches the /data/runner-shared alias of the root", t => {
+  const proc = procTree(tmp(t), {
+    1: { cwd: "/data/runner-shared/.tmp/uzi-runner/alpha/sub" },
+    2: { cwd: "/", fds: ["/data/runner-shared/.tmp/uzi-runner/beta (deleted)", "/data/runner-shared/.tmp/uzi-runner-2/gamma"] },
+  });
+  assert.deepEqual(scanScratchProcesses(SPLIT_ROOT, ["alpha", "beta", "gamma"], fs, proc), { held: new Set(["alpha", "beta"]) });
+  // A root outside /data/runner has no alias.
+  assert.deepEqual(scanScratchProcesses("/elsewhere/root", ["alpha"], fs, proc), { held: new Set() });
+});
+
 test("scanScratchProcesses refuses a process that is not exactly the worker uid and gid", t => {
   const cases: Array<[string, FakeProc]> = [
     ["real uid", { uid: "10002\t10001\t10001\t10001" }], ["effective uid", { uid: "10001\t10002\t10001\t10001" }],
@@ -381,6 +391,29 @@ test("classifyBindSources classifies ancestors, leaf references and unrelated so
   assert.deepEqual(classifyBindSources({ sources: [root + "/alpha"], root, lstat: () => dirSt }), { referenced: new Set(["alpha"]) });
 });
 
+test("a symlink in any component of a bind source, inside or outside the root, is bind_unknown", t => {
+  const dir = tmp(t);
+  const root = path.join(dir, "root");
+  fs.mkdirSync(path.join(root, "A"), { recursive: true });
+  fs.mkdirSync(path.join(root, "B"));
+  const lstat = (p: string) => fs.lstatSync(p, { throwIfNoEntry: false });
+  const run = (sources: string[]) => classifyBindSources({ sources, root, lstat });
+  // (a) R/A/link -> ../B: only A is named, B is the real target.
+  fs.symlinkSync("../B", path.join(root, "A", "link"));
+  assert.deepEqual(run([path.join(root, "A", "link", "x")]), { refused: "bind_unknown" });
+  // (b) a source outside the root that resolves, through a symlink, into R/B.
+  fs.symlinkSync(path.join(root, "B"), path.join(dir, "outside"));
+  assert.deepEqual(run([path.join(dir, "outside", "x")]), { refused: "bind_unknown" });
+  assert.deepEqual(run([path.join(dir, "outside")]), { refused: "bind_unknown" });
+  // An outside symlink that resolves elsewhere (like /var/run -> /run) is unrelated.
+  fs.mkdirSync(path.join(dir, "elsewhere"));
+  fs.symlinkSync(path.join(dir, "elsewhere"), path.join(dir, "harmless"));
+  assert.deepEqual(run([path.join(dir, "harmless", "sock")]), { referenced: new Set() });
+  // A missing tail below a real leaf is classified by its literal path; a missing outside path is unrelated.
+  assert.deepEqual(run([path.join(root, "A", "not", "there")]), { referenced: new Set(["A"]) });
+  assert.deepEqual(run([path.join(dir, "nowhere", "x")]), { referenced: new Set() });
+});
+
 test("a bind source not in normal form is bind_unknown", t => {
   const root = tmp(t);
   for (const source of ["relative/path", "", root + "/alpha/", root + "//alpha", root + "/./alpha", root + "/alpha/../beta", "/data/runner/../x", "/a//b"])
@@ -404,6 +437,16 @@ test("protectedLeaves compares component-wise after normalisation", () => {
   assert.deepEqual(hit("relative/leaf"), []);
   assert.deepEqual(hit(root + "/unlisted"), []);
   assert.deepEqual([...protectedLeaves([root + "/leaf", root + "/other/x", "/x"], root, leaves)].sort(), ["leaf", "other"]);
+});
+
+test("protectedLeaves matches the /data/runner-shared alias and never a string-prefix sibling of the root", () => {
+  const leaves = ["leaf", "other"];
+  const hit = (p: string) => [...protectedLeaves([p], SPLIT_ROOT, leaves)];
+  assert.deepEqual(hit("/data/runner-shared/.tmp/uzi-runner/leaf/x"), ["leaf"]);
+  assert.deepEqual(hit("/data/runner-shared/.tmp/uzi-runner/../uzi-runner/other"), ["other"]);
+  assert.deepEqual(hit("/data/runner-shared/.tmp/uzi-runner-2/leaf"), []);
+  assert.deepEqual(hit(SPLIT_ROOT + "Xleaf/x"), [], "root as a string prefix of a sibling");
+  assert.deepEqual(hit(SPLIT_ROOT + "Xleaf"), []);
 });
 
 test("absorbJsonPaths collects absolute strings and keys and refuses over its bounds", () => {
@@ -596,6 +639,22 @@ test("parseScratchCensus accepts a closed listing and checks the root identity",
   assert.deepEqual(parsed.entries.map(e => [e.name, e.type, e.devIno]), [["a", "dir", "7:11"], ["b", "absent", ""]]);
   assert.deepEqual(parseScratchCensus({ code: 0, stdout: goodCensus }, "7:8"), { refused: "census_identity" });
   assert.deepEqual(parseScratchCensus({ code: 3, stdout: goodCensus.split("\n")[0]! + "\n" }, "7:7"), { refused: "census_identity" });
+});
+
+test("an unreadable single-leaf entry parses as incomplete and maps to PostCensus unreadable, never other", () => {
+  const stdout = [line({ root: "7:7", uid: 10002, mode: 448 }),
+    line({ name: "a", type: "unreadable", dev: "0", ino: "0", uid: -1, fsdiff: false, fuid: false, bytes: 0, shared: 0, ctime: 0, inc: true }),
+    line({ end: true, entries: 1, overflow: false })].join("\n") + "\n";
+  const parsed = parseScratchCensus({ code: 0, stdout }, "7:7");
+  assert.ok(!("refused" in parsed));
+  assert.equal(parsed.entries[0]!.type, "unreadable");
+  assert.equal(parsed.entries[0]!.incomplete, true);
+  assert.deepEqual(postCensusOf(parsed.entries[0], "7:11"), { state: "unreadable" });
+  assert.deepEqual(postCensusOf(undefined, "7:11"), { state: "unreadable" });
+  assert.deepEqual(postCensusOf(entry("a", { type: "absent" }), "7:11"), { state: "absent" });
+  assert.deepEqual(postCensusOf(entry("a", { type: "other", devIno: "7:11" }), "7:11"), { state: "other" });
+  assert.deepEqual(postCensusOf(entry("a", { devIno: "7:12" }), "7:11"), { state: "other" });
+  assert.deepEqual(postCensusOf(entry("a", { devIno: "7:11", bytes: 90, incomplete: true }), "7:11"), { state: "same", bytes: 90, complete: false });
 });
 
 test("parseScratchCensus refuses a failed exit, a missing end line and every malformed field", () => {
