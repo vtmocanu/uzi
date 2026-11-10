@@ -21269,8 +21269,11 @@ export class RunRunner {
    *   - `checkpoint`: issue / self_improve and descriptor-authorized task runs;
    *     task checkpoint destinations come from the server-authorized run key;
    *   - `branch`: task runs ONLY — the one kind whose runs.branch is set at creation (task.sql).
-   *     prompt (CreatePromptRun), ci_fix and mr_rework runs leave runs.branch NULL, so the api
-   *     answers not_eligible for them while live; they fire nothing and settle on completion.
+   *     ci_fix and mr_rework leave runs.branch NULL and have no checkpoint target, so the api
+   *     answers not_eligible while live; they fire nothing and settle on completion.
+   *   Prompt runs also leave runs.branch NULL, but have checkpoint key `uzi/prompt-<run-id>`
+   *   (issue #4116). The api can prove that checkpoint target; this worker deliberately
+   *   excludes prompt live-settle triggers, which remain deferred.
    */
   private triggerLiveSettle(flight: RunFlight, publishedSha: string, target: LiveSettleTarget): void {
     if (flight.retainedLocalCustody || !this.settlement.enabled) return;

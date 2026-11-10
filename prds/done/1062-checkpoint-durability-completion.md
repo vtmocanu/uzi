@@ -479,7 +479,7 @@ cadence is a **documented residual / follow-up**, not in M3. Do not describe M3 
 | `ci_fix` | deferred | branches, but a `ci_fix` on an existing `agent/issue-<iid>` shares that branch and its checkpoint ref; the per-run owner-anchor discriminates, but flag before enabling |
 | `mr_rework` | deferred | branches, but `origin/<branch>` already exists (an open MR), so recovery seeds off origin anyway; checkpoint adds only unpushed rework commits |
 | `task` | out of scope | produces a branch (`uzi/task/<runId>`); not in #1037's list |
-| `prompt` | deferred | re-runnable on the next schedule tick; low value now |
+| `prompt` | enabled (#4116, 2026-11-09) | originally deferred (re-runnable on the next schedule tick; low value then); enabled by #4116 so an owner pause can park a prompt run |
 | `chat` | NO | interactive, re-askable, often repo-less |
 | `judge` | NO | advice-only, writes no code, no branch |
 

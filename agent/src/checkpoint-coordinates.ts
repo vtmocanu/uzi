@@ -9,7 +9,7 @@ export interface CheckpointCoordinates {
   readonly run_id: string;
   readonly user_id: string;
   readonly repo_id: string;
-  readonly kind: "issue" | "self_improve" | "task";
+  readonly kind: "issue" | "self_improve" | "task" | "prompt";
   readonly issue_iid: number | null;
   readonly provenance: readonly string[];
 }
@@ -32,6 +32,8 @@ export function checkpointCoordinatesForClaim(claim: ClaimResponse): CheckpointC
     if (kind === "issue" && Number.isSafeInteger(claim.issue_iid) && claim.issue_iid! > 0)
       return legacy("agent/issue-" + claim.issue_iid);
     if (kind === "self_improve") return legacy("uzi/self-improve/" + claim.run_id);
+    // Issue #4116: mirrors deriveCloneKey's prompt branch and the api's checkpointBranch.
+    if (kind === "prompt") return legacy("uzi/prompt-" + claim.run_id);
     return undefined;
   }
   const fail = (): never => { throw new Error("invalid authorized checkpoint coordinates"); };
@@ -39,14 +41,15 @@ export function checkpointCoordinatesForClaim(claim: ClaimResponse): CheckpointC
   const p = value as Record<string, unknown>;
   if (p.version !== 1 || !uuid(p.run_id) || p.run_id !== claim.run_id ||
       !uuid(p.user_id) || !uuid(p.repo_id) || p.repo_id !== claim.repo.id ||
-      p.kind !== kind || !["issue", "self_improve", "task"].includes(kind) ||
+      p.kind !== kind || !["issue", "self_improve", "task", "prompt"].includes(kind) ||
       p.issue_iid !== (claim.issue_iid ?? null) ||
       (p.issue_iid !== null && (!Number.isSafeInteger(p.issue_iid) || (p.issue_iid as number) <= 0)) ||
       !Array.isArray(p.provenance) || p.provenance.length < 1 || p.provenance.length > 64 ||
       !p.provenance.every(uuid) || new Set(p.provenance).size !== p.provenance.length ||
       p.provenance[0] !== claim.run_id) return fail();
   const branch = kind === "task" ? "uzi/task/" + p.provenance.at(-1)
-    : kind === "issue" ? "agent/issue-" + claim.issue_iid : "uzi/self-improve/" + claim.run_id;
+    : kind === "issue" ? "agent/issue-" + claim.issue_iid
+    : kind === "prompt" ? "uzi/prompt-" + claim.run_id : "uzi/self-improve/" + claim.run_id;
   const key = kind === "task" ? "uzi/task/" + claim.run_id : branch;
   if (p.work_branch !== branch || p.checkpoint_key !== key ||
       (claim.branch != null && claim.branch !== branch) ||
@@ -57,7 +60,7 @@ export function checkpointCoordinatesForClaim(claim: ClaimResponse): CheckpointC
   function legacy(branch: string): CheckpointCoordinates {
     return Object.freeze({
       version: 1, work_branch: branch, checkpoint_key: branch, run_id: claim.run_id,
-      user_id: "", repo_id: claim.repo.id, kind: kind as "issue" | "self_improve",
+      user_id: "", repo_id: claim.repo.id, kind: kind as "issue" | "self_improve" | "prompt",
       issue_iid: claim.issue_iid ?? null, provenance: Object.freeze([claim.run_id]),
     });
   }

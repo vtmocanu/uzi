@@ -25,6 +25,8 @@ func checkpointBranch(kind string, runID uuid.UUID, issueIid pgtype.Int8) (strin
 		return agentIssueBranch(issueIid.Int64), true
 	case runkind.SelfImprove:
 		return selfImproveBranch(runID), true
+	case runkind.Prompt:
+		return promptBranch(runID), true
 	default:
 		return "", false
 	}
@@ -36,4 +38,11 @@ func checkpointBranch(kind string, runID uuid.UUID, issueIid pgtype.Int8) (strin
 // cross-language contract in checkpoint_branch_contract_test.go.
 func selfImproveBranch(runID uuid.UUID) string {
 	return "uzi/self-improve/" + runID.String()
+}
+
+// promptBranch mirrors the worker's agent/src/run-kind.ts deriveCloneKey prompt arm:
+// uzi/prompt-<runId>, keyed on the run uuid (issue #4116). The SQL mirror is the prompt arm of
+// fn_checkpoint_coordinates (migration 00422); fixtures/checkpoint-branch pins all three.
+func promptBranch(runID uuid.UUID) string {
+	return "uzi/prompt-" + runID.String()
 }
