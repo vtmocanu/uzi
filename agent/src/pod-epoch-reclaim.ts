@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { release as osRelease } from "node:os";
 import { basename, resolve as resolvePath } from "node:path";
+import { dockerSidecarExpected } from "./docker-wiring.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
 import type { PodEpochOwnership } from "./pod-epoch-lock.js";
@@ -15,15 +16,26 @@ import type { GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLi
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js";
 
 /**
- * Activation gate for the M1b deletion phase. While it is false, production startup is shadow-only: no proof is
- * created and nothing is mutated, whatever deletion dependencies the caller supplies. Flipping it needs the R9
- * owner co-sign recorded in PRD #3431.
+ * Startup activation for the M1b deletion phase. Parsed once from the worker's own process env: the controller
+ * renders UZI_EPOCH_RECLAIM_DELETION=1 only for the one selected canary worker. It permits attempting the phase
+ * and supplies no evidence: the shadow verdict, attested authority and every other gate in runPodEpochShadow
+ * still decide whether anything is reclaimed. Unset, empty or "0" is off; "1" needs an epoch-enabled hosted
+ * Docker worker; anything else is a startup error (no trimming).
  *
  * Test-only override: the deletion phase also runs when `deletion.enableForTest` is exactly the sentinel
  * below, which agent/test/pod-epoch-reclaim-support.ts exports as `ENABLE_DELETION_FOR_TEST`. Nothing under
- * agent/src passes `enableForTest` (a test asserts it), so production can only run deletion through this flag.
+ * agent/src passes `enableForTest` (a test asserts it), so production can only run deletion through the
+ * startup activation.
  */
-export const EPOCH_RECLAIM_DELETION_ENABLED: boolean = false;
+export function readEpochReclaimDeletionActivation(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.UZI_EPOCH_RECLAIM_DELETION;
+  if (raw === undefined || raw === "" || raw === "0") return false;
+  if (raw === "1") {
+    if (env.UZI_EPOCH_LOCK === "1" && dockerSidecarExpected(env)) return true;
+    throw new Error("UZI_EPOCH_RECLAIM_DELETION=1 requires an epoch-enabled hosted Docker worker");
+  }
+  throw new Error("UZI_EPOCH_RECLAIM_DELETION must be unset, empty, 0 or 1");
+}
 const TEST_ENABLE_DELETION = Symbol.for("uzi.test.pod-epoch-reclaim.enable-deletion");
 
 /** What the deletion phase needs; absent means the pass stays shadow-only whatever the gate says. */
@@ -38,7 +50,9 @@ export interface PodEpochDeletionDeps {
    */
   quiesce: (paths: string[]) => Promise<boolean>;
   git: Pick<GitCache, "createEpochDiscardProof" | "discardStoppedSource" | "readEpochJournalVector" | "assertNoUnsettledDeletes">;
-  /** Test override sentinel only; see {@link EPOCH_RECLAIM_DELETION_ENABLED}. */
+  /** Startup opt-in; set only by main.ts from {@link readEpochReclaimDeletionActivation}. Permits the phase, proves nothing. */
+  activation?: boolean;
+  /** Test override sentinel only; production uses `activation`. */
   enableForTest?: symbol;
 }
 type Schedule = (callback: () => void, milliseconds: number) => () => void;
@@ -498,7 +512,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     // attested authority, an intact pass (not invalidated, aborted or soft-stopped), a native reclaim scope on
     // the ownership, and the deletion dependencies. Anything less stays shadow-only and mutates nothing.
     const deps = options.deletion;
-    if (deps && (EPOCH_RECLAIM_DELETION_ENABLED || deps.enableForTest === TEST_ENABLE_DELETION) &&
+    if (deps && (deps.activation === true || deps.enableForTest === TEST_ENABLE_DELETION) &&
         result.verdict === "eligible" && result.authority.result === "attested" &&
         !invalid && !controller.signal.aborted && typeof ownership.beginReclaim === "function") {
       // With no admitted candidate nothing can be mutated, so no native scope is opened or finished; the pass
