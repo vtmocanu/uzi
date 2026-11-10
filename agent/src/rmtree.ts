@@ -859,7 +859,7 @@ const SELF_FD = "/proc/self/fd/";
 
 /** One path component: no separator, not `.`/`..`, not dash-leading (it becomes a bare
  *  `node -e` argument). Run ids and `mkdtemp` names (`uzi-judge-XXXXXX`) all fit. */
-const TREE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+export const TREE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 const TEARDOWN_COMPONENT_RE = /^(?![.-])[^\p{Cc}/\\]+$/u;
 function isTeardownComponent(name: string): boolean {
   return TEARDOWN_COMPONENT_RE.test(name);
@@ -1810,6 +1810,157 @@ export async function runAgentHelper(
       } catch { cancel(); }
     } else child.stdin?.end(input);
   });
+}
+
+/** Caps the scratch census helper enforces. */
+const SCRATCH_CENSUS_LIMITS = { rootEntries: 4096, leafEntries: 200_000, totalEntries: 2_000_000, depth: 256 } as const;
+
+/**
+ * Issue #4043: the read-only scratch census, as
+ * `node -e <script> <root> <rootExpect> <leaf|-> <maxRoot> <maxLeaf> <maxTotal> <maxDepth> <budgetMs>`.
+ * It pins `<root>` component by component from `/` ({@link PINNED_PRELUDE}: a symlink or non-directory
+ * component exits 3, a missing one 2), prints the root's identity as the FIRST line
+ * (`{"root":"<dev>:<ino>","uid":N,"mode":N}`) and exits 3 when that differs from `<rootExpect>`. It then
+ * walks `lstat`-only through pinned descriptors (a symlink is never followed, a directory is descended
+ * only after an `O_NOFOLLOW` re-pin whose identity equals the `lstat`; a directory on another st_dev is
+ * reported, never entered) and prints one JSON line per top-level entry:
+ * `{name,type:"dir"|"other"|"absent",dev,ino,uid,fsdiff,fuid,bytes,shared,ctime,inc}` (`dev`/`ino`
+ * decimal strings; `bytes` = allocated bytes of directories and `nlink==1` entries, `shared` = those of
+ * `nlink>1` entries; `ctime` = the newest ctime in ms over the whole subtree including the entry itself;
+ * `fsdiff` = any subtree entry on another st_dev; `fuid` = any entry whose uid is not the root's; `inc` = a
+ * cap, the time budget or an unreadable entry made the numbers a lower bound). A final
+ * `{"end":true,"entries":N,"overflow":bool}` line is the only proof the listing finished. With `<leaf>`
+ * only that name is censused (`type:"absent"` when it is gone). Caps: `<maxRoot>` top-level entries
+ * (beyond: `overflow`), `<maxLeaf>` entries per leaf, `<maxTotal>` overall, depth `<maxDepth>`, and the
+ * helper's own `<budgetMs>` (the worker cannot always signal it: the uid split). A leaf past a cap is
+ * emitted `inc` without further walking. Exit 0 listed; 2/3/5/6/7 as the other pinned helpers.
+ */
+export const SCRATCH_CENSUS_SCRIPT = `${PINNED_PRELUDE}
+const [rootArg, expect, leafArg, maxRootArg, maxLeafArg, maxTotalArg, maxDepthArg, budgetArg] = process.argv.slice(1);
+const maxRoot = Number(maxRootArg), maxLeaf = Number(maxLeafArg), maxTotal = Number(maxTotalArg);
+const maxDepth = Number(maxDepthArg), budgetMs = Number(budgetArg);
+if (!rootArg || !rootArg.startsWith("/") || !(maxRoot >= 1) || !(maxLeaf >= 1) || !(maxTotal >= 1) ||
+    !(maxDepth >= 1) || !(budgetMs >= 0) || !expect) process.exit(6);
+const parts = rootArg.split("/").slice(1);
+if (parts.length === 0 || parts.some((x) => x === "" || x === "." || x === "..")) process.exit(6);
+if (leafArg !== "-" && (leafArg === "" || leafArg === "." || leafArg === ".." || leafArg.includes("/") || leafArg.includes("\\0"))) process.exit(6);
+const deadline = Date.now() + budgetMs;
+const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+let rootPin;
+try {
+  rootPin = fs.openSync("/", PIN);
+  for (const part of parts) { const next = fs.openSync(at(rootPin, part), PIN); fs.closeSync(rootPin); rootPin = next; }
+} catch (e) {
+  process.exit(e.code === "ENOENT" ? 2 : e.code === "ELOOP" || e.code === "ENOTDIR" ? 3 : 7);
+}
+const rst = fs.fstatSync(rootPin, { bigint: true });
+const rootId = rst.dev + ":" + rst.ino;
+out({ root: rootId, uid: Number(rst.uid), mode: Number(rst.mode) & 0o7777 });
+if (rootId !== expect) process.exit(3);
+let rootFd;
+try { rootFd = reopen(rootPin); } catch { process.exit(7); }
+let total = 0;
+function note(L, st) {
+  const c = Number(st.ctimeMs);
+  if (c > L.ctime) L.ctime = c;
+  if (st.dev !== rst.dev) L.fsdiff = true;
+  if (st.uid !== rst.uid) L.fuid = true;
+  const b = Number(st.blocks) * 512;
+  if (st.isDirectory() || st.nlink <= 1n) L.bytes += b; else L.shared += b;
+}
+function room(L) {
+  if (L.inc) return false;
+  if (L.count >= maxLeaf || total >= maxTotal || Date.now() > deadline) { L.inc = true; return false; }
+  L.count++; total++;
+  return true;
+}
+function walk(L, dirFd, depth) {
+  let dir;
+  try { dir = fs.opendirSync(FD + dirFd); } catch { L.inc = true; return; }
+  try {
+    for (;;) {
+      let e;
+      try { e = dir.readSync(); } catch { L.inc = true; return; }
+      if (e === null || !room(L)) return;
+      let st;
+      try { st = fs.lstatSync(at(dirFd, e.name), { bigint: true }); } catch { L.inc = true; continue; }
+      note(L, st);
+      if (!st.isDirectory() || st.dev !== rst.dev) continue;
+      if (depth + 1 > maxDepth) { L.inc = true; continue; }
+      let child;
+      try {
+        const pin = fs.openSync(at(dirFd, e.name), PIN);
+        try {
+          const ps = fs.fstatSync(pin, { bigint: true });
+          if (ps.dev !== st.dev || ps.ino !== st.ino) { L.inc = true; continue; }
+          child = reopen(pin);
+        } finally { fs.closeSync(pin); }
+      } catch { L.inc = true; continue; }
+      try { walk(L, child, depth + 1); } finally { fs.closeSync(child); }
+    }
+  } finally {
+    dir.closeSync();
+  }
+}
+function entry(name) {
+  const L = { count: 0, ctime: 0, bytes: 0, shared: 0, fsdiff: false, fuid: false, inc: false };
+  let st;
+  try { st = fs.lstatSync(at(rootFd, name), { bigint: true }); } catch (e) {
+    if (e.code === "ENOENT") { out({ name, type: "absent" }); return; }
+    out({ name, type: "other", dev: "0", ino: "0", uid: -1, fsdiff: false, fuid: false, bytes: 0, shared: 0, ctime: 0, inc: true });
+    return;
+  }
+  total++;
+  note(L, st);
+  const isDir = st.isDirectory();
+  if (total > maxTotal || Date.now() > deadline) L.inc = true;
+  else if (isDir && st.dev === rst.dev) {
+    try {
+      const pin = fs.openSync(at(rootFd, name), PIN);
+      let child;
+      try {
+        const ps = fs.fstatSync(pin, { bigint: true });
+        if (ps.dev !== st.dev || ps.ino !== st.ino) L.inc = true;
+        else child = reopen(pin);
+      } finally { fs.closeSync(pin); }
+      if (child !== undefined) { try { walk(L, child, 1); } finally { fs.closeSync(child); } }
+    } catch { L.inc = true; }
+  }
+  out({ name, type: isDir ? "dir" : "other", dev: String(st.dev), ino: String(st.ino), uid: Number(st.uid),
+    fsdiff: L.fsdiff, fuid: L.fuid, bytes: L.bytes, shared: L.shared, ctime: L.ctime, inc: L.inc });
+}
+let seen = 0, overflow = false;
+if (leafArg !== "-") { entry(leafArg); seen = 1; }
+else {
+  let dir;
+  try { dir = fs.opendirSync(FD + rootFd); } catch { process.exit(7); }
+  try {
+    for (;;) {
+      let e;
+      try { e = dir.readSync(); } catch { process.exit(7); }
+      if (e === null) break;
+      if (seen >= maxRoot) { overflow = true; break; }
+      seen++;
+      entry(e.name);
+    }
+  } finally { dir.closeSync(); }
+}
+out({ end: true, entries: seen, overflow });
+`;
+
+/**
+ * Issue #4043: run {@link SCRATCH_CENSUS_SCRIPT} as the runner uid (the only uid that can read a 0700
+ * split root), joined on timeout and killed through the runner-group killer under the uid split, so a
+ * returned promise never leaves the census walking. `leaf` censuses a single top-level name.
+ */
+export async function censusScratchRoot(
+  root: string, rootExpect: string, leaf: string | undefined, timeoutMs: number,
+): Promise<{ code: number; stdout: string }> {
+  const lim = SCRATCH_CENSUS_LIMITS;
+  return runAgentHelper(runnerCommand, SCRATCH_CENSUS_SCRIPT,
+    [root, rootExpect, leaf ?? "-", String(lim.rootEntries), String(lim.leafEntries), String(lim.totalEntries),
+      String(lim.depth), String(Math.max(0, Math.floor(timeoutMs) - HELPER_SLACK_MS))],
+    timeoutMs, "", { joinOnTimeout: true, killAsHelperUid: helperUidKillerFor(runnerCommand) });
 }
 
 /**

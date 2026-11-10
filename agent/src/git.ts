@@ -31,6 +31,7 @@ import { processGroupAlive } from "./tick-spawner.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
+import { absorbBareConfigValue, newPathSink, readProtectedStores, type ProtectedPathsRead } from "./pod-epoch-scratch.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
@@ -4073,6 +4074,48 @@ export class GitCache {
     result.overflow = result.physicalPaths - selectedPaths.size;
     result.overflowExact = result.inventoryComplete;
     return result;
+  }
+
+  /** Issue #4043: every absolute path the worker's recovery records name, for the scratch reclaim's
+   * protected-record rule. Read-only: each bare's `config --local --null --list` (the argv discovery
+   * already uses, under the same bare lock, bounds and recovery operation), then the four recovery
+   * stores through a bounded fd-relative walk. Anything unreadable, malformed, truncated or over a cap
+   * is `unknown`/`malformed` with a fixed reason token and no paths: the caller then refuses scratch. */
+  async collectEpochScratchProtectedPaths(opts: { signal: AbortSignal; deadline: number }): Promise<ProtectedPathsRead> {
+    const sink = newPathSink();
+    const limits = this.epochLimits();
+    const outcome = async (): Promise<ProtectedPathsRead> => {
+      let configBytes = 0;
+      for (const bare of await this.retainedBares()) {
+        this.checkRecoveryInterruption();
+        const refused = await this.withLock(bare, async (): Promise<ProtectedPathsRead | undefined> => {
+          await this.assertRecoveryBare(bare);
+          const out = await this.runGit(bare, ["config", "--local", "--null", "--list"]);
+          if ((configBytes += out.length) > limits.maxMetadataBytes) return { state: "unknown", reason: "bare_overflow" };
+          for (const item of out.split("\0")) {
+            const nl = item.indexOf("\n");
+            const key = nl < 0 ? item : item.slice(0, nl);
+            if (!key.startsWith("uzi-")) continue;
+            // A valueless key is a boolean-true entry in git config, not a record value.
+            if (nl < 0) continue;
+            if (absorbBareConfigValue(key, item.slice(nl + 1), sink) !== "ok") return { state: "unknown", reason: "bare_value_unparseable" };
+          }
+          return undefined;
+        }, opts.signal);
+        if (refused) return refused;
+      }
+      const stores = await readProtectedStores(
+        [this.recoveryRoot, this.recoveryMaintenanceRoot, this.recoverySettlementRoot, this.recoveryArchiveRoot],
+        { interrupt: () => this.checkRecoveryInterruption() });
+      if (stores.state !== "read") return stores;
+      for (const p of stores.paths) sink.paths.add(p);
+      return { state: "read", paths: [...sink.paths].sort() };
+    };
+    try {
+      return await this.epochRetained.run(limits, () => this.withRecoveryOperation(opts.signal, opts.deadline, outcome));
+    } catch {
+      return { state: "unknown", reason: opts.signal.aborted ? "protected_aborted" : Date.now() >= opts.deadline ? "protected_deadline" : "bare_unreadable" };
+    }
   }
 
   /** Local recovery clocks, including queued locks and actual child settlement. */
