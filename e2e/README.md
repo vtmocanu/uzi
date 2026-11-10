@@ -123,6 +123,13 @@ Results and artifacts (written under the rundir, `$RUNROOT`):
   point-in-time: logs emitted between it and the operation are not guaranteed captured, and
   this is not a continuous collector. Kept only when the rundir is kept (a red run, a LEAK
   sentinel, `KEEP_RUNDIR` or `KEEP_STACK`; under `KEEP_STACK` no teardown snapshot is taken).
+- `artifacts/docker-wiring/startup-*/`: written when a phase's in-phase DinD sidecar start
+  (`docker_wire_prepare`, phases 45 and 52) fails, before the exit trap removes the
+  containers (#4165): `up.log`, `ps.txt`, `dind-init.log` / `dind.log` (`--tail 80`),
+  `inspect.txt` (selected `State` fields only), `host-userns.txt` (the host's userns sysctls,
+  read-only) and `diagnostics.txt`. Every Docker read is bounded by `timeout`/`gtimeout`
+  (at most 62s in total) and skipped with a `MISSING-EVIDENCE` line when neither exists; the
+  phase still fails with its original message.
 
 Fail-soft behavior: a red run now prints `summary.md` (every failing phase, not
 just the first) to stdout **before** teardown, and the suite exits `1` iff any
