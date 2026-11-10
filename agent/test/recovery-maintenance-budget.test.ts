@@ -197,3 +197,50 @@ it("#4140 R0 held preparation inside a named attempt leaves no budget attached a
     });
   } finally { activated?.dispose(); }
 });
+
+it("#4140 R0 an owned-pass abort during preparation stops preparation", async () => {
+  const owned = new AbortController();
+  const order: string[] = [];
+  const git = {
+    resolveCheckpointRange: async () => ({}),
+    secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }),
+    rangeTouchesWorkflows: async () => "clean",
+    checkpointPack: async () => {
+      order.push("pack");
+      owned.abort(new Error("owned pass cancelled"));
+      return { tipOid: tip, pack: Readable.from([Buffer.from("PACK")]), exited: Promise.resolve(0) };
+    },
+  } as unknown as HeldGit;
+  await assert.rejects(
+    MaintenanceBudget.runOwned(owned.signal, () => MaintenanceBudget.runAttempt("run-4140:8", () => new MaintenanceBudget(600_000), () =>
+      prepareFrozenHeld({ git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 30_000 }))),
+    /owned pass cancelled/,
+    "inherited owned-pass cancellation must bind preparation",
+  );
+  assert.deepEqual(order, ["pack"]);
+});
+
+it("#4140 R0 cancellation observed during preparation activates the attempt's own budget", async () => {
+  let factories = 0, activated: MaintenanceBudget | undefined;
+  let preparingBudget: MaintenanceBudget | undefined;
+  const git = {
+    resolveCheckpointRange: async () => ({}),
+    secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }),
+    rangeTouchesWorkflows: async () => "clean",
+    checkpointPack: async () => {
+      preparingBudget = MaintenanceBudget.current();
+      MaintenanceBudget.observeCancellation();
+      return { tipOid: tip, pack: Readable.from([Buffer.from("PACK")]), exited: Promise.resolve(0) };
+    },
+  } as unknown as HeldGit;
+  try {
+    await MaintenanceBudget.runAttempt("run-4140:9", () => { factories++; return activated = new MaintenanceBudget(600_000); }, async () => {
+      assert.equal(MaintenanceBudget.current(), undefined);
+      await prepareFrozenHeld({ git, barePath: "bare", branch: "task", sourceSha: tip, policy, deadlineMs: 30_000 });
+      assert.equal(factories, 1, "the factory runs exactly once");
+      assert.ok(activated);
+      assert.notEqual(preparingBudget, activated);
+      assert.equal(MaintenanceBudget.current(), activated, "the attempt's own budget is now active");
+    });
+  } finally { activated?.dispose(); }
+});
