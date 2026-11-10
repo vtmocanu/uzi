@@ -160,3 +160,40 @@ it("pack abort cancels the stream and awaits child exit before returning", async
     exited.resolve(); await rejected;
   } finally { exited.resolve(); budget.dispose(); stream.destroy(); }
 });
+
+// Issue #4140: the held-preparation clock binds preparation only. A caller inside a named attempt that has
+// no active cancellation budget must find the attempt exactly as it was before the preparation ran.
+it("#4140 R0 held preparation inside a named attempt leaves no budget attached and the factory untouched", async () => {
+  const policy0 = { version: 1 as const, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: null, extraFloors: [] };
+  const order: string[] = [];
+  let preparingBudget: MaintenanceBudget | undefined;
+  const git = {
+    resolveCheckpointRange: async () => ({}),
+    secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }),
+    rangeTouchesWorkflows: async () => "clean",
+    checkpointPack: async () => {
+      preparingBudget = MaintenanceBudget.current();
+      order.push("pack");
+      return { tipOid: tip, pack: Readable.from([Buffer.from("PACK")]), exited: Promise.resolve(0) };
+    },
+  } as unknown as HeldGit;
+  let factories = 0, activated: MaintenanceBudget | undefined;
+  try {
+    await MaintenanceBudget.runAttempt("run-4140:7", () => { factories++; return activated = new MaintenanceBudget(600_000); }, async () => {
+      assert.equal(MaintenanceBudget.current(), undefined, "the attempt starts with no active budget");
+      const prepared = await prepareFrozenHeld({ git, barePath: "bare", branch: "task", sourceSha: tip, policy: policy0, deadlineMs: 30_000 });
+      assert.deepEqual(order, ["pack"]);
+      assert.ok("pack" in prepared && prepared.pack.toString() === "PACK", "preparation itself succeeds");
+      assert.ok(preparingBudget, "preparation runs under its own deadline");
+      assert.equal(MaintenanceBudget.current(), undefined,
+        "after preparation the attempt has no budget: the preparation clock must not stay attached to the attempt");
+      assert.equal(factories, 0, "preparation never activates the attempt's cancellation budget");
+      // A later genuine cancellation observation still activates the attempt's own budget.
+      const observed = MaintenanceBudget.observeCancellation();
+      assert.equal(factories, 1);
+      assert.equal(observed, activated);
+      assert.notEqual(observed, preparingBudget);
+      assert.equal(MaintenanceBudget.current(), activated);
+    });
+  } finally { activated?.dispose(); }
+});

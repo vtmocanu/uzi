@@ -2,7 +2,8 @@ import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { WorkerClient } from "../src/client.js";
+import { RequestError, WorkerClient } from "../src/client.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import type { RecoveryFinalDisposition } from "../src/protocol.js";
 import { StubExecutor } from "../src/executor.js";
 import { Outbox } from "../src/outbox.js";
@@ -293,4 +294,61 @@ describe("held publication of a failed run", () => {
     assert.equal(server.heldCalls.length, 0, "a completed run never reaches step A");
     assert.equal(server.finals.filter(f => f.disposition?.kind === "held_publication").length, 0);
   });
+});
+
+// Issue #4140: a completed V2 run's foreground held step must not leave the held-preparation clock attached
+// to the run's attempt, so the held POST is bound by its own 330 s ceiling, not by what is left of the
+// preparation deadline (scanDeadlineMs).
+it("#4140 R0b a completed V2 run's held preparation does not bound the held POST", { skip: HELD_LINUX_ONLY }, async t => {
+  const claim = gitlabClaim(4140, { claim_generation: 71, inventory_guarded: true });
+  const features = ["recovery_inventory_v1", "recovery_held_publication_v2"];
+  api.setRegisterProtocolFeatures(features);
+  await client.register("v2-4140", undefined, undefined, undefined, ["recovery_held_publication_v2"]);
+  assert.equal(client.hasHeldPublicationV2(), true);
+  const server = heldServer(claim, features);
+  const holdId = "00000000-0000-4000-8000-000000000071";
+  const repoId = "00000000-0000-4000-8000-000000000072";
+  claim.repo.id = repoId;
+  client.listRecoveryHolds = async () => ({ run_id: claim.run_id, holds: server.holdOpen() ? [{
+    hold_id: holdId, generation: 71, inventory_guarded: true, has_available_capture: false,
+  }] : [] });
+  client.getExactRecoveryHold = async () => ({
+    run_id: claim.run_id, generation: 71, hold_id: holdId, repo_id: repoId, inventory_guarded: true,
+    original_worker_id: "original", original_worker_identity: "original",
+    live_worker_id: "original", live_run_id: claim.run_id, state: server.holdOpen() ? "open" : "released",
+    run_status: "completed", current_claim_generation: 71, claim_released: true,
+  });
+  // The archive is refused with a typed quota refusal, so the completed run falls to held publication.
+  client.reserveRecoveryCapture = async () => { throw new RequestError("POST", "/reserve", 429, JSON.stringify({ reason: "quota" })); };
+  skipCheckpoints();
+  const work: Partial<Work> = {};
+  const r = runner({ run: async ctx => {
+    work.clone = ctx.worktreePath;
+    work.rootA = commit(ctx.worktreePath, "completed-root.txt");
+    await ctx.checkpoint!({ reap: false });
+    work.afterCheckpoint = commit(ctx.worktreePath, "completed-after-checkpoint.txt");
+    return { branch: ctx.branch };
+  } }, fakeGitlab().gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
+  const seen: { entry?: { current: MaintenanceBudget | undefined }; send?: { current: MaintenanceBudget | undefined; remaining?: number } } = {};
+  const step = Reflect.get(r, "heldPublicationStep") as (...args: unknown[]) => Promise<unknown>;
+  t.mock.method(r as unknown as { heldPublicationStep: (...args: unknown[]) => Promise<unknown> }, "heldPublicationStep", function (this: unknown, ...args: unknown[]) {
+    seen.entry = { current: MaintenanceBudget.current() };
+    return step.apply(this, args);
+  });
+  const send = client.publishHeld;
+  client.publishHeld = async (...args: Parameters<typeof send>) => {
+    const current = MaintenanceBudget.current();
+    seen.send = { current, remaining: current?.remainingMs() };
+    return send(...args);
+  };
+  await r.execute(claim);
+  assert.ok(api.states.some(s => s.runId === claim.run_id && s.body.status === "completed"), "the run completed");
+  assert.equal(failedStates(claim.run_id).length, 0);
+  assert.equal(server.heldCalls.length, 1, "the completed run reached the held create");
+  assert.ok(seen.entry, "the foreground held preparation step ran");
+  assert.equal(seen.entry.current, undefined, "no budget is active when held preparation starts (a completed run has no cancellation budget)");
+  assert.ok(seen.send, "the held create was sent");
+  const scanDeadlineMs = (r as unknown as { scanDeadlineMs(): number }).scanDeadlineMs();
+  assert.ok(seen.send.current === undefined || seen.send.remaining! > scanDeadlineMs,
+    `at send the held POST runs under a leaked preparation budget with ${seen.send.remaining} ms left (scanDeadlineMs ${scanDeadlineMs})`);
 });
