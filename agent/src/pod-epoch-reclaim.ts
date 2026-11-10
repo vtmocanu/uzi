@@ -1,5 +1,5 @@
 import { countPartialCause, mergePartialCauses, readFailureCause, type PartialCauses } from "./pod-epoch-partial-causes.js";
-import { constants } from "node:fs";
+import { constants, statfsSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { release as osRelease } from "node:os";
 import { basename, resolve as resolvePath } from "node:path";
@@ -11,8 +11,14 @@ import type { AuthorityRuntime } from "./authority-runtime.js";
 import { isRunOwnershipLost } from "./client.js";
 import { parsePodEpochEvidence, assertPodEpochEvidenceBinding } from "./pod-epoch-evidence.js";
 import { openPodEpochDaemonBarrier, PodEpochDaemonError, type PodEpochDaemonGuard } from "./pod-epoch-daemon.js";
-import type { GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector } from "./git.js";
+import type { EpochScratchDiscardInput, GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector } from "./git.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js";
+import { censusScratchRoot } from "./rmtree.js";
+import {
+  KEPT_REASONS, censusEntryUnchanged, classifyBindSources, classifyScratchCensus, parseScratchCensus, pinScratchRoot,
+  protectedLeaves, readPodEntryFence, readScratchMounts, repinScratchRoot, scanScratchProcesses, scratchFilesystemOf,
+  scratchLayout, type ScratchIo, type ScratchLayout, type ScratchRootPin, type Settlement,
+} from "./pod-epoch-scratch.js";
 
 /**
  * Activation gate for the M1b deletion phase. While it is false, production startup is shadow-only: no proof is
@@ -41,6 +47,46 @@ export interface PodEpochDeletionDeps {
   /** Test override sentinel only; see {@link EPOCH_RECLAIM_DELETION_ENABLED}. */
   enableForTest?: symbol;
 }
+/**
+ * Activation gate for the runner-scratch reclaim (issue #4043), separate from {@link EPOCH_RECLAIM_DELETION_ENABLED}
+ * and independent of it: the attempt gate being open never starts scratch work and the reverse. While it is false,
+ * production startup does nothing for scratch: no census, no new child and no new path read. Flipping it needs a
+ * separate owner decision recorded on issue #4043.
+ *
+ * Test-only override: the phase also runs when `scratch.scratchTestGate` is exactly the sentinel below, which
+ * agent/test/pod-epoch-reclaim-support.ts exports as `ENABLE_SCRATCH_FOR_TEST`. Nothing under agent/src passes
+ * `scratchTestGate` (a test asserts it), and the seams in {@link PodEpochScratchDeps.seams} are ignored without it.
+ */
+export const EPOCH_SCRATCH_DELETION_ENABLED: boolean = false;
+const TEST_SCRATCH_GATE = Symbol.for("uzi.test.pod-epoch-reclaim.scratch-gate");
+
+/** Test seams of the scratch phase; honored only under the test gate sentinel, never passed by main.ts. */
+export interface PodEpochScratchTestSeams {
+  /** Environment for the exact-layout gate (defaults to process.env). */
+  env?: NodeJS.ProcessEnv;
+  /** Replaces the layout the gate returned, so a fixture can use a temp root. */
+  layout?: ScratchLayout;
+  io?: ScratchIo;
+  podEntryFile?: string;
+  readFence?: (podUid: string) => ReturnType<typeof readPodEntryFence>;
+  readMounts?: (leafNames: readonly string[]) => ReturnType<typeof readScratchMounts>;
+  statfs?: () => "ok" | "fs_unsupported";
+  freeBytes?: () => bigint | null;
+  scanProcesses?: (leafNames: readonly string[]) => ReturnType<typeof scanScratchProcesses>;
+  bindLstat?: Parameters<typeof classifyBindSources>[0]["lstat"];
+  bindShared?: string;
+  census?: typeof censusScratchRoot;
+  discardSeam?: EpochScratchDiscardInput["testSeam"];
+}
+/** What the scratch phase needs; absent means no scratch work whatever the gate says. */
+export interface PodEpochScratchDeps {
+  git: Pick<GitCache, "collectEpochScratchProtectedPaths" | "discardEpochScratchLeaf" | "assertNoUnsettledDeletes">;
+  /** Worker-wide exclusive-idle proof (bound to terminalMaintenanceProof). */
+  quiesce: () => Promise<boolean>;
+  /** Test override sentinel only; see {@link EPOCH_SCRATCH_DELETION_ENABLED}. */
+  scratchTestGate?: symbol;
+  seams?: PodEpochScratchTestSeams;
+}
 type Schedule = (callback: () => void, milliseconds: number) => () => void;
 interface Options {
   bootstrap: ReturnType<typeof inspectPodEpochBootstrap>;
@@ -61,6 +107,8 @@ interface Options {
   kernelRelease?: () => string;
   /** M1b deletion dependencies; used only while the activation gate is open. */
   deletion?: PodEpochDeletionDeps;
+  /** Runner-scratch reclaim dependencies; used only while the scratch gate is open. */
+  scratch?: PodEpochScratchDeps;
   /** Daemon barrier opener; defaults to the real one. A seam for tests only, never passed by main.ts. */
   openDaemonGuard?: typeof openPodEpochDaemonBarrier;
   /** Operator log for the deletion phase; every field is a fixed token or a count, never controller text. */
@@ -123,7 +171,41 @@ interface Verdict {
   /** "measured" once the phase ran (deleted_bytes sums measured shadow bytes of sources positively removed);
    *  "unknown" when it did not run. */
   reclaim_bytes_state: "measured" | "unknown";
+  /** Runner-scratch reclaim (issue #4043); always present, `not_run` while the gate is closed. Only fixed tokens
+   *  and counts, never controller text or path names. */
+  scratch: ScratchVerdict;
 }
+interface ScratchVerdict {
+  state: "not_run" | "refused" | "ran" | "stopped";
+  reason: string;
+  layout: "split" | "single" | null;
+  examined: number;
+  /** Kept leaves by fixed reason (the classifier's reasons plus `changed`, a leaf that moved before its delete). */
+  kept: Record<string, number>;
+  eligible: number;
+  eligible_allocated_bytes_estimate: number;
+  shared_bytes: number;
+  deleted: number;
+  deleted_allocated_bytes_estimate: number;
+  residue: number;
+  helper_failed: number;
+  estimate_partial: boolean;
+  /** Pool free-bytes change across the phase (all writers, so unattributed); null when unreadable. */
+  statfs_free_delta_unattributed: number | null;
+  /** Estimated from allocated blocks, never proof that storage was freed. */
+  reclaim_bytes_state: "estimated" | "unknown";
+  /** The root listing hit its entry cap, so some top-level names were never seen. */
+  list_overflow: boolean;
+  /** The idle proof failed after the last delete joined (everything deleted was already settled). */
+  not_idle_after: boolean;
+}
+const emptyScratch = (): ScratchVerdict => ({
+  state: "not_run", reason: "not_run", layout: null, examined: 0,
+  kept: Object.fromEntries([...KEPT_REASONS, "changed"].map(reason => [reason, 0])), eligible: 0,
+  eligible_allocated_bytes_estimate: 0, shared_bytes: 0, deleted: 0, deleted_allocated_bytes_estimate: 0, residue: 0,
+  helper_failed: 0, estimate_partial: false, statfs_free_delta_unattributed: null, reclaim_bytes_state: "unknown",
+  list_overflow: false, not_idle_after: false,
+});
 /** Fatal startup refusal. The caller must exit without admitting a worker or releasing EX. */
 export class PodEpochSettlementError extends Error {
   constructor() { super("pod_epoch_settlement_uncertain"); this.name = "PodEpochSettlementError"; }
@@ -196,6 +278,220 @@ function journalShape(vector: ReadonlyArray<string | null>, selector: RetainedSo
 }
 const safe = (value: string) => value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160);
 
+interface ScratchContext {
+  deps: PodEpochScratchDeps;
+  seams: PodEpochScratchTestSeams;
+  podUid: string;
+  guard: PodEpochDaemonGuard;
+  controller: AbortController;
+  owned<T>(work: () => Promise<T>, hard: number, cleanup?: boolean): Promise<T>;
+  check(): void;
+  entry(): void;
+  now(): number;
+  hardPass: number;
+  deadlineAt(): number;
+  out: ScratchVerdict;
+  openScope(): PodEpochReclaimScope;
+  /** True once the pass is fatal or aborted: an error is then the pass's own and propagates. */
+  interrupted(): boolean;
+  failFatal(): never;
+  /** Invalidates the pass as a daemon veto (the real guard has already done so itself). */
+  veto(): void;
+}
+const SCRATCH_CENSUS_MARGIN_MS = 10_000;
+const SCRATCH_RECENSUS_MAX_MS = 30_000;
+const SCRATCH_RETAINED_STOP = 3;
+const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+
+function poolFreeBytes(fd: number): bigint | null {
+  try {
+    const stat = statfsSync(`/proc/self/fd/${fd}`, { bigint: true });
+    return stat.bavail * stat.bsize;
+  } catch { return null; }
+}
+
+/**
+ * The runner-scratch phase (issue #4043 plan 1d). Every refusal is recorded as `refused`/`stopped` with a fixed
+ * token on `ctx.out` and returns; the caller's attempt phase then continues unless the pass was invalidated.
+ * Throws only for the pass's own fatal/abort/veto outcomes. Deletes serially, each leaf to a settled
+ * classification before the next begins.
+ */
+async function runScratchPhase(ctx: ScratchContext): Promise<void> {
+  const { deps, seams, out } = ctx;
+  const refuse =(reason: string): void => { out.state = "refused"; out.reason = reason; };
+  const stopPhase = (reason: string): void => { out.state = "stopped"; out.reason = reason; };
+  try { deps.git.assertNoUnsettledDeletes(); } catch { ctx.failFatal(); }
+  const gate = scratchLayout(seams.env ?? process.env);
+  if ("refused" in gate) return refuse(gate.refused);
+  out.layout = gate.mode;
+  const layout: ScratchLayout = seams.layout ?? gate;
+  const pin = pinScratchRoot(layout, seams.io);
+  if ("refused" in pin) return refuse(pin.refused);
+  try { await scratchBody(ctx, layout, pin, refuse, stopPhase); }
+  catch (error) {
+    // The pass's own abort or veto ended the phase mid-way: record it before propagating.
+    if (out.state === "ran" || out.state === "not_run") stopPhase(error instanceof Refusal || error instanceof PodEpochDaemonError ? error.reason : "interrupted");
+    throw error;
+  } finally { pin.close(); }
+}
+
+async function scratchBody(ctx: ScratchContext, layout: ScratchLayout, pin: ScratchRootPin,
+    refuse: (reason: string) => void, stopPhase: (reason: string) => void): Promise<void> {
+  const { deps, seams, out, controller, guard } = ctx;
+  const fence = (seams.readFence ?? ((uid: string) => readPodEntryFence(uid, seams.io, seams.podEntryFile)))(ctx.podUid);
+  if ("refused" in fence) return refuse(fence.refused);
+  const readMounts = (names: readonly string[]) =>
+    (seams.readMounts ?? ((n: readonly string[]) => readScratchMounts(pin, n, layout.root, seams.io)))(names);
+  // Before the census the leaf names are unknown, so only the topology refusal is decided here; a mount inside
+  // the root is judged against the listed names below.
+  const early = readMounts([]);
+  if ("refused" in early && early.refused === "mount_unexpected_ancestor") return refuse(early.refused);
+  if ((seams.statfs ?? (() => scratchFilesystemOf(pin, seams.io)))() !== "ok") return refuse("fs_unsupported");
+
+  // Fail closed: a guard without bindSources, or one that cannot read it, is unknown, never "no binds".
+  let binds: ReturnType<NonNullable<PodEpochDaemonGuard["bindSources"]>> = { state: "unknown" };
+  try { if (typeof guard.bindSources === "function") binds = guard.bindSources(); } catch { /* unknown */ }
+  if (binds.state !== "read") return refuse("bind_unknown");
+  const bindInput: Parameters<typeof classifyBindSources>[0] = { sources: binds.sources, root: layout.root };
+  if (seams.bindLstat) bindInput.lstat = seams.bindLstat;
+  if (seams.bindShared) bindInput.shared = seams.bindShared;
+  const bound = classifyBindSources(bindInput);
+  if ("refused" in bound) return refuse(bound.refused);
+
+  let storedPaths: string[];
+  try {
+    const stored = await ctx.owned(() => deps.git.collectEpochScratchProtectedPaths({
+      signal: controller.signal, deadline: ctx.deadlineAt() }), ctx.hardPass);
+    if (stored.state !== "read") return refuse(stored.state === "malformed" ? "protected_malformed" : "protected_unknown");
+    storedPaths = stored.paths;
+  } catch (error) {
+    if (error instanceof PodEpochSettlementError || ctx.interrupted()) throw error;
+    return refuse("protected_unknown");
+  }
+
+  const scan = (names: readonly string[]) =>
+    (seams.scanProcesses ?? ((n: readonly string[]) => scanScratchProcesses(layout.root, n, seams.io)))(names);
+  // The exclusive-idle proof; a throw or false is "not idle". `cleanup` joins it even after an abort.
+  const idle = async (cleanup = false): Promise<boolean> => {
+    try { return await ctx.owned(() => deps.quiesce(), ctx.hardPass, cleanup); }
+    catch (error) {
+      if (error instanceof PodEpochSettlementError || (!cleanup && ctx.interrupted())) throw error;
+      return false;
+    }
+  };
+  if (!(await idle())) return refuse("not_idle");
+  const first = scan([]);
+  if ("refused" in first) return refuse(first.refused);
+
+  // ---- census (read-only, as the runner uid) ----
+  const budget = ctx.hardPass - 5000 - ctx.now() - SCRATCH_CENSUS_MARGIN_MS;
+  if (budget <= 0) return refuse("census_budget");
+  const runCensus = seams.census ?? censusScratchRoot;
+  const raw = await ctx.owned(() => runCensus(layout.root, pin.devIno, undefined, budget), ctx.hardPass);
+  const census = parseScratchCensus(raw, pin.devIno);
+  if ("refused" in census) return refuse(census.refused);
+  const names = census.entries.map(e => e.name);
+  const mounts = readMounts(names);
+  if ("refused" in mounts) return refuse(mounts.refused);
+  const held = scan(names);
+  if ("refused" in held) return refuse(held.refused);
+  const classified = classifyScratchCensus({
+    census, t0Ms: fence.t0Ms, mountedLeaves: mounts.mountedLeaves, boundLeaves: bound.referenced,
+    protectedLeaves: protectedLeaves(storedPaths, layout.root, names), heldLeaves: held.held,
+  });
+  out.examined = classified.examined;
+  Object.assign(out.kept, classified.kept);
+  out.eligible = classified.admitted.length;
+  out.eligible_allocated_bytes_estimate = classified.eligibleBytes;
+  out.shared_bytes = classified.sharedBytes;
+  out.list_overflow = census.overflow;
+  out.reclaim_bytes_state = "estimated";
+  out.state = "ran"; out.reason = "complete";
+
+  const freeBytes = seams.freeBytes ?? (() => poolFreeBytes(pin.fd));
+  const freeBefore = freeBytes();
+  let retained = 0, launched = 0;
+  for (const leaf of classified.admitted) {
+    // Soft stop: no new leaf; whatever is in flight was already joined by the previous iteration.
+    if (controller.signal.aborted) {
+      stopPhase(controller.signal.reason instanceof Refusal ? controller.signal.reason.reason : "pass_aborted");
+      break;
+    }
+    ctx.check(); ctx.entry();
+    const fresh = readMounts(names);
+    if ("refused" in fresh) { stopPhase(fresh.refused); break; }
+    if (fresh.mountedLeaves.has(leaf.name)) { out.kept.mount = (out.kept.mount ?? 0) + 1; continue; }
+    if (typeof guard.refreshInventory !== "function") { stopPhase("daemon_changed"); break; }
+    try { await ctx.owned(() => guard.refreshInventory!(), ctx.hardPass); }
+    catch (error) {
+      if (error instanceof PodEpochSettlementError || error instanceof Refusal) throw error;
+      // The inventory moved (or could not be read): the whole pass is a daemon veto.
+      stopPhase("daemon_changed");
+      ctx.veto();
+      throw error instanceof PodEpochDaemonError ? error : new PodEpochDaemonError("daemon_changed");
+    }
+    const remaining = ctx.hardPass - 5000 - ctx.now();
+    if (remaining <= 0) { stopPhase("census_budget"); break; }
+    const again = parseScratchCensus(
+      await ctx.owned(() => runCensus(layout.root, pin.devIno, leaf.name, Math.min(SCRATCH_RECENSUS_MAX_MS, remaining)), ctx.hardPass),
+      pin.devIno);
+    if ("refused" in again) { stopPhase(again.refused); break; }
+    if (!censusEntryUnchanged(leaf, again.entries.find(e => e.name === leaf.name), again.rootUid)) {
+      out.kept.changed = (out.kept.changed ?? 0) + 1; continue;
+    }
+    if (!(await idle())) { stopPhase("not_idle"); break; }
+    const holding = scan([leaf.name]);
+    if ("refused" in holding) { stopPhase(holding.refused); break; }
+    if (holding.held.has(leaf.name)) { out.kept.held_open = (out.kept.held_open ?? 0) + 1; continue; }
+    ctx.check(); ctx.entry();
+
+    let scope: PodEpochReclaimScope;
+    try { scope = ctx.openScope(); } catch { stopPhase("scope_refused"); break; }
+    if (scope.stopped()) ctx.failFatal();
+    // A refusal raised by the pre-launch observation itself happens before any child, ticket or unsettled
+    // entry exists: it is the pass's own invalidation (as in the attempt phase), not an unresolved delete.
+    let preLaunch: unknown;
+    let settlement: Settlement;
+    try {
+      settlement = await ctx.owned(() => deps.git.discardEpochScratchLeaf({
+        scope, root: layout.root as EpochScratchDiscardInput["root"], name: leaf.name, expect: leaf.devIno,
+        rootExpect: pin.devIno, bytes: leaf.bytes, signal: controller.signal, deadline: ctx.deadlineAt(),
+        beforeLaunch: async () => {
+          try { ctx.check(); ctx.entry(); } catch (error) { preLaunch = error; throw error; }
+        },
+        rootRepin: () => repinScratchRoot(layout, pin.devIno, seams.io),
+        mountsOk: () => {
+          const current = readMounts(names);
+          return !("refused" in current) && !current.mountedLeaves.has(leaf.name);
+        },
+        ...(seams.discardSeam ? { testSeam: seams.discardSeam } : {}),
+      }), ctx.hardPass, true);
+    } catch (error) {
+      if (error instanceof PodEpochSettlementError) throw error;
+      if (preLaunch !== undefined && error === preLaunch) { stopPhase("observation_refused"); throw error; }
+      // An unresolved delete, or anything else thrown once a launch may have happened: EX stays held.
+      return ctx.failFatal();
+    }
+    launched++;
+    if (settlement.outcome === "removed") {
+      out.deleted++; out.deleted_allocated_bytes_estimate += settlement.bytes;
+    } else if (settlement.outcome === "residue") {
+      out.residue++; out.deleted_allocated_bytes_estimate += settlement.bytesLowerBound; out.estimate_partial = true;
+      if (settlement.kind === "helper_failed") out.helper_failed++;
+      if (settlement.stopPhase) { stopPhase(settlement.kind); break; }
+      if (++retained >= SCRATCH_RETAINED_STOP) { stopPhase("retained_cap"); break; }
+    } else ctx.failFatal();
+  }
+  // The proof once more after the last join. Everything deleted is already settled, so a failure here only
+  // records that the idle interval cannot be vouched for to its end.
+  if (launched > 0 && !(await idle(true))) out.not_idle_after = true;
+  const freeAfter = freeBytes();
+  if (freeBefore !== null && freeAfter !== null) {
+    const delta = freeAfter - freeBefore;
+    out.statfs_free_delta_unattributed = delta >= -MAX_SAFE_BIGINT && delta <= MAX_SAFE_BIGINT ? Number(delta) : null;
+  }
+}
+
 /** Read-only, first-process shadow pass. Durable consumption is performed by main.
  * Evidence soft-stops at 115s (hard 120s); the entire pass soft-stops at 595s
  * (hard 600s). Both include a 5s settlement reserve, not an extra grace period.
@@ -219,17 +515,19 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     list: [], list_overflow: 0, inventory_overflow: 0, inventory_overflow_exact: false,
     inventory_complete: false, bytes_state: "unknown", evidence_wait_ms: 0, pass_ms: 0,
     settlement_reserve_ms: 5000, deleted: 0, deleted_bytes: 0, settled: 0, source_use_not_ended: 0, kept_after_refusal: 0, kept_residue: 0,
-    kept_protected: 0, kept_unrecoverable_shape: 0, reclaim_bytes_state: "unknown",
+    kept_protected: 0, kept_unrecoverable_shape: 0, reclaim_bytes_state: "unknown", scratch: emptyScratch(),
   };
-  // Set once the deletion phase opened its reclaim scope; settled and finished before native handover.
+  // The ONE reclaim scope shared by the scratch and attempt phases, opened lazily by whichever deletes first;
+  // settled and finished before native handover.
   let reclaimScope: PodEpochReclaimScope | undefined;
-  // Set with the scope: the git handle whose process-wide unsettled-delete map the finish must consult.
-  let deletionGit: PodEpochDeletionDeps["git"] | undefined;
+  const openScope = (): PodEpochReclaimScope => reclaimScope ??= ownership.beginReclaim!();
+  // The git handles whose process-wide unsettled-delete maps the finish must consult (the same GitCache in production).
+  const settleGits = new Set<{ assertNoUnsettledDeletes(): void }>();
   const finishReclaimScope = () => {
     const scope = reclaimScope;
     if (!scope) return;
     try {
-      deletionGit?.assertNoUnsettledDeletes();
+      for (const git of settleGits) git.assertNoUnsettledDeletes();
       if (scope.stopped() || scope.pendingMutations > 0) throw new Error("reclaim unsettled");
       scope.finish();
       reclaimScope = undefined;
@@ -493,6 +791,25 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     result.bytes_state = measured.size === examined.size && !partial ? "measured" :
       measured.size ? "partial" : "unknown";
 
+    const deadlineAt = () => Date.now() + Math.max(0, hardPass - 5000 - now());
+    // ---- Runner-scratch phase (issue #4043). Runs before the attempt phase, under the same shadow verdict, with
+    // the guard open. It never reads bytes_state or partial_causes: the #3851 attempt shortfalls are not its
+    // authority. Gate closed (production): nothing below this condition executes. ----
+    const scratchDeps = options.scratch;
+    if (scratchDeps && (EPOCH_SCRATCH_DELETION_ENABLED || scratchDeps.scratchTestGate === TEST_SCRATCH_GATE) &&
+        result.verdict === "eligible" && result.authority.result === "attested" &&
+        !invalid && !controller.signal.aborted && typeof ownership.beginReclaim === "function") {
+      settleGits.add(scratchDeps.git);
+      await runScratchPhase({
+        deps: scratchDeps, seams: scratchDeps.scratchTestGate === TEST_SCRATCH_GATE ? scratchDeps.seams ?? {} : {},
+        podUid: boot.podUid, guard: guard!, controller, owned, check, entry, now, hardPass, deadlineAt, out: result.scratch,
+        openScope,
+        interrupted: () => fatal || controller.signal.aborted,
+        failFatal: () => { fatal = true; throw new PodEpochSettlementError(); },
+        veto: () => { invalidate("daemon_veto"); stop("daemon_veto"); },
+      });
+    }
+
     // ---- M1b deletion phase. Shadow counters and the verdict above are final; this only reclaims. ----
     // Runs only when ALL hold: the activation gate (or the test override), a shadow verdict of "eligible" with
     // attested authority, an intact pass (not invalidated, aborted or soft-stopped), a native reclaim scope on
@@ -501,20 +818,22 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     if (deps && (EPOCH_RECLAIM_DELETION_ENABLED || deps.enableForTest === TEST_ENABLE_DELETION) &&
         result.verdict === "eligible" && result.authority.result === "attested" &&
         !invalid && !controller.signal.aborted && typeof ownership.beginReclaim === "function") {
-      // With no admitted candidate nothing can be mutated, so no native scope is opened or finished; the pass
-      // still reports reclaim_complete. Every loop body below runs only when admits is non-empty.
-      // An unsettled runner delete already recorded in this process is fatal before any scope opens (defence in
-      // depth: no startup step before the pass deletes today, but any delete recorded before or during the pass
-      // counts): EX is kept and no handover happens.
+      // With no admitted candidate nothing can be mutated here, so this phase opens no native scope of its own (the
+      // scratch phase may already have opened the shared one); the pass still reports reclaim_complete. Every loop
+      // body below runs only when admits is non-empty.
+      // An unsettled runner delete already recorded in this process is fatal before this phase opens a scope
+      // (defence in depth: no startup step before the pass deletes today except the scratch phase above, which
+      // settles each of its deletes before it returns, but any delete recorded before or during the pass counts):
+      // EX is kept and no handover happens.
       try { deps.git.assertNoUnsettledDeletes(); } catch { fatal = true; throw new PodEpochSettlementError(); }
-      const scope = admits.size > 0 ? ownership.beginReclaim() : undefined;
-      reclaimScope = scope;
-      deletionGit = deps.git;
-      // Pending children or a stop latch are never settled by a later step: fail closed with EX kept.
+      const scope = admits.size > 0 ? openScope() : undefined;
+      settleGits.add(deps.git);
+      // Pending children or a stop latch (the shared scope's, scratch phase included) are never settled by a
+      // later step: fail closed with EX kept.
       const assertSettled = () => {
-        if (scope && (scope.stopped() || scope.pendingMutations > 0)) { fatal = true; throw new PodEpochSettlementError(); }
+        const shared = reclaimScope;
+        if (shared && (shared.stopped() || shared.pendingMutations > 0)) { fatal = true; throw new PodEpochSettlementError(); }
       };
-      const deadlineAt = () => Date.now() + Math.max(0, hardPass - 5000 - now());
       // Fresh lifecycle then holds; undefined keeps the source. Never throws: a failed, aborted or
       // non-definitive read is a keep (bounded by the pass signal and deadline).
       const readAuthority = async (runId: string) => {
