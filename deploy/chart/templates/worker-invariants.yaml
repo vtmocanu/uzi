@@ -1,3 +1,12 @@
+{{- $epochReclaim := .Values.workers.epochReclaim | default dict -}}
+{{- $canaryID := 0 -}}
+{{- if kindIs "map" $epochReclaim -}}
+{{- $canaryID = "" -}}
+{{- if hasKey $epochReclaim "deletionCanaryWorkerId" -}}{{- $canaryID = index $epochReclaim "deletionCanaryWorkerId" -}}{{- end -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $canaryID) (or (eq $canaryID "") (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" $canaryID))) -}}
+{{- fail "workers.epochReclaim.deletionCanaryWorkerId must be empty or one canonical lowercase UUID" -}}
+{{- end -}}
 {{- $runtime := .Values.workers.docker.podEpochReclaim.runtime -}}
 {{- if not (and (kindIs "string" $runtime) (has $runtime (list "" "containerd-runc" "crio-crun"))) -}}
 {{- fail "workers.docker.podEpochReclaim.runtime must be empty, containerd-runc or crio-crun" -}}

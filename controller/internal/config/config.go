@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
+
+// canonicalUUIDRE is the only accepted shape of UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID.
+var canonicalUUIDRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // workerMaxConcurrentRunsCeiling is the sanity ceiling for UZI_WORKER_MAX_CONCURRENT_RUNS.
 // It mirrors the api's maxAdvertisedConcurrentRuns band (api/internal/handler/
@@ -277,6 +281,10 @@ type Config struct {
 	// loud error rather than rendered into the wrong (restricted) namespace.
 	WorkerDockerNamespace string
 	WorkerPodEpochRuntime string
+	// WorkerEpochReclaimDeletionCanaryID names the one persistent Docker worker whose pod
+	// template carries UZI_EPOCH_RECLAIM_DELETION=1. Empty means no worker does. It is
+	// exactly one canonical lowercase UUID: no list, wildcard or padding.
+	WorkerEpochReclaimDeletionCanaryID string
 	// WorkerDinDImage is the fully-pinned DinD sidecar image
 	// (docker:<tag>-dind-rootless@sha256:... or, non-rootless, docker:<tag>-dind@...).
 	// It is operator config, not wire data — the api never names an image — and shared
@@ -458,6 +466,10 @@ func loadWorkerSettings(cfg *Config) error {
 	case "", "containerd-runc", "crio-crun":
 	default:
 		return fmt.Errorf("UZI_WORKER_POD_EPOCH_RUNTIME must be unset, containerd-runc or crio-crun")
+	}
+	cfg.WorkerEpochReclaimDeletionCanaryID = os.Getenv("UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID")
+	if id := cfg.WorkerEpochReclaimDeletionCanaryID; id != "" && !canonicalUUIDRE.MatchString(id) {
+		return fmt.Errorf("UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID must be empty or one canonical lowercase UUID")
 	}
 	required := []struct {
 		key  string
