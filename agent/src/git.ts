@@ -13938,11 +13938,14 @@ export class GitCache {
           bytes = m.complete ? m.bytes : null;
           // An epoch inspection keeps a tree-local shortfall (permission denied at the root or below, or a
           // measurement cap) out of the pass-wide `partial`: the part stays unmeasured and the source is
-          // not byte-complete, so nothing is granted for it. Only a live budget and signal qualify; the
-          // wall clock is read here, not the injected one, so a test clock is not consumed.
+          // not byte-complete, so nothing is granted for it. Only a live signal, absolute deadline and
+          // inspection budget qualify. The budget is re-read here, and only on this local-stop path,
+          // because the walk's own check precedes its directory close and a cache hit reuses an earlier
+          // decision: a budget spent since then makes the stop pass-wide.
           if (!m.complete) {
             if (opts.epoch && m.local !== undefined && opts.signal?.aborted !== true && Date.now() < (opts.deadline ?? Infinity)) {
-              shortfall = m.local;
+              if (now() < deadline) shortfall = m.local;
+              else { countPartialCause(partialCauses, "inspection_budget"); partial = true; }
             } else partial = true;
           }
         }

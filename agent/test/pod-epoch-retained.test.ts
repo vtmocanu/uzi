@@ -586,10 +586,34 @@ for (const stop of ["opendir-eacces", "entry-cap"] as const) {
     assert.ok(!("measurementShortfall" in result.sources[0]!.sources[0]!));
   });
 }
+// The walk's budget check precedes its awaited directory close; a budget spent during that close still
+// makes the local stop pass-wide when the inspection accepts it.
+it("#3851 an inspection budget spent during the directory close after a local entry-cap stop is pass-wide", async () => {
+  const [entry] = attempts(1);
+  const root = entry!.clonePath;
+  fs.mkdirSync(root, { recursive: true });
+  for (const name of ["a", "b", "c"]) fs.writeFileSync(path.join(root, name), "retained");
+  const open = fsp.opendir;
+  let clock = 0, closes = 0;
+  mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    const handle = await open(...args);
+    if (args[0] === root) {
+      const close = handle.close.bind(handle);
+      mock.method(handle, "close", async () => { await close(); closes++; clock = 100; });
+    }
+    return handle;
+  });
+  const result = await inspect({ epoch: true, now: () => clock, budgetMs: 100, measureCaps: { maxEntries: 1 } });
+  assert.equal(closes, 1);
+  assert.equal(result.partial, true);
+  assert.deepEqual(result.partialCauses, { measurement_entry_cap: 1, inspection_budget: 1 });
+  assert.ok(!("measurementShortfall" in result.sources[0]!.sources[0]!));
+  assert.equal(result.sources[0]!.sources[0]!.allocatedBytes, null);
+});
 // The shortfall guard in inspectRetainedSourcesScoped only decides on a measurement cache hit: a second
 // descriptor naming an already-measured path skips withRecoveryOperation, so no interruption check runs
 // for it. These pin each half of the guard there, acting only after the first measurement has settled.
-for (const half of ["signal", "deadline"] as const) {
+for (const half of ["signal", "deadline", "budget"] as const) {
   it("#3851 a cached local stop is not a shortfall once the " + half + " has expired after the first measurement", async () => {
     const clonePath = cache.runnerClonePath(bare, "issue-3430");
     fs.mkdirSync(clonePath, { recursive: true });
@@ -615,15 +639,21 @@ for (const half of ["signal", "deadline"] as const) {
     let guardReads = 0;
     const live = () => settled && ++guardReads > 1 ? false : true;
     if (half === "signal") Object.defineProperty(stop.signal, "aborted", { get: () => !live() });
-    else mock.method(Date, "now", () => (live() ? realNow() : deadline + 1));
+    else if (half === "deadline") mock.method(Date, "now", () => (live() ? realNow() : deadline + 1));
     const operation = GitCache.prototype.withRecoveryOperation;
     mock.method(cache, "withRecoveryOperation", async (...args: Parameters<typeof operation>) => {
       const value = await operation.apply(cache, args);
       if (measured) settled = true;
       return value;
     });
-    const result = await inspect({ epoch: true, signal: stop.signal, deadline, measureCaps: { maxEntries: 0 } });
+    // The budget half drives the injected inspection clock: it stays at 0 until the first post-settlement
+    // read (the first descriptor's guard), then reads past the 100 ms budget.
+    const result = await inspect({ epoch: true, signal: stop.signal, deadline, measureCaps: { maxEntries: 0 },
+      ...(half === "budget" ? { now: () => (live() ? 0 : 100), budgetMs: 100 } :
+        // The deadline half mocks Date.now, so the budget runs on its own injected clock.
+        half === "deadline" ? { now: () => 0, budgetMs: 600_000 } : {}) });
     assert.ok(guardReads >= 2, "the second descriptor's guard ran after the first measurement settled");
+    if (half === "budget") assert.equal(result.partialCauses?.inspection_budget, 1);
     assert.equal(result.sources.length, 2);
     const parts = result.sources.map(s => s.sources[0]!);
     assert.equal(parts[0]!.measurementShortfall, "entry_cap");
