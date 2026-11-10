@@ -125,7 +125,8 @@ mismatched is now `ack_evidence_inconsistent`.
 The digest binds a distinct Case B domain (`retained-local-record-case-b-v1`),
 the run, generation, class, hold and repo ids, the anchor and server capture
 ids, the immutable fields of the fresh exact observation (state, release
-evidence, receipt, run status, original worker identity), the bare repository's
+evidence, receipt, completed-publication receipt, guarded flag, run status,
+original worker identity), the bare repository's
 `dev:ino` and refs, the record-directory names, the settlement names, a hash of
 **every** authenticated record of the run (not only this generation's), the
 source-evidence descriptor and the `laterCleanup` list. Resolve recomputes it

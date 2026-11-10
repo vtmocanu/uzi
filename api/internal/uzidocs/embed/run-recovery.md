@@ -2607,7 +2607,9 @@ exact hold is discarded or released without the matching receipt is now
 The table is not exhaustive. Other replay and cleanup reasons can appear, for example
 `source_boundary_retained`, `no_saved_final`, `replay_ack_mismatch`, `replay_failed:<reason>`,
 `held_fallback_required:<why>`, `dispose_failed` and `dispose_failed_before_mutation`
-(a Case B failure after, and before, the first unlink), and cleanup outcomes such as
+(a Case B failure after, and before, the first unlink), `rmdir_failed` and
+`remaining_unreadable` (a Case B `partial` when removing the empty run directory or
+counting the remaining records fails unexpectedly after the records were retired), and cleanup outcomes such as
 `cleanup_retained` and `source_protected`. Re-run `local-records` or `inspect` before retrying.
 
 An unbound `*.tmp` file or orphan bundle in the run's record directory is retained and
