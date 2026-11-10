@@ -425,6 +425,7 @@ describe("reclaimStrandedRunHomes (PRD #108 M6)", () => {
       skippedTooRecent: 0,
       skippedStatusUnknown: 0,
       skippedNotTerminal: 0,
+      skippedRetainedHome: 0,
       failed: 0,
       unexamined: 0,
     });

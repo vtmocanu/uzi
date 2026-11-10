@@ -7,8 +7,14 @@
 # requires: REPO_ID UZI_WORKER_TOKEN UZI_BIN UZI_TOKEN_VAL
 # provides: -
 # handoff:  -
-# mutates:  publication resume feature on for cases 1-3/6, off for 4-5/7-8; compose:api(force-recreated: heartbeat-stale window raised for the outage; stopped/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases), compose:outbox-api-placeholder(phase-only idle container using the built worker image; api DNS alias, no listener, credentials or mounts); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
-# restores: publication resume overlay unset (default true), verified by stopped-agent probe + fresh registration; placeholder removed; cleanup evidence saved under artifacts/52-api-outage-outbox (agent logs + allowlisted recovery-record projections, before API restore and before agent recreation); api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort
+# mutates:  Docker wiring for cases 7-8 when not already wired (dind/dind-init started, UZI_DIND_SOCKET appended to $ENVFILE, picked up by the case 7 agent recreate); publication resume feature on for cases 1-3/6, off for 4-5/7-8; compose:api(force-recreated: heartbeat-stale window raised for the outage; stopped/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases), compose:outbox-api-placeholder(phase-only idle container using the built worker image; api DNS alias, no listener, credentials or mounts); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
+# restores: Docker posture (docker_wire_prepare before case 7 starts the DinD sidecar and appends UZI_DIND_SOCKET only when the stack is not already wired; after case 8, cleanup settles known fixtures and stops the agent, then docker_unwire_prepare stops and removes only the sidecars it started and removes only its own env line; recreate_outbox_agent performs the sole final recreate and docker_unwire_assert verifies that final container is unwired; nothing changes when the stack was already wired); publication resume overlay unset (default true), verified by stopped-agent probe + fresh registration; placeholder removed; cleanup evidence saved under artifacts/52-api-outage-outbox (agent logs + allowlisted recovery-record projections, before API restore and before agent recreation); api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort; custody: the declared owner discards (resolve_fixture_source_hold) of the killed generation-1 hold of the case 7 run and of both generation holds of the case 8 run, nothing else is discarded; expected exit residue is at most the case 3 completed hold (this phase does not discard it) plus at most one per case 1, 2, 4, 5, 6 run whose final custody ack has not landed (see custody:), which phases 72 and 74 see under the unchanged custody limit 8
+# custody:  holds are counted relative to E52, the open_holds census taken at phase entry (log_hold_census "phase 52 entry"). Each accepted claim generation opens ONE hold. admission_counted_holds (ADR-2445) = open holds minus at most one hold per run that is live and healthy at its current generation; every other open hold counts, including a completed run's hold not yet released and a run in recovery_wait. Every make_outbox_run calls wait_custody_headroom 1 before creating its run (8 initial claims); the restore claims of cases 7 and 8 are continuations and need none.
+#   cases 1, 2, 4, 5, 6 (one run and one claim each; the generation is asserted unchanged across the outage in 4, 5 and 6, and the 300s heartbeat-stale window is meant to prevent any re-claim in 1 and 2): +1 open while live, +0 counted. Completion releases the hold through the worker's final custody ack, which this phase does not await (no wait_completed_custody_receipt); the log_run_hold_census line after each case records it. Delta against E52 after settling: 0; up to +1 open and +1 counted between the completion and that ack.
+#   case 3 (one run and one claim, generation asserted unchanged; durable publication intent reconciled, one MR): its completed hold is not discarded by this phase. Nothing in this phase awaits, discards or asserts it, and the closing comment of the phase says it is untouched: +1 open and +1 counted (terminal runs are counted) against E52 for the rest of the phase, unless the worker's final ack releases it.
+#   case 7 (generation 1 killed with the api down while finalize is durable, restored at generation 2 in one claim, asserted, and completed): +2 open at the peak, +1 counted (generation 1; generation 2 is live and excluded). wait_completed_custody_receipt releases generation 2; resolve_fixture_source_hold discards generation 1: +0, asserted by assert_no_open_run_holds.
+#   case 8 (generation 1 killed, restored at generation 2, then generation 2 interrupted again; the spent allowance parks the run in recovery_wait worker_requeue_exhausted with no third claim, asserted): +2 open and +2 counted at the peak. Owner Cancel keeps the evidence; resolve_fixture_source_hold discards generation 1 (GEN_F2) and generation 2 (GEN_F2_OBSERVED, the same generation as GEN_F2B): +0 (a hold with an available capture is instead awaited to its archive release). assert_no_open_run_holds covers cases 7 and 8.
+#   exit: only log_hold_census "after phase 52" is taken, with no bound against E52 asserted. Expected residue attributable to this phase: up to 1 open hold (the case 3 run, unless its final ack releases it), plus at most one per case 1, 2, 4, 5, 6 run whose completion ack has not landed; expected E52+0 to E52+1 once the case 1, 2, 4, 5, 6 acks have landed.
 # race-sensitive: yes
 # =============================================================================
 # PRD #1391 M5 (Run A) — the worker message OUTBOX survives an api outage. When the api
@@ -501,14 +507,21 @@ restore_outbox_resolution() {
     apipost "/api/runs/$run/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
   done
   stop_outbox_agent "${own_runs[@]}" || { echo 'outbox cleanup: fixtures did not settle; agent retained' >&2; return 1; }
-  recreate_outbox_agent
+  # Keep Docker available through fixture settlement. Only then remove the owned wiring,
+  # and let the normal stopped-agent probe/recreate produce the final unwired container.
+  docker_unwire_prepare || return 1
+  recreate_outbox_agent || return 1
+  docker_unwire_assert || return 1
   record_outbox_transition cleanup "$transition_start" reused-existing
   storage_diagnostic_snapshot outbox-after-restore
   OUTBOX_RESTORE_NEEDED=0
 }
 restore_outage_state() {
   local rc=$?
-  restore_outbox_resolution || echo 'outbox cleanup: API alias restore failed' >&2
+  if ! restore_outbox_resolution; then
+    echo 'outbox cleanup: restore failed; refusing any additional blind agent recreate or Docker teardown' >&2
+    [ "$rc" != 0 ] || rc=1
+  fi
   set_interlock true 2>/dev/null || true
   return "$rc"
 }
@@ -532,6 +545,11 @@ outage() {
     || fail "outbox phase: spill event for run $run was not observed before the 60s deadline; no barrier margin was established"
   observe_barrier "$run"
 }
+
+# Entry custody census (measured, not assumed): the baseline the per-case census lines below read against.
+# Taken before the entry block that e2e/outage-cut.test.sh extracts and runs on its own stubs.
+E52="$(hold_open_count)" || fail "outbox phase: cannot read the entry open custody hold count"
+log_hold_census "phase 52 entry (E52=$E52)"
 
 # --- raise the api heartbeat-stale window so the outage never requeues the run --------
 # Exported so it out-ranks the env-file's E2E_WORKER_HEARTBEAT_STALE=15s (compose ranks
@@ -579,6 +597,7 @@ NT1="$(printf '%s' "$M1" | jq '[.messages[] | select((.payload.text? // "") | st
 { [ -n "$NT1" ] && [ "$NT1" -ge 5 ] 2>/dev/null; } \
   || fail "case 1: fewer than 5 outbox tick frames replayed (got ${NT1:-none})"
 pass "case 1: spill+drain proven — barrier seen, run completed with no failed report, $NT1 ticks replayed, stream gapless 1..$(printf '%s' "$M1" | jq '.messages | length')"
+log_run_hold_census "after case 1" "$RUN1"
 
 # =============================================================================
 # CASE 2 — a tiny per-run quota forces eviction; replay fills the range per-seq.
@@ -616,6 +635,7 @@ else
   # when eviction is actually observed.
   say "case 2: no quota eviction observed on this run (segment sizing / spill volume left it under the 1 KiB quota); the contiguous-stream invariant still held (observed-only, by design)"
 fi
+log_run_hold_census "after case 2" "$RUN2"
 
 # =============================================================================
 # PRD #1391 M6 (Run B) — write-ahead terminal reports survive the SAME outage. A run-lane
@@ -692,6 +712,7 @@ RB1_FR="$(apiget "/api/runs/$RUN_B1" | jq -r '.run.failure_reason // ""')"
 [ "$(fake_state | jq '.mrs | length')" = "$((MRS_B1 + 1))" ] \
   || fail "case 3: expected exactly one forge publication"
 pass "case 3: durable intent reconciled at unchanged generation/requeue count, one publication, fenced gapless completed, no failed"
+log_run_hold_census "after case 3" "$RUN_B1"
 
 # =============================================================================
 # CASE 4 — the agent CONTAINER restarted mid-outage lands the journaled outcome from the D7 BOOT
@@ -743,6 +764,7 @@ RB2_FR="$(apiget "/api/runs/$RUN_B2" | jq -r '.run.failure_reason // ""')"
 [ -z "$RB2_FR" ] \
   || fail "case 4: run carried a failure_reason after the restart — the journaled outcome was not the result: $RB2_FR"
 pass "case 4: agent restart mid-outage -> boot gate landed the journaled completed at gen $GEN_B2 (no re-claim, no requeue), stream gapless"
+log_run_hold_census "after case 4" "$RUN_B2"
 
 # =============================================================================
 # CASE 5 — a run in the timeout-sweep CARVE-OUT (completion_attempts>0, set in the DB; the run itself is not interlocked) whose lost terminal lands on replay: it does not sit non-terminal forever.
@@ -790,6 +812,7 @@ RB3_ORIGIN="$(apiget "/api/runs/$RUN_B3" | jq -r '.run.fail_origin // ""')"
 [ -z "$RB3_ORIGIN" ] \
   || fail "case 5: run carried fail_origin=$RB3_ORIGIN — a wall-clock sweep failed it instead of the journal landing 'completed'"
 pass "case 5: the carve-out run's lost terminal landed on replay -> completed at gen $GEN_B3 (never sat non-terminal, never sweep-failed)"
+log_run_hold_census "after case 5" "$RUN_B3"
 
 # =============================================================================
 # Cases 3-5 and 7-8 hold the executor; case 6 holds acknowledged publication until the cut. Cases 7-8 require a durable
@@ -824,6 +847,7 @@ RB4_FR="$(apiget "/api/runs/$RUN_B4" | jq -r '.run.failure_reason // ""')"
 [ "$(rb_run_field "$RUN_B4" claim_generation)" = "$GEN_B4" ] \
   || fail "case 6: generation advanced — the run was re-executed instead of waiting out the outage (gen $GEN_B4 -> $(rb_run_field "$RUN_B4" claim_generation))"
 pass "case 6: the interlocked run retried its publication-running ACK during the outage, then got its permit after recovery -> completed at gen $GEN_B4, no false failed"
+log_run_hold_census "after case 6" "$RUN_B4"
 
 # =============================================================================
 # Issue #1742 — the finalize record (write-ahead of every finalize step) survives an agent restart
@@ -898,7 +922,7 @@ f42_cut_judge() {
 # error, the api is restored, and only then is the error judged. A precondition or UPDATE error skips
 # the kill (the attempt is inconclusive) but still restores the api.
 f42_restart_cycle() {
-  local run="$1" gen="$2" max="$3" set_max="${4:-0}" err="" rc=0 st="" regs_before=0 regs_now=0 deadline
+  local run="$1" gen="$2" max="$3" set_max="${4:-0}" err="" rc=0 st="" regs_before=0 regs_now=0 deadline id_before="" pbranch=""
   # One exec prints a state token, so an exec/container error (no token) is told apart from a
   # journaled terminal.
   rc=0; st="$("${COMPOSE[@]}" exec -T agent sh -c \
@@ -917,6 +941,15 @@ f42_restart_cycle() {
       [ "$(rb_run_field "$run" requeue_count || true)" = "$max" ] || err="requeue_count on run $run is not $max after the UPDATE"
     fi
   fi
+  # #3644: the first cut of a run is followed by an independent-restore assertion, which only means something
+  # when P (the predecessor about to be killed) is attempt-shaped. Judged with the api still down, so it only
+  # records an error (the kill is then skipped, the attempt is inconclusive) and never calls fail.
+  if [ -z "$err" ] && [ "$set_max" = 1 ]; then
+    pbranch="$(f42_run_branch "$run")" || err="issue 3644: cannot derive the branch of run $run to check its predecessor shape"
+    if [ -z "$err" ]; then
+      restore_check_p_shape "$run" "$pbranch" attempt || err="issue 3644: the predecessor of run $run is not attempt-shaped before the SIGKILL (Docker wiring not in effect)"
+    fi
+  fi
   if [ -z "$err" ]; then
     # Baseline of the agent's "registered" log lines, so the post-restart wait can prove a NEW register.
     # A failed log read must not yield a 0 baseline (the agent's earlier register would then pass the wait).
@@ -929,9 +962,18 @@ f42_restart_cycle() {
   fi
   if [ -z "$err" ]; then
     say "SIGKILLing the agent container with the api still down (run $run generation $gen)"
+    # #3644: record the container identity (the compose slot) the restart must preserve.
+    id_before="$(restore_agent_identity)" || err="could not read the agent container identity before the SIGKILL"
     capture_agent_logs 52-api-outage-outbox before-sigkill
     rc=0; "${COMPOSE[@]}" kill -s SIGKILL agent >/dev/null 2>&1 || rc=$?
-    [ "$rc" = 0 ] || err="could not SIGKILL the agent container (exit $rc)"
+    [ "$rc" = 0 ] || err="${err:+$err; }could not SIGKILL the agent container (exit $rc)"
+    # The agent is stopped: snapshot the killed predecessor before the restart can touch it. Only the
+    # first cut of a run (SET_MAX=1) is followed by an independent-restore assertion; the second cut of
+    # case 8 interrupts the restored attempt itself and is judged by assert_finalize_allowance_spent.
+    if [ "$rc" = 0 ] && [ "$set_max" = 1 ]; then
+      pbranch="$(f42_run_branch "$run")" && restore_snapshot_predecessor "$run" "$pbranch" \
+        || err="${err:+$err; }could not snapshot the killed predecessor of run $run"
+    fi
     capture_agent_logs 52-api-outage-outbox before-start
     rc=0; "${COMPOSE[@]}" start agent >/dev/null 2>&1 || rc=$?
     [ "$rc" = 0 ] || err="${err:+$err; }could not start the agent container again (exit $rc)"
@@ -950,6 +992,16 @@ f42_restart_cycle() {
   [ "${regs_now:-0}" -gt "${regs_before:-0}" ] \
     || fail "issue 1742: the restarted agent never logged a new 'registered' line within 90s (before=$regs_before now=${regs_now:-0}) for run $run"
   wait_worker_online
+  restore_assert_agent_identity "phase 52 kill/start (run $run generation $gen)" "$id_before"
+}
+# f42_run_branch RUN — the run's agent branch. runs.branch is NULL for an issue run until its terminal report
+# (CreateRun sets none), so derive it from issue_iid with the server's convention (agentIssueBranch in
+# api/internal/workersvc/ci_fix.go). Prints nothing and returns non-zero when issue_iid is not a positive integer.
+f42_run_branch() {
+  local iid
+  iid="$(rb_run_field "$1" issue_iid)" || return 1
+  [[ "$iid" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf 'agent/issue-%s' "$iid"
 }
 # f42_wait_reclaim RUN GEN TIMEOUT — poll until RUN is running at claim generation GEN. A run that goes
 # failed while waiting is a failure with its origin named.
@@ -967,14 +1019,17 @@ f42_wait_reclaim() {
   fail "issue 1742: run $run was never re-claimed and running at generation $gen (status=${s:-none} generation=${g:-none})"
 }
 
-# #2512: retained-source recovery completes inside the acquired claim. The exact
-# G+1 capture must be available before its fresh attempt is seeded, without another
-# claim. The seed log names branch and generation; the run-scoped post-clone
-# inventory confirms that generation before model admission. One active run per
-# issue binds the branch's seed between this run's two claim events.
-# TIMEOUT=0 is a single observation for the hermetic decoder regressions.
+# #3644: after the SIGKILL the re-claim at G+1 restores independently: it seeds a fresh
+# attempt from the predecessor's verified pin inside the one successor claim (no bundle
+# capture). The seed log names the branch and generation; the run-scoped post-clone
+# inventory confirms that generation before model admission. The SIGKILL races the
+# finalization pin, so the pin may still be owed or already on the default branch.
+# TIMEOUT=0 (third argument) is a single observation for the hermetic decoder regressions.
 f42_assert_capture_resume() {
-  wait_same_claim_capture_resume "$@"
+  local run="$1" gen="$2" timeout="${3:-60}" branch
+  branch="$(f42_run_branch "$run")" || fail "issue 3644: cannot derive the branch of run $run from its issue_iid"
+  wait_independent_restore_resume "$run" "$gen" "$branch" owed,on_default "$timeout"
+  restore_assert_seed_witness "$run" "$branch" "$gen"
 }
 
 # The api is up here, so a failure to resolve the budget can fail at once.
@@ -982,9 +1037,14 @@ F42_MAX="$(f42_max_requeues)" || fail "issue 1742: cannot resolve RUN_MAX_REQUEU
 
 # -----------------------------------------------------------------------------
 # CASE 7 (A, completion control): the durable finalize record lets the run resume at G+1 even with the
-# requeue budget spent. G+1 captures the predecessor and completes in the same claim.
+# requeue budget spent. G+1 restores independently from the predecessor's pin and completes in the same claim.
+# #3644: cases 7 and 8 kill an attempt-shaped predecessor. The agent resolves Docker wiring once at startup, so
+# wire the sidecar immediately before the agent recreate this transition performs, and assert it before any
+# case run is created. Cases 1-6 keep the entry posture, whatever it is (wired already under --profile agent-docker, unwired otherwise).
+docker_wire_prepare
 transition_outbox_feature before7 false "$RUN_B4"
-say "CASE 7: finalize restart on spent budget -> G+1 capture and completion (never worker_lost)"
+docker_wire_assert
+say "CASE 7: finalize restart on spent budget -> G+1 independent restore and completion (never worker_lost)"
 make_outbox_run first_cut_barrier
 RUN_F1="$OUTBOX_RUN"
 GEN_F1="$(rb_run_field "$RUN_F1" claim_generation)"
@@ -1005,11 +1065,13 @@ wait_status "$RUN_F1" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_D
 f42_assert_capture_resume "$RUN_F1" "$((GEN_F1 + 1))"
 [ "$(rb_run_field "$RUN_F1" claim_generation)" = "$((GEN_F1 + 1))" ] \
   || fail "case 7: run $RUN_F1 completed at generation $(rb_run_field "$RUN_F1" claim_generation), want $((GEN_F1 + 1)) after same-claim recovery"
-pass "case 7: run $RUN_F1 captured and completed at generation $((GEN_F1 + 1)); finalize_resume_generation=$GEN_F1, never worker_lost"
+pass "case 7: run $RUN_F1 restored and completed at generation $((GEN_F1 + 1)); finalize_resume_generation=$GEN_F1, never worker_lost"
+# The successor generation's custody hold is released at completion: observe it before the declared discard.
+wait_completed_custody_receipt "$RUN_F1"
 resolve_fixture_source_hold "$RUN_F1" "$GEN_F1"
 
 # -----------------------------------------------------------------------------
-# CASE 8 (B, one-shot control): the allowance is used ONCE. After the G+1 capture and fresh
+# CASE 8 (B, one-shot control): the allowance is used ONCE. After the G+1 independent restore and fresh
 # seed, a second interruption of the EXECUTING generation G+1 leaves the
 # spent budget to hold preserved work for owner recovery, with no second finalize allowance.
 # The orphan/finalize exhaustion writers in worker_recovery.sql (#2426) preserve the
@@ -1023,7 +1085,7 @@ assert_finalize_allowance_spent() {
   [ "$(rb_run_field "$run" finalize_resume_generation)" = "$original" ] || fail "case 8: finalize allowance marker changed"
   [ "$(rb_run_field "$run" requeue_count)" = "$((max + 1))" ] || fail "case 8: spent requeue count changed"
 }
-say "CASE 8: allowance is one-shot: G+1 captured, resumed finalize interrupted -> owner recovery hold, mark stays G"
+say "CASE 8: allowance is one-shot: G+1 restored, resumed finalize interrupted -> owner recovery hold, mark stays G"
 make_outbox_run cut_barrier
 RUN_F2="$OUTBOX_RUN"
 GEN_F2="$(rb_run_field "$RUN_F2" claim_generation)"
@@ -1042,7 +1104,7 @@ f42_assert_capture_resume "$RUN_F2" "$((GEN_F2 + 1))"
 # The allowance is charged as a requeue, and the second cut below must NOT reset the counter downward.
 [ "$(rb_run_field "$RUN_F2" requeue_count)" = "$((F42_MAX + 1))" ] \
   || fail "case 8: after the allowance requeue requeue_count is '$(rb_run_field "$RUN_F2" requeue_count)', want $((F42_MAX + 1)) (RUN_MAX_REQUEUES $F42_MAX + the one charged requeue)"
-pass "case 8: run $RUN_F2 used the allowance, captured at G+1, and is executing at generation $((GEN_F2 + 1)) (finalize_resume_generation=$GEN_F2, requeue_count=$((F42_MAX + 1)))"
+pass "case 8: run $RUN_F2 used the allowance, restored at G+1, and is executing at generation $((GEN_F2 + 1)) (finalize_resume_generation=$GEN_F2, requeue_count=$((F42_MAX + 1)))"
 # Second cut follows the proved G+1 fresh seed and post-clone inventory, without a timed sleep.
 GEN_F2B=$((GEN_F2 + 1))
 GEN_F2_OBSERVED="$(rb_run_field "$RUN_F2" claim_generation)"
@@ -1112,6 +1174,8 @@ pass "case 8: owner cancelled the test-owned recovery hold without discarding it
 # the available G+1 archive stays exportable. Case 3's completed hold is untouched.
 resolve_fixture_source_hold "$RUN_F2" "$GEN_F2"
 resolve_fixture_source_hold "$RUN_F2" "$GEN_F2_OBSERVED"
+log_hold_census "after phase 52"
+assert_no_open_run_holds "cases 7 and 8" "$RUN_F1" "$RUN_F2"
 
 # =============================================================================
 # RESTORE — return the api stale window, outbox knobs and recovery retry spacing to defaults so
@@ -1120,7 +1184,7 @@ say "restore: recreate api + agent back to their defaults"
 restore_outbox_resolution
 pass "api + agent recreated back to their defaults"
 
-# Best-effort cleanup: every run is terminal (completed, or failed for the case 8 run), so a cancel is a
+# Best-effort cleanup: every run is terminal (completed, or owner-cancelled for case 8), so a cancel is a
 # no-op, but never let a cleanup blip redden a passed phase.
 for r in "$RUN1" "$RUN2" "$RUN_B1" "$RUN_B2" "$RUN_B3" "$RUN_B4" "$RUN_F1" "$RUN_F2"; do
   [ -n "${r:-}" ] && apipost "/api/runs/$r/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true

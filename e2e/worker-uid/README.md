@@ -392,6 +392,20 @@ node --import ./agent/node_modules/tsx/dist/loader.mjs --test --test-concurrency
 cd agent && npx tsc --noEmit -p ../e2e/worker-uid/tsconfig.json
 ```
 
+### Namespace teardown proof (issue #3644, PRD #3831 8.1)
+
+`e2e/worker-uid/namespace-teardown-real.test.mts` runs on the host, not inside the inventory container, and drives the Docker
+CLI against `WORKER_UID_IMAGE` (default `wuid-2134-base:local`, the image `run.sh` builds). Its probe,
+`namespace-teardown-probe.mts`, runs under `docker exec` as the worker UID with the real `agent/src/restore-boundary.ts`. A delayed
+child holds a pending write to a bare repo's config; `docker kill --signal KILL` stops the namespace init; `docker start` restarts
+the same container on the same volume; the successor writes its boundary record before the child's deadline and evaluates the
+compose restore predicate (`evaluateComposeRestore`: R1-R6, R8, R9) after it. The probe stubs the R8 inputs (bare repo not busy, no
+bare slot, census ok) and passes a cast predecessor slot with only the fields the predicate reads, so the admission instant is the
+compose predicate with stubbed R8 inputs, which is what this kernel proof needs. The test asserts the child is gone, the predicate admits (a strictly newer init start, same
+boot), and the config bytes, inode and mtime are unchanged through the admission instant. The PID-namespace inode can repeat across
+the restart, so the test asserts the execution tuple changed rather than the inode. A missing Docker or image fails the test. The
+container and volume are named `cdr-3644-nsproof-*` and removed by exact name. `task test:agent:worker-uid` runs it after `run.sh`.
+
 ### Node assert diagnostic calibration (issue #2471)
 
 After the two reports, `calibration.py` runs a measurement-only step of eight serial

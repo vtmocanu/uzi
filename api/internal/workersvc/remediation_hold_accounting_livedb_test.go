@@ -3,6 +3,7 @@ package workersvc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -627,5 +628,358 @@ func TestRemediationHoldOwnerCancelLiveDB(t *testing.T) {
 	}
 	if got := f.rhHoldRows(t, pred); got != predRows {
 		t.Fatalf("Cancel changed the predecessor's custody rows")
+	}
+}
+
+// Issue #3644: a restore-route worker reports the EXISTING park {recovery_wait,
+// retained_recovery_adoption_failed, claim_generation} for an unsupported predecessor. The rows
+// below drive that report through the real SetStateReportWithReconciliation -> parkRetainedRecovery
+// -> ParkRunRetainedRecovery writer for a run that already carries its own open predecessor
+// (generation 1) custody hold, and pin the hold arithmetic, the fences and the allowance usage.
+// "R-u" is the remaining requeue allowance of the current episode: RUN_MAX_REQUEUES minus
+// (requeue_count - requeue_episode_baseline). No row writes a departure witness by hand.
+
+// rsRetained is a queued run at claim_generation 1 holding its own open generation-1 hold: the
+// shape a retained restore successor has before its generation-2 claim.
+func (f *cncFixture) rsRetained(t *testing.T) uuid.UUID {
+	t.Helper()
+	run := f.seedRun("queued", 1)
+	// Inserted guarded (the trigger ignores a later flip), as a recovery_inventory_v1 claim opens it.
+	f.env.exec(`INSERT INTO recovery_custody_holds
+	              (user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, inventory_guarded)
+	            VALUES ($1, $2, $3, 1, 'open', $4, 'fixture-identity', true)`, f.userID, f.repoID, run, f.workerID)
+	if got := f.rhHoldRows(t, run); got == "[]" || f.ownOpenHolds(t, run) != 1 {
+		t.Fatalf("fixture: want exactly the predecessor hold, have %s", got)
+	}
+	return run
+}
+
+// rsUsage asserts the episode usage u = requeue_count - requeue_episode_baseline and logs R-u.
+func (f *cncFixture) rsUsage(t *testing.T, run uuid.UUID, r int32, wantU int32, what string) store.Run {
+	t.Helper()
+	row := f.run(t, run)
+	if u := row.RequeueCount - row.RequeueEpisodeBaseline; u != wantU {
+		t.Fatalf("%s: episode usage u = %d (requeue_count=%d baseline=%d), want %d", what, u, row.RequeueCount, row.RequeueEpisodeBaseline, wantU)
+	}
+	t.Logf("%s: R=%d u=%d R-u=%d own_open_holds=%d", what, r, wantU, r-wantU, f.ownOpenHolds(t, run))
+	return row
+}
+
+// rsNotApplied asserts the report was a no-write, non-confirming outcome.
+func rsNotApplied(t *testing.T, what string, res StateReportResult, err error, wantErr error) {
+	t.Helper()
+	if res.Applied {
+		t.Fatalf("%s: applied=true (status %s), want not applied (never a confirmation)", what, res.Run.Status)
+	}
+	if wantErr == nil && err != nil {
+		t.Fatalf("%s: err=%v, want nil", what, err)
+	}
+	if wantErr != nil && !errors.Is(err, wantErr) {
+		t.Fatalf("%s: err=%v, want %v", what, err, wantErr)
+	}
+}
+
+// TestRestoreUnsupportedHoldParkArithmeticLiveDB: rows (a) and (i-a). The park releases the claim
+// and touches no hold; a sweep and a re-register change nothing; the claim returns idle. At
+// custody_hold_limit 3 the owner Resume path then shows the admission-blocked outcome.
+func TestRestoreUnsupportedHoldParkArithmeticLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	const max = 3
+	for _, limit := range []int32{testCustodyLimit, 3} {
+		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
+			f := newRHFixture(t, env, max, limit)
+			run := f.rsRetained(t)
+			f.claimRun(t, run, 2)
+			f.rhRunning(t, run, 2)
+			if got := f.ownOpenHolds(t, run); got != 2 {
+				t.Fatalf("own open holds = %d before the park, want 2 (predecessor + generation 2)", got)
+			}
+			holds := f.rhHoldRows(t, run)
+			res, err := f.rhPark(t, run, 2)
+			if err != nil || !res.Applied {
+				t.Fatalf("park applied=%v err=%v", res.Applied, err)
+			}
+			if res.Run.Status != "recovery_wait" || res.Run.RecoveryWaitCause.String != rhCause {
+				t.Fatalf("park ACK = %s/%v, want recovery_wait/%s", res.Run.Status, res.Run.RecoveryWaitCause, rhCause)
+			}
+			f.rhAssertImmediatePark(t, run, 0, 0, "after park")
+			if got := f.ownOpenHolds(t, run); got != 2 {
+				t.Fatalf("own open holds = %d after the park, want 2 (the park touches no hold)", got)
+			}
+			if got := f.rhHoldRows(t, run); got != holds {
+				t.Fatalf("the park changed the custody rows:\n before %s\n after  %s", holds, got)
+			}
+			f.rsUsage(t, run, max, 0, "(a) after park")
+
+			f.sweep(t)
+			f.rhReregister(t)
+			f.rhAssertImmediatePark(t, run, 0, 0, "after sweep and re-register")
+			if got := f.rhHoldRows(t, run); got != holds {
+				t.Fatalf("sweep/re-register changed the custody rows")
+			}
+			if got, _ := f.claim(t); got != uuid.Nil {
+				t.Fatalf("claimed %s while held, want idle", got)
+			}
+			f.rsUsage(t, run, max, 0, "(a) after sweep and re-register")
+
+			if limit != 3 {
+				return
+			}
+			// Low limit: Resume admits one more claim (own 2 < 3), whose park reaches the limit;
+			// the next Resume is then refused at admission and the run stays plainly queued.
+			resume := func(what string) {
+				row, err := f.env.q.ResumeWorkerRecoveryEpisode(f.env.ctx, store.ResumeWorkerRecoveryEpisodeParams{ID: run, UserID: f.userID, GlobalTimeoutSeconds: 3600})
+				if err != nil || row.Status != "queued" {
+					t.Fatalf("%s: Resume status=%q err=%v", what, row.Status, err)
+				}
+			}
+			resume("first Resume")
+			f.omit(t) // re-registered worker needs an accepted snapshot to be claimable
+			f.claimRun(t, run, 3)
+			f.rhRunning(t, run, 3)
+			if res, err := f.rhPark(t, run, 3); err != nil || !res.Applied {
+				t.Fatalf("gen 3 park applied=%v err=%v", res.Applied, err)
+			}
+			if got := f.ownOpenHolds(t, run); got != 3 {
+				t.Fatalf("own open holds = %d after the generation-3 park, want 3 = limit", got)
+			}
+			resume("second Resume")
+			r := f.rsUsage(t, run, max, 0, "(i-a) low limit, after second Resume")
+			f.rhAssertRefusedQueued(t, run, limit, r.RequeueCount, f.rhHoldRows(t, run), run)
+			t.Logf("(i-a) limit=3: admission-blocked after generation 3; own_open_holds=3 requeue_count=%d final=queued (reasonCustodyLimit)", r.RequeueCount)
+		})
+	}
+}
+
+// TestRestoreUnsupportedHoldReportFencesLiveDB: rows (b)-(g), each through the real writer with
+// the predecessor hold open, asserting the full run row and the run's hold rows are unchanged
+// wherever the report must not apply.
+func TestRestoreUnsupportedHoldReportFencesLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	const max = 3
+
+	t.Run("(b) lost ACK replay is stale, never a confirmation", func(t *testing.T) {
+		f := newRHFixture(t, env, max, testCustodyLimit)
+		run := f.rsRetained(t)
+		f.claimRun(t, run, 2)
+		f.rhRunning(t, run, 2)
+		if res, err := f.rhPark(t, run, 2); err != nil || !res.Applied {
+			t.Fatalf("park applied=%v err=%v", res.Applied, err)
+		}
+		frozen, holds := f.rowJSON(t, run), f.rhHoldRows(t, run)
+		res, err := f.rhPark(t, run, 2)
+		rsNotApplied(t, "replay", res, err, ErrStaleClaim)
+		sameExcept(t, "replayed park", frozen, f.rowJSON(t, run))
+		if got := f.rhHoldRows(t, run); got != holds {
+			t.Fatalf("the replay changed the custody rows")
+		}
+		f.rsUsage(t, run, max, 0, "(b) after replay")
+	})
+
+	t.Run("(c) delayed generation-2 report after register requeue and a generation-3 reclaim", func(t *testing.T) {
+		f := newRHFixture(t, env, max, testCustodyLimit)
+		run := f.rsRetained(t)
+		f.claimRun(t, run, 2)
+		f.rhRunning(t, run, 2)
+		f.heartbeat(t, f.next(), f.nonce, ActiveRunEntry{RunID: run.String(), ClaimGeneration: 2, Phase: "running"})
+		f.rhReregister(t)
+		r := f.rsUsage(t, run, max, 1, "(c) after register requeue")
+		if r.Status != "queued" {
+			t.Fatalf("after re-register status=%s, want queued", r.Status)
+		}
+		f.omit(t)
+		f.claimRun(t, run, 3)
+		frozen, holds := f.rowJSON(t, run), f.rhHoldRows(t, run)
+		res, err := f.rhPark(t, run, 2)
+		rsNotApplied(t, "delayed generation-2 park", res, err, ErrStaleClaim)
+		sameExcept(t, "delayed generation-2 park", frozen, f.rowJSON(t, run))
+		if got := f.rhHoldRows(t, run); got != holds {
+			t.Fatalf("the delayed park changed the custody rows")
+		}
+		if got := f.ownOpenHolds(t, run); got != 3 {
+			t.Fatalf("own open holds = %d, want 3 (predecessor, generation 2, generation 3)", got)
+		}
+		if r := f.run(t, run); r.Status != "claimed" || r.ClaimReleasedAt.Valid || r.ClaimGeneration != 3 {
+			t.Fatalf("status=%s released=%v generation=%d, want the generation-3 claim untouched", r.Status, r.ClaimReleasedAt.Valid, r.ClaimGeneration)
+		}
+		f.rsUsage(t, run, max, 1, "(c) after delayed report")
+	})
+
+	t.Run("(d) same-generation readoption before the park: the park applies to that claim only", func(t *testing.T) {
+		f := newRHFixture(t, env, max, testCustodyLimit)
+		run := f.rsRetained(t)
+		f.claimRun(t, run, 2)
+		f.rhRunning(t, run, 2)
+		f.heartbeat(t, f.next(), f.nonce, ActiveRunEntry{RunID: run.String(), ClaimGeneration: 2, Phase: "running"})
+		f.env.exec(`UPDATE runs SET status_since = now() - interval '2 hours' WHERE id = $1`, run)
+		f.omit(t) // the real snapshot omission requeues the running flight (a charged requeue)
+		r := f.rsUsage(t, run, max, 1, "(d) after snapshot omission")
+		if r.Status != "queued" || r.ClaimReleasedAt.Valid || r.ClaimGeneration != 2 {
+			t.Fatalf("after omission status=%s released=%v generation=%d, want queued at generation 2 with the claim kept", r.Status, r.ClaimReleasedAt.Valid, r.ClaimGeneration)
+		}
+		holds := f.rhHoldRows(t, run)
+		f.heartbeat(t, f.next(), f.nonce, ActiveRunEntry{RunID: run.String(), ClaimGeneration: 2, Phase: "running"}) // real readoption
+		if r = f.run(t, run); r.Status != "running" || r.ClaimGeneration != 2 || r.ClaimReleasedAt.Valid {
+			t.Fatalf("after readoption status=%s generation=%d released=%v, want running at generation 2", r.Status, r.ClaimGeneration, r.ClaimReleasedAt.Valid)
+		}
+		// The snapshot-omission charge is not a stale requeue, so readoption refunds nothing.
+		f.rsUsage(t, run, max, 1, "(d) after same-generation readoption")
+		if got := f.rhHoldRows(t, run); got != holds {
+			t.Fatalf("readoption changed the custody rows")
+		}
+		if res, err := f.rhPark(t, run, 1); !errors.Is(err, ErrStaleClaim) || res.Applied {
+			t.Fatalf("generation-1 park after readoption: applied=%v err=%v, want ErrStaleClaim", res.Applied, err)
+		}
+		res, err := f.rhPark(t, run, 2)
+		if err != nil || !res.Applied {
+			t.Fatalf("park of the readopted claim applied=%v err=%v", res.Applied, err)
+		}
+		f.rhAssertImmediatePark(t, run, 1, 0, "after readopted park")
+		if got := f.rhHoldRows(t, run); got != holds {
+			t.Fatalf("the park changed the custody rows")
+		}
+		if got, _ := f.claim(t); got != uuid.Nil {
+			t.Fatalf("claimed %s while held, want idle", got)
+		}
+		f.rsUsage(t, run, max, 1, "(d) after readopted park")
+	})
+
+	t.Run("(e) status claimed is not applied", func(t *testing.T) {
+		f := newRHFixture(t, env, max, testCustodyLimit)
+		run := f.rsRetained(t)
+		f.claimRun(t, run, 2)
+		frozen, holds := f.rowJSON(t, run), f.rhHoldRows(t, run)
+		res, err := f.rhPark(t, run, 2)
+		rsNotApplied(t, "park of a claimed run", res, err, nil)
+		sameExcept(t, "claimed park", frozen, f.rowJSON(t, run))
+		if got := f.rhHoldRows(t, run); got != holds {
+			t.Fatalf("the refused park changed the custody rows")
+		}
+		if r := f.run(t, run); r.Status != "claimed" || r.ClaimReleasedAt.Valid {
+			t.Fatalf("status=%s released=%v, want claimed with the claim kept", r.Status, r.ClaimReleasedAt.Valid)
+		}
+		f.rsUsage(t, run, max, 0, "(e) after refused park")
+	})
+
+	t.Run("(f) pending owner stop on a running run is not applied", func(t *testing.T) {
+		f := newRHFixture(t, env, max, testCustodyLimit)
+		run := f.rsRetained(t)
+		f.claimRun(t, run, 2)
+		f.rhRunning(t, run, 2)
+		f.plainHeartbeat(t) // a live poller routes the owner cancel to the running flight
+		heldSeamCancelViaPoller(t, env, f.svc, f.userID, run, "owner stop")
+		if r := f.run(t, run); r.Status != "running" || !r.StopKind.Valid || r.StopKind.String != "cancelled" {
+			t.Fatalf("after owner cancel status=%s stop_kind=%v, want running with stop_kind cancelled", r.Status, r.StopKind)
+		}
+		frozen, holds := f.rowJSON(t, run), f.rhHoldRows(t, run)
+		res, err := f.rhPark(t, run, 2)
+		rsNotApplied(t, "park under a pending stop", res, err, nil)
+		sameExcept(t, "pending-stop park", frozen, f.rowJSON(t, run))
+		if got := f.rhHoldRows(t, run); got != holds {
+			t.Fatalf("the refused park changed the custody rows")
+		}
+		if total, unapplied := heldSeamCancelInputs(t, env, run); total != 1 || unapplied != 1 {
+			t.Fatalf("cancel inputs total/unapplied = %d/%d, want 1/1 (the owner request stays pending)", total, unapplied)
+		}
+		f.rsUsage(t, run, max, 0, "(f) after refused park")
+	})
+
+	t.Run("(g) report from a different worker id", func(t *testing.T) {
+		f := newRHFixture(t, env, max, testCustodyLimit)
+		run := f.rsRetained(t)
+		f.claimRun(t, run, 2)
+		f.rhRunning(t, run, 2)
+		other := uuid.New()
+		env.exec(`INSERT INTO workers (id, user_id, name, token_hash, status) VALUES ($1, $2, $3, $4, 'online')`,
+			other, f.userID, "w-"+other.String(), other[:])
+		wkr := f.wkr
+		wkr.ID = other
+		frozen, holds := f.rowJSON(t, run), f.rhHoldRows(t, run)
+		g := int64(2)
+		res, err := f.svc.SetStateReportWithReconciliation(env.ctx, wkr, run, StateRequest{State: "recovery_wait", RecoveryCause: strPtr(rhCause), ClaimGeneration: &g})
+		rsNotApplied(t, "foreign-worker park", res, err, ErrRunNotOwned)
+		sameExcept(t, "foreign-worker park", frozen, f.rowJSON(t, run))
+		if got := f.rhHoldRows(t, run); got != holds {
+			t.Fatalf("the foreign park changed the custody rows")
+		}
+		if r := f.run(t, run); r.Status != "running" || r.ClaimReleasedAt.Valid {
+			t.Fatalf("status=%s released=%v, want the owner's running claim untouched", r.Status, r.ClaimReleasedAt.Valid)
+		}
+		f.rsUsage(t, run, max, 0, "(g) after foreign report")
+	})
+}
+
+// TestRestoreUnsupportedHoldCrashBeforeCommitLiveDB: row (h) and (i-h). The worker dies before
+// the park commits, so only Register ever reacts: each restart charges one requeue and the run
+// holds one more hold per claimed generation. Over RUN_MAX_REQUEUES it parks for its owner at
+// worker_requeue_exhausted; at custody_hold_limit 3 admission blocks the claim first.
+func TestRestoreUnsupportedHoldCrashBeforeCommitLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	const max = 3
+	for _, limit := range []int32{testCustodyLimit, 3} {
+		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
+			f := newRHFixture(t, env, max, limit)
+			run := f.rsRetained(t)
+			for gen := int64(2); ; gen++ {
+				if gen > int64(limit)+int64(max)+2 {
+					t.Fatalf("runaway at generation %d", gen)
+				}
+				if limit == 3 && gen == 4 {
+					// Own holds = 3 = limit: the continuation exemption is spent.
+					r := f.rsUsage(t, run, max, 2, "(i-h) before the refused claim")
+					f.rhAssertRefusedQueued(t, run, limit, r.RequeueCount, f.rhHoldRows(t, run), run)
+					t.Logf("(i-h) limit=3 R=%d: admission-blocked at generation 4; own_open_holds=3 requeue_count=%d R-u=%d final=queued", max, r.RequeueCount, max-(r.RequeueCount-r.RequeueEpisodeBaseline))
+					return
+				}
+				f.claimRun(t, run, gen)
+				f.rhRunning(t, run, gen)
+				if own := f.ownOpenHolds(t, run); own != gen {
+					t.Fatalf("gen %d: own open holds = %d after the claim, want %d (predecessor + one per claim)", gen, own, gen)
+				}
+				f.heartbeat(t, f.next(), f.nonce, ActiveRunEntry{RunID: run.String(), ClaimGeneration: gen, Phase: "running"})
+				f.rhReregister(t) // the crash: the park never committed, the worker restarts
+				r := f.run(t, run)
+				if gen-1 <= max {
+					if r.Status != "queued" || r.RequeueCount != int32(gen-1) || r.FailOrigin.Valid || r.RecoveryWaitCause.Valid {
+						t.Fatalf("gen %d: status=%s requeue_count=%d fail_origin=%v cause=%v, want a charged requeue to queued (count %d)", gen, r.Status, r.RequeueCount, r.FailOrigin, r.RecoveryWaitCause, gen-1)
+					}
+					f.rsUsage(t, run, max, int32(gen-1), fmt.Sprintf("(h) gen %d charged", gen))
+					f.omit(t)
+					continue
+				}
+				if r.Status != "recovery_wait" || r.RecoveryWaitCause.String != "worker_requeue_exhausted" || r.FailOrigin.Valid || r.FinishedAt.Valid || r.RecoveryRetryNotBefore.Valid {
+					t.Fatalf("gen %d: status=%s cause=%v fail_origin=%v retry=%v, want an owner-held recovery_wait/worker_requeue_exhausted", gen, r.Status, r.RecoveryWaitCause, r.FailOrigin, r.RecoveryRetryNotBefore)
+				}
+				if got := f.ownOpenHolds(t, run); got != gen {
+					t.Fatalf("own open holds = %d at exhaustion, want %d (nothing released)", got, gen)
+				}
+				f.rsUsage(t, run, max, r.RequeueCount-r.RequeueEpisodeBaseline, "(h) exhausted")
+				if got, _ := f.claim(t); got != uuid.Nil {
+					t.Fatalf("claimed %s while held, want idle", got)
+				}
+				return
+			}
+		})
+	}
+}
+
+// TestRestoreUnsupportedHoldUnwitnessedResetLiveDB: row (j). A claimed continuation that never
+// reports running and is never listed is reset uncharged by the sweep, once per claim, and the
+// only bound is the run's own open-hold count against custody_hold_limit. The unwitnessed park
+// beside it is TestRemediationHoldUnwitnessedParkControlLiveDB.
+func TestRestoreUnsupportedHoldUnwitnessedResetLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	const max = 3
+	for _, limit := range []int32{testCustodyLimit, 3} {
+		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
+			f := newRHFixture(t, env, max, limit)
+			run := f.rsRetained(t)
+			claims := f.rhDrainLostClaims(t, run, int(limit), 2, 0, 1)
+			if claims != int(limit)-1 {
+				t.Fatalf("claims = %d, want %d (own holds start at 1 and stop at the limit %d)", claims, int(limit)-1, limit)
+			}
+			f.rhAssertRefusedQueued(t, run, limit, 0, f.rhHoldRows(t, run), run)
+			f.rsUsage(t, run, max, 0, fmt.Sprintf("(j) limit %d, %d uncharged claims", limit, claims))
+		})
 	}
 }
