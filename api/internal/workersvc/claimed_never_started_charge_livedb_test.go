@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -1012,8 +1013,8 @@ func TestClaimedNeverStartedChargeCustodyCapFirstLiveDB(t *testing.T) {
 	}
 	f.assertQueued(t, run, 1, "waiting on the custody cap")
 	row := store.ListActiveRunsForHealthRow{ID: run, UserID: f.userID, Status: "queued", Kind: "issue"}
-	if got := f.svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(2)); got != reasonCustodyLimit {
-		t.Fatalf("health reason = %q, want %q", got, reasonCustodyLimit)
+	if got := f.svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(2)); got != apitypes.ReasonCustodyRunHoldBound {
+		t.Fatalf("health reason = %q, want %q", got, apitypes.ReasonCustodyRunHoldBound)
 	}
 }
 
