@@ -16,7 +16,7 @@ import (
 type sidesFake struct{ forgetest.BaseFake }
 
 func TestRepoSidesResolveRepoForge(t *testing.T) {
-	const token = "plain-token-value"
+	const plain = "plain-value"
 	const baseURL = "https://forge.example.test"
 	box, err := secretbox.New([]byte("0123456789abcdefghijklmnopqrstuv"))
 	if err != nil {
@@ -29,7 +29,7 @@ func TestRepoSidesResolveRepoForge(t *testing.T) {
 		gotType, gotURL, gotToken = kind, u, pat
 		return fake, nil
 	})
-	sealed, err := s.EncryptToken(token)
+	sealed, err := s.EncryptToken(plain)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestRepoSidesResolveRepoForge(t *testing.T) {
 	if tr != forge.IssueTracker(fake) {
 		t.Errorf("IssueTrackerForRepo = %v, want the built driver", tr)
 	}
-	if gotType != forge.TypeGitLab || gotURL != baseURL || gotToken != token {
+	if gotType != forge.TypeGitLab || gotURL != baseURL || gotToken != plain {
 		t.Errorf("builder got (%q, %q, %q)", gotType, gotURL, gotToken)
 	}
 
@@ -54,7 +54,7 @@ func TestRepoSidesResolveRepoForge(t *testing.T) {
 	if ch != forge.CodeHost(fake) {
 		t.Errorf("CodeHostForRepo = %v, want the built driver", ch)
 	}
-	if gotType != forge.TypeGitLab || gotURL != baseURL || gotToken != token {
+	if gotType != forge.TypeGitLab || gotURL != baseURL || gotToken != plain {
 		t.Errorf("builder got (%q, %q, %q)", gotType, gotURL, gotToken)
 	}
 }
