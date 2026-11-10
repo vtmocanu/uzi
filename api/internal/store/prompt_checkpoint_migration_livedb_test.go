@@ -12,12 +12,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// TestPromptCheckpointMigrationLifecycleLiveDB pins migrations 00419/00420 (issue #4116):
+// TestPromptCheckpointMigrationLifecycleLiveDB pins migrations 00422/00423 (issue #4116):
 // the fn_checkpoint_coordinates prompt arm, the widened run_salvage branch CHECK, and the
 // guarded Down.
 func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "prompt_checkpoint_migration_")
-	if err := store.MigrateTo(ctx, dsn, 418); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 421); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -66,9 +66,9 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 	insertPrompt(run1)
 	insertPrompt(run2)
 
-	t.Run("version 418 has no prompt arm and rejects the prompt salvage branch", func(t *testing.T) {
+	t.Run("version 421 has no prompt arm and rejects the prompt salvage branch", func(t *testing.T) {
 		if got := coords(run1); got != "" {
-			t.Fatalf("418 prompt coordinates = %s, want NULL", got)
+			t.Fatalf("421 prompt coordinates = %s, want NULL", got)
 		}
 		pgErr := wantPgCode(insertSalvage(run2, "uzi/prompt-"+run2.String()), "23514")
 		if pgErr.ConstraintName != "run_salvage_branch_format_check" {
@@ -77,13 +77,13 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 	})
 
 	// The definitions Down must restore exactly (function body and constraint, incl. validation).
-	defs418 := schemaDefs(ctx, t, pool)
+	defs421 := schemaDefs(ctx, t, pool)
 
-	if err := store.MigrateTo(ctx, dsn, 420); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 423); err != nil {
 		t.Fatal(err)
 	}
 
-	t.Run("version 420 still resolves no coordinates for non-checkpoint kinds", func(t *testing.T) {
+	t.Run("version 423 still resolves no coordinates for non-checkpoint kinds", func(t *testing.T) {
 		// Synthetic rows bypass runs_kind_shape: only the resolver's kind dispatch is under test.
 		// issue_iid is set so widening the issue arm to another kind is visible too.
 		for _, kind := range []string{"ci_fix", "mr_rework", "chat", "judge", "job", "cross_check"} {
@@ -99,7 +99,7 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("version 420 resolves prompt coordinates", func(t *testing.T) {
+	t.Run("version 423 resolves prompt coordinates", func(t *testing.T) {
 		var ok bool
 		err := pool.QueryRow(ctx, `SELECT fn_checkpoint_coordinates(r) = jsonb_build_object(
 			'version',1,'run_id',r.id,'user_id',r.user_id,'repo_id',r.repo_id,'kind','prompt','issue_iid',NULL::int,
@@ -136,7 +136,7 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("version 420 admits the prompt salvage branch", func(t *testing.T) {
+	t.Run("version 423 admits the prompt salvage branch", func(t *testing.T) {
 		if err := insertSalvage(run2, "uzi/prompt-"+run2.String()); err != nil {
 			t.Fatal(err)
 		}
@@ -145,15 +145,15 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !validated {
-			t.Fatal("00420 left the salvage branch constraint NOT VALID")
+			t.Fatal("00423 left the salvage branch constraint NOT VALID")
 		}
 		_ = wantPgCode(insertSalvage(run1, "uzi/prompt-not-a-uuid"), "23514")
 	})
 
-	// MigrateDownTo commits one migration per step, so a refused Down to 418 has already
-	// committed 00420's no-op Down. Step to 419 first so the snapshot compares exactly the
-	// state the refusing migration (00419) saw.
-	if err := store.MigrateDownTo(ctx, dsn, 419); err != nil {
+	// MigrateDownTo commits one migration per step, so a refused Down to 421 has already
+	// committed 00423's no-op Down. Step to 422 first so the snapshot compares exactly the
+	// state the refusing migration (00422) saw.
+	if err := store.MigrateDownTo(ctx, dsn, 422); err != nil {
 		t.Fatal(err)
 	}
 
@@ -231,7 +231,7 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 			clearAll(ctx, pool)
 			tc.setup()
 			state := snapshot()
-			err := store.MigrateDownTo(ctx, dsn, 418)
+			err := store.MigrateDownTo(ctx, dsn, 421)
 			var pgErr *pgconn.PgError
 			if !errors.As(err, &pgErr) || !strings.Contains(pgErr.Message, tc.want) {
 				t.Fatalf("Down error = %v, want message containing %q", err, tc.want)
@@ -244,11 +244,11 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 
 	t.Run("Down succeeds with no prompt checkpoint state", func(t *testing.T) {
 		clearAll(ctx, pool)
-		if err := store.MigrateDownTo(ctx, dsn, 418); err != nil {
+		if err := store.MigrateDownTo(ctx, dsn, 421); err != nil {
 			t.Fatal(err)
 		}
 		if got := coords(run1); got != "" {
-			t.Fatalf("418 prompt coordinates after Down = %s, want NULL", got)
+			t.Fatalf("421 prompt coordinates after Down = %s, want NULL", got)
 		}
 		var def string
 		if err := pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='run_salvage'::regclass AND conname='run_salvage_branch_format_check'`).Scan(&def); err != nil {
@@ -258,8 +258,8 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 			t.Fatalf("constraint still admits prompt branches: %s", def)
 		}
 		_ = wantPgCode(insertSalvage(run2, "uzi/prompt-"+run2.String()), "23514")
-		if got := schemaDefs(ctx, t, pool); got != defs418 {
-			t.Fatalf("Down did not restore the 418 definitions:\n got  %s\n want %s", got, defs418)
+		if got := schemaDefs(ctx, t, pool); got != defs421 {
+			t.Fatalf("Down did not restore the 421 definitions:\n got  %s\n want %s", got, defs421)
 		}
 	})
 }

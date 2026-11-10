@@ -42,7 +42,7 @@ func selfImproveBranch(runID uuid.UUID) string {
 
 // promptBranch mirrors the worker's agent/src/run-kind.ts deriveCloneKey prompt arm:
 // uzi/prompt-<runId>, keyed on the run uuid (issue #4116). The SQL mirror is the prompt arm of
-// fn_checkpoint_coordinates (migration 00419); fixtures/checkpoint-branch pins all three.
+// fn_checkpoint_coordinates (migration 00422); fixtures/checkpoint-branch pins all three.
 func promptBranch(runID uuid.UUID) string {
 	return "uzi/prompt-" + runID.String()
 }

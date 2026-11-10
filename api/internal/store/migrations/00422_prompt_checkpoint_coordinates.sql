@@ -72,7 +72,7 @@ $$;
 -- +goose StatementEnd
 
 -- A failed prompt run is now salvage-eligible, so its key must satisfy the salvage format.
--- Validated separately (00420) so the scan never extends this migration's lock.
+-- Validated separately (00423) so the scan never extends this migration's lock.
 ALTER TABLE run_salvage DROP CONSTRAINT run_salvage_branch_format_check;
 ALTER TABLE run_salvage ADD CONSTRAINT run_salvage_branch_format_check
     CHECK (branch ~ '^(agent/issue-[0-9]+|uzi/(self-improve|task)/[0-9a-f-]{36}|uzi/prompt-[0-9a-f-]{36})$') NOT VALID;
