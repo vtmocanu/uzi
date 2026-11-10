@@ -847,10 +847,43 @@ describe("verifyStoppedSourceCovered", () => {
       assert.match(warns[0]!.stderr ?? "", /fsyncObjectFiles/);
     });
 
-    // The status pins carry core.attributesFile=/dev/null because gitEnv passes the process HOME
-    // through: without it Git reads $HOME/.config/git/attributes and an unreadable one warns on
-    // stderr even for a clean, covered tree.
-    it("stays covered when the HOME attributes file is unreadable and a tracked file is stat-dirty", { skip: UNREADABLE_SKIP }, async () => {
+    for (const [name, capturedStderr] of [
+      ["captured stderr", "warning: \u001b[31m" + "private".repeat(80)],
+      ["fallback error", ""],
+    ] as const) {
+      it("warns and retains when a legacy local-ref read fails with " + name, async t => {
+        const { a, head, rec } = await capturedWith({});
+        const reader = git as unknown as { runGitAsRunner: (cwd: string | undefined, args: string[],
+          opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => Promise<string> };
+        const original = reader.runGitAsRunner.bind(git);
+        let reached = 0;
+        t.mock.method(reader, "runGitAsRunner", async (cwd: string | undefined, args: string[],
+          opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => {
+          if (cwd === a.path && args.includes("for-each-ref")) {
+            reached++;
+            if (capturedStderr) opts?.onStderr?.(capturedStderr);
+            throw new Error("local-ref read fallback diagnostic");
+          }
+          return original(cwd, args, opts);
+        });
+        assert.equal(await git["localRefsReachableFrom"](bare, a.path, head), false);
+        assert.equal(reached, 1, "the local-ref read reached the failed Git call");
+        const warns = rec.lines as Array<{ level?: string; msg?: string; stderr?: string; error?: string }>;
+        const warn = warns.find(line => line.level === "warn" && line.msg === "stopped source local refs could not be proven held");
+        assert.ok(warn, "the failed local-ref read logs a warning");
+        if (capturedStderr) {
+          assert.match(warn.stderr ?? "", /^warning:/);
+          assert.ok((warn.stderr ?? "").length <= 256);
+          assert.ok(!(warn.stderr ?? "").includes("\u001b"), "stderr is sanitized");
+        } else {
+          assert.match(warn.error ?? "", /local-ref read fallback diagnostic/);
+        }
+      });
+    }
+
+    // The legacy proof uses capture's HOME and attribute inputs. Git warns when it cannot
+    // read an attributes file under that HOME, so an otherwise clean source stays retained.
+    it("is not covered when the HOME attributes file is unreadable and a tracked file is stat-dirty", { skip: UNREADABLE_SKIP }, async () => {
       const { a, head, rec } = await capturedWith({});
       const home = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-home-4141-"));
       const attrs = path.join(home, ".config", "git", "attributes");
@@ -863,8 +896,10 @@ describe("verifyStoppedSourceCovered", () => {
         fs.writeFileSync(path.join(a.path, "work.txt"), "captured\n");
         const when = new Date(Date.now() + 5000);
         fs.utimesSync(path.join(a.path, "work.txt"), when, when);
-        assert.equal(await verify(a, head), "covered");
-        assert.equal(stderrWarns(rec, STATUS_MSG).length, 0);
+        assert.equal(await verify(a, head), "not_covered");
+        const warns = stderrWarns(rec, STATUS_MSG);
+        assert.equal(warns.length, 1);
+        assert.match(warns[0]!.stderr ?? "", /Permission denied/);
       } finally {
         if (oldHome === undefined) delete process.env.HOME;
         else process.env.HOME = oldHome;

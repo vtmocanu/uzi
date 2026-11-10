@@ -12222,6 +12222,7 @@ export class GitCache {
    */
   private async localRefsReachableFrom(barePath: string, cwd: string, head: string, automatic?: AutomaticPreservation): Promise<boolean> {
     const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    let refsStderr = "";
     try {
       // Per-worktree HEADs and refs of a linked worktree are invisible to for-each-ref and status,
       // so any `.git/worktrees/` entry (or an unreadable directory) makes coverage unprovable.
@@ -12235,10 +12236,9 @@ export class GitCache {
       if (automatic?.roots.length) {
         return await this.automaticObjectCoverage(barePath, cwd, head, automatic);
       }
-      let refsStderr = "";
       const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], {
         env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
-        onStderr: (text) => { refsStderr += text; },
+        onStderr: (text) => { refsStderr += text.slice(0, Math.max(0, 256 - refsStderr.length)); },
       }));
       const out = await refs();
       if (refsStderr !== "") {
@@ -12269,7 +12269,10 @@ export class GitCache {
       return true;
     } catch (err) {
       if (err instanceof AutomaticCompletenessUnknown) throw err;
-      this.log.debug("stopped source local refs could not be proven held", { cwd, error: gitErrorMessage(err) });
+      if (automatic) this.log.debug("stopped source local refs could not be proven held", { cwd, error: gitErrorMessage(err) });
+      else this.log.warn("stopped source local refs could not be proven held", { cwd,
+        ...(refsStderr !== "" ? { stderr: sanitizeForLog(refsStderr, 256) } :
+          { error: sanitizeForLog(gitErrorMessage(err), 256) }) });
       return false;
     }
   }
@@ -12293,8 +12296,8 @@ export class GitCache {
    *
    * Any stderr from the `status` read is not provable: Git exits 0 with empty stdout and a warning for
    * an unreadable directory, so the omission would otherwise read as clean. Benign warnings (a
-   * deprecated config key, CRLF warnings included) therefore retain conservatively. The attributes
-   * file is pinned to `/dev/null` because gitEnv passes the worker HOME to runner-uid Git.
+   * deprecated config key, CRLF warnings included) therefore retain conservatively. Status uses
+   * capture's HOME and attribute inputs; an unreadable HOME attributes file also retains.
    *
    * This is the LEGACY proof. With `automatic` it delegates to {@link worktreeProvenCleanAutomatic},
    * which does not run `status` over anything it has not first bounded and typed itself; the
@@ -12304,7 +12307,7 @@ export class GitCache {
     if (automatic) return this.worktreeProvenCleanAutomatic(cwd, automatic);
     const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(undefined, action);
     const hardened = [
-      "-c", "core.excludesFile=/dev/null", "-c", "core.attributesFile=/dev/null", "-c", `core.worktree=${cwd}`, "-c", "core.trustctime=true",
+      "-c", "core.excludesFile=/dev/null", "-c", `core.worktree=${cwd}`, "-c", "core.trustctime=true",
       "-c", "core.checkStat=default", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
       "-c", "status.showUntrackedFiles=all", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false",
     ];
