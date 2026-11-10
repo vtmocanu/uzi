@@ -15,6 +15,17 @@ import type {
   WorkerRunListItem,
   WorkerRunMessage,
 } from "../src/protocol.js";
+import { RunRunner } from "../src/runner.js";
+
+/** Issue #4158: every listening fake learns each claim a RunRunner executes, so the api's
+ *  cross-check running rule applies by default, also to a claim a test hands straight to
+ *  RunRunner.execute without going through the claim route or enqueueClaim. */
+const liveFakeApis = new Set<FakeApi>();
+const originalExecute = RunRunner.prototype.execute;
+RunRunner.prototype.execute = function (this: RunRunner, claim: ClaimResponse): Promise<void> {
+  for (const fake of liveFakeApis) fake.registerClaim(claim);
+  return originalExecute.call(this, claim);
+};
 
 /** Issue #1673/#1604: the input receipt routes (POST /inputs/{ack,applied,discarded}). */
 type ReceiptKind = "ack" | "applied" | "discarded";
@@ -540,11 +551,13 @@ export class FakeApi {
     // exits and --test-timeout does not end it (measured 2026-09-29: a passing test
     // that leaves a listening server open hangs its file until killed from outside).)
     this.server.unref();
+    liveFakeApis.add(this);
     const { port } = this.server.address() as AddressInfo;
     return `http://127.0.0.1:${port}`;
   }
 
   async close(): Promise<void> {
+    liveFakeApis.delete(this);
     await new Promise<void>((resolve, reject) =>
       this.server.close((err) => (err ? reject(err) : resolve())),
     );
@@ -561,7 +574,8 @@ export class FakeApi {
   requeueRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
     this.requeues++;
     const next = { ...claim, claim_generation: nextGeneration };
-    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    // The re-offered run is `claimed` until its first accepted `running` report, as on the server.
+    this.setOwnershipStatus(claim.run_id, "claimed", nextGeneration);
     this.enqueueClaim(next);
     return next;
   }
@@ -575,14 +589,77 @@ export class FakeApi {
   redispatchRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
     this.redispatches++;
     const next = { ...claim, claim_generation: nextGeneration };
-    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    this.setOwnershipStatus(claim.run_id, "claimed", nextGeneration);
     this.enqueueClaim(next);
     return next;
   }
 
   enqueueClaim(claim: ClaimResponse): void {
     this.receiptGeneration.set(claim.run_id, claim.claim_generation ?? 0);
+    this.registerClaim(claim);
+    this.rowStatusByRun.set(claim.run_id, "claimed");
     this.claimQueue.push(claim);
+  }
+
+  // --- cross-check running rule (issue #4158) ------------------------------------------------
+  private readonly claimByRun = new Map<string, ClaimResponse>();
+  /** The status the api's run row holds: the latest of a recorded report, a claim and
+   *  setOwnershipStatus. */
+  private readonly rowStatusByRun = new Map<string, string>();
+  /** The plan_md the run row stores: the last plan an accepted awaiting_approval report carried. */
+  private readonly storedPlanByRun = new Map<string, string>();
+
+  /** Tell the fake which claim a run executes under, so the api's cross-check running rule (see
+   *  {@link crossCheckRunningAdmitted}) applies to it. enqueueClaim, the claim route and every
+   *  RunRunner.execute call (the module-level wrapper above) call it.
+   *  Only a cross-check claim (gated, or required) is modelled; an ordinary claim keeps the fake's
+   *  accept-everything behaviour. */
+  registerClaim(claim: ClaimResponse): void {
+    this.claimByRun.set(claim.run_id, claim);
+    if (typeof claim.plan_md === "string" && claim.plan_md !== "") this.storedPlanByRun.set(claim.run_id, claim.plan_md);
+    if (!this.rowStatusByRun.has(claim.run_id)) this.rowStatusByRun.set(claim.run_id, "claimed");
+  }
+
+  /** Overwrite the plan the run row stores without republishing the gate: the api state where
+   *  plan_md no longer equals the presented gate payload. */
+  setStoredPlan(runId: string, plan: string): void {
+    this.storedPlanByRun.set(runId, plan);
+  }
+
+  /** The run's cross-check model, or undefined when the run is not modelled. */
+  private crossCheckModel(runId: string): CrossCheckModel | undefined {
+    const claim = this.claimByRun.get(runId);
+    if (!claim) return undefined;
+    const auto = claim.auto_approve === true;
+    const lane: CrossCheckLane | undefined = claim.plan_cross_check_gated === true && !auto ? "gated"
+      : claim.plan_cross_check_required === true ? (auto ? "required_auto" : "required") : undefined;
+    if (lane === undefined) return undefined;
+    const gate = this.gateByRun.get(runId);
+    return {
+      lane,
+      plan: this.storedPlanByRun.get(runId),
+      presentedPlan: gate && gate.revision > 0 ? gate.snapshot.plan_md : undefined,
+      gateRevision: gate?.revision ?? 0,
+    };
+  }
+
+  /** The run's approve_plan rows as the api's guard reads them. */
+  private crossCheckApprovals(runId: string): CrossCheckApproval[] {
+    const applied = this.appliedByRun.get(runId);
+    return (this.inputsByRun.get(runId) ?? []).filter((row) => row.kind === "approve_plan").map((row) => ({
+      applied: applied?.has(row.id) ?? false,
+      superseded: this.isDiscarded(runId, row.id) || this.isInputSuperseded(runId, row.id),
+      bound: row.gate_binding === "bound",
+      gateRevision: row.gate_revision,
+    }));
+  }
+
+  /** The run's current row status when a `running` report must be refused, else undefined. */
+  private crossCheckRunningRefusal(runId: string): string | undefined {
+    const model = this.crossCheckModel(runId);
+    if (!model) return undefined;
+    const status = this.rowStatusByRun.get(runId) ?? "claimed";
+    return crossCheckRunningAdmitted(model, this.crossCheckApprovals(runId), status) ? undefined : status;
   }
 
   /** Make the next `times` /state calls fail with `status` before succeeding. */
@@ -1075,6 +1152,7 @@ export class FakeApi {
    *  PRD #1391 Run B M4: an optional `generation` rides the 200 as `claim_generation`, so a test
    *  can model the queued-duplicate router seeing a DIFFERENT generation own the run. */
   setOwnershipStatus(runId: string, status: string, generation?: number, inventoryGuarded?: boolean, holdReason?: string): void {
+    this.rowStatusByRun.set(runId, status);
     this.ownershipByRun.set(runId, {
       httpStatus: 200,
       status,
@@ -1312,6 +1390,7 @@ export class FakeApi {
       const claim = this.claimQueue.shift();
       if (!claim) return sendEmpty(res, 204);
       this.claimsServed++;
+      this.registerClaim(claim);
       return send(res, 200, claim);
     }
 
@@ -2123,6 +2202,12 @@ export class FakeApi {
     ) {
       return send(res, 409, { error: "run is not running", run: { id: runId, status: lastStatus } });
     }
+    // Issue #4158: the api's SetRunRunning refuses a running report for a human-gated cross-check
+    // run that holds a stored plan unless a bound approval for the current gate revision applied.
+    if (body.status === "running") {
+      const refusedAt = this.crossCheckRunningRefusal(runId);
+      if (refusedAt !== undefined) return send(res, 409, { error: "running report refused", run: { id: runId, status: refusedAt } });
+    }
     const receipt = this.revisionReceipts.get(runId);
     const receiptReplay = this.planRevisionRetries && receipt !== undefined &&
       receipt.body === JSON.stringify(body) &&
@@ -2187,6 +2272,14 @@ export class FakeApi {
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);
     this.lastRecordedStatus.set(runId, body.status);
+    this.rowStatusByRun.set(runId, body.status);
+    if (body.status === "awaiting_approval" && typeof body.plan_md === "string" && body.plan_md !== "")
+      this.storedPlanByRun.set(runId, body.plan_md);
+    if (body.status === "running") {
+      const owned = this.ownershipByRun.get(runId);
+      if (owned?.httpStatus === 200 && owned.status !== undefined && owned.status !== "running")
+        this.ownershipByRun.set(runId, { ...owned, status: "running" });
+    }
     this.timeline.push({ type: "state", runId, status: body.status, ...(body.plan_md !== undefined ? { plan_md: body.plan_md } : {}) });
     // Issue #1604: the server's release (or give-up clear) ends a pending switch.
     // A release also fences the released claim: its later receipts are refused as `released`.
@@ -2299,6 +2392,46 @@ export class FakeApi {
     this.stateAckCredentialSwitchOnce.delete(runId);
     return { credential_switch: { generation: armed.generation } };
   }
+}
+
+/** The cross-check lanes of the running rule. `gated` and `required` are the human-gated lanes
+ *  (required without auto_approve); `required_auto` and `ordinary` exist so the rule can be stated
+ *  for every lane the shared fixture names. */
+export type CrossCheckLane = "gated" | "required" | "required_auto" | "ordinary";
+
+/** What the api's run row holds that the running rule reads. */
+export interface CrossCheckModel {
+  lane: CrossCheckLane;
+  /** The stored plan_md; undefined or "" = no plan stored yet. */
+  plan: string | undefined;
+  /** plan_md of the presented gate payload; undefined = nothing presented. */
+  presentedPlan: string | undefined;
+  /** The run's current gate revision. */
+  gateRevision: number;
+}
+
+/** One approve_plan input row. */
+export interface CrossCheckApproval {
+  applied: boolean;
+  /** Settled with disposition 'superseded' (a discarded or revise-superseded approve). */
+  superseded: boolean;
+  bound: boolean;
+  gateRevision: number | undefined;
+}
+
+/** The api's SetRunRunning guard for a `running` report on a run row in `status`
+ *  (api/internal/store/queries/runtime.sql). A human-gated cross-check run (gated, or required
+ *  without auto_approve) that holds a plan must have a presented payload equal to that plan and an
+ *  applied, non-superseded approve_plan bound to the CURRENT gate revision, in every status. An
+ *  ordinary run needs, only in awaiting_approval, any applied non-superseded approve; an
+ *  auto-approved required run is never admitted out of awaiting_approval. The pre-plan running
+ *  report of a human-gated run is admitted (outside awaiting_approval). */
+export function crossCheckRunningAdmitted(model: CrossCheckModel, approvals: CrossCheckApproval[], status: string): boolean {
+  const live = approvals.filter((a) => a.applied && !a.superseded);
+  if (model.lane === "ordinary") return status !== "awaiting_approval" || live.length > 0;
+  if (model.lane === "required_auto") return status !== "awaiting_approval";
+  if ((model.plan ?? "") === "") return status !== "awaiting_approval";
+  return model.presentedPlan === model.plan && live.some((a) => a.bound && a.gateRevision === model.gateRevision);
 }
 
 /** PRD #1795: the approval-relevant payload of a gate presentation (plan_changed_files excluded). */
