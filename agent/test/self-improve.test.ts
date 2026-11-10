@@ -637,6 +637,8 @@ describe("buildSelfImprovePlanPrompt — generic vs dogfood directive (PRD #686 
     assert.ok(p.includes("`UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`"));
     assert.ok(p.includes("watched red then green"));
     assert.ok(p.includes("pending exact-head PR CI"));
+    assert.ok(p.includes("what they add beyond these checks is pending exact-head PR CI"));
+    assert.ok(!p.includes("their required proof is pending"));
     assert.ok(!p.includes("`task gate:repo` plus `task gate:<component>`"), "no in-run full-gate demand");
     assert.ok(!p.includes("`npm run build` in web/"), "the web production build is CI's build-web job, not an in-run demand");
     assert.ok(p.includes("still holds on the current code"));

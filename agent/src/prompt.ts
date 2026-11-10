@@ -2750,7 +2750,7 @@ export function buildSelfImprovePlanPrompt(
         "  watched red then green, and the repo-wide checks for the files you changed.",
         "  The repo, api, web and agent full gates, their full suites and the web production",
         "  build are not required in-run:",
-        "  their required proof is pending exact-head PR CI, and you never report them",
+        "  what they add beyond these checks is pending exact-head PR CI; never report them",
         "  passed from focused checks. The worker provides `task`; if it is missing,",
         "  report that as a check failure rather than running a subset.",
         "- Recommendations were judged against an older tree: before you pick one, confirm it",
