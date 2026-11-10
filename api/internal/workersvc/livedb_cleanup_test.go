@@ -52,11 +52,10 @@ func trackLiveDBProduct(t testing.TB, pool *pgxpool.Pool, id uuid.UUID) {
 func trackLiveDBOwnedProduct(t testing.TB, pool *pgxpool.Pool, id, owner uuid.UUID) {
 	t.Helper()
 	liveDBTrackMu.Lock()
-	for _, e := range liveDBTrack {
+	for k, e := range liveDBTrack {
 		if slices.Contains(e.users, owner) {
-			e.products = append(e.products, id)
-			liveDBTrackMu.Unlock()
-			return
+			t, pool = k, e.pool
+			break
 		}
 	}
 	liveDBTrackMu.Unlock()
