@@ -11,13 +11,13 @@ import (
 )
 
 // Issue #3876: every per-user row carries both harness splits. A usage row copies the
-// store counts; an outcomes-only row and a PR-only row (no usage, so no runs) carry {0,0}.
+// store counts (four distinct values, so a cross-window or cross-field swap fails); an outcomes-only row and a PR-only row (no usage, so no runs) carry {0,0}.
 func TestAdminUsageHarnessRuns(t *testing.T) {
 	usageID, outcomeID, prOnlyID := uuid.New(), uuid.New(), uuid.New()
 	st := &runsStore{
 		adminPerUser: []store.AdminUsagePerUserRow{{
-			UserID: usageID, Email: "usage@x", RunCount: 10, Last7RunCount: 4,
-			ClaudeRunCount: 7, CodexRunCount: 3, Last7ClaudeRunCount: 1, Last7CodexRunCount: 3,
+			UserID: usageID, Email: "usage@x", RunCount: 10, Last7RunCount: 3,
+			ClaudeRunCount: 7, CodexRunCount: 3, Last7ClaudeRunCount: 2, Last7CodexRunCount: 1,
 		}},
 		adminRunOutcomesPerUser: []store.AdminRunOutcomesPerUserRow{
 			{UserID: outcomeID, Email: "outcome@x", Finished: 1, Failed: 1},
@@ -43,7 +43,7 @@ func TestAdminUsageHarnessRuns(t *testing.T) {
 		t.Fatalf("want 3 rows (usage, outcomes-only, pr-only), got %d: %s", len(raw.Users), rec.Body.String())
 	}
 	want := [][2]map[string]int64{
-		{{"claude": 7, "codex": 3}, {"claude": 1, "codex": 3}},
+		{{"claude": 7, "codex": 3}, {"claude": 2, "codex": 1}},
 		{{"claude": 0, "codex": 0}, {"claude": 0, "codex": 0}},
 		{{"claude": 0, "codex": 0}, {"claude": 0, "codex": 0}},
 	}
