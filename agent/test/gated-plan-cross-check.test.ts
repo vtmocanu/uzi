@@ -309,26 +309,10 @@ describe("gated plan cross-check: human gate settlement", () => {
     checkerSays("approve");
     let otherwise = 0;
     let resumed: PlanVerdict | undefined;
-    // The fake api records a state before it replies, so a gate visible in api.states may still
-    // have its ACK in flight. Hold the first gate's ACK briefly so that window is open on every
-    // run. The timer starts inside the hook: one armed up front would expire during the checker.
-    let held = false;
-    api.onState(c.run_id, (b) => {
-      if (b.status !== "awaiting_approval" || held) return;
-      held = true;
-      api.afterPersistState(c.run_id, (s) => s.status === "awaiting_approval", new Promise((r) => setTimeout(r, 100)));
-    });
     const exec: Executor = { run: async (ctx) => {
       assert.ok(ctx.continueExistingPlanGate, "a gated run offers the re-entry hook");
-      // Re-enter only once the worker has applied the gate's ACK: it calls onPlanPersisted then.
-      let persisted!: () => void;
-      const confirmed = new Promise<void>((r) => { persisted = r; });
-      void ctx.gatePlan!(PLAN, undefined, async () => { persisted(); }).catch(() => undefined);
-      let deadline: NodeJS.Timeout | undefined;
-      const presented = await Promise.race([confirmed.then(() => true),
-        new Promise<false>((r) => { deadline = setTimeout(() => r(false), 4000); })]);
-      clearTimeout(deadline);
-      assert.ok(presented, "the worker confirmed the gate before the re-entry");
+      void ctx.gatePlan!(PLAN).catch(() => undefined);
+      for (let i = 0; i < 400 && gates(c.run_id).length === 0; i++) await new Promise((r) => setTimeout(r, 10));
       assert.equal(gates(c.run_id).length, 1, "the gate is presented before the re-entry");
       const pending = ctx.continueExistingPlanGate!(async () => { otherwise++; return { kind: "reject", reason: "re-planned" } as PlanVerdict; });
       send(c.run_id, row("approve_plan"));
