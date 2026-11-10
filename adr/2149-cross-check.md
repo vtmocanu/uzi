@@ -776,7 +776,7 @@ silently. Decisions:
 - If the SDK exhausts its retries the check fails `malformed` with log subreason `structured_output_retries` and a fixed message.
 - The Codex checker was unchanged by #4038; [#4103 below](#amendment-2026-11-09--4103-codex-plan-output-schema) subsequently adds a Plan-only output schema.
 
-**Evidence.** `agent/test/fixtures/claude-structured-output-0.3.310.json` was captured from the pinned SDK with scripted model turns. Replay tests in `agent/test/claude-structured-output-replay.test.ts` and `agent/test/claude-structured-output.test.ts` exercise it.
+**Evidence.** `agent/test/fixtures/claude-structured-output-0.3.316.json` was recaptured on 2026-11-10 from SDK 0.3.316 / CLI 2.1.316 with scripted model turns. Replay tests in `agent/test/claude-structured-output-replay.test.ts` and `agent/test/claude-structured-output.test.ts` exercise it.
 
 **Rejected alternative.** A manual follow-up turn asking the model to re-emit only the JSON would add a resume path and separate usage accounting; the SDK retry stays inside one session.
 
