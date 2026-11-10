@@ -218,29 +218,36 @@ binding. The amendment of 2026-11-06 above is unaffected.
   one.
 - **Refusals (whole phase, fixed reason, attempt phase continues).** Anything but the exact
   layouts (uid-split root `/data/runner/.tmp/uzi-runner`, runner-owned `0700`; single-uid root
-  `/data/runner/.tmp`); a root that cannot be pinned component by component; an unexpected mount
-  above or inside the root; a filesystem other than ext4 or XFS; an unknown or unreadable Docker
-  bind-source inventory; unreadable or malformed protected recovery records; an invalid pod-entry
-  record; a failed exclusive-idle proof; a census that fails or would overrun the pass deadline.
+  `/data/runner/.tmp`); a root that cannot be pinned component by component or has the wrong
+  owner, mode or identity; an unexpected mount above or inside the root; a filesystem other than
+  ext4 or XFS; an unknown or unreadable Docker bind-source inventory, or a bind source at or above
+  the root; unreadable or malformed protected recovery records; an invalid pod-entry record; a
+  failed exclusive-idle proof, an exempt process not running as the worker uid/gid, or unreadable
+  process descriptors; a census that fails, is malformed, reports another root identity or would
+  overrun the pass deadline. Later in the loop, a re-read that fails stops the phase the same way.
+  The exceptions are a daemon-inventory change and a refused pre-launch observation or launch:
+  those invalidate the whole pass, so the attempt phase does not run.
 - **Never removed.** The root itself; `uzi-worker` and `uzi-runner`; dot-names and other refused
   names; non-directories; leaves owned by another uid or containing foreign-owned entries; mounted
   or other-filesystem leaves; leaves a Docker bind source or a protected recovery record
   references; leaves a visible process holds open or uses as its cwd; `uzi-quiesce-*` helper leaves; and
-  any leaf whose newest subtree ctime is at or after the pod-entry fence (record ctime minus 2 s).
-  At most 512 leaves are admitted per pass, in name order.
+  any leaf whose newest subtree ctime is at or after the pod-entry fence (record ctime minus 2 s);
+  and any leaf whose census was incomplete (a cap, the deadline or an unreadable entry). At most 512 leaves are admitted per pass, in name order.
 - **Deletion.** Top-level leaves are censused read-only as the runner uid, then deleted one at a
   time. Before each delete the mounts, daemon inventory, leaf census, idle proof and process
-  holders are re-read; any change keeps that leaf or stops the phase. The strict pinned helper
+  holders are re-read; a changed leaf is kept and a failed re-read stops the phase (a daemon
+  change invalidates the pass, above). The strict pinned helper
   stays on one filesystem, re-pins every descendant and prints a removal receipt only after its own
   final `rmdir` succeeded and the retained leaf pin reports `nlink` 0.
-- **Settlement.** Each leaf settles as removed or residue before the next starts; three retained
-  leaves stop the phase. A delete that cannot be settled (or a pending child or stop latch) is
+- **Settlement.** Each leaf settles as removed or residue before the next starts. A residue whose
+  leaf changed or whose helper failed stops the phase at once; otherwise three retained leaves stop
+  it. A delete that cannot be settled (or a pending child or stop latch) is
   fatal: EX is kept, nothing is admitted and the process exits non-zero, as for M1b.
 - **Bytes.** Reported figures are allocated-block estimates from the census (hard-linked bytes
   counted separately), not proof of freed storage.
 - **Costs (bounded work, separate from the byte estimates).** The census reads at most 4096
   top-level entries, 200,000 entries per leaf and 2,000,000 in total, to depth 256, within the pass
-  budget minus a 10 s margin; each per-leaf re-census is capped at 30 s; each delete helper at
+  budget minus the 5 s settlement reserve and a 10 s margin; each per-leaf re-census is capped at 30 s; each delete helper at
   2,000,000 entries, depth 256 and 300 s; the whole phase stays inside the existing 600 s pass
   with its 5 s settlement reserve. With the gate off none of this runs. The real-UID image lane's
   runtime change from the new split-mode leaf is unmeasured (that lane could not run in-run).

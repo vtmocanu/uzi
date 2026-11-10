@@ -336,13 +336,16 @@ nothing is deleted. The only visible change is a `scratch` object on the
 `pod_epoch_reclaim` log line that reads `state: "not_run"`. Do not expect
 `TMPDIR` scratch to be reclaimed yet; a full data volume still relies on the
 paths above. When an owner enables the phase, it acts only at a verified pod
-epoch and removes only leaves that every guard proves unused; the other
-`scratch` fields are counts (`examined`, `kept` by reason, `eligible`,
-`deleted`, `residue`, `helper_failed`) and byte figures named `*_estimate`.
-`eligible_allocated_bytes_estimate` and `deleted_allocated_bytes_estimate` come
-from allocated blocks, and `statfs_free_delta_unattributed` is the pool's
-free-byte change across the phase from all writers, so none of them proves that
-storage was freed (`reclaim_bytes_state` reads `estimated` or `unknown`).
+epoch and removes only leaves that every guard proves unused. The `scratch`
+object then reports `state` and `reason` (fixed tokens), `layout`, the counts
+`examined`, `kept` by reason, `eligible` (admitted at census time; a leaf
+demoted before its delete is also counted under `kept`), `deleted`, `residue`
+and `helper_failed`, and the flags `estimate_partial`, `list_overflow` and
+`not_idle_after`. The byte figures `eligible_allocated_bytes_estimate`,
+`deleted_allocated_bytes_estimate` and `shared_bytes` (hard-linked files) come
+from allocated blocks, and `statfs_free_delta_unattributed` is the change in
+available bytes across the delete loop from all writers, so none of them proves
+that storage was freed (`reclaim_bytes_state` reads `estimated` or `unknown`).
 Activation and hosted before/after-byte acceptance are pending owner decisions.
 
 **The [disk self-heal recycle](hosted-workers.md#disk-self-heal) (PRD #837)
