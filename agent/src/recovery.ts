@@ -6558,16 +6558,17 @@ export class RecoveryCoordinator {
       if (source.runId === runId && source.barePath === bare) mine.push(source);
     }
     for (const source of mine) {
-      if (!Array.isArray(source.sources) || !Array.isArray(source.consumers) || !source.consumers.every(isText) ||
+      if (!Array.isArray(source.sources) || source.sources.length === 0 ||
+          !Array.isArray(source.consumers) || !source.consumers.every(isText) ||
           !isText(source.descriptor) || !isText(source.kind) || !isText(source.key) || !isText(source.attempt) ||
           !isText(source.journalState) || !isText(source.markerState) ||
           !source.sources.every(p => p && isText(p.clonePath) && isText(p.presence))) return incomplete;
     }
-    if (!e1.clones.length && !mine.length) return { classification: "source_evidence_empty" };
     if (mine.some(s => s.presence !== "present" || s.sources.some(p => p.presence !== "present"))) return { classification: "source_missing" };
     const unique = (values: string[]): string[] => [...new Set(values)].sort();
     const inventoried = unique(e1.clones.map(c => c.clonePath));
     const inspected = unique(mine.flatMap(s => s.sources.map(p => p.clonePath)));
+    if (!inventoried.length || !inspected.length) return { classification: "source_evidence_empty" };
     if (JSON.stringify(inventoried) !== JSON.stringify(inspected)) return { classification: "source_enumeration_mismatch" };
     // The aggregate view reports the run's own local records in `localRecords`, never as a blocker: any blocker refuses.
     const blockers = unique(mine.flatMap(s => s.consumers.filter(c => c.startsWith("blocker:"))));

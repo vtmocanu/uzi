@@ -331,6 +331,7 @@ it("#3885 recordDisposition: only cleanliness is skipped; identity, liveness and
   assert.equal(ok.proved, 1);
   assert.deepEqual(ok.diagnostics, []);
   assert.deepEqual(ok.statusCalls, [], "cleanliness is not read");
+  assert.ok(ok.options.length >= 2, "the boundary reads clone identities before and after the runner's git");
   assert.ok(ok.options.every(o => (o as { cloneIdentity?: boolean })?.cloneIdentity === true), "every read asks for the clone identity");
   // The boundary proves once before the action and once inside it: quiescence before and after the runner's git, each time.
   assert.deepEqual(ok.sites, ["inventory_source", "inventory_source:after_runner_git", "inventory_source", "inventory_source:after_runner_git"]);

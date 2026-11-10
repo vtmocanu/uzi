@@ -623,7 +623,8 @@ const refusals: Array<[string, string, Mutator]> = [
   ["an unsafe part", "source_missing", ev => { e2(ev).sources[0]!.sources[0].presence = "unsafe"; }],
   ["E1 path not in E2", "source_enumeration_mismatch", ev => { (ev.e1 as any).clones[0].clonePath = "/elsewhere/issue-1"; }],
   ["an extra E1 clone", "source_enumeration_mismatch", ev => { (ev.e1 as any).clones.push({ ...(ev.e1 as any).clones[0], clonePath: "/extra/issue-2" }); }],
-  ["E1 empty with E2 present", "source_enumeration_mismatch", ev => { (ev.e1 as any).clones = []; }],
+  ["E1 empty with E2 present", "source_evidence_empty", ev => { (ev.e1 as any).clones = []; }],
+  ["E2 has no own physical paths", "source_evidence_empty", ev => { e2(ev).sources[0]!.runId = "other-run"; }],
   ["a named-by-other-journal blocker", "source_not_exclusive:named_by_other_journal:other", ev => { e2(ev).sources[0]!.consumers.push("blocker:named_by_other_journal:other"); }],
   ["a live blocker", "source_not_exclusive:live:issue-3105", ev => { e2(ev).sources[0]!.consumers.push("blocker:live:issue-3105"); }],
 ];
@@ -645,6 +646,24 @@ test("source evidence refusals: each shape is named, and every record, bundle an
   const failing = await world();
   failing.evidence = () => { throw new Error("fixture inspection failure"); };
   assert.equal(await failing.classification(), "source_evidence_unavailable");
+});
+
+test("an own E2 descriptor with zero parts cannot prove an empty physical inventory", async () => {
+  const w = await world();
+  const digest = await w.digest();
+  w.evidence = () => {
+    const ev = fakeSourceEvidence(w.runId, w.bare);
+    (ev.e1 as any).clones = [];
+    e2(ev).sources[0]!.sources = [];
+    return ev;
+  };
+  const view = await w.view();
+  assert.equal(view?.classification, "source_evidence_incomplete");
+  assert.equal(view?.digest, undefined, "a malformed own descriptor offers no confirmation digest");
+  const before = await w.state();
+  assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "source_evidence_incomplete" });
+  await w.assertUntouched(before);
+  assert.equal(w.contexts.length, 0, "no source boundary was entered");
 });
 
 test("diagnostic-only causes and unrelated sources never change eligibility or the digest", async () => {
@@ -799,7 +818,7 @@ test("shutdown after the boundary is a partial; the client cannot interrupt past
   const digest = await w.digest();
   w.stepHook = s => { if (s.kind === "bundle" && s.phase === "after") w.shutdown.abort(); };
   assert.deepEqual(await w.resolve(digest), { kind: "partial", reason: "shutting_down" });
-  assert.ok((await w.coordinator.inspect(w.runId)).length >= 1);
+  assert.equal((await w.coordinator.inspect(w.runId)).length, 2, "only the anchor bundle went; both records remain");
 });
 
 test("a deadline that passes after the boundary is a partial", async () => {
@@ -811,7 +830,7 @@ test("a deadline that passes after the boundary is a partial", async () => {
     if (s.kind === "bundle" && s.phase === "after") await new Promise(resolve => setTimeout(resolve, Math.max(0, deadlineAt - Date.now()) + 100));
   };
   assert.deepEqual(await w.resolve(digest, { deadlineAt }), { kind: "partial", reason: "deadline_exhausted" });
-  assert.ok((await w.coordinator.inspect(w.runId)).length >= 1);
+  assert.equal((await w.coordinator.inspect(w.runId)).length, 2, "only the anchor bundle went; both records remain");
 });
 
 test("an unsafe bundle path is refused before the first unlink (bundle_path_unknown)", async () => {
