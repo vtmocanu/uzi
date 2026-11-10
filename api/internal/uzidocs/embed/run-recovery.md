@@ -2775,8 +2775,12 @@ deletion, so A and B can both be enabled at once. A same-pod container restart
 does not re-run a pass whose pod UID was already durably consumed; it re-runs
 only if the first process died before that consumption. This is an accepted
 limit of the design, not a bug to work around:
-clear the selector, confirm A has been replaced (or its activation line reads
-`deletion_requested: false`), and only then set the new ID.
+clear the selector, confirm A's Deployment template no longer contains
+`UZI_EPOCH_RECLAIM_DELETION=1`, confirm every pod that started with it is gone,
+and confirm A's current pod logged `pod_epoch_reclaim_activation` with
+`deletion_requested: false`. Only then set the new ID. A replacement that
+started before the template changed (for example after an eviction) still
+carries the env, so "A was replaced" alone is not proof.
 
 **Settlement contract (unchanged).** Crash scope is process crashes only: a crash
 after a `running` pending record leaves the source KEPT and not recovered
