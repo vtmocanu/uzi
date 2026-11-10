@@ -161,16 +161,31 @@ describe("buildSdkOptions guardedCommand", () => {
   it("leaves the options identical, with no new keys, when unset", () => {
     const opts = buildSdkOptions(base());
     assert.equal("toolAliases" in opts, false);
-    assert.deepEqual(opts.disallowedTools, [...ASYNC_DEFERRAL_TOOLS]);
+    assert.deepEqual(opts.disallowedTools, [...ASYNC_DEFERRAL_TOOLS, "AskUserQuestion"]);
   });
 
   it("adds the Bash alias and denies native Bash and Monitor when set", () => {
     const opts = buildSdkOptions({ ...base(), guardedCommand: true });
     assert.deepEqual(opts.toolAliases, { Bash: GUARDED_COMMAND_TOOL });
-    assert.deepEqual(opts.disallowedTools, [...ASYNC_DEFERRAL_TOOLS, "Bash", "Monitor"]);
+    assert.deepEqual(opts.disallowedTools, [...ASYNC_DEFERRAL_TOOLS, "AskUserQuestion", "Bash", "Monitor"]);
     const rest = { ...opts };
     delete rest.toolAliases;
-    rest.disallowedTools = [...ASYNC_DEFERRAL_TOOLS];
+    rest.disallowedTools = [...ASYNC_DEFERRAL_TOOLS, "AskUserQuestion"];
     assert.deepEqual(rest, buildSdkOptions(base()), "nothing else changes");
+  });
+
+  // Issue #4149: native AskUserQuestion is denied on the run lane in BOTH branches, so a
+  // headless run can never ask a question nobody on the worker answers; clarification goes
+  // through uzi's MCP ask_user (PRD #88). The other run-lane denials still hold.
+  it("denies native AskUserQuestion in both the plain and the guardedCommand branch", () => {
+    for (const [label, opts] of [
+      ["plain", buildSdkOptions(base())],
+      ["guardedCommand", buildSdkOptions({ ...base(), guardedCommand: true })],
+    ] as const) {
+      const denied = opts.disallowedTools ?? [];
+      assert.ok(denied.includes("AskUserQuestion"), `${label}: AskUserQuestion is disallowed`);
+      for (const t of ["ScheduleWakeup", "CronCreate"]) assert.ok(denied.includes(t), `${label}: ${t} stays disallowed`);
+      if (label === "guardedCommand") for (const t of ["Bash", "Monitor"]) assert.ok(denied.includes(t), `${label}: ${t} stays disallowed`);
+    }
   });
 });

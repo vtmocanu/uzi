@@ -221,6 +221,12 @@ export interface ClaudeTurnConfig {
   guardedCommand?: true;
 }
 
+/** Issue #4149: the run lane's query-level deny list, shared by both `buildSdkOptions`
+ *  branches so they cannot drift. Native `AskUserQuestion` is denied as defense in depth:
+ *  nobody on a headless worker answers it, and run-lane clarification goes through uzi's
+ *  MCP `ask_user` (PRD #88), which parks the run at `awaiting_input`. */
+const RUN_LANE_DISALLOWED_TOOLS = [...ASYNC_DEFERRAL_TOOLS, "AskUserQuestion"] as const;
+
 /**
  * Assemble the per-turn `SdkOptions` from the owner-computed ingredients. Keys are in
  * EXACTLY the insertion order the owner's literal used before the M2 extraction, so a
@@ -247,7 +253,7 @@ export function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
     mcpServers: config.mcpServers,
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
-    disallowedTools: [...ASYNC_DEFERRAL_TOOLS],
+    disallowedTools: [...RUN_LANE_DISALLOWED_TOOLS],
     hooks: { PreToolUse: config.preToolUse },
     // issue #2014 (ADR-2014 D1/D2): the run lane asks for stream_event frames so each message's
     // FINAL usage (message_delta) and any message that never arrives as an assistant frame reach the
@@ -260,7 +266,7 @@ export function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
   if (config.attributionSettings) options.settings = config.attributionSettings;
   if (config.guardedCommand) {
     options.toolAliases = { Bash: GUARDED_COMMAND_TOOL };
-    options.disallowedTools = [...ASYNC_DEFERRAL_TOOLS, "Bash", "Monitor"];
+    options.disallowedTools = [...RUN_LANE_DISALLOWED_TOOLS, "Bash", "Monitor"];
   }
   return options;
 }

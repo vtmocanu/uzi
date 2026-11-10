@@ -144,7 +144,7 @@ describe("default-off: no ctx.capturedMemory", () => {
     assert.equal(seen.length, 2, "a plan turn and an implement turn");
     for (const options of seen) {
       assert.equal("toolAliases" in options, false);
-      assert.deepEqual(options.disallowedTools, [...ASYNC_DEFERRAL_TOOLS]);
+      assert.deepEqual(options.disallowedTools, [...ASYNC_DEFERRAL_TOOLS, "AskUserQuestion"]);
       assert.equal(GUARDED_COMMAND_SERVER in (options.mcpServers ?? {}), false);
       assert.equal(matchers(options).includes(GUARDED_COMMAND_TOOL), false);
       assert.equal(matchers(options).filter((m) => m === "Bash").length, 1, "only the original Bash hook");
@@ -174,7 +174,7 @@ describe("guard-bound run", () => {
     assert.equal(seen.length, 2);
     for (const options of seen) {
       assert.deepEqual(options.toolAliases, { Bash: GUARDED_COMMAND_TOOL });
-      assert.deepEqual(options.disallowedTools, [...ASYNC_DEFERRAL_TOOLS, "Bash", "Monitor"]);
+      assert.deepEqual(options.disallowedTools, [...ASYNC_DEFERRAL_TOOLS, "AskUserQuestion", "Bash", "Monitor"]);
       assert.ok(GUARDED_COMMAND_SERVER in (options.mcpServers ?? {}));
       const names = matchers(options);
       assert.deepEqual(names.slice(0, 3), ["Bash", "Bash", GUARDED_COMMAND_TOOL], "the original Bash hook stays, the lane hook rides both names");
