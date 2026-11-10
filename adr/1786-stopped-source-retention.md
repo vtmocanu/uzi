@@ -256,7 +256,10 @@ positive server evidence that its run is terminal; an absent or released hold is
 - **Actively parked, and the lifecycle evidence for a marker-less source.** An open hold of the
   run means the run is still parked, so `owner_hold_discard` refuses and deletes nothing: this
   is the actively-parked refusal. A local record (`resolve_local_record`) or a live flight also
-  refuses. An absent or released hold is not proof the run is terminal: a hold can be released
+  refuses. Guarded Case B records can now be resolved with `resolve-local-record --case-b`
+  ([ADR-2417](2417-guarded-local-retention.md#amendment-2026-11-10-case-b-local-record-disposition-3885));
+  retiring the record alone grants no source disposal, and the source still needs its own
+  `inspect` disposition and `discard`. An absent or released hold is not proof the run is terminal: a hold can be released
   (claim released, capture available) or never opened (`paused` and `limit_wait` parks,
   recovery-disabled workers) while the run is still parked. Discard of a marker-less canonical
   source therefore requires positive lifecycle evidence (maintainer decision 3, 2026-10-12): the
