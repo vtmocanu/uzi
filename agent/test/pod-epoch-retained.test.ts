@@ -292,7 +292,8 @@ it("#3775 epoch measurement walks a physical path once when multiple descriptors
   assert.deepEqual(result.partialCauses, {});
   const capped = await inspect({ epoch: true, maxPhysicalPaths: 1, measureCaps: { maxEntries: 0 } });
   assert.deepEqual(capped.partialCauses, { measurement_entry_cap: 1 });
-  assert.equal(capped.partial, true);
+  assert.equal(capped.partial, false, "a cap confined to one tree no longer makes the pass partial");
+  assert.deepEqual(capped.sources.map(s => s.sources[0]!.measurementShortfall), ["entry_cap", "entry_cap"]);
   assert.equal(capped.unreadable, 0);
   assert.equal(walks, 2);
 });
@@ -486,8 +487,18 @@ it("#3775 a child ENOENT stays a complete measurement without a partial cause", 
   assert.deepEqual(result.partialCauses, {});
 });
 
-for (const mode of ["entry", "pending", "depth", "deadline", "root", "open", "read", "child", "close", "cap-close", "read-close"] as const) {
-  it("#3775 measurement original-site causes " + mode, async () => {
+type MeasureMode = "entry" | "pending" | "depth" | "deadline" | "root" | "open" | "read" | "child" | "close" | "cap-close" | "read-close" |
+  "open-eacces" | "sub-eperm" | "child-eperm" | "open-eio" | "open-emfile" | "read-eacces" | "open-string" | "open-getter" | "child-getter";
+/** Faults confined to one tree: in epoch inspection they leave the pass complete and name a shortfall. */
+const localShortfall = {
+  entry: "entry_cap", pending: "pending_cap", depth: "depth_cap", child: "eacces", "child-eperm": "eperm",
+  "open-eacces": "eacces", "sub-eperm": "eperm",
+} as const;
+const codedError = (code: string) => Object.assign(new Error("private"), { code });
+const throwingCode = () => Object.defineProperty({}, "code", { get() { throw new Error("hostile getter"); } });
+for (const epoch of [true, false]) for (const mode of ["entry", "pending", "depth", "deadline", "root", "open", "read", "child", "close", "cap-close", "read-close",
+  "open-eacces", "sub-eperm", "child-eperm", "open-eio", "open-emfile", "read-eacces", "open-string", "open-getter", "child-getter"] as const satisfies readonly MeasureMode[]) {
+  it("#3775 measurement original-site causes " + mode + (epoch ? "" : " (operator twin)"), async () => {
     const [entry] = attempts(1);
     const root = entry!.clonePath;
     fs.mkdirSync(root, { recursive: true });
@@ -496,19 +507,30 @@ for (const mode of ["entry", "pending", "depth", "deadline", "root", "open", "re
     fs.mkdirSync(path.join(root, "dir2"));
     const open = fsp.opendir, lstat = fsp.lstat;
     let rootStats = 0, hits = 0, clock = 0;
+    const childFault = (): Error | object | undefined =>
+      mode === "child" ? codedError("EACCES") : mode === "child-eperm" ? codedError("EPERM") :
+      mode === "child-getter" ? throwingCode() : undefined;
     mock.method(fsp, "lstat", async (...args: Parameters<typeof fsp.lstat>) => {
-      if ((mode === "root" && args[0] === root && ++rootStats === 2) ||
-          (mode === "child" && String(args[0]).startsWith(root + path.sep))) {
-        hits++; throw Object.assign(new Error("private"), { code: "EACCES" });
-      }
+      if (mode === "root" && args[0] === root && ++rootStats === 2) { hits++; throw codedError("EACCES"); }
+      const fault = childFault();
+      if (fault && String(args[0]).startsWith(root + path.sep)) { hits++; throw fault; }
       return lstat(...args);
     });
     mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
-      if (args[0] === root && mode === "open") { hits++; throw new Error("private"); }
+      const atRoot = args[0] === root;
+      const below = String(args[0]).startsWith(root + path.sep);
+      if (atRoot && mode === "open") { hits++; throw new Error("private"); }
+      if (atRoot && mode === "open-eacces") { hits++; throw codedError("EACCES"); }
+      if (atRoot && mode === "open-eio") { hits++; throw codedError("EIO"); }
+      if (atRoot && mode === "open-emfile") { hits++; throw codedError("EMFILE"); }
+      if (atRoot && mode === "open-string") { hits++; throw "private"; }
+      if (atRoot && mode === "open-getter") { hits++; throw throwingCode(); }
+      if (below && mode === "sub-eperm") { hits++; throw codedError("EPERM"); }
       const handle = await open(...args);
-      if (args[0] === root) {
+      if (atRoot) {
         if (mode === "deadline") clock = 100;
         if (mode === "read" || mode === "read-close") mock.method(handle, "read", async () => { hits++; throw new Error("private"); });
+        if (mode === "read-eacces") mock.method(handle, "read", async () => { hits++; throw codedError("EACCES"); });
         if (mode === "close" || mode === "cap-close" || mode === "read-close") {
           const close = handle.close.bind(handle);
           mock.method(handle, "close", async () => { await close(); hits++; throw new Error("private"); });
@@ -518,20 +540,163 @@ for (const mode of ["entry", "pending", "depth", "deadline", "root", "open", "re
     });
     const caps = mode === "entry" || mode === "cap-close" ? { maxEntries: 1 } :
       mode === "pending" ? { maxPending: 0 } : mode === "depth" ? { maxDepth: 0 } : {};
-    const result = await inspect({ epoch: true, measureCaps: caps, now: () => clock, budgetMs: 100 });
+    const result = await inspect({ epoch, measureCaps: caps, now: () => clock, budgetMs: 100 });
     const expected = mode === "entry" ? { measurement_entry_cap: 1 } :
       mode === "cap-close" ? { measurement_entry_cap: 1, measurement_filesystem_error: 1 } :
       mode === "pending" ? { measurement_pending_cap: 1 } : mode === "depth" ? { measurement_depth_cap: 1 } :
       mode === "deadline" ? { measurement_deadline: 1 } :
       { measurement_filesystem_error: mode === "read-close" ? 2 : 1 };
     assert.deepEqual(result.partialCauses, expected);
-    assert.equal(result.partial, true);
+    const shortfall = mode in localShortfall ? localShortfall[mode as keyof typeof localShortfall] : undefined;
+    assert.equal(result.partial, !(epoch && shortfall));
     assert.equal(result.sources.length, 1);
-    assert.equal(result.sources[0]!.allocatedBytes, null);
-    assert.equal(result.unreadable, ["read", "close", "cap-close", "read-close"].includes(mode) ? 1 : 0);
-    if (["root", "open", "read", "child", "close", "cap-close", "read-close"].includes(mode)) assert.ok(hits > 0);
+    const part = result.sources[0]!.sources[0]!;
+    assert.equal(part.allocatedBytes, null);
+    assert.equal(result.sources[0]!.bytesState, "unknown");
+    if (epoch && shortfall) assert.equal(part.measurementShortfall, shortfall);
+    else assert.ok(!("measurementShortfall" in part), "only a tree-local epoch stop carries the key");
+    assert.equal(result.unreadable, ["read", "close", "cap-close", "read-close", "read-eacces"].includes(mode) ? 1 : 0);
+    if (!["entry", "pending", "depth", "deadline"].includes(mode)) assert.ok(hits > 0);
   });
 }
+
+// A spent budget outranks a tree-local stop: the stop is then a pass-wide deadline, never a shortfall.
+for (const stop of ["opendir-eacces", "entry-cap"] as const) {
+  it("#3851 a measurement deadline that passed during a local " + stop + " stop is pass-wide", async () => {
+    const [entry] = attempts(1);
+    const root = entry!.clonePath;
+    fs.mkdirSync(root, { recursive: true });
+    for (const name of ["a", "b", "c"]) fs.writeFileSync(path.join(root, name), "retained");
+    const open = fsp.opendir;
+    let clock = 0, reads = 0;
+    mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+      if (args[0] === root && stop === "opendir-eacces") { clock = 100; throw codedError("EACCES"); }
+      const handle = await open(...args);
+      if (args[0] === root) {
+        const read = handle.read.bind(handle);
+        mock.method(handle, "read", async () => { if (++reads === 2) clock = 100; return read(); });
+      }
+      return handle;
+    });
+    const result = await inspect({ epoch: true, now: () => clock, budgetMs: 100, measureCaps: stop === "entry-cap" ? { maxEntries: 1 } : {} });
+    assert.equal(result.partial, true);
+    assert.deepEqual(result.partialCauses, stop === "entry-cap"
+      ? { measurement_entry_cap: 1, measurement_deadline: 1 }
+      : { measurement_filesystem_error: 1, measurement_deadline: 1 });
+    assert.ok(!("measurementShortfall" in result.sources[0]!.sources[0]!));
+  });
+}
+// The walk's budget check precedes its awaited directory close; a budget spent during that close still
+// makes the local stop pass-wide when the inspection accepts it.
+it("#3851 an inspection budget spent during the directory close after a local entry-cap stop is pass-wide", async () => {
+  const [entry] = attempts(1);
+  const root = entry!.clonePath;
+  fs.mkdirSync(root, { recursive: true });
+  for (const name of ["a", "b", "c"]) fs.writeFileSync(path.join(root, name), "retained");
+  const open = fsp.opendir;
+  let clock = 0, closes = 0;
+  mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    const handle = await open(...args);
+    if (args[0] === root) {
+      const close = handle.close.bind(handle);
+      mock.method(handle, "close", async () => { await close(); closes++; clock = 100; });
+    }
+    return handle;
+  });
+  const result = await inspect({ epoch: true, now: () => clock, budgetMs: 100, measureCaps: { maxEntries: 1 } });
+  assert.equal(closes, 1);
+  assert.equal(result.partial, true);
+  assert.deepEqual(result.partialCauses, { measurement_entry_cap: 1, inspection_budget: 1 });
+  assert.ok(!("measurementShortfall" in result.sources[0]!.sources[0]!));
+  assert.equal(result.sources[0]!.sources[0]!.allocatedBytes, null);
+});
+// The shortfall guard in inspectRetainedSourcesScoped only decides on a measurement cache hit: a second
+// descriptor naming an already-measured path skips withRecoveryOperation, so no interruption check runs
+// for it. These pin each half of the guard there, acting only after the first measurement has settled.
+for (const half of ["signal", "deadline", "budget"] as const) {
+  it("#3851 a cached local stop is not a shortfall once the " + half + " has expired after the first measurement", async () => {
+    const clonePath = cache.runnerClonePath(bare, "issue-3430");
+    fs.mkdirSync(clonePath, { recursive: true });
+    fs.writeFileSync(path.join(clonePath, "payload"), "retained");
+    for (const generation of [1, 2]) {
+      const marker = { version: 1, runId: "epoch-run", branch: "agent/issue-3430", key: "issue-3430",
+        clonePath, generation, journalDigest: "a".repeat(64), reason: "stale_claim", at: new Date().toISOString() };
+      git(bare, ["config", "--local", "--add", "uzi-stopped.epoch-run.entry", JSON.stringify(marker)]);
+    }
+    const open = fsp.opendir;
+    let measured = false;
+    mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+      if (args[0] === clonePath) measured = true;
+      return open(...args);
+    });
+    // No await separates the first descriptor's guard from the second descriptor's cache hit, so the
+    // expiry is injected synchronously: the first read of the guarded value (made by the first
+    // descriptor's guard, after its measurement settled) is still live, every later read is expired.
+    const stop = new AbortController();
+    const deadline = Date.now() + 600_000;
+    const realNow = Date.now.bind(Date);
+    let settled = false;
+    let guardReads = 0;
+    const live = () => settled && ++guardReads > 1 ? false : true;
+    if (half === "signal") Object.defineProperty(stop.signal, "aborted", { get: () => !live() });
+    else if (half === "deadline") mock.method(Date, "now", () => (live() ? realNow() : deadline + 1));
+    const operation = GitCache.prototype.withRecoveryOperation;
+    mock.method(cache, "withRecoveryOperation", async (...args: Parameters<typeof operation>) => {
+      const value = await operation.apply(cache, args);
+      if (measured) settled = true;
+      return value;
+    });
+    // The budget half drives the injected inspection clock: it stays at 0 until the first post-settlement
+    // read (the first descriptor's guard), then reads past the 100 ms budget.
+    const result = await inspect({ epoch: true, signal: stop.signal, deadline, measureCaps: { maxEntries: 0 },
+      ...(half === "budget" ? { now: () => (live() ? 0 : 100), budgetMs: 100 } :
+        // The deadline half mocks Date.now, so the budget runs on its own injected clock.
+        half === "deadline" ? { now: () => 0, budgetMs: 600_000 } : {}) });
+    assert.ok(guardReads >= 2, "the second descriptor's guard ran after the first measurement settled");
+    if (half === "budget") assert.equal(result.partialCauses?.inspection_budget, 1);
+    assert.equal(result.sources.length, 2);
+    const parts = result.sources.map(s => s.sources[0]!);
+    assert.equal(parts[0]!.measurementShortfall, "entry_cap");
+    assert.ok(!("measurementShortfall" in parts[1]!), "the cached part is a pass-wide stop, not a shortfall");
+    assert.equal(result.partial, true);
+  });
+}
+
+// These two stop through checkRecoveryInterruption() in the opendir catch, not the cache-hit guard.
+it("#3851 an absolute deadline option that expires during a local stop is partial without a shortfall (interruption path)", async () => {
+  const [entry] = attempts(1);
+  fs.mkdirSync(entry!.clonePath, { recursive: true });
+  const deadline = Date.now() + 600_000;
+  const realNow = Date.now.bind(Date);
+  let targetOpens = 0;
+  mock.method(Date, "now", () => targetOpens ? deadline + 1 : realNow());
+  mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    if (args[0] === entry!.clonePath) { targetOpens++; throw codedError("EACCES"); }
+    throw new Error("unexpected opendir");
+  });
+  const result = await inspect({ epoch: true, deadline, now: () => 0, budgetMs: 600_000 });
+  assert.equal(targetOpens, 1, "the target opendir reached the interruption catch");
+  assert.equal(result.partial, true);
+  const parts = result.sources.flatMap(source => source.sources);
+  assert.equal(parts.length, 1);
+  assert.ok(!("measurementShortfall" in parts[0]!));
+});
+it("#3851 an aborted signal during a local stop is partial without a shortfall (interruption path)", async () => {
+  const [entry] = attempts(1);
+  fs.mkdirSync(entry!.clonePath, { recursive: true });
+  const stop = new AbortController();
+  let targetOpens = 0;
+  mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    if (args[0] === entry!.clonePath) { targetOpens++; stop.abort(); throw codedError("EACCES"); }
+    throw new Error("unexpected opendir");
+  });
+  const result = await inspect({ epoch: true, signal: stop.signal });
+  assert.equal(targetOpens, 1, "the target opendir reached the interruption catch");
+  assert.equal(result.partial, true);
+  const parts = result.sources.flatMap(source => source.sources);
+  assert.equal(parts.length, 1);
+  assert.ok(!("measurementShortfall" in parts[0]!));
+});
 
 for (const [limits, key] of [
   [{ maxMetadataBytes: 32 }, "census_metadata_byte_cap"],

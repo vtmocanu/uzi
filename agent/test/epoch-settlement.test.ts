@@ -622,6 +622,52 @@ it("M1b: an eligible attested pass physically reclaims a clean epoch source thro
   assert.equal((await slotOf(stack().authority, clonePath))?.state, "retired");
 });
 
+for (const fault of ["chmod", "entry cap"] as const) {
+  it(`#3851 a source whose deletion re-inspection turns tree-locally short (${fault}) is refused before any proof or discard`, async t => {
+    if (fault === "chmod" && process.getuid?.() === 0) { t.skip("root bypasses directory permissions"); return; }
+    const locked = path.join(clonePath, "locked-subdir");
+    fs.mkdirSync(locked);
+    const journalBefore = journal(), ledgerBefore = ledger();
+    const s = stack();
+    const calls = { inspections: 0, proofs: 0, discards: 0 };
+    const reports: Array<{ partial: boolean; shortfall: string | undefined; bytesState: string }> = [];
+    try {
+      const out = await epoch(s, (o, deps) => {
+        const real = s.git;
+        o.git = {
+          discoverEpochRetainedSources: opts => real.discoverEpochRetainedSources(opts),
+          inspectRetainedSources: async opts => {
+            const second = ++calls.inspections === 2;
+            if (second && fault === "chmod") fs.chmodSync(locked, 0o000);
+            const result = await real.inspectRetainedSources(second && fault === "entry cap" ? { ...opts, measureCaps: { maxEntries: 1 } } : opts);
+            if (second) {
+              const source = result.sources[0]!;
+              reports.push({ partial: result.partial, shortfall: source.sources[0]!.measurementShortfall, bytesState: source.bytesState });
+            }
+            return result;
+          },
+        };
+        deps.git = {
+          assertNoUnsettledDeletes: () => real.assertNoUnsettledDeletes(),
+          readEpochJournalVector: (...args) => real.readEpochJournalVector(...args),
+          createEpochDiscardProof: (...args) => { calls.proofs++; return real.createEpochDiscardProof(...args); },
+          discardStoppedSource: (...args) => { calls.discards++; return real.discardStoppedSource(...args); },
+        };
+      });
+      assert.equal(out.error, undefined);
+      assert.equal(calls.inspections, 2, "one shadow inspection and one deletion re-inspection");
+      assert.deepEqual(reports, [{ partial: false, shortfall: fault === "chmod" ? "eacces" : "entry_cap", bytesState: "unknown" }]);
+      assert.equal(calls.proofs, 0); assert.equal(calls.discards, 0);
+      assert.equal(out.result!.would_delete, 1);
+      assert.equal(out.result!.deleted, 0);
+      assert.equal(out.result!.kept_after_refusal, 1);
+      assert.equal(out.handovers, 1);
+      assert.ok(fs.existsSync(clonePath), "the source is kept");
+      assert.equal(journal(), journalBefore); assert.deepEqual(ledger(), ledgerBefore);
+    } finally { fs.chmodSync(locked, 0o700); }
+  });
+}
+
 /** A process-death emulation for the authority store: the Nth slot or head rename fails and every later one too. */
 function crashOps() {
   const control = { dead: false, failSlot: 0, failHead: 0, slot: 0, head: 0 };

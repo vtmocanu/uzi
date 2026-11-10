@@ -353,7 +353,17 @@ event counters. `measurement_entry_cap` records a measurement limit and
 `holds_read_` keys classify failures at those read stages. Counters saturate at
 **65535**; a missing counter does not establish that unvisited work was clean.
 No raw errors, URLs, paths or IDs appear in this object, and eligibility and
-authority are unchanged. See the
+authority are unchanged. A tree-local measurement shortfall (EACCES/EPERM from
+opendir of the tree root or any directory below it, or from an entry lstat below
+the root, or the measurement entry, depth or pending-directory cap) is recorded on that tree's part as `measurementShortfall`
+(`eacces`, `eperm`, `entry_cap`, `depth_cap`, `pending_cap`), leaves its bytes
+unmeasured and no longer makes the whole pass `inventory_partial`. The tree stays
+ineligible, and an independently eligible sibling is not blocked. Its counters
+(for example `measurement_filesystem_error`) can therefore appear on an
+`eligible` verdict, where they are diagnostic only and `bytes_state` can be
+`partial` or `unknown`: `eligible` does not mean every retained tree was measured.
+A directory read or close failure, any other errno, a deadline, cancellation, a root `lstat` failure and the global caps stay
+pass-wide. See the
 [full #3775 diagnostic contract](../prds/3431-pod-epoch-reclaim.md#3775-partial-shadow-diagnostic-contract).
 
 **Production deletion is off.** The worker image contains a gated deletion
