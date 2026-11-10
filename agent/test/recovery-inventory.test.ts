@@ -7952,6 +7952,7 @@ it("#4140 m3 a completed journal for a held-guarded generation is re-sent while 
   // RecoveryCoordinator and the frozen held publication (operateFrozenInventory -> publishHeld -> held_publication
   // FINAL). Faked: the server (fixture client). The completed body has no persisted completion receipt.
   const { outbox, root } = await mkSweepOutbox();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
   const f = await v2FrozenFixture("ci_fix", true, { outbox });
   t.after(() => f.close());
   f.state.status = "completed";
