@@ -632,7 +632,8 @@ describe("buildSelfImprovePlanPrompt — generic vs dogfood directive (PRD #686 
     assert.ok(p.includes("`task check:api` plus `go test -race -count=1`"));
     // Only real Taskfile targets: there is no check:controller.
     assert.ok(!p.includes("`task check:controller`"), "the prompt must not name a nonexistent check:controller target");
-    assert.ok(p.includes("`task vet:controller`"));
+    // Controller has no narrower boundary in AGENTS.md, so its gate still applies in-run.
+    assert.ok(p.includes("For controller,\n  which has no narrower in-run boundary: `task gate:controller`"));
     assert.ok(p.includes("`UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`"));
     assert.ok(p.includes("watched red then green"));
     assert.ok(p.includes("pending exact-head PR CI"));
