@@ -192,7 +192,7 @@ interface ScratchVerdict {
   residue: number;
   helper_failed: number;
   estimate_partial: boolean;
-  /** Pool free-bytes change across the phase (all writers, so unattributed); null when unreadable. */
+  /** Pool available-bytes change across the delete loop (all writers, so unattributed); null when unreadable. */
   statfs_free_delta_unattributed: number | null;
   /** Estimated from allocated blocks, never proof that storage was freed. */
   reclaim_bytes_state: "estimated" | "unknown";

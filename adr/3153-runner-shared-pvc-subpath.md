@@ -219,14 +219,16 @@ binding. The amendment of 2026-11-06 above is unaffected.
 - **Refusals (whole phase, fixed reason, attempt phase continues).** Anything but the exact
   layouts (uid-split root `/data/runner/.tmp/uzi-runner`, runner-owned `0700`; single-uid root
   `/data/runner/.tmp`); a root that cannot be pinned component by component or has the wrong
-  owner, mode or identity; an unexpected mount above or inside the root; a filesystem other than
-  ext4 or XFS; an unknown or unreadable Docker bind-source inventory, or a bind source at or above
-  the root; unreadable or malformed protected recovery records; an invalid pod-entry record; a
+  owner, mode or identity; an unexpected mount above or inside the root, or mount state that cannot be read or
+  reconciled; a filesystem other than
+  ext4 or XFS; an unreadable Docker bind-source inventory, any bind source outside `/data/runner` or
+  through a symlink, or a bind source at or above the root; unreadable or malformed protected recovery records; an invalid pod-entry record; a
   failed exclusive-idle proof, an exempt process not running as the worker uid/gid, or unreadable
   process descriptors; a census that fails, is malformed, reports another root identity or would
-  overrun the pass deadline. Later in the loop, a re-read that fails stops the phase the same way.
-  The exceptions are a daemon-inventory change and a refused pre-launch observation or launch:
-  those invalidate the whole pass, so the attempt phase does not run.
+  overrun the pass deadline. Later in the loop, a failed mount, census, idle-proof or
+  process-holder re-read stops the phase the same way. The exceptions end the whole pass, so the
+  attempt phase does not run: a daemon-inventory re-read that changes or cannot be read, a
+  pod-entry change, a pass abort or stop, and a refused pre-launch observation or launch.
 - **Never removed.** The root itself; `uzi-worker` and `uzi-runner`; dot-names and other refused
   names; non-directories; leaves owned by another uid or containing foreign-owned entries; mounted
   or other-filesystem leaves; leaves a Docker bind source or a protected recovery record
@@ -235,8 +237,8 @@ binding. The amendment of 2026-11-06 above is unaffected.
   and any leaf whose census was incomplete (a cap, the deadline or an unreadable entry). At most 512 leaves are admitted per pass, in name order.
 - **Deletion.** Top-level leaves are censused read-only as the runner uid, then deleted one at a
   time. Before each delete the mounts, daemon inventory, leaf census, idle proof and process
-  holders are re-read; a changed leaf is kept and a failed re-read stops the phase (a daemon
-  change invalidates the pass, above). The strict pinned helper
+  holders are re-read; a changed leaf is kept and a failed re-read stops the phase or ends the
+  pass as listed above. The strict pinned helper
   stays on one filesystem, re-pins every descendant and prints a removal receipt only after its own
   final `rmdir` succeeded and the retained leaf pin reports `nlink` 0.
 - **Settlement.** Each leaf settles as removed or residue before the next starts. A residue whose
