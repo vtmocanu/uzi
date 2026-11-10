@@ -2030,3 +2030,53 @@ says so. The same charged and uncharged arms above apply, with no owner hold.
 protected `discardProtectedSource` removes the source and clears the journal, remediation record
 included. That is observed behaviour of the existing owner discard, which requires review. It is not an
 authorized disposal route for remediation, and this amendment names none.
+
+## Amendment 2026-11-09, #3644: an unsupported predecessor holds for its owner
+
+Decision record (AI-synced 2026-11-09). This extends the admission in the #3527 owner hold
+([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)) and the #4058 hold
+([amendment](#amendment-2026-11-07-4058-a-successor-holds-for-its-owner-when-a-terminal-predecessors-source-is-under-remediation))
+to one more classification, made before any effect, and qualifies the #3527 wording that the
+`retained_recovery_adoption_failed` cause means persisted `adoption_failed`, proven quiescence and
+preserved local work. For this classification the cause means only that continuation was refused before
+any source effect because this release does not support the predecessor. Nothing was adopted, no
+`adoption_failed` blocker is persisted and no quiescence was proven.
+
+**The case.** A later claim of a run finds the predecessor's source still owned by a dead worker
+process, and the independent-restore route (`evaluateRestoreRoute` in `agent/src/restore-route.ts`)
+positively identifies one of three unsupported classes: canonical (an attempt-less journal naming only
+the run and the canonical clone path, slot foreign-owned and active with no pending footprint or
+publication, and complete, non-conflicting attribution), hosted (this worker is a hosted pod with a
+valid own boundary record matching live, and the predecessor's slot has no publication) or a missing
+boundary record for the predecessor's incarnation (only once the pin, census and own-record checks
+pass; with no pin or several pins the refusal is `no_eligible_pin` or `pin_ambiguous` and is not
+parked). Design and the restore itself:
+[ADR-1783 amendments](1783-run-quiescence-and-attempt-clone-paths.md#amendment-15-unsupported-predecessors-are-parked-for-the-owner).
+
+**Decision.**
+
+- **Admission.** `holdUnsupportedRestore` in `agent/src/runner.ts` parks only with the api feature
+  `recovery_cause_retained_recovery_adoption_failed`, a positive claim generation and a first `running`
+  report acknowledged as `running`. Without them the old nonterminal stop and its server-side
+  accounting apply. Like #4058, no quiescence proof is required because nothing is touched.
+- **Guidance and park.** One conditionally worded status line (feed: `Independent continuation was
+  refused before any source effect: this release does not support this predecessor (<class>).`), a
+  bounded delivery confirmation, then the existing writer at `recovery_wait` /
+  `retained_recovery_adoption_failed`, then a nonterminal stop. There is no new cause, wire field or
+  schema change. A 400 refusal of the park is logged and followed by a corrected status.
+- **No effect on the predecessor.** Journal, slot, ledger, clone, HOME and provision are unchanged and
+  nothing is reaped. Resume claims again and holds again unchanged on this release; it grants no
+  authority over the predecessor. A stale claim, a credential switch, lost ownership and an owner
+  Cancel propagate unchanged.
+
+**Accounting.** The park holds the predecessor's custody hold and the current generation's, and an
+owner Resume adds a claim and a hold, each counting toward `custody_hold_limit`. An owner-held hosted
+run blocks its worker's ordinary image roll until the owner cancels or discards it. Every other restore refusal
+keeps the item-7 accounting disclosed in the #4058 amendment above: charged requeues up to
+`RUN_MAX_REQUEUES` then `worker_requeue_exhausted` on the running path when custody is uncertain,
+uncharged generations on the claimed path up to the run's own hold-admission bound or the server-only
+`retained_continuation_unwitnessed` park, and a custody-blocked queued run on a live worker may stay
+queued even at the cap.
+
+**Fallback.** If the api lacks the feature, the worker does not park and the run follows the ordinary
+requeue paths.

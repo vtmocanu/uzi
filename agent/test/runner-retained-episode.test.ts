@@ -917,11 +917,16 @@ for (const stage of ["reservation", "discovery"] as const) {
     git.recoveryAttemptMode = async () => false;
     if (stage === "reservation") {
       git.discoverRetainedRecovery = async () => ({ barePath: bare, journal: before });
+      // issue #3644: the opaque pre-discovery reads the bare under the same lock; discovery is stubbed here, so it is too.
+      git.discoverOpaque = async () => ({ kind: "other" });
       const reserve = git.reserveRecoveryIteration.bind(git);
       git.reserveRecoveryIteration = async (...args) => { entered(); return reserve(...args); };
     } else {
       const discover = git.discoverRetainedRecovery.bind(git);
       git.discoverRetainedRecovery = async (...args) => { entered(); return discover(...args); };
+      // issue #3644: discovery now starts with the opaque config read, which is the first step to queue behind the held lock.
+      const opaque = git.discoverOpaque.bind(git);
+      git.discoverOpaque = async (...args) => { entered(); return opaque(...args); };
     }
     const retainedHome = path.join(homeDir, claim.run_id);
     fs.mkdirSync(retainedHome, { recursive: true });
@@ -1120,6 +1125,8 @@ for (const setupDelay of [0, 5_000]) {
     client.protocolFeatures = ["claim_generation_fence"];
     git.recoveryAttemptMode = async () => false;
     git.discoverRetainedRecovery = async () => ({ barePath: bare, journal: before });
+    // issue #3644: the opaque pre-discovery would queue behind the held lock; discovery is stubbed, so it is too.
+    git.discoverOpaque = async () => ({ kind: "other" });
     let release!: () => void, acquired!: () => void, entered!: () => void;
     const held = new Promise<void>(resolve => { acquired = resolve; });
     const entry = new Promise<void>(resolve => { entered = resolve; });

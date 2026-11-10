@@ -396,7 +396,8 @@ func TestRetainedAdoptionCLI(t *testing.T) {
 				t.Fatalf("exit %d mutation %v: %s", code, mutation, errout)
 			}
 			copy := out + errout
-			requireWorkerCopy(t, copy, "integrity hold", "remediation record refused source use",
+			requireWorkerCopy(t, copy, "integrity hold", "adoption failed", "predecessor needs remediation review",
+				"this release does not support the predecessor", "agent did not start",
 				"local work and custody preserved", "owner-held", "no automatic resume",
 				"another recovery episode", "can hold again", "new claim adds a custody hold", "Resolve the cause before resuming",
 				"uzi run resume r1", "uzi run cancel r1", "availability")
@@ -497,7 +498,8 @@ func TestRetainedAdoptionTUI(t *testing.T) {
 			m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 			m = step(m, tea.WindowSizeMsg{Width: 60, Height: 36})
 			out := stripANSI(m.View().Content)
-			requireWorkerCopy(t, out, "Integrity hold", "remediation record refused source use",
+			requireWorkerCopy(t, out, "Integrity hold", "Adoption failed", "predecessor needs remediation review",
+				"this release does not support the predecessor",
 				"Local work and custody preserved", "no automatic resume", "owner Resume/Cancel",
 				"another recovery episode", "can hold again", "new claim adds a custody hold", "Resolve the cause before resuming",
 				"uzi run resume r1", "uzi run cancel r1", "availability and latest edits unverified")
