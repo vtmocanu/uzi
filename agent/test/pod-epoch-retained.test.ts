@@ -586,7 +586,54 @@ for (const stop of ["opendir-eacces", "entry-cap"] as const) {
     assert.ok(!("measurementShortfall" in result.sources[0]!.sources[0]!));
   });
 }
-it("#3851 an absolute deadline option that expires during a local stop is partial without a shortfall", async () => {
+// The shortfall guard in inspectRetainedSourcesScoped only decides on a measurement cache hit: a second
+// descriptor naming an already-measured path skips withRecoveryOperation, so no interruption check runs
+// for it. These pin each half of the guard there, acting only after the first measurement has settled.
+for (const half of ["signal", "deadline"] as const) {
+  it("#3851 a cached local stop is not a shortfall once the " + half + " has expired after the first measurement", async () => {
+    const clonePath = cache.runnerClonePath(bare, "issue-3430");
+    fs.mkdirSync(clonePath, { recursive: true });
+    fs.writeFileSync(path.join(clonePath, "payload"), "retained");
+    for (const generation of [1, 2]) {
+      const marker = { version: 1, runId: "epoch-run", branch: "agent/issue-3430", key: "issue-3430",
+        clonePath, generation, journalDigest: "a".repeat(64), reason: "stale_claim", at: new Date().toISOString() };
+      git(bare, ["config", "--local", "--add", "uzi-stopped.epoch-run.entry", JSON.stringify(marker)]);
+    }
+    const open = fsp.opendir;
+    let measured = false;
+    mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+      if (args[0] === clonePath) measured = true;
+      return open(...args);
+    });
+    // No await separates the first descriptor's guard from the second descriptor's cache hit, so the
+    // expiry is injected synchronously: the first read of the guarded value (made by the first
+    // descriptor's guard, after its measurement settled) is still live, every later read is expired.
+    const stop = new AbortController();
+    const deadline = Date.now() + 600_000;
+    const realNow = Date.now.bind(Date);
+    let settled = false;
+    let guardReads = 0;
+    const live = () => settled && ++guardReads > 1 ? false : true;
+    if (half === "signal") Object.defineProperty(stop.signal, "aborted", { get: () => !live() });
+    else mock.method(Date, "now", () => (live() ? realNow() : deadline + 1));
+    const operation = GitCache.prototype.withRecoveryOperation;
+    mock.method(cache, "withRecoveryOperation", async (...args: Parameters<typeof operation>) => {
+      const value = await operation.apply(cache, args);
+      if (measured) settled = true;
+      return value;
+    });
+    const result = await inspect({ epoch: true, signal: stop.signal, deadline, measureCaps: { maxEntries: 0 } });
+    assert.ok(guardReads >= 2, "the second descriptor's guard ran after the first measurement settled");
+    assert.equal(result.sources.length, 2);
+    const parts = result.sources.map(s => s.sources[0]!);
+    assert.equal(parts[0]!.measurementShortfall, "entry_cap");
+    assert.ok(!("measurementShortfall" in parts[1]!), "the cached part is a pass-wide stop, not a shortfall");
+    assert.equal(result.partial, true);
+  });
+}
+
+// These two stop through checkRecoveryInterruption() in the opendir catch, not the cache-hit guard.
+it("#3851 an absolute deadline option that expires during a local stop is partial without a shortfall (interruption path)", async () => {
   const [entry] = attempts(1);
   fs.mkdirSync(entry!.clonePath, { recursive: true });
   mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
@@ -597,7 +644,7 @@ it("#3851 an absolute deadline option that expires during a local stop is partia
   assert.equal(result.partial, true);
   for (const source of result.sources) for (const part of source.sources) assert.ok(!("measurementShortfall" in part));
 });
-it("#3851 an aborted signal during a local stop is partial without a shortfall", async () => {
+it("#3851 an aborted signal during a local stop is partial without a shortfall (interruption path)", async () => {
   const [entry] = attempts(1);
   fs.mkdirSync(entry!.clonePath, { recursive: true });
   const stop = new AbortController();

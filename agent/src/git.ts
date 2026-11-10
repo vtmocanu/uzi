@@ -2392,10 +2392,12 @@ export interface RetainedSourcePart {
   live: boolean;
   allocatedBytes: number | null;
   /** Epoch inspections only; diagnostic, grants nothing. Names why this present part could not be
-   *  measured when the stop was confined to its own tree (permission denied below the root, or a
-   *  measurement cap). `allocatedBytes` stays null, so the source is never byte-complete. */
+   *  measured when the stop was confined to its own tree (permission denied at the root or below,
+   *  or a measurement cap). `allocatedBytes` stays null, so the source is never byte-complete. */
   measurementShortfall?: "eacces" | "eperm" | "entry_cap" | "depth_cap" | "pending_cap";
 }
+
+type MeasurementShortfall = NonNullable<RetainedSourcePart["measurementShortfall"]>;
 
 /** Content-free evidence for one retained source (or one protected episode of several). */
 export interface RetainedSourceEvidence {
@@ -13646,18 +13648,21 @@ export class GitCache {
    *  deadline of the injected clock, or at a cap on the entries visited, the pending-directory stack
    *  or the directory depth (the tree is runner-written and hostile), and then reports
    *  `complete: false`, never a total of zero and never a total claimed complete.
+   *  `local` is set only on an incomplete result whose stop was confined to this tree (permission
+   *  denied at the root or below, or an entry, depth or pending-directory cap) while the deadline had
+   *  not passed; a passed deadline is counted as `measurement_deadline` and carries no `local`.
    *  `partialOnIoError` (default off): a directory read or close error carrying a string `code` returns
    *  the partial total with `complete: false` instead of throwing; an interruption still propagates. */
   private async measureAllocated(
     root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
     skip?: (rel: string) => boolean, partialOnIoError = false,
-  ): Promise<{ bytes: number; entries: number; complete: boolean; local?: "eacces" | "eperm" | "entry_cap" | "depth_cap" | "pending_cap" }> {
+  ): Promise<{ bytes: number; entries: number; complete: boolean; local?: MeasurementShortfall }> {
     const filesystem = async <T>(action: () => Promise<T>): Promise<T> => {
       try { return await action(); }
       catch (error) { countPartialCause(causes, "measurement_filesystem_error"); throw error; }
     };
-    type Local = "eacces" | "eperm" | "entry_cap" | "depth_cap" | "pending_cap";
-    // A stop confined to this tree (permission denied below the root, or a cap) is reported as `local`.
+    type Local = MeasurementShortfall;
+    // A stop confined to this tree (permission denied at the root or below, or a cap) is reported as `local`.
     // A deadline that has already passed outranks it: the stop is then a pass-wide budget stop, so it
     // is counted as the deadline and carries no `local`. Read the clock only on this stop path.
     const stopped = (reportBytes: number, reportEntries: number, local: Local): { bytes: number; entries: number; complete: false; local?: Local } => {
@@ -13894,7 +13899,7 @@ export class GitCache {
       found.length = maxDescriptors;
     }
     const sources: RetainedSourceEvidence[] = [];
-    type Shortfall = NonNullable<RetainedSourcePart["measurementShortfall"]>;
+    type Shortfall = MeasurementShortfall;
     const measurements = new Map<string, { bytes: number; complete: boolean; local?: Shortfall }>();
     let bindingFailed = false;
     for (const { g, rec, ev } of found) {
@@ -13931,7 +13936,7 @@ export class GitCache {
             if (!stopped) unreadable++;
           }
           bytes = m.complete ? m.bytes : null;
-          // An epoch inspection keeps a tree-local shortfall (permission denied below the root, or a
+          // An epoch inspection keeps a tree-local shortfall (permission denied at the root or below, or a
           // measurement cap) out of the pass-wide `partial`: the part stays unmeasured and the source is
           // not byte-complete, so nothing is granted for it. Only a live budget and signal qualify; the
           // wall clock is read here, not the injected one, so a test clock is not consumed.
