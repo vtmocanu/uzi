@@ -12311,6 +12311,7 @@ export class GitCache {
       "-c", "core.checkStat=default", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
       "-c", "status.showUntrackedFiles=all", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false",
     ];
+    let statusStderr = "";
     try {
       const attributes = await read(() => fs.lstat(path.join(cwd, ".git", "info", "attributes"))).then(() => true, (err: NodeJS.ErrnoException) => {
         if (err.code === "ENOENT") return false;
@@ -12350,10 +12351,9 @@ export class GitCache {
         if (!st.isDirectory() || st.isSymbolicLink()) return false;
         if ((await fs.readdir(gitlink)).length > 0) return false;
       }
-      let statusStderr = "";
       const status = await read(() => this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], {
         env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
-        onStderr: (text) => { statusStderr += text; },
+        onStderr: (text) => { statusStderr += text.slice(0, Math.max(0, 256 - statusStderr.length)); },
       }));
       if (statusStderr !== "") {
         this.log.warn("stopped source status reported a problem on stderr; not provable", { cwd, stderr: sanitizeForLog(statusStderr, 256) });
@@ -12368,7 +12368,10 @@ export class GitCache {
       }
       return true;
     } catch (err) {
-      this.log.debug("stopped source status could not be proven clean", { cwd, error: gitErrorMessage(err) });
+      if (err instanceof AutomaticCompletenessUnknown) throw err;
+      this.log.warn("stopped source status could not be proven clean", { cwd,
+        ...(statusStderr !== "" ? { stderr: sanitizeForLog(statusStderr, 256) } :
+          { error: sanitizeForLog(gitErrorMessage(err), 256) }) });
       return false;
     }
   }

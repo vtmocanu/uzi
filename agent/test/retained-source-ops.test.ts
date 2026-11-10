@@ -881,6 +881,43 @@ describe("verifyStoppedSourceCovered", () => {
       });
     }
 
+    for (const [name, capturedStderr] of [
+      ["captured stderr", "warning: \u001b[31m" + "private".repeat(80)],
+      ["fallback error", ""],
+    ] as const) {
+      it("warns and retains when a legacy status read fails with " + name, async t => {
+        const { a, rec } = await capturedWith({});
+        // macOS initializes this fixture with core.ignorecase=true, which the proof
+        // correctly refuses before status; isolate the failed-status seam here.
+        gitIn(a.path, ["config", "--local", "core.ignoreCase", "false"]);
+        const reader = git as unknown as { runGitAsRunner: (cwd: string | undefined, args: string[],
+          opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => Promise<string> };
+        const original = reader.runGitAsRunner.bind(git);
+        let reached = 0;
+        t.mock.method(reader, "runGitAsRunner", async (cwd: string | undefined, args: string[],
+          opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => {
+          if (args.includes("status")) {
+            reached++;
+            if (capturedStderr) opts?.onStderr?.(capturedStderr);
+            throw new Error("status read fallback diagnostic");
+          }
+          return original(cwd, args, opts);
+        });
+        assert.equal(await git["worktreeCleanHardened"](a.path), false);
+        assert.equal(reached, 1, "the status read reached the failed Git call");
+        const warns = rec.lines as Array<{ level?: string; msg?: string; stderr?: string; error?: string }>;
+        const warn = warns.find(line => line.level === "warn" && line.msg === "stopped source status could not be proven clean");
+        assert.ok(warn, "the failed status read logs a warning");
+        if (capturedStderr) {
+          assert.match(warn.stderr ?? "", /^warning:/);
+          assert.ok((warn.stderr ?? "").length <= 256);
+          assert.ok(!(warn.stderr ?? "").includes("\u001b"), "stderr is sanitized");
+        } else {
+          assert.match(warn.error ?? "", /status read fallback diagnostic/);
+        }
+      });
+    }
+
     // The legacy proof uses capture's HOME and attribute inputs. Git warns when it cannot
     // read an attributes file under that HOME, so an otherwise clean source stays retained.
     it("is not covered when the HOME attributes file is unreadable and a tracked file is stat-dirty", { skip: UNREADABLE_SKIP }, async () => {
