@@ -96,11 +96,14 @@ it("server-cancelled reply releases snapshot and overflow admission while real c
   assert.equal(await fs.stat(f.archive.bundlePath!).then(() => true, () => false), false);
 });
 
-it("#4140 m3 heartbeat sweeps keep re-sending a server-completed terminal until authorized settlement retires the journal", { skip: LINUX_ONLY }, async t => {
+it("#4140 m3 heartbeat sweeps keep re-sending a server-completed failed-journal terminal while retirement authority is unverifiable, then retire it once authority is verified", { skip: LINUX_ONLY }, async t => {
+  // Scope: a journaled FAILED terminal body whose server outcome is already "completed". A journaled
+  // completed body with no saved completion receipt is not reachable through reportRetirementFixture
+  // (its terminal comes from the real runner's failed flight), so that variant is not covered here.
   const f = await reportRetirementFixture(t);
   const journalPath = path.join(fx.dataDir, "outbox", f.claim.run_id, "terminal-2.json");
   const journalBytes = await fs.readFile(journalPath);
-  // Custody cannot verify the archive, so the open guarded hold forbids retiring the journal.
+  // The recovery capture cannot be verified, so the open guarded hold forbids retiring the journal.
   f.capture.mode = "throw";
   let reports = 0;
   t.mock.method(client, "reportState", async (runId: string) => {
@@ -116,7 +119,7 @@ it("#4140 m3 heartbeat sweeps keep re-sending a server-completed terminal until 
       sweepPendingTerminals(signal?: AbortSignal): Promise<void>;
     };
 
-  // Before settlement: every heartbeat sweep re-sends the report, and the journal stays protected.
+  // Retirement authority unverifiable: every heartbeat sweep re-sends, and the journal stays protected.
   for (let sweep = 1; sweep <= 3; sweep++) {
     await worker.sweepPendingTerminals();
     assert.equal(reports, sweep, "each sweep re-sends the pending terminal report once");
@@ -125,30 +128,15 @@ it("#4140 m3 heartbeat sweeps keep re-sending a server-completed terminal until 
     await f.assertCustody();
   }
 
-  // Authorized settlement: the real FINAL producer obtains an independent server release.
+  // Authority verified (capture is verifiable again): the next sweep retires through the existing path.
   f.capture.mode = "healthy";
-  let released = false;
-  const holds = client.listRecoveryHolds.bind(client);
-  client.listRecoveryHolds = async run => released ? { run_id: run, holds: [] } : holds(run);
-  client.releaseRecoveryCustody = async (run, generation) => {
-    assert.equal(run, f.claim.run_id);
-    assert.equal(generation, 2);
-    f.calls.final++;
-    released = true;
-    return { run_id: run, generation, released: true, holds_released: 1 };
-  };
-  await f.r.resumePendingRecoveries(undefined, [f.archive]);
-  assert.equal(released, true, "existing FINAL producer obtained the release");
-  assert.deepEqual((await client.listRecoveryHolds(f.claim.run_id)).holds, []);
-
-  // The next sweep completes the existing terminal retirement.
   const beforeRetire = reports;
   await worker.sweepPendingTerminals();
   assert.equal(reports, beforeRetire + 1, "the retiring sweep sends the report one last time");
   assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
   assert.deepEqual(f.outbox.listPendingTerminals(), []);
 
-  // The redundant completed-report loop has ended.
+  // The redundant report loop has ended.
   for (let sweep = 0; sweep < 3; sweep++) await worker.sweepPendingTerminals();
   assert.equal(reports, beforeRetire + 1, "no further reports after retirement");
 });
