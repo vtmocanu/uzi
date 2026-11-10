@@ -6,12 +6,23 @@
 
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
-import { api, type Repo } from "../lib/api";
+import { api, type Repo, type RecoveryCustodyHolds, type RunSummaryItem } from "../lib/api";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
+import { overviewDecisions, type DecisionItem } from "../lib/overview";
 import { stripUnsafeChars } from "../lib/safeText";
+import { HELD_WORK_HREF } from "./HeldWorkCard";
 import { Modal } from "./Modal";
-import { BoardIcon, ChatIcon, SearchIcon } from "./icons";
+import {
+  BoardIcon,
+  BranchIcon,
+  ChatIcon,
+  FileTextIcon,
+  PlayIcon,
+  SearchIcon,
+  ShieldIcon,
+  ThoughtIcon,
+} from "./icons";
 import { visibleNavItems } from "./navItems";
 
 export type CommandGroup = "needs" | "actions" | "goto";
@@ -71,7 +82,50 @@ export function filterCommandItems(items: CommandItem[], query: string): Command
     .map((r) => r.item);
 }
 
+const RUN_DECISION_VIEW = {
+  plan: { hint: "Plan review", icon: <FileTextIcon /> },
+  question: { hint: "Question", icon: <ThoughtIcon /> },
+  park: { hint: "Resume", icon: <PlayIcon /> },
+  pr: { hint: "Pull request", icon: <BranchIcon /> },
+} as const;
+
+// The Needs you items for a set of decisions (overviewDecisions' output). Every target
+// comes from the loaded run id or the fixed held-work link, never from label text.
+export function decisionCommandItems(decisions: ReadonlyArray<DecisionItem>): CommandItem[] {
+  return decisions.map((d): CommandItem => {
+    if (d.kind === "held") {
+      return {
+        id: "needs:held",
+        group: "needs",
+        label: d.verb,
+        hint: d.count > 1 ? `Custody · ${d.count}` : "Custody",
+        to: HELD_WORK_HREF,
+        icon: <ShieldIcon />,
+        title: d.label === null ? undefined : stripUnsafeChars(d.label),
+      };
+    }
+    const run = d.run;
+    const view = RUN_DECISION_VIEW[d.kind];
+    let label: string;
+    if (run.issue_iid != null) {
+      label = d.kind === "plan" ? `Review plan for #${run.issue_iid}` : `${d.verb} #${run.issue_iid}`;
+    } else {
+      const name = stripUnsafeChars(run.title || run.issue_title || "");
+      label = name ? `${d.verb}: ${name}` : d.verb;
+    }
+    return {
+      id: `needs:${d.kind}:${run.id}`,
+      group: "needs",
+      label,
+      hint: view.hint,
+      to: `/runs/${encodeURIComponent(run.id)}`,
+      icon: view.icon,
+    };
+  });
+}
+
 type RepoState = { status: "loading" } | { status: "error" } | { status: "ok"; repos: Repo[] };
+type DecisionState = { status: "loading" } | { status: "error" } | { status: "ok"; items: CommandItem[] };
 
 export function CommandMenu({
   onClose,
@@ -95,9 +149,32 @@ export function CommandMenu({
   // do not shift the highlight to a different command. null: the first visible item.
   const [activeId, setActiveId] = useState<string | null>(null);
   const [repoState, setRepoState] = useState<RepoState>({ status: "loading" });
+  const [decisionState, setDecisionState] = useState<DecisionState>({ status: "loading" });
 
   useEffect(() => {
     inputRef.current?.focus();
+  }, []);
+
+  // The viewer's decisions are fetched once when the menu opens, like the repos: no poll,
+  // no subscription. Either request failing hides the whole group (never a partial list);
+  // a response that lands after unmount is dropped.
+  useEffect(() => {
+    let alive = true;
+    void Promise.allSettled([api.listRuns({ view: "summary" }), api.getRecoveryHolds()]).then(
+      ([runsResult, holdsResult]) => {
+        if (!alive) return;
+        if (runsResult.status !== "fulfilled" || holdsResult.status !== "fulfilled") {
+          setDecisionState({ status: "error" });
+          return;
+        }
+        const runs: RunSummaryItem[] = runsResult.value.runs;
+        const holds: RecoveryCustodyHolds = holdsResult.value;
+        setDecisionState({ status: "ok", items: decisionCommandItems(overviewDecisions(runs, holds)) });
+      },
+    );
+    return () => {
+      alive = false;
+    };
   }, []);
 
   // Repos are fetched once when the menu opens: no subscription, no poll. A response that
@@ -143,8 +220,9 @@ export function CommandMenu({
       to: n.to,
       icon: n.icon,
     }));
-    return [...(extraItems ?? []), ...actions, ...goto];
-  }, [repoState, demo, isAdmin, extraItems]);
+    const needs = decisionState.status === "ok" ? decisionState.items : [];
+    return [...needs, ...(extraItems ?? []), ...actions, ...goto];
+  }, [repoState, decisionState, demo, isAdmin, extraItems]);
 
   const visible = useMemo(() => filterCommandItems(items, query), [items, query]);
   const activeIndex = visible.length === 0 ? -1 : Math.max(0, visible.findIndex((it) => it.id === activeId));
@@ -175,6 +253,7 @@ export function CommandMenu({
 
   const searching = query.trim() !== "";
   const boardsUnavailable = repoState.status === "error";
+  const decisionsUnavailable = decisionState.status === "error";
 
   const renderOption = (item: CommandItem, i: number) => (
     <div
@@ -182,7 +261,9 @@ export function CommandMenu({
       id={optionId(i)}
       role="option"
       aria-selected={i === activeIndex}
-      title={item.title}
+      // Re-stripped here whatever the source, so an unsafe title or label handed in through
+      // extraItems cannot reach the DOM.
+      title={item.title === undefined ? undefined : stripUnsafeChars(item.title)}
       onClick={() => run(item)}
       onMouseMove={() => setActiveId(item.id)}
       className={
@@ -195,7 +276,7 @@ export function CommandMenu({
       <span aria-hidden="true" className="text-base text-faint">
         {item.icon}
       </span>
-      <span className="min-w-0 truncate">{item.label}</span>
+      <span className="min-w-0 truncate">{stripUnsafeChars(item.label)}</span>
       {item.hint && <span className="ml-auto shrink-0 text-xs text-faint">{item.hint}</span>}
     </div>
   );
@@ -209,12 +290,12 @@ export function CommandMenu({
     body = DISPLAY_ORDER.map((g) => {
       const rows = visible.map((item, i) => ({ item, i })).filter((r) => r.item.group === g);
       if (rows.length === 0) return null;
-      const titleId = `${uid}-group-${g}`;
       return (
-        <div key={g} role="group" aria-labelledby={titleId}>
+        // aria-label, not aria-labelledby: the visible heading is upper-cased by CSS and some
+        // readers then spell it out ("ACTIONS").
+        <div key={g} role="group" aria-label={GROUP_TITLES[g]}>
           <div
-            id={titleId}
-            role="presentation"
+            aria-hidden="true"
             className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint"
           >
             {GROUP_TITLES[g]}
@@ -225,11 +306,12 @@ export function CommandMenu({
     });
   }
   // Announced politely as the query narrows the list; empty while browsing.
-  const announcement = !searching
-    ? ""
-    : visible.length === 0
-      ? "No matches"
-      : `${visible.length} ${visible.length === 1 ? "result" : "results"}`;
+  const notes = [boardsUnavailable && "Boards unavailable", decisionsUnavailable && "Decisions unavailable"]
+    .filter((n): n is string => !!n)
+    .join(". ");
+  const count =
+    visible.length === 0 ? "No matches" : `${visible.length} ${visible.length === 1 ? "result" : "results"}`;
+  const announcement = !searching ? "" : notes ? `${count}. ${notes}` : count;
 
   return (
     <Modal
@@ -251,7 +333,7 @@ export function CommandMenu({
             type="text"
             role="combobox"
             aria-controls={listId}
-            aria-expanded="true"
+            aria-expanded={visible.length > 0}
             aria-autocomplete="list"
             aria-activedescendant={activeIndex >= 0 ? optionId(activeIndex) : undefined}
             autoComplete="off"
@@ -274,7 +356,12 @@ export function CommandMenu({
             Esc
           </kbd>
         </div>
-        <div id={listId} role="listbox" aria-label="Commands" className="max-h-[360px] overflow-y-auto p-2">
+        <div
+          id={listId}
+          role="listbox"
+          aria-label="Commands"
+          className={"max-h-[360px] overflow-y-auto " + (visible.length > 0 ? "p-2" : "")}
+        >
           {body}
         </div>
         {visible.length === 0 && (
@@ -283,6 +370,7 @@ export function CommandMenu({
           </div>
         )}
         {boardsUnavailable && <div className="px-5 pb-3 text-xs text-faint">Boards unavailable</div>}
+        {decisionsUnavailable && <div className="px-5 pb-3 text-xs text-faint">Decisions unavailable</div>}
         <div role="status" aria-live="polite" className="sr-only">
           {announcement}
         </div>

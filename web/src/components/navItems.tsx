@@ -38,7 +38,8 @@ export type NavDef = {
   // The Admin entry's health severity pip (PRD #1484 M5, D1): a count + worded severity
   // when checks need attention. The sidebar feeds it from the shared health provider.
   healthPip?: true;
-  // The command menu's right-hand hint when the section has no group name.
+  // Overrides the command menu's right-hand hint, which otherwise is the section's group
+  // name (empty for the unlabelled sections).
   hint?: string;
 };
 

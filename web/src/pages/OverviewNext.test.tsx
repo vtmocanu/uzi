@@ -989,6 +989,29 @@ describe("OverviewNext Search button", () => {
     expect(open).toHaveBeenCalledTimes(1);
   });
 
+  it("names the shortcut in aria-keyshortcuts: Control+K by default, Meta+K on an Apple platform", async () => {
+    const mountWithMenu = () =>
+      render(
+        <MemoryRouter>
+          <CommandMenuContext.Provider value={{ open: vi.fn() }}>
+            <OverviewNext />
+          </CommandMenuContext.Provider>
+        </MemoryRouter>,
+      );
+    const view = mountWithMenu();
+    await settle();
+    expect(screen.getByRole("button", { name: /^Search/ }).getAttribute("aria-keyshortcuts")).toBe("Control+K");
+    view.unmount();
+    Object.defineProperty(navigator, "platform", { configurable: true, value: "MacIntel" });
+    try {
+      mountWithMenu();
+      await settle();
+      expect(screen.getByRole("button", { name: /^Search/ }).getAttribute("aria-keyshortcuts")).toBe("Meta+K");
+    } finally {
+      delete (navigator as unknown as Record<string, unknown>).platform;
+    }
+  });
+
   it("renders no Search button without a command menu (page mounted outside the shell)", async () => {
     await mount();
     expect(screen.queryByRole("button", { name: /^Search/ })).toBeNull();

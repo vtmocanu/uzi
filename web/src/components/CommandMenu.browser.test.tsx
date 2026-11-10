@@ -30,6 +30,10 @@ vi.mock("../lib/api", async (importOriginal) => ({
       .fn()
       .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
+    getRecoveryHolds: vi.fn().mockResolvedValue({
+      aggregate: { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
+      holds: [],
+    }),
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
     getMyCodexRateLimits: vi.fn().mockResolvedValue({ accounts: [] }),
     getMySettings: vi.fn().mockResolvedValue({ settings: {} }),
