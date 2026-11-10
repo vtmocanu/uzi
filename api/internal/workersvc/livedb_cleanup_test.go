@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -43,6 +44,23 @@ func trackLiveDBUser(t testing.TB, pool *pgxpool.Pool, ids ...uuid.UUID) {
 func trackLiveDBProduct(t testing.TB, pool *pgxpool.Pool, id uuid.UUID) {
 	t.Helper()
 	liveDBTrackEntry(t, pool, func(e *liveDBTracked) { e.products = append(e.products, id) })
+}
+
+// trackLiveDBOwnedProduct tracks a product on the test that tracks owner, when there is
+// one: a subtest's product can back a job run of its parent's user (job_origins RESTRICTs
+// the product), so it must outlive the subtest and go after that user's runs.
+func trackLiveDBOwnedProduct(t testing.TB, pool *pgxpool.Pool, id, owner uuid.UUID) {
+	t.Helper()
+	liveDBTrackMu.Lock()
+	for _, e := range liveDBTrack {
+		if slices.Contains(e.users, owner) {
+			e.products = append(e.products, id)
+			liveDBTrackMu.Unlock()
+			return
+		}
+	}
+	liveDBTrackMu.Unlock()
+	trackLiveDBProduct(t, pool, id)
 }
 
 // trackLiveDBTemplate schedules deletion of an ownerless agent_templates row (user_id
@@ -294,6 +312,15 @@ func TestLiveDBFixtureCleanupRemovesOwnRowsLiveDB(t *testing.T) {
 		e.exec(`INSERT INTO agent_templates (id, name, description, prompt_body) VALUES ($1, $2, 'd', 'b')`, tmpl, "cleanup-"+tmpl.String())
 		trackLiveDBTemplate(t, e.pool, tmpl)
 		users, products, templates = append(users, u), append(products, prod), append(templates, tmpl)
+		// A subtest's product backing a job run of this test's user: job_origins RESTRICTs
+		// the product until the run goes, so its delete must wait for this test's cleanup.
+		t.Run("subtest product with parent job run", func(t *testing.T) {
+			sub, tok := e.seedProduct(t, u, []string{"research"})
+			if _, err := e.svc.CreateJobRun(e.ctx, jobReq(productCaller(u, sub, tok))); err != nil {
+				t.Fatalf("CreateJobRun: %v", err)
+			}
+			products = append(products, sub)
+		})
 	})
 
 	run("writer stopped before delete", func(t *testing.T) {

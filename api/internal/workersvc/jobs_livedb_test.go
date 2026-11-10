@@ -63,7 +63,7 @@ func (e jobEnv) seedProduct(t *testing.T, userID uuid.UUID, allowed []string) (p
 	}
 	e.exec(`INSERT INTO products (id, name, allowed_job_types) VALUES ($1, $2, $3)`,
 		productID, "prod-"+productID.String(), allowed)
-	trackLiveDBProduct(t, e.pool, productID)
+	trackLiveDBOwnedProduct(t, e.pool, productID, userID)
 	e.exec(`INSERT INTO product_tokens (id, user_id, product_id, name, token_hash, token_prefix, scopes)
 	        VALUES ($1, $2, $3, 'tok', $4, 'uzp_test', ARRAY['jobs:run','jobs:read'])`,
 		tokenID, userID, productID, []byte(tokenID.String()))
