@@ -1086,7 +1086,10 @@ for canary_bad in "$canary_upper" '*' 'a\,b' " $canary_uuid" "$canary_uuid " abc
     echo "FAIL: invalid epoch-reclaim canary id accepted: $canary_bad" >&2
     exit 1
   fi
-  grep -F "$canary_msg" "$WORK/canary-invalid.log" >/dev/null
+  if ! grep -F "$canary_msg" "$WORK/canary-invalid.log" >/dev/null; then
+    echo "FAIL: epoch-reclaim canary id $canary_bad was refused without the expected message" >&2
+    exit 1
+  fi
 done
 for canary_bad in '{a,b}' true 7; do
   if helm template uzi "$STRIPPED" \
@@ -1094,7 +1097,10 @@ for canary_bad in '{a,b}' true 7; do
     echo "FAIL: invalid epoch-reclaim canary id accepted: $canary_bad" >&2
     exit 1
   fi
-  grep -F "$canary_msg" "$WORK/canary-invalid.log" >/dev/null
+  if ! grep -F "$canary_msg" "$WORK/canary-invalid.log" >/dev/null; then
+    echo "FAIL: epoch-reclaim canary id $canary_bad was refused without the expected message" >&2
+    exit 1
+  fi
 done
 helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true \
   --set workers.docker.enabled=true --set workers.docker.networkPolicy.acknowledgeUnfenced=true \

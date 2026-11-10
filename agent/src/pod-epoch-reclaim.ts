@@ -19,8 +19,8 @@ import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js"
  * Startup activation for the M1b deletion phase. Parsed once from the worker's own process env: the controller
  * renders UZI_EPOCH_RECLAIM_DELETION=1 only for the one selected canary worker. It permits attempting the phase
  * and supplies no evidence: the shadow verdict, attested authority and every other gate in runPodEpochShadow
- * still decide whether anything is reclaimed. Unset, empty or "0" is off; "1" needs an epoch-enabled hosted
- * Docker worker; anything else is a startup error (no trimming).
+ * still decide whether anything is reclaimed. Unset, empty or "0" is off; "1" needs an epoch-locked, Docker-wired
+ * worker (UZI_EPOCH_LOCK=1 and DOCKER_HOST or UZI_DIND_SOCKET); anything else is a startup error (no trimming).
  *
  * Test-only override: the deletion phase also runs when `deletion.enableForTest` is exactly the sentinel
  * below, which agent/test/pod-epoch-reclaim-support.ts exports as `ENABLE_DELETION_FOR_TEST`. Nothing under
@@ -32,7 +32,7 @@ export function readEpochReclaimDeletionActivation(env: NodeJS.ProcessEnv): bool
   if (raw === undefined || raw === "" || raw === "0") return false;
   if (raw === "1") {
     if (env.UZI_EPOCH_LOCK === "1" && dockerSidecarExpected(env)) return true;
-    throw new Error("UZI_EPOCH_RECLAIM_DELETION=1 requires an epoch-enabled hosted Docker worker");
+    throw new Error("UZI_EPOCH_RECLAIM_DELETION=1 requires an epoch-locked, Docker-wired worker (UZI_EPOCH_LOCK=1 and DOCKER_HOST or UZI_DIND_SOCKET)");
   }
   throw new Error("UZI_EPOCH_RECLAIM_DELETION must be unset, empty, 0 or 1");
 }

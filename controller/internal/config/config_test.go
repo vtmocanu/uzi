@@ -89,7 +89,9 @@ func TestEpochReclaimDeletionCanaryIDConfig(t *testing.T) {
 				t.Setenv(key, tc.raw)
 			} else {
 				t.Setenv(key, "")
-				os.Unsetenv(key)
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatal(err)
+				}
 			}
 			cfg, err := Load()
 			if tc.valid {

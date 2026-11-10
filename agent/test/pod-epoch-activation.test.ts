@@ -15,10 +15,10 @@ test("activation is off when unset, empty or 0, whatever else the env carries", 
   assert.equal(read({ [NAME]: "0", UZI_EPOCH_LOCK: "1", DOCKER_HOST: "tcp://127.0.0.1:2375" }), false);
 });
 
-test("activation 1 needs the epoch lock and a hosted Docker sidecar signal", () => {
+test("activation 1 needs the epoch lock and a Docker wiring signal (DOCKER_HOST or UZI_DIND_SOCKET)", () => {
   assert.equal(read({ [NAME]: "1", UZI_EPOCH_LOCK: "1", DOCKER_HOST: "tcp://127.0.0.1:2375" }), true);
   assert.equal(read({ [NAME]: "1", UZI_EPOCH_LOCK: "1", UZI_DIND_SOCKET: "/run/docker.sock" }), true);
-  const refusal = /^Error: UZI_EPOCH_RECLAIM_DELETION=1 requires an epoch-enabled hosted Docker worker$/;
+  const refusal = /^Error: UZI_EPOCH_RECLAIM_DELETION=1 requires an epoch-locked, Docker-wired worker \(UZI_EPOCH_LOCK=1 and DOCKER_HOST or UZI_DIND_SOCKET\)$/;
   for (const env of [
     { [NAME]: "1", DOCKER_HOST: "tcp://127.0.0.1:2375" },
     { [NAME]: "1", UZI_EPOCH_LOCK: "1" },

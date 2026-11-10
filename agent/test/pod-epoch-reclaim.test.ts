@@ -1174,7 +1174,12 @@ test("on: no sentinel and activation true deletes and settles exactly like the s
   assert.equal((active.result as any).deleted_bytes, (sentinel.result as any).deleted_bytes);
   assert.equal(strip(active).verdict, strip(sentinel).verdict);
 });
-test("on, still non-effectful: activation never replaces the shadow, authority, pass-integrity or scope requirements", async () => {
+test("on, still non-effectful: activation never deletes after an early refusal, a partial verdict, a missing native scope or absent deps", async () => {
+  // The unattested-authority and aborted-pass cases below end the pass with a refusal before the deletion gate
+  // is evaluated, so they pin those refusals, not the gate's own `authority.result === "attested"` and
+  // `!controller.signal.aborted` conjuncts. The gate is reached only after decide("attested") and a synchronous
+  // check() that throws on an abort, so no test-world pass arrives there unattested or aborted; those two
+  // conjuncts stay unpinned.
   const cases: Array<[string, (w: ReturnType<typeof makeWorld>) => void | Promise<void>]> = [
     ["partial inventory", w => {
       const discover = w.options.git.discoverEpochRetainedSources;
