@@ -1711,6 +1711,21 @@ The pending-`running` row is the stated residual: the operator-discard takeover 
 later owner-approved mechanism. The table covers process crashes only. No storage or
 power-loss durability is claimed: the tree removal's parent directory is not fsynced.
 
+### Accepted historical-writer residual (owner decision 2026-10-24)
+
+Pod-epoch evidence covers the immediately preceding pod, intervening pod use of the
+volume, and concurrent participating worker processes under the epoch lock. It does not
+prove that every process ever started by an older pod has died. A process from an older
+pod may survive its own termination, for example after a runtime dead-shim cleanup
+failure, and write into a settled tree after one or more later evidenced epochs. The
+owner accepted this residual for verified-epoch reclaim in
+[PRD #3430](../prds/3430-pod-epoch-lock-shadow.md) on 2026-10-24.
+
+The epoch lock still closes races during the reclaim interval. This accepted historical
+risk does not bypass a current source-use, custody, process, Docker, or epoch-lock
+refusal. An observed or unknown current writer still keeps the source under the
+applicable guard.
+
 ### Not shipped
 
 Production activation (owner co-sign), hosted acceptance, and any resolver for the pending

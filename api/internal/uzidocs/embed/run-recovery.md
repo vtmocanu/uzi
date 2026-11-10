@@ -2515,6 +2515,16 @@ destructive-record save and before its settle leaves the slot `retiring` with a
 `running` pending record. That source is kept and not recovered automatically:
 this is a stated residual, and no automatic path clears it.
 
+A verified epoch is not proof that every historical writer is gone. Its evidence
+covers the immediately preceding pod and intervening pod use, while the epoch lock
+excludes concurrent participating workers during reclaim. A process from an older
+pod could have survived termination, for example after a runtime dead-shim cleanup
+failure, and write to a settled tree after a later evidenced epoch. The owner
+accepted this historical-writer residual on 2026-10-24 in
+[PRD #3430](../prds/3430-pod-epoch-lock-shadow.md). It does not authorize bypassing
+a current source-use, custody, process, Docker, or epoch-lock refusal. A known or
+unverified current writer keeps the source.
+
 #### Resolving guarded local records
 
 When inspect reports `resolve_local_record` for a guarded recovery record, two more
