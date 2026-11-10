@@ -189,7 +189,7 @@ Build from what exists; do not re-implement these. The original anchors were che
 - **D16** PR open lists only PRs opened by the viewer's own uzi runs, for admins too (the admin list carries no completed runs); human and bot PRs are out of scope.
 - **D17** Run scope follows today's Runs page: a normal user sees only their runs; an admin also sees every other user's runs, as a separate "Other users (admin)" group (maintainer call on the name), and the line counts them. Needs your decision stays the viewer's own (maintainer call). A behaviour change from today's Overview, which lists only the viewer's own runs even for admins.
 - **D18** On the Overview the banner stack sits under the page header, between the greeting and Needs your decision (maintainer call). Its all-pages variant is superseded by D20.
-- **D19** The Search button lives only in the Overview header; the Cmd K shortcut opens the menu on every page (recommendation; the maintainer leaned Overview-only, confirm before dispatching #3875).
+- **D19** The Search button lives only in the Overview header; the Cmd K shortcut opens the menu on every signed-in page (confirmed by the maintainer 2026-11-10; no sidebar entry).
 - **D20** Banners render under the header on the Overview only; other pages keep the shell slot (maintainer call). One shared component, so placement differs but code does not.
 - **D21** ci_fix and mr_rework runs sit in Other work: they maintain an existing PR, they are not issue lifecycle stages.
 - **D22** Shadow markers: `data-attention` on the decisions card, `data-live` on the issue-work card.
@@ -199,9 +199,7 @@ Build from what exists; do not re-implement these. The original anchors were che
 ## Open decisions
 
 1. After the trial: promote the preview and delete the old Overview (B), or keep both behind a per-user setting (C)? Decided at #3877.
-2. Confirm the Cmd K shortcut works on every page (D19's recommendation) rather than only on the Overview.
-
-Resolved since the issue was filed: ci_fix and mr_rework placement (D21), Shadow markers (D22), provider split by runs (D23), banners Overview-only (D20).
+Resolved since the issue was filed: ci_fix and mr_rework placement (D21), Shadow markers (D22), provider split by runs (D23), banners Overview-only (D20), Cmd K on every signed-in page with the button on the Overview only (D19).
 
 ## Inspiration (patterns borrowed, not visuals)
 
