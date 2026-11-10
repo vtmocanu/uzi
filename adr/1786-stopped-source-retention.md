@@ -165,11 +165,13 @@ below). It returns `covered` only if these checks pass (AI-synced 2026-10-24):
   directory 'x/': Permission denied`) or a loose ref (`warning: ignoring broken ref`), so an
   empty status alone is not proof of a clean tree. No warning text is matched and there is no
   allowlist, so a benign warning retains conservatively: `core.fsyncObjectFiles=true` in the
-  clone's config (a deprecation warning) or a CRLF-conversion warning makes a clean clone
-  `not_covered` and kept, and no `core.safecrlf` override is added. The status read pins
+  clone's config (a deprecation warning) makes a clean clone `not_covered` and kept. A
+  CRLF-conversion warning, if `status` emits one, likewise makes the clone `not_covered` and
+  kept; no `core.safecrlf` override is added. The status read pins
   `core.attributesFile=/dev/null` on its own command line beside `core.excludesFile=/dev/null`,
   because runner-uid Git inherits the worker's HOME and an unreadable
-  `~/.config/git/attributes` would otherwise warn on every clean tree. Residual: Git silently
+  `~/.config/git/attributes` would otherwise warn whenever status consults attributes (for
+  example for a stat-dirty tracked file), making such a clean clone `not_covered`. Residual: Git silently
   omits refs inside an unreadable refs directory (no stderr), so that case is not detected by
   this rule. The automatic mode, `worktreeStatus` (exit captures) and custody are unchanged;
 - where the final process scan runs, it reaped no writer: a writer reaped after
