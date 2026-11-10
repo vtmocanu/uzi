@@ -9354,7 +9354,14 @@ SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.output_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_output_tokens,
     COALESCE(SUM(t.cost_usd) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
     count(*) FILTER (WHERE t.cost_status = 'subscription' AND r.created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
-    count(*) FILTER (WHERE t.cost_status = 'unreported' AND r.created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count
+    count(*) FILTER (WHERE t.cost_status = 'unreported' AND r.created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
+    -- Runs by harness (issue #3876), the same population as run_count / last7_run_count.
+    -- runs.harness is NOT NULL with CHECK (harness IN ('claude','codex')) (migrations
+    -- 00226/00227), so per window claude + codex == run_count.
+    count(t.run_id) FILTER (WHERE r.harness = 'claude')::bigint AS claude_run_count,
+    count(t.run_id) FILTER (WHERE r.harness = 'codex')::bigint AS codex_run_count,
+    count(t.run_id) FILTER (WHERE r.harness = 'claude' AND r.created_at >= now() - interval '7 days')::bigint AS last7_claude_run_count,
+    count(t.run_id) FILTER (WHERE r.harness = 'codex' AND r.created_at >= now() - interval '7 days')::bigint AS last7_codex_run_count
 FROM run_usage_totals t
 JOIN runs r ON r.id = t.run_id
 JOIN users u ON u.id = r.user_id

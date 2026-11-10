@@ -277,6 +277,8 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			RunCount:                  u.RunCount,
 			PRCount:                   prsByUser[u.UserID].LifetimePrCount,
 			Last7PRCount:              prsByUser[u.UserID].Last7PrCount,
+			HarnessRuns:               &apitypes.HarnessRunsDTO{Claude: u.ClaudeRunCount, Codex: u.CodexRunCount},
+			Last7HarnessRuns:          &apitypes.HarnessRunsDTO{Claude: u.Last7ClaudeRunCount, Codex: u.Last7CodexRunCount},
 			// PRD #1429 M1 (D7): the user's lifetime subscription/unreported run counts, so the
 			// admin per-user breakdown discloses a non-metered component like the factory total.
 			SubscriptionRunCount: u.SubscriptionRunCount,
@@ -302,6 +304,9 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			RunCount:      0,
 			PRCount:       prsByUser[oc.UserID].LifetimePrCount,
 			Last7PRCount:  prsByUser[oc.UserID].Last7PrCount,
+			// No usage row, so no runs in either window: both splits are {0,0}.
+			HarnessRuns:      &apitypes.HarnessRunsDTO{},
+			Last7HarnessRuns: &apitypes.HarnessRunsDTO{},
 			// No usage row means no run_usage_totals rows, so both non-metered counts are zero.
 			SubscriptionRunCount: 0,
 			UnreportedRunCount:   0,
@@ -318,14 +323,16 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 		}
 		seen[p.UserID] = true
 		users = append(users, apitypes.AdminUserUsageDTO{
-			UserID:        p.UserID.String(),
-			Email:         p.Email,
-			Usage:         apitypes.UsageDTO{},
-			Last7Days:     &apitypes.UsageDTO{},
-			Last7Outcomes: runOutcomes(0, 0, 0, 0, 0, 0, 0, nil),
-			Outcomes:      runOutcomes(0, 0, 0, 0, 0, 0, 0, nil),
-			PRCount:       p.LifetimePrCount,
-			Last7PRCount:  p.Last7PrCount,
+			UserID:           p.UserID.String(),
+			Email:            p.Email,
+			Usage:            apitypes.UsageDTO{},
+			Last7Days:        &apitypes.UsageDTO{},
+			Last7Outcomes:    runOutcomes(0, 0, 0, 0, 0, 0, 0, nil),
+			Outcomes:         runOutcomes(0, 0, 0, 0, 0, 0, 0, nil),
+			PRCount:          p.LifetimePrCount,
+			Last7PRCount:     p.Last7PrCount,
+			HarnessRuns:      &apitypes.HarnessRunsDTO{},
+			Last7HarnessRuns: &apitypes.HarnessRunsDTO{},
 		})
 	}
 	httpx.JSON(w, http.StatusOK, apitypes.AdminUsageDTO{
