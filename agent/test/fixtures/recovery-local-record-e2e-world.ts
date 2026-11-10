@@ -7,6 +7,7 @@ import { formatAttemptId } from "../../src/attempt-path.js";
 import { DindPruneGate } from "../../src/dind-prune.js";
 import { GitCache, type OwedCandidate, type PositiveOwedCandidateContext } from "../../src/git.js";
 import type { Logger } from "../../src/log.js";
+import { Outbox } from "../../src/outbox.js";
 import { RetainedSourceServer } from "../../src/ops/retained-source-server.js";
 import type { RecoveryExactHold, RecoveryHoldsResponse, RunOwnershipResponse } from "../../src/protocol.js";
 import type { RecoveryCoordinator, RecoveryRecord } from "../../src/recovery.js";
@@ -132,6 +133,9 @@ export interface WorldOptions {
   serverLog?: Logger;
   /** Test-scoped overrides of the channel server's cooperative deadline and shutdown wait. */
   serverTimeouts?: { resolveDeadlineMs?: number; shutdownSettleMs?: number };
+  /** Wire a REAL, initialised Outbox (under `<dir>/outbox`) into the real RunRunner: its `pendingGenerationReport`
+   *  then reads the outbox's own terminal / policy / finalize state instead of answering false. */
+  outbox?: boolean;
 }
 
 export interface Episode { branch: string; key: string; tip: string; sourcePath: string; successorPath: string }
@@ -144,6 +148,8 @@ export interface World {
   bare: string;
   client: E2EClient;
   runner: RunRunner;
+  /** The runner's real outbox when the world was created with `outbox: true`. */
+  outbox: Outbox | undefined;
   coordinator: RecoveryCoordinator;
   server: RetainedSourceServer;
   gate: DindPruneGate;
@@ -248,8 +254,15 @@ export async function createWorld(opts: WorldOptions): Promise<World> {
   fs.chmodSync(bare, 0o700);
   fs.chmodSync(path.join(bare, "config"), 0o600);
   const client = new E2EClient();
+  let outbox: Outbox | undefined;
+  if (opts.outbox) {
+    outbox = new Outbox({ root: path.join(dir, "outbox"), log: nullLogger(), runMaxBytes: 64 * 1024 * 1024,
+      maxBytes: 512 * 1024 * 1024, retentionMs: 7 * 86_400_000 });
+    await outbox.init();
+    assert.equal(outbox.isDisabled(), false, "the fixture outbox must be usable");
+  }
   const runner = new RunRunner(client as unknown as ConstructorParameters<typeof RunRunner>[0], git, () => { throw new Error("no executor"); },
-    nullLogger(), 20, WORKER_TOKEN, { pollMs: 5 });
+    nullLogger(), 20, WORKER_TOKEN, { pollMs: 5, ...(outbox ? { outbox } : {}) });
   const coordinator = runner["recovery"] as RecoveryCoordinator;
   client.records = runId => coordinator.inspect(runId);
   const gens = new Map<number, GenInfo>();
@@ -304,7 +317,7 @@ export async function createWorld(opts: WorldOptions): Promise<World> {
   const served = server.serve(ac.signal);
   await server.ready;
   assert.ok(server.listening, "the retained-source channel must be listening");
-  return { dir, fx, git, bare, client, runner, coordinator, server, gate, sock: server.path, flags, gens, episode, other,
+  return { dir, fx, git, bare, client, runner, outbox, coordinator, server, gate, sock: server.path, flags, gens, episode, other,
     stop: async () => { ac.abort(); await served; fx.cleanup(); fs.rmSync(dir, { recursive: true, force: true }); } };
 }
 

@@ -93,7 +93,7 @@ async function startApi(f: Fixture, stateFile: string, caseB: boolean, later?: R
 
 /** The record shapes of a Case B world: one anchor; several bundles and records (only the anchor bound, plus a binding carrier);
  *  or a run with a LATER, already acknowledged generation beside the disposed one. */
-type Shape = "single" | "multi" | "later";
+type Shape = "single" | "multi" | "anchor-only" | "later";
 interface SeedOptions {
   shape?: Shape;
   caseB?: boolean;
@@ -129,6 +129,13 @@ async function seed(opts: SeedOptions = {}) {
     const loose = await extra({}, "bare");
     await fs.writeFile(coordinator["bundlePath"](loose), "sibling bundle bytes");
     await extra({ inventoryGuarded: true, exactHoldBinding: binding }, "bare");
+  }
+  if (shape === "anchor-only") {
+    // Only the anchor carries the exactHoldBinding: two unbound non-anchor records, each with its bundle on disk.
+    for (const n of [1, 2]) {
+      const loose = await extra({}, "bare");
+      await fs.writeFile(coordinator["bundlePath"](loose), `sibling bundle bytes ${n}`);
+    }
   }
   let later: { record: RecoveryRecord } | undefined;
   if (shape === "later") {
@@ -389,7 +396,7 @@ test("kill 6: after the bundle unlinks, before the record deletes: the ACK recor
 //
 // The child runs the real coordinator over the same data directory with the injected, shared fake source evidence and
 // stops at the n-th step the m1 seam `onOperatorDisposeStepForTest` reports. A fresh process then describes the survivors.
-// Selection (all of it kept in this file's runtime, ~16 worlds x 2 children): every world is killed
+// Selection (all of it kept in this file's runtime, ~20 worlds x 2 children): every world is killed
 //   - before the first unlink (step 0),
 //   - after each bundle, after each record (non-binding record, then binding carrier), and
 //   - immediately before and immediately after the anchor (the last unlink; the rmdir has not run).
@@ -402,6 +409,8 @@ const CASE_B_WORLDS: CaseBWorld[] = [
   { name: "one bundle and the anchor", opts: { caseB: true }, remaining: 0,
     steps: ["bundle:before", "bundle:after", "anchor:before", "anchor:after", "rmdir:before", "rmdir:after"] },
   { name: "three bundles, an unbound record, a binding carrier and the anchor", opts: { caseB: true, shape: "multi" }, remaining: 0,
+    steps: [...repeat(3, "bundle:before", "bundle:after"), ...repeat(2, "record:before", "record:after"), "anchor:before", "anchor:after", "rmdir:before", "rmdir:after"] },
+  { name: "two bundles and two unbound records beside the anchor, which is the only binding carrier", opts: { caseB: true, shape: "anchor-only" }, remaining: 0,
     steps: [...repeat(3, "bundle:before", "bundle:after"), ...repeat(2, "record:before", "record:after"), "anchor:before", "anchor:after", "rmdir:before", "rmdir:after"] },
   { name: "no saved FINAL, with a later acknowledged generation", opts: { caseB: true, noFinal: true, shape: "later" }, remaining: 1,
     steps: ["bundle:before", "bundle:after", "anchor:before", "anchor:after", "rmdir:before", "rmdir:after"] },

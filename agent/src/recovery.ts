@@ -6479,6 +6479,7 @@ export class RecoveryCoordinator {
         anchor.serverCaptureId ?? null,
         { hold_id: exact.hold_id, repo_id: exact.repo_id, generation: exact.generation, state: exact.state,
           release_evidence: exact.release_evidence ?? null, final_receipt: exact.final_receipt ?? null, run_status: exact.run_status,
+          completed_publication_receipt: exact.completed_publication_receipt ?? null, inventory_guarded: exact.inventory_guarded,
           original_worker_id: exact.original_worker_id, original_worker_identity: exact.original_worker_identity },
         snapshot.devIno, bare, snapshot.refs, journal.names, observed.settlementNames, all, sourceEvidence!.descriptor, later,
       ])).digest("hex");
@@ -6842,9 +6843,21 @@ export class RecoveryCoordinator {
           if (reason) throw new OperatorDisposeRefusal(reason);
           io.budget.check();
           await step("rmdir", runDir, "before");
-          await ownedRecoveryIO(() => fs.rmdir(runDir)).catch(() => undefined);
+          try { await ownedRecoveryIO(() => fs.rmdir(runDir)); }
+          catch (err) {
+            MaintenanceBudget.current()?.check();
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") return partial("rmdir_failed");
+          }
           await step("rmdir", runDir, "after");
-          return { kind: "retired", generation, remaining: await this.operatorRemaining(runId) };
+          let remaining: number;
+          try { remaining = (await ownedRecoveryIO(() => fs.readdir(runDir))).filter(name => name.endsWith(".json")).length; }
+          catch (err) {
+            MaintenanceBudget.current()?.check();
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") return partial("remaining_unreadable");
+            remaining = 0;
+          }
+          return { kind: "retired", generation, remaining };
         });
       } catch (err) { outcome = fail(err); }
     };

@@ -910,3 +910,75 @@ test("after a Case B retirement the existing inspect and discard take over: the 
   sameLines(treeDigest(w.other!.clonePath), otherSource, "the other run's retained source");
   assertNoApiWrites(w, "follow-on discard");
 });
+
+// ─── Case B against the runner's REAL outbox (issue #3885 repair R1) ─────────────────────────────────────────────────
+// The world's `outbox: true` wires a real, initialised Outbox into the real RunRunner, so `pendingGenerationReport` is the
+// runner's own predicate (isDisabled / hasPendingTerminal / finalizeRecordIdentity), not a stub.
+
+const POLICY_OUTCOME = "5c1f0000-0000-4000-8000-000000000001";
+
+test("Case B is refused as pending_generation_report while the real outbox holds an UNKNOWN policy outcome or a finalize record for the generation; every byte stays", {
+  skip: process.platform === "linux" ? false : "Linux only: the production source proof refuses non_linux_host",
+}, async () => {
+  const kinds: Array<[string, (w: World) => Promise<void>]> = [
+    ["an UNKNOWN policy outcome (reserved, then selected)", async w => {
+      const token = w.outbox!.reservePolicyFlight(RUN, 9);
+      assert.ok(token, "the real outbox admits the policy flight");
+      assert.equal(w.outbox!.selectPolicyFlight(token, POLICY_OUTCOME), true);
+      assert.equal(w.outbox!.hasPendingTerminal(RUN, 9), true);
+    }],
+    ["a journaled finalize record", async w => {
+      assert.deepEqual(await w.outbox!.journalFinalize(RUN, 9), { written: true });
+      assert.ok(w.outbox!.finalizeRecordIdentity(RUN, 9));
+    }],
+  ];
+  for (const [name, seed] of kinds) {
+    const w = await world({ gens: [{ generation: 9, kind: "caseB" }], sharedOwedPin: false, otherRun: true, outbox: true });
+    // Described and digested while nothing is pending; the report appears afterwards.
+    const described = await localRecords(w);
+    assert.deepEqual(classes(described), { 9: "case_b_owner_discard" }, name);
+    const digest = digestOf(described, 9);
+    await seed(w);
+    const before = dataSnapshot(w);
+    const refs0 = allRefs(w.bare);
+    const refused = await resolve(w, 9, digest, RUN, true);
+    assert.equal(refused.code, 1, name + refused.stderr);
+    assert.deepEqual(refused.json.result, { kind: "refused", reason: "pending_generation_report" }, name);
+    const view = await localRecords(w);
+    assert.equal(view.result.generations[0].classification, "pending_generation_report", name);
+    sameSnap(dataSnapshot(w), before, "after the pending-report refusal: " + name);
+    sameLines(allRefs(w.bare), refs0, "refs: " + name);
+    assertNoApiWrites(w, name);
+  }
+});
+
+test("Case B owner-discard with a real outbox: unrelated policy and finalize artifacts of another run or generation stay byte-identical", {
+  skip: process.platform === "linux" ? false : "Linux only: the production source proof refuses non_linux_host",
+}, async () => {
+  const w = await world({ gens: [{ generation: 9, kind: "caseB" }], sharedOwedPin: false, otherRun: true, outbox: true });
+  const b = w.gens.get(9)!;
+  // Another run, and another generation of this run: real finalize records on disk plus a selected policy outcome in memory.
+  assert.deepEqual(await w.outbox!.journalFinalize(OTHER_RUN, 3), { written: true });
+  assert.deepEqual(await w.outbox!.journalFinalize(RUN, 8), { written: true });
+  const token = w.outbox!.reservePolicyFlight(OTHER_RUN, 3);
+  assert.ok(token);
+  assert.equal(w.outbox!.selectPolicyFlight(token, POLICY_OUTCOME), true);
+  const outboxDir = path.join(w.dir, "outbox");
+  const outboxBefore = treeDigest(outboxDir);
+  assert.ok(outboxBefore.some(l => l.includes("finalize-3.json")) && outboxBefore.some(l => l.includes("finalize-8.json")), outboxBefore.join("\n"));
+  const described = await localRecords(w);
+  assert.deepEqual(classes(described), { 9: "case_b_owner_discard" });
+  const before = dataSnapshot(w);
+  const files = filesOf(w, b);
+  const refs0 = allRefs(w.bare);
+
+  const retired = await resolve(w, 9, digestOf(described, 9), RUN, true);
+  assert.equal(retired.code, 0, retired.stderr + JSON.stringify(retired.json));
+  assert.deepEqual(retired.json.result, { kind: "retired", generation: 9, remaining: 0 });
+  sameLines(treeDigest(outboxDir), outboxBefore, "the outbox (policy and finalize journals of other runs and generations)");
+  assert.equal(w.outbox!.hasPendingTerminal(OTHER_RUN, 3), true, "the other run's policy outcome is still pending");
+  assert.ok(w.outbox!.finalizeRecordIdentity(RUN, 8) && w.outbox!.finalizeRecordIdentity(OTHER_RUN, 3));
+  sameSnap(dataSnapshot(w), minus(w, before, files, true), "after the retirement");
+  sameLines(allRefs(w.bare), refs0, "refs");
+  assertNoApiWrites(w, "real outbox retirement");
+});

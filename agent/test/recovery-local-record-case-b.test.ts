@@ -12,7 +12,7 @@ import { type DescribeLocalRecordsResult, type LocalRecordGeneration, type Opera
 import { nullLogger } from "./helpers.js";
 import { binding, closed, environment, fixture, git, inventory, patch, type Variant } from "./fixtures/recovery-bindingless-compat.js";
 import { fakeSourceEvidence } from "./fixtures/recovery-case-b-evidence.js";
-import { RUN, allRefs, createWorld, treeDigest, type World as E2EWorld } from "./fixtures/recovery-local-record-e2e-world.js";
+import { RUN, allRefs, createWorld, gitIn, treeDigest, type World as E2EWorld } from "./fixtures/recovery-local-record-e2e-world.js";
 
 // issue #3885 M1: the operator's Case B disposition. A generation whose archive was never settled (its hold is
 // discarded or closed without the saved FINAL's receipt, or the FINAL was never saved) is described as
@@ -545,6 +545,8 @@ test("a stale digest is descriptor_changed whatever changed: a record, a ref, th
     ["a record", async w => { await patch(w.coordinator, await w.latest(), { reason: "changed" }); }],
     ["a ref", w => { git(w.bare, "update-ref", `refs/uzi-owed/${w.runId}/${w.f.head}`, w.f.head); }],
     ["the exact observation", w => { w.exact = { ...closed(w.f), run_status: "cancelled" }; }],
+    // Changes between describe and resolve; both resolve reads then agree, so only the digest can notice it.
+    ["only the completed publication receipt", w => { w.exact = { ...closed(w.f), completed_publication_receipt: { observed_branch_head: "d".repeat(40) } as never }; }],
     ["another run record", async w => { await addRecord(w, { generation: 3 }); }],
     ["a clone head", w => { w.evidence = () => fakeSourceEvidence(w.runId, w.bare, { head: "b".repeat(40) }); }],
     ["a clone replaced at the same path and head (new dev:ino)", w => { w.evidence = () => fakeSourceEvidence(w.runId, w.bare, { identity: "1:43" }); }],
@@ -754,6 +756,43 @@ test("an unlink error after the boundary is a partial, never a refusal", async (
   w.assertNoForbidden();
 });
 
+test("the run directory removal tolerates only ENOENT/ENOTEMPTY/EEXIST; the remaining count tolerates only ENOENT", async () => {
+  // An unexpected rmdir error is a named partial, with every record already gone.
+  const rm = await world();
+  const rmDigest = await rm.digest();
+  const rmdir = fs.rmdir.bind(fs);
+  const runDir = rm.coordinator["runDir"](rm.runId) as string;
+  mock.method(fs, "rmdir", async (dir: string) => {
+    if (path.resolve(String(dir)) === path.resolve(runDir)) throw Object.assign(new Error("fixture EPERM"), { code: "EPERM" });
+    return rmdir(dir);
+  });
+  assert.deepEqual(await rm.resolve(rmDigest), { kind: "partial", reason: "rmdir_failed" });
+  assert.deepEqual(await rm.coordinator.inspect(rm.runId), []);
+  mock.restoreAll();
+
+  // A non-empty run directory (ENOTEMPTY) is tolerated and counts only record files.
+  const stray = await world();
+  const strayDigest = await stray.digest();
+  stray.stepHook = async s => {
+    if (s.kind === "anchor" && s.phase === "after") await fs.writeFile(path.join(stray.coordinator["runDir"](stray.runId), "stray.txt"), "not a record");
+  };
+  assert.deepEqual(await stray.resolve(strayDigest), { kind: "retired", generation: 7, remaining: 0 });
+
+  // An unexpected readdir error while counting what remains is a named partial.
+  const rd = await world();
+  const rdDigest = await rd.digest();
+  const readdir = fs.readdir.bind(fs);
+  const rdRunDir = rd.coordinator["runDir"](rd.runId) as string;
+  rd.stepHook = s => {
+    if (s.kind !== "rmdir" || s.phase !== "after") return;
+    mock.method(fs, "readdir", async (dir: string, ...rest: unknown[]) => {
+      if (path.resolve(String(dir)) === path.resolve(rdRunDir)) throw Object.assign(new Error("fixture EACCES"), { code: "EACCES" });
+      return (readdir as (...a: unknown[]) => Promise<unknown>)(dir, ...rest);
+    });
+  };
+  assert.deepEqual(await rd.resolve(rdDigest), { kind: "partial", reason: "remaining_unreadable" });
+});
+
 test("shutdown after the boundary is a partial; the client cannot interrupt past it", async () => {
   const w = await world();
   await addRecord(w);
@@ -950,4 +989,48 @@ test("real readers and the real boundary: forged completeness and a replaced clo
   assert.deepEqual(allRefs(w.bare), kept.refs, "no ref or pin is touched");
   await assert.rejects(fs.stat(path.join(w.dir, "recovery", RUN)), { code: "ENOENT" });
   assert.equal(w.client.posts.length, 0, "nothing was reported to the api");
+});
+
+test("real readers: metadata-only drift of the retained source (journal bytes) changes the native descriptor, not the E1 clone tuple, and refuses descriptor_changed", {
+  skip: process.platform === "linux" ? false : "Linux only: the production source proof refuses non_linux_host",
+}, async () => {
+  const w = await createWorld({ gens: [{ generation: 9, kind: "caseB" }], sharedOwedPin: false, otherRun: false });
+  e2eWorlds.push(w);
+  const sig = () => ({ requestSignal: new AbortController().signal, shutdownSignal: new AbortController().signal, deadlineAt: Date.now() + 60_000 });
+  const describe = async () => {
+    const d = await w.coordinator.describeLocalRecords(RUN, sig());
+    assert.equal(d.kind, "described", JSON.stringify(d));
+    return d.kind === "described" ? d.generations.find(g => g.generation === 9)! : (undefined as never);
+  };
+  const footprint = () => ({ source: treeDigest(w.episode.sourcePath), successor: treeDigest(w.episode.successorPath),
+    records: treeDigest(path.join(w.dir, "recovery", RUN)), refs: allRefs(w.bare) });
+  const e1 = async () => JSON.stringify(await w.git.readInventoryCloneHeads(w.bare, RUN, { cloneIdentity: true }));
+  const native = async (): Promise<string[]> => (await w.git.inspectRetainedSources({ isLivePath: () => false })).sources
+    .filter(x => x.runId === RUN && x.barePath === w.bare).map(x => x.descriptor).sort();
+
+  const view = await describe();
+  assert.equal(view.classification, "case_b_owner_discard");
+  const e1Before = await e1();
+  const nativeBefore = await native();
+  assert.ok(nativeBefore.length >= 1);
+  const before = footprint();
+
+  // Same JSON value, different bytes: only the journal text the native descriptor hashes changes.
+  const key = `uzi-recovery.${w.episode.branch}.clone`;
+  const raw = gitIn(w.bare, ["config", "--get", key]);
+  const reformatted = raw.replace(/^\{/, "{ ");
+  assert.notEqual(reformatted, raw);
+  gitIn(w.bare, ["config", key, reformatted]);
+
+  assert.equal(await e1(), e1Before, "the E1 clone tuple (paths, branches, heads, identities) is unchanged");
+  assert.notDeepEqual(await native(), nativeBefore, "the native retained-source descriptor (rec.digest) changed");
+  const drifted = await describe();
+  assert.equal(drifted.classification, "case_b_owner_discard", "still eligible");
+  assert.notEqual(drifted.digest, view.digest, "the native descriptor moved the digest");
+  const mid = footprint();
+  assert.deepEqual(await w.coordinator.resolveLocalRecord({ runId: RUN, generation: 9, confirm: view.digest!, action: "case_b", ...sig() }),
+    { kind: "refused", reason: "descriptor_changed" });
+  assert.deepEqual(footprint(), mid, "nothing is deleted");
+  assert.deepEqual(mid.source, before.source);
+  assert.deepEqual(mid.refs, before.refs);
 });
