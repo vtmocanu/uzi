@@ -2391,6 +2391,10 @@ export interface RetainedSourcePart {
   ledgerState: AttemptLedgerState | "none";
   live: boolean;
   allocatedBytes: number | null;
+  /** Epoch inspections only; diagnostic, grants nothing. Names why this present part could not be
+   *  measured when the stop was confined to its own tree (permission denied below the root, or a
+   *  measurement cap). `allocatedBytes` stays null, so the source is never byte-complete. */
+  measurementShortfall?: "eacces" | "eperm" | "entry_cap" | "depth_cap" | "pending_cap";
 }
 
 /** Content-free evidence for one retained source (or one protected episode of several). */
@@ -13647,10 +13651,27 @@ export class GitCache {
   private async measureAllocated(
     root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
     skip?: (rel: string) => boolean, partialOnIoError = false,
-  ): Promise<{ bytes: number; entries: number; complete: boolean }> {
+  ): Promise<{ bytes: number; entries: number; complete: boolean; local?: "eacces" | "eperm" | "entry_cap" | "depth_cap" | "pending_cap" }> {
     const filesystem = async <T>(action: () => Promise<T>): Promise<T> => {
       try { return await action(); }
       catch (error) { countPartialCause(causes, "measurement_filesystem_error"); throw error; }
+    };
+    type Local = "eacces" | "eperm" | "entry_cap" | "depth_cap" | "pending_cap";
+    // A stop confined to this tree (permission denied below the root, or a cap) is reported as `local`.
+    // A deadline that has already passed outranks it: the stop is then a pass-wide budget stop, so it
+    // is counted as the deadline and carries no `local`. Read the clock only on this stop path.
+    const stopped = (reportBytes: number, reportEntries: number, local: Local): { bytes: number; entries: number; complete: false; local?: Local } => {
+      if (now() >= deadline) {
+        countPartialCause(causes, "measurement_deadline");
+        return { bytes: reportBytes, entries: reportEntries, complete: false };
+      }
+      return { bytes: reportBytes, entries: reportEntries, complete: false, local };
+    };
+    const permissionCode = (error: unknown): "eacces" | "eperm" | undefined => {
+      try {
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        return code === "EACCES" ? "eacces" : code === "EPERM" ? "eperm" : undefined;
+      } catch { return undefined; }
     };
     const maxEntries = caps.maxEntries ?? RETAINED_MEASURE_MAX_ENTRIES;
     const maxPending = caps.maxPending ?? RETAINED_MEASURE_MAX_PENDING;
@@ -13670,11 +13691,12 @@ export class GitCache {
       try {
         this.checkRecoveryInterruption();
         handle = await filesystem(() => fs.opendir(dir));
-      } catch {
+      } catch (openError) {
         this.checkRecoveryInterruption();
-        return { bytes, entries: visited + 1, complete: false };
+        const denied = permissionCode(openError);
+        return denied ? stopped(bytes, visited + 1, denied) : { bytes, entries: visited + 1, complete: false };
       }
-      type Walk = { bytes: number; entries: number; complete: boolean };
+      type Walk = { bytes: number; entries: number; complete: boolean; local?: Local };
       const walk = async (): Promise<Walk | undefined> => {
         this.checkRecoveryInterruption();
         for (;;) {
@@ -13688,7 +13710,7 @@ export class GitCache {
             return { bytes, entries: visited + 1, complete: false };
           }
           if (!ent) break;
-          if (++visited > maxEntries) { countPartialCause(causes, "measurement_entry_cap"); return { bytes, entries: visited + 1, complete: false }; }
+          if (++visited > maxEntries) { countPartialCause(causes, "measurement_entry_cap"); return stopped(bytes, visited + 1, "entry_cap"); }
           const p = path.join(dir, ent.name);
           let st: Stats;
           try {
@@ -13703,16 +13725,20 @@ export class GitCache {
             });
           } catch (err) {
             this.checkRecoveryInterruption();
-            if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
-            return { bytes, entries: visited + 1, complete: false };
+            let vanished = false;
+            try { vanished = (err as NodeJS.ErrnoException | undefined)?.code === "ENOENT"; } catch { /* Treat an unreadable code as not vanished. */ }
+            if (vanished) continue;
+            const denied = permissionCode(err);
+            return denied ? stopped(bytes, visited + 1, denied) : { bytes, entries: visited + 1, complete: false };
           }
           bytes += st.blocks * 512;
           const childRel = rel === "" ? ent.name : `${rel}/${ent.name}`;
           // A skipped directory is lstat-counted above but never descended into.
           if (st.isDirectory() && !st.isSymbolicLink() && !skip?.(childRel)) {
             if (depth + 1 > maxDepth || stack.length >= maxPending) {
-              countPartialCause(causes, depth + 1 > maxDepth ? "measurement_depth_cap" : "measurement_pending_cap");
-              return { bytes, entries: visited + 1, complete: false };
+              const depthCap = depth + 1 > maxDepth;
+              countPartialCause(causes, depthCap ? "measurement_depth_cap" : "measurement_pending_cap");
+              return stopped(bytes, visited + 1, depthCap ? "depth_cap" : "pending_cap");
             }
             stack.push({ dir: p, depth: depth + 1, rel: childRel });
           }
@@ -13868,7 +13894,8 @@ export class GitCache {
       found.length = maxDescriptors;
     }
     const sources: RetainedSourceEvidence[] = [];
-    const measurements = new Map<string, { bytes: number; complete: boolean }>();
+    type Shortfall = NonNullable<RetainedSourcePart["measurementShortfall"]>;
+    const measurements = new Map<string, { bytes: number; complete: boolean; local?: Shortfall }>();
     let bindingFailed = false;
     for (const { g, rec, ev } of found) {
       const parts: RetainedSourcePart[] = [];
@@ -13877,9 +13904,10 @@ export class GitCache {
       let total = 0;
       for (const p of rec.parts) {
         let bytes: number | null = null;
+        let shortfall: Shortfall | undefined;
         if (p.presence === "missing") bytes = 0;
         else if (p.presence === "present") {
-          let m = { bytes: 0, complete: false };
+          let m: { bytes: number; complete: boolean; local?: Shortfall } = { bytes: 0, complete: false };
           try {
             if (bindingFailed) throw new Error("retained tree binding check failed");
             m = (opts.epoch ? measurements.get(p.clonePath) : undefined) ??
@@ -13903,7 +13931,15 @@ export class GitCache {
             if (!stopped) unreadable++;
           }
           bytes = m.complete ? m.bytes : null;
-          if (!m.complete) partial = true;
+          // An epoch inspection keeps a tree-local shortfall (permission denied below the root, or a
+          // measurement cap) out of the pass-wide `partial`: the part stays unmeasured and the source is
+          // not byte-complete, so nothing is granted for it. Only a live budget and signal qualify; the
+          // wall clock is read here, not the injected one, so a test clock is not consumed.
+          if (!m.complete) {
+            if (opts.epoch && m.local !== undefined && opts.signal?.aborted !== true && Date.now() < (opts.deadline ?? Infinity)) {
+              shortfall = m.local;
+            } else partial = true;
+          }
         }
         if (bytes === null) unmeasured++;
         else {
@@ -13913,6 +13949,7 @@ export class GitCache {
         parts.push({
           clonePath: p.clonePath, attempt: p.attemptId ?? "canonical", generation: p.generation ?? "none",
           presence: p.presence, ledgerState: p.ledgerState, live: ev.live.get(p.clonePath) ?? false, allocatedBytes: bytes,
+          ...(shortfall ? { measurementShortfall: shortfall } : {}),
         });
       }
       const head = rec.parts[0]!;

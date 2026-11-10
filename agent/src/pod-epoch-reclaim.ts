@@ -463,7 +463,9 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
             if (part.presence === "present" && source.bytesState === "measured" &&
                 part.allocatedBytes !== null && Number.isSafeInteger(part.allocatedBytes) && part.allocatedBytes >= 0)
               candidate = { ...entry, bytes: part.allocatedBytes, presence: "present", basis };
-            else if (part.presence === "missing")
+            // A descriptor with any byte-incomplete part (a locally short present sibling) yields no
+            // candidate for any of its parts, a missing one included.
+            else if (part.presence === "missing" && source.bytesState === "measured")
               candidate = { ...entry, bytes: 0, presence: "missing", basis };
           }
           if (candidate && source.epochJournalExtraFields) extraFieldPaths.add(part.clonePath);
@@ -580,7 +582,10 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           if (!only || inspected.partial || inspected.unreadable !== 0 || only.runId !== runId || only.barePath !== admit.barePath ||
               only.kind !== "attempt" || only.descriptor !== admit.descriptor || only.presence !== candidate.presence ||
               only.sources.length !== 1 || only.sources[0]!.clonePath !== clonePath || only.sources[0]!.live ||
-              only.localRecords.length !== 0 || only.holds.state !== "read" || only.holds.ids.length !== 0 || !plain) {
+              only.localRecords.length !== 0 || only.holds.state !== "read" || only.holds.ids.length !== 0 || !plain ||
+              // A tree-local measurement shortfall no longer makes the re-inspection partial, so a fresh
+              // present source that is not byte-measured must be refused here.
+              (only.presence === "present" && only.bytesState !== "measured")) {
             assertSettled(); refusal(); continue;
           }
           // 4. the raw journal must still be exactly what the structural pre-check admitted; a change is a

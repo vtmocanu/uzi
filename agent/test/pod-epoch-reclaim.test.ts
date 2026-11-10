@@ -1586,6 +1586,28 @@ test("a path or entry change between the shadow and the recheck keeps the source
   }, (w, result) => { noMutation(w); assert.equal(result.kept_after_refusal, 1); });
 });
 
+test("#3851 a deletion re-inspection that is locally short but not partial refuses that source only", async () => {
+  await withDeletion(2, w => {
+    const inspections = [0, 0];
+    w.mutateSource = (s, i) => {
+      // The second inspection of source 0 is the deletion re-inspection: a tree-local shortfall leaves
+      // the inspection non-partial, yet the present source is no longer byte-measured.
+      if (++inspections[i]! === 2 && i === 0) {
+        s.bytesState = "unknown"; s.allocatedBytes = null;
+        s.sources[0]!.allocatedBytes = null; s.sources[0]!.measurementShortfall = "eacces";
+      }
+    };
+  }, (w, result) => {
+    assert.equal(result.would_delete, 2, "the shadow pass saw both sources as measured candidates");
+    assert.equal(result.kept_after_refusal, 1);
+    assert.equal(result.deleted, 1);
+    assert.deepEqual(w.spies.proofs.map(p => p.paths), [["/tree/1"]]);
+    assert.deepEqual(w.spies.discards.map(x => x.opts.epochProof.input.paths), [["/tree/1"]]);
+    assert.ok(w.spies.reserved.every(run => run !== "run0"), "no reservation was taken for the refused source");
+    assert.ok(w.spies.ended.every(e => !e.paths.includes("/tree/0")));
+  });
+});
+
 test("an eligible attested pass with zero admitted candidates reports reclaim_complete without opening a scope", async () => {
   await withDeletion(0, undefined, (w, result) => {
     noMutation(w);
