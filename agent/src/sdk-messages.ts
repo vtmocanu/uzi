@@ -227,6 +227,9 @@ export function decodeResult(msg: Record<string, unknown>): {
   apiErrorStatus?: number | null;
   resultText?: string;
   terminalReason?: string;
+  // Issue #3767: the frame's literal `is_error === true`; `outcome` alone cannot say it
+  // (a non-success subtype is also "failed"). Only the boolean true counts.
+  isError: boolean;
   wire: {
     usage: unknown;
     modelUsage: unknown;
@@ -260,6 +263,7 @@ export function decodeResult(msg: Record<string, unknown>): {
     // final assistant text, not an error — mirroring the existing `errors` guard.
     resultText: outcome === "failed" ? asString(msg["result"]) : undefined,
     terminalReason: asString(msg["terminal_reason"]),
+    isError: msg["is_error"] === true,
     wire: {
       usage: msg["usage"],
       modelUsage: msg["modelUsage"],

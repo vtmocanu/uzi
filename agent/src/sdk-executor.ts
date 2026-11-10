@@ -109,7 +109,7 @@ import {
   SIGNAL_SERVER_NAME,
   type PrSummaryClaim,
 } from "./signals.js";
-import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
+import { classifyLimitEvidence, classifySpendLimitTerminal, LimitReachedError, SpendLimitHoldError } from "./limit.js";
 import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes, type PlanVerdict } from "./steering.js";
 import { DiskParkSignal } from "./cache-cap.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
@@ -5257,6 +5257,15 @@ export class SdkExecutor implements Executor {
             providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
             terminal.apiErrorStatus,
             resumableSessionId(),
+          );
+        }
+        // Issue #3767: a lead spend-limit 400 is an owner-held park candidate. The runner decides
+        // whether the api can take it; otherwise this error's message is today's failure text.
+        const spend = limitFacts ? undefined : classifySpendLimitTerminal(terminal);
+        if (spend) {
+          throw new SpendLimitHoldError(
+            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
+            spend.detail,
           );
         }
         const thrown = terminal.failure

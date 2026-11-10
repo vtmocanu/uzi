@@ -221,6 +221,8 @@ export interface HarnessTerminal {
   apiErrorStatus?: number | null;
   resultText?: string;
   terminalReason?: string;
+  // Issue #3767: the result frame's literal `is_error === true` (Claude lane only).
+  isError?: boolean;
   // Deferred compatibility construction, independent of display subtype.
   // Invoke only at the lane's existing terminal-classification point.
   failure?: HarnessTerminalFailure;

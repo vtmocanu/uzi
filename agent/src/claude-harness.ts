@@ -691,6 +691,7 @@ function buildTerminal(
     apiErrorStatus: decoded.apiErrorStatus,
     resultText: decoded.resultText,
     terminalReason: decoded.terminalReason,
+    isError: decoded.isError,
     usage: {
       basis: "session",
       tokens: {},

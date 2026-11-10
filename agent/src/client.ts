@@ -2746,6 +2746,24 @@ export class WorkerClient {
         throw error;
       }
     }
+    if (body.recovery_cause === "anthropic_spend_limit") {
+      // Issue #3767: an owner-held spend-limit park. Sent once, exactly as given, fenced: it never
+      // takes the generic generation fallback or an untyped resend (an untyped park would be
+      // auto-retried by the api against a limit that cannot clear). A definite 4xx refusal closes
+      // only this feature's gate and propagates so the runner fails the run with the provider message.
+      if (!this.hasFeature("recovery_cause_anthropic_spend_limit") || body.status !== "recovery_wait" ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) < 1)
+        throw new Error("spend-limit park requires support and a positive generation");
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        if (evidence.refusedAfterAmbiguity) throw new Error("spend-limit park outcome uncertain", { cause: error });
+        if (error instanceof RequestError && error.status >= 400 && error.status < 500 &&
+            ![408, 409, 425, 429].includes(error.status)) this.dropFeature("recovery_cause_anthropic_spend_limit");
+        throw error;
+      }
+    }
     if (body.recovery_cause === "worker_memory_pressure") {
       // Snapshot once: caller mutation and transport retries cannot rebind this request.
       const outbound: PlanCrossCheckStateRequest = Object.freeze(JSON.parse(JSON.stringify(body)));

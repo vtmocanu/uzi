@@ -117,7 +117,7 @@ import {
 import { skillsPluginDir } from "./skills-plugin.js";
 import { captureFailureOf, EpochCleanupUnprovenError, type CodexExecutionSafety } from "./harness.js";
 import { CodexTurnFailedError } from "./codex/terminal-normalize.js";
-import { describeLimit, LimitReachedError } from "./limit.js";
+import { describeLimit, LimitReachedError, SpendLimitHoldError } from "./limit.js";
 import type { Logger } from "./log.js";
 import { LeadConfigReporter, leadConfigActive } from "./lead-config-report.js";
 import { CodexCatalogReporter, codexCatalogReportActive } from "./codex/catalog-report.js";
@@ -699,7 +699,9 @@ type RecoveryParkCause =
   /** Issue #1324 D3: an enrolled run's publication hop stayed transiently unreachable. */
   | { kind: "publication_forge_unreachable"; surface: "git" | "api"; step: "floor_refresh" | "push" | "mr_create" }
   | { kind: "vault_locked" | "refresh_unknown" | "account_unavailable" | "credential_release_unavailable" }
-  | { kind: "data_volume_full"; preventive: boolean };
+  | { kind: "data_volume_full"; preventive: boolean }
+  /** Issue #3767: the Claude lead hit an Anthropic organization or workspace spend limit. */
+  | { kind: "anthropic_spend_limit"; detail: string };
 
 /* Exact local revocation from assertHeldFreeCapture, distinct from an arbitrary refusal. */
 class FreeCaptureScopeExpired extends TrustedExecutionRefusal {}
@@ -864,6 +866,18 @@ const ACCOUNT_PARK_FEED = {
   reportFailed: "This run's Codex account was unavailable. Could not record the pause yet; keeping the local work and session and retrying.",
   held: "This run's Codex account was unavailable and this run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
 } as const;
+
+/**
+ * Issue #3767: the owner-facing feed line for an Anthropic spend-limit park. Owner-neutral
+ * ("this run's"), and it promises no automatic retry: only the owner (or a credential switch)
+ * moves the run on. `detail` is the provider's own sentence.
+ */
+function spendLimitParkFeed(detail: string, published: boolean): string {
+  return `Paused: this run's Anthropic API credential reached its organization or workspace spend limit (${detail}). ` +
+    `The recovery checkpoint is ${published ? "published" : "saved only on this worker"}. ` +
+    "Resume retries under the same credential choice, so it helps only after the spend limit is raised in the provider console. " +
+    "To continue now, switch tokens with `uzi run set-token` or \"Run with another token\" on the run page. Cancel ends the run.";
+}
 
 /** An unavailable initial release carries no inferred vault cause. */
 const RELEASE_UNAVAILABLE_PARK_FEED = {
@@ -1102,8 +1116,8 @@ function isCheckedLifecycleControl(error: unknown): boolean {
     error instanceof PlanRevisionRecoveryStoppedError || error instanceof PlanRejectedError ||
     error instanceof RunningAckTerminalError || error instanceof CredentialSwitchRetainedStop ||
     error instanceof CredentialSwitchSignal || error instanceof E2EDropExecutionError ||
-    error instanceof RunResidueBlockedError || isInputReceiptError(error) ||
-    codexDeferralOf(error) !== undefined;
+    error instanceof RunResidueBlockedError || error instanceof SpendLimitHoldError ||
+    isInputReceiptError(error) || codexDeferralOf(error) !== undefined;
 }
 
 /** PRD #974 follow-up (#1077): a terminal push_secret_blocked report whose reportState
@@ -6058,6 +6072,17 @@ export class RunRunner {
         flight.parked = await recoveryDisposition(() => this.handleRecoveryExhausted(
           err, claim, flight, executor, batcher, reportState, runLog,
           { kind: "publication_forge_unreachable", surface: err.surface, step: err.step },
+        ));
+        if (flight.parked) await this.retireFinalizeRecord(flight, "recovery_park_accepted");
+      } else if (err instanceof SpendLimitHoldError &&
+          this.client.protocolFeatures.includes("recovery_cause_anthropic_spend_limit") &&
+          (claim.claim_generation ?? 0) > 0 && this.client.stampsClaimGeneration(claim.claim_generation)) {
+        // Issue #3767: park owner-held instead of failing, only when the api advertised the cause and
+        // the report is claim-fenced. Anything else falls to the generic failure below with this
+        // error's message, which is today's `provider error: 400 ...` text.
+        flight.parked = await recoveryDisposition(() => this.handleRecoveryExhausted(
+          err, claim, flight, executor, batcher, reportState, runLog,
+          { kind: "anthropic_spend_limit", detail: err.detail },
         ));
         if (flight.parked) await this.retireFinalizeRecord(flight, "recovery_park_accepted");
       } else if (err instanceof TransientRecoveryError) {
@@ -22355,6 +22380,7 @@ export class RunRunner {
       credentialDeadlineAt?: number; diskCause?: Extract<RecoveryParkCause, { kind: "data_volume_full" }> } = {},
   ): Promise<boolean> {
     const disk = cause.kind === "data_volume_full" ? cause : opts.diskCause;
+    const spend = cause.kind === "anthropic_spend_limit" ? cause : undefined;
     const episode = opts.episode;
     if (opts.dispositionOnly && episode) this.validateJoinedCapture(flight, episode);
     const progress = episode ? this.captureProgressFor(flight, episode) : undefined;
@@ -23108,7 +23134,10 @@ export class RunRunner {
         const handoffTip = cause.kind === "publication_forge_unreachable" ? await this.publicationHandoffTip(flight) : undefined;
         try {
           const parkBody: StateRequest = {
-            ...(idleTyped
+            ...(spend
+              // Owner-held: the api writes a NULL retry. Never any progress or productive-turn counter.
+              ? { status: "recovery_wait", recovery_cause: "anthropic_spend_limit", claim_generation: flight.claimGeneration }
+              : idleTyped
               ? { status: "recovery_wait", recovery_cause: "codex_idle_stall", provider_progress_turns: flight.productiveTurns ?? 0 }
               : providerTyped
               ? { status: "recovery_wait", recovery_cause: "provider_outage", productive_turns: flight.productiveTurns ?? 0 }
@@ -23208,6 +23237,25 @@ export class RunRunner {
             markParkKeep();
             if (await this.dispositionProviderPark(claim, flight, runLog, providerReap, ack.status, opts.heldAuthenticated?.signal)) keepClone();
             return true;
+          }
+          if (spend && ack.status === "recovery_wait" &&
+              (ack.recoveryCause === undefined || ack.recoveryCause === "anthropic_spend_limit")) {
+            runLog.info("run parked for an Anthropic spend limit; it waits for owner Resume or Cancel", {
+              run_id: flight.runId,
+              cause: "anthropic_spend_limit",
+              published: capture.published,
+            });
+            batcher.emit({ kind: "status", agent: "worker", payload: { text: spendLimitParkFeed(spend.detail, capture.published) } });
+            // No reapThenSettleRecoveryGeneration: the custody hold and clone are kept, like the
+            // disk park, so an owner Resume continues from the retained work.
+            markParkKeep();
+            return true;
+          }
+          if (spend && ack.status === "recovery_wait") {
+            // The api parked the run under a different cause than ours: do not pretend.
+            runLog.warn("spend-limit park acknowledged with another recovery cause; failing the run", { cause: ack.recoveryCause });
+            await failCapture(err);
+            return false;
           }
           if (ack.status === "recovery_wait" && !credentialDeferred && disk) {
             const held = ack.recoveryRetryNotBefore === null;
@@ -23340,6 +23388,17 @@ export class RunRunner {
           if (opts.terminalDisk) {
             this.terminalDiskInterruption(flight);
             if (canonicalRecoveryInterruption(reportError)) throw reportError;
+          }
+          // Issue #3767: a DEFINITE refusal (an api that cannot take this cause answers a 4xx) never
+          // loops: the run fails with the provider's original message. Transport and 5xx errors
+          // keep the retry below.
+          if (spend && reportError instanceof RequestError && reportError.status >= 400 && reportError.status < 500 &&
+              ![408, 409, 425, 429].includes(reportError.status)) {
+            runLog.warn("spend-limit park refused by the api; failing the run with the provider message", {
+              status: reportError.status,
+            });
+            await failCapture(err);
+            return false;
           }
           // Bounded HTTP retries can fail while this worker keeps heartbeating.
           // Retain ownership and retry the idempotent park until its ACK is known.

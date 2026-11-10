@@ -284,3 +284,60 @@ export function describeLimit(limit: { resetsAtMs?: number; rateLimitType?: stri
   if (limit.resetsAtMs === undefined) return `${type}; reset time unknown`;
   return `${type}; resets at ${new Date(limit.resetsAtMs).toISOString()}`;
 }
+
+// ── THE SINGLE DOCUMENTED EXCEPTION TO "STRUCTURED FIELDS, NEVER TEXT" ────────
+// Issue #3767. An Anthropic API-key organization or workspace spend limit arrives as an HTTP 400
+// `invalid_request_error` (https://platform.claude.com/docs/en/api/errors) whose only discriminator
+// is its message text. SDK 0.3.316 re-check: the result frame has no spend discriminator
+// (`TerminalReason` has no spend member; `billing_error` exists only on assistant frames and the
+// observed spend frames carry `error: "unknown"`; `USAGE_LIMIT_ERROR_PREFIXES` does not contain
+// these strings). So this one classifier matches the two documented sentences, exact and
+// case-sensitive, and only on a lead terminal that structurally is a 400 `api_error` result.
+// A reworded provider message degrades to today's terminal failure, never to a retry loop.
+
+/** Organization spend limit sentence (issue #3767; https://platform.claude.com/docs/en/api/errors). */
+export const SPEND_LIMIT_ORG_TEXT = "You have reached your specified API usage limits.";
+/** Workspace spend limit sentence (issue #3767; https://platform.claude.com/docs/en/api/errors). */
+export const SPEND_LIMIT_WORKSPACE_TEXT = "You have reached your specified workspace API usage limits.";
+
+/** The lead's terminal frame facts the spend-limit classifier reads. */
+export interface SpendLimitTerminalFacts {
+  isError?: boolean;
+  terminalReason?: string;
+  apiErrorStatus?: number | null;
+  resultText?: string;
+}
+
+/**
+ * Classify a failed lead terminal as an Anthropic spend-limit hold. Requires the structural
+ * facts (`is_error === true`, `terminal_reason: "api_error"`, HTTP status 400) AND the raw result
+ * text, after stripping at most one leading `API Error: 400 ` (else `API Error: `) wrapper,
+ * starting with one of the two documented sentences. `detail` is the provider sentence line
+ * (trimmed, capped at 200 characters) for the owner-facing feed.
+ */
+export function classifySpendLimitTerminal(t: SpendLimitTerminalFacts): { detail: string } | undefined {
+  if (t.isError !== true || t.terminalReason !== "api_error" || t.apiErrorStatus !== 400) return undefined;
+  const raw = t.resultText;
+  if (typeof raw !== "string") return undefined;
+  const text = raw.startsWith("API Error: 400 ")
+    ? raw.slice("API Error: 400 ".length)
+    : raw.startsWith("API Error: ")
+      ? raw.slice("API Error: ".length)
+      : raw;
+  if (!text.startsWith(SPEND_LIMIT_ORG_TEXT) && !text.startsWith(SPEND_LIMIT_WORKSPACE_TEXT)) return undefined;
+  const firstLine = text.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  return { detail: firstLine.slice(0, 200).trim() };
+}
+
+/**
+ * Issue #3767: thrown by the Claude executor for a lead terminal classified by
+ * {@link classifySpendLimitTerminal}. `message` is byte-identical to the terminal failure message
+ * a non-parking worker reports (`provider error: 400 ...`), so a worker or api that cannot park
+ * this cause fails exactly as before.
+ */
+export class SpendLimitHoldError extends Error {
+  constructor(message: string, readonly detail: string) {
+    super(message);
+    this.name = "SpendLimitHoldError";
+  }
+}
