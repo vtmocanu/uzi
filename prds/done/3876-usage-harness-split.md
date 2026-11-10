@@ -29,10 +29,10 @@ A cost split by harness (would need per-model cost attribution); a model-level s
 
 ## Modules and seams
 
-- **Store query**: extend `AdminUsagePerUser` (`api/internal/store/queries/runtime.sql:8755`) with counts per `runs.harness` (the column exists since migration 00226), for both windows, over the same row set as `run_count`. Regenerate with `sqlc generate`. Add the counts as `FILTER (WHERE r.harness = ...)` aggregates on the existing per-user scan; a new `GROUP BY` key would break one row per user. Bounds: admin-only endpoint, the same scan as today; no new unbounded work. Measure the query on a realistic row count before and after and put the numbers in the PR.
-- **DTO**: the three-file edit `.claude/rules/web.md` describes: the Go struct, `fixtures/api-contract/admin_user_usage.zero.json` and `admin_user_usage.full.json` re-recorded from the contract test output (never hand-written), and `web/src/lib/apiTypes.ts`.
+- **Store query**: extend `AdminUsagePerUser` (`-- name: AdminUsagePerUser` in `api/internal/store/queries/runtime.sql`) with counts per `runs.harness` (the column exists since migration 00226), for both windows, over the same row set as `run_count`. Regenerate with `sqlc generate`. Add the counts as `FILTER (WHERE r.harness = ...)` aggregates on the existing per-user scan; a new `GROUP BY` key would break one row per user. Bounds: admin-only endpoint, the same scan as today; no new unbounded work. Measure the query on a realistic row count before and after and put the numbers in the PR.
+- **DTO**: the three-file edit `.claude/rules/web.md` describes: the Go struct, `fixtures/api-contract/admin_user_usage.{zero,full}.json` and `admin_usage.{zero,full}.json` (it embeds a user row) re-recorded from the contract test output (never hand-written), and `web/src/lib/apiTypes.ts`.
 - **CLI**: `api/cmd/uzi/` admin usage table and JSON; update the admin usage section of `docs/cli.md` and run `task docs:sync`.
-- **Mock mode**: `getAdminUsage` in `web/src/mocks/mockApi/runs.ts:598` returns the new fields.
+- **Mock mode**: `getAdminUsage` in `web/src/mocks/mockApi/runs.ts` returns the new fields.
 - **Web**: one column in #3881's `ByUserTable`, hidden on absence.
 
 ## Testing decisions
