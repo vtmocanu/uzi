@@ -69,7 +69,7 @@ func issueBaseline(frozenText string, cur currentIssue) (baseline string, compos
 
 // readCurrentSemanticIssue reads the run's own issue with a bounded deadline. A
 // forge error never fails the observation: it becomes an explicit unknown reason.
-func readCurrentSemanticIssue(ctx context.Context, f forge.Forge, projectID, iid int64) currentIssue {
+func readCurrentSemanticIssue(ctx context.Context, f forge.IssueTracker, projectID, iid int64) currentIssue {
 	ctx, cancel := context.WithTimeout(ctx, semanticIssueReadTimeout)
 	defer cancel()
 	issue, err := f.GetIssue(ctx, projectID, iid)

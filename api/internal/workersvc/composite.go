@@ -147,7 +147,8 @@ func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, pro
 		}
 	}
 
-	created, err := f.CreateIssue(ctx, repo.ForgeProjectID, claim.Title, claim.Description, labels)
+	var tr forge.IssueTracker = f
+	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, claim.Title, claim.Description, labels)
 	if err != nil {
 		s.revertProposal(ctx, propID)
 		// err is already PAT-redacted by the driver.
