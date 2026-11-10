@@ -666,25 +666,36 @@ for (const half of ["signal", "deadline", "budget"] as const) {
 it("#3851 an absolute deadline option that expires during a local stop is partial without a shortfall (interruption path)", async () => {
   const [entry] = attempts(1);
   fs.mkdirSync(entry!.clonePath, { recursive: true });
+  const deadline = Date.now() + 600_000;
+  const realNow = Date.now.bind(Date);
+  let targetOpens = 0;
+  mock.method(Date, "now", () => targetOpens ? deadline + 1 : realNow());
   mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
-    if (args[0] === entry!.clonePath) { await new Promise<void>(r => setTimeout(r, 400)); throw codedError("EACCES"); }
+    if (args[0] === entry!.clonePath) { targetOpens++; throw codedError("EACCES"); }
     throw new Error("unexpected opendir");
   });
-  const result = await inspect({ epoch: true, deadline: Date.now() + 250 });
+  const result = await inspect({ epoch: true, deadline, now: () => 0, budgetMs: 600_000 });
+  assert.equal(targetOpens, 1, "the target opendir reached the interruption catch");
   assert.equal(result.partial, true);
-  for (const source of result.sources) for (const part of source.sources) assert.ok(!("measurementShortfall" in part));
+  const parts = result.sources.flatMap(source => source.sources);
+  assert.equal(parts.length, 1);
+  assert.ok(!("measurementShortfall" in parts[0]!));
 });
 it("#3851 an aborted signal during a local stop is partial without a shortfall (interruption path)", async () => {
   const [entry] = attempts(1);
   fs.mkdirSync(entry!.clonePath, { recursive: true });
   const stop = new AbortController();
+  let targetOpens = 0;
   mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
-    if (args[0] === entry!.clonePath) { stop.abort(); throw codedError("EACCES"); }
+    if (args[0] === entry!.clonePath) { targetOpens++; stop.abort(); throw codedError("EACCES"); }
     throw new Error("unexpected opendir");
   });
   const result = await inspect({ epoch: true, signal: stop.signal });
+  assert.equal(targetOpens, 1, "the target opendir reached the interruption catch");
   assert.equal(result.partial, true);
-  for (const source of result.sources) for (const part of source.sources) assert.ok(!("measurementShortfall" in part));
+  const parts = result.sources.flatMap(source => source.sources);
+  assert.equal(parts.length, 1);
+  assert.ok(!("measurementShortfall" in parts[0]!));
 });
 
 for (const [limits, key] of [
