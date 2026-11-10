@@ -435,13 +435,46 @@ function drain(dirFd, limit, spend, skip, each, onFirst) {
  * pinned; phase `listed` pauses after the leaf's first batch of names was read and before
  * any child in it is pinned; phase `emptied` pauses after a child directory was emptied and
  * before it is `rmdir`ed through its parent.
+ *
+ * Issue #4043 STRICT scratch mode: three trailing arguments after `<sync> <phase>` (`<sync>` may be
+ * the empty string, which turns the seams off): `<rootExpect> <oneFs> <maxDepth>`. Absent (every
+ * caller above), the script behaves exactly as described so far. `<rootExpect>` (`<dev>:<ino>`, or
+ * `""`/`-` for none) is compared with the pinned `<home>` right after it is pinned (exit 3 on a
+ * mismatch). `<oneFs>` `1` selects strict mode (only with `remove`, a single-component `<rel>`, a
+ * `<dev>:<ino>` `<expect>`, a `<rootExpect>` and a `<maxDepth>`; anything else exits 6):
+ *  - every directory pinned during the walk must be on the root's st_dev; another one is skipped
+ *    (neither entered nor removed) and the script ends with exit 9;
+ *  - before each descendant `rmdir` the name is re-pinned `O_NOFOLLOW` and its dev:ino compared with
+ *    the pin taken before descending; a mismatch keeps it (exit 3 at the end). A swap that lands
+ *    between that comparison and the `rmdir` can at worst remove an empty directory planted there;
+ *  - nothing is chmodded (no re-owning): an entry that cannot be opened or emptied is left (exit 4);
+ *  - the top-level leaf pin and its parent pin stay open until the script ends;
+ *  - descending beyond `<maxDepth>` stops (the directory is kept) and ends with exit 8;
+ *  - receipt: it prints `UZI-SCRATCH-REMOVED <dev>:<ino>` (the `<expect>`) and exits 0 ONLY IF this
+ *    process's own final `rmdir` of the name succeeded after the name pinned `<expect>`, AND the
+ *    still-open leaf pin then reports `<expect>` with `st_nlink` 0. A failed `rmdir` (ENOENT
+ *    included, e.g. another actor removed the emptied original) never prints one. Without a receipt
+ *    the exit is 4 when the original is still linked at its name, else 3.
+ * When several apply, the exit code precedence is 3 > 9 > 8 > 4. The extra test-only seam phases
+ * `rechecked` (after the descendant re-pin comparison, before its `rmdir`) and `final` (after the
+ * name pinned `<expect>`, before the final `rmdir`) exist only with a non-empty `<sync>`.
  */
-const PINNED_SUBTREE_SCRIPT = `${PINNED_PRELUDE}${STREAM_PRELUDE}
-const [home, rel, maxArg, budgetArg, mode = "remove", expect = "-", sync, phase = "pinned"] = process.argv.slice(1);
+export const PINNED_SUBTREE_SCRIPT = `${PINNED_PRELUDE}${STREAM_PRELUDE}
+const [home, rel, maxArg, budgetArg, mode = "remove", expect = "-", sync, phase = "pinned",
+  rootExpect = "", oneFs = "", maxDepthArg = ""] = process.argv.slice(1);
 const maxEntries = Number(maxArg);
 const budgetMs = Number(budgetArg);
 if (!home || !home.startsWith("/") || !rel || !(maxEntries >= 0) || !(budgetMs >= 0)) process.exit(6);
 if (mode !== "remove" && mode !== "empty") process.exit(6);
+if (oneFs !== "" && oneFs !== "1") process.exit(6);
+const strict = oneFs === "1";
+const maxDepth = strict ? Number(maxDepthArg) : Infinity;
+if (strict && (mode !== "remove" || rel.includes("/") || !/^\\d+:\\d+$/.test(expect) || !/^\\d+:\\d+$/.test(rootExpect) ||
+    !(Number.isInteger(maxDepth) && maxDepth >= 0))) process.exit(6);
+let rootDev;
+let changed = false;
+let devSkipped = false;
+let depthHit = false;
 const deadline = Date.now() + budgetMs;
 let readCount = 0;
 let exhausted = false;
@@ -464,6 +497,11 @@ let parentFd;
 let leafPin;
 try {
   leafPin = fs.openSync(home, PIN);
+  if (rootExpect !== "" && rootExpect !== "-") {
+    const rootSt = fs.fstatSync(leafPin, { bigint: true });
+    if (rootSt.dev + ":" + rootSt.ino !== rootExpect) process.exit(3);
+    rootDev = rootSt.dev;
+  }
   for (const part of parts) {
     if (parentFd !== undefined) fs.closeSync(parentFd);
     parentFd = leafPin;
@@ -476,11 +514,12 @@ if (expect !== "-") {
   const st = fs.fstatSync(leafPin, { bigint: true });
   if (st.dev + ":" + st.ino !== expect) process.exit(3);
 }
+if (strict && fs.fstatSync(leafPin, { bigint: true }).dev !== rootDev) process.exit(9);
 const leafName = parts[parts.length - 1];
 const uid = process.getuid();
 function openOwned(pinFd) {
   const st = fs.fstatSync(pinFd);
-  if (st.uid === uid && (st.mode & 0o700) !== 0o700) {
+  if (!strict && st.uid === uid && (st.mode & 0o700) !== 0o700) {
     try { fs.chmodSync(FD + pinFd, (st.mode & 0o7777) | 0o700); } catch {}
   }
   return reopen(pinFd);
@@ -491,11 +530,12 @@ pause("pinned");
 const BATCH = 256;
 const gone = (err) => err.code === "ENOENT";
 // Remove one entry of the directory pinned at dirFd; true when its name is gone.
-function removeEntry(dirFd, e) {
+function removeEntry(dirFd, e, depth) {
   const p = at(dirFd, e.name);
   if (!e.isDir) {
     try { fs.unlinkSync(p); return true; } catch (err) { return gone(err); }
   }
+  if (depth + 1 > maxDepth) { depthHit = true; return false; }
   let pin;
   try { pin = fs.openSync(p, PIN); } catch (err) {
     // Swapped for a symlink or file since it was listed: remove that entry, never follow it.
@@ -504,11 +544,39 @@ function removeEntry(dirFd, e) {
     }
     return gone(err);
   }
+  let pinId;
+  if (strict) {
+    try {
+      const st = fs.fstatSync(pin, { bigint: true });
+      if (st.dev !== rootDev) { fs.closeSync(pin); devSkipped = true; return false; }
+      pinId = st.dev + ":" + st.ino;
+    } catch { fs.closeSync(pin); changed = true; return false; }
+  }
   let childFd;
   try { childFd = openOwned(pin); } catch { return false; } finally { fs.closeSync(pin); }
-  try { emptyDir(childFd, false); } finally { fs.closeSync(childFd); }
+  try { emptyDir(childFd, false, depth + 1); } finally { fs.closeSync(childFd); }
   if (exhausted) return false;
   pause("emptied");
+  if (strict) {
+    // Re-pin the name: it must still be the directory that was emptied.
+    try {
+      const again = fs.openSync(p, PIN);
+      let same;
+      try { const st = fs.fstatSync(again, { bigint: true }); same = st.dev + ":" + st.ino === pinId; }
+      finally { fs.closeSync(again); }
+      if (!same) { changed = true; return false; }
+    } catch (err) {
+      if (gone(err)) return true;
+      changed = true;
+      return false;
+    }
+    pause("rechecked");
+    try { fs.rmdirSync(p); return true; } catch (err) {
+      // A swap to a file after the comparison: kept, never unlinked.
+      if (err.code === "ENOTDIR") changed = true;
+      return gone(err);
+    }
+  }
   try { fs.rmdirSync(p); return true; } catch (err) {
     // Swapped for a symlink or file while it was being emptied: unlink that entry itself.
     if (err.code === "ENOTDIR") {
@@ -517,22 +585,52 @@ function removeEntry(dirFd, e) {
     return gone(err);
   }
 }
-function emptyDir(dirFd, isLeaf) {
+function emptyDir(dirFd, isLeaf, depth) {
   const stuck = new Set();
   drain(dirFd, BATCH, spend, stuck, (batch) => {
     let removed = 0;
     for (const e of batch) {
-      if (removeEntry(dirFd, e)) removed++;
+      if (removeEntry(dirFd, e, depth)) removed++;
       else stuck.add(e.name);
     }
     return removed;
   }, isLeaf ? () => pause("listed") : undefined);
 }
-emptyDir(leafFd, true);
+emptyDir(leafFd, true, 0);
 if (mode === "empty") {
   let left;
   try { left = readSome(leafFd, 1, new Set(), () => true).length; } catch { left = 1; }
   process.exit(exhausted ? 8 : left === 0 ? 0 : 4);
+}
+if (strict) {
+  // The leaf pin and its parent pin stay open to the end: the receipt reads the pin's st_nlink.
+  fs.closeSync(leafFd);
+  if (changed) process.exit(3);
+  if (devSkipped) process.exit(9);
+  if (exhausted || depthHit) process.exit(8);
+  const linked = () => {
+    try {
+      const fd = fs.openSync(at(parentFd, leafName), PIN);
+      const st = fs.fstatSync(fd, { bigint: true });
+      fs.closeSync(fd);
+      return st.dev + ":" + st.ino === expect ? "pinned" : "other";
+    } catch (e) {
+      return e.code === "ENOENT" ? "gone" : "other";
+    }
+  };
+  let ours = false;
+  if (linked() === "pinned") {
+    pause("final");
+    try { fs.rmdirSync(at(parentFd, leafName)); ours = true; } catch {}
+  }
+  if (ours) {
+    const st = fs.fstatSync(leafPin, { bigint: true });
+    if (st.dev + ":" + st.ino === expect && st.nlink === 0n) {
+      fs.writeSync(1, "UZI-SCRATCH-REMOVED " + expect + "\\n");
+      process.exit(0);
+    }
+  }
+  process.exit(linked() === "pinned" ? 4 : 3);
 }
 const pinned = fs.fstatSync(leafPin);
 fs.closeSync(leafFd);
@@ -1811,6 +1909,10 @@ export async function runAgentHelper(
     } else child.stdin?.end(input);
   });
 }
+
+/** Issue #4043: the constants the strict scratch delete (PINNED_SUBTREE_SCRIPT, `<oneFs>` 1) is
+ * launched with; the launch validator in git.ts admits exactly these. */
+export const SCRATCH_DELETE_LIMITS = { maxEntries: 2_000_000, budgetMs: 300_000, maxDepth: 256, killSlackMs: HELPER_SLACK_MS } as const;
 
 /** Caps the scratch census helper enforces. */
 const SCRATCH_CENSUS_LIMITS = { rootEntries: 4096, leafEntries: 200_000, totalEntries: 2_000_000, depth: 256 } as const;

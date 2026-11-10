@@ -30,8 +30,8 @@ import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { processGroupAlive } from "./tick-spawner.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
-import { rmRunnerTeardownTree } from "./rmtree.js";
-import { absorbBareConfigValue, newPathSink, readProtectedStores, type ProtectedPathsRead } from "./pod-epoch-scratch.js";
+import { PINNED_SUBTREE_SCRIPT, SCRATCH_DELETE_LIMITS, TREE_NAME_RE, censusScratchRoot, rmRunnerTeardownTree } from "./rmtree.js";
+import { absorbBareConfigValue, classifyScratchSettlement, newPathSink, parseScratchCensus, postCensusOf, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
@@ -2902,6 +2902,47 @@ const RETENTION_RM_TIMEOUT_MS = 120_000;
  *  pipe shut: every holder of it gone) before declaring the rm possibly still alive. */
 const RETENTION_RM_CLOSE_WAIT_MS = 10_000;
 
+/** Issue #4043: what {@link GitCache}'s shared epoch spawn-and-join core reports. The ticket is
+ *  still pending in every variant; settling it is the caller's decision. */
+export type JoinedEpochChild =
+  | { joined: true; spawned: true; ticket: { settle(): void }; code: number | null; signal: NodeJS.Signals | null;
+      stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer; failure: unknown }
+  | { joined: true; spawned: false; ticket: { settle(): void }; failure: unknown };
+
+/** Issue #4043: one admitted scratch leaf to delete (see {@link GitCache.discardEpochScratchLeaf}). */
+export interface EpochScratchDiscardInput {
+  scope: PodEpochReclaimScope;
+  root: "/data/runner/.tmp/uzi-runner" | "/data/runner/.tmp";
+  /** A top-level scratch name that matches TREE_NAME_RE. */
+  name: string;
+  /** The admitted leaf's `<dev>:<ino>`. */
+  expect: string;
+  /** The pinned root's `<dev>:<ino>`. */
+  rootExpect: string;
+  /** Allocated bytes the caller's pre-delete re-census revalidated; reported as removed bytes. */
+  bytes: number;
+  signal: AbortSignal;
+  deadline: number;
+  /** The explicit pre-launch observation (the caller's proofs). It runs before anything else. */
+  beforeLaunch: () => Promise<void>;
+  /** True when the root still pins to `rootExpect` with its layout owner and mode. */
+  rootRepin: () => boolean;
+  /** True when the mount rules still hold (re-read by the caller). */
+  mountsOk: () => boolean;
+  /** Hermetic tests only; production code never passes it (see EPOCH_SCRATCH_TEST_SEAM). */
+  testSeam?: {
+    token: symbol;
+    /** A temp root instead of the two literal ones. */
+    root?: string;
+    census?: (root: string, rootExpect: string, leaf: string, timeoutMs: number) => Promise<{ code: number; stdout: string }>;
+    /** Called between the join and the classification. */
+    onClassify?: () => void;
+  };
+}
+const EPOCH_SCRATCH_TEST_SEAM = Symbol.for("uzi.test.pod-epoch-scratch.delete-seam");
+const EPOCH_SCRATCH_ROOTS: ReadonlySet<string> = new Set(["/data/runner/.tmp/uzi-runner", "/data/runner/.tmp"]);
+const EPOCH_SCRATCH_CENSUS_TIMEOUT_MS = 30_000;
+
 /**
  * issue #1783 — the runner-uid delete timed out and its rm could NOT be shown gone: the child's
  * 'close' did not arrive within {@link RETENTION_RM_CLOSE_WAIT_MS} after the group kill, whether
@@ -3665,15 +3706,52 @@ export class GitCache {
     }
     assertNoCredentialedGitWhileQuarantined(options.env);
     MaintenanceResources.consumeIfActive("launches", 1);
-    const ticket = state.scope.beginMutation();
+    const joined = await this.spawnJoinedEpochChild(state.scope, command, args, {
+      env: options.env, cwd: options.cwd, timeout: options.timeout, maxBuffer: options.maxBuffer, input: options.input,
+      bytes: options.bytes, encoding: options.encoding, identity,
+      signals: [state.signal, ...(signal ? [signal] : [])], deadline: state.deadline,
+    });
+    if (!joined.spawned) { state.scope.stop(); throw joined.failure; }
+    if (state.scope.stopped()) throw new Error("epoch native scope stopped");
+    joined.ticket.settle();
+    const { failure, code } = joined;
+    const result = { stdout: joined.stdout, stderr: joined.stderr,
+      ...(options.bytes ? { stdoutBytes: joined.stdoutBytes, stderrBytes: joined.stderrBytes } : {}) };
+    if (failure || code !== 0) throw Object.assign(
+      failure instanceof Error ? failure : new Error(result.stderr || "git subprocess failed"),
+      result, { ...(failure && typeof failure === "object" && "code" in failure ? {} : { code }),
+        epochProcessJoined: true, ...(joined.signal ? { signal: joined.signal } : {}) });
+    this.checkRecoveryInterruption();
+    MaintenanceResources.checkIfActive();
+    return result;
+  }
+
+  /**
+   * Issue #4043: the shared spawn-and-join core of every epoch native child. It takes the mutation
+   * ticket, inherits the scope's descriptor, spawns detached, and joins exit, close, both output
+   * streams and process-group absence. It NEVER settles the ticket: the caller does, once it has
+   * judged the outcome (execEpochNative right away, the scratch delete only after classification).
+   * Any joined outcome (a non-zero exit, a signal, an abort, a timeout that was killed and joined)
+   * returns `{ joined: true, spawned: true }`; a spawn that throws before a child exists returns
+   * `{ joined: true, spawned: false }` and the caller decides whether that stops the scope. An
+   * unconfirmed join stops the scope and throws with `epochProcessJoined: false`.
+   */
+  private async spawnJoinedEpochChild(
+    scope: PodEpochReclaimScope, command: string, args: string[],
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer;
+      bytes?: true; encoding?: "latin1"; identity: BoundaryProcessRequest["identity"];
+      signals: readonly AbortSignal[]; deadline: number },
+  ): Promise<JoinedEpochChild> {
+    const identity = options.identity;
+    const ticket = scope.beginMutation();
     const deps = this.epochNativeTestDependencies;
     let child: ChildProcess;
     try {
-      const stdio = state.scope.inheritStdio(["pipe", "pipe", "pipe"]);
+      const stdio = scope.inheritStdio(["pipe", "pipe", "pipe"]);
       child = (deps?.spawn ?? spawn)(command, args, {
         env: options.env, cwd: options.cwd, detached: true, stdio,
       });
-    } catch (error) { state.scope.stop(); throw error; }
+    } catch (error) { return { joined: true, spawned: false, ticket, failure: error }; }
     const pid = child.pid;
     const alive = () => {
       if (!Number.isSafeInteger(pid) || pid! <= 0) throw new Error("epoch process group unknown");
@@ -3710,7 +3788,7 @@ export class GitCache {
           if (Date.now() >= joinedUntil) throw new Error("epoch native group or IO join unconfirmed");
           await new Promise<void>(resolve => setTimeout(resolve, 10));
         }
-      } catch (error) { state.scope.stop(); throw error; }
+      } catch (error) { scope.stop(); throw error; }
     })();
     let notifyCleanup!: () => void;
     const cleanupStarted = new Promise<void>(resolve => { notifyCleanup = resolve; });
@@ -3719,7 +3797,7 @@ export class GitCache {
     const io: Promise<unknown>[] = [];
     for (const name of ["stdout", "stderr"] as const) {
       const source = child[name];
-      if (!source) { state.scope.stop(); fail(new Error("epoch native output missing")); continue; }
+      if (!source) { scope.stop(); fail(new Error("epoch native output missing")); continue; }
       const joinedSource = finished(source);
       void joinedSource.catch(() => undefined);
       io.push(joinedSource);
@@ -3742,38 +3820,34 @@ export class GitCache {
       output.on("error", fail);
     }
     // stdin EPIPE remains an ordinary child outcome; child close joins its handle.
-    if (!child.stdin) { state.scope.stop(); fail(new Error("epoch native input missing")); }
+    if (!child.stdin) { scope.stop(); fail(new Error("epoch native input missing")); }
     else {
       child.stdin.on("error", () => undefined);
       try { child.stdin.end(options.input); }
-      catch (error) { state.scope.stop(); fail(error); }
+      catch (error) { scope.stop(); fail(error); }
     }
     void Promise.all(io).then(() => { ioJoined = io.length >= 2; }, fail);
     child.once("exit", value => { direct = true; code = value; clean(); });
     child.once("error", error => { direct = true; fail(error); });
     child.once("close", () => { closed = true; });
-    const abortSignal = AbortSignal.any([state.signal, ...(signal ? [signal] : [])]);
+    const abortSignal = AbortSignal.any([...options.signals]);
     const abort = () => fail(abortSignal.reason ?? new Error(GIT_OUTPUT_ABORT_MESSAGE));
     abortSignal.addEventListener("abort", abort, { once: true });
-    const timeout = Math.max(1, Math.min(options.timeout ?? Infinity, state.deadline - Date.now()));
+    const timeout = Math.max(1, Math.min(options.timeout ?? Infinity, options.deadline - Date.now()));
     const timer = setTimeout(() => fail(Object.assign(new Error("git subprocess timed out"), { killed: true })), timeout);
     if (abortSignal.aborted) abort();
     try {
       await cleanupStarted;
-      await cleanup;
-      if (state.scope.stopped()) throw new Error("epoch native scope stopped");
-      ticket.settle();
+      try { await cleanup; }
+      catch (error) {
+        if (error !== null && typeof error === "object") Object.assign(error, { epochProcessJoined: false });
+        throw error;
+      }
       const stdoutBytes = Buffer.concat(chunks.stdout);
       const stderrBytes = Buffer.concat(chunks.stderr);
-      const result = { stdout: stdoutBytes.toString(options.encoding), stderr: stderrBytes.toString(),
+      return { joined: true, spawned: true, ticket, code, signal: child.signalCode, failure,
+        stdout: stdoutBytes.toString(options.encoding), stderr: stderrBytes.toString(),
         ...(options.bytes ? { stdoutBytes, stderrBytes } : {}) };
-      if (failure || code !== 0) throw Object.assign(
-        failure instanceof Error ? failure : new Error(result.stderr || "git subprocess failed"),
-        result, { ...(failure && typeof failure === "object" && "code" in failure ? {} : { code }),
-          epochProcessJoined: true, ...(child.signalCode ? { signal: child.signalCode } : {}) });
-      this.checkRecoveryInterruption();
-      MaintenanceResources.checkIfActive();
-      return result;
     } finally {
       clearTimeout(timer);
       abortSignal.removeEventListener("abort", abort);
@@ -3833,6 +3907,105 @@ export class GitCache {
         ticket.settle();
       }
     }
+  }
+
+  /**
+   * Issue #4043: the fixed argv the strict scratch delete may launch. Exactly
+   * `runnerCommand(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, <root>, <TREE_NAME_RE name>, <max>,
+   * <budget>, "remove", <dev:ino>, "", "pinned", <dev:ino>, "1", <depth>])` with env `{ PATH }`, cwd `/`
+   * and identity `command`; `root` is one of the two literal roots (or the test seam's). Equality with
+   * `runnerCommand`'s own wrapper is the group-identity check of execEpochNative: the command is the
+   * setpriv wrapper exactly when the uid split is active.
+   */
+  private validateEpochScratchLaunch(command: string, args: readonly string[], env: NodeJS.ProcessEnv,
+    cwd: string | undefined, identity: BoundaryProcessRequest["identity"], seamRoot?: string): void {
+    const refuse = (): never => { throw new Error("epoch scratch launch unaudited"); };
+    const wrap = runnerCommand(process.execPath, []);
+    if (command !== wrap.command || identity !== "command" || cwd !== "/") return refuse();
+    const keys = Object.keys(env);
+    if (keys.length !== 1 || keys[0] !== "PATH" || env.PATH !== "/usr/bin:/bin") return refuse();
+    if (args.length !== wrap.args.length + 13 || !wrap.args.every((arg, i) => args[i] === arg)) return refuse();
+    const [dash, script, root, name, max, budget, mode, expect, sync, phase, rootExpect, oneFs, depth] = args.slice(wrap.args.length);
+    const lim = SCRATCH_DELETE_LIMITS;
+    const pair = /^\d+:\d+$/;
+    if (dash !== "-e" || script !== PINNED_SUBTREE_SCRIPT ||
+        !(EPOCH_SCRATCH_ROOTS.has(root!) || seamRoot !== undefined && root === seamRoot) ||
+        !TREE_NAME_RE.test(name!) || max !== String(lim.maxEntries) || budget !== String(lim.budgetMs) ||
+        mode !== "remove" || !pair.test(expect!) || sync !== "" || phase !== "pinned" || !pair.test(rootExpect!) ||
+        oneFs !== "1" || depth !== String(lim.maxDepth)) return refuse();
+  }
+
+  /**
+   * Issue #4043: delete one admitted scratch leaf through the strict PINNED_SUBTREE_SCRIPT mode and
+   * classify what happened before anything is settled. It never enters preflightEpochNative, the
+   * epochNative store, beginDestructive or a slot. Order: the argv validator, the caller's explicit
+   * pre-launch observation, scope liveness, the `unsettledDeletes` entry, then the shared spawn/join
+   * core (ticket pending); classification re-pins the root, re-checks the mounts (both caller
+   * callbacks) and re-censuses the leaf NAME as the runner, then maps it with
+   * classifyScratchSettlement. Only a settled outcome (`removed` or `residue`) removes the entry and
+   * then settles the ticket; anything else stops the scope, leaves both pending and throws an error
+   * carrying `epochScratchUnresolved: true`.
+   */
+  async discardEpochScratchLeaf(input: EpochScratchDiscardInput): Promise<Settlement> {
+    const seam = input.testSeam;
+    if (seam !== undefined && seam.token !== EPOCH_SCRATCH_TEST_SEAM) throw new Error("epoch scratch test seam refused");
+    const scope = input.scope;
+    if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped"]
+      .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function") ||
+      typeof input.beforeLaunch !== "function" || typeof input.rootRepin !== "function" ||
+      typeof input.mountsOk !== "function" || !(input.signal instanceof AbortSignal) ||
+      !Number.isFinite(input.deadline) || !Number.isSafeInteger(input.bytes) || input.bytes < 0)
+      throw new Error("epoch scratch delete input refused");
+    const root = seam?.root ?? input.root;
+    const wrapped = runnerCommand(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, root, input.name,
+      String(SCRATCH_DELETE_LIMITS.maxEntries), String(SCRATCH_DELETE_LIMITS.budgetMs), "remove", input.expect, "",
+      "pinned", input.rootExpect, "1", String(SCRATCH_DELETE_LIMITS.maxDepth)]);
+    const env = { PATH: "/usr/bin:/bin" };
+    this.validateEpochScratchLaunch(wrapped.command, wrapped.args, env, "/", "command", seam?.root);
+    await input.beforeLaunch();
+    input.signal.throwIfAborted();
+    if (Date.now() >= input.deadline) throw new Error("epoch scratch delete deadline exhausted");
+    scope.assertExclusive();
+    if (scope.stopped()) throw new Error("epoch scratch delete stopped");
+    const key = path.resolve(root, input.name);
+    this.unsettledDeletes.set(key, (this.unsettledDeletes.get(key) ?? 0) + 1);
+    const unresolved = (cause?: unknown): never => {
+      scope.stop();
+      throw Object.assign(new Error("epoch scratch delete unresolved"),
+        { epochScratchUnresolved: true, ...(cause === undefined ? {} : { cause }) });
+    };
+    let joined: JoinedEpochChild;
+    try {
+      joined = await this.spawnJoinedEpochChild(scope, wrapped.command, wrapped.args, {
+        env, cwd: "/", timeout: SCRATCH_DELETE_LIMITS.budgetMs + SCRATCH_DELETE_LIMITS.killSlackMs,
+        identity: "command", signals: [input.signal], deadline: input.deadline,
+      });
+    } catch (error) { return unresolved(error); }
+    let settlement: Settlement;
+    try {
+      seam?.onClassify?.();
+      if (scope.stopped()) return unresolved();
+      const rootRepinOk = input.rootRepin();
+      const mountsOk = input.mountsOk();
+      const census = await (seam?.census ?? censusScratchRoot)(root, input.rootExpect, input.name, EPOCH_SCRATCH_CENSUS_TIMEOUT_MS);
+      const parsed = parseScratchCensus(census, input.rootExpect);
+      const postCensus = "refused" in parsed ? { state: "unreadable" as const }
+        : postCensusOf(parsed.entries.find(e => e.name === input.name), input.expect);
+      // A failure (abort, timeout, output overrun) means the exit and output are not the helper's verdict.
+      const ran = joined.spawned && !joined.failure ? joined : undefined;
+      settlement = classifyScratchSettlement({
+        joined: joined.joined, spawned: joined.spawned,
+        code: ran ? ran.code : null, signal: joined.spawned ? joined.signal : null,
+        stdout: ran ? ran.stdout : "", expect: input.expect, rootRepinOk, mountsOk, postCensus, bytesBefore: input.bytes,
+      });
+      if (scope.stopped()) return unresolved();
+    } catch (error) { return unresolved(error); }
+    if (settlement.outcome === "unresolved") return unresolved();
+    const pending = (this.unsettledDeletes.get(key) ?? 1) - 1;
+    if (pending > 0) this.unsettledDeletes.set(key, pending);
+    else this.unsettledDeletes.delete(key);
+    joined.ticket.settle();
+    return settlement;
   }
 
   /**
