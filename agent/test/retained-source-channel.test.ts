@@ -1311,6 +1311,43 @@ describe("local-records and resolve-local-record: request parsing", () => {
     assert.equal(rig.events.some((e) => e.startsWith("gate_")), false);
   });
 
+  it("action: only the string case_b is legal, and only on resolve-local-record", async () => {
+    const rig = await rigOf();
+    const bad: unknown[] = [
+      resolveReq({ action: "case_a" }),
+      resolveReq({ action: "CASE_B" }),
+      resolveReq({ action: "" }),
+      resolveReq({ action: "case_b " }),
+      resolveReq({ action: true }),
+      resolveReq({ action: 1 }),
+      resolveReq({ action: null }),
+      resolveReq({ action: undefined, extra: 1 }),
+      resolveReq({ action: ["case_b"] }),
+      resolveReq({ action: { kind: "case_b" } }),
+      resolveReq({ action: "case_b", extra: 1 }),
+      { op: "local-records", run: "run-lr", action: "case_b" },
+      { op: "local-records", run: "run-lr", action: null },
+    ];
+    for (const req of bad) {
+      const r = await send(rig.sock, req);
+      assert.equal(r.ok, false, JSON.stringify(req));
+      assert.equal(r.error, "invalid_request", JSON.stringify(req));
+    }
+    assert.equal(rig.describeCalls.length + rig.resolveCalls.length, 0);
+    assert.equal(rig.events.some((e) => e.startsWith("gate_")), false);
+  });
+
+  it("action case_b is passed through to the runner port; an absent action is omitted, not undefined", async () => {
+    const rig = await rigOf();
+    const withAction = await send(rig.sock, resolveReq({ action: "case_b" }));
+    assert.equal(withAction.ok, true, JSON.stringify(withAction));
+    const without = await send(rig.sock, resolveReq());
+    assert.equal(without.ok, true, JSON.stringify(without));
+    assert.equal(rig.resolveCalls.length, 2);
+    assert.equal(rig.resolveCalls[0]!.action, "case_b");
+    assert.equal(Object.prototype.hasOwnProperty.call(rig.resolveCalls[1]!, "action"), false);
+  });
+
   it("accepts local-records without an attempt, with the longest allowed run id", async () => {
     const rig = await rigOf();
     const r = await send(rig.sock, { op: "local-records", run: "A".repeat(128) });

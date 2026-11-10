@@ -150,6 +150,37 @@ describe("the documented invocation", { skip: ENV_SKIP }, () => {
     ]);
   });
 
+  it("--case-b adds action case_b to resolve-local-record only (issue #3885)", async () => {
+    const { sock, requests } = await fixtureServer(() => '{"ok":true}\n');
+    const digest = "ab".repeat(32);
+    const a = documented(["resolve-local-record", "--run", "run-1", "--generation", "3", "--confirm", digest, "--case-b", "--socket", sock]);
+    assert.equal((await run(a.command, a.args, process.env)).code, 0);
+    const b = documented(["resolve-local-record", "--case-b", "--run", "run-1", "--generation", "3", "--confirm", digest, "--socket", sock]);
+    assert.equal((await run(b.command, b.args, process.env)).code, 0);
+    assert.deepEqual(requests.map((l) => JSON.parse(l)), [
+      { op: "resolve-local-record", run: "run-1", generation: 3, confirm: digest, action: "case_b" },
+      { op: "resolve-local-record", run: "run-1", generation: 3, confirm: digest, action: "case_b" },
+    ]);
+  });
+
+  it("rejects --case-b on local-records, inspect and discard, and with a value, with exit 2 and no connection", async () => {
+    const { sock, requests } = await fixtureServer(() => '{"ok":true}\n');
+    const digest = "ab".repeat(32);
+    const base = ["resolve-local-record", "--run", "r", "--generation", "1", "--confirm", digest];
+    for (const bad of [
+      ["local-records", "--run", "r", "--case-b"],
+      ["inspect", "--case-b"],
+      ["discard", "--run", "r", "--generation", "1", "--attempt", "canonical", "--confirm", digest, "--case-b"],
+      [...base, "--case-b", "yes"],
+      [...base, "--case-b", "case_b"],
+      [...base, "--case-b=true"],
+    ]) {
+      const { command, args } = documented([...bad, "--socket", sock]);
+      assert.equal((await run(command, args, process.env)).code, 2, JSON.stringify(bad));
+    }
+    assert.equal(requests.length, 0);
+  });
+
   it("rejects malformed local-record command lines with exit 2 and no connection", async () => {
     const { sock, requests } = await fixtureServer(() => '{"ok":true}\n');
     const digest = "ab".repeat(32);

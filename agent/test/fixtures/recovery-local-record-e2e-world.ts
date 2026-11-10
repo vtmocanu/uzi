@@ -59,6 +59,8 @@ export class E2EClient {
   allowFinal = false;
   runStatus = "completed";
   posts: Post[] = [];
+  /** Every api WRITE the coordinator attempted (reserve, upload, release, held publication), in order: a Case B disposition makes none. */
+  writes: string[] = [];
   /** Late-bound: the coordinator's authenticated view of a run's records (set once the runner exists). */
   records: (runId: string) => Promise<RecoveryRecord[]> = async () => [];
   hasFeature = (): boolean => true;
@@ -77,9 +79,11 @@ export class E2EClient {
     return { run_id: runId, holds, run_open_holds: { run_id: runId, count: holds.length } } as RecoveryHoldsResponse;
   }
   async reserveRecoveryCapture(): Promise<{ capture_id: string; state: "preparing" }> {
+    this.writes.push("reserve");
     return { capture_id: this.producing!.captureId, state: "preparing" };
   }
   async uploadRecoveryBundle(_run: string, _capture: string, _manifest: unknown, stream: AsyncIterable<unknown>) {
+    this.writes.push("upload");
     for await (const chunk of stream) assert.ok(chunk);
     return { capture_id: this.producing!.captureId, state: "available" as const, manifest_bound: true };
   }
@@ -89,11 +93,14 @@ export class E2EClient {
       byte_size: record?.byteSize, expires_at: "2099-01-01T00:00:00Z" };
   }
   async releaseRecoveryCustody(runId: string, generation?: number, evidence?: string, disposition?: unknown) {
+    this.writes.push("release");
     this.posts.push({ runId, generation, evidence, disposition });
     if (!this.allowFinal) throw new Error("fixture: lost FINAL ACK");
     return { run_id: runId, generation, released: true, holds_released: 1 };
   }
-  async publishHeld(): Promise<never> { throw new Error("unexpected held publication"); }
+  async publishHeld(): Promise<never> {
+    this.writes.push("publishHeld");
+    throw new Error("unexpected held publication"); }
   async getExactRecoveryHold(runId: string, generation: number): Promise<RecoveryExactHold | undefined> {
     return this.of(runId, generation)?.exact;
   }
@@ -281,6 +288,7 @@ export async function createWorld(opts: WorldOptions): Promise<World> {
     }
   }
   client.posts.length = 0;
+  client.writes.length = 0;
   client.allowFinal = true;
   for (const g of gens.values()) g.open = false;
   const gate = new DindPruneGate();
@@ -301,12 +309,14 @@ export async function createWorld(opts: WorldOptions): Promise<World> {
 }
 
 /** A path -> "mode sha256" digest of every entry under `root` (symlinks by target), for byte-equality comparisons. */
-export function treeDigest(root: string): string[] {
+export function treeDigest(root: string, skip: (rel: string) => boolean = () => false): string[] {
   const lines: string[] = [];
   const visit = (rel: string): void => {
+    if (rel !== "." && skip(rel)) return;
     const full = path.join(root, rel);
     const st = fs.lstatSync(full);
-    if (st.isSymbolicLink()) lines.push(`${rel} link ${fs.readlinkSync(full)}`);
+    if (!st.isSymbolicLink() && !st.isDirectory() && !st.isFile()) lines.push(`${rel} special`);
+    else if (st.isSymbolicLink()) lines.push(`${rel} link ${fs.readlinkSync(full)}`);
     else if (st.isDirectory()) {
       lines.push(`${rel} dir ${st.mode & 0o7777}`);
       for (const name of fs.readdirSync(full).sort()) visit(path.join(rel, name));
