@@ -1383,7 +1383,8 @@ the measured caps. PRD #3430's items above stay pending.
 `workers.epochReclaim.deletionCanaryWorkerId` defaults to `""` (off everywhere).
 It accepts empty or exactly one canonical lowercase UUID; a list, wildcard,
 uppercase, padded or non-string value fails chart rendering, and the controller
-(`UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID`) refuses to boot on it. When the ID
+(`UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID`, always a string) refuses to boot
+on a list, wildcard, uppercase or padded value. When the ID
 equals a persistent, non-isolated Docker worker's ID, the controller renders
 `UZI_EPOCH_RECLAIM_DELETION=1` into that worker's pod template only; no other
 template or spec hash changes, so only that worker rolls, through the existing
@@ -1398,9 +1399,11 @@ activation from the worker's `pod_epoch_reclaim_activation` startup line
 Clearing the selector removes the env at that worker's next replacement; it does
 not stop a pass already running and cannot restore deleted bytes. Never move the
 selector to another UUID until the prior enabled incarnation is proven gone or
-off: the old worker keeps its env until its own replacement, and a container
-restart of its existing pod would re-run the startup deletion phase (an accepted
-limit). Prerequisites, evidence and stop rules are in the
+off: the old worker keeps its env until its own replacement, so while its current
+pod has not finished its first pass, or a new pod for it starts (for example
+after an eviction), it can still attempt deletion and both workers can be enabled
+at once (an accepted limit). A same-pod restart re-runs a pass only if the first
+process died before the pod UID was durably consumed. Prerequisites, evidence and stop rules are in the
 [one-worker deletion canary checklist](../docs/run-recovery.md#one-worker-deletion-canary-checklist).
 Live enablement waits on the #3851 implementation in the deployed image and
 refreshed R9 measurements; hosted acceptance is pending.

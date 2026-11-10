@@ -2553,7 +2553,9 @@ before the clear, clear barrier uncertain) are rediscovered by the next epoch an
 either finished exactly or kept; the exact `[""]` repair repeats only the barriers.
 Authority-store slot and head write windows follow the existing store recovery: a
 transactional load finishes a slot exactly one ahead, and a read-only peek refuses.
-The full table is in [PRD #3431](../prds/3431-pod-epoch-reclaim.md).
+The full crash table, including these states, is in
+[ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md); [PRD #3431](../prds/3431-pod-epoch-reclaim.md)
+carries three rows.
 
 A verified epoch is not proof that every historical writer is gone. Its evidence
 covers the immediately preceding pod and intervening pod use, while the epoch lock
@@ -2594,7 +2596,10 @@ the chart value: hosted deletion acceptance is owner-owned and pending.
    - the replacement's identity (worker, pod and PVC);
    - its `UZI_EPOCH_RECLAIM_DELETION=1` env;
    - the `pod_epoch_reclaim_activation` line with `deletion_requested: true`. This
-     is mandatory: an old image ignores the variable and emits no line;
+     is mandatory: an old image ignores the variable and emits no line. The line
+     shows only that the opt-in was read; it is also logged on same-pod restarts
+     where no pass runs. Execution evidence is the `pod_epoch_reclaim` result of
+     a fresh epoch;
    - that unselected workers' templates are unchanged.
 
    Registration alone is not proof. Collect at least three distinct complete,
@@ -2620,8 +2625,12 @@ effects keep exclusion and refuse admission.
 **Never move the selector to another UUID until the prior enabled incarnation is
 proven gone or off.** Moving it from worker A to worker B renders B's env
 immediately, but A keeps its env until its own replacement. A busy A is only
-cordoned, and a container restart of A's existing pod would re-run its startup
-deletion phase. This is an accepted limit of the design, not a bug to work around:
+cordoned. While A's current pod has not finished its first pass, or a new pod for
+A starts (for example after an eviction or reschedule), A can still attempt
+deletion, so A and B can both be enabled at once. A same-pod container restart
+does not re-run a pass whose pod UID was already durably consumed; it re-runs
+only if the first process died before that consumption. This is an accepted
+limit of the design, not a bug to work around:
 clear the selector, confirm A has been replaced (or its activation line reads
 `deletion_requested: false`), and only then set the new ID.
 
