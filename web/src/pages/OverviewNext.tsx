@@ -37,7 +37,7 @@ import { InShellHeader } from "../components/PageHeaderSlot";
 import { Button, PageHeader } from "../components/ui";
 import { useCommandMenu } from "../components/CommandMenuContext";
 import { SearchIcon } from "../components/icons";
-import { commandShortcutLabel } from "../lib/platform";
+import { commandShortcutKeys, commandShortcutLabel } from "../lib/platform";
 
 export function OverviewNext() {
   const commandMenu = useCommandMenu();
@@ -126,7 +126,7 @@ export function OverviewNext() {
           actions={
             <>
               {commandMenu && (
-                <Button variant="secondary" size="sm" onClick={commandMenu.open} aria-keyshortcuts="Meta+K Control+K">
+                <Button variant="secondary" size="sm" onClick={commandMenu.open} aria-keyshortcuts={commandShortcutKeys()}>
                   <SearchIcon aria-hidden="true" />
                   Search
                   <kbd

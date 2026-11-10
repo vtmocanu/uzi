@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // PRD #3875 M1: the command menu, driven through the AppShell that mounts it.
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { AppShell } from "./AppShell";
 import { Modal } from "./Modal";
@@ -115,7 +115,7 @@ function renderShell(children: React.ReactNode = null, path = "/runs") {
   );
 }
 
-type KeyInit = { key?: string; code?: string; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean };
+type KeyInit = { key?: string; code?: string; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; isComposing?: boolean };
 
 // Dispatches a keydown at `target` and reports whether a handler called preventDefault.
 function press(target: EventTarget, init: KeyInit): boolean {
@@ -170,6 +170,24 @@ describe("opening by shortcut", () => {
     expect(menu()).toBeNull();
   });
 
+  it("matches the typed letter: another letter at the K position is not hijacked, a non-Latin layout still opens", async () => {
+    renderShell();
+    await screen.findByRole("link", { name: "Workers" });
+    // Colemak: the KeyK position types "e".
+    expect(press(document.body, { key: "e", code: "KeyK", ctrlKey: true })).toBe(false);
+    expect(menu()).toBeNull();
+    // Cyrillic layout: the KeyK position types a letter that is not Latin.
+    expect(press(document.body, { key: "\u043b", code: "KeyK", ctrlKey: true })).toBe(true);
+    expect(menu()).not.toBeNull();
+  });
+
+  it("ignores a composing Ctrl K", async () => {
+    renderShell();
+    await screen.findByRole("link", { name: "Workers" });
+    expect(press(document.body, { ...CTRL_K, isComposing: true } as KeyInit)).toBe(false);
+    expect(menu()).toBeNull();
+  });
+
   it("opens from inside a focused text field", async () => {
     renderShell(<input aria-label="field" />);
     const field = await screen.findByLabelText("field");
@@ -213,6 +231,22 @@ describe("opening by shortcut", () => {
   });
 });
 
+describe("sidebar active state", () => {
+  it("lights the board child, not the exact-only Repos parent, on a board route", async () => {
+    renderShell(null, "/repos/r-net/board");
+    const links = await screen.findAllByRole("link");
+    await screen.findByText("acme/network");
+    const current = (href: string) =>
+      screen
+        .getAllByRole("link")
+        .filter((a) => a.getAttribute("href") === href)
+        .map((a) => a.getAttribute("aria-current"));
+    expect(links.length).toBeGreaterThan(0);
+    expect(current("/repos/r-net/board")).toEqual(["page"]);
+    expect(current("/repos")).toEqual([null]);
+  });
+});
+
 describe("keyboard and navigation", () => {
   it("typing 'work' ranks Workers first even with a repo named acme/network; Enter navigates and closes", async () => {
     renderShell();
@@ -235,8 +269,47 @@ describe("keyboard and navigation", () => {
     fireEvent.change(input(), { target: { value: "work" } });
     expect(screen.queryByText("Go to")).toBeNull();
     fireEvent.change(input(), { target: { value: "zzzzqq" } });
-    expect(screen.getByText("No matches")).toBeTruthy();
+    expect(within(menu() as HTMLElement).getByRole("status").textContent).toBe("No matches");
+    expect(screen.getByRole("listbox").textContent).not.toContain("No matches");
     expect(input().getAttribute("aria-activedescendant")).toBeNull();
+  });
+
+  it("groups the browsing list under labelled groups and announces the result count while searching", async () => {
+    renderShell();
+    await openByShortcut();
+    await screen.findByText("Open board: acme/network");
+    expect(within(menu() as HTMLElement).getByRole("status").textContent).toBe("");
+    const groups = screen.getAllByRole("group");
+    expect(groups.map((g) => g.getAttribute("aria-labelledby")).every((id) => !!id)).toBe(true);
+    expect(screen.getByRole("group", { name: "Go to" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Actions" })).toBeTruthy();
+    fireEvent.change(input(), { target: { value: "work" } });
+    expect(screen.queryAllByRole("group")).toHaveLength(0);
+    const count = screen.getAllByRole("option").length;
+    expect(within(menu() as HTMLElement).getByRole("status").textContent).toBe(`${count} results`);
+    expect(within(menu() as HTMLElement).getByRole("status").closest('[role="listbox"]')).toBeNull();
+  });
+
+  it("keeps the highlight on the same command when repos arrive above it", async () => {
+    let resolveRepos: (v: { repos: Repo[] }) => void = () => {};
+    mockApi.listRepos.mockReturnValue(new Promise((r) => (resolveRepos = r)));
+    renderShell();
+    await openByShortcut();
+    // Only Start a chat, then Overview and Repos under Go to, so far.
+    expect(optionLabels().slice(0, 3)).toEqual(["Start a chat", "Overview", "Repos"]);
+    fireEvent.keyDown(input(), { key: "ArrowDown" });
+    fireEvent.keyDown(input(), { key: "ArrowDown" });
+    const before = screen.getAllByRole("option").find((o) => o.getAttribute("aria-selected") === "true");
+    const label = before?.querySelector("span.truncate")?.textContent;
+    expect(label).toBe("Repos");
+    await act(async () => {
+      resolveRepos({ repos: [repo("r-net", "acme/network")] });
+    });
+    await screen.findByText("Open board: acme/network");
+    const after = screen.getAllByRole("option").find((o) => o.getAttribute("aria-selected") === "true");
+    expect(after?.querySelector("span.truncate")?.textContent).toBe(label);
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect(path()).toBe("/repos");
   });
 
   it("ArrowDown then Enter runs the second item; aria-activedescendant tracks the active option", async () => {
@@ -366,13 +439,13 @@ describe("repo data in Actions", () => {
   });
 
   it("targets the loaded repo id, whatever the path says", async () => {
-    mockApi.listRepos.mockResolvedValue({ repos: [repo("r-9", "../admin")] });
+    mockApi.listRepos.mockResolvedValue({ repos: [repo("r/9 x", "../admin")] });
     renderShell();
     await openByShortcut();
     await screen.findByText("Open board: ../admin");
     fireEvent.change(input(), { target: { value: "board" } });
     fireEvent.keyDown(input(), { key: "Enter" });
-    expect(path()).toBe("/repos/r-9/board");
+    expect(path()).toBe("/repos/r%2F9%20x/board");
   });
 
   it("fetches repos once per open", async () => {
@@ -393,6 +466,16 @@ describe("repo data in Actions", () => {
     expect(optionLabels()).toContain("Start a chat");
     expect(optionLabels().some((l) => l.startsWith("Open board"))).toBe(false);
     expect(optionLabels()).toContain("Workers");
+  });
+
+  it("keeps 'Boards unavailable' outside the listbox and visible while a query is set", async () => {
+    mockApi.listRepos.mockRejectedValue(new Error("down"));
+    renderShell();
+    await openByShortcut();
+    const note = await screen.findByText("Boards unavailable");
+    expect(note.closest('[role="listbox"]')).toBeNull();
+    fireEvent.change(input(), { target: { value: "work" } });
+    expect(screen.getByText("Boards unavailable")).toBeTruthy();
   });
 });
 

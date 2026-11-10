@@ -1068,7 +1068,12 @@ export function AppShell({ children }: { children: ReactNode }) {
     if (!user) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.altKey || e.shiftKey || e.isComposing) return;
-      if (!(e.key?.toLowerCase() === "k" || e.code === "KeyK")) return;
+      // Match the typed letter, so Colemak/Dvorak users keep their own letters. The
+      // physical KeyK position is only a fallback when the layout types no Latin letter
+      // (e.g. Cyrillic), where e.key could never be "k".
+      const typed = e.key ?? "";
+      const isK = /^[a-z]$/i.test(typed) ? typed.toLowerCase() === "k" : e.code === "KeyK";
+      if (!isK) return;
       if (isApplePlatform() ? !e.metaKey || e.ctrlKey : !e.ctrlKey || e.metaKey) return;
       if (menuOpen) {
         e.preventDefault();
@@ -1396,11 +1401,13 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
       </main>
 
+      {/* The command menu (PRD #3875), mounted only while open so its repo fetch runs once
+          per open. */}
+      {menuOpen && <CommandMenu isAdmin={!!user.is_admin} onClose={() => setMenuOpen(false)} />}
       {/* The ONE changelog drawer instance (PRD #415 M2). Mounted at AppShell scope,
           not inside SidebarContent, because the sidebar renders twice; both footer
           triggers set the same state. `runningVersion` is the footer's own version
           coordinate, undefined until the shared /api/version fetch settles. */}
-      {menuOpen && <CommandMenu isAdmin={!!user.is_admin} onClose={() => setMenuOpen(false)} />}
       {changelogOpen && (
         <ChangelogDrawer
           runningVersion={build?.status === "ok" ? build.info.version : undefined}

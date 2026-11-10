@@ -8,6 +8,11 @@ export function isApplePlatform(): boolean {
   return /mac|iphone|ipad/i.test(platform);
 }
 
+// The command menu shortcut as aria-keyshortcuts names it.
+export function commandShortcutKeys(): string {
+  return isApplePlatform() ? "Meta+K" : "Control+K";
+}
+
 // The command menu shortcut as shown on the Search button.
 export function commandShortcutLabel(): string {
   return isApplePlatform() ? "⌘K" : "Ctrl K";

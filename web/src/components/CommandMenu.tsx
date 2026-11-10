@@ -91,7 +91,9 @@ export function CommandMenu({
   const optionId = (i: number) => `${uid}-opt-${i}`;
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
-  const [active, setActive] = useState(0);
+  // The active option is tracked by item id, so rows inserted above it (the repos arriving)
+  // do not shift the highlight to a different command. null: the first visible item.
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [repoState, setRepoState] = useState<RepoState>({ status: "loading" });
 
   useEffect(() => {
@@ -145,7 +147,7 @@ export function CommandMenu({
   }, [repoState, demo, isAdmin, extraItems]);
 
   const visible = useMemo(() => filterCommandItems(items, query), [items, query]);
-  const activeIndex = visible.length === 0 ? -1 : Math.min(active, visible.length - 1);
+  const activeIndex = visible.length === 0 ? -1 : Math.max(0, visible.findIndex((it) => it.id === activeId));
 
   useEffect(() => {
     if (activeIndex < 0) return;
@@ -163,7 +165,7 @@ export function CommandMenu({
       e.preventDefault();
       if (visible.length === 0) return;
       const step = e.key === "ArrowDown" ? 1 : -1;
-      setActive((activeIndex + step + visible.length) % visible.length);
+      setActiveId(visible[(activeIndex + step + visible.length) % visible.length].id);
     } else if (e.key === "Enter") {
       e.preventDefault();
       const item = visible[activeIndex];
@@ -182,10 +184,12 @@ export function CommandMenu({
       aria-selected={i === activeIndex}
       title={item.title}
       onClick={() => run(item)}
-      onMouseMove={() => setActive(i)}
+      onMouseMove={() => setActiveId(item.id)}
       className={
         "flex min-h-10 cursor-pointer items-center gap-2.5 rounded-lg px-3 py-2 text-sm " +
-        (i === activeIndex ? "bg-raised text-fg" : "text-fg")
+        // bg-raised on bg-surface is too faint alone (WCAG 1.4.11): the brand rail is the
+        // second cue.
+        (i === activeIndex ? "bg-raised text-fg shadow-[inset_2px_0_0_rgb(var(--brand))]" : "text-fg")
       }
     >
       <span aria-hidden="true" className="text-base text-faint">
@@ -196,30 +200,36 @@ export function CommandMenu({
     </div>
   );
 
+  // Only options (inside role="group" while browsing) live in the listbox; the empty and
+  // error notes sit beside it so the listbox holds nothing but options and groups.
   let body: ReactNode;
-  if (visible.length === 0) {
-    body = <div className="px-3 py-6 text-center text-sm text-muted">No matches</div>;
-  } else if (searching) {
+  if (searching) {
     body = visible.map(renderOption);
   } else {
     body = DISPLAY_ORDER.map((g) => {
       const rows = visible.map((item, i) => ({ item, i })).filter((r) => r.item.group === g);
-      const note = g === "actions" && boardsUnavailable;
-      if (rows.length === 0 && !note) return null;
+      if (rows.length === 0) return null;
+      const titleId = `${uid}-group-${g}`;
       return (
-        <div key={g} role="presentation">
+        <div key={g} role="group" aria-labelledby={titleId}>
           <div
+            id={titleId}
             role="presentation"
             className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-faint"
           >
             {GROUP_TITLES[g]}
           </div>
           {rows.map((r) => renderOption(r.item, r.i))}
-          {note && <div className="px-3 py-1.5 text-xs text-faint">Boards unavailable</div>}
         </div>
       );
     });
   }
+  // Announced politely as the query narrows the list; empty while browsing.
+  const announcement = !searching
+    ? ""
+    : visible.length === 0
+      ? "No matches"
+      : `${visible.length} ${visible.length === 1 ? "result" : "results"}`;
 
   return (
     <Modal
@@ -250,10 +260,12 @@ export function CommandMenu({
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);
-              setActive(0);
+              setActiveId(null);
             }}
             onKeyDown={onKeyDown}
-            className="h-12 min-w-0 flex-1 bg-transparent text-[15px] font-medium text-fg outline-hidden placeholder:text-faint"
+            // The global input:focus-visible ring would draw a clipped box here; the active
+            // option and the modal already show where the keyboard is.
+            className="h-12 min-w-0 flex-1 bg-transparent text-[15px] font-medium text-fg outline-hidden placeholder:text-faint focus-visible:ring-0 focus-visible:ring-offset-0"
           />
           <kbd
             aria-hidden="true"
@@ -264,6 +276,15 @@ export function CommandMenu({
         </div>
         <div id={listId} role="listbox" aria-label="Commands" className="max-h-[360px] overflow-y-auto p-2">
           {body}
+        </div>
+        {visible.length === 0 && (
+          <div aria-hidden="true" className="px-3 py-6 text-center text-sm text-muted">
+            No matches
+          </div>
+        )}
+        {boardsUnavailable && <div className="px-5 pb-3 text-xs text-faint">Boards unavailable</div>}
+        <div role="status" aria-live="polite" className="sr-only">
+          {announcement}
         </div>
       </div>
     </Modal>

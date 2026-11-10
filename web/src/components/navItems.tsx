@@ -38,6 +38,8 @@ export type NavDef = {
   // The Admin entry's health severity pip (PRD #1484 M5, D1): a count + worded severity
   // when checks need attention. The sidebar feeds it from the shared health provider.
   healthPip?: true;
+  // The command menu's right-hand hint when the section has no group name.
+  hint?: string;
 };
 
 export type NavGroupName = "Work" | "Factory";
@@ -95,7 +97,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { key: "settings", label: "Settings", to: "/settings", icon: <GearIcon /> },
       // /admin redirects to the first tab; the prefix match keeps this entry lit on every
       // /admin/* tab.
-      { key: "admin", label: "Admin", to: "/admin", icon: <ShieldIcon />, adminOnly: true, healthPip: true },
+      { key: "admin", label: "Admin", to: "/admin", icon: <ShieldIcon />, adminOnly: true, healthPip: true, hint: "Admin" },
       { key: "docs", label: "Docs", to: "/docs", icon: <BookIcon /> },
     ],
   },
@@ -104,7 +106,7 @@ export const NAV_SECTIONS: NavSection[] = [
 export type VisibleNavItem = NavDef & {
   // The section's group name, null for the unlabelled sections.
   group: NavGroupName | null;
-  // The right-hand hint the command menu shows: the group, or "Admin" for the Admin entry.
+  // The right-hand hint the command menu shows: the item's own hint, else the group.
   hint: string;
 };
 
@@ -116,7 +118,7 @@ export function visibleNavItems(isAdmin: boolean): VisibleNavItem[] {
       .map((item) => ({
         ...item,
         group: section.group,
-        hint: section.group ?? (item.key === "admin" ? "Admin" : ""),
+        hint: item.hint ?? section.group ?? "",
       })),
   );
 }
