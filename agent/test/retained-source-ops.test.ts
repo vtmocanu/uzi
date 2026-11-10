@@ -724,6 +724,122 @@ describe("verifyStoppedSourceCovered", () => {
     });
   });
 
+  describe("Git reads that warn on stderr instead of failing (#4141)", () => {
+    const UNREADABLE_SKIP = LINUX_ONLY || (process.getuid?.() === 0 ? "root bypasses mode-000 permission checks" : false);
+    const stderrWarns = (rec: { lines: unknown[] }, msg: string) =>
+      (rec.lines as Array<{ level?: string; msg?: string; stderr?: string }>).filter((l) => l.level === "warn" && l.msg === msg);
+
+    /** Like captured(), with extra committed files, on a GitCache whose log lines are recorded. */
+    async function capturedWith(files: Record<string, string>) {
+      const rec = recordingLogger();
+      git = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions());
+      const a = await seedAttempt("run-v", 1);
+      fs.writeFileSync(path.join(a.path, "work.txt"), "captured\n");
+      gitIn(a.path, ["add", "work.txt"]);
+      for (const [rel, body] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(a.path, rel)), { recursive: true });
+        fs.writeFileSync(path.join(a.path, rel), body);
+        gitIn(a.path, ["add", rel]);
+      }
+      gitIn(a.path, ["commit", "-m", "milestone"]);
+      await fixtureFetchTracking(git, bare, a.path, a.branch, a.runId, 1);
+      const head = gitIn(a.path, ["rev-parse", "HEAD"]);
+      assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "precondition: clean at the captured head");
+      return { a, head, rec };
+    }
+    const STATUS_MSG = "stopped source status reported a problem on stderr; not provable";
+    const REFS_MSG = "stopped source local refs read reported a problem on stderr; not provable";
+
+    it("a nonignored mode-000 untracked directory is not covered", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      const dir = path.join(a.path, "secret");
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "key.txt"), "worker-only\n");
+      fs.chmodSync(dir, 0o000);
+      try {
+        assert.equal(await verify(a, head), "not_covered");
+        assert.equal(stderrWarns(rec, STATUS_MSG).length, 1, "the stderr problem is logged");
+      } finally {
+        fs.chmodSync(dir, 0o700);
+      }
+    });
+
+    it("a modified tracked file inside a mode-000 tracked directory is not covered", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({ "tracked/inner.txt": "original\n" });
+      const dir = path.join(a.path, "tracked");
+      fs.writeFileSync(path.join(dir, "inner.txt"), "modified worker-only bytes\n");
+      fs.chmodSync(dir, 0o000);
+      try {
+        assert.equal(await verify(a, head), "not_covered");
+        assert.equal(stderrWarns(rec, STATUS_MSG).length, 1, "the stderr problem is logged");
+      } finally {
+        fs.chmodSync(dir, 0o700);
+      }
+    });
+
+    it("a mode-000 loose ref naming a local-only commit is not covered", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      gitIn(a.path, ["checkout", "-q", "-b", "side"]);
+      fs.writeFileSync(path.join(a.path, "side.txt"), "only on a side branch\n");
+      gitIn(a.path, ["add", "side.txt"]);
+      gitIn(a.path, ["commit", "-m", "side work"]);
+      gitIn(a.path, ["checkout", "-q", "--detach", head]);
+      const ref = path.join(a.path, ".git", "refs", "heads", "side");
+      fs.chmodSync(ref, 0o000);
+      try {
+        assert.equal(await verify(a, head), "not_covered");
+        assert.equal(stderrWarns(rec, REFS_MSG).length, 1, "the stderr problem is logged");
+      } finally {
+        fs.chmodSync(ref, 0o600);
+      }
+    });
+
+    it("stays covered for a stat-dirty tracked file whose content is unchanged", { skip: LINUX_ONLY }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      fs.writeFileSync(path.join(a.path, "work.txt"), "captured\n");
+      const when = new Date(Date.now() + 5000);
+      fs.utimesSync(path.join(a.path, "work.txt"), when, when);
+      assert.equal(await verify(a, head), "covered");
+      assert.equal(stderrWarns(rec, STATUS_MSG).length, 0);
+    });
+
+    it("stays covered for a mode-000 directory matched by a committed .gitignore", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({ ".gitignore": "/secret/\n" });
+      const dir = path.join(a.path, "secret");
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "key.txt"), "ignored\n");
+      fs.chmodSync(dir, 0o000);
+      try {
+        assert.equal(await verify(a, head), "covered");
+        assert.equal(stderrWarns(rec, STATUS_MSG).length, 0);
+      } finally {
+        fs.chmodSync(dir, 0o700);
+      }
+    });
+
+    it("stays covered for a mode-000 directory matched by .git/info/exclude", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      fs.appendFileSync(path.join(a.path, ".git", "info", "exclude"), "/secret/\n");
+      const dir = path.join(a.path, "secret");
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "key.txt"), "excluded\n");
+      fs.chmodSync(dir, 0o000);
+      try {
+        assert.equal(await verify(a, head), "covered");
+        assert.equal(stderrWarns(rec, STATUS_MSG).length, 0);
+      } finally {
+        fs.chmodSync(dir, 0o700);
+      }
+    });
+
+    it("retains conservatively when Git warns about a benign deprecated config key", { skip: LINUX_ONLY }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      fs.appendFileSync(path.join(a.path, ".git", "config"), "[core]\n\tfsyncObjectFiles = true\n");
+      assert.equal(await verify(a, head), "not_covered");
+      assert.equal(stderrWarns(rec, STATUS_MSG).length, 1, "the benign warning is logged as a stderr problem");
+    });
+  });
+
   it("is covered through an owed pin alone when the shared tracking ref has moved on", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     const other = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);

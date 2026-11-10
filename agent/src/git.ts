@@ -12205,6 +12205,9 @@ export class GitCache {
    * means "not covered". The `refs/stash` refusal is a belt: stash commits are never reachable
    * from the bare. Any failed read is `false`.
    *
+   * Any stderr from the `for-each-ref` read (e.g. `ignoring broken ref` for an unreadable loose ref,
+   * which Git reports with exit 0 and omits) is not provable and returns `false`.
+   *
    * The transient {@link RECOVERY_BUNDLE_REF} is excluded from `--all`: an aborted bundle pass may
    * leave it behind, and it only retains objects, never proves a side ref held.
    *
@@ -12232,8 +12235,16 @@ export class GitCache {
       if (automatic?.roots.length) {
         return await this.automaticObjectCoverage(barePath, cwd, head, automatic);
       }
-      const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
+      let refsStderr = "";
+      const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], {
+        env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+        onStderr: (text) => { refsStderr += text; },
+      }));
       const out = await refs();
+      if (refsStderr !== "") {
+        this.log.warn("stopped source local refs read reported a problem on stderr; not provable", { cwd, stderr: sanitizeForLog(refsStderr, 256) });
+        return false;
+      }
       if (automatic) this.automaticCollection(out, "\n");
       const shas = new Set<string>();
       for (const line of out.split("\n")) {
@@ -12280,6 +12291,11 @@ export class GitCache {
    * `--ignore-submodules=none`. A `.git/modules` store or a populated (non-empty or non-directory)
    * gitlink path is `false`, since the parent proof cannot cover a submodule's own files, commits and refs.
    *
+   * Any stderr from the `status` read is not provable: Git exits 0 with empty stdout and a warning for
+   * an unreadable directory, so the omission would otherwise read as clean. Benign warnings (a
+   * deprecated config key, CRLF warnings included) therefore retain conservatively. The attributes
+   * file is pinned to `/dev/null` because gitEnv passes the worker HOME to runner-uid Git.
+   *
    * This is the LEGACY proof. With `automatic` it delegates to {@link worktreeProvenCleanAutomatic},
    * which does not run `status` over anything it has not first bounded and typed itself; the
    * code below never sees `automatic`.
@@ -12288,7 +12304,7 @@ export class GitCache {
     if (automatic) return this.worktreeProvenCleanAutomatic(cwd, automatic);
     const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(undefined, action);
     const hardened = [
-      "-c", "core.excludesFile=/dev/null", "-c", `core.worktree=${cwd}`, "-c", "core.trustctime=true",
+      "-c", "core.excludesFile=/dev/null", "-c", "core.attributesFile=/dev/null", "-c", `core.worktree=${cwd}`, "-c", "core.trustctime=true",
       "-c", "core.checkStat=default", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
       "-c", "status.showUntrackedFiles=all", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false",
     ];
@@ -12331,7 +12347,15 @@ export class GitCache {
         if (!st.isDirectory() || st.isSymbolicLink()) return false;
         if ((await fs.readdir(gitlink)).length > 0) return false;
       }
-      const status = await read(() => this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], { env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
+      let statusStderr = "";
+      const status = await read(() => this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], {
+        env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+        onStderr: (text) => { statusStderr += text; },
+      }));
+      if (statusStderr !== "") {
+        this.log.warn("stopped source status reported a problem on stderr; not provable", { cwd, stderr: sanitizeForLog(statusStderr, 256) });
+        return false;
+      }
       if (status.split("\n").some((l) => l.length > 0)) return false;
       const flags = await read(() => this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
       for (const entry of flags.split("\0")) {
