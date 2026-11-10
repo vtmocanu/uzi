@@ -227,10 +227,12 @@ export function CommandMenu({
   const visible = useMemo(() => filterCommandItems(items, query), [items, query]);
   const activeIndex = visible.length === 0 ? -1 : Math.max(0, visible.findIndex((it) => it.id === activeId));
 
+  // Re-runs on a new result list too: filtering can keep index 0 active while the list keeps a
+  // stale scroll offset, and Enter must never run an option the user cannot see.
   useEffect(() => {
     if (activeIndex < 0) return;
     document.getElementById(`${uid}-opt-${activeIndex}`)?.scrollIntoView?.({ block: "nearest" });
-  }, [activeIndex, uid]);
+  }, [activeIndex, uid, visible]);
 
   const run = (item: CommandItem) => {
     navigate(item.to);

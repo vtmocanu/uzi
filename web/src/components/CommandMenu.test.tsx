@@ -334,6 +334,27 @@ describe("keyboard and navigation", () => {
     expect(menu()).toBeNull();
   });
 
+  it("scrolls the first result into view when a new query keeps index 0 active", async () => {
+    renderShell();
+    await openByShortcut();
+    await screen.findByText("Open board: acme/network");
+    // jsdom has no scrollIntoView; record which option each call scrolls to.
+    const scrolled: string[] = [];
+    const proto = Element.prototype as { scrollIntoView?: unknown };
+    const original = proto.scrollIntoView;
+    proto.scrollIntoView = function (this: Element) {
+      scrolled.push(this.textContent ?? "");
+    };
+    try {
+      fireEvent.change(input(), { target: { value: "board" } });
+      expect(optionLabels()[0]).toBe("Open board: acme/network");
+      expect(scrolled.some((t) => t.includes("Open board: acme/network"))).toBe(true);
+    } finally {
+      if (original === undefined) delete proto.scrollIntoView;
+      else proto.scrollIntoView = original;
+    }
+  });
+
   it("hides group headings while a query is set and shows 'No matches' for none", async () => {
     renderShell();
     await openByShortcut();
