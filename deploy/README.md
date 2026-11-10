@@ -1192,7 +1192,17 @@ For `inventory_partial`, `partial_causes` supplies sparse, bounded event counter
 limits or filesystem failures; `ownership_read_` and `holds_read_` keys classify
 failures at those read stages. Each counter saturates at **65535**; a missing
 counter is not evidence that unvisited work was clean. The object carries no raw
-errors, URLs, paths or IDs and changes no eligibility or authority. See the
+errors, URLs, paths or IDs and changes no eligibility or authority. A tree-local
+measurement shortfall (EACCES/EPERM from opendir or an entry lstat below the tree
+root, or the measurement entry, depth or pending-directory cap) is recorded on
+that tree's part as `measurementShortfall` (`eacces`, `eperm`, `entry_cap`,
+`depth_cap`, `pending_cap`), leaves its bytes unmeasured and no longer makes the
+whole pass `inventory_partial`. The tree stays ineligible and an independently
+eligible sibling is not blocked, so these counters can appear on an `eligible`
+verdict, where they are diagnostic only and `bytes_state` can be `partial`:
+`eligible` does not mean every retained tree was measured. Any other errno, a
+deadline, cancellation, a root `lstat` failure and the global caps stay
+pass-wide. See the
 [full #3775 diagnostic contract](../prds/3431-pod-epoch-reclaim.md#3775-partial-shadow-diagnostic-contract).
 
 **Authority and counts (PRD #3431 M1a).** The log line also carries

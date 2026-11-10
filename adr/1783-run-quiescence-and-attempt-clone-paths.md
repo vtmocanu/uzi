@@ -1682,7 +1682,8 @@ reservation S inside it, then fresh lifecycle and hold reads inside S, then the 
 (the #3404 operator-discard takeover comes last, immediately before the first delete), then
 `endSourceUse` after any takeover, then release of S and A, and only then classification.
 A thrown error after the discard began is unproven and fatal: the pass keeps EX and refuses
-admission.
+admission. The deletion re-inspection also requires a fresh `bytesState` of `measured` for a
+present source (#3851, 2026-11-10).
 
 ### Authority persistence model (existing mechanisms only)
 
