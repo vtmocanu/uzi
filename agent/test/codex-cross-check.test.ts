@@ -4,7 +4,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
 import { createHash } from "node:crypto";
-import { CodexCrossCheck, CrossCheckMalformedError, validateVerdict, validateCodeFindings, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
+import { CodexCrossCheck, CrossCheckMalformedError, PLAN_VERDICT_SCHEMA, validateVerdict, validateCodeFindings, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
 import type { CodexRootHandle, CodexLaunchSpec, CodexEffectLaunchSpec } from "../src/codex/launcher.js";
 import { wireFileopHelper, type FileopHelperHandle } from "../src/codex/fileop-client.js";
 import type { FileopRequest, FileopResponse } from "../src/codex/broker.js";
@@ -29,6 +29,7 @@ for (const [name, text, subreason] of [
   assert.throws(() => validateVerdict(text), (err: unknown) => {
    assert.ok(err instanceof CrossCheckMalformedError);
    assert.equal(err.subreason, subreason);
+   assert.equal(err.finalTextShape, undefined, "standalone validation has no final text metadata");
    return true;
   });
  });
@@ -230,6 +231,46 @@ function rig(options: {
   } };
 }
 
+it("production turn/start sends the unchanged Plan schema and omits Code schema without a capture adapter", async () => {
+ for (const stage of ["plan", "code"] as const) {
+  const r = rig({ claim: stage === "plan" ? claim() : codeClaim(),
+   notes: emit => r.terminal(emit, stage === "plan" ? verdict : '{"findings":[]}') });
+  await r.run();
+  const turns = r.requests.filter(frame => frame.method === "turn/start");
+  assert.equal(turns.length, 1);
+  if (stage === "plan") {
+   assert.deepEqual(turns[0]!.params!.outputSchema, PLAN_VERDICT_SCHEMA);
+   assert.equal(turns[0]!.params!.outputSchema.properties.summary.maxLength, 4096);
+   assert.equal(turns[0]!.params!.outputSchema.properties.items.maxItems, 20);
+   for (const key of ["file", "summary", "rationale"] as const) {
+    assert.equal(turns[0]!.params!.outputSchema.properties.items.items.properties[key].maxLength, 2048);
+   }
+  } else assert.equal(Object.hasOwn(turns[0]!.params!, "outputSchema"), false);
+ }
+});
+
+for (const mode of ["startup", "transport", "cleanup", "usage", "code validation"] as const) {
+ it("M2 final text shape absent on " + mode, async () => {
+  const r = rig({
+   ...(mode === "startup" ? { rpcFailure: "turn/start", rpcError: { code: -1, message: "startup failed" } } : {}),
+   failDispose: mode === "cleanup", failUsage: mode === "usage",
+   claim: mode === "code validation" ? codeClaim() : claim(),
+   notes: emit => {
+    if (mode === "transport") { r.fail(); return; }
+    r.terminal(emit, mode === "usage" ? verdict : "{broken");
+   },
+  });
+  await assert.rejects(r.run(), (error: unknown) => {
+   assert.ok(error instanceof Error);
+   assert.equal((error as CrossCheckMalformedError).finalTextShape, undefined);
+   if (mode === "cleanup") assert.equal(error.message, "cross-check cleanup unconfirmed");
+   if (mode === "usage") assert.equal(error.message, "usage failed");
+   if (mode === "code validation") assert.ok(error instanceof CrossCheckMalformedError);
+   return true;
+  });
+ });
+}
+
 it("plan checker wires the shared brief into trusted developer instructions, separate from candidate DATA", async () => {
  const r = rig();
  assert.equal(await r.run(), verdict);
@@ -272,7 +313,7 @@ it("code checker uses the confined provider and file broker and returns only fin
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
 const GOLDEN_CODE_PROMPT = "35fd960289a82fde40b0d12e24533b5130a8db60687b4023ddb14b07d5c080a9";
-const GOLDEN_CODEX_CODE_BRIEF = "67ea80eefc42d66f40db3774f6845f6ad9d2d5bd143bc1d28b9cc3fb3a2c85be";
+const GOLDEN_CODEX_CODE_BRIEF = "9f6489adf9e43295e04fcfe688d55408b734f3fe0c35e72f02390ba48850d437";
 
 async function codeRequests(c: ClaimResponse) {
  const r = rig({ claim: c, notes: (emit) => r.terminal(emit, '{"findings":[]}') });
@@ -766,6 +807,9 @@ for (const stage of ["plan", "code"] as const) {
  const refuse = async (frames: Frame[], expected: NonNullable<CrossCheckMalformedError["subreason"]> | RegExp): Promise<void> => {
   const r = replay(frames);
   await assert.rejects(r.run(), (error: unknown) => {
+   if (stage === "code" || expected instanceof RegExp || !["invalid_json", "verdict_schema", "finding_schema", "findings_cap"].includes(expected)) {
+    assert.equal((error as CrossCheckMalformedError).finalTextShape, undefined, "lifecycle rejection has no final text metadata");
+   }
    if (expected instanceof RegExp) {
     assert.ok(error instanceof Error);
     assert.match(error.message, expected);

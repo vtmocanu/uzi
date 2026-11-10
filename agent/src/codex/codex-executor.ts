@@ -40,7 +40,8 @@ import { ExecutorLifetime, type ExecutorSealResult, type ExecutorTerminalSeal } 
 // too: in the implement phase through ctx.parkForPause (a declined park re-drives the turn), in
 // the plan phase by throwing a PauseNowSignal the runner parks.
 // Issue #1800: the pending owner follow-ups (ctx.pullFollowUps, one batch up to the rune cap) ride the
-// base implement prompt of the next ordinary turn, each in its own <follow_up> fence, and every one is
+// base implement prompt of the next ordinary turn (or the first policy-continuation plan request),
+// each in its own <follow_up> fence, and every one is
 // reported included (ctx.followUpIncluded) when that turn first yields an event evidencing the model processed them (evidencesModelProcessing; not
 // thread/turn lifecycle notifications); a completion-rework or secret-remediation turn leaves it waiting.
 // It reuses `ctx.gatePlan` for the plan→approval gate exactly like SdkExecutor, but drives
@@ -62,7 +63,7 @@ import { ownedSummaryFactories, ownedSummaryHarnesses, summaryCallDeadlines, sum
 import { MaintenanceBudget } from "../maintenance-budget.js";
 import { chunkedTimeout } from "../chunked-timeout.js";
 import { CI_EVIDENCE_READ, readCIEvidence, ciEvidencePrompt } from "../ci-evidence-tools.js";
-import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
+import { PolicyContextRefusal, TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
@@ -87,7 +88,7 @@ import { type CodexErrorClassification, CodexTurnFailedError, formatCodexClassif
 import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
-import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES } from "../steering.js";
+import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
@@ -134,7 +135,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildRepoInstructionsContext, interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
+import { buildRepoInstructionsContext, interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, REPO_SUBAGENT_PLANNING_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -144,7 +145,7 @@ import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import { gateVerdictSelection, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
 import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -161,6 +162,7 @@ import {
   type SpawnedBoundaryProcess,
 } from "./safety.js";
 import { bindCaptureLaunch, isCaptureRequest } from "../git.js";
+import { PolicyContinuationRejected } from "../provider-policy-refusal.js";
 import {
   CodexHarness,
   CodexResumeError,
@@ -587,6 +589,12 @@ function planMaxRevisionsOf(config: RunContext["config"]): number {
  *  builder and run()'s status line / result so the names cannot diverge. */
 function implementTemplates(ctx: RunContext, selection: AgentSelection): AgentTemplate[] {
   return selectSubagentTemplates(selection.source, ctx.agents ?? [], ctx.repoAgents ?? [], selection.exclusions);
+}
+
+function planTemplateSelection(ctx: RunContext): AgentSelection | undefined {
+  const persisted = ctx.approvedSelection;
+  if (planAgentSource(persisted?.source, ctx.requestedAgentSource, (ctx.repoAgents?.length ?? 0) > 0) !== "repo") return undefined;
+  return { source: "repo", exclusions: persisted?.source === "repo" ? persisted.exclusions : [] };
 }
 
 /** Map one uzi {@link AgentTemplate} onto the neutral {@link HarnessAgent} the Codex
@@ -3959,10 +3967,25 @@ export class CodexExecutor implements Executor {
         ctx.emit({ kind: "answer", agent: "lead", payload: { answers: verdict.answers } });
         return answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined);
       };
+      // One batch survives pre-evidence retries. Policy continuations may place it on their first
+      // planning request; ordinary planning leaves it for implementation, as before (#1800).
+      let ownerBatch: Array<{ id: number; body: string }> | undefined;
+      let priorOwnerHistoryPlaced = false;
+      let policyPlanPending = ctx.policyOwnerContinuation === true;
+      let planSourceReported = false;
       const drivePlan = async (initialPrompt: string, humanRevision = false) => {
         // issue #2213: a quarantined worker stops a run cleanly at the plan and revise boundaries,
         // before the next prompt is built; the call-site gates remain the guarantee.
         assertResidueQuarantineOpen("provider_turn");
+        if (!planSourceReported) {
+          const planSelection = planTemplateSelection(ctx);
+          if (planSelection) {
+            ctx.emit({ kind: "status", agent: "worker", payload: {
+              text: `planning with the repo's agents (${implementTemplates(ctx, planSelection).map((t) => t.name).join(", ") || "none"})` } });
+          }
+          await ctx.reportPlanAgentSource?.(planSelection ? "repo" : "own");
+          planSourceReported = true;
+        }
         let prompt = initialPrompt;
         // #1593: the prose-only recovery budget, LOCAL to this invocation so the initial plan
         // turn and every revision turn each get one nudge and one owner park.
@@ -4010,7 +4033,35 @@ export class CodexExecutor implements Executor {
               chargeSilentRecovery();
               silentRevision.needsRebuild = false;
             }
-            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, undefined, undefined, undefined, undefined, false, !humanRevision, humanRevision);
+            if (policyPlanPending && ownerBatch === undefined) {
+              const pulled = ctx.pullFollowUps?.(MAX_FOLLOW_UP_BATCH_RUNES, true);
+              if (pulled?.length) ownerBatch = pulled;
+              // A prefix may omit the owner's latest narrowing correction. Refuse before model work
+              // rather than silently plan from that prefix; unacknowledged rows remain replayable.
+              const overflow = ctx.pullFollowUps?.(0, true);
+              if ((ownerBatch?.reduce((n, f) => n + followUpRunes(f.body), 0) ?? 0) > MAX_FOLLOW_UP_BATCH_RUNES || overflow?.length) {
+                if (overflow?.length) ownerBatch = [...(ownerBatch ?? []), ...overflow];
+                throw new PolicyContextRefusal("live_guidance_over_bound");
+              }
+            }
+            const ownerRides = policyPlanPending ? ownerBatch : undefined;
+            const liveIds = new Set((ownerRides ?? []).map(f => f.id));
+            const historyBodies = policyPlanPending && !ctx.sessionId && !priorOwnerHistoryPlaced
+              ? selectPriorOwnerHistory(ctx.priorOwnerFollowUps, id => liveIds.has(id) || (ctx.isLiveFollowUpId?.(id) ?? false))
+              : [];
+            const planningPrompt = ownerRides || historyBodies.length > 0
+              ? [prompt, ...renderPriorOwnerHistory(historyBodies), ...(ownerRides ? renderFollowUpBatch(ownerRides.map(f => f.body)) : [])].join("\n")
+              : prompt;
+            const onPolicyPlanFirstEvent = policyPlanPending ? () => {
+              if (!policyPlanPending) return;
+              policyPlanPending = false;
+              if (historyBodies.length > 0) priorOwnerHistoryPlaced = true;
+              if (ownerRides && ownerBatch === ownerRides) {
+                ownerBatch = undefined;
+                for (const f of ownerRides) ctx.followUpIncluded?.(f.id);
+              }
+            } : undefined;
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", planningPrompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, undefined, onPolicyPlanFirstEvent, undefined, undefined, false, !humanRevision, humanRevision);
           } catch (error) {
             if (silentRevision?.needsRebuild && error instanceof CodexTurnTripError && error.message === REASON_WALL) {
               const stopped = await routeSilentInterruption();
@@ -4319,13 +4370,6 @@ export class CodexExecutor implements Executor {
       const noProgress = new NoProgressStallTracker();
       let lastServedCompletionAttempts: number | undefined;
       let lastServedCompletedCount: number | undefined;
-      // Issue #1800: the owner's follow-up batch (never empty; an empty pull stays undefined). Pulled from steering only immediately before an ordinary
-      // implement prompt is built (never while a system text owns the turn), carried across loop
-      // iterations (the base prompt is rebuilt each time), and cleared only when the turn whose
-      // prompt held it first yields a model-evidencing event (evidencesModelProcessing), which is when every entry is reported included. A turn that
-      // throws, parks, walls, pauses or whose epoch is recreated first keeps it for the next turn.
-      let ownerBatch: Array<{ id: number; body: string }> | undefined;
-      let priorOwnerHistoryPlaced = false;
       // Issue #1674: the approved breakdown this loop reports against: the list approved at this
       // run's gate, else (a pre-approved resume) the claim's frozen list.
       const milestones = approvedMilestones ?? ctx.frozenMilestones ?? undefined;
@@ -4555,15 +4599,15 @@ export class CodexExecutor implements Executor {
               ? { milestones: approvedMilestones, findings: checkedFindings, humanApproved: humanCanonicalPlan,
                 scopeSuperseded: approvedContractSuperseded } : undefined);
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
-        // Issue #3149: earlier owner follow-ups ride only the first implement turn of a reviewed-plan
-        // resume (never a system-text turn), deduped by id against this turn's live batch and the
+        // Issues #3149/#3607: earlier owner follow-ups ride the first ordinary implement turn of a
+        // reviewed-plan or policy resume unless policy planning already placed them. Dedup by id against this turn's live batch and the
         // claim's live ids. The latch is spent only on the turn's first model event, so a turn that
         // aborts before any event composes the history again. No inclusion receipt for a history id.
         // The `systemFollowUp === undefined` term is defensive: every system-text turn follows an
         // evidenced turn that already spent the latch, and a system-text body replaces basePrompt,
         // so today it never changes the outcome; it keeps history off such a turn if that changes.
         let historyBodies: string[] = [];
-        if (systemFollowUp === undefined && ctx.reviewedPlanResume === true && !ctx.sessionId && !priorOwnerHistoryPlaced) {
+        if (systemFollowUp === undefined && (ctx.reviewedPlanResume === true || ctx.policyOwnerContinuation === true) && !ctx.sessionId && !priorOwnerHistoryPlaced) {
           const liveIds = new Set((ownerRides ?? []).map((f) => f.id));
           historyBodies = selectPriorOwnerHistory(ctx.priorOwnerFollowUps, (id) => liveIds.has(id) || (ctx.isLiveFollowUpId?.(id) ?? false));
         }
@@ -5841,6 +5885,9 @@ export class CodexExecutor implements Executor {
           // A rejected thread/resume has started no model turn. The persisted rollout may
           // have disappeared or the provider may refuse it despite a successful preflight.
           if (!resumeId || !(error instanceof CodexResumeError)) throw error;
+          // A policy-held conversation never falls back: no lineage-break notice (no fresh admission
+          // happened) and no thread/start. The runner re-holds the run for its owner.
+          if (ctx.preserveConversation === true) throw new PolicyContinuationRejected("provider_resume_rejected");
           this.log.warn("codex provider rejected resumed thread; starting a fresh session", { run_id: ctx.runId });
           ctx.emit({ kind: "status", agent: "worker", payload: {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
@@ -6572,10 +6619,16 @@ export class CodexExecutor implements Executor {
     const agents: Record<string, HarnessAgent> = {};
     let repoSourced = false;
     if (phase === "plan") {
-      // The plan phase is deliberately independent of the selection: it runs before the human
-      // approves one, with the owner's roster, exactly as before issue #1718.
-      for (const t of ownSubagentTemplates(ctx.agents ?? [])) {
-        agents[t.name] = toHarnessAgent(t);
+      const planSelection = planTemplateSelection(ctx);
+      if (planSelection) {
+        repoSourced = true;
+        const repoSkills = (ctx.skills ?? []).map((s) => s.name);
+        for (const t of implementTemplates(ctx, planSelection)) agents[t.name] = toHarnessAgent(t, repoSkills);
+        prompt += `\n\n${REPO_SUBAGENT_UNTRUSTED_APPEND}\n\n${REPO_SUBAGENT_PLANNING_APPEND}`;
+      } else {
+        for (const t of ownSubagentTemplates(ctx.agents ?? [])) {
+          agents[t.name] = toHarnessAgent(t);
+        }
       }
     } else {
       if (!selection) throw new TrustedExecutionRefusal("codex implement request built without a resolved agent selection");
@@ -6616,6 +6669,7 @@ export class CodexExecutor implements Executor {
       harness: "codex",
       repoInstructions,
       repoSourced,
+      planning: phase === "plan",
       // Issue #3272: only an implement-phase request of an owner-supplied plan gets the seeded variant.
       seeded: phase === "implement" && isSeededOwnerPlan(ctx),
       codexChildTurnBudgetMs: this.childTurnDeadlineMs(),
@@ -6659,6 +6713,11 @@ export class CodexExecutor implements Executor {
         ? { modelSource: "worker_default" as const }
         : {}),
       ...(resumeId !== undefined ? { resumeSessionId: resumeId } : {}),
+      // Every root lead request of a policy-held claim (epoch recreation, plan to implement, adoption of
+      // a fresh epoch, the rejected-resume retry) carries it, so the harness's one fresh-thread branch
+      // can refuse. Side passes never use this builder.
+      ...(ctx.preserveConversation === true ? { preserveConversation: true } : {}),
+      ...(ctx.preserveConversation === true && ctx.policyFreshAllowance !== undefined ? { policyFreshAllowance: ctx.policyFreshAllowance } : {}),
       ...(effort !== undefined ? { effort } : {}),
     };
     return request;

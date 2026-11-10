@@ -28,7 +28,7 @@ func TestWorkerScopedClaimRegistration(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(response.Features, "pending_outcome_scoped_claim_v1") || slices.Contains(response.Features, "provider_policy_hold_v1") {
+	if !slices.Contains(response.Features, "pending_outcome_scoped_claim_v1") || !slices.Contains(response.Features, "provider_policy_hold_v1") {
 		t.Fatalf("readiness negotiation: %v", response.Features)
 	}
 }

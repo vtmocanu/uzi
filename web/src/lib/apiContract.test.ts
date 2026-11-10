@@ -69,6 +69,10 @@ import type {
   SessionResponse,
   VaultStatus,
   VaultToggleResponse,
+  AccountResetLink,
+  ResetLinkPreview,
+  ResetLinkPreviewRequest,
+  ResetLinkRedeemRequest,
   AdminRateLimitUser,
   Branding,
   Chat,
@@ -95,6 +99,17 @@ import type {
   GuardrailOverrideRequest,
   CodexAccountRateLimit,
   CodexAdminRateLimitRow,
+  EffectiveSettings,
+  EffectiveModelCell,
+  EffectiveEffortCell,
+  Credential,
+  HarnessValue,
+  ScheduleAlternative,
+  ScheduleSettingsPreview,
+  ScheduleSettingsPreviewRequest,
+  StartPreview,
+  StartPreviewAlternative,
+  StartPreviewRequest,
   HealthDoc,
   BuildInfo,
   ReleaseCheckStatus,
@@ -163,6 +178,16 @@ import runOutcomesZero from "../../../fixtures/api-contract/run_outcomes.zero.js
 import runOutcomesFull from "../../../fixtures/api-contract/run_outcomes.full.json";
 import userSettingsZero from "../../../fixtures/api-contract/user_settings.zero.json";
 import userSettingsFull from "../../../fixtures/api-contract/user_settings.full.json";
+import effectiveSettingsZero from "../../../fixtures/api-contract/effective_settings.zero.json";
+import effectiveSettingsFull from "../../../fixtures/api-contract/effective_settings.full.json";
+import startPreviewZero from "../../../fixtures/api-contract/effective_settings_start_preview.zero.json";
+import startPreviewFull from "../../../fixtures/api-contract/effective_settings_start_preview.full.json";
+import schedulePreviewZero from "../../../fixtures/api-contract/effective_settings_schedule_preview.zero.json";
+import schedulePreviewFull from "../../../fixtures/api-contract/effective_settings_schedule_preview.full.json";
+import schedulePreviewRequestZero from "../../../fixtures/api-contract/effective_settings_schedule_preview_request.zero.json";
+import schedulePreviewRequestFull from "../../../fixtures/api-contract/effective_settings_schedule_preview_request.full.json";
+import startPreviewRequestZero from "../../../fixtures/api-contract/effective_settings_start_preview_request.zero.json";
+import startPreviewRequestFull from "../../../fixtures/api-contract/effective_settings_start_preview_request.full.json";
 import settingsUserSettingsFull from "../../../fixtures/api-contract/settings_user_settings.full.json";
 import settingsUserSettingsZero from "../../../fixtures/api-contract/settings_user_settings.zero.json";
 import catalogEntryZero from "../../../fixtures/api-contract/catalog_entry.zero.json";
@@ -232,6 +257,14 @@ import vaultStatusZero from "../../../fixtures/api-contract/vault_status.zero.js
 import vaultStatusFull from "../../../fixtures/api-contract/vault_status.full.json";
 import vaultToggleZero from "../../../fixtures/api-contract/vault_toggle.zero.json";
 import vaultToggleFull from "../../../fixtures/api-contract/vault_toggle.full.json";
+import accountResetLinkZero from "../../../fixtures/api-contract/account_reset_link.zero.json";
+import accountResetLinkFull from "../../../fixtures/api-contract/account_reset_link.full.json";
+import resetLinkPreviewZero from "../../../fixtures/api-contract/reset_link_preview.zero.json";
+import resetLinkPreviewFull from "../../../fixtures/api-contract/reset_link_preview.full.json";
+import resetLinkPreviewRequestZero from "../../../fixtures/api-contract/reset_link_preview_request.zero.json";
+import resetLinkPreviewRequestFull from "../../../fixtures/api-contract/reset_link_preview_request.full.json";
+import resetLinkRedeemRequestZero from "../../../fixtures/api-contract/reset_link_redeem_request.zero.json";
+import resetLinkRedeemRequestFull from "../../../fixtures/api-contract/reset_link_redeem_request.full.json";
 import anthropicAdminRateLimitRowZero from "../../../fixtures/api-contract/anthropic_admin_rate_limit_row.zero.json";
 import anthropicAdminRateLimitRowFull from "../../../fixtures/api-contract/anthropic_admin_rate_limit_row.full.json";
 import codexAdminRateLimitRowZero from "../../../fixtures/api-contract/codex_admin_rate_limit_row.zero.json";
@@ -404,8 +437,8 @@ void _releaseCheckStatusFull;
 
 // ── RunListItem ─────────────────────────────────────────────────────────────
 // RunListItem extends Run, so its extra keys inherit the same drift fields; its
-// own fields (repo_path, worker_name, owner_email, judge_verdict, judge_todo_count)
-// match. Same six ZeroOf exemptions, inherited from Run.
+// own fields (repo_path, worker_name, owner_email, judge_verdict, judge_todo_count,
+// cross_check_active) match. Same six ZeroOf exemptions, inherited from Run.
 {
   const _runListItemMissing: never = null as unknown as Exclude<keyof RunListItem, keyof typeof runListItemFull>;
   const _runListItemExtra: never = null as unknown as Exclude<keyof typeof runListItemFull, keyof RunListItem>;
@@ -870,6 +903,83 @@ void _releaseCheckStatusFull;
   void _userSettingsFull;
 }
 
+// ── Effective settings (PRD #3254 M2) ───────────────────────────────────────
+// ZeroOf exemptions: the four top-level slices and the two cross_check slices are Go nil-slices
+// whose zero marshals null (GET always emits them). The start-preview response omits
+// `alternatives` when empty (omitempty), so its zero fixture simply lacks the key.
+{
+  type SettingsZero = Omit<ZeroOf<EffectiveSettings, "harnesses" | "start" | "models" | "efforts">, "cross_check"> & {
+    cross_check: { models: EffectiveModelCell[] | null; efforts: EffectiveEffortCell[] | null };
+  };
+  const zero: SettingsZero = effectiveSettingsZero;
+  const full: Widen<EffectiveSettings> = effectiveSettingsFull;
+  // A mismatch in either direction makes the call's argument type `false`, which fails to compile.
+  const keysOf = <A, B>(_same: [Exclude<keyof A, keyof B> | Exclude<keyof B, keyof A>] extends [never] ? true : false): true => true;
+  type Fixture = typeof effectiveSettingsFull;
+  const checks = [
+    keysOf<EffectiveSettings, Fixture>(true),
+    keysOf<EffectiveSettings["cross_check"], Fixture["cross_check"]>(true),
+    keysOf<EffectiveSettings["harnesses"][number], Fixture["harnesses"][number]>(true),
+    keysOf<EffectiveSettings["start"][number], Fixture["start"][number]>(true),
+    keysOf<HarnessValue, Fixture["start"][number]["harness"]>(true),
+    keysOf<Credential, Fixture["harnesses"][number]["credential"]>(true),
+    keysOf<EffectiveModelCell, Fixture["models"][number]>(true),
+    keysOf<NonNullable<EffectiveModelCell["ignored"]>, Fixture["models"][number]["ignored"]>(true),
+    keysOf<EffectiveEffortCell, Fixture["efforts"][number]>(true),
+    keysOf<EffectiveModelCell, Fixture["cross_check"]["models"][number]>(true),
+    keysOf<EffectiveEffortCell, Fixture["cross_check"]["efforts"][number]>(true),
+  ];
+  type PreviewZero = ZeroOf<StartPreview>;
+  const previewZero: PreviewZero = startPreviewZero;
+  const previewFull: Widen<StartPreview> = startPreviewFull;
+  const previewChecks = [
+    keysOf<StartPreview, typeof startPreviewFull>(true),
+    keysOf<StartPreviewAlternative, typeof startPreviewFull.alternatives[number]>(true),
+    keysOf<StartPreviewRequest, typeof startPreviewRequestFull>(true),
+    keysOf<NonNullable<StartPreviewRequest["credential_override"]>, typeof startPreviewRequestFull.credential_override>(true),
+  ];
+  const requestZero: ZeroOf<StartPreviewRequest> = startPreviewRequestZero;
+  const requestFull: Widen<StartPreviewRequest> = startPreviewRequestFull;
+  void [zero, full, checks, previewZero, previewFull, previewChecks, requestZero, requestFull];
+}
+// PRD #3254 M3: the schedule preview. Its zero fixture has a null `notes` (a Go nil slice that
+// the handler always fills) and omits `alternatives` (omitempty). The request has no zero-null
+// member: every field is omitted when unset, so its zero is `{}`. The refused-branch shape (null
+// worker_model, worker_effort, credential and subagents plus a refusal) is covered by the
+// `ScheduleAlternative` assignment below, since the full fixture's alternative is the valid shape.
+{
+  const scheduleZero: ZeroOf<ScheduleSettingsPreview, "notes"> = schedulePreviewZero;
+  const scheduleFull: Widen<ScheduleSettingsPreview> = schedulePreviewFull;
+  const keysOf = <A, B>(_same: [Exclude<keyof A, keyof B> | Exclude<keyof B, keyof A>] extends [never] ? true : false): true => true;
+  type Full = typeof schedulePreviewFull;
+  const scheduleChecks = [
+    keysOf<ScheduleSettingsPreview, Full>(true),
+    keysOf<ScheduleAlternative, Full["alternatives"][number]>(true),
+    keysOf<NonNullable<ScheduleSettingsPreview["subagents"]>, Full["subagents"]>(true),
+    keysOf<NonNullable<ScheduleSettingsPreview["subagents"]>["pinned"][number], Full["subagents"]["pinned"][number]>(true),
+    keysOf<EffectiveModelCell, Full["worker_model"]>(true),
+    keysOf<EffectiveEffortCell, Full["worker_effort"]>(true),
+    keysOf<ScheduleSettingsPreviewRequest, typeof schedulePreviewRequestFull>(true),
+    keysOf<NonNullable<ScheduleSettingsPreviewRequest["credential_override"]>, typeof schedulePreviewRequestFull.credential_override>(true),
+  ];
+  const scheduleRequestFull: Widen<ScheduleSettingsPreviewRequest> = schedulePreviewRequestFull;
+  const scheduleRequestZero: ScheduleSettingsPreviewRequest = schedulePreviewRequestZero;
+  const refusedBranch: ScheduleAlternative = {
+    harness: "codex", worker_model: null, worker_effort: null, credential: null, subagents: null,
+    refusal: "codex_override_conflict", refusal_detail: null,
+  };
+  void [scheduleZero, scheduleFull, scheduleChecks, scheduleRequestFull, scheduleRequestZero, refusedBranch];
+}
+it("effective-settings zero fixtures carry null slices and the alternatives omission", () => {
+  expect(effectiveSettingsZero.harnesses).toBeNull();
+  expect(effectiveSettingsZero.cross_check.models).toBeNull();
+  expect(startPreviewZero).not.toHaveProperty("alternatives");
+  expect(startPreviewFull.alternatives[0].refusal).toBe("x");
+  expect(schedulePreviewZero.notes).toBeNull();
+  expect(schedulePreviewZero).not.toHaveProperty("alternatives");
+  expect(schedulePreviewRequestZero).toEqual({});
+});
+
 // Nested members must match the Go recorder, including required nullable metadata.
 {
   type RecordedCell = typeof userSettingsFull.cross_check_pins[number];
@@ -962,6 +1072,35 @@ it("recorded nested checker metadata always has the nullable member", () => {
   const extra: never = null as unknown as Exclude<keyof typeof vaultToggleFull, keyof VaultToggleResponse>;
   const zero: ZeroOf<VaultToggleResponse> = vaultToggleZero;
   const full: Widen<VaultToggleResponse> = vaultToggleFull;
+  void missing; void extra; void zero; void full;
+}
+// PRD #3989: the account reset link issue response, preview response and both request bodies.
+{
+  const missing: never = null as unknown as Exclude<keyof AccountResetLink, keyof typeof accountResetLinkFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof accountResetLinkFull, keyof AccountResetLink>;
+  const zero: ZeroOf<AccountResetLink> = accountResetLinkZero;
+  const full: Widen<AccountResetLink> = accountResetLinkFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof ResetLinkPreview, keyof typeof resetLinkPreviewFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof resetLinkPreviewFull, keyof ResetLinkPreview>;
+  const zero: ZeroOf<ResetLinkPreview> = resetLinkPreviewZero;
+  const full: Widen<ResetLinkPreview> = resetLinkPreviewFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof ResetLinkPreviewRequest, keyof typeof resetLinkPreviewRequestFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof resetLinkPreviewRequestFull, keyof ResetLinkPreviewRequest>;
+  const zero: ZeroOf<ResetLinkPreviewRequest> = resetLinkPreviewRequestZero;
+  const full: Widen<ResetLinkPreviewRequest> = resetLinkPreviewRequestFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof ResetLinkRedeemRequest, keyof typeof resetLinkRedeemRequestFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof resetLinkRedeemRequestFull, keyof ResetLinkRedeemRequest>;
+  const zero: ZeroOf<ResetLinkRedeemRequest> = resetLinkRedeemRequestZero;
+  const full: Widen<ResetLinkRedeemRequest> = resetLinkRedeemRequestFull;
   void missing; void extra; void zero; void full;
 }
 {
@@ -1717,6 +1856,13 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "admin_user_usage", nullable: true },
   { stem: "admin_usage", nullable: true },
   { stem: "user_settings", nullable: true },
+  // PRD #3254 M2: all three carry nulls in zero.json (nil slices, nil pointers).
+  { stem: "effective_settings", nullable: true },
+  { stem: "effective_settings_start_preview", nullable: true },
+  { stem: "effective_settings_start_preview_request", nullable: true },
+  // PRD #3254 M3: the schedule preview's zero carries nulls; its request zero is `{}` (all omitempty).
+  { stem: "effective_settings_schedule_preview", nullable: true },
+  { stem: "effective_settings_schedule_preview_request", nullable: false },
   { stem: "catalog_entry", nullable: true },
   { stem: "cli_token", nullable: true },
   // M3 — the handler-package hot set.
@@ -1809,7 +1955,28 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // PRD #1909 M6: applied_at/applied_by/staged are present-as-null and applied.skills is a
   // nil-slice null in zero.json.
   { stem: "product_skills", nullable: true },
+  // PRD #3989: the reset link DTOs are all-scalar, so no zero.json carries a null.
+  { stem: "account_reset_link", nullable: false },
+  { stem: "reset_link_preview", nullable: false },
+  { stem: "reset_link_preview_request", nullable: false },
+  { stem: "reset_link_redeem_request", nullable: false },
 ];
+
+describe("account reset link contract (PRD #3989)", () => {
+  it("pins the issue and preview key sets", () => {
+    expect(Object.keys(accountResetLinkFull).sort()).toEqual(["expires_at", "kind", "target_is_admin", "token"]);
+    expect(Object.keys(accountResetLinkZero).sort()).toEqual(Object.keys(accountResetLinkFull).sort());
+    expect(Object.keys(resetLinkPreviewFull).sort()).toEqual(["expires_at", "kind"]);
+    expect(Object.keys(resetLinkPreviewZero).sort()).toEqual(["expires_at", "kind"]);
+  });
+
+  it("carries the token in the request bodies and omits an unset redeem password", () => {
+    expect(resetLinkPreviewRequestFull).toEqual({ token: "x" });
+    expect(resetLinkRedeemRequestFull).toEqual({ token: "x", password: "x" });
+    // vault_only redemption sends no password: the zero value omits the key entirely.
+    expect(resetLinkRedeemRequestZero).toEqual({ token: "" });
+  });
+});
 
 describe("vault lifecycle contract fixtures", () => {
   it("pins the session envelope and nested public metadata keys", () => {

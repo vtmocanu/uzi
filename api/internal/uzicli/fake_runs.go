@@ -219,6 +219,24 @@ func (f *FakeClient) ResumeRunNow(_ context.Context, id string) (apitypes.RunDTO
 	return f.ResumedRun, nil
 }
 
+// PolicyResumeCall records one FakeClient.ResumePolicyHold invocation.
+type PolicyResumeCall struct {
+	Called                        bool
+	ID, Mode, EpisodeID, Guidance string
+}
+
+// ResumePolicyHold captures its arguments before the error branch, like ResumeRunNow.
+func (f *FakeClient) ResumePolicyHold(_ context.Context, id, mode, episodeID, guidance string) (apitypes.RunDTO, bool, error) {
+	f.LastPolicyResume = PolicyResumeCall{Called: true, ID: id, Mode: mode, EpisodeID: episodeID, Guidance: guidance}
+	if f.ResumeRunNowErr != nil {
+		return apitypes.RunDTO{}, false, f.ResumeRunNowErr
+	}
+	if f.Err != nil {
+		return apitypes.RunDTO{}, false, f.Err
+	}
+	return f.ResumedRun, f.PolicyResumeReplay, nil
+}
+
 // SetRunCredential records the run id and the resolved override it was called with and
 // returns the canned run + warning. It captures BEFORE the error branch (mirroring
 // ResumeRunNow) so a test asserting a 409/404/422 still proves the write was reached with
@@ -327,13 +345,14 @@ func (f *FakeClient) AcceptCompletionDecision(_ context.Context, id string, crit
 	return f.DecideRun, nil
 }
 
-func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
+func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
 	f.LastCreateRepoID = repoID
 	f.LastCreateIssueIID = issueIID
 	f.LastCreateWaitOnLimit = waitOnLimit
 	f.LastCreateMrRework = mrReworkEnabled
 	f.LastCreateForce = force
 	f.LastCreateSeed = seed
+	f.LastCreateAgentSource = agentSource
 	f.LastCreateCredOverride = credOverride
 	f.LastCreateHarness = harness
 	if f.Err != nil {

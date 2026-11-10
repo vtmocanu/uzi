@@ -163,6 +163,8 @@ uzi run extend <id> --by <duration>
 uzi run pause <id> [--now|--cancel]
 uzi run resume <id>
 uzi run resume-now <id>
+uzi run resume-now <id> --policy-mode <preserve|fresh_from_saved_work|fresh_one_claim> --episode <uuid>
+                [--guidance <text> | --guidance-file <path>] [--yes]
 uzi run decide <id> (--continue [--guidance <text>] | --partial <ids> --reason <text> | --accept <ids> --reason <text>)
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
@@ -338,10 +340,24 @@ A few worth knowing:
   [Seeding a plan](./seeded-plans.md) for the full walkthrough, including the
   constraint that matters most: the plan must stand on its own, since a
   seeded run starts with no session and no memory of how it was written.
-  `--agent-source`/`--exclude-agents` (below) and `--planned-commit`/
-  `--require-base` (the base-commit staleness guard) are all optional and all
-  require `--plan-file`; an empty or oversized plan is rejected at create
-  time. A run created with no `--plan-file` is unchanged.
+  `--exclude-agents` (below) and `--planned-commit`/`--require-base` (the
+  base-commit staleness guard) are all optional and all require
+  `--plan-file`; `--agent-source` sets the seeded run's roster here and also
+  works without a plan file (below). An empty or oversized plan is rejected at
+  create time. A run created with no `--plan-file` is unchanged.
+- **`run create --agent-source own|repo` chooses this run's agents.** Without
+  `--plan-file` the choice is frozen onto the run as its agent-source request,
+  overriding your [per-repo default](repo-agents.md#set-a-default-for-your-runs-on-a-repo)
+  for this run only; `run get` shows it as `AGENTS_REQUESTED ... (this run)`.
+  It applies to implementation the same way a default does: an approval with
+  no agent choice and an autopilot run implement with it, and an explicit choice
+  at the plan gate still wins. A choice of `repo` also applies to planning; see
+  [Planning with repo agents](repo-agents.md#planning-with-repo-agents).
+  `--exclude-agents` without `--plan-file` is a usage error
+  (exit 2); exclude agents at the plan gate instead. Over the API, the same
+  choice is `"agent_selection": {"source": "own"|"repo"}` on
+  `POST /api/repos/{id}/runs` without `plan_md`; non-empty `exclusions`
+  without `plan_md` returns 400 `exclusions require a plan file or an approval`.
 - **`run create --force` re-runs an issue that already has an open MR.** By
   default, creating a run for an issue whose last completed run still owns an
   open MR is refused (a 409, exit 5) — re-running would spend budget building
@@ -374,14 +390,17 @@ A few worth knowing:
   `--agent-source`. Detection reads one folder, never merges rosters, and prefers
   the run harness's native folder; a present preferred folder is final even if
   empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
-  `run create --plan-file` takes the same two flags, for the seeded run's
-  roster.
-- **`run get` shows the requested and implemented agents.** A run that carries
-  a frozen agent-source request shows `AGENTS_REQUESTED` (for example
-  `repo agents (repo default)`, or `(this run)` for a seeded plan's source), and
-  once a selection is recorded `IMPLEMENTED_WITH` shows the roster used, with
-  `(as requested)` or `(changed at approval)` when a request exists. `--json`
-  carries `agent_source_requested` and `agent_source_requested_basis`.
+  `run create` takes the same two flags (see `run create --agent-source`
+  above).
+- **`run get` shows the requested, planning and implemented agents.** A run that
+  carries a frozen agent-source request shows `AGENTS_REQUESTED` (for example
+  `repo agents (repo default)`, or `(this run)` for a source chosen at create or
+  a seeded plan's source) and `PLANNED_WITH`, the agents its plan turn used (with
+  the request's basis when they match it, or `—` when no plan turn was recorded,
+  as on a seeded run). Once a selection is recorded `IMPLEMENTED_WITH` shows the
+  roster used, with `(as requested)` or `(changed at approval)` when a request
+  exists. `--json` carries `agent_source_requested`, `agent_source_requested_basis` and
+  `plan_agent_source`.
 - **`repo list` shows each repo's default agents.** The `DEFAULT_AGENTS` column
   reads `own`, `repo` or `unset`; `--json` carries `agent_source_default`
   (`"own"`, `"repo"` or `null`). The setting is changed on the Repos page; the
@@ -3171,6 +3190,88 @@ your own switch for the model-written [Now summary](./run-activity.md#now-summar
 instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Change it in
 **Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
 
+### Effective settings
+
+`uzi settings get` also reads the read-only [effective-settings
+view](./configuration.md#effective-settings) (`GET /api/me/effective-settings`)
+and, when the server has it, builds the **Model settings** table from it, so each
+setting prints once. The rows, in order:
+
+| `SETTING` | Rows | Notes |
+| --- | --- | --- |
+| `start (default)`, `start (claude)`, `start (codex)` | One each | `HARNESS`, `STORED` and `DEFAULT` show `-`. `RESOLVED` is the predicted harness, `claude or codex` when the harness is chosen when the run is created, or `refused: <token>` / `refused: <token> (<detail>)`. `SOURCE` is the harness source label (`your choice for this run`, `your default harness`, `automatic` or `chosen when the run is created`) plus its notes. |
+| `worker model` | `claude`, `codex` | `RESOLVED` and `DEFAULT` show `SDK/account default` when the runtime decides. |
+| `worker effort` | `claude`, `codex` | As the existing effort rows. |
+| `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
+| `task review model` | `claude`, `codex` | Built-in; Codex notes `not configurable`, Claude `the SDK decides`. |
+| `task review effort` | `claude`, `codex` | `not sent` for both. |
+
+`SOURCE` appends each cell's notes after a `·`, for example `built-in · not sent`.
+When a start choice is chosen at creation, the table is followed by one block per
+such choice:
+
+```text
+start (default) is chosen when the run is created; it can run on:
+  claude: chosen when the run starts
+  codex: your default Codex credential
+```
+
+Each line is a harness's credential source label (a Codex account picked by
+headroom reads `chosen when the run is created`), or `refused:` and its token
+(with the detail in parentheses) for a harness that is not usable. A start
+choice is chosen at creation only when both harnesses are usable, so in practice
+both lines show credential labels. A harness that is not usable shows up in the
+`start (claude)` / `start (codex)` rows as `refused: no_credential_for_harness`,
+and `start (default)` shows `refused: no_usable_credential` when neither is
+usable. The CLI shows the `GET` only; it does not call the start-preview.
+`--schedule` adds the schedule preview, below.
+
+`--json` carries every key of the settings read plus an `effective` key holding
+the view's body: `version`, `harnesses`, `start`, `models`, `efforts` and
+`cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
+`effective` is `null` when the server does not have the view or the read failed.
+In that case the human output falls back to the previous Model settings rows, a
+line goes to stderr (`Effective settings: not available on this server` for an
+older server, otherwise `Effective settings: unavailable (<error>)`), and the
+exit code stays 0.
+
+#### Previewing a schedule
+
+```sh
+uzi settings get --schedule <schedule-id>
+```
+
+`--schedule` previews what firing one of your saved schedules now, and
+claiming the run, would use (`POST /api/me/effective-settings/schedule-preview`;
+request fields, refusals and per-target behaviour in
+[Scheduling](./scheduling.md#settings-preview)). The CLI sends only the
+schedule id, so it previews the schedule as saved. After the Model settings
+table it prints `If fired and claimed now (schedule <id>)` and a second table in
+the same columns:
+
+| `SETTING` | `HARNESS` | Notes |
+| --- | --- | --- |
+| `schedule harness` | `-` | `RESOLVED` is the harness, `claude or codex` when it is chosen when the run is created, or `refused: <token>` (with the detail in parentheses). A refusal on a known harness reads `<harness>, refused: <token>`. |
+| `worker model`, `worker effort`, `credential`, `subagents` | `claude` or `codex` | One set per harness the fire can land on; with a single harness the rows are that harness's. |
+| `fire` | `claude` or `codex` | Replaces the set above for a harness whose fire is refused, as `refused: <token>`. |
+
+When the harness is chosen at creation, the rows for both harnesses follow
+(Claude then Codex) and a line says so. A model pin the harness cannot run is
+named on its own line (`codex: the model <model> from the schedule pin does not
+run on this harness; the default applies`).
+
+`--json` adds a `schedule_preview` key holding the response body
+(`version`, `harness`, `refusal`, `refusal_detail`, `worker_model`,
+`worker_effort`, `credential`, `subagents`, `notes` and, when the harness is
+chosen at creation, `alternatives`). The key is absent without `--schedule`.
+
+Exit codes follow the schedule being something you asked for: a schedule that
+does not exist for your account (or a server that predates the route) is a 404
+and the command fails with a non-zero exit before printing anything, as does any
+other 4xx. A 5xx or an unreachable server degrades instead: the settings still
+print, `schedule_preview` is absent, a line goes to stderr (`Schedule preview:
+unavailable (<error>)`) and the exit code stays 0.
+
 ### Weekly usage reserve
 
 ```sh
@@ -3314,8 +3415,13 @@ never changes an existing run or resume. See
 [rate limits](./rate-limits.md#how-overflow-compares-headroom) for selected
 accounts, Claude aggregation and capacity holds.
 
-`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`. The last
-two rows are the weekly resets, `pref reset:` and `other reset:`, or
+`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`. An `off`
+or `excluded` decision was recorded before any usage was read, so it shows
+only `preferred:`, `chosen:`, `reason:` and one line saying overflow was off
+(`overflow off in settings`) or not considered (`overflow not considered`);
+the stored reason does not say which exclusion applied, and `--json` still
+carries every field. For every other
+reason the last two rows are the weekly resets, `pref reset:` and `other reset:`, or
 `claude reset:` and `codex reset:` for an `auto_*` reason (whose score,
 measured and held rows are likewise labelled `claude` and `codex` instead of
 `preferred`/`pref` and `other`). A reset reads as an RFC3339 UTC timestamp, or `unknown`. The TUI detail rail has **HARNESS at creation**, fitted as a whole block
@@ -3758,6 +3864,14 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+  A `paused` run can also be **waiting because your credentials were reset**
+  (`hold_reason: credentials_reset`): a Claude or chat run created before an
+  admin-issued [account reset](auth-design.md) found no model credential at
+  claim. `run get` prints a `HOLD` row reading `credentials were reset` with
+  the action "add a credential in Settings; the run resumes automatically",
+  and the web badge reads "waiting: credentials were reset". It resumes on its
+  own once you add a credential; `run resume` and `run set-token` are refused
+  with a 409 until then.
   A `paused` run can also be held after an owner token switch on a run with
   retained recovery work (`hold_reason: credential_switch_settling`, then
   `credential_switch_unsettled`). `run get` prints a `HOLD` row reading
@@ -3973,6 +4087,43 @@ set written explicitly. Ordinary recovery waits continue as before.
 status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
 owner actions, counts and historical evidence, without a self-retry countdown.
 
+### Codex policy hold
+
+A run paused on a confirmed `codex_policy_hold` shows, in `uzi run get`, the
+cause, the resume modes this episode accepts, a pending one-claim fresh start
+and whether the required recovery head is verified. Cancel is the only other
+action; there is no Stop. `--json` carries the same fields under `policy_hold`
+(`hold_cause`, `resume_modes`, `pending_fresh`, `outcome_id`).
+
+Resume it with the existing verb plus the policy flags:
+
+```
+uzi run resume-now <id> --policy-mode <mode> --episode <outcome_id> \
+    [--guidance <text> | --guidance-file <path>] [--yes]
+```
+
+- `--policy-mode` is one of `preserve`, `fresh_from_saved_work`,
+  `fresh_one_claim`; any other value is refused before a request is sent.
+- `--episode` is required and must be the hold's `policy_hold.outcome_id` (a
+  UUID). If the hold changed since you read it, the server answers 409
+  "policy hold changed or does not match this mode; refresh the run and choose
+  again"; run `uzi run get` again and choose again.
+- `--guidance` and `--guidance-file` are mutually exclusive, optional, at most
+  16000 bytes of UTF-8 with no NUL byte. Resending the same request after it was
+  applied prints "already resumed (this request was applied earlier)"; the same
+  request with different guidance is a 409 and the new guidance is not recorded.
+- The mode's label and consequence are printed to stderr, then you confirm on a
+  terminal. `--yes` skips the prompt; without a terminal and without `--yes`
+  the command refuses and sends nothing.
+
+| Mode | Label | Consequence |
+|---|---|---|
+| `preserve` | Resume the preserved conversation | Continues the same conversation with your guidance. If the conversation is missing or rejected, the run is held again; it never starts a new conversation. |
+| `fresh_from_saved_work` | Fresh conversation from the saved work | Starts a fresh conversation from the saved work and resolves this refusal. Any earlier requirement to preserve the old conversation ends for the rest of the run, until a new refusal. |
+| `fresh_one_claim` | Fresh conversation for one pickup | Lets exactly the next pickup start one new conversation from the saved work. Later pickups preserve that new conversation again; a fresh start that is never confirmed is held, not repeated. |
+
+Without `--policy-mode`, `uzi run resume-now <id>` is unchanged.
+
 ### Codex idle stalls
 
 `recovery_wait` / `codex_idle_stall` covers measured no-output and productive
@@ -4027,8 +4178,11 @@ for renewal bounds, storage risks and rollout requirements.
 ### Retained recovery adoption failed
 
 `recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
-refused adoption. Local work and custody are preserved; the run is owner-held
-with no automatic retry, regardless of a displayed retry timestamp.
+refused adoption, or that a predecessor's active secret-scan remediation record
+refused source use so the agent did not start. Local work and custody are
+preserved; the run is owner-held with no automatic retry, regardless of a
+displayed retry timestamp. In the remediation case, Resume holds again unless
+that remediation was resolved through a separately authorized route.
 
 Read `uzi run recovery <id>` and export an available archive before deciding.
 Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,

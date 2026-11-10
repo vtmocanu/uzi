@@ -363,6 +363,11 @@ export class CrossCheckRunner {
       await finishTelemetry();
       if (reason === "malformed") {
         this.log.warn("cross-check verdict malformed", { run_id: runId, stage: code ? "code" : "plan",
+          ...(!code && familyName === "codex" && err instanceof CrossCheckMalformedError && err.finalTextShape ? {
+            final_text_bytes: err.finalTextShape.final_text_bytes,
+            final_text_empty: err.finalTextShape.final_text_empty,
+            final_text_starts_with_code_fence: err.finalTextShape.final_text_starts_with_code_fence,
+          } : {}),
           ...(err instanceof CrossCheckMalformedError ? { subreason: err.subreason ?? "unknown" } : {
             subreason: "unclassified_error",
             error_name: err instanceof Error && err.constructor === SyntaxError ? "SyntaxError"

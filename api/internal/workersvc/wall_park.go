@@ -70,17 +70,20 @@ func (s *Service) ReportWallPark(ctx context.Context, wkr store.Worker, runID uu
 		}
 		return run, applied, nil
 	}
-	_ = published // informational (the degraded-park feed message, M2); the store transition ignores it.
 	// NUL-strip BEFORE the trim (a NUL is not whitespace), the same order every worker-authored text
 	// field uses; hold_captured_head accepts arbitrary worker input and a NUL would raise 22021.
 	clean, _ := stripNUL(capturedHead)
 	head := pgconv.TextOrNull(strings.TrimSpace(clean))
 	run, err := s.q.SetRunWallPark(ctx, store.SetRunWallParkParams{
-		ID:                   runID,
-		WorkerID:             pgconv.UUID(wkr.ID),
-		HoldCapturedHead:     head,
-		Now:                  pgconv.Time(s.now()),
-		GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+		ID:               runID,
+		WorkerID:         pgconv.UUID(wkr.ID),
+		HoldCapturedHead: head,
+		// Publication evidence for the required-recovery supersede (#3607 M2a); it only takes
+		// effect inside the same statement, bound to this generation's verification record.
+		Published:                published,
+		CheckpointContainsLatest: pgconv.BoolPtr(checkpointContainsLatest),
+		Now:                      pgconv.Time(s.now()),
+		GlobalTimeoutSeconds:     int32(s.p.RunTimeout.Seconds()),
 		// The nullable generation fence (D16). A wall_park_v1 worker stamps it; nil is honoured on a
 		// live claim and rejected on a released one by the store transition.
 		ClaimGeneration: pgconv.Int8Ptr(claimGen),

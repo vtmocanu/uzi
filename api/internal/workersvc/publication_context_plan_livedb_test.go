@@ -92,4 +92,28 @@ func TestPublicationContextQueryPlanLiveDB(t *testing.T) {
 			}
 		})
 	}
+	// A ci_fix bound to PR 7 on a branch whose history also holds an old merged PR 3 must
+	// resolve to the bound root, with no association conflict from the old PR.
+	t.Run("bound_ci_fix_with_old_merged_pr", func(t *testing.T) {
+		f.e.exec(t, `INSERT INTO runs(id,user_id,repo_id,kind,status,branch,mr_iid,issue_iid,issue_title,issue_description)
+ VALUES(gen_random_uuid(),$1,$2,'issue','completed',$3,3,900001,'old merged','')`, f.w.UserID, f.e.repoID, branch)
+		// Only one ci_fix may be active per branch, so bind the existing request.
+		boundID := id
+		f.e.exec(t, "UPDATE runs SET ci_fix_mr_iid=7 WHERE id=$1", boundID)
+		raw, err := store.New(f.e.pool).PublicationContextSnapshot(f.e.ctx, store.PublicationContextSnapshotParams{RunID: boundID, UserID: f.w.UserID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var s publicationSnapshot
+		if err := json.Unmarshal(raw, &s); err != nil || len(s.Nodes) != 1 || s.Nodes[0].Run.ID != f.id || s.AssociationUnknown || s.AncestryUnknown || s.CIMRConflict {
+			t.Fatalf("bound snapshot: nodes=%d error=%v %+v", len(s.Nodes), err, s)
+		}
+		if s.Request.CIFixMRIID == nil || *s.Request.CIFixMRIID != 7 {
+			t.Fatalf("snapshot request ci_fix_mr_iid = %v, want 7", s.Request.CIFixMRIID)
+		}
+		got, _ := resolvePublicationSnapshot(s, f.w, boundID, PublicationContextRequest{ClaimGeneration: 1, Branch: branch, CandidateHead: strings.Repeat("c", 40)})
+		if got.Status != "resolved" || got.Binding == nil || got.Binding.SourceRunID != f.id || got.Binding.MRIID != 7 {
+			t.Fatalf("bound resolution: %+v", got)
+		}
+	})
 }

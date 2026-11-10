@@ -1,0 +1,522 @@
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import type { TestContext } from "node:test";
+import { deflateSync } from "node:zlib";
+import { createHash, randomBytes } from "node:crypto";
+import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
+import { formatAttemptId } from "../src/attempt-path.js";
+import { GitCache, type EpochDiscardProofOptions, type RetainedDiscardOptions } from "../src/git.js";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
+
+const RUN = "run-content-roots";
+const BRANCH = "agent/issue-3431";
+const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+let fx: Fixture;
+let git: GitCache;
+let bare: string;
+let clonePath: string;
+let raw: string;
+let options: RetainedDiscardOptions;
+let input: EpochDiscardProofOptions;
+let scope: PodEpochReclaimScope;
+let pending: number;
+let stopped: boolean;
+let live: boolean;
+
+
+function gitIn(args: string[]): string {
+  return execFileSync("git", ["-C", bare, ...args], { env: ENV, encoding: "utf8" }).trim();
+}
+function journal(): string { return gitIn(["config", "--local", `uzi-recovery.${BRANCH}.clone`]); }
+
+beforeEach(async () => {
+  fx = makeFixture();
+  fs.writeFileSync(path.join(fx.originPath, "base"), "abcdefgh");
+  fs.writeFileSync(path.join(fx.originPath, "target"), "abcdWXYZ");
+  fs.writeFileSync(path.join(fx.originPath, "long-base"), longBase);
+  command(fx.originPath, "add", "base", "target", "long-base");
+  command(fx.originPath, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "published delta objects");
+  git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  bare = await git.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  const attempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0000000000000001");
+  const clone = await git.runnerCloneForBranch(bare, BRANCH, "issue-3431", noProofReseed, RUN, false, undefined,
+    { attemptId: attempt, isLive: () => false, beforeSeed: async () => {} });
+  clonePath = clone.path;
+  await git.markRecoveryCapture(bare, clonePath, BRANCH, RUN, attempt);
+  raw = journal();
+  const selector = { runId: RUN, generation: 1, attempt };
+  const holds = { state: "read" as const, holds: [] };
+  const lifecycle = { state: "terminal" as const, status: "completed" as const };
+  const inspection = await git.inspectRetainedSources({ selector, barePath: bare, holds, lifecycle, epoch: true, isLivePath: () => false });
+  assert.equal(inspection.partial, false);
+  pending = 0; stopped = false; live = true;
+  // Contract double counts real Git participation; descriptor ownership is tested separately.
+  scope = {
+    assertExclusive() { if (stopped) throw new Error("stopped"); },
+    get pendingMutations() { return pending; },
+    beginMutation() {
+      pending++;
+      let settled = false;
+      return { settle() { if (!settled) { settled = true; pending--; } } };
+    },
+    inheritStdio(stdio = ["pipe", "pipe", "pipe"]) { return [...stdio]; },
+    stop() { stopped = true; },
+    stopped() { return stopped; },
+    assertSettled() { if (stopped || pending) throw new Error("unsettled"); },
+    finish() { this.assertSettled(); },
+  };
+  options = { selector, confirm: inspection.sources[0]!.descriptor, holds, lifecycle, barePath: bare,
+    isLivePath: () => false, quiesce: async () => true };
+  input = { decision: { eligible: true, attested: true }, scope, selector, barePath: bare,
+    paths: [clonePath], confirm: options.confirm, expectedRawJournal: raw,
+    beforeEffect: async () => {}, checkLive: () => { if (!live) throw new Error("reservation expired"); },
+    signal: new AbortController().signal, deadline: Date.now() + 30_000 };
+});
+afterEach(() => fx?.cleanup());
+
+
+// Invoke the registered automatic proof under its production native/limit scopes.
+// The discard core intentionally refuses owed consumers before reaching this proof.
+async function observation(limits: { maxMetadataRecords?: number; maxMetadataBytes?: number; maxObjectStoreBytes?: number } = {}): Promise<boolean> {
+  const proof = git.createEpochDiscardProof(input);
+  const state = git["epochDiscardProofs"].get(proof)!;
+  return git["epochRetained"].run(git["epochLimits"](limits), () =>
+    git["withEpochNativeReads"](proof, () => git["automaticContentPreserved"](state)));
+}
+/** The object-store observation alone, so the check that ends it can be identified. */
+async function observeStores(limits: { maxMetadataRecords?: number; maxMetadataBytes?: number; maxObjectStoreBytes?: number } = {}): Promise<unknown> {
+  const proof = git.createEpochDiscardProof(input);
+  const state = git["epochDiscardProofs"].get(proof)!;
+  return git["epochRetained"].run(git["epochLimits"](limits), () => git["withEpochNativeReads"](proof, () => {
+    const automatic = { roots: [], checkLive: () => git["checkEpochDiscardLive"](state) };
+    return git["automaticObserveStores"](bare, clonePath, automatic as never);
+  }));
+}
+async function failure(action: Promise<unknown>): Promise<{ name: string; message: string; cause?: { code?: string; message?: string } }> {
+  try { await action; } catch (error) {
+    const e = error as Error & { cause?: { code?: string; message?: string } };
+    return { name: e.constructor.name, message: e.message, ...(e.cause ? { cause: e.cause } : {}) };
+  }
+  assert.fail("expected the observation to end in an error");
+}
+/** The proof refuses by the named check: a settled keep (overflow) or UNKNOWN (everything else). */
+async function refusedBy(limits: { maxMetadataRecords?: number; maxObjectStoreBytes?: number }, kind: "AutomaticBoundExceeded" | "AutomaticCompletenessUnknown",
+  reason: RegExp): Promise<void> {
+  const error = await failure(observeStores(limits));
+  assert.equal(error.name, kind);
+  assert.match(`${error.message} ${error.cause?.code ?? ""} ${error.cause?.message ?? ""}`, reason);
+}
+function command(cwd: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], { env: ENV, encoding: "utf8", stdio: "pipe" }).trim();
+}
+function hash(data: Buffer): Buffer { return createHash("sha1").update(data).digest(); }
+function oid(text: string): string { return hash(Buffer.from("blob " + Buffer.byteLength(text) + "\0" + text)).toString("hex"); }
+function integer(n: number): Buffer {
+  const out: number[] = [];
+  do { const b = n % 128; n = Math.floor(n / 128); out.push(b | (n ? 128 : 0)); } while (n);
+  return Buffer.from(out);
+}
+function entry(type: number, body: Buffer, reference = Buffer.alloc(0), declared = body.length): Buffer {
+  const out = [(type << 4) | (declared & 15)];
+  let n = Math.floor(declared / 16);
+  while (n) { out[out.length - 1]! |= 128; out.push(n % 128); n = Math.floor(n / 128); }
+  return Buffer.concat([Buffer.from(out), reference, deflateSync(body)]);
+}
+function crc(data: Buffer): number {
+  let value = 0xffffffff;
+  for (const b of data) {
+    value ^= b;
+    for (let j = 0; j < 8; j++) value = (value >>> 1) ^ ((value & 1) ? 0xedb88320 : 0);
+  }
+  return (value ^ 0xffffffff) >>> 0;
+}
+function pair(records: { id: string; data: Buffer }[], cwd = clonePath, offsets?: number[]): string {
+  const header = Buffer.alloc(12); header.write("PACK"); header.writeUInt32BE(2, 4); header.writeUInt32BE(records.length, 8);
+  const body = Buffer.concat([header, ...records.map(r => r.data)]), checksum = hash(body);
+  const pack = Buffer.concat([body, checksum]);
+  let start = 12;
+  const rows = records.map((r, i) => {
+    const row = { ...r, start: offsets?.[i] ?? start }; start += r.data.length; return row;
+  }).sort((a, b) => a.id.localeCompare(b.id));
+  const idx = Buffer.alloc(8 + 1024 + records.length * 28 + 40);
+  idx.writeUInt32BE(0xff744f63); idx.writeUInt32BE(2, 4);
+  for (let i = 0; i < 256; i++) idx.writeUInt32BE(rows.filter(r => parseInt(r.id.slice(0, 2), 16) <= i).length, 8 + 4 * i);
+  rows.forEach((r, i) => {
+    Buffer.from(r.id, "hex").copy(idx, 1032 + 20 * i);
+    idx.writeUInt32BE(crc(r.data), 1032 + 20 * rows.length + 4 * i);
+    idx.writeUInt32BE(r.start, 1032 + 24 * rows.length + 4 * i);
+  });
+  checksum.copy(idx, idx.length - 40); hash(idx.subarray(0, -20)).copy(idx, idx.length - 20);
+  const dir = path.join(cwd, cwd === bare ? "objects/pack" : ".git/objects/pack");
+  fs.mkdirSync(dir, { recursive: true });
+  const name = path.join(dir, "pack-" + checksum.toString("hex"));
+  fs.writeFileSync(name + ".pack", pack); fs.writeFileSync(name + ".idx", idx);
+  return name;
+}
+const base = "abcdefgh", target = "abcdWXYZ";
+const longBase = Buffer.concat([Buffer.from("abcd"), Buffer.from(Array.from({ length: 256 }, (_, i) => i))]);
+const program = Buffer.from([8, 8, 0x90, 4, 4, 87, 88, 89, 90]);
+function verifierSpy(t: TestContext, delegate = false): () => number {
+  const original = git["runGitWithEnv"].bind(git); let attempts = 0;
+  t.mock.method(git as unknown as { runGitWithEnv: typeof original }, "runGitWithEnv", async (...args: Parameters<typeof original>) => {
+    if (args[1].includes("verify-pack")) {
+      attempts++;
+      if (!delegate) throw new Error("verifier must not receive hazardous fixture");
+    }
+    return original(...args);
+  });
+  return () => attempts;
+}
+for (const format of ["OFS", "REF", "forwardREF"] as const) {
+  it("accepts a real verified published " + format + " delta", async t => {
+    const full = { id: oid(base), data: entry(3, Buffer.from(base)) };
+    const delta = { id: oid(target), data: entry(format === "OFS" ? 6 : 7, program,
+      format === "OFS" ? Buffer.from([full.data.length]) : Buffer.from(oid(base), "hex")) };
+    const packed = pair(format === "forwardREF" ? [delta, full] : [full, delta]);
+    assert.equal((fs.readFileSync(packed + ".pack")[12 + (format === "forwardREF" ? 0 : full.data.length)]! >> 4) & 7,
+      format === "OFS" ? 6 : 7);
+    const attempts = verifierSpy(t, true);
+    assert.equal(await observation(), true);
+    assert.ok(attempts() > 0);
+  });
+}
+// Each damage case must be refused by the check it names, not by an earlier one. A damage case that is a
+// finite-limit OVERFLOW is a settled keep (owner answer seq 1162, 2026-11-06 (R9)): the proof returns false and
+// the discard keeps the source with `epoch_content_unproven`. An overflow is bytes actually read, inflated or
+// generated passing the budget; a declared size the data contradicts is a corrupt store. Every other case is
+// corrupt or incomplete and stays UNKNOWN: it must never be laundered into a settled keep.
+const OVERFLOWS = new Set(["compressed-bomb", "physical-bomb", "delta-bomb"]);
+const REASONS = {
+  "compressed-bomb": /pack inflated byte limit/,
+  "lying-inflated-bomb": /pack compressed span or size/,
+  "lying-size": /pack compressed span or size/,
+  "trailing": /pack compressed span or size/,
+  "declared-result-lie": /delta generated size mismatch/,
+  "lying-result": /delta generated size mismatch/,
+  "zero-opcode": /invalid delta insert/,
+  "copy-outside": /delta copy outside base/,
+  "insert-truncated": /invalid delta insert/,
+  "duplicate-offset": /invalid pack offsets/,
+  "missing-offset": /invalid pack offsets/,
+  "interior-OFS": /OFS base is not an earlier record/,
+  "self-REF": /cyclic pack delta graph/,
+  "two-REF": /cyclic pack delta graph/,
+  "missing-REF": /missing same-pack REF base/,
+  "base-length": /delta base length mismatch/,
+  "physical-bomb": /object metadata byte limit/,
+  "declared-reconstruction-lie": /delta generated size mismatch/,
+  "delta-bomb": /delta generated byte limit/,
+  "forward-delta-bomb": /delta base length not yet verified/,
+  "lying-base-ref-bomb": /delta base length mismatch/,
+  "lying-base-ofs-bomb": /delta base length mismatch/,
+  "outside-offset": /invalid pack offsets/,
+  "truncated-zlib": /unexpected end of file/i,
+  "overlong-integer": /delta integer overflow/,
+  "overlong-header": /pack entry size integer overflow/,
+  "short-delta": /short delta program/,
+} as const;
+for (const damage of Object.keys(REASONS) as (keyof typeof REASONS)[]) {
+  it("rejects " + damage + " before any native verifier and preserves core evidence", async t => {
+    let full = { id: oid(base), data: entry(3, Buffer.from(base)) };
+    let delta = { id: oid(target), data: entry(7, program, Buffer.from(oid(base), "hex")) };
+    let offsets: number[] | undefined;
+    if (damage === "compressed-bomb" || damage === "lying-inflated-bomb") {
+      const bomb = Buffer.alloc(16 * 1024 * 1024, 65);
+      full = { id: oid("bomb"), data: entry(3, bomb, Buffer.alloc(0), damage === "compressed-bomb" ? bomb.length : 8) };
+    }
+    if (damage === "lying-size") full.data = entry(3, Buffer.from(base), Buffer.alloc(0), 7);
+    if (damage === "trailing") full.data = Buffer.concat([full.data, Buffer.from([1])]);
+    // The delta DECLARES a 16 MiB result but its instructions generate 8 bytes: a lie, not a bomb.
+    if (damage === "declared-result-lie") delta.data = entry(7, Buffer.concat([integer(8), integer(16 * 1024 * 1024), Buffer.from([0x90, 8])]), Buffer.from(oid(base), "hex"));
+    if (damage === "lying-result") delta.data = entry(7, Buffer.from([8, 7, ...program.subarray(2)]), Buffer.from(oid(base), "hex"));
+    if (damage === "zero-opcode") delta.data = entry(7, Buffer.from([8, 8, 0, 0]), Buffer.from(oid(base), "hex"));
+    if (damage === "copy-outside") delta.data = entry(7, Buffer.from([8, 8, 0x91, 7, 8]), Buffer.from(oid(base), "hex"));
+    if (damage === "insert-truncated") delta.data = entry(7, Buffer.from([8, 8, 8, 65]), Buffer.from(oid(base), "hex"));
+    if (damage === "duplicate-offset") offsets = [12, 12];
+    if (damage === "missing-offset") offsets = [13, 12 + full.data.length];
+    if (damage === "interior-OFS") delta.data = entry(6, program, Buffer.from([full.data.length - 1]));
+    if (damage === "self-REF") delta.data = entry(7, program, Buffer.from(oid(target), "hex"));
+    if (damage === "two-REF") full.data = entry(7, program, Buffer.from(oid(target), "hex"));
+    if (damage === "missing-REF") delta.data = entry(7, program, Buffer.from("f".repeat(40), "hex"));
+    if (damage === "base-length") delta.data = entry(7, Buffer.from([9, ...program.subarray(1)]), Buffer.from(oid(base), "hex"));
+    if (damage === "physical-bomb") full.data = entry(3, randomBytes(8 * 1024 * 1024));
+    if (damage === "declared-reconstruction-lie") {
+      // The base fits the budget; the delta declares a 16 MiB reconstruction but one 8000 byte copy generates 8000.
+      full.data = entry(3, Buffer.alloc(8000, 65));
+      delta.data = entry(7, Buffer.concat([integer(8000), integer(16 * 1024 * 1024), Buffer.from([0xb0, 0x40, 0x1f])]),
+        Buffer.from(oid(base), "hex"));
+    }
+    // Ten copies of an 8000 byte base generate 80000 bytes: past the 64 KiB budget by generated content alone.
+    const tenCopies = Buffer.concat([integer(8000), integer(80000), ...Array.from({ length: 10 }, () => Buffer.from([0xb0, 0x40, 0x1f]))]);
+    let forward = false;
+    if (damage === "delta-bomb" || damage === "forward-delta-bomb" || damage === "lying-base-ref-bomb" || damage === "lying-base-ofs-bomb") {
+      full.data = entry(3, damage.startsWith("lying-base") ? Buffer.from(base) : Buffer.alloc(8000, 65));
+      // A lying declared base length (8000, the real base is 8 bytes) lets every copy look in range: it must be
+      // refused as a mismatch BEFORE any generated byte is charged, never as an overflow.
+      delta.data = entry(damage === "lying-base-ofs-bomb" ? 6 : 7, tenCopies,
+        damage === "lying-base-ofs-bomb" ? Buffer.from([full.data.length]) : Buffer.from(oid(base), "hex"));
+      forward = damage === "forward-delta-bomb";
+    }
+    // A 31-bit offset past the pack end (the 0xffffffff form is refused earlier as an invalid large-offset slot).
+    if (damage === "outside-offset") offsets = [12, 0x7fffffff];
+    if (damage === "truncated-zlib") delta.data = delta.data.subarray(0, -1);
+    if (damage === "overlong-integer") delta.data = entry(7, Buffer.alloc(20, 0xff), Buffer.from(oid(base), "hex"));
+    if (damage === "overlong-header") full.data = Buffer.concat([
+      Buffer.from([0xb0, ...Array<number>(11).fill(0x80), 0]), deflateSync(Buffer.alloc(0)),
+    ]);
+    if (damage === "short-delta") delta.data = entry(7, Buffer.from([8, 0]), Buffer.from(oid(base), "hex"));
+    const packed = pair(forward ? [delta, full] : [full, delta], clonePath, offsets);
+    const config = fs.readFileSync(path.join(bare, "config"));
+    const ledger = await git["readAllAttemptLedgerRaw"](bare);
+    const attempts = verifierSpy(t);
+    // The discard core has no limit argument: lower the same seam for its own epoch scope.
+    const limitsOf = git["epochLimits"].bind(git);
+    t.mock.method(git as unknown as { epochLimits: typeof limitsOf }, "epochLimits",
+      (limits?: Parameters<typeof limitsOf>[0]) => limitsOf({ ...limits, maxObjectStoreBytes: 65536 }));
+    if (OVERFLOWS.has(damage)) {
+      await refusedBy({ maxObjectStoreBytes: 65536 }, "AutomaticBoundExceeded", REASONS[damage]);
+      assert.equal(await observation({ maxObjectStoreBytes: 65536 }), false, "a positively identified overflow is a settled keep");
+      assert.equal(attempts(), 0);
+      assert.equal(journal(), raw);
+      const result = await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) });
+      assert.deepEqual(result, { kind: "refused", reason: "epoch_content_unproven", consumers: [] });
+      assert.equal(stopped, false, "a settled keep does not stop the epoch scope");
+    } else {
+      await assert.rejects(observation({ maxObjectStoreBytes: 65536 }), error => {
+        assert.equal((error as Error).constructor.name, "AutomaticCompletenessUnknown");
+        const e = error as Error & { cause?: { code?: string; message?: string } };
+        assert.match(`${e.message} ${e.cause?.code ?? ""} ${e.cause?.message ?? ""}`, REASONS[damage]);
+        return true;
+      });
+      assert.equal(attempts(), 0);
+      const result = await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) });
+      assert.equal(result.kind, "unknown"); assert.equal(stopped, true);
+    }
+    assert.ok(fs.existsSync(clonePath)); assert.ok(fs.existsSync(packed + ".pack"));
+    assert.deepEqual(fs.readFileSync(path.join(bare, "config")), config);
+    assert.deepEqual(await git["readAllAttemptLedgerRaw"](bare), ledger);
+    assert.equal(attempts(), 0);
+  });
+}
+/** Counts every Git launch of the worktree stage (config, ls-tree, ls-files, check-ignore: each carries the `--attr-source` pin that the object-store launches lack); the proof has no `status` launch since Node hashes tracked content. */
+function worktreeReadSpy(t: TestContext): () => number {
+  const original = git["execEpochNative"].bind(git); let launches = 0;
+  t.mock.method(git as unknown as { execEpochNative: typeof original }, "execEpochNative", async (...args: Parameters<typeof original>) => {
+    if (args[1].some(arg => arg.startsWith("--attr-source="))) launches++;
+    return original(...args);
+  });
+  return () => launches;
+}
+it("keeps the source before any worktree Git read when a sparse tracked file differs from its index entry", async t => {
+  // Sparse and still carrying its original index entry: the content no longer matches the entry,
+  // so the Node hash comparison refuses it before the worktree stage asks Git anything. This pins the mismatch refusal only; the tracked-content BYTE BUDGET cannot be pinned
+  // through the whole proof (a committed large file also exceeds the same budget in the object
+  // observation first), so it is pinned in epoch-worktree-proof.test.ts ("F3: ...").
+  const tracked = path.join(clonePath, "base");
+  fs.truncateSync(tracked, 1024 * 1024);
+  const future = new Date(Date.now() + 3600_000);
+  fs.utimesSync(tracked, future, future);
+  const launches = worktreeReadSpy(t);
+  const reasons: string[] = [];
+  const debug = git["log"].debug.bind(git["log"]);
+  t.mock.method(git["log"], "debug", (message: string, fields?: unknown) => {
+    reasons.push(`${message} ${JSON.stringify(fields)}`);
+    return debug(message, fields as never);
+  });
+  assert.equal(await observation(), false);
+  assert.ok(reasons.some(r => /worktree differs from the index/.test(r)), `refused for the hash mismatch: ${reasons.join("|")}`);
+  assert.equal(launches(), 0, "no worktree Git read may run on a tracked file that differs from the index");
+  assert.equal(journal(), raw);
+});
+it("still proves a normal clean tree under the default budget, running its worktree Git read", async t => {
+  const launches = worktreeReadSpy(t);
+  assert.equal(await observation(), true);
+  assert.equal(launches(), 5, "config, ls-tree, ls-files and two check-ignore");
+});
+it("charges aggregate inflation across stores before verifying an earlier pair", async t => {
+  // Leave room for fixture metadata: each object fits 256 KiB, their sum does not.
+  pair([{ id: oid("source"), data: entry(3, Buffer.alloc(150000, 65)) }]);
+  pair([{ id: oid("bare"), data: entry(3, Buffer.alloc(150000, 66)) }], bare);
+  const attempts = verifierSpy(t);
+  await refusedBy({ maxObjectStoreBytes: 256 * 1024 }, "AutomaticBoundExceeded", /pack inflated byte limit/);
+  assert.equal(await observation({ maxObjectStoreBytes: 256 * 1024 }), false, "aggregate overflow is a settled keep");
+  assert.equal(attempts(), 0); assert.equal(journal(), raw);
+});
+it("charges instruction-generated delta content globally before any verifier", async t => {
+  const copies = Buffer.alloc(37500);
+  for (let i = 0; i < copies.length; i += 2) { copies[i] = 0x90; copies[i + 1] = 8; }
+  const instructions = Buffer.concat([integer(8), integer(150000), copies]);
+  for (const cwd of [clonePath, bare]) pair([
+    { id: oid(base), data: entry(3, Buffer.from(base)) },
+    { id: oid("expanded"), data: entry(7, instructions, Buffer.from(oid(base), "hex")) },
+  ], cwd);
+  const attempts = verifierSpy(t);
+  await refusedBy({ maxObjectStoreBytes: 256 * 1024 }, "AutomaticBoundExceeded", /delta generated byte limit/);
+  assert.equal(await observation({ maxObjectStoreBytes: 256 * 1024 }), false, "generated-byte overflow is a settled keep");
+  assert.equal(attempts(), 0); assert.equal(journal(), raw);
+});
+
+// Offset12 is always the first physical record and remains 32-bit; force the
+// later record into the supported anomalous 64-bit table (not every record).
+for (const version of ["1", "2,12"] as const) {
+  it("accepts verified index version " + version + " without assuming the v2 offset layout", async t => {
+    const full = { id: oid(base), data: entry(3, Buffer.from(base)) };
+    const packed = pair([full, { id: oid(target), data: entry(7, program, Buffer.from(oid(base), "hex")) }]);
+    command(clonePath, "index-pack", "--index-version=" + version, "-o", packed + ".idx", packed + ".pack");
+    const idx = fs.readFileSync(packed + ".idx");
+    if (version === "1") assert.notEqual(idx.readUInt32BE(0), 0xff744f63);
+    else {
+      assert.equal(idx.readUInt32BE(0), 0xff744f63);
+      assert.ok([0, 1].some(i => idx.readUInt32BE(1032 + 24 * 2 + 4 * i) >= 0x80000000));
+    }
+    const attempts = verifierSpy(t, true);
+    assert.equal(await observation(), true);
+    assert.ok(attempts() > 0);
+  });
+}
+it("accepts a multi-byte OFS carry after a real published base", async t => {
+  const id = hash(Buffer.concat([Buffer.from("blob " + longBase.length + "\0"), longBase])).toString("hex");
+  const full = { id, data: entry(3, longBase) };
+  const encoded: number[] = [full.data.length % 128];
+  let distance = Math.floor(full.data.length / 128);
+  while (distance) { distance--; encoded.unshift(128 | (distance % 128)); distance = Math.floor(distance / 128); }
+  assert.ok(encoded.length > 1);
+  const instructions = Buffer.concat([integer(longBase.length), program.subarray(1)]);
+  pair([full, { id: oid(target), data: entry(6, instructions, Buffer.from(encoded)) }]);
+  const attempts = verifierSpy(t, true);
+  assert.equal(await observation(), true);
+  assert.ok(attempts() > 0);
+});
+
+it("stops inflating at a small declared size when a pack header lies, instead of charging the stream's real size", async t => {
+  pair([{ id: oid("lying allocation"), data: entry(3, Buffer.alloc(16 * 1024 * 1024, 65), Buffer.alloc(0), 8) }]);
+  const attempts = verifierSpy(t);
+  // The header declares 8 bytes, which fits; the stream outgrows it, so the pack is corrupt (UNKNOWN), not over budget.
+  await refusedBy({ maxObjectStoreBytes: 65536 }, "AutomaticCompletenessUnknown", /pack compressed span or size/);
+  await assert.rejects(observation({ maxObjectStoreBytes: 65536 }),
+    error => (error as Error).constructor.name === "AutomaticCompletenessUnknown");
+  assert.equal(attempts(), 0);
+  assert.equal(journal(), raw);
+});
+
+// ---- pack index fanout (F1/F5): the declared count is an overflow only when the file layout accounts for it ----
+function manyBlobs(count: number): { id: string; data: Buffer }[] {
+  return Array.from({ length: count }, (_, i) => ({ id: oid(`fanout ${i}`), data: entry(3, Buffer.from(`fanout ${i}`)) }));
+}
+describe("pack index fanout", () => {
+  const lowered = { maxMetadataRecords: 150 };
+  it("control: a pack of 200 objects fits the default limits and is observed", async () => {
+    pair(manyBlobs(200));
+    await observeStores();
+  });
+  it("a layout-consistent count above the limit is a settled keep", async () => {
+    const packed = pair(manyBlobs(200));
+    await refusedBy(lowered, "AutomaticBoundExceeded", /pack index object count limit/);
+    assert.equal(await observation(lowered), false);
+    assert.ok(fs.existsSync(packed + ".idx"));
+  });
+  it("a v1 index with a layout-consistent count above the limit is a settled keep", async () => {
+    const packed = pair(manyBlobs(200));
+    command(clonePath, "index-pack", "--index-version=1", "-o", packed + ".idx", packed + ".pack");
+    assert.notEqual(fs.readFileSync(packed + ".idx").readUInt32BE(0), 0xff744f63);
+    await refusedBy(lowered, "AutomaticBoundExceeded", /pack index object count limit/);
+  });
+  it("a v2 index with large offsets and a consistent layout is still a settled keep", async () => {
+    const packed = pair(manyBlobs(200));
+    // Re-index with a 64-bit table entry for every object past the first: the layout stays consistent.
+    command(clonePath, "index-pack", "--index-version=2,12", "-o", packed + ".idx", packed + ".pack");
+    const idx = fs.readFileSync(packed + ".idx");
+    assert.ok(idx.length > 1032 + 28 * 200 + 40, "the index carries a large-offset table");
+    await refusedBy(lowered, "AutomaticBoundExceeded", /pack index object count limit/);
+  });
+  it("a non-monotonic fanout stays UNKNOWN, whatever the final count", async () => {
+    const packed = pair(manyBlobs(200));
+    const idx = fs.readFileSync(packed + ".idx");
+    idx.writeUInt32BE(idx.readUInt32BE(8 + 4 * 11) + 5, 8 + 4 * 10);
+    fs.writeFileSync(packed + ".idx", idx);
+    await refusedBy(lowered, "AutomaticCompletenessUnknown", /pack fanout limit or order/);
+    await refusedBy({}, "AutomaticCompletenessUnknown", /pack fanout limit or order/);
+  });
+  it("a count the file layout does not account for stays UNKNOWN, above the limit or not", async () => {
+    const packed = pair(manyBlobs(200));
+    const idx = fs.readFileSync(packed + ".idx");
+    // The last fanout slot now claims 1000 objects; the file still holds 200.
+    idx.writeUInt32BE(1000, 8 + 4 * 255);
+    fs.writeFileSync(packed + ".idx", idx);
+    await refusedBy(lowered, "AutomaticCompletenessUnknown", /short v2 index tables/);
+    await refusedBy({}, "AutomaticCompletenessUnknown", /short v2 index tables/);
+  });
+  it("a file longer than its count allows stays UNKNOWN above the limit", async () => {
+    const packed = pair(manyBlobs(200));
+    fs.appendFileSync(packed + ".idx", Buffer.alloc(8 * 200 + 8));
+    await refusedBy(lowered, "AutomaticCompletenessUnknown", /pack index size/);
+  });
+  it("a layout-consistent count above the limit is UNKNOWN when the pack header does not name that count", async () => {
+    const packed = pair(manyBlobs(200));
+    // The idx alone is consistent; the pack is garbage of a plausible size.
+    fs.writeFileSync(packed + ".pack", Buffer.alloc(64, 0x41));
+    await refusedBy(lowered, "AutomaticCompletenessUnknown", /pack header mismatch/);
+    await refusedBy({}, "AutomaticCompletenessUnknown", /pack header mismatch/);
+  });
+  it("a pack header with the wrong object count is UNKNOWN above the limit", async () => {
+    const packed = pair(manyBlobs(200));
+    const pack = fs.readFileSync(packed + ".pack");
+    pack.writeUInt32BE(199, 8);
+    fs.writeFileSync(packed + ".pack", pack);
+    await refusedBy(lowered, "AutomaticCompletenessUnknown", /pack header mismatch/);
+  });
+});
+
+// ---- delta copy bounds, inflate-chunk straddling and window refills ----
+describe("delta programs and windows that cross internal boundaries", () => {
+  // Base "abcdefgh" (8 bytes); copy `length` bytes from `offset` (opcode 0x91: one offset byte, one length byte).
+  const copy = (offset: number, length: number) => Buffer.concat([integer(8), integer(length), Buffer.from([0x91, offset, length])]);
+  const delta = (instructions: Buffer) => [
+    { id: oid(base), data: entry(3, Buffer.from(base)) },
+    { id: oid("derived " + instructions.length), data: entry(7, instructions, Buffer.from(oid(base), "hex")) },
+  ];
+  // Git computes the real ids and checksums, so the pair also passes the native verifier that follows the Node pass.
+  const reindexed = (packed: string) => command(clonePath, "index-pack", "-o", packed + ".idx", packed + ".pack");
+  it("a copy that ends exactly at the end of the base is accepted", async () => {
+    reindexed(pair(delta(copy(4, 4))));
+    await observeStores();
+  });
+  it("a copy that ends one byte past the end of the base is UNKNOWN", async () => {
+    pair(delta(copy(4, 5)));
+    await refusedBy({}, "AutomaticCompletenessUnknown", /delta copy outside base/);
+  });
+  it("an insert that straddles a 256 KiB inflate output chunk of a delta program is valid", async () => {
+    const inserts = 2100;
+    const payload = randomBytes(inserts * 127);
+    const parts: Buffer[] = [integer(8), integer(payload.length)];
+    for (let i = 0; i < inserts; i++) parts.push(Buffer.from([127]), payload.subarray(i * 127, (i + 1) * 127));
+    const program = Buffer.concat(parts);
+    assert.ok(program.length > 256 * 1024);
+    // Incompressible, so the record's compressed span is past the one-shot size and takes the streaming inflater.
+    const record = delta(program)[1]!;
+    assert.ok(record.data.length > 256 * 1024);
+    reindexed(pair([delta(program)[0]!, record]));
+    await observeStores();
+  });
+  it("a record header that straddles the end of the 8 MiB read window is valid", async () => {
+    // The second record starts 30 bytes before the end of the first window, so reading its 64 byte header refills the
+    // window while keeping those 30 bytes. The first record's length is tuned until that holds exactly.
+    const WINDOW = 8 * 1024 * 1024, keep = 30, source = randomBytes(WINDOW);
+    let n = WINDOW - keep - 12, first = entry(3, source.subarray(0, n));
+    for (let tries = 0; first.length !== WINDOW - keep - 12 && tries < 8; tries++) {
+      n += WINDOW - keep - 12 - first.length;
+      first = entry(3, source.subarray(0, n));
+    }
+    assert.equal(12 + first.length, WINDOW - keep);
+    const packed = pair([{ id: oid("window one"), data: first }, { id: oid("window two"), data: entry(3, randomBytes(200_000)) }]);
+    assert.ok(fs.statSync(packed + ".pack").size > WINDOW);
+    reindexed(packed);
+    await observeStores();
+  });
+});

@@ -6,6 +6,7 @@ import { RunView } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
 import { api, ApiError, type Run } from "../lib/api";
 import { mockRuns } from "../mocks/data/runs";
+import wording from "../../../fixtures/policy-hold/wording.json";
 
 vi.mock("../lib/useRunStream", () => ({ useRunStream: vi.fn() }));
 vi.mock("../lib/api", async (original) => {
@@ -23,6 +24,8 @@ vi.mock("../lib/api", async (original) => {
       archives: [],
     }),
     resumeRun: vi.fn().mockResolvedValue({}),
+    resumeRunNow: vi.fn().mockResolvedValue({}),
+    resumePolicyHold: vi.fn(),
     submitRunInput: vi.fn().mockResolvedValue({}),
   } };
 });
@@ -152,4 +155,192 @@ it("keeps permanent pending-outcome copy and discard action", () => {
     outcome_pending: { reason: "worker_auth_failed" } })));
   expect(screen.getByText(/The run finished on its worker, but that outcome has not reached uzi yet/)).toBeTruthy();
   expect(screen.getByRole("button", { name: "Discard held outcome…" })).toBeTruthy();
+});
+
+// Issue #3607: the owner's resume choice on a confirmed policy hold.
+const sameConversation = { ...hold, hold_cause: "refused", resume_modes: ["preserve", "fresh_one_claim"] };
+const attemptPath = { ...hold, hold_cause: "attempt_path", continuation_mode: "fresh_from_saved_work" as const,
+  resume_modes: ["fresh_from_saved_work"] };
+const modeButtons = () => screen.queryAllByRole("button", { name: new RegExp(
+  `^(${Object.values(wording.modes).map(m => m.label).join("|")})$`) });
+function bodyless() {
+  expect(api.resumeRun).not.toHaveBeenCalled();
+  expect(api.resumeRunNow).not.toHaveBeenCalled();
+}
+
+it("attempt-path episode offers only the fresh-from-saved-work action, with its consequence in the confirm", async () => {
+  render(view(held({ policy_hold: attemptPath })));
+  expect(screen.getByText(wording.causes.attempt_path)).toBeTruthy();
+  expect(modeButtons().map(b => b.textContent)).toEqual([wording.modes.fresh_from_saved_work.label]);
+  fireEvent.click(screen.getByRole("button", { name: wording.modes.fresh_from_saved_work.label }));
+  const confirm = screen.getByRole("group", { name: wording.modes.fresh_from_saved_work.label });
+  await waitFor(() => expect(document.activeElement).toBe(confirm));
+  expect(confirm.textContent).toMatch(/fresh conversation from the saved work/i);
+  const described = document.getElementById(confirm.getAttribute("aria-describedby")!);
+  expect(described?.textContent).toBe(wording.modes.fresh_from_saved_work.consequence);
+  expect(described?.textContent).toMatch(/ends for the rest of the run/);
+  expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+  bodyless();
+});
+
+it("same-conversation episode offers preserve and one-pickup fresh, nothing else", () => {
+  render(view(held({ policy_hold: sameConversation })));
+  expect(modeButtons().map(b => b.textContent)).toEqual([wording.modes.preserve.label, wording.modes.fresh_one_claim.label]);
+  expect(screen.queryByRole("button", { name: /Stop|Revise/ })).toBeNull();
+  const panel = screen.getByRole("heading", { name: "Codex policy hold" }).parentElement!;
+  expect(within(panel).getByText(/Stop is not available for a policy hold/)).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+});
+
+it.each([
+  ["empty", { ...hold, resume_modes: [] }],
+  ["absent (older API)", hold],
+  ["unknown modes only", { ...hold, resume_modes: ["resume", "toString"] }],
+])("%s resume_modes offers no resume action", (_label, policy_hold) => {
+  render(view(held({ policy_hold })));
+  expect(modeButtons()).toHaveLength(0);
+  noContinuation();
+  expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+});
+
+it("offers no action once the episode is resolved and the run left the hold", () => {
+  render(view(held({ status: "queued", hold_reason: null, policy_hold: { ...sameConversation, resolved_at: "2026-11-07T10:00:00Z", resume_modes: [] } })));
+  expect(screen.queryByRole("heading", { name: "Codex policy hold" })).toBeNull();
+  expect(modeButtons()).toHaveLength(0);
+});
+
+it("a non-owner sees the hold but no resume action", () => {
+  render(view(held({ policy_hold: sameConversation }), { owner: false }));
+  expect(modeButtons()).toHaveLength(0);
+  expect(screen.getByText(/The run's owner can choose how to continue or Cancel/)).toBeTruthy();
+});
+
+it("posts the exact body, refreshes and reports success", async () => {
+  vi.mocked(api.resumePolicyHold).mockResolvedValue({ run: held() });
+  render(view(held({ policy_hold: sameConversation })));
+  fireEvent.click(screen.getByRole("button", { name: wording.modes.preserve.label }));
+  fireEvent.change(screen.getByLabelText("Guidance for the agent (optional)"), { target: { value: "Skip the exploit PoC; patch only." } });
+  fireEvent.click(screen.getByRole("button", { name: "Confirm and resume" }));
+  await waitFor(() => expect(api.resumePolicyHold).toHaveBeenCalledExactlyOnceWith("held",
+    { mode: "preserve", expected_episode_id: "private-episode", guidance: "Skip the exploit PoC; patch only." }));
+  await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  expect(screen.getByText(/Resume the preserved conversation: resumed/)).toBeTruthy();
+  bodyless();
+});
+
+it("omits blank guidance from the body", async () => {
+  vi.mocked(api.resumePolicyHold).mockResolvedValue({ run: held() });
+  render(view(held({ policy_hold: attemptPath })));
+  fireEvent.click(screen.getByRole("button", { name: wording.modes.fresh_from_saved_work.label }));
+  fireEvent.change(screen.getByLabelText("Guidance for the agent (optional)"), { target: { value: "   " } });
+  fireEvent.click(screen.getByRole("button", { name: "Confirm and resume" }));
+  await waitFor(() => expect(api.resumePolicyHold).toHaveBeenCalledExactlyOnceWith("held",
+    { mode: "fresh_from_saved_work", expected_episode_id: "private-episode" }));
+});
+
+it("shows a replayed request as already resumed, and keeps it after the hold ends", async () => {
+  vi.mocked(api.resumePolicyHold).mockResolvedValue({ run: held(), replay: true });
+  const rendered = render(view(held({ policy_hold: sameConversation })));
+  fireEvent.click(screen.getByRole("button", { name: wording.modes.fresh_one_claim.label }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm and resume" }));
+  const note = await screen.findByText("Already resumed (this request was applied earlier).");
+  expect(note.getAttribute("role")).toBe("status");
+  rendered.rerender(view(held({ status: "queued", hold_reason: null, policy_hold: { ...sameConversation, resume_modes: [] } })));
+  expect(screen.getByText("Already resumed (this request was applied earlier).")).toBeTruthy();
+  await waitFor(() => expect(document.activeElement).toBe(
+    screen.getByText("Already resumed (this request was applied earlier).").parentElement));
+});
+
+it.each([
+  "policy hold changed or does not match this mode; refresh the run and choose again",
+  "already resumed with different guidance; the new guidance was not recorded",
+])("a 409 shows the server message and offers a refresh: %s", async (message) => {
+  vi.mocked(api.resumePolicyHold).mockRejectedValue(new ApiError(409, message));
+  render(view(held({ policy_hold: sameConversation })));
+  fireEvent.click(screen.getByRole("button", { name: wording.modes.preserve.label }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm and resume" }));
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toBe(message);
+  refreshRun.mockClear();
+  fireEvent.click(screen.getByRole("button", { name: "Refresh run" }));
+  expect(refreshRun).toHaveBeenCalledTimes(1);
+});
+
+it("counts guidance in UTF-8 bytes and blocks submit above 16,000", () => {
+  render(view(held({ policy_hold: sameConversation })));
+  fireEvent.click(screen.getByRole("button", { name: wording.modes.preserve.label }));
+  const box = screen.getByLabelText("Guidance for the agent (optional)");
+  const submitButton = () => screen.getByRole("button", { name: "Confirm and resume" }) as HTMLButtonElement;
+  // "é" is 2 bytes: 8,000 of them sit exactly on the cap.
+  fireEvent.change(box, { target: { value: "é".repeat(8000) } });
+  expect(screen.getByText("16,000 / 16,000 bytes")).toBeTruthy();
+  expect(submitButton().disabled).toBe(false);
+  expect(screen.queryByRole("alert")).toBeNull();
+  fireEvent.change(box, { target: { value: "é".repeat(8000) + "a" } });
+  expect(screen.getByText("16,001 / 16,000 bytes")).toBeTruthy();
+  expect(submitButton().disabled).toBe(true);
+  expect(screen.getByRole("alert").textContent).toMatch(/over the 16,000-byte limit/);
+  expect(box.getAttribute("aria-describedby")).toBe(screen.getByText("16,001 / 16,000 bytes").id);
+  fireEvent.click(submitButton());
+  expect(api.resumePolicyHold).not.toHaveBeenCalled();
+});
+
+it("Escape and Back close the confirm and return focus to the action", async () => {
+  render(view(held({ policy_hold: sameConversation })));
+  fireEvent.click(screen.getByRole("button", { name: wording.modes.fresh_one_claim.label }));
+  const confirm = screen.getByRole("group", { name: wording.modes.fresh_one_claim.label });
+  fireEvent.keyDown(confirm, { key: "Escape" });
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: wording.modes.fresh_one_claim.label })));
+  fireEvent.click(screen.getByRole("button", { name: wording.modes.preserve.label }));
+  fireEvent.click(screen.getByRole("button", { name: "Back" }));
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: wording.modes.preserve.label })));
+  expect(api.resumePolicyHold).not.toHaveBeenCalled();
+});
+
+it("keeps typed guidance when Escape closes the confirm and the same mode is reopened", () => {
+  render(view(held({ policy_hold: sameConversation })));
+  const label = wording.modes.preserve.label;
+  fireEvent.click(screen.getByRole("button", { name: label }));
+  const box = screen.getByLabelText("Guidance for the agent (optional)") as HTMLTextAreaElement;
+  fireEvent.change(box, { target: { value: "Keep the patch minimal." } });
+  fireEvent.keyDown(box, { key: "Escape" });
+  expect(screen.queryByRole("group", { name: label })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: label }));
+  expect((screen.getByLabelText("Guidance for the agent (optional)") as HTMLTextAreaElement).value).toBe("Keep the patch minimal.");
+});
+
+it("closes the confirm when the episode changes under it", () => {
+  const rendered = render(view(held({ policy_hold: sameConversation })));
+  fireEvent.click(screen.getByRole("button", { name: wording.modes.preserve.label }));
+  expect(screen.getByRole("group", { name: wording.modes.preserve.label })).toBeTruthy();
+  rendered.rerender(view(held({ policy_hold: { ...sameConversation, outcome_id: "next-episode" } })));
+  expect(screen.queryByRole("group", { name: wording.modes.preserve.label })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Confirm and resume" })).toBeNull();
+});
+
+it.each([
+  [null, wording.unknown_cause],
+  [undefined, wording.unknown_cause],
+  ["cause_from_the_future", wording.unknown_cause],
+  ["fresh_start_uncertain", wording.causes.fresh_start_uncertain],
+])("cause %s reads its table wording", (hold_cause, text) => {
+  render(view(held({ policy_hold: { ...sameConversation, hold_cause } })));
+  expect(screen.getByText(text)).toBeTruthy();
+  expect(screen.queryByText(/no provider (thread|conversation) (was )?started/i)).toBeNull();
+});
+
+it("states a pending one-pickup fresh start and recovery verification", () => {
+  render(view(held({ policy_hold: { ...sameConversation, pending_fresh: true, recovery_required: true, recovery_verified_this_claim: false } })));
+  expect(screen.getByText(/next pickup may start one new conversation/)).toBeTruthy();
+  expect(screen.getByText(/required recovery checkpoint is recorded; the current pickup has not verified it/)).toBeTruthy();
+});
+
+it.each([
+  [true, 1],
+  [false, 0],
+])("resolved hold: pending_fresh=%s shows the fresh-start notice %s time(s), without actions", (pending_fresh, count) => {
+  render(view(held({ status: "queued", hold_reason: null, policy_hold: { ...hold, pending_fresh } })));
+  expect(screen.queryAllByText(/One-pickup fresh start pending: the next pickup may start one new conversation from the saved work\./)).toHaveLength(count);
+  expect(screen.queryByRole("heading", { name: "Codex policy hold" })).toBeNull();
+  expect(screen.queryByRole("group", { name: "Continue this run" })).toBeNull();
 });

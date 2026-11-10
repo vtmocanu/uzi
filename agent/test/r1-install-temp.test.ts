@@ -109,7 +109,7 @@ it("R1 policy selection remains protected throughout its own temporary installat
   await box.init();
   const request = {
     outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 7, claim_generation: 7,
-    detail: "refused" as const, continuation_mode: "same_conversation" as const,
+    detail: "refused" as const, cause: "refused" as const, continuation_mode: "same_conversation" as const,
     tag: "cyberPolicy" as const, phase: "implementation" as const,
     correlation_id: "pr-" + "a".repeat(32) + "-1", published: false,
   };

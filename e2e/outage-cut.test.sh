@@ -4,6 +4,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PHASE="${OUTBOX_TEST_PHASE:-$ROOT/e2e/phases/52-api-outage-outbox.sh}"
 SCRATCH="$(mktemp -d "$ROOT/.uzi/scratch/outage-cut.XXXXXX")"
 trap 'rm -rf "$SCRATCH"' EXIT
+# The real phase-52 helpers snapshot agent logs before stop/recreate (#4060); the fake compose below
+# answers the ps/logs reads against the scratch RUNROOT.
+eval "$(awk '/^capture_agent_logs\(\) \{/,/^\}/' "$ROOT/e2e/lib.sh")"
 fixture() {
   # shellcheck disable=SC2034  # evaluated real helpers consume these variables
   RUNROOT="$SCRATCH" PROJECT=fixture COMPOSE=(fake_compose) OUTBOX_BASE_COMPOSE=(fake_compose) OUTBOX_RESTORE_NEEDED=0 RUN_B1=00000000-0000-0000-0000-000000000001

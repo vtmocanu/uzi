@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { ClaimResponse, UserInput } from "../src/protocol.js";
-import { api, installHarness } from "./runner-harness.js";
+import { api, client, installHarness } from "./runner-harness.js";
+import { newApi } from "./gate-revision-harness.js";
 import { waitForTestEvent } from "./helpers.js";
 import {
   PLAN_V1,
@@ -222,6 +223,68 @@ describe("#1604 — boundaries of the revise receipt", () => {
       assert.ok(api.isApplied(s.runId, rej!.id), "the superseded reject is applied");
       assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
     }));
+});
+
+// Issue #3985: the production SdkExecutor (scripted model, no real model) asks a clarification while
+// revising a HUMAN revise_plan verdict on a plan cross-check run (auto-approve cleared). The owner's
+// answer settles through `clarification_settled` back to the plan gate; planning resumes, plan B is
+// published at awaiting_approval, and no implementation turn is dispatched until an approve verdict
+// bound to plan B. A refused settlement returns no answer and dispatches no implementation.
+describe("#3985 — clarification during a human plan revision (production SdkExecutor)", () => {
+  const FEATURE = "clarification_revision_settlement_v1";
+  const required = { plan_cross_check_required: true, auto_approve: false } as Partial<ClaimResponse>;
+  function settlementAck(applied: boolean): void {
+    api.stateAckWire = (body, run) => body.status !== "clarification_settled" ? undefined : {
+      status: applied ? 200 : 409,
+      body: { run: { ...run, status: "awaiting_approval" }, ...(applied ? { disposition: "clarification_settled" } : {}) },
+    };
+  }
+
+  it("success: answer, settlement, planning resumes, plan B at awaiting_approval, implementation only after approve", () =>
+    scenario(async (s) => {
+      newApi();
+      client.protocolFeatures = [...client.protocolFeatures, FEATURE];
+      settlementAck(true);
+      s.model.askInNextRevise = true;
+      const first = await s.toFirstGate();
+      api.onState(s.runId, (b) => {
+        if (b.status === "awaiting_input" && b.open_question_id) s.send(s.answer(b.open_question_id));
+      });
+      s.send(s.input("revise_plan", FEEDBACK));
+      assert.ok(await until(() => s.gates(first).length >= 2 || first.finished), s.statuses(first).join(","));
+      assert.equal(s.gates(first)[1]?.plan_md, revisedPlan(1), "plan B is published at the gate");
+      const statuses = s.statuses(first);
+      const asked = statuses.indexOf("awaiting_input");
+      const settled = statuses.indexOf("clarification_settled");
+      assert.ok(asked >= 0 && settled > asked, statuses.join(","));
+      assert.equal(statuses.slice(asked, statuses.lastIndexOf("awaiting_approval")).includes("running"), false,
+        "an answer to a revise clarification is never reported as running");
+      assert.equal(s.model.count("implement"), 0, "nothing is implemented before an approve bound to plan B");
+      s.send(s.input("approve_plan"));
+      await s.finish(first);
+      assert.equal(s.model.count("implement"), 1, "implementation starts after the approve");
+      assert.ok(s.statuses(first).includes("completed"), s.statuses(first).join(","));
+    }, required));
+
+  it("refusal: no answer reaches the model and nothing is implemented", () =>
+    scenario(async (s) => {
+      newApi();
+      client.protocolFeatures = [...client.protocolFeatures, FEATURE];
+      settlementAck(false);
+      s.model.askInNextRevise = true;
+      const first = await s.toFirstGate();
+      api.onState(s.runId, (b) => {
+        if (b.status === "awaiting_input" && b.open_question_id) s.send(s.answer(b.open_question_id));
+      });
+      s.send(s.input("revise_plan", FEEDBACK));
+      await s.finish(first);
+      const statuses = s.statuses(first);
+      assert.ok(statuses.includes("clarification_settled"), statuses.join(","));
+      assert.equal(s.gates(first).length, 1, "no plan B after a refused settlement");
+      assert.equal(s.model.count("implement"), 0, "no implementation dispatch");
+      assert.equal(s.model.revisions, 0, "the revision turn never received the answer");
+      assert.equal(statuses.includes("completed"), false, statuses.join(","));
+    }, required));
 });
 
 describe("#1604 — receipt scheduling around a revise that becomes ready", () => {

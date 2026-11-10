@@ -40,7 +40,7 @@ export async function resolvePolicyOutcome(
     if (authority && Number.isSafeInteger(authority.claimGeneration) && authority.claimGeneration > original.source_generation) {
       request = validatePolicyHoldRequest({
         outcome_id: original.outcome_id, source_generation: original.source_generation,
-        claim_generation: authority.claimGeneration, detail: "resume_rejected",
+        claim_generation: authority.claimGeneration, detail: "resume_rejected", cause: "pending_conversion",
         continuation_mode: authority.continuationMode, published: false,
       });
     }

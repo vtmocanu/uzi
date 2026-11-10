@@ -342,6 +342,7 @@ stop_outbox_agent() {
   # Entry inherits phase 51 quiescence and a stopped agent; later calls name only
   # the preceding fixture(s). Settlement never releases custody or changes limits.
   if [ "$#" -gt 0 ]; then wait_runs_terminal_off_worker 120 "$@" || return 1; fi
+  capture_agent_logs 52-api-outage-outbox before-stop
   "${COMPOSE[@]}" stop agent >/dev/null || return 1
 }
 # Hash the complete ordered ref/OID set, including main and every publication branch.
@@ -419,6 +420,7 @@ recreate_outbox_api() {
 recreate_outbox_agent() {
   stop_outbox_agent "$@" || fail "outbox phase: unsafe agent recreation"
   probe_outbox_feature "${E2E_RUN_PUBLICATION_RESUME_ENABLED:-true}" || fail "outbox phase: API feature probe failed"
+  capture_agent_logs 52-api-outage-outbox before-recreate-up
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null || fail "outbox phase: agent recreation failed"
   OUTBOX_AGENT_CONTAINER="$("${COMPOSE[@]}" ps -q agent)" || fail "outbox phase: agent container missing"
   wait_worker_online || fail "outbox phase: agent registration failed"
@@ -718,6 +720,7 @@ terminal_lost_b2=0; if wait_terminal_lost "$RUN_B2"; then terminal_lost_b2=1; fi
 # the same container + the same /data volume, so the existing outbox tree is what the worker boots
 # onto (no --force-recreate, which would keep the named volume too but discard the container).
 say "restarting the agent container mid-outage (its /data outbox tree persists across the restart)"
+capture_agent_logs 52-api-outage-outbox before-restart
 "${COMPOSE[@]}" restart agent >/dev/null 2>&1
 # Bring the api back. The restarted worker — parked in its register-retry while the api was down —
 # registers with its pending-terminal snapshot, then the boot gate resolves the journal BEFORE the
@@ -926,8 +929,10 @@ f42_restart_cycle() {
   fi
   if [ -z "$err" ]; then
     say "SIGKILLing the agent container with the api still down (run $run generation $gen)"
+    capture_agent_logs 52-api-outage-outbox before-sigkill
     rc=0; "${COMPOSE[@]}" kill -s SIGKILL agent >/dev/null 2>&1 || rc=$?
     [ "$rc" = 0 ] || err="could not SIGKILL the agent container (exit $rc)"
+    capture_agent_logs 52-api-outage-outbox before-start
     rc=0; "${COMPOSE[@]}" start agent >/dev/null 2>&1 || rc=$?
     [ "$rc" = 0 ] || err="${err:+$err; }could not start the agent container again (exit $rc)"
   fi

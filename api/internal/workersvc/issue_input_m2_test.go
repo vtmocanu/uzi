@@ -53,7 +53,7 @@ func TestM2CreatePolicyScheduleOnly(t *testing.T) {
 				var err error
 				switch origin {
 				case "manual":
-					_, err = svc.CreateRun(context.Background(), user, repo, 4, "caller raw body", nil, nil, false, nil, nil, nil)
+					_, err = svc.CreateRun(context.Background(), user, repo, 4, "caller raw body", nil, nil, false, nil, nil, nil, nil)
 				case "poller":
 					_, err = svc.CreateAutopilotRun(context.Background(), user, repo, 4, "caller raw body", nil)
 				case "schedule_manual":

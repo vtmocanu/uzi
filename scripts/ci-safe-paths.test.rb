@@ -88,7 +88,7 @@ assert = lambda do |actual, expected, label|
 end
 components = %w[validate-api lint-api test-api test-api-store-it test-codex-refresh-lostreply-e2e validate-controller lint-controller test-controller validate-web test-web test-web-browser validate-agent test-agent-shard]
 context = {
-  'github.event_name' => 'pull_request', 'needs.changes.result' => 'success',
+  'github.event_name' => 'pull_request', 'github.ref' => 'refs/pull/1/merge', 'needs.changes.result' => 'success',
   'needs.changes.outputs.skip_components' => '1',
   'needs.changes.outputs.worker_uid' => 'false', 'needs.validate-agent.result' => 'success',
   'needs.test-agent-shard.result' => 'skipped', 'needs.test-agent-worker-uid.result' => 'skipped',
@@ -117,10 +117,30 @@ components.each do |job|
   # test-api-store-it uses always() (the test-agent pattern) and is asserted below.
   assert.call(run_job.call(job, 'cancelled' => true), false, "supersession cancels #{job}") unless job == 'test-api-store-it'
 end
+assert.call(jobs.key?('deadcode-api'), false, 'no deadcode job in PR/main CI (#4109: nightly)')
+assert.call(jobs.fetch('lint-api').fetch('steps').map { |step| step['run'].to_s }.join.include?('task deadcode:api'), false, 'lint-api no longer runs deadcode')
+nightly = YAML.safe_load(File.read(File.join(root, '.github/workflows/deadcode-nightly.yml')))
+assert.call(nightly.fetch('on').keys.sort, %w[schedule workflow_dispatch], 'deadcode runs nightly and on dispatch only')
+assert.call(nightly.fetch('permissions'), {'contents' => 'read'}, 'nightly deadcode token is read-only')
+dc_job = nightly.fetch('jobs').fetch('deadcode-api')
+assert.call(dc_job.key?('permissions'), false, 'the job running the Go tool keeps the read-only token')
+assert.call(dc_job.fetch('steps').map { |step| step['run'].to_s }.join.include?('task deadcode:api'), true, 'nightly runs the gate target')
+reporter = nightly.fetch('jobs').fetch('report')
+assert.call(reporter.fetch('permissions'), {'issues' => 'write'}, 'only the reporter writes issues')
+assert.call(reporter.fetch('steps').any? { |step| step['uses'].to_s.include?('checkout') }, false, 'the reporter checks out no code')
+assert.call(reporter.fetch('if').include?("github.ref == 'refs/heads/main'"), true, 'the reporter files only for main')
+# The reporter keys on the job result, so a setup failure (deadcode step skipped) still files.
+assert.call(nightly.fetch('jobs').fetch('deadcode-api').key?('outputs'), false, 'reporter does not read a step-outcome output')
+report_ctx = {'github.ref' => 'refs/heads/main', 'needs.deadcode-api.result' => 'failure'}
+assert.call(Expression.new(reporter.fetch('if'), report_ctx).value, true, 'a failed nightly job files an issue, whichever step failed')
+%w[success cancelled skipped].each do |result|
+  assert.call(Expression.new(reporter.fetch('if'), report_ctx.merge('needs.deadcode-api.result' => result)).value, false, "no issue after #{result}")
+end
+assert.call(Expression.new(reporter.fetch('if'), report_ctx.merge('github.ref' => 'refs/heads/ci/x')).value, false, 'no issue off main')
 assert.call(jobs.fetch('lint-repo').key?('needs'), false, 'repo gate remains independent')
 assert.call(jobs.fetch('lint-repo').key?('if'), false, 'repo gate remains unconditional')
 assert.call(workflow.fetch('on').keys.sort, %w[pull_request push], 'triggers unchanged')
-assert.call(workflow.fetch('concurrency').fetch('cancel-in-progress'), true, 'supersession retained')
+assert.call(workflow.fetch('concurrency').fetch('cancel-in-progress'), "${{ github.ref != 'refs/heads/main' }}", 'PR supersession retained; main runs finish')
 assert.call(run_job.call('test-agent-worker-uid'), false, 'safe PR skips worker lane')
 %w[failure cancelled skipped].each do |result|
   assert.call(run_job.call('test-agent-worker-uid', 'needs.changes.result' => result), true, 'unknown classification runs worker lane')
@@ -144,39 +164,88 @@ end
 safe_step = jobs.fetch('changes').fetch('steps').find { |step| step['id'] == 'safe' }
 raise 'missing safe classification step' unless safe_step
 assert.call(jobs.fetch('changes').fetch('outputs').fetch('skip_components'), '${{ steps.safe.outputs.skip_components }}', 'classification output wiring')
-assert.call(safe_step.fetch('env'), {'ALL_COUNT' => '${{ steps.filter.outputs.all_count }}', 'SAFE_COUNT' => '${{ steps.filter.outputs.component_safe_count }}', 'EXPECTED_COUNT' => '${{ github.event.pull_request.changed_files }}'}, 'count source wiring')
-classify = lambda do |all, safe, expected|
+safe_env = safe_step.fetch('env')
+assert.call(safe_env.reject { |key, _| key == 'SAFE_ROOTS' }, {'ALL_COUNT' => '${{ steps.filter.outputs.all_count }}', 'SAFE_COUNT' => '${{ steps.filter.outputs.component_safe_count }}', 'EXPECTED_COUNT' => '${{ github.event.pull_request.changed_files }}'}, 'count source wiring')
+# A pin-veto fixture repo: a tracked file under each safe root, optionally holding text.
+pin_repo = lambda do |text|
+  dir = Dir.mktmpdir('ci-safe-pins')
+  git_env = {'GIT_CONFIG_GLOBAL' => '/dev/null', 'GIT_CONFIG_SYSTEM' => '/dev/null'}
+  Open3.capture3(git_env, 'git', 'init', '-q', dir)
+  safe_env.fetch('SAFE_ROOTS').split.each do |root_path|
+    FileUtils.mkdir_p(File.join(dir, root_path))
+    File.write(File.join(dir, root_path, 'SKILL.md'), "# skill\n#{text}\n")
+  end
+  File.write(File.join(dir, 'outside.md'), 'codex-cli ' + "0.0.1\n")
+  _, err, status = Open3.capture3(git_env, 'git', '-C', dir, 'add', '-A')
+  raise err unless status.success?
+  dir
+end
+clean_repo = pin_repo.call('no pins here')
+classify = lambda do |all, safe, expected, dir = clean_repo|
   Tempfile.create('ci-safe-output') do |file|
-    _, err, status = Open3.capture3({'ALL_COUNT' => all, 'SAFE_COUNT' => safe, 'EXPECTED_COUNT' => expected, 'GITHUB_OUTPUT' => file.path}, 'bash', '-e', '-c', safe_step.fetch('run'))
+    env = {'ALL_COUNT' => all, 'SAFE_COUNT' => safe, 'EXPECTED_COUNT' => expected, 'SAFE_ROOTS' => safe_env.fetch('SAFE_ROOTS'), 'GITHUB_OUTPUT' => file.path, 'GIT_CONFIG_GLOBAL' => '/dev/null', 'GIT_CONFIG_SYSTEM' => '/dev/null'}
+    _, err, status = Open3.capture3(env, 'bash', '-e', '-c', safe_step.fetch('run'), chdir: dir)
     raise err unless status.success?
     File.read(file.path).strip
   end
 end
 assert.call(classify.call('2', '2', '2'), 'skip_components=1', 'nonempty complete safe list')
+# The Codex pin scan in test-agent greps every tracked file, safe roots included; a pin
+# prefix under a safe root must run full CI, a pin outside them is not this veto's concern.
+pin_prefixes = ['/opt/uzi-codex/', 'codex-cli ', 'Codex worker uses runtime ']
+pin_prefixes.each do |prefix|
+  assert.call(classify.call('2', '2', '2', pin_repo.call("#{prefix}9.9.9")), 'skip_components=0', "pin prefix #{prefix.inspect} vetoes the skip")
+end
+not_a_repo = Dir.mktmpdir('ci-safe-norepo')
+assert.call(classify.call('2', '2', '2', not_a_repo), 'skip_components=0', 'git grep error runs full CI')
+assert.call(safe_step.fetch('run').scan(/-e '([^']+)'/).flatten, pin_prefixes, 'veto greps exactly the pin prefixes')
+pin_source = File.read(File.join(root, 'agent/test/codex-pins.ts'))
+scan_pattern = pin_source[/PIN_SCAN_PATTERN = `\(([^)]*)\)/, 1] or raise 'PIN_SCAN_PATTERN not found'
+assert.call(scan_pattern.split('|'), pin_prefixes, 'veto prefixes match the agent pin scan')
 [['2', '1', '2'], ['0', '0', '0'], ['', '', ''], ['x', 'x', 'x'], ['01', '01', '01'], ['2', '2', '3'], ['2', '2', ''], ['3000', '3000', '3001']].each do |counts|
   assert.call(classify.call(*counts), 'skip_components=0', "unsafe/malformed/truncated counts #{counts}")
 end
 filter_step = jobs.fetch('changes').fetch('steps').find { |step| step['id'] == 'filter' }
 rules = YAML.safe_load(filter_step.fetch('with').fetch('filters'))
 assert.call(rules.fetch('all'), ['**'], 'all changed paths counted')
-assert.call(rules.fetch('component_safe'), [{'added|modified' => '.agents/skills/uzi-lander/**'}], 'only audited additions/modifications allowed')
+assert.call(rules.fetch('component_safe'), [{'added|modified' => '.agents/skills/uzi-lander/**'}, {'added|modified' => 'changelog.d/**'}], 'only audited additions/modifications allowed')
+assert.call(safe_env.fetch('SAFE_ROOTS').split, rules.fetch('component_safe').map { |rule| rule.values.first.delete_suffix('/**') }, 'veto roots are exactly the component_safe roots')
 flags = File::FNM_PATHNAME | File::FNM_DOTMATCH
-allowed = rules.fetch('component_safe').first
-statuses, pattern = allowed.first
-fixtures = [
-  [['modified', '.agents/skills/uzi-lander/SKILL.md']],
-  [['added', '.agents/skills/uzi-lander/references/new.md']],
-  [['modified', '.agents/skills/uzi-lander/SKILL.md'], ['added', 'fixtures/new.json']],
-  [['deleted', '.agents/skills/uzi-lander/SKILL.md']],
-  [['deleted', 'api/old.go'], ['added', '.agents/skills/uzi-lander/new.go']],
-  [['deleted', '.agents/skills/uzi-lander/old.md'], ['added', 'api/new.go']],
-  [['modified', '.agents/skills/uzi-watcher/scripts/backup-runs.sh']]
-]
-fixtures.each_with_index do |files, index|
-  # Ruby's terminal ** needs /* to match nested files as picomatch's ** does.
-  safe = files.count { |status, path| statuses.split('|').include?(status) && File.fnmatch(pattern.sub(/\/\*\*$/, '/**/*'), path, flags) }
-  assert.call(classify.call(files.length.to_s, safe.to_s, files.length.to_s), index < 2 ? 'skip_components=1' : 'skip_components=0', "path/status fixture #{index}")
+# A file counts as safe when any component_safe rule matches it (dorny counts it once).
+safe_file = lambda do |status, path|
+  rules.fetch('component_safe').any? do |rule|
+    statuses, pattern = rule.first
+    # Ruby's terminal ** needs /* to match nested files as picomatch's ** does.
+    statuses.split('|').include?(status) && File.fnmatch(pattern.sub(/\/\*\*$/, '/**/*'), path, flags)
+  end
 end
+fixtures = [
+  [true, [['modified', '.agents/skills/uzi-lander/SKILL.md']]],
+  [true, [['added', '.agents/skills/uzi-lander/references/new.md']]],
+  [true, [['added', 'changelog.d/0b8e1c2a-1d3f-4c5e-9a7b-6f2d4e8c1a3b.md']]],
+  [true, [['modified', '.agents/skills/uzi-lander/references/advisory.md'], ['added', 'changelog.d/0b8e1c2a-1d3f-4c5e-9a7b-6f2d4e8c1a3b.md']]],
+  [false, [['modified', '.agents/skills/uzi-lander/SKILL.md'], ['added', 'fixtures/new.json']]],
+  [false, [['deleted', '.agents/skills/uzi-lander/SKILL.md']]],
+  [false, [['deleted', 'api/old.go'], ['added', '.agents/skills/uzi-lander/new.go']]],
+  [false, [['deleted', '.agents/skills/uzi-lander/old.md'], ['added', 'api/new.go']]],
+  [false, [['modified', '.agents/skills/uzi-watcher/scripts/backup-runs.sh']]],
+  [false, [['deleted', 'changelog.d/0b8e1c2a-1d3f-4c5e-9a7b-6f2d4e8c1a3b.md']]],
+  [false, [['added', 'changelog.d/0b8e1c2a-1d3f-4c5e-9a7b-6f2d4e8c1a3b.md'], ['modified', 'web/src/App.tsx']]],
+  [false, [['modified', 'CHANGELOG.md']]]
+]
+fixtures.each_with_index do |(skips, files), index|
+  safe = files.count { |status, path| safe_file.call(status, path) }
+  assert.call(classify.call(files.length.to_s, safe.to_s, files.length.to_s), skips ? 'skip_components=1' : 'skip_components=0', "path/status fixture #{index}")
+end
+# changelog.d is safe only while no component reads it. Direct readers: the agent Codex pin
+# scan must keep excluding it, and no component or e2e tree may name it. Dynamic readers
+# a literal sweep cannot see: api/cmd/rollupbench/corpus.go (loadTextPool) reads tracked
+# text files in sorted order up to a 24 MiB cap, which fills from agent/ and api/ before
+# changelog.d, and its test asserts no corpus digest. Re-audit this entry if that reader
+# gains a fixed digest or a cap large enough to reach changelog.d.
+assert.call(File.read(File.join(root, 'agent/test/codex-pins.ts')).include?('":(exclude)changelog.d/**"'), true, 'agent pin scan excludes changelog.d')
+component_refs, _, refs_status = Open3.capture3('git', '-C', root, 'grep', '-l', '-F', 'changelog.d', '--', 'api', 'web', 'controller', 'agent', 'docs', 'deploy/chart', 'e2e', ':!agent/test/codex-pins.ts')
+assert.call([refs_status.exitstatus, component_refs], [1, ''], 'no direct component reference to changelog.d')
 # One LiveDB execution backs both required contexts: the producer carries the canonical
 # recipe (the sweep with its livedb-skip-guard, then the combined proofs); test-api-store-it
 # only aggregates the producer's result.

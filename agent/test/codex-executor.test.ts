@@ -7,7 +7,7 @@ import { m3Calls } from "./m3-recovery-fixture.js";
 import { PARK_RUN_CONTINUATION } from "../src/park-run.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
-import { describe, it, mock, type TestContext } from "node:test";
+import { afterEach, beforeEach, describe, it, mock, type TestContext } from "node:test";
 import { dependencyWaitQuestion, dependencyWaitAnswer, dependencyWaitProgress, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import assert from "node:assert/strict";
 import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWallRunner } from "./dependency-wait-runner-fixture.js";
@@ -57,7 +57,7 @@ import {
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
 import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
-import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
+import { PolicyContinuationRejected, ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
 import { RunRunner } from "../src/runner.js";
 import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
@@ -70,7 +70,11 @@ import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
 import { leadRequestCaseAgents, makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
-import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
+import { PolicyContextRefusal, TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
+import { runDiskReclaimPass } from "../src/disk-reclaim.js";
+import { reclaimStrandedRunHomes } from "../src/home-reclaim.js";
+import { RunDiskLocks } from "../src/run-disk-locks.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { PlanRevisionRecovery } from "../src/plan-revision-retry.js";
 import { WORKER_UID, RUNNER_UID, runnerCommand, commandRootCommand } from "../src/runner-uid.js";
@@ -107,9 +111,9 @@ import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
-import { detectRepoAgents, filterRepoAgentModel } from "../src/repoagents.js";
+import { detectRepoAgents, filterRepoAgentModel, REPO_AGENT_DENIED_TOOLS } from "../src/repoagents.js";
 import { parseCodexAgentFile } from "../src/repoagents-codex.js";
-import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND, SUBAGENT_SAFETY_APPEND } from "../src/prompt.js";
+import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND, REPO_SUBAGENT_PLANNING_APPEND, SUBAGENT_SAFETY_APPEND } from "../src/prompt.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
@@ -117,7 +121,7 @@ import { CommandCacheStartError } from "../src/codex/launcher.js";
 import { isBrokerModelCommand, type CapturedMemoryContext, type SpawnCommandOptions } from "../src/codex/broker.js";
 import { WorkerMemoryCommands } from "../src/worker-memory-commands.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
-import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/protocol.js";
+import type { ClaimResponse, MemoryReservationRequest, StateAck, StateRequest } from "../src/protocol.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
@@ -3890,7 +3894,7 @@ describe("compact policy hold production producer", () => {
         }
         assert.match(packets[0]!.head ?? "", /^[0-9a-f]{40}$/, JSON.stringify(captureLog.lines.filter(line => rec(line).level === "warn")));
         assert.deepEqual(packets[0], {
-          outcome_id: packets[0]!.outcome_id, source_generation: 7, claim_generation: 7, detail: "refused",
+          outcome_id: packets[0]!.outcome_id, source_generation: 7, claim_generation: 7, detail: "refused", cause: "refused",
           continuation_mode: "same_conversation", tag, phase: phase === "plan" ? "planning" : "implementation",
           correlation_id: packets[0]!.correlation_id,
           ...(mode === "long_session" ? {} : { session_id: "th-1" }),
@@ -8602,6 +8606,55 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
     assert.match(childReply.text ?? "", /not permitted during the plan phase/, "the child deny is write_denied_in_plan");
     assert.deepEqual(childFileop.ops, [], "no child fileop op ran during the plan phase");
     assert.equal(rig.transport.turnStartCount, 2, "the child turn ran on the same transport (demuxed)");
+  });
+
+  it("(P3) PRD #3914 M3: a repo agent spawned during a repo-sourced PLAN turn cannot write", async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const repoWriter: AgentTemplate = { name: "repo-writer", description: "a repo writer", prompt_body: "REPO WRITER BODY", tools: null, skills: [] };
+    const CHILD_WRITE_ID = 89;
+    const OWN_SPAWN_ID = 2;
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport
+          .push(toolCall(CHILD_WRITE_ID, "Write", { file_path: "REPO.md", content: "repo agent must not write in plan" }, "th-child", "tn-child", "cc-repo-write"))
+          .push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      if (c.method === "turn/interrupt") return {};
+      return {};
+    };
+    const rig = makeRig({ responder });
+    const childFileop = recordingFileop();
+    rig.deps = { ...rig.deps, wireFileop: () => childFileop.handle };
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "repo-writer", prompt: "check the plan" }, "th-1", "tn-1", "c-root"));
+
+    const reported: string[] = [];
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined, gatePlan, agents, repoAgents: [repoWriter], requestedAgentSource: "repo",
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+    });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply", 5000);
+    assert.equal(replyForId(rig, 1).success, true, "the repo agent is a planning delegate");
+    rig.transport.push(toolCall(OWN_SPAWN_ID, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-own"));
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === OWN_SPAWN_ID), "own spawn_agent reply", 5000);
+    assert.equal(replyForId(rig, OWN_SPAWN_ID).success, false, "an owner template is not on a repo-sourced plan roster");
+    rig.transport.push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await assert.rejects(withTimeout(runP, 5000, "repo plan-turn subagent write"), /produced no plan/);
+
+    const childReply = replyForId(rig, CHILD_WRITE_ID);
+    assert.equal(childReply.success, false, "the repo agent's plan-turn Write was DENIED");
+    assert.match(childReply.text ?? "", /not permitted during the plan phase/, "the deny is write_denied_in_plan");
+    assert.deepEqual(childFileop.ops, [], "no fileop op ran during the plan phase");
+    const childStart = rig.transport.requests.filter((r) => r.method === "thread/start")[1];
+    assert.ok(String(rec(childStart?.params).developerInstructions).includes("REPO WRITER BODY"), "the child ran the repo agent's body");
+    assert.deepEqual(reported, ["repo"]);
   });
 });
 
@@ -19437,6 +19490,60 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.ok(rootInstructions(rig.epochs[1]!.transport).includes("OWN LEAD BODY"), "the lead stays uzi's builtin");
   });
 
+  const planReported = () => {
+    const reported: string[] = [];
+    return { reported, reportPlanAgentSource: async (source: string) => { reported.push(source); } };
+  };
+
+  it("PRD #3914 M3: a requested repo source with a roster plans with the repo agents and the untrusted framing", async () => {
+    const r = planReported();
+    const { rig } = await gated({ status: "absent" }, { repoAgents: [repoReviewer, repoTester], requestedAgentSource: "repo",
+      reportPlanAgentSource: r.reportPlanAgentSource }, []);
+    const [planText] = turnInputs(rig.epochs[0]!.transport);
+    assert.ok(planText!.includes(PASSAGE), "the plan turn carries the untrusted-review passage");
+    assert.ok(planText!.includes(REPO_SUBAGENT_PLANNING_APPEND));
+    assert.equal(REPO_SUBAGENT_PLANNING_APPEND, "Planning subagents report findings; they do not change files.");
+    assert.ok(planText!.includes("Available subagents to delegate to: repo-reviewer (can edit files), repo-tester (can edit files)."));
+    assert.ok(planText!.includes("All planning dispatches are read-only"));
+    assert.ok(!planText!.includes("coder (can edit files)"), "the owner templates are not on the plan roster");
+    const instructions = rootInstructions(rig.epochs[0]!.transport);
+    assert.ok(instructions.includes(PASSAGE), "the plan thread's instructions carry the passage");
+    assert.ok(instructions.includes(REPO_SUBAGENT_PLANNING_APPEND));
+    assert.ok(instructions.includes("OWN LEAD BODY"), "the lead stays the owner's");
+    assert.deepEqual(r.reported, ["repo"]);
+  });
+
+  for (const [name, extra] of [
+    ["an unset request", { repoAgents: [repoReviewer] }],
+    ["a requested own source", { repoAgents: [repoReviewer], requestedAgentSource: "own" }],
+    ["a requested repo source with no roster", { requestedAgentSource: "repo" }],
+    ["a persisted own source on a replan", { repoAgents: [repoReviewer], requestedAgentSource: "repo", approvedSelection: { source: "own", exclusions: [] } }],
+    ["an unset request with a persisted repo source from autopilot", { repoAgents: [repoReviewer], approvedSelection: { source: "repo", exclusions: [] } }],
+  ] as [string, Partial<RunContext>][]) {
+    it(`PRD #3914 M3: ${name} plans with the owner templates and no framing`, async () => {
+      const r = planReported();
+      const { rig } = await gated({ status: "absent" }, { ...extra, reportPlanAgentSource: r.reportPlanAgentSource }, []);
+      const [planText] = turnInputs(rig.epochs[0]!.transport);
+      assert.ok(planText!.includes("Available subagents to delegate to: coder (can edit files), tester (can edit files)."));
+      assert.ok(!planText!.includes(PASSAGE));
+      assert.ok(!planText!.includes(REPO_SUBAGENT_PLANNING_APPEND));
+      assert.ok(!rootInstructions(rig.epochs[0]!.transport).includes(PASSAGE));
+      assert.deepEqual(r.reported, ["own"]);
+    });
+  }
+
+  it("PRD #3914 M3: a repo-sourced plan request maps repo agents with the repo denylist and the run's skills", () => {
+    const { ctx } = makeCtx({ agents: ownAgents, repoAgents: [repoReviewer], requestedAgentSource: "repo",
+      skills: [{ name: "lint", description: "d", body: "b" }] });
+    const request = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION))["buildRunRequest"](ctx, "plan", "p", undefined, new AbortController().signal, undefined);
+    assert.deepEqual(Object.keys(request.agents), ["repo-reviewer"]);
+    assert.deepEqual(request.agents["repo-reviewer"]!.deniedTools, [...REPO_AGENT_DENIED_TOOLS]);
+    assert.deepEqual(request.agents["repo-reviewer"]!.skills, ["lint"]);
+    assert.equal(request.phase, "plan");
+    const rendered = renderCodexRun(request);
+    assert.equal(rendered.perRoleGrants.get("repo-reviewer")!.phase, "plan", "the repo planning agent runs under plan-phase grants");
+  });
+
   it("own source: names on the base turn, no passage", async () => {
     const { rig } = await gated(okSel("own"), { repoAgents: [repoReviewer] }, []);
     const [implText] = turnInputs(rig.epochs[1]!.transport);
@@ -29243,7 +29350,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       providerDefaultModel?: string; expect: import("../src/lead-config-report.js").LeadRequest;
     }> };
     const cases = contract.request_cases.filter((c) => c.harness === "codex");
-    assert.equal(cases.length, 16, "all Codex request cases loaded");
+    assert.equal(cases.length, 18, "all Codex request cases loaded");
     const visited: string[] = [];
     const phases = new Set<string>();
     for (const c of cases) {
@@ -29301,7 +29408,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 16);
+    assert.equal(visited.length, 18);
     assert.deepEqual([...phases].sort(), ["implement", "plan"]);
   });
 
@@ -29481,4 +29588,811 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
     assert.equal(entered, 0);
     assert.equal(observedCalls, 0);
   });
+});
+
+// A policy-held (preserve-only) claim may continue its saved conversation or re-hold, never start a fresh
+// one. The guard lives in CodexHarness.startTurn's single fresh-thread branch and the executor's
+// resume-rejection catch, and every root lead request of such a claim carries it.
+describe("CodexExecutor: a preserve-only conversation never starts a fresh provider thread", () => {
+  const routes = (t: FakeTransport) => t.requests.filter((r) => r.method === "thread/start" || r.method === "thread/resume");
+  const rpcRejection = () => new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+  const rejectsWith = (cause: PolicyContinuationRejected["cause"]) => (error: unknown): boolean =>
+    error instanceof PolicyContinuationRejected && error.cause === cause;
+
+  it("no session to resume: the root turn rejects before any thread/start", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ preserveConversation: true });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "preserve without session"),
+      rejectsWith("session_missing"));
+    assert.deepEqual(routes(rig.transport), [], "neither thread/start nor thread/resume was sent");
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 0);
+  });
+
+  it("unconstrained control: the same claim without the preserving fact starts a fresh thread", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "unconstrained fresh start");
+    assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/start"]);
+  });
+
+  it("a provider-rejected resume re-holds: no lineage-break notice and no fresh thread", async () => {
+    const rig = makeRig();
+    rig.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread", preserveConversation: true });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "preserve rejected resume"),
+      rejectsWith("provider_resume_rejected"));
+    assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/resume"]);
+    assert.equal(emitted.some((m) => m.payload.event === "resume_lineage_break"), false,
+      "a lineage break is announced only after an actual fresh admission");
+  });
+
+  it("a successfully resumed preserving root runs normally on the claimed thread", async () => {
+    const rig = makeRig();
+    rig.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.resolve({ thread: { id: "claimed-thread" } }) : undefined;
+    rig.transport.push(threadStarted("claimed-thread")).push(signalDone("claimed-thread", "tn-1")).push(turnCompleted("completed", "claimed-thread")).end();
+    const { ctx } = makeCtx({ sessionId: "claimed-thread", preserveConversation: true });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "preserve resumed");
+    assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/resume"]);
+  });
+
+  it("epoch recreation after a checkpoint reap resumes the saved session or re-holds, never thread/start", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", () => {}),
+    ]);
+    rig.epochs[1]!.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+    let exec!: CodexExecutor;
+    const { ctx } = makeCtx({
+      sessionId: "th-1", preserveConversation: true,
+      checkpoint: async (opts) => {
+        if (opts.reap) await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    await assert.rejects(withTimeout(exec.run(ctx), 5000, "preserve epoch recreation"), rejectsWith("provider_resume_rejected"));
+    assert.equal(rig.providerLaunches(), 2, "the checkpoint reap recreated the epoch");
+    assert.deepEqual(routes(rig.epochs[0]!.transport).map((r) => r.method), ["thread/resume"]);
+    assert.deepEqual(routes(rig.epochs[1]!.transport).map((r) => r.method), ["thread/resume"], "the recreated root never started a thread");
+  });
+
+  it("plan to implement recreation resumes the planning session or re-holds, never thread/start", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", () => {}),
+    ]);
+    rig.epochs[1]!.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+    const gatePlan: NonNullable<RunContext["gatePlan"]> = async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never);
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan, sessionId: "th-1", preserveConversation: true });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "preserve plan to implement"),
+      rejectsWith("provider_resume_rejected"));
+    assert.equal(rig.providerLaunches(), 2, "approval recreated the epoch for implementation");
+    assert.deepEqual(routes(rig.epochs[1]!.transport).map((r) => r.method), ["thread/resume"]);
+  });
+});
+
+// The compatible-lane one-claim Fresh: the claim that consumed the owner's authorization may start exactly
+// one new conversation. The allowance is one object shared by every root lead request of the claim and is
+// spent in the harness's single fresh-thread branch BEFORE thread/start is sent.
+describe("CodexExecutor: the one-claim Fresh allowance starts at most one provider thread", () => {
+  const routes = (t: FakeTransport) => t.requests.filter((r) => r.method === "thread/start" || r.method === "thread/resume");
+  const rpcRejection = () => new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+  const rejectsWith = (cause: PolicyContinuationRejected["cause"]) => (error: unknown): boolean =>
+    error instanceof PolicyContinuationRejected && error.cause === cause;
+
+  it("positive: a Fresh claim without a session sends exactly one thread/start and the turn runs", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const allowance = { remaining: 1 };
+    const { ctx } = makeCtx({ preserveConversation: true, policyFreshAllowance: allowance });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "fresh start");
+    assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/start"]);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1, "the turn ran on the new thread");
+    assert.equal(allowance.remaining, 0, "the allowance is spent by the single start");
+  });
+
+  it("an allowance does not apply without the preserving fact: the unconstrained path is unchanged", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const allowance = { remaining: 1 };
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({ policyFreshAllowance: allowance }).ctx), 3000, "unconstrained");
+    assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/start"]);
+    assert.equal(allowance.remaining, 1, "only a preserving root spends the allowance");
+  });
+
+  it("the same claim without an allowance re-holds with session_missing and zero thread/start", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ preserveConversation: true });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "no allowance"), rejectsWith("session_missing"));
+    assert.deepEqual(routes(rig.transport), []);
+  });
+
+  it("a spent allowance re-holds: a second sessionless root of the same claim sends no second thread/start", async () => {
+    const allowance = { remaining: 1 };
+    const first = makeRig();
+    first.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(first, bindingOf(SUBSCRIPTION)).run(makeCtx({ preserveConversation: true, policyFreshAllowance: allowance }).ctx), 3000, "first root");
+    assert.deepEqual(routes(first.transport).map((r) => r.method), ["thread/start"]);
+    // The recreated root has no session id to resume (it never persisted): the shared allowance is gone.
+    const second = makeRig();
+    second.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await assert.rejects(withTimeout(makeExecutor(second, bindingOf(SUBSCRIPTION)).run(makeCtx({ preserveConversation: true, policyFreshAllowance: allowance }).ctx), 3000, "second root"),
+      rejectsWith("fresh_start_uncertain"));
+    assert.deepEqual(routes(second.transport), [], "no second conversation was started");
+  });
+
+  it("an allowance that is not exactly one never starts a thread", async () => {
+    for (const remaining of [0, 2, -1, Number.NaN]) {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+      const { ctx } = makeCtx({ preserveConversation: true, policyFreshAllowance: { remaining } });
+      await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, `allowance ${remaining}`), rejectsWith("fresh_start_uncertain"));
+      assert.deepEqual(routes(rig.transport), []);
+    }
+  });
+
+  it("a failed thread/start still spends the allowance: the same claim's retried root sends no second thread/start", async () => {
+    const allowance = { remaining: 1 };
+    const first = makeRig();
+    first.transport.requestOverride = (c) => c.method === "thread/start" ? Promise.reject(rpcRejection()) : undefined;
+    first.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    // The outcome of the failed root is not under test; only that it attempted the start once.
+    await withTimeout(makeExecutor(first, bindingOf(SUBSCRIPTION)).run(makeCtx({ preserveConversation: true, policyFreshAllowance: allowance }).ctx), 3000, "failing first root")
+      .then(() => undefined, () => undefined);
+    assert.deepEqual(routes(first.transport).map((r) => r.method), ["thread/start"], "exactly one start was attempted");
+    assert.equal(allowance.remaining, 0, "the allowance was spent before the start was sent, so its failure cannot refund it");
+    // The same claim retries a root with the same allowance object: it re-holds instead of starting again.
+    const retry = makeRig();
+    retry.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await assert.rejects(withTimeout(makeExecutor(retry, bindingOf(SUBSCRIPTION)).run(makeCtx({ preserveConversation: true, policyFreshAllowance: allowance }).ctx), 3000, "retried root"),
+      rejectsWith("fresh_start_uncertain"));
+    assert.deepEqual(routes(retry.transport), [], "no second thread/start after the failed one");
+  });
+
+  it("forced epoch recreation in the same claim never sends a second thread/start and re-holds", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", () => {}),
+    ]);
+    rig.epochs[1]!.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+    let exec!: CodexExecutor;
+    const allowance = { remaining: 1 };
+    const { ctx } = makeCtx({
+      preserveConversation: true, policyFreshAllowance: allowance,
+      checkpoint: async (opts) => {
+        if (opts.reap) await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    await assert.rejects(withTimeout(exec.run(ctx), 5000, "fresh then recreation"), rejectsWith("provider_resume_rejected"));
+    assert.equal(rig.providerLaunches(), 2, "the checkpoint reap recreated the epoch");
+    assert.deepEqual(routes(rig.epochs[0]!.transport).map((r) => r.method), ["thread/start"], "the claim's one new conversation");
+    assert.deepEqual(routes(rig.epochs[1]!.transport).map((r) => r.method), ["thread/resume"], "the recreated root never started another");
+    assert.equal(allowance.remaining, 0);
+  });
+});
+
+// Issue #3607 m4: the compact policy-hold fake-provider matrix. Every case drives the REAL RunRunner
+// (admission, Outbox, hold reporting), the REAL CodexExecutor and CodexHarness, and a fake Codex
+// app-server transport. Nothing here stubs the executor, so the thread/start and thread/resume counts
+// are the harness's own. Each case that reaches the provider ends in a renewed provider refusal, which
+// the runner reports as a compact hold (the same end state a real continuation would reach).
+describe("compact policy hold: fake-provider continuation matrix (production runner, outbox and harness)", () => {
+  m2Runner.installHarness();
+  const realInspect = CodexSessionStore.inspectSession;
+  let transcript: "present" | "absent" | "unknown" = "present";
+  let nextIid = 36070;
+  const PLAN = "# reviewed plan\n- ship it";
+  const GUIDANCE = "OWNER-GUIDANCE-3607-use-the-saved-approach";
+  const GUIDANCE_ID = 31;
+  const EARLIER = [{ id: 21, body: "EARLIER-OWNER-FOLLOWUP-3607-A" }, { id: 25, body: "EARLIER-OWNER-FOLLOWUP-3607-B" }];
+  const rpcRejection = () => new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+
+  beforeEach(() => { transcript = "present"; });
+  afterEach(() => { CodexSessionStore.inspectSession = realInspect; });
+
+  interface Drive {
+    claim: (head: string) => Record<string, unknown>;
+    rejectResume?: boolean;
+    dockerHost?: string;
+    guidance?: boolean;
+    earlier?: readonly { id: number; body: string }[];
+    /** Hold the steering's FIRST GET /inputs for a short delay and do NOT wait for live routing in the
+     *  executor, so only the runner's own initial-delivery wait can put the guidance in the first turn. */
+    holdFirstInputGet?: boolean;
+    /** Observe the real delivery wait and release the held GET on entry, without a timer or
+     *  an executor-side wait. If execution overtakes the barrier, release only for cleanup. */
+    inputBarrierTest?: TestContext;
+    modelEvidence?: boolean;
+    retryBeforeEvidence?: boolean;
+    parkBeforeEvidence?: boolean;
+    runId?: string;
+    issueIid?: number;
+    historyUnavailable?: boolean;
+    liveInputs?: { id: number; body: string }[];
+    retainEvidence?: TestContext;
+  }
+
+  async function drive(o: Drive) {
+    const { api, client, fx } = m2Runner;
+    CodexSessionStore.inspectSession = (async () => transcript) as typeof CodexSessionStore.inspectSession;
+    api.setRegisterProtocolFeatures(["provider_policy_hold_v1", "claim_generation_fence",
+      ...(o.parkBeforeEvidence ? ["recovery_cause_provider_outage"] : [])]);
+    await client.register("policy-matrix", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
+    const head = spawnSync("git", ["-C", fx.originPath, "rev-parse", "HEAD"], { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+    assert.match(head, /^[0-9a-f]{40}$/);
+    const runId = o.runId ?? randomUUID();
+    const claim = m2Runner.gitlabClaim(o.issueIid ?? nextIid++, {
+      run_id: runId, claim_generation: 3, plan_approved: true, plan_source: "agent", plan_md: PLAN, auto_approve: true,
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: { auth_mode: "api_key", capability: "fixture-capability", access_token: "fixture-access" } },
+      ...o.claim(head),
+    }) as ClaimResponse;
+    api.setInputClaimGeneration(runId, claim.claim_generation!);
+    api.setOwnershipStatus(runId, "running", claim.claim_generation!);
+    if (o.earlier) api.overrideFollowUps(runId, 200, { inputs: o.earlier.map(e => ({ id: e.id, kind: "follow_up", body: e.body })) });
+    if (o.historyUnavailable) api.overrideFollowUps(runId, 503, { error: "history unavailable" });
+    if (o.liveInputs) api.setInputs(runId, o.liveInputs.map(row => ({ ...row, kind: "follow_up" })));
+    else if (o.guidance) api.setInputs(runId, [{ id: GUIDANCE_ID, kind: "follow_up", body: GUIDANCE }]);
+    let sourcePath: string | undefined;
+    let sourceJournal: string | undefined;
+    let sourceBranch: string | undefined;
+    let custodyOpen = true;
+    const attach = m2Runner.git.createOrAttachRunnerClone.bind(m2Runner.git);
+    o.retainEvidence?.mock.method(m2Runner.git, "createOrAttachRunnerClone", async (...args: Parameters<typeof attach>) => {
+      const clone = await attach(...args);
+      sourcePath = clone.path;
+      sourceBranch = clone.branch;
+      await fs.writeFile(path.join(clone.path, "CONTEXT-RETAIN.txt"), "unfinished context work\n");
+      await m2Runner.git.markRecoveryCapture(args[0], clone.path, clone.branch, runId, clone.attemptId);
+      sourceJournal = spawnSync("git", ["-C", args[0], "config", `uzi-recovery.${clone.branch}.clone`],
+        { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+      assert.ok(sourceJournal, "the test has a real source journal to preserve");
+      return clone;
+    });
+    o.retainEvidence?.mock.method(client, "releaseRecoveryCustody", async () => {
+      custodyOpen = false;
+      return { run_id: runId, released: true, holds_released: 1 };
+    });
+    const inputHold = o.holdFirstInputGet ? api.holdNextInputGet(runId) : undefined;
+    let inputBarrierObserved = false;
+    const awaitDelivery = SteeringChannel.prototype.awaitInitialDelivery;
+    const inputBarrier = inputHold && o.inputBarrierTest?.mock.method(SteeringChannel.prototype, "awaitInitialDelivery",
+      function(this: SteeringChannel, signal?: AbortSignal) {
+        inputBarrierObserved = true;
+        const delivered = awaitDelivery.call(this, signal);
+        void inputHold.entered.then(() => inputHold.release());
+        return delivered;
+      });
+    const inputHoldReleased = inputHold && !o.inputBarrierTest
+      ? inputHold.entered.then(() => new Promise<void>(r => setTimeout(r, 2000))).then(() => inputHold.release())
+      : undefined;
+
+    const events: string[] = [];
+    const holds: PolicyHoldRequest[] = [];
+    const verifies: { claim_generation: number; required_head: string }[] = [];
+    const states: StateRequest[] = [];
+    const acknowledgedStates: string[] = [];
+    const reportState = client.reportState.bind(client);
+    client.reportState = async (...args) => {
+      states.push(structuredClone(args[1]));
+      const ack = await reportState(...args);
+      if (ack.status) acknowledgedStates.push(ack.status);
+      return ack;
+    };
+    client.reportPolicyHold = async (_id, body) => {
+      holds.push(structuredClone(body));
+      events.push(`hold:${body.cause}`);
+      return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
+        observed_status: "paused", observed_generation: body.claim_generation, hold_reason: "codex_policy_hold" };
+    };
+    client.reportPolicyRecoveryVerified = async (_id, body) => {
+      verifies.push(structuredClone(body));
+      events.push("verify");
+      return { disposition: "recorded" };
+    };
+
+    const runHome = path.join(m2Runner.homeDir, runId);
+    const seen: RunContext[] = [];
+    const rigs: Rig[] = [];
+    let executingRig: Rig | undefined;
+    // Retained adoption can consume a capture-only executor before constructing the model executor.
+    // Match production's per-invocation factory; never reuse a capture-closed executor for execution.
+    const executorFactory = () => {
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start" || c.method === "thread/resume" || c.method === "turn/start") events.push(`provider:${c.method}`);
+        if (c.method === "thread/start") return { thread: { id: "th-new" } };
+        if (c.method === "thread/resume") return { thread: { id: String(rec(c.params).threadId) } };
+        if (c.method === "turn/start") {
+          const th = String(rec(c.params).threadId);
+          const tn = `tn-${c.turnStartCount}`;
+          const retry = o.parkBeforeEvidence || (o.retryBeforeEvidence && c.turnStartCount === 1);
+          if (o.parkBeforeEvidence) c.transport.push(threadStarted(th));
+          if (o.modelEvidence && !retry) {
+            events.push("provider:model-evidence");
+            c.transport.push(agentMessage("planning model evidence", th));
+          }
+          c.transport.push({ ...turnCompleted("failed", th, tn), params: { threadId: th, turn: { id: tn, status: "failed",
+            error: { codexErrorInfo: retry ? "serverOverloaded" : "cyberPolicy", message: "PRIVATE-PROVIDER-TEXT" } } } });
+          return { turn: { id: tn } };
+        }
+        return {};
+      } });
+      rigs.push(rig);
+      if (o.rejectResume) rig.transport.requestOverride = c => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+      const launch = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+        ...(o.retryBeforeEvidence ? { transientRetryMax: 1, transientBackoffBaseMs: 0 } : {}),
+        ...(o.parkBeforeEvidence ? { transientRetryMax: 0 } : {}),
+        launchEffectRoot: async (spec, deadline) => forwardCredentialFreeGitRoot(spec, deadline, await launch(spec, deadline)) };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, runHome);
+      const run = executor.run.bind(executor);
+      executor.run = async ctx => {
+        executingRig = rig;
+        seen.push(ctx);
+        const included = ctx.followUpIncluded;
+        ctx.followUpIncluded = id => { events.push(`included:${id}`); included?.(id); };
+        if (inputHold && o.inputBarrierTest && !inputBarrierObserved) inputHold.release();
+        await fs.writeFile(path.join(ctx.worktreePath, "POLICY-WORK.txt"), "retained work\n");
+        if (o.guidance && !o.holdFirstInputGet) await waitFor(() => ctx.isLiveFollowUpId?.(GUIDANCE_ID) === true, "owner guidance routed live");
+        return run(ctx);
+      };
+      return { executor, homeDir: runHome };
+    };
+    const outbox = new Outbox({ root: path.join(fx.dataDir, "policy-matrix-outbox"), log: noopLog,
+      runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 });
+    await outbox.init();
+    const runner = m2Runner.runnerWith(executorFactory, m2Runner.fakeGitlab().gitlab, undefined, noopLog, {
+      outbox, activeRuns: new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10),
+      quiesceRun: async () => ({ process: { state: "quiescent", processes: [], killed: [], detail: "fixture proof" },
+        docker: { state: "not_wired", removed: [], detail: "not wired" } }),
+      ...(o.dockerHost ? { dockerHost: o.dockerHost } : {}),
+    });
+    // Observe the safety boundary before generic terminal disposal, not only the final files:
+    // existing retained journals can independently keep a synthetic fixture's source. The wrapper
+    // must also protect non-retained Fresh shapes and disallow custody settlement at this boundary.
+    type RetentionState = { preserveRecoveryClone: boolean; preserveSession: boolean;
+      keepGuardedInventoryOpen: boolean; stoppedSourceKept: boolean; sourceExitDenied: boolean };
+    const terminalRetention: Array<RetentionState & { keepCustody: boolean }> = [];
+    const fail = Reflect.get(runner, "reportGenericFailure").bind(runner) as
+      (claim: ClaimResponse, flight: RetentionState, error: unknown, options?: { keepCustody?: boolean }) => Promise<void>;
+    if (o.retainEvidence) Reflect.set(runner, "reportGenericFailure", async (c: ClaimResponse,
+      f: RetentionState, error: unknown, options?: { keepCustody?: boolean }) => {
+      if (error instanceof PolicyContextRefusal) terminalRetention.push({ preserveRecoveryClone: f.preserveRecoveryClone,
+        preserveSession: f.preserveSession, keepGuardedInventoryOpen: f.keepGuardedInventoryOpen,
+        stoppedSourceKept: f.stoppedSourceKept, sourceExitDenied: f.sourceExitDenied,
+        keepCustody: options?.keepCustody === true });
+      return fail(c, f, error, options);
+    });
+    try {
+      await withTimeout(runner.execute(claim), 30000, "matrix run");
+    } finally {
+      inputHold?.release();
+      inputBarrier?.mock.restore();
+    }
+    const rig = executingRig ?? rigs.at(-1)!;
+    const requests = rigs.flatMap(r => r.transport.requests);
+    if (inputHoldReleased) await inputHoldReleased;
+    return {
+      inputGetHeld: inputHold !== undefined, inputBarrierObserved, claim, runId, holds, verifies, states, events, seen, rig, head,
+      routes: requests.filter(r => r.method === "thread/start" || r.method === "thread/resume").map(r => r.method),
+      prompts: requests.filter(r => r.method === "turn/start").map(r => String((rec(r.params).input as { text?: string }[])[0]?.text)),
+      notices: api.messages(runId).map(m => String(rec(m.payload).event)),
+      messages: api.messages(runId), sourcePath, sourceJournal, sourceBranch, custodyOpen, acknowledgedStates, terminalRetention, runHome,
+    };
+  }
+  type Result = Awaited<ReturnType<typeof drive>>;
+
+  const preserving = (extra: Record<string, unknown> = {}) => (head: string) =>
+    ({ session_id: "saved-session", policy_preserve_only: true, policy_expected_head: head, ...extra });
+  /** The proof is recorded before the first provider request of the claim. */
+  const verifiedBeforeProvider = (r: Result): void => {
+    const verify = r.events.indexOf("verify");
+    const provider = r.events.findIndex(e => e.startsWith("provider:"));
+    assert.ok(verify >= 0 && provider > verify, "head proof precedes provider work: " + JSON.stringify(r.events));
+    assert.deepEqual(r.verifies, [{ claim_generation: 3, required_head: r.head }]);
+  };
+  const refusedHold = (r: Result): void => {
+    assert.equal(r.holds.length, 1);
+    assert.equal(r.holds[0]!.cause, "refused");
+    assert.equal(r.holds[0]!.detail, "refused");
+    assert.equal(r.holds[0]!.tag, "cyberPolicy");
+    assert.equal(r.states.some(s => s.status === "failed" || s.status === "completed"), false, "a hold, never a terminal state");
+    assert.ok(!JSON.stringify(r.holds).includes("PRIVATE-PROVIDER-TEXT"));
+  };
+  const rehold = (r: Result, cause: PolicyHoldRequest["cause"], mode: string): void => {
+    assert.equal(r.holds.length, 1);
+    assert.equal(r.holds[0]!.cause, cause);
+    assert.equal(r.holds[0]!.detail, "resume_rejected");
+    assert.equal(r.holds[0]!.continuation_mode, mode);
+    assert.equal(r.holds[0]!.published, false);
+    assert.equal(r.states.some(s => s.status === "failed" || s.status === "completed"), false, "a hold, never a terminal state");
+  };
+  /** The first turn of a fresh conversation: approval framing, the approved plan, every earlier owner
+   *  follow-up in order, and the live guidance. */
+  const freshFirstTurn = (r: Result): void => {
+    const t = r.prompts[0]!;
+    assert.ok(t.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE), "approval framing");
+    assert.ok(t.includes(`<approved_plan>\n${PLAN}\n</approved_plan>`), "selected plan");
+    const fenced = [...t.matchAll(/<owner_history_([0-9a-f]{16})>\n([\s\S]*?)\n<\/owner_history_\1>/g)].map(m => m[2]);
+    assert.deepEqual(fenced, EARLIER.map(e => e.body), "earlier owner follow-ups, oldest first");
+    assert.ok(t.includes(GUIDANCE), "the live owner guidance");
+    assert.ok(t.lastIndexOf(EARLIER[1]!.body) < t.indexOf(GUIDANCE), "history precedes the live guidance");
+  };
+
+  it("(i) a preserving continuation resumes the saved session and its turn carries the owner guidance", async () => {
+    const r = await drive({ claim: preserving(), guidance: true });
+    assert.deepEqual(r.routes, ["thread/resume"], "one resume, no thread/start");
+    assert.equal(rec(r.rig.transport.requests.find(q => q.method === "thread/resume")?.params).threadId, "saved-session");
+    assert.equal(r.prompts.length, 1);
+    assert.ok(r.prompts[0]!.includes(GUIDANCE), "the resumed turn includes the owner guidance");
+    assert.equal(r.seen[0]?.preserveConversation, true);
+    assert.equal(r.seen[0]?.policyFreshAllowance, undefined);
+    verifiedBeforeProvider(r);
+  });
+
+  for (const [name, claimFor] of [
+    ["a preserving continuation", preserving()],
+    ["an owner Fresh start", preserving({ session_id: null, policy_fresh_session: true })],
+    ["a fresh_from_saved_work claim carrying the saved-work head", (head: string) => ({ session_id: null, policy_saved_work_head: head })],
+  ] as const) {
+    it(`(i-b) ${name} awaits the first GET /inputs delivery: the first provider turn carries the guidance`, async () => {
+      const r = await drive({ claim: claimFor, guidance: true, holdFirstInputGet: true });
+      assert.ok(r.prompts.length >= 1, "a provider turn ran");
+      assert.ok(r.prompts[0]!.includes(GUIDANCE), "the first provider turn includes the owner guidance");
+    });
+  }
+
+  it("(ii) a renewed refusal on the preserving continuation re-holds on the same conversation", async () => {
+    const r = await drive({ claim: preserving() });
+    assert.deepEqual(r.routes, ["thread/resume"]);
+    refusedHold(r);
+    assert.equal(r.holds[0]!.continuation_mode, "same_conversation");
+    assert.equal(r.holds[0]!.session_id, "saved-session");
+  });
+
+  it("(iii) a missing session id sends no provider request and re-holds session_missing", async () => {
+    const r = await drive({ claim: preserving({ session_id: null }) });
+    assert.equal(r.rig.providerLaunches(), 0, "no provider root was launched");
+    assert.deepEqual(r.routes, []);
+    rehold(r, "session_missing", "same_conversation");
+  });
+
+  it("(iii) an absent or unknown transcript sends no provider request and re-holds transcript_unknown", async () => {
+    for (const state of ["absent", "unknown"] as const) {
+      transcript = state;
+      const r = await drive({ claim: preserving() });
+      assert.equal(r.rig.providerLaunches(), 0, state);
+      assert.deepEqual(r.routes, [], state);
+      rehold(r, "transcript_unknown", "same_conversation");
+    }
+  });
+
+  it("(iii) a resume the provider rejects re-holds provider_resume_rejected: no thread/start, no lineage break", async () => {
+    const r = await drive({ claim: preserving(), rejectResume: true });
+    assert.deepEqual(r.routes, ["thread/resume"], "the rejected resume is the only thread request");
+    assert.equal(r.prompts.length, 0, "no turn was sent");
+    rehold(r, "provider_resume_rejected", "same_conversation");
+    assert.equal(r.notices.includes("resume_lineage_break"), false);
+  });
+
+  for (const lane of ["Docker-wired", "retained-recovery (not Docker-wired)"] as const) {
+    it(`(iv) an attempt-path claim on a ${lane} lane re-holds attempt_path with no provider work`, async t => {
+      // Docker-wired: the runner's dockerHost. Retained recovery: the persisted recovery mode that enables attempt paths.
+      if (lane !== "Docker-wired") t.mock.method(m2Runner.git, "recoveryAttemptMode", async () => true);
+      const r = await drive({ claim: preserving(), ...(lane === "Docker-wired" ? { dockerHost: "unix:///fixture" } : {}) });
+      assert.equal(r.rig.providerLaunches(), 0);
+      assert.deepEqual(r.routes, []);
+      assert.equal(r.verifies.length, 0, "the attempt-path rule precedes head verification");
+      rehold(r, "attempt_path", "fresh_from_saved_work");
+    });
+  }
+
+  for (const planSource of ["agent", "seeded"] as const) {
+    it(`headless policy Fresh (${planSource} plan) waits for Resume guidance without prior history`, async t => {
+      const r = await drive({ claim: () => ({ session_id: null, plan_source: planSource,
+        policy_resume_inputs_pending: true }), guidance: true, holdFirstInputGet: true, inputBarrierTest: t });
+      assert.equal(r.inputBarrierObserved, true, "the runner waits before handing the claim to the executor");
+      assert.deepEqual(r.routes, ["thread/start"]);
+      assert.equal(r.prompts.length, 1);
+      assert.ok(r.prompts[0]!.includes(GUIDANCE), "headless Fresh first turn must include owner guidance");
+      assert.equal(r.seen[0]?.preserveConversation, undefined, "input ordering grants no conversation restriction");
+      assert.equal(r.seen[0]?.policyFreshAllowance, undefined, "input ordering grants no Fresh allowance");
+    });
+  }
+
+  for (const mode of ["preserve", "fresh_from_saved_work"] as const) {
+    it(`policy initial planning (${mode}) sees Resume guidance before any approval`, async t => {
+      const r = await drive({ claim: head => ({ plan_approved: false, plan_md: null,
+        ...(mode === "preserve" ? preserving()(head) : { session_id: null, policy_resume_inputs_pending: true }) }),
+        guidance: true, holdFirstInputGet: true, inputBarrierTest: t, modelEvidence: mode === "preserve",
+        ...(mode === "fresh_from_saved_work" ? { earlier: [...EARLIER, { id: GUIDANCE_ID, body: GUIDANCE }] } : {}) });
+      assert.equal(r.seen[0]?.planApproved, false, "the actual unapproved planning branch ran");
+      assert.equal(r.prompts.length, 1);
+      assert.match(r.prompts[0]!, /Produce a plan/);
+      assert.ok(r.prompts[0]!.includes(GUIDANCE), "the first planning request must contain the Resume correction");
+      assert.ok(!r.prompts[0]!.includes("<approved_plan>"), "planning must not acquire approval framing");
+      const included = r.events.filter(e => e.startsWith("included:"));
+      if (mode === "preserve") {
+        assert.deepEqual(included, [`included:${GUIDANCE_ID}`], "one inclusion receipt after model evidence");
+        assert.ok(r.events.indexOf(`included:${GUIDANCE_ID}`) > r.events.indexOf("provider:model-evidence"));
+      } else {
+        assert.deepEqual(included, [], "a refused turn without model evidence keeps the guidance unacknowledged");
+        assert.equal(r.prompts[0]!.split(GUIDANCE).length - 1, 1, "live/history overlap is deduplicated by id");
+        for (const entry of EARLIER) assert.equal(r.prompts[0]!.split(entry.body).length - 1, 1);
+      }
+      refusedHold(r);
+    });
+  }
+
+  it("policy fresh initial planning with no new guidance replays earlier owner history", async () => {
+    const r = await drive({ claim: () => ({ plan_approved: false, plan_md: null, session_id: null,
+      policy_resume_context_pending: true }), earlier: EARLIER });
+    assert.equal(r.seen[0]?.planApproved, false);
+    assert.equal(r.prompts.length, 1);
+    for (const entry of EARLIER) {
+      assert.equal(r.prompts[0]!.split(entry.body).length - 1, 1, "earlier owner history reaches fresh planning once");
+    }
+    assert.ok(!r.prompts[0]!.includes(GUIDANCE));
+    assert.ok(!r.prompts[0]!.includes("<approved_plan>"));
+    refusedHold(r);
+  });
+
+  it("policy fresh seeded implementation keeps earlier history without inventing a planning turn", async () => {
+    const r = await drive({ claim: () => ({ session_id: null, plan_source: "seeded", policy_resume_context_pending: true }), earlier: EARLIER });
+    assert.equal(r.seen[0]?.planApproved, true);
+    assert.equal(r.prompts.length, 1);
+    assert.ok(r.prompts[0]!.includes(`<plan>\n${PLAN}\n</plan>`), "the seeded owner plan keeps its existing framing");
+    for (const entry of EARLIER) assert.equal(r.prompts[0]!.split(entry.body).length - 1, 1);
+    refusedHold(r);
+  });
+
+  it("policy fresh initial planning refuses unavailable owner history before provider work", async () => {
+    const r = await drive({ claim: () => ({ plan_approved: false, plan_md: null, session_id: null,
+      policy_resume_context_pending: true }), historyUnavailable: true });
+    assert.equal(r.rig.providerLaunches(), 0);
+    assert.deepEqual(r.prompts, []);
+    assert.equal(r.states.some(s => s.status === "failed"), false, "history loading failure preserves the continuation");
+    assert.ok(r.states.some(s => s.status === "recovery_wait"));
+    assert.match(JSON.stringify(r.messages), /owner history could not be read.*automatic recovery retries/i);
+  });
+
+  for (const blocked of ["live backlog", "history over bound"] as const) {
+    it(`policy context terminal refusal retains ${blocked} source, journal and custody`, async t => {
+      const r = await drive({ claim: () => ({ plan_approved: false, plan_md: null, session_id: null,
+        policy_resume_context_pending: true, policy_resume_inputs_pending: true }),
+        guidance: blocked === "live backlog", retainEvidence: t,
+        ...(blocked === "live backlog" ? { liveInputs: [{ id: 30, body: "A".repeat(MAX_FOLLOW_UP_BATCH_RUNES) },
+          { id: GUIDANCE_ID, body: GUIDANCE }] } : { earlier: [{ id: 21, body: "A".repeat(MAX_FOLLOW_UP_BATCH_RUNES + 1) }] }) });
+      assert.equal(r.prompts.length, 0, "no model turn was sent");
+      assert.equal(r.states.filter(s => s.status === "failed").length, 1, "a real terminal state acknowledgement");
+      assert.equal(r.acknowledgedStates.filter(s => s === "failed").length, 1, "the failed report was actually acknowledged");
+      assert.equal(r.states.some(s => s.status === "recovery_wait"), false, "never automatically requeued");
+      assert.match(r.states.find(s => s.status === "failed")?.failure_reason ?? "", /No model turn was sent.*guidance is preserved.*successor.*manually/s);
+      assert.deepEqual(r.events.filter(e => e.startsWith("included:")), [], "no fabricated inclusion");
+      assert.equal(m2Runner.api.isInputIncluded(r.runId, GUIDANCE_ID), false, "the API has no model-inclusion receipt");
+      assert.equal(r.custodyOpen, true, "the custody release endpoint was never used");
+      assert.deepEqual(r.terminalRetention, [{ preserveRecoveryClone: true, preserveSession: false,
+        keepGuardedInventoryOpen: true, stoppedSourceKept: true, sourceExitDenied: true, keepCustody: true }],
+        "retention must be established before generic failure can settle custody or retire the source");
+      assert.ok(r.sourcePath && r.sourceJournal);
+      assert.equal(await fs.readFile(path.join(r.sourcePath, "CONTEXT-RETAIN.txt"), "utf8"), "unfinished context work\n");
+      const bare = m2Runner.git.barePathFor(m2Runner.fx.originPath);
+      const journal = spawnSync("git", ["-C", bare, "config", `uzi-recovery.${r.sourceBranch}.clone`],
+        { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+      assert.equal(journal, r.sourceJournal, "the actual bare journal is unchanged");
+      await assert.rejects(fs.stat(r.runHome), { code: "ENOENT" }, "a terminal context refusal promises source retention, not a resumable HOME");
+      // A stranded HOME can exist after an interrupted teardown. Exercise both real cleanup paths:
+      // they may delete session artifacts, but their roots never include the retained source/bare.
+      for (const cleanup of ["periodic", "startup"] as const) {
+        const store = path.join(r.runHome, "codex-session-store", "sessions");
+        await fs.mkdir(store, { recursive: true });
+        await fs.writeFile(path.join(store, "session.jsonl"), "disposable terminal transcript\n");
+        if (cleanup === "periodic") {
+          // The existing lifecycle fixture supplies removal off Linux, where /proc/self/fd is
+          // unavailable. Linux CI uses the real descriptor-pinned removal unchanged.
+          const portableRemoval = portableTeardownTestDeps?.removeTreePinned;
+          const result = await runDiskReclaimPass({ homeRoot: m2Runner.homeDir,
+            provisionRoot: path.join(m2Runner.fx.dataDir, "provision"), statusOf: async () => "failed",
+            isRunLive: () => false, locks: new RunDiskLocks(), log: noopLog,
+            ...(portableRemoval ? { removeTree: (parent: string, name: string, deadline: number) => portableRemoval(parent, name, { deadline }) } : {}) });
+          assert.equal(result.terminalHomesRemoved, 1, JSON.stringify(result));
+        } else {
+          const result = await reclaimStrandedRunHomes(m2Runner.homeDir, async () => "failed", noopLog, { minAgeMs: 0 });
+          assert.equal(result.removed, 1, JSON.stringify(result));
+        }
+        await assert.rejects(fs.stat(r.runHome), { code: "ENOENT" }, cleanup);
+        assert.equal(await fs.readFile(path.join(r.sourcePath, "CONTEXT-RETAIN.txt"), "utf8"), "unfinished context work\n", cleanup);
+        assert.equal(spawnSync("git", ["-C", bare, "config", `uzi-recovery.${r.sourceBranch}.clone`],
+          { env: gitEnv(), encoding: "utf8" }).stdout.trim(), r.sourceJournal, `${cleanup}: source journal remains`);
+        assert.equal(r.custodyOpen, true, `${cleanup}: HOME cleanup grants no custody release`);
+      }
+    });
+  }
+
+  it("policy initial planning retry before model evidence keeps its guidance and receipts once", async t => {
+    const r = await drive({ claim: head => ({ ...preserving()(head), plan_approved: false, plan_md: null }),
+      guidance: true, holdFirstInputGet: true, inputBarrierTest: t, modelEvidence: true, retryBeforeEvidence: true });
+    assert.equal(r.prompts.length, 2);
+    for (const prompt of r.prompts) assert.equal(prompt.split(GUIDANCE).length - 1, 1);
+    assert.deepEqual(r.events.filter(e => e.startsWith("included:")), [`included:${GUIDANCE_ID}`]);
+    assert.ok(r.events.indexOf(`included:${GUIDANCE_ID}`) > r.events.lastIndexOf("provider:turn/start"));
+    refusedHold(r);
+  });
+
+  it("policy initial planning reclaim after a session report replays unincluded guidance", async t => {
+    m2Runner.api.inclusionTracking = true;
+    // The matrix's synthetic roots use host-owned fixture files, as in the retained-source
+    // executor fixture above. UID normalization is a fixture precondition, not a real-UID proof.
+    const readiness = t.mock.method(m2Runner.git, "normalizeRetainedSourceObjects", async () => {});
+    const first = await drive({ claim: () => ({ plan_approved: false, plan_md: null, session_id: null,
+      policy_resume_inputs_pending: true, policy_resume_context_pending: true }),
+      guidance: true, holdFirstInputGet: true, inputBarrierTest: t, parkBeforeEvidence: true });
+    assert.ok(first.states.some(s => s.status === "running" && s.session_id === "th-new"), "the fresh session was actually reported");
+    assert.ok(first.states.some(s => s.status === "recovery_wait"), "the claim parked before model processing");
+    assert.equal(first.states.some(s => s.status === "failed"), false);
+    assert.deepEqual(first.events.filter(e => e.startsWith("included:")), []);
+    assert.ok(first.prompts[0]!.includes(GUIDANCE));
+
+    // The session-bounded context marker is gone, but applied/unincluded input remains pending.
+    // The real Go claim-projection test pins this exact split after the session report.
+    const second = await drive({ runId: first.runId, issueIid: first.claim.issue_iid!,
+      claim: () => ({ claim_generation: 4, plan_approved: false, plan_md: null,
+        session_id: "th-new", policy_resume_inputs_pending: true }), modelEvidence: true });
+    assert.ok(second.seen.length > 0, JSON.stringify({ states: second.states, holds: second.holds, events: second.events, notices: second.notices }));
+    assert.equal(second.seen[0]?.planApproved, false);
+    assert.equal(second.claim.session_id, "th-new", "the server supplied the reported session");
+    assert.match(second.seen[0]!.worktreePath, /\.attempt-/, "retained adoption uses the existing fresh-attempt lane");
+    assert.equal(second.seen[0]?.sessionId, undefined);
+    assert.equal(second.seen[0]?.preserveConversation, undefined, "the input marker supplies no session/Fresh permission");
+    assert.deepEqual(second.routes, ["thread/start"], "owner fresh_from_saved_work consent keeps normal attempt-path behavior");
+    assert.ok(second.prompts[0]!.includes(GUIDANCE), "the reclaimed planning request carries the unprocessed input");
+    assert.deepEqual(second.events.filter(e => e.startsWith("included:")), [`included:${GUIDANCE_ID}`]);
+    assert.equal(readiness.mock.callCount(), 1, "the second claim passed through retained-source readiness");
+    refusedHold(second);
+  });
+
+  it("ordinary headless claim keeps its existing initial-delivery behavior", async t => {
+    const r = await drive({ claim: () => ({ session_id: null }), holdFirstInputGet: true, inputBarrierTest: t });
+    assert.equal(r.inputBarrierObserved, false, "an ordinary claim gains no policy input barrier");
+    assert.deepEqual(r.routes, ["thread/start"]);
+    assert.equal(r.prompts.length, 1);
+  });
+
+  it("(v-a) a confirmed fresh_from_saved_work makes exactly one thread/start; its first turn carries guidance, history and approval framing", async () => {
+    const r = await drive({ claim: () => ({ session_id: null }), guidance: true, earlier: EARLIER });
+    assert.deepEqual(r.routes, ["thread/start"]);
+    assert.equal(r.prompts.length, 1);
+    freshFirstTurn(r);
+    assert.equal(r.verifies.length, 0, "no saved-work head was required");
+    assert.equal(r.seen[0]?.preserveConversation, undefined, "an unconstrained fresh start");
+    refusedHold(r);
+  });
+
+  it("(v-b) the same with the saved-work head verified first (policy_saved_work_head)", async () => {
+    const r = await drive({ claim: head => ({ session_id: null, policy_saved_work_head: head }), guidance: true, earlier: EARLIER });
+    verifiedBeforeProvider(r);
+    assert.deepEqual(r.routes, ["thread/start"]);
+    freshFirstTurn(r);
+    assert.equal(r.seen[0]?.preserveConversation, undefined);
+    refusedHold(r);
+  });
+
+  for (const lane of ["Docker-wired", "retained-recovery (not Docker-wired)"] as const) {
+    it(`(v-c) a confirmed fresh_from_saved_work on a ${lane} attempt-path lane makes one thread/start with guidance, history and framing`, async t => {
+      if (lane !== "Docker-wired") t.mock.method(m2Runner.git, "recoveryAttemptMode", async () => true);
+      const r = await drive({ claim: head => ({ session_id: null, policy_saved_work_head: head }), guidance: true, earlier: EARLIER,
+        ...(lane === "Docker-wired" ? { dockerHost: "unix:///fixture" } : {}) });
+      assert.match(r.seen[0]!.worktreePath, /\.attempt-/, "the run executed on an attempt-path clone");
+      verifiedBeforeProvider(r);
+      assert.deepEqual(r.routes, ["thread/start"]);
+      assert.equal(r.prompts.length, 1);
+      freshFirstTurn(r);
+      assert.equal(r.seen[0]?.preserveConversation, undefined);
+      refusedHold(r);
+    });
+  }
+
+  it("(v-b) a saved-work head the clone does not hold re-holds saved_work_missing before any provider request", async () => {
+    const r = await drive({ claim: () => ({ session_id: null, policy_saved_work_head: "ab".repeat(20) }), earlier: EARLIER });
+    assert.equal(r.rig.providerLaunches(), 0);
+    assert.deepEqual(r.routes, []);
+    assert.equal(r.verifies.length, 0);
+    rehold(r, "saved_work_missing", "same_conversation");
+  });
+
+  it("(vi) fresh_one_claim makes exactly one thread/start, spends its allowance, and its first turn carries guidance, history and framing", async () => {
+    const r = await drive({ claim: preserving({ session_id: null, policy_fresh_session: true }), guidance: true, earlier: EARLIER });
+    verifiedBeforeProvider(r);
+    assert.deepEqual(r.routes, ["thread/start"], "exactly one new conversation");
+    freshFirstTurn(r);
+    assert.equal(r.seen[0]?.preserveConversation, true);
+    assert.deepEqual(r.seen[0]?.policyFreshAllowance, { remaining: 0 }, "the single start spent the allowance");
+    refusedHold(r);
+  });
+
+  it("(vii) an ordinary claim with no policy fields starts one thread with no policy admission", async () => {
+    const r = await drive({ claim: () => ({ session_id: null }) });
+    assert.deepEqual(r.routes, ["thread/start"]);
+    assert.equal(r.verifies.length, 0);
+    assert.equal(r.seen[0]?.preserveConversation, undefined);
+    assert.equal(r.seen[0]?.policyFreshAllowance, undefined);
+    assert.equal(r.claim.policy_preserve_only, undefined);
+    assert.equal(r.claim.policy_saved_work_head, undefined);
+  });
+
+  it("(vii) an ordinary claim whose resume the provider rejects still falls back to a fresh thread", async () => {
+    const r = await drive({ claim: () => ({ session_id: "saved-session" }), rejectResume: true });
+    assert.deepEqual(r.routes, ["thread/resume", "thread/start"], "unchanged: resume, then the lineage-break fresh start");
+    assert.equal(r.notices.includes("resume_lineage_break"), true);
+    assert.equal(r.verifies.length, 0);
+  });
+});
+
+it("ordinary initial planning leaves its queued follow-ups for implementation", async () => {
+  const prompts: string[] = [];
+  let pulls = 0;
+  for (const queued of [false, true]) {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-ordinary" } };
+      if (c.method === "turn/start") {
+        prompts.push(String((rec(c.params).input as { text?: string }[])[0]?.text));
+        c.transport.push({ ...turnCompleted("failed", "th-ordinary"), params: { threadId: "th-ordinary",
+          turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => { assert.fail("refusal must not reach approval"); },
+      ...(queued ? {
+        pullFollowUps: () => { pulls++; return [{ id: 1, body: "ORDINARY-PENDING-GUIDANCE" }]; },
+        priorOwnerFollowUps: [{ id: 2, body: "ORDINARY-PRIOR-HISTORY" }],
+      } : {}),
+    });
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), ProviderPolicyRefusal);
+  }
+  assert.equal(pulls, 0, "ordinary planning still does not drain the implementation follow-up queue");
+  assert.equal(prompts.length, 2);
+  // The existing untrusted issue fence deliberately has a fresh nonce on each rendering.
+  assert.equal(prompts[0]!.replace(/issue_context_[0-9a-f]{16}/g, "issue_context_NONCE"),
+    prompts[1]!.replace(/issue_context_[0-9a-f]{16}/g, "issue_context_NONCE"));
+});
+
+it("policy initial planning refuses a backlog that could exclude the latest Resume correction", async () => {
+  for (const overflow of ["second batch", "oversized entry"] as const) {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-budget" } };
+      if (c.method === "turn/start") {
+        c.transport.push({ ...turnCompleted("failed", "th-budget"), params: { threadId: "th-budget",
+          turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    const rows = [{ id: 1, body: "A".repeat(MAX_FOLLOW_UP_BATCH_RUNES) }];
+    if (overflow === "oversized entry") rows[0]!.body += "x";
+    else rows.push({ id: 2, body: "LATEST-RESUME-CORRECTION" });
+    const included: number[] = [];
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      policyOwnerContinuation: true, priorOwnerFollowUps: [],
+      gatePlan: async () => { assert.fail("overflow must not reach approval"); },
+      pullFollowUps: (remaining, empty) => {
+        const next = rows[0];
+        return next && (empty || followUpRunes(next.body) <= remaining) ? [rows.shift()!] : [];
+      },
+      followUpIncluded: id => { included.push(id); },
+    });
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), error =>
+      error instanceof TrustedExecutionRefusal && error.message.includes("context budget"), overflow);
+    assert.equal(rig.transport.turnStartCount, 0, "do not plan from a prefix that may omit the latest correction");
+    assert.deepEqual(included, [], "overflow is never acknowledged as model inclusion");
+  }
 });

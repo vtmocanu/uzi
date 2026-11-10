@@ -133,7 +133,7 @@ test("authorized rejection cleanup clears the physical sentinel but preserves in
     try {
       await outbox.init();
       if (memory) await outbox.journalPolicyHold(run, {
-        outcome_id: hold, source_generation: 3, claim_generation: 3, detail: "refused",
+        outcome_id: hold, source_generation: 3, claim_generation: 3, detail: "refused", cause: "refused",
         continuation_mode: "same_conversation", published: false,
         tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1",
       });

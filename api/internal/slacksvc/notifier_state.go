@@ -18,6 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/runpresentation"
+	"github.com/vtmocanu/uzi/api/internal/runquestion"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -420,7 +421,7 @@ func (n *Notifier) handleQuestion(ctx context.Context, rc store.GetSlackRunConte
 		}
 		return
 	}
-	q, ok := parseQuestionPayload(raw)
+	q, ok := runquestion.Parse(raw)
 	if !ok {
 		n.logf("parse question payload", fmt.Errorf("run %s: unusable question payload", rc.ID))
 		return
@@ -520,10 +521,11 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		}
 		// Only the persisted reason describes this gate; a cleared reason after
 		// human revision must not imply checker unavailability.
-		crossCheckReason := ""
+		crossCheckReason, requestedSource := "", ""
 		if run, rerr := n.store.GetRunByID(ctx, rc.ID); rerr != nil {
 			n.logf("load gate cross-check reason", rerr)
 		} else {
+			requestedSource = run.AgentSourceRequested.String
 			if (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) && run.PlanCrossCheckGateReason.Valid {
 				crossCheckReason = run.PlanCrossCheckGateReason.String
 				if run.PlanCrossCheckGated && crossCheckReason == "worker_unsupported" {
@@ -539,7 +541,7 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 				crossCheckReason = n.gatedCrossCheckLine(ctx, run)
 			}
 		}
-		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames, rc.RepoAgentFolder, crossCheckReason))
+		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames, rc.RepoAgentFolder, requestedSource, crossCheckReason))
 		if err != nil {
 			n.logf("post gate", err)
 			return

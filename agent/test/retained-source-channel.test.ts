@@ -1613,4 +1613,23 @@ describe("resolve-local-record: a deadline is cooperative and owned work is awai
     await until(() => !rig.gate.heldBy("retained_ops"), "the gate reopened after the work settled");
     await until(() => lines.some((l) => (l as Json).msg === "retained-source: local record resolution finished"), "completion logged");
   });
+  it("issue #4066: close() registers a request it abandons as a shutdown producer, so the barrier can join it", async () => {
+    const release = deferred<{ kind: "retired"; generation: number; remaining: number }>();
+    const tracked: Array<{ promise: Promise<unknown>; kind: string }> = [];
+    const authority = {
+      withTransaction: async <T,>(fn: (tx: never) => Promise<T>): Promise<T> => fn(undefined as never),
+      trackProducer: (promise: Promise<unknown>, kind: string): void => { tracked.push({ promise, kind }); },
+    };
+    const rig = await rigOf({ server: { shutdownSettleMs: 30, authority }, resolveLocalRecord: () => release.promise });
+    const conn = await sendDetached(rig.sock, resolveReq());
+    await until(() => rig.resolveCalls.length === 1, "the runner was called");
+    assert.equal(tracked.length, 0, "nothing is registered while the request is merely running");
+    await within(5000, "close()", rig.server.close());
+    assert.deepEqual(tracked.map((t) => t.kind), ["retained_source_request"]);
+    assert.equal(await Promise.race([tracked[0]!.promise.then(() => "settled", () => "settled"), new Promise((r) => setTimeout(() => r("pending"), 50))]), "pending",
+      "the registered promise is the still-running request");
+    conn.destroy();
+    release.resolve({ kind: "retired", generation: 1, remaining: 0 });
+    await until(() => !rig.gate.heldBy("retained_ops"), "the gate reopened after the work settled");
+  });
 });

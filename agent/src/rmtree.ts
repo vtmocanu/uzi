@@ -4,7 +4,7 @@ import { constants } from "node:fs";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { RUNNER_UID, commandRootCommand, runnerCommand, uidSplitActive } from "./runner-uid.js";
+import { RUNNER_UID, commandRootCommand, killCommandRootPid, killRunnerGroup, runnerCommand, uidSplitActive } from "./runner-uid.js";
 import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
@@ -1674,6 +1674,21 @@ export interface TrimHelperOptions {
   sync?: string;
 }
 
+/** Issue #4089: the same-uid kill for a budgeted helper's timeout or abort. Under the uid split
+ *  the worker cannot signal a helper running as the runner or runner-cmd uid (EPERM), so the
+ *  wrapper (compared by identity) selects the matching kill that signals as that uid. Undefined
+ *  single-uid and for any other wrapper, where `child.kill` is the right call. `split` is a test
+ *  seam defaulting to {@link uidSplitActive}. */
+export function helperUidKillerFor(
+  wrap: CommandWrapper,
+  split = uidSplitActive(),
+): ((pid: number) => boolean) | undefined {
+  if (!split) return undefined;
+  if (wrap === runnerCommand) return killRunnerGroup;
+  if (wrap === commandRootCommand) return killCommandRootPid;
+  return undefined;
+}
+
 /** Spawn one streaming helper pass (the trim helpers here, the run-process helper in
  *  run-procs.ts) with `input` on stdin; resolve its exit status and stdout. The deadline and the
  *  no-kill caveat are {@link runHelper}'s; the stdout read back is capped. It runs in `/`, so the
@@ -1684,8 +1699,18 @@ export async function runAgentHelper(
   args: readonly string[],
   timeout: number,
   input = "",
+  /** issue #3980: `joinOnTimeout` records a timeout or a spawn error as the failure, SIGKILLs the
+   *  helper and settles only once it has closed (as the ambient-budget branch does), so a caller with
+   *  an absolute deadline never returns while its helper may still be running. Default: unchanged.
+   *  `killAsHelperUid` (read with `joinOnTimeout` and, issue #4089, under an ambient budget, where
+   *  it overrides {@link helperUidKillerFor}'s default): the timeout (and, under a budget, the cancel)
+   *  kill signals the helper through it instead of `child.kill`, for a helper running as a uid the worker cannot signal (the runner-uid
+   *  split: EPERM). A false return leaves the helper running; it is still joined (fail-closed).
+   *  `uidSplit`: test seam only, forwarded to {@link helperUidKillerFor}. */
+  opts: { joinOnTimeout?: boolean; killAsHelperUid?: (pid: number) => boolean; uidSplit?: boolean } = {},
 ): Promise<{ code: number; stdout: string }> {
   const budget = MaintenanceBudget.current();
+  const join = opts.joinOnTimeout === true;
   budget?.check();
   const remaining = budget?.cap(timeout);
   const wrapped = wrap(process.execPath, ["-e", script, ...args]);
@@ -1710,7 +1735,17 @@ export async function runAgentHelper(
     let overflow = false;
     let settled = false;
     let failure: Error | undefined;
-    const cancel = () => { failure = new Error("maintenance helper cancelled"); child.kill("SIGKILL"); };
+    // Budgeted kill (issue #4089): through the helper's own uid when it has one, else child.kill.
+    const budgetKill = (): void => {
+      const k = opts.killAsHelperUid ?? helperUidKillerFor(wrap, opts.uidSplit);
+      if (k) {
+        // Not yet reaped by Node (no exit seen), so the pid cannot have been recycled.
+        if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+          try { k(child.pid); } catch { /* not delivered: still joined */ }
+        }
+      } else child.kill("SIGKILL");
+    };
+    const cancel = () => { failure = new Error("maintenance helper cancelled"); budgetKill(); };
     const settle = (fn: () => void): void => {
       if (settled) return;
       settled = true;
@@ -1719,8 +1754,16 @@ export async function runAgentHelper(
       fn();
     };
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      if (budget) failure = new Error("maintenance helper timed out");
+      if (budget) {
+        failure = new Error("maintenance helper timed out");
+        budgetKill();
+        return;
+      }
+      if (join && opts.killAsHelperUid) {
+        // Not yet reaped by Node (no exit seen), so the pid cannot have been recycled.
+        if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) opts.killAsHelperUid(child.pid);
+      } else child.kill("SIGKILL");
+      if (join) failure = helperFailure({ name: "Error", message: "", killed: true, signal: "SIGKILL" });
       else settle(() => reject(helperFailure({ name: "Error", message: "", killed: true, signal: "SIGKILL" })));
     }, duration);
     budget?.signal.addEventListener("abort", cancel, { once: true });
@@ -1731,7 +1774,18 @@ export async function runAgentHelper(
       if (!overflow) chunks.push(b);
     });
     child.on("error", (e) => {
-      if (budget) { failure = e; child.kill("SIGKILL"); }
+      if (budget) {
+        // A refused kill (EPERM) is reported here synchronously by `child.kill` itself: killing
+        // again would re-enter this handler without end. Keep the timeout or cancel reason.
+        if ((e as NodeJS.ErrnoException).syscall === "kill") failure ??= e;
+        else { failure = e; budgetKill(); }
+      }
+      else if (join) {
+        failure = helperFailure(e as HelperExecError);
+        // A refused kill (EPERM) is reported here synchronously by `child.kill` itself: killing
+        // again would re-enter this handler without end.
+        if ((e as NodeJS.ErrnoException).syscall !== "kill") child.kill("SIGKILL");
+      }
       else settle(() => reject(helperFailure(e as HelperExecError)));
     });
     child.on("close", (code, signal) =>

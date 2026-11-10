@@ -1094,9 +1094,14 @@ runs. See [adr/1598-codex-command-storage.md](../adr/1598-codex-command-storage.
 ### Pod-epoch shadow reclaim (PRD #3430)
 
 Hosted Docker workers now participate in epoch ownership and can report a
-read-only `pod_epoch_reclaim` verdict before run admission. **The shadow pass
-does not delete attempt trees, release holds or remove stopped containers.**
-Existing startup reapers and DinD maintenance are separate. Compose and
+`pod_epoch_reclaim` verdict before run admission. **Production deletion is off:
+the pass does not delete attempt trees, release holds or remove stopped
+containers.** The worker image carries a gated deletion phase from
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md), compiled with its activation
+constant set to `false`; no chart value or environment variable turns it on, and
+enabling it needs a separate owner decision. Hosted deletion acceptance and
+#3329's idle-gated roll are not shipped. Existing startup reapers
+and DinD maintenance are separate. Compose and
 non-Docker lanes are unchanged. See the [worker overview](../docs/worker-docker.md#pod-epoch-shadow-reclaim)
 and [design and implementation evidence](../prds/3430-pod-epoch-lock-shadow.md).
 
@@ -1165,7 +1170,7 @@ and uncertain ledger durability refuse startup without admission.
 | Shared reacquisition after EX | Separate **120 s** wait after cleanup, before admission. |
 | Daemon inventory | **10 s** per request; **500 containers**, **500 volumes**, **50 plugins**; inspect concurrency **4**. |
 | Input bytes | Finite daemon bodies and finite subprocess output capped at **8 MiB**; cumulative event stream capped at **64 KiB**; projected evidence **8 KiB**. |
-| Retained-source discovery | **200 physical tree paths**, **4,096 directory entries**, **1,024 bare repositories**; metadata per bare **8 MiB / 4,096 records**. The operator inspector retains its independent **64-descriptor** default. |
+| Retained-source discovery | **200 physical tree paths**, **16,384 directory entries**, **1,024 bare repositories**; metadata **16 MiB / 131,072 records** (the PRD #3431 R9 budgets; they were 4,096 entries and 8 MiB / 4,096 records before it). The operator inspector retains its independent **64-descriptor** default. |
 | Consumption history | **4,096 distinct pod UUIDs / 151,560 logical bytes**, on one immutable ledger inode, plus filesystem allocation overhead. No eviction, compaction or automatic reset. |
 
 **Reading verdicts.** `pod_epoch_reclaim` reports `eligible`, `deferred` or
@@ -1229,11 +1234,24 @@ and authority falls back to `unproven` when the pass is invalidated
   keep their existing `discard` basis. Only the count is reported (list entries
   carry no marker), so identify them by reading each candidate's journal before M1b.
 
+**Deletion-phase fields (PRD #3431 M1b; present but zero while the gate is off).**
+The same line carries `deleted`, `deleted_bytes`, `settled` (missing trees settled
+by metadata only; no bytes), `kept_after_refusal`, `kept_residue`, `kept_protected`,
+`kept_unrecoverable_shape`, `source_use_not_ended` and `reclaim_bytes_state`
+(`measured` once the phase ran, otherwise `unknown`). The reasons
+`reclaim_complete` and `reclaim_partial` apply only to a pass that ran the phase.
+Shadow fields are unchanged. If the phase is ever enabled it needs the full-contract
+attestation above, an `eligible` and `attested` pass, a fresh terminal lifecycle
+and a run-wide `run_open_holds` count of 0 (the worker advertises
+`recovery_run_open_holds_v1`; the first roll onto an image carrying it keeps
+every tree). Admitted shapes, content-proof budgets and crash residuals are in
+[Verified-epoch reclaim](../docs/run-recovery.md#verified-epoch-reclaim-prd-3431).
+
 The cross-checks have limits. Matching observations never prove the
 unobservable OCI-handler, crun/conmon, NRI, attachment or ownership-walk facts,
-and the kernel observation covers the successor's node only. Nothing is deleted
-or settled; deletion and settlement are PRD #3431 M1b, later and separately
-gated.
+and the kernel observation covers the successor's node only. In production
+nothing is deleted or settled: the PRD #3431 M1b deletion phase is switched off
+and its activation is separately gated by an owner decision.
 
 **Kernel allowlist (operator note).** Any kernel release outside the exact
 `crio-crun` allowlist above yields `kernel_unaudited` and defers, including after
@@ -1288,7 +1306,7 @@ neither measures server commit time or downward-API projection latency. Pod name
 can be reused and are correlation labels; UID/resourceVersion fencing remains
 authoritative. Raw errors, pod UIDs and container IDs are not logged. The captured
 pod-name length is charged to retained metadata.
-The maintainer's #3621 live graceful-roll check remains pending: collect per
+The #3621 live graceful-roll acceptance is owner-relayed in PRD #3431 and not independently verified here; for any further roll, collect per
 successor worker/pod labels, timestamps, both available elapsed values and
 attempts/conflicts; measure projection latency independently and diagnose
 exhaustion from watch/request evidence. Cap or fence changes require separate review.
@@ -1334,13 +1352,15 @@ base/candidate controls; exact-head PR CI is still pending. Before delivery,
 a formal owner partial decision must name the actual milestone IDs and the
 outstanding M1/M2c image/full-gate criteria and M3 live acceptance. Continuation
 guidance does not waive these checks. These pending proofs are not production
-verification; deletion remains later work under #3431.
+verification; deletion stays off in production under #3431 pending an owner decision.
 
-[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1a's widened live acceptance is
-also pending: on real rolls, check strict-plain eligibility, protected and shared
-refusals, present versus missing classification, the declaration, contradiction
-and legacy-evidence behavior, and the measured caps. PRD #3430's items above stay
-pending.
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) records M1a's widened live
+acceptance as an owner-relayed assertion that this guide has not independently
+verified. The M1b deletion phase is implemented but off, and its hosted deletion
+acceptance is owner-owned, pending and unverified. On real rolls, check
+strict-plain eligibility, protected and shared refusals, present versus missing
+classification, the declaration, contradiction and legacy-evidence behavior, and
+the measured caps. PRD #3430's items above stay pending.
 
 ### M4/M5 runbook: known items before go-live
 

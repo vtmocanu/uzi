@@ -92,6 +92,7 @@ import {
   SwitchTokenAction,
 } from "../components/RunCredentialOverride";
 import { CredentialDisabledPanel, isCredentialDisabledHold } from "../components/CredentialDisabledPanel";
+import { CredentialsResetPanel, isCredentialsResetHold } from "../components/CredentialsResetPanel";
 import { CredentialSwitchHoldPanel } from "../components/CredentialSwitchHoldPanel";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
@@ -106,6 +107,7 @@ import { CheckerActivitySummary } from "../components/CheckerActivitySummary";
 import { CodeCrossCheck } from "../components/CodeCrossCheck";
 import { Markdown } from "../components/Markdown";
 import { JobResultPanel } from "./runView/JobResultPanel";
+import { PolicyHoldPanel, isPolicyHeld } from "./runView/PolicyHoldPanel";
 import { Alert, Badge, Button, Card, PageHeader, StatusPill, cx, type BadgeTone } from "../components/ui";
 import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
@@ -455,44 +457,12 @@ export function HealthFlag({ run }: { run: Run }) {
   );
 }
 
-// Only the run state confirms a hold. Delivery telemetry blocks continuation controls;
-// it does not establish a paused state, preservation evidence, or consent.
-function isPolicyHeld(run: Run): boolean {
-  return run.status === "paused" && run.hold_reason === "codex_policy_hold";
-}
-
 function isPolicyPending(run: Run): boolean {
   return !isTerminalRun(run.status) && run.outcome_pending?.reason === "codex_policy_hold_pending";
 }
 
 function policyBlocksContinuation(run: Run): boolean {
   return isPolicyHeld(run) || isPolicyPending(run);
-}
-
-function PolicyHoldPanel({ run }: { run: Run }) {
-  if (!isPolicyHeld(run)) return null;
-  const hold = run.policy_hold;
-  const head = hold?.captured_head;
-  const preservation = head
-    ? hold?.published === true
-      ? "Worker-reported published checkpoint"
-      : "Verified local checkpoint; publication is not confirmed"
-    : hold?.published === false
-      ? "Local-only retention; checkpoint capture is unverified"
-      : "Preservation is unverified";
-  return <Card className="p-4">
-    <h2 className="text-sm font-semibold text-warn">Codex policy hold</h2>
-    <p className="mt-1 text-xs text-muted">{preservation}{head ? <>: <span className="font-mono">{head}</span></> : "."} Preservation evidence was last reported by the worker.</p>
-    <p className="mt-1 text-xs text-muted">
-      {hold?.continuation_mode === "same_conversation"
-        ? "Continuation requires preserving the provider session."
-        : hold?.continuation_mode === "fresh_from_saved_work"
-          ? "Any future continuation would use a fresh conversation from the saved work."
-          : "Continuation requirements are unverified."}
-      {" "}The provider conversation's availability and ability to resume are not confirmed.
-    </p>
-    <p className="mt-1 text-xs text-muted">Resume and policy-specific Stop are unavailable. Cancel remains available to the run owner.</p>
-  </Card>;
 }
 
 // CompletionStatePanel shows bounded server completion fields, with untrusted text
@@ -504,7 +474,7 @@ export function CompletionStatePanel({ run }: { run: Run }) {
   const phase = run.completion_phase ?? "";
   // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
   // Token-switch, base-attestation and repo-agent source holds have their own panels.
-  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "provider_unavailable" &&
+  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "credentials_reset" && run.hold_reason !== "provider_unavailable" &&
     run.hold_reason !== "base_attestation_missing" && run.hold_reason !== "repo_agent_source_unavailable" && credentialSwitchHold(run) === null;
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
@@ -984,6 +954,7 @@ export function PausedPanel({
     policyBlocksContinuation(run) ||
     run.hold_reason === "completion_blocked" ||
     run.hold_reason === "credential_disabled" ||
+    run.hold_reason === "credentials_reset" ||
     run.hold_reason === "provider_unavailable" ||
     run.hold_reason === "iteration_budget_exhausted" ||
     // Issue #3181: the token-switch holds have their own panel and Resume gating.
@@ -1530,12 +1501,12 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   const evidence = recovery?.evidence;
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
-      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Retained recovery integrity check failed" : unwitnessed ? "Unwitnessed continuation hold needs your decision" : retained ? decisionHeld ? `${decisionName} needs your decision`
+      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Integrity hold needs your decision" : unwitnessed ? "Unwitnessed continuation hold needs your decision" : retained ? decisionHeld ? `${decisionName} needs your decision`
         : decisionRetrying ? `${decisionName} retrying` : `${decisionName} timing unknown`
         : memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
       <p className="mt-0.5 text-xs text-muted">
         {retained ? <>
-          {adoptionFailed && "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. "}
+          {adoptionFailed && "Integrity hold: retained adoption or a predecessor remediation record refused source use, so the agent did not start. Local work and its custody are preserved. "}
           {unwitnessed && "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. "}
           {decisionHeld
             ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
@@ -1550,6 +1521,9 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
+      {adoptionFailed && <p className="mt-1.5 text-xs text-warn">
+        Resume starts another recovery episode. If the underlying block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming.
+      </p>}
       {idleStall && <p className="mt-1.5 text-xs text-muted">Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.</p>}
       {!retained && <p className="mt-1.5 text-xs text-muted">
         {memoryHeld
@@ -2499,6 +2473,8 @@ export function RunView() {
               ? "provider_unavailable"
             : run?.status === "paused" && run.hold_reason === "credential_disabled"
               ? "credential_disabled"
+            : run?.status === "paused" && run.hold_reason === "credentials_reset"
+              ? "credentials_reset"
             : run?.status === "paused" && run.hold_reason === "credential_switch_settling"
               ? "credential_switch_settling"
             : run?.status === "paused" && run.hold_reason === "credential_switch_unsettled"
@@ -2518,7 +2494,7 @@ export function RunView() {
     setResumeAnnounce("");
     setParkAnnounce(
       parkKey === "codex_policy_hold"
-        ? "Codex policy hold. Resume and policy-specific Stop are unavailable. The owner can Cancel."
+        ? "Codex policy hold. The owner can choose how to continue, or Cancel. Stop is not available for a policy hold."
         : parkKey === "codex_policy_hold_pending"
           ? "Policy report delivery pending. The server has not confirmed a policy hold. Continuation is blocked pending delivery."
         : parkKey === "followup"
@@ -2526,7 +2502,7 @@ export function RunView() {
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "retained_recovery_adoption_failed"
-            ? "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
+            ? "Integrity hold: retained adoption or a predecessor remediation record refused source use, so the agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "retained_continuation_unwitnessed"
             ? "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "codex_idle_stall_held"
@@ -2565,6 +2541,8 @@ export function RunView() {
               ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
             : parkKey === "credential_disabled"
               ? "The run is waiting because a credential it needs is disabled. Enable it and the run resumes automatically."
+            : parkKey === "credentials_reset"
+              ? "The run is waiting because your account's credentials were reset. Add a credential in Settings and the run resumes automatically."
             : parkKey === "base_attestation_missing"
               ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
             : parkKey === "repo_agent_source_unavailable"
@@ -2648,7 +2626,7 @@ export function RunView() {
         actionsBesideTitle
         actions={<div className="relative flex flex-wrap items-center gap-2">
           <RunSettingsDisclosure>
-            {!policyBlocked && !isCredentialDisabledHold(run) && !(run.status === "awaiting_approval" && changedMilestones(run)) && (
+            {!policyBlocked && !isCredentialDisabledHold(run) && !isCredentialsResetHold(run) && !(run.status === "awaiting_approval" && changedMilestones(run)) && (
               <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
             )}
             <CredentialEpochList epochs={run.credential_epochs} />
@@ -2769,6 +2747,9 @@ export function RunView() {
                 // PRD #1732: a credential_disabled hold resumes on Enable (its panel), and a
                 // plain Resume would only park it again.
                 run.hold_reason !== "credential_disabled" &&
+                // PRD #3989 M3: the server refuses Resume (409) for a credentials_reset hold; it
+                // resumes on its own once a credential is added.
+                run.hold_reason !== "credentials_reset" &&
                 run.hold_reason !== "provider_unavailable" &&
                 run.hold_reason !== "iteration_budget_exhausted" &&
                 // Issue #3181: the token-switch holds offer Resume in their own panel, which
@@ -3088,7 +3069,7 @@ export function RunView() {
       )}
 
 
-      <PolicyHoldPanel run={run} />
+      <PolicyHoldPanel run={run} canSteer={canSteer} refreshRun={refreshRun} />
       {!policyBlocked && <CompletionDecisionPanel
         run={run}
         canSteer={canSteer}
@@ -3108,6 +3089,8 @@ export function RunView() {
           statusRef.current?.focus();
         }}
       />
+
+      <CredentialsResetPanel run={run} canSteer={canSteer} />
 
       <IterationHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
         onResume={() => act(async (isCurrent) => {
@@ -3741,10 +3724,21 @@ export function AgentRosterSummary({ run }: { run: Run }) {
 
 const AGENT_SOURCE_RUN_LABELS: Record<AgentSource, string> = { own: "my templates", repo: "repo agents" };
 
-function agentSourceRequestLine(run: Pick<Run, "agent_source" | "agent_source_requested" | "agent_source_requested_basis">): string | null {
+function agentSourceRequestLine(
+  run: Pick<Run, "agent_source" | "agent_source_requested" | "agent_source_requested_basis" | "plan_agent_source">,
+): string | null {
   const requested = run.agent_source_requested;
   if (!requested || !run.agent_source) return null;
   const basis = run.agent_source_requested_basis === "repo_default" ? "repo default" : "this run";
+  const planned = run.plan_agent_source;
+  const parts: string[] = [];
+  if (planned === requested) {
+    parts.push(`Planned with: ${AGENT_SOURCE_RUN_LABELS[planned]} (${basis})`);
+  } else {
+    parts.push(`Requested: ${AGENT_SOURCE_RUN_LABELS[requested]} (${basis})`);
+    parts.push(`Planned with: ${planned ? AGENT_SOURCE_RUN_LABELS[planned] : "—"}`);
+  }
   const outcome = run.agent_source === requested ? "as requested" : "changed at approval";
-  return `Requested: ${AGENT_SOURCE_RUN_LABELS[requested]} (${basis}) · Implemented with: ${AGENT_SOURCE_RUN_LABELS[run.agent_source]} (${outcome})`;
+  parts.push(`Implemented with: ${AGENT_SOURCE_RUN_LABELS[run.agent_source]} (${outcome})`);
+  return parts.join(" · ");
 }

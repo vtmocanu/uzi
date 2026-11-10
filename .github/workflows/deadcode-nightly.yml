@@ -1,0 +1,190 @@
+# Nightly API dead-code check (#4109).
+#
+# `task deadcode:api` (deadcode -test ./... over api/, zero findings against an
+# empty baseline) left PR and main CI: it took 48-60 min and held a job slot on
+# every run (memory growth: #4108). Recorded policy: deadcode no longer gates
+# merges, green main CI or releases. An exported unreachable function can reach
+# main and is reported on a subsequent scheduled run; Go `unused` (golangci-lint in
+# ci.yml's lint-api) still catches unexported dead code before merge.
+# `task gate:api` still runs it locally.
+#
+# Trust: the job that runs the Go tool and the checked-out source has a
+# read-only token. Only the separate `report` job holds issues: write, checks
+# out nothing, and runs only for a failure on refs/heads/main.
+name: Nightly deadcode
+
+# Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
+"on":
+  schedule:
+    # 03:23 UTC, off the hour and distinct from main-guard (05:43) and e2e (21:17).
+    - cron: "23 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deadcode-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deadcode-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          # Same Go minor and latest patch as ci.yml's lint-api, so deadcode analyses the
+          # tree with the toolchain CI builds it with (go.mod's toolchain line still wins
+          # when newer; Renovate keeps this go-version in its Go group).
+          go-version: "1.27"
+          check-latest: true
+          # Per-job-class cache below instead (.github/actions/go-cache).
+          cache: false
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: api-deadcode
+          module: api
+      - uses: ./.github/actions/setup-task
+      - name: go mod download
+        working-directory: api
+        run: go mod download
+      - name: Inspect memory and add owned swap headroom
+        id: swap_headroom
+        run: |
+          set -euo pipefail
+          free -b
+          swapon --show --bytes
+          nproc
+          # Keep existing swap. Require 8 GiB plus 2 GiB of free-disk margin.
+          swap_dir=
+          for candidate in /mnt /; do
+            if [ -d "$candidate" ]; then
+              df -h "$candidate"
+              available=$(df -B1 --output=avail "$candidate" | tail -n 1 | tr -d ' ')
+              if [ "$available" -ge 10737418240 ]; then
+                swap_dir=$candidate
+                break
+              fi
+            fi
+          done
+          if [ -z "$swap_dir" ]; then
+            echo 'Insufficient disk for 8 GiB swap plus 2 GiB margin' >&2
+            exit 1
+          fi
+          cgroup_path=$(awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup)
+          cgroup_dir="/sys/fs/cgroup${cgroup_path%/}"
+          printf '%s\n' "$cgroup_dir" > "$RUNNER_TEMP/deadcode-api-cgroup-path"
+          for name in memory.max memory.swap.max memory.events; do
+            if [ -r "$cgroup_dir/$name" ]; then
+              echo "Before: $cgroup_dir/$name"
+              cat "$cgroup_dir/$name"
+            else
+              echo "Unavailable: $cgroup_dir/$name"
+            fi
+          done
+          # mktemp owns a fresh path; never truncate an existing swap file.
+          swap_file=$(sudo -n mktemp "${swap_dir%/}/deadcode-api-swap.XXXXXX")
+          printf 'file=%s\n' "$swap_file" >> "$GITHUB_OUTPUT"
+          sudo -n chmod 600 "$swap_file"
+          sudo -n fallocate -l 8G "$swap_file"
+          sudo -n mkswap "$swap_file"
+          sudo -n swapon "$swap_file"
+          swapon --show --bytes
+          free -b
+      - name: deadcode
+        id: deadcode
+        run: |
+          # Sample system swap use in KiB. Reap only this step's own monitor.
+          vmstat -S K -w 1 > "$RUNNER_TEMP/deadcode-api-vmstat.log" &
+          monitor=$!
+          trap 'kill "$monitor" 2>/dev/null || true; wait "$monitor" 2>/dev/null || true' EXIT
+          task deadcode:api
+      - name: Record memory and swap outcome
+        if: always()
+        env:
+          OWNED_SWAP_FILE: ${{ steps.swap_headroom.outputs.file }}
+        run: |
+          free -b || true
+          swapon --show --bytes || true
+          awk '/^Swap(Total|Free):/ { print }' /proc/meminfo || true
+          if [ -s "$RUNNER_TEMP/deadcode-api-vmstat.log" ]; then
+            awk '$1 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {
+              if ($3 > peak) peak=$3; samples++
+            } END {
+              if (samples) printf "sampled_system_swap_peak_bytes=%.0f samples=%d interval_seconds=1\n", peak*1024, samples
+              else print "sampled_system_swap_peak_bytes=unavailable"
+            }' "$RUNNER_TEMP/deadcode-api-vmstat.log"
+            tail -n 5 "$RUNNER_TEMP/deadcode-api-vmstat.log"
+          else
+            echo 'sampled_system_swap_peak_bytes=unavailable'
+          fi
+          if [ -n "$OWNED_SWAP_FILE" ]; then
+            echo "Owned swap: $OWNED_SWAP_FILE"
+          fi
+          if [ -r "$RUNNER_TEMP/deadcode-api-cgroup-path" ]; then
+            cgroup_dir=$(cat "$RUNNER_TEMP/deadcode-api-cgroup-path")
+            for name in memory.events memory.swap.current memory.swap.peak; do
+              if [ -r "$cgroup_dir/$name" ]; then
+                echo "After: $cgroup_dir/$name"
+                cat "$cgroup_dir/$name"
+              else
+                echo "Unavailable: $cgroup_dir/$name"
+              fi
+            done
+          fi
+          if kernel_log=$(sudo -n dmesg --ctime 2>/dev/null); then
+            printf '%s\n' "$kernel_log" | grep -Ei 'oom|out of memory|killed process' || true
+          else
+            echo 'Kernel OOM log unavailable'
+          fi
+          # Leave swap active until this disposable VM is destroyed. swapoff
+          # could force other processes' swapped pages back into scarce RAM.
+      - name: Save Go cache (main only)
+        if: github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
+        with:
+          key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
+
+
+  # One open tracking issue: comment on it, else open it. Neutral wording: `task`
+  # exits non-zero for findings and for load/tool errors alike. Never auto-closed;
+  # a person closes it after verifying the fix. Keyed on the JOB result, not the
+  # deadcode step's outcome: a failed setup step skips that step, so its outcome
+  # would read `skipped` and a red nightly would file nothing.
+  report:
+    needs: deadcode-api
+    if: >-
+      always() && github.ref == 'refs/heads/main' &&
+      needs.deadcode-api.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          LABEL="nightly-deadcode"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh label create "$LABEL" \
+            --description "Nightly API deadcode check failures" \
+            --color B60205 --force
+          existing="$(gh issue list --state open --label "$LABEL" \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" \
+              --body "Nightly API deadcode check failed again on \`${GITHUB_SHA}\`. Run: ${RUN_URL}"
+          else
+            gh issue create \
+              --title "Nightly API deadcode check failed" \
+              --label "$LABEL" \
+              --body "$(printf '%s\n\n%s\n%s\n' \
+                'The nightly `task deadcode:api` run failed on main: an unreachable function (delete it, see the run log), a load/tool error, or a failed setup step. Close this after verifying the fix.' \
+                "First failing run: ${RUN_URL}" \
+                "Commit: ${GITHUB_SHA}")"
+          fi

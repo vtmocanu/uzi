@@ -1,0 +1,5 @@
+{
+  "policy_preserve_only": true,
+  "policy_expected_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "policy_fresh_unconfirmed": true
+}

@@ -17,7 +17,8 @@ var ErrIterationParkEvidence = errors.New("invalid iteration park evidence")
 var ErrIterationParkAuthority = errors.New("iteration park requires transaction authority")
 
 // IterationParkEvidence describes this invocation's allowance, not the run's
-// lifetime high-water iteration counter. Published is informational.
+// lifetime high-water iteration counter. Published and CheckpointContainsLatest are the
+// publication evidence that can supersede a required policy recovery head (#3607 M2a).
 type IterationParkEvidence struct {
 	ClaimGeneration          int64
 	IterationCount           int32
@@ -62,7 +63,7 @@ func (s *Service) ReportIterationPark(ctx context.Context, w store.Worker, id uu
 	}
 	// The policy episode is an independent continuation fence, including a
 	// replay whose iteration marker survived another lifecycle transition.
-	if activePolicyHold(run) {
+	if unresolvedPolicyEpisode(run) {
 		return run, false, "pending_control", nil
 	}
 	// A replay must not certify zero-attempt eligibility after history changed.
@@ -125,6 +126,7 @@ func (s *Service) ReportIterationPark(ctx context.Context, w store.Worker, id uu
 	n, err := q.SetRunIterationPark(ctx, store.SetRunIterationParkParams{
 		ID: id, WorkerID: pgconv.UUID(w.ID), ClaimGeneration: e.ClaimGeneration,
 		HoldCapturedHead: captured, GlobalMaxIterations: globalMaxIterations,
+		Published: e.Published, CheckpointContainsLatest: pgconv.BoolPtr(e.CheckpointContainsLatest),
 		MaxIterations: e.MaxIterations, IterationCount: e.IterationCount,
 	})
 	if err != nil {

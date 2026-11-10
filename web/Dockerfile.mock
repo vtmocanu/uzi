@@ -52,6 +52,8 @@ COPY fixtures/model-settings/ /app/fixtures/model-settings/
 COPY fixtures/lead-config/ /app/fixtures/lead-config/
 # mockApi.effortDefaults.test.ts imports the effort-defaults parity fixture (#3247).
 COPY fixtures/effort-defaults/ /app/fixtures/effort-defaults/
+# issue #3607: the policy-hold wording table the web panel and the CLI share.
+COPY fixtures/policy-hold/ /app/fixtures/policy-hold/
 ENV VITE_UZI_MOCK=1
 RUN npm run build
 

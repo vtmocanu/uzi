@@ -1,4 +1,8 @@
-import { validatePolicyHoldRequest, decodePolicyHoldReply, POLICY_HOLD_MAX_BYTES } from "./protocol.js";
+import {
+  validatePolicyHoldRequest, decodePolicyHoldReply, POLICY_HOLD_MAX_BYTES, normalizePolicyPreserveClaim,
+  validatePolicyRecoveryVerifiedRequest, decodePolicyRecoveryVerifiedReply, POLICY_RECOVERY_VERIFIED_MAX_BYTES,
+  type PolicyRecoveryVerifiedRequest, type PolicyRecoveryVerifiedReply,
+} from "./protocol.js";
 import { decodeCodexOperationDecision, validCodexOperationRequest } from "./codex-operation-admission.js";
 import type { CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
@@ -1295,6 +1299,8 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 
 /** issue #3181: the registration feature that lets a worker hold a credential switch it cannot settle. */
 export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
+/** Issue #3985: the server accepts `clarification_settled` after a human revise's clarification. */
+export const CLARIFICATION_REVISION_SETTLEMENT_FEATURE = "clarification_revision_settlement_v1";
 
 /** Issue #1324: the api accepts NEW publication intents and the typed publication-phase park. */
 const PUBLICATION_RESUME_FEATURE = "publication_resume_v1";
@@ -2230,6 +2236,7 @@ export class WorkerClient {
       validateClaimMemory(claim);
       dropMalformedMemoryParkReference(claim, this.log);
       this.dropUnknownDefaultEffort(claim);
+      if (isRecord(claim)) normalizePolicyPreserveClaim(claim as unknown as Record<string, unknown>);
       if (isRecord(claim) && claim.inventory_guarded !== undefined &&
           (typeof claim.inventory_guarded !== "boolean" ||
            (claim.inventory_guarded === true &&
@@ -2611,6 +2618,22 @@ export class WorkerClient {
     return reply;
   }
 
+  /** One bounded attempt (the caller owns any retry). 409 is the typed `pending` disposition. The record
+   *  only enables a later server-side supersede; it never clears the preserve-only requirement. A lost
+   *  reply may still have committed the record, so whether a supersede is allowed depends only on the
+   *  server's own predicates, never on this worker having seen a confirmation; a new claim generation
+   *  re-verifies before any supersede. */
+  async reportPolicyRecoveryVerified(runId: string, body: PolicyRecoveryVerifiedRequest, signal?: AbortSignal): Promise<PolicyRecoveryVerifiedReply> {
+    const request = validatePolicyRecoveryVerifiedRequest(body);
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/policy-recovery-verified`;
+    const res = await this.fetchRaw("POST", path, request, this.httpTimeoutMs, signal);
+    if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
+    const reply = decodePolicyRecoveryVerifiedReply(
+      JSON.parse(await readBoundedText(res, POLICY_RECOVERY_VERIFIED_MAX_BYTES, true, signal)));
+    if ((res.status === 409) !== (reply.disposition === "pending")) throw new Error("invalid policy recovery verification HTTP disposition");
+    return reply;
+  }
+
   /**
    * Report a run state and return what the server made of it. Every report —
    * terminal (completed/failed) and non-terminal (running/awaiting_approval/
@@ -2749,6 +2772,16 @@ export class WorkerClient {
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0)
         throw new Error("credential switch hold report requires the credential_switch_hold feature, a registration nonce and a positive claim_generation");
       return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
+    if (body.status === "clarification_settled") {
+      // Issue #3985: a settlement is not an ordinary running report. It is sent once, whole, and
+      // never stripped, downgraded or re-sent as an unqualified `running` (the server refuses that
+      // for a human-revise clarification), so it bypasses every legacy strip-and-retry path.
+      if (!this.hasFeature(CLARIFICATION_REVISION_SETTLEMENT_FEATURE) ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+          !body.clarification_settlement)
+        throw new Error("clarification settlement requires the clarification_revision_settlement_v1 feature, a positive claim_generation and clarification_settlement");
+      return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     // Once a source fence is negotiated, never retry its write without that fence
     // on a rolled-back strict decoder. Initial older-API calls retain compatibility.
@@ -3132,6 +3165,8 @@ export class WorkerClient {
           if (fields.credentialSwitchHeld !== undefined) ack.credentialSwitchHeld = fields.credentialSwitchHeld;
           if (fields.credentialSwitchHoldSettled !== undefined)
             ack.credentialSwitchHoldSettled = fields.credentialSwitchHoldSettled;
+          // Issue #3985: only a 200 can confirm a clarification settlement; a 409 is a refusal.
+          if (res.status === 200 && fields.clarificationSettled === true) ack.clarificationSettled = true;
           // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
           // read like contractRevision off the same single-use body (top-level, beside `run`).
           if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
@@ -5736,6 +5771,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   credentialSwitchReleased?: boolean;
   credentialSwitchHeld?: boolean;
   credentialSwitchHoldSettled?: boolean;
+  clarificationSettled?: boolean;
   gateRevision?: number;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
@@ -5832,6 +5868,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       credentialSwitchReleased?: boolean;
       credentialSwitchHeld?: boolean;
       credentialSwitchHoldSettled?: boolean;
+      clarificationSettled?: boolean;
       gateRevision?: number;
       revisionInputId?: number;
       supersededRevisionInputIds?: number[];
@@ -5968,6 +6005,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // acknowledgement applied (`hold_settled`). Read only off the 200 ack, like `released`.
     if (parsed?.disposition === "held") out.credentialSwitchHeld = true;
     if (parsed?.disposition === "hold_settled") out.credentialSwitchHoldSettled = true;
+    // Issue #3985: the clarification settlement applied; read only off the 200 ack.
+    if (parsed?.disposition === "clarification_settled") out.clarificationSettled = true;
     // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A
     // positive integer only; anything else (absent on an older api or another report, garbled)
     // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).

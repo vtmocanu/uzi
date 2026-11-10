@@ -17,12 +17,18 @@ import type { HarnessEffort } from "./harness.js";
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
 
-// Compact M1 transport only: this does not advertise provider_policy_hold_v1 readiness.
+/** Why a hold was entered. "refused" is the only cause of a `refused` detail; every other cause is a
+ *  metadata-free `resume_rejected` re-hold. fresh_start_uncertain re-holds a claim whose earlier one-claim
+ *  Fresh authorization was consumed without confirming a new conversation. */
+export const POLICY_HOLD_CAUSES = ["refused", "attempt_path", "saved_work_missing", "session_missing",
+  "transcript_unknown", "provider_resume_rejected", "pending_conversion", "fresh_start_uncertain"] as const;
+export type PolicyHoldCause = typeof POLICY_HOLD_CAUSES[number];
 export interface PolicyHoldRequest {
   outcome_id: string;
   source_generation: number;
   claim_generation: number;
   detail: "refused" | "resume_rejected";
+  cause: PolicyHoldCause;
   continuation_mode: "same_conversation" | "fresh_from_saved_work";
   tag?: "cyberPolicy" | "misalignmentPolicyViolation";
   phase?: "planning" | "implementation";
@@ -46,7 +52,7 @@ export const POLICY_HOLD_MAX_BYTES = 17 * 1024;
 const policyGeneration = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) > 0;
 const policyObject = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === "object" && !Array.isArray(v);
-const policyKeys = new Set(["outcome_id", "source_generation", "claim_generation", "detail", "continuation_mode",
+const policyKeys = new Set(["outcome_id", "source_generation", "claim_generation", "detail", "cause", "continuation_mode",
   "tag", "phase", "correlation_id", "session_id", "head", "published", "checkpoint_contains_latest"]);
 export function validatePolicyHoldRequest(value: unknown): PolicyHoldRequest {
   const invalid = () => { throw new Error("invalid policy hold request"); };
@@ -59,6 +65,9 @@ export function validatePolicyHoldRequest(value: unknown): PolicyHoldRequest {
       !policyGeneration(v.source_generation) || !policyGeneration(v.claim_generation) || v.claim_generation < v.source_generation ||
       !["refused", "resume_rejected"].includes(v.detail as string) ||
       !["same_conversation", "fresh_from_saved_work"].includes(v.continuation_mode as string) || typeof v.published !== "boolean") return invalid();
+  // cause is required: "refused" exactly when detail is refused; any other cause is a resume_rejected re-hold.
+  if (typeof v.cause !== "string" || !(POLICY_HOLD_CAUSES as readonly string[]).includes(v.cause) ||
+      (v.cause === "refused") !== (v.detail === "refused")) return invalid();
   if (v.detail === "refused" && (v.tag === undefined || v.phase === undefined || v.correlation_id === undefined)) return invalid();
   if (v.tag !== undefined && v.tag !== "cyberPolicy" && v.tag !== "misalignmentPolicyViolation") return invalid();
   if (v.phase !== undefined && v.phase !== "planning" && v.phase !== "implementation") return invalid();
@@ -92,6 +101,59 @@ export function decodePolicyHoldReply(value: unknown, request: PolicyHoldRequest
       v.applying_generation <= request.source_generation || v.applying_generation > (v.observed_generation as number))) return invalid();
   if (v.disposition === "terminal" && !["completed", "failed", "cancelled"].includes(v.observed_status as string)) return invalid();
   return v as unknown as PolicyHoldReply;
+}
+
+/** Worker-observed proof that a preserve-only claim's recovered clone contains the required head.
+ *  A record enables a later server-side supersede only; it never clears the requirement. */
+export interface PolicyRecoveryVerifiedRequest {
+  claim_generation: number;
+  required_head: string;
+}
+export interface PolicyRecoveryVerifiedReply {
+  disposition: "recorded" | "pending" | "refused";
+  reason?: string;
+}
+export const POLICY_RECOVERY_VERIFIED_MAX_BYTES = 4 * 1024;
+/** Lowercase 40- or 64-hex object id, the only shape policy_expected_head / required_head may take. */
+function isPolicyHeadId(value: unknown): value is string {
+  return typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})(?![\s\S])/.test(value);
+}
+export function validatePolicyRecoveryVerifiedRequest(value: unknown): PolicyRecoveryVerifiedRequest {
+  const invalid = () => { throw new Error("invalid policy recovery verification request"); };
+  if (!policyObject(value) || Object.keys(value).some(k => k !== "claim_generation" && k !== "required_head")) return invalid();
+  if (!policyGeneration(value.claim_generation) || !isPolicyHeadId(value.required_head)) return invalid();
+  return { claim_generation: value.claim_generation, required_head: value.required_head };
+}
+export function decodePolicyRecoveryVerifiedReply(value: unknown): PolicyRecoveryVerifiedReply {
+  const invalid = () => { throw new Error("invalid policy recovery verification reply"); };
+  if (!policyObject(value) || Object.keys(value).some(k => k !== "disposition" && k !== "reason")) return invalid();
+  if (!["recorded", "pending", "refused"].includes(value.disposition as string)) return invalid();
+  if (value.reason !== undefined && (typeof value.reason !== "string" || value.reason.length > 256)) return invalid();
+  return value as unknown as PolicyRecoveryVerifiedReply;
+}
+
+/** Normalizes the preserve-only claim fields in place. A present but non-boolean `policy_preserve_only`
+ *  is treated as true (fail closed: the claim may only continue the earlier conversation). `policy_expected_head` is kept only when it is a lowercase 40/64-hex id; a PRESENT but
+ *  invalid head is replaced by "" so a preserve-only claim reads it as missing saved work rather than
+ *  as a degraded capture that carries no requirement. */
+export function normalizePolicyPreserveClaim(claim: Record<string, unknown>): void {
+  if (claim.policy_resume_context_pending !== undefined && typeof claim.policy_resume_context_pending !== "boolean")
+    claim.policy_resume_context_pending = true; // keep context on a malformed marker; grants no authority
+  // This marker grants no execution authority. A malformed present value keeps the input barrier.
+  if (claim.policy_resume_inputs_pending !== undefined && typeof claim.policy_resume_inputs_pending !== "boolean")
+    claim.policy_resume_inputs_pending = true;
+  if (claim.policy_preserve_only !== undefined && typeof claim.policy_preserve_only !== "boolean")
+    claim.policy_preserve_only = true;
+  // The one-claim Fresh grant fails closed: anything but the literal boolean true is dropped, so a
+  // malformed value never lets a claim start a new conversation. The unconfirmed marker fails the other
+  // way: a present non-boolean value under a preserve-only claim reads as true (re-hold).
+  if (claim.policy_fresh_session !== undefined && claim.policy_fresh_session !== true) delete claim.policy_fresh_session;
+  if (claim.policy_fresh_unconfirmed !== undefined && typeof claim.policy_fresh_unconfirmed !== "boolean")
+    claim.policy_fresh_unconfirmed = claim.policy_preserve_only === true;
+  if (claim.policy_expected_head !== undefined && !isPolicyHeadId(claim.policy_expected_head))
+    claim.policy_expected_head = "";
+  if (claim.policy_saved_work_head !== undefined && !isPolicyHeadId(claim.policy_saved_work_head))
+    claim.policy_saved_work_head = "";
 }
 
 /** Compile-time two-way tie between the SDK's EffortLevel and HARNESS_EFFORTS: this line fails
@@ -182,6 +244,11 @@ export type RunState =
   /** issue #3181: the worker's acknowledgement that the held flight's owned operations have
    *  joined (hold_reason credential_switch_unsettled). Same fences as the hold report. */
   | "credential_switch_hold_settled"
+  /** Issue #3985: a plan cross-check run whose lead asked a clarification after a HUMAN
+   *  revise_plan verdict has the owner's answer; the run returns to awaiting_approval with the
+   *  revise still pending (an answer is never plan approval). Carries `clarification_settlement`
+   *  and `claim_generation`; requires the `clarification_revision_settlement_v1` feature. */
+  | "clarification_settled"
   | "completed"
   | "failed";
 
@@ -1660,6 +1727,31 @@ export interface ClaimResponse extends ClaimMemoryState {
   park_run_supported?: boolean;
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
   inventory_guarded?: boolean;
+  /** Compact policy hold: this claim may only continue the earlier conversation. The worker re-holds
+   *  instead of starting a fresh one. Normalized by normalizePolicyPreserveClaim. */
+  policy_preserve_only?: boolean;
+  /** A resolved policy episode has Resume guidance still owed. Selects the initial input-delivery
+   *  barrier even for a headless fresh_from_saved_work continuation; grants no Fresh/session authority.
+   *  Modern applied-but-unincluded inputs remain pending. Absent on ordinary claims and after inclusion.
+   *  Old APIs omit it and keep the earlier behavior. */
+  policy_resume_inputs_pending?: boolean;
+  /** A resolved policy episode has not reported its fresh session yet. Replay earlier owner context
+   *  for its first planning request; this grants no Fresh/session permission. Omitted otherwise. */
+  policy_resume_context_pending?: boolean;
+  /** The head the held work must still contain (lowercase 40/64 hex). "" means the server sent a
+   *  malformed value; absent means the hold captured no head (degraded capture). */
+  policy_expected_head?: string;
+  /** Set only on a claim that is NOT preserve-only, after an owner fresh_from_saved_work Resume while a
+   *  required head remains (lowercase 40/64 hex). "" means a malformed value (missing saved work);
+   *  absent means no requirement. Normalized by normalizePolicyPreserveClaim. */
+  policy_saved_work_head?: string;
+  /** Only on the one claim that consumed the owner's compatible-lane one-claim Fresh authorization while
+   *  no new conversation is confirmed: the worker may start exactly one new conversation for it. Anything
+   *  but `true` is dropped by normalizePolicyPreserveClaim (no fresh allowed). */
+  policy_fresh_session?: boolean;
+  /** A later claim of a preserving run whose consumed Fresh authorization never confirmed a new
+   *  conversation: re-hold (fresh_start_uncertain), never resume or start a conversation. */
+  policy_fresh_unconfirmed?: boolean;
   cross_check?: ClaimPlanCrossCheck | ClaimCodeCrossCheck;
   /** Frozen owner steering for a plan cross-check (issue #3841); decoded by decodeOwnerSteering. */
   cross_check_owner_steering?: ClaimOwnerSteering;
@@ -2340,6 +2432,8 @@ export const REPO_AGENT_SOURCE_HOLD_REASON = "repo_agent_source_unavailable";
 
 export const REPO_AGENT_SOURCE_FEATURE = "repo_agent_source_v1";
 
+export const PLAN_AGENT_SOURCE_FEATURE = "plan_agent_source_v1";
+
 /** issue #3194: what a base-attestation hold request established. `held` is the server's positive
  *  ACK for this flight's generation; `stale` is a fence refusal (the claim moved on); `unknown`
  *  covers every answer that proves neither (transport, 5xx, 404, 400, an unreadable body). */
@@ -2796,6 +2890,15 @@ export function seedAgentSelection(persisted?: AgentSelection | null): AgentSele
   return persisted ? { status: "ok", selection: persisted } : { status: "absent" };
 }
 
+export function planAgentSource(
+  persisted: AgentSource | null | undefined,
+  requested: AgentSource | null | undefined,
+  repoAvailable: boolean,
+): AgentSource {
+  const narrowed = persisted !== undefined && persisted !== null && persisted !== "repo";
+  return requestedAgentSource(requested) === "repo" && repoAvailable && !narrowed ? "repo" : "own";
+}
+
 export function gateVerdictSelection(
   verdict: AgentSelectionParse,
   persisted: AgentSelection | null | undefined,
@@ -2870,7 +2973,16 @@ export interface RunRegistrationEvidence {
   registration_epoch: number;
 }
 
+/** Issue #3985: the identities a `clarification_settled` report binds. */
+export interface ClarificationSettlement {
+  question_id: string;
+  revision_input_id: number;
+  gate_revision: number;
+}
+
 export interface StateRequest {
+  /** Issue #3985: present only on a `clarification_settled` report. */
+  clarification_settlement?: ClarificationSettlement;
   /** Issue #3859: set by the client alone, never by a caller. */
   registration_evidence?: RunRegistrationEvidence;
   /** Memory-pressure park fence, bound to the current registration. */
@@ -3014,6 +3126,7 @@ export interface StateRequest {
    *  Human-gated runs persist their selection through the `approve_plan` input
    *  instead, so this is absent there. */
   agent_selection?: AgentSelection;
+  plan_agent_source?: AgentSource;
   /** The plan's milestone breakdown (PRD #122 M1, Decision 2). Additive + optional
    *  and OMITTED ENTIRELY when absent — never `null` or `[]` — so an old worker's
    *  payload and a new worker's "no milestones" payload stay the same shape on the
@@ -3188,6 +3301,12 @@ export interface StateRequest {
    *  Resume with a NULL retry time and unchanged count. The api 400s it with any other cause, and only accepts it once it
    *  advertises `recovery_cause_data_volume_full`. The disk-full handling (M5) never sends it. */
   disk_park_preventive?: boolean;
+  /** Issue #4046: qualifies a `recovery_cause: "retained_recovery_exhausted"` park. `true` says every
+   *  recovery reservation this flight positively witnessed in the window ended in a data volume capacity
+   *  refusal, so the api holds the run for the owner (uncounted, NULL retry time) instead of retrying on
+   *  a timer. Sent only when the api advertised `retained_recovery_capacity_hold_v1` at register; absent
+   *  is today's counted park. */
+  retained_capacity_only?: boolean;
   /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit
    *  park, the owner pause park, a recovery park including the mid-run `data_volume_full` one),
    *  whether that published checkpoint contains the run's latest committed work. `false` when the
@@ -3413,6 +3532,8 @@ export interface StateAck {
   credentialSwitchHeld?: boolean;
   /** issue #3181: true when the 200 ack carried `disposition: "hold_settled"`. */
   credentialSwitchHoldSettled?: boolean;
+  /** Issue #3985: true when the 200 ack carried `disposition: "clarification_settled"`. */
+  clarificationSettled?: boolean;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
    *  revision the report was answered with, allocated or returned inside the report's transaction.
    *  The gate confirms THIS revision for bound-verdict matching. A positive integer only; absent
@@ -3777,6 +3898,9 @@ export interface RecoveryExactHold {
 export interface RecoveryHoldsResponse {
   run_id: string;
   holds: RecoveryHold[];
+  /** Run-wide open-hold count across every worker and generation (issue #3431). Present only when the api
+   *  read it for a worker that advertised recovery_run_open_holds_v1; ABSENT is unknown, never zero. */
+  run_open_holds?: { run_id: string; count: number };
 }
 
 /** RecoverySettleRequest is the worker's request that the api settle ONE older-generation

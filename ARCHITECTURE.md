@@ -838,7 +838,11 @@ existing gate path; original checker findings remain historical evidence.
 
 The Claude checker (for a Codex lead) is confined in layers: the SDK `tools`
 list is `Read`, `Grep` and `Glob` only, with every other tool disallowed and
-`settingSources` empty; its environment is isolated and holds only the
+`settingSources` empty. When the check requests structured output, the SDK's
+end-turn `StructuredOutput` carrier (final verdict only, no file access) is
+additionally admitted by exact name in the tool gate, the init check and the
+Code tool budget (issue #4038). Its
+environment is isolated and holds only the
 Anthropic token; it runs as the runner uid through `spawnDetached`; one path
 guard allows reads only inside the checkout plus its own SDK spill files under
 its home; and a Glob/Grep pattern guard denies absolute, home-relative and
@@ -1258,6 +1262,22 @@ chain in the diagram above, with no intervening `running`.
   See the Anthropic-credential discussion above and
   [docs/anthropic-token.md](docs/anthropic-token.md#waiting-for-a-token).
 
+- **claimed → paused (`credential_disabled` / `credentials_reset`)** (PRD
+  #3989 M3): `paused` carries two credential hold reasons on one park,
+  promoter and partial index. `credential_disabled` is a disabled credential
+  the run needs; `credentials_reset` is a Claude-harness or chat run created
+  before the owner's admin-issued account reset that finds, at claim, no model
+  credential left. Both park instead of failing and are promoted back to
+  `queued` by the same pass on secret create or enable, vault unlock and the
+  periodic sweep; a credential that vanishes again before the claim re-parks
+  the run, never fails it. A manual resume of a `credentials_reset` run is
+  refused with 409. Not parked: judge, job and cross_check runs, runs created
+  after the reset (they fail without a credential), and Codex runs, whose bound
+  login was frozen at create and so fail terminally. Auto-bound workers keep
+  `pool_wait`. All of it runs only after the vault gate, since queued runs are
+  not claimed until the new vault exists and is unlocked. See
+  [docs/vault-threat-model.md](docs/vault-threat-model.md#admin-issued-account-reset).
+
 - **running → recovery_wait → queued** (issue #1197): an SDK turn
   that comes back **positively empty** (zero reported turns, no model activity,
   no plan, no question and no completion signal) is
@@ -1334,6 +1354,13 @@ chain in the diagram above, with no intervening `running`.
   owner resume. Current message evidence can distinguish these execution
   paths in CLI/TUI/web run detail, not identify the requester; missing evidence
   leaves the label neutral (see [pause labels](docs/run-pause.md#reading-the-pause-label)).
+
+- **claimed or running → paused (Codex policy hold)** (`hold_reason=codex_policy_hold`, issue #3607).
+  A root Codex provider policy refusal on an eligible run pauses it with work and custody
+  preserved; the owner resumes per exact episode, and rollback is drain-only. Decisions,
+  residual limits and the guarded migration Downs (00420 and 00419) are in
+  [ADR-3607](adr/3607-compact-policy-hold-m1-isolation.md#consent-and-continuity-m2m3);
+  owner behaviour is in [docs/run-pause.md](docs/run-pause.md#held-on-a-codex-policy-refusal).
 
 - **running → paused (structural completion hold)** ([PRD #1226](prds/done/1226-structural-completion-interlock.md),
   rollout switch `completion_interlock_rollout`, **on by default** for a new `issue`

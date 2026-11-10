@@ -5,7 +5,7 @@
 
 import { Link } from "react-router-dom";
 import { isTerminalRun, type RunSummaryItem } from "../lib/api";
-import { issueLineStage, type IssueStage } from "../lib/issueLine";
+import { issueLineStage, type IssueStage, type IssueWorkScope } from "../lib/issueLine";
 import { formatAgo } from "../lib/rateLimits";
 import type { AdminRunsState } from "../lib/useOverviewData";
 import { OverviewRunRow } from "./OverviewRunRow";
@@ -39,6 +39,7 @@ export function OverviewRunsWidget({
   loading,
   stage = null,
   prRuns = [],
+  scope = "all",
 }: {
   ownRuns: RunSummaryItem[];
   adminRuns: AdminRunsState | null;
@@ -53,6 +54,8 @@ export function OverviewRunsWidget({
   // station lists those runs; no other user's PR is ever on the line.
   stage?: IssueStage | null;
   prRuns?: RunSummaryItem[];
+  // The issue-work line's scope: "you" hides other users' runs while a stage is picked.
+  scope?: IssueWorkScope;
 }) {
   const openPrIds = new Set(prRuns.map((r) => r.id));
   const onStage = (r: RunSummaryItem) => stage == null || issueLineStage(r, openPrIds) === stage;
@@ -61,19 +64,21 @@ export function OverviewRunsWidget({
   const adminFailed = isAdmin && adminRuns?.failed === true;
   // A failed admin read keeps its last good rows, but the line is drawn without them
   // (otherRuns is empty), so they must not shape the label or the empty sentence either.
+  // Under a stage filter with the line's scope at "you" (#4052), other users' runs are left
+  // out so the widget agrees with the line's own-only counts. Unfiltered it is unchanged.
   const others =
-    isAdmin && !adminFailed
+    isAdmin && !adminFailed && !(filtered && scope === "you")
       ? (adminRuns?.runs ?? []).filter((r) => r.owner_email !== viewerEmail && !isTerminalRun(r.status) && onStage(r))
       : [];
   // "Questions" when another user's question is in the group, as the line's bay says.
-  const scope = stage == null ? "Active runs" : stage === "asking" && others.length > 0 ? "Questions" : STAGE_NAMES[stage];
+  const heading = stage == null ? "Active runs" : stage === "asking" && others.length > 0 ? "Questions" : STAGE_NAMES[stage];
 
   return (
     <Card>
       <div className="flex items-center justify-between">
         <SectionTitle>Runs</SectionTitle>
         <span className="flex items-center gap-3 text-xs">
-          <span className="text-faint">{scope}</span>
+          <span className="text-faint">{heading}</span>
           <Link to="/runs" className="font-medium text-brand hover:text-brand-hover">
             All runs →
           </Link>

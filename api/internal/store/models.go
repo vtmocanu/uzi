@@ -11,6 +11,19 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AccountResetLink struct {
+	ID            uuid.UUID          `json:"id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	TokenHash     []byte             `json:"token_hash"`
+	Kind          string             `json:"kind"`
+	TargetIsAdmin bool               `json:"target_is_admin"`
+	IssuedBy      uuid.UUID          `json:"issued_by"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+	RedeemedAt    pgtype.Timestamptz `json:"redeemed_at"`
+	SupersededAt  pgtype.Timestamptz `json:"superseded_at"`
+}
+
 type AgentMemory struct {
 	ID        uuid.UUID          `json:"id"`
 	UserID    uuid.UUID          `json:"user_id"`
@@ -1212,81 +1225,89 @@ type Run struct {
 	FinalizeResumeGeneration pgtype.Int8 `json:"finalize_resume_generation"`
 	JobProtocol              pgtype.Int2 `json:"job_protocol"`
 	// Issue #2004: when the run first reached running; stamped once by SetRunRunning and never reset (display anchor). started_at stays the budget/timeout anchor and is reset by resume paths that grant a fresh wall.
-	FirstStartedAt                 pgtype.Timestamptz `json:"first_started_at"`
-	PlanCrossCheckRequired         bool               `json:"plan_cross_check_required"`
-	PlanCrossCheckGateReason       pgtype.Text        `json:"plan_cross_check_gate_reason"`
-	IssueRawDigest                 pgtype.Text        `json:"issue_raw_digest"`
-	IssueSavedBody                 pgtype.Text        `json:"issue_saved_body"`
-	IssueInputReason               pgtype.Text        `json:"issue_input_reason"`
-	AutoApproveBlockedReasons      []string           `json:"auto_approve_blocked_reasons"`
-	PlanCrossCheckDiffRefusal      pgtype.Text        `json:"plan_cross_check_diff_refusal"`
-	WorkerRecoveryEpisode          int64              `json:"worker_recovery_episode"`
-	RequeueEpisodeBaseline         int32              `json:"requeue_episode_baseline"`
-	WorkerRecoveryEvidence         []byte             `json:"worker_recovery_evidence"`
-	CrossCheckLane                 bool               `json:"cross_check_lane"`
-	CrossCheckLaneGeneration       pgtype.Int8        `json:"cross_check_lane_generation"`
-	CompletionFinalHead            pgtype.Text        `json:"completion_final_head"`
-	CodeCrossCheckRequired         bool               `json:"code_cross_check_required"`
-	ProviderParkCount              int32              `json:"provider_park_count"`
-	ProviderParkStreakStartedAt    pgtype.Timestamptz `json:"provider_park_streak_started_at"`
-	CiConfigGuard                  bool               `json:"ci_config_guard"`
-	MemoryEpisode                  int64              `json:"memory_episode"`
-	MemoryInterventionCount        int32              `json:"memory_intervention_count"`
-	MemoryPolicy                   []byte             `json:"memory_policy"`
-	CompletionNonClosingReason     pgtype.Text        `json:"completion_non_closing_reason"`
-	CiArtifactManifest             []byte             `json:"ci_artifact_manifest"`
-	CheckpointAttestedSource       pgtype.Text        `json:"checkpoint_attested_source"`
-	SourcePublicationIntent        []byte             `json:"source_publication_intent"`
-	ContinuedIssueIid              pgtype.Int8        `json:"continued_issue_iid"`
-	CheckpointCoordinates          []byte             `json:"checkpoint_coordinates"`
-	RetainedParkCount              int32              `json:"retained_park_count"`
-	IgnoredInferredCapabilities    []string           `json:"ignored_inferred_capabilities"`
-	ReserveHoldReason              pgtype.Text        `json:"reserve_hold_reason"`
-	ReserveExemptUntil             pgtype.Timestamptz `json:"reserve_exempt_until"`
-	ReserveExemptGrantedAt         pgtype.Timestamptz `json:"reserve_exempt_granted_at"`
-	ReserveExemptCredentialID      pgtype.UUID        `json:"reserve_exempt_credential_id"`
-	ReserveExemptWindowReset       pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
-	ReserveExemptPriorPct          pgtype.Int2        `json:"reserve_exempt_prior_pct"`
-	HintedCapabilities             []string           `json:"hinted_capabilities"`
-	CapabilityInferenceEvidence    []byte             `json:"capability_inference_evidence"`
-	IdleStallParkCount             int32              `json:"idle_stall_park_count"`
-	ForgeAdmission                 []byte             `json:"forge_admission"`
-	CodexSelectReason              pgtype.Text        `json:"codex_select_reason"`
-	RecoveryWaitPhase              pgtype.Text        `json:"recovery_wait_phase"`
-	PlanCrossCheckGated            bool               `json:"plan_cross_check_gated"`
-	PolicyPreserveRequired         bool               `json:"policy_preserve_required"`
-	PolicyPendingFresh             bool               `json:"policy_pending_fresh"`
-	PolicyOutcomeID                pgtype.UUID        `json:"policy_outcome_id"`
-	PolicyContinuationMode         pgtype.Text        `json:"policy_continuation_mode"`
-	PolicyResolvedAt               pgtype.Timestamptz `json:"policy_resolved_at"`
-	PolicyApplyingWorkerID         pgtype.UUID        `json:"policy_applying_worker_id"`
-	PolicyApplyingGeneration       pgtype.Int8        `json:"policy_applying_generation"`
-	PolicySourceGeneration         pgtype.Int8        `json:"policy_source_generation"`
-	PolicyRefusalCount             int32              `json:"policy_refusal_count"`
-	PolicyRefusalTag               pgtype.Text        `json:"policy_refusal_tag"`
-	PolicyRefusalPhase             pgtype.Text        `json:"policy_refusal_phase"`
-	PolicyRefusalCorrelationID     pgtype.Text        `json:"policy_refusal_correlation_id"`
-	PolicyHoldPublished            pgtype.Bool        `json:"policy_hold_published"`
-	HarnessPreferred               pgtype.Text        `json:"harness_preferred"`
-	HarnessDecisionReason          pgtype.Text        `json:"harness_decision_reason"`
-	HarnessPreferredScore          pgtype.Float8      `json:"harness_preferred_score"`
-	HarnessOtherScore              pgtype.Float8      `json:"harness_other_score"`
-	HarnessPreferredMeasured       pgtype.Float8      `json:"harness_preferred_measured"`
-	HarnessOtherMeasured           pgtype.Float8      `json:"harness_other_measured"`
-	HarnessPreferredHeld           pgtype.Bool        `json:"harness_preferred_held"`
-	HarnessOtherHeld               pgtype.Bool        `json:"harness_other_held"`
-	HarnessPreferredWeeklyResetAt  pgtype.Timestamptz `json:"harness_preferred_weekly_reset_at"`
-	HarnessOtherWeeklyResetAt      pgtype.Timestamptz `json:"harness_other_weekly_reset_at"`
-	RegistrationEvidenceGeneration pgtype.Int8        `json:"registration_evidence_generation"`
-	RegistrationEvidenceNonce      pgtype.Text        `json:"registration_evidence_nonce"`
-	RegistrationEvidenceEpoch      pgtype.Int8        `json:"registration_evidence_epoch"`
-	SnapshotDepartedGeneration     pgtype.Int8        `json:"snapshot_departed_generation"`
-	SnapshotDepartedNonce          pgtype.Text        `json:"snapshot_departed_nonce"`
-	SnapshotDepartedEpoch          pgtype.Int8        `json:"snapshot_departed_epoch"`
-	RepoAgentSourceCommit          pgtype.Text        `json:"repo_agent_source_commit"`
-	RepoAgentSourceRequired        bool               `json:"repo_agent_source_required"`
-	AgentSourceRequested           pgtype.Text        `json:"agent_source_requested"`
-	AgentSourceRequestedBasis      pgtype.Text        `json:"agent_source_requested_basis"`
+	FirstStartedAt                   pgtype.Timestamptz `json:"first_started_at"`
+	PlanCrossCheckRequired           bool               `json:"plan_cross_check_required"`
+	PlanCrossCheckGateReason         pgtype.Text        `json:"plan_cross_check_gate_reason"`
+	IssueRawDigest                   pgtype.Text        `json:"issue_raw_digest"`
+	IssueSavedBody                   pgtype.Text        `json:"issue_saved_body"`
+	IssueInputReason                 pgtype.Text        `json:"issue_input_reason"`
+	AutoApproveBlockedReasons        []string           `json:"auto_approve_blocked_reasons"`
+	PlanCrossCheckDiffRefusal        pgtype.Text        `json:"plan_cross_check_diff_refusal"`
+	WorkerRecoveryEpisode            int64              `json:"worker_recovery_episode"`
+	RequeueEpisodeBaseline           int32              `json:"requeue_episode_baseline"`
+	WorkerRecoveryEvidence           []byte             `json:"worker_recovery_evidence"`
+	CrossCheckLane                   bool               `json:"cross_check_lane"`
+	CrossCheckLaneGeneration         pgtype.Int8        `json:"cross_check_lane_generation"`
+	CompletionFinalHead              pgtype.Text        `json:"completion_final_head"`
+	CodeCrossCheckRequired           bool               `json:"code_cross_check_required"`
+	ProviderParkCount                int32              `json:"provider_park_count"`
+	ProviderParkStreakStartedAt      pgtype.Timestamptz `json:"provider_park_streak_started_at"`
+	CiConfigGuard                    bool               `json:"ci_config_guard"`
+	MemoryEpisode                    int64              `json:"memory_episode"`
+	MemoryInterventionCount          int32              `json:"memory_intervention_count"`
+	MemoryPolicy                     []byte             `json:"memory_policy"`
+	CompletionNonClosingReason       pgtype.Text        `json:"completion_non_closing_reason"`
+	CiArtifactManifest               []byte             `json:"ci_artifact_manifest"`
+	CheckpointAttestedSource         pgtype.Text        `json:"checkpoint_attested_source"`
+	SourcePublicationIntent          []byte             `json:"source_publication_intent"`
+	ContinuedIssueIid                pgtype.Int8        `json:"continued_issue_iid"`
+	CheckpointCoordinates            []byte             `json:"checkpoint_coordinates"`
+	RetainedParkCount                int32              `json:"retained_park_count"`
+	IgnoredInferredCapabilities      []string           `json:"ignored_inferred_capabilities"`
+	ReserveHoldReason                pgtype.Text        `json:"reserve_hold_reason"`
+	ReserveExemptUntil               pgtype.Timestamptz `json:"reserve_exempt_until"`
+	ReserveExemptGrantedAt           pgtype.Timestamptz `json:"reserve_exempt_granted_at"`
+	ReserveExemptCredentialID        pgtype.UUID        `json:"reserve_exempt_credential_id"`
+	ReserveExemptWindowReset         pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
+	ReserveExemptPriorPct            pgtype.Int2        `json:"reserve_exempt_prior_pct"`
+	HintedCapabilities               []string           `json:"hinted_capabilities"`
+	CapabilityInferenceEvidence      []byte             `json:"capability_inference_evidence"`
+	IdleStallParkCount               int32              `json:"idle_stall_park_count"`
+	ForgeAdmission                   []byte             `json:"forge_admission"`
+	CodexSelectReason                pgtype.Text        `json:"codex_select_reason"`
+	RecoveryWaitPhase                pgtype.Text        `json:"recovery_wait_phase"`
+	PlanCrossCheckGated              bool               `json:"plan_cross_check_gated"`
+	PolicyPreserveRequired           bool               `json:"policy_preserve_required"`
+	PolicyPendingFresh               bool               `json:"policy_pending_fresh"`
+	PolicyOutcomeID                  pgtype.UUID        `json:"policy_outcome_id"`
+	PolicyContinuationMode           pgtype.Text        `json:"policy_continuation_mode"`
+	PolicyResolvedAt                 pgtype.Timestamptz `json:"policy_resolved_at"`
+	PolicyApplyingWorkerID           pgtype.UUID        `json:"policy_applying_worker_id"`
+	PolicyApplyingGeneration         pgtype.Int8        `json:"policy_applying_generation"`
+	PolicySourceGeneration           pgtype.Int8        `json:"policy_source_generation"`
+	PolicyRefusalCount               int32              `json:"policy_refusal_count"`
+	PolicyRefusalTag                 pgtype.Text        `json:"policy_refusal_tag"`
+	PolicyRefusalPhase               pgtype.Text        `json:"policy_refusal_phase"`
+	PolicyRefusalCorrelationID       pgtype.Text        `json:"policy_refusal_correlation_id"`
+	PolicyHoldPublished              pgtype.Bool        `json:"policy_hold_published"`
+	HarnessPreferred                 pgtype.Text        `json:"harness_preferred"`
+	HarnessDecisionReason            pgtype.Text        `json:"harness_decision_reason"`
+	HarnessPreferredScore            pgtype.Float8      `json:"harness_preferred_score"`
+	HarnessOtherScore                pgtype.Float8      `json:"harness_other_score"`
+	HarnessPreferredMeasured         pgtype.Float8      `json:"harness_preferred_measured"`
+	HarnessOtherMeasured             pgtype.Float8      `json:"harness_other_measured"`
+	HarnessPreferredHeld             pgtype.Bool        `json:"harness_preferred_held"`
+	HarnessOtherHeld                 pgtype.Bool        `json:"harness_other_held"`
+	HarnessPreferredWeeklyResetAt    pgtype.Timestamptz `json:"harness_preferred_weekly_reset_at"`
+	HarnessOtherWeeklyResetAt        pgtype.Timestamptz `json:"harness_other_weekly_reset_at"`
+	RegistrationEvidenceGeneration   pgtype.Int8        `json:"registration_evidence_generation"`
+	RegistrationEvidenceNonce        pgtype.Text        `json:"registration_evidence_nonce"`
+	RegistrationEvidenceEpoch        pgtype.Int8        `json:"registration_evidence_epoch"`
+	SnapshotDepartedGeneration       pgtype.Int8        `json:"snapshot_departed_generation"`
+	SnapshotDepartedNonce            pgtype.Text        `json:"snapshot_departed_nonce"`
+	SnapshotDepartedEpoch            pgtype.Int8        `json:"snapshot_departed_epoch"`
+	RepoAgentSourceCommit            pgtype.Text        `json:"repo_agent_source_commit"`
+	RepoAgentSourceRequired          bool               `json:"repo_agent_source_required"`
+	AgentSourceRequested             pgtype.Text        `json:"agent_source_requested"`
+	AgentSourceRequestedBasis        pgtype.Text        `json:"agent_source_requested_basis"`
+	PlanAgentSource                  pgtype.Text        `json:"plan_agent_source"`
+	CiFixMrIid                       pgtype.Int8        `json:"ci_fix_mr_iid"`
+	PolicyRequiredHead               pgtype.Text        `json:"policy_required_head"`
+	PolicyRecoveryVerifiedGeneration pgtype.Int8        `json:"policy_recovery_verified_generation"`
+	PolicyRecoveryVerifiedHead       pgtype.Text        `json:"policy_recovery_verified_head"`
+	PolicyHoldCause                  pgtype.Text        `json:"policy_hold_cause"`
+	PolicyFreshConsumedGeneration    pgtype.Int8        `json:"policy_fresh_consumed_generation"`
+	PolicyFreshConfirmedGeneration   pgtype.Int8        `json:"policy_fresh_confirmed_generation"`
 }
 
 type RunCompletionAttempt struct {
@@ -1804,6 +1825,7 @@ type User struct {
 	CodexAccountMode          string             `json:"codex_account_mode"`
 	HarnessOverflowEnabled    bool               `json:"harness_overflow_enabled"`
 	CodexSummaryModel         pgtype.Text        `json:"codex_summary_model"`
+	CredentialsResetAt        pgtype.Timestamptz `json:"credentials_reset_at"`
 }
 
 type UserCrossCheckPin struct {

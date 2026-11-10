@@ -258,6 +258,56 @@ func (q *Queries) CountOpenCustodyHoldsForRepo(ctx context.Context, repoID uuid.
 	return count, err
 }
 
+const createForgeConnectionIfAbsent = `-- name: CreateForgeConnectionIfAbsent :one
+INSERT INTO forge_connections (
+    user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, last_verified_at
+) VALUES ($1, $2, $3, $4, $5, $6, now())
+ON CONFLICT (user_id, forge_type, base_url) DO NOTHING
+RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username
+`
+
+type CreateForgeConnectionIfAbsentParams struct {
+	UserID          uuid.UUID `json:"user_id"`
+	ForgeType       string    `json:"forge_type"`
+	BaseUrl         string    `json:"base_url"`
+	BotUsername     string    `json:"bot_username"`
+	BotForgeUserID  int64     `json:"bot_forge_user_id"`
+	TokenCiphertext []byte    `json:"token_ciphertext"`
+}
+
+// Create-only counterpart of UpsertForgeConnection for the operator setup
+// command (PRD #3760): it never updates an existing row, so a concurrent or
+// earlier connection keeps its token and bot identity. No row is returned on a
+// (user, forge_type, base_url) conflict; the caller then reads the winner with
+// GetForgeConnectionByTarget.
+func (q *Queries) CreateForgeConnectionIfAbsent(ctx context.Context, arg CreateForgeConnectionIfAbsentParams) (ForgeConnection, error) {
+	row := q.db.QueryRow(ctx, createForgeConnectionIfAbsent,
+		arg.UserID,
+		arg.ForgeType,
+		arg.BaseUrl,
+		arg.BotUsername,
+		arg.BotForgeUserID,
+		arg.TokenCiphertext,
+	)
+	var i ForgeConnection
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.BotUsername,
+		&i.BotForgeUserID,
+		&i.TokenCiphertext,
+		&i.CreatedAt,
+		&i.LastVerifiedAt,
+		&i.PrivilegeReport,
+		&i.PrivilegeCheckedAt,
+		&i.PrivilegeStatus,
+		&i.HumanUsername,
+	)
+	return i, err
+}
+
 const deleteBoardColumnsByRepo = `-- name: DeleteBoardColumnsByRepo :exec
 DELETE FROM board_columns WHERE repo_id = $1
 `
@@ -281,7 +331,7 @@ WITH deletion_scope AS MATERIALIZED (
         THEN cc.lead_run_id ELSE candidates.id END
         AND parent.kind <> 'cross_check'
 ), locked_parents AS MATERIALIZED (
-    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities, lead.reserve_hold_reason, lead.reserve_exempt_until, lead.reserve_exempt_granted_at, lead.reserve_exempt_credential_id, lead.reserve_exempt_window_reset, lead.reserve_exempt_prior_pct, lead.hinted_capabilities, lead.capability_inference_evidence, lead.idle_stall_park_count, lead.forge_admission, lead.codex_select_reason, lead.recovery_wait_phase, lead.plan_cross_check_gated, lead.policy_preserve_required, lead.policy_pending_fresh, lead.policy_outcome_id, lead.policy_continuation_mode, lead.policy_resolved_at, lead.policy_applying_worker_id, lead.policy_applying_generation, lead.policy_source_generation, lead.policy_refusal_count, lead.policy_refusal_tag, lead.policy_refusal_phase, lead.policy_refusal_correlation_id, lead.policy_hold_published, lead.harness_preferred, lead.harness_decision_reason, lead.harness_preferred_score, lead.harness_other_score, lead.harness_preferred_measured, lead.harness_other_measured, lead.harness_preferred_held, lead.harness_other_held, lead.harness_preferred_weekly_reset_at, lead.harness_other_weekly_reset_at, lead.registration_evidence_generation, lead.registration_evidence_nonce, lead.registration_evidence_epoch, lead.snapshot_departed_generation, lead.snapshot_departed_nonce, lead.snapshot_departed_epoch, lead.repo_agent_source_commit, lead.repo_agent_source_required, lead.agent_source_requested, lead.agent_source_requested_basis FROM runs lead
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities, lead.reserve_hold_reason, lead.reserve_exempt_until, lead.reserve_exempt_granted_at, lead.reserve_exempt_credential_id, lead.reserve_exempt_window_reset, lead.reserve_exempt_prior_pct, lead.hinted_capabilities, lead.capability_inference_evidence, lead.idle_stall_park_count, lead.forge_admission, lead.codex_select_reason, lead.recovery_wait_phase, lead.plan_cross_check_gated, lead.policy_preserve_required, lead.policy_pending_fresh, lead.policy_outcome_id, lead.policy_continuation_mode, lead.policy_resolved_at, lead.policy_applying_worker_id, lead.policy_applying_generation, lead.policy_source_generation, lead.policy_refusal_count, lead.policy_refusal_tag, lead.policy_refusal_phase, lead.policy_refusal_correlation_id, lead.policy_hold_published, lead.harness_preferred, lead.harness_decision_reason, lead.harness_preferred_score, lead.harness_other_score, lead.harness_preferred_measured, lead.harness_other_measured, lead.harness_preferred_held, lead.harness_other_held, lead.harness_preferred_weekly_reset_at, lead.harness_other_weekly_reset_at, lead.registration_evidence_generation, lead.registration_evidence_nonce, lead.registration_evidence_epoch, lead.snapshot_departed_generation, lead.snapshot_departed_nonce, lead.snapshot_departed_epoch, lead.repo_agent_source_commit, lead.repo_agent_source_required, lead.agent_source_requested, lead.agent_source_requested_basis, lead.plan_agent_source, lead.ci_fix_mr_iid, lead.policy_required_head, lead.policy_recovery_verified_generation, lead.policy_recovery_verified_head, lead.policy_hold_cause, lead.policy_fresh_consumed_generation, lead.policy_fresh_confirmed_generation FROM runs lead
     WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
       AND lead.kind <> 'cross_check'
     ORDER BY lead.id
@@ -354,7 +404,7 @@ WITH deletion_scope AS MATERIALIZED (
         THEN cc.lead_run_id ELSE candidates.id END
         AND parent.kind <> 'cross_check'
 ), locked_parents AS MATERIALIZED (
-    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities, lead.reserve_hold_reason, lead.reserve_exempt_until, lead.reserve_exempt_granted_at, lead.reserve_exempt_credential_id, lead.reserve_exempt_window_reset, lead.reserve_exempt_prior_pct, lead.hinted_capabilities, lead.capability_inference_evidence, lead.idle_stall_park_count, lead.forge_admission, lead.codex_select_reason, lead.recovery_wait_phase, lead.plan_cross_check_gated, lead.policy_preserve_required, lead.policy_pending_fresh, lead.policy_outcome_id, lead.policy_continuation_mode, lead.policy_resolved_at, lead.policy_applying_worker_id, lead.policy_applying_generation, lead.policy_source_generation, lead.policy_refusal_count, lead.policy_refusal_tag, lead.policy_refusal_phase, lead.policy_refusal_correlation_id, lead.policy_hold_published, lead.harness_preferred, lead.harness_decision_reason, lead.harness_preferred_score, lead.harness_other_score, lead.harness_preferred_measured, lead.harness_other_measured, lead.harness_preferred_held, lead.harness_other_held, lead.harness_preferred_weekly_reset_at, lead.harness_other_weekly_reset_at, lead.registration_evidence_generation, lead.registration_evidence_nonce, lead.registration_evidence_epoch, lead.snapshot_departed_generation, lead.snapshot_departed_nonce, lead.snapshot_departed_epoch, lead.repo_agent_source_commit, lead.repo_agent_source_required, lead.agent_source_requested, lead.agent_source_requested_basis FROM runs lead
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities, lead.reserve_hold_reason, lead.reserve_exempt_until, lead.reserve_exempt_granted_at, lead.reserve_exempt_credential_id, lead.reserve_exempt_window_reset, lead.reserve_exempt_prior_pct, lead.hinted_capabilities, lead.capability_inference_evidence, lead.idle_stall_park_count, lead.forge_admission, lead.codex_select_reason, lead.recovery_wait_phase, lead.plan_cross_check_gated, lead.policy_preserve_required, lead.policy_pending_fresh, lead.policy_outcome_id, lead.policy_continuation_mode, lead.policy_resolved_at, lead.policy_applying_worker_id, lead.policy_applying_generation, lead.policy_source_generation, lead.policy_refusal_count, lead.policy_refusal_tag, lead.policy_refusal_phase, lead.policy_refusal_correlation_id, lead.policy_hold_published, lead.harness_preferred, lead.harness_decision_reason, lead.harness_preferred_score, lead.harness_other_score, lead.harness_preferred_measured, lead.harness_other_measured, lead.harness_preferred_held, lead.harness_other_held, lead.harness_preferred_weekly_reset_at, lead.harness_other_weekly_reset_at, lead.registration_evidence_generation, lead.registration_evidence_nonce, lead.registration_evidence_epoch, lead.snapshot_departed_generation, lead.snapshot_departed_nonce, lead.snapshot_departed_epoch, lead.repo_agent_source_commit, lead.repo_agent_source_required, lead.agent_source_requested, lead.agent_source_requested_basis, lead.plan_agent_source, lead.ci_fix_mr_iid, lead.policy_required_head, lead.policy_recovery_verified_generation, lead.policy_recovery_verified_head, lead.policy_hold_cause, lead.policy_fresh_consumed_generation, lead.policy_fresh_confirmed_generation FROM runs lead
     WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
       AND lead.kind <> 'cross_check'
     ORDER BY lead.id
@@ -390,6 +440,38 @@ func (q *Queries) DeleteRepoForUser(ctx context.Context, arg DeleteRepoForUserPa
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getForgeConnectionByTarget = `-- name: GetForgeConnectionByTarget :one
+SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username FROM forge_connections
+WHERE user_id = $1 AND forge_type = $2 AND base_url = $3
+`
+
+type GetForgeConnectionByTargetParams struct {
+	UserID    uuid.UUID `json:"user_id"`
+	ForgeType string    `json:"forge_type"`
+	BaseUrl   string    `json:"base_url"`
+}
+
+func (q *Queries) GetForgeConnectionByTarget(ctx context.Context, arg GetForgeConnectionByTargetParams) (ForgeConnection, error) {
+	row := q.db.QueryRow(ctx, getForgeConnectionByTarget, arg.UserID, arg.ForgeType, arg.BaseUrl)
+	var i ForgeConnection
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.BotUsername,
+		&i.BotForgeUserID,
+		&i.TokenCiphertext,
+		&i.CreatedAt,
+		&i.LastVerifiedAt,
+		&i.PrivilegeReport,
+		&i.PrivilegeCheckedAt,
+		&i.PrivilegeStatus,
+		&i.HumanUsername,
+	)
+	return i, err
 }
 
 const getForgeConnectionForUser = `-- name: GetForgeConnectionForUser :one
@@ -721,6 +803,30 @@ type InsertBoardColumnParams struct {
 // hitting the (repo_id, label_name) unique violation.
 func (q *Queries) InsertBoardColumn(ctx context.Context, arg InsertBoardColumnParams) error {
 	_, err := q.db.Exec(ctx, insertBoardColumn, arg.RepoID, arg.LabelName, arg.Position)
+	return err
+}
+
+const insertDefaultBoardColumns = `-- name: InsertDefaultBoardColumns :exec
+INSERT INTO board_columns (repo_id, label_name, position)
+SELECT $1::uuid, c.label_name, (c.ord - 1)::int
+FROM unnest($2::text[]) WITH ORDINALITY AS c(label_name, ord)
+WHERE NOT EXISTS (SELECT 1 FROM board_columns b WHERE b.repo_id = $1::uuid)
+ON CONFLICT (repo_id, label_name) DO NOTHING
+`
+
+type InsertDefaultBoardColumnsParams struct {
+	RepoID     uuid.UUID `json:"repo_id"`
+	LabelNames []string  `json:"label_names"`
+}
+
+// One statement, so a repo gets every default column or none: a failure part
+// way through rolls the whole insert back, and a retry starts from no columns
+// instead of mistaking a partial board for a complete one. Position is the
+// label's 0-based index in @label_names. NOT EXISTS leaves a repo that already
+// has any column (custom columns included) untouched; DO NOTHING keeps two
+// concurrent seeds of the same empty repo from a unique violation.
+func (q *Queries) InsertDefaultBoardColumns(ctx context.Context, arg InsertDefaultBoardColumnsParams) error {
+	_, err := q.db.Exec(ctx, insertDefaultBoardColumns, arg.RepoID, arg.LabelNames)
 	return err
 }
 

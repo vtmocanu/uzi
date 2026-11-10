@@ -8,10 +8,11 @@
 import { useId, type ReactNode } from "react";
 import type { RunSummaryItem } from "../lib/api";
 import { maskEmail } from "../lib/demoMask";
-import { runRef, type IssueLineModel, type IssueStage, type LineEntry } from "../lib/issueLine";
+import { crossCheckTag, runRef, type CrossCheckTag, type IssueLineModel, type IssueStage, type IssueWorkScope, type LineEntry } from "../lib/issueLine";
 import { stripUnsafeChars } from "../lib/safeText";
 import { ActivityIcon, ChatIcon, ClockIcon } from "./icons";
-import { Badge, Button, RUN_STATUS_TONES, type BadgeTone } from "./ui";
+import { Badge, RUN_STATUS_TONES, type BadgeTone } from "./ui";
+import { SegmentedToggle } from "./usageParts";
 
 // At most this many badges per station; the rest collapse into one "+N" badge.
 const MAX_BADGES = 12;
@@ -56,29 +57,48 @@ const STATIONS: Station[] = [
   { stage: "pr", label: "PR open", tone: "ok", flows: false },
 ];
 
+// The inner pill of a cross-check tag. An outline only: a fill would stack on the chip's own
+// tint and pull 11px coloured text under AA 4.5:1 (#4082 review), so the tone lives in the
+// text and its border alone. A plain check reads in the foreground colour, as the mock's .why.chk.
+const TAG_CLASSES: Record<CrossCheckTag["tone"], string> = {
+  check: "text-fg",
+  warn: "text-warn",
+  danger: "text-danger",
+};
+
 function RunBadges({
   runs,
   tone,
+  stage,
   demo,
 }: {
   runs: { run: RunSummaryItem; own: boolean }[];
   tone: BadgeTone;
+  stage: IssueStage;
   demo: boolean;
 }) {
   if (runs.length === 0) return null;
   const shown = runs.slice(0, MAX_BADGES);
   return (
     <span className="mt-2 flex min-w-0 flex-wrap gap-1">
-      {shown.map(({ run, own }) => (
-        <Badge
-          key={run.id}
-          tone={tone}
-          // Another user's run names its owner on hover, masked in demo mode.
-          title={!own && run.owner_email ? stripUnsafeChars(maskEmail(run.owner_email, demo)) : undefined}
-        >
-          {runRef(run)}
-        </Badge>
-      ))}
+      {shown.map(({ run, own }) => {
+        const tag = crossCheckTag(run, stage);
+        // Another user's run names its owner on hover, masked in demo mode; a tag adds its meaning.
+        const ownerPart = !own && run.owner_email ? maskEmail(run.owner_email, demo) : undefined;
+        const title = [ownerPart, tag?.title].filter(Boolean).join(" · ");
+        return (
+          <Badge key={run.id} tone={tone} wrap={tag != null} title={title ? stripUnsafeChars(title) : undefined}>
+            {runRef(run)}
+            {tag && (
+              <>
+                {/* A real space, so the chip reads "#N cross-checking" to assistive tech and copy. */}{" "}
+                {/* One bordered box that may break inside itself in a narrow station, never past it. */}
+                <span className={`inline-block max-w-full rounded border border-current/40 px-1 ${TAG_CLASSES[tag.tone]}`}>{stripUnsafeChars(tag.text)}</span>
+              </>
+            )}
+          </Badge>
+        );
+      })}
       {runs.length > shown.length && <Badge tone="neutral">+{runs.length - shown.length}</Badge>}
     </span>
   );
@@ -163,7 +183,7 @@ function StationButton({
       </span>
       <span className="text-xs text-faint">{caption}</span>
       {note && <span className="text-xs text-faint opacity-80">{note}</span>}
-      <RunBadges runs={entries} tone={station.tone} demo={demo} />
+      <RunBadges runs={entries} tone={station.tone} stage={station.stage} demo={demo} />
     </button>
   );
 }
@@ -231,35 +251,54 @@ export function IssueLine({
   selected,
   onSelect,
   demo,
-  factory,
+  scope,
+  scopeToggle,
 }: {
   model: IssueLineModel;
   selected: IssueStage | null;
   onSelect: (stage: IssueStage | null) => void;
   demo: boolean;
-  // The admin's factory-wide scope: the note says the counts cover every user.
-  factory: boolean;
+  // "all" is the admin's every-user scope: the note says the counts cover every user.
+  scope: IssueWorkScope;
+  // The admin's You / All users switch (#4052); absent for a non-admin, who gets no switch.
+  scopeToggle?: { value: IssueWorkScope; onChange: (scope: IssueWorkScope) => void; allDisabled: boolean };
 }) {
   const titleId = useId();
   const { entries, captions } = model;
   // Pressing the pressed stage again lets go of it.
   const toggle = (stage: IssueStage) => () => onSelect(selected === stage ? null : stage);
-  const note = `${plural(model.onLine, "run", "runs")} on the line, ${entries.other.length} other${factory ? ", all users" : ""}`;
+  const note = `${plural(model.onLine, "run", "runs")} on the line, ${entries.other.length} other${scope === "all" ? ", all users" : ""}`;
   const prEntries: LineEntry[] = model.prs.map((run) => ({ run, own: true }));
   // Card (components/ui) has no attribute passthrough, so this repeats its classes to carry
   // data-live, which only the Shadow theme styles.
   return (
     <section aria-labelledby={titleId} data-live="" className="rounded-xl border border-edge bg-surface p-5">
-      <div className="flex flex-wrap items-center justify-between gap-2">
+      {/* Title, note, then the admin's scope switch last, at the far right. Below md the note
+          drops to its own full-width row so the switch stays on the title row. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <h2 id={titleId} className="text-xs font-semibold uppercase tracking-wider text-faint">
           Issue work
         </h2>
-        <span className="flex items-center gap-2 text-xs text-faint">
-          <span>{note}</span>
-          <Button variant="ghost" size="sm" onClick={() => onSelect(null)}>
-            Show all
-          </Button>
+        <span
+          className={`min-w-0 text-xs text-faint md:flex-1 md:text-right ${
+            scopeToggle ? "order-last basis-full md:order-none" : "ml-auto"
+          } md:ml-0`}
+        >
+          {note}
         </span>
+        {scopeToggle && (
+          <SegmentedToggle
+            label="Issue work scope"
+            options={[
+              { value: "you", label: "You" },
+              { value: "all", label: "All users", disabled: scopeToggle.allDisabled },
+            ]}
+            value={scopeToggle.value}
+            onChange={scopeToggle.onChange}
+            className="ml-auto md:ml-0"
+            steadyWidth
+          />
+        )}
       </div>
       <div role="group" aria-label="Filter runs by stage" className="relative mt-2 grid grid-cols-1 md:grid-cols-5">
         <span aria-hidden="true" className="absolute left-[26px] right-[calc(20%-26px)] top-[25px] hidden h-0.5 bg-edge-strong md:block" />

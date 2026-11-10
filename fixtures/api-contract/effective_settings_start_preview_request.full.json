@@ -1,0 +1,7 @@
+{
+  "harness": "x",
+  "credential_override": {
+    "mode": "x",
+    "secret_id": "x"
+  }
+}

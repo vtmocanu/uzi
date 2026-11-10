@@ -14,7 +14,7 @@ const run = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const other = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const policy: PolicyHoldRequest = {
   outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-  source_generation: 1, claim_generation: 1, detail: "refused",
+  source_generation: 1, claim_generation: 1, detail: "refused", cause: "refused",
   continuation_mode: "same_conversation", published: false,
   tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1",
 };

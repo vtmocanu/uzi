@@ -137,6 +137,9 @@ type Client interface {
 	// /api/runs/{id}/resume-now, RequireUser so a CLI token can reach it. A non-held run
 	// is a 409 → ExitConflict (5); a foreign/absent run is 404 → 4. No request body.
 	ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error)
+	// ResumePolicyHold resumes a Codex policy hold (issue #3607): POST /api/runs/{id}/resume-now
+	// {mode, expected_episode_id, guidance}. replay reports an already-applied identical request.
+	ResumePolicyHold(ctx context.Context, id, mode, episodeID, guidance string) (apitypes.RunDTO, bool, error)
 	// SetRunCredential is the `uzi run set-token` verb (PRD #1247 M4, D4/D12): POST
 	// /api/runs/{id}/credential {mode, secret_id?}, RequireUser so a uzc_ CLI Bearer reaches
 	// it. It re-points which Anthropic token a queued or parked run spends (promoting a
@@ -209,6 +212,16 @@ type Client interface {
 	// sidebar_token_ids: GET /api/me/settings. RequireUser (the GET was split out
 	// from the cookie-only /me/settings group so a uzc_ can read it).
 	GetMySettings(ctx context.Context) (apitypes.UserSettingsDTO, error)
+	// GetEffectiveSettings returns what model, effort and harness a run would use for the
+	// caller (PRD #3254): GET /api/me/effective-settings. RequireUser, read-only, owner-scoped;
+	// no credential id, label or value is in the body. An older server answers 404.
+	GetEffectiveSettings(ctx context.Context) (apitypes.EffectiveSettingsDTO, error)
+	// PreviewScheduleSettings returns what firing a saved schedule now, and claiming the run,
+	// would use (PRD #3254): POST /api/me/effective-settings/schedule-preview with the schedule
+	// id. RequireUser, read-only, owner-scoped; the server loads the stored override, so a stored
+	// pin is checked with fire semantics. A foreign or missing schedule, and a server that
+	// predates the route, answer 404.
+	PreviewScheduleSettings(ctx context.Context, scheduleID string) (apitypes.ScheduleSettingsPreviewDTO, error)
 	// SetUsageReserve sets the caller's weekly usage reserve (PRD #3522):
 	// PUT /api/me/usage-reserve. thresholdPct nil turns the reserve off, else it is the
 	// 7-day utilization percent (1..100) at which uzi stops spending the caller's
@@ -368,7 +381,7 @@ type Client interface {
 	// sends no meaningful selection (byte-identical to a pre-#1429 create; the server
 	// resolves the effective harness itself, D11), "claude"/"codex" (validated CLIENT-SIDE
 	// before this call) rides as an explicit pin.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error)
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error)
 	// CreateTaskRun queues a handoff/task run on a repo (PRD #400 M3). A nil
 	// continuedIssueIID omits the optional existing-issue link:
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server

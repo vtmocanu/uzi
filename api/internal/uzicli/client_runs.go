@@ -251,6 +251,27 @@ func (c *HTTPClient) ResumeRunNow(ctx context.Context, id string) (apitypes.RunD
 	return env.Run, nil
 }
 
+// ResumePolicyHold resumes a run held by a Codex policy hold (issue #3607): POST
+// /api/runs/{id}/resume-now {mode, expected_episode_id, guidance}. Unlike ResumeRunNow it carries
+// a body; guidance is always sent (an empty guidance is valid). replay is true when the server
+// reports the same request was already applied. The exit-code mapping (409 messages such as a
+// changed hold or different guidance included) comes from statusError/postJSON.
+func (c *HTTPClient) ResumePolicyHold(ctx context.Context, id, mode, episodeID, guidance string) (apitypes.RunDTO, bool, error) {
+	body := struct {
+		Mode              string `json:"mode"`
+		ExpectedEpisodeID string `json:"expected_episode_id"`
+		Guidance          string `json:"guidance"`
+	}{Mode: mode, ExpectedEpisodeID: episodeID, Guidance: guidance}
+	var env struct {
+		Run    apitypes.RunDTO `json:"run"`
+		Replay bool            `json:"replay"`
+	}
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/resume-now", body, &env); err != nil {
+		return apitypes.RunDTO{}, false, err
+	}
+	return env.Run, env.Replay, nil
+}
+
 // SetRunCredentialOverride is the wire shape of PRD #1247 M4's `uzi run set-token` body:
 // {mode, secret_id?}. Mode is one of "pinned"/"auto"/"default"/"inherit"; SecretID is set
 // ONLY for a pinned choice (the label is resolved to an anthropic_token id CLIENT-SIDE,
@@ -402,12 +423,6 @@ func (c *HTTPClient) AcceptCompletionDecision(ctx context.Context, id string, cr
 	return env.Run, nil
 }
 
-// CreateRunSeed is PRD #209's optional seeded plan for CreateRun: an
-// externally-authored plan and the run's subagent roster. Nil ⇒ an ordinary run
-// planned from the issue. It mirrors the server's workersvc.SeededPlan and keeps the
-// coupling STRUCTURAL — a Selection cannot ride without a plan, which is the server's
-// own rule ("agent_selection requires plan_md"): a nil-vs-set seed carries the choice,
-// so no CreateRun caller can express the rejected combination in the first place.
 type CreateRunSeed struct {
 	// PlanMD is the plan text, forwarded verbatim. Empty is a valid value to SEND —
 	// the server returns 422 on an empty/whitespace plan, and letting it decide keeps
@@ -469,7 +484,7 @@ func (r *CreatedRunResult) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
 	var env struct {
 		Run    apitypes.RunDTO `json:"run"`
 		Notice string          `json:"notice"`
@@ -530,6 +545,8 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 			reqBody.PlannedCommit = &seed.PlannedCommit
 		}
 		reqBody.RequireBase = seed.RequireBase
+	} else if agentSource != "" {
+		reqBody.Selection = &apitypes.AgentSelection{Source: agentSource, Exclusions: []string{}}
 	}
 	if credOverride != nil {
 		ov := &createRunCredentialOverride{Mode: credOverride.Mode}

@@ -58,7 +58,8 @@ import type { CommandSandboxMode } from "./config.js";
 import { ensureRunnerTmpdir } from "./runner-tmpdir.js";
 import { createPodEpoch, restoreEpochRuntimeTmpdir } from "./pod-epoch-lock.js";
 import { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
-import { PodEpochSettlementError, runPodEpochShadow } from "./pod-epoch-reclaim.js";
+import { PodEpochSettlementError, runPodEpochShadow, type PodEpochDeletionDeps } from "./pod-epoch-reclaim.js";
+import { armShutdownResultDeadline, finishWorkerShutdown, type ShutdownGate, type ShutdownLog } from "./shutdown-barrier.js";
 
 export function buildWorkerGitCache(
   config: Pick<Config, "dataDir" | "recoveryDecodedLimitBytes">,
@@ -89,6 +90,25 @@ export function buildAfterPublicationEnrolled(
         run_id: runId, claim_generation: claimGeneration,
       });
     });
+  };
+}
+
+/**
+ * The production dependencies of the pod-epoch deletion phase. The phase stays inert while
+ * EPOCH_RECLAIM_DELETION_ENABLED is false; this only binds what it will use. It carries no activation override.
+ * `quiesce` is the worker-wide deny-only capture-mode proof: it never tears down Docker or retains a source boundary.
+ */
+export function buildPodEpochDeletionDeps(parts: {
+  authority: Pick<AuthorityRuntime, "withTransaction" | "active" | "endSourceUse">;
+  runner: Pick<RunRunner, "withSourceReservation">;
+  git: PodEpochDeletionDeps["git"];
+  dockerHost: string | undefined;
+}): PodEpochDeletionDeps {
+  return {
+    authority: parts.authority,
+    reserve: (runId, action) => parts.runner.withSourceReservation(runId, action),
+    quiesce: () => terminalMaintenanceProof(3, parts.dockerHost),
+    git: parts.git,
   };
 }
 
@@ -189,6 +209,8 @@ export function startupReapVerdict(result: ReapOrphansResult | undefined, aborte
 let fatalLog: Logger | undefined;
 let lifecyclePhase: "config" | "startup" | "reap" | "worker" | "stopped" = "config";
 let shutdownSignal: "SIGINT" | "SIGTERM" | undefined;
+/** issue #4066: how long after the first signal (or barrier entry, when no signal came) the worker has to report its shutdown result (k8s grace is longer). */
+const SHUTDOWN_RESULT_DEADLINE_MS = 35_000;
 
 /** Dependencies {@link buildRunExecutor} needs, factored out of `main()`'s closure so
  *  the seam is callable in isolation (PRD #1429 M6 test). Production always supplies
@@ -379,9 +401,40 @@ async function mainBody(): Promise<void> {
   // protected startup access. Runtime shutdown hooks are installed once built.
   const controller = new AbortController();
   let shutdownRuntime: (() => void) | undefined;
+  // issue #4066: the shutdown budget starts at the FIRST signal, or at barrier entry when no signal came; a repeated
+  // signal resets nothing. The observer is
+  // armed with a lazily bound snapshot: the authority runtime (and the git cache) may not exist yet at an early signal.
+  let shutdownDeadlineAt: number | undefined;
+  let shutdownBarrierStarted = false;
+  let shutdownAuthority: AuthorityRuntime | undefined;
+  let shutdownGit: GitCache | undefined;
+  const shutdownLog: ShutdownLog = {
+    info: (message, fields) => {
+      if (fatalLog) fatalLog.info(message, fields);
+      else process.stderr.write(JSON.stringify({ level: "info", msg: message, ...fields }) + "\n");
+    },
+    warn: (message, fields) => {
+      if (fatalLog) fatalLog.warn(message, fields);
+      else process.stderr.write(JSON.stringify({ level: "warn", msg: message, ...fields }) + "\n");
+    },
+  };
+  // Idempotent: the first call fixes the deadline and arms the one observer; a later call (a repeated signal, or the
+  // barrier after a signal) changes nothing.
+  const armShutdownObserver = (): number => {
+    const deadlineAt = (shutdownDeadlineAt ??= Date.now() + SHUTDOWN_RESULT_DEADLINE_MS);
+    armShutdownResultDeadline({
+      deadlineAt, log: shutdownLog,
+      snapshot: () => shutdownAuthority?.snapshot({
+        unsettled_delete: shutdownGit?.unsettledDeleteCount() ?? 0,
+        pin_continuation: shutdownGit?.pendingArchivedPinContinuations() ?? 0,
+      }),
+    });
+    return deadlineAt;
+  };
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, () => {
       shutdownSignal = sig;
+      if (!shutdownBarrierStarted) armShutdownObserver();
       fatalLog?.info("shutting down", { signal: sig, phase: lifecyclePhase, cause: "signal" });
       try { shutdownRuntime?.(); } finally { controller.abort(); }
     });
@@ -560,6 +613,15 @@ async function mainBody(): Promise<void> {
   // production path that reaches a hooked GitCache effect opens its transaction through it.
   const authority = new AuthorityRuntime({ lifetime: requireWorkerLifetime(), workerToken: config.workerToken, log });
   const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId), authority);
+  shutdownAuthority = authority;
+  shutdownGit = git;
+  // issue #4066: every graceful exit below runs this barrier before its stop log (join, seal, drain, one decision).
+  const finishShutdown = async (): Promise<ShutdownGate> => {
+    // Every barrier entry is observed, including worker_returned with no signal.
+    const deadlineAt = shutdownBarrierStarted ? (shutdownDeadlineAt as number) : armShutdownObserver();
+    shutdownBarrierStarted = true;
+    return finishWorkerShutdown({ authority, git, deadlineAt, log });
+  };
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
   // (the bare clone/fetch, the fetch-back, the outbox reserve), preflights the volume at claim and
@@ -1026,6 +1088,7 @@ async function mainBody(): Promise<void> {
   // Preserve shutdown ordering: revoke memory, initiate run-lane drain, then
   // abort loops. The early signal handler also cancels startup lock waits.
   shutdownRuntime = () => {
+    if (shutdownDeadlineAt !== undefined) authority.beginShutdown(shutdownDeadlineAt);
     void worker.shutdownMemory();
     runner.shutdown();
     isolatedRunner.shutdown();
@@ -1080,9 +1143,10 @@ async function mainBody(): Promise<void> {
     process.exit(1);
   }
   if (verdict === "shutdown") {
+    const gate = await finishShutdown();
     lifecyclePhase = "stopped";
     log.info("uzi-agent stopped during the startup reap; the worker was not started", {
-      cause: "signal", signal: shutdownSignal ?? null, exit_code: 0,
+      cause: "signal", signal: shutdownSignal ?? null, exit_code: gate.exitCode, shutdown_result: gate.result,
     });
     return;
   }
@@ -1090,19 +1154,29 @@ async function mainBody(): Promise<void> {
   if (epochBootstrap && epochOwnership && epochConsumption) {
     const result = await runPodEpochShadow({
       bootstrap: epochBootstrap, ownership: epochOwnership, consumption: epochConsumption,
-      dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal,
+      dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal, log,
+      deletion: buildPodEpochDeletionDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost }),
     });
     if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });
   }
-  if (controller.signal.aborted) return;
+  if (controller.signal.aborted) {
+    const gate = await finishShutdown();
+    lifecyclePhase = "stopped";
+    log.info("uzi-agent stopped before the worker started", {
+      cause: "signal", signal: shutdownSignal ?? null, exit_code: gate.exitCode, shutdown_result: gate.result,
+    });
+    return;
+  }
 
   lifecyclePhase = "worker";
   await worker.run(controller.signal);
+  const gate = await finishShutdown();
   lifecyclePhase = "stopped";
   log.info("uzi-agent stopped", {
     cause: shutdownSignal ? "signal" : "worker_returned",
     signal: shutdownSignal ?? null,
-    exit_code: 0,
+    exit_code: gate.exitCode,
+    shutdown_result: gate.result,
   });
 }
 

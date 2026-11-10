@@ -113,6 +113,10 @@ unless the schedule applies its model to all agents. Your worker-model
 setting does not override a subagent pin. **Chat always uses your Claude
 lane**, whichever harness is your default.
 
+To see what these rules give you right now, without starting a run, read the
+read-only [effective settings](./configuration.md#effective-settings) view
+(`uzi settings get`).
+
 ## Claude model guard and recovery
 
 Saving the Claude worker lane (`default_claude_model`, or legacy
@@ -140,7 +144,7 @@ preference until you save a change; there is no new CLI command.
 
 ## Custom Codex model
 
-Codex's dropdown offers the curated `gpt-6-astra`, `gpt-5.6-sol` and
+Codex's dropdown offers the curated `gpt-6-astra`, `gpt-5.6-sol`,
 `gpt-6-sol` and `gpt-6.1-sol`, plus **Other (custom model ID)**, the same escape hatch
 Claude has always had. uzi validates the string for length and unsafe
 characters but makes no provider call at save time; an unavailable or

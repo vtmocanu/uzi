@@ -111,16 +111,12 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// PRD #209: assemble the optional seeded plan. agent_selection is only meaningful
-	// alongside a plan (it is the roster for the seeded implement run); a selection
-	// with no plan is a confused request — the run would plan and gate normally, where
-	// the selection is made anyway — so reject it here rather than persist a pointless
-	// pre-gate selection. The plan itself is capped/scrubbed/empty-checked in CreateRun.
 	var plannedCommit string
 	if req.PlannedCommit != nil {
 		plannedCommit = *req.PlannedCommit
 	}
 	var seed *workersvc.SeededPlan
+	var requested *workersvc.AgentSelection
 	if req.PlanMd != nil {
 		seed = &workersvc.SeededPlan{
 			PlanMD:    *req.PlanMd,
@@ -130,15 +126,13 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			PlannedCommit: plannedCommit,
 			RequireBase:   req.RequireBase,
 		}
-	} else if req.AgentSelection != nil {
-		httpx.Error(w, http.StatusBadRequest, "agent_selection requires plan_md")
-		return
 	} else if req.PlannedCommit != nil || req.RequireBase {
 		// PRD #209 M4: a planned_commit / require_base with no plan_md is a confused
 		// request — the staleness guard describes a seeded run, and there is none here.
-		// Rejected consistently with "agent_selection requires plan_md" above.
 		httpx.Error(w, http.StatusBadRequest, "planned_commit and require_base require plan_md")
 		return
+	} else {
+		requested = req.AgentSelection
 	}
 	// require_base is meaningful only with a planned_commit to compare against — without
 	// one the flag can never fire. Reject it rather than silently persist a guard that is
@@ -180,7 +174,7 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
 	// cap all live inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat
 	// start-run card.
-	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed, explicit, rawOverride)
+	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed, requested, explicit, rawOverride)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return
@@ -369,6 +363,8 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 		httpx.Error(w, http.StatusBadRequest, "planned_commit must be a hex commit sha of 7-64 characters")
 	case errors.Is(err, workersvc.ErrInvalidSelection):
 		httpx.Error(w, http.StatusBadRequest, "invalid agent selection: "+err.Error())
+	case errors.Is(err, workersvc.ErrCreateExclusionsNeedPlan):
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, workersvc.ErrNotPRDIssue):
 		// PRD #764, widened by PRD #767: the single run-eligibility gate. An issue is
 		// uzi's to run if it carries the uzi_label OR is assigned to the uzi-bot account
