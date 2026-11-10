@@ -596,8 +596,12 @@ export class FakeApi {
 
   enqueueClaim(claim: ClaimResponse): void {
     this.receiptGeneration.set(claim.run_id, claim.claim_generation ?? 0);
+    const prev = this.claimByRun.get(claim.run_id);
     this.registerClaim(claim);
-    this.rowStatusByRun.set(claim.run_id, "claimed");
+    // A new claim generation re-offers the run as `claimed`; a repeat of the same generation keeps
+    // a row status a test set explicitly (registerClaim defaults an unknown run to `claimed`).
+    if (prev !== undefined && (claim.claim_generation ?? 0) > (prev.claim_generation ?? 0))
+      this.rowStatusByRun.set(claim.run_id, "claimed");
     this.claimQueue.push(claim);
   }
 
@@ -616,9 +620,25 @@ export class FakeApi {
    *  accept-everything behaviour. */
   registerClaim(claim: ClaimResponse): void {
     this.claimByRun.set(claim.run_id, claim);
-    if (typeof claim.plan_md === "string" && claim.plan_md !== "") this.storedPlanByRun.set(claim.run_id, claim.plan_md);
+    // The row's auto_approve is monotone true -> false (SetRunAwaitingApproval clears it): the
+    // first claim seeds it, a later claim may only turn it off.
+    this.autoApproveByRun.set(claim.run_id, claim.auto_approve === true && this.autoApproveByRun.get(claim.run_id) !== false);
+    if (typeof claim.plan_md === "string" && claim.plan_md !== "") {
+      this.storedPlanByRun.set(claim.run_id, claim.plan_md);
+      // A claim resuming a published gate (positive resume_gate_revision) carries the stored plan
+      // as the presented payload when the fake holds no real gate for the run (gateRevisions off).
+      const revision = claim.resume_gate_revision;
+      if (typeof revision === "number" && revision > 0) this.presentedSeedByRun.set(claim.run_id, { plan: claim.plan_md, revision });
+    }
     if (!this.rowStatusByRun.has(claim.run_id)) this.rowStatusByRun.set(claim.run_id, "claimed");
   }
+
+  /** The run row's auto_approve as the cross-check rule reads it. */
+  private readonly autoApproveByRun = new Map<string, boolean>();
+  /** Presented payload seeded from a gate-resume claim, used until a real gate is recorded. */
+  private readonly presentedSeedByRun = new Map<string, { plan: string; revision: number }>();
+  /** Every `running` report the modelled cross-check rule refused, in order (status = the row's status). */
+  readonly crossCheckRunningRefusals: { runId: string; status: string }[] = [];
 
   /** Overwrite the plan the run row stores without republishing the gate: the api state where
    *  plan_md no longer equals the presented gate payload. */
@@ -630,16 +650,18 @@ export class FakeApi {
   private crossCheckModel(runId: string): CrossCheckModel | undefined {
     const claim = this.claimByRun.get(runId);
     if (!claim) return undefined;
-    const auto = claim.auto_approve === true;
+    const auto = this.autoApproveByRun.get(runId) === true;
     const lane: CrossCheckLane | undefined = claim.plan_cross_check_gated === true && !auto ? "gated"
       : claim.plan_cross_check_required === true ? (auto ? "required_auto" : "required") : undefined;
     if (lane === undefined) return undefined;
     const gate = this.gateByRun.get(runId);
+    const seed = this.presentedSeedByRun.get(runId);
+    const real = gate !== undefined && gate.revision > 0;
     return {
       lane,
       plan: this.storedPlanByRun.get(runId),
-      presentedPlan: gate && gate.revision > 0 ? gate.snapshot.plan_md : undefined,
-      gateRevision: gate?.revision ?? 0,
+      presentedPlan: real ? gate.snapshot.plan_md : seed?.plan,
+      gateRevision: real ? gate.revision : seed?.revision ?? 0,
     };
   }
 
@@ -2206,6 +2228,7 @@ export class FakeApi {
     // run that holds a stored plan unless a bound approval for the current gate revision applied.
     if (body.status === "running") {
       const refusedAt = this.crossCheckRunningRefusal(runId);
+      if (refusedAt !== undefined) this.crossCheckRunningRefusals.push({ runId, status: refusedAt });
       if (refusedAt !== undefined) return send(res, 409, { error: "running report refused", run: { id: runId, status: refusedAt } });
     }
     const receipt = this.revisionReceipts.get(runId);
@@ -2275,6 +2298,8 @@ export class FakeApi {
     this.rowStatusByRun.set(runId, body.status);
     if (body.status === "awaiting_approval" && typeof body.plan_md === "string" && body.plan_md !== "")
       this.storedPlanByRun.set(runId, body.plan_md);
+    // SetRunAwaitingApproval clears auto_approve on every accepted park (PRD #71 M5 safety fix).
+    if (body.status === "awaiting_approval") this.autoApproveByRun.set(runId, false);
     if (body.status === "running") {
       const owned = this.ownershipByRun.get(runId);
       if (owned?.httpStatus === 200 && owned.status !== undefined && owned.status !== "running")
@@ -2425,7 +2450,12 @@ export interface CrossCheckApproval {
  *  applied, non-superseded approve_plan bound to the CURRENT gate revision, in every status. An
  *  ordinary run needs, only in awaiting_approval, any applied non-superseded approve; an
  *  auto-approved required run is never admitted out of awaiting_approval. The pre-plan running
- *  report of a human-gated run is admitted (outside awaiting_approval). */
+ *  report of a human-gated run is admitted (outside awaiting_approval).
+ *
+ *  Approximation: the fake compares only the plan_md of the presented payload. The SQL also compares
+ *  milestones, required_tools and size_class (and its pre-plan milestones clause for an auto-approved
+ *  required run); none of those is modelled here. `required_auto` is the row while auto_approve is
+ *  still true; the fake moves a run out of it when it accepts an awaiting_approval report. */
 export function crossCheckRunningAdmitted(model: CrossCheckModel, approvals: CrossCheckApproval[], status: string): boolean {
   const live = approvals.filter((a) => a.applied && !a.superseded);
   if (model.lane === "ordinary") return status !== "awaiting_approval" || live.length > 0;

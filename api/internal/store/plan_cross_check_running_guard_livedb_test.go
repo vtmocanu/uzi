@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -57,12 +58,37 @@ func runningGuardApproveInput(ctx context.Context, t *testing.T, f *awaitingInpu
 	return input.ID
 }
 
+// runningGuardAutopilotPlan stores `plan` on an auto-approved required run the way the api does:
+// SetRunAutopilotPlan, bound to an opposite-harness approve cross-check of the current generation.
+func runningGuardAutopilotPlan(ctx context.Context, t *testing.T, f *awaitingInputFixture, plan string) {
+	t.Helper()
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'claimed' WHERE id = $1`, f.runID)
+	childID := uuid.New()
+	mustExec(ctx, t, f.pool, `INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, report_only, budget_wall_seconds,
+		issue_title, issue_description, status) VALUES ($1,$2,$3,'cross_check',$4,'codex',true,1800,'check','check','running')`,
+		childID, f.userID, f.repoID, f.runID)
+	mustExec(ctx, t, f.pool, `INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, plan_md,
+		milestones, required_capabilities, required_tools, size_class, base_commit, candidate_digest,
+		checker_run_id, checker_harness, verdict, deadline_at)
+		VALUES ($1,'plan',1,1,$2,'[]','{}','{}','s',$3,$4,$5,'codex','approve',now()+interval '30 minutes')`,
+		f.runID, plan, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", []byte("digest"), childID)
+	rows, err := f.q.SetRunAutopilotPlan(ctx, store.SetRunAutopilotPlanParams{ID: f.runID, WorkerID: pgU(f.workerID),
+		PlanMd: pgT(plan), CandidateDigest: []byte("digest"), InferredCapabilities: []string{}, InferredTools: []string{},
+		SizeClass: pgT("s"), MilestonesFrozen: []byte(`[]`)})
+	if err != nil || rows != 1 {
+		t.Fatalf("SetRunAutopilotPlan: rows=%d err=%v", rows, err)
+	}
+}
+
 func TestCrossCheckRunningGuardLiveDB(t *testing.T) {
 	cases := loadRunningGuardCases(t)
+	// Rows set after the park. required_auto and required_auto_parked are set up BEFORE any park
+	// (auto_approve = true from the start), because SetRunAwaitingApproval clears auto_approve.
 	lanes := map[string]string{
 		"gated":                 "",
 		"required_forced_human": "plan_cross_check_gated = false, plan_cross_check_required = true",
-		"required_auto":         "plan_cross_check_gated = false, plan_cross_check_required = true, auto_approve = true",
+		"required_auto":         "",
+		"required_auto_parked":  "",
 		"ordinary":              "plan_cross_check_gated = false",
 	}
 	approvals := map[string]bool{"applied_bound_current": true, "unapplied": true, "stale_revision": true,
@@ -88,9 +114,32 @@ func TestCrossCheckRunningGuardLiveDB(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
 			f := setupGatedRun(ctx, t)
-			// A plan is stored and presented in every case.
-			gatedPark(ctx, t, f, "plan A", 1, nil)
-			rev1 := publishPlanCrossCheckGate(ctx, t, f, "plan A")
+			autoStart := c.Lane == "required_auto" || c.Lane == "required_auto_parked"
+			if autoStart {
+				mustExec(ctx, t, f.pool, `UPDATE runs SET plan_cross_check_gated = false, plan_cross_check_required = true,
+					auto_approve = true, plan_source = 'agent' WHERE id = $1`, f.runID)
+			}
+			var rev1 int64
+			if c.Lane == "required_auto" {
+				// An auto-approved required run stores its plan through SetRunAutopilotPlan (no park, no gate).
+				if c.Approval != "none" || c.PayloadMismatch || c.Status == "awaiting_approval" {
+					t.Fatalf("case %q: required_auto has no gate and is never awaiting_approval", c.Name)
+				}
+				runningGuardAutopilotPlan(ctx, t, f, "plan A")
+			} else {
+				// A plan is stored and presented in every other case, through the real park.
+				gatedPark(ctx, t, f, "plan A", 1, nil)
+				rev1 = publishPlanCrossCheckGate(ctx, t, f, "plan A")
+			}
+			if autoStart && c.Lane == "required_auto_parked" {
+				var auto bool
+				if err := f.pool.QueryRow(ctx, `SELECT auto_approve FROM runs WHERE id = $1`, f.runID).Scan(&auto); err != nil {
+					t.Fatal(err)
+				}
+				if auto {
+					t.Fatal("SetRunAwaitingApproval left auto_approve = true")
+				}
+			}
 			switch c.Approval {
 			case "applied_bound_current":
 				gatedApprove(ctx, t, f, rev1)

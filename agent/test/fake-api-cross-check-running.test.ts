@@ -30,7 +30,7 @@ const fixture = JSON.parse(
   fs.readFileSync(new URL("../../fixtures/cross-check-running-guard/cases.json", import.meta.url), "utf8"),
 ) as { cases: Case[] };
 
-const LANES = ["gated", "required_forced_human", "required_auto", "ordinary"];
+const LANES = ["gated", "required_forced_human", "required_auto", "required_auto_parked", "ordinary"];
 const APPROVALS = ["applied_bound_current", "unapplied", "stale_revision", "unbound", "superseded", "none"];
 const STATUSES = ["claimed", "awaiting_approval", "running"];
 
@@ -49,7 +49,9 @@ describe("fixture shape", () => {
 
 // The pure rule, model built directly from the case.
 describe("crossCheckRunningAdmitted", () => {
-  const lane = (l: string): CrossCheckLane => (l === "required_forced_human" ? "required" : (l as CrossCheckLane));
+  // A parked auto run has auto_approve cleared, so it is the human-gated `required` row.
+  const lane = (l: string): CrossCheckLane =>
+    l === "required_forced_human" || l === "required_auto_parked" ? "required" : (l as CrossCheckLane);
   it("matches every fixture case", () => {
     let ran = 0;
     for (const c of fixture.cases) {
@@ -112,18 +114,26 @@ describe("FakeApi /state running rule", () => {
         unmodelled.push(c.name);
         continue;
       }
+      const autoStart = c.lane === "required_auto" || c.lane === "required_auto_parked";
       const claim = makeClaim({
         claim_generation: GENERATION,
-        auto_approve: c.lane === "required_auto",
+        auto_approve: autoStart,
         plan_cross_check_gated: c.lane === "gated",
-        plan_cross_check_required: c.lane === "required_forced_human" || c.lane === "required_auto",
+        plan_cross_check_required: c.lane === "required_forced_human" || autoStart,
+        // An auto-approved required run stores its plan without a park (SetRunAutopilotPlan).
+        ...(c.lane === "required_auto" ? { plan_md: "plan A" } : {}),
       });
       const runId = claim.run_id;
       api.enqueueClaim(claim);
       api.setInputClaimGeneration(runId, GENERATION);
 
-      assert.equal((await gate(runId, "plan A")).status, 200, `${c.name}: gate A`);
-      const rev1 = api.gateOf(runId).revision;
+      let rev1 = 0;
+      if (c.lane === "required_auto") {
+        assert.equal(c.approval, "none", `${c.name}: required_auto has no gate to approve`);
+      } else {
+        assert.equal((await gate(runId, "plan A")).status, 200, `${c.name}: gate A`);
+        rev1 = api.gateOf(runId).revision;
+      }
       const approve = (revision: number | undefined, binding: "bound" | "unbound" | undefined): number => {
         const id = nextInput++;
         api.appendInputs(runId, [{
@@ -165,12 +175,15 @@ describe("FakeApi /state running rule", () => {
       api.setOwnershipStatus(runId, c.status, GENERATION);
 
       const before = api.states.length;
+      const refusalsBefore = api.crossCheckRunningRefusals.length;
       const res = await post(`${runId}/state`, { status: "running", claim_generation: GENERATION });
       if (c.expect_applied) {
         assert.equal(res.status, 200, c.name);
         assert.equal(res.json.run.status, "running", c.name);
         assert.equal(api.states.length, before + 1, `${c.name}: recorded`);
+        assert.equal(api.crossCheckRunningRefusals.length, refusalsBefore, `${c.name}: no refusal recorded`);
       } else {
+        assert.equal(api.crossCheckRunningRefusals.length, refusalsBefore + 1, `${c.name}: refusal recorded`);
         assert.equal(res.status, 409, c.name);
         assert.equal(res.json.run.status, c.status, `${c.name}: acks the current status`);
         assert.equal(api.states.length, before, `${c.name}: a refusal records nothing`);
@@ -188,11 +201,40 @@ describe("FakeApi /state running rule", () => {
     assert.equal(res.status, 200);
   });
 
+  it("enqueueClaim keeps a row status the test set for the same generation", async () => {
+    const claim = makeClaim({ claim_generation: GENERATION, auto_approve: false, plan_cross_check_gated: true });
+    api.enqueueClaim(claim);
+    await gate(claim.run_id, "plan A");
+    api.setOwnershipStatus(claim.run_id, "running", GENERATION);
+    api.enqueueClaim(claim);
+    const res = await post(`${claim.run_id}/state`, { status: "running", claim_generation: GENERATION });
+    assert.equal(res.status, 409);
+    assert.equal(res.json.run.status, "running");
+  });
+
+  it("a gate-resume claim seeds the presented plan so an approved human-gated run is admitted", async () => {
+    const claim = makeClaim({ claim_generation: GENERATION, auto_approve: false, plan_cross_check_gated: true,
+      plan_md: "plan A", resume_gate_revision: 3 });
+    api.enqueueClaim(claim);
+    api.setInputClaimGeneration(claim.run_id, GENERATION);
+    const id = nextInput++;
+    api.appendInputs(claim.run_id, [{ id, kind: "approve_plan", body: "{}", gate_binding: "bound", gate_revision: 3 }]);
+    assert.equal((await receipt(claim.run_id, "ack", id)).status, 200);
+    assert.equal((await receipt(claim.run_id, "applied", id)).status, 200);
+    const res = await post(`${claim.run_id}/state`, { status: "running", claim_generation: GENERATION });
+    assert.equal(res.status, 200);
+  });
+
   it("requeueRun re-offers the run as claimed and a refused running report leaves it claimed", async () => {
     const claim = makeClaim({ claim_generation: GENERATION, auto_approve: false, plan_cross_check_gated: true });
     api.enqueueClaim(claim);
     await gate(claim.run_id, "plan A");
     const next = api.requeueRun(claim, GENERATION + 1);
+    // The ownership probe reports `claimed` at the next generation (not the stale `running`).
+    const own = await fetch(`${base}/api/worker/runs/${next.run_id}/ownership`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    const ownBody = await own.json() as { status?: string; claim_generation?: number };
+    assert.equal(ownBody.status, "claimed");
+    assert.equal(ownBody.claim_generation, GENERATION + 1);
     const res = await post(`${next.run_id}/state`, { status: "running", claim_generation: GENERATION + 1 });
     assert.equal(res.status, 409);
     assert.equal(res.json.run.status, "claimed");
