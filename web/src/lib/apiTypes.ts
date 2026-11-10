@@ -523,8 +523,8 @@ export interface UserSettings {
    *  Defaults page writes it. */
   default_harness: Harness | null;
   /** Per-user "Judge runs on" (PRD #3257); null = same as the run being reviewed. One of
-   *  claude|codex when set. */
-  judge_runs_on?: Harness | null;
+   *  claude|codex when set. Always present on the wire, like default_harness. */
+  judge_runs_on: Harness | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present

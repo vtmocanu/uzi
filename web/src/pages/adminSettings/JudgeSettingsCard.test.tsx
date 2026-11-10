@@ -81,3 +81,16 @@ describe("JudgeSettingsCard model validation (#3255)", () => {
     expect(document.body.textContent ?? "").not.toMatch(/strongest/i);
   });
 });
+
+// PRD #3257 M1: the instance help says the judge follows each user's "Judge runs on" choice,
+// defaulting to the run's harness, and no longer that it always follows the run.
+describe("JudgeSettingsCard judge harness copy (#3257)", () => {
+  it("says the judge runs on each user's Judge runs on choice, by default the run's harness", () => {
+    renderCard();
+    const help = screen.getByText(/so each harness has its own judge model/).textContent ?? "";
+    expect(help).toContain(
+      "The judge runs on each user’s “Judge runs on” choice, by default the harness of the run it reviews",
+    );
+    expect(help).not.toContain("The judge runs on the harness of the run it reviews");
+  });
+});

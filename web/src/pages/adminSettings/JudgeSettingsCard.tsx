@@ -119,8 +119,8 @@ export function JudgeSettingsCard({
         <SectionTitle>Run judge</SectionTitle>
         <p className="mt-2 text-sm text-muted">
           When on, every finished run of an opted-in user is reviewed by an LLM on{" "}
-          <strong className="text-fg">that user&rsquo;s own credential for the run&rsquo;s provider</strong>{" "}
-          (Anthropic or Codex), producing a verdict
+          <strong className="text-fg">that user&rsquo;s own credential</strong> (Anthropic or Codex) for the harness
+          their &ldquo;Judge runs on&rdquo; choice picks, by default the run&rsquo;s own, producing a verdict
           and recommendations on the Judge page and the run&rsquo;s page, plus a Slack DM when that user has
           linked Slack. This switch arms the feature instance-wide; each user still opts in under their own
           Settings. Off by default.
@@ -142,8 +142,8 @@ export function JudgeSettingsCard({
         </label>
 
         {/* PRD #3245: one judge model per harness, side by side (Claude | Codex). A
-            judge runs on the harness of the run it reviews, so each lane is its own
-            instance default. */}
+            judge runs on each user's "Judge runs on" choice, by default the harness of the
+            run it reviews (PRD #3257), so each lane is its own instance default. */}
         <div className="space-y-2">
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-1.5">
@@ -200,7 +200,8 @@ export function JudgeSettingsCard({
             </div>
           </div>
           <p className="text-xs text-faint">
-            The judge runs on the harness of the run it reviews, so each harness has its own judge model.
+            The judge runs on each user&rsquo;s &ldquo;Judge runs on&rdquo; choice, by default the harness of the
+            run it reviews, so each harness has its own judge model.
             Default follows uzi&rsquo;s built-in model, including future changes to it. Pin a cheaper model, such
             as <code className="rounded bg-raised px-1 py-0.5 text-fg">sonnet</code> for Claude, to spend less.
             A user&rsquo;s own choice under Settings &rarr; Run defaults wins over these.
@@ -226,9 +227,9 @@ export function JudgeSettingsCard({
           </label>
           <p className="text-xs text-faint">
             With this on, EVERY user&rsquo;s finished runs are judged — bypassing their per-user opt-in — and
-            each is spent on <strong className="text-fg">that user&rsquo;s own credential for the run&rsquo;s
-            harness (Anthropic or Codex) without their opt-in</strong>. A user with no usable credential for
-            that harness is skipped. On a subscription plan it also eats their rate-limit quota. Before
+            each is spent on <strong className="text-fg">that user&rsquo;s own Claude or Codex credential,
+            following their &ldquo;Judge runs on&rdquo; choice, without their opt-in</strong>. A user with no
+            usable credential for that harness is skipped, never charged to the other provider. On a subscription plan it also eats their rate-limit quota. Before
             enforcing, consider choosing a cheaper model in the Claude and Codex judge model pickers above;
             Default follows the built-in model. The per-user judge toggle on the Users page becomes inert
             while this is on.

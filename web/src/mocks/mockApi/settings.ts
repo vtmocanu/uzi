@@ -783,6 +783,21 @@ function recordedEffectiveScenario(): RecordedEffectiveScenario {
   return found;
 }
 
+// PRD #3257: the recordings are all taken with "Judge runs on" unset, so the stored choice is
+// applied at response time, exactly as effective_settings.go derives it: an explicit choice is a
+// user_default judge_harness, and the other lane's judge_model cell gains the not_used note.
+// With the setting unset the recording is served unchanged.
+function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undefined): EffectiveSettings {
+  if (!runsOn) return view;
+  view.judge_harness = { value: runsOn, source: "user_default", fixed_at: "create", notes: [] };
+  view.models = view.models.map(c =>
+    c.setting === "judge_model" && c.harness !== runsOn && !c.notes.includes("not_used")
+      ? { ...c, notes: [...c.notes, "not_used"] }
+      : c,
+  );
+  return view;
+}
+
 // Absent and null request members mean the same choice, so key on the normalized triple.
 function previewRequestKey(r: StartPreviewRequest): string {
   const o = r.credential_override;
@@ -1450,7 +1465,7 @@ export const settingsApi = {
   // overflowCodexDefault one (the recorded refused-alternative case); anything else the default.
   getEffectiveSettings: async (): Promise<EffectiveSettings> => {
     requireSession();
-    return delay(structuredClone(recordedEffectiveScenario().get), 60);
+    return delay(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
     requireSession();
