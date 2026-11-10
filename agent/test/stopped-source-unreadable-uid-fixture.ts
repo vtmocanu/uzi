@@ -247,8 +247,10 @@ export async function looseRefUnreadable(): Promise<void> {
 /**
  * Control: a tracked file with unchanged content and a newer mtime is stat-dirty, which makes Git
  * refresh the index. The process HOME is whatever the image entrypoint gives the worker (nothing is
- * asserted about it); the control shows `core.attributesFile=/dev/null` in the status pins keeps
- * that run free of stderr problems, so a clean covered source is not retained over noise.
+ * asserted about it); the control shows a clean covered source under that HOME is not retained over
+ * stderr noise. It does not depend on the `core.attributesFile=/dev/null` status pin (the image HOME
+ * leaves the attributes file readable or absent); retained-source-ops.test.ts's unreadable-HOME
+ * control is the one that binds that pin.
  */
 export async function statDirtyControl(): Promise<void> {
   await withCovered({}, async ({ rec, clone, verify }) => {
