@@ -208,25 +208,44 @@ end
 filter_step = jobs.fetch('changes').fetch('steps').find { |step| step['id'] == 'filter' }
 rules = YAML.safe_load(filter_step.fetch('with').fetch('filters'))
 assert.call(rules.fetch('all'), ['**'], 'all changed paths counted')
-assert.call(rules.fetch('component_safe'), [{'added|modified' => '.agents/skills/uzi-lander/**'}], 'only audited additions/modifications allowed')
+assert.call(rules.fetch('component_safe'), [{'added|modified' => '.agents/skills/uzi-lander/**'}, {'added|modified' => 'changelog.d/**'}], 'only audited additions/modifications allowed')
 assert.call(safe_env.fetch('SAFE_ROOTS').split, rules.fetch('component_safe').map { |rule| rule.values.first.delete_suffix('/**') }, 'veto roots are exactly the component_safe roots')
 flags = File::FNM_PATHNAME | File::FNM_DOTMATCH
-allowed = rules.fetch('component_safe').first
-statuses, pattern = allowed.first
-fixtures = [
-  [['modified', '.agents/skills/uzi-lander/SKILL.md']],
-  [['added', '.agents/skills/uzi-lander/references/new.md']],
-  [['modified', '.agents/skills/uzi-lander/SKILL.md'], ['added', 'fixtures/new.json']],
-  [['deleted', '.agents/skills/uzi-lander/SKILL.md']],
-  [['deleted', 'api/old.go'], ['added', '.agents/skills/uzi-lander/new.go']],
-  [['deleted', '.agents/skills/uzi-lander/old.md'], ['added', 'api/new.go']],
-  [['modified', '.agents/skills/uzi-watcher/scripts/backup-runs.sh']]
-]
-fixtures.each_with_index do |files, index|
-  # Ruby's terminal ** needs /* to match nested files as picomatch's ** does.
-  safe = files.count { |status, path| statuses.split('|').include?(status) && File.fnmatch(pattern.sub(/\/\*\*$/, '/**/*'), path, flags) }
-  assert.call(classify.call(files.length.to_s, safe.to_s, files.length.to_s), index < 2 ? 'skip_components=1' : 'skip_components=0', "path/status fixture #{index}")
+# A file counts as safe when any component_safe rule matches it (dorny counts it once).
+safe_file = lambda do |status, path|
+  rules.fetch('component_safe').any? do |rule|
+    statuses, pattern = rule.first
+    # Ruby's terminal ** needs /* to match nested files as picomatch's ** does.
+    statuses.split('|').include?(status) && File.fnmatch(pattern.sub(/\/\*\*$/, '/**/*'), path, flags)
+  end
 end
+fixtures = [
+  [true, [['modified', '.agents/skills/uzi-lander/SKILL.md']]],
+  [true, [['added', '.agents/skills/uzi-lander/references/new.md']]],
+  [true, [['added', 'changelog.d/0b8e1c2a-1d3f-4c5e-9a7b-6f2d4e8c1a3b.md']]],
+  [true, [['modified', '.agents/skills/uzi-lander/references/advisory.md'], ['added', 'changelog.d/0b8e1c2a-1d3f-4c5e-9a7b-6f2d4e8c1a3b.md']]],
+  [false, [['modified', '.agents/skills/uzi-lander/SKILL.md'], ['added', 'fixtures/new.json']]],
+  [false, [['deleted', '.agents/skills/uzi-lander/SKILL.md']]],
+  [false, [['deleted', 'api/old.go'], ['added', '.agents/skills/uzi-lander/new.go']]],
+  [false, [['deleted', '.agents/skills/uzi-lander/old.md'], ['added', 'api/new.go']]],
+  [false, [['modified', '.agents/skills/uzi-watcher/scripts/backup-runs.sh']]],
+  [false, [['deleted', 'changelog.d/0b8e1c2a-1d3f-4c5e-9a7b-6f2d4e8c1a3b.md']]],
+  [false, [['added', 'changelog.d/0b8e1c2a-1d3f-4c5e-9a7b-6f2d4e8c1a3b.md'], ['modified', 'web/src/App.tsx']]],
+  [false, [['modified', 'CHANGELOG.md']]]
+]
+fixtures.each_with_index do |(skips, files), index|
+  safe = files.count { |status, path| safe_file.call(status, path) }
+  assert.call(classify.call(files.length.to_s, safe.to_s, files.length.to_s), skips ? 'skip_components=1' : 'skip_components=0', "path/status fixture #{index}")
+end
+# changelog.d is safe only while no component reads it. Direct readers: the agent Codex pin
+# scan must keep excluding it, and no component or e2e tree may name it. Dynamic readers
+# a literal sweep cannot see: api/cmd/rollupbench/corpus.go (loadTextPool) reads tracked
+# text files in sorted order up to a 24 MiB cap, which fills from agent/ and api/ before
+# changelog.d, and its test asserts no corpus digest. Re-audit this entry if that reader
+# gains a fixed digest or a cap large enough to reach changelog.d.
+assert.call(File.read(File.join(root, 'agent/test/codex-pins.ts')).include?('":(exclude)changelog.d/**"'), true, 'agent pin scan excludes changelog.d')
+component_refs, _, refs_status = Open3.capture3('git', '-C', root, 'grep', '-l', '-F', 'changelog.d', '--', 'api', 'web', 'controller', 'agent', 'docs', 'deploy/chart', 'e2e', ':!agent/test/codex-pins.ts')
+assert.call([refs_status.exitstatus, component_refs], [1, ''], 'no direct component reference to changelog.d')
 # One LiveDB execution backs both required contexts: the producer carries the canonical
 # recipe (the sweep with its livedb-skip-guard, then the combined proofs); test-api-store-it
 # only aggregates the producer's result.
