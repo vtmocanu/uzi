@@ -758,7 +758,9 @@ describe("verifyStoppedSourceCovered", () => {
       fs.chmodSync(dir, 0o000);
       try {
         assert.equal(await verify(a, head), "not_covered");
-        assert.equal(stderrWarns(rec, STATUS_MSG).length, 1, "the stderr problem is logged");
+        const warns = stderrWarns(rec, STATUS_MSG);
+        assert.equal(warns.length, 1, "the stderr problem is logged");
+        assert.match(warns[0]!.stderr ?? "", /Permission denied/);
       } finally {
         fs.chmodSync(dir, 0o700);
       }
@@ -771,7 +773,9 @@ describe("verifyStoppedSourceCovered", () => {
       fs.chmodSync(dir, 0o000);
       try {
         assert.equal(await verify(a, head), "not_covered");
-        assert.equal(stderrWarns(rec, STATUS_MSG).length, 1, "the stderr problem is logged");
+        const warns = stderrWarns(rec, STATUS_MSG);
+        assert.equal(warns.length, 1, "the stderr problem is logged");
+        assert.match(warns[0]!.stderr ?? "", /Permission denied/);
       } finally {
         fs.chmodSync(dir, 0o700);
       }
@@ -788,7 +792,9 @@ describe("verifyStoppedSourceCovered", () => {
       fs.chmodSync(ref, 0o000);
       try {
         assert.equal(await verify(a, head), "not_covered");
-        assert.equal(stderrWarns(rec, REFS_MSG).length, 1, "the stderr problem is logged");
+        const warns = stderrWarns(rec, REFS_MSG);
+        assert.equal(warns.length, 1, "the stderr problem is logged");
+        assert.match(warns[0]!.stderr ?? "", /broken ref/);
       } finally {
         fs.chmodSync(ref, 0o600);
       }
@@ -836,7 +842,35 @@ describe("verifyStoppedSourceCovered", () => {
       const { a, head, rec } = await capturedWith({});
       fs.appendFileSync(path.join(a.path, ".git", "config"), "[core]\n\tfsyncObjectFiles = true\n");
       assert.equal(await verify(a, head), "not_covered");
-      assert.equal(stderrWarns(rec, STATUS_MSG).length, 1, "the benign warning is logged as a stderr problem");
+      const warns = stderrWarns(rec, STATUS_MSG);
+      assert.equal(warns.length, 1, "the benign warning is logged as a stderr problem");
+      assert.match(warns[0]!.stderr ?? "", /fsyncObjectFiles/);
+    });
+
+    // The status pins carry core.attributesFile=/dev/null because gitEnv passes the process HOME
+    // through: without it Git reads $HOME/.config/git/attributes and an unreadable one warns on
+    // stderr even for a clean, covered tree.
+    it("stays covered when the HOME attributes file is unreadable and a tracked file is stat-dirty", { skip: UNREADABLE_SKIP }, async () => {
+      const { a, head, rec } = await capturedWith({});
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-home-4141-"));
+      const attrs = path.join(home, ".config", "git", "attributes");
+      fs.mkdirSync(path.dirname(attrs), { recursive: true });
+      fs.writeFileSync(attrs, "* text\n");
+      fs.chmodSync(attrs, 0o000);
+      const oldHome = process.env.HOME;
+      process.env.HOME = home;
+      try {
+        fs.writeFileSync(path.join(a.path, "work.txt"), "captured\n");
+        const when = new Date(Date.now() + 5000);
+        fs.utimesSync(path.join(a.path, "work.txt"), when, when);
+        assert.equal(await verify(a, head), "covered");
+        assert.equal(stderrWarns(rec, STATUS_MSG).length, 0);
+      } finally {
+        if (oldHome === undefined) delete process.env.HOME;
+        else process.env.HOME = oldHome;
+        fs.chmodSync(attrs, 0o600);
+        fs.rmSync(home, { recursive: true, force: true });
+      }
     });
   });
 
