@@ -58,5 +58,13 @@
   "subscription_run_count": 1,
   "unreported_run_count": 1,
   "pr_count": 1,
-  "last7_pr_count": 1
+  "last7_pr_count": 1,
+  "harness_runs": {
+    "claude": 1,
+    "codex": 1
+  },
+  "last7_harness_runs": {
+    "claude": 1,
+    "codex": 1
+  }
 }

@@ -121,7 +121,15 @@
       "subscription_run_count": 1,
       "unreported_run_count": 1,
       "pr_count": 1,
-      "last7_pr_count": 1
+      "last7_pr_count": 1,
+      "harness_runs": {
+        "claude": 1,
+        "codex": 1
+      },
+      "last7_harness_runs": {
+        "claude": 1,
+        "codex": 1
+      }
     }
   ],
   "earliest_run": "2020-01-02T03:04:05Z"

@@ -1058,6 +1058,24 @@ func TestAdminUserUsageDTOTags(t *testing.T) {
 		"subscription_run_count", "unreported_run_count",
 		// Issue #3686: this user's owned PRs, lifetime and last 7 days.
 		"pr_count", "last7_pr_count")
+	// Issue #3876: the harness splits are optional pointers, so the zero value above drops
+	// them; a populated call proves their tags.
+	got := tagSet(t, AdminUserUsageDTO{HarnessRuns: &HarnessRunsDTO{}, Last7HarnessRuns: &HarnessRunsDTO{}})
+	for _, k := range []string{"harness_runs", "last7_harness_runs"} {
+		if !contains(got, k) {
+			t.Fatalf("AdminUserUsageDTO with harness splits set must include %s, got %v", k, got)
+		}
+	}
+	for _, k := range tagSet(t, AdminUserUsageDTO{}) {
+		if k == "harness_runs" || k == "last7_harness_runs" {
+			t.Fatalf("AdminUserUsageDTO without harness splits must omit %s", k)
+		}
+	}
+}
+
+// TestHarnessRunsDTOTags pins the per-window harness split (issue #3876).
+func TestHarnessRunsDTOTags(t *testing.T) {
+	assertTags(t, "HarnessRunsDTO", HarnessRunsDTO{}, "claude", "codex")
 }
 
 func TestAdminUsageDTOTags(t *testing.T) {

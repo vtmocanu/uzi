@@ -4664,6 +4664,17 @@ export interface AdminUsageUser {
   /** Issue #3686: this user's lifetime and seven-day PR counts. Absent on older APIs. */
   pr_count?: number;
   last7_pr_count?: number;
+  /** Issue #3876: this user's lifetime and seven-day runs split by harness. The same runs as
+   *  run_count / last7_run_count, so each split sums to its window's count; a cross-check run
+   *  counts under the harness it ran on. Absent on older APIs. */
+  harness_runs?: HarnessRuns;
+  last7_harness_runs?: HarnessRuns;
+}
+
+// HarnessRuns counts runs per harness (issue #3876).
+export interface HarnessRuns {
+  claude: number;
+  codex: number;
 }
 
 // AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the

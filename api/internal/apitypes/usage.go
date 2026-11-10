@@ -173,6 +173,19 @@ type AdminUserUsageDTO struct {
 	// usage row.
 	PRCount      int64 `json:"pr_count"`
 	Last7PRCount int64 `json:"last7_pr_count"`
+	// HarnessRuns and Last7HarnessRuns split RunCount and Last7RunCount by harness (issue
+	// #3876): the same population, so Claude + Codex equals the matching run count. Additive
+	// and optional: an older server omits them, and every row a current server sends carries
+	// both (zero-run rows carry {0,0}).
+	HarnessRuns      *HarnessRunsDTO `json:"harness_runs,omitempty"`
+	Last7HarnessRuns *HarnessRunsDTO `json:"last7_harness_runs,omitempty"`
+}
+
+// HarnessRunsDTO is one window's usage-bearing run count split by harness (issue #3876). It
+// counts the same runs as the row's run count, so Claude + Codex equals that count.
+type HarnessRunsDTO struct {
+	Claude int64 `json:"claude"`
+	Codex  int64 `json:"codex"`
 }
 
 // AdminUsageDTO is the admin factory view: the factory-wide totals plus the

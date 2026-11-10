@@ -266,8 +266,13 @@ A few worth knowing:
   `$0.00` for metered zero and discloses runs without a cost estimate and
   unreported runs. Incomplete totals include recorded partial costs.
   Recoverable work may already have been landed.
+  The table's `CLAUDE/CODEX` column shows the selected window's runs by
+  harness (the same runs as `RUNS`, so the two numbers sum to it; cross-check
+  runs count under the harness they ran on). The column is omitted against an
+  older API without the split.
   `--json` returns the complete API response with both windows and additive
-  per-user seven-day fields; the flag selects only the human report. Invalid
+  per-user seven-day fields, plus `harness_runs` / `last7_harness_runs` per
+  user; the flag selects only the human report. Invalid
   window values are rejected before a request, including with `--json`.
   With an older API missing a user's `last_7_days`, the CLI returns an
   upgrade error before printing a seven-day human report; lifetime and JSON

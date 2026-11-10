@@ -396,7 +396,7 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     expect(section(view).getByText("last 7 days, by cost")).toBeTruthy();
   });
 
-  it("has exactly the same seven headers with and without PR counts, in both windows", () => {
+  it("has exactly the same seven headers with and without PR counts, in both windows, when the API sends no harness split", () => {
     const { self, admin } = fixture();
     withPRs(admin);
     const view = factoryView({ self, admin });
@@ -410,6 +410,66 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     fireEvent.click(second.getByRole("button", { name: "Last 7 days" }));
     expect(headers(second)).toEqual(HEADERS);
     expect(second.queryByRole("columnheader", { name: /Tokens|Out|Cost share/ })).toBeNull();
+  });
+
+  // Issue #3876: the Claude / Codex column.
+  const withHarness = (admin: AdminUsage) => {
+    admin.users.forEach((u) => { u.harness_runs = { claude: 20, codex: 3 }; u.last7_harness_runs = { claude: 2, codex: 1 }; });
+  };
+  const HARNESS = 7;
+
+  it("adds Claude / Codex as the eighth and last header when the API sends the split, in both windows", () => {
+    const { self, admin } = fixture();
+    withHarness(admin);
+    const view = factoryView({ self, admin });
+    expect(headers(view)).toEqual([...HEADERS, "Claude / Codex"]);
+    expect(section(view).getByRole("columnheader", { name: "Claude / Codex" }).getAttribute("title")).toBe(
+      "Share of each user's runs by harness, the same runs as the Runs column; cross-check runs count under the harness they ran on",
+    );
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    expect(headers(view)).toEqual([...HEADERS, "Claude / Codex"]);
+    // The Factory row keeps the table rectangular with an empty cell.
+    const total = cells(rowOf(view, "Factory"));
+    expect(total).toHaveLength(8);
+    expect(total[HARNESS]).toBe("");
+  });
+
+  it("shows a 7-day user's 7 Claude / 3 Codex runs as 70 / 30, with the counts in the title", () => {
+    const { self, admin } = fixture();
+    withHarness(admin);
+    admin.users[0].last7_harness_runs = { claude: 7, codex: 3 };
+    const view = factoryView({ self, admin });
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    const cell = rowOf(view, /^owner\./).children[HARNESS] as HTMLElement;
+    expect(cell.textContent).toBe("70 / 30");
+    expect(cell.getAttribute("title")).toBe("7 Claude, 3 Codex runs");
+    expect(cell.querySelector("[aria-hidden='true']")).toBeTruthy();
+    expect(cells(rowOf(view, /^other\./))[HARNESS]).toBe("67 / 33");
+  });
+
+  it("omits the column against a response without the split, keeping the other headers", () => {
+    const { self, admin } = fixture();
+    const view = factoryView({ self, admin });
+    expect(section(view).queryByRole("columnheader", { name: "Claude / Codex" })).toBeNull();
+    for (const h of HEADERS) expect(section(view).getByRole("columnheader", { name: h })).toBeTruthy();
+    expect(cells(rowOf(view, "Factory"))).toHaveLength(7);
+    cleanup();
+    const full = fixture();
+    withHarness(full.admin);
+    const second = factoryView({ self: full.self, admin: full.admin });
+    expect(section(second).getByRole("columnheader", { name: "Claude / Codex" })).toBeTruthy();
+  });
+
+  it("reads a dash for a user with no runs in the window", () => {
+    const { self, admin } = fixture();
+    withHarness(admin);
+    admin.users[1].last7_harness_runs = { claude: 0, codex: 0 };
+    const view = factoryView({ self, admin });
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    const cell = rowOf(view, /^other\./).children[HARNESS] as HTMLElement;
+    expect(cell.textContent).toBe("—");
+    expect(cell.getAttribute("title")).toBeNull();
+    expect(cells(rowOf(view, /^owner\./))[HARNESS]).toBe("67 / 33");
   });
 
   it("titles the headers and scopes them to their columns", () => {

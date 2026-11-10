@@ -1,4 +1,4 @@
-import type { AdminUsage, RunUsage } from "./api";
+import type { AdminUsage, HarnessRuns, RunUsage } from "./api";
 import { aggregateDisclosure } from "./costStatus";
 import type { UsageWindow } from "../components/UsageCards";
 
@@ -13,6 +13,16 @@ export function breakdown(u: RunUsage): { fresh: number; cached: number; out: nu
   const cached = u.cache_read_tokens;
   const out = u.output_tokens;
   return { fresh, cached, out, total: fresh + cached + out, cost: u.cost_usd };
+}
+
+// Issue #3876: a user's Claude / Codex run shares as whole percentages summing to 100 (Codex
+// takes the rounding remainder); null when the split is absent or the window has no runs.
+export function harnessShare(h: HarnessRuns | undefined): { claude: number; codex: number } | null {
+  if (!h) return null;
+  const total = h.claude + h.codex;
+  if (total === 0) return null;
+  const claude = Math.round((100 * h.claude) / total);
+  return { claude, codex: 100 - claude };
 }
 
 export function perUserRows(admin: AdminUsage, window: UsageWindow) {
@@ -38,12 +48,16 @@ export function perUserRows(admin: AdminUsage, window: UsageWindow) {
     subscription: recent ? u.last7_subscription_run_count! : u.subscription_run_count,
     unreported: recent ? u.last7_unreported_run_count! : u.unreported_run_count,
     selectedPRs: recent ? u.last7_pr_count : u.pr_count,
+    selectedHarness: recent ? u.last7_harness_runs : u.harness_runs,
   })).sort((a, b) => b.b.cost - a.b.cost || b.b.total - a.b.total || b.b.out - a.b.out ||
     (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0));
   // Issue #3686: the PRs column and total exist only when every row reports the selected window's count.
   const showPRs = rows.every((r) => r.selectedPRs != null);
   // null (never a partial sum) unless every row reports the count.
   const factoryPRs: number | null = showPRs ? rows.reduce((sum, r) => sum + r.selectedPRs!, 0) : null;
+  // Issue #3876: the Claude / Codex column exists only when every row reports the selected
+  // window's split, the same rule as the PRs.
+  const showHarness = rows.every((r) => r.selectedHarness != null);
   const factoryRuns = recent ? rows.reduce((sum, u) => sum + u.selectedRuns, 0) : admin.factory.run_count;
-  return { available, rows, showPRs, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure };
+  return { available, rows, showPRs, showHarness, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure };
 }
