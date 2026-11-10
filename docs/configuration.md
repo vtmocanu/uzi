@@ -332,6 +332,7 @@ The body holds, for a manual start of an issue run with no model and no Anthropi
 | `models` | Eight cells: worker model, judge model, run-summary model and task-review model, each for Claude then Codex. |
 | `efforts` | Four cells: worker effort and task-review effort, each for Claude then Codex. |
 | `cross_check` | Eight cells: plan then code, Claude then Codex, as `models` and `efforts`. |
+| `judge_harness` | One cell, always present: the harness a [judge](./judge.md#judge-runs-on) run would use (`value`, `source`, `fixed_at`, `notes`). An explicit **Judge runs on** choice is `value` `claude` or `codex` with `source` `user_default`; unset is `value` null with `source` `same_as_run`, because the judge follows the harness of the run it reviews, known only once that run exists. `fixed_at` is `create` in both cases. |
 
 Each model and effort cell carries the stored choice, what **Default** would mean, the resolved value, its `source`, `fixed_at` and `notes`. An empty `resolved_model` means the runtime decides (note `sdk_default`); a null `resolved_effort` means nothing is sent. A Codex effort cell also carries the [catalog default](./worker-effort.md#what-the-codex-catalog-default-means).
 
@@ -341,7 +342,8 @@ Each model and effort cell carries the stored choice, what **Default** would mea
 |---|---|---|
 | Harness | The harness you pick for this start; else your default harness (skipped, with note `user_default_harness_unusable`, when it has no usable credential); else automatic. | `run_override`, `user_default`, `automatic`, `chosen_at_create` |
 | Worker model | Your model lane for the harness; else the `lead` template's pin; else the built-in (Codex `gpt-6.1-sol`; Claude has none, so the SDK or account decides). | `user_default`, `template`, `builtin` |
-| Judge and run-summary model | Your lane; else the instance default; else the built-in. If the instance settings cannot be read, the built-in applies and the cell carries note `instance_settings_unavailable`. | `user_default`, `instance_default`, `builtin` |
+| Judge and run-summary model | Your lane; else the instance default; else the built-in. If the instance settings cannot be read, the built-in applies and the cell carries note `instance_settings_unavailable`. The `judge_model` cell of the lane the judge will not run on (your explicit **Judge runs on** choice names the other harness) also carries note `not_used`. | `user_default`, `instance_default`, `builtin` |
+| Judge harness | Your **Judge runs on** choice (`claude` or `codex`); else the harness of the run being reviewed. | `user_default`, `same_as_run` |
 | Task-review model | A built-in you cannot configure. Codex carries note `not_configurable`; the Claude review sends no model, so the SDK decides. | `builtin` |
 | Worker effort | Your effort preference for the harness, then the product default. | see [Reasoning effort](./worker-effort.md) |
 | Task-review effort | Neither review pass sends an effort (note `not_sent`). | `builtin` |

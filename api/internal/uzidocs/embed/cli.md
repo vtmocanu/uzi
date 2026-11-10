@@ -3401,6 +3401,14 @@ reports the error. `uzi settings get` shows `Default harness: automatic
 after Codex account mode, then the same overflow line; its decoded settings
 JSON includes `harness_overflow_enabled`.
 
+`uzi settings get` ends with a `Judge runs on:` line for the per-user
+[Judge runs on](./judge.md#judge-runs-on) setting: `Judge runs on: Same as the
+run (default)` when unset, otherwise `Judge runs on: Claude (your setting)` or
+`Judge runs on: Codex (your setting)`. `--json` carries the stored
+`judge_runs_on` (`claude`, `codex` or `null`) and, in `effective`, the
+`judge_harness` cell. The setting is changed in **Settings → Run defaults →
+Run judge**; there is no CLI write verb for it.
+
 Overflow applies at creation to new implicit issue runs started manually,
 by autopilot or by a schedule, with both harnesses usable, and only when your
 default harness is an explicit Claude or Codex: with the default automatic it

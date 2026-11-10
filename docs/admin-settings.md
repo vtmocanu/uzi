@@ -112,8 +112,9 @@ blank personal value instead inherits the instance value). The judge model keys
 store values trimmed, and a whitespace-only value stores empty and is reported
 as source `default`. This switch
 only arms the feature instance-wide; each user still opts in under their own
-Settings, and the judge always spends that user's own credential for the run's harness, never
-the admin's. A **Not a Claude model** warning appears under the Claude field
+Settings, and the judge always spends that user's own credential for the harness it runs on
+(each user's [Judge runs on](./judge.md#judge-runs-on) choice, default the reviewed run's
+harness), never the admin's and never charged to the other provider. A **Not a Claude model** warning appears under the Claude field
 when its stored value is a Codex id, which Claude judges skip. Changing a
 field to an invalid model ID (interior spaces, control or format characters,
 or too long) is blocked before save, with a message beneath the picker; an
@@ -162,11 +163,12 @@ above is off), combines with the kill-switch into three effective modes:
 |---|---|---|
 | `judge_enabled=false` | **Off** | Nobody — the kill-switch always wins, even with `judge_enforce_all=true`. |
 | `judge_enabled=true`, `judge_enforce_all=false` | **Optional** | Only users who've opted in themselves. |
-| `judge_enabled=true`, `judge_enforce_all=true` | **Enforced** | Every user who holds a usable credential for the run's harness (an Anthropic token for a Claude run, a usable Codex credential for a Codex run), whether or not they've opted in; a user without it is skipped for that run, since there's nothing to spend. |
+| `judge_enabled=true`, `judge_enforce_all=true` | **Enforced** | Every user who holds a usable credential for the harness their judge runs on (their [Judge runs on](./judge.md#judge-runs-on) choice, default the reviewed run's harness: an Anthropic token for Claude, a usable Codex credential for Codex), whether or not they've opted in; a user without it has the judge skipped for that run, since there's nothing to spend. Enforcement never overrides the choice. |
 
 Enforcing the judge never redirects *who pays*: spend always stays on each
-run owner's own credential for the run's harness — an admin can force that judging happens,
-never send the bill to a different account. It also overrides a per-user
+run owner's own credential for the harness the judge runs on (the owner's
+[Judge runs on](./judge.md#judge-runs-on) choice, default the run's harness) — an admin can
+force that judging happens, never send the bill to a different account or to the other provider. It also overrides a per-user
 force-disable set on **Admin → Users**: the per-user toggle there is shown
 greyed and labelled "Inert: enforced mode judges every run regardless of
 this flag" while enforcement is on, since one boolean can't tell "an admin

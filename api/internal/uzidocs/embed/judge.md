@@ -10,15 +10,16 @@ With the run judge on, every one of your **finished** runs gets a
 retrospective: an LLM reads the run's trace (agents, tools, plan, review
 cycles, delivery) and produces a verdict plus structured recommendations —
 never code changes, only advice. It's opt-in and off by default; your
-instance admin also has to enable it globally first. The judge always runs
-on the same harness as the reviewed run: a Claude run is judged on **your
-own Anthropic token** — your default one, a token you name for the judge
-lane specifically, or auto-selected from your token pool — and a Codex run
-is judged on **your usable Codex credential at the time the judge is
-queued**, freshly resolved and frozen onto the judge run — not necessarily
-the same credential the reviewed run itself used. If you have no usable
-Codex credential when the judge would be queued, the judge is skipped for
-that run, with no fallback to another harness.
+instance admin also has to enable it globally first. By default the judge
+runs on the same harness as the reviewed run, and you can pick Claude or
+Codex for it instead (see [Judge runs on](#judge-runs-on)). A judge that runs
+on Claude uses **your own Anthropic token** — your default one, a token you
+name for the judge lane specifically, or auto-selected from your token pool —
+and a judge that runs on Codex uses **your usable Codex credential at the
+time the judge is queued**, freshly resolved and frozen onto the judge run —
+not necessarily the same credential the reviewed run itself used. If you have
+no usable credential for the judge's harness when the judge would be queued,
+the judge is skipped for that run, with no fallback to the other harness.
 
 ## 1. Enable it
 
@@ -47,9 +48,11 @@ judge for everyone — into three effective modes:
   once an admin turns the judge on, until they also turn on enforcement.
 - **Enforced** — both are on. Every one of your finished runs is judged
   **whether or not you've opted in yourself**, as long as you hold a
-  usable credential for that run's harness (an Anthropic token for a Claude
-  run, a usable Codex credential for a Codex run) — a user without it is
-  skipped silently for that run, since there's nothing to spend. Spend still
+  usable credential for the judge's harness (an Anthropic token for a judge
+  on Claude, a usable Codex credential for a judge on Codex) — a user without
+  it has the judge skipped for that run, since there's nothing to spend. The
+  judge's harness follows your [Judge runs on](#judge-runs-on) choice, which
+  enforcement does not override. Spend still
   stays on your own credential: an admin can
   force that judging *happens*, never redirect *who pays* for it. Enforcement
   also overrides a per-user force-disable an admin may have set for you on
@@ -57,15 +60,43 @@ judge for everyone — into three effective modes:
   opted out," so enforcement wins whenever it's on.
 
 **Enforced mode has no separate user opt-out switch.** Judging still depends
-on a usable credential for the reviewed run's own harness. Removing Anthropic
-credentials does not prevent a Codex run from being judged when a usable
-Codex credential remains. Your lever under enforced mode is the *model* it
-runs on, not the on/off toggle; see the next section.
+on a usable credential for the judge's own harness. With **Judge runs on** set
+to Codex, removing your Codex credentials means the judge is skipped for every
+run, and it is never moved to Claude instead; with it set to Claude or to the
+run's harness, the harness is the one named there. Your levers under enforced
+mode are the *model* it runs on and the harness it runs on, not the on/off
+toggle; see the sections below.
+
+## Judge runs on
+
+**Settings → Run defaults → Run judge → Judge runs on** chooses the harness
+the judge runs on, for both the automatic judge and the **Run judge** button:
+
+- **Same as the run** (the default): the judge runs on the harness of the run
+  it reviews.
+- **Claude**: every judge runs on Claude, whatever harness the reviewed run
+  used.
+- **Codex**: every judge runs on Codex, whatever harness the reviewed run
+  used.
+
+The choice is frozen onto the judge run when it is created. An explicit choice
+is never silently replaced: if you pick Claude or Codex and have no usable
+credential for it, the judge is skipped for that run rather than running on
+the other provider or on the run's own harness. The **Run judge** button
+refuses with a message naming the harness ("the judge's harness (<harness>)
+has no usable credential"). The judge always spends your own credential for
+the harness it runs on, never a shared one.
+
+The model, reasoning effort and token controls below apply to the harness the
+judge runs on. The card dims the other harness's model field with a "Not used:
+the judge runs on X" note, and the token picker is dimmed when the judge runs
+on Codex. The [effective settings](./configuration.md#effective-settings)
+view reports the choice as `judge_harness`.
 
 ## Which token the judge spends
 
-**This picker covers Claude judge runs only.** A Codex run's judge spends
-**your usable Codex credential at the time the judge is queued** —
+**This picker covers judges that run on Claude only.** A judge that runs on
+Codex spends **your usable Codex credential at the time the judge is queued** —
 re-resolved fresh (subscription default first) and frozen onto the judge
 run, which is not guaranteed to be the credential the reviewed run itself
 used — with no separate judge-lane pick; the picker below never applies to
@@ -108,8 +139,8 @@ up waiting on a judge that can't run.
 
 The judge has **two model settings, one per harness**: the Claude lane
 (`judge_model`) and the Codex lane (`codex_judge_model`), each settable per
-user and per instance. A judge run reads only the lane of **its own run's
-harness**, resolving in this order:
+user and per instance. A judge run reads only the lane of **the harness the
+judge itself runs on** ([Judge runs on](#judge-runs-on)), resolving in this order:
 
 1. your own value for that lane,
 2. the instance value for that lane,
@@ -165,8 +196,8 @@ the instance's) is copied into the Codex lane; the Claude key is left unchanged
 and is then skipped, with a note, by Claude judges. Any other Codex id (such
 as `gpt-6-luna`) is not copied.
 
-The judge uses your [reasoning effort](./worker-effort.md) preference for its
-run's harness: Claude or Codex. An unset preference inherits `medium`.
+The judge uses your [reasoning effort](./worker-effort.md) preference for the
+harness it runs on: Claude or Codex. An unset preference inherits `medium`.
 The judge model settings above are unaffected; this setting changes how hard
 the judge model reasons.
 
