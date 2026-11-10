@@ -404,8 +404,9 @@ describe("the restored attempt completes through the certified completion path (
     assert.notEqual(fenced.kind === "entry" ? fenced.remainder.completionSourceFence : undefined, undefined, "S's journal carries its completion source fence");
     // The flight degrades to an unpublished source (it may still report completion); the slot never reached its published state.
     const slot = await slotOf(r, clone);
-    assert.notEqual(slot?.state, "claude_ready", "the slot never reached its published state");
-    assert.equal(slot?.publication ?? null, null, "no publication was committed");
+    assert.ok(slot, "S's authority slot still exists after the crashed completion");
+    assert.notEqual(slot.state, "claude_ready", "the slot never reached its published state");
+    assert.equal(slot.publication, null, "no publication was committed");
     const sLedger = cfgAll(r, r.ledgerKey).map(l => JSON.parse(l) as { clonePath: string; state: string }).find(l => l.clonePath === clone);
     assert.equal(sLedger?.state, "live", "S is not retired");
     assert.equal(fs.existsSync(clone), true, "S's clone is still there");
