@@ -3,7 +3,9 @@ import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable } from "node:stream";
 import { makeScratchRoot } from "./fixture-repo.js";
-import { it } from "node:test";
+import { it, type TestContext } from "node:test";
+import { performance } from "node:perf_hooks";
+import { startHeldRouteEmulator, EMULATED_PUBLICATION_ID, type HeldRouteEmulator } from "./held-route-emulator.js";
 import type { ProcessQuiescence, QuiesceRunRequest, QuiesceRunOutcome } from "../src/run-quiescence.js";
 import { RunRunner } from "../src/runner.js";
 import { prepareFrozenHeld, type HeldGit } from "../src/frozen-held.js";
@@ -20,6 +22,12 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { buildRecoveryLiveTiming } from "../src/main.js";
+import { Worker } from "../src/worker.js";
+import type { Config } from "../src/config.js";
+import type { ChatRunner } from "../src/chat-runner.js";
+import type { JudgeRunner } from "../src/judge-runner.js";
+import type { ReviewRunner } from "../src/review-runner.js";
+import { mkSweepOutbox } from "./worker-sweep-rig.js";
 
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
@@ -700,8 +708,9 @@ it("M3 changed immutable request and disappeared record reset local retry identi
 });
 
 // V2 records retain original generation and preparation policy across worker drift.
-async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "issue", receiptModel = false) {
-  const f = await fixture(true, os.tmpdir(), receiptModel, receiptModel ? "00000000-0000-4000-8000-000000000001" : "run-1");
+async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "issue", receiptModel = false,
+  runnerOptions: ConstructorParameters<typeof RunRunner>[6] = {}) {
+  const f = await fixture(true, os.tmpdir(), receiptModel, receiptModel ? "00000000-0000-4000-8000-000000000001" : "run-1", runnerOptions);
   const order: string[] = [];
   const holdId = "00000000-0000-4000-8000-000000000007";
   const repoId = "00000000-0000-4000-8000-000000000008";
@@ -7817,4 +7826,353 @@ it("M2 C2 atomic journal persistence error propagates and releases J and B", asy
     await write();
     assert.ok((await saved()).finalRequest);
   } finally { await f.close(); }
+});
+
+// ── Issue #4140: the held POST is not bound by the held-preparation clock ─────────────────────
+// A completed ci_fix record is re-driven through the REAL WorkerClient.publishHeld over a real socket
+// to an emulated route (held-route-emulator.ts). The preparation clock is scaled by a forward-only
+// performance.now offset (MaintenanceBudget's default clock), advanced inside the fixture's last
+// preparation step so the current budget has R_4140 left; the emulated API then takes
+// D_4140 = 4 R to answer. No production seam is used.
+const R_4140 = 1000, D_4140 = 4000;
+
+/** Forward-only offset on MaintenanceBudget's default clock; undone by the test context at test end. */
+function scaledClock4140(t: TestContext) {
+  const real = performance.now.bind(performance);
+  let offset = 0;
+  t.mock.method(performance, "now", () => real() + offset);
+  return { advance(ms: number) { assert.ok(ms >= 0, "the scaled clock only moves forward"); offset += ms; } };
+}
+
+async function held4140(t: TestContext, opts: { status?: string; thin?: boolean } = {}) {
+  const kind: PositiveOwedCandidateContext["kind"] = "ci_fix";
+  const emu = await startHeldRouteEmulator();
+  const f = await v2FrozenFixture(kind, true);
+  t.after(async () => { await emu.close(); await f.close(); });
+  f.state.status = opts.status ?? "completed";
+  f.state.thin = opts.thin ?? true;
+  // The incident is the CURRENT generation: the exact hold's current_claim_generation equals the frozen
+  // record's generation (v2FrozenFixture defaults ownGeneration to a superseded 8 against the record's 7).
+  f.state.ownGeneration = 7;
+  const real = emu.client;
+  Object.assign(f.client, { publishHeld: (...args: Parameters<typeof real.publishHeld>) => real.publishHeld(...args) });
+  let leaveMs: number | undefined;
+  let clock: ReturnType<typeof scaledClock4140> | undefined;
+  const pack = Reflect.get(f.git, "checkpointPack") as (...args: unknown[]) => Promise<unknown>;
+  Object.assign(f.git, { checkpointPack: async (...args: unknown[]) => {
+    if (leaveMs !== undefined && clock) {
+      const budget = MaintenanceBudget.current();
+      assert.ok(budget, "held preparation runs under a MaintenanceBudget");
+      const left = budget.remainingMs();
+      if (left > leaveMs) clock.advance(left - leaveMs);
+    }
+    return pack(...args);
+  } });
+  return {
+    f, emu,
+    /** From now on, the last preparation step leaves the current budget `ms` of its clock. */
+    scaleClock(ms: number) { clock ??= scaledClock4140(t); leaveMs = ms; },
+    record: async () => (await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === f.record.captureId),
+  };
+}
+type Held4140 = Awaited<ReturnType<typeof held4140>>;
+
+const forgeUnavailable = { kind: "status", status: 503, reason: "forge_unavailable" } as const;
+const heldKind = (final: unknown[] | undefined) => (final?.[3] as RecoveryFinalDisposition | undefined)?.kind;
+
+function closedEarly4140(emu: HeldRouteEmulator): string {
+  return emu.closedBeforeAnswer().map(r => `request ${r.seq} (${r.empty ? "probe" : "create"}) closed ${r.closedBeforeAnswer!.elapsedMs} ms after its full body, unanswered`).join("; ");
+}
+
+it("#4140 R1 an interrupted preparation then a slow healthy API completes one create, read-back, held FINAL and ack", async t => {
+  const h = await held4140(t);
+  const { f, emu } = h;
+  const runId = f.context.runId;
+
+  // Pass 1: the runner source boundary refuses (an execution tail is present). Nothing is sent.
+  const boundary = f.make("runner");
+  f.runnerState().executionTails.set(runId, new Promise<void>(() => undefined));
+  await boundary.operateFrozenInventory({ record: f.record, barePath: f.context.barePath, defaultBranch: "main" });
+  assert.ok(f.logs.some(l => l.source_boundary_reason === "execution_tail_present"), "the boundary reported execution_tail_present");
+  assert.equal(emu.requests.length, 0, "a refused boundary sends nothing");
+  // The archive-first thin capture of a completed run is independent of the source boundary; its FINAL is not.
+  assert.equal(f.state.produced, 1); assert.equal(f.state.uploads, 1); assert.equal(f.finals.length, 0);
+  assert.equal((await h.record())?.heldCreateUncertain, undefined);
+  f.runnerState().executionTails.delete(runId);
+
+  // Pass 2: the API's preparation is interrupted before any invocation (503 forge_unavailable, no marker).
+  emu.mode = forgeUnavailable;
+  const second = await f.operate();
+  assert.equal(second.held, "kept");
+  const afterSecond = (await h.record())!;
+  assert.equal(afterSecond.heldCreateUncertain, true, "an unanswered-by-created V2 create stays uncertain");
+  assert.equal(afterSecond.finalRequest, undefined, "no held FINAL");
+  assert.equal(f.finals.length, 0, "no thin archive FINAL is minted for an uncertain create");
+  assert.deepEqual(emu.requests.map(r => [r.empty, r.answered?.status]), [[false, 503]]);
+  assert.equal(emu.markers.size, 0);
+  const producedAfterSecond = f.state.produced, uploadsAfterSecond = f.state.uploads;
+  assert.equal(producedAfterSecond, 1); assert.equal(uploadsAfterSecond, 1);
+
+  // Pass 3: the remote is healthy but the API takes D = 4R to prepare; preparation has R of its clock left.
+  emu.mode = { kind: "created" };
+  emu.prepareDelayMs = D_4140;
+  h.scaleClock(R_4140);
+  const thirdResult = await settled4140(() => f.operate());
+  await emu.idle();
+
+  // The regression: the POST must not be cancelled by the preparation clock while the API is still working.
+  assert.deepEqual(emu.closedBeforeAnswer(), [],
+    `closedBeforeAnswer: the held create request was closed early (preparation budget leaked onto the POST): ${closedEarly4140(emu)}${"error" in thirdResult ? `; the pass then threw: ${String(thirdResult.error)}` : ""}`);
+  assert.ok("ok" in thirdResult, "the pass completes instead of throwing");
+  assert.equal(thirdResult.ok.held, "acked");
+  assert.deepEqual(emu.requests.map(r => [r.empty, r.answered?.status]), [[false, 503], [true, 422], [false, 200]],
+    "one 503 create, one empty probe (pack_invalid), exactly one full create");
+  assert.equal(emu.createsReachingMarker(), 1);
+  assert.equal(emu.markers.size, 1);
+  const creates = emu.requests.filter(r => !r.empty);
+  assert.equal(creates[0]!.packSha256, creates[1]!.packSha256, "the same frozen pack bytes are sent again");
+  for (const r of emu.requests) {
+    assert.equal(r.tip, f.record.sourceSha); assert.equal(r.generation, 7); assert.equal(r.coverage, f.record.coverageDigest);
+  }
+  assert.equal(f.state.produced, producedAfterSecond, "no extra archive capture");
+  assert.equal(f.state.uploads, uploadsAfterSecond, "no extra archive upload");
+  assert.equal(f.finals.length, 1);
+  assert.equal(heldKind(f.finals[0]), "held_publication");
+  assert.deepEqual(f.committedReceipts.get(7), {
+    kind: "held_publication", publication_id: EMULATED_PUBLICATION_ID,
+    source_sha: f.record.sourceSha, coverage_digest: f.record.coverageDigest,
+  });
+  assert.equal(f.state.open, false, "the exact hold was acknowledged");
+  const saved = await h.record();
+  assert.ok(saved === undefined || (saved.finalAcknowledged === true && saved.heldCreateUncertain !== true));
+});
+
+it("#4140 m3 a completed journal for a held-guarded generation is re-sent while the hold is open, then retires once the held FINAL is acknowledged", async t => {
+  // Real: Worker.sweepPendingTerminals, Outbox, RunRunner.protectRecoveryTerminalDeps / recoveryInventoryPending,
+  // RecoveryCoordinator and the frozen held publication (operateFrozenInventory -> publishHeld -> held_publication
+  // FINAL). Faked: the server (fixture client). The completed body has no persisted completion receipt.
+  const { outbox, root } = await mkSweepOutbox();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const f = await v2FrozenFixture("ci_fix", true, { outbox });
+  t.after(() => f.close());
+  f.state.status = "completed";
+  f.state.thin = true;
+  f.state.ownGeneration = 7;
+  const runId = f.context.runId;
+  const reportsSent: string[] = [];
+  const authorityReads: number[] = [];
+  const retiredNotices: number[] = [];
+  Object.assign(f.client, {
+    // The server answers the replayed report as already completed (the 409-terminal shape).
+    reportState: async (run: string) => { reportsSent.push(run); return { applied: false, status: "completed" }; },
+    // A pending-state authority requires every exact hold discarded; this hold is open, then released by the
+    // held publication FINAL (which acknowledges the record, so authority is not consulted afterwards).
+    hasRecoveryRetirementAuthority: async (_run: string, generation: number) => { authorityReads.push(generation); return false; },
+    capturePublicationCompletionRetirement: () => ({}),
+    releaseRetiredPublicationCompletion: (_run: string, generation: number) => { retiredNotices.push(generation); },
+  });
+  const boundary = f.make("runner");
+  const runner = f.runnerState() as unknown as RunRunner;
+  assert.equal(outbox.hasPendingTerminal(runId, 7), false);
+  assert.equal((await outbox.journalTerminal(runId, 7, "finalize", 0, { status: "completed", claim_generation: 7 })).journaled, true);
+  assert.equal(await boundary.hasPersistedCompletionReceipt(runId, 7), false, "the completed body has no persisted completion receipt");
+  const journalFile = path.join(root, "outbox", runId, "terminal-7.json");
+  const journalBytes = () => fs.readFile(journalFile);
+  const original = await journalBytes();
+
+  const worker = new Worker({ maxConcurrentRuns: 1, pollIntervalMs: 0, httpTimeoutMs: 1000,
+    gapFillMax: 100, outboxTerminalMaxBytes: 64 * 1024 } as Config,
+    f.client as unknown as WorkerClient, runner, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner, nullLogger(),
+    () => ({ ok: true, missing: [] }), outbox, new Map(), undefined) as unknown as {
+      sweepPendingTerminals(signal?: AbortSignal): Promise<void>;
+    };
+
+  // The exact guarded hold is open: every heartbeat sweep re-sends, and the journal stays pending and unchanged.
+  for (let sweep = 1; sweep <= 3; sweep++) {
+    await worker.sweepPendingTerminals();
+    assert.equal(reportsSent.length, sweep, "each sweep re-sends the completed report once");
+    assert.equal(outbox.hasPendingTerminal(runId, 7), true);
+    assert.deepEqual(await journalBytes(), original, "journal bytes are unchanged");
+    assert.equal(await runner.recoveryInventoryPending(runId, 7), true, "the open guarded hold forbids retirement");
+    assert.equal(f.state.open, true);
+    assert.equal(f.finals.length, 0);
+    assert.equal(f.state.pinDeletes, 0);
+  }
+  assert.ok(authorityReads.length > 0, "the real custody-authority check was consulted and refused");
+  assert.deepEqual(retiredNotices, [], "nothing was retired, so no retirement was announced");
+
+  // The held publication settles the hold: held_publication FINAL, exact-hold ack.
+  const settled = await f.operate();
+  assert.equal(settled.held, "acked");
+  assert.equal(f.finals.length, 1);
+  assert.equal(heldKind(f.finals[0]), "held_publication");
+  assert.equal(f.state.open, false, "the exact hold was released");
+  assert.equal((await f.coordinator.inspect(runId))[0]!.finalAcknowledged, true);
+  assert.equal(await runner.recoveryInventoryPending(runId, 7), false, "the acknowledged generation no longer pends");
+  assert.equal(outbox.hasPendingTerminal(runId, 7), true, "FINAL alone does not retire the journal");
+
+  // The next sweep re-sends one last time and retires the journal; the redundant report loop then ends.
+  const beforeRetire = reportsSent.length;
+  await worker.sweepPendingTerminals();
+  assert.equal(reportsSent.length, beforeRetire + 1, "the retiring sweep sends the report one last time");
+  assert.equal(outbox.hasPendingTerminal(runId, 7), false);
+  assert.deepEqual(outbox.listPendingTerminals(), []);
+  assert.deepEqual(retiredNotices, [7], "the authorized retirement is announced exactly once");
+  for (let sweep = 0; sweep < 3; sweep++) await worker.sweepPendingTerminals();
+  assert.equal(reportsSent.length, beforeRetire + 1, "no further reports after retirement");
+  assert.equal(f.finals.length, 1, "no second FINAL");
+});
+
+/** Run an operation that may either settle or reject; the control pins which one. */
+async function settled4140<T>(action: () => Promise<T>): Promise<{ ok: T } | { error: unknown }> {
+  return action().then(ok => ({ ok }), error => ({ error }));
+}
+
+async function expectKeptUncertain4140(h: Held4140, expectedClosed = 1) {
+  const { f, emu } = h;
+  await emu.idle();
+  const saved = (await h.record())!;
+  assert.equal(saved.heldCreateUncertain, true, "custody and uncertainty are kept");
+  assert.equal(saved.finalRequest, undefined);
+  assert.equal(saved.finalAcknowledged, undefined);
+  assert.equal(f.finals.length, 0, "no FINAL of any kind");
+  assert.equal(emu.closedBeforeAnswer().length, expectedClosed);
+  assert.equal(emu.markers.size, 0, "an aborted create never reached the API's invocation point");
+  assert.equal(f.state.open, true);
+}
+
+it("#4140 C1 a persistent API outage keeps custody and uncertainty and mints nothing", async t => {
+  const h = await held4140(t);
+  const { f, emu } = h;
+  emu.mode = forgeUnavailable;
+  for (let pass = 0; pass < 3; pass++) assert.equal((await f.operate()).held, "kept");
+  assert.deepEqual(emu.requests.map(r => [r.empty, r.answered?.status]),
+    [[false, 503], [true, 422], [false, 503], [true, 422], [false, 503]]);
+  await expectKeptUncertain4140(h, 0);
+  assert.equal(f.state.produced, 1); assert.equal(f.state.uploads, 1);
+});
+
+it("#4140 C4 an empty probe answered forge_unavailable keeps uncertainty and sends no create", async t => {
+  const h = await held4140(t);
+  const { f, emu } = h;
+  emu.mode = forgeUnavailable;
+  await f.operate();
+  emu.emptyWithoutMarker = { status: 503, reason: "forge_unavailable" };
+  assert.equal((await f.operate()).held, "kept");
+  assert.deepEqual(emu.requests.map(r => [r.empty, r.answered?.status]), [[false, 503], [true, 503]]);
+  await expectKeptUncertain4140(h, 0);
+  assert.equal(f.state.produced, 1);
+});
+
+it("#4140 C2a a genuinely shorter inherited budget still aborts the held POST", async t => {
+  const h = await held4140(t);
+  const { f, emu } = h;
+  emu.mode = { kind: "created" };
+  emu.prepareDelayMs = 6000;
+  // The injected clock never moves: only the budget's own timer (1500 ms) ends it, and it is the budget that
+  // is genuinely inherited from the caller, so it must reach the POST.
+  const mono = 0;
+  const budget = new MaintenanceBudget(1500, () => mono);
+  try {
+    const result = await settled4140(() => MaintenanceBudget.run(budget, () => f.operate()));
+    assert.ok("error" in result, "the inherited deadline ends the pass");
+  } finally { budget.dispose(); }
+  await expectKeptUncertain4140(h);
+  assert.ok(emu.closedBeforeAnswer()[0]!.closedBeforeAnswer!.elapsedMs < 5000, "closed by the inherited budget, not by the API answering");
+});
+
+it("#4140 C2b an aborted caller signal ends the held POST", async t => {
+  const h = await held4140(t);
+  const { f, emu } = h;
+  const caller = new AbortController();
+  emu.mode = { kind: "created" };
+  emu.prepareDelayMs = 6000;
+  emu.onBodyComplete = () => caller.abort();
+  const outcome = await f.coordinator.operateFrozenInventory({
+    record: f.record, barePath: f.context.barePath, defaultBranch: "main", signal: caller.signal,
+  });
+  assert.equal(outcome.held, "kept");
+  await expectKeptUncertain4140(h);
+  assert.ok(emu.closedBeforeAnswer()[0]!.closedBeforeAnswer!.elapsedMs < 5000);
+});
+
+it("#4140 C2c an owned-pass abort ends the held POST", async t => {
+  const h = await held4140(t);
+  const { f, emu } = h;
+  const owned = new AbortController();
+  emu.mode = { kind: "created" };
+  emu.prepareDelayMs = 6000;
+  emu.onBodyComplete = () => owned.abort();
+  const result = await settled4140(() => MaintenanceBudget.runOwned(owned.signal, () => f.operate()));
+  if ("ok" in result) assert.equal(result.ok.held, "kept");
+  await expectKeptUncertain4140(h);
+  assert.ok(emu.closedBeforeAnswer()[0]!.closedBeforeAnswer!.elapsedMs < 5000);
+});
+
+it("#4140 C3 a lost reply after an applied create reconciles on the next pass with one create", async t => {
+  const h = await held4140(t);
+  const { f, emu } = h;
+  emu.mode = { kind: "lost_reply" };
+  assert.equal((await f.operate()).held, "kept");
+  assert.equal((await h.record())!.heldCreateUncertain, true);
+  assert.equal(emu.markers.size, 1, "the create applied before the reply was lost");
+  assert.equal(f.finals.length, 0);
+  const second = await f.operate();
+  assert.equal(second.held, "acked");
+  assert.deepEqual(emu.requests.map(r => [r.empty, r.answered?.status, r.answered?.state]),
+    [[false, undefined, undefined], [true, 200, "created"]], "the probe read the marker back; no second create");
+  assert.equal(emu.createsReachingMarker(), 1);
+  assert.equal(f.finals.length, 1);
+  assert.equal(heldKind(f.finals[0]), "held_publication");
+  assert.equal(f.state.produced, 1); assert.equal(f.state.uploads, 1);
+  assert.equal(f.state.open, false);
+});
+
+it("#4140 C5 a stated ci_config_guard refusal clears this pass's uncertainty and is attested", async t => {
+  const h = await held4140(t, { status: "failed", thin: false });
+  const { f, emu } = h;
+  emu.mode = { kind: "status", status: 409, reason: "ci_config_guard" };
+  await f.operate();
+  assert.deepEqual(emu.requests.map(r => [r.empty, r.answered?.status, r.answered?.reason]), [[false, 409, "ci_config_guard"]]);
+  assert.notEqual((await h.record())?.heldCreateUncertain, true, "the stated refusal clears the uncertainty set for this send");
+  assert.equal(emu.markers.size, 0);
+  assert.equal(f.finals.length, 1, "attested: the archive fallback mints its FINAL");
+  assert.equal(heldKind(f.finals[0]), "archive");
+});
+
+it("#4140 C5 a stated ci_config_guard refusal never clears an earlier uncertainty", async t => {
+  const h = await held4140(t);
+  const { f, emu } = h;
+  await patchAuthenticated(f, f.record, { heldCreateUncertain: true });
+  emu.mode = { kind: "status", status: 409, reason: "ci_config_guard" };
+  assert.equal((await f.operate()).held, "kept");
+  assert.deepEqual(emu.requests.map(r => [r.empty, r.answered?.status, r.answered?.reason]),
+    [[true, 422, "pack_invalid"], [false, 409, "ci_config_guard"]]);
+  await expectKeptUncertain4140(h, 0);
+  assert.equal(f.state.produced, 0);
+});
+
+it("#4140 C5 a validated 200 create_refused on the full create clears uncertainty and is attested", async t => {
+  const h = await held4140(t, { status: "failed", thin: false });
+  const { f, emu } = h;
+  emu.mode = { kind: "refused" };
+  await f.operate();
+  assert.deepEqual(emu.requests.map(r => [r.empty, r.answered?.status, r.answered?.state, r.answered?.reason]),
+    [[false, 200, "refused", "create_refused"]]);
+  assert.notEqual((await h.record())?.heldCreateUncertain, true);
+  assert.equal(f.finals.length, 1);
+  assert.equal(heldKind(f.finals[0]), "archive");
+});
+
+it("#4140 C5 a validated 200 create_refused read back by the probe clears uncertainty and is attested", async t => {
+  const h = await held4140(t, { status: "failed", thin: false });
+  const { f, emu } = h;
+  await patchAuthenticated(f, f.record, { heldCreateUncertain: true });
+  emu.seedMarker(f.context.runId, 7, "refused");
+  await f.operate();
+  assert.deepEqual(emu.requests.map(r => [r.empty, r.answered?.status, r.answered?.state]), [[true, 200, "refused"]]);
+  assert.notEqual((await h.record())?.heldCreateUncertain, true);
+  assert.equal(emu.createsReachingMarker(), 0);
+  assert.equal(f.finals.length, 1);
+  assert.equal(heldKind(f.finals[0]), "archive");
 });
