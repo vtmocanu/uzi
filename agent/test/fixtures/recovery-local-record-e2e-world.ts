@@ -72,8 +72,9 @@ export class E2EClient {
     return { status: this.runStatus, claim_generation: claim, inventory_guarded: true } as RunOwnershipResponse;
   }
   async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
-    return { run_id: runId, holds: [...this.gens.values()].filter(g => g.runId === runId && g.open).map(g => ({
-      hold_id: g.holdId, generation: g.generation, inventory_guarded: true, has_available_capture: false })) } as RecoveryHoldsResponse;
+    const holds = [...this.gens.values()].filter(g => g.runId === runId && g.open).map(g => ({
+      hold_id: g.holdId, generation: g.generation, inventory_guarded: true, has_available_capture: false }));
+    return { run_id: runId, holds, run_open_holds: { run_id: runId, count: holds.length } } as RecoveryHoldsResponse;
   }
   async reserveRecoveryCapture(): Promise<{ capture_id: string; state: "preparing" }> {
     return { capture_id: this.producing!.captureId, state: "preparing" };

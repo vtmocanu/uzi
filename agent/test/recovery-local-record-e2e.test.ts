@@ -124,7 +124,7 @@ test("a multi-generation run: local-records names each case, A1 then A2 retire, 
   assert.deepEqual(classes(described), { 7: "case_a_ack", 8: "case_a_replay", 9: "source_not_exclusive:shared_owed_pin" });
   const digestA1 = digestOf(described, 7);
   digestOf(described, 8);
-  assert.equal((described.result.generations as Json[]).find(g => g.generation === 9)?.digest, undefined, "Case B offers no digest");
+  assert.equal((described.result.generations as Json[]).find(g => g.generation === 9)?.digest, undefined, "generation 9 is refused for source exclusivity (source_not_exclusive:shared_owed_pin), so it offers no digest");
 
   // Everything that must not move: Case B's records and bundle, the other run's records and source, and every ref except the retired ones.
   const caseB = filesOf(w, b).map(f => [f, treeDigest(f)] as const);

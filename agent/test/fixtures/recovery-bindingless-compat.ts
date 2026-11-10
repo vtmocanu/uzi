@@ -46,7 +46,7 @@ export function environment(f: Fixture, ReaderClass: Reader = RecoveryCoordinato
     getRunOwnership: async () => ({ status: "failed", claim_generation: 7, inventory_guarded: true }),
     listRecoveryHolds: async () => ({ run_id: f.context.runId, holds: state.open ? [{
       hold_id: binding.holdId, generation: 7, inventory_guarded: true, has_available_capture: false,
-    }] : [] }),
+    }] : [], run_open_holds: { run_id: f.context.runId, count: state.open ? 1 : 0 } }),
     reserveRecoveryCapture: async () => {
       calls.reserve++;
       return { capture_id: id(3), state: "preparing" };

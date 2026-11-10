@@ -6389,7 +6389,7 @@ export class RecoveryCoordinator {
       anchor = ackRecord!;
     } else if (!ackRecord && guarded.some(r => r.finalAcknowledged === true)) {
       return no("final_ack_unknown");
-    } else if (ackRecord || selected.some(r => r.finalAcknowledged === true)) {
+    } else if (ackRecord) {
       return no("cleanup_pending");
     } else {
       const saved = guarded.filter(r => r.finalRequest && r.coverageDigest);
@@ -6421,8 +6421,10 @@ export class RecoveryCoordinator {
     if (!bare || bare !== context.barePath) return no("bare_mismatch");
     if (observed.holds === "unknown") return no("holds_unknown");
     // Case B: no open hold of the run at ANY generation. Case A keeps its own-generation check.
-    const runHoldOpen = (): boolean => observed.holds === "unknown" || observed.holds.size > 0 || (observed.runOpenHolds ?? 0) > 0;
-    if (track === "b") { if (runHoldOpen()) return no("run_hold_open"); }
+    // The api omits the run-wide count when it is unknown: absent is never zero, so Case B refuses it as unknown holds.
+    const runHolds = (): string | undefined => observed.holds === "unknown" || observed.holds.size > 0 || (observed.runOpenHolds ?? 0) > 0
+      ? "run_hold_open" : observed.runOpenHolds === undefined ? "holds_unknown" : undefined;
+    if (track === "b") { const refusal = runHolds(); if (refusal) return no(refusal); }
     else if (observed.holds.has(generation)) return no("hold_open");
     if (this.pendingGenerationReport?.(runId, generation)) return no("pending_generation_report");
     if (!this.client.getExactRecoveryHold) return no("exact_evidence_unavailable");
@@ -6443,7 +6445,8 @@ export class RecoveryCoordinator {
     if (track === "a2" && !matching) {
       // The saved FINAL's hold is discarded, or released without its receipt: not a replay.
       track = "b";
-      if (runHoldOpen()) return no("run_hold_open");
+      const refusal = runHolds();
+      if (refusal) return no(refusal);
     }
     let caseB: "case_b_owner_discard" | "case_b_released_mismatch" | undefined;
     let sourceEvidence: { expectedClones: string; descriptor: unknown } | undefined;

@@ -438,6 +438,28 @@ test("Case A is unchanged by a later generation's open hold, while Case B refuse
   assert.equal(await fresh.classification(), "run_hold_open");
 });
 
+test("an absent run-wide open-hold count is unknown, never zero: Case B refuses it, Case A does not change", async () => {
+  for (const track of TRACKS) {
+    const w = await world(track);
+    const digest = await w.digest();
+    w.client.listRecoveryHolds = async () => ({ run_id: w.runId, holds: [] });
+    const view = await w.view();
+    assert.equal(view?.classification, "holds_unknown", track);
+    assert.equal(view?.digest, undefined, track + ": no Case B digest is offered");
+    const before = await w.state();
+    assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "holds_unknown" }, track);
+    await w.assertUntouched(before);
+  }
+  const a1 = await world("discarded-final", { variant: "acknowledged" });
+  a1.exact = { ...closed(a1.f), state: "released", release_evidence: a1.f.record.finalRequest!.evidence, final_receipt: a1.f.record.finalRequest!.disposition };
+  a1.client.listRecoveryHolds = async () => ({ run_id: a1.runId, holds: [] });
+  assert.equal(await a1.classification(), "case_a_ack");
+  // A saved FINAL whose fresh read turns out discarded is Case B only after the exact read, and refuses the same way.
+  const fresh = await world("discarded-final");
+  fresh.client.listRecoveryHolds = async () => ({ run_id: fresh.runId, holds: [] });
+  assert.equal(await fresh.classification(), "holds_unknown");
+});
+
 test("a discarded merged-predecessor policy outcome is retained even when confirmed, and unknown discard evidence is not Case B", async () => {
   for (const final_receipt of [undefined, { kind: "settled", coverage_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" }] as const) {
     const w = await world();
@@ -527,6 +549,19 @@ test("the exact observation changing inside J (after the pre-check) is descripto
   assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "descriptor_changed" });
   await w.assertUntouched(before);
   assert.equal(w.proves, 1, "refused before the in-action proof");
+
+  // Only a field the digest omits changes inside J: the in-J comparison of the immutable observation must catch it.
+  const receipt = await world();
+  const receiptDigest = await receipt.digest();
+  const receiptBefore = await receipt.state();
+  let reads = 0;
+  receipt.evidence = () => {
+    if (++reads === 1) receipt.exact = { ...closed(receipt.f), completed_publication_receipt: { hold_id: binding.holdId } as never };
+    return fakeSourceEvidence(receipt.runId, receipt.bare);
+  };
+  assert.deepEqual(await receipt.resolve(receiptDigest), { kind: "refused", reason: "descriptor_changed" });
+  await receipt.assertUntouched(receiptBefore);
+  assert.equal(receipt.proves, 1, "refused before the in-action proof");
 });
 
 // ── the source evidence ──────────────────────────────────────────────────────────────────────────────────
