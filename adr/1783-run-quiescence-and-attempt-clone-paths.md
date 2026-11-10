@@ -1605,19 +1605,27 @@ amendments above. It adds a deletion phase to the first-process pod-epoch pass
 (`runPodEpochShadow`, `agent/src/pod-epoch-reclaim.ts`) that reuses the existing operator
 discard core and the existing authority store. It adds no new deletion primitive, no new
 authority record and no resolver. Those two amendments remain the history of their
-boundaries: the #1858 "no safe automatic reclaim" statement still holds in production,
-because the phase is off (below).
+boundaries: the #1858 "no safe automatic reclaim" statement still holds in production
+except on the one worker an operator opts in (below).
 
 ### Activation gate
 
-`EPOCH_RECLAIM_DELETION_ENABLED` is `false`. While it is false the pass stays shadow-only:
+Amended 2026-11-10 (#4134): the compile-time constant `EPOCH_RECLAIM_DELETION_ENABLED`
+is gone; a startup opt-in replaces it. `readEpochReclaimDeletionActivation` reads
+`UZI_EPOCH_RECLAIM_DELETION` once in `main.ts` before the pod epoch is created: unset,
+`""` or `0` is off, `1` is on only with `UZI_EPOCH_LOCK=1` and a Docker wiring, and anything
+else refuses startup. Without the opt-in the pass stays shadow-only:
 no proof is created and nothing is mutated, whatever deletion dependencies the caller
-supplies. `main.ts` wires the dependencies (`buildPodEpochDeletionDeps`: authority
+supplies. The opt-in only permits attempting the phase; every gate here stays conjunctive.
+The chart default is off, and the controller sets it for at most one selected hosted Docker
+worker (`workers.epochReclaim.deletionCanaryWorkerId`).
+
+`main.ts` wires the dependencies (`buildPodEpochDeletionDeps`: authority
 runtime, `RunRunner.withSourceReservation`, the worker-wide deny-only capture-mode proof
-as `quiesce`, GitCache) and carries no activation override. A test-only symbol sentinel
-is the only other way the phase runs; nothing under `agent/src` passes it. Turning
-production deletion on needs a separate owner activation co-sign on the re-measured R9
-numbers; that co-sign has not happened. Hosted acceptance is also pending.
+as `quiesce`, GitCache). A test-only symbol sentinel
+is the only other way the phase runs; nothing under `agent/src` passes it. Live
+enablement waits on the #3851 implementation being in the deployed worker image and on
+refreshed R9 measurements; hosted acceptance is also pending.
 
 ### Disposal is plain-only, through one core
 

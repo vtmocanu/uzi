@@ -2487,14 +2487,25 @@ verified pod epoch, under the exclusive epoch lock and before it admits runs
 (see [Pod-epoch shadow reclaim](./worker-docker.md#pod-epoch-shadow-reclaim)).
 The evaluation is reported in the `pod_epoch_reclaim` log line. The worker image
 also contains a deletion phase that reclaims through the same discard core as the
-operator channel above. **That phase is gated off: `EPOCH_RECLAIM_DELETION_ENABLED`
-is `false`, so a production worker deletes nothing and settles no records.**
-Enabling it needs a separate owner decision on the re-measured numbers in
-[PRD #3431](../prds/3431-pod-epoch-reclaim.md); this guide does not describe it as
-available. Hosted deletion acceptance, the later idle-gated roll (#3329) and the
-Compose and plain lanes (#3709, #3710) are not shipped.
+operator channel above. **That phase is off unless an operator opts in on exactly
+one worker: a production worker deletes nothing and settles no records by default.**
+The worker reads `UZI_EPOCH_RECLAIM_DELETION` once at startup, before it creates
+its pod epoch: unset, empty or `0` is off; `1` is on only for an epoch-locked,
+Docker-wired worker (`UZI_EPOCH_LOCK=1` and `DOCKER_HOST` or `UZI_DIND_SOCKET`),
+and any other value, or `1` on a worker without those, refuses startup. The opt-in
+only permits attempting the phase described below; it supplies no evidence, and
+every gate below stays required. Every epoch worker logs one startup line,
+`pod_epoch_reclaim_activation`, with `deletion_requested: true|false`; an image
+without the opt-in never emits it. In a hosted deployment the controller sets the
+variable for one selected worker only, from the chart value
+`workers.epochReclaim.deletionCanaryWorkerId` (default `""`, off everywhere; see
+[configuration](./configuration.md#controller)). There is no fleet-wide enable, hot
+kill switch, synthetic epoch reset or forced roll. Live enablement waits on the
+[one-worker deletion canary checklist](#one-worker-deletion-canary-checklist).
+Hosted deletion acceptance, the later idle-gated roll (#3329) and the Compose and
+plain lanes (#3709, #3710) are not shipped.
 
-If the phase is enabled, it runs only for an `eligible` and `attested` pass, one
+When the phase is attempted, it runs only for an `eligible` and `attested` pass, one
 source at a time, and keeps everything else:
 
 - It needs a fresh positive terminal lifecycle and a recovery-holds response with
@@ -2536,7 +2547,13 @@ claimed. A residue failure leaves the slot `retiring` with a `settled_failed`
 pending record, which the next epoch retakes. A crash inside or after the
 destructive-record save and before its settle leaves the slot `retiring` with a
 `running` pending record. That source is kept and not recovered automatically:
-this is a stated residual, and no automatic path clears it.
+this is a stated residual, and no automatic path clears it. The other interrupted
+states (takeover saved, delete settled before the retired append, retired append
+before the clear, clear barrier uncertain) are rediscovered by the next epoch and
+either finished exactly or kept; the exact `[""]` repair repeats only the barriers.
+Authority-store slot and head write windows follow the existing store recovery: a
+transactional load finishes a slot exactly one ahead, and a read-only peek refuses.
+The full table is in [PRD #3431](../prds/3431-pod-epoch-reclaim.md).
 
 A verified epoch is not proof that every historical writer is gone. Its evidence
 covers the immediately preceding pod and intervening pod use, while the epoch lock
@@ -2547,6 +2564,71 @@ accepted this historical-writer residual on 2026-10-24 in
 [PRD #3430](../prds/3430-pod-epoch-lock-shadow.md). It does not authorize bypassing
 a current source-use, custody, process, Docker, or epoch-lock refusal. A known or
 unverified current writer keeps the source.
+
+#### One-worker deletion canary checklist
+
+Setting `workers.epochReclaim.deletionCanaryWorkerId` is an owner-run, evidence
+gated step. It lets one worker attempt the deletion phase above; every existing
+gate (eligible verdict, attested authority, intact pass, native reclaim scope,
+fresh per-source reads, reservation and authority transaction, journal and
+descriptor equality, quiescence, durable settlement) stays conjunctive, and the
+setting supplies no evidence. Nothing here is accepted or verified by shipping
+the chart value: hosted deletion acceptance is owner-owned and pending.
+
+**Prerequisites, before setting the selector:**
+
+- (a) The deployed worker image contains the reviewed #3851 implementation.
+- (b) Refreshed R9 measurements from that image exist.
+
+**Steps:**
+
+1. Ship with the chart default empty. Deploy the new controller and an image with
+   the opt-in, activation off. Finish any global worker image rollout first; the
+   selector never changes the image pin.
+2. Pick ONE persistent, genuinely idle Docker worker from fresh inventory, with a
+   supported runtime and layout, headroom and normal pool replacement coverage.
+   Record the worker, image digest, pod, data-PVC identities and the
+   before-inventory. Do not discard holds or edit protected records to manufacture
+   a deletion. Keep ForceRoll off.
+3. Set the selector through normal GitOps. Verify:
+   - the replacement's identity (worker, pod and PVC);
+   - its `UZI_EPOCH_RECLAIM_DELETION=1` env;
+   - the `pod_epoch_reclaim_activation` line with `deletion_requested: true`. This
+     is mandatory: an old image ignores the variable and emits no line;
+   - that unselected workers' templates are unchanged.
+
+   Registration alone is not proof. Collect at least three distinct complete,
+   attested startup epochs on the SAME worker, including at least one
+   independently verified physical deletion. Zero-candidate or metadata-only epochs
+   count toward the three but not toward the deletion. Same-pod restarts,
+   partial or deferred passes and unresolved outcomes do not count.
+4. Preserve each epoch's full `pod_epoch_reclaim` result: counts, `deleted_bytes`,
+   every `kept_*` and the partial/authority fields, plus duration, resource
+   observations, before/after paths and preserved refs. Verify that each removed
+   source had no live reference. No memory-pressure park may be attributable to it.
+5. Lead and buddy review the evidence before any further rollout. Any anomaly stops
+   the canary: preserve the evidence and clear the selector. There is no automatic
+   promotion, and fleet expansion needs a separate owner decision.
+
+**Disabling.** Clear the selector. It takes effect at the next safe replacement or
+startup of that worker: the controller drops the env from the template and the
+worker rolls through the same pacing, idle and custody guards as any other roll. It
+does not stop a pass already running and cannot restore deleted bytes; in-flight
+effects follow the existing graceful cancellation and settlement rules, and unknown
+effects keep exclusion and refuse admission.
+
+**Never move the selector to another UUID until the prior enabled incarnation is
+proven gone or off.** Moving it from worker A to worker B renders B's env
+immediately, but A keeps its env until its own replacement. A busy A is only
+cordoned, and a container restart of A's existing pod would re-run its startup
+deletion phase. This is an accepted limit of the design, not a bug to work around:
+clear the selector, confirm A has been replaced (or its activation line reads
+`deletion_requested: false`), and only then set the new ID.
+
+**Settlement contract (unchanged).** Crash scope is process crashes only: a crash
+after a `running` pending record leaves the source KEPT and not recovered
+automatically, and `settled_failed` residue is retaken by the next epoch (see the
+crash paragraph above). No storage or power-loss durability is claimed.
 
 #### Resolving guarded local records
 
@@ -2740,7 +2822,7 @@ abandoned. Either way Case B removes no tree bytes.
 - **Source disposal is separate.** After retirement `inspect` may show `local_discard`;
   the existing [epoch reclaim](#verified-epoch-reclaim-prd-3431) then acts only if its own
   strict-plain shape, byte measurement, custody and writer predicates pass (and that
-  deletion phase is gated off in production). It may instead show `local_protected_discard`,
+  deletion phase runs only on the one opted-in canary worker, if any). It may instead show `local_protected_discard`,
   which the epoch deletion recheck refuses; the ordinary operator `discard --protected`
   runs its own checks. Record retirement guarantees neither outcome and grants no source
   disposal.

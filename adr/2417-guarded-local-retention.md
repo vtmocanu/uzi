@@ -232,7 +232,7 @@ whole run (`record_unverified`).
   design and has not been measured.
 - **Follow-on source disposal.** After retirement `inspect` may show
   `local_discard`: the existing epoch path reclaims only if its own predicates
-  pass, and that path is gated off in production. Or it may show
+  pass, and that path runs only on the one opted-in canary worker, if any. Or it may show
   `local_protected_discard`, which the epoch deletion recheck refuses; the
   ordinary operator `discard --protected` runs its own checks. Record
   retirement guarantees neither outcome and grants no source disposal.

@@ -179,9 +179,11 @@ The issue made "rootless isolation is preserved" a merge condition. The maintain
 
 Refs [PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b. The first-process pod-epoch pass
 can now settle and delete a retained attempt clone under `/data/runner` (the `runner-shared`
-subPath), but only behind `EPOCH_RECLAIM_DELETION_ENABLED`, which is `false`. Until a
-separate owner activation co-sign, the D5, D8 and Consequences statements that automatic
-retention deletion stays off remain true in production. The mechanism is recorded in the
+subPath), but only behind the startup opt-in `UZI_EPOCH_RECLAIM_DELETION` (#4134
+replaced the compile-time constant), which the chart leaves off. The D5, D8 and
+Consequences statements that automatic retention deletion stays off remain true in
+production except on the one hosted Docker worker an operator selects with
+`workers.epochReclaim.deletionCanaryWorkerId`. The mechanism is recorded in the
 [ADR-1783 amendment of the same date](1783-run-quiescence-and-attempt-clone-paths.md).
 
 - **Scope.** Plain attempt sources in the admitted journal shapes only; protected sources,
