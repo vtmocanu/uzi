@@ -85,6 +85,9 @@ type codexTestEnv struct {
 	box  *secretbox.Box
 	vlt  *vault.Vault
 	exec func(sql string, args ...any)
+	// isolated marks an env on a database the test creates and drops itself
+	// (isolatedCoordinateDatabase), whose users need no per-test cleanup.
+	isolated bool
 }
 
 // codexToken assembles a token-shaped fixture string from parts at runtime, so no
@@ -128,6 +131,9 @@ func (e codexTestEnv) seedUser(t *testing.T) uuid.UUID {
 	userID := uuid.New()
 	e.exec(`INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		userID, fmt.Sprintf("codex-%s@e2e", userID))
+	if !e.isolated {
+		trackLiveDBUser(t, e.pool, userID)
+	}
 	return userID
 }
 

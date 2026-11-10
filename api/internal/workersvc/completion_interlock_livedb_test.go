@@ -55,6 +55,7 @@ func setupInterlockLiveDB(t *testing.T) interlockLiveDB {
 	connID := uuid.New()
 	e.exec(t, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		e.userID, fmt.Sprintf("interlock-%s@e2e", e.userID))
+	trackLiveDBUser(t, pool, e.userID)
 	e.exec(t, `INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	           VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, e.userID, []byte("x"))
 	e.exec(t, `INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
