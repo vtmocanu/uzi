@@ -3946,28 +3946,39 @@ export class GitCache {
    * callbacks) and re-censuses the leaf NAME as the runner, then maps it with
    * classifyScratchSettlement. Only a settled outcome (`removed` or `residue`) removes the entry and
    * then settles the ticket; anything else stops the scope, leaves both pending and throws an error
-   * carrying `epochScratchUnresolved: true`.
+   * carrying `epochScratchUnresolved: true`. An error thrown before the entry (validation, the observation,
+   * abort, deadline, exclusivity) carries `epochScratchNotLaunched: true`.
    */
   async discardEpochScratchLeaf(input: EpochScratchDiscardInput): Promise<Settlement> {
     const seam = input.testSeam;
-    if (seam !== undefined && seam.token !== EPOCH_SCRATCH_TEST_SEAM) throw new Error("epoch scratch test seam refused");
     const scope = input.scope;
-    if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped"]
-      .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function") ||
-      typeof input.beforeLaunch !== "function" || typeof input.rootRepin !== "function" ||
-      typeof input.mountsOk !== "function" || !(input.signal instanceof AbortSignal) ||
-      !Number.isFinite(input.deadline) || !Number.isSafeInteger(input.bytes) || input.bytes < 0)
-      throw new Error("epoch scratch delete input refused");
-    const root = seam?.root ?? input.root;
-    const wrapped = runnerCommand(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, root, input.name,
-      String(SCRATCH_DELETE_LIMITS.maxEntries), String(SCRATCH_DELETE_LIMITS.budgetMs), "remove", input.expect, "",
-      "pinned", input.rootExpect, "1", String(SCRATCH_DELETE_LIMITS.maxDepth)]);
+    let root: string;
+    let wrapped: ReturnType<typeof runnerCommand>;
     const env = { PATH: "/usr/bin:/bin" };
-    this.validateEpochScratchLaunch(wrapped.command, wrapped.args, env, "/", "command", seam?.root);
-    await input.beforeLaunch();
-    input.signal.throwIfAborted();
-    if (Date.now() >= input.deadline) throw new Error("epoch scratch delete deadline exhausted");
-    scope.assertExclusive();
+    // Everything before the `unsettledDeletes` entry: no child, ticket or unsettled entry exists yet, so an
+    // error thrown here is tagged `epochScratchNotLaunched` and is not an unresolved delete. A stopped scope
+    // is the exception: it means an earlier effect is unresolved, so that throw stays untagged (fatal).
+    try {
+      if (seam !== undefined && seam.token !== EPOCH_SCRATCH_TEST_SEAM) throw new Error("epoch scratch test seam refused");
+      if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped"]
+        .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function") ||
+        typeof input.beforeLaunch !== "function" || typeof input.rootRepin !== "function" ||
+        typeof input.mountsOk !== "function" || !(input.signal instanceof AbortSignal) ||
+        !Number.isFinite(input.deadline) || !Number.isSafeInteger(input.bytes) || input.bytes < 0)
+        throw new Error("epoch scratch delete input refused");
+      root = seam?.root ?? input.root;
+      wrapped = runnerCommand(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, root, input.name,
+        String(SCRATCH_DELETE_LIMITS.maxEntries), String(SCRATCH_DELETE_LIMITS.budgetMs), "remove", input.expect, "",
+        "pinned", input.rootExpect, "1", String(SCRATCH_DELETE_LIMITS.maxDepth)]);
+      this.validateEpochScratchLaunch(wrapped.command, wrapped.args, env, "/", "command", seam?.root);
+      await input.beforeLaunch();
+      input.signal.throwIfAborted();
+      if (Date.now() >= input.deadline) throw new Error("epoch scratch delete deadline exhausted");
+      scope.assertExclusive();
+    } catch (error) {
+      if (error !== null && typeof error === "object") (error as { epochScratchNotLaunched?: boolean }).epochScratchNotLaunched = true;
+      throw error;
+    }
     if (scope.stopped()) throw new Error("epoch scratch delete stopped");
     const key = path.resolve(root, input.name);
     this.unsettledDeletes.set(key, (this.unsettledDeletes.get(key) ?? 0) + 1);

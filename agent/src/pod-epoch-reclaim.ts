@@ -182,6 +182,8 @@ interface ScratchVerdict {
   examined: number;
   /** Kept leaves by fixed reason (the classifier's reasons plus `changed`, a leaf that moved before its delete). */
   kept: Record<string, number>;
+  /** Leaves admitted at census time. `kept.mount`, `kept.changed` and `kept.held_open` may also count an
+   *  admitted leaf demoted before its delete, so those counts overlap `eligible`. */
   eligible: number;
   eligible_allocated_bytes_estimate: number;
   shared_bytes: number;
@@ -318,7 +320,7 @@ function poolFreeBytes(fd: number): bigint | null {
  */
 async function runScratchPhase(ctx: ScratchContext): Promise<void> {
   const { deps, seams, out } = ctx;
-  const refuse =(reason: string): void => { out.state = "refused"; out.reason = reason; };
+  const refuse = (reason: string): void => { out.state = "refused"; out.reason = reason; };
   const stopPhase = (reason: string): void => { out.state = "stopped"; out.reason = reason; };
   try { deps.git.assertNoUnsettledDeletes(); } catch { ctx.failFatal(); }
   const gate = scratchLayout(seams.env ?? process.env);
@@ -387,7 +389,14 @@ async function scratchBody(ctx: ScratchContext, layout: ScratchLayout, pin: Scra
   const budget = ctx.hardPass - 5000 - ctx.now() - SCRATCH_CENSUS_MARGIN_MS;
   if (budget <= 0) return refuse("census_budget");
   const runCensus = seams.census ?? censusScratchRoot;
-  const raw = await ctx.owned(() => runCensus(layout.root, pin.devIno, undefined, budget), ctx.hardPass);
+  // censusScratchRoot joins its child before it rejects (joinOnTimeout), so a rejection here is a joined
+  // census failure; an unjoined one surfaces as the owner's PodEpochSettlementError and stays fatal.
+  let raw: Awaited<ReturnType<typeof runCensus>>;
+  try { raw = await ctx.owned(() => runCensus(layout.root, pin.devIno, undefined, budget), ctx.hardPass); }
+  catch (error) {
+    if (error instanceof PodEpochSettlementError || ctx.interrupted()) throw error;
+    return refuse("census_failed");
+  }
   const census = parseScratchCensus(raw, pin.devIno);
   if ("refused" in census) return refuse(census.refused);
   const names = census.entries.map(e => e.name);
@@ -432,9 +441,14 @@ async function scratchBody(ctx: ScratchContext, layout: ScratchLayout, pin: Scra
     }
     const remaining = ctx.hardPass - 5000 - ctx.now();
     if (remaining <= 0) { stopPhase("census_budget"); break; }
-    const again = parseScratchCensus(
-      await ctx.owned(() => runCensus(layout.root, pin.devIno, leaf.name, Math.min(SCRATCH_RECENSUS_MAX_MS, remaining)), ctx.hardPass),
-      pin.devIno);
+    let rawAgain: Awaited<ReturnType<typeof runCensus>>;
+    try {
+      rawAgain = await ctx.owned(() => runCensus(layout.root, pin.devIno, leaf.name, Math.min(SCRATCH_RECENSUS_MAX_MS, remaining)), ctx.hardPass);
+    } catch (error) {
+      if (error instanceof PodEpochSettlementError || ctx.interrupted()) throw error;
+      stopPhase("census_failed"); break;
+    }
+    const again = parseScratchCensus(rawAgain, pin.devIno);
     if ("refused" in again) { stopPhase(again.refused); break; }
     if (!censusEntryUnchanged(leaf, again.entries.find(e => e.name === leaf.name), again.rootUid)) {
       out.kept.changed = (out.kept.changed ?? 0) + 1; continue;
@@ -469,7 +483,12 @@ async function scratchBody(ctx: ScratchContext, layout: ScratchLayout, pin: Scra
     } catch (error) {
       if (error instanceof PodEpochSettlementError) throw error;
       if (preLaunch !== undefined && error === preLaunch) { stopPhase("observation_refused"); throw error; }
-      // An unresolved delete, or anything else thrown once a launch may have happened: EX stays held.
+      // discardEpochScratchLeaf tags an error thrown before any unsettled entry or child exists; that is the
+      // pass's own invalidation, not an unresolved delete.
+      if ((error as { epochScratchNotLaunched?: unknown } | null)?.epochScratchNotLaunched === true) {
+        stopPhase("launch_refused"); throw error;
+      }
+      // An unresolved delete, or any untagged throw (a launch may have happened): EX stays held.
       return ctx.failFatal();
     }
     launched++;

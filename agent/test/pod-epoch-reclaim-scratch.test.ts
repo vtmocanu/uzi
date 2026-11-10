@@ -592,7 +592,7 @@ test("settlement: a helper failure or a changed leaf stops the phase after that 
   }
 });
 
-test("settlement: an unresolved delete, or any other throw after launch, is fatal: EX kept, no handover", async () => {
+test("settlement: an unresolved delete, or an untagged throw, is fatal: EX kept, no handover", async () => {
   const failures: Array<[string, () => Error]> = [
     ["epochScratchUnresolved", () => Object.assign(new Error("epoch scratch delete unresolved"), { epochScratchUnresolved: true })],
     ["any other throw", () => new Error("boom")],
@@ -641,6 +641,74 @@ test("settlement: a refusal of the pre-launch observation is the pass's own inva
     assert.equal(result.reason, "daemon_changed");
     assert.equal(result.scratch.deleted, 0);
     assert.deepEqual(w.calls.discards, ["a"]);
+  });
+});
+
+test("settlement: a throw tagged as never launched is not fatal; the same throw untagged is", async () => {
+  // The real delete refuses on a past deadline before any child or unsettled entry exists.
+  await withWorld(["a", "b"], async w => {
+    w.census = fakeCensus(() => [dirEntry("a", 1), dirEntry("b", 2)]);
+    w.discard = async input => w.git.discardEpochScratchLeaf({ ...input, deadline: 0 });
+    let outcome: unknown;
+    try { outcome = await run(w); } catch (error) { outcome = error; }
+    assert.ok(!(outcome instanceof PodEpochSettlementError), "a pre-launch refusal is not an unresolved delete");
+    assert.deepEqual(w.calls.discards, ["a"]);
+    assert.equal(w.scope.stopped(), false);
+    assert.doesNotThrow(() => w.git.assertNoUnsettledDeletes());
+    await untouched(w, ["a", "b"]);
+  });
+  await withWorld(["a"], async w => {
+    w.census = fakeCensus(() => [dirEntry("a", 1)]);
+    w.discard = async () => { throw new Error("epoch scratch delete deadline exhausted"); };
+    await assert.rejects(runPodEpochShadow(w.options), error => error instanceof PodEpochSettlementError);
+  });
+});
+
+test("census: a rejecting initial census refuses the scratch phase and the attempt phase still runs", async () => {
+  await withWorld(["a"], async w => {
+    const attempt = { discards: 0, unsettled: 0 };
+    w.options.deletion = attemptDeletion(w, attempt);
+    withAttemptInventory(w, () => attemptSource());
+    w.census = async () => { throw new Error("census helper timed out"); };
+    const result = await run(w);
+    assert.equal(result.scratch.state, "refused"); assert.equal(result.scratch.reason, "census_failed");
+    assert.deepEqual(w.calls.discards, []);
+    assert.equal(result.deleted, 1); assert.equal(attempt.discards, 1);
+    await untouched(w, ["a"]);
+  });
+});
+
+test("census: a rejecting re-census stops the scratch phase and the attempt phase still runs", async () => {
+  await withWorld(["a"], async w => {
+    const attempt = { discards: 0, unsettled: 0 };
+    w.options.deletion = attemptDeletion(w, attempt);
+    withAttemptInventory(w, () => attemptSource());
+    const first = fakeCensus(() => [dirEntry("a", 1)]);
+    w.census = async (r, e, leaf, t) => { if (leaf !== undefined) throw new Error("census helper killed"); return first(r, e, leaf, t); };
+    const result = await run(w);
+    assert.equal(result.scratch.state, "stopped"); assert.equal(result.scratch.reason, "census_failed");
+    assert.equal(result.scratch.eligible, 1);
+    assert.deepEqual(w.calls.discards, []);
+    assert.equal(result.deleted, 1); assert.equal(attempt.discards, 1);
+    await untouched(w, ["a"]);
+  });
+});
+
+test("the scratch phase runs before the attempt deletion phase", async () => {
+  await withWorld(["a"], async w => {
+    const attempt = { discards: 0, unsettled: 0 };
+    const deps = attemptDeletion(w, attempt);
+    const git = deps.git as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    const attemptDiscard = git.discardStoppedSource!;
+    git.discardStoppedSource = async (...args) => { w.events.push("attempt-discard"); return attemptDiscard(...args); };
+    w.options.deletion = deps;
+    withAttemptInventory(w, () => attemptSource());
+    w.census = fakeCensus(() => [dirEntry("a", 1)]);
+    w.discard = async () => { w.events.push("scratch-discard"); return removed(); };
+    const result = await run(w);
+    assert.equal(result.scratch.deleted, 1); assert.equal(result.deleted, 1);
+    const order = w.events.filter(e => e.endsWith("-discard"));
+    assert.deepEqual(order, ["scratch-discard", "attempt-discard"]);
   });
 });
 
@@ -748,6 +816,21 @@ test("gate independence: the attempt override open with the scratch gate closed 
     assert.equal(result.deleted, 1); assert.equal(attempt.discards, 1);
     assert.equal(result.scratch.state, "not_run");
     await untouched(w, ["a"]);
+  });
+});
+
+test("gate independence: the attempt deletion deps with the attempt gate closed and the scratch gate open delete no attempt", async () => {
+  await withWorld(["a"], async w => {
+    const attempt = { discards: 0, unsettled: 0 };
+    const deps = attemptDeletion(w, attempt);
+    delete (deps as { enableForTest?: unknown }).enableForTest;
+    w.options.deletion = deps;
+    withAttemptInventory(w, () => attemptSource());
+    w.census = fakeCensus(() => [dirEntry("a", 1)]);
+    w.discard = async () => removed();
+    const result = await run(w);
+    assert.equal(result.scratch.deleted, 1);
+    assert.equal(result.deleted, 0); assert.equal(attempt.discards, 0);
   });
 });
 
