@@ -402,7 +402,7 @@
   // zizmor (scripts/worker-tool-version.sh) and keeps its sha256-pinned actionlint
   // tarball; `task check:actions-tool-parity` fails when either drifts from this lock.
   "packages": [
-    "github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473#go_1_27",
+    "github:NixOS/nixpkgs/6dadaf4375be35033e1c84395adbd53ff5fded96#go_1_27",
     "gcc",
     "python3",
     "python3Packages.pip",
