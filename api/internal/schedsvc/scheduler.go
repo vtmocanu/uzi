@@ -1419,11 +1419,12 @@ func (e *Scheduler) proposalDigestSection(ctx context.Context, sched store.RunSc
 		e.logger.Warn("scheduler: proposal digest skipped, cannot resolve repo/forge", "schedule", sched.ID.String(), "error", err)
 		return ""
 	}
+	var tr forge.IssueTracker = f // only the tracker half is needed here
 	// The SAME label workersvc files a proposal under (single source of truth), so the
 	// digest lists exactly this job's own proposal history.
 	label := workersvc.ProposalLabel(catalogSlugOf(sched))
 	// Zero-value State is StateAll (open + closed) — exactly what dedup needs; do not set it.
-	issues, err := f.ListIssues(ctx, repo.ForgeProjectID, forge.ListIssuesOptions{Labels: []string{label}})
+	issues, err := tr.ListIssues(ctx, repo.ForgeProjectID, forge.ListIssuesOptions{Labels: []string{label}})
 	if err != nil {
 		e.logger.Warn("scheduler: proposal digest skipped, list issues failed", "schedule", sched.ID.String(), "label", label, "error", err)
 		return ""

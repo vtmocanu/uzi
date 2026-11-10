@@ -248,7 +248,7 @@ func (e *Scheduler) notifySelfImproveSkipped(ctx context.Context, userID uuid.UU
 // project, reusing the newest OPEN issue carrying SelfImproveTrackingLabel or filing a new
 // one. The label is not a trigger label, so the poller never enqueues a rival issue run on
 // it. Relocated verbatim (retyped) from selfimprove/engine.go.
-func ensureTrackingIssue(ctx context.Context, f forge.Forge, projectID int64) (int64, error) {
+func ensureTrackingIssue(ctx context.Context, f forge.IssueTracker, projectID int64) (int64, error) {
 	existing, err := f.ListIssues(ctx, projectID, forge.ListIssuesOptions{Labels: []string{SelfImproveTrackingLabel}})
 	if err != nil {
 		return 0, fmt.Errorf("list tracking issues: %w", err)

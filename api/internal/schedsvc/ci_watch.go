@@ -410,7 +410,7 @@ type ciStartResult struct {
 
 // ciStartOne walks the candidates in order, building at most ciMaxSnapshots failure snapshots,
 // and starts the first run the loop guard and the locked recheck allow.
-func (e *Scheduler) ciStartOne(ctx context.Context, sched store.RunSchedule, repo store.GetRepoForUserRow, f forge.Forge, cfg CIRepairConfig, target workersvc.CIWatchTarget, body string, candidates []*ciKey) (ciStartResult, error) {
+func (e *Scheduler) ciStartOne(ctx context.Context, sched store.RunSchedule, repo store.GetRepoForUserRow, f forge.CodeHost, cfg CIRepairConfig, target workersvc.CIWatchTarget, body string, candidates []*ciKey) (ciStartResult, error) {
 	var res ciStartResult
 	if conflict, cerr := e.codexOverrideConflict(ctx, sched); cerr != nil {
 		return res, cerr
