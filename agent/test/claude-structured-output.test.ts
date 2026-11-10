@@ -124,7 +124,7 @@ describe("verdict schemas and the in-test checker", () => {
 // ---- The carrier in the gate, the init check, the budget and the built options ----
 
 const fixtureInit = ((): Record<string, unknown> => {
- const parsed = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "claude-structured-output-0.3.310.json"), "utf8")) as
+ const parsed = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "claude-structured-output-0.3.316.json"), "utf8")) as
   { sessions: Record<string, { frames: Array<Record<string, unknown>> }> };
  return parsed.sessions["plan_retry"]!.frames.find((f) => f["type"] === "system" && f["subtype"] === "init")!;
 })();

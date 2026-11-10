@@ -1,4 +1,4 @@
-// Replays the REAL Claude Agent SDK frames recorded in fixtures/claude-structured-output-0.3.310.json
+// Replays the REAL Claude Agent SDK frames recorded in fixtures/claude-structured-output-0.3.316.json
 // (see claude-structured-output.probe.ts) through the production ClaudeCrossCheck: the real built
 // options, the real composed PreToolUse hooks, the real init check and tool budget. This file imports
 // only symbols that exist without the structured-output carrier support, so it can be run against an
@@ -16,7 +16,7 @@ import { nullLogger } from "./helpers.js";
 import { check } from "./json-schema-subset.js";
 
 interface Session { stage: "plan" | "code"; threw: string | null; frames: Array<Record<string, unknown>>; hook_inputs: Array<Record<string, unknown>> }
-const fixture = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "claude-structured-output-0.3.310.json"), "utf8")) as
+const fixture = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "claude-structured-output-0.3.316.json"), "utf8")) as
   { sessions: Record<string, Session> };
 
 const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");

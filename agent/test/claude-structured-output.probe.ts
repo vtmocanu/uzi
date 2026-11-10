@@ -106,6 +106,8 @@ function normalizer(replacements: Array<[string, string]>): (v: unknown, key?: s
       if (key === "messaging_socket_path") return "<socket>";
       let s = v;
       for (const [from, to] of ordered) s = s.split(from).join(to);
+      // Git worktrees share the original repository's auto-memory directory, not repoRoot's.
+      if (key === "auto") s = s.replace(/^<home>\/\.claude\/projects\/[^/]+\/memory\/$/, "<home>/.claude/projects/<repo>/memory/");
       return s.replace(uuid, "<uuid>").replace(iso, "<timestamp>");
     }
     if (typeof v === "number" && key && (/^(duration|ttft|time_to_request|first_content_frame)/.test(key) || key.endsWith("_ms"))) return 0;
@@ -198,7 +200,7 @@ async function capture(cli: string, outPath: string): Promise<void> {
   const sdk = await import("@anthropic-ai/claude-agent-sdk") as unknown as { query: SdkQueryFn };
   const repoRoot = path.resolve(import.meta.dirname, "../..");
   const sdkVersion = (JSON.parse(await fs.readFile(path.resolve(import.meta.dirname, "../node_modules/@anthropic-ai/claude-agent-sdk/package.json"), "utf8")) as { version: string }).version;
-  assert.equal(sdkVersion, "0.3.310", "the fixture file name pins SDK 0.3.310; rename it when the SDK is bumped");
+  assert.equal(sdkVersion, "0.3.316", "the fixture file name pins SDK 0.3.316; rename it when the SDK is bumped");
   const scratch = path.join(repoRoot, ".uzi/scratch");
   await fs.mkdir(scratch, { recursive: true });
   const root = await fs.mkdtemp(path.join(scratch, "so-probe-"));
@@ -234,7 +236,7 @@ async function capture(cli: string, outPath: string): Promise<void> {
       ? "auth: the production CLAUDE_CODE_OAUTH_TOKEN placeholder was accepted against the stub"
       : "auth: CLAUDE_CODE_OAUTH_TOKEN removed and ANTHROPIC_API_KEY set to a dummy because the CLI would not use the OAuth placeholder against a custom base URL";
     const fixture = {
-      _provenance: `real frames from @anthropic-ai/claude-agent-sdk ${sdkVersion} / native CLI ${version}, recorded 2026-11-07 by test/claude-structured-output.probe.ts capture; model turns scripted by a loopback Anthropic Messages stub because no Anthropic credential is available in the worker; production buildClaudeCrossCheckOptions (model passed through its own argument; the code session also passes an allow-all recording toolBudgetHook) with probe-local outputFormat (PLAN/CODE_VERDICT_SCHEMA), probe-local abortController with a 60 s timeout, probe-local replacement of only the matcher-less tool gate (allows exactly StructuredOutput, delegates the rest), probe-local init latch opening after a carrier-aware init check, env changed only by ANTHROPIC_BASE_URL (+ auth used) and HOME, pathToClaudeCodeExecutable set; ${authNote}; spawnClaudeCodeProcess left as built; ids/timestamps/paths normalized; repeat with: node --import tsx test/claude-structured-output.probe.ts capture <absolute CLI path>`,
+      _provenance: `real frames from @anthropic-ai/claude-agent-sdk ${sdkVersion} / native CLI ${version}, recorded ${new Date().toISOString().slice(0, 10)} by test/claude-structured-output.probe.ts capture; model turns scripted by a loopback Anthropic Messages stub because no Anthropic credential is available in the worker; production buildClaudeCrossCheckOptions (model passed through its own argument; the code session also passes an allow-all recording toolBudgetHook) with probe-local outputFormat (PLAN/CODE_VERDICT_SCHEMA), probe-local abortController with a 60 s timeout, probe-local replacement of only the matcher-less tool gate (allows exactly StructuredOutput, delegates the rest), probe-local init latch opening after a carrier-aware init check, env changed only by ANTHROPIC_BASE_URL (+ auth used) and HOME, pathToClaudeCodeExecutable set; ${authNote}; spawnClaudeCodeProcess left as built; ids/timestamps/paths normalized; repeat with: node --import tsx test/claude-structured-output.probe.ts capture <absolute CLI path>`,
       sessions,
     };
     const out = JSON.stringify(fixture, null, 2) + "\n";
@@ -326,4 +328,4 @@ const [mode, cli, out] = process.argv.slice(2);
 if (mode !== "capture" && mode !== "verify") throw new Error("usage: claude-structured-output.probe.ts capture|verify <absolute CLI path> [out path]");
 if (!cli || !path.isAbsolute(cli)) throw new Error("an explicit absolute native CLI path is required");
 if (mode === "verify") await verify(cli);
-else await capture(cli, out ? path.resolve(out) : path.resolve(import.meta.dirname, "fixtures/claude-structured-output-0.3.310.json"));
+else await capture(cli, out ? path.resolve(out) : path.resolve(import.meta.dirname, "fixtures/claude-structured-output-0.3.316.json"));

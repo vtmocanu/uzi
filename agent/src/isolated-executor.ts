@@ -91,7 +91,7 @@ const PINNED_BUILTIN_AGENTS: ReadonlySet<string> = new Set(["claude", "general-p
 const PINNED_BUILTIN_SKILLS: ReadonlySet<string> = new Set(["doctor"]);
 
 /** The SDK's end-turn tool for `outputFormat: {type: "json_schema"}`, recorded in
- *  test/fixtures/claude-structured-output-0.3.310.json (init tools and assistant tool_use name). */
+ *  test/fixtures/claude-structured-output-0.3.316.json (init tools and assistant tool_use name). */
 export const STRUCTURED_OUTPUT_CARRIER = "StructuredOutput" as const;
 
 /**
