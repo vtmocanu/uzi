@@ -328,6 +328,8 @@ func (s *Service) setCredentialAndPromote(ctx context.Context, observed store.Ru
 			}
 			return fmt.Errorf("lock run for credential switch: %w", err)
 		}
+		// anthropic_spend_limit is deliberately NOT refused here: switching to another token is
+		// one of the owner's three ways out of that hold, and PromoteRecoveryWaitRunNow admits it.
 		if locked.Status == "recovery_wait" && locked.RecoveryWaitCause.String == recoveryCauseDataVolumeFull && !locked.RecoveryRetryNotBefore.Valid {
 			return ErrDataVolumeFullHeld
 		}

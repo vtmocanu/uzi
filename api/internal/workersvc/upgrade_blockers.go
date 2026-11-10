@@ -126,6 +126,8 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 				return fmt.Sprintf("automatic retry not before %s; recorded cause %s; owner may inspect or Resume", blockerTime(r.RecoveryRetryNotBefore), cause)
 			}
 			return fmt.Sprintf("recorded cause %s; owner reviews retained recovery and chooses Resume; no timer", cause)
+		case recoveryCauseAnthropicSpendLimit:
+			return fmt.Sprintf("recorded cause %s; Anthropic API spend limit reached; owner action: raise the limit and Resume, set-token, or Cancel; no timer", cause)
 		case "worker_requeue_exhausted", recoveryCauseRetainedRecoveryAdoptionFailed, recoveryCauseRetainedContinuationUnwitnessed:
 			return fmt.Sprintf("recorded cause %s; owner reviews recovery evidence and chooses Resume; no timer", cause)
 		}
