@@ -39,7 +39,7 @@ func TestCIAutofixHaltPublishesSlackPipelineLink(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-	newCF(st, &cfRuns{}, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, &cfRuns{}, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(notifier.calls) != 1 || notifier.calls[0].kind != "ci_autofix_halted" {
 		t.Fatalf("expected one halted notification, got %+v", notifier.calls)
@@ -87,7 +87,7 @@ func TestCIAutofixHaltDropsUnsafePipelineLink(t *testing.T) {
 		notifier := &cfNotifier{}
 		f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-		newCF(cfCappedStore(cand), &cfRuns{}, notifier).detect(context.Background(), cfRepoRow(), f)
+		newCF(cfCappedStore(cand), &cfRuns{}, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 		if len(notifier.calls) != 1 || notifier.calls[0].slack == nil {
 			t.Fatalf("url %q: expected one halted notification with a Slack render, got %+v", bad, notifier.calls)
@@ -106,9 +106,11 @@ func TestCIAutofixHaltSlackOncePerHalt(t *testing.T) {
 	notifier := &cfNotifier{}
 	d := newCF(st, &cfRuns{}, notifier)
 
-	d.detect(context.Background(), cfRepoRow(), &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"})
+	cf := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
+	d.detect(context.Background(), cfRepoRow(), cf, cf)
 	st.candidates = []store.ListCIAutofixCandidateRefsRow{cfCand(9011)}
-	d.detect(context.Background(), cfRepoRow(), &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"})
+	cf2 := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
+	d.detect(context.Background(), cfRepoRow(), cf2, cf2)
 
 	renders := 0
 	for _, c := range notifier.calls {
@@ -132,7 +134,7 @@ func TestMRReworkHaltPublishesSlackRunLink(t *testing.T) {
 	f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
 
 	newMRW(st, &mrwRuns{}, notifier, mrwSettings{enabled: true, capVal: 5, baseURL: "https://uzi.example.com/"}).
-		detect(context.Background(), mrwRepoRow(), f)
+		detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(notifier.calls) != 1 || notifier.calls[0].kind != "mr_rework_halted" {
 		t.Fatalf("expected one halted notification, got %+v", notifier.calls)
@@ -168,7 +170,7 @@ func TestMRReworkHaltSlackNoBaseNoLink(t *testing.T) {
 		notifier := &mrwNotifier{}
 		f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
 
-		newMRW(st, &mrwRuns{}, notifier, set).detect(context.Background(), mrwRepoRow(), f)
+		newMRW(st, &mrwRuns{}, notifier, set).detect(context.Background(), mrwRepoRow(), f, f)
 
 		if len(notifier.calls) != 1 || notifier.calls[0].slack == nil {
 			t.Fatalf("%s: expected one halted notification with a Slack render, got %+v", name, notifier.calls)

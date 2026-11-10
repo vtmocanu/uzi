@@ -35,7 +35,7 @@ func TestMRReworkEvictedPendingIDIsRemovedAndNextTickDoesNoAssessment(t *testing
 	f := landedForge(comments...)
 	d := newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5})
 
-	d.detect(context.Background(), mrwRepoRow(), f)
+	d.detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("tick 1 created %d runs; nothing in the capped snapshot is new", len(runs.calls))
@@ -51,7 +51,7 @@ func TestMRReworkEvictedPendingIDIsRemovedAndNextTickDoesNoAssessment(t *testing
 		t.Fatal("tick 1 should have assessed the pending id's author")
 	}
 
-	d.detect(context.Background(), mrwRepoRow(), f)
+	d.detect(context.Background(), mrwRepoRow(), f, f)
 	if n := len(f.lookups); n != lookupsAfterTick1 {
 		t.Fatalf("tick 2 made %d more lookups; the removed id must not be assessed again", n-lookupsAfterTick1)
 	}

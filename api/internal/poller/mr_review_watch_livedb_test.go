@@ -121,7 +121,7 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 				}
 			}
 			candidates(1)
-			watch.detect(ctx, row, f)
+			watch.detect(ctx, row, f, f)
 			before := ledger(1, 120)
 			if runs.starts != 1 {
 				t.Fatalf("first note: starts=%d", runs.starts)
@@ -135,7 +135,7 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 				exec("UPDATE users SET mr_rework_enabled=false WHERE id=$1", owner)
 			}
 			candidates(0)
-			watch.detect(ctx, row, f)
+			watch.detect(ctx, row, f, f)
 			after := ledger(1, 120)
 			if !reflect.DeepEqual(after, before) {
 				t.Fatalf("ineligible tick changed ledger: before=%+v after=%+v", before, after)
@@ -152,7 +152,7 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 				exec("UPDATE users SET mr_rework_enabled=true WHERE id=$1", owner)
 			}
 			candidates(1)
-			watch.detect(ctx, row, f)
+			watch.detect(ctx, row, f, f)
 			ledger(1, 120)
 			if runs.starts != 1 || runs.attempts != 1 {
 				t.Fatalf("same consumed note duplicated: starts=%d attempts=%d, want 1 and 1 (no new create attempt)", runs.starts, runs.attempts)
@@ -160,7 +160,7 @@ func TestMRReworkEligibilityRoundTripLiveDB(t *testing.T) {
 			// The first rework run finishes before the next cycle (one active rework per MR).
 			exec("UPDATE runs SET status='completed' WHERE kind='mr_rework' AND target_run_id=$1", source)
 			f.comments = append(f.comments, mrwComment(121, time.Date(2020, 1, 2, 0, 0, 0, 0, time.UTC), mrwHeadSHA))
-			watch.detect(ctx, row, f)
+			watch.detect(ctx, row, f, f)
 			ledger(2, 121)
 			if runs.starts != 2 {
 				t.Fatalf("higher-ID positive control: starts=%d", runs.starts)

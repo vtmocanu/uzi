@@ -81,7 +81,7 @@ func NewAutopilot(q autopilotStore, runs RunStarter, set SettingsReader) *Autopi
 // Every per-issue failure is log-and-skipped (the poller convention): a forge blip
 // or a DB error on one issue must not stall the tick or the other issues, and an
 // unrecorded event id simply re-evaluates the issue next tick.
-func (a *Autopilot) detect(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge) {
+func (a *Autopilot) detect(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, ch forge.CodeHost, tr forge.IssueTracker) {
 	label := a.autopilotLabel(ctx)
 
 	// The repo's owner is the only user who can satisfy the "repo connected by that
@@ -128,16 +128,16 @@ func (a *Autopilot) detect(ctx context.Context, r store.ListEnabledReposWithConn
 		if ctx.Err() != nil {
 			return
 		}
-		a.detectOne(ctx, r, f, label, cc, iss)
+		a.detectOne(ctx, r, ch, tr, label, cc, iss)
 	}
 }
 
 // detectOne resolves the current autopilot-label application for one issue and, if
 // it is a not-yet-handled transition, hands it to handle.
-func (a *Autopilot) detectOne(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge, label string, cc store.GetAutopilotConnectionContextRow, iss store.ListAutopilotCandidateIssuesRow) {
+func (a *Autopilot) detectOne(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, ch forge.CodeHost, tr forge.IssueTracker, label string, cc store.GetAutopilotConnectionContextRow, iss store.ListAutopilotCandidateIssuesRow) {
 	iid := iss.ForgeIssueIid
 
-	events, err := f.ListIssueLabelEvents(ctx, r.ForgeProjectID, iid)
+	events, err := tr.ListIssueLabelEvents(ctx, r.ForgeProjectID, iid)
 	if err != nil {
 		// Already PAT-redacted by the driver. Leave the issue for the next tick.
 		slog.Warn("poller: autopilot label events", "repo", r.PathWithNamespace, "issue", iid, "error", err)
@@ -165,14 +165,14 @@ func (a *Autopilot) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 		return
 	}
 
-	a.handle(ctx, r, f, label, cc, iss, add.ID, add.Username)
+	a.handle(ctx, r, ch, tr, label, cc, iss, add.ID, add.Username)
 }
 
 // handle decides the outcome for a fresh label application: swallow (active run),
 // start a run (eligible), or record-then-comment (not eligible / no PRD link / too
 // large). eventID is the current application's label-event id; adder is who added
 // the label.
-func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge, label string, cc store.GetAutopilotConnectionContextRow, iss store.ListAutopilotCandidateIssuesRow, eventID int64, adder string) {
+func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, ch forge.CodeHost, tr forge.IssueTracker, label string, cc store.GetAutopilotConnectionContextRow, iss store.ListAutopilotCandidateIssuesRow, eventID int64, adder string) {
 	iid := iss.ForgeIssueIid
 
 	// Decision 5: a (re-)application while a run is active is swallowed — no comment,
@@ -198,7 +198,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		author = iss.Author.String
 	}
 	if !consentingOwner(cc, adder, author) {
-		a.recordThenComment(ctx, r, f, iid, eventID, noEligibleUserComment(label))
+		a.recordThenComment(ctx, r, tr, iid, eventID, noEligibleUserComment(label))
 		return
 	}
 
@@ -206,10 +206,10 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 	// issue eligibility and one-active-run gates all enforced there), only
 	// with auto_approve set. The description is the fresh forge copy, snapshotted onto
 	// the run exactly as the manual start path snapshots the description it is given.
-	capture, err := issueinput.Fetch(ctx, f, f, r.ForgeProjectID, iid, cc.BotForgeUserID)
+	capture, err := issueinput.Fetch(ctx, ch, tr, r.ForgeProjectID, iid, cc.BotForgeUserID)
 	if err != nil {
 		if forge.IsIssueResponseTooLarge(err) {
-			a.recordThenComment(ctx, r, f, iid, eventID, tooLargeComment())
+			a.recordThenComment(ctx, r, tr, iid, eventID, tooLargeComment())
 			return
 		}
 		// Transient forge error: leave the event unrecorded so the next tick retries.
@@ -222,7 +222,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		if selection.LabelSelected {
 			_, err = a.runs.ResolveHarnessForUser(ctx, cc.UserID, selection.Explicit)
 		} else if !cc.HasAnthropicToken {
-			a.recordThenComment(ctx, r, f, iid, eventID, noEligibleUserComment(label))
+			a.recordThenComment(ctx, r, tr, iid, eventID, noEligibleUserComment(label))
 			return
 		}
 	}
@@ -241,7 +241,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 	case errors.Is(err, workersvc.ErrDescriptionTooLarge):
 		// The shared createRun cap (unified in M5): the description is too large to
 		// snapshot onto an unattended run — explain it instead of running.
-		a.recordThenComment(ctx, r, f, iid, eventID, tooLargeComment())
+		a.recordThenComment(ctx, r, tr, iid, eventID, tooLargeComment())
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		// A run appeared between the pre-check and here: swallow, same as an active run.
 		_ = a.record(ctx, r, iid, eventID)
@@ -303,11 +303,11 @@ func (a *Autopilot) record(ctx context.Context, r store.ListEnabledReposWithConn
 // comment (Decision 6): a crash between the two loses one comment rather than ever
 // double-posting on a later tick. If the dedup record does not persist, no comment
 // is posted (a comment without its record could double-post next tick).
-func (a *Autopilot) recordThenComment(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge, iid, eventID int64, body string) {
+func (a *Autopilot) recordThenComment(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, tr forge.IssueTracker, iid, eventID int64, body string) {
 	if a.record(ctx, r, iid, eventID) != nil {
 		return
 	}
-	if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, iid, body); err != nil {
+	if _, err := tr.CreateIssueNote(ctx, r.ForgeProjectID, iid, body); err != nil {
 		// Already PAT-redacted by the driver. The event id is recorded, so this comment
 		// is simply lost (never retried) — the accepted record-then-comment trade.
 		slog.Warn("poller: autopilot comment", "repo", r.PathWithNamespace, "issue", iid, "error", err)

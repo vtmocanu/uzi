@@ -507,7 +507,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// user (or one explanatory issue comment). All per-issue errors are handled
 	// inside; nothing surfaces here.
 	if e.autopilot != nil {
-		e.autopilot.detect(ctx, r, f)
+		e.autopilot.detect(ctx, r, f, f)
 	}
 
 	// CI-autofix detection (PRD #71 M6): also post-sync, a sibling of the autopilot
@@ -518,7 +518,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// MR branch into an automatic ci_fix run (or one halt comment). All per-candidate
 	// errors are handled inside; nothing surfaces here.
 	if e.pipelineMaxRefs > 0 && e.ciAutoFix != nil {
-		e.ciAutoFix.detect(ctx, r, f)
+		e.ciAutoFix.detect(ctx, r, f, f)
 	}
 
 	// MR-review-rework detection (PRD #700 M3): also post-sync, a sibling of the
@@ -530,7 +530,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// being wired (the instance kill-switch); the admin kill-switch + per-user opt-in +
 	// per-MR cap gate activation inside it. All per-candidate errors are handled inside.
 	if e.pipelineMaxRefs > 0 && e.mrReviewWatch != nil {
-		e.mrReviewWatch.detect(ctx, r, f)
+		e.mrReviewWatch.detect(ctx, r, f, f)
 	}
 
 	// Reverse Status→label sync (PRD #364 M6): a genuine per-tick sibling (NOT gated
