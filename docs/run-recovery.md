@@ -1257,8 +1257,9 @@ commit that only the clone holds (on another local branch, under a tag or under
 `refs/remotes/`) or a stash entry makes it not covered. Gitignored files are not covered by any capture, so they do not
 make a clone that is otherwise anchored not covered. Accepted residuals: commits reachable
 only from the reflog (for example after an agent's `git reset --hard`) are not
-counted as source, and a bare ref that justified coverage can later move (a
-forge force-push, pin settlement).
+counted as source, a bare ref that justified coverage can later move (a
+forge force-push, pin settlement), and refs inside an unreadable refs directory are
+silently omitted by Git, so the stderr rule below does not detect them.
 
 Coverage is also refused (`not_covered`) in these cases, which matter where coverage
 still gates release (terminal exits, below); on parks it is diagnostic:
@@ -1268,6 +1269,21 @@ still gates release (terminal exits, below); on parks it is diagnostic:
   `ignore=all` set in `.gitmodules` or config. The status read runs with
   `--ignore-submodules=none`, and the parent proof says nothing about a
   submodule's own files, commits or refs.
+- **Git reported a problem.** In the legacy (non-automatic) proof, any nonempty stderr
+  from the hardened `git status --porcelain` read or from the `for-each-ref` read of the
+  clone's local refs is `not_covered`. Git exits 0 with empty stdout and only warns when it
+  cannot read part of the worktree (`warning: could not open directory 'x/': Permission
+  denied`) or a loose ref (`warning: ignoring broken ref`), so an empty status is not proof of
+  a clean tree. On a terminal `record: "none"` exit the clone, its keep flag and the plain
+  journal remain, with no stopped marker. No warning text is matched and there is no
+  allowlist, so benign warnings retain conservatively: `core.fsyncObjectFiles=true` in the
+  clone's config (a deprecation warning) or a CRLF-conversion warning makes a clean clone
+  `not_covered` and kept; no `core.safecrlf` override is added. The status read pins
+  `core.attributesFile=/dev/null` beside `core.excludesFile=/dev/null`, because runner-uid Git
+  inherits the worker's HOME and an unreadable `~/.config/git/attributes` would otherwise warn
+  on every clean tree. Residual: Git silently omits refs inside an unreadable refs
+  directory (no stderr), so that case is not detected. The automatic mode, exit captures and
+  custody are unchanged ([#4141](https://github.com/vtmocanu/uzi/issues/4141)).
 - **Late writer.** If the final process proof had to kill a writer, the earlier
   byte checks do not cover what it wrote. The residual is a writer that writes and
   exits between the status read and that proof. Stopped and park exits keep the
