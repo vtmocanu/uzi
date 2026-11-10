@@ -337,16 +337,36 @@ interface TrackedHelper { child: ChildProcess; args: readonly string[]; exited: 
  * Spies on child_process.spawn and controls performance.now so a loaded host cannot spend the deadline window before the
  * helper under test exists. Before the first non-"--version" helper launches the clock reads 0, so the operation's deadline is
  * exactly timeoutMs; the launch releases it to timeoutMs plus real time elapsed since, so the product's own timers still fire
- * unchanged. The cases using it claim: a helper was launched, was killed at the deadline, had exited before the rejection, and
- * was classified as expected. They do not distinguish close- from exit-ordering (handle.close()/done() leave close time to fire)
- * and do not pin deadline arithmetic against early-firing timers. Install after any setup acquisition the case does not test.
+ * unchanged; timeoutMs must therefore equal the operation's own timeoutMs. It also wraps the close() of each `lockName` descriptor
+ * opened after install (FileHandle.close is an own instance method) and snapshots the first helper at the entry of the first
+ * such close. From the helper settling to that entry the product runs only microtasks, so the child's exit/close events cannot
+ * slip in between: the snapshot shows whether the helper was joined before the descriptor it was handed was closed, which is
+ * before the caller sees the rejection. The cases do not pin deadline arithmetic against early-firing timers. Install after any
+ * setup acquisition the case does not test.
  */
-function trackHelpers(t: Parameters<typeof makeTmp>[0], timeoutMs: number): { helpers: TrackedHelper[]; all: TrackedHelper[] } {
+function trackHelpers(t: Parameters<typeof makeTmp>[0], timeoutMs: number, lockName: string): {
+  helpers: TrackedHelper[]; closes: { count: number; snapshot?: ReturnType<typeof lifecycle> };
+} {
   const realSpawn = childProcess.spawn;
+  const realOpen = fsp.open;
   const realNow = performance.now.bind(performance);
   const all: TrackedHelper[] = [];
   const helpers: TrackedHelper[] = [];
+  const closes: { count: number; snapshot?: ReturnType<typeof lifecycle> } = { count: 0 };
   let launchedAt: number | undefined;
+  const openMock = mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+    const handle = await realOpen(...args);
+    const file = String(args[0]);
+    if (file.startsWith("/proc/self/fd/") && path.basename(file) === lockName) {
+      const close = handle.close.bind(handle);
+      t.mock.method(handle, "close", async () => {
+        closes.count++;
+        closes.snapshot ??= lifecycle(helpers[0], helpers.length);
+        return close();
+      });
+    }
+    return handle;
+  });
   const spawnMock = mock.method(childProcess, "spawn", (command: string, args: string[], options: childProcess.SpawnOptions) => {
     const child = realSpawn(command, args, options);
     const entry: TrackedHelper = { child, args, exited: false, closed: false };
@@ -364,10 +384,18 @@ function trackHelpers(t: Parameters<typeof makeTmp>[0], timeoutMs: number): { he
   t.after(() => {
     spawnMock.mock.restore();
     nowMock.mock.restore();
+    openMock.mock.restore();
     syncBuiltinESMExports();
     for (const { child } of all) { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
   });
-  return { helpers, all };
+  return { helpers, closes };
+}
+
+/** The helper was killed, reaped and closed before the descriptor it was handed was closed, which happened exactly once. */
+function assertJoinedBeforeClose(closes: { count: number; snapshot?: ReturnType<typeof lifecycle> }): void {
+  assert.equal(closes.count, 1, "the lock descriptor was closed exactly once");
+  assert.deepEqual(closes.snapshot, { count: 1, alive: false, exited: true, closed: true, signalCode: "SIGKILL" },
+    "the helper was joined before its lock descriptor was closed");
 }
 
 function lifecycle(helper: TrackedHelper | undefined, count: number) {
@@ -379,7 +407,7 @@ function lifecycle(helper: TrackedHelper | undefined, count: number) {
 
 test("the real flock helper is SIGKILLed and joined at its deadline", { timeout: 30_000 }, async (t) => {
   const { script } = fakeFlock(t);
-  const { helpers } = trackHelpers(t, 300);
+  const { helpers, closes } = trackHelpers(t, 300, "worker.lock");
   let snapshot: ReturnType<typeof lifecycle> | undefined;
   await acquireWorkerLifetime(makeTmp(t), { supportedFs: async () => true, flockPath: script, timeoutMs: 300 })
     .then(() => assert.fail("acquisition resolved"), (error: unknown) => {
@@ -391,6 +419,7 @@ test("the real flock helper is SIGKILLed and joined at its deadline", { timeout:
   assert.equal(snapshot?.exited, true, "the helper's exit was observed before rejection");
   assert.equal(snapshot?.closed, true, "the helper's close was observed before rejection");
   assert.equal(snapshot?.signalCode, "SIGKILL");
+  assertJoinedBeforeClose(closes);
 });
 
 test("A: a flock helper still unanswered when A's deadline runs out is AuthorityLockBusy, joined before rejection", { timeout: 30_000 }, async (t) => {
@@ -404,7 +433,7 @@ if [ ! -e '${wDone}' ]; then : > '${wDone}'; exit 0; fi
 exec sleep 300
 `, { mode: 0o755 });
   const lifetime = await acquireWorkerLifetime(makeTmp(t), { supportedFs: async () => true, flockPath: script });
-  const { helpers } = trackHelpers(t, 300);
+  const { helpers, closes } = trackHelpers(t, 300, "authority.lock");
   let ran = false;
   let snapshot: (ReturnType<typeof lifecycle> & { error: unknown }) | undefined;
   await withAuthorityTransaction(lifetime, { timeoutMs: 300 }, async () => { ran = true; })
@@ -418,6 +447,7 @@ exec sleep 300
   assert.equal(snapshot?.exited, true, "the helper's exit was observed before rejection");
   assert.equal(snapshot?.closed, true, "the helper's close was observed before rejection");
   assert.equal(snapshot?.signalCode, "SIGKILL");
+  assertJoinedBeforeClose(closes);
 });
 
 test("A: another process holding the authority lock blocks until a finite deadline, then releases", async (t) => {
