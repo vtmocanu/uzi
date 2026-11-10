@@ -3955,7 +3955,7 @@ export class GitCache {
     const seam = input.testSeam;
     const scope = input.scope;
     let root: string;
-    let wrapped: ReturnType<typeof runnerCommand>;
+    let wrapped: { command: string; args: string[] };
     const env = { PATH: "/usr/bin:/bin" };
     // Everything before the `unsettledDeletes` entry: no child, ticket or unsettled entry exists yet, so an
     // error thrown here is tagged `epochScratchNotLaunched` and is not an unresolved delete. The
