@@ -177,6 +177,7 @@ export interface ScratchMountInput {
   leafNames: readonly string[];
 }
 
+const SHARED_DAEMON_VIEW = "/data/runner";
 const within = (parent: string, child: string): boolean => child === parent || (parent === "/" ? child.startsWith("/") : child.startsWith(parent + "/"));
 
 /** Plan 1b vi rules 1 to 4 as a pure function. Rule 5 (re-reading before each delete) is the caller
@@ -323,15 +324,18 @@ type LstatLike = { isDirectory(): boolean; isSymbolicLink(): boolean };
 
 /** Classifies the daemon's bind sources against the root. Normal form is absolute, `normalize`d and
  * without a trailing slash. A source at the root or above it refuses the phase (`bind_ancestor`); one
- * inside a leaf keeps that leaf (`bind_referenced`); a source with a symlink component at or under the
- * root, or one outside it that resolves to or across the root, or whose first component under the root
- * is a file or missing, is `bind_unknown`. Sources elsewhere are unrelated. */
+ * inside a leaf keeps that leaf (`bind_referenced`). `bind_unknown` (a phase refusal): a source outside
+ * /data/runner (the daemon resolves it in a filesystem the worker cannot see), a symlink component at
+ * or below /data/runner, or a first component under the root that is a file or missing. Other sources
+ * inside /data/runner but outside the root are unrelated. */
 export function classifyBindSources(input: {
   sources: readonly string[]; root: string;
   lstat?: (p: string) => LstatLike | undefined;
-  realpath?: (p: string) => string;
+  /** The only path the worker and the daemon see alike (the runner-shared subPath both mount at
+   * /data/runner). Test seam; defaults to that literal. */
+  shared?: string;
 }): { refused: "bind_unknown" | "bind_ancestor" } | { referenced: Set<string> } {
-  const realpath = input.realpath ?? ((p: string) => fs.realpathSync(p));
+  const shared = input.shared ?? SHARED_DAEMON_VIEW;
   const lstat = input.lstat ?? ((p: string) => {
     try { return fs.lstatSync(p); } catch (e) { if (vanished(e)) return undefined; throw e; }
   });
@@ -340,28 +344,26 @@ export function classifyBindSources(input: {
   for (const source of input.sources) {
     if (!path.posix.isAbsolute(source) || path.posix.normalize(source) !== source || (source.length > 1 && source.endsWith("/")))
       return { refused: "bind_unknown" };
-    // Every component, inside or outside the root, must not be a symlink: one would let the source
-    // resolve into a leaf its literal path does not name. A missing component ends the walk (nothing
-    // below it can be a symlink); the literal path then decides.
-    let prefix = "";
-    for (const part of source.split("/").filter(Boolean)) {
+    if (within(source, input.root)) { ancestor = true; continue; }
+    // Docker resolves a bind source in the daemon's own filesystem. Outside the shared subPath that is
+    // the dind rootfs, which the worker cannot see (a symlink there could name any leaf): unknown.
+    if (!within(shared, source)) return { refused: "bind_unknown" };
+    // Inside the shared tree both views agree: no component at or below it may be a symlink, since
+    // one would let the source resolve into a leaf its literal path does not name. A missing
+    // component ends the walk (nothing below it exists); the literal path then decides.
+    let prefix = shared;
+    let st: LstatLike | undefined;
+    try { st = lstat(prefix); } catch { return { refused: "bind_unknown" }; }
+    if (!st || st.isSymbolicLink() || !st.isDirectory()) return { refused: "bind_unknown" };
+    for (const part of source.slice(shared.length).split("/").filter(Boolean)) {
       prefix += "/" + part;
       let component: LstatLike | undefined;
       try { component = lstat(prefix); } catch { return { refused: "bind_unknown" }; }
       if (!component) break;
-      if (component.isSymbolicLink()) {
-        // Inside the root it is never acceptable. Outside, it only matters when it resolves to or
-        // across the root (an ordinary /var/run -> /run does not).
-        if (within(input.root, prefix)) return { refused: "bind_unknown" };
-        let real: string;
-        try { real = realpath(prefix); } catch { return { refused: "bind_unknown" }; }
-        if (within(input.root, real) || within(real, input.root)) return { refused: "bind_unknown" };
-      }
+      if (component.isSymbolicLink()) return { refused: "bind_unknown" };
     }
-    if (within(source, input.root)) { ancestor = true; continue; }
     if (!source.startsWith(input.root + "/")) continue;
     const leaf = source.slice(input.root.length + 1).split("/")[0]!;
-    let st: LstatLike | undefined;
     try { st = lstat(path.posix.join(input.root, leaf)); } catch { return { refused: "bind_unknown" }; }
     if (!st || st.isSymbolicLink() || !st.isDirectory()) return { refused: "bind_unknown" };
     referenced.add(leaf);

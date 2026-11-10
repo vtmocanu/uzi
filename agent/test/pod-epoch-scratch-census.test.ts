@@ -166,6 +166,19 @@ test("top-level names that are not valid UTF-8 are reported distinctly and refus
   assert.deepEqual(classified.admitted.map(l => l.name), ["good"]);
 });
 
+test("a leading U+FEFF is kept: the name is never reported as another name", async t => {
+  const root = tmp(t);
+  fs.mkdirSync(path.join(root, "﻿abc"));
+  fs.mkdirSync(path.join(root, "abc"));
+  const { result, parsed } = await census(root);
+  assert.equal(result.code, 0);
+  assert.ok(!("refused" in parsed), JSON.stringify(parsed));
+  const classified = classifyScratchCensus({ census: parsed, t0Ms: Infinity, mountedLeaves: new Set(), boundLeaves: new Set(),
+    protectedLeaves: new Set(), heldLeaves: new Set() });
+  assert.equal(classified.kept.name_refused, 1);
+  assert.deepEqual(classified.admitted.map(l => l.name), ["abc"]);
+});
+
 test("a single-leaf lstat error other than ENOENT is unreadable, not another inode", async t => {
   const root = tmp(t);
   const { parsed } = await census(root, undefined, "a".repeat(300));

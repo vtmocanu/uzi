@@ -375,29 +375,34 @@ test("classifyBindSources classifies ancestors, leaf references and unrelated so
   const root = tmp(t);
   fs.mkdirSync(path.join(root, "alpha"));
   const dirSt = { isDirectory: () => true, isSymbolicLink: () => false };
-  const run = (sources: string[], lstat = (p: string) => (fs.existsSync(p) ? fs.lstatSync(p) : undefined)) => classifyBindSources({ sources, root, lstat });
+  const shared = path.dirname(root);
+  const run = (sources: string[], lstat = (p: string) => (fs.existsSync(p) ? fs.lstatSync(p) : undefined)) => classifyBindSources({ sources, root, lstat, shared });
   assert.deepEqual(run([]), { referenced: new Set() });
-  assert.deepEqual(run(["/elsewhere", "/var/run/docker.sock", root + "-sibling/x"]), { referenced: new Set() });
+  assert.deepEqual(run([root + "-sibling/x"]), { referenced: new Set() });
+  // Outside the shared subPath the daemon resolves the source in a filesystem the worker cannot see.
+  for (const outside of ["/elsewhere", "/var/run/docker.sock", "/tmp/l"]) assert.deepEqual(run([outside]), { refused: "bind_unknown" }, outside);
   assert.deepEqual(run([path.join(root, "alpha"), path.join(root, "alpha", "sub", "deep")]), { referenced: new Set(["alpha"]) });
   for (const ancestor of [root, path.dirname(root), "/"]) assert.deepEqual(run([ancestor]), { refused: "bind_ancestor" }, ancestor);
-  assert.deepEqual(run(["/elsewhere", root]), { refused: "bind_ancestor" });
+  assert.deepEqual(run([root + "-sibling", root]), { refused: "bind_ancestor" });
   // The first component under the root must be a real directory.
   assert.deepEqual(run([path.join(root, "ghost", "x")]), { refused: "bind_unknown" });
   fs.writeFileSync(path.join(root, "file"), "");
   fs.symlinkSync(path.join(root, "alpha"), path.join(root, "link"));
   assert.deepEqual(run([path.join(root, "file")]), { refused: "bind_unknown" });
   assert.deepEqual(run([path.join(root, "link", "x")]), { refused: "bind_unknown" });
-  assert.deepEqual(classifyBindSources({ sources: [root + "/alpha"], root, lstat: () => { throw new Error("EIO"); } }), { refused: "bind_unknown" });
-  assert.deepEqual(classifyBindSources({ sources: [root + "/alpha"], root, lstat: () => dirSt }), { referenced: new Set(["alpha"]) });
+  assert.deepEqual(classifyBindSources({ sources: [root + "/alpha"], root, shared, lstat: () => { throw new Error("EIO"); } }), { refused: "bind_unknown" });
+  assert.deepEqual(classifyBindSources({ sources: [root + "/alpha"], root, shared, lstat: () => dirSt }), { referenced: new Set(["alpha"]) });
+  // The shipped default view is the literal /data/runner: a root outside it refuses every source.
+  assert.deepEqual(classifyBindSources({ sources: ["/srv/scratch/alpha"], root: "/srv/scratch", lstat: () => dirSt }), { refused: "bind_unknown" });
 });
 
-test("a symlink in any component of a bind source, inside or outside the root, is bind_unknown", t => {
+test("a symlink in any component of a bind source under the shared tree is bind_unknown", t => {
   const dir = tmp(t);
   const root = path.join(dir, "root");
   fs.mkdirSync(path.join(root, "A"), { recursive: true });
   fs.mkdirSync(path.join(root, "B"));
   const lstat = (p: string) => fs.lstatSync(p, { throwIfNoEntry: false });
-  const run = (sources: string[]) => classifyBindSources({ sources, root, lstat });
+  const run = (sources: string[]) => classifyBindSources({ sources, root, lstat, shared: dir });
   // (a) R/A/link -> ../B: only A is named, B is the real target.
   fs.symlinkSync("../B", path.join(root, "A", "link"));
   assert.deepEqual(run([path.join(root, "A", "link", "x")]), { refused: "bind_unknown" });
@@ -405,10 +410,10 @@ test("a symlink in any component of a bind source, inside or outside the root, i
   fs.symlinkSync(path.join(root, "B"), path.join(dir, "outside"));
   assert.deepEqual(run([path.join(dir, "outside", "x")]), { refused: "bind_unknown" });
   assert.deepEqual(run([path.join(dir, "outside")]), { refused: "bind_unknown" });
-  // An outside symlink that resolves elsewhere (like /var/run -> /run) is unrelated.
+  // Any symlink below the shared tree refuses, even one resolving away from the root.
   fs.mkdirSync(path.join(dir, "elsewhere"));
   fs.symlinkSync(path.join(dir, "elsewhere"), path.join(dir, "harmless"));
-  assert.deepEqual(run([path.join(dir, "harmless", "sock")]), { referenced: new Set() });
+  assert.deepEqual(run([path.join(dir, "harmless", "sock")]), { refused: "bind_unknown" });
   // A missing tail below a real leaf is classified by its literal path; a missing outside path is unrelated.
   assert.deepEqual(run([path.join(root, "A", "not", "there")]), { referenced: new Set(["A"]) });
   assert.deepEqual(run([path.join(dir, "nowhere", "x")]), { referenced: new Set() });

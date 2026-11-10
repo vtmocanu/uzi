@@ -1851,7 +1851,8 @@ const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
 // Entry names are bytes: every path below is a Buffer, so a name that is not valid UTF-8 is examined
 // as itself and never aliases another name through U+FFFD replacement.
 const atb = (fd, nameBuf) => Buffer.concat([Buffer.from(FD + fd + "/"), nameBuf]);
-const strict = new TextDecoder("utf-8", { fatal: true });
+// ignoreBOM keeps a leading U+FEFF, so a name is never reported as a different name.
+const strict = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 let rootPin;
 try {
   rootPin = fs.openSync("/", PIN);
