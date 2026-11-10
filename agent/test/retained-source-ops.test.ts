@@ -894,12 +894,13 @@ describe("verifyStoppedSourceCovered", () => {
           opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => Promise<string> };
         const original = reader.runGitAsRunner.bind(git);
         let reached = 0;
+        const fallbackError = "status read fallback diagnostic \u001b[31m" + "private".repeat(80);
         t.mock.method(reader, "runGitAsRunner", async (cwd: string | undefined, args: string[],
           opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => {
           if (args.includes("status")) {
             reached++;
             if (capturedStderr) opts?.onStderr?.(capturedStderr);
-            throw new Error("status read fallback diagnostic");
+            throw new Error(fallbackError);
           }
           return original(cwd, args, opts);
         });
@@ -914,6 +915,9 @@ describe("verifyStoppedSourceCovered", () => {
           assert.ok(!(warn.stderr ?? "").includes("\u001b"), "stderr is sanitized");
         } else {
           assert.match(warn.error ?? "", /status read fallback diagnostic/);
+          assert.ok((warn.error ?? "").length <= 259, "sanitizeForLog adds a three-character truncation marker");
+          assert.ok((warn.error ?? "").endsWith("..."), "the long fallback is truncated");
+          assert.ok(!(warn.error ?? "").includes("\u001b"), "fallback error is sanitized");
         }
       });
     }
