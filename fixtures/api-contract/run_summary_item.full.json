@@ -13,7 +13,13 @@
     "phase": "x",
     "correlation_id": "x",
     "published": true,
-    "captured_head": "x"
+    "captured_head": "x",
+    "hold_cause": "x",
+    "resume_modes": [
+      "x"
+    ],
+    "recovery_required": true,
+    "recovery_verified_this_claim": true
   },
   "worker_recovery": {
     "episode": 1,

@@ -4,11 +4,17 @@ package main
 // (PRD #1009 M4).
 
 import (
+	"bufio"
 	"fmt"
+	"io"
+	"os"
+	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -55,9 +61,16 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 			"token pool was empty when it claimed (PRD #754). It flips the hold straight to `queued` " +
 			"instead of waiting up to a sweeper tick for the reactive pass to notice a token was pooled.\n\n" +
 			"A run that is NOT held is a 409 (exit 5); a foreign or unknown run is a 404 (exit 4). No " +
-			"token is spent and nothing is written to the forge — it only releases the hold.",
+			"token is spent and nothing is written to the forge — it only releases the hold.\n\n" +
+			"For a Codex policy hold pass --policy-mode (preserve | fresh_from_saved_work | fresh_one_claim) " +
+			"and --episode <policy_hold.outcome_id from `uzi run get`>, optionally --guidance TEXT or " +
+			"--guidance-file PATH (at most 16000 bytes). The mode's consequence is shown and you confirm " +
+			"(or pass --yes; required without a terminal).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if policyFlagsUsed(cmd) {
+				return runPolicyResume(env, gf, cmd, args[0])
+			}
 			c, err := env.client(gf)
 			if err != nil {
 				return err
@@ -73,7 +86,115 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 			return renderRunDetail(p, run)
 		},
 	}
+	resumeNow.Flags().String("policy-mode", "", "resume a Codex policy hold: "+strings.Join(apitypes.PolicyResumeModes, " | "))
+	resumeNow.Flags().String("episode", "", "the hold's policy_hold.outcome_id (a UUID, see `uzi run get`); required with --policy-mode")
+	resumeNow.Flags().String("guidance", "", "guidance for the resumed run (policy hold only; at most 16000 bytes)")
+	resumeNow.Flags().String("guidance-file", "", "read the guidance from this file (policy hold only; exclusive with --guidance)")
+	resumeNow.Flags().BoolP("yes", "y", false, "skip the interactive confirmation (required for a non-interactive policy resume)")
 	return resumeNow
+}
+
+// maxPolicyGuidanceBytes is the server's limit on resume guidance (UTF-8 bytes).
+const maxPolicyGuidanceBytes = 16000
+
+var policyEpisodeRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// policyFlagsUsed reports whether any policy-hold flag was passed, so that an otherwise
+// bare `resume-now` stays on the unchanged body-less path.
+func policyFlagsUsed(cmd *cobra.Command) bool {
+	for _, name := range []string{"policy-mode", "episode", "guidance", "guidance-file", "yes"} {
+		if cmd.Flags().Changed(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// policyResumeGuidance resolves --guidance / --guidance-file and enforces the wire limits.
+func policyResumeGuidance(cmd *cobra.Command) (string, error) {
+	guidance, _ := cmd.Flags().GetString("guidance")
+	file, _ := cmd.Flags().GetString("guidance-file")
+	if cmd.Flags().Changed("guidance") && cmd.Flags().Changed("guidance-file") {
+		return "", uzicli.Exitf(uzicli.ExitUsage, "--guidance and --guidance-file are mutually exclusive; pass one")
+	}
+	if cmd.Flags().Changed("guidance-file") {
+		b, err := os.ReadFile(file) //nolint:gosec // G304: the operator's own --guidance-file argument to their local CLI.
+		if err != nil {
+			return "", uzicli.Exitf(uzicli.ExitUsage, "reading --guidance-file: %v", err)
+		}
+		guidance = string(b)
+	}
+	if len(guidance) > maxPolicyGuidanceBytes {
+		return "", uzicli.Exitf(uzicli.ExitUsage, "guidance is %d bytes; the limit is %d bytes", len(guidance), maxPolicyGuidanceBytes)
+	}
+	if strings.ContainsRune(guidance, 0) {
+		return "", uzicli.Exitf(uzicli.ExitUsage, "guidance must not contain a NUL byte")
+	}
+	if !utf8.ValidString(guidance) {
+		return "", uzicli.Exitf(uzicli.ExitUsage, "guidance must be valid UTF-8")
+	}
+	return guidance, nil
+}
+
+// runPolicyResume is `uzi run resume-now <id> --policy-mode ...` (issue #3607): it validates
+// every flag client-side, shows the chosen mode's consequence, confirms, then posts the body.
+func runPolicyResume(env Env, gf *globalFlags, cmd *cobra.Command, runID string) error {
+	mode, _ := cmd.Flags().GetString("policy-mode")
+	episode, _ := cmd.Flags().GetString("episode")
+	yes, _ := cmd.Flags().GetBool("yes")
+	if !cmd.Flags().Changed("policy-mode") {
+		return uzicli.Exitf(uzicli.ExitUsage, "--episode, --guidance, --guidance-file and --yes apply only with --policy-mode")
+	}
+	if apitypes.PolicyResumeModeLabel(mode) == "" {
+		return uzicli.Exitf(uzicli.ExitUsage, "unknown --policy-mode %q; valid modes: %s",
+			sanitizeTTY(mode), strings.Join(apitypes.PolicyResumeModes, ", "))
+	}
+	if episode == "" {
+		return uzicli.Exitf(uzicli.ExitUsage, "--episode is required with --policy-mode (the hold's policy_hold.outcome_id)")
+	}
+	if !policyEpisodeRE.MatchString(episode) {
+		return uzicli.Exitf(uzicli.ExitUsage, "--episode must be a UUID (the hold's policy_hold.outcome_id)")
+	}
+	guidance, err := policyResumeGuidance(cmd)
+	if err != nil {
+		return err
+	}
+	if !yes && !env.StdinTTY {
+		return uzicli.Exitf(uzicli.ExitUsage,
+			"refusing to resume run %s without confirmation: pass --yes (stdin is not a terminal, so an interactive confirmation cannot be shown)",
+			sanitizeTTY(runID))
+	}
+	_, _ = fmt.Fprintf(env.Stderr, "%s\n%s\n",
+		apitypes.PolicyResumeModeLabel(mode), apitypes.PolicyResumeModeConsequence(mode))
+	if !yes {
+		_, _ = fmt.Fprintf(env.Stderr, "Resume run %s this way? [y/N]: ", sanitizeTTY(runID))
+		line, rerr := bufio.NewReader(env.Stdin).ReadString('\n')
+		if rerr != nil && rerr != io.EOF {
+			return uzicli.Exitf(uzicli.ExitGeneric, "reading confirmation from stdin: %v", rerr)
+		}
+		if ans := strings.ToLower(strings.TrimSpace(line)); ans != "y" && ans != "yes" {
+			if !gf.quiet {
+				_, _ = fmt.Fprintln(env.Stderr, "aborted")
+			}
+			return nil
+		}
+	}
+	c, err := env.client(gf)
+	if err != nil {
+		return err
+	}
+	run, replay, err := c.ResumePolicyHold(cmd.Context(), runID, mode, episode, guidance)
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(run)
+	}
+	if replay && !gf.quiet {
+		p.Printf("already resumed (this request was applied earlier)\n")
+	}
+	return renderRunDetail(p, run)
 }
 
 // newRunResumeCmd builds `uzi run resume` (PRD #1190 M4).

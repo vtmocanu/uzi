@@ -772,6 +772,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Branch:         textPtr(branch),
 		SessionID:      sessionID,
 		CheckpointTip:  textPtr(run.CheckpointTip),
+		// Compact policy hold (#3607 M2a): the preserving fact and the required recovery head,
+		// read off the claimed row. Only a still-preserving run carries either.
+		PolicyPreserveOnly:         run.PolicyPreserveRequired,
+		PolicyExpectedHead:         policyExpectedHead(run),
+		PolicySavedWorkHead:        policySavedWorkHead(run),
+		PolicyFreshSession:         policyFreshSession(run),
+		PolicyFreshUnconfirmed:     policyFreshUnconfirmed(run),
+		PolicyResumeInputsPending:  rc.PolicyResumeInputsPending,
+		PolicyResumeContextPending: rc.PolicyResumeContextPending,
 		// Issue #3194: read off the claimed run row, never derived from ownership or the tip.
 		CheckpointAttestedSource: textPtr(run.CheckpointAttestedSource),
 		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any
@@ -1354,6 +1363,42 @@ func (e legacyReviewClaimError) Unwrap() error { return errGuardrailBlockedClaim
 // checked before its human gate.
 func planCrossCheckCodexLeadSupported(run store.Run) bool {
 	return (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) && run.Harness == harnessCodex
+}
+
+// policyExpectedHead projects policy_required_head onto the claim only while the run still carries
+// the preserving constraint.
+func policyExpectedHead(run store.Run) *string {
+	if !run.PolicyPreserveRequired || !run.PolicyRequiredHead.Valid || run.PolicyRequiredHead.String == "" {
+		return nil
+	}
+	return textPtr(run.PolicyRequiredHead)
+}
+
+// policyFreshSession is true only for the claim that consumed the one-claim Fresh authorization:
+// the consumed generation is this claim's, no report confirmed a new conversation, and the run is
+// still preserving. It is read off the row ClaimRun returned, never reconstructed from audit.
+func policyFreshSession(run store.Run) bool {
+	return run.PolicyPreserveRequired && run.PolicyFreshConsumedGeneration.Valid &&
+		run.PolicyFreshConsumedGeneration.Int64 == run.ClaimGeneration &&
+		(!run.PolicyFreshConfirmedGeneration.Valid || run.PolicyFreshConfirmedGeneration.Int64 != run.PolicyFreshConsumedGeneration.Int64)
+}
+
+// policyFreshUnconfirmed is true on a later claim of a preserving run whose consumed one-claim Fresh
+// authorization (an earlier generation) was never confirmed by a current-generation session report.
+func policyFreshUnconfirmed(run store.Run) bool {
+	return run.PolicyPreserveRequired && run.PolicyFreshConsumedGeneration.Valid &&
+		run.PolicyFreshConsumedGeneration.Int64 < run.ClaimGeneration &&
+		(!run.PolicyFreshConfirmedGeneration.Valid || run.PolicyFreshConfirmedGeneration.Int64 != run.PolicyFreshConsumedGeneration.Int64)
+}
+
+// policySavedWorkHead projects policy_required_head onto the claim for a run whose episode was
+// resolved fresh_from_saved_work: not preserving, but the saved work must still contain the head.
+// policy_expected_head stays preserve-only.
+func policySavedWorkHead(run store.Run) *string {
+	if run.PolicyPreserveRequired || !run.PolicyRequiredHead.Valid || run.PolicyRequiredHead.String == "" {
+		return nil
+	}
+	return textPtr(run.PolicyRequiredHead)
 }
 
 // resolveClaimSummaryModel resolves the run-summary model riding an ISSUE-run claim

@@ -503,6 +503,11 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// awaiting_approval gate. Advertised UNCONDITIONALLY: a worker sends the report ONLY after
 		// seeing this token, because an older api 400s the unknown state and field.
 		{"clarification_revision_settlement_v1"},
+		// Issue #3607: this api accepts the compact provider policy hold report and the owner
+		// policy Resume. Advertised UNCONDITIONALLY; a worker negotiates the protocol by
+		// registering the same capability, and the claim SQL fences policy-held runs to workers
+		// that registered it.
+		{capability.ProviderPolicyHoldV1},
 	}
 	if publicationResumeEnabled {
 		// Issue #1324: this api accepts NEW publication intents. Omitted when

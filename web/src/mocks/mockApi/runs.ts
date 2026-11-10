@@ -2,6 +2,7 @@ import {
   type AdminUsage,
   type AgentSelectionInput,
   type MilestoneResetOptions,
+  type PolicyHoldResumeRequest,
   type CredentialEpoch,
   type CredentialOverride,
   type Harness,
@@ -1029,6 +1030,24 @@ export const runsApi = {
       throw new ApiError(409, "run is not waiting for a pooled token");
     patchRun(id, { status: "queued", updated_at: new Date().toISOString() });
     return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
+  // Issue #3607: the owner's choice on a Codex policy hold. Mirrors the server's fences:
+  // the run must be paused on that hold, the mode must be one the episode offers, and
+  // expected_episode_id must name the current episode; otherwise the 409 the panel shows.
+  resumePolicyHold: async (id: string, body: PolicyHoldResumeRequest) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    const hold = run.policy_hold;
+    if (run.status !== "paused" || run.hold_reason !== "codex_policy_hold" || !hold ||
+      hold.outcome_id !== body.expected_episode_id || !(hold.resume_modes ?? []).includes(body.mode))
+      throw new ApiError(409, "policy hold changed or does not match this mode; refresh the run and choose again");
+    const now = new Date().toISOString();
+    patchRun(id, { status: "queued", hold_reason: null, updated_at: now, status_since: now,
+      policy_hold: { ...hold, resolved_at: now, resume_modes: [],
+        pending_fresh: body.mode === "fresh_one_claim",
+        continuation_mode: body.mode === "preserve" ? "same_conversation" : "fresh_from_saved_work" } });
+    return delay({ run: { ...getRun(id)! } }, 120);
   },
 
   // PRD #1190: request a pause / withdraw one. Route through the engine's handleInput so

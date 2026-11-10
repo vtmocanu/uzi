@@ -1092,6 +1092,13 @@ export class Worker {
           if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
         }
         protocolCapabilities.push("pending_outcome_scoped_claim_v1");
+        // The compact policy hold promises a durable local outcome journal and the active-run snapshot
+        // registry. Advertise only while both are usable; these are the same preconditions
+        // RunRunner.executeClaimInAttempt checks before it reserves a policy flight, so a claim the
+        // API places on the strength of this capability can always be held rather than failed.
+        if (this.outbox && !this.outbox.isDisabled() && this.activeRuns) {
+          protocolCapabilities.push("provider_policy_hold_v1");
+        }
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
         // Issue #1324: publication_resume_v1 promises a durable local publication-intent record, so it is
         // advertised only while the outbox that holds it is usable. Without it the api never enrolls this

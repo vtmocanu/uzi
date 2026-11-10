@@ -3516,6 +3516,18 @@ export interface Run {
     correlation_id: string | null;
     published: boolean | null;
     captured_head?: string | null;
+    /** Issue #3607: why the latest episode was held. A closed server enum (see
+     * policyHoldWording's causes), typed as string so an unknown future cause degrades to
+     * the unknown_cause wording; null for an episode recorded before the field, absent
+     * from older APIs. */
+    hold_cause?: string | null;
+    /** Owner resume modes this exact episode accepts right now; [] (never null) unless the
+     * run is paused on an unresolved codex_policy_hold. Absent from older APIs. */
+    resume_modes?: string[];
+    /** A required recovery head is recorded for the run. */
+    recovery_required?: boolean;
+    /** The worker holding the current claim generation verified the required recovery head. */
+    recovery_verified_this_claim?: boolean;
   };
   forge_origin_cooldown?: ForgeOriginCooldown;
   capability_provenance?: {
@@ -5954,4 +5966,23 @@ export interface MilestoneResetOptions {
     expected_completion_revision: number | null;
   };
   expected_reset_state_digest: string;
+}
+
+/** Issue #3607: the owner resume modes a Codex policy hold can offer (policy_hold.resume_modes). */
+export type PolicyHoldResumeMode = "preserve" | "fresh_from_saved_work" | "fresh_one_claim";
+
+/** Issue #3607: the POST /api/runs/{id}/resume-now body for a Codex policy hold. The other
+ * holds keep posting no body. expected_episode_id is policy_hold.outcome_id, so a hold that
+ * changed under the owner 409s instead of resuming the wrong episode; guidance is optional,
+ * at most 16,000 UTF-8 bytes, and never contains NUL. */
+export interface PolicyHoldResumeRequest {
+  mode: PolicyHoldResumeMode;
+  expected_episode_id: string;
+  guidance?: string;
+}
+
+/** replay:true means this exact request was already applied (a lost response). */
+export interface PolicyHoldResumeResponse {
+  run: Run;
+  replay?: true;
 }

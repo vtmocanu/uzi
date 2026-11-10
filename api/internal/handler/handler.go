@@ -1207,6 +1207,9 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// Bounded local lifecycle outcome, like /state and memory outcomes: no rate
 		// limiter or upstream I/O. Strict 17 KiB decoding and worker/run fences apply.
 		r.Post("/runs/{id}/policy-hold", h.WorkerRunPolicyHold)
+		// Per-generation verification record for the required policy recovery head (#3607 M2a):
+		// bounded 1 KiB local lifecycle write under the worker and run locks, no upstream I/O.
+		r.Post("/runs/{id}/policy-recovery-verified", h.WorkerRunPolicyRecoveryVerified)
 		r.Post("/runs/{id}/forge-clone-success", h.WorkerForgeCloneSuccess)
 		// Bound intent body-decoding and enrollment writes per worker, like the semantic candidate.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/publication-intent", h.WorkerPublicationIntent)

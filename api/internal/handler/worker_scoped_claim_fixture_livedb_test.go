@@ -66,7 +66,7 @@ func TestWorkerScopedClaimSharedFixtureLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if registration.Nonce == "" || !slices.Contains(registration.Features, capability) ||
-		slices.Contains(registration.Features, "provider_policy_hold_v1") {
+		!slices.Contains(registration.Features, "provider_policy_hold_v1") {
 		t.Fatalf("independent negotiation: %+v", registration)
 	}
 	worker, err := q.GetWorkerByID(ctx, registration.WorkerID)

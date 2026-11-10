@@ -198,6 +198,14 @@ export interface RunContext {
   codexCatalogReport?: import("./codex/catalog-report.js").CodexCatalogReporter;
   /** Negotiated before execution/capture; remains binding if registration features shrink. */
   codexIdleStallRecovery?: boolean;
+  /** Policy-held (preserve-only) claim: every root lead turn may continue its saved session but must
+   *  never start or fall back to a fresh conversation (carried to RunTurnRequest.preserveConversation).
+   *  Absent means false, the unconstrained behaviour. */
+  preserveConversation?: boolean;
+  /** One-claim Fresh allowance of a policy-held claim, shared by reference by every root lead request of the
+   *  claim. `remaining` is decremented to 0 BEFORE the single thread/start it permits. Absent means no fresh
+   *  conversation is allowed. */
+  policyFreshAllowance?: { remaining: number };
   /** Claim support assertion; absent means false. The runner separately gates root and phase. */
   parkRunSupported?: boolean;
   /** Request a park and await its authoritative outcome or a racing owner answer. */
@@ -429,11 +437,14 @@ export interface RunContext {
    *  (a plan approved at the gate with no session to carry it), which does not use this flag.
    *  Absent/false ⇒ today's behaviour, byte-for-byte. */
   reviewedPlanResume?: boolean;
-  /** Issue #3149: on a reviewedPlanResume the fresh session has none of the run's earlier owner
+  /** Policy continuation's first model request carries pending owner inputs, including initial
+   *  planning. Context only; never a grant to start a session or broaden approved scope. */
+  policyOwnerContinuation?: boolean;
+  /** Issue #3149: on a reviewedPlanResume, or fresh policy continuation, the session has none of the run's earlier owner
    *  follow-ups. These are the ones earlier claims consumed (id order, trimmed), complete or
-   *  absent: the runner leaves this undefined, and drops reviewedPlanResume, when the history
-   *  could not be restored in full. The executor renders them (selectPriorOwnerHistory +
-   *  renderPriorOwnerHistory) on the first implement turn as historical context. */
+   *  absent: incomplete history drops reviewedPlanResume; a fresh policy continuation instead parks
+   *  before provider work. The executor renders them (selectPriorOwnerHistory +
+   *  renderPriorOwnerHistory) on its first applicable turn as historical context. */
   priorOwnerFollowUps?: readonly { id: number; body: string }[];
   /** Issue #3149: true when follow-up `id` reaches the lead live on this claim (steering
    *  isLiveDeliveryId), so the history replay skips it by id and it is delivered once. */

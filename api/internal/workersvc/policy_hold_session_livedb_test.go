@@ -61,7 +61,7 @@ func TestPolicyHoldSessionIdentityLiveDB(t *testing.T) {
 							ID: id, UserID: e.userID, WorkerID: pgconv.UUID(wid),
 							OutcomeID:       pgconv.UUID(uuid.MustParse(req.OutcomeID)),
 							ClaimGeneration: pgconv.Int8Ptr(&req.ClaimGeneration), SourceGeneration: pgconv.Int8Ptr(&req.SourceGeneration),
-							ContinuationMode: pgconv.TextPtr(&req.ContinuationMode), ActualRefusal: true,
+							ContinuationMode: pgconv.TextPtr(&req.ContinuationMode), ActualRefusal: true, Cause: req.Cause,
 							PolicyTag: pgconv.TextPtr(req.PolicyTag), Phase: pgconv.TextPtr(req.Phase), CorrelationID: pgconv.TextPtr(req.CorrelationID),
 							SessionID: pgconv.TextPtr(req.SessionID),
 						})
