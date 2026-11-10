@@ -22,6 +22,12 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { buildRecoveryLiveTiming } from "../src/main.js";
+import { Worker } from "../src/worker.js";
+import type { Config } from "../src/config.js";
+import type { ChatRunner } from "../src/chat-runner.js";
+import type { JudgeRunner } from "../src/judge-runner.js";
+import type { ReviewRunner } from "../src/review-runner.js";
+import { mkSweepOutbox } from "./worker-sweep-rig.js";
 
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
@@ -702,8 +708,9 @@ it("M3 changed immutable request and disappeared record reset local retry identi
 });
 
 // V2 records retain original generation and preparation policy across worker drift.
-async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "issue", receiptModel = false) {
-  const f = await fixture(true, os.tmpdir(), receiptModel, receiptModel ? "00000000-0000-4000-8000-000000000001" : "run-1");
+async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "issue", receiptModel = false,
+  runnerOptions: ConstructorParameters<typeof RunRunner>[6] = {}) {
+  const f = await fixture(true, os.tmpdir(), receiptModel, receiptModel ? "00000000-0000-4000-8000-000000000001" : "run-1", runnerOptions);
   const order: string[] = [];
   const holdId = "00000000-0000-4000-8000-000000000007";
   const repoId = "00000000-0000-4000-8000-000000000008";
@@ -7844,6 +7851,9 @@ async function held4140(t: TestContext, opts: { status?: string; thin?: boolean 
   t.after(async () => { await emu.close(); await f.close(); });
   f.state.status = opts.status ?? "completed";
   f.state.thin = opts.thin ?? true;
+  // The incident is the CURRENT generation: the exact hold's current_claim_generation equals the frozen
+  // record's generation (v2FrozenFixture defaults ownGeneration to a superseded 8 against the record's 7).
+  f.state.ownGeneration = 7;
   const real = emu.client;
   Object.assign(f.client, { publishHeld: (...args: Parameters<typeof real.publishHeld>) => real.publishHeld(...args) });
   let leaveMs: number | undefined;
@@ -7935,6 +7945,81 @@ it("#4140 R1 an interrupted preparation then a slow healthy API completes one cr
   assert.equal(f.state.open, false, "the exact hold was acknowledged");
   const saved = await h.record();
   assert.ok(saved === undefined || (saved.finalAcknowledged === true && saved.heldCreateUncertain !== true));
+});
+
+it("#4140 m3 a completed journal for a held-guarded generation is re-sent while the hold is open, then retires once the held FINAL is acknowledged", async t => {
+  // Real: Worker.sweepPendingTerminals, Outbox, RunRunner.protectRecoveryTerminalDeps / recoveryInventoryPending,
+  // RecoveryCoordinator and the frozen held publication (operateFrozenInventory -> publishHeld -> held_publication
+  // FINAL). Faked: the server (fixture client). The completed body has no persisted completion receipt.
+  const { outbox, root } = await mkSweepOutbox();
+  const f = await v2FrozenFixture("ci_fix", true, { outbox });
+  t.after(() => f.close());
+  f.state.status = "completed";
+  f.state.thin = true;
+  f.state.ownGeneration = 7;
+  const runId = f.context.runId;
+  const reportsSent: string[] = [];
+  const authorityReads: number[] = [];
+  const retiredNotices: number[] = [];
+  Object.assign(f.client, {
+    // The server answers the replayed report as already completed (the 409-terminal shape).
+    reportState: async (run: string) => { reportsSent.push(run); return { applied: false, status: "completed" }; },
+    // A pending-state authority requires every exact hold discarded; this hold is open, then released by the
+    // held publication FINAL (which acknowledges the record, so authority is not consulted afterwards).
+    hasRecoveryRetirementAuthority: async (_run: string, generation: number) => { authorityReads.push(generation); return false; },
+    capturePublicationCompletionRetirement: () => ({}),
+    releaseRetiredPublicationCompletion: (_run: string, generation: number) => { retiredNotices.push(generation); },
+  });
+  const boundary = f.make("runner");
+  const runner = f.runnerState() as unknown as RunRunner;
+  assert.equal(outbox.hasPendingTerminal(runId, 7), false);
+  assert.equal((await outbox.journalTerminal(runId, 7, "finalize", 0, { status: "completed", claim_generation: 7 })).journaled, true);
+  assert.equal(await boundary.hasPersistedCompletionReceipt(runId, 7), false, "the completed body has no persisted completion receipt");
+  const journalFile = path.join(root, "outbox", runId, "terminal-7.json");
+  const journalBytes = () => fs.readFile(journalFile);
+  const original = await journalBytes();
+
+  const worker = new Worker({ maxConcurrentRuns: 1, pollIntervalMs: 0, httpTimeoutMs: 1000,
+    gapFillMax: 100, outboxTerminalMaxBytes: 64 * 1024 } as Config,
+    f.client as unknown as WorkerClient, runner, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner, nullLogger(),
+    () => ({ ok: true, missing: [] }), outbox, new Map(), undefined) as unknown as {
+      sweepPendingTerminals(signal?: AbortSignal): Promise<void>;
+    };
+
+  // The exact guarded hold is open: every heartbeat sweep re-sends, and the journal stays pending and unchanged.
+  for (let sweep = 1; sweep <= 3; sweep++) {
+    await worker.sweepPendingTerminals();
+    assert.equal(reportsSent.length, sweep, "each sweep re-sends the completed report once");
+    assert.equal(outbox.hasPendingTerminal(runId, 7), true);
+    assert.deepEqual(await journalBytes(), original, "journal bytes are unchanged");
+    assert.equal(await runner.recoveryInventoryPending(runId, 7), true, "the open guarded hold forbids retirement");
+    assert.equal(f.state.open, true);
+    assert.equal(f.finals.length, 0);
+    assert.equal(f.state.pinDeletes, 0);
+  }
+  assert.ok(authorityReads.length > 0, "the real custody-authority check was consulted and refused");
+  assert.deepEqual(retiredNotices, [], "nothing was retired, so no retirement was announced");
+
+  // The held publication settles the hold: held_publication FINAL, exact-hold ack.
+  const settled = await f.operate();
+  assert.equal(settled.held, "acked");
+  assert.equal(f.finals.length, 1);
+  assert.equal(heldKind(f.finals[0]), "held_publication");
+  assert.equal(f.state.open, false, "the exact hold was released");
+  assert.equal((await f.coordinator.inspect(runId))[0]!.finalAcknowledged, true);
+  assert.equal(await runner.recoveryInventoryPending(runId, 7), false, "the acknowledged generation no longer pends");
+  assert.equal(outbox.hasPendingTerminal(runId, 7), true, "FINAL alone does not retire the journal");
+
+  // The next sweep re-sends one last time and retires the journal; the redundant report loop then ends.
+  const beforeRetire = reportsSent.length;
+  await worker.sweepPendingTerminals();
+  assert.equal(reportsSent.length, beforeRetire + 1, "the retiring sweep sends the report one last time");
+  assert.equal(outbox.hasPendingTerminal(runId, 7), false);
+  assert.deepEqual(outbox.listPendingTerminals(), []);
+  assert.deepEqual(retiredNotices, [7], "the authorized retirement is announced exactly once");
+  for (let sweep = 0; sweep < 3; sweep++) await worker.sweepPendingTerminals();
+  assert.equal(reportsSent.length, beforeRetire + 1, "no further reports after retirement");
+  assert.equal(f.finals.length, 1, "no second FINAL");
 });
 
 /** Run an operation that may either settle or reject; the control pins which one. */
