@@ -694,6 +694,94 @@ test("census: a rejecting re-census stops the scratch phase and the attempt phas
   });
 });
 
+/** A fake clock for the pass: `fire` jumps to the hard deadline and runs the due timers (no real-time wait). */
+function fakeClock(w: World) {
+  let t = 0;
+  const timers: Array<{ at: number; cb: () => void; live: boolean }> = [];
+  w.options.now = () => t;
+  w.options.schedule = (cb, ms) => {
+    const entry = { at: t + ms, cb, live: true };
+    timers.push(entry);
+    return () => { entry.live = false; };
+  };
+  /** `from` selects only timers due at or after that time (600_000 = the owner's hard deadline, not the soft stop). */
+  const fire = (from = 0) => {
+    t = 600_000;
+    for (;;) {
+      const due = timers.find(x => x.live && x.at <= t && x.at >= from);
+      if (!due) break;
+      due.live = false; due.cb();
+    }
+  };
+  return { fire };
+}
+
+test("census: a census that never resolves at the hard deadline is fatal: no attempt delete, no handover", async () => {
+  for (const which of ["initial", "re-census"] as const) {
+    await withWorld(["a"], async w => {
+      const attempt = { discards: 0, unsettled: 0 };
+      w.options.deletion = attemptDeletion(w, attempt);
+      withAttemptInventory(w, () => attemptSource());
+      const clock = fakeClock(w);
+      const first = fakeCensus(() => [dirEntry("a", 1)]);
+      w.census = (r, e, leaf, t) => {
+        if (which === "initial" || leaf !== undefined) {
+          setImmediate(() => clock.fire());
+          return new Promise(() => undefined);
+        }
+        return first(r, e, leaf, t);
+      };
+      w.discard = async () => assert.fail("must not delete");
+      await assert.rejects(runPodEpochShadow(w.options), error => error instanceof PodEpochSettlementError, which);
+      assert.deepEqual(w.calls.discards, [], which);
+      assert.equal(attempt.discards, 0, which);
+      assert.equal(w.calls.handovers, 0, which);
+      assert.ok(!w.events.includes("handover"), which);
+      await untouched(w, ["a"]);
+    });
+  }
+});
+
+test("pre-launch: a refusal tagged as never launched ends the pass as launch_refused; the attempt phase deletes nothing", async () => {
+  await withWorld(["a", "b"], async w => {
+    const attempt = { discards: 0, unsettled: 0 };
+    w.options.deletion = attemptDeletion(w, attempt);
+    withAttemptInventory(w, () => attemptSource());
+    w.census = fakeCensus(() => [dirEntry("a", 1), dirEntry("b", 2)]);
+    // The real delete refuses on a past deadline before any child or unsettled entry exists (tagged).
+    w.discard = async input => w.git.discardEpochScratchLeaf({ ...input, deadline: 0 });
+    const result = await run(w);
+    assert.equal(result.scratch.state, "stopped"); assert.equal(result.scratch.reason, "launch_refused");
+    assert.equal(result.verdict, "deferred"); assert.equal(result.reason, "read_failed");
+    assert.deepEqual(w.calls.discards, ["a"]);
+    assert.equal(result.scratch.deleted, 0);
+    assert.equal(attempt.discards, 0); assert.equal(result.deleted, 0);
+    await untouched(w, ["a", "b"]);
+  });
+});
+
+test("pre-launch: a slow observation that finishes after the pass went fatal cannot start a delete", async () => {
+  await withWorld(["a"], async w => {
+    const clock = fakeClock(w);
+    w.census = fakeCensus(() => [dirEntry("a", 1)]);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let late: Promise<unknown> | undefined;
+    w.discard = input => {
+      late = gate.then(() => input.beforeLaunch()).then(() => "launched", (error: unknown) => error);
+      // Only the owner's hard deadline passes: the pass goes fatal without the soft stop having aborted it.
+      setImmediate(() => clock.fire(600_000));
+      return late as Promise<never>;
+    };
+    await assert.rejects(runPodEpochShadow(w.options), error => error instanceof PodEpochSettlementError);
+    release();
+    const outcome = await late;
+    assert.ok(outcome instanceof Error, "the observation refused instead of letting the delete launch");
+    assert.match((outcome as Error).message, /interrupted/);
+    assert.equal(w.calls.handovers, 0);
+  });
+});
+
 test("the scratch phase runs before the attempt deletion phase", async () => {
   await withWorld(["a"], async w => {
     const attempt = { discards: 0, unsettled: 0 };

@@ -518,8 +518,10 @@ describe("GitCache.discardEpochScratchLeaf", () => {
     it(`${label} is unresolved: scope stopped, entry and ticket stay pending`, async () => {
       const x = discardFixture(over, census);
       fakeChildDeps(x.internal, { outcome });
+      // A post-entry failure is unresolved and is never tagged as not launched.
       await assert.rejects(x.git.discardEpochScratchLeaf(x.input),
-        (error: Error & { epochScratchUnresolved?: boolean }) => error.epochScratchUnresolved === true);
+        (error: Error & { epochScratchUnresolved?: boolean; epochScratchNotLaunched?: boolean }) =>
+          error.epochScratchUnresolved === true && error.epochScratchNotLaunched === undefined);
       assert.equal(x.seen.pending, 1);
       assert.equal(x.f.stopped(), true);
       assert.equal(x.f.pending(), 1);
@@ -577,8 +579,9 @@ describe("GitCache.discardEpochScratchLeaf", () => {
     fakeChildDeps(x.internal, { outcome: "hang", joinMs: 30 });
     x.input.deadline = Date.now() + 120;
     await assert.rejects(x.git.discardEpochScratchLeaf(x.input),
-      (error: Error & { epochScratchUnresolved?: boolean; cause?: { epochProcessJoined?: boolean } }) =>
-        error.epochScratchUnresolved === true && error.cause?.epochProcessJoined === false);
+      (error: Error & { epochScratchUnresolved?: boolean; epochScratchNotLaunched?: boolean; cause?: { epochProcessJoined?: boolean } }) =>
+        error.epochScratchUnresolved === true && error.epochScratchNotLaunched === undefined &&
+        error.cause?.epochProcessJoined === false);
     assert.deepEqual(x.events, ["beforeLaunch"]);
     assert.equal(x.f.stopped(), true);
     assert.equal(x.f.pending(), 1);

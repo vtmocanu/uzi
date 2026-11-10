@@ -3947,7 +3947,9 @@ export class GitCache {
    * classifyScratchSettlement. Only a settled outcome (`removed` or `residue`) removes the entry and
    * then settles the ticket; anything else stops the scope, leaves both pending and throws an error
    * carrying `epochScratchUnresolved: true`. An error thrown before the entry (validation, the observation,
-   * abort, deadline, exclusivity) carries `epochScratchNotLaunched: true`.
+   * abort, deadline, exclusivity) carries `epochScratchNotLaunched: true`, except the `scope.stopped()`
+   * throw, which is left untagged; a stopped scope is fatal through the caller's `scope.stopped()` check
+   * and finishReclaimScope's stop latch, not through the missing tag.
    */
   async discardEpochScratchLeaf(input: EpochScratchDiscardInput): Promise<Settlement> {
     const seam = input.testSeam;
@@ -3956,8 +3958,10 @@ export class GitCache {
     let wrapped: ReturnType<typeof runnerCommand>;
     const env = { PATH: "/usr/bin:/bin" };
     // Everything before the `unsettledDeletes` entry: no child, ticket or unsettled entry exists yet, so an
-    // error thrown here is tagged `epochScratchNotLaunched` and is not an unresolved delete. A stopped scope
-    // is the exception: it means an earlier effect is unresolved, so that throw stays untagged (fatal).
+    // error thrown here is tagged `epochScratchNotLaunched` and is not an unresolved delete. The
+    // `scope.stopped()` throw below is left untagged; fatality of a stopped scope is guaranteed by the caller's
+    // `scope.stopped()` check and finishReclaimScope's stop latch (assertExclusive on a stopped native scope
+    // throws a tagged error), not by the missing tag.
     try {
       if (seam !== undefined && seam.token !== EPOCH_SCRATCH_TEST_SEAM) throw new Error("epoch scratch test seam refused");
       if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped"]

@@ -471,7 +471,11 @@ async function scratchBody(ctx: ScratchContext, layout: ScratchLayout, pin: Scra
         scope, root: layout.root as EpochScratchDiscardInput["root"], name: leaf.name, expect: leaf.devIno,
         rootExpect: pin.devIno, bytes: leaf.bytes, signal: controller.signal, deadline: ctx.deadlineAt(),
         beforeLaunch: async () => {
-          try { ctx.check(); ctx.entry(); } catch (error) { preLaunch = error; throw error; }
+          try {
+            ctx.check(); ctx.entry();
+            // A slow pre-launch step finishing after the pass went fatal or aborted must not start a delete.
+            if (ctx.interrupted()) throw new Error("scratch pass interrupted before launch");
+          } catch (error) { preLaunch = error; throw error; }
         },
         rootRepin: () => repinScratchRoot(layout, pin.devIno, seams.io),
         mountsOk: () => {
