@@ -144,7 +144,7 @@ type ProjectSyncSettings interface {
 // the two forward-hooked call sites (D6), so a reverse label write does not
 // re-project back onto Status.
 type ProjectMover interface {
-	AutoMove(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error)
+	AutoMove(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error)
 }
 
 // ProjectSyncService adopts and seeds an existing GitHub Projects v2 board against
@@ -316,7 +316,7 @@ func (s *ProjectSyncService) ProjectSyncStatus(ctx context.Context, repoID uuid.
 // An introspection-unsupported forge (no scopes header) proceeds best-effort — the
 // first mutation surfaces any real permission error. A transient introspection
 // error is surfaced so the caller does not silently proceed on unknown scopes.
-func ensureProjectScope(ctx context.Context, f forge.Forge) error {
+func ensureProjectScope(ctx context.Context, f forge.CodeHost) error {
 	info, err := f.TokenInfo(ctx)
 	if err != nil {
 		if errors.Is(err, forge.ErrTokenIntrospectionUnsupported) {

@@ -20,7 +20,7 @@ const (
 	defaultConcurrency = 4
 )
 
-// Checker computes privilege reports against a Forge. It holds no state beyond
+// Checker computes privilege reports against a forge.CodeHost. It holds no state beyond
 // its tunables and is safe to share.
 type Checker struct {
 	warnWindow  time.Duration

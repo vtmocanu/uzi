@@ -99,7 +99,7 @@ func (m *fakeMover) ForgeForConnection(string, string, []byte) (forge.Forge, err
 	}
 	return m.forge, nil
 }
-func (m *fakeMover) AutoMove(_ context.Context, _ forge.Forge, _ int64, issue store.Issue, _ []store.BoardColumn, target string) (store.Issue, error) {
+func (m *fakeMover) AutoMove(_ context.Context, _ forge.IssueTracker, _ int64, issue store.Issue, _ []store.BoardColumn, target string) (store.Issue, error) {
 	m.moves = append(m.moves, target)
 	if m.autoMoveErr != nil {
 		return store.Issue{}, m.autoMoveErr

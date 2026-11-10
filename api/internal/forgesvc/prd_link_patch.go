@@ -32,7 +32,7 @@ const PRDLinkPatchBatch = 20
 // narrowed to one poller tick and to only the occurrences of this run's own PRD
 // path; there is nothing further to do about it without a forge primitive that
 // does not exist.
-func (s *Service) SyncPRDLinkPatches(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) error {
+func (s *Service) SyncPRDLinkPatches(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, ch forge.CodeHost, tr forge.IssueTracker) error {
 	rows, err := s.q.ListPRDLinkPatchCandidates(ctx, store.ListPRDLinkPatchCandidatesParams{
 		RepoID: repoID,
 		Lim:    PRDLinkPatchBatch,
@@ -44,7 +44,7 @@ func (s *Service) SyncPRDLinkPatches(ctx context.Context, repoID uuid.UUID, forg
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		s.patchOnePRDLink(ctx, forgeProjectID, f, c)
+		s.patchOnePRDLink(ctx, forgeProjectID, ch, tr, c)
 	}
 	return nil
 }
@@ -83,10 +83,10 @@ func (s *Service) SyncPRDLinkPatches(ctx context.Context, repoID uuid.UUID, forg
 // LATER, loses its patch. Narrow — the follow-up run normally moves the PRD itself
 // and patches through its own marker — and the alternative is polling an abandoned
 // open MR forever, which is the unbounded per-tick forge call the PRD forbids.
-func (s *Service) patchOnePRDLink(ctx context.Context, forgeProjectID int64, f forge.Forge, c store.ListPRDLinkPatchCandidatesRow) {
+func (s *Service) patchOnePRDLink(ctx context.Context, forgeProjectID int64, ch forge.CodeHost, tr forge.IssueTracker, c store.ListPRDLinkPatchCandidatesRow) {
 	lg := slog.With("run", c.ID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64)
 
-	mr, err := f.GetMergeRequest(ctx, forgeProjectID, c.MrIid.Int64)
+	mr, err := ch.GetMergeRequest(ctx, forgeProjectID, c.MrIid.Int64)
 	if err != nil {
 		// Case 1. A failed read is not evidence about the MR.
 		lg.Warn("PRD link patch: read merge request", "error", err)
@@ -156,7 +156,7 @@ func (s *Service) patchOnePRDLink(ctx context.Context, forgeProjectID int64, f f
 		return
 	}
 
-	issue, err := f.GetIssue(ctx, forgeProjectID, c.IssueIid.Int64)
+	issue, err := tr.GetIssue(ctx, forgeProjectID, c.IssueIid.Int64)
 	if err != nil {
 		// Case 1 again: a failed read is not evidence about the description.
 		lg.Warn("PRD link patch: read issue", "error", err)
@@ -177,7 +177,7 @@ func (s *Service) patchOnePRDLink(ctx context.Context, forgeProjectID int64, f f
 		return
 	}
 
-	if err := f.UpdateIssueDescription(ctx, forgeProjectID, c.IssueIid.Int64, desc); err != nil {
+	if err := tr.UpdateIssueDescription(ctx, forgeProjectID, c.IssueIid.Int64, desc); err != nil {
 		// Leave the marker: the write is what we are retrying.
 		lg.Warn("PRD link patch: update issue description", "error", err)
 		return

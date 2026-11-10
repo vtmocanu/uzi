@@ -177,7 +177,7 @@ func (e *storedOverrideLookupError) Unwrap() error { return e.cause }
 // seam selfimprove/autopilot use. *forgesvc.Service satisfies it.
 type ForgeBuilder interface {
 	CIArtifactScrubber([]byte) (func(string) string, error)
-	SetIssueLabel(context.Context, forge.Forge, int64, store.Issue, string, string, bool) (store.Issue, error)
+	SetIssueLabel(context.Context, forge.IssueTracker, int64, store.Issue, string, string, bool) (store.Issue, error)
 	ForgeForConnection(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
 }
 

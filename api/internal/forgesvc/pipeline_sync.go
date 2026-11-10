@@ -47,7 +47,7 @@ type PipelineSyncOptions struct {
 // and is retried next tick). ErrNoPipeline is not an error — it is "no CI for
 // this ref", so the ref is not cached and any stale row for it is allowed to
 // evict, which is how a default branch honestly flips to "no CI".
-func (s *Service) SyncPipelines(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, opts PipelineSyncOptions) error {
+func (s *Service) SyncPipelines(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.CodeHost, opts PipelineSyncOptions) error {
 	if opts.MaxRefs <= 0 {
 		return nil // pipeline sync disabled (CI_WATCH_MAX_REFS=0)
 	}
@@ -183,7 +183,7 @@ func (s *Service) PrunePipelineCapState(live map[uuid.UUID]struct{}) {
 // eviction: true when a pipeline was cached OR the fetch/upsert failed (preserve
 // the existing row and retry next tick), false only on ErrNoPipeline (genuinely
 // no CI, so any stale row is allowed to evict).
-func (s *Service) syncOneRef(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, ref string, mrIID pgtype.Int8, f forge.Forge) (keep bool) {
+func (s *Service) syncOneRef(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, ref string, mrIID pgtype.Int8, f forge.CodeHost) (keep bool) {
 	var (
 		p   forge.Pipeline
 		err error

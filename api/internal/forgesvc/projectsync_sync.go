@@ -626,7 +626,7 @@ type plannedMove struct {
 //
 // A single genuine user drag (destructive count 1) always passes both gates. See
 // ReverseSync's doc for the convergence invariant the marker advance preserves.
-func (s *ProjectSyncService) reverseDiff(ctx context.Context, repo store.GetRepoByIDRow, f forge.Forge, live []forge.ProjectV2ItemStatus, optionColumn map[string]string, issuesByIID map[int64]store.Issue, itemsByIID map[int64]store.GithubProjectItem, columns []store.BoardColumn) {
+func (s *ProjectSyncService) reverseDiff(ctx context.Context, repo store.GetRepoByIDRow, f forge.IssueTracker, live []forge.ProjectV2ItemStatus, optionColumn map[string]string, issuesByIID map[int64]store.Issue, itemsByIID map[int64]store.GithubProjectItem, columns []store.BoardColumn) {
 	repoID := repo.ID
 
 	// Column-name → position map, so board.ResolveColumn can report each issue's CURRENT
