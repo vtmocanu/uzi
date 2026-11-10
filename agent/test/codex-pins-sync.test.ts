@@ -82,6 +82,8 @@ it("a bumped lock fails the coordination and parity checks until the sync runs, 
     assert.notEqual(before.status, 0, "a lock-only bump must fail the checks");
     assert.match(String(before.stdout), /live Codex pins must match CODEX_VERSION=9\.9\.9/);
 
+    const recordedTape = join(dir, "agent/test/fixtures/codex-plan-output-schema-0.164.0.json");
+    const recordedBefore = readFileSync(recordedTape);
     const originals = new Map<string, string>();
     for (const file of new Set([...scannedPinFiles(dir), ...EXPLICIT_PIN_SITES.map((site) => site.file)])) {
       originals.set(file, readFileSync(join(dir, file), "utf8"));
@@ -91,6 +93,8 @@ it("a bumped lock fails the coordination and parity checks until the sync runs, 
     assert.equal(cli.status, 0, `sync failed: ${cli.stderr}`);
     assert.match(cli.stdout, /codex-pins:sync rewrote \d+ file\(s\)/);
     phase("sync");
+    assert.ok(readFileSync(recordedTape).equals(recordedBefore),
+      "pin sync must preserve recorded evidence byte-for-byte, not relabel its runtime");
 
     // Only pin tokens changed: each changed line is its original with the version and the
     // digests substituted, and no file outside the registered sites changed.

@@ -70,9 +70,10 @@ export async function runChecker(deps: CrossCheckModelDeps, checkout: string, ho
 }
 
 /** Evidence checks are independent of the replay driver: missing callbacks cannot silently pass. */
-export function assertFixture(f: SchemaFixture): void {
+export function assertFixture(f: SchemaFixture, expectedVersion = "0.164.0"): void {
  assert.equal(f.version, 1);
- assert.equal(f.provenance.codexVersion, "codex-cli 0.164.0");
+ // Replay defaults to the recorded runtime; a real capture supplies its independently checked version.
+ assert.equal(f.provenance.codexVersion, `codex-cli ${expectedVersion}`);
  assert.ok(f.events.length > 0 && f.events.length < 10000);
  assert.ok(Buffer.byteLength(JSON.stringify(f)) <= CAPTURE_LIMIT);
  assert.equal(f.verdict, VERDICT);

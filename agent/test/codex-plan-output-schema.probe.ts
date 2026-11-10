@@ -15,7 +15,9 @@ import { ANCHOR, VERDICT, CAPTURE_LIMIT, frameSink, runChecker, assertFixture, t
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const SCRATCH = path.join(ROOT, ".uzi/scratch");
-const DEFAULT_OUT = path.join(ROOT, "agent/test/fixtures/codex-plan-output-schema-0.164.0.json");
+// CODEX_BIN is the fixed, versioned launcher path, updated by codex-pins:sync.
+const PROBE_VERSION = path.basename(path.dirname(path.dirname(CODEX_BIN)));
+const DEFAULT_OUT = path.join(ROOT, `agent/test/fixtures/codex-plan-output-schema-${PROBE_VERSION}.json`);
 const TIMEOUT = 60_000;
 
 /** Direct roots intentionally omit supervisor/identity isolation, per the M1 owner exception.
@@ -144,7 +146,7 @@ export async function captureSchemaFixture(out = DEFAULT_OUT,
   assertNoUnexpectedSystemConfig();
   const version = spawnSync(CODEX_BIN, ["--version"], { encoding: "utf8", timeout: 5000, maxBuffer: 4096 });
   assert.equal(version.status, 0);
-  assert.equal(version.stdout.trim(), "codex-cli 0.164.0");
+  assert.equal(version.stdout.trim(), `codex-cli ${PROBE_VERSION}`);
   await access(path.join(path.dirname(CODEX_BIN), "codex-code-mode-host"), constants.X_OK);
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   const address = server.address();
@@ -211,7 +213,7 @@ export async function captureSchemaFixture(out = DEFAULT_OUT,
    version: 1,
    provenance: {
     codexVersion: version.stdout.trim(), capturedAt: new Date().toISOString(),
-    command: "cd agent && node --import tsx test/codex-plan-output-schema.probe.ts capture test/fixtures/codex-plan-output-schema-0.164.0.json",
+    command: `cd agent && node --import tsx test/codex-plan-output-schema.probe.ts capture test/fixtures/codex-plan-output-schema-${PROBE_VERSION}.json`,
     substitutions: ["owned scratch root -> /fixture", "loopback endpoint -> 127.0.0.1:12345", "UUID and fence nonce -> stable identity-N"],
     limitations: ["Scripted Responses provider; no live-provider acceptance", "Direct spawn under current identity; no OS identity or confinement proof",
      "Auth RPC traffic and stderr excluded; real auth handshake executed",
@@ -220,7 +222,7 @@ export async function captureSchemaFixture(out = DEFAULT_OUT,
     tool_choice: request.tool_choice, input: (request.input as Record<string, unknown>[])
      .filter(item => item.type === "custom_tool_call_output") })), verdict: result.text,
   })));
-  assertFixture(fixture);
+  assertFixture(fixture, PROBE_VERSION);
   assert.ok(!JSON.stringify(fixture).includes(credential), "no dummy credential in fixture");
   await writeFile(path.resolve(out), JSON.stringify(fixture, null, 2) + "\n", { flag: "wx" });
  } finally {
