@@ -7,7 +7,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test as nodeTest } from "node:test";
-import { binding, closed, environment, fixture, git, inventory, patch, type Fixture, type Variant } from "./fixtures/recovery-bindingless-compat.js";
+import { binding, closed, environment, fixture, git, inventory, patch, type Fixture } from "./fixtures/recovery-bindingless-compat.js";
 import type { RecoveryRecord } from "../src/recovery.js";
 import type { ChildSpec, KillAt, ServerState } from "./fixtures/recovery-local-record-restart-child.js";
 
@@ -48,7 +48,7 @@ interface ChildOutcome { described?: Described; stale?: Resolved; resolved?: Res
  * with the same ack, a different one is a conflict. Its state is a JSON file, so a fresh child meets earlier POSTs and
  * the parent reads them without asking the server.
  */
-async function startApi(f: Fixture, stateFile: string, caseB: boolean): Promise<string> {
+async function startApi(f: Fixture, stateFile: string, caseB: boolean, later?: RecoveryRecord): Promise<string> {
   // Case A: the closed hold released under the saved FINAL's receipt. Case B (issue #3885): the owner discarded it (no receipt).
   const request = f.record.finalRequest;
   const hold = caseB ? closed(f) : { ...closed(f), state: "released", run_status: "failed", release_evidence: request!.evidence ?? "archive",
@@ -63,7 +63,15 @@ async function startApi(f: Fixture, stateFile: string, caseB: boolean): Promise<
       if (req.method === "POST" && url.pathname.endsWith("/register")) {
         return reply(200, { worker_id: hold.original_worker_id, protocol_features: ["recovery_inventory_v1"] });
       }
-      if (req.method === "GET" && url.pathname.endsWith("/recovery-holds")) return reply(200, { run_id: f.context.runId, holds: [], exact_hold: hold });
+      if (req.method === "GET" && url.pathname.endsWith("/recovery-holds")) {
+        // A later generation has its own closed hold, released under its own saved FINAL's receipt (it was acknowledged).
+        if (later && url.searchParams.get("generation") === "8") {
+          const fr = later.finalRequest!;
+          return reply(200, { run_id: f.context.runId, holds: [], exact_hold: { ...closed(f), generation: 8, hold_id: LATER_BINDING.holdId,
+            current_claim_generation: 8, state: "released", run_status: "failed", release_evidence: fr.evidence ?? "archive", final_receipt: fr.disposition } });
+        }
+        return reply(200, { run_id: f.context.runId, holds: [], exact_hold: hold });
+      }
       if (req.method === "POST" && url.pathname.endsWith("/archives/release")) {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { generation: number; release_evidence?: unknown; final_disposition?: unknown };
         const entry = { evidence: body.release_evidence, disposition: body.final_disposition };
@@ -86,15 +94,22 @@ async function startApi(f: Fixture, stateFile: string, caseB: boolean): Promise<
 /** The record shapes of a Case B world: one anchor; several bundles and records (only the anchor bound, plus a binding carrier);
  *  or a run with a LATER, already acknowledged generation beside the disposed one. */
 type Shape = "single" | "multi" | "later";
-interface SeedOptions { variant?: Variant; shape?: Shape; caseB?: boolean }
+interface SeedOptions {
+  shape?: Shape;
+  caseB?: boolean;
+  /** Generation 7 has NO saved FINAL (track c: a frozen aggregate only). */
+  noFinal?: boolean;
+}
+/** The later generation's own hold (and so its own binding). */
+const LATER_BINDING = { holdId: "31050000-0000-4000-8000-0000000000a8", repoId: binding.repoId };
 
 /** A temp data directory with a real bare, one guarded saved-FINAL generation and an unrelated run beside it. */
 async function seed(opts: SeedOptions = {}) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "uzi-local-restart-")));
   roots.push(root);
-  // The later acknowledged generation needs a saved FINAL of its own to be a valid record, so that world is built from a
-  // saved-final anchor whose FINAL is dropped again below: generation 7 is then the frozen aggregate with NO FINAL (track c).
-  const f = await fixture(root, opts.variant === "uploaded" && opts.shape === "later" ? "saved-final" : (opts.variant ?? "saved-final"));
+  // Always built from a saved-final anchor (a later acknowledged generation needs a FINAL of its own); `noFinal` drops
+  // generation 7's FINAL again below, leaving the frozen aggregate with no FINAL (track c).
+  const f = await fixture(root, "saved-final");
   const bare = f.context.barePath;
   await fs.chmod(path.dirname(bare), 0o700);
   await fs.chmod(bare, 0o700);
@@ -115,10 +130,16 @@ async function seed(opts: SeedOptions = {}) {
     await fs.writeFile(coordinator["bundlePath"](loose), "sibling bundle bytes");
     await extra({ inventoryGuarded: true, exactHoldBinding: binding }, "bare");
   }
+  let later: { record: RecoveryRecord } | undefined;
   if (shape === "later") {
-    await extra({ generation: 8, finalAcknowledged: true, coverageContext: { ...f.record.coverageContext!, generation: 8 } }, "anchor");
-    if (opts.variant === "uploaded") f.record = await patch(coordinator, f.record, { finalRequest: undefined });
+    // A realistic later ACKed generation: its own capture id, its own hold binding and its bundle on disk (the anchor's bytes, so
+    // the checksum it carries is true).
+    const record = await extra({ generation: 8, finalAcknowledged: true, exactHoldBinding: LATER_BINDING,
+      coverageContext: { ...f.record.coverageContext!, generation: 8 } }, "anchor");
+    await fs.copyFile(f.record.bundlePath!, record.bundlePath!);
+    later = { record };
   }
+  if (opts.noFinal) f.record = await patch(coordinator, f.record, { finalRequest: undefined });
   // Unrelated state in the same data directory: another run's record, an unbound file and bundle-shaped file in
   // its directory, and a ref that belongs to no generation.
   assert.ok(await coordinator.pin({ runId: LEGACY_RUN, sourceSha: f.head, kind: "issue", branch: "agent/issue-1", generation: 3 }));
@@ -130,7 +151,7 @@ async function seed(opts: SeedOptions = {}) {
   await fs.mkdir(ctl);
   const server = path.join(ctl, "server.json");
   await fs.writeFile(server, JSON.stringify({ posts: [] } satisfies ServerState));
-  const apiUrl = await startApi(f, server, opts.caseB === true);
+  const apiUrl = await startApi(f, server, opts.caseB === true, later?.record);
   return { f, root, bare, runId: f.context.runId, ctl, server, apiUrl, counter: { n: 0 } };
 }
 type World = Awaited<ReturnType<typeof seed>>;
@@ -382,10 +403,17 @@ const CASE_B_WORLDS: CaseBWorld[] = [
     steps: ["bundle:before", "bundle:after", "anchor:before", "anchor:after", "rmdir:before", "rmdir:after"] },
   { name: "three bundles, an unbound record, a binding carrier and the anchor", opts: { caseB: true, shape: "multi" }, remaining: 0,
     steps: [...repeat(3, "bundle:before", "bundle:after"), ...repeat(2, "record:before", "record:after"), "anchor:before", "anchor:after", "rmdir:before", "rmdir:after"] },
-  { name: "no saved FINAL, with a later acknowledged generation", opts: { caseB: true, variant: "uploaded", shape: "later" }, remaining: 1,
+  { name: "no saved FINAL, with a later acknowledged generation", opts: { caseB: true, noFinal: true, shape: "later" }, remaining: 1,
     steps: ["bundle:before", "bundle:after", "anchor:before", "anchor:after", "rmdir:before", "rmdir:after"] },
 ];
 const kindPhase = (steps: string[]): string[] => steps.map(s => s.split(":").slice(0, 2).join(":"));
+const g8 = (d: Described | undefined) => d?.generations?.find(g => g.generation === 8);
+/** Every file that is not generation 7's (the later generation's record and bundle, loose files) is byte-identical. */
+function assertOthersIdentical(before: Snapshot, now: Snapshot, names7: string[], what: string): void {
+  for (const [name, hash] of Object.entries(before.gen)) {
+    if (!names7.includes(name)) assert.equal(now.gen[name], hash, `${what}: ${name} is byte-identical`);
+  }
+}
 const g7 = (d: Described | undefined) => d?.generations?.find(g => g.generation === 7);
 
 /** The file names of generation 7's records and bundles (a record's bundle shares its capture id). */
@@ -413,6 +441,12 @@ for (const world of CASE_B_WORLDS) {
     assert.deepEqual(Object.keys(after.gen).sort(), Object.keys(before.gen).filter(n => !names7.includes(n)).sort());
     assert.equal(after.refs, before.refs, "no ref or pin is touched");
     assertBoundary(before, after, 0);
+    assertOthersIdentical(before, after, names7, "control");
+    if (world.opts.shape === "later") {
+      assert.equal(g8(out.described)?.classification, "case_a_ack", "generation 8 at seed");
+      const end = await runChild(w, "describe");
+      assert.equal(g8(end.described)?.classification, "case_a_ack", "generation 8 once generation 7's unacknowledged FINAL is gone");
+    }
   });
 }
 
@@ -446,6 +480,7 @@ for (const world of CASE_B_WORLDS) {
       if (completed.length === 0) assert.equal(removed.length, 0, "a kill before the first unlink has removed nothing");
       assert.equal(after.refs, before.refs, "the pins are unchanged");
       assertBoundary(before, after, 0);
+      assertOthersIdentical(before, after, names7, "after the kill");
       const anchorGone = completed.some(s => s.startsWith("anchor"));
       const changed = removed.length > 0;
 
@@ -463,6 +498,13 @@ for (const world of CASE_B_WORLDS) {
         assert.deepEqual(fresh.resolved, { kind: "retired", generation: 7, remaining: world.remaining });
       }
       const last = await snapshot(w);
+      assertOthersIdentical(before, last, names7, "at the end");
+      if (world.opts.shape === "later") {
+        assert.equal(g8(killed.described)?.classification, "case_a_ack", "generation 8 at seed");
+        assert.equal(g8(fresh.described)?.classification, "case_a_ack", "generation 8 after the kill");
+        const end = await runChild(w, "describe");
+        assert.equal(g8(end.described)?.classification, "case_a_ack", "generation 8 at the end");
+      }
       assert.deepEqual(Object.keys(last.gen).sort(), Object.keys(before.gen).filter(n => !names7.includes(n)).sort(), "every generation 7 file is gone, nothing else");
       assert.equal(last.refs, before.refs, "protections and pins are unchanged at the end");
       assert.equal(posts(w).length, 0, "no api write, ever");

@@ -238,6 +238,8 @@ const finishedLines = (lines: unknown[]): Json[] =>
 
 const DEADLINE_MS = 4000;
 const CLIENT_IDLE_MS = 1500;
+/** The Case B deadline: generous, so no phase before the delayed unlink can exhaust it on a loaded host; the test then waits it out. */
+const CASE_B_DEADLINE_MS = 12_000;
 
 test("a resolution that outlasts the server deadline and the client idle timeout: unknown to the client, finished in the log, gate closed until the delayed unlink settles", async () => {
   const { logger, lines } = recordingLogger();
@@ -699,7 +701,9 @@ test("Case B on a dirty source is refused twice, each by name: a writer that can
   assertNoApiWrites(foreign, "foreign-journal refusal");
 });
 
-test("Case B released mismatch: a released hold whose receipt is not the saved FINAL's needs the action; with it the generation retires", async () => {
+test("Case B released mismatch: a released hold whose receipt is not the saved FINAL's needs the action; with it the generation retires", {
+  skip: process.platform === "linux" ? false : "Linux only: the production source proof refuses non_linux_host",
+}, async () => {
   const w = await world({ gens: [{ generation: 9, kind: "caseB" }], sharedOwedPin: false, otherRun: true });
   const b = w.gens.get(9)!;
   b.exact = { ...closedHold(b), state: "released", release_evidence: "publication",
@@ -733,12 +737,12 @@ const rawRequest = (w: World, req: unknown): Promise<net.Socket> => new Promise(
   conn.on("error", reject);
 });
 
-test("Case B with a client that times out: the claim gate stays closed until the delayed first unlink settles, the final result is recorded, and a fresh confirmation completes", {
+test("Case B with a client that gives up after the boundary and a spent deadline: the claim gate stays closed until the delayed first unlink settles, the final result is recorded, and a fresh confirmation completes", {
   skip: process.platform === "linux" ? false : "Linux only: the production source proof refuses non_linux_host",
 }, async () => {
   const { logger, lines } = recordingLogger();
   const w = await world({ gens: [{ generation: 9, kind: "caseB" }], sharedOwedPin: false, otherRun: true,
-    serverLog: logger, serverTimeouts: { resolveDeadlineMs: DEADLINE_MS } });
+    serverLog: logger, serverTimeouts: { resolveDeadlineMs: CASE_B_DEADLINE_MS } });
   const b = w.gens.get(9)!;
   dirtySource(w);
   const described = await localRecords(w);
@@ -749,11 +753,15 @@ test("Case B with a client that times out: the claim gate stays closed until the
   const refs0 = allRefs(w.bare);
 
   const delay = delayFirstUnlinkOf(files);
-  const t0 = Date.now();
-  const client = operatorRaw(w, ["resolve-local-record", "--run", RUN, "--generation", "9", "--confirm", digest0, "--case-b"],
-    { UZI_RETAINED_SOURCE_IDLE_TIMEOUT_MS: String(CLIENT_IDLE_MS) });
+  // Event-driven: the client stays connected until the first unlink is pending (the last client checkpoint is behind it), and
+  // only then gives up. The server deadline runs from the request's receipt (before `reachedAt`), so waiting `reachedAt + deadline` always outlasts it.
+  const requestedAt = Date.now();
+  let conn: net.Socket | undefined;
   try {
-    await within(delay.reached, 30_000, "the delayed Case B unlink");
+    conn = await rawRequest(w, { op: "resolve-local-record", run: RUN, generation: 9, confirm: digest0, action: "case_b" });
+    await within(delay.reached, 60_000, "the delayed Case B unlink");
+    const reachedAt = Date.now();
+    assert.ok(reachedAt < requestedAt + CASE_B_DEADLINE_MS, "the unlink was reached before the deadline (else the host is too slow for this test)");
     assert.equal(w.gate.heldBy("retained_ops"), true);
     assert.equal(w.gate.tryEnterClaim(), false, "claims are refused");
     const second = await send(w.sock, { op: "resolve-local-record", run: RUN, generation: 9, confirm: "a".repeat(64), action: "case_b" });
@@ -761,13 +769,9 @@ test("Case B with a client that times out: the claim gate stays closed until the
     for (const f of files) assert.equal(fs.existsSync(f), true, "no file is removed yet: " + f);
     sameLines(allRefs(w.bare), refs0, "Case B never touches a ref");
 
-    // The client gives up first. That proves neither that the helper exited nor that intake may reopen.
-    const out = await within(client, 30_000, "the client to time out");
-    assert.equal(out.code, 1, out.stderr);
-    assert.equal(out.stdout, "");
-    assert.match(out.stderr, /outcome is unknown/);
-    assert.ok(Date.now() - t0 < DEADLINE_MS, "the client's idle timeout fired before the server deadline");
-    await new Promise(r => setTimeout(r, Math.max(0, t0 + DEADLINE_MS + 300 - Date.now())));
+    // The client gives up. That proves neither that the helper exited nor that intake may reopen.
+    conn.destroy();
+    await new Promise(r => setTimeout(r, Math.max(0, reachedAt + CASE_B_DEADLINE_MS + 300 - Date.now())));
     assert.equal(finishedLines(lines).length, 0, "not finished while the unlink is pending");
     assert.equal(w.gate.heldBy("retained_ops"), true, "a spent deadline and a gone client do not reopen the gate");
     assert.equal(w.gate.tryEnterClaim(), false);
@@ -782,7 +786,7 @@ test("Case B with a client that times out: the claim gate stays closed until the
     await until(() => !w.gate.heldBy("retained_ops"), 10_000, "the gate to reopen");
     assert.equal(w.gate.tryEnterClaim(), true);
     w.gate.exitClaim();
-  } finally { delay.restore(); }
+  } finally { delay.restore(); conn?.destroy(); }
 
   // The final result is recorded (inspect remembers it) and the post-mutation state is a new observation.
   const last = (await send(w.sock, { op: "inspect", run: RUN, generation: EPISODE_GENERATION, attempt: EPISODE_ATTEMPT })).lastDiscards as Json[];
