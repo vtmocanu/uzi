@@ -2609,8 +2609,11 @@ the chart value: hosted deletion acceptance is owner-owned and pending.
    partial or deferred passes and unresolved outcomes do not count.
 4. Preserve each epoch's full `pod_epoch_reclaim` result: counts, `deleted_bytes`,
    every `kept_*` and the partial/authority fields, plus duration, resource
-   observations, before/after paths and preserved refs. Verify that each removed
-   source had no live reference. No memory-pressure park may be attributable to it.
+   observations, before/after exact paths and preserved refs, and the epoch's
+   admission/shutdown outcome. For every epoch, verify that each removed source had
+   no live reference and that its preserved roots remain intact. No memory-pressure
+   park may be attributable to it. Keep the earlier unexplained proof failure and
+   its public tracking evidence: a later passing epoch does not explain it.
 5. Lead and buddy review the evidence before any further rollout. Any anomaly stops
    the canary: preserve the evidence and clear the selector. There is no automatic
    promotion, and fleet expansion needs a separate owner decision.
