@@ -187,6 +187,7 @@ func (e *Scheduler) fireCIWatch(ctx context.Context, sched store.RunSchedule) (F
 	if err != nil {
 		return FireOutcome{}, err
 	}
+	var ch forge.CodeHost = f // CI watch reads only the code-host half
 	branch := strings.TrimSpace(repo.DefaultBranch.String)
 	if !repo.DefaultBranch.Valid || branch == "" {
 		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipNoDefaultBranch}}}, nil
@@ -201,7 +202,7 @@ func (e *Scheduler) fireCIWatch(ctx context.Context, sched store.RunSchedule) (F
 	// One budget for the whole fire: the listing and every snapshot's job listing draw on it,
 	// sequentially (the compressed per-fire reservation is not designed for concurrent reads).
 	ctx = forge.WithCIRepairReadLimits(ctx)
-	runs, err := f.ListWorkflowRuns(ctx, repo.ForgeProjectID, forge.ListWorkflowRunsOptions{Branch: branch, Limit: ciListLimit})
+	runs, err := ch.ListWorkflowRuns(ctx, repo.ForgeProjectID, forge.ListWorkflowRunsOptions{Branch: branch, Limit: ciListLimit})
 	if err != nil {
 		return ciForgeErrOutcome(err)
 	}
@@ -288,7 +289,7 @@ func (e *Scheduler) fireCIWatch(ctx context.Context, sched store.RunSchedule) (F
 		return candidates[i].key < candidates[j].key
 	})
 	if len(candidates) > 0 {
-		o, ferr := e.ciStartOne(ctx, sched, repo, f, cfg, target, body, candidates)
+		o, ferr := e.ciStartOne(ctx, sched, repo, ch, cfg, target, body, candidates)
 		if ferr != nil {
 			return FireOutcome{}, ferr
 		}

@@ -117,6 +117,10 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	if err != nil {
 		return FireOutcome{}, fmt.Errorf("build forge driver: %w", err) // transient
 	}
+	// One driver, two halves: MR reads go through the code host, the tracking issue
+	// through the issue tracker.
+	var ch forge.CodeHost = f
+	var tr forge.IssueTracker = f
 
 	// 4b. Cap concurrent OPEN self-improve MRs per repo (PRD #686 D10/D12). This runs BEFORE
 	// ensureTrackingIssue so a capped cycle does NO forge write. Open-state is resolved LIVE
@@ -138,7 +142,7 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		if !c.MrIid.Valid {
 			continue
 		}
-		mr, err := f.GetMergeRequest(ctx, repo.ForgeProjectID, c.MrIid.Int64)
+		mr, err := ch.GetMergeRequest(ctx, repo.ForgeProjectID, c.MrIid.Int64)
 		if err != nil {
 			// TRANSIENT — retry next tick. We neither fail-closed (counting an errored MR as
 			// open would wedge the cap forever) nor fail-open (skipping the check would breach
@@ -157,7 +161,7 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	}
 
 	// 5. File (or reuse) the tracking issue. A forge error here is transient.
-	issueIID, err := ensureTrackingIssue(ctx, f, repo.ForgeProjectID)
+	issueIID, err := ensureTrackingIssue(ctx, tr, repo.ForgeProjectID)
 	if err != nil {
 		return FireOutcome{}, err // transient
 	}
