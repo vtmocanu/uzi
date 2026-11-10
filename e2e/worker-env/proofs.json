@@ -1,0 +1,12 @@
+{
+  "file": "e2e/worker-env/worker-env-real.test.mts",
+  "leaves": {
+    "preflight": "M0 preflight: image Nix store, sanitized env, data layout and run-shaped checkout",
+    "toolchain": "M0 preflight: provisionRunTools yields the gate:repo tools, gitleaks and the repo tier-2 extras",
+    "timezone": "M1 timezone: TZ=Europe/Bucharest resolves to +0200 for ruby and date after the 2026 DST end",
+    "forgeFake": "M1 forge-fake contract bootstraps and passes under the image Node (Claude lane)",
+    "claudePrivate": "M1 ci-safe-paths passes under the Claude lane with a private runner TMPDIR",
+    "claudeShared": "M1 ci-safe-paths passes under the Claude lane with a shared setgid TMPDIR",
+    "codexBroker": "M1 ci-safe-paths passes under the Codex broker command env with checkout trust"
+  }
+}

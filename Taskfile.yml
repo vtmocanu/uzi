@@ -377,6 +377,8 @@ tasks:
       - task: test:codex-proof-harness
       # Docker-free diagnostic regressions for the worker UID lane (#2397).
       - task: test:worker-uid-harness
+      # Docker-free regressions for the worker execution-environment lane (#3894), ~25s.
+      - task: test:worker-env-harness
       # hermetic (~instant): a fake `docker` on PATH, no daemon. Guards that
       # run-store-it.sh's teardown removes the throwaway Postgres ANONYMOUS VOLUME
       # (`docker rm -v`); the missing `-v` leaked one pg volume per run and filled
@@ -2960,6 +2962,20 @@ tasks:
       - task: test:agent:unit
       # PRD 1287 C1 / D7 point 5: M4 runs once after the complete local unit suite.
       - task: test:codex-m4
+
+  test:worker-env-harness:
+    desc: Docker-free worker execution-environment checker and run.sh regressions (#3894)
+    cmds:
+      - python3 -B e2e/worker-env/check_test.py
+      - python3 -B e2e/worker-env/run_test.py
+
+  test:agent:worker-env:
+    desc: agent - M0 preflight and M1 focused proofs in the worker's execution environment (needs the built worker image and network)
+    cmds:
+      - task: test:worker-env-harness
+      # This lane's CI job installs agent dependencies; gate:repo deliberately does not.
+      - cd agent && npx tsc --project ../e2e/worker-env/tsconfig.json
+      - bash e2e/worker-env/run.sh
 
   test:worker-uid-harness:
     desc: Docker-free worker UID report checker and shell wrapper regressions
