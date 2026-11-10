@@ -126,6 +126,7 @@ const accept: PostBehaviour = async () => {};
 const refusedWith = (status: number): PostBehaviour => async () => { throw new RequestError("POST", "/memory/settlement", status, ""); };
 const lostAck: PostBehaviour = async () => { throw new TypeError("fetch failed"); };
 const neverAnswers: PostBehaviour = (_attempt, signal) => new Promise<void>((_resolve, reject) => {
+  if (signal?.aborted) { reject(new Error("aborted")); return; }
   signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
 });
 
@@ -414,13 +415,42 @@ describe("the producer posts the settled park's exact journal bytes (issue #3639
   });
 
   it("an unanswered request is bounded by the fresh boundary deadline", async () => {
+    // Exercise delivery independently of the park and journal deadlines. Under load the
+    // 1500 ms park can expire before it writes a settlement, leaving no POST to bound.
+    const f = await setup();
+    const runner = runnerWith(() => { throw new Error("delivery test starts no executor"); },
+      fakeGitlab().gitlab, undefined, undefined, { codexBoundaryDeadlineMs: 1500 });
+    const inner = runner as unknown as Internals & {
+      deliverMemoryParkSettlement(flight: unknown, log: Logger, entry: Entry, record: MemoryParkRecord,
+        clonePath: string, attemptId: string | undefined): Promise<boolean>;
+    };
+    const binding = { runId: f.claim.run_id, claimGeneration: 7, workerId: f.workerId,
+      registerNonce: NONCE, memoryEpisode: 3 };
+    const entry: Entry = { state: "pending", binding };
+    inner.ownMemoryParks.set(binding.runId, entry);
+    const clonePath = worktreeDirFor(IID);
+    const confirmed: MemoryParkRecord = {
+      version: 1, binding, ack: "confirmed",
+      origin: { flightId: randomUUID(), attemptId: null, executorIncarnation: null,
+        authorityIncarnation: randomUUID(), sourceEpoch: randomUUID() },
+      settlement: { version: 1, confirmed: true, sources: [{ path: clonePath,
+        authorityKey: sha256(clonePath), attemptId: null, epoch: randomUUID(), seq: 1 }],
+        evidence: { parkAck: binding, interventionIds: [], processJoin: "executor",
+          commands: "not_required", steering: "joined", auxiliaries: "none",
+          feedback: "drained", sinkReceipts: "joined", parkReap: "not_applicable" } },
+    };
+    const posts: Post[] = [];
+    client.reportMemoryParkSettlement = async (runId, bytes, signal) => {
+      posts.push({ runId, bytes });
+      await neverAnswers(posts.length - 1, signal);
+    };
     const started = Date.now();
-    const p = await parked({ post: neverAnswers, boundaryMs: 1500 });
-    try {
-      assert.equal(p.posts.length, 1, "the abort ends the loop: no second attempt after the deadline");
-      assert.ok(Date.now() - started < 60_000);
-      assert.equal(entryOf(p)?.state, "pending");
-    } finally { await p.done(); }
+    assert.equal(await inner.deliverMemoryParkSettlement({ runId: binding.runId }, nullLogger(),
+      entry, confirmed, clonePath, undefined), true, "delivery attempts the request");
+    assert.equal(posts.length, 1, "the abort ends the loop: no second attempt after the deadline");
+    assert.ok(Date.now() - started < 60_000);
+    assert.equal(entry.state, "pending");
+    assert.equal(entry.sha, sha256(posts[0]!.bytes), "the attempted bytes remain pinned");
   });
 });
 

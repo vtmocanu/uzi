@@ -1010,7 +1010,7 @@ export function ScheduleModal({
                 ? target === "self_improve"
                   ? `${repoPath} · cadence & run options are editable; the improvement directive is baked in worker-side`
                   : `${repoPath} · cadence & run options are editable; the prompt is baked in`
-                : `${repoPath || "Pick a repo"} · fires as you, on your Anthropic token`}
+                : `${repoPath || "Pick a repo"} · fires as you, on your own credentials`}
             </p>
           </div>
           <button
@@ -1523,7 +1523,7 @@ export function ScheduleModal({
               <span className="text-[13px] text-fg">
                 Wait on usage limit
                 <span className="block text-[11px] text-faint">
-                  Park the run until the Anthropic window reopens instead of failing it
+                  Park the run until its usage-limit window reopens instead of failing it
                 </span>
               </span>
             </div>

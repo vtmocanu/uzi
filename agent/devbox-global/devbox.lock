@@ -119,9 +119,9 @@
         }
       }
     },
-    "github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473#go_1_27": {
-      "last_modified": "2026-10-20T14:23:57Z",
-      "resolved": "github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473?lastModified=1792506237&narHash=sha256-Q%2F8KLB6jNfpaUN1HAedE%2Fu%2FEt9feE%2FzYSsutBLKrCFk%3D#go_1_27",
+    "github:NixOS/nixpkgs/6dadaf4375be35033e1c84395adbd53ff5fded96#go_1_27": {
+      "last_modified": "2026-11-04T21:12:09Z",
+      "resolved": "github:NixOS/nixpkgs/6dadaf4375be35033e1c84395adbd53ff5fded96?lastModified=1793826729&narHash=sha256-D5H7H%2BqMoTGI%2FjJtxKP4u7BdjkFnUyhOovTrf3pTOr0%3D#go_1_27",
       "version": "1.27.3",
       "systems": {
         "x86_64-linux": {

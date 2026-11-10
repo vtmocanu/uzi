@@ -1548,7 +1548,8 @@ uzi run recovery <run-id> [--json]
   a newer run using that key superseded it, `refs/uzi-recovery/<run-id>`. `--json` carries
   the same information as `checkpoint_ref`, `checkpoint_tip`, and `checkpoint_state` on each
   hold. A hold with no retained checkpoint ref omits the line (and the `--json` fields are
-  absent). The key keeps the exact legacy issue/self-improvement spelling; an enrolled
+  absent). The key keeps the exact legacy issue/self-improvement spelling, a prompt
+  run uses `uzi/prompt-<run-id>`, and an enrolled
   task uses `uzi/task/<its-own-run-id>`, even when its work branch belongs to a root
   task. See [task checkpoint recovery](./run-recovery.md#task-checkpoint-recovery).
 

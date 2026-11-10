@@ -1358,7 +1358,7 @@ chain in the diagram above, with no intervening `running`.
 - **claimed or running → paused (Codex policy hold)** (`hold_reason=codex_policy_hold`, issue #3607).
   A root Codex provider policy refusal on an eligible run pauses it with work and custody
   preserved; the owner resumes per exact episode, and rollback is drain-only. Decisions,
-  residual limits and the guarded migration Downs (00420 and 00419) are in
+  residual limits and the guarded migration Downs (00423 and 00422) are in
   [ADR-3607](adr/3607-compact-policy-hold-m1-isolation.md#consent-and-continuity-m2m3);
   owner behaviour is in [docs/run-pause.md](docs/run-pause.md#held-on-a-codex-policy-refusal).
 
@@ -1761,7 +1761,8 @@ chain in the diagram above, with no intervening `running`.
   identity commit before the bounded API forge proof. The server derives the
   branch from `agentIssueBranch(issue)`, frozen MR-rework `pipeline_ref`, or
   `selfImproveBranch(runID)` (`uzi/self-improve/<run-id>`), respectively;
-  tracking issues, self-improvement pipelines and worker-reported branches
+  `prompt` runs, checkpoint-eligible under `uzi/prompt-<run-id>` since #4116,
+  are not on this path (deferred); tracking issues, self-improvement pipelines and worker-reported branches
   are not proof authority. The recorded MR in the own repository must name
   that branch; BranchHead H must equal MR HeadSHA and CompareAncestry must
   prove H contains or equals the durably reported final SHA. A matching

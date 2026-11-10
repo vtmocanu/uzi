@@ -446,14 +446,18 @@ body {
   border-radius: 0.5rem;
 }
 
-/* Respect prefers-reduced-motion (PRD #38 M4): neutralize the two Tailwind
-   keyframe utilities the run feed animates — the running-tool spinner
-   (animate-spin) and the active-agent pulsing dot (animate-pulse). This block is
-   deliberately UNLAYERED (kept out of any @layer). Tailwind v4 emits its
+/* Respect prefers-reduced-motion (PRD #38 M4): neutralize four keyframe
+   animations — the two Tailwind utilities the run feed animates (the
+   running-tool spinner, animate-spin, and the active-agent pulsing dot,
+   animate-pulse), the connect-form sync flash (.forge-flash, #3986) and the
+   Overview issue-work line's flowing segment (.issue-line-flow, PRD #3879). This
+   block is deliberately UNLAYERED (kept out of any @layer). Tailwind v4 emits its
    utilities inside the native `utilities` cascade layer, and an unlayered rule
    always wins over any layered rule regardless of source order — so these
    overrides beat the animate-* utilities. Keeping it out of `@layer base` also
-   matters: base sorts below utilities, so a base rule would lose to them. */
+   matters: base sorts below utilities, so a base rule would lose to them. The two
+   custom classes are unlayered too, with equal specificity, so source order
+   decides: they are declared above this block, and the later override wins. */
 @media (prefers-reduced-motion: reduce) {
   .animate-spin,
   .animate-pulse,

@@ -100,6 +100,12 @@ describe("selfImproveMrSection", () => {
   it("carries the test evidence and the human-merge note", () => {
     const md = md_(selfImproveMrSection([], checks));
     assert.ok(md.includes("Test evidence"));
+    // uzi has exact-head PR CI: the evidence heading must not claim otherwise.
+    assert.ok(!/no CI/i.test(md), "the evidence heading must not claim the repo has no CI");
+    assert.ok(md.includes("the PR's own CI is separate"));
+    // A skipped suite's proof comes from the PR's required exact-head CI, not a manual run.
+    assert.ok(md.includes("required exact-head CI"));
+    assert.ok(!md.includes("Run them yourself before merging."));
     assert.ok(md.includes("api: go test ./... — passed"));
     assert.ok(md.includes("web: npm test — failed"));
     assert.ok(md.includes("agent: npm test — skipped"));
@@ -520,7 +526,7 @@ describe("buildSelfImprovePlanPrompt", () => {
   it("carries the trusted directive: pick ONE, guardrails, tests, guard-path flag", () => {
     assert.ok(prompt.includes("exactly ONE"));
     assert.ok(prompt.includes("Never weaken uzi's guardrails"));
-    assert.ok(prompt.includes("`task gate:repo`"));
+    assert.ok(prompt.includes("Run economy (agents)"));
     assert.ok(prompt.includes("never merge to `main`"));
     assert.ok(prompt.includes(SELF_IMPROVE_BRANCH));
   });
@@ -618,9 +624,23 @@ describe("buildSelfImprovePlanPrompt — generic vs dogfood directive (PRD #686 
     assert.ok(!p.includes("go test ./..."), "no hand-written test list that omits lint/deadcode/race slots");
     // Learned from judge-rec triage: gate through the Taskfile, re-check a recommendation
     // against the current tree, and never edit the verbatim upstream builtins.
-    assert.ok(p.includes("`task gate:repo` plus `task gate:<component>`"));
-    // gate:web omits the production vite build that CI's build-web job runs.
-    assert.ok(p.includes("`npm run build` in web/ (the gate does not run the production build)"));
+    // In-run validation follows the AGENTS.md run-economy boundary (Taskfile check targets,
+    // focused tests, red/green); full gates, full suites and the web production build stay
+    // pending exact-head PR CI and are never demanded in-run or reported passed.
+    assert.ok(p.includes("AGENTS.md \"Run economy (agents)\" sets out; it is authoritative"));
+    assert.ok(p.includes("`task test:codex-m4`"));
+    assert.ok(p.includes("`task check:api` plus `go test -race -count=1`"));
+    // Only real Taskfile targets: there is no check:controller.
+    assert.ok(!p.includes("`task check:controller`"), "the prompt must not name a nonexistent check:controller target");
+    // Controller has no narrower boundary in AGENTS.md, so its gate still applies in-run.
+    assert.ok(p.includes("For controller,\n  which has no narrower in-run boundary: `task gate:controller`"));
+    assert.ok(p.includes("`UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`"));
+    assert.ok(p.includes("watched red then green"));
+    assert.ok(p.includes("pending exact-head PR CI"));
+    assert.ok(p.includes("what they add beyond these checks is pending exact-head PR CI"));
+    assert.ok(!p.includes("their required proof is pending"));
+    assert.ok(!p.includes("`task gate:repo` plus `task gate:<component>`"), "no in-run full-gate demand");
+    assert.ok(!p.includes("`npm run build` in web/"), "the web production build is CI's build-web job, not an in-run demand");
     assert.ok(p.includes("still holds on the current code"));
     assert.ok(p.includes("verbatim upstream copies: never edit them"));
     // The generic-only wording must NOT appear in the dogfood variant.

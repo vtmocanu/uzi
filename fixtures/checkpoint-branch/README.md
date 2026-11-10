@@ -7,10 +7,13 @@ agree byte-for-byte, because the server publishes/deletes the ref the worker's c
 pushed to. This fixture is the hand-authored source of truth for that derivation, and
 each side pins to it independently.
 
-## The two checkpoint-eligible kinds, and the kind-first rule
+## The three checkpoint-eligible kinds, and the kind-first rule
 
 Checkpointing fires for the **checkpoint-eligible set**: an `issue` run
-(`agent/issue-<iid>`) and a `self_improve` run (`uzi/self-improve/<run_id>`, added in M3).
+(`agent/issue-<iid>`), a `self_improve` run (`uzi/self-improve/<run_id>`, added in M3) and a
+`prompt` run (`uzi/prompt-<run_id>`, added by issue #4116 so an owner pause can park it).
+A `prompt` run carries no issue iid; its case's `issue_iid` is a placeholder the derivation
+ignores, kept only because both readers parse a number there.
 A `self_improve` run also carries a **valid `issue_iid`** (a stable tracking-issue
 container reused across cycles), so the derivation MUST dispatch on **kind first** —
 gating on `issue_iid` alone would misroute a self_improve run to the issue branch. Every
@@ -38,8 +41,8 @@ reader, not the fixture. In particular the Go drift guard asserts the fixture's
 
 Each side folds its **own** production derivation and compares against the **same**
 hand-authored fixture — the Go side calls `checkpointBranch`, the TS side folds the
-worker's actual per-kind derivation (`RUN_KIND_PROFILES.self_improve.cloneBranch` for
-self_improve, the `agent/issue-${iid}` `createOrAttachRunnerClone` default for issue).
+worker's actual per-kind derivation (`RUN_KIND_PROFILES.<kind>.cloneBranch` for
+self_improve and prompt, the `agent/issue-${iid}` `createOrAttachRunnerClone` default for issue).
 Never Go against TS directly: a direct diff can report only *that* they disagree, never
 *which* side drifted, and it would make `npm test` depend on a Go toolchain.
 
