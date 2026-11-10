@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
+import { CommandMenuContext } from "../components/CommandMenuContext";
 import { Dashboard } from "./Dashboard";
 import { api } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -967,5 +968,29 @@ describe("People chip (issue #4042)", () => {
     expect(screen.queryByRole("button", { name: /^People:/ })).toBeNull();
     expect(sentence()).not.toContain(" for ");
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
+  });
+});
+
+// PRD #3875 M1: the Search button in the header opens the shell's command menu.
+describe("OverviewNext Search button", () => {
+  it("calls the shell's open() on click, with the shortcut shown on the button", async () => {
+    const open = vi.fn();
+    render(
+      <MemoryRouter>
+        <CommandMenuContext.Provider value={{ open }}>
+          <OverviewNext />
+        </CommandMenuContext.Provider>
+      </MemoryRouter>,
+    );
+    await settle();
+    const button = screen.getByRole("button", { name: /^Search/ });
+    expect(button.textContent).toMatch(/Ctrl K|\u2318K/);
+    fireEvent.click(button);
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders no Search button without a command menu (page mounted outside the shell)", async () => {
+    await mount();
+    expect(screen.queryByRole("button", { name: /^Search/ })).toBeNull();
   });
 });
