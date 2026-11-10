@@ -51,8 +51,8 @@ by an orphan reclaim. No retirement, rebind or discard authority is added, and t
 
 ## Amendment 2026-11-04: operator local-record resolution (#3885)
 
-A worker-local operator command can now retire guarded local recovery records,
-but only for Case A: the exact closed hold was released with a receipt matching the saved
+This amendment added a worker-local operator command that retires guarded local
+recovery records, and it covered Case A only: the exact closed hold was released with a receipt matching the saved
 FINAL request, with or without the FINAL ACK already saved (an ACK with a
 discarded hold is refused). The binding, lock order, retention exclusions and
 failure model are in the

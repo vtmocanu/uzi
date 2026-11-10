@@ -2332,7 +2332,7 @@ unknown measurement does not mean zero.
 | Disposition | Meaning and next step |
 |---|---|
 | `owner_hold_discard <hold-id>` | A server hold still owns the source. Use `uzi run discard <run-id> --hold <hold-id> --yes`. |
-| `resolve_local_record` | A local recovery, settlement or terminal record still protects the source. A guarded recovery record whose closed hold was released with a receipt matching the saved FINAL request (whether or not its FINAL ACK is already saved) can be resolved with the [local-record commands](#resolving-guarded-local-records) below (Case A). A discarded hold, a release without the matching receipt, or a generation with no saved FINAL (Case B) can be resolved only by an explicit `--case-b` request, which retires the local records alone ([Case B](#case-b-operator-confirmed-record-disposition)). Settlement and terminal records and unbound files remain blocked and need owner handling. An empty open-hold list never makes deletion safe. |
+| `resolve_local_record` | A local recovery, settlement or terminal record still protects the source. A guarded recovery record whose closed hold was released with a receipt matching the saved FINAL request (whether or not its FINAL ACK is already saved) can be resolved with the [local-record commands](#resolving-guarded-local-records) below (Case A). A discarded hold, a release without the matching receipt, or a generation with no saved FINAL (Case B) can be resolved only by an explicit `--case-b` request, which retires the local records alone ([Case B](#case-b-operator-confirmed-record-disposition)). An acknowledged generation with a discarded or mismatched hold stays refused (`ack_evidence_inconsistent`), and a merged-predecessor discard stays refused (`policy_discard_retained`). Settlement and terminal records and unbound files remain blocked and need owner handling. An empty open-hold list never makes deletion safe. |
 | `local_discard` / `local_protected_discard` | Nothing else holds the source; it may be discarded with the command below (protected for episode or protected sources). |
 | `refused` | Named consumers still use the source. The output lists them. |
 
@@ -2596,7 +2596,7 @@ request runs to completion or to its deadline.
 | Source proof and replay | `source_identity_unavailable`, `bare_mutation_unresolved`, `replay_failed_before_post`, `replay_precondition_unmet:<reason>`, `replay_failed`, `internal_error` |
 
 `run_hold_open`, `settlement_evidence_inconsistent`, `policy_discard_retained`,
-`case_b_discard_evidence_unsupported`, the source-evidence rows and `bundle_path_unknown`
+`case_b_discard_evidence_unsupported` and the source-evidence rows
 are raised on the Case B path only (Case A keeps its own-generation `hold_open` check).
 `holds_unknown` is shared; for Case B it also covers a holds response whose run-wide
 `run_open_holds` count is absent or malformed, because an absent count is never read as
@@ -2650,8 +2650,9 @@ The first failing check wins, so an earlier blocker such as `cleanup_pending`,
 **Retained even when confirmed.**
 
 - A merged-predecessor discard (`policy_discard_retained`).
-- An owner discard whose archive disposition has a missing or mismatched server capture id
-  (`binding_missing`).
+- Any generation (including a released mismatch) whose anchor has no persisted hold
+  binding, or whose saved FINAL has an archive disposition with a missing or mismatched
+  server capture id (`binding_missing`).
 - A run with no clone and no retained source (`source_evidence_empty`).
 - A replay-refused anchor without a persisted settlement (`replay_refused_persisted`).
 
@@ -2690,8 +2691,9 @@ refuse (`settlement_record_unsupported`, `terminal_protection`).
 
 **Failure model.** Tested for an abrupt process kill only: a real `SIGKILL` at each unlink
 step of three Case B scenarios, each followed by a fresh process that re-describes the
-generation as the same class with a new digest (the old digest is refused
-`descriptor_changed`), or as `not_found` once the anchor record is gone. Storage or
+generation as the same class; the digest changes once any file was removed (the old digest
+is then refused `descriptor_changed`) and is unchanged if nothing was removed; `not_found`
+once the anchor is gone. Storage or
 power-loss behaviour is unspecified (record writes are rename-atomic, not fsynced).
 
 **Trust model.** The local socket proves access to the pod, not the owner's identity.

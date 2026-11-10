@@ -161,7 +161,7 @@ Case B adds these refusals on top of the shared ones.
   fresh read on the immutable fields.
 - `policy_discard_retained`: a `merged_predecessor_discard` outcome, even
   confirmed. `case_b_discard_evidence_unsupported`: any other discard evidence.
-- Source evidence (next section), `bundle_path_unknown`, and
+- Source evidence (next section), and
   `inventory_source_not_quiescent:<check>` from the source boundary.
 
 ### Source-evidence gate
@@ -199,19 +199,22 @@ return `partial`. It never deletes tree bytes, refs, pins, server archives,
 other generations' data or unbound files, and never releases, uploads or ACKs.
 
 Failure model: abrupt process kill only, verified by real `SIGKILL` of a child
-worker at every step of three Case B worlds
+worker at each distinct on-disk state (every unlink) of three Case B
+owner-discard worlds
 (`agent/test/recovery-local-record-restart.test.ts`). Every surviving state
-re-describes as the same class with a new digest, or as `not_found` once the
-anchor is gone. Storage or power loss is unspecified (rename-atomic, not
+re-describes as the same class; the digest changes once any file was removed
+(the old digest is then refused `descriptor_changed`) and is unchanged if
+nothing was removed; `not_found` once the anchor is gone. Storage or power loss is unspecified (rename-atomic, not
 fsynced). There is no autonomous retry: a fresh describe, a fresh confirmation
 and `--case-b` are required.
 
 ### Retained classes
 
 These stay refused even when confirmed: merged-predecessor discard
-(`policy_discard_retained`); an owner discard whose archive disposition has a
-missing or mismatched `serverCaptureId` (`binding_missing`, raised by the classification shared
-with Case A);
+(`policy_discard_retained`); any generation (including a released mismatch) whose anchor has no
+persisted hold binding, or whose saved FINAL has an archive disposition with a
+missing or mismatched `serverCaptureId` (`binding_missing`, raised by the
+classification shared with Case A);
 `source_evidence_empty`; and a replay-refused anchor without a persisted
 settlement (`replay_refused_persisted`). A record that fails its MAC refuses the
 whole run (`record_unverified`).
