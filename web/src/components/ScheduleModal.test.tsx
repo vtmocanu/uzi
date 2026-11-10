@@ -150,6 +150,21 @@ describe("label sweep eligibility copy", () => {
   });
 });
 
+// Issue #3988: a schedule can fire on Codex (pin, Codex-only/default owner, overflow,
+// automatic choice), so the custom header and the limit help name no provider.
+describe("provider-neutral credential copy (#3988)", () => {
+  it("names no provider in the custom header or the usage-limit help", async () => {
+    await act(async () => {
+      renderModal();
+    });
+
+    const header = screen.getByText("Pick a repo · fires as you, on your own credentials");
+    const limitHelp = screen.getByText("Park the run until its usage-limit window reopens instead of failing it");
+    expect(header.textContent).not.toContain("Anthropic");
+    expect(limitHelp.textContent).not.toContain("Anthropic");
+  });
+});
+
 describe("target switching swaps the fields", () => {
   it("issue → sweep → prompt reveals the right control each time", async () => {
     renderModal();
