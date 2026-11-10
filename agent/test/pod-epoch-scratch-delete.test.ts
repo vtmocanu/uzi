@@ -423,7 +423,7 @@ function discardFixture(over: Partial<EpochScratchDiscardInput> = {}, census?: (
 }
 
 describe("GitCache.discardEpochScratchLeaf", () => {
-  it("the launch validator admits exactly the fixed argv and nothing else", () => {
+  it("the launch validator admits only the fixed argv with a bounded per-launch time budget", () => {
     const { internal, root } = discardFixture();
     const build = (over: Partial<Record<number, string>> = {}) => {
       const tail = ["-e", PINNED_SUBTREE_SCRIPT, root, "leaf-1", "2000000", "300000", "remove", EXPECT, "", "pinned", ROOT_EXPECT, "1", "256"];
@@ -433,6 +433,10 @@ describe("GitCache.discardEpochScratchLeaf", () => {
     const ok = build();
     const env = { PATH: "/usr/bin:/bin" };
     assert.doesNotThrow(() => internal.validateEpochScratchLaunch(ok.command, ok.args, env, "/", "command", root));
+    for (const budget of ["1000", "3000", "299999"]) {
+      const args = build({ 5: budget });
+      assert.doesNotThrow(() => internal.validateEpochScratchLaunch(args.command, args.args, env, "/", "command", root));
+    }
     // Without the test seam the temp root is refused, and so is every deviation below.
     assert.throws(() => internal.validateEpochScratchLaunch(ok.command, ok.args, env, "/", "command"), /unaudited/);
     const bad: Array<[string, () => void]> = [
@@ -443,6 +447,8 @@ describe("GitCache.discardEpochScratchLeaf", () => {
         () => { const a = build({ 3: n }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }]),
       ["other root", () => { const a = build({ 2: "/data/runner" }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
       ["max entries", () => { const a = build({ 4: "1" }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
+      ...["0", "999", "300001", "-1000", "1000.5", "01000", "1e3", "NaN"].map((budget): [string, () => void] => ["time budget " + budget,
+        () => { const a = build({ 5: budget }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }]),
       ["mode empty", () => { const a = build({ 6: "empty" }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
       ["bad expect", () => { const a = build({ 7: "-" }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
       ["sync set", () => { const a = build({ 8: "/tmp/s" }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
@@ -478,7 +484,7 @@ describe("GitCache.discardEpochScratchLeaf", () => {
   });
 
   it("runs the pre-launch observation before the spawn, then launches with the inherited descriptor", async () => {
-    const x = discardFixture();
+    const x = discardFixture({ deadline: Date.now() + 400_000 });
     fakeChildDeps(x.internal, {
       outcome: { stdout: `UZI-SCRATCH-REMOVED ${EXPECT}\n`, code: 0 },
       onSpawn: (command, args, options) => {
@@ -572,24 +578,49 @@ describe("GitCache.discardEpochScratchLeaf", () => {
     assert.equal(x.internal.unsettledDeletes.get(x.key), 1);
   });
 
-  it("the post-delete census is bounded by the caller's deadline", async () => {
-    const seen: number[] = [];
-    for (const [deadline, check] of [[Date.now() + 10_000, (t: number) => t <= 10_000 && t > 1]] as const) {
-      const x = discardFixture({ deadline });
-      x.input.testSeam!.census = async (_root, _expect, _leaf, timeout) => { seen.push(timeout); return censusText("leaf-1", "absent"); };
-      fakeChildDeps(x.internal, { outcome: { stdout: `UZI-SCRATCH-REMOVED ${EXPECT}\n`, code: 0 } });
-      await x.git.discardEpochScratchLeaf(x.input);
-      assert.ok(check(seen.at(-1)!), `timeout ${seen.at(-1)}`);
-    }
-    // A deadline that passes during the join leaves the census 1 ms.
-    const late = discardFixture();
-    late.input.deadline = Date.now() + 300;
-    late.input.testSeam!.census = async (_root, _expect, _leaf, timeout) => { seen.push(timeout); return censusText("leaf-1", "absent"); };
-    fakeChildDeps(late.internal, { outcome: { stdout: `UZI-SCRATCH-REMOVED ${EXPECT}\n`, code: 0 },
-      onSpawn: () => { const until = Date.now() + 350; while (Date.now() < until) { /* hold past the deadline */ } } });
-    await late.git.discardEpochScratchLeaf(late.input).catch(() => undefined);
-    assert.equal(seen.at(-1), 1);
-  });
+  for (const late of [true, false]) {
+    it(`reserves settlement time after the pre-launch observation: ${late ? "late launch refuses without effects" : "a bounded delete leaves the census its full budget"}`, async t => {
+      let now = 1_000_000;
+      t.mock.method(Date, "now", () => now);
+      const x = discardFixture({ deadline: now + 40_000 });
+      let launches = 0, censuses = 0;
+      x.input.beforeLaunch = async () => {
+        x.events.push("beforeLaunch");
+        if (late) now += 5_000; // Initially enough time, but the final observation uses the delete allowance.
+      };
+      t.mock.method(x.internal, "spawnJoinedEpochChild", async (scope: PodEpochReclaimScope, _command: string,
+        args: string[], options: Parameters<Internal["spawnJoinedEpochChild"]>[3]) => {
+        launches++;
+        const budget = Number(args[args.indexOf(PINNED_SUBTREE_SCRIPT) + 4]);
+        // Spend the entire child timeout and both 1s join waits, without a real-time wait.
+        now += Math.min(options.timeout ?? Infinity, options.deadline - now) + 2_000;
+        if (!late) assert.equal(budget, 3_000, "delete leaves 5s kill slack, 2s join allowance and 30s census time");
+        return { joined: true as const, spawned: true as const, ticket: scope.beginMutation(),
+          code: 0, signal: null, stdout: `UZI-SCRATCH-REMOVED ${EXPECT}\n`, stderr: "", failure: undefined };
+      });
+      x.input.testSeam!.census = async (_root, _expect, _leaf, timeout) => {
+        censuses++;
+        // On the unfixed code the child consumes the deadline and this census is starved (1 ms).
+        if (timeout < 30_000) return { code: 1, stdout: "" };
+        assert.equal(timeout, 30_000);
+        return censusText("leaf-1", "absent");
+      };
+      if (late) {
+        await assert.rejects(x.git.discardEpochScratchLeaf(x.input),
+          (error: Error & { epochScratchNotLaunched?: boolean }) =>
+            error.epochScratchNotLaunched === true && /budget/.test(error.message));
+        assert.equal(launches, 0);
+        assert.equal(censuses, 0);
+        assert.equal(x.f.stopped(), false, "a late refused launch is not a fatal settlement");
+      } else {
+        assert.deepEqual(await x.git.discardEpochScratchLeaf(x.input), { outcome: "removed", bytes: 1000 });
+        assert.equal(launches, 1);
+        assert.equal(censuses, 1);
+      }
+      assert.equal(x.f.pending(), 0);
+      assert.equal(x.internal.unsettledDeletes.size, 0);
+    });
+  }
 
   it("a settled outcome removes the unsettledDeletes entry before it settles the ticket", async () => {
     const x = discardFixture();
@@ -608,11 +639,14 @@ describe("GitCache.discardEpochScratchLeaf", () => {
   it("an unconfirmed join is unresolved without a census: scope stopped, entry and ticket pending", async () => {
     const x = discardFixture();
     fakeChildDeps(x.internal, { outcome: "hang", joinMs: 30 });
-    x.input.deadline = Date.now() + 120;
-    await assert.rejects(x.git.discardEpochScratchLeaf(x.input),
+    const stop = new AbortController();
+    x.input.signal = stop.signal;
+    const timer = setTimeout(() => stop.abort(), 5);
+    try { await assert.rejects(x.git.discardEpochScratchLeaf(x.input),
       (error: Error & { epochScratchUnresolved?: boolean; epochScratchNotLaunched?: boolean; cause?: { epochProcessJoined?: boolean } }) =>
         error.epochScratchUnresolved === true && error.epochScratchNotLaunched === undefined &&
-        error.cause?.epochProcessJoined === false);
+        error.cause?.epochProcessJoined === false); }
+    finally { clearTimeout(timer); }
     assert.deepEqual(x.events, ["beforeLaunch"]);
     assert.equal(x.f.stopped(), true);
     assert.equal(x.f.pending(), 1);

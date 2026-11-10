@@ -2942,6 +2942,8 @@ export interface EpochScratchDiscardInput {
 const EPOCH_SCRATCH_TEST_SEAM = Symbol.for("uzi.test.pod-epoch-scratch.delete-seam");
 const EPOCH_SCRATCH_ROOTS: ReadonlySet<string> = new Set(["/data/runner/.tmp/uzi-runner", "/data/runner/.tmp"]);
 const EPOCH_SCRATCH_CENSUS_TIMEOUT_MS = 30_000;
+const EPOCH_NATIVE_JOIN_MS = 1_000;
+const EPOCH_SCRATCH_MIN_DELETE_BUDGET_MS = 1_000;
 
 /**
  * issue #1783 — the runner-uid delete timed out and its rm could NOT be shown gone: the child's
@@ -3771,7 +3773,7 @@ export class GitCache {
     let failure: unknown, cleanup: Promise<void> | undefined;
     let direct = false, closed = false, ioJoined = false;
     let code: number | null = null;
-    const joinMs = deps?.joinMs ?? 1_000;
+    const joinMs = deps?.joinMs ?? EPOCH_NATIVE_JOIN_MS;
     // One bounded cleanup per launch; failure does not settle sibling tickets.
     const startCleanup = () => cleanup ??= (async () => {
       const until = Date.now() + joinMs;
@@ -3915,7 +3917,8 @@ export class GitCache {
    * <budget>, "remove", <dev:ino>, "", "pinned", <dev:ino>, "1", <depth>])` with env `{ PATH }`, cwd `/`
    * and identity `command`; `root` is one of the two literal roots (or the test seam's). Equality with
    * `runnerCommand`'s own wrapper is the group-identity check of execEpochNative: the command is the
-   * setpriv wrapper exactly when the uid split is active.
+   * setpriv wrapper exactly when the uid split is active. Only the helper's time budget varies:
+   * a canonical integer from the minimum launch budget to the existing per-leaf maximum.
    */
   private validateEpochScratchLaunch(command: string, args: readonly string[], env: NodeJS.ProcessEnv,
     cwd: string | undefined, identity: BoundaryProcessRequest["identity"], seamRoot?: string): void {
@@ -3927,12 +3930,14 @@ export class GitCache {
     if (args.length !== wrap.args.length + 13 || !wrap.args.every((arg, i) => args[i] === arg)) return refuse();
     const [dash, script, root, name, max, budget, mode, expect, sync, phase, rootExpect, oneFs, depth] = args.slice(wrap.args.length);
     const lim = SCRATCH_DELETE_LIMITS;
+    const budgetMs = Number(budget);
     const pair = /^\d+:\d+$/;
     if (dash !== "-e" || script !== PINNED_SUBTREE_SCRIPT ||
         !(EPOCH_SCRATCH_ROOTS.has(root!) || seamRoot !== undefined && root === seamRoot) ||
         // The names the census never admits are refused here too, at the last gate before removal.
         !TREE_NAME_RE.test(name!) || isNeverRemovedScratchName(name!) ||
-        max !== String(lim.maxEntries) || budget !== String(lim.budgetMs) ||
+        max !== String(lim.maxEntries) || !Number.isInteger(budgetMs) || budget !== String(budgetMs) ||
+        budgetMs < EPOCH_SCRATCH_MIN_DELETE_BUDGET_MS || budgetMs > lim.budgetMs ||
         mode !== "remove" || !pair.test(expect!) || sync !== "" || phase !== "pinned" || !pair.test(rootExpect!) ||
         oneFs !== "1" || depth !== String(lim.maxDepth)) return refuse();
   }
@@ -3956,6 +3961,8 @@ export class GitCache {
     const scope = input.scope;
     let root: string;
     let wrapped: { command: string; args: string[] };
+    let budgetMs: number;
+    let childDeadline: number;
     const env = { PATH: "/usr/bin:/bin" };
     // Everything before the `unsettledDeletes` entry: no child, ticket or unsettled entry exists yet, so an
     // error thrown here is tagged `epochScratchNotLaunched` and is not an unresolved delete. The
@@ -3979,6 +3986,17 @@ export class GitCache {
       input.signal.throwIfAborted();
       if (Date.now() >= input.deadline) throw new Error("epoch scratch delete deadline exhausted");
       scope.assertExclusive();
+      // Compute this after the final observation: its awaits may have spent the allowance seen at
+      // loop entry. The core can wait one join interval before killing, then another after it.
+      const joinAllowance = 2 * (this.epochNativeTestDependencies?.joinMs ?? EPOCH_NATIVE_JOIN_MS);
+      childDeadline = input.deadline - EPOCH_SCRATCH_CENSUS_TIMEOUT_MS - joinAllowance;
+      budgetMs = Math.floor(Math.min(SCRATCH_DELETE_LIMITS.budgetMs,
+        childDeadline - Date.now() - SCRATCH_DELETE_LIMITS.killSlackMs));
+      if (budgetMs < EPOCH_SCRATCH_MIN_DELETE_BUDGET_MS) throw new Error("epoch scratch delete launch budget exhausted");
+      wrapped = runnerCommand(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, root, input.name,
+        String(SCRATCH_DELETE_LIMITS.maxEntries), String(budgetMs), "remove", input.expect, "",
+        "pinned", input.rootExpect, "1", String(SCRATCH_DELETE_LIMITS.maxDepth)]);
+      this.validateEpochScratchLaunch(wrapped.command, wrapped.args, env, "/", "command", seam?.root);
     } catch (error) {
       if (error !== null && typeof error === "object") (error as { epochScratchNotLaunched?: boolean }).epochScratchNotLaunched = true;
       throw error;
@@ -3994,8 +4012,8 @@ export class GitCache {
     let joined: JoinedEpochChild;
     try {
       joined = await this.spawnJoinedEpochChild(scope, wrapped.command, wrapped.args, {
-        env, cwd: "/", timeout: SCRATCH_DELETE_LIMITS.budgetMs + SCRATCH_DELETE_LIMITS.killSlackMs,
-        identity: "command", signals: [input.signal], deadline: input.deadline,
+        env, cwd: "/", timeout: budgetMs + SCRATCH_DELETE_LIMITS.killSlackMs,
+        identity: "command", signals: [input.signal], deadline: childDeadline,
       });
     } catch (error) { return unresolved(error); }
     let settlement: Settlement;
@@ -4005,9 +4023,9 @@ export class GitCache {
       const rootRepinOk = input.rootRepin();
       const mountsOk = input.mountsOk();
       const census = await (seam?.census ?? censusScratchRoot)(root, input.rootExpect, input.name,
-        // Bounded by the caller's deadline too. Near it the census runs with no walk budget and reports
-        // the leaf incomplete (no receipt: unresolved, never residue; a receipt with the name gone still
-        // settles removed), or is killed before it starts (unreadable: unresolved). Both fail closed.
+        // Launch admission reserves this whole census window plus the child's kill/join allowance.
+        // If an unexpected delay still spends that reserve, retain the deadline clamp: an incomplete
+        // or unreadable post-state remains unresolved rather than granting residue settlement.
         Math.max(1, Math.min(EPOCH_SCRATCH_CENSUS_TIMEOUT_MS, input.deadline - Date.now())));
       const parsed = parseScratchCensus(census, input.rootExpect);
       const postCensus = "refused" in parsed ? { state: "unreadable" as const }
