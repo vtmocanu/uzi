@@ -41,7 +41,10 @@
  *    canonical clone dir (deleted then reseeded). Owner: the bare lock. The slot epoch binds a
  *    completion source's identity; a canonical reseed is a new use of the same path.
  *  - "seed-attempt": GitCache.attemptCloneForBranch, before the ledger `live` append and clone.
- *    Footprint: the fresh attempt dir. Owner: the bare lock.
+ *    Footprint: the fresh attempt dir. Owner: the bare lock. issue #3644: GitCache.seedIndependentAttempt (the
+ *    independent restore) asks for the same op, for the SUCCESSOR's fresh path only, AFTER its ledger `live` append
+ *    and restore-entry write (the entry is the durable trace the hook's refusal leaves behind); the predecessor's
+ *    path is never named to any hook by that call.
  *  - "normalize": GitCache.normalizeRetainedSourceObjects, after attribution and before the
  *    supervised helper writes object permissions into the clone's objects and the bare's.
  *  - "remediation-recovery": authenticate the current executor-bound lease before recording or
@@ -50,7 +53,9 @@
  *    clone. Footprint: the successor path and the journal that names the retained predecessors.
  *  - "discard": GitCache.discardRetainedSource, after the disposition check and before the first
  *    delete. Footprint: every path of the retained record. The guarded operator discard has already
- *    authorized exactly the clone and its paired skills dir, so this is the ONE operator-discard takeover
+ *    authorized exactly the clone and its paired skills dir (issue #3644: the restore-aware exit asks for it for
+ *    the restored successor S first and, once S is gone, for the predecessor P, each only on its own path), so
+ *    this is the ONE operator-discard takeover
  *    (AuthorityStore.admitOperatorDiscard): a fresh epoch in state `retiring` whose manifest is that footprint,
  *    whatever state the slot held (a crashed worker's `active` epoch, `ineligible` with settled_failed residue
  *    inside the footprint); only a `running` pending record refuses. The destructive records of the deletes are
@@ -95,7 +100,9 @@
  *  episode/ (the discard path), refs/uzi-workflow-target/, refs/uzi-secret-scan-floor/, the
  *  RECOVERY_BUNDLE_REF, and clone-local refs (runGitAsRunner / the clone `git` helper). The guarded
  *  namespaces refs/uzi-owed/, refs/uzi-coverage/ and refs/uzi-recovery-pin/ are deleted only by the
- *  four sites above.
+ *  four sites above (re-enumerated for issue #3644 with `git grep` over agent/src: no other `update-ref -d`,
+ *  `update-ref --stdin` delete, pack-refs or gc touches them). While a restore entry or tombstone of the run exists
+ *  each of the four keeps the restored predecessor's generations and pin SHA (GitCache.restoreKeepsRecoveryRef).
  *
  * assertBareClear(barePath, op) — refuses while a beginBareMutation record on that bare is unresolved,
  *  so a pin or coverage ref cannot be re-created over a pending (ABA) deletion, and a seed cannot start

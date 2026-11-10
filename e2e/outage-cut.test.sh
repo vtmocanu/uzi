@@ -77,6 +77,8 @@ fixture() {
   say() { :; }
   wait_http() { [ "$API_AVAILABLE:$ALIAS_AVAILABLE" = 1:0 ]; }
   login() { :; }
+  docker_unwire_prepare() { :; }
+  docker_unwire_assert() { :; }
   wait_worker_online() { :; }
   apipost() { :; }
   wait_runs_terminal_off_worker() {
@@ -173,6 +175,38 @@ $terminal
 {\"run_id\":\"$run\",\"status\":\"running\"}" 'running status on a different line'
   echo "PASS: $log_format publication predicate rejects other runs, terminal status, reversed order, permit-only and split-line status"
 done
+( fixture
+  : > "$SCRATCH/calls"
+  configure_outbox_api_alias
+  AGENT_RUNNING=1 SETTLED=0 OUTBOX_RESTORE_NEEDED=1
+  docker_unwire_prepare() {
+    [ "$SETTLED:$AGENT_RUNNING" = 1:0 ] || fail 'unwire preceded fixture settlement and agent stop'
+    echo unwire-prepared >> "$SCRATCH/calls"
+  }
+  docker_unwire_assert() {
+    [ "$AGENT_RUNNING" = 1 ] || fail 'final unwired check preceded agent recreation'
+    echo final-unwired >> "$SCRATCH/calls"
+  }
+  restore_outbox_resolution
+  awk '/^settled / && !settled { settled=NR } /^unwire-prepared$/ { unwire=NR }
+    /force-recreate agent/ { recreated=NR; count++ } /^final-unwired$/ { checked=NR }
+    END { exit(settled && unwire > settled && recreated > unwire && checked > recreated && count == 1 ? 0 : 1) }' "$SCRATCH/calls" \
+    || fail 'cleanup must settle, unwire, recreate once, and check the final container'
+)
+echo 'PASS: phase 52 settles fixtures before unwiring and checks its sole final agent recreate'
+( fixture
+  : > "$SCRATCH/calls"
+  configure_outbox_api_alias
+  AGENT_RUNNING=1 OUTBOX_RESTORE_NEEDED=1
+  wait_runs_terminal_off_worker() { return 1; }
+  docker_wire_exit_restore() { echo unsafe-fallback >> "$SCRATCH/calls"; }
+  local_rc=0
+  restore_outage_state || local_rc=$?
+  [ "$local_rc" != 0 ] || fail 'unconfirmed cleanup must fail even after a successful phase'
+  if grep -F unsafe-fallback "$SCRATCH/calls" >/dev/null; then fail 'unconfirmed cleanup forced a blind recreate'; fi
+  if grep -F 'force-recreate agent' "$SCRATCH/calls" >/dev/null; then fail 'unconfirmed cleanup recreated the agent'; fi
+)
+echo 'PASS: unconfirmed phase-52 settlement leaves the agent intact and reports cleanup failure'
 fixture
 configure_outbox_api_alias
 SLOW_HELPER=1

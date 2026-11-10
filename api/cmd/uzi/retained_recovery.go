@@ -66,7 +66,8 @@ func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
 	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
 		return append([]string{
 			"Integrity hold: the agent did not start.",
-			"Adoption or a remediation record refused source use.",
+			"Adoption failed, a predecessor needs remediation review,",
+			"or this release does not support the predecessor.",
 			"Local work and custody preserved.",
 			"Owner-held · no automatic resume.",
 			"Resume starts another recovery episode.",
@@ -139,7 +140,7 @@ func workerHoldNoticeKey(r apitypes.RunDTO) string {
 
 func recoveryDecisionName(r apitypes.RunDTO) string {
 	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
-		return "integrity hold · retained adoption or a predecessor remediation record refused source use · local work and custody preserved"
+		return "integrity hold · retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor · agent did not start · local work and custody preserved"
 	}
 	if strOr(r.RecoveryWaitCause, "") == retainedContinuationUnwitnessedCause {
 		return "retained continuation not witnessed · owner decision needed · claim released · local work and custody kept · no retry scheduled"

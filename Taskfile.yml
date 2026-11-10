@@ -2982,6 +2982,9 @@ tasks:
       - cd agent && node --import tsx --test --test-timeout=120000 ../e2e/worker-uid/inventory.test.mts
       - cd agent && npx tsc --project ../e2e/worker-uid/tsconfig.json
       - bash e2e/worker-uid/run.sh
+      # issue #3644 (PRD #3831 8.1): host-driven proof that killing the namespace init stops a delayed config writer before the
+      # successor's admission; it drives the Docker CLI against WORKER_UID_IMAGE (the image this lane tests).
+      - cd agent && node --import tsx --test --test-timeout=300000 ../e2e/worker-uid/namespace-teardown-real.test.mts
       - |
           if [ "${GITHUB_ACTIONS:-}" = true ]; then
             python3 -B e2e/worker-uid/calibration.py --image "${WORKER_UID_IMAGE:-wuid-2134-base:local}" --mode ci

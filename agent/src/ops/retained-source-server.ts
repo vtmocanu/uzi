@@ -30,9 +30,10 @@ import { ATTEMPT_ID_RE } from "../attempt-path.js";
 import type { AuthorityRuntime, AuthorityScope } from "../authority-runtime.js";
 import type { DindPruneGate } from "../dind-prune.js";
 import type {
-  GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedInspectResult, RetainedLifecycleSnapshot, RetainedSourceSelector,
+  GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedHomeBinding, RetainedInspectResult, RetainedLifecycleSnapshot, RetainedSourceSelector,
 } from "../git.js";
 import type { Logger } from "../log.js";
+import { hasRetainedHomeMarker, removeRetainedHomeMarker } from "../retained-homes.js";
 import type { DescribeLocalRecordsResult, OperatorRequestSignals, ResolveLocalRecordResult } from "../recovery.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "../protocol.js";
 import { RUN_TERMINAL_STATUSES } from "../recovery-settlement.js";
@@ -644,6 +645,11 @@ export class RetainedSourceServer {
           const opts = {
             selector: sel, confirm: req.confirm, holds, lifecycle, isLivePath: ctx.isLivePath, quiesce: ctx.quiesce,
             barePath: ev.barePath, signal: this.shutdown.signal,
+            // issue #3644: the retained-home marker of an independent restore lives under the worker's data dir. The guarded discard of
+            // the predecessor finishes through the committed restore exit and removes it LAST; without these hooks that exit
+            // can never be planned or finished, and the predecessor's HOME and provision directory stay protected forever.
+            removeRetainedHomeMarker: (runId: string) => removeRetainedHomeMarker(this.deps.dataDir, runId),
+            hasRetainedHomeMarker: (runId: string, binding?: RetainedHomeBinding) => hasRetainedHomeMarker(this.deps.dataDir, runId, binding),
             ...(this.deps.deadlineMs === undefined ? {} : { deadlineMs: this.deps.deadlineMs }),
           };
           // 7. One bare-lock section inside GitCache.

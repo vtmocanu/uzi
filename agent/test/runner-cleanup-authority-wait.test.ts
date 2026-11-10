@@ -415,6 +415,14 @@ describe("runner.ts: which sites use the cleanup wait", () => {
     assert.ok(receiptSlots.every(s => s.includes("this.authorityWait(flight)")), receiptSlots.join("\n"));
     assert.ok(statement(source.indexOf("await this.inFlightAuthority(flight, () => this.git.recordRemediationRestrictions(")).includes("this.authorityWait(flight)"));
     assert.ok(statement(source.indexOf("await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(")).includes("this.authorityWait(flight)"));
-    assert.equal(starts("this.authorityWait(").length, 15, "live source, remediation and existing admission waits remain enumerated");
+    // issue #3644 m4b: the independent restore seeds a fresh attempt under A. Both of its waits are in-flight source admission
+    // waits of the live flight (the seeding transaction itself and the post-seed remediation-restriction restore), the same
+    // class as bindSource and the attempt seed above, so they use authorityWait with the clone bound and never the cleanup wait.
+    const restoreStart = source.indexOf("private async restoreFromPin(");
+    const restore = source.slice(restoreStart, source.indexOf("\n  private ", restoreStart + 10));
+    const restoreWaits = [...restore.matchAll(/this\.authorityWait\(flight, CLONE_AUTHORITY_WAIT_MS\)/g)];
+    assert.equal(restoreWaits.length, 2, "restoreFromPin: the seeding transaction and the post-seed restriction restore");
+    assert.ok(!restore.includes("this.cleanupAuthorityWait("), "the restore seed has no cleanup wait");
+    assert.equal(starts("this.authorityWait(").length, 17, "live source, remediation, existing admission and the two restore-seed waits remain enumerated");
   });
 });

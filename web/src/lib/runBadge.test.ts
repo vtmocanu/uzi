@@ -1639,7 +1639,8 @@ it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:0
   expect(runStatusTone(status, null)).toBe("warning");
   const badge = runBadge(input, NOW);
   expect(badge).toMatchObject({ label: "retained recovery integrity hold", tone: "warning", pulse: false });
-  expect(badge.kind === "badge" && badge.title).toMatch(/Integrity hold.*remediation record/);
+  expect(badge.kind === "badge" && badge.title).toMatch(/Integrity hold.*retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor/);
+  expect(badge.kind === "badge" && badge.title).toMatch(/The agent did not start/);
   expect(badge.kind === "badge" && badge.title).toMatch(/local work and its custody are preserved/i);
   expect(badge.kind === "badge" && badge.title).toMatch(/owner can Resume or Cancel.*no scheduled retry/);
   expect(badge.kind === "badge" && badge.title).not.toMatch(/automatically|retrying in|retry in/);
