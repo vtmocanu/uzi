@@ -8071,7 +8071,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if ferr != nil {
 			return store.Run{}, ErrForgeBuild
 		}
-		capture, err = issueinput.Fetch(ctx, f, row.ForgeProjectID, issueIID, row.BotForgeUserID)
+		capture, err = issueinput.Fetch(ctx, f, f, row.ForgeProjectID, issueIID, row.BotForgeUserID)
 		if err != nil {
 			if forge.IsIssueResponseTooLarge(err) {
 				return store.Run{}, fmt.Errorf("%w: %w", ErrDescriptionTooLarge, err)

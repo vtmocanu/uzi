@@ -78,7 +78,7 @@ type Forges interface {
 
 // Guard runs the least-privilege checks (*privcheck.Service).
 type Guard interface {
-	CheckToken(ctx context.Context, f forge.Forge, forgeType forge.Type, isAdmin bool) privcheck.TokenReport
+	CheckToken(ctx context.Context, f forge.CodeHost, forgeType forge.Type, isAdmin bool) privcheck.TokenReport
 	GuardRepo(ctx context.Context, in privcheck.GuardInput) privcheck.GuardResult
 }
 

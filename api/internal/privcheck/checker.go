@@ -39,7 +39,7 @@ func NewChecker() *Checker {
 // An introspection-unsupported forge or a transient introspection error becomes
 // a warning, never a blocking violation; the admin check still applies (it rides
 // on VerifyToken, not TokenInfo). now is injectable for tests.
-func (c *Checker) CheckToken(ctx context.Context, f forge.Forge, forgeType forge.Type, isAdmin bool, now time.Time) TokenReport {
+func (c *Checker) CheckToken(ctx context.Context, f forge.CodeHost, forgeType forge.Type, isAdmin bool, now time.Time) TokenReport {
 	info, err := f.TokenInfo(ctx)
 	if err != nil {
 		warn := "could not verify token scopes against the forge; scope/expiry checks were skipped"
@@ -73,7 +73,7 @@ func introspectionUnsupportedWarn(forgeType forge.Type) string {
 // error-as-report: if the token cannot even be verified against the forge
 // (revoked, forge unreachable) the report is StatusError with that finding, not
 // a returned error — a revoked token is exactly what the report must surface.
-func (c *Checker) Check(ctx context.Context, f forge.Forge, forgeType forge.Type, repos []Repo, now time.Time) Report {
+func (c *Checker) Check(ctx context.Context, f forge.CodeHost, forgeType forge.Type, repos []Repo, now time.Time) Report {
 	identity, err := f.VerifyToken(ctx)
 	if err != nil {
 		// A version-gate refusal is a different condition from a bad token, and
@@ -106,7 +106,7 @@ func (c *Checker) Check(ctx context.Context, f forge.Forge, forgeType forge.Type
 
 // checkRepos fans out the per-repo checks with a bounded worker pool, preserving
 // input order in the result.
-func (c *Checker) checkRepos(ctx context.Context, f forge.Forge, botUserID int64, repos []Repo) []RepoReport {
+func (c *Checker) checkRepos(ctx context.Context, f forge.CodeHost, botUserID int64, repos []Repo) []RepoReport {
 	out := make([]RepoReport, len(repos))
 	if len(repos) == 0 {
 		return out
@@ -133,7 +133,7 @@ func (c *Checker) checkRepos(ctx context.Context, f forge.Forge, botUserID int64
 // checkRepo runs the role + branch-protection checks for one repo. A forge call
 // failing mid-repo is a warning on that repo, never a crash — the sweep must
 // keep going across a flaky project.
-func (c *Checker) checkRepo(ctx context.Context, f forge.Forge, botUserID int64, repo Repo) RepoReport {
+func (c *Checker) checkRepo(ctx context.Context, f forge.CodeHost, botUserID int64, repo Repo) RepoReport {
 	rr := RepoReport{RepoID: repo.ID, Path: repo.Path, Findings: []Finding{}}
 
 	role, member, roleErr := f.ProjectRole(ctx, repo.ForgeProjectID, botUserID)
@@ -154,7 +154,7 @@ func (c *Checker) checkRepo(ctx context.Context, f forge.Forge, botUserID int64,
 // evaluateRepo turns one repo's forge answers (the bot's role, and the default
 // branch's protection) into findings. It is pure — no forge calls — and it is
 // the single evaluator both drivers flow through, because checkRepo talks only
-// to the forge.Forge interface and never learns which forge answered. That is
+// to the forge.CodeHost interface and never learns which forge answered. That is
 // what "one shared evaluateRepo" (R12) means here: there is no per-forge branch
 // to keep in step.
 //

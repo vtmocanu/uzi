@@ -206,7 +206,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 	// issue eligibility and one-active-run gates all enforced there), only
 	// with auto_approve set. The description is the fresh forge copy, snapshotted onto
 	// the run exactly as the manual start path snapshots the description it is given.
-	capture, err := issueinput.Fetch(ctx, f, r.ForgeProjectID, iid, cc.BotForgeUserID)
+	capture, err := issueinput.Fetch(ctx, f, f, r.ForgeProjectID, iid, cc.BotForgeUserID)
 	if err != nil {
 		if forge.IsIssueResponseTooLarge(err) {
 			a.recordThenComment(ctx, r, f, iid, eventID, tooLargeComment())

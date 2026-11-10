@@ -591,7 +591,7 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Reason: SkipAlreadyRunning}}}, nil
 	}
 
-	capture, err := issueinput.Fetch(ctx, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
+	capture, err := issueinput.Fetch(ctx, f, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
 	if err != nil {
 		if forge.IsIssueResponseTooLarge(err) {
 			iidCopy := iid
@@ -803,7 +803,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipAlreadyRunning})
 			continue
 		}
-		capture, err := issueinput.Fetch(ctx, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
+		capture, err := issueinput.Fetch(ctx, f, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
 		if err != nil {
 			e.logger.Warn("scheduler: sweep fetch issue", "schedule", sched.ID.String(), "issue", iid, "error", err)
 			reason := SkipFetchFailed

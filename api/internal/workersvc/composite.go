@@ -209,7 +209,7 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 	if err != nil {
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
 	}
-	capture, err := issueinput.FetchWithTimeout(ctx, f, repo.ForgeProjectID, issueIID, repo.BotForgeUserID, issueinput.InteractiveAssessmentTimeout)
+	capture, err := issueinput.FetchWithTimeout(ctx, f, f, repo.ForgeProjectID, issueIID, repo.BotForgeUserID, issueinput.InteractiveAssessmentTimeout)
 	if err != nil {
 		if forge.IsIssueResponseTooLarge(err) {
 			return store.Run{}, fmt.Errorf("%w: %w", ErrDescriptionTooLarge, err)
