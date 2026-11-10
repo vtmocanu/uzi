@@ -526,7 +526,7 @@ describe("buildSelfImprovePlanPrompt", () => {
   it("carries the trusted directive: pick ONE, guardrails, tests, guard-path flag", () => {
     assert.ok(prompt.includes("exactly ONE"));
     assert.ok(prompt.includes("Never weaken uzi's guardrails"));
-    assert.ok(prompt.includes("`task check:<component>`"));
+    assert.ok(prompt.includes("Run economy (agents)"));
     assert.ok(prompt.includes("never merge to `main`"));
     assert.ok(prompt.includes(SELF_IMPROVE_BRANCH));
   });
@@ -627,7 +627,12 @@ describe("buildSelfImprovePlanPrompt — generic vs dogfood directive (PRD #686 
     // In-run validation follows the AGENTS.md run-economy boundary (Taskfile check targets,
     // focused tests, red/green); full gates, full suites and the web production build stay
     // pending exact-head PR CI and are never demanded in-run or reported passed.
-    assert.ok(p.includes("`task check:<component>`"));
+    assert.ok(p.includes("AGENTS.md \"Run economy (agents)\" sets out; it is authoritative"));
+    assert.ok(p.includes("`task test:codex-m4`"));
+    assert.ok(p.includes("`task check:api` plus `go test -race -count=1`"));
+    // Only real Taskfile targets: there is no check:controller.
+    assert.ok(!p.includes("`task check:controller`"), "the prompt must not name a nonexistent check:controller target");
+    assert.ok(p.includes("`task vet:controller`"));
     assert.ok(p.includes("`UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`"));
     assert.ok(p.includes("watched red then green"));
     assert.ok(p.includes("pending exact-head PR CI"));
