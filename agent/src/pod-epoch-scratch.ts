@@ -12,6 +12,11 @@ const SCRATCH_ROOT_SINGLE = "/data/runner/.tmp";
 const SPLIT_WORKER_TMPDIR = "/data/runner/.tmp/uzi-worker";
 /** The two names the entrypoint creates under the pod TMPDIR; never removed in either mode. */
 const PROTECTED_NAMES: ReadonlySet<string> = new Set(["uzi-worker", "uzi-runner"]);
+const ACTIVE_HELPER_PREFIX = "uzi-quiesce-";
+/** A top-level name the scratch reclaim never removes: the protected containers and any live quiesce
+ * helper leaf. The census classifier and the delete launch validator both use this one rule. */
+export const isNeverRemovedScratchName = (name: string): boolean =>
+  PROTECTED_NAMES.has(name) || name.startsWith(ACTIVE_HELPER_PREFIX);
 const POD_ENTRY = "/data/.uzi-pod-entry";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** `O_PATH` (Linux; absent from `fs.constants`), the same idiom as rmtree's PINNED_PRELUDE. */
@@ -616,7 +621,7 @@ export function classifyScratchCensus(input: {
     if (PROTECTED_NAMES.has(e.name)) return "protected_name";
     if (e.type !== "dir") return "not_directory";
     if (!TREE_NAME_RE.test(e.name)) return "name_refused";
-    if (e.name.startsWith("uzi-quiesce-")) return "active_helper";
+    if (e.name.startsWith(ACTIVE_HELPER_PREFIX)) return "active_helper";
     if (e.uid !== input.census.rootUid || e.foreignUid) return "foreign_owner";
     if (e.fsDiffers || input.mountedLeaves.has(e.name)) return "mount";
     if (e.incomplete) return "incomplete";

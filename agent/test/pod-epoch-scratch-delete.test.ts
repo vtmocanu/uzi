@@ -539,6 +539,25 @@ describe("GitCache.discardEpochScratchLeaf", () => {
     assert.equal(x.internal.unsettledDeletes.get(x.key), 1);
   });
 
+  it("the post-delete census is bounded by the caller's deadline", async () => {
+    const seen: number[] = [];
+    for (const [deadline, check] of [[Date.now() + 10_000, (t: number) => t <= 10_000 && t > 1]] as const) {
+      const x = discardFixture({ deadline });
+      x.input.testSeam!.census = async (_root, _expect, _leaf, timeout) => { seen.push(timeout); return censusText("leaf-1", "absent"); };
+      fakeChildDeps(x.internal, { outcome: { stdout: `UZI-SCRATCH-REMOVED ${EXPECT}\n`, code: 0 } });
+      await x.git.discardEpochScratchLeaf(x.input);
+      assert.ok(check(seen.at(-1)!), `timeout ${seen.at(-1)}`);
+    }
+    // A deadline that passes during the join leaves the census 1 ms.
+    const late = discardFixture();
+    late.input.deadline = Date.now() + 300;
+    late.input.testSeam!.census = async (_root, _expect, _leaf, timeout) => { seen.push(timeout); return censusText("leaf-1", "absent"); };
+    fakeChildDeps(late.internal, { outcome: { stdout: `UZI-SCRATCH-REMOVED ${EXPECT}\n`, code: 0 },
+      onSpawn: () => { const until = Date.now() + 350; while (Date.now() < until) { /* hold past the deadline */ } } });
+    await late.git.discardEpochScratchLeaf(late.input).catch(() => undefined);
+    assert.equal(seen.at(-1), 1);
+  });
+
   it("a settled outcome removes the unsettledDeletes entry before it settles the ticket", async () => {
     const x = discardFixture();
     const begin = x.f.scope.beginMutation.bind(x.f.scope);

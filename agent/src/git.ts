@@ -31,7 +31,7 @@ import { processGroupAlive } from "./tick-spawner.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { PINNED_SUBTREE_SCRIPT, SCRATCH_DELETE_LIMITS, TREE_NAME_RE, censusScratchRoot, rmRunnerTeardownTree } from "./rmtree.js";
-import { absorbBareConfigValue, classifyScratchSettlement, newPathSink, parseScratchCensus, postCensusOf, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
+import { absorbBareConfigValue, classifyScratchSettlement, isNeverRemovedScratchName, newPathSink, parseScratchCensus, postCensusOf, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
@@ -3931,7 +3931,7 @@ export class GitCache {
     if (dash !== "-e" || script !== PINNED_SUBTREE_SCRIPT ||
         !(EPOCH_SCRATCH_ROOTS.has(root!) || seamRoot !== undefined && root === seamRoot) ||
         // The names the census never admits are refused here too, at the last gate before removal.
-        !TREE_NAME_RE.test(name!) || name === "uzi-worker" || name === "uzi-runner" || name!.startsWith("uzi-quiesce-") ||
+        !TREE_NAME_RE.test(name!) || isNeverRemovedScratchName(name!) ||
         max !== String(lim.maxEntries) || budget !== String(lim.budgetMs) ||
         mode !== "remove" || !pair.test(expect!) || sync !== "" || phase !== "pinned" || !pair.test(rootExpect!) ||
         oneFs !== "1" || depth !== String(lim.maxDepth)) return refuse();
@@ -3990,7 +3990,9 @@ export class GitCache {
       const rootRepinOk = input.rootRepin();
       const mountsOk = input.mountsOk();
       const census = await (seam?.census ?? censusScratchRoot)(root, input.rootExpect, input.name,
-        // Bounded by the caller's deadline too; a census cut short is unreadable, so unresolved.
+        // Bounded by the caller's deadline too. Near it the census runs with no walk budget and reports
+        // the leaf incomplete (no receipt: unresolved, never residue; a receipt with the name gone still
+        // settles removed), or is killed before it starts (unreadable: unresolved). Both fail closed.
         Math.max(1, Math.min(EPOCH_SCRATCH_CENSUS_TIMEOUT_MS, input.deadline - Date.now())));
       const parsed = parseScratchCensus(census, input.rootExpect);
       const postCensus = "refused" in parsed ? { state: "unreadable" as const }
