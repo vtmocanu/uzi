@@ -68,7 +68,7 @@ Acceptance: the group lists exactly the viewer's own decisions shown on the prev
 
 ## Delivered
 
-Shipped on branch agent/issue-3875 in two milestones. Web only; no API, migration or workflow edit. Tests: `web/src/components/CommandMenu.test.tsx` (component), `web/src/components/CommandMenu.browser.test.tsx` (real browser), `web/src/components/AppShell.test.tsx` (sidebar characterization), `web/src/pages/OverviewNext.test.tsx` (Search button). Screenshots are in the PR body.
+Shipped on branch agent/issue-3875 in two milestones. Web only: no API code, migration or workflow edit (the only file under `api/` is the regenerated docs mirror). Tests: `web/src/components/CommandMenu.test.tsx` (component), `web/src/components/CommandMenu.browser.test.tsx` (real browser), `web/src/components/AppShell.test.tsx` (sidebar characterization), `web/src/pages/OverviewNext.test.tsx` (Search button). Screenshots against the mock (desktop and 400 px, Ember and Dawn) were captured in-run by the browser validator; they are attached to the PR when it is landed.
 
 ### Outcome
 
@@ -88,7 +88,7 @@ Shipped on branch agent/issue-3875 in two milestones. Web only; no API, migratio
 - Component tests for open/close, filtering, Enter, arrows, Escape, focus return and admin gating: `CommandMenu.test.tsx`, plus focused browser cases in `CommandMenu.browser.test.tsx`.
 - Shortcut does nothing while another modal dialog is open: `CommandMenu.test.tsx` ("does nothing while another modal dialog is open").
 - Bidi and control characters stripped, repo paths masked in demo mode, links built from loaded IDs only: `CommandMenu.test.tsx` (repo path, demo mode and "builds the target from the loaded run id only" cases).
-- Screenshots (desktop and 400 px): in the PR body. The 400 px layout is also checked in `CommandMenu.browser.test.tsx` (panel fits, no horizontal overflow).
+- Screenshots (desktop and 400 px): captured in-run side by side with the mock in Ember and Dawn, attached to the PR at landing. The 400 px layout is also checked in `CommandMenu.browser.test.tsx` (panel fits, no horizontal overflow).
 
 ### Milestones
 
@@ -107,4 +107,4 @@ Shipped on branch agent/issue-3875 in two milestones. Web only; no API, migratio
 - **PR items open the run page**, not the forge PR, so navigation stays within the app. The label uses the forge's MR reference ("Review PR !N").
 - **The park hint is "Parked"**, not "Resume".
 - **Mock deviations**: the keyboard hint is platform-aware; per-repo "Open board: <repo>" items replace "Start a run on an issue"; the sidebar's Admin destination replaces "Health checks"; the group order follows the mock but every decision is listed (no per-kind cap).
-- **Deferred**: a per-kind cap or summary rows for long decision lists; matching hints and run titles in search; a lighter shadow than the mock; the 400 px keyboard-hint label.
+- **Deferred**: a per-kind cap or summary rows for long decision lists; matching hints and run titles in search; a lighter shadow than the mock; the 400 px keyboard-hint label; rejecting a bare `..` run or repo id client-side (server-minted ids; it resolves in-app only).

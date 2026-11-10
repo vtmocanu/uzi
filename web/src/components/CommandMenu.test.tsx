@@ -769,7 +769,7 @@ describe("Needs you group", () => {
     expect(within(menu() as HTMLElement).getByRole("status").textContent).toContain("Boards unavailable");
   });
 
-  it("fetches runs and holds once per open; a late response after unmount throws and a reopen shows only its own decisions", async () => {
+  it("fetches runs and holds once per open; a late response after unmount is ignored and a reopen shows only its own decisions", async () => {
     let resolveFirst: (v: { runs: RunSummaryItem[] }) => void = () => {};
     listRunsMock.mockReturnValueOnce(new Promise((r) => (resolveFirst = r)));
     const mount = () =>
