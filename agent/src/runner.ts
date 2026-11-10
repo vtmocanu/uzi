@@ -138,7 +138,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, PredecessorAuthorityLost, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type PredecessorMeasurements, type RecoveryOutcome, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
+import { RecoveryCoordinator, PredecessorAuthorityLost, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryCloneKey, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type PredecessorMeasurements, type RecoveryOutcome, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -734,16 +734,6 @@ interface PredecessorBoundaryRegistration {
   markSettlementLate(): void;
   /** Kills the token; `live()` is false afterwards. */
   dispose(): void;
-}
-
-/** Canonical key of a clone set's [clonePath, branch, head, dev:ino] tuples, or undefined when any head/identity is absent. */
-function predecessorBaselineKey(clones: ReadonlyArray<{ clonePath: string; branch: string; head?: string; identity?: string }>): string | undefined {
-  const tuples: string[][] = [];
-  for (const c of clones) {
-    if (typeof c.head !== "string" || typeof c.identity !== "string") return undefined;
-    tuples.push([c.clonePath, c.branch, c.head, c.identity]);
-  }
-  return JSON.stringify(tuples.sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0)));
 }
 
 /** Runner-local capability, valid only inside its matching flight's callback. */
@@ -3628,6 +3618,12 @@ export class RunRunner {
         log: this.log,
         recoveryRoot: this.git.recoveryRoot,
         terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
+        // Operator Case B: the clone inventory with identities, and the worker-wide retained-source view (no selector,
+        // no bare filter: the coordinator filters and judges completeness itself).
+        operatorSourceEvidence: async (runId, bare, signal) => ({
+          e1: await this.git.readInventoryCloneHeads(bare, runId, { cloneIdentity: true }),
+          e2: await this.git.inspectRetainedSources({ isLivePath: p => this.liveAttempts.isLivePath(p), ...(signal ? { signal } : {}) }),
+        }),
         pendingGenerationReport: (runId, generation) => !!this.outbox &&
           (this.outbox.isDisabled() || this.outbox.hasPendingTerminal(runId, generation) ||
             !!this.outbox.finalizeRecordIdentity(runId, generation)),
@@ -4430,7 +4426,7 @@ export class RunRunner {
     if (!tail || this.executionTails.get(flight.runId) !== tail) throw new TrustedExecutionRefusal("predecessor boundary needs the flight's own execution tail");
     if (opts.generations.length === 0 || opts.generations.some(g => !Number.isSafeInteger(g) || g < 1 || g >= flight.claimGeneration))
       throw new TrustedExecutionRefusal("predecessor boundary generation is not below the executing claim");
-    const baseline = opts.baseline === undefined ? undefined : predecessorBaselineKey(opts.baseline);
+    const baseline = opts.baseline === undefined ? undefined : inventoryCloneKey(opts.baseline);
     if (opts.baseline !== undefined && baseline === undefined) throw new TrustedExecutionRefusal("predecessor boundary baseline is incomplete");
     const token = Object.freeze({});
     const grant: PredecessorBoundaryGrant = {
@@ -4511,7 +4507,10 @@ export class RunRunner {
       grant?.refusals.push(clonePath === undefined ? { check } : { check, clonePath });
       return refuse(diagnostic);
     };
-    const read = () => grant ? this.git.readInventoryCloneHeads(barePath, runId, { cloneIdentity: true })
+    // Operator Case B record disposition: the sources stay in place, so they need not be clean, but they must be
+    // exactly the confirmed ones (path, branch, head, dev:ino). Only the ordinary (grant-free) boundary honours it.
+    const record = grant ? undefined : context.recordDisposition;
+    const read = () => grant || record ? this.git.readInventoryCloneHeads(barePath, runId, { cloneIdentity: true })
       : this.git.readInventoryCloneHeads(barePath, runId);
     // Held validity and the grant's own liveness, before and after each clone.
     const scope = (): void => {
@@ -4526,13 +4525,14 @@ export class RunRunner {
     const inventory = await read();
     if (inventory.kind !== "verified")
       return fail("inventory_read_not_verified", { check: "inventory_read_not_verified", cause: inventoryReadCause(inventory) });
+    if (record && inventoryCloneKey(inventory.clones) !== record.expectedClones) return fail("source_identity_changed", { check: "source_identity_changed" });
     const identity = JSON.stringify({ heads: inventory.heads, clones: inventory.clones });
     if (state.sourceIdentity !== undefined && state.sourceIdentity !== identity) return fail("source_identity_changed", { check: "source_identity_changed" });
     state.sourceIdentity = identity;
     // The cross-call baseline: per-clone path, branch, head and dev:ino. Seeded once, compared on every prove.
     const baselineDrift = (clones: typeof inventory.clones): boolean => {
       if (!grant) return false;
-      const key = predecessorBaselineKey(clones);
+      const key = inventoryCloneKey(clones);
       if (key === undefined) return true;
       grant.baseline ??= key;
       return grant.baseline !== key;
@@ -4567,7 +4567,8 @@ export class RunRunner {
         return fail("process_not_quiescent_before_git", inventoryProcessDiagnostic("process_not_quiescent_before_git", before.process, otherClaimInFlight), clone.clonePath);
       if (!grant) {
         // Ordinary terminal FINAL: byte-for-byte base behaviour (worktreeStatus, no content proof, caps or budget).
-        const status = await this.git.worktreeStatus(clone.clonePath);
+        // A record disposition leaves the source untouched, so only its cleanliness is not required.
+        const status = record ? "" : await this.git.worktreeStatus(clone.clonePath);
         const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
         if (status === null) return fail("worktree_status_unreadable", { check: "worktree_status_unreadable" }, clone.clonePath);
         if (status.length !== 0) return fail("worktree_status_dirty", { check: "worktree_status_dirty" }, clone.clonePath);
@@ -17683,7 +17684,7 @@ export class RunRunner {
 
   /** issue #3885 — the retained-source channel's resolve-local-record port: operator resolution of one guarded
    *  local record generation (case A1 cleanup, or case A2 replay of the saved FINAL then cleanup). */
-  resolveLocalRecord(input: OperatorRequestSignals & { runId: string; generation: number; confirm: string }):
+  resolveLocalRecord(input: OperatorRequestSignals & { runId: string; generation: number; confirm: string; action?: "case_b" }):
     Promise<ResolveLocalRecordResult> {
     return this.recovery.resolveLocalRecord(input);
   }

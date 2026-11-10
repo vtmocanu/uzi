@@ -80,7 +80,7 @@ export interface RetainedSourceRunnerPort {
   /** issue #3885: operator resolution of one guarded local record generation. The coordinator takes
    *  authority A itself, so the channel must call it outside any authority transaction. */
   resolveLocalRecord(
-    input: OperatorRequestSignals & { runId: string; generation: number; confirm: string },
+    input: OperatorRequestSignals & { runId: string; generation: number; confirm: string; action?: "case_b" },
   ): Promise<ResolveLocalRecordResult>;
 }
 

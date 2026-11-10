@@ -120,7 +120,8 @@ test("a multi-generation run: local-records names each case, A1 then A2 retire, 
   // 2. local-records (the real client): each generation by its own case.
   const described = await localRecords(w);
   assert.equal(described.ok, true);
-  assert.deepEqual(classes(described), { 7: "case_a_ack", 8: "case_a_replay", 9: "case_b_pending_owner_review" });
+  // Generation 9 is Case B by its records, but the other run's shared owed pin makes its retained source not exclusive.
+  assert.deepEqual(classes(described), { 7: "case_a_ack", 8: "case_a_replay", 9: "source_not_exclusive:shared_owed_pin" });
   const digestA1 = digestOf(described, 7);
   digestOf(described, 8);
   assert.equal((described.result.generations as Json[]).find(g => g.generation === 9)?.digest, undefined, "Case B offers no digest");
@@ -150,7 +151,7 @@ test("a multi-generation run: local-records names each case, A1 then A2 retire, 
   assert.ok(a2Refs.length >= 2, a2Refs.join());
   const request = a2.record.finalRequest!;
   const described2 = await localRecords(w);
-  assert.deepEqual(classes(described2), { 8: "case_a_replay", 9: "case_b_pending_owner_review" });
+  assert.deepEqual(classes(described2), { 8: "case_a_replay", 9: "source_not_exclusive:shared_owed_pin" });
   const stale = await resolve(w, 8, digestA1);
   assert.equal(stale.code, 1);
   assert.deepEqual(stale.json.result, { kind: "refused", reason: "descriptor_changed" });
@@ -167,9 +168,9 @@ test("a multi-generation run: local-records names each case, A1 then A2 retire, 
   assert.equal(after.disposition.kind, "resolve_local_record", JSON.stringify(after.disposition));
   assert.deepEqual([...new Set((after.disposition.records as Json[]).filter(r => r.generation !== null).map(r => r.generation))], [9]);
   const left = await localRecords(w);
-  assert.deepEqual(classes(left), { 9: "case_b_pending_owner_review" });
+  assert.deepEqual(classes(left), { 9: "source_not_exclusive:shared_owed_pin" });
   const refusedB = await resolve(w, 9, "a".repeat(64));
-  assert.deepEqual(refusedB.json.result, { kind: "refused", reason: "case_b_pending_owner_review" });
+  assert.deepEqual(refusedB.json.result, { kind: "refused", reason: "source_not_exclusive:shared_owed_pin" });
   assert.equal(w.client.posts.length, 1);
 
   // 7. Byte equality of everything that was not retired.
