@@ -390,6 +390,10 @@ shadow fields are unchanged. With the gate off these counters stay `0` and
 every tree. See [Verified-epoch reclaim](./run-recovery.md#verified-epoch-reclaim-prd-3431)
 for the admitted shapes, budgets and crash residuals.
 
+The line also carries a `scratch` object for the runner `TMPDIR` scratch phase
+(#4043). That phase has its own off-by-default gate, so the object reads
+`state: "not_run"`; see [Runner TMPDIR scratch](./worker-setup.md) for its fields.
+
 The administrator's `workers.docker.podEpochReclaim.runtime` defaults to unset.
 A fresh default-off pod logs `deferred` / `runtime_not_declared` immediately
 after startup reaping, without waiting for predecessor evidence; keeping trees

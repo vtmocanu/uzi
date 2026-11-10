@@ -197,3 +197,57 @@ retention deletion stays off remain true in production. The mechanism is recorde
   tree removal's parent directory under `runner-shared` is not fsynced.
 - **Not verified.** No hosted run of the deletion phase on a real `runner-shared` PVC; it is
   maintainer-owned live acceptance, like the list above.
+
+## Amendment 2026-11-10 — issue #4043: gated runner-`TMPDIR` scratch reclaim
+
+Issue #4043 adds a scratch-only reclaim phase to the [PRD #3431](../prds/3431-pod-epoch-reclaim.md)
+pod-epoch pass. It narrows D4 ("no new cleanup authority") and D5 ("automatic retention deletion
+stays off") for the runner-`TMPDIR` scratch root only; clones, `.retire-*` leftovers, retained
+sources and every other path under `runner-shared` are unchanged, and D9's custody procedure stays
+binding. The amendment of 2026-11-06 above is unaffected.
+
+- **Gate.** `EPOCH_SCRATCH_DELETION_ENABLED` (`agent/src/pod-epoch-reclaim.ts`) is `false` and
+  independent of `EPOCH_RECLAIM_DELETION_ENABLED`: neither gate opens the other's phase. While it
+  is off, startup runs no census, starts no new child and reads no new path. Activation needs a
+  separate owner decision recorded on issue #4043; until then the D4, D5, D8 and Consequences
+  statements remain true in production.
+- **Authority.** Only inside the existing pass, under held EX, at a fresh shadow verdict
+  `eligible` with authority `attested`, with the pass intact (not invalidated or aborted). The
+  phase runs before the attempt-deletion phase and shares its reclaim scope. Process scans, daemon
+  listings, mount tables and ctimes are exclusion proofs only: each can keep a leaf, none can admit
+  one.
+- **Refusals (whole phase, fixed reason, attempt phase continues).** Anything but the exact
+  layouts (uid-split root `/data/runner/.tmp/uzi-runner`, runner-owned `0700`; single-uid root
+  `/data/runner/.tmp`); a root that cannot be pinned component by component; an unexpected mount
+  above or inside the root; a filesystem other than ext4 or XFS; an unknown or unreadable Docker
+  bind-source inventory; unreadable or malformed protected recovery records; an invalid pod-entry
+  record; a failed exclusive-idle proof; a census that fails or would overrun the pass deadline.
+- **Never removed.** The root itself; `uzi-worker` and `uzi-runner`; dot-names and other refused
+  names; non-directories; leaves owned by another uid or containing foreign-owned entries; mounted
+  or other-filesystem leaves; leaves a Docker bind source or a protected recovery record
+  references; leaves a visible process holds open or uses as its cwd; `uzi-quiesce-*` helper leaves; and
+  any leaf whose newest subtree ctime is at or after the pod-entry fence (record ctime minus 2 s).
+  At most 512 leaves are admitted per pass, in name order.
+- **Deletion.** Top-level leaves are censused read-only as the runner uid, then deleted one at a
+  time. Before each delete the mounts, daemon inventory, leaf census, idle proof and process
+  holders are re-read; any change keeps that leaf or stops the phase. The strict pinned helper
+  stays on one filesystem, re-pins every descendant and prints a removal receipt only after its own
+  final `rmdir` succeeded and the retained leaf pin reports `nlink` 0.
+- **Settlement.** Each leaf settles as removed or residue before the next starts; three retained
+  leaves stop the phase. A delete that cannot be settled (or a pending child or stop latch) is
+  fatal: EX is kept, nothing is admitted and the process exits non-zero, as for M1b.
+- **Bytes.** Reported figures are allocated-block estimates from the census (hard-linked bytes
+  counted separately), not proof of freed storage.
+- **Costs (bounded work, separate from the byte estimates).** The census reads at most 4096
+  top-level entries, 200,000 entries per leaf and 2,000,000 in total, to depth 256, within the pass
+  budget minus a 10 s margin; each per-leaf re-census is capped at 30 s; each delete helper at
+  2,000,000 entries, depth 256 and 300 s; the whole phase stays inside the existing 600 s pass
+  with its 5 s settlement reserve. With the gate off none of this runs. The real-UID image lane's
+  runtime change from the new split-mode leaf is unmeasured (that lane could not run in-run).
+- **Residuals, not accepted until activation.** A historical-pod writer (the #3431 residual) can
+  still write inside the revalidation windows between the last re-check and the helper's pin; a
+  transient uid switch between scans is not observed; a clock step weakens only the ctime fence
+  (the other exclusions stand); the byte figure is an estimate. Activation requires the owner to
+  accept these.
+- **Not verified.** No hosted before/after-byte acceptance on a real `runner-shared` PVC; that is
+  owner-owned, like the list above.
