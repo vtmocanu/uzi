@@ -83,8 +83,11 @@ type Handler struct {
 	// forgeFactory, when non-nil, replaces h.svc.ForgeForConnection for the forge-view
 	// read routes (PRD #1255 M2a), so their handlers can be exercised against a
 	// forgetest.BaseFake without a live forge or a wired forgesvc.Service (the auth
-	// live-DB suite injects one). nil in production — New leaves it unset and
-	// forgeForConnection falls back to h.svc. Mirrors tmplWriteStore.
+	// live-DB suite injects one). It also covers the repo-side wrappers
+	// issueTrackerForRepo and codeHostForRepo, which return the factory's value
+	// (narrowed to its half) instead of calling h.svc.IssueTrackerForRepo or
+	// h.svc.CodeHostForRepo. nil in production — New leaves it unset and the
+	// wrappers fall back to h.svc. Mirrors tmplWriteStore.
 	forgeFactory func(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
 	// forgeMemo folds duplicate forge reads under the forge-view routes (PRD #1255
 	// M2b, D4): a short-TTL + singleflight memo so N terminals polling one PR cost
@@ -482,6 +485,32 @@ func (h *Handler) forgeForConnection(forgeType, baseURL string, tokenCiphertext 
 		return h.forgeFactory(forgeType, baseURL, tokenCiphertext)
 	}
 	return h.svc.ForgeForConnection(forgeType, baseURL, tokenCiphertext)
+}
+
+// issueTrackerForRepo builds the issue-tracker half of a repo's forge, going through
+// the injected forgeFactory when one is set and otherwise through
+// forgesvc.Service.IssueTrackerForRepo. Like forgeForConnection it returns nil on error.
+func (h *Handler) issueTrackerForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.IssueTracker, error) {
+	if h.forgeFactory != nil {
+		f, err := h.forgeFactory(forgeType, baseURL, tokenCiphertext)
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
+	return h.svc.IssueTrackerForRepo(ctx, repoID, forgeType, baseURL, tokenCiphertext)
+}
+
+// codeHostForRepo is issueTrackerForRepo for the code-host half.
+func (h *Handler) codeHostForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.CodeHost, error) {
+	if h.forgeFactory != nil {
+		f, err := h.forgeFactory(forgeType, baseURL, tokenCiphertext)
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
+	return h.svc.CodeHostForRepo(ctx, repoID, forgeType, baseURL, tokenCiphertext)
 }
 
 // memo returns the process-wide forge-view read memo (PRD #1255 M2b), constructing
