@@ -78,8 +78,12 @@ func TestUserJudgeRunsOnRoundTripLiveDB(t *testing.T) {
 		t.Fatalf("absent changed the column: %v", v)
 	}
 
-	// An unknown value is refused before any write, even next to a valid field.
-	for _, body := range []string{`{"judge_runs_on":"other"}`, `{"judge_runs_on":"","mr_rework_enabled":true}`, `{"judge_runs_on":7}`} {
+	// An unknown value is refused before any write, even next to a valid field. default_effort
+	// is written earlier than judge_runs_on in PutMySettings, so it must stay unchanged.
+	if rec := f.putSettings(`{"default_effort":"low"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set default_effort: %d %s", rec.Code, rec.Body.String())
+	}
+	for _, body := range []string{`{"judge_runs_on":"other"}`, `{"judge_runs_on":"","default_effort":"high"}`, `{"judge_runs_on":7}`} {
 		rec := f.putSettings(body)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("PUT %s = %d %s, want 400", body, rec.Code, rec.Body.String())
@@ -91,6 +95,13 @@ func TestUserJudgeRunsOnRoundTripLiveDB(t *testing.T) {
 	}
 	if v := f.storedJudgeRunsOn(); v == nil || *v != "codex" {
 		t.Fatalf("a refused PUT changed the column: %v", v)
+	}
+	var effort *string
+	if err := f.pool.QueryRow(f.ctx, `SELECT default_effort FROM users WHERE id = $1`, f.user).Scan(&effort); err != nil {
+		t.Fatalf("read default_effort: %v", err)
+	}
+	if effort == nil || *effort != "low" {
+		t.Fatalf("a refused PUT partially wrote default_effort: %v, want low", effort)
 	}
 
 	if rec := f.putSettings(`{"judge_runs_on":"claude"}`); rec.Code != http.StatusOK {

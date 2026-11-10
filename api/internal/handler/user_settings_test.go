@@ -1654,3 +1654,45 @@ func TestPutMySettingsNowSummaryRoundTripAndClear(t *testing.T) {
 		t.Fatalf("response now_summary_enabled = %v, want null", *got)
 	}
 }
+
+// PRD #3257: judge_runs_on is tri-state on PUT: absent leaves it, a value sets it, null
+// clears it, and an unknown value is a 400 that writes nothing.
+func TestPutMySettingsJudgeRunsOn(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	put := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.PutMySettings(rec, authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(body)))))
+		return rec
+	}
+
+	if rec := put(`{"judge_runs_on":"codex"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set: %d %s", rec.Code, rec.Body.String())
+	}
+	if !db.judgeRunsOn.Valid || db.judgeRunsOn.String != "codex" {
+		t.Fatalf("stored = %+v, want codex", db.judgeRunsOn)
+	}
+
+	if rec := put(`{"default_effort":"low"}`); rec.Code != http.StatusOK {
+		t.Fatalf("absent: %d %s", rec.Code, rec.Body.String())
+	}
+	if !db.judgeRunsOn.Valid || db.judgeRunsOn.String != "codex" {
+		t.Fatalf("absent changed judge_runs_on: %+v", db.judgeRunsOn)
+	}
+
+	for _, body := range []string{`{"judge_runs_on":"other"}`, `{"judge_runs_on":""}`, `{"judge_runs_on":7}`} {
+		if rec := put(body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("PUT %s = %d, want 400", body, rec.Code)
+		}
+	}
+	if !db.judgeRunsOn.Valid || db.judgeRunsOn.String != "codex" {
+		t.Fatalf("a refused PUT changed judge_runs_on: %+v", db.judgeRunsOn)
+	}
+
+	if rec := put(`{"judge_runs_on":null}`); rec.Code != http.StatusOK {
+		t.Fatalf("clear: %d %s", rec.Code, rec.Body.String())
+	}
+	if db.judgeRunsOn.Valid {
+		t.Fatalf("stored after null = %+v, want NULL", db.judgeRunsOn)
+	}
+}

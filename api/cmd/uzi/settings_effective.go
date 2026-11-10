@@ -78,7 +78,16 @@ func effectiveSettingsRows(s apitypes.UserSettingsDTO, e *apitypes.EffectiveSett
 	rows := effectiveStartRows(e)
 	rows = append(rows, modelRows("worker_model")...)
 	rows = append(rows, effortRows("worker_effort")...)
-	rows = append(rows, modelSettingRows("judge", s.JudgeModels)...)
+	// The judge rows come from the settings read; carry the effective judge_model cell's notes
+	// (not_used on the lane the judge will not run on, PRD #3257) onto the row of that harness.
+	for _, r := range modelSettingRows("judge", s.JudgeModels) {
+		for _, c := range e.Models[:min(len(e.Models), 12)] {
+			if c.Setting == "judge_model" && c.Harness == r.Harness {
+				r.Notes = c.Notes
+			}
+		}
+		rows = append(rows, r)
+	}
 	rows = append(rows, modelSettingRows("summary", s.SummaryModels)...)
 	rows = append(rows, modelRows("task_review_model")...)
 	return append(rows, effortRows("task_review_effort")...)

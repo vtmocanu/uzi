@@ -76,3 +76,34 @@ func TestSettingsGetJudgeRunsOn(t *testing.T) {
 		t.Fatalf("--json = %s, want judge_runs_on codex and effective.judge_harness codex/user_default", out)
 	}
 }
+
+// TestSettingsGetJudgeNotUsedNote pins that the not_used note of the effective judge_model cell
+// reaches the judge row of the lane the judge will not run on (PRD #3257), and only that row.
+func TestSettingsGetJudgeNotUsedNote(t *testing.T) {
+	e := effectiveFixture()
+	for i, c := range e.Models {
+		if c.Setting == "judge_model" && c.Harness == "claude" {
+			e.Models[i].Notes = []string{"not_used"}
+		}
+	}
+	fc := &uzicli.FakeClient{Settings: settingsWithLegacyCells(), Effective: e}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	var claude, codex string
+	for _, l := range strings.Split(out, "\n") {
+		switch f := fields(l); {
+		case strings.HasPrefix(f, "judge claude "):
+			claude = f
+		case strings.HasPrefix(f, "judge codex "):
+			codex = f
+		}
+	}
+	if want := "judge claude Default haiku haiku instance default · not used: the judge runs on the other harness"; claude != want {
+		t.Fatalf("claude judge row = %q, want %q", claude, want)
+	}
+	if strings.Contains(codex, "not used") || codex == "" {
+		t.Fatalf("codex judge row = %q, want a row without the not-used note", codex)
+	}
+}

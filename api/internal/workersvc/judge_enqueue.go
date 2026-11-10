@@ -247,8 +247,8 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	}
 	// Gate 5: per-user spend guards (PRD #69 M5, Decision 9). Count-based, best-effort,
 	// applied in EVERY mode (a runaway loop is a footgun even for an opted-in user). On
-	// trip: skip silently (like a Gate 3/4 miss), debug-logged — no defer, no queue, no
-	// notification. Deliberately FAIL-OPEN, the opposite of Gates 2–4: those gate
+	// trip: skip silently (like a Gate 3 miss), debug-logged — no defer, no queue, no
+	// notification. Deliberately FAIL-OPEN, the opposite of Gates 2–3 and Gate 4 below: those gate
 	// correctness/consent and fail closed; these are a soft anti-runaway cost backstop,
 	// so on ANY read error (settings or query) we do NOT trip the guard — we proceed to
 	// enqueue (a query error is logged at warn). A transient DB/settings hiccup must
@@ -503,7 +503,7 @@ func composeThenFixDescription(findings []store.TaskReviewFinding) string {
 // it silently (debug-logged). Called in every mode, after the correctness/consent gates
 // and before the idempotency insert.
 //
-// FAIL-OPEN by design (opposite to Gates 2–4): on ANY read error, settings or query, it
+// FAIL-OPEN by design (opposite to Gates 2–3 and Gate 4): on ANY read error, settings or query, it
 // returns true so the enqueue proceeds — the guards are a soft cost backstop, and a
 // transient DB/settings hiccup must never silently disable judging. A query error is
 // logged at warn; the generous defaults keep the guard to genuine runaways. s.settings

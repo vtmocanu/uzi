@@ -23,5 +23,5 @@ ALTER TABLE users ADD CONSTRAINT users_judge_runs_on_check
 -- not run in this deployment (store.Migrate only goes up).
 SET LOCAL lock_timeout = '5s';
 
-ALTER TABLE users DROP CONSTRAINT users_judge_runs_on_check;
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_judge_runs_on_check;
 ALTER TABLE users DROP COLUMN IF EXISTS judge_runs_on;
