@@ -7,7 +7,7 @@ import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { GitCache, restoreJournalJson } from "../src/git.js";
+import { GitCache, parseRetainedDescriptorShape, restoreJournalJson } from "../src/git.js";
 import { restoreRefProtection, restoreTombstoneJson, type RestoreBasis } from "../src/restore-journal.js";
 import { classifyScratchCensus, parseScratchCensus, postCensusOf } from "../src/pod-epoch-scratch.js";
 import { SCRATCH_CENSUS_SCRIPT, censusScratchRoot, runAgentHelper } from "../src/rmtree.js";
@@ -335,6 +335,26 @@ for (const stage of ["seeding", "ready", "retired"] as const) {
     assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "read", paths: [pPath, sPath] });
   });
 }
+
+for (const [key, value] of [
+  ["uzi-retained.run1.journal", "not-json"],
+  ["uzi-retained.run1.journal", "{}"],
+  ["uzi-retained.run1.other", "{}"],
+] as const) {
+  test(`scratch protection refuses a malformed retained descriptor: ${key}=${value}`, async t => {
+    const { cache } = cacheWithBare(t, { [key]: value });
+    assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "unknown", reason: "bare_value_unparseable" });
+  });
+}
+
+test("scratch protection reads paths from a well-formed protected retained descriptor", async t => {
+  const pPath = "/data/runner/.tmp/uzi-runner/predecessor", sPath = "/data/runner/.tmp/uzi-runner/successor";
+  const value = JSON.stringify({ version: 1, branch: "agent/issue-1", key: "issue-1",
+    journal: { runId: "run1", clonePath: pPath, retainedSources: [{ runId: "run1", clonePath: sPath }] } });
+  assert.doesNotThrow(() => parseRetainedDescriptorShape("run1", value), "the control satisfies the existing retained reader");
+  const { cache } = cacheWithBare(t, { "uzi-retained.run1.journal": value });
+  assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "read", paths: [pPath, sPath] });
+});
 
 test("collectEpochScratchProtectedPaths surfaces a malformed store, an abort and a spent deadline", async t => {
   const { data, cache } = cacheWithBare(t);

@@ -4524,10 +4524,18 @@ export class GitCache {
             // undecodable. Refuse every valueless uzi-* key rather than silently omitting one.
             if (nl < 0) return { state: "unknown", reason: "bare_value_unparseable" };
             const value = item.slice(nl + 1);
-            // Match the restore reader's existing protect-all result, not just JSON syntax. Empty
-            // cleared values remain accepted; no new schema policy is imposed on other families.
+            // Reuse the existing restore protect-all and retained-descriptor contracts, not just
+            // JSON syntax. Empty cleared values remain accepted; other families keep path collection.
             if (restoreKeyBranch(key) !== undefined && restoreRefProtection([value]).all)
               return { state: "unknown", reason: "bare_value_unparseable" };
+            if (key.startsWith("uzi-retained.")) {
+              const retained = /^uzi-retained\.([^.]+)\.journal$/.exec(key);
+              if (!retained) return { state: "unknown", reason: "bare_value_unparseable" };
+              if (value !== "") {
+                try { parseRetainedDescriptorShape(retained[1]!, value); }
+                catch { return { state: "unknown", reason: "bare_value_unparseable" }; }
+              }
+            }
             if (absorbBareConfigValue(key, value, sink) !== "ok") return { state: "unknown", reason: "bare_value_unparseable" };
           }
           return undefined;
