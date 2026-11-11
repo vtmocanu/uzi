@@ -202,7 +202,7 @@ Settings → Issue trackers, the CLI commands, a setup page under `docs/`.
 
 ## Risks
 
-- **Size of M2.** 53 production and 31 test files, mechanical. A type-checked inventory of forge calls was the guard.
+- **Size of M2.** 54 production and 31 test files, mechanical. A type-checked inventory of forge calls was the guard.
 - **Drift from `main` between milestones.** Each milestone's branch is rebased on `main` before its PR.
 - **YouTrack specifics leak into the seam.** The id adapter (D10) and the tag rules (D14) stay inside the driver, the contract suite runs on all four implementations, and the second issue tracker (Asana) is the real test of the seam.
 
