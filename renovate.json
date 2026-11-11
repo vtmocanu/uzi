@@ -146,6 +146,12 @@
       "groupName": "npm lint tooling"
     },
     {
+      "description": "Playwright: test-web-browser runs in mcr.microsoft.com/playwright:v<version>-noble, which bakes the browsers for exactly web's playwright npm pin; check:playwright-image-parity requires them equal, so one PR moves both.",
+      "matchPackageNames": ["playwright", "mcr.microsoft.com/playwright"],
+      "groupName": "playwright",
+      "separateMajorMinor": false
+    },
+    {
       "description": "oasdiff is pinned four times (Taskfile version plus three platform archives in scripts/oasdiff.sh); scripts/oasdiff.test.sh requires them equal, so single-pin PRs can never go green. Distinct depName aliases share packageName oasdiff/oasdiff.",
       "matchPackageNames": ["oasdiff/oasdiff"],
       "groupName": "oasdiff",
