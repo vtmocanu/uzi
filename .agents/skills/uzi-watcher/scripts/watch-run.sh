@@ -80,9 +80,10 @@
 # A retained_continuation_unwitnessed park (server-only; a claimed flight never witnessed starting)
 # also always stops as an owner decision regardless of retry stamp: the claim was released, local
 # work and custody are preserved, and there is no automatic retry (not an integrity refusal).
-# An anthropic_spend_limit park (#3767: the provider refused on a spend/usage limit; recovery_retry_not_before
+# An anthropic_spend_limit park (#3767: the provider refused on an Anthropic API spend limit; recovery_retry_not_before
 # is null) also always stops as an owner decision: it never resumes by itself; owner uzi run resume
-# (after raising the limit), uzi run set-token (another credential), or cancel.
+# (after raising the limit), uzi run set-token (another credential; switchable kinds only, not chat,
+# judge, self_improve or job), or cancel.
 # Other recovery_wait causes keep polling unless the stop set names
 # recovery_wait, except a `data_volume_full` park, which is an attention signal (above).
 # `paused` never resumes on its own either (an owner pause, or hold_reason budget_exhausted /
@@ -195,7 +196,7 @@ while [ "$i" -lt "$MAX" ]; do
     fi
     if [ "$rc_cause" = anthropic_spend_limit ]; then
       printf 'STOP=recovery_wait:anthropic_spend_limit\n'
-      printf 'NOTE owner decision: the Anthropic spend limit holds this run and it never resumes by itself; raise the limit then uzi run resume, uzi run set-token for another credential, or cancel\n'
+      printf 'NOTE owner decision: the Anthropic spend limit holds this run and it never resumes by itself; raise the limit then uzi run resume, uzi run set-token for another credential (switchable kinds only; not chat, judge, self_improve or job), or cancel\n'
       printf 'RESULT=stop:recovery_wait\n'
       exit 0
     fi

@@ -247,6 +247,14 @@ rc=0; out=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed 0 2) || rc=$?
 [ "$rc" -eq 0 ] || fail "spend-limit park outside stop set: want exit 0, got $rc: $out"
 case "$out" in *"STOP=recovery_wait:anthropic_spend_limit"*) ;; *) fail "spend-limit outside stop set: $out";; esac
 
+# 12c. a stale anthropic_spend_limit cause on a run that is no longer recovery_wait (set-token re-queued
+#      it) must not stop the poller: the cause is only read while the status is recovery_wait
+reset queued ok "" '[]'
+echo anthropic_spend_limit > "$WORK/cause"
+rc=0; out=$(run) || rc=$?
+[ "$rc" -eq 3 ] || fail "queued run with stale spend-limit cause should keep polling to ELAPSED: $rc: $out"
+case "$out" in *STOP=*) fail "queued run with stale spend-limit cause stopped: $out";; esac
+
 # 13. any other recovery_wait cause keeps its existing behaviour: keep polling to ELAPSED
 reset recovery_wait ok "" '[]'
 echo provider_outage > "$WORK/cause"

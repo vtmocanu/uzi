@@ -1229,9 +1229,12 @@ it. Nothing switches credentials for you. The only exits are yours:
      **first**.
   2. Otherwise the per-run credential override, if one is set. A pin whose
      token was deleted falls through, as it does today.
-  3. Then the worker binding: a static pin, or, for an auto-mode worker, the
-     pool ranker.
-  4. Then the default token.
+  3. Then the worker binding: a static pin (the owner's default token when
+     none is pinned) or, in auto mode, the pool ranker (an empty pool waits in
+     `pool_wait`).
+
+  Resume is refused once the run's wall-clock budget is spent (chat, judge,
+  interactive and never-started runs are exempt).
 
   Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first. To choose another token now, use Switch token or `uzi run set-token`.
 

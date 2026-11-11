@@ -240,7 +240,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
    `worker_requeue_exhausted`, `retained_recovery_adoption_failed` and `retained_continuation_unwitnessed` (each regardless of retry timing),
    `worker_memory_pressure` (regardless of remaining interventions),
-   `anthropic_spend_limit` (owner Resume after raising the limit, `uzi run set-token`, or Cancel),
+   `anthropic_spend_limit` (owner Resume after raising the limit, `uzi run set-token` (switchable kinds only; not chat, judge, self_improve or job), or Cancel),
    or `retained_recovery_exhausted` with its retry stamp explicitly null: the poller
    stops on it (exit 0) because only the owner can Resume or Cancel; back up first (`uzi-watcher` recovery).
    Adoption failure is an integrity hold: retained adoption or a predecessor remediation
