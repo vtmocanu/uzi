@@ -347,15 +347,23 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	var botPAT []byte
 	if !isolated {
 		// forgecred.Open, not box.Open: a GitHub App connection stores a
-		// domain-separated envelope, and the raw box cannot authenticate it. The
-		// claim also carries the App material only as an opaque handle — the
-		// worker renews installation tokens through the run-scoped credential
-		// endpoint, and the App private key never leaves the API.
+		// domain-separated envelope, and the raw box cannot authenticate it.
 		botPAT, err = forgecred.Open(s.box, rc.TokenCiphertext)
 		if err != nil {
 			// Decrypt errors carry no plaintext.
 			return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
 		}
+		// An App connection stores key material, not a token, and the claim has
+		// always carried a directly-usable credential. Exchange it here so the
+		// worker's path is identical for both credential types: it receives a
+		// working token and never learns which kind it got. The App private key
+		// never leaves the API. A PAT short-circuits with itself.
+		gitToken, _, resolveErr := forge.ResolveGitCredentialWithExpiry(
+			ctx, forge.Type(rc.ForgeType), rc.BaseUrl, string(botPAT), 20*time.Second)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("%w: forge credential could not be resolved", errCredentialUnavailable)
+		}
+		botPAT = []byte(gitToken)
 	}
 
 	// PRD #1429 M2 (D4): claim assembly is HARNESS-AUTHORITATIVE — the Codex/Claude split is
@@ -919,7 +927,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			ForgeType:       rc.ForgeType,
 		},
 		Secrets: ClaimSecrets{
-			ForgeUsername:       rc.BotUsername,
+			// Installation tokens authenticate as GitHub's machine user, not as the
+			// App's bot login; commit and PR attribution still use rc.BotUsername.
+			ForgeUsername:       gitCredentialUsername(rc.ForgeType, rc.BotUsername, string(botPAT)),
 			ForgePAT:            string(botPAT),
 			AnthropicOAuthToken: string(anthropic),
 		},
