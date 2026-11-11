@@ -11,8 +11,9 @@ import (
 
 // ListIssueLabelEvents implements forge.IssueTracker from the issue's tag
 // activities. Events are oldest first, one per added or removed tag; ID is the
-// 1-based position in that order. A tag that has the eligibility name but is not
-// the eligibility tag is left out.
+// 1-based position in that order. Tags follow readLabel, as in issue reads: the
+// eligibility tag is reported under the stored eligibility name, a tag the
+// token's account owns under its own name, and any other tag is left out.
 func (y *youTrack) ListIssueLabelEvents(ctx context.Context, projectID, issueIID int64) ([]forge.LabelEvent, error) {
 	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
@@ -33,23 +34,32 @@ func (y *youTrack) ListIssueLabelEvents(ctx context.Context, projectID, issueIID
 		return 0
 	})
 	out := []forge.LabelEvent{}
-	emit := func(a ytActivity, action string, tags []ytTag) {
+	emit := func(a ytActivity, action string, tags []ytTag) error {
 		for _, t := range tags {
-			if y.foreignEligibility(t) {
+			name, ok, err := y.readLabel(ctx, t)
+			if err != nil {
+				return err
+			}
+			if !ok {
 				continue
 			}
 			out = append(out, forge.LabelEvent{
 				ID:        int64(len(out) + 1),
 				Action:    action,
-				LabelName: t.Name,
+				LabelName: name,
 				Username:  login(a.Author),
 				CreatedAt: time.UnixMilli(a.Timestamp).UTC(),
 			})
 		}
+		return nil
 	}
 	for _, a := range acts {
-		emit(a, "add", a.Added)
-		emit(a, "remove", a.Removed)
+		if err := emit(a, "add", a.Added); err != nil {
+			return nil, err
+		}
+		if err := emit(a, "remove", a.Removed); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }

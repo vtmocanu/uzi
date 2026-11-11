@@ -2,9 +2,11 @@ package issuetrackersvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync"
@@ -323,6 +325,51 @@ func TestConnectRefusesBadAccount(t *testing.T) {
 	h.template.account = issuetracker.Account{ID: strings.Repeat("1", 255), Login: "Zoë"}
 	if _, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, testToken("t")); err != nil {
 		t.Errorf("a 255-byte id and a non-ASCII login must pass: %v", err)
+	}
+}
+
+// TestConnectRefusesAnAccountThatCarriesTheToken: the account id and login are
+// stored unsealed and returned, so an issue tracker that echoes the token in
+// its account answer, raw or escaped, is refused and nothing is stored.
+func TestConnectRefusesAnAccountThatCarriesTheToken(t *testing.T) {
+	// Characters each escaping form rewrites, as in the driver's own fixture.
+	tok := strings.Join([]string{"perm", ":", "ab c/d\"e", ".", "Zq9xLm2VnB7wKp3T"}, "")
+	quoted, err := json.Marshal(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forms := map[string]string{
+		"raw":          tok,
+		"query":        url.QueryEscape(tok),
+		"path":         url.PathEscape(tok),
+		"path lower":   strings.ToLower(url.PathEscape(tok[:strings.IndexByte(tok, '.')])) + tok[strings.IndexByte(tok, '.'):],
+		"json":         string(quoted[1 : len(quoted)-1]),
+		"last segment": tok[strings.LastIndexByte(tok, '.')+1:],
+	}
+	for name, form := range forms {
+		for field, acct := range map[string]issuetracker.Account{
+			"login": {ID: "1-1", Login: "bot " + form},
+			"id":    {ID: "1-" + form, Login: "bot"},
+		} {
+			t.Run(name+" in the "+field, func(t *testing.T) {
+				h := newHarness(t)
+				h.template.account = acct
+				_, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, tok)
+				e := wantKind(t, err, KindBadGateway)
+				if strings.Contains(e.Message, form) || !strings.Contains(e.Message, "contains the token") {
+					t.Errorf("message = %q, want a refusal that names the token and not the value", e.Message)
+				}
+				if len(h.q.rows) != 0 {
+					t.Error("a row was stored for an account that carries the token")
+				}
+			})
+		}
+	}
+	// A token that merely shares a prefix with the login is not a match.
+	h := newHarness(t)
+	h.template.account = issuetracker.Account{ID: "1-1", Login: "perm"}
+	if _, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, tok); err != nil {
+		t.Errorf("an ordinary account was refused: %v", err)
 	}
 }
 

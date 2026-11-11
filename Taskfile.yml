@@ -1222,7 +1222,7 @@ tasks:
     cmds:
       # Same shape as test:forge-fake-contract: the launcher starts the fake with
       # FORGE_FAKE_ISSUE_CONTRACT=1 and a self-signed cert, then runs this exact Go
-      # argv from api. It allows only two subtests to skip on the forge subjects: the moved-issue one (no MoveIssue seam) and SameNameTagUsesEligibilityTag (forge labels have no owners). The forge subjects also run the ProjectGuard case.
+      # argv from api. It allows only three subtests to skip on the forge subjects: the moved-issue one (no MoveIssue seam), and SameNameTagUsesEligibilityTag and RenamedEligibilityTagIsStillListed (forge labels have no owners and are not tags that can be renamed). The forge subjects also run the ProjectGuard case.
       - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node e2e/forge-fake/issue-tracker-contracts.test.mjs -- go test -buildvcs=false -count=1 -v -timeout=60s -run='^TestIssueTrackerForgeFakeContracts$' ./internal/issuetracker
 
   test:create-gitlab-bot:

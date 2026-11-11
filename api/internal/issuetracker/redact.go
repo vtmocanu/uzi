@@ -68,6 +68,19 @@ func newRedactor(token string) redactor {
 	return redactor{secrets: secrets}
 }
 
+// ContainsToken reports whether s holds token in any form the redactor knows:
+// raw, query-escaped, path-escaped or JSON-escaped (with either hex case in a
+// percent escape), or the same forms of the token's final '.'-separated
+// segment when that is long enough to scrub. A caller uses it to refuse a value
+// from the issue tracker that would otherwise be stored or shown in plain text,
+// where redacting an error message does not help.
+func ContainsToken(s, token string) bool {
+	if token == "" {
+		return false
+	}
+	return newRedactor(token).scrub(s) != s
+}
+
 // lowerPercent lower-cases the hex digits of every %XX escape in s.
 func lowerPercent(s string) string {
 	b := []byte(s)

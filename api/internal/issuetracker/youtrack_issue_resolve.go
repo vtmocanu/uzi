@@ -14,10 +14,12 @@ import (
 // YouTrack's numberInProject. The issue is read as SHORT-n and must sit in the
 // bound project with that number; otherwise it is reported as
 // *forge.IssueNotFoundError. YouTrack keeps answering an old SHORT-n after the
-// issue moves to another project, so this check is what makes a moved issue
-// read as gone. Follow-up calls address the issue by the returned entity id.
-// The check is a read: YouTrack has no conditional write, so an issue moved
-// after resolveIssue returns can still be written by the follow-up call.
+// issue moves to another project, so this check is what makes an issue moved
+// before the call read as gone, and it is then not written. Follow-up calls
+// address the issue by the returned entity id. The check is a read and YouTrack
+// offers no conditional write, so an issue moved between this check and the
+// follow-up write can still be written, once, in its new project. That window
+// is documented (PRD #4173 D10), not closed.
 func (y *youTrack) resolveIssue(ctx context.Context, projectID, issueIID int64) (ytIssue, error) {
 	p, err := y.requireProject(projectID)
 	if err != nil {

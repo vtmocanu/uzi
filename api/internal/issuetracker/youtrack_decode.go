@@ -17,12 +17,14 @@ var errNestedCeiling = errors.New("issuetracker: an item carries more nested ent
 // json.Unmarshal. A value is counted as one comma or one opening bracket
 // outside a string, which approximates the number of JSON values (at most
 // 2*count+1). Real YouTrack adds a "$type" member to every entity, so a tag
-// with $type, id, name and one more member such as "color" costs 5 (its brace,
-// the commas between its four members and the comma after it). An activity
-// carries up to maxNestedItems such tags in each of "added" and "removed"
-// (10*maxNestedItems values), so one item is allowed 10*maxNestedItems+256. A
-// single object (an issue holds one tags array, plus a few members of its own)
-// is allowed 6*maxNestedItems+256, which holds 5*maxNestedItems for the tags.
+// with $type, id, name, its owner (an object of $type and id, asked for since
+// reads judge tag ownership) and one more member such as "color" costs 8 (its
+// brace, the commas between its five members, the owner's brace and comma, and
+// the comma after it). An activity carries up to maxNestedItems such tags in
+// each of "added" and "removed" (16*maxNestedItems values), so one item is
+// allowed 16*maxNestedItems+256. A single object (an issue holds one tags
+// array, plus a few members of its own) is allowed 8*maxNestedItems+256, which
+// holds 8*maxNestedItems for the tags.
 // The real-shaped tests pin that headroom. Three totals are enforced:
 // pageValueBudget for a whole list page, itemValueBudget for each element of
 // it and objectValueBudget for one single-object response. The budgets bound
@@ -32,8 +34,8 @@ var errNestedCeiling = errors.New("issuetracker: an item carries more nested ent
 // also decodes element by element and stops at the first error, which leaves
 // one element, at most itemValueBudget values, to amplify.
 const (
-	itemValueBudget   = 10*maxNestedItems + 256
-	objectValueBudget = 6*maxNestedItems + 256
+	itemValueBudget   = 16*maxNestedItems + 256
+	objectValueBudget = 8*maxNestedItems + 256
 	pageValueBudget   = pageSize * itemValueBudget
 )
 

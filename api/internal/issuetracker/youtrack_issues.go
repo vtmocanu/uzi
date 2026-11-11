@@ -13,6 +13,11 @@ import (
 // tag ids (see resolveTagIDs), the exact update instant and the bound project,
 // and honours opts.Limit after that filter. A label whose tag the token's
 // account does not own yields no issue.
+//
+// The eligibility label is passed as the stored eligibility name, but the query
+// narrows by the eligibility tag's live name, read by id (see queryTagNames), so
+// renaming the tag in YouTrack does not hide eligible issues. When the tag cannot
+// be read the call fails and nothing is listed.
 func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
 	p, err := y.requireProject(projectID)
 	if err != nil {
@@ -30,7 +35,11 @@ func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.L
 			return []forge.Issue{}, nil
 		}
 	}
-	query := url.Values{"query": {issueQuery(p.ShortName, opts)}, "fields": {issueFields}}
+	tagNames, err := y.queryTagNames(ctx, opts.Labels)
+	if err != nil {
+		return nil, err
+	}
+	query := url.Values{"query": {issueQuery(p.ShortName, tagNames, opts)}, "fields": {issueFields}}
 	out := []forge.Issue{}
 	var mapErr error
 	err = ytPages(ctx, y, []string{"issues"}, query, func(page []ytIssue) bool {
@@ -38,7 +47,7 @@ func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.L
 			if !y.matchesIssue(w, opts, tagIDs) {
 				continue
 			}
-			issue, err := y.toIssue(w)
+			issue, err := y.toIssue(ctx, w)
 			if err != nil {
 				mapErr = err
 				return true
@@ -65,7 +74,7 @@ func (y *youTrack) GetIssue(ctx context.Context, projectID, issueIID int64) (for
 	if err != nil {
 		return forge.Issue{}, err
 	}
-	return y.toIssue(w)
+	return y.toIssue(ctx, w)
 }
 
 // CreateIssue implements forge.IssueTracker. The labels resolve to tag ids first
@@ -121,7 +130,7 @@ func (y *youTrack) CreateIssue(ctx context.Context, projectID int64, title, desc
 	if err != nil {
 		return forge.Issue{}, err
 	}
-	return y.toIssue(w)
+	return y.toIssue(ctx, w)
 }
 
 // UpdateIssueDescription implements forge.IssueTracker.

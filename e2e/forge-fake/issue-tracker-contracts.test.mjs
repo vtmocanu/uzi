@@ -44,13 +44,14 @@ async function stop(child) {
 
 // The only subtests that may skip: the forge subjects supply no MoveIssue seam,
 // so the moved-issue case runs on YouTrack only, and forge labels have no
-// owners, so the same-name tag case (Subject.SameName) does too. ProjectGuard
-// must pass on every forge.
-const ALLOWED_SKIPS = new Set(["MovedIssueIsRefused", "SameNameTagUsesEligibilityTag"]);
+// owners, so the same-name tag case (Subject.SameName) does too, and so does the
+// renamed eligibility tag case, which uses the same seams. ProjectGuard must
+// pass on every forge.
+const ALLOWED_SKIPS = new Set(["MovedIssueIsRefused", "SameNameTagUsesEligibilityTag", "RenamedEligibilityTagIsStillListed"]);
 const CASES = [
   "EnsureLabelsIsIdempotent", "CreateIssueRoundTrips", "ListIssuesFilters", "UpdateLabelsAndDescription",
   "SetIssueStateClosesAndReopens", "CommentsOldestFirst", "LabelEventsOldestFirst", "MissingIssueIsNotFound", "MovedIssueIsRefused",
-  "ProjectGuard", "SameNameTagUsesEligibilityTag",
+  "ProjectGuard", "SameNameTagUsesEligibilityTag", "RenamedEligibilityTagIsStillListed",
 ];
 const DIALECTS = ["gitlab", "github", "forgejo"];
 

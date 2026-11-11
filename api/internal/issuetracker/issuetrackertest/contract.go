@@ -61,6 +61,10 @@ type SameNameSeams struct {
 	IssueTagIDs func(t *testing.T, iid int64) []string
 	// TagsNamed returns every tag with the name, server side.
 	TagsNamed func(t *testing.T, name string) []TagView
+	// RenameTag renames the tag with the id, server side, bypassing the
+	// IssueTracker under test. Nil skips the RenamedEligibilityTagIsStillListed
+	// case.
+	RenameTag func(t *testing.T, tagID, name string)
 }
 
 // TagView is one server-side tag, as far as the SameName case judges it.
@@ -69,7 +73,8 @@ type TagView struct {
 	// OwnedByAccount is true when the connection's own account owns the tag.
 	OwnedByAccount bool
 	// SharedLikeEligibility is true when the tag's read and tag sharing settings
-	// equal the eligibility tag's.
+	// equal the eligibility tag's, with that tag's owner added as a named user
+	// (the owner's own access is not in the settings).
 	SharedLikeEligibility bool
 }
 
@@ -101,6 +106,7 @@ func RunContract(t *testing.T, newSubject func(t *testing.T) Subject) {
 		{"MovedIssueIsRefused", caseMoved},
 		{"ProjectGuard", caseProjectGuard},
 		{"SameNameTagUsesEligibilityTag", caseSameNameTag},
+		{"RenamedEligibilityTagIsStillListed", caseRenamedEligibilityTag},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -522,5 +528,28 @@ func caseSameNameTag(t *testing.T, c *contract) {
 	}
 	if got := s.IssueTagIDs(t, lookalike); !slices.Equal(got, []string{s.SameNameTagID}) {
 		t.Errorf("after remove the issue carries %v, want only the same-named tag", got)
+	}
+}
+
+// caseRenamedEligibilityTag shows that the subject follows the eligibility tag
+// by id: after the tag is renamed in the issue tracker, the stored eligibility
+// name still lists and reads the tagged issue, and an issue that carries only
+// the account's own tag of the old name is still not listed.
+func caseRenamedEligibilityTag(t *testing.T, c *contract) {
+	s := c.SameName
+	if s == nil || s.RenameTag == nil {
+		t.Skip("labels are not tags that can be renamed on this implementation")
+	}
+	elig := s.EligibilityName
+	created := c.create(t, "eligible", elig)
+	lookalike := s.SeedIssue(t, s.SameNameTagID)
+	s.RenameTag(t, s.EligibilityTagID, unique("contract-renamed"))
+
+	wantIIDs(t, c.listIIDs(t, forge.ListIssuesOptions{Labels: []string{elig}}), created.IID)
+	if got := c.get(t, created.IID).Labels; !slices.Equal(got, []string{elig}) {
+		t.Errorf("the tagged issue reads labels %v after the rename, want [%s]", got, elig)
+	}
+	if got := c.get(t, lookalike).Labels; slices.Contains(got, elig) {
+		t.Errorf("an issue with only a same-named tag reports labels %v", got)
 	}
 }

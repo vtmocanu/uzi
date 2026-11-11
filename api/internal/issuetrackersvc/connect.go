@@ -50,7 +50,7 @@ func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, 
 		// err is already token-redacted by the driver.
 		return Connection{}, &Error{Kind: KindBadGateway, Message: "token verification failed: " + err.Error()}
 	}
-	if err := validateAccount(account); err != nil {
+	if err := validateAccount(account, token); err != nil {
 		return Connection{}, &Error{Kind: KindBadGateway, Message: err.Error()}
 	}
 

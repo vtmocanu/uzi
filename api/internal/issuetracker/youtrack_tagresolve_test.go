@@ -57,8 +57,11 @@ func TestEnsureLabelsNeverCreatesTheEligibilityTag(t *testing.T) {
 	if fresh[0].OwnerLogin != youtracktest.BotLogin {
 		t.Errorf("fresh is owned by %q, want the account %q", fresh[0].OwnerLogin, youtracktest.BotLogin)
 	}
-	if !reflect.DeepEqual(fresh[0].Read, elig.Read) || !reflect.DeepEqual(fresh[0].Use, elig.Use) {
-		t.Errorf("fresh sharing = read %+v use %+v, want the eligibility tag's read %+v use %+v", fresh[0].Read, fresh[0].Use, elig.Read, elig.Use)
+	// The copy is the eligibility tag's settings plus that tag's owner (see
+	// TestCreatedTagKeepsTheEligibilityOwnersAccess).
+	want := youtracktest.Sharing{Groups: elig.Read.Groups, Users: []string{youtracktest.OtherUserID}}
+	if !reflect.DeepEqual(fresh[0].Read, want) || !reflect.DeepEqual(fresh[0].Use, want) {
+		t.Errorf("fresh sharing = read %+v use %+v, want the eligibility tag's groups and its owner: %+v", fresh[0].Read, fresh[0].Use, want)
 	}
 	if len(elig.Use.Groups) != 1 || elig.Use.Groups[0] != youtracktest.AllUsersGroupID {
 		t.Fatalf("fixture error: the seeded eligibility tag is not shared with All Users: %+v", elig)
@@ -293,17 +296,36 @@ func TestEnsureLabelsStopsWhenTheEligibilityTagCannotBeRead(t *testing.T) {
 	}
 }
 
+// TestEligibilityNameAloneMakesNoRequest: resolving the eligibility name needs
+// no request. ListIssues by it reads the eligibility tag by id, for its live
+// name, and nothing else about tags or the account.
 func TestEligibilityNameAloneMakesNoRequest(t *testing.T) {
-	y, log := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, "[]") })
+	y, log := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/tags/") {
+			writeRaw(w, `{"id":"`+youtracktest.EligibilityTagID+`","name":"`+youtracktest.EligibilityTagName+`"}`)
+			return
+		}
+		writeRaw(w, "[]")
+	})
 	if err := y.EnsureLabels(context.Background(), testProjectID, labels(youtracktest.EligibilityTagName)); err != nil {
 		t.Fatal(err)
+	}
+	if got := log.all(); len(got) != 0 {
+		t.Errorf("EnsureLabels sent %v for the eligibility name alone", got)
 	}
 	if _, err := y.ListIssues(context.Background(), testProjectID, forge.ListIssuesOptions{Labels: []string{youtracktest.EligibilityTagName}}); err != nil {
 		t.Fatal(err)
 	}
+	tagReads := 0
 	for _, c := range log.all() {
-		if strings.Contains(c, "/tags") || strings.Contains(c, "users/me") {
+		switch {
+		case c == "GET /api/tags/"+youtracktest.EligibilityTagID:
+			tagReads++
+		case strings.Contains(c, "/tags") || strings.Contains(c, "users/me"):
 			t.Errorf("sent %v for the eligibility name alone", c)
 		}
+	}
+	if tagReads != 1 {
+		t.Errorf("read the eligibility tag by id %d times, want 1", tagReads)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"slices"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
@@ -38,24 +39,85 @@ type ytIDRef struct {
 	ID string `json:"id"`
 }
 
+// queryTagNames gives the tag names the ListIssues query narrows by, one per
+// distinct label. Every label but the eligibility one is its own name (the
+// account-owned tag resolveTagIDs found carries exactly that name). The
+// eligibility label stands for the stored tag id, so its term uses the tag's
+// live name, read by id: the stored name may be stale after a rename in
+// YouTrack. A tag that cannot be read (gone, or no longer visible to the token)
+// is an error, so nothing is listed. A live name that labelNameProblem refuses
+// (a brace would break the query's quoting) gets no term at all: the project
+// term and the client-side id filter still select the right issues, at the cost
+// of a wider page walk.
+func (y *youTrack) queryTagNames(ctx context.Context, labels []string) ([]string, error) {
+	names := make([]string, 0, len(labels))
+	seen := make(map[string]bool, len(labels))
+	for _, l := range labels {
+		if seen[l] {
+			continue
+		}
+		seen[l] = true
+		if l != y.eligibility.Name {
+			names = append(names, l)
+			continue
+		}
+		live, err := y.eligibilityLiveName(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !labelNameProblem(live) {
+			names = append(names, live)
+		}
+	}
+	return names, nil
+}
+
+// eligibilityLiveName reads the eligibility tag by its stored id and returns
+// the name it has in YouTrack now.
+func (y *youTrack) eligibilityLiveName(ctx context.Context) (string, error) {
+	var t ytTag
+	_, _, err := y.do(ctx, ytCall{
+		method: http.MethodGet,
+		path:   []string{"tags", y.eligibility.ID},
+		query:  url.Values{"fields": {tagFields}},
+		limit:  objectBytes,
+		prov:   forge.ResponseSuccess,
+	}, &t)
+	if err != nil {
+		return "", err
+	}
+	if t.ID != y.eligibility.ID {
+		return "", y.fail("youtrack: the eligibility tag read by id came back as another tag")
+	}
+	return t.Name, nil
+}
+
 // eligibilitySharing reads the eligibility tag's read and tag sharing settings
-// as ids. A tag the driver creates gets the same ones, so whoever can see and
-// apply the eligibility tag can see and apply the tags the driver makes.
-func (y *youTrack) eligibilitySharing(ctx context.Context) (sharingCopy, error) {
+// as ids, plus its owner. A tag the driver creates gets the same settings, so
+// whoever can see and apply the eligibility tag can see and apply the tags the
+// driver makes. The eligibility tag's owner has both rights by owning it, which
+// the settings do not list, so the owner is added to the users of both copies
+// (once, and not when the owner is account, the token's own account, which owns
+// the new tag anyway).
+func (y *youTrack) eligibilitySharing(ctx context.Context, account Account) (sharingCopy, error) {
 	const spec = "permittedGroups(id),permittedUsers(id)"
 	var t struct {
-		Read *ytSharing `json:"readSharingSettings"`
-		Use  *ytSharing `json:"tagSharingSettings"`
+		Owner *ytUser    `json:"owner"`
+		Read  *ytSharing `json:"readSharingSettings"`
+		Use   *ytSharing `json:"tagSharingSettings"`
 	}
 	_, _, err := y.do(ctx, ytCall{
 		method: http.MethodGet,
 		path:   []string{"tags", y.eligibility.ID},
-		query:  url.Values{"fields": {"readSharingSettings(" + spec + "),tagSharingSettings(" + spec + ")"}},
+		query:  url.Values{"fields": {"owner(id),readSharingSettings(" + spec + "),tagSharingSettings(" + spec + ")"}},
 		limit:  objectBytes,
 		prov:   forge.ResponseSuccess,
 	}, &t)
 	if err != nil {
 		return sharingCopy{}, err
+	}
+	if t.Owner != nil && !entityIDRE.MatchString(t.Owner.ID) {
+		return sharingCopy{}, y.fail("youtrack: eligibility tag owner with a malformed id in the response")
 	}
 	var c sharingCopy
 	for _, p := range []struct {
@@ -77,6 +139,14 @@ func (y *youTrack) eligibilitySharing(ctx context.Context) (sharingCopy, error) 
 				return sharingCopy{}, y.fail("youtrack: sharing settings with a malformed id in the response")
 			}
 			p.to.Users = append(p.to.Users, ytIDRef{ID: u.ID})
+		}
+	}
+	if t.Owner != nil && t.Owner.ID != account.ID {
+		owner := ytIDRef{ID: t.Owner.ID}
+		for _, to := range []*ytSharingIDs{&c.Read, &c.Use} {
+			if !slices.Contains(to.Users, owner) {
+				to.Users = append(to.Users, owner)
+			}
 		}
 	}
 	return c, nil
@@ -111,8 +181,9 @@ func (y *youTrack) createTag(ctx context.Context, name string, share sharingCopy
 //   - The eligibility name is the stored eligibility tag's id, whoever owns that
 //     tag and whatever other tag carries the name. It is never created.
 //   - Any other name is the visible tag the token's own account owns. With create
-//     set, a missing one is created with the eligibility tag's sharing settings;
-//     without it, the name is left out of the result.
+//     set, a missing one is created with the eligibility tag's sharing settings
+//     plus its owner (see eligibilitySharing); without it, the name is left out
+//     of the result.
 //
 // The eligibility tag is never a candidate for another name, even when its
 // YouTrack name drifted to one: name matching skips the eligibility tag's id,
@@ -165,7 +236,7 @@ func (y *youTrack) resolveTagIDs(ctx context.Context, names []string, create boo
 			delete(ids, n)
 		default:
 			if share == nil {
-				c, err := y.eligibilitySharing(ctx)
+				c, err := y.eligibilitySharing(ctx, account)
 				if err != nil {
 					return nil, err
 				}

@@ -3,17 +3,37 @@ package issuetracker
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
 )
 
+// TestStateFieldOption: with the State field renamed, a driver told the new
+// name lists that field's values as the fake defines them, and a driver left on
+// the default name finds no state field.
 func TestStateFieldOption(t *testing.T) {
 	srv, y := newFakeDriverWithField(t, "Stage")
-	_ = srv
 	ctx := context.Background()
-	if _, err := y.ListStates(ctx, "0-1"); err != nil {
+	got, err := y.ListStates(ctx, youtracktest.ProjectID)
+	if err != nil {
 		t.Fatal(err)
+	}
+	want := []State{
+		{ID: "10-1", Name: "Open", Resolved: false, Ordinal: 0},
+		{ID: "10-2", Name: "Fixed", Resolved: true, Ordinal: 1},
+		{ID: "10-3", Name: "Won't fix", Resolved: true, Ordinal: 2},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("ListStates = %+v, want %+v", got, want)
+	}
+	byDefault, err := newYouTrackOver(fakeOptions(srv), srv.Client().Transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := byDefault.ListStates(ctx, youtracktest.ProjectID); err == nil {
+		t.Errorf("a driver on the default field name listed %+v from a project whose field is named Stage", got)
 	}
 }
 

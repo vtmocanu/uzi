@@ -2,6 +2,7 @@ package issuetracker_test
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
@@ -74,17 +75,23 @@ func TestYouTrackContract(t *testing.T) {
 				},
 				IssueTagIDs: func(t *testing.T, iid int64) []string { return srv.IssueTagIDs(iid) },
 				TagsNamed: func(t *testing.T, name string) []issuetrackertest.TagView {
+					// The fake's eligibility tag is owned by the other user, so a
+					// tag shared like it also names that owner.
 					eligibility := srv.TagByID(youtracktest.EligibilityTagID)
+					want := func(s youtracktest.Sharing) youtracktest.Sharing {
+						return youtracktest.Sharing{Groups: s.Groups, Users: append(slices.Clone(s.Users), youtracktest.OtherUserID)}
+					}
 					var out []issuetrackertest.TagView
 					for _, tag := range srv.TagsNamed(name) {
 						out = append(out, issuetrackertest.TagView{
 							ID:                    tag.ID,
 							OwnedByAccount:        tag.OwnerLogin == youtracktest.BotLogin,
-							SharedLikeEligibility: reflect.DeepEqual(tag.Read, eligibility.Read) && reflect.DeepEqual(tag.Use, eligibility.Use),
+							SharedLikeEligibility: reflect.DeepEqual(tag.Read, want(eligibility.Read)) && reflect.DeepEqual(tag.Use, want(eligibility.Use)),
 						})
 					}
 					return out
 				},
+				RenameTag: func(t *testing.T, tagID, name string) { srv.RenameTag(tagID, name) },
 			},
 		}
 	})

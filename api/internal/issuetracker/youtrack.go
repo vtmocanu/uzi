@@ -85,7 +85,8 @@ func buildYouTrack(opts Options, base http.RoundTripper) (*youTrack, error) {
 // strictBaseURL accepts only https://host[:port] with an optional single
 // trailing slash. A path, userinfo, query or fragment is rejected rather than
 // stripped, so the URL the token is sent to is exactly the one that was
-// validated.
+// validated. A YouTrack served under a context path (such as /youtrack) is
+// therefore not supported yet.
 func strictBaseURL(raw string) (string, error) {
 	bad := func(why string) (string, error) {
 		return "", fmt.Errorf("issuetracker: base URL %s", why)
@@ -105,7 +106,7 @@ func strictBaseURL(raw string) (string, error) {
 	case u.User != nil:
 		return bad("must not carry credentials")
 	case u.Path != "" && u.Path != "/":
-		return bad("must not carry a path")
+		return bad("must not carry a path; a YouTrack served under a context path is not supported yet")
 	}
 	// An invisible or non-ASCII host character would look like another host
 	// once shown; an internationalised name arrives as "xn--" punycode.

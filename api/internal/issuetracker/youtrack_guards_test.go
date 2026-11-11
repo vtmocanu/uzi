@@ -179,16 +179,16 @@ func TestUpdateIssueLabelsAddOfAPresentTagWritesNothing(t *testing.T) {
 }
 
 func TestListedCommentsAndEventsCarryTheirTimestamps(t *testing.T) {
-	y, _ := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
+	y, _ := loggedDriver(t, withRawMe(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/comments"):
 			writeRaw(w, `[{"id":"4-1","text":"hi","created":1500,"author":{"id":"1-1","login":"alice"}}]`)
 		case strings.HasSuffix(r.URL.Path, "/activities"):
-			writeRaw(w, `[{"id":"3-1","timestamp":2500,"author":{"id":"1-1","login":"bob"},"added":[{"id":"5-1","name":"a"}]}]`)
+			writeRaw(w, `[{"id":"3-1","timestamp":2500,"author":{"id":"1-1","login":"bob"},"added":[`+rawOwnTag("5-1", "a")+`]}]`)
 		default:
 			writeRaw(w, rawIssue("2-1", "UZI-1", 1, "0-1", ""))
 		}
-	})
+	}))
 	ctx := context.Background()
 	comments, err := y.ListIssueComments(ctx, 1, 1)
 	if err != nil || len(comments) != 1 || !comments[0].CreatedAt.Equal(time.UnixMilli(1500)) || comments[0].AuthorUsername != "alice" {

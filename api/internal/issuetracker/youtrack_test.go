@@ -173,6 +173,22 @@ const (
 	rawNoSharing = `{"readSharingSettings":{"permittedGroups":[],"permittedUsers":[]},"tagSharingSettings":{"permittedGroups":[],"permittedUsers":[]}}`
 )
 
+// rawOwnTag renders a tag the rawMe account owns, so reads report it as a label.
+func rawOwnTag(id, name string) string {
+	return fmt.Sprintf(`{"id":%q,"name":%q,"owner":{"id":%q}}`, id, name, rawMeID)
+}
+
+// withRawMe answers users/me with rawMe and hands every other request to h.
+func withRawMe(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/users/me" {
+			writeRaw(w, rawMe)
+			return
+		}
+		h(w, r)
+	}
+}
+
 func writeRaw(w http.ResponseWriter, body string) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(body))

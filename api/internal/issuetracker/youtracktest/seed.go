@@ -44,6 +44,19 @@ func (s *Server) SeedOwnTag(name string) string {
 	return s.SeedTag(name, BotLogin, Sharing{}, Sharing{})
 }
 
+// RenameTag gives the tag with id a new name, as its owner can in YouTrack at
+// any time. Issues keep the tag; only its name changes.
+func (s *Server) RenameTag(id, name string) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := s.m.tagByID(id)
+	if t == nil {
+		s.t.Fatalf("youtracktest: no tag %q", id)
+	}
+	t.name = name
+}
+
 // TagsNamed returns every tag called name, in creation order, whoever owns it
 // and whether or not the bot can see it.
 func (s *Server) TagsNamed(name string) []TagInfo {

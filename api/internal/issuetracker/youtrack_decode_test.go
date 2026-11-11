@@ -101,9 +101,12 @@ func TestTagBombAllocatesLittle(t *testing.T) {
 // ytTags.UnmarshalJSON once per repeated "tags" key costs no per-call Decoder.
 // The fixtures sit just under pageValueBudget (and itemValueBudget per issue) and
 // objectValueBudget, so every repeated key reaches ytTags. Measured without and
-// with -race: the page allocates about 14 and 54 MiB, and about 172 and 215 MiB
-// with a json.Decoder built per call; the issue allocates about 279 and 646 KiB,
-// and about 1282 and 1593 KiB with one.
+// with -race at the current budgets (2026-11-11): the page allocates about 21
+// and 84 MiB, the issue about 370 and 790 KiB. At the earlier, smaller budgets
+// (10 and 6 values per nested item, before tags carried their owner) the page
+// measured about 14 and 54 MiB, and about 172 and 215 MiB with a json.Decoder
+// built per call; the issue about 279 and 646 KiB, and about 1282 and 1593 KiB
+// with one. The per-call Decoder figures were not measured again.
 func TestDuplicateTagsKeysAllocateLittle(t *testing.T) {
 	const bound = 112 << 20
 	const issueBound = 960 << 10
@@ -274,7 +277,7 @@ func TestTagElementsMustBeObjects(t *testing.T) {
 }
 
 func tagsJSON(n int) string {
-	return strings.TrimSuffix(strings.Repeat(`{"id":"5-1","name":"a"},`, n), ",")
+	return strings.TrimSuffix(strings.Repeat(rawOwnTag("5-1", "a")+",", n), ",")
 }
 
 func TestNestedTagCeilingBoundary(t *testing.T) {
@@ -284,7 +287,7 @@ func TestNestedTagCeilingBoundary(t *testing.T) {
 		wantErr bool
 	}{{maxNestedItems, false}, {maxNestedItems + 1, true}} {
 		issue := rawIssue("2-1", "UZI-1", 1, "0-1", tagsJSON(tc.n))
-		y, _ := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, issue) })
+		y, _ := loggedDriver(t, withRawMe(func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, issue) }))
 		got, err := y.GetIssue(ctx, 1, 1)
 		if (err != nil) != tc.wantErr || (err == nil && len(got.Labels) != tc.n) {
 			t.Errorf("%d tags: %d labels, %v; wantErr %v", tc.n, len(got.Labels), err, tc.wantErr)
@@ -456,14 +459,14 @@ func TestScalarTypeErrorsStopAtTheFirstElement(t *testing.T) {
 // output (a $type on every entity, 1000 tags) through GetIssue, so the object
 // budget keeps headroom for the shape the real server sends.
 func TestRealShapedIssueIsAccepted(t *testing.T) {
-	tag := `{"$type":"Tag","id":"6-1","name":"x","color":null}`
+	tag := `{"$type":"Tag","id":"6-1","name":"x","owner":{"$type":"User","id":"` + rawMeID + `"},"color":null}`
 	issue := `{"$type":"Issue","id":"2-1","idReadable":"UZI-1","numberInProject":1,"summary":"s","created":1,"updated":2000,` +
 		`"project":{"$type":"Project","id":"0-1","shortName":"UZI"},` +
 		`"tags":[` + strings.TrimSuffix(strings.Repeat(tag+",", maxNestedItems), ",") + `]}`
-	if n := valueCount([]byte(issue)); n > objectValueBudget || n <= 4*maxNestedItems+256 {
-		t.Fatalf("fixture holds %d values, want more than %d without exceeding the %d budget", n, 4*maxNestedItems+256, objectValueBudget)
+	if n := valueCount([]byte(issue)); n > objectValueBudget || n <= 7*maxNestedItems+256 {
+		t.Fatalf("fixture holds %d values, want more than %d without exceeding the %d budget", n, 7*maxNestedItems+256, objectValueBudget)
 	}
-	y, _ := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, issue) })
+	y, _ := loggedDriver(t, withRawMe(func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, issue) }))
 	got, err := y.GetIssue(context.Background(), 1, 1)
 	if err != nil || len(got.Labels) != maxNestedItems {
 		t.Fatalf("%d labels, %v; want %d labels", len(got.Labels), err, maxNestedItems)
@@ -474,12 +477,12 @@ func TestRealShapedIssueIsAccepted(t *testing.T) {
 // YouTrack's own output (a $type on every entity) at the nested ceiling in both
 // "added" and "removed", so the per-item budget keeps headroom for it.
 func TestRealShapedActivityIsAccepted(t *testing.T) {
-	tag := `{"$type":"Tag","id":"6-1","name":"x","color":null}`
+	tag := `{"$type":"Tag","id":"6-1","name":"x","owner":{"$type":"User","id":"` + rawMeID + `"},"color":null}`
 	tags := "[" + strings.TrimSuffix(strings.Repeat(tag+",", maxNestedItems), ",") + "]"
 	act := `{"$type":"TagsActivityItem","id":"a-1","timestamp":1,"author":{"$type":"User","id":"1-1","login":"bot"},"added":` + tags + `,"removed":` + tags + `}`
 	body := "[" + strings.TrimSuffix(strings.Repeat(act+",", 3), ",") + "]"
-	if n := valueCount([]byte(act)); n <= 8*maxNestedItems+64 || n > itemValueBudget {
-		t.Fatalf("fixture holds %d values per activity, want between %d and the item budget %d", n, 8*maxNestedItems+64, itemValueBudget)
+	if n := valueCount([]byte(act)); n <= 14*maxNestedItems+64 || n > itemValueBudget {
+		t.Fatalf("fixture holds %d values per activity, want between %d and the item budget %d", n, 14*maxNestedItems+64, itemValueBudget)
 	}
 	got, err := decodePage[ytActivity]([]byte(body))
 	if err != nil {

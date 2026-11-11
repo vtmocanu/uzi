@@ -1,6 +1,7 @@
 package issuetracker
 
 import (
+	"context"
 	"regexp"
 	"time"
 
@@ -9,13 +10,13 @@ import (
 
 // fields parameters. YouTrack returns only what is asked for.
 const (
-	issueFields     = "id,idReadable,numberInProject,summary,description,created,updated,resolved,reporter(id,login),tags(id,name),project(id,shortName)"
+	issueFields     = "id,idReadable,numberInProject,summary,description,created,updated,resolved,reporter(id,login),tags(id,name,owner(id)),project(id,shortName)"
 	tagFields       = "id,name"
 	ownedTagFields  = "id,name,owner(id)"
 	sharingFields   = "permittedGroups(id,name,allUsersGroup,usersCount),permittedUsers(id,login)"
 	sharedTagFields = "id,name,owner(id,login),readSharingSettings(" + sharingFields + "),tagSharingSettings(" + sharingFields + ")"
 	commentFields   = "id,text,created,deleted,author(id,login)"
-	activityFields  = "id,timestamp,author(id,login),added(id,name),removed(id,name)"
+	activityFields  = "id,timestamp,author(id,login),added(id,name,owner(id)),removed(id,name,owner(id))"
 )
 
 // idReadableRE matches an id-readable such as "UZI-15"; it ends up in WebURL.
@@ -117,8 +118,9 @@ func (y *youTrack) checkIssue(w ytIssue) error {
 }
 
 // toIssue maps a wire issue to the neutral type. The issue must carry a valid
-// entity id and id-readable.
-func (y *youTrack) toIssue(w ytIssue) (forge.Issue, error) {
+// entity id and id-readable. Its labels follow readLabel, so a tag is reported
+// only when a write could address it.
+func (y *youTrack) toIssue(ctx context.Context, w ytIssue) (forge.Issue, error) {
 	if err := y.checkIssue(w); err != nil {
 		return forge.Issue{}, err
 	}
@@ -139,19 +141,43 @@ func (y *youTrack) toIssue(w ytIssue) (forge.Issue, error) {
 		issue.Author = w.Reporter.Login
 	}
 	for _, t := range w.Tags {
-		if y.foreignEligibility(t) {
-			continue
+		name, ok, err := y.readLabel(ctx, t)
+		if err != nil {
+			return forge.Issue{}, err
 		}
-		issue.Labels = append(issue.Labels, t.Name)
+		if ok {
+			issue.Labels = append(issue.Labels, name)
+		}
 	}
 	return issue, nil
 }
 
-// foreignEligibility reports whether t carries the eligibility name without
-// being the eligibility tag. Reads leave it out, so the eligibility name in a
-// result always means the stored tag.
-func (y *youTrack) foreignEligibility(t ytTag) bool {
-	return y.eligibility.Name != "" && t.Name == y.eligibility.Name && t.ID != y.eligibility.ID
+// readLabel is the read side of resolveTagIDs: it gives the label name a tag on
+// an issue (or in a label event) is reported under, and false for a tag that is
+// left out. The rules mirror the write side, so a label a read reports is one
+// that a ListIssues filter matches and UpdateIssueLabels can remove:
+//   - The eligibility tag, matched by its stored id, is reported under the stored
+//     eligibility name, whatever its live YouTrack name is.
+//   - Any other tag is reported under its own name only when the token's account
+//     owns it and that name is not the eligibility name, so the eligibility name
+//     in a result always means the stored tag.
+//   - Every other tag (someone else's, or one whose owner the response does not
+//     give) is left out.
+//
+// The account is asked for (see connAccount) only when a tag's owner has to be
+// judged.
+func (y *youTrack) readLabel(ctx context.Context, t ytTag) (string, bool, error) {
+	if y.eligibility.ID != "" && t.ID == y.eligibility.ID {
+		return y.eligibility.Name, true, nil
+	}
+	if t.Name == y.eligibility.Name || t.Owner == nil {
+		return "", false, nil
+	}
+	account, err := y.connAccount(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	return t.Name, t.Owner.ID == account.ID, nil
 }
 
 // inBoundProject reports whether the issue sits in the bound project.

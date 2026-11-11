@@ -35,6 +35,11 @@ type Group struct {
 // The tag must come from ListTags (or a read of the tag by id), which return
 // only tags the token can see. This function judges the apply half only; it does
 // not know whether a can see t.
+//
+// This is a fact about the tag's sharing and nothing more. It does not prove
+// that a can tag an issue in any project: that also takes the permission to
+// edit issues in that project, which is not read here or anywhere in the
+// driver.
 func AccountCanApply(t Tag, a Account) bool {
 	if a.ID == "" {
 		return false
@@ -63,6 +68,11 @@ func AccountCanApply(t Tag, a Account) bool {
 // account never counts, so the answer fails closed.
 //
 // The tag must come from ListTags, as for AccountCanApply.
+//
+// Like AccountCanApply this is a fact about the tag's sharing only. It does not
+// prove that anyone it counts can edit issues in the linked project, so it does
+// not prove they can tag an issue there (PRD #4173 D14: an admin-confirmed
+// limitation).
 func OthersCanApply(t Tag, a Account) bool {
 	if a.ID == "" {
 		return false
