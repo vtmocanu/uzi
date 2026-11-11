@@ -34,36 +34,36 @@ func TestMemoryCodeCheckerAuthorityLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
 		eligible, expired bool
-		mutate            func(memoryFixture, uuid.UUID)
+		mutate            func(*testing.T, memoryFixture, uuid.UUID)
 	}{
 		{"running parent", true, false, nil},
-		{"interactive task parent", true, false, func(f memoryFixture, lead uuid.UUID) {
+		{"interactive task parent", true, false, func(t *testing.T, f memoryFixture, lead uuid.UUID) {
 			f.e.exec("UPDATE runs SET kind='task',issue_iid=NULL,branch='uzi/task/'||id::text,interactive=true,status='awaiting_followup' WHERE id=$1", lead)
 		}},
-		{"stale generation", false, false, func(f memoryFixture, lead uuid.UUID) {
+		{"stale generation", false, false, func(t *testing.T, f memoryFixture, lead uuid.UUID) {
 			f.e.exec("UPDATE runs SET claim_generation=3 WHERE id=$1", lead)
 		}},
-		{"released parent", false, false, func(f memoryFixture, lead uuid.UUID) {
+		{"released parent", false, false, func(t *testing.T, f memoryFixture, lead uuid.UUID) {
 			f.e.exec("UPDATE runs SET claim_released_at=now() WHERE id=$1", lead)
 		}},
-		{"interrupted pending check", false, false, func(f memoryFixture, lead uuid.UUID) {
+		{"interrupted pending check", false, false, func(t *testing.T, f memoryFixture, lead uuid.UUID) {
 			f.e.exec("UPDATE cross_checks SET interrupted_at=now() WHERE lead_run_id=$1", lead)
 		}},
-		{"decided code check", false, false, func(f memoryFixture, lead uuid.UUID) {
+		{"decided code check", false, false, func(t *testing.T, f memoryFixture, lead uuid.UUID) {
 			f.e.exec("UPDATE cross_checks SET outcome='completed',decided_at=now() WHERE lead_run_id=$1", lead)
 		}},
 		{"deadline", false, true, nil},
-		{"unsupported waiting issue", false, false, func(f memoryFixture, lead uuid.UUID) {
+		{"unsupported waiting issue", false, false, func(t *testing.T, f memoryFixture, lead uuid.UUID) {
 			f.e.exec("UPDATE runs SET status='awaiting_followup' WHERE id=$1", lead)
 		}},
-		{"noninteractive waiting task", false, false, func(f memoryFixture, lead uuid.UUID) {
+		{"noninteractive waiting task", false, false, func(t *testing.T, f memoryFixture, lead uuid.UUID) {
 			f.e.exec("UPDATE runs SET kind='task',issue_iid=NULL,branch='uzi/task/'||id::text,interactive=false,status='awaiting_followup' WHERE id=$1", lead)
 		}},
-		{"target mismatch", false, false, func(f memoryFixture, lead uuid.UUID) {
+		{"target mismatch", false, false, func(t *testing.T, f memoryFixture, lead uuid.UUID) {
 			other := seedOutageRun(t, f.e, f.w.UserID, f.repo, f.w.ID, "running", "issue", 2, 0)
 			f.e.exec("UPDATE runs SET target_run_id=$2 WHERE id=$1", f.b.RunID, other)
 		}},
-		{"foreign parent", false, false, func(f memoryFixture, lead uuid.UUID) {
+		{"foreign parent", false, false, func(t *testing.T, f memoryFixture, lead uuid.UUID) {
 			user := f.e.seedUser(t)
 			f.ownUser(user)
 			f.e.exec("UPDATE runs SET user_id=$2 WHERE id=$1", lead, user)
@@ -73,7 +73,7 @@ func TestMemoryCodeCheckerAuthorityLiveDB(t *testing.T) {
 			t.Run("admission", func(t *testing.T) {
 				f, lead := memoryCodeFixture(t, tc.expired)
 				if tc.mutate != nil {
-					tc.mutate(f, lead)
+					tc.mutate(t, f, lead)
 				}
 				got, err := f.s.ReserveMemoryIntervention(f.e.ctx, f.w, MemoryReservationRequest{
 					MemoryBinding: f.b, Policy: MemoryPolicy{Version: 1, MaxInterventions: 3}})
@@ -103,7 +103,7 @@ func TestMemoryCodeCheckerAuthorityLiveDB(t *testing.T) {
 					f, lead := memoryCodeFixture(t, false)
 					f.reserve(t, f.b)
 					if tc.mutate != nil {
-						tc.mutate(f, lead)
+						tc.mutate(t, f, lead)
 					}
 					got, err := f.s.ReserveMemoryIntervention(f.e.ctx, f.w, MemoryReservationRequest{
 						MemoryBinding: f.b, Policy: MemoryPolicy{Version: 1, MaxInterventions: 3}})
@@ -121,7 +121,7 @@ func TestMemoryCodeCheckerAuthorityLiveDB(t *testing.T) {
      claim_released_at=now(),released_worker_id=worker_id,released_worker_nonce='memory-nonce',
      memory_policy='{"version":1,"max_interventions":3}',memory_intervention_count=3 WHERE id=$1`, f.b.RunID)
 				if tc.mutate != nil {
-					tc.mutate(f, lead)
+					tc.mutate(t, f, lead)
 				}
 				before := f.run(t)
 				_, err := f.e.q.ResumeMemoryEpisode(f.e.ctx, store.ResumeMemoryEpisodeParams{

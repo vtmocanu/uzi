@@ -90,13 +90,17 @@ func liveDBTrackEntry(t testing.TB, pool *pgxpool.Pool, add func(*liveDBTracked)
 }
 
 // liveDBCleanupSteps run in order in one transaction. $1 binds the step's tracked set
-// (users unless named otherwise); every row reached hangs off those ids.
+// (users unless named otherwise); every row reached hangs off those ids. That includes
+// rows owned by other users that reference tracked runs, workers or holds (live_run_id,
+// live_worker_id, hold_id), which the RESTRICT FKs force the steps to remove first.
 var liveDBCleanupSteps = []struct {
 	name, sql string
 	set       liveDBSet
 }{
 	// Captures RESTRICT their hold, so they go first. A closure pins its capture and
-	// cannot be deleted, so a pinned capture is left (none exists on the shared DB).
+	// cannot be deleted, so a pinned capture is left. The shared DB does hold closures
+	// (harness_overflow_lifecycle_livedb_test.go creates them and deletes them in its own
+	// cleanup, which runs before this tracked one), so those captures are normally gone.
 	{"recovery_captures", `DELETE FROM recovery_captures c
 		WHERE (c.user_id = ANY($1) OR c.run_id IN (SELECT id FROM runs WHERE user_id = ANY($1)))
 		  AND NOT EXISTS (SELECT 1 FROM recovery_prerequisite_closures pc WHERE pc.capture_id = c.id)`, liveDBUsers},
@@ -127,8 +131,10 @@ var liveDBCleanupSteps = []struct {
 		   OR checker_run_id IN (SELECT id FROM runs WHERE user_id = ANY($1))`, liveDBUsers},
 	// Holds and publications RESTRICT each other (hold_id, final_publication_id), so one
 	// statement deletes both; the FK checks run at its end. A hold carrying a merged
-	// predecessor binding (its guard raises) or pinned by a closure stays: none exists on
-	// the shared DB, and if one ever RESTRICTs a tracked run the transaction fails loudly.
+	// predecessor binding (its guard raises) or pinned by a closure stays. Closures do
+	// exist on the shared DB, but harness_overflow_lifecycle_livedb_test.go deletes its own
+	// in its cleanup, which runs before this tracked one; if one ever RESTRICTs a tracked
+	// run the transaction fails loudly.
 	{"recovery_custody_holds + run_held_publications", `WITH h AS (
 		DELETE FROM recovery_custody_holds rh
 		WHERE (rh.user_id = ANY($1)
@@ -229,7 +235,8 @@ func liveDBRowCount(t *testing.T, e codexTestEnv, table, column string, ids []uu
 
 // Issue #4154: every shared-DB fixture shape deletes its own users, runs, workers, repos
 // and custody rows (and its ownerless products and templates) when its test ends, while
-// an untracked control user's rows stay.
+// the control user (tracked by the parent test through seedCodexInfra) keeps its rows
+// through the subtests' cleanups.
 func TestLiveDBFixtureCleanupRemovesOwnRowsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	controlUser, controlWorker, controlRepo := env.seedCodexInfra(t)
@@ -401,7 +408,7 @@ func TestLiveDBFixtureCleanupRemovesOwnRowsLiveDB(t *testing.T) {
 		{"repos", "id", controlRepo}, {"runs", "id", controlRun},
 	} {
 		if n := liveDBRowCount(t, env, c.table, c.column, []uuid.UUID{c.id}); n != 1 {
-			t.Errorf("untracked control %s row: count %d, want 1", c.table, n)
+			t.Errorf("parent test's control %s row must survive the subtests' cleanups: count %d, want 1", c.table, n)
 		}
 	}
 }
