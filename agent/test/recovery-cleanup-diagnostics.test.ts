@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 import type { RecoveryExactHold } from "../src/protocol.js";
@@ -10,7 +11,7 @@ import { binding, closed, patch, inventory, environment, fixture } from "./fixtu
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }); });
 async function world(variant: Parameters<typeof fixture>[1] = "acknowledged") {
-  const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/cleanup-diagnostics-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cleanup-diagnostics-"));
   roots.push(root);
   const f = await fixture(root, variant);
   return { f, ...environment(f) };
