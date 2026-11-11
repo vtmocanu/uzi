@@ -183,17 +183,23 @@ func TestCapacityBlockerProjectionFailureDoesNotChangeSeverity(t *testing.T) {
 }
 
 func TestCapacityBlockersComposedBudgetPreservesActions(t *testing.T) {
-	for _, status := range []string{"queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "paused", "pool_wait", "limit_wait", "recovery_wait"} {
+	for _, status := range []string{"queued", "queued_with_source_gap", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "paused", "pool_wait", "limit_wait", "recovery_wait"} {
 		t.Run(status, func(t *testing.T) {
 			o, w, run := uuid.New(), uuid.New(), uuid.New()
+			missingSource := status == "queued_with_source_gap"
+			rowStatus := status
+			if missingSource {
+				rowStatus = "queued"
+			}
 			long := pgtype.Text{String: strings.Repeat("界", 200) + "\n\u202e", Valid: true}
 			stamp := pgtype.Timestamptz{Time: fixedNow.Add(time.Hour), Valid: true}
 			f := &fakeStore{
 				capacityRows: []store.ListOwnersWaitingNoCapacityRow{{RunID: uuid.New(), UserID: o, HealthReason: long, HealthSince: pgtype.Timestamptz{}}},
 				workers:      []store.ListAllWorkersRow{{Worker: store.Worker{ID: w, UserID: o, Kind: "hosted", DrainingSince: stamp}}},
 				blockerRows: []store.ListWorkerUpgradeBlockersRow{{WorkerID: w, WorkerOwner: o, OwnerMismatch: true, SafeCount: 999999,
-					RunID: pgtype.UUID{Bytes: run, Valid: true}, Kind: pgtype.Text{String: "cross_check", Valid: true}, Status: pgtype.Text{String: status, Valid: true},
-					HealthReason: long, HoldReason: long, RecoveryWaitCause: long, LimitResetsAt: stamp, RetryNotBefore: stamp, RecoveryRetryNotBefore: stamp}},
+					RunID: pgtype.UUID{Bytes: run, Valid: true}, Kind: pgtype.Text{String: "cross_check", Valid: true}, Status: pgtype.Text{String: rowStatus, Valid: true},
+					MissingRepoAgentSource: missingSource,
+					HealthReason:           long, HoldReason: long, RecoveryWaitCause: long, LimitResetsAt: stamp, RetryNotBefore: stamp, RecoveryRetryNotBefore: stamp}},
 			}
 			c := newSvc(f, nil).checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled)
 			v := c.Evidence[0].Value
@@ -210,6 +216,13 @@ func TestCapacityBlockersComposedBudgetPreservesActions(t *testing.T) {
 			}
 			if status == "limit_wait" && !strings.Contains(v, "no roll time promised") {
 				t.Fatal(v)
+			}
+			if missingSource {
+				for _, want := range []string{"assigned worker lacks required repo_agent_source_v1", "recorded reason " + strings.Repeat("界", 23), "hold " + strings.Repeat("界", 23)} {
+					if !strings.Contains(v, want) {
+						t.Fatalf("%s missing %s", v, want)
+					}
+				}
 			}
 			if status == "queued" && !strings.Contains(v, "exact fence unavailable, inspect run") {
 				t.Fatal(v)

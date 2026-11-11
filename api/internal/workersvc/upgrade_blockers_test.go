@@ -26,12 +26,18 @@ func TestUpgradeBlockerCapabilityWithRecordedFacts(t *testing.T) {
 				r.HealthReason = blockerText(reason)
 			}
 			got := GroupUpgradeBlockers([]store.ListWorkerUpgradeBlockersRow{r})[w].Summary()
-			for _, want := range []string{"hold credential_disabled", "exact fence unavailable", "assignment releases only when the run ends"} {
+			for _, want := range []string{"hold credential_disabled", "assignment releases only when the run ends"} {
 				if !strings.Contains(got, want) {
 					t.Fatalf("%s missing %s", got, want)
 				}
 			}
 			if strings.Contains(got, "repo_agent_source_v1") != missing {
+				t.Fatal(got)
+			}
+			if missing && !strings.Contains(got, "assigned worker lacks required repo_agent_source_v1") {
+				t.Fatal(got)
+			}
+			if !missing && !strings.Contains(got, "exact fence unavailable") {
 				t.Fatal(got)
 			}
 			if reason == "" && !strings.Contains(got, "recorded reason unavailable") {
