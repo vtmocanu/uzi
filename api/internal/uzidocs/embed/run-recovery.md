@@ -2743,8 +2743,9 @@ neither activation nor deletion.
 Post-release owner observation is separate from operational disable evidence,
 not a pre-enable canary or approval gate. Record the actual image, pod, epoch,
 requested state and scratch result (deleted counts, kept reasons, or fatal
-settlement). Report three separate figures: allocated-byte estimate,
-unattributed statfs free delta, and independently verified physical reclaim.
+settlement). Report three separate figures: the deleted allocated-byte estimate
+(`scratch.deleted_allocated_bytes_estimate`), the unattributed statfs free delta
+(`scratch.statfs_free_delta_unattributed`), and independently measured physical reclaim.
 Neither of the first two proves the third. Hosted before/after-byte acceptance
 and the owner's keep-default decision remain pending on #4043; the PRD stays
 open pending hosted acceptance. Existing mechanism protections and residuals

@@ -403,11 +403,15 @@ every tree. See [Verified-epoch reclaim](./run-recovery.md#verified-epoch-reclai
 for the admitted shapes, budgets and crash residuals.
 
 The line also carries a `scratch` object for the runner `TMPDIR` scratch phase
-(#4043). That phase has its own off-by-default gate, so the object reads
-`state: "not_run"`; see [Runner TMPDIR scratch](./worker-setup.md) for its fields.
+(#4043, #4182). The chart requests this phase by default, independently of
+attempt deletion. `state: "not_run"` means the scratch phase was not entered:
+it can reflect a request that is off, or a requested pass without both an
+`eligible` verdict and `attested` authority. Read `scratch_requested` on the startup activation line
+alongside the pass verdict and reason; `not_run` alone does not prove the
+request is off. See [Runner TMPDIR scratch](./worker-setup.md) for its fields.
 
 The administrator's `workers.docker.podEpochReclaim.runtime` defaults to unset.
-A fresh default-off pod logs `deferred` / `runtime_not_declared` immediately
+A fresh pod without a runtime declaration logs `deferred` / `runtime_not_declared` immediately
 after startup reaping, without waiting for predecessor evidence; keeping trees
 needs no declaration. Setting a value attests the full audited runtime/storage
 contract, and the worker cross-checks it against the controller's version-2
