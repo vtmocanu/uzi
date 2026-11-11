@@ -442,8 +442,10 @@ type RenderConfig struct {
 	// gets UZI_EPOCH_RECLAIM_DELETION=1. Empty means off. The env is omitted, never
 	// rendered as "0", so every unselected template stays byte-identical.
 	EpochReclaimDeletionCanaryID string
-	RollConcurrency              int
-	RollTargetVersion            string
+	// EpochScratchDeletion enables scratch cleanup for persistent DinD workers.
+	EpochScratchDeletion bool
+	RollConcurrency      int
+	RollTargetVersion    string
 	// Namespace is the dedicated worker namespace: it contains nothing but hosted
 	// workers, which is what bounds a compromised controller.
 	Namespace string
@@ -1343,6 +1345,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			corev1.EnvVar{Name: "UZI_POD_EPOCH_EVIDENCE_FILE", Value: podEpochMountPath + "/evidence"})
 		if cfg.PodEpochRuntime != "" {
 			env = append(env, corev1.EnvVar{Name: PodEpochRuntimeEnv, Value: cfg.PodEpochRuntime})
+		}
+		if cfg.EpochScratchDeletion && !w.Ephemeral {
+			env = append(env, corev1.EnvVar{Name: "UZI_EPOCH_SCRATCH_DELETION", Value: "1"})
 		}
 		if epochReclaimDeletionCanary(cfg, w) {
 			env = append(env, corev1.EnvVar{Name: "UZI_EPOCH_RECLAIM_DELETION", Value: "1"})

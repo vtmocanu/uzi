@@ -1001,6 +1001,8 @@ workers:
   # next replacement/startup of that worker. Never move it to another UUID until the prior
   # enabled incarnation is gone or off. See docs/run-recovery.md.
   epochReclaim:
+    # Scratch cleanup for persistent Docker workers; attempt deletion stays canary-only.
+    scratchDeletion: true
     deletionCanaryWorkerId: ""
   docker:
     podEpochReclaim:
@@ -1009,8 +1011,8 @@ workers:
       # in lifetime epoch locking. Setting containerd-runc or crio-crun is
       # the operator's attestation of the FULL audited runtime/storage contract (a future
       # hosted-Docker deletion will require it) and is cross-checked against observations.
-      # Deletion runs only on the one worker selected by workers.epochReclaim.deletionCanaryWorkerId
-      # below; every other worker deletes nothing. See deploy/README.md, Pod-epoch shadow reclaim.
+      # Attempt deletion runs only on workers.epochReclaim.deletionCanaryWorkerId;
+      # scratch cleanup is controlled separately by workers.epochReclaim.scratchDeletion.
       runtime: ""
     # Turning this on creates the privileged namespace, its quota/limits, the worker
     # SA + pull secret in it, and the controller's Role there. It also makes the

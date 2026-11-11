@@ -94,6 +94,7 @@ func main() {
 		DockerNamespace:              cfg.WorkerDockerNamespace,
 		PodEpochRuntime:              cfg.WorkerPodEpochRuntime,
 		EpochReclaimDeletionCanaryID: cfg.WorkerEpochReclaimDeletionCanaryID,
+		EpochScratchDeletion:         cfg.WorkerEpochScratchDeletion,
 		DinDImage:                    cfg.WorkerDinDImage,
 		// Config carries the POSITIVE `rootless` bool (matching the chart value); the
 		// render side carries the NEGATIVE `non-rootless` so its zero value is the safe
