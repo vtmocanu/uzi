@@ -62,7 +62,7 @@ These hold in every milestone. A change that weakens one is out of scope for thi
   - *Issue description:* the PRD link patch (`GetIssue`, `UpdateIssueDescription` in `patchOnePRDLink`, `forgesvc/prd_link_patch.go`).
   - *Autopilot:* label events (`ListIssueLabelEvents` in `detectOne`, `api/internal/poller/autopilot.go`).
   - *Comments out* (`CreateIssueNote`, five calls, all discarding the returned note): autopilot's refusal comment (`recordThenComment`, `poller/autopilot.go`), CI autofix start and halt comments (`detectOne`, `poller/ci_autofix.go`), the merge request rework halt comment (`detectOne`, `poller/mr_review_watch.go`) and the terminal comment (`maybeTerminalComment`, `api/internal/runlifecycle/lifecycle.go`).
-- **Code-host calls still made on a `forge.Forge` value.** Four: `VerifyToken` and `ListProjects` in `validateConnection` and `DiscoverRepos` (`api/internal/provisionsvc/provisionsvc.go`) and in `ForgeConnection` (`api/internal/seed/seed.go`), each called directly on what the connection factory returns. No issue-side call goes through the union.
+- **No call goes through the union.** The same inventory shows 66 code-host calls, all through `CodeHost`, and none of either kind through `forge.Forge`. The connection factories still return `forge.Forge`; each caller narrows the value before its first call.
 - **The privilege check is code-host only.** `VerifyToken`, `ProjectRole`, `DefaultBranchProtection` (`Check`, `CheckToken` and `checkRepo`, `api/internal/privcheck/checker.go`, all taking `forge.CodeHost`; `privcheck/service.go` at claim), fail-closed.
 - **Mixed callers.** Comment intake reads issue comments (`ListIssueComments`) and checks each author against the repository (`RepositoryAuthorEligibility`, in `Assessment.Author`, `api/internal/issueinput/assessment.go`); merge request watchers read the MR from the code host and move the card on the issue side (`AutoMove`), both in `forgesvc/mr_watch.go`.
 - **Issue identity is a number.** `issues.forge_issue_iid bigint` (`api/internal/store/migrations/00002_forge.sql:47-50`), `runs.issue_iid`, and one active run per issue on `(repo_id, coalesce(issue_iid, continued_issue_iid))` for issue runs and tasks continuing an issue (`00351_task_continued_issue.sql:11-14`).
@@ -135,7 +135,7 @@ These hold in every milestone. A change that weakens one is out of scope for thi
 Progress (one PR per milestone, each merged before the next starts):
 
 - [x] **M1:** the `IssueTracker` and `CodeHost` interfaces
-- [x] **M2:** every caller on its half. The type-checked inventory shows 0 issue-side calls through `forge.Forge` and 45 through `IssueTracker`, and handing `privcheck` an `IssueTracker`-only value fails to compile.
+- [x] **M2:** every caller on its half. The type-checked inventory shows 45 issue-side calls through `IssueTracker`, 66 code-host calls through `CodeHost` and none through `forge.Forge`, and handing `privcheck` an `IssueTracker`-only value fails to compile.
 - [ ] **M3:** issue tracker connections and the YouTrack driver
 - [ ] **M4:** issue identity, the repo link and issue intake from YouTrack
 - [ ] **M5:** the board and issue writes on YouTrack

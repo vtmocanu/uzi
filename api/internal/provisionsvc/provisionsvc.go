@@ -211,14 +211,16 @@ func (s *Service) validateConnection(ctx context.Context, forgeType, baseURL, to
 	if err != nil {
 		return validatedConnection{}, &Error{Kind: KindBadRequest, Message: "could not initialize forge client"}
 	}
-	identity, err := f.VerifyToken(ctx)
+	// PRD #4173 D3: connection validation uses the code-host half only.
+	var ch forge.CodeHost = f
+	identity, err := ch.VerifyToken(ctx)
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		return validatedConnection{}, &Error{Kind: KindBadGateway, Message: "token verification failed: " + err.Error()}
 	}
 
 	// Least-privilege gate (PRD #5): token-level violations block the save.
-	if tr := s.guard.CheckToken(ctx, f, forge.Type(forgeType), identity.IsAdmin); len(tr.Violations) > 0 {
+	if tr := s.guard.CheckToken(ctx, ch, forge.Type(forgeType), identity.IsAdmin); len(tr.Violations) > 0 {
 		return validatedConnection{}, &Error{
 			Kind:       KindOverPrivileged,
 			Message:    "the bot token is over-privileged and was not saved; mint a least-privilege token (see the bot setup doc)",
@@ -246,7 +248,9 @@ func (s *Service) DiscoverRepos(ctx context.Context, userID, connID uuid.UUID) (
 		s.logger().Error("build forge for connection", "error", err)
 		return store.ForgeConnection{}, internal()
 	}
-	projects, err := f.ListProjects(ctx)
+	// PRD #4173 D3: discovery lists projects on the code-host half.
+	var ch forge.CodeHost = f
+	projects, err := ch.ListProjects(ctx)
 	if err != nil {
 		return store.ForgeConnection{}, &Error{Kind: KindBadGateway, Message: "could not list projects: " + err.Error()}
 	}
@@ -306,7 +310,9 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		s.logger().Error("build forge for connection", "error", err)
 		return store.Repo{}, internal()
 	}
-	if err := forgesvc.EnsureBoardColumns(ctx, s.q, f, row.ID, row.ForgeProjectID); err != nil {
+	// PRD #4173 D3: board columns are labels, on the issue-tracker half.
+	var tr forge.IssueTracker = f
+	if err := forgesvc.EnsureBoardColumns(ctx, s.q, tr, row.ID, row.ForgeProjectID); err != nil {
 		var seedErr *forgesvc.LabelSeedError
 		if errors.As(err, &seedErr) {
 			return store.Repo{}, &Error{Kind: KindBadGateway, Message: "could not seed board labels on the forge: " + seedErr.Error()}
