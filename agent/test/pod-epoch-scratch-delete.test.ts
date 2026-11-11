@@ -469,7 +469,7 @@ describe("GitCache.discardEpochScratchLeaf", () => {
     for (const [label, run] of bad) assert.throws(run, /unaudited/, label);
   });
 
-  it("the public method refuses a bad name, a foreign root and a stray seam before any observation", async () => {
+  it("the public method refuses a bad name, a foreign root and a stray seam before any mutation", async () => {
     for (const over of [
       { name: ".." }, { name: "a/b" }, { expect: "x" }, { rootExpect: "-" },
       { testSeam: undefined, root: "/tmp" as never },
@@ -477,7 +477,7 @@ describe("GitCache.discardEpochScratchLeaf", () => {
     ] as Array<Partial<EpochScratchDiscardInput>>) {
       const x = discardFixture(over);
       await assert.rejects(x.git.discardEpochScratchLeaf(x.input));
-      assert.deepEqual(x.events, []);
+      assert.deepEqual(x.events, over.testSeam && over.testSeam.token !== SEAM ? [] : ["beforeLaunch"]);
       assert.equal(x.f.pending(), 0);
       assert.equal(x.internal.unsettledDeletes.size, 0);
     }

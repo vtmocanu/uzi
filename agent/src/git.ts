@@ -4161,8 +4161,8 @@ export class GitCache {
   /**
    * Issue #4043: delete one admitted scratch leaf through the strict PINNED_SUBTREE_SCRIPT mode and
    * classify what happened before anything is settled. It never enters preflightEpochNative, the
-   * epochNative store, beginDestructive or a slot. Order: the argv validator, the caller's explicit
-   * pre-launch observation, scope liveness, the `unsettledDeletes` entry, then the shared spawn/join
+   * epochNative store, beginDestructive or a slot. Order: the caller's explicit pre-launch observation,
+   * scope liveness and budget calculation, the argv validator, the `unsettledDeletes` entry, then the shared spawn/join
    * core (ticket pending); classification re-pins the root, re-checks the mounts (both caller
    * callbacks) and re-censuses the leaf NAME as the runner, then maps it with
    * classifyScratchSettlement. Only a settled outcome (`removed` or `residue`) removes the entry and
@@ -4194,10 +4194,6 @@ export class GitCache {
         !Number.isFinite(input.deadline) || !Number.isSafeInteger(input.bytes) || input.bytes < 0)
         throw new Error("epoch scratch delete input refused");
       root = seam?.root ?? input.root;
-      wrapped = runnerCommand(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, root, input.name,
-        String(SCRATCH_DELETE_LIMITS.maxEntries), String(SCRATCH_DELETE_LIMITS.budgetMs), "remove", input.expect, "",
-        "pinned", input.rootExpect, "1", String(SCRATCH_DELETE_LIMITS.maxDepth)]);
-      this.validateEpochScratchLaunch(wrapped.command, wrapped.args, env, "/", "command", seam?.root);
       await input.beforeLaunch();
       input.signal.throwIfAborted();
       if (Date.now() >= input.deadline) throw new Error("epoch scratch delete deadline exhausted");
