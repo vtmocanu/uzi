@@ -80,6 +80,7 @@ These hold in every milestone. A change that weakens one is out of scope for thi
 - **D10. Issue identity is designed in M4, against YouTrack.** The candidate, taken from a working prototype in our fork: the numeric identity is YouTrack's `numberInProject`, which satisfies the `NOT NULL`, uniqueness and `runs_kind_shape` constraints above with no schema change to them; a nullable `issue_key text` carries the readable id (`ABC-12`) for display and references, NULL for forge issues. An issue moved to another YouTrack project gets a new number, which is treated as the issue leaving the repo. The decision is recorded in the Decision Log in M4, before code.
 - **D11. Issue tracker comments are withheld until their author is proven.** An issue tracker comment reaches a run only when its author maps to a uzi user who owns or can access the repo. Until that mapping exists, issue tracker comments are withheld exactly like a comment whose author lookup failed. How an issue tracker account is proven to belong to a uzi user is designed in M4 and recorded in the Decision Log before code; the fail-closed default holds until then.
 - **D12. Autopilot is not offered on a repo linked to an issue tracker in this PRD.** It maps the label adder to a uzi user through the forge identity, which an issue tracker account does not have. It stays unchanged on forge-backed repos.
+- **D13. An issue number belongs to one issue source, and a repo changes source only when idle.** A forge issue 12 and a YouTrack issue 12 are different issues, and so are number 12 in two YouTrack projects. Each run and each cached issue records the issue source it came from (the issue tracker connection and project, or the forge when NULL). Linking, relinking or unlinking a repo is refused while it has a run that is not terminal. When the source changes, the repo's cached issues from the old source are removed and schedules pinned to an issue number are disabled until their owner pins them again. Lifecycle moves, comments and merge request watcher updates act on a run's issue only when the run's recorded source is the repo's current source; otherwise they are skipped and logged, never applied to the same number in another source.
 
 ## Feature parity on a repo linked to an issue tracker
 
@@ -128,10 +129,10 @@ D6, D7, D8 and S3. The `api/internal/issuetracker` package, the YouTrack driver 
 
 ### M4: issue identity, the repo link and issue intake from YouTrack
 
-D5, D10, D11 and S2. The identity decision (recorded in the Decision Log before code), the repo link to a connection and project, `IssueTrackerForRepo` returning the issue tracker, sync on the poll cadence, run creation from an issue tracker issue.
+D5, D10, D11, D13 and S2. The identity decision (recorded in the Decision Log before code), the repo link to a connection and project with the link and relink rules of D13, `IssueTrackerForRepo` returning the issue tracker, sync on the poll cadence, run creation from an issue tracker issue.
 
 - **Blocked by:** M3.
-- **Acceptance:** a tagged YouTrack issue appears on the board and starts a run that receives its title and body; an issue tracker comment from an unmapped author is withheld; the privilege check and claim still run against the forge and fail closed with the issue tracker unreachable; a repo with no link is byte-for-byte unchanged in its forge calls (recorded-call test).
+- **Acceptance:** a tagged YouTrack issue appears on the board and starts a run that receives its title and body; an issue tracker comment from an unmapped author is withheld; the privilege check and claim still run against the forge and fail closed with the issue tracker unreachable; a repo with no link is byte-for-byte unchanged in its forge calls (recorded-call test); linking is refused while a run is active; after a link or relink, a finished run and a pinned schedule from the old source cause no read or write on the same issue number in the new source (D13).
 
 ### M5: the board and issue writes on YouTrack
 
@@ -149,7 +150,7 @@ Settings → Issue trackers, the CLI commands, a setup page under `docs/`, an AD
 
 ## Testing decisions
 
-- **Every milestone's gate:** `task gate:api`, plus `task gate:web` when web changes, `check:changelog-entry`, and `docs:sync` with `check-docs:web` when docs change. Token-shaped test strings are assembled at runtime.
+- **Every milestone's gate:** `task gate:api` and `task scan:secrets`, plus `task gate:web` when web changes, `check:changelog-entry`, and `docs:sync` with `check-docs:web` when docs change. Token-shaped test strings are assembled at runtime, and the run's evidence includes the canaries-detected line of `scan:secrets`.
 - **No change in behaviour on forge-backed repos:** the existing API, web, agent and E2E suites pass; M2's two mechanical test edits are the only ones allowed without a finding.
 - **Parity is the contract suite (D7)**, not a per-driver checklist.
 
@@ -166,3 +167,4 @@ Settings → Issue trackers, the CLI commands, a setup page under `docs/`, an AD
 - **2026-11-10: no reflection test.** The interface declarations enforce the split (D4).
 - **2026-11-10: M2 test edits.** Fakes may change a parameter type, and mixed callers' test call sites pass the same fake twice. Nothing else in a test changes.
 - **2026-11-10: scope after the maintainer's review.** YouTrack becomes part of this PRD and drives the identity design. The living comment, the outbox, withdrawal, comments to the agent and `/uzi` commands move out. Asana follows in its own PRD.
+- **2026-11-11: link and relink policy (D13).** Review of the M1 PR found that project-local numbers let an old run or pinned schedule resolve to an unrelated issue after a repo changes its issue source. D13 scopes every number to its source and M4's acceptance covers the transition.
