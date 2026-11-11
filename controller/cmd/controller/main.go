@@ -88,12 +88,13 @@ func main() {
 	}
 
 	materializerCfg := kube.RenderConfig{
-		RollConcurrency:   cfg.RollConcurrency,
-		RollTargetVersion: cfg.RollTargetVersion,
-		Namespace:         cfg.WorkerNamespace,
-		DockerNamespace:   cfg.WorkerDockerNamespace,
-		PodEpochRuntime:   cfg.WorkerPodEpochRuntime,
-		DinDImage:         cfg.WorkerDinDImage,
+		RollConcurrency:              cfg.RollConcurrency,
+		RollTargetVersion:            cfg.RollTargetVersion,
+		Namespace:                    cfg.WorkerNamespace,
+		DockerNamespace:              cfg.WorkerDockerNamespace,
+		PodEpochRuntime:              cfg.WorkerPodEpochRuntime,
+		EpochReclaimDeletionCanaryID: cfg.WorkerEpochReclaimDeletionCanaryID,
+		DinDImage:                    cfg.WorkerDinDImage,
 		// Config carries the POSITIVE `rootless` bool (matching the chart value); the
 		// render side carries the NEGATIVE `non-rootless` so its zero value is the safe
 		// rootless posture. Invert here, at the one wiring point.

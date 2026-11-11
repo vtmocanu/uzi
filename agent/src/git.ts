@@ -2040,7 +2040,7 @@ function unionPeeledMarkers(...lists: Array<readonly string[] | undefined>): str
 // capturing it: the clone may be the only copy of that run's work, so it is retained FOREVER (the
 // attempt-path twin of the unwired worker's foreign quarantine, `discard:false`) — never counted
 // toward the abandoned cap and never deleted by any AUTOMATIC path. That includes the verified-epoch
-// disposal (PRD #3431, gated off in production): its settlement admits only a `live` attempt with an
+// disposal (PRD #3431, off unless the worker's startup opt-in is set): its settlement admits only a `live` attempt with an
 // exact strict-plain journal, or a `retired` entry for the exact retired/empty-journal repair
 // (see exactPlainAttemptJournal). Only an operator discard (#1786) disposes of a `reclaimed` tree.
 // Each seed compacts the key to its last value per
@@ -14394,7 +14394,7 @@ export class GitCache {
    * (`[]`) journal are refused at construction. It additionally requires a positively terminal lifecycle,
    * a read zero-hold response, the clean content proof ({@link automaticContentPreserved}; a settled
    * over-limit keeps the source as `epoch_content_unproven`) and a GET-only epoch observation before any
-   * effect. Production deletion stays off (`EPOCH_RECLAIM_DELETION_ENABLED` in pod-epoch-reclaim.ts).
+   * effect. Production deletion runs only under the worker's startup opt-in (`readEpochReclaimDeletionActivation` in pod-epoch-reclaim.ts).
    *
    * The pre-lock hold-read invariant belongs to the caller, not to this method: the holds snapshot
    * is only as current as the caller's proof that nothing can open a new hold on the run between the

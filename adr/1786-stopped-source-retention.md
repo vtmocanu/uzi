@@ -541,9 +541,12 @@ the single disposal core of a gated first-process deletion at a verified pod epo
 mechanism, its crash table and its R9 limits are recorded in the
 [ADR-1783 amendment of the same date](1783-run-quiescence-and-attempt-clone-paths.md).
 
-- **Off by default.** `EPOCH_RECLAIM_DELETION_ENABLED` is `false`, so production startup
-  is shadow-only and every retained source stays as this ADR describes. Activation needs a
-  separate owner co-sign; hosted acceptance is pending.
+- **Off by default.** Production startup is shadow-only and every retained source stays as
+  this ADR describes, unless the worker starts with the `UZI_EPOCH_RECLAIM_DELETION=1`
+  opt-in (#4134, which replaced the compile-time constant). The chart default selects no
+  worker; an operator can select exactly one hosted Docker worker. Live enablement waits on
+  the #3851 implementation in the deployed image plus refreshed R9 measurements; hosted
+  acceptance is pending.
 - **Plain only.** With an epoch proof, `discardRetainedSource` refuses any mode but
   `plain`; a `local_protected_discard` source is counted `kept_protected` and keeps the
   protected operator route.
