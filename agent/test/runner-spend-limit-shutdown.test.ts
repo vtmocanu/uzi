@@ -152,6 +152,47 @@ describe("RunRunner #3767 spend-limit park meets a worker shutdown", () => {
     });
   });
 
+  it("a shutdown routine that throws after starting runs once and its error propagates (no propagated re-entry)", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = ["claim_generation_fence", FEATURE];
+      const claim = gitlabClaim(3795, { claim_generation: 3 });
+      const r = rig(homeRoot, { waitForAbort: false });
+      api.failStateWhen(claim.run_id, (b) => {
+        if (b.recovery_cause !== "anthropic_spend_limit") return false;
+        r.runner.shutdown();
+        return true;
+      }, { httpStatus: 403, error: "forbidden" });
+      let bodyRuns = 0;
+      (r.runner as unknown as { awaitTickSurvivorsGone: unknown }).awaitTickSurvivorsGone = async () => {
+        bodyRuns++;
+        throw new Error("tick survivors probe failed");
+      };
+      await bounded(r.runner.execute(claim), "execute").catch(() => undefined);
+      assert.deepEqual(r.exits(), ["terminal_arm"], "the shutdown exit is taken exactly once");
+      assert.equal(bodyRuns, 1, "the shutdown routine body ran exactly once");
+      assert.equal(failures(claim.run_id).length, 0, `not reported failed: ${JSON.stringify(failures(claim.run_id))}`);
+    });
+  });
+
+  it("shutdown in progress when the park is acknowledged with another recovery cause: shutdown interruption, not failed (terminal_arm)", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = ["claim_generation_fence", FEATURE];
+      const claim = gitlabClaim(3796, { claim_generation: 3 });
+      const r = rig(homeRoot, { waitForAbort: false });
+      api.stateAckWire = (body, run) => {
+        if (body.status !== "recovery_wait" || body.recovery_cause !== "anthropic_spend_limit") return undefined;
+        r.runner.shutdown();
+        return { status: 200, body: { run: { ...run, status: "recovery_wait", recovery_wait_cause: "transient" } } };
+      };
+      try {
+        await bounded(r.runner.execute(claim), "execute");
+      } finally { api.stateAckWire = undefined; }
+      assert.deepEqual(r.exits(), ["terminal_arm"]);
+      assert.equal(failures(claim.run_id).length, 0, "no failed report");
+      assert.equal(checkpointLines(claim.run_id).length, 1, `a delivered shutdown checkpoint line: ${JSON.stringify(feedTexts(claim.run_id))}`);
+    });
+  });
+
   it("an interruption thrown out of the park capture during shutdown is handled inside the handler (propagated)", async () => {
     await withHome(async (homeRoot) => {
       client.protocolFeatures = ["claim_generation_fence", FEATURE];

@@ -22406,8 +22406,11 @@ export class RunRunner {
     const spend = cause.kind === "anthropic_spend_limit" ? cause : undefined;
     // Issue #3767: a spend-limit park that meets a worker shutdown takes the caller's shutdown
     // interruption (checkpoint, diagnostic, no terminal report) instead of reporting `failed`.
+    // The shutdown routine runs at most once: a throw out of it must propagate, not re-enter it.
+    let shutdownExitRan = false;
     const spendShutdownExit = async (exit: string): Promise<boolean> => {
       if (!(spend && opts.onShutdownExit && flight.active?.shuttingDown)) return false;
+      shutdownExitRan = true;
       runLog.info("spend-limit park interrupted by worker shutdown", { run_id: flight.runId, exit });
       await opts.onShutdownExit();
       return true;
@@ -23456,7 +23459,7 @@ export class RunRunner {
       // Issue #3767: a shutdown that interrupted the spend-limit park (capture or a report the
       // shutdown aborted) takes the caller's shutdown interruption here, while the batcher is still
       // open for its checkpoint diagnostic, instead of propagating into the generic recovery exit.
-      if (spend && opts.onShutdownExit && flight.active?.shuttingDown &&
+      if (spend && opts.onShutdownExit && flight.active?.shuttingDown && !shutdownExitRan &&
           !(error instanceof RetainedRecoveryStop) && !(error instanceof StaleClaimError) &&
           flight.steering.claimFence() === undefined && !flight.steering.isCancelled() &&
           !(progress && (opts.heldAuthenticated || opts.heldCapture))) {
