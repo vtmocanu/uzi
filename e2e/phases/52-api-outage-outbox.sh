@@ -363,6 +363,7 @@ record_outbox_transition() {
   local label="$1" start="$2" kind="$3" elapsed=$((SECONDS - $2))
   mkdir -p "$RUNROOT/artifacts/52-api-outage-outbox"
   printf '%s\t%s\t%s\n' "$label" "$kind" "$elapsed" >> "$RUNROOT/artifacts/52-api-outage-outbox/feature-transitions.tsv"
+  echo "publication feature transition: $label ($kind) ${elapsed}s, health + negotiation included"
   record_margin "publication feature $label ($kind, health + negotiation included)" "$((SECONDS - start))" 120
 }
 transition_outbox_feature() {

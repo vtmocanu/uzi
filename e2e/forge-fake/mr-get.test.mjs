@@ -138,6 +138,10 @@ test("shared fake serves a single MR/PR by iid in all three dialects", { timeout
       assert.equal(output.trim().split(/\s+/)[0], restoreHeads.get(name));
     }
     assert.equal(new Set(restoreRepos.map(name => restoreHeads.get(name))).size, 4);
+    assert.throws(() => execFileSync("git", ["-c", `http.sslCAInfo=${certPath}`, "ls-remote", `${origin}/group/no-such-fixture.git`, "refs/heads/main"], {
+      encoding: "utf8", timeout: 10000, stdio: "pipe",
+      env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    }), "an unknown project must not be served from another fixture's bare");
   });
 
   await t.test("GitLab /merge_requests/:iid returns state, source_branch and iid", async () => {

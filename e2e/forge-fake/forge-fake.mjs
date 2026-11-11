@@ -709,7 +709,14 @@ function handleGit(req, res, url) {
   // Keep the same per-project bare on both transports; aliasing every path to repo.git would
   // make the independent-restore fixture repositories share upstream refs and content.
   const requested = decodeURIComponent(url.pathname.slice(1).split(".git", 1)[0]);
-  const project = PROJECTS.find(p => p.path_with_namespace === requested) || PROJECT;
+  const project = PROJECTS.find(p => p.path_with_namespace === requested);
+  if (!project) {
+    // An unknown project must not silently reach another fixture's bare.
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("404 (forge-fake git: unknown project)");
+    log("git 404 unknown project", req.method, url.pathname);
+    return;
+  }
   const bareName = project.path_with_namespace.split("/").pop();
   const rest = url.pathname.replace(/^.*?\.git/, "");
   const cgi = spawn(GIT_HTTP_BACKEND, [], {
