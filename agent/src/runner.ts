@@ -23397,6 +23397,9 @@ export class RunRunner {
           // ownership: returning while it is still running would strand the row
           // because this healthy worker's heartbeats prevent stale-worker requeue.
         } catch (reportError) {
+          // Issue #3767: a throw out of the spend-limit shutdown routine (run from an ACK arm inside
+          // this try) propagates; it is never retried into a second shutdown routine.
+          if (shutdownExitRan) throw reportError;
           if (cause.kind === "publication_forge_unreachable" && reportError instanceof RequestError && reportError.status === 409) {
             let reason: string | undefined;
             try { reason = publicationParkRefusal(JSON.parse(reportError.body) as { reason?: string }); } catch { /* not a refusal body */ }

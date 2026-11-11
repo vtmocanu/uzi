@@ -167,7 +167,7 @@ describe("RunRunner #3767 spend-limit park meets a worker shutdown", () => {
         bodyRuns++;
         throw new Error("tick survivors probe failed");
       };
-      await bounded(r.runner.execute(claim), "execute").catch(() => undefined);
+      await assert.rejects(bounded(r.runner.execute(claim), "execute"), /tick survivors probe failed/);
       assert.deepEqual(r.exits(), ["terminal_arm"], "the shutdown exit is taken exactly once");
       assert.equal(bodyRuns, 1, "the shutdown routine body ran exactly once");
       assert.equal(failures(claim.run_id).length, 0, `not reported failed: ${JSON.stringify(failures(claim.run_id))}`);
@@ -190,6 +190,30 @@ describe("RunRunner #3767 spend-limit park meets a worker shutdown", () => {
       assert.deepEqual(r.exits(), ["terminal_arm"]);
       assert.equal(failures(claim.run_id).length, 0, "no failed report");
       assert.equal(checkpointLines(claim.run_id).length, 1, `a delivered shutdown checkpoint line: ${JSON.stringify(feedTexts(claim.run_id))}`);
+    });
+  });
+
+  it("a shutdown routine that throws at the other-cause ACK arm runs once and its error propagates (no loop-top re-entry)", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = ["claim_generation_fence", FEATURE];
+      const claim = gitlabClaim(3797, { claim_generation: 3 });
+      const r = rig(homeRoot, { waitForAbort: false });
+      api.stateAckWire = (body, run) => {
+        if (body.status !== "recovery_wait" || body.recovery_cause !== "anthropic_spend_limit") return undefined;
+        r.runner.shutdown();
+        return { status: 200, body: { run: { ...run, status: "recovery_wait", recovery_wait_cause: "transient" } } };
+      };
+      let bodyRuns = 0;
+      (r.runner as unknown as { awaitTickSurvivorsGone: unknown }).awaitTickSurvivorsGone = async () => {
+        bodyRuns++;
+        throw new Error("tick survivors probe failed");
+      };
+      try {
+        await assert.rejects(bounded(r.runner.execute(claim), "execute"), /tick survivors probe failed/);
+      } finally { api.stateAckWire = undefined; }
+      assert.deepEqual(r.exits(), ["terminal_arm"], "the shutdown exit is taken exactly once");
+      assert.equal(bodyRuns, 1, "the shutdown routine body ran exactly once");
+      assert.equal(failures(claim.run_id).length, 0, `not reported failed: ${JSON.stringify(failures(claim.run_id))}`);
     });
   });
 
