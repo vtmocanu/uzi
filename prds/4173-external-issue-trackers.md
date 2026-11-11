@@ -1,9 +1,13 @@
 # PRD #4173: External issue trackers: `IssueTracker` and `CodeHost` interfaces, with YouTrack as the first external issue tracker
 
-**Issue:** #4173  
-**Priority:** Medium  
-**Status:** In progress, r3 2026-11-11. M1 delivered. r3 follows the maintainer's scope review: one real issue tracker instead of abstract identity work, and the comment, command and withdrawal behaviours leave this PRD.  
-**Delivery:** one PR per milestone, each merged before the next starts. No implementation or validation step touches `.github/workflows/**`.  
+**Issue:** #4173
+
+**Priority:** Medium
+
+**Status:** In progress, r4 2026-11-11. M1 delivered. r3 followed the maintainer's scope review: one real issue tracker instead of abstract identity work, and the comment, command and withdrawal behaviours leave this PRD. r4 follows the maintainer's review of the M1 PR: the YouTrack id, tag and author decisions are made before the driver, and the issue source of a repo no longer changes.
+
+**Delivery:** one PR per milestone, each merged before the next starts. No implementation or validation step touches `.github/workflows/**`.
+
 **Builds on:**
 
 - **The forge layer** (`api/internal/forge`): three drivers (GitLab, `adr/0065-forgejo-driver.md`, `adr/0238-github-driver.md`) and the shared fake `forgetest.BaseFake`.
@@ -48,6 +52,8 @@ These hold in every milestone. A change that weakens one is out of scope for thi
 
 ## Current state (anchors from r1, verified on upstream `main` 6a76d09f7; line numbers drift, cite by symbol)
 
+M2's PR refreshes these anchors and the count of issue-side uses against `main` as it is then.
+
 - **Where the issue side is used today.** Every place in uzi's code, tests excluded, that calls one of the eleven issue-side methods through the `Forge` interface (47 in all; calls a driver makes inside itself are not counted), listed from the type-checked code (`golang.org/x/tools/go/packages`) and cross-checked with `gopls call_hierarchy`:
   - *Sync:* `forgesvc` `FullSync`, `IncrementalSync` and `reconcileFindingGroupMarkers` (`ListIssues`, `api/internal/forgesvc/service.go:787`, `:795`, `:816`, `:911`, `:915`, `:926`, `:448`).
   - *Board:* `AutoMove` and `SetIssueLabel` (`EnsureLabels`, `UpdateIssueLabels`, `forgesvc/service.go:534-542`, `:600-607`); column setup and label checks in the handlers (`EnsureLabels`, `ListLabels`, `api/internal/handler/board.go:366`, `:432`, `:760`, `handler/labels.go:36`, `:120`); close and reopen (`SetIssueState`, `forgesvc/close_reopen.go:29`, `:62`).
@@ -64,6 +70,9 @@ These hold in every milestone. A change that weakens one is out of scope for thi
 - **Board columns are labels.** `board_columns.label_name` (`00002_forge.sql:39`); moving a card swaps labels through `UpdateIssueLabels` (`api/internal/forgesvc/service.go:512-542`), forge-first, with the `move_pending_since` marker (`api/internal/runlifecycle/lifecycle.go:1-17`).
 - **Autopilot.** Maps the label adder to a uzi user through `forge_connections.human_username` (`00037_autopilot_mapping.sql:6-20`, `poller/autopilot.go:194`).
 - **Constraints a text key meets.** `issues.forge_issue_iid` is `bigint NOT NULL` with `UNIQUE (repo_id, forge_issue_iid)` (`00002_forge.sql:50`, `:59`), and `runs_kind_shape` requires `issue_iid IS NOT NULL` for `kind = 'issue'` (`00314_cross_check_claude_checker.sql`). An added `issue_key` column alone does not make an issue tracker issue storable.
+- **The issue author is checked the same way.** Run creation assesses `Issue.AuthorForgeUserID` through `RepositoryAuthorEligibility` (`Assessment.Author`, `api/internal/issueinput/assessment.go`). An author that cannot be assessed gives the reason `permission_unknown`, and a scheduled start with that reason is not auto-approved (`createRun`, `api/internal/workersvc/service.go`).
+- **The forge allowlist is deployment configuration.** `FORGE_ALLOWED_BASE_URLS` is rendered from the Helm value `forge.allowedBaseURLs` (`deploy/chart/values.yaml`, `deploy/chart/templates/api-configmap.yaml`) and passed through `docker-compose.yml`.
+- **Disabling a repo drains nothing.** It flips `repos.enabled`; a sync or a run already in flight finishes.
 - **Comment authors are checked against the repository.** Comment intake keeps a comment only when its author has repository access (`RepositoryAuthorEligibility`, a `CodeHost` method taking a forge user ID). An issue tracker comment's author is an issue tracker account, which that check cannot evaluate.
 
 ## Decisions
@@ -74,18 +83,41 @@ These hold in every milestone. A change that weakens one is out of scope for thi
 - **D4. What enforces the split.** The interface declarations do: a method belongs to the half that declares it, and passing an `IssueTracker` where a `CodeHost` is required does not compile. The per-driver `var _ IssueTracker` / `var _ CodeHost` lines are readable markers only; implementing `Forge` already implies them. No reflection test in M1 or M2.
 - **D5. A repo resolves its two sides.** `IssueTrackerForRepo` and `CodeHostForRepo` (`forgesvc`). Through M2 both return the repo's forge driver. From M4, `IssueTrackerForRepo` returns the linked issue tracker's driver. `CodeHostForRepo` always returns the forge driver (S2).
 - **D6. Issue tracker drivers live in their own package**, `api/internal/issuetracker`, not in `forge`. A driver is `forge.IssueTracker` plus what a connection needs: verify the token, list projects, list states. A new issue tracker is one kind constant, one registry entry, one driver and its fake.
-- **D7. Every driver ships with a fake and contract tests.** The fake follows `forgetest.BaseFake` (loud `ErrNotStubbed` defaults). One contract suite runs against every `IssueTracker` implementation, the three forge drivers' fakes included, so parity is tested, not asserted.
+- **D7. Every driver ships with a fake and contract tests, and the contract suite runs against the real drivers.** One contract suite covers every `IssueTracker` implementation. Each one is built by its production constructor and talks HTTP to a fake server: the YouTrack driver to an in-process HTTPS fake, the three forge drivers to `e2e/forge-fake`, as `api/internal/forge/fake_contract_test.go` already does for forge operations. An in-memory fake in the style of `forgetest.BaseFake` (loud `ErrNotStubbed` defaults) also ships, for the tests of callers; passing the suite on it is not evidence of parity.
 - **D8. Issue tracker connections are separate from forge connections.** Per user, kind and base URL, with the rules in S3. A repo links to one connection and one issue tracker project. NULL means the forge is the issue source.
-- **D9. Moving a card is an `IssueTracker` method.** `MoveToColumn`. The forge drivers implement it with one shared helper that does today's label swap in one `UpdateIssueLabels` call. YouTrack maps a column to a value of the project's State field. The column-to-state mapping is a side table, so relinking a repo never has to clear a column other code reads.
-- **D10. Issue identity is designed in M4, against YouTrack.** The candidate, taken from a working prototype in our fork: the numeric identity is YouTrack's `numberInProject`, which satisfies the `NOT NULL`, uniqueness and `runs_kind_shape` constraints above with no schema change to them; a nullable `issue_key text` carries the readable id (`ABC-12`) for display and references, NULL for forge issues. An issue moved to another YouTrack project gets a new number, which is treated as the issue leaving the repo. The decision is recorded in the Decision Log in M4, before code.
-- **D11. Issue tracker comments are withheld until their author is proven.** An issue tracker comment reaches a run only when its author maps to a uzi user who owns or can access the repo. Until that mapping exists, issue tracker comments are withheld exactly like a comment whose author lookup failed. How an issue tracker account is proven to belong to a uzi user is designed in M4 and recorded in the Decision Log before code; the fail-closed default holds until then.
+- **D9. Moving a card is an `IssueTracker` method.** `MoveToColumn`. The forge drivers implement it with one shared helper that does today's label swap in one `UpdateIssueLabels` call. YouTrack maps a column to a value of the project's State field. The column-to-state mapping is a side table, so `board_columns.label_name` keeps its meaning for the code that reads it.
+- **D10. YouTrack ids are adapted inside the driver; the neutral types do not change.** `IssueTracker` takes `projectID int64` and `issueIID int64` and returns `IssueNote.ID int64`, while YouTrack project, comment and account ids are strings. Changing the neutral types would cost the three forge drivers and every caller and give the forges nothing, so the driver adapts, and M3 implements exactly this:
+  - *Project.* A YouTrack driver is built for one project and holds that project's string id and short name. The `projectID int64` argument does not select a project. Methods called on a driver built without a project return an error.
+  - *Issue.* `issueIID` is YouTrack's `numberInProject`. It satisfies the `NOT NULL`, uniqueness and `runs_kind_shape` constraints above with no change to them.
+  - *Comment.* `IssueNote.ID` is the numeric part of the comment's entity id, which has the form `<type>-<number>`. An id of any other form is an error, never a guessed number.
+  - *Accounts.* The numeric author id of an issue or comment is 0, which the existing code already reads as unresolved; the login is carried as text. D11 says what an unresolved author may do.
+  - *Every read and write checks where it landed.* The issue reached must be in the driver's project and carry the requested number; otherwise the driver returns issue-not-found. An issue moved to another YouTrack project gets a new number there, so in the old project it is not found, even where YouTrack still resolves the old readable id.
+  - *A live run whose issue was moved away.* Its later issue writes (card move, comment, description patch) are skipped and logged. The code-host side of the run (branch, merge request, CI, settle) continues. The next sync removes the issue from the repo's cache.
+  - *Storage, decided in M4.* A nullable `issue_key text` carries the readable id (`ABC-12`) for display and references, NULL for forge issues. M4 records the column and its constraints in the Decision Log before code.
+- **D11. An issue tracker author is unproven until mapped, for comments and for the issue itself.** The forge's `RepositoryAuthorEligibility` is never asked about an issue tracker account. An issue tracker author counts as eligible only when the account maps to a uzi user who owns or can access the repo. Until then:
+  - *Comments* are withheld from the run, exactly like a comment whose author lookup failed.
+  - *The issue author* is assessed as `permission_unknown`. A manual start proceeds, because a uzi user chose that issue. A scheduled start is created but never auto-approved: its plan waits for a person. M4 tests the manual and the scheduled start separately.
+
+  How an issue tracker account is proven to belong to a uzi user is designed in M4 and recorded in the Decision Log before code; the fail-closed default holds until then.
 - **D12. Autopilot is not offered on a repo linked to an issue tracker in this PRD.** It maps the label adder to a uzi user through the forge identity, which an issue tracker account does not have. It stays unchanged on forge-backed repos.
-- **D13. An issue number belongs to one issue source, and a repo changes source only when idle.** A forge issue 12 and a YouTrack issue 12 are different issues, and so are number 12 in two YouTrack projects. Each run and each cached issue records the issue source it came from (the issue tracker connection and project, or the forge when NULL). Linking, relinking or unlinking a repo is refused while it has a run that is not terminal. When the source changes, the repo's cached issues from the old source are removed and schedules pinned to an issue number are disabled until their owner pins them again. Lifecycle moves, comments and merge request watcher updates act on a run's issue only when the run's recorded source is the repo's current source; otherwise they are skipped and logged, never applied to the same number in another source. One per-repo fence covers the source change and every operation that resolves or uses the repo's issue source: run creation (so the idle check and a new run cannot interleave), sync, and each issue write from resolving the source through its external call and its cache update. Such an operation completes entirely against the source it resolved, or it is refused or its result discarded; none resolves one source and lands, in the forge, the issue tracker or the cache, on another. M4 chooses the mechanism (a per-repo lock, a source generation checked with each write, or both) and records it in the Decision Log before code.
+- **D13. A repo's issue source is chosen before the repo is first enabled, and does not change.** Linking is accepted only for a repo that has never been enabled. Such a repo has had no sync and no run, so no stored reference and no operation in flight can meet the change. M4 verifies in code that neither can start on a repo that is not enabled, and refuses the link when anything else already stores an issue number for the repo, such as a schedule pinned to an issue. Relinking and unlinking are out of scope for this PRD, and so is linking a repo that is already in use.
+  - *"Never enabled" is a stored fact, not a reading of `repos.enabled`,* because disabling drains nothing. M4 adds a marker set in the transaction that first enables a repo and never cleared. Its migration marks every existing repo that is enabled or has a cached issue, a run or a schedule.
+  - *The link and the first enable take the same repo row lock,* so one of them sees the other: either the link lands first and the repo starts on YouTrack, or the enable lands first and the link is refused.
+  - *An issue tracker connection with a linked repo cannot be deleted.*
+  - A forge issue 12 and a YouTrack issue 12 can therefore never belong to the same repo.
+- **D14. YouTrack tags are not project labels, and the eligibility tag is chosen by id.** A YouTrack tag belongs to the user who created it, is private unless shared, and can share its name with another user's tag. So:
+  - *Choice.* When a repo is linked (M4), the admin picks the eligibility tag from the tags the connection's token can see. uzi stores the tag's id with the link, and its name for display only.
+  - *Verification at link time.* The token can read the tag and can add it to and remove it from an issue of the linked project, and the tag is shared beyond its owner. A private tag is refused, with what to change in YouTrack.
+  - *Matching.* Intake selects issues by the stored tag id. Another tag with the same name is ignored.
+  - *Other tags uzi writes* (on issues it creates, such as findings). `EnsureLabels` resolves a name only to a tag owned by the connection's account and creates it there when missing, with the sharing settings of the eligibility tag. It never resolves a name to another user's tag and never creates the eligibility tag.
+  - *`ListLabels`* returns the tags the token can see. Board columns are not tags on YouTrack (D9).
+  - *In the contract suite* the shared rule is "a label is addressed by name within the project the driver serves". The YouTrack subject is seeded with one eligibility tag and a second tag of the same name owned by another user, and the suite shows that only the first is ever read or written.
 
 ## Feature parity on a repo linked to an issue tracker
 
-- Bring tagged issues into uzi: the `uzi` tag in the linked project. Milestone M4.
+- Bring tagged issues into uzi: the eligibility tag chosen at link time (D14), in the linked project. Milestone M4.
 - Give the run the issue's title, body and comments: yes, comments subject to D11. M4.
+- Auto-approve a scheduled run's plan: only when the issue author is mapped (D11).
 - Let the agent read an issue through the worker API: yes, same routes. M4.
 - Show the board and move cards: yes, through the State field (D9). M5.
 - Close or reopen an issue: yes, through the State field. M5.
@@ -94,6 +126,7 @@ These hold in every milestone. A change that weakens one is out of scope for thi
 - PRD link patch in the issue description: yes. M5.
 - Eligibility by assigning the issue to the uzi bot: not offered in this PRD; the tag is the only signal.
 - Autopilot: not offered (D12).
+- Change a repo's issue source after it was first enabled: not offered (D13).
 - Privilege checks, claim and settle, pipeline sync, merge request watchers, clone and push: unchanged, on the forge (S2).
 
 ## Milestones
@@ -105,7 +138,7 @@ Progress (one PR per milestone, each merged before the next starts):
 - [ ] **M3:** issue tracker connections and the YouTrack driver
 - [ ] **M4:** issue identity, the repo link and issue intake from YouTrack
 - [ ] **M5:** the board and issue writes on YouTrack
-- [ ] **M6:** web and CLI surfaces, docs, ADR and live acceptance
+- [ ] **M6:** web and CLI surfaces, docs and live acceptance
 
 ### M1: the `IssueTracker` and `CodeHost` interfaces
 
@@ -118,21 +151,30 @@ D1, D2 and D4. One file per interface with the types only it uses (`issuetracker
 D3 and D5.
 
 - **Blocked by:** M1.
-- **Acceptance:** all 47 issue-side uses go through `IssueTracker`; `privcheck` cannot be handed a value that has only the issue side; existing tests change only in two mechanical ways (a fake's parameter type, and passing the same fake as both halves).
+- **Acceptance:** every issue-side use in the refreshed inventory (47 at r1) goes through `IssueTracker`; `privcheck` cannot be handed a value that has only the issue side; existing tests change only in two mechanical ways (a fake's parameter type, and passing the same fake as both halves).
 
 ### M3: issue tracker connections and the YouTrack driver
 
-D6, D7, D8 and S3. The `api/internal/issuetracker` package, the YouTrack driver for every `IssueTracker` method plus verify, list projects and list states, its fake, the contract suite, the connection table and the allowlist. No repo can link to an issue tracker yet, so no behaviour changes.
+D6, D7, D8, D10 (the id adapter), D14 (the tag rules inside the driver) and S3. The `api/internal/issuetracker` package, the YouTrack driver for every `IssueTracker` method plus verify, list projects, list states and list tags, its fakes, the contract suite, the connection table and the allowlist. No repo can link to an issue tracker yet, so no behaviour changes.
 
+- **Deployment wiring for S3.** The issue tracker allowlist gets a Helm value rendered into the API ConfigMap, with the same https-only validation as `forge.allowedBaseURLs`, and a pass-through in `docker-compose.yml`. It is empty by default in both. It does not feed the worker egress list, because the worker never calls an issue tracker (S5).
+- **ADR.** The ADR for the issue tracker seam ships with this milestone, where the package (D6) and the connections (D8) become real: adr/4173-issue-tracker-seam.md.
 - **Blocked by:** M2.
-- **Acceptance:** the contract suite passes on the YouTrack fake and on the three forge fakes; with the allowlist empty no connection can be created and uzi still boots; a redirect, an oversized body and an error carrying the token are each refused or scrubbed in a test.
+- **Acceptance:** the contract suite passes on the real YouTrack driver against its HTTPS fake and on the three real forge drivers against `e2e/forge-fake`; the same-name tag case of D14 passes; a comment id of an unexpected form and an issue found in another project are each an error; with the allowlist empty no connection can be created and uzi still boots; the chart renders the allowlist and refuses a non-https entry; a redirect, an oversized body and an error carrying the token are each refused or scrubbed in a test.
 
 ### M4: issue identity, the repo link and issue intake from YouTrack
 
-D5, D10, D11, D13 and S2. The identity decision (recorded in the Decision Log before code), the repo link to a connection and project with the link and relink rules of D13, `IssueTrackerForRepo` returning the issue tracker, sync on the poll cadence, run creation from an issue tracker issue.
+D5, D10 (storage), D11, D13, D14 (choice and verification of the tag) and S2. The storage decision and the author mapping (both recorded in the Decision Log before code), the never-enabled marker, the repo link to a connection, a project and an eligibility tag, `IssueTrackerForRepo` returning the issue tracker, sync on the poll cadence, run creation from an issue tracker issue.
 
 - **Blocked by:** M3.
-- **Acceptance:** a tagged YouTrack issue appears on the board and starts a run that receives its title and body; an issue tracker comment from an unmapped author is withheld; the privilege check and claim still run against the forge and fail closed with the issue tracker unreachable; a repo with no link is byte-for-byte unchanged in its forge calls (recorded-call test); linking is refused while a run is active; after a link or relink, a finished run and a pinned schedule from the old source cause no read or write on the same issue number in the new source; concurrent cases hold too: a sync that started before a relink stores nothing after it; a watcher or lifecycle update racing a relink, cache update included, either completes on the old source before the change or is skipped after it; a run created while a relink is in progress is refused or sees the new source, never half of each (D13).
+- **Acceptance:**
+  - a YouTrack issue carrying the eligibility tag appears on the board and starts a run that receives its title and body, and an issue carrying only a same-named tag of another user does not;
+  - an issue tracker comment from an unmapped author is withheld;
+  - with an unmapped issue author, a manual start proceeds and a scheduled start is created without auto-approval, each in its own test;
+  - the privilege check and claim still run against the forge and fail closed with the issue tracker unreachable;
+  - a repo with no link is byte-for-byte unchanged in its forge calls (recorded-call test);
+  - linking is refused for a repo that was ever enabled, including one that is disabled now, and for a private tag; a link racing the first enable ends in exactly one of the two outcomes of D13; a connection with a linked repo cannot be deleted;
+  - when a run's issue is moved to another YouTrack project, its issue writes are skipped and its merge request still completes (D10).
 
 ### M5: the board and issue writes on YouTrack
 
@@ -141,24 +183,26 @@ D9. `MoveToColumn` on all four drivers, the column-to-state mapping, close and r
 - **Blocked by:** M4.
 - **Acceptance:** the recorded-call test shows identical label calls on the three forges; a card move changes the YouTrack State and a failed move snaps back; closing never lands on a state that means "won't fix".
 
-### M6: web and CLI surfaces, docs, ADR and live acceptance
+### M6: web and CLI surfaces, docs and live acceptance
 
-Settings → Issue trackers, the CLI commands, a setup page under `docs/`, an ADR for the issue tracker seam.
+Settings → Issue trackers, the CLI commands, a setup page under `docs/`.
 
 - **Blocked by:** M5.
-- **Acceptance (maintainer-owned, live):** connect, link, tag, run, board move and close verified on a real YouTrack, and a regression pass on GitHub, GitLab and Forgejo.
+- **Acceptance (maintainer-owned, live):** connect, link, tag, run, board move and close verified on a real YouTrack from a hosted Kubernetes install, with the allowlist set through the chart, and a regression pass on GitHub, GitLab and Forgejo.
 
 ## Testing decisions
 
-- **Every milestone's gate:** `task gate:api` and `task scan:secrets`, plus `task gate:web` when web changes, `check:changelog-entry`, and `docs:sync` with `check-docs:web` when docs change. Token-shaped test strings are assembled at runtime, and the run's evidence includes the canaries-detected line of `scan:secrets`.
+- **In a uzi run, the in-run boundary of `AGENTS.md` "Run economy" applies:** `task check:api` plus `go test -race -count=1` on the affected packages, with each focused regression test watched red then green, `task check:web` plus the touched tests when web changes, and the companion checks for the files changed (`check:changelog-entry`, the migration checks, `docs:sync` with `check-docs:web`, `check:token-literals`). M3 to M5 touch credentials and untrusted input, so `task scan:secrets` also runs in the run and its canaries-detected line is part of the evidence. Token-shaped test strings are assembled at runtime. The full `gate:*` targets are the PR's CI on the exact head.
+- **The E2E harness follows every changed issue or forge call in the same PR** (`AGENTS.md`, "A product contract change updates the E2E harness in the same PR"): the old identifiers are searched across `e2e/phases/`, `e2e/lib.sh`, `e2e/lib.test.sh` and `e2e/forge-fake/`, stale expectations and fake routes are updated, `task test:e2e-lib` and `task test:forge-fake` run, and the PR names the affected phases left unrun.
 - **No change in behaviour on forge-backed repos:** the existing API, web, agent and E2E suites pass; M2's two mechanical test edits are the only ones allowed without a finding.
-- **Parity is the contract suite (D7)**, not a per-driver checklist.
+- **Parity is the contract suite on the real drivers (D7)**, not a per-driver checklist and not a run against in-memory fakes.
+- **Hosted Kubernetes is verified, not only compose:** the chart test in M3 and the live acceptance in M6.
 
 ## Risks
 
 - **Size of M2.** About 57 production and 31 test files, mechanical. A type-checked inventory of forge calls is the guard.
 - **Drift from `main` between milestones.** Each milestone's branch is rebased on `main` before its PR.
-- **YouTrack specifics leak into the seam.** The contract suite runs on all four implementations, and the second issue tracker (Asana) is the real test of the seam.
+- **YouTrack specifics leak into the seam.** The id adapter (D10) and the tag rules (D14) stay inside the driver, the contract suite runs on all four implementations, and the second issue tracker (Asana) is the real test of the seam.
 
 ## Decision Log
 
@@ -167,4 +211,8 @@ Settings → Issue trackers, the CLI commands, a setup page under `docs/`, an AD
 - **2026-11-10: no reflection test.** The interface declarations enforce the split (D4).
 - **2026-11-10: M2 test edits.** Fakes may change a parameter type, and mixed callers' test call sites pass the same fake twice. Nothing else in a test changes.
 - **2026-11-10: scope after the maintainer's review.** YouTrack becomes part of this PRD and drives the identity design. The living comment, the outbox, withdrawal, comments to the agent and `/uzi` commands move out. Asana follows in its own PRD.
-- **2026-11-11: link and relink policy (D13).** Review of the M1 PR found that project-local numbers let an old run or pinned schedule resolve to an unrelated issue after a repo changes its issue source. D13 scopes every number to its source and M4's acceptance covers the transition. Later passes extended it to operations in flight: one per-repo fence over run creation, sync and issue writes through their cache update, with the mechanism chosen in M4.
+- **2026-11-11: the issue source is fixed before first enable (D13).** Review of the M1 PR found that project-local numbers let an old run or pinned schedule resolve to an unrelated issue after a repo changes its issue source. The first answer was a per-repo fence over run creation, sync and every issue write. The maintainer proposed the simpler policy: choose the source before the repo is first enabled, and leave relinking out. It holds, because a never-enabled repo has had no sync and no run, provided "never enabled" is stored rather than read from `repos.enabled` and the link and the first enable share the repo row lock. The fence is dropped.
+- **2026-11-11: id adapter instead of new neutral types (D10).** The driver is built for one project, `issueIID` is `numberInProject`, `IssueNote.ID` is the numeric part of the comment id and account ids are 0. Decided before the M3 driver; only the `issue_key` column waits for M4.
+- **2026-11-11: the eligibility tag is chosen by id (D14)**, because YouTrack tags are user-owned, private by default and not unique by name.
+- **2026-11-11: an unmapped issue author is `permission_unknown` (D11).** Manual start proceeds, scheduled start is never auto-approved.
+- **2026-11-11: the contract suite runs on the real drivers (D7), the allowlist is wired through the chart and compose in M3, and the ADR moves from M6 to M3.**
