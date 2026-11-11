@@ -237,6 +237,16 @@ rc=0; out=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,recovery_wait 0 
 [ "$rc" -eq 0 ] || fail "explicit memory stop: want exit 0, got $rc: $out"
 case "$out" in *"STOP=recovery_wait:worker_memory_pressure"*"resume or cancel"*) ;; *) fail "explicit memory stop lost guidance: $out";; esac
 
+# 12b. anthropic_spend_limit (#3767) always stops as an owner decision, in the default and an explicit stop set
+reset recovery_wait ok "" '[]'
+echo anthropic_spend_limit > "$WORK/cause"
+rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+[ "$rc" -eq 0 ] || fail "spend-limit park: want exit 0, got $rc: $out"
+case "$out" in *"STOP=recovery_wait:anthropic_spend_limit"*"resume"*"set-token"*"RESULT=stop:recovery_wait") ;; *) fail "spend-limit stop missing: $out";; esac
+rc=0; out=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed 0 2) || rc=$?
+[ "$rc" -eq 0 ] || fail "spend-limit park outside stop set: want exit 0, got $rc: $out"
+case "$out" in *"STOP=recovery_wait:anthropic_spend_limit"*) ;; *) fail "spend-limit outside stop set: $out";; esac
+
 # 13. any other recovery_wait cause keeps its existing behaviour: keep polling to ELAPSED
 reset recovery_wait ok "" '[]'
 echo provider_outage > "$WORK/cause"

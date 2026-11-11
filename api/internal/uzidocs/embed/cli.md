@@ -1533,6 +1533,8 @@ uzi run recovery <run-id> [--json]
   owner Resume/Cancel. Adoption failure always requires owner Resume/Cancel; so does
   the same cause when the worker refused an unsupported predecessor of an independent restore
   (no adoption was attempted).
+  An open hold at `recovery_wait` / `anthropic_spend_limit` (no retry time) is owner-held
+  like a NULL-retry `data_volume_full` hold: a worker's final proof does not release it.
   Archive readiness does not implicitly release this custody.
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
@@ -2972,6 +2974,7 @@ something to say:
 | `HOME` | the server has a fresh worker report of the run's size | the run's HOME and cache size, e.g. `4.2 GiB (cache 3.0 GiB)`; `at least` leads when the size walk was truncated (both numbers are then lower bounds) |
 | `CHECKPOINT` | the run is parked (`limit_wait`, `recovery_wait`, or `paused`) and the worker reported it | whether the checkpoint published for this park contains the run's latest committed work: `contains the latest work`, or `does NOT contain the latest committed work (the worker keeps it)` |
 | `DISK` | the run is parked with cause `data_volume_full` | the [waiting-for-disk-space sentence](run-recovery-wait.md#worker-data-volume-full), the timed retry or owner Resume/Cancel guidance (unknown timing labeled separately), and the run's lifetime count of counted disk parks |
+| `SPEND_LIMIT` | the run is held in `recovery_wait` with cause `anthropic_spend_limit` (and not re-queued) | `Anthropic API spend limit reached` and the owner guidance: `Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first. To choose another token now, use Switch token or `uzi run set-token`.` In the CLI the line reads `uzi run resume <id>`, then, on kinds that accept a switch (not `chat`, `judge`, `self_improve` or `job`), `uzi token list`, then `uzi run set-token <id> <label>`, and `uzi run cancel <id>`. No automatic resume. See [Anthropic API spend limit](run-recovery-wait.md#anthropic-api-spend-limit) |
 | `EST. TAIL` | a Claude run has usage no result frame covered (an interrupted session) | the [estimated tail](run-cost.md#estimated-tail-of-an-interrupted-session), kept apart from `COST`: `~$1.23 estimated (price-table version) · 1.2M in/34k out · partial: <reasons>`, `<$0.01 estimated` under half a cent, or `cost unknown (unpriced)`; hidden for the all-zero, complete tail |
 
 `CHECKPOINT` shows while the run is actually parked (`limit_wait`,
@@ -3811,6 +3814,8 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   those interruptions on a capped backoff. Disk parks (`data_volume_full`) have
   three timed counted retries by default, then hold for owner Resume/Cancel;
   preventive parks stay uncounted and timed. See [Worker data volume full](run-recovery-wait.md#worker-data-volume-full).
+  An Anthropic API spend limit (`anthropic_spend_limit`) is owner-held with no timer; see
+  [Anthropic API spend limit](run-recovery-wait.md#anthropic-api-spend-limit).
   Empty-turn and resumed-gate recovery have no lifetime cap;
   negotiated `codex_idle_stall` parks instead have three timed retries by default,
   then require owner Resume/Cancel. See [Codex idle stalls](#codex-idle-stalls).
@@ -3941,7 +3946,7 @@ hold presentation and remedies are unchanged. See
 
 `limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
-account hold waits for its account. `codex_idle_stall`, `data_volume_full` and
+account hold waits for its account. `anthropic_spend_limit` has no timer and needs owner Resume, Switch token or Cancel. `codex_idle_stall`, `data_volume_full` and
 `retained_recovery_exhausted` retry when their timestamp is finite (even if due);
 explicit NULL instead needs owner Resume/Cancel, and omitted timing is unknown. `retained_recovery_adoption_failed` requires
 owner Resume/Cancel regardless of retry timing, including when it holds an unsupported restore predecessor. `pool_wait` instead clears only when a token is
@@ -4235,7 +4240,8 @@ rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`pau
 except a default wait also stops at `recovery_wait` with cause
 `worker_requeue_exhausted`, `worker_memory_pressure`,
 `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, or
-owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), and at a `paused` run held on
+owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), `anthropic_spend_limit` (an
+Anthropic API spend-limit hold, Resume, Switch token or Cancel), and at a `paused` run held on
 `base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means

@@ -469,6 +469,10 @@ uzi version
   retained-custody continuation, `retained_continuation_unwitnessed` (server-only; claim
   released, work and custody kept), owner Resume/Cancel only, no automatic retry, not an
   integrity refusal — or
+  an Anthropic API spend limit, `anthropic_spend_limit` (a Claude run's lead hit its organization
+  or workspace spend limit; no timer, no automatic retry or credential switch, work and custody kept,
+  owner Resume, Switch token or Cancel). Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first. To choose another token now, use Switch token or `uzi run set-token`
+  (`uzi token list`, then `uzi run set-token <id> <label>`; not for chat, judge, self_improve or job runs) — or
   because the forge was unreachable at clone — cause `forge_unreachable`, with up to
   `RUN_FORGE_UNREACHABLE_MAX_PARKS` timed parks (`0` means unlimited), followed by an
   owner Resume/Cancel hold with NULL retry. Resume queues one bounded attempt without
@@ -532,7 +536,8 @@ uzi version
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
   `worker_requeue_exhausted`, `worker_memory_pressure`,
-  `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, owner-held
+  `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, `anthropic_spend_limit`
+  (spend-limit owner hold: Resume, `uzi run set-token` or Cancel), owner-held
   `retained_recovery_exhausted` (NULL retry), or a paused credential-switch hold (`credential_switch_settling` /
   `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and ordinary owner or lead pauses need `uzi run resume`. A

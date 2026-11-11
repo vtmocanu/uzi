@@ -6,7 +6,7 @@ audience: user
 
 # Recovering from a transient interruption
 
-`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. [Codex idle stalls](#codex-idle-stalls), [worker data volume full](#worker-data-volume-full) and retained-source exhaustion can also become owner-held. The transient-interruption retries below do not describe those holds.
+`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. [Codex idle stalls](#codex-idle-stalls), [worker data volume full](#worker-data-volume-full) and retained-source exhaustion can also become owner-held, and an [Anthropic API spend limit](#anthropic-api-spend-limit) is always owner-held. The transient-interruption retries below do not describe those holds.
 
 Uzi retries in place and, if the trouble persists, parks the run in
 `recovery_wait` on these transient interruptions:
@@ -1195,6 +1195,87 @@ remove that work before it is recovered.
   can read `data_volume_full (the worker's data volume stayed full after N
   counted disk parks)`. This is historical compatibility, not current cap policy.
 
+## Anthropic API spend limit
+
+A Claude run on an Anthropic API key can reach the **spend limit** its
+Anthropic organization or workspace sets. uzi does not fail that run. It parks
+it in `recovery_wait` with cause `anthropic_spend_limit`, keeps the worker's
+work and custody, and waits for you. This is not the usage window behind
+[`limit_wait`](run-limit-wait.md), and credit depletion (an exhausted prepaid
+or promotional balance) is **not** covered by this hold.
+
+### What you'll see
+
+- A **spend limit: owner hold** badge on the run, and a panel on the run page
+  with **Resume** and **Cancel**. On the run kinds that accept a credential
+  switch it also offers **Run with another token** and a **Manage tokens**
+  link to Settings.
+- The run feed and Slack name the hold.
+- `uzi run get <id>` shows a `SPEND_LIMIT` row with the owner guidance.
+  `uzi run list` appends `(spend limit: owner hold)` to the STATUS cell.
+- `uzi run wait` stops on it by default, as it does for other owner holds.
+- `uzi tui` bands it into NEEDS YOU.
+
+### No timer, no automatic resume
+
+The hold has no retry time, and no timer, sweeper or automatic resume leaves
+it. Nothing switches credentials for you. The only exits are yours:
+
+- **Resume** (`uzi run resume <id>`, or Resume on the run page) re-queues the
+  run. The next claim chooses the credential again through the run's own
+  selection, in this order (`resolveClaimSecret` in
+  `api/internal/workersvc/secretchoice.go`):
+  1. For a `self_improve` run, the judge's credential binding is checked
+     **first**.
+  2. Otherwise the per-run credential override, if one is set. A pin whose
+     token was deleted falls through, as it does today.
+  3. Then the worker binding: a static pin, or, for an auto-mode worker, the
+     pool ranker.
+  4. Then the default token.
+
+  Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first. To choose another token now, use Switch token or `uzi run set-token`.
+
+  That last sentence applies only to the kinds that accept a credential
+  switch: not `chat`, `judge`, `self_improve` or `job` runs. In auto mode,
+  Resume re-ranks the pool and may pick the capped token again, or another
+  pooled token; excluding the capped token is follow-up
+  [#4163](https://github.com/vtmocanu/uzi/issues/4163).
+- **Switch token** (web **Switch token** / **Run with another token**, or
+  `uzi token list` then `uzi run set-token <id> <label>`) points the run at a
+  different token.
+- **Cancel** ends the run.
+
+### What triggers it
+
+A narrow, documented text match. Anthropic exposes no structured signal for a
+spend limit (checked against Claude Agent SDK 0.3.316), so uzi matches the
+provider text of the lead's terminal result. The hold applies only when that
+result is a failure with terminal reason `api_error` and HTTP status 400, and
+the provider message, after removing one leading `API Error: 400 ` or
+`API Error: ` wrapper, **starts with** one of:
+
+- `You have reached your specified API usage limits.` (organization limit)
+- `You have reached your specified workspace API usage limits.` (workspace limit)
+
+See Anthropic's [errors page](https://platform.claude.com/docs/en/api/errors).
+The sentence anywhere other than the start, any other 400, a 429 or 402, other
+terminal reasons, successful turns and subagent errors keep their existing
+handling. A spend-limit terminal wins over earlier rate-limit evidence in the
+same run: it never becomes an automatic [`limit_wait`](run-limit-wait.md).
+
+### Which runs
+
+The hold covers `issue`, `task`, `prompt`, `ci_fix`, `mr_rework` and
+`self_improve` runs. `chat` runs, review runs (a `task` with a review target),
+`job`, `judge` and `cross_check` runs are not covered and keep today's terminal
+failure.
+
+### Rollout
+
+The hold needs both a worker and an api that support it (worker protocol
+feature `recovery_cause_anthropic_spend_limit`). A newer worker on an older api
+keeps today's terminal failure, with no retry loop.
+
 ## Worker recovery exhausted
 
 When automatic worker-death recovery is exhausted, the server decides from
@@ -1296,6 +1377,8 @@ historical-evidence rules above remain in force.
   with no automatic retry, including for an unsupported restore predecessor; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
   `retained_continuation_unwitnessed` is likewise owner Resume or Cancel with no
   automatic retry; see [Unwitnessed continuation hold](#unwitnessed-continuation-hold).
+  `anthropic_spend_limit` is owner Resume, Switch token or Cancel with no timer;
+  see [Anthropic API spend limit](#anthropic-api-spend-limit).
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an
