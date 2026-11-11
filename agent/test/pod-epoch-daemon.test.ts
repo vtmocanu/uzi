@@ -308,3 +308,98 @@ test("event byte bound counts cumulative small whitespace frames and joins strea
   await guard.close();
   await turns(() => d.sockets.size === 0);
 });
+
+// ---- issue #4043 M1: bind sources and inventory refresh --------------------------------------
+type Inspect = { Mounts?: unknown; HostConfig?: Record<string, unknown>; State?: Record<string, unknown> };
+function inspectBody(n: number, extra: Inspect = {}) {
+  return { Id: cid(n), State: { Running: false, Restarting: false, Paused: false, Status: "exited", ...extra.State },
+    ...("Mounts" in extra ? (extra.Mounts === undefined ? {} : { Mounts: extra.Mounts }) : { Mounts: [] }),
+    HostConfig: { RestartPolicy: { Name: "no" }, ...extra.HostConfig } };
+}
+async function withInventory(t: TestContext, containers: Map<number, Inspect>) {
+  const listed = () => [...containers.keys()].map(n => ({ Id: cid(n), State: "exited" }));
+  const d = await daemon(t, (path, res) => {
+    if (path === "/containers/json?all=1") { res.end(JSON.stringify(listed())); return true; }
+    const m = /^\/containers\/([a-f0-9]{64})\/json$/.exec(path);
+    if (!m) return false;
+    const n = Number.parseInt(m[1]!, 16);
+    const spec = containers.get(n);
+    if (!spec) { res.writeHead(404); res.end(); return true; }
+    res.end(JSON.stringify(inspectBody(n, spec))); return true;
+  });
+  return d;
+}
+test("bindSources collects Mounts, HostConfig.Mounts and absolute Binds sources, ignoring volumes", async t => {
+  const d = await withInventory(t, new Map<number, Inspect>([
+    [1, { Mounts: [{ Type: "bind", Source: "/a" }, { Type: "volume", Name: "v" }],
+      HostConfig: { Mounts: [{ Type: "bind", Source: "/b" }, { Type: "tmpfs" }], Binds: ["/c:/mnt:ro", "named:/v", "/d"] } }],
+    [2, { Mounts: [], HostConfig: { Binds: null } }],
+  ]));
+  const guard = await openPodEpochDaemonBarrier(d.options);
+  try {
+    assert.deepEqual(guard.bindSources?.(), { state: "read", sources: ["/a", "/b", "/c", "/d"] });
+  } finally { await guard.close(); }
+});
+test("bindSources is unknown for every unrecognised mount shape", async t => {
+  const shapes: Array<[string, Inspect]> = [
+    ["missing Mounts", { Mounts: undefined }],
+    ["Mounts not an array", { Mounts: {} }],
+    ["bind without string Source", { Mounts: [{ Type: "bind" }] }],
+    ["bind with numeric Source", { Mounts: [{ Type: "bind", Source: 7 }] }],
+    ["HostConfig.Mounts bind without Source", { Mounts: [], HostConfig: { Mounts: [{ Type: "bind" }] } }],
+    ["HostConfig.Mounts not an array", { Mounts: [], HostConfig: { Mounts: "x" } }],
+    ["Binds not an array", { Mounts: [], HostConfig: { Binds: "/a:/b" } }],
+    ["Binds element not a string", { Mounts: [], HostConfig: { Binds: [1] } }],
+    ["more than 256 non-bind Mounts entries", { Mounts: Array.from({ length: 257 }, (_, n) => ({ Type: "volume", Name: "v" + n })) }],
+    ["more than 256 mounts across Mounts, HostConfig.Mounts and named-volume Binds", { Mounts: Array.from({ length: 100 }, () => ({ Type: "tmpfs" })),
+      HostConfig: { Mounts: Array.from({ length: 100 }, () => ({ Type: "tmpfs" })), Binds: Array.from({ length: 57 }, (_, n) => "vol" + n + ":/m") } }],
+    ["more than 256 binds", { Mounts: [], HostConfig: { Binds: Array.from({ length: 257 }, (_, n) => "/p" + n + ":/m") } }],
+  ];
+  for (const [name, spec] of shapes) await t.test(name, async sub => {
+    const d = await withInventory(sub, new Map([[1, spec]]));
+    const guard = await openPodEpochDaemonBarrier(d.options);
+    try { assert.deepEqual(guard.bindSources?.(), { state: "unknown" }); } finally { await guard.close(); }
+  });
+});
+test("refreshInventory resolves on an identical inventory and re-reads every container", async t => {
+  const containers = new Map<number, Inspect>([[1, { Mounts: [{ Type: "bind", Source: "/a" }] }], [2, {}]]);
+  const d = await withInventory(t, containers);
+  const guard = await openPodEpochDaemonBarrier(d.options);
+  try {
+    const before = d.calls.length;
+    await guard.refreshInventory?.();
+    const added = d.calls.slice(before);
+    assert.equal(added.filter(c => c === "GET /containers/json?all=1").length, 1);
+    assert.equal(added.filter(c => /^GET \/containers\/[a-f0-9]{64}\/json$/.test(c)).length, 2);
+    guard.assertHealthy();
+  } finally { await guard.close(); }
+});
+test("refreshInventory vetoes daemon_changed on a new id, a removed id, a changed bind or a changed State", async t => {
+  const mutations: Array<[string, (m: Map<number, Inspect>) => void]> = [
+    ["added container", m => m.set(3, {})],
+    ["removed container", m => m.delete(2)],
+    ["new bind source", m => m.set(1, { Mounts: [{ Type: "bind", Source: "/a" }, { Type: "bind", Source: "/z" }] })],
+    ["changed Binds", m => m.set(1, { Mounts: [{ Type: "bind", Source: "/a" }], HostConfig: { Binds: ["/q:/q"] } })],
+    ["state flip", m => m.set(2, { State: { Status: "created" } })],
+    ["mount shape unknown", m => m.set(1, { Mounts: {} })],
+  ];
+  for (const [name, mutate] of mutations) await t.test(name, async sub => {
+    const containers = new Map<number, Inspect>([[1, { Mounts: [{ Type: "bind", Source: "/a" }] }], [2, {}]]);
+    const d = await withInventory(sub, containers);
+    const guard = await openPodEpochDaemonBarrier(d.options);
+    try {
+      mutate(containers);
+      await assert.rejects(guard.refreshInventory!(), { reason: "daemon_changed" });
+      assert.throws(() => guard.assertHealthy(), { reason: "daemon_changed" });
+    } finally { await guard.close(); }
+  });
+});
+test("refreshInventory refuses after close and a predicate break keeps its own reason", async t => {
+  const containers = new Map<number, Inspect>([[1, {}]]);
+  const d = await withInventory(t, containers);
+  const guard = await openPodEpochDaemonBarrier(d.options);
+  containers.set(1, { HostConfig: { RestartPolicy: { Name: "always" } } });
+  await assert.rejects(guard.refreshInventory!(), { reason: "daemon_predicate" });
+  await guard.close();
+  await assert.rejects(guard.refreshInventory!(), PodEpochDaemonError);
+});

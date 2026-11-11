@@ -625,6 +625,12 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 			w.DiskPressure && !slices.Contains(w.DiskPressureVolumes, "nix") {
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-docker-data worker=%s", w.ID))
 		}
+		if m.cfg.EpochReclaimDeletionCanaryID != "" && m.cfg.EpochReclaimDeletionCanaryID == w.ID && !epochReclaimDeletionCanary(m.cfg, w) {
+			m.log.Info(fmt.Sprintf("epoch-reclaim-deletion-canary-ineligible worker=%s", w.ID))
+		}
+	}
+	if id := m.cfg.EpochReclaimDeletionCanaryID; id != "" && !desiredIDs[id] {
+		m.log.Info(fmt.Sprintf("epoch-reclaim-deletion-canary-absent worker=%s", id))
 	}
 
 	observedByID := make(map[string]reconcile.ObservedWorker, len(observed))

@@ -214,6 +214,9 @@ spec:
             {{- end }}
             - name: UZI_WORKER_POD_EPOCH_RUNTIME
               value: {{ .Values.workers.docker.podEpochReclaim.runtime | quote }}
+            # Validated in worker-invariants.yaml: empty or one canonical lowercase UUID.
+            - name: UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID
+              value: {{ (default dict .Values.workers.epochReclaim).deletionCanaryWorkerId | default "" | quote }}
             - name: UZI_WORKER_MAX_CONCURRENT_RUNS
               value: {{ .Values.workers.maxConcurrentRuns | quote }}
             # Unconditional: Helm treats 0 as empty, but it disables this lane.

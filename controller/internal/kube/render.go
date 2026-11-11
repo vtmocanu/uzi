@@ -398,6 +398,12 @@ func withDinD(w protocol.DesiredWorker) bool {
 	return w.Docker && !w.Isolated
 }
 
+// epochReclaimDeletionCanary reports whether w is the one persistent Docker worker
+// selected to run epoch-reclaim deletion.
+func epochReclaimDeletionCanary(cfg RenderConfig, w protocol.DesiredWorker) bool {
+	return cfg.EpochReclaimDeletionCanaryID != "" && cfg.EpochReclaimDeletionCanaryID == w.ID && withDinD(w) && !w.Ephemeral
+}
+
 // seedResources are the init container's requests/limits.
 //
 // They are REQUIRED, not decoration: a ResourceQuota on requests.CPU or
@@ -431,9 +437,13 @@ var seedResources = corev1.ResourceRequirements{
 // Every field here is operator config — the api sends names, this side owns every
 // mapping to a concrete pod-spec value.
 type RenderConfig struct {
-	PodEpochRuntime   string
-	RollConcurrency   int
-	RollTargetVersion string
+	PodEpochRuntime string
+	// EpochReclaimDeletionCanaryID selects exactly one worker (by id) whose pod template
+	// gets UZI_EPOCH_RECLAIM_DELETION=1. Empty means off. The env is omitted, never
+	// rendered as "0", so every unselected template stays byte-identical.
+	EpochReclaimDeletionCanaryID string
+	RollConcurrency              int
+	RollTargetVersion            string
 	// Namespace is the dedicated worker namespace: it contains nothing but hosted
 	// workers, which is what bounds a compromised controller.
 	Namespace string
@@ -1333,6 +1343,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			corev1.EnvVar{Name: "UZI_POD_EPOCH_EVIDENCE_FILE", Value: podEpochMountPath + "/evidence"})
 		if cfg.PodEpochRuntime != "" {
 			env = append(env, corev1.EnvVar{Name: PodEpochRuntimeEnv, Value: cfg.PodEpochRuntime})
+		}
+		if epochReclaimDeletionCanary(cfg, w) {
+			env = append(env, corev1.EnvVar{Name: "UZI_EPOCH_RECLAIM_DELETION", Value: "1"})
 		}
 		workerMounts = append(workerMounts, corev1.VolumeMount{Name: "pod-epoch", MountPath: podEpochMountPath, ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: "pod-epoch", VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{Items: []corev1.DownwardAPIVolumeFile{{Path: "evidence", FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['uzi.dev/pod-epoch-evidence']"}}}}}})

@@ -646,7 +646,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.87.0-rc.6"
+    tag: "0.87.0-rc.7"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -994,6 +994,14 @@ workers:
   #     node root, gated behind acknowledgeNonRootlessNodeRoot (see below).
   # sysbox (runtimeClassName: sysbox-runc) remains the documented path to a
   # non-privileged tier once a cluster can run it; it is NOT installed and NOT required.
+  # One-worker epoch-reclaim deletion canary, OFF by default. The controller renders
+  # UZI_EPOCH_RECLAIM_DELETION=1 only into the pod template of the single persistent Docker
+  # worker whose id equals this value; no other worker's template changes. It must be empty
+  # or one lowercase UUID (no list, wildcard or padding). Clearing it takes effect at the
+  # next replacement/startup of that worker. Never move it to another UUID until the prior
+  # enabled incarnation is gone or off. See docs/run-recovery.md.
+  epochReclaim:
+    deletionCanaryWorkerId: ""
   docker:
     podEpochReclaim:
       # The pass runs by default and keeping trees needs no declaration: unset keeps every
@@ -1001,7 +1009,8 @@ workers:
       # in lifetime epoch locking. Setting containerd-runc or crio-crun is
       # the operator's attestation of the FULL audited runtime/storage contract (a future
       # hosted-Docker deletion will require it) and is cross-checked against observations.
-      # This release still deletes nothing; see deploy/README.md, Pod-epoch shadow reclaim.
+      # Deletion runs only on the one worker selected by workers.epochReclaim.deletionCanaryWorkerId
+      # below; every other worker deletes nothing. See deploy/README.md, Pod-epoch shadow reclaim.
       runtime: ""
     # Turning this on creates the privileged namespace, its quota/limits, the worker
     # SA + pull secret in it, and the controller's Role there. It also makes the

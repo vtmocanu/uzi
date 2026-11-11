@@ -59,7 +59,7 @@ import type { CommandSandboxMode } from "./config.js";
 import { ensureRunnerTmpdir } from "./runner-tmpdir.js";
 import { createPodEpoch, restoreEpochRuntimeTmpdir } from "./pod-epoch-lock.js";
 import { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
-import { PodEpochSettlementError, runPodEpochShadow, type PodEpochDeletionDeps } from "./pod-epoch-reclaim.js";
+import { PodEpochSettlementError, readEpochReclaimDeletionActivation, runPodEpochShadow, type PodEpochDeletionDeps, type PodEpochScratchDeps } from "./pod-epoch-reclaim.js";
 import { armShutdownResultDeadline, finishWorkerShutdown, type ShutdownGate, type ShutdownLog } from "./shutdown-barrier.js";
 
 export function buildWorkerGitCache(
@@ -95,8 +95,9 @@ export function buildAfterPublicationEnrolled(
 }
 
 /**
- * The production dependencies of the pod-epoch deletion phase. The phase stays inert while
- * EPOCH_RECLAIM_DELETION_ENABLED is false; this only binds what it will use. It carries no activation override.
+ * The production dependencies of the pod-epoch deletion phase. The phase stays inert unless `activation` (the
+ * startup opt-in parsed by readEpochReclaimDeletionActivation) is true; this binds what it will use. It carries
+ * no test override.
  * `quiesce` is the worker-wide deny-only capture-mode proof: it never tears down Docker or retains a source boundary.
  */
 export function buildPodEpochDeletionDeps(parts: {
@@ -104,13 +105,28 @@ export function buildPodEpochDeletionDeps(parts: {
   runner: Pick<RunRunner, "withSourceReservation">;
   git: PodEpochDeletionDeps["git"];
   dockerHost: string | undefined;
+  /** The startup opt-in; absent means off. */
+  activation?: boolean;
 }): PodEpochDeletionDeps {
   return {
+    activation: parts.activation === true,
     authority: parts.authority,
     reserve: (runId, action) => parts.runner.withSourceReservation(runId, action),
     quiesce: () => terminalMaintenanceProof(3, parts.dockerHost),
     git: parts.git,
   };
+}
+
+/**
+ * The production dependencies of the pod-epoch runner-scratch reclaim (issue #4043). The phase stays inert while
+ * EPOCH_SCRATCH_DELETION_ENABLED is false; this only binds what it will use. It carries no activation override
+ * and no test seam.
+ */
+export function buildPodEpochScratchDeps(parts: {
+  git: PodEpochScratchDeps["git"];
+  dockerHost: string | undefined;
+}): PodEpochScratchDeps {
+  return { git: parts.git, quiesce: () => terminalMaintenanceProof(3, parts.dockerHost) };
 }
 
 /** Only the stub lane may accelerate retry spacing. No predicates or pass cap change. */
@@ -453,6 +469,7 @@ async function mainBody(): Promise<void> {
   if (process.env.UZI_EPOCH_LOCK !== undefined && process.env.UZI_EPOCH_LOCK !== "1") {
     throw new Error("UZI_EPOCH_LOCK must be unset or 1");
   }
+  const epochReclaimDeletion = readEpochReclaimDeletionActivation(process.env);
   const epochEnabled = process.env.UZI_EPOCH_LOCK === "1";
   if (epochEnabled && process.env.UZI_DATA_DIR !== "/data") {
     throw new Error("epoch workers require UZI_DATA_DIR=/data");
@@ -490,6 +507,7 @@ async function mainBody(): Promise<void> {
   if (epochOwnership) log.info("pod epoch participation", {
     mode: epochOwnership.mode, consumption: epochConsumption?.result,
   });
+  if (epochOwnership) log.info("pod_epoch_reclaim_activation", { deletion_requested: epochReclaimDeletion });
   // Issue #3382: optional Go build concurrency defaults for every scrubbed command env.
   configureGoConcurrency(config.goConcurrency);
   log.info("go concurrency defaults", {
@@ -1173,7 +1191,8 @@ async function mainBody(): Promise<void> {
     const result = await runPodEpochShadow({
       bootstrap: epochBootstrap, ownership: epochOwnership, consumption: epochConsumption,
       dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal, log,
-      deletion: buildPodEpochDeletionDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost }),
+      deletion: buildPodEpochDeletionDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost, activation: epochReclaimDeletion }),
+      scratch: buildPodEpochScratchDeps({ git, dockerHost: config.dockerWiring.dockerHost }),
     });
     if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });
   }
