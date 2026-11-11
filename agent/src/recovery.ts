@@ -814,6 +814,14 @@ interface DurableRetirementPlan {
   expected: { runId: string; clonePath: string; attemptId?: string };
 }
 
+export type CleanupPendingReason =
+  | "missing_ack" | "ack_quiescence_breach" | "ack_snapshot_changed" | "unacknowledged_sibling_final"
+  | "missing_frozen_source_heads" | "source_coverage_bare_unavailable" | "source_coverage_bare_mismatch"
+  | "source_coverage_proof_unavailable" | "source_coverage_unverified" | "multiple_saved_finals"
+  | "unpaired_final_evidence" | "missing_frozen_anchor" | "multiple_frozen_anchors";
+
+type CleanupDetail = { state: "legacy" | "acknowledged" } | { state: "pending"; cleanupPendingReason: CleanupPendingReason };
+
 /** What {@link RecoveryCoordinator.forgetGenerationWithinCycle} did, one name per exit. Only `forgotten` means
  * the generation's refs, bundles and records were removed; every other value retained them (or, for
  * `legacy_removed`, took the legacy exact-release branch). `operator_refused` and `not_guarded` exist only
@@ -839,6 +847,7 @@ export interface OperatorRequestSignals { requestSignal: AbortSignal; shutdownSi
 export interface LocalRecordGeneration {
   generation: number;
   classification: string;
+  cleanupPendingReason?: CleanupPendingReason;
   digest?: string;
   holdId?: string;
   repoId?: string;
@@ -881,7 +890,7 @@ interface OperatorObserved {
 }
 type OperatorCase = "case_a_ack" | "case_a_replay" | "case_b_owner_discard" | "case_b_released_mismatch";
 type OperatorVerdict =
-  | { ok: false; classification: string }
+  | { ok: false; classification: string; cleanupPendingReason?: CleanupPendingReason }
   | { ok: true; case: OperatorCase; digest: string; anchor: RecoveryRecord; bare: string;
       holdId: string; repoId: string; captureIds: string[]; exact: RecoveryExactHold;
       /** Case B only: the {@link inventoryCloneKey} the source boundary must find unchanged, and the later-generation effect. */
@@ -1638,11 +1647,11 @@ export class RecoveryCoordinator {
   }
 
   /** One info line per transition and diagnostic channel; diagnostics only, never throws. */
-  private noteRedriveExit(path: RedrivePath, record: Pick<RecoveryRecord, "runId" | "generation" | "captureId">, reason: string, field?: string, inventory = false): void {
+  private noteRedriveExit(path: RedrivePath, record: Pick<RecoveryRecord, "runId" | "generation" | "captureId">, reason: string, field?: string, inventory = false, diagnostic?: { outcome: string; why?: string; cleanupPendingReason?: CleanupPendingReason }): void {
     try {
       const key = this.redriveExitKey(record);
       const logged = inventory ? this.inventoryDiagnosticLogged : this.redriveExitLogged;
-      const value = field ? `${reason}:${field}` : reason;
+      const value = diagnostic ? canonicalJson([reason, field, diagnostic]) : field ? `${reason}:${field}` : reason;
       if (logged.get(key)?.value === value) return;
       logged.delete(key);
       logged.set(key, { captureId: record.captureId, value });
@@ -1652,7 +1661,7 @@ export class RecoveryCoordinator {
         logged.delete(oldest.value);
       }
       this.log.info(inventory ? "recovery: inventory reconstruction" : "recovery: re-drive exit", {
-        path, reason, ...(field ? { field } : {}),
+        path, reason, ...(field ? { field } : {}), ...diagnostic,
         run_id: record.runId, generation: record.generation,
         ...(!inventory || record.captureId ? { capture_id: record.captureId } : {}),
       });
@@ -3671,11 +3680,17 @@ export class RecoveryCoordinator {
     path: RedrivePath = "live"): Promise<RecoveryOutcome | void> {
     if (record.holdSettlement && !record.finalRequest && !record.finalAcknowledged && !record.completionReceipt) return this.heldStopped(record, "settled");
     if (record.completionReceipt) {
-      await this.forgetCompletedGeneration(record.runId, record.generation!, isExecuting, signal);
+      const outcome = await this.forgetCompletedGeneration(record.runId, record.generation!, isExecuting, signal);
+      this.noteRedriveExit(path, record, "completion_retirement", undefined, false,
+        { outcome: outcome.kind, ...("why" in outcome ? { why: outcome.why } : {}) });
       return;
     }
     if (record.finalAcknowledged) {
-      await this.forgetGenerationWithinCycle(record.runId, record.generation!, isExecuting, signal);
+      let cleanupPendingReason: CleanupPendingReason | undefined;
+      const outcome = await this.forgetGenerationWithinCycle(record.runId, record.generation!, isExecuting, signal, undefined,
+        reason => { cleanupPendingReason = reason; });
+      this.noteRedriveExit(path, record, "case_a_retirement", undefined, false,
+        { outcome, ...(outcome === "cleanup_pending" && cleanupPendingReason ? { cleanupPendingReason } : {}) });
       return;
     }
     if (settledRefusesWork(record)) return this.heldStopped(record, "settled");
@@ -6125,7 +6140,7 @@ export class RecoveryCoordinator {
    * step, excluding delayed journal writers. One pass, no internal retries; failure keeps the
    * covering ACK and the bounded boot/live passes retry it independently of upload eligibility. */
   private async forgetGenerationWithinCycle(runId: string, generation: number, isExecuting = this.isExecuting,
-    signal?: AbortSignal, operator?: OperatorForget): Promise<ForgetOutcome> {
+    signal?: AbortSignal, operator?: OperatorForget, diagnostic?: (reason: CleanupPendingReason) => void): Promise<ForgetOutcome> {
     // Issue #2625: claims are built under the journal lock and submitted after it, as in forgetCompletedGeneration.
     let claims: PendingRedundancyClaim[] = [];
     const budget = this.startRedundancyBudget(signal);
@@ -6160,12 +6175,16 @@ export class RecoveryCoordinator {
       }
       const selected = records.filter(r => r.generation === generation);
       if (!selected.length) return "no_records";
-      const state = await this.cleanupStateOf(records, generation);
+      const detail = await this.cleanupDetailOf(records, generation);
+      const state = detail.state;
       if (state === "legacy") {
         await this.removeGenerationRecordsUnlocked(runId, generation, "rmdir_if_empty");
         return "legacy_removed";
       }
-      if (state !== "acknowledged") return "cleanup_pending";
+      if (detail.state === "pending") {
+        try { diagnostic?.(detail.cleanupPendingReason); } catch { /* diagnostics only */ }
+        return "cleanup_pending";
+      }
       if (!this.git.cleanupRecoveryGeneration) return "cleanup_unavailable";
       const ack = selected.find(r => r.inventoryGuarded && r.finalAcknowledged && r.finalRequest && r.coverageDigest)!;
       const open = (): boolean => residueQuarantine() === undefined && !this.isExecuting(runId) && !isExecuting(runId);
@@ -6394,7 +6413,8 @@ export class RecoveryCoordinator {
     journal: Extract<OperatorJournal, { kind: "ok" }>, observed: OperatorObserved,
     /** After the replay's own ACK: classify as acknowledged but digest as the replay that was confirmed. */
     replayed = false): Promise<OperatorVerdict> {
-    const no = (classification: string): OperatorVerdict => ({ ok: false, classification });
+    const no = (classification: string, cleanupPendingReason?: CleanupPendingReason): OperatorVerdict =>
+      ({ ok: false, classification, ...(cleanupPendingReason ? { cleanupPendingReason } : {}) });
     const selected = journal.records.filter(r => r.generation === generation);
     if (!selected.length) return no("not_found");
     if (journal.unbound.length) return no("unbound_artifact:" + journal.unbound[0]);
@@ -6404,7 +6424,8 @@ export class RecoveryCoordinator {
     if (!guarded.length) return no("not_guarded");
     if (selected.some(r => classifyRecoveryOrigin(r.captureId) !== "ordinary")) return no("non_ordinary_origin");
     if (selected.some(r => r.completionReceipt !== undefined || r.completionSource !== undefined)) return no("completion_receipt_generation");
-    const state = await this.cleanupStateOf(journal.records, generation);
+    const detail = await this.cleanupDetailOf(journal.records, generation);
+    const state = detail.state;
     const ackRecord = guarded.find(r => r.finalAcknowledged === true && r.finalRequest && r.coverageDigest);
     // a1: the FINAL ACK is persisted. a2: one saved FINAL, no ACK, whose closed hold may carry the matching receipt
     // (replay) and otherwise becomes Case B. b: Case B already by the record evidence.
@@ -6417,10 +6438,10 @@ export class RecoveryCoordinator {
     } else if (!ackRecord && guarded.some(r => r.finalAcknowledged === true)) {
       return no("final_ack_unknown");
     } else if (ackRecord) {
-      return no("cleanup_pending");
+      return no("cleanup_pending", detail.state === "pending" ? detail.cleanupPendingReason : undefined);
     } else {
       const saved = guarded.filter(r => r.finalRequest && r.coverageDigest);
-      if (saved.length > 1) return no("cleanup_pending");
+      if (saved.length > 1) return no("cleanup_pending", "multiple_saved_finals");
       if (saved.length === 1) {
         anchor = saved[0]!;
         const settled = anchor.holdSettlement;
@@ -6430,9 +6451,9 @@ export class RecoveryCoordinator {
       } else {
         // No saved FINAL: exactly one guarded frozen aggregate is the anchor. A producer-origin record never is
         // (the origin check above refuses the generation).
-        if (guarded.some(r => r.finalRequest)) return no("cleanup_pending");
+        if (guarded.some(r => r.finalRequest)) return no("cleanup_pending", "unpaired_final_evidence");
         const frozen = guarded.filter(r => r.coverageDigest);
-        if (frozen.length !== 1) return no("cleanup_pending");
+        if (frozen.length !== 1) return no("cleanup_pending", frozen.length ? "multiple_frozen_anchors" : "missing_frozen_anchor");
         anchor = frozen[0]!;
         track = "b";
       }
@@ -6652,7 +6673,8 @@ export class RecoveryCoordinator {
             ? { generation, classification: verdict.case, digest: verdict.digest, holdId: verdict.holdId, repoId: verdict.repoId,
               captureIds: verdict.captureIds,
               ...(verdict.laterCleanup === undefined ? {} : { action: "case_b" as const, laterCleanup: verdict.laterCleanup }) }
-            : { generation, classification: verdict.classification, captureIds });
+            : { generation, classification: verdict.classification, captureIds,
+              ...(verdict.cleanupPendingReason ? { cleanupPendingReason: verdict.cleanupPendingReason } : {}) });
         }
         return { kind: "described", runId, generations: views, blockers };
       });
@@ -7383,7 +7405,11 @@ export class RecoveryCoordinator {
   }
 
   /** The one settlement rule, shared by cleanup authority and owed-context pruning. */
-  private cleanupStateOf(records: RecoveryRecord[], generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
+  private async cleanupStateOf(records: RecoveryRecord[], generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
+    return (await this.cleanupDetailOf(records, generation)).state;
+  }
+
+  private cleanupDetailOf(records: RecoveryRecord[], generation: number): Promise<CleanupDetail> {
     // One evaluation per generation per journal snapshot: the memo is keyed by the snapshot array
     // itself (weakly), so it never outlives or crosses a snapshot. Without it every generation
     // re-evaluates all earlier ones through settledEarlierGenerations, which is exponential.
@@ -7394,14 +7420,17 @@ export class RecoveryCoordinator {
     return state;
   }
 
-  private readonly cleanupMemo = new WeakMap<RecoveryRecord[], Map<number, Promise<"legacy" | "pending" | "acknowledged">>>();
+  private readonly cleanupMemo = new WeakMap<RecoveryRecord[], Map<number, Promise<CleanupDetail>>>();
 
-  private async evaluateCleanupState(records: RecoveryRecord[], generation: number): Promise<"legacy" | "pending" | "acknowledged"> {
+  private async evaluateCleanupState(records: RecoveryRecord[], generation: number): Promise<CleanupDetail> {
+    const pending = (cleanupPendingReason: CleanupPendingReason): CleanupDetail => ({ state: "pending", cleanupPendingReason });
     const relevant = records.filter(r => r.generation === generation);
     const guarded = relevant.filter(r => r.inventoryGuarded === true);
-    if (guarded.length === 0) return "legacy";
+    if (guarded.length === 0) return { state: "legacy" };
     const ack = guarded.find(r => r.finalAcknowledged === true && r.finalRequest && r.coverageDigest);
-    if (!ack || ack.reason === "inventory_quiescence_breach" || ack.reason === "inventory_snapshot_changed") return "pending";
+    if (!ack) return pending("missing_ack");
+    if (ack.reason === "inventory_quiescence_breach") return pending("ack_quiescence_breach");
+    if (ack.reason === "inventory_snapshot_changed") return pending("ack_snapshot_changed");
     // FINAL authenticated its frozen metadata. Later source records still require coverage;
     // no ACK can short-circuit an unreadable sibling or an unattributed source.
     const settledEarlier = await this.settledEarlierGenerations(records, generation);
@@ -7409,21 +7438,23 @@ export class RecoveryCoordinator {
       if (source.generation !== undefined && source.generation > generation) continue;
       if (source.generation !== undefined && settledEarlier.has(source.generation)) continue;
       if (source.captureId === ack.captureId) continue;
-      if (source.finalRequest && !source.finalAcknowledged) return "pending";
+      if (source.finalRequest && !source.finalAcknowledged) return pending("unacknowledged_sibling_final");
       // Earlier recovery-only aggregates are not adopted original heads. Check their
       // original roots and current source, without requiring synthetic commits as parents.
-      if (source.coverageDigest && (!source.originalSourceSha || !source.inventoryCurrentSha)) return "pending";
+      if (source.coverageDigest && (!source.originalSourceSha || !source.inventoryCurrentSha)) return pending("missing_frozen_source_heads");
       const heads = source.coverageDigest
         ? [...new Set([source.originalSourceSha!, source.inventoryCurrentSha!, ...(source.originalRoots ?? []).map(r => r.sha)])]
         : [source.sourceSha];
       for (const head of heads) {
         if (head === ack.sourceSha) continue;
         const bare = ack.bareDir && await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(ack.bareDir!));
-        if (!bare || bare !== ack.coverageContext?.barePath || !this.git.ancestry ||
-            await ownedRecoveryIO(() => this.git.ancestry!(bare, head, ack.sourceSha)) !== "ancestor") return "pending";
+        if (!bare) return pending("source_coverage_bare_unavailable");
+        if (bare !== ack.coverageContext?.barePath) return pending("source_coverage_bare_mismatch");
+        if (!this.git.ancestry) return pending("source_coverage_proof_unavailable");
+        if (await ownedRecoveryIO(() => this.git.ancestry!(bare, head, ack.sourceSha)) !== "ancestor") return pending("source_coverage_unverified");
       }
     }
-    return "acknowledged";
+    return { state: "acknowledged" };
   }
 
   /** True only for a new finalization of this live slot's own producer record (#3031 F1). */

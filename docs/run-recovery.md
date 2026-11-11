@@ -2846,6 +2846,54 @@ A client that disconnects before the first mutation (the cleanup, the replay's
 release POST, or the Case B first unlink) ends the request `client_disconnected` with nothing touched; afterwards the
 request runs to completion or to its deadline.
 
+**Cleanup diagnostics.** A `local-records` generation classified `cleanup_pending`
+may also carry `cleanupPendingReason`. The classification is unchanged; the optional
+field explains the pending check and is outside the confirmation digest. Pending
+views have no digest. The closed set of tokens is:
+
+| `cleanupPendingReason` | Meaning |
+|---|---|
+| `missing_ack` | No guarded record has an acknowledgement paired with a saved FINAL and coverage digest. |
+| `ack_quiescence_breach` | The acknowledged record reports an inventory quiescence breach. |
+| `ack_snapshot_changed` | The acknowledged record reports an inventory snapshot change. |
+| `unacknowledged_sibling_final` | Another source record in the coverage check has an unacknowledged FINAL. |
+| `missing_frozen_source_heads` | A frozen source lacks its original or current source head. |
+| `source_coverage_bare_unavailable` | The bare repository needed for source coverage cannot be resolved. |
+| `source_coverage_bare_mismatch` | The resolved bare repository differs from the acknowledged coverage context. |
+| `source_coverage_proof_unavailable` | The ancestry proof operation is unavailable. |
+| `source_coverage_unverified` | Ancestry does not prove a source head is covered by the acknowledged source. |
+| `multiple_saved_finals` | Operator assessment found more than one guarded saved FINAL with a coverage digest. |
+| `unpaired_final_evidence` | Operator assessment found FINAL evidence without a paired coverage digest. |
+| `missing_frozen_anchor` | Operator assessment found no guarded frozen anchor when no saved FINAL was available. |
+| `multiple_frozen_anchors` | Operator assessment found multiple guarded frozen anchors when no saved FINAL was available. |
+
+The first failing check supplies the detail. Ordinary Case A cleanup can report
+`missing_ack` while operator assessment instead selects `case_a_replay` or a Case B
+classification from the saved FINAL and hold evidence. A cleanup diagnostic does
+not itself determine the operator classification.
+
+**Retirement re-drive diagnostics.** The structured info event
+`recovery: re-drive exit` reports retirement results with `path` (`boot`, `live` or `terminal_source`)
+and the existing `run_id`, `generation` and `capture_id` fields:
+
+- `reason: completion_retirement`: `outcome` is the existing completion-retirement
+  kind: `retired`, `pending`, `invalid`, `uncertain` or `unsupported`. `why` is
+  included where that outcome defines it; `retired` has no `why`.
+- `reason: case_a_retirement`: `outcome` is the existing `ForgetOutcome`:
+  `forgotten`, `legacy_removed`, `no_records`, `cleanup_pending`,
+  `cleanup_unavailable`, `source_protected`, `ack_incomplete`, `bare_mismatch`,
+  `bundle_path_unknown`, `pending_generation_report`, `cleanup_retained`,
+  `not_guarded` or `operator_refused`. The last two belong only to the operator
+  forget path and are not emitted by this automatic re-drive call.
+  A `cleanup_pending` outcome includes `cleanupPendingReason` when available.
+
+A bounded map (256 entries) remembers the last diagnostic tuple per
+run/generation/capture. An identical tuple is suppressed; a changed outcome kind,
+`why` or reason is emitted, as is a changed cleanup detail. The map is pruned
+against the live journal snapshot and is process-local: a crash loses its memory,
+so a later process can emit the same tuple again. These fields are diagnostic only;
+they add no authority, eligibility, disposition, retries or deletion behavior.
+
 **Refusals and blockers.**
 
 | Group | Names |
