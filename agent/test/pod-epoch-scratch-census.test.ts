@@ -7,7 +7,8 @@ import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { GitCache } from "../src/git.js";
+import { GitCache, restoreJournalJson } from "../src/git.js";
+import { restoreRefProtection, restoreTombstoneJson, type RestoreBasis } from "../src/restore-journal.js";
 import { classifyScratchCensus, parseScratchCensus, postCensusOf } from "../src/pod-epoch-scratch.js";
 import { SCRATCH_CENSUS_SCRIPT, censusScratchRoot, runAgentHelper } from "../src/rmtree.js";
 import { runnerCommand } from "../src/runner-uid.js";
@@ -305,6 +306,33 @@ for (const section of ['uzi-restore "agent/issue-1"', 'uzi-retained "run1"']) {
     const { data, cache } = cacheWithBare(t, { "uzi-recovery.agent-issue-1.clone": kept });
     fs.appendFileSync(path.join(data, "repos", "r1.git", "config"), `\n[${section}]\n\tjournal =\n`);
     assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "read", paths: [kept] });
+  });
+}
+
+for (const value of ["not-json", "{}", "null", "[]", "true", '{"restoreStage":"ready"}']) {
+  test(`scratch protection refuses a protect-all restore value: ${value}`, async t => {
+    assert.equal(restoreRefProtection([value]).all, true, "the existing restore reader protects every ref");
+    const { cache } = cacheWithBare(t, { "uzi-restore.agent/issue-1.journal": value });
+    assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "unknown", reason: "bare_value_unparseable" });
+  });
+}
+
+for (const stage of ["seeding", "ready", "retired"] as const) {
+  test(`scratch protection reads paths from a well-formed ${stage} restore value`, async t => {
+    const pId = "20261110T010000Z-g1-0123456789abcdef", sId = "20261110T020000Z-g2-fedcba9876543210";
+    const pPath = `/data/runner/.tmp/uzi-runner/predecessor.attempt-${pId}`;
+    const sPath = `/data/runner/.tmp/uzi-runner/successor.attempt-${sId}`;
+    const basis: RestoreBasis = {
+      version: 1, predecessor: { clonePath: pPath, attemptId: pId, generation: 1, root: { dev: "2049", ino: "131072" } },
+      journalDigest: "a".repeat(64), boundary: { predecessor: "c".repeat(64), successor: "d".repeat(64) },
+      slotOwner: { worker: "worker-incarnation-1", epoch: "epoch-1" },
+      pin: { captureId: "capture-1", generation: 1, sourceSha: "b".repeat(40), finalization: true }, restoreTip: "b".repeat(40),
+    };
+    const successor = { runId: "restored-run", attemptId: sId, clonePath: sPath };
+    const value = stage === "retired" ? restoreTombstoneJson(basis, successor) : restoreJournalJson(basis, stage, successor);
+    assert.equal(restoreRefProtection([value]).all, false, "the control is accepted by the existing restore reader");
+    const { cache } = cacheWithBare(t, { "uzi-restore.agent/issue-1.journal": value });
+    assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "read", paths: [pPath, sPath] });
   });
 }
 

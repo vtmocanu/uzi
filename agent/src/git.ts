@@ -4523,7 +4523,12 @@ export class GitCache {
             // A valueless record is not a cleared value: other protection readers treat it as
             // undecodable. Refuse every valueless uzi-* key rather than silently omitting one.
             if (nl < 0) return { state: "unknown", reason: "bare_value_unparseable" };
-            if (absorbBareConfigValue(key, item.slice(nl + 1), sink) !== "ok") return { state: "unknown", reason: "bare_value_unparseable" };
+            const value = item.slice(nl + 1);
+            // Match the restore reader's existing protect-all result, not just JSON syntax. Empty
+            // cleared values remain accepted; no new schema policy is imposed on other families.
+            if (restoreKeyBranch(key) !== undefined && restoreRefProtection([value]).all)
+              return { state: "unknown", reason: "bare_value_unparseable" };
+            if (absorbBareConfigValue(key, value, sink) !== "ok") return { state: "unknown", reason: "bare_value_unparseable" };
           }
           return undefined;
         }, opts.signal);
