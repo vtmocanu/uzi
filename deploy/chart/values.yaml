@@ -83,6 +83,17 @@ imageVerification:
 forge:
   allowedBaseURLs: []
 
+# --- issueTracker: the API's issue tracker SSRF allowlist (PRD #4173 S3) -----------
+#
+# Renders into the api's ISSUE_TRACKER_ALLOWED_BASE_URLS env. It is SEPARATE from the
+# forge allowlist above: https base URLs only, and empty (the default) means no issue
+# tracker connection can be created. It never feeds the worker egress lists (forge.* does
+# that), because the worker never calls an issue tracker (S5). Set this per-cluster instead
+# of api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS (setting BOTH fails the render — see
+# api-configmap.yaml).
+issueTracker:
+  allowedBaseURLs: []
+
 # --- releaseCheck: the periodic GitHub release-availability check (PRD #836) -------
 #
 # The api periodically polls GitHub's releases API for vtmocanu/uzi and surfaces an

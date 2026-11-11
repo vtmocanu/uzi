@@ -352,6 +352,7 @@ tasks:
       - task: test:renovate-schedule-groups
       - task: test:forge-fake
       - task: test:forge-fake-contract
+      - task: test:issue-tracker-forge-fake-contract
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
       # no network, covering host selection, JSON, PAT headers and safe diagnostics.
       - task: test:create-gitlab-bot
@@ -1213,6 +1214,17 @@ tasks:
       # Anchored run selects only this external-package contract, not the suite.
       - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node e2e/forge-fake/operation-contracts.test.mjs -- go test -buildvcs=false -count=1 -v -timeout=60s -run='^TestForgeFakeOperationContracts$' ./internal/forge
 
+  test:issue-tracker-forge-fake-contract:
+    desc: shared issue tracker contract against the real GitLab, GitHub and Forgejo drivers over the Node HTTPS fake
+    preconditions:
+      - sh: command -v node
+        msg: the issue tracker forge fake contract requires Node
+    cmds:
+      # Same shape as test:forge-fake-contract: the launcher starts the fake with
+      # FORGE_FAKE_ISSUE_CONTRACT=1 and a self-signed cert, then runs this exact Go
+      # argv from api. It allows only two subtests to skip on the forge subjects: the moved-issue one (no MoveIssue seam) and SameNameTagUsesEligibilityTag (forge labels have no owners). The forge subjects also run the ProjectGuard case.
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node e2e/forge-fake/issue-tracker-contracts.test.mjs -- go test -buildvcs=false -count=1 -v -timeout=60s -run='^TestIssueTrackerForgeFakeContracts$' ./internal/issuetracker
+
   test:create-gitlab-bot:
     desc: hermetic bot-provisioning contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
     cmds:
@@ -1673,6 +1685,9 @@ tasks:
       # ceiling guards, and the controller's single get-only StorageClass ClusterRole), the
       # same no-workflow-edit wiring as the DB capacity check above.
       - ./scripts/assert-pvc-expansion-render.sh
+      # Also runs the issue tracker allowlist render check (PRD #4173 S3: the separate
+      # ISSUE_TRACKER_ALLOWED_BASE_URLS, never worker egress), same no-workflow-edit wiring.
+      - ./scripts/assert-issue-tracker-allowlist-render.sh
 
   render:pvc-expansion-check:
     desc: assert the chart renders the PVC expansion surface (DinD data-size env, ceiling guards, the get-only StorageClass ClusterRole)
@@ -1689,6 +1704,14 @@ tasks:
       # (CNPG subchart stripped), non-vacuous, needs helm + yq. Also run by
       # render:openshift-check.
       - ./scripts/assert-db-capacity-render.sh
+
+  render:issue-tracker-allowlist-check:
+    desc: assert the chart renders the api's ISSUE_TRACKER_ALLOWED_BASE_URLS from issueTracker.allowedBaseURLs and keeps it out of worker egress
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline
+      # (CNPG subchart stripped), non-vacuous, needs helm + yq. Also run by
+      # render:openshift-check.
+      - ./scripts/assert-issue-tracker-allowlist-render.sh
 
   render:drain-knobs-check:
     desc: assert the controller Deployment renders the drain-deadline + force-roll knobs (PRD 422 M5)
