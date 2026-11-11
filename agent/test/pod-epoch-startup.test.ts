@@ -59,7 +59,7 @@ function contract(text: string): void {
   // The scratch dependencies are passed after the runtime TMPDIR was restored (restore < shadow above) and
   // carry no scratch gate sentinel or test seam.
   assert.match(main.slice(shadow, admission),
-    /scratch: buildPodEpochScratchDeps\(\{ git, dockerHost: config.dockerWiring.dockerHost \}\)/,
+    /scratch: buildPodEpochScratchDeps\(\{ git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion \}\)/,
     "the pass receives the production scratch dependencies");
   assert.ok(!main.includes("scratchTestGate") && !main.includes("seams"), "main never passes the scratch test gate or seams");
   const cancellation = at("if (controller.signal.aborted) {");
@@ -192,7 +192,7 @@ function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<un
     finishShutdown: async () => { events.push("shutdown"); return { result: "drained", exitCode: 0 }; },
     epochBootstrap: {}, epochOwnership: {}, epochConsumption: {},
     config: { dockerWiring: { dockerHost: "unix:///docker.sock" } }, git: {}, client: {},
-    authority: {}, runner: {}, epochReclaimDeletion: false,
+    authority: {}, runner: {}, epochReclaimDeletion: false, epochScratchDeletion: true,
     buildPodEpochDeletionDeps: (parts: Record<string, unknown>) => ({ built: parts }),
     buildPodEpochScratchDeps: (parts: Record<string, unknown>) => ({ built: parts }),
     runPodEpochShadow: shadow,
@@ -220,7 +220,8 @@ test("main waits for shadow handover, forwards its ports and logs a defined verd
     assert.equal(built.dockerHost, "unix:///docker.sock");
     assert.equal(built.activation, fixture.ports.epochReclaimDeletion);
     const scratch = (options.scratch as { built: Record<string, unknown> }).built;
-    assert.deepEqual(Object.keys(scratch).sort(), ["dockerHost", "git"]);
+    assert.deepEqual(Object.keys(scratch).sort(), ["activation", "dockerHost", "git"]);
+    assert.equal(scratch.activation, fixture.ports.epochScratchDeletion);
     assert.equal(scratch.git, fixture.ports.git);
     assert.equal(scratch.dockerHost, "unix:///docker.sock");
     assert.equal(options.signal, fixture.controller.signal);
@@ -318,10 +319,12 @@ test("the deletion dependencies main builds bind the runner reservation, never c
   assert.equal(await deps.quiesce(["/tree/0"]), false);
 });
 
-test("the scratch dependencies main builds carry only git and a deny-only quiesce, never the gate sentinel or seams", async () => {
+test("the scratch dependencies main builds carry activation, git and a deny-only quiesce, never the gate sentinel or seams", async () => {
   const git = {};
   const deps = buildPodEpochScratchDeps({ git: git as never, dockerHost: undefined });
-  assert.deepEqual(Object.keys(deps).sort(), ["git", "quiesce"]);
+  assert.deepEqual(Object.keys(deps).sort(), ["activation", "git", "quiesce"]);
+  assert.equal(deps.activation, false);
+  assert.equal(buildPodEpochScratchDeps({ git: git as never, dockerHost: undefined, activation: true }).activation, true);
   assert.equal(deps.git, git);
   // Without a recorded maintenance bootstrap the proof is a denial; it never reaches Docker.
   assert.equal(await deps.quiesce(), false);
