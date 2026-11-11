@@ -80,8 +80,19 @@ func (g *github) githubAppBranchProtection(ctx context.Context, projectID int64,
 		for _, rule := range ruleset.Rules {
 			hasUpdate = hasUpdate || rule.Type == "update"
 		}
-		if !hasUpdate || len(ruleset.BypassActors) == 0 || bytes.Equal(bytes.TrimSpace(ruleset.BypassActors), []byte("null")) {
+		if !hasUpdate {
 			return unknown, nil
+		}
+		// An absent bypass list is NOT an unreadable ruleset. GitHub returns
+		// bypass_actors only to a caller with write access to the ruleset, and an
+		// installation token holds none, so every App credential sees the field
+		// omitted. The binding evidence is the effective-rules response fetched
+		// above: it lists the rules that apply to THIS credential, and an "update"
+		// entry there means the credential is subject to the restriction. That is
+		// the same surface the PAT path has always trusted. A bypass list that IS
+		// returned is honoured below, so an App granted bypass is still reported.
+		if trimmed := bytes.TrimSpace(ruleset.BypassActors); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+			return BranchProtection{Protected: true}, nil
 		}
 		var actors []struct {
 			ID   *int64 `json:"actor_id"`

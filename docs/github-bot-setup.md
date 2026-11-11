@@ -54,6 +54,15 @@ preferred over the legacy **Settings → Branches** protection rule because uzi 
 read it at write role; classic protection is invisible to the bot beyond a bare
 "protected" flag.
 
+**A GitHub App connection additionally needs the "Restrict updates" rule.** A
+required pull request stops a merge without review, but it does not stop a
+credential from updating the branch ref directly, so uzi's App path treats a
+ruleset without **Restrict updates** as unreadable and refuses the repo. Add that
+rule to the same ruleset. Leave the App out of the ruleset's **bypass list** — an
+App listed there with `always` can push and merge, and uzi reports that as a
+violation. A PAT connection does not need this rule; it is checked by role
+instead.
+
 ## Personal access token
 
 ### 1. Create the bot account

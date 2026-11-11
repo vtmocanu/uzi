@@ -215,7 +215,7 @@ func evaluateRepo(rr *RepoReport, repo Repo, role forge.Role, member bool, roleE
 	// protection_unreadable BLOCK code. It does NOT early-return: the Can* fields
 	// are false here so nothing else fires, but the structure is preserved.
 	if bp.ProtectionUnverified {
-		rr.Findings = append(rr.Findings, newFinding(CodeProtectionUnreadable, fmt.Sprintf("could not fully verify push/merge rights on protected %q", repo.DefaultBranch)))
+		rr.Findings = append(rr.Findings, newFinding(CodeProtectionUnreadable, fmt.Sprintf("could not verify push/merge rights on protected %q: add a ruleset covering it with \"Require a pull request before merging\" and \"Restrict updates\", and list this credential in no bypass actor", repo.DefaultBranch)))
 	}
 	// Push/merge findings all BLOCK (D6): a bot that can push or merge into
 	// protected main breaks the primary directive. M1 only surfaces them as coded

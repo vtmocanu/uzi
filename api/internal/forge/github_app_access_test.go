@@ -20,8 +20,11 @@ func TestGitHubAppBranchProtection(t *testing.T) {
 		want      BranchProtection
 	}{
 		{"explicit-empty-bypass-list", effectiveUpdate, safe, 200, BranchProtection{Protected: true}},
-		{"omitted-bypass-list", effectiveUpdate, strings.Replace(safe, `,"bypass_actors":[]`, "", 1), 200, unknown},
-		{"null-bypass-list", effectiveUpdate, strings.Replace(safe, `"bypass_actors":[]`, `"bypass_actors":null`, 1), 200, unknown},
+		// GitHub returns bypass_actors only to a caller with write access to the
+		// ruleset; an installation token has none, so an omitted or null list is the
+		// normal App response and must not be read as an unreadable ruleset.
+		{"omitted-bypass-list", effectiveUpdate, strings.Replace(safe, `,"bypass_actors":[]`, "", 1), 200, BranchProtection{Protected: true}},
+		{"null-bypass-list", effectiveUpdate, strings.Replace(safe, `"bypass_actors":[]`, `"bypass_actors":null`, 1), 200, BranchProtection{Protected: true}},
 		{"unreadable-full-ruleset", effectiveUpdate, safe, 403, unknown},
 		{"classic-protection-only", `[]`, "", 200, unknown},
 		{"force-push-only-is-not-update-protection", `[{"type":"non_fast_forward","ruleset_id":11}]`, safe, 200, unknown},
