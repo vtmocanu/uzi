@@ -10,6 +10,7 @@ import type { ExecutorSealResult, ExecutorTerminalSeal } from "./codex/executor-
 import type { UsageSink } from "./usage-recorder.js";
 import type { RunCacheDropResult } from "./run-caches.js";
 import type { BoundarySink, CodexExecutionSafety, CredentialFreeCaptureContext, HarnessError } from "./harness.js";
+import type { ClaimAnthropicEndpoint } from "./protocol.js";
 import type {
   AgentSelection,
   AgentSource,
@@ -291,6 +292,12 @@ export interface RunContext {
   redactText?: (s: string) => string;
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
   oauthToken?: string;
+  /** PRD #229 D10: an admin-allowlisted custom Anthropic-Messages-compatible endpoint
+   *  this run's Claude side talks to instead of Anthropic's API. When present it is the
+   *  run's credential and `oauthToken` is expected to be empty — the two are mutually
+   *  exclusive by construction in claim assembly, and buildSdkEnv drops the token in
+   *  the same object that carries the custom base URL. Absent ⇒ today's behaviour. */
+  anthropicEndpoint?: ClaimAnthropicEndpoint;
   /** PRD #362 M3c: the model the inline run-summary generator runs on, resolved
    *  user-value-wins from users.summary_model over the instance summary_model at
    *  issue-run claim assembly. Absent ⇒ the generator uses the SDK/account default

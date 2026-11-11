@@ -126,6 +126,29 @@ func (s *Service) anthropicSlotAllDisabled(ctx context.Context, userID uuid.UUID
 	return !enabled, nil
 }
 
+// claimAnthropicEndpoint returns the instance-wide custom Anthropic-Messages endpoint
+// this run is bound to, or nil when the feature is off (PRD #229 D10). Only a Claude
+// run can be bound: a Codex run has its own credential block and never talks to an
+// Anthropic-shaped endpoint.
+func (s *Service) claimAnthropicEndpoint(run store.Run) *ClaimAnthropicEndpoint {
+	if s.anthropicEndpoint == nil || run.Harness == harnessCodex {
+		return nil
+	}
+	return s.anthropicEndpoint
+}
+
+// claimAnthropicOAuthToken applies the PRD #229 D10 mutual exclusion as data: when an
+// endpoint is bound it IS the run's credential, so the subscription token is emptied
+// rather than left for a downstream consumer to deprioritize. Returning "" also drops
+// the key from the wire under omitempty on the worker side, so a bound run's claim
+// carries no subscription material at all.
+func claimAnthropicOAuthToken(token []byte, endpoint *ClaimAnthropicEndpoint) string {
+	if endpoint != nil {
+		return ""
+	}
+	return string(token)
+}
+
 // workerIdentity is the immutable, non-secret provenance label recorded on a custody
 // hold and its captures (PRD #1296 M1, D1/D2). It must be reproducible by the SAME worker
 // at a post-terminal recovery retry and is bound into the capture AAD, so it is derived
@@ -752,6 +775,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if err != nil {
 		return nil, err
 	}
+	// PRD #229 D10: resolved ONCE so the token and the endpoint cannot disagree.
+	anthropicEndpoint := s.claimAnthropicEndpoint(run)
 	payload := &ClaimPayload{
 		CheckpointCoordinates: coordinates,
 		CIRepair:              ciRepair,
@@ -913,9 +938,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			ForgeType:       rc.ForgeType,
 		},
 		Secrets: ClaimSecrets{
-			ForgeUsername:       rc.BotUsername,
-			ForgePAT:            string(botPAT),
-			AnthropicOAuthToken: string(anthropic),
+			ForgeUsername: rc.BotUsername,
+			ForgePAT:      string(botPAT),
+			// PRD #229 D10: bind this Claude run to the instance's custom endpoint, and
+			// CLEAR the subscription token in the same literal. That is the trust
+			// boundary stated as data: a claim can never carry both, so no downstream
+			// consumer has to remember to prefer one. A Codex run leaves the endpoint nil
+			// (its secrets come from the Codex block below), and an instance with no
+			// endpoint configured leaves the whole wire byte-identical to today's.
+			AnthropicOAuthToken: claimAnthropicOAuthToken(anthropic, anthropicEndpoint),
+			AnthropicEndpoint:   anthropicEndpoint,
 		},
 		Agents:        agentsFromTemplates(templates, skills.perTemplate, run.Harness),
 		Skills:        skills.union,

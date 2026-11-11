@@ -71,6 +71,7 @@ import {
   type AgentSelectionParse,
   type AgentSource,
   type AskUserQuestion,
+  type ClaimAnthropicEndpoint,
   type ClaimConfig,
   type Milestone,
   type MilestoneProgress,
@@ -869,6 +870,9 @@ interface RunDrive {
  */
 interface DriveState {
   oauthToken: string;
+  /** PRD #229 D10: the admin-allowlisted custom endpoint this run talks to, when one is
+   *  bound. Undefined on a subscription run, which is every run that predates the feature. */
+  anthropicEndpoint: ClaimAnthropicEndpoint | undefined;
   toolEnv: Awaited<ReturnType<typeof provisionRunTools>>["toolEnv"];
   provisionDir: Awaited<ReturnType<typeof provisionRunTools>>["provisionDir"];
   depsAbort: AbortController;
@@ -1588,7 +1592,12 @@ export class SdkExecutor implements Executor {
    */
   private async phaseSetup(ctx: RunContext, observeState: (state: RunDrive) => void): Promise<DriveState> {
     const oauthToken = ctx.oauthToken?.trim();
-    if (!oauthToken) {
+    const anthropicEndpoint = ctx.anthropicEndpoint;
+    // PRD #229 D10: a bound custom endpoint IS this run's credential, so it satisfies the
+    // same requirement a subscription token does. Exactly one of the two is present —
+    // claim assembly never sets both, and buildSdkEnv drops the token when an endpoint is
+    // bound — so an absent pair is still the fail-fast it was before.
+    if (!oauthToken && !anthropicEndpoint) {
       // OAuth is the sole supported credential (no API keys). Detect its
       // absence up front and fail fast rather than spawning a doomed CLI.
       throw new Error(REASON_NO_TOKEN);
@@ -1620,7 +1629,7 @@ export class SdkExecutor implements Executor {
 
     // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the
     // agent starts is positively attributable to this attempt by the quiescence reaper.
-    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir);
+    const env = buildSdkEnv(oauthToken ?? "", this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, anthropicEndpoint);
     // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
     // probe runs as the runner uid with this SDK env in its own process group: a baseline for
     // what the lead's commands can do, NOT provably identical to an SDK Bash tool call (the SDK
@@ -2177,7 +2186,8 @@ export class SdkExecutor implements Executor {
     let resumeId = ctx.sessionId ?? undefined;
 
     return {
-      oauthToken,
+      oauthToken: oauthToken ?? "",
+      anthropicEndpoint,
       toolEnv,
       provisionDir,
       depsAbort,

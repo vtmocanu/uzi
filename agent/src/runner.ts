@@ -16581,6 +16581,9 @@ export class RunRunner {
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.
       redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
+      // PRD #229 D10: present only when this run's owner has an admin-allowlisted
+      // custom endpoint bound. Claim assembly never sets it alongside an oauth token.
+      anthropicEndpoint: claim.secrets.anthropic_endpoint,
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
       // and whether the intent summary is already set so the executor skips
       // re-generating it on a resume/re-claim (Decision 3). Both absent on older

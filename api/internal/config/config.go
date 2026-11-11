@@ -135,6 +135,25 @@ type Config struct {
 	// connection may target. Normalized (scheme+host, no trailing slash), https
 	// only. The connect UI offers exactly this set.
 	ForgeAllowedBaseURLs []string
+	// AnthropicEndpointAllowedBaseURLs is the admin allowlist for custom
+	// Anthropic-Messages-compatible model endpoints (PRD #229 D10/D9). Repo contents
+	// are sent to whichever endpoint a run's Claude harness talks to, so an arbitrary
+	// base URL is an exfiltration channel: only hosts named here may be bound. EMPTY
+	// (the default) means the feature is off — nothing can be bound, and a deployment
+	// that never sets this behaves exactly as before. Same shape as the forge list.
+	AnthropicEndpointAllowedBaseURLs []string
+	// AnthropicEndpointURL is the custom endpoint every Claude run on this instance
+	// talks to, applied only when it also appears on the allowlist above. A
+	// deployment-level setting rather than a per-user secret: the endpoint is
+	// operator infrastructure (a gateway the whole instance egresses through), and
+	// keeping it out of the claim path means no user secret kind, no handler and no
+	// vault wiring is needed to make it work. Empty ⇒ the feature is off.
+	AnthropicEndpointURL string
+	// AnthropicEndpointAPIKey is the credential for AnthropicEndpointURL. It REPLACES
+	// the per-run subscription token for a run bound to that endpoint, and buildSdkEnv
+	// drops the token in the same object that carries this URL, so the two can never
+	// reach the SDK together. Empty with a URL set is a boot error (see Load).
+	AnthropicEndpointAPIKey string
 	// AgentSourceAllowedBaseURLs is the SEPARATE SSRF allowlist for the agent-source
 	// repo sync (PRD #602 M2): the only base URLs an agent-source clone may target.
 	// Normalized (scheme+host, no trailing slash), https only — same shape as
@@ -995,6 +1014,30 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.AgentSourceAllowedBaseURLs = agentSourceAllowed
+	// PRD #229 D10: the custom Anthropic-endpoint SSRF allowlist. EMPTY by default
+	// (feature off) so an existing install is unchanged; a present-but-malformed
+	// entry still fails the boot closed rather than widening to "allow anything".
+	anthropicEndpointAllowed, err := parseBaseURLAllowlist("ANTHROPIC_ENDPOINT_ALLOWED_BASE_URLS", getenv("ANTHROPIC_ENDPOINT_ALLOWED_BASE_URLS", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AnthropicEndpointAllowedBaseURLs = anthropicEndpointAllowed
+	// PRD #229 D10: the instance-wide custom endpoint, applied only when allowlisted.
+	// Fail closed on every half-configured shape: a URL without an allowlist entry is
+	// refused at boot rather than silently ignored, because a deployment that thinks it
+	// pointed runs at a gateway and did not is worse than one that refuses to start.
+	cfg.AnthropicEndpointURL = strings.TrimSpace(getenv("ANTHROPIC_ENDPOINT_URL", ""))
+	cfg.AnthropicEndpointAPIKey = strings.TrimSpace(getenv("ANTHROPIC_ENDPOINT_API_KEY", ""))
+	if cfg.AnthropicEndpointURL != "" {
+		if !cfg.AnthropicEndpointBaseURLAllowed(cfg.AnthropicEndpointURL) {
+			return Config{}, fmt.Errorf("ANTHROPIC_ENDPOINT_URL %q is not in ANTHROPIC_ENDPOINT_ALLOWED_BASE_URLS", cfg.AnthropicEndpointURL)
+		}
+		if cfg.AnthropicEndpointAPIKey == "" {
+			return Config{}, fmt.Errorf("ANTHROPIC_ENDPOINT_URL is set but ANTHROPIC_ENDPOINT_API_KEY is empty; the endpoint has no credential to use")
+		}
+	} else if cfg.AnthropicEndpointAPIKey != "" {
+		return Config{}, fmt.Errorf("ANTHROPIC_ENDPOINT_API_KEY is set but ANTHROPIC_ENDPOINT_URL is empty")
+	}
 	// PRD #1909 M6: the product-skills allowlist, default EMPTY (feature off, instance still boots).
 	productSkillsAllowed, err := parseBaseURLAllowlist("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", getenv("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", ""))
 	if err != nil {
@@ -2210,6 +2253,34 @@ func (c Config) ForgeBaseURLAllowed(raw string) bool {
 		return false
 	}
 	for _, a := range c.ForgeAllowedBaseURLs {
+		if a == norm {
+			return true
+		}
+	}
+	return false
+}
+
+// AnthropicEndpointBaseURLAllowed reports whether raw normalizes to an allowlisted
+// custom Anthropic-Messages endpoint (PRD #229 D10). It checks the SEPARATE
+// AnthropicEndpointAllowedBaseURLs list and returns false when that list is empty —
+// the feature is off by default, so nothing is bindable until an admin configures it.
+//
+// Repo contents travel to whatever endpoint this permits, which is why the check is
+// an allowlist on the admin's configuration rather than anything a run or a repo can
+// name (the same SSRF reasoning as FORGE_ALLOWED_BASE_URLS).
+func (c Config) AnthropicEndpointBaseURLAllowed(raw string) bool {
+	// NormalizeForgeBaseURL keeps only scheme and host, so it silently DROPS userinfo:
+	// `https://user:pass@gateway.example` normalizes to the allowlisted origin and would
+	// otherwise pass. The endpoint credential travels in its own field, so a URL
+	// carrying credentials has no legitimate use here — refuse it before normalizing.
+	if u, err := url.Parse(strings.TrimSpace(raw)); err == nil && u.User != nil {
+		return false
+	}
+	norm, err := NormalizeForgeBaseURL(raw)
+	if err != nil {
+		return false
+	}
+	for _, a := range c.AnthropicEndpointAllowedBaseURLs {
 		if a == norm {
 			return true
 		}

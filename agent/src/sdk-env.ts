@@ -22,6 +22,7 @@
 // `bash`, and coreutils.
 
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
+import type { ClaimAnthropicEndpoint } from "./protocol.js";
 import { goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } from "./worker-spawn-mark.js";
@@ -34,6 +35,10 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   "HOME",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
+  // PRD #229 D10: the model endpoint. Repo contents travel to whatever base URL the
+  // SDK talks to, so a provisioned var must never redirect it — the only writer is
+  // the admin-allowlisted claim field, applied after the fold below.
+  "ANTHROPIC_BASE_URL",
   // Not a credential — the mandatory browser launch flag (see the base env below).
   // provision.ts's allowlist does not emit AGENT_BROWSER_ARGS today, so this is not a
   // live conflict; protecting it keeps the --no-sandbox guarantee durable against
@@ -71,11 +76,13 @@ export interface SdkAttemptEnv {
  *  provision.ts's explicit allowlist (PATH override + NIX_SSL_CERT_FILE /
  *  LOCALE_ARCHIVE) — never a blind merge of devbox's shellenv. */
 export interface SdkEnv {
-  CLAUDE_CODE_OAUTH_TOKEN: string;
+  /** Present for a subscription run; explicitly `undefined` when a custom endpoint is
+   *  bound (PRD #229 D10), because a custom base URL never receives this token. */
+  CLAUDE_CODE_OAUTH_TOKEN: string | undefined;
   HOME: string;
   PATH: string | undefined;
   ANTHROPIC_API_KEY: undefined;
-  ANTHROPIC_AUTH_TOKEN: undefined;
+  ANTHROPIC_AUTH_TOKEN: string | undefined;
   [key: string]: string | undefined;
 }
 
@@ -103,6 +110,11 @@ export interface SdkEnv {
  *                   Set as GOTMPDIR AFTER the toolEnv fold and the Go concurrency env, so
  *                   a provisioned GOTMPDIR cannot override it. Undefined ⇒ no key from
  *                   this parameter (a provisioned GOTMPDIR behaves as before).
+ * @param endpoint   PRD #229 D10: an admin-allowlisted custom Anthropic-Messages-compatible
+ *                   model endpoint. When present, the SDK is pointed at it with the
+ *                   endpoint's OWN key and the subscription OAuth token is structurally
+ *                   dropped — a custom base URL must never receive it. Undefined ⇒ output
+ *                   is byte-identical to before this parameter existed.
  */
 export function buildSdkEnv(
   oauthToken: string,
@@ -111,6 +123,7 @@ export function buildSdkEnv(
   dockerHost?: string,
   attempt?: SdkAttemptEnv,
   goWorkDir?: string,
+  endpoint?: ClaimAnthropicEndpoint,
 ): SdkEnv {
   const env: SdkEnv = {
     CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
@@ -177,6 +190,17 @@ export function buildSdkEnv(
     env[RUN_ATTEMPT_ENV] = attempt.marker;
     env[RUN_CLONE_ENV] = attempt.clonePath;
     env[RUN_CLONE_KEY_ENV] = attempt.cloneKey;
+  }
+  // PRD #229 D10: a custom endpoint replaces Anthropic's API for this run. Set AFTER
+  // the fold (the keys stay protected above), and the subscription token is cleared in
+  // the SAME object that carries the custom URL — there is no code path where
+  // CLAUDE_CODE_OAUTH_TOKEN and a non-default ANTHROPIC_BASE_URL both reach the SDK.
+  // That is the trust boundary, enforced structurally rather than by ordering.
+  if (endpoint) {
+    env.ANTHROPIC_BASE_URL = endpoint.base_url;
+    env.ANTHROPIC_AUTH_TOKEN = endpoint.api_key;
+    env.ANTHROPIC_API_KEY = undefined;
+    env.CLAUDE_CODE_OAUTH_TOKEN = undefined;
   }
   return env;
 }

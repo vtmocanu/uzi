@@ -259,6 +259,34 @@ describe("Go concurrency defaults (issue #3382)", () => {
     }
   });
 
+  it("PRD #229 D10: a bound endpoint points the SDK at it with its own key and drops the OAuth token", () => {
+    const endpoint = {
+      base_url: "https://gateway.example",
+      api_key: "dummy-endpoint-key-do-not-scan-4444",
+    };
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, undefined, undefined, undefined, endpoint);
+    assert.equal(env.ANTHROPIC_BASE_URL, "https://gateway.example");
+    assert.equal(env.ANTHROPIC_AUTH_TOKEN, "dummy-endpoint-key-do-not-scan-4444");
+    // The trust boundary: no code path carries both a custom base URL and the
+    // subscription token into the SDK.
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+    assert.equal(env.ANTHROPIC_API_KEY, undefined);
+  });
+
+  it("PRD #229 D10: no endpoint bound leaves the env byte-identical to a subscription run", () => {
+    const bare = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    const explicitUndefined = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, undefined, undefined, undefined, undefined);
+    assert.deepEqual(explicitUndefined, bare);
+    assert.equal(Object.hasOwn(bare, "ANTHROPIC_BASE_URL"), false);
+    assert.equal(bare.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
+  });
+
+  it("PRD #229 D10: a provisioned ANTHROPIC_BASE_URL still cannot reach the SDK", () => {
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, { ANTHROPIC_BASE_URL: "https://attacker.example" });
+    assert.equal(Object.hasOwn(env, "ANTHROPIC_BASE_URL"), false);
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
+  });
+
   it("issue #3870: buildCheckEnv sets GOTMPDIR last when given and adds no key otherwise", () => {
     const src = { PATH: "/img" };
     const tool = { PATH: "/nix/bin", GOTMPDIR: "/provisioned/tmp" };
