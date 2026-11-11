@@ -72,6 +72,9 @@
 #   No scenario in the matrix is uncovered; this phase is the integrated proof M7 asks for.
 # =============================================================================
 say "PRD #1349 M7: custody-limit wedge repro + owner-disposition unblock"
+# #3644 entry census (logging only, never asserts): how much admission headroom earlier phases left and which
+# runs are queued, so a later wedge is attributable to the holds the restore route leaves open.
+log_custody_entry_census || true
 # Remove this phase's own seeds on failure: later phases (73-76) run after this one and
 # would otherwise inherit the seeded custody. Skips when the owner was never resolved.
 custody_seed_cleanup() {

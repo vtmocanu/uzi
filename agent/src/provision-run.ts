@@ -12,7 +12,7 @@ import type { RunContext } from "./executor.js";
 import { provisionTools } from "./provision.js";
 import { extractRepoDevboxPackages, mergeToolPackages, filterDeniedPackages } from "./repo-tools.js";
 import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
-import { errMessage, RUN_ID_RE } from "./util.js";
+import { errMessage, parseRunDirName, RUN_ID_RE } from "./util.js";
 
 /** Reason prefix for a FATAL provisioning failure. Tier-1 (uzi-stored) failure
  *  fails the run with this reason; a tier-2 (repo opt-in extra) failure does NOT —
@@ -46,6 +46,9 @@ export interface ProvisionRunDeps {
   log: Logger;
   /** Injected in tests so no real devbox/nix egress happens; default = provisionTools. */
   provision?: typeof provisionTools;
+  /** issue #3644: the per-attempt directory name (`<runId>` or `<runId>.g<N>`) under `provisionRoot`; wins over `ctx.dirKey`.
+   *  It must parse as a run directory name of `ctx.runId`. Absent everywhere = `<runId>`, today's exact path. */
+  dirKey?: string;
 }
 
 export interface ProvisionRunResult {
@@ -106,7 +109,13 @@ export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps)
   if (toolPackages.length === 0) return { toolEnv: {} };
   if (!RUN_ID_RE.test(ctx.runId)) throw new TrustedExecutionRefusal(`${REASON_PROVISION_FAILED}: invalid run id`);
 
-  const provisionDir = path.join(deps.provisionRoot, ctx.runId);
+  // Only this directory is ever created, rewritten or removed (success, failure and retry alike): a restore's successor
+  // provisions under `<runId>.g<N>`, so the restored predecessor's `<runId>` directory is never touched.
+  const dirKey = deps.dirKey ?? ctx.dirKey ?? ctx.runId;
+  if (dirKey !== ctx.runId && parseRunDirName(dirKey)?.runId !== ctx.runId) {
+    throw new TrustedExecutionRefusal(`${REASON_PROVISION_FAILED}: invalid provision directory key`);
+  }
+  const provisionDir = path.join(deps.provisionRoot, dirKey);
 
   // Provision `packages` against provisionDir, emitting the run-feed status
   // messages. provisionTools re-creates the dir and writes a fresh packages-only

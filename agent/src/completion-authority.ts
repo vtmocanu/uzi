@@ -305,7 +305,7 @@ function unseal<T extends object>(key: Buffer, kind: string, source: string, nor
 
 // ---- file IO (async only) -------------------------------------------------------------
 
-async function readRegular(file: string, uid: number, limit: number): Promise<string | null> {
+export async function readRegular(file: string, uid: number, limit: number): Promise<string | null> {
   let handle: fsp.FileHandle;
   try { handle = await fsp.open(file, fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK); }
   catch (error) {
@@ -595,7 +595,7 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   if (options.workerToken === "") throw new AuthorityRefusal("worker token required to authenticate authority state");
   const ops = options.ops ?? realOps;
   // Domain-separated from the join token itself: only this derived key ever MACs state.
-  const key = createHmac("sha256", options.workerToken).update(KEY_LABEL).digest();
+  const key = deriveAuthorityKey(options.workerToken);
   if (path.resolve(ctx.dataDir) !== ctx.dataDir || await fsp.realpath(ctx.dataDir) !== ctx.dataDir) {
     throw new AuthorityRefusal("authority data root is not the canonical spelling");
   }
@@ -650,6 +650,12 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   });
 }
 
+/** Issue #3644: the authority store's derived MAC key, for sibling records (restore boundary) that share it under their own domain label. */
+export function deriveAuthorityKey(workerToken: string): Buffer {
+  if (workerToken === "") throw new AuthorityRefusal("worker token required to authenticate authority state");
+  return createHmac("sha256", workerToken).update(KEY_LABEL).digest();
+}
+
 /** The worker incarnation a store opened without an explicit `workerIncarnation` writes its slots under. */
 export function processWorkerIncarnation(): string { return PROCESS_INCARNATION; }
 
@@ -666,7 +672,7 @@ export async function peekAuthoritySlot(
   if (options.workerToken === "") throw new AuthorityRefusal("worker token required to authenticate authority state");
   const dataDir = options.dataDir;
   const uid = options.uid ?? process.getuid?.() ?? -1;
-  const key = createHmac("sha256", options.workerToken).update(KEY_LABEL).digest();
+  const key = deriveAuthorityKey(options.workerToken);
   if (path.resolve(dataDir) !== dataDir || await fsp.realpath(dataDir) !== dataDir) {
     throw new AuthorityRefusal("authority data root is not the canonical spelling");
   }
@@ -698,6 +704,50 @@ export async function peekAuthoritySlot(
     incarnation: PROCESS_INCARNATION, ops: realOps, maxHeadBytes: MAX_SLOT_BYTES,
   });
   return store.peekSlot(sourcePath);
+}
+
+/** Canonical relative layout identity of a source path plus the final component's identity; refuses anything unsafe. */
+async function relativeWithRoot(root: string, sourcePath: string): Promise<{ rel: string; root: { dev: string; ino: string } | undefined }> {
+  if (typeof sourcePath !== "string" || sourcePath.includes("\0") || !path.isAbsolute(sourcePath) ||
+      path.resolve(sourcePath) !== sourcePath) {
+    throw new AuthorityRefusal("source path must be a normalized absolute path");
+  }
+  const rel = path.relative(root, sourcePath);
+  if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    throw new AuthorityRefusal("source path is outside the data root");
+  }
+  const parts = rel.split(path.sep);
+  if (parts[0] === AUTHORITY_DIR_NAME) throw new AuthorityRefusal("source path is inside authority storage");
+  let current = root;
+  let identity: { dev: string; ino: string } | undefined;
+  for (const [index, part] of parts.entries()) {
+    current = path.join(current, part);
+    let stat;
+    try { stat = await fsp.lstat(current, { bigint: true }); }
+    catch (error) {
+      // Only the final component may be absent: nothing below a missing ancestor is checkable.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && index === parts.length - 1) break;
+      throw new AuthorityRefusal("source path is not resolvable");
+    }
+    if (stat.isSymbolicLink()) throw new AuthorityRefusal("source path crosses a symlink");
+    if (index < parts.length - 1 && !stat.isDirectory()) throw new AuthorityRefusal("source path ancestor is not a directory");
+    if (index === parts.length - 1) identity = { dev: stat.dev.toString(), ino: stat.ino.toString() };
+  }
+  return { rel, root: identity };
+}
+
+/**
+ * Read-only counterpart of {@link peekAuthoritySlot} for the clone root's identity: the same canonical-data-root check
+ * and the same lstat walk as the slot-key derivation, no enrollment read, no write, nothing opened or listed in the root.
+ */
+export async function peekSourceRootIdentity(
+  options: { dataDir: string }, sourcePath: string,
+): Promise<{ dev: string; ino: string } | undefined> {
+  const dataDir = options.dataDir;
+  if (path.resolve(dataDir) !== dataDir || await fsp.realpath(dataDir) !== dataDir) {
+    throw new AuthorityRefusal("authority data root is not the canonical spelling");
+  }
+  return (await relativeWithRoot(dataDir, sourcePath)).root;
 }
 
 interface StoreInit {
@@ -860,31 +910,16 @@ export class AuthorityStore {
 
   /** Canonical relative layout identity of a source path; refuses anything unsafe. */
   async #relative(sourcePath: string): Promise<string> {
-    const root = this.#init.dataDir;
-    if (typeof sourcePath !== "string" || sourcePath.includes("\0") || !path.isAbsolute(sourcePath) ||
-        path.resolve(sourcePath) !== sourcePath) {
-      throw new AuthorityRefusal("source path must be a normalized absolute path");
-    }
-    const rel = path.relative(root, sourcePath);
-    if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
-      throw new AuthorityRefusal("source path is outside the data root");
-    }
-    const parts = rel.split(path.sep);
-    if (parts[0] === AUTHORITY_DIR_NAME) throw new AuthorityRefusal("source path is inside authority storage");
-    let current = root;
-    for (const [index, part] of parts.entries()) {
-      current = path.join(current, part);
-      let stat;
-      try { stat = await fsp.lstat(current); }
-      catch (error) {
-        // Only the final component may be absent: nothing below a missing ancestor is checkable.
-        if ((error as NodeJS.ErrnoException).code === "ENOENT" && index === parts.length - 1) break;
-        throw new AuthorityRefusal("source path is not resolvable");
-      }
-      if (stat.isSymbolicLink()) throw new AuthorityRefusal("source path crosses a symlink");
-      if (index < parts.length - 1 && !stat.isDirectory()) throw new AuthorityRefusal("source path ancestor is not a directory");
-    }
-    return rel;
+    return (await relativeWithRoot(this.#init.dataDir, sourcePath)).rel;
+  }
+
+  /**
+   * The decimal dev/ino of the source path's final component (the clone root), taken by the SAME lstat walk as
+   * {@link slotKey} (identical refusals). Undefined when the final component is absent. Reads nothing inside the root.
+   */
+  async sourceRootIdentity(tx: AuthorityTransaction, sourcePath: string): Promise<{ dev: string; ino: string } | undefined> {
+    this.#check(tx);
+    return (await relativeWithRoot(this.#init.dataDir, sourcePath)).root;
   }
 
   async slotKey(tx: AuthorityTransaction, sourcePath: string): Promise<string> {
