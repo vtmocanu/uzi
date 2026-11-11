@@ -1072,6 +1072,9 @@ fi
 if [ "${PLAN_HISTORY_FAILURE:-0}" = 1 ]; then
   case " $* " in *' log --first-parent '*) exit 74 ;; esac
 fi
+if [ "${PLAN_BLOB_FAILURE:-0}" = 1 ]; then
+  case " $* " in *' cat-file '*) exit 75 ;; esac
+fi
 exec "$PLAN_REAL_GIT" "$@"
 GIT
   chmod +x "$d/plan-bin/git"
@@ -1183,11 +1186,62 @@ GIT
   gcommit "$d" 'docs: isolated fragment'
   plan_expect 'only committed fragment makes range releasable' $'OP=nextrc\nTAG=v0.2.0-rc.12\nSHIPPING_COUNT=1'
   mkdir -p "$d/agent/codex"
-  echo 'runtime pin fixture' > "$d/agent/codex/codex-package.lock"
+  printf 'CODEX_VERSION=2.0.0\nCODEX_TAG=rust-v2.0.0\n' > "$d/agent/codex/codex-package.lock"
   git -C "$d" add agent/codex/codex-package.lock
   gcommit "$d" 'chore: change Codex runtime'
   plan_expect 'Codex adoption requires a local cut' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
   PLAN_PUBLICATION=failed plan_expect 'Codex block precedes liftable publication block' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  # #4172: an adoption assertion belongs to the committed lock, never a worktree file.
+  local adoption digest valid_record malformed publication_reason
+  adoption=agent/codex/codex-package.adopted
+  digest="$(shasum -a 256 "$d/agent/codex/codex-package.lock" | awk '{print $1}')"
+  valid_record="$(printf 'lock-sha256=%s\nruntime-tag=rust-v2.0.0' "$digest")"
+  printf '%s\n' "$valid_record" > "$d/$adoption"
+  plan_expect 'Codex untracked adoption cannot authorize release' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  git -C "$d" add "$adoption"
+  gcommit "$d" 'docs: record Codex adoption'
+  plan_expect 'Codex matching committed adoption' $'OP=nextrc\nTAG=v0.2.0-rc.12'
+  PLAN_BLOB_FAILURE=1 plan_expect 'Codex blob read failure stays closed' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  for PLAN_PUBLICATION in failed pending missing error transient; do
+    export PLAN_PUBLICATION
+    publication_reason=previous-publication-not-successful
+    case "$PLAN_PUBLICATION" in error|transient) publication_reason=previous-publication-unreadable ;; esac
+    plan_expect "Codex adopted publication $PLAN_PUBLICATION" "$(printf 'OP=blocked\nREASON=%s' "$publication_reason")"
+  done
+  export PLAN_PUBLICATION=success
+  PLAN_PREVIOUS=v0.1.0 plan_expect 'Codex adopted abandon uses stable boundary' $'OP=new-base\nPREVIOUS_TAG=v0.1.0' --version 0.3.0 --abandon-train
+  for malformed in stale tag duplicate unknown extra uppercase short garbage missing newline crlf; do
+    case "$malformed" in
+      stale) printf 'lock-sha256=%064d\nruntime-tag=rust-v2.0.0\n' 0 ;;
+      tag) printf 'lock-sha256=%s\nruntime-tag=rust-v9.9.9\n' "$digest" ;;
+      duplicate) printf '%s\nlock-sha256=%s\n' "$valid_record" "$digest" ;;
+      unknown) printf '%s\nunknown=true\n' "$valid_record" ;;
+      extra) printf '%s\n\n' "$valid_record" ;;
+      uppercase) printf 'lock-sha256=%s\nruntime-tag=rust-v2.0.0\n' "$(printf '%s' "$digest" | tr '[:lower:]' '[:upper:]')" ;;
+      short) printf 'lock-sha256=abc\nruntime-tag=rust-v2.0.0\n' ;;
+      garbage) printf '$(touch adoption-executed)\n' ;;
+      missing) printf 'lock-sha256=%s\n' "$digest" ;;
+      newline) printf '%s' "$valid_record" ;;
+      crlf) printf 'lock-sha256=%s\r\nruntime-tag=rust-v2.0.0\r\n' "$digest" ;;
+    esac > "$d/$adoption"
+    git -C "$d" add "$adoption"
+    gcommit "$d" "test: Codex adoption $malformed"
+    plan_expect "Codex $malformed adoption refuses" $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  done
+  assert_eq 'Codex adoption data never executed' no "$(if [ -e "$d/adoption-executed" ]; then echo yes; else echo no; fi)"
+  PLAN_PREVIOUS=v0.1.0 plan_expect 'Codex invalid adoption blocks abandon' $'OP=blocked\nREASON=codex-runtime-needs-local-cut' --version 0.3.0 --abandon-train
+  # A matching worktree target cannot turn a committed symlink into an assertion.
+  printf '%s\n' "$valid_record" > "$d/adoption-target"
+  git -C "$d" rm -q "$adoption"
+  ln -s ../../adoption-target "$d/$adoption"
+  git -C "$d" add "$adoption"
+  gcommit "$d" 'test: Codex adoption symlink'
+  plan_expect 'Codex symlink adoption refuses' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  git -C "$d" rm -q "$adoption"
+  printf '%s\n' "$valid_record" > "$d/$adoption"
+  git -C "$d" add "$adoption"
+  gcommit "$d" 'docs: restore valid adoption'
+  plan_expect 'Codex restored committed adoption' $'OP=nextrc\nTAG=v0.2.0-rc.12'
   # A human's local cut establishes a new boundary after the adoption read.
   git -C "$d" tag v0.2.0-rc.12
   export PLAN_PREVIOUS=v0.2.0-rc.12

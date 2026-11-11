@@ -105,6 +105,13 @@ new version can break uzi or ship capabilities uzi should adopt.
   lock-only bump. On your own branch (below), take the lock and run `task codex-pins:sync`,
   which rewrites every registered Codex version and digest pin from it; keep the Codex
   guardrail/conformance checks green.
+- After the Codex adoption read, hand-update `agent/codex/codex-package.adopted`:
+  exactly `lock-sha256=<64 lowercase hex>` then `runtime-tag=<CODEX_TAG>`, each
+  followed by LF, with no other lines. Hash the raw lock bytes with
+  `shasum -a 256 agent/codex/codex-package.lock`; take the tag from that lock. Commit both as
+  regular files. Pin sync and Renovate must never update this assertion. A lock
+  edit invalidates it; review the edit before recording adoption again. CI validates
+  the committed assertion, not whether the read occurred (ADR-3512, #4172).
 - Required PR CI covers the agent suite, the real-binary `test:codex-m4` on amd64 and the
   worker-uid lane (`test-agent`). The required `codex-packaged-proof-gate` covers the strict
   packaged proof on amd64 and the arm64 package check (`e2e/codex-proof/package-exec.sh`). The amd64 image builds run but are not required.

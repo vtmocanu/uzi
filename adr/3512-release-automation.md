@@ -67,10 +67,16 @@ flowchart LR
   cutter still validates releasability. Supersede lifts only the matched latest
   failed/missing publication refusal, never pending/unreadable state or another
   guard. It cannot waive coverage, oracle, metadata, pin or adoption checks.
-- Codex lock changes require the adoption read and a local cut. No model or
-  attestation parsing runs in CI. Abandon uses the highest stable boundary, so
-  an adopted Codex change in an abandoned train still blocks automatic abandon
-  until a local cut. This is deliberate fail-closed behavior.
+- Codex lock changes require the adoption read. CI accepts a maintainer-reviewed
+  `agent/codex/codex-package.adopted` assertion binding the raw lock SHA256 and
+  runtime tag to regular-file blobs at the same pinned HEAD (#4172). Its exact
+  two-line format is documented in the uzi-release skill. Missing or invalid
+  assertions retain `codex-runtime-needs-local-cut`; pin sync and Renovate never
+  certify adoption. This records the maintainer's read, not a read performed by CI.
+  Abandon still uses the highest stable boundary and validates the same HEAD
+  assertion. Publication, coverage and authorization gates remain independent.
+  This supersedes #3524's unconditional local-cut requirement with the
+  maintainer's acknowledgement; no model, PR-body parsing or new authority is added.
 - A thin bundle requires its pinned parent to be fetched before verification.
   Validate digest, exact refs, release SHA, tag object and single parent before
   minting. No configuration or hooks are imported. A lost push receipt is

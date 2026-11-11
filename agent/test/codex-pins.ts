@@ -22,6 +22,8 @@ const PIN_SCAN_EXCLUDES = [
   ":(exclude)e2e/worker-uid/issue-2397-investigation.md",
   // A recorded frame tape is historical evidence, not a live deployment pin.
   ":(exclude)agent/test/fixtures/codex-plan-output-schema-0.164.0.json",
+  // A maintainer's adoption assertion must never be certified by pin sync.
+  ":(exclude)agent/codex/codex-package.adopted",
   // Synthetic version output deliberately includes mismatches to test the verifier.
   ":(exclude)e2e/codex-m4/provision.test.ts",
 ];
