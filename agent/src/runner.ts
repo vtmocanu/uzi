@@ -4346,7 +4346,7 @@ export class RunRunner {
       flight.sourceAdmissionRetired = true;
     };
     const remediation: { kind: "confirmed" | "denied" | "held" } = { kind: "confirmed" };
-    if (flight.remediationRestrictions?.pending && flight.sourceTailsJoined === true) {
+    if (flight.remediationRestrictions && flight.sourceTailsJoined === true) {
       remediation.kind = "held";
       try {
         // One bounded acquisition/confirmation attempt. Retire under the same owning A.
@@ -4362,13 +4362,25 @@ export class RunRunner {
               return;
             }
           }
-          const snapshot = canonicalJson(flight.remediationRestrictions!.pending!);
+          const pending = flight.remediationRestrictions?.pending;
+          if (!flight.remediationRestrictions) {
+            remediation.kind = "confirmed";
+            retire();
+            return;
+          }
+          if (!pending) {
+            // A latch with no pending entry (sticky, or a clearable one the re-read did not clear) cannot be
+            // confirmed here: stay held, no publication, slots stay active.
+            retire();
+            return;
+          }
+          const snapshot = canonicalJson(pending);
           try {
             remediation.kind = await this.withRemediationLifecycle(undefined, () => this.confirmPendingRemediation(flight));
           }
           finally {
             retire();
-            if (canonicalJson(flight.remediationRestrictions!.pending!) !== snapshot) remediation.kind = "held";
+            if (canonicalJson(flight.remediationRestrictions?.pending) !== snapshot) remediation.kind = "held";
           }
         }, this.cleanupAuthorityWait(this.sourceUseEndWaitMs));
       } catch {

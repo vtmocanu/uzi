@@ -4657,7 +4657,19 @@ export class GitCache {
       });
     };
     try { return await (budget ? MaintenanceBudget.run(budget, run) : run()); }
+    catch (error) {
+      // MaintenanceBudget.run checks the budget before entering `run`; classify that entry expiry only when it is
+      // positively the budget's own and no read has started.
+      if (opts?.restrictionProgress && !opts.restrictionProgress.started && this.isBudgetExpiry(error, budget))
+        opts.restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** Positive identity only: the error is a deadline expiry raised by one of these budgets (or the ambient one). */
+  private isBudgetExpiry(error: unknown, ...budgets: Array<MaintenanceBudget | undefined>): boolean {
+    return [...budgets, MaintenanceBudget.current()].some(b => b?.ownsExpiry(error) === true);
   }
 
   /** Central helpers also honor a budget scoped before any explicit recovery wrapper. */
@@ -26819,7 +26831,14 @@ try {
   private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal, restrictionProgress?: RemediationRestrictionProgress): Promise<T> {
     const prev = this.locks.get(key) ?? Promise.resolve();
     const boundary = this.boundaryProcesses.getStore();
-    const recovery = this.recoveryOperation();
+    let recovery: ReturnType<typeof this.recoveryOperation>;
+    try { recovery = this.recoveryOperation(); }
+    catch (error) {
+      // Only a positively identified maintenance-budget expiry before any read is a clearable interruption.
+      if (restrictionProgress && !restrictionProgress.started
+        && this.isBudgetExpiry(error, this.recoveryOperations.getStore()?.budget)) restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     const report = this.reportProofs.getStore();
     this.checkReportProof();
     try {

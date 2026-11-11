@@ -394,6 +394,74 @@ for (const failure of [false, true]) {
   });
 }
 
+for (const mode of ["lock entry budget expiry", "run entry budget expiry", "lock entry other error", "run entry other error"] as const) {
+  test("#4191 pre-read maintenance-budget expiry is classified only when positively identified: " + mode, async t => {
+    const f = await fixture(false);
+    const { runner, cache, subject, flight } = f.fresh();
+    let wall = 0;
+    const budget = new MaintenanceBudget(1000, () => wall);
+    const expire = (): unknown => {
+      wall = 5000;
+      try { budget.check(); } catch (error) { return error; }
+      throw new Error("budget did not expire");
+    };
+    try {
+      await MaintenanceBudget.run(budget, async () => {
+        if (mode === "lock entry budget expiry") {
+          t.mock.method(cache as any, "recoveryOperation", () => { throw expire(); });
+        } else if (mode === "lock entry other error") {
+          t.mock.method(cache as any, "recoveryOperation", () => { throw new Error("resource check failed"); });
+        } else if (mode === "run entry budget expiry") {
+          expire();
+        } else {
+          t.mock.method(MaintenanceBudget, "run", () => { throw new Error("unrelated entry failure"); });
+        }
+        assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
+      });
+      assert.ok(flight.remediationRestrictions, "bootstrap latched");
+      assert.equal(flight.remediationRestrictions.clearable, mode.includes("budget expiry"),
+        "only a positively identified budget expiry leaves the latch clearable");
+    } finally { runner.shutdown(); }
+  });
+}
+
+for (const mode of ["clearable reread fails", "clearable reread confirms", "sticky"] as const) {
+  test("#4191 teardown of a no-pending latch with a bound completion source: " + mode, async t => {
+    const f = await sourceImportFixture(false);
+    const entered = latch(), release = latch();
+    const hold = AsyncLocalStorage.bind(() => f.cache.withBareLock(f.bare, async () => {
+      entered.release(); await release.promise;
+    }));
+    const holder = hold(); await entered.promise;
+    f.subject.codexBoundaryDeadlineMs = 30;
+    try { await f.subject.bootstrapRemediationRestrictions(f.flight); }
+    finally { release.release(); await holder; }
+    f.subject.codexBoundaryDeadlineMs = 5000;
+    try {
+      assert.ok(f.flight.remediationRestrictions, "bootstrap latched");
+      assert.equal(f.flight.remediationRestrictions.pending, undefined, "no pending entry");
+      if (mode === "sticky") f.flight.remediationRestrictions.clearable = false;
+      if (mode === "clearable reread fails") t.mock.method(f.cache, "readRemediationRestrictionFacts", async () => {
+        throw new Error("private sentinel must stay out of diagnostics");
+      });
+      f.flight.completionSourceBound = { clonePath: f.clone.path };
+      f.flight.sourceTailsJoined = true;
+      let published = 0;
+      t.mock.method(f.subject, "publishFlightSource", async () => { published++; return "published"; });
+      const end = await f.subject.endFlightSourceUse(f.flight, nullLogger());
+      if (mode === "clearable reread confirms") {
+        assert.equal(f.flight.remediationRestrictions, undefined, "verified absence cleared the latch");
+        assert.equal(published, 1, "ordinary publication proceeds");
+      } else {
+        assert.ok(f.flight.remediationRestrictions, "latch kept");
+        assert.equal(published, 0, "no publication under a latch");
+        assert.deepEqual(end.endedSlots, [], "slots stay active");
+        assert.equal(end.published, false);
+      }
+    } finally { f.runner.shutdown(); }
+  });
+}
+
 for (const mode of ["active", "protected", "readback", "unknown", "restore", "predecessor", "report proof"] as const) {
   test("#4191 sticky denial survives later verified absence: " + mode, async t => {
     const f = await fixture(mode === "active" || mode === "protected");
