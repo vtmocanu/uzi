@@ -54,7 +54,7 @@ describe("HeldWorkCard", () => {
       String(a.open_holds),
       String(a.decision_needed),
     ]);
-    expect(screen.getByText("custody slots used")).toBeTruthy();
+    expect(screen.getByText("custody units used")).toBeTruthy();
     expect(screen.getByText(a.open_holds === 1 ? "open custody hold" : "open custody holds")).toBeTruthy();
     expect(screen.getByText(a.decision_needed === 1 ? "hold needs a decision" : "holds need a decision")).toBeTruthy();
 
@@ -79,7 +79,7 @@ describe("HeldWorkCard", () => {
 
   it("reads the configured limit in its copy, never a hardcoded 8", () => {
     mount(agg({ custody_hold_limit: 3, open_holds: 1, admission_counted_holds: 1 }));
-    expect(screen.getByText(/New runs wait for admission once all 3 custody slots are taken\./)).toBeTruthy();
+    expect(screen.getByText(/New runs wait for admission once all 3 custody units are taken\./)).toBeTruthy();
     expect(screen.getByText(/Holds protect each run's committed but unpushed work, while it runs and after a worker is lost\./)).toBeTruthy();
     expect(screen.getByText("1 / 3")).toBeTruthy();
   });
@@ -105,7 +105,7 @@ describe("HeldWorkCard", () => {
     const { container } = mount(null);
     expect(screen.getByText("Loading held work…").className).toContain("text-muted");
     expect(screen.queryByText(/unavailable/)).toBeNull();
-    expect(screen.queryByText("custody slots used")).toBeNull();
+    expect(screen.queryByText("custody units used")).toBeNull();
     expect(screen.queryByRole("link")).toBeNull();
     expect(container.querySelector("[role]")).toBeNull();
   });
@@ -118,7 +118,7 @@ describe("HeldWorkCard", () => {
     );
     expect(screen.getByText("Held work is unavailable right now.")).toBeTruthy();
     expect(screen.queryByText(/Loading held work/)).toBeNull();
-    expect(screen.queryByText("custody slots used")).toBeNull();
+    expect(screen.queryByText("custody units used")).toBeNull();
     expect(container.querySelector("[role]")).toBeNull();
   });
 

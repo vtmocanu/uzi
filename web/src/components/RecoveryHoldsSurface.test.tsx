@@ -76,6 +76,20 @@ async function renderSurface(resp: RecoveryCustodyHolds, initialEntries?: string
 }
 
 describe("RecoveryHoldsSurface", () => {
+  it("shows a grouped hold with its label at the limit and tolerates old-server holds without admission fields", async () => {
+    await renderSurface(listing([
+      hold({ id: "rep", counts_toward_admission: true, admission_reason: "live_claim" }),
+      hold({ id: "grp", generation: 2, counts_toward_admission: false, admission_reason: "same_run_group" }),
+    ], { custody_hold_limit: 1, admission_counted_holds: 1 }));
+    const row = document.getElementById("recovery-hold-grp")!;
+    expect(within(row).getByText("Counted once with this run's other holds on the same worker")).toBeTruthy();
+    expect(screen.getByText("custody units used")).toBeTruthy();
+    cleanup();
+    await renderSurface(listing([hold({ id: "old" })], { custody_hold_limit: 1, admission_counted_holds: undefined }));
+    const oldRow = document.getElementById("recovery-hold-old")!;
+    expect(within(oldRow).queryByText(/Counted once/)).toBeNull();
+  });
+
   it.each(["available", "preparing", "uploading"])("links source-only export to the run archive section with latest capture %s", async (capture_state) => {
     await renderSurface(listing([hold({ attention: "source_only", run_id: "run-exhausted", has_available_capture: true, capture_state })]));
     const row = screen.getByText("Decision required").closest("li")!;

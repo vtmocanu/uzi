@@ -395,7 +395,7 @@ describe("Held work card", () => {
     });
     await mount();
     const card = screen.getByRole("alert", { name: "Held work" });
-    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Held work is blocking new runs");
+    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("A queued run reached its own custody hold limit");
     expect(within(card).getByRole("heading", { level: 3 }).className).toContain("text-danger");
     expect(screen.queryByRole("link", { name: /^Review held work/ })).toBeNull();
     expect(screen.queryByText("Needs your decision")).toBeNull();
@@ -424,7 +424,7 @@ describe("Held work card", () => {
     });
     await mount();
     const card = screen.getByRole("alert", { name: "Held work" });
-    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Held work is blocking new runs");
+    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("A queued run reached its own custody hold limit");
     expect(within(card).getByRole("link", { name: "Review held work →" })).toBeTruthy();
     expect(within(screen.getByRole("region", { name: "Needs your decision" })).getByText(/Held work from run/)).toBeTruthy();
   });

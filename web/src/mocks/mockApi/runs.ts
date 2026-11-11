@@ -102,6 +102,9 @@ function seedCustodyHolds(): RecoveryCustodyHold[] {
     // Its published checkpoint was superseded by a newer run on the same branch (PRD #1810):
     // the work now lives at the run's recovery ref.
     mk({ id: "hold-a1", run_id: "run-a1", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 1, attention: "source_only", checkpoint_ref: "refs/uzi-recovery/run-a1", checkpoint_tip: "3f9c2a7d41be08e6c5a9f1d27b4e3c8a90d6f512", checkpoint_state: "superseded", counts_toward_admission: true, admission_reason: "decision_needed" }),
+    // A second open hold of run-a4 on the same worker: one admission unit covers both, so this
+    // non-representative hold is grouped and never counts toward the limit.
+    mk({ id: "hold-a4-grouped", run_id: "run-a4", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 5, attention: "active", counts_toward_admission: false, admission_reason: "same_run_group" }),
     // Worker B — jvm-worker: an actionable capture failure + a source-only hold.
     // Still at its branch checkpoint slot (PRD #1810); the long branch exercises phone wrapping.
     mk({ id: "hold-b2", run_id: "run-b2", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 2, attention: "needs_action", capture_state: "needs_action", checkpoint_ref: "refs/uzi-checkpoints/agent/issue-1810-retain-published-checkpoints-across-supersession", checkpoint_tip: "b41e7d09a2c3f58e61d4a7b90c2e5f3a1d8b6c47", checkpoint_state: "retained", counts_toward_admission: true, admission_reason: "decision_needed" }),
@@ -155,14 +158,16 @@ function custodyResponse(): RecoveryCustodyHolds {
   const decisionNeeded = open.filter(
     (h) => h.attention === "source_only" || h.attention === "needs_action",
   ).length;
+  // Admission counts units (a grouped hold is uncounted), so the aggregate follows the counted holds.
+  const counted = open.filter((h) => h.counts_toward_admission === true).length;
   return {
     aggregate: {
       open_holds: open.length,
-      admission_counted_holds: open.filter((h) => h.counts_toward_admission === true).length,
+      admission_counted_holds: counted,
       custody_hold_limit: custodyLimit,
       decision_needed: decisionNeeded,
       // Two queued code runs are wedged behind the owner limit in this scenario.
-      blocked_runs: open.length >= custodyLimit ? 2 : 0,
+      blocked_runs: counted >= custodyLimit ? 2 : 0,
     },
     holds,
   };

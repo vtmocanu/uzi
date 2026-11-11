@@ -48,7 +48,7 @@ describe("CustodyBoardAlert", () => {
     if (admission_counted_holds === undefined) delete resp.aggregate.admission_counted_holds;
     await renderAlert(resp);
     expect(screen.getByRole("status")).toBeTruthy();
-    expect(screen.getByText(`${admission_counted_holds ?? 12} / 8 custody slots used`)).toBeTruthy();
+    expect(screen.getByText(`${admission_counted_holds ?? 12} / 8 custody units used`)).toBeTruthy();
     expect(screen.getByText(/open custody holds/).textContent).toBe("12 open custody holds");
     expect(screen.getByRole("link", { name: /Review held work/ })).toBeTruthy();
   });
@@ -65,7 +65,7 @@ describe("CustodyBoardAlert", () => {
     expect(region.classList.contains("bg-warn/10")).toBe(true);
     expect(region.classList.contains("bg-danger/10")).toBe(false);
     expect(screen.getByText("Custody capacity reached").classList.contains("text-warn")).toBe(true);
-    expect(screen.getByText(`${open_holds} / 8 custody slots used`)).toBeTruthy();
+    expect(screen.getByText(`${open_holds} / 8 custody units used`)).toBeTruthy();
     expect(screen.getByText("Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when counted holds settle.")).toBeTruthy();
     expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
     expect(screen.queryByText(/needs? a decision/)).toBeNull();
@@ -102,7 +102,18 @@ describe("CustodyBoardAlert", () => {
     expect(link.classList.contains("bg-raised")).toBe(true);
   });
 
-  it.each([4, 8, 9])("renders blocked runs without decisions at %i as danger with queued-wait advice", async (open_holds) => {
+  it("renders a below-limit blocked run as its own hold-limit case, not as unrelated waiting runs", async () => {
+    await renderAlert(holds({ open_holds: 4, admission_counted_holds: 2, blocked_runs: 1 }));
+    expect(screen.getByRole("alert").classList.contains("bg-danger/10")).toBe(true);
+    expect(screen.getByText("A queued run reached its own custody hold limit").classList.contains("text-danger")).toBe(true);
+    expect(screen.getByText("A queued run has reached its own custody hold limit. Resolve or discard that run's own retained holds to let it start.")).toBeTruthy();
+    expect(screen.getByText("2 / 8 custody units used")).toBeTruthy();
+    expect(screen.queryByText(/Queued code runs are waiting/)).toBeNull();
+    expect(screen.queryByText(/New code runs will wait/)).toBeNull();
+    expect(screen.queryByText(/Held work is blocking new runs/)).toBeNull();
+  });
+
+  it.each([8, 9])("renders blocked runs without decisions at %i as danger with queued-wait advice", async (open_holds) => {
     await renderAlert(holds({ open_holds, blocked_runs: 2 }));
     const region = screen.getByRole("alert");
     expect(region.getAttribute("aria-live")).toBe("assertive");
@@ -121,7 +132,7 @@ describe("CustodyBoardAlert", () => {
     const region = screen.getByRole("alert");
     expect(region.getAttribute("aria-live")).toBe("assertive");
     expect(region.classList.contains("bg-danger/10")).toBe(true);
-    expect(screen.getByText("Held work is blocking new runs")).toBeTruthy();
+    expect(screen.getByText(open_holds >= 8 ? "Held work is blocking new runs" : "A queued run reached its own custody hold limit")).toBeTruthy();
     expect(screen.getByText("Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work.")).toBeTruthy();
     expect(screen.getByText(/hold needs a decision/)).toBeTruthy();
     expect(screen.getByText(/runs blocked/)).toBeTruthy();
@@ -157,7 +168,7 @@ describe("CustodyBoardAlert", () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
     expect(screen.getByRole("alert").getAttribute("aria-live")).toBe("assertive");
-    expect(screen.getByText("Held work is blocking new runs")).toBeTruthy();
+    expect(screen.getByText("A queued run reached its own custody hold limit")).toBeTruthy();
     expect(screen.queryByRole("status")).toBeNull();
 
     await act(async () => { await vi.advanceTimersByTimeAsync(10000); });

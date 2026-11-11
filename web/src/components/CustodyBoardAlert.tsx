@@ -75,6 +75,8 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
                 ? danger
                   ? "Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work."
                   : "Review the holds that need a decision and choose how to preserve their work."
+                : view.runBoundOnly
+                  ? "A queued run has reached its own custody hold limit. Resolve or discard that run's own retained holds to let it start."
                 : danger
                   ? "Queued code runs are waiting for custody admission; no action is needed. Admission resumes when counted holds settle."
                   : "Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when counted holds settle."}
