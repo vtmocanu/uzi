@@ -366,7 +366,7 @@ A directory read or close failure, any other errno, a deadline, cancellation, a 
 pass-wide. See the
 [full #3775 diagnostic contract](../prds/3431-pod-epoch-reclaim.md#3775-partial-shadow-diagnostic-contract).
 
-**Production deletion is off by default.** The worker image contains a deletion
+**Attempt deletion is off by default.** The worker image contains a deletion
 phase that runs only when the worker starts with `UZI_EPOCH_RECLAIM_DELETION=1`
 (read once at startup; `UZI_EPOCH_LOCK=1` and a Docker wiring required, else
 startup is refused). The chart sets it for at most one hosted Docker worker, via
@@ -379,6 +379,13 @@ and [PRD #3431](../prds/3431-pod-epoch-reclaim.md); hosted deletion acceptance a
 the later idle-gated roll (#3329) are not shipped. Existing startup reapers and
 DinD maintenance retain their separate behavior. Compose and non-Docker workers
 are unchanged.
+
+Runner `TMPDIR` scratch reclaim is separate: the chart requests it by default
+through `workers.epochReclaim.scratchDeletion: true` for persistent Docker
+workers. The default empty runtime declaration supplies no attestation and
+keeps scratch. Every existing epoch, authority and settlement guard still
+applies. See [startup disable and observation](./run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation)
+for safe replacement, version skew and evidence; this is not a hot switch.
 
 When the phase is enabled it runs only for an `eligible`, `attested` pass and
 adds these fields to the `pod_epoch_reclaim` line: `deleted` and `deleted_bytes`

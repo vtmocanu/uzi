@@ -994,14 +994,17 @@ workers:
   #     node root, gated behind acknowledgeNonRootlessNodeRoot (see below).
   # sysbox (runtimeClassName: sysbox-runc) remains the documented path to a
   # non-privileged tier once a cluster can run it; it is NOT installed and NOT required.
-  # One-worker epoch-reclaim deletion canary, OFF by default. The controller renders
+  # One-worker epoch-reclaim attempt-deletion canary, OFF by default. The controller renders
   # UZI_EPOCH_RECLAIM_DELETION=1 only into the pod template of the single persistent Docker
   # worker whose id equals this value; no other worker's template changes. It must be empty
   # or one lowercase UUID (no list, wildcard or padding). Clearing it takes effect at the
   # next replacement/startup of that worker. Never move it to another UUID until the prior
   # enabled incarnation is gone or off. See docs/run-recovery.md.
   epochReclaim:
-    # Scratch cleanup for persistent Docker workers; attempt deletion stays canary-only.
+    # Default-on scratch request for persistent Docker workers; strict boolean.
+    # false omits worker UZI_EPOCH_SCRATCH_DELETION after controller reconciliation.
+    # Startup-only: wait for safe replacement; ForceRoll must stay off.
+    # Supplies no attestation; empty runtime below keeps scratch. Attempt deletion stays canary-only.
     scratchDeletion: true
     deletionCanaryWorkerId: ""
   docker:
@@ -1009,8 +1012,8 @@ workers:
       # The pass runs by default and keeping trees needs no declaration: unset keeps every
       # tree (deferred / runtime_not_declared, no candidate inventory) and still participates
       # in lifetime epoch locking. Setting containerd-runc or crio-crun is
-      # the operator's attestation of the FULL audited runtime/storage contract (a future
-      # hosted-Docker deletion will require it) and is cross-checked against observations.
+      # the operator's attestation of the FULL audited runtime/storage contract required
+      # for hosted-Docker deletion, and is cross-checked against observations.
       # Attempt deletion runs only on workers.epochReclaim.deletionCanaryWorkerId;
       # scratch cleanup is controlled separately by workers.epochReclaim.scratchDeletion.
       runtime: ""

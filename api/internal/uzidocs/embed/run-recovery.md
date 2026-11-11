@@ -314,8 +314,8 @@ durable authority and is otherwise retained, for both harnesses (see
 Registered-root capture exclusion does not exclude daemon or sibling writers,
 accepted-but-invisible creates (#1860), or Claude terminal residuals; per-attempt
 cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858;
-the one gated exception, verified-epoch deletion under PRD #3431, is off in
-production, see [Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)),
+verified-epoch attempt deletion under PRD #3431 is selector-gated, default off;
+scratch reclaim is independently requested by default, see [Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)),
 and custody SETTLE and physical CLEANUP remain separate (#2746).
 Failed or uncertain capture keeps local source custody; there is no archive or
 latest-work guarantee, and loss of that worker's retained storage can lose
@@ -1391,8 +1391,8 @@ disk parks can compound retained storage (#2013/#225). The retention-only,
 non-closing #1858 change disables unsafe automatic retention reclaim on every
 worker, including abandoned attempts and crash-window live orphans, shared
 own-key residue from canonical and attempt entries, and orphaned skills.
-There is no automatic reclaim escape from that accumulation in production: the
-verified-epoch deletion code exists but is switched off (see
+Verified-epoch attempt deletion is selector-gated, default off; scratch reclaim
+is independently requested by default and does not reclaim these attempt sources (see
 [Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)).
 
 **Slice A contract (Refs #2852) (AI-synced 2026-10-22):** credential-free capture, including owner pause,
@@ -2629,7 +2629,7 @@ verified pod epoch, under the exclusive epoch lock and before it admits runs
 The evaluation is reported in the `pod_epoch_reclaim` log line. The worker image
 also contains a deletion phase that reclaims through the same discard core as the
 operator channel above. **That phase is off unless an operator opts in on exactly
-one worker: a production worker deletes nothing and settles no records by default.**
+one worker: attempt deletion settles no records and deletes no attempt trees by default.**
 The worker reads `UZI_EPOCH_RECLAIM_DELETION` once at startup, before it creates
 its pod epoch: unset, empty or `0` is off; `1` is on only for an epoch-locked,
 Docker-wired worker (`UZI_EPOCH_LOCK=1` and `DOCKER_HOST` or `UZI_DIND_SOCKET`),
@@ -2707,6 +2707,48 @@ accepted this historical-writer residual on 2026-10-24 in
 [PRD #3430](../prds/3430-pod-epoch-lock-shadow.md). It does not authorize bypassing
 a current source-use, custody, process, Docker, or epoch-lock refusal. A known or
 unverified current writer keeps the source.
+
+#### Runner TMPDIR scratch reclaim: startup disable and observation
+
+Scratch reclaim is requested by default through chart
+`workers.epochReclaim.scratchDeletion: true` (#4182), independently of the
+attempt-deletion selector below. It requires a fresh `eligible` + `attested`
+verdict; the default empty runtime declaration supplies no attestation and keeps
+scratch. The deployed worker image must contain #4171 (`7cd46526`, merged).
+No hosted proof is claimed here.
+
+To disable scratch reclaim operationally:
+
+1. Set `workers.epochReclaim.scratchDeletion: false` and keep
+   `workers.forceRoll: false`. Reconcile the updated controller configuration
+   (`UZI_WORKER_EPOCH_SCRATCH_DELETION="false"`). Global ForceRoll bypasses
+   pacing and busy deferral and can interrupt a run; keep it off.
+2. Inspect the desired, reconciled worker Deployment pod template and confirm
+   `UZI_EPOCH_SCRATCH_DELETION` is omitted. A values file or Helm render alone
+   does not prove the controller has reconciled that template.
+3. Wait for safe worker replacement through ordinary pacing, busy and custody
+   guards; a busy worker may defer indefinitely. A same-pod restart or eviction
+   from an old template can still carry `1`. Do not force replacement to obtain
+   disable evidence.
+4. Inspect the new pod, actual worker image and epoch. Record its
+   `pod_epoch_reclaim_activation` startup line with `scratch_requested: false`
+   and inspect the actual `pod_epoch_reclaim.scratch` result before claiming
+   disabled. An old worker ignoring the env is not equivalent evidence.
+
+This is a startup switch, not a hot switch: changing it cannot stop an active
+pass or restore deleted bytes. Old controllers and outside-chart deployments
+with absent env leave the phase off; rendered `1` on an old worker proves
+neither activation nor deletion.
+
+Post-release owner observation is separate from operational disable evidence,
+not a pre-enable canary or approval gate. Record the actual image, pod, epoch,
+requested state and scratch result (deleted counts, kept reasons, or fatal
+settlement). Report three separate figures: allocated-byte estimate,
+unattributed statfs free delta, and independently verified physical reclaim.
+Neither of the first two proves the third. Hosted before/after-byte acceptance
+and the owner's keep-default decision remain pending on #4043; the PRD stays
+open pending hosted acceptance. Existing mechanism protections and residuals
+are recorded in [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md).
 
 #### One-worker deletion canary checklist
 
