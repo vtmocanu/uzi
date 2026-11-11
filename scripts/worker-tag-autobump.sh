@@ -27,6 +27,8 @@
 #     agent/bin  agent/templates     agent/devbox-global     agent/codex scripts/sqlc.sh
 # (agent/codex -- the pinned Codex package lock, its install/assert scripts and the Go
 # supervisor the runtime stage builds -- was missing until #1720.)
+# The exact codex-package.adopted assertion is excluded: it records release review
+# and changes no worker execution input (#4172).
 # (A self-improve run DOES read /opt/uzi-src, but it is admin-only / off by default; if
 # that path ever needs a fresh per-release snapshot, widen AGENT_PATHS deliberately --
 # do not silently fold in the whole tree, which defeats the decoupling.)
