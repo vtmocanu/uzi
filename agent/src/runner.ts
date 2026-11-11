@@ -3034,8 +3034,9 @@ interface RunFlight {
    *  checkpoint ticks within a flight (a fresh flight after a restart re-detects, which is fine —
    *  the finalize bridge in M3 is the correctness backstop). */
   steeredTips?: Set<string>;
-  /** Restriction latch only. Never authorizes source use; launch re-reads durable proofs. */
+  /** Process-only denial fence. Never wraps or clears, including after a verified latch clear. */
   remediationDenialRevision?: number;
+  /** Restriction latch only. Never authorizes source use; launch re-reads durable proofs. */
   remediationRestrictions?: {
     roots: string[];
     /** Only bootstrap mints this provenance; absent metadata is permanently sticky. */
@@ -4253,6 +4254,7 @@ export class RunRunner {
       if (!existed) state.clearable = progress.cause === "pre_read_unavailable" && !progress.started && !flight.predecessorCapture;
       else if (progress.cause !== "pre_read_unavailable" || progress.started) state.clearable = false;
       const current = flight.remediationDenialRevision ?? 0;
+      // Never wrap or clear this denial revision; a verified clear removes only the transient latch.
       flight.remediationDenialRevision = Number.isSafeInteger(current) && current >= 0 && current < Number.MAX_SAFE_INTEGER
         ? current + 1 : -1;
       try { this.log.warn("remediation restriction read unavailable", { class: progress.cause ?? "unknown" }); }
