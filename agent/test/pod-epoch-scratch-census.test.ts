@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -224,6 +225,59 @@ test("collectEpochScratchProtectedPaths gathers bare-record and store paths", as
   fs.writeFileSync(path.join(data, "recovery", "run1", "rec.json"), JSON.stringify({ bundlePath: "/data/recovery/run1/x.bundle" }));
   const result = await cache.collectEpochScratchProtectedPaths(window());
   assert.deepEqual(result, { state: "read", paths: ["/data/recovery/run1/x.bundle", "/data/runner/slug/issue-1", "/data/runner/slug/issue-2", "/scratch/a"] });
+});
+
+for (const code of ["EACCES", "ENOENT"]) {
+  test(`protected bare enumeration refuses an lstat ${code} instead of omitting its records`, async t => {
+    const protectedPath = "/data/runner/.tmp/uzi-runner/protected-leaf";
+    const { data, cache } = cacheWithBare(t, { "uzi-recovery.agent-issue-1.clone": protectedPath });
+    assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "read", paths: [protectedPath] });
+    const bare = path.join(data, "repos", "r1.git");
+    const lstat = fsPromises.lstat.bind(fsPromises);
+    let failures = 0;
+    t.mock.method(fsPromises, "lstat", async (...args: Parameters<typeof fsPromises.lstat>) => {
+      if (args[0] === bare) { failures++; throw Object.assign(new Error("fixture bare lstat failure"), { code }); }
+      return lstat(...args);
+    });
+    assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "unknown", reason: "bare_unreadable" });
+    assert.equal(failures, 1, "the protected bare's lstat was attempted");
+    // Legacy discovery keeps its skip behaviour; only the scratch protection reader opts into strictness.
+    const legacy = cache as unknown as { retainedBares(): Promise<string[]> };
+    assert.deepEqual(await legacy.retainedBares(), []);
+    assert.equal(failures, 2);
+  });
+}
+
+for (const kind of ["file", "symlink"]) {
+  test(`protected bare enumeration refuses a non-directory ${kind} .git entry`, async t => {
+    const protectedPath = "/data/runner/.tmp/uzi-runner/protected-leaf";
+    const { data, cache } = cacheWithBare(t, { "uzi-recovery.agent-issue-1.clone": protectedPath });
+    const bare = path.join(data, "repos", "r1.git"), stray = path.join(data, "repos", "r0.git");
+    if (kind === "file") fs.writeFileSync(stray, "unexpected bare entry");
+    else fs.symlinkSync(bare, stray);
+    assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "unknown", reason: "bare_unreadable" });
+    const legacy = cache as unknown as { retainedBares(): Promise<string[]> };
+    assert.deepEqual(await legacy.retainedBares(), [bare]);
+  });
+}
+
+test("protected bare enumeration preserves an interruption at a failed lstat", async t => {
+  const { data, cache } = cacheWithBare(t);
+  const bare = path.join(data, "repos", "r1.git");
+  const stop = new AbortController();
+  const lstat = fsPromises.lstat.bind(fsPromises);
+  let reached = 0;
+  t.mock.method(fsPromises, "lstat", async (...args: Parameters<typeof fsPromises.lstat>) => {
+    if (args[0] === bare) {
+      reached++;
+      stop.abort();
+      throw Object.assign(new Error("fixture bare lstat failure"), { code: "EACCES" });
+    }
+    return lstat(...args);
+  });
+  assert.deepEqual(await cache.collectEpochScratchProtectedPaths({ signal: stop.signal, deadline: Date.now() + 60_000 }),
+    { state: "unknown", reason: "protected_aborted" });
+  assert.equal(reached, 1);
 });
 
 test("collectEpochScratchProtectedPaths is empty for a fresh volume and unknown for an uninterpretable record", async t => {

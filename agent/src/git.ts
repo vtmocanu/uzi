@@ -4510,7 +4510,7 @@ export class GitCache {
     const limits = this.epochLimits();
     const outcome = async (): Promise<ProtectedPathsRead> => {
       let configBytes = 0;
-      for (const bare of await this.retainedBares()) {
+      for (const bare of await this.retainedBares(undefined, { strict: true })) {
         this.checkRecoveryInterruption();
         const refused = await this.withLock(bare, async (): Promise<ProtectedPathsRead | undefined> => {
           await this.assertRecoveryBare(bare);
@@ -13663,9 +13663,10 @@ export class GitCache {
     }
   }
 
-  /** The worker's bares, or just `only`. A non-bare entry is skipped; a bare that cannot be read is
-   *  reported by the caller. */
-  private async retainedBares(only?: string): Promise<string[]> {
+  /** The worker's bares, or just `only`. Legacy callers skip unreadable or non-directory candidates.
+   * Scratch protection uses strict enumeration: omitting any `.git` candidate would make its record
+   * census incomplete, so a failed lstat, symlink or other non-directory refuses the entire scan. */
+  private async retainedBares(only?: string, opts: { strict?: boolean } = {}): Promise<string[]> {
     if (only !== undefined) return [only];
     let names: string[];
     try {
@@ -13678,14 +13679,15 @@ export class GitCache {
     for (const name of names.sort()) {
       if (!name.endsWith(".git")) continue;
       const p = path.join(this.reposRoot, name);
-      const st = await this.retainedIO(() => fs.lstat(p)).catch(() => {
+      const st = await this.retainedIO(() => fs.lstat(p)).catch((err: unknown) => {
         this.checkRecoveryInterruption();
+        if (opts.strict) throw err;
         return undefined;
       });
       if (st?.isDirectory() && !st.isSymbolicLink()) {
         if (out.length >= (this.epochRetained.getStore()?.maxBares ?? Infinity)) throw this.retainedCause(new Error("epoch bare limit"), "bare_cap");
         out.push(p);
-      }
+      } else if (opts.strict) throw new Error("scratch protection requires plain bare directories");
     }
     return out;
   }
