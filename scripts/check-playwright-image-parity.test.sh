@@ -48,6 +48,22 @@ $PW"
 check otherjob 2 "      image: ubuntu:24.04" "$PW" "$IMG"
 check onlyother 2 "      options: --ipc=host" "$PW" "$IMG"
 check bothjobs 0 "$IMG" "$PW" "$IMG"
+# Only container.image counts: a step's with.image or a services image is not it.
+check stepimg 2 "      options: --ipc=host
+    steps:
+      - uses: example/action@v1
+        with:
+          image: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:$D" "$PW"
+check service 2 "      options: --ipc=host
+    services:
+      pw:
+        image: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:$D" "$PW"
+check withsteps 0 "$IMG
+      options: --ipc=host
+    steps:
+      - uses: example/action@v1
+        with:
+          image: ubuntu:24.04" "$PW"
 # @vitest/browser-playwright must not count as the playwright pin.
 check vitestpw 0 "$IMG" '    "@vitest/browser-playwright": "4.1.12",
     "playwright": "1.64.1"'

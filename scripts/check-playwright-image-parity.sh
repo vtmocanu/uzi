@@ -21,18 +21,18 @@ pkg=${2:-web/package.json}
 repo=mcr.microsoft.com/playwright
 
 # Only jobs.test-web-browser.container.image counts: the job block runs from its
-# two-space key to the next two-space key. Exactly one `image:` line may sit in it,
-# and it must be the Playwright image, so a matching image in another job cannot
-# read as parity.
+# two-space key to the next two-space key, and the container block from its
+# four-space `container:` key to the next four-space key. Exactly one six-space
+# `image:` may sit there, and it must be the Playwright image, so an image in another
+# job or in a step's `with:` cannot read as parity.
 image=$(awk -v repo="$repo" '
-  /^  [^ #]/ { injob = ($0 ~ /^  test-web-browser:[ \t]*$/) }
-  injob {
-    line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
-    if (index(line, "image:") == 1) {
-      n++; ref = substr(line, 7); sub(/^[ \t]+/, "", ref)
-      if (index(ref, repo ":") != 1) exit 1
-      v = substr(ref, length(repo) + 2)
-    }
+  /^  [^ #]/ { injob = ($0 ~ /^  test-web-browser:[ \t]*$/); incont = 0; next }
+  injob && /^    [^ #]/ { incont = ($0 ~ /^    container:[ \t]*$/); next }
+  injob && incont && /^      image:/ {
+    ref = $0; sub(/^      image:[ \t]*/, "", ref); sub(/[ \t]+$/, "", ref)
+    n++
+    if (index(ref, repo ":") != 1) exit 1
+    v = substr(ref, length(repo) + 2)
   }
   END {
     if (n != 1) exit 1
@@ -40,7 +40,7 @@ image=$(awk -v repo="$repo" '
     if (length(v) - index(v, "@sha256:") - 7 != 64) exit 1
     print v
   }' "$ci") || {
-  echo "check-playwright-image-parity: expected exactly one 'image: $repo:v<x.y.z>-<distro>@sha256:<64 hex>' line in $ci's test-web-browser job" >&2
+  echo "check-playwright-image-parity: expected exactly one 'image: $repo:v<x.y.z>-<distro>@sha256:<64 hex>' line under $ci's jobs.test-web-browser.container" >&2
   exit 2
 }
 
