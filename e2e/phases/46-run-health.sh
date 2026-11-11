@@ -57,7 +57,7 @@ done
 [ "$H47_CAP" = 3 ] || fail "worker did not advertise max_concurrent_runs=3 after recreate (got ${H47_CAP:-none})"
 pass "worker back online advertising cap 3 (room for three concurrent health legs)"
 
-# All three simultaneous legs must fit under the owner custody admission limit.
+# All three simultaneous legs must fit under the owner custody admission limit (admission units, #4162).
 # Wait for final settlement without discarding cross-phase archives or source-only holds.
 wait_custody_headroom "$H47_CAP"
 

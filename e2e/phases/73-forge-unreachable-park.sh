@@ -261,8 +261,14 @@ ADMISSION_B="$(apiget /api/recovery/holds)"
 printf '%s' "$ADMISSION_B" | jq -e '.aggregate | [.admission_counted_holds,.custody_hold_limit]
   | all(.[]; type=="number" and .>=0 and .==floor)' >/dev/null \
   || fail "invalid custody admission aggregate: $ADMISSION_B"
-if printf '%s' "$ADMISSION_B" | jq -e '.aggregate | .custody_hold_limit==0
-    or (.custody_hold_limit>1 and .admission_counted_holds+1<=.custody_hold_limit)' >/dev/null; then
+# Issue #4162: admission is counted in units (a run's same-worker holds count once), and a
+# run whose own open holds reach the limit is refused by the hard per-run bound, so the
+# execution branch also needs RUN_B's own open holds below the limit.
+OWN_B="$(db_psql "SELECT count(*) FROM recovery_custody_holds WHERE run_id='$RUN_B' AND state='open'")"
+[[ "$OWN_B" =~ ^[0-9]+$ ]] || fail "invalid own open hold count for $RUN_B: $OWN_B"
+if printf '%s' "$ADMISSION_B" | jq -e --argjson own "$OWN_B" '.aggregate | .custody_hold_limit==0
+    or (.custody_hold_limit>1 and .admission_counted_holds+1<=.custody_hold_limit
+        and $own<.custody_hold_limit)' >/dev/null; then
   wait_eq true 900 "forge resumed ordinary attempt" forge_attempt_ready "$RUN_B" "$PARK_GENERATION_B"
   BEFORE_REHOLD_B="$(forge_park_posture "$RUN_B")"
   wait_eq true 150 "forge owner rehold" forge_owner_hold_ready "$RUN_B"

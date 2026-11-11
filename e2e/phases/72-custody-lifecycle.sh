@@ -23,8 +23,8 @@
 # SQL in isolation (the store-level version is api/internal/store/recovery_exact_livedb_test.go
 # and api/internal/workersvc/claim_custody_livedb_test.go). It:
 #
-#   WEDGE   — seeds the owner with LIMIT open holds of its own, so admission-counted
-#             holds are at or above the limit independent of baseline settlement (an
+#   WEDGE   — seeds the owner with LIMIT open holds of its own, so admission units
+#             (admission_counted_holds, #4162) are at or above the limit independent of baseline settlement (an
 #             idle worker opens no new claim holds, so the baseline can only shrink as
 #             earlier phases' holds settle). It creates a code run, and shows it
 #             stays QUEUED with online + idle worker samples while
@@ -55,7 +55,7 @@
 #   same-worker two-generation release (M4) ....... api/internal/workersvc/custody_multihold_livedb_test.go
 #                                                    (TestSetStateCompletedSameWorkerMultiGenReleasesOnlyCurrentLiveDB)
 #   generation-exact reserve/release (M1/M4) ...... api/internal/recovery/reserve_release_generation_livedb_test.go
-#   default-limit (8) admission-counted holds block a claim (M1) api/internal/store/recovery_exact_livedb_test.go,
+#   default-limit (8) admission units block a claim (M1) api/internal/store/recovery_exact_livedb_test.go,
 #                                                    api/internal/workersvc/claim_custody_livedb_test.go,
 #                                                    api/internal/workersvc/claim_custody_limit_setting_livedb_test.go
 #                                                    (exact boundaries: blocked at the limit, admitted
@@ -166,7 +166,8 @@ pass "preconditions: worker sampled online + idle at entry, owner has $C0 baseli
 # abruptly-lost, capture-less sources sit 'open' awaiting an owner decision, and how
 # api/internal/store/recovery_exact_livedb_test.go seeds the same admission fixture.
 # live_worker_id/live_run_id stay NULL (no FK dependency), so ADR-2445 keeps every
-# seed admission-counted: no seed proves an exact healthy live current-generation claim.
+# seed a separate counted admission unit (null live ids never form a same-run group, #4162):
+# no seed proves an exact healthy live current-generation claim.
 # Each row gets a distinct generation. run_id is a plain column here: real owned run ids
 # are attached to the holds that get discarded, below.
 NEED=$LIMIT
@@ -224,7 +225,8 @@ pass "wedge reproduced: run $WEDGE_RUN stayed queued for ${NEG_WINDOW}s (worker 
 # The server's OWN custody-block signal: blocked_runs counts the owner's queued
 # non-exempt code-publishing runs when admission_counted_holds >= the limit
 # (recovery.sql GetCustodyAggregateForOwner, the same accounting ClaimRun and health.go's
-# reasonCustodyLimit use). Continuation's own-hold bound still uses total open holds.
+# reasonCustodyLimit use). Continuation's own-hold bound still uses total open holds, and since
+# #4162 a run at its own limit is a hard bound (blocked_runs counts it even below the owner limit).
 # >= 1 here establishes the server-observed custody block; the worker checks
 # establish online + idle only at the sampled boundaries.
 BLOCKED="$(apiget /api/recovery/holds | jq -r '.aggregate.blocked_runs')"

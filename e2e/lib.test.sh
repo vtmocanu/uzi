@@ -1770,7 +1770,7 @@ for mode in entry window discard idle; do
 done
 
 # Stateful gate model driving the REAL phase end to end (no cutoff). The model is a set of
-# files (mocks run inside command substitutions): baseline holds B (all admission-counted),
+# files (mocks run inside command substitutions): baseline holds B (each its own admission unit),
 # the seeds the phase inserted, how many were attached/discarded. The fake claim loop admits
 # the wedge run iff counted = B + undiscarded seeds < 8, and wait_status FAILS unless the
 # model says the run was claimed, so a phase that discards too few holds cannot pass.

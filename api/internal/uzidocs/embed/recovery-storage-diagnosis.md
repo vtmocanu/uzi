@@ -28,7 +28,7 @@ still need reproduction. A subsequent per-owner override to 4 GiB and an
 unchanged 4 GiB instance quota are operator-reported mitigation facts.
 Those reports do not identify the rejecting branch: the shared budget,
 other owners, reservations, capture counts and bind-time checks also matter.
-Admission-counted `needs_action` quota holds can coexist with `source_only`
+Open `needs_action` quota holds can coexist with `source_only`
 holds; the exact share remains unknown.
 
 This diagnosis changes no quota, expiry, custody or bundle policy.
@@ -361,12 +361,12 @@ ORDER BY h.run_id, h.generation, h.id;
 ROLLBACK;
 ```
 
-`total_open` is custody, not the admission count.
+`total_open` is custody, not the admission count; `admission_counted` is admission units (a run's earlier generations on one original worker count once).
 [GetCustodyAggregateForOwner](../api/internal/store/queries/recovery.sql)
 uses `fn_custody_admission_count(owner, heartbeat_cutoff)`; the
 [function](../api/internal/store/migrations/00310_custody_admission_count.sql)
 discounts at most one qualifying healthy current-claim hold per run,
-with no owner-decision attention. Unknown evidence remains counted.
+with no owner-decision attention. Since #4162 (migration 00424, which replaces the function body) the remaining holds that are group-eligible count once per run and original worker, and the rest count singly. Unknown evidence remains counted.
 Quota-linked rows do not establish which individual holds are discounted or
 the exact proportion of admission pressure caused by quota.
 
@@ -450,7 +450,7 @@ not a reproduction on the operator's deployment.
 > [pending]; historical/current effective owner, instance, shared and
 > count limits [pending]; excluded-capture owner/global recovery bytes,
 > job reservations, reclaim allowance and verified bundle bytes [pending];
-> total-open versus admission-counted holds and quota-linked subset
+> total-open versus admission units and quota-linked subset
 > [pending]. Quota `needs_action` and source-only custody coexist;
 > their exact share is unknown.
 >
