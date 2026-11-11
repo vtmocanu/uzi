@@ -4520,8 +4520,9 @@ export class GitCache {
             const nl = item.indexOf("\n");
             const key = nl < 0 ? item : item.slice(0, nl);
             if (!key.startsWith("uzi-")) continue;
-            // A valueless key is a boolean-true entry in git config, not a record value.
-            if (nl < 0) continue;
+            // A valueless record is not a cleared value: other protection readers treat it as
+            // undecodable. Refuse every valueless uzi-* key rather than silently omitting one.
+            if (nl < 0) return { state: "unknown", reason: "bare_value_unparseable" };
             if (absorbBareConfigValue(key, item.slice(nl + 1), sink) !== "ok") return { state: "unknown", reason: "bare_value_unparseable" };
           }
           return undefined;

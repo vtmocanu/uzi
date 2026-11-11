@@ -287,6 +287,27 @@ test("collectEpochScratchProtectedPaths is empty for a fresh volume and unknown 
   assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "unknown", reason: "bare_value_unparseable" });
 });
 
+for (const [family, section, key] of [
+  ["restore", 'uzi-restore "agent/issue-1"', "journal"],
+  ["retained", 'uzi-retained "run1"', "journal"],
+  ["other uzi", 'uzi-unknown "key"', "enabled"],
+] as const) {
+  test(`scratch protection refuses a valueless ${family} key`, async t => {
+    const { data, cache } = cacheWithBare(t);
+    fs.appendFileSync(path.join(data, "repos", "r1.git", "config"), `\n[${section}]\n\t${key}\n`);
+    assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "unknown", reason: "bare_value_unparseable" });
+  });
+}
+
+for (const section of ['uzi-restore "agent/issue-1"', 'uzi-retained "run1"']) {
+  test(`scratch protection accepts an explicit empty cleared value in ${section}`, async t => {
+    const kept = "/data/runner/.tmp/uzi-runner/protected-leaf";
+    const { data, cache } = cacheWithBare(t, { "uzi-recovery.agent-issue-1.clone": kept });
+    fs.appendFileSync(path.join(data, "repos", "r1.git", "config"), `\n[${section}]\n\tjournal =\n`);
+    assert.deepEqual(await cache.collectEpochScratchProtectedPaths(window()), { state: "read", paths: [kept] });
+  });
+}
+
 test("collectEpochScratchProtectedPaths surfaces a malformed store, an abort and a spent deadline", async t => {
   const { data, cache } = cacheWithBare(t);
   fs.mkdirSync(path.join(data, "recovery-settlement"), { recursive: true });
