@@ -433,6 +433,7 @@ tasks:
       # so it belongs in gate:repo.
       - task: check:mktemp-portability
       - task: check:postgres-pin-parity
+      - task: check:playwright-image-parity
       # Over-cap SKILL.md guard: a repo skill whose SKILL.md exceeds the 65536-byte
       # runtime cap is dropped silently at run time (agent/src/repo-skills.ts:151), so it
       # looks committed but never loads. Sub-second, offline, tree-fact -- runs before
@@ -1555,6 +1556,13 @@ tasks:
       # ci.yml pulls postgres through mirror.gcr.io (#2621), so Renovate sees two packages;
       # renovate.json groups them (#2622) and this fails the gate if they still drift.
       - ./scripts/check-postgres-pin-parity.test.sh
+
+  check:playwright-image-parity:
+    desc: test-web-browser's Playwright image tag matches web's playwright npm pin, with hermetic 0/1/2 fixtures
+    cmds:
+      # The image bakes browsers for one Playwright release; npm ci installs web's pin.
+      # renovate.json groups them and this fails the gate if they still drift.
+      - ./scripts/check-playwright-image-parity.test.sh
 
   check:mktemp-portability:
     desc: no tracked *.sh carries a `mktemp -t <name>` template with too few X's (dies on GNU coreutils), with a canary proving the detector fired
@@ -2805,8 +2813,9 @@ tasks:
       # web/vitest.browser.config.ts. A uzi worker uses its prebaked Chromium, found on disk
       # by that config. Elsewhere the browser is NOT fetched here (a gate does not hit the
       # network): a missing one exits 1 with Playwright's "Executable doesn't exist" banner.
-      # Fix with `npx playwright install chromium`, once, from web/. CI installs it in its
-      # own step. UZI_WEB_BROWSER_CHROMIUM=<path> runs any other Chromium instead.
+      # Fix with `npx playwright install chromium`, once, from web/. CI runs this job in
+      # Playwright's image, which ships it. UZI_WEB_BROWSER_CHROMIUM=<path> runs any other
+      # Chromium instead.
       - npm run test:browser
 
   # ----------------------------------------------------------- agent (npm) ----
