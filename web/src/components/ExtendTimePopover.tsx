@@ -13,7 +13,8 @@
 // panel degrades honestly to "extensions are turned off" rather than offering a Confirm that
 // would 409.
 //
-// Issue #4179: "turned off" is ONLY for a 0 cap. A wall park (paused, hold_reason
+// Issue #4179: "turned off" is ONLY for a 0 (or missing) cap; RunView hides the trigger when the
+// cap is unknown. A wall park (paused, hold_reason
 // 'budget_exhausted') with no budget figures on the wire, an interactive task the worker parked
 // at its per-follow-up time limit, still gets the chooser: the server routes its extend to
 // ExtendAndResumeWallPark, which adds the time and resumes the run. Any other run without

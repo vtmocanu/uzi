@@ -552,11 +552,13 @@ A few worth knowing:
   least 60 seconds (the server's minimum), so `0`, anything under a minute, a
   negative value, or an unparseable one is a usage error (exit 2). Valid on any non-terminal run
   of a kind the sweep can time out (issue, task, prompt, self-improve,
-  mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
-  interactive-task run never times out, so extending one is a 409 (exit 5),
-  except an interactive task its worker parked at its time limit (`paused`,
-  `hold_reason: budget_exhausted`): extend gives it the time and resumes it,
-  like any run parked there.
+  mr-rework, ci-fix), including a queued or parked one. A chat or judge
+  run, or an interactive task's session, has no server wall deadline, so
+  extending one is a 409 (exit 5), with one exception: the worker bounds each
+  follow-up of an interactive task with its wall budget and parks a follow-up
+  that uses it up (`paused`, `hold_reason: budget_exhausted`), and extend adds
+  the time to such a parked task and resumes it. No server deadline is
+  reported for an interactive run, so none is printed.
   `--by` is limited per request by the admin's maximum per extension
   (default 16h), not per run: you may extend the same run repeatedly, and
   each extension is an audited action. A request above that maximum, a

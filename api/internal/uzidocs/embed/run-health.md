@@ -207,11 +207,14 @@ the worker. A later `RUN_TIMEOUT` increase above 72h can raise the served
 total for a run with no frozen wall; that larger total is honored without
 clamping. The worker schedules long relative deadlines in chunks within the
 native timer range, so exceeding that range no longer fires the timer at
-once. Chat, judge and interactive-task runs never time out, so extending
-one is refused, and a job is never extended. The exception is an
-interactive task its worker parked at its time limit (`hold_reason:
-budget_exhausted`): extending it adds the time and resumes it, from the web
-or the CLI, like any [run that ran out of time](#running-out-of-time).
+once. A chat or judge run, or an interactive task's session, has no server
+wall deadline, so extending one is refused, and a job is never extended.
+The one exception: the worker bounds each follow-up of an interactive task
+with its wall budget and parks a follow-up that uses it up (`hold_reason:
+budget_exhausted`), and extending such a parked task adds the time and
+resumes it, from the web or the CLI, like any [run that ran out of
+time](#running-out-of-time). No server deadline is reported for an
+interactive run, so none is shown or printed afterwards.
 
 ## Running out of time
 
