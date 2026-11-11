@@ -8,11 +8,11 @@
 # requires: UZI_WORKER_TOKEN
 # provides: -
 # handoff:  -
-# mutates: owner autopilot disabled; group/repo2 enabled; agent cap 2; creates cap-test runs; wires the DinD sidecar for the cap-2 and kill scenarios when the stack is not already wired (starts dind/dind-init, appends UZI_DIND_SOCKET to $ENVFILE, force-recreates agent); a fresh canonical-control run is killed, refused and cancelled after the posture is restored
-# restores: owner autopilot stays disabled to isolate later phases; repo2 stays enabled and agent stays at cap 2 for the next phase; the entry Docker posture (docker_restore_posture: stops and removes only the sidecar services this phase started, removes only the env line it appended, then force-recreates agent and asserts it unwired; nothing changes when the stack was already wired); open custody holds left <= the entry census E45, after the declared owner discards (resolve_fixture_source_hold) of the killed predecessors' generation-1 holds of runs KA and KB and of both generations of the canonical control run C; every hold this phase opens is individually released (completion receipt), awaited to its archive release (a hold with an available capture) or discarded, so phases 72 and 74 see no custody residue from this phase under the unchanged custody limit 8
+# mutates: owner autopilot disabled; group/repo2 enabled; agent cap 2; enables reserved restore45a/restore45b for KA/KB; creates cap-test runs; wires the DinD sidecar for the cap-2 and kill scenarios when the stack is not already wired (starts dind/dind-init, appends UZI_DIND_SOCKET to $ENVFILE, force-recreates agent); a fresh canonical-control run is killed, refused and cancelled after the posture is restored
+# restores: owner autopilot stays disabled to isolate later phases; reserved restore45a/restore45b return to disabled (including EXIT); repo2 stays enabled and agent stays at cap 2 for the next phase; the entry Docker posture (docker_restore_posture: stops and removes only the sidecar services this phase started, removes only the env line it appended, then force-recreates agent and asserts it unwired; nothing changes when the stack was already wired); open custody holds left <= the entry census E45, after the declared owner discards (resolve_fixture_source_hold) of the killed predecessors' generation-1 holds of runs KA and KB and of both generations of the canonical control run C; every hold this phase opens is individually released (completion receipt), awaited to its archive release (a hold with an available capture) or discarded, so phases 72 and 74 see no custody residue from this phase under the unchanged custody limit 8
 # custody:  holds are counted relative to E45, the open_holds census taken at phase entry (log_hold_census "phase 45 entry"). Each accepted claim generation opens ONE hold. admission_counted_holds (ADR-2445) = open holds minus at most one hold per run that is live and healthy at its current generation; every other open hold counts, including a terminal or killed run's hold, a run in recovery_wait, and a restored run's predecessor-generation hold, which stays open until its declared discard. wait_custody_headroom N asks for counted + N <= limit (8) before N NEW initial claims; a restore claim is a continuation (1-7 own holds) and needs none.
 #   A, B (repo, repo2; one claim each): +2 open while live at the gate, +0 counted; the entry headroom wait reserves 2. Completion releases both holds, awaited by wait_completed_custody_receipt before the kill scenario: back to E45. Peak E45+2 open.
-#   KA, KB (headroom 2 re-reserved first; generation 1 killed by the agent SIGKILL, restored by one successor claim at generation 2, asserted original+1, no extra park or generation): after the kill each run's generation-1 hold counts, E45+2 open and +2 counted; after the restore each run holds generation 1 (counted, kept) and generation 2 (live, excluded): peak E45+4 open, +2 counted. Completion releases the two generation-2 holds (receipt awaited): E45+2. resolve_fixture_source_hold then discards generation 1 of KA and of KB: E45+0 (a hold with an available capture is instead awaited to its archive release, never discarded).
+#   KA, KB (restore45a/restore45b, isolated unused bares; headroom 2 re-reserved first; generation 1 killed by the agent SIGKILL, restored by one successor claim at generation 2, asserted original+1, no extra park or generation): after the kill each run's generation-1 hold counts, E45+2 open and +2 counted; after the restore each run holds generation 1 (counted, kept) and generation 2 (live, excluded): peak E45+4 open, +2 counted. Completion releases the two generation-2 holds (receipt awaited): E45+2. resolve_fixture_source_hold then discards generation 1 of KA and of KB: E45+0 (a hold with an available capture is instead awaited to its archive release, never discarded).
 #   C canonical control (docker_restore_posture first; headroom 1): generation 1 +1 open; after the kill the canonical-shaped predecessor is not restored, the generation-2 claim is refused into recovery_wait and neither hold is live: +2 open, +2 counted. Owner Cancel keeps both; resolve_fixture_source_hold discards generation 1 and generation 2 (GEN_C_ORIGINAL, +1): E45+0.
 #   Phase peak E45+4 open (KA and KB restored at the gate), at most +2 counted from this phase's own runs; exit bound: assert_hold_count_le "phase 45 exit" E45, so every hold this phase opened is released by receipt or discarded by the declared discards. The bound is <= rather than = because earlier phases' holds may settle meanwhile.
 # =============================================================================
@@ -88,7 +88,13 @@ else
   # and appends UZI_DIND_SOCKET; this recreate is the one that picks it up) and assert it right after.
   # The trap restores the entry posture if the phase ends (fails) before its normal docker_restore_posture;
   # it is a no-op once that has run, and never changes the phase's exit status.
-  trap docker_wire_exit_restore EXIT
+  restore_cap2_fixture_state() {
+    local rc=$?
+    docker_wire_exit_restore "$rc" || true
+    restore_fixture_repo_states || { [ "$rc" != 0 ] || rc=1; }
+    return "$rc"
+  }
+  trap restore_cap2_fixture_state EXIT
   docker_wire_prepare
   printf 'UZI_E2E_MAX_CONCURRENT_RUNS=2\n' >> "$ENVFILE"
   capture_agent_logs 45-bounded-concurrency before-recreate-cap2
@@ -180,29 +186,13 @@ else
   # Each branch landed on its OWN repo's bare — proving the two runs used
   # independent git caches (repo2's branch is NOT in repo1's bare, and vice versa).
   #
-  # This REMOTE-bare independence check holds only for the default (insteadOf) transport,
-  # where repo.git and repo2.git are two distinct local bares. Under E2E_GIT_SMART_HTTP
-  # forge-fake routes EVERY repo path onto the ONE shared bare (forge-fake.mjs
-  # PATH_INFO=/repo.git${rest}), so both branches necessarily land on repo.git and this
-  # check is unsatisfiable by construction — the pre-#97-M1 opt-in smart-HTTP full run was
-  # already red here (PRD #97 M1 confirm-and-fix). The WORKER-side cache independence — the
-  # actual #42 property — still holds under smart-HTTP (repo and repo2 have DISTINCT clone
-  # URLs ⇒ distinct worker bare dirs, no per-repo GitCache lock shared) and is proven by the
-  # concurrency asserts above (both parked at once on the one worker) plus the per-project
-  # MR attribution below. So gate the remote-bare check to the default transport; under
-  # smart-HTTP assert only that both branches reached the shared bare.
-  if [ -z "${E2E_GIT_SMART_HTTP:-}" ]; then
-    git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
-      || fail "run A branch not on the repo1 bare"
-    git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-      || fail "run B branch not on the repo2 bare (independent bare-cache check)"
-    git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-      && fail "run B's branch leaked into the repo1 bare (caches not independent)"
-  else
-    git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
-      || fail "run A branch not on the shared smart-HTTP bare"
-    git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-      || fail "run B branch not on the shared smart-HTTP bare (forge-fake collapses repo/repo2 — see comment)"
+  # Both transports now resolve each project to its own upstream bare as well as its own worker cache.
+  git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
+    || fail "run A branch not on the repo1 bare"
+  git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
+    || fail "run B branch not on the repo2 bare"
+  if git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B"; then
+    fail "run B's branch leaked into the repo1 bare"
   fi
   FS="$(fake_state)"
   [ "$(echo "$FS" | jq --arg b "agent/issue-$IID_A" '[.mrs[]|select(.source_branch==$b)]|length')" -ge 1 ] \
@@ -210,7 +200,7 @@ else
   # The repo2 MR is attributed to project 2 (the multi-project fake resolves :id).
   [ "$(echo "$FS" | jq --arg b "agent/issue-$IID_B" '[.mrs[]|select(.source_branch==$b)][-1].project_id')" = 2 ] \
     || fail "run B's MR not attributed to forge project 2 (group/repo2)"
-  if [ -z "${E2E_GIT_SMART_HTTP:-}" ]; then bare_note="each on its own independent bare"; else bare_note="both on the one shared smart-HTTP bare"; fi
+  bare_note="each on its own independent bare (both transports)"
   pass "both runs completed: MRs !$MRA (repo) + !$MRB (repo2, project 2), $bare_note"
 
   # --- (e) mid-run SIGKILL → sweeper re-queues BOTH (N=2) → restart completes ---
@@ -220,12 +210,16 @@ else
   # api recreate — 15s is still 3× the 5s heartbeat, so a LIVE worker is never spuriously swept.
 
   wait_custody_headroom 2
-  IID_KA="$(apipost "/api/repos/$REPO_ID/issues" \
+  enable_restore_fixture_repo restore45a || fail "could not enable isolated restore fixture A"
+  RESTORE45_A_ID="$RESTORE_FIXTURE_REPO_ID"
+  enable_restore_fixture_repo restore45b || fail "could not enable isolated restore fixture B"
+  RESTORE45_B_ID="$RESTORE_FIXTURE_REPO_ID"
+  IID_KA="$(apipost "/api/repos/$RESTORE45_A_ID/issues" \
     '{"title":"E2E cap2 kill A","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
-  IID_KB="$(apipost "/api/repos/$REPO2_ID/issues" \
+  IID_KB="$(apipost "/api/repos/$RESTORE45_B_ID/issues" \
     '{"title":"E2E cap2 kill B","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
-  RUN_KA="$(create_run "$REPO_ID" "$IID_KA")" || fail "cap2 kill-scenario run A run-create failed (non-transient; see stderr)"
-  RUN_KB="$(create_run "$REPO2_ID" "$IID_KB")" || fail "cap2 kill-scenario run B run-create failed (non-transient; see stderr)"
+  RUN_KA="$(create_run "$RESTORE45_A_ID" "$IID_KA")" || fail "cap2 kill-scenario run A run-create failed (non-transient; see stderr)"
+  RUN_KB="$(create_run "$RESTORE45_B_ID" "$IID_KB")" || fail "cap2 kill-scenario run B run-create failed (non-transient; see stderr)"
   { [ -n "$RUN_KA" ] && [ "$RUN_KA" != null ] && [ -n "$RUN_KB" ] && [ "$RUN_KB" != null ]; } \
     || fail "the two kill-scenario runs were not created"
   wait_status "$RUN_KA" awaiting_approval
@@ -282,7 +276,11 @@ else
   MRKA="$(echo "$FKA" | jq -r '.run.mr_iid')"; MRKB="$(echo "$FKB" | jq -r '.run.mr_iid')"
   { [ "$MRKA" != null ] && [ "$MRKA" -gt 0 ] && [ "$MRKB" != null ] && [ "$MRKB" -gt 0 ]; } \
     || fail "re-queued runs must still land their MRs after the restart (got A=$MRKA B=$MRKB)"
-  pass "both re-queued runs completed after restart (requeue_count>=1), MRs !$MRKA + !$MRKB"
+  git --git-dir="$RUNROOT/fakeremote/restore45a.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_KA" \
+    || fail "run KA did not publish to its isolated bare"
+  git --git-dir="$RUNROOT/fakeremote/restore45b.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_KB" \
+    || fail "run KB did not publish to its isolated bare"
+  pass "both re-queued runs completed after restart on restore45a/restore45b (requeue_count>=1), MRs !$MRKA + !$MRKB"
   # The successor generation's own custody hold is released at completion: observe that, per run.
   wait_completed_custody_receipt "$RUN_KA"
   wait_completed_custody_receipt "$RUN_KB"
@@ -328,4 +326,5 @@ else
   resolve_fixture_source_hold "$RUN_C" "$((GEN_C_ORIGINAL + 1))"
   log_hold_census "after phase 45"
   assert_hold_count_le "phase 45 exit" "$E45"
+  restore_fixture_repo_states || fail "phase 45: isolated fixture repo state was not restored"
 fi

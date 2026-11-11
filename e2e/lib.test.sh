@@ -3106,6 +3106,7 @@ dw_case "hold census helpers: baseline, run attribution and open-hold gates" cen
 dw_case "predecessor shape: attempt-shaped vs exactly {runId, clonePath}" p-shape
 dw_case "canonical refusal: one successor claim, no seed, frozen log and feed, recovery_wait/adoption-failed" refusal
 
+bash "$ROOT/e2e/restore-fixtures.test.sh"
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"
