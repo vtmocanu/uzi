@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 	"time"
+
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -43,6 +46,69 @@ func TestSpendLimitHoldLineNotSwitchable(t *testing.T) {
 		if !strings.Contains(line, "uzi run resume r1") || !strings.Contains(line, "uzi run cancel r1") {
 			t.Errorf("%s: lacks Resume/Cancel: %q", kind, line)
 		}
+	}
+}
+
+func TestSpendLimitHoldLineExact(t *testing.T) {
+	base := "Anthropic API spend limit reached · Resume uses this run's current credential selection. " +
+		"If it still selects the capped token, raise the limit first: uzi run resume r1"
+	cancel := " · Cancel: uzi run cancel r1"
+	switchable := base + " · To choose another token now: uzi token list, then uzi run set-token r1 <label>" + cancel
+	if got := spendLimitHoldLine(spendRun("issue", statusRecoveryWait)); got != switchable {
+		t.Errorf("switchable line:\n got %q\nwant %q", got, switchable)
+	}
+	if got := spendLimitHoldLine(spendRun("job", statusRecoveryWait)); got != base+cancel {
+		t.Errorf("non-switchable line:\n got %q\nwant %q", got, base+cancel)
+	}
+}
+
+func TestRunLogsFollowSpendLimitHoldNotice(t *testing.T) {
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+	old := logsPollInterval
+	logsPollInterval = time.Millisecond
+	defer func() { logsPollInterval = old }()
+
+	held := spendRun("issue", statusRecoveryWait)
+	pf := &codexParkFake{
+		FakeClient: &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+			"r1": {{Seq: 1, Kind: "assistant", Payload: []byte(`{"text":"hi"}`)}},
+		}},
+		seq: []apitypes.RunDTO{{ID: "r1", Status: "running"}, held, held, held, {ID: "r1", Status: "completed"}},
+	}
+	var out, errBuf bytes.Buffer
+	env := fakeEnv(pf)
+	env.Stdout, env.Stderr = &out, &errBuf
+	done := make(chan int, 1)
+	go func() { done <- Main(env, []string{"run", "logs", "r1", "--follow"}) }()
+	select {
+	case code := <-done:
+		if code != uzicli.ExitOK {
+			t.Fatalf("--follow exit = %d, want 0", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run logs --follow hung on a spend-limit hold")
+	}
+	stderr := errBuf.String()
+	want := "run r1 " + spendLimitHoldLine(held) + "\n"
+	if n := strings.Count(stderr, want); n != 1 {
+		t.Errorf("hold line appeared %d times, want exactly 1:\n%s", n, stderr)
+	}
+	if strings.Contains(stderr, "transient interruption") {
+		t.Errorf("spend-limit hold got the transient-recovery wording:\n%s", stderr)
+	}
+}
+
+func TestSpendLimitHoldBoardRow(t *testing.T) {
+	r := spendRun("issue", statusRecoveryWait)
+	row := apitypes.RunListItemDTO{RunDTO: r}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m.width = 200
+	if word := m.pal.runStateToken(r, false).word; word != "spend limit" {
+		t.Errorf("state token word = %q, want %q", word, "spend limit")
+	}
+	if got := stripANSI(m.boardSecondLine(row)); !strings.Contains(got, "Spend limit · Resume/Cancel · detail: enter") {
+		t.Errorf("board second line = %q", got)
 	}
 }
 
@@ -93,6 +159,17 @@ func TestSpendLimitHoldRenders(t *testing.T) {
 	assertNoRawControls(t, "spend limit", raw)
 	if out := stripANSI(raw); !strings.Contains(out, "Anthropic API spend limit reached") || !strings.Contains(out, "uzi run resume r1") {
 		t.Errorf("TUI detail lacks the hold:\n%s", out)
+	}
+	for _, kind := range []string{"issue", "job"} {
+		for _, width := range []int{60, 80, 200} {
+			kr := spendRun(kind, statusRecoveryWait)
+			dm := applyDetail(tuiTestModel(t, &uzicli.FakeClient{}, kr.ID), kr, nil)
+			dm = step(dm, tea.WindowSizeMsg{Width: width, Height: 30})
+			frame := stripANSI(dm.View().Content)
+			if n := len(strings.Split(frame, "\n")); n != dm.height {
+				t.Errorf("%s width %d frame height: %d want %d", kind, width, n, dm.height)
+			}
+		}
 	}
 	stale := apitypes.RunListItemDTO{RunDTO: spendRun("issue", "queued")}
 	if runBandOf(stale) == bandNeedsYou || runStateWord(stale) == "spend limit" || strings.Contains(runStatusCellAt(stale, time.Now()), "spend limit") {

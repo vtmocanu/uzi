@@ -211,7 +211,8 @@ var allRunStatuses = func() map[string]bool {
 // runWait separately stops a default wait on owner-required worker holds, including
 // retained recovery exhaustion when its retry stamp is NULL and adoption failure
 // regardless of stamp, and on the Anthropic spend-limit owner hold (recovery_wait cause
-// anthropic_spend_limit; owner Resume, set-token or Cancel). An explicit --until retains the exact status-set semantics.
+// anthropic_spend_limit; owner Resume, set-token or Cancel). An explicit --until retains
+// the exact status-set semantics.
 var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled"}
 
 // run wait poll cadence and transient-blip resilience knobs (PRD #264 D1/D9). Vars,
