@@ -132,6 +132,24 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A successor reclaiming a source under secret-scan remediation now holds for its owner instead of failing ([#4058](https://github.com/vtmocanu/uzi/pull/4058), [#4072](https://github.com/vtmocanu/uzi/pull/4072)).**
   The worker refuses before touching the predecessor, explains that the agent did not start, and parks at `recovery_wait` / `retained_recovery_adoption_failed`; Resume holds again and adds admission-counted custody holds, Cancel ends the run, and no remediation disposal route is added.
 
+- **A stopped-source proof now keeps the source when its `git status` or local-ref read reports a Git problem on stderr ([#4141](https://github.com/vtmocanu/uzi/pull/4141), [#4152](https://github.com/vtmocanu/uzi/pull/4152)).**
+  The legacy proof treats nonempty stderr from its hardened `git status --porcelain` or local-ref `for-each-ref` read as `not_covered`, because Git exits 0 with empty stdout when it cannot read part of the worktree or a loose ref; benign warnings such as `core.fsyncObjectFiles` retain conservatively, and refs inside an unreadable refs directory remain undetected.
+
+- **Pipeline reconcile clears stale CI badges and autofix ledgers when nothing is watched ([#3889](https://github.com/vtmocanu/uzi/pull/3889)).**
+  An empty keep-set was sent to Postgres as NULL, so reconcile eviction deleted nothing.
+
+- **A held publication is no longer cut short by its own preparation clock ([#4140](https://github.com/vtmocanu/uzi/pull/4140), [#4157](https://github.com/vtmocanu/uzi/pull/4157)).**
+  After the worker prepared a held pack for a terminal guarded run, the create request only got what was left of the preparation budget (30 s or 60 s), so a slower API pre-verification could be cancelled on each retry and the hold stay open; the request now keeps its full allowance while inherited deadlines and cancellation still apply.
+
+- **Pausing a prompt run parks it on a checkpoint ([#4116](https://github.com/vtmocanu/uzi/pull/4116), [#4125](https://github.com/vtmocanu/uzi/pull/4125)).**
+  Prompt runs now publish checkpoints under the key `uzi/prompt-<run-id>`, so `uzi run pause` parks them instead of reporting `pause_failed`. Resume continues from the preserved session; a fresh worker adopts the published checkpoint only when it matches the run's recorded checkpoint.
+
+- **A restarted Compose worker can continue a run from its verified saved pin instead of stopping at retained recovery ([#3644](https://github.com/vtmocanu/uzi/pull/3644), [#4100](https://github.com/vtmocanu/uzi/pull/4100)).**
+  Restore applies to eligible attempt-path predecessors on Compose, normally Docker-wired, or an unwired key already in the supported persisted attempt mode; a fresh unwired (no-DinD) key keeps canonical paths and is the canonical unsupported class. The retained predecessor stays held (counting toward `custody_hold_limit`) until the owner's guarded discard of the new attempt then the predecessor, and merging closes only server custody holds (and discards their non-ready captures), never the predecessor's worker-side bytes. Canonical (an attempt-less journal at the canonical path with a quiet slot), hosted (this worker is a hosted pod with a valid own boundary record) and no-boundary-record (started by an older build; only once the pin, census and own-record checks pass) predecessors are refused before any source effect and, when the api advertises `recovery_cause_retained_recovery_adoption_failed`, parked for the owner at `recovery_wait` / `retained_recovery_adoption_failed` with no predecessor byte changed (here the cause means the release does not support the predecessor: no adoption, no persisted blocker, no proven quiescence); Resume holds again and adds a claim and a hold, and an owner-held hosted run blocks its worker's ordinary image roll until cancelled or discarded. Without that capability, and for every other refusal, the claim stops nonterminally with server charging: on the running path charged requeues up to `RUN_MAX_REQUEUES` then `worker_requeue_exhausted` when custody is uncertain, on the claimed path uncharged generations up to the run's own hold-admission bound or the server-only `retained_continuation_unwitnessed` park, and a custody-blocked queued run on a live worker may stay queued even at the cap; each accepted generation opens a custody hold counting toward `custody_hold_limit`. Without active-run snapshots, first refusals with no restore entry keep `preservation_failed`; existing restore entries remain blocked ([#3999](https://github.com/vtmocanu/uzi/pull/3999)). A restored run reads the default-branch tip from the bare without fetching, so an unpinned restored claim no longer falls into the repo-agent source hold when the bare has `origin/<default>`, and a `--require-base` restore whose planned base resolves in the bare and differs from the pin holds for attestation instead of failing `base_diverged` (a planned commit missing from the bare still fails it). The restore uses the single ordinary pin record of the dead generation (several refuse `pin_ambiguous`, none `no_eligible_pin`); choosing among several records is not implemented. Rolling back to any build before the restore-enabling release after a restore is unsupported (rc.3 to rc.5 lack the restore code too; the compatibility proof executed the v0.87.0-rc.2 sources): rc.2 can write a reservation and a `preservation_failed` blocker into the predecessor's journal and delete its legacy HOME and provision directories once terminal, while keeping the new attempt's clone and the predecessor's clone bytes, owed refs and pins. If rc.2 reclaimed the predecessor, rolling forward recognises it, but when rc.2's ledger compaction dropped the evidence the roll-forward refuses and the bytes stay (fence tracked by #3981, open); the supported exit is the guarded discard of the new attempt, then the predecessor. While a retained predecessor is undiscarded, the bare-wide census refuses other independent restores on the same repository (`census_foreign_active`). Crash safety covers process and container crashes and injected faults only; the boundary record is link-published, synced and read back, the ledger and entry writes are config renames followed by a sync, and later live successor journal rewrites have none.
+
+- **The schedule modal no longer names Anthropic for schedules that may fire on Codex ([#3988](https://github.com/vtmocanu/uzi/pull/3988), [#4027](https://github.com/vtmocanu/uzi/pull/4027)).**
+  Its header and "Wait on usage limit" help now use provider-neutral wording.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -191,7 +209,25 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Admins see who is using uzi right now from a People chip on the Overview preview ([#4042](https://github.com/vtmocanu/uzi/pull/4042), [#4084](https://github.com/vtmocanu/uzi/pull/4084)).**
   The chip shows "N active now of M" with an avatar stack, and its popover lists each active person's runs, recent sign-ins, idle accounts and this week's usage, with a shortcut to the By user usage table; the status sentence also says how many people own the executing runs.
 
+- **Operators can retire the local records of a discarded or receipt-mismatched recovery generation with `resolve-local-record --case-b` ([#3885](https://github.com/vtmocanu/uzi/pull/3885), [#4153](https://github.com/vtmocanu/uzi/pull/4153)).**
+  The request is confirmed per generation against a fresh digest, deletes only that generation's local records and bundles after the source proof, and never removes tree bytes, refs, pins or server archives; it can change a later generation's ACK-cleanup state (listed as `laterCleanup`) but does not retire it.
+
+- **Operators can enable pod-epoch deletion on exactly one hosted Docker worker with `workers.epochReclaim.deletionCanaryWorkerId` ([#4134](https://github.com/vtmocanu/uzi/pull/4134), [#4168](https://github.com/vtmocanu/uzi/pull/4168)).**
+  The value defaults to empty (off everywhere); a startup opt-in, `UZI_EPOCH_RECLAIM_DELETION`, replaces the compile-time gate and only permits attempting the existing deletion phase, so every current safety gate still applies. Clearing the selector takes effect at that worker's next replacement, and it must not be moved to another UUID until the prior enabled worker is proven gone or off; see the one-worker deletion canary checklist in `docs/run-recovery.md`.
+
+- **Admins see each user's Claude / Codex run split ([#3876](https://github.com/vtmocanu/uzi/pull/3876), [#4146](https://github.com/vtmocanu/uzi/pull/4146)).**
+  The admin usage API, `uzi admin usage` and the Overview preview's By user table show each user's runs by harness for both windows, hidden against an older API.
+
+- **A Cmd K / Ctrl K command menu jumps to pages, repo boards and your pending decisions ([#3875](https://github.com/vtmocanu/uzi/pull/3875), [#4159](https://github.com/vtmocanu/uzi/pull/4159)).**
+  It opens on any signed-in page (and from the Overview preview's Search button), fetches once per open, and only navigates: nothing is approved or answered from it.
+
+- **Owners can resume a Codex run held on a provider policy refusal ([#3607](https://github.com/vtmocanu/uzi/pull/3607), [#4071](https://github.com/vtmocanu/uzi/pull/4071)).**
+  An eligible run now pauses as `codex_policy_hold` instead of failing, and the owner resumes it per episode with `fresh_from_saved_work`, `preserve` or `fresh_one_claim`; rollback is drain-only (see docs/run-pause.md).
+
 ### Changed
+
+- **Routine dependency updates ([#4021](https://github.com/vtmocanu/uzi/pull/4021), [#4030](https://github.com/vtmocanu/uzi/pull/4030), [#4029](https://github.com/vtmocanu/uzi/pull/4029), [#4124](https://github.com/vtmocanu/uzi/pull/4124)).**
+  Dependency manifest and image bumps that carry no entry of their own.
 
 - **The Overview preview shows your capacity and held work in a right-hand rail ([#3880](https://github.com/vtmocanu/uzi/pull/3880), [#3971](https://github.com/vtmocanu/uzi/pull/3971)).**
   Run slots in use, closed and open with every worker behind a disclosure replace the worker-load card, and a Held work card plus one held-work decision row replace the custody banner on /overview/next.
@@ -228,6 +264,24 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **The code cross-checker is told not to report missing evidence of the worker's own command runs ([#4120](https://github.com/vtmocanu/uzi/pull/4120)).**
   The checker never receives gate, test or red/green logs, so a check whose only findings said it could not see them cost the lead a repair turn with no code change; claimed run results stay unverified and a criterion that itself requires a run result gets a minor Coverage uncertainty: finding.
+
+- **Self-improvement runs on uzi follow the run-economy boundary ([#4138](https://github.com/vtmocanu/uzi/pull/4138)).**
+  The run prompt now asks for the in-run checks (component check targets, focused tests, a red/green regression test) and leaves full gates to the PR's exact-head CI, and the PR's test-evidence block no longer claims the repo has no CI.
+
+- **Update the Claude Agent SDK to 0.3.316 and its bundled CLI to 2.1.316 ([#4145](https://github.com/vtmocanu/uzi/pull/4145)).**
+  Refresh the real-CLI guarded-command proof pins and structured-output recording.
+
+- **Update the packaged Codex runtime to 0.166.0 with coordinated version and digest pins ([#4147](https://github.com/vtmocanu/uzi/pull/4147)).**
+  Pin synchronization preserves historical recorded fixtures instead of relabelling their provenance.
+
+- **Refresh the worker Go nixpkgs pin with its matching lock metadata ([#4144](https://github.com/vtmocanu/uzi/pull/4144)).**
+  Both Linux architectures still resolve to the same cached Go 1.27.3 binaries.
+
+- **A tree-local measurement shortfall no longer blocks eligible siblings in the pod-epoch reclaim pass ([#3851](https://github.com/vtmocanu/uzi/pull/3851), [#4148](https://github.com/vtmocanu/uzi/pull/4148)).**
+  The affected tree records a typed `measurementShortfall` and stays unmeasured and ineligible; `eligible` verdicts can now carry diagnostic `partial_causes` counters, and a shortfall is one more reason their `bytes_state` can be `partial` or `unknown`, and deletion remains off.
+
+- **The Claude run lane now explicitly denies the native AskUserQuestion tool ([#4149](https://github.com/vtmocanu/uzi/pull/4149), [#4151](https://github.com/vtmocanu/uzi/pull/4151)).**
+  Run clarification keeps going through uzi's own ask_user tool even if a future SDK or option change would offer the native one.
 
 ### Security
 
