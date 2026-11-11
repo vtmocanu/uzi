@@ -31,6 +31,7 @@ func sourceGapFixture() (*sourceGapHealthStore, *Service, store.ListActiveRunsFo
 
 	r.WorkerID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 	r.UpdatedAt = ago(3 * time.Hour)
+	base.eligibility.Claimable = 1
 	f := &sourceGapHealthStore{repoAgentSourceHealthStore: base, worker: store.Worker{ID: uuid.UUID(r.WorkerID.Bytes), UserID: r.UserID, DrainingSince: ago(time.Hour)}}
 	return f, healthSvc(f, defaultHealthSettings()), r
 }
@@ -49,7 +50,7 @@ func TestHealthSourceGapAssignedContinuation(t *testing.T) {
 				if !strings.Contains(got, reasonAssignedRepoAgentSourceGap) {
 					t.Fatalf("commit=%v free=%d peers=%d reason=%q", commit, free, peers, got)
 				}
-				if strings.Contains(got, "all workers busy") {
+				if got == reasonAllWorkersBusy || got == reasonWaitingWorker {
 					t.Fatal(got)
 				}
 				if len(f.workerCalls) != 1 || f.workerCalls[0].ID != f.worker.ID || f.workerCalls[0].UserID != r.UserID {
@@ -61,7 +62,7 @@ func TestHealthSourceGapAssignedContinuation(t *testing.T) {
 }
 
 func TestHealthSourceGapControls(t *testing.T) {
-	for _, name := range []string{"commit only", "no requirement", "foreign", "missing", "error", "capable", "unassigned", "crosscheck", "noncontinuation", "no pin within ceiling", "eligibility error", "manual preserved", "forge", "roll", "account"} {
+	for _, name := range []string{"commit only", "no requirement", "foreign", "missing", "error", "capable", "unassigned", "crosscheck", "noncontinuation", "no pin within ceiling", "eligibility error", "claimable peer", "unavailable peer", "manual preserved", "forge", "roll", "account"} {
 		t.Run(name, func(t *testing.T) {
 			f, s, r := sourceGapFixture()
 			want := reasonWaitingWorker
@@ -90,6 +91,12 @@ func TestHealthSourceGapControls(t *testing.T) {
 			case "no pin within ceiling":
 				r.UpdatedAt = ago(time.Minute)
 				want = reasonAssignedRepoAgentSourceGap
+			case "claimable peer":
+				f.eligibility.Claimable = 1
+				want = reasonAssignedRepoAgentSourceGap
+			case "unavailable peer":
+				f.eligibility.Claimable = 0
+				want = reasonAssignedRepoAgentSourceGap + sourcePeerUnavailableSuffix
 			case "eligibility error":
 				f.eligibilityErr = errors.New("projection failed")
 				want = reasonAssignedRepoAgentSourceGap
@@ -98,6 +105,7 @@ func TestHealthSourceGapControls(t *testing.T) {
 				r.HealthReason = pgtype.Text{String: manualCordonWaitPrefix + " owner", Valid: true}
 				want = r.HealthReason.String
 			case "forge":
+				f.eligibility.Claimable = 0
 				f.eligibility.ForgeBlocked = 1
 				want = reasonForgeOriginWait
 			case "roll":

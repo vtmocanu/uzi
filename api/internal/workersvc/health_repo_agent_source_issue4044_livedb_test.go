@@ -196,7 +196,7 @@ func TestIssue4044PostHoldProjectionAndUpgradeBlockerLiveDB(t *testing.T) {
 
 // Capacity in ClaimRun is peer spread, not a claimant self-cap. We only call
 // ClaimRun on the actually free peer. The worker self-cap lives in
-// agent/src/worker.ts:1467 (claim loop), covered by agent/test/worker.test.ts:376.
+// agent/src/worker.ts (claim loop), covered by agent/test/worker.test.ts.
 func TestIssue4044CapablePeerBusyThenFreeLiveDB(t *testing.T) {
 	for _, retained := range []bool{false, true} {
 		t.Run(map[bool]string{false: "no commit", true: "retained commit"}[retained], func(t *testing.T) {
@@ -204,7 +204,7 @@ func TestIssue4044CapablePeerBusyThenFreeLiveDB(t *testing.T) {
 			f.health(t, f.at, reasonNoRepoAgentSourceCapableWorker+"; "+reasonAssignedRepoAgentSourceGap)
 			peer := f.e.seedSpreadWorker(t, issue4044Caps(true), 1)
 			active := f.e.seedActiveRunOwnedBy(t, peer)
-			f.health(t, f.at, reasonAssignedRepoAgentSourceGap)
+			f.health(t, f.at, reasonAssignedRepoAgentSourceGap+sourcePeerUnavailableSuffix)
 			counts, err := f.svc.WorkerEligibilityForHealth(f.e.ctx, f.at, f.run)
 			if err != nil || counts.Claimable != 0 {
 				t.Fatalf("busy peer counts=%+v err=%v", counts, err)
@@ -243,9 +243,11 @@ func TestIssue4044PeerAffinityReleaseLiveDB(t *testing.T) {
 			}
 			if mode == "offline no drain" {
 				f.e.exec(t, "UPDATE workers SET draining_since=NULL WHERE id=$1", f.owner)
+				f.health(t, f.at, reasonAssignedRepoAgentSourceGap)
 				f.claim(t, f.params(peer, issue4044Caps(true)))
 				return
 			}
+			f.health(t, f.at, "waiting until "+f.at.Add(time.Hour).Format(time.RFC3339)+" for its previous worker source-owner to finish draining or maintenance"+heldRepoAgentSourceGapSuffix)
 			hold := mhOpenHold(t, f.e, f.run, 9, f.owner)
 			f.refuse(t, f.params(peer, issue4044Caps(true)), hold)
 			f.e.exec(t, "UPDATE runs SET updated_at=$2 WHERE id=$1", f.run, f.at.Add(-3*time.Hour))

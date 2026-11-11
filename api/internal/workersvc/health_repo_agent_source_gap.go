@@ -11,6 +11,7 @@ import (
 )
 
 const reasonAssignedRepoAgentSourceGap = "assigned worker lacks repo_agent_source_v1 required by this continuation; upgrade the assigned worker or wait for a compatible worker"
+const sourcePeerUnavailableSuffix = "; compatible worker currently unavailable"
 const heldRepoAgentSourceGapSuffix = "; assigned worker also lacks repo_agent_source_v1 required by this continuation"
 
 // assignedRepoAgentSourceGap reads the assignment independently of owner-pin projections.

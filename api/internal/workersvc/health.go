@@ -1485,6 +1485,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			return reasonNoCIConfigGuardCapableWorker
 		}
 	}
+	sourceCapablePeerConfirmed := false
 	if r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid {
 		if q, ok := s.q.(interface {
 			CountOnlineWorkersSatisfyingRepoAgentSource(context.Context, uuid.UUID) (int64, error)
@@ -1494,6 +1495,8 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 				slog.Error("health: count repo agent source capable workers", "run_id", r.ID, "error", err)
 			} else if n == 0 {
 				return withAssignedRepoAgentSourceGap(reasonNoRepoAgentSourceCapableWorker, sourceGap)
+			} else {
+				sourceCapablePeerConfirmed = n > 0
 			}
 		}
 	}
@@ -1790,6 +1793,11 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 		}
 	}
 	if sourceGap {
+		// The capability count establishes a peer, not its claimability. Only the
+		// composed eligibility projection establishes current unavailability.
+		if sourceCapablePeerConfirmed && eligibilityErr == nil && eligibility.Claimable == 0 {
+			return reasonAssignedRepoAgentSourceGap + sourcePeerUnavailableSuffix
+		}
 		return reasonAssignedRepoAgentSourceGap
 	}
 	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, r.UserID)

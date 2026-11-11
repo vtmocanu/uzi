@@ -61,6 +61,7 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 		exec("INSERT INTO workers (id,user_id,name,token_hash,status) VALUES ($1,$2,'blocker-fixture',$3,'online')", id, owner, id[:])
 		return id
 	}
+	var seedProfile any
 	seed := func(id, u uuid.UUID, w any, status, kind string) {
 		t.Helper()
 		var r, iid, branch, pipeline, ref, target, job any
@@ -95,9 +96,9 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 			report = true
 			budget = int32(600)
 		}
-		exec(`INSERT INTO runs (id,user_id,worker_id,status,kind,issue_title,issue_description,repo_id,issue_iid,branch,pipeline_id,pipeline_ref,target_run_id,mr_iid,job_type,harness,report_only,budget_wall_seconds,claim_released_at)
-			VALUES ($1,$2,$3,$4,$5,'must not expose title','must not expose prompt',$6,$7,$8,$9,$10,$11,1,$12,$13,$14,$15,now())`,
-			id, u, w, status, kind, r, iid, branch, pipeline, ref, target, job, harness, report, budget)
+		exec(`INSERT INTO runs (id,user_id,worker_id,status,kind,issue_title,issue_description,repo_id,issue_iid,branch,pipeline_id,pipeline_ref,target_run_id,mr_iid,job_type,harness,report_only,budget_wall_seconds,claim_released_at,egress_profile_id)
+			VALUES ($1,$2,$3,$4,$5,'must not expose title','must not expose prompt',$6,$7,$8,$9,$10,$11,1,$12,$13,$14,$15,now(),$16)`,
+			id, u, w, status, kind, r, iid, branch, pipeline, ref, target, job, harness, report, budget, seedProfile)
 	}
 	capture := &blockerQueryCapture{Tx: tx}
 	q := store.New(capture)
@@ -128,7 +129,9 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 			t.Fatalf("%+v", r)
 		}
 	}
-	// Exercise the independent capability fact through the real generated query.
+	// This independent upgrade fact intentionally includes generation-zero and
+	// cross-check/egress assignments. Health has stronger precedence and narrower
+	// continuation scope; do not narrow this diagnostic to match health.
 	for _, tc := range []struct {
 		name                      string
 		required, commit, capable bool
@@ -159,6 +162,30 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 			}
 			if got[0].MissingRepoAgentSource != tc.want {
 				t.Fatalf("projection: %+v want missing=%v", got[0], tc.want)
+			}
+		})
+	}
+	for _, lane := range []string{"generation-zero", "cross-check", "egress"} {
+		t.Run("independent-source-fact/"+lane, func(t *testing.T) {
+			w, id := worker(), uuid.New()
+			kind := "prompt"
+			if lane == "cross-check" {
+				kind = "cross_check"
+			}
+			if lane == "egress" {
+				profile := uuid.New()
+				exec("INSERT INTO egress_profiles (id,name,hosts) VALUES ($1,$2,ARRAY['example.test'])", profile, profile.String())
+				seedProfile = profile
+			}
+			seed(id, owner, w, "queued", kind)
+			seedProfile = nil
+			exec("UPDATE runs SET claim_generation=0,repo_agent_source_required=true WHERE id=$1", id)
+			if lane == "cross-check" {
+				exec("UPDATE runs SET cross_check_lane=true WHERE id=$1", id)
+			}
+			got, err := q.ListWorkerUpgradeBlockers(ctx, []uuid.UUID{w})
+			if err != nil || len(got) != 1 || !got[0].MissingRepoAgentSource {
+				t.Fatalf("independent source fact: %+v err=%v", got, err)
 			}
 		})
 	}
