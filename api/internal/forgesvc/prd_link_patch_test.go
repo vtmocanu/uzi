@@ -73,7 +73,7 @@ func enumerated(t *testing.T, st *fakeStore) {
 
 func runPRDPatch(t *testing.T, s *Service, f *fakeForge) {
 	t.Helper()
-	if err := s.SyncPRDLinkPatches(context.Background(), uuid.New(), fixProject, f); err != nil {
+	if err := s.SyncPRDLinkPatches(context.Background(), uuid.New(), fixProject, f, f); err != nil {
 		t.Fatalf("SyncPRDLinkPatches: %v", err)
 	}
 }
@@ -352,7 +352,7 @@ func TestPRDLinkPatchAsksForTheBoundedBatch(t *testing.T) {
 func TestPRDLinkPatchReturnsEnumerationErrors(t *testing.T) {
 	st := &fakeStore{prdCandidatesErr: errors.New("db down")}
 	f := &fakeForge{}
-	if err := newTestService(st).SyncPRDLinkPatches(context.Background(), uuid.New(), fixProject, f); err == nil {
+	if err := newTestService(st).SyncPRDLinkPatches(context.Background(), uuid.New(), fixProject, f, f); err == nil {
 		t.Fatal("an enumeration failure must surface to the poller")
 	}
 }

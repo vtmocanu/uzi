@@ -4,6 +4,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import type { spawn, ChildProcess } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -646,6 +649,67 @@ test("settlement: residue that retained the leaf continues, and the third retain
     assert.deepEqual(w.events, ["begin", "finish", "handover"]);
   });
 });
+
+for (const mode of ["readable", "unreadable", "missingclose"] as const) {
+  test("async no-child reclaim real discard: " + mode, async () => {
+    await withWorld(["a", "b"], async w => {
+      const census = fakeCensus(() => [dirEntry("a", 1), dirEntry("b", 2)]);
+      w.census = census;
+      const child = Object.assign(new EventEmitter(), {
+        pid: undefined, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+        exitCode: null, signalCode: null,
+      });
+      const internal = w.git as unknown as { epochNativeTestDependencies: {
+        spawn: typeof spawn; alive: () => boolean; kill: () => void; joinMs: number;
+      } };
+      internal.epochNativeTestDependencies = {
+        spawn: (() => {
+          setImmediate(() => {
+            child.emit("error", Object.assign(new Error("exec refused"), { code: "EAGAIN" }));
+            child.stdout.end(); child.stderr.end();
+            if (mode !== "missingclose") child.emit("close", -11, null);
+          });
+          return child as unknown as ChildProcess;
+        }) as typeof spawn,
+        alive: () => { throw new Error("undefined pid has no group proof"); },
+        kill: () => assert.fail("no group to kill"), joinMs: 20,
+      };
+      let classified = false;
+      w.discard = input => w.git.discardEpochScratchLeaf({
+        ...input,
+        testSeam: { token: DELETE_SEAM, root: w.root, census: async (...args) => {
+          classified = true;
+          assert.equal(w.scope.pending(), 1);
+          assert.throws(() => w.git.assertNoUnsettledDeletes());
+          return mode === "unreadable" ? { code: 1, stdout: "" } : census(...args);
+        } },
+      });
+      if (mode === "readable") {
+        const result = await run(w);
+        assert.equal(result.scratch.state, "stopped");
+        assert.equal(result.scratch.reason, "helper_failed");
+        assert.equal(result.scratch.helper_failed, 1);
+        assert.equal(result.scratch.residue, 1);
+        assert.equal(w.scope.pending(), 0);
+        assert.equal(w.scope.stopped(), false);
+        w.git.assertNoUnsettledDeletes();
+        assert.ok(w.events.indexOf("finish") >= 0);
+        assert.ok(w.events.indexOf("handover") > w.events.indexOf("finish"));
+        assert.equal(w.calls.handovers, 1);
+      } else {
+        await assert.rejects(run(w), error => error instanceof PodEpochSettlementError);
+        assert.equal(w.scope.pending(), 1);
+        assert.equal(w.scope.stopped(), true);
+        assert.throws(() => w.git.assertNoUnsettledDeletes());
+        assert.equal(w.calls.handovers, 0);
+        assert.ok(!w.events.includes("finish"));
+      }
+      assert.equal(classified, mode !== "missingclose");
+      assert.deepEqual(w.calls.discards, ["a"], "the sibling never starts");
+      await untouched(w, ["a", "b"]);
+    });
+  });
+}
 
 test("settlement: a helper failure or a changed leaf stops the phase after that leaf", async () => {
   for (const kind of ["helper_failed", "changed"] as const) {

@@ -185,7 +185,7 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	f, err := h.forgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("forge view: build forge", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -209,7 +209,7 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 		if e := h.chargeBudget(repo.ConnectionID); e != nil {
 			return nil, 0, e
 		}
-		refs, e := f.ListMergeRequestRefs(loadCtx, repo.ForgeProjectID,
+		refs, e := ch.ListMergeRequestRefs(loadCtx, repo.ForgeProjectID,
 			forge.ListMergeRequestsOptions{State: forge.MRStateOpened, Limit: forgeViewPullsLimit})
 		if e != nil {
 			return nil, 0, e
@@ -244,7 +244,7 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 				if ce := h.chargeBudget(repo.ConnectionID); ce != nil {
 					return nil, 0, ce
 				}
-				s, se := f.GetMergeRequestSummary(loadCtx, repo.ForgeProjectID, ref.IID)
+				s, se := ch.GetMergeRequestSummary(loadCtx, repo.ForgeProjectID, ref.IID)
 				if se != nil {
 					return nil, 0, se
 				}
@@ -294,7 +294,7 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid pull id")
 		return
 	}
-	f, err := h.forgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("forge view: build forge", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -317,7 +317,7 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		if e := h.chargeBudget(repo.ConnectionID); e != nil {
 			return nil, 0, e
 		}
-		s, e := f.GetMergeRequestSummary(loadCtx, repo.ForgeProjectID, iid)
+		s, e := ch.GetMergeRequestSummary(loadCtx, repo.ForgeProjectID, iid)
 		if e != nil {
 			return nil, 0, e
 		}
@@ -340,7 +340,7 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		if e := h.chargeBudget(repo.ConnectionID); e != nil {
 			return nil, 0, e
 		}
-		cs, e := f.ListChecks(loadCtx, repo.ForgeProjectID, s.HeadSHA)
+		cs, e := ch.ListChecks(loadCtx, repo.ForgeProjectID, s.HeadSHA)
 		if e != nil {
 			return nil, 0, e
 		}
@@ -355,7 +355,7 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		if e := h.chargeBudget(repo.ConnectionID); e != nil {
 			return nil, 0, e
 		}
-		rv, e := f.ListMergeRequestReviews(loadCtx, repo.ForgeProjectID, iid)
+		rv, e := ch.ListMergeRequestReviews(loadCtx, repo.ForgeProjectID, iid)
 		if e != nil {
 			return nil, 0, e
 		}
@@ -393,7 +393,7 @@ func (h *Handler) ListCIRuns(w http.ResponseWriter, r *http.Request) {
 	if limit > forgeViewCIRunsMax {
 		limit = forgeViewCIRunsMax
 	}
-	f, err := h.forgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("forge view: build forge", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -408,7 +408,7 @@ func (h *Handler) ListCIRuns(w http.ResponseWriter, r *http.Request) {
 		if e := h.chargeBudget(repo.ConnectionID); e != nil {
 			return nil, 0, e
 		}
-		runs, e := f.ListWorkflowRuns(loadCtx, repo.ForgeProjectID, forge.ListWorkflowRunsOptions{Limit: limit})
+		runs, e := ch.ListWorkflowRuns(loadCtx, repo.ForgeProjectID, forge.ListWorkflowRunsOptions{Limit: limit})
 		if e != nil {
 			return nil, 0, e
 		}
@@ -445,7 +445,7 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid run id")
 		return
 	}
-	f, err := h.forgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("forge view: build forge", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -460,7 +460,7 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 		if e := h.chargeBudget(repo.ConnectionID); e != nil {
 			return nil, 0, e
 		}
-		run, e := f.GetWorkflowRun(loadCtx, repo.ForgeProjectID, runID)
+		run, e := ch.GetWorkflowRun(loadCtx, repo.ForgeProjectID, runID)
 		if e != nil {
 			return nil, 0, e
 		}
@@ -482,7 +482,7 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 		if e := h.chargeBudget(repo.ConnectionID); e != nil {
 			return nil, 0, e
 		}
-		jobs, e := f.ListPipelineJobs(loadCtx, repo.ForgeProjectID, runID)
+		jobs, e := ch.ListPipelineJobs(loadCtx, repo.ForgeProjectID, runID)
 		if e != nil {
 			return nil, 0, e
 		}

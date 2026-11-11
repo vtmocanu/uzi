@@ -45,7 +45,7 @@ func parseCIArtifacts(raw []byte) ([]string, error) {
 
 // ciRevalidate compares to discovery, never to a subsequently fetched revision.
 // An old red candidate cannot reset a now-green episode or consume an attempt.
-func ciRevalidate(ctx context.Context, f forge.Forge, repo store.GetRepoForUserRow, k *ciKey) (bool, error) {
+func ciRevalidate(ctx context.Context, f forge.CodeHost, repo store.GetRepoForUserRow, k *ciKey) (bool, error) {
 	if k.run.ID <= 0 || k.run.WorkflowKey == "" || k.run.SHA == "" || k.run.UpdatedAt.IsZero() {
 		return false, nil // equality of missing identity metadata proves no freshness
 	}
@@ -108,7 +108,7 @@ func artifactRefusal(err error) (reason string, safeContinue bool) {
 // ciCollectArtifacts performs no DB writes. One 60-second child context bounds
 // the sequential list and at most 100 downloads; only pre-body status refusals
 // permit siblings to continue. Unknown partial consumption stops the collection.
-func (e *Scheduler) ciCollectArtifacts(ctx context.Context, sched store.RunSchedule, repo store.GetRepoForUserRow, f forge.Forge, cfg CIRepairConfig, k *ciKey) (*ciartifacts.Manifest, []ciartifacts.Input) {
+func (e *Scheduler) ciCollectArtifacts(ctx context.Context, sched store.RunSchedule, repo store.GetRepoForUserRow, f forge.CodeHost, cfg CIRepairConfig, k *ciKey) (*ciartifacts.Manifest, []ciartifacts.Input) {
 	selectors, err := parseCIArtifacts(sched.CiArtifacts)
 	if err != nil || len(selectors) == 0 {
 		return nil, nil

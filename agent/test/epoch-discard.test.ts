@@ -510,3 +510,33 @@ for (const cancellation of ["abort", "deadline"] as const) it(`epoch ${cancellat
     assert.equal(journal(), raw); assert.ok(fs.existsSync(clonePath));
   } finally { unblock(); await holder; await discard; }
 });
+
+for (const code of ["ENOENT", "EAGAIN"]) {
+  it("no-child delete " + code + " retains the source as nonfatal incomplete", async t => {
+    const internal = git as unknown as {
+      runRunnerUidDelete(target: string): Promise<void>;
+      runEpochRunnerUidDelete(target: string): Promise<void>;
+      execEpochNative(...args: unknown[]): Promise<unknown>;
+    };
+    const exec = internal.execEpochNative.bind(internal);
+    t.mock.method(internal, "execEpochNative", async (...args: unknown[]) => {
+      if (!(args[1] as string[]).includes("-rf")) return exec(...args);
+      throw Object.assign(new Error("not spawned"), { epochNativeNotSpawned: true, code });
+    });
+    t.mock.method(internal, "runRunnerUidDelete", async (target: string) => {
+      const previous = process.env.UZI_UID_SPLIT;
+      process.env.UZI_UID_SPLIT = "1";
+      try { await internal.runEpochRunnerUidDelete(target); }
+      finally {
+        if (previous === undefined) delete process.env.UZI_UID_SPLIT;
+        else process.env.UZI_UID_SPLIT = previous;
+      }
+    });
+    const proof = git.createEpochDiscardProof(input);
+    const result = await git.discardStoppedSource({ ...options, epochProof: proof });
+    assert.equal(result.kind, "incomplete");
+    assert.ok(fs.existsSync(clonePath));
+    assert.equal(journal(), raw);
+    git.assertEpochDiscardSettled(proof);
+  });
+}

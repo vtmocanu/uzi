@@ -16,7 +16,7 @@ type BoardColumnStore interface {
 	InsertDefaultBoardColumns(ctx context.Context, arg store.InsertDefaultBoardColumnsParams) error
 }
 
-// LabelEnsurer is the slice of forge.Forge EnsureBoardColumns needs.
+// LabelEnsurer is the slice of forge.IssueTracker EnsureBoardColumns needs.
 type LabelEnsurer interface {
 	EnsureLabels(ctx context.Context, projectID int64, labels []forge.Label) error
 }

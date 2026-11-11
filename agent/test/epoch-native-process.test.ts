@@ -525,3 +525,76 @@ for (const stream of ["stdout", "stderr"] as const) {
     f.scope.assertSettled();
   });
 }
+
+for (const deleteLaunch of [false, true]) {
+  it("async no-child refusal settles " + (deleteLaunch ? "delete authority before its own entry" : "native read without stopping"), async () => {
+    const previous = process.env.UZI_UID_SPLIT;
+    process.env.UZI_UID_SPLIT = "1";
+    try {
+      const f = fixture(deleteLaunch);
+      Object.assign(f.child, { pid: undefined });
+      f.internal.epochNativeTestDependencies.alive = () => { throw new Error("must not probe"); };
+      f.internal.unsettledDeletes.set("/sibling", 3);
+      if (deleteLaunch) f.internal.unsettledDeletes.set(f.target, 2);
+      let release!: () => void;
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      let classified!: () => void;
+      const classification = new Promise<void>(resolve => { classified = resolve; });
+      f.internal.beginDestructive = async () => ({
+        async settle(result) {
+          assert.equal(result.ok, false);
+          assert.equal(f.pending(), 1);
+          assert.equal(f.internal.unsettledDeletes.get(f.target), 3);
+          classified(); await barrier;
+        },
+      });
+      const result = deleteLaunch
+        ? f.internal.withEpochNativeReads(f.proof, () => f.internal.runRunnerUidDelete(f.target))
+        : f.invoke();
+      const rejected = assert.rejects(result, (error: Error & { epochNativeNotSpawned?: boolean; code?: string; cause?: unknown }) =>
+        error.epochNativeNotSpawned === true && error.code === "ENOENT" && error.cause === failure);
+      await f.launched;
+      const failure = Object.assign(new Error("exec refused"), { code: "ENOENT" });
+      f.child.emit("error", failure); f.close();
+      if (deleteLaunch) {
+        await classification;
+        assert.equal(f.stopped(), false);
+        release();
+      }
+      await rejected;
+      assert.equal(f.internal.unsettledDeletes.get("/sibling"), 3);
+      assert.equal(f.internal.unsettledDeletes.get(f.target), deleteLaunch ? 2 : undefined);
+      f.scope.assertSettled();
+    } finally {
+      if (previous === undefined) delete process.env.UZI_UID_SPLIT;
+      else process.env.UZI_UID_SPLIT = previous;
+    }
+  });
+}
+
+for (const joins of [true, false]) {
+  it("post-spawn error retains normal possible-child policy; joined=" + joins, async () => {
+    const f = fixture();
+    const result = f.invoke();
+    const failure = new Error("post-spawn error");
+    const rejection = assert.rejects(result, joins ? error => error === failure : /unconfirmed/);
+    await f.launched;
+    f.child.emit("spawn");
+    f.child.emit("error", failure);
+    if (joins) { f.gone(); f.exit(1); f.close(1); }
+    await rejection;
+    assert.equal(f.stopped(), !joins);
+    assert.equal(f.pending(), joins ? 0 : 1);
+    f.child.stdout.destroy(); f.child.stderr.destroy();
+  });
+}
+
+it("synchronous spawn throw keeps the native ticket pending and stops without the async refusal tag", async () => {
+  const f = fixture();
+  const failure = Object.assign(new Error("synchronous spawn failed"), { code: "ENOENT" });
+  f.internal.epochNativeTestDependencies.spawn = (() => { throw failure; }) as typeof spawn;
+  await assert.rejects(f.invoke(), error => error === failure && error instanceof Error &&
+    !("epochNativeNotSpawned" in error));
+  assert.equal(f.pending(), 1);
+  assert.equal(f.stopped(), true);
+});

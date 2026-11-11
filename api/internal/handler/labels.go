@@ -27,13 +27,13 @@ func (h *Handler) CheckRepoLabels(w http.ResponseWriter, r *http.Request) {
 		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("check repo labels: build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	existing, err := f.ListLabels(r.Context(), repo.ForgeProjectID)
+	existing, err := tr.ListLabels(r.Context(), repo.ForgeProjectID)
 	if err != nil {
 		// err is already PAT-redacted by the driver; an upstream forge read failure is a 502.
 		httpx.Error(w, http.StatusBadGateway, "could not list the repo's labels on the forge: "+err.Error())
@@ -58,13 +58,13 @@ func (h *Handler) EnsureRepoLabels(w http.ResponseWriter, r *http.Request) {
 		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("ensure repo labels: build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	ensured, err := ensureRepoLabels(r.Context(), f, repo.ForgeProjectID, req.Labels)
+	ensured, err := ensureRepoLabels(r.Context(), tr, repo.ForgeProjectID, req.Labels)
 	if err != nil {
 		// err is already PAT-redacted by the driver; an upstream forge write failure is a 502.
 		httpx.Error(w, http.StatusBadGateway, "could not ensure the labels on the forge: "+err.Error())
@@ -106,9 +106,9 @@ func missingLabels(existing []forge.Label, requested []string) []string {
 // deduped, non-blank set it ensured. It hands EnsureLabels the requested labels directly
 // (EnsureLabels skips any that already exist), with an empty color so each of the three
 // drivers applies its own neutral default — mirroring findings_file.go's `forge.Label{{Name: marker}}`. An empty
-// request is a no-op (no forge call). Split out as a package function taking a forge.Forge
+// request is a no-op (no forge call). Split out as a package function taking a forge.IssueTracker
 // so the WARN/CONFIRM logic is unit-testable against a fake forge without a DB.
-func ensureRepoLabels(ctx context.Context, f forge.Forge, projectID int64, requested []string) ([]string, error) {
+func ensureRepoLabels(ctx context.Context, f forge.IssueTracker, projectID int64, requested []string) ([]string, error) {
 	names := dedupNonBlank(requested)
 	if len(names) == 0 {
 		return []string{}, nil

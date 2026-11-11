@@ -139,7 +139,7 @@ func (d *MRReviewWatch) assessor() *workersvc.ReviewAssessor {
 // read error or a false value skips the repo entirely, so a settings blip never
 // auto-reworks. Every per-candidate failure is log-and-skipped (the poller
 // convention).
-func (d *MRReviewWatch) detect(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge) {
+func (d *MRReviewWatch) detect(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, ch forge.CodeHost, tr forge.IssueTracker) {
 	// Decision 5 fail-closed: MrReworkEnabled propagates its store error (three-state
 	// read), and the detector — the caller that owns the fail-closed decision — maps a
 	// non-nil error to OFF. Absent → ON is already resolved inside MrReworkEnabled.
@@ -177,7 +177,7 @@ func (d *MRReviewWatch) detect(ctx context.Context, r store.ListEnabledReposWith
 		if ctx.Err() != nil {
 			return
 		}
-		d.detectOne(ctx, r, f, cand, capLimit, trusted)
+		d.detectOne(ctx, r, ch, tr, cand, capLimit, trusted)
 	}
 
 	// Reconcile once per repo, best-effort: DeleteMRReworkLedgerNotIn retains rows
@@ -200,7 +200,7 @@ func (d *MRReviewWatch) detect(ctx context.Context, r store.ListEnabledReposWith
 // capLimit → branch free (checked at create time inside CreateAutoMRReworkRunAndAdvance). Any gate
 // that fails is a silent no-op (no ledger write, no comment) except the capLimit halt,
 // which comments once.
-func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge, cand store.ListMRReworkCandidatesRow, capLimit int, trusted []settings.TrustedBot) {
+func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, ch forge.CodeHost, tr forge.IssueTracker, cand store.ListMRReworkCandidatesRow, capLimit int, trusted []settings.TrustedBot) {
 	ref := cand.Ref.String
 	mrIID := cand.MrIid.Int64
 
@@ -263,7 +263,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		return
 	}
 
-	comments, err := f.ListMergeRequestComments(ctx, r.ForgeProjectID, mrIID)
+	comments, err := ch.ListMergeRequestComments(ctx, r.ForgeProjectID, mrIID)
 	if err != nil {
 		// Already PAT-redacted by the driver.
 		slog.Warn("poller: mr-rework list comments", "repo", r.PathWithNamespace, "ref", ref, "error", err)
@@ -302,7 +302,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		ProjectID:      r.ForgeProjectID,
 		BaseURL:        r.BaseUrl,
 		BotForgeUserID: cand.BotForgeUserID,
-		Lookup:         f,
+		Lookup:         ch,
 		Trusted:        trusted,
 		Comments:       comments,
 		Ledger:         state,
@@ -415,7 +415,7 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 				return
 			}
 			if ok {
-				if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, issueIID, mrReworkHaltCommentBody(capLimit, mrIID)); err != nil {
+				if _, err := tr.CreateIssueNote(ctx, r.ForgeProjectID, issueIID, mrReworkHaltCommentBody(capLimit, mrIID)); err != nil {
 					// Already PAT-redacted; the latch is set, so the comment is lost, not retried.
 					slog.Warn("poller: mr-rework halt comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 				}

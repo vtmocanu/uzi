@@ -731,3 +731,107 @@ describe("GitCache.discardEpochScratchLeaf", () => {
     });
   });
 });
+
+describe("confirmed asynchronous no-child provenance", () => {
+  function setup(mode = "nochild") {
+    const f = fakeScope();
+    const internal = new GitCache(path.join(os.tmpdir(), "cache"), nullLogger()) as unknown as Internal;
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined as number | undefined, stdin: new PassThrough(),
+      stdout: new PassThrough(), stderr: new PassThrough(), exitCode: null, signalCode: null,
+    });
+    if (mode === "missing-output") Object.assign(child, { stderr: undefined });
+    const failure = Object.assign(new Error("exec refused"), { code: "ENOENT" });
+    internal.epochNativeTestDependencies = {
+      spawn: (() => {
+        setImmediate(() => {
+          if (mode === "pid") child.pid = 4242;
+          if (mode === "zero-pid") child.pid = 0;
+          if (mode === "nan-pid") child.pid = NaN;
+          if (mode === "close-before-error") child.emit("close", -2, null);
+          if (mode === "spawn") child.emit("spawn");
+          if (mode === "exit-before") child.emit("exit", 1, null);
+          if (mode !== "no-error") child.emit("error", failure);
+          if (mode === "exit-after") child.emit("exit", 1, null);
+          if (mode !== "unfinished") { child.stdout.end(); child.stderr?.end(); }
+          if (mode !== "no-close") child.emit("close", -2, null);
+          if (mode === "late-pid") queueMicrotask(() => { child.pid = 4242; });
+          if (mode === "late-spawn") queueMicrotask(() => { child.emit("spawn"); });
+        });
+        return child as unknown as ChildProcess;
+      }) as typeof spawn,
+      alive: () => { throw new Error("possible child needs group proof"); },
+      kill: () => { throw new Error("unexpected kill"); }, joinMs: 20,
+    };
+    return { f, internal, child, failure };
+  }
+  const options = () => ({ env: {}, identity: "command" as const, signals: [],
+    deadline: Date.now() + 1000, timeout: 10 });
+
+  it("async undefined-pid error joins close and output with a pending caller-owned ticket", async () => {
+    const x = setup();
+    const result = await x.internal.spawnJoinedEpochChild(x.f.scope, "/missing", [], options());
+    assert.equal(result.spawned, false);
+    assert.equal((result as { provenance?: string }).provenance, "not-spawned");
+    assert.equal(result.failure, x.failure);
+    assert.equal(x.f.pending(), 1);
+    assert.equal(x.f.stopped(), false);
+    assert.equal(x.internal.unsettledDeletes.size, 0);
+    result.ticket.settle();
+    x.f.scope.assertSettled();
+  });
+
+  for (const mode of ["pid", "zero-pid", "nan-pid", "close-before-error", "spawn", "exit-before", "exit-after", "late-pid", "late-spawn", "no-error", "no-close", "unfinished", "missing-output"]) {
+    it(mode + " never grants no-child settlement", async () => {
+      const x = setup(mode);
+      await assert.rejects(x.internal.spawnJoinedEpochChild(x.f.scope, "/missing", [], options()));
+      assert.equal(x.f.pending(), 1);
+      assert.equal(x.f.stopped(), true);
+      x.child.stdout.destroy(); x.child.stderr?.destroy();
+    });
+  }
+
+  it("a real nonexistent executable joins safe stdio without a process group", async () => {
+    const f = fakeScope({ realStdio: true });
+    const internal = new GitCache(path.join(os.tmpdir(), "cache"), nullLogger()) as unknown as Internal;
+    const result = await internal.spawnJoinedEpochChild(f.scope,
+      "/nonexistent-uzi-issue4171/executable", [], { ...options(), timeout: 1000 });
+    assert.equal(result.spawned, false);
+    assert.equal((result as { provenance?: string }).provenance, "not-spawned");
+    assert.equal((result.failure as NodeJS.ErrnoException).code, "ENOENT");
+    assert.equal(f.pending(), 1);
+    result.ticket.settle(); f.scope.assertSettled();
+  });
+});
+
+for (const readable of [true, false]) {
+  it("async no-child scratch keeps classification pending; census readable=" + readable, async () => {
+    const x = discardFixture({}, () => readable ? censusText("leaf-1", "same") : { code: 1, stdout: "" });
+    const child = fakeChildDeps(x.internal, { outcome: "hang", joinMs: 20 });
+    Object.assign(child, { pid: undefined });
+    x.internal.epochNativeTestDependencies!.alive = () => { throw new Error("no group"); };
+    const census = x.input.testSeam!.census!;
+    x.input.testSeam!.census = async (...args) => {
+      assert.equal(x.f.pending(), 1);
+      assert.equal(x.internal.unsettledDeletes.get(x.key), 1);
+      return census(...args);
+    };
+    const result = x.git.discardEpochScratchLeaf(x.input);
+    const rejection = readable ? undefined : assert.rejects(result, { epochScratchUnresolved: true });
+    setImmediate(() => {
+      child.emit("error", Object.assign(new Error("exec refused"), { code: "EAGAIN" }));
+      child.stdout.end(); child.stderr.end(); child.emit("close", -11, null);
+    });
+    if (readable) {
+      assert.equal((await result).outcome, "residue");
+      assert.deepEqual(x.seen, { pending: 1, entry: 1 });
+      assert.equal(x.internal.unsettledDeletes.has(x.key), false);
+      x.f.scope.assertSettled();
+    } else {
+      await rejection;
+      assert.equal(x.f.pending(), 1);
+      assert.equal(x.internal.unsettledDeletes.get(x.key), 1);
+      assert.equal(x.f.stopped(), true);
+    }
+  });
+}

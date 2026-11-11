@@ -52,7 +52,7 @@ func TestM2CaptureWholeThreadBeforeCaps(t *testing.T) {
 	for i := 0; i < 201; i++ {
 		f.comments = append(f.comments, forge.IssueComment{AuthorForgeUserID: 2, AuthorUsername: "alice\n\u202e\x1b[31m", Body: "eligible"})
 	}
-	c, err := issueinput.Fetch(context.Background(), f, 7, 11, 1)
+	c, err := issueinput.Fetch(context.Background(), f, f, 7, 11, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestM2CaptureDispositionBodiesAndFailures(t *testing.T) {
 	for _, id := range []int64{2, 3, 4} {
 		f := &captureForge{issue: forge.Issue{IID: 11, Title: "raw title", Description: "raw body", AuthorForgeUserID: id},
 			comments: []forge.IssueComment{{AuthorForgeUserID: id, Body: "raw comment"}}}
-		c, err := issueinput.Fetch(context.Background(), f, 7, 11, 1)
+		c, err := issueinput.Fetch(context.Background(), f, f, 7, 11, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -95,23 +95,23 @@ func TestM2CaptureDispositionBodiesAndFailures(t *testing.T) {
 		}
 	}
 	f := &captureForge{issue: forge.Issue{IID: 11, AuthorForgeUserID: 2}, commentsErr: errors.New("secret")}
-	c, err := issueinput.Fetch(context.Background(), f, 7, 11, 1)
+	c, err := issueinput.Fetch(context.Background(), f, f, 7, 11, 1)
 	if err != nil || !c.Unknown {
 		t.Fatalf("%+v %v", c, err)
 	}
-	c, err = issueinput.Fetch(context.Background(), f, 7, 11, 0)
+	c, err = issueinput.Fetch(context.Background(), f, f, 7, 11, 0)
 	if err != nil || !c.Unknown || len(c.Thread.Comments) != 0 {
 		t.Fatalf("%+v %v", c, err)
 	}
 	f.getErr = errors.New("fetch failed")
-	if _, err = issueinput.Fetch(context.Background(), f, 7, 11, 1); err == nil {
+	if _, err = issueinput.Fetch(context.Background(), f, f, 7, 11, 1); err == nil {
 		t.Fatal("failed raw fetch succeeded")
 	}
 }
 func TestM2CaptureParentCancellation(t *testing.T) {
 	parent, cancel := context.WithCancel(context.Background())
 	f := &captureForge{issue: forge.Issue{IID: 11, Title: "raw", Description: "raw", AuthorForgeUserID: 2}, childCancel: cancel}
-	if _, err := issueinput.Fetch(parent, f, 7, 11, 1); !errors.Is(err, context.Canceled) {
+	if _, err := issueinput.Fetch(parent, f, f, 7, 11, 1); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 }
@@ -126,7 +126,7 @@ func TestM2CaptureChildExpiryValidRaw(t *testing.T) {
 		start := time.Now()
 		f := &expiryForge{expireDuringAssessment: true}
 		f.comments = []forge.IssueComment{{AuthorForgeUserID: 4, Body: "UNVERIFIED_RAW"}}
-		c, err := issueinput.FetchWithTimeout(parent, f, 7, 11, 1, budget)
+		c, err := issueinput.FetchWithTimeout(parent, f, f, 7, 11, 1, budget)
 		if err != nil || c == nil {
 			t.Fatalf("valid raw lost on child expiry: %+v %v", c, err)
 		}
@@ -153,7 +153,8 @@ func TestM2CaptureLateRawRejected(t *testing.T) {
 		defer cancel()
 		budget := issueinput.InteractiveAssessmentTimeout
 		start := time.Now()
-		c, err := issueinput.FetchWithTimeout(parent, &expiryForge{}, 7, 11, 1, budget)
+		ef := &expiryForge{}
+		c, err := issueinput.FetchWithTimeout(parent, ef, ef, 7, 11, 1, budget)
 		if !errors.Is(err, context.DeadlineExceeded) || c != nil {
 			t.Fatalf("late raw accepted: %+v %v", c, err)
 		}

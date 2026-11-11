@@ -127,15 +127,16 @@ func (h *Handler) WorkerForgeGetIssue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ch, tr := forge.CodeHost(f), forge.IssueTracker(f)
 	iid, err := parseInt64(chi.URLParam(r, "iid"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
 		return
 	}
-	assessment := issueinput.NewAssessment(r.Context(), f, conn.ForgeProjectID)
+	assessment := issueinput.NewAssessment(r.Context(), ch, conn.ForgeProjectID)
 	defer assessment.Close()
 	own := conn.IssueIID != nil && *conn.IssueIID == iid
-	issue, err := f.GetIssue(assessment.Context(), conn.ForgeProjectID, iid)
+	issue, err := tr.GetIssue(assessment.Context(), conn.ForgeProjectID, iid)
 	unavailable := err != nil
 	if unavailable && !own {
 		h.forgeDriverError(w, err)
@@ -180,7 +181,7 @@ func (h *Handler) WorkerForgeGetIssue(w http.ResponseWriter, r *http.Request) {
 	var commentsTruncated, commentsWithheld bool
 	commentsUnknown := unavailable
 	if !unavailable {
-		raw, cerr := f.ListIssueComments(assessment.Context(), conn.ForgeProjectID, iid)
+		raw, cerr := tr.ListIssueComments(assessment.Context(), conn.ForgeProjectID, iid)
 		if cerr != nil {
 			commentsUnknown = true
 		} else {
@@ -229,6 +230,7 @@ func (h *Handler) WorkerForgeListIssues(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	tr := forge.IssueTracker(f)
 	q := r.URL.Query()
 	var opts forge.ListIssuesOptions
 	switch q.Get("state") {
@@ -262,7 +264,7 @@ func (h *Handler) WorkerForgeListIssues(w http.ResponseWriter, r *http.Request) 
 	// report truncated=true, regardless of what the worker requested.
 	opts.Limit = MaxForgeListItems + 1
 
-	issues, err := f.ListIssues(r.Context(), conn.ForgeProjectID, opts)
+	issues, err := tr.ListIssues(r.Context(), conn.ForgeProjectID, opts)
 	if err != nil {
 		h.forgeDriverError(w, err)
 		return
@@ -302,12 +304,13 @@ func (h *Handler) WorkerForgeListIssueLabelEvents(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
+	tr := forge.IssueTracker(f)
 	iid, err := parseInt64(chi.URLParam(r, "iid"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
 		return
 	}
-	events, err := f.ListIssueLabelEvents(r.Context(), conn.ForgeProjectID, iid)
+	events, err := tr.ListIssueLabelEvents(r.Context(), conn.ForgeProjectID, iid)
 	if err != nil {
 		h.forgeDriverError(w, err)
 		return
@@ -341,12 +344,13 @@ func (h *Handler) WorkerForgeGetMergeRequest(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
+	ch := forge.CodeHost(f)
 	iid, err := parseInt64(chi.URLParam(r, "iid"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
 		return
 	}
-	mrq, err := f.GetMergeRequest(r.Context(), conn.ForgeProjectID, iid)
+	mrq, err := ch.GetMergeRequest(r.Context(), conn.ForgeProjectID, iid)
 	if err != nil {
 		h.forgeDriverError(w, err)
 		return
@@ -366,12 +370,13 @@ func (h *Handler) WorkerForgePipelineJobs(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	ch := forge.CodeHost(f)
 	pipelineID, err := parseInt64(chi.URLParam(r, "pipeline_id"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
 		return
 	}
-	jobs, err := f.ListPipelineJobs(r.Context(), conn.ForgeProjectID, pipelineID)
+	jobs, err := ch.ListPipelineJobs(r.Context(), conn.ForgeProjectID, pipelineID)
 	if err != nil {
 		h.forgeDriverError(w, err)
 		return
@@ -407,6 +412,7 @@ func (h *Handler) WorkerForgeLatestPipeline(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	ch := forge.CodeHost(f)
 	q := r.URL.Query()
 	ref := q.Get("ref")
 	mrRaw := q.Get("mr_iid")
@@ -418,14 +424,14 @@ func (h *Handler) WorkerForgeLatestPipeline(w http.ResponseWriter, r *http.Reque
 	var pipe forge.Pipeline
 	var err error
 	if ref != "" {
-		pipe, err = f.LatestPipeline(r.Context(), conn.ForgeProjectID, ref)
+		pipe, err = ch.LatestPipeline(r.Context(), conn.ForgeProjectID, ref)
 	} else {
 		mrIID, perr := parseInt64(mrRaw)
 		if perr != nil {
 			httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
 			return
 		}
-		pipe, err = f.LatestMRPipeline(r.Context(), conn.ForgeProjectID, mrIID)
+		pipe, err = ch.LatestMRPipeline(r.Context(), conn.ForgeProjectID, mrIID)
 	}
 	if err != nil {
 		if errors.Is(err, forge.ErrNoPipeline) {
@@ -511,6 +517,7 @@ func (h *Handler) WorkerForgeReplyMRThread(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	ch := forge.CodeHost(f)
 	var req apitypes.ForgeMRThreadReplyRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
@@ -534,7 +541,7 @@ func (h *Handler) WorkerForgeReplyMRThread(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusForbidden, forgeErrMRThreadScope)
 		return
 	}
-	if err := f.ReplyMergeRequestComment(r.Context(), conn.ForgeProjectID, mrIID, req.ReplyID, body); err != nil {
+	if err := ch.ReplyMergeRequestComment(r.Context(), conn.ForgeProjectID, mrIID, req.ReplyID, body); err != nil {
 		h.forgeDriverError(w, err)
 		return
 	}
@@ -551,6 +558,7 @@ func (h *Handler) WorkerForgeResolveMRThread(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
+	ch := forge.CodeHost(f)
 	var req apitypes.ForgeMRThreadResolveRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
@@ -568,7 +576,7 @@ func (h *Handler) WorkerForgeResolveMRThread(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusForbidden, forgeErrMRThreadScope)
 		return
 	}
-	err := f.ResolveMergeRequestThread(r.Context(), conn.ForgeProjectID, mrIID, req.ResolveID)
+	err := ch.ResolveMergeRequestThread(r.Context(), conn.ForgeProjectID, mrIID, req.ResolveID)
 	if errors.Is(err, forge.ErrResolveUnsupported) {
 		// Forgejo has no resolvable-thread concept: reply-only is the documented contract,
 		// so a resolve is a tolerated no-op rather than a run failure.

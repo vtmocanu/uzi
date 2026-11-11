@@ -588,7 +588,7 @@ type fakeBuilder struct {
 	err error
 }
 
-func (b *fakeBuilder) SetIssueLabel(context.Context, forge.Forge, int64, store.Issue, string, string, bool) (store.Issue, error) {
+func (b *fakeBuilder) SetIssueLabel(context.Context, forge.IssueTracker, int64, store.Issue, string, string, bool) (store.Issue, error) {
 	panic("unexpected label removal")
 }
 
