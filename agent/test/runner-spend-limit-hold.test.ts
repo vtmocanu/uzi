@@ -155,4 +155,34 @@ describe("RunRunner #3767 spend-limit hold", () => {
       assert.equal(client.protocolFeatures.includes(FEATURE), false, "the refused feature is dropped");
     });
   });
+
+  it("a feature dropped between park retries fails the run with the original message, no loop and no untyped send", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = ["claim_generation_fence", FEATURE];
+      const claim = gitlabClaim(3772, { claim_generation: 3 });
+      let sends = 0;
+      const arm = (): void => api.failStateWhen(claim.run_id, (b) => {
+        if (b.recovery_cause !== "anthropic_spend_limit") return false;
+        sends++;
+        // Every typed send in the first runner attempt hits a 5xx (the client's own bounded transport
+        // retries included, hence the re-arm); the feature set then shrinks (heartbeat replacement or
+        // a strict-decode rollback), so the runner's next park retry is refused locally.
+        client.protocolFeatures = ["claim_generation_fence"];
+        if (sends < 20) arm();
+        return true;
+      }, { httpStatus: 503, error: "unavailable" });
+      arm();
+      const r = rig(spend, homeRoot);
+      const outcome = await Promise.race([
+        r.runner.execute(claim).then(() => "done"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 20000).unref()),
+      ]);
+      assert.equal(outcome, "done", "the run must end instead of retrying forever");
+      assert.ok(sends >= 1 && sends < 20, `bounded typed sends, got ${sends}`);
+      assert.equal(parks(claim.run_id).filter((b) => b.recovery_cause === undefined).length, 0, "no untyped park was sent");
+      const failed = failures(claim.run_id);
+      assert.equal(failed.length, 1);
+      assert.equal(failed[0]!.failure_reason, MESSAGE);
+    });
+  });
 });

@@ -21215,8 +21215,9 @@ type ResumeAnthropicSpendLimitHoldParams struct {
 	GlobalTimeoutSeconds int32     `json:"global_timeout_seconds"`
 }
 
-// Owner Resume of an anthropic_spend_limit hold: one ordinary queued attempt on the SAME
-// credential (a run-pinned run keeps anthropic_secret_id), no new allowance, grant or episode.
+// Owner Resume of an anthropic_spend_limit hold: one ordinary queued attempt whose next claim
+// re-selects the credential through the run's own claim ladder (a run-pinned secret is kept; auto
+// mode may pick another pooled token, issue #4163), no new allowance, grant or episode.
 // Mirrors ResumeDataVolumeFullHold. The hold's recovery_wait_phase is not meaningful for this
 // cause (the worker never writes one), so it is not consulted; stop_kind and the wall-budget
 // clauses are kept, exactly as the disk resume.

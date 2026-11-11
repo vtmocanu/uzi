@@ -26,7 +26,7 @@ import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
-import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
+import { RequestError, SpendLimitParkUnsupportedError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
 import type { ClarificationSettlement } from "./protocol.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
@@ -23397,10 +23397,13 @@ export class RunRunner {
           // Issue #3767: a DEFINITE refusal (an api that cannot take this cause answers a 4xx) never
           // loops: the run fails with the provider's original message. Transport and 5xx errors
           // keep the retry below.
-          if (spend && reportError instanceof RequestError && reportError.status >= 400 && reportError.status < 500 &&
-              ![408, 409, 425, 429].includes(reportError.status)) {
-            runLog.warn("spend-limit park refused by the api; failing the run with the provider message", {
-              status: reportError.status,
+          // The client's local refusal (feature dropped mid-retry, or no positive generation) is just
+          // as definite: nothing was sent and nothing untyped may be sent.
+          if (spend && (reportError instanceof SpendLimitParkUnsupportedError ||
+              (reportError instanceof RequestError && reportError.status >= 400 && reportError.status < 500 &&
+              ![408, 409, 425, 429].includes(reportError.status)))) {
+            runLog.warn("spend-limit park refused; failing the run with the provider message", {
+              status: reportError instanceof RequestError ? reportError.status : undefined,
             });
             await failCapture(err);
             return false;

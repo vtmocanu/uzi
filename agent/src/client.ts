@@ -406,6 +406,17 @@ export class HeldFeatureUnavailableError extends Error {
   }
 }
 
+/** Issue #3767: a spend-limit park was requested but the client no longer supports it (the feature
+ *  left the negotiated set, or the generation is not positive). Thrown BEFORE anything is sent and
+ *  never retryable: the runner fails the run with the provider message instead of looping or sending
+ *  an untyped park. */
+export class SpendLimitParkUnsupportedError extends Error {
+  constructor() {
+    super("spend-limit park requires support and a positive generation");
+    this.name = "SpendLimitParkUnsupportedError";
+  }
+}
+
 /** The typed outcome of {@link WorkerClient.publishHeld}. `ok: true` only means the api answered 2xx
  *  with a well-formed body; the caller must still require `body.state === "created"`. */
 export type HeldPublishResult =
@@ -2753,7 +2764,7 @@ export class WorkerClient {
       // only this feature's gate and propagates so the runner fails the run with the provider message.
       if (!this.hasFeature("recovery_cause_anthropic_spend_limit") || body.status !== "recovery_wait" ||
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) < 1)
-        throw new Error("spend-limit park requires support and a positive generation");
+        throw new SpendLimitParkUnsupportedError();
       const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
       try {
         return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
