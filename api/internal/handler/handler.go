@@ -478,7 +478,7 @@ func (h *Handler) templateWriteStore() agentTemplateWriteStore {
 
 // issueTrackerForRepo builds the issue-tracker half of a repo's forge, going through
 // the injected forgeFactory when one is set and otherwise through
-// forgesvc.Service.IssueTrackerForRepo. It returns a nil tracker whenever err != nil,
+// forgesvc.Service.IssueTrackerForRepo. It returns a nil issue tracker whenever err != nil,
 // on both paths. nil-safe only when a factory is injected; in production h.svc is
 // always wired.
 func (h *Handler) issueTrackerForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.IssueTracker, error) {

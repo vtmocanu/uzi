@@ -1419,7 +1419,7 @@ func (e *Scheduler) proposalDigestSection(ctx context.Context, sched store.RunSc
 		e.logger.Warn("scheduler: proposal digest skipped, cannot resolve repo/forge", "schedule", sched.ID.String(), "error", err)
 		return ""
 	}
-	var tr forge.IssueTracker = f // only the tracker half is needed here
+	var tr forge.IssueTracker = f // only the issue-tracker half is needed here
 	// The SAME label workersvc files a proposal under (single source of truth), so the
 	// digest lists exactly this job's own proposal history.
 	label := workersvc.ProposalLabel(catalogSlugOf(sched))
