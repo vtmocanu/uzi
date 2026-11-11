@@ -115,7 +115,7 @@ type ListIssuesOptions struct {
 
 // IssueTracker is the issue-side half of the driver contract: issues, labels,
 // comments and issue state. It is split out of Forge (PRD #4173) so a later phase
-// can let a non-forge tracker implement it without the code-host methods.
+// can let a non-forge issue tracker implement it without the code-host methods.
 type IssueTracker interface {
 	// ListLabels returns all labels defined on a project.
 	ListLabels(ctx context.Context, projectID int64) ([]Label, error)
