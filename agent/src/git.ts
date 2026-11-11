@@ -3119,7 +3119,7 @@ const RETENTION_RM_CLOSE_WAIT_MS = 10_000;
 export type JoinedEpochChild =
   | { joined: true; spawned: true; ticket: { settle(): void }; code: number | null; signal: NodeJS.Signals | null;
       stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer; failure: unknown }
-  | { joined: true; spawned: false; ticket: { settle(): void }; failure: unknown };
+  | { joined: true; spawned: false; provenance?: "not-spawned"; ticket: { settle(): void }; failure: unknown };
 
 /** Issue #4043: one admitted scratch leaf to delete (see {@link GitCache.discardEpochScratchLeaf}). */
 export interface EpochScratchDiscardInput {
@@ -3929,7 +3929,17 @@ export class GitCache {
       bytes: options.bytes, encoding: options.encoding, identity,
       signals: [state.signal, ...(signal ? [signal] : [])], deadline: state.deadline,
     });
-    if (!joined.spawned) { state.scope.stop(); throw joined.failure; }
+    if (!joined.spawned) {
+      if (joined.provenance === "not-spawned" && !state.scope.stopped()) {
+        joined.ticket.settle();
+        throw Object.assign(new Error("epoch native executable not spawned", { cause: joined.failure }), {
+          epochNativeNotSpawned: true,
+          ...(joined.failure && typeof joined.failure === "object" && "code" in joined.failure
+            ? { code: joined.failure.code } : {}),
+        });
+      }
+      state.scope.stop(); throw joined.failure;
+    }
     if (state.scope.stopped()) throw new Error("epoch native scope stopped");
     joined.ticket.settle();
     const { failure, code } = joined;
@@ -3952,6 +3962,9 @@ export class GitCache {
    * Any joined outcome (a non-zero exit, a signal, an abort, a timeout that was killed and joined)
    * returns `{ joined: true, spawned: true }`; a spawn that throws before a child exists returns
    * `{ joined: true, spawned: false }` and the caller decides whether that stops the scope. An
+   * asynchronous exec error observed before close, with no spawn, PID or exit evidence, returns the additional
+   * `provenance: "not-spawned"` only after close and successful output joins. Callers may
+   * settle that refusal without treating it as a generic joined process error. An
    * unconfirmed join stops the scope and throws with `epochProcessJoined: false`.
    */
   private async spawnJoinedEpochChild(
@@ -3970,12 +3983,22 @@ export class GitCache {
         env: options.env, cwd: options.cwd, detached: true, stdio,
       });
     } catch (error) { return { joined: true, spawned: false, ticket, failure: error }; }
-    const pid = child.pid;
+    let sawSpawn = false, sawExit = false, errorBeforeSpawn = false, noChildJoined = false;
+    let sawPid = child.pid !== undefined;
+    const noChild = () => {
+      sawPid ||= child.pid !== undefined;
+      return errorBeforeSpawn && !sawSpawn && !sawExit && !sawPid &&
+        child.pid === undefined &&
+        // Node records the negative exec errno in exitCode even though no exit event fires.
+        (child.exitCode === null || child.exitCode < 0) && child.signalCode === null;
+    };
     const alive = () => {
+      const pid = child.pid;
       if (!Number.isSafeInteger(pid) || pid! <= 0) throw new Error("epoch process group unknown");
       return deps ? deps.alive(pid!, identity) : processGroupAlive(pid!, identity, true);
     };
     const kill = () => {
+      const pid = child.pid;
       if (deps) { deps.kill(pid!, identity); return; }
       if (identity === "command") {
         if (!killRunnerGroupOnly(pid!, true) && alive()) throw new Error("epoch group signal unconfirmed");
@@ -3996,6 +4019,13 @@ export class GitCache {
       try {
         // Normal exit permits one bounded grace; errors cancel immediately. Only
         // positive group absence plus direct and IO joins can settle this ticket.
+        // A confirmed exec failure has no group to probe. Close and both output
+        // joins are still mandatory, and every await rechecks contradictory evidence.
+        while (noChild()) {
+          if (closed && ioJoined) { noChildJoined = true; return; }
+          if (Date.now() >= until) throw new Error("epoch native group unknown: no-child IO join unconfirmed");
+          await new Promise<void>(resolve => setTimeout(resolve, 10));
+        }
         const grace = Date.now() + (failure ? 0 : joinMs);
         while (alive() && Date.now() < grace && !failure)
           await new Promise<void>(resolve => setTimeout(resolve, 10));
@@ -4045,8 +4075,12 @@ export class GitCache {
       catch (error) { scope.stop(); fail(error); }
     }
     void Promise.all(io).then(() => { ioJoined = io.length >= 2; }, fail);
-    child.once("exit", value => { direct = true; code = value; clean(); });
-    child.once("error", error => { direct = true; fail(error); });
+    child.on("spawn", () => { sawSpawn = true; sawPid ||= child.pid !== undefined; });
+    child.on("exit", value => { sawExit = true; direct = true; code = value; clean(); });
+    child.on("error", error => {
+      errorBeforeSpawn ||= !closed && !sawSpawn && !sawExit && child.pid === undefined;
+      direct = true; fail(error);
+    });
     child.once("close", () => { closed = true; });
     const abortSignal = AbortSignal.any([...options.signals]);
     const abort = () => fail(abortSignal.reason ?? new Error(GIT_OUTPUT_ABORT_MESSAGE));
@@ -4060,6 +4094,18 @@ export class GitCache {
       catch (error) {
         if (error !== null && typeof error === "object") Object.assign(error, { epochProcessJoined: false });
         throw error;
+      }
+      if (noChild() && closed && ioJoined && !scope.stopped())
+        return { joined: true, spawned: false, provenance: "not-spawned", ticket, failure };
+      if (noChildJoined) {
+        scope.stop();
+        throw Object.assign(new Error("epoch no-child lifecycle changed"), { epochProcessJoined: false });
+      }
+      // Revalidate after the cleanup await: late lifecycle evidence cannot inherit
+      // a no-child join that skipped process-group proof.
+      if (!Number.isSafeInteger(child.pid) || child.pid! <= 0) {
+        scope.stop();
+        throw Object.assign(new Error("epoch process group unknown"), { epochProcessJoined: false });
       }
       const stdoutBytes = Buffer.concat(chunks.stdout);
       const stderrBytes = Buffer.concat(chunks.stderr);
@@ -4093,7 +4139,8 @@ export class GitCache {
             { env: { PATH: "/usr/bin:/bin" }, cwd: "/", timeout: RETENTION_RM_TIMEOUT_MS }, "command");
           joined = true;
         } catch (error) {
-          joined = (error as { epochProcessJoined?: boolean }).epochProcessJoined === true;
+          joined = (error as { epochProcessJoined?: boolean }).epochProcessJoined === true ||
+            (error as { epochNativeNotSpawned?: boolean }).epochNativeNotSpawned === true;
           throw error;
         }
       } else {
@@ -4114,7 +4161,8 @@ export class GitCache {
       if (!joined || state.scope.stopped()) { state.scope.stop(); throw error; }
       try { await settlement?.settle({ ok: false, residue: [target] }); }
       catch { state.scope.stop(); throw error; }
-      if (undeletableCode(error) !== undefined)
+      if (undeletableCode(error) !== undefined ||
+          (error as { epochNativeNotSpawned?: boolean }).epochNativeNotSpawned === true)
         throw Object.assign(error as object, { epochDeleteJoined: true });
       throw error;
     } finally {
