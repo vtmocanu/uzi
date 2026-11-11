@@ -1339,7 +1339,7 @@ shipping_path_regressions() {
   # shellcheck source=scripts/lib/shipping-paths.sh
   . "$SCRIPTS_DIR/lib/shipping-paths.sh"
   local expected="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global agent/codex scripts/sqlc.sh"
-  assert_eq "shared runtime set stays exact" "$expected" "$AGENT_PATHS"
+  assert_eq "shared runtime set stays exact" "$expected :(exclude)agent/codex/codex-package.adopted" "$AGENT_PATHS"
   local p d out status subject
   for p in $expected; do
     if is_shipping "$p"; then pass "runtime entry $p ships"; else fail "runtime entry $p ships"; fi
@@ -1349,7 +1349,7 @@ shipping_path_regressions() {
   for p in api/x.go controller/x.go web/src/x.ts deploy/chart/values.yaml docs/cli.md; do
     if is_shipping "$p"; then pass "existing shipping $p"; else fail "existing shipping $p"; fi
   done
-  for p in api/x_test.go agent/src/foo.test.ts web/src/foo.test.tsx api/testdata/x agent/test/x.ts agent/templates/test/x agent/codex/x_test.go e2e/x fixtures/x .agents/skills/x prds/x.md agent/README.md; do
+  for p in api/x_test.go agent/src/foo.test.ts web/src/foo.test.tsx api/testdata/x agent/test/x.ts agent/templates/test/x agent/codex/x_test.go agent/codex/codex-package.adopted e2e/x fixtures/x .agents/skills/x prds/x.md agent/README.md; do
     if is_shipping "$p"; then fail "excluded $p"; else pass "excluded $p"; fi
   done
 
@@ -1428,6 +1428,42 @@ MD
     pass "autobump has no private AGENT_PATHS assignment"
   fi
   assert_contains "autobump sources shipping library" '/lib/shipping-paths.sh"' "$(cat "$SCRIPTS_DIR/worker-tag-autobump.sh")"
+  # #4172: the release adoption assertion is not worker execution input. Its
+  # addition AND later record-only edits must preserve the published worker pin.
+  d="$(mktemp -d)"; seed_repo "$d"
+  mkdir -p "$d/agent/codex"
+  for subject in seed amend; do
+    printf 'adoption assertion %s\n' "$subject" > "$d/agent/codex/codex-package.adopted"
+    git -C "$d" add agent/codex/codex-package.adopted
+    gcommit "$d" "docs: $subject adoption assertion"
+    status=0
+    out="$(cd "$d" && bash scripts/worker-tag-autobump.sh --check 0.2.0 2>&1)" || status=$?
+    assert_eq "$subject adoption-only check needs no worker bump" 0 "$status"
+    status=0
+    out="$(cd "$d" && bash scripts/worker-tag-autobump.sh 0.2.0 2>&1)" || status=$?
+    assert_eq "$subject adoption-only edit succeeds" 0 "$status"
+    assert_eq "$subject adoption-only keeps worker pin" 0.1.0 "$(pin_tag "$d")"
+    assert_eq "$subject adoption-only leaves tracked inputs unchanged" '' "$(git -C "$d" status --porcelain --untracked-files=no)"
+    # Keep the next fixture discriminating even against the unmodified autobump.
+    git -C "$d" checkout -- deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh
+  done
+  # The exception is exactly one path; neither its neighbor nor the lock is exempt.
+  for p in agent/codex/codex-package.adopted.extra agent/codex/codex-package.lock; do
+    printf 'runtime change\n' > "$d/$p"
+    git -C "$d" add "$p"; gcommit "$d" "chore: change $p"
+    status=0
+    out="$(cd "$d" && bash scripts/worker-tag-autobump.sh --check 0.2.0 2>&1)" || status=$?
+    assert_eq "$p still requires worker bump" 1 "$status"
+    assert_contains "$p appears in changed runtime paths" "$p" "$out"
+    git -C "$d" rm -q "$p"; gcommit "$d" "test: remove $p"
+  done
+  printf 'runtime change\n' > "$d/agent/codex/codex-package.lock"
+  git -C "$d" add agent/codex/codex-package.lock; gcommit "$d" 'chore: change actual runtime lock'
+  status=0
+  out="$(cd "$d" && bash scripts/worker-tag-autobump.sh 0.2.0 2>&1)" || status=$?
+  assert_eq 'runtime lock edit still succeeds' 0 "$status"
+  assert_eq 'runtime lock still advances worker pin' 0.2.0 "$(pin_tag "$d")"
+  rm -rf "$d"
   # Override only the fixture-local library. A non-agent sentinel proves both actual
   # Git diff selection and changed-path reporting consume that library's pathspecs.
   d="$(mktemp -d)"; seed_repo "$d"
