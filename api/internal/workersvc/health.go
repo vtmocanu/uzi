@@ -217,11 +217,11 @@ const (
 	// required_capabilities and the capability-aware kill-switch, so an all-old-image fleet
 	// leaves the run queued until a worker that enforces the guard comes online.
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
-	reasonNoRepoAgentSourceCapableWorker    = "no online worker reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
-	reasonNoAgentSourceRequestCapableWorker = "no online worker honours the run's requested agent source (agent_source_request_v1); upgrade a worker"
+	reasonNoRepoAgentSourceCapableWorker    = "no regular online worker accepting new intake reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
+	reasonNoAgentSourceRequestCapableWorker = "no regular online worker accepting new intake honours the run's requested agent source (agent_source_request_v1); upgrade a worker"
 	// reasonNoRepoAgentSourceAndRequestCapableWorker (issue #4005) is emitted when each of the two
 	// reasons above is satisfied by some worker but no single worker satisfies both.
-	reasonNoRepoAgentSourceAndRequestCapableWorker = "no single online worker supports both repo agent sources (repo_agent_source_v1) and the requested agent source (agent_source_request_v1); upgrade a worker"
+	reasonNoRepoAgentSourceAndRequestCapableWorker = "no single regular online worker accepting new intake supports both repo agent sources (repo_agent_source_v1) and the requested agent source (agent_source_request_v1); upgrade a worker"
 	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
 	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
 	// advertising the 'codex_harness_v1' protocol capability. Like reasonNoCompletionCapableWorker
@@ -1381,6 +1381,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	}
 	eligibility, eligibilityErr := projection.counts, projection.err
 	until, held := s.ownerHold(now, r)
+	sourceGap := s.assignedRepoAgentSourceGap(ctx, r)
 	preserveManual := eligibilityErr != nil && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String)
 	if eligibilityErr == nil {
 		if reason := manualCordonWaitReason(eligibility); reason != "" {
@@ -1391,10 +1392,10 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 		}
 	}
 	if held && !preserveManual && (eligibilityErr != nil || (eligibility.AssignedClaimable == 0 && (eligibility.ManualCordoned == 0 || eligibility.AutomaticOwnerHold))) {
-		return ownerHoldReason(until, r.StaleRequeueWorkerName)
+		return withHeldRepoAgentSourceGap(ownerHoldReason(until, r.StaleRequeueWorkerName), sourceGap)
 	}
 	if until, pinned := s.staleRequeuePin(now, r); pinned {
-		return staleRequeuePinReason(until, r.StaleRequeueWorkerName)
+		return withHeldRepoAgentSourceGap(staleRequeuePinReason(until, r.StaleRequeueWorkerName), sourceGap)
 	}
 	if preserveManual {
 		// A failed projection cannot prove that the prior manual block ended.
@@ -1492,7 +1493,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			if err != nil {
 				slog.Error("health: count repo agent source capable workers", "run_id", r.ID, "error", err)
 			} else if n == 0 {
-				return reasonNoRepoAgentSourceCapableWorker
+				return withAssignedRepoAgentSourceGap(reasonNoRepoAgentSourceCapableWorker, sourceGap)
 			}
 		}
 	}
@@ -1504,7 +1505,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			if err != nil {
 				slog.Error("health: count agent-source-request capable workers", "run_id", r.ID, "error", err)
 			} else if n == 0 {
-				return reasonNoAgentSourceRequestCapableWorker
+				return withAssignedRepoAgentSourceGap(reasonNoAgentSourceRequestCapableWorker, sourceGap)
 			}
 		}
 	}
@@ -1519,7 +1520,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			if err != nil {
 				slog.Error("health: count repo agent source and request capable workers", "run_id", r.ID, "error", err)
 			} else if n == 0 {
-				return reasonNoRepoAgentSourceAndRequestCapableWorker
+				return withAssignedRepoAgentSourceGap(reasonNoRepoAgentSourceAndRequestCapableWorker, sourceGap)
 			}
 		}
 	}
@@ -1787,6 +1788,9 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 				return fmt.Sprintf("waiting for another worker, or restart worker %s (its previous process was released at the time limit)", wkr.Name)
 			}
 		}
+	}
+	if sourceGap {
+		return reasonAssignedRepoAgentSourceGap
 	}
 	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, r.UserID)
 	if err != nil {
@@ -2193,7 +2197,9 @@ func isStaleRequeuePinReason(reason string) bool {
 	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix) &&
 		strings.Contains(reason, " for its previous worker") &&
 		(strings.HasSuffix(reason, " to return; another worker may take it after that") ||
-			strings.HasSuffix(reason, " to finish draining or maintenance; another worker may take it after that"))
+			strings.HasSuffix(reason, " to finish draining or maintenance; another worker may take it after that") ||
+			strings.HasSuffix(reason, " to return"+heldRepoAgentSourceGapSuffix) ||
+			strings.HasSuffix(reason, " to finish draining or maintenance"+heldRepoAgentSourceGapSuffix))
 }
 
 func isCodeCrossCheckWaitingReason(reason string) bool {

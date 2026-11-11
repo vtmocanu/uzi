@@ -11238,7 +11238,7 @@ SELECT id, runs.user_id, status, auto_approve,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
-       harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
+       harness, codex_material_revision, codex_secret_id, worker_id, claim_generation, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
@@ -11357,6 +11357,7 @@ type ListActiveRunsForHealthRow struct {
 	CodexMaterialRevision     pgtype.Int8        `json:"codex_material_revision"`
 	CodexSecretID             pgtype.UUID        `json:"codex_secret_id"`
 	WorkerID                  pgtype.UUID        `json:"worker_id"`
+	ClaimGeneration           int64              `json:"claim_generation"`
 	ReleasedWorkerID          pgtype.UUID        `json:"released_worker_id"`
 	EgressProfileID           pgtype.UUID        `json:"egress_profile_id"`
 	JobProtocol               pgtype.Int2        `json:"job_protocol"`
@@ -11484,6 +11485,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.CodexMaterialRevision,
 			&i.CodexSecretID,
 			&i.WorkerID,
+			&i.ClaimGeneration,
 			&i.ReleasedWorkerID,
 			&i.EgressProfileID,
 			&i.JobProtocol,
