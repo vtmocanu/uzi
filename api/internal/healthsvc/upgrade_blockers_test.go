@@ -14,6 +14,38 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+func TestCapacityBlockerCapabilityEvidence(t *testing.T) {
+	for _, reason := range []string{"", "manual hold", "waiting: provider reported overload; account admission eligible after private"} {
+		owner, worker, run := uuid.New(), uuid.New(), uuid.New()
+		f := &fakeStore{
+			capacityRows: []store.ListOwnersWaitingNoCapacityRow{{RunID: uuid.New(), UserID: owner}},
+			workers:      []store.ListAllWorkersRow{{Worker: store.Worker{ID: worker, UserID: owner, Kind: "hosted", DrainingSince: pgtype.Timestamptz{Valid: true, Time: fixedNow}}}},
+			blockerRows: []store.ListWorkerUpgradeBlockersRow{{
+				WorkerID: worker, WorkerOwner: owner, SafeCount: 1,
+				RunID: pgtype.UUID{Bytes: run, Valid: true}, Status: pgtype.Text{String: "queued", Valid: true},
+				HealthReason:           pgtype.Text{String: reason, Valid: reason != ""},
+				HoldReason:             pgtype.Text{String: "credential_disabled", Valid: true},
+				MissingRepoAgentSource: true,
+			}},
+		}
+		v := newSvc(f, nil).checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled).Evidence[0].Value
+		for _, want := range []string{run.String(), "repo_agent_source_v1", "credential_disabled", "release requires terminal or unassignment"} {
+			if !strings.Contains(v, want) {
+				t.Fatalf("%s missing %s", v, want)
+			}
+		}
+		if reason == "" && !strings.Contains(v, "recorded reason unavailable") {
+			t.Fatal(v)
+		}
+		if reason == "manual hold" && !strings.Contains(v, reason) {
+			t.Fatal(v)
+		}
+		if strings.Contains(v, "private") || len([]rune(v)) > 512 {
+			t.Fatal(v)
+		}
+	}
+}
+
 func TestCapacityBlockersRetainedOwnersMultiworker(t *testing.T) {
 	f := &fakeStore{}
 	var retained []uuid.UUID

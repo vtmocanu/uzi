@@ -13,6 +13,40 @@ import (
 
 func blockerText(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
 
+func TestUpgradeBlockerCapabilityWithRecordedFacts(t *testing.T) {
+	for _, reason := range []string{"", "manual hold", "waiting: provider reported overload; account admission eligible after private"} {
+		for _, missing := range []bool{false, true} {
+			w := uuid.New()
+			r := store.ListWorkerUpgradeBlockersRow{
+				WorkerID: w, SafeCount: 1, RunID: pgtype.UUID{Bytes: uuid.New(), Valid: true},
+				Status: blockerText("queued"), HoldReason: blockerText("credential_disabled"),
+				MissingRepoAgentSource: missing,
+			}
+			if reason != "" {
+				r.HealthReason = blockerText(reason)
+			}
+			got := GroupUpgradeBlockers([]store.ListWorkerUpgradeBlockersRow{r})[w].Summary()
+			for _, want := range []string{"hold credential_disabled", "exact fence unavailable", "assignment releases only when the run ends"} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("%s missing %s", got, want)
+				}
+			}
+			if strings.Contains(got, "repo_agent_source_v1") != missing {
+				t.Fatal(got)
+			}
+			if reason == "" && !strings.Contains(got, "recorded reason unavailable") {
+				t.Fatal(got)
+			}
+			if reason == "manual hold" && !strings.Contains(got, reason) {
+				t.Fatal(got)
+			}
+			if strings.Contains(got, "private") {
+				t.Fatal(got)
+			}
+		}
+	}
+}
+
 func TestUpgradeBlockerStatuses(t *testing.T) {
 	tests := []struct{ status, want string }{
 		{"awaiting_approval", "owner approves or reviews"},

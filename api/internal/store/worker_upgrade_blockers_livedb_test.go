@@ -128,6 +128,40 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 			t.Fatalf("%+v", r)
 		}
 	}
+	// Exercise the independent capability fact through the real generated query.
+	for _, tc := range []struct {
+		name                      string
+		required, commit, capable bool
+		status                    string
+		want                      bool
+	}{
+		{"required-no-commit", true, false, false, "queued", true},
+		{"required-commit", true, true, false, "queued", true},
+		{"commit-only", false, true, false, "queued", true},
+		{"neither", false, false, false, "queued", false},
+		{"capable", true, true, true, "queued", false},
+		{"nonqueued", true, true, false, "paused", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, id := worker(), uuid.New()
+			seed(id, owner, w, tc.status, "prompt")
+			var commit any
+			if tc.commit {
+				commit = strings.Repeat("a", 40)
+			}
+			exec("UPDATE runs SET repo_agent_source_required=$2, repo_agent_source_commit=$3 WHERE id=$1", id, tc.required, commit)
+			if tc.capable {
+				exec("UPDATE workers SET protocol_capabilities=ARRAY['repo_agent_source_v1'] WHERE id=$1", w)
+			}
+			got, err := q.ListWorkerUpgradeBlockers(ctx, []uuid.UUID{w})
+			if err != nil || len(got) != 1 {
+				t.Fatalf("projection: %+v %v", got, err)
+			}
+			if got[0].MissingRepoAgentSource != tc.want {
+				t.Fatalf("projection: %+v want missing=%v", got[0], tc.want)
+			}
+		})
+	}
 	// Top five must use UUID order and the entire safe population's count.
 	top, empty, mixed, foreignOnly, other := worker(), worker(), worker(), worker(), worker()
 	var runIDs []string
@@ -143,7 +177,8 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 	seed(uuid.New(), owner, nil, "running", "chat")
 	seed(uuid.New(), owner, other, "running", "chat")
 	foreignRun := uuid.New()
-	seed(foreignRun, foreign, foreignOnly, "awaiting_input", "chat")
+	seed(foreignRun, foreign, foreignOnly, "queued", "prompt")
+	exec("UPDATE runs SET repo_agent_source_required=true WHERE id=$1", foreignRun)
 	seed(uuid.New(), foreign, mixed, "running", "chat")
 	safeRun := uuid.New()
 	seed(safeRun, owner, mixed, "paused", "chat")
@@ -170,7 +205,7 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 			}
 			n++
 		case empty:
-			if r.RunID.Valid || r.SafeCount != 0 || r.OwnerMismatch {
+			if r.RunID.Valid || r.SafeCount != 0 || r.OwnerMismatch || r.MissingRepoAgentSource {
 				t.Fatalf("%+v", r)
 			}
 		case mixed:
@@ -178,7 +213,7 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 				t.Fatalf("%+v", r)
 			}
 		case foreignOnly:
-			if !r.OwnerMismatch || r.RunID.Valid || r.SafeCount != 0 || r.Status.Valid || r.HealthReason.Valid {
+			if !r.OwnerMismatch || r.RunID.Valid || r.SafeCount != 0 || r.Status.Valid || r.HealthReason.Valid || r.MissingRepoAgentSource {
 				t.Fatalf("foreign disclosure: %+v", r)
 			}
 		default:
