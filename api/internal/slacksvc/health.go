@@ -6,6 +6,7 @@ import (
 
 	"github.com/slack-go/slack"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -160,6 +161,11 @@ func healthNudgeHead(health, reason string) string {
 		// ALREADY taken.
 		if reason == reasonVerdictUndelivered {
 			return "⏳ You've already responded; this run is waiting on its worker, not on you."
+		}
+		// Issue #4162: the per-run custody hold bound is neither an unclaimed-run wait
+		// nor an owner-capacity block, so neither sentence is true of it.
+		if reason == apitypes.ReasonCustodyRunHoldBound {
+			return "⏳ This run has reached its own custody hold limit."
 		}
 		return "⏳ This run is still waiting for a worker to pick it up."
 	case healthApprovalIdle:

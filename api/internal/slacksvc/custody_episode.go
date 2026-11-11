@@ -226,7 +226,7 @@ func buildCustodyEpisodeNotification(baseURL string, userID uuid.UUID, openHolds
 // pressure is not understated to nothing.
 func custodyEpisodeFacts(openHolds, admissionCountedHolds, blockedRuns int64) []string {
 	return []string{
-		fmt.Sprintf("*%d* admission-counted holds", admissionCountedHolds),
+		fmt.Sprintf("*%d* admission units", admissionCountedHolds),
 		fmt.Sprintf("*%d* held %s", openHolds, plural(openHolds, "source", "sources")),
 		fmt.Sprintf("*%d* blocked %s", blockedRuns, plural(blockedRuns, "run", "runs")),
 		"Discard held work: `" + custodyDiscardCommand + "`",

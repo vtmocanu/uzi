@@ -537,7 +537,15 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// Expiry into ordinary silence or approval age stays quiet across the cohort.
 		independentFault := reason == reasonPersistFailing || reason == reasonLooping ||
 			reason == reasonNearTimeout || reason == reasonOutcomeUndelivered
-		nudge := target != healthOK && (r.Health == healthOK || leftPin || (leftAccountCooldown && independentFault)) &&
+		// Issue #4162: the per-run hold bound is the run's own condition, unlike the owner-level
+		// reasonCustodyLimit that the episode reconciler covers. A run already flagged
+		// waiting_worker (for any reason, including reasonCustodyLimit) that acquires the
+		// bound reason starts a new nudge-eligible episode: the owner learns about a bound the
+		// owner-level DM never described. A run already carrying the bound reason does not
+		// re-nudge, and the cooldown term below still applies.
+		enteredRunBound := reason == apitypes.ReasonCustodyRunHoldBound &&
+			!(r.HealthReason.Valid && r.HealthReason.String == apitypes.ReasonCustodyRunHoldBound)
+		nudge := target != healthOK && (r.Health == healthOK || leftPin || enteredRunBound || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
 		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner

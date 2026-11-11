@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/slack-go/slack"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -165,6 +166,22 @@ func TestHealthNudgeHeadLeavesTheUnclaimedWordingExactlyAsItWas(t *testing.T) {
 	}
 	if got := healthNudgeHead(healthWaitingWorker, ""); got != before {
 		t.Fatalf("nudge head with NO reason = %q, want the unchanged %q — an empty reason must fall back to the original wording, which is also what a mirror drift degrades to", got, before)
+	}
+}
+
+// TestHealthNudgeHeadCustodyRunHoldBoundIsItsOwnSentence pins issue #4162: a run refused by
+// its OWN hold bound is neither unclaimed nor blocked by owner capacity, so the head must
+// say neither.
+func TestHealthNudgeHeadCustodyRunHoldBoundIsItsOwnSentence(t *testing.T) {
+	const want = "⏳ This run has reached its own custody hold limit."
+	got := healthNudgeHead(healthWaitingWorker, apitypes.ReasonCustodyRunHoldBound)
+	if got != want {
+		t.Fatalf("nudge head = %q, want %q", got, want)
+	}
+	for _, bad := range []string{"waiting for a worker", "new runs can't start", "custody limit, so", "capacity"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("nudge head = %q must not contain %q", got, bad)
+		}
 	}
 }
 

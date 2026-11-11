@@ -1374,18 +1374,18 @@ func (s *Service) checkCustodyHolds(ctx context.Context, now time.Time) apitypes
 	}
 	c.Evidence = []apitypes.HealthEvidenceDTO{
 		{Label: "Owners", Value: fmt.Sprintf("%d", len(owners))},
-		{Label: "Admission-counted holds", Value: fmt.Sprint(counted)},
+		{Label: "Admission units", Value: fmt.Sprint(counted)},
 		{Label: "Total open custody", Value: fmt.Sprint(total)},
 		{Label: "Owners with decisions", Value: fmt.Sprintf("%d", withDecisions)},
 		{Label: "Owners without decisions", Value: fmt.Sprintf("%d", withoutDecisions)},
 	}
 	switch {
 	case withDecisions == 0:
-		c.Action = strPtr("No owner decision is currently required; admission resumes when counted holds settle.")
+		c.Action = strPtr("No owner decision is currently required; admission resumes when admission units settle.")
 	case withoutDecisions == 0:
-		c.Action = strPtr("Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle.")
+		c.Action = strPtr("Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when admission units settle.")
 	default:
-		c.Action = strPtr("Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle. Other at-limit owners need no decision; admission resumes when their counted holds settle.")
+		c.Action = strPtr("Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when admission units settle. Other at-limit owners need no decision; admission resumes when their admission units settle.")
 	}
 	return c
 }

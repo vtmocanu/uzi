@@ -412,7 +412,7 @@ func TestOwnerRecoveryHuman(t *testing.T) {
 	for i, want := range [][]string{
 		{"run-a", "hold-a", "1", "source_only", "-", "false", "worker-a"},
 		{"run-b", "hold-b", "2", "needs_action", "counted", "(decision_needed)", "false", "beta"},
-		{"run-z", "hold-z", "3", "active", "not", "counted", "false", "worker-z"},
+		{"run-z", "hold-z", "3", "active", "not", "counted", "(live_claim)", "false", "worker-z"},
 	} {
 		got := strings.Fields(lines[i+1])
 		n := len(want)
@@ -424,7 +424,7 @@ func TestOwnerRecoveryHuman(t *testing.T) {
 		strings.Contains(out, "run-r") || strings.Contains(out, "run-d") {
 		t.Errorf("settled hold in human view: %q", out)
 	}
-	if !strings.Contains(out, "open_holds: 3  admission_counted_holds: 2  custody_hold_limit: 8  decision_needed: 2  blocked_runs: 1") {
+	if !strings.Contains(out, "open_holds: 3  admission_units (admission_counted_holds): 2  custody_hold_limit: 8  decision_needed: 2  blocked_runs: 1") {
 		t.Errorf("aggregate absent: %q", out)
 	}
 	if !strings.Contains(out, "2 hold(s) await a decision") || !strings.Contains(out, "run discard <run-id> --hold <hold-id> --yes") {
@@ -466,7 +466,7 @@ func TestOwnerRecoveryEmptyAndNoHint(t *testing.T) {
 		}}
 		out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery")
 		if code != uzicli.ExitOK || !strings.Contains(out, "no open custody holds") ||
-			!strings.Contains(out, "open_holds: 0  admission_counted_holds: 0  custody_hold_limit: 8  decision_needed: 0  blocked_runs: 0") ||
+			!strings.Contains(out, "open_holds: 0  admission_units (admission_counted_holds): 0  custody_hold_limit: 8  decision_needed: 0  blocked_runs: 0") ||
 			strings.Contains(out, "await a decision") || strings.Contains(out, "settled") {
 			t.Errorf("empty human view: code=%d output=%q", code, out)
 		}

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -895,6 +896,44 @@ func TestHealthQueuedCustodyLimit(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHealthQueuedCustodyRunHoldBound pins issue #4162 on the health side: a queued run whose
+// own open holds reached the bound reports apitypes.ReasonCustodyRunHoldBound, ahead of the
+// owner-level reasonCustodyLimit even when the owner is at/over the limit and not exempt, and
+// a young run (below the queued threshold) is flagged early for it.
+func TestHealthQueuedCustodyRunHoldBound(t *testing.T) {
+	t.Run("precedes owner limit", func(t *testing.T) {
+		r := runRow("queued")
+		fs := &healthFakeStore{custodyHolds: int64(testCustodyLimit) + 2, custodyRunBound: true, custodyOwnOpen: int64(testCustodyLimit)}
+		svc := healthSvc(fs, defaultHealthSettings())
+		if got := svc.queuedReason(context.Background(), t0, r, thWithLimit(testCustodyLimit)); got != apitypes.ReasonCustodyRunHoldBound {
+			t.Fatalf("reason = %q, want the run-bound reason (it outranks %q)", got, reasonCustodyLimit)
+		}
+	})
+	t.Run("bound not reached keeps the owner reason", func(t *testing.T) {
+		r := runRow("queued")
+		fs := &healthFakeStore{custodyHolds: int64(testCustodyLimit)}
+		svc := healthSvc(fs, defaultHealthSettings())
+		if got := svc.queuedReason(context.Background(), t0, r, thWithLimit(testCustodyLimit)); got != reasonCustodyLimit {
+			t.Fatalf("reason = %q, want %q", got, reasonCustodyLimit)
+		}
+	})
+	t.Run("young run is flagged early", func(t *testing.T) {
+		r := runRow("queued")
+		r.StatusSince = ago(time.Minute) // far below the 10m queued threshold
+		fs := &healthFakeStore{custodyHolds: int64(testCustodyLimit) - 1, custodyRunBound: true}
+		svc := healthSvc(fs, defaultHealthSettings())
+		health, reason := svc.youngQueuedTarget(context.Background(), t0, r, thWithLimit(testCustodyLimit))
+		if health != healthWaitingWorker || reason != apitypes.ReasonCustodyRunHoldBound {
+			t.Fatalf("young target = %q / %q, want waiting_worker / the run-bound reason", health, reason)
+		}
+	})
+	t.Run("precedes Codex admission", func(t *testing.T) {
+		if !QueuedReasonPrecedesCodexAdmission(apitypes.ReasonCustodyRunHoldBound) {
+			t.Fatal("run-bound reason must precede temporary Codex admission")
+		}
+	})
 }
 
 // TestHealthQueuedRepoNotDockerAllowed drives PRD #361's new queued arm through
