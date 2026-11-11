@@ -64,12 +64,12 @@ func TestHealthSourceGapControls(t *testing.T) {
 	for _, name := range []string{"commit only", "no requirement", "foreign", "missing", "error", "capable", "unassigned", "crosscheck", "noncontinuation", "no pin within ceiling", "eligibility error", "manual preserved", "forge", "roll", "account"} {
 		t.Run(name, func(t *testing.T) {
 			f, s, r := sourceGapFixture()
-			wantGap := false
+			want := reasonWaitingWorker
 			switch name {
 			case "commit only":
 				r.RepoAgentSourceRequired = false
 				r.RepoAgentSourceCommit = pgtype.Text{String: "retained", Valid: true}
-				wantGap = true
+				want = reasonAssignedRepoAgentSourceGap
 			case "no requirement":
 				r.RepoAgentSourceRequired = false
 			case "foreign":
@@ -84,27 +84,32 @@ func TestHealthSourceGapControls(t *testing.T) {
 				r.WorkerID = pgtype.UUID{}
 			case "crosscheck":
 				r.Kind = "cross_check"
+				want = reasonNoCrossCheckWorker
 			case "noncontinuation":
 				r.ClaimGeneration = 0
 			case "no pin within ceiling":
 				r.UpdatedAt = ago(time.Minute)
-				wantGap = true
+				want = reasonAssignedRepoAgentSourceGap
 			case "eligibility error":
 				f.eligibilityErr = errors.New("projection failed")
-				wantGap = true
+				want = reasonAssignedRepoAgentSourceGap
 			case "manual preserved":
 				f.eligibilityErr = errors.New("projection failed")
 				r.HealthReason = pgtype.Text{String: manualCordonWaitPrefix + " owner", Valid: true}
+				want = r.HealthReason.String
 			case "forge":
 				f.eligibility.ForgeBlocked = 1
+				want = reasonForgeOriginWait
 			case "roll":
 				f.eligibility.DrainingEligible = 1
+				want = ReasonWorkersUpgrading
 			case "account":
 				r.CodexAccountGated = true
+				want = reasonCodexAccountUnavailable
 			}
 			reason := s.queuedReasonWithEligibility(context.Background(), t0, r, healthThresholds{custodyLimit: testCustodyLimit, custodyLimitOK: true}, nil)
-			if got := strings.Contains(reason, reasonAssignedRepoAgentSourceGap); got != wantGap {
-				t.Fatalf("reason=%q gap=%v want %v", reason, got, wantGap)
+			if reason != want {
+				t.Fatalf("reason=%q want %q", reason, want)
 			}
 		})
 	}

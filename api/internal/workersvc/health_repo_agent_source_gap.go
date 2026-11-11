@@ -17,7 +17,7 @@ const heldRepoAgentSourceGapSuffix = "; assigned worker also lacks repo_agent_so
 // A failed lookup or an incomplete fake cannot establish a capability gap.
 func (s *Service) assignedRepoAgentSourceGap(ctx context.Context, r store.ListActiveRunsForHealthRow) bool {
 	if r.Status != "queued" || r.Kind == "cross_check" || r.EgressProfileID.Valid || !r.WorkerID.Valid || r.ClaimGeneration <= 0 ||
-		!(r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid) {
+		(!r.RepoAgentSourceRequired && !r.RepoAgentSourceCommit.Valid) {
 		return false
 	}
 	id := uuid.UUID(r.WorkerID.Bytes)
