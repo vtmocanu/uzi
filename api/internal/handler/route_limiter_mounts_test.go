@@ -879,6 +879,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/codex/operation-admission", noLimiter},
 	// Authenticated, run-scoped advisory telemetry: no forge call or token spend.
 	{"POST", "/api/worker/runs/{id}/forge-clone-success", noLimiter},
+	// Rides proposalLimiter.PerWorkerMiddleware (per-WORKER), which this per-USER probe
+	// reads as noLimiter. TestSemanticWorkerWritesUseWorkerLimiter proves the bucket.
+	{"POST", "/api/worker/runs/{id}/forge/credential", noLimiter},
 	// Rides proposalLimiter.PerWorkerMiddleware (per-WORKER), which this per-USER probe reads as noLimiter.
 	{"POST", "/api/worker/runs/{id}/publication-intent", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/release", noLimiter},

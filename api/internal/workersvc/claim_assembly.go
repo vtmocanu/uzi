@@ -20,6 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgecred"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -345,9 +346,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// nothing reaches the forge.
 	var botPAT []byte
 	if !isolated {
-		botPAT, err = s.box.Open(rc.TokenCiphertext)
+		// forgecred.Open, not box.Open: a GitHub App connection stores a
+		// domain-separated envelope, and the raw box cannot authenticate it. The
+		// claim also carries the App material only as an opaque handle — the
+		// worker renews installation tokens through the run-scoped credential
+		// endpoint, and the App private key never leaves the API.
+		botPAT, err = forgecred.Open(s.box, rc.TokenCiphertext)
 		if err != nil {
-			// box.Open errors carry no plaintext.
+			// Decrypt errors carry no plaintext.
 			return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgecred"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -309,7 +310,7 @@ func (s *Service) prerequisiteBinding(ctx context.Context, q PrerequisiteStore, 
 		if s.box == nil {
 			return prerequisiteBinding{}, errors.New("prerequisite: secret box unavailable")
 		}
-		pat, err := s.box.Open(conn.TokenCiphertext)
+		pat, err := forgecred.Open(s.box, conn.TokenCiphertext)
 		if err != nil {
 			return prerequisiteBinding{}, errors.New("prerequisite: credential unavailable")
 		}

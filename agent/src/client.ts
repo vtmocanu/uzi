@@ -3,6 +3,7 @@ import {
   validatePolicyRecoveryVerifiedRequest, decodePolicyRecoveryVerifiedReply, POLICY_RECOVERY_VERIFIED_MAX_BYTES,
   type PolicyRecoveryVerifiedRequest, type PolicyRecoveryVerifiedReply,
 } from "./protocol.js";
+import type { ForgeCredentialResponse } from "./forge-credentials.js";
 import { decodeCodexOperationDecision, validCodexOperationRequest } from "./codex-operation-admission.js";
 import type { CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
@@ -5182,6 +5183,33 @@ export class WorkerClient {
       await readCrossCheckText(res, maxResponseBytes, fenceResponseAbort ? callerSignal : undefined, semanticContext);
     MaintenanceBudget.current()?.check();
     return text ? JSON.parse(text) : undefined;
+  }
+
+  /** Mint a short-lived GitHub App installation token for a run.
+   *
+   *  The App private key never leaves the API: this returns an installation
+   *  token with its expiry, and nothing else. The path run id is the sole run
+   *  identity and the body carries only the claim generation the worker
+   *  believes it holds, so a stale worker cannot renew against a re-claimed
+   *  run. A malformed response throws rather than handing back an unvalidated
+   *  token, and a zero generation is refused locally without a request.
+   */
+  async refreshForgeCredential(runId: string, claimGeneration: number): Promise<ForgeCredentialResponse> {
+    if (!Number.isSafeInteger(claimGeneration) || claimGeneration <= 0) {
+      throw new Error("invalid claim generation");
+    }
+    const raw = await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/credential`,
+      { claim_generation: claimGeneration },
+      this.httpTimeoutMs,
+      undefined,
+      64 * 1024,
+    );
+    if (!isRecord(raw) || typeof raw.forge_pat !== "string" || raw.forge_pat.length === 0 ||
+        typeof raw.expires_at !== "string" || !Number.isFinite(Date.parse(raw.expires_at))) {
+      throw new Error("invalid forge credential response");
+    }
+    return { forge_pat: raw.forge_pat, expires_at: raw.expires_at };
   }
 
   private async postCodexJSON(path: string, body: unknown, signal?: AbortSignal, errorPolicy?: "release"): Promise<unknown> {
