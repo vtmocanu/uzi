@@ -42,7 +42,7 @@ func TestMRReworkNewCommentInAnotherNamespaceFiresDespiteHigherConsumedID(t *tes
 		mrwNSComment(forge.CommentNSReviewComment, newReview, landed()),
 	)
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("runs = %d, want the new inline comment to fire a rework", len(runs.calls))
@@ -57,7 +57,7 @@ func TestMRReworkNewCommentInAnotherNamespaceFiresDespiteHigherConsumedID(t *tes
 	}
 	// The consumed issue comment alone never re-fires.
 	f2 := landedForge(mrwNSComment(forge.CommentNSIssueComment, issueMark, landed()), mrwNSComment(forge.CommentNSReviewComment, newReview, landed()))
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f2)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f2, f2)
 	if len(runs.calls) != 1 {
 		t.Fatalf("runs = %d after a repeat tick, want still 1", len(runs.calls))
 	}
@@ -71,7 +71,7 @@ func TestMRReworkBootstrapIsGivenTheRowAndTheListing(t *testing.T) {
 	runs := &mrwRuns{}
 	f := landedForge(mrwComment(100, landed(), mrwHeadSHA), mrwComment(140, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.bootstraps) != 1 || runs.bootstraps[0].comments != 2 || runs.bootstraps[0].pre.HighWater != 100 {
 		t.Fatalf("bootstrap calls = %+v, want one with the ledger row read before the listing and both comments", runs.bootstraps)
@@ -88,7 +88,7 @@ func TestMRReworkFailedListingNeverBootstraps(t *testing.T) {
 	f := landedForge()
 	f.commentsErr = errors.New("forge unavailable")
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.bootstraps) != 0 || len(runs.calls) != 0 || !reflect.DeepEqual(st.ledgers[mrwRef], legacy) {
 		t.Fatalf("a failed listing must leave the row legacy: bootstraps=%d runs=%d ledger=%+v", len(runs.bootstraps), len(runs.calls), st.ledgers[mrwRef])
@@ -106,8 +106,8 @@ func TestMRReworkBootstrapOverflowWarnsOncePerTickAndFiresNothing(t *testing.T) 
 	f := landedForge(mrwComment(140, landed(), mrwHeadSHA))
 	d := newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5})
 
-	d.detect(context.Background(), mrwRepoRow(), f)
-	d.detect(context.Background(), mrwRepoRow(), f)
+	d.detect(context.Background(), mrwRepoRow(), f, f)
+	d.detect(context.Background(), mrwRepoRow(), f, f)
 
 	var warns []map[string]any
 	for _, rec := range logRecords(t, logs) {
@@ -150,7 +150,7 @@ func TestMRReworkBootstrapLedgerChangedIsSilentAndOtherErrorsWarn(t *testing.T) 
 			runs := &mrwRuns{bootstrapErr: tc.err}
 			f := landedForge(mrwComment(140, landed(), mrwHeadSHA))
 
-			newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+			newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 			if len(runs.calls) != 0 || !reflect.DeepEqual(st.ledgers[mrwRef], legacy) {
 				t.Fatalf("runs=%d ledger=%+v, want no run and no write", len(runs.calls), st.ledgers[mrwRef])
@@ -172,7 +172,7 @@ func TestMRReworkCreateLedgerChangedIsSwallowed(t *testing.T) {
 	runs := &mrwRuns{err: workersvc.ErrReworkLedgerChanged}
 	f := landedForge(mrwComment(140, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 1 || len(st.upserts) != 0 || !reflect.DeepEqual(st.ledgers[mrwRef], row) {
 		t.Fatalf("runs=%d upserts=%d ledger=%+v", len(runs.calls), len(st.upserts), st.ledgers[mrwRef])

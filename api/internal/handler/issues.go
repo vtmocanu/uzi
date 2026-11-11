@@ -52,7 +52,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -62,7 +62,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	// best-effort — a cold settings read yields the compiled-in default ("uzi"),
 	// never an empty label.
 	uziLabel, _ := h.settings.UziLabel(r.Context())
-	created, err := f.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, []string{uziLabel})
+	created, err := tr.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, []string{uziLabel})
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())
@@ -207,13 +207,13 @@ func (h *Handler) GetIssueDetail(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid issue id")
 		return
 	}
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	issue, err := f.GetIssue(r.Context(), repo.ForgeProjectID, iid)
+	issue, err := tr.GetIssue(r.Context(), repo.ForgeProjectID, iid)
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		httpx.Error(w, http.StatusBadGateway, "could not read the issue from the forge: "+err.Error())

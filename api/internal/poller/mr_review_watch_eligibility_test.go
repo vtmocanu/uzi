@@ -78,7 +78,7 @@ func (e *ew) tick(comments ...forge.MRComment) int {
 	e.f.comments = comments
 	before := len(e.f.lookups)
 	e.d.set = e.set
-	e.d.detect(context.Background(), mrwRepoRow(), e.f)
+	e.d.detect(context.Background(), mrwRepoRow(), e.f, e.f)
 	return len(e.f.lookups) - before
 }
 
@@ -502,7 +502,7 @@ func TestAnotherMRDoesNotReorderThisMRsQueue(t *testing.T) {
 	}
 	e.f.comments = comments
 	e.d.maxLookups = 2
-	e.d.detect(context.Background(), mrwRepoRow(), e.f)
+	e.d.detect(context.Background(), mrwRepoRow(), e.f, e.f)
 
 	// Both MRs share the author ids but own separate queues: each saw the same two attempts.
 	orderA := e.st.ras().Order(mrwRepoID, mrwRef)
@@ -514,7 +514,7 @@ func TestAnotherMRDoesNotReorderThisMRsQueue(t *testing.T) {
 	}
 	// A tick for MR B alone leaves A's order untouched.
 	e.st.candidates = []store.ListMRReworkCandidatesRow{candB}
-	e.d.detect(context.Background(), mrwRepoRow(), e.f)
+	e.d.detect(context.Background(), mrwRepoRow(), e.f, e.f)
 	if got := e.st.ras().Order(mrwRepoID, mrwRef); !slices.Equal(got, want) {
 		t.Fatalf("MR A's queue changed while only MR B was processed: %v", got)
 	}
@@ -534,7 +534,7 @@ func TestTrustedBotSkipsLookupAndItsSummaryNeverTriggers(t *testing.T) {
 		finding := e.comment(120, botAuthor, "guard nil here")
 		e.f.comments = []forge.MRComment{finding}
 		e.d.set = e.set
-		e.d.detect(context.Background(), row, e.f)
+		e.d.detect(context.Background(), row, e.f, e.f)
 		if len(e.runs.calls) != 1 || len(e.f.lookups) != 0 {
 			t.Fatalf("runs=%d lookups=%v, want the allowlisted bot's finding to fire with no lookup", len(e.runs.calls), e.f.lookups)
 		}
@@ -549,7 +549,7 @@ func TestTrustedBotSkipsLookupAndItsSummaryNeverTriggers(t *testing.T) {
 		note.AuthorForgeUserID = botAuthor
 		e.f.comments = []forge.MRComment{note}
 		e.d.set = e.set
-		e.d.detect(context.Background(), row, e.f)
+		e.d.detect(context.Background(), row, e.f, e.f)
 		if len(e.runs.calls) != 0 || len(e.st.upserts) != 0 {
 			t.Fatalf("runs=%d upserts=%d, want an allowlisted bot's summary to be inert", len(e.runs.calls), len(e.st.upserts))
 		}

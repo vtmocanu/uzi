@@ -64,13 +64,13 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := h.forgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	snapshot, err := workersvc.BuildFailureSnapshot(r.Context(), f, repo.ForgeProjectID, ps, h.cfg.CIFixMaxJobs, h.cfg.CIFixLogTailBytes)
+	snapshot, err := workersvc.BuildFailureSnapshot(r.Context(), ch, repo.ForgeProjectID, ps, h.cfg.CIFixMaxJobs, h.cfg.CIFixLogTailBytes)
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		httpx.Error(w, http.StatusBadGateway, "could not snapshot the failed pipeline: "+err.Error())
@@ -80,7 +80,7 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 	// Resolve the guard's watch set (PRD #71 M2): the configured default globs unioned
 	// with the project's own ci_config_path. A fetch failure degrades to defaults —
 	// manual Fix CI runs are human-approved, so the guard never reads this set for them.
-	projectPath, err := f.ProjectCIConfigPath(r.Context(), repo.ForgeProjectID)
+	projectPath, err := ch.ProjectCIConfigPath(r.Context(), repo.ForgeProjectID)
 	if err != nil {
 		slog.Warn("ci-fix: fetch ci_config_path", "error", err)
 		projectPath = "" // degrade to defaults; manual runs are human-approved so the guard never reads this

@@ -11,7 +11,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-func (s *Service) prerequisiteList(ctx context.Context, b prerequisiteBinding, driver forge.Forge, row store.RecoveryPrerequisiteClosure, end time.Time) (string, bool, error) {
+func (s *Service) prerequisiteList(ctx context.Context, b prerequisiteBinding, driver forge.CodeHost, row store.RecoveryPrerequisiteClosure, end time.Time) (string, bool, error) {
 	if ctx.Err() != nil || end.Sub(s.now()) <= 1500*time.Millisecond {
 		return "", false, context.DeadlineExceeded
 	}

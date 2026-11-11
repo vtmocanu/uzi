@@ -107,7 +107,7 @@ func TestM2RealDriverOverflowProjection(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				capture, err := issueinput.Fetch(context.Background(), driver, 4242, 11, 1)
+				capture, err := issueinput.Fetch(context.Background(), driver, driver, 4242, 11, 1)
 				if mode == "target" {
 					var concrete *forge.ResponseTooLargeError
 					if capture != nil || !errors.Is(err, forge.ErrResponseTooLarge) || !errors.As(err, &concrete) {

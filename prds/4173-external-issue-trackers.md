@@ -4,7 +4,7 @@
 
 **Priority:** Medium
 
-**Status:** In progress, r4 2026-11-11. M1 delivered. r3 followed the maintainer's scope review: one real issue tracker instead of abstract identity work, and the comment, command and withdrawal behaviours leave this PRD. r4 follows the maintainer's review of the M1 PR: the YouTrack id, tag and author decisions are made before the driver, and the issue source of a repo no longer changes.
+**Status:** In progress, r5 2026-11-11. M1 and M2 delivered. r3 followed the maintainer's scope review: one real issue tracker instead of abstract identity work, and the comment, command and withdrawal behaviours leave this PRD. r4 follows the maintainer's review of the M1 PR: the YouTrack id, tag and author decisions are made before the driver, and the issue source of a repo no longer changes.
 
 **Delivery:** one PR per milestone, each merged before the next starts. No implementation or validation step touches `.github/workflows/**`.
 
@@ -26,7 +26,7 @@ An issue tracker does only the second job. Adding one as a fourth forge would fo
 ## Goal
 
 1. `Forge` splits into `IssueTracker` (issues, labels, comments, state) and `CodeHost` (everything else), and stays as their union. Done in M1.
-2. Every caller receives only the half it needs. M2.
+2. Every caller receives only the half it needs. Done in M2.
 3. A repo can take its issues from a YouTrack project while its code, merge requests and CI stay on its forge.
 4. Feature parity: every issue-side feature that works today on GitLab, GitHub and Forgejo works on YouTrack, or is listed below as not offered on an issue tracker yet.
 5. Backwards compatible: a repo with no issue tracker link behaves exactly as today. No backfill, no setting to change.
@@ -50,25 +50,24 @@ These hold in every milestone. A change that weakens one is out of scope for thi
 - **Jira and Asana.** One PRD each, after YouTrack.
 - **How the worker clones, pushes and opens the merge request.** The code host is unchanged.
 
-## Current state (anchors from r1, verified on upstream `main` 6a76d09f7; line numbers drift, cite by symbol)
+## Current state (anchors refreshed in M2's PR on upstream `main` f19bc0739 with M2 applied; cited by file and symbol, because line numbers drift)
 
-M2's PR refreshes these anchors and the count of issue-side uses against `main` as it is then.
-
-- **Where the issue side is used today.** Every place in uzi's code, tests excluded, that calls one of the eleven issue-side methods through the `Forge` interface (47 in all; calls a driver makes inside itself are not counted), listed from the type-checked code (`golang.org/x/tools/go/packages`) and cross-checked with `gopls call_hierarchy`:
-  - *Sync:* `forgesvc` `FullSync`, `IncrementalSync` and `reconcileFindingGroupMarkers` (`ListIssues`, `api/internal/forgesvc/service.go:787`, `:795`, `:816`, `:911`, `:915`, `:926`, `:448`).
-  - *Board:* `AutoMove` and `SetIssueLabel` (`EnsureLabels`, `UpdateIssueLabels`, `forgesvc/service.go:534-542`, `:600-607`); column setup and label checks in the handlers (`EnsureLabels`, `ListLabels`, `api/internal/handler/board.go:366`, `:432`, `:760`, `handler/labels.go:36`, `:120`); close and reopen (`SetIssueState`, `forgesvc/close_reopen.go:29`, `:62`).
-  - *Run creation:* the issue's text and comments (`GetIssue`, `ListIssueComments`, `api/internal/issueinput/projection.go:158`, `:169`), reached from `workersvc` `CreateRun`, the scheduler (`api/internal/schedsvc/scheduler.go:594`, `:806`), autopilot (`api/internal/poller/autopilot.go:209`) and the composite flow (`api/internal/workersvc/composite.go:212`); a task continuing an issue (`GetIssue` through the helper `forge.GetIssueBounded`, `forge/response_limit.go:114`, called from `workersvc/task.go:100`); semantic drift (`GetIssue`, `workersvc/semantic_drift.go:75`).
-  - *The agent:* the worker reads issues through the API, `GET /api/worker/runs/{id}/forge/issues`, `…/issues/{iid}` and `…/issues/{iid}/label-events` (`ListIssues`, `GetIssue`, `ListIssueComments`, `ListIssueLabelEvents`, `handler/worker_forge.go:138`, `:183`, `:265`, `:310`).
-  - *The issue page:* `GetIssueDetail` (`GetIssue`, `handler/issues.go:216`).
-  - *Issues uzi creates:* the board's new issue (`handler/issues.go:65`), findings and finding groups, which also ensure their labels first (`EnsureLabels`, `handler/findings_file.go:163`, `:169`, `handler/findings_group_file.go:203`, `:227`), the judge's admin issue (`handler/judge_admin_issue.go:269`), review issues (`handler/review_issue_file.go:159`), the self-improve tracking issue (`schedsvc/self_improve.go:269`) and proposals (`workersvc/composite.go:150`, `workersvc/proposal_filing.go:175`), all through `CreateIssue`; the scheduler's proposal digest and self-improve lookup read issues (`ListIssues`, `schedsvc/scheduler.go:1426`, `schedsvc/self_improve.go:252`).
-  - *Issue description:* the PRD link patch (`GetIssue`, `UpdateIssueDescription`, `forgesvc/prd_link_patch.go:159`, `:180`).
-  - *Autopilot:* label events (`ListIssueLabelEvents`, `poller/autopilot.go:140`).
-  - *Comments out:* see below.
-- **The privilege check is code-host only.** `VerifyToken`, `ProjectRole`, `DefaultBranchProtection` (`api/internal/privcheck/checker.go:77`, `:139`, `:147`; `privcheck/service.go:256-283` at claim), fail-closed.
-- **Mixed callers.** Comment intake reads issue comments (`ListIssueComments`) and checks each author against the repository (`RepositoryAuthorEligibility`, `api/internal/issueinput/assessment.go:86`); merge request watchers read the MR from the code host (`forgesvc/mr_watch.go:60`) and move the card on the issue side (`AutoMove`, `mr_watch.go:227`).
+- **Where the issue side is used.** Every place in uzi's code, tests excluded, that calls one of the eleven issue-side methods (45 calls, all through `IssueTracker` since M2; calls a driver makes inside itself are not counted), listed from the type-checked code (`golang.org/x/tools/go/packages`). r1 counted 47 through `Forge` on an older `main`.
+  - *Sync:* `FullSync`, `IncrementalSync` and `reconcileFindingGroupMarkers` (`ListIssues`, seven calls, `api/internal/forgesvc/service.go`).
+  - *Board:* `AutoMove` and `SetIssueLabel` (`EnsureLabels`, `UpdateIssueLabels`, `forgesvc/service.go`); column setup and label checks in the handlers (`EnsureLabels` in `ConfigureColumns` and `ensureHumanReviewColumn`, `api/internal/handler/board.go`, and in `ensureRepoLabels`, `handler/labels.go`; `ListLabels` in `CheckRepoLabels`, `handler/labels.go`); close and reopen (`SetIssueState` in `CloseIssue` and `ReopenIssue`, `forgesvc/close_reopen.go`).
+  - *Run creation:* the issue's text and comments (`GetIssue`, `ListIssueComments` in `FetchWithTimeout`, `api/internal/issueinput/projection.go`), reached from `workersvc` `CreateRun`, the scheduler, autopilot and the composite flow; a task continuing an issue (`GetIssue` through the helper `forge.GetIssueBounded`); semantic drift (`GetIssue` in `readCurrentSemanticIssue`, `api/internal/workersvc/semantic_drift.go`).
+  - *The agent:* the worker reads issues through the API, `GET /api/worker/runs/{id}/forge/issues`, `…/issues/{iid}` and `…/issues/{iid}/label-events` (`ListIssues` in `WorkerForgeListIssues`, `GetIssue` and `ListIssueComments` in `WorkerForgeGetIssue`, `ListIssueLabelEvents` in `WorkerForgeListIssueLabelEvents`, `handler/worker_forge.go`).
+  - *The issue page:* `GetIssueDetail` (`GetIssue`, `handler/issues.go`).
+  - *Issues uzi creates* (`CreateIssue`, eight calls): the board's new issue (`CreateIssue`, `handler/issues.go`), findings and finding groups, which also ensure their labels first (`FileFinding`, `handler/findings_file.go`; `FileFindingGroup`, `handler/findings_group_file.go`), the judge's admin issue (`AdminFileJudgeIssue`, `handler/judge_admin_issue.go`), review issues (`FileIssue`, `handler/review_issue_file.go`), the self-improve tracking issue (`ensureTrackingIssue`, `api/internal/schedsvc/self_improve.go`) and proposals (`ConfirmProposalForUser`, `workersvc/composite.go`; `maybeFileProposal`, `workersvc/proposal_filing.go`). The scheduler's proposal digest and the self-improve lookup read issues (`ListIssues` in `proposalDigestSection`, `schedsvc/scheduler.go`, and in `ensureTrackingIssue`).
+  - *Issue description:* the PRD link patch (`GetIssue`, `UpdateIssueDescription` in `patchOnePRDLink`, `forgesvc/prd_link_patch.go`).
+  - *Autopilot:* label events (`ListIssueLabelEvents` in `detectOne`, `api/internal/poller/autopilot.go`).
+  - *Comments out* (`CreateIssueNote`, five calls, all discarding the returned note): autopilot's refusal comment (`recordThenComment`, `poller/autopilot.go`), CI autofix start and halt comments (`detectOne`, `poller/ci_autofix.go`), the merge request rework halt comment (`detectOne`, `poller/mr_review_watch.go`) and the terminal comment (`maybeTerminalComment`, `api/internal/runlifecycle/lifecycle.go`).
+- **No call goes through the union.** The same inventory shows 66 code-host calls, all through `CodeHost`, and none of either kind through `forge.Forge`. The connection factories still return `forge.Forge`; each caller narrows the value before its first call.
+- **The privilege check is code-host only.** `VerifyToken`, `ProjectRole`, `DefaultBranchProtection` (`Check`, `CheckToken` and `checkRepo`, `api/internal/privcheck/checker.go`, all taking `forge.CodeHost`; `privcheck/service.go` at claim), fail-closed.
+- **Mixed callers.** Comment intake reads issue comments (`ListIssueComments`) and checks each author against the repository (`RepositoryAuthorEligibility`, in `Assessment.Author`, `api/internal/issueinput/assessment.go`); merge request watchers read the MR from the code host and move the card on the issue side (`AutoMove`), both in `forgesvc/mr_watch.go`.
 - **Issue identity is a number.** `issues.forge_issue_iid bigint` (`api/internal/store/migrations/00002_forge.sql:47-50`), `runs.issue_iid`, and one active run per issue on `(repo_id, coalesce(issue_iid, continued_issue_iid))` for issue runs and tasks continuing an issue (`00351_task_continued_issue.sql:11-14`).
-- **Board columns are labels.** `board_columns.label_name` (`00002_forge.sql:39`); moving a card swaps labels through `UpdateIssueLabels` (`api/internal/forgesvc/service.go:512-542`), forge-first, with the `move_pending_since` marker (`api/internal/runlifecycle/lifecycle.go:1-17`).
-- **Autopilot.** Maps the label adder to a uzi user through `forge_connections.human_username` (`00037_autopilot_mapping.sql:6-20`, `poller/autopilot.go:194`).
+- **Board columns are labels.** `board_columns.label_name` (`00002_forge.sql:39`); moving a card swaps labels through `UpdateIssueLabels` (`AutoMove`, `api/internal/forgesvc/service.go`), forge-first, with the `move_pending_since` marker (`api/internal/runlifecycle/lifecycle.go`).
+- **Autopilot.** Maps the label adder to a uzi user through `forge_connections.human_username` (`00037_autopilot_mapping.sql:6-20`, `detectOne` in `poller/autopilot.go`).
 - **Constraints a text key meets.** `issues.forge_issue_iid` is `bigint NOT NULL` with `UNIQUE (repo_id, forge_issue_iid)` (`00002_forge.sql:50`, `:59`), and `runs_kind_shape` requires `issue_iid IS NOT NULL` for `kind = 'issue'` (`00314_cross_check_claude_checker.sql`). An added `issue_key` column alone does not make an issue tracker issue storable.
 - **The issue author is checked the same way.** Run creation assesses `Issue.AuthorForgeUserID` through `RepositoryAuthorEligibility` (`Assessment.Author`, `api/internal/issueinput/assessment.go`). An author that cannot be assessed gives the reason `permission_unknown`, and a scheduled start with that reason is not auto-approved (`createRun`, `api/internal/workersvc/service.go`).
 - **The forge allowlist is deployment configuration.** `FORGE_ALLOWED_BASE_URLS` is rendered from the Helm value `forge.allowedBaseURLs` (`deploy/chart/values.yaml`, `deploy/chart/templates/api-configmap.yaml`) and passed through `docker-compose.yml`.
@@ -87,7 +86,7 @@ M2's PR refreshes these anchors and the count of issue-side uses against `main` 
 - **D8. Issue tracker connections are separate from forge connections.** Per user, kind and base URL, with the rules in S3. A repo links to one connection and one issue tracker project. NULL means the forge is the issue source.
 - **D9. Moving a card is an `IssueTracker` method.** `MoveToColumn`. The forge drivers implement it with one shared helper that does today's label swap in one `UpdateIssueLabels` call. YouTrack maps a column to a value of the project's State field. The column-to-state mapping is a side table, so `board_columns.label_name` keeps its meaning for the code that reads it.
 - **D10. YouTrack ids are adapted inside the driver; the neutral types do not change.** `IssueTracker` takes `projectID int64` and `issueIID int64` and returns `IssueNote.ID int64`, while YouTrack project, comment and account ids are strings. Changing the neutral types would cost the three forge drivers and every caller and give the forges nothing, so the driver adapts, and M3 implements exactly this:
-  - *Project.* A YouTrack driver is built for one project. It holds that project's string id and short name, and the one `projectID int64` value it answers to: the repo's forge project id, which is the number every caller already passes for that repo. An `IssueTracker` method called with any other `projectID` is refused before any request is made, so a driver resolved for one repo cannot serve a call meant for another. The `IssueTracker` methods of a driver built without a project return an error.
+  - *Project.* A YouTrack driver is built for one project. It holds that project's string id and short name, and the one `projectID int64` value it answers to: the repo's forge project id, which is the number every caller already passes for that repo. An `IssueTracker` method called with a different `projectID` is refused before any request. This catches mismatched forge project numbers; the owner-scoped repo resolver must also bind the driver to the correct repo and issue tracker connection, including when two connections expose the same forge project number. M4 tests that collision. The `IssueTracker` methods of a driver built without a project return an error.
   - *Connection operations.* Verify the token, list projects and list tags need no project, so a connection can be set up before one is chosen. Listing states is project-scoped, because states belong to a project: it takes the project it reads, picked from the list of projects, and cannot be called without one.
   - *Issue.* `issueIID` is YouTrack's `numberInProject`. It satisfies the `NOT NULL`, uniqueness and `runs_kind_shape` constraints above with no change to them.
   - *Comment.* The driver does not derive a number from a YouTrack comment id. YouTrack documents these ids as strings and guarantees no grammar for them. `CreateIssueNote` returns `IssueNote.ID` 0 on YouTrack, and no caller reads that field today: all five call sites discard the returned note.
@@ -136,7 +135,7 @@ M2's PR refreshes these anchors and the count of issue-side uses against `main` 
 Progress (one PR per milestone, each merged before the next starts):
 
 - [x] **M1:** the `IssueTracker` and `CodeHost` interfaces
-- [ ] **M2:** every caller on its half
+- [x] **M2:** every caller on its half. The type-checked inventory shows 45 issue-side calls through `IssueTracker`, 66 code-host calls through `CodeHost` and none through `forge.Forge`, and handing `privcheck` an `IssueTracker`-only value fails to compile.
 - [ ] **M3:** issue tracker connections and the YouTrack driver
 - [ ] **M4:** issue identity, the repo link and issue intake from YouTrack
 - [ ] **M5:** the board and issue writes on YouTrack
@@ -153,7 +152,7 @@ D1, D2 and D4. One file per interface with the types only it uses (`issuetracker
 D3 and D5.
 
 - **Blocked by:** M1.
-- **Acceptance:** every issue-side use in the refreshed inventory (47 at r1) goes through `IssueTracker`; `privcheck` cannot be handed a value that has only the issue side; existing tests change only in two mechanical ways (a fake's parameter type, and passing the same fake as both halves).
+- **Acceptance:** every issue-side use in the refreshed inventory (45 calls, 47 at r1) goes through `IssueTracker`; `privcheck` cannot be handed a value that has only the issue side; existing tests change only in two mechanical ways (a fake's parameter type, and passing the same fake as both halves).
 
 ### M3: issue tracker connections and the YouTrack driver
 
@@ -173,6 +172,7 @@ D5, D10 (storage), D11, D13, D14 (choice and verification of the tag) and S2. Th
   - a YouTrack issue carrying the eligibility tag appears on the board and starts a run that receives its title and body, and an issue carrying only a same-named tag of another user does not;
   - an issue tracker comment from an unmapped author is withheld;
   - with an unmapped issue author, a manual start proceeds and a scheduled start is created without auto-approval, each in its own test;
+  - two repos on different forge connections that expose the same forge project number, one linked to YouTrack and one not, each resolve to their own issue source: a call for one never reaches the other's driver (D10);
   - the privilege check and claim still run against the forge and fail closed with the issue tracker unreachable;
   - a repo with no link is byte-for-byte unchanged in its forge calls (recorded-call test);
   - linking is refused for every repo that existed before the migration and for a repo enabled since, including one that is disabled now; it is refused for a tag the connection's account cannot apply or that nobody else can apply, and the check modifies no issue; a link racing the first enable ends in exactly one of the two outcomes of D13; a connection with a linked repo cannot be deleted;
@@ -202,7 +202,7 @@ Settings → Issue trackers, the CLI commands, a setup page under `docs/`.
 
 ## Risks
 
-- **Size of M2.** About 57 production and 31 test files, mechanical. A type-checked inventory of forge calls is the guard.
+- **Size of M2.** 54 production and 31 test files, mechanical. A type-checked inventory of forge calls was the guard.
 - **Drift from `main` between milestones.** Each milestone's branch is rebased on `main` before its PR.
 - **YouTrack specifics leak into the seam.** The id adapter (D10) and the tag rules (D14) stay inside the driver, the contract suite runs on all four implementations, and the second issue tracker (Asana) is the real test of the seam.
 
@@ -212,6 +212,9 @@ Settings → Issue trackers, the CLI commands, a setup page under `docs/`.
 - **2026-11-10: one file per interface.** `issuetracker.go` and `codehost.go`; r1 had both interfaces in `forge.go`.
 - **2026-11-10: no reflection test.** The interface declarations enforce the split (D4).
 - **2026-11-10: M2 test edits.** Fakes may change a parameter type, and mixed callers' test call sites pass the same fake twice. Nothing else in a test changes.
+- **2026-11-10: M2 wires `IssueTrackerForRepo`/`CodeHostForRepo` (D5) where a repo is in hand without new test fakes.** They are `forgesvc.(*Service)` methods in `forgesvc/repo_sides.go` taking `(ctx, repoID, forgeType, baseURL, tokenCiphertext)` (the caller's own owner-scoped lookup, never the unscoped `GetRepoByID`), used by the repo-scoped handlers and the merged-predecessor check. `workersvc`, `schedsvc`, `runlifecycle`, `privcheck`, `provisionsvc` and `seed` keep their own `ForgeForConnection` factory interfaces (adding the resolvers there would add methods to about 30 test fakes) and narrow at the first use; M4 routes them through the resolvers. Connection-scoped handlers, the run-scoped worker forge proxy (`resolveForgeRun`), `ProjectSyncService`'s own factory and the poll loop build one driver and narrow it at each use or pass it as both halves.
+- **2026-11-10: the PRD link patch takes both halves.** D3 placed it on `IssueTracker`, but it also reads the merge request (`GetMergeRequest`), so `SyncPRDLinkPatches` takes `(ch forge.CodeHost, tr forge.IssueTracker)`. Comment intake (`issueinput.Fetch`), the autopilot, CI-autofix and MR-rework detectors, the MR state watcher, self-improve and the worker get-issue route are mixed the same way.
+- **2026-11-10: "`privcheck` compiles against `CodeHost` only" means every privcheck parameter, local and forge call is `CodeHost`.** Its `ForgeBuilder` factory interface still returns `forge.Forge`, converted to `CodeHost` straight after the build; handing privcheck an `IssueTracker`-only value is a compile error.
 - **2026-11-10: scope after the maintainer's review.** YouTrack becomes part of this PRD and drives the identity design. The living comment, the outbox, withdrawal, comments to the agent and `/uzi` commands move out. Asana follows in its own PRD.
 - **2026-11-11: the issue source is fixed before first enable (D13).** Review of the M1 PR found that project-local numbers let an old run or pinned schedule resolve to an unrelated issue after a repo changes its issue source. The first answer was a per-repo fence over run creation, sync and every issue write. The maintainer proposed the simpler policy: choose the source before the repo is first enabled, and leave relinking out. It holds, because a never-enabled repo has had no sync and no run, provided "never enabled" is stored rather than read from `repos.enabled` and the link and the first enable share the repo row lock. The fence is dropped.
 - **2026-11-11: id adapter instead of new neutral types (D10).** The driver is built for one project, `issueIID` is `numberInProject`, the driver answers only to the repo's forge project id, `IssueNote.ID` is not derived and account ids are 0. Decided before the M3 driver; only the `issue_key` column waits for M4.
@@ -219,3 +222,4 @@ Settings → Issue trackers, the CLI commands, a setup page under `docs/`.
 - **2026-11-11: an unmapped issue author is `permission_unknown` (D11).** Manual start proceeds, scheduled start is never auto-approved.
 - **2026-11-11: the contract suite runs on the real drivers (D7), the allowlist is wired through the chart and compose in M3, and the ADR moves from M6 to M3.**
 - **2026-11-11: second review pass.** Every repo that exists at the M4 migration counts as previously enabled (D13). The driver refuses a `projectID` other than its own, and listing states is project-scoped (D10). The eligibility tag is checked through its see and use settings, read-only (D14). No number is derived from a comment id (D10).
+- **2026-11-11: the `projectID` guard is not the whole binding (D10).** `repos` is unique on `(connection_id, forge_project_id)`, so two connections can expose the same forge project number. The guard catches a mismatched number; the owner-scoped repo resolver binds the driver to the right repo and issue tracker connection, and M4 tests the collision.

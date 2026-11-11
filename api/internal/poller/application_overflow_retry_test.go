@@ -47,9 +47,9 @@ func TestR3AutopilotOverflowRetry(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						NewAutopilot(st, runs, nil).handle(context.Background(), repoRow(), fresh, apLabel, st.cc, candIssue(7, "alice"), 9, "alice")
+						NewAutopilot(st, runs, nil).handle(context.Background(), repoRow(), fresh, fresh, apLabel, st.cc, candIssue(7, "alice"), 9, "alice")
 					} else {
-						NewAutopilot(st, runs, nil).detect(context.Background(), repoRow(), f)
+						NewAutopilot(st, runs, nil).detect(context.Background(), repoRow(), f, f)
 					}
 					if len(runs.calls)+len(runs.resolutions) != 0 {
 						t.Fatal("failed capture reached harness/create")

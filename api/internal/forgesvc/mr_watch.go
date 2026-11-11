@@ -26,7 +26,7 @@ import (
 // It never returns per-candidate errors: one bad MR read or move must not stall
 // the tick (the poller's log-and-skip convention). Only a failure to enumerate
 // candidates is returned, so the poller can log it once for the repo.
-func (s *Service) SyncMRStates(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) error {
+func (s *Service) SyncMRStates(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, ch forge.CodeHost, tr forge.IssueTracker) error {
 	candidates, err := s.q.ListMRWatchCandidates(ctx, repoID)
 	if err != nil {
 		return err
@@ -35,7 +35,7 @@ func (s *Service) SyncMRStates(ctx context.Context, repoID uuid.UUID, forgeProje
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		s.syncOneMRState(ctx, repoID, forgeProjectID, f, c)
+		s.syncOneMRState(ctx, repoID, forgeProjectID, ch, tr, c)
 	}
 	return nil
 }
@@ -56,8 +56,8 @@ func (s *Service) SyncMRStates(ctx context.Context, repoID uuid.UUID, forgeProje
 // read, or the move itself) mr_state is LEFT as-is, so the next poller tick
 // re-observes the same edge and retries — the poller cadence is the retry loop.
 // Consuming the edge on failure would re-create the stuck-card bug this PRD fixes.
-func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, c store.ListMRWatchCandidatesRow) {
-	mr, err := f.GetMergeRequest(ctx, forgeProjectID, c.MrIid.Int64)
+func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, ch forge.CodeHost, tr forge.IssueTracker, c store.ListMRWatchCandidatesRow) {
+	mr, err := ch.GetMergeRequest(ctx, forgeProjectID, c.MrIid.Int64)
 	if err != nil {
 		// A read failure is not an edge: log-and-skip, leave mr_state for next tick.
 		slog.Warn("forgesvc: MR-state read failed", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", err)
@@ -110,7 +110,7 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		if cancelErr != nil {
 			slog.Warn("forgesvc: cancel rework on MR close failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", cancelErr)
 		}
-		moved := s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, f, board.ColumnHumanReview, board.ColumnInProgress)
+		moved := s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, tr, board.ColumnHumanReview, board.ColumnInProgress)
 		if moved == moveDeferred || cancelErr != nil {
 			// forge failure / vanished card, or a cancel that must be retried: leave
 			// mr_state unadvanced so the next tick re-observes the edge and retries.
@@ -120,7 +120,7 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 	case stored == forge.MRStateClosed && observed == forge.MRStateOpened:
 		// reopen-edge (Decision 6): restore the card Human Review-ward,
 		// symmetrically, guarded from In Progress (where the close-edge left it).
-		if s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, f, board.ColumnInProgress, board.ColumnHumanReview) == moveDeferred {
+		if s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, tr, board.ColumnInProgress, board.ColumnHumanReview) == moveDeferred {
 			return
 		}
 		s.recordMRState(ctx, c.ID, observed)
@@ -185,7 +185,7 @@ const (
 // source-column guard makes the retry a no-op (the card already moved) — except
 // the narrow case where a human dragged the card back to wantSource in the crash
 // window, which then gets re-moved once; accepted (crash-window-sized exposure).
-func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProjectID, issueIID int64, f forge.Forge, wantSource, target string) moveOutcome {
+func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProjectID, issueIID int64, tr forge.IssueTracker, wantSource, target string) moveOutcome {
 	issue, err := s.q.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repoID, ForgeIssueIid: issueIID})
 	if err != nil {
 		// No cached card (evicted/de-labeled since the candidate scan): leave the
@@ -224,7 +224,7 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 		return moveSkipped
 	}
 
-	if _, err := s.AutoMove(ctx, f, forgeProjectID, issue, cols, target); err != nil {
+	if _, err := s.AutoMove(ctx, tr, forgeProjectID, issue, cols, target); err != nil {
 		// Forge error: leave mr_state unadvanced so the next tick re-observes this
 		// edge and retries once the forge is reachable again.
 		slog.Warn("forgesvc: MR-state move failed, will retry", "repo", repoID, "issue", issueIID, "target", target, "error", err)

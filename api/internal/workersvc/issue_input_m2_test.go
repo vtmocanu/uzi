@@ -95,7 +95,7 @@ func TestM2CreatePolicyScheduleOnly(t *testing.T) {
 }
 func TestM2CreateCapturedGuidanceAndDedup(t *testing.T) {
 	f := &m2Forge{disposition: forge.AuthorEligible}
-	capture, err := issueinput.Fetch(context.Background(), f, 0, 4, 1)
+	capture, err := issueinput.Fetch(context.Background(), f, f, 0, 4, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
