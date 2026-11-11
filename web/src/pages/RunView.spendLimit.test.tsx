@@ -46,13 +46,15 @@ function view(run: Run, proof?: boolean) {
 beforeEach(() => { vi.clearAllMocks(); });
 afterEach(cleanup);
 
-const WORDING_HEAD = /Resume uses this run.s current credential selection\. If it still selects the capped token, raise the limit first\./;
+// Exact wording, straight ASCII apostrophe (U+0027); compared on textContent so a curly one fails.
+const WORDING_HEAD = "Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first.";
+const WORDING_FULL = `${WORDING_HEAD} To choose another token now, use Switch token or uzi run set-token.`;
+const wordingText = () => screen.getByText(/^Resume uses this run/).textContent;
 
 it("renders the spend-limit panel with the owner wording, Resume and Cancel, not the generic copy", async () => {
   render(view(held(), true));
   expect(screen.getByText("Anthropic API spend limit reached")).toBeTruthy();
-  expect(screen.getByText(WORDING_HEAD)).toBeTruthy();
-  expect(screen.getByText(/To choose another token now, use Switch token or/)).toBeTruthy();
+  expect(wordingText()).toBe(WORDING_FULL);
   expect(screen.getByText("uzi run set-token").tagName).toBe("CODE");
   expect(screen.queryByText(/Recovering and resuming automatically|no action is needed/)).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
@@ -70,7 +72,7 @@ it.each(["issue", "task"] as const)("a switchable %s run offers another token an
 
 it("a self_improve run offers neither and drops the choose-another-token sentence", () => {
   render(view(held({ kind: "self_improve" }), true));
-  expect(screen.getByText(WORDING_HEAD)).toBeTruthy();
+  expect(wordingText()).toBe(WORDING_HEAD);
   expect(screen.getByRole("button", { name: /^Resume$/ })).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Run with another token" })).toBeNull();
   expect(screen.queryByRole("link", { name: "Manage tokens in Settings" })).toBeNull();
@@ -82,6 +84,24 @@ it("a non-owner sees no actions", () => {
   expect(screen.getByText("Only the run owner can resume or cancel this hold.")).toBeTruthy();
   expect(screen.queryByRole("button", { name: /^Resume$/ })).toBeNull();
   expect(screen.queryByRole("button", { name: "Run with another token" })).toBeNull();
+  // The non-owner sentence appears once, not duplicated by the generic hold line.
+  expect(screen.queryByText(/Only the run owner can Resume or Cancel/)).toBeNull();
+  expect(screen.getByText("This hold has no scheduled retry.")).toBeTruthy();
+});
+
+it.each([undefined, false])("owner proof %s hides the header Stop and Switch token controls (ownerDecisionHold)", (proof) => {
+  // Positive control first: a confirmed owner gets both header controls on the held run.
+  render(view(held(), true));
+  fireEvent.click(screen.getByRole("button", { name: /Run settings/ }));
+  expect(screen.getByRole("button", { name: "Stop run" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Switch token" })).toBeTruthy();
+  cleanup();
+  // Unconfirmed ownership: the stream says canSteer, but the hold gates it off.
+  render(view(held(), proof));
+  fireEvent.click(screen.getByRole("button", { name: /Run settings/ }));
+  expect(screen.queryByRole("button", { name: "Stop run" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Switch token" })).toBeNull();
+  expect(screen.getByText(/Only the run.s owner can switch its token/)).toBeTruthy();
 });
 
 it("a queued run with a stale cause renders no panel and no hold badge", () => {

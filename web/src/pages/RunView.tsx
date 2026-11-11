@@ -1744,10 +1744,10 @@ function SpendLimitPanel({ run, ownerProof, busy, onResume, onCancel, onSwitched
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4" data-testid="spend-limit-panel">
       <p className="text-sm font-semibold text-warn">Anthropic API spend limit reached</p>
       <p className="mt-1 text-sm text-fg">
-        Resume uses this run&rsquo;s current credential selection. If it still selects the capped token, raise the limit first.
+        Resume uses this run&apos;s current credential selection. If it still selects the capped token, raise the limit first.
         {canSwitch && <> To choose another token now, use Switch token or <code>uzi run set-token</code>.</>}
       </p>
-      <p className="mt-1.5 text-xs text-muted">This hold has no scheduled retry. Only the run owner can Resume or Cancel.</p>
+      <p className="mt-1.5 text-xs text-muted">This hold has no scheduled retry.</p>
       {ownerProof ? (
         <div className="mt-3 flex flex-wrap items-start gap-2">
           <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
