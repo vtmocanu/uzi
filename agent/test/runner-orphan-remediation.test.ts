@@ -49,6 +49,8 @@ function assertGuidance(s: Scene, claim = s.claim): void {
     "no path, commit id or inner error text");
   assert.ok(joined.includes("Resume on this worker will hold again unchanged"), "the park is reported, so Resume holds again");
   assert.ok(!joined.includes("not placed on an owner hold"));
+  assert.ok(!joined.includes("admission-counted") && joined.includes("custody hold limit"),
+    "states the run's own custody hold limit and no admission-counted promise");
   const log = api.requestLog;
   const messages = log.indexOf("messages");
   const park = log.indexOf("state:recovery_wait");
@@ -251,6 +253,7 @@ describe("the park acknowledgement", linux, () => {
     assert.ok(first.includes("Resume on this worker will hold again unchanged"));
     assert.ok(second.includes(`The api refused the owner hold for the secret-scan remediation of predecessor run ${s.ownerRun}. This run was not placed on an owner hold`));
     assert.ok(!second.includes(s.clone) && !second.includes(s.bare) && !/Error/.test(second));
+    assert.ok(!second.includes("admission-counted") && second.includes("custody hold limit"));
     assert.equal(s.entered.value, false);
     assert.deepEqual(snapshot(s), before);
   });

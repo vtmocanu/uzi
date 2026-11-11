@@ -26977,13 +26977,15 @@ export class RunRunner {
     const predecessor = RUN_ID_RE.test(hold.ownerRunId) ? hold.ownerRunId : "unknown";
     const willPark = this.client?.protocolFeatures?.includes(RETAINED_ADOPTION_FAILED_FEATURE) === true &&
       Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0;
-    const notHeld = "This run was not placed on an owner hold: each automatic retry on this worker will stop the same way " +
-      "and adds at least one admission-counted custody hold, up to this run's custody admission limit, unless that " +
+    const notHeld = "This run was not placed on an owner hold: each automatic retry on this worker will stop the same way. " +
+      "Each retry that is claimed opens at least one more custody hold for this run; once this run's own open holds reach " +
+      "the custody hold limit it is no longer claimed, until its holds are resolved or discarded, unless that " +
       "remediation has been resolved through a separately authorized route. ";
     const consequence = willPark
-      ? "Resume on this worker will hold again unchanged and adds at least one admission-counted custody hold; lost " +
-        "reports, crashes or worker re-registration can add more, up to this run's custody admission limit, unless " +
-        "that remediation has been resolved through a separately authorized route. "
+      ? "Resume on this worker will hold again unchanged and each claimed Resume opens at least one more custody hold " +
+        "for this run (its holds on this worker count as one admission unit toward the owner limit, but each stays open); " +
+        "once this run's own open holds reach the custody hold limit, Resume creates no further claim or hold until they " +
+        "are resolved or discarded, unless that remediation has been resolved through a separately authorized route. "
       : notHeld;
     flight.batcher.emit({
       kind: "status",
@@ -27681,8 +27683,8 @@ export class RunRunner {
     flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: sanitizeForLog(flight.redactText(
       `Independent continuation was refused before any source effect: this release does not support this predecessor (${unsupported}). ` +
       "The predecessor's source and custody stay on this worker. The worker is requesting an owner hold; the run's status shows " +
-      "whether it was applied. If held, Resume claims again, will hold again unchanged on this release and adds at least one " +
-      "admission-counted custody hold (lost reports, crashes or worker re-registration can add more), and Cancel ends the run. " +
+      "whether it was applied. If held, Resume claims again only while this run's own open holds are below the custody hold limit, " +
+      "will hold again unchanged on this release and opens another hold; at the limit Resume creates no claim or hold. Cancel ends the run. " +
       `If not held, automatic retries follow the ordinary requeue accounting.${hostedRoll}`), 1200) } });
     try {
       const delivered = await flight.batcher.flushOwned(
