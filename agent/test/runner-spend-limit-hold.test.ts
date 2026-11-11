@@ -82,14 +82,26 @@ describe("RunRunner #3767 spend-limit hold", () => {
     });
   });
 
-  it("switch sentence appears on a switchable lane (task) and is omitted on a non-switchable one (self_improve)", async () => {
-    for (const [iid, kind, switchable] of [[3780, "task", true], [3781, "self_improve", false]] as const) {
+  it("every in-scope kind parks with work and custody retained; the switch sentence is omitted only on self_improve", async () => {
+    const kinds = [
+      [3780, "issue", true], [3781, "task", true], [3782, "prompt", true],
+      [3783, "ci_fix", true], [3784, "mr_rework", true], [3785, "self_improve", false],
+    ] as const;
+    for (const [iid, kind, switchable] of kinds) {
       await withHome(async (homeRoot) => {
         client.protocolFeatures = ["claim_generation_fence", FEATURE];
         const base = gitlabClaim(iid, { claim_generation: 3 });
-        const claim = kind === "task" ? { ...base, kind, branch: `uzi/task/${base.run_id}` } : { ...base, kind };
-        await rig(spend, homeRoot).runner.execute(claim);
-        assert.equal(parks(claim.run_id).length, 1, `${kind} parks`);
+        const claim = kind === "issue" ? base
+          : kind === "task" ? { ...base, kind, branch: `uzi/task/${base.run_id}` }
+          : kind === "mr_rework" ? { ...base, kind, issue_iid: null, branch: `agent/issue-${iid}`, base_branch: "main" }
+          : { ...base, kind };
+        const r = rig(spend, homeRoot);
+        await r.runner.execute(claim);
+        assert.equal(parks(claim.run_id).length, 1, `${kind} parks; states: ${JSON.stringify(statesOf(claim.run_id).map((s) => [s.status, s.failure_reason]))}`);
+        assert.equal(parks(claim.run_id)[0]!.recovery_cause, "anthropic_spend_limit", kind);
+        assert.equal(failures(claim.run_id).length, 0, `${kind} is parked, not failed`);
+        assert.equal(r.custody(), 0, `${kind}: custody is kept`);
+        assert.equal(fs.existsSync(r.home), true, `${kind}: the session HOME is kept`);
         const feed = feedTexts(claim.run_id).filter((t) => /spend limit/.test(t));
         assert.equal(feed.length, 1, kind);
         assert.ok(feed[0]!.includes(RESUME_SENTENCE), kind);

@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -127,6 +128,11 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 			}
 			return fmt.Sprintf("recorded cause %s; owner reviews retained recovery and chooses Resume; no timer", cause)
 		case recoveryCauseAnthropicSpendLimit:
+			// Non-switchable lanes (mirroring validateCredentialOverrideOn) cannot take a token override.
+			switch r.Kind.String {
+			case runkind.Chat, runkind.Judge, runkind.SelfImprove, runkind.Job:
+				return fmt.Sprintf("recorded cause %s; Anthropic API spend limit reached; owner action: raise the limit and Resume, or Cancel; no timer", cause)
+			}
 			return fmt.Sprintf("recorded cause %s; Anthropic API spend limit reached; owner action: raise the limit and Resume, set-token, or Cancel; no timer", cause)
 		case "worker_requeue_exhausted", recoveryCauseRetainedRecoveryAdoptionFailed, recoveryCauseRetainedContinuationUnwitnessed:
 			return fmt.Sprintf("recorded cause %s; owner reviews recovery evidence and chooses Resume; no timer", cause)
