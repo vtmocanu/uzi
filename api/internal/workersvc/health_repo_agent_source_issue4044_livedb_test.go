@@ -229,7 +229,7 @@ func TestIssue4044HeldProjectionBoundaryLiveDB(t *testing.T) {
 	peer := f.e.seedSpreadWorker(t, issue4044Caps(true), 1)
 	hold := mhOpenHold(t, f.e, f.run, 9, f.owner)
 	f.refuse(t, f.params(peer, issue4044Caps(true)), hold)
-	f.health(t, deadline.Add(time.Microsecond), reasonAssignedRepoAgentSourceGap)
+	f.health(t, deadline.Add(time.Microsecond), reasonAssignedRepoAgentSourceGap+sourcePeerUnavailableSuffix)
 }
 
 func TestIssue4044PeerAffinityReleaseLiveDB(t *testing.T) {
