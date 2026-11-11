@@ -18610,6 +18610,7 @@ UPDATE runs SET
     provider_park_count = 0, provider_park_streak_started_at = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
+    claim_released_at = CASE WHEN runs.recovery_wait_cause = 'anthropic_spend_limit' THEN now() ELSE runs.claim_released_at END,
     updated_at = now()
 WHERE runs.id = $1 AND runs.user_id = $2 AND runs.status = 'recovery_wait'
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -18639,7 +18640,8 @@ type PromoteRecoveryWaitRunNowParams struct {
 }
 
 // The SINGLE-ROW early promote of ONE owner's recovery_wait run for `uzi run set-token`
-// (PRD #1247 M4, D4). Mirrors PromoteRecoveryWaitRuns' mutation set field-for-field, but
+// (PRD #1247 M4, D4). Mirrors PromoteRecoveryWaitRuns' mutation set field-for-field (plus the
+// owner streak reset and the spend-only claim fence below), but
 // for one owner+run and WITHOUT the recovery_retry_not_before guard — the owner chose a
 // new credential, so the run is returned to `queued` at once rather than sleeping to the
 // capped recovery cadence.
@@ -18650,6 +18652,13 @@ type PromoteRecoveryWaitRunNowParams struct {
 // recovery_retry_not_before are LEFT IN PLACE as affinity/history (recovery_wait carries no
 // lifetime cap and this is not a new park). recovery_wait is not a usage limit, so there is
 // no limit_dead_secret_id to preserve here.
+//
+// The ONE cause-scoped exception to "left in place": for recovery_wait_cause =
+// 'anthropic_spend_limit' this also stamps claim_released_at = now(), exactly as
+// ResumeAnthropicSpendLimitHold does, so the old claim is fenced. Otherwise a delayed
+// old-generation `failed` report (SetRunFailed is fenced by claim_released_at IS NULL plus
+// generation) could overwrite the owner's set-token decision before the run is reclaimed;
+// ClaimRun clears the stamp. Every other cause keeps claim_released_at unchanged.
 //
 // Owner- and status-scoped (user_id + status = 'recovery_wait'): a run that moved out of
 // recovery_wait between the verb's read and this write is a 0-row no-op the service

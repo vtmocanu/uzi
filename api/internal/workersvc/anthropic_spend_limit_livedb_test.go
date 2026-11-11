@@ -183,6 +183,99 @@ func TestAnthropicSpendLimitSetTokenLiveDB(t *testing.T) {
 	}
 }
 
+// Issue #3767: set-token on a spend-limit hold must fence the OLD claim. A delayed
+// old-generation `failed` (or a second spend park) from the worker that was running generation G
+// must not overwrite the owner's decision before the run is reclaimed.
+func TestAnthropicSpendLimitSetTokenFencesOldClaimLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
+	svc.SetTxBeginner(env.pool)
+	svc.SetBackground(func(func()) {})
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	clearSpendLimitCause(t, env.exec, userID)
+	env.sealBotPAT(t, userID)
+	tokenA := env.seedAnthropicSecret(t, userID, "fence-worker-a-"+uuid.NewString(), true)
+	tokenB := env.seedAnthropicSecret(t, userID, "fence-pinned-b-"+uuid.NewString(), false)
+	tokenC := env.seedAnthropicSecret(t, userID, "fence-pinned-c-"+uuid.NewString(), false)
+	const iid = 4893
+	env.exec(`INSERT INTO issues (id, repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
+	          VALUES ($1, $2, $3, 'spend fence issue', 'opened', '["uzi"]', 'https://forge.e2e/i', false, now(), now())`, uuid.New(), repoID, int64(iid))
+	waitFalse := false
+	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", &waitFalse, nil, false, nil, nil, nil,
+		&RawCredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &tokenB})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	env.exec(`UPDATE workers SET protocol_capabilities = array_append(protocol_capabilities, 'repo_agent_source_v1') WHERE id = $1`, workerID)
+	wkr := store.Worker{ID: workerID, UserID: userID, Name: "w", Status: "online", ProtocolCapabilities: []string{"repo_agent_source_v1"},
+		AnthropicBindMode: BindModePinned, AnthropicSecretID: pgconv.UUID(tokenA)}
+	if p, err := svc.Claim(env.ctx, wkr, nil); err != nil || p == nil || p.RunID != run.ID.String() {
+		t.Fatalf("first claim %+v err=%v", p, err)
+	}
+	claimed := mustRun(t, env, run.ID)
+	gen := claimed.ClaimGeneration
+	env.exec(`UPDATE runs SET status='running', started_at=now() WHERE id=$1`, run.ID)
+	if _, applied, err := svc.SetState(env.ctx, wkr, run.ID, spendLimitReport(gen)); err != nil || !applied {
+		t.Fatalf("park applied=%v err=%v", applied, err)
+	}
+	if held := mustRun(t, env, run.ID); held.Status != "recovery_wait" || held.ClaimReleasedAt.Valid {
+		t.Fatalf("held run = status %s claim_released_at valid=%v, want recovery_wait with the claim not yet released", held.Status, held.ClaimReleasedAt.Valid)
+	}
+
+	if _, err := svc.SetRunCredential(env.ctx, userID, run.ID, CredentialOverrideModePinned, &tokenC); err != nil {
+		t.Fatalf("owner set-token: %v", err)
+	}
+	afterSwitch := mustRun(t, env, run.ID)
+	if afterSwitch.Status != "queued" || !afterSwitch.ClaimReleasedAt.Valid {
+		t.Fatalf("after set-token: status=%s claim_released_at valid=%v, want queued with the old claim fenced", afterSwitch.Status, afterSwitch.ClaimReleasedAt.Valid)
+	}
+
+	// BEFORE any reclaim: the old worker (same id, generation G) reports failed, then tries a
+	// second spend park. Neither may apply.
+	if _, applied, _ := svc.SetState(env.ctx, wkr, run.ID, StateRequest{State: "failed", ClaimGeneration: i64Ptr(gen)}); applied {
+		t.Fatal("late old-generation failed applied after set-token")
+	}
+	if _, applied, _ := svc.SetState(env.ctx, wkr, run.ID, spendLimitReport(gen)); applied {
+		t.Fatal("second spend park at the old generation applied after set-token")
+	}
+	got := mustRun(t, env, run.ID)
+	if got.Status != "queued" || !got.ClaimReleasedAt.Valid ||
+		got.CredentialOverrideMode.String != CredentialOverrideModePinned ||
+		!got.CredentialOverrideSecretID.Valid || uuid.UUID(got.CredentialOverrideSecretID.Bytes) != tokenC {
+		t.Fatalf("late reports changed the owner's decision: status=%s released=%v override=%v/%v",
+			got.Status, got.ClaimReleasedAt.Valid, got.CredentialOverrideMode, got.CredentialOverrideSecretID)
+	}
+
+	// A fresh claim still succeeds and clears the stamp.
+	if p, err := svc.Claim(env.ctx, wkr, nil); err != nil || p == nil || p.RunID != run.ID.String() {
+		t.Fatalf("reclaim %+v err=%v", p, err)
+	}
+	if again := mustRun(t, env, run.ID); again.Status != "claimed" || again.ClaimReleasedAt.Valid || again.ClaimGeneration <= gen {
+		t.Fatalf("after reclaim: status=%s released=%v gen=%d (was %d)", again.Status, again.ClaimReleasedAt.Valid, again.ClaimGeneration, gen)
+	}
+}
+
+// Control for the fence above: the stamp is scoped to the spend-limit cause. Another promotable
+// cause (forge_unreachable with a retry stamp) leaves claim_released_at exactly as it was.
+func TestAnthropicSpendLimitSetTokenOtherCauseKeepsClaimLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := New(env.q, env.box, testParams())
+	svc.SetTxBeginner(env.pool)
+	o := seedReevalOwner(t, env, BindModeAuto, false)
+	id := seedRunInStatus(t, env, o, 4894, "recovery_wait", time.Now().UTC())
+	env.exec(`UPDATE runs SET recovery_wait_cause='forge_unreachable' WHERE id=$1`, id)
+	if before := mustRun(t, env, id); before.ClaimReleasedAt.Valid || !before.RecoveryRetryNotBefore.Valid {
+		t.Fatalf("fixture: released=%v retry=%v", before.ClaimReleasedAt.Valid, before.RecoveryRetryNotBefore.Valid)
+	}
+	if _, err := svc.SetRunCredential(env.ctx, o.userID, id, CredentialOverrideModePinned, &o.altTok); err != nil {
+		t.Fatalf("owner set-token: %v", err)
+	}
+	if got := mustRun(t, env, id); got.Status != "queued" || got.ClaimReleasedAt.Valid {
+		t.Fatalf("after set-token: status=%s claim_released_at valid=%v, want queued with it still NULL", got.Status, got.ClaimReleasedAt.Valid)
+	}
+}
+
 // A run-pinned run resumed from the hold claims the SAME secret again.
 func TestAnthropicSpendLimitResumeKeepsPinnedSecretLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
