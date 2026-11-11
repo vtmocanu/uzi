@@ -216,9 +216,13 @@ function cacheWithBare(t: { after(fn: () => void): void }, config: Record<string
 }
 
 test("collectEpochScratchProtectedPaths gathers bare-record and store paths", async t => {
+  const retained = JSON.stringify({ version: 1, branch: "agent/issue-1", key: "issue-1",
+    journal: { runId: "run1", clonePath: "/data/runner/slug/issue-2",
+      retainedSources: [{ runId: "run1", clonePath: "/scratch/a" }] } });
+  assert.doesNotThrow(() => parseRetainedDescriptorShape("run1", retained), "the path-collection fixture is a valid retained descriptor");
   const { data, cache } = cacheWithBare(t, {
     "uzi-recovery.agent-issue-1.clone": "/data/runner/slug/issue-1",
-    "uzi-retained.run1.journal": JSON.stringify({ runId: "run1", clonePath: "/data/runner/slug/issue-2", nested: [{ p: "/scratch/a" }] }),
+    "uzi-retained.run1.journal": retained,
     "uzi-attemptmode.key.enabled": "maybe",
     "user.name": "ignored",
   });
