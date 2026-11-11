@@ -1090,8 +1090,9 @@ export const runsApi = {
       throw new ApiError(404, "run not found");
     const forgeHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "forge_unreachable" && run.recovery_retry_not_before === null;
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
+    const spendLimitHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "anthropic_spend_limit";
     const diskHeld = diskWaitMode(run) === "held";
-    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld && !diskHeld)
+    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld && !diskHeld && !spendLimitHeld)
       throw new ApiError(409, `run is ${run.status}`);
     const iterationHeld = run.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
     const diskWallLimited = diskHeld && run.kind !== "chat" && run.kind !== "judge" &&
@@ -1119,6 +1120,7 @@ export const runsApi = {
         health_reason: "Owner resumed one bounded forge attempt; origin cooldown and other admission limits may still block execution.",
       } : {}),
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
+      ...(spendLimitHeld ? { recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
       ...(diskHeld ? { recovery_wait_cause: null, recovery_retry_not_before: null,
         recovery_wait_phase: null, health: "ok", health_reason: null, health_since: null } : {}),
       ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),
