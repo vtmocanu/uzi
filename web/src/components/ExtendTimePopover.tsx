@@ -12,6 +12,12 @@
 // cap is unknown or 0 — see budget.extendEnabled). If it is rendered with a 0 cap anyway, the
 // panel degrades honestly to "extensions are turned off" rather than offering a Confirm that
 // would 409.
+//
+// Issue #4179: "turned off" is ONLY for a 0 cap. A wall park (paused, hold_reason
+// 'budget_exhausted') with no budget figures on the wire, an interactive task the worker parked
+// at its per-follow-up time limit, still gets the chooser: the server routes its extend to
+// ExtendAndResumeWallPark, which adds the time and resumes the run. Any other run without
+// budget figures has no time limit to extend, and the panel says exactly that.
 
 import { useEffect, useId, useRef, useState } from "react";
 import {
@@ -145,21 +151,26 @@ export function ExtendTimePopover({
   }, [open]);
 
   const view = extendBudgetView(run, now);
-  const capDisabled = (view?.capSec ?? run.budget_extension_cap_seconds ?? 0) <= 0;
+  const cap = view?.capSec ?? run.budget_extension_cap_seconds ?? 0;
+  const capDisabled = cap <= 0;
+  // Issue #4179: a wall park is extendable even when the run carries no budget figures.
+  const wallParked = run.status === "paused" && run.hold_reason === "budget_exhausted";
+  const extendable = !capDisabled && (view != null || wallParked);
 
   // The effective pick: a non-empty custom input overrides the quick pick. parseDurationToSeconds
   // returns null for an unparseable custom value, which disables Confirm with a hint.
   const customTrimmed = custom.trim();
   const effective = customTrimmed !== "" ? parseDurationToSeconds(custom) : picked;
 
-  const perExtensionMax = view?.perExtensionMaxSec ?? 0;
+  // The cap is a per-request maximum (#2735), so without a view it is the per-extension maximum.
+  const perExtensionMax = view?.perExtensionMaxSec ?? (extendable ? cap : 0);
   const overMax = effective != null && effective > perExtensionMax;
-  const canConfirm = !busy && !capDisabled && effective != null && !overMax && perExtensionMax > 0;
+  const canConfirm = !busy && extendable && effective != null && !overMax && perExtensionMax > 0;
 
   // The disabled reason, named so the owner knows why: an invalid custom value, or a pick above
   // the per-extension maximum.
   let reason: string | null = null;
-  if (!capDisabled && view) {
+  if (extendable) {
     if (customTrimmed !== "" && effective == null) {
       reason = "Enter a duration like 2h, 90m or 1h30m.";
     } else if (overMax && effective != null) {
@@ -205,11 +216,13 @@ export function ExtendTimePopover({
           className="absolute right-0 top-full z-20 mt-2 w-72 max-w-[calc(100vw-1rem)] rounded-xl border border-edge bg-raised p-3 text-left shadow-2xl outline-hidden"
         >
           <p className="text-sm font-semibold text-fg">Extend time</p>
-          {capDisabled || !view ? (
+          {capDisabled ? (
             <p className="mt-2 text-xs text-muted">
               Extensions are turned off for this instance. Ask an admin to set a maximum per
               extension to let owners grant a run more time.
             </p>
+          ) : !extendable ? (
+            <p className="mt-2 text-xs text-muted">This run has no time limit to extend.</p>
           ) : (
             <>
               {/* Quick picks: a non-empty custom field overrides the highlighted pick. */}
@@ -252,38 +265,54 @@ export function ExtendTimePopover({
 
               {/* The facts the pick is chosen against (mock frame B): what is used, the most
                   one extension may add, and the deadline the pick would produce. */}
-              <dl className="mt-3 space-y-1 text-xs text-muted">
-                <div className="flex justify-between gap-2">
-                  <dt>Used</dt>
-                  <dd className="tabular-nums text-fg">
-                    {formatBudgetDuration(view.usedSec)} of {budgetRightLabel(view)}
-                  </dd>
-                </div>
-                <div className="flex justify-between gap-2">
-                  <dt>Up to {formatBudgetDuration(view.perExtensionMaxSec)} per extension</dt>
-                  <dd className="text-faint">extend again any time</dd>
-                </div>
-                {view.extSec > 0 && (
+              {view ? (
+                <dl className="mt-3 space-y-1 text-xs text-muted">
                   <div className="flex justify-between gap-2">
-                    <dt>Extended so far</dt>
-                    <dd className="tabular-nums text-fg">{formatBudgetDuration(view.extSec)}</dd>
-                  </div>
-                )}
-                {effective != null && !overMax && (
-                  <div className="flex justify-between gap-2">
-                    <dt>After +{formatBudgetDuration(effective)}</dt>
+                    <dt>Used</dt>
                     <dd className="tabular-nums text-fg">
-                      {view.running
-                        ? `${formatBudgetDuration(view.remainingSec + effective)} left${
-                            afterDeadline(view.deadlineIso, effective)
-                              ? `, stops at ${afterDeadline(view.deadlineIso, effective)}`
-                              : ""
-                          }`
-                        : `${formatBudgetDuration(view.remainingSec + effective)} left when resumed`}
+                      {formatBudgetDuration(view.usedSec)} of {budgetRightLabel(view)}
                     </dd>
                   </div>
-                )}
-              </dl>
+                  <div className="flex justify-between gap-2">
+                    <dt>Up to {formatBudgetDuration(view.perExtensionMaxSec)} per extension</dt>
+                    <dd className="text-faint">extend again any time</dd>
+                  </div>
+                  {view.extSec > 0 && (
+                    <div className="flex justify-between gap-2">
+                      <dt>Extended so far</dt>
+                      <dd className="tabular-nums text-fg">{formatBudgetDuration(view.extSec)}</dd>
+                    </div>
+                  )}
+                  {effective != null && !overMax && (
+                    <div className="flex justify-between gap-2">
+                      <dt>After +{formatBudgetDuration(effective)}</dt>
+                      <dd className="tabular-nums text-fg">
+                        {view.running
+                          ? `${formatBudgetDuration(view.remainingSec + effective)} left${
+                              afterDeadline(view.deadlineIso, effective)
+                                ? `, stops at ${afterDeadline(view.deadlineIso, effective)}`
+                                : ""
+                            }`
+                          : `${formatBudgetDuration(view.remainingSec + effective)} left when resumed`}
+                      </dd>
+                    </div>
+                  )}
+                </dl>
+              ) : (
+                // Issue #4179: a wall park without budget figures. Only the cap is known, so the
+                // facts are the per-extension maximum and what Confirm does.
+                <>
+                  <dl className="mt-3 space-y-1 text-xs text-muted">
+                    <div className="flex justify-between gap-2">
+                      <dt>Up to {formatBudgetDuration(perExtensionMax)} per extension</dt>
+                      <dd className="text-faint">extend again any time</dd>
+                    </div>
+                  </dl>
+                  <p className="mt-2 text-xs text-muted">
+                    This run stopped at its time limit. Extending adds the time and resumes it.
+                  </p>
+                </>
+              )}
 
               {reason && <p className="mt-2 text-xs text-warn">{reason}</p>}
 

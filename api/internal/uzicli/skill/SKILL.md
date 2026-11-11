@@ -705,7 +705,9 @@ uzi version
   stacks on the frozen budget rather than replacing it. `--by` is capped per request by an admin-set maximum per extension (default 16h), not per run: a run may be extended repeatedly, up to a technical total limit.
   Owner-only, and valid on any non-terminal run of a kind the sweep can time out (issue, task,
   prompt, self-improve, mr-rework, ci-fix), including a queued or parked one. A chat, judge or
-  interactive-task run never times out, an over-cap request, or extending while the admin has
+  interactive-task run never times out (except an interactive task its worker parked at its time
+  limit, `hold_reason: budget_exhausted`, which extend gives the time and resumes), an over-cap
+  request, or extending while the admin has
   turned extensions off, is a 409 (exit 5) with the server's message printed verbatim. Prints
   the new deadline and the run's total extension (with the per-extension maximum); `uzi run get` then shows the
   extension on its `DEADLINE` row (`· +2h extended`).

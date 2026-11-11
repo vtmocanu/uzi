@@ -27,6 +27,9 @@ export type BudgetRun = {
   budget_used_seconds?: number | null;
   budget_extension_seconds?: number | null;
   budget_extension_cap_seconds?: number | null;
+  // Issue #4179: lets the Extend chooser recognise a wall park (paused, 'budget_exhausted') that
+  // carries no budget figures, which the server still extends and resumes in one step.
+  hold_reason?: string | null;
 };
 
 // BudgetView is the normalized set of seconds every budget surface reads, so the header text,

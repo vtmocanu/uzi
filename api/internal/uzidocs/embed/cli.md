@@ -553,7 +553,10 @@ A few worth knowing:
   negative value, or an unparseable one is a usage error (exit 2). Valid on any non-terminal run
   of a kind the sweep can time out (issue, task, prompt, self-improve,
   mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
-  interactive-task run never times out, so extending one is a 409 (exit 5).
+  interactive-task run never times out, so extending one is a 409 (exit 5),
+  except an interactive task its worker parked at its time limit (`paused`,
+  `hold_reason: budget_exhausted`): extend gives it the time and resumes it,
+  like any run parked there.
   `--by` is limited per request by the admin's maximum per extension
   (default 16h), not per run: you may extend the same run repeatedly, and
   each extension is an audited action. A request above that maximum, a

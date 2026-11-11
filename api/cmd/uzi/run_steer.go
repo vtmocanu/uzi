@@ -160,7 +160,9 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 			"For Iteration limit reached, Extend adds wall time only and leaves the run paused; use Resume separately.\n\n" +
 			"Valid on any non-terminal run of a kind the sweep can time out (an issue, task, prompt, " +
 			"self-improve, mr-rework or ci-fix run), including a queued or parked one. A chat, judge " +
-			"or interactive-task run never times out, so extending one is a 409 (exit 5); a request " +
+			"or interactive-task run never times out, so extending one is a 409 (exit 5), except an " +
+			"interactive task its worker parked at its time limit (paused, hold reason budget_exhausted), " +
+			"which extend gives the time and resumes like any run parked there; a request " +
 			"over the per-extension maximum or past the total-time limit, or extending while the admin " +
 			"has turned extensions off, is also a 409, with the server's message printed verbatim. " +
 			"So is a --require-base run held because its kept work is not attested against the planned " +
