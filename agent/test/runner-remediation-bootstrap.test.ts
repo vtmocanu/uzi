@@ -97,6 +97,355 @@ async function fixture(enrolled = true) {
   return { claim, bare, base, clone, source, seedJournal, q, d, s, fetch, commit, journal, write, detach, fresh, snapshot };
 }
 
+for (const mode of ["finding", "denial"] as const) {
+  test("#4191 clearable revalidation refuses publication after " + mode, async t => {
+    const f = await fixture(false);
+    const { cache, runner, subject, flight } = f.fresh();
+    try {
+      await timeout4191(f, cache, subject, flight);
+      const revision = flight.remediationDenialRevision;
+      const read = cache.readRemediationRestrictionFacts.bind(cache);
+      let injected = false;
+      t.mock.method(cache, "recordRemediationScan", async () => { throw new Error("write failure"); });
+      t.mock.method(cache, "readRemediationRestrictionFacts", async (...args: Parameters<typeof read>) => {
+        const facts = await read(...args);
+        if (!injected) {
+          injected = true;
+          await assert.rejects(subject.persistRemediationScan(flight, f.bare, BRANCH, f.s,
+            mode === "finding" ? [{ commit: f.s }] : [{ commit: f.s }, {}], "pre-exit"));
+        }
+        return facts;
+      });
+      flight.publishedTip = f.base; flight.checkpointFloor = f.base;
+      await assert.rejects(subject.pushRemediationCandidate(flight, f.bare, BRANCH, "fixture", fx.originPath, undefined,
+        { candidate: f.s, originalHead: f.s, floor: { kind: "absent" } }));
+      assert.equal(injected, true);
+      assert.ok(flight.remediationRestrictions.pending.requiredOIDs.includes(f.s));
+      assert.equal(subject.frozenHeldPolicy(flight).blocked, true);
+      assert.ok(flight.remediationDenialRevision >= revision);
+      assert.equal(flight.preserveRecoveryClone, true);
+      assert.equal(command(f.clone.path, "rev-parse", "HEAD"), f.s);
+      assert.throws(() => command(fx.originPath, "rev-parse", "refs/heads/" + BRANCH));
+    } finally { runner.shutdown(); }
+  });
+}
+
+for (const mode of ["finding", "denial", "binding"] as const) {
+  test("#4191 failed persistence then clean read retains pending: " + mode, async t => {
+    const f = await fixture(false);
+    const { cache, runner, subject, flight } = f.fresh();
+    const failure = t.mock.method(cache, "recordRemediationScan", async () => {
+      assert.deepEqual(flight.remediationRestrictions.pending.requiredOIDs, [f.s]);
+      throw new Error("write failure");
+    });
+    try {
+      await assert.rejects(subject.persistRemediationScan(flight, f.bare, BRANCH, f.s, [{ commit: f.s }], "pre-exit"));
+      assert.equal(failure.mock.callCount(), 1, "the real finding reached the failed persistence write");
+      if (mode === "denial")
+        await assert.rejects(subject.persistRemediationScan(flight, f.bare, BRANCH, f.s, [{ commit: f.s }, {}], "pre-exit"));
+      if (mode === "binding") {
+        flight.runnerClone = { ...f.clone, attemptId: "another-attempt" };
+        await assert.rejects(subject.persistRemediationScan(flight, f.bare, BRANCH, f.s, [{ commit: f.s }], "pre-exit"));
+        flight.runnerClone = f.clone;
+      }
+      failure.mock.restore();
+      const pending = flight.remediationRestrictions.pending;
+      assert.deepEqual(pending.requiredOIDs, [f.s]);
+      if (mode === "denial") assert.equal(pending.requireDenial, true);
+      if (mode === "binding") assert.equal(pending.bindingUncertain, true);
+      assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: false });
+      assert.equal(flight.remediationRestrictions.pending, pending);
+      await assert.rejects(subject.requireLaunchAuthority(flight), /enrollment disappeared|pending persistence/);
+    } finally { runner.shutdown(); }
+  });
+}
+
+for (const poison of [false, true]) {
+  test("#4191 captured admission rejects after real timeout clears poison=" + poison, async () => {
+    const f = await fixture(false);
+    const { cache, runner, subject, flight } = f.fresh();
+    try {
+      const admission = await subject.requireLaunchAuthority(flight);
+      if (poison) flight.remediationDenialRevision = Number.MAX_SAFE_INTEGER;
+      await timeout4191(f, cache, subject, flight);
+      assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: false });
+      assert.equal(flight.remediationRestrictions, undefined);
+      assert.throws(admission, /confirmation changed/);
+      if (poison) {
+        assert.equal(flight.remediationDenialRevision, -1);
+        await assert.rejects(subject.requireLaunchAuthority(flight), /confirmation changed/);
+        assert.equal(flight.remediationDenialRevision, -1);
+      } else await subject.requireLaunchAuthority(flight);
+    } finally { runner.shutdown(); }
+  });
+}
+
+for (const protectedOnly of [false, true]) {
+  test("#4191 enrollment observed before a failed read stays sticky protected=" + protectedOnly, async t => {
+    const f = await fixture();
+    if (protectedOnly) await f.detach();
+    const { cache, runner, subject, flight } = f.fresh();
+    const messages: unknown[][] = [];
+    t.mock.method(subject.log, "warn", (...args: unknown[]) => { messages.push(args); });
+    const failure = t.mock.method(cache as any, "syncJournalAndReadBack", async () => {
+      throw new Error("private-post-enrollment-sentinel");
+    });
+    try {
+      assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
+      assert.ok(flight.remediationRestrictions.flaggedOIDs.includes(f.q),
+        "partial-read enrollment contributes negative knowledge before the later failure");
+      assert.deepEqual(messages.at(-1), ["remediation restriction read unavailable", { class: "enrolled_observed" }]);
+      failure.mock.restore();
+      f.write(f.seedJournal);
+      if (protectedOnly) command(f.bare, "config", "--unset", "uzi-retained." + f.claim.run_id + ".journal");
+      assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: false });
+      await assert.rejects(subject.restoreRemediationRestrictions(flight), /enrollment disappeared/);
+      const diagnostics = JSON.stringify(messages);
+      for (const secret of [f.bare, f.q, "private-post-enrollment-sentinel"])
+        assert.equal(diagnostics.includes(secret), false);
+    } finally { runner.shutdown(); }
+  });
+}
+
+async function timeout4191(f: Awaited<ReturnType<typeof fixture>>, cache: GitCache, subject: any, flight: any) {
+  const entered = latch(), release = latch();
+  const hold = AsyncLocalStorage.bind(() => cache.withBareLock(f.bare, async () => {
+    entered.release(); await release.promise;
+  }));
+  const holder = hold(); await entered.promise;
+  subject.codexBoundaryDeadlineMs = 30;
+  try {
+    assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
+    assert.equal(flight.remediationRestrictions.clearable, true);
+  } finally { release.release(); await holder; subject.codexBoundaryDeadlineMs = 5000; }
+}
+
+for (const mode of ["zero blocked", "ambiguous", "malformed", "noncanonical", "identity", "overflow", "restore identity", "unknown"] as const) {
+  test("#4191 actual cause remains sticky after clean read: " + mode, async t => {
+    const f = await fixture(mode === "zero blocked" || mode === "noncanonical" || mode === "identity" || mode === "overflow");
+    if (mode === "overflow") await f.detach();
+    const { cache, runner, subject, flight } = f.fresh();
+    const messages: unknown[][] = [];
+    t.mock.method(subject.log, "warn", (...args: unknown[]) => { messages.push(args); });
+    try {
+      await timeout4191(f, cache, subject, flight);
+      if (mode === "zero blocked") {
+        const j = f.journal();
+        j.remediationRecovery.flaggedOIDs = []; j.remediationRecovery.edges = [];
+        j.remediationRecovery.blocked = true; delete j.remediationRecovery.active; f.write(j);
+        assert.equal(f.journal().remediationRecovery.flaggedOIDs.length, 0);
+      }
+      if (mode === "ambiguous") command(f.bare, "config", "--add", ACTIVE, JSON.stringify(f.seedJournal));
+      if (mode === "malformed") command(f.bare, "config", ACTIVE, "{private-journal-sentinel");
+      if (mode === "noncanonical") command(f.bare, "config", ACTIVE, JSON.stringify(f.journal(), null, 2));
+      if (mode === "identity") { const j = f.journal(); j.remediationRecovery.branch = "agent/other"; f.write(j); }
+      if (mode === "overflow") {
+        const j = JSON.parse(command(f.bare, "config", "uzi-retained." + f.claim.run_id + ".journal")).journal;
+        j.remediationRecovery.flaggedOIDs = Array.from({ length: 64 }, (_, i) => (i + 1).toString(16).padStart(40, "0"));
+        j.remediationRecovery.edges = []; delete j.remediationRecovery.active; f.write(j);
+      }
+      if (mode === "restore identity") {
+        flight.barePath = undefined; flight.branch = undefined; flight.worktreePath = undefined;
+        await assert.rejects(subject.restoreRemediationRestrictions(flight), /source identity unavailable/);
+        flight.barePath = f.bare; flight.branch = BRANCH; flight.worktreePath = f.clone.path;
+      } else {
+        const injected = mode === "unknown" ? t.mock.method(cache as any, "readRecoverySnapshot", async () => {
+          throw new Error("private-error-sentinel");
+        }) : undefined;
+        assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
+        injected?.mock.restore();
+        const expected = mode === "zero blocked" ? "blocked" : mode === "identity" ? "identity" : mode === "unknown" ? "unknown" : "integrity";
+        assert.deepEqual(messages.at(-1), ["remediation restriction read unavailable", { class: expected }]);
+      }
+      command(f.bare, "config", "--replace-all", ACTIVE, JSON.stringify(f.seedJournal));
+      if (mode === "overflow") command(f.bare, "config", "--unset", "uzi-retained." + f.claim.run_id + ".journal");
+      assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: false });
+      assert.equal(subject.frozenHeldPolicy(flight).blocked, true);
+      assert.equal(flight.remediationRestrictions.clearable, false);
+      const allowed = new Set(["pre_read_unavailable", "enrolled_observed", "blocked", "integrity", "identity", "changed_facts", "post_read_expiry", "unknown"]);
+      for (const message of messages) {
+        assert.equal(message.length, 2);
+        assert.equal(message[0], "remediation restriction read unavailable");
+        assert.ok(allowed.has((message[1] as { class: string }).class));
+        assert.deepEqual(Object.keys(message[1] as object), ["class"]);
+      }
+      const diagnostics = JSON.stringify(messages);
+      for (const secret of [f.bare, f.clone.path, f.q, "private-error-sentinel", "private-journal-sentinel", JSON.stringify(f.seedJournal)])
+        assert.equal(diagnostics.includes(secret), false);
+    } finally { runner.shutdown(); }
+  });
+}
+
+for (const mode of ["branch", "bare", "run"] as const) {
+  test("#4191 wrong confirmed identity cannot clear: " + mode, async t => {
+    const f = await fixture(false);
+    const { cache, runner, subject, flight } = f.fresh();
+    try {
+      await timeout4191(f, cache, subject, flight);
+      if (mode === "run") {
+        const read = (cache as any).readRecoverySnapshot.bind(cache);
+        const entered = latch(), release = latch();
+        const injected = t.mock.method(cache as any, "readRecoverySnapshot", async (...args: unknown[]) => {
+          entered.release(); await release.promise; return read(...args);
+        });
+        const reading = subject.bootstrapRemediationRestrictions(flight);
+        try { await entered.promise; flight.runId = "another-valid-run"; }
+        finally { release.release(); }
+        assert.deepEqual(await reading, { kind: "confirmed", enrolled: false });
+        injected.mock.restore(); flight.runId = f.claim.run_id;
+      } else {
+        const otherBare = mode === "bare" ? path.join(path.dirname(f.bare), "other-confirmed.git") : f.bare;
+        if (mode === "bare") command(f.bare, "init", "--bare", otherBare);
+        assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight, otherBare,
+          mode === "branch" ? "agent/other" : BRANCH), { kind: "confirmed", enrolled: false });
+      }
+      assert.ok(flight.remediationRestrictions);
+      assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: false });
+      assert.equal(flight.remediationRestrictions, undefined);
+    } finally { runner.shutdown(); }
+  });
+}
+
+test("#4191 deadline after B before facts stays sticky", async t => {
+  const f = await fixture(false);
+  const { cache, runner, subject, flight } = f.fresh();
+  let wall = Date.now(); t.mock.method(Date, "now", () => wall);
+  let readStarted: boolean | undefined, expired = false;
+  const read = (cache as any).readRecoverySnapshot.bind(cache);
+  const injected = t.mock.method(cache as any, "readRecoverySnapshot", async (...args: unknown[]) => {
+    readStarted = (cache as any).restrictionProgress.getStore()?.started;
+    wall += subject.codexBoundaryDeadlineMs;
+    expired = true;
+    return read(...args);
+  });
+  try {
+    assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
+    assert.equal(readStarted, true, "the actual reader began under B before expiry");
+    assert.equal(expired, true, "the test actually advances the deadline before facts exist");
+    injected.mock.restore();
+    assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: false });
+    assert.equal(subject.frozenHeldPolicy(flight).blocked, true);
+  } finally { runner.shutdown(); }
+});
+
+test("#4191 unenrolled lock timeout clears before ordinary push and ends real source slots", async () => {
+  const f = await sourceImportFixture(false);
+  const entered = latch(), release = latch();
+  const hold = AsyncLocalStorage.bind(() => f.cache.withBareLock(f.bare, async () => {
+    entered.release(); await release.promise;
+  }));
+  const holder = hold();
+  await entered.promise;
+  f.subject.codexBoundaryDeadlineMs = 30;
+  try {
+    assert.deepEqual(await f.subject.bootstrapRemediationRestrictions(f.flight), { kind: "unavailable" });
+    assert.ok(f.flight.remediationRestrictions, "timeout latches denial while B remains held");
+  } finally { release.release(); await holder; }
+  f.subject.codexBoundaryDeadlineMs = 5000;
+  try {
+    const frozen = f.subject.frozenHeldPolicy(f.flight);
+    assert.equal(frozen.blocked, true);
+    await f.subject.persistRemediationScan(f.flight, f.bare, BRANCH, f.s, [], "pre-exit");
+    assert.deepEqual(await f.subject.bootstrapRemediationRestrictions(f.flight), { kind: "confirmed", enrolled: false });
+    assert.equal(f.flight.remediationRestrictions, undefined, "verified absence clears the pre-acquisition denial and empty pending");
+    assert.equal(f.subject.frozenHeldPolicy(f.flight).blocked, false);
+    assert.equal(frozen.blocked, true, "a previously frozen policy stays blocked");
+    assert.equal(f.journal().remediationRecovery, undefined, "clean scan never enrolls a blocked journal");
+    f.flight.publishedTip = f.base; f.flight.checkpointFloor = f.base;
+    await f.subject.pushRemediationCandidate(f.flight, f.bare, BRANCH, "fixture", fx.originPath, undefined,
+      { candidate: f.s, originalHead: f.s, floor: { kind: "absent" } });
+    assert.equal(command(fx.originPath, "rev-parse", "refs/heads/" + BRANCH), f.s);
+    f.flight.sourceTailsJoined = true;
+    const end = await f.subject.endFlightSourceUse(f.flight, nullLogger());
+    assert.ok(end.endedSlots.length > 0, "real authority source-use slots end");
+    assert.equal(f.journal().remediationRecovery, undefined, "teardown writes no denial after the clear");
+  } finally { f.runner.shutdown(); }
+});
+
+for (const failure of [false, true]) {
+  test("#4191 teardown revalidates empty pending with real source slots failure=" + failure, async t => {
+    const f = await sourceImportFixture(false);
+    const entered = latch(), release = latch();
+    const hold = AsyncLocalStorage.bind(() => f.cache.withBareLock(f.bare, async () => {
+      entered.release(); await release.promise;
+    }));
+    const holder = hold(); await entered.promise;
+    f.subject.codexBoundaryDeadlineMs = 30;
+    try { await f.subject.bootstrapRemediationRestrictions(f.flight); }
+    finally { release.release(); await holder; }
+    f.subject.codexBoundaryDeadlineMs = 5000;
+    try {
+      await f.subject.persistRemediationScan(f.flight, f.bare, BRANCH, f.s, [], "pre-exit");
+      assert.ok(f.flight.remediationRestrictions.pending);
+      if (failure) t.mock.method(f.cache, "readRemediationRestrictionFacts", async () => {
+        throw new Error("private sentinel must stay out of diagnostics");
+      });
+      f.flight.sourceTailsJoined = true;
+      const end = await f.subject.endFlightSourceUse(f.flight, nullLogger());
+      if (failure) {
+        assert.ok(f.flight.remediationRestrictions);
+        assert.equal(f.journal().remediationRecovery.blocked, true, "failed revalidation persists denial");
+      } else {
+        assert.equal(f.flight.remediationRestrictions, undefined);
+        assert.equal(f.journal().remediationRecovery, undefined);
+      }
+      assert.ok(end.endedSlots.length > 0, "real source-use slots leave active after absence or durable denial");
+    } finally { f.runner.shutdown(); }
+  });
+}
+
+for (const mode of ["active", "protected", "readback", "unknown", "restore", "predecessor", "report proof"] as const) {
+  test("#4191 sticky denial survives later verified absence: " + mode, async t => {
+    const f = await fixture(mode === "active" || mode === "protected");
+    if (mode === "protected") await f.detach();
+    const { cache, runner, subject, flight } = f.fresh();
+    const diagnostics: unknown[][] = [];
+    if (mode === "readback") t.mock.method(subject.log, "warn", (...args: unknown[]) => { diagnostics.push(args); });
+    try {
+      if (mode === "predecessor") flight.predecessorCapture = true;
+      const original = cache.readRemediationRestrictionFacts.bind(cache);
+      let injection: ReturnType<typeof t.mock.method> | undefined;
+      if (mode === "readback") injection = t.mock.method(cache, "readRemediationRestrictionFacts",
+        async (...args: Parameters<typeof original>) => original(args[0], args[1], args[2], undefined,
+          { readback: async () => "different" }));
+      if (mode === "unknown") injection = t.mock.method(cache, "readRemediationRestrictionFacts", async () => {
+        throw new Error("sensitive-fixture-sentinel");
+      });
+      if (mode === "report proof") injection = t.mock.method(cache as any, "checkReportProof", () => {
+        throw new Error("sensitive-proof-sentinel");
+      });
+      if (mode === "predecessor" || mode === "restore") {
+        const entered = latch(), release = latch();
+        const hold = AsyncLocalStorage.bind(() => cache.withBareLock(f.bare, async () => {
+          entered.release(); await release.promise;
+        }));
+        const holder = hold(); await entered.promise;
+        subject.codexBoundaryDeadlineMs = 30;
+        try { await subject.bootstrapRemediationRestrictions(flight); }
+        finally { release.release(); await holder; }
+        subject.codexBoundaryDeadlineMs = 5000;
+      } else await subject.bootstrapRemediationRestrictions(flight);
+      injection?.mock.restore();
+      if (mode === "readback") assert.deepEqual(diagnostics, [
+        ["remediation restriction read unavailable", { class: "changed_facts" }],
+      ]);
+      if (mode === "restore") {
+        const broken = t.mock.method(cache, "readRuntimeRemediationRecovery", async () => { throw new Error("unreadable"); });
+        await assert.rejects(subject.restoreRemediationRestrictions(flight), /unreadable/);
+        broken.mock.restore();
+      }
+      if (mode === "active") {
+        const journal = f.journal(); delete journal.remediationRecovery; f.write(journal);
+      }
+      if (mode === "protected") command(f.bare, "config", "--unset", "uzi-retained." + f.claim.run_id + ".journal");
+      flight.predecessorCapture = false;
+      assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: false });
+      assert.ok(flight.remediationRestrictions, "later absence cannot erase observed or unknown denial");
+      assert.equal(subject.frozenHeldPolicy(flight).blocked, true);
+    } finally { runner.shutdown(); }
+  });
+}
+
 for (const mode of ["active", "protected", "malformed", "readback", "overflow", "large"] as const) {
   test("fresh sinks restore durable negative restrictions: " + mode, async t => {
     const f = await fixture();
@@ -229,7 +578,7 @@ for (const unavailable of [false, true]) {
     const admission = t.mock.method(subject, "admitPredecessorSource", async () => {
       assert.equal(query.mock.callCount(), 1);
       if (unavailable) {
-        assert.ok(flight.remediationRestrictions.denialRevision > 0);
+        assert.ok(flight.remediationDenialRevision > 0);
         assert.equal(flight.preserveRecoveryClone, true);
       } else {
         assert.ok(flight.remediationRestrictions.roots.includes(f.q));
@@ -430,7 +779,7 @@ for (const late of ["confirmed", "unavailable", "blocked", "reconfirmed", "initi
     const { cache, runner, subject, flight } = f.fresh();
     flight.publishedTip = f.base; flight.checkpointFloor = f.base;
     flight.executor = {};
-    if (late === "overflow") flight.remediationRestrictions = { roots: [], denialRevision: Number.MAX_SAFE_INTEGER };
+    if (late === "overflow") flight.remediationDenialRevision = Number.MAX_SAFE_INTEGER;
     if (late === "initial-wait")
       assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: true });
     t.mock.method(cache, "secretScanCheckpointRange", async () => ({ trusted: true as const, findings: [] }));
@@ -482,14 +831,14 @@ for (const late of ["confirmed", "unavailable", "blocked", "reconfirmed", "initi
         { message: "remediation restriction confirmation changed" },
         "an unavailable read invalidates the admission already waiting");
       if (late === "reconfirmed") {
-        assert.equal(flight.remediationRestrictions.denialRevision, 1);
+        assert.equal(flight.remediationDenialRevision, 1);
         await subject.requireLaunchAuthority(flight);
-        assert.equal(flight.remediationRestrictions.denialRevision, 1, "fresh confirmation never resets a denial");
+        assert.equal(flight.remediationDenialRevision, 1, "fresh confirmation never resets a denial");
       }
       if (late === "overflow") {
-        assert.equal(flight.remediationRestrictions.denialRevision, -1);
+        assert.equal(flight.remediationDenialRevision, -1);
         await assert.rejects(subject.requireLaunchAuthority(flight), { message: "remediation restriction confirmation changed" });
-        assert.equal(flight.remediationRestrictions.denialRevision, -1, "overflow never wraps or clears");
+        assert.equal(flight.remediationDenialRevision, -1, "overflow never wraps or clears");
       }
       assert.equal(observed, true);
     } finally { runner.shutdown(); }
@@ -849,7 +1198,7 @@ for (const mode of ["healthy", "unenrolled", "revoked", "expired", "unsafe", "re
   });
 }
 
-test("negative post-action expiry latches denial and independent private capture retains bytes", async t => {
+test("#4191 negative post-action expiry latches denial and independent private capture retains bytes", async t => {
   const f = await fixture();
   const { cache, runner, subject, flight } = f.fresh();
   let wall = Date.now(), first = true;
@@ -865,13 +1214,16 @@ test("negative post-action expiry latches denial and independent private capture
   t.mock.method(subject, "reproveDetailAfterRunnerGit", async () => undefined);
   try {
     assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
-    assert.equal(flight.remediationRestrictions.denialRevision, 1);
+    assert.equal(flight.remediationDenialRevision, 1);
     assert.equal(flight.preserveRecoveryClone, true);
     const result = await subject.captureRecoveryRestorePointBody(f.claim, flight, nullLogger(),
       "recovery_capture", { credentialFree: true, publish: false });
     assert.equal(result.verified, true);
     assert.equal(result.published, false);
     assert.deepEqual(f.snapshot(), before);
+    f.write(f.seedJournal);
+    assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: false });
+    await assert.rejects(subject.restoreRemediationRestrictions(flight), /enrollment disappeared/);
   } finally { runner.shutdown(); }
 });
 
@@ -892,7 +1244,7 @@ test("negative bootstrap inherits a shorter parent deadline without renewing it"
     await assert.rejects(cache.withRecoveryOperation(new AbortController().signal, deadline, async () => {
       assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
     }), /recovery deadline/);
-    assert.equal(flight.remediationRestrictions.denialRevision, 1);
+    assert.equal(flight.remediationDenialRevision, 1);
     assert.equal(flight.preserveRecoveryClone, true);
   } finally { runner.shutdown(); }
 });
@@ -915,7 +1267,7 @@ for (const seam of ["capture", "frozen", "prepare"] as const) {
       else assert.deepEqual(await subject.heldPublicationStep(f.claim, flight, record, caller.signal),
         { reason: "secret_remediation_pending" });
       assert.equal(query.mock.callCount(), 0, "scope entry refuses the earlier query");
-      assert.equal(flight.remediationRestrictions.denialRevision, 1);
+      assert.equal(flight.remediationDenialRevision, 1);
       assert.equal(flight.preserveRecoveryClone, true);
     } finally { runner.shutdown(); }
   });
@@ -1026,7 +1378,7 @@ for (const native of [false, true]) for (const stop of ["caller", "late attempt"
     const result = await outcome;
     assert.equal(result.kind, "value");
     assert.deepEqual(result.kind === "value" ? result.value : undefined, { kind: "unavailable" });
-    assert.equal(flight.remediationRestrictions.denialRevision, 1);
+    assert.equal(flight.remediationDenialRevision, 1);
     assert.equal(siblingA, true); assert.equal(siblingB, true);
   });
 }
