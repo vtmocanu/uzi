@@ -406,7 +406,7 @@ type RecoveryCustodyHoldDTO struct {
 
 // ReasonCustodyRunHoldBound is the queued-run health reason when the run's OWN open custody
 // holds have reached the custody hold limit (issue #4162, ClaimRun's hard per-run bound). It is
-// shared by workersvc (which sets it), slacksvc, handler and the CLI, so the wording is never
+// shared by workersvc (which sets it), slacksvc and the CLI, so the wording is never
 // mirrored.
 const ReasonCustodyRunHoldBound = "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start"
 

@@ -1168,7 +1168,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
       AND fn_worker_can_claim($10::boolean, $11::uuid[], r.repo_id, r.kind, $12::text[], r.required_capabilities, $13::boolean)
       -- PRD #1296 M1 (D2/D4): custody-admission. Block the claim when the run's OWNER
-      -- already holds >= @custody_hold_limit admission-counted open holds (ADR-2445) — the
+      -- already holds >= @custody_hold_limit admission units (ADR-2445) — the
       -- owner has too much unpublished work awaiting recovery disposition. A gated claim
       -- matches no row, so the run stays queued (the health resolver surfaces a distinct
       -- custody-limit reason against this SAME predicate in a later milestone). This is an
@@ -1195,7 +1195,8 @@ WITH checker_template_pins AS MATERIALIZED (
       -- and loops forever; the owner cap used to stop that loop. Issue #3859 charges a
       -- WITNESSED departure of such a continuation (SweepClaimedNeverStartedCohort), so this
       -- bound remains the backstop for unwitnessed ones (e.g. older agents). Once a single run holds
-      -- @custody_hold_limit open holds of its own, it faces the owner cap like new work. The
+      -- @custody_hold_limit open holds of its own, it is refused outright (see the hard
+      -- per-run bound below), whatever the owner count says. The
       -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
       -- agree.
