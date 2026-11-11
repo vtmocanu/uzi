@@ -10168,6 +10168,19 @@ describe("SdkExecutor spend-limit terminal (issue #3767)", () => {
     assert.strictEqual(turns.length, 1, "a spend limit never retries in process");
   });
 
+  it("carries the failing turn's session id (B), not an earlier turn's (A), on the SpendLimitHoldError", async () => {
+    const init = (sid: string): SDKMessage =>
+      ({ type: "system", subtype: "init", session_id: sid, model: "m" }) as unknown as SDKMessage;
+    const { queryFn, turns } = fakeTurns([
+      [init("A"), resultApiError(529, "API Error: 529 Overloaded", "A")], // earlier turn: transient, retried in process
+      [init("B"), resultApiError(400, `API Error: 400 ${SPEND_TEXT}`, "B")], // failing turn: a fresh session
+    ]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));
+    assert.ok(err instanceof SpendLimitHoldError);
+    assert.strictEqual(turns.length, 2, "the retry turn is the one that hit the spend limit");
+    assert.strictEqual(err.sessionId, "B");
+  });
+
   it("a different 400 text keeps today's plain failure", async () => {
     const { queryFn } = fakeTurns([[resultApiError(400, "API Error: 400 messages: text content blocks must be non-empty")]]);
     const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));

@@ -18,12 +18,17 @@ installRecoveryRootCleanup();
 // typed `anthropic_spend_limit` (owner-held) when the api advertised the cause; otherwise it fails
 // with the unchanged provider message and never loops.
 
+// The api's generic invalid-state 400 body (api/internal/handler/worker_protocol.go), which is what an
+// api that does not know a recovery_cause answers; the client drops the feature only on this exact body.
+const GENERIC_INVALID_STATE_ERROR =
+  "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed";
+
 const FEATURE = "recovery_cause_anthropic_spend_limit";
 const TEXT = "You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC.";
 const RAW = `API Error: 400 ${TEXT}`;
 const MESSAGE = providerErrorMessage(400, RAW);
 
-function rig(thrown: () => Error, homeRoot: string): { runner: RunRunner; custody: () => number; home: string; turns: () => number } {
+function rig(thrown: () => Error, homeRoot: string, pre?: (ctx: RunContext) => void): { runner: RunRunner; custody: () => number; home: string; turns: () => number } {
   let turnCount = 0;
   const { gitlab } = fakeGitlab();
   const { coord } = enabledRecovery();
@@ -33,6 +38,7 @@ function rig(thrown: () => Error, homeRoot: string): { runner: RunRunner; custod
     fs.mkdirSync(home, { recursive: true });
     fs.writeFileSync(path.join(home, "session"), "transcript", "utf8");
     commitInTree(ctx.worktreePath, "WORK.txt", "work before the spend limit\n");
+    pre?.(ctx);
     throw thrown();
   };
   const executor: Executor = { run: behavior };
@@ -157,7 +163,7 @@ describe("RunRunner #3767 spend-limit hold", () => {
         if (b.recovery_cause !== "anthropic_spend_limit") return false;
         sends++;
         return true;
-      }, { httpStatus: 400, error: "unknown recovery_cause" });
+      }, { httpStatus: 400, error: GENERIC_INVALID_STATE_ERROR });
       await rig(spend, homeRoot).runner.execute(claim);
       assert.equal(sends, 1, "one typed park send, no retry loop");
       assert.equal(parks(claim.run_id).length, 0, "no untyped park was sent either");
@@ -195,6 +201,94 @@ describe("RunRunner #3767 spend-limit hold", () => {
       const failed = failures(claim.run_id);
       assert.equal(failed.length, 1);
       assert.equal(failed[0]!.failure_reason, MESSAGE);
+    });
+  });
+  it("the park report carries the failing turn's session id (B), not the one observed earlier (A)", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = ["claim_generation_fence", FEATURE];
+      const claim = gitlabClaim(3773, { claim_generation: 3 });
+      const r = rig(() => new SpendLimitHoldError(MESSAGE, TEXT.slice(0, 200).trim(), "session-B"), homeRoot,
+        (ctx) => ctx.onSessionId?.("session-A"));
+      await r.runner.execute(claim);
+      const sent = parks(claim.run_id);
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0]!.recovery_cause, "anthropic_spend_limit");
+      assert.equal(sent[0]!.session_id, "session-B");
+    });
+  });
+
+  it("an ownership probe that shows a newer claim generation stops the run: no park send, no failed, no retry loop", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = ["claim_generation_fence", FEATURE];
+      const claim = gitlabClaim(3774, { claim_generation: 3 });
+      let sends = 0;
+      api.failStateWhen(claim.run_id, (b) => {
+        if (b.recovery_cause === "anthropic_spend_limit") sends++;
+        return false;
+      });
+      const r = rig(spend, homeRoot, () => api.setOwnershipStatus(claim.run_id, "running", 4));
+      const before = api.ownershipRequests.length;
+      const outcome = await Promise.race([
+        r.runner.execute(claim).then(() => "done"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 20000).unref()),
+      ]);
+      assert.equal(outcome, "done", "the run must stop instead of retrying");
+      assert.equal(sends, 0, "no park was sent through the superseded claim");
+      assert.equal(parks(claim.run_id).length, 0);
+      assert.equal(failures(claim.run_id).length, 0, "no failed report through a superseded claim");
+      assert.ok(api.ownershipRequests.length - before <= 5, `bounded ownership reads, got ${api.ownershipRequests.length - before}`);
+      assert.equal(r.turns(), 1);
+    });
+  });
+
+  it("a park report refused as a stale claim stops the run: no failed, no second park send, no retry loop", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = ["claim_generation_fence", FEATURE];
+      const claim = gitlabClaim(3775, { claim_generation: 3 });
+      let sends = 0;
+      api.failStateWhen(claim.run_id, (b) => {
+        if (b.recovery_cause !== "anthropic_spend_limit") return false;
+        sends++;
+        return true;
+      }, { httpStatus: 409, runStatus: "running", disposition: "stale_claim" });
+      const r = rig(spend, homeRoot);
+      const outcome = await Promise.race([
+        r.runner.execute(claim).then(() => "done"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 20000).unref()),
+      ]);
+      assert.equal(outcome, "done", "the run must stop instead of retrying");
+      assert.equal(sends, 1, "exactly one park send");
+      assert.equal(parks(claim.run_id).length, 0, "the park is not re-sent through a superseded claim");
+      assert.equal(failures(claim.run_id).length, 0, "no failed report through a superseded claim");
+    });
+  });
+
+  it("an ambiguous first send followed by a 401 retries; the ownership probe then shows recovery_wait and the run counts as parked", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = ["claim_generation_fence", FEATURE];
+      const claim = gitlabClaim(3776, { claim_generation: 3 });
+      const isSpend = (b: { recovery_cause?: string }): boolean => b.recovery_cause === "anthropic_spend_limit";
+      let dropped = 0;
+      let refused = 0;
+      api.dropStatesWhen(claim.run_id, (b) => isSpend(b) && dropped++ === 0);
+      api.failStateWhen(claim.run_id, (b) => {
+        if (!isSpend(b)) return false;
+        refused++;
+        // The first send's outcome is unknown (connection dropped) and this definite refusal followed it:
+        // the park may have landed, so the api's view is what decides, and it says the run is parked.
+        api.setOwnershipStatus(claim.run_id, "recovery_wait", 3);
+        return true;
+      }, { httpStatus: 401, error: "unauthorized" });
+      const r = rig(spend, homeRoot);
+      const outcome = await Promise.race([
+        r.runner.execute(claim).then(() => "done"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 20000).unref()),
+      ]);
+      assert.equal(outcome, "done");
+      assert.equal(dropped >= 1 && refused === 1, true, `one dropped send then one 401, got dropped=${dropped} refused=${refused}`);
+      assert.equal(failures(claim.run_id).length, 0, "an uncertain park outcome is never reported as failed");
+      assert.equal(r.custody(), 0, "custody is kept: the run counts as parked");
+      assert.equal(fs.existsSync(worktreeDirFor(3776)), true, "the clone is kept");
     });
   });
 });

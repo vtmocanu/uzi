@@ -5262,6 +5262,7 @@ export class SdkExecutor implements Executor {
           throw new SpendLimitHoldError(
             providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
             spend.detail,
+            resumableSessionId(),
           );
         }
         if (!limitFacts && isProviderTransient(terminal)) {

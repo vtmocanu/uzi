@@ -336,7 +336,8 @@ export function classifySpendLimitTerminal(t: SpendLimitTerminalFacts): { detail
  * this cause fails exactly as before.
  */
 export class SpendLimitHoldError extends Error {
-  constructor(message: string, readonly detail: string) {
+  /** The resumable SDK session id of the failing turn, when it reported one (see the executor). */
+  constructor(message: string, readonly detail: string, readonly sessionId?: string) {
     super(message);
     this.name = "SpendLimitHoldError";
   }
