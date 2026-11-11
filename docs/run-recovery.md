@@ -2029,7 +2029,7 @@ holds keeps resuming; once that one run alone holds the limit, it is not started
 (a per-run bound that applies even when you are below the owner limit; discard or settle
 that run's own holds to free it).
 When the owner limit is reached, the dashboard shows a full-width alert beneath the page
-heading with your safety-slot use, how many held sources need a decision, how
+heading with your custody admission unit use, how many held sources need a decision, how
 many runs are blocked, and a **Review held work** button; if you connected
 Slack, you also get one coalesced direct message per blocked episode (not one
 per run) carrying your open-hold and blocked-run counts, a link to the surface,
@@ -2067,7 +2067,8 @@ section so you can see what is consuming capacity without needing a decision.
 it counts, each with its run link, claim generation, worker, and the reason it
 counts (for example, no live claim backs it). A run's earlier generations on the same
 original worker count as one unit: one row is the counted representative and the others
-show `same_run_group` and are not counted. These rows are read-only: this is
+are listed under "Counted with another hold" with the label "Counted once with this run's
+other holds on the same worker" (`uzi run recovery` prints `not counted (same_run_group)`). These rows are read-only: this is
 visibility only, and adds no new way to release or discard custody and changes
 no accounting. **Admission membership not reported** lists holds from an older
 server that does not report membership; uzi never infers it, so an unreported
@@ -2248,7 +2249,8 @@ does not start the agent and touches nothing of the predecessor. It emits `orpha
 with `remediation_retained`, sends a status message naming only the predecessor run id, and parks the
 run for you at `recovery_wait` / `retained_recovery_adoption_failed`. The message says the agent did not
 start and the source requires review. **Resume** on this worker holds again and adds at least one
-open custody hold; **Cancel** ends the run and leaves its open holds for you to discard.
+open custody hold while this run's own open holds are below the custody hold limit (at the limit,
+Resume creates no further claim or hold); **Cancel** ends the run and leaves its open holds for you to discard.
 Run `uzi run recovery <predecessor-run-id>` to inspect the predecessor. Resume grants no remediation
 authority, and this page names no route that disposes of the remediation. While held or queued, the
 run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`; its generations on one worker count as one unit), and a
@@ -2293,7 +2295,8 @@ attribution and own-record checks pass, so with no pin or several pins it is ref
 `recovery_cause_retained_recovery_adoption_failed`), the run parks for you at
 `recovery_wait` / `retained_recovery_adoption_failed` instead of requeueing into the
 same refusal: Resume claims again and holds again unchanged on this release and adds at
-least one open custody hold, and Cancel ends the run. Without that
+least one open custody hold while this run's own open holds are below the custody hold limit (at the
+limit, Resume creates no further claim or hold), and Cancel ends the run. Without that
 capability the refusal is the ordinary nonterminal stop described below. The park
 changes no predecessor bytes (journal, slot, clone, HOME and provision directories stay
 as they were) and reaps nothing. Here the cause has a third meaning: continuation was

@@ -145,6 +145,9 @@ func TestCustodyRunHoldBoundFixtureRenders(t *testing.T) {
 	if err := renderRunDetail(uzicli.NewPrinter(&detail, false, false, true, false), run); err != nil {
 		t.Fatal(err)
 	}
+	if out := detail.String(); !strings.Contains(out, "HEALTH_REASON") || !strings.Contains(out, "custody hold limit") {
+		t.Fatalf("run detail lacks the bound health reason:\n%s", out)
+	}
 	// The retained queued blocker survives the compact status cell like the owner custody reason.
 	want := "queued (" + apitypes.ReasonCustodyRunHoldBound + ")"
 	if got := runStatusCellAt(apitypes.RunListItemDTO{RunDTO: run}, time.Now()); got != want {

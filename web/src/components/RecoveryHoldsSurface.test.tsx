@@ -78,7 +78,7 @@ async function renderSurface(resp: RecoveryCustodyHolds, initialEntries?: string
 describe("RecoveryHoldsSurface", () => {
   it("shows a grouped hold with its label at the limit and tolerates old-server holds without admission fields", async () => {
     await renderSurface(listing([
-      hold({ id: "rep", counts_toward_admission: true, admission_reason: "live_claim" }),
+      hold({ id: "rep", counts_toward_admission: true, admission_reason: "earlier_generation" }),
       hold({ id: "grp", generation: 2, counts_toward_admission: false, admission_reason: "same_run_group" }),
     ], { custody_hold_limit: 1, admission_counted_holds: 1 }));
     const row = document.getElementById("recovery-hold-grp")!;

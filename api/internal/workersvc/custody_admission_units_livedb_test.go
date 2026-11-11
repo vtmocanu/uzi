@@ -696,6 +696,9 @@ func TestCustodyRunHoldBoundOwnerResumeVerbsLiveDB(t *testing.T) {
 func TestCustodyUnitsGroupedHoldReadsAndExactReleaseLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	f := newUnitsFixture(t, env)
+	// recovery_captures.hold_id is ON DELETE RESTRICT: remove the capture this test inserts
+	// before the fixture's hold cleanup (LIFO) runs.
+	t.Cleanup(func() { env.exec("DELETE FROM recovery_captures WHERE user_id=$1", f.userID) })
 	f.setLimit(testCustodyLimit)
 	w := f.seedWorker(false)
 	run := f.seedRunIn("failed", 3, uuid.Nil)

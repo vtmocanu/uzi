@@ -1467,7 +1467,7 @@ before native bundle verification/import.
 ### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
 
 A run's custody hold protects its committed-but-unpublished work per claim generation.
-The owner admission limit is the admin setting `custody_hold_limit` (default 8 counted
+The owner admission limit is the admin setting `custody_hold_limit` (default 8
 admission units; see [Admin settings](./admin-settings.md#custody-hold-limit)). `open_holds` is total open custody;
 `admission_counted_holds` counts admission units: it first excludes at most one hold per run backing a healthy, valid live
 current-generation claim without an owner decision. That requires exact owner/run/live-run

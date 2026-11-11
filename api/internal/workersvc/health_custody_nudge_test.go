@@ -29,6 +29,7 @@ func TestHealthCustodyRunHoldBoundNudge(t *testing.T) {
 		{"ok to bound nudges", healthOK, pgtype.Text{}, pgtype.Timestamptz{}, true, true},
 		{"waiting_worker custody limit to bound nudges", healthWaitingWorker, txt(reasonCustodyLimit), pgtype.Timestamptz{}, true, true},
 		{"bound to bound does not nudge again", healthWaitingWorker, txt(apitypes.ReasonCustodyRunHoldBound), pgtype.Timestamptz{}, false, false},
+		{"waiting_worker maintenance to bound does not nudge", healthWaitingWorker, txt(reasonMaintenance), pgtype.Timestamptz{}, true, false},
 		{"entering bound within cooldown does not nudge", healthWaitingWorker, txt(reasonCustodyLimit), ago(5 * time.Minute), true, false},
 	}
 	for _, tc := range cases {

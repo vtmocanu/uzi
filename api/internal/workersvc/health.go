@@ -538,13 +538,15 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		independentFault := reason == reasonPersistFailing || reason == reasonLooping ||
 			reason == reasonNearTimeout || reason == reasonOutcomeUndelivered
 		// Issue #4162: the per-run hold bound is the run's own condition, unlike the owner-level
-		// reasonCustodyLimit that the episode reconciler covers. A run already flagged
-		// waiting_worker (for any reason, including reasonCustodyLimit) that acquires the
-		// bound reason starts a new nudge-eligible episode: the owner learns about a bound the
-		// owner-level DM never described. A run already carrying the bound reason does not
-		// re-nudge, and the cooldown term below still applies.
-		enteredRunBound := reason == apitypes.ReasonCustodyRunHoldBound &&
-			!(r.HealthReason.Valid && r.HealthReason.String == apitypes.ReasonCustodyRunHoldBound)
+		// reasonCustodyLimit that the episode reconciler covers. A run that moves from the
+		// owner-level reasonCustodyLimit (waiting_worker) to the bound reason starts a new
+		// nudge-eligible episode: the owner learns about a bound the owner-level DM never
+		// described. Entry from ok is already covered by the r.Health == healthOK term; entry
+		// from any other waiting reason (e.g. a maintenance lift) does not nudge (PRD #3454 D12).
+		// A run already carrying the bound reason does not re-nudge, and the cooldown term below
+		// still applies.
+		enteredRunBound := reason == apitypes.ReasonCustodyRunHoldBound && r.Health == healthWaitingWorker &&
+			r.HealthReason.Valid && r.HealthReason.String == reasonCustodyLimit
 		nudge := target != healthOK && (r.Health == healthOK || leftPin || enteredRunBound || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The

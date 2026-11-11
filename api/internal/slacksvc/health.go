@@ -15,22 +15,26 @@ import (
 // detector owns the reason TEXT (it travels in the PublishHealth event and the
 // health_reason column); slacksvc owns the Slack-facing wording keyed off the enum.
 //
-// TWO EXCEPTIONS, spelled out here rather than only at their sites below, because
-// this is the paragraph a reader hits first. Both are the SAME shape: an enum that
-// carries two causes, where the enum alone cannot tell them apart and the existing
-// head sentence is FALSE of the second cause. healthNudgeHead therefore compares the
-// reason against a mirrored constant in those two arms only:
+// THREE EXCEPTIONS, spelled out here rather than only at their sites below, because
+// this is the paragraph a reader hits first. All are the SAME shape: an enum that
+// carries several causes, where the enum alone cannot tell them apart and the existing
+// head sentence is FALSE of the other cause. healthNudgeHead therefore compares the
+// reason in these three arms only:
 //
-//   - `looping`, since PRD #108 M4 — reasonPersistFailing;
-//   - `waiting_worker`, since issue #182 — reasonVerdictUndelivered.
+//   - `looping`, since PRD #108 M4 — reasonPersistFailing (mirrored constant);
+//   - `waiting_worker`, since issue #182 — reasonVerdictUndelivered (mirrored constant);
+//   - `waiting_worker`, since issue #4162 — apitypes.ReasonCustodyRunHoldBound.
 //
 // Everything else still keys off the enum, and each exception degrades to its
-// enum-keyed wording if the mirror ever drifts.
+// enum-keyed wording if the reason ever drifts.
 //
-// A THIRD instance of this shape should stop and reconsider the mechanism rather than
-// adding a third mirrored constant: at that point the enum is carrying more meanings
-// than it has values, and the fix is a health enum (migration + web union + badge
-// label), not more reason-sniffing here.
+// The third arm is acceptable without a new enum (issue #4162) because it compares
+// against the exported shared const apitypes.ReasonCustodyRunHoldBound (no mirrored
+// literal, so it cannot drift silently), its miss mode degrades to the generic head,
+// and a new health enum would need a migration + web union + badge label, which is out
+// of that issue's scope. Any FURTHER instance of this shape should stop and take the
+// enum route (migration + web union + badge label) rather than add another arm: at that
+// point the enum is carrying more meanings than it has values.
 const (
 	healthStalled       = "stalled"
 	healthLooping       = "looping"

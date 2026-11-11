@@ -1976,7 +1976,7 @@ instead detached and the successor proceeded.
   worker adopted. Here nothing is touched or adopted, so there is nothing to prove quiescent.
 - **Guidance and park.** The worker sends a status message naming only the predecessor run id. It says
   the agent did not start, the source is held under secret-scan remediation and requires review, Resume
-  on this worker holds again and adds at least one open custody hold, Cancel ends the run,
+  on this worker holds again and adds at least one open custody hold while this run's own open holds are below the custody hold limit (at the limit it creates no further claim or hold), Cancel ends the run,
   and `uzi run recovery <predecessor>` inspects it. It confirms delivery (10 s) and parks even if
   delivery is unconfirmed. It parks through the existing writer at `recovery_wait` /
   `retained_recovery_adoption_failed`, then stops nonterminal. There is no new cause, wire field or

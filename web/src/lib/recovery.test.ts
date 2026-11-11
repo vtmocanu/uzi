@@ -294,6 +294,12 @@ describe("custodyAlertView — self-hide, capacity, and blocked-run severity", (
     expect(v?.slotsLabel).toBe("2 / 8 custody units used");
   });
 
+  it("uses the plural per-run bound headline when several runs are blocked below the limit", () => {
+    const v = custodyAlertView(agg({ open_holds: 6, admission_counted_holds: 2, blocked_runs: 2 }), 0);
+    expect(v?.headline).toBe("Queued runs reached their own custody hold limits");
+    expect(v?.runBoundOnly).toBe(true);
+  });
+
   it("keeps the blocking headline when blocked runs coincide with the owner limit", () => {
     const v = custodyAlertView(agg({ open_holds: 8, admission_counted_holds: 8, blocked_runs: 1 }), 0);
     expect(v?.headline).toBe("Held work is blocking new runs");

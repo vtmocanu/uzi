@@ -68,6 +68,8 @@ function assertHeld(r: Rig, seen: { flight?: FlightView }, unsupported: string):
   assert.equal(logged(r, "restore unsupported predecessor hold unconfirmed").length, 0);
   assert.equal(guidance(r).length, 1, "one guidance line");
   assert.ok(guidance(r)[0]!.includes(`(${unsupported})`));
+  assert.ok(!guidance(r)[0]!.includes("admission-counted"), "no stale admission-counted wording");
+  assert.ok(guidance(r)[0]!.includes("custody hold limit"), "names the custody hold limit");
   assert.ok(guidance(r)[0]!.length < 1200 && !guidance(r)[0]!.endsWith("..."), "bounded, not truncated");
   assert.equal(itemSevenLines(r).filter(t => !t.includes(GUIDANCE)).length, 0, "no item-7 line after a confirmed park");
   assert.equal(seen.flight?.parked, true, "the flight records the confirmed park");

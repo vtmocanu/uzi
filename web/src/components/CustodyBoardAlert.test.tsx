@@ -66,7 +66,7 @@ describe("CustodyBoardAlert", () => {
     expect(region.classList.contains("bg-danger/10")).toBe(false);
     expect(screen.getByText("Custody capacity reached").classList.contains("text-warn")).toBe(true);
     expect(screen.getByText(`${open_holds} / 8 custody units used`)).toBeTruthy();
-    expect(screen.getByText("Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when counted holds settle.")).toBeTruthy();
+    expect(screen.getByText("Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when admission units settle.")).toBeTruthy();
     expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
     expect(screen.queryByText(/needs? a decision/)).toBeNull();
     expect(screen.queryByText(/runs? blocked/)).toBeNull();
@@ -120,7 +120,7 @@ describe("CustodyBoardAlert", () => {
     expect(region.classList.contains("bg-danger/10")).toBe(true);
     expect(region.classList.contains("bg-warn/10")).toBe(false);
     expect(screen.getByText("Held work is blocking new runs").classList.contains("text-danger")).toBe(true);
-    expect(screen.getByText("Queued code runs are waiting for custody admission; no action is needed. Admission resumes when counted holds settle.")).toBeTruthy();
+    expect(screen.getByText("Queued code runs are waiting for custody admission; no action is needed. Admission resumes when admission units settle.")).toBeTruthy();
     expect(screen.getByText(/runs blocked/)).toBeTruthy();
     expect(screen.queryByText(/needs? a decision/)).toBeNull();
     expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
@@ -132,8 +132,14 @@ describe("CustodyBoardAlert", () => {
     const region = screen.getByRole("alert");
     expect(region.getAttribute("aria-live")).toBe("assertive");
     expect(region.classList.contains("bg-danger/10")).toBe(true);
-    expect(screen.getByText(open_holds >= 8 ? "Held work is blocking new runs" : "A queued run reached its own custody hold limit")).toBeTruthy();
-    expect(screen.getByText("Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work.")).toBeTruthy();
+    expect(screen.getByText(open_holds >= 8 ? "Held work is blocking new runs" : "Queued runs reached their own custody hold limits")).toBeTruthy();
+    expect(
+      screen.getByText(
+        open_holds >= 8
+          ? "Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work."
+          : "Queued runs have reached their own custody hold limit. Review the holds that need a decision and resolve or discard those runs' own retained holds to let them start.",
+      ),
+    ).toBeTruthy();
     expect(screen.getByText(/hold needs a decision/)).toBeTruthy();
     expect(screen.getByText(/runs blocked/)).toBeTruthy();
     const link = screen.getByRole("link", { name: /Review held work/ });
@@ -168,7 +174,7 @@ describe("CustodyBoardAlert", () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
     expect(screen.getByRole("alert").getAttribute("aria-live")).toBe("assertive");
-    expect(screen.getByText("A queued run reached its own custody hold limit")).toBeTruthy();
+    expect(screen.getByText("Queued runs reached their own custody hold limits")).toBeTruthy();
     expect(screen.queryByRole("status")).toBeNull();
 
     await act(async () => { await vi.advanceTimersByTimeAsync(10000); });

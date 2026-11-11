@@ -226,7 +226,9 @@ export function custodyAlertView(
     headline: agg.blocked_runs > 0
       ? atLimit
         ? "Held work is blocking new runs"
-        : "A queued run reached its own custody hold limit"
+        : agg.blocked_runs > 1
+          ? "Queued runs reached their own custody hold limits"
+          : "A queued run reached its own custody hold limit"
       : agg.decision_needed > 0
         ? "Held work needs your attention"
         : "Custody capacity reached",
