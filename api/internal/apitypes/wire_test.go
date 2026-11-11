@@ -801,12 +801,26 @@ func TestIncidentalFindingFileResultDTOTags(t *testing.T) {
 // The literals below are what json.Marshal actually emits: a map's keys are sorted, so
 // pending_judge precedes review regardless of the order they are written here.
 func TestReviewNullEnvelope(t *testing.T) {
-	b, err := json.Marshal(map[string]any{"review": (*ReviewDTO)(nil), "pending_judge": (*PendingJudgeDTO)(nil)})
+	b, err := json.Marshal(map[string]any{"review": (*ReviewDTO)(nil), "pending_judge": (*PendingJudgeDTO)(nil), "skip": (*JudgeSkipDTO)(nil)})
 	if err != nil {
 		t.Fatalf("marshal null review envelope: %v", err)
 	}
-	if string(b) != `{"pending_judge":null,"review":null}` {
-		t.Fatalf("null review envelope = %s, want {\"pending_judge\":null,\"review\":null}", b)
+	if string(b) != `{"pending_judge":null,"review":null,"skip":null}` {
+		t.Fatalf("null review envelope = %s, want {\"pending_judge\":null,\"review\":null,\"skip\":null}", b)
+	}
+	// The skipped-judge case (issue #3257): review and pending_judge null, skip populated with
+	// the three documented keys.
+	at := time.Date(2026, 11, 10, 9, 8, 7, 0, time.UTC)
+	b, err = json.Marshal(map[string]any{
+		"review":        (*ReviewDTO)(nil),
+		"pending_judge": (*PendingJudgeDTO)(nil),
+		"skip":          JudgeSkipDTO{Harness: "codex", Reason: "no_usable_credential", At: at},
+	})
+	if err != nil {
+		t.Fatalf("marshal skip envelope: %v", err)
+	}
+	if string(b) != `{"pending_judge":null,"review":null,"skip":{"harness":"codex","reason":"no_usable_credential","at":"2026-11-10T09:08:07Z"}}` {
+		t.Fatalf("skip envelope = %s", b)
 	}
 	// A populated review round-trips through the same envelope key, with pending_judge
 	// still present and null (the settled-verdict case).

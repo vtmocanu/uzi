@@ -243,3 +243,39 @@ WHERE rr.target_run_id = @target_run_id;
 SELECT * FROM review_recommendations
 WHERE review_id = @review_id
 ORDER BY created_at ASC, id ASC;
+
+-- name: LockRunForJudge :one
+-- Issue #3257: the target-row lock that serializes judge creation against the skip writer.
+-- FOR NO KEY UPDATE conflicts with itself but not with the FOR KEY SHARE a foreign key
+-- insert (the judge run's target_run_id, judge_skips) takes, so it never blocks those
+-- inserts. No rows means the target run is gone.
+SELECT id FROM runs WHERE id = @id FOR NO KEY UPDATE;
+
+-- name: RecordJudgeSkip :execrows
+-- Issue #3257: record why the automatic judge was skipped, unless any judge run (active or
+-- terminal) already exists for the target. One row per target: a later refusal overwrites
+-- the reason. Callers hold LockRunForJudge's lock, in a READ COMMITTED transaction, so the
+-- NOT EXISTS sees every judge run committed before the lock was granted. Zero rows means a
+-- judge exists and nothing was recorded.
+INSERT INTO judge_skips (target_run_id, harness, reason)
+SELECT @target_run_id::uuid, @harness::text, @reason::text
+WHERE NOT EXISTS (
+    SELECT 1 FROM runs WHERE kind = 'judge' AND target_run_id = @target_run_id::uuid
+)
+ON CONFLICT (target_run_id) DO UPDATE
+SET harness = EXCLUDED.harness, reason = EXCLUDED.reason, created_at = now();
+
+-- name: DeleteJudgeSkipForTarget :exec
+-- Issue #3257: creating a judge for a target clears its skip record, in the creating
+-- transaction (so a rolled-back create keeps the record).
+DELETE FROM judge_skips WHERE target_run_id = @target_run_id;
+
+-- name: GetJudgeSkipForTarget :one
+-- Issue #3257: the recorded skip for a target, for the review panel. No visibility check
+-- here: the caller applies GetRunForViewer first, like GetActiveJudgeRunForTarget.
+SELECT target_run_id, harness, reason, created_at FROM judge_skips WHERE target_run_id = @target_run_id;
+
+-- name: CurrentTransactionIsolation :one
+-- Issue #3257: the judge creation guard needs READ COMMITTED (see createJudgeGuarded), and
+-- the pool's Begin is the only thing that decides the level, so the transaction asserts it.
+SELECT current_setting('transaction_isolation')::text;

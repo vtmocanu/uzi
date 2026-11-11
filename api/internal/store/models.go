@@ -669,6 +669,13 @@ type JobResult struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type JudgeSkip struct {
+	TargetRunID uuid.UUID          `json:"target_run_id"`
+	Harness     string             `json:"harness"`
+	Reason      string             `json:"reason"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
 type MemoryIntervention struct {
 	InterventionID  uuid.UUID          `json:"intervention_id"`
 	RunID           uuid.UUID          `json:"run_id"`

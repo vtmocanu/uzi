@@ -421,8 +421,10 @@ func dispReason(disposed bool, d store.RecommendationDisposition) string {
 // either read): a run the caller can't see is 404, and no pending-judge query is issued
 // for it.
 //
-// The response is {"review": …|null, "pending_judge": …|null} with BOTH keys always
-// present and either one nullable. They are independent: an unjudged run with an
+// The response is {"review": …|null, "pending_judge": …|null, "skip": …|null} with ALL keys
+// always present and each nullable. "skip" (issue #3257) is the recorded reason the automatic
+// judge was not created, non-null only when there is no review and no pending judge.
+// review and pending_judge are independent. They are independent: an unjudged run with an
 // auto-judge in flight is review:null + pending_judge set, which is precisely the state
 // the panel could not previously distinguish from "never judged" — it showed "not judged
 // yet" next to a live button whose only possible outcome was a 409 from the
@@ -438,7 +440,7 @@ func (h *Handler) GetRunReview(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, pending, err := h.wsvc.GetRunReviewPanel(r.Context(), user.ID, user.IsAdmin, id)
+	res, pending, skip, err := h.wsvc.GetRunReviewPanel(r.Context(), user.ID, user.IsAdmin, id)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotFound) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
@@ -452,12 +454,15 @@ func (h *Handler) GetRunReview(w http.ResponseWriter, r *http.Request) {
 	// omitting the key, so a client can always read the pair — an absent key and a null
 	// one are different claims, and "there is no judge coming" is a claim this endpoint
 	// makes, not something a client should infer from silence.
-	body := map[string]any{"review": nil, "pending_judge": nil}
+	body := map[string]any{"review": nil, "pending_judge": nil, "skip": nil}
 	if res != nil {
 		body["review"] = reviewToDTO(*res)
 	}
 	if pending != nil {
 		body["pending_judge"] = pendingJudgeToDTO(*pending)
+	}
+	if skip != nil {
+		body["skip"] = apitypes.JudgeSkipDTO{Harness: skip.Harness, Reason: skip.Reason, At: skip.At}
 	}
 	httpx.JSON(w, http.StatusOK, body)
 }

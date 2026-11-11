@@ -53,12 +53,16 @@ func pendingJudgePhrase(state string) string {
 // repo/issue/CI content the judge LLM read can shape them, and ingest cannot
 // strip instruction-shaped prose. They are printed as DATA here, never
 // interpreted — the same standing the SPA gives them.
-func renderReview(p *uzicli.Printer, id string, rv *apitypes.ReviewDTO, pj *apitypes.PendingJudgeDTO) error {
+func renderReview(p *uzicli.Printer, id string, rv *apitypes.ReviewDTO, pj *apitypes.PendingJudgeDTO, skip *apitypes.JudgeSkipDTO) error {
 	if rv == nil {
 		// 200 {"review": null}: visible but unjudged. Not an error (exit 0) — the
 		// API deliberately does not raise one, so the CLI must not invent a 404.
 		if pj != nil {
 			p.Printf("run %s: judge %s\n", id, pendingJudgePhrase(pj.State))
+			return nil
+		}
+		if skip != nil {
+			p.Printf("run %s: %s\n", id, judgeSkipPhrase(skip))
 			return nil
 		}
 		p.Printf("run %s: not judged\n", id)
@@ -151,4 +155,30 @@ func dispositionSuffix(d apitypes.DispositionDTO) string {
 func triageLine(t apitypes.TriageDTO) string {
 	return fmt.Sprintf("triage: %d total · %d to do · %d filed · %d done · %d dismissed (%d false positive)",
 		t.Total, t.Todo, t.Filed, t.Done, t.Dismissed, t.FalsePositives)
+}
+
+// judgeSkipPhrase is the `uzi review show` line for a recorded judge skip (issue #3257). The
+// harness and reason are server enums, but a --json consumer and this table must not trust
+// them blindly: each maps to FIXED copy, and an unknown value falls back to generic copy
+// built from sanitised text, so nothing a server sends reaches the terminal raw.
+func judgeSkipPhrase(skip *apitypes.JudgeSkipDTO) string {
+	harness := "The judge's harness"
+	switch skip.Harness {
+	case "claude":
+		harness = "Claude"
+	case "codex":
+		harness = "Codex"
+	}
+	var why string
+	switch skip.Reason {
+	case "no_usable_credential":
+		why = harness + " had no usable credential."
+	case "credential_disabled":
+		why = "the " + harness + " credential is disabled."
+	case "codex_pool_unavailable":
+		why = "no pooled Codex account was available."
+	default:
+		why = "the judge could not run (" + sanitizeTTY(skip.Reason) + ")."
+	}
+	return "Judge skipped " + skip.At.UTC().Format("2006-01-02") + ": " + why
 }

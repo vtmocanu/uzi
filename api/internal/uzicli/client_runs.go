@@ -188,7 +188,7 @@ func (c *HTTPClient) RunLogsPage(ctx context.Context, id string, q LogsPageQuery
 	return env.Messages, nil
 }
 
-func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, error) {
+func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, *apitypes.JudgeSkipDTO, error) {
 	// The envelope is {"review": <dto>|null, "pending_judge": <dto>|null} — both keys
 	// always present, either nullable (PRD #119 M1). A 200 with review:null is a
 	// visible-but-unjudged run — return a nil review so the command exits 0 rather
@@ -202,11 +202,12 @@ func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.Review
 	var env struct {
 		Review       *apitypes.ReviewDTO       `json:"review"`
 		PendingJudge *apitypes.PendingJudgeDTO `json:"pending_judge"`
+		Skip         *apitypes.JudgeSkipDTO    `json:"skip"`
 	}
 	if err := c.get(ctx, "/api/runs/"+url.PathEscape(id)+"/review", &env); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return env.Review, env.PendingJudge, nil
+	return env.Review, env.PendingJudge, env.Skip, nil
 }
 
 func (c *HTTPClient) RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error) {

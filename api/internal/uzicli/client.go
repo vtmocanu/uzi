@@ -70,7 +70,7 @@ type Client interface {
 	// carries the server-normalized state ("scheduled" | "running") and its enqueue
 	// time; it is orthogonal to the review and can accompany a non-nil one too (a
 	// re-judge in flight over an existing verdict).
-	RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, error)
+	RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, *apitypes.JudgeSkipDTO, error)
 	// RunInputs returns a run's follow_up steer queue (newest-first) with delivery
 	// status (PRD #95). Owner-only server-side (GetRunByIDForUser): a non-owner —
 	// including an admin_ro token on another user's run — gets a 404 →

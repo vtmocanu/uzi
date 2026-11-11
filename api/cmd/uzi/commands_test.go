@@ -534,6 +534,74 @@ func TestRunReviewNullJSONEnvelope(t *testing.T) {
 	if !strings.Contains(out, `"pending_judge": null`) {
 		t.Errorf("--json must carry pending_judge as an explicit null when no judge is in flight:\n%s", out)
 	}
+	// Same for skip (issue #3257): present-and-null, never omitted.
+	if !strings.Contains(out, `"skip": null`) {
+		t.Errorf("--json must carry skip as an explicit null when no judge was skipped:\n%s", out)
+	}
+}
+
+// A recorded judge skip (issue #3257) is shown by `uzi review show` as fixed copy per reason,
+// and --json carries it in the "skip" key (the envelope is re-minted in runReviewShow, so the
+// key has to be named there).
+func TestReviewShowJudgeSkip(t *testing.T) {
+	at := time.Date(2026, 11, 10, 23, 30, 0, 0, time.UTC)
+	cases := []struct {
+		harness, reason, want string
+	}{
+		{"codex", "no_usable_credential", "Judge skipped 2026-11-10: Codex had no usable credential."},
+		{"codex", "credential_disabled", "Judge skipped 2026-11-10: the Codex credential is disabled."},
+		{"codex", "codex_pool_unavailable", "Judge skipped 2026-11-10: no pooled Codex account was available."},
+		{"claude", "no_usable_credential", "Judge skipped 2026-11-10: Claude had no usable credential."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.harness+"/"+tc.reason, func(t *testing.T) {
+			fc := &uzicli.FakeClient{
+				Reviews:    map[string]*apitypes.ReviewDTO{"r1": nil},
+				JudgeSkips: map[string]*apitypes.JudgeSkipDTO{"r1": {Harness: tc.harness, Reason: tc.reason, At: at}},
+			}
+			out, _, code := runCLI(t, fakeEnv(fc), "review", "show", "r1")
+			if code != uzicli.ExitOK {
+				t.Fatalf("exit = %d, want 0", code)
+			}
+			if !strings.Contains(out, tc.want) || strings.Contains(out, "not judged") {
+				t.Errorf("table output = %q, want it to contain %q", out, tc.want)
+			}
+			jout, _, code := runCLI(t, fakeEnv(fc), "review", "show", "r1", "--json")
+			if code != uzicli.ExitOK {
+				t.Fatalf("--json exit = %d, want 0", code)
+			}
+			var env struct {
+				Skip *apitypes.JudgeSkipDTO `json:"skip"`
+			}
+			if err := json.Unmarshal([]byte(jout), &env); err != nil {
+				t.Fatalf("decode --json envelope: %v\n%s", err, jout)
+			}
+			if env.Skip == nil || env.Skip.Harness != tc.harness || env.Skip.Reason != tc.reason || !env.Skip.At.Equal(at) {
+				t.Errorf("--json skip = %+v, want harness=%s reason=%s at=%s", env.Skip, tc.harness, tc.reason, at)
+			}
+		})
+	}
+	t.Run("an unknown reason is sanitised, not echoed raw", func(t *testing.T) {
+		fc := &uzicli.FakeClient{
+			Reviews:    map[string]*apitypes.ReviewDTO{"r1": nil},
+			JudgeSkips: map[string]*apitypes.JudgeSkipDTO{"r1": {Harness: "codex", Reason: "x\x1b[31mred", At: at}},
+		}
+		out, _, _ := runCLI(t, fakeEnv(fc), "review", "show", "r1")
+		if strings.Contains(out, "\x1b") {
+			t.Errorf("an escape byte from the server reached the terminal: %q", out)
+		}
+	})
+	t.Run("a pending judge outranks a stale skip", func(t *testing.T) {
+		fc := &uzicli.FakeClient{
+			Reviews:       map[string]*apitypes.ReviewDTO{"r1": nil},
+			PendingJudges: map[string]*apitypes.PendingJudgeDTO{"r1": {State: "scheduled"}},
+			JudgeSkips:    map[string]*apitypes.JudgeSkipDTO{"r1": {Harness: "codex", Reason: "no_usable_credential", At: at}},
+		}
+		out, _, _ := runCLI(t, fakeEnv(fc), "review", "show", "r1")
+		if strings.Contains(out, "skipped") {
+			t.Errorf("a pending judge must be shown instead of a skip: %q", out)
+		}
+	})
 }
 
 // The populated half of the pair: --json emits the pending judge with its

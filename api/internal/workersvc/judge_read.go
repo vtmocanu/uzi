@@ -102,16 +102,19 @@ func (s *Service) GetReviewForTarget(ctx context.Context, userID uuid.UUID, isAd
 // second query on write paths that do not need it. The panel is the only caller that
 // needs both, so the panel gets the method that fetches both.
 //
+// It also returns the recorded judge skip (issue #3257): non-nil only for an unjudged run
+// with no judge in flight whose automatic judge was refused for want of a credential.
+//
 // The visibility gate runs ONCE, before either read: an invisible run is ErrRunNotFound
 // with no pending-judge query issued at all, so this route can never be used to probe
 // whether some other user's run is being judged.
-func (s *Service) GetRunReviewPanel(ctx context.Context, userID uuid.UUID, isAdmin bool, targetRunID uuid.UUID) (*ReviewWithRecommendations, *PendingJudge, error) {
+func (s *Service) GetRunReviewPanel(ctx context.Context, userID uuid.UUID, isAdmin bool, targetRunID uuid.UUID) (*ReviewWithRecommendations, *PendingJudge, *JudgeSkip, error) {
 	if _, err := s.GetRunForViewer(ctx, userID, isAdmin, targetRunID); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	review, err := s.reviewForTarget(ctx, targetRunID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// The judge run's own timing + usage strip (PRD #69 M6) is a PANEL-only concern, so it
 	// is fetched here rather than in the shared reviewForTarget. Only when a review exists
@@ -119,15 +122,24 @@ func (s *Service) GetRunReviewPanel(ctx context.Context, userID uuid.UUID, isAdm
 	if review != nil {
 		judgeRun, jerr := s.judgeRunUsageForTarget(ctx, targetRunID)
 		if jerr != nil {
-			return nil, nil, jerr
+			return nil, nil, nil, jerr
 		}
 		review.JudgeRun = judgeRun
 	}
 	pending, err := s.pendingJudgeForTarget(ctx, targetRunID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return review, pending, nil
+	// The recorded judge skip (issue #3257) is read only when neither a review nor a pending
+	// judge exists: either of those supersedes it, and creating a judge deletes the record.
+	// It runs after the visibility gate above, like the pending-judge read.
+	var skip *JudgeSkip
+	if review == nil && pending == nil {
+		if skip, err = s.judgeSkipForTarget(ctx, targetRunID); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return review, pending, skip, nil
 }
 
 // pendingJudgeForTarget reads the active judge run for a target, or (nil, nil) when
@@ -278,7 +290,13 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 	// JUDGE's harness as an EXPLICIT selection, so D11 resolution + the INSERT + (for a Codex
 	// judge) the binding freeze commit atomically.
 	judge, err := s.createRunResolved(ctx, target.UserID, &judgeHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
-		return q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
+		// Same guard as the automatic path: a rerun clears the target's skip record in the
+		// creating transaction. A rerun refusal records nothing (it is shown synchronously);
+		// errJudgeCreateIsolation surfaces as a plain error (HTTP 500).
+		if err := s.lockJudgeTargetForCreate(ctx, q, target.ID); err != nil {
+			return store.Run{}, err
+		}
+		judge, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 			UserID:           target.UserID,
 			TargetRunID:      pgconv.UUID(target.ID),
 			IssueTitle:       judgeRunTitle(target),
@@ -286,6 +304,10 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 			TriggerSource:    "judge_rerun",
 			Harness:          string(resolved.Harness),
 		})
+		if err == nil && s.judgeAfterInsertHook != nil {
+			s.judgeAfterInsertHook(ctx)
+		}
+		return judge, err
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError

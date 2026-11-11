@@ -147,10 +147,12 @@ func (s *Service) maybeEnqueueJudgeByID(ctx context.Context, runID uuid.UUID) {
 // user-cancelled run is not judged, Decision 2), eligible kind (allowlist — no
 // recursion), global judge_enabled, owner opted in, the 4b fail-origin skip sets, the spend
 // guards, and then — when the judge's resolved harness is Claude — that the owner has an
-// Anthropic token. The token presence check deliberately runs after the spend guards (PRD
-// #3257), because the harness it depends on is resolved from the owner's setting. The
-// judge's harness is the owner's "Judge runs on" choice, else the run's own (judgeHarnessFor). The one-active-judge-per-target unique index is the final guard: a
-// duplicate raises 23505, treated as "already being judged".
+// Anthropic token. The credential checks deliberately run after the spend guards (PRD #3257):
+// a credential refusal is recorded as a visible skip (judge_skips) only once every other gate
+// has passed, so a skip is never reported for a run the judge would not review anyway. The
+// judge's harness is the owner's "Judge runs on" choice, else the run's own (judgeHarnessFor).
+// The one-active-judge-per-target unique index is the final guard: a duplicate raises 23505,
+// treated as "already being judged", and records nothing.
 func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// Gate 0: only completed/failed are judged. cancelled and non-terminal never are.
 	if run.Status != "completed" && run.Status != "failed" {
@@ -276,8 +278,11 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		}); err != nil {
 			if !errors.Is(err, pgx.ErrNoRows) {
 				slog.Warn("judge enqueue: token presence check", "run", run.ID, "error", err)
+				return
 			}
-			return // no token ⇒ nothing to spend ⇒ no judge run
+			// No token ⇒ nothing to spend ⇒ no judge run, with a visible reason.
+			s.recordJudgeSkip(ctx, run.ID, judgeHarness, JudgeSkipNoUsableCredential)
+			return
 		}
 	}
 	// Enqueue. The judge run is owned by the SAME user (never cross-user) and targets
@@ -290,7 +295,10 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// provider, and a chosen-but-unusable harness fails closed (ErrNoCredentialForHarness)
 	// instead of inserting a stranded row.
 	judge, err := s.createRunResolved(ctx, run.UserID, &judgeHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
-		return q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
+		if err := s.lockJudgeTargetForCreate(ctx, q, run.ID); err != nil {
+			return store.Run{}, err
+		}
+		judge, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 			UserID:           run.UserID,
 			TargetRunID:      pgconv.UUID(run.ID),
 			IssueTitle:       judgeRunTitle(run),
@@ -298,19 +306,29 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			TriggerSource:    "judge",
 			Harness:          string(resolved.Harness),
 		})
+		if err == nil && s.judgeAfterInsertHook != nil {
+			s.judgeAfterInsertHook(ctx)
+		}
+		return judge, err
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return // a judge run is already active for this target — expected, not an error
 		}
-		if errors.Is(err, ErrNoCredentialForHarness) {
+		if errors.Is(err, errJudgeCreateIsolation) {
+			slog.Warn("judge enqueue: judge creation is not READ COMMITTED, no judge created and no skip recorded", "run", run.ID)
+			return
+		}
+		if reason, ok := judgeSkipReasonFor(err); ok {
 			// Legible harness-specific skip (PRD #1429 D4: "no derived run created" without a
-			// visible reason is not accepted): the judge's harness became unusable between
-			// Gate 4's pre-check and this atomic create (a credential deleted mid-race), or —
-			// for a Codex judge, which has no separate pre-check — right here.
-			slog.Debug("judge enqueue: judge harness has no usable credential, skipping judge",
-				"run", run.ID, "harness", judgeHarness)
+			// visible reason is not accepted): the judge's harness is unusable at the atomic
+			// create (a Codex judge has no separate pre-check, or a Claude credential was
+			// deleted mid-race). The create's transaction already rolled back; record the
+			// reason in its own transaction, best-effort.
+			slog.Info("judge enqueue: judge harness has no usable credential, skipping judge",
+				"run", run.ID, "harness", judgeHarness, "reason", reason)
+			s.recordJudgeSkip(ctx, run.ID, judgeHarness, reason)
 			return
 		}
 		slog.Warn("judge enqueue: create judge run", "run", run.ID, "error", err)
