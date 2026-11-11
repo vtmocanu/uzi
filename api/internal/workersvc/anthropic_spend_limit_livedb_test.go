@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -223,5 +224,93 @@ func TestAnthropicSpendLimitResumeKeepsPinnedSecretLiveDB(t *testing.T) {
 	again := mustRun(t, env, run.ID)
 	if !again.AnthropicSecretID.Valid || uuid.UUID(again.AnthropicSecretID.Bytes) != tokenB {
 		t.Fatalf("resumed claim spent %+v, want the pinned %s", again.AnthropicSecretID, tokenB)
+	}
+}
+
+// Resume from the hold leaves the run's credential choice to the ladder again: an auto-mode
+// worker re-runs autoChoice, so a token that now ranks first is spent, with an auto reason and
+// not a pinned one.
+func TestAnthropicSpendLimitAutoResumeReentersAutoChoiceLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	// autoParams carries a real autoselect policy; testParams() leaves it zero (every gauge stale).
+	svc := New(env.q, env.box, autoParams())
+	svc.SetVault(env.vlt)
+	svc.SetTxBeginner(env.pool)
+	svc.SetBackground(func(func()) {})
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	clearSpendLimitCause(t, env.exec, userID)
+	env.sealBotPAT(t, userID)
+	tokenA := env.seedAnthropicSecret(t, userID, "pool-a-"+uuid.NewString(), true)
+	tokenB := env.seedAnthropicSecret(t, userID, "pool-b-"+uuid.NewString(), false)
+	env.exec(`UPDATE user_secrets SET auto_eligible = true WHERE id = ANY($1)`, []uuid.UUID{tokenA, tokenB})
+	env.exec(`UPDATE workers SET anthropic_bind_mode = 'auto' WHERE id = $1`, workerID)
+	// Only A is measured at first, so A is the one auto pick.
+	env.exec(`INSERT INTO anthropic_rate_limits (user_secret_id, user_id, five_hour_pct, seven_day_pct, source, synced_at)
+	          VALUES ($1, $2, 20, 10, 'usage_endpoint', now())`, tokenA, userID)
+	const iid = 4892
+	env.exec(`INSERT INTO issues (id, repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
+	          VALUES ($1, $2, $3, 'spend issue', 'opened', '["uzi"]', 'https://forge.e2e/i', false, now(), now())`, uuid.New(), repoID, int64(iid))
+	waitFalse := false
+	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", &waitFalse, nil, false, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	env.exec(`UPDATE workers SET protocol_capabilities = array_append(protocol_capabilities, 'repo_agent_source_v1') WHERE id = $1`, workerID)
+	wkr := store.Worker{ID: workerID, UserID: userID, Name: "w", Status: "online", ProtocolCapabilities: []string{"repo_agent_source_v1"},
+		AnthropicBindMode: BindModeAuto}
+	if p, err := svc.Claim(env.ctx, wkr, nil); err != nil || p == nil || p.RunID != run.ID.String() {
+		t.Fatalf("first claim %+v err=%v", p, err)
+	}
+	first := mustRun(t, env, run.ID)
+	if !first.AnthropicSecretID.Valid || uuid.UUID(first.AnthropicSecretID.Bytes) != tokenA {
+		t.Fatalf("first claim spent %+v, want pooled token A %s", first.AnthropicSecretID, tokenA)
+	}
+	env.exec(`UPDATE runs SET status='running', started_at=now() WHERE id=$1`, run.ID)
+	if _, applied, err := svc.SetState(env.ctx, wkr, run.ID, spendLimitReport(first.ClaimGeneration)); err != nil || !applied {
+		t.Fatalf("park applied=%v err=%v", applied, err)
+	}
+	// While held, A stops being measurable and B becomes the only measured pooled token.
+	env.exec(`DELETE FROM anthropic_rate_limits WHERE user_secret_id = $1`, tokenA)
+	env.exec(`INSERT INTO anthropic_rate_limits (user_secret_id, user_id, five_hour_pct, seven_day_pct, source, synced_at)
+	          VALUES ($1, $2, 5, 5, 'usage_endpoint', now())`, tokenB, userID)
+	if _, err := env.q.ResumeAnthropicSpendLimitHold(env.ctx, store.ResumeAnthropicSpendLimitHoldParams{ID: run.ID, UserID: userID, GlobalTimeoutSeconds: 86400}); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if p, err := svc.Claim(env.ctx, wkr, nil); err != nil || p == nil || p.RunID != run.ID.String() {
+		t.Fatalf("second claim %+v err=%v", p, err)
+	}
+	again := mustRun(t, env, run.ID)
+	if !again.AnthropicSecretID.Valid || uuid.UUID(again.AnthropicSecretID.Bytes) != tokenB {
+		t.Fatalf("resumed claim spent %+v (reason %q), want the now top-ranked pooled token B %s (A=%s)", uuid.UUID(again.AnthropicSecretID.Bytes), again.AnthropicSelectReason.String, tokenB, tokenA)
+	}
+	switch again.AnthropicSelectReason.String {
+	case string(autoselect.ReasonAuto), string(autoselect.ReasonBestOfPool):
+	default:
+		t.Fatalf("selection reason %q (valid=%v), want an auto-select reason", again.AnthropicSelectReason.String, again.AnthropicSelectReason.Valid)
+	}
+}
+
+// An owner cancel ends a spend-limit hold; another user's cancel is refused and the hold stays.
+func TestAnthropicSpendLimitParkedCancelLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	clearSpendLimitCause(t, func(q string, a ...any) { e.exec(t, q, a...) }, e.userID)
+	svc := e.spendLimitService(t)
+	id, _, held := e.spendLimitHeld(t, svc)
+	if held.Status != "recovery_wait" || held.RecoveryWaitCause.String != "anthropic_spend_limit" {
+		t.Fatalf("not parked: %+v", held)
+	}
+	before, _ := e.q.GetRunByID(e.ctx, id)
+	if _, err := svc.SubmitInput(e.ctx, uuid.New(), id, "cancel", "", nil); err == nil {
+		t.Fatal("foreign cancel succeeded")
+	}
+	if after, _ := e.q.GetRunByID(e.ctx, id); !reflect.DeepEqual(before, after) {
+		t.Fatalf("foreign cancel changed the hold:\n%+v\n%+v", before, after)
+	}
+	if _, err := svc.SubmitInput(e.ctx, e.userID, id, "cancel", "no longer needed", nil); err != nil {
+		t.Fatalf("owner cancel: %v", err)
+	}
+	got, _ := e.q.GetRunByID(e.ctx, id)
+	if got.Status != "cancelled" {
+		t.Fatalf("after owner cancel: status=%s", got.Status)
 	}
 }

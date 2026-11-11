@@ -872,11 +872,16 @@ const ACCOUNT_PARK_FEED = {
  * ("this run's"), and it promises no automatic retry: only the owner (or a credential switch)
  * moves the run on. `detail` is the provider's own sentence.
  */
-function spendLimitParkFeed(detail: string, published: boolean): string {
+function spendLimitParkFeed(detail: string, published: boolean, kind: RunKind | undefined): string {
+  // Mirrors the api's non-switchable lanes (credential_override.go,
+  // validateCredentialOverrideOn): those runs cannot take a token override, so the
+  // switch sentence is omitted for them.
+  const switchable = !["chat", "judge", "self_improve", "job"].includes(resolveRunKind(kind));
   return `Paused: this run's Anthropic API credential reached its organization or workspace spend limit (${detail}). ` +
     `The recovery checkpoint is ${published ? "published" : "saved only on this worker"}. ` +
-    "Resume retries under the same credential choice, so it helps only after the spend limit is raised in the provider console. " +
-    "To continue now, switch tokens with `uzi run set-token` or \"Run with another token\" on the run page. Cancel ends the run.";
+    "Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first." +
+    (switchable ? " To choose another token now, use Switch token or `uzi run set-token`." : "") +
+    " Cancel ends the run.";
 }
 
 /** An unavailable initial release carries no inferred vault cause. */
@@ -23245,7 +23250,7 @@ export class RunRunner {
               cause: "anthropic_spend_limit",
               published: capture.published,
             });
-            batcher.emit({ kind: "status", agent: "worker", payload: { text: spendLimitParkFeed(spend.detail, capture.published) } });
+            batcher.emit({ kind: "status", agent: "worker", payload: { text: spendLimitParkFeed(spend.detail, capture.published, claim.kind) } });
             // No reapThenSettleRecoveryGeneration: the custody hold and clone are kept, like the
             // disk park, so an owner Resume continues from the retained work.
             markParkKeep();

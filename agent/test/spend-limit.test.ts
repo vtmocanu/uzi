@@ -38,6 +38,11 @@ describe("classifySpendLimitTerminal (issue #3767)", () => {
     it(`does not hold ${name}`, () => assert.equal(hold(text, over), undefined));
   }
 
+  it("does not hold an explicit successful result row", () => {
+    assert.equal(hold(undefined, { isError: false, terminalReason: "completed", apiErrorStatus: undefined }), undefined);
+    assert.equal(hold(SPEND_LIMIT_ORG_TEXT, { isError: false, terminalReason: "completed", apiErrorStatus: undefined }), undefined);
+  });
+
   it("SpendLimitHoldError carries its message and detail", () => {
     const e = new SpendLimitHoldError("provider error: 400 x", "x");
     assert.equal(e.name, "SpendLimitHoldError");

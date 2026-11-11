@@ -23,11 +23,13 @@ const TEXT = "You have reached your specified API usage limits. You will regain 
 const RAW = `API Error: 400 ${TEXT}`;
 const MESSAGE = providerErrorMessage(400, RAW);
 
-function rig(thrown: () => Error, homeRoot: string): { runner: RunRunner; custody: () => number; home: string } {
+function rig(thrown: () => Error, homeRoot: string): { runner: RunRunner; custody: () => number; home: string; turns: () => number } {
+  let turnCount = 0;
   const { gitlab } = fakeGitlab();
   const { coord } = enabledRecovery();
   const home = path.join(homeRoot, "home");
   const behavior = async (ctx: RunContext): Promise<ExecutorResult> => {
+    turnCount++;
     fs.mkdirSync(home, { recursive: true });
     fs.writeFileSync(path.join(home, "session"), "transcript", "utf8");
     commitInTree(ctx.worktreePath, "WORK.txt", "work before the spend limit\n");
@@ -37,13 +39,16 @@ function rig(thrown: () => Error, homeRoot: string): { runner: RunRunner; custod
   const runner = runnerWith(() => ({ homeDir: home, executor }), gitlab, undefined, nullLogger(), {
     recovery: coord, recoveryRetryMs: 5,
   });
-  return { runner, custody: spyCustodySettle(runner), home };
+  return { runner, custody: spyCustodySettle(runner), home, turns: () => turnCount };
 }
 
 async function withHome(fn: (homeRoot: string) => Promise<void>): Promise<void> {
   const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-spend-park-"));
   try { await fn(homeRoot); } finally { fs.rmSync(homeRoot, { recursive: true, force: true }); }
 }
+
+const RESUME_SENTENCE = "Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first.";
+const SWITCH_SENTENCE = "To choose another token now, use Switch token or `uzi run set-token`.";
 
 const spend = () => new SpendLimitHoldError(MESSAGE, TEXT.slice(0, 200).trim());
 const statesOf = (runId: string) => api.states.filter((s) => s.runId === runId).map((s) => s.body);
@@ -70,19 +75,38 @@ describe("RunRunner #3767 spend-limit hold", () => {
       const feed = feedTexts(claim.run_id).filter((t) => /spend limit/.test(t));
       assert.equal(feed.length, 1);
       assert.match(feed[0]!, /You have reached your specified API usage limits\./);
-      assert.match(feed[0]!, /Resume retries under the same credential choice/);
-      assert.match(feed[0]!, /uzi run set-token/);
-      assert.match(feed[0]!, /Run with another token/);
+      assert.ok(feed[0]!.includes(RESUME_SENTENCE));
+      assert.ok(feed[0]!.includes(SWITCH_SENTENCE));
       assert.match(feed[0]!, /Cancel ends the run/);
       assert.doesNotMatch(feed[0]!.replace(TEXT.slice(0, 200).trim(), ""), /automatically|\byour\b/i, "owner-neutral, no automatic retry wording");
     });
+  });
+
+  it("switch sentence appears on a switchable lane (task) and is omitted on a non-switchable one (self_improve)", async () => {
+    for (const [iid, kind, switchable] of [[3780, "task", true], [3781, "self_improve", false]] as const) {
+      await withHome(async (homeRoot) => {
+        client.protocolFeatures = ["claim_generation_fence", FEATURE];
+        const base = gitlabClaim(iid, { claim_generation: 3 });
+        const claim = kind === "task" ? { ...base, kind, branch: `uzi/task/${base.run_id}` } : { ...base, kind };
+        await rig(spend, homeRoot).runner.execute(claim);
+        assert.equal(parks(claim.run_id).length, 1, `${kind} parks`);
+        const feed = feedTexts(claim.run_id).filter((t) => /spend limit/.test(t));
+        assert.equal(feed.length, 1, kind);
+        assert.ok(feed[0]!.includes(RESUME_SENTENCE), kind);
+        assert.equal(feed[0]!.includes(SWITCH_SENTENCE), switchable, kind);
+        assert.equal(/To choose another token now/.test(feed[0]!), switchable, kind);
+        assert.match(feed[0]!, /Cancel ends the run\.$/);
+      });
+    }
   });
 
   it("feature absent: fails with the byte-identical provider message and never parks", async () => {
     await withHome(async (homeRoot) => {
       client.protocolFeatures = ["claim_generation_fence"];
       const claim = gitlabClaim(3768, { claim_generation: 3 });
-      await rig(spend, homeRoot).runner.execute(claim);
+      const r = rig(spend, homeRoot);
+      await r.runner.execute(claim);
+      assert.equal(r.turns(), 1, "exactly one executor turn: no retry and no second claim");
       assert.equal(parks(claim.run_id).length, 0);
       const failed = failures(claim.run_id);
       assert.equal(failed.length, 1);

@@ -10176,15 +10176,59 @@ describe("SdkExecutor spend-limit terminal (issue #3767)", () => {
     assert.match(err.message, /provider error: 400/);
   });
 
-  it("a rejected rate-limit event with a future reset wins: LimitReachedError, not a spend hold", async () => {
+  it("a spend-limit terminal wins over a rejected rate-limit event with a future reset: SpendLimitHoldError, not LimitReachedError", async () => {
     const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
     const { queryFn } = fakeTurns([[
       rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
       resultApiError(400, `API Error: 400 ${SPEND_TEXT}`),
     ]]);
     const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));
+    assert.ok(err instanceof SpendLimitHoldError);
+    assert.ok(!(err instanceof LimitReachedError));
+    assert.ok(!(err instanceof ProviderTransientError));
+  });
+
+  it("a non-spend terminal with the same rejected rate-limit evidence still yields LimitReachedError", async () => {
+    const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
+    const { queryFn } = fakeTurns([[
+      rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
+      resultApiError(400, "API Error: 400 messages: text content blocks must be non-empty"),
+    ]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));
     assert.ok(err instanceof LimitReachedError);
     assert.ok(!(err instanceof SpendLimitHoldError));
+  });
+
+  it("subagent frames carrying the text (assistant error and an is_error tool result) followed by a successful lead result complete", async () => {
+    const subagentAssistantError = {
+      ...(subagentText(`API Error: 400 ${SPEND_TEXT}`) as unknown as Record<string, unknown>),
+      error: "unknown",
+    } as unknown as SDKMessage;
+    const subagentToolError = {
+      type: "user",
+      session_id: "sess-1",
+      parent_tool_use_id: "p1",
+      message: {
+        content: [{ type: "tool_result", tool_use_id: "tu-sub", is_error: true, content: `API Error: 400 ${SPEND_TEXT}` }],
+      },
+    } as unknown as SDKMessage;
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [subagentAssistantError, subagentToolError, assistantText("done"), signalDone(), resultSuccess()],
+    ]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx);
+    assert.ok(result, "the run completed without throwing");
+  });
+
+  it("a subagent frame carrying the spend sentence while the lead fails on a different 400 is a plain failure", async () => {
+    const { queryFn } = fakeTurns([[
+      subagentText(`API Error: 400 ${SPEND_TEXT}`),
+      resultApiError(400, "API Error: 400 messages: text content blocks must be non-empty"),
+    ]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));
+    assert.ok(err instanceof Error);
+    assert.ok(!(err instanceof SpendLimitHoldError));
+    assert.match(err.message, /provider error: 400/);
   });
 
   it("a subagent frame carrying the text followed by a successful lead result completes", async () => {

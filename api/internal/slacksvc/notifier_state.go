@@ -736,16 +736,22 @@ func spendLimitHold(rc store.GetSlackRunContextRow) bool {
 	return rc.Status == "recovery_wait" && rc.RecoveryWaitCause.Valid && rc.RecoveryWaitCause.String == spendLimitCause
 }
 
-// spendLimitStateDetail names the owner's three ways out of an Anthropic spend-limit hold.
-// It is static text: nothing from the worker's failure reason is rendered.
+// spendLimitStateDetail names the owner's ways out of an Anthropic spend-limit hold. The switch
+// sentence is omitted on the lanes that cannot take a token override (the same set as
+// validateCredentialOverrideOn in workersvc). It is static text: nothing from the worker's
+// failure reason is rendered.
 func spendLimitStateDetail(rc store.GetSlackRunContextRow) string {
 	if !spendLimitHold(rc) {
 		return ""
 	}
-	return "The Anthropic API spend limit was reached; this run waits for you. " +
-		"Raise the limit in the provider console, then Resume; " +
-		"or switch to another token with `uzi run set-token " + rc.ID.String() + " <label>`; " +
-		"or Cancel from the run page."
+	detail := "The Anthropic API spend limit was reached; this run waits for you. " +
+		"Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first."
+	switch rc.Kind {
+	case runkind.Chat, runkind.Judge, runkind.SelfImprove, runkind.Job:
+	default:
+		detail += " To choose another token now, use Switch token or `uzi run set-token`."
+	}
+	return detail + " Cancel from the run page."
 }
 
 // mrContextElem is the MR/PR context element for the root — `🔀 <url|MR !N>` in the

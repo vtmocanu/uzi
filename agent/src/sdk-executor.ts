@@ -5252,20 +5252,23 @@ export class SdkExecutor implements Executor {
         // recovery wrapper retries it and, on a sustained outage, PARKS via recovery_wait
         // instead of terminal-failing. Permanent api errors (401/403/400) fail through
         // materialize as before (isProviderTransient's isTransientStatus check excludes them).
+        //
+        // Issue #3767: a lead spend-limit 400 is an owner-held park candidate and is classified
+        // FIRST, so neither stale rate-limit evidence (limitFacts) nor the transient branch can
+        // shadow it. The runner decides whether the api can take it; otherwise this error's
+        // message is today's failure text.
+        const spend = classifySpendLimitTerminal(terminal);
+        if (spend) {
+          throw new SpendLimitHoldError(
+            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
+            spend.detail,
+          );
+        }
         if (!limitFacts && isProviderTransient(terminal)) {
           throw new ProviderTransientError(
             providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
             terminal.apiErrorStatus,
             resumableSessionId(),
-          );
-        }
-        // Issue #3767: a lead spend-limit 400 is an owner-held park candidate. The runner decides
-        // whether the api can take it; otherwise this error's message is today's failure text.
-        const spend = limitFacts ? undefined : classifySpendLimitTerminal(terminal);
-        if (spend) {
-          throw new SpendLimitHoldError(
-            providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
-            spend.detail,
           );
         }
         const thrown = terminal.failure
