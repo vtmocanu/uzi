@@ -93,6 +93,12 @@ export function ForgeSettings() {
   // legible. CSS-only, no setTimeout — cleared in the wrapper's onAnimationEnd.
   const [flash, setFlash] = useState<"url" | "type" | null>(null);
   const [token, setToken] = useState("");
+  const [githubAuth, setGithubAuth] = useState("pat");
+  const [appId, setAppId] = useState("");
+  const [installationId, setInstallationId] = useState("");
+  const [privateKey, setPrivateKey] = useState("");
+  const [repositories, setRepositories] = useState("");
+  const useGitHubApp = forgeType === "github" && githubAuth === "app";
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [warning, setWarning] = useState("");
@@ -142,14 +148,55 @@ export function ForgeSettings() {
   const connect = async (e: React.FormEvent) => {
     e.preventDefault();
     resetMessages();
+    let credential = token;
+    if (useGitHubApp) {
+      const names = [...new Set(repositories.split(/[,\n]/).map((name) => name.trim()).filter(Boolean))];
+      const installation = Number(installationId);
+      if (!/^[1-9]\d*$/.test(appId.trim())) {
+        setError("App ID must be a positive decimal number.");
+        return;
+      }
+      if (!/^[1-9]\d*$/.test(installationId.trim()) || !Number.isSafeInteger(installation)) {
+        setError("Installation ID must be a positive integer.");
+        return;
+      }
+      if (
+        names.length === 0 || names.length > 100 ||
+        names.some((name) => !/^[A-Za-z0-9_.-]{1,100}$/.test(name) || name === "." || name === "..")
+      ) {
+        setError("Enter 1–100 repository names, without an owner or URL.");
+        return;
+      }
+      const pem = privateKey.trim();
+      if (
+        pem.length > 16_384 ||
+        !/^-----BEGIN (?:RSA )?PRIVATE KEY-----\r?\n/.test(pem) ||
+        !/\r?\n-----END (?:RSA )?PRIVATE KEY-----$/.test(pem)
+      ) {
+        setError("Paste the complete PEM private key, including its BEGIN and END lines.");
+        return;
+      }
+      credential = JSON.stringify({
+        auth_type: "github_app",
+        app_id: appId.trim(),
+        installation_id: installation,
+        private_key: pem,
+        repositories: names,
+      });
+    }
     setConnecting(true);
     try {
-      const { connection } = await api.createConnection(baseUrl, token, forgeType);
+      const { connection } = useGitHubApp
+        ? await api.createConnection(baseUrl, credential, forgeType, "github_app")
+        : await api.createConnection(baseUrl, credential, forgeType);
       setToken("");
+      setPrivateKey("");
       setNotice(`Connected as ${maskUsername(connection.bot_username, "bot", demo)}.`);
       await reload();
     } catch (err) {
-      if (err instanceof ApiError && err.status === 422) {
+      if (useGitHubApp && err instanceof ApiError && err.status === 404) {
+        setError("This Uzi API does not support GitHub App connections. Update the API, then try again.");
+      } else if (err instanceof ApiError && err.status === 422) {
         const body = err.body as { violations?: string[] } | null;
         setError(err.message);
         setConnectViolations(body?.violations ?? []);
@@ -242,12 +289,14 @@ export function ForgeSettings() {
     const inferred = inferForgeType(url, forgeTypes);
     if (inferred !== null && inferred !== forgeType) {
       setForgeType(inferred);
+      if (inferred !== "github") setPrivateKey("");
       setFlash("type"); // flash the auto-changed type field (cosmetic)
     }
   };
 
   const onForgeTypeChange = (type: string) => {
     setForgeType(type);
+    if (type !== "github") setPrivateKey("");
     const currentInferred = inferForgeType(baseUrl, forgeTypes);
     // Only move the URL if the current host is recognized (non-null) and is a
     // different forge than the newly chosen type. An unrecognized/self-hosted host
@@ -279,9 +328,9 @@ export function ForgeSettings() {
             ))}
           </ul>
           <p className="mt-3 text-sm text-muted">
-            Mint a least-privilege token ({hints.scopeWord}{" "}
+            {useGitHubApp ? "Check the App's repository permissions and installation access — see the " : <>Mint a least-privilege token ({hints.scopeWord}{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> only,
-            non-admin bot) — see the{" "}
+            non-admin bot) — see the </>}
             <DocLink slug={botSetupDoc(forgeType)}>bot setup guide</DocLink>
             .
           </p>
@@ -291,14 +340,21 @@ export function ForgeSettings() {
       {warning && <Alert tone="warning" message={warning} />}
 
       <Card>
-        <SectionTitle>Connect a bot PAT</SectionTitle>
-        <p className="mt-2 text-sm text-muted">
+        <SectionTitle>{useGitHubApp ? "Connect a GitHub App" : "Connect a bot PAT"}</SectionTitle>
+        {useGitHubApp ? (
+          <p className="mt-2 text-sm text-muted">
+            Use a GitHub App installation instead of a bot account. Choose the repository names
+            this connection may access. The private key is stored encrypted on the API server;
+            workers receive only short-lived installation tokens. See the{" "}
+            <DocLink slug={botSetupDoc(forgeType)}>bot setup</DocLink> guide.
+          </p>
+        ) : <p className="mt-2 text-sm text-muted">
           Create a bot account, give it a personal access token with the{" "}
           <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> {hints.scopeWord}, and add
           it {hints.roleClause} to the projects uzi should see. The token is stored encrypted and never
           shown again.{" "}Step-by-step instructions are in the{" "}
           <DocLink slug={botSetupDoc(forgeType)}>bot setup</DocLink> guide.
-        </p>
+        </p>}
         <form className="mt-4 space-y-4" onSubmit={connect}>
           <Field label="Forge base URL">
             <div
@@ -337,7 +393,38 @@ export function ForgeSettings() {
               </div>
             </Field>
           )}
-          <Field label={`Bot personal access token (${hints.scopeLabel})`} htmlFor="forge-bot-pat">
+          {forgeType === "github" && (
+            <Field label="GitHub authentication" htmlFor="github-authentication">
+              <Select id="github-authentication" value={githubAuth} onChange={(e) => { setGithubAuth(e.target.value); setPrivateKey(""); resetMessages(); }}>
+                <option value="pat">Personal access token</option>
+                <option value="app">GitHub App</option>
+              </Select>
+            </Field>
+          )}
+          {useGitHubApp ? <>
+            <Field label="App ID" htmlFor="github-app-id">
+              <Input id="github-app-id" inputMode="numeric" autoComplete="off" value={appId} onChange={(e) => setAppId(e.target.value)} />
+            </Field>
+            <Field label="Installation ID" htmlFor="github-installation-id">
+              <Input id="github-installation-id" inputMode="numeric" autoComplete="off" value={installationId} onChange={(e) => setInstallationId(e.target.value)} />
+            </Field>
+            <Field label="Repository names" htmlFor="github-app-repositories">
+              <Input id="github-app-repositories" placeholder="aifactory" autoComplete="off" value={repositories} onChange={(e) => setRepositories(e.target.value)} />
+              <p className="mt-1 text-xs text-muted">Comma-separated names within this installation, without the owner. Only these repositories are authorized.</p>
+            </Field>
+            <Field label="Private key (PEM)" htmlFor="github-app-private-key">
+              <Input
+                id="github-app-private-key"
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                value={privateKey}
+                onChange={(e) => setPrivateKey(e.target.value.replace(/\\n/g, "\n"))}
+                onPaste={(e) => { e.preventDefault(); setPrivateKey(e.clipboardData.getData("text")); }}
+              />
+              <p className="mt-1 text-xs text-muted">Paste the entire PEM key. Multiline paste is preserved and the key stays masked.</p>
+            </Field>
+          </> : <Field label={`Bot personal access token (${hints.scopeLabel})`} htmlFor="forge-bot-pat">
             <PasswordInput
               id="forge-bot-pat"
               autoComplete="off"
@@ -345,8 +432,8 @@ export function ForgeSettings() {
               value={token}
               onChange={(e) => setToken(e.target.value)}
             />
-          </Field>
-          <Button type="submit" disabled={connecting || !baseUrl || !forgeType || !token}>
+          </Field>}
+          <Button type="submit" disabled={connecting || !baseUrl || !forgeType || (useGitHubApp ? !appId || !installationId || !repositories || !privateKey : !token)}>
             {connecting ? "Verifying…" : "Connect"}
           </Button>
         </form>
@@ -361,7 +448,7 @@ export function ForgeSettings() {
         <EmptyState
           icon={<BranchIcon />}
           title="No forge connection yet"
-          description="Connect a bot PAT above — repos the bot can see become boards."
+          description="Connect a forge above — authorized repos become boards."
         />
       ) : (
         <Card flush>
@@ -500,7 +587,7 @@ export function ForgeSettings() {
       )}
 
       <p className="text-xs text-faint">
-        To rotate a token, connect again with the same base URL — the new PAT replaces the old one.
+        To rotate credentials, connect again with the same base URL and bot identity — the new credentials replace the old ones.
       </p>
     </SettingsShell>
   );

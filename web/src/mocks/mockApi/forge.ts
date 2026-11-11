@@ -157,7 +157,7 @@ export const forgeApi = {
   // ── Forge ───────────────────────────────────────────────────────────────────
   forgeConfig: async () => delay({ ...mockForgeConfig, allowed_base_urls: [...mockForgeConfig.allowed_base_urls] }),
   listConnections: async () => delay({ connections: connections.map((c) => ({ ...c })) }),
-  createConnection: async (baseUrl: string, _token: string, forgeType = "gitlab") => {
+  createConnection: async (baseUrl: string, _token: string, forgeType = "gitlab", _authMode?: "github_app") => {
     const conn = {
       ...mockConnection,
       id: `conn-${Date.now()}`,

@@ -947,8 +947,10 @@ const realApi = {
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),
   listConnections: () =>
     request<{ connections: ForgeConnection[] }>("GET", "/forge/connections"),
-  createConnection: (baseUrl: string, token: string, forgeType = "gitlab") =>
-    request<{ connection: ForgeConnection }>("POST", "/forge/connections", {
+  createConnection: (baseUrl: string, token: string, forgeType = "gitlab", authMode?: "github_app") =>
+    // A distinct route prevents a newer UI from passing an App credential envelope
+    // to an older API that would treat the entire PEM-bearing JSON as a PAT.
+    request<{ connection: ForgeConnection }>("POST", authMode === "github_app" ? "/forge/connections/github-app" : "/forge/connections", {
       base_url: baseUrl,
       token,
       forge_type: forgeType,

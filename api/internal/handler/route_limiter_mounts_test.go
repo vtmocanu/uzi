@@ -749,6 +749,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/chats/{id}/proposals/{pid}/confirm", limForge},
 	{"POST", "/api/chats/{id}/proposals/{pid}/dismiss", noLimiter},
 	{"POST", "/api/forge/connections/", noLimiter},
+	// The App route mints an installation token upstream, so it rides the same
+	// per-user forge budget as the other proxying routes.
+	{"POST", "/api/forge/connections/github-app", limForge},
 	{"POST", "/api/forge/connections/{id}/privilege-check", limForge},
 	{"POST", "/api/forge/connections/{id}/verify", limForge},
 	{"POST", "/api/me/cli-tokens/", noLimiter},

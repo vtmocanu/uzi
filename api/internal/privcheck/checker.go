@@ -276,7 +276,11 @@ func evaluateToken(forgeType forge.Type, info forge.TokenInfo, isAdmin bool, now
 		return tr
 	}
 
-	if !scopesAcceptable(forgeType, info.Scopes) {
+	if info.GitHubApp {
+		if forgeType != forge.TypeGitHub || !forge.GitHubAppPermissionsValid(info.AppPermissions) {
+			tr.Violations = append(tr.Violations, "GitHub App installation token permissions do not match the required minimum")
+		}
+	} else if !scopesAcceptable(forgeType, info.Scopes) {
 		tr.Violations = append(tr.Violations, fmt.Sprintf("token scopes %v are not acceptable: they must include %v and add nothing beyond the allowed optional scopes %v", info.Scopes, requiredScopesFor(forgeType), allowedOptionalScopesFor(forgeType)))
 	}
 	if !info.Active {
@@ -286,7 +290,7 @@ func evaluateToken(forgeType forge.Type, info forge.TokenInfo, isAdmin bool, now
 		switch {
 		case !info.ExpiresAt.After(now):
 			tr.Violations = append(tr.Violations, "token has expired")
-		case info.ExpiresAt.Before(now.Add(warnWindow)):
+		case !info.GitHubApp && info.ExpiresAt.Before(now.Add(warnWindow)):
 			days := int(warnWindow.Hours() / 24)
 			tr.Warnings = append(tr.Warnings, fmt.Sprintf("token expires within %d days (on %s)", days, info.ExpiresAt.Format("2006-01-02")))
 		}
