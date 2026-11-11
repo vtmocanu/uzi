@@ -1063,6 +1063,45 @@ for epoch_runtime in invalid CONTAINERD-RUNC true 7; do
   fi
   grep -F 'workers.docker.podEpochReclaim.runtime must be' "$WORK/epoch-invalid.log" >/dev/null
 done
+# Epoch-reclaim deletion canary: one lowercase UUID or empty, rendered verbatim.
+canary_uuid=0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d
+for canary_id in '' "$canary_uuid"; do
+  if [ -z "$canary_id" ]; then
+    helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true > "$WORK/canary.yaml"
+  else
+    helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true \
+      --set-string "workers.epochReclaim.deletionCanaryWorkerId=$canary_id" > "$WORK/canary.yaml"
+  fi
+  awk -v expected="\"$canary_id\"" '
+    /- name: UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID/ { pending=1; count++; next }
+    pending && /^[[:space:]]*value:/ { if ($2 != expected) exit 1; pending=0 }
+    END { if (count != 1 || pending) exit 1 }
+  ' "$WORK/canary.yaml"
+done
+canary_msg='workers.epochReclaim.deletionCanaryWorkerId must be empty or one canonical lowercase UUID'
+canary_upper=$(printf '%s' "$canary_uuid" | tr 'a-f' 'A-F')
+for canary_bad in "$canary_upper" '*' 'a\,b' " $canary_uuid" "$canary_uuid " abc; do
+  if helm template uzi "$STRIPPED" \
+    --set-string "workers.epochReclaim.deletionCanaryWorkerId=$canary_bad" > "$WORK/canary-invalid.log" 2>&1; then
+    echo "FAIL: invalid epoch-reclaim canary id accepted: $canary_bad" >&2
+    exit 1
+  fi
+  if ! grep -F "$canary_msg" "$WORK/canary-invalid.log" >/dev/null; then
+    echo "FAIL: epoch-reclaim canary id $canary_bad was refused without the expected message" >&2
+    exit 1
+  fi
+done
+for canary_bad in '{a,b}' true 7; do
+  if helm template uzi "$STRIPPED" \
+    --set "workers.epochReclaim.deletionCanaryWorkerId=$canary_bad" > "$WORK/canary-invalid.log" 2>&1; then
+    echo "FAIL: invalid epoch-reclaim canary id accepted: $canary_bad" >&2
+    exit 1
+  fi
+  if ! grep -F "$canary_msg" "$WORK/canary-invalid.log" >/dev/null; then
+    echo "FAIL: epoch-reclaim canary id $canary_bad was refused without the expected message" >&2
+    exit 1
+  fi
+done
 helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true \
   --set workers.docker.enabled=true --set workers.docker.networkPolicy.acknowledgeUnfenced=true \
   --set workers.isolatedLane.enabled=true --set workers.fqdnEgress.enabled=true \

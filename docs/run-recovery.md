@@ -1257,8 +1257,9 @@ commit that only the clone holds (on another local branch, under a tag or under
 `refs/remotes/`) or a stash entry makes it not covered. Gitignored files are not covered by any capture, so they do not
 make a clone that is otherwise anchored not covered. Accepted residuals: commits reachable
 only from the reflog (for example after an agent's `git reset --hard`) are not
-counted as source, and a bare ref that justified coverage can later move (a
-forge force-push, pin settlement).
+counted as source, a bare ref that justified coverage can later move (a
+forge force-push, pin settlement), and refs inside an unreadable refs directory are
+silently omitted by Git, so the stderr rule below does not detect them.
 
 Coverage is also refused (`not_covered`) in these cases, which matter where coverage
 still gates release (terminal exits, below); on parks it is diagnostic:
@@ -1268,6 +1269,22 @@ still gates release (terminal exits, below); on parks it is diagnostic:
   `ignore=all` set in `.gitmodules` or config. The status read runs with
   `--ignore-submodules=none`, and the parent proof says nothing about a
   submodule's own files, commits or refs.
+- **Git reported a problem.** On a terminal exit (completed, failed, cancelled), any
+  output on stderr from the worktree `git status --porcelain` read or from the `for-each-ref`
+  read of the clone's local refs makes the source `not_covered`. Git exits 0 with empty
+  stdout and only warns when it cannot read part of the worktree (`warning: could not open
+  directory 'x/': Permission denied`) or a loose ref (`warning: ignoring broken ref`), so an
+  empty status is not proof of a clean tree. The clone, its keep flag and the plain journal
+  remain, with no stopped marker. No warning text is matched and there is no allowlist, so benign warnings retain conservatively: `core.fsyncObjectFiles=true` in the
+  clone's config (a deprecation warning) makes a clean clone `not_covered` and kept. A
+  CRLF-conversion warning, if `status` emits one, likewise makes the clone `not_covered` and
+  kept; no `core.safecrlf` override is added. The status read still pins
+  `core.excludesFile=/dev/null` but uses capture's HOME and attribute inputs. If
+  `~/.config/git/attributes` under that HOME is unreadable, status can warn when it
+  consults attributes (for example for a stat-dirty tracked file), making even a
+  clean clone `not_covered` and kept. Residual: Git silently omits refs inside an unreadable refs
+  directory (no stderr), so that case is not detected
+  ([#4141](https://github.com/vtmocanu/uzi/issues/4141)).
 - **Late writer.** If the final process proof had to kill a writer, the earlier
   byte checks do not cover what it wrote. The residual is a writer that writes and
   exits between the status read and that proof. Stopped and park exits keep the
@@ -2238,6 +2255,147 @@ consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeu
 unless the run's own open holds reach the custody admission limit first; it then stays queued for
 capacity (not an owner park) until it can be claimed again.
 
+### When a restarted worker continues from a saved pin (independent restore)
+
+If a worker process dies and the run is claimed again, the earlier attempt (the
+predecessor) can still be owned by the dead process, so the new claim cannot take
+its clone over. On a Docker Compose worker uzi can then start a **fresh attempt**
+from the run's verified saved work instead of stopping. It does not fence, read or
+reuse the predecessor.
+
+**When it happens.** Only for an eligible attempt-path predecessor,
+normally Docker-wired, or an unwired key already in the supported persisted attempt
+mode, and only when all of these hold: the worker is a Compose worker (a hosted
+Kubernetes worker is not supported); the run is an issue, MR-rework or self-improvement
+run with guarded recovery; the dead worker was started by a build that wrote a
+per-process boundary record (a worker started by an older build has none, so its
+predecessor is never restored); and the run has exactly one saved pin for the
+generation that died, whose checks all pass. Any other case is a refusal. A fresh
+unwired (no Docker-in-Docker) key keeps canonical clone paths, so its predecessor is
+the canonical unsupported class below.
+
+**Unsupported predecessors are held for you.** Three classes are positively
+recognised and refused before any source effect, and are parked when the earlier checks
+pass: a **canonical** predecessor (its journal names only the run and the canonical
+clone path, with no attempt id, and its slot is active under another worker process with
+no pending footprint or publication; a journal that carries an attempt id at the
+canonical path is still refused as `predecessor_path` and not parked), a predecessor
+seen from a **hosted** worker (this worker is a hosted pod with a valid boundary record
+of its own; a hosted predecessor reached from a Compose worker is refused as
+`hosted_restore_not_delivered` and not parked), and a predecessor of a worker process
+with **no boundary record** (started by an older build; parked only once the saved-pin,
+attribution and own-record checks pass, so with no pin or several pins it is refused as
+`no_eligible_pin` or `pin_ambiguous` and not parked). If the api supports it (it advertises
+`recovery_cause_retained_recovery_adoption_failed`), the run parks for you at
+`recovery_wait` / `retained_recovery_adoption_failed` instead of requeueing into the
+same refusal: Resume claims again and holds again unchanged on this release and adds at
+least one admission-counted custody hold, and Cancel ends the run. Without that
+capability the refusal is the ordinary nonterminal stop described below. The park
+changes no predecessor bytes (journal, slot, clone, HOME and provision directories stay
+as they were) and reaps nothing. Here the cause has a third meaning: continuation was
+refused because this release does not support the predecessor, not because an adoption
+was attempted, so no `adoption_failed` blocker is persisted and no quiescence is
+proven. The feed shows `Independent continuation was refused before any source effect:
+this release does not support this predecessor (<class>).` The worker log records
+`restore unsupported predecessor held`. An owner-held hosted run blocks its worker's
+ordinary image roll until you cancel or discard it. The CLI and web descriptions of this
+hold name this third meaning; in this release the watcher skill's description still covers
+only the cause's earlier two meanings (presentation deferred,
+[#4000](https://github.com/vtmocanu/uzi/issues/4000)).
+
+This is a behaviour change for hosted workers, canonical predecessors and predecessors
+started by an older build. Before this release, a claim that found its predecessor still
+owned by a dead process failed with `preservation_failed`. Now, on the normal running
+path with active-run snapshots, those classes are parked for you as described
+above when the qualifying checks pass (and the api supports it). Every other refusal, and those classes on an api
+without the capability, keeps the ordinary accounting: the claim stops without failing
+and its cost depends on the path (see "What it costs"; details in
+[ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-11-08--3644-independent-restore)).
+Without active-run snapshots, a first foreign-active predecessor refusal with no restore entry keeps the old `preservation_failed` outcome. An existing restore entry still stops the claim nonterminally; turning snapshots off after a restore does not enable legacy recovery (known limitation [#3999](https://github.com/vtmocanu/uzi/issues/3999)).
+
+**What you see.** The run feed can show one of two worker lines (some stops put
+nothing on the feed, see below):
+
+- `independent restore: a fresh attempt was seeded from the verified pin`, followed by
+  `continues from verified saved work at pin <id> (generation <n>, sha <sha>); later
+  unpinned edits may remain only in the retained predecessor on the worker (not
+  measured); merging closes only the server custody holds; the retained predecessor's
+  worker-side copy stays until the owner's guarded discard`.
+- `independent restore refused (<reason>); the retained predecessor is kept and the
+  run is not failed`.
+
+A refusal is not a failure. Nothing is written to the predecessor and its work is
+kept. The worker log records `independent restore refused; predecessor retained` with
+the reason. The composite stop (`restore entry present; claim stopped`), the
+seeding-disabled stop and a post-seed handoff failure put nothing on the feed; they
+are in the worker log only. Back the work up first when a run is held for you. A Cancel you already issued is honored before anything is written. That
+check is a bounded best-effort read: if the read fails, the worker logs that it stops
+without cancel and stops nonterminally.
+
+**What it costs.**
+
+- Edits the predecessor made after the pin are not carried into the new attempt, and
+  how much that is has not been measured.
+- Every refusal other than the parked unsupported classes is a nonterminal stop with
+  server-side charging, and its per-crash cost is conditional. On the running path a
+  claim is charged a requeue, up to `RUN_MAX_REQUEUES`, then the run parks at
+  `recovery_wait` / `worker_requeue_exhausted` when custody is uncertain; only you can
+  then Resume or Cancel it. A claimed-but-never-started continuation can consume
+  uncharged generations, up to the run's own hold-admission bound, or park at the
+  server-only `retained_continuation_unwitnessed`. A custody-blocked queued run on a
+  live worker can stay queued even at the cap: there is no universal hold at the cap.
+  Each accepted generation opens a custody hold that counts toward `custody_hold_limit`.
+  A parked unsupported run holds the predecessor's hold and the current generation's,
+  and an owner Resume adds a claim and a hold.
+- The restore uses the single ordinary pin record of the dead generation. Several
+  records refuse with `pin_ambiguous` and none with `no_eligible_pin`. Choosing among
+  several records, and preferring a finalization pin, are not implemented.
+- The predecessor's hold stays open and counts toward your
+  [custody admission limit](admin-settings.md) (`custody_hold_limit`) until you
+  discard it. The generation's final acknowledgment, settlement and report retirement
+  all refuse while it is open. Merging the PR closes only the server custody holds; it
+  never deletes the predecessor's copy on the worker. The server's verified-merge
+  discard closes only server holds, and also discards those holds' non-ready captures.
+- The restore keeps the new attempt's HOME separate (`agent-home/<run-id>.g<n>`), so
+  the predecessor's HOME is never touched.
+- A retained predecessor also blocks other restores on the same repository. Before it
+  restores, the worker checks every attributed source in the run's bare repository,
+  and a source still marked active under another worker incarnation refuses with
+  `census_foreign_active`. Only the predecessor being restored is excluded. So until
+  you discard a retained predecessor, even one whose new attempt has already finished,
+  no other run on that repository can be restored independently; those runs are
+  refused instead. Ordinary fresh claims do not run this check.
+
+**How to release it.** Discard the new attempt's retained source first, then the
+predecessor's. Both guarded discards require the run to be terminal
+(`run_state_not_terminal` otherwise). Use the guarded worker-local inspect and discard described in
+[Retained sources with no open hold](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)
+and `uzi run discard <run-id> --hold <hold-id> --yes` for the server hold (see
+[the CLI reference](cli.md)). Run `inspect` first and read its disposition; never delete a clone by
+hand. Inspect, discard and `run discard` stay owner-guarded; nothing here is automatic.
+
+**Limits.** Rolling back to any build before the restore-enabling release after a
+restore is unsupported (v0.87.0-rc.3 to rc.5 lack the restore code too; the
+compatibility proof executed the rc.2 sources specifically). rc.2 can write a reservation and a `preservation_failed` blocker into the predecessor's
+journal and delete the predecessor's legacy HOME and provision directories once the run
+is terminal; it does not delete the new attempt's clone, the predecessor's clone
+bytes, owed refs or pins. If rc.2 has reclaimed the predecessor for another run, rolling
+forward recognises it and the guarded discards still finish. In the holding-root mode
+the predecessor's holding copy is reported and kept and still needs an owner. The
+exception is when rc.2's ledger compaction dropped the evidence (a second rollback, or,
+in the attempt-path mode only, the new attempt already retired before the rollback): the
+roll-forward then refuses and the predecessor's bytes stay (issue #3981 is open). In the
+holding-root mode a retired new attempt does not cause that refusal; it still completes. The crash model is process and
+container crashes and injected faults only; no storage or power-loss guarantee is claimed.
+The boundary record is its own file, published with a non-replacing link, synced and read
+back. The seed's ledger append, the seeding and ready entry writes and the retirement
+tombstone are Git config renames followed by a sync; the entry writes and the tombstone
+are also read back, while the seed's ledger append is only checked indirectly when the
+next `seeding` write re-reads the config. Later live successor journal rewrites have no
+following sync. The restore exit's atomic config rewrite syncs its temporary file but not
+the directory, then the exit syncs. Design and
+evidence: [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-11-08--3644-independent-restore).
+
 ### Retained sources with no open hold (worker-local inspect and discard)
 
 A retained source can outlive its server hold: the hold was released or discarded,
@@ -2470,14 +2628,25 @@ verified pod epoch, under the exclusive epoch lock and before it admits runs
 (see [Pod-epoch shadow reclaim](./worker-docker.md#pod-epoch-shadow-reclaim)).
 The evaluation is reported in the `pod_epoch_reclaim` log line. The worker image
 also contains a deletion phase that reclaims through the same discard core as the
-operator channel above. **That phase is gated off: `EPOCH_RECLAIM_DELETION_ENABLED`
-is `false`, so a production worker deletes nothing and settles no records.**
-Enabling it needs a separate owner decision on the re-measured numbers in
-[PRD #3431](../prds/3431-pod-epoch-reclaim.md); this guide does not describe it as
-available. Hosted deletion acceptance, the later idle-gated roll (#3329) and the
-Compose and plain lanes (#3709, #3710) are not shipped.
+operator channel above. **That phase is off unless an operator opts in on exactly
+one worker: a production worker deletes nothing and settles no records by default.**
+The worker reads `UZI_EPOCH_RECLAIM_DELETION` once at startup, before it creates
+its pod epoch: unset, empty or `0` is off; `1` is on only for an epoch-locked,
+Docker-wired worker (`UZI_EPOCH_LOCK=1` and `DOCKER_HOST` or `UZI_DIND_SOCKET`),
+and any other value, or `1` on a worker without those, refuses startup. The opt-in
+only permits attempting the phase described below; it supplies no evidence, and
+every gate below stays required. Every epoch worker logs one startup line,
+`pod_epoch_reclaim_activation`, with `deletion_requested: true|false`; an image
+without the opt-in never emits it. In a hosted deployment the controller sets the
+variable for one selected worker only, from the chart value
+`workers.epochReclaim.deletionCanaryWorkerId` (default `""`, off everywhere; see
+[configuration](./configuration.md#controller)). There is no fleet-wide enable, hot
+kill switch, synthetic epoch reset or forced roll. Live enablement waits on the
+[one-worker deletion canary checklist](#one-worker-deletion-canary-checklist).
+Hosted deletion acceptance, the later idle-gated roll (#3329) and the Compose and
+plain lanes (#3709, #3710) are not shipped.
 
-If the phase is enabled, it runs only for an `eligible` and `attested` pass, one
+When the phase is attempted, it runs only for an `eligible` and `attested` pass, one
 source at a time, and keeps everything else:
 
 - It needs a fresh positive terminal lifecycle and a recovery-holds response with
@@ -2519,7 +2688,15 @@ claimed. A residue failure leaves the slot `retiring` with a `settled_failed`
 pending record, which the next epoch retakes. A crash inside or after the
 destructive-record save and before its settle leaves the slot `retiring` with a
 `running` pending record. That source is kept and not recovered automatically:
-this is a stated residual, and no automatic path clears it.
+this is a stated residual, and no automatic path clears it. The other interrupted
+states (takeover saved, delete settled before the retired append, retired append
+before the clear, clear barrier uncertain) are rediscovered by the next epoch and
+either finished exactly or kept; the exact `[""]` repair repeats only the barriers.
+Authority-store slot and head write windows follow the existing store recovery: a
+transactional load finishes a slot exactly one ahead, and a read-only peek refuses.
+The full crash table, including these states, is in
+[ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md); [PRD #3431](../prds/3431-pod-epoch-reclaim.md)
+carries three rows.
 
 A verified epoch is not proof that every historical writer is gone. Its evidence
 covers the immediately preceding pod and intervening pod use, while the epoch lock
@@ -2530,6 +2707,85 @@ accepted this historical-writer residual on 2026-10-24 in
 [PRD #3430](../prds/3430-pod-epoch-lock-shadow.md). It does not authorize bypassing
 a current source-use, custody, process, Docker, or epoch-lock refusal. A known or
 unverified current writer keeps the source.
+
+#### One-worker deletion canary checklist
+
+Setting `workers.epochReclaim.deletionCanaryWorkerId` is an owner-run, evidence
+gated step. It lets one worker attempt the deletion phase above; every existing
+gate (eligible verdict, attested authority, intact pass, native reclaim scope,
+fresh per-source reads, reservation and authority transaction, journal and
+descriptor equality, quiescence, durable settlement) stays conjunctive, and the
+setting supplies no evidence. Nothing here is accepted or verified by shipping
+the chart value: hosted deletion acceptance is owner-owned and pending.
+
+**Prerequisites, before setting the selector:**
+
+- (a) The deployed worker image contains the reviewed #3851 implementation.
+- (b) Refreshed R9 measurements from that image exist.
+
+**Steps:**
+
+1. Ship with the chart default empty. Deploy the new controller and an image with
+   the opt-in, activation off. Finish any global worker image rollout first; the
+   selector never changes the image pin.
+2. Pick ONE persistent, genuinely idle Docker worker from fresh inventory, with a
+   supported runtime and layout, headroom and normal pool replacement coverage.
+   Record the worker, image digest, pod, data-PVC identities and the
+   before-inventory. Do not discard holds or edit protected records to manufacture
+   a deletion. Keep ForceRoll off.
+3. Set the selector through normal GitOps. Verify:
+   - the replacement's identity (worker, pod and PVC);
+   - its `UZI_EPOCH_RECLAIM_DELETION=1` env;
+   - the `pod_epoch_reclaim_activation` line with `deletion_requested: true`. This
+     is mandatory: an old image ignores the variable and emits no line. The line
+     shows only that the opt-in was read; it is also logged on same-pod restarts
+     where no pass runs. Execution evidence is the `pod_epoch_reclaim` result of
+     a fresh epoch;
+   - that unselected workers' templates are unchanged.
+
+   Registration alone is not proof. Collect at least three distinct complete,
+   attested startup epochs on the SAME worker, including at least one
+   independently verified physical deletion. Zero-candidate or metadata-only epochs
+   count toward the three but not toward the deletion. Same-pod restarts,
+   partial or deferred passes and unresolved outcomes do not count.
+4. Preserve each epoch's full `pod_epoch_reclaim` result: counts, `deleted_bytes`,
+   every `kept_*` and the partial/authority fields, plus duration, resource
+   observations, before/after exact paths and preserved refs, and the epoch's
+   admission/shutdown outcome. For every epoch, verify that each removed source had
+   no live reference and that its preserved roots remain intact. No memory-pressure
+   park may be attributable to it. Keep the earlier unexplained proof failure and
+   its public tracking evidence: a later passing epoch does not explain it.
+5. Lead and buddy review the evidence before any further rollout. Any anomaly stops
+   the canary: preserve the evidence and clear the selector. There is no automatic
+   promotion, and fleet expansion needs a separate owner decision.
+
+**Disabling.** Clear the selector. It takes effect at the next safe replacement or
+startup of that worker: the controller drops the env from the template and the
+worker rolls through the same pacing, idle and custody guards as any other roll. It
+does not stop a pass already running and cannot restore deleted bytes; in-flight
+effects follow the existing graceful cancellation and settlement rules, and unknown
+effects keep exclusion and refuse admission.
+
+**Never move the selector to another UUID until the prior enabled incarnation is
+proven gone or off.** Moving it from worker A to worker B renders B's env
+immediately, but A keeps its env until its own replacement. A busy A is only
+cordoned. While A's current pod has not finished its first pass, or a new pod for
+A starts (for example after an eviction or reschedule), A can still attempt
+deletion, so A and B can both be enabled at once. A same-pod container restart
+does not re-run a pass whose pod UID was already durably consumed; it re-runs
+only if the first process died before that consumption. This is an accepted
+limit of the design, not a bug to work around:
+clear the selector, confirm A's Deployment template no longer contains
+`UZI_EPOCH_RECLAIM_DELETION=1`, confirm every pod that started with it is gone,
+and confirm A's current pod logged `pod_epoch_reclaim_activation` with
+`deletion_requested: false`. Only then set the new ID. A replacement that
+started before the template changed (for example after an eviction) still
+carries the env, so "A was replaced" alone is not proof.
+
+**Settlement contract (unchanged).** Crash scope is process crashes only: a crash
+after a `running` pending record leaves the source KEPT and not recovered
+automatically, and `settled_failed` residue is retaken by the next epoch (see the
+crash paragraph above). No storage or power-loss durability is claimed.
 
 #### Resolving guarded local records
 
@@ -2723,7 +2979,7 @@ abandoned. Either way Case B removes no tree bytes.
 - **Source disposal is separate.** After retirement `inspect` may show `local_discard`;
   the existing [epoch reclaim](#verified-epoch-reclaim-prd-3431) then acts only if its own
   strict-plain shape, byte measurement, custody and writer predicates pass (and that
-  deletion phase is gated off in production). It may instead show `local_protected_discard`,
+  deletion phase runs only on the one opted-in canary worker, if any). It may instead show `local_protected_discard`,
   which the epoch deletion recheck refuses; the ordinary operator `discard --protected`
   runs its own checks. Record retirement guarantees neither outcome and grants no source
   disposal.

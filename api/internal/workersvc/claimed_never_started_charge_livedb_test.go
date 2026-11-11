@@ -3,6 +3,9 @@ package workersvc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -1045,4 +1048,179 @@ func TestClaimedNeverStartedChargeRunningPathLiveDB(t *testing.T) {
 			t.Fatalf("gen %d: status=%s cause=%v fail_origin=%v released=%v, want the over-cap park", gen, r.Status, r.RecoveryWaitCause, r.FailOrigin, r.ClaimReleasedAt.Valid)
 		}
 	}
+}
+
+// holdRows lists the run's custody holds as "generation/state", ordered, so a test can compare
+// the exact set before and after a step.
+func (f *cncFixture) holdRows(t *testing.T, run uuid.UUID) []string {
+	t.Helper()
+	rows, err := f.env.pool.Query(f.env.ctx,
+		`SELECT generation, state FROM recovery_custody_holds WHERE user_id = $1 AND run_id = $2 ORDER BY generation, id`, f.userID, run)
+	if err != nil {
+		t.Fatalf("list holds: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var gen int64
+		var state string
+		if err := rows.Scan(&gen, &state); err != nil {
+			t.Fatalf("scan hold: %v", err)
+		}
+		out = append(out, fmt.Sprintf("%d/%s", gen, state))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("hold rows: %v", err)
+	}
+	return out
+}
+
+// TestClaimedNeverStartedChargeRetainedCustodyRunningPathLiveDB (issue #3644, plan 3.5 running
+// path): a run holding a retained OPEN generation-1 recovery custody hold reaches running on a
+// worker, whose active-run snapshot then omits it (the worker refused the restore nonterminally
+// and dropped it). The existing server paths run unchanged: FrozenRequeueRunsMissingFromSnapshot
+// charges a requeue below RUN_MAX_REQUEUES, and at the cap frozenFailRunsMissingFromSnapshotLocked
+// parks the run at recovery_wait / worker_requeue_exhausted with custody_uncertain=true. Neither
+// path touches the holds. SetRunRunning has no custody guard, so the running report is applied.
+// Every subtest also seeds testCustodyLimit-1 unrelated open holds for the owner. The retained
+// subtests (which seed the predecessor hold too) therefore sit at custody_hold_limit; the hold-free
+// control sits one below it. The run still claims, which is all that is pinned about the limit.
+//
+// svc.Claim opens one hold per claimed generation, so three subtests isolate which hold matters:
+//   - "retained predecessor hold" keeps every hold: it ends in the park, custody_uncertain=true.
+//   - "only the generation-1 hold" deletes the holds Claim opens for generations above 1 right
+//     after each claim, leaving only the retained generation-1 hold; it must still park with
+//     custody_uncertain=true, so the predecessor-generation hold alone is sufficient (a
+//     custody_uncertain EXISTS narrowed to the run's current claim_generation reddens it).
+//   - "hold-free control" deletes every hold of the run after each claim: the same sequence ends
+//     failed/worker_lost (no park) with custody_uncertain=false.
+func TestClaimedNeverStartedChargeRetainedCustodyRunningPathLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	const max = 2
+
+	// holdMode says which of the run's holds are deleted right after each claim.
+	type holdMode int
+	const (
+		keepAll holdMode = iota
+		dropAbove1
+		dropAll
+	)
+
+	runCycle := func(t *testing.T, f *cncFixture, run uuid.UUID, wantGen int64, wantCount int32, mode holdMode) store.Run {
+		t.Helper()
+		f.claimRun(t, run, wantGen)
+		switch mode {
+		case dropAll:
+			f.env.exec(`DELETE FROM recovery_custody_holds WHERE user_id = $1 AND run_id = $2`, f.userID, run)
+		case dropAbove1:
+			f.env.exec(`DELETE FROM recovery_custody_holds WHERE user_id = $1 AND run_id = $2 AND generation > 1`, f.userID, run)
+		}
+		g := wantGen
+		res, err := f.svc.SetStateReportWithReconciliation(f.env.ctx, f.wkr, run, StateRequest{State: "running", ClaimGeneration: &g})
+		if err != nil || !res.Applied {
+			t.Fatalf("gen %d: running applied=%v err=%v (SetRunRunning has no custody guard)", wantGen, res.Applied, err)
+		}
+		if r := f.run(t, run); r.Status != "running" || r.RequeueCount != wantCount {
+			t.Fatalf("gen %d: after running report status=%s requeue_count=%d, want running/%d", wantGen, r.Status, r.RequeueCount, wantCount)
+		}
+		f.heartbeat(t, f.next(), f.nonce, ActiveRunEntry{RunID: run.String(), ClaimGeneration: wantGen, Phase: "running"})
+		f.env.exec(`UPDATE runs SET status_since = now() - interval '2 hours' WHERE id = $1`, run)
+		holdsBefore := f.holdRows(t, run)
+		f.omit(t)
+		if got := f.holdRows(t, run); !slices.Equal(got, holdsBefore) {
+			t.Fatalf("gen %d: holds = %v after the omitting snapshot, want %v unchanged", wantGen, got, holdsBefore)
+		}
+		return f.run(t, run)
+	}
+	evidence := func(t *testing.T, r store.Run) store.WorkerRecoveryEvidence {
+		t.Helper()
+		var ev store.WorkerRecoveryEvidence
+		if err := json.Unmarshal(r.WorkerRecoveryEvidence, &ev); err != nil {
+			t.Fatalf("evidence = %s (%v)", r.WorkerRecoveryEvidence, err)
+		}
+		return ev
+	}
+
+	// drive runs the whole sequence from a run seeded at claim_generation 1 (generation 1 is the
+	// retained predecessor; the first claim here is generation 2) and returns the parked run.
+	drive := func(t *testing.T, f *cncFixture, run uuid.UUID, mode holdMode) store.Run {
+		t.Helper()
+		for step := int32(0); step <= max; step++ {
+			r := runCycle(t, f, run, int64(step)+2, step, mode)
+			held := f.holdRows(t, run)
+			switch {
+			case mode == dropAll && len(held) != 0:
+				t.Fatalf("step %d: control holds = %v, want none", step, held)
+			case mode == dropAbove1 && !slices.Equal(held, []string{"1/open"}):
+				t.Fatalf("step %d: holds = %v, want only the retained 1/open", step, held)
+			case mode == keepAll && (len(held) != int(step)+2 || held[0] != "1/open"):
+				t.Fatalf("step %d: holds = %v, want the retained 1/open plus one per claimed generation", step, held)
+			}
+			for _, h := range held {
+				if !strings.HasSuffix(h, "/open") {
+					t.Fatalf("step %d: hold %q is not open", step, h)
+				}
+			}
+			if step < max {
+				if r.Status != "queued" || r.RequeueCount != step+1 || r.RecoveryWaitCause.Valid || r.FailOrigin.Valid {
+					t.Fatalf("step %d: status=%s requeue_count=%d cause=%v fail_origin=%v, want the charged requeue %d", step, r.Status, r.RequeueCount, r.RecoveryWaitCause, r.FailOrigin, step+1)
+				}
+				continue
+			}
+			if mode == dropAll {
+				// Current code: with no custody evidence the over-cap run is failed, not parked.
+				if r.Status != "failed" || !r.FailOrigin.Valid || r.FailOrigin.String != "worker_lost" || !r.FinishedAt.Valid || r.RecoveryWaitCause.Valid {
+					t.Fatalf("step %d: control status=%s fail_origin=%v finished=%v cause=%v, want failed/worker_lost", step, r.Status, r.FailOrigin, r.FinishedAt.Valid, r.RecoveryWaitCause)
+				}
+				return r
+			}
+			if r.Status != "recovery_wait" || !r.RecoveryWaitCause.Valid || r.RecoveryWaitCause.String != "worker_requeue_exhausted" ||
+				r.FailOrigin.Valid || r.FinishedAt.Valid || !r.ClaimReleasedAt.Valid {
+				t.Fatalf("step %d: status=%s cause=%v fail_origin=%v finished=%v released=%v, want the over-cap park, never failed", step, r.Status, r.RecoveryWaitCause, r.FailOrigin, r.FinishedAt.Valid, r.ClaimReleasedAt.Valid)
+			}
+			if r.RequeueCount != max {
+				t.Fatalf("step %d: requeue_count = %d, want %d (the park is not a charge)", step, r.RequeueCount, max)
+			}
+			return r
+		}
+		t.Fatal("unreachable")
+		return store.Run{}
+	}
+
+	seeded := func(t *testing.T, retained bool) (*cncFixture, uuid.UUID) {
+		t.Helper()
+		f := newCNCFixture(t, env, max)
+		run := f.seedRun("queued", 1)
+		if retained {
+			f.seedHold(f.userID, run, 1, "open")
+		}
+		f.seedUnrelatedOpenHolds(testCustodyLimit - 1) // retained: owner at custody_hold_limit; hold-free control: one below
+		return f, run
+	}
+	parks := func(t *testing.T, mode holdMode) {
+		f, run := seeded(t, true)
+		if got := f.holdRows(t, run); !slices.Equal(got, []string{"1/open"}) {
+			t.Fatalf("seeded holds = %v, want [1/open]", got)
+		}
+		r := drive(t, f, run, mode)
+		if !evidence(t, r).CustodyUncertain {
+			t.Fatalf("evidence = %s, want custody_uncertain=true for a run holding open custody", r.WorkerRecoveryEvidence)
+		}
+	}
+
+	t.Run("retained predecessor hold: charged requeues then custody-uncertain park", func(t *testing.T) {
+		parks(t, keepAll)
+	})
+
+	t.Run("only the generation-1 hold: still the custody-uncertain park", func(t *testing.T) {
+		parks(t, dropAbove1)
+	})
+
+	t.Run("hold-free control: same sequence fails with custody_uncertain false", func(t *testing.T) {
+		f, run := seeded(t, false)
+		r := drive(t, f, run, dropAll)
+		if evidence(t, r).CustodyUncertain {
+			t.Fatalf("evidence = %s, want custody_uncertain=false without holds", r.WorkerRecoveryEvidence)
+		}
+	})
 }

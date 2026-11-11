@@ -7,7 +7,7 @@ import {
   type AuthorityTransaction, type WorkerLifetime,
 } from "./authority-lock.js";
 import {
-  AuthorityPostWriteRefusal, leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, processWorkerIncarnation,
+  AuthorityPostWriteRefusal, leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, peekSourceRootIdentity, processWorkerIncarnation,
   type AuthorityFsOps, type AuthorityStore, type EndedSlotReceipt, type SlotCohort, type SlotSnapshot, type SourceUseLease,
 } from "./completion-authority.js";
 import {
@@ -836,6 +836,35 @@ export class AuthorityRuntime implements AuthorityScope {
     } catch {
       return { kind: "other" };
     }
+  }
+
+  /**
+   * issue #3644 Gate B - the clone root's decimal dev/ino for a restore basis, read under lock A without writing or
+   * repairing anything, by the same lstat walk as the slot-key derivation (nothing inside the root is read). Undefined
+   * when the root is absent; any refusal or lock timeout rejects.
+   */
+  async sourceRootIdentity(clonePath: string, wait: AuthorityWait = {}): Promise<{ dev: string; ino: string } | undefined> {
+    const read = (): Promise<{ dev: string; ino: string } | undefined> =>
+      peekSourceRootIdentity({ dataDir: this.#options.lifetime.dataDir }, path.resolve(clonePath));
+    if (this.active()) return read();
+    return withAuthorityTransaction(this.#options.lifetime, {
+      ...(wait.signal ? { signal: wait.signal } : {}),
+      timeoutMs: wait.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_WAIT_MS,
+    }, read);
+  }
+
+  /**
+   * issue #3644 m4a - one slot read through {@link peekAuthoritySlot}: no authority transaction, no write, no repair. The slot
+   * key derivation is the only touch of `clonePath` (its lstat walk); nothing inside the clone is read. Rejects on any
+   * uncertainty (an unreadable or unauthenticated store, a slot one ahead of its head); null when no slot exists.
+   */
+  peekSlot(clonePath: string): Promise<SlotSnapshot | null> {
+    return peekAuthoritySlot({ dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, path.resolve(clonePath));
+  }
+
+  /** issue #3644 m4a - the data root and join token the restore boundary records are read and authenticated with. */
+  restoreEvidenceOptions(): { dataDir: string; workerToken: string } {
+    return { dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken };
   }
 
   /** Whether `clonePath` is owned by a sink other than `sink` whose end has not been confirmed. Read-only. */

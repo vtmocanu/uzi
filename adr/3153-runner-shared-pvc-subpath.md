@@ -78,7 +78,7 @@ On Docker-lane hosted workers, the run's working clones and `$TMPDIR` (`/data/ru
 - Admission fails open on an unknown sample and reopens after the bounded wait `UZI_DISK_ADMISSION_MAX_WAIT` (default 15m, `agent/src/config.ts`). **No admission headroom is claimed.**
 - `workerDefaultDockerEphemeralRequest` stays 5Gi (not remeasured). Data PVC sizes are unchanged (presets 5/25/50Gi, run-bound 40Gi) pending live measurement.
 - Since #3852, automatic pressure recycle preserves Docker `/data` regardless of custody or runner layout: explicit Nix pressure selects Nix only; data pressure without Nix defers. This protection requires the fixed controller; old controllers can still delete data. Ephemeral teardown and manual data-PVC deletion still physically remove runner contents. A DinD-only maintenance recycle keeps `/data/runner` and loses only DinD state.
-- Full Docker data now degrades capacity. Existing run park-and-trim and supported manual settled-tree cleanup remain the reclaim paths; D9's custody procedure remains binding for protected sources. PRD #3431 M1b settlement/deletion is implemented behind an off-by-default gate (amendment 2026-11-06 below), so production still grants it no authority, and #3329's genuine-idle reclaim roll remains deferred. No new reclaim authority is granted; see [ADR-837 D9](0837-worker-disk-lifecycle.md#d9--recycle-defaults-on-over-recorded-reviewer-dissent).
+- Full Docker data now degrades capacity. Existing run park-and-trim and supported manual settled-tree cleanup remain the reclaim paths; D9's custody procedure remains binding for protected sources. PRD #3431 M1b settlement/deletion is implemented behind an off-by-default gate (amendment 2026-11-06 below), so production still grants it no authority unless an operator selects one canary worker (#4134), and #3329's genuine-idle reclaim roll remains deferred. No new reclaim authority is granted; see [ADR-837 D9](0837-worker-disk-lifecycle.md#d9--recycle-defaults-on-over-recorded-reviewer-dissent).
 
 ### D9. Availability residual: daemon-owned bytes on a custody-held worker (maintainer wording)
 
@@ -179,9 +179,11 @@ The issue made "rootless isolation is preserved" a merge condition. The maintain
 
 Refs [PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b. The first-process pod-epoch pass
 can now settle and delete a retained attempt clone under `/data/runner` (the `runner-shared`
-subPath), but only behind `EPOCH_RECLAIM_DELETION_ENABLED`, which is `false`. Until a
-separate owner activation co-sign, the D5, D8 and Consequences statements that automatic
-retention deletion stays off remain true in production. The mechanism is recorded in the
+subPath), but only behind the startup opt-in `UZI_EPOCH_RECLAIM_DELETION` (#4134
+replaced the compile-time constant), which the chart leaves off. The D5, D8 and
+Consequences statements that automatic retention deletion stays off remain true in
+production except on the one hosted Docker worker an operator selects with
+`workers.epochReclaim.deletionCanaryWorkerId`. The mechanism is recorded in the
 [ADR-1783 amendment of the same date](1783-run-quiescence-and-attempt-clone-paths.md).
 
 - **Scope.** Plain attempt sources in the admitted journal shapes only; protected sources,
@@ -207,7 +209,8 @@ sources and every other path under `runner-shared` are unchanged, and D9's custo
 binding. The amendment of 2026-11-06 above is unaffected.
 
 - **Gate.** `EPOCH_SCRATCH_DELETION_ENABLED` (`agent/src/pod-epoch-reclaim.ts`) is `false` and
-  independent of `EPOCH_RECLAIM_DELETION_ENABLED`: neither gate opens the other's phase. While it
+  independent of the attempt-deletion activation (`UZI_EPOCH_RECLAIM_DELETION`, the #4134 one-worker
+  canary): neither gate opens the other's phase. While it
   is off, startup runs no census, starts no new child and reads no new path. Activation needs a
   separate owner decision recorded on issue #4043; until then the D4, D5, D8 and Consequences
   statements remain true in production.

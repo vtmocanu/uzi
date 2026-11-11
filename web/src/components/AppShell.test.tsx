@@ -772,3 +772,80 @@ describe("the Admin item's health pip (PRD #1648 D9)", () => {
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
 });
+
+// Characterization of the desktop sidebar's full destination sequence (PRD #3875 M1
+// prefactor): label, href and section, in DOM order, for each viewer and rail state. The
+// nav definition is shared with the command menu, so this pins that extracting it kept
+// the sidebar byte-for-byte equivalent in structure. `section` is the index of the nav's
+// child block (Overview, Work, Factory, bottom cluster) because the collapsed rail drops
+// the group labels from the DOM.
+describe("AppShell sidebar destination sequence (characterization)", () => {
+  function sequence() {
+    const nav = document.querySelector("aside nav") as HTMLElement;
+    const sections = Array.from(nav.children);
+    return Array.from(nav.querySelectorAll("a")).map((a) => {
+      const label = a.getAttribute("title") ?? a.querySelector("span.truncate")?.textContent ?? "";
+      const section = sections.findIndex((s) => s.contains(a));
+      const heading = sections[section]?.querySelector("p")?.textContent ?? "";
+      return { label, href: a.getAttribute("href"), section, heading };
+    });
+  }
+
+  function asAdmin() {
+    const auth = vi.mocked(useAuth)();
+    vi.mocked(useAuth).mockReturnValue({ ...auth, user: { ...user, is_admin: true } });
+    mockApi.getAdminHealth.mockRejectedValue(new Error("no health"));
+  }
+
+  const memberExpanded = [
+    { label: "Overview", href: "/dashboard", section: 0, heading: "" },
+    { label: "Repos", href: "/repos", section: 1, heading: "Work" },
+    { label: "vtmocanu/uzi", href: "/repos/repo-uzi/board", section: 1, heading: "Work" },
+    { label: "vtmocanu/atlas", href: "/repos/repo-atlas/board", section: 1, heading: "Work" },
+    { label: "Runs", href: "/runs", section: 1, heading: "Work" },
+    { label: "Findings", href: "/findings", section: 1, heading: "Work" },
+    { label: "Schedules", href: "/schedules", section: 1, heading: "Work" },
+    { label: "Chat", href: "/chat", section: 1, heading: "Work" },
+    { label: "Agents", href: "/agents", section: 2, heading: "Factory" },
+    { label: "Skills", href: "/skills", section: 2, heading: "Factory" },
+    { label: "Workers", href: "/workers", section: 2, heading: "Factory" },
+    { label: "Judge", href: "/judge", section: 2, heading: "Factory" },
+    { label: "Settings", href: "/settings", section: 3, heading: "" },
+    { label: "Docs", href: "/docs", section: 3, heading: "" },
+  ];
+  const adminExpanded = [
+    ...memberExpanded.slice(0, 13),
+    { label: "Admin", href: "/admin", section: 3, heading: "" },
+    memberExpanded[13],
+  ];
+  const collapsedOf = (rows: typeof memberExpanded) =>
+    rows.filter((r) => !r.href?.endsWith("/board")).map((r) => ({ ...r, heading: "" }));
+
+  it("non-admin, expanded", async () => {
+    renderShell("/runs");
+    await screen.findByRole("link", { name: "vtmocanu/atlas" });
+    expect(sequence()).toEqual(memberExpanded);
+  });
+
+  it("admin, expanded", async () => {
+    asAdmin();
+    renderShell("/runs");
+    await screen.findByRole("link", { name: "vtmocanu/atlas" });
+    expect(sequence()).toEqual(adminExpanded);
+  });
+
+  it("non-admin, collapsed", async () => {
+    window.localStorage.setItem("uzi.sidebar.collapsed", "true");
+    renderShell("/runs");
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    expect(sequence()).toEqual(collapsedOf(memberExpanded));
+  });
+
+  it("admin, collapsed", async () => {
+    asAdmin();
+    window.localStorage.setItem("uzi.sidebar.collapsed", "true");
+    renderShell("/runs");
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    expect(sequence()).toEqual(collapsedOf(adminExpanded));
+  });
+});

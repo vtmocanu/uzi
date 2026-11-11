@@ -80,7 +80,7 @@ function prHrefOf(run: RunSummaryItem): string | null {
 
 type IconKind = "held" | DecisionKind;
 
-function KindIcon({ kind }: { kind: IconKind }) {
+export function KindIcon({ kind }: { kind: IconKind }) {
   const common = {
     viewBox: "0 0 24 24",
     fill: "none",

@@ -4,6 +4,7 @@ import { loadConfig, memoryGuardTimingOf, MAX_CONCURRENT_RUNS_SOFT_CEILING, type
 import { configureGoConcurrency } from "./go-concurrency.js";
 import { acquireWorkerLifetime } from "./authority-lock.js";
 import { installWorkerLifetime, requireWorkerLifetime } from "./completion-authority.js";
+import { establishProcessBoundary } from "./restore-boundary.js";
 import { AuthorityRuntime } from "./authority-runtime.js";
 import { createLogger, type Logger } from "./log.js";
 import { startMainWatchdog } from "./main-watchdog.js";
@@ -17,7 +18,7 @@ import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
-import { RunRunner, type ExecutorFactory, type RunExecution, type RunnerOptions } from "./runner.js";
+import { RunRunner, type ExecutorFactory, type RunExecution, type RunExecutorAddress, type RunnerOptions } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
@@ -46,7 +47,7 @@ import { RunDiskLocks } from "./run-disk-locks.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { DiskGovernor } from "./cache-cap.js";
 import { sampleVolume } from "./stats.js";
-import { errMessage } from "./util.js";
+import { errMessage, runDirKey } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from "./docker-wiring.js";
 import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
@@ -58,7 +59,7 @@ import type { CommandSandboxMode } from "./config.js";
 import { ensureRunnerTmpdir } from "./runner-tmpdir.js";
 import { createPodEpoch, restoreEpochRuntimeTmpdir } from "./pod-epoch-lock.js";
 import { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
-import { PodEpochSettlementError, runPodEpochShadow, type PodEpochDeletionDeps, type PodEpochScratchDeps } from "./pod-epoch-reclaim.js";
+import { PodEpochSettlementError, readEpochReclaimDeletionActivation, runPodEpochShadow, type PodEpochDeletionDeps, type PodEpochScratchDeps } from "./pod-epoch-reclaim.js";
 import { armShutdownResultDeadline, finishWorkerShutdown, type ShutdownGate, type ShutdownLog } from "./shutdown-barrier.js";
 
 export function buildWorkerGitCache(
@@ -94,8 +95,9 @@ export function buildAfterPublicationEnrolled(
 }
 
 /**
- * The production dependencies of the pod-epoch deletion phase. The phase stays inert while
- * EPOCH_RECLAIM_DELETION_ENABLED is false; this only binds what it will use. It carries no activation override.
+ * The production dependencies of the pod-epoch deletion phase. The phase stays inert unless `activation` (the
+ * startup opt-in parsed by readEpochReclaimDeletionActivation) is true; this binds what it will use. It carries
+ * no test override.
  * `quiesce` is the worker-wide deny-only capture-mode proof: it never tears down Docker or retains a source boundary.
  */
 export function buildPodEpochDeletionDeps(parts: {
@@ -103,8 +105,11 @@ export function buildPodEpochDeletionDeps(parts: {
   runner: Pick<RunRunner, "withSourceReservation">;
   git: PodEpochDeletionDeps["git"];
   dockerHost: string | undefined;
+  /** The startup opt-in; absent means off. */
+  activation?: boolean;
 }): PodEpochDeletionDeps {
   return {
+    activation: parts.activation === true,
     authority: parts.authority,
     reserve: (runId, action) => parts.runner.withSourceReservation(runId, action),
     quiesce: () => terminalMaintenanceProof(3, parts.dockerHost),
@@ -297,7 +302,9 @@ export function buildIsolatedExecutor(deps: { log: Logger; executorKind: Executo
   });
 }
 
-export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps): RunExecution {
+export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps, addr: RunExecutorAddress = {}): RunExecution {
+  const dirKey = runDirKey(runId, addr.generation);
+  const keyOpt = addr.generation === undefined ? {} : { dirKey };
   const { log, client, sdkHomeRoot, executorKind, stubPlanGate, workerTokenFile, dockerWiring, codexCommandSandbox, codexSandboxDegraded } = deps;
   let selection;
   try {
@@ -335,7 +342,7 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
   if (selection.kind === "codex") {
     // A validated Codex binding: the production CodexExecutor over the M3a launcher, the
     // dark core and the M1 credential bridge. Per-run owned HOME (like SdkExecutor).
-    const runHome = path.join(sdkHomeRoot, runId);
+    const runHome = path.join(sdkHomeRoot, dirKey);
     const executor = new CodexExecutor(
       log,
       runHome,
@@ -351,6 +358,7 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
         // materializes the per-run HOME with the wrong gid. provisionRoot takes its
         // computed default (path.dirname(provisionHomeDir)/provision).
         provisionHomeDir: sdkHomeRoot,
+        ...keyOpt,
         dockerWiring,
         // PRD #1493 M3: the worker-configured command-sandbox mode (never run/repo/model
         // input). Threaded into commandSandboxArgv's `--mode` token; degraded drives the
@@ -373,8 +381,9 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
   }
 
   // selection.kind === "claude": the EXACT legacy path, unchanged.
-  const runHome = path.join(sdkHomeRoot, runId);
+  const runHome = path.join(sdkHomeRoot, dirKey);
   const executor = new SdkExecutor(log, runHome, {
+    ...keyOpt,
     // Deny a Bash `cat` of the join-token file (a read-only secret mount
     // persists it); the built-in /run/secrets/ prefix already covers the
     // shipping default, this adds a non-default UZI_WORKER_TOKEN_FILE path AND its
@@ -393,6 +402,12 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
     client,
   });
   return { executor, homeDir: runHome };
+}
+
+/** The run lane's executor factory: {@link buildRunExecutor} bound to this process's deps. The optional third argument is the
+ *  per-attempt address (issue #3644); the runner's restore decision rebuilds the executor with it. */
+export function makeRunExecutorFactory(deps: BuildRunExecutorDeps): (runId: string, codex?: ClaimCodexSecrets, addr?: RunExecutorAddress) => RunExecution {
+  return (runId, codex, addr) => buildRunExecutor(runId, codex, deps, addr);
 }
 
 async function main(): Promise<void> {
@@ -454,6 +469,7 @@ async function mainBody(): Promise<void> {
   if (process.env.UZI_EPOCH_LOCK !== undefined && process.env.UZI_EPOCH_LOCK !== "1") {
     throw new Error("UZI_EPOCH_LOCK must be unset or 1");
   }
+  const epochReclaimDeletion = readEpochReclaimDeletionActivation(process.env);
   const epochEnabled = process.env.UZI_EPOCH_LOCK === "1";
   if (epochEnabled && process.env.UZI_DATA_DIR !== "/data") {
     throw new Error("epoch workers require UZI_DATA_DIR=/data");
@@ -491,6 +507,7 @@ async function mainBody(): Promise<void> {
   if (epochOwnership) log.info("pod epoch participation", {
     mode: epochOwnership.mode, consumption: epochConsumption?.result,
   });
+  if (epochOwnership) log.info("pod_epoch_reclaim_activation", { deletion_requested: epochReclaimDeletion });
   // Issue #3382: optional Go build concurrency defaults for every scrubbed command env.
   configureGoConcurrency(config.goConcurrency);
   log.info("go concurrency defaults", {
@@ -509,6 +526,12 @@ async function mainBody(): Promise<void> {
   // descriptor is retained for the whole process; nothing here can release it.
   installWorkerLifetime(await acquireWorkerLifetime(config.dataDir, { signal: controller.signal }));
   log.info("worker lifetime lock acquired");
+  // Issue #3644 Gate B: the write-once boundary record (hostname cross-check for compose). A failure never
+  // crashes startup; it disables independent restore for this process and successors refuse at R2.
+  const boundary = await establishProcessBoundary({ dataDir: config.dataDir, workerToken: config.workerToken,
+    podUid: process.env.UZI_POD_UID, ...(process.env.UZI_POD_CONTAINER ? { container: process.env.UZI_POD_CONTAINER } : {}) });
+  if (boundary.ok) log.info("restore boundary record written", { slot: boundary.record.slot.kind });
+  else log.warn("restore boundary record not written; independent restore disabled", { reason: boundary.reason });
 
   // Issue #3153: when TMPDIR lives under the (now persistent) `<dataDir>/runner`, confirm it is a
   // real, worker-owned, writable directory BEFORE anything uses a temp path. A symlink or
@@ -712,20 +735,21 @@ async function mainBody(): Promise<void> {
   // Codex/SdkExecutor wiring) lives in the top-level `buildRunExecutor` above,
   // factored out so a test can call it directly. This closure only binds it to
   // this process's live config/log/client/sdkHomeRoot.
-  const makeExecutor: ExecutorFactory = (runId, codex) =>
-    buildRunExecutor(runId, codex, {
-      log,
-      client,
-      sdkHomeRoot,
-      executorKind: config.executor,
-      codexAdviceHarnessFactory,
-      stubPlanGate: config.stubPlanGate,
-      workerTokenFile: config.workerTokenFile,
-      dockerWiring: config.dockerWiring,
-      codexCommandSandbox: config.codexCommandSandbox,
-      codexSandboxDegraded: config.codexHarness.degraded,
-      codexCommandCacheRunBytes: config.codexCommandCacheRunBytes,
-    });
+  // Built once, on first use: `codexAdviceHarnessFactory` below is declared after this closure.
+  let runExecutorFactory: ExecutorFactory | undefined;
+  const makeExecutor: ExecutorFactory = (runId, codex, addr?: RunExecutorAddress) => (runExecutorFactory ??= makeRunExecutorFactory({
+    log,
+    client,
+    sdkHomeRoot,
+    executorKind: config.executor,
+    codexAdviceHarnessFactory,
+    stubPlanGate: config.stubPlanGate,
+    workerTokenFile: config.workerTokenFile,
+    dockerWiring: config.dockerWiring,
+    codexCommandSandbox: config.codexCommandSandbox,
+    codexSandboxDegraded: config.codexHarness.degraded,
+    codexCommandCacheRunBytes: config.codexCommandCacheRunBytes,
+  }))(runId, codex, addr);
   // PRD #1429 M3: the Codex advice-harness factory judge/review thread into
   // runReadOnlyModelPass (model-pass.ts) so a Codex judge/review claim (secrets.codex
   // present) gets a REAL Codex advice pass instead of the missing-token fallback. PRD #1798 M5
@@ -1167,7 +1191,7 @@ async function mainBody(): Promise<void> {
     const result = await runPodEpochShadow({
       bootstrap: epochBootstrap, ownership: epochOwnership, consumption: epochConsumption,
       dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal, log,
-      deletion: buildPodEpochDeletionDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost }),
+      deletion: buildPodEpochDeletionDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost, activation: epochReclaimDeletion }),
       scratch: buildPodEpochScratchDeps({ git, dockerHost: config.dockerWiring.dockerHost }),
     });
     if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });

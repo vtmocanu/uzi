@@ -199,7 +199,7 @@ test("the production scratch gate is closed, separate from the attempt gate, and
   assert.equal(definition.match(/scratchTestGate\s*===\s*TEST_SCRATCH_GATE\b/g)?.length, 2, "the gate and the seams are tied to the sentinel");
   assert.equal(definition.match(/TEST_SCRATCH_GATE\b/g)?.length, 3, "the sentinel is defined once and compared twice");
   assert.equal(definition.match(/export const EPOCH_SCRATCH_DELETION_ENABLED: boolean = false;/g)?.length, 1);
-  assert.equal(definition.match(/export const EPOCH_RECLAIM_DELETION_ENABLED: boolean = false;/g)?.length, 1);
+  assert.ok(!definition.includes("EPOCH_RECLAIM_DELETION_ENABLED"), "the attempt phase uses the #4134 startup activation, not a constant");
   const built = buildPodEpochScratchDeps({ git: {} as never, dockerHost: undefined });
   assert.deepEqual(Object.keys(built).sort(), ["git", "quiesce"]);
 });

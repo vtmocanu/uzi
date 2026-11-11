@@ -143,7 +143,11 @@ shift  # drop --e2e-sanitized; safe — this line is reached only when $1 held i
 # the rootless DinD sidecar (dind + dind-init) alongside the worker and runs the
 # docker-capable PHASE at the end: sidecar reachability + a toy `docker compose up` + the
 # LIVE Decision-3 efficacy test (a sidecar container cannot read the worker's join token).
-# The default (no args) is BYTE-IDENTICAL to before. Args survive the env -i re-exec above
+# The flag only drives phase 49 and brings the sidecar services into the compose profile set. Phases 45
+# and 52 (#3644) do NOT depend on it: they wire the sidecar themselves (docker_wire_prepare /
+# docker_wire_assert in lib.sh) for their attempt-shaped kill scenarios and restore the entry Docker
+# posture afterwards (docker_restore_posture), so the nightly no-arg run exercises them too.
+# Without the flag the stack's agent wiring is otherwise unchanged. Args survive the env -i re-exec above
 # (they ride after --e2e-sanitized). No env knob is used, so nothing new enters the
 # compose-read env — the sidecar is opt-in purely by this flag + the compose profile.
 DOCKER_PROFILE=""

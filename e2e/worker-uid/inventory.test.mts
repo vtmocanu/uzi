@@ -174,6 +174,62 @@ test("retained recovery inventory requires every literal real-UID permission pro
   }
 });
 
+const stoppedSourceTitles = [
+  "is not covered for a nonignored untracked directory the runner cannot read",
+  "is not covered for a modified tracked file inside a tracked directory the runner cannot read",
+  "is not covered for a nonignored directory private to the command uid",
+  "is not covered for a runner-unreadable loose ref naming a commit only the clone holds",
+  "stays covered for a stat-dirty tracked file whose content is unchanged",
+  "stays covered for an unreadable directory matched by a committed gitignore",
+  "stays covered for an unreadable directory matched by the clone info exclude",
+  "retains conservatively when Git warns about a benign deprecated config key",
+];
+test("stopped-source unreadable-entry inventory requires every literal real-UID proof", () => {
+  mkdirSync(path.join(repo, ".uzi/scratch"), { recursive: true });
+  const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/stopped-source-inventory."));
+  const api = new API({ cwd: scratch });
+  const stoppedFile = "agent/test/stopped-source-unreadable-uid.test.ts";
+  const suite = "stopped-source legacy proof with entries the runner cannot read";
+  const declarations = stoppedSourceTitles.map(name => `it(${JSON.stringify(name)}, async () => {});`);
+  const wrap = (body: string, gate = true) =>
+    `describe(${JSON.stringify(suite)}, ${gate ? "{ skip: INIT_SKIP }, " : ""}() => { ${body} });`;
+  try {
+    const fixtures: { name: string; source: string; error?: RegExp }[] = [
+      { name: "literal", source: wrap(declarations.join("\n")) },
+      { name: "actual", source: readFileSync(path.join(repo, stoppedFile), "utf8") },
+      { name: "duplicate", source: wrap([...declarations, declarations[0]!].join("\n")), error: /duplicate source leaf/ },
+      { name: "nested", source: wrap('describe("nested", () => {' + declarations.join("\n") + '});'), error: /missing required literal stopped-source/ },
+      { name: "ungated", source: wrap(declarations.join("\n"), false), error: /expected one UID gate/ },
+    ];
+    for (let index = 0; index < declarations.length; index++) {
+      for (const mutation of ["missing", "renamed", "nonliteral"] as const) {
+        const changed = [...declarations];
+        if (mutation === "missing") changed.splice(index, 1);
+        else changed[index] = `it(${JSON.stringify(stoppedSourceTitles[index]! + (mutation === "renamed" ? " changed" : ""))}${mutation === "nonliteral" ? ' + ""' : ""}, async () => {});`;
+        fixtures.push({ name: `${mutation}-${index}`, source: wrap(changed.join("\n")),
+          error: mutation === "nonliteral" ? /nonliteral targeted/ : /missing required literal stopped-source/ });
+      }
+    }
+    writeFileSync(path.join(scratch, "tsconfig.json"), JSON.stringify({ files: fixtures.map(f => f.name + ".mts") }));
+    for (const fixture of fixtures) writeFileSync(path.join(scratch, fixture.name + ".mts"), fixture.source);
+    const program = api.updateSnapshot({ openProjects: [path.join(scratch, "tsconfig.json")] }).getProjects()[0].program;
+    const wanted = stoppedSourceTitles.map(name => ({ file: stoppedFile, names: [suite, name] }));
+    for (const fixture of fixtures) {
+      const filename = path.join(scratch, fixture.name + ".mts");
+      assert.equal(program.getSyntacticDiagnostics(filename).length, 0, fixture.name);
+      const collect = () => inventoryForSource(program.getSourceFile(filename), "stopped-source-unreadable-uid");
+      if (fixture.error) assert.throws(collect, fixture.error, fixture.name);
+      else assert.deepEqual(collect(), wanted, fixture.name);
+    }
+    const actual = JSON.parse(execFileSync(process.execPath,
+      [path.join(repo, "e2e/worker-uid/inventory.mjs")], { cwd: repo, encoding: "utf8" }));
+    assert.deepEqual(actual.filter((item: { file: string }) => item.file === stoppedFile), wanted);
+  } finally {
+    api.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 const claudeFile = "e2e/worker-uid/claude-command-real.test.mts";
 const claudeSuite = "real Claude guarded command lane";
 const claudeTitles = [

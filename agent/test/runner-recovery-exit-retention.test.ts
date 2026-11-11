@@ -685,6 +685,62 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
     assertRecoverable(r.clone(), late!, "row 8 transient");
   });
 
+  describe("a terminal park ACK over content Git warned about on stderr (#4141)", () => {
+    const ROOT_SKIP = LINUX_CAPTURE || (process.getuid?.() === 0 ? "root bypasses mode-000 permission checks" : false);
+
+    /** Run the transient rig with a terminal ACK for the park report; `setup` runs right after the verified capture. */
+    async function terminalAck(t: TestContext, iid: number, setup?: (wt: string) => void) {
+      const r = transientRig(iid);
+      type Flight = { preserveRecoveryClone?: boolean };
+      const seam = r.runner as unknown as { buildFlight(...args: unknown[]): Flight };
+      const build = seam.buildFlight.bind(r.runner);
+      let flight: Flight | undefined;
+      t.mock.method(seam, "buildFlight", (...args: unknown[]) => flight = build(...args));
+      const report = client.reportState.bind(client);
+      client.reportState = async (runId, body, signal) => (body.status === "recovery_wait"
+        ? ({ applied: true, status: "failed" } as never) : report(runId, body, signal));
+      const hook = setup ? afterVerifiedCapture(setup) : undefined;
+      try {
+        await r.runner.execute(r.claim);
+      } finally {
+        hook?.restore();
+        client.reportState = report;
+      }
+      return { r, flight: flight! };
+    }
+
+    it("an unreadable nonignored directory created after the capture keeps the clone", { skip: ROOT_SKIP }, async (t) => {
+      const iid = 17940;
+      let secret = "";
+      const { r, flight } = await terminalAck(t, iid, (wt) => {
+        secret = path.join(wt, "secret");
+        fs.mkdirSync(secret);
+        fs.writeFileSync(path.join(secret, "key.txt"), "worker-only\n");
+        fs.chmodSync(secret, 0o000);
+      });
+      try {
+        assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack_terminal"]);
+        const line = (r.lines as Array<{ msg?: string; proof?: string; coverage?: string }>)
+          .find((l) => l.msg === "source kept without a stopped-source record (park or terminal exit); a resume recaptures it");
+        assert.equal(line?.proof, "quiescent");
+        assert.equal(line?.coverage, "not_covered");
+        assert.ok(fs.existsSync(r.clone()), "the clone is retained");
+        assert.equal(flight.preserveRecoveryClone, true);
+        assert.equal(journalCount(iid), 1, "the plain journal stays");
+        assert.deepEqual(stopMarkers(r.claim.run_id), []);
+      } finally {
+        if (secret !== "" && fs.existsSync(secret)) fs.chmodSync(secret, 0o700);
+      }
+    });
+
+    it("control: the same terminal ACK with no unreadable directory releases the covered clone", { skip: LINUX_CAPTURE }, async (t) => {
+      const { r } = await terminalAck(t, 17941);
+      assert.deepEqual(coveredReasons(r.lines), ["recovery_park_ack_terminal"]);
+      assert.deepEqual(keptReasons(r.lines), []);
+      assert.equal(fs.existsSync(r.clone()), false, "terminal coverage releases the clone");
+    });
+  });
+
   it("operator inspect pins what a park keeps: an attempt clone is listed through its ledger entry, a canonical clone kept under its plain journal is listed too and is discardable only on a terminal server lifecycle", async () => {
     // Both parks commit in the "same second": their pins must still be their own (#3131).
     const { attempt, canonical } = await withSameSecondCommits(async () => {

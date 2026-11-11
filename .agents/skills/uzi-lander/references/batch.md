@@ -76,6 +76,30 @@ but rebase serially: land-prep one PR, merge it, then the next (SKILL.md step 5)
 re-push the whole held batch, since every merge stales the rest again. Watch post-merge CI per
 SKILL.md step 7; a `cancelled` run under a newer merge is supersession, not red.
 
+## 4a. Fast merge mode (backlog clearing, on the user's word)
+
+Use only when the user asks to clear a backlog fast; it replaces per-PR fresh CI on the
+current `main` with one `main` CI per batch, fixing forward. Releases still gate on a green tip.
+
+- **Per PR**: review lane done; one green PR CI run on the reviewed pushed head (its base may be
+  stale); `MERGEABLE` (no conflict); migrations renumbered and `task check:migration-numbering`
+  run locally. A PR adding a migration or touching data integrity also needs the
+  `test-codex-refresh-lostreply-e2e` job's `LiveDB: N passed, 0 skipped` line on that head (SKILL.md step 5).
+- **Batch**: 4-5 PRs, one per area. Two `agent/**` PRs may pair when their tests and jobs
+  are separable. If both touch the worker image or packaged runtime, dispatch
+  `gh workflow run codex-packaged-proof.yml --ref main` after both merge, confirm the run's
+  `headSha` is the combined batch SHA (or a descendant), and watch it with `main` CI; a red counts below.
+- **Order**: PRs without infra deltas before PRs with one (an infra delta re-runs the others' CI).
+  Within each group, large or conflict-prone PRs first: rebasing a small PR onto a large one is
+  cheap, the reverse re-conflicts the large one per merge. Give a large PR at most one separable
+  small companion so a red stays attributable.
+- **After each batch**: one `main` CI run; the next batch may merge while it runs. Red: rerun a
+  known flake, or fix forward / revert the culprit in parallel. A second unresolved red pauses merges.
+- **Single, never batched**: trust-boundary PRs (own CI plus `e2e.yml` on the exact head).
+- **CI hygiene**: cancel runs that no longer decide anything: exact-head runs of PRs already merged
+  under this mode, and an older `main` run once a newer descendant `main` run covers it. Never cancel
+  a required packaged proof, trust-boundary CI or `e2e.yml`, a LiveDB job above, or a run another owner relies on.
+
 ## 5. Report-only runs whose issue could now be closed
 
 Not every delivery is a PR: a run can finish `completed` with `report_only=true` and no PR

@@ -923,7 +923,12 @@ type RunDTO struct {
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
 	// predecessor remediation record refused source use (in the remediation case the agent did
-	// not start and nothing was adopted or touched). Local work and custody are preserved, and
+	// not start and nothing was adopted or touched). Since issue #3644 it also marks an
+	// independent restore refused before any source effect because this release does not
+	// support the predecessor (an attempt-less canonical-path predecessor, a plain predecessor met
+	// by a hosted worker, or one with no boundary record), when the route's earlier checks
+	// pass: no adoption was attempted, no adoption_failed blocker was persisted and no
+	// quiescence was proven. Local work and custody are preserved, and
 	// only the owner can Resume or Cancel, without automatic retry.
 	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
 	// continuation was never witnessed starting: the claim is released, retained work and custody
@@ -1826,7 +1831,12 @@ type RunSummaryItemDTO struct {
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
 	// predecessor remediation record refused source use (in the remediation case the agent did
-	// not start and nothing was adopted or touched). Local work and custody are preserved, and
+	// not start and nothing was adopted or touched). Since issue #3644 it also marks an
+	// independent restore refused before any source effect because this release does not
+	// support the predecessor (an attempt-less canonical-path predecessor, a plain predecessor met
+	// by a hosted worker, or one with no boundary record), when the route's earlier checks
+	// pass: no adoption was attempted, no adoption_failed blocker was persisted and no
+	// quiescence was proven. Local work and custody are preserved, and
 	// only the owner can Resume or Cancel, without automatic retry.
 	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
 	// continuation was never witnessed starting: the claim is released, retained work and custody

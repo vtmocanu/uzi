@@ -53,7 +53,7 @@ function contract(text: string): void {
   // authority, runner and Git cache without a test activation override.
   assert.ok(at("const runner = new RunRunner(") < shadow, "the RunRunner exists before the pass");
   assert.match(main.slice(shadow, admission),
-    /deletion: buildPodEpochDeletionDeps\(\{ authority, runner, git, dockerHost: config.dockerWiring.dockerHost \}\)/,
+    /deletion: buildPodEpochDeletionDeps\(\{ authority, runner, git, dockerHost: config.dockerWiring.dockerHost, activation: epochReclaimDeletion \}\)/,
     "the pass receives the production deletion dependencies");
   assert.ok(!main.includes("enableForTest"), "main never passes the deletion test override");
   // The scratch dependencies are passed after the runtime TMPDIR was restored (restore < shadow above) and
@@ -192,7 +192,7 @@ function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<un
     finishShutdown: async () => { events.push("shutdown"); return { result: "drained", exitCode: 0 }; },
     epochBootstrap: {}, epochOwnership: {}, epochConsumption: {},
     config: { dockerWiring: { dockerHost: "unix:///docker.sock" } }, git: {}, client: {},
-    authority: {}, runner: {},
+    authority: {}, runner: {}, epochReclaimDeletion: false,
     buildPodEpochDeletionDeps: (parts: Record<string, unknown>) => ({ built: parts }),
     buildPodEpochScratchDeps: (parts: Record<string, unknown>) => ({ built: parts }),
     runPodEpochShadow: shadow,
@@ -218,6 +218,7 @@ test("main waits for shadow handover, forwards its ports and logs a defined verd
     assert.equal(built.runner, fixture.ports.runner);
     assert.equal(built.git, fixture.ports.git);
     assert.equal(built.dockerHost, "unix:///docker.sock");
+    assert.equal(built.activation, fixture.ports.epochReclaimDeletion);
     const scratch = (options.scratch as { built: Record<string, unknown> }).built;
     assert.deepEqual(Object.keys(scratch).sort(), ["dockerHost", "git"]);
     assert.equal(scratch.git, fixture.ports.git);
@@ -304,8 +305,10 @@ test("the deletion dependencies main builds bind the runner reservation, never c
   const runner = {
     withSourceReservation: async (...args: unknown[]) => { calls.push(args); return "reserved"; },
   };
-  const deps = buildPodEpochDeletionDeps({ authority: authority as never, runner: runner as never, git: git as never, dockerHost: undefined });
-  assert.deepEqual(Object.keys(deps).sort(), ["authority", "git", "quiesce", "reserve"], "no enableForTest key");
+  const deps = buildPodEpochDeletionDeps({ authority: authority as never, runner: runner as never, git: git as never, dockerHost: undefined, activation: true });
+  assert.deepEqual(Object.keys(deps).sort(), ["activation", "authority", "git", "quiesce", "reserve"], "no enableForTest key");
+  assert.equal(deps.activation, true);
+  assert.equal(buildPodEpochDeletionDeps({ authority: authority as never, runner: runner as never, git: git as never, dockerHost: undefined, activation: false }).activation, false);
   assert.equal(deps.authority, authority);
   assert.equal(deps.git, git);
   const action = async () => 1;
