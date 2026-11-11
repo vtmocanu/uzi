@@ -20,16 +20,27 @@ ci=${1:-.github/workflows/ci.yml}
 pkg=${2:-web/package.json}
 repo=mcr.microsoft.com/playwright
 
+# Only jobs.test-web-browser.container.image counts: the job block runs from its
+# two-space key to the next two-space key. Exactly one `image:` line may sit in it,
+# and it must be the Playwright image, so a matching image in another job cannot
+# read as parity.
 image=$(awk -v repo="$repo" '
-  { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
-  index(line, "image: " repo ":") == 1 { n++; v = substr(line, length("image: " repo ":") + 1) }
+  /^  [^ #]/ { injob = ($0 ~ /^  test-web-browser:[ \t]*$/) }
+  injob {
+    line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+    if (index(line, "image:") == 1) {
+      n++; ref = substr(line, 7); sub(/^[ \t]+/, "", ref)
+      if (index(ref, repo ":") != 1) exit 1
+      v = substr(ref, length(repo) + 2)
+    }
+  }
   END {
     if (n != 1) exit 1
     if (v !~ /^v[0-9]+\.[0-9]+\.[0-9]+-[a-z]+@sha256:[0-9a-f]+$/) exit 1
     if (length(v) - index(v, "@sha256:") - 7 != 64) exit 1
     print v
   }' "$ci") || {
-  echo "check-playwright-image-parity: expected exactly one 'image: $repo:v<x.y.z>-<distro>@sha256:<64 hex>' line in $ci" >&2
+  echo "check-playwright-image-parity: expected exactly one 'image: $repo:v<x.y.z>-<distro>@sha256:<64 hex>' line in $ci's test-web-browser job" >&2
   exit 2
 }
 

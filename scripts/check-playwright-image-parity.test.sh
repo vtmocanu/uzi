@@ -19,9 +19,10 @@ fail() {
 
 D=2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
 
-# check <case> <expected-rc> <ci container lines> <package.json devDependency lines>
+# check <case> <expected-rc> <test-web-browser container lines> <package.json devDependency lines> [<other job container lines>]
 check() {
-  printf 'jobs:\n  t:\n    container:\n%s\n' "$3" > "$TMP/$1.ci.yml"
+  printf 'jobs:\n  test-web:\n    container:\n%s\n  test-web-browser:\n    container:\n%s\n  test-agent:\n    runs-on: ubuntu-latest\n' \
+    "${5:-      image: node:26}" "$3" > "$TMP/$1.ci.yml"
   printf '{\n  "devDependencies": {\n%s\n  }\n}\n' "$4" > "$TMP/$1.package.json"
   rc=0
   "$SUT" "$TMP/$1.ci.yml" "$TMP/$1.package.json" > "$TMP/$1.out" 2>&1 || rc=$?
@@ -43,6 +44,10 @@ check range    2 "$IMG" '    "playwright": "^1.64.1"'
 check nopw     2 "$IMG" '    "vitest": "4.1.12"'
 check twopw    2 "$IMG" "$PW,
 $PW"
+# The image must be in test-web-browser itself: a matching one in another job is no parity.
+check otherjob 2 "      image: ubuntu:24.04" "$PW" "$IMG"
+check onlyother 2 "      options: --ipc=host" "$PW" "$IMG"
+check bothjobs 0 "$IMG" "$PW" "$IMG"
 # @vitest/browser-playwright must not count as the playwright pin.
 check vitestpw 0 "$IMG" '    "@vitest/browser-playwright": "4.1.12",
     "playwright": "1.64.1"'
