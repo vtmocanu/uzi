@@ -332,6 +332,47 @@ EOF
 
 # --plan is deliberately before every fetch, index edit and release mutation.
 # Scratch snapshots use the cutter's existing bounded validators and clean traps.
+# The assertion records a maintainer's adoption read, not a review performed by CI.
+# Read only regular blobs at the pinned commit; never execute assertion/lock content.
+codex_adoption_record_matches() {
+  python3 -I - "$1" <<'PY'
+import hashlib
+import re
+import subprocess
+import sys
+
+
+def blob(path):
+    entry = subprocess.check_output(
+        ["git", "ls-tree", "-z", sys.argv[1], "--", path], stderr=subprocess.DEVNULL
+    )
+    metadata, name = entry.removesuffix(b"\0").split(b"\t")
+    mode, kind, oid = metadata.split(b" ")
+    if mode != b"100644" or kind != b"blob" or name != path.encode():
+        raise ValueError("expected a committed regular file")
+    return subprocess.check_output(
+        ["git", "cat-file", "blob", oid.decode("ascii")], stderr=subprocess.DEVNULL
+    )
+
+
+try:
+    lock = blob("agent/codex/codex-package.lock")
+    record = blob("agent/codex/codex-package.adopted")
+    fields = re.fullmatch(
+        rb"lock-sha256=([0-9a-f]{64})\nruntime-tag=(rust-v[0-9]+\.[0-9]+\.[0-9]+)\n",
+        record,
+    )
+    tags = [line.removeprefix(b"CODEX_TAG=") for line in lock.split(b"\n")
+            if line.startswith(b"CODEX_TAG=")]
+    valid = (fields is not None and len(tags) == 1
+             and fields[1] == hashlib.sha256(lock).hexdigest().encode("ascii")
+             and fields[2] == tags[0])
+except (OSError, ValueError, subprocess.SubprocessError):
+    valid = False
+sys.exit(0 if valid else 1)
+PY
+}
+
 release_plan() (
   export GIT_OPTIONAL_LOCKS=0
   git() { command git -c core.fsmonitor=false "$@"; }
@@ -382,13 +423,13 @@ release_plan() (
     fi
     tag="v$base-rc.1"; op='new-base'
   fi
-  # Adoption still needs a local review/cut. Check before the publication refusal,
-  # which an explicitly authorized supersede may lift in the CI orchestrator.
+  # Adoption requires a matching committed assertion, or a local cut. Check before
+  # the publication refusal, which authorized supersede may lift independently.
   git diff --quiet --no-ext-diff --no-textconv "$previous" "$head" -- agent/codex/codex-package.lock
   runtime_rc=$?
   case "$runtime_rc" in
     0) : ;;
-    1) block_plan codex-runtime-needs-local-cut ;;
+    1) codex_adoption_record_matches "$head" || block_plan codex-runtime-needs-local-cut ;;
     *) return 2 ;;
   esac
   # Check the previous publication even for a zero-delta scheduled attempt.
