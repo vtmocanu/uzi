@@ -59,7 +59,7 @@ import type { CommandSandboxMode } from "./config.js";
 import { ensureRunnerTmpdir } from "./runner-tmpdir.js";
 import { createPodEpoch, restoreEpochRuntimeTmpdir } from "./pod-epoch-lock.js";
 import { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
-import { PodEpochSettlementError, readEpochReclaimDeletionActivation, runPodEpochShadow, type PodEpochDeletionDeps } from "./pod-epoch-reclaim.js";
+import { PodEpochSettlementError, readEpochReclaimDeletionActivation, runPodEpochShadow, type PodEpochDeletionDeps, type PodEpochScratchDeps } from "./pod-epoch-reclaim.js";
 import { armShutdownResultDeadline, finishWorkerShutdown, type ShutdownGate, type ShutdownLog } from "./shutdown-barrier.js";
 
 export function buildWorkerGitCache(
@@ -115,6 +115,18 @@ export function buildPodEpochDeletionDeps(parts: {
     quiesce: () => terminalMaintenanceProof(3, parts.dockerHost),
     git: parts.git,
   };
+}
+
+/**
+ * The production dependencies of the pod-epoch runner-scratch reclaim (issue #4043). The phase stays inert while
+ * EPOCH_SCRATCH_DELETION_ENABLED is false; this only binds what it will use. It carries no activation override
+ * and no test seam.
+ */
+export function buildPodEpochScratchDeps(parts: {
+  git: PodEpochScratchDeps["git"];
+  dockerHost: string | undefined;
+}): PodEpochScratchDeps {
+  return { git: parts.git, quiesce: () => terminalMaintenanceProof(3, parts.dockerHost) };
 }
 
 /** Only the stub lane may accelerate retry spacing. No predicates or pass cap change. */
@@ -1180,6 +1192,7 @@ async function mainBody(): Promise<void> {
       bootstrap: epochBootstrap, ownership: epochOwnership, consumption: epochConsumption,
       dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal, log,
       deletion: buildPodEpochDeletionDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost, activation: epochReclaimDeletion }),
+      scratch: buildPodEpochScratchDeps({ git, dockerHost: config.dockerWiring.dockerHost }),
     });
     if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });
   }

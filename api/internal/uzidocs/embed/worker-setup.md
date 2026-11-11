@@ -325,6 +325,31 @@ does not count toward cache bytes, only toward the run HOME's size. Old
 shared `go-build*` residue in `TMPDIR` is not collected. See the
 [ADR-1809 amendment](../adr/1809-per-run-cache-bounds.md#amendment-3870-park-only-go-scratch).
 
+**Runner `TMPDIR` scratch reclaim (#4043) is dark.** The
+[pod-epoch reclaim pass](worker-docker.md#pod-epoch-shadow-reclaim) carries a
+scratch phase for orphaned top-level directories under the runner `TMPDIR`
+(`/data/runner/.tmp/uzi-runner` on a split-UID worker, `/data/runner/.tmp` on a
+single-UID one). It sits behind its own default-off constant,
+`EPOCH_SCRATCH_DELETION_ENABLED`, independent of the attempt-deletion gate, and
+it is off in every shipped build: no census runs, no child process starts and
+nothing is deleted. The only visible change is a `scratch` object on the
+`pod_epoch_reclaim` log line that reads `state: "not_run"`. Do not expect
+`TMPDIR` scratch to be reclaimed yet; a full data volume still relies on the
+paths above. When an owner enables the phase, it acts only at a verified pod
+epoch and removes only leaves that pass every epoch admission check, subject to
+the residual risks recorded in ADR-3153 (for example a historical-pod writer the
+checks cannot exclude) and the owner's activation decision. The `scratch`
+object then reports `state` and `reason` (fixed tokens), `layout`, the counts
+`examined`, `kept` by reason, `eligible` (admitted at census time; a leaf
+demoted before its delete is also counted under `kept`), `deleted`, `residue`
+and `helper_failed`, and the flags `estimate_partial`, `list_overflow` and
+`not_idle_after`. The byte figures `eligible_allocated_bytes_estimate`,
+`deleted_allocated_bytes_estimate` and `shared_bytes` (hard-linked files) come
+from allocated blocks, and `statfs_free_delta_unattributed` is the change in
+available bytes across the delete loop from all writers, so none of them proves
+that storage was freed (`reclaim_bytes_state` reads `estimated` or `unknown`).
+Activation and hosted before/after-byte acceptance are pending owner decisions.
+
 **The [disk self-heal recycle](hosted-workers.md#disk-self-heal) (PRD #837)
 remains a last resort on plain hosted workers**, where sustained pressure can
 drain and recycle nix/data, losing everything on `/data`. After the fixed #3852
