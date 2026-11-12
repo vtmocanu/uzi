@@ -1204,3 +1204,79 @@ proof is absent; the resulting “enrollment disappeared” refusal is intention
 The incident's attribution remains partly unresolved; this decision does not
 establish that a specific failure caused the observed incident. Existing
 zero-denial repair and fleet investigation remain outside this change.
+
+## Amendment 2026-11-12 — launch-round lock-wait retry (#4246)
+
+A startup run failed terminally when a launch-round wait on the worker's shared
+bare-repo lock aborted before acquisition ("permit-held git lock wait aborted:
+boundary deadline exceeded"). Two launch rounds can hit it: the phaseClone
+remediation round (`cloneRemediationRound`) and the executor-launch gate
+(`requireLaunchAuthority`). Both now run through one helper,
+`withLaunchLockRetry`. Each round stays one round and throws exactly its
+pre-#4246 errors; provenance travels out of band in a per-round record: the
+lock-wait label (from the `RemediationRestrictionProgress` pre-acquisition
+stage), the round's deadline and its scope signal.
+
+Amends the #4191 rule that restore failures are sticky. A launch-round
+runtime-restore read whose bare-lock wait aborted before acquisition
+(`pre_read_unavailable`, not started, not acquired) creates a clearable latch,
+but only when no latch existed on entry and none exists at catch time (a
+concurrently installed latch stays sticky), and never for `predecessorCapture`.
+It advances `remediationDenialRevision` like a bootstrap failure. All other
+restore failures, other callers (candidate admission, restore-from-pin,
+retained claim body, independent restore seeding) and existing latches remain
+sticky. Only a later fully verified two-read bootstrap may clear it, under the
+#4191 conditions. That is sound because the read reports enrolled whenever the
+journal carries this run's `remediationRecovery`, and launch still re-runs the
+restore under the lock and `checkRemediation` before the executor starts.
+
+#4191's statement that it adds no retry subsystem applies to #4191 only; #4246
+adds this bounded fresh-round retry.
+
+A round is retried only when all hold: its lock wait aborted before
+acquisition; no stop fired (owner cancel, pause, credential switch, shutdown,
+terminal lifecycle, claim fence), checked without throwing and never by testing
+the shared cancel controller directly; the round's own absolute deadline
+elapsed and its scope aborted with `RecoveryDeadlineExhaustedError`; it is not
+`predecessorCapture`; and the latch is clearable. Anything else (unknown abort,
+early timer, parent deadline, budget) rethrows unchanged and fails closed.
+Each retry re-enters the whole round: fresh denial-revision capture, a new
+source-use authority A acquisition (released during the backoff), a new
+`codexBoundaryDeadlineMs` lifecycle, and a fresh bootstrap and restore.
+Backoff is `recoveryRetryMs * 2 ** (retry - 1)`; stops are re-checked after it.
+The per-claim allowance is `RETAINED_DISCOVERY_RETRIES`, shared by both sites
+and separate from #2683's discovery counter. `classifyRetainedDiscoveryError`
+is not used; there is no new Git error class and no cause on
+`GitBoundaryAbortError`.
+
+Exhaustion throws `LaunchLockBusyError` ("local repository lock busy after
+bounded retries; local work and custody retained"), reported as a generic
+failure (`agent_failure`, no new `fail_origin`) with `keepCustody`; the clone
+and session are preserved. A launch that recovers through a retry restores the
+clone-retention flag the failed round set, once the fresh round's verified read
+has cleared the latch, so a completed run retires its clone normally.
+
+Diagnostics: the helper logs one bounded line per launch-round lock-wait abort
+with the label (`restriction_facts` or `runtime_restore`), elapsed ms and abort
+class (`deadline`, named stop or `unknown`). No paths, refs or holder tracking,
+and never inside `withLock`.
+
+Accepted risks:
+
+- A server wall park only seeds a pause request, so it may be retried once
+  before its signal fires (bounded by the post-backoff stop check).
+- Each retried round advances the denial revision permanently; no captured
+  revision outlives its round.
+- A cancelled round may leave a clearable latch; a later verified read clears
+  it or teardown holds it.
+- Worst-case authority occupancy is `(2 + RETAINED_DISCOVERY_RETRIES) *
+  codexBoundaryDeadlineMs`, cumulative across both sites, never continuous.
+- The clone-retention restore resets the whole flag. This is safe because no
+  latch-free writer of it runs during a launch round.
+
+State is process-local; this amendment adds no storage-loss or power-loss
+durability guarantee.
+
+The focused "#4246" cases in
+[runner-remediation-bootstrap.test.ts](../agent/test/runner-remediation-bootstrap.test.ts)
+cover the retry rule, exhaustion, the sticky exceptions and clone retirement.
