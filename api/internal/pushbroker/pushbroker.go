@@ -1212,9 +1212,52 @@ func fetchBaseRefs(ctx context.Context, remote *git.Remote, auth transport.AuthM
 // fetchWantedRefs lists origin and shallow-fetches (depth 1) the subset of want (source ref ->
 // local destination ref) that origin advertises. Because a specific refspec for an
 // unadvertised ref fails the whole fetch, it fetches only the advertised subset. Missing refs,
-// an empty remote and up-to-date are all tolerated.
+// an empty remote and up-to-date are all tolerated while the context is live; see fetchWanted
+// for what happens once it has ended.
 func fetchWantedRefs(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, want map[string]string) error {
-	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	list := func(ctx context.Context) ([]*plumbing.Reference, error) {
+		return remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	}
+	fetch := func(ctx context.Context, specs []config.RefSpec) error {
+		return remote.FetchContext(ctx, &git.FetchOptions{
+			RemoteName: "origin",
+			RefSpecs:   specs,
+			Auth:       auth,
+			Tags:       git.NoTags,
+			// SHALLOW (depth 1) — bounds memory to ONE snapshot, not the branch's whole
+			// history. A full fetch of a real repo unpacks its entire pack into the
+			// in-memory storer: measured 787 MiB heap / 742 MB RSS for uzi's 131 MiB pack,
+			// which OOM-killed the 512Mi api pod at every checkpoint (PRD #122 M8, found in
+			// the first real-forge deploy — the unit tests use a 1-commit local fixture,
+			// where depth is a no-op, so they never caught it). Depth 1 fetches only each
+			// wanted ref's TIP snapshot — the base objects the worker's non-thin delta
+			// pack references. Ancestry walks may encounter missing parents on side paths;
+			// they continue other paths and require positive reach of the fetched base.
+			// Measured with depth 1: 47 MiB heap / 194 MB RSS
+			// including the push. Validated against gitlab.example.com before shipping.
+			Depth: 1,
+		})
+	}
+	return fetchWanted(ctx, list, fetch, want)
+}
+
+// fetchWanted is fetchWantedRefs with the list and fetch stages injected (tests drive the
+// stage results directly). Once a stage returns and ctx has ended, it returns the context
+// error (wrapped with the stage label) whatever the stage returned (#4223). A response that
+// races cancellation can be one the cancellation manufactured: net/http may hand go-git an
+// empty 200, which decodes as "empty input" at list and, at the upload-pack POST, as an
+// empty result go-git treats as up to date while still writing the advertised refs without
+// their objects. That false success turned a cancellation into a definitive ci-config guard
+// refusal ("default tip unreadable"). The other list wrappers are deliberately left alone: a
+// manufactured reply already decodes as an error there, and anything they classify comes from
+// a genuinely decoded advertisement.
+func fetchWanted(ctx context.Context, list func(context.Context) ([]*plumbing.Reference, error),
+	fetch func(context.Context, []config.RefSpec) error, want map[string]string,
+) error {
+	advertised, err := list(ctx)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("pushbroker: list: %w", ctxErr)
+	}
 	if err != nil {
 		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
 			return nil // nothing to fetch; the storer stays empty and tips resolve zero
@@ -1235,24 +1278,10 @@ func fetchWantedRefs(ctx context.Context, remote *git.Remote, auth transport.Aut
 	if len(specs) == 0 {
 		return nil // none of the wanted refs exist on origin yet
 	}
-	fetchErr := remote.FetchContext(ctx, &git.FetchOptions{
-		RemoteName: "origin",
-		RefSpecs:   specs,
-		Auth:       auth,
-		Tags:       git.NoTags,
-		// SHALLOW (depth 1) — bounds memory to ONE snapshot, not the branch's whole
-		// history. A full fetch of a real repo unpacks its entire pack into the
-		// in-memory storer: measured 787 MiB heap / 742 MB RSS for uzi's 131 MiB pack,
-		// which OOM-killed the 512Mi api pod at every checkpoint (PRD #122 M8, found in
-		// the first real-forge deploy — the unit tests use a 1-commit local fixture,
-		// where depth is a no-op, so they never caught it). Depth 1 fetches only each
-		// wanted ref's TIP snapshot — the base objects the worker's non-thin delta
-		// pack references. Ancestry walks may encounter missing parents on side paths;
-		// they continue other paths and require positive reach of the fetched base.
-		// Measured with depth 1: 47 MiB heap / 194 MB RSS
-		// including the push. Validated against gitlab.example.com before shipping.
-		Depth: 1,
-	})
+	fetchErr := fetch(ctx, specs)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("pushbroker: fetch: %w", ctxErr)
+	}
 	if fetchErr != nil &&
 		!errors.Is(fetchErr, git.NoErrAlreadyUpToDate) &&
 		!errors.Is(fetchErr, transport.ErrEmptyRemoteRepository) {
