@@ -271,26 +271,28 @@ describe("#3985 clarification settlement selection", () => {
 
   for (const verdict of [{ kind: "reject", reason: "no" }, { kind: "cancel" }] as const) {
     it(`a ${verdict.kind} verdict clears the pending revise: the next question settles with running`, async t => {
+      let refusalsBefore = -1;
       const o = await drive(t, {
         after: async ctx => {
           await ctx.continueExistingPlanGate!(async () => verdict);
-          const second = await ctx.askUser!([{ question: "After the verdict?", header: "Plan" }]);
-          assert.equal(second.kind, "answer");
+          // The second question is not a revise clarification, so it settles with the ordinary,
+          // confirmed running report. Issue #4158: this gated run stores a plan and holds no applied
+          // approve_plan bound to the current gate revision, so the api's SetRunRunning refuses that
+          // report (the fake models the refusal) and the confirming issue caller stops the flight.
+          refusalsBefore = api.crossCheckRunningRefusals.length;
+          await assert.rejects(ctx.askUser!([{ question: "After the verdict?", header: "Plan" }]),
+            /clarification running settlement was not confirmed/);
         },
         claim: { plan_cross_check_required: false, plan_cross_check_gated: true, plan_md: "# Persisted" },
       });
       assert.equal(o.error, undefined, errorName(o.error));
       assert.equal(api.states.filter(s => s.body.status === "clarification_settled").length, 1);
-      // The second question was not a revise clarification, so it reports running after it parked.
-      // Issue #4158: this gated run stores a plan and holds no applied approval bound to the current
-      // gate revision, so the api's SetRunRunning (and the fake modelling it) refuses that report; the
-      // worker choosing the plain running report is what this case pins, accepted or refused.
       const statuses = api.states.map(s => s.body.status);
-      const secondQuestion = statuses.lastIndexOf("awaiting_input");
-      assert.ok(secondQuestion > statuses.indexOf("awaiting_input"), statuses.join(","));
-      assert.ok(await until(() => api.states.slice(secondQuestion).some(s => s.body.status === "running") ||
-        api.crossCheckRunningRefusals.some(r => r.status === "awaiting_input"), 4_000),
-        `a running report follows the second question: ${api.states.map(s => s.body.status).join(",")}`);
+      assert.ok(statuses.lastIndexOf("awaiting_input") > statuses.indexOf("awaiting_input"), statuses.join(","));
+      const runId = api.states[0]!.runId;
+      assert.ok(refusalsBefore >= 0, "the second question was asked");
+      assert.ok(api.crossCheckRunningRefusals.slice(refusalsBefore).some(r => r.runId === runId && r.status === "awaiting_input"),
+        `the second question settled with a running report: ${JSON.stringify(api.crossCheckRunningRefusals)}`);
     });
   }
 
