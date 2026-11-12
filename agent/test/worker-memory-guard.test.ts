@@ -1709,11 +1709,11 @@ async function settleObservations(f: Fix) {
 const unavailableTree = (detail: string, pid = 20): TreeObservation => ({
   available: false, complete: false, startedAtMs: 0, completedAtMs: 0, rows: [{ pid, startTime: "10", rssBytes: 500 }], detail,
 } as TreeObservation);
-const addTree = (f: Fix, pid: number, observe: () => Promise<TreeObservation>, extra: { toolId?: string; command?: string; context?: Fix["context"] } = {}) =>
+const addTree = (f: Fix, pid: number, observe: () => Promise<TreeObservation>, extra: { toolId?: string; command?: string; context?: Fix["context"]; cancel?: () => void } = {}) =>
   f.commands.register(extra.context ?? f.context, {
     source: "codex-model-command", toolId: extra.toolId ?? `tool-${pid}`, attemptId: "attempt",
     root: { pid, startTime: "10" }, command: extra.command ?? "inert fixture", observe,
-    cancel: async () => {}, drain: async () => ({ confirmed: true }),
+    cancel: async () => { extra.cancel?.(); }, drain: async () => ({ confirmed: true }),
   });
 async function drive(f: Fix, ack = true) {
   f.monitor.tick();
@@ -1824,6 +1824,60 @@ test("#4219 an adapter detail getter that throws reads unknown and cannot change
       { run_id: f.input.run_id, command_id: hostile.commandId, reasons: ["observation_unavailable"], observation_detail: "unknown", rss_bytes_approx: { unavailable: "unknown" } },
       { run_id: f.input.run_id, command_id: odd.commandId, reasons: ["observation_unavailable"], observation_detail: "unknown", rss_bytes_approx: { unavailable: "unknown" } },
     ]);
+  } finally { await f.monitor.stop(); }
+});
+
+test("#4219 a valid observation with a throwing enumerable detail getter is still selected and cancelled", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  const observeValid = async (): Promise<TreeObservation> => {
+    const o = { available: true, complete: true, startedAtMs: 0, completedAtMs: 0, rows: [{ pid: 20, startTime: "10", rssBytes: 500 }] };
+    Object.defineProperty(o, "detail", { enumerable: true, get(): string { throw new Error("detail boom"); } });
+    return o as unknown as TreeObservation;
+  };
+  let largerCancels = 0;
+  const larger = addTree(f, 20, observeValid, { cancel: () => { largerCancels++; } });
+  try {
+    await drive(f);
+    const d = norm(diagnostics) as { tree: DiagTree };
+    assert.equal(d.tree.selected_rss_bytes_approx, 500);
+    assert.equal(f.requests.length, 1);
+    // f.signals() counts only the fixture's own entry; the larger tree is the one cancelled.
+    assert.equal(largerCancels, 1);
+    assert.equal(f.signals(), 0);
+    assert.equal(f.feedback[0]?.run_id, f.input.run_id);
+    assert.equal(f.feedback[0]?.command_id, larger.commandId);
+    assert.equal(f.feedback[0]?.outcome, "confirmed_drained");
+    assert.ok(f.reports.length >= 1);
+  } finally { await f.monitor.stop(); }
+});
+
+test("#4219 a hostile rejected observation is contained through the real selector", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  // `available` reads false once (fresh() rejects the candidate), then throws on every later read:
+  // freshnessClass and the diagnostic copy in selectWithRejections each hit their catch (row dropped),
+  // and the guard's failure count hits its own catch (count unknown).
+  let reads = 0;
+  addTree(f, 20, async () => {
+    const o = { complete: false, startedAtMs: 0, completedAtMs: 0, rows: [{ pid: 20, startTime: "10", rssBytes: 500 }] };
+    Object.defineProperty(o, "available", { enumerable: true, get(): boolean { if (++reads === 1) return false; throw new Error("available boom"); } });
+    return o as unknown as TreeObservation;
+  });
+  try {
+    await drive(f);
+    const d = norm(diagnostics) as { tree: DiagTree };
+    assert.equal(d.tree.selected_rss_bytes_approx, 100);
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.signals(), 1);
+    assert.equal(f.feedback[0]?.run_id, f.input.run_id);
+    assert.equal(f.feedback[0]?.command_id, f.entry.commandId);
+    assert.equal(f.feedback[0]?.outcome, "confirmed_drained");
+    assert.ok(f.reports.length >= 1);
+    assert.ok(reads >= 2, "the throwing reads were reached");
+    // The guard's failure count reads `available` too, so it is unknown rather than a number.
+    assert.deepEqual(d.tree.observation_failures, { unavailable: "error" });
+    assert.deepEqual(rowsOf(diagnostics), []);
   } finally { await f.monitor.stop(); }
 });
 

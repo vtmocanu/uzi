@@ -533,8 +533,10 @@ export class WorkerMemoryCommands {
     candidates.forEach(({ entry, observation }, index) => {
       const rssBytesApprox = totals.get(index);
       if (!invalid.has(index) && rssBytesApprox !== undefined) {
+        // Authority fields are copied explicitly: the diagnostic-only `detail` is never read here.
         valid.push(Object.freeze({ entry, phaseRevision: this.phaseRevision(entry.context), rssBytesApprox, observation: Object.freeze({
-          ...observation,
+          available: observation.available, complete: observation.complete,
+          startedAtMs: observation.startedAtMs, completedAtMs: observation.completedAtMs,
           ...(observation.supervisor ? { supervisor: Object.freeze({ ...observation.supervisor }) } : {}),
           ...(observation.primary ? { primary: Object.freeze({ ...observation.primary }) } : {}),
           rows: Object.freeze(observation.rows.map((row) => Object.freeze({ ...row }))),
