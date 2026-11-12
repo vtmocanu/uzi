@@ -184,8 +184,8 @@ func TestWorkerCredentialSwitchApplyRouteLiveDB(t *testing.T) {
 
 	t.Run("an unknown worker path is chi's plain-text 404", func(t *testing.T) {
 		rec := e.do(e.worker, "POST", "/api/worker/runs/"+e.run.String()+"/credential-switch/nope", "{}")
-		if rec.Code != http.StatusNotFound || rec.Body.String() != "404 page not found\n" {
-			t.Fatalf("status %d body %q, want chi's plain-text 404", rec.Code, rec.Body)
+		if rec.Code != http.StatusNotFound || rec.Body.String() != "404 page not found\n" || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/plain") {
+			t.Fatalf("status %d content-type %q body %q, want chi's plain-text 404", rec.Code, rec.Header().Get("Content-Type"), rec.Body)
 		}
 	})
 

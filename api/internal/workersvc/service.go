@@ -2024,6 +2024,10 @@ type Service struct {
 	// share-locked, before the transaction continues. TEST-ONLY: unexported and nil in production; the
 	// rotation-race test parks the apply here while a concurrent rotation tries to take the row.
 	afterApplySecretLock func()
+	// beforeApplySecretLock runs in ApplyCredentialSwitch right before the chosen token row is
+	// share-locked (NOWAIT), once per attempt. TEST-ONLY: unexported and nil in production; the
+	// busy-row tests hold or release a competing lock here.
+	beforeApplySecretLock func()
 	// leaseClaimProbe, when set by a test, is told the outcome of every claim that ran through a
 	// lease: whether ClaimRun admitted a run through it and whether the rebind applied. TEST-ONLY:
 	// nil in production.
@@ -8561,10 +8565,6 @@ func (s *Service) RunUsageTotal(ctx context.Context, runID uuid.UUID) (store.Get
 	return s.q.GetRunUsageTotal(ctx, runID)
 }
 
-// RunCredentialEpochs returns one run's applied-switch attribution journal, oldest
-// generation first (PRD #1247 M1, D7), owner-scoped through the query's run join. Empty
-// for a run that has never been claimed. Consumed by the handler's GetRun for the
-// credential_epochs DTO field.
 // RunCredentialSwitchEpochs returns the in-generation epochs in-place switches opened in one run
 // (issue #4201), owner-scoped, oldest first.
 func (s *Service) RunCredentialSwitchEpochs(ctx context.Context, runID, userID uuid.UUID) ([]store.RunCredentialSwitchEpoch, error) {
@@ -8577,6 +8577,10 @@ func (s *Service) RunUsageByCredentialEpoch(ctx context.Context, runID uuid.UUID
 	return s.q.ListRunUsageByCredentialEpoch(ctx, runID)
 }
 
+// RunCredentialEpochs returns one run's applied-switch attribution journal, oldest
+// generation first (PRD #1247 M1, D7), owner-scoped through the query's run join. Empty
+// for a run that has never been claimed. Consumed by the handler's GetRun for the
+// credential_epochs DTO field.
 func (s *Service) RunCredentialEpochs(ctx context.Context, runID, userID uuid.UUID) ([]store.RunCredentialEpoch, error) {
 	return s.q.ListRunCredentialEpochs(ctx, store.ListRunCredentialEpochsParams{RunID: runID, UserID: userID})
 }

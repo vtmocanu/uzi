@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -340,8 +341,179 @@ func TestApplyCredentialSwitchRotationBlocksUntilCommitLiveDB(t *testing.T) {
 	f.want(t, f.apply(t, run, f.req(op)), ApplyOutcomeRefusedCommitted, applyReasonCredentialChanged)
 }
 
+// holdSecretRow takes the token row FOR UPDATE in its own transaction (what a rotate, disable or
+// delete does first) and returns the release func.
+func (f applyFx) holdSecretRow(t *testing.T) (release func()) {
+	t.Helper()
+	tx, err := f.env.pool.Begin(f.env.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(f.env.ctx, `SELECT 1 FROM user_secrets WHERE id = $1 FOR UPDATE`, f.newTok); err != nil {
+		_ = tx.Rollback(f.env.ctx)
+		t.Fatal(err)
+	}
+	var once atomic.Bool
+	release = func() {
+		if once.CompareAndSwap(false, true) {
+			_ = tx.Rollback(f.env.ctx)
+		}
+	}
+	t.Cleanup(release)
+	return release
+}
+
+// applyWithin runs one apply under a deadline, so a regression that waits on the token row fails the
+// test instead of hanging it.
+func (f applyFx) applyWithin(t *testing.T, run uuid.UUID, req CredentialSwitchApplyRequest) (CredentialSwitchApplyResult, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(f.env.ctx, 20*time.Second)
+	defer cancel()
+	return f.svc.ApplyCredentialSwitch(ctx, f.worker(t), run, req)
+}
+
+func fastApplyBackoff(t *testing.T) {
+	t.Helper()
+	old := applyLockBusyBackoff
+	applyLockBusyBackoff = time.Millisecond
+	t.Cleanup(func() { applyLockBusyBackoff = old })
+}
+
+// TestApplyCredentialSwitchBusyTokenRowLiveDB: the apply takes the token row FOR SHARE NOWAIT after
+// it holds the worker and run rows. A row held by another writer (the first thing a delete, rotate
+// or disable does) must never make the apply wait: it rolls back and retries, then answers
+// not_applied credential_busy (fresh) or an error (replay, never refused_committed).
+func TestApplyCredentialSwitchBusyTokenRowLiveDB(t *testing.T) {
+	fastApplyBackoff(t)
+	t.Run("a row released between attempts is applied by the retry", func(t *testing.T) {
+		f := newApplyFx(t)
+		run, op := f.run(t, "running")
+		var calls atomic.Int32
+		var release func()
+		f.svc.beforeApplySecretLock = func() {
+			switch calls.Add(1) {
+			case 1:
+				release = f.holdSecretRow(t)
+			case 2:
+				release()
+			}
+		}
+		res, err := f.applyWithin(t, run, f.req(op))
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		f.want(t, res, ApplyOutcomeApplied, "")
+		if calls.Load() != 2 || res.Token != f.newPlain || res.Replay {
+			t.Fatalf("attempts = %d result %+v, want the second attempt to apply the new token", calls.Load(), res)
+		}
+	})
+	t.Run("a row held through every attempt is credential_busy and commits nothing", func(t *testing.T) {
+		f := newApplyFx(t)
+		run, op := f.run(t, "running")
+		var calls atomic.Int32
+		f.svc.beforeApplySecretLock = func() {
+			if calls.Add(1) == 1 {
+				f.holdSecretRow(t)
+			}
+		}
+		f.noWrite(t, run, func() {
+			res, err := f.applyWithin(t, run, f.req(op))
+			if err != nil {
+				t.Fatalf("a busy row must be an outcome, not an error (40P01 would land here): %v", err)
+			}
+			f.want(t, res, ApplyOutcomeNotApplied, applyReasonCredentialBusy)
+			if res.Token != "" {
+				t.Fatal("a not_applied outcome must carry no token")
+			}
+		})
+		if got := calls.Load(); got != applyLockBusyAttempts {
+			t.Fatalf("attempts = %d, want %d", got, applyLockBusyAttempts)
+		}
+		if f.opOf(t, run) != op {
+			t.Fatal("the stamp must stay pending")
+		}
+	})
+	t.Run("a replay against a held row is an error, never refused_committed", func(t *testing.T) {
+		f := newApplyFx(t)
+		run, op := f.run(t, "running")
+		f.want(t, f.apply(t, run, f.req(op)), ApplyOutcomeApplied, "")
+		f.holdSecretRow(t)
+		f.noWrite(t, run, func() {
+			res, err := f.applyWithin(t, run, f.req(op))
+			if err == nil || !isLockNotAvailable(err) {
+				t.Fatalf("err = %v result %+v, want a 55P03 error", err, res)
+			}
+			if res.Outcome != "" {
+				t.Fatalf("outcome = %q, want none on an error", res.Outcome)
+			}
+		})
+	})
+}
+
+// TestApplyCredentialSwitchConcurrentDeleteDoesNotDeadlockLiveDB: a token delete locks the secret row
+// first and its ON DELETE SET NULL cascade then needs the run row the apply holds. With the apply's
+// token lock waiting, the two deadlock (40P01); with NOWAIT the apply yields and the delete wins.
+func TestApplyCredentialSwitchConcurrentDeleteDoesNotDeadlockLiveDB(t *testing.T) {
+	fastApplyBackoff(t)
+	f := newApplyFx(t)
+	run, op := f.run(t, "running")
+	deleted := make(chan error, 1)
+	var calls atomic.Int32
+	f.svc.beforeApplySecretLock = func() {
+		if calls.Add(1) != 1 {
+			return
+		}
+		go func() {
+			_, err := f.env.pool.Exec(f.env.ctx, `DELETE FROM user_secrets WHERE id = $1`, f.newTok)
+			deleted <- err
+		}()
+		// Park until the delete holds the secret row and is waiting on the run row we hold.
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			var waiting int
+			if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*) FROM pg_stat_activity
+			    WHERE wait_event_type = 'Lock' AND query LIKE 'DELETE FROM user_secrets%'`).Scan(&waiting); err == nil && waiting > 0 {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Error("the delete never blocked on the run row")
+	}
+	res, err := f.applyWithin(t, run, f.req(op))
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+		t.Fatalf("apply deadlocked against the delete: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	select {
+	case derr := <-deleted:
+		if derr != nil {
+			t.Fatalf("delete: %v (a 40P01 here is the deadlock, the delete being its victim)", derr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the delete never completed")
+	}
+	// Once the delete lands the run's override is NULL, so a retry may legitimately apply the owner's
+	// other credential; what it must never do is hand out the deleted token's bytes.
+	if res.Token == f.newPlain {
+		t.Fatalf("apply returned the bytes of a token a concurrent delete removed: %+v", res)
+	}
+	var n int
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*) FROM user_secrets WHERE id = $1`, f.newTok).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("token rows after delete = %d (err %v), want 0", n, err)
+	}
+}
+
 func TestApplyCredentialSwitchFencesCommitNothingLiveDB(t *testing.T) {
 	f := newApplyFx(t)
+	t.Run("stamp generation older than the claim generation", func(t *testing.T) {
+		run, op := f.run(t, "running")
+		// The claim is at f.gen but the stamp was written for an earlier generation.
+		f.env.exec(`UPDATE runs SET credential_switch_generation = $2 WHERE id = $1`, run, f.gen-1)
+		f.noWrite(t, run, func() { f.want(t, f.apply(t, run, f.req(op)), ApplyOutcomeNotApplied, applyReasonGenerationMismatch) })
+	})
 	t.Run("stale generation", func(t *testing.T) {
 		run, op := f.run(t, "running")
 		req := f.req(op)

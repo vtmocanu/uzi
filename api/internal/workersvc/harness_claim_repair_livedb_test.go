@@ -24,7 +24,7 @@ func (e codexTestEnv) countRunCredentialEpochs(t *testing.T, runID uuid.UUID) in
 	var n int
 	// Issue #4201: a Codex claim journals its own binding epoch (select_reason codex_binding). The
 	// assertions that use this count are about CLAUDE attribution, so that row is excluded here;
-	// codex_epoch_livedb_test.go pins the Codex row itself.
+	// TestRecordCodexEpochIdempotentLiveDB (credential_switch_apply_livedb_test.go) pins the Codex row itself.
 	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_credential_epochs WHERE run_id = $1 AND select_reason IS DISTINCT FROM 'codex_binding'`, runID).Scan(&n); err != nil {
 		t.Fatalf("count run_credential_epochs: %v", err)
 	}

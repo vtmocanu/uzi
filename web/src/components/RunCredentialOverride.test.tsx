@@ -163,6 +163,30 @@ describe("CredentialEpochList", () => {
     expect(screen.getByText(/pinned by override/)).toBeTruthy();
   });
 
+  it("renders an in-place switch epoch beside its claim's base epoch, with Codex binding copy and usage", () => {
+    const { container } = render(
+      <CredentialEpochList
+        epochs={[
+          { claim_generation: 1, ordinal: 0, secret_id: "sec-a", label: "codex-a", select_reason: "codex_binding", applied_at: "2026-01-01T10:00:00Z" },
+          {
+            claim_generation: 1,
+            ordinal: 1,
+            message_seq: 7,
+            secret_id: "sec-b",
+            label: "codex-b",
+            select_reason: "codex_binding",
+            applied_at: "2026-01-01T11:00:00Z",
+            usage: { input_tokens: 1, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 1.5 },
+          },
+        ]}
+      />,
+    );
+    expect(container.querySelectorAll("li")).toHaveLength(2);
+    expect(screen.getAllByText(/Codex binding/)).toHaveLength(2);
+    expect(screen.getAllByText(/switched in place/)).toHaveLength(1);
+    expect(screen.getByText(/\$1\.50/)).toBeTruthy();
+  });
+
   it("routes a user-authored label through sanitizeLabel and onto its title/aria-label", () => {
     const bidi = String.fromCodePoint(0x202e); // U+202E RTL override, category Cf
     render(

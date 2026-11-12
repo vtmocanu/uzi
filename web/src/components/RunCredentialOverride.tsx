@@ -92,6 +92,8 @@ function selectReasonText(reason: string | null): string {
       return "default token";
     case "pinned":
       return "pinned token";
+    case "codex_binding":
+      return "Codex binding";
     default:
       return reason ?? "";
   }
@@ -111,11 +113,13 @@ export function CredentialEpochList({ epochs }: { epochs?: CredentialEpoch[] }) 
           const reason = selectReasonText(e.select_reason);
           const when = new Date(e.applied_at).toLocaleString();
           return (
-            <li key={e.claim_generation} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+            <li key={`${e.claim_generation}.${e.ordinal ?? 0}`} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
               <span className="font-medium" title={safe || "unknown token"} aria-label={safe || "unknown token"}>
                 {safe || "unknown token"}
               </span>
               {reason && <span className="text-muted">· {reason}</span>}
+              {(e.ordinal ?? 0) >= 1 && <span className="text-muted">· switched in place</span>}
+              {e.usage && <span className="text-faint tabular-nums">· ${e.usage.cost_usd.toFixed(2)}</span>}
               <span className="text-faint tabular-nums">· {when}</span>
             </li>
           );

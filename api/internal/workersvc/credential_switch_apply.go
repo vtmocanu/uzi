@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -30,9 +31,17 @@ import (
 // whose seq the worker's later frames follow. Only after that commit is the token returned.
 //
 // The transaction is beginClaimMutation's: the worker row FOR UPDATE, then the run row FOR UPDATE,
-// then the chosen token row FOR SHARE (LockAnthropicSecretForApply). The share lock is what makes
-// the returned bytes the bytes of a token that could not be rotated, disabled or deleted while the
-// apply decided; a rotation that lands after the commit is the replay's refused_committed case.
+// then the chosen token row FOR SHARE NOWAIT (LockAnthropicSecretForApply). The share lock is what
+// makes the returned bytes the bytes of a token that could not be rotated, disabled or deleted while
+// the apply decided; a rotation that lands after the commit is the replay's refused_committed case.
+//
+// NOWAIT is the house rule for the claim side (see credential_disabled.go): a token delete locks the
+// secret row first and its ON DELETE SET NULL cascade then needs the run and worker rows this
+// transaction already holds, so an apply that WAITED on the secret row would deadlock against it
+// (SQLSTATE 40P01). A held row answers 55P03 instead; the apply rolls the whole transaction back
+// and retries it a bounded number of times (ApplyCredentialSwitch), then answers not_applied
+// credential_busy on a fresh apply, or an error on a replay (nothing changed, so the worker retries
+// the same operation).
 
 // Apply outcomes, the JSON "outcome" the endpoint answers.
 const (
@@ -68,7 +77,28 @@ const (
 	applyReasonCredentialChanged    = "credential_changed"         //nolint:gosec // G101: an apply-outcome reason VOCABULARY value, not a credential.
 	applyReasonCredentialGone       = "credential_gone"            //nolint:gosec // G101: an apply-outcome reason VOCABULARY value, not a credential.
 	applyReasonCredentialNotDecrypt = "credential_not_decryptable" //nolint:gosec // G101: an apply-outcome reason VOCABULARY value, not a credential.
+	// applyReasonCredentialBusy: the token row was locked by a concurrent writer for every attempt
+	// (a fresh apply only; a replay answers an error instead, see ApplyCredentialSwitch).
+	applyReasonCredentialBusy = "credential_busy" //nolint:gosec // G101: an apply-outcome reason VOCABULARY value, not a credential.
 )
+
+// Bounds on the retry of an apply whose token row was held by another writer (SQLSTATE 55P03).
+// applyLockBusyBackoff is a variable so a test can shorten it.
+const applyLockBusyAttempts = 3
+
+var applyLockBusyBackoff = 50 * time.Millisecond
+
+// errApplySecretBusy marks a 55P03 from the token row lock; replay says which path hit it. It wraps
+// the database error.
+type errApplySecretBusy struct {
+	replay bool
+	err    error
+}
+
+func (e *errApplySecretBusy) Error() string {
+	return "credential switch apply: token row busy: " + e.err.Error()
+}
+func (e *errApplySecretBusy) Unwrap() error { return e.err }
 
 // ErrInvalidApplyRequest is a malformed apply request (the handler answers 400).
 var ErrInvalidApplyRequest = errors.New("invalid credential switch apply request")
@@ -203,7 +233,35 @@ func applyLiveStatus(status string) bool {
 // transaction shape. It returns ErrRunNotOwned (the handler's exact 404) for a run the worker does
 // not hold; every other refusal is an outcome, and an outcome other than applied commits nothing.
 // The caller validated the request (ValidateCredentialSwitchApplyRequest) and passes the results.
+//
+// A token row held by a concurrent writer (55P03) rolls the whole transaction back and retries the
+// whole apply up to applyLockBusyAttempts times. Exhausted: a fresh apply answers not_applied
+// credential_busy; a replay returns the error (the handler's 500), never refused_committed, because
+// nothing changed and the worker retries the same operation.
 func (s *Service) ApplyCredentialSwitch(ctx context.Context, wkr store.Worker, runID uuid.UUID, req CredentialSwitchApplyRequest) (CredentialSwitchApplyResult, error) {
+	var busy *errApplySecretBusy
+	for attempt := 1; ; attempt++ {
+		res, err := s.applyCredentialSwitchOnce(ctx, wkr, runID, req)
+		if !errors.As(err, &busy) {
+			return res, err
+		}
+		if attempt >= applyLockBusyAttempts {
+			if busy.replay {
+				return CredentialSwitchApplyResult{}, err
+			}
+			return CredentialSwitchApplyResult{Outcome: ApplyOutcomeNotApplied, Reason: applyReasonCredentialBusy}, nil
+		}
+		select {
+		case <-ctx.Done():
+			return CredentialSwitchApplyResult{}, ctx.Err()
+		case <-time.After(applyLockBusyBackoff):
+		}
+	}
+}
+
+// applyCredentialSwitchOnce is one attempt of ApplyCredentialSwitch in one transaction. A busy token
+// row comes back as *errApplySecretBusy after the deferred rollback.
+func (s *Service) applyCredentialSwitchOnce(ctx context.Context, wkr store.Worker, runID uuid.UUID, req CredentialSwitchApplyRequest) (CredentialSwitchApplyResult, error) {
 	op, oldCumulative, err := ValidateCredentialSwitchApplyRequest(req)
 	if err != nil {
 		return CredentialSwitchApplyResult{}, err
@@ -262,16 +320,26 @@ func (s *Service) ApplyCredentialSwitch(ctx context.Context, wkr store.Worker, r
 	if !run.CredentialSwitchGeneration.Valid || run.CredentialSwitchGeneration.Int64 != gen {
 		return CredentialSwitchApplyResult{Outcome: ApplyOutcomeNotApplied, Reason: applyReasonGenerationMismatch}, nil
 	}
-	choiceID, choice, reason, err := s.chooseApplySecret(ctx, wkr, run)
+	// The locked re-read worker w, not the middleware's earlier snapshot. chooseApplySecret's reads go
+	// through s.q rather than the transaction: the transaction-bound child service lacks the vault,
+	// settings and pool wiring the ladder needs, and the ladder only picks an id that the NOWAIT lock
+	// below then re-reads under the run lock.
+	choiceID, choice, reason, err := s.chooseApplySecret(ctx, w, run)
 	if err != nil {
 		return CredentialSwitchApplyResult{}, err
 	}
 	if reason != "" {
 		return CredentialSwitchApplyResult{Outcome: ApplyOutcomeNotApplied, Reason: reason}, nil
 	}
+	if s.beforeApplySecretLock != nil {
+		s.beforeApplySecretLock()
+	}
 	sec, err := qtx.LockAnthropicSecretForApply(ctx, store.LockAnthropicSecretForApplyParams{ID: choiceID, UserID: run.UserID})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CredentialSwitchApplyResult{Outcome: ApplyOutcomeNotApplied, Reason: applyReasonCredentialGone}, nil
+	}
+	if isLockNotAvailable(err) {
+		return CredentialSwitchApplyResult{}, &errApplySecretBusy{err: err}
 	}
 	if err != nil {
 		return CredentialSwitchApplyResult{}, err
@@ -390,9 +458,15 @@ func (s *Service) replayCredentialSwitchApply(ctx context.Context, qtx *store.Qu
 	if !prior.SecretID.Valid {
 		return refuse(applyReasonCredentialGone)
 	}
+	if s.beforeApplySecretLock != nil {
+		s.beforeApplySecretLock()
+	}
 	sec, err := qtx.LockAnthropicSecretForApply(ctx, store.LockAnthropicSecretForApplyParams{ID: uuid.UUID(prior.SecretID.Bytes), UserID: run.UserID})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return refuse(applyReasonCredentialGone)
+	}
+	if isLockNotAvailable(err) {
+		return CredentialSwitchApplyResult{}, &errApplySecretBusy{replay: true, err: err}
 	}
 	if err != nil {
 		return CredentialSwitchApplyResult{}, err

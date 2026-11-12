@@ -2,9 +2,12 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -116,8 +119,8 @@ func TestCredentialSwitchOpIDTriggerLiveDB(t *testing.T) {
 	if !op2.Valid || op2 == op1 {
 		t.Fatalf("second stamp reused the op id: %v %v", op1, op2)
 	}
-	// Self-heal: stamp set, id NULL (drop the trigger-protected value via a stamp-preserving write is
-	// impossible, so null it with the trigger disabled for this one statement).
+	// Heal on a stamp write: stamp set, id NULL (nulling the trigger-protected value through a
+	// stamp-preserving write is impossible, so null it with the trigger disabled for one statement).
 	mustExec(ctx, t, f.pool, "ALTER TABLE runs DISABLE TRIGGER runs_credential_switch_op_id_trg")
 	mustExec(ctx, t, f.pool, "UPDATE runs SET credential_switch_op_id=NULL WHERE id=$1", id)
 	mustExec(ctx, t, f.pool, "ALTER TABLE runs ENABLE TRIGGER runs_credential_switch_op_id_trg")
@@ -129,11 +132,70 @@ func TestCredentialSwitchOpIDTriggerLiveDB(t *testing.T) {
 	if got := f.op(t, id); !got.Valid {
 		t.Fatal("a pending stamp with a NULL op id did not self-heal")
 	}
+	// Non-NULL stamp with a NULL op id and a writer-supplied id: the trigger mints its own, never
+	// accepting the writer's value.
+	mustExec(ctx, t, f.pool, "ALTER TABLE runs DISABLE TRIGGER runs_credential_switch_op_id_trg")
+	mustExec(ctx, t, f.pool, "UPDATE runs SET credential_switch_op_id=NULL WHERE id=$1", id)
+	mustExec(ctx, t, f.pool, "ALTER TABLE runs ENABLE TRIGGER runs_credential_switch_op_id_trg")
+	supplied := uuid.New()
+	mustExec(ctx, t, f.pool, "UPDATE runs SET credential_switch_op_id=$2 WHERE id=$1", id, supplied)
+	if got := f.op(t, id); !got.Valid || got.Bytes == [16]byte(supplied) {
+		t.Fatalf("a writer-supplied op id was accepted under a NULL old id: %v (supplied %v)", got, supplied)
+	}
 	// An old-binary-shaped plain clear nulls it.
 	mustExec(ctx, t, f.pool, "UPDATE runs SET credential_switch_requested_at=NULL WHERE id=$1", id)
 	if got := f.op(t, id); got.Valid {
 		t.Fatal("clearing the stamp left the op id")
 	}
+}
+
+// TestCredentialSecretShareLocksAreNowaitLiveDB pins both share-lock modes: the in-place apply's
+// LockAnthropicSecretForApply and the claim finisher's LockSecretEnablementForShareNowait must fail
+// fast with 55P03 (lock_not_available) while another transaction holds the row FOR UPDATE, never
+// wait. Waiting would deadlock against a token delete, whose cascade needs the run row the caller
+// already holds.
+func TestCredentialSecretShareLocksAreNowaitLiveDB(t *testing.T) {
+	ctx, dsn := standIsolatedDB(t, "switch_nowait_")
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	f := newSwitchOpFixture(t, dsn, ctx)
+	sec := uuid.New()
+	mustExec(ctx, t, f.pool, `INSERT INTO user_secrets(id,user_id,kind,label,ciphertext) VALUES($1,$2,'anthropic_token','s',$3)`, sec, f.user, []byte{1})
+
+	holder, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, "SELECT 1 FROM user_secrets WHERE id=$1 FOR UPDATE", sec); err != nil {
+		t.Fatal(err)
+	}
+	assertLockNotAvailable := func(name string, call func(q *store.Queries) error) {
+		t.Helper()
+		tx, err := f.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		start := time.Now()
+		err = call(store.New(tx))
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			t.Fatalf("%s under a held FOR UPDATE: err = %v, want SQLSTATE 55P03", name, err)
+		}
+		if d := time.Since(start); d > 5*time.Second {
+			t.Fatalf("%s waited %v; NOWAIT must fail fast", name, d)
+		}
+	}
+	assertLockNotAvailable("LockAnthropicSecretForApply", func(q *store.Queries) error {
+		_, err := q.LockAnthropicSecretForApply(ctx, store.LockAnthropicSecretForApplyParams{ID: sec, UserID: f.user})
+		return err
+	})
+	assertLockNotAvailable("LockSecretEnablementForShareNowait", func(q *store.Queries) error {
+		_, err := q.LockSecretEnablementForShareNowait(ctx, store.LockSecretEnablementForShareNowaitParams{ID: sec, UserID: f.user})
+		return err
+	})
 }
 
 func TestCredentialSwitchOpFenceAndHoldIdentityLiveDB(t *testing.T) {

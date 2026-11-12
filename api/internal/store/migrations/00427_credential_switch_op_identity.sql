@@ -21,7 +21,9 @@ UPDATE runs SET credential_switch_op_id = gen_random_uuid() WHERE credential_swi
 
 -- The op id follows the stamp: cleared with it, minted when the stamp is set or changes, and
 -- write-once while the stamp is unchanged (a writer cannot swap it under a pending request).
--- A pending stamp with a NULL id self-heals to a fresh id.
+-- A pending stamp with a NULL id is given a fresh id the next time a write touches the stamp or the
+-- id column (the trigger's WHEN clause); an unrelated update of such a row does not fire it. When it
+-- does fire with a NULL old id, the id is always minted here: a value the writer supplied is ignored.
 -- +goose StatementBegin
 CREATE FUNCTION runs_credential_switch_op_id() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -31,7 +33,7 @@ BEGIN
           OR NEW.credential_switch_requested_at IS DISTINCT FROM OLD.credential_switch_requested_at THEN
         NEW.credential_switch_op_id := gen_random_uuid();
     ELSIF OLD.credential_switch_op_id IS NULL THEN
-        NEW.credential_switch_op_id := COALESCE(NEW.credential_switch_op_id, gen_random_uuid());
+        NEW.credential_switch_op_id := gen_random_uuid();
     ELSE
         NEW.credential_switch_op_id := OLD.credential_switch_op_id;
     END IF;

@@ -109,6 +109,34 @@ func TestRenderRunDetailCredentialEpochs(t *testing.T) {
 	}
 }
 
+// TestRenderRunDetailCredentialEpochsInPlaceSwitch pins issue #4201: child epochs share their claim's
+// generation, so the header counts distinct generations and tallies switches apart, each child row
+// shows gen.ordinal, codex_binding reads in words, and per-epoch usage renders as a cost.
+func TestRenderRunDetailCredentialEpochsInPlaceSwitch(t *testing.T) {
+	applied := time.Date(2026, 9, 16, 10, 30, 0, 0, time.UTC)
+	seq := int32(42)
+	run := apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: "running", Health: "ok",
+		CredentialEpochs: []apitypes.CredentialEpochDTO{
+			{ClaimGeneration: 1, SecretID: sptr("secret-aaa"), Label: sptr("codex-a"), SelectReason: sptr("codex_binding"), AppliedAt: applied},
+			{ClaimGeneration: 1, Ordinal: 1, SecretID: sptr("secret-bbb"), Label: sptr("codex-b"), SelectReason: sptr("codex_binding"), AppliedAt: applied.Add(time.Hour), MessageSeq: &seq,
+				Usage: &apitypes.CredentialEpochUsageDTO{CostUSD: 1.5}},
+		},
+	}
+	out := renderDetail(t, run)
+	for _, want := range []string{"1 claims, 1 in-place switch", "gen 1.1", "Codex binding", "$1.50"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("in-place switch history missing %q, got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "2 claims") {
+		t.Errorf("a child epoch must not count as a claim, got:\n%s", out)
+	}
+	if got := selectReasonText("codex_binding", nil); got != "Codex binding" {
+		t.Errorf("selectReasonText(codex_binding) = %q", got)
+	}
+}
+
 // TestCredentialHistoryHasSwitch pins the switch-detection key to the STABLE secret_id, not the
 // renameable/reusable label (CodeRabbit correctness finding): a rename must NOT read as a switch,
 // and a real switch behind a reused label MUST. Two cases are mutation-red against the old

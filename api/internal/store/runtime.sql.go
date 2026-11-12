@@ -15337,7 +15337,7 @@ const lockAnthropicSecretForApply = `-- name: LockAnthropicSecretForApply :one
 SELECT id, user_id, kind, label, ciphertext, sealed_with, disabled_at, anthropic_rejected_at, enablement_rev
 FROM user_secrets
 WHERE id = $1 AND user_id = $2 AND kind = 'anthropic_token'
-FOR SHARE
+FOR SHARE NOWAIT
 `
 
 type LockAnthropicSecretForApplyParams struct {
@@ -15358,7 +15358,11 @@ type LockAnthropicSecretForApplyRow struct {
 }
 
 // Issue #4201: share-lock the Anthropic token an in-place apply is about to use, so a concurrent
-// disable, rotate or delete (which take FOR UPDATE) waits for the apply transaction.
+// disable, rotate or delete (which take FOR UPDATE) waits for the apply transaction. NOWAIT: the
+// apply already holds the worker and run rows, and a delete holds the secret row and then needs
+// those rows for its ON DELETE SET NULL cascade, so waiting here would deadlock; a held row returns
+// 55P03 and the caller rolls back and retries (the claim side's rule, see
+// LockSecretEnablementForShareNowait).
 func (q *Queries) LockAnthropicSecretForApply(ctx context.Context, arg LockAnthropicSecretForApplyParams) (LockAnthropicSecretForApplyRow, error) {
 	row := q.db.QueryRow(ctx, lockAnthropicSecretForApply, arg.ID, arg.UserID)
 	var i LockAnthropicSecretForApplyRow
@@ -28142,7 +28146,8 @@ UPDATE runs SET
     credential_override_secret_id  = $2,
     -- Strictly increasing per run (issue #4201): the credential_switch_op_id trigger mints a new op id
     -- whenever this value changes, so a restamp inside one transaction (now() would repeat) must
-    -- still differ from the previous stamp. Read the minted id back with GetRunCredentialSwitchOpID.
+    -- still differ from the previous stamp. Production does not read the minted id here; the worker
+    -- learns it from the stamp via the run's own row (GetRunCredentialSwitchOpID is a test read).
     credential_switch_requested_at = GREATEST(clock_timestamp(), COALESCE(credential_switch_requested_at, '-infinity'::timestamptz) + interval '1 microsecond'),
     credential_switch_generation   = $3,
     updated_at                     = now()
