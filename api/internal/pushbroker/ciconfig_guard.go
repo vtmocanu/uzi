@@ -118,6 +118,11 @@ func newCIConfigMatcher(globs []string) (match func(string) bool, ok bool, err e
 // worker's merge-base check decides the final branch push. Also fail closed: a missing
 // candidate root tree, any missing default-side object, a candidate-only directory whose tree is
 // missing, and any other error.
+//
+// A context that has already ended on entry is returned as the plain context error, not a
+// refusal (#4223): the caller's cancellation is transient, and a refusal is a definitive
+// verdict. A cancellation that lands during the tree walk is still refused (fail closed; see
+// ciConfigWalk.visit).
 func ciConfigGuard(ctx context.Context, repo *git.Repository, candidate *object.Commit, defaultBranch string, globs []string) error {
 	match, ok, err := newCIConfigMatcher(globs)
 	if err != nil {
@@ -125,6 +130,9 @@ func ciConfigGuard(ctx context.Context, repo *git.Repository, candidate *object.
 	}
 	if !ok {
 		return nil // nothing is protected
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if defaultBranch == "" {
 		return fmt.Errorf("%w: default branch unknown", ErrCIConfigGuard)
