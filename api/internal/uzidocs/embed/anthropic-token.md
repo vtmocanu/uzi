@@ -366,6 +366,19 @@ regardless of the worker.
   fails closed. In a narrow race a refused `set-token` can still save the
   token you chose.
 
+  **Known limitation on a cross-check human gate.** If the run is held at a
+  [Plan cross-check](cross-check.md) human gate (a gated check, or a required
+  check that was forced to a human gate), a switch made at that gate, whether
+  by `uzi run approve --token`, the plan-gate picker or `set-token`, can leave
+  the run unable to restart once the worker releases its claim: the api
+  refuses the restarted flight's `running` report unless an applied approval
+  is bound to the gate's current revision. Retiring that release path is
+  tracked in [#4201](https://github.com/vtmocanu/uzi/issues/4201). Cancelling
+  such a run is a separate decision from what happens to work it preserved:
+  if it carries retained recovery work or a credential-switch hold, settle
+  that through [Recovering unpublished work](run-recovery.md) rather than
+  discarding it.
+
 ### Which choice wins
 
 Only one thing ever outranks a per-run choice: the [run judge](./judge.md)

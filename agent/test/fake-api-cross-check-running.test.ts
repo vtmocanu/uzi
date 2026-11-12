@@ -1,4 +1,5 @@
-// Issue #4158: the fake api must refuse the `running` reports the real api's SetRunRunning refuses.
+// Issue #4158: with modelCrossCheckRunningRule on, the fake api must refuse the `running` reports the
+// real api's SetRunRunning refuses.
 // Differential: fixtures/cross-check-running-guard/cases.json drives both the pure rule and the
 // fake's /state route; api/internal/store/plan_cross_check_running_guard_livedb_test.go drives the
 // same file against Postgres. Both halves must stay green on the same cases.

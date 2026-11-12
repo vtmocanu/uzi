@@ -2342,10 +2342,13 @@ WHERE id = @id AND user_id = @user_id;
 -- "Consumed" here means APPLIED and not discarded (issue #1604): an approve the worker
 -- discarded as stale is settled by DiscardRunInputRows with disposition 'superseded', and
 -- that row never opens the gate.
--- claimed→running and running→running are unaffected (the guard only narrows the
--- awaiting_approval source status); autopilot never enters awaiting_approval.
--- Required cross-check runs additionally match the current published payload and
--- an applied, bound approval for its current gate revision.
+-- For ordinary runs claimed→running and running→running are unaffected (this guard
+-- only narrows the awaiting_approval source status); autopilot never enters
+-- awaiting_approval. Cross-check runs are NOT exempt: when
+-- (plan_cross_check_required OR plan_cross_check_gated) AND NOT auto_approve and
+-- plan_md is set, EVERY entry to running, claimed→running included, needs the
+-- current presented payload to match and an applied, bound approval for the current
+-- gate revision (the status-independent clause below, issue #4158).
 UPDATE runs SET
     -- Startup/recovery reports do not resolve an interrupted required plan check.
     -- SetRunAutopilotPlan clears on canonical application; the guards below admit

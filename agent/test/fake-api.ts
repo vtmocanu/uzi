@@ -2238,8 +2238,9 @@ export class FakeApi {
     ) {
       return send(res, 409, { error: "run is not running", run: { id: runId, status: lastStatus } });
     }
-    // Issue #4158: the api's SetRunRunning refuses a running report for a human-gated cross-check
-    // run that holds a stored plan unless a bound approval for the current gate revision applied.
+    // Issue #4158 (opt-in, modelCrossCheckRunningRule): the api's SetRunRunning refuses a running
+    // report for a human-gated cross-check run that holds a stored plan unless a bound approval for
+    // the current gate revision applied.
     if (body.status === "running") {
       const refusedAt = this.crossCheckRunningRefusal(runId);
       if (refusedAt !== undefined) this.crossCheckRunningRefusals.push({ runId, status: refusedAt });
