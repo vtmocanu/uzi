@@ -12,12 +12,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #3767: migration 00424 widens runs_recovery_wait_cause_check with 'anthropic_spend_limit'
-// (NOT VALID), 00425 validates it, and 00424's Down never relabels a live hold. Skipped unless
+// Issue #3767: migration 00425 widens runs_recovery_wait_cause_check with 'anthropic_spend_limit'
+// (NOT VALID), 00426 validates it, and 00425's Down never relabels a live hold. Skipped unless
 // UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 func TestAnthropicSpendLimitMigrationLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "spend_limit_migration_")
-	if err := store.MigrateTo(ctx, dsn, 423); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 424); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -46,26 +46,26 @@ func TestAnthropicSpendLimitMigrationLiveDB(t *testing.T) {
 			t.Fatalf("cause %q: %v, want CHECK violation", cause, err)
 		}
 	}
-	rejected(held, "anthropic_spend_limit") // absent before 00424
+	rejected(held, "anthropic_spend_limit") // absent before 00425
 
-	if err := store.MigrateTo(ctx, dsn, 424); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 425); err != nil {
 		t.Fatal(err)
 	}
 	var valid bool
 	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conrelid='runs'::regclass AND conname='runs_recovery_wait_cause_check'").Scan(&valid); err != nil || valid {
-		t.Fatalf("00424 must install the CHECK NOT VALID: valid=%v err=%v", valid, err)
+		t.Fatalf("00425 must install the CHECK NOT VALID: valid=%v err=%v", valid, err)
 	}
 	rejected(held, "not_a_recovery_cause")
 	mustExec(ctx, t, pool, "UPDATE runs SET status='recovery_wait', recovery_wait_cause='anthropic_spend_limit' WHERE id=$1", held)
 	mustExec(ctx, t, pool, "UPDATE runs SET recovery_wait_cause='anthropic_spend_limit' WHERE id=$1", queued) // stale cause, as set-token leaves it
 
-	b, err := os.ReadFile(filepath.Join("migrations", "00424_anthropic_spend_limit.sql"))
+	b, err := os.ReadFile(filepath.Join("migrations", "00425_anthropic_spend_limit.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	i := strings.Index(string(b), "-- +goose Down")
 	if i < 0 {
-		t.Fatal("00424 has no Down block")
+		t.Fatal("00425 has no Down block")
 	}
 	down := string(b)[i+len("-- +goose Down"):]
 
@@ -109,11 +109,11 @@ func TestAnthropicSpendLimitMigrationLiveDB(t *testing.T) {
 	}
 	_ = tx.Rollback(ctx)
 
-	// (iii) 00425 validates the widened CHECK over the existing rows.
-	if err := store.MigrateTo(ctx, dsn, 425); err != nil {
+	// (iii) 00426 validates the widened CHECK over the existing rows.
+	if err := store.MigrateTo(ctx, dsn, 426); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conrelid='runs'::regclass AND conname='runs_recovery_wait_cause_check'").Scan(&valid); err != nil || !valid {
-		t.Fatalf("00425 must validate the CHECK: valid=%v err=%v", valid, err)
+		t.Fatalf("00426 must validate the CHECK: valid=%v err=%v", valid, err)
 	}
 }

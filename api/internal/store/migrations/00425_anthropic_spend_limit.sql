@@ -6,7 +6,7 @@ SET LOCAL lock_timeout = '5s';
 -- worker when the Anthropic API refuses for a spend limit. It is always parked with a NULL
 -- recovery_retry_not_before (never sweeper-promoted); only the owner's Resume, set-token or
 -- Cancel moves it. The widened CHECK is installed NOT VALID so no runs scan happens under
--- ACCESS EXCLUSIVE; 00425 validates it while ordinary reads and writes continue.
+-- ACCESS EXCLUSIVE; 00426 validates it while ordinary reads and writes continue.
 ALTER TABLE runs DROP CONSTRAINT runs_recovery_wait_cause_check;
 ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_cause_check CHECK (
     recovery_wait_cause IS NULL OR recovery_wait_cause IN (
@@ -20,7 +20,7 @@ SET LOCAL lock_timeout = '5s';
 -- Serialise against live run writers while the Down rewrites rows and narrows the CHECK; a held
 -- lock fails the rollback after 5s rather than queueing every runs writer behind it.
 LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
--- A live spend-limit hold has no pre-00424 equivalent: relabelling it as another cause would
+-- A live spend-limit hold has no pre-00425 equivalent: relabelling it as another cause would
 -- fabricate a classification the run never earned. Refuse the rollback while any run is still
 -- parked there (checked under the lock above) so the owner decides first.
 -- +goose StatementBegin
@@ -31,7 +31,7 @@ BEGIN
     SELECT count(*) INTO n FROM runs
     WHERE status = 'recovery_wait' AND recovery_wait_cause = 'anthropic_spend_limit';
     IF n > 0 THEN
-        RAISE EXCEPTION 'refusing to roll back 00424: % run(s) are parked in recovery_wait at anthropic_spend_limit; Resume, set-token or Cancel those runs first so no parked run is relabelled', n;
+        RAISE EXCEPTION 'refusing to roll back 00425: % run(s) are parked in recovery_wait at anthropic_spend_limit; Resume, set-token or Cancel those runs first so no parked run is relabelled', n;
     END IF;
 END
 $$;
