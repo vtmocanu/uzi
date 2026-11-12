@@ -7,8 +7,8 @@
 # requires: REPO_ID UZI_WORKER_TOKEN UZI_BIN UZI_TOKEN_VAL
 # provides: -
 # handoff:  -
-# mutates:  Docker wiring for cases 7-8 when not already wired (dind/dind-init started, UZI_DIND_SOCKET appended to $ENVFILE, picked up by the case 7 agent recreate); publication resume feature on for cases 1-3/6, off for 4-5/7-8; compose:api(force-recreated: heartbeat-stale window raised for the outage; stopped/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases), compose:outbox-api-placeholder(phase-only idle container using the built worker image; api DNS alias, no listener, credentials or mounts); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
-# restores: Docker posture (docker_wire_prepare before case 7 starts the DinD sidecar and appends UZI_DIND_SOCKET only when the stack is not already wired; after case 8, cleanup settles known fixtures and stops the agent, then docker_unwire_prepare stops and removes only the sidecars it started and removes only its own env line; recreate_outbox_agent performs the sole final recreate and docker_unwire_assert verifies that final container is unwired; nothing changes when the stack was already wired); publication resume overlay unset (default true), verified by stopped-agent probe + fresh registration; placeholder removed; cleanup evidence saved under artifacts/52-api-outage-outbox (agent logs + allowlisted recovery-record projections, before API restore and before agent recreation); api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort; custody: the declared owner discards (resolve_fixture_source_hold) of the killed generation-1 hold of the case 7 run and of both generation holds of the case 8 run, nothing else is discarded; expected exit residue is at most the case 3 completed hold (this phase does not discard it) plus at most one per case 1, 2, 4, 5, 6 run whose final custody ack has not landed (see custody:), which phases 72 and 74 see under the unchanged custody limit 8
+# mutates: cases 7/8 enable reserved restore52a/restore52b and select them with OUTBOX_REPO_ID (REPO_ID stays unchanged);  Docker wiring for cases 7-8 when not already wired (dind/dind-init started, UZI_DIND_SOCKET appended to $ENVFILE, picked up by the case 7 agent recreate); publication resume feature on for cases 1-3/6, off for 4-5/7-8; compose:api(force-recreated: heartbeat-stale window raised for the outage; stopped/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases), compose:outbox-api-placeholder(phase-only idle container using the built worker image; api DNS alias, no listener, credentials or mounts); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
+# restores: OUTBOX_REPO_ID is unset and reserved restore52a/restore52b return to disabled, including EXIT; Docker posture (docker_wire_prepare before case 7 starts the DinD sidecar and appends UZI_DIND_SOCKET only when the stack is not already wired; after case 8, cleanup settles known fixtures and stops the agent, then docker_unwire_prepare stops and removes only the sidecars it started and removes only its own env line; recreate_outbox_agent performs the sole final recreate and docker_unwire_assert verifies that final container is unwired; nothing changes when the stack was already wired); publication resume overlay unset (default true), verified by stopped-agent probe + fresh registration; placeholder removed; cleanup evidence saved under artifacts/52-api-outage-outbox (agent logs + allowlisted recovery-record projections, before API restore and before agent recreation); api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort; custody: the declared owner discards (resolve_fixture_source_hold) of the killed generation-1 hold of the case 7 run and of both generation holds of the case 8 run, nothing else is discarded; expected exit residue is at most the case 3 completed hold (this phase does not discard it) plus at most one per case 1, 2, 4, 5, 6 run whose final custody ack has not landed (see custody:), which phases 72 and 74 see under the unchanged custody limit 8
 # custody:  holds are counted relative to E52, the open_holds census taken at phase entry (log_hold_census "phase 52 entry"). Each accepted claim generation opens ONE hold. admission_counted_holds (ADR-2445) = open holds minus at most one hold per run that is live and healthy at its current generation; every other open hold counts, including a completed run's hold not yet released and a run in recovery_wait. Every make_outbox_run calls wait_custody_headroom 1 before creating its run (8 initial claims); the restore claims of cases 7 and 8 are continuations and need none.
 #   cases 1, 2, 4, 5, 6 (one run and one claim each; the generation is asserted unchanged across the outage in 4, 5 and 6, and the 300s heartbeat-stale window is meant to prevent any re-claim in 1 and 2): +1 open while live, +0 counted. Completion releases the hold through the worker's final custody ack, which this phase does not await (no wait_completed_custody_receipt); the log_run_hold_census line after each case records it. Delta against E52 after settling: 0; up to +1 open and +1 counted between the completion and that ack.
 #   case 3 (one run and one claim, generation asserted unchanged; durable publication intent reconciled, one MR): its completed hold is not discarded by this phase. Nothing in this phase awaits, discards or asserts it, and the closing comment of the phase says it is untouched: +1 open and +1 counted (terminal runs are counted) against E52 for the rest of the phase, unless the worker's final ack releases it.
@@ -156,16 +156,16 @@ assert_contiguous() {
 # cut_barrier holds stub completion until the harness releases the run after API stop.
 # first_cut_barrier holds only claim 1, letting case 7's resumed execution complete.
 make_outbox_run() {
-  local iid n deadline barrier="${1:-}"
+  local iid n deadline barrier="${1:-}" repo="${OUTBOX_REPO_ID:-$REPO_ID}"
   wait_outbox_feature "${E2E_RUN_PUBLICATION_RESUME_ENABLED:-true}" || fail "outbox phase: fixture requires fresh registration"
-  iid="$(apipost "/api/repos/$REPO_ID/issues" \
+  iid="$(apipost "/api/repos/$repo/issues" \
     "$(jq -nc --arg barrier "$barrier" '{title:"E2E outbox UZI_STUB_OUTBOX",description:("implements prds/1391-worker-outbox-durable-reports.md UZI_STUB_OUTBOX" + (if $barrier == "cut_barrier" then " UZI_STUB_OUTBOX_CUT_BARRIER" elif $barrier == "publication_cut_barrier" then " UZI_STUB_OUTBOX_PUBLICATION_CUT_BARRIER" elif $barrier == "first_cut_barrier" then " UZI_STUB_OUTBOX_FIRST_CUT_BARRIER" else "" end))}')" \
     | jq -r '.card.iid')"
   { [ -n "$iid" ] && [ "$iid" != null ]; } || fail "outbox phase: could not create the stub issue"
   # Cases create one fresh run at a time. Re-check before each initial claim;
   # earlier completion can precede final custody acknowledgement.
   wait_custody_headroom 1
-  OUTBOX_RUN="$(create_run "$REPO_ID" "$iid")" || fail "outbox phase: run-create failed (non-transient; see stderr)"
+  OUTBOX_RUN="$(create_run "$repo" "$iid")" || fail "outbox phase: run-create failed (non-transient; see stderr)"
   { [ -n "$OUTBOX_RUN" ] && [ "$OUTBOX_RUN" != null ]; } || fail "outbox phase: run was not created"
   wait_status "$OUTBOX_RUN" awaiting_approval
   apipost "/api/runs/$OUTBOX_RUN/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
@@ -363,6 +363,7 @@ record_outbox_transition() {
   local label="$1" start="$2" kind="$3" elapsed=$((SECONDS - $2))
   mkdir -p "$RUNROOT/artifacts/52-api-outage-outbox"
   printf '%s\t%s\t%s\n' "$label" "$kind" "$elapsed" >> "$RUNROOT/artifacts/52-api-outage-outbox/feature-transitions.tsv"
+  echo "publication feature transition: $label ($kind) ${elapsed}s, health + negotiation included"
   record_margin "publication feature $label ($kind, health + negotiation included)" "$((SECONDS - start))" 120
 }
 transition_outbox_feature() {
@@ -522,6 +523,8 @@ restore_outage_state() {
     echo 'outbox cleanup: restore failed; refusing any additional blind agent recreate or Docker teardown' >&2
     [ "$rc" != 0 ] || rc=1
   fi
+  unset OUTBOX_REPO_ID
+  restore_fixture_repo_states || { [ "$rc" != 0 ] || rc=1; }
   set_interlock true 2>/dev/null || true
   return "$rc"
 }
@@ -1045,6 +1048,8 @@ docker_wire_prepare
 transition_outbox_feature before7 false "$RUN_B4"
 docker_wire_assert
 say "CASE 7: finalize restart on spent budget -> G+1 independent restore and completion (never worker_lost)"
+enable_restore_fixture_repo restore52a || fail "case 7: could not enable its isolated repository bare"
+OUTBOX_REPO_ID="$RESTORE_FIXTURE_REPO_ID"
 make_outbox_run first_cut_barrier
 RUN_F1="$OUTBOX_RUN"
 GEN_F1="$(rb_run_field "$RUN_F1" claim_generation)"
@@ -1086,6 +1091,8 @@ assert_finalize_allowance_spent() {
   [ "$(rb_run_field "$run" requeue_count)" = "$((max + 1))" ] || fail "case 8: spent requeue count changed"
 }
 say "CASE 8: allowance is one-shot: G+1 restored, resumed finalize interrupted -> owner recovery hold, mark stays G"
+enable_restore_fixture_repo restore52b || fail "case 8: could not enable its isolated repository bare"
+OUTBOX_REPO_ID="$RESTORE_FIXTURE_REPO_ID"
 make_outbox_run cut_barrier
 RUN_F2="$OUTBOX_RUN"
 GEN_F2="$(rb_run_field "$RUN_F2" claim_generation)"
@@ -1182,6 +1189,8 @@ assert_no_open_run_holds "cases 7 and 8" "$RUN_F1" "$RUN_F2"
 # later phases (59-restart-agent, 60-62) are unaffected. Mirrors phase 46's restore.
 say "restore: recreate api + agent back to their defaults"
 restore_outbox_resolution
+unset OUTBOX_REPO_ID
+restore_fixture_repo_states || fail "phase 52: isolated fixture repo state was not restored"
 pass "api + agent recreated back to their defaults"
 
 # Best-effort cleanup: every run is terminal (completed, or owner-cancelled for case 8), so a cancel is a

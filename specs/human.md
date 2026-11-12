@@ -1559,6 +1559,10 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 - A park or the periodic reclaim drops a run's caches only once no process carrying the run's HOME is left alive (a complete reap or scan); otherwise the caches stay and a later reclaim pass retries. (AI-synced 2026-10-03, #1828)
 - Claude runs get a per-run, per-claim Go temp dir (`GOTMPDIR`) in the run HOME; a process-ended park and the periodic reclaim remove it only once no process of the run (by HOME, cwd or that `GOTMPDIR`) is left; older generations are removed at re-claim after the HOME reap; terminal cleanup removes it with the HOME. (AI-synced 2026-11-03, #3870)
 
+## Issue #3767 — Anthropic API spend-limit owner hold
+
+- An Anthropic API spend limit (organization or workspace) holds the run in `recovery_wait` (`anthropic_spend_limit`) for the owner, with no automatic retry or credential switch; it is detected by a narrow anchored text match because Anthropic exposes no structured signal, Resume re-uses the run's own credential selection, and credit depletion is out of scope. See [run-recovery-wait](../docs/run-recovery-wait.md#anthropic-api-spend-limit). (AI-synced 2026-11-11)
+
 ## Bug #1864 — Codex delegation still open when the lead's turn ends
 
 Tracked as GitHub issue vtmocanu/uzi#1864.
@@ -1788,7 +1792,7 @@ Design record: [ADR-3845](../adr/3845-limit-aware-automatic-harness.md).
 Design record: `prds/done/3878-overview-preview-decisions.md` (epic #3873).
 
 - A new Overview lives at `/overview/next`, linked both ways with the current Overview at `/dashboard`, which is unchanged apart from that link; both read one shared data hook. (AI-synced 2026-11-05)
-- The page header shows a greeting and one status sentence: decisions and (deduplicated) pull requests waiting on the viewer, or "Nothing needs you right now.", then executing / queued / parked counts, across the factory for admins, where an admin's sentence also says how many people own the executing runs ("for N people"). Admins get a compact health chip and a People chip (see #4042). (AI-synced 2026-11-08)
+- The page header shows a greeting and one status sentence: decisions and (deduplicated) pull requests waiting on the viewer, or "Nothing needs you right now.", then executing / queued / parked counts, across the factory for admins, where an admin's sentence also says how many people own the executing runs ("for N people"). Admins get a compact health chip and a People chip (see #4042). While any check needs attention the health chip opens a System health popover listing every attention check worst-first (severity, title, summary, evidence, docs link, duration) with an Open health link; when all checks pass it links to the Health tab (#4166). (AI-synced 2026-11-12)
 - On that page the app-wide banner stack renders under the header; every other page keeps it above the content. The stack never remounts on navigation, so snoozes and dismissals survive moving to and from the preview. (AI-synced 2026-11-05)
 - Needs your decision lists only the viewer's own plan reviews, questions and follow-ups, owner-action parks and open PRs for admins too, and hides when empty; items of one kind are grouped (see #4041) and each keeps its verb and age once its group is expanded. A parked run counts as resuming on its own only with evidence (account cooldown, weekly-reserve pause, limit / pool wait, a parseable scheduled retry); anything else is an owner action. Review PR opens the forge only for an https URL. (AI-synced 2026-11-07)
 - Runs are grouped Yours, then for admins Other users (admin) with the owner email (masked in demo mode); another user's waiting run reads "waits on owner". A failed admin read shows "Other users' runs are unavailable" with the last good read time, and a non-admin never calls an admin endpoint. (AI-synced 2026-11-05)

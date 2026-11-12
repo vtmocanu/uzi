@@ -26,7 +26,7 @@ import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
-import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
+import { RequestError, SpendLimitParkUnsupportedError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
 import type { ClarificationSettlement } from "./protocol.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
@@ -117,7 +117,7 @@ import {
 import { skillsPluginDir } from "./skills-plugin.js";
 import { captureFailureOf, EpochCleanupUnprovenError, type CodexExecutionSafety } from "./harness.js";
 import { CodexTurnFailedError } from "./codex/terminal-normalize.js";
-import { describeLimit, LimitReachedError } from "./limit.js";
+import { describeLimit, LimitReachedError, SpendLimitHoldError } from "./limit.js";
 import type { Logger } from "./log.js";
 import { LeadConfigReporter, leadConfigActive } from "./lead-config-report.js";
 import { CodexCatalogReporter, codexCatalogReportActive } from "./codex/catalog-report.js";
@@ -699,7 +699,9 @@ type RecoveryParkCause =
   /** Issue #1324 D3: an enrolled run's publication hop stayed transiently unreachable. */
   | { kind: "publication_forge_unreachable"; surface: "git" | "api"; step: "floor_refresh" | "push" | "mr_create" }
   | { kind: "vault_locked" | "refresh_unknown" | "account_unavailable" | "credential_release_unavailable" }
-  | { kind: "data_volume_full"; preventive: boolean };
+  | { kind: "data_volume_full"; preventive: boolean }
+  /** Issue #3767: the Claude lead hit an Anthropic organization or workspace spend limit. */
+  | { kind: "anthropic_spend_limit"; detail: string };
 
 /* Exact local revocation from assertHeldFreeCapture, distinct from an arbitrary refusal. */
 class FreeCaptureScopeExpired extends TrustedExecutionRefusal {}
@@ -864,6 +866,23 @@ const ACCOUNT_PARK_FEED = {
   reportFailed: "This run's Codex account was unavailable. Could not record the pause yet; keeping the local work and session and retrying.",
   held: "This run's Codex account was unavailable and this run is not running, so it was not paused for recovery; its local work and session are kept on this worker.",
 } as const;
+
+/**
+ * Issue #3767: the owner-facing feed line for an Anthropic spend-limit park. Owner-neutral
+ * ("this run's"), and it promises no automatic retry: only the owner (or a credential switch)
+ * moves the run on. `detail` is the provider's own sentence.
+ */
+function spendLimitParkFeed(detail: string, published: boolean, kind: RunKind | undefined): string {
+  // Mirrors the api's non-switchable lanes (credential_override.go,
+  // validateCredentialOverrideOn): those runs cannot take a token override, so the
+  // switch sentence is omitted for them.
+  const switchable = !["chat", "judge", "self_improve", "job"].includes(resolveRunKind(kind));
+  return `Paused: this run's Anthropic API credential reached its organization or workspace spend limit (${detail}). ` +
+    `The recovery checkpoint is ${published ? "published" : "saved only on this worker"}. ` +
+    "Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first." +
+    (switchable ? " To choose another token now, use Switch token or `uzi run set-token`." : "") +
+    " Cancel ends the run.";
+}
 
 /** An unavailable initial release carries no inferred vault cause. */
 const RELEASE_UNAVAILABLE_PARK_FEED = {
@@ -1102,8 +1121,8 @@ function isCheckedLifecycleControl(error: unknown): boolean {
     error instanceof PlanRevisionRecoveryStoppedError || error instanceof PlanRejectedError ||
     error instanceof RunningAckTerminalError || error instanceof CredentialSwitchRetainedStop ||
     error instanceof CredentialSwitchSignal || error instanceof E2EDropExecutionError ||
-    error instanceof RunResidueBlockedError || isInputReceiptError(error) ||
-    codexDeferralOf(error) !== undefined;
+    error instanceof RunResidueBlockedError || error instanceof SpendLimitHoldError ||
+    isInputReceiptError(error) || codexDeferralOf(error) !== undefined;
 }
 
 /** PRD #974 follow-up (#1077): a terminal push_secret_blocked report whose reportState
@@ -5822,6 +5841,241 @@ export class RunRunner {
       if (err instanceof CredentialSwitchSignal && flight.steering?.cancelCommittedUnderWithheldSwitch()) {
         err = new Error("run cancelled");
       }
+      // Issue #3767: the worker-shutdown interruption (checkpoint, diagnostic, batcher close, no
+      // terminal report) is a closure so the spend-limit park handler can run the very same sequence
+      // when a shutdown races its park (see handleRecoveryExhausted `onShutdownExit`).
+      const shutdownInterruption = async (): Promise<void> => {
+        // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
+        // run mid-flight. The DISCRIMINATOR is the flag, never the error: a user
+        // steering-cancel aborts the same controller with the same REASON_CANCELLED and
+        // must still fall through to the generic failure below. The run's tree is
+        // already reaped (sdk-executor's run() finally kills the agent tree before this
+        // catch is entered); the belt-and-braces reap now lives INSIDE the durability sink
+        // below (m4: reapForSink — killAgentTree for Claude, withBoundary for Codex).
+        // Early registration also permits shutdown before discovery or clone creation;
+        // the durability sink runs only when the clone coordinates below are available.
+        if (flight.barePath && flight.worktreePath && flight.branch) {
+          const barePath = flight.barePath;
+          const worktreePath = flight.worktreePath;
+          const branch = flight.branch;
+          // PRD #1030 M4: publish a FINAL checkpoint on graceful shutdown, mirroring the
+          // park path's ordering (commitWipMarker → fetchBackBestEffort → publishCheckpoint).
+          // Before M4 this branch was fetch-back ONLY, so a roll-while-running / eviction /
+          // OOM / node-drain lost up to a whole ~20-min checkpoint interval of committed
+          // work AND any uncommitted mid-milestone edits. Now:
+          //   1. commitWipMarker captures uncommitted work into a throwaway `wip(park):`
+          //      marker commit (best-effort; the .catch is belt-and-braces so nothing here
+          //      undoes the requeue), exactly as the park path does — the shutdown branch
+          //      previously did NOT do this, so uncommitted work was lost even from the marker.
+          //   2. fetchBackBestEffort moves that tip to the local tracking ref.
+          //   3. publishCheckpointBestEffort brokers the delta to refs/uzi-checkpoints/<checkpoint-key>
+          //      AFTER the fetch-back (so checkpointPack reads the current tip), one-shot and
+          //      unconditional on the join-token seam (never a git push / PAT), same signature
+          //      the park path uses. So a DIFFERENT worker re-claiming this requeued run
+          //      recovers the committed tree instead of cold-starting from the default branch.
+          //
+          // BUDGET (issue #1030 M4 / PRD #1030): this whole best-effort sequence runs inside
+          // the termination grace. Issue #4066 set the worker pod's terminationGracePeriodSeconds
+          // (controller/internal/kube/render.go) and the compose agent's stop_grace_period to 40s,
+          // covering the worker's 35s shutdown result deadline (shutdown-barrier.ts); this
+          // publication budget is unchanged and gets no share of the extra time. The local git
+          // steps (marker, fetch-back) are sub-second; the ONLY step that can hang is the
+          // publish RPC to the api, and the server-side maxPublishDuration is 60s — longer
+          // than the entire grace — so the CLIENT must not simply await it. We cap the whole
+          // sequence with a Promise.race against shutdownPublishTimeoutMs (default 15s): that
+          // leaves ~25s of the 40s grace for the runtime's own SIGTERM teardown and for the
+          // concurrently-aborted sibling runs' sequences (shutdown() aborts every active run
+          // at once; their catch branches race the same wall clock, so the cost is the slowest
+          // plus contention, not the sum). 15s is generous for a healthy publish yet caps a
+          // hung/unreachable forge well short of both the 40s SIGKILL and the 60s server cap.
+          // issue #1597 M1: the sequence resolves to a typed ShutdownCheckpointOutcome instead of a
+          // boolean, so the feed names WHY a shutdown checkpoint did not land (and a published
+          // checkpoint is never misreported by a later boundary error).
+          const durability = (async (): Promise<ShutdownCheckpointOutcome> => {
+            let publishOutcome: PublishOutcome | undefined;
+            let permitSignal: AbortSignal | undefined;
+            if (executor.safety) {
+              const cause = flight.active!.gracefulShutdownCheckpoint!;
+              if (cause.stopSignal.aborted) {
+                flight.preserveRecoveryClone = true;
+                return "boundary_blocked";
+              }
+              if (Date.now() >= cause.deadlineAt) {
+                flight.preserveRecoveryClone = true;
+                return "timeout";
+              }
+            }
+            // issue #1597 M2: a surviving tick process group gets its bounded chance to go first.
+            await this.awaitTickSurvivorsGone(flight);
+            try {
+              // PRD #1171 m4: the shutdown durability publish routes through the reap facade so
+              // deadlineMs ≤ the shutdown publish timeout keeps it inside the k8s grace race
+              // below. Claude/stub reaps via killAgentTree then runs the body byte-for-byte;
+              // Codex quiesces+reaps the provider root (after its per-sink reconcile) and holds
+              // the permit across the body.
+              await this.reapForSink(
+                executor,
+                {
+                  boundary: "shutdown",
+                  deadlineMs: executor.safety
+                    ? Math.max(0, flight.active!.gracefulShutdownCheckpoint!.deadlineAt - Date.now())
+                    : Math.min(this.codexBoundaryDeadlineMs, this.shutdownPublishTimeoutMs),
+                  ...(executor.safety ? { gracefulShutdownCheckpoint: flight.active!.gracefulShutdownCheckpoint } : {}),
+                },
+                async (permit) => {
+                  permitSignal = permit?.signal;
+                  const check = () => permit?.signal.throwIfAborted();
+                  check();
+                  await this.git.commitWipMarker(worktreePath, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => false);
+                  // issue #1783 (auditor M1): re-prove after the marker's runner-clone git, before
+                  // the credentialed overlay + publish (blocked → RunResidueBlockedError below).
+                  check();
+                  await this.quiesceOrBlockSink(flight, executor, "shutdown", { processOnly: true });
+                  check();
+                  // issue #3239: an unvetted marker (rollback refused) is never fetched back or published.
+                  if (flight.wipMarkerUnsafe && await this.wipSafeTip(flight, worktreePath, branch) === null) return;
+                  const cause = flight.active!.gracefulShutdownCheckpoint!;
+                  if (cause.stopSignal.aborted || Date.now() >= cause.deadlineAt) return;
+                  const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog,
+                    {}, undefined, { signal: permit?.signal ?? cause.stopSignal,
+                      timeoutMs: Math.max(1, cause.deadlineAt - Date.now()) });
+                  check();
+                  if (fetched.kind === "refused") return;
+                  // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
+                  // a resume adopts B, not the published tip. Best-effort — a shutdown checkpoint must
+                  // never throw (it is inside the k8s termination grace race, D4).
+                  if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown",
+                    permit?.signal ?? cause.stopSignal, cause.deadlineAt)).kind === "preservation_refused") return;
+                  // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
+                  // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
+                  check();
+                  const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
+                  check();
+                  publishOutcome = await this.publishCheckpointOutcome(
+                    flight,
+                    barePath,
+                    branch,
+                    shutdownOverlay,
+                    permit?.signal ?? cause.stopSignal,
+                    undefined,
+                    undefined,
+                    true,
+                    cause.deadlineAt,
+                  );
+                },
+                // issue #1783 (auditor M2): the flight rides along, so the shutdown sink first proves
+                // the clone quiescent; a survivor/unverified skips the whole body (no overlay PAT
+                // fetch, no publish), keeping the clone, journal and tracking ref.
+                flight,
+              );
+            } catch (err) {
+              // issue #1783: a clone that could not be proven quiescent published NOTHING — the same
+              // "nothing published" consequence as a blocked Codex boundary. The requeue stands.
+              if (err instanceof RunResidueBlockedError) {
+                runLog.warn("shutdown checkpoint skipped: the clone is not provably quiescent; nothing published to origin", {
+                  run_id: runId,
+                  error: errMessage(err),
+                });
+                return "boundary_blocked";
+              }
+              // A NON-boundary throw propagates as before. A CodexBoundaryError must NOT fail the
+              // requeue. issue #1597 M1: it no longer implies "nothing landed" — the boundary can
+              // error AFTER the body's publish was ACKed (e.g. a late deadline/cleanup failure), and
+              // the checkpoint on origin is then real: published WINS.
+              if (!isCodexBoundaryError(err)) throw err;
+              if (publishOutcome?.published === true) {
+                runLog.warn(
+                  "shutdown checkpoint boundary failed after the checkpoint was published to origin",
+                  { run_id: runId, error: errMessage(err) },
+                );
+                return "published";
+              }
+              runLog.warn("shutdown checkpoint boundary blocked; checkpoint not published to origin", {
+                run_id: runId,
+                error: errMessage(err),
+                ...codexBoundaryDiagnosticField(err, flight.redactText),
+              });
+              return isCodexBoundaryTimeout(err) ? "timeout" : "boundary_blocked";
+            }
+            return shutdownOutcomeOf(publishOutcome, permitSignal);
+          })();
+          // Claude retains the literal legacy budget race. Codex must not abandon a held
+          // permit: its boundary signal cancels supervised children + the upload at the same
+          // bounded deadline, and we await actual action/root settlement before terminal
+          // safety.dispose or run-home cleanup can proceed.
+          // issue #1597 M1: the Claude budget race resolving `undefined` IS the timeout class.
+          const raced: ShutdownCheckpointOutcome = executor.safety
+            ? await durability
+            : ((await this.raceShutdownBudget(durability, this.shutdownPublishTimeoutMs)) ?? "timeout");
+          // issue #4066: a Claude race that returned without the durability sequence abandons it still running;
+          // the shutdown barrier joins it before sealing so it can still settle what it opened.
+          if (!executor.safety && raced === "timeout") this.authority?.trackProducer(durability, "claude_shutdown_durability");
+          // issue #1597 M2: when a cancelled mid-turn tick left a git lock in the worker bare that
+          // could not be proven its own AND that lock STILL exists, a shutdown checkpoint that did
+          // not land is named for that cause — the retained lock is what blocks the fetch-back/
+          // publish. A lock that has since gone never relabels an unrelated failure.
+          const outcome: ShutdownCheckpointOutcome =
+            raced === "published"
+              ? raced
+              : this.tickSurvivorsRemain(flight)
+                ? "tick_process_survived"
+                : (await this.retainedBareLockRemains(flight))
+                  ? "bare_lock_retained"
+                  : raced;
+          runLog.info("shutdown checkpoint outcome", { run_id: runId, outcome });
+          // issue #1030 M4: surface the outcome on the feed the same way the park path does — a
+          // worker diagnostic, NOT deduped (it fires once per shutdown; only the generic
+          // publish-failure lines go through the reportPublishOutcome dedupe). Delivery is
+          // attempted BEFORE the single batcher.close() below — the shutdown
+          // branch closes the batcher exactly once, further down, never here.
+          this.emitWorkerDiagnostic(
+            flight,
+            "status",
+            // issue #1597 M1: the class only — no error message, remote text or credential. The
+            // tail names the likely restart point. A checkpoint this run (or its claim) knows
+            // landed is only adopted by a resume while it is still adoptable (runnerCloneForBranch
+            // sets it aside when e.g. origin/<branch> exists and it does not descend it), so that
+            // case is hedged; with no known checkpoint the default branch is named, as before.
+            outcome === "published"
+              ? "shutdown checkpoint published to origin"
+              : `shutdown checkpoint NOT published (reason: ${outcome}) — a resume on another worker will restart from ${
+                  flight.lastCheckpointRefTip
+                    ? "the last published checkpoint if it is still adoptable, else the branch or default branch"
+                    : "the default branch"
+                }`,
+          );
+          // PRD #1349 M2 (D4.6): record this generation's restore point in the durable journal
+          // so an interrupted run's exact hold can be dispositioned later. A shutdown is bounded
+          // by the k8s termination grace (the durability publish above is already raced against
+          // shutdownPublishTimeoutMs), so we do NOT run a credentialed fresh-forge capture here —
+          // that could exceed the grace and be SIGKILLed. Pin only (local, credential-free,
+          // sub-millisecond); settlement is left to the requeued run's reaped terminal or the
+          // server reconciler, and an abrupt interruption legitimately retains custody (D3).
+          await this.pinRecoveryGeneration(
+            claim,
+            flight,
+            await this.currentRestorePointHead(flight),
+          ).catch(async (e) =>
+            runLog.warn("recovery: shutdown generation-evidence pin failed (custody retained)", {
+              run_id: runId,
+              error: errMessage(e),
+              // PRD #1809 D6: name a pin that failed because the data volume is full.
+              ...(await this.diskFullCauseOf(e, this.git.recoveryRoot)),
+            }),
+          );
+        }
+        // PRD #556 M1: a shutdown interrupt now preserves the same two filesystem dirs a
+        // park does (the sibling skills plugin dir and the per-run HOME holding the
+        // resumable SDK transcript), so a same-worker re-claim within the affinity grace
+        // can resume the SDK session instead of restarting it from scratch. Scoped to
+        // ONLY those two fs removals in the finally — every other cleanup still runs.
+        flight.preserveSession = true;
+        runLog.info("run interrupted by worker shutdown; leaving it for requeue");
+        await batcher.close().catch(() => undefined);
+        // NO reportState: the run stays non-terminal so the server's sweeper requeues
+        // it. Reporting `failed` here would turn a recoverable interruption into a dead
+        // run — the exact outcome the fetch-back exists to prevent.
+      };
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
       // generic path below because that path is terminal in both senses — it reports
       // `failed` and it lets the finally erase the session this run wants to resume from.
@@ -6060,6 +6314,21 @@ export class RunRunner {
           { kind: "publication_forge_unreachable", surface: err.surface, step: err.step },
         ));
         if (flight.parked) await this.retireFinalizeRecord(flight, "recovery_park_accepted");
+      } else if (err instanceof SpendLimitHoldError && !flight.active?.shuttingDown &&
+          this.client.protocolFeatures.includes("recovery_cause_anthropic_spend_limit") &&
+          (claim.claim_generation ?? 0) > 0 && this.client.stampsClaimGeneration(claim.claim_generation)) {
+        // Issue #3767: park owner-held instead of failing, only when the api advertised the cause and
+        // the report is claim-fenced. Anything else falls to the generic failure below with this
+        // error's message, which is today's `provider error: 400 ...` text.
+        // The failing turn's session id (the terminal's own init, not an earlier turn's) rides the
+        // park report so a resume continues that transcript; mirrors the onSessionId callback.
+        if (err.sessionId !== undefined && !flight.policyHold) flight.observedSessionId = err.sessionId;
+        flight.parked = await recoveryDisposition(() => this.handleRecoveryExhausted(
+          err, claim, flight, executor, batcher, reportState, runLog,
+          { kind: "anthropic_spend_limit", detail: err.detail },
+          { onShutdownExit: shutdownInterruption },
+        ));
+        if (flight.parked) await this.retireFinalizeRecord(flight, "recovery_park_accepted");
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
         // durability permits automatic promotion; shutdown retains uncaptured work
@@ -6080,236 +6349,12 @@ export class RunRunner {
         flight.preserveSession = true;
         await batcher.close().catch(() => undefined);
       } else if (flight.active?.shuttingDown && !(err instanceof RetainedRecoveryStop)) {
-        // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
-        // run mid-flight. The DISCRIMINATOR is the flag, never the error: a user
-        // steering-cancel aborts the same controller with the same REASON_CANCELLED and
-        // must still fall through to the generic failure below. The run's tree is
-        // already reaped (sdk-executor's run() finally kills the agent tree before this
-        // catch is entered); the belt-and-braces reap now lives INSIDE the durability sink
-        // below (m4: reapForSink — killAgentTree for Claude, withBoundary for Codex).
-        // Early registration also permits shutdown before discovery or clone creation;
-        // the durability sink runs only when the clone coordinates below are available.
-        if (flight.barePath && flight.worktreePath && flight.branch) {
-          const barePath = flight.barePath;
-          const worktreePath = flight.worktreePath;
-          const branch = flight.branch;
-          // PRD #1030 M4: publish a FINAL checkpoint on graceful shutdown, mirroring the
-          // park path's ordering (commitWipMarker → fetchBackBestEffort → publishCheckpoint).
-          // Before M4 this branch was fetch-back ONLY, so a roll-while-running / eviction /
-          // OOM / node-drain lost up to a whole ~20-min checkpoint interval of committed
-          // work AND any uncommitted mid-milestone edits. Now:
-          //   1. commitWipMarker captures uncommitted work into a throwaway `wip(park):`
-          //      marker commit (best-effort; the .catch is belt-and-braces so nothing here
-          //      undoes the requeue), exactly as the park path does — the shutdown branch
-          //      previously did NOT do this, so uncommitted work was lost even from the marker.
-          //   2. fetchBackBestEffort moves that tip to the local tracking ref.
-          //   3. publishCheckpointBestEffort brokers the delta to refs/uzi-checkpoints/<checkpoint-key>
-          //      AFTER the fetch-back (so checkpointPack reads the current tip), one-shot and
-          //      unconditional on the join-token seam (never a git push / PAT), same signature
-          //      the park path uses. So a DIFFERENT worker re-claiming this requeued run
-          //      recovers the committed tree instead of cold-starting from the default branch.
-          //
-          // BUDGET (issue #1030 M4 / PRD #1030): this whole best-effort sequence runs inside
-          // the termination grace. Issue #4066 set the worker pod's terminationGracePeriodSeconds
-          // (controller/internal/kube/render.go) and the compose agent's stop_grace_period to 40s,
-          // covering the worker's 35s shutdown result deadline (shutdown-barrier.ts); this
-          // publication budget is unchanged and gets no share of the extra time. The local git
-          // steps (marker, fetch-back) are sub-second; the ONLY step that can hang is the
-          // publish RPC to the api, and the server-side maxPublishDuration is 60s — longer
-          // than the entire grace — so the CLIENT must not simply await it. We cap the whole
-          // sequence with a Promise.race against shutdownPublishTimeoutMs (default 15s): that
-          // leaves ~25s of the 40s grace for the runtime's own SIGTERM teardown and for the
-          // concurrently-aborted sibling runs' sequences (shutdown() aborts every active run
-          // at once; their catch branches race the same wall clock, so the cost is the slowest
-          // plus contention, not the sum). 15s is generous for a healthy publish yet caps a
-          // hung/unreachable forge well short of both the 40s SIGKILL and the 60s server cap.
-          // issue #1597 M1: the sequence resolves to a typed ShutdownCheckpointOutcome instead of a
-          // boolean, so the feed names WHY a shutdown checkpoint did not land (and a published
-          // checkpoint is never misreported by a later boundary error).
-          const durability = (async (): Promise<ShutdownCheckpointOutcome> => {
-            let publishOutcome: PublishOutcome | undefined;
-            let permitSignal: AbortSignal | undefined;
-            if (executor.safety) {
-              const cause = flight.active!.gracefulShutdownCheckpoint!;
-              if (cause.stopSignal.aborted) {
-                flight.preserveRecoveryClone = true;
-                return "boundary_blocked";
-              }
-              if (Date.now() >= cause.deadlineAt) {
-                flight.preserveRecoveryClone = true;
-                return "timeout";
-              }
-            }
-            // issue #1597 M2: a surviving tick process group gets its bounded chance to go first.
-            await this.awaitTickSurvivorsGone(flight);
-            try {
-              // PRD #1171 m4: the shutdown durability publish routes through the reap facade so
-              // deadlineMs ≤ the shutdown publish timeout keeps it inside the k8s grace race
-              // below. Claude/stub reaps via killAgentTree then runs the body byte-for-byte;
-              // Codex quiesces+reaps the provider root (after its per-sink reconcile) and holds
-              // the permit across the body.
-              await this.reapForSink(
-                executor,
-                {
-                  boundary: "shutdown",
-                  deadlineMs: executor.safety
-                    ? Math.max(0, flight.active!.gracefulShutdownCheckpoint!.deadlineAt - Date.now())
-                    : Math.min(this.codexBoundaryDeadlineMs, this.shutdownPublishTimeoutMs),
-                  ...(executor.safety ? { gracefulShutdownCheckpoint: flight.active!.gracefulShutdownCheckpoint } : {}),
-                },
-                async (permit) => {
-                  permitSignal = permit?.signal;
-                  const check = () => permit?.signal.throwIfAborted();
-                  check();
-                  await this.git.commitWipMarker(worktreePath, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => false);
-                  // issue #1783 (auditor M1): re-prove after the marker's runner-clone git, before
-                  // the credentialed overlay + publish (blocked → RunResidueBlockedError below).
-                  check();
-                  await this.quiesceOrBlockSink(flight, executor, "shutdown", { processOnly: true });
-                  check();
-                  // issue #3239: an unvetted marker (rollback refused) is never fetched back or published.
-                  if (flight.wipMarkerUnsafe && await this.wipSafeTip(flight, worktreePath, branch) === null) return;
-                  const cause = flight.active!.gracefulShutdownCheckpoint!;
-                  if (cause.stopSignal.aborted || Date.now() >= cause.deadlineAt) return;
-                  const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog,
-                    {}, undefined, { signal: permit?.signal ?? cause.stopSignal,
-                      timeoutMs: Math.max(1, cause.deadlineAt - Date.now()) });
-                  check();
-                  if (fetched.kind === "refused") return;
-                  // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
-                  // a resume adopts B, not the published tip. Best-effort — a shutdown checkpoint must
-                  // never throw (it is inside the k8s termination grace race, D4).
-                  if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown",
-                    permit?.signal ?? cause.stopSignal, cause.deadlineAt)).kind === "preservation_refused") return;
-                  // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
-                  // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
-                  check();
-                  const shutdownOverlay = await this.buildCheckpointOverlay(claim, flight, barePath);
-                  check();
-                  publishOutcome = await this.publishCheckpointOutcome(
-                    flight,
-                    barePath,
-                    branch,
-                    shutdownOverlay,
-                    permit?.signal ?? cause.stopSignal,
-                    undefined,
-                    undefined,
-                    true,
-                    cause.deadlineAt,
-                  );
-                },
-                // issue #1783 (auditor M2): the flight rides along, so the shutdown sink first proves
-                // the clone quiescent; a survivor/unverified skips the whole body (no overlay PAT
-                // fetch, no publish), keeping the clone, journal and tracking ref.
-                flight,
-              );
-            } catch (err) {
-              // issue #1783: a clone that could not be proven quiescent published NOTHING — the same
-              // "nothing published" consequence as a blocked Codex boundary. The requeue stands.
-              if (err instanceof RunResidueBlockedError) {
-                runLog.warn("shutdown checkpoint skipped: the clone is not provably quiescent; nothing published to origin", {
-                  run_id: runId,
-                  error: errMessage(err),
-                });
-                return "boundary_blocked";
-              }
-              // A NON-boundary throw propagates as before. A CodexBoundaryError must NOT fail the
-              // requeue. issue #1597 M1: it no longer implies "nothing landed" — the boundary can
-              // error AFTER the body's publish was ACKed (e.g. a late deadline/cleanup failure), and
-              // the checkpoint on origin is then real: published WINS.
-              if (!isCodexBoundaryError(err)) throw err;
-              if (publishOutcome?.published === true) {
-                runLog.warn(
-                  "shutdown checkpoint boundary failed after the checkpoint was published to origin",
-                  { run_id: runId, error: errMessage(err) },
-                );
-                return "published";
-              }
-              runLog.warn("shutdown checkpoint boundary blocked; checkpoint not published to origin", {
-                run_id: runId,
-                error: errMessage(err),
-                ...codexBoundaryDiagnosticField(err, flight.redactText),
-              });
-              return isCodexBoundaryTimeout(err) ? "timeout" : "boundary_blocked";
-            }
-            return shutdownOutcomeOf(publishOutcome, permitSignal);
-          })();
-          // Claude retains the literal legacy budget race. Codex must not abandon a held
-          // permit: its boundary signal cancels supervised children + the upload at the same
-          // bounded deadline, and we await actual action/root settlement before terminal
-          // safety.dispose or run-home cleanup can proceed.
-          // issue #1597 M1: the Claude budget race resolving `undefined` IS the timeout class.
-          const raced: ShutdownCheckpointOutcome = executor.safety
-            ? await durability
-            : ((await this.raceShutdownBudget(durability, this.shutdownPublishTimeoutMs)) ?? "timeout");
-          // issue #4066: a Claude race that returned without the durability sequence abandons it still running;
-          // the shutdown barrier joins it before sealing so it can still settle what it opened.
-          if (!executor.safety && raced === "timeout") this.authority?.trackProducer(durability, "claude_shutdown_durability");
-          // issue #1597 M2: when a cancelled mid-turn tick left a git lock in the worker bare that
-          // could not be proven its own AND that lock STILL exists, a shutdown checkpoint that did
-          // not land is named for that cause — the retained lock is what blocks the fetch-back/
-          // publish. A lock that has since gone never relabels an unrelated failure.
-          const outcome: ShutdownCheckpointOutcome =
-            raced === "published"
-              ? raced
-              : this.tickSurvivorsRemain(flight)
-                ? "tick_process_survived"
-                : (await this.retainedBareLockRemains(flight))
-                  ? "bare_lock_retained"
-                  : raced;
-          runLog.info("shutdown checkpoint outcome", { run_id: runId, outcome });
-          // issue #1030 M4: surface the outcome on the feed the same way the park path does — a
-          // worker diagnostic, NOT deduped (it fires once per shutdown; only the generic
-          // publish-failure lines go through the reportPublishOutcome dedupe). Delivery is
-          // attempted BEFORE the single batcher.close() below — the shutdown
-          // branch closes the batcher exactly once, further down, never here.
-          this.emitWorkerDiagnostic(
-            flight,
-            "status",
-            // issue #1597 M1: the class only — no error message, remote text or credential. The
-            // tail names the likely restart point. A checkpoint this run (or its claim) knows
-            // landed is only adopted by a resume while it is still adoptable (runnerCloneForBranch
-            // sets it aside when e.g. origin/<branch> exists and it does not descend it), so that
-            // case is hedged; with no known checkpoint the default branch is named, as before.
-            outcome === "published"
-              ? "shutdown checkpoint published to origin"
-              : `shutdown checkpoint NOT published (reason: ${outcome}) — a resume on another worker will restart from ${
-                  flight.lastCheckpointRefTip
-                    ? "the last published checkpoint if it is still adoptable, else the branch or default branch"
-                    : "the default branch"
-                }`,
-          );
-          // PRD #1349 M2 (D4.6): record this generation's restore point in the durable journal
-          // so an interrupted run's exact hold can be dispositioned later. A shutdown is bounded
-          // by the k8s termination grace (the durability publish above is already raced against
-          // shutdownPublishTimeoutMs), so we do NOT run a credentialed fresh-forge capture here —
-          // that could exceed the grace and be SIGKILLed. Pin only (local, credential-free,
-          // sub-millisecond); settlement is left to the requeued run's reaped terminal or the
-          // server reconciler, and an abrupt interruption legitimately retains custody (D3).
-          await this.pinRecoveryGeneration(
-            claim,
-            flight,
-            await this.currentRestorePointHead(flight),
-          ).catch(async (e) =>
-            runLog.warn("recovery: shutdown generation-evidence pin failed (custody retained)", {
-              run_id: runId,
-              error: errMessage(e),
-              // PRD #1809 D6: name a pin that failed because the data volume is full.
-              ...(await this.diskFullCauseOf(e, this.git.recoveryRoot)),
-            }),
-          );
+        // Issue #3767: a spend-limit terminal that arrives while the worker is already shutting down
+        // takes this arm and sends no park request.
+        if (err instanceof SpendLimitHoldError) {
+          runLog.info("spend-limit park interrupted by worker shutdown", { run_id: runId, exit: "pre_catch" });
         }
-        // PRD #556 M1: a shutdown interrupt now preserves the same two filesystem dirs a
-        // park does (the sibling skills plugin dir and the per-run HOME holding the
-        // resumable SDK transcript), so a same-worker re-claim within the affinity grace
-        // can resume the SDK session instead of restarting it from scratch. Scoped to
-        // ONLY those two fs removals in the finally — every other cleanup still runs.
-        flight.preserveSession = true;
-        runLog.info("run interrupted by worker shutdown; leaving it for requeue");
-        await batcher.close().catch(() => undefined);
-        // NO reportState: the run stays non-terminal so the server's sweeper requeues
-        // it. Reporting `failed` here would turn a recoverable interruption into a dead
-        // run — the exact outcome the fetch-back exists to prevent.
+        await shutdownInterruption();
       } else if (err instanceof OrdinaryOwnerPaused) {
         flight.parked = true;
         await this.retainAcceptedOwnerPause(claim, flight, "recovery: owner pause pin failed");
@@ -22352,9 +22397,24 @@ export class RunRunner {
     cause: RecoveryParkCause = { kind: "transient" },
     opts: { terminalDisk?: boolean; heldAuthenticated?: HeldAuthenticatedCapture; heldCapture?: HeldFreeCapture;
       episode?: CaptureEpisode; freeFallback?: boolean; dispositionOnly?: boolean; dispositionSignal?: AbortSignal;
-      credentialDeadlineAt?: number; diskCause?: Extract<RecoveryParkCause, { kind: "data_volume_full" }> } = {},
+      credentialDeadlineAt?: number; diskCause?: Extract<RecoveryParkCause, { kind: "data_volume_full" }>;
+      /** Issue #3767: the caller's worker-shutdown interruption, run INSIDE this handler (before its
+       *  finally closes the batcher) when a shutdown races a spend-limit park. */
+      onShutdownExit?: () => Promise<void> } = {},
   ): Promise<boolean> {
     const disk = cause.kind === "data_volume_full" ? cause : opts.diskCause;
+    const spend = cause.kind === "anthropic_spend_limit" ? cause : undefined;
+    // Issue #3767: a spend-limit park that meets a worker shutdown takes the caller's shutdown
+    // interruption (checkpoint, diagnostic, no terminal report) instead of reporting `failed`.
+    // The shutdown routine runs at most once: a throw out of it must propagate, not re-enter it.
+    let shutdownExitRan = false;
+    const spendShutdownExit = async (exit: string): Promise<boolean> => {
+      if (!(spend && opts.onShutdownExit && flight.active?.shuttingDown)) return false;
+      shutdownExitRan = true;
+      runLog.info("spend-limit park interrupted by worker shutdown", { run_id: flight.runId, exit });
+      await opts.onShutdownExit();
+      return true;
+    };
     const episode = opts.episode;
     if (opts.dispositionOnly && episode) this.validateJoinedCapture(flight, episode);
     const progress = episode ? this.captureProgressFor(flight, episode) : undefined;
@@ -22675,6 +22735,7 @@ export class RunRunner {
         }
         captureSignal?.throwIfAborted();
         if (opts.terminalDisk) this.terminalDiskInterruption(flight);
+        if (await spendShutdownExit("loop_top")) return false;
         if (flight.active?.shuttingDown) return false;
         if (!confirmedRunning && !flight.steering.isCancelled()) {
           const confirm = await this.confirmRunningForCredentialPark(flight, body => reportState(body, captureSignal), runLog, captureSignal);
@@ -22738,7 +22799,7 @@ export class RunRunner {
           samePositiveGeneration = Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
             own.claim_generation === flight.claimGeneration;
           if (status === "cancelled" && own.claim_generation === flight.claimGeneration && own.claim_released !== true) this.observeCancellation(flight);
-          if ((credentialDeferred || opts.terminalDisk || this.isCredentialFreeOwnerCancel(claim, flight)) &&
+          if ((spend !== undefined || credentialDeferred || opts.terminalDisk || this.isCredentialFreeOwnerCancel(claim, flight)) &&
               own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
             // An authoritative successor claim: no report, and (issue #1786) the clone is kept (even
             // when covered), since the successor cannot see this worker's bytes.
@@ -23108,7 +23169,10 @@ export class RunRunner {
         const handoffTip = cause.kind === "publication_forge_unreachable" ? await this.publicationHandoffTip(flight) : undefined;
         try {
           const parkBody: StateRequest = {
-            ...(idleTyped
+            ...(spend
+              // Owner-held: the api writes a NULL retry. Never any progress or productive-turn counter.
+              ? { status: "recovery_wait", recovery_cause: "anthropic_spend_limit", claim_generation: flight.claimGeneration }
+              : idleTyped
               ? { status: "recovery_wait", recovery_cause: "codex_idle_stall", provider_progress_turns: flight.productiveTurns ?? 0 }
               : providerTyped
               ? { status: "recovery_wait", recovery_cause: "provider_outage", productive_turns: flight.productiveTurns ?? 0 }
@@ -23208,6 +23272,26 @@ export class RunRunner {
             markParkKeep();
             if (await this.dispositionProviderPark(claim, flight, runLog, providerReap, ack.status, opts.heldAuthenticated?.signal)) keepClone();
             return true;
+          }
+          if (spend && ack.status === "recovery_wait" &&
+              (ack.recoveryCause === undefined || ack.recoveryCause === "anthropic_spend_limit")) {
+            runLog.info("run parked for an Anthropic spend limit; it waits for owner Resume or Cancel", {
+              run_id: flight.runId,
+              cause: "anthropic_spend_limit",
+              published: capture.published,
+            });
+            batcher.emit({ kind: "status", agent: "worker", payload: { text: spendLimitParkFeed(spend.detail, capture.published, claim.kind) } });
+            // No reapThenSettleRecoveryGeneration: the custody hold and clone are kept, like the
+            // disk park, so an owner Resume continues from the retained work.
+            markParkKeep();
+            return true;
+          }
+          if (spend && ack.status === "recovery_wait") {
+            // The api parked the run under a different cause than ours: do not pretend.
+            runLog.warn("spend-limit park acknowledged with another recovery cause; failing the run", { cause: ack.recoveryCause });
+            if (await spendShutdownExit("terminal_arm")) return false;
+            await failCapture(err);
+            return false;
           }
           if (ack.status === "recovery_wait" && !credentialDeferred && disk) {
             const held = ack.recoveryRetryNotBefore === null;
@@ -23313,6 +23397,9 @@ export class RunRunner {
           // ownership: returning while it is still running would strand the row
           // because this healthy worker's heartbeats prevent stale-worker requeue.
         } catch (reportError) {
+          // Issue #3767: a throw out of the spend-limit shutdown routine (run from an ACK arm inside
+          // this try) propagates; it is never retried into a second shutdown routine.
+          if (shutdownExitRan) throw reportError;
           if (cause.kind === "publication_forge_unreachable" && reportError instanceof RequestError && reportError.status === 409) {
             let reason: string | undefined;
             try { reason = publicationParkRefusal(JSON.parse(reportError.body) as { reason?: string }); } catch { /* not a refusal body */ }
@@ -23326,7 +23413,7 @@ export class RunRunner {
           if (opts.heldAuthenticated && (reportError instanceof CheckpointUnsafeCleanupError ||
               isCodexBoundaryError(reportError) || opts.heldAuthenticated.signal.aborted ||
               Date.now() >= opts.heldAuthenticated.deadlineAt)) throw reportError;
-          if ((credentialDeferred || opts.terminalDisk) && reportError instanceof StaleClaimError) {
+          if ((spend !== undefined || credentialDeferred || opts.terminalDisk) && reportError instanceof StaleClaimError) {
             // #1247: the run moved on under this worker. Stop silently; issue #1786: the clone is kept
             // even when covered (no write through the stale claim).
             markReleaseEligible("recovery_park_report_stale", { stale: true, record: "stopped" });
@@ -23340,6 +23427,21 @@ export class RunRunner {
           if (opts.terminalDisk) {
             this.terminalDiskInterruption(flight);
             if (canonicalRecoveryInterruption(reportError)) throw reportError;
+          }
+          // Issue #3767: a DEFINITE refusal (an api that cannot take this cause answers a 4xx) never
+          // loops: the run fails with the provider's original message. Transport and 5xx errors
+          // keep the retry below.
+          // The client's local refusal (feature dropped mid-retry, or no positive generation) is just
+          // as definite: nothing was sent and nothing untyped may be sent.
+          if (spend && (reportError instanceof SpendLimitParkUnsupportedError ||
+              (reportError instanceof RequestError && reportError.status >= 400 && reportError.status < 500 &&
+              ![408, 409, 425, 429].includes(reportError.status)))) {
+            runLog.warn("spend-limit park refused; failing the run with the provider message", {
+              status: reportError instanceof RequestError ? reportError.status : undefined,
+            });
+            if (await spendShutdownExit("terminal_arm")) return false;
+            await failCapture(err);
+            return false;
           }
           // Bounded HTTP retries can fail while this worker keeps heartbeating.
           // Retain ownership and retry the idempotent park until its ACK is known.
@@ -23356,6 +23458,16 @@ export class RunRunner {
           (flight.steering.claimFence() !== undefined || flight.steering.isCancelled())) {
         const control = flight.steering.claimFence() !== undefined ? new StaleClaimError() : new Error("run cancelled");
         progress.control = { issued: {}, error: control };
+      }
+      // Issue #3767: a shutdown that interrupted the spend-limit park (capture or a report the
+      // shutdown aborted) takes the caller's shutdown interruption here, while the batcher is still
+      // open for its checkpoint diagnostic, instead of propagating into the generic recovery exit.
+      if (spend && opts.onShutdownExit && flight.active?.shuttingDown && !shutdownExitRan &&
+          !(error instanceof RetainedRecoveryStop) && !(error instanceof StaleClaimError) &&
+          flight.steering.claimFence() === undefined && !flight.steering.isCancelled() &&
+          !(progress && (opts.heldAuthenticated || opts.heldCapture))) {
+        await spendShutdownExit("propagated");
+        return false;
       }
       // dispatchFailure reuses this batcher to report the credential recovery notices.
       credentialRedispatch = opts.terminalDisk === true && codexDeferralOf(error) !== undefined;

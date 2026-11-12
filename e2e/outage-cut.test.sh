@@ -77,6 +77,7 @@ fixture() {
   say() { :; }
   wait_http() { [ "$API_AVAILABLE:$ALIAS_AVAILABLE" = 1:0 ]; }
   login() { :; }
+  restore_fixture_repo_states() { :; }
   docker_unwire_prepare() { :; }
   docker_unwire_assert() { :; }
   wait_worker_online() { :; }

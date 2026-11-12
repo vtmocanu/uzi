@@ -48,7 +48,8 @@ func validateProviderPark(req StateRequest) error {
 	// Typed accounting needs a positive generation: the nil-generation compatibility path must
 	// never become authority for a new streak or a progress reset (generation 0 is a chat run).
 	idle := req.State == "recovery_wait" && req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexIdleStall
-	if (typed || idle) && (req.ClaimGeneration == nil || *req.ClaimGeneration <= 0) {
+	spend := req.State == "recovery_wait" && req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseAnthropicSpendLimit
+	if (typed || idle || spend) && (req.ClaimGeneration == nil || *req.ClaimGeneration <= 0) {
 		return fmt.Errorf("%w: %s park requires a positive claim_generation", ErrInvalidState, *req.RecoveryCause)
 	}
 	return nil

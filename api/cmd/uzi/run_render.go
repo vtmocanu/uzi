@@ -175,6 +175,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if line := vaultParkLine(r); line != "" {
 		rows = append(rows, []string{"VAULT", line})
 	}
+	if line := spendLimitHoldLine(r); line != "" {
+		rows = append(rows, []string{"SPEND_LIMIT", line})
+	}
 	// DISK: current retry/hold timing and the lifetime disk-park count, only while parked.
 	if line := diskParkLine(r); line != "" {
 		rows = append(rows, []string{"DISK", line})
@@ -2180,6 +2183,10 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
 		recoveringSuffix = " (run waiting for the forge)"
 	}
+	// An Anthropic spend-limit hold is owner-held, never a transient interruption.
+	if len(recoveryCause) > 0 && recoveryCause[0] == anthropicSpendLimitCause {
+		recoveringSuffix = " (waiting for owner: spend limit)"
+	}
 	// PRD #1590: a run held on its Codex account names the account, not a transient
 	// interruption; the action detail lives on the run-get row and the TUI detail line.
 	if len(recoveryCause) > 0 && recoveryCause[0] == codexAccountUnavailableCause {
@@ -2550,6 +2557,9 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	}
 	if isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
+	}
+	if isSpendLimitHold(r.RunDTO) {
+		return s + " (" + spendLimitHoldShort + ")"
 	}
 	if short := codexAccountActionShort(r.RunDTO); short != "" {
 		s += " (" + short + ")"
