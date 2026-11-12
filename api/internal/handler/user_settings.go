@@ -1122,7 +1122,7 @@ func validateHarness(raw *string) (pgtype.Text, error) {
 // validateJudgeRunsOn maps a nullable judge_runs_on value to its storage type (PRD #3257):
 // a nil pointer clears to NULL ("same as the run"), "claude"/"codex" becomes a set
 // pgtype.Text, and anything else is a 400. The closed set mirrors the
-// users_judge_runs_on_check CHECK (migration 00425); the tokens come from workersvc so the
+// users_judge_runs_on_check CHECK (migration 00427); the tokens come from workersvc so the
 // API and the resolver cannot drift. Like validateHarness it does not trim a blank string
 // to NULL: only JSON null clears.
 func validateJudgeRunsOn(raw *string) (pgtype.Text, error) {

@@ -9,7 +9,7 @@
 --
 -- users is a hot table, so the statement times out rather than queue behind a long
 -- writer and stall everyone behind it. A nullable ADD COLUMN with no default is
--- metadata-only; the CHECK is added NOT VALID and VALIDATE-d in the sibling 00426, the
+-- metadata-only; the CHECK is added NOT VALID and VALIDATE-d in the sibling 00428, the
 -- lock-cheap two-step 00233/00234 established.
 SET LOCAL lock_timeout = '5s';
 
