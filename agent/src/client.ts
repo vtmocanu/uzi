@@ -335,6 +335,8 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number, round:
 }
 
 export type PlanCrossCheckStateRequest = StateRequest & {
+  /** Issue #4201: the credential-switch operation id a failed, held or uncertain report is fenced to. */
+  op_id?: string;
   plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null;
   plan_cross_check_diff_refusal?: PlanCrossCheckDiffRefusal;
   plan_cross_check_refusal?: "candidate_too_large" | "candidate_invalid" | "envelope_too_large" | "submit_failed";
@@ -491,8 +493,12 @@ interface StateAttemptEvidence {
 }
 
 // The api's generic invalid-state 400 body (worker_protocol.go state handler).
-const GENERIC_INVALID_STATE_ERROR =
-  "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed";
+// Both spellings are generic: the list an api without credential_switch_uncertain prints, and the
+// one a current api prints.
+const GENERIC_INVALID_STATE_ERRORS: ReadonlySet<string> = new Set([
+  "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed",
+  "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, completed, failed",
+]);
 
 /** True when a spend-limit park refusal means the server does not understand the cause: the strict
  *  decode refusal, or a 400 whose body is exactly the generic invalid-state error. */
@@ -501,7 +507,7 @@ function isUnsupportedSpendLimitRefusal(error: unknown): boolean {
   if (!(error instanceof RequestError) || error.status !== 400) return false;
   try {
     const decoded: unknown = JSON.parse(error.body);
-    return isRecord(decoded) && Object.keys(decoded).length === 1 && decoded.error === GENERIC_INVALID_STATE_ERROR;
+    return isRecord(decoded) && Object.keys(decoded).length === 1 && typeof decoded.error === "string" && GENERIC_INVALID_STATE_ERRORS.has(decoded.error);
   } catch { return false; }
 }
 
@@ -788,6 +794,18 @@ export class SanitizedPrDescriptionFields {
 // level (the version, its fields and their list entries, the size and its buckets): the fields are
 // minted as a frozen SanitizedPrDescriptionFields instance and the size is rebuilt frozen. None is exported: minting from arbitrary input stays
 // inside this module, on HTTP response bodies only.
+
+/** Issue #4201: the credential_switch signal is `{generation, op_id?}`; v1 servers omit op_id. */
+function credentialSwitchSignal(cs: { generation: number; op_id?: unknown }): { generation: number; op_id?: string } {
+  return typeof cs.op_id === "string" && cs.op_id !== "" ? { generation: cs.generation, op_id: cs.op_id } : { generation: cs.generation };
+}
+
+function parseJSONRecord(text: string): Record<string, unknown> | undefined {
+  try {
+    const v: unknown = JSON.parse(text);
+    return isRecord(v) ? v : undefined;
+  } catch { return undefined; }
+}
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -1329,6 +1347,34 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 
 /** issue #3181: the registration feature that lets a worker hold a credential switch it cannot settle. */
 export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
+/** Issue #4201: the api serves the in-place credential switch apply route and op-fenced reports. */
+const CREDENTIAL_SWITCH_APPLY_FEATURE = "credential_switch_apply_v1";
+/** Issue #4201: the protocol capability a worker advertises to use the in-place apply route. */
+const CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY = "credential_switch_in_place_v1";
+
+/** Issue #4201: the state report for an apply whose outcome the worker cannot establish. */
+const CREDENTIAL_SWITCH_UNCERTAIN_STATE = "credential_switch_uncertain";
+
+export interface CredentialSwitchApplyRequest {
+  claimGeneration: number;
+  registerNonce: string;
+  opId: string;
+  oldCumulative?: unknown;
+}
+
+/** Raw classification of one apply call. Never carries a response body; `detail` is a fixed label. */
+export type CredentialSwitchApplyResult =
+  | { kind: "applied"; token: string; ordinal: number; messageSeq: number; replay: boolean }
+  | { kind: "superseded" }
+  | { kind: "fenced" }
+  | { kind: "not_applied"; reason: string }
+  | { kind: "refused_committed"; reason: string }
+  | { kind: "uncertain"; detail: string }
+  | { kind: "route_absent" };
+
+const APPLY_TOKEN_MIN_LENGTH = 8;
+const APPLY_RESPONSE_MAX_BYTES = 16 * 1024;
+const APPLY_REASON_MAX = 128;
 /** Issue #3985: the server accepts `clarification_settled` after a human revise's clarification. */
 export const CLARIFICATION_REVISION_SETTLEMENT_FEATURE = "clarification_revision_settlement_v1";
 
@@ -1600,6 +1646,8 @@ export class WorkerClient {
    * optimistic so the next request self-recovers once the api rolls forward).
    */
   private hasCredentialSwitchCapability = false;
+  /** Issue #4201: whether THIS registration advertised credential_switch_in_place_v1. */
+  private hasInPlaceCredentialSwitchCapability = false;
   /** Issue #3859: set when this registration's api proved (strict-decode 400) it cannot decode
    *  `registration_evidence`. Sticky until the next register(); a heartbeat feature refresh does
    *  not reopen it, which is why it is not simply dropFeature(). */
@@ -1949,6 +1997,7 @@ export class WorkerClient {
     // capability, so the send-gate can stamp the claim generation optimistically (its runs
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
+    this.hasInPlaceCredentialSwitchCapability = originalCapabilities?.includes(CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY) ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
     this.hasBindinglessHoldCapability = originalCapabilities?.includes("recovery_bindingless_closed_v1") ?? false;
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
@@ -1985,6 +2034,74 @@ export class WorkerClient {
   /** Whether the current API feature cache advertises `f`; gates optional wire extensions. */
   hasFeature(f: string): boolean {
     return this.serverFeatures.has(f);
+  }
+
+  /** Issue #4201: the in-place switch needs this registration's capability AND the server feature. */
+  supportsInPlaceCredentialSwitch(): boolean {
+    return this.hasInPlaceCredentialSwitchCapability && this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE);
+  }
+
+  /**
+   * POST /worker/runs/:id/credential-switch/apply (issue #4201). One attempt, never retried here.
+   * Classification is strict: `route_absent` only for chi's default text/plain `404 page not found`;
+   * the exact run-not-owned JSON 404 is `fenced`; everything unrecognised is `uncertain`, because the
+   * server may have committed. Never echoes a response body or the token. Callers must check
+   * supportsInPlaceCredentialSwitch() first; calling without it is a programming error.
+   */
+  async applyCredentialSwitch(runId: string, req: CredentialSwitchApplyRequest): Promise<CredentialSwitchApplyResult> {
+    if (!this.supportsInPlaceCredentialSwitch())
+      throw new Error("applyCredentialSwitch requires the credential_switch_in_place_v1 capability and the credential_switch_apply_v1 feature; check supportsInPlaceCredentialSwitch() first");
+    const body: Record<string, unknown> = {
+      claim_generation: req.claimGeneration, register_nonce: req.registerNonce, op_id: req.opId,
+    };
+    if (req.oldCumulative !== undefined) body.old_cumulative = req.oldCumulative;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/credential-switch/apply`;
+    const uncertain = (detail: string): CredentialSwitchApplyResult => ({ kind: "uncertain", detail });
+    let res: Response;
+    try {
+      res = await this.fetchRaw("POST", path, body);
+    } catch {
+      return uncertain("transport_error");
+    }
+    let raw: Buffer;
+    try {
+      raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true);
+    } catch {
+      return uncertain("response_unreadable");
+    }
+    const text = raw.toString("utf8");
+    if (res.status === 404) {
+      const contentType = (res.headers.get("content-type") ?? "").trim().toLowerCase();
+      if (contentType.startsWith("text/plain") && (text === "404 page not found" || text === "404 page not found\n"))
+        return { kind: "route_absent" };
+      const decoded = parseJSONRecord(text);
+      if (decoded && Object.keys(decoded).length === 1 && decoded.error === "run not found for this worker")
+        return { kind: "fenced" };
+      return uncertain("unrecognized_404");
+    }
+    if (res.status !== 200) return uncertain(`http_${res.status}`);
+    const out = parseJSONRecord(text);
+    if (!out) return uncertain("malformed_response");
+    switch (out.outcome) {
+      case "applied": {
+        const { token, ordinal, message_seq: messageSeq, replay } = out;
+        if (typeof token !== "string" || token.length < APPLY_TOKEN_MIN_LENGTH ||
+            typeof ordinal !== "number" || !Number.isSafeInteger(ordinal) || ordinal < 1 ||
+            typeof messageSeq !== "number" || !Number.isSafeInteger(messageSeq) || messageSeq < 0)
+          return uncertain("malformed_applied");
+        return { kind: "applied", token, ordinal, messageSeq, replay: replay === true };
+      }
+      case "superseded": return { kind: "superseded" };
+      case "fenced": return { kind: "fenced" };
+      case "not_applied":
+      case "refused_committed": {
+        const reason = out.reason;
+        if (typeof reason !== "string" || reason.length === 0 || reason.length > APPLY_REASON_MAX)
+          return uncertain("malformed_reason");
+        return { kind: out.outcome, reason };
+      }
+      default: return uncertain("unknown_outcome");
+    }
   }
 
   /** V2 publication requires both this registration's capability and the server feature. */
@@ -2706,6 +2823,25 @@ export class WorkerClient {
       return this.reportStateOnce(runId, path, frozen, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     this.sealCodexAdmission(path, body);
+    if ((body.status as string) === CREDENTIAL_SWITCH_UNCERTAIN_STATE) {
+      // Issue #4201: fenced on the current registration and on the switch operation; never
+      // downgraded or retried unqualified, because an api without the feature cannot decode it.
+      const nonce = this.registerNonce;
+      if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE) || !nonce ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+          typeof body.op_id !== "string" || body.op_id === "")
+        throw new Error("credential switch uncertain report requires the credential_switch_apply_v1 feature, a registration nonce, a positive claim_generation and an op_id");
+      return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
+    if (body.op_id !== undefined) {
+      if (body.status !== "credential_switch_failed" && body.status !== "credential_switch_held")
+        throw new Error("op_id is only valid on credential switch failed, held and uncertain reports");
+      // An api without the feature strict-decodes the report: keep the pre-#4201 shape for it.
+      if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE)) {
+        const { op_id: _opId, ...withoutOp } = body;
+        body = withoutOp;
+      }
+    }
     if (body.source_publication !== undefined) {
       // Snapshot nested proof once, before either transport retries or caller mutation.
       const outbound: PlanCrossCheckStateRequest = Object.freeze(structuredClone(body));
@@ -4003,7 +4139,7 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
+  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number; op_id?: string }; receipts?: boolean; nowSummary?: boolean }> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const epoch = this.inputObservationEpoch;
@@ -4023,7 +4159,7 @@ export class WorkerClient {
     // (steering.maybeTripCredentialSwitch); a legacy caller that reads only `.inputs` is unaffected.
     // Issue #1673: `receipts` is the server's per-reply declaration of receipt mode.
     // PRD #2603: `now_summary` is the run's effective Now-summary setting; absent ⇒ off.
-    return { inputs: res.inputs ?? [], ...(terminalCancelled ? { terminalCancelled } : {}), credentialSwitch: res.credential_switch, receipts: res.receipts === true, nowSummary: res.now_summary === true };
+    return { inputs: res.inputs ?? [], ...(terminalCancelled ? { terminalCancelled } : {}), credentialSwitch: res.credential_switch ? credentialSwitchSignal(res.credential_switch) : undefined, receipts: res.receipts === true, nowSummary: res.now_summary === true };
   }
 
   async ackInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
@@ -5818,7 +5954,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   budgetExhausted?: boolean;
   reason?: string;
   recoveryRetryNotBefore?: string | null;
-  credentialSwitch?: { generation: number };
+  credentialSwitch?: { generation: number; op_id?: string };
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
   credentialSwitchHeld?: boolean;
@@ -5915,7 +6051,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       budgetExhausted?: boolean;
       reason?: string;
       recoveryRetryNotBefore?: string | null;
-      credentialSwitch?: { generation: number };
+      credentialSwitch?: { generation: number; op_id?: string };
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
       credentialSwitchHeld?: boolean;
@@ -6046,7 +6182,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // reportState closure throws StaleClaimError off staleClaim.
     const cs = parsed?.credential_switch;
     if (typeof cs === "object" && cs !== null && typeof (cs as { generation?: unknown }).generation === "number")
-      out.credentialSwitch = { generation: (cs as { generation: number }).generation };
+      out.credentialSwitch = credentialSwitchSignal(cs as { generation: number; op_id?: unknown });
     if (parsed?.disposition === "stale_claim") out.staleClaim = true;
     // PRD #1247 M5b (BLOCKING-2 rework): the held-state credential-switch RELEASE applied. The
     // server sets it on the 200 ack for BOTH a fresh requeue (status 'queued') and an idempotent
