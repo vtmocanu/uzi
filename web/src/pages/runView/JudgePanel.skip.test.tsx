@@ -6,9 +6,9 @@
 // The skip only renders when there is no review and no pending judge (read precedence review >
 // pending > skip), and a rerun refusal (422) shows inline.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { JudgePanel } from "./JudgePanel";
+import { JUDGE_SETTLE_MAX_TRIES, JudgePanel } from "./JudgePanel";
 import { api, ApiError, type JudgeSkip, type Run, type RunReview } from "../../lib/api";
 import { mockRuns } from "../../mocks/data";
 
@@ -178,5 +178,85 @@ describe("JudgePanel skip state (#3257 M2)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run judge" }));
     await waitFor(() => expect(screen.queryByText(/The judge was skipped/)).toBeNull());
     expect(screen.getAllByText(/Judge re-queued/).length).toBeGreaterThan(0);
+  });
+
+  // The panel mounts on the terminal transition, which the server broadcasts before it runs the
+  // automatic judge enqueue, so the first answer can be empty and the skip commit a moment later.
+  describe("settle poll after a just-finished run", () => {
+    function renderRun(finishedAt: string) {
+      return render(
+        <MemoryRouter>
+          <JudgePanel run={{ ...RUN, status: "completed", finished_at: finishedAt }} />
+        </MemoryRouter>,
+      );
+    }
+
+    it("shows a skip recorded after an empty first answer", async () => {
+      vi.useFakeTimers();
+      try {
+        mockApi.getRunReview
+          .mockResolvedValueOnce({ review: null, pending_judge: null, skip: null })
+          .mockResolvedValue({ review: null, pending_judge: null, skip: skip() });
+        renderRun(new Date().toISOString());
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(screen.getByText(/hasn't been judged yet/)).toBeTruthy();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(4000);
+        });
+        expect(screen.getByText("judge skipped")).toBeTruthy();
+        expect(screen.queryByText(/hasn't been judged yet/)).toBeNull();
+        // It stopped at the first non-empty answer.
+        const calls = mockApi.getRunReview.mock.calls.length;
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(20_000);
+        });
+        expect(mockApi.getRunReview.mock.calls.length).toBe(calls);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("gives up after the cap when nothing is ever recorded", async () => {
+      vi.useFakeTimers();
+      try {
+        mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null, skip: null });
+        renderRun(new Date().toISOString());
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(4000 * (JUDGE_SETTLE_MAX_TRIES + 3));
+        });
+        expect(mockApi.getRunReview.mock.calls.length).toBe(1 + JUDGE_SETTLE_MAX_TRIES);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not re-poll a run that finished long ago", async () => {
+      vi.useFakeTimers();
+      try {
+        mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null, skip: null });
+        renderRun("2020-01-01T00:00:00Z");
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(30_000);
+        });
+        expect(mockApi.getRunReview.mock.calls.length).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it("the never-judged copy is harness-neutral", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null, skip: null });
+    renderPanel();
+    const p = await screen.findByText(/hasn't been judged yet/);
+    expect(p.textContent).not.toMatch(/Anthropic|your/);
   });
 });

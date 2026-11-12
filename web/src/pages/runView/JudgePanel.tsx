@@ -171,6 +171,22 @@ function JudgeSkipNotice({ skip }: { skip: JudgeSkip }) {
 // event-loop turns (issue #227); production never passes it, so the default always holds.
 export const JUDGE_POLL_MAX_TRIES = 150;
 
+// The settle poll (issue #3257): RunView mounts this panel on the run's terminal transition,
+// which the server broadcasts BEFORE it runs the automatic judge enqueue (maybeEnqueueJudge,
+// api/internal/workersvc/service.go), so the mount fetch can land before the queued judge or
+// the recorded skip commits. When that first answer is empty (no review, no pending judge, no
+// skip) for a run that finished within JUDGE_SETTLE_WINDOW_MS, the panel re-asks every 4s, up
+// to JUDGE_SETTLE_MAX_TRIES times, and stops at the first non-empty answer (a pending judge
+// then hands over to the in-flight poll below). An old never-judged run is not re-polled.
+export const JUDGE_SETTLE_MAX_TRIES = 5;
+const JUDGE_SETTLE_WINDOW_MS = 2 * 60 * 1000;
+
+function finishedRecently(finishedAt: string | null | undefined): boolean {
+  if (!finishedAt) return false;
+  const t = Date.parse(finishedAt);
+  return Number.isFinite(t) && Date.now() - t < JUDGE_SETTLE_WINDOW_MS;
+}
+
 export function JudgePanel({
   run,
   pollMaxTries = JUDGE_POLL_MAX_TRIES,
@@ -191,6 +207,8 @@ export function JudgePanel({
   // the server already applies that precedence; the render re-applies it so a stale skip can
   // never sit beside a verdict or an in-flight judge.
   const [skip, setSkip] = useState<JudgeSkip | null>(null);
+  // Armed by an empty mount answer for a just-finished run (see JUDGE_SETTLE_MAX_TRIES).
+  const [settling, setSettling] = useState(false);
   // The caller's connected repos back the file-issue draft picker (PRD #68 M4). Fetched
   // once for the panel; a failure just leaves the picker empty (the draft still opens).
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -242,6 +260,10 @@ export function JudgePanel({
       // handles the same skew on the CLI side.)
       setPendingJudge(pending_judge ?? null);
       setSkip(skip ?? null);
+      setSettling(
+        review === null && (pending_judge ?? null) === null && (skip ?? null) === null &&
+          finishedRecently(run.finished_at),
+      );
     },
     [run.id],
     { enabled: eligible, fallback: "Failed to load the review" },
@@ -373,6 +395,45 @@ export function JudgePanel({
     }, 4000);
     return () => clearInterval(id);
   }, [polling, run.id, pollMaxTries]);
+
+  // The settle poll (see JUDGE_SETTLE_MAX_TRIES). It writes the same state as the mount
+  // fetch and ends at the first non-empty answer or the cap; a click on Run judge ends it too
+  // (the in-flight poll owns that episode).
+  useEffect(() => {
+    if (!settling || queued) return;
+    let tries = 0;
+    let alive = true;
+    const id = setInterval(async () => {
+      tries += 1;
+      let next: Awaited<ReturnType<typeof api.getRunReview>> | null = null;
+      try {
+        next = await api.getRunReview(run.id);
+      } catch {
+        next = null; // transient: the cap bounds it
+      }
+      if (!alive) return;
+      const nextPending = next?.pending_judge ?? null;
+      const nextSkip = next?.skip ?? null;
+      const nextReview = next?.review ?? null;
+      if (nextReview !== null || nextPending !== null || nextSkip !== null) {
+        setReview(nextReview);
+        baselineUpdatedAt.current = nextReview?.updated_at ?? null;
+        setPendingJudge(nextPending);
+        setSkip(nextSkip);
+        setSettling(false);
+        clearInterval(id);
+        return;
+      }
+      if (tries >= JUDGE_SETTLE_MAX_TRIES) {
+        setSettling(false);
+        clearInterval(id);
+      }
+    }, 4000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [settling, queued, run.id]);
 
   const rerun = async () => {
     setActionErr("");
@@ -544,7 +605,7 @@ export function JudgePanel({
           <JudgeSkipNotice skip={skip} />
         ) : (
           <p className="text-sm text-faint">
-            This run hasn't been judged yet. Running the judge reviews the run on your Anthropic token.
+            This run hasn't been judged yet. Running the judge reviews the run on the owner's credential for the judge's harness.
           </p>
         )
       ) : (
