@@ -518,9 +518,14 @@ Nothing restarts the worker for you.
 Boundaries. Workers that provide neither witness (an old agent that sends no
 registration evidence and never lists the run in a snapshot) and workers that
 re-register between refusals are not witnessed; they remain bounded only by the per-run custody
-bound (`custody_hold_limit`, default 8, ADR-1751 D2a), which can still block the
-owner. If `custody_hold_limit` is below the requeue budget the run stays
-`queued` with health `custody_limit` instead of parking. Migration 00404's Down
+bound (`custody_hold_limit`, default 8, ADR-1751 D2a), which since #4162 is a hard
+bound: it blocks only that run, whatever the owner's admission units. If
+`custody_hold_limit` is below the requeue budget the run stays `queued` with the
+per-run reason ("this run has reached its own custody hold limit; retained holds
+still protect its work; resolve or discard this run's own retained holds to let it
+start", not the owner custody-limit wait) instead of parking. Resume does not
+bypass it and creates no further claim or hold; discard or settle that run's own
+holds to free it. Migration 00404's Down
 refuses while any run is parked at this cause (Resume or Cancel it first) and
 clears the cause on other rows.
 

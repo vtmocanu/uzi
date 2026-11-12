@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -496,7 +497,9 @@ func TestIssue4044CustodyLimitLiveDB(t *testing.T) {
 			cp.CustodyHoldLimit = 1
 			f.refuse(t, cp, hold)
 			flag, reason := f.svc.healthTargetFor(f.e.ctx, f.at, f.e.healthRowFor(t, f.run), healthThresholds{queued: time.Minute, custodyLimit: 1, custodyLimitOK: true})
-			if flag != healthWaitingWorker || reason != reasonCustodyLimit {
+			// The run's own open hold reaches the limit, so issue #4162's hard per-run bound is the
+			// binding cause and outranks the owner-limit reason (queuedCustodyReason).
+			if flag != healthWaitingWorker || reason != apitypes.ReasonCustodyRunHoldBound {
 				t.Fatalf("custody limit health=(%q,%q)", flag, reason)
 			}
 			cp.CustodyHoldLimit = 2

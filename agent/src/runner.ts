@@ -27159,13 +27159,18 @@ export class RunRunner {
     const predecessor = RUN_ID_RE.test(hold.ownerRunId) ? hold.ownerRunId : "unknown";
     const willPark = this.client?.protocolFeatures?.includes(RETAINED_ADOPTION_FAILED_FEATURE) === true &&
       Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0;
-    const notHeld = "This run was not placed on an owner hold: each automatic retry on this worker will stop the same way " +
-      "and adds at least one admission-counted custody hold, up to this run's custody admission limit, unless that " +
-      "remediation has been resolved through a separately authorized route. ";
+    const notHeld = "This run was not placed on an owner hold. Each automatic retry on this worker will stop the same way " +
+      "unless that remediation has been resolved through a separately authorized route. " +
+      "This run's holds from one original worker count as one admission unit toward the owner limit, but each stays open. " +
+      "Below the custody hold limit, each retry that is claimed opens at least one more custody hold for this run. " +
+      "Once this run's own open holds reach the custody hold limit it is no longer claimed; only discarding or settling " +
+      "this run's own holds frees it. ";
     const consequence = willPark
-      ? "Resume on this worker will hold again unchanged and adds at least one admission-counted custody hold; lost " +
-        "reports, crashes or worker re-registration can add more, up to this run's custody admission limit, unless " +
-        "that remediation has been resolved through a separately authorized route. "
+      ? "Resume on this worker will hold again unchanged unless that remediation has been resolved through a separately " +
+        "authorized route. This run's holds from one original worker count as one admission unit toward the owner limit, " +
+        "but each stays open. Below the custody hold limit, a Resume that is claimed opens at least one more custody hold " +
+        "for this run. Once this run's own open holds reach the custody hold limit, Resume creates no claim and no hold; " +
+        "only discarding or settling this run's own holds frees it. "
       : notHeld;
     flight.batcher.emit({
       kind: "status",
@@ -27863,8 +27868,10 @@ export class RunRunner {
     flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: sanitizeForLog(flight.redactText(
       `Independent continuation was refused before any source effect: this release does not support this predecessor (${unsupported}). ` +
       "The predecessor's source and custody stay on this worker. The worker is requesting an owner hold; the run's status shows " +
-      "whether it was applied. If held, Resume claims again, will hold again unchanged on this release and adds at least one " +
-      "admission-counted custody hold (lost reports, crashes or worker re-registration can add more), and Cancel ends the run. " +
+      "whether it was applied. If held, Resume claims again only while this run's own open holds are below the custody hold limit; " +
+      "a claimed Resume will hold again unchanged on this release and opens at least one more hold. This run's holds from one " +
+      "original worker count as one admission unit toward the owner limit, but each stays open. At the limit, Resume creates " +
+      "no claim and no hold; only discarding or settling this run's own holds frees it. Cancel ends the run. " +
       `If not held, automatic retries follow the ordinary requeue accounting.${hostedRoll}`), 1200) } });
     try {
       const delivered = await flight.batcher.flushOwned(

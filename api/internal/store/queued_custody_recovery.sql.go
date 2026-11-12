@@ -355,19 +355,19 @@ WHERE r.worker_id = $2 AND r.id = ANY($3::uuid[])
         AND f.stop_kind IS NOT DISTINCT FROM r.stop_kind
         AND f.stop_reason IS NOT DISTINCT FROM r.stop_reason
         AND f.hold_reason IS NOT DISTINCT FROM r.hold_reason)
-  -- Same owner count and bounded continuation exemption as ClaimRun. An own
+  -- The park needs only the run's own in-range open holds at the limit (ClaimRun's hard per-run
+  -- bound, issue #4162); the owner admission count is deliberately not required here. An own
   -- open hold is also mandatory, so ordinary and generation-zero work cannot park.
   AND $6::integer > 0
   AND (SELECT count(*) FROM recovery_custody_holds h
       WHERE h.id = ANY($7::uuid[])
         AND h.run_id = r.id AND h.user_id = r.user_id AND h.state = 'open'
         AND h.generation BETWEEN 1 AND r.claim_generation) >= $6
-  AND fn_custody_admission_count(r.user_id, $8::timestamptz) >= $6
   -- A fresh current-generation execution or pending outcome still owns this run.
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
       WHERE a.worker_id = r.worker_id AND a.run_id = r.id AND a.claim_generation = r.claim_generation
         AND r.claim_released_at IS NULL
-        AND (a.reported_at >= $9::timestamptz
+        AND (a.reported_at >= $8::timestamptz
              OR (a.terminal_pending AND a.terminal_pending_until > now())))
   AND NOT EXISTS (SELECT 1 FROM workers w
       WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
@@ -389,7 +389,6 @@ type ParkFrozenQueuedCustodyExhaustedParams struct {
 	FrozenTargets       []byte             `json:"frozen_targets"`
 	CustodyHoldLimit    int32              `json:"custody_hold_limit"`
 	LockedHoldIds       []uuid.UUID        `json:"locked_hold_ids"`
-	HeartbeatCutoff     pgtype.Timestamptz `json:"heartbeat_cutoff"`
 	SnapshotFreshCutoff pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
 }
 
@@ -410,7 +409,6 @@ func (q *Queries) ParkFrozenQueuedCustodyExhausted(ctx context.Context, arg Park
 		arg.FrozenTargets,
 		arg.CustodyHoldLimit,
 		arg.LockedHoldIds,
-		arg.HeartbeatCutoff,
 		arg.SnapshotFreshCutoff,
 	)
 	if err != nil {

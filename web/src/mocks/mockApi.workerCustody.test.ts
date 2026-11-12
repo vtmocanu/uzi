@@ -89,3 +89,36 @@ it("keeps the custody holder deleted after its holds are discarded and it is del
   await vi.advanceTimersByTimeAsync(1000);
   expect((await listP).workers.some((w) => w.id === "wkr-jvm")).toBe(false);
 });
+
+it("shows the per-run custody bound under custody-run-bound: blocked run while counted units stay below the limit", async () => {
+  window.localStorage.setItem("uzi_mock_scenario", "custody-run-bound");
+  vi.useFakeTimers();
+  const p = mockApi.getRecoveryHolds();
+  await vi.advanceTimersByTimeAsync(1000);
+  const { aggregate } = await p;
+  expect(aggregate.open_holds).toBe(9);
+  expect(aggregate.admission_counted_holds).toBe(1);
+  expect(aggregate.blocked_runs).toBe(1);
+  expect(aggregate.admission_counted_holds!).toBeLessThan(aggregate.custody_hold_limit);
+  expect(mockRuns.find((r) => r.id === "run-custody-run-bound")?.health_reason).toMatch(/own custody hold limit/);
+
+  // Discarding enough of the run's own holds (9 open -> 7, below the limit of 8) unblocks it.
+  for (const holdId of ["hold-rb-1", "hold-rb-2"]) {
+    const d = mockApi.discardHold("run-custody-run-bound", holdId);
+    await vi.advanceTimersByTimeAsync(1000);
+    await d;
+  }
+  const after = mockApi.getRecoveryHolds();
+  await vi.advanceTimersByTimeAsync(1000);
+  const afterResp = await after;
+  const next = afterResp.aggregate;
+  expect(next.open_holds).toBe(7);
+  expect(next.blocked_runs).toBe(0);
+  // The surviving group still counts as one unit, represented by its oldest member.
+  const survivors = afterResp.holds.filter((h) => h.run_id === "run-custody-run-bound");
+  const counted = survivors.filter((h) => h.counts_toward_admission === true);
+  expect(next.admission_counted_holds).toBe(afterResp.holds.filter((h) => h.counts_toward_admission === true).length);
+  expect(counted).toHaveLength(1);
+  expect(counted[0].id).toBe("hold-rb-3");
+  expect(counted[0].admission_reason).toBe("earlier_generation");
+});

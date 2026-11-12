@@ -2238,6 +2238,14 @@ for (const [id, max, sourceOnly] of [
     },
   });
 }
+// Per-run custody bound: open /runs/run-custody-run-bound under ?mock=custody-run-bound. The
+// literal is apitypes.ReasonCustodyRunHoldBound (api/internal/apitypes/recovery.go); the run's
+// own open holds reach the limit while the owner's counted units stay below it.
+mockRuns.push({
+  ...pausedBase, id: "run-custody-run-bound", status: "queued", hold_reason: null,
+  health: "ok", health_since: null,
+  health_reason: "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
+});
 // Issue #3767: a Claude run held on its Anthropic API key's spend limit. Owner-held (explicit
 // null retry stamp); open /runs/run-spend-limit-hold.
 mockRuns.push({

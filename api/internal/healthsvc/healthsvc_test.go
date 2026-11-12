@@ -980,7 +980,7 @@ func TestCustodyHoldsAdvice(t *testing.T) {
 			}
 			want := []apitypes.HealthEvidenceDTO{
 				{Label: "Owners", Value: fmt.Sprint(len(tc.holds))},
-				{Label: "Admission-counted holds", Value: "0"},
+				{Label: "Admission units", Value: "0"},
 				{Label: "Total open custody", Value: "0"},
 				{Label: "Owners with decisions", Value: tc.with},
 				{Label: "Owners without decisions", Value: tc.without},
@@ -1879,7 +1879,7 @@ func TestCustodyHoldsConfiguredCutoffAndFacts(t *testing.T) {
 			got = check
 		}
 	}
-	want := []apitypes.HealthEvidenceDTO{{Label: "Owners", Value: "2"}, {Label: "Admission-counted holds", Value: "16"}, {Label: "Total open custody", Value: "22"}, {Label: "Owners with decisions", Value: "0"}, {Label: "Owners without decisions", Value: "2"}}
+	want := []apitypes.HealthEvidenceDTO{{Label: "Owners", Value: "2"}, {Label: "Admission units", Value: "16"}, {Label: "Total open custody", Value: "22"}, {Label: "Owners with decisions", Value: "0"}, {Label: "Owners without decisions", Value: "2"}}
 	if got.Severity != sevWarn || !reflect.DeepEqual(got.Evidence, want) {
 		t.Fatalf("custody check=%+v, want evidence=%v", got, want)
 	}

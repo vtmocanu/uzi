@@ -959,7 +959,7 @@ describe("OverviewNext held work card", () => {
     await page.viewport(400, 900);
     mountWithHolds();
     await screen.findByText("Capacity");
-    await screen.findByText("custody slots used");
+    await screen.findByText("custody units used");
     await document.fonts.ready;
     expect(window.innerWidth).toBe(400);
     const capacity = cardOf(/Capacity/).getBoundingClientRect();
@@ -982,7 +982,7 @@ describe("OverviewNext held work card", () => {
     await page.viewport(1100, 900);
     mountWithHolds();
     await screen.findByText("Capacity");
-    await screen.findByText("custody slots used");
+    await screen.findByText("custody units used");
     await document.fonts.ready;
     const capacity = cardOf(/Capacity/).getBoundingClientRect();
     const held = cardOf(/Held work/).getBoundingClientRect();

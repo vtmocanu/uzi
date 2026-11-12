@@ -1472,19 +1472,23 @@ before native bundle verification/import.
 ### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
 
 A run's custody hold protects its committed-but-unpublished work per claim generation.
-The owner admission limit is the admin setting `custody_hold_limit` (default 8 counted
-holds; see [Admin settings](./admin-settings.md#custody-hold-limit)). `open_holds` is total open custody;
-`admission_counted_holds` excludes at most one hold per run backing a healthy, valid live
+The owner admission limit is the admin setting `custody_hold_limit` (default 8
+admission units; see [Admin settings](./admin-settings.md#custody-hold-limit)). `open_holds` is total open custody;
+`admission_counted_holds` counts admission units: it first excludes at most one hold per run backing a healthy, valid live
 current-generation claim without an owner decision. That requires exact owner/run/live-run
 and worker identity, an unreleased claim, a fresh non-null heartbeat (inclusive cutoff
 from the configured `WorkerHeartbeatStale`), and status `claimed`, `running`,
 `awaiting_approval`, `awaiting_input` or `awaiting_followup`. Missing, mismatched, stale,
 released, terminal and old/future-generation claims remain counted, as do decision holds;
 `active` attention alone does not establish eligibility. The discount releases nothing
-and does not permit pruning or teardown of held source.
+and does not permit pruning or teardown of held source. Of the remaining open holds, a run's
+open holds on the same original worker, from any of its generations, count as one unit together (whatever the
+worker's heartbeat); every other hold counts as one unit alone.
 
 New code runs wait at the admission limit. A previously claimed queued run with 1 to limit-1
-of its own total open holds can still resume; at the limit it loses that exemption. Concurrent
+of its own total open holds can still resume. A queued run whose own open holds (counted or not)
+reach the limit is not started even when its owner is below the limit, and an owner Resume does not
+bypass it; discard or settle that run's own holds to free it. Concurrent
 claims and later heartbeat staleness can exceed the limit: it is a statement-snapshot
 admission gate, not a strict ceiling. To find what held work you have, start here before
 choosing a run to export or an exact hold to discard:
@@ -1496,13 +1500,16 @@ uzi run recovery [--json]
 - The human view shows only open holds across your runs, oldest first by `created_at`.
   Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ADMISSION`, `ARCHIVE` (whether an
   available capture exists), `WORKER`, and `AGE`. `ADMISSION` is the server's per-hold
-  custody admission membership: `counted (<reason>)`, `not counted`, or `-` when the
+  custody admission membership: `counted (<reason>)`, `not counted (<reason>)` (for example
+  `not counted (same_run_group)`: one of a run's open holds on the same original worker (any generation),
+  covered by that group's counted representative), or `-` when the
   server did not report it (a non-open hold or an older server), which is unknown, never
   `not counted`. Run and hold ids are shown in full.
-  Below the table it prints the owner-wide `open_holds`, `admission_counted_holds`,
+  Below the table it prints the owner-wide `open_holds`, `admission_units (admission_counted_holds): N`,
   `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate. Read
-  `admission_counted_holds` against the limit for capacity, and `open_holds` for total
-  custody. `blocked_runs` excludes continuations eligible for the exemption. If the
+  `admission_counted_holds` (admission units) against the limit for capacity, and `open_holds` for total
+  custody. `blocked_runs` excludes continuations eligible for the exemption, and also counts queued runs
+  stopped by the hard per-run bound (their own open holds at the limit), even when the owner is below it. If the
   server cannot read a valid `custody_hold_limit`, the listing returns an error instead of
   guessing a limit; an admin saves a valid value in Admin → Instance settings. For each
   `source_only` hold it reports retained source and archive availability independently.

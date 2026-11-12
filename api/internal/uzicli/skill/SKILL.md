@@ -845,20 +845,24 @@ uzi version
 - `uzi run recovery [<run-id>] [--json]` — start without a run id to find what held work
   you have before export or discard. The human view lists only open custody holds across
   your runs in `created_at` order, with full `RUN ID` and `HOLD ID`, `GEN`, `DISPOSITION`,
-  `ADMISSION` (`counted (<reason>)`, `not counted`, or `-` when the server did not report it: unknown, never `not counted`), `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
-  `open_holds`, `admission_counted_holds`, `custody_hold_limit`, `decision_needed`, and
+  `ADMISSION` (`counted (<reason>)`, `not counted (<reason>)` such as `not counted (same_run_group)`, or `-` when the server did not report it: unknown, never `not counted`), `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
+  `open_holds`, `admission_units (admission_counted_holds): N`, `custody_hold_limit`, `decision_needed`, and
   `blocked_runs` aggregate (the listing errors if the server cannot read a valid
-  `custody_hold_limit`; an admin saves one). Capacity uses admission count against the configured `custody_hold_limit` (default 8);
+  `custody_hold_limit`; an admin saves one). Capacity uses admission units (`admission_counted_holds`) against the configured `custody_hold_limit` (default 8);
   `open_holds` remains total custody. At most one hold per run is excluded when it backs
   an exact-owner/run/live-run, unreleased current-generation claim on a matching existing
   same-owner worker with a fresh non-null heartbeat (inclusive configured
   `WorkerHeartbeatStale` cutoff), in `claimed`, `running`, `awaiting_approval`,
   `awaiting_input` or `awaiting_followup`, without a `needs_action`/`source_only` decision.
   Unknown/mismatched, old/future-generation, stale, released, terminal and other statuses
-  remain counted; `active` attention alone is not eligibility. Accounting releases nothing
+  remain counted; `active` attention alone is not eligibility. Of the remaining open holds, a run's
+  open holds on the same original worker, from any of its generations, count as one unit (heartbeat plays no part); others count singly.
+  Accounting releases nothing
   and leaves open-hold cleanup safeguards intact. Previously claimed queued continuations
-  bypass owner admission with 1 to limit-1 own total open holds, losing that exemption at the limit;
-  `blocked_runs` excludes exempt continuations. Concurrent claims and late staleness can
+  bypass owner admission with 1 to limit-1 own total open holds. A queued run whose own open holds
+  (counted or not) reach the limit is not claimable even when its owner is below the limit, and owner
+  Resume does not bypass it (discard or settle that run's own holds); `blocked_runs` excludes exempt
+  continuations and includes such hard-bound runs. Concurrent claims and late staleness can
   exceed the limit under the statement-snapshot gate. The current API emits the new field
   even at zero; the CLI falls back to total only when an older API omits it, preserving
   explicit zero. The human view also prints

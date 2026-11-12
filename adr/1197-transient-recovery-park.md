@@ -1781,7 +1781,7 @@ discarded/released precedence and before archive readiness or capture progress:
 failed latest capture yields `needs_action`, otherwise `source_only`. Leaving
 the park restores existing proof-based release rules. An earlier archive remains
 exportable independently and may omit latest local edits. Custody can block
-worker image rolls (#3103); each Resume's fresh claim opens another counted hold
+worker image rolls (#3103); each Resume's fresh claim opens another open custody hold
 and repeated failures may retain successor paths on disk (#3329/#2445).
 Same-worker affinity is retained, but a peer after worker death or affinity
 expiry can run a published checkpoint without the original local journal,
@@ -1976,7 +1976,7 @@ instead detached and the successor proceeded.
   worker adopted. Here nothing is touched or adopted, so there is nothing to prove quiescent.
 - **Guidance and park.** The worker sends a status message naming only the predecessor run id. It says
   the agent did not start, the source is held under secret-scan remediation and requires review, Resume
-  on this worker holds again and adds at least one admission-counted custody hold, Cancel ends the run,
+  on this worker holds again and adds at least one open custody hold while this run's own open holds are below the custody hold limit (at the limit it creates no further claim or hold), Cancel ends the run,
   and `uzi run recovery <predecessor>` inspects it. It confirms delivery (10 s) and parks even if
   delivery is unconfirmed. It parks through the existing writer at `recovery_wait` /
   `retained_recovery_adoption_failed`, then stops nonterminal. There is no new cause, wire field or
@@ -2009,17 +2009,20 @@ instead detached and the successor proceeded.
 - A claim lost before any running report, listing or registration evidence, with no restart, is reset
   uncharged by `SweepClaimedNeverStarted`, repeatedly, including after Resume. It is bounded only by
   the run's own open holds reaching `custody_hold_limit` L (default 8): then `ClaimRun` refuses and the
-  run stays queued with the custody-capacity reason. That queued state is not an owner park. Measured: 8
+  run stays queued with the per-run custody hold limit reason (issue #4162). That queued state is not an owner park. Measured: 8
   at L=8, 3 at L=3, 7 more after a park plus Resume.
 - A worker that is online with current presence parks as `recovery_wait` /
   `retained_continuation_unwitnessed`, uncharged (measured for a continuation claim whose running
   report never landed). The successor reports `running` before the orphan reclaim, so this arm and the
   uncharged reset above apply only when that first running report is lost or refused.
-- Run-lifetime bound: this run's own open holds stay at or below L, on the premise that none is
-  released. This does not claim that owner aggregate custody is a transactional ceiling, or that the
-  owner's other runs are always blocked.
-- Disclosed: while held or queued, the run's holds are admission-counted and can reduce the owner's
-  capacity. While held it blocks the worker's upgrade or drain, like any owner-held cause. Owner Cancel
+- Run-lifetime bound: a claim whose statement snapshot sees this run's own open holds at or above L
+  does not claim it (ADR-2445 D6 snapshot semantics), so sequential claims stop the run at L, as
+  measured above. This is an admission condition, not a transactional ceiling: concurrent claims are
+  not serialized against the run's holds, and no numerical overshoot bound is claimed. Nor does it
+  claim that owner aggregate custody is a transactional ceiling, or that the owner's other runs are
+  always blocked.
+- Disclosed: while held or queued, the run's open holds can reduce the owner's admission capacity (a run's open
+  holds on one original worker, from any of its generations, count as one admission unit, ADR-2445's #4162 amendment). While held it blocks the worker's upgrade or drain, like any owner-held cause. Owner Cancel
   of a held successor is terminal and leaves its open hold or holds open (measured 1 to 1) for owner
   discard; cleanup uses the existing owner discard after normal inspection.
 

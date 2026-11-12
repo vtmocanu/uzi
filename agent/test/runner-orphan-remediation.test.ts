@@ -40,6 +40,25 @@ function assertHeld(s: Scene, before: ReturnType<typeof snapshot>, parks = 1, cl
   assert.equal(api.states.some(x => x.runId === claim.run_id && (x.body.status === "completed")), false);
 }
 
+/** Pins the custody meaning of a remediation hold line: units clause, below-the-bound direction, an at-bound sentence
+ *  that no remediation-resolution clause can lift, and no admission-counted overshoot promise. */
+function assertCustodyMeaning(text: string): void {
+  assert.ok(!text.includes("admission-counted"),
+    "no admission-counted promise");
+  assert.ok(text.includes("holds from one original worker count as one admission unit toward the owner limit, but each stays open"),
+    "units clause");
+  assert.ok(text.includes("Below the custody hold limit,") && text.includes("opens at least one more custody hold"),
+    "below the bound a claim opens at least one more hold");
+  const bound = text.split(/(?<=[.;]) /).find(x => x.startsWith("Once this run's own open holds reach the custody hold limit"));
+  assert.ok(bound, "an at-bound sentence exists");
+  assert.ok(!bound.includes("unless") && !bound.includes("remediation"), "the bound is not conditioned on the remediation");
+  assert.ok(/Resume creates no claim and no hold; only discarding or settling this run's own holds frees it|it is no longer claimed; only discarding or settling this run's own holds frees it/.test(text.slice(text.indexOf(bound))),
+    "the at-bound outcome and its freeing clause");
+  assert.ok(/only discarding or settling this run's own holds frees it/.test(text), "only the run's own holds free the bound");
+  assert.ok(/(hold again unchanged|stop the same way) unless that remediation has been resolved through a separately authorized route\./.test(text),
+    "the unless clause is attached to the repeat-outcome clause");
+}
+
 function assertGuidance(s: Scene, claim = s.claim): void {
   const text = s.guidance(claim);
   assert.ok(text.length >= 1, "guidance delivered");
@@ -49,6 +68,7 @@ function assertGuidance(s: Scene, claim = s.claim): void {
     "no path, commit id or inner error text");
   assert.ok(joined.includes("Resume on this worker will hold again unchanged"), "the park is reported, so Resume holds again");
   assert.ok(!joined.includes("not placed on an owner hold"));
+  assertCustodyMeaning(joined);
   const log = api.requestLog;
   const messages = log.indexOf("messages");
   const park = log.indexOf("state:recovery_wait");
@@ -227,7 +247,7 @@ describe("the park acknowledgement", linux, () => {
     assert.equal(s.guidance().length >= 1, true);
     const joined = s.guidance().join("\n");
     assert.ok(joined.includes("This run was not placed on an owner hold"), "the no-park wording");
-    assert.ok(joined.includes("each automatic retry on this worker will stop the same way"));
+    assert.ok(joined.includes("Each automatic retry on this worker will stop the same way"));
     assert.ok(!joined.includes("Resume on this worker"), "no Resume promise when nothing is parked");
     assert.deepEqual(snapshot(s), before);
     assert.equal(client.protocolFeatures?.includes(FEATURE), false);
@@ -251,6 +271,7 @@ describe("the park acknowledgement", linux, () => {
     assert.ok(first.includes("Resume on this worker will hold again unchanged"));
     assert.ok(second.includes(`The api refused the owner hold for the secret-scan remediation of predecessor run ${s.ownerRun}. This run was not placed on an owner hold`));
     assert.ok(!second.includes(s.clone) && !second.includes(s.bare) && !/Error/.test(second));
+    assertCustodyMeaning(second);
     assert.equal(s.entered.value, false);
     assert.deepEqual(snapshot(s), before);
   });

@@ -71,7 +71,7 @@ export function RecoveryHoldsSurface() {
   // At the custody limit the capacity can be consumed by holds that need no decision; list
   // them so the panel explains the "at the limit" alert instead of hiding.
   const info = admissionInfoHolds(holds);
-  const hasInfo = info.counted.length > 0 || info.unreported.length > 0;
+  const hasInfo = info.counted.length > 0 || info.grouped.length > 0 || info.unreported.length > 0;
   if (visibleHolds.length === 0 && !hasInfo && requestedIds.length === 0) return null;
   const groups = groupHoldsByWorker(visibleHolds);
   // Requested holds are looked up in the UNFILTERED open listing: a healthy active hold the
@@ -80,6 +80,7 @@ export function RecoveryHoldsSurface() {
   const renderedIds = new Set<string>([
     ...visibleHolds.map((h) => h.id),
     ...info.counted.map((h) => h.id),
+    ...info.grouped.map((h) => h.id),
     ...info.unreported.map((h) => h.id),
   ]);
   const openById = new Map(holds.holds.filter((h) => h.state === "open").map((h) => [h.id, h]));
@@ -115,7 +116,7 @@ export function RecoveryHoldsSurface() {
           <span className="tabular-nums text-muted">
             {capacityUsed} / {custody_hold_limit}
           </span>{" "}
-          custody slots used
+          custody units used
           {" · "}
           <span className="tabular-nums text-muted">{open_holds} open custody {open_holds === 1 ? "hold" : "holds"}</span>
           {decision_needed > 0 && (
@@ -193,8 +194,16 @@ export function RecoveryHoldsSurface() {
           {info.counted.length > 0 && (
             <InfoSection
               label="Counting toward the limit"
-              copy="These holds currently consume admission capacity without requiring an owner decision. They stop counting only when the server's admission criteria exclude them or their custody settles."
+              copy="These holds currently consume admission units without requiring an owner decision. They stop counting only when the server's admission criteria exclude them or their custody settles."
               holds={info.counted}
+              showReason
+            />
+          )}
+          {info.grouped.length > 0 && (
+            <InfoSection
+              label="Counted with another hold"
+              copy="A run's holds from the same original worker usually count as one admission unit; these holds are covered by that unit and add nothing to the limit."
+              holds={info.grouped}
               showReason
             />
           )}

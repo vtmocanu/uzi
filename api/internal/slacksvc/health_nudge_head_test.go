@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/slack-go/slack"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -165,6 +166,39 @@ func TestHealthNudgeHeadLeavesTheUnclaimedWordingExactlyAsItWas(t *testing.T) {
 	}
 	if got := healthNudgeHead(healthWaitingWorker, ""); got != before {
 		t.Fatalf("nudge head with NO reason = %q, want the unchanged %q — an empty reason must fall back to the original wording, which is also what a mirror drift degrades to", got, before)
+	}
+}
+
+// TestHealthNudgeHeadCustodyRunHoldBoundIsItsOwnSentence pins issue #4162: a run refused by
+// its OWN hold bound is neither unclaimed nor blocked by owner capacity, so the head must
+// say neither.
+func TestHealthNudgeHeadCustodyRunHoldBoundIsItsOwnSentence(t *testing.T) {
+	const want = "⏳ This queued run cannot start."
+	got := healthNudgeHead(healthWaitingWorker, apitypes.ReasonCustodyRunHoldBound)
+	if got != want {
+		t.Fatalf("nudge head = %q, want %q", got, want)
+	}
+	for _, bad := range []string{"waiting for a worker", "new runs can't start", "custody limit, so", "capacity", "hold limit"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("nudge head = %q must not contain %q", got, bad)
+		}
+	}
+}
+
+// TestHealthNudgeBlocksCustodyRunHoldBoundStatesReasonOnce pins the rendered DM: head plus
+// appended reason must say the bound once, not repeat it.
+func TestHealthNudgeBlocksCustodyRunHoldBoundStatesReasonOnce(t *testing.T) {
+	blocks, _ := healthNudgeBlocks(healthWaitingWorker, apitypes.ReasonCustodyRunHoldBound, "https://uzi.example",
+		store.GetSlackRunContextRow{ID: uuid.New()}, nil, 0, time.Now())
+	_, body := blockSummary(blocks)
+	if !strings.Contains(body, apitypes.ReasonCustodyRunHoldBound) {
+		t.Fatalf("nudge section = %q, want the reason verbatim", body)
+	}
+	if n := strings.Count(strings.ToLower(body), "reached its own custody hold limit"); n != 1 {
+		t.Fatalf("nudge section = %q states the bound %d times, want once", body, n)
+	}
+	if strings.Contains(body, "waiting for a worker") {
+		t.Fatalf("nudge section = %q carries the unclaimed-run framing", body)
 	}
 }
 

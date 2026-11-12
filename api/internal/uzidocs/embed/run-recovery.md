@@ -192,8 +192,7 @@ the cap the run parks `recovery_wait` with `worker_requeue_exhausted` for an own
 Resume or Cancel. Every claim on this path opens its own custody hold and the stop leaves it open, so at
 the default cap of 3, when the server accepted the initial `running` report,
 this stop loop accrues at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default
-`custody_hold_limit` of 8; those holds share the owner's admission count with the
-owner's other runs, so several exhausted runs can hold the owner's new claims
+`custody_hold_limit` of 8; those holds count toward the owner's admission units (a run's generations on one original worker are one unit), so several exhausted runs can hold the owner's new claims
 queued until those holds are discarded or released (Resume and Cancel leave them open). A retained-sources journal
 where authority finds neither a record carrying the fence nor a slot for the path
 (a classify `not_completion`) still takes the unchanged detach. In retire mode, a
@@ -1147,7 +1146,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Captures on file that are neither discarded nor expired (preparing, uploading, available, needs action; any other state also counts). Expired tombstones stay for audit but free their slot. |
-| Admission-counted recovery holds per owner | 8 by default; the admin setting `custody_hold_limit` (1 to 1000) | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs subject to custody admission until the counted pressure falls. Hold-free Plan and Code checker children (`kind = 'cross_check'`, both harness families) are exempt; judges and jobs gain no exemption. A requeued run with 1 to limit-1 of its own owner-scoped open holds remains exempt; at the limit it loses that exemption. This admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past the limit. Admins change the limit in [Admin settings](./admin-settings.md#custody-hold-limit); it is not an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
+| Admission units per owner | 8 by default; the admin setting `custody_hold_limit` (1 to 1000) | After excluding at most one hold per run backing a healthy current claim without an owner decision, the remaining open holds of one run, from any of its generations, that share the same original worker count as **one unit** together (heartbeat freshness plays no part, so a dead worker's group is still one unit); every other open hold counts as one unit by itself. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs subject to custody admission until the counted pressure falls. Hold-free Plan and Code checker children (`kind = 'cross_check'`, both harness families) are exempt; judges and jobs gain no exemption. A requeued run with 1 to limit-1 of its own owner-scoped open holds remains exempt. A queued run whose own open holds (counted or not) reach the limit is not claimable at all, even when its owner is below the limit; only that run waits, Resume does not bypass it, and discarding or settling that run's own holds frees it. This admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past the limit. Admins change the limit in [Admin settings](./admin-settings.md#custody-hold-limit); it is not an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
 
 A byte refusal keeps the source retained. The archive's **Needs action**
 reason can read `storage quota exceeded`; current workers preserve a typed
@@ -2017,8 +2016,8 @@ keeps the pass switched off. See the
 
 ## Reviewing and resolving held work
 
-Once the **admission-counted holds per owner** limit (the *Admission-counted
-recovery holds* limit above: default 8, the admin setting `custody_hold_limit`)
+Once the **admission units per owner** limit (the *Admission units per owner*
+limit above: default 8, the admin setting `custody_hold_limit`)
 is reached, uzi pauses admitting **new** runs subject to
 custody admission for you. Hold-free Plan and Code checker children
 (`kind = 'cross_check'`) in both harness families are exempt; judges and jobs
@@ -2026,13 +2025,22 @@ gain no exemption. Checker claims still require eligible owner identity,
 current parent/generation/round, deadline, protocol, vault, credentials,
 checker slots and workers (see [Cross-check](./cross-check.md)).
 A run that was interrupted and requeued while it has 1 to limit-1 of its own open
-holds keeps resuming; once that one run alone holds the limit, it loses the exemption.
-When that happens, the dashboard shows a full-width alert beneath the page
-heading with your safety-slot use, how many held sources need a decision, how
-many runs are blocked, and a **Review held work** button; if you connected
-Slack, you also get one coalesced direct message per blocked episode (not one
+holds keeps resuming; once that one run alone holds the limit, it is not started at all
+(a per-run bound that applies even when you are below the owner limit; discard or settle
+that run's own holds to free it).
+When the owner limit is reached, or when any of your queued runs has reached its own
+hold limit while you are still below the owner limit, the dashboard shows a full-width alert beneath the page
+heading with your custody admission unit use, how many held sources need a decision, how
+many runs are blocked, and, when at least one hold needs a decision, a
+**Review held work** button; if you connected Slack, then when the owner limit is
+reached you also get one coalesced direct message per blocked episode (not one
 per run) carrying your open-hold and blocked-run counts, a link to the surface,
-and the exact discard command. The per-worker **retaining work** pills stay as
+and the exact discard command. A queued run that reaches its own bound instead gets
+a threaded per-run run-health nudge on entry (subject to the nudge cooldown; see
+[Slack](./slack.md)). In the per-run case the alert says a queued run has reached
+its own custody hold limit and points to `uzi run recovery <run>` and
+`uzi run discard <run> --hold <id>`; it does not mean the owner is at capacity, and only the
+affected runs wait. The per-worker **retaining work** pills stay as
 row context.
 
 The **Workers** settings page is where you resolve them: the holds that need a
@@ -2064,7 +2072,10 @@ At or over the limit, the surface also shows an **Admission information**
 section so you can see what is consuming capacity without needing a decision.
 **Counting toward the limit** lists the non-decision holds the server confirms
 it counts, each with its run link, claim generation, worker, and the reason it
-counts (for example, no live claim backs it). These rows are read-only: this is
+counts (for example, no live claim backs it). A run's generations on the same
+original worker (the current one included unless it backs a healthy live claim, which counts 0) count as one unit: one row is the counted representative and the others
+are listed under "Counted with another hold" with the label "Counted once with this run's
+other holds on the same worker" (`uzi run recovery` prints `not counted (same_run_group)`). These rows are read-only: this is
 visibility only, and adds no new way to release or discard custody and changes
 no accounting. **Admission membership not reported** lists holds from an older
 server that does not report membership; uzi never infers it, so an unreported
@@ -2245,15 +2256,17 @@ does not start the agent and touches nothing of the predecessor. It emits `orpha
 with `remediation_retained`, sends a status message naming only the predecessor run id, and parks the
 run for you at `recovery_wait` / `retained_recovery_adoption_failed`. The message says the agent did not
 start and the source requires review. **Resume** on this worker holds again and adds at least one
-admission-counted custody hold; **Cancel** ends the run and leaves its open holds for you to discard.
+open custody hold while this run's own open holds are below the custody hold limit (at the limit,
+Resume creates no further claim or hold); **Cancel** ends the run and leaves its open holds for you to discard.
 Run `uzi run recovery <predecessor-run-id>` to inspect the predecessor. Resume grants no remediation
 authority, and this page names no route that disposes of the remediation. While held or queued, the
-run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`), and a
+run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`; its generations on one worker count as one unit), and a
 held run blocks its worker's upgrade or drain. If the api does not support the park, the worker does not
 park and the message says so; the run is then handled by the ordinary requeue paths. A worker restart
 consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeue_exhausted`,
-unless the run's own open holds reach the custody admission limit first; it then stays queued for
-capacity (not an owner park) until it can be claimed again.
+unless the run's own open holds reach the custody hold limit first; it then stays queued (not an owner park) with the per-run reason
+"this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start".
+Resume does not bypass that bound and creates no further claim or hold; discard or settle the run's own holds to free it.
 
 ### When a restarted worker continues from a saved pin (independent restore)
 
@@ -2289,7 +2302,8 @@ attribution and own-record checks pass, so with no pin or several pins it is ref
 `recovery_cause_retained_recovery_adoption_failed`), the run parks for you at
 `recovery_wait` / `retained_recovery_adoption_failed` instead of requeueing into the
 same refusal: Resume claims again and holds again unchanged on this release and adds at
-least one admission-counted custody hold, and Cancel ends the run. Without that
+least one open custody hold while this run's own open holds are below the custody hold limit (at the
+limit, Resume creates no further claim or hold), and Cancel ends the run. Without that
 capability the refusal is the ordinary nonterminal stop described below. The park
 changes no predecessor bytes (journal, slot, clone, HOME and provision directories stay
 as they were) and reaps nothing. Here the cause has a third meaning: continuation was
@@ -2346,12 +2360,12 @@ without cancel and stops nonterminally.
   live worker can stay queued even at the cap: there is no universal hold at the cap.
   Each accepted generation opens a custody hold that counts toward `custody_hold_limit`.
   A parked unsupported run holds the predecessor's hold and the current generation's,
-  and an owner Resume adds a claim and a hold.
+  and an owner Resume adds a claim and a hold (except at the run's own custody bound, where Resume requeues the run but creates no claim and no hold).
 - The restore uses the single ordinary pin record of the dead generation. Several
   records refuse with `pin_ambiguous` and none with `no_eligible_pin`. Choosing among
   several records, and preferring a finalization pin, are not implemented.
 - The predecessor's hold stays open and counts toward your
-  [custody admission limit](admin-settings.md) (`custody_hold_limit`) until you
+  [custody admission limit](admin-settings.md) (`custody_hold_limit`, as part of one admission unit with the run's other generations on the same worker) until you
   discard it. The generation's final acknowledgment, settlement and report retirement
   all refuse while it is open. Merging the PR closes only the server custody holds; it
   never deletes the predecessor's copy on the worker. The server's verified-merge

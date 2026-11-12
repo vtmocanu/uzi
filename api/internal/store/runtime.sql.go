@@ -1168,7 +1168,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
       AND fn_worker_can_claim($10::boolean, $11::uuid[], r.repo_id, r.kind, $12::text[], r.required_capabilities, $13::boolean)
       -- PRD #1296 M1 (D2/D4): custody-admission. Block the claim when the run's OWNER
-      -- already holds >= @custody_hold_limit admission-counted open holds (ADR-2445) — the
+      -- already holds >= @custody_hold_limit admission units (ADR-2445) — the
       -- owner has too much unpublished work awaiting recovery disposition. A gated claim
       -- matches no row, so the run stays queued (the health resolver surfaces a distinct
       -- custody-limit reason against this SAME predicate in a later milestone). This is an
@@ -1195,20 +1195,33 @@ WITH checker_template_pins AS MATERIALIZED (
       -- and loops forever; the owner cap used to stop that loop. Issue #3859 charges a
       -- WITNESSED departure of such a continuation (SweepClaimedNeverStartedCohort), so this
       -- bound remains the backstop for unwitnessed ones (e.g. older agents). Once a single run holds
-      -- @custody_hold_limit open holds of its own, it faces the owner cap like new work. The
-      -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
+      -- @custody_hold_limit open holds of its own, it is refused outright (see the hard
+      -- per-run bound below), whatever the owner count says. The
+      -- exemption is mirrored, logically equivalent under that hard bound, by
+      -- GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
       -- agree.
+      --
+      -- Issue #4162 / ADR-2445 amendment: the bound is HARD. A run whose own open holds (every
+      -- open hold, counted or not) reach @custody_hold_limit is refused here whatever the owner
+      -- count says; it is ANDed with the owner arm below, not ORed. The owner count is in
+      -- admission UNITS (fn_custody_admission_count groups one run's holds on one original
+      -- worker into a single unit). This is an admission gate with ADR-2445 D6 statement-snapshot
+      -- semantics, not a transactional ceiling: the predicate is evaluated in the candidate scan
+      -- before FOR UPDATE OF r SKIP LOCKED, so a claim plus requeue committed between another
+      -- claimant's snapshot and its row lock can be missed. Sequential claims see every
+      -- committed hold. A refused claim inserts no hold (the generation hold INSERT is fed only
+      -- by the claimed row).
       -- Report-only checkers open no custody hold; their exemption is independent
       -- of the bounded continuation exemption for code-publishing runs above.
       AND ($14::int <= 0
            OR r.kind = 'cross_check'
-           OR (r.claim_generation >= 1
-               AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
-                             WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
-               AND (SELECT count(*) FROM recovery_custody_holds oh2
-                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $14::int)
-           OR (SELECT fn_custody_admission_count($3::uuid, $6::timestamptz)) < $14::int)
+           OR ((SELECT count(*) FROM recovery_custody_holds oh2
+                  WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $14::int
+               AND ((r.claim_generation >= 1
+                     AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                   WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open'))
+                    OR (SELECT fn_custody_admission_count($3::uuid, $6::timestamptz)) < $14::int)))
       -- PRD #3522 M3: the weekly usage reserve admission gate. @reserve_on is true only when the run
       -- owner has a threshold set (users.weekly_reserve_pct); every other @reserve_* param is then
       -- precomputed in Go (workersvc/usage_reserve.go, reserveSnapshot) from the owner's fresh
@@ -6387,7 +6400,17 @@ SELECT
                       AND (SELECT count(*) FROM recovery_custody_holds oh2
                              WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $3::int)
                 FROM runs r
-                WHERE r.id = $4::uuid AND r.user_id = $1::uuid), false)::boolean AS continuation_exempt
+                WHERE r.id = $4::uuid AND r.user_id = $1::uuid), false)::boolean AS continuation_exempt,
+    COALESCE((SELECT count(*) FROM recovery_custody_holds oh2
+                WHERE oh2.user_id = $1::uuid AND oh2.run_id = $4::uuid
+                  AND oh2.state = 'open'
+                  AND EXISTS (SELECT 1 FROM runs r
+                                WHERE r.id = $4::uuid AND r.user_id = $1::uuid)), 0)::bigint AS own_open_holds,
+    COALESCE((SELECT ($3::int > 0
+                      AND (SELECT count(*) FROM recovery_custody_holds oh2
+                             WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') >= $3::int)
+                FROM runs r
+                WHERE r.id = $4::uuid AND r.user_id = $1::uuid), false)::boolean AS run_hold_bound_reached
 `
 
 type GetCustodyAdmissionForRunParams struct {
@@ -6401,19 +6424,24 @@ type GetCustodyAdmissionForRunRow struct {
 	AdmissionCountedHolds int64 `json:"admission_counted_holds"`
 	OpenHolds             int64 `json:"open_holds"`
 	ContinuationExempt    bool  `json:"continuation_exempt"`
+	OwnOpenHolds          int64 `json:"own_open_holds"`
+	RunHoldBoundReached   bool  `json:"run_hold_bound_reached"`
 }
 
 // Issue #1751 / ADR-1751: the per-run custody-admission facts the health resolver reads so
-// its reasonCustodyLimit pill agrees with ClaimRun. open_holds is total open custody;
-// admission_counted_holds is the shared live-claim-discounted count compared against
-// @custody_hold_limit (ADR-2445); continuation_exempt is ClaimRun's continuation exemption, byte-for-byte
-// the same expression: the run was claimed before (claim_generation >= 1) AND its OWN open
-// custody-hold count (owner-scoped) is at least 1 and below @custody_hold_limit. The upper bound
-// stops a run that the never-started sweep keeps requeueing from opening holds forever (see
-// ClaimRun). A continuation-exempt run is never blocked by the custody cap. The separate
-// kind='cross_check' exemption is handled before this health read; hold-free children do not
-// become continuation-exempt. A run that does not exist (or
-// belongs to another owner), or a non-positive limit, yields continuation_exempt = false.
+// its custody pills agree with ClaimRun. open_holds is total open custody;
+// admission_counted_holds is the shared admission-UNIT count compared against
+// @custody_hold_limit (ADR-2445, issue #4162: the live-claim-discounted count with one run's
+// holds on one original worker grouped into one unit); continuation_exempt is ClaimRun's
+// continuation exemption, logically equivalent under the hard per-run bound: the run was claimed before
+// (claim_generation >= 1) AND its OWN open custody-hold count (owner-scoped) is at least 1 and
+// below @custody_hold_limit. own_open_holds is that same own count (every open hold of the run,
+// counted or not) and run_hold_bound_reached is ClaimRun's hard per-run bound: the limit is
+// positive and own_open_holds >= the limit. A bound-reached run is refused by ClaimRun even when
+// the owner is below the limit. The separate kind='cross_check' exemption is handled before this
+// health read; hold-free children do not become continuation-exempt. A run that does not exist
+// (or belongs to another owner), or a non-positive limit, yields continuation_exempt = false and
+// run_hold_bound_reached = false.
 func (q *Queries) GetCustodyAdmissionForRun(ctx context.Context, arg GetCustodyAdmissionForRunParams) (GetCustodyAdmissionForRunRow, error) {
 	row := q.db.QueryRow(ctx, getCustodyAdmissionForRun,
 		arg.UserID,
@@ -6422,7 +6450,13 @@ func (q *Queries) GetCustodyAdmissionForRun(ctx context.Context, arg GetCustodyA
 		arg.RunID,
 	)
 	var i GetCustodyAdmissionForRunRow
-	err := row.Scan(&i.AdmissionCountedHolds, &i.OpenHolds, &i.ContinuationExempt)
+	err := row.Scan(
+		&i.AdmissionCountedHolds,
+		&i.OpenHolds,
+		&i.ContinuationExempt,
+		&i.OwnOpenHolds,
+		&i.RunHoldBoundReached,
+	)
 	return i, err
 }
 
