@@ -4273,10 +4273,19 @@ export class RunRunner {
    * shared by every call site and separate from retainedDiscoveryRetries.
    */
   private async withLaunchLockRetry<T>(flight: RunFlight, run: (round: LaunchRound) => Promise<T>): Promise<T> {
+    // A failed round's catch latches preserveRecoveryClone with the clearable restriction latch. When a
+    // later round recovers (the fresh verified read cleared the latch), the run is uncontended again, so
+    // the clone retention that only the failed round asked for is undone; otherwise terminal retirement
+    // would keep the clone and journal of a run that completed normally.
+    const preserveBefore = flight.preserveRecoveryClone;
+    let retriedHere = false;
     for (;;) {
       const round: LaunchRound = { startedAt: Date.now() };
       try {
-        return await run(round);
+        const result = await run(round);
+        if (retriedHere && flight.remediationRestrictions === undefined)
+          flight.preserveRecoveryClone = preserveBefore;
+        return result;
       } catch (error) {
         if (!round.lockWait) throw error;
         const stop = this.launchStop(flight);
@@ -4289,12 +4298,10 @@ export class RunRunner {
         } catch { /* Diagnostics must not change the launch outcome. */ }
         if (cls !== "deadline" || flight.predecessorCapture || flight.remediationRestrictions?.clearable !== true) throw error;
         const retry = (flight.launchLockRetries ?? 0) + 1;
-        if (retry > RETAINED_DISCOVERY_RETRIES) {
-          flight.preserveRecoveryClone = true;
-          flight.preserveSession = true;
-          throw new LaunchLockBusyError();
-        }
+        // Exhaustion only throws; the execute catch arm for LaunchLockBusyError sets the retention flags.
+        if (retry > RETAINED_DISCOVERY_RETRIES) throw new LaunchLockBusyError();
         flight.launchLockRetries = retry;
+        retriedHere = true;
         await this.waitRecoveryRetry(flight, true, this.recoveryRetryMs * 2 ** (retry - 1),
           this.retainedLifecycleSignal(flight)).catch(() => undefined);
         if (this.launchStop(flight)) throw error;

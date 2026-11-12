@@ -2101,6 +2101,13 @@ async function driveExecute(t: any, iid: number, decide: (site: "clone" | "launc
       return orig(...args);
     });
   }
+  // Pass-through spies on the provider reap and custody settle that reportGenericFailure skips under keepCustody.
+  const custody = { reaps: 0, settles: 0 };
+  for (const [name, key] of [["reapRecoveryProviderForSettle", "reaps"], ["reapThenSettleRecoveryGeneration", "settles"],
+    ["settleRecoveryGeneration", "settles"]] as const) {
+    const orig = subject[name].bind(subject);
+    t.mock.method(subject, name, async (...args: unknown[]) => { custody[key]++; return orig(...args); });
+  }
   const retry = subject.withLaunchLockRetry.bind(subject);
   t.mock.method(subject, "withLaunchLockRetry", async (...args: any[]) => {
     if (flight !== args[0]) {
@@ -2113,7 +2120,7 @@ async function driveExecute(t: any, iid: number, decide: (site: "clone" | "launc
   });
   try { await runner.execute(claim); }
   finally { for (const release of releases) release(); await Promise.allSettled(holders); runner.shutdown(); }
-  return { claim, flight, runs, atLaunch, counts, diagnostics: abortLines(diagnostics), raw: diagnostics, failed: failedReports(claim.run_id) };
+  return { claim, flight, runs, atLaunch, counts, custody, diagnostics: abortLines(diagnostics), raw: diagnostics, failed: failedReports(claim.run_id) };
 }
 
 for (const [method, label] of [["readRemediationRestrictionFacts", "restriction_facts"],
@@ -2159,6 +2166,25 @@ test("#4246 phaseClone exhaustion fails visibly after exactly three rounds and k
   assert.equal(fs.existsSync(r.flight.worktreePath), true, "the clone is kept");
   assert.notEqual(command(r.flight.barePath, "config", "--get", "uzi-recovery." + r.flight.branch + ".clone"), "",
     "the recovery journal (custody) is kept");
+  assert.deepEqual(r.custody, { reaps: 0, settles: 0 }, "keepCustody: no provider reap and no custody settle");
+});
+
+const cloneJournal = (flight: any) => command(flight.barePath, "config", "--get", "uzi-recovery." + flight.branch + ".clone");
+
+test("#4246 a launch that recovers via a retry completes and retires its clone like an uncontended run", async t => {
+  const base = await driveExecute(t, 4251, () => undefined);
+  const retried = await driveExecute(t, 4252,
+    (site, round) => site === "launch" && round === 1 ? { method: "readRemediationRestrictionFacts", mode: "new_release_on_abort" } : undefined);
+  assert.equal(retried.counts.launch, 2, "one expired round, then one fresh round");
+  assert.equal(retried.runs, 1);
+  assert.deepEqual(retried.failed, []);
+  assert.equal(retried.flight.remediationRestrictions, undefined);
+  assert.equal(retried.flight.preserveRecoveryClone, base.flight.preserveRecoveryClone);
+  assert.equal(retried.flight.preserveRecoveryClone, false, "the failed round's retention was undone");
+  assert.equal(fs.existsSync(retried.flight.worktreePath), fs.existsSync(base.flight.worktreePath));
+  assert.equal(fs.existsSync(retried.flight.worktreePath), false, "the clone is retired");
+  assert.equal(cloneJournal(retried.flight), cloneJournal(base.flight));
+  assert.equal(cloneJournal(retried.flight), "", "the recovery journal is cleared");
 });
 
 test("#4246 the retry allowance is shared between the clone and launch sites", async t => {
@@ -2174,6 +2200,7 @@ test("#4246 the retry allowance is shared between the clone and launch sites", a
   assert.equal(r.failed[0].fail_origin, undefined);
   assert.equal(r.flight.launchLockRetries, 2);
   assert.equal(r.flight.retainedDiscoveryRetries, undefined, "separate from the discovery allowance");
+  assert.deepEqual(r.custody, { reaps: 0, settles: 0 }, "keepCustody: no provider reap and no custody settle");
 });
 
 type DirectStop = "cancel" | "pause" | "credential_switch" | "shutdown" | "claim_fence";
@@ -2199,6 +2226,8 @@ async function directLaunch(t: any, f: Awaited<ReturnType<typeof fixture>>, opts
   budget?: boolean;
   retryMs?: number;
   breakRead?: boolean;
+  /** The real read acquires the lock, then its cause is forced to pre_read_unavailable and it throws. */
+  lateUnavailable?: boolean;
 }) {
   const { cache, runner, subject, flight } = f.fresh();
   flight.executor = {};
@@ -2214,7 +2243,21 @@ async function directLaunch(t: any, f: Awaited<ReturnType<typeof fixture>>, opts
   const budget = new MaintenanceBudget(1000, () => wall);
   const method = opts.at === "facts" ? "readRemediationRestrictionFacts" : "readRuntimeRemediationRecovery";
   const orig = (cache[method] as (...args: any[]) => Promise<any>).bind(cache);
+  let captured: any;
+  if (opts.lateUnavailable) {
+    const withProgress = (cache as any).withRemediationRestrictionProgress.bind(cache);
+    t.mock.method(cache as any, "withRemediationRestrictionProgress", (progress: any, action: any) => {
+      captured = progress; return withProgress(progress, action);
+    });
+  }
   t.mock.method(cache, method, async (...args: any[]) => {
+    if (opts.lateUnavailable) {
+      const progress = opts.at === "facts" ? captured : args[4];
+      await orig(...args);
+      assert.equal(!!progress.started || !!progress.acquired, true, "the real read reached the lock");
+      progress.cause = "pre_read_unavailable";
+      throw new Error("late-unavailable-sentinel");
+    }
     if (rounds === 1 && !holder && !opts.breakRead) {
       holder = hold(); await entered.promise;
       setImmediate(() => {
@@ -2330,6 +2373,22 @@ test("#4246 a denial landing during the real restore lock wait stays sticky and 
     assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [["runtime_restore", "deadline"]]);
   } finally { r.runner.shutdown(); }
 });
+
+for (const at of ["facts", "restore"] as const) {
+  test("#4246 a read that acquired the lock stays sticky even if its cause is forced to pre_read_unavailable (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, lateUnavailable: true });
+    try {
+      assert.ok(r.error);
+      assert.match(String(r.error.message), /late-unavailable-sentinel|unavailable/);
+      assert.equal(r.rounds, 1, "no retry");
+      assert.ok(r.flight.remediationRestrictions, "a latch is held");
+      assert.equal(r.flight.remediationRestrictions.clearable, false, "the latch is sticky");
+      assert.deepEqual(r.diagnostics, [], "no lock-wait diagnostic");
+      assert.equal(r.flight.launchLockRetries, undefined);
+    } finally { r.runner.shutdown(); }
+  });
+}
 
 test("#4246 a restore failure after the lock was acquired is sticky and carries no lock-wait diagnostic", async t => {
   const f = await fixture(false);
