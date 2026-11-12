@@ -621,6 +621,7 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
 - Codex advice has zero worker callbacks; native async questions and read-only UTC remain permitted. Advice ignores text from items whose delivery is exactly `"async"`; no questions are surfaced or answered, and the native capability stays available. This resolves the earlier filtering deferral under #2239. Other native effectful surfaces stay disabled, except the authority-free run code host. (AI-synced 2026-10-05) [AI-synced, #1566]
 - Landlock for Codex commands is off by default (a third mode, `off`, is the default everywhere: worker, controller, chart); `required` and `best-effort` remain opt-ins. User decision after repeated Landlock-caused run failures (#1769, #1863, #1598). (AI-synced 2026-09-28)
 - Restricted-tier hosted workers may reach `api.openai.com`, `chatgpt.com` and `auth.openai.com` on 443, fleet-wide for the tier (Claude-only workers included), per PRD #1106 D12. (AI-synced 2026-09-24)
+- An admin can hibernate an idle persistent hosted worker (Deployment to 0 replicas; worker row, join-token Secret and PVCs kept) and wake it, behind the default-off `worker_hibernation_enabled` setting; disabling the setting wakes every hibernated worker; ephemeral, compose and local workers are never hibernated; hibernate/wake are web-only admin actions. Automatic wake on demand is not delivered yet. [#4205] (AI-synced 2026-11-12)
 
 ## Feature #64 — uzi CLI: terminal control for humans and agents
 
@@ -1865,7 +1866,7 @@ Design record: issue #4078 (epic #3873); target mock `prds/mockups/3873-overview
     **on user request** (Settings → Workers; opt-in, quota-bounded). NOT delivered,
     still deferred: the **when-queued-work-appears trigger**, autoscaling,
     scale-to-zero, and the chat-agent case — a #58 worker is persistent and runs
-    until deleted. [design detail in specs/ai.md §264-275]
+    until deleted. [design detail in specs/ai.md §264-275] Manual hibernation now delivers per-worker scale-to-zero (#4205). (AI-synced 2026-11-12)
 - Auto-creating bot accounts / bot role enforcement (forge ships with user-managed bots).
 - Forgejo driver — DELIVERED by PRD #65 (2026-07-17): full-parity second driver behind the forge-generic interface; no longer deferred.
 - Agent runtime/execution (spawn, file writes, Anthropic API calls) — PRD #4.

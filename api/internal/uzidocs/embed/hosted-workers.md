@@ -123,6 +123,70 @@ when the scheduler reports a verified CPU/memory shortage. Capacity blockage
 requires waiting, a smaller worker, or added capacity; Pending claims alone do
 not establish storage health. See [Worker versions and upgrades](worker-upgrades.md).
 
+## Hibernation
+
+An admin can put an idle persistent hosted worker to sleep. **Hibernating** scales
+the worker's Deployment to 0 replicas and frees its CPU and memory. The worker
+row, its join-token Secret and all its volumes are kept, so waking it brings back
+the same worker with its cache and data. Ephemeral, compose and local workers are
+never hibernated.
+
+Hibernation is off by default. An admin turns it on with
+[`worker_hibernation_enabled`](./admin-settings.md#worker-hibernation).
+
+Admins hibernate and wake a worker with the **Hibernate** and **Wake** buttons in
+**Admin → Health**, in the **Fleet, all users** table (see
+[Admin health](admin-health.md)). Both are web-only (cookie session plus CSRF);
+the CLI's admin tokens are read-only, so there is no CLI verb to hibernate or
+wake. Waking is never gated by the setting.
+
+A worker passes through these states:
+
+| State | Meaning |
+|---|---|
+| `hibernating` | Preparing: the controller is checking the worker is safe to scale down. |
+| `hibernated` | The Deployment is at 0 replicas. |
+| `waking` | A wake was requested; the Deployment is scaling back up. |
+
+Hibernate is refused, with a reason, when the worker:
+
+- has any assigned run that is not terminal;
+- has an open recovery custody hold;
+- is under a manual or controller cordon, or in a maintenance or DinD phase;
+- has no registered pod identity;
+- or the controller has not advertised hibernation support recently.
+
+The controller can still refuse after the request is accepted (a roll marker or
+reservation, a disk-pressure recycle, DinD maintenance, a busy worker, or a layout
+migration). If nothing was scaled down, a refusal returns the worker to normal.
+Preparation that does not finish within 10 minutes is withdrawn into a wake.
+
+A wake completes only when the new pod registers (or the original pod is still
+alive). A wake not confirmed within 15 minutes shows a wake error on the worker.
+
+For now a hibernated worker wakes only when an admin presses **Wake** or turns
+the setting off, which wakes every hibernated worker. A run is not woken
+automatically.
+
+Status shows in `uzi worker list` and `uzi admin workers`; see
+[CLI](./cli.md#hibernated-workers). The design is in
+[PRD #4205](../prds/4205-worker-hibernation-sleep-wake.md).
+
+### Downgrading
+
+Operators rolling back past this feature, in order:
+
+1. Turn `worker_hibernation_enabled` off.
+2. Wait until no worker is `hibernating`, `hibernated` or `waking`. The sweeper
+   wakes at most 10 workers per pass.
+3. Roll back migrations 00428, then 00427. Down refuses while any worker is not
+   awake or a wake record exists. Rolling back 00428 briefly takes exclusive
+   locks on the runs and workers tables, so do it in a quiet window.
+4. Only then run an older api: an older api cannot claim runs on the new schema.
+
+If the controller is rolled back mid-operation, affected workers stay fenced in
+`waking` until a hibernation-capable controller returns.
+
 ## Pod shutdown grace
 
 Worker pods render `terminationGracePeriodSeconds: 40`. On a stop, the worker joins its own already-authorized authority settlements and logs one `worker_shutdown_result` line within 35 s of the first signal; the extra 5 s is margin (the result is described in [Configuration](./configuration.md)). The field is part of the pod spec, so upgrading the controller changes the pod spec hash once and every hosted worker rolls once through the existing paced roll ([ADR-1470](../adr/1470-paced-hosted-worker-rolls.md)). If a worker stops on its own and its shutdown is `incomplete` (exit 1), the container restarts in the live pod, and the roll health view may briefly name that terminated container (exit 1) as the blocking one; a pod being deleted by the roll is normally not shown. An `incomplete` result never certifies anything: any unresolved record keeps its protections (a successor still refuses it), while a write already started may still complete after the diagnostic. Hosted end-to-end acceptance is pending.
