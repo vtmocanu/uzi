@@ -273,6 +273,42 @@ describe("openPrs", () => {
     ]);
     expect(got.map((r) => r.id).sort()).toEqual(["new", "other-repo"]);
   });
+
+  // #4167: the MR watcher refreshes only the newest run, so an older run's stale "opened"
+  // must not outlive a newer run that saw the merge.
+  it("reads the MR state from the newest run, so a stale older opened run does not count", () => {
+    const got = openPrs([
+      pr({ id: "old", mr_iid: 4100, mr_state: "opened", finished_at: "2026-11-08T00:00:00Z" }),
+      pr({ id: "new", mr_iid: 4100, mr_state: "merged", finished_at: "2026-11-09T00:00:00Z" }),
+    ]);
+    expect(got).toEqual([]);
+  });
+
+  it("keeps the PR when the newest run says opened over an older merged run", () => {
+    const got = openPrs([
+      pr({ id: "old", mr_iid: 4100, mr_state: "merged", finished_at: "2026-11-08T00:00:00Z" }),
+      pr({ id: "new", mr_iid: 4100, mr_state: "opened", finished_at: "2026-11-09T00:00:00Z" }),
+    ]);
+    expect(got.map((r) => r.id)).toEqual(["new"]);
+  });
+
+  it("hides the PR while the newest run's MR state is not yet observed", () => {
+    const got = openPrs([
+      pr({ id: "old", mr_iid: 4100, mr_state: "opened", finished_at: "2026-11-08T00:00:00Z" }),
+      pr({ id: "new", mr_iid: 4100, mr_state: null, finished_at: "2026-11-09T00:00:00Z" }),
+    ]);
+    expect(got).toEqual([]);
+  });
+});
+
+describe("overviewDecisions stale PR state (#4167)", () => {
+  it("offers no Review PR item when a newer run on the same PR saw it merged", () => {
+    const got = overviewDecisions([
+      run({ id: "old", status: "completed", kind: "issue", repo_id: "repo-1", mr_iid: 4100, mr_state: "opened", finished_at: "2026-11-08T00:00:00Z" }),
+      run({ id: "new", status: "completed", kind: "issue", repo_id: "repo-1", mr_iid: 4100, mr_state: "merged", finished_at: "2026-11-09T00:00:00Z" }),
+    ]);
+    expect(got.filter((d) => d.kind === "pr")).toEqual([]);
+  });
 });
 
 describe("overviewDecisions", () => {
