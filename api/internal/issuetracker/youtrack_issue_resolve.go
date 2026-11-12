@@ -18,7 +18,8 @@ import (
 // before the call read as gone, and it is then not written. Follow-up calls
 // address the issue by the returned entity id. The check is a read and YouTrack
 // offers no conditional write, so an issue moved between this check and the
-// follow-up write can still be written, once, in its new project. That window
+// follow-up writes can still be written in its new project; a call that sends
+// several writes (UpdateIssueLabels, one per tag) can land more than one. That window
 // is documented (PRD #4173 D10), not closed.
 func (y *youTrack) resolveIssue(ctx context.Context, projectID, issueIID int64) (ytIssue, error) {
 	p, err := y.requireProject(projectID)

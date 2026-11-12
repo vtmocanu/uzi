@@ -1142,3 +1142,65 @@ or release is promised. Old wrapper history and floors are preserved; an
 already overbound graph is not bypassed. #3583's historical publication
 investigation and #1324's separate maintainer acceptance remain unresolved
 and outside this fix.
+
+## Amendment 2026-11-11 — transient restriction-read safety latch (#4191)
+
+A restriction query that cannot start still holds publication, but its
+process-local safety latch need not outlive a positively verified recovery.
+Only positive evidence of interruption before the reader starts (operation
+entry/recovery interruption or a bare-lock B wait) can create a clearable
+latch, and never for `predecessorCapture`. Classification follows the stage,
+not the exception or signal type: an actual aborted lock wait before
+acquisition can qualify regardless of the stop signal, including a queued
+report-budget abort. Unknown entry failures, such as an arbitrary
+`checkReportProof` failure, remain sticky. Bootstrap remains nonthrowing so
+private byte preservation can continue without granting publication.
+
+Read-local progress uses the closed classes `pre_read_unavailable`,
+`enrolled_observed`, `blocked`, `integrity`, `identity`, `changed_facts`,
+`post_read_expiry` and `unknown`. Diagnostics log the allowlisted class,
+without paths, OIDs, journal bytes or exception text. Failures after reader
+start remain sticky even when no facts were returned. Enrolled or blocked
+facts observed before a later throw, remembered/restored records, findings,
+denial and binding uncertainty permanently disqualify clearing within the
+flight. Legacy or injected state is sticky; restore failures, including
+missing identity, are sticky too. A predecessor-created sticky latch stays
+sticky after that phase ends.
+
+The next ordinary, fully verified two-read query may clear an unenrolled,
+unblocked result after its lifecycle check, for the flight's current
+`barePath`, branch and run ID. Deletion requires the same still-clearable
+state, denial revision and contribution count, with no new negative knowledge.
+Roots, flagged OIDs and scan findings must be empty. Pending state is normally
+a hold; the narrow exception is the exact `safeEmptyPending` object minted
+under an already clearable latch, with empty `requiredOIDs`, false
+`requireDenial` and `bindingUncertain`, and unchanged source binding.
+The existing clean-scan short circuit remains. This adds neither a retry
+subsystem nor a persistence rewrite.
+
+Each bootstrap failure advances the flight's `remediationDenialRevision`;
+invalid or exhausted revisions become the permanent `-1` poison value.
+Clearing never resets the revision, so a previously captured admission remains
+invalid. At teardown, after source-capable tails have been positively joined,
+a clearable latch with safe empty pending state gets one bounded reread under
+source-use authority A before the pending snapshot. Verified clearing retires
+admission with a `confirmed` result, writes no denial and permits the existing
+slot-end path; otherwise the existing deny/hold paths apply.
+
+Existing blocked journals, including zero-finding records, are not cleared or
+disposed by this exception. The retained-recovery and owner-gated adoption
+rules in #3855/#4058 are unchanged; this adds no remediation disposal route.
+A frozen `heldPolicy.blocked` remains blocked for its old capture;
+a new policy after verified clearing may be unblocked. A process crash loses
+the flight latch and revision: a successor still needs fresh durable proof.
+Existing journal writes, fsync and readback requirements are unchanged; this
+amendment adds no storage-loss or power-loss durability guarantee.
+
+The focused cases in
+[runner-remediation-bootstrap.test.ts](../agent/test/runner-remediation-bootstrap.test.ts)
+cover active and protected-only enrollment remaining held after a failed read.
+Protected-only custody facts can report enrollment while the active runtime
+proof is absent; the resulting “enrollment disappeared” refusal is intentional.
+The incident's attribution remains partly unresolved; this decision does not
+establish that a specific failure caused the observed incident. Existing
+zero-denial repair and fleet investigation remain outside this change.

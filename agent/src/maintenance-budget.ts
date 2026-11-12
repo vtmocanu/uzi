@@ -30,6 +30,8 @@ export class MaintenanceBudget {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private readonly inherited: Array<{ signal: AbortSignal; abort: () => void }> = [];
   private inheritedBudget?: () => MaintenanceBudget | undefined;
+  /** The error this budget itself aborted with on deadline exhaustion; the only positive identity of an expiry. */
+  private expiryError?: Error;
 
   constructor(
     durationMs = 600_000,
@@ -38,7 +40,7 @@ export class MaintenanceBudget {
     if (!Number.isFinite(durationMs) || durationMs < 0) throw new Error("invalid maintenance budget");
     this.deadline = now() + durationMs;
     this.signal = this.controller.signal;
-    this.timer = setTimeout(() => this.controller.abort(new Error("maintenance deadline exhausted")), durationMs);
+    this.timer = setTimeout(() => this.expire(), durationMs);
     this.timer.unref();
   }
 
@@ -56,10 +58,22 @@ export class MaintenanceBudget {
 
   check(): void {
     this.inheritedBudget?.()?.check();
-    if (this.remainingMs() <= 0 && !this.signal.aborted) {
-      this.controller.abort(new Error("maintenance deadline exhausted"));
-    }
+    if (this.remainingMs() <= 0 && !this.signal.aborted) this.expire();
     this.signal.throwIfAborted();
+  }
+
+  private expire(): void {
+    if (this.signal.aborted) return;
+    this.expiryError = new Error("maintenance deadline exhausted");
+    this.controller.abort(this.expiryError);
+  }
+
+  /**
+   * True only when `error` is the deadline-exhaustion error this budget (or a budget it inherits from) raised itself.
+   * A caller cancellation, resource check or any other error, even one carried by an aborted signal, is not.
+   */
+  ownsExpiry(error: unknown): boolean {
+    return (this.expiryError !== undefined && error === this.expiryError) || (this.inheritedBudget?.()?.ownsExpiry(error) ?? false);
   }
 
   private inheritSignal(signal: AbortSignal): void {
