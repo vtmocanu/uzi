@@ -69,7 +69,20 @@ export function HealthChip() {
     };
     place();
     window.addEventListener("resize", place);
-    return () => window.removeEventListener("resize", place);
+    // The header is a wrapping flex row with live content: a sibling (Search, the People chip),
+    // the chip itself (a refreshed verdict) or the row can change size and move the chip without
+    // a window resize. The offset above is relative to the chip, so re-place on any of those.
+    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => place());
+    const row = hostRef.current?.parentElement;
+    if (ro && row) {
+      ro.observe(row);
+      if (row.parentElement) ro.observe(row.parentElement);
+      for (const el of Array.from(row.children)) ro.observe(el);
+    }
+    return () => {
+      window.removeEventListener("resize", place);
+      ro?.disconnect();
+    };
   }, [open]);
 
   useEffect(() => {

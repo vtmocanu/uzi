@@ -1503,6 +1503,39 @@ describe("OverviewNext health chip popover", () => {
     }
   });
 
+  it("re-places the open panel when the header reflows without a window resize", async () => {
+    await page.viewport(1280, 900);
+    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <CommandMenuContext.Provider value={{ open: () => {} }}>
+            <OverviewNext />
+          </CommandMenuContext.Provider>
+        </main>
+      </MemoryRouter>,
+    );
+    const chip = await screen.findByRole("button", { name: /System health/ });
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    await document.fonts.ready;
+    // A live sibling grows (as a refreshed header control would) and pushes the chip right.
+    const search = screen.getByRole("button", { name: /Search/ });
+    const before = chip.getBoundingClientRect().left;
+    // Wide enough that a stale chip-relative offset would push the panel past the right edge.
+    search.style.width = "720px";
+    await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
+    // Re-placed against the chip's new position: attached to it and inside the viewport.
+    await expect
+      .poll(() => {
+        const r = dialog.getBoundingClientRect();
+        const c = chip.getBoundingClientRect();
+        const attached = Math.abs(r.right - c.right) <= 1 || Math.abs(r.left - c.left) <= 1;
+        return attached && r.left >= 15 && r.right <= document.documentElement.clientWidth - 15;
+      })
+      .toBe(true);
+  });
+
   it("re-places the open panel on resize, switching to the bottom sheet below sm", async () => {
     await page.viewport(1280, 900);
     const chip = await mountChip();
