@@ -185,6 +185,10 @@ cat > "$WORK/bin/python3" <<'STUB'
 case "$*" in
   *release-ci-coverage.py*) echo "$*" >> "$COV_LOG"; echo "coverage stub rc=${COV_RC:-1}"; exit "${COV_RC:-1}" ;;
 esac
+# The session-peers registry, only when a case supplies one (REG_JSON); each call is counted.
+if [ -n "${REG_JSON:-}" ] && [ "$*" = "${SESSION_PEERS_PY:-} list --json" ]; then
+  echo x >> "$REG_LOG"; printf '%s\n' "$REG_JSON"; exit 0
+fi
 exec "$REAL_PY" "$@"
 STUB
 export COV_LOG="$WORK/cov.log"
@@ -314,6 +318,21 @@ merge_run short_head
 [ "$rc" -eq 0 ] || fail "matching seven-character head rc=$rc: $(cat "$WORK/m.short_head")"
 [ -e "$WORK/merge.log" ] || fail "matching seven-character head refused: $(cat "$WORK/m.short_head")"
 grep -qF -- "--match-head-commit $HEAD" "$WORK/merge.log" || fail "short head weakened the server-side full-head lock"
+# Merge-lock contention reads the session-peers registry once: self_identity runs in a
+# $(...) subshell, so without a warm fetch in the parent the holder's is_live refetched.
+mkdir -p "$WORK/state/locks/merge"; printf uuid-other > "$WORK/state/locks/merge/uuid"; printf other > "$WORK/state/locks/merge/name"
+: > "$WORK/peers.py"; rm -f "$WORK/reg.log"
+(
+  unset SESSION_PEERS_NAME SESSION_PEERS_UUID SESSION_PEERS_KIND CODEX_THREAD_ID OPENCODE_SESSION_ID
+  export SESSION_PEERS_PY="$WORK/peers.py" CLAUDE_CODE_MESSAGING_SOCKET=/x REG_LOG="$WORK/reg.log"
+  export REG_JSON='{"claude":[{"sessionId":"uuid-me","name":"me","socket":"/x"},{"sessionId":"uuid-other","name":"other","socket":"/y"}],"codex":[],"codex_schema_recognised":true}'
+  merge_run lock_held; echo "$rc" > "$WORK/lock_held.rc"
+)
+[ "$(cat "$WORK/lock_held.rc")" -eq 7 ] || fail "live lock holder rc=$(cat "$WORK/lock_held.rc"), want 7: $(cat "$WORK/m.lock_held")"
+grep -qF 'MERGE_LOCK_HELD_BY=other (uuid-other' "$WORK/m.lock_held" || fail "lock holder not named: $(cat "$WORK/m.lock_held")"
+[ ! -e "$WORK/merge.log" ] || fail "a held merge lock reached the merge"
+[ "$(wc -l < "$WORK/reg.log" | tr -d ' ')" -eq 1 ] || fail "merge-lock contention fetched the registry $(wc -l < "$WORK/reg.log" | tr -d ' ') times, want 1"
+rm -rf "$WORK/state/locks/merge" "$WORK/peers.py"
 MERGE_ARGS=(--expect-head abcdef0)
 merge_run short_mismatch
 [ "$rc" -eq 8 ] || fail "short mismatch rc=$rc, want 8"

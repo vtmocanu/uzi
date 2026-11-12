@@ -118,6 +118,7 @@ case "$verb" in
         *) echo "unknown arg: $1" >&2; usage;;
       esac
     done
+    peers_warm_identity "$uuid"
     me=$(self_identity "$as" "$uuid" "$kind") || exit 3
     my_name=$(printf '%s' "$me" | cut -f1); my_uuid=$(printf '%s' "$me" | cut -f2); my_kind=$(printf '%s' "$me" | cut -f3)
     f="$CL/$key.json"
@@ -128,6 +129,7 @@ case "$verb" in
       claim_ok "$f" || { echo "unreadable claim file $f: fix or remove it by hand" >&2; exit 3; }
       o_uuid=$(jq -r '.owner_uuid // ""' "$f"); o_name=$(jq -r '.owner // ""' "$f")
       if [ "$o_uuid" != "$my_uuid" ] && [ "$force" -eq 0 ]; then
+        peers_warm_live "$o_uuid"
         st=$(owner_live "$o_uuid" "$f")
         if [ "$st" != "dead" ]; then
           echo "CLAIM_HELD_BY=$o_name"; echo "CLAIM_HELD_UUID=$o_uuid"; echo "CLAIM_OWNER_LIVENESS=$st"
@@ -187,6 +189,7 @@ case "$verb" in
     for f in "$CL"/*.json; do [ -f "$f" ] || continue
       claim_ok "$f" || { echo "unreadable claim file $f" >&2; exit 3; }
       u=$(jq -r '.owner_uuid' "$f")
+      peers_warm_live "$u"
       l=$(owner_live "$u" "$f"); r=$(registry_live "$u")
       row=$(jq -c --arg live "$l" --arg reg "$r" '. + {live:$live, registry_live:$reg}' "$f" 2>/dev/null) \
         || { echo "unreadable claim file $f" >&2; exit 3; }
@@ -229,6 +232,7 @@ case "$verb" in
           esac
         fi;;
       esac
+      [ -n "$why" ] || peers_warm_live "$u"
       if [ -z "$why" ] && [ "$(owner_live "$u" "$f")" = "dead" ]; then why="owner $o dead/stale"; fi
       [ -n "$why" ] || continue
       n=$((n+1))
