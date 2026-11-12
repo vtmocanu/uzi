@@ -43,7 +43,7 @@ function assertHeld(s: Scene, before: ReturnType<typeof snapshot>, parks = 1, cl
 /** Pins the custody meaning of a remediation hold line: units clause, below-the-bound direction, an at-bound sentence
  *  that no remediation-resolution clause can lift, and no admission-counted overshoot promise. */
 function assertCustodyMeaning(text: string): void {
-  assert.ok(!text.includes("admission-counted") && !text.includes("adds at least one admission-counted"),
+  assert.ok(!text.includes("admission-counted"),
     "no admission-counted promise");
   assert.ok(text.includes("holds from one original worker count as one admission unit toward the owner limit, but each stays open"),
     "units clause");
@@ -52,6 +52,8 @@ function assertCustodyMeaning(text: string): void {
   const bound = text.split(/(?<=[.;]) /).find(x => x.startsWith("Once this run's own open holds reach the custody hold limit"));
   assert.ok(bound, "an at-bound sentence exists");
   assert.ok(!bound.includes("unless") && !bound.includes("remediation"), "the bound is not conditioned on the remediation");
+  assert.ok(/Resume creates no claim and no hold; only discarding or settling this run's own holds frees it|it is no longer claimed; only discarding or settling this run's own holds frees it/.test(text.slice(text.indexOf(bound))),
+    "the at-bound outcome and its freeing clause");
   assert.ok(/only discarding or settling this run's own holds frees it/.test(text), "only the run's own holds free the bound");
   assert.ok(/(hold again unchanged|stop the same way) unless that remediation has been resolved through a separately authorized route\./.test(text),
     "the unless clause is attached to the repeat-outcome clause");

@@ -74,8 +74,11 @@ function assertHeld(r: Rig, seen: { flight?: FlightView }, unsupported: string):
   assert.ok(g.includes("opens at least one more hold") && !g.includes("opens another hold"), "a claimed Resume opens at least one more hold");
   assert.ok(g.includes("holds from one original worker count as one admission unit toward the owner limit, but each stays open"),
     "units clause");
-  assert.ok(g.includes("At the limit, Resume creates no claim and no hold."), "at the bound Resume creates no claim or hold");
-  assert.ok(!g.includes("unless"), "no remediation-style condition attached to the bound");
+  assert.ok(g.includes("At the limit, Resume creates no claim and no hold;"), "at the bound Resume creates no claim or hold");
+  const atLimit = g.split(/(?<=[.;]) /).filter(x => x.startsWith("At the limit,")).join(" ");
+  assert.ok(atLimit.length > 0 && !atLimit.includes("unless"), "no remediation-style condition attached to the bound");
+  assert.ok(g.includes("At the limit, Resume creates no claim and no hold; only discarding or settling this run's own holds frees it."),
+    "only the run's own holds free the bound");
   assert.ok(guidance(r)[0]!.length < 1200 && !guidance(r)[0]!.endsWith("..."), "bounded, not truncated");
   assert.equal(itemSevenLines(r).filter(t => !t.includes(GUIDANCE)).length, 0, "no item-7 line after a confirmed park");
   assert.equal(seen.flight?.parked, true, "the flight records the confirmed park");

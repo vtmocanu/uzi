@@ -27689,7 +27689,7 @@ export class RunRunner {
       "whether it was applied. If held, Resume claims again only while this run's own open holds are below the custody hold limit; " +
       "a claimed Resume will hold again unchanged on this release and opens at least one more hold. This run's holds from one " +
       "original worker count as one admission unit toward the owner limit, but each stays open. At the limit, Resume creates " +
-      "no claim and no hold. Cancel ends the run. " +
+      "no claim and no hold; only discarding or settling this run's own holds frees it. Cancel ends the run. " +
       `If not held, automatic retries follow the ordinary requeue accounting.${hostedRoll}`), 1200) } });
     try {
       const delivered = await flight.batcher.flushOwned(
