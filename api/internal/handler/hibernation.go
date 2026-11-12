@@ -39,7 +39,7 @@ func (h *Handler) ControllerHibernation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var body hostedsvc.HibernationTransition
-	if err := httpx.DecodeJSON(r, &body); err != nil {
+	if err := httpx.DecodeJSONStrict(r, &body); err != nil {
 		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}

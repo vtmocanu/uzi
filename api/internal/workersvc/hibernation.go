@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,6 +35,8 @@ const (
 
 	hibernationAdvertisedVersion = 1
 	hibernationTextMax           = 500
+	// hibernationResourceVersionMax bounds the opaque Kubernetes resourceVersion.
+	hibernationResourceVersionMax = 64
 	// hibernationPollClampMin/Max bound the controller-reported poll interval used to
 	// size the advertisement freshness window.
 	hibernationPollClampMin = 1
@@ -211,7 +212,7 @@ func (s *Service) hibernationTx(ctx context.Context, workerID uuid.UUID, fn func
 
 // HibernateWorker admits none -> preparing, or returns a *HibernationRefusal.
 func (s *Service) HibernateWorker(ctx context.Context, actor HibernationActor, workerID uuid.UUID, reason string) (store.Worker, error) {
-	reason = strings.TrimSpace(reason)
+	reason = store.ManualCordonText(reason, hibernationTextMax+1)
 	if len([]rune(reason)) > hibernationTextMax {
 		return store.Worker{}, &HibernationValidationError{Msg: "reason must be at most 500 characters"}
 	}
@@ -247,11 +248,11 @@ func (s *Service) HibernateWorker(ctx context.Context, actor HibernationActor, w
 }
 
 func actorLabel(a HibernationActor) string {
-	l := strings.TrimSpace(a.Label)
+	l := store.ManualCordonText(a.Label, 200)
 	if l == "" {
 		l = a.ID.String()
 	}
-	return truncateRunes(l, 200)
+	return l
 }
 
 // hibernateRefusal evaluates the admission predicates against the locked row and
@@ -321,7 +322,7 @@ func hibernationAdvertisementFresh(adv store.GetControllerHibernationAdvertiseme
 // audit event). A worker already waking is a no-op that keeps its op. A worker that is
 // awake is ErrHibernationConflict. Not gated by the setting.
 func (s *Service) WakeWorker(ctx context.Context, actor *HibernationActor, workerID uuid.UUID, reason string) (store.Worker, error) {
-	reason = strings.TrimSpace(reason)
+	reason = store.ManualCordonText(reason, hibernationTextMax+1)
 	if len([]rune(reason)) > hibernationTextMax {
 		return store.Worker{}, &HibernationValidationError{Msg: "reason must be at most 500 characters"}
 	}
@@ -351,7 +352,8 @@ func (s *Service) WakeWorker(ctx context.Context, actor *HibernationActor, worke
 	return out, err
 }
 
-func validateHibernationTransition(t HibernationTransition) (opID uuid.UUID, podUID pgtype.UUID, err error) {
+// validateHibernationTransition validates t and rewrites t.Reason to its sanitized form.
+func validateHibernationTransition(t *HibernationTransition) (opID uuid.UUID, podUID pgtype.UUID, err error) {
 	bad := func(msg string) error { return &HibernationValidationError{Msg: msg} }
 	if t.OpID == "" {
 		return uuid.Nil, podUID, bad("op_id is required")
@@ -370,6 +372,12 @@ func validateHibernationTransition(t HibernationTransition) (opID uuid.UUID, pod
 	if t.DeploymentUID == "" {
 		return uuid.Nil, podUID, bad("deployment_uid is required")
 	}
+	if _, perr := uuid.Parse(t.DeploymentUID); perr != nil {
+		return uuid.Nil, podUID, bad("deployment_uid must be a uuid")
+	}
+	if len(t.ResourceVersion) > hibernationResourceVersionMax {
+		return uuid.Nil, podUID, bad("resource_version must be at most 64 bytes")
+	}
 	needsRV := t.Transition != TransitionScaledDown
 	needsPod := t.Transition == TransitionScalingDown || t.Transition == TransitionReady
 	if needsRV && t.ResourceVersion == "" {
@@ -386,7 +394,7 @@ func validateHibernationTransition(t HibernationTransition) (opID uuid.UUID, pod
 		podUID = hibernationUUID(p)
 	}
 	if t.Transition == TransitionRefused {
-		if t.Reason == "" {
+		if t.Reason = store.ManualCordonText(t.Reason, hibernationTextMax+1); t.Reason == "" {
 			return uuid.Nil, podUID, bad("reason is required")
 		}
 		if len([]rune(t.Reason)) > hibernationTextMax {
@@ -400,7 +408,7 @@ func validateHibernationTransition(t HibernationTransition) (opID uuid.UUID, pod
 // *HibernationValidationError; a stale op id or an illegal transition is
 // ErrHibernationConflict and leaves the row unchanged.
 func (s *Service) ApplyTransition(ctx context.Context, workerID uuid.UUID, t HibernationTransition) (store.Worker, error) {
-	opID, podUID, err := validateHibernationTransition(t)
+	opID, podUID, err := validateHibernationTransition(&t)
 	if err != nil {
 		return store.Worker{}, err
 	}
@@ -481,6 +489,17 @@ func (s *Service) ApplyTransition(ctx context.Context, workerID uuid.UUID, t Hib
 // settle. It runs inside the Register transaction, which already holds the row lock via
 // GetWorkerForUpdate; w is the post-RegisterWorker row.
 func (s *Service) settleRegisteredWaking(ctx context.Context, q *store.Queries, w store.Worker, podUID pgtype.UUID) error {
+	if w.HibernationState == "preparing" {
+		// The pod that was live at admission is gone (a pod that Registers while the
+		// worker is still preparing is its replacement): track the live pod, or rule (a)
+		// of trySettle could never match the pod the controller later reports ready.
+		if !podUID.Valid || (w.HibernationAdmissionPodUid.Valid && w.HibernationAdmissionPodUid.Bytes == podUID.Bytes) {
+			return nil
+		}
+		w.HibernationAdmissionPodUid = podUID
+		_, err := writeHibernation(ctx, q, w)
+		return err
+	}
 	if w.HibernationState != "waking" {
 		return nil
 	}

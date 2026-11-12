@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -763,4 +764,64 @@ func TestHibernateVersusClaimRaceLiveDB(t *testing.T) {
 		f.env.exec(`UPDATE runs SET status='cancelled', worker_id=NULL WHERE id=$1`, run)
 	}
 	t.Logf("claim wins=%d hibernate wins=%d", claimWins, hibernateWins)
+}
+
+// A pod that Registers while the worker is still preparing replaces the admission pod;
+// the wake that follows (no scaling_down was ever recorded) must settle on that live pod.
+func TestHibernationPreparingRegisterTracksLivePodLiveDB(t *testing.T) {
+	f := newHibFx(t)
+	id, p1 := f.worker()
+	f.hibernate(id)
+	f.want(id, "preparing")
+	if got := f.row(id).HibernationAdmissionPodUid; got.Bytes != p1 {
+		t.Fatalf("admission pod = %v, want %v", got, p1)
+	}
+	p2 := uuid.New()
+	f.register(id, &p2)
+	f.want(id, "preparing")
+	if got := f.row(id).HibernationAdmissionPodUid; !got.Valid || got.Bytes != p2 {
+		t.Fatalf("admission pod after a preparing register = %v, want %v", got, p2)
+	}
+	if _, err := f.svc.WakeWorker(f.env.ctx, &f.actor, id, "deadline"); err != nil {
+		t.Fatalf("wake: %v", err)
+	}
+	f.want(id, "waking")
+	f.heartbeatNow(id)
+	f.mustApply(id, TransitionReady, p2)
+	f.want(id, "none")
+}
+
+func TestHibernationFreeTextIsSanitizedLiveDB(t *testing.T) {
+	f := newHibFx(t)
+	id, pod := f.worker()
+	dirty := "ro\x1b[31mll\x1b[0m‮back"
+	f.actor.Label = "ad\x1b[31mmin‮"
+	if _, err := f.svc.HibernateWorker(f.env.ctx, f.actor, id, dirty); err != nil {
+		t.Fatal(err)
+	}
+	var reason, label string
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT reason, actor_label FROM worker_hibernation_events WHERE worker_id=$1 AND action='hibernate'`, id).Scan(&reason, &label); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{reason, label} {
+		if strings.ContainsAny(v, "\x1b‮") {
+			t.Fatalf("control or bidi characters survived: %q", v)
+		}
+	}
+	// A refused reason that sanitizes to nothing is a validation error (HTTP 400).
+	bad := f.tr(id, TransitionRefused, pod)
+	bad.Reason = "\x1b[31m‮"
+	var verr *HibernationValidationError
+	if _, err := f.apply(id, bad); !errors.As(err, &verr) {
+		t.Fatalf("empty-after-sanitize refused reason: %v", err)
+	}
+	ok := f.tr(id, TransitionRefused, pod)
+	ok.Reason = "ro\x1b[31mll‮"
+	w, err := f.apply(id, ok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(w.HibernationReason.String, "\x1b‮") {
+		t.Fatalf("refused reason not sanitized: %q", w.HibernationReason.String)
+	}
 }

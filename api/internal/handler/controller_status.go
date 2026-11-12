@@ -124,7 +124,11 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 		// PRD #4205: record the hibernation protocol version and poll interval beside it
 		// (version 0 is an honest "this controller does not speak it"). Best-effort like
 		// the write above; admission refuses on a missing or stale advertisement.
-		if err := h.q.UpsertControllerHibernationAdvertisement(r.Context(), store.UpsertControllerHibernationAdvertisementParams{
+		// Only a fleet report speaks for the advertisement: a readiness report carries
+		// Hibernation 0 by construction and must not overwrite a fleet report's value.
+		if req.Kind != "" && req.Kind != "fleet" {
+			// readiness: leave the stored advertisement untouched
+		} else if err := h.q.UpsertControllerHibernationAdvertisement(r.Context(), store.UpsertControllerHibernationAdvertisementParams{
 			AdvertisedAt:        pgconv.Time(observedAt),
 			HibernationVersion:  pgtype.Int4{Int32: clampInt32(req.Hibernation), Valid: true},
 			PollIntervalSeconds: pgtype.Int4{Int32: clampInt32(req.PollIntervalSeconds), Valid: true},

@@ -208,16 +208,20 @@ func TestControllerHibernationRouteLiveDB(t *testing.T) {
 		t.Fatalf("hibernate = %d %s", rec.Code, rec.Body.String())
 	}
 	_, op := f.state(id)
+	depUID := uuid.NewString()
 	body := func(extra string) string {
-		return `{"op_id":"` + *op + `","transition":"scaling_down","deployment_uid":"dep","resource_version":"7","pod_uid":"` + pod.String() + `"` + extra + `}`
+		return `{"op_id":"` + *op + `","transition":"scaling_down","deployment_uid":"` + depUID + `","resource_version":"7","pod_uid":"` + pod.String() + `"` + extra + `}`
 	}
 
 	// Strict decode and validation: 400, row unchanged.
 	for name, b := range map[string]string{
-		"unknown field": body(`,"surprise":1`),
-		"missing op":    `{"transition":"scaling_down","deployment_uid":"dep","resource_version":"7","pod_uid":"` + pod.String() + `"}`,
-		"missing pod":   `{"op_id":"` + *op + `","transition":"scaling_down","deployment_uid":"dep","resource_version":"7"}`,
-		"bad json":      `{`,
+		"unknown field":       body(`,"surprise":1`),
+		"missing op":          `{"transition":"scaling_down","deployment_uid":"` + depUID + `","resource_version":"7","pod_uid":"` + pod.String() + `"}`,
+		"missing pod":         `{"op_id":"` + *op + `","transition":"scaling_down","deployment_uid":"` + depUID + `","resource_version":"7"}`,
+		"bad json":            `{`,
+		"trailing json":       body(``) + ` {}`,
+		"long rv":             strings.Replace(body(``), `"resource_version":"7"`, `"resource_version":"`+strings.Repeat("r", 65)+`"`, 1),
+		"deployment not uuid": strings.Replace(body(``), depUID, "dep", 1),
 	} {
 		if rec := f.controller(path, b, true); rec.Code != http.StatusBadRequest {
 			t.Errorf("%s = %d %s, want 400", name, rec.Code, rec.Body.String())
@@ -264,5 +268,24 @@ func TestControllerStatusRecordsHibernationAdvertisementLiveDB(t *testing.T) {
 	f.controller("/api/controller/status", `{"kind":"fleet","reported_at":"2026-01-01T00:00:00Z","poll_interval_seconds":7,"worker_image_tag":"x","workers":[]}`, true)
 	if err := f.pool.QueryRow(context.Background(), `SELECT hibernation_version FROM controller_report_status WHERE id=1`).Scan(&v); err != nil || v != 0 {
 		t.Fatalf("version after a legacy report = %d (%v), want 0", v, err)
+	}
+}
+
+// A readiness report (Hibernation 0 by construction) must not erase a fleet report's
+// advertisement, or admission would refuse controller_not_advertising.
+func TestControllerStatusReadinessKeepsAdvertisementLiveDB(t *testing.T) {
+	f := newHibRouteFx(t)
+	f.set.on = true
+	id, _ := f.worker()
+	cliMustExec(t, f.pool, `UPDATE controller_report_status SET hibernation_version=NULL, hibernation_advertised_at=NULL, poll_interval_seconds=NULL`)
+	if rec := f.controller("/api/controller/status", `{"kind":"fleet","reported_at":"2026-01-01T00:00:00Z","poll_interval_seconds":10,"worker_image_tag":"x","workers":[],"hibernation":1}`, true); rec.Code != http.StatusNoContent {
+		t.Fatalf("fleet = %d", rec.Code)
+	}
+	if rec := f.controller("/api/controller/status", `{"kind":"readiness","reported_at":"2026-01-01T00:00:00Z","poll_interval_seconds":10,"worker_image_tag":"x","workers":[]}`, true); rec.Code != http.StatusNoContent {
+		t.Fatalf("readiness = %d", rec.Code)
+	}
+	rec := cookieReq(t, f.router, http.MethodPost, "/api/admin/workers/"+id.String()+"/hibernate", cliMintJWT(t, f.pool, f.admin), `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hibernate after a readiness report = %d %s", rec.Code, rec.Body.String())
 	}
 }
