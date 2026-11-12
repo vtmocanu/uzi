@@ -96,7 +96,7 @@ func TestM2AutopilotDurableOverflowLiveDB(t *testing.T) {
 			st := &m2RecordStore{Queries: q, fail: mode == "record_failure"}
 			runs := &apRuns{}
 			row := store.ListEnabledReposWithConnectionsRow{ID: repo, ConnectionID: conn, ForgeProjectID: 42}
-			detect := func() { NewAutopilot(st, runs, nil).detect(ctx, row, driver) }
+			detect := func() { NewAutopilot(st, runs, nil).detect(ctx, row, driver, driver) }
 			detect()
 			if mode == "record_failure" || mode == "transient" {
 				if notes.Load() != 0 {

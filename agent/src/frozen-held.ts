@@ -45,11 +45,10 @@ export async function prepareFrozenHeld(input: {
   remediationHold?: () => Promise<boolean>;
   ciHold?: () => Promise<"clear" | "blocked" | "unknown">;
 }): Promise<{ pack: Buffer } | { reason: string }> {
-  const ownBudget = MaintenanceBudget.current() ? undefined : new MaintenanceBudget(input.deadlineMs);
-  try {
-    return await (ownBudget ? MaintenanceBudget.run(ownBudget, () => prepareFrozenHeldWithBudget(input))
-      : prepareFrozenHeldWithBudget(input));
-  } finally { ownBudget?.dispose(); }
+  if (MaintenanceBudget.current()) return prepareFrozenHeldWithBudget(input);
+  // Issue #4140: this clock bounds preparation only. A producer scope never becomes the
+  // enclosing attempt's budget, so the held POST that follows keeps its own allowance.
+  return MaintenanceBudget.runProducer(() => prepareFrozenHeldWithBudget(input), { durationMs: input.deadlineMs });
 }
 
 async function prepareFrozenHeldWithBudget(input: Parameters<typeof prepareFrozenHeld>[0]): Promise<{ pack: Buffer } | { reason: string }> {

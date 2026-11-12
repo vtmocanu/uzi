@@ -95,7 +95,7 @@ func (l *mrwLive) reworkRuns(t *testing.T) int {
 func (l *mrwLive) detect(capVal int, f *mrwForge) {
 	row := mrwRepoRow()
 	row.ID = l.repo
-	NewMRReviewWatch(l.q, l.svc, poolQueue{l.pool}, nil, mrwSettings{enabled: true, capVal: capVal}, capVal, 0).detect(l.ctx, row, f)
+	NewMRReviewWatch(l.q, l.svc, poolQueue{l.pool}, nil, mrwSettings{enabled: true, capVal: capVal}, capVal, 0).detect(l.ctx, row, f, f)
 }
 
 // A manual rework that consumes the comment and completes while the watcher is listing: the

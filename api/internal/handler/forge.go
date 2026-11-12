@@ -301,7 +301,8 @@ func (h *Handler) VerifyConnection(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if _, err := f.VerifyToken(r.Context()); err != nil {
+	var ch forge.CodeHost = f
+	if _, err := ch.VerifyToken(r.Context()); err != nil {
 		httpx.Error(w, http.StatusBadGateway, "token verification failed: "+err.Error())
 		return
 	}
@@ -376,7 +377,8 @@ func (h *Handler) UpdateConnection(w http.ResponseWriter, r *http.Request) {
 			slog.Error("build forge for connection", "error", ferr)
 			warning = usernameUnverifiedWarning
 		} else {
-			warning = humanUsernameWarning(r.Context(), f, username)
+			var ch forge.CodeHost = f
+			warning = humanUsernameWarning(r.Context(), ch, username)
 		}
 	}
 
@@ -411,7 +413,7 @@ func (h *Handler) UpdateConnection(w http.ResponseWriter, r *http.Request) {
 // It returns "" when the user exists, and a warning string when the forge says no
 // such user or the lookup itself fails — a forge blip must never block the save
 // (PRD #19 Decision 3, verified-or-warned).
-func humanUsernameWarning(ctx context.Context, f forge.Forge, username string) string {
+func humanUsernameWarning(ctx context.Context, f forge.CodeHost, username string) string {
 	exists, err := f.UserExists(ctx, username)
 	if err != nil {
 		return usernameUnverifiedWarning
@@ -843,12 +845,12 @@ func (h *Handler) importAfterEnable(ctx context.Context, userID, repoID uuid.UUI
 		slog.Warn("import after enable: read repo", "error", err)
 		return
 	}
-	f, err := h.svc.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(ctx, row.ID, row.ForgeType, row.BaseUrl, row.TokenCiphertext)
 	if err != nil {
 		slog.Warn("import after enable: build forge", "error", err)
 		return
 	}
-	if _, err := h.svc.FullSync(ctx, row.ID, row.ForgeProjectID, f); err != nil {
+	if _, err := h.svc.FullSync(ctx, row.ID, row.ForgeProjectID, tr); err != nil {
 		slog.Warn("import after enable failed; the poller retries", "repo", row.PathWithNamespace, "error", err)
 	}
 }

@@ -219,11 +219,12 @@ func (p *archiveRedundancyProver) prove(ctx context.Context, w store.Worker, run
 	if err != nil {
 		return retain(apitypes.RecoveryRedundancyAncestryUnknown), nil
 	}
-	head, reason := proveCompletedPublication(proofCtx, f, id)
+	var ch forge.CodeHost = f
+	head, reason := proveCompletedPublication(proofCtx, ch, id)
 	if reason != "" {
 		return refuse(reason), nil
 	}
-	if reason := proveRedundantCoverage(proofCtx, f, id.ProjectID, head, in, req.CurrentSha, view.PrerequisiteShas); reason != "" {
+	if reason := proveRedundantCoverage(proofCtx, ch, id.ProjectID, head, in, req.CurrentSha, view.PrerequisiteShas); reason != "" {
 		return refuse(reason), nil
 	}
 
@@ -680,7 +681,7 @@ func redundancyProvedCount(in redundancyInputs, prerequisites []string) int {
 // proveRedundantCoverage asks the forge, once per distinct commit, whether it is an ancestor of
 // head. Only an error-free Ancestor answer is proof; a NotAncestor answer names the class that
 // failed, and an error, timeout or inconclusive answer is never read as coverage.
-func proveRedundantCoverage(ctx context.Context, f forge.Forge, projectID int64, head string, in redundancyInputs, currentSha string, prerequisites []string) string {
+func proveRedundantCoverage(ctx context.Context, f forge.CodeHost, projectID int64, head string, in redundancyInputs, currentSha string, prerequisites []string) string {
 	cache := map[string]forge.Ancestry{}
 	ask := func(sha string) (forge.Ancestry, string) {
 		if sha == head {

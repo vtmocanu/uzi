@@ -259,14 +259,14 @@ func (h *Handler) AdminFileJudgeIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(ctx, repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		h.revertFiledClaim(ctx, claimID)
 		slog.Error("admin file issue: build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	created, err := f.CreateIssue(ctx, repo.ForgeProjectID, title, description, labels)
+	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, title, description, labels)
 	if err != nil {
 		// Forge rejected the write: the claim reverts, nothing persists, the coordinate is
 		// fileable again. err is already PAT-redacted by the driver.

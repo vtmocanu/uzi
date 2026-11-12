@@ -25,6 +25,26 @@ export function errMessage(err: unknown): string {
  */
 export const RUN_ID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
+const RUN_DIR_NAME_RE = /^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\.g([1-9][0-9]*))?$/;
+
+/** The per-run directory name under `agent-home/` and `provision/`: `<runId>` (today's exact name) or, for an independent
+ *  restore's successor attempt (issue #3644), `<runId>.g<generation>`. The caller validates `runId` with {@link RUN_ID_RE}. */
+export function runDirKey(runId: string, generation?: number): string {
+  if (generation === undefined) return runId;
+  if (!Number.isSafeInteger(generation) || generation < 1) throw new Error("run directory generation must be a positive integer");
+  return `${runId}.g${generation}`;
+}
+
+/** Parse a directory name under `agent-home/` or `provision/` as a run directory: `<uuid>` or `<uuid>.g<N>` (N >= 1, no leading
+ *  zero). Anything else is not a run directory (undefined). The inverse of {@link runDirKey}. */
+export function parseRunDirName(name: string): { runId: string; generation?: number } | undefined {
+  const m = RUN_DIR_NAME_RE.exec(name);
+  if (!m) return undefined;
+  if (m[2] === undefined) return { runId: m[1]! };
+  const generation = Number(m[2]);
+  return Number.isSafeInteger(generation) ? { runId: m[1]!, generation } : undefined;
+}
+
 /**
  * Clamp a directory name discovered in a CLONE to a safe rendering, bounded to `max`.
  *

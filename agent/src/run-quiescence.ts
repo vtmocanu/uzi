@@ -859,6 +859,11 @@ export interface ScanRequest {
   ownMarker?: string;
   /** Markers of every OTHER live attempt on this worker. */
   liveMarkers: string[];
+  /** issue #3644: markers of attempts that must be neither killed nor ignored: a process carrying one is a
+   *  survivor (`protected_attempt`), and the presence of any protected marker forbids the unreadable-process kill. An
+   *  independent restore passes its retained predecessor's `<run>:<attempt>` marker so the seed blocks instead of
+   *  reaping the predecessor's processes. */
+  protectedMarkers?: string[];
   /** Explicit permission for solitary uid-split reaping; omission is false. */
   mayKillUnreadableUnattributed?: boolean;
   /** issue #2213: a WORKER-WIDE detection scan (the pre-fetch check). No process is in scope and
@@ -1111,6 +1116,7 @@ export function scanOnce(
     return undefined;
   };
   const liveMarkers = new Set(req.liveMarkers);
+  const protectedMarkers = new Set(req.protectedMarkers ?? []);
   const roots = indexRoots(req.liveRoots);
   let traced = 0;
 
@@ -1162,6 +1168,7 @@ export function scanOnce(
         req.workerWide !== true &&
         req.mayKillUnreadableUnattributed === true &&
         req.liveMarkers.length === 0 &&
+        (req.protectedMarkers?.length ?? 0) === 0 &&
         descendant === false &&
         facts?.startTime !== undefined
       ) {
@@ -1203,7 +1210,8 @@ export function scanOnce(
     });
     const candidate = (reason: string): KillCandidate => ({ ...entry(reason), startTime: startTimeOf.get(pid) });
     const marker = env.get(RUN_ATTEMPT_ENV);
-    if (marker !== undefined && marker === req.ownMarker) result.kill.push(candidate("own_attempt"));
+    if (marker !== undefined && protectedMarkers.has(marker)) result.survivors.push(entry("protected_attempt"));
+    else if (marker !== undefined && marker === req.ownMarker) result.kill.push(candidate("own_attempt"));
     else if (marker !== undefined && liveMarkers.has(marker)) result.survivors.push(entry("live_attempt_conflict"));
     else if (marker !== undefined) result.kill.push(candidate("terminal_attempt"));
     else if (req.mode === "own") result.kill.push(candidate("unmarked_in_scope"));
@@ -1242,6 +1250,7 @@ function scanExclusiveIdle(req: ScanRequest, table: ProcTable, selfPid: number, 
   const bootstrap = req.exclusiveIdleBootstrap ?? [];
   if (req.mode !== "capture" || req.workerWide === true || req.targetKey !== "" ||
       req.targetPaths.length !== 0 || req.ownMarker !== undefined || req.liveMarkers.length !== 0 ||
+      (req.protectedMarkers?.length ?? 0) !== 0 ||
       req.liveRoots.length !== 0 || req.mayKillUnreadableUnattributed === true ||
       !Array.isArray(roots) || roots.length > 32 || roots.some(root => !root ||
         !Number.isSafeInteger(root.pid) || root.pid <= 0 || !Number.isSafeInteger(root.startTime) || root.startTime < 0) ||
@@ -2481,6 +2490,8 @@ export interface QuiesceRunRequest {
   workerWide?: boolean;
   dockerHost: string | undefined;
   registry: LiveAttemptRegistry;
+  /** issue #3644: see {@link ScanRequest.protectedMarkers}. */
+  protectedMarkers?: readonly string[];
   /** Whether another claim is executing, including before it registers an attempt. */
   otherClaimInFlight?: boolean;
   /** The runner site asking (e.g. `finalize`, `park:after_runner_git` for a re-proof after a
@@ -2525,6 +2536,7 @@ function reapScopedRunProcesses(
   const frozen = Object.freeze({ ...scan,
     targetPaths: Object.freeze([...scan.targetPaths]),
     liveMarkers: Object.freeze([...scan.liveMarkers]),
+    ...(scan.protectedMarkers ? { protectedMarkers: Object.freeze([...scan.protectedMarkers]) as string[] } : {}),
     liveRoots: Object.freeze(scan.liveRoots.map(root => Object.freeze({ ...root }))),
   });
   const reportBudget = req.reportBudget ? Object.freeze({ ...req.reportBudget }) : undefined;
@@ -2689,6 +2701,7 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       targetPaths: req.targetPaths.map((p) => path.resolve(p)),
       ownMarker: req.attempt?.marker,
       liveMarkers: others.map((a) => a.marker),
+      ...(req.protectedMarkers?.length ? { protectedMarkers: [...req.protectedMarkers] } : {}),
       mayKillUnreadableUnattributed:
         req.workerWide !== true && uidSplitActive() && req.otherClaimInFlight === false && others.length === 0,
       ...(req.workerWide === true ? { workerWide: true } : {}),
@@ -2755,6 +2768,7 @@ function isScanRequest(v: unknown): v is HelperScanRequest {
     (o.workerWide !== true || (o.targetPaths as string[]).length === 0) &&
     (o.ownMarker === undefined || typeof o.ownMarker === "string") &&
     strings(o.liveMarkers) &&
+    (o.protectedMarkers === undefined || strings(o.protectedMarkers)) &&
     (o.mayKillUnreadableUnattributed === undefined || typeof o.mayKillUnreadableUnattributed === "boolean") &&
     (o.workerWide === undefined || typeof o.workerWide === "boolean") &&
     (o.exclusiveIdle === undefined || o.exclusiveIdle === true) &&

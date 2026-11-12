@@ -30,6 +30,9 @@ export interface Logger {
    *  un-scrubs it from a still-active sibling run that shares it (same user ⇒ same
    *  PAT + Anthropic token). A no-op for a never-added or worker-lifetime secret. */
   removeSecret(secret: string): void;
+  /** Scrub registered secrets before a caller truncates a diagnostic. A logger
+   * without this method must not be given raw diagnostic text as a fallback. */
+  redactDiagnostic?(text: string): string;
   child(fields: Record<string, unknown>): Logger;
 }
 
@@ -96,6 +99,7 @@ class ConsoleLogger implements Logger {
 
   addSecret(secret: string): void { this.registry.add(secret); }
   removeSecret(secret: string): void { this.registry.remove(secret); }
+  redactDiagnostic(text: string): string { return this.registry.scrub(text); }
 
   child(fields: Record<string, unknown>): Logger {
     return new ConsoleLogger(this.minLevel, this.registry, { ...this.base, ...fields });

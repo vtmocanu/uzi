@@ -15,7 +15,8 @@
 # attempt and retains older ones in place (a delayed create can even leave a NEWER,
 # empty, root-owned attempt dir). So the clone is chosen by IDENTITY, never by the
 # newest path: a candidate counts only when the bare's recovery journal
-# (uzi-recovery.<branch>.clone), protected descriptor (uzi-retained.<runId>.journal),
+# (uzi-recovery.<branch>.clone), a restored successor's entry (uzi-restore.<branch>.journal),
+# protected descriptor (uzi-retained.<runId>.journal),
 # or attempt ledger (uzi-attempts.<branch>.entry, last value per attemptId wins)
 # names it for THIS run, and its .git reports the run's
 # branch. The PRIMARY capture (issue-N.tgz) is the journal-named candidate, else a
@@ -42,6 +43,17 @@
 # attemptId|null,epoch,seq}],evidence:{parkAck (= binding),interventionIds (<=64),processJoin,commands,steering,
 # auxiliaries,feedback,sinkReceipts,parkReap}}} (settlement only with ack "confirmed"). The protected descriptor
 # validator accepts exactly that v1 shape and refuses anything else; the record grants no attribution of its own.
+# An independent restore (issue #3644) leaves the killed predecessor P's plain journal byte-identical and keeps its
+# successor S in its OWN key, uzi-restore.<branch>.journal (single-valued, "" = cleared): {"restore":<basis>,
+# (the basis is exactly {version:1, predecessor:{clonePath,attemptId,generation,root:{dev,ino}}, journalDigest,
+# boundary:{predecessor,successor}, slotOwner, pin, restoreTip}: dev/ino are decimal digit strings of 1..30 characters and
+# the boundary values are 64 lowercase hex digests),
+# "restoreStage":"seeding"|"ready",<S's runId, clonePath, attemptId[, memoryPark][, completionSourceFence]>}, or a
+# tombstone {"restore":<basis>,"restoreStage":"retired","successor":{runId,attemptId,clonePath}} once S is gone. For a
+# run that is not completed or cancelled, S's entry makes S's clone the journal-current (primary) source exactly like a
+# journal-named clone; P stays an attributed extra through its own journal and its ledger entry. A tombstone names no
+# source. An entry of another run is ignored; a value that is not exactly one of these shapes, or a repeated key, is
+# unreadable evidence and makes the pod's search inconclusive (never absence).
 # .uzi-residue-* / .uzi-skills-* siblings are never candidates. The host resolves the concrete dir and passes it to the capture.
 #
 # For each run id it resolves worker_id -> pod FRESH each call (so it survives a
@@ -489,7 +501,7 @@ select_clone(){
   local LC_ALL=C listing journal ledger protected_ledger="" protected="" protected_ok="" ledger_rows ledger_ok ledger_live journal_ok="" journal_current="" retained="" path br name aid
   local attributed="" primary=""
   local best="" best_aid="" have_best=0 tab=$'\t' bare="$REPOS_BASE/$REPO_SLUG.git"
-  local stopped="" marker_path="" marker_verdict=""
+  local stopped="" marker_path="" marker_verdict="" restore="" restore_ok="" restore_cfg="" restore_count="" cfg_rc=0
   [ -n "$branch" ] || return 1
   local rc=0
   # rc 3: listed, but some candidate's .git could not be read; keep the readable ones.
@@ -798,6 +810,71 @@ select_clone(){
       | "\(.attemptId // "")\t\(.clonePath)"' 2>/dev/null)" || journal_ok=""
   fi
   if [ -n "$protected_ok" ]; then journal_ok="$protected_ok"; fi
+  # issue #3644: a restored successor S, from uzi-restore.<branch>.journal. The value is validated against the exact
+  # envelope (basis keys, stage, S's remainder keys) and S's identity; only this run's seeding/ready entry names a source,
+  # and it goes FIRST so it is the journal-current (primary) one. A completed or cancelled run ignores it like the plain
+  # journal (S's live ledger entry still attributes it).
+  if [ "${terminal_capture:-0}" -ne 2 ]; then
+    rc=0
+    restore="$(kexec_probe "$ns" "$pod" \
+      git --git-dir="$bare" config --local --no-includes --get-all "uzi-restore.$branch.journal")" || rc=$?
+    case "$rc" in 0|1) ;; *) probe_inconclusive "reading the restore entry on pod $ns/$pod failed"; return 1 ;; esac
+    # The key is single-valued, and a cleared value is "" (one occurrence). --get-all hides a repeated "" and cannot tell a
+    # valueless key from a cleared one, so count the raw occurrences in the listing (what restoreValueIn in git.ts does):
+    # more than one, or a valueless one, is ambiguous evidence.
+    cfg_rc=0
+    restore_cfg="$(kexec_probe "$ns" "$pod" git --git-dir="$bare" config --local --no-includes --list)" || cfg_rc=$?
+    [ "$cfg_rc" -eq 0 ] || { probe_inconclusive "listing the restore entry on pod $ns/$pod failed"; return 1; }
+    restore_count="$(printf '%s\n' "$restore_cfg" | awk -v k="uzi-restore.$branch.journal" \
+      'index($0, k "=") == 1 { n++ } $0 == k { n += 2 } END { print n + 0 }')"
+    if [ "$restore_count" -gt 1 ]; then probe_inconclusive "invalid restore entry on pod $ns/$pod (ambiguous: repeated or valueless)"; return 1; fi
+    if [ "$rc" -eq 0 ] && [ -n "$restore" ]; then
+      restore_ok=""
+      # shellcheck disable=SC2016
+      restore_ok="$(printf '%s\n' "$restore" | "$JQ" -rs --arg rid "$rid" --arg stem "$stem" --arg root "$RUNNER_BASE" '
+        def hex64: type == "string" and test("^[0-9a-f]{64}$");
+        def sha: type == "string" and test("^[0-9a-f]{40}$");
+        def aid: type == "string" and test("^[0-9]{8}T[0-9]{6}Z-(g[0-9]+|gx)-[0-9a-f]{16}$");
+        def pos: type == "number" and floor == . and . >= 1 and . <= 9007199254740991;
+        def str: type == "string" and length > 0 and length <= 4096 and (contains("\u0000") | not);
+        def abs: str and startswith("/") and (split("/")[1:] | all(.[]; length > 0 and . != "." and . != ".."));
+        def uuid: type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+        def fence: type == "object" and keys == ["sourceCoreDigest","sourceUseEpoch","version"]
+          and .version == 1 and (.sourceUseEpoch | uuid) and (.sourceCoreDigest | hex64);
+        def digits: type == "string" and test("^[0-9]{1,30}$");
+        def basis: type == "object" and keys == ["boundary","journalDigest","pin","predecessor","restoreTip","slotOwner","version"]
+          and .version == 1 and (.journalDigest | hex64) and (.restoreTip | sha)
+          and (.boundary | type == "object" and keys == ["predecessor","successor"] and (.predecessor | hex64) and (.successor | hex64))
+          and (.predecessor | type == "object" and keys == ["attemptId","clonePath","generation","root"]
+            and (.attemptId | aid) and (.clonePath | abs) and (.generation | pos)
+            and (.root | type == "object" and keys == ["dev","ino"] and (.dev | digits) and (.ino | digits))
+            and (. as $x | .clonePath | endswith(".attempt-" + $x.attemptId)))
+          and (.slotOwner | type == "object" and keys == ["epoch","worker"] and (.epoch | str) and (.worker | str))
+          and (.pin | type == "object" and keys == ["captureId","finalization","generation","sourceSha"]
+            and (.captureId | str) and (.finalization | type == "boolean") and (.generation | pos) and (.sourceSha | sha));
+        def tombstone: type == "object" and keys == ["attemptId","clonePath","runId"] and (.runId | str)
+          and (.attemptId | aid) and (.clonePath | abs) and (. as $x | .clonePath | endswith(".attempt-" + $x.attemptId));
+        if length != 1 then error("the restore entry is single-valued") else .[0] end
+        | if type != "object" or (.restore | basis | not) then error("restore basis") else . end
+        | if .restoreStage == "retired" then
+            if keys == ["restore","restoreStage","successor"] and (.successor | tombstone) then empty else error("restore tombstone") end
+          elif .restoreStage == "seeding" or .restoreStage == "ready" then
+            del(.restore, .restoreStage) as $e
+            | if ($e | keys - ["attemptId","clonePath","completionSourceFence","memoryPark","runId"] | length) != 0
+                 or ($e | has("attemptId") and has("clonePath") and has("runId") | not)
+                 or ($e.runId | str | not) or ($e.attemptId | aid | not) or ($e.clonePath | abs | not)
+                 or ($e | has("completionSourceFence") and (.completionSourceFence | fence | not))
+                 or ($e | has("memoryPark") and (.memoryPark | type != "object"))
+              then error("restore remainder")
+              elif $e.runId != $rid then empty
+              elif $e.clonePath != ($root + "/" + $stem + ".attempt-" + $e.attemptId) then error("restore source path")
+              else "\($e.attemptId)\t\($e.clonePath)" end
+          else error("restore stage") end' 2>/dev/null)" || {
+        probe_inconclusive "invalid restore entry on pod $ns/$pod"; return 1;
+      }
+      [ -z "$restore_ok" ] || journal_ok="$restore_ok${journal_ok:+$'\n'$journal_ok}"
+    fi
+  fi
   journal_current="${journal_ok%%$'\n'*}"
   # The marker-named canonical dir joins the retained set only now, so it can never
   # be journal-current.

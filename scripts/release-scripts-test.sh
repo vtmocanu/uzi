@@ -1072,6 +1072,9 @@ fi
 if [ "${PLAN_HISTORY_FAILURE:-0}" = 1 ]; then
   case " $* " in *' log --first-parent '*) exit 74 ;; esac
 fi
+if [ "${PLAN_BLOB_FAILURE:-0}" = 1 ]; then
+  case " $* " in *' cat-file '*) exit 75 ;; esac
+fi
 exec "$PLAN_REAL_GIT" "$@"
 GIT
   chmod +x "$d/plan-bin/git"
@@ -1183,11 +1186,62 @@ GIT
   gcommit "$d" 'docs: isolated fragment'
   plan_expect 'only committed fragment makes range releasable' $'OP=nextrc\nTAG=v0.2.0-rc.12\nSHIPPING_COUNT=1'
   mkdir -p "$d/agent/codex"
-  echo 'runtime pin fixture' > "$d/agent/codex/codex-package.lock"
+  printf 'CODEX_VERSION=2.0.0\nCODEX_TAG=rust-v2.0.0\n' > "$d/agent/codex/codex-package.lock"
   git -C "$d" add agent/codex/codex-package.lock
   gcommit "$d" 'chore: change Codex runtime'
   plan_expect 'Codex adoption requires a local cut' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
   PLAN_PUBLICATION=failed plan_expect 'Codex block precedes liftable publication block' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  # #4172: an adoption assertion belongs to the committed lock, never a worktree file.
+  local adoption digest valid_record malformed publication_reason
+  adoption=agent/codex/codex-package.adopted
+  digest="$(shasum -a 256 "$d/agent/codex/codex-package.lock" | awk '{print $1}')"
+  valid_record="$(printf 'lock-sha256=%s\nruntime-tag=rust-v2.0.0' "$digest")"
+  printf '%s\n' "$valid_record" > "$d/$adoption"
+  plan_expect 'Codex untracked adoption cannot authorize release' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  git -C "$d" add "$adoption"
+  gcommit "$d" 'docs: record Codex adoption'
+  plan_expect 'Codex matching committed adoption' $'OP=nextrc\nTAG=v0.2.0-rc.12'
+  PLAN_BLOB_FAILURE=1 plan_expect 'Codex blob read failure stays closed' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  for PLAN_PUBLICATION in failed pending missing error transient; do
+    export PLAN_PUBLICATION
+    publication_reason=previous-publication-not-successful
+    case "$PLAN_PUBLICATION" in error|transient) publication_reason=previous-publication-unreadable ;; esac
+    plan_expect "Codex adopted publication $PLAN_PUBLICATION" "$(printf 'OP=blocked\nREASON=%s' "$publication_reason")"
+  done
+  export PLAN_PUBLICATION=success
+  PLAN_PREVIOUS=v0.1.0 plan_expect 'Codex adopted abandon uses stable boundary' $'OP=new-base\nPREVIOUS_TAG=v0.1.0' --version 0.3.0 --abandon-train
+  for malformed in stale tag duplicate unknown extra uppercase short garbage missing newline crlf; do
+    case "$malformed" in
+      stale) printf 'lock-sha256=%064d\nruntime-tag=rust-v2.0.0\n' 0 ;;
+      tag) printf 'lock-sha256=%s\nruntime-tag=rust-v9.9.9\n' "$digest" ;;
+      duplicate) printf '%s\nlock-sha256=%s\n' "$valid_record" "$digest" ;;
+      unknown) printf '%s\nunknown=true\n' "$valid_record" ;;
+      extra) printf '%s\n\n' "$valid_record" ;;
+      uppercase) printf 'lock-sha256=%s\nruntime-tag=rust-v2.0.0\n' "$(printf '%s' "$digest" | tr '[:lower:]' '[:upper:]')" ;;
+      short) printf 'lock-sha256=abc\nruntime-tag=rust-v2.0.0\n' ;;
+      garbage) printf '$(touch adoption-executed)\n' ;;
+      missing) printf 'lock-sha256=%s\n' "$digest" ;;
+      newline) printf '%s' "$valid_record" ;;
+      crlf) printf 'lock-sha256=%s\r\nruntime-tag=rust-v2.0.0\r\n' "$digest" ;;
+    esac > "$d/$adoption"
+    git -C "$d" add "$adoption"
+    gcommit "$d" "test: Codex adoption $malformed"
+    plan_expect "Codex $malformed adoption refuses" $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  done
+  assert_eq 'Codex adoption data never executed' no "$(if [ -e "$d/adoption-executed" ]; then echo yes; else echo no; fi)"
+  PLAN_PREVIOUS=v0.1.0 plan_expect 'Codex invalid adoption blocks abandon' $'OP=blocked\nREASON=codex-runtime-needs-local-cut' --version 0.3.0 --abandon-train
+  # A matching worktree target cannot turn a committed symlink into an assertion.
+  printf '%s\n' "$valid_record" > "$d/adoption-target"
+  git -C "$d" rm -q "$adoption"
+  ln -s ../../adoption-target "$d/$adoption"
+  git -C "$d" add "$adoption"
+  gcommit "$d" 'test: Codex adoption symlink'
+  plan_expect 'Codex symlink adoption refuses' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  git -C "$d" rm -q "$adoption"
+  printf '%s\n' "$valid_record" > "$d/$adoption"
+  git -C "$d" add "$adoption"
+  gcommit "$d" 'docs: restore valid adoption'
+  plan_expect 'Codex restored committed adoption' $'OP=nextrc\nTAG=v0.2.0-rc.12'
   # A human's local cut establishes a new boundary after the adoption read.
   git -C "$d" tag v0.2.0-rc.12
   export PLAN_PREVIOUS=v0.2.0-rc.12
@@ -1285,7 +1339,7 @@ shipping_path_regressions() {
   # shellcheck source=scripts/lib/shipping-paths.sh
   . "$SCRIPTS_DIR/lib/shipping-paths.sh"
   local expected="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global agent/codex scripts/sqlc.sh"
-  assert_eq "shared runtime set stays exact" "$expected" "$AGENT_PATHS"
+  assert_eq "shared runtime set stays exact" "$expected :(exclude)agent/codex/codex-package.adopted" "$AGENT_PATHS"
   local p d out status subject
   for p in $expected; do
     if is_shipping "$p"; then pass "runtime entry $p ships"; else fail "runtime entry $p ships"; fi
@@ -1295,7 +1349,7 @@ shipping_path_regressions() {
   for p in api/x.go controller/x.go web/src/x.ts deploy/chart/values.yaml docs/cli.md; do
     if is_shipping "$p"; then pass "existing shipping $p"; else fail "existing shipping $p"; fi
   done
-  for p in api/x_test.go agent/src/foo.test.ts web/src/foo.test.tsx api/testdata/x agent/test/x.ts agent/templates/test/x agent/codex/x_test.go e2e/x fixtures/x .agents/skills/x prds/x.md agent/README.md; do
+  for p in api/x_test.go agent/src/foo.test.ts web/src/foo.test.tsx api/testdata/x agent/test/x.ts agent/templates/test/x agent/codex/x_test.go agent/codex/codex-package.adopted e2e/x fixtures/x .agents/skills/x prds/x.md agent/README.md; do
     if is_shipping "$p"; then fail "excluded $p"; else pass "excluded $p"; fi
   done
 
@@ -1374,6 +1428,42 @@ MD
     pass "autobump has no private AGENT_PATHS assignment"
   fi
   assert_contains "autobump sources shipping library" '/lib/shipping-paths.sh"' "$(cat "$SCRIPTS_DIR/worker-tag-autobump.sh")"
+  # #4172: the release adoption assertion is not worker execution input. Its
+  # addition AND later record-only edits must preserve the published worker pin.
+  d="$(mktemp -d)"; seed_repo "$d"
+  mkdir -p "$d/agent/codex"
+  for subject in seed amend; do
+    printf 'adoption assertion %s\n' "$subject" > "$d/agent/codex/codex-package.adopted"
+    git -C "$d" add agent/codex/codex-package.adopted
+    gcommit "$d" "docs: $subject adoption assertion"
+    status=0
+    out="$(cd "$d" && bash scripts/worker-tag-autobump.sh --check 0.2.0 2>&1)" || status=$?
+    assert_eq "$subject adoption-only check needs no worker bump" 0 "$status"
+    status=0
+    out="$(cd "$d" && bash scripts/worker-tag-autobump.sh 0.2.0 2>&1)" || status=$?
+    assert_eq "$subject adoption-only edit succeeds" 0 "$status"
+    assert_eq "$subject adoption-only keeps worker pin" 0.1.0 "$(pin_tag "$d")"
+    assert_eq "$subject adoption-only leaves tracked inputs unchanged" '' "$(git -C "$d" status --porcelain --untracked-files=no)"
+    # Keep the next fixture discriminating even against the unmodified autobump.
+    git -C "$d" checkout -- deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh
+  done
+  # The exception is exactly one path; neither its neighbor nor the lock is exempt.
+  for p in agent/codex/codex-package.adopted.extra agent/codex/codex-package.lock; do
+    printf 'runtime change\n' > "$d/$p"
+    git -C "$d" add "$p"; gcommit "$d" "chore: change $p"
+    status=0
+    out="$(cd "$d" && bash scripts/worker-tag-autobump.sh --check 0.2.0 2>&1)" || status=$?
+    assert_eq "$p still requires worker bump" 1 "$status"
+    assert_contains "$p appears in changed runtime paths" "$p" "$out"
+    git -C "$d" rm -q "$p"; gcommit "$d" "test: remove $p"
+  done
+  printf 'runtime change\n' > "$d/agent/codex/codex-package.lock"
+  git -C "$d" add agent/codex/codex-package.lock; gcommit "$d" 'chore: change actual runtime lock'
+  status=0
+  out="$(cd "$d" && bash scripts/worker-tag-autobump.sh 0.2.0 2>&1)" || status=$?
+  assert_eq 'runtime lock edit still succeeds' 0 "$status"
+  assert_eq 'runtime lock still advances worker pin' 0.2.0 "$(pin_tag "$d")"
+  rm -rf "$d"
   # Override only the fixture-local library. A non-agent sentinel proves both actual
   # Git diff selection and changed-path reporting consume that library's pathspecs.
   d="$(mktemp -d)"; seed_repo "$d"

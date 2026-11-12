@@ -217,7 +217,7 @@ func detectWith(st *apStore, runs *apRuns, f *apForge) {
 	if f.issue.Description == "" && f.issueErr == nil {
 		f.issue = forge.Issue{Description: "see prds/19.md"}
 	}
-	NewAutopilot(st, runs, apLabeler{label: apLabel}).detect(context.Background(), repoRow(), f)
+	NewAutopilot(st, runs, apLabeler{label: apLabel}).detect(context.Background(), repoRow(), f, f)
 }
 
 func lastUpsert(t *testing.T, st *apStore) store.UpsertAutopilotTriggerParams {
@@ -420,7 +420,7 @@ func TestAutopilotRunsWithoutPRDLink(t *testing.T) {
 		issue:  forge.Issue{Description: "small typo fix, no PRD", Labels: []string{apLabel}},
 	}
 
-	NewAutopilot(st, runs, apLabeler{label: apLabel}).detect(context.Background(), repoRow(), f)
+	NewAutopilot(st, runs, apLabeler{label: apLabel}).detect(context.Background(), repoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("CreateAutopilotRun calls = %d, want 1 (a link-less run must now start)", len(runs.calls))

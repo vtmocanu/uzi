@@ -5,7 +5,7 @@ import type { Logger } from "./log.js";
 import { RUN_DISK_MAX_ENTRIES, type RunDiskEntry } from "./protocol.js";
 import { measureRunHome, type MeasureOptions, type RunHomeBytes } from "./rmtree.js";
 import { DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES, TERMINAL_RUN_STATUSES, type RunStatusLookup } from "./home-reclaim.js";
-import { errMessage, RUN_ID_RE } from "./util.js";
+import { errMessage, parseRunDirName } from "./util.js";
 
 /**
  * PRD #1809 D8: the per-run HOME size the heartbeat reports (`stats.run_disk`).
@@ -150,16 +150,25 @@ export class RunDiskSampler {
     const startAt = this.resumeAfter === undefined ? 0 : names.findIndex((n) => n > this.resumeAfter!);
     const ordered = startAt <= 0 ? names : [...names.slice(startAt), ...names.slice(0, startAt)];
 
+    // issue #3644: a run can own several HOME directories (`<runId>` and an independent restore's `<runId>.g<N>`). Each is
+    // visited and decided on its own, by its run's status; the report carries one entry per RUN (the sum of its measured HOMEs).
     const fresh: Omit<RunDiskEntry, "sampled_at">[] = [];
-    // Runs this sample decided (measured, or dropped as gone/foreign/terminal/unknown).
+    const namesOfRun = new Map<string, string[]>();
+    for (const n of names) {
+      const id = parseRunDirName(n)!.runId;
+      namesOfRun.set(id, [...(namesOfRun.get(id) ?? []), n]);
+    }
+    // HOME directories this sample decided (measured, or dropped as gone/foreign/terminal/unknown).
     const reached = new Set<string>();
+    const statusOfRun = new Map<string, { status: string | undefined } | "failed">();
     let measured = 0;
     let statusFailures = 0;
     let lookupFailures = 0;
     let measureFailures = 0;
     let stoppedEarly: "budget" | "deadline" | undefined;
     let lastVisited: string | undefined;
-    for (const runId of ordered) {
+    for (const dirName of ordered) {
+      const runId = parseRunDirName(dirName)!.runId;
       if (measured >= maxMeasured) {
         stoppedEarly = "budget";
         break;
@@ -168,17 +177,17 @@ export class RunDiskSampler {
         stoppedEarly = "deadline";
         break;
       }
-      lastVisited = runId;
-      const home = path.join(o.homeRoot, runId);
+      lastVisited = dirName;
+      const home = path.join(o.homeRoot, dirName);
       let st: DirStat;
       try {
         st = await lstat(home);
       } catch {
-        reached.add(runId); // gone since the listing
+        reached.add(dirName); // gone since the listing
         continue;
       }
       if (!workerOwnedDir(st)) {
-        reached.add(runId);
+        reached.add(dirName);
         continue;
       }
       if (!o.isRunLive(runId)) {
@@ -188,30 +197,49 @@ export class RunDiskSampler {
           lookupFailures += 1;
           continue;
         }
-        let status: string | undefined;
-        try {
-          status = await o.statusOf(runId);
-          statusFailures = 0;
-        } catch {
-          statusFailures += 1;
+        // One lookup per run, whichever of its HOME directories is visited first (a failure is remembered too).
+        let looked = statusOfRun.get(runId);
+        if (looked === undefined) {
+          try {
+            looked = { status: await o.statusOf(runId) };
+            statusFailures = 0;
+          } catch {
+            looked = "failed";
+            statusFailures += 1;
+          }
+          statusOfRun.set(runId, looked);
+        }
+        if (looked === "failed") {
           lookupFailures += 1;
           continue;
         }
+        const status = looked.status;
         if (status === undefined || TERMINAL_RUN_STATUSES.has(status)) {
-          reached.add(runId);
+          reached.add(dirName);
           continue;
         }
       }
       measured += 1;
       try {
         const r = await measure(home, { deadline: Math.min(sampleDeadline, this.now() + perRunMs) });
-        fresh.push({
-          run_id: runId,
-          home_bytes: r.homeBytes,
-          cache_bytes: r.cacheBytes,
-          ...(r.truncated ? { truncated: true } : {}),
-        });
-        reached.add(runId);
+        const prior = fresh.findIndex((f) => f.run_id === runId);
+        if (prior >= 0) {
+          const f = fresh[prior]!;
+          fresh[prior] = {
+            run_id: runId,
+            home_bytes: f.home_bytes + r.homeBytes,
+            cache_bytes: f.cache_bytes + r.cacheBytes,
+            ...(f.truncated || r.truncated ? { truncated: true } : {}),
+          };
+        } else {
+          fresh.push({
+            run_id: runId,
+            home_bytes: r.homeBytes,
+            cache_bytes: r.cacheBytes,
+            ...(r.truncated ? { truncated: true } : {}),
+          });
+        }
+        reached.add(dirName);
       } catch (err) {
         measureFailures += 1;
         o.log.warn("run disk sample could not measure a run HOME", { run_id: runId, error: errMessage(err) });
@@ -222,22 +250,37 @@ export class RunDiskSampler {
     // Every fresh entry carries the moment this sample finished measuring.
     const sampledAt = new Date(this.now()).toISOString();
     const entries: RunDiskEntry[] = fresh.map((e) => ({ ...e, sampled_at: sampledAt }));
+    // A truncated listing may have missed a sibling HOME (`<id>` vs `<id>.g<N>`) of any run, so every fresh sum is a lower bound.
+    // Carried entries (below) replace their fresh counterparts unchanged.
+    if (listingTruncated) for (const e of entries) e.truncated = true;
 
     // Keep the previous reading for the runs this sample did not reach, while their HOME is still a
     // worker-owned directory. A run that is gone from the listing of a complete sample fails that
     // check and drops out.
     let carried = 0;
+    const previous = new Set<string>();
     for (const prev of this.latest ?? []) {
-      if (reached.has(prev.run_id)) continue;
-      let st: DirStat;
-      try {
-        st = await lstat(path.join(o.homeRoot, prev.run_id));
-      } catch {
-        continue;
+      previous.add(prev.run_id);
+      // A run's entry is replaced only when this sample decided EVERY HOME of the run; otherwise (a HOME was not reached, or
+      // not measured) the previous full reading is kept in place of a partial sum.
+      const dirsOfRun = namesOfRun.get(prev.run_id) ?? [prev.run_id];
+      if (dirsOfRun.every((n) => reached.has(n))) continue;
+      let owned = false;
+      for (const n of dirsOfRun) {
+        try {
+          if (workerOwnedDir(await lstat(path.join(o.homeRoot, n)))) { owned = true; break; }
+        } catch { /* gone */ }
       }
-      if (!workerOwnedDir(st)) continue;
+      if (!owned) continue;
+      const at = entries.findIndex((e) => e.run_id === prev.run_id);
+      if (at >= 0) entries.splice(at, 1);
       entries.push(prev);
       carried += 1;
+    }
+    // A partial sum of a run with no previous reading to fall back on is reported, marked truncated (a lower bound).
+    for (const e of entries) {
+      if (e.truncated || previous.has(e.run_id) || !fresh.some((f) => f.run_id === e.run_id)) continue;
+      if ((namesOfRun.get(e.run_id) ?? []).some((n) => !reached.has(n))) e.truncated = true;
     }
 
     const partial = stoppedEarly !== undefined || listingTruncated || lookupFailures > 0 || measureFailures > 0;
@@ -277,7 +320,7 @@ export class RunDiskSampler {
           truncated = false;
           break;
         }
-        if (e.isDirectory() && RUN_ID_RE.test(e.name)) names.push(e.name);
+        if (e.isDirectory() && parseRunDirName(e.name) !== undefined) names.push(e.name);
       }
     } finally {
       await dir.close().catch(() => undefined);

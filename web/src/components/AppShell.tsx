@@ -6,7 +6,7 @@
 // Active-state logic keeps a parent lit on child routes.
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { useEffect, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, MOCK_MODE, type Branding, type BuildInfo, type HealthDoc, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
@@ -30,26 +30,17 @@ import { JudgeTodoContext } from "./JudgeTodoContext";
 import { FindingsOpenContext, FindingsOpenValueContext } from "./FindingsOpenContext";
 import { BuildInfoPopover } from "./BuildInfoPopover";
 import { ChangelogDrawer } from "./ChangelogDrawer";
+import { NAV_SECTIONS, type NavBadgeKey } from "./navItems";
+import { CommandMenu } from "./CommandMenu";
+import { CommandMenuContext } from "./CommandMenuContext";
+import { isApplePlatform } from "../lib/platform";
 import {
-  ActivityIcon,
-  BoardIcon,
-  BookIcon,
-  BotIcon,
-  BugIcon,
-  ChatIcon,
-  ClockIcon,
   ChevronRightIcon,
   FactoryIcon,
-  GearIcon,
   GitIcon,
   GitLabIcon,
-  HomeIcon,
   LogOutIcon,
   MenuIcon,
-  ScaleIcon,
-  ServerIcon,
-  ShieldIcon,
-  SkillIcon,
   XIcon,
 } from "./icons";
 
@@ -707,6 +698,37 @@ function SidebarContent({
       .catch(() => setForgeTypeById({}));
   }, [user]);
 
+  // Resolves a nav definition's badge key to the count, tone and accessible noun the
+  // sidebar renders (the NOUN says what the number MEANS; see NavItem's badgeLabel).
+  const badgeProps = (key: NavBadgeKey): NavItemBadge & { badgeTone?: CountPillTone } => {
+    switch (key) {
+      case "runs":
+        // "in progress": the noun the mock spec'd for this count. Brand tone (Decision 2),
+        // not the Workers alert red.
+        return { badge: runsInProgress, badgeLabel: "in progress" };
+      case "findings":
+        return { badge: findingsOpen, badgeTone: "count", badgeLabel: "open" };
+      case "schedules":
+        // Any parked schedule (PRD #1650 D6) replaces the enabled count with the parked
+        // count in the alert tone: a parked schedule has stopped firing until it is fixed.
+        return schedulesParked > 0
+          ? {
+              badge: schedulesParked,
+              badgeTone: "alert",
+              badgeLabel: schedulesParked === 1 ? "parked schedule" : "parked schedules",
+            }
+          : { badge: schedulesEnabled, badgeLabel: "enabled" };
+      case "workers":
+        // alert, not the default count tone: red reads "go look", while the grey Judge
+        // pill beside it reads "there is a queue" (Decision 2).
+        return { badge: workersAttention, badgeTone: "alert", badgeLabel: "needing attention" };
+      case "judge":
+        // The Judge page's own tab name for this number, so the badge and the tab
+        // announce the same thing.
+        return { badge: judgeTodo, badgeLabel: "to triage" };
+    }
+  };
+
   const handleLogout = async () => {
     onNavigate?.();
     await logout();
@@ -782,137 +804,48 @@ function SidebarContent({
       </div>
 
       <nav className="flex-1 space-y-1 overflow-y-auto px-2 pb-4 lg:space-y-0.5 lg:pb-2">
-        <div className="space-y-0.5 pt-3 lg:pt-2">
-          <NavItem to="/dashboard" icon={<HomeIcon />} label="Overview" onNavigate={onNavigate} collapsed={collapsed} />
-        </div>
-
-        <NavGroup label="Work" collapsed={collapsed}>
-          <NavItem to="/repos" icon={<BoardIcon />} label="Repos" exactOnly onNavigate={onNavigate} collapsed={collapsed} />
-          {/* Board children collapse into the "Repos" parent: on the rail every
-              repo would render as an identical forge glyph, so hide them and let
-              /repos stand in (Decision: reviewer #7). */}
-          {!collapsed &&
-            repos.map((r) => (
-              <NavItem
-                key={r.id}
-                to={`/repos/${r.id}/board`}
-                icon={forgeIcon(forgeTypeById[r.connection_id])}
-                label={maskRepoPath(r.path_with_namespace, demoMode)}
-                indent
-                onNavigate={onNavigate}
-              />
-            ))}
-          {/* Runs badge (PRD #239): the caller's in-progress run count. Default
-              "count" tone — brand, "there is a queue", not the Workers alert red. */}
-          <NavItem
-            to="/runs"
-            icon={<ActivityIcon />}
-            label="Runs"
-            badge={runsInProgress}
-            // "in progress": the noun the mock spec'd for this count. Brand tone
-            // (Decision 2), not the Workers alert red.
-            badgeLabel="in progress"
-            onNavigate={onNavigate}
-            collapsed={collapsed}
-          />
-          {/* Findings (PRD #333 D8): off-task bugs workers flagged on YOUR code — Work, not the
-              agent-grading Factory where Judge lives. Sits directly under Runs, the lane whose
-              output it collects. Badge is the open-findings count from the GET /api/findings
-              meta; brand "count" tone, the noun is "open". */}
-          <NavItem
-            to="/findings"
-            icon={<BugIcon />}
-            label="Findings"
-            badge={findingsOpen}
-            badgeTone="count"
-            badgeLabel="open"
-            onNavigate={onNavigate}
-            collapsed={collapsed}
-          />
-          {/* Schedules (PRD #241): the time-driven run origin. Badge is the caller's
-              enabled-schedule count — brand "count" tone, paused ones excluded — unless
-              any schedule is parked (PRD #1650 D6): then it is the parked count in the
-              alert tone, since a parked schedule has stopped firing until it is fixed. */}
-          <NavItem
-            to="/schedules"
-            icon={<ClockIcon />}
-            label="Schedules"
-            {...(schedulesParked > 0
-              ? {
-                  badge: schedulesParked,
-                  badgeTone: "alert" as const,
-                  badgeLabel: schedulesParked === 1 ? "parked schedule" : "parked schedules",
-                }
-              : { badge: schedulesEnabled, badgeLabel: "enabled" })}
-            onNavigate={onNavigate}
-            collapsed={collapsed}
-          />
-          <NavItem to="/chat" icon={<ChatIcon />} label="Chat" onNavigate={onNavigate} collapsed={collapsed} />
-        </NavGroup>
-
-        <NavGroup label="Factory" collapsed={collapsed}>
-          <NavItem to="/agents" icon={<BotIcon />} label="Agents" onNavigate={onNavigate} collapsed={collapsed} />
-          <NavItem to="/skills" icon={<SkillIcon />} label="Skills" onNavigate={onNavigate} collapsed={collapsed} />
-          {/* Workers' ONE nav home. It was also a Settings tab (as /settings/workers),
-              which needed the excludeSubpath active-state hack to keep the two entries
-              from lighting together — the fleet is operations, so it lives here alone. */}
-          <NavItem
-            to="/workers"
-            icon={<ServerIcon />}
-            label="Workers"
-            badge={workersAttention}
-            // alert, not the default count tone: red reads "go look", while the grey
-            // Judge pill beside it reads "there is a queue" (Decision 2).
-            badgeTone="alert"
-            badgeLabel="needing attention"
-            onNavigate={onNavigate}
-            collapsed={collapsed}
-          />
-          {/* Judge (PRD #98): the cross-run recommendation workbench. Badge is the
-              to-triage backlog count — the same number the page's To-triage tab shows. */}
-          <NavItem
-            to="/judge"
-            icon={<ScaleIcon />}
-            label="Judge"
-            badge={judgeTodo}
-            // The Judge page's own tab name for this number, so the badge and the tab
-            // announce the same thing.
-            badgeLabel="to triage"
-            onNavigate={onNavigate}
-            collapsed={collapsed}
-          />
-        </NavGroup>
-
-        {/* The bottom cluster: system destinations, grouped by a rule rather than a
-            label. Settings and Docs used to each carry a one-item labeled group
-            ("Configure", "Help"), and the five admin pages each held a sidebar row —
-            they are now one tabbed Admin destination (AdminShell), the same treatment
-            the Settings tabs give the user-scoped surfaces. */}
-        <NavGroup collapsed={collapsed}>
-          {/* Forge has no standalone entry (Decision 3): it lives only under the
-              Settings tabs, so Settings stays lit across /settings/*. */}
-          <NavItem
-            to="/settings"
-            icon={<GearIcon />}
-            label="Settings"
-            onNavigate={onNavigate}
-            collapsed={collapsed}
-          />
-          {user?.is_admin && (
-            /* /admin redirects to the first tab; the prefix match keeps this entry
-               lit on every /admin/* tab. The health pip is a severity entry point (PRD
-               #1484 M5, D1): a count + worded severity when checks need attention. */
-            <NavItem
-              to="/admin"
-              icon={<ShieldIcon />}
-              label="Admin"
-              onNavigate={onNavigate}
-              collapsed={collapsed}
-              healthPip={health?.counts ?? null}
-            />
-          )}
-          <NavItem to="/docs" icon={<BookIcon />} label="Docs" onNavigate={onNavigate} collapsed={collapsed} />
-        </NavGroup>
+        {NAV_SECTIONS.map((section, i) => {
+          const items = section.items
+            .filter((def) => !def.adminOnly || user?.is_admin)
+            .map((def) => (
+              <Fragment key={def.key}>
+                <NavItem
+                  to={def.to}
+                  icon={def.icon}
+                  label={def.label}
+                  exactOnly={def.exactOnly}
+                  onNavigate={onNavigate}
+                  collapsed={collapsed}
+                  {...(def.badge ? badgeProps(def.badge) : {})}
+                  healthPip={def.healthPip ? (health?.counts ?? null) : undefined}
+                />
+                {/* Board children collapse into the "Repos" parent: on the rail every
+                    repo would render as an identical forge glyph, so hide them and let
+                    /repos stand in (Decision: reviewer #7). */}
+                {def.key === "repos" &&
+                  !collapsed &&
+                  repos.map((r) => (
+                    <NavItem
+                      key={r.id}
+                      to={`/repos/${r.id}/board`}
+                      icon={forgeIcon(forgeTypeById[r.connection_id])}
+                      label={maskRepoPath(r.path_with_namespace, demoMode)}
+                      indent
+                      onNavigate={onNavigate}
+                    />
+                  ))}
+              </Fragment>
+            ));
+          return section.leading ? (
+            <div key={i} className="space-y-0.5 pt-3 lg:pt-2">
+              {items}
+            </div>
+          ) : (
+            <NavGroup key={i} label={section.group ?? undefined} collapsed={collapsed}>
+              {items}
+            </NavGroup>
+          );
+        })}
       </nav>
 
       <div className="border-t border-edge">
@@ -1115,6 +1048,45 @@ export function AppShell({ children }: { children: ReactNode }) {
     if (back) navigate(back, { replace: true });
   }, [authLoading, user, navigate]);
   const [mobileOpen, setMobileOpen] = useState(false);
+  // Command menu (PRD #3875). State and shortcut live above the guest early return so the
+  // hook order stays stable; the listener is active only while signed in.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const openNavRef = useRef<HTMLButtonElement>(null);
+  // Opening from the mobile drawer: the drawer unmounts in the same commit the menu
+  // mounts, so a drawer link holding focus would vanish and Modal would record <body> as
+  // the opener. Move focus to the always-present "Open navigation" button first, so Escape
+  // returns somewhere real.
+  const openMenu = useCallback(() => {
+    if (mobileOpen) {
+      openNavRef.current?.focus();
+      setMobileOpen(false);
+    }
+    setMenuOpen(true);
+  }, [mobileOpen]);
+  const commandMenuApi = useMemo(() => ({ open: openMenu }), [openMenu]);
+  useEffect(() => {
+    if (!user) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.altKey || e.shiftKey || e.isComposing) return;
+      // Match the typed letter, so Colemak/Dvorak users keep their own letters. The
+      // physical KeyK position is only a fallback when the layout types no Latin letter
+      // (e.g. Cyrillic), where e.key could never be "k".
+      const typed = e.key ?? "";
+      const isK = /^[a-z]$/i.test(typed) ? typed.toLowerCase() === "k" : e.code === "KeyK";
+      if (!isK) return;
+      if (isApplePlatform() ? !e.metaKey || e.ctrlKey : !e.ctrlKey || e.metaKey) return;
+      if (menuOpen) {
+        e.preventDefault();
+        return;
+      }
+      // Another modal owns the keyboard: leave the key (and the browser default) alone.
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      e.preventDefault();
+      openMenu();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [user, menuOpen, openMenu]);
   // The node InShellHeader portals a page header into (PRD #3878); state, not a ref, so
   // the page re-renders once the node exists.
   const [headerSlot, setHeaderSlot] = useState<HTMLDivElement | null>(null);
@@ -1358,6 +1330,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           it carries its own frame marker to go ember-dark under Hall. Inert elsewhere. */}
       <div className="frame sticky top-0 z-20 flex items-center gap-3 border-b border-edge bg-surface px-4 py-3 lg:hidden">
         <button
+          ref={openNavRef}
           onClick={() => setMobileOpen(true)}
           aria-label="Open navigation"
           className="rounded-md p-1 text-muted hover:text-fg"
@@ -1419,13 +1392,18 @@ export function AppShell({ children }: { children: ReactNode }) {
           <JudgeTodoContext.Provider value={setJudgeTodo}>
             <FindingsOpenContext.Provider value={setFindingsOpen}>
               <FindingsOpenValueContext.Provider value={findingsOpen}>
-                <PageHeaderSlotContext.Provider value={headerSlot}>{children}</PageHeaderSlotContext.Provider>
+                <CommandMenuContext.Provider value={commandMenuApi}>
+                  <PageHeaderSlotContext.Provider value={headerSlot}>{children}</PageHeaderSlotContext.Provider>
+                </CommandMenuContext.Provider>
               </FindingsOpenValueContext.Provider>
             </FindingsOpenContext.Provider>
           </JudgeTodoContext.Provider>
         </div>
       </main>
 
+      {/* The command menu (PRD #3875), mounted only while open so its repo fetch runs once
+          per open. */}
+      {menuOpen && <CommandMenu isAdmin={!!user.is_admin} onClose={() => setMenuOpen(false)} />}
       {/* The ONE changelog drawer instance (PRD #415 M2). Mounted at AppShell scope,
           not inside SidebarContent, because the sidebar renders twice; both footer
           triggers set the same state. `runningVersion` is the footer's own version

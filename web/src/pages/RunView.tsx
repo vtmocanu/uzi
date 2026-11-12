@@ -1506,7 +1506,7 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
         : memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
       <p className="mt-0.5 text-xs text-muted">
         {retained ? <>
-          {adoptionFailed && "Integrity hold: retained adoption or a predecessor remediation record refused source use, so the agent did not start. Local work and its custody are preserved. "}
+          {adoptionFailed && "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. "}
           {unwitnessed && "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. "}
           {decisionHeld
             ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
@@ -2502,7 +2502,7 @@ export function RunView() {
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "retained_recovery_adoption_failed"
-            ? "Integrity hold: retained adoption or a predecessor remediation record refused source use, so the agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
+            ? "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "retained_continuation_unwitnessed"
             ? "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "codex_idle_stall_held"

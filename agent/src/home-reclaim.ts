@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import { rmHomeTree } from "./rmtree.js";
-import { RUN_ID_RE } from "./util.js";
+import { hasRetainedHomeMarker } from "./retained-homes.js";
+import { parseRunDirName } from "./util.js";
 
 /**
  * One-off reclaim of run HOMEs stranded before PRD #108 M6 (`agent-home/<runId>`
@@ -161,12 +162,18 @@ export interface ReclaimOptions {
   deadlineMs?: number;
   /** Injected for tests. */
   now?: () => number;
+  /**
+   * issue #3644: whether `runId` has a retained-home marker, which keeps the run's LEGACY `<runId>` HOME out of the sweep (a
+   * throw counts as present). Default: the real marker under the data dir (the parent of `homeRoot`). A `<runId>.g<N>` HOME
+   * is not covered: it follows its run's status like any other.
+   */
+  hasRetainedHomeMarker?: (runId: string) => Promise<boolean>;
 }
 
 /**
  * Every EXAMINED directory lands in exactly one bucket
  * (`removed + skippedTooRecent + skippedStatusUnknown + skippedNotTerminal +
- * failed === examined`), and `unexamined` carries everything the sweep stopped
+ * skippedRetainedHome + failed === examined`), and `unexamined` carries everything the sweep stopped
  * short of.
  *
  * That last field exists because the earlier version claimed full accounting and
@@ -183,6 +190,8 @@ export interface ReclaimSummary {
   skippedTooRecent: number;
   skippedStatusUnknown: number;
   skippedNotTerminal: number;
+  /** A legacy HOME left alone because its run has a retained-home marker (issue #3644). */
+  skippedRetainedHome: number;
   /** Positively terminal, but the removal itself failed. */
   failed: number;
   /** Candidates the sweep never looked at, because it stopped early. */
@@ -204,6 +213,7 @@ export async function reclaimStrandedRunHomes(
   const deadlineMs = opts.deadlineMs ?? DEFAULT_RECLAIM_DEADLINE_MS;
   const now = opts.now ?? Date.now;
   const startedAt = now();
+  const markerOf = opts.hasRetainedHomeMarker ?? ((runId: string) => hasRetainedHomeMarker(path.dirname(homeRoot), runId));
   let consecutiveFailures = 0;
   const summary: ReclaimSummary = {
     examined: 0,
@@ -212,6 +222,7 @@ export async function reclaimStrandedRunHomes(
     skippedTooRecent: 0,
     skippedStatusUnknown: 0,
     skippedNotTerminal: 0,
+    skippedRetainedHome: 0,
     failed: 0,
     unexamined: 0,
   };
@@ -233,7 +244,7 @@ export async function reclaimStrandedRunHomes(
   // Candidates first, so "how many did we not get to" is a subtraction from a list
   // that exists rather than a number nobody counted.
   const candidates = entries.filter(
-    (e) => e.isDirectory() && RUN_ID_RE.test(e.name),
+    (e) => e.isDirectory() && parseRunDirName(e.name) !== undefined,
   );
   summary.skippedNotRunDir = entries.length - candidates.length;
 
@@ -248,6 +259,16 @@ export async function reclaimStrandedRunHomes(
     }
     summary.examined += 1;
     const dir = path.join(homeRoot, entry.name);
+    const parsed = parseRunDirName(entry.name) as { runId: string; generation?: number };
+    // issue #3644: a run with a retained-home marker keeps its legacy HOME, whatever its status.
+    if (parsed.generation === undefined) {
+      let marked: boolean;
+      try { marked = await markerOf(parsed.runId); } catch { marked = true; }
+      if (marked) {
+        summary.skippedRetainedHome += 1;
+        continue;
+      }
+    }
 
     let st;
     try {
@@ -274,7 +295,7 @@ export async function reclaimStrandedRunHomes(
     let status: string | undefined;
     let couldNotAsk = false;
     try {
-      status = await statusOf(entry.name);
+      status = await statusOf(parsed.runId);
     } catch {
       couldNotAsk = true;
     }
@@ -329,6 +350,7 @@ export async function reclaimStrandedRunHomes(
     skipped_too_recent: summary.skippedTooRecent,
     skipped_status_unknown: summary.skippedStatusUnknown,
     skipped_not_terminal: summary.skippedNotTerminal,
+    skipped_retained_home: summary.skippedRetainedHome,
     failed: summary.failed,
     unexamined: summary.unexamined,
     stopped_early: summary.stoppedEarly,

@@ -74,7 +74,7 @@ type Store interface {
 // forge-first single-column move. *forgesvc.Service satisfies it.
 type Mover interface {
 	ForgeForConnection(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
-	AutoMove(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error)
+	AutoMove(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error)
 }
 
 // Projector is an OPTIONAL collaborator that projects a uzi-originated column move
@@ -482,8 +482,10 @@ func (l *Lifecycle) maybeTerminalComment(ctx context.Context, runID uuid.UUID, s
 		slog.Warn("run lifecycle: build forge for terminal comment", "run", runID, "error", err)
 		return
 	}
+	// Only the issue side of the driver is used here.
+	var tracker forge.IssueTracker = f
 	body := l.terminalCommentBody(status, runID, mc)
-	if _, err := f.CreateIssueNote(ctx, mc.ForgeProjectID, mc.IssueIid.Int64, body); err != nil {
+	if _, err := tracker.CreateIssueNote(ctx, mc.ForgeProjectID, mc.IssueIid.Int64, body); err != nil {
 		// Already PAT-redacted by the driver. Recorded but lost (never retried).
 		slog.Warn("run lifecycle: post autopilot terminal comment", "run", runID, "error", err)
 	}

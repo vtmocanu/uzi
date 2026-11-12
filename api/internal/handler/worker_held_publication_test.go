@@ -447,3 +447,114 @@ func TestWorkerRunHeldPublicationStalledUploadTimesOut(t *testing.T) {
 		t.Fatal("PublishHeld ran for an incomplete upload")
 	}
 }
+
+// ---- characterization: which context error the service observes (issue #4140) ---------------
+//
+// Supports reading hosted logs where every "pack pre-verify failed" line says "context canceled"
+// and none says "deadline exceeded". The service's context derives from the request context
+// (cancelled when the client goes away) with heldServiceBudget as its deadline. These tests pin
+// both causes at the service seam; they do not attribute any hosted attempt.
+
+// heldPostCtx is heldPost with a caller-controlled request context.
+func heldPostCtx(ctx context.Context, srv *httptest.Server, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/api/worker/runs/"+uuid.NewString()+"/held-publication", body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Uzi-Held-Tip", heldTipHdr)
+	req.Header.Set("X-Uzi-Held-Generation", "2")
+	req.Header.Set("X-Uzi-Held-Coverage", heldCovHdr)
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	return client.Do(req)
+}
+
+// blockedPublishSvc returns a fake whose PublishHeld signals entry, then blocks on ctx.Done()
+// and reports ctx.Err() and how long it waited.
+func blockedPublishSvc() (f *fakeHeldSvc, entered chan struct{}, observed chan error, waited chan time.Duration) {
+	f = newFakeHeldSvc()
+	entered = make(chan struct{})
+	observed = make(chan error, 1)
+	waited = make(chan time.Duration, 1)
+	f.publish = func(ctx context.Context, _ workersvc.HeldPublishRequest, _ []byte) (workersvc.HeldPublishResult, error) {
+		close(entered)
+		start := time.Now()
+		<-ctx.Done()
+		waited <- time.Since(start)
+		observed <- ctx.Err()
+		return workersvc.HeldPublishResult{}, ctx.Err()
+	}
+	return f, entered, observed, waited
+}
+
+// (1) The client aborts after the service is entered: the service sees context.Canceled, well
+// before its own budget.
+func TestWorkerRunHeldPublicationClientAbortServiceSeesCanceled(t *testing.T) {
+	base := scaleHeldBudgets(t, 100) // service budget 1.5 s
+	f, entered, observed, waited := blockedPublishSvc()
+	srv := heldTransportServer(t, f, base)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientDone := make(chan error, 1)
+	go func() {
+		resp, err := heldPostCtx(ctx, srv, strings.NewReader("pack"))
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		clientDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the service was never entered")
+	}
+	cancel()
+	select {
+	case err := <-observed:
+		if !errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("service saw %v, want context.Canceled", err)
+		}
+		if w := <-waited; w >= heldServiceBudget {
+			t.Fatalf("the service waited %v (>= budget %v): the abort did not cancel it", w, heldServiceBudget)
+		}
+	case <-time.After(heldServiceBudget + 10*time.Second):
+		t.Fatal("the service context did not end after the client aborted")
+	}
+	if err := <-clientDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("client error = %v, want context.Canceled", err)
+	}
+}
+
+// (2) No client abort: the scaled service budget fires and the service sees
+// context.DeadlineExceeded, never Canceled.
+func TestWorkerRunHeldPublicationServiceBudgetSeesDeadlineExceeded(t *testing.T) {
+	base := scaleHeldBudgets(t, 100) // service budget 1.5 s
+	f, entered, observed, waited := blockedPublishSvc()
+	srv := heldTransportServer(t, f, base)
+
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		if resp, err := heldPostCtx(context.Background(), srv, strings.NewReader("pack")); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the service was never entered")
+	}
+	select {
+	case err := <-observed:
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			t.Fatalf("service saw %v, want context.DeadlineExceeded", err)
+		}
+		w := <-waited
+		if w < heldServiceBudget/2 || w > heldServiceBudget+5*time.Second {
+			t.Fatalf("the service waited %v, want about the %v budget", w, heldServiceBudget)
+		}
+	case <-time.After(heldServiceBudget + 10*time.Second):
+		t.Fatal("the service budget never fired")
+	}
+	<-clientDone
+}

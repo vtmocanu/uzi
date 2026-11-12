@@ -7,7 +7,7 @@ const repo = fileURLToPath(new URL('../../', import.meta.url));
 const require = createRequire(path.join(repo, 'agent/package.json'));
 const { API } = await import(pathToFileURL(require.resolve('typescript/unstable/sync')));
 const { SyntaxKind } = await import(pathToFileURL(require.resolve('typescript/unstable/ast')));
-const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'codex-capture-reaper-real', 'git-retained-permissions', 'code-cross-check-replay-uid-split', 'claude-command-launcher', 'claude-command-real'];
+const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'codex-capture-reaper-real', 'git-retained-permissions', 'code-cross-check-replay-uid-split', 'claude-command-launcher', 'claude-command-real', 'stopped-source-unreadable-uid'];
 const singleFile = 'single-uid-preflight';
 const sharedFile = 'runner-shared-real';
 const epochFile = 'pod-epoch-real';
@@ -18,6 +18,7 @@ const epochLeaves = [
   'pod epoch real entrypoint fences protected initialization under EX and confines both UID bootstrap launches',
   'pod epoch private API CA survives both real UID launch chains without relaxing preload refusal',
   'pod epoch restores observable persistent worker and runner scratch in both UID modes and refuses invalid saved paths',
+  'pod epoch real split: the worker pins the runner scratch root, the runner-uid census reads it and the strict delete removes a leaf',
 ];
 // Issue #3907: the one lane whose container leaves /nix unmasked (a labelled named volume), so the
 // baked Chromium exists. Two literal leaves under one literal suite, gated by one INIT_SKIP.
@@ -87,6 +88,21 @@ const retainedLeaves = new Set([
   "keeps source and custody when retained object recovery fails"
 ]);
 
+// Issue #4141: the legacy stopped-source proof when the runner or command uid made entries the
+// runner uid cannot read. Eight literal leaves under one literal suite, gated by one INIT_SKIP.
+const stoppedSourceFile = 'stopped-source-unreadable-uid';
+const stoppedSourceSuite = 'stopped-source legacy proof with entries the runner cannot read';
+const stoppedSourceLeaves = [
+  'is not covered for a nonignored untracked directory the runner cannot read',
+  'is not covered for a modified tracked file inside a tracked directory the runner cannot read',
+  'is not covered for a nonignored directory private to the command uid',
+  'is not covered for a runner-unreadable loose ref naming a commit only the clone holds',
+  'stays covered for a stat-dirty tracked file whose content is unchanged',
+  'stays covered for an unreadable directory matched by a committed gitignore',
+  'stays covered for an unreadable directory matched by the clone info exclude',
+  'retains conservatively when Git warns about a benign deprecated config key',
+];
+
 // The source AST seam lets regressions share one small parser project.
 export function inventoryForSource(source, file) {
   const planning = file === 'git-planning-diff';
@@ -141,6 +157,13 @@ export function inventoryForSource(source, file) {
     for (const leaf of retainedLeaves) {
       if (!expected.some(test => test.names.length === 2 && test.names[1] === leaf)) {
         throw new Error(`${file}: missing required literal retained recovery leaf: ${leaf}`);
+      }
+    }
+  } else if (file === stoppedSourceFile) {
+    if (gates !== 1) throw new Error(`${file}: expected one UID gate, found ${gates}`);
+    for (const leaf of stoppedSourceLeaves) {
+      if (!expected.some(test => test.names.length === 2 && test.names[0] === stoppedSourceSuite && test.names[1] === leaf)) {
+        throw new Error(`${file}: missing required literal stopped-source proof: ${leaf}`);
       }
     }
   } else if (claudeReal) {

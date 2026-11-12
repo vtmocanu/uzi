@@ -66,6 +66,12 @@ type github struct {
 	slugs map[int64]repoSlug
 }
 
+// The driver implements both halves of the Forge contract (PRD #4173).
+var (
+	_ IssueTracker = (*github)(nil)
+	_ CodeHost     = (*github)(nil)
+)
+
 // newGitHub builds a GitHub driver against baseURL using token, with a bounded
 // per-call HTTP timeout. baseURL is assumed allowlist-checked by the caller (the
 // SSRF guard lives in config). No network call happens here.

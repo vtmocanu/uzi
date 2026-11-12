@@ -157,7 +157,7 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "MR rework is unavailable: the trusted review bot list could not be read")
 			return
 		}
-		f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+		ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 		if err != nil {
 			slog.Error("mr-rework: build forge for connection", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -182,7 +182,7 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		comments, err := f.ListMergeRequestComments(r.Context(), repo.ForgeProjectID, run.MrIid.Int64)
+		comments, err := ch.ListMergeRequestComments(r.Context(), repo.ForgeProjectID, run.MrIid.Int64)
 		if err != nil {
 			// err is already PAT-redacted by the driver.
 			httpx.Error(w, http.StatusBadGateway, "could not read the merge request comments: "+err.Error())
@@ -211,7 +211,7 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			ProjectID:         repo.ForgeProjectID,
 			BaseURL:           repo.BaseUrl,
 			BotForgeUserID:    repo.BotForgeUserID,
-			Lookup:            f,
+			Lookup:            ch,
 			Trusted:           trusted,
 			Comments:          comments,
 			Ledger:            state,

@@ -139,4 +139,69 @@ describe("ExtendTimePopover (PRD #1189)", () => {
     expect(within(panel).getByText(/extensions are turned off/i)).toBeTruthy();
     expect(within(panel).queryByRole("button", { name: /Extend by/ })).toBeNull();
   });
+
+  // Issue #4179: an interactive task the worker wall-parked carries no budget figures (the server
+  // projects none for an interactive run), but the server still extends and resumes it in one step.
+  function wallParkedNoBudget(over: Partial<BudgetRun> = {}): BudgetRun {
+    return {
+      status: "paused",
+      hold_reason: "budget_exhausted",
+      started_at: new Date(Date.now() - 7 * 3600 * 1000).toISOString(),
+      deadline_at: null,
+      budget_wall_seconds: null,
+      budget_total_seconds: null,
+      budget_used_seconds: 21766,
+      budget_extension_seconds: 0,
+      budget_extension_cap_seconds: 57600,
+      ...over,
+    };
+  }
+
+  it("offers the chooser on a wall park with no budget figures and posts the seconds", () => {
+    const onSubmit = vi.fn();
+    render(<ExtendTimePopover run={wallParkedNoBudget()} busy={false} onSubmit={onSubmit} />);
+    const panel = open();
+    expect(within(panel).queryByText(/extensions are turned off/i)).toBeNull();
+    expect(within(panel).getByText(/Up to 16h per extension/)).toBeTruthy();
+    expect(within(panel).getByText(/Extending adds the time and resumes it/)).toBeTruthy();
+    fireEvent.click(within(panel).getByRole("button", { name: /Extend by 2h/ }));
+    expect(onSubmit).toHaveBeenCalledWith(7200);
+  });
+
+  it("still enforces the per-extension maximum on a wall park with no budget figures", () => {
+    const onSubmit = vi.fn();
+    render(<ExtendTimePopover run={wallParkedNoBudget()} busy={false} onSubmit={onSubmit} />);
+    const panel = open();
+    fireEvent.change(within(panel).getByPlaceholderText(/custom/i), { target: { value: "17h" } });
+    const confirm = within(panel).getByRole("button", { name: /Extend by 17h/ }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    expect(within(panel).getByText(/more than the 16h maximum per extension/)).toBeTruthy();
+  });
+
+  it("says extensions are turned off on a wall park only when the cap is 0", () => {
+    render(
+      <ExtendTimePopover
+        run={wallParkedNoBudget({ budget_extension_cap_seconds: 0 })}
+        busy={false}
+        onSubmit={vi.fn()}
+      />,
+    );
+    const panel = open();
+    expect(within(panel).getByText(/extensions are turned off/i)).toBeTruthy();
+    expect(within(panel).queryByRole("button", { name: /Extend by/ })).toBeNull();
+  });
+
+  it("says a run without a budget has no time limit to extend, not that extensions are off", () => {
+    render(
+      <ExtendTimePopover
+        run={wallParkedNoBudget({ hold_reason: null, budget_used_seconds: null })}
+        busy={false}
+        onSubmit={vi.fn()}
+      />,
+    );
+    const panel = open();
+    expect(within(panel).getByText(/no time limit to extend/i)).toBeTruthy();
+    expect(within(panel).queryByText(/extensions are turned off/i)).toBeNull();
+    expect(within(panel).queryByRole("button", { name: /Extend by/ })).toBeNull();
+  });
 });

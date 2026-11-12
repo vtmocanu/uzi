@@ -60,7 +60,7 @@ type fakeGuard struct {
 	blocked    map[string]bool // by path_with_namespace
 }
 
-func (g *fakeGuard) CheckToken(context.Context, forge.Forge, forge.Type, bool) privcheck.TokenReport {
+func (g *fakeGuard) CheckToken(context.Context, forge.CodeHost, forge.Type, bool) privcheck.TokenReport {
 	return privcheck.TokenReport{Violations: g.violations}
 }
 func (g *fakeGuard) GuardRepo(_ context.Context, in privcheck.GuardInput) privcheck.GuardResult {

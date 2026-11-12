@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
+import { CommandMenuContext } from "../components/CommandMenuContext";
 import { Dashboard } from "./Dashboard";
 import { api } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -967,5 +968,52 @@ describe("People chip (issue #4042)", () => {
     expect(screen.queryByRole("button", { name: /^People:/ })).toBeNull();
     expect(sentence()).not.toContain(" for ");
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
+  });
+});
+
+// PRD #3875 M1: the Search button in the header opens the shell's command menu.
+describe("OverviewNext Search button", () => {
+  it("calls the shell's open() on click, with the shortcut shown on the button", async () => {
+    const open = vi.fn();
+    render(
+      <MemoryRouter>
+        <CommandMenuContext.Provider value={{ open }}>
+          <OverviewNext />
+        </CommandMenuContext.Provider>
+      </MemoryRouter>,
+    );
+    await settle();
+    const button = screen.getByRole("button", { name: /^Search/ });
+    expect(button.textContent).toMatch(/Ctrl K|\u2318K/);
+    fireEvent.click(button);
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it("names the shortcut in aria-keyshortcuts: Control+K by default, Meta+K on an Apple platform", async () => {
+    const mountWithMenu = () =>
+      render(
+        <MemoryRouter>
+          <CommandMenuContext.Provider value={{ open: vi.fn() }}>
+            <OverviewNext />
+          </CommandMenuContext.Provider>
+        </MemoryRouter>,
+      );
+    const view = mountWithMenu();
+    await settle();
+    expect(screen.getByRole("button", { name: /^Search/ }).getAttribute("aria-keyshortcuts")).toBe("Control+K");
+    view.unmount();
+    Object.defineProperty(navigator, "platform", { configurable: true, value: "MacIntel" });
+    try {
+      mountWithMenu();
+      await settle();
+      expect(screen.getByRole("button", { name: /^Search/ }).getAttribute("aria-keyshortcuts")).toBe("Meta+K");
+    } finally {
+      delete (navigator as unknown as Record<string, unknown>).platform;
+    }
+  });
+
+  it("renders no Search button without a command menu (page mounted outside the shell)", async () => {
+    await mount();
+    expect(screen.queryByRole("button", { name: /^Search/ })).toBeNull();
   });
 });

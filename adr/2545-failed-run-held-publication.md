@@ -124,6 +124,11 @@ protected; committed-only coverage cannot discharge unproven residue.
   per-request timeout for this route alone is 330 s
   (`HELD_PUBLICATION_TIMEOUT_MS`, `agent/src/client.ts`). At most four
   requests are in flight process-wide (429 `busy` otherwise).
+  Clarification (#4140): that 330 s is narrowed only by budgets, slot
+  deadlines and cancellation the enclosing scope already holds. The worker's
+  own frozen-preparation clock (30 s on a background recovery pass, the scan
+  deadline in the foreground) bounds preparation alone and never becomes the
+  attempt's budget, so it cannot cut the POST short.
 - **Pre-body eligibility.** Ownership, switch, worker capability and scope are
   checked before the body is read. If a create was already invoked for this
   identity, the answer is reconcile-only and no body is read.

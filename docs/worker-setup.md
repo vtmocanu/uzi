@@ -325,6 +325,41 @@ does not count toward cache bytes, only toward the run HOME's size. Old
 shared `go-build*` residue in `TMPDIR` is not collected. See the
 [ADR-1809 amendment](../adr/1809-per-run-cache-bounds.md#amendment-3870-park-only-go-scratch).
 
+**Runner `TMPDIR` scratch reclaim (#4043, #4182) is requested by default in the chart.**
+The [pod-epoch reclaim pass](worker-docker.md#pod-epoch-shadow-reclaim) carries a
+scratch phase for orphaned top-level directories under runner `TMPDIR`
+(`/data/runner/.tmp/uzi-runner` on a split-UID worker, `/data/runner/.tmp` on a
+single-UID one). Chart `workers.epochReclaim.scratchDeletion: true` maps to
+controller `UZI_WORKER_EPOCH_SCRATCH_DELETION="true"`, which renders worker
+`UZI_EPOCH_SCRATCH_DELETION=1` for persistent Docker workers. The worker reads it
+once before creating the pod epoch; this is independent of attempt deletion,
+which remains selector-gated and off by default. The startup
+`pod_epoch_reclaim_activation` line reports boolean `deletion_requested` and
+`scratch_requested`, not proof of deletion.
+
+The default supplies no attestation: `workers.docker.podEpochReclaim.runtime`
+remains empty, and undeclared or unattested passes keep scratch. A requested
+phase deletes only at a fresh `eligible` + `attested` verdict under the existing
+exclusion and settlement protections and ADR-3153 residuals. The worker image
+must include the #4171 fix (merged at `7cd46526`). Older controllers or deployments
+outside the chart with absent env leave scratch reclaim off; older workers
+ignore the new env, so a rendered `1` is not proof of activation. See
+[configuration](configuration.md#controller) for exact values and
+[startup disable and observation](run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation)
+for rollout evidence and limits.
+
+The `scratch`
+object then reports `state` and `reason` (fixed tokens), `layout`, the counts
+`examined`, `kept` by reason, `eligible` (admitted at census time; a leaf
+demoted before its delete is also counted under `kept`), `deleted`, `residue`
+and `helper_failed`, and the flags `estimate_partial`, `list_overflow` and
+`not_idle_after`. The byte figures `eligible_allocated_bytes_estimate`,
+`deleted_allocated_bytes_estimate` and `shared_bytes` (hard-linked files) come
+from allocated blocks, and `statfs_free_delta_unattributed` is the change in
+available bytes across the delete loop from all writers, so none of them proves
+that storage was freed (`reclaim_bytes_state` reads `estimated` or `unknown`).
+Hosted before/after-byte acceptance and the owner keep-default decision remain pending on #4043; no hosted proof is claimed.
+
 **The [disk self-heal recycle](hosted-workers.md#disk-self-heal) (PRD #837)
 remains a last resort on plain hosted workers**, where sustained pressure can
 drain and recycle nix/data, losing everything on `/data`. After the fixed #3852

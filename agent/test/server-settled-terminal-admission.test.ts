@@ -96,6 +96,51 @@ it("server-cancelled reply releases snapshot and overflow admission while real c
   assert.equal(await fs.stat(f.archive.bundlePath!).then(() => true, () => false), false);
 });
 
+it("#4140 m3 heartbeat sweeps keep re-sending a server-completed failed-journal terminal while retirement authority is unverifiable, then retire it once authority is verified", { skip: LINUX_ONLY }, async t => {
+  // Scope: a journaled FAILED terminal body whose server outcome is already "completed". A journaled
+  // completed body with no saved completion receipt is not reachable through reportRetirementFixture
+  // (its terminal comes from the real runner's failed flight), so that variant is not covered here.
+  const f = await reportRetirementFixture(t);
+  const journalPath = path.join(fx.dataDir, "outbox", f.claim.run_id, "terminal-2.json");
+  const journalBytes = await fs.readFile(journalPath);
+  // The recovery capture cannot be verified, so the open guarded hold forbids retiring the journal.
+  f.capture.mode = "throw";
+  let reports = 0;
+  t.mock.method(client, "reportState", async (runId: string) => {
+    assert.equal(runId, f.claim.run_id);
+    reports++;
+    // The 409-terminal shape actOnAck treats as "outcome already landed" (terminal-resolve.ts).
+    return { applied: false, status: "completed" };
+  });
+  const worker = new Worker({ maxConcurrentRuns: 1, pollIntervalMs: 0, httpTimeoutMs: 1000,
+    gapFillMax: 100, outboxTerminalMaxBytes: 64 * 1024 } as Config,
+    client, f.r, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner, nullLogger(),
+    () => ({ ok: true, missing: [] }), f.outbox, new Map(), f.registry) as unknown as {
+      sweepPendingTerminals(signal?: AbortSignal): Promise<void>;
+    };
+
+  // Retirement authority unverifiable: every heartbeat sweep re-sends, and the journal stays protected.
+  for (let sweep = 1; sweep <= 3; sweep++) {
+    await worker.sweepPendingTerminals();
+    assert.equal(reports, sweep, "each sweep re-sends the pending terminal report once");
+    assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), true);
+    assert.deepEqual(await fs.readFile(journalPath), journalBytes, "journal bytes are unchanged");
+    await f.assertCustody();
+  }
+
+  // Authority verified (capture is verifiable again): the next sweep retires through the existing path.
+  f.capture.mode = "healthy";
+  const beforeRetire = reports;
+  await worker.sweepPendingTerminals();
+  assert.equal(reports, beforeRetire + 1, "the retiring sweep sends the report one last time");
+  assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
+  assert.deepEqual(f.outbox.listPendingTerminals(), []);
+
+  // The redundant report loop has ended.
+  for (let sweep = 0; sweep < 3; sweep++) await worker.sweepPendingTerminals();
+  assert.equal(reports, beforeRetire + 1, "no further reports after retirement");
+});
+
 it("restart conservatively advertises then re-marks after one real refused replay", async t => {
   const f = await reportRetirementFixture(t);
   f.capture.mode = "throw";

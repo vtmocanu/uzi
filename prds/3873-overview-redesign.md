@@ -12,7 +12,7 @@
 | #3879 (`prds/done/3879-overview-issue-line.md`) | The issue-work line, filtering the runs widget | #3878 |
 | #3880 (`prds/done/3880-overview-capacity-held-work.md`) | Capacity rail and Held work; retires the worker-load card and custody banner on the preview | #3878 |
 | #3881 (`prds/done/3881-overview-usage-by-user.md`) | Usage card with the You / Factory toggle and the admin by-user table | #3878 |
-| #3875 (`prds/3875-command-menu.md`) | The Cmd K command menu | #3878, #3880 |
+| #3875 (`prds/done/3875-command-menu.md`) | The Cmd K command menu | #3878, #3880 |
 | #3876 (`prds/done/3876-usage-harness-split.md`) | Per-user Claude / Codex split in admin usage (API, CLI, table column) | #3881 |
 | #4052 (issue) | Issue work: an admin-only You \| All users scope toggle pinned right (same as the usage card, default You, remembered per browser), and no Show all button; target mock `prds/mockups/3873-overview-issue-work-scope.html` | #3881 |
 | #4041 (issue) | Needs your decision: group same-kind decisions and PR reviews into expandable rows, kind icons, plan milestone line, two-column rule; target mock `prds/mockups/4041-needs-decision-after.html` | #3881 |

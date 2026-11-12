@@ -113,9 +113,9 @@ func TestFetchTotalTimeout(t *testing.T) {
 				var c *issueinput.Capture
 				var err error
 				if mode == "default" {
-					c, err = issueinput.Fetch(parent, f, 7, 11, 1)
+					c, err = issueinput.Fetch(parent, f, f, 7, 11, 1)
 				} else {
-					c, err = issueinput.FetchWithTimeout(parent, f, 7, 11, 1, issueinput.InteractiveAssessmentTimeout)
+					c, err = issueinput.FetchWithTimeout(parent, f, f, 7, 11, 1, issueinput.InteractiveAssessmentTimeout)
 				}
 				switch mode {
 				case "failed_raw":

@@ -4028,7 +4028,10 @@ export interface Run {
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
    *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
    *  "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a predecessor
-   *  remediation record refused source use (the agent did not start): always owner-held with local work and custody preserved, no automatic retry.
+   *  remediation record refused source use, or independent restore refused an unsupported
+   *  predecessor before source effects (canonical, hosted or no boundary record, when earlier
+   *  checks pass). The agent did not start; always owner-held with local work and custody
+   *  preserved, no automatic retry. An unsupported predecessor proves no adoption or quiescence.
    *  Only the owner can Resume or Cancel, through the existing owner authorization.
    *  "retained_continuation_unwitnessed" (issue #3859) means a retained-custody continuation's
    *  claimed worker flight was never witnessed starting or departing within a bounded window;

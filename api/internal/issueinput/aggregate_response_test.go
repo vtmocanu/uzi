@@ -74,7 +74,7 @@ func TestFetchAggregateRefusal(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				c, err := issueinput.Fetch(context.Background(), d, 7, 9, 99)
+				c, err := issueinput.Fetch(context.Background(), d, d, 7, 9, 99)
 				if err != nil {
 					t.Fatal(err)
 				}

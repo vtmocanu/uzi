@@ -533,12 +533,14 @@ A3="20260903T000000Z-gx-0123456789abcdef"
 RB="$WORK/runner"
 JKEY='uzi-recovery.agent/issue-4242.clone'
 LKEY='uzi-attempts.agent/issue-4242.entry'
+RKEY='uzi-restore.agent/issue-4242.journal'
 
 # reset_layout: empty runner dir, no journal/ledger, no tracking ref.
 reset_layout() {
   rm -rf "$RB"; mkdir -p "$RB"
   git --git-dir="$BARE" config --unset-all "$JKEY" 2>/dev/null || :
   git --git-dir="$BARE" config --unset-all "$LKEY" 2>/dev/null || :
+  git --git-dir="$BARE" config --unset-all "$RKEY" 2>/dev/null || :
   git --git-dir="$BARE" update-ref -d refs/uzi-runner/agent/issue-4242 2>/dev/null || :
   local r
   for r in run-4242 failed-1 completed-1; do
@@ -1722,5 +1724,125 @@ rc="$(backup_rc "$D_T3D" failed-2 "UZI_TEST_PODS=pod/uzi-hw-$WID-test pod/uzi-hw
 grep -q "FAIL failed-2 .*inconclusive (.*exec into pod ns/uzi-hw-second-test failed.*a candidate's .git on pod ns/uzi-hw-$WID-test could not be read); retry" "$D_T3D/latest-attempt/backup.log" \
   || fail "t3 both: FAIL line must name both pods; log: $(log_of "$D_T3D")"
 echo "PASS t3: the no-capture FAIL line names the failing pod, namespace or unreadable .git"
+
+# --- issue #3644: an independent restore keeps S in uzi-restore.<branch>.journal -------------------
+# P's plain journal is untouched; S's own entry makes S the journal-current (primary) source and P stays an
+# attributed extra. A tombstone names no source; another run's entry is ignored; anything that is not exactly
+# the documented shape is unreadable evidence (inconclusive), never absence.
+DIGR="$(printf 'd%.0s' $(seq 64))"
+SHAR="$(printf 'e%.0s' $(seq 40))"
+RP="$RB/issue-4242.attempt-$A1"
+RS="$RB/issue-4242.attempt-$A2"
+# restore_value <stage> <runId> <S clonePath> <S attemptId>: the persisted spelling of S's entry (envelope, then remainder).
+restore_value() {
+  jq -cn --arg stage "$1" --arg rid "$2" --arg p "$3" --arg a "$4" --arg pp "$RP" --arg pa "$A1" --arg d "$DIGR" --arg sha "$SHAR" '
+    {restore:{version:1,predecessor:{clonePath:$pp,attemptId:$pa,generation:1,root:{dev:"2049",ino:"131072"}},journalDigest:$d,boundary:{predecessor:$d,successor:$d},
+      slotOwner:{worker:"w-1",epoch:"e-1"},pin:{captureId:"cap-1",generation:1,sourceSha:$sha,finalization:true},restoreTip:$sha},
+     restoreStage:$stage} + {runId:$rid,clonePath:$p,attemptId:$a}'
+}
+restore_layout() {
+  reset_layout
+  make_clone "$RP" agent/issue-4242 pred-dirty
+  make_clone "$RS" agent/issue-4242 succ-dirty
+  journal run-4242 "$RP" "$A1"
+  ledger "$A1" run-4242 "$RP" live
+  ledger "$A2" run-4242 "$RS" live
+}
+# control: without the restore key the journal-named P is the primary and S the extra.
+restore_layout
+source_check restore-ctl "$RP" pred-dirty "$RS" succ-dirty
+for stage in ready seeding; do
+  restore_layout
+  git --git-dir="$BARE" config "$RKEY" "$(restore_value "$stage" run-4242 "$RS" "$A2")"
+  source_check "restore-$stage" "$RS" succ-dirty "$RP" pred-dirty
+  echo "PASS restore-$stage: S is the primary source and P an attributed extra"
+done
+# A fenced entry and a memory-park object are accepted shapes.
+restore_layout
+git --git-dir="$BARE" config "$RKEY" "$(restore_value ready run-4242 "$RS" "$A2" | jq -c \
+  '. + {memoryPark:{version:1}, completionSourceFence:{version:1,sourceUseEpoch:"0123abcd-0123-4abc-8def-0123456789ab",sourceCoreDigest:("b" * 64)}}')"
+source_check restore-fenced "$RS" succ-dirty "$RP" pred-dirty
+echo "PASS restore-fenced: a fence and a memoryPark object do not change attribution"
+# A tombstone names no source: S is retired in the ledger, and P is the journal-named primary.
+restore_layout
+git --git-dir="$BARE" config --unset-all "$LKEY"
+ledger "$A1" run-4242 "$RP" live
+ledger "$A2" run-4242 "$RS" retired
+git --git-dir="$BARE" config "$RKEY" "$(jq -cn --arg rs "$RS" --arg a "$A2" --arg pp "$RP" --arg pa "$A1" --arg d "$DIGR" --arg sha "$SHAR" '
+  {restore:{version:1,predecessor:{clonePath:$pp,attemptId:$pa,generation:1,root:{dev:"2049",ino:"131072"}},journalDigest:$d,boundary:{predecessor:$d,successor:$d},slotOwner:{worker:"w-1",epoch:"e-1"},
+   pin:{captureId:"cap-1",generation:1,sourceSha:$sha,finalization:true},restoreTip:$sha},restoreStage:"retired",
+   successor:{runId:"run-4242",attemptId:$a,clonePath:$rs}}')"
+expect_pick restore-tombstone "$RP" pred-dirty
+[ ! -e "$WORK/out.restore-tombstone/latest/issue-4242.source-2.tgz" ] || fail "restore-tombstone: a retired S was captured as an extra"
+# A cleared value ("") and an entry of ANOTHER run name nothing.
+restore_layout
+git --git-dir="$BARE" config "$RKEY" ""
+source_check restore-cleared "$RP" pred-dirty "$RS" succ-dirty
+restore_layout
+git --git-dir="$BARE" config "$RKEY" "$(restore_value ready other-run "$RS" "$A2")"
+source_check restore-other-run "$RP" pred-dirty "$RS" succ-dirty
+echo "PASS restore: tombstone, cleared value and another run's entry name no primary"
+# Malformed values are unreadable evidence: the search is inconclusive, nothing is attributed, the exit is nonzero.
+restore_bad() {  # <tag> <value> [<second value>]
+  restore_layout
+  git --git-dir="$BARE" config "$RKEY" "$2"
+  [ -z "${3:-}" ] || git --git-dir="$BARE" config --add "$RKEY" "$3"
+  local d="$WORK/out.restore-bad.$1" rc
+  rc="$(backup_rc "$d" run-4242)"
+  [ "$rc" -ne 0 ] || fail "restore-bad $1: a malformed restore entry was accepted"
+  [ ! -e "$d/latest-attempt/issue-4242.tgz" ] || fail "restore-bad $1: an archive was produced from an unreadable entry"
+  grep -q 'invalid restore entry' "$d/latest-attempt/backup.log" || fail "restore-bad $1: log lacks the reason; got: $(cat "$d/latest-attempt/backup.log")"
+}
+GOOD="$(restore_value ready run-4242 "$RS" "$A2")"
+restore_bad not-json 'not json'
+restore_bad extra-key "$(printf '%s' "$GOOD" | jq -c '. + {recovery:{}}')"
+restore_bad extra-envelope "$(printf '%s' "$GOOD" | jq -c '. + {restoreStage2:1}' | jq -c 'del(.runId)')"
+restore_bad stage "$(printf '%s' "$GOOD" | jq -c '.restoreStage="done"')"
+restore_bad no-basis "$(printf '%s' "$GOOD" | jq -c 'del(.restore)')"
+restore_bad basis-extra "$(printf '%s' "$GOOD" | jq -c '.restore.extra=1')"
+restore_bad basis-digest "$(printf '%s' "$GOOD" | jq -c '.restore.journalDigest="abc"')"
+restore_bad basis-sha "$(printf '%s' "$GOOD" | jq -c '.restore.pin.sourceSha="abc"')"
+restore_bad basis-finalization "$(printf '%s' "$GOOD" | jq -c '.restore.pin.finalization="yes"')"
+restore_bad basis-generation "$(printf '%s' "$GOOD" | jq -c '.restore.predecessor.generation=0')"
+restore_bad root-missing "$(printf '%s' "$GOOD" | jq -c 'del(.restore.predecessor.root)')"
+restore_bad root-dev "$(printf '%s' "$GOOD" | jq -c '.restore.predecessor.root.dev="0x1"')"
+restore_bad root-ino-number "$(printf '%s' "$GOOD" | jq -c '.restore.predecessor.root.ino=5')"
+restore_bad root-ino-long "$(printf '%s' "$GOOD" | jq -c --arg n "$(printf '9%.0s' $(seq 31))" '.restore.predecessor.root.ino=$n')"
+restore_bad root-extra "$(printf '%s' "$GOOD" | jq -c '.restore.predecessor.root.extra="1"')"
+restore_bad boundary-missing "$(printf '%s' "$GOOD" | jq -c 'del(.restore.boundary)')"
+restore_bad boundary-short "$(printf '%s' "$GOOD" | jq -c '.restore.boundary.predecessor="abc"')"
+restore_bad boundary-upper "$(printf '%s' "$GOOD" | jq -c --arg u "$(printf 'D%.0s' $(seq 64))" '.restore.boundary.successor=$u')"
+restore_bad boundary-extra "$(printf '%s' "$GOOD" | jq -c '.restore.boundary.extra=$ARGS.positional[0]' --args "$DIGR")"
+restore_bad path-mismatch "$(printf '%s' "$GOOD" | jq -c --arg p "$RP" '.clonePath=$p')"
+restore_bad run-type "$(printf '%s' "$GOOD" | jq -c '.runId=42')"
+restore_bad attempt "$(printf '%s' "$GOOD" | jq -c '.attemptId="nope"')"
+restore_bad fence "$(printf '%s' "$GOOD" | jq -c '.completionSourceFence={version:2}')"
+restore_bad tombstone-extra "$(jq -cn --arg rs "$RS" --arg a "$A2" --arg pp "$RP" --arg pa "$A1" --arg d "$DIGR" --arg sha "$SHAR" '
+  {restore:{version:1,predecessor:{clonePath:$pp,attemptId:$pa,generation:1,root:{dev:"2049",ino:"131072"}},journalDigest:$d,boundary:{predecessor:$d,successor:$d},slotOwner:{worker:"w-1",epoch:"e-1"},
+   pin:{captureId:"cap-1",generation:1,sourceSha:$sha,finalization:true},restoreTip:$sha},restoreStage:"retired",
+   successor:{runId:"run-4242",attemptId:$a,clonePath:$rs},fence:1}')"
+restore_bad repeated-key "$GOOD" "$GOOD"
+# A repeated key whose other value is "" passes `jq -s length` as one value; the raw count catches it. So does a valueless key.
+restore_layout
+git --git-dir="$BARE" config "$RKEY" ""
+git --git-dir="$BARE" config --add "$RKEY" "$GOOD"
+d="$WORK/out.restore-bad.empty-plus-value"
+rc="$(backup_rc "$d" run-4242)"
+[ "$rc" -ne 0 ] || fail "restore-bad empty-plus-value: a repeated key with a cleared value was accepted"
+grep -q 'invalid restore entry' "$d/latest-attempt/backup.log" || fail "restore-bad empty-plus-value: log lacks the reason"
+restore_layout
+printf '[uzi-restore "agent/issue-4242"]\n\tjournal\n' >> "$BARE/config"
+d="$WORK/out.restore-bad.valueless"
+rc="$(backup_rc "$d" run-4242)"
+[ "$rc" -ne 0 ] || fail "restore-bad valueless: a valueless key was accepted"
+grep -q 'invalid restore entry' "$d/latest-attempt/backup.log" || fail "restore-bad valueless: log lacks the reason"
+echo "PASS restore: malformed or repeated restore entries are inconclusive and attribute nothing"
+# A completed run ignores the key like the plain journal (S's live ledger entry still attributes it).
+restore_layout
+git --git-dir="$BARE" config "$RKEY" "BROKEN"
+D_RC="$WORK/out.restore-completed"
+rc="$(backup_rc "$D_RC" completed-1)"
+[ "$rc" -eq 0 ] || fail "restore-completed: a terminal run read the restore key (exit $rc)"
+echo "PASS restore: a completed run does not read the restore key"
 
 echo "ALL PASS"
