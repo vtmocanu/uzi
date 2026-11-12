@@ -231,13 +231,15 @@ export function WindowToggle({ value, onChange, className, steadyWidth }: { valu
 // first column names its row.
 type TableVariant = "current" | "preview";
 
-export function Th({ children, left, title, variant = "current" }: { children: ReactNode; left?: boolean; title?: string; variant?: TableVariant }) {
+// `start` (preview only) left-aligns a column header or cell without making it a row header,
+// for the By user table's combined cost-share / Claude-Codex bar column.
+export function Th({ children, left, start, title, variant = "current" }: { children: ReactNode; left?: boolean; start?: boolean; title?: string; variant?: TableVariant }) {
   if (variant === "preview") {
     return (
       <th
         scope="col"
         title={title}
-        className={cx("whitespace-nowrap border-b border-edge px-2.5 py-2 text-[11px] font-medium uppercase tracking-[0.04em] text-faint", left ? "text-left" : "text-right")}
+        className={cx("whitespace-nowrap border-b border-edge px-2.5 py-2 text-[11px] font-medium uppercase tracking-[0.04em] text-faint", left || start ? "text-left" : "text-right")}
       >
         {children}
       </th>
@@ -259,6 +261,7 @@ export function Th({ children, left, title, variant = "current" }: { children: R
 export function Td({
   children,
   left,
+  start,
   total,
   cost,
   title,
@@ -266,6 +269,7 @@ export function Td({
 }: {
   children?: ReactNode;
   left?: boolean;
+  start?: boolean;
   total?: boolean;
   cost?: boolean;
   title?: string;
@@ -274,7 +278,7 @@ export function Td({
   if (variant === "preview") {
     const cls = cx(
       "whitespace-nowrap px-2.5 py-2 align-top tabular-nums",
-      left ? "text-left" : "text-right",
+      left || start ? "text-left" : "text-right",
       total ? "border-t-2 border-edge-strong font-semibold text-fg" : "border-b border-edge/50 text-fg",
     );
     if (left) return <th scope="row" title={title} className={cx(cls, !total && "font-normal")}>{children}</th>;

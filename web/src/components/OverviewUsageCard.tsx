@@ -8,6 +8,7 @@ import { overviewScope, USAGE_SCOPE_KEY } from "../lib/prefs";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import { breakdown, harnessShare, perUserRows } from "../lib/usageByUser";
+import { costShareRows } from "../lib/costShares";
 import { Card, SectionTitle } from "./ui";
 import type { UsageWindow } from "./UsageCards";
 import {
@@ -18,7 +19,8 @@ import {
 // PRD #3881: the Overview preview's one Usage card. A You / All users scope toggle (admins
 // only) and the window toggle switch one set of figures, instead of the current Overview's
 // side-by-side columns; the All users scope adds a By user table below. The admin's scope
-// choice is remembered per browser (#4052).
+// choice is remembered per browser (#4052). The By user table ends in one combined bar per row:
+// its length is the user's share of the factory's cost, its colours their Claude / Codex runs (#4227).
 
 type Scope = "you" | "all";
 
@@ -49,45 +51,118 @@ function FailRateCell({ outcomes, total }: { outcomes: RunOutcomes; total?: bool
   );
 }
 
-function CostCell({ cost, disclosure, total }: { cost: number; disclosure: ReturnType<typeof aggregateDisclosure>; total?: boolean }) {
+// Compact cost notes (issue #4227): the long "+ N runs without a cost estimate and M unreported
+// runs" sentence becomes one small chip per non-zero count under the cost. A chip is focusable so
+// the full sentence is reachable by keyboard as well as hover; its accessible name is that sentence.
+function CostChip({ count, short, full, detail }: { count: number; short: string; full: (n: string) => string; detail: string }) {
+  const n = count.toLocaleString("en-US");
+  const sentence = full(n);
+  return (
+    <span
+      role="note"
+      tabIndex={0}
+      aria-label={sentence}
+      title={`${sentence}: ${detail}`}
+      className="cursor-help whitespace-nowrap rounded-full border border-edge bg-raised px-[7px] text-[11px] font-normal leading-[17px] text-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      +{n} {short}
+    </span>
+  );
+}
+
+function CostCell({ cost, subscription, unreported, total }: { cost: number; subscription: number; unreported: number; total?: boolean }) {
   return (
     <Td variant="preview" total={total}>
       <span className="font-mono">{summaryCost(cost)}</span>
-      {disclosure.incomplete && <span className="ml-auto block max-w-[16ch] whitespace-normal lg:max-w-none lg:whitespace-nowrap text-[11px] font-normal text-faint" title={disclosure.title}>{disclosure.text}</span>}
+      {(subscription > 0 || unreported > 0) && (
+        <span className="mt-1 flex flex-wrap justify-end gap-1">
+          {subscription > 0 && (
+            <CostChip
+              count={subscription}
+              short="no est."
+              full={(n) => `${n} ${subscription === 1 ? "run" : "runs"} without a cost estimate`}
+              detail="tokens only, no dollar figure"
+            />
+          )}
+          {unreported > 0 && (
+            <CostChip
+              count={unreported}
+              short="unrep."
+              full={(n) => `${n} unreported ${unreported === 1 ? "run" : "runs"}`}
+              detail="cost incomplete; recorded partial costs included"
+            />
+          )}
+        </span>
+      )}
     </Td>
   );
 }
 
-const HARNESS_TITLE =
-  "Share of each user's runs by harness, the same runs as the Runs column; cross-check runs count under the harness they ran on";
+const SHARE_TITLE = "Share of recorded API-equivalent cost in the selected period";
+const HARNESS_NOTE =
+  "share of each user's runs by harness, the same runs as the Runs column; cross-check runs count under the harness they ran on";
 
-// Issue #3876: a user's Claude / Codex share as a two-segment bar plus its figures. A window
-// with no runs reads "—".
-function HarnessCell({ runs }: { runs: HarnessRuns }) {
-  const share = harnessShare(runs);
-  if (!share) return <Td variant="preview">—</Td>;
+// Issue #4227: one combined bar per row. Its length is the row's share of the factory's cost
+// (ratio, unrounded); when the API sends the harness split, that length is divided into a Claude
+// and a Codex segment by the row's runs, and the "C / X" figure beside it names the split. A row
+// with no runs (or no split at all) draws one cost-only segment. Zero recorded factory cost has
+// no length to draw: the percentage reads "—" and the track stays empty.
+function ShareCell({ pct, ratio, runs, withHarness, total }: {
+  pct: number | undefined;
+  ratio: number | undefined;
+  runs: HarnessRuns | undefined;
+  withHarness: boolean;
+  total?: boolean;
+}) {
+  const split = withHarness ? harnessShare(runs) : null;
+  const width = ratio == null ? 0 : Math.min(Math.max(ratio, 0), 1) * 100;
+  let title = pct == null ? "No recorded factory cost in the selected period" : `${pct}% of factory cost`;
+  if (split) title += `; runs ${split.claude}% Claude, ${split.codex}% Codex`;
   return (
-    <Td variant="preview" title={`${runs.claude.toLocaleString("en-US")} Claude, ${runs.codex.toLocaleString("en-US")} Codex runs`}>
-      <span className="inline-flex items-center gap-2">
-        <span aria-hidden="true" className="flex h-1.5 w-[72px] overflow-hidden rounded-[3px] bg-raised">
-          <span className="block h-full bg-brand-claude" style={{ width: `${share.claude}%` }} />
-          <span className="block h-full bg-muted" style={{ width: `${share.codex}%` }} />
+    <Td start variant="preview" total={total} title={title}>
+      <span className="flex items-center gap-2">
+        <span className="w-9 shrink-0 text-right">{pct == null ? "—" : `${pct}%`}</span>
+        <span aria-hidden="true" className="flex h-1.5 w-[120px] shrink-0 overflow-hidden rounded-[3px] bg-raised">
+          {ratio != null && (split ? (
+            <>
+              <span className="block h-full bg-brand-claude" style={{ width: `${(width * split.claude) / 100}%` }} />
+              <span className="block h-full bg-muted" style={{ width: `${(width * split.codex) / 100}%` }} />
+            </>
+          ) : (
+            <span className="block h-full bg-brand" style={{ width: `${width}%` }} />
+          ))}
         </span>
-        <span className="min-w-12 text-right text-[11px] font-normal tabular-nums text-faint">{share.claude} / {share.codex}</span>
+        {withHarness && (
+          <span className="w-14 shrink-0 whitespace-nowrap text-right text-[11px] font-normal tabular-nums text-faint">
+            {split ? `${split.claude} / ${split.codex}` : ""}
+          </span>
+        )}
       </span>
     </Td>
   );
 }
 
 // PRD #3881 M2: the Factory scope's per-user table. The columns are fixed on every API version,
-// except Claude / Codex (issue #3876), which appears only when the API sends every row's
-// harness split for the window; a PR count the API does not report reads "—", never 0.
-// The section takes focus (tabIndex -1) when the People chip's "Usage by user" lands here.
+// except that the last one's Claude / Codex half (issue #3876) appears only when the API sends
+// every row's harness split for the window; a PR count the API does not report reads "—", never 0.
+// The last column (issue #4227) is always present: the cost share with its combined bar. Under the
+// table a one-line legend explains the bar. The section takes focus (tabIndex -1) when the
+// People chip's "Usage by user" lands here.
 function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; window: UsageWindow; viewerId: string; ref: Ref<HTMLElement> }) {
   const now = useNow(30_000);
   const demo = useDemoMode();
-  const { available, rows, showHarness, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure } = perUserRows(admin, window);
+  const {
+    available, rows, showHarness, factoryRuns, factoryPRs, factoryOutcomes, factory,
+    factorySubscription, factoryUnreported,
+  } = perUserRows(admin, window);
   const recent = window === "last_7_days";
+  const shares = costShareRows(rows.map((r) => r.b.cost), factory.cost);
+  const factoryHarness: HarnessRuns | undefined = showHarness
+    ? {
+        claude: rows.reduce((sum, r) => sum + r.selectedHarness!.claude, 0),
+        codex: rows.reduce((sum, r) => sum + r.selectedHarness!.codex, 0),
+      }
+    : undefined;
   return (
     <section ref={ref} id="overview-usage-by-user" tabIndex={-1} aria-label="By user" className="mt-5 border-t border-edge pt-4 scroll-mt-20 rounded-md outline-hidden focus:ring-2 focus:ring-ring">
       <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
@@ -101,52 +176,73 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
       ) : rows.length === 0 ? (
         <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
       ) : (
-        <div data-testid="by-user-scroll" role="region" aria-label="By user, scrollable" className="mt-2 overflow-x-auto">
-          {/* The Claude / Codex column (#3876) widens the floor to the mock's 780px; without it the table keeps 640px. */}
-          <table aria-label="By user" className={`w-full ${showHarness ? "min-w-[780px]" : "min-w-[640px]"} border-collapse text-[13px]`}>
-            <thead>
-              <tr>
-                <Th variant="preview" left>User</Th>
-                <Th variant="preview" title="Runs with recorded usage in the period">Runs</Th>
-                <Th variant="preview">PRs</Th>
-                <Th variant="preview">Failed</Th>
-                <Th variant="preview" title="Failed of finished runs in the period">Fail rate</Th>
-                <Th variant="preview" title={LAST_FAILURE_TITLE}>Last failure</Th>
-                <Th variant="preview">Cost</Th>
-                {showHarness && <Th variant="preview" title={HARNESS_TITLE}>Claude / Codex</Th>}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((u) => (
-                <tr key={u.user_id}>
-                  <Td variant="preview" left>
-                    {stripUnsafeChars(maskEmail(u.email, demo))}
-                    {u.user_id === viewerId && <span className="font-normal text-faint"> (you)</span>}
-                  </Td>
-                  <Td variant="preview">{u.selectedRuns.toLocaleString("en-US")}</Td>
-                  <Td variant="preview">{u.selectedPRs == null ? "—" : u.selectedPRs.toLocaleString("en-US")}</Td>
-                  <Td variant="preview">{u.selectedOutcomes.failed.toLocaleString("en-US")}</Td>
-                  <FailRateCell outcomes={u.selectedOutcomes} />
-                  <Td variant="preview">{failureAgo(u.outcomes, now)}</Td>
-                  <CostCell cost={u.b.cost} disclosure={aggregateDisclosure(u.subscription, u.unreported)} />
-                  {showHarness && <HarnessCell runs={u.selectedHarness!} />}
+        <>
+          <div data-testid="by-user-scroll" role="region" aria-label="By user, scrollable" className="mt-2 overflow-x-auto">
+            {/* One floor, sized so the whole table fits the 935px-wide card body at a 1280px
+                viewport; narrower widths scroll inside this region. */}
+            <table aria-label="By user" className="w-full min-w-[860px] border-collapse text-[13px]">
+              <thead>
+                <tr>
+                  <Th variant="preview" left>User</Th>
+                  <Th variant="preview" title="Runs with recorded usage in the period">Runs</Th>
+                  <Th variant="preview">PRs</Th>
+                  <Th variant="preview">Failed</Th>
+                  <Th variant="preview" title="Failed of finished runs in the period">Fail rate</Th>
+                  <Th variant="preview" title={LAST_FAILURE_TITLE}>Last failure</Th>
+                  <Th variant="preview">Cost</Th>
+                  <Th variant="preview" start title={showHarness ? `${SHARE_TITLE}; Claude / Codex: ${HARNESS_NOTE}` : SHARE_TITLE}>
+                    {showHarness ? "Cost share · Claude / Codex" : "Cost share"}
+                  </Th>
                 </tr>
-              ))}
-            </tbody>
-            <tfoot>
-              <tr>
-                <Td variant="preview" left total>Factory</Td>
-                <Td variant="preview" total>{factoryRuns.toLocaleString("en-US")}</Td>
-                <Td variant="preview" total>{factoryPRs == null ? "—" : factoryPRs.toLocaleString("en-US")}</Td>
-                <Td variant="preview" total>{factoryOutcomes.failed.toLocaleString("en-US")}</Td>
-                <FailRateCell outcomes={factoryOutcomes} total />
-                <Td variant="preview" total>{failureAgo(admin.factory.outcomes.lifetime, now)}</Td>
-                <CostCell cost={factory.cost} disclosure={factoryDisclosure} total />
-                {showHarness && <Td variant="preview" total />}
-              </tr>
-            </tfoot>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {rows.map((u, i) => (
+                  <tr key={u.user_id}>
+                    <Td variant="preview" left>
+                      {stripUnsafeChars(maskEmail(u.email, demo))}
+                      {u.user_id === viewerId && <span className="font-normal text-faint"> (you)</span>}
+                    </Td>
+                    <Td variant="preview">{u.selectedRuns.toLocaleString("en-US")}</Td>
+                    <Td variant="preview">{u.selectedPRs == null ? "—" : u.selectedPRs.toLocaleString("en-US")}</Td>
+                    <Td variant="preview">{u.selectedOutcomes.failed.toLocaleString("en-US")}</Td>
+                    <FailRateCell outcomes={u.selectedOutcomes} />
+                    <Td variant="preview">{failureAgo(u.outcomes, now)}</Td>
+                    <CostCell cost={u.b.cost} subscription={u.subscription} unreported={u.unreported} />
+                    <ShareCell
+                      pct={shares?.[i]}
+                      ratio={shares ? u.b.cost / factory.cost : undefined}
+                      runs={u.selectedHarness}
+                      withHarness={showHarness}
+                    />
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <Td variant="preview" left total>Factory</Td>
+                  <Td variant="preview" total>{factoryRuns.toLocaleString("en-US")}</Td>
+                  <Td variant="preview" total>{factoryPRs == null ? "—" : factoryPRs.toLocaleString("en-US")}</Td>
+                  <Td variant="preview" total>{factoryOutcomes.failed.toLocaleString("en-US")}</Td>
+                  <FailRateCell outcomes={factoryOutcomes} total />
+                  <Td variant="preview" total>{failureAgo(admin.factory.outcomes.lifetime, now)}</Td>
+                  <CostCell cost={factory.cost} subscription={factorySubscription ?? 0} unreported={factoryUnreported ?? 0} total />
+                  <ShareCell pct={shares ? 100 : undefined} ratio={shares ? 1 : undefined} runs={factoryHarness} withHarness={showHarness} total />
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+          {shares && (
+            <p className="mt-2 flex flex-wrap items-center gap-x-3.5 gap-y-1 text-xs text-muted">
+              <span>Bar length: cost share of the factory</span>
+              {showHarness && (
+                <>
+                  <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="inline-block h-1.5 w-2.5 rounded-sm bg-brand-claude" />Claude runs</span>
+                  <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="inline-block h-1.5 w-2.5 rounded-sm bg-muted" />Codex runs</span>
+                </>
+              )}
+            </p>
+          )}
+        </>
       )}
     </section>
   );
