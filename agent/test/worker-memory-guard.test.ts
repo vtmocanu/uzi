@@ -1789,6 +1789,24 @@ test("#4219 a larger tree that never answers exhausts the shared deadline: obser
   } finally { await f.monitor.stop(); }
 });
 
+test("#4219 a slow rejection log write cannot spend the intervention deadline before reservation or cancellation", async () => {
+  const at: { requests: number; signals: number }[] = [];
+  let fix: Fix | undefined;
+  const f = await fixture({ autoReserve: true, rejections: () => {
+    at.push({ requests: fix!.requests.length, signals: fix!.signals() });
+    fix!.advance(1000); // a blocked stderr write: far past responseBudgetMs
+  } });
+  fix = f;
+  addTree(f, 20, async () => unavailableTree("stale"));
+  try {
+    f.monitor.tick();
+    await f.monitor.settle();
+    assert.equal(f.signals(), 1);
+    assert.equal(f.feedback[0]?.outcome, "confirmed_drained");
+    assert.deepEqual(at, [{ requests: 1, signals: 1 }]);
+  } finally { await f.monitor.stop(); }
+});
+
 test("#4219 an abort that the deadline timer did not fire is observation_interrupted, not a timeout", async () => {
   const records: { rejections: unknown }[] = [];
   const f = await fixture({ rejections: (record) => { records.push(record); } });

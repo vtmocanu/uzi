@@ -721,93 +721,97 @@ export class WorkerMemoryMonitor {
     const observed = candidates.filter((value) => value !== undefined);
     const admitted = observed.filter(({ entry, phaseRevision }) => commands.phaseAdmits(entry.context, phaseRevision));
     const { selection: selected, rejected } = commands.selectWithRejections(admitted, this.ports.now(), this.config.responseBudgetMs);
-    // Synchronous, contained copy: it can neither change the selection nor delay the steps below.
+    // Synchronous, contained copy: it cannot change the selection. The warning is written only after the
+    // deadline-bound steps, since a blocked stderr write must not spend the intervention budget.
     const rejections = this.rejectionRows(captures, failed, observed, admitted, rejected);
-    this.logRejections(rejections, selected, candidates.length);
-    if (!selected) return;
-    const entry = selected.entry;
-    const incarnation = this.ports.incarnation();
-    if (!this.latest || !this.latestDecision || !incarnation || incarnation.worker_id !== entry.context.worker_id || incarnation.register_nonce !== entry.context.register_nonce) return;
-    const tree: Tree = Object.freeze({
-      rssBytesApprox: selected.rssBytesApprox, startedAtMs: selected.observation.startedAtMs,
-      completedAtMs: selected.observation.completedAtMs, candidates: candidates.length,
-      // Rejected/timed-out observations and adapter responses without complete evidence both count as failures.
-      // Diagnostic only: a throwing observation leaves the count unknown and never aborts the intervention.
-      failures: (() => {
-        try { return candidates.length - observed.filter(({ observation }) => observation?.available === true && observation.complete === true).length; }
-        catch { return undefined; }
-      })(),
-      rejections,
-    });
-    const a: Authority = Object.freeze({
-      context: entry.context, phaseRevision: selected.phaseRevision, entry, incarnation: Object.freeze({ ...incarnation }),
-      sample: snapshot(this.latest), decision: this.latestDecision,
-      request: Object.freeze({
-        run_id: entry.context.run_id, worker_id: entry.context.worker_id, register_nonce: entry.context.register_nonce,
-        claim_generation: entry.context.claim_generation, memory_episode: entry.context.memory_episode,
-        intervention_id: randomUUID(), policy: Object.freeze({ ...(entry.context.memory_policy ?? { version: 1, max_interventions: this.config.maxInterventions }) }),
-      }),
-    });
-    if (!this.current(a)) return;
-    const latch = commands.acquireLatch(a.context);
-    if (!latch) return;
-    const ticket = this.guard.beginIntervention();
-    if (!ticket) { commands.releaseLatch(latch); return; }
-    this.held = { ticket, latch, entry, authority: a };
-    void commands.prepareOutcome(entry);
-    this.record(a, "pending");
-    let outcome: MemoryOutcome = "no_signal";
-    let preserve = true;
-    let awaiting = true;
-    let cancelStarted = false;
-    let cancelObservation: Observed | undefined; // stays undefined when admission is denied or fails
     try {
-      if (commands.remaining(a.context) === 0) throw new Error("memory allowance exhausted");
-      const ack = await this.bounded((signal, ms) => {
-        const request = this.ports.reserve(a.request, signal, ms);
-        void request.then(() => { if (!awaiting) this.historical(a); }, () => {});
-        return request;
-      }, deadline);
-      awaiting = false;
-      if (!this.validAck(ack, a) || !this.current(a)) throw new Error("invalid memory authority");
-      commands.updateAllowance(a.context, ack.allowance.remaining);
-      this.record(a, ack.admitted ? "admitted" : "denied");
-      if (!ack.admitted || !ack.authorizing || commands.remaining(a.context) === undefined) throw new Error("memory admission denied");
-      preserve = ack.allowance.remaining === 0;
-      const observation = await this.bounded((signal, remainingMs) => entry.observe({ signal, remainingMs }), deadline);
-      const authorized = () => this.ports.now() < deadline && this.current(a)
-        && commands.checkBeforeCancel(selected, observation, this.ports.now(), this.config.responseBudgetMs);
-      if (!authorized()) throw new Error("stale memory authority");
-      cancelObservation = observation; // recorded only once checkBeforeCancel validated its rows
-      outcome = "unknown"; // invoking cancellation can have an ambiguous signal result
-      await this.bounded((signal, remainingMs) => {
-        if (!authorized()) throw new Error("stale memory authority");
-        cancelStarted = true;
-        return entry.cancel(Object.freeze({ authorized: () => !signal.aborted && authorized(), remainingMs, signal }));
-      }, deadline);
-      if (!commands.hasConfirmedStop(entry)) {
-        // Once cancellation completes, falling usage does not revoke exact-tree drain authority.
-        const ownsSelected = () => this.ports.now() < deadline && this.contextCurrent(a)
-          && commands.checkBeforeCancel(selected, observation, this.ports.now(), this.config.responseBudgetMs);
-        if (!ownsSelected()) throw new Error("retired cancellation");
-        const drain = await this.bounded((signal, remainingMs) => {
-          const authorized = () => !signal.aborted && ownsSelected();
-          if (!authorized()) throw new Error("stale memory authority");
-          return entry.drain({ signal, remainingMs, authorized });
+      if (!selected) return;
+      const entry = selected.entry;
+      const incarnation = this.ports.incarnation();
+      if (!this.latest || !this.latestDecision || !incarnation || incarnation.worker_id !== entry.context.worker_id || incarnation.register_nonce !== entry.context.register_nonce) return;
+      const tree: Tree = Object.freeze({
+        rssBytesApprox: selected.rssBytesApprox, startedAtMs: selected.observation.startedAtMs,
+        completedAtMs: selected.observation.completedAtMs, candidates: candidates.length,
+        // Rejected/timed-out observations and adapter responses without complete evidence both count as failures.
+        // Diagnostic only: a throwing observation leaves the count unknown and never aborts the intervention.
+        failures: (() => {
+          try { return candidates.length - observed.filter(({ observation }) => observation?.available === true && observation.complete === true).length; }
+          catch { return undefined; }
+        })(),
+        rejections,
+      });
+      const a: Authority = Object.freeze({
+        context: entry.context, phaseRevision: selected.phaseRevision, entry, incarnation: Object.freeze({ ...incarnation }),
+        sample: snapshot(this.latest), decision: this.latestDecision,
+        request: Object.freeze({
+          run_id: entry.context.run_id, worker_id: entry.context.worker_id, register_nonce: entry.context.register_nonce,
+          claim_generation: entry.context.claim_generation, memory_episode: entry.context.memory_episode,
+          intervention_id: randomUUID(), policy: Object.freeze({ ...(entry.context.memory_policy ?? { version: 1, max_interventions: this.config.maxInterventions }) }),
+        }),
+      });
+      if (!this.current(a)) return;
+      const latch = commands.acquireLatch(a.context);
+      if (!latch) return;
+      const ticket = this.guard.beginIntervention();
+      if (!ticket) { commands.releaseLatch(latch); return; }
+      this.held = { ticket, latch, entry, authority: a };
+      void commands.prepareOutcome(entry);
+      this.record(a, "pending");
+      let outcome: MemoryOutcome = "no_signal";
+      let preserve = true;
+      let awaiting = true;
+      let cancelStarted = false;
+      let cancelObservation: Observed | undefined; // stays undefined when admission is denied or fails
+      try {
+        if (commands.remaining(a.context) === 0) throw new Error("memory allowance exhausted");
+        const ack = await this.bounded((signal, ms) => {
+          const request = this.ports.reserve(a.request, signal, ms);
+          void request.then(() => { if (!awaiting) this.historical(a); }, () => {});
+          return request;
         }, deadline);
-        commands.recordDrain(entry, drain);
+        awaiting = false;
+        if (!this.validAck(ack, a) || !this.current(a)) throw new Error("invalid memory authority");
+        commands.updateAllowance(a.context, ack.allowance.remaining);
+        this.record(a, ack.admitted ? "admitted" : "denied");
+        if (!ack.admitted || !ack.authorizing || commands.remaining(a.context) === undefined) throw new Error("memory admission denied");
+        preserve = ack.allowance.remaining === 0;
+        const observation = await this.bounded((signal, remainingMs) => entry.observe({ signal, remainingMs }), deadline);
+        const authorized = () => this.ports.now() < deadline && this.current(a)
+          && commands.checkBeforeCancel(selected, observation, this.ports.now(), this.config.responseBudgetMs);
+        if (!authorized()) throw new Error("stale memory authority");
+        cancelObservation = observation; // recorded only once checkBeforeCancel validated its rows
+        outcome = "unknown"; // invoking cancellation can have an ambiguous signal result
+        await this.bounded((signal, remainingMs) => {
+          if (!authorized()) throw new Error("stale memory authority");
+          cancelStarted = true;
+          return entry.cancel(Object.freeze({ authorized: () => !signal.aborted && authorized(), remainingMs, signal }));
+        }, deadline);
+        if (!commands.hasConfirmedStop(entry)) {
+          // Once cancellation completes, falling usage does not revoke exact-tree drain authority.
+          const ownsSelected = () => this.ports.now() < deadline && this.contextCurrent(a)
+            && commands.checkBeforeCancel(selected, observation, this.ports.now(), this.config.responseBudgetMs);
+          if (!ownsSelected()) throw new Error("retired cancellation");
+          const drain = await this.bounded((signal, remainingMs) => {
+            const authorized = () => !signal.aborted && ownsSelected();
+            if (!authorized()) throw new Error("stale memory authority");
+            return entry.drain({ signal, remainingMs, authorized });
+          }, deadline);
+          commands.recordDrain(entry, drain);
+        }
+      } catch { awaiting = false; preserve = true; }
+      // Direct proof settles only an invoked cancellation, including command cleanup during either await.
+      // It grants no new authority and cannot turn a no-signal attempt into a cancellation.
+      if (cancelStarted && commands.hasConfirmedStop(entry)) outcome = "confirmed_drained";
+      const prepared = await this.finish(a, selected, outcome, preserve || outcome !== "confirmed_drained", { trigger, tree, cancel: cancelObservation });
+      const confirmed = await this.report(a, outcome, ticket);
+      if (!confirmed && !prepared.preserved) {
+        this.preparePreservation(a, prepared.result);
+        await this.preserve(a);
       }
-    } catch { awaiting = false; preserve = true; }
-    // Direct proof settles only an invoked cancellation, including command cleanup during either await.
-    // It grants no new authority and cannot turn a no-signal attempt into a cancellation.
-    if (cancelStarted && commands.hasConfirmedStop(entry)) outcome = "confirmed_drained";
-    const prepared = await this.finish(a, selected, outcome, preserve || outcome !== "confirmed_drained", { trigger, tree, cancel: cancelObservation });
-    const confirmed = await this.report(a, outcome, ticket);
-    if (!confirmed && !prepared.preserved) {
-      this.preparePreservation(a, prepared.result);
-      await this.preserve(a);
+      // Park can release the claim; the exact historical replay grants no authority.
+      if (!confirmed && !this.closed) await this.report(a, outcome, ticket, 1);
+    } finally {
+      this.logRejections(rejections, selected, candidates.length);
     }
-    // Park can release the claim; the exact historical replay grants no authority.
-    if (!confirmed && !this.closed) await this.report(a, outcome, ticket, 1);
   }
 }
