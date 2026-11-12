@@ -56,6 +56,10 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
   const runBoundLead = `${plural ? "Queued runs have" : "A queued run has"} reached ${plural ? "their own custody hold limits" : "its own custody hold limit"}.`;
   const runBoundTail = `To let ${plural ? "them" : "it"} start, inspect ${plural ? "each run's" : "the run's"} holds with uzi run recovery <run>, then settle or discard enough of ${plural ? "their" : "its"} own holds to bring ${plural ? "them" : "it"} below the limit (uzi run discard <run> --hold <id>; run uzi run export first if a hold may be the only copy of the work).`;
 
+  // Owner capacity and a run's own bound can both apply. blocked_runs does not say which, so the
+  // combined state never claims "no action is needed": settling unrelated holds does not free a run
+  // at its own bound.
+  const combinedRunBound = "A run that has also reached its own custody hold limit starts only after its own holds drop below it: inspect them with uzi run recovery <run>, then settle or discard enough of them (uzi run discard <run> --hold <id>; run uzi run export first if a hold may be the only copy of the work).";
   return (
     <section
       // Danger (blocked runs reported) is an alert; the warning tier is a status region. Both are
@@ -84,10 +88,10 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
                   : `${runBoundLead} ${runBoundTail}`
                 : actionable
                   ? danger
-                    ? "Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work."
+                    ? `Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work. ${combinedRunBound}`
                     : "Review the holds that need a decision and choose how to preserve their work."
                   : danger
-                    ? "Queued code runs are waiting for custody admission; no action is needed. Admission resumes when counted holds settle."
+                    ? `Queued code runs are waiting for custody admission; admission resumes when counted holds settle. ${combinedRunBound}`
                     : "Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when counted holds settle."}
             </p>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">

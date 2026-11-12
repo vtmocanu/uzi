@@ -120,7 +120,9 @@ describe("CustodyBoardAlert", () => {
     expect(region.classList.contains("bg-danger/10")).toBe(true);
     expect(region.classList.contains("bg-warn/10")).toBe(false);
     expect(screen.getByText("Held work is blocking new runs").classList.contains("text-danger")).toBe(true);
-    expect(screen.getByText("Queued code runs are waiting for custody admission; no action is needed. Admission resumes when counted holds settle.")).toBeTruthy();
+    expect(screen.getByText("Queued code runs are waiting for custody admission; admission resumes when counted holds settle. A run that has also reached its own custody hold limit starts only after its own holds drop below it: inspect them with uzi run recovery <run>, then settle or discard enough of them (uzi run discard <run> --hold <id>; run uzi run export first if a hold may be the only copy of the work).")).toBeTruthy();
+    // Combined limits never claim "no action is needed": a run at its own bound needs its own holds settled.
+    expect(screen.queryByText(/no action is needed/)).toBeNull();
     expect(screen.getByText(/runs blocked/)).toBeTruthy();
     expect(screen.queryByText(/needs? a decision/)).toBeNull();
     expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
@@ -140,7 +142,7 @@ describe("CustodyBoardAlert", () => {
     expect(
       screen.getByText(
         used >= 8
-          ? "Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work."
+          ? "Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work. A run that has also reached its own custody hold limit starts only after its own holds drop below it: inspect them with uzi run recovery <run>, then settle or discard enough of them (uzi run discard <run> --hold <id>; run uzi run export first if a hold may be the only copy of the work)."
           : "Queued runs have reached their own custody hold limits. Review the holds that need a decision. To let them start, inspect each run's holds with uzi run recovery <run>, then settle or discard enough of their own holds to bring them below the limit (uzi run discard <run> --hold <id>; run uzi run export first if a hold may be the only copy of the work).",
       ),
     ).toBeTruthy();
