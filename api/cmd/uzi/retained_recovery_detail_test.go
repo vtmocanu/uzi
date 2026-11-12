@@ -3,6 +3,9 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // TestAdoptionFailedDetailGuidance covers the closed switch of issue #4177: a known detail picks
@@ -16,7 +19,7 @@ func TestAdoptionFailedDetailGuidance(t *testing.T) {
 		deny   []string
 	}{
 		{"active", strPtrT(recoveryDetailSecretRemediationActive),
-			[]string{"active secret-scan remediation", "Resume cannot succeed unchanged", "uzi run export", "--output <file>", "operator can recover the retained work from worker storage", "Cancel ends the run", "uzi run cancel"},
+			[]string{"active secret-scan remediation", "Resume cannot succeed unchanged", "uzi run export", "--output <path>", "operator can recover the retained work from worker storage", "Cancel ends the run", "uzi run cancel"},
 			[]string{generic, "remediation proof could not be verified", "uzi run resume", "success is not assured"}},
 		{"unknown proof", strPtrT(recoveryDetailRemediationProofUnknown),
 			[]string{"remediation proof could not be verified", "Resume may help", "uzi run resume"},
@@ -55,5 +58,30 @@ func TestRecoveryDetailIgnoredOnOtherCauses(t *testing.T) {
 	r.RecoveryWaitDetail = &d
 	if strings.Contains(recoveryDecisionLine(r), "secret-scan") {
 		t.Fatal("detail leaked into a non-adoption cause")
+	}
+}
+
+// The board row never offers Resume for an active secret-scan remediation (the server 409s it);
+// any other detail keeps "Resume now/Cancel".
+func TestAdoptionFailedDetailBoardRow(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m.width = 200
+	for _, tc := range []struct {
+		detail *string
+		want   string
+	}{
+		{strPtrT(recoveryDetailSecretRemediationActive), "Owner-held · Cancel · detail: enter"},
+		{strPtrT(recoveryDetailRemediationProofUnknown), "Resume now/Cancel"},
+		{nil, "Resume now/Cancel"},
+	} {
+		r := retainedRecoveryRun("adoption/held")
+		r.RecoveryWaitDetail = tc.detail
+		got := stripANSI(m.boardSecondLine(apitypes.RunListItemDTO{RunDTO: r}))
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("detail %v: board row %q, want %q", tc.detail, got, tc.want)
+		}
+		if tc.want != "Resume now/Cancel" && strings.Contains(got, "Resume") {
+			t.Errorf("active detail board row offers Resume: %q", got)
+		}
 	}
 }
