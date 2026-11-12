@@ -2962,17 +2962,12 @@ case "$SCENARIO" in
     [ "$(grep -c 'MISSING-EVIDENCE: docker wiring diagnostics: timed out after 10s' <<< "$OUT")" = 6 ] || fail "timeout: each read must report MISSING-EVIDENCE: $OUT"
     [ "$(dw_count '^(ps -a|logs --no-color)' "$S/calls")" = 0 ] && [ ! -e "$S/inspect-calls" ] || fail "timeout: a read ran past the limiter"
     # (b) the 59s budget runs out after three 25s reads (remaining 59, 34, 9): the rest are never issued.
-    dw_bounded_run 'DIAG_SLOW=25'
+    dw_bounded_run 'unset SECONDS; SECONDS=0; DIAG_SLOW=25'
     [ "$(dw_count . "$S/limiter-calls")" = 3 ] || fail "budget: expected exactly 3 issued reads: $(cat "$S/limiter-calls")"
     [ "$(grep -c 'MISSING-EVIDENCE: docker wiring diagnostics: budget exhausted, skipped' <<< "$OUT")" = 4 ] || fail "budget: 4 skipped reads must be reported: $OUT"
-    # SECONDS keeps counting real time on top of the simulated 25s steps, so a slow host can shave one
-    # second off the third read's remaining budget: its clamp is 9, or 8 when a real second ticked.
-    case "$(cut -d' ' -f1 "$S/limiter-calls" | tr '\n' ' ')" in
-      '10 10 9 ' | '10 10 8 ') ;;
-      *) fail "budget: per-read limits must be 10 10 then the clamped remainder (9, or 8 after a real tick): $(cat "$S/limiter-calls")" ;;
-    esac
+    [ "$(cut -d' ' -f1 "$S/limiter-calls" | tr '\n' ' ')" = '10 10 9 ' ] || fail "budget: per-read limits must be 10 10 9: $(cat "$S/limiter-calls")"
     # The last read is clamped to the remaining budget (remaining 59, 32, 5), so the total stays bounded.
-    dw_bounded_run 'DIAG_SLOW=27'
+    dw_bounded_run 'unset SECONDS; SECONDS=0; DIAG_SLOW=27'
     [ "$(cut -d' ' -f1 "$S/limiter-calls" | tr '\n' ' ')" = '10 10 5 ' ] || fail "budget: the last read must be clamped to 5s: $(cat "$S/limiter-calls")"
     # The shipped resolver finds timeout, else gtimeout, else nothing (PATH fixtures; command -v is a builtin).
     mkdir -p "$S/fx-t" "$S/fx-g" "$S/fx-none"; : > "$S/fx-t/timeout"; : > "$S/fx-g/gtimeout"; chmod +x "$S/fx-t/timeout" "$S/fx-g/gtimeout"
