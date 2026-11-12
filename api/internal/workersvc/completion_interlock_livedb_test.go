@@ -49,12 +49,21 @@ func setupInterlockLiveDB(t *testing.T) interlockLiveDB {
 		t.Fatalf("open pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	return seedInterlockOn(t, ctx, pool, true)
+}
 
+// seedInterlockOn seeds the user/connection/repo on pool. track registers the user for
+// shared-DB cleanup; pass false on a database the test owns and drops.
+func seedInterlockOn(t *testing.T, ctx context.Context, pool *pgxpool.Pool, track bool) interlockLiveDB {
+	t.Helper()
 	firstIID := int64(1)
 	e := interlockLiveDB{ctx: ctx, pool: pool, q: store.New(pool), userID: uuid.New(), repoID: uuid.New(), nextIID: &firstIID}
 	connID := uuid.New()
 	e.exec(t, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		e.userID, fmt.Sprintf("interlock-%s@e2e", e.userID))
+	if track {
+		trackLiveDBUser(t, pool, e.userID)
+	}
 	e.exec(t, `INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	           VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, e.userID, []byte("x"))
 	e.exec(t, `INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)

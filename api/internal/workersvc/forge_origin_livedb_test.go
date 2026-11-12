@@ -310,6 +310,7 @@ func TestForgeOriginIsolatedClaimIgnoresGitMappingLiveDB(t *testing.T) {
 	// The exemption removes only a Git-placement check, never owner scoping.
 	other := uuid.New()
 	f.env.exec("INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", other, other.String()+"@example.com")
+	trackLiveDBUser(t, f.env.pool, other)
 	t.Cleanup(func() { f.env.exec("DELETE FROM users WHERE id=$1", other) })
 	f.env.exec("UPDATE forge_connections SET user_id=$2 WHERE id=(SELECT connection_id FROM repos WHERE id=$1)", f.repo, other)
 	if _, err := f.env.q.GetRunClaimContext(f.env.ctx, id); !errors.Is(err, pgx.ErrNoRows) {
