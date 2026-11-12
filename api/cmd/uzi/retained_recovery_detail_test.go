@@ -85,3 +85,16 @@ func TestAdoptionFailedDetailBoardRow(t *testing.T) {
 		}
 	}
 }
+
+// The steer-queue state suffix never offers Resume for an active secret-scan remediation.
+func TestAdoptionFailedDetailSteerState(t *testing.T) {
+	in := apitypes.SteerInputDTO{Kind: "follow_up"}
+	r := retainedRecoveryRun("adoption/held")
+	if got := steerStateForRun(in, r); !strings.Contains(got, "owner Resume/Cancel") {
+		t.Fatalf("unclassified steer state = %q, want Resume/Cancel", got)
+	}
+	r.RecoveryWaitDetail = strPtrT(recoveryDetailSecretRemediationActive)
+	if got := steerStateForRun(in, r); strings.Contains(got, "Resume") || !strings.Contains(got, "owner Cancel") {
+		t.Fatalf("active steer state = %q, want owner Cancel and no Resume", got)
+	}
+}

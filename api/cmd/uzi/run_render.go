@@ -2180,6 +2180,10 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause || isAlwaysHeldRecoveryCause(recoveryCause[0])) {
 		recoveringSuffix = " (owner Resume/Cancel)"
 	}
+	// Issue #4177: the server refuses Resume for an active secret-scan remediation.
+	if run != nil && secretRemediationActiveDetail(*run) {
+		recoveringSuffix = " (owner Cancel)"
+	}
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
 		recoveringSuffix = " (run waiting for the forge)"
 	}
