@@ -248,9 +248,18 @@ func (m tuiModel) applyWorkers(msg workersMsg) (tea.Model, tea.Cmd) {
 	m.workers.tickGen++
 	return m, tea.Batch(departure, workersTickAfter(workersTickInterval(m.workers.errStreak), m.workers.tickGen))
 }
+func hibernatingWorker(w apitypes.WorkerDTO) bool {
+	return w.HibernationState != "" && w.HibernationState != "none"
+}
+
 func workerState(r workerRow) string {
 	w := r.w
 	switch {
+	// Hibernation precedes liveness: a hibernated worker is swept offline by design.
+	case w.HibernationState == "preparing":
+		return "hibernating"
+	case w.HibernationState == "hibernated" || w.HibernationState == "waking":
+		return w.HibernationState
 	case w.Status != "online":
 		return "offline"
 	case w.CustodyDecisionsNeeded != nil && *w.CustodyDecisionsNeeded > 0:
@@ -271,6 +280,8 @@ func workerStateGlyph(state string) string {
 		return "○"
 	case "holding":
 		return "⚑"
+	case "hibernating", "hibernated", "waking":
+		return "◇"
 	case "draining":
 		return "◐"
 	case "cordoned":
@@ -339,6 +350,10 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 		} else {
 			add(0, "✕ "+label, detail)
 		}
+	}
+	// A failed wake (PRD #4205): the api's bounded wake_error, drawn only through Plain.
+	if w.HibernationState != "none" && w.HibernationState != "" && w.WakeError != nil && *w.WakeError != "" {
+		add(1, "✕ wake error", "✕ wake error: "+renderer.Plain(*w.WakeError, 200))
 	}
 	if w.UpgradeStatus == "provisioning" {
 		add(2, "◌ provisioning", "◌ provisioning")
@@ -416,7 +431,8 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 		text := fmt.Sprintf("⇡ outbox %d queued", *w.OutboxPendingMessages)
 		add(1, text, text)
 	}
-	if w.Status != "online" {
+	// A hibernating worker is offline by design; its state column already says so.
+	if w.Status != "online" && !hibernatingWorker(w) {
 		text := "○ offline " + workerAge(w.LastHeartbeatAt, now)
 		add(1, text, text+" since last heartbeat")
 	}
@@ -764,7 +780,7 @@ func (m tuiModel) workerStateColor(state string) color.Color {
 		return m.pal.amber
 	case "offline":
 		return m.pal.stall
-	case "draining", "cordoned":
+	case "draining", "cordoned", "hibernating", "waking":
 		return m.pal.wait
 	default:
 		return m.pal.faintC
@@ -831,14 +847,18 @@ func workerMemoryText(w apitypes.WorkerDTO) string {
 }
 
 type workerTableWidths struct {
-	memory, version, kind, intake int
-	dense, uptime                 bool
+	memory, version, kind, intake, state int
+	dense, uptime                        bool
 }
 
 // Measure the filtered fleet once; the header and every row share these widths.
 func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidths {
-	columns := workerTableWidths{memory: workerMemoryMinWidth, version: 8, kind: 9}
+	columns := workerTableWidths{memory: workerMemoryMinWidth, version: 8, kind: 9, state: 10}
 	for _, row := range rows {
+		// "◇ hibernated" needs two more cells than the 10-wide STATE column.
+		if row.w.HibernationState == "preparing" || row.w.HibernationState == "hibernated" {
+			columns.state = 13
+		}
 		if workerIntakeLabel(row.w) != "" {
 			columns.intake = 17
 		}
@@ -857,7 +877,7 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 	columns.dense = width >= 120 && (columns.intake == 0 || width >= 160)
 	// Cursor, name, state, kind, runs, cross-checks, resource cells, heartbeat, eleven separators,
 	// and one attention glyph; factory scope adds owner plus its separator.
-	fixed := 1 + 13 + 10 + columns.kind + 5 + 6 + workerCPUWidth + columns.memory + workerDiskWidth + 3 + 12
+	fixed := 1 + 13 + columns.state + columns.kind + 5 + 6 + workerCPUWidth + columns.memory + workerDiskWidth + 3 + 12
 	if m.board.admin {
 		fixed += 8
 	}
@@ -892,7 +912,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 		fields = append(fields, cell(m.workerOwnerCell(r), 7, m.pal.faintC))
 	}
 	state := workerState(r)
-	fields = append(fields, cell(workerStateGlyph(state)+" "+state, 10, m.workerStateColor(state)), cell(m.workerKind(r), columns.kind, m.pal.faintC), cell(workerSlots(r.w), 5, nil), cell(workerCrossCheckSlots(r.w), 6, nil))
+	fields = append(fields, cell(workerStateGlyph(state)+" "+state, columns.state, m.workerStateColor(state)), cell(m.workerKind(r), columns.kind, m.pal.faintC), cell(workerSlots(r.w), 5, nil), cell(workerCrossCheckSlots(r.w), 6, nil))
 	if columns.dense {
 		cpu, disk := "?", "?"
 		var cpuC, diskC color.Color
@@ -1013,7 +1033,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	if width >= 120 && m.board.admin {
 		cols = append(cols, padVisual("OWNER", 7))
 	}
-	cols = append(cols, padVisual("STATE", 10), padVisual("KIND", columns.kind), padVisual("RUNS", 5), padVisual("CHECKS", 6))
+	cols = append(cols, padVisual("STATE", columns.state), padVisual("KIND", columns.kind), padVisual("RUNS", 5), padVisual("CHECKS", 6))
 	if columns.dense {
 		cols = append(cols, padVisual("CPU", workerCPUWidth), padVisual("MEM", columns.memory), padVisual("DISK (worst)", workerDiskWidth), padVisual("VERSION", columns.version), padVisual("HB", 3))
 		if columns.uptime {

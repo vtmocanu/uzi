@@ -2822,6 +2822,14 @@ export interface Worker {
   manual_cordoned_by_label?: string | null;
   manual_cordon_reason?: string | null;
   effective_cordoned?: boolean;
+  // Worker hibernation (PRD #4205). Always sent by this api (optional here only so
+  // fixtures and mocks that predate it still compile); check it before upgrade_status
+  // or cordon state, since a non-"none" worker is never outdated/rolling.
+  hibernation_state?: "none" | "preparing" | "hibernated" | "waking";
+  hibernation_reason?: string | null;
+  hibernated_at?: string | null;
+  wake_requested_at?: string | null;
+  wake_error?: string | null;
   // Omitted when absent, invalid or older than the API's independent receipt TTL.
   roll_pacing?: WorkerRollPacing;
   id: string;

@@ -105,6 +105,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		CPVersion:           cpVersion,
 		PinnedWorkerVersion: pinnedWorkerVersion,
 		Signal:              nil,
+		Hibernation:         w.HibernationState,
 		Now:                 now,
 		APIStartedAt:        apiStartedAt,
 	}, workersvc.UpgradeParams{})
@@ -115,6 +116,11 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		ManualCordonedByLabel: textPtrValue(w.ManualCordonedByLabel.Valid, w.ManualCordonedByLabel.String),
 		ManualCordonReason:    textPtrValue(w.ManualCordonReason.Valid, w.ManualCordonReason.String),
 		EffectiveCordoned:     !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase, HibernationState: w.HibernationState}),
+		HibernationState:      hibernationStateWire(w.HibernationState),
+		HibernationReason:     textPtrValue(w.HibernationReason.Valid, w.HibernationReason.String),
+		HibernatedAt:          timePtr(w.HibernatedAt.Valid, w.HibernatedAt.Time),
+		WakeRequestedAt:       timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
+		WakeError:             textPtrValue(w.WakeError.Valid, w.WakeError.String),
 		UpgradeStatus:         upgradeStatus,
 		UpgradeDetail:         textPtrValue(upgradeDetail != "", upgradeDetail),
 		UpgradeTarget:         upgradeTarget,
@@ -166,6 +172,14 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 	}
 }
 
+// hibernationStateWire maps the column to the wire enum; an empty value reads as "none".
+func hibernationStateWire(state string) string {
+	if state == "" {
+		return "none"
+	}
+	return state
+}
+
 func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	sig := rollSignalFromRow(w)
 	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
@@ -175,6 +189,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		CPVersion:           cpVersion,
 		PinnedWorkerVersion: pinnedWorkerVersion,
 		Signal:              sig,
+		Hibernation:         w.HibernationState,
 		Now:                 now,
 		APIStartedAt:        apiStartedAt,
 	}, workersvc.UpgradeParams{})
@@ -186,6 +201,11 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		ManualCordonedByLabel: textPtrValue(w.ManualCordonedByLabel.Valid, w.ManualCordonedByLabel.String),
 		ManualCordonReason:    textPtrValue(w.ManualCordonReason.Valid, w.ManualCordonReason.String),
 		EffectiveCordoned:     !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase, HibernationState: w.HibernationState}),
+		HibernationState:      hibernationStateWire(w.HibernationState),
+		HibernationReason:     textPtrValue(w.HibernationReason.Valid, w.HibernationReason.String),
+		HibernatedAt:          timePtr(w.HibernatedAt.Valid, w.HibernatedAt.Time),
+		WakeRequestedAt:       timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
+		WakeError:             textPtrValue(w.WakeError.Valid, w.WakeError.String),
 		RollPacing:            freshPacingJSON(w.RollPacing, w.RollPacingObservedAt, now),
 		UpgradeStatus:         upgradeStatus,
 		UpgradeDetail:         textPtrValue(upgradeDetail != "", upgradeDetail),
@@ -374,6 +394,7 @@ func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerV
 		CPVersion:           cpVersion,
 		PinnedWorkerVersion: pinnedWorkerVersion,
 		Signal:              sig,
+		Hibernation:         row.Worker.HibernationState,
 		Now:                 now,
 		APIStartedAt:        apiStartedAt,
 	}, workersvc.UpgradeParams{})

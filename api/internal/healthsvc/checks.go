@@ -162,7 +162,8 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 
 	hosted := make([]store.ListAllWorkersRow, 0, len(workers))
 	for _, w := range workers {
-		if w.Worker.Kind == "hosted" {
+		// A hibernating worker has no pod to roll: it is neither rolling nor stuck (PRD #4205).
+		if w.Worker.Kind == "hosted" && !workersvc.IsHibernating(w.Worker.HibernationState) {
 			hosted = append(hosted, w)
 		}
 	}
