@@ -221,13 +221,16 @@ choice: an arbitrary base URL would be an exfiltration channel.
 |---|---|---|
 | `ANTHROPIC_ENDPOINT_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for the custom endpoint host; every entry must be an absolute `https://` URL, and a malformed entry fails the boot. An **empty** list turns the feature off, so an unconfigured instance behaves exactly as before. Matching is on the normalized origin (scheme + host), and a URL carrying userinfo is refused outright. |
 | `ANTHROPIC_ENDPOINT_URL` | *(empty)* | The custom endpoint every Claude run on this instance is bound to, e.g. a hosted gateway serving `/v1/messages`. Must appear on `ANTHROPIC_ENDPOINT_ALLOWED_BASE_URLS` or the boot fails. Empty ⇒ the feature is off. |
-| `ANTHROPIC_ENDPOINT_API_KEY` | *(empty)* | The credential for `ANTHROPIC_ENDPOINT_API_KEY`'s endpoint. It **replaces** the per-run subscription token, which is then excluded from both the claim and the SDK child env — the two never travel together. Setting this without a URL, or a URL without this, is a boot error. |
+| `ANTHROPIC_ENDPOINT_API_KEY` | *(empty)* | The credential for `ANTHROPIC_ENDPOINT_URL`'s endpoint. It **replaces** the per-run subscription token, which is then excluded from both the claim and the SDK child env — the two never travel together. Setting this without a URL, or a URL without this, is a boot error. |
+| `ANTHROPIC_ENDPOINT_MODEL` | *(empty)* | The model slug the endpoint serves, e.g. a gateway's own model id. **Required whenever `ANTHROPIC_ENDPOINT_URL` is set**: a custom endpoint does not serve Anthropic's model names, and the SDK's resolved default would address a model the host does not have, failing inside the provider rather than at boot. Setting this without a URL is a boot error. |
 
 When an endpoint is bound, the run's claim carries no subscription token at
 all and `buildSdkEnv` sets `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` while
-clearing `CLAUDE_CODE_OAUTH_TOKEN` in the same object. A Codex run is never
-bound: it has its own credential block and does not talk to an
-Anthropic-shaped endpoint.
+clearing `CLAUDE_CODE_OAUTH_TOKEN` in the same object. The endpoint's model
+replaces the resolved model for the lead and every subagent, because an agent
+definition's own `model:` outranks `CLAUDE_CODE_SUBAGENT_MODEL` and the
+builtin roles all pin one. A Codex run is never bound: it has its own
+credential block and does not talk to an Anthropic-shaped endpoint.
 
 ## Agent-source repo sync (PRD #602)
 
