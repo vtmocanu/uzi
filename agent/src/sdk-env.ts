@@ -39,6 +39,14 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   // SDK talks to, so a provisioned var must never redirect it — the only writer is
   // the admin-allowlisted claim field, applied after the fold below.
   "ANTHROPIC_BASE_URL",
+  // PRD #229 D10: the model the endpoint serves. Protected for the same reason as the
+  // base URL — a provisioned var must never name a model the operator's endpoint does
+  // not serve, and the only writer is the admin-configured claim field below.
+  "ANTHROPIC_MODEL",
+  // PRD #229 D10: the auto-mode classifier calls Anthropic's own service, so a bound
+  // run would egress repo context to the very vendor the endpoint exists to replace.
+  // Pinned here so a provisioned var cannot switch it back on.
+  "CLAUDE_CODE_AUTO_MODE_SERVER",
   // Not a credential — the mandatory browser launch flag (see the base env below).
   // provision.ts's allowlist does not emit AGENT_BROWSER_ARGS today, so this is not a
   // live conflict; protecting it keeps the --no-sandbox guarantee durable against
@@ -199,8 +207,19 @@ export function buildSdkEnv(
   if (endpoint) {
     env.ANTHROPIC_BASE_URL = endpoint.base_url;
     env.ANTHROPIC_AUTH_TOKEN = endpoint.api_key;
+    // A gateway serves its own model ids, so the SDK's resolved default addresses a
+    // model it does not have and the request fails provider-side. Set only when the
+    // claim carries a slug, so an endpoint fronting Anthropic keeps default resolution.
+    if (endpoint.model) {
+      env.ANTHROPIC_MODEL = endpoint.model;
+    }
     env.ANTHROPIC_API_KEY = undefined;
     env.CLAUDE_CODE_OAUTH_TOKEN = undefined;
+    // The auto-mode classifier is a separate Anthropic-side call that survives the
+    // base-URL override and is the one piece of run traffic a bound endpoint does not
+    // carry. Off for the same trust reason as the token: a bound run sends nothing to
+    // Anthropic.
+    env.CLAUDE_CODE_AUTO_MODE_SERVER = "0";
   }
   return env;
 }
