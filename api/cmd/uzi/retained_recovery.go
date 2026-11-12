@@ -73,7 +73,7 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
 		switch adoptionFailedDetail(r) {
 		case recoveryDetailSecretRemediationActive:
-			guidance = "The retained source is held under an active secret-scan remediation. Resume cannot succeed unchanged and is refused. Export an available archive (`uzi run export " + cellText(r.ID) + "`), which may omit later work kept on the worker; an operator can recover the retained work from worker storage. Cancel ends the run."
+			guidance = "The retained source is held under an active secret-scan remediation. Resume cannot succeed unchanged and is refused. Export an available archive (`uzi run export " + cellText(r.ID) + " --output <file>`), which may omit later work kept on the worker; an operator can recover the retained work from worker storage. Cancel ends the run."
 		case recoveryDetailRemediationProofUnknown:
 			guidance = "The remediation proof could not be verified. Resume may help; if the block persists the run holds again and each new claim adds a custody hold."
 		default:
@@ -83,9 +83,19 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 	if guidance != "" {
 		guidance = " · " + guidance
 	}
+	if secretRemediationActiveDetail(r) {
+		// Issue #4177: the server refuses Resume (409) for this detail, so the CLI never offers it.
+		return state + guidance + " · Cancel: uzi run cancel " + cellText(r.ID) + " (terminal)"
+	}
 	return state + guidance + " · owner Resume now: uzi run resume " + cellText(r.ID) +
 		"; Cancel: uzi run cancel " + cellText(r.ID) + " (terminal)" +
 		" · Resume requests an attempt; success is not assured · source/archive availability and latest edits unverified"
+}
+
+// secretRemediationActiveDetail reports an adoption-failed park classified secret_remediation_active,
+// for which the server refuses Resume.
+func secretRemediationActiveDetail(r apitypes.RunDTO) bool {
+	return strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause && adoptionFailedDetail(r) == recoveryDetailSecretRemediationActive
 }
 
 func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
@@ -97,7 +107,8 @@ func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
 				"The retained source is held under an active",
 				"secret-scan remediation. Resume cannot succeed",
 				"unchanged and is refused.",
-				"Export an available archive (`uzi run export " + cellText(r.ID) + "`),",
+				"Export an available archive",
+				"(`uzi run export " + cellText(r.ID) + " --output <file>`),",
 				"which may omit later work kept on the worker;",
 				"an operator can recover the retained work from",
 				"worker storage. Cancel ends the run.",
@@ -124,6 +135,10 @@ func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
 			"Owner-held · no automatic resume.",
 		}
 		lines = append(lines, guidance...)
+		if secretRemediationActiveDetail(r) {
+			lines = append(lines, "Cancel: uzi run cancel "+cellText(r.ID)+" (terminal)")
+			return append(lines, workerExhaustionEvidence(r)...)
+		}
 		lines = append(lines,
 			"Owner Resume or Cancel:",
 			"Resume: uzi run resume "+cellText(r.ID),

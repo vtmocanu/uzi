@@ -16,10 +16,10 @@ func TestAdoptionFailedDetailGuidance(t *testing.T) {
 		deny   []string
 	}{
 		{"active", strPtrT(recoveryDetailSecretRemediationActive),
-			[]string{"active secret-scan remediation", "Resume cannot succeed unchanged", "uzi run export", "Cancel ends the run"},
-			[]string{generic, "remediation proof could not be verified"}},
+			[]string{"active secret-scan remediation", "Resume cannot succeed unchanged", "uzi run export", "--output <file>", "operator can recover the retained work from worker storage", "Cancel ends the run", "uzi run cancel"},
+			[]string{generic, "remediation proof could not be verified", "uzi run resume", "success is not assured"}},
 		{"unknown proof", strPtrT(recoveryDetailRemediationProofUnknown),
-			[]string{"remediation proof could not be verified", "Resume may help"},
+			[]string{"remediation proof could not be verified", "Resume may help", "uzi run resume"},
 			[]string{generic, "cannot succeed unchanged"}},
 		{"nil", nil, []string{generic}, []string{"cannot succeed unchanged", "proof could not be verified"}},
 		{"unrecognised", strPtrT("raw-new-value"), []string{generic}, []string{"raw-new-value", "cannot succeed unchanged"}},
