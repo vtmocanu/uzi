@@ -2427,12 +2427,12 @@ export class FakeApi {
   }
 }
 
-/** The cross-check lanes of the running rule. `gated` and `required` are the human-gated lanes
- *  (required without auto_approve); `required_auto` and `ordinary` exist so the rule can be stated
- *  for every lane the shared fixture names. */
 /** Row statuses the api's SetRunRunning moves to `running` (runtime.sql). */
 const RUNNING_REPORT_SOURCES = new Set(["claimed", "awaiting_approval", "awaiting_input", "awaiting_followup"]);
 
+/** The cross-check lanes of the running rule. `gated` and `required` are the human-gated lanes
+ *  (required without auto_approve); `required_auto` and `ordinary` exist so the rule can be stated
+ *  for every lane the shared fixture names. */
 export type CrossCheckLane = "gated" | "required" | "required_auto" | "ordinary";
 
 /** What the api's run row holds that the running rule reads. */

@@ -282,10 +282,14 @@ describe("#3985 clarification settlement selection", () => {
       assert.equal(o.error, undefined, errorName(o.error));
       assert.equal(api.states.filter(s => s.body.status === "clarification_settled").length, 1);
       // The second question was not a revise clarification, so it reports running after it parked.
+      // Issue #4158: this gated run stores a plan and holds no applied approval bound to the current
+      // gate revision, so the api's SetRunRunning (and the fake modelling it) refuses that report; the
+      // worker choosing the plain running report is what this case pins, accepted or refused.
       const statuses = api.states.map(s => s.body.status);
       const secondQuestion = statuses.lastIndexOf("awaiting_input");
       assert.ok(secondQuestion > statuses.indexOf("awaiting_input"), statuses.join(","));
-      assert.ok(await until(() => api.states.slice(secondQuestion).some(s => s.body.status === "running"), 4_000),
+      assert.ok(await until(() => api.states.slice(secondQuestion).some(s => s.body.status === "running") ||
+        api.crossCheckRunningRefusals.some(r => r.status === "awaiting_input"), 4_000),
         `a running report follows the second question: ${api.states.map(s => s.body.status).join(",")}`);
     });
   }
