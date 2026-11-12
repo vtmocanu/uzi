@@ -1,4 +1,5 @@
-{{- if and .Values.workers.enabled .Values.workers.controller.enabled .Values.workers.extraCA.pem }}
+{{- $extra := .Values.workers.extraCA | default dict }}
+{{- if and .Values.workers.enabled .Values.workers.controller.enabled $extra.pem }}
 {{- /*
   workers.extraCA.pem: the inline extra CA bundle the controller relays to hosted
   workers after the api's CA (see values.yaml). Release namespace, read by the
@@ -13,5 +14,5 @@ metadata:
     app.kubernetes.io/component: controller
 data:
   ca.crt: |
-    {{- .Values.workers.extraCA.pem | nindent 4 }}
+    {{- $extra.pem | nindent 4 }}
 {{- end }}

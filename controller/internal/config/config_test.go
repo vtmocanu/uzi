@@ -693,6 +693,7 @@ func TestLoadWorkerExtraCA(t *testing.T) {
 		setWorkerEnv(t)
 		t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
 		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_CA_FILE", writeCA(t, caPEM(t)))
 	}
 	t.Run("kept raw for relay", func(t *testing.T) {
 		base(t)
@@ -725,6 +726,24 @@ func TestLoadWorkerExtraCA(t *testing.T) {
 		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", filepath.Join(t.TempDir(), "absent.crt"))
 		if _, err := Load(); err == nil {
 			t.Fatal("Load: want error for an unreadable extra CA file, got nil")
+		}
+	})
+	// Without the api CA there is no Secret entry for the bundle to ride, and a worker
+	// pointed at a missing CA file does not start.
+	t.Run("needs the api CA", func(t *testing.T) {
+		base(t)
+		t.Setenv("UZI_API_CA_FILE", "")
+		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", writeCA(t, caPEM(t)))
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_API_CA_FILE") {
+			t.Fatalf("Load: err = %v, want one naming UZI_API_CA_FILE", err)
+		}
+	})
+	t.Run("size cap", func(t *testing.T) {
+		base(t)
+		big := append(caPEM(t), make([]byte, maxWorkerExtraCABytes)...)
+		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", writeCA(t, big))
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "limit") {
+			t.Fatalf("Load: err = %v, want the size limit", err)
 		}
 	})
 }

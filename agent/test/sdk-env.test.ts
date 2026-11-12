@@ -25,11 +25,11 @@ beforeEach(() => {
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
     ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
     UZI_RUNNER_PATH: process.env.UZI_RUNNER_PATH,
-    NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS,
+    UZI_CLI_CA_FILE: process.env.UZI_CLI_CA_FILE,
     PATH: process.env.PATH,
   };
   delete process.env.UZI_RUNNER_PATH;
-  delete process.env.NODE_EXTRA_CA_CERTS;
+  delete process.env.UZI_CLI_CA_FILE;
   process.env.UZI_WORKER_TOKEN = FAKE_JOIN_TOKEN;
   process.env.UZI_FORGE_PAT = FAKE_PAT;
   process.env.ANTHROPIC_API_KEY = FAKE_API_KEY;
@@ -66,9 +66,9 @@ describe("buildSdkEnv", () => {
     assert.deepStrictEqual(new Set(Object.keys(env)), expected);
   });
 
-  it("hands the CLI the worker's CA bundle path, which a provisioned tool env cannot redirect", () => {
-    assert.ok(!("NODE_EXTRA_CA_CERTS" in buildSdkEnv(FAKE_OAUTH, HOME_DIR)));
-    process.env.NODE_EXTRA_CA_CERTS = "/run/secrets/ca.crt";
+  it("hands the CLI the extra CA bundle path, which a provisioned tool env cannot redirect", () => {
+    assert.ok(!("NODE_EXTRA_CA_CERTS" in buildSdkEnv(FAKE_OAUTH, HOME_DIR, { NODE_EXTRA_CA_CERTS: "/tmp/attacker.pem" })));
+    process.env.UZI_CLI_CA_FILE = "/run/secrets/ca.crt";
     const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, { NODE_EXTRA_CA_CERTS: "/tmp/attacker.pem" });
     assert.strictEqual(env.NODE_EXTRA_CA_CERTS, "/run/secrets/ca.crt");
   });

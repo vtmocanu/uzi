@@ -73,7 +73,7 @@ spec:
         # and every poll is silently dropped by the default-deny — which looks like an
         # api outage from here, not a policy mismatch.
         app.kubernetes.io/component: controller
-      {{- with .Values.workers.extraCA.pem }}
+      {{- with (.Values.workers.extraCA | default dict).pem }}
       annotations:
         # The controller reads the extra CA once at boot: roll it when the inline bundle changes.
         checksum/worker-extra-ca: {{ . | sha256sum }}
@@ -565,7 +565,8 @@ spec:
           configMap:
             name: {{ . }}
             items:
-              - key: {{ if $.Values.workers.extraCA.pem }}ca.crt{{ else }}{{ $.Values.workers.extraCA.configMap.key | default "ca.crt" }}{{ end }}
+              {{- $extra := $.Values.workers.extraCA | default dict }}
+              - key: {{ if $extra.pem }}ca.crt{{ else }}{{ ($extra.configMap | default dict).key | default "ca.crt" }}{{ end }}
                 path: ca.crt
         {{- end }}
         - name: tmp

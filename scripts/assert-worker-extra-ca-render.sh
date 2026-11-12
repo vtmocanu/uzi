@@ -79,5 +79,12 @@ elif ! grep -q -F "set pem OR configMap.name" "$WORK/err"; then
   echo "FAIL (both): refused, but not with the extraCA message:" >&2; cat "$WORK/err" >&2; fail=1
 fi
 
+helm template uzi "$WORK/chart" --set workers.enabled=true --set api.tls.enabled=false \
+  --set workers.allowPlaintextAPI=true --set-string "workers.extraCA.pem=$PEM" > "$WORK/out" 2> "$WORK/err" \
+  && { echo "FAIL (no api TLS): rendered an extra CA with api.tls.enabled=false" >&2; fail=1; }
+grep -q -F "workers.extraCA needs api.tls.enabled" "$WORK/err" || { echo "FAIL (no api TLS): refused without the extraCA message:" >&2; cat "$WORK/err" >&2; fail=1; }
+
+render --set workers.extraCA=null || { echo "FAIL (null): workers.extraCA=null did not render:" >&2; cat "$WORK/err" >&2; fail=1; }
+
 [ "$fail" -eq 0 ] && echo "OK: workers.extraCA renders as documented"
 exit "$fail"

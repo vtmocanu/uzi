@@ -1052,6 +1052,33 @@ func TestSecretAppendsTheExtraCAAfterTheAPICA(t *testing.T) {
 	}
 }
 
+// The Claude CLI gets the bundle (UZI_CLI_CA_FILE) only when an extra CA exists and the uid
+// split is off: the CLI never dials the api, and under the split it runs as a uid that
+// cannot read the Secret file.
+func TestCLICAFileOnlyWithAnExtraCAAndNoUIDSplit(t *testing.T) {
+	cliCA := func(cfg RenderConfig) string {
+		for _, e := range RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Containers[0].Env {
+			if e.Name == "UZI_CLI_CA_FILE" {
+				return e.Value
+			}
+		}
+		return ""
+	}
+	cfg := testConfig()
+	cfg.APICAPEM = []byte("api")
+	if got := cliCA(cfg); got != "" {
+		t.Errorf("api CA only: UZI_CLI_CA_FILE = %q, want unset", got)
+	}
+	cfg.ExtraCAPEM = []byte("extra")
+	if got := cliCA(cfg); got != "/run/secrets/ca.crt" {
+		t.Errorf("extra CA: UZI_CLI_CA_FILE = %q, want the bundle path", got)
+	}
+	cfg.UIDSplit = true
+	if got := cliCA(cfg); got != "" {
+		t.Errorf("uid split: UZI_CLI_CA_FILE = %q, want unset", got)
+	}
+}
+
 func TestWorkerEnvDefaultsToSingleRunCap(t *testing.T) {
 	// testConfig() leaves MaxConcurrentRuns at its zero value, which must still render
 	// "1" — the default cap, so any RenderConfig{} built in a test keeps working. The

@@ -313,6 +313,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and $ca.pem $cm.name -}}
 {{- fail "workers.extraCA: set pem OR configMap.name, not both" -}}
 {{- end -}}
+{{- if and (or $ca.pem $cm.name) (not .Values.api.tls.enabled) -}}
+{{- fail "workers.extraCA needs api.tls.enabled: the extra CA rides the bundle workers verify the api with" -}}
+{{- end -}}
 {{- if $ca.pem -}}
 {{- printf "%s-worker-extra-ca" (include "uzi.fullname" .) -}}
 {{- else if $cm.name -}}

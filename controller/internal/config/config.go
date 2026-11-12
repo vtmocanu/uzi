@@ -1053,6 +1053,10 @@ func loadAPICA(cfg *Config) error {
 	return nil
 }
 
+// maxWorkerExtraCABytes bounds the extra bundle so the per-worker Secret (the join token,
+// the api CA, the fetcher CA and this) stays far below Kubernetes' 1 MiB Secret limit.
+const maxWorkerExtraCABytes = 512 * 1024
+
 // loadWorkerExtraCA reads the optional extra CA bundle relayed to workers next to the
 // api's CA. A file holding no PEM certificate is a boot error, as for UZI_API_CA_FILE:
 // the operator who set it expects workers to trust something.
@@ -1067,6 +1071,16 @@ func loadWorkerExtraCA(cfg *Config) error {
 	}
 	if !x509.NewCertPool().AppendCertsFromPEM(pem) {
 		return fmt.Errorf("UZI_WORKER_EXTRA_CA_FILE: %s contains no PEM certificate", path)
+	}
+	if len(pem) > maxWorkerExtraCABytes {
+		return fmt.Errorf("UZI_WORKER_EXTRA_CA_FILE: %s is %d bytes, over the %d-byte limit: it rides each worker's Secret, which Kubernetes caps at 1 MiB", path, len(pem), maxWorkerExtraCABytes)
+	}
+	// The bundle rides the Secret entry the api CA creates, and the worker entrypoint
+	// requires that entry wherever NODE_EXTRA_CA_CERTS points. Without the api CA, adding an
+	// extra CA would point existing workers (whose write-once Secrets lack the entry) at a
+	// missing file on their next roll, and a docker worker's entrypoint refuses to start.
+	if len(cfg.APICAPEM) == 0 {
+		return fmt.Errorf("UZI_WORKER_EXTRA_CA_FILE needs UZI_API_CA_FILE: the extra CA rides the worker's api CA bundle, so it requires api TLS")
 	}
 	cfg.WorkerExtraCAPEM = pem
 	return nil
