@@ -2555,16 +2555,24 @@ type MemoryFlight = {
  * writer; the pending-policy admission is a second, independent writer. A flag reads true while any
  * writer holds it, so releasing the admission after a successful reconciliation clears only what the
  * admission itself added: retained recovery, capture seeding and the retainedEpisode/predecessorCapture
- * vetoes keep theirs.
+ * vetoes keep theirs. A third writer, the launch-round retry (withLaunchLockRetry), holds the
+ * recovery-clone flag only for what a failed launch round latched; a successful retry releases that
+ * writer alone, while any explicit flight-level write (setFlight) supersedes it, so a retention another
+ * path asked for before or during the backoff is never undone.
  */
 class RetentionFlag {
   private byFlight = false;
   private byAdmission = false;
-  get value(): boolean { return this.byFlight || this.byAdmission; }
-  setFlight(on: boolean): void { this.byFlight = on; }
+  private byLaunchRetry = false;
+  get value(): boolean { return this.byFlight || this.byAdmission || this.byLaunchRetry; }
+  setFlight(on: boolean): void {
+    this.byFlight = on;
+    if (!on) this.byLaunchRetry = false;
+  }
   setAdmission(on: boolean): void { this.byAdmission = on; }
+  setLaunchRetry(on: boolean): void { this.byLaunchRetry = on; }
 }
-class FlightRetention {
+export class FlightRetention {
   readonly recoveryClone = new RetentionFlag();
   readonly session = new RetentionFlag();
   readonly guardedInventoryOpen = new RetentionFlag();
@@ -4273,18 +4281,18 @@ export class RunRunner {
    * shared by every call site and separate from retainedDiscoveryRetries.
    */
   private async withLaunchLockRetry<T>(flight: RunFlight, run: (round: LaunchRound) => Promise<T>): Promise<T> {
-    // A failed round's catch latches preserveRecoveryClone with the clearable restriction latch. When a
-    // later round recovers (the fresh verified read cleared the latch), the run is uncontended again, so
-    // the clone retention that only the failed round asked for is undone; otherwise terminal retirement
-    // would keep the clone and journal of a run that completed normally.
-    const preserveBefore = flight.preserveRecoveryClone;
+    // A failed round's catch holds the recovery-clone retention through the launch-retry writer (see
+    // RetentionFlag), alongside the clearable restriction latch. When a later round recovers (the fresh
+    // verified read cleared the latch), the run is uncontended again, so only that writer is released;
+    // a retention any other path asked for, before or during the backoff, stays. Otherwise terminal
+    // retirement would keep the clone and journal of a run that completed normally.
     let retriedHere = false;
     for (;;) {
       const round: LaunchRound = { startedAt: Date.now() };
       try {
         const result = await run(round);
         if (retriedHere && flight.remediationRestrictions === undefined)
-          flight.preserveRecoveryClone = preserveBefore;
+          flight.retention.recoveryClone.setLaunchRetry(false);
         return result;
       } catch (error) {
         if (!round.lockWait) throw error;
@@ -4296,7 +4304,8 @@ export class RunRunner {
           flight.runLog.warn("launch round lock wait aborted",
             { label: round.lockWait, elapsed_ms: Date.now() - round.startedAt, abort: cls });
         } catch { /* Diagnostics must not change the launch outcome. */ }
-        if (cls !== "deadline" || flight.predecessorCapture || flight.remediationRestrictions?.clearable !== true) throw error;
+        if (cls !== "deadline" || flight.predecessorCapture || flight.remediationRestrictions?.clearable !== true)
+          throw stop !== undefined ? this.launchControl(flight, error) : error;
         const retry = (flight.launchLockRetries ?? 0) + 1;
         // Exhaustion only throws; the execute catch arm for LaunchLockBusyError sets the retention flags.
         if (retry > RETAINED_DISCOVERY_RETRIES) throw new LaunchLockBusyError();
@@ -4304,9 +4313,33 @@ export class RunRunner {
         retriedHere = true;
         await this.waitRecoveryRetry(flight, true, this.recoveryRetryMs * 2 ** (retry - 1),
           this.retainedLifecycleSignal(flight)).catch(() => undefined);
-        if (this.launchStop(flight)) throw error;
+        if (this.launchStop(flight)) throw this.launchControl(flight, error);
       }
     }
+  }
+
+  /**
+   * The error a launch round surfaces when an owner/lifecycle stop is in force, so dispatchFailure sees
+   * the stop's own control (pause, credential switch, cancel, shutdown, terminal reason, claim fence)
+   * instead of the lock-read failure that the stop cut short. An unrecognized stop yields `original`
+   * unchanged. Precedence mirrors the interrupted() guard of the publication reconciliation loop; cancel
+   * precedes terminal because a committed cancel also aborts the terminal lifecycle.
+   */
+  private launchControl(flight: RunFlight, original: unknown): unknown {
+    if (flight.steering.claimFence() !== undefined) return new StaleClaimError();
+    if (flight.steering.isCancelled()) return new Error("run cancelled");
+    if (this.shutdownSignal.signal.aborted || flight.active?.shuttingDown || this.shuttingDownGlobal)
+      return new Error("worker shutdown");
+    const terminal = flight.steering.terminalLifecycleSignal();
+    if (terminal.aborted) return terminal.reason;
+    for (const signal of this.retainedLifecycleSignals(flight)) {
+      if (!signal.aborted) continue;
+      const reason: unknown = signal.reason;
+      if (reason instanceof PauseNowSignal || reason instanceof CredentialSwitchSignal) return reason;
+      if (signal === flight.cancel.signal) return reason;
+      break;
+    }
+    return original;
   }
 
   private rememberRemediationRestrictions(flight: RunFlight, journal: RecoveryJournalEntry): void {
@@ -4381,7 +4414,9 @@ export class RunRunner {
         ? current + 1 : -1;
       try { this.log.warn("remediation restriction read unavailable", { class: progress.cause ?? "unknown" }); }
       catch { /* Diagnostics must not interrupt custody preservation. */ }
-      flight.preserveRecoveryClone = true;
+      // A launch round's latch is the retry writer's, so a recovered retry releases only that.
+      if (round) flight.retention.recoveryClone.setLaunchRetry(true);
+      else flight.preserveRecoveryClone = true;
       return { kind: "unavailable" };
     }
   }
@@ -4435,7 +4470,7 @@ export class RunRunner {
         const current = flight.remediationDenialRevision ?? 0;
         flight.remediationDenialRevision = Number.isSafeInteger(current) && current >= 0 && current < Number.MAX_SAFE_INTEGER
           ? current + 1 : -1;
-        flight.preserveRecoveryClone = true;
+        flight.retention.recoveryClone.setLaunchRetry(true);
       } else {
         // An unreadable enrollment is held, rather than silently treated as absent.
         (flight.remediationRestrictions ??= { roots: [] }).clearable = false;
