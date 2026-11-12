@@ -18,6 +18,7 @@
   "dark_theme": null,
   "typeface": null,
   "default_harness": null,
+  "judge_runs_on": null,
   "default_claude_model": null,
   "default_codex_model": null,
   "judge_models": null,

@@ -55,6 +55,8 @@ type CredentialDTO struct {
 
 // HarnessValueDTO is a predicted harness. Value is null with source chosen_at_create when a
 // creation-time policy (a note: automatic_weekly_reset or overflow) chooses it at creation.
+// The judge harness cell (PRD #3257) adds source same_as_run: value is null because the judge
+// follows the harness of the run it reviews, which is known only when that run exists.
 type HarnessValueDTO struct {
 	Value   *string  `json:"value"`
 	Source  string   `json:"source"`
@@ -89,7 +91,7 @@ type EffectiveCrossCheckDTO struct {
 }
 
 // EffectiveSettingsDTO is the body of GET /api/me/effective-settings: both harnesses, the three
-// start choices, the 8 model cells, the 4 effort cells and the 8 cross-check cells.
+// start choices, the 8 model cells, the 4 effort cells, the 8 cross-check cells and the judge harness.
 type EffectiveSettingsDTO struct {
 	Version    int                       `json:"version"`
 	Harnesses  []EffectiveHarnessDTO     `json:"harnesses"`
@@ -97,6 +99,11 @@ type EffectiveSettingsDTO struct {
 	Models     []EffectiveModelCellDTO   `json:"models"`
 	Efforts    []EffectiveEffortCellDTO  `json:"efforts"`
 	CrossCheck EffectiveCrossCheckDTO    `json:"cross_check"`
+	// JudgeHarness is the harness a judge run would use (PRD #3257), always present: an
+	// explicit "Judge runs on" choice is value claude|codex with source user_default; unset is
+	// value null with source same_as_run (the judge follows the run it reviews). fixed_at is
+	// create in both cases.
+	JudgeHarness HarnessValueDTO `json:"judge_harness"`
 }
 
 // PreviewCredentialOverrideRequest is an Anthropic token choice in a preview request: mode is

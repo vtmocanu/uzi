@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -34,6 +35,7 @@ const (
 	harnessSourceUserDefault      = "user_default"
 	harnessSourceAutomatic        = "automatic"
 	harnessSourceChosenAtCreate   = "chosen_at_create"
+	harnessSourceSameAsRun        = "same_as_run"
 	sourceCrossCheckPin           = "cross_check_pin"
 	sourceCrossCheckWorkerDefault = "cross_check_worker_default"
 	sourceCrossCheckDefault       = "cross_check_default"
@@ -42,6 +44,7 @@ const (
 	noteSDKDefault             = "sdk_default"
 	noteNotConfigurable        = "not_configurable"
 	noteNotSent                = "not_sent"
+	noteNotUsed                = "not_used"
 	noteDefaultHarnessUnusable = "user_default_harness_unusable"
 	noteInstanceUnavailable    = "instance_settings_unavailable"
 
@@ -130,6 +133,18 @@ func harnessValue(p workersvc.HarnessPrediction, explicitSource string) *apitype
 		notes = append(notes, noteDefaultHarnessUnusable)
 	}
 	return &apitypes.HarnessValueDTO{Value: strPtr(string(p.Harness)), Source: source, FixedAt: workersvc.FixedAtCreate, Notes: notes}
+}
+
+// judgeHarnessValue is the wire cell of the judge harness (PRD #3257): an explicit "Judge runs
+// on" choice is a user_default; unset is value null with source same_as_run, because the judge
+// then follows the harness of the run it reviews, which is not known until that run exists.
+func judgeHarnessValue(runsOn pgtype.Text) apitypes.HarnessValueDTO {
+	if runsOn.Valid {
+		return apitypes.HarnessValueDTO{
+			Value: strPtr(runsOn.String), Source: harnessSourceUserDefault, FixedAt: workersvc.FixedAtCreate, Notes: []string{},
+		}
+	}
+	return apitypes.HarnessValueDTO{Source: harnessSourceSameAsRun, FixedAt: workersvc.FixedAtCreate, Notes: []string{}}
 }
 
 // startOutcome is one start choice's prediction or refusal.
@@ -221,6 +236,10 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 		dto.Start = append(dto.Start, effectiveStartChoice(choice, starts[i]))
 	}
 
+	// The judge harness (PRD #3257): the user's explicit choice, else the harness of the run
+	// the judge reviews. Always present; fixed when the judge run is created.
+	dto.JudgeHarness = judgeHarnessValue(s.JudgeRunsOn)
+
 	// Worker, judge, summary and task review, each Claude then Codex.
 	dto.Models = append(dto.Models, workerModelCell(leads[workersvc.HarnessClaude]), workerModelCell(leads[workersvc.HarnessCodex]))
 	if h.settings != nil {
@@ -230,7 +249,12 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 		summaryLane := textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String)
 		codexSummaryLane := textPtrValue(s.CodexSummaryModel.Valid, s.CodexSummaryModel.String)
 		for _, c := range judgeModelCells(judgeLane, codexJudgeLane, instance) {
-			dto.Models = append(dto.Models, claimedModelCell("judge_model", c, notes))
+			cellNotes := notes
+			if s.JudgeRunsOn.Valid && c.Harness != s.JudgeRunsOn.String {
+				// The judge runs on the other harness, so this lane's model is never read.
+				cellNotes = append(append([]string{}, notes...), noteNotUsed)
+			}
+			dto.Models = append(dto.Models, claimedModelCell("judge_model", c, cellNotes))
 		}
 		for _, c := range summaryModelCells(summaryLane, codexSummaryLane, instance) {
 			dto.Models = append(dto.Models, claimedModelCell("summary_model", c, notes))

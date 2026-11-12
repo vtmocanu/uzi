@@ -1,6 +1,7 @@
 import type {
   CostStatus,
   Disposition,
+  JudgeSkip,
   PendingJudge,
   RecommendationCategory,
   ReviewStatus,
@@ -507,4 +508,13 @@ export const mockAdminScenarioReviews: MockReview[] = [
 export const mockPendingJudges: Record<string, PendingJudge> = {
   "c57b3989-105a-4e08-bf74-77ebc28e5a01": { state: "scheduled", enqueued_at: minsAgo(2) },
   "c57b3989-105a-4e08-bf74-77ebc28e5a02": { state: "running", enqueued_at: minsAgo(9) },
+};
+
+// Recorded automatic-judge skips (PRD #3257 M2), keyed by target run id: the fifth panel
+// state, "the judge was skipped" with the reason and the Run judge retry. run-judge-skipped is
+// a Claude run whose owner chose "Judge runs on: Codex" with no usable Codex credential, so the
+// skip names Codex, not the run's own harness. Like the real table, a skip only exists for a
+// run with no review and no active judge; do not seed one beside either.
+export const mockJudgeSkips: Record<string, JudgeSkip> = {
+  "run-judge-skipped": { harness: "codex", reason: "no_usable_credential", at: minsAgo(56) },
 };

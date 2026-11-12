@@ -63,9 +63,9 @@ type CreateJudgeRunParams struct {
 // has no issue. The one-active-judge-per-target partial unique index (00057) makes a
 // duplicate raise 23505, which the caller treats as "already being judged" (a no-op).
 // harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
-// create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. A judge inherits its
-// target run's harness as an explicit selection (D4); M3 wires that real value. Every current
-// caller passes string(HarnessClaude) as a mechanical stopgap.
+// create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. The caller passes the
+// judge's resolved harness (#3257): the owner's explicit "Judge runs on" choice when set,
+// otherwise the target run's harness as an explicit selection (PRD #1429 D4).
 func (q *Queries) CreateJudgeRun(ctx context.Context, arg CreateJudgeRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createJudgeRun,
 		arg.UserID,
@@ -316,6 +316,30 @@ func (q *Queries) CreateJudgeRun(ctx context.Context, arg CreateJudgeRunParams) 
 		&i.PolicyFreshConfirmedGeneration,
 	)
 	return i, err
+}
+
+const currentTransactionIsolation = `-- name: CurrentTransactionIsolation :one
+SELECT current_setting('transaction_isolation')::text
+`
+
+// Issue #3257: the judge creation guard needs READ COMMITTED (see lockJudgeTargetForCreate), and
+// the pool's Begin is the only thing that decides the level, so the transaction asserts it.
+func (q *Queries) CurrentTransactionIsolation(ctx context.Context) (string, error) {
+	row := q.db.QueryRow(ctx, currentTransactionIsolation)
+	var column_1 string
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const deleteJudgeSkipForTarget = `-- name: DeleteJudgeSkipForTarget :exec
+DELETE FROM judge_skips WHERE target_run_id = $1
+`
+
+// Issue #3257: creating a judge for a target clears its skip record, in the creating
+// transaction (so a rolled-back create keeps the record).
+func (q *Queries) DeleteJudgeSkipForTarget(ctx context.Context, targetRunID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteJudgeSkipForTarget, targetRunID)
+	return err
 }
 
 const getActiveJudgeRunForTarget = `-- name: GetActiveJudgeRunForTarget :one
@@ -695,6 +719,24 @@ func (q *Queries) GetJudgeRunUsageForTarget(ctx context.Context, targetRunID uui
 	return i, err
 }
 
+const getJudgeSkipForTarget = `-- name: GetJudgeSkipForTarget :one
+SELECT target_run_id, harness, reason, created_at FROM judge_skips WHERE target_run_id = $1
+`
+
+// Issue #3257: the recorded skip for a target, for the review panel. No visibility check
+// here: the caller applies GetRunForViewer first, like GetActiveJudgeRunForTarget.
+func (q *Queries) GetJudgeSkipForTarget(ctx context.Context, targetRunID uuid.UUID) (JudgeSkip, error) {
+	row := q.db.QueryRow(ctx, getJudgeSkipForTarget, targetRunID)
+	var i JudgeSkip
+	err := row.Scan(
+		&i.TargetRunID,
+		&i.Harness,
+		&i.Reason,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getRunReviewForTarget = `-- name: GetRunReviewForTarget :one
 SELECT id, target_run_id, judge_run_id, user_id, verdict, summary_md, judge_model, status, created_at, updated_at FROM run_reviews WHERE target_run_id = $1
 `
@@ -889,6 +931,66 @@ func (q *Queries) ListToolTraceForRun(ctx context.Context, arg ListToolTraceForR
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockRunForJudge = `-- name: LockRunForJudge :one
+SELECT r.id
+FROM runs r
+WHERE r.id = $1
+  AND pg_advisory_xact_lock(1970956916, hashtext($1::uuid::text)) IS NOT NULL
+`
+
+// Issue #3257: the per-target lock that serializes judge creation against the skip writer.
+// It is a transaction-scoped ADVISORY lock keyed on the target, NOT a row lock, so it never
+// conflicts with an FK cascade (runs_codex_secret_fk ON DELETE SET NULL during a credential
+// delete) or any other writer of the run row; a row lock here inverted lock order against
+// that delete and deadlocked. A row returned means the lock is held; no rows means the
+// target run is gone; the lock may or may not be held then (the planner may evaluate it
+// first), which is harmless because the key does not depend on the row and it is XACT-scoped.
+//
+// The existence read in this statement uses the snapshot taken before any lock wait, which is
+// fine: the reads that must be fresh are the LATER, separate statements (the skip DELETE and
+// RecordJudgeSkip's NOT EXISTS), which must never be folded into this one. No fencing argument
+// relies on lock-before-read order inside this statement.
+//
+// Two-int advisory lock: class 1970956916 = 0x757A6A74 ("uzjt"), the value of
+// store.JudgeTargetLockClass in migrate.go; TestJudgeTargetLockClassMatchesSQL pins this literal
+// to it. XACT-scoped: released on commit or rollback, so it must run on a transaction-bound
+// Queries (on a bare pool it would release immediately).
+func (q *Queries) LockRunForJudge(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockRunForJudge, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
+const recordJudgeSkip = `-- name: RecordJudgeSkip :execrows
+INSERT INTO judge_skips (target_run_id, harness, reason)
+SELECT $1::uuid, $2::text, $3::text
+WHERE NOT EXISTS (
+    SELECT 1 FROM runs WHERE kind = 'judge' AND target_run_id = $1::uuid
+)
+ON CONFLICT (target_run_id) DO UPDATE
+SET harness = EXCLUDED.harness, reason = EXCLUDED.reason, created_at = now()
+`
+
+type RecordJudgeSkipParams struct {
+	TargetRunID uuid.UUID `json:"target_run_id"`
+	Harness     string    `json:"harness"`
+	Reason      string    `json:"reason"`
+}
+
+// Issue #3257: record why the automatic judge was skipped, unless any judge run (active or
+// terminal) already exists for the target. One row per target: a later refusal overwrites
+// the reason. Callers hold LockRunForJudge's lock, in a READ COMMITTED transaction, so the
+// NOT EXISTS sees every judge run committed before the lock was granted. Zero rows means a
+// judge exists and nothing was recorded.
+func (q *Queries) RecordJudgeSkip(ctx context.Context, arg RecordJudgeSkipParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordJudgeSkip, arg.TargetRunID, arg.Harness, arg.Reason)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const upsertRunReviewWithRecommendations = `-- name: UpsertRunReviewWithRecommendations :one

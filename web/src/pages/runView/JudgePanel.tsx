@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Link } from "react-router-dom";
 import {
   api,
   ApiError,
   type CreatedIssue,
   type Disposition,
   type FiledIssue,
+  type JudgeSkip,
   type PendingJudge,
   type Repo,
   type ReviewRecommendation,
@@ -101,6 +103,58 @@ export function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview[
   );
 }
 
+// JUDGE_SKIP_HARNESS names the two harness codes the skip record can carry. Anything else (a
+// future harness this build does not know) falls through to the generic sentence below, so a
+// server code never reaches the page as raw text (PRD #3257 "Text safety").
+const JUDGE_SKIP_HARNESS: Record<string, string> = { claude: "Claude", codex: "Codex" };
+
+// judgeSkipCause maps a stored skip row to the fixed clause after "The judge was skipped on
+// <date>:". Derived ONLY from the row (harness + reason as recorded when the automatic judge
+// was refused), never from the owner's current setting, and viewer-neutral: an admin reading
+// another user's run must not be told about "your" credential. Unknown codes get the generic
+// clause rather than a guess.
+function judgeSkipCause(skip: JudgeSkip): string {
+  const harness = JUDGE_SKIP_HARNESS[skip.harness];
+  if (skip.reason === "codex_pool_unavailable") return "no pooled Codex account was available.";
+  if (harness !== undefined && skip.reason === "no_usable_credential") return `${harness} had no usable credential.`;
+  if (harness !== undefined && skip.reason === "credential_disabled") return `the ${harness} credential was disabled.`;
+  return "the judge's harness had no usable credential.";
+}
+
+// JudgeSkipNotice is the panel body for a run whose automatic judge was skipped (PRD #3257 M2):
+// one sentence saying when and why, and where the judge's harness is chosen. The existing Run
+// judge button in the header is the retry; it uses the setting and credentials current at the
+// click, which is why the copy points at Run defaults rather than restating the old choice.
+function JudgeSkipNotice({ skip }: { skip: JudgeSkip }) {
+  const at = new Date(skip.at);
+  const when = Number.isNaN(at.getTime())
+    ? null
+    : at.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  return (
+    <div className="rounded-lg border border-edge border-l-2 border-l-warn bg-raised/40 px-3 py-2.5">
+      <p className="text-sm text-fg">
+        The judge was skipped
+        {when !== null && (
+          <>
+            {" "}on <time dateTime={skip.at}>{when}</time>
+          </>
+        )}
+        : {judgeSkipCause(skip)}
+      </p>
+      <p className="mt-1 text-xs text-muted">
+        The harness that runs the judge is chosen in{" "}
+        <Link
+          to="/settings/run-defaults"
+          className="font-medium text-fg underline underline-offset-2 hover:text-brand focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-1 rounded-sm"
+        >
+          Run defaults
+        </Link>
+        . Run judge tries again with the current setting.
+      </p>
+    </div>
+  );
+}
+
 // JudgePanel is the run retrospective (PRD #46 M4): the LLM judge's verdict +
 // structured recommendations, plus the "re-run judge" action. It fetches its own
 // review (owner-or-admin scoped server-side) and, while a judge is in flight, polls a
@@ -117,6 +171,22 @@ export function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview[
 // event-loop turns (issue #227); production never passes it, so the default always holds.
 export const JUDGE_POLL_MAX_TRIES = 150;
 
+// The settle poll (issue #3257): RunView mounts this panel on the run's terminal transition,
+// which the server broadcasts BEFORE it runs the automatic judge enqueue (maybeEnqueueJudge,
+// api/internal/workersvc/service.go), so the mount fetch can land before the queued judge or
+// the recorded skip commits. When that first answer is empty (no review, no pending judge, no
+// skip) for a run that finished within JUDGE_SETTLE_WINDOW_MS, the panel re-asks every 4s, up
+// to JUDGE_SETTLE_MAX_TRIES times, and stops at the first non-empty answer (a pending judge
+// then hands over to the in-flight poll below). An old never-judged run is not re-polled.
+export const JUDGE_SETTLE_MAX_TRIES = 5;
+const JUDGE_SETTLE_WINDOW_MS = 2 * 60 * 1000;
+
+function finishedRecently(finishedAt: string | null | undefined): boolean {
+  if (!finishedAt) return false;
+  const t = Date.parse(finishedAt);
+  return Number.isFinite(t) && Date.now() - t < JUDGE_SETTLE_WINDOW_MS;
+}
+
 export function JudgePanel({
   run,
   pollMaxTries = JUDGE_POLL_MAX_TRIES,
@@ -132,6 +202,13 @@ export function JudgePanel({
   // EVERY getRunReview response — the mount fetch, the poll, and the 409 re-fetch — so
   // it can never go stale against a response the panel already has in hand.
   const [pendingJudge, setPendingJudge] = useState<PendingJudge | null>(null);
+  // Server truth: why the automatic judge was skipped, or null (PRD #3257 M2). Written from the
+  // same responses as pendingJudge. Rendered only when review and pendingJudge are both null —
+  // the server already applies that precedence; the render re-applies it so a stale skip can
+  // never sit beside a verdict or an in-flight judge.
+  const [skip, setSkip] = useState<JudgeSkip | null>(null);
+  // Armed by an empty mount answer for a just-finished run (see JUDGE_SETTLE_MAX_TRIES).
+  const [settling, setSettling] = useState(false);
   // The caller's connected repos back the file-issue draft picker (PRD #68 M4). Fetched
   // once for the panel; a failure just leaves the picker empty (the draft still opens).
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -167,7 +244,7 @@ export function JudgePanel({
     reload: fetchReview,
   } = useAsyncData(
     async ({ isCurrent }) => {
-      const { review, pending_judge } = await api.getRunReview(run.id);
+      const { review, pending_judge, skip } = await api.getRunReview(run.id);
       if (!isCurrent()) return;
       setReview(review);
       // Seed the poll's baseline to the verdict this fetch just put on screen (see the
@@ -182,6 +259,11 @@ export function JudgePanel({
       // the whole app over a missing optional field. (api/internal/uzicli/client_runs.go
       // handles the same skew on the CLI side.)
       setPendingJudge(pending_judge ?? null);
+      setSkip(skip ?? null);
+      setSettling(
+        review === null && (pending_judge ?? null) === null && (skip ?? null) === null &&
+          finishedRecently(run.finished_at),
+      );
     },
     [run.id],
     { enabled: eligible, fallback: "Failed to load the review" },
@@ -270,7 +352,7 @@ export function JudgePanel({
     let tries = 0;
     const id = setInterval(async () => {
       tries += 1;
-      let next: { review: RunReview | null; pending_judge: PendingJudge | null } | null = null;
+      let next: Awaited<ReturnType<typeof api.getRunReview>> | null = null;
       try {
         next = await api.getRunReview(run.id);
       } catch {
@@ -294,6 +376,7 @@ export function JudgePanel({
       // predates the key would otherwise put `undefined` into state and throw on render.
       const nextPending = next.pending_judge ?? null;
       setPendingJudge(nextPending);
+      setSkip(next.skip ?? null);
       // A verdict NEWER than the one on screen: swap to it and advance the baseline in the
       // same step, so the invariant holds and later ticks re-serving that same verdict do
       // not read as another landing. Deliberately not a stop condition — see above.
@@ -313,6 +396,45 @@ export function JudgePanel({
     return () => clearInterval(id);
   }, [polling, run.id, pollMaxTries]);
 
+  // The settle poll (see JUDGE_SETTLE_MAX_TRIES). It writes the same state as the mount
+  // fetch and ends at the first non-empty answer or the cap; a successful Run judge click ends it
+  // too (the in-flight poll owns that episode).
+  useEffect(() => {
+    if (!settling || queued) return;
+    let tries = 0;
+    let alive = true;
+    const id = setInterval(async () => {
+      tries += 1;
+      let next: Awaited<ReturnType<typeof api.getRunReview>> | null = null;
+      try {
+        next = await api.getRunReview(run.id);
+      } catch {
+        next = null; // transient: the cap bounds it
+      }
+      if (!alive) return;
+      const nextPending = next?.pending_judge ?? null;
+      const nextSkip = next?.skip ?? null;
+      const nextReview = next?.review ?? null;
+      if (nextReview !== null || nextPending !== null || nextSkip !== null) {
+        setReview(nextReview);
+        baselineUpdatedAt.current = nextReview?.updated_at ?? null;
+        setPendingJudge(nextPending);
+        setSkip(nextSkip);
+        setSettling(false);
+        clearInterval(id);
+        return;
+      }
+      if (tries >= JUDGE_SETTLE_MAX_TRIES) {
+        setSettling(false);
+        clearInterval(id);
+      }
+    }, 4000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [settling, queued, run.id]);
+
   const rerun = async () => {
     setActionErr("");
     setRerunning(true);
@@ -324,6 +446,14 @@ export function JudgePanel({
       // already holds at this point and re-writing it would be a no-op — one that invites
       // the same bug back by making "the click seeds the baseline" look load-bearing.
       setQueued(true);
+      // A successful click ends any settle poll for good: the in-flight poll owns this
+      // episode, and leaving `settling` set would re-arm it once `queued` clears. A refused
+      // click leaves it running, so a skip committed just after the refusal still shows.
+      setSettling(false);
+      // A created judge deletes the target's skip row in the same commit (PRD #3257), so the
+      // skip is no longer true the moment the POST succeeds; clearing it here keeps the
+      // "re-queued" note from sitting on top of a "was skipped" sentence until the next poll.
+      setSkip(null);
     } catch (e) {
       // The 409 backstop (PRD #119). The button is disabled whenever the last fetch saw
       // a pending judge, but that answer is POINT-IN-TIME: an auto-judge can enqueue in
@@ -410,11 +540,14 @@ export function JudgePanel({
   // Mutually exclusive by construction: inFlightNote needs a review (or no pendingJudge
   // at all), pendingEmptyCopy needs no review AND a pendingJudge.
   const judgeAnnounce = inFlightNote ?? pendingEmptyCopy ?? "";
+  // Read precedence review > pending judge > skip (PRD #3257), plus this tab's own queued flag.
+  const showSkip = skip !== null && review === null && pendingJudge === null && !queued;
 
   return (
     <Card className="space-y-4 p-4">
       <CardHeader title="Run review" level={2} badge={<>
           {review && <Badge tone={verdictTone(review.verdict)}>{verdictLabel(review.verdict)}</Badge>}
+          {showSkip && <Badge tone="neutral">judge skipped</Badge>}
           {review?.status === "failed" && (
             <Badge tone="neutral" title="The judge model call failed; the deterministic findings below still landed.">
               judge incomplete
@@ -472,9 +605,11 @@ export function JudgePanel({
             <Spinner />
             {pendingEmptyCopy}
           </p>
+        ) : showSkip && skip !== null ? (
+          <JudgeSkipNotice skip={skip} />
         ) : (
           <p className="text-sm text-faint">
-            This run hasn't been judged yet. Running the judge reviews the run on your Anthropic token.
+            This run hasn't been judged yet. Running the judge reviews the run on the owner's credential for the judge's harness.
           </p>
         )
       ) : (

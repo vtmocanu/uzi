@@ -934,7 +934,10 @@ A few worth knowing:
   hidden, deprecated alias) prints the judge's verdict, summary,
   recommendations, and triage tally for a run — see
   [Run judge](./judge.md#reading-a-review-from-the-cli) for the full `--json`
-  contract. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
+  contract. A run whose judge was skipped for a credential reason prints
+  `Judge skipped <date>: <reason>` (for example `Judge skipped 2026-11-12:
+  Codex had no usable credential.`) instead of "not judged", and `--json`
+  keeps the `skip` object. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
   `undo`/`stats`, plus `file` to turn a recommendation into a forge issue)
   triages recommendations, per run or across all of them — see
   [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli)
@@ -3417,6 +3420,14 @@ reports the error. `uzi settings get` shows `Default harness: automatic
 (chosen per run by weekly limits when both harnesses are usable)` (or `Default harness: claude` / `codex`)
 after Codex account mode, then the same overflow line; its decoded settings
 JSON includes `harness_overflow_enabled`.
+
+`uzi settings get` ends with a `Judge runs on:` line for the per-user
+[Judge runs on](./judge.md#judge-runs-on) setting: `Judge runs on: Same as the
+run (default)` when unset, otherwise `Judge runs on: Claude (your setting)` or
+`Judge runs on: Codex (your setting)`. `--json` carries the stored
+`judge_runs_on` (`claude`, `codex` or `null`) and, in `effective`, the
+`judge_harness` cell. The setting is changed in **Settings → Run defaults →
+Run judge**; there is no CLI write verb for it.
 
 Overflow applies at creation to new implicit issue runs started manually,
 by autopilot or by a schedule, with both harnesses usable, and only when your

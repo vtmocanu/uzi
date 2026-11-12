@@ -265,6 +265,13 @@ RETURNING judge_model;
 UPDATE users SET codex_judge_model = @codex_judge_model WHERE id = @id
 RETURNING codex_judge_model;
 
+-- name: SetUserJudgeRunsOn :one
+-- Sets (or clears, when @judge_runs_on is NULL) the current user's "Judge runs on"
+-- harness (PRD #3257). NULL means the judge runs on the harness of the run it reviews.
+-- Own-user only; caller passes the session user's id and has validated the value.
+UPDATE users SET judge_runs_on = @judge_runs_on WHERE id = @id
+RETURNING judge_runs_on;
+
 -- name: GetUserSummaryModels :one
 -- The current user's per-user run-summary model overrides, Claude lane
 -- (summary_model, PRD #362 M2) and Codex lane (codex_summary_model, PRD #3248);
@@ -309,7 +316,9 @@ RETURNING codex_summary_model;
 -- lanes, and projects the deprecated default_model from the effective harness's lane.
 -- weekly_reserve_pct and weekly_reserve_pause_running (PRD #3522) ride it too: the weekly
 -- usage reserve, NULL threshold = off.
-SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running FROM users WHERE id = $1;
+-- judge_runs_on (PRD #3257) rides it too; NULL means the judge runs on the harness of the run it
+-- reviews, the settings surface exposes it as nullable claude|codex.
+SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch

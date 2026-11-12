@@ -681,6 +681,13 @@ type JobResult struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type JudgeSkip struct {
+	TargetRunID uuid.UUID          `json:"target_run_id"`
+	Harness     string             `json:"harness"`
+	Reason      string             `json:"reason"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
 type MemoryIntervention struct {
 	InterventionID  uuid.UUID          `json:"intervention_id"`
 	RunID           uuid.UUID          `json:"run_id"`
@@ -1838,6 +1845,7 @@ type User struct {
 	HarnessOverflowEnabled    bool               `json:"harness_overflow_enabled"`
 	CodexSummaryModel         pgtype.Text        `json:"codex_summary_model"`
 	CredentialsResetAt        pgtype.Timestamptz `json:"credentials_reset_at"`
+	JudgeRunsOn               pgtype.Text        `json:"judge_runs_on"`
 }
 
 type UserCrossCheckPin struct {

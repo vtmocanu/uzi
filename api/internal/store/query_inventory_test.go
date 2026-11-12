@@ -527,6 +527,23 @@ var queryInventory = []queryPin{
 			"run_usage_totals LEFT JOIN yields NULL usage for a judge with no run_usage row"},
 	{"ListRecommendationsForReview", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:147"},
+	{"RecordJudgeSkip", "judge.sql", "TestJudgeSkipRecordedOnCredentialRefusalLiveDB",
+		"issue #3257: reached through svc.maybeEnqueueJudge -> recordJudgeSkip in ../workersvc; the " +
+			"test asserts the harness/reason row per refusal. Its NOT EXISTS (no row once any judge " +
+			"exists) is pinned by TestJudgeSkipLateWriterLiveDB in the same file"},
+	{"DeleteJudgeSkipForTarget", "judge.sql", "TestJudgeRerunClearsSkipInSameCommitLiveDB",
+		"issue #3257: reached through svc.RerunJudge -> lockJudgeTargetForCreate in ../workersvc; " +
+			"the test asserts zero judge_skips rows once the rerun's judge exists"},
+	{"GetJudgeSkipForTarget", "judge.sql", "TestJudgeSkipRecordedOnCredentialRefusalLiveDB",
+		"issue #3257: direct call in the wantSkip helper of ../workersvc/judge_skip_livedb_test.go, " +
+			"which asserts the harness and reason read back"},
+	{"LockRunForJudge", "judge.sql", "TestJudgeTargetLockIsAdvisoryLiveDB",
+		"issue #3257: reached through lockJudgeTargetForCreate in ../workersvc; the test asserts the " +
+			"granted advisory lock on the target key in pg_locks while the judge insert is open. " +
+			"TestJudgeSkipLateWriterLiveDB pins that the skip writer blocks on it"},
+	{"CurrentTransactionIsolation", "judge.sql", "TestJudgeCreateIsolationGuardFailsClosedLiveDB",
+		"issue #3257: reached through lockJudgeTargetForCreate in ../workersvc; the test runs both " +
+			"creation paths at REPEATABLE READ and asserts no judge and errJudgeCreateIsolation"},
 	{"ListOwnedRecommendationsForCoords", "judge_bulk_disposition.sql", "TestBulkDispositionFiledMemberIsNotOpenLiveDB",
 		"named in NO test source: reached via handler.BulkSetDispositions -> workersvc. This pin is " +
 			"the one whose folds are recorded — dropping the filed-issues join's coordinate half " +

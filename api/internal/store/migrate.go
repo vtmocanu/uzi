@@ -312,6 +312,17 @@ const RunUsageLockClass int32 = 0x757A7573 // "uzus"
 // collision only serializes two unrelated users' reports for a moment.
 const CodexCatalogLockClass int32 = 0x757A6364 // "uzcd"
 
+// JudgeTargetLockClass is the class half of the two-int advisory lock that serializes judge
+// creation against the judge-skip writer for ONE target run (issue #3257). Taken in SQL by
+// LockRunForJudge (queries/judge.sql), which carries this value as the literal 1970956916 with
+// the objid derived there from the target run id; TestJudgeTargetLockClassMatchesSQL fails if the
+// two disagree and TestProductTokenMintLockClassMatchesSQL's source enumeration fails on any
+// collision with another *LockClass. It is an advisory lock, not a row lock, precisely so it never
+// conflicts with the runs_codex_secret_fk cascade a credential delete runs against the target row.
+// XACT-scoped: released on commit or rollback. An objid collision only serializes two unrelated
+// targets' judge creations for a moment.
+const JudgeTargetLockClass int32 = 0x757A6A74 // "uzjt"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.

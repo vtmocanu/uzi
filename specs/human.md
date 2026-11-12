@@ -439,11 +439,15 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
   template/prompt, improve existing agents (including repo agents living in git)
   or propose missing agents that should be added to a repo, or change uzi itself
   (recommendation only, never code). [user 2026-07-12]
-- The judge runs on the run owner's own credential for the reviewed run's harness
-  (Anthropic token for a Claude run, Codex credential for a Codex run), never a
-  shared one. [user 2026-07-12] (AI-synced 2026-09-24)
+- The judge runs on the run owner's own credential for the harness it runs on
+  (Anthropic token for Claude, Codex credential for Codex), never a shared
+  one. [user 2026-07-12] (AI-synced 2026-09-24) That harness is the owner's
+  "Judge runs on" choice (Same as the run by default, Claude or Codex); an
+  explicit choice without a usable credential skips the judge, never falling
+  back to the other provider; admin enforcement follows the choice.
+  (AI-synced 2026-11-10)
 - Judge model is per harness (Claude and Codex lanes), resolved user → instance
-  → built-in for the reviewed run's harness: built-ins `opus` (Claude) and
+  → built-in for the judge run's harness: built-ins `opus` (Claude) and
   `gpt-6.1-sol` (Codex, user decision 2026-10-21); Codex judge models are
   curated ids only. Supersedes the older "cheap default" wording above.
   (AI-synced 2026-10-21)

@@ -79,6 +79,34 @@ describe("getEffectiveSettings", () => {
     expect(got.start.find((c) => c.choice === "claude")).toMatchObject({ harness: null, refusal: "no_credential_for_harness" });
   });
 
+  // PRD #3257: the recordings have "Judge runs on" unset; the stored choice is applied at
+  // response time, as the server derives it, without touching the recorded copy.
+  it("reflects a saved Judge runs on: a user_default judge harness and not_used on the other lane", async () => {
+    try {
+      await mockApi.putMySettings({ judge_runs_on: "codex" });
+      const got = await mockApi.getEffectiveSettings();
+      expect(got.judge_harness).toEqual({ value: "codex", source: "user_default", fixed_at: "create", notes: [] });
+      const judge = got.models.filter((c) => c.setting === "judge_model");
+      expect(judge.map((c) => [c.harness, c.notes.includes("not_used")])).toEqual([["claude", true], ["codex", false]]);
+      // Every other cell is the recording's, and the recording itself is untouched.
+      expect(got.models.filter((c) => c.setting !== "judge_model")).toEqual(
+        behavior.scenarios[0].get.models.filter((c) => c.setting !== "judge_model"),
+      );
+      expect(RECORDED_EFFECTIVE_SCENARIOS[0].get.judge_harness.source).toBe("same_as_run");
+
+      await mockApi.putMySettings({ judge_runs_on: "claude" });
+      const claude = await mockApi.getEffectiveSettings();
+      expect(claude.judge_harness).toMatchObject({ value: "claude", source: "user_default" });
+      expect(claude.models.filter((c) => c.setting === "judge_model").map((c) => [c.harness, c.notes.includes("not_used")]))
+        .toEqual([["claude", false], ["codex", true]]);
+
+      await mockApi.putMySettings({ judge_runs_on: null });
+      expect(await mockApi.getEffectiveSettings()).toEqual(behavior.scenarios[0].get);
+    } finally {
+      await mockApi.putMySettings({ judge_runs_on: null });
+    }
+  });
+
   it("returns a copy, so a caller cannot change the recording", async () => {
     const first = await mockApi.getEffectiveSettings();
     first.harnesses.length = 0;

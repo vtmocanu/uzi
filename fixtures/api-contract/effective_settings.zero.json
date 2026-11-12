@@ -7,5 +7,11 @@
   "cross_check": {
     "models": null,
     "efforts": null
+  },
+  "judge_harness": {
+    "value": null,
+    "source": "",
+    "fixed_at": "",
+    "notes": null
   }
 }

@@ -742,6 +742,13 @@ type Store interface {
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
 	CreateJudgeRun(ctx context.Context, arg store.CreateJudgeRunParams) (store.Run, error)
+	// Visible judge skip (issue #3257): the creation guard (isolation, target lock, skip
+	// delete) and the skip writer/reader. See judge_skip.go.
+	CurrentTransactionIsolation(ctx context.Context) (string, error)
+	LockRunForJudge(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
+	DeleteJudgeSkipForTarget(ctx context.Context, targetRunID uuid.UUID) error
+	RecordJudgeSkip(ctx context.Context, arg store.RecordJudgeSkipParams) (int64, error)
+	GetJudgeSkipForTarget(ctx context.Context, targetRunID uuid.UUID) (store.JudgeSkip, error)
 	// Per-user judge spend guards (PRD #69 M5 Decision 9, Gate 5). Read-only count
 	// queries feeding the cooldown and daily-budget backstops in maybeEnqueueJudge.
 	// LastJudgeEnqueuedAt returns a NULLABLE timestamp (NULL ⇒ user never judged).
@@ -2156,6 +2163,12 @@ type Service struct {
 	codexSelectHook            func(ctx context.Context)
 	codexSelectLockedHook      func(ctx context.Context)
 	codexSelectBeforeFenceHook func(ctx context.Context, picked uuid.UUID)
+	// judgeBeforeLockHook / judgeAfterInsertHook are test seams in the judge insert closures
+	// (issue #3257): the first runs in the creating transaction after the isolation check and
+	// before the target lock, the second after the judge INSERT and before the commit. Nil in
+	// production.
+	judgeBeforeLockHook  func(ctx context.Context)
+	judgeAfterInsertHook func(ctx context.Context)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every

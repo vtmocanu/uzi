@@ -42,7 +42,7 @@ const codexKey = {
 // resolver, so the page is driven through the same lane/cell contract the server serves.
 function settings(codex: string | null): UserSettings {
   return {
-    default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null,
+    default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null,
     summary_model: null, codex_summary_model: codex, appearance_mode: null, light_theme: null, dark_theme: null,
     typeface: null, theme: null,
     summary_models: mockSummaryModelCells({ claude: null, codex }, { claude: "haiku", codex: "gpt-6.1-sol" }),
