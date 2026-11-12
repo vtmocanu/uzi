@@ -268,6 +268,16 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 	//
 	// Nil-safe on h.q: the validation-only tests build a struct-literal Handler with
 	// no store (issue #223 pattern), and in production h.q is always wired.
+	//
+	// The window between this lookup and the upsert is real but narrow, and it is
+	// NOT closed here on purpose: it can be lost only by the SAME user submitting the
+	// same target twice concurrently, within the token-verification round trip, and
+	// the loser's outcome is the pre-#412 behaviour rather than anything worse. The
+	// row both writes race onto is keyed by (user_id, forge_type, base_url), so an
+	// attacker cannot exploit it, and a single user re-posting their own form is not
+	// the destructive accident this guard exists to stop — that accident is
+	// sequential. Closing it properly means moving the check inside ConnectForge's
+	// transaction, which is a larger change to the App branch's path too.
 	if !req.Replace && h.q != nil {
 		normBaseURL, normErr := config.NormalizeForgeBaseURL(req.BaseURL)
 		if normErr != nil {
