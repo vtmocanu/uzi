@@ -934,7 +934,10 @@ A few worth knowing:
   hidden, deprecated alias) prints the judge's verdict, summary,
   recommendations, and triage tally for a run — see
   [Run judge](./judge.md#reading-a-review-from-the-cli) for the full `--json`
-  contract. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
+  contract. A run whose judge was skipped for a credential reason prints
+  `Judge skipped <date>: <reason>` (for example `Judge skipped 2026-11-12:
+  Codex had no usable credential.`) instead of "not judged", and `--json`
+  keeps the `skip` object. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
   `undo`/`stats`, plus `file` to turn a recommendation into a forge issue)
   triages recommendations, per run or across all of them — see
   [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli)

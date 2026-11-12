@@ -163,7 +163,7 @@ above is off), combines with the kill-switch into three effective modes:
 |---|---|---|
 | `judge_enabled=false` | **Off** | Nobody — the kill-switch always wins, even with `judge_enforce_all=true`. |
 | `judge_enabled=true`, `judge_enforce_all=false` | **Optional** | Only users who've opted in themselves. |
-| `judge_enabled=true`, `judge_enforce_all=true` | **Enforced** | Every user who holds a usable credential for the harness their judge runs on (their [Judge runs on](./judge.md#judge-runs-on) choice, default the reviewed run's harness: an Anthropic token for Claude, a usable Codex credential for Codex), whether or not they've opted in; a user without it has the judge skipped for that run, since there's nothing to spend. Enforcement never overrides the choice. |
+| `judge_enabled=true`, `judge_enforce_all=true` | **Enforced** | Every user who holds a usable credential for the harness their judge runs on (their [Judge runs on](./judge.md#judge-runs-on) choice, default the reviewed run's harness: an Anthropic token for Claude, a usable Codex credential for Codex), whether or not they've opted in; a user without it has the judge skipped for that run, with the reason shown on the run page, since there's nothing to spend. Enforcement never overrides the choice. |
 
 Enforcing the judge never redirects *who pays*: spend always stays on each
 run owner's own credential for the harness the judge runs on (the owner's

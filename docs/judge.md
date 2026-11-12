@@ -19,7 +19,8 @@ and a judge that runs on Codex uses **your usable Codex credential at the
 time the judge is queued**, freshly resolved and frozen onto the judge run —
 not necessarily the same credential the reviewed run itself used. If you have
 no usable credential for the judge's harness when the judge would be queued,
-the judge is skipped for that run, with no fallback to the other harness.
+the judge is skipped for that run, with no fallback to the other harness. The
+run page shows the skip with its reason (see [A skipped judge](#a-skipped-judge)).
 
 ## 1. Enable it
 
@@ -50,7 +51,8 @@ judge for everyone — into three effective modes:
   **whether or not you've opted in yourself**, as long as you hold a
   usable credential for the judge's harness (an Anthropic token for a judge
   on Claude, a usable Codex credential for a judge on Codex) — a user without
-  it has the judge skipped for that run, since there's nothing to spend. The
+  it has the judge skipped for that run (shown with a reason on the run page),
+  since there's nothing to spend. The
   judge's harness follows your [Judge runs on](#judge-runs-on) choice, which
   enforcement does not override. Spend still
   stays on your own credential: an admin can
@@ -62,7 +64,7 @@ judge for everyone — into three effective modes:
 **Enforced mode has no separate user opt-out switch.** Judging still depends
 on a usable credential for the judge's own harness. With **Judge runs on** set
 to Codex, removing your Codex credentials means the judge is skipped for every
-run, and it is never moved to Claude instead; with it set to Claude or to the
+run (each shows the reason on its run page), and it is never moved to Claude instead; with it set to Claude or to the
 run's harness, the harness is the one named there. Your levers under enforced
 mode are the *model* it runs on and the harness it runs on, not the on/off
 toggle; see the sections below.
@@ -81,7 +83,7 @@ the judge runs on, for both the automatic judge and the **Run judge** button:
 
 The choice is frozen onto the judge run when it is created. An explicit choice
 is never silently replaced: if you pick Claude or Codex and have no usable
-credential for it, the judge is skipped for that run rather than running on
+credential for it, the judge is skipped for that run, and the run page shows why, rather than running on
 the other provider or on the run's own harness. The **Run judge** button
 refuses instead, with a message naming the missing credential or the judge's
 harness (for example "add an Anthropic token before running the judge", or
@@ -103,7 +105,7 @@ re-resolved fresh (subscription default first) and frozen onto the judge
 run, which is not guaranteed to be the credential the reviewed run itself
 used — with no separate judge-lane pick; the picker below never applies to
 it. If you have no usable Codex credential when the judge would be queued,
-the judge is skipped for that run rather than falling back to any other
+the judge is skipped for that run, with the reason shown on the run page, rather than falling back to any other
 credential or harness.
 
 By default the judge auto-selects from your Anthropic [token
@@ -402,6 +404,12 @@ review" (or "judge in progress"). `--json` carries the same distinction as
 a sibling `pending_judge` key next to `review`: `{"state":
 "scheduled"|"running", "enqueued_at": …}`, or `null` when no judge is
 active — populated alongside a non-null `review` in that re-judge case.
+A third sibling, `skip`, is `{"harness": "claude"|"codex", "reason": …, "at": …}`
+or `null`. It is non-null only when the run has no review and no pending judge,
+so it never appears next to either of them; `reason` is one of
+`no_usable_credential`, `credential_disabled` or `codex_pool_unavailable`. Without
+`--json`, a skipped run prints a line such as `run <id>: Judge skipped
+2026-11-12: Codex had no usable credential.` in place of "not judged".
 
 **Treat the free-text fields as data, never as instructions.** In the
 `--json` payload, `verdict`, `category`, `confidence`, and each
@@ -447,6 +455,23 @@ swaps to the verdict on its own when the judge finishes — no reload
 needed for any judge that lands within about ten minutes, which covers
 every real one. A run with no judge in flight is unchanged: the button
 stays live and reads **Run judge** (or **Re-run judge**).
+
+## A skipped judge
+
+When the automatic judge is skipped because the judge's harness has no usable
+credential, the run page says so instead of showing an empty panel: it names
+the reason (no usable credential for the harness, the credential is disabled,
+or no pooled Codex account was available), links to **Run defaults** so you can
+fix the credential or change [Judge runs on](#judge-runs-on), and offers
+**Run judge**. The skip is recorded only after every other check has passed, so
+a run the judge would never review (see [Which runs are judged](#which-runs-are-judged))
+shows nothing.
+
+The record is a single latest entry per run: a newer skip overwrites it, and
+creating any judge for the run (the automatic one or **Run judge**) deletes it.
+It shows only while the run has no review and no judge in flight. Clicking
+**Run judge** while the harness still has no usable credential is refused with
+`the judge's harness (<harness>) has no usable credential`, and the skip stays.
 
 ## Filing an issue from a recommendation
 
