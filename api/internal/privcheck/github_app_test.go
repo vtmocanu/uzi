@@ -9,7 +9,7 @@ import (
 )
 
 func appTestPermissions() map[string]string {
-	return map[string]string{"contents": "write", "issues": "write", "pull_requests": "write", "metadata": "read", "actions": "read", "checks": "read", "statuses": "read"}
+	return map[string]string{"contents": "write", "issues": "write", "pull_requests": "write", "metadata": "read", "actions": "read", "checks": "read", "statuses": "read", "administration": "read"}
 }
 
 func TestGitHubAppTokenPrivilegeEvaluationUsesPermissionsAndRenewableExpiry(t *testing.T) {

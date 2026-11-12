@@ -193,7 +193,7 @@ func TestGitHubAppDriverTokenInfoIsExplicitAndDetached(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := []string{"actions:read", "checks:read", "contents:write", "issues:write", "metadata:read", "pull_requests:write", "statuses:read"}
+	expected := []string{"actions:read", "administration:read", "checks:read", "contents:write", "issues:write", "metadata:read", "pull_requests:write", "statuses:read"}
 	if !info.GitHubApp || !info.Active || !info.ExpiresAt.Equal(f.now.Add(time.Hour)) || !reflect.DeepEqual(info.Scopes, expected) || !GitHubAppPermissionsValid(info.AppPermissions) {
 		t.Fatalf("App token info misrepresented effective permission scope: %#v", info)
 	}

@@ -166,7 +166,7 @@ func newAppAuthFixture(t *testing.T) *appAuthFixture {
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Errorf("decode mint request: %v", err)
 			}
-			expected := map[string]string{"contents": "write", "issues": "write", "pull_requests": "write", "metadata": "read", "actions": "read", "checks": "read", "statuses": "read"}
+			expected := map[string]string{"contents": "write", "issues": "write", "pull_requests": "write", "metadata": "read", "actions": "read", "checks": "read", "statuses": "read", "administration": "read"}
 			if !reflect.DeepEqual(request.Repositories, []string{"widgets"}) || !reflect.DeepEqual(request.Permissions, expected) {
 				t.Error("mint request did not downscope to the exact repository and minimum permissions")
 			}

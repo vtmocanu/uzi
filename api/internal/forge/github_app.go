@@ -96,8 +96,21 @@ func parseGitHubAppCredential(value string) (GitHubAppCredential, *rsa.PrivateKe
 	return c, key, nil
 }
 
+// githubAppPermissions is the exact permission map uzi requests when it mints an
+// installation token, and the map the minted token must come back holding.
+//
+// administration:read is what makes a ruleset's bypass_actors readable at all:
+// GitHub returns that field only to a caller with write access to the ruleset, and
+// an installation token otherwise holds none, so every App credential sees it
+// omitted. Without it the branch-protection check can only say "protected, bypass
+// unknown" (see github_app_access.go), which UNDER-reports an App that really is a
+// bypass actor and makes uzi take the PR route it does not strictly need.
+//
+// It is read-only and the App is installed per-repository, so the blast radius is
+// the repos the installer selected — the same scope the rest of this map already
+// covers. Do not widen it to administration:write.
 func githubAppPermissions() map[string]string {
-	return map[string]string{"contents": "write", "issues": "write", "pull_requests": "write", "metadata": "read", "actions": "read", "checks": "read", "statuses": "read"}
+	return map[string]string{"contents": "write", "issues": "write", "pull_requests": "write", "metadata": "read", "actions": "read", "checks": "read", "statuses": "read", "administration": "read"}
 }
 
 type githubAppAuth struct {
