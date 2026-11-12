@@ -326,9 +326,11 @@ the web. Admins: see [Instance maintenance mode](./instance-maintenance.md).
 
 ## Custody hold limit
 
-The recovery custody admission limit, how many [admission-counted
-holds](./run-recovery.md#reviewing-and-resolving-held-work) one owner may have
-before uzi stops admitting their **new** runs, is one setting:
+The recovery custody admission limit, how many [admission
+units](./run-recovery.md#reviewing-and-resolving-held-work) one owner may have
+before uzi stops admitting their **new** runs, is one setting. A unit is one hold,
+except that a run's open holds on the same original worker, from any of its generations, count as one
+unit together:
 
 | Setting | Default | Controls |
 |---|---|---|
@@ -340,17 +342,23 @@ and anything above 1000.
 
 - **Raising it admits more work; lowering it blocks future claims only.** Lowering
   never cancels a run or releases or discards a hold, and prune, teardown and
-  release safeguards still see every open hold. How holds are counted, the checker
-  (`cross_check`) exemption and the statement-snapshot overshoot are unchanged; see
+  release safeguards still see every open hold. The checker (`cross_check`)
+  exemption and the statement-snapshot overshoot are unchanged; how holds are
+  counted is described in
   [Run recovery](./run-recovery.md#reviewing-and-resolving-held-work) and
   [ADR-2445](../adr/2445-custody-admission-accounting.md).
+- **The limit is also a hard per-run bound.** A queued run whose own open holds
+  (counted or not) reach the limit is not started, even when its owner is below the
+  limit; only that run waits. The owner's Resume does not bypass it. The owner
+  frees the run by discarding or settling that run's own retained holds; nothing is
+  released automatically.
 - **No restart.** The API replica that saves it applies it on the next read; other
   replicas pick it up within one settings cache TTL (`SETTINGS_CACHE_TTL`, default
   5s) once their refresh succeeds. If a refresh fails while a good value is cached,
   the last good value keeps being used.
 - **Every consumer reads the same value:** claim admission, the continuation
   exemption (a previously claimed queued run keeps resuming with 1 to limit-1 of its
-  own open holds), the queued-run health reason, the `custody_hold_limit` and
+  own open holds), the hard per-run bound, the queued-run health reason, the `custody_hold_limit` and
   `blocked_runs` figures in `uzi run recovery`, the `custody.holds`
   [health check](./admin-health.md), and the Slack custody-episode message.
 - **Unreadable fails closed.** With no usable value (unreadable right after boot or

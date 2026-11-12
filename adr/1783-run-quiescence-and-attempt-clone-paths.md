@@ -1475,7 +1475,7 @@ and never reach `RunRunner`, the other kinds have their own runners, and current
 images advertise the recovery capabilities the hold requires. Every claim opens its
 own hold and the stop leaves it open, so at the default cap of 3 this stop loop accrues
 at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default `custody_hold_limit` of 8; those holds
-share the owner's admission count with the owner's other runs, so several
+count toward the owner's admission units (one unit per run and original worker since #4162, ADR-2445), so several
 exhausted runs can hold the owner's new claims queued until those holds are discarded or
 released; Resume and Cancel leave them open. The `stopOnHeldSource` stop accrues holds the same way. `TestClaimantHandoffExhaustionLiveDB` proves one open
 hold per claim, all holds open at the cap (0 and 3), a cancel leaving them open and the ownership change; the
@@ -1931,7 +1931,7 @@ the admission rules of the [ADR-1197 #3644 amendment](1197-transient-recovery-pa
   no `adoption_failed` blocker is persisted and no quiescence is proven.
 - **No effect on P.** The park changes none of P's bytes (journal, slot, clone, HOME,
   provision) and reaps nothing. Resume claims again, holds again unchanged on this
-  release, and adds a claim and an admission-counted hold. The parked run holds P's hold
+  release, and adds a claim and an open custody hold, except that a run already at its own `custody_hold_limit` bound is requeued with no claim and no hold (#4162). The parked run holds P's hold
   and the current generation's.
 - **Hosted.** An owner-held hosted run blocks its worker's ordinary image roll (the run is
   non-terminal) until the owner cancels or discards it.

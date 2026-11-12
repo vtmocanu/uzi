@@ -1374,7 +1374,7 @@ func (s *Service) checkCustodyHolds(ctx context.Context, now time.Time) apitypes
 	}
 	c.Evidence = []apitypes.HealthEvidenceDTO{
 		{Label: "Owners", Value: fmt.Sprintf("%d", len(owners))},
-		{Label: "Admission-counted holds", Value: fmt.Sprint(counted)},
+		{Label: "Admission units", Value: fmt.Sprint(counted)},
 		{Label: "Total open custody", Value: fmt.Sprint(total)},
 		{Label: "Owners with decisions", Value: fmt.Sprintf("%d", withDecisions)},
 		{Label: "Owners without decisions", Value: fmt.Sprintf("%d", withoutDecisions)},

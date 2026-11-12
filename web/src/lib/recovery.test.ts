@@ -276,15 +276,39 @@ describe("custodyAlertView — self-hide, capacity, and blocked-run severity", (
     const v = custodyAlertView(agg({ open_holds: 4, decision_needed: 2, blocked_runs: 0 }), 0);
     expect(v?.tone).toBe("warning");
     expect(v?.atLimit).toBe(false);
-    expect(v?.slotsLabel).toBe("4 / 8 custody slots used");
+    expect(v?.slotsLabel).toBe("4 / 8 custody units used");
     expect(v?.headline).toMatch(/needs your attention/);
   });
 
   it.each([0, 1])("shows danger below capacity with blocked runs and %i decisions", (decision_needed) => {
-    const v = custodyAlertView(agg({ open_holds: 5, decision_needed, blocked_runs: 1 }), 0);
+    const v = custodyAlertView(agg({ open_holds: 9, admission_counted_holds: 5, decision_needed, blocked_runs: 1 }), 0);
     expect(v?.tone).toBe("danger");
     expect(v?.atLimit).toBe(false);
+    expect(v?.headline).toBe("A queued run reached its own custody hold limit");
+  });
+
+  it("flags a below-limit blocked run as its own per-run bound with the hold-limit headline", () => {
+    const v = custodyAlertView(agg({ open_holds: 9, admission_counted_holds: 2, blocked_runs: 1 }), 0);
+    expect(v?.headline).toBe("A queued run reached its own custody hold limit");
+    expect(v?.runBoundOnly).toBe(true);
+    expect(v?.slotsLabel).toBe("2 / 8 custody units used");
+  });
+
+  it("uses the plural per-run bound headline when several runs are blocked below the limit", () => {
+    const v = custodyAlertView(agg({ open_holds: 16, admission_counted_holds: 2, blocked_runs: 2 }), 0);
+    expect(v?.headline).toBe("Queued runs reached their own custody hold limits");
+    expect(v?.runBoundOnly).toBe(true);
+  });
+
+  it("keeps the blocking headline when blocked runs coincide with the owner limit", () => {
+    const v = custodyAlertView(agg({ open_holds: 8, admission_counted_holds: 8, blocked_runs: 1 }), 0);
     expect(v?.headline).toBe("Held work is blocking new runs");
+    expect(v?.runBoundOnly).toBe(false);
+  });
+
+  it("respects an explicit zero admission_counted_holds and falls back only when absent", () => {
+    expect(custodyAlertView(agg({ open_holds: 9, admission_counted_holds: 0, decision_needed: 1, blocked_runs: 0 }), 0)?.slotsUsed).toBe(0);
+    expect(custodyAlertView(agg({ open_holds: 9, blocked_runs: 1 }), 0)?.slotsUsed).toBe(9);
   });
 
   it.each([4, 8, 9])("keeps decision-only holds at %i warning even at capacity", (open_holds) => {
@@ -486,7 +510,27 @@ describe("admissionInfoHolds", () => {
     holds,
   });
   const yes = (id: string, over: Partial<RecoveryCustodyHold> = {}) => hold({ id, counts_toward_admission: true, ...over });
-  const none = { counted: [], unreported: [] };
+  const none = { counted: [], grouped: [], unreported: [] };
+
+  it("lists uncounted same_run_group holds as grouped, never as counted, and drops other uncounted holds", () => {
+    const r = admissionInfoHolds(
+      resp({ custody_hold_limit: 2, open_holds: 4, admission_counted_holds: 2 }, [
+        yes("rep"),
+        yes("g", { counts_toward_admission: false, admission_reason: "same_run_group" }),
+        yes("other", { counts_toward_admission: false, admission_reason: "stale_heartbeat" }),
+        yes("closed", { state: "released", counts_toward_admission: false, admission_reason: "same_run_group" }),
+      ]),
+    );
+    expect(r.counted.map((h) => h.id)).toEqual(["rep"]);
+    expect(r.grouped.map((h) => h.id)).toEqual(["g"]);
+    expect(r.unreported).toEqual([]);
+  });
+
+  it("renders no grouped rows for an older server that omits the admission fields", () => {
+    const r = admissionInfoHolds(resp({ custody_hold_limit: 1, open_holds: 1 }, [hold({ id: "old" })]));
+    expect(r.grouped).toEqual([]);
+    expect(r.unreported.map((h) => h.id)).toEqual(["old"]);
+  });
 
   it("is empty when the limit is disabled", () => {
     expect(admissionInfoHolds(resp({ custody_hold_limit: 0, open_holds: 5, admission_counted_holds: 5 }, [yes("a")]))).toEqual(none);
@@ -526,6 +570,10 @@ describe("admissionReasonLabel", () => {
   it("maps known reasons to plain copy", () => {
     expect(admissionReasonLabel("earlier_generation")).toBe("Earlier generation of a run whose newer attempt holds the claim");
     expect(admissionReasonLabel("stale_heartbeat")).toBe("Worker heartbeat is stale");
+  });
+
+  it("labels same_run_group", () => {
+    expect(admissionReasonLabel("same_run_group")).toBe("Counted once with this run's other holds on the same worker");
   });
 
   it("falls back for unknown, empty and prototype-key values", () => {

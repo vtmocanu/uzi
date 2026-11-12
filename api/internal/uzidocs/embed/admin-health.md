@@ -270,6 +270,22 @@ nor triggers ordinary ephemeral capacity provisioning. Adding capacity or expedi
 the run does not bypass the hold. Moving between these two reasons keeps the expected
 wait episode; leaving both for a genuine wait restamps `health_since`.
 
+For a regular-intake continuation whose assigned worker lacks
+`repo_agent_source_v1`, either hold instead ends with
+"; assigned worker also lacks repo_agent_source_v1 required by this continuation".
+This suffix keeps the expected-wait classification and suppresses nudges; it does
+not predict placement after the deadline. After the hold, health diagnoses current
+prerequisites first, then fleet capability absence and the assigned dependency.
+At the final dependency fallback, "compatible worker currently unavailable" needs
+both a confirmed online source-capable peer and zero claimable workers in composed
+eligibility. A free peer is not a promise of claimability.
+
+The upgrade blocker diagnostic intentionally has broader scope than run health:
+for any queued assigned run, a source requirement **or** a recorded source commit
+plus an assigned worker missing the capability is an independent fact, including
+generation zero and cross-check or egress lanes. Stronger health reasons may take
+precedence without removing that upgrade fact.
+
 A running lead awaiting a required code cross-check also uses `waiting_worker`,
 with the reason "waiting until <UTC deadline> for code cross-check". The deadline
 is the persisted check deadline, formatted as RFC3339 UTC; it stays stable across
@@ -482,7 +498,7 @@ These are bounded observations, not a globally ordered snapshot:
 | `schedules.paused` | A user with a [pause-all](scheduling.md#pausing-everything-at-once) in force while still owning enabled schedules — their labelled issues look queued but will not fire | any such user | — | — |
 | `maintenance.active` | [Instance maintenance mode](instance-maintenance.md) is on: new runs wait in the queue. Carries the start time, reason and readout counts (active, held, custody). Liveness and readiness are unaffected | while on | — | `unknown` when the state cannot be read. A missing state row reads as paused, so the check warns |
 | `board.drift` | A board column move given up (stuck pending past the give-up boundary) on a run that has an issue, in the last 24 hours | any given-up move | — | — |
-| `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md) | any owner at the limit | — | `unknown` when the `custody_hold_limit` setting cannot be read; `na` only when the health service has no settings wired |
+| `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md), counted in admission units (a run's generations on one original worker are one unit) | any owner at the limit | — | `unknown` when the `custody_hold_limit` setting cannot be read; `na` only when the health service has no settings wired |
 | `recovery.storage` | Logical recovery/shared byte-budget pressure and current persisted quota-refused recovery captures; [diagnosis](./recovery-storage-diagnosis.md) | any enabled byte budget at 80% or more, or any matching refusal marker | — | `unknown` when the read fails, the aggregate is missing or the four-second deadline is reached |
 | `release.check` | Whether this instance is far behind the latest release, per the same derivation [Update checks](updates.md) uses | far behind | — | `na` when the upstream release check is disabled |
 | `agentsource.update` | Persisted [agent-source discovery](agent-source.md#update-checks-and-the-update-badge), compared with the current pin and last-applied SHA | newer semver tag or tracked branch moved | — | `na` when disabled, unconfigured or SHA-pinned; `unknown` before a recorded check or on a settings read failure |

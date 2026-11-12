@@ -9,10 +9,11 @@ import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { api } from "../lib/api";
-import { healthySilentDoc } from "../mocks/data";
+import { healthySilentDoc, overviewNextDoc } from "../mocks/data";
 import { overviewNextOwnerWorkers } from "../mocks/data/overviewNext";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 import { useAuth } from "../auth/AuthContext";
+import { CommandMenuContext } from "../components/CommandMenuContext";
 
 // PRD #3878 M3: the preview's cards stack and never scroll sideways on a phone. Layout
 // needs a real engine, so this runs in Chromium; jsdom cannot see an overflow.
@@ -201,6 +202,32 @@ describe("OverviewNext issue work line", () => {
       );
       for (let i = 1; i < bays.length; i++) expect.soft(bays[i].top, `bay ${i} below the previous`).toBeGreaterThanOrEqual(bays[i - 1].bottom - 1);
       expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    });
+  }
+
+  // #4167: an older run's stale "opened" must not put a merged PR at the PR open station.
+  for (const width of [1280, 375]) {
+    it(`leaves a PR merged per its newest run off the PR open station at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mockApi.listRuns.mockResolvedValue({
+        runs: [
+          aRun({ id: "stale", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "opened", finished_at: "2026-11-08T00:00:00Z" }),
+          aRun({ id: "merged", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "merged", finished_at: "2026-11-09T00:00:00Z" }),
+          aRun({ id: "open", status: "completed", issue_iid: 3700, mr_iid: 4200, mr_state: "opened", finished_at: "2026-11-09T00:00:00Z" }),
+        ],
+      });
+      render(
+        <MemoryRouter initialEntries={["/overview/next"]}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+            <OverviewNext />
+          </main>
+        </MemoryRouter>,
+      );
+      const card = await screen.findByRole("region", { name: "Issue work" });
+      const station = card.querySelector(`[data-stage="pr"]`) as HTMLElement;
+      await expect.poll(() => station.textContent ?? "").toContain("#3700");
+      expect(window.innerWidth).toBe(width);
+      expect(station.textContent ?? "").not.toContain("#3644");
     });
   }
 
@@ -932,7 +959,7 @@ describe("OverviewNext held work card", () => {
     await page.viewport(400, 900);
     mountWithHolds();
     await screen.findByText("Capacity");
-    await screen.findByText("custody slots used");
+    await screen.findByText("custody units used");
     await document.fonts.ready;
     expect(window.innerWidth).toBe(400);
     const capacity = cardOf(/Capacity/).getBoundingClientRect();
@@ -955,7 +982,7 @@ describe("OverviewNext held work card", () => {
     await page.viewport(1100, 900);
     mountWithHolds();
     await screen.findByText("Capacity");
-    await screen.findByText("custody slots used");
+    await screen.findByText("custody units used");
     await document.fonts.ready;
     const capacity = cardOf(/Capacity/).getBoundingClientRect();
     const held = cardOf(/Held work/).getBoundingClientRect();
@@ -1407,5 +1434,169 @@ describe("OverviewNext People chip", () => {
     expect(screen.queryByRole("dialog", { name: "People using uzi" })).toBeNull();
     expect(within(screen.getByRole("group", { name: "Usage scope" })).getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
     await expect.poll(() => document.activeElement?.id).toBe("overview-usage-by-user");
+  });
+});
+
+describe("OverviewNext health chip popover", () => {
+  function mountChip() {
+    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+    return screen.findByRole("button", { name: /System health/ });
+  }
+
+  it("opens on click, closes on Escape and on a click elsewhere, and returns focus to the chip", async () => {
+    await page.viewport(1280, 900);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    expect(dialog.checkVisibility(), "panel visible").toBe(true);
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+    expect(document.activeElement).toBe(chip);
+
+    await userEvent.click(chip);
+    await screen.findByRole("dialog", { name: "System health" });
+    // Click on empty page: the greeting heading is inert text (not focusable) above the panel,
+    // so focus falls to <body> and the chip takes it back a frame later.
+    const heading = screen.getByRole("heading", { level: 1 });
+    expect(heading.tabIndex, "click target is not focusable").toBe(-1);
+    await userEvent.click(heading);
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+    await expect.poll(() => document.activeElement).toBe(chip);
+  });
+
+  it("stays inside the viewport and below the chip at sm and wider", async () => {
+    for (const width of [640, 768, 1024, 1280, 1440]) {
+      cleanup();
+      await page.viewport(width, 900);
+      const chip = await mountChip();
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "System health" });
+      await document.fonts.ready;
+      const r = dialog.getBoundingClientRect();
+      const visibleWidth = document.documentElement.clientWidth;
+      expect.soft(r.left, `left edge at ${width}px`).toBeGreaterThanOrEqual(15);
+      expect.soft(r.right, `right edge at ${width}px`).toBeLessThanOrEqual(visibleWidth - 15);
+      const c = chip.getBoundingClientRect();
+      expect.soft(r.top, `below the chip at ${width}px`).toBeGreaterThanOrEqual(c.bottom);
+      // Attached to the chip: right-aligned when that fits, otherwise left-aligned when that fits.
+      if (c.right - r.width >= 16) {
+        expect.soft(Math.abs(r.right - c.right), `right-aligned to the chip at ${width}px`).toBeLessThanOrEqual(1);
+      } else if (c.left + r.width <= visibleWidth - 16) {
+        expect.soft(Math.abs(r.left - c.left), `left-aligned to the chip at ${width}px`).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  it("never covers a fixed sidebar left of the content column", async () => {
+    for (const width of [1280, 1440, 1600]) {
+      cleanup();
+      await page.viewport(width, 900);
+      mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+      // The shell's lg sidebar is a fixed 240px aside beside <main> (AppShell lg:pl-60).
+      render(
+        <MemoryRouter initialEntries={["/overview/next"]}>
+          <div style={{ paddingLeft: 240 }}>
+            <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+              {/* AppShell's content column, and the Search button (rendered only with a command
+                  menu), both push the chip right as in production; without them the old
+                  viewport-only floor never right-aligns over the sidebar and the case is vacuous. */}
+              <div className="mx-auto w-full max-w-[68rem]">
+                <CommandMenuContext.Provider value={{ open: () => {} }}>
+                  <OverviewNext />
+                </CommandMenuContext.Provider>
+              </div>
+            </main>
+          </div>
+        </MemoryRouter>,
+      );
+      const chip = await screen.findByRole("button", { name: /System health/ });
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "System health" });
+      await document.fonts.ready;
+      const mainLeft = document.querySelector("main")!.getBoundingClientRect().left;
+      const r = dialog.getBoundingClientRect();
+      expect.soft(r.left, `clear of the sidebar at ${width}px`).toBeGreaterThanOrEqual(mainLeft);
+      expect.soft(r.right, `inside the viewport at ${width}px`).toBeLessThanOrEqual(document.documentElement.clientWidth - 15);
+    }
+  });
+
+  it("re-places the open panel when the header reflows without a window resize", async () => {
+    await page.viewport(1280, 900);
+    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <CommandMenuContext.Provider value={{ open: () => {} }}>
+            <OverviewNext />
+          </CommandMenuContext.Provider>
+        </main>
+      </MemoryRouter>,
+    );
+    const chip = await screen.findByRole("button", { name: /System health/ });
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    await document.fonts.ready;
+    // A live sibling grows (as a refreshed header control would) and pushes the chip right.
+    const search = screen.getByRole("button", { name: /Search/ });
+    const before = chip.getBoundingClientRect().left;
+    // Wide enough that a stale chip-relative offset would push the panel past the right edge.
+    search.style.width = "720px";
+    await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
+    // Re-placed against the chip's new position: attached to it and inside the viewport.
+    await expect
+      .poll(() => {
+        const r = dialog.getBoundingClientRect();
+        const c = chip.getBoundingClientRect();
+        const attached = Math.abs(r.right - c.right) <= 1 || Math.abs(r.left - c.left) <= 1;
+        return attached && r.left >= 15 && r.right <= document.documentElement.clientWidth - 15;
+      })
+      .toBe(true);
+  });
+
+  it("re-places the open panel on resize, switching to the bottom sheet below sm", async () => {
+    await page.viewport(1280, 900);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    await page.viewport(700, 900);
+    // At 700 the panel (640 wide) must stay inside the viewport; the 500 step below proves re-placement.
+    await expect
+      .poll(() => {
+        const r = dialog.getBoundingClientRect();
+        return r.left >= 15 && r.right <= document.documentElement.clientWidth - 15;
+      })
+      .toBe(true);
+    await page.viewport(500, 900);
+    await expect
+      .poll(() => Math.abs(dialog.getBoundingClientRect().left - 16))
+      .toBeLessThanOrEqual(1);
+    expect(dialog.style.left, "no inline placement on the bottom sheet").toBe("");
+  });
+
+  it("stays inside the viewport as a bottom sheet at 375px", async () => {
+    await page.viewport(375, 900);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    await document.fonts.ready;
+    expect(window.innerWidth).toBe(375);
+    const r = dialog.getBoundingClientRect();
+    // Bottom sheet with 1rem (16px) insets on the sides and bottom, fully inside the viewport.
+    expect.soft(Math.abs(r.left - 16), "left inset").toBeLessThanOrEqual(1);
+    expect.soft(Math.abs(window.innerWidth - r.right - 16), "right inset").toBeLessThanOrEqual(1);
+    expect.soft(Math.abs(window.innerHeight - r.bottom - 16), "bottom inset").toBeLessThanOrEqual(1);
+    expect.soft(r.top, "top inside the viewport").toBeGreaterThanOrEqual(0);
+    expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
+      window.innerWidth,
+    );
   });
 });

@@ -709,7 +709,8 @@ scenarios are mutually exclusive by construction. Known values:
 - `overview-next` — `/overview/next?mock=overview-next`, signed in as the
   admin, seeds the Overview preview: the maintenance banner is on, the health
   document carries one owner warning that raises the admin attention banner (and
-  a non-passing health chip), and six other users' runs join the admin
+  a non-passing health chip, which opens the per-check System health
+  popover), and six other users' runs join the admin
   all-users list (one awaiting approval, three running, one in a usage-limit
   wait, and `run-ov-omar-asking`, which is awaiting input). One of your own
   runs is awaiting input too (`#409`, "Let admins cap concurrent exports per
@@ -729,7 +730,7 @@ scenarios are mutually exclusive by construction. Known values:
   other-run owners plus three people with no runs (one signed in two hours ago,
   one never signed in, one last seen nine days ago), so the admin People chip's
   popover shows names, a signed-in-within-24-hours row and an Idle line.
-  (PRD #3878, PRD #3880, #4052, #4042.)
+  (PRD #3878, PRD #3880, #4052, #4042, #4166.)
 - `overview-calm` — `/overview/next?mock=overview-calm`: you have active runs
   but nothing waiting on a decision (no plan review, question, owner-action
   park, open pull request or custody hold), so the decision card stays hidden.

@@ -60,6 +60,7 @@ func TestManualCordonHealthSuitableSetLiveDB(t *testing.T) {
 				case "wrong-owner":
 					owner := uuid.New()
 					e.exec(t, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", owner, owner.String()+"@e2e")
+					trackLiveDBUser(t, e.pool, owner)
 					e.exec(t, "UPDATE workers SET user_id=$2 WHERE id=$1", peer, owner)
 				case "incompatible":
 					e.exec(t, "UPDATE workers SET capabilities='{}' WHERE id=$1", peer)

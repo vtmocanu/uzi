@@ -59,6 +59,7 @@ func TestHeldTerminalCustodyControlsV2LiveDB(t *testing.T) {
 				case "user":
 					other := uuid.New()
 					f.e.exec(t, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", other, other.String()+"@example.com")
+					trackLiveDBUser(t, f.e.pool, other)
 					f.rawHold("UPDATE recovery_custody_holds SET user_id=$2 WHERE id=$1", f.hold, other)
 				case "lane":
 					f.worker.IsolatedLane = true

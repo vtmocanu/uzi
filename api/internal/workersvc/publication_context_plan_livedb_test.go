@@ -15,7 +15,10 @@ import (
 // Record both prepared-plan modes on substantial unrelated history and one heavily
 // refreshed branch. This is an executable query-plan probe, not a timing threshold.
 func TestPublicationContextQueryPlanLiveDB(t *testing.T) {
-	f := seedSourcePublication(t, false)
+	// Own database: its 22k-run history would make a shared-DB cleanup delete quadratic
+	// through the unindexed self-referencing runs FKs; the DB drop removes everything.
+	iso := isolatedCoordinateDatabase(t)
+	f := seedSourcePublicationOn(t, seedInterlockOn(t, iso.ctx, iso.pool, false), false)
 	if r, err := f.svc.SetStateReportWithReconciliation(f.e.ctx, f.w, f.id, f.req); err != nil || !r.Applied {
 		t.Fatalf("source: %+v %v", r, err)
 	}

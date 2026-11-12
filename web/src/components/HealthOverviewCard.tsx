@@ -11,19 +11,10 @@
 import { Link } from "react-router-dom";
 
 import { attentionChecks, healthVerdict } from "../lib/healthView";
-import { formatAgo } from "../lib/rateLimits";
 import { useHealthStatus } from "../lib/useAdminHealth";
 import { SeverityBadge } from "./healthSeverity";
-import { DocLink } from "./DocLink";
-import { HealthEvidenceLabel, HealthEvidenceValue } from "./HealthEvidenceLabel";
+import { HealthCheckRow } from "./HealthCheckRow";
 import { cx } from "./ui";
-
-// "for 38m" from an RFC3339 `since`, or empty when the check carries none. Static (no live
-// clock): the card refreshes on the dashboard's 10 s poll through the shared provider.
-function sinceLabel(since: string | null): string {
-  if (!since) return "";
-  return `for ${formatAgo(since).replace(/ ago$/, "")}`;
-}
 
 function OpenHealthLink() {
   return (
@@ -86,25 +77,7 @@ export function HealthOverviewCard() {
       </div>
       <ul className="space-y-1.5">
         {top.map((c) => (
-          <li key={c.id} className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <SeverityBadge severity={c.severity} />
-            <span className="min-w-0 flex-1 text-sm">
-              <span className="font-medium text-fg">{c.title}</span>{" "}
-              <span className="text-muted">{c.summary}</span>
-              {c.evidence.map((e, i) => (
-                <span key={i} className="block break-words text-xs text-muted">
-                  <span className="font-medium"><HealthEvidenceLabel evidence={e} />:</span>{" "}
-                  <HealthEvidenceValue evidence={e} />
-                </span>
-              ))}
-              {c.doc && (
-                <span className="block text-xs">
-                  <DocLink slug={c.doc}>Docs: {c.doc}</DocLink>
-                </span>
-              )}
-            </span>
-            {c.since && <span className="shrink-0 text-xs tabular-nums text-faint">{sinceLabel(c.since)}</span>}
-          </li>
+          <HealthCheckRow key={c.id} check={c} />
         ))}
       </ul>
       {attention.length > 3 && (

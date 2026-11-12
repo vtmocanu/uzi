@@ -30,6 +30,7 @@ func TestSemanticCompletionOwnerAuthorizationReplayLiveDB(t *testing.T) {
 	dec := CompletionDecisionInput{Decision: "authorize_maintainer", Maintainers: semanticMaintainers(c)[:1], Reason: "authorize frozen owner steps", ContractRevision: 1}
 	foreignAdmin := uuid.New()
 	e.exec(t, "INSERT INTO users (id,email,password_hash,is_admin) VALUES ($1,$2,'hash',true)", foreignAdmin, "m4-"+foreignAdmin.String()+"@example.com")
+	trackLiveDBUser(t, e.pool, foreignAdmin)
 	if _, err := svc.DecideCompletion(e.ctx, foreignAdmin, id, dec); !errors.Is(err, ErrRunNotFound) {
 		t.Fatalf("foreign admin: %v", err)
 	}

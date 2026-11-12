@@ -77,6 +77,7 @@ func newGateFix(t *testing.T, maxRefusals int) *gateFix {
 		t.Fatalf("seal anthropic token: %v", err)
 	}
 	f.exec(`INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`, f.userID, fmt.Sprintf("gate1795-%s@e2e", f.userID))
+	trackLiveDBUser(t, pool, f.userID)
 	f.exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	      VALUES ($1, $2, 'github', 'https://forge.e2e', 'bot', 1, $3)`, connID, f.userID, sealedPAT)
 	f.exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)

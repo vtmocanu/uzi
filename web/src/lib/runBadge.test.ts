@@ -31,8 +31,10 @@ import {
   retryHint,
   runBadge,
   runStatusTone,
+  queuedBlockerPrecedesCodexAdmission,
   shouldShowHealthFlag,
 } from "./runBadge";
+import boundFixture from "../../../fixtures/api-contract/run.custody_run_hold_bound.json";
 import { RUN_STATUS_TONES } from "../components/ui";
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { isTerminalRun, TERMINAL_RUN_STATUSES } from "./runStatus";
@@ -1595,11 +1597,18 @@ describe("Codex admission read-time projection", () => {
       label: "⚠ waiting for worker", title: `${reason} · ${text}`,
     });
   });
+  it("treats the server's per-run custody hold bound reason (api-contract fixture) as a preceding blocker", () => {
+    // The literal is apitypes.ReasonCustodyRunHoldBound; the fixture is checked against it by api/cmd/uzi TestCustodyRunHoldBoundFixtureRenders.
+    const reason = "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start";
+    expect(boundFixture.health_reason).toBe(reason);
+    expect(queuedBlockerPrecedesCodexAdmission({ status: boundFixture.status, health_reason: boundFixture.health_reason })).toBe(true);
+  });
   it.each([
     "handoff setup has not finished",
     "your vault is locked, so this run can't start",
     "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
     "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+    "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
   ])("preserves the higher-priority queued blocker %s", (reason) => {
     const text = codexAdmissionText(held, NOW);
     const r = { ...held, health_reason: reason };

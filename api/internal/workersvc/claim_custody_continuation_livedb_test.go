@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -239,8 +240,8 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 			t.Fatalf("claimed %s, want idle (own open holds at the limit end the exemption)", got)
 		}
 		row := store.ListActiveRunsForHealthRow{ID: run, UserID: f.userID, Status: "queued", Kind: "issue"}
-		if got := f.svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonCustodyLimit {
-			t.Fatalf("health reason = %q, want %q", got, reasonCustodyLimit)
+		if got := f.svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != apitypes.ReasonCustodyRunHoldBound {
+			t.Fatalf("health reason = %q, want %q (per-run hold bound)", got, apitypes.ReasonCustodyRunHoldBound)
 		}
 		adm, err := env.q.GetCustodyAdmissionForRun(env.ctx, store.GetCustodyAdmissionForRunParams{
 			UserID: f.userID, RunID: run, CustodyHoldLimit: testCustodyLimit,
