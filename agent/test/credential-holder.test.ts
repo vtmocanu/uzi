@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { CredentialHolder } from "../src/credential-holder.js";
+import { inspect } from "node:util";
 
 describe("CredentialHolder", () => {
   it("starts at the base epoch with the seed token", () => {
@@ -46,5 +47,26 @@ describe("CredentialHolder", () => {
 
   it("refuses an empty seed token", () => {
     assert.throws(() => new CredentialHolder({ token: "", ordinal: 0 }));
+  });
+});
+
+describe("CredentialHolder redaction", () => {
+  const TOKEN = "tok-" + "secret-value";
+  it("keeps the token out of JSON and inspect output for the holder and its snapshots", () => {
+    const h = new CredentialHolder({ token: TOKEN, ordinal: 0 });
+    const snap = h.current();
+    for (const out of [JSON.stringify(h), inspect(h), JSON.stringify(snap), inspect(snap), JSON.stringify({ h, snap })]) {
+      assert.ok(!out.includes(TOKEN), out);
+    }
+    assert.deepEqual(JSON.parse(JSON.stringify(h)), { ordinal: 0, token: "[redacted]" });
+    assert.deepEqual(JSON.parse(JSON.stringify(snap)), { ordinal: 0, token: "[redacted]" });
+    h.publish({ token: TOKEN + "-2", ordinal: 1 });
+    assert.ok(!JSON.stringify(h.current()).includes(TOKEN));
+    assert.ok(!inspect(h.current()).includes(TOKEN));
+  });
+
+  it("still returns the real token from current().token", () => {
+    const h = new CredentialHolder({ token: TOKEN, ordinal: 0 });
+    assert.equal(h.current().token, TOKEN);
   });
 });

@@ -1537,7 +1537,8 @@ export class SteeringChannel {
     if (this.lifecycleEnded || this.terminalLifecycle.signal.aborted || this.cancelled ||
         this.flightEnded || this.pendingSwitch !== undefined || this.pauseMode === "disk" ||
         (this.cancel.signal.aborted &&
-          !(this.cancel.signal.reason instanceof PauseNowSignal))) this.revokeStop("shutdown");
+          !(this.cancel.signal.reason instanceof PauseNowSignal) &&
+          !this.isSettledSwitchSignal(this.cancel.signal.reason))) this.revokeStop("shutdown");
     this.shutdownCheckpoint = Object.freeze({ stopSignal: this.shutdownStop.signal, deadlineAt });
     this.cancel.abort();
     this.terminalLifecycle.abort();
@@ -1576,6 +1577,7 @@ export class SteeringChannel {
   private readonly settledOps = new Set<string>();
   /** CredentialSwitchSignal abort reasons whose switch settled: the signal is spent, not a stop. */
   private readonly settledSwitchSignals = new WeakSet<object>();
+  private readonly cancelReplacedListeners = new Set<(signal: AbortSignal) => void>();
   private latchedSwitchOpId: string | undefined;
   /** PRD #1247 M5b (MAJOR-6 rework): while > 0, a matching credential_switch signal is DEFERRED —
    *  maybeTripCredentialSwitch returns WITHOUT setting pendingSwitch and WITHOUT aborting,
@@ -1649,8 +1651,9 @@ export class SteeringChannel {
     private readonly runId: string,
     private readonly pollMs: number,
     private readonly log: Logger,
-    /** Aborted when a `cancel` input arrives; wired to the executor's ctx.signal. */
-    private readonly cancel: AbortController,
+    /** Aborted when a `cancel` input arrives; wired to the executor's ctx.signal. Replaced (not
+     *  readonly) by an applied in-place switch: see cancelSignal(). */
+    private cancel: AbortController,
     opts: SteeringOptions = {},
   ) {
     this.sleepFn = opts.sleep ?? sleep;
@@ -1854,6 +1857,19 @@ export class SteeringChannel {
     return this.pendingSwitch ? { ...this.pendingSwitch } : undefined;
   }
 
+  /** Issue #4201: the lifecycle (cancel) signal steering currently aborts. After an applied in-place
+   *  switch it is a fresh signal; read it at use time and never cache it. */
+  cancelSignal(): AbortSignal {
+    return this.cancel.signal;
+  }
+
+  /** Issue #4201: `cb` runs with the fresh signal each time an applied switch replaces the cancel
+   *  controller, so the runner can re-wire whatever listened to the spent one. Returns an unsubscribe. */
+  onCancelSignalReplaced(cb: (signal: AbortSignal) => void): () => void {
+    this.cancelReplacedListeners.add(cb);
+    return () => { this.cancelReplacedListeners.delete(cb); };
+  }
+
   /** Issue #4201: whether `reason` is the abort reason of a switch that has settled in place, so a
    *  guard that treats a spent shared cancel controller as a stop can leave it out. */
   isSettledSwitchSignal(reason: unknown): boolean {
@@ -1948,8 +1964,16 @@ export class SteeringChannel {
       this.settledOps.delete(oldest);
     }
     const spent = this.cancel.signal;
-    if (spent.aborted && spent.reason instanceof CredentialSwitchSignal) this.settledSwitchSignals.add(spent.reason);
+    const spentBySwitch = spent.aborted && spent.reason instanceof CredentialSwitchSignal;
+    if (spentBySwitch) this.settledSwitchSignals.add(spent.reason);
     this.rearmCredentialSwitch();
+    // An AbortController cannot be reset, so every `!cancel.signal.aborted` guard (fence, disk stop,
+    // cancel, pause now/wall, a later switch trip) would silently drop its reason on the spent one.
+    // Replace it, then tell the runner so it follows the new signal (cancelSignal()).
+    if (spentBySwitch && outcome === "applied") {
+      this.cancel = new AbortController();
+      for (const cb of this.cancelReplacedListeners) cb(this.cancel.signal);
+    }
     if (outcome === "applied" && this.revokedBy.size === 1 && this.revokedBy.has("switch")) {
       this.shutdownStop = new AbortController();
       this.revokedBy.clear();

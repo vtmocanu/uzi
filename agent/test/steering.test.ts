@@ -2923,4 +2923,37 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
     assert.equal(rearmed.aborted, true, "the cancel reaches the signal a reader fetched after the apply");
     assert.equal(ch.checkpointAuthoritySignal(), rearmed);
   });
+
+  it("workerShutdown after a settled applied switch leaves the checkpoint stop un-revoked", () => {
+    const { ch } = make();
+    ch.tripCredentialSwitch(GEN, "op-1");
+    ch.settleCredentialSwitch("op-1", "applied");
+    ch.rearmLifecycle();
+    const cp = ch.workerShutdown(Date.now() + 1000);
+    assert.equal(cp.stopSignal.aborted, false);
+  });
+
+  it("after a settled applied switch a cancel, a fence and a disk stop each reach the exposed lifecycle signal", () => {
+    const cases: Array<[string, (ch: SteeringChannel) => void, (r: unknown) => boolean]> = [
+      ["cancel", (ch) => (ch as unknown as { commitCancel(): void }).commitCancel(), (r) => r instanceof Error && r.name === "AbortError"],
+      ["fence", (ch) => (ch as unknown as Private).endFencedFlight("stale"), (r) => r instanceof Error && r.name === "ClaimFencedSignal"],
+      ["disk stop", (ch) => ch.requestDiskStop(), (r) => r instanceof PauseNowSignal],
+      ["second switch", (ch) => ch.tripCredentialSwitch(GEN, "op-2"), (r) => r instanceof CredentialSwitchSignal],
+    ];
+    for (const [name, act, matches] of cases) {
+      const { ch, cancel } = make();
+      ch.tripCredentialSwitch(GEN, "op-1");
+      const spent = cancel.signal;
+      const seen: AbortSignal[] = [];
+      ch.onCancelSignalReplaced((s) => seen.push(s));
+      ch.settleCredentialSwitch("op-1", "applied");
+      assert.equal(seen.length, 1, `${name}: listeners are told about the replacement`);
+      assert.equal(ch.cancelSignal(), seen[0]);
+      assert.notEqual(ch.cancelSignal(), spent);
+      assert.equal(ch.cancelSignal().aborted, false, `${name}: fresh signal`);
+      act(ch);
+      assert.equal(ch.cancelSignal().aborted, true, `${name}: reason delivered on the fresh signal`);
+      assert.ok(matches(ch.cancelSignal().reason), `${name}: reason ${String(ch.cancelSignal().reason)}`);
+    }
+  });
 });
