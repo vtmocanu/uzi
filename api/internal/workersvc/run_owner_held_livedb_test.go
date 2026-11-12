@@ -64,7 +64,7 @@ func (f ownerHeldFx) snapshot(t *testing.T, run uuid.UUID) [3]string {
 	}
 	q("SELECT row_to_json(r)::text FROM runs r WHERE id=$1", &s[0])
 	q("SELECT coalesce(jsonb_agg(to_jsonb(h) ORDER BY h.id)::text,'[]') FROM recovery_custody_holds h WHERE run_id=$1", &s[1])
-	q("SELECT count(*)::text FROM run_user_inputs WHERE run_id=$1 AND kind='resume'", &s[2])
+	q("SELECT coalesce(jsonb_agg(to_jsonb(i) ORDER BY i.id)::text,'[]') FROM run_user_inputs i WHERE i.run_id=$1", &s[2])
 	return s
 }
 
