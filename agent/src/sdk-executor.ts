@@ -1776,12 +1776,20 @@ export class SdkExecutor implements Executor {
       config: ctx.config,
       ...(assembled.leadModel !== undefined ? { templateModel: assembled.leadModel } : {}),
     });
-    const leadModel = leadRequest.model;
+    // PRD #229 D10: a bound endpoint serves its own model ids. The SDK's explicit
+    // `model` option (set from leadModel below) OUTRANKS ANTHROPIC_MODEL in the env,
+    // so the slug has to replace the resolved model here or every request names a
+    // model the gateway does not have and fails inside the provider.
+    const boundModel = ctx.anthropicEndpoint?.model;
+    const leadModel = boundModel || leadRequest.model;
+    // A bound endpoint serves one model, so the roster cannot keep its pins either: a
+    // subagent left on the resolved default fails exactly as the lead would.
+    const useLeadModel = Boolean(boundModel) || Boolean(ctx.config?.override_subagent_model);
     // PRD #305: apply the run's model to every OWN subagent now, before planTurnSubagents
     // copies them and before the own-source implement path reuses them, so both the plan
     // turn and an own-source implement follow the lead model. The repo roster is built
     // later and overridden where it is built. Off/no-model = pins win (byte-identical).
-    if (ctx.config?.override_subagent_model && leadModel) {
+    if (useLeadModel && leadModel) {
       applySubagentModelOverride(assembled.subagents, leadModel);
     }
     // The names come from the RESULT, never from `assembled.subagents`. They feed
@@ -1808,7 +1816,7 @@ export class SdkExecutor implements Executor {
     const guarded = ctx.capturedMemory !== undefined;
     const planShaped = guarded ? shapeGuardedGrants(planTurn.subagents) : undefined;
     const planAgents = planShaped ? planShaped.agents : planTurn.subagents;
-    if (planSource === "repo" && ctx.config?.override_subagent_model && leadModel) {
+    if (planSource === "repo" && useLeadModel && leadModel) {
       applySubagentModelOverride(planAgents, leadModel);
     }
     const planUnavailable: UnavailableRole[] = planShaped ? planShaped.unavailable : [];
@@ -3011,7 +3019,10 @@ export class SdkExecutor implements Executor {
       // roster (the primary case: an auto-approved scheduled run resolves to the repo
       // roster). Own-source defs were copied by reference from the already-overridden
       // assembled.subagents, so this repeat is idempotent for them.
-      if (ctx.config?.override_subagent_model && leadModel) {
+      // A bound endpoint serves one model, so the repo roster cannot keep its pins
+      // either (PRD #229 D10); `useLeadModel` is not in scope in this closure, hence
+      // the same predicate spelled against ctx.
+      if ((ctx.anthropicEndpoint?.model || ctx.config?.override_subagent_model) && leadModel) {
         applySubagentModelOverride(selectedSubagents, leadModel);
       }
       // Issue #2471: a guard-bound run shapes the implement roster the same way as the plan roster.
