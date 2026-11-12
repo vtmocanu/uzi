@@ -295,6 +295,54 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
     }
   });
 
+  it("evicts a bound endpoint's key on terminal (PRD #229 D10)", async () => {
+    const { gitlab } = fakeGitlab();
+    const { logger, added, removed } = secretRecordingLogger();
+    const KEY = "sk-fixture-endpoint-key-evict-001";
+    // The server binds the endpoint and empties the token; the key is the run's credential.
+    const claim = gitlabClaim(62, {
+      secrets: {
+        forge_pat: "fixture-forge-pat-evict-002",
+        anthropic_oauth_token: "",
+        anthropic_endpoint: { base_url: "https://gateway.example/v1", api_key: KEY, model: "m-1" },
+        forge_username: "bot",
+      } as never,
+    });
+    await runnerWith(
+      () => ({ executor: new StubExecutor(nullLogger()) }),
+      gitlab,
+      undefined,
+      logger,
+    ).execute(claim);
+
+    assert.ok(added.includes(KEY), "the endpoint key is registered with the redactor");
+    assert.ok(removed.includes(KEY), "and evicted on terminal");
+  });
+
+  it("scrubs a bound endpoint's key out of the posted run messages (PRD #229 D10)", async () => {
+    const { gitlab } = fakeGitlab();
+    const KEY = "sk-fixture-endpoint-key-scrub-003";
+    const claim = gitlabClaim(63, {
+      secrets: {
+        forge_pat: "fixture-forge-pat-scrub-004",
+        anthropic_oauth_token: "",
+        anthropic_endpoint: { base_url: "https://gateway.example/v1", api_key: KEY, model: "m-1" },
+        forge_username: "bot",
+      } as never,
+    });
+    // An executor that echoes the key into a run message, the way a provider error would.
+    const echoing: Executor = {
+      run: async (ctx: RunContext) => {
+        ctx.emit({ kind: "status", payload: { text: `provider said ${KEY}` } });
+        return { ok: true } as unknown as ExecutorResult;
+      },
+    };
+    await runnerWith(() => ({ executor: echoing }), gitlab).execute(claim);
+    const posted = JSON.stringify(api.messages(claim.run_id));
+    assert.ok(posted.length > 0, "the run posted messages");
+    assert.equal(posted.includes(KEY), false, "the endpoint key never reaches a run message");
+  });
+
   it("still evicts the run's secrets when the run FAILS (Decision 7 — finally path)", async () => {
     const { gitlab } = fakeGitlab();
     const { logger, added, removed } = secretRecordingLogger();

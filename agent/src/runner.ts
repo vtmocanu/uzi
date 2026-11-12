@@ -13355,6 +13355,10 @@ export class RunRunner {
     const secrets = [
       claim.secrets.forge_pat,
       claim.secrets.anthropic_oauth_token,
+      // PRD #229 D10: the endpoint key reaches the SDK env rather than the claim body, but a
+      // provider error echoing it must not survive into a run message. Absent on an unbound
+      // run, so that wire stays byte-identical.
+      claim.secrets.anthropic_endpoint?.api_key,
       this.joinToken,
       gitBasic,
     ];
