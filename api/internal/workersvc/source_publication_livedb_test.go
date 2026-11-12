@@ -25,7 +25,11 @@ type sourcePublicationFixture struct {
 
 func seedSourcePublication(t *testing.T, permit bool) sourcePublicationFixture {
 	t.Helper()
-	e := setupInterlockLiveDB(t)
+	return seedSourcePublicationOn(t, setupInterlockLiveDB(t), permit)
+}
+
+func seedSourcePublicationOn(t *testing.T, e interlockLiveDB, permit bool) sourcePublicationFixture {
+	t.Helper()
 	wid := e.seedWorker(t, nil) // Deliberately no inventory/recovery capability.
 	id := e.seedLegacyRunningRun(t, wid)
 	if permit {

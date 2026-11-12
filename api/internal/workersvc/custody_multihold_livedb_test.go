@@ -294,6 +294,7 @@ func TestDeleteWorkerCustodyListsLiveHolderHoldsLiveDB(t *testing.T) {
 	otherUser := uuid.New()
 	e.exec(t, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		otherUser, "r3921-"+otherUser.String()+"@e2e")
+	trackLiveDBUser(t, e.pool, otherUser)
 	foreignRun := uuid.New()
 	foreignIID := *e.nextIID
 	*e.nextIID++

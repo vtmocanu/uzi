@@ -65,6 +65,7 @@ func adminSeedOwner(ctx context.Context, t *testing.T, pool *pgxpool.Pool, tag s
 	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
 	adminMustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		userID, fmt.Sprintf("admindispo-%s-%s@e2e", tag, userID))
+	trackLiveDBUser(t, pool, userID)
 	adminMustExec(ctx, t, pool,
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})

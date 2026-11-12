@@ -93,6 +93,7 @@ func TestPublicationContextResolverLiveDB(t *testing.T) {
 				case "foreign_source":
 					other := uuid.New()
 					f.e.exec(t, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", other, other.String()+"@e2e")
+					trackLiveDBUser(t, f.e.pool, other)
 					f.e.exec(t, "UPDATE runs SET user_id=$2 WHERE id=$1", f.id, other)
 				case "foreign_repo":
 					other := uuid.New()

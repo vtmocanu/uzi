@@ -38,6 +38,7 @@ func seedReevalOwner(t *testing.T, env codexTestEnv, bindMode string, altEligibl
 	userID := uuid.New()
 	env.exec(`INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 		userID, fmt.Sprintf("reeval-%s@e2e", userID))
+	trackLiveDBUser(t, env.pool, userID)
 	connID, repoID := uuid.New(), uuid.New()
 	env.exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	          VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte("x"))

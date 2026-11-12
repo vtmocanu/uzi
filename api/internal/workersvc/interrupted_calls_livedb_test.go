@@ -429,6 +429,7 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		e.exec(t, "UPDATE workers SET snapshot_register_nonce='nonce' WHERE id=$1", wid)
 		otherOwner := uuid.New()
 		e.exec(t, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", otherOwner, otherOwner.String()+"@interrupted.test")
+		trackLiveDBUser(t, e.pool, otherOwner)
 		e.exec(t, "UPDATE runs SET user_id=$2 WHERE id=$1", run, otherOwner)
 		if _, err := svc.InterruptedCalls(e.ctx, w, run, "nonce", 4); !errors.Is(err, ErrRunNotOwned) {
 			t.Fatalf("run owner fence: %v", err)

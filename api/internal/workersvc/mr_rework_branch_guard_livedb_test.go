@@ -54,7 +54,7 @@ func TestMRReworkBranchGuardForcedInterleaveLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	svc := New(q, nil, Params{})
 
@@ -68,6 +68,7 @@ func TestMRReworkBranchGuardForcedInterleaveLiveDB(t *testing.T) {
 	// The repo-ownership check (GetRepoForUser) needs users + forge_connections + repos.
 	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("bg-%s@e2e", userID))
+	trackLiveDBUser(t, pool, userID)
 	// PRD #1429 M2 (D4): createMRReworkRun now inherits the SOURCE run's harness (defaults to
 	// 'claude') as an EXPLICIT createRunResolved selection, which requires the user to actually
 	// hold a usable Claude credential — orthogonal to the branch-guard behaviour under test.
@@ -184,7 +185,7 @@ func TestCreateAutoMRReworkRunSameMRDuplicateIsActiveExistsLiveDB(t *testing.T) 
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	svc := New(q, nil, Params{})
 
@@ -198,6 +199,7 @@ func TestCreateAutoMRReworkRunSameMRDuplicateIsActiveExistsLiveDB(t *testing.T) 
 	// The repo-ownership check (GetRepoForUser) needs users + forge_connections + repos.
 	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("dup-%s@e2e", userID))
+	trackLiveDBUser(t, pool, userID)
 	// PRD #1429 M2 (D4): createMRReworkRun now inherits the SOURCE run's harness (defaults to
 	// 'claude') as an EXPLICIT createRunResolved selection, which requires the user to actually
 	// hold a usable Claude credential — orthogonal to the same-MR duplicate behaviour under test.
