@@ -234,7 +234,7 @@ export class CrossCheckRunner {
       // Single-family custody: a Codex checker holds only a Codex credential, a Claude checker only
       // the Anthropic token (PRD #2460); a claim carrying both, or neither, is invalid.
       const family = selectCodexBinding(claim.secrets).kind;
-      const hasAnthropic = Boolean(claim.secrets.anthropic_oauth_token);
+      const hasAnthropic = Boolean(claim.secrets.anthropic_oauth_token || claim.secrets.anthropic_endpoint);
       const checker = family === "codex" ? (hasAnthropic ? undefined : this.model)
         : hasAnthropic ? this.claudeModel : undefined;
       familyName = checker === this.model ? "codex" : checker === this.claudeModel ? "claude" : "unknown";

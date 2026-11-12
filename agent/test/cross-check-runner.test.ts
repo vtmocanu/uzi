@@ -545,9 +545,36 @@ for (const stage of ["plan", "code"] as const) {
  }
 }
 
+it("selects the Claude checker for an endpoint-only claim (PRD #229 D10)", async () => {
+ const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "endpoint-family-"));
+ const decisions: unknown[] = [];
+ const c = { ...claim(), claim_generation: 7 };
+ // The server binds the endpoint and empties the token, so the claim carries no token at all.
+ c.secrets = { forge_pat: "", anthropic_oauth_token: "",
+  anthropic_endpoint: { base_url: "https://gateway.example/v1", api_key: "sk-gateway", model: "m-1" } } as ClaimResponse["secrets"];
+ const client = {
+  reportState: async () => ({ applied: true }),
+  getInputs: async () => ({ inputs: [] }),
+  postMessages: async () => {},
+  reportCrossCheckVerdict: async (_id: string, _g: number, body: unknown) => { decisions.push(body); },
+ } as unknown as WorkerClient;
+ const git = { ensureClone: async () => "/bare", runnerCloneAtCommit: async () => "/checkout",
+  removeRunnerClone: async () => {} } as unknown as GitCache;
+ let claudeCalls = 0;
+ let codexCalls = 0;
+ try {
+  await new CrossCheckRunner(client, git, nullLogger(), { homeRoot: root, pollMs: 1, modelTimeoutMs: 5000,
+   model: { run: async () => { codexCalls++; return '{"verdict":"approve","summary":"x","items":[]}'; } },
+   claudeModel: { run: async () => { claudeCalls++; return '{"verdict":"approve","summary":"x","items":[]}'; } },
+  }).execute(c);
+  assert.equal(claudeCalls, 1, "the Claude checker ran");
+  assert.equal(codexCalls, 0, "the Codex checker did not");
+  assert.equal((decisions[0] as { verdict?: string }).verdict, "approve");
+ } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 for (const family of ["codex", "claude"] as const) {
- it("M2 actual checker error reaches runner warning with only Codex Plan shape: " + family, async () => {
-  const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "plan-shape-runner-"));
+ it("M2 actual checker error reaches runner warning with only Codex Plan shape: " + family, async () => {  const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "plan-shape-runner-"));
   const recorded = recordingLogger();
   const sentinel = "SENTINEL-final-shape-4103";
   const text = "```json\n" + JSON.stringify({ verdict: "approve", summary: sentinel, items: [] }) + "\n```";
