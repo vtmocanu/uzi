@@ -989,6 +989,68 @@ WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
 ORDER BY r.created_at DESC
 LIMIT 500;
 
+-- name: ListRunsAdminDebug :many
+-- Issue #4198: the admin run debug listing. Runs in EVERY status (terminal included),
+-- newest first (created_at, then id as the tiebreak), across all users or one @user_id,
+-- optionally created at or after @since, excluding chat, judge, and cross-check runs.
+-- The caller asks for one row more than it serves so it can report truncation.
+-- Keep in step with ListActiveRunsAll (select list, joins, cross-check flags) and
+-- ListRunsForUser (has_available_capture).
+SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
+       c.forge_type,
+       i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
+       -- ListRunsForUser), so the admin overview pill and the claim order agree.
+       -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
+       fn_run_priority_class(r.kind, r.priority, r.created_at < @background_grace_cutoff) AS priority_class,
+       -- issue #1418: the capture half of the read-path landing_state; the same expression as ListRunsForUser.
+       (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available'))::boolean AS has_available_capture,
+       -- issue #4082: live plan / code cross-check presence; the same two correlated EXISTS
+       -- as ListRunsForUser (see its comment for the source queries they must stay in step with).
+       (EXISTS (
+           SELECT 1 FROM cross_checks cc
+           JOIN runs lead ON lead.id = cc.lead_run_id
+           WHERE lead.id = r.id AND (lead.plan_cross_check_required OR lead.plan_cross_check_gated)
+             -- mirrors runkind.PlanCrossCheckable, which health.go applies in Go
+             AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework')
+             AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
+             AND cc.lead_claim_generation = lead.claim_generation
+             AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+             AND cc.deadline_at > now()
+       ))::boolean AS has_live_plan_cross_check,
+       (EXISTS (
+           SELECT 1
+           FROM runs lead
+           JOIN cross_checks cc ON cc.lead_run_id = lead.id
+           JOIN runs child ON child.id = cc.checker_run_id
+           WHERE lead.id = r.id AND lead.status = 'running'
+            AND lead.code_cross_check_required AND NOT lead.report_only
+            AND lead.fix_verdict IS DISTINCT FROM 'not_code'
+            AND lead.claim_released_at IS NULL AND cc.lead_claim_generation = lead.claim_generation
+            AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework','task')
+            AND lead.harness IN ('claude','codex')
+            AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
+            AND cc.deadline_at > now()
+            AND child.target_run_id = lead.id AND child.kind = 'cross_check'
+            AND child.user_id = lead.user_id AND child.worker_id = lead.worker_id
+            AND child.harness IN ('claude','codex') AND child.harness <> lead.harness
+            AND child.harness = cc.checker_harness
+            AND child.status IN ('queued','claimed','running')
+       ))::boolean AS has_live_code_cross_check
+FROM runs r
+-- PRD #1908: LEFT JOINs so a repo-less JOB run (repo_id NULL) is listed with NULL repo_path and
+-- forge_type (see ListRunsForUser).
+LEFT JOIN repos rp ON rp.id = r.repo_id
+LEFT JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
+LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
+LEFT JOIN workers w ON w.id = r.worker_id
+JOIN users u ON u.id = r.user_id
+WHERE r.kind NOT IN ('chat', 'judge', 'cross_check')
+  AND (sqlc.narg(user_id)::uuid IS NULL OR r.user_id = sqlc.narg(user_id)::uuid)
+  AND (sqlc.narg(since)::timestamptz IS NULL OR r.created_at >= sqlc.narg(since)::timestamptz)
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT @max_rows;
+
 -- name: ListAllWorkers :many
 -- Admin Agents-status: every worker with owner email plus the same two derived
 -- signals as ListWorkersByUser (PRD #42 Decision 10): busy is the ANY-kind

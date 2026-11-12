@@ -3,12 +3,15 @@ package handler
 import (
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -149,34 +152,149 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	writeRunList(w, r, out)
 }
 
+// adminRunDebugMaxRows is the most runs the all-states admin listing serves; the query asks
+// for one more so the response can say whether the list was cut.
+const adminRunDebugMaxRows = 500
+
+// adminRunDebugRefusal is the 403 body of a debug-mode /admin/runs request that may not take
+// the debug path. It names the prerequisites; it never echoes request input.
+const adminRunDebugRefusal = "admin run debug reads require the server flag UZI_ADMIN_RUN_DEBUG (chart api.adminRunDebug.enabled) and an admin_ro (uza_) Bearer token"
+
+// adminRunRow is the common shape of one /admin/runs row, mapped explicitly from both list
+// queries (ListActiveRunsAll and ListRunsAdminDebug) so one builder decorates either.
+type adminRunRow struct {
+	Run                   store.Run
+	RepoPath, WorkerName  pgtype.Text
+	OwnerEmail            string
+	ForgeType             pgtype.Text
+	IssueWebURL           pgtype.Text
+	PriorityClass         string
+	HasLivePlanCrossCheck bool
+	HasLiveCodeCrossCheck bool
+	HasAvailableCapture   bool
+}
+
 // AdminListRuns returns the newest 500 non-terminal runs across all users, excluding
 // chat, judge, and cross-check runs (admin-only, gated by RequireAdmin on the route).
 // Powers the Agents-status overview. ?view=summary serves the compact rows exactly
 // as ListRuns does.
+//
+// Issue #4198: a request that carries any of the query keys state, user or since (even with
+// an empty value) is a debug request and takes adminRunDebugListRuns instead.
 func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if q.Has("state") || q.Has("user") || q.Has("since") {
+		h.adminRunDebugListRuns(w, r)
+		return
+	}
 	rows, err := h.wsvc.ListActiveRunsAll(r.Context())
 	if err != nil {
 		slog.Error("admin list runs", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	common := make([]adminRunRow, 0, len(rows))
+	for _, row := range rows {
+		common = append(common, adminRunRow{
+			Run: row.Run, RepoPath: row.RepoPath, WorkerName: row.WorkerName, OwnerEmail: row.OwnerEmail,
+			ForgeType: row.ForgeType, IssueWebURL: row.IssueWebUrl, PriorityClass: row.PriorityClass,
+			HasLivePlanCrossCheck: row.HasLivePlanCrossCheck, HasLiveCodeCrossCheck: row.HasLiveCodeCrossCheck,
+		})
+	}
+	out := h.buildAdminRunList(r, common, false)
+	h.overlayListDecorations(r, out)
+	writeRunList(w, r, out)
+}
+
+// adminRunDebugListRuns serves GET /api/admin/runs with ?state=all[&user=<uuid>][&since=<RFC3339>]
+// (issue #4198): runs of every status, newest first, capped at adminRunDebugMaxRows with a
+// truncated flag. It always serves the summary projection in a {runs, truncated} envelope,
+// whatever ?view says. The predicate is checked before any validation, so a caller who may
+// not debug learns nothing about which parameters were acceptable.
+func (h *Handler) adminRunDebugListRuns(w http.ResponseWriter, r *http.Request) {
+	actor, tokenID, ok := h.adminRunDebugActor(r)
+	if !ok {
+		httpx.Error(w, http.StatusForbidden, adminRunDebugRefusal)
+		return
+	}
+	q := r.URL.Query()
+	if q.Get("state") != "all" {
+		httpx.Error(w, http.StatusBadRequest, "state must be 'all'")
+		return
+	}
+	var ownerFilter *uuid.UUID
+	if q.Has("user") {
+		id, err := uuid.Parse(q.Get("user"))
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid user id")
+			return
+		}
+		ownerFilter = &id
+	}
+	var since *time.Time
+	if q.Has("since") {
+		ts, err := time.Parse(time.RFC3339Nano, q.Get("since")) // also accepts plain RFC3339
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid since; use RFC3339")
+			return
+		}
+		since = &ts
+	}
+	rows, err := h.wsvc.ListRunsAdminDebug(r.Context(), ownerFilter, since, adminRunDebugMaxRows+1)
+	if err != nil {
+		slog.Error("admin debug list runs", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	truncated := len(rows) > adminRunDebugMaxRows
+	if truncated {
+		rows = rows[:adminRunDebugMaxRows]
+	}
+	common := make([]adminRunRow, 0, len(rows))
+	for _, row := range rows {
+		common = append(common, adminRunRow{
+			Run: row.Run, RepoPath: row.RepoPath, WorkerName: row.WorkerName, OwnerEmail: row.OwnerEmail,
+			ForgeType: row.ForgeType, IssueWebURL: row.IssueWebUrl, PriorityClass: row.PriorityClass,
+			HasLivePlanCrossCheck: row.HasLivePlanCrossCheck, HasLiveCodeCrossCheck: row.HasLiveCodeCrossCheck,
+			HasAvailableCapture: row.HasAvailableCapture,
+		})
+	}
+	items := h.buildAdminRunList(r, common, true)
+	h.overlayListDecorations(r, items)
+	summaries := make([]apitypes.RunSummaryItemDTO, 0, len(items))
+	for _, item := range items {
+		s := apitypes.RunSummaryOf(item)
+		// The summary projection drops plan_md and preserved_patch; the debug listing also
+		// withholds the lead's report text (report_md stays a null key, the summary shape).
+		// Job is detail-only (runs_lifecycle.go), so no job result report rides a list row.
+		s.ReportMd = nil
+		summaries = append(summaries, s)
+	}
+	auditRunsListDebugRead(r, actor, tokenID, adminRunDebugRouteRuns, ownerFilter, since, len(summaries))
+	httpx.JSON(w, http.StatusOK, apitypes.AdminRunsDebugDTO{Runs: summaries, Truncated: truncated})
+}
+
+// buildAdminRunList decorates the admin rows into list items: plan-revising flag, the "now"
+// line for non-terminal runs, extension cap and clock read once, owner email, forge type,
+// issue URL, live cross-check presence and progress phase. withLanding also applies the
+// capture-aware landing_state (issue #1418), as ListRuns does; the Agents-status path leaves
+// it off so its output is unchanged.
+func (h *Handler) buildAdminRunList(r *http.Request, rows []adminRunRow, withLanding bool) []apitypes.RunListItemDTO {
 	runIDs := make([]uuid.UUID, 0, len(rows))
 	for _, row := range rows {
 		runIDs = append(runIDs, row.Run.ID)
 	}
-	// Plan-revise display flag, same best-effort contract as ListRuns (issue #750): the
-	// admin CLI renders status through effectiveRunStatus(..., IsRevising), so without this
-	// a revising run would show as awaiting_approval here while the owner's own list says
-	// "revising". Decoration only — a failure logs and leaves every flag false.
+	// Plan-revise display flag, same best-effort contract as ListRuns (issue #750): the admin CLI
+	// renders status through effectiveRunStatus(..., IsRevising), so without this a revising run
+	// would show as awaiting_approval here while the owner's own list says "revising". Decoration
+	// only: a failure logs and leaves every flag false.
 	revising, err := h.wsvc.PlanRevisingForRuns(r.Context(), runIDs)
 	if err != nil {
 		slog.Error("plan revising states", "error", err)
 		revising = nil
 	}
-	// PRD #1064 M2: the "now" line for the non-terminal runs on this page. AdminListRuns
-	// (ListActiveRunsAll) already excludes terminal runs, so every id here is active; the
-	// IsTerminalRunStatus guard is kept for parity with ListRuns and to stay correct if
-	// that query ever widens. Best-effort like the revising decoration above.
+	// PRD #1064 M2: the "now" line for the non-terminal runs on this page. Best-effort like the
+	// revising decoration above.
 	activeIDs := make([]uuid.UUID, 0, len(rows))
 	for _, row := range rows {
 		if !apitypes.IsTerminalRunStatus(row.Run.Status) {
@@ -205,15 +323,17 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		// Admin overview carries no private harness comparison, even for an admin-owned run.
 		item.ForgeType = row.ForgeType.String // "" for a repo-less job run; per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
-		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
-		applyRevising(&item.RunDTO, revising[row.Run.ID]) // nil map ⇒ false (issue #750)
-		item.CurrentActivity = activity[row.Run.ID]       // nil map ⇒ null (PRD #1064)
+		item.IssueWebURL = textPtrValue(row.IssueWebURL.Valid, row.IssueWebURL.String)
+		applyRevising(&item.RunDTO, revising[row.Run.ID]) // nil map => false (issue #750)
+		item.CurrentActivity = activity[row.Run.ID]       // nil map => null (PRD #1064)
 		item.CrossCheckActive = crossCheckActive(row.HasLivePlanCrossCheck, row.HasLiveCodeCrossCheck)
 		setProgressPhase(&item.RunDTO)
+		if withLanding {
+			item.LandingState = workersvc.DeriveLandingState(textPtrValue(row.Run.FailOrigin.Valid, row.Run.FailOrigin.String), row.Run.PreservedPatch.Valid, row.HasAvailableCapture)
+		}
 		out = append(out, item)
 	}
-	h.overlayListDecorations(r, out)
-	writeRunList(w, r, out)
+	return out
 }
 
 // crossCheckActive maps the list query's two live-cross-check flags onto the list-only

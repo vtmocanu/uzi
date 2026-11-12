@@ -4589,6 +4589,14 @@ export type RunSummaryItem = Omit<
   | "capability_provenance" | "lead_config" | "created_issues"
 >;
 
+/** The GET /api/admin/runs?state=all response (Go AdminRunsDebugDTO, issue #4198 admin run
+ *  debug listing): summary rows of every status, newest first. runs is always an array on the
+ *  wire; truncated is true when more matching runs existed than the server's row cap. */
+export interface AdminRunsDebug {
+  runs: RunSummaryItem[];
+  truncated: boolean;
+}
+
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
 // Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
 // spending a token has no usage row but must still count. All counts are always

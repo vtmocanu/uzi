@@ -95,6 +95,7 @@ import type {
   RecoveryCustodyAggregate,
   HeldPublication,
   HeldPublications,
+  AdminRunsDebug,
   RecoveryCustodyHolds,
   GuardrailOverrideRequest,
   CodexAccountRateLimit,
@@ -243,6 +244,8 @@ import recoveryCustodyHoldZero from "../../../fixtures/api-contract/recovery_cus
 import recoveryCustodyHoldFull from "../../../fixtures/api-contract/recovery_custody_hold.full.json";
 import recoveryCustodyAggregateZero from "../../../fixtures/api-contract/recovery_custody_aggregate.zero.json";
 import recoveryCustodyAggregateFull from "../../../fixtures/api-contract/recovery_custody_aggregate.full.json";
+import adminRunsDebugZero from "../../../fixtures/api-contract/admin_runs_debug.zero.json";
+import adminRunsDebugFull from "../../../fixtures/api-contract/admin_runs_debug.full.json";
 import heldPublicationsZero from "../../../fixtures/api-contract/held_publications.zero.json";
 import heldPublicationsFull from "../../../fixtures/api-contract/held_publications.full.json";
 import recoveryCustodyHoldsZero from "../../../fixtures/api-contract/recovery_custody_holds.zero.json";
@@ -1612,6 +1615,19 @@ it("recovery held-publication fields match the Go contract and permit older serv
   void _heldPublicationsExtra;
   void _heldPublicationsZero;
   void _heldPublicationsFull;
+}
+
+// ── AdminRunsDebug (issue #4198) ─────────────────────────────────────────────
+// runs is non-omitempty, so zero.json carries a null the handler normalizes to [].
+{
+  const _adminRunsDebugMissing: never = null as unknown as Exclude<keyof AdminRunsDebug, keyof typeof adminRunsDebugFull>;
+  const _adminRunsDebugExtra: never = null as unknown as Exclude<keyof typeof adminRunsDebugFull, keyof AdminRunsDebug>;
+  const _adminRunsDebugZero: ZeroOf<AdminRunsDebug, "runs"> = adminRunsDebugZero;
+  const _adminRunsDebugFull: Widen<AdminRunsDebug> = adminRunsDebugFull;
+  void _adminRunsDebugMissing;
+  void _adminRunsDebugExtra;
+  void _adminRunsDebugZero;
+  void _adminRunsDebugFull;
 }
 
 it("held publication rows carry exactly the Go key set", () => {

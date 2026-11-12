@@ -2745,3 +2745,11 @@ func (r *RunSummaryItemDTO) UnmarshalJSON(data []byte) error {
 	*r = RunSummaryItemDTO(wire)
 	return nil
 }
+
+// AdminRunsDebugDTO is the GET /api/admin/runs?state=all response (issue #4198 admin run
+// debug listing): the summary rows of every status, newest first, and whether more matching
+// runs existed than the server's row cap. Runs is always a JSON array, never null.
+type AdminRunsDebugDTO struct {
+	Runs      []RunSummaryItemDTO `json:"runs"`
+	Truncated bool                `json:"truncated"`
+}

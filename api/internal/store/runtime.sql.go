@@ -13011,6 +13011,361 @@ func (q *Queries) ListRunUsageTotalsForRuns(ctx context.Context, runIds []uuid.U
 	return items, nil
 }
 
+const listRunsAdminDebug = `-- name: ListRunsAdminDebug :many
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, r.pause_requested_at, r.pause_mode, r.pause_after_count, r.checkpoint_tip_at, r.recovery_wait_count, r.recovery_retry_not_before, r.completion_contract_version, r.contract_revision, r.completion_contract, r.completion_attempts, r.latest_completion_attempt, r.milestones_agents, r.hold_reason, r.hold_captured_head, r.completion_budget_exhausted_at, r.completion_question_at, r.budget_extension_seconds, r.claim_generation, r.harness, r.recovery_wait_cause, r.forge_park_count, r.credential_override_mode, r.credential_override_secret_id, r.claim_released_at, r.credential_switch_requested_at, r.credential_switch_generation, r.stale_requeue_generation, r.budget_finalize_seconds, r.released_worker_id, r.released_worker_nonce, r.gate_revision, r.gate_presentation_id, r.gate_presented_payload, r.gate_payload_digest, r.gate_refusal_count, r.gate_refusal_generation, r.disk_park_count, r.checkpoint_contains_latest, r.egress_profile_id, r.egress_snapshot, r.job_type, r.finalize_resume_generation, r.job_protocol, r.first_started_at, r.plan_cross_check_required, r.plan_cross_check_gate_reason, r.issue_raw_digest, r.issue_saved_body, r.issue_input_reason, r.auto_approve_blocked_reasons, r.plan_cross_check_diff_refusal, r.worker_recovery_episode, r.requeue_episode_baseline, r.worker_recovery_evidence, r.cross_check_lane, r.cross_check_lane_generation, r.completion_final_head, r.code_cross_check_required, r.provider_park_count, r.provider_park_streak_started_at, r.ci_config_guard, r.memory_episode, r.memory_intervention_count, r.memory_policy, r.completion_non_closing_reason, r.ci_artifact_manifest, r.checkpoint_attested_source, r.source_publication_intent, r.continued_issue_iid, r.checkpoint_coordinates, r.retained_park_count, r.ignored_inferred_capabilities, r.reserve_hold_reason, r.reserve_exempt_until, r.reserve_exempt_granted_at, r.reserve_exempt_credential_id, r.reserve_exempt_window_reset, r.reserve_exempt_prior_pct, r.hinted_capabilities, r.capability_inference_evidence, r.idle_stall_park_count, r.forge_admission, r.codex_select_reason, r.recovery_wait_phase, r.plan_cross_check_gated, r.policy_preserve_required, r.policy_pending_fresh, r.policy_outcome_id, r.policy_continuation_mode, r.policy_resolved_at, r.policy_applying_worker_id, r.policy_applying_generation, r.policy_source_generation, r.policy_refusal_count, r.policy_refusal_tag, r.policy_refusal_phase, r.policy_refusal_correlation_id, r.policy_hold_published, r.harness_preferred, r.harness_decision_reason, r.harness_preferred_score, r.harness_other_score, r.harness_preferred_measured, r.harness_other_measured, r.harness_preferred_held, r.harness_other_held, r.harness_preferred_weekly_reset_at, r.harness_other_weekly_reset_at, r.registration_evidence_generation, r.registration_evidence_nonce, r.registration_evidence_epoch, r.snapshot_departed_generation, r.snapshot_departed_nonce, r.snapshot_departed_epoch, r.repo_agent_source_commit, r.repo_agent_source_required, r.agent_source_requested, r.agent_source_requested_basis, r.plan_agent_source, r.ci_fix_mr_iid, r.policy_required_head, r.policy_recovery_verified_generation, r.policy_recovery_verified_head, r.policy_hold_cause, r.policy_fresh_consumed_generation, r.policy_fresh_confirmed_generation, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
+       c.forge_type,
+       i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
+       -- ListRunsForUser), so the admin overview pill and the claim order agree.
+       -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
+       fn_run_priority_class(r.kind, r.priority, r.created_at < $1) AS priority_class,
+       -- issue #1418: the capture half of the read-path landing_state; the same expression as ListRunsForUser.
+       (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available'))::boolean AS has_available_capture,
+       -- issue #4082: live plan / code cross-check presence; the same two correlated EXISTS
+       -- as ListRunsForUser (see its comment for the source queries they must stay in step with).
+       (EXISTS (
+           SELECT 1 FROM cross_checks cc
+           JOIN runs lead ON lead.id = cc.lead_run_id
+           WHERE lead.id = r.id AND (lead.plan_cross_check_required OR lead.plan_cross_check_gated)
+             -- mirrors runkind.PlanCrossCheckable, which health.go applies in Go
+             AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework')
+             AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
+             AND cc.lead_claim_generation = lead.claim_generation
+             AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+             AND cc.deadline_at > now()
+       ))::boolean AS has_live_plan_cross_check,
+       (EXISTS (
+           SELECT 1
+           FROM runs lead
+           JOIN cross_checks cc ON cc.lead_run_id = lead.id
+           JOIN runs child ON child.id = cc.checker_run_id
+           WHERE lead.id = r.id AND lead.status = 'running'
+            AND lead.code_cross_check_required AND NOT lead.report_only
+            AND lead.fix_verdict IS DISTINCT FROM 'not_code'
+            AND lead.claim_released_at IS NULL AND cc.lead_claim_generation = lead.claim_generation
+            AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework','task')
+            AND lead.harness IN ('claude','codex')
+            AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
+            AND cc.deadline_at > now()
+            AND child.target_run_id = lead.id AND child.kind = 'cross_check'
+            AND child.user_id = lead.user_id AND child.worker_id = lead.worker_id
+            AND child.harness IN ('claude','codex') AND child.harness <> lead.harness
+            AND child.harness = cc.checker_harness
+            AND child.status IN ('queued','claimed','running')
+       ))::boolean AS has_live_code_cross_check
+FROM runs r
+LEFT JOIN repos rp ON rp.id = r.repo_id
+LEFT JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
+LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
+LEFT JOIN workers w ON w.id = r.worker_id
+JOIN users u ON u.id = r.user_id
+WHERE r.kind NOT IN ('chat', 'judge', 'cross_check')
+  AND ($2::uuid IS NULL OR r.user_id = $2::uuid)
+  AND ($3::timestamptz IS NULL OR r.created_at >= $3::timestamptz)
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT $4
+`
+
+type ListRunsAdminDebugParams struct {
+	BackgroundGraceCutoff pgtype.Timestamptz `json:"background_grace_cutoff"`
+	UserID                pgtype.UUID        `json:"user_id"`
+	Since                 pgtype.Timestamptz `json:"since"`
+	MaxRows               int32              `json:"max_rows"`
+}
+
+type ListRunsAdminDebugRow struct {
+	Run                   Run         `json:"run"`
+	RepoPath              pgtype.Text `json:"repo_path"`
+	WorkerName            pgtype.Text `json:"worker_name"`
+	OwnerEmail            string      `json:"owner_email"`
+	ForgeType             pgtype.Text `json:"forge_type"`
+	IssueWebUrl           pgtype.Text `json:"issue_web_url"`
+	PriorityClass         string      `json:"priority_class"`
+	HasAvailableCapture   bool        `json:"has_available_capture"`
+	HasLivePlanCrossCheck bool        `json:"has_live_plan_cross_check"`
+	HasLiveCodeCrossCheck bool        `json:"has_live_code_cross_check"`
+}
+
+// Issue #4198: the admin run debug listing. Runs in EVERY status (terminal included),
+// newest first (created_at, then id as the tiebreak), across all users or one @user_id,
+// optionally created at or after @since, excluding chat, judge, and cross-check runs.
+// The caller asks for one row more than it serves so it can report truncation.
+// Keep in step with ListActiveRunsAll (select list, joins, cross-check flags) and
+// ListRunsForUser (has_available_capture).
+// PRD #1908: LEFT JOINs so a repo-less JOB run (repo_id NULL) is listed with NULL repo_path and
+// forge_type (see ListRunsForUser).
+func (q *Queries) ListRunsAdminDebug(ctx context.Context, arg ListRunsAdminDebugParams) ([]ListRunsAdminDebugRow, error) {
+	rows, err := q.db.Query(ctx, listRunsAdminDebug,
+		arg.BackgroundGraceCutoff,
+		arg.UserID,
+		arg.Since,
+		arg.MaxRows,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunsAdminDebugRow{}
+	for rows.Next() {
+		var i ListRunsAdminDebugRow
+		if err := rows.Scan(
+			&i.Run.ID,
+			&i.Run.UserID,
+			&i.Run.RepoID,
+			&i.Run.IssueIid,
+			&i.Run.IssueTitle,
+			&i.Run.IssueDescription,
+			&i.Run.Status,
+			&i.Run.RequeueCount,
+			&i.Run.WorkerID,
+			&i.Run.SessionID,
+			&i.Run.LastSeq,
+			&i.Run.Branch,
+			&i.Run.MrIid,
+			&i.Run.FailureReason,
+			&i.Run.PlanMd,
+			&i.Run.IterationCount,
+			&i.Run.ClaimedAt,
+			&i.Run.StartedAt,
+			&i.Run.FinishedAt,
+			&i.Run.CreatedAt,
+			&i.Run.UpdatedAt,
+			&i.Run.OriginColumn,
+			&i.Run.BoardColumn,
+			&i.Run.MovePendingSince,
+			&i.Run.MrState,
+			&i.Run.AutoApprove,
+			&i.Run.AutopilotCommentedAt,
+			&i.Run.Kind,
+			&i.Run.PipelineID,
+			&i.Run.PipelineRef,
+			&i.Run.FailureSnapshot,
+			&i.Run.FixVerdict,
+			&i.Run.StopKind,
+			&i.Run.AgentSource,
+			&i.Run.AgentExclusions,
+			&i.Run.RepoAgents,
+			&i.Run.Title,
+			&i.Run.ResumeOfRunID,
+			&i.Run.LastActivityAt,
+			&i.Run.Health,
+			&i.Run.HealthReason,
+			&i.Run.HealthSince,
+			&i.Run.HealthNotifiedAt,
+			&i.Run.TargetRunID,
+			&i.Run.MrWebUrl,
+			&i.Run.PrdDonePath,
+			&i.Run.PrdPatchSettledAt,
+			&i.Run.AnthropicSecretID,
+			&i.Run.AnthropicSecretLabel,
+			&i.Run.AnthropicSelectReason,
+			&i.Run.AnthropicHeadroomPct,
+			&i.Run.WaitOnLimit,
+			&i.Run.LimitResetsAt,
+			&i.Run.RetryNotBefore,
+			&i.Run.LimitWaitCount,
+			&i.Run.RateLimitType,
+			&i.Run.OpenQuestionID,
+			&i.Run.ReviseCount,
+			&i.Run.PlanSource,
+			&i.Run.PlannedBaseCommit,
+			&i.Run.RequireBaseMatch,
+			&i.Run.MilestonesCandidate,
+			&i.Run.MilestonesFrozen,
+			&i.Run.MilestonesCompleted,
+			&i.Run.MilestonesInProgress,
+			&i.Run.BudgetMaxIterations,
+			&i.Run.BudgetWallSeconds,
+			&i.Run.ScheduleID,
+			&i.Run.LimitDeadSecretID,
+			&i.Run.ReportOnly,
+			&i.Run.ReportMd,
+			&i.Run.CiConfigPaths,
+			&i.Run.Model,
+			&i.Run.OverrideSubagentModel,
+			&i.Run.FailOrigin,
+			&i.Run.Priority,
+			&i.Run.SummaryIntent,
+			&i.Run.SummaryPlan,
+			&i.Run.SummaryDeltas,
+			&i.Run.IssueComments,
+			&i.Run.BaseBranch,
+			&i.Run.OpenMr,
+			&i.Run.DispatchedAt,
+			&i.Run.ReviewTargetRunID,
+			&i.Run.ReviewRequested,
+			&i.Run.ThenFixRequested,
+			&i.Run.ThenFixOfRunID,
+			&i.Run.PreservedPatch,
+			&i.Run.RequiredCapabilities,
+			&i.Run.StopReason,
+			&i.Run.RequiredTools,
+			&i.Run.SizeClass,
+			&i.Run.Interactive,
+			&i.Run.OpenFollowupID,
+			&i.Run.PlanChangedFiles,
+			&i.Run.ScopeCeiling,
+			&i.Run.StatusSince,
+			&i.Run.ReviewComments,
+			&i.Run.BudgetPausedSeconds,
+			&i.Run.MrReworkEnabled,
+			&i.Run.TriggerSource,
+			&i.Run.CheckpointTip,
+			&i.Run.UsageRefolded,
+			&i.Run.CodexSecretID,
+			&i.Run.CodexAuthMode,
+			&i.Run.CodexSecretLabel,
+			&i.Run.CodexAccountKey,
+			&i.Run.CodexMaterialRevision,
+			&i.Run.CodexAccountRevision,
+			&i.Run.CodexClaimEpoch,
+			&i.Run.CodexCapHash,
+			&i.Run.PauseRequestedAt,
+			&i.Run.PauseMode,
+			&i.Run.PauseAfterCount,
+			&i.Run.CheckpointTipAt,
+			&i.Run.RecoveryWaitCount,
+			&i.Run.RecoveryRetryNotBefore,
+			&i.Run.CompletionContractVersion,
+			&i.Run.ContractRevision,
+			&i.Run.CompletionContract,
+			&i.Run.CompletionAttempts,
+			&i.Run.LatestCompletionAttempt,
+			&i.Run.MilestonesAgents,
+			&i.Run.HoldReason,
+			&i.Run.HoldCapturedHead,
+			&i.Run.CompletionBudgetExhaustedAt,
+			&i.Run.CompletionQuestionAt,
+			&i.Run.BudgetExtensionSeconds,
+			&i.Run.ClaimGeneration,
+			&i.Run.Harness,
+			&i.Run.RecoveryWaitCause,
+			&i.Run.ForgeParkCount,
+			&i.Run.CredentialOverrideMode,
+			&i.Run.CredentialOverrideSecretID,
+			&i.Run.ClaimReleasedAt,
+			&i.Run.CredentialSwitchRequestedAt,
+			&i.Run.CredentialSwitchGeneration,
+			&i.Run.StaleRequeueGeneration,
+			&i.Run.BudgetFinalizeSeconds,
+			&i.Run.ReleasedWorkerID,
+			&i.Run.ReleasedWorkerNonce,
+			&i.Run.GateRevision,
+			&i.Run.GatePresentationID,
+			&i.Run.GatePresentedPayload,
+			&i.Run.GatePayloadDigest,
+			&i.Run.GateRefusalCount,
+			&i.Run.GateRefusalGeneration,
+			&i.Run.DiskParkCount,
+			&i.Run.CheckpointContainsLatest,
+			&i.Run.EgressProfileID,
+			&i.Run.EgressSnapshot,
+			&i.Run.JobType,
+			&i.Run.FinalizeResumeGeneration,
+			&i.Run.JobProtocol,
+			&i.Run.FirstStartedAt,
+			&i.Run.PlanCrossCheckRequired,
+			&i.Run.PlanCrossCheckGateReason,
+			&i.Run.IssueRawDigest,
+			&i.Run.IssueSavedBody,
+			&i.Run.IssueInputReason,
+			&i.Run.AutoApproveBlockedReasons,
+			&i.Run.PlanCrossCheckDiffRefusal,
+			&i.Run.WorkerRecoveryEpisode,
+			&i.Run.RequeueEpisodeBaseline,
+			&i.Run.WorkerRecoveryEvidence,
+			&i.Run.CrossCheckLane,
+			&i.Run.CrossCheckLaneGeneration,
+			&i.Run.CompletionFinalHead,
+			&i.Run.CodeCrossCheckRequired,
+			&i.Run.ProviderParkCount,
+			&i.Run.ProviderParkStreakStartedAt,
+			&i.Run.CiConfigGuard,
+			&i.Run.MemoryEpisode,
+			&i.Run.MemoryInterventionCount,
+			&i.Run.MemoryPolicy,
+			&i.Run.CompletionNonClosingReason,
+			&i.Run.CiArtifactManifest,
+			&i.Run.CheckpointAttestedSource,
+			&i.Run.SourcePublicationIntent,
+			&i.Run.ContinuedIssueIid,
+			&i.Run.CheckpointCoordinates,
+			&i.Run.RetainedParkCount,
+			&i.Run.IgnoredInferredCapabilities,
+			&i.Run.ReserveHoldReason,
+			&i.Run.ReserveExemptUntil,
+			&i.Run.ReserveExemptGrantedAt,
+			&i.Run.ReserveExemptCredentialID,
+			&i.Run.ReserveExemptWindowReset,
+			&i.Run.ReserveExemptPriorPct,
+			&i.Run.HintedCapabilities,
+			&i.Run.CapabilityInferenceEvidence,
+			&i.Run.IdleStallParkCount,
+			&i.Run.ForgeAdmission,
+			&i.Run.CodexSelectReason,
+			&i.Run.RecoveryWaitPhase,
+			&i.Run.PlanCrossCheckGated,
+			&i.Run.PolicyPreserveRequired,
+			&i.Run.PolicyPendingFresh,
+			&i.Run.PolicyOutcomeID,
+			&i.Run.PolicyContinuationMode,
+			&i.Run.PolicyResolvedAt,
+			&i.Run.PolicyApplyingWorkerID,
+			&i.Run.PolicyApplyingGeneration,
+			&i.Run.PolicySourceGeneration,
+			&i.Run.PolicyRefusalCount,
+			&i.Run.PolicyRefusalTag,
+			&i.Run.PolicyRefusalPhase,
+			&i.Run.PolicyRefusalCorrelationID,
+			&i.Run.PolicyHoldPublished,
+			&i.Run.HarnessPreferred,
+			&i.Run.HarnessDecisionReason,
+			&i.Run.HarnessPreferredScore,
+			&i.Run.HarnessOtherScore,
+			&i.Run.HarnessPreferredMeasured,
+			&i.Run.HarnessOtherMeasured,
+			&i.Run.HarnessPreferredHeld,
+			&i.Run.HarnessOtherHeld,
+			&i.Run.HarnessPreferredWeeklyResetAt,
+			&i.Run.HarnessOtherWeeklyResetAt,
+			&i.Run.RegistrationEvidenceGeneration,
+			&i.Run.RegistrationEvidenceNonce,
+			&i.Run.RegistrationEvidenceEpoch,
+			&i.Run.SnapshotDepartedGeneration,
+			&i.Run.SnapshotDepartedNonce,
+			&i.Run.SnapshotDepartedEpoch,
+			&i.Run.RepoAgentSourceCommit,
+			&i.Run.RepoAgentSourceRequired,
+			&i.Run.AgentSourceRequested,
+			&i.Run.AgentSourceRequestedBasis,
+			&i.Run.PlanAgentSource,
+			&i.Run.CiFixMrIid,
+			&i.Run.PolicyRequiredHead,
+			&i.Run.PolicyRecoveryVerifiedGeneration,
+			&i.Run.PolicyRecoveryVerifiedHead,
+			&i.Run.PolicyHoldCause,
+			&i.Run.PolicyFreshConsumedGeneration,
+			&i.Run.PolicyFreshConfirmedGeneration,
+			&i.RepoPath,
+			&i.WorkerName,
+			&i.OwnerEmail,
+			&i.ForgeType,
+			&i.IssueWebUrl,
+			&i.PriorityClass,
+			&i.HasAvailableCapture,
+			&i.HasLivePlanCrossCheck,
+			&i.HasLiveCodeCrossCheck,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunsForUser = `-- name: ListRunsForUser :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, r.pause_requested_at, r.pause_mode, r.pause_after_count, r.checkpoint_tip_at, r.recovery_wait_count, r.recovery_retry_not_before, r.completion_contract_version, r.contract_revision, r.completion_contract, r.completion_attempts, r.latest_completion_attempt, r.milestones_agents, r.hold_reason, r.hold_captured_head, r.completion_budget_exhausted_at, r.completion_question_at, r.budget_extension_seconds, r.claim_generation, r.harness, r.recovery_wait_cause, r.forge_park_count, r.credential_override_mode, r.credential_override_secret_id, r.claim_released_at, r.credential_switch_requested_at, r.credential_switch_generation, r.stale_requeue_generation, r.budget_finalize_seconds, r.released_worker_id, r.released_worker_nonce, r.gate_revision, r.gate_presentation_id, r.gate_presented_payload, r.gate_payload_digest, r.gate_refusal_count, r.gate_refusal_generation, r.disk_park_count, r.checkpoint_contains_latest, r.egress_profile_id, r.egress_snapshot, r.job_type, r.finalize_resume_generation, r.job_protocol, r.first_started_at, r.plan_cross_check_required, r.plan_cross_check_gate_reason, r.issue_raw_digest, r.issue_saved_body, r.issue_input_reason, r.auto_approve_blocked_reasons, r.plan_cross_check_diff_refusal, r.worker_recovery_episode, r.requeue_episode_baseline, r.worker_recovery_evidence, r.cross_check_lane, r.cross_check_lane_generation, r.completion_final_head, r.code_cross_check_required, r.provider_park_count, r.provider_park_streak_started_at, r.ci_config_guard, r.memory_episode, r.memory_intervention_count, r.memory_policy, r.completion_non_closing_reason, r.ci_artifact_manifest, r.checkpoint_attested_source, r.source_publication_intent, r.continued_issue_iid, r.checkpoint_coordinates, r.retained_park_count, r.ignored_inferred_capabilities, r.reserve_hold_reason, r.reserve_exempt_until, r.reserve_exempt_granted_at, r.reserve_exempt_credential_id, r.reserve_exempt_window_reset, r.reserve_exempt_prior_pct, r.hinted_capabilities, r.capability_inference_evidence, r.idle_stall_park_count, r.forge_admission, r.codex_select_reason, r.recovery_wait_phase, r.plan_cross_check_gated, r.policy_preserve_required, r.policy_pending_fresh, r.policy_outcome_id, r.policy_continuation_mode, r.policy_resolved_at, r.policy_applying_worker_id, r.policy_applying_generation, r.policy_source_generation, r.policy_refusal_count, r.policy_refusal_tag, r.policy_refusal_phase, r.policy_refusal_correlation_id, r.policy_hold_published, r.harness_preferred, r.harness_decision_reason, r.harness_preferred_score, r.harness_other_score, r.harness_preferred_measured, r.harness_other_measured, r.harness_preferred_held, r.harness_other_held, r.harness_preferred_weekly_reset_at, r.harness_other_weekly_reset_at, r.registration_evidence_generation, r.registration_evidence_nonce, r.registration_evidence_epoch, r.snapshot_departed_generation, r.snapshot_departed_nonce, r.snapshot_departed_epoch, r.repo_agent_source_commit, r.repo_agent_source_required, r.agent_source_requested, r.agent_source_requested_basis, r.plan_agent_source, r.ci_fix_mr_iid, r.policy_required_head, r.policy_recovery_verified_generation, r.policy_recovery_verified_head, r.policy_hold_cause, r.policy_fresh_consumed_generation, r.policy_fresh_confirmed_generation, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
