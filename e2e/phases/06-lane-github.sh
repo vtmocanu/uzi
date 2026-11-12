@@ -16,12 +16,10 @@
 #
 # Connection mechanism (same shape as the Forgejo lane): the harness flips the
 # boot-seeded connection's forge_type to 'github' directly in the THROWAWAY test DB
-# rather than creating a github connection through the product. This is a NETWORK-
-# ALIASING workaround, not a gate one: post-M10 CreateConnection accepts github, but
-# the driver derives its API host as api.<web-host>, which for the fake would be
-# api.forge-fake.e2e — a name the e2e overlay does not alias — whereas the seeded
-# base_url (https://forge-fake.e2e) plus go-github's /api/v3 enterprise mount lands
-# the driver on the fake's shared table directly. migration 00102's CHECK admits
+# rather than creating a github connection through the product, reusing the seeded
+# connection. With the seeded base_url (https://forge-fake.e2e) both drivers target
+# the fake's shared /api/v3 table: go-github's enterprise mount on the api side, and
+# the worker's <host>/api/v3 derivation for a non-github.com host. migration 00102's CHECK admits
 # 'github', the sealed PAT is forge-agnostic (a classic-PAT shape — no github_pat_
 # prefix), and the base_url is unchanged. Test state only — no api/seed change.
 #
