@@ -30,10 +30,11 @@
 # ProjectRole + branch-protection rulesets (D6), issue create + R4 PR filter, the
 # Actions two-field status/conclusion collapse (D8), and the CI-fix trigger gate.
 # It does NOT drive a worker run: the worker's GitHubClient (agent/src/forge.ts) IS
-# wired into runner.ts (the 3-way forge pick), but its api.github.com host derivation
-# has no network alias here — so the worker PR path is validated at the FAKE (direct
-# /api/v3 /pulls create+dup smoke) and by the runner-push-mr unit test, rather than
-# through a live claim in this lane. See the run report.
+# wired into runner.ts (the 3-way forge pick). For this non-github.com host it derives
+# https://forge-fake.e2e/api/v3, the fake's own table, but this lane still does not
+# claim a run: the worker PR path is validated at the FAKE (direct /api/v3 /pulls
+# create+dup smoke), by the runner-push-mr unit test and by test:forge-fake-contract,
+# rather than through a live claim in this lane. See the run report.
 # =============================================================================
 say "PRD #238 M8 (GitHub lane): flip the seeded connection to github in the test DB"
 GHFLIP="$(db_psql "UPDATE forge_connections SET forge_type='github' WHERE forge_type='gitlab' RETURNING id")"
