@@ -39,8 +39,10 @@ export function HealthChip() {
   }, []);
 
   // The chip sits left of centre in the header, so a panel right-aligned to it can run past the
-  // viewport's left edge at sm+. Measure and clamp it into the visible width. Below sm the
-  // fixed bottom sheet places itself, so no inline style there (it would override inset-x-4).
+  // viewport's left edge at sm+. Prefer the chip's right edge, then its left edge, and only then
+  // clamp into the visible width, so the panel stays attached to the chip and off the sidebar.
+  // Below sm the fixed bottom sheet places itself, so no inline style there (it would override
+  // inset-x-4). The query uses Tailwind's rem breakpoint so both switch at the same width.
   const [panelLeft, setPanelLeft] = useState<number | null>(null);
   useLayoutEffect(() => {
     if (!open) {
@@ -48,7 +50,7 @@ export function HealthChip() {
       return;
     }
     // jsdom has no matchMedia: treat it as "not sm+" and leave the CSS placement alone.
-    const mq = window.matchMedia?.("(min-width: 640px)");
+    const mq = window.matchMedia?.("(min-width: 40rem)");
     const place = () => {
       const host = hostRef.current;
       const panel = panelRef.current;
@@ -59,7 +61,8 @@ export function HealthChip() {
       const hostRect = host.getBoundingClientRect();
       const width = panel.offsetWidth;
       const max = document.documentElement.clientWidth - 16 - width;
-      const abs = Math.max(16, Math.min(hostRect.right - width, max));
+      const preferred = hostRect.right - width >= 16 ? hostRect.right - width : hostRect.left;
+      const abs = Math.max(16, Math.min(preferred, max));
       setPanelLeft(abs - hostRect.left);
     };
     place();
@@ -150,7 +153,7 @@ export function HealthChip() {
           aria-label="System health"
           tabIndex={-1}
           style={panelLeft == null ? undefined : { left: panelLeft, right: "auto" }}
-          // Same placement as PeopleChip: below the chip on desktop, a bottom sheet below sm.
+          // Below the chip at sm+ (placed by the layout effect above), a bottom sheet below sm.
           className="absolute right-0 top-full z-30 mt-2 max-h-[70vh] w-[min(40rem,calc(100vw-32px))] overflow-y-auto rounded-xl border border-edge bg-raised text-left shadow-2xl outline-hidden max-sm:fixed max-sm:inset-x-4 max-sm:bottom-4 max-sm:top-auto max-sm:mt-0 max-sm:max-h-[calc(100dvh-2rem)] max-sm:w-auto"
         >
           <div className="space-y-3 p-3">

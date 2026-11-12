@@ -1458,8 +1458,32 @@ describe("OverviewNext health chip popover", () => {
       const visibleWidth = document.documentElement.clientWidth;
       expect.soft(r.left, `left edge at ${width}px`).toBeGreaterThanOrEqual(15);
       expect.soft(r.right, `right edge at ${width}px`).toBeLessThanOrEqual(visibleWidth - 15);
-      expect.soft(r.top, `below the chip at ${width}px`).toBeGreaterThanOrEqual(chip.getBoundingClientRect().bottom);
+      const c = chip.getBoundingClientRect();
+      expect.soft(r.top, `below the chip at ${width}px`).toBeGreaterThanOrEqual(c.bottom);
+      // Attached to the chip: right-aligned when that fits, otherwise left-aligned when that fits.
+      if (c.right - r.width >= 16) {
+        expect.soft(Math.abs(r.right - c.right), `right-aligned to the chip at ${width}px`).toBeLessThanOrEqual(1);
+      } else if (c.left + r.width <= visibleWidth - 16) {
+        expect.soft(Math.abs(r.left - c.left), `left-aligned to the chip at ${width}px`).toBeLessThanOrEqual(1);
+      }
     }
+  });
+
+  it("re-places the open panel on resize, switching to the bottom sheet below sm", async () => {
+    await page.viewport(1280, 900);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    await page.viewport(700, 900);
+    await expect.poll(() => dialog.getBoundingClientRect().left, "left edge after resize to 700").toBeGreaterThanOrEqual(15);
+    expect(dialog.getBoundingClientRect().right, "right edge after resize to 700").toBeLessThanOrEqual(
+      document.documentElement.clientWidth - 15,
+    );
+    await page.viewport(500, 900);
+    await expect
+      .poll(() => Math.abs(dialog.getBoundingClientRect().left - 16), "bottom-sheet left inset after resize to 500")
+      .toBeLessThanOrEqual(1);
+    expect(dialog.style.left, "no inline placement on the bottom sheet").toBe("");
   });
 
   it("stays inside the viewport as a bottom sheet at 375px", async () => {
