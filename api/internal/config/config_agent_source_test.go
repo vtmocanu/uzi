@@ -73,7 +73,8 @@ func TestAnthropicGatewayBaseURLAllowed(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{"https://evil.example.com", "http://gw.example.com", "https://shared.example.com/v1/acct2",
-		"https://shared.example.com/v1", "https://shared.example.com"} {
+		"https://shared.example.com/v1", "https://shared.example.com",
+		"https://shared.example.com/v1/acct/../other", "https://shared.example.com/v1/acct/%2e%2e/other", "https://shared.example.com/v1/acct/./x"} {
 		if c.AnthropicGatewayBaseURLAllowed(bad) {
 			t.Errorf("%q allowed", bad)
 		}

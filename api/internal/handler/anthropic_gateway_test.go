@@ -11,6 +11,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
 	"github.com/vtmocanu/uzi/api/internal/config"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -98,5 +99,33 @@ func TestGatewayOutcome(t *testing.T) {
 				t.Fatalf("status = %q after %d probes, want %q after 1", got.Status, fake.calls, tc.want)
 			}
 		})
+	}
+}
+
+// While a gateway is configured a worker without anthropic_gateway_v1 claims nothing: an
+// older worker would send the saved gateway key to api.anthropic.com.
+func TestWorkerClaimRefusesWorkersWithoutGatewaySupport(t *testing.T) {
+	h := gatewayHandler(nil, store.AppSetting{Key: settings.KeyAnthropicGatewayBaseURL, Value: "https://gw.example.com"})
+	req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/claim?lane=chat", nil)
+	req = req.WithContext(mw.ContextWithWorker(req.Context(), store.Worker{ProtocolCapabilities: []string{"pending_outcome_scoped_claim_v1"}}))
+	rec := httptest.NewRecorder()
+	h.WorkerClaim(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (no claim) for a worker without gateway support", rec.Code)
+	}
+}
+
+type gatewayFailingSettings struct{}
+
+func (gatewayFailingSettings) ListAppSettings(context.Context) ([]store.AppSetting, error) {
+	return nil, errors.New("settings read failed")
+}
+
+// A failed settings read must read as "configured": the safe answer when it decides
+// whether a token may go to api.anthropic.com.
+func TestGatewayConfiguredOnSettingsReadFailure(t *testing.T) {
+	c := settings.New(gatewayFailingSettings{}, time.Minute)
+	if !c.AnthropicGatewayConfigured(context.Background()) {
+		t.Fatal("a failed settings read reported no gateway")
 	}
 }

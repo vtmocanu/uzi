@@ -120,6 +120,8 @@ up on their next heartbeat. Turn the gateway on before users save gateway keys:
 a key tested or polled against Anthropic first is marked rejected until its owner
 presses **Test** again. A saved gateway whose URL the operator no longer allows is
 blocked: Claude runs fail rather than send gateway keys to Anthropic.
+While a gateway is set, a worker too old to route through it claims no work, so
+upgrade workers before turning the gateway on.
 
 ## Run judge
 

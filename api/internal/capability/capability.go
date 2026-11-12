@@ -343,7 +343,14 @@ const RecoveryBindinglessClosedV1 = "recovery_bindingless_closed_v1"
 // RecoveryRunOpenHoldsV1 negotiates the run-wide open-hold count on the worker recovery-holds read.
 const RecoveryRunOpenHoldsV1 = "recovery_run_open_holds_v1"
 
+// AnthropicGatewayV1: the worker routes the Claude CLI through the Anthropic-compatible
+// gateway it learns on register/heartbeat (blocked included). While a gateway is configured
+// the api hands no claim to a worker that lacks it, since an older worker would send the
+// saved gateway key to api.anthropic.com.
+const AnthropicGatewayV1 = "anthropic_gateway_v1"
+
 var protocolVocabulary = map[string]struct{}{
+	AnthropicGatewayV1:              {},
 	RecoveryRunOpenHoldsV1:          {},
 	RecoveryBindinglessClosedV1:     {},
 	ProviderPolicyHoldV1:            {},
@@ -401,7 +408,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{ProviderPolicyHoldV1, PendingOutcomeScopedClaimV1, ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryBindinglessClosedV1, RecoveryRunOpenHoldsV1, RecoveryPrerequisiteClosureV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckGatedV1, CrossCheckSemanticPlanV1, CrossCheckOwnerSteeringV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, RepoAgentSourceV1, AgentSourceRequestV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1}
+var protocolOrder = []string{ProviderPolicyHoldV1, PendingOutcomeScopedClaimV1, ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryBindinglessClosedV1, RecoveryRunOpenHoldsV1, RecoveryPrerequisiteClosureV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckGatedV1, CrossCheckSemanticPlanV1, CrossCheckOwnerSteeringV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, RepoAgentSourceV1, AgentSourceRequestV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1, AnthropicGatewayV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

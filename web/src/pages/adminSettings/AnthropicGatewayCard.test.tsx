@@ -54,4 +54,21 @@ describe("AnthropicGatewayCard", () => {
     });
     expect(button().disabled).toBe(true);
   });
+
+  it("takes a sibling save's confirmed values for untouched fields and keeps an edit", async () => {
+    mockApi.updateSettings.mockImplementation(async (body) => ({ settings: settings(body as Partial<AppSettings>), secrets: {}, sources: {}, slack_status: "disabled" }) as SettingsResponse);
+    const { rerender } = render(<AnthropicGatewayCard settings={settings({ anthropic_gateway_base_url: "https://old.example.com", anthropic_gateway_auth_header: "authorization", anthropic_gateway_models: "opus=a" })} onSaved={() => {}} />);
+    fireEvent.change(model("haiku"), { target: { value: "gw-haiku" } });
+    rerender(<AnthropicGatewayCard settings={settings({ anthropic_gateway_base_url: "https://new.example.com", anthropic_gateway_auth_header: "x-api-key", anthropic_gateway_models: "opus=b" })} onSaved={() => {}} />);
+    expect(url().value).toBe("https://new.example.com");
+    expect(model("opus").value).toBe("b");
+    expect(model("haiku").value).toBe("gw-haiku");
+    fireEvent.click(button());
+    expect(await screen.findByText("Claude gateway settings saved.")).toBeTruthy();
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({
+      anthropic_gateway_base_url: "https://new.example.com",
+      anthropic_gateway_auth_header: "x-api-key",
+      anthropic_gateway_models: "opus=b,haiku=gw-haiku",
+    });
+  });
 });

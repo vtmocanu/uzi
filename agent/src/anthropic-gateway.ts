@@ -38,10 +38,13 @@ export function anthropicGateway(): AnthropicGateway | undefined {
   return current;
 }
 
-/** Replace the gateway from a register/heartbeat field. null or absent clears it (no
- *  gateway configured, or an api without the feature): the CLI talks to Anthropic. A
- *  blocked or unreadable field blocks: a gateway exists, so the token is its key. */
+/** Replace the gateway from a register/heartbeat field. null clears it (no gateway
+ *  configured): the CLI talks to Anthropic. Absent keeps the current value. A blocked or
+ *  unreadable field blocks: a gateway exists, so the token is its key. */
 export function setAnthropicGatewayFromWire(wire: unknown): void {
+  // An ABSENT field (an older api pod mid-rollout) is no information: keep what we know.
+  // Only an explicit null turns the gateway off.
+  if (wire === undefined) return;
   current = decodeAnthropicGateway(wire);
 }
 

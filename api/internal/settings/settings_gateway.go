@@ -49,9 +49,12 @@ func (c *Cache) AnthropicGateway(ctx context.Context) (anthropic.Gateway, bool, 
 // or not. A configured gateway that cannot be used (invalid, or its host no longer
 // allowlisted) is BLOCKED, not off: the saved tokens are gateway keys, so nothing may
 // send them to api.anthropic.com.
+//
+// A failed settings read counts as configured: the safe reading when the answer decides
+// whether a token may go to api.anthropic.com.
 func (c *Cache) AnthropicGatewayConfigured(ctx context.Context) bool {
-	base, _ := c.get(ctx, KeyAnthropicGatewayBaseURL)
-	return base != ""
+	base, err := c.get(ctx, KeyAnthropicGatewayBaseURL)
+	return err != nil || base != ""
 }
 
 // validateGatewayBaseURL: empty is off; otherwise an absolute https URL with no

@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle, Select } from "../../components/ui";
@@ -61,6 +61,23 @@ export function AnthropicGatewayCard({ settings, onSaved }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+
+  // A sibling card's save replaces `settings` with the server's confirmed values. Take the
+  // new value for every field the admin has not edited, so a later save here never writes
+  // back a stale URL or header; an edited field keeps the edit.
+  const confirmed = useRef({ url: savedURL, header: savedHeader, models: parseModels(savedModels) });
+  useEffect(() => {
+    const prev = confirmed.current;
+    const nextModels = parseModels(savedModels);
+    setURL((cur) => (cur === prev.url ? savedURL : cur));
+    setHeader((cur) => (cur === prev.header ? savedHeader : cur));
+    setModels((cur) => {
+      const out = { ...cur };
+      for (const a of ALIASES) if (cur[a] === prev.models[a]) out[a] = nextModels[a];
+      return out;
+    });
+    confirmed.current = { url: savedURL, header: savedHeader, models: nextModels };
+  }, [savedURL, savedHeader, savedModels]);
 
   const encoded = encodeModels(models);
   const dirty = url !== savedURL || header !== savedHeader || encoded !== encodeModels(parseModels(savedModels));

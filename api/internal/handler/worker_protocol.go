@@ -1176,6 +1176,15 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
+	// Every claim lane can release the owner's Anthropic token. While a gateway is
+	// configured (blocked included) that token is a gateway key, and a worker that does not
+	// route through the gateway would send it to api.anthropic.com: such a worker claims
+	// nothing until it upgrades.
+	if h.settings != nil && h.settings.AnthropicGatewayConfigured(r.Context()) &&
+		!slices.Contains(wkr.ProtocolCapabilities, capability.AnthropicGatewayV1) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 
 	switch r.URL.Query().Get("lane") {
 	case "chat":

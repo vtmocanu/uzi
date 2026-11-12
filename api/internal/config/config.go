@@ -2284,6 +2284,13 @@ func normalizeGatewayURL(raw string) (string, error) {
 	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return "", fmt.Errorf("%q must be an https URL with no credentials, query or fragment", raw)
 	}
+	// A dot segment, plain or percent-encoded, could resolve outside an allowlisted path on
+	// the receiving side (…/acct/../other).
+	for _, seg := range strings.Split(u.EscapedPath(), "/") {
+		if dec, err := url.PathUnescape(seg); err != nil || dec == "." || dec == ".." {
+			return "", fmt.Errorf("%q must not contain dot path segments", raw)
+		}
+	}
 	return "https://" + strings.ToLower(u.Host) + strings.TrimRight(u.EscapedPath(), "/"), nil
 }
 

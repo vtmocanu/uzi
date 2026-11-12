@@ -62,6 +62,12 @@ describe("anthropic gateway", () => {
     assert.strictEqual(env.ANTHROPIC_AUTH_TOKEN, undefined);
   });
 
+  it("an absent field keeps the gateway (an older api pod mid-rollout); only null clears it", () => {
+    setAnthropicGatewayFromWire({ base_url: "https://gw.example.com", auth_header: "authorization" });
+    setAnthropicGatewayFromWire(undefined);
+    assert.strictEqual(anthropicGateway()?.baseUrl, "https://gw.example.com");
+  });
+
   it("a null wire clears the gateway, so the CLI talks to Anthropic directly again", () => {
     setAnthropicGatewayFromWire({ base_url: "https://gw.example.com", auth_header: "authorization" });
     assert.ok(anthropicGateway());

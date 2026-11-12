@@ -281,6 +281,9 @@ it("register and every ordinary heartbeat set or clear the Anthropic-compatible 
     const f = fixture({ anthropic_gateway: gw });
     await f.client.register("w");
     assert.equal(anthropicGateway()?.baseUrl, "https://gw.example.com");
+    f.setReply(() => json({ protocol_features: [] }));
+    await f.client.heartbeat();
+    assert.equal(anthropicGateway()?.baseUrl, "https://gw.example.com", "an older api pod omitting the field must not clear it");
     f.setReply(() => json({ anthropic_gateway: null }));
     await f.client.heartbeat();
     assert.equal(anthropicGateway(), undefined, "a null heartbeat field turns the gateway off");

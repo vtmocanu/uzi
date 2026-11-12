@@ -1092,6 +1092,10 @@ export class Worker {
           if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
         }
         protocolCapabilities.push("pending_outcome_scoped_claim_v1");
+        // This build routes the Claude CLI through the admin's Anthropic-compatible gateway
+        // (anthropic-gateway.ts); while one is configured the api gives no claim to a worker
+        // without it, since that worker would send the gateway key to api.anthropic.com.
+        protocolCapabilities.push("anthropic_gateway_v1");
         // The compact policy hold promises a durable local outcome journal and the active-run snapshot
         // registry. Advertise only while both are usable; these are the same preconditions
         // RunRunner.executeClaimInAttempt checks before it reserves a policy flight, so a claim the
