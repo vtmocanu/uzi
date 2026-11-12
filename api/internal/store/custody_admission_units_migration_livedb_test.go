@@ -23,7 +23,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #4162: migration 00424 redefines fn_custody_admission_count / _members to count admission
+// Issue #4162: migration 00427 redefines fn_custody_admission_count / _members to count admission
 // UNITS. These tests pin its Down, the operator rollback script (scripts/custody-admission-units-
 // rollback.sql, for running the previous api image against an upgraded database), the script's
 // version coupling to the migration filename, and the hazard the script exists for: the previous

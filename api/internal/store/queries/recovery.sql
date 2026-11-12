@@ -762,7 +762,7 @@ FROM admission;
 -- name: ListCustodyAdmissionMembersForOwner :many
 -- Issue #2970: per-hold custody admission membership for the owner hold list, one row per
 -- state='open' hold. counted mirrors fn_custody_admission_count membership and reason names the
--- first matching cause (closed vocabulary, see migrations 00336 and 00424: same_run_group marks a
+-- first matching cause (closed vocabulary, see migrations 00336 and 00427: same_run_group marks a
 -- hold counted once with its run's representative hold on the same worker). Read-only visibility only:
 -- admission accounting stays on fn_custody_admission_count. Callers pass the SAME
 -- @heartbeat_cutoff as GetCustodyAggregateForOwner so both read one cutoff. Explicit casts type

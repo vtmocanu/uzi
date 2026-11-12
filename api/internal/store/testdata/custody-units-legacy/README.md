@@ -20,5 +20,5 @@ rollback script `scripts/custody-admission-units-rollback.sql` can be exercised.
 The test reads the fixtures without invoking Git, executes via tx.Exec (discarding the
 historic RETURNING projection) in a transaction it always rolls back, and binds fields
 in the archived method argument order. It documents the hazard of the previous image on
-grouped accounting: with migration 00424 applied, this ClaimRun admits a queued run
+grouped accounting: with migration 00427 applied, this ClaimRun admits a queued run
 whose own open holds already equal the limit; after the rollback script it refuses.

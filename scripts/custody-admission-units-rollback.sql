@@ -1,19 +1,19 @@
--- Rollback of the custody admission units migration (issue #4162, migration 00424) for
+-- Rollback of the custody admission units migration (issue #4162, migration 00427) for
 -- operators who must run the PREVIOUS api image against an already-upgraded database.
 --
--- Why: the previous api image's ClaimRun calls fn_custody_admission_count, which the 00424
+-- Why: the previous api image's ClaimRun calls fn_custody_admission_count, which the 00427
 -- migration redefines to count admission UNITS. Without the hard per-run bound that ships in
 -- the same image, the old binary would admit a run whose own open holds already reach the
 -- limit. This script restores the 00310 / 00336 function bodies (byte-for-byte the Down block
--- of 00424_custody_admission_units.sql) and removes the goose row for version 424, so a later
--- upgrade re-applies 00424 Up.
+-- of 00427_custody_admission_units.sql) and removes the goose row for version 427, so a later
+-- upgrade re-applies 00427 Up.
 --
--- Valid only while 424 is the head: the guard below refuses unless goose version 424 is
+-- Valid only while 427 is the head: the guard below refuses unless goose version 427 is
 -- applied AND is the highest applied version. Run it with the UPGRADED api stopped, before
 -- starting the previous image. It is non-destructive: it only replaces two functions and
 -- deletes one goose bookkeeping row; no hold, run, worker or capture state changes.
 --
--- If migration 00424 is renumbered at merge, update ALL FIVE occurrences of 424 below (the
+-- If migration 00427 is renumbered at merge, update ALL FIVE occurrences of 427 below (the
 -- guard, the two refusal messages, the IS DISTINCT FROM comparison and the DELETE); the migration test custody_admission_units_migration_livedb_test.go fails
 -- when the number here differs from the migration filename prefix.
 --
@@ -24,12 +24,12 @@ DO $$
 DECLARE
   head_version bigint;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM goose_db_version WHERE version_id = 424 AND is_applied) THEN
-    RAISE EXCEPTION 'custody admission units rollback refused: goose version 424 is not applied';
+  IF NOT EXISTS (SELECT 1 FROM goose_db_version WHERE version_id = 427 AND is_applied) THEN
+    RAISE EXCEPTION 'custody admission units rollback refused: goose version 427 is not applied';
   END IF;
   SELECT max(version_id) INTO head_version FROM goose_db_version WHERE is_applied;
-  IF head_version IS DISTINCT FROM 424 THEN
-    RAISE EXCEPTION 'custody admission units rollback refused: 424 is not the head migration (head is %)', head_version;
+  IF head_version IS DISTINCT FROM 427 THEN
+    RAISE EXCEPTION 'custody admission units rollback refused: 427 is not the head migration (head is %)', head_version;
   END IF;
 END
 $$;
@@ -134,6 +134,6 @@ RETURNS TABLE(hold_id uuid, counted boolean, reason text) LANGUAGE sql STABLE AS
  FROM ranked k
 $$;
 
-DELETE FROM goose_db_version WHERE version_id = 424;
+DELETE FROM goose_db_version WHERE version_id = 427;
 
 COMMIT;
