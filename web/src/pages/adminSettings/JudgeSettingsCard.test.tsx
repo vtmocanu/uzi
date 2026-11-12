@@ -94,3 +94,16 @@ describe("JudgeSettingsCard judge harness copy (#3257)", () => {
     expect(help).not.toContain("The judge runs on the harness of the run it reviews");
   });
 });
+
+// PRD #3257 M2: the enforce help says a user with no usable credential is skipped WITH A REASON
+// SHOWN (the run page's skip notice), matching AfterAdmin.dc.html, and still that the other
+// provider is never charged.
+describe("JudgeSettingsCard skip copy (#3257 M2)", () => {
+  it("says a user with no usable credential is skipped with a reason shown, never charged elsewhere", () => {
+    renderCard();
+    const help = screen.getByText(/Before\s+enforcing/).textContent?.replace(/\s+/g, " ") ?? "";
+    expect(help).toContain(
+      "A user with no usable credential for that harness is skipped, with a reason shown on the run, and is never charged to the other provider.",
+    );
+  });
+});

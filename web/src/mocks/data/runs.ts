@@ -2209,6 +2209,18 @@ mockRuns.push({
   usage_estimated_tail: null,
 });
 
+// PRD #3257 M2: the judge-skipped fixture. A terminal Claude issue run with no review and no
+// pending judge, paired with a mockJudgeSkips row, so /runs/run-judge-skipped shows the run-review
+// panel's skip notice. Derived from run-unjudged (whose own job is the never-judged state and
+// must stay skip-free) so every other field stays realistic.
+mockRuns.push({
+  ...mockRuns.find((r) => r.id === "run-unjudged")!,
+  id: "run-judge-skipped", issue_iid: 21,
+  issue_title: "Rotate worker registration tokens on a schedule",
+  issue_description: "", branch: "agent/issue-21",
+  mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/44", mr_iid: 44,
+});
+
 // PRD #3708: gated plan cross-check runs (checked before your review), from the parked gate.
 mockRuns.push(...gatedCrossCheckRuns(mockRuns.find((r) => r.id === "run-awaiting")!));
 

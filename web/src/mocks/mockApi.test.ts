@@ -536,6 +536,36 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     }
   });
 
+  // PRD #3257 M2: the fifth panel state. run-judge-skipped carries a recorded automatic-judge
+  // skip (a Claude run whose judge runs on Codex, with no usable Codex credential); every other
+  // terminal fixture answers skip:null, and a skip never rides beside a review or a pending judge.
+  it("returns the seeded judge skip, null elsewhere, and refuses Run judge with the 422 (#3257)", async () => {
+    installStorage();
+    const api = await reload();
+    const { mockRuns } = await import("./data");
+
+    const skipped = await api.getRunReview("run-judge-skipped");
+    expect(skipped).toEqual({
+      review: null,
+      pending_judge: null,
+      skip: { harness: "codex", reason: "no_usable_credential", at: expect.any(String) },
+    });
+    // The never-judged control fixture stays skip-free.
+    expect((await api.getRunReview("run-unjudged")).skip).toBeNull();
+    for (const r of mockRuns.filter((x) => x.id !== "run-judge-skipped")) {
+      if (r.kind !== "issue" && r.kind !== "ci_fix") continue;
+      expect((await api.getRunReview(r.id)).skip, r.id).toBeNull();
+    }
+
+    await expect(api.rerunJudge("run-judge-skipped")).rejects.toMatchObject({
+      status: 422,
+      message: "the judge's harness (codex) has no usable credential",
+      body: { code: "no_credential_for_harness" },
+    });
+    // No judge was created on the other harness: still skipped, nothing pending.
+    expect((await api.getRunReview("run-judge-skipped")).pending_judge).toBeNull();
+  });
+
   it("rerunJudge enqueues a judge run for a terminal issue run and rejects a non-terminal one", async () => {
     installStorage();
     const api = await reload();

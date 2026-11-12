@@ -229,7 +229,8 @@ export function JudgeSettingsCard({
             With this on, EVERY user&rsquo;s finished runs are judged — bypassing their per-user opt-in — and
             each is spent on <strong className="text-fg">that user&rsquo;s own Claude or Codex credential,
             following their &ldquo;Judge runs on&rdquo; choice, without their opt-in</strong>. A user with no
-            usable credential for that harness is skipped, never charged to the other provider. On a subscription plan it also eats their rate-limit quota. Before
+            usable credential for that harness is skipped, with a reason shown on the run, and is never charged
+            to the other provider. On a subscription plan it also eats their rate-limit quota. Before
             enforcing, consider choosing a cheaper model in the Claude and Codex judge model pickers above;
             Default follows the built-in model. The per-user judge toggle on the Users page becomes inert
             while this is on.

@@ -5088,6 +5088,19 @@ export interface PendingJudge {
   enqueued_at: string;
 }
 
+// JudgeSkip is the recorded reason the AUTOMATIC judge of a run was skipped (issue #3257,
+// apitypes.JudgeSkipDTO): the judge's harness had no usable credential. A third sibling key on
+// the review envelope, always present and null when nothing was skipped; the server sets it
+// only when `review` and `pending_judge` are both null (read precedence review > pending >
+// skip). `harness` and `reason` are fixed server codes, typed as strings on purpose: the panel
+// maps each KNOWN code to fixed copy and renders generic fixed copy for anything else, so a
+// future code never reaches the page as raw text. `at` is when the skip was recorded.
+export interface JudgeSkip {
+  harness: string;
+  reason: string;
+  at: string;
+}
+
 // IssueDraft is the templated, human-editable draft for filing a forge issue from a
 // recommendation (PRD #68 M2/M4). The body is server-rendered + sanitized (fenced/
 // stripped/scanned), but the panel treats title/description as INERT text (never Markdown)
