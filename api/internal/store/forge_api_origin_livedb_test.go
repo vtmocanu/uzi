@@ -19,8 +19,9 @@ import (
 // clone/fetch failures. These tests execute the generated ClaimRun and the generated observation and
 // success queries against a real Postgres. The fixture moves its repo to https://github.com, so with a
 // github connection its API origin is https://api.github.com and with a gitlab connection the API
-// origin equals the Git origin. github.com is the one host whose API origin differs from its Git
-// origin: GitHub Enterprise Server serves its API on the web host (TestForgeAPIOriginGHESSharesGitOriginLiveDB).
+// origin equals the Git origin. github.com (like a <sub>.ghe.com data-residency host) has distinct
+// Git and API origins; GitHub Enterprise Server serves its API on the web host and shares one origin
+// (TestForgeAPIOriginGHESSharesGitOriginLiveDB).
 const (
 	apiFxGit = "https://github.com"
 	apiFxAPI = "https://api.github.com"
