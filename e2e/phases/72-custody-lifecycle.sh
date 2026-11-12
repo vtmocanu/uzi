@@ -329,13 +329,22 @@ FRESH_ID="${FRESH_IDS[0]}"
 uzi_cli run recovery "$WEDGE_RUN" --json \
   | jq -e --arg h "$FRESH_ID" 'map(select(.id == $h and .state == "open")) | length == 1' >/dev/null \
   || fail "uzi run recovery did not list the fresh open hold $FRESH_ID on run $WEDGE_RUN"
-AGG_LINE="$(custody_aggregate)" || fail "custody aggregate unreadable"
+# One snapshot feeds both the aggregate and the exact per-hold check below.
+AFTER_SNAPSHOT="$(apiget /api/recovery/holds)" || fail "custody holds snapshot unreadable after the unblock"
+AGG_LINE="$(printf '%s' "$AFTER_SNAPSHOT" | jq -er '.aggregate | [.admission_counted_holds, .open_holds, .custody_hold_limit]
+    | if all(.[]; type == "number" and . >= 0 and . == floor) then map(tostring) | join(" ")
+      else error("invalid") end')" || fail "custody aggregate: invalid admission_counted_holds/open_holds/custody_hold_limit"
 read -r AFTER_COUNTED AFTER_OPEN _ <<< "$AGG_LINE"
 # Exactly one hold (the healthy live claim hold) is discounted on top of the baseline grouped
 # surplus, which may only have shrunk since it was sampled.
 AFTER_SURPLUS=$((AFTER_OPEN - AFTER_COUNTED))
 { [ "$AFTER_SURPLUS" -ge 1 ] && [ "$AFTER_SURPLUS" -le $((BASE_SURPLUS + 1)) ]; } \
   || fail "open_holds - admission_counted_holds = $AFTER_SURPLUS after the healthy claim, want 1 beyond the baseline grouped surplus $BASE_SURPLUS (open=$AFTER_OPEN counted=$AFTER_COUNTED)"
+# The range above cannot tell a healthy live claim from a grouped baseline surplus when
+# BASE_SURPLUS >= 1, so pin the fresh hold itself from the same snapshot.
+printf '%s' "$AFTER_SNAPSHOT" | jq -e --arg h "$FRESH_ID" '[.holds[]? | select(.id == $h)]
+    | length == 1 and .[0].counts_toward_admission == false and .[0].admission_reason == "live_claim"' >/dev/null \
+  || fail "fresh hold $FRESH_ID is not (counts_toward_admission=false, admission_reason=live_claim) in /api/recovery/holds"
 [ "$AFTER_COUNTED" -lt "$LIMIT" ] || fail "admission_counted_holds=$AFTER_COUNTED still >= $LIMIT after the unblock"
 pass "episode cleared: blocked_runs=0, open_holds=$AFTER_OPEN, admission_counted_holds=$AFTER_COUNTED (< $LIMIT); fresh hold $FRESH_ID remains open"
 

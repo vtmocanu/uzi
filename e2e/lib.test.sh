@@ -1827,7 +1827,7 @@ custody_model_phase() {
     esac
   }
   apiget() {
-    local counted open
+    local counted open fresh
     case "$1" in
       /api/workers) echo '{"workers":[{"status":"online","busy":false}]}' ;;
       /api/recovery/holds)
@@ -1844,8 +1844,16 @@ custody_model_phase() {
         elif [ "$agg" = post-nodiff ] && [ "$(cat "$M/claimed")" = 1 ]; then open="$counted"
         elif [ "$agg" = post-high ] && [ "$(cat "$M/claimed")" = 1 ]; then counted=8; open=9
         fi
-        jq -nc --argjson c "$counted" --argjson o "$open" --argjson b "$([ "$(cat "$M/claimed")" = 1 ] && echo 0 || echo 1)" \
-          '{aggregate:{open_holds:$o,admission_counted_holds:$c,custody_hold_limit:8,blocked_runs:$b}}' ;;
+        fresh='[]'
+        if [ "$(cat "$M/claimed")" = 1 ]; then
+          if [ "$agg" = fresh-counted ]; then
+            fresh="[{\"id\":\"${U}ffff\",\"state\":\"open\",\"counts_toward_admission\":true,\"admission_reason\":\"decision_needed\"}]"
+          else
+            fresh="[{\"id\":\"${U}ffff\",\"state\":\"open\",\"counts_toward_admission\":false,\"admission_reason\":\"live_claim\"}]"
+          fi
+        fi
+        jq -nc --argjson c "$counted" --argjson o "$open" --argjson b "$([ "$(cat "$M/claimed")" = 1 ] && echo 0 || echo 1)" --argjson f "$fresh" \
+          '{aggregate:{open_holds:$o,admission_counted_holds:$c,custody_hold_limit:8,blocked_runs:$b},holds:$f}' ;;
       /api/runs/wedge) if model_claimed; then echo '{"run":{"status":"running"}}'; else echo '{"run":{"status":"queued"}}'; fi ;;
       *) fail "unhandled model API read: $1" ;;
     esac
@@ -1910,6 +1918,7 @@ model_case "product control: claim while counted >= limit fails the negative win
 model_case "mutant seeding LIMIT - baseline wedges nothing when the baseline settles" fail "wedge run left 'queued'" "$SEQ_DIR/phase72-base.sh" 1 poll1 gate
 model_case "post-claim aggregate with open == counted fails" fail 'open_holds - admission_counted_holds = 0' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate post-nodiff
 model_case "post-claim aggregate with counted >= limit fails" fail 'still >= 8 after the unblock' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate post-high
+model_case "fresh hold counted toward admission fails the exact check" fail 'is not (counts_toward_admission=false, admission_reason=live_claim)' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate fresh-counted
 model_case "post-seed aggregate below the limit fails" fail 'after seeding 8 holds' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate seed-short
 
 # Exercise the actual handoff startup/trap, stopping before transport and dispatch.
