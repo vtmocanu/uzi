@@ -68,6 +68,7 @@ Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/done/2-forge-integration-ka
   - Reference: an internal board (label-as-column example); kan.bn (UI style).
 - Board/agents work only issues carrying the `PRD` label, sanity-checked to contain a link to the PRD file. [superseded — see Feature #22: run-eligibility is now the single `uzi` label and the PRD link is optional (PRD #764) (AI-synced 2026-08-29)]
 - GitLab `GetMergeRequest` and `GetMergeRequestSummary` bound the response body before decoding: 32 MiB for a 200, 201, 202 or 204 and 4 KiB for any other status, counted as transfer-decoded wire bytes (compressed responses are refused). An oversized response is refused with a fixed error and is unverified evidence, never a partial or merged answer (#3038, #3226). (AI-synced 2026-10-21)
+- Base-URL allowlist entries (forge, agent source, product skills, issue tracker) must be a bare `https://host[:port]`; an entry with userinfo, a path, a query or a fragment refuses boot instead of being reduced to its host, and the Helm chart fails the render for the forge and issue-tracker values. (AI-synced 2026-11-12, #4194)
 
 ## Feature #3 — Agent templates & per-user Anthropic token
 
