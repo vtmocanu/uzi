@@ -975,6 +975,29 @@ describe("People chip (issue #4042)", () => {
 
 // PRD #3875 M1: the Search button in the header opens the shell's command menu.
 describe("OverviewNext Search button", () => {
+  it("follows the health and People chips, before the Back link", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    render(
+      <MemoryRouter>
+        <CommandMenuContext.Provider value={{ open: vi.fn() }}>
+          <OverviewNext />
+        </CommandMenuContext.Provider>
+      </MemoryRouter>,
+    );
+    await settle();
+
+    const health = screen.getByRole("button", { name: /^System health:/ });
+    const people = screen.getByRole("button", { name: /^People:/ });
+    const search = screen.getByRole("button", { name: /^Search/ });
+    const back = screen.getByRole("link", { name: "Back to the current Overview" });
+    const before = (a: Element, b: Element) =>
+      (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    expect(before(health, people)).toBe(true);
+    expect(before(people, search)).toBe(true);
+    expect(before(search, back)).toBe(true);
+  });
+
   it("calls the shell's open() on click, with the shortcut shown on the button", async () => {
     const open = vi.fn();
     render(

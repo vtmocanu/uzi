@@ -189,7 +189,7 @@ Build from what exists; do not re-implement these. The original anchors were che
 - **D16** PR open lists only PRs opened by the viewer's own uzi runs, for admins too (the admin list carries no completed runs); human and bot PRs are out of scope.
 - **D17** Run scope follows today's Runs page: a normal user sees only their runs; an admin also sees every other user's runs, as a separate "Other users (admin)" group (maintainer call on the name), and the line counts them. Needs your decision stays the viewer's own (maintainer call). A behaviour change from today's Overview, which lists only the viewer's own runs even for admins.
 - **D18** On the Overview the banner stack sits under the page header, between the greeting and Needs your decision (maintainer call). Its all-pages variant is superseded by D20.
-- **D19** The Search button lives only in the Overview header; the Cmd K shortcut opens the menu on every signed-in page (confirmed by the maintainer 2026-11-10; no sidebar entry).
+- **D19** The Search button lives only in the Overview header; the Cmd K shortcut opens the menu on every signed-in page (confirmed by the maintainer 2026-11-10; no sidebar entry). Amended (#4248, 2026-11-12): in the header, Search follows the health and People chips and precedes the Back link.
 - **D20** Banners render under the header on the Overview only; other pages keep the shell slot (maintainer call). One shared component, so placement differs but code does not.
 - **D21** ci_fix and mr_rework runs sit in Other work: they maintain an existing PR, they are not issue lifecycle stages.
 - **D22** Shadow markers: `data-attention` on the decisions card, `data-live` on the issue-work card.
