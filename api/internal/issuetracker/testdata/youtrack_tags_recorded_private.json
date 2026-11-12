@@ -1,0 +1,86 @@
+[
+  {
+    "tagSharingSettings": {
+      "permittedGroups": [
+        {
+          "allUsersGroup": true,
+          "usersCount": 12,
+          "name": "All Users",
+          "id": "579-1",
+          "$type": "AllUsersGroup"
+        }
+      ],
+      "permittedUsers": [],
+      "$type": "TagSharingSettings"
+    },
+    "owner": {
+      "login": "user-1",
+      "id": "25-1",
+      "$type": "User"
+    },
+    "readSharingSettings": {
+      "permittedGroups": [
+        {
+          "allUsersGroup": true,
+          "usersCount": 12,
+          "name": "All Users",
+          "id": "579-1",
+          "$type": "AllUsersGroup"
+        }
+      ],
+      "permittedUsers": [],
+      "$type": "WatchFolderSharingSettings"
+    },
+    "name": "tag-1",
+    "id": "6-1",
+    "$type": "Tag"
+  },
+  {
+    "tagSharingSettings": {
+      "permittedGroups": [],
+      "permittedUsers": [],
+      "$type": "TagSharingSettings"
+    },
+    "owner": {
+      "login": "user-1",
+      "id": "25-1",
+      "$type": "User"
+    },
+    "readSharingSettings": {
+      "permittedGroups": [
+        {
+          "allUsersGroup": true,
+          "usersCount": 12,
+          "name": "All Users",
+          "id": "579-1",
+          "$type": "AllUsersGroup"
+        }
+      ],
+      "permittedUsers": [],
+      "$type": "WatchFolderSharingSettings"
+    },
+    "name": "tag-2",
+    "id": "6-2",
+    "$type": "Tag"
+  },
+  {
+    "tagSharingSettings": {
+      "permittedGroups": [],
+      "permittedUsers": [],
+      "$type": "TagSharingSettings"
+    },
+    "owner": {
+      "login": "user-2",
+      "id": "25-2",
+      "$type": "User"
+    },
+    "readSharingSettings": {
+      "permittedGroups": [],
+      "permittedUsers": [],
+      "$type": "WatchFolderSharingSettings"
+    },
+    "name": "tag-3",
+    "id": "6-3",
+    "$type": "Tag"
+  }
+]

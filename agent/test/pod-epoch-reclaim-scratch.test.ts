@@ -11,7 +11,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runPodEpochShadow, PodEpochSettlementError, EPOCH_SCRATCH_DELETION_ENABLED } from "../src/pod-epoch-reclaim.js";
+import { runPodEpochShadow, PodEpochSettlementError } from "../src/pod-epoch-reclaim.js";
 import { PodEpochDaemonError, type PodEpochDaemonGuard } from "../src/pod-epoch-daemon.js";
 import { GitCache, type EpochScratchDiscardInput, type RetainedSourceEvidence } from "../src/git.js";
 import { censusScratchRoot } from "../src/rmtree.js";
@@ -187,8 +187,7 @@ const noScratchWork = (w: World) => {
 };
 const run = async (w: World) => (await runPodEpochShadow(w.options))!;
 
-test("the production scratch gate is closed, separate from the attempt gate, and nothing under agent/src opens it", async () => {
-  assert.equal(EPOCH_SCRATCH_DELETION_ENABLED, false);
+test("production scratch activation is separate and nothing under agent/src supplies the sentinel", async () => {
   const src = fileURLToPath(new URL("../src/", import.meta.url));
   const files = (await readdir(src, { recursive: true })).filter(f => /\.(ts|mts|cts|js|mjs|cjs)$/.test(f));
   assert.ok(files.length > 50);
@@ -201,15 +200,58 @@ test("the production scratch gate is closed, separate from the attempt gate, and
   const definition = await readFile(join(src, "pod-epoch-reclaim.ts"), "utf8");
   assert.equal(definition.match(/scratchTestGate\s*===\s*TEST_SCRATCH_GATE\b/g)?.length, 2, "the gate and the seams are tied to the sentinel");
   assert.equal(definition.match(/TEST_SCRATCH_GATE\b/g)?.length, 3, "the sentinel is defined once and compared twice");
-  assert.equal(definition.match(/export const EPOCH_SCRATCH_DELETION_ENABLED: boolean = false;/g)?.length, 1);
+  assert.match(definition, /scratchDeps\.activation === true \|\| scratchDeps\.scratchTestGate === TEST_SCRATCH_GATE/);
   assert.ok(!definition.includes("EPOCH_RECLAIM_DELETION_ENABLED"), "the attempt phase uses the #4134 startup activation, not a constant");
   const built = buildPodEpochScratchDeps({ git: {} as never, dockerHost: undefined });
-  assert.deepEqual(Object.keys(built).sort(), ["git", "quiesce"]);
+  assert.deepEqual(Object.keys(built).sort(), ["activation", "git", "quiesce"]);
+});
+
+test("production scratch activation without sentinel enters phase, refuses unsafe layout and cannot read test seams", async () => {
+  await withWorld(["a"], async w => {
+    const scratch = w.options.scratch!;
+    delete scratch.scratchTestGate;
+    assert.equal(scratch.scratchTestGate, undefined);
+    scratch.activation = true;
+    Object.defineProperty(scratch, "seams", { get() { throw new Error("production accessed test seams"); } });
+    // An unsupported fixed root refuses before pinning, census or deletion, regardless of host layout.
+    const saved = process.env.UZI_RUNNER_TMPDIR;
+    process.env.UZI_RUNNER_TMPDIR = "/unsupported-epoch-scratch-root";
+    try {
+      const result = await run(w);
+      assert.equal(result.verdict, "eligible");
+      assert.equal(result.scratch.state, "refused");
+      assert.equal(result.scratch.reason, "layout_refused");
+      assert.equal(result.scratch.deleted, 0);
+      noScratchWork(w);
+      await untouched(w, ["a"]);
+    } finally {
+      if (saved === undefined) delete process.env.UZI_RUNNER_TMPDIR;
+      else process.env.UZI_RUNNER_TMPDIR = saved;
+    }
+  });
+});
+
+test("scratch activation absent or false without sentinel stays not_run even with attempt activation", async () => {
+  for (const activation of [undefined, false]) {
+    await withWorld(["a"], async w => {
+      delete w.options.scratch!.scratchTestGate;
+      w.options.scratch!.activation = activation;
+      w.options.deletion = { activation: true } as NonNullable<Options["deletion"]>;
+      // No attempt candidates: it may settle its deps, but must never enter scratch.
+      w.options.deletion.git = { assertNoUnsettledDeletes() {} } as never;
+      const result = await run(w);
+      assert.equal(result.scratch.state, "not_run");
+      assert.equal(result.scratch.reason, "not_run");
+      noScratchWork(w);
+      await untouched(w, ["a"]);
+    });
+  }
 });
 
 test("gate closed: a pass with scratch deps does no census, no child, no new path read and reports not_run", async () => {
   await withWorld(["a", "b"], async w => {
     w.gateOpen = false;
+    w.options.scratch!.activation = false;
     const result = await run(w);
     assert.equal(result.verdict, "eligible");
     assert.equal(result.scratch.state, "not_run"); assert.equal(result.scratch.reason, "not_run");

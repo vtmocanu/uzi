@@ -4925,7 +4925,9 @@ async function issue3152LivePasses(f: Issue3152Fixture, c: RecoveryCoordinator, 
 }
 
 function issue3152Assert(lines: ExitLine[], from: number, expected: { path: string; reason: string; field?: string }, rec: RecoveryRecord) {
-  const fresh = lines.slice(from);
+  // A pass may also retire a separately reconstructed capture; keep this assertion
+  // scoped to the identity whose exit transition and fixed field set it exercises.
+  const fresh = lines.slice(from).filter(line => line.capture_id === rec.captureId);
   assert.equal(fresh.length, 1, `exactly one line, got ${JSON.stringify(fresh)}`);
   const line = fresh[0]!;
   assert.deepEqual(Object.keys(line).sort(), [...(expected.field ? ["field"] : []), "capture_id", "generation", "path", "reason", "run_id"].sort());

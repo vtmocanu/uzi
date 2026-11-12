@@ -151,6 +151,13 @@ type Config struct {
 	// scheme+host, https only) but a DISTINCT list, so enabling one source never widens the
 	// other. EMPTY means the feature is off: ProductSkillsBaseURLAllowed is false for every URL.
 	ProductSkillsAllowedBaseURLs []string
+	// IssueTrackerAllowedBaseURLs is the SEPARATE SSRF allowlist for external issue tracker
+	// connections (PRD #4173 D8, ISSUE_TRACKER_ALLOWED_BASE_URLS): the only base URLs a
+	// connection may target. Same shape as the other allowlists (normalized scheme+host, https
+	// only) but a DISTINCT list, never FORGE_ALLOWED_BASE_URLS, so a forge host is not an issue
+	// tracker host. EMPTY by default, which means no connection can be created:
+	// IssueTrackerBaseURLAllowed is false for every URL.
+	IssueTrackerAllowedBaseURLs []string
 	// ForgePollInterval is the per-enabled-repo incremental poll cadence.
 	ForgePollInterval time.Duration
 	// ForgeReconcileEvery is the number of incremental polls between full
@@ -994,6 +1001,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.ProductSkillsAllowedBaseURLs = productSkillsAllowed
+	// PRD #4173 D8: the issue tracker allowlist, default EMPTY (no connection can be created, instance still boots).
+	issueTrackerAllowed, err := parseBaseURLAllowlist("ISSUE_TRACKER_ALLOWED_BASE_URLS", getenv("ISSUE_TRACKER_ALLOWED_BASE_URLS", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.IssueTrackerAllowedBaseURLs = issueTrackerAllowed
 	cfg.ForgePollInterval = parseDuration("FORGE_POLL_INTERVAL", time.Minute)
 	cfg.ForgeReconcileEvery = parseInt("FORGE_RECONCILE_EVERY", 10)
 	cfg.ForgeHTTPTimeout = parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second)
@@ -2224,6 +2237,24 @@ func (c Config) AgentSourceBaseURLAllowed(raw string) bool {
 		return false
 	}
 	for _, a := range c.AgentSourceAllowedBaseURLs {
+		if a == norm {
+			return true
+		}
+	}
+	return false
+}
+
+// IssueTrackerBaseURLAllowed reports whether raw normalizes to an allowlisted issue tracker base
+// URL (PRD #4173 D8). It checks the SEPARATE IssueTrackerAllowedBaseURLs list and is false when
+// that list is empty. NormalizeForgeBaseURL keeps only scheme and host, so it does NOT reject
+// userinfo, a path, a query or a fragment: the issue tracker service applies its own strict check
+// first and passes this method the already-normalized value.
+func (c Config) IssueTrackerBaseURLAllowed(raw string) bool {
+	norm, err := NormalizeForgeBaseURL(raw)
+	if err != nil {
+		return false
+	}
+	for _, a := range c.IssueTrackerAllowedBaseURLs {
 		if a == norm {
 			return true
 		}

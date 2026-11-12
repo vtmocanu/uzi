@@ -212,6 +212,8 @@ spec:
             - name: UZI_WORKER_GO_MAXPROCS
               value: {{ $goMaxProcs | quote }}
             {{- end }}
+            - name: UZI_WORKER_EPOCH_SCRATCH_DELETION
+              value: {{ .Values.workers.epochReclaim.scratchDeletion | quote }}
             - name: UZI_WORKER_POD_EPOCH_RUNTIME
               value: {{ .Values.workers.docker.podEpochReclaim.runtime | quote }}
             # Validated in worker-invariants.yaml: empty or one canonical lowercase UUID.

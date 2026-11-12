@@ -93,6 +93,32 @@ const GIT_HTTP_BACKEND = `${GIT_EXEC_PATH}/git-http-backend`;
 const EXPECT_USER = process.env.FORGE_FAKE_EXPECT_USER || "";
 const EXPECT_PAT = process.env.FORGE_FAKE_EXPECT_PAT || "";
 
+// FORGE_FAKE_ISSUE_CONTRACT=1 turns on the issue-tracker contract fidelity the
+// default e2e fake deliberately lacks: an in-memory label catalog on GitLab and
+// GitHub, issue state/description writes on all three dialects, GitHub's per-label
+// add/remove routes, the /_e2e/issues/{iid}/comments mutator, and a 404 for a
+// project id the fake does not serve (see missingContractProject). Unset, every
+// answer is byte-identical to before (e2e/phases/60-schedules-sweep.sh relies on
+// GitLab GET /labels answering [] and POST not persisting).
+const ISSUE_CONTRACT = process.env.FORGE_FAKE_ISSUE_CONTRACT === "1";
+// missingContractProject is true under ISSUE_CONTRACT for a project id the fake
+// does not serve, so the issue tracker contract's ProjectGuard case sees a
+// driver that names another project fail instead of landing on PROJECTS[0], the
+// way resolveProject() maps an unknown id for every other caller. Without the
+// flag it is always false, so the default behavior is unchanged.
+function missingContractProject(idParam) {
+  if (!ISSUE_CONTRACT) return false;
+  const raw = decodeURIComponent(String(idParam || ""));
+  return !PROJECTS.some((p) => String(p.id) === raw || p.path_with_namespace === raw);
+}
+// name -> {id, name, color}; only read or written when ISSUE_CONTRACT is on.
+const labelCatalog = /** @type {Record<string, any>} */ ({});
+let nextCatalogLabelId = 300;
+function catalogLabel(name, color) {
+  if (!labelCatalog[name]) labelCatalog[name] = { id: nextCatalogLabelId++, name, color };
+  return labelCatalog[name];
+}
+
 const state = {
   issues: /** @type {Record<number, any>} */ ({}),
   mrs: /** @type {any[]} */ ([]),
@@ -864,6 +890,25 @@ const server = https.createServer(
       return send(res, 201, issue);
     }
 
+    // Seed a human comment on an issue, visible to all three dialects' comment
+    // routes (they share state.notes). Only under FORGE_FAKE_ISSUE_CONTRACT=1.
+    const commentEv = ISSUE_CONTRACT && method === "POST" && path.match(/^\/_e2e\/issues\/(\d+)\/comments$/);
+    if (commentEv) {
+      const body = await readBody(req);
+      const iid = Number(commentEv[1]);
+      const issue = state.issues[iid];
+      if (!issue) return send(res, 404, { message: "404 Not found (no such issue)" });
+      const note = {
+        id: state.nextNoteId++, project_id: issue.project_id, issue_iid: iid,
+        body: String(body.body || ""), created_at: new Date().toISOString(), system: false,
+        author: { id: Number(body.id) || 2, username: String(body.username || "reviewer") },
+      };
+      state.notes.push(note);
+      persist();
+      log("_e2e comment on issue", iid, "by", note.author.username);
+      return send(res, 201, note);
+    }
+
     // Append a resource label event to an issue — the harness stand-in for a
     // human adding/removing a label. The rising id models GitLab's globally-
     // monotonic event ids, so a remove+re-add mints a larger id (the autopilot
@@ -896,8 +941,8 @@ const server = https.createServer(
     //
     // MEASURED before adding it: makeIssue stamps state:"opened" and NOTHING else in
     // this file assigns issue.state — the GitLab PUT /issues/{iid} handler applies
-    // only add_labels/remove_labels, by design, and the Forgejo lane's PATCH does the
-    // same. So this is a new capability, not a second way to do an existing one.
+    // only add_labels/remove_labels by default, and the Forgejo lane has no issue PATCH
+    // (both gain state writes only under FORGE_FAKE_ISSUE_CONTRACT=1). So this is a new capability, not a second way to do an existing one.
     //
     // LANE-NEUTRAL BY CONSTRUCTION: it mutates the shared state.issues store, and the
     // Forgejo lane serves the same objects through toForgejoIssue (which maps
@@ -1135,6 +1180,7 @@ const server = https.createServer(
     const fjRepoById = path.match(/^\/api\/v1\/repositories\/(\d+)$/);
     if (method === "GET" && fjRepoById) {
       // GetRepoByID (the driver resolves a numeric project id -> owner/repo slug).
+      if (missingContractProject(fjRepoById[1])) return send(res, 404, { message: "The target couldn't be found." });
       const project = resolveProject(fjRepoById[1]);
       const [owner, ...rest] = project.path_with_namespace.split("/");
       return send(res, 200, {
@@ -1194,6 +1240,18 @@ const server = https.createServer(
       if (method === "GET" && fjIssueGet) {
         const issue = state.issues[Number(fjIssueGet[1])];
         return issue ? send(res, 200, toForgejoIssue(issue)) : send(res, 404, { message: "issue does not exist" });
+      }
+      if (ISSUE_CONTRACT && method === "PATCH" && fjIssueGet) {
+        // EditIssue: body and state ("open"/"closed"), applied only under the contract flag.
+        const issue = state.issues[Number(fjIssueGet[1])];
+        if (!issue) return send(res, 404, { message: "issue does not exist" });
+        const body = await readBody(req);
+        if (typeof body.body === "string") issue.description = body.body;
+        if (body.state === "open") issue.state = "opened";
+        if (body.state === "closed") issue.state = "closed";
+        issue.updated_at = new Date().toISOString();
+        persist();
+        return send(res, 201, toForgejoIssue(issue));
       }
       if (method === "POST" && rest === "/issues") {
         // CreateIssue: body {title, body, labels:[ids]}. Map ids -> names.
@@ -1474,6 +1532,7 @@ const server = https.createServer(
       // member=true (compliant, least-privilege).
       const ghRepoById = g.match(/^\/repositories\/(\d+)$/);
       if (method === "GET" && ghRepoById) {
+        if (missingContractProject(ghRepoById[1])) return send(res, 404, { message: "Not Found" });
         const project = resolveProject(ghRepoById[1]);
         const [owner, ...rest] = project.path_with_namespace.split("/");
         return send(res, 200, {
@@ -1540,6 +1599,8 @@ const server = https.createServer(
           if (!issue) return send(res, 404, { message: "Not Found" });
           const body = await readBody(req);
           if (typeof body.body === "string") issue.description = body.body;
+          if (ISSUE_CONTRACT && body.state === "open") issue.state = "opened";
+          if (ISSUE_CONTRACT && body.state === "closed") issue.state = "closed";
           issue.updated_at = new Date().toISOString();
           persist();
           log("gh issue", issue.iid, "description updated");
@@ -1558,6 +1619,30 @@ const server = https.createServer(
           persist();
           log("gh issue", issue.iid, "labels ->", JSON.stringify(issue.labels));
           return send(res, 200, names.map((n) => ({ id: 1000 + issue.iid, name: n, color: "ededed" })));
+        }
+        if (ISSUE_CONTRACT && ghIssueLabels && method === "POST") {
+          // AddLabelsToIssue: a bare JSON array of names; add, deduplicated.
+          const issue = state.issues[Number(ghIssueLabels[1])];
+          if (!issue) return send(res, 404, { message: "Not Found" });
+          const body = await readBody(req);
+          const names = Array.isArray(body) ? body.map(String) : normLabels(body.labels);
+          const next = [...(issue.labels || [])];
+          for (const n of names) if (!next.includes(n)) next.push(n);
+          issue.labels = next;
+          issue.updated_at = new Date().toISOString();
+          persist();
+          return send(res, 200, next.map((n) => ({ id: 1000 + issue.iid, name: n, color: "ededed" })));
+        }
+        const ghIssueLabel = ISSUE_CONTRACT && method === "DELETE" && rest.match(/^\/issues\/(\d+)\/labels\/(.+)$/);
+        if (ghIssueLabel) {
+          // RemoveLabelForIssue: remove one label by name, answer the remaining set.
+          const issue = state.issues[Number(ghIssueLabel[1])];
+          if (!issue) return send(res, 404, { message: "Not Found" });
+          const name = decodeURIComponent(ghIssueLabel[2]);
+          issue.labels = (issue.labels || []).filter((l) => l !== name);
+          issue.updated_at = new Date().toISOString();
+          persist();
+          return send(res, 200, issue.labels.map((n) => ({ id: 1000 + issue.iid, name: n, color: "ededed" })));
         }
         // Issue comments (CreateIssueNote). Recorded in the shared notes list so the
         // harness reads them back via /_e2e/state exactly like the other lanes.
@@ -1597,10 +1682,15 @@ const server = https.createServer(
           if (method === "GET") {
             // Defensive: the harness critical path does not depend on a pre-seeded
             // catalog (CreateIssue auto-creates a referenced label on GitHub).
+            if (ISSUE_CONTRACT) return send(res, 200, Object.values(labelCatalog));
             return send(res, 200, []);
           }
           if (method === "POST") {
             const body = await readBody(req);
+            if (ISSUE_CONTRACT) {
+              const color = (body.color || "ededed").replace(/^#/, "");
+              return send(res, 201, catalogLabel(String(body.name || "label"), color));
+            }
             return send(res, 201, { id: 1, name: body.name || "label", color: (body.color || "ededed").replace(/^#/, "") });
           }
         }
@@ -1799,6 +1889,7 @@ const server = https.createServer(
     // the single-project behavior otherwise.
     const proj = path.match(/^\/api\/v4\/projects\/([^/]+)(\/.*)?$/);
     if (proj) {
+      if (missingContractProject(proj[1])) return send(res, 404, { message: "404 Project Not Found" });
       const project = resolveProject(proj[1]);
       const rest = proj[2] || "";
 
@@ -1854,6 +1945,11 @@ const server = https.createServer(
         const next = (issue.labels || []).filter((l) => !remove.has(l));
         for (const l of normLabels(body.add_labels)) if (!next.includes(l)) next.push(l);
         issue.labels = next;
+        if (ISSUE_CONTRACT) {
+          if (body.state_event === "close") issue.state = "closed";
+          if (body.state_event === "reopen") issue.state = "opened";
+          if (typeof body.description === "string") issue.description = body.description;
+        }
         issue.updated_at = new Date().toISOString();
         persist();
         log("issue", issue.iid, "labels ->", JSON.stringify(issue.labels));
@@ -1948,9 +2044,10 @@ const server = https.createServer(
       // Labels. On the harness critical path: enabling a repo (the startup seed,
       // the web enable, /server setup) creates the board column labels first, and
       // a refusal here keeps the repo off (PRD #3760).
-      if (method === "GET" && rest === "/labels") return send(res, 200, []);
+      if (method === "GET" && rest === "/labels") return send(res, 200, ISSUE_CONTRACT ? Object.values(labelCatalog) : []);
       if (method === "POST" && rest === "/labels") {
         const body = await readBody(req);
+        if (ISSUE_CONTRACT) return send(res, 201, catalogLabel(String(body.name || "label"), body.color || "#cccccc"));
         return send(res, 201, { id: 1, name: body.name || "label", color: body.color || "#cccccc" });
       }
 

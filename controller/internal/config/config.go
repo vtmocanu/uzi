@@ -285,6 +285,7 @@ type Config struct {
 	// template carries UZI_EPOCH_RECLAIM_DELETION=1. Empty means no worker does. It is
 	// exactly one canonical lowercase UUID: no list, wildcard or padding.
 	WorkerEpochReclaimDeletionCanaryID string
+	WorkerEpochScratchDeletion         bool
 	// WorkerDinDImage is the fully-pinned DinD sidecar image
 	// (docker:<tag>-dind-rootless@sha256:... or, non-rootless, docker:<tag>-dind@...).
 	// It is operator config, not wire data — the api never names an image — and shared
@@ -466,6 +467,13 @@ func loadWorkerSettings(cfg *Config) error {
 	case "", "containerd-runc", "crio-crun":
 	default:
 		return fmt.Errorf("UZI_WORKER_POD_EPOCH_RUNTIME must be unset, containerd-runc or crio-crun")
+	}
+	switch os.Getenv("UZI_WORKER_EPOCH_SCRATCH_DELETION") {
+	case "", "false":
+	case "true":
+		cfg.WorkerEpochScratchDeletion = true
+	default:
+		return fmt.Errorf("UZI_WORKER_EPOCH_SCRATCH_DELETION must be empty, true or false")
 	}
 	cfg.WorkerEpochReclaimDeletionCanaryID = os.Getenv("UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID")
 	if id := cfg.WorkerEpochReclaimDeletionCanaryID; id != "" && !canonicalUUIDRE.MatchString(id) {
