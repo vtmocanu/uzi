@@ -9,6 +9,25 @@ import (
 const retainedRecoveryExhaustedCause = "retained_recovery_exhausted"
 const retainedRecoveryAdoptionFailedCause = "retained_recovery_adoption_failed"
 
+// Closed-set recovery_wait_detail values (issue #4177). A client renders only these and never
+// prints the raw string; nil or any other value selects the generic text and permits nothing new.
+const (
+	recoveryDetailSecretRemediationActive = "secret_remediation_active"
+	recoveryDetailRemediationProofUnknown = "remediation_proof_unknown"
+)
+
+// adoptionFailedDetail returns the known detail of an adoption-failed park, else "".
+func adoptionFailedDetail(r apitypes.RunDTO) string {
+	if strOr(r.RecoveryWaitCause, "") != retainedRecoveryAdoptionFailedCause {
+		return ""
+	}
+	switch d := strOr(r.RecoveryWaitDetail, ""); d {
+	case recoveryDetailSecretRemediationActive, recoveryDetailRemediationProofUnknown:
+		return d
+	}
+	return ""
+}
+
 // retainedContinuationUnwitnessedCause is the server-only park for a retained
 // continuation whose claimed flight was never witnessed starting or departing
 // within a bounded window. The claim is released, local work and custody are
@@ -52,7 +71,14 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 	}
 	guidance := idleStallResumeGuidance(r)
 	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
-		guidance = "Resume starts another recovery episode. If the block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming."
+		switch adoptionFailedDetail(r) {
+		case recoveryDetailSecretRemediationActive:
+			guidance = "The retained source is held under an active secret-scan remediation. Resume cannot succeed unchanged and is refused. Export an available archive (`uzi run export " + cellText(r.ID) + "`), which may omit later work kept on the worker; an operator can recover the retained work from worker storage. Cancel ends the run."
+		case recoveryDetailRemediationProofUnknown:
+			guidance = "The remediation proof could not be verified. Resume may help; if the block persists the run holds again and each new claim adds a custody hold."
+		default:
+			guidance = "Resume starts another recovery episode. If the block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming."
+		}
 	}
 	if guidance != "" {
 		guidance = " · " + guidance
@@ -64,22 +90,48 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 
 func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
 	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
-		return append([]string{
+		var guidance []string
+		switch adoptionFailedDetail(r) {
+		case recoveryDetailSecretRemediationActive:
+			guidance = []string{
+				"The retained source is held under an active",
+				"secret-scan remediation. Resume cannot succeed",
+				"unchanged and is refused.",
+				"Export an available archive (`uzi run export " + cellText(r.ID) + "`),",
+				"which may omit later work kept on the worker;",
+				"an operator can recover the retained work from",
+				"worker storage. Cancel ends the run.",
+			}
+		case recoveryDetailRemediationProofUnknown:
+			guidance = []string{
+				"The remediation proof could not be verified.",
+				"Resume may help; if the block persists the run",
+				"holds again and each new claim adds a custody hold.",
+			}
+		default:
+			guidance = []string{
+				"Resume starts another recovery episode.",
+				"If the block persists, the run can hold again.",
+				"Each new claim adds a custody hold.",
+				"Resolve the cause before resuming.",
+			}
+		}
+		lines := []string{
 			"Integrity hold: the agent did not start.",
 			"Adoption failed, a predecessor needs remediation review,",
 			"or this release does not support the predecessor.",
 			"Local work and custody preserved.",
 			"Owner-held · no automatic resume.",
-			"Resume starts another recovery episode.",
-			"If the block persists, the run can hold again.",
-			"Each new claim adds a custody hold.",
-			"Resolve the cause before resuming.",
+		}
+		lines = append(lines, guidance...)
+		lines = append(lines,
 			"Owner Resume or Cancel:",
-			"Resume: uzi run resume " + cellText(r.ID),
-			"Cancel: uzi run cancel " + cellText(r.ID) + " (terminal)",
+			"Resume: uzi run resume "+cellText(r.ID),
+			"Cancel: uzi run cancel "+cellText(r.ID)+" (terminal)",
 			"Resume requests an attempt; success is not assured.",
 			"Source/archive availability and latest edits unverified.",
-		}, workerExhaustionEvidence(r)...)
+		)
+		return append(lines, workerExhaustionEvidence(r)...)
 	}
 	if strOr(r.RecoveryWaitCause, "") == retainedContinuationUnwitnessedCause {
 		return append([]string{
@@ -125,6 +177,9 @@ func workerHoldNoticeKey(r apitypes.RunDTO) string {
 			key += "/" + r.RecoveryRetryNotBefore.UTC().Format(time.RFC3339Nano)
 		}
 		return key
+	}
+	if d := adoptionFailedDetail(r); d != "" {
+		key += "/" + d
 	}
 	if isRecoveryDecisionPark(r) || isForgePark(r) {
 		if isRecoveryDecisionHold(r) || isForgeOwnerHold(r) {
