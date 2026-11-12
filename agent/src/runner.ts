@@ -1,4 +1,4 @@
-import type { RemediationRestrictionProgress } from "./git.js";
+import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
 import { validatePolicyHoldRequest } from "./protocol.js";
 import { checkpointCoordinatesForClaim, type CheckpointCoordinates } from "./checkpoint-coordinates.js";
@@ -50,6 +50,7 @@ import {
   RetainedReadinessCleanupUnconfirmedError,
   formatRetainedRecoveryDiagnostic,
   annotateRetainedSuccessorError,
+  retainedAdoptionRefusal,
   gitBasicCredential,
   isNonFastForwardRejection,
   isPushProtectionRejection,
@@ -1405,6 +1406,8 @@ class RetainedSeedCapacityShortfall extends Error {
 const RETAINED_EXHAUSTED_FEATURE = "recovery_cause_retained_recovery_exhausted";
 /** Issue #4046: the api holds a capacity-only exhaustion park for the owner instead of retrying it on a timer. */
 const RETAINED_CAPACITY_HOLD_FEATURE = "retained_recovery_capacity_hold_v1";
+/** Issue #4177: the api accepts `recovery_detail` on a retained adoption-failure park. An older api 400s the field. */
+const RETAINED_ADOPTION_DETAIL_FEATURE = "recovery_detail_adoption_refusal_v1";
 
 /* issue #2969: the time budget of the predecessor FINAL pass a retained re-claim runs before it prepares its successor
  * (disabled in production; see settlePredecessorHolds).
@@ -1447,6 +1450,11 @@ class OrphanRemediationHold extends Error {
 
 /** issue #4058: the bound on confirming the predecessor-remediation guidance before the hold is reported. */
 const GUIDANCE_FLUSH_MS = 10_000;
+
+/** A restricted root that is not divergent from the source: an ancestor is active remediation, anything else unknown. */
+function relationRefusal(relation: "ancestor" | "divergent" | "unknown"): RetainedAdoptionRefusal {
+  return relation === "ancestor" ? "secret_remediation_active" : "remediation_proof_unknown";
+}
 
 const RETAINED_ADOPTION_FAILED_FEATURE = "recovery_cause_retained_recovery_adoption_failed";
 
@@ -27393,7 +27401,7 @@ export class RunRunner {
    * Any unresolved outcome stops this flight without terminal reporting or releasing custody. */
   private async parkRetainedRecoveryExhausted(flight: RunFlight,
     cause: "retained_recovery_exhausted" | "retained_recovery_adoption_failed" = "retained_recovery_exhausted",
-    opts?: { capacityOnly?: boolean },
+    opts?: { capacityOnly?: boolean; detail?: RetainedAdoptionRefusal },
   ): Promise<boolean> {
     const deadline = Date.now() + this.codexBoundaryDeadlineMs;
     const timeout = new AbortController();
@@ -27406,6 +27414,11 @@ export class RunRunner {
     // that advertised the hold. One body object serves both attempts so a replay is byte-identical.
     const marked = opts?.capacityOnly === true && cause === "retained_recovery_exhausted" &&
       this.client.hasFeature(RETAINED_CAPACITY_HOLD_FEATURE);
+    // Issue #4177: the adoption-refusal detail rides the one body object (a replay stays byte-identical), only on the
+    // adoption cause and only to an api that advertised it. A 400 falls back to the same body without it.
+    const detailed = opts?.detail !== undefined && cause === "retained_recovery_adoption_failed" &&
+      Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
+      this.client.hasFeature(RETAINED_ADOPTION_DETAIL_FEATURE);
     // One pass of the two-report loop. A 400 under `rejectToFallback` leaves the pass (the api may not
     // understand the marker) and reports whether any earlier report in the pass was left unresolved.
     const pass = async (reqBody: StateRequest, rejectToFallback: boolean, priorUncertain: boolean):
@@ -27464,6 +27477,11 @@ export class RunRunner {
     };
     try {
       let uncertain = false;
+      if (detailed) {
+        const outcome = await pass({ ...body, recovery_detail: opts!.detail }, true, false);
+        if (outcome === "confirmed") return true;
+        if (typeof outcome === "object") uncertain = outcome.uncertain;
+      }
       if (marked) {
         const outcome = await pass({ ...body, retained_capacity_only: true }, true, false);
         if (outcome === "confirmed") {
@@ -28392,6 +28410,17 @@ export class RunRunner {
     let lastWitnessed: Pick<import("./recovery-progress.js").RecoveryProgress, "startedAt" | "deadline" | "attempts" | "episode" | "claimGeneration"> | undefined;
     let observed = 0;
     let allCapacity = true;
+    // Issue #4177: why the retained adoption was refused, set only by a classified remediation refusal of the last
+    // iteration. Active wins over unknown. Absent never permits adoption; it only selects the generic park text.
+    let adoptionRefusal: RetainedAdoptionRefusal | undefined;
+    let callbackRefusal: RetainedAdoptionRefusal | undefined;
+    const noteCallbackRefusal = (refusal: RetainedAdoptionRefusal): false => {
+      if (callbackRefusal !== "secret_remediation_active") callbackRefusal = refusal;
+      return false;
+    };
+    // An `unknown` probe after the operation signal or the iteration deadline fired says nothing about the evidence.
+    const refuseRelation = (relation: "ancestor" | "divergent" | "unknown", interrupted: boolean): false =>
+      relation === "unknown" && interrupted ? false : noteCallbackRefusal(relationRefusal(relation));
     const fail = async (): Promise<never> => {
       this.retainedLifecycleGuard(flight);
       // Deadline expiry can reclassify a failed iteration, but only persisted readback
@@ -28431,6 +28460,13 @@ export class RunRunner {
                   snapshot.journal.attemptId !== expectedSource.attemptId) throw new Error("recovery readback identity changed");
               persisted = snapshot.journal;
               persistedPaths = snapshot.paths;
+              // Issue #4177 crash rediscovery: a claim that adopted nothing itself (the refusal's in-memory class
+              // died with the previous process) re-derives the class from the blocked journal, read-only.
+              if (adoptionRefusal === undefined && observed === 0 && blocker === "adoption_failed" &&
+                  persisted.recovery?.stage === "blocked" && persisted.recovery.blocker === "adoption_failed") {
+                adoptionRefusal = await this.git.classifyBlockedRemediationAdoption(bare, branch, key, expectedSource);
+                this.retainedLifecycleGuard(flight);
+              }
             }
           });
       }
@@ -28494,7 +28530,11 @@ export class RunRunner {
         // The proof can exhaust its operation clock. Use a separate bounded ownership
         // probe before either outcome, so integrity refusal cannot overwrite a changed owner.
         await checkOwnership();
-        if (quiescent && await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed"))
+        // The detail rides only a park whose final blocker is still adoption_failed (a deadline can rewrite it) and
+        // whose persisted readback agrees (the enclosing condition); the api feature gate is applied by the park.
+        const detail = blocker === "adoption_failed" ? adoptionRefusal : undefined;
+        if (quiescent && await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed",
+          detail === undefined ? undefined : { detail }))
           throw new RetainedRecoveryStop();
       }
       if (persistence === "" && persisted?.recovery?.stage === "blocked" && persisted.recovery.blocker === "budget_exhausted" &&
@@ -28819,6 +28859,7 @@ export class RunRunner {
                   checkpointKey: flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : undefined),
                   selfContained: this.retainedSuccessorSelfContained(claim, flight),
                   admitRemediationSource: async input => {
+                    callbackRefusal = undefined;
                     this.retainedLifecycleGuard(flight);
                     assertOldFacts(input.flaggedOIDs);
                     if (!record || input.runId !== source.runId || input.clonePath !== source.clonePath ||
@@ -28829,11 +28870,11 @@ export class RunRunner {
                     if (scan.trusted && scan.findings.length) {
                       deferredRestrictions = { tip: input.sourceTip, findings: scan.findings };
                       this.latchRemediationFindings(flight, bare, branch, scan.findings);
-                      return false;
+                      return noteCallbackRefusal("secret_remediation_active");
                     }
                     this.retainedLifecycleGuard(flight);
                     assertOldFacts(input.flaggedOIDs);
-                    if (!scan.trusted) return false;
+                    if (!scan.trusted) return noteCallbackRefusal("remediation_proof_unknown");
                     const roots = [...new Set([...input.restrictedRoots, ...(flight.remediationRestrictions?.roots ?? [])])];
                     const executionTip = input.executionTip ?? input.sourceTip;
                     const floors = [...new Set([executionTip,
@@ -28849,7 +28890,7 @@ export class RunRunner {
                       const relation = await this.git.ancestry(bare, root, input.sourceTip);
                       this.retainedLifecycleGuard(flight);
                       assertOldFacts(input.flaggedOIDs);
-                      if (relation !== "divergent") return false;
+                      if (relation !== "divergent") return refuseRelation(relation, signal.aborted || Date.now() >= iteration.deadline);
                     }
                     // Parser-bounded roots and range/published floors; a failed proof stops adoption.
                     // Every probe retains the existing recovery signal and deadline.
@@ -28858,7 +28899,7 @@ export class RunRunner {
                         const relation = await this.git.ancestry(bare, root, floor);
                         this.retainedLifecycleGuard(flight);
                         assertOldFacts(input.flaggedOIDs);
-                        if (relation !== "divergent") return false;
+                        if (relation !== "divergent") return refuseRelation(relation, signal.aborted || Date.now() >= iteration.deadline);
                       }
                     this.retainedLifecycleGuard(flight);
                     assertOldFacts(input.flaggedOIDs);
@@ -28951,6 +28992,12 @@ export class RunRunner {
         if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
         observed++;
         if (!(error instanceof RetainedSeedCapacityShortfall)) allCapacity = false;
+        // The class belongs to this refusal only: git's annotation, merged with the callback's runner-local class.
+        const gitRefusal = retainedAdoptionRefusal(error);
+        adoptionRefusal = blocker !== "adoption_failed" ? undefined
+          : gitRefusal === "secret_remediation_active" || callbackRefusal === "secret_remediation_active"
+            ? "secret_remediation_active" : gitRefusal ?? callbackRefusal;
+        callbackRefusal = undefined;
         flight.runLog.warn("retained recovery iteration failed; reserved budget retained", {
           iteration: iteration.attempts, ...formatRetainedRecoveryDiagnostic(error, flight.redactText),
         });
