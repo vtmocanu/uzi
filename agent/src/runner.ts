@@ -4270,8 +4270,9 @@ export class RunRunner {
       const existed = flight.remediationRestrictions;
       const state = flight.remediationRestrictions ??= { roots: [] };
       // Existing, injected and successor-capture latches can never acquire clearable provenance.
-      if (!existed) state.clearable = progress.cause === "pre_read_unavailable" && !progress.started && !flight.predecessorCapture;
-      else if (progress.cause !== "pre_read_unavailable" || progress.started) state.clearable = false;
+      if (!existed) state.clearable = progress.cause === "pre_read_unavailable" && !progress.started && !progress.acquired &&
+        !flight.predecessorCapture;
+      else if (progress.cause !== "pre_read_unavailable" || progress.started || progress.acquired) state.clearable = false;
       const current = flight.remediationDenialRevision ?? 0;
       // Never wrap or clear this denial revision; a verified clear removes only the transient latch.
       flight.remediationDenialRevision = Number.isSafeInteger(current) && current >= 0 && current < Number.MAX_SAFE_INTEGER

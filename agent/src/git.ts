@@ -1897,6 +1897,8 @@ export interface RemediationRecovery {
 /** Worker-owned, per-query diagnostics; never carries journal bytes or exception text. */
 export interface RemediationRestrictionProgress {
   started?: boolean;
+  /** Set when withLock enters its locked section; any later failure is post-acquisition and sticky (#4191). */
+  acquired?: boolean;
   cause?: "pre_read_unavailable" | "enrolled_observed" | "blocked" | "integrity" | "identity" |
     "changed_facts" | "post_read_expiry" | "unknown";
   observe?: (facts: RemediationRestrictionFacts) => void;
@@ -4637,7 +4639,7 @@ export class GitCache {
         combined.throwIfAborted();
         budget?.check();
       } catch (error) {
-        if (opts?.restrictionProgress && !opts.restrictionProgress.started)
+        if (opts?.restrictionProgress && !opts.restrictionProgress.started && !opts.restrictionProgress.acquired)
           opts.restrictionProgress.cause = "pre_read_unavailable";
         throw error;
       }
@@ -4660,7 +4662,8 @@ export class GitCache {
     catch (error) {
       // MaintenanceBudget.run checks the budget before entering `run`; classify that entry expiry only when it is
       // positively the budget's own and no read has started.
-      if (opts?.restrictionProgress && !opts.restrictionProgress.started && this.isBudgetExpiry(error, budget))
+      if (opts?.restrictionProgress && !opts.restrictionProgress.started && !opts.restrictionProgress.acquired &&
+        this.isBudgetExpiry(error, budget))
         opts.restrictionProgress.cause = "pre_read_unavailable";
       throw error;
     }
@@ -26835,7 +26838,7 @@ try {
     try { recovery = this.recoveryOperation(); }
     catch (error) {
       // Only a positively identified maintenance-budget expiry before any read is a clearable interruption.
-      if (restrictionProgress && !restrictionProgress.started
+      if (restrictionProgress && !restrictionProgress.started && !restrictionProgress.acquired
         && this.isBudgetExpiry(error, this.recoveryOperations.getStore()?.budget)) restrictionProgress.cause = "pre_read_unavailable";
       throw error;
     }
@@ -26844,7 +26847,7 @@ try {
     try {
       this.checkRecoveryInterruption();
     } catch (error) {
-      if (restrictionProgress) restrictionProgress.cause = "pre_read_unavailable";
+      if (restrictionProgress && !restrictionProgress.acquired) restrictionProgress.cause = "pre_read_unavailable";
       throw error;
     }
     const signals = [boundary?.signal, recovery?.signal, report?.signal, MaintenanceBudget.signal()].filter((s): s is AbortSignal => s !== undefined);
@@ -26888,12 +26891,15 @@ try {
         return;
       }
       started = true;
+      if (restrictionProgress) restrictionProgress.acquired = true;
       removeAbortListener();
       let outcome: { ok: true; value: T } | { ok: false; error: unknown };
       try {
+        // The bare lock is already held here (started = true above), so a failure is post-acquisition
+        // and must stay sticky (#4191): it is never classified as pre-read unavailability.
         try { this.checkRecoveryInterruption(); }
         catch (error) {
-          if (restrictionProgress) restrictionProgress.cause = "pre_read_unavailable";
+          if (restrictionProgress) restrictionProgress.cause = "unknown";
           throw error;
         }
         const value = await fn();

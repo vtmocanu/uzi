@@ -425,6 +425,41 @@ for (const mode of ["lock entry budget expiry", "run entry budget expiry", "lock
   });
 }
 
+for (const mode of ["generic error", "budget-owned expiry"] as const) {
+  test("#4191 a failure after the bare lock is acquired keeps the latch sticky: " + mode, async t => {
+    const f = await fixture(false);
+    const { runner, cache, subject, flight } = f.fresh();
+    let wall = 0;
+    const budget = new MaintenanceBudget(1000, () => wall);
+    const expire = (): unknown => {
+      wall = 5000;
+      try { budget.check(); } catch (error) { return error; }
+      throw new Error("budget did not expire");
+    };
+    try {
+      // withLock checks recovery interruption once before scheduling (pre-acquisition) and once inside
+      // the locked section (post-acquisition). Abort only the second check, before the facts callback.
+      const original = (cache as any).checkRecoveryInterruption.bind(cache);
+      let calls = 0;
+      t.mock.method(cache as any, "checkRecoveryInterruption", () => {
+        calls++;
+        if (calls === 2) throw mode === "budget-owned expiry" ? expire() : new Error("deadline expired after lock acquisition");
+        return original();
+      });
+      await MaintenanceBudget.run(budget, async () => {
+        assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
+      });
+      assert.ok(calls >= 2, "the post-acquisition check ran");
+      assert.ok(flight.remediationRestrictions, "bootstrap latched");
+      assert.equal(flight.remediationRestrictions.clearable, false, "post-acquisition failure is sticky");
+      t.mock.restoreAll();
+      // A later verified unenrolled read must not clear a sticky latch.
+      assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: false });
+      assert.ok(flight.remediationRestrictions, "sticky latch survives a clean read");
+    } finally { runner.shutdown(); }
+  });
+}
+
 for (const mode of ["clearable reread fails", "clearable reread confirms", "sticky"] as const) {
   test("#4191 teardown of a no-pending latch with a bound completion source: " + mode, async t => {
     const f = await sourceImportFixture(false);
