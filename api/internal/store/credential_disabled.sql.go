@@ -199,7 +199,8 @@ func (q *Queries) LockDefaultAnthropicSecretForShare(ctx context.Context, userID
 }
 
 const lockRunForCredentialSwitch = `-- name: LockRunForCredentialSwitch :one
-SELECT id, status, status_since, claim_generation, recovery_wait_cause, recovery_retry_not_before
+SELECT id, status, status_since, claim_generation, recovery_wait_cause, recovery_retry_not_before,
+       hold_reason, policy_outcome_id, policy_resolved_at
 FROM runs
 WHERE id = $1 AND user_id = $2
 FOR UPDATE
@@ -217,6 +218,9 @@ type LockRunForCredentialSwitchRow struct {
 	ClaimGeneration        int64              `json:"claim_generation"`
 	RecoveryWaitCause      pgtype.Text        `json:"recovery_wait_cause"`
 	RecoveryRetryNotBefore pgtype.Timestamptz `json:"recovery_retry_not_before"`
+	HoldReason             pgtype.Text        `json:"hold_reason"`
+	PolicyOutcomeID        pgtype.UUID        `json:"policy_outcome_id"`
+	PolicyResolvedAt       pgtype.Timestamptz `json:"policy_resolved_at"`
 }
 
 // The set-token verb's run lock (PRD #1733). SetRunCredential reads a run unlocked, validates the
@@ -235,6 +239,9 @@ func (q *Queries) LockRunForCredentialSwitch(ctx context.Context, arg LockRunFor
 		&i.ClaimGeneration,
 		&i.RecoveryWaitCause,
 		&i.RecoveryRetryNotBefore,
+		&i.HoldReason,
+		&i.PolicyOutcomeID,
+		&i.PolicyResolvedAt,
 	)
 	return i, err
 }
