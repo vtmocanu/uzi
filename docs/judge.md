@@ -461,17 +461,18 @@ stays live and reads **Run judge** (or **Re-run judge**).
 When the automatic judge is skipped because the judge's harness has no usable
 credential, the run page says so instead of showing an empty panel: it names
 the reason (no usable credential for the harness, the credential is disabled,
-or no pooled Codex account was available), links to **Run defaults** so you can
-fix the credential or change [Judge runs on](#judge-runs-on), and offers
-**Run judge**. The skip is recorded only after every other check has passed, so
+or no pooled Codex account was available), links to **Run defaults**, where
+[Judge runs on](#judge-runs-on) and the Claude judge token are chosen (Codex
+accounts are linked and pooled in Settings), and offers **Run judge**. The skip is recorded only after every other check has passed, so
 a run the judge would never review (see [Which runs are judged](#which-runs-are-judged))
 shows nothing.
 
 The record is a single latest entry per run: a newer skip overwrites it, and
 creating any judge for the run (the automatic one or **Run judge**) deletes it.
 It shows only while the run has no review and no judge in flight. Clicking
-**Run judge** while the harness still has no usable credential is refused with
-`the judge's harness (<harness>) has no usable credential`, and the skip stays.
+**Run judge** while the credential is still missing is refused with a message
+naming what is missing (an Anthropic token, a usable credential for the judge's
+harness, or a pooled Codex account), shown inline in the panel, and the skip stays.
 
 ## Filing an issue from a recommendation
 

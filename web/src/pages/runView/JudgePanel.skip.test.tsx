@@ -130,6 +130,7 @@ describe("JudgePanel skip state (#3257 M2)", () => {
     renderPanel();
     expect(await screen.findByRole("button", { name: "Judge scheduled" })).toBeTruthy();
     expect(screen.queryByText(/The judge was skipped/)).toBeNull();
+    expect(screen.queryByText("judge skipped")).toBeNull();
   });
 
   it("an absent skip key (older api) renders the never-judged state", async () => {
