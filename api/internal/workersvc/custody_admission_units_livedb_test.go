@@ -614,8 +614,9 @@ func TestCustodyUnitsPerRunBoundBoundaryLiveDB(t *testing.T) {
 // is the per-run reason, a claim refuses it and the hold rows are untouched; discarding one hold
 // (own holds limit-1) then lets the same run claim, so the refusal was the bound and nothing else.
 // ResumePublicationForgeHold is covered by TestCustodyRunHoldBoundPublicationResumeLiveDB and the
-// handler route POST /api/runs/{id}/resume-now by TestResumeNowCustodyRunHoldBoundLiveDB (handler
-// package). Not covered: ResumePausedRun resumes a paused run, not a custody park; it feeds the
+// handler route POST /api/runs/{id}/resume-now's requeue-and-preserve-holds behaviour by
+// TestResumeNowCustodyRunHoldBoundLiveDB (handler package; it drives no claim, the refusal is
+// covered here). Not covered: ResumePausedRun resumes a paused run, not a custody park; it feeds the
 // same ClaimRun clause, which does not depend on how the run reached queued.
 func TestCustodyRunHoldBoundOwnerResumeVerbsLiveDB(t *testing.T) {
 	const limit = 3
