@@ -27,7 +27,11 @@ data:
   {{- if hasKey .Values.api.config "UZI_ADMIN_RUN_DEBUG" }}
   {{- fail "Set UZI_ADMIN_RUN_DEBUG through api.adminRunDebug.enabled, not api.config" }}
   {{- end }}
-  {{- if (.Values.api.adminRunDebug).enabled }}
+  {{- $adminRunDebugEnabled := (.Values.api.adminRunDebug).enabled }}
+  {{- if and (not (kindIs "invalid" $adminRunDebugEnabled)) (not (kindIs "bool" $adminRunDebugEnabled)) }}
+  {{- fail "api.adminRunDebug.enabled must be a boolean true/false (a quoted or --set-string value is truthy and would enable the flag)" }}
+  {{- end }}
+  {{- if $adminRunDebugEnabled }}
   UZI_ADMIN_RUN_DEBUG: "true"
   {{- end }}
   {{- /*

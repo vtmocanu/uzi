@@ -37,18 +37,18 @@ var adminRunDebugLogger = func() *slog.Logger { return slog.Default() }
 // admin_ro (never a cookie, never a uzc_ token), and the user, loaded live per
 // request, must still be an admin.
 func (h *Handler) adminRunDebugActor(r *http.Request) (store.User, uuid.UUID, bool) {
-	if !h.cfg.AdminRunDebug {
-		return store.User{}, uuid.Nil, false
-	}
-	cred, ok := mw.CLICredentialFromContext(r.Context())
-	if !ok || cred.Scope != clitoken.ScopeAdminRO {
-		return store.User{}, uuid.Nil, false
-	}
-	user, ok := mw.UserFromContext(r.Context())
-	if !ok || !user.IsAdmin {
+	cred, credOK := mw.CLICredentialFromContext(r.Context())
+	user, userOK := mw.UserFromContext(r.Context())
+	if !adminRunDebugAllowed(h.cfg.AdminRunDebug, cred, credOK, user, userOK) {
 		return store.User{}, uuid.Nil, false
 	}
 	return user, cred.TokenID, true
+}
+
+// adminRunDebugAllowed is the pure fail-closed decision behind adminRunDebugActor:
+// every condition must hold.
+func adminRunDebugAllowed(flagOn bool, cred mw.CLICredential, credOK bool, user store.User, userOK bool) bool {
+	return flagOn && credOK && cred.Scope == clitoken.ScopeAdminRO && userOK && user.IsAdmin
 }
 
 func adminRunDebugBaseAttrs(actor store.User, tokenID uuid.UUID, route adminRunDebugRoute) []any {

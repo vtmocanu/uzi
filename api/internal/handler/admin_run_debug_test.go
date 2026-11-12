@@ -118,6 +118,36 @@ func TestAdminRunDebugActor(t *testing.T) {
 	}
 }
 
+func TestAdminRunDebugAllowed(t *testing.T) {
+	adminRO := mw.CLICredential{TokenID: uuid.New(), Scope: clitoken.ScopeAdminRO}
+	userScope := mw.CLICredential{TokenID: uuid.New(), Scope: clitoken.ScopeUser}
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	nonAdmin := store.User{ID: uuid.New()}
+	cases := []struct {
+		name   string
+		flag   bool
+		cred   mw.CLICredential
+		credOK bool
+		user   store.User
+		userOK bool
+		want   bool
+	}{
+		{"all conditions met", true, adminRO, true, admin, true, true},
+		{"flag off", false, adminRO, true, admin, true, false},
+		{"no credential", true, adminRO, false, admin, true, false},
+		{"stored scope user, admin user", true, userScope, true, admin, true, false},
+		{"no user", true, adminRO, true, admin, false, false},
+		{"non-admin user", true, adminRO, true, nonAdmin, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := adminRunDebugAllowed(tc.flag, tc.cred, tc.credOK, tc.user, tc.userOK); got != tc.want {
+				t.Fatalf("adminRunDebugAllowed = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAdminRunDebugActorNoCredential(t *testing.T) {
 	h := &Handler{cfg: adminDebugCfg(true)}
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", nil)

@@ -14,11 +14,11 @@
 # case that fails for a different reason than the one asserted, is a BROKEN INSTRUMENT
 # (exit 2), never a pass.
 #
-# NOT ASSERTED: that the flag alone keeps the ConfigMap. api.config cannot be emptied (a
-# values override merges into the default map, and null breaks the template's hasKey), and
-# the default chart carries other ConfigMap triggers, so the flag's membership in
-# uzi.apiConfigMapEnabled is not observable here. Case (b) still proves the rendered flag
-# reaches the pod through the Deployment envFrom.
+# FLAG-ONLY CASE (e): the other uzi.apiConfigMapEnabled triggers are nulled out with
+# --set <key>=null, so the flag is the only reason left to render the ConfigMap. Its
+# negative control (the same overrides without the flag must render NO api ConfigMap)
+# proves the overrides really removed every other trigger; if it does not, the instrument
+# is broken (exit 2).
 #
 # EXIT CODES:
 #     2 = the instrument is broken (helm/yq/chart missing, a render that must succeed
@@ -104,8 +104,7 @@ fi
 render "$WORK/on.yaml" api-configmap.yaml --set api.adminRunDebug.enabled=true
 _got=$(flag_key "$WORK/on.yaml")
 if [ "$_got" = "ABSENT" ]; then
-  echo "BROKEN: UZI_ADMIN_RUN_DEBUG absent from a render with api.adminRunDebug.enabled=true" >&2
-  exit 2
+  bad "(b) UZI_ADMIN_RUN_DEBUG absent from a render with api.adminRunDebug.enabled=true"
 elif [ "$_got" = "true" ]; then
   ok "(b) enabled renders UZI_ADMIN_RUN_DEBUG: \"true\""
 else
@@ -134,6 +133,46 @@ expect_fail "(d) enabled + api.config.UZI_ADMIN_RUN_DEBUG" "Set UZI_ADMIN_RUN_DE
   --set api.adminRunDebug.enabled=true --set-string api.config.UZI_ADMIN_RUN_DEBUG=true
 expect_fail "(d) api.secretEnv.UZI_ADMIN_RUN_DEBUG" "Set UZI_ADMIN_RUN_DEBUG through api.adminRunDebug.enabled, not api.secretEnv" \
   --set-string api.secretEnv.UZI_ADMIN_RUN_DEBUG=x
+
+expect_fail "(d) enabled + api.secretEnv.UZI_ADMIN_RUN_DEBUG" "Set UZI_ADMIN_RUN_DEBUG through api.adminRunDebug.enabled, not api.secretEnv" \
+  --set api.adminRunDebug.enabled=true --set-string api.secretEnv.UZI_ADMIN_RUN_DEBUG=x
+
+# --- (e) only a real boolean enables the flag -----------------------------------------------
+_BOOL_MSG="api.adminRunDebug.enabled must be a boolean true/false"
+expect_fail "(e) string \"false\"" "$_BOOL_MSG" --set-string api.adminRunDebug.enabled=false
+expect_fail "(e) string \"true\"" "$_BOOL_MSG" --set-string api.adminRunDebug.enabled=true
+expect_fail "(e) string \"0\"" "$_BOOL_MSG" --set-string api.adminRunDebug.enabled=0
+
+# --- (f) flag-only: the flag alone keeps the ConfigMap and the Deployment envFrom ------------
+# Null every other uzi.apiConfigMapEnabled trigger of the default values.
+set -- --set api.config.API_ADDR=null --set releaseCheck=null --set database.mode=external
+if ! helm template uzi "$CHART" --namespace uzi "$@" > "$WORK/ctl.yaml" 2> "$WORK/ctl.err"; then
+  echo "BROKEN: the flag-less control render failed" >&2
+  cat "$WORK/ctl.err" >&2
+  exit 2
+fi
+if [ "$(yq 'select(.kind == "ConfigMap" and .metadata.name == "uzi-api-config") | .metadata.name' "$WORK/ctl.yaml")" != "" ]; then
+  echo "BROKEN: the flag-less control still renders an api ConfigMap (another trigger remains; the flag-only case would be vacuous)" >&2
+  exit 2
+fi
+# The whole render must succeed; the ConfigMap being absent from it is the property failing.
+if ! helm template uzi "$CHART" --namespace uzi "$@" --set api.adminRunDebug.enabled=true > "$WORK/only-all.yaml" 2> "$WORK/only.err"; then
+  echo "BROKEN: the flag-only render failed" >&2
+  cat "$WORK/only.err" >&2
+  exit 2
+fi
+yq 'select(.kind == "ConfigMap" and .metadata.name == "uzi-api-config")' "$WORK/only-all.yaml" > "$WORK/only.yaml"
+yq 'select(.kind == "Deployment" and .metadata.name == "uzi-api")' "$WORK/only-all.yaml" > "$WORK/onlydep.yaml"
+if [ "$(flag_key "$WORK/only.yaml")" = "true" ]; then
+  ok "(f) flag alone renders the api ConfigMap with UZI_ADMIN_RUN_DEBUG"
+else
+  bad "(f) flag-only render lacks the api ConfigMap UZI_ADMIN_RUN_DEBUG"
+fi
+if [ "$(envfrom_name "$WORK/onlydep.yaml")" = "uzi-api-config" ]; then
+  ok "(f) flag-only api Deployment envFroms the ConfigMap"
+else
+  bad "(f) flag-only api Deployment does not envFrom the ConfigMap"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "FAIL: UZI_ADMIN_RUN_DEBUG is NOT correctly rendered from api.adminRunDebug.enabled" >&2
