@@ -607,7 +607,7 @@ func providerBoardLine(r apitypes.RunDTO) string {
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 	return isIterationHold(r.RunDTO) || isForgePark(r.RunDTO) || r.ForgeOriginCooldown != nil || (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
-		diskParkLine(r.RunDTO) != "" || credentialHoldLine(r.RunDTO) != "" || credentialSwitchHoldLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) ||
+		diskParkLine(r.RunDTO) != "" || credentialHoldLine(r.RunDTO) != "" || credentialSwitchHoldLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) || isSpendLimitHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) ||
 		isProviderUnavailableHold(r.RunDTO) || providerParkLine(r.RunDTO) != ""
 }
 
@@ -639,6 +639,10 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 			hold = "Publishing held · Resume (publication-only)/Cancel · detail: enter"
 		}
 		out := prefix + paintSeg(m.pal.amber, bg, false, hold)
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
+	if isSpendLimitHold(r.RunDTO) {
+		out := prefix + paintSeg(m.pal.amber, bg, false, "Spend limit · Resume/Cancel · detail: enter")
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	if isIterationHold(r.RunDTO) {

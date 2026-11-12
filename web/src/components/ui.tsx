@@ -525,6 +525,7 @@ export const RUN_STATUS_TONES: Record<
   retained_recovery_unknown: { tone: "warning" },
   worker_requeue_exhausted: { tone: "warning" },
   worker_memory_pressure: { tone: "warning" },
+  anthropic_spend_limit: { tone: "warning" },
   /** PRD #1190: a run its OWNER paused. `info` tone (D11), deliberately DISTINCT from
    *  the warning-toned involuntary holds (limit_wait / pool_wait / awaiting_*): those
    *  are something to notice, a pause is something the owner did. NOT pulsing — a paused
@@ -610,6 +611,7 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   retained_recovery_unknown: "retained recovery timing unknown",
   worker_requeue_exhausted: "recovery needs decision",
   worker_memory_pressure: "memory pressure: owner hold",
+  anthropic_spend_limit: "spend limit: owner hold",
   // PRD #1190: the "‖" glyph tells a chosen pause apart from the rate-limit park's "~"
   // (the TUI carries the same distinction). Kept in step with runBadge's matching
   // "‖ paused" label — the ui.test.tsx label-agreement loop over RUN_STATUS_TONES asserts

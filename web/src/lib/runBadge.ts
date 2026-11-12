@@ -170,6 +170,7 @@ const PARK_LABELS = {
   retained_continuation_unwitnessed: "unwitnessed continuation hold",
   worker_requeue_exhausted: "recovery needs decision",
   worker_memory_pressure: "memory pressure: owner hold",
+  anthropic_spend_limit: "spend limit: owner hold",
   paused: "paused",
   credential_disabled: "waiting: credential disabled",
   credentials_reset: "waiting: credentials were reset",
@@ -280,6 +281,7 @@ export function effectiveRunStatus(
   }
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted") return "worker_requeue_exhausted";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure") return "worker_memory_pressure";
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "anthropic_spend_limit") return "anthropic_spend_limit";
   return run.status;
 }
 
@@ -418,7 +420,7 @@ export function runStatusTone(
   if (status === "pool_wait") return "warning";
   // Recovery holds use warning: transient recovery and worker exhaustion are
   // non-terminal, though exhaustion requires an owner decision.
-  if (status === "retained_recovery_adoption_failed" || status === "retained_continuation_unwitnessed" || status === "codex_idle_stall_retrying" || status === "codex_idle_stall_held" || status === "codex_idle_stall_unknown" || status === "retained_recovery_retrying" || status === "retained_recovery_held" || status === "retained_recovery_unknown" || status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
+  if (status === "retained_recovery_adoption_failed" || status === "retained_continuation_unwitnessed" || status === "codex_idle_stall_retrying" || status === "codex_idle_stall_held" || status === "codex_idle_stall_unknown" || status === "retained_recovery_retrying" || status === "retained_recovery_held" || status === "retained_recovery_unknown" || status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure" || status === "anthropic_spend_limit") return "warning";
   // PRD #1190: an ordinary paused run. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
@@ -970,6 +972,15 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
           `Memory interventions: used ${run.memory_hold?.used ?? "unknown"}. Maximum: ${run.memory_hold?.max ?? "unknown"}. Remaining: ${run.memory_hold?.remaining ?? "unknown"}.`,
         ].join(" "),
       };
+    case "anthropic_spend_limit":
+      return {
+        kind: "badge",
+        label: PARK_LABELS.anthropic_spend_limit,
+        tone: "warning",
+        pulse: false,
+        title:
+          "The run's Anthropic API key hit its spend limit. Only the run owner can resume, switch token or cancel; there is no scheduled retry.",
+      };
     // The board projection omits the cause; run details determine the available actions.
     case "recovery_wait":
       return {
@@ -1238,6 +1249,7 @@ export function needsHumanAttention(status: string): boolean {
     status === "retained_continuation_unwitnessed" ||
     status === "worker_requeue_exhausted" ||
     status === "worker_memory_pressure" ||
+    status === "anthropic_spend_limit" ||
     status === "iteration_budget_exhausted" ||
     status === "provider_unavailable" ||
     status === "codex_policy_hold" ||

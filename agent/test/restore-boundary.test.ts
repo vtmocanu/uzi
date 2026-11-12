@@ -480,6 +480,23 @@ describe("attribution census", () => {
     runAttributionCensus({ pairs, complete: true, selfIncarnation: "inc-S", predecessorClonePath: P,
       peekSlot: async (p) => { peeked.push(p); const s = slots[p] ?? null; if (s === "throw") throw new Error("x"); return s; } });
 
+  it("a prior completed restore's retained P blocks another restore in the same bare, but not an isolated bare", async () => {
+    const priorP = `/a/prior.attempt-${P_ATT}`, priorS = `/z/successor.attempt-${S_ATT}`;
+    const current = { key: "uzi-recovery.current.clone", value: j(P) };
+    const prior = { key: "uzi-restore.previous.journal", value: restoreTombstoneJson(rbasis(priorP), {
+      runId: "previous", attemptId: S_ATT, clonePath: priorS,
+    }) };
+    const peeked: string[] = [];
+    assert.deepEqual(await run([current, prior], {
+      [priorP]: slot({ epoch: "epoch-1", owner: { worker: "worker-incarnation-1", executor: null } }),
+      [priorS]: slot({ state: "retired" }),
+    }, peeked),
+      { ok: false, reason: "census_foreign_active" });
+    assert.ok(peeked.includes(priorP));
+    assert.equal(peeked.includes(P), false, "only the current P is excused");
+    assert.deepEqual(await run([current], {}), { ok: true, paths: [P] }, "a separately attributed bare remains eligible");
+  });
+
   it("a stopped-canonical source of another run that is foreign-active refuses", async () => {
     assert.deepEqual(await run([{ key: "uzi-stopped.r2.entry", value: marker("/b/canon") }], { "/b/canon": slot({ owner: { worker: "inc-Z", executor: null } }) }),
       { ok: false, reason: "census_foreign_active" });

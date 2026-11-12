@@ -1,0 +1,263 @@
+[
+  {
+    "$type": "Tag",
+    "id": "68-1001",
+    "name": "tag-1",
+    "owner": {
+      "$type": "User",
+      "id": "11-1001",
+      "login": "user-1"
+    },
+    "readSharingSettings": {
+      "$type": "WatchFolderSharingSettings",
+      "permittedGroups": [
+        {
+          "$type": "AllUsersGroup",
+          "allUsersGroup": true,
+          "id": "675-0",
+          "name": "All Users"
+        }
+      ],
+      "permittedUsers": [
+        {
+          "$type": "User",
+          "id": "11-1002",
+          "login": "user-2"
+        },
+        {
+          "$type": "User",
+          "id": "11-1003",
+          "login": "user-3"
+        }
+      ]
+    },
+    "tagSharingSettings": {
+      "$type": "TagSharingSettings",
+      "permittedGroups": [],
+      "permittedUsers": [
+        {
+          "$type": "User",
+          "id": "11-1002",
+          "login": "user-2"
+        },
+        {
+          "$type": "User",
+          "id": "11-1003",
+          "login": "user-3"
+        }
+      ]
+    }
+  },
+  {
+    "$type": "Tag",
+    "id": "68-1002",
+    "name": "tag-2",
+    "owner": {
+      "$type": "User",
+      "id": "11-1004",
+      "login": "user-4"
+    },
+    "readSharingSettings": {
+      "$type": "WatchFolderSharingSettings",
+      "permittedGroups": [
+        {
+          "$type": "AllUsersGroup",
+          "allUsersGroup": true,
+          "id": "675-0",
+          "name": "All Users"
+        }
+      ],
+      "permittedUsers": [
+        {
+          "$type": "User",
+          "id": "11-1002",
+          "login": "user-2"
+        },
+        {
+          "$type": "User",
+          "id": "11-1003",
+          "login": "user-3"
+        }
+      ]
+    },
+    "tagSharingSettings": {
+      "$type": "TagSharingSettings",
+      "permittedGroups": [],
+      "permittedUsers": [
+        {
+          "$type": "User",
+          "id": "11-1002",
+          "login": "user-2"
+        },
+        {
+          "$type": "User",
+          "id": "11-1003",
+          "login": "user-3"
+        }
+      ]
+    }
+  },
+  {
+    "$type": "Tag",
+    "id": "68-1003",
+    "name": "tag-3",
+    "owner": {
+      "$type": "User",
+      "id": "11-1005",
+      "login": "user-5"
+    },
+    "readSharingSettings": {
+      "$type": "WatchFolderSharingSettings",
+      "permittedGroups": [
+        {
+          "$type": "AllUsersGroup",
+          "allUsersGroup": true,
+          "id": "675-0",
+          "name": "All Users"
+        }
+      ],
+      "permittedUsers": [
+        {
+          "$type": "User",
+          "id": "11-1006",
+          "login": "user-6"
+        },
+        {
+          "$type": "User",
+          "id": "11-1002",
+          "login": "user-2"
+        },
+        {
+          "$type": "User",
+          "id": "11-1007",
+          "login": "user-7"
+        },
+        {
+          "$type": "User",
+          "id": "11-1003",
+          "login": "user-3"
+        }
+      ]
+    },
+    "tagSharingSettings": {
+      "$type": "TagSharingSettings",
+      "permittedGroups": [],
+      "permittedUsers": [
+        {
+          "$type": "User",
+          "id": "11-1006",
+          "login": "user-6"
+        },
+        {
+          "$type": "User",
+          "id": "11-1002",
+          "login": "user-2"
+        },
+        {
+          "$type": "User",
+          "id": "11-1007",
+          "login": "user-7"
+        },
+        {
+          "$type": "User",
+          "id": "11-1003",
+          "login": "user-3"
+        }
+      ]
+    }
+  },
+  {
+    "$type": "Tag",
+    "id": "68-1004",
+    "name": "tag-4",
+    "owner": {
+      "$type": "User",
+      "id": "11-1008",
+      "login": "user-8"
+    },
+    "readSharingSettings": {
+      "$type": "WatchFolderSharingSettings",
+      "permittedGroups": [
+        {
+          "$type": "ProjectTeam",
+          "allUsersGroup": false,
+          "id": "673-1",
+          "name": "Named Team 1"
+        },
+        {
+          "$type": "AllUsersGroup",
+          "allUsersGroup": true,
+          "id": "675-0",
+          "name": "All Users"
+        }
+      ],
+      "permittedUsers": [
+        {
+          "$type": "User",
+          "id": "11-1002",
+          "login": "user-2"
+        }
+      ]
+    },
+    "tagSharingSettings": {
+      "$type": "TagSharingSettings",
+      "permittedGroups": [],
+      "permittedUsers": [
+        {
+          "$type": "User",
+          "id": "11-1002",
+          "login": "user-2"
+        }
+      ]
+    }
+  },
+  {
+    "$type": "Tag",
+    "id": "68-1005",
+    "name": "tag-5",
+    "owner": {
+      "$type": "User",
+      "id": "11-1009",
+      "login": "user-9"
+    },
+    "readSharingSettings": {
+      "$type": "WatchFolderSharingSettings",
+      "permittedGroups": [
+        {
+          "$type": "AllUsersGroup",
+          "allUsersGroup": true,
+          "id": "675-0",
+          "name": "All Users"
+        }
+      ],
+      "permittedUsers": [
+        {
+          "$type": "User",
+          "id": "11-1002",
+          "login": "user-2"
+        },
+        {
+          "$type": "User",
+          "id": "11-1003",
+          "login": "user-3"
+        }
+      ]
+    },
+    "tagSharingSettings": {
+      "$type": "TagSharingSettings",
+      "permittedGroups": [],
+      "permittedUsers": [
+        {
+          "$type": "User",
+          "id": "11-1002",
+          "login": "user-2"
+        },
+        {
+          "$type": "User",
+          "id": "11-1003",
+          "login": "user-3"
+        }
+      ]
+    }
+  }
+]

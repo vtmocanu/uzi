@@ -62,17 +62,19 @@ export interface PodEpochDeletionDeps {
   enableForTest?: symbol;
 }
 /**
- * Activation gate for the runner-scratch reclaim (issue #4043), separate from the attempt-deletion activation
- * ({@link PodEpochDeletionDeps.activation}, the one-worker canary of issue #4134)
- * and independent of it: the attempt gate being open never starts scratch work and the reverse. While it is false,
- * production startup does nothing for scratch: no census, no new child and no new path read. Flipping it needs a
- * separate owner decision recorded on issue #4043.
- *
- * Test-only override: the phase also runs when `scratch.scratchTestGate` is exactly the sentinel below, which
- * agent/test/pod-epoch-reclaim-support.ts exports as `ENABLE_SCRATCH_FOR_TEST`. Nothing under agent/src passes
- * `scratchTestGate` (a test asserts it), and the seams in {@link PodEpochScratchDeps.seams} are ignored without it.
+ * Startup opt-in for runner-scratch reclaim, independent of attempt deletion.
+ * It permits phase entry only; every layout, authority and deletion guard still applies.
+ * Test seams remain exclusive to the scratch test sentinel.
  */
-export const EPOCH_SCRATCH_DELETION_ENABLED: boolean = false;
+export function readEpochScratchDeletionActivation(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.UZI_EPOCH_SCRATCH_DELETION;
+  if (raw === undefined || raw === "" || raw === "0") return false;
+  if (raw === "1") {
+    if (env.UZI_EPOCH_LOCK === "1" && dockerSidecarExpected(env)) return true;
+    throw new Error("UZI_EPOCH_SCRATCH_DELETION=1 requires an epoch-locked, Docker-wired worker (UZI_EPOCH_LOCK=1 and DOCKER_HOST or UZI_DIND_SOCKET)");
+  }
+  throw new Error("UZI_EPOCH_SCRATCH_DELETION must be unset, empty, 0 or 1");
+}
 const TEST_SCRATCH_GATE = Symbol.for("uzi.test.pod-epoch-reclaim.scratch-gate");
 
 /** Test seams of the scratch phase; honored only under the test gate sentinel, never passed by main.ts. */
@@ -98,7 +100,9 @@ export interface PodEpochScratchDeps {
   git: Pick<GitCache, "collectEpochScratchProtectedPaths" | "discardEpochScratchLeaf" | "assertNoUnsettledDeletes">;
   /** Worker-wide exclusive-idle proof (bound to terminalMaintenanceProof). */
   quiesce: () => Promise<boolean>;
-  /** Test override sentinel only; see {@link EPOCH_SCRATCH_DELETION_ENABLED}. */
+  /** Startup opt-in parsed by main.ts; permits phase entry, supplies no evidence. */
+  activation?: boolean;
+  /** Test override sentinel only; production uses activation. */
   scratchTestGate?: symbol;
   seams?: PodEpochScratchTestSeams;
 }
@@ -835,7 +839,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     // the guard open. It never reads bytes_state or partial_causes: the #3851 attempt shortfalls are not its
     // authority. Gate closed (production): nothing below this condition executes. ----
     const scratchDeps = options.scratch;
-    if (scratchDeps && (EPOCH_SCRATCH_DELETION_ENABLED || scratchDeps.scratchTestGate === TEST_SCRATCH_GATE) &&
+    if (scratchDeps && (scratchDeps.activation === true || scratchDeps.scratchTestGate === TEST_SCRATCH_GATE) &&
         result.verdict === "eligible" && result.authority.result === "attested" &&
         !invalid && !controller.signal.aborted && typeof ownership.beginReclaim === "function") {
       settleGits.add(scratchDeps.git);

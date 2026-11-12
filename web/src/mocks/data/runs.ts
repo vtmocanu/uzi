@@ -2238,6 +2238,12 @@ for (const [id, max, sourceOnly] of [
     },
   });
 }
+// Issue #3767: a Claude run held on its Anthropic API key's spend limit. Owner-held (explicit
+// null retry stamp); open /runs/run-spend-limit-hold.
+mockRuns.push({
+  ...pausedBase, id: "run-spend-limit-hold", status: "recovery_wait", hold_reason: null,
+  recovery_wait_cause: "anthropic_spend_limit", recovery_retry_not_before: null,
+});
 mockRuns.push(
   { ...pausedBase, id: "run-iteration-hold", hold_reason: "iteration_budget_exhausted",
     budget_wall_seconds: null, budget_total_seconds: 3600, budget_used_seconds: 1800,

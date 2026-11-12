@@ -41,6 +41,7 @@ var recoveryWaitCauses = map[string]bool{
 	recoveryCauseVaultLocked:                    true,
 	recoveryCauseDataVolumeFull:                 true,
 	recoveryCauseCodexAccountUnavailable:        true,
+	recoveryCauseAnthropicSpendLimit:            true,
 }
 
 // recoveryCauseVaultLocked is the issue #1766 cause for a run parked because its owner's vault
@@ -48,6 +49,12 @@ var recoveryWaitCauses = map[string]bool{
 const recoveryCauseVaultLocked = "vault_locked"
 
 const recoveryCauseCodexIdleStall = "codex_idle_stall"
+
+// recoveryCauseAnthropicSpendLimit is the issue #3767 cause for a run whose Anthropic API call
+// was refused for a spend limit. The worker reports it (gated by the protocol feature
+// recovery_cause_anthropic_spend_limit); setRecoveryWait parks it with a NULL retry, so it is an
+// owner-held hold that only Resume, set-token or Cancel moves. Never promoted by the sweeper.
+const recoveryCauseAnthropicSpendLimit = "anthropic_spend_limit"
 
 // recoveryCauseDataVolumeFull is the PRD #1809 M5 (D6) cause for a run parked because its
 // worker's data volume is (or was about to be) full. Historical cap failures retain
