@@ -54,7 +54,10 @@ def read_json(path):
             require(key not in result)
             result[key] = value
         return result
-    return json.loads(raw, object_pairs_hook=pairs)
+    def bounded_int(raw_number):
+        require(len(raw_number) <= 20)
+        return int(raw_number)
+    return json.loads(raw, object_pairs_hook=pairs, parse_int=bounded_int)
 
 
 def margin_fraction(raw):
@@ -64,7 +67,7 @@ def margin_fraction(raw):
             return 0.1
         value = float(raw)
         return value if math.isfinite(value) and 0 <= value < 1 else 0.1
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return 0.1
 
 
@@ -172,12 +175,18 @@ def inventory(raw_root):
     digest = hashlib.sha256(v)
     started = time.monotonic()
     count = total = entries = 0
-    for base, dirs, files in os.walk(root/"src", followlinks=False):
-        entries += len(dirs)+len(files)
-        require(entries <= 20000 and time.monotonic()-started < 10)
-        dirs.sort()
-        for name in dirs:
-            require(not (Path(base)/name).is_symlink())
+    pending = [root/"src"]
+    while pending:
+        base = pending.pop()
+        dirs, files = [], []
+        with os.scandir(base) as stream:
+            for entry in stream:
+                entries += 1
+                require(entries <= 20000 and time.monotonic()-started < 10)
+                require(not entry.is_symlink())
+                (dirs if entry.is_dir(follow_symlinks=False) else files).append(entry.name)
+        # Retained names and pending directories together are bounded by entries.
+        pending.extend(base/name for name in sorted(dirs, reverse=True))
         for name in sorted(files):
             p = Path(base)/name
             require(not p.is_symlink() and p.is_file())
@@ -208,7 +217,8 @@ def report(args):
     def observe(name, fn):
         try:
             legs[name] = fn()
-        except (ValueError, OSError, KeyError, TypeError, http.client.HTTPException):
+        except (ValueError, OSError, KeyError, TypeError, OverflowError, RecursionError,
+                http.client.HTTPException):
             legs[name] = leg("UNVERIFIED", "missing-invalid-or-unavailable")
     observe("threshold", lambda: leg("PROVEN", "current-manifest-shape-only",
                                     soft=threshold(read_json(args.manifest), time.time())))

@@ -35,7 +35,9 @@ All inputs are optional so unavailable prerequisites can be inspected:
   Reads VERSION and src; never executes its tools. `--source-sha256` must match
   the deterministic source inventory digest.
 - `--manifest`: absolute existing regular JSON file beneath this worktree's
-  .uzi/scratch, without symlink components or parent traversal. Maximum 64 KiB.
+  .uzi/scratch, without symlink components or parent traversal. Maximum 64 KiB;
+  integer tokens at most 20 characters, duplicate keys rejected. Malformed or
+  excessively nested JSON yields UNVERIFIED rather than aborting the report.
 
 The nonsecret threshold manifest has exactly these keys:
 
@@ -54,7 +56,8 @@ authenticated proof of live worker configuration. Never put secrets in inputs.
 The source digest starts with VERSION bytes, then sorted depth-first src file
 relative path, NUL, contents, NUL. Facts include file count, content bytes,
 aggregate SHA256 and VERSION SHA256. Inventory caps: 20,000 directory/file
-entries, 256 MiB content, 1 KiB VERSION, 10 seconds checked between reads.
+entries checked during streaming directory enumeration before retaining names,
+256 MiB content, 1 KiB VERSION, 10 seconds checked between entries and reads.
 Only small regular fixtures are unit tested. Concurrent replacement or special
 filesystem behavior is not an attested snapshot; no hostile-filesystem guarantee.
 Installed host source is not proof of the Go version/source inside an image.

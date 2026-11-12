@@ -1,5 +1,6 @@
 """Pure small fixtures: no Docker, Go, subprocesses or native caches."""
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -127,6 +128,41 @@ class PreflightTests(unittest.TestCase):
             self.assertFalse(result[key])
         self.assertEqual(result["limits"]["aggregate"], 2147483648)
         self.assertEqual(result["frozen"]["T"], 268435456)
+
+    def test_malformed_numeric_metadata_reports_unverified(self):
+        fixture = self.root/"manifest.json"
+        args = argparse.Namespace(manifest=str(fixture), endpoint="/fixture.sock", docker_version="fixture",
+            image=None, repo_digest=None, go_root=None, source_sha256=None, experimental=True)
+        for field in ("observed_at", "threshold", "margin"):
+            fixture.write_text(json.dumps(self.manifest(**{field: 10**400})))
+            with patch.object(p, "docker_get", side_effect=OSError):
+                self.assertEqual(p.report(args)["legs"]["threshold"]["status"], "UNVERIFIED")
+        fixture.write_text("["*1500 + "0" + "]"*1500)
+        with patch.object(p, "docker_get", side_effect=OSError):
+            self.assertEqual(p.report(args)["legs"]["threshold"]["status"], "UNVERIFIED")
+
+    def test_inventory_stops_during_stream_enumeration(self):
+        (self.root/"VERSION").write_text("go1.27.3\n")
+        (self.root/"src").mkdir()
+        consumed = []
+        class Entry:
+            def __init__(self, n):
+                self.name = "entry" + str(n)
+            def is_dir(self, **_):
+                return False
+            def is_symlink(self):
+                return False
+        @contextlib.contextmanager
+        def scan(_):
+            def entries():
+                for n in range(20005):
+                    consumed.append(n)
+                    yield Entry(n)
+            yield entries()
+        with patch.object(p.os, "scandir", scan):
+            with self.assertRaises(ValueError):
+                p.inventory(str(self.root))
+        self.assertLessEqual(len(consumed), 20001)
 
     def test_json_sanitization(self):
         raw = p.encode({"value": "fixture\x1b[31m\n\u202e"})
