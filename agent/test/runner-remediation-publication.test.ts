@@ -20,7 +20,8 @@ function command(dir: string, ...args: string[]): string {
   }).trim();
 }
 type Flight = Record<string, unknown> & {
-  remediationRestrictions?: { roots: string[]; denialRevision?: number;
+  remediationDenialRevision?: number;
+  remediationRestrictions?: { roots: string[];
     pending?: { requiredOIDs: string[]; requireDenial: boolean } };
 };
 type Subject = {
@@ -216,7 +217,7 @@ for (const mode of ["checkpoint", "push"] as const) {
         }
         if (failure === "late denial") {
           assert.ok(flight.remediationRestrictions);
-          flight.remediationRestrictions.denialRevision = 1;
+          flight.remediationDenialRevision = 1;
           lateMutation = true;
         }
         return { trusted: failure !== "unknown scan", findings: [] };
