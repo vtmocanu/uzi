@@ -173,7 +173,8 @@ export async function enrollClaudeCommand(
   const convert = (evidence: Awaited<ReturnType<CodexRootHandle["observe"]>>, startedAt: number): Observation => {
     const completedAtMs = performance.now();
     if (evidence.state !== "complete" || !same(evidence.supervisor, supervisor) || !same(evidence.root, primary)) {
-      return { available: false, complete: false, startedAtMs: startedAt, completedAtMs, rows: [] };
+      return { available: false, complete: false, startedAtMs: startedAt, completedAtMs, rows: [],
+        detail: evidence.state === "complete" ? "identity_mismatch" : evidence.reason };
     }
     return { available: true, complete: true, startedAtMs: startedAt, completedAtMs,
       supervisor, primary, rows: evidence.processes.map(({ pid, startTime, rss }) => ({ pid, startTime, rssBytes: rss })) };
@@ -211,10 +212,10 @@ export async function enrollClaudeCommand(
     source: "claude-model-command", toolId: metadata.toolId, attemptId: metadata.attemptId,
     command: metadata.command, root: supervisor, primary,
     observe: async (budget) => {
-      if (!current() || budget?.signal.aborted) return { available: false, complete: false, startedAtMs: performance.now(), completedAtMs: performance.now(), rows: [] };
+      if (!current() || budget?.signal.aborted) return { available: false, complete: false, startedAtMs: performance.now(), completedAtMs: performance.now(), rows: [], detail: "retired" };
       const started = performance.now();
       const evidence = await boundedCommandWait(handle.observe(budget?.remainingMs ?? deadlineMs), budget?.remainingMs ?? deadlineMs);
-      if (!current() || budget?.signal.aborted) return { available: false, complete: false, startedAtMs: started, completedAtMs: performance.now(), rows: [] };
+      if (!current() || budget?.signal.aborted) return { available: false, complete: false, startedAtMs: started, completedAtMs: performance.now(), rows: [], detail: "retired" };
       return convert(evidence, started);
     },
     cancel: async (authority) => {

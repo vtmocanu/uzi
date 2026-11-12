@@ -9,7 +9,8 @@ import {
 import { makeDefaultSpawnCommand } from "../src/codex/codex-executor.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { SupervisedChildExitTimeoutError, type CodexRootHandle, type ObservationOutcome } from "../src/codex/launcher.js";
-import { WorkerMemoryCommands } from "../src/worker-memory-commands.js";
+import { MemoryWaitTimeout, WorkerMemoryCommands } from "../src/worker-memory-commands.js";
+import { boundedCommandWait } from "../src/codex/memory-command.js";
 import { WorkerMemoryMonitor } from "../src/worker-memory-guard.js";
 import type { WorkerMemoryPressureResult } from "../src/protocol.js";
 import { projectToolOutput } from "../src/codex/projection.js";
@@ -770,4 +771,42 @@ test("long_running selected victim retains pressure outcome when effective deadl
   } finally {
     root.completeDisposal(); expire(); await monitor.stop(); await reply;
   }
+});
+
+test("#4219 the adapter observation carries the evidence reason, identity_mismatch or retired as detail", async () => {
+  const c = captured();
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  const root = fakeRoot();
+  const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, undefined, c), registry, c);
+  const reply = b.handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
+  await until(() => c.commands.eligibleEntries()?.length === 1);
+  const entry = c.commands.eligibleEntries()![0]!;
+  const budget = () => ({ remainingMs: 500, signal: new AbortController().signal });
+  const complete = await entry.observe(budget());
+  assert.equal(complete.available, true);
+  assert.equal("detail" in complete, false, "a complete observation has no detail");
+  for (const reason of ["unreadable", "oversize", "stale", "timeout", "busy", "transport"] as const) {
+    root.change({ event: "observe", id: 2, state: "unavailable", reason });
+    const o = await entry.observe(budget());
+    assert.deepEqual([o.available, o.complete, o.rows, o.detail], [false, false, [], reason]);
+  }
+  root.change({ event: "observe", id: 3, state: "complete", supervisor: { pid: 50, startTime: "18446744073709551614" },
+    root: { pid: 51, startTime: ticks }, processes: [{ pid: 51, startTime: ticks, ppid: 50, rss: 100 }] });
+  assert.equal((await entry.observe(budget())).detail, "identity_mismatch");
+  const aborted = new AbortController();
+  aborted.abort();
+  assert.equal((await entry.observe({ remainingMs: 500, signal: aborted.signal })).detail, "retired");
+  c.commands.retire(c.context);
+  assert.equal((await entry.observe(budget())).detail, "retired");
+  root.child.resolve({ event: "child_exit", code: 0 });
+  await reply;
+});
+
+test("#4219 boundedCommandWait rejects with MemoryWaitTimeout and the unchanged message", async () => {
+  await assert.rejects(boundedCommandWait(new Promise<never>(() => {}), 5), (error: unknown) => {
+    assert.ok(error instanceof MemoryWaitTimeout);
+    assert.ok(error instanceof Error);
+    assert.equal((error as Error).message, "command cleanup/outcome deadline");
+    return true;
+  });
 });
