@@ -42,6 +42,10 @@ ALTER TABLE workers
 -- Audit history. Snapshot identifiers deliberately have no foreign keys: deletion
 -- must preserve history. Down keeps this table, so Up must be re-entrant and must
 -- refuse a leftover table whose shape no longer matches.
+-- Remember (transaction-locally) whether the table already existed, so a fresh install
+-- never depends on the text pg_get_constraintdef prints; only a leftover table is
+-- compared against the exact definitions below.
+SELECT set_config('uzi.hibernation_events_preexisting', (to_regclass('worker_hibernation_events') IS NOT NULL)::text, true);
 CREATE TABLE IF NOT EXISTS worker_hibernation_events (
  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
  owner_id uuid NOT NULL,
@@ -56,11 +60,12 @@ CREATE TABLE IF NOT EXISTS worker_hibernation_events (
 CREATE INDEX IF NOT EXISTS worker_hibernation_events_worker_time_idx
  ON worker_hibernation_events (worker_id, occurred_at);
 
--- Re-entrant validation of a leftover table: restore each named CHECK that is
--- absent, then require the exact column shape, the exact set of CHECK and
--- PRIMARY KEY constraint definitions and the exact index definition. A
--- constraint or index that exists with a different definition RAISEs; it is
--- never silently replaced.
+-- Re-entrant validation of a LEFTOVER table (one that existed before this migration
+-- ran). A table created above is only given its named CHECKs: restore each named
+-- CHECK that is absent. For a leftover only, also require the exact column
+-- shape, the exact set of CHECK and PRIMARY KEY constraint definitions and the
+-- exact index definition. A constraint or index that exists with a different
+-- definition RAISEs; it is never silently replaced.
 -- +goose StatementBegin
 DO $$
 DECLARE
@@ -76,12 +81,14 @@ DECLARE
   'worker_hibernation_events_reason_check=CHECK (((reason IS NULL) OR ((char_length(reason) >= 1) AND (char_length(reason) <= 500))))'];
  actual_cons text[];
  idx text;
+ leftover boolean;
 BEGIN
+ leftover := current_setting('uzi.hibernation_events_preexisting', true) = 'true';
  SELECT array_agg(column_name || ':' || data_type || ':' || is_nullable ORDER BY column_name)
   INTO actual_cols
   FROM information_schema.columns
   WHERE table_schema = current_schema() AND table_name = 'worker_hibernation_events';
- IF actual_cols IS DISTINCT FROM (SELECT array_agg(e ORDER BY split_part(e, ':', 1)) FROM unnest(expected_cols) e) THEN
+ IF leftover AND actual_cols IS DISTINCT FROM (SELECT array_agg(e ORDER BY split_part(e, ':', 1)) FROM unnest(expected_cols) e) THEN
   RAISE EXCEPTION 'worker_hibernation_events has an unexpected shape: %', actual_cols;
  END IF;
 
@@ -101,6 +108,10 @@ BEGIN
    CHECK (reason IS NULL OR char_length(reason) BETWEEN 1 AND 500);
  END IF;
 
+ IF NOT leftover THEN
+  RETURN;
+ END IF;
+
  SELECT array_agg(conname || '=' || pg_get_constraintdef(oid) ORDER BY conname)
   INTO actual_cons
   FROM pg_constraint
@@ -114,7 +125,7 @@ BEGIN
     AND indexrelid = to_regclass('worker_hibernation_events_worker_time_idx');
  IF idx IS NULL OR idx NOT IN (
    'CREATE INDEX worker_hibernation_events_worker_time_idx ON worker_hibernation_events USING btree (worker_id, occurred_at)',
-   'CREATE INDEX worker_hibernation_events_worker_time_idx ON ' || current_schema() || '.worker_hibernation_events USING btree (worker_id, occurred_at)') THEN
+   'CREATE INDEX worker_hibernation_events_worker_time_idx ON ' || quote_ident(current_schema()) || '.worker_hibernation_events USING btree (worker_id, occurred_at)') THEN
   RAISE EXCEPTION 'worker_hibernation_events_worker_time_idx is missing or wrong: %', idx;
  END IF;
 END;

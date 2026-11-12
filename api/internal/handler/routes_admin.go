@@ -164,6 +164,11 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// RequireAdmin, target from the path, never the body.
 			r.Put("/users/{id}/ci-autofix", h.SetUserCIAutofixEnabled)
 			r.Put("/settings", h.UpdateSettings)
+			// Worker hibernation (PRD #4205): admin-only sleep and wake of a persistent hosted
+			// worker. Cookie-only so a uza_ Bearer 401s and CSRF applies; the actor is the
+			// session user and the target comes from the path.
+			r.Post("/workers/{id}/hibernate", h.AdminHibernateWorker)
+			r.Post("/workers/{id}/wake", h.AdminWakeWorker)
 			// Instance maintenance (PRD #3454): cookie-only like settings, so an admin read
 			// token is refused and CSRF applies; the actor is the session user.
 			r.Put("/maintenance", h.AdminPutMaintenance)

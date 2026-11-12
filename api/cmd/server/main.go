@@ -599,6 +599,8 @@ func run() error {
 	// profile-bound run says provisioning is off, rather than waiting on a lane worker that the
 	// provisioner will never create.
 	wsvc.SetEphemeralSettings(settingsCache)
+	// Worker hibernation kill-switch (PRD #4205): admission and the disable-wake pass read it.
+	wsvc.SetHibernationSettings(settingsCache)
 	// Issue #1965: a profile-bound run on a deployment without the lane says so instead of waiting.
 	wsvc.SetIsolatedLaneEnabled(cfg.IsolatedLaneEnabled())
 	// PRD #2006: lease entry on a worker-reported terminal and lease-arm claims (0 disables).
@@ -891,6 +893,13 @@ func run() error {
 		// and concurrency-safe. Rides this ticker like the passes above rather than a
 		// goroutine of its own. Flag-off footprint is one settings read: the pass returns
 		// immediately unless the instance kill-switch (ephemeral_workers_enabled) is on.
+		// Worker hibernation settle pass (PRD #4205): withdraws overdue preparations, paces
+		// wakes after the setting is switched off, settles waking workers and flags an
+		// unconfirmed wake. Unconditional: waking a sleeper never depends on the setting.
+		sweeper.Pass{
+			Name: "worker_hibernation_settle",
+			Run:  wsvc.HibernationSettlePass,
+		},
 		sweeper.Pass{
 			Name: "ephemeral_workers_provision",
 			Run:  ephemeralProv.ProvisionPass,

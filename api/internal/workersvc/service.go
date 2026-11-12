@@ -1996,6 +1996,9 @@ type Service struct {
 	// ephemeralSettings reads the instance ephemeral-worker kill-switch for the queued reason
 	// of a profile-bound run (PRD #1906 M5). Optional (nil-safe); set via SetEphemeralSettings.
 	ephemeralSettings EphemeralSettingsReader
+	// hibernationSettings reads the worker-hibernation kill-switch (PRD #4205). Optional;
+	// set via SetHibernationSettings. Nil is "off".
+	hibernationSettings HibernationSettings
 	// isolatedLaneDisabled is true when the deployment did not enable the isolated research
 	// lane (issue #1965); set via SetIsolatedLaneEnabled. Stored negated so a Service that never
 	// calls the setter (tests, other wiring) keeps the pre-#1965 queued reasons.
@@ -2691,6 +2694,13 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	row, err := qtx.RegisterWorker(ctx, regParams)
 	if err != nil {
 		return store.Worker{}, "", err
+	}
+	// PRD #4205: a Register against a waking worker is settlement evidence, recorded in
+	// this same transaction under the row lock taken above.
+	if prior.HibernationState == "waking" {
+		if err := s.settleRegisteredWaking(ctx, qtx, store.Worker(row), registeredPodUID); err != nil {
+			return store.Worker{}, "", err
+		}
 	}
 	// Validate before any snapshot/FK write and capture the conservative union,
 	// including orphan phases even when there is no valid active snapshot.
