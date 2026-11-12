@@ -1446,6 +1446,22 @@ describe("OverviewNext health chip popover", () => {
     await expect.poll(() => document.activeElement).toBe(chip);
   });
 
+  it("stays inside the viewport and below the chip at sm and wider", async () => {
+    for (const width of [640, 768, 1024, 1280, 1440]) {
+      cleanup();
+      await page.viewport(width, 900);
+      const chip = await mountChip();
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "System health" });
+      await document.fonts.ready;
+      const r = dialog.getBoundingClientRect();
+      const visibleWidth = document.documentElement.clientWidth;
+      expect.soft(r.left, `left edge at ${width}px`).toBeGreaterThanOrEqual(15);
+      expect.soft(r.right, `right edge at ${width}px`).toBeLessThanOrEqual(visibleWidth - 15);
+      expect.soft(r.top, `below the chip at ${width}px`).toBeGreaterThanOrEqual(chip.getBoundingClientRect().bottom);
+    }
+  });
+
   it("stays inside the viewport as a bottom sheet at 375px", async () => {
     await page.viewport(375, 900);
     const chip = await mountChip();

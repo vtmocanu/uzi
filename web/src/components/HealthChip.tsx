@@ -8,7 +8,7 @@
 // follow PeopleChip. If the last attention item clears while the panel is open, the panel
 // closes and focus moves to the link the chip has become.
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { attentionChecks, healthVerdict } from "../lib/healthView";
@@ -37,6 +37,35 @@ export function HealthChip() {
     setOpen(false);
     if (returnFocus) triggerRef.current?.focus();
   }, []);
+
+  // The chip sits left of centre in the header, so a panel right-aligned to it can run past the
+  // viewport's left edge at sm+. Measure and clamp it into the visible width. Below sm the
+  // fixed bottom sheet places itself, so no inline style there (it would override inset-x-4).
+  const [panelLeft, setPanelLeft] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    if (!open) {
+      setPanelLeft(null);
+      return;
+    }
+    // jsdom has no matchMedia: treat it as "not sm+" and leave the CSS placement alone.
+    const mq = window.matchMedia?.("(min-width: 640px)");
+    const place = () => {
+      const host = hostRef.current;
+      const panel = panelRef.current;
+      if (!host || !panel || !mq?.matches) {
+        setPanelLeft(null);
+        return;
+      }
+      const hostRect = host.getBoundingClientRect();
+      const width = panel.offsetWidth;
+      const max = document.documentElement.clientWidth - 16 - width;
+      const abs = Math.max(16, Math.min(hostRect.right - width, max));
+      setPanelLeft(abs - hostRect.left);
+    };
+    place();
+    window.addEventListener("resize", place);
+    return () => window.removeEventListener("resize", place);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -120,6 +149,7 @@ export function HealthChip() {
           role="dialog"
           aria-label="System health"
           tabIndex={-1}
+          style={panelLeft == null ? undefined : { left: panelLeft, right: "auto" }}
           // Same placement as PeopleChip: below the chip on desktop, a bottom sheet below sm.
           className="absolute right-0 top-full z-30 mt-2 max-h-[70vh] w-[min(40rem,calc(100vw-32px))] overflow-y-auto rounded-xl border border-edge bg-raised text-left shadow-2xl outline-hidden max-sm:fixed max-sm:inset-x-4 max-sm:bottom-4 max-sm:top-auto max-sm:mt-0 max-sm:max-h-[calc(100dvh-2rem)] max-sm:w-auto"
         >
