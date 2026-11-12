@@ -13055,7 +13055,7 @@ WITH expired AS (
     RETURNING cc.*
 ), cancelled AS (
     UPDATE runs child SET plan_cross_check_gate_reason = NULL,
-    status = 'cancelled', finished_at = now(), updated_at = now(),
+    status = 'cancelled', status_since = now(), finished_at = now(), updated_at = now(),
         claim_released_at = now()
     FROM expired e WHERE child.id = e.checker_run_id AND child.status NOT IN ('completed', 'failed', 'cancelled')
 ), banked AS (
@@ -13090,7 +13090,7 @@ WITH leads AS MATERIALIZED (
     RETURNING cc.*
 ), cancelled AS (
     UPDATE runs child SET plan_cross_check_gate_reason = NULL,
-    status = 'cancelled', finished_at = now(), updated_at = now(),
+    status = 'cancelled', status_since = now(), finished_at = now(), updated_at = now(),
         claim_released_at = now()
     FROM superseded cc WHERE child.id = cc.checker_run_id
       AND child.status NOT IN ('completed', 'failed', 'cancelled')

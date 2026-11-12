@@ -125,7 +125,7 @@ WITH expired AS (
  AND cc.outcome = 'pending' AND cc.deadline_at <= now()
  RETURNING cc.*
 ), cancelled AS (
- UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
+ UPDATE runs child SET status = 'cancelled', status_since = now(), finished_at = now(), updated_at = now(),
  claim_released_at = now() FROM expired cc WHERE child.id = cc.checker_run_id
  AND child.status NOT IN ('completed','failed','cancelled')
 )
