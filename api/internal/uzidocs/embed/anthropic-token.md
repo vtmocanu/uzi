@@ -347,8 +347,8 @@ regardless of the worker.
   confirm). Switching to a token that looks tight can warn instead of refuse
   — see [Claude rate limits](rate-limits.md).
 
-  A run parked on an owner hold (worker memory pressure, worker requeue
-  exhausted, or a retained recovery cause) does not promote: `set-token` is
+  A run parked on an owner hold (for example worker memory pressure, worker
+  requeue exhausted, or a retained recovery cause) does not promote: `set-token` is
   refused with a 409 naming the hold, and nothing is written. Resume (which may
   re-hold the run) or Cancel are the ways out.
 
