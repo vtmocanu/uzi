@@ -2308,7 +2308,9 @@ export class FakeApi {
     if (body.status === "awaiting_approval") this.autoApproveByRun.set(runId, false);
     if (body.status === "running") {
       const owned = this.ownershipByRun.get(runId);
-      if (owned?.httpStatus === 200 && owned.status !== undefined && owned.status !== "running")
+      // SetRunRunning only moves a live row (claimed or a wait-for-human status); it refuses terminal,
+      // paused, queued, limit_wait, pool_wait and recovery_wait rows, so those keep their status.
+      if (owned?.httpStatus === 200 && owned.status !== undefined && RUNNING_REPORT_SOURCES.has(owned.status))
         this.ownershipByRun.set(runId, { ...owned, status: "running" });
     }
     this.timeline.push({ type: "state", runId, status: body.status, ...(body.plan_md !== undefined ? { plan_md: body.plan_md } : {}) });
@@ -2428,6 +2430,9 @@ export class FakeApi {
 /** The cross-check lanes of the running rule. `gated` and `required` are the human-gated lanes
  *  (required without auto_approve); `required_auto` and `ordinary` exist so the rule can be stated
  *  for every lane the shared fixture names. */
+/** Row statuses the api's SetRunRunning moves to `running` (runtime.sql). */
+const RUNNING_REPORT_SOURCES = new Set(["claimed", "awaiting_approval", "awaiting_input", "awaiting_followup"]);
+
 export type CrossCheckLane = "gated" | "required" | "required_auto" | "ordinary";
 
 /** What the api's run row holds that the running rule reads. */
@@ -2460,7 +2465,7 @@ export interface CrossCheckApproval {
  *
  *  Approximation: the fake compares only the plan_md of the presented payload. The SQL also compares
  *  milestones, required_tools and size_class (and its pre-plan milestones clause for an auto-approved
- *  required run); none of those is modelled here. `required_auto` is the row while auto_approve is
+ *  required run or a gated run); none of those is modelled here. `required_auto` is the row while auto_approve is
  *  still true; the fake moves a run out of it when it accepts an awaiting_approval report. */
 export function crossCheckRunningAdmitted(model: CrossCheckModel, approvals: CrossCheckApproval[], status: string): boolean {
   const live = approvals.filter((a) => a.applied && !a.superseded);
