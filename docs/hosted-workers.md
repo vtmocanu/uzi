@@ -165,7 +165,7 @@ A wake completes only when the new pod registers (or the original pod is still
 alive). A wake not confirmed within 15 minutes shows a wake error on the worker.
 
 For now a hibernated worker wakes only when an admin presses **Wake** or turns
-the setting off, which wakes every hibernated worker. A run is not woken
+the setting off, which wakes every hibernated or still-hibernating worker. A run is not woken
 automatically.
 
 Status shows in `uzi worker list` and `uzi admin workers`; see
@@ -180,8 +180,9 @@ Operators rolling back past this feature, in order:
 2. Wait until no worker is `hibernating`, `hibernated` or `waking`. The sweeper
    wakes at most 10 workers per pass.
 3. Roll back migrations 00428, then 00427. Down refuses while any worker is not
-   awake or a wake record exists. Rolling back 00428 briefly takes exclusive
-   locks on the runs and workers tables, so do it in a quiet window.
+   awake or a wake record exists. Both rollbacks briefly take exclusive
+   locks (00427 on the workers table; 00428 on the runs and workers tables),
+   so do them in a quiet window.
 4. Only then run an older api: an older api cannot claim runs on the new schema.
 
 If the controller is rolled back mid-operation, affected workers stay fenced in

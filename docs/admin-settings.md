@@ -316,7 +316,7 @@ deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 
 | Setting | Default | Controls |
 |---|---|---|
-| `worker_hibernation_enabled` | `false` | Whether admins may [hibernate](./hosted-workers.md#hibernation) idle persistent hosted workers (Deployment scaled to 0, worker row, join-token Secret and volumes kept). Turning it off wakes every hibernated worker, at most 10 per sweeper pass. Waking is never gated by this setting. |
+| `worker_hibernation_enabled` | `false` | Whether admins may [hibernate](./hosted-workers.md#hibernation) idle persistent hosted workers (Deployment scaled to 0, worker row, join-token Secret and volumes kept). Turning it off wakes every hibernated or still-hibernating worker, at most 10 per sweeper pass. Waking is never gated by this setting. |
 
 Edit it in the **Worker hibernation** card on **Admin → Settings**. Hibernate and
 Wake are per-worker buttons in **Admin → Health**. Roll back migrations before an

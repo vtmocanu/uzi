@@ -40,9 +40,9 @@ describe("WorkerHibernationCard", () => {
 
   it("explains that turning it off wakes every hibernated worker and that waking never depends on it", () => {
     render(<WorkerHibernationCard settings={settingsWith("false")} onSaved={vi.fn()} />);
-    expect(screen.getByText(/every hibernated worker/)).toBeTruthy();
+    expect(screen.getByText(/every hibernated or hibernating worker/)).toBeTruthy();
     expect(screen.getByText(/at most 10 per pass/)).toBeTruthy();
-    expect(screen.getByText(/Waking a worker on demand never depends on this setting/)).toBeTruthy();
+    expect(screen.getByText(/Waking a worker never depends on this setting/)).toBeTruthy();
   });
 
   it("shows the server error when the save fails", async () => {

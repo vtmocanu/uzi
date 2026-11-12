@@ -18,7 +18,7 @@ export function isHibernating(w: Pick<Worker, "hibernation_state">): boolean {
 
 const LABELS: Record<Exclude<HibernationState, "none">, { label: string; title: string }> = {
   preparing: { label: "hibernating", title: "Hibernating: finishing its shutdown. It takes no new runs." },
-  hibernated: { label: "hibernated", title: "Hibernated: its pod is scaled down on purpose. It wakes on demand." },
+  hibernated: { label: "hibernated", title: "Hibernated: its pod is scaled down on purpose. An admin can wake it." },
   waking: { label: "waking", title: "Waking: its pod is starting again. It takes no new runs until it is ready." },
 };
 

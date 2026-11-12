@@ -46,8 +46,8 @@ export function WorkerHibernationCard({
           When on, an admin can hibernate an idle persistent hosted worker: its pod is scaled down
           and its storage is kept, so it costs nothing while it sleeps. A hibernated worker takes no
           new runs and does not count as available capacity. Turning this off wakes{" "}
-          <strong className="text-fg">every hibernated worker</strong> (at most 10 per pass, so a
-          large fleet wakes over several passes). Waking a worker on demand never depends on this
+          <strong className="text-fg">every hibernated or hibernating worker</strong> (at most 10 per pass, so a
+          large fleet wakes over several passes). Waking a worker never depends on this
           setting. Off by default.
         </p>
       </div>

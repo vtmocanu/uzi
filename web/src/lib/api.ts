@@ -1978,7 +1978,7 @@ const realApi = {
   adminListWorkers: () =>
     request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
   // Worker hibernation (PRD #4205): cookie admin writes. 200 {worker_id, state, op_id}. A
-  // refused request is a 409 {error, reason_code}; hibernationRefusalMessage maps the code to
+  // refused request is a 409 {error, reason_code}; hibernationErrorMessage maps the code to
   // human text. The reason is optional and server-sanitized.
   adminHibernateWorker: (id: string, reason?: string) =>
     request<HibernationResult>("POST", `/admin/workers/${encodeURIComponent(id)}/hibernate`, reason ? { reason } : {}),

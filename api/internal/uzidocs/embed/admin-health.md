@@ -6,8 +6,8 @@ audience: operator
 
 # Admin health
 
-Admin health ([PRD #1484](../prds/done/1484-admin-health-tab.md)) is a read-only,
-admin-only diagnostic of what uzi itself can tell about its own ability to run
+Admin health ([PRD #1484](../prds/done/1484-admin-health-tab.md)) is an admin-only
+diagnostic of what uzi itself can tell about its own ability to run
 work: worker rolls and capacity, the queue, the controller's own liveness,
 background loops, the database, integrations, and a handful of housekeeping
 signals. It exists because, before this, an admin had no instance-level way to
@@ -31,7 +31,11 @@ It surfaces six ways:
     default, showing a chip per check; a check that needs attention links up
     to its item, and expanding a group lists each check's own summary;
   - **Fleet, all users**: a cross-user table (owner, worker, status, version,
-    upgrade, blocking reason, last seen).
+    upgrade, blocking reason, last seen). It is read-only except for the
+    worker [hibernation](./hosted-workers.md#hibernation) controls: a
+    Hibernate button on an idle persistent hosted worker, a Wake button on a
+    hibernating, hibernated or waking one, a status chip for each of those
+    states, and the last wake failure. A refused hibernate shows its reason.
 
   The sidebar Admin nav item and the tab itself carry a count pill when
   anything needs attention, red when any check is danger and amber

@@ -3082,7 +3082,7 @@ export type BindMode = "default" | "pinned" | "auto";
 export interface HibernationResult {
   worker_id: string;
   state: "none" | "preparing" | "hibernated" | "waking";
-  op_id: string;
+  op_id?: string;
 }
 
 export interface AdminWorker extends Worker {
