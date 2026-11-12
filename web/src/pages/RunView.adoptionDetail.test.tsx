@@ -64,6 +64,29 @@ it("active secret remediation disables Resume with an accessible reason and show
   expect(text).not.toMatch(/latest|complete/i);
   expect((screen.getByRole("button", { name: /^Cancel$/ }) as HTMLButtonElement).disabled).toBe(false);
   expect(screen.queryByText(GENERIC)).toBeNull();
+  const muted = screen.getByText(/This hold has no scheduled retry\. Only the run owner can Cancel\./);
+  expect(muted.textContent).not.toMatch(/Resume or Cancel/);
+});
+
+it("active secret remediation announces that Resume is unavailable and only Cancel remains", async () => {
+  const { container } = render(view(adoption("secret_remediation_active")));
+  const region = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(region.textContent).toMatch(/Resume is unavailable\. Only the run owner can Cancel\./));
+  expect(region.textContent).not.toMatch(/Resume or Cancel/);
+});
+
+it("a null detail keeps the generic announcement", async () => {
+  const { container } = render(view(adoption(null)));
+  const region = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(region.textContent).toMatch(/Only the run owner can Resume or Cancel\./));
+});
+
+it("a detail change at the same cause re-announces", async () => {
+  const { container, rerender } = render(view(adoption(null)));
+  const region = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(region.textContent).toMatch(/Resume or Cancel/));
+  rerender(view(adoption("secret_remediation_active")));
+  await waitFor(() => expect(region.textContent).toMatch(/Resume is unavailable/));
 });
 
 it("active secret remediation shows both routes even when an archive is listed", async () => {

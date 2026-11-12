@@ -1444,6 +1444,14 @@ function codexHoldCopy(
   }
 }
 
+// Issue #4177: closed copy map for the adoption-failure detail classification.
+const ADOPTION_DETAIL_COPY = {
+  secret_remediation_active:
+    "Resume is unavailable: the retained source is held under an active secret-scan remediation, so Resume cannot succeed unchanged. To recover the work, either export an available recovery archive (uzi run export <run-id> --output <path>), which may omit later work kept on the worker, or ask an operator to recover the retained work from worker storage. Cancel ends the run.",
+  remediation_proof_unknown:
+    "The secret-scan remediation proof could not be verified, so a retry may help.",
+} as const;
+
 /**
  * Issue #1197: the transient-recovery park panel — the analogue of PoolWaitPanel for
  * `recovery_wait`, and deliberately COPY ONLY.
@@ -1478,13 +1486,6 @@ function codexHoldCopy(
  *
  * Exported like the sibling panels so its copy is reachable without mounting the page.
  */
-// Issue #4177: closed copy map for the adoption-failure detail classification.
-const ADOPTION_DETAIL_COPY = {
-  secret_remediation_active:
-    "Resume is unavailable: the retained source is held under an active secret-scan remediation, so Resume cannot succeed unchanged. To recover the work, either export an available recovery archive (uzi run export <run-id> --output <path>), which may omit later work kept on the worker, or ask an operator to recover the retained work from worker storage. Cancel ends the run.",
-  remediation_proof_unknown:
-    "The secret-scan remediation proof could not be verified, so a retry may help.",
-} as const;
 
 function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   run: Run;
@@ -1524,7 +1525,8 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
           {adoptionFailed && "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. "}
           {unwitnessed && "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. "}
           {decisionHeld
-            ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
+            ? secretActive ? "This hold has no scheduled retry. Only the run owner can Cancel."
+              : "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
             : decisionRetrying
               ? idleStall ? `Automatic retry is scheduled not before ${new Date(retryMs).toLocaleString()}; it may still be pending when due. Only the run owner can Resume now or Cancel.`
                 : retryMs <= Date.now() ? "Automatic retry is due; the run will retry automatically. Only the run owner can Resume now or Cancel."
@@ -2526,7 +2528,11 @@ export function RunView() {
                       : `forge:${forgeWaitMode(run)}`
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
-                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed" || run.recovery_wait_cause === "retained_continuation_unwitnessed")
+                  : run.recovery_wait_cause === "retained_recovery_adoption_failed"
+                    ? // Issue #4177: the closed-set detail is part of the key so a detail change at
+                      // the same cause re-announces; null or any other value adds no suffix.
+                      `retained_recovery_adoption_failed${run.recovery_wait_detail === "secret_remediation_active" || run.recovery_wait_detail === "remediation_proof_unknown" ? `:${run.recovery_wait_detail}` : ""}`
+                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_continuation_unwitnessed")
                     ? effectiveRunStatus(run)
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
                     ? "worker_requeue_exhausted"
@@ -2569,7 +2575,9 @@ export function RunView() {
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
-          : parkKey === "retained_recovery_adoption_failed"
+          : parkKey === "retained_recovery_adoption_failed:secret_remediation_active"
+            ? "Integrity hold: the retained source is held under an active secret-scan remediation. The agent did not start. Local work and its custody are preserved. Resume is unavailable. Only the run owner can Cancel. There is no scheduled retry."
+          : parkKey.startsWith("retained_recovery_adoption_failed")
             ? "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "retained_continuation_unwitnessed"
             ? "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. Only the run owner can Resume or Cancel. There is no scheduled retry."
