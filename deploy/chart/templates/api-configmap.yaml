@@ -45,7 +45,7 @@ data:
     issueTracker.allowedBaseURLs value (PRD #4173 S3): the issue tracker SSRF allowlist,
     SEPARATE from the forge one and never an input to the worker egress FQDN list (a worker
     never calls an issue tracker). Every entry is validated by
-    uzi.issueTrackerAllowedBaseURLs (https, with a host) before it is rendered. Empty (the
+    uzi.issueTrackerAllowedBaseURLs (bare https://host[:port]; userinfo, path, query and fragment are refused) before it is rendered. Empty (the
     default) renders no key, so no issue tracker connection can be created.
 
     Setting BOTH issueTracker.allowedBaseURLs AND api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS

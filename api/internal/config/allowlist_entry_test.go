@@ -31,20 +31,20 @@ const userinfoReason = "contains userinfo"
 // any part of the entry.
 func TestAllowlistEntriesRefuseUnsafeForms(t *testing.T) {
 	cases := []struct {
-		entry    string
-		reason   string
-		userinfo bool
+		entry  string
+		reason string
 	}{
-		{"https://tracker.example.com@evil.example.com", userinfoReason, true},
-		{"https://user:s3cret@forge.example.com", userinfoReason, true},
-		{"https://@forge.example.com", userinfoReason, true},
-		{"https://u:s3cret@forge.example.com/%zz", userinfoReason, true},
-		{"https://forge.example.com/some/path", "has a path", false},
-		{"https://forge.example.com//", "has a path", false},
-		{"https://forge.example.com?x=1", "has a query", false},
-		{"https://forge.example.com?", "has a query", false},
-		{"https://forge.example.com#frag", "has a fragment", false},
-		{"https://forge.example.com#", "has a fragment", false},
+		{"https://tracker.example.com@evil.example.com", userinfoReason},
+		{"https://alice:s3cret@forge.example.com", userinfoReason},
+		{"https://@forge.example.com", userinfoReason},
+		{"https://u:s3cret@forge.example.com/%zz", userinfoReason},
+		{"https://forge.example.com/secret%zz", "is not a valid URL"},
+		{"https://forge.example.com/some/path", "has a path"},
+		{"https://forge.example.com//", "has a path"},
+		{"https://forge.example.com?x=1", "has a query"},
+		{"https://forge.example.com?", "has a query"},
+		{"https://forge.example.com#frag", "has a fragment"},
+		{"https://forge.example.com#", "has a fragment"},
 	}
 	for _, p := range allowlistParsers() {
 		for _, tc := range cases {
@@ -66,12 +66,9 @@ func TestAllowlistEntriesRefuseUnsafeForms(t *testing.T) {
 							t.Errorf("error %q lacks %q", msg, w)
 						}
 					}
-					// The fixed reason text itself says "user:password@", so the entry's own
-					// "user:" prefix is checked together with its secret ("user:s3").
-					forbidden := []string{"s3cret", "user:s3", "tracker.example.com", "evil.example.com"}
-					if !tc.userinfo {
-						forbidden = append(forbidden, "forge.example.com")
-					}
+					// The fixed reason text says "user:password@", so the entry's own userinfo is
+					// checked through the distinctive username "alice".
+					forbidden := []string{"s3cret", "alice", "secret", "tracker.example.com", "evil.example.com", "forge.example.com", tc.entry}
 					for _, f := range forbidden {
 						if strings.Contains(msg, f) {
 							t.Errorf("error %q leaks %q", msg, f)

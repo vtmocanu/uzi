@@ -202,6 +202,36 @@ for pair in "forge.allowedBaseURLs:forge" "issueTracker.allowedBaseURLs:issueTra
   expect_reject "$kl" "$yk" "has a path" "https://forge.example.com/secret%zz" $F1 $F2 $F3 secret
 done
 
+# Egress path: with api.enabled=false the api ConfigMap does not render, so only
+# uzi.forgeEgressHosts (worker-fqdn-egress.yaml) can reject a forge entry here. Removing its
+# uzi.validateBaseURLEntry include must redden these cases.
+for pair in \
+  "$_userinfo|https://user:s3cret@forge.example.com" \
+  "has a query|https://forge.example.com?private_token=s3cret" \
+  "has a path|https://forge.example.com/secret%zz" \
+  "must be an absolute https URL with a host|https://[:::]"; do
+  _frag=${pair%%|*}; _ent=${pair#*|}
+  values_file "$WORK/eg.yaml" forge "https://good.example.com" "$_ent"
+  if helm template uzi "$CHART" --namespace uzi --show-only templates/worker-fqdn-egress.yaml \
+      --set api.enabled=false --set workers.enabled=true --set api.tls.enabled=true \
+      --set workers.fqdnEgress.enabled=true -f "$WORK/eg.yaml" > "$WORK/eg.out" 2> "$WORK/eg.err"; then
+    bad "(e) egress path: forge entry '$_ent' rendered but must fail"
+    continue
+  fi
+  if ! grep -F -q -- "$_frag" "$WORK/eg.err" || ! grep -F -q -- "forge.allowedBaseURLs entry 2" "$WORK/eg.err"; then
+    echo "BROKEN: (e) egress path: forge entry failed for an unrelated reason (wanted '$_frag' at entry 2): $(head -c 300 "$WORK/eg.err")" >&2
+    exit 2
+  fi
+  _leak=0
+  for _f in "$_ent" s3cret secret; do
+    if grep -F -q -- "$_f" "$WORK/eg.err"; then
+      bad "(e) egress path: rejection of '$_ent' leaked '$_f' into the error"
+      _leak=1
+    fi
+  done
+  [ "$_leak" -eq 0 ] && ok "(e) egress path rejects '$_ent' ($_frag) without echoing it"
+done
+
 # Accepted shapes render as given, on both lists.
 _acc="https://forge.example.com https://forge.example.com/ https://forge.example.com:8443 https://forge.example.com:8443/"
 _want_acc="https://forge.example.com,https://forge.example.com/,https://forge.example.com:8443,https://forge.example.com:8443/"

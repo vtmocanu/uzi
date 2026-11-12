@@ -378,10 +378,11 @@ true
   render with the raw text on malformed input, and reports empty userinfo for "https://@h"
   and empty query/fragment for a bare "?" / "#", so URL-parsed fields cannot be trusted
   to catch those. Order matters: userinfo, separators, query, fragment, path, shape.
-  An entry that passes the final anchored regex is guaranteed parseable by urlParse:
-  https scheme, a host made only of [A-Za-z0-9._-] or a bracketed [hex:.] literal, an
-  optional numeric port, an optional trailing slash, nothing else. (A bracketed literal
-  that is not a real IP, e.g. [:::], is accepted here and parsed by urlParse without error.)
+  An entry that passes the final anchored regex is made only of: https scheme, a host of
+  [A-Za-z0-9._-], an optional numeric port, an optional trailing slash. That shape holds no
+  bracket, so urlParse never sees a bracketed host. Bracketed IPv6 literals (https://[::1])
+  are therefore refused by the chart: urlParse aborts the render echoing the raw entry when
+  a bracketed host is not a valid IP, so the shape check must keep them out.
 */}}
 {{- define "uzi.validateBaseURLEntry" -}}
 {{- $raw := toString .entry }}
@@ -402,7 +403,7 @@ true
 {{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/]*/." $raw }}
 {{- fail (printf "%s: has a path; only https://host[:port] with an optional trailing / is allowed" $where) }}
 {{- end }}
-{{- if not (regexMatch "^(?i:https)://([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?/?$" $raw) }}
+{{- if not (regexMatch "^(?i:https)://([A-Za-z0-9._-]+)(:[0-9]{1,5})?/?$" $raw) }}
 {{- fail (printf "%s: must be an absolute https URL with a host, e.g. https://github.com (non-ASCII hosts use the xn-- form)" $where) }}
 {{- end }}
 {{- end }}
