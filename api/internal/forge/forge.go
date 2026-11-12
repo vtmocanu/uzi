@@ -129,7 +129,7 @@ const (
 	TypeGitLab Type = "gitlab"
 	// TypeForgejo is the Forgejo REST driver.
 	TypeForgejo Type = "forgejo"
-	// TypeGitHub is the GitHub REST driver (github.com only, classic PAT).
+	// TypeGitHub is the GitHub REST driver (github.com or a GHES host, classic PAT).
 	TypeGitHub Type = "github"
 )
 

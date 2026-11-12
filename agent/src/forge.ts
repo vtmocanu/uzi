@@ -608,7 +608,8 @@ export function forgejoRepoParts(repoUrl: string): { apiBase: string; owner: str
  * → base `https://api.github.com`, a leading `www.` ignored). GitHub Enterprise Server
  * serves it on the web host under `/api/v3` (`https://ghe.example.com/owner/repo` →
  * `https://ghe.example.com/api/v3`), the same base go-github's WithEnterpriseURLs
- * derives on the API side. The last two path segments are owner/repo (a trailing
+ * derives on the API side. GitHub Enterprise Cloud with data residency (`<sub>.ghe.com`)
+ * serves it on `api.<sub>.ghe.com`, like github.com. The last two path segments are owner/repo (a trailing
  * `.git` is stripped).
  */
 export function githubRepoParts(repoUrl: string): { apiBase: string; owner: string; repo: string } {
@@ -617,8 +618,12 @@ export function githubRepoParts(repoUrl: string): { apiBase: string; owner: stri
   const repo = (segs.pop() ?? "").replace(/\.git$/, "");
   const owner = segs.pop() ?? "";
   if (!owner || !repo) throw new ForgeError(0, "cannot derive owner/repo from GitHub repo URL");
-  const apiBase = u.host.replace(/^www\./, "") === "github.com" ? `${u.protocol}//api.github.com` : `${u.protocol}//${u.host}/api/v3`;
-  return { apiBase, owner, repo };
+  const host = u.hostname.replace(/\.$/, "").replace(/^www\./, "");
+  const port = u.port ? `:${u.port}` : "";
+  if (host === "github.com") return { apiBase: `${u.protocol}//api.github.com`, owner, repo };
+  // GitHub Enterprise Cloud with data residency (<sub>.ghe.com) keeps the api.<host> form.
+  if (host.endsWith(".ghe.com")) return { apiBase: `${u.protocol}//api.${host}${port}`, owner, repo };
+  return { apiBase: `${u.protocol}//${u.host}/api/v3`, owner, repo };
 }
 
 function isHttps(url: string): boolean {

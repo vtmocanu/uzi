@@ -1160,7 +1160,8 @@ describe("URL helpers", () => {
       repo: "repo",
     });
     assert.equal(githubRepoParts("https://ghe.example.com:8443/octo/repo").apiBase, "https://ghe.example.com:8443/api/v3");
-    assert.equal(githubRepoParts("https://www.github.com/octo/repo").apiBase, "https://api.github.com");
+    assert.equal(githubRepoParts("https://github.com./octo/repo").apiBase, "https://api.github.com");
+    assert.equal(githubRepoParts("https://acme.ghe.com/octo/repo").apiBase, "https://api.acme.ghe.com");
   });
 
   it("rejects a GitHub URL that has no owner/repo", () => {
