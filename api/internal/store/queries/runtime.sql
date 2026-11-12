@@ -2345,7 +2345,7 @@ WHERE id = @id AND credential_switch_op_id = @op_id;
 -- name: LockAnthropicSecretForApply :one
 -- Issue #4201: share-lock the Anthropic token an in-place apply is about to use, so a concurrent
 -- disable, rotate or delete (which take FOR UPDATE) waits for the apply transaction.
-SELECT id, user_id, kind, ciphertext, sealed_with, disabled_at, anthropic_rejected_at, enablement_rev
+SELECT id, user_id, kind, label, ciphertext, sealed_with, disabled_at, anthropic_rejected_at, enablement_rev
 FROM user_secrets
 WHERE id = @id AND user_id = @user_id AND kind = 'anthropic_token'
 FOR SHARE;
@@ -5023,6 +5023,43 @@ WHERE id = @id
   AND claim_generation = @generation
   AND claim_released_at IS NULL
   AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup');
+
+-- name: SetRunCredentialSwitchUncertainHold :execrows
+-- Issue #4201: the worker's credential_switch_uncertain report. An in-place apply whose outcome the
+-- worker cannot prove (the response was lost, or the swap failed after the server committed) parks the
+-- run PAUSED so the owner decides, rather than letting the session keep spending a token the server
+-- may or may not have recorded. running / awaiting_* -> paused, NON-TERMINAL. hold_reason stays NULL
+-- (an ordinary owner-style pause: Resume works), the worker_id, session_id, open_question_id and gate
+-- state are kept, pause_requested_at / pause_mode are NOT touched (a pending owner pause survives), and
+-- nothing is banked (ResumePausedRun banks the paused gap once, from the status_since written here).
+-- A pending wall or reserve pause is excluded: that park belongs to the worker's own park path and the
+-- caller answers it with a distinct refusal. The switch stamp is NOT cleared: a still-pending stamp
+-- is the evidence that the operation never committed.
+--
+-- THE WHERE IS THE FENCE: reporting worker, reported generation, an UNRELEASED claim, a live status,
+-- a kind that can pause, no existing hold, the operation named by op_id (a stamp pending for it at this
+-- generation, or a committed child epoch for it in this run and generation) and the current
+-- registration incarnation.
+UPDATE runs SET
+    status       = 'paused',
+    -- clock_timestamp() for the same register-floor ordering reason as HoldCredentialSwitchUnsettled.
+    status_since = clock_timestamp(),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at   = now()
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @generation::bigint
+  AND runs.claim_released_at IS NULL
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.kind NOT IN ('job', 'cross_check')
+  AND runs.hold_reason IS NULL
+  AND NOT (runs.pause_requested_at IS NOT NULL AND runs.pause_mode IN ('wall', 'reserve'))
+  AND ((runs.credential_switch_requested_at IS NOT NULL
+        AND runs.credential_switch_generation = @generation::bigint
+        AND runs.credential_switch_op_id = @op_id::uuid)
+       OR EXISTS (SELECT 1 FROM run_credential_switch_epochs e
+                  WHERE e.run_id = runs.id AND e.claim_generation = @generation::bigint AND e.op_id = @op_id::uuid))
+  AND EXISTS (SELECT 1 FROM workers w
+              WHERE w.id = runs.worker_id AND w.snapshot_register_nonce = @register_nonce::text);
 
 -- name: ClearCredentialSwitchByWorker :execrows
 -- PRD #1247 M5 (D3/D14): a bounded capture-failure give-up (a credential_switch_failed worker

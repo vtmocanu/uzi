@@ -69,6 +69,12 @@ func RefoldRunUsage(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, r
 			Payload:         m.Payload,
 			ClaimGeneration: claimGen,
 		}
+		// Issue #4201: the persisted (already clamped) epoch ordinal, so a refold keeps every leg
+		// on the epoch, or in the unattributed bucket, the incremental fold put it in.
+		if m.CredentialEpochOrdinal.Valid {
+			ord := m.CredentialEpochOrdinal.Int32
+			frames[i].CredentialEpochOrdinal = &ord
+		}
 	}
 
 	// The same fold body the incremental path runs, writing through the tx-bound

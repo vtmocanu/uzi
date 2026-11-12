@@ -1165,12 +1165,32 @@ type CredentialOverrideDTO struct {
 // Nullable — the FK nulls it when the token is deleted, exactly as RunDTO.AnthropicSecretID
 // does, so a historical epoch legitimately carries a label with no id. Owner-or-admin scoped
 // like the rest of this DTO, so exposing the per-epoch id here is consistent with that field.
+//
+// Issue #4201 adds the in-generation epochs an in-place token switch opens. Ordinal is 0 for the
+// claim's base epoch (one per generation) and n >= 1 for the nth switch applied inside that
+// generation; a consumer orders epochs by (claim_generation, ordinal). MessageSeq is the seq of the
+// run's credential_switch message for an applied switch (null for a base epoch). Usage is the
+// epoch's own spend, computed by telescoping the run's usage legs, and is omitted when the run has
+// recorded none.
 type CredentialEpochDTO struct {
-	ClaimGeneration int64     `json:"claim_generation"`
-	SecretID        *string   `json:"secret_id"`
-	Label           *string   `json:"label"`
-	SelectReason    *string   `json:"select_reason"`
-	AppliedAt       time.Time `json:"applied_at"`
+	ClaimGeneration int64                    `json:"claim_generation"`
+	Ordinal         int32                    `json:"ordinal"`
+	SecretID        *string                  `json:"secret_id"`
+	Label           *string                  `json:"label"`
+	SelectReason    *string                  `json:"select_reason"`
+	AppliedAt       time.Time                `json:"applied_at"`
+	MessageSeq      *int32                   `json:"message_seq,omitempty"`
+	Usage           *CredentialEpochUsageDTO `json:"usage,omitempty"`
+}
+
+// CredentialEpochUsageDTO is one credential epoch's spend (issue #4201). The fields mean what the
+// run's usage totals mean (tokens by kind, cost in USD), restricted to the legs the epoch opened.
+type CredentialEpochUsageDTO struct {
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CostUSD             float64 `json:"cost_usd"`
 }
 
 // RunSummaryItemDTO is the compact run row served by GET /api/runs?view=summary and

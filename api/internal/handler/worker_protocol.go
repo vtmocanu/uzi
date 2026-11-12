@@ -501,6 +501,13 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// with disposition "held" / "hold_settled". Advertised UNCONDITIONALLY: a worker sends
 		// the two reports ONLY after seeing this token, because an older api 400s the unknown states.
 		{"credential_switch_hold"},
+		// Issue #4201: this api serves POST /api/worker/runs/{id}/credential-switch/apply, accepts
+		// op_id on the credential_switch_failed and credential_switch_held reports, accepts
+		// {status:"credential_switch_uncertain", claim_generation, register_nonce, op_id}, and accepts
+		// a per-message credential_epoch_ordinal on the message append. Advertised UNCONDITIONALLY:
+		// a worker applies a switch in place ONLY after seeing this token, because an older api 404s
+		// the route and 400s the unknown fields and state.
+		{"credential_switch_apply_v1"},
 		// Issue #3985: this api accepts {status:"clarification_settled", claim_generation,
 		// clarification_settlement:{question_id, revision_input_id, gate_revision}} and answers it
 		// with disposition "clarification_settled". It returns a plan cross-check run parked at
@@ -1547,6 +1554,14 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 				stale["registration_evidence"] = result.RegistrationEvidence
 			}
 			httpx.JSON(w, http.StatusConflict, stale)
+		case errors.Is(err, workersvc.ErrCredentialSwitchUncertainParkPending):
+			// Issue #4201: a pending wall or reserve pause owns the park; the worker takes that one
+			// instead of the uncertain hold. Nothing was written. Same {run, reason} shape as the
+			// other typed 409 refusals.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    h.workerRunDTO(r.Context(), run),
+				"reason": "park_pending",
+			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			// Issue #2950: a machine-readable reason so the worker can BLOCK (not retire) its
 			// write-ahead terminal journal instead of retrying a 404 forever. Body is exactly
@@ -1577,7 +1592,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1659,6 +1674,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// Issue #3181: the settlement acknowledgement applied (or replayed): the hold is now
 		// credential_switch_unsettled and the owner's Resume is open.
 		ack["disposition"] = "hold_settled"
+	case "credential_switch_uncertain":
+		// Issue #4201: the uncertain-apply park applied (or replayed): the run is paused for the
+		// owner with its claim, worker and session kept. The worker keys on this.
+		ack["disposition"] = "uncertain"
 	case "clarification_settled":
 		// Issue #3985: the settlement applied (or replayed): the run is back at awaiting_approval
 		// with the human revise still pending. The worker keys on this.
@@ -1688,6 +1707,50 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, ack)
+}
+
+// maxCredentialSwitchApplyBody bounds the apply request: 64 old_cumulative entries of keys up to 200
+// bytes plus the fixed fields fit well inside it.
+const maxCredentialSwitchApplyBody = 32 << 10
+
+// WorkerCredentialSwitchApply answers POST /api/worker/runs/{id}/credential-switch/apply (issue
+// #4201): the in-place Claude credential switch. The body is strict and bounded; the response
+// carries a plaintext token on an applied outcome, so it is never cacheable. A run the worker does
+// not hold is the same exact 404 the other worker run routes answer; every other refusal is a 200
+// with an outcome the worker dispatches on.
+func (h *Handler) WorkerCredentialSwitchApply(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	var req workersvc.CredentialSwitchApplyRequest
+	if err := httpx.DecodeJSONStrictBounded(r, &req, maxCredentialSwitchApplyBody); err != nil {
+		httpx.RespondDecodeError(w, err, "invalid request body")
+		return
+	}
+	res, err := h.wsvc.ApplyCredentialSwitch(r.Context(), wkr, runID, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrInvalidApplyRequest):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, workersvc.ErrRunNotOwned):
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		default:
+			// The error never carries token bytes (the service returns it before any token is read
+			// back into a result), and the result itself is not logged here.
+			slog.Error("worker credential switch apply", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	slog.Info("worker credential switch apply", "run_id", runID, "worker_id", wkr.ID, "result", res)
+	httpx.JSON(w, http.StatusOK, res)
 }
 
 // workerStateAck builds the state-report ack body: the run DTO plus, when a held-state switch is

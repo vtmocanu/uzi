@@ -15334,7 +15334,7 @@ func (q *Queries) LiveLaneFramesForRun(ctx context.Context, runID uuid.UUID) ([]
 }
 
 const lockAnthropicSecretForApply = `-- name: LockAnthropicSecretForApply :one
-SELECT id, user_id, kind, ciphertext, sealed_with, disabled_at, anthropic_rejected_at, enablement_rev
+SELECT id, user_id, kind, label, ciphertext, sealed_with, disabled_at, anthropic_rejected_at, enablement_rev
 FROM user_secrets
 WHERE id = $1 AND user_id = $2 AND kind = 'anthropic_token'
 FOR SHARE
@@ -15349,6 +15349,7 @@ type LockAnthropicSecretForApplyRow struct {
 	ID                  uuid.UUID          `json:"id"`
 	UserID              uuid.UUID          `json:"user_id"`
 	Kind                string             `json:"kind"`
+	Label               string             `json:"label"`
 	Ciphertext          []byte             `json:"ciphertext"`
 	SealedWith          string             `json:"sealed_with"`
 	DisabledAt          pgtype.Timestamptz `json:"disabled_at"`
@@ -15365,6 +15366,7 @@ func (q *Queries) LockAnthropicSecretForApply(ctx context.Context, arg LockAnthr
 		&i.ID,
 		&i.UserID,
 		&i.Kind,
+		&i.Label,
 		&i.Ciphertext,
 		&i.SealedWith,
 		&i.DisabledAt,
@@ -25398,6 +25400,66 @@ func (q *Queries) SetRunCredentialOverride(ctx context.Context, arg SetRunCreden
 		arg.SecretID,
 		arg.ID,
 		arg.UserID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setRunCredentialSwitchUncertainHold = `-- name: SetRunCredentialSwitchUncertainHold :execrows
+UPDATE runs SET
+    status       = 'paused',
+    -- clock_timestamp() for the same register-floor ordering reason as HoldCredentialSwitchUnsettled.
+    status_since = clock_timestamp(),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at   = now()
+WHERE runs.id = $1 AND runs.worker_id = $2
+  AND runs.claim_generation = $3::bigint
+  AND runs.claim_released_at IS NULL
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.kind NOT IN ('job', 'cross_check')
+  AND runs.hold_reason IS NULL
+  AND NOT (runs.pause_requested_at IS NOT NULL AND runs.pause_mode IN ('wall', 'reserve'))
+  AND ((runs.credential_switch_requested_at IS NOT NULL
+        AND runs.credential_switch_generation = $3::bigint
+        AND runs.credential_switch_op_id = $4::uuid)
+       OR EXISTS (SELECT 1 FROM run_credential_switch_epochs e
+                  WHERE e.run_id = runs.id AND e.claim_generation = $3::bigint AND e.op_id = $4::uuid))
+  AND EXISTS (SELECT 1 FROM workers w
+              WHERE w.id = runs.worker_id AND w.snapshot_register_nonce = $5::text)
+`
+
+type SetRunCredentialSwitchUncertainHoldParams struct {
+	ID            uuid.UUID   `json:"id"`
+	WorkerID      pgtype.UUID `json:"worker_id"`
+	Generation    int64       `json:"generation"`
+	OpID          uuid.UUID   `json:"op_id"`
+	RegisterNonce string      `json:"register_nonce"`
+}
+
+// Issue #4201: the worker's credential_switch_uncertain report. An in-place apply whose outcome the
+// worker cannot prove (the response was lost, or the swap failed after the server committed) parks the
+// run PAUSED so the owner decides, rather than letting the session keep spending a token the server
+// may or may not have recorded. running / awaiting_* -> paused, NON-TERMINAL. hold_reason stays NULL
+// (an ordinary owner-style pause: Resume works), the worker_id, session_id, open_question_id and gate
+// state are kept, pause_requested_at / pause_mode are NOT touched (a pending owner pause survives), and
+// nothing is banked (ResumePausedRun banks the paused gap once, from the status_since written here).
+// A pending wall or reserve pause is excluded: that park belongs to the worker's own park path and the
+// caller answers it with a distinct refusal. The switch stamp is NOT cleared: a still-pending stamp
+// is the evidence that the operation never committed.
+//
+// THE WHERE IS THE FENCE: reporting worker, reported generation, an UNRELEASED claim, a live status,
+// a kind that can pause, no existing hold, the operation named by op_id (a stamp pending for it at this
+// generation, or a committed child epoch for it in this run and generation) and the current
+// registration incarnation.
+func (q *Queries) SetRunCredentialSwitchUncertainHold(ctx context.Context, arg SetRunCredentialSwitchUncertainHoldParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setRunCredentialSwitchUncertainHold,
+		arg.ID,
+		arg.WorkerID,
+		arg.Generation,
+		arg.OpID,
+		arg.RegisterNonce,
 	)
 	if err != nil {
 		return 0, err
