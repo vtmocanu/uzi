@@ -942,6 +942,20 @@ interface DriveState {
 /** issue #3181: a reap whose joins outlived the maintenance budget: nothing was proven, so it is incomplete. */
 const unconfirmedJoinReap = (): RunProcessReap => ({ killed: [], left: [], complete: false });
 
+/** PRD #229 D10: does this run put the lead's model on every subagent too?
+ *
+ *  A bound custom endpoint serves exactly one model id, and `AgentDefinition.model`
+ *  outranks `CLAUDE_CODE_SUBAGENT_MODEL` whenever it is set — so a template pin left in
+ *  place (every builtin pins `opus` or `sonnet`) asks the endpoint for a model it does
+ *  not have and dies on the subagent's first turn. True under the operator's own
+ *  override flag as well, which is the pre-endpoint behaviour.
+ *
+ *  One definition rather than a spelled-out predicate per call site: the roster guards
+ *  live in three places, two of them inside closures, and a fourth added later silently
+ *  missing the endpoint case is exactly the drift this function exists to prevent. */
+const useLeadModelFor = (ctx: RunContext): boolean =>
+  Boolean(ctx.anthropicEndpoint?.model) || Boolean(ctx.config?.override_subagent_model);
+
 export class SdkExecutor implements Executor {
   /** Issue #1604: see Executor.resumesAtGate — the plan gate reads a resumed claim's pending
    *  inputs (takeResumedGateEvent) and re-presents an awaiting_approval claim's plan. */
@@ -1782,14 +1796,11 @@ export class SdkExecutor implements Executor {
     // model the gateway does not have and fails inside the provider.
     const boundModel = ctx.anthropicEndpoint?.model;
     const leadModel = boundModel || leadRequest.model;
-    // A bound endpoint serves one model, so the roster cannot keep its pins either: a
-    // subagent left on the resolved default fails exactly as the lead would.
-    const useLeadModel = Boolean(boundModel) || Boolean(ctx.config?.override_subagent_model);
     // PRD #305: apply the run's model to every OWN subagent now, before planTurnSubagents
     // copies them and before the own-source implement path reuses them, so both the plan
     // turn and an own-source implement follow the lead model. The repo roster is built
     // later and overridden where it is built. Off/no-model = pins win (byte-identical).
-    if (useLeadModel && leadModel) {
+    if (useLeadModelFor(ctx) && leadModel) {
       applySubagentModelOverride(assembled.subagents, leadModel);
     }
     // The names come from the RESULT, never from `assembled.subagents`. They feed
@@ -1816,7 +1827,7 @@ export class SdkExecutor implements Executor {
     const guarded = ctx.capturedMemory !== undefined;
     const planShaped = guarded ? shapeGuardedGrants(planTurn.subagents) : undefined;
     const planAgents = planShaped ? planShaped.agents : planTurn.subagents;
-    if (planSource === "repo" && useLeadModel && leadModel) {
+    if (planSource === "repo" && useLeadModelFor(ctx) && leadModel) {
       applySubagentModelOverride(planAgents, leadModel);
     }
     const planUnavailable: UnavailableRole[] = planShaped ? planShaped.unavailable : [];
@@ -3020,9 +3031,8 @@ export class SdkExecutor implements Executor {
       // roster). Own-source defs were copied by reference from the already-overridden
       // assembled.subagents, so this repeat is idempotent for them.
       // A bound endpoint serves one model, so the repo roster cannot keep its pins
-      // either (PRD #229 D10); `useLeadModel` is not in scope in this closure, hence
-      // the same predicate spelled against ctx.
-      if ((ctx.anthropicEndpoint?.model || ctx.config?.override_subagent_model) && leadModel) {
+      // either (PRD #229 D10); same predicate as the two plan-side guards above.
+      if (useLeadModelFor(ctx) && leadModel) {
         applySubagentModelOverride(selectedSubagents, leadModel);
       }
       // Issue #2471: a guard-bound run shapes the implement roster the same way as the plan roster.
