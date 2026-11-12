@@ -260,7 +260,12 @@ async function contracts(t) {
     let output = "";
     const started = performance.now();
     go = spawn(command[0], command.slice(1), { cwd: path.join(root, "api"),
-      env: { ...goEnv, SSL_CERT_FILE: cert, HTTPS_PROXY: "", HTTP_PROXY: "", ALL_PROXY: "", NO_PROXY: "127.0.0.1",
+      // api/go.mod targets Go 1.26, whose x509sslcertoverrideplatform default (0) makes
+      // macOS ignore SSL_CERT_FILE; =1 makes the Go child trust the fake there too (#4238).
+      // Tied to that go line: drop this once api/go.mod says go 1.27 or later.
+      env: { ...goEnv, SSL_CERT_FILE: cert,
+        GODEBUG: [goEnv.GODEBUG, "x509sslcertoverrideplatform=1"].filter(Boolean).join(","),
+        HTTPS_PROXY: "", HTTP_PROXY: "", ALL_PROXY: "", NO_PROXY: "127.0.0.1",
         UZI_FORGE_FAKE_REQUIRED: "1", UZI_FORGE_FAKE_MANIFEST: manifestPath },
       stdio: ["ignore", "pipe", "pipe"] });
     for (const stream of [go.stdout, go.stderr]) stream.on("data", (data) => {
