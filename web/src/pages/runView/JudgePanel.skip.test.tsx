@@ -262,6 +262,36 @@ describe("JudgePanel skip state (#3257 M2)", () => {
       }
     });
 
+    it("a refused Run judge click keeps the settle poll, so a later skip still shows", async () => {
+      vi.useFakeTimers();
+      try {
+        mockApi.getRunReview
+          .mockResolvedValueOnce({ review: null, pending_judge: null, skip: null })
+          .mockResolvedValue({ review: null, pending_judge: null, skip: skip() });
+        const message = "the judge's harness (codex) has no usable credential";
+        mockApi.rerunJudge.mockRejectedValue(
+          new ApiError(422, message, { error: message, code: "no_credential_for_harness" }),
+        );
+        renderRun(new Date().toISOString());
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        fireEvent.click(screen.getByRole("button", { name: "Run judge" }));
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        for (let i = 0; i < 2; i++) {
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(4000);
+          });
+        }
+        expect(screen.getByText("judge skipped")).toBeTruthy();
+        expect(screen.getByText(message)).toBeTruthy();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("does not re-poll a run that finished long ago", async () => {
       vi.useFakeTimers();
       try {

@@ -397,8 +397,8 @@ export function JudgePanel({
   }, [polling, run.id, pollMaxTries]);
 
   // The settle poll (see JUDGE_SETTLE_MAX_TRIES). It writes the same state as the mount
-  // fetch and ends at the first non-empty answer or the cap; a click on Run judge ends it too
-  // (the in-flight poll owns that episode).
+  // fetch and ends at the first non-empty answer or the cap; a successful Run judge click ends it
+  // too (the in-flight poll owns that episode).
   useEffect(() => {
     if (!settling || queued) return;
     let tries = 0;
@@ -438,9 +438,6 @@ export function JudgePanel({
   const rerun = async () => {
     setActionErr("");
     setRerunning(true);
-    // A click ends any settle poll for good: the in-flight poll owns this episode, and
-    // leaving `settling` set would re-arm it once `queued` clears.
-    setSettling(false);
     try {
       await api.rerunJudge(run.id);
       // No baseline write here on purpose. It used to live here, and being the ONLY writer
@@ -449,6 +446,10 @@ export function JudgePanel({
       // already holds at this point and re-writing it would be a no-op — one that invites
       // the same bug back by making "the click seeds the baseline" look load-bearing.
       setQueued(true);
+      // A successful click ends any settle poll for good: the in-flight poll owns this
+      // episode, and leaving `settling` set would re-arm it once `queued` clears. A refused
+      // click leaves it running, so a skip committed just after the refusal still shows.
+      setSettling(false);
       // A created judge deletes the target's skip row in the same commit (PRD #3257), so the
       // skip is no longer true the moment the POST succeeds; clearing it here keeps the
       // "re-queued" note from sitting on top of a "was skipped" sentence until the next poll.
