@@ -16,9 +16,8 @@ import (
 // TestResumeNowCustodyRunHoldBoundLiveDB (issue #4162): POST /api/runs/{id}/resume-now on a
 // custody-parked run whose OWN open holds equal the limit as group-eligible same-worker holds
 // (so the owner's admission-counted units stay below the limit). It pins the route's part only:
-// the resume succeeds, requeues the run and leaves the hold rows untouched, so the admission read
-// still reports RunHoldBoundReached. The claim-time refusal is not exercised here (this package
-// has no claim fixture); TestCustodyRunHoldBoundOwnerResumeVerbsLiveDB and
+// the resume succeeds, requeues the run and leaves the hold rows untouched, and the admission read
+// still reports RunHoldBoundReached. The claim-time refusal is not exercised here; TestCustodyRunHoldBoundOwnerResumeVerbsLiveDB and
 // TestCustodyRunHoldBoundPublicationResumeLiveDB in workersvc cover it.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
