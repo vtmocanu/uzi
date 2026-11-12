@@ -96,6 +96,7 @@ func TestHealthSourceGapControls(t *testing.T) {
 				want = reasonAssignedRepoAgentSourceGap
 			case "unavailable peer":
 				f.eligibility.Claimable = 0
+				f.eligibility.StrictEligible = 1
 				want = reasonAssignedRepoAgentSourceGap + sourcePeerUnavailableSuffix
 			case "eligibility error":
 				f.eligibilityErr = errors.New("projection failed")
@@ -160,5 +161,66 @@ func TestHealthSourceGapHeldLifecycle(t *testing.T) {
 		if exit.HealthReason.String != reasonAssignedRepoAgentSourceGap || !exit.HealthSince.Time.Equal(t0.Add(4*time.Minute+time.Nanosecond)) {
 			t.Fatalf("exit=%+v", exit)
 		}
+	}
+}
+
+func TestHealthSourceGapNoComposedPeerOmitsUnavailable(t *testing.T) {
+	f, s, r := sourceGapFixture()
+	f.capable = 1
+	f.eligibility.Claimable = 0
+	f.eligibility.StrictEligible = 0
+	got := s.queuedReasonWithEligibility(context.Background(), t0, r, healthThresholds{custodyLimit: testCustodyLimit, custodyLimitOK: true}, nil)
+	if got != reasonAssignedRepoAgentSourceGap {
+		t.Fatalf("reason=%q", got)
+	}
+}
+
+// A live, non-draining assigned worker without the capability still pins peers until the
+// affinity ceiling (ClaimRun's affinity arm pins on a fresh heartbeat), so health must show
+// the held form then, and the post-hold form only after the pin ended.
+func TestHealthSourceGapLiveAssignedPin(t *testing.T) {
+	for _, name := range []string{"held", "after ceiling", "ceiling inclusive", "forge released", "stale heartbeat"} {
+		t.Run(name, func(t *testing.T) {
+			f, s, r := sourceGapFixture()
+			s.p.WorkerAffinityCeiling = 5 * time.Minute
+			s.p.WorkerHeartbeatStale = time.Minute
+			f.worker.DrainingSince = pgtype.Timestamptz{}
+			f.worker.LastHeartbeatAt = ago(10 * time.Second)
+			r.StaleRequeueWorkerName = "live-w"
+			r.UpdatedAt = ago(time.Minute)
+			held := true
+			switch name {
+			case "after ceiling":
+				r.UpdatedAt = ago(6 * time.Minute)
+				held = false
+			case "ceiling inclusive":
+				r.UpdatedAt = ago(5 * time.Minute)
+			case "forge released":
+				r.StaleRequeueWorkerName = ""
+				held = false
+			case "stale heartbeat":
+				f.worker.LastHeartbeatAt = ago(10 * time.Minute)
+				held = false
+			}
+			b := &fakeBroadcaster{}
+			s.SetBroadcaster(b)
+			f.active = []store.ListActiveRunsForHealthRow{r}
+			s.detectRunHealth(context.Background(), t0)
+			w := lastWrite(t, f.healthFakeStore, r.ID)
+			got := w.HealthReason.String
+			if held {
+				want := "waiting until " + r.UpdatedAt.Time.Add(5*time.Minute).UTC().Format(time.RFC3339) + " for its previous worker live-w to return" + heldRepoAgentSourceGapSuffix
+				if got != want || !isStaleRequeuePinReason(got) {
+					t.Fatalf("reason=%q want %q", got, want)
+				}
+				if w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || b.healthNudges[0] {
+					t.Fatal("held must not nudge")
+				}
+				return
+			}
+			if got != reasonAssignedRepoAgentSourceGap || isStaleRequeuePinReason(got) {
+				t.Fatalf("reason=%q", got)
+			}
+		})
 	}
 }

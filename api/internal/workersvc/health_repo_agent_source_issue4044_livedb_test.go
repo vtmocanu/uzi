@@ -546,3 +546,20 @@ func TestIssue4044ManualCordonWinsLiveDB(t *testing.T) {
 	want := manualCordonWaitPrefix + " source operator (" + f.e.userID.String() + ") at " + cordoned.ManualCordonedAt.Time.UTC().Format(time.RFC3339) + ": investigating"
 	f.health(t, f.at, want)
 }
+
+// A source-capable worker and a separate docker-capable worker are not one compatible
+// peer: the reason must not claim a compatible worker is merely unavailable.
+func TestIssue4044SplitFleetNoComposedPeerLiveDB(t *testing.T) {
+	f := issue4044Setup(t, true)
+	f.e.exec(t, `UPDATE runs SET required_capabilities='{docker}' WHERE id=$1`, f.run)
+	srcOnly := f.e.seedSpreadWorker(t, issue4044Caps(true), 1)
+	f.e.seedActiveRunOwnedBy(t, srcOnly)
+	dockerOnly := f.e.seedSpreadWorker(t, issue4044Caps(false), 1)
+	f.e.seedActiveRunOwnedBy(t, dockerOnly)
+	f.e.exec(t, `UPDATE workers SET capabilities='{docker}' WHERE id=$1`, dockerOnly)
+	counts, err := f.svc.WorkerEligibilityForHealth(f.e.ctx, f.at, f.run)
+	if err != nil || counts.StrictEligible != 0 {
+		t.Fatalf("split fleet counts=%+v err=%v", counts, err)
+	}
+	f.health(t, f.at, reasonAssignedRepoAgentSourceGap)
+}

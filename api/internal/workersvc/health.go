@@ -1381,7 +1381,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	}
 	eligibility, eligibilityErr := projection.counts, projection.err
 	until, held := s.ownerHold(now, r)
-	sourceGap := s.assignedRepoAgentSourceGap(ctx, r)
+	gapWorker, sourceGap := s.assignedRepoAgentSourceGap(ctx, r)
 	preserveManual := eligibilityErr != nil && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String)
 	if eligibilityErr == nil {
 		if reason := manualCordonWaitReason(eligibility); reason != "" {
@@ -1793,9 +1793,16 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 		}
 	}
 	if sourceGap {
+		if until, pinned := s.liveAssignedPin(now, r, gapWorker); pinned {
+			// ClaimRun still pins peers to the live assigned worker: the hold form, so the run
+			// is neither nudged nor alarmed while the pin really holds.
+			return withHeldRepoAgentSourceGap(staleRequeuePinReason(until, r.StaleRequeueWorkerName), true)
+		}
 		// The capability count establishes a peer, not its claimability. Only the
 		// composed eligibility projection establishes current unavailability.
-		if sourceCapablePeerConfirmed && eligibilityErr == nil && eligibility.Claimable == 0 {
+		// A source-capable worker and a separate worker that meets the run's other needs
+		// are not one compatible peer: require the composed StrictEligible count.
+		if sourceCapablePeerConfirmed && eligibilityErr == nil && eligibility.StrictEligible > 0 && eligibility.Claimable == 0 {
 			return reasonAssignedRepoAgentSourceGap + sourcePeerUnavailableSuffix
 		}
 		return reasonAssignedRepoAgentSourceGap
