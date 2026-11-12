@@ -754,8 +754,8 @@ The `worker_memory_pressure` feed event also carries an optional
 `memory_diagnostics` object with the decision metric, thresholds and
 `memory.stat` breakdown, including `active_file`, `file_dirty` and
 `file_writeback`. These are diagnostics only: the metric is unchanged and the
-guard still does not use dirty/writeback. Its `tree.rejections` lists each
-candidate command the guard could not select, by run and command ID, with a
+guard still does not use dirty/writeback. Its `tree.rejections` lists, best effort,
+each candidate command the guard could not select, by run and command ID, with a
 closed-set reason (for example `observation_timed_out`,
 `observation_unavailable` with the supervisor's `stale`, `overlap` or
 `pid_collision`) and the tree RSS when it is known. The worker also logs these

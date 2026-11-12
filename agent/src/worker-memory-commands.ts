@@ -518,7 +518,9 @@ export class WorkerMemoryCommands {
         const candidate = candidates[index];
         if (!candidate) continue;
         const o = candidate.observation;
-        const rssBytesApprox = o.available === true && o.complete === true && !unsafeRows.has(index) ? totals.get(index) : undefined;
+        // An empty observation measured nothing: its zero total is reported as unknown, never as 0.
+        const rssBytesApprox = o.available === true && o.complete === true && !unsafeRows.has(index)
+          && Array.isArray(o.rows) && o.rows.length > 0 ? totals.get(index) : undefined;
         const set = reasons.get(index) ?? new Set<RejectionReason>();
         rejected.push(Object.freeze({
           index, runId: candidate.entry.context.run_id, commandId: candidate.entry.commandId,

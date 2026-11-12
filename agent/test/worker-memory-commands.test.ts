@@ -512,7 +512,7 @@ test("rejection reasons: one case per class, with the RSS reported only for a fu
   const cases: [string, Observation, readonly string[], number | undefined][] = [
     ["observation_unavailable", { ...observation(), available: false }, ["observation_unavailable"], undefined],
     ["incomplete", { ...observation(), complete: false }, ["observation_unavailable"], undefined],
-    ["empty rows", observation([]), ["malformed", "missing_root"], 0],
+    ["empty rows", observation([]), ["malformed", "missing_root"], undefined],
     ["missing rows array", { ...observation(), rows: undefined } as unknown as Observation, ["malformed"], undefined],
     ["more than 256 rows", observation(big), ["malformed"], undefined],
     ["invalid row", observation([row(10), { pid: -1, startTime: "10", rssBytes: 1 }]), ["malformed"], undefined],
