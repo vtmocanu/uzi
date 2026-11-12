@@ -1634,6 +1634,51 @@ type RunSchedule struct {
 	CiArtifacts                []byte             `json:"ci_artifacts"`
 }
 
+type RunTerminalContribution struct {
+	ID              uuid.UUID          `json:"id"`
+	PreservationID  uuid.UUID          `json:"preservation_id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	Generation      int64              `json:"generation"`
+	WorkerID        uuid.UUID          `json:"worker_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	HoldID          pgtype.UUID        `json:"hold_id"`
+	Authority       string             `json:"authority"`
+	Tip             string             `json:"tip"`
+	PriorTip        pgtype.Text        `json:"prior_tip"`
+	CoverageDigest  string             `json:"coverage_digest"`
+	Manifest        []byte             `json:"manifest"`
+	Disposition     string             `json:"disposition"`
+	State           string             `json:"state"`
+	RefusalReason   pgtype.Text        `json:"refusal_reason"`
+	CreateInvokedAt pgtype.Timestamptz `json:"create_invoked_at"`
+	PublishedAt     pgtype.Timestamptz `json:"published_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RunTerminalPreservation struct {
+	ID               uuid.UUID          `json:"id"`
+	RunID            uuid.UUID          `json:"run_id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	LiveRunID        pgtype.UUID        `json:"live_run_id"`
+	Ref              string             `json:"ref"`
+	Tip              pgtype.Text        `json:"tip"`
+	LifetimeAtBind   string             `json:"lifetime_at_bind"`
+	State            string             `json:"state"`
+	FirstPublishedAt pgtype.Timestamptz `json:"first_published_at"`
+	RetireTip        pgtype.Text        `json:"retire_tip"`
+	RetireReason     pgtype.Text        `json:"retire_reason"`
+	RetireObservedAt pgtype.Timestamptz `json:"retire_observed_at"`
+	RetireDecidedAt  pgtype.Timestamptz `json:"retire_decided_at"`
+	NextCheckAt      pgtype.Timestamptz `json:"next_check_at"`
+	Attempts         int32              `json:"attempts"`
+	LastError        pgtype.Text        `json:"last_error"`
+	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RunUsage struct {
 	RunID                  uuid.UUID          `json:"run_id"`
 	SessionID              string             `json:"session_id"`

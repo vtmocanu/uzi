@@ -419,6 +419,8 @@ var inventoryQueryFiles = []string{
 	"findings.sql",
 	// PRD #3454 instance maintenance mode
 	"intake_pause.sql",
+	// Issue #4007 slice A — the terminal preservation store
+	"terminal_preservation.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -1072,6 +1074,27 @@ var queryInventory = []queryPin{
 	{"ListRunQueueReasons", "intake_pause.sql", "TestQueueReasonLiveDB",
 		"../handler: runs_dto.go batch lookup behind the run reads; asserts queue_reason for queued " +
 			"runs while paused and its absence once lifted. Also called from workersvc/jobs.go"},
+	// Issue #4007 slice A, M1: the terminal preservation store. Later milestones add their writers.
+	{"InsertTerminalPreservation", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the insert-or-load contract on a repeated insert"},
+	{"GetTerminalPreservationByRun", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the ref and lifetime of the loaded row"},
+	{"InsertTerminalContribution", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the prepared and recorded births and the nullable hold and prior tip"},
+	{"GetTerminalContributionByRunGeneration", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the generation selects its own row"},
+	{"ListTerminalContributionsForRun", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the newest-generation-first order"},
+	{"ListTerminalPreservationsDue", "terminal_preservation.sql", "TestTerminalPreservationDueListLiveDB",
+		"direct call; asserts the state filter, the future exclusion, the (next_check_at, id) order and the limit"},
+	{"CountLiveTerminalPreservationsForRepo", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: the DELETE /api/repos/{id} pre-check; asserts a pointer-bearing row blocks and a bound row does not"},
+	{"ListLiveTerminalRefsForRepo", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: names the refs/uzi-terminal ref in the repo-removal 409"},
+	{"CountLiveTerminalPreservationsForConnection", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: the DELETE /api/forge/connections/{id} pre-check"},
+	{"ListLiveTerminalRefsForConnection", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: names the refs/uzi-terminal ref in the connection-removal 409"},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)
