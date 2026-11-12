@@ -2259,6 +2259,7 @@ export class SdkExecutor implements Executor {
       state,
       idleMs,
       oauthToken,
+      anthropicEndpoint,
       planSubagentNames,
       planSource,
       subagentCanWrite,
@@ -2425,9 +2426,11 @@ export class SdkExecutor implements Executor {
       // token, and a client to POST to — a stub/e2e run without a token or client is
       // unaffected. resolvePrdInput is memoized ONCE per run (a single file read) and
       // reused by BOTH hooks; it never throws.
+      // PRD #229 D10: a bound endpoint is a credential too, so an endpoint-only instance
+      // still gets its summaries. Gating on the token alone silently skipped them there.
       const summariesOn =
         isRunSummaryKind(ctx.kind) &&
-        !!oauthToken &&
+        (!!oauthToken || !!anthropicEndpoint) &&
         !!this.client;
       const prdInputP: Promise<PrdInput> | undefined = summariesOn
         ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log)
@@ -2454,7 +2457,8 @@ export class SdkExecutor implements Executor {
             const prd = await prdInputP!;
             if (flight.abandoned || flight.ctrl.signal.aborted || ctx.claimFenced?.() || ctx.cancelRequested?.()) return;
             const summary = await this.summaryRunner.generateIntentSummary({
-              token: oauthToken,
+              token: oauthToken ?? "",
+              anthropicEndpoint,
               model: ctx.summaryModel ?? "",
               issueTitle: ctx.issueTitle,
               issueBody: ctx.issueDescription,

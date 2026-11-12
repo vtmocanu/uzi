@@ -221,3 +221,78 @@ describe("summary prompts", () => {
     assert.match(p, /add columns/);
   });
 });
+
+// PRD #229 D10: the endpoint is a credential. Two things are pinned here, because the
+// delivery lane had BOTH halves wrong before: the gate rejected an endpoint-only claim,
+// and deliveryHarness computed the endpoint then dropped it on the floor (its return type
+// listed token/model/codex only). A test on the intent lane alone would have missed the
+// delivery half entirely.
+describe("SummaryRunner — bound custom endpoint (PRD #229 D10)", () => {
+  it("generateIntentSummary runs on an endpoint-only instance and puts the endpoint in the SDK env", async () => {
+    let seenEnv: Record<string, string | undefined> | undefined;
+    const queryFn: SdkQueryFn = ((opts: { options?: { env?: Record<string, string | undefined> } }) => {
+      seenEnv = opts.options?.env;
+      return (async function* () {
+        yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "a summary" }] } };
+        yield { type: "result", subtype: "success", is_error: false };
+      })();
+    }) as unknown as SdkQueryFn;
+    const { runner } = await makeRunner(queryFn);
+
+    const out = await runner.generateIntentSummary({
+      ...intentInput,
+      token: "",
+      anthropicEndpoint: { base_url: "https://gateway.example", api_key: "sk-gateway", model: "gateway-model-1" },
+    });
+
+    assert.equal(out, "a summary", "an endpoint-only instance must still produce a summary");
+    assert.equal(seenEnv?.ANTHROPIC_BASE_URL, "https://gateway.example");
+    assert.equal(seenEnv?.ANTHROPIC_AUTH_TOKEN, "sk-gateway");
+    assert.equal(seenEnv?.CLAUDE_CODE_OAUTH_TOKEN, undefined, "the subscription token is cleared alongside the endpoint");
+  });
+
+  // NOTE: this one is a CHARACTERIZATION test, not a regression test. I first believed
+  // deliveryHarness dropped the endpoint (its Pick<> listed token/model/codex only), added
+  // the field to the type, then sabotaged it back — and the test stayed green. The spread
+  // `...harness` carries the runtime value regardless of the declared Pick, so the lane was
+  // already correct and the type was merely under-declared. Kept because it pins the
+  // behaviour end to end; do not read it as proof of a fix.
+  it("generateDeliverySummary threads the claim's endpoint into the pass", async () => {
+    let seenEnv: Record<string, string | undefined> | undefined;
+    const queryFn: SdkQueryFn = ((opts: { options?: { env?: Record<string, string | undefined> } }) => {
+      seenEnv = opts.options?.env;
+      return (async function* () {
+        yield {
+          type: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: JSON.stringify({ summary: "did the thing", diagram: null }) }] },
+        };
+        yield { type: "result", subtype: "success", is_error: false };
+      })();
+    }) as unknown as SdkQueryFn;
+    const { runner } = await makeRunner(queryFn);
+
+    await runner.generateDeliverySummary({
+      claim: {
+        run_id: "run-1",
+        summary_model: "haiku",
+        secrets: {
+          anthropic_oauth_token: "",
+          anthropic_endpoint: { base_url: "https://gateway.example", api_key: "sk-gateway", model: "gateway-model-1" },
+        },
+      },
+      context: {
+        issue: "Work", prd: null, plan: null, previous: null, claims: null,
+        commits: "", paths: "", diff: "", bytes: 4,
+        truncated: { issue: false, prd: false, plan: false, previous: false, claims: false, commits: false, paths: false, diff: false },
+      },
+      deadlineMs: Date.now() + 5_000,
+      signal: new AbortController().signal,
+    });
+
+    // The whole point: deliveryHarness MUST carry the endpoint through to buildSdkEnv.
+    // If its return type loses the field again, this is undefined and the test fails.
+    assert.equal(seenEnv?.ANTHROPIC_BASE_URL, "https://gateway.example",
+      "the PR-description pass dropped the claim's endpoint before the SDK env");
+    assert.equal(seenEnv?.ANTHROPIC_AUTH_TOKEN, "sk-gateway");
+  });
+});

@@ -2187,3 +2187,41 @@ for (const mode of r1Modes) it("R1 disabled judge-runner cached empty then " + m
 
   } finally { await r1fs.rm(root, { recursive: true, force: true }); }
 });
+
+// PRD #229 D10: a bound custom endpoint IS the judge's credential. Before this, the judge
+// lane read only `anthropic_oauth_token`, so on an endpoint-only instance (no token at all)
+// EVERY judge silently degraded to the deterministic fallback — a review that looks real but
+// never consulted a model. This pins both halves: the model IS called, and the SDK env uses
+// the endpoint rather than an empty subscription token.
+describe("JudgeRunner — bound custom endpoint (PRD #229 D10)", () => {
+  it("runs the model on an endpoint-only claim instead of the deterministic fallback", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    let seenEnv: Record<string, string | undefined> | undefined;
+    const queryFn: SdkQueryFn = ((opts: { options?: { env?: Record<string, string | undefined> } }) => {
+      seenEnv = opts.options?.env;
+      return (async function* () {
+        yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: JSON.stringify({ verdict: "ok", summary: "reviewed", recommendations: [] }) }] } };
+        yield { type: "result", subtype: "success", is_error: false };
+      })();
+    }) as unknown as SdkQueryFn;
+
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
+    await runner.execute(
+      judgeClaim({
+        secrets: {
+          forge_pat: "",
+          anthropic_oauth_token: "",
+          anthropic_endpoint: { base_url: "https://gateway.example", api_key: "sk-gateway", model: "gateway-model-1" },
+        } as never,
+      }),
+    );
+
+    assert.ok(seenEnv, "the model must be called when an endpoint is bound");
+    assert.equal(seenEnv!.ANTHROPIC_BASE_URL, "https://gateway.example", "the SDK env must point at the bound endpoint");
+    assert.equal(seenEnv!.ANTHROPIC_AUTH_TOKEN, "sk-gateway");
+    assert.equal(seenEnv!.CLAUDE_CODE_OAUTH_TOKEN, undefined, "the subscription token must be cleared alongside the endpoint");
+    assert.equal(seenEnv!.ANTHROPIC_MODEL, "gateway-model-1", "every model slot must name the endpoint's model");
+    // The review posts, i.e. the run did NOT take the missing-credential fallback path.
+    assert.equal(calls.review?.review.status, "complete");
+  });
+});

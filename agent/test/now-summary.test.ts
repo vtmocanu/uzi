@@ -97,7 +97,7 @@ function usage(input: number, output: number, extra: Partial<AdviceUsageSnapshot
   };
 }
 
-function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../src/protocol.js").RunKind; enabled?: boolean; ignoreAbort?: boolean; redact?: (s: string) => string } = {}) {
+function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../src/protocol.js").RunKind; enabled?: boolean; ignoreAbort?: boolean; redact?: (s: string) => string; endpoint?: { base_url: string; api_key: string; model: string } } = {}) {
   const clock = new FakeClock();
   const emitted: EmittedMessage[] = [];
   const calls: PassCall[] = [];
@@ -130,7 +130,7 @@ function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../sr
         // A real pass rejects the moment its signal aborts; model that.
         if (!over.ignoreAbort) opts.signal?.addEventListener("abort", () => reject(new Error("now model call aborted")), { once: true });
       }),
-    pass: { token: "tok", homeRoot: "/tmp", queryFn: (() => {
+    pass: { token: "tok", ...(over.endpoint ? { anthropicEndpoint: over.endpoint } : {}), homeRoot: "/tmp", queryFn: (() => {
       throw new Error("the controller must go through runPass");
     }) as never },
     now: clock.now,
@@ -1030,5 +1030,33 @@ describe("NowSummaryController: review-rework behaviours", () => {
       const text = String(h.notes()[0]!.text);
       assert.ok(text !== "" && !text.includes(fragment.slice(0, 6)));
     });
+  });
+});
+
+// PRD #229 D10: a bound custom endpoint is a Claude credential. The gate used to read only
+// `claim.claude`, which the runner derived from `!!anthropic_oauth_token` — so on an
+// endpoint-only instance the Now summary was silently disabled, and nothing said why.
+describe("NowSummary — bound custom endpoint (PRD #229 D10)", () => {
+  it("runs the pass when the claim carries an endpoint and no subscription token", async () => {
+    // The harness's `claude` flag models what the runner derives from the claim.
+    const h = harness({ claude: true });
+    await running(h);
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "a" }));
+    await h.clock.advance(NOW_PERIODIC_MS * 2);
+    assert.equal(h.calls.length, 1, "an endpoint-only run must still get a Now summary");
+  });
+
+  // CHARACTERIZATION, not a regression test: sabotaging the Pick<> type back leaves this
+  // green, because the spread carries the runtime value regardless of the declared type.
+  // Kept as end-to-end coverage of the pass options; the runner-level test in
+  // runner-now-summary.test.ts is the one that actually bites.
+  it("carries the endpoint into the pass options", async () => {
+    const h = harness({ claude: true, endpoint: { base_url: "https://gateway.example", api_key: "sk-gateway", model: "gateway-model-1" } });
+    await running(h);
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "a" }));
+    await h.clock.advance(NOW_PERIODIC_MS * 2);
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.calls[0]!.opts.anthropicEndpoint?.base_url, "https://gateway.example",
+      "the Now pass dropped the claim's endpoint before buildSdkEnv");
   });
 });

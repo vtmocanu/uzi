@@ -16427,7 +16427,10 @@ export class RunRunner {
             steering,
             claim: {
               kind: resolveRunKind(claim.kind),
-              claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
+              // PRD #229 D10: a bound endpoint is a Claude credential too, so an
+              // endpoint-only instance still gets Now summaries. Gating on the token alone
+              // silently disabled them there.
+              claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || !!claim.secrets.anthropic_endpoint),
               ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory, claim.claim_generation),
             },
             emit: (m) => batcher.emit(m),
@@ -16435,6 +16438,7 @@ export class RunRunner {
             runPass: runReadOnlyModelPass,
             pass: {
               token: claim.secrets.anthropic_oauth_token,
+              anthropicEndpoint: claim.secrets.anthropic_endpoint,
               homeRoot: this.nowSummaryOpts.homeRoot,
               queryFn: this.nowSummaryOpts.queryFn,
             },

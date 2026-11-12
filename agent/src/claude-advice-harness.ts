@@ -8,6 +8,7 @@ import { promptStream, mapSdkMessage, isResult, isErrorResult } from "./sdk-mess
 import { RateLimitObserver, type RateLimitObservation } from "./limit.js";
 import type { Logger } from "./log.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
+import type { ClaimAnthropicEndpoint } from "./protocol.js";
 import type {
   AdviceHarness,
   AdviceModelUsage,
@@ -37,12 +38,19 @@ function buildDenyAllHook(reason: string) {
  *  compatibility surface the advice adapter absorbs from the old `consume` body. Kept
  *  in the Claude module rather than the SDK-free harness contract. */
 interface ClaudeAdviceInputs {
+  /** The subscription OAuth token. Empty when a bound endpoint supplies the credential
+   *  instead (PRD #229 D10); buildSdkEnv clears it whenever an endpoint is present. */
   token: string;
   homeDir: string;
   abort: AbortController;
   queryFn: SdkQueryFn;
   denyReason: string;
   log: Logger;
+  /** PRD #229 D10: the instance's custom Anthropic-Messages endpoint, when one is bound.
+   *  Without it every advice pass (judge, review, summary, plan contract) would talk to
+   *  Anthropic's API on the subscription token, which an endpoint-only instance does not
+   *  have — so those lanes had no working credential at all. Absent ⇒ unchanged. */
+  anthropicEndpoint?: ClaimAnthropicEndpoint;
   /** Claude-only raw-msg compat shim (the judge's onResult). When present it REPLACES the
    *  policy's default onTerminal, mirroring today's `if (opts.onResult) … else …`. */
   rawResultShim?(msg: unknown, ctx: { isError: boolean; latest: RateLimitObservation | undefined }): void;
@@ -217,7 +225,11 @@ export class ClaudeAdviceHarness implements AdviceHarness {
   constructor(private readonly inputs: ClaudeAdviceInputs) {}
 
   async run(request: AdviceRequest, policy: AdviceResultPolicy): Promise<AdviceResult> {
-    const env = buildSdkEnv(this.inputs.token, this.inputs.homeDir);
+    // PRD #229 D10: pass the bound endpoint through. buildSdkEnv already clears the
+    // subscription token and sets ANTHROPIC_BASE_URL/AUTH_TOKEN in the same object when one
+    // is present, so an advice pass on an endpoint-only instance uses the endpoint rather
+    // than an empty token. Absent ⇒ the env is byte-identical to before.
+    const env = buildSdkEnv(this.inputs.token, this.inputs.homeDir, {}, undefined, undefined, undefined, this.inputs.anthropicEndpoint);
     // PRD #2603: the output cap. buildSdkEnv is an allowlist, so the one variable the bundled
     // CLI reads is set on the object it returned, and only when the request asks for it.
     if (request.maxOutputTokens !== undefined) env[MAX_OUTPUT_TOKENS_ENV] = String(request.maxOutputTokens);

@@ -207,7 +207,7 @@ export interface NowSummaryDeps {
   /** The model pass. Production passes runReadOnlyModelPass. */
   runPass(opts: ReadOnlyModelPassOpts): Promise<string>;
   /** The pass options the controller does not own: token, homeRoot, queryFn, log. */
-  pass: Pick<ReadOnlyModelPassOpts, "token" | "homeRoot" | "queryFn">;
+  pass: Pick<ReadOnlyModelPassOpts, "token" | "homeRoot" | "queryFn" | "anthropicEndpoint">;
   /** The run's claim-secret redactor (RunContext.redactText), applied before any cap. Absent ⇒ identity. */
   redact?: (s: string) => string;
   now(): number;
