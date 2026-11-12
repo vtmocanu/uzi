@@ -9269,8 +9269,9 @@ export class GitCache {
    * throws. This never creates pins, opens a grant, or admits execution/publication of tracking. */
   async readRuntimeRemediationRecovery(barePath: string, branch: string,
     expectedSource: { runId: string; clonePath: string; attemptId?: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRecovery | undefined> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<RemediationRecovery | undefined> {
     return this.withLock(barePath, async () => {
+      if (progress) progress.started = true;
       // This read has no discovery/normalization effects. Legacy unenrolled sources need no
       // attempt identity; enrollment still requires the independently selected exact attempt.
       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
@@ -9278,7 +9279,7 @@ export class GitCache {
       if (!expectedSource.attemptId) throw new Error("remediation source identity unavailable");
       return this.readRemediationUnderLock(barePath, branch,
         { ...expectedSource, attemptId: expectedSource.attemptId }, durability, "runtime-restrictions");
-    });
+    }, undefined, progress);
   }
 
   /**

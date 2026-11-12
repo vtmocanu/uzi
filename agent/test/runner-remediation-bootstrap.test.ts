@@ -19,7 +19,9 @@ import { formatAttemptId } from "../src/attempt-path.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import { legacyProtectedDetach } from "./legacy-protected-detach.js";
-import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runner as runnerFor } from "./runner-harness.js";
+import { StubExecutor } from "../src/executor.js";
+import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
 
 installHarness();
 const BRANCH = "agent/issue-3747", KEY = "issue-3747";
@@ -2015,4 +2017,382 @@ for (const transport of ["push", "pack"] as const) {
       } finally { f.runner.shutdown(); }
     });
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// issue #4246: a launch round whose bare-lock wait aborts before acquisition is retried as a fresh
+// round within a per-claim allowance. Real bare lock, real restore wrapper, no real 30s waits.
+// ---------------------------------------------------------------------------------------------
+
+type LockMethod = "readRemediationRestrictionFacts" | "readRuntimeRemediationRecovery";
+const LAUNCH_MS = 4321; // distinctive, so the clock hook recognises the round's own operation timer
+const ABORT_LINE = "launch round lock wait aborted";
+
+/** Skews Date.now and captures the first matching operation timer so a test expires a round without waiting. */
+function launchClock(t: any) {
+  const realNow = Date.now.bind(Date);
+  const realTimer = globalThis.setTimeout;
+  let skew = 0, armed = false, expire: (() => void) | undefined;
+  t.mock.method(Date, "now", () => realNow() + skew);
+  t.mock.method(globalThis, "setTimeout", (callback: () => void, delay?: number, ...rest: unknown[]) => {
+    if (armed && !expire && typeof delay === "number" && delay > LAUNCH_MS - 1000 && delay <= LAUNCH_MS) expire = callback;
+    return (realTimer as any)(callback, delay, ...rest);
+  });
+  return {
+    arm: () => { armed = true; expire = undefined; },
+    /** elapsed=true advances the clock past the deadline first (a real expiry); false is an early notification. */
+    fire: (elapsed: boolean) => {
+      assert.ok(expire, "the round's operation timer was installed");
+      const callback = expire; expire = undefined; armed = false;
+      if (elapsed) skew += LAUNCH_MS;
+      callback();
+    },
+  };
+}
+
+const failedReports = (runId: string) => api.states.filter(s => s.runId === runId && s.body.status === "failed").map(s => s.body as any);
+const abortLines = (calls: unknown[][]) => calls.filter(c => c[0] === ABORT_LINE).map(c => c[1] as any);
+
+type Hold = { method: LockMethod; mode: "new_release_on_abort" | "new_until_end" | "existing" };
+
+/** Full runner.execute with an independent holder of the real bare lock injected at chosen launch rounds. */
+async function driveExecute(t: any, iid: number, decide: (site: "clone" | "launch", round: number) => Hold | undefined) {
+  const claim = gitlabClaim(iid);
+  const stub = new StubExecutor(nullLogger());
+  const origRun = stub.run.bind(stub);
+  let flight: any, runs = 0, atLaunch: unknown = "unset";
+  t.mock.method(stub, "run", async (...args: Parameters<typeof origRun>) => {
+    runs++; atLaunch = flight?.remediationRestrictions; return origRun(...args);
+  });
+  const runner = runnerFor(stub, fakeGitlab().gitlab, undefined, { recoveryRetryMs: 1 });
+  const subject = runner as any;
+  const defaultMs = subject.codexBoundaryDeadlineMs;
+  const clock = launchClock(t);
+  const hold = AsyncLocalStorage.bind((bare: string, entered: { release: () => void }, until: Promise<void>) =>
+    git.withBareLock(bare, async () => { entered.release(); await until; }));
+  const holders: Promise<void>[] = [], releases: Array<() => void> = [], diagnostics: unknown[][] = [];
+  const counts = { clone: 0, launch: 0 };
+  let current: { hold?: Hold; injected: boolean; release?: () => void } | undefined;
+  for (const [name, site] of [["cloneRemediationRound", "clone"], ["requireLaunchAuthority", "launch"]] as const) {
+    const orig = subject[name].bind(subject);
+    t.mock.method(subject, name, async (...args: unknown[]) => {
+      const round = { hold: decide(site, ++counts[site]), injected: false } as NonNullable<typeof current>;
+      current = round;
+      if (round.hold) { subject.codexBoundaryDeadlineMs = LAUNCH_MS; clock.arm(); }
+      try { return await orig(...args); }
+      catch (error) { round.release?.(); throw error; }
+      finally { subject.codexBoundaryDeadlineMs = defaultMs; current = undefined; }
+    });
+  }
+  for (const method of ["readRemediationRestrictionFacts", "readRuntimeRemediationRecovery"] as const) {
+    const orig = (git[method] as (...args: any[]) => Promise<any>).bind(git);
+    t.mock.method(git, method, async (...args: any[]) => {
+      const round = current;
+      if (round?.hold && round.hold.method === method && !round.injected) {
+        round.injected = true;
+        if (round.hold.mode !== "existing") {
+          const entered = latch(), until = latch();
+          holders.push(hold(args[0], entered, until.promise));
+          await entered.promise;
+          if (round.hold.mode === "new_release_on_abort") round.release = until.release; else releases.push(until.release);
+        }
+        setImmediate(() => clock.fire(true));
+      }
+      return orig(...args);
+    });
+  }
+  const retry = subject.withLaunchLockRetry.bind(subject);
+  t.mock.method(subject, "withLaunchLockRetry", async (...args: any[]) => {
+    if (flight !== args[0]) {
+      flight = args[0];
+      const warn = flight.runLog.warn.bind(flight.runLog);
+      t.mock.method(flight.runLog, "warn", (...a: unknown[]) => { diagnostics.push(a); return warn(...a); });
+    }
+    try { return await retry(...args); }
+    catch (error) { for (const release of releases) release(); throw error; }
+  });
+  try { await runner.execute(claim); }
+  finally { for (const release of releases) release(); await Promise.allSettled(holders); runner.shutdown(); }
+  return { claim, flight, runs, atLaunch, counts, diagnostics: abortLines(diagnostics), raw: diagnostics, failed: failedReports(claim.run_id) };
+}
+
+for (const [method, label] of [["readRemediationRestrictionFacts", "restriction_facts"],
+  ["readRuntimeRemediationRecovery", "runtime_restore"]] as const) {
+  test("#4246 launch round retries a lock wait that expired before acquisition: " + label, async t => {
+    const r = await driveExecute(t, label === "restriction_facts" ? 4246 : 4247,
+      (site, round) => site === "launch" && round === 1 ? { method, mode: "new_release_on_abort" } : undefined);
+    assert.equal(r.counts.launch, 2, "one expired round, then one fresh round");
+    assert.equal(r.runs, 1, "the executor ran once");
+    assert.deepEqual(r.failed, [], "the run did not fail at startup");
+    assert.equal(r.atLaunch, undefined, "the clearable latch was lifted by the fresh round before launch");
+    assert.equal(r.diagnostics.length, 1);
+    assert.equal(r.diagnostics[0].label, label);
+    assert.equal(r.diagnostics[0].abort, "deadline");
+    assert.equal(typeof r.diagnostics[0].elapsed_ms, "number");
+    assert.deepEqual(Object.keys(r.diagnostics[0]).sort(), ["abort", "elapsed_ms", "label"]);
+  });
+}
+
+test("#4246 phaseClone round retries a lock wait that expired before acquisition", async t => {
+  const r = await driveExecute(t, 4248,
+    (site, round) => site === "clone" && round === 1 ? { method: "readRuntimeRemediationRecovery", mode: "new_release_on_abort" } : undefined);
+  assert.equal(r.counts.clone, 2);
+  assert.equal(r.counts.launch, 1);
+  assert.equal(r.runs, 1);
+  assert.deepEqual(r.failed, []);
+  assert.equal(r.atLaunch, undefined);
+  assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [["runtime_restore", "deadline"]]);
+});
+
+test("#4246 phaseClone exhaustion fails visibly after exactly three rounds and keeps the clone and custody", async t => {
+  const r = await driveExecute(t, 4249, (site, round) => site === "clone"
+    ? { method: "readRemediationRestrictionFacts", mode: round === 1 ? "new_until_end" : "existing" } : undefined);
+  assert.equal(r.counts.clone, 3, "the first round plus the two allowed retries");
+  assert.equal(r.counts.launch, 0);
+  assert.equal(r.runs, 0, "no model turn");
+  assert.equal(r.failed.length, 1, "exactly one failure report");
+  assert.match(r.failed[0].failure_reason, /local repository lock busy after bounded retries; local work and custody retained/);
+  assert.equal(r.failed[0].fail_origin, undefined);
+  assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), Array(3).fill(["restriction_facts", "deadline"]));
+  assert.equal(r.flight.preserveRecoveryClone, true);
+  assert.equal(r.flight.preserveSession, true);
+  assert.equal(fs.existsSync(r.flight.worktreePath), true, "the clone is kept");
+  assert.notEqual(command(r.flight.barePath, "config", "--get", "uzi-recovery." + r.flight.branch + ".clone"), "",
+    "the recovery journal (custody) is kept");
+});
+
+test("#4246 the retry allowance is shared between the clone and launch sites", async t => {
+  const r = await driveExecute(t, 4250, (site, round) => {
+    if (site === "clone") return round === 1 ? { method: "readRemediationRestrictionFacts", mode: "new_release_on_abort" } : undefined;
+    return { method: "readRemediationRestrictionFacts", mode: round === 1 ? "new_until_end" : "existing" };
+  });
+  assert.equal(r.counts.clone, 2, "phaseClone spent one retry");
+  assert.equal(r.counts.launch, 2, "the launch site had only two rounds left");
+  assert.equal(r.runs, 0);
+  assert.equal(r.failed.length, 1);
+  assert.match(r.failed[0].failure_reason, /local repository lock busy/);
+  assert.equal(r.failed[0].fail_origin, undefined);
+  assert.equal(r.flight.launchLockRetries, 2);
+  assert.equal(r.flight.retainedDiscoveryRetries, undefined, "separate from the discovery allowance");
+});
+
+type DirectStop = "cancel" | "pause" | "credential_switch" | "shutdown" | "claim_fence";
+function applyStop(runner: RunRunner, flight: any, stop: DirectStop): void {
+  const subject = runner as any;
+  if (stop === "cancel") flight.cancel.abort(new Error("controlled cancellation"));
+  else if (stop === "pause") { flight.cancel.abort(new PauseNowSignal()); flight.steering.abortLifecycle(new PauseNowSignal(), false); }
+  else if (stop === "credential_switch") flight.steering.abortLifecycle(new CredentialSwitchSignal(), false);
+  else if (stop === "shutdown") { subject.shuttingDownGlobal = true; subject.shutdownSignal.abort(); }
+  else flight.steering.fence = "released";
+}
+
+/**
+ * The retry helper around one real launch round on a fixture flight. A holder of the real bare lock is
+ * injected at the chosen read; `during` and `expiry` then race the queued wait.
+ */
+async function directLaunch(t: any, f: Awaited<ReturnType<typeof fixture>>, opts: {
+  at: "facts" | "restore";
+  expiry?: "elapsed" | "early" | "none";
+  during?: (flight: any, runner: RunRunner) => void;
+  afterFirstFailure?: (flight: any, runner: RunRunner) => void;
+  preset?: (flight: any) => void;
+  budget?: boolean;
+  retryMs?: number;
+  breakRead?: boolean;
+}) {
+  const { cache, runner, subject, flight } = f.fresh();
+  flight.executor = {};
+  opts.preset?.(flight);
+  if (opts.retryMs !== undefined) subject.recoveryRetryMs = opts.retryMs;
+  subject.codexBoundaryDeadlineMs = LAUNCH_MS;
+  const clock = launchClock(t);
+  const diagnostics: unknown[][] = [];
+  t.mock.method(flight.runLog, "warn", (...a: unknown[]) => { diagnostics.push(a); });
+  const entered = latch(), release = latch();
+  const hold = AsyncLocalStorage.bind(() => cache.withBareLock(f.bare, async () => { entered.release(); await release.promise; }));
+  let holder: Promise<void> | undefined, rounds = 0, wall = 0;
+  const budget = new MaintenanceBudget(1000, () => wall);
+  const method = opts.at === "facts" ? "readRemediationRestrictionFacts" : "readRuntimeRemediationRecovery";
+  const orig = (cache[method] as (...args: any[]) => Promise<any>).bind(cache);
+  t.mock.method(cache, method, async (...args: any[]) => {
+    if (rounds === 1 && !holder && !opts.breakRead) {
+      holder = hold(); await entered.promise;
+      setImmediate(() => {
+        opts.during?.(flight, runner);
+        if (opts.budget) { wall = 5000; try { budget.check(); } catch { /* the abort is the point */ } }
+        if (opts.expiry !== "none" && !opts.budget) clock.fire((opts.expiry ?? "elapsed") === "elapsed");
+      });
+    }
+    return orig(...args);
+  });
+  if (opts.breakRead) t.mock.method(cache as any, "readRecoveryCaptureWithRaw", async () => { throw new Error("private-read-sentinel"); });
+  const round = subject.requireLaunchAuthority.bind(subject);
+  t.mock.method(subject, "requireLaunchAuthority", async (...args: unknown[]) => {
+    rounds++; clock.arm();
+    try { return await round(...args); }
+    catch (error) { if (rounds === 1) opts.afterFirstFailure?.(flight, runner); throw error; }
+  });
+  let error: any;
+  try {
+    const run = () => subject.withLaunchLockRetry(flight, (r: unknown) => subject.requireLaunchAuthority(flight, r));
+    await (opts.budget ? MaintenanceBudget.run(budget, run) : run());
+  } catch (e) { error = e; }
+  finally { release.release(); await holder; subject.codexBoundaryDeadlineMs = 5000; }
+  return { error, rounds, flight, runner, subject, cache, diagnostics: abortLines(diagnostics), all: diagnostics };
+}
+
+const ORIGINAL = { facts: /remediation restriction facts unavailable/, restore: /lock wait aborted/ };
+
+for (const at of ["facts", "restore"] as const) {
+  for (const stop of ["cancel", "pause", "credential_switch", "shutdown", "claim_fence"] as const) {
+    for (const phase of ["during the wait", "during backoff"] as const) {
+      test("#4246 no retry when " + stop + " lands " + phase + " (" + at + ")", async t => {
+        const f = await fixture(false);
+        const during = phase === "during the wait";
+        const r = await directLaunch(t, f, {
+          at, retryMs: during ? undefined : 300,
+          expiry: "elapsed",
+          during: during ? (flight, runner) => applyStop(runner, flight, stop) : undefined,
+          afterFirstFailure: during ? undefined : (flight, runner) => { setTimeout(() => applyStop(runner, flight, stop), 20); },
+        });
+        try {
+          assert.ok(r.error, "today's error is rethrown");
+          assert.match(String(r.error.message), ORIGINAL[at]);
+          assert.equal(r.rounds, 1, "no fresh round");
+          assert.equal(r.diagnostics.length, 1, "exactly one diagnostic");
+          assert.equal(r.diagnostics[0].label, at === "facts" ? "restriction_facts" : "runtime_restore");
+          assert.equal(r.diagnostics[0].abort, during ? stop : "deadline");
+          if (!during) assert.equal(r.flight.launchLockRetries, 1, "the backoff was entered and then interrupted");
+        } finally { r.runner.shutdown(); }
+      });
+    }
+  }
+}
+
+for (const at of ["facts", "restore"] as const) {
+  test("#4246 an unidentified abort is classified unknown and not retried (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, budget: true });
+    try {
+      assert.ok(r.error);
+      assert.equal(r.rounds, 1);
+      assert.equal(r.flight.launchLockRetries, undefined);
+      assert.deepEqual(r.diagnostics.map(d => d.abort), ["unknown"]);
+    } finally { r.runner.shutdown(); }
+  });
+
+  test("#4246 an early timer notification before the deadline elapsed is unknown and not retried (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, expiry: "early" });
+    try {
+      assert.ok(r.error);
+      assert.match(String(r.error.message), ORIGINAL[at]);
+      assert.equal(r.rounds, 1);
+      assert.equal(r.flight.launchLockRetries, undefined);
+      assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [[at === "facts" ? "restriction_facts" : "runtime_restore", "unknown"]]);
+    } finally { r.runner.shutdown(); }
+  });
+
+  test("#4246 a pre-existing sticky latch is never retried or lifted (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, preset: flight => { flight.remediationRestrictions = { roots: [], clearable: false }; } });
+    try {
+      assert.ok(r.error);
+      assert.equal(r.rounds, 1);
+      assert.equal(r.flight.remediationRestrictions.clearable, false);
+      assert.deepEqual(r.diagnostics.map(d => d.abort), ["deadline"], "the abort is still diagnosed once");
+    } finally { r.runner.shutdown(); }
+  });
+
+  test("#4246 a successor capture is never retried (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, preset: flight => { flight.predecessorCapture = true; } });
+    try {
+      assert.ok(r.error);
+      assert.equal(r.rounds, 1);
+      assert.equal(r.flight.remediationRestrictions.clearable, false);
+      assert.equal(r.flight.launchLockRetries, undefined);
+      assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [[at === "facts" ? "restriction_facts" : "runtime_restore", "deadline"]]);
+    } finally { r.runner.shutdown(); }
+  });
+}
+
+test("#4246 a denial landing during the real restore lock wait stays sticky and is not retried", async t => {
+  const f = await fixture(false);
+  const r = await directLaunch(t, f, { at: "restore", during: flight => {
+    (flight.remediationRestrictions ??= { roots: [] }).clearable = false;
+    flight.remediationDenialRevision = (flight.remediationDenialRevision ?? 0) + 1;
+  } });
+  try {
+    assert.ok(r.error);
+    assert.equal(r.rounds, 1, "no fresh round and no launch");
+    assert.equal(r.flight.remediationRestrictions.clearable, false, "the concurrent denial is not made clearable");
+    assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [["runtime_restore", "deadline"]]);
+  } finally { r.runner.shutdown(); }
+});
+
+test("#4246 a restore failure after the lock was acquired is sticky and carries no lock-wait diagnostic", async t => {
+  const f = await fixture(false);
+  const r = await directLaunch(t, f, { at: "restore", breakRead: true });
+  try {
+    assert.ok(r.error);
+    assert.equal(r.rounds, 1);
+    assert.equal(r.flight.remediationRestrictions.clearable, false);
+    assert.deepEqual(r.diagnostics, []);
+    assert.equal(r.flight.launchLockRetries, undefined);
+    assert.equal(JSON.stringify(r.all).includes("private-read-sentinel"), false);
+  } finally { r.runner.shutdown(); }
+});
+
+test("#4246 the lock-wait diagnostic carries no path, ref or message", async t => {
+  const f = await fixture(false);
+  const r = await directLaunch(t, f, { at: "facts", expiry: "elapsed" });
+  try {
+    const text = JSON.stringify(r.all);
+    for (const secret of [f.bare, BRANCH, f.base, "boundary deadline"]) assert.equal(text.includes(secret), false, secret);
+  } finally { r.runner.shutdown(); }
+});
+
+for (const enrolled of [false, true]) {
+  test("#4246 teardown revalidation of a restore-site latch: " + (enrolled ? "enrolled journal stays held" : "clearable latch lifts only on a fresh unenrolled read"), async t => {
+    const f = await sourceImportFixture(enrolled);
+    f.subject.codexBoundaryDeadlineMs = LAUNCH_MS;
+    const clock = launchClock(t);
+    const entered = latch(), release = latch();
+    const hold = AsyncLocalStorage.bind(() => f.cache.withBareLock(f.bare, async () => { entered.release(); await release.promise; }));
+    let holder: Promise<void> | undefined;
+    const orig = f.cache.readRuntimeRemediationRecovery.bind(f.cache);
+    t.mock.method(f.cache, "readRuntimeRemediationRecovery", async (...args: Parameters<typeof orig>) => {
+      if (!holder) {
+        holder = hold(); await entered.promise;
+        setImmediate(() => clock.fire(true));
+      }
+      return orig(...args);
+    });
+    const round: any = { startedAt: Date.now() };
+    clock.arm();
+    try {
+      await assert.rejects(f.subject.requireLaunchAuthority(f.flight, round));
+    } finally { release.release(); await holder; f.subject.codexBoundaryDeadlineMs = 5000; }
+    try {
+      assert.equal(round.lockWait, "runtime_restore");
+      assert.ok(f.flight.remediationRestrictions, "a latch is left at the end of the flight");
+      assert.equal(f.flight.remediationRestrictions.clearable, !enrolled);
+      let published = 0;
+      t.mock.method(f.subject, "publishFlightSource", async () => { published++; return "published"; });
+      const facts = t.mock.method(f.cache, "readRemediationRestrictionFacts");
+      f.flight.completionSourceBound = { clonePath: f.clone.path };
+      f.flight.sourceTailsJoined = true;
+      const end = await f.subject.endFlightSourceUse(f.flight, nullLogger());
+      if (enrolled) {
+        assert.ok(f.flight.remediationRestrictions, "latch kept");
+        assert.equal(published, 0, "no publication under an enrolled journal");
+        assert.deepEqual(end.endedSlots, []);
+      } else {
+        assert.ok(facts.mock.callCount() >= 1, "a fresh facts read was made");
+        assert.equal(f.flight.remediationRestrictions, undefined, "verified absence cleared the latch");
+        assert.equal(published, 1);
+      }
+    } finally { f.runner.shutdown(); }
+  });
 }
