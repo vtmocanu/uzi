@@ -2104,7 +2104,8 @@ landing), valid only on that status and cause.
 - NULL: unclassified. The existing generic text applies and nothing new is permitted. An absent or NULL
   classification never permits adoption; it only selects the generic refusal text.
 
-An abort or deadline, and every other refusal, give NULL. The Run DTO exposes the field only for that
+A confirmed restricted ancestor or a trusted scan finding is active; an unknown probe after an abort or
+deadline, a deadline that rewrites the blocker, and every other refusal give NULL. The Run DTO exposes the field only for that
 status and cause; it is not in the `/api/v1` OpenAPI.
 
 **Feature token and rollout order.** The worker reports the value as optional `recovery_detail` on the
@@ -2116,8 +2117,8 @@ cause, and a non-positive `claim_generation`.
 **Resume refusal and fence.** Owner Resume (`uzi run resume`, `resume-now`, the web Resume) on
 `secret_remediation_active` returns 409 before any write: no claim, no claim generation, no audit row and
 no custody released. The message names both routes and Cancel. The SQL resume query is fenced on the same
-predicate, so a concurrent writer cannot slip a Resume past the handler check. The CLI, TUI and web never
-offer Resume in this state and show both routes then Cancel: export an available archive
+predicate, so a concurrent writer cannot slip a Resume past the handler check. The CLI and TUI print no Resume
+command in this state, the web shows Resume disabled, and all three show both routes then Cancel: export an available archive
 (`uzi run export <id> --output <path>`) or operator recovery from retained worker storage
 ([run recovery](../docs/run-recovery.md#retained-source-failure-and-local-proof)).
 

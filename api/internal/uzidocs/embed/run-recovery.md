@@ -600,7 +600,8 @@ A temporary API connection failure of the ownership check after the successor
 is verified is retried in place first; see
 [Retained recovery adoption failed](run-recovery-wait.md#retained-recovery-adoption-failed).
 When the refusal confirms the retained source still descends from a secret-scan-flagged
-commit, the run carries `recovery_wait_detail` `secret_remediation_active` and owner
+commit (and the API advertised `recovery_detail_adoption_refusal_v1`), the run carries
+`recovery_wait_detail` `secret_remediation_active` and owner
 Resume is refused (409, no claim, no generation, no audit row, no custody released):
 export an available archive (`uzi run export <id> --output <path>`, which may omit later
 work kept on the worker) or have an operator recover from retained worker storage (see

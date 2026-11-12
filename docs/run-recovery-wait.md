@@ -386,16 +386,18 @@ which may omit later work; an archive is not proven to hold the latest work) or
 operator recovery from retained worker storage (see
 [Run recovery](run-recovery.md#retained-source-failure-and-local-proof), the
 failed source-only paragraph), then Cancel. `uzi run get`, `list`, `wait`, `inputs`,
-the TUI and the web run page do not offer Resume in this state; for
+and the TUI print no Resume command in this state and the web run page shows Resume
+disabled with the reason; for
 `remediation_proof_unknown` they say a retry may help.
 
 The worker reports the detail as optional `recovery_detail` on the park, only
 after the API advertises the register feature
 `recovery_detail_adoption_refusal_v1`; the API 400s any other value, state,
 cause or a non-positive `claim_generation`. Deploy the API first. A confirmed
-restricted ancestor gives `secret_remediation_active`; an unknown ancestry probe
-or an untrusted scan gives `remediation_proof_unknown`; an abort, a deadline and
-every other refusal give no detail. After a worker process crash between
+restricted ancestor or a trusted scan finding gives `secret_remediation_active`;
+an unknown ancestry probe or an untrusted scan gives `remediation_proof_unknown`;
+an unknown probe after an abort or deadline, a deadline that rewrites the blocker,
+and every other refusal give no detail. After a worker process crash between
 persisting the blocker and the park, a fresh claim re-derives the class from the
 persisted journal, read-only and authenticated, in its own bounded operation;
 anything it cannot verify gives no detail, so a class known only from a

@@ -1545,7 +1545,8 @@ uzi run recovery <run-id> [--json]
   `retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed`: it remains `source_only`, or `needs_action` after a failed
   latest capture, even with an available archive or capture in flight. Retained
   exhaustion with a finite retry can retry automatically; its NULL retry requires
-  owner Resume/Cancel. Adoption failure always requires owner Resume/Cancel; so does
+  owner Resume/Cancel. Adoption failure always requires an owner decision (Resume/Cancel; Cancel only for
+`secret_remediation_active`, where Resume is refused); so does
   the same cause when the worker refused an unsupported predecessor of an independent restore
   (no adoption was attempted).
   An open hold at `recovery_wait` / `anthropic_spend_limit` (no retry time) is owner-held
