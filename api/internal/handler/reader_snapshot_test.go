@@ -93,6 +93,10 @@ func (p *handlerSnapshotProvider) ProbeTest(context.Context, []byte) (anthropic.
 	p.probes++
 	return anthropic.Reading{}, false, errors.New("unexpected snapshot test probe")
 }
+func (p *handlerSnapshotProvider) GatewayProbe(context.Context, anthropic.Gateway, []byte) error {
+	p.probes++
+	return errors.New("unexpected snapshot gateway probe")
+}
 
 func TestHandlerAnthropicSnapshotRetry(t *testing.T) {
 	for _, name := range []string{"normal", "enable", "disable", "ABA", "second transition", "enablement", "success generation", "owner", "id"} {

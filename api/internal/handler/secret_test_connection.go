@@ -33,6 +33,7 @@ type secretTestResult struct {
 type anthropicTester interface {
 	Usage(context.Context, []byte) (anthropic.Reading, error)
 	ProbeTest(context.Context, []byte) (anthropic.Reading, bool, error)
+	GatewayProbe(context.Context, anthropic.Gateway, []byte) error
 }
 
 type codexSecretTester interface {
@@ -160,6 +161,13 @@ func (h *Handler) testAnthropicSecret(ctx context.Context, userID, id uuid.UUID,
 	if err != nil {
 		return secretTestResult{Status: "inconclusive", Reason: "generic"}
 	}
+	if gw := h.anthropicGateway(ctx); gw != nil {
+		// Behind a gateway the token is the gateway's key: api.anthropic.com would refuse
+		// it and mark it rejected. Ask the gateway instead.
+		return testGatewayOutcome(ctx, h.secretTester().anthropic, *gw, plain,
+			func() secretTestResult { return h.anthropicTestClear(ctx, row) },
+			func() secretTestResult { return h.anthropicTestRejected(ctx, row) })
+	}
 	return testAnthropicOutcome(ctx, h.secretTester().anthropic, plain, h.cfg.UsageProbe,
 		func(reading anthropic.Reading) secretTestResult { return h.anthropicTestSuccess(ctx, row, reading) },
 		func() secretTestResult { return h.anthropicTestClear(ctx, row) },
@@ -186,6 +194,23 @@ func testAnthropicOutcome(ctx context.Context, client anthropicTester, plain []b
 		}
 		return clear()
 	}
+	if errors.As(err, &providerErr) && providerErr.Kind == anthropic.KindHTTP &&
+		(providerErr.Status == http.StatusUnauthorized || providerErr.Status == http.StatusForbidden) {
+		return reject()
+	}
+	return secretTestResult{Status: "inconclusive", Reason: "generic"}
+}
+
+// testGatewayOutcome probes the gateway with the key. A 2xx clears any rejection (a
+// gateway has no subscription windows, so there is no gauge); 401/403 is the gateway
+// refusing the key; anything else (a 404 for an unknown model, a 5xx, a redirect, a
+// transport error) proves nothing about the key and is inconclusive.
+func testGatewayOutcome(ctx context.Context, client anthropicTester, gw anthropic.Gateway, plain []byte, clear, reject func() secretTestResult) secretTestResult {
+	err := client.GatewayProbe(ctx, gw, plain)
+	if err == nil {
+		return clear()
+	}
+	var providerErr *anthropic.Error
 	if errors.As(err, &providerErr) && providerErr.Kind == anthropic.KindHTTP &&
 		(providerErr.Status == http.StatusUnauthorized || providerErr.Status == http.StatusForbidden) {
 		return reject()

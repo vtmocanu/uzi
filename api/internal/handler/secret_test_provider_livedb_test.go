@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -20,6 +21,14 @@ import (
 type providerAnthropicFake struct {
 	usage func(context.Context, []byte) (anthropic.Reading, error)
 	probe func(context.Context, []byte) (anthropic.Reading, bool, error)
+	gw    func(context.Context, anthropic.Gateway, []byte) error
+}
+
+func (f providerAnthropicFake) GatewayProbe(ctx context.Context, g anthropic.Gateway, token []byte) error {
+	if f.gw == nil {
+		return errors.New("unexpected gateway probe")
+	}
+	return f.gw(ctx, g, token)
 }
 
 func (f providerAnthropicFake) Usage(ctx context.Context, token []byte) (anthropic.Reading, error) {

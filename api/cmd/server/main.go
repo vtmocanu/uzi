@@ -1341,6 +1341,12 @@ func run() error {
 		anthropicClient := anthropic.New(&http.Client{Timeout: cfg.AnthropicHTTPTimeout})
 		usageEngine = usagepoller.New(q, secretopen.NewOpener(vlt, box), anthropicClient, cfg.UsagePollInterval, cfg.UsageProbe, slog.Default())
 		usageEngine.SetNotifier(notifier) // PRD #1020 M2: deliver the loud early-reset DM
+		usageEngine.SetGatewayCheck(func(ctx context.Context) bool {
+			// Allowlist or not: a configured gateway means the tokens are gateway keys,
+			// so never probe api.anthropic.com with them.
+			_, on, _ := settingsCache.AnthropicGateway(ctx)
+			return on
+		})
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()

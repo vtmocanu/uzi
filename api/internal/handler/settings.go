@@ -206,6 +206,16 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The gateway receives every user's saved token, so its host must be one the
+	// operator allowlisted (ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS), checked here for the
+	// same reason as the agent-source URL above. Empty (turning it off) is exempt.
+	if gwURL, ok := req.Settings[settings.KeyAnthropicGatewayBaseURL]; ok && strings.TrimSpace(gwURL) != "" {
+		if !h.cfg.AnthropicGatewayBaseURLAllowed(gwURL) {
+			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("%s: host is not in the gateway allowlist (ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS)", settings.KeyAnthropicGatewayBaseURL))
+			return
+		}
+	}
+
 	// Live-validate submitted Slack tokens against Slack after the cheap label
 	// precheck and BEFORE opening a transaction (a network call must not run inside
 	// the write tx). The error is scrubbed of any token bytes and never echoes the

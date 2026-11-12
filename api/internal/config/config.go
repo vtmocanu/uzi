@@ -145,6 +145,12 @@ type Config struct {
 	// means nothing is allowed until an admin configures it (AgentSourceBaseURLAllowed
 	// returns false on a nil list).
 	AgentSourceAllowedBaseURLs []string
+	// AnthropicGatewayAllowedBaseURLs (ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS) are the only
+	// hosts the admin's anthropic_gateway_base_url may name. Every user's saved Anthropic
+	// token is sent to the gateway (by the token test, and by every run), so the operator,
+	// not the admin UI, decides where that may be. Same shape as AgentSourceAllowedBaseURLs:
+	// normalized scheme+host, https only, EMPTY by default, and empty allows nothing.
+	AnthropicGatewayAllowedBaseURLs []string
 	// ProductSkillsAllowedBaseURLs is the SEPARATE SSRF allowlist for product skill sets
 	// (PRD #1909 D9, UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS): the only base URLs a product's
 	// skills_repo_url may target. Same shape as AgentSourceAllowedBaseURLs (normalized
@@ -995,6 +1001,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.AgentSourceAllowedBaseURLs = agentSourceAllowed
+	gatewayAllowed, err := parseBaseURLAllowlist("ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS", getenv("ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AnthropicGatewayAllowedBaseURLs = gatewayAllowed
 	// PRD #1909 M6: the product-skills allowlist, default EMPTY (feature off, instance still boots).
 	productSkillsAllowed, err := parseBaseURLAllowlist("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", getenv("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", ""))
 	if err != nil {
@@ -2242,6 +2253,17 @@ func (c Config) AgentSourceBaseURLAllowed(raw string) bool {
 		}
 	}
 	return false
+}
+
+// AnthropicGatewayBaseURLAllowed reports whether raw's scheme+host is in
+// AnthropicGatewayAllowedBaseURLs; false when that list is empty. A path on raw is
+// allowed (gateways may serve the API under one); the host is what the list pins.
+func (c Config) AnthropicGatewayBaseURLAllowed(raw string) bool {
+	norm, err := NormalizeForgeBaseURL(raw)
+	if err != nil {
+		return false
+	}
+	return slices.Contains(c.AnthropicGatewayAllowedBaseURLs, norm)
 }
 
 // IssueTrackerBaseURLAllowed reports whether raw normalizes to an allowlisted issue tracker base

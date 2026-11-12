@@ -363,6 +363,8 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// returned at register so the worker can size its own pending-outcome quota to match the
 		// server's WORKER_OUTBOX_MAX_PENDING without a separate config channel.
 		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
+		// The Anthropic-compatible gateway every Claude call routes through, or null.
+		"anthropic_gateway": h.anthropicGatewayWire(r.Context()),
 	})
 }
 
@@ -693,6 +695,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		"worker":                    dto,
 		"protocol_features":         h.advertisedFeatures(),
 		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
+		"anthropic_gateway":         h.anthropicGatewayWire(r.Context()),
 	}
 	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {
 		response["dind_maintenance"] = maintenance

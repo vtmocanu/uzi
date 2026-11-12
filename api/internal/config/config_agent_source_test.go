@@ -64,3 +64,16 @@ func TestAgentSourceBaseURLAllowed(t *testing.T) {
 		t.Error("an http URL must not be allowed (https-only)")
 	}
 }
+
+func TestAnthropicGatewayBaseURLAllowed(t *testing.T) {
+	c := Config{AnthropicGatewayAllowedBaseURLs: []string{"https://gw.example.com"}}
+	if !c.AnthropicGatewayBaseURLAllowed("https://GW.example.com/anthropic") {
+		t.Error("allowlisted host with a path refused")
+	}
+	if c.AnthropicGatewayBaseURLAllowed("https://evil.example.com") || c.AnthropicGatewayBaseURLAllowed("http://gw.example.com") {
+		t.Error("non-allowlisted or plain-http URL accepted")
+	}
+	if (Config{}).AnthropicGatewayBaseURLAllowed("https://gw.example.com") {
+		t.Error("an empty allowlist allowed a gateway")
+	}
+}

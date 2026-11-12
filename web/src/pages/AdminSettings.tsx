@@ -39,6 +39,7 @@ import {
   DEFAULT_DARK_THEME,
 } from "../lib/theme";
 import { JudgeSettingsCard } from "./adminSettings/JudgeSettingsCard";
+import { AnthropicGatewayCard } from "./adminSettings/AnthropicGatewayCard";
 import { CustodyHoldLimitCard } from "./adminSettings/CustodyHoldLimitCard";
 import { HostedWorkerQuotaCard } from "./adminSettings/HostedWorkerQuotaCard";
 import { EphemeralWorkersCard } from "./adminSettings/EphemeralWorkersCard";
@@ -518,6 +519,12 @@ export function AdminSettings() {
           </form>
         )}
       </Card>
+
+      {!loading && saved && (
+        <section id="claude-gateway" className="scroll-mt-6">
+          <AnthropicGatewayCard settings={saved} onSaved={applyResponse} />
+        </section>
+      )}
 
       {!loading && saved && (
         <section id="run-judge" className="scroll-mt-6">

@@ -96,6 +96,28 @@ nobody's screen changes until an admin or a user opts into `system` mode or
 a light theme. See [Theming](./theming.md) for how themes and polarity work
 and how to add a theme.
 
+## Claude gateway
+
+Routes every Claude call through an Anthropic-compatible gateway instead of
+Anthropic directly: LiteLLM, Portkey, Cloudflare AI Gateway or a corporate proxy.
+Each user's saved Anthropic token is then their key for that gateway.
+
+- **Gateway base URL**: the `https` URL Claude Code calls `/v1/messages` under.
+  Its host must be in the operator's `ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS`
+  ([Configuration](./configuration.md#anthropic-compatible-gateway)). Empty
+  means Anthropic directly.
+- **Send the key as**: `Authorization: Bearer` or `x-api-key`, whichever the
+  gateway expects.
+- **Gateway model for opus / sonnet / haiku / fable**: the gateway's name for
+  each Claude Code alias. An empty field sends the alias as Claude Code resolves it.
+
+While a gateway is set, **Test** on a token sends one tiny request to the gateway:
+the gateway accepting the key reads as OK, a 401 or 403 as rejected, anything
+else as inconclusive. The usage poller pauses, because a gateway exposes no
+Anthropic subscription windows; tokens then show no usage meter, and automatic
+token selection falls back as it does with the poller off. Workers pick a change
+up on their next heartbeat.
+
 ## Run judge
 
 A global kill-switch for the [run judge](./judge.md), plus the model it runs
