@@ -90,7 +90,7 @@ func TestCredentialSwitchOpIDTriggerLiveDB(t *testing.T) {
 	stamped, plain := pre.run(t, "running"), pre.run(t, "running")
 	mustExec(ctx, t, pool, "UPDATE runs SET credential_switch_requested_at=now(), credential_switch_generation=1 WHERE id=$1", stamped)
 	pool.Close()
-	if err := store.MigrateTo(ctx, dsn, 428); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 431); err != nil {
 		t.Fatal(err)
 	}
 	f := newSwitchOpFixture(t, dsn, ctx)

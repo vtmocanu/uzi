@@ -1,15 +1,8 @@
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
--- Issue #4201. The ALTERs on the busy tables come first, and the CREATE TABLE (whose foreign keys
--- lock runs and user_secrets) comes last; every lock wait is bounded by lock_timeout above.
+-- Issue #4201. The ordinal columns and the worker nonce are in 00428..00430, one busy table per
+-- migration; this file only creates the table (its foreign keys lock runs and user_secrets).
 --
--- Per-epoch attribution of messages and usage rows; NULL means "the claim's base epoch".
-ALTER TABLE run_messages ADD COLUMN credential_epoch_ordinal integer;
-ALTER TABLE run_usage ADD COLUMN credential_epoch_ordinal integer;
-
--- The registration nonce stamped at registration by an apply-negotiated worker (wired in m3a).
-ALTER TABLE workers ADD COLUMN credential_switch_apply_nonce text;
-
 -- The in-place Claude credential switch apply journals each applied switch as a
 -- child epoch of the claim it happened in. run_credential_epochs (00233) keeps one row per claim
 -- generation; this table holds the ordinal 1..n switches applied inside one generation, each
@@ -35,7 +28,4 @@ CREATE INDEX run_credential_switch_epochs_secret_idx ON run_credential_switch_ep
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
-ALTER TABLE workers DROP COLUMN IF EXISTS credential_switch_apply_nonce;
-ALTER TABLE run_usage DROP COLUMN IF EXISTS credential_epoch_ordinal;
-ALTER TABLE run_messages DROP COLUMN IF EXISTS credential_epoch_ordinal;
 DROP TABLE IF EXISTS run_credential_switch_epochs;
