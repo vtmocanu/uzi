@@ -363,6 +363,51 @@ true
 {{- end -}}
 
 {{- /*
+  uzi.validateBaseURLEntry: the ONE shape check for an allowlist base URL entry
+  (forge.allowedBaseURLs, issueTracker.allowedBaseURLs). It only ever fails; it renders
+  nothing, so include it as `{{- include "uzi.validateBaseURLEntry" (dict ...) -}}`.
+  Args (dict): "key" (the values key, for the message), "pos" (1-based entry position),
+  "entry" (the raw value), "rejectSeparators" (bool: also refuse a comma or whitespace,
+  for lists that are joined with "," into one env var).
+
+  NO fail message prints the entry or any part of it: an entry can carry credentials
+  (https://user:pw@host, ?private_token=...) and a render error ends up in CI logs and
+  Argo UI. Messages are "<key> entry <pos>: <reason>".
+
+  Every check runs on the RAW string, before any urlParse: sprig's urlParse aborts the
+  render with the raw text on malformed input, and reports empty userinfo for "https://@h"
+  and empty query/fragment for a bare "?" / "#", so URL-parsed fields cannot be trusted
+  to catch those. Order matters: userinfo, separators, query, fragment, path, shape.
+  An entry that passes the final anchored regex is guaranteed parseable by urlParse:
+  https scheme, a host made only of [A-Za-z0-9._-] or a bracketed [hex:.] literal, an
+  optional numeric port, an optional trailing slash, nothing else. (A bracketed literal
+  that is not a real IP, e.g. [:::], is accepted here and parsed by urlParse without error.)
+*/}}
+{{- define "uzi.validateBaseURLEntry" -}}
+{{- $raw := toString .entry }}
+{{- $where := printf "%s entry %d" .key (int .pos) }}
+{{- if contains "@" $raw }}
+{{- fail (printf "%s: must not contain userinfo (user@ or user:password@); list the bare https://host[:port]" $where) }}
+{{- end }}
+{{- if and .rejectSeparators (regexMatch "[,\\s]" $raw) }}
+{{- /* The list is joined with "," and the api splits on ",", so an entry holding one would smuggle in a second URL past the https check. */}}
+{{- fail (printf "%s: must not contain a comma or whitespace (the entries are joined with \",\" into ISSUE_TRACKER_ALLOWED_BASE_URLS; list each URL as its own entry)" $where) }}
+{{- end }}
+{{- if contains "?" $raw }}
+{{- fail (printf "%s: has a query; only https://host[:port] with an optional trailing / is allowed" $where) }}
+{{- end }}
+{{- if contains "#" $raw }}
+{{- fail (printf "%s: has a fragment; only https://host[:port] with an optional trailing / is allowed" $where) }}
+{{- end }}
+{{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/]*/." $raw }}
+{{- fail (printf "%s: has a path; only https://host[:port] with an optional trailing / is allowed" $where) }}
+{{- end }}
+{{- if not (regexMatch "^(?i:https)://([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?/?$" $raw) }}
+{{- fail (printf "%s: must be an absolute https URL with a host, e.g. https://github.com (non-ASCII hosts use the xn-- form)" $where) }}
+{{- end }}
+{{- end }}
+
+{{- /*
   uzi.forgeEgressHosts: the worker egress destinations DERIVED from forge.allowedBaseURLs
   (PRD #808), as a JSON list of {"host": ..., "port": ...}. It is the ONE derivation every
   FQDN-egress provider consumes (Antrea ANNP, OVN EgressFirewall), so a forge host is
@@ -372,21 +417,20 @@ true
   (default 443), so a non-standard forge port does NOT diverge from the api, which preserves
   the port in NormalizeForgeBaseURL.
 
-  Validated fail-CLOSED to mirror the api: NormalizeForgeBaseURL refuses to boot on a
-  scheme-less / hostless entry, so a render that would emit an empty name (match-nothing at
-  best, match-anything at worst) is a hard render failure rather than a malformed rule.
+  Validated fail-CLOSED to mirror the api: every entry goes through uzi.validateBaseURLEntry
+  first (so urlParse only ever sees a well-formed bare https://host[:port]), and a render
+  that would emit an empty name (match-nothing at best, match-anything at worst) is a hard
+  render failure rather than a malformed rule.
   Consumers: `fromJsonArray (include "uzi.forgeEgressHosts" .)`.
 */}}
 {{- define "uzi.forgeEgressHosts" -}}
 {{- $out := list }}
-{{- range .Values.forge.allowedBaseURLs }}
-{{- $u := urlParse . }}
+{{- range $i, $e := .Values.forge.allowedBaseURLs }}
+{{- include "uzi.validateBaseURLEntry" (dict "key" "forge.allowedBaseURLs" "pos" (add1 $i) "entry" $e "rejectSeparators" false) -}}
+{{- $u := urlParse (toString $e) }}
 {{- $host := $u.hostname }}
-{{- if or (not $host) (ne $u.scheme "https") }}
-{{- fail (printf "forge.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://github.com (it feeds both FORGE_ALLOWED_BASE_URLS and the worker egress FQDN list; the api's NormalizeForgeBaseURL rejects the same input at boot)." .) }}
-{{- end }}
 {{- if or (contains ":" $host) (regexMatch "^[0-9]+(\\.[0-9]+)+$" $host) }}
-{{- fail (printf "forge.allowedBaseURLs entry %q resolves to an IP-literal host (%s). FQDN egress rules cannot express an IP address, and the derived port parsing breaks on a bracketed IPv6 literal (splitting the host on ':' yields an invalid port). Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." . $host) }}
+{{- fail (printf "forge.allowedBaseURLs entry %d resolves to an IP-literal host (%s). FQDN egress rules cannot express an IP address, and the derived port parsing breaks on a bracketed IPv6 literal (splitting the host on ':' yields an invalid port). Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." (add1 $i) $host) }}
 {{- end }}
 {{- /* urlParse has no .port field; .host carries host[:port], so split it out (default 443). */}}
 {{- $port := "443" }}
@@ -398,24 +442,18 @@ true
 
 {{- /*
   uzi.issueTrackerAllowedBaseURLs: issueTracker.allowedBaseURLs (PRD #4173 S3) as a JSON
-  list, validated fail-CLOSED like uzi.forgeEgressHosts: an entry must be an absolute https
-  URL with a host, mirroring what the api refuses at boot. Unlike the forge list there is
-  no IP-literal check, because nothing here derives an FQDN egress rule from it (a worker
-  never calls an issue tracker).
+  list, validated fail-CLOSED like uzi.forgeEgressHosts: every entry goes through
+  uzi.validateBaseURLEntry (bare https://host[:port], optional trailing /; no userinfo,
+  path, query or fragment; no comma or whitespace), mirroring what the api refuses at boot.
+  Unlike the forge list there is no IP-literal check, because nothing here derives an FQDN
+  egress rule from it (a worker never calls an issue tracker). Entries are returned as given.
   Consumers: `fromJsonArray (include "uzi.issueTrackerAllowedBaseURLs" .)`.
 */}}
 {{- define "uzi.issueTrackerAllowedBaseURLs" -}}
 {{- $out := list }}
-{{- range (.Values.issueTracker).allowedBaseURLs }}
-{{- /* Checked before urlParse: the list is joined with "," and the api splits on ",", so an entry holding one would smuggle in a second URL past the https check. */}}
-{{- if regexMatch "[,\\s]" (toString .) }}
-{{- fail (printf "issueTracker.allowedBaseURLs entry %q must not contain a comma or whitespace (the entries are joined with \",\" into ISSUE_TRACKER_ALLOWED_BASE_URLS; list each URL as its own entry)." .) }}
-{{- end }}
-{{- $u := urlParse . }}
-{{- if or (not $u.hostname) (ne $u.scheme "https") }}
-{{- fail (printf "issueTracker.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://tracker.example.com (it feeds ISSUE_TRACKER_ALLOWED_BASE_URLS; the api rejects the same input at boot)." .) }}
-{{- end }}
-{{- $out = append $out . }}
+{{- range $i, $e := (.Values.issueTracker).allowedBaseURLs }}
+{{- include "uzi.validateBaseURLEntry" (dict "key" "issueTracker.allowedBaseURLs" "pos" (add1 $i) "entry" $e "rejectSeparators" true) -}}
+{{- $out = append $out $e }}
 {{- end }}
 {{- toJson $out }}
 {{- end }}
