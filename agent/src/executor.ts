@@ -798,10 +798,16 @@ export interface RunContext {
    *     a later NORMAL completion cleans up as usual. This is the fall-through the PRD requires
    *     (D3/D14), exactly like a declined `now` pause continues rather than parks.
    *
+   * A third outcome exists only when the api serves the in-place apply route (issue #4201):
+   *   - `"applied"` — the new token was applied server-side and published to `credential()`; the
+   *     caller continues in place exactly as for `"gave_up"` (same worker, generation, cwd and session
+   *     id) but must rebind its token copies first and read `ctx.signal` afresh. `opts` carries the
+   *     site and whether the executor's guarded lane is settled (the proof's executor-side half).
+   *
    * Absent on the stub/test executors ⇒ the loop/waiters re-throw the CredentialSwitchSignal to the
    * runner's outer catch, byte-identical to the pre-fix behaviour.
    */
-  attemptCredentialSwitch?(opts?: { site: InPlaceSwitchSite; laneSettled: boolean }): Promise<"released" | "gave_up">;
+  attemptCredentialSwitch?(opts?: { site: InPlaceSwitchSite; laneSettled: boolean }): Promise<"released" | "gave_up" | "applied">;
   /**
    * PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED — a matching switch
    * signal is held (not tripped, the turn not aborted) for the duration, then honored at the next

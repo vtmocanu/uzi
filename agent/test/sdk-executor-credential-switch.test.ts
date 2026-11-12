@@ -599,3 +599,218 @@ describe("SdkExecutor — credential switch during the plan source report (PRD #
     assert.strictEqual(turnCount(), 0, "no provider turn started after the release");
   });
 });
+
+// Issue #4201 m2c: an "applied" hook outcome continues the run in place at EVERY executor site, exactly as a
+// give-up does, but on the new token: the wait re-runs (or the turn restarts with the same resumeId and cwd)
+// and the next provider turn spawns with the published credential in the shared env.
+describe("SdkExecutor — an applied in-place credential switch (issue #4201)", () => {
+  const NEW_OAUTH = "dummy-new-oauth-token-do-not-scan-9999";
+  const askUserTurn = (): SDKMessage => ({
+    type: "assistant",
+    session_id: "sess-1",
+    message: { content: [{ type: "tool_use", id: "ta", name: "mcp__uzi__ask_user", input: { questions: [{ question: "Which db?" }] } }] },
+  } as unknown as SDKMessage);
+
+  function recordingTurns(scripts: Script[]): { queryFn: SdkQueryFn; turns: Array<{ token: string | undefined; resume: string | undefined; cwd: string | undefined }> } {
+    const turns: Array<{ token: string | undefined; resume: string | undefined; cwd: string | undefined }> = [];
+    const { queryFn: inner } = fakeTurns(scripts);
+    const queryFn: SdkQueryFn = (params) => {
+      const env = params.options.env as Record<string, string | undefined>;
+      turns.push({ token: env.CLAUDE_CODE_OAUTH_TOKEN, resume: params.options.resume, cwd: params.options.cwd });
+      return inner(params);
+    };
+    return { queryFn, turns };
+  }
+
+  /** The runner's half, in miniature: publish the new credential, then answer "applied". */
+  function applying() {
+    const calls: Array<{ site: string; laneSettled: boolean }> = [];
+    const credential = { token: OAUTH, ordinal: 0 };
+    const overrides: Partial<RunContext> = {
+      credential: () => ({ ...credential }),
+      attemptCredentialSwitch: async (opts) => {
+        calls.push({ site: opts?.site ?? "none", laneSettled: opts?.laneSettled ?? false });
+        credential.token = NEW_OAUTH;
+        credential.ordinal = 1;
+        return "applied";
+      },
+    };
+    return { calls, overrides };
+  }
+  const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+  const revise = { kind: "revise", feedback: "tighten it" } as PlanVerdict;
+  const resumedAtGate = { planApproved: false, resumePhase: "awaiting_approval", approvedPlan: "# Submitted plan" } as const;
+
+  const cases: Array<{ site: string; build: () => { scripts: Script[]; ctx: Partial<RunContext>; settles: () => boolean; firstNewTurn: number } }> = [
+    {
+      site: "gate_resumed",
+      build: () => {
+        let n = 0;
+        return {
+          scripts: [doneTurn()],
+          ctx: { ...resumedAtGate, takeResumedGateEvent: async () => { if (++n === 1) throw new CredentialSwitchSignal(); return undefined; } },
+          settles: () => n === 2, firstNewTurn: 0,
+        };
+      },
+    },
+    {
+      site: "plan_turn",
+      build: () => {
+        let n = 0;
+        return {
+          scripts: [[submitPlan("# Plan"), resultSuccess()], doneTurn()],
+          ctx: { reportPlanAgentSource: async () => { if (++n === 1) throw new CredentialSwitchSignal(); } },
+          settles: () => n === 2, firstNewTurn: 0,
+        };
+      },
+    },
+    {
+      site: "plan_gate",
+      build: () => {
+        let n = 0;
+        return {
+          scripts: [[submitPlan("# Plan"), resultSuccess()], doneTurn()],
+          ctx: { gatePlan: async () => { if (++n === 1) throw new CredentialSwitchSignal(); return approve; } },
+          settles: () => n === 2, firstNewTurn: 1,
+        };
+      },
+    },
+    {
+      site: "plan_gate_exhausted",
+      build: () => {
+        let n = 0;
+        return {
+          scripts: [[submitPlan("# Plan"), resultSuccess()], doneTurn()],
+          ctx: {
+            config: { plan_max_revisions: 0 } as never,
+            gatePlan: async () => { n++; if (n === 1) return revise; if (n === 2) throw new CredentialSwitchSignal(); return approve; },
+          },
+          settles: () => n === 3, firstNewTurn: 1,
+        };
+      },
+    },
+    {
+      site: "plan_source",
+      build: () => {
+        let reports = 0;
+        let gates = 0;
+        return {
+          scripts: [[submitPlan("# Revised plan"), resultSuccess()], doneTurn()],
+          ctx: {
+            ...resumedAtGate,
+            gatePlan: async () => (++gates === 1 ? revise : approve),
+            reportPlanAgentSource: async () => { if (++reports === 1) throw new CredentialSwitchSignal(); },
+            deferCredentialSwitch: async (fn) => fn(),
+          },
+          settles: () => reports === 2, firstNewTurn: 0,
+        };
+      },
+    },
+    {
+      site: "plan_gate_revision",
+      build: () => {
+        let n = 0;
+        return {
+          scripts: [[submitPlan("# Plan"), resultSuccess()], [submitPlan("# Plan v2"), resultSuccess()], doneTurn()],
+          ctx: {
+            gatePlan: async () => { n++; if (n === 1) return revise; if (n === 2) throw new CredentialSwitchSignal(); return approve; },
+            deferCredentialSwitch: async (fn) => fn(),
+          },
+          settles: () => n === 3, firstNewTurn: 2,
+        };
+      },
+    },
+    {
+      site: "ask_user",
+      build: () => {
+        let n = 0;
+        return {
+          scripts: [[submitPlan("# Plan"), resultSuccess()], [askUserTurn(), resultSuccess()], doneTurn()],
+          ctx: { askUser: async () => { if (++n === 1) throw new CredentialSwitchSignal(); return { kind: "answer", answers: ["postgres"] }; } },
+          settles: () => n === 2, firstNewTurn: 2,
+        };
+      },
+    },
+    {
+      site: "follow_up",
+      build: () => {
+        let n = 0;
+        return {
+          scripts: [[submitPlan("# Plan"), resultSuccess()], doneTurn(), doneTurn()],
+          ctx: {
+            interactive: true,
+            awaitFollowUp: async () => {
+              n++;
+              if (n === 1) throw new CredentialSwitchSignal();
+              if (n === 2) return { kind: "followup", id: 1, body: "one more thing" };
+              return { kind: "ended", reason: "idle" };
+            },
+          },
+          settles: () => n === 3, firstNewTurn: 2,
+        };
+      },
+    },
+  ];
+
+  for (const c of cases) {
+    it(`${c.site}: the wait re-runs and the next provider turn spawns on the new token`, async () => {
+      const built = c.build();
+      const { queryFn, turns } = recordingTurns(built.scripts);
+      const hook = applying();
+      const { ctx } = makeCtx({ ...built.ctx, ...hook.overrides });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      assert.strictEqual(result.switchReleased, undefined, "an apply never releases");
+      assert.deepEqual(hook.calls, [{ site: c.site, laneSettled: true }], "the hook is told the site and that the lane is settled");
+      assert.ok(built.settles(), "the interrupted wait ran again after the apply");
+      assert.strictEqual(ctx.oauthToken, NEW_OAUTH, "ctx.oauthToken follows the published credential");
+      assert.ok(turns.length > c.build().firstNewTurn, `a provider turn followed the apply: ${JSON.stringify(turns)}`);
+      assert.ok(turns.slice(0, built.firstNewTurn).every((t) => t.token === OAUTH), "turns before the apply used the old token");
+      assert.ok(turns.slice(built.firstNewTurn).every((t) => t.token === NEW_OAUTH), `turns after the apply use the new token: ${JSON.stringify(turns)}`);
+      assert.strictEqual(new Set(turns.map((t) => t.cwd)).size, 1, "one cwd for every turn");
+    });
+  }
+
+  it("implement_turn: the aborted turn restarts in place with the same resumeId and cwd on the new token", async () => {
+    const { queryFn, turns } = recordingTurns([[submitPlan("# Plan"), resultSuccess()], doneTurn()]);
+    const cancel = new AbortController();
+    const hook = applying();
+    const { ctx } = makeCtx({
+      ...hook.overrides,
+      signal: cancel.signal,
+      reportIteration: async (n) => { if (n === 1) cancel.abort(new CredentialSwitchSignal()); return undefined; },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, undefined);
+    assert.deepEqual(hook.calls, [{ site: "implement_turn", laneSettled: true }]);
+    const last = turns.at(-1)!;
+    assert.strictEqual(last.token, NEW_OAUTH, "the restarted turn spawns on the new token");
+    assert.ok(turns.slice(0, -1).every((t) => t.token === OAUTH));
+    assert.strictEqual(new Set(turns.map((t) => t.cwd)).size, 1);
+    assert.ok(last.resume === undefined || last.resume === "sess-1", "the restart continues the same session");
+  });
+
+  it("laneSettled is false when the guarded lane's quiesce failed after the switch trip took the carrier", async (t) => {
+    const { ClaudeCommandLane, GuardedCommandUnconfirmedError } = await import("../src/claude-command/lane.js");
+    const cancel = new AbortController();
+    // Only the turn the switch interrupted fails its join; the plan turn before it joins cleanly.
+    t.mock.method(ClaudeCommandLane.prototype, "quiesce", async () => {
+      if (cancel.signal.aborted) throw new GuardedCommandUnconfirmedError("fixture unconfirmed");
+    });
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      // The switch lands while the implement turn is live; its join then fails.
+      (signal) => { cancel.abort(new CredentialSwitchSignal()); return hangUntilAbort(signal); },
+      doneTurn(),
+    ]);
+    const opts: Array<{ site: string; laneSettled: boolean } | undefined> = [];
+    const commands = { protect: () => ({}), unprotect: () => true };
+    const { ctx } = makeCtx({
+      signal: cancel.signal,
+      capturedMemory: () => ({ commands, context: {}, flight: {}, lifecycleRevision: 1 }) as never,
+      // The switch trip is held first, so the lane failure never becomes the turn's error: the hook sees it.
+      attemptCredentialSwitch: async (o) => { opts.push(o); throw new Error("stop here"); },
+    });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /stop here|unconfirmed/);
+    assert.deepEqual(opts, [{ site: "implement_turn", laneSettled: false }]);
+  });
+});

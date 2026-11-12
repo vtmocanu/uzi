@@ -3544,6 +3544,8 @@ export interface StateAck {
   credentialSwitchHeld?: boolean;
   /** issue #3181: true when the 200 ack carried `disposition: "hold_settled"`. */
   credentialSwitchHoldSettled?: boolean;
+  /** Issue #4201: true when the 200 ack carried `disposition: "uncertain"` (the uncertain report applied). */
+  credentialSwitchUncertain?: boolean;
   /** Issue #3985: true when the 200 ack carried `disposition: "clarification_settled"`. */
   clarificationSettled?: boolean;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the

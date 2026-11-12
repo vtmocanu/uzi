@@ -156,6 +156,40 @@ describe("credential switch op ledger", () => {
     await new CredentialSwitchOpLedger(dir).cleanup("never-seen");
   });
 
+  it("record(ambiguous) re-creates a missing entry, so a lost entry never reads as clean", async () => {
+    const dir = tmp();
+    const ledger = new CredentialSwitchOpLedger(dir);
+    await assert.rejects(ledger.record(RUN, "ghost", "clean_route_absent"), /no entry to record/);
+    assert.equal(await ledger.record(RUN, "ghost", "ambiguous", "uncertain", 4), "ambiguous");
+    assert.deepEqual(onDisk(dir)["ghost"], { generation: 4, state: "ambiguous", outcome: "uncertain" });
+    // A send of the op after the entry vanished (a prune or cleanup raced it) is still ambiguous.
+    const client = fakeClient([], { kind: "route_absent" });
+    await ledger.cleanup(RUN, 4);
+    assert.equal((await applyThroughLedger(client, ledger, RUN, { ...REQ, opId: "ghost", claimGeneration: 4 })).kind, "uncertain");
+  });
+
+  it("cleanup and prune never drop a sending or ambiguous entry of the current generation", async () => {
+    const dir = tmp();
+    const ledger = new CredentialSwitchOpLedger(dir);
+    await ledger.markSending(RUN, "inflight", 5);
+    await ledger.markSending(RUN, "unsure", 5);
+    await ledger.record(RUN, "unsure", "ambiguous", "uncertain");
+    await ledger.markSending(RUN, "done", 5);
+    await ledger.record(RUN, "done", "settled", "applied");
+    await ledger.markSending(RUN, "stale", 2);
+    await ledger.record(RUN, "stale", "ambiguous", "uncertain");
+    await ledger.pruneGenerationsBelow(RUN, 5);
+    assert.deepEqual(Object.keys(onDisk(dir)).sort(), ["done", "inflight", "unsure"], "only the older generation went");
+    await ledger.cleanup(RUN, 5);
+    assert.deepEqual(Object.keys(onDisk(dir)).sort(), ["inflight", "unsure"], "the unresolved entries of this generation survive cleanup");
+    // A fresh instance (a restart) still sees them, and reads the in-flight send as ambiguous.
+    const reborn = new CredentialSwitchOpLedger(dir);
+    assert.equal((await reborn.stateOf(RUN, "inflight"))?.state, "ambiguous");
+    // Cleanup for a newer generation finally releases them.
+    await ledger.cleanup(RUN, 6);
+    assert.equal(fs.existsSync(ledgerFile(dir)), false);
+  });
+
   it("a corrupt or unreadable ledger file is uncertain and an unsafe run id is unavailable, never sent", async () => {
     const dir = tmp();
     fs.mkdirSync(path.join(dir, "credential-switch-ops"));

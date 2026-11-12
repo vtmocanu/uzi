@@ -5,6 +5,16 @@
 //
 // File: <dataDir>/credential-switch-ops/<runId>.json, `{ops: {<opId>: {generation, state, outcome?}}}`.
 // Write order for every mutation: temp file -> fsync(file) -> rename -> fsync(dir).
+//
+// ONE INSTANCE PER WORKER DATA DIR. The per-run lock (`chains`) and the entry cache live in the
+// instance, so two instances over the same directory would interleave load+mutate+persist cycles
+// and could overwrite each other's entries. Construct the ledger once and share it with every
+// runner on that data dir (RunnerOptions.credentialSwitchLedger).
+//
+// Lifecycle contract for callers: `cleanup` only at a run's terminal state, `pruneGenerationsBelow`
+// only with a NEWER claim generation, and neither during an apply. Neither ever drops an entry that
+// is still `sending` or `ambiguous` for the current generation: that entry is the only memory that
+// a send may have committed.
 import { promises as fsp, constants as fsc } from "node:fs";
 import path from "node:path";
 import type { CredentialSwitchApplyRequest, CredentialSwitchApplyResult } from "./client.js";
@@ -173,15 +183,20 @@ export class CredentialSwitchOpLedger {
    * lock: a `settled` entry is never degraded, and an `ambiguous` one never becomes
    * `clean_route_absent`. Throws when the change cannot be made durable.
    */
-  async record(runId: string, opId: string, state: Exclude<OpState, "sending">, outcome?: string): Promise<OpState> {
+  async record(
+    runId: string, opId: string, state: Exclude<OpState, "sending">, outcome?: string, generation?: number,
+  ): Promise<OpState> {
     return this.withLock(runId, async () => {
       const entries = await this.load(runId);
       const prior = entries.get(opId);
-      if (!prior) throw new Error("credential switch ledger: no entry to record");
-      if (state !== "settled" && (prior.state === "settled" || (state === "clean_route_absent" && prior.state === "ambiguous")))
+      // An `ambiguous` record re-creates a missing entry (a prune or cleanup raced the send, or the
+      // file was lost): losing the memory of a possibly committed send must never make it clean.
+      if (!prior && !(state === "ambiguous" && generation !== undefined))
+        throw new Error("credential switch ledger: no entry to record");
+      if (prior && state !== "settled" && (prior.state === "settled" || (state === "clean_route_absent" && prior.state === "ambiguous")))
         return prior.state;
       const previous = new Map([...entries].map(([k, v]) => [k, { ...v }] as const));
-      entries.set(opId, { generation: prior.generation, state, ...(outcome !== undefined ? { outcome } : {}) });
+      entries.set(opId, { generation: prior?.generation ?? generation!, state, ...(outcome !== undefined ? { outcome } : {}) });
       try {
         await this.persist(runId, entries);
       } catch (err) {
@@ -200,7 +215,7 @@ export class CredentialSwitchOpLedger {
     });
   }
 
-  /** Drop entries from generations older than `generation`. */
+  /** Drop entries from generations older than `generation`. Never touches the current generation. */
   async pruneGenerationsBelow(runId: string, generation: number): Promise<void> {
     return this.withLock(runId, async () => {
       const entries = await this.load(runId);
@@ -217,10 +232,32 @@ export class CredentialSwitchOpLedger {
     });
   }
 
-  /** Remove the run's ledger file and make the removal durable. */
-  async cleanup(runId: string): Promise<void> {
+  /**
+   * Terminal-state cleanup: drop every entry except those still `sending` or `ambiguous` at
+   * `currentGeneration` or later (all of them when it is omitted), and remove the file once nothing
+   * is left. The kept entries are the memory that a send may have committed.
+   */
+  async cleanup(runId: string, currentGeneration?: number): Promise<void> {
     const file = this.fileFor(runId);
     return this.withLock(runId, async () => {
+      // A file that cannot be read or parsed is left alone: it may hold an ambiguous entry.
+      const entries = await this.load(runId);
+      const keep = new Map<string, OpEntry>();
+      for (const [opId, e] of entries) {
+        if ((e.state === "sending" || e.state === "ambiguous") && (currentGeneration === undefined || e.generation >= currentGeneration))
+          keep.set(opId, e);
+      }
+      if (keep.size > 0) {
+        const previous = new Map([...entries].map(([k, v]) => [k, { ...v }] as const));
+        try {
+          await this.persist(runId, keep);
+          this.cache.set(runId, keep);
+        } catch (err) {
+          this.cache.set(runId, previous);
+          throw err;
+        }
+        return;
+      }
       this.cache.delete(runId);
       await this.fs.rm(file);
       await this.fs.fsyncDir(this.dir).catch((err: unknown) => {
@@ -260,11 +297,11 @@ export async function applyThroughLedger(
   const result = await client.applyCredentialSwitch(runId, req);
   switch (result.kind) {
     case "uncertain":
-      await ledger.record(runId, req.opId, "ambiguous", "uncertain").catch(() => undefined);
+      await ledger.record(runId, req.opId, "ambiguous", "uncertain", req.claimGeneration).catch(() => undefined);
       return result;
     case "route_absent":
       if (wasAmbiguous) {
-        await ledger.record(runId, req.opId, "ambiguous", "route_absent_after_ambiguous").catch(() => undefined);
+        await ledger.record(runId, req.opId, "ambiguous", "route_absent_after_ambiguous", req.claimGeneration).catch(() => undefined);
         return { kind: "uncertain", detail: "route_absent_after_ambiguous_send" };
       }
       try {

@@ -2036,6 +2036,11 @@ export class WorkerClient {
     return this.serverFeatures.has(f);
   }
 
+  /** Issue #4201: the nonce the most recent register response returned, for the apply route's fence. */
+  registrationNonce(): string | undefined {
+    return this.registerNonce;
+  }
+
   /** Issue #4201: the in-place switch needs this registration's capability AND the server feature. */
   supportsInPlaceCredentialSwitch(): boolean {
     return this.hasInPlaceCredentialSwitchCapability && this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE);
@@ -3350,6 +3355,7 @@ export class WorkerClient {
           if (fields.credentialSwitchReleased !== undefined)
             ack.credentialSwitchReleased = fields.credentialSwitchReleased;
           if (fields.credentialSwitchHeld !== undefined) ack.credentialSwitchHeld = fields.credentialSwitchHeld;
+          if (fields.credentialSwitchUncertain !== undefined) ack.credentialSwitchUncertain = fields.credentialSwitchUncertain;
           if (fields.credentialSwitchHoldSettled !== undefined)
             ack.credentialSwitchHoldSettled = fields.credentialSwitchHoldSettled;
           // Issue #3985: only a 200 can confirm a clarification settlement; a 409 is a refusal.
@@ -5959,6 +5965,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   credentialSwitchReleased?: boolean;
   credentialSwitchHeld?: boolean;
   credentialSwitchHoldSettled?: boolean;
+  credentialSwitchUncertain?: boolean;
   clarificationSettled?: boolean;
   gateRevision?: number;
   revisionInputId?: number;
@@ -6056,6 +6063,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       credentialSwitchReleased?: boolean;
       credentialSwitchHeld?: boolean;
       credentialSwitchHoldSettled?: boolean;
+      credentialSwitchUncertain?: boolean;
       clarificationSettled?: boolean;
       gateRevision?: number;
       revisionInputId?: number;
@@ -6193,6 +6201,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // acknowledgement applied (`hold_settled`). Read only off the 200 ack, like `released`.
     if (parsed?.disposition === "held") out.credentialSwitchHeld = true;
     if (parsed?.disposition === "hold_settled") out.credentialSwitchHoldSettled = true;
+    // Issue #4201: the credential-switch UNCERTAIN report applied (the run is an owner pause).
+    if (parsed?.disposition === "uncertain") out.credentialSwitchUncertain = true;
     // Issue #3985: the clarification settlement applied; read only off the 200 ack.
     if (parsed?.disposition === "clarification_settled") out.clarificationSettled = true;
     // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A

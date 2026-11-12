@@ -2956,4 +2956,32 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
       assert.ok(matches(ch.cancelSignal().reason), `${name}: reason ${String(ch.cancelSignal().reason)}`);
     }
   });
+
+  it("a stop that lands while the switch is pending survives the applied settle's controller replacement (review BN1)", () => {
+    const cases: Array<[string, (ch: SteeringChannel) => void, (r: unknown) => boolean]> = [
+      ["cancel", (ch) => (ch as unknown as { commitCancel(): void }).commitCancel(), (r) => r instanceof Error && r.name === "AbortError"],
+      ["fence", (ch) => (ch as unknown as Private).endFencedFlight("stale"), (r) => r instanceof Error && r.name === "ClaimFencedSignal"],
+      ["disk stop", (ch) => ch.requestDiskStop(), (r) => r instanceof PauseNowSignal],
+      ["shutdown", (ch) => ch.workerShutdown(Date.now() + 1000), (r) => r instanceof Error && r.name === "AbortError"],
+    ];
+    for (const [name, act, matches] of cases) {
+      const { ch } = make();
+      ch.tripCredentialSwitch(GEN, "op-1");
+      act(ch);
+      ch.settleCredentialSwitch("op-1", "applied");
+      assert.equal(ch.cancelSignal().aborted, true, `${name}: a stop deferred behind the pending switch must abort the fresh signal`);
+      assert.ok(matches(ch.cancelSignal().reason), `${name}: reason ${String(ch.cancelSignal().reason)}`);
+    }
+  });
+
+  it("a throwing replacement listener skips neither the re-arm nor later listeners", () => {
+    const { ch } = make();
+    ch.tripCredentialSwitch(GEN, "op-1");
+    let later = 0;
+    ch.onCancelSignalReplaced(() => { throw new Error("listener boom"); });
+    ch.onCancelSignalReplaced(() => { later++; });
+    ch.settleCredentialSwitch("op-1", "applied");
+    assert.equal(later, 1);
+    assert.equal(ch.checkpointAuthoritySignal().aborted, false);
+  });
 });

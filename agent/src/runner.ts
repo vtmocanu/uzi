@@ -75,6 +75,7 @@ import type {
   WallParkRefresh,
 } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
+import type { InPlaceSwitchSite } from "./executor.js";
 import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import { CodexOperationAdmissionError } from "./client.js";
@@ -164,7 +165,7 @@ import {
   type RepoAgentHarness,
   type RepoAgentRevisionReader,
 } from "./repoagents.js";
-import { CandidateReservationRefusedError, MessageBatcher } from "./batcher.js";
+import { CandidateReservationRefusedError, MessageBatcher, type CredentialSwitchHold as BatcherSwitchHold } from "./batcher.js";
 import type { Outbox, ReportRetirementContext } from "./outbox.js";
 import {
   PUBLICATION_RESUME_UNAVAILABLE,
@@ -236,7 +237,9 @@ import {
   latchOnUnattributedUnreadable,
   residueQuarantine,
 } from "./residue-quarantine.js";
-import { makeRedactor, makeTextRedactor } from "./redact.js";
+import { SecretSet } from "./redact.js";
+import { CredentialHolder } from "./credential-holder.js";
+import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult } from "./credential-switch-op-ledger.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { CodexSessionStore } from "./codex/session-state.js";
 import { selectCodexBinding } from "./codex/select.js";
@@ -1544,13 +1547,57 @@ function classifyRetainedDiscoveryError(error: unknown, deadlineElapsed: boolean
 }
 
 class CredentialSwitchRetainedStop extends Error {
-  /** issue #3181: `held` is a server-confirmed switch hold (the run is paused), not an unconfirmed stop. */
-  constructor(readonly held = false) {
-    super(held ? "credential switch held; retaining work and stopping the flight"
+  /** issue #3181: `held` is a server-confirmed switch hold (the run is paused), not an unconfirmed stop.
+   *  Issue #4201: `uncertain` is a server-confirmed `credential_switch_uncertain` owner pause: an in-place
+   *  apply may have committed, so neither token is used again and the work and custody are kept. */
+  constructor(readonly disposition: "unconfirmed" | "held" | "uncertain" = "unconfirmed") {
+    super(disposition === "held" ? "credential switch held; retaining work and stopping the flight"
+      : disposition === "uncertain" ? "credential switch outcome uncertain; retaining work and stopping the flight"
       : "credential switch unconfirmed; retaining work and stopping the flight");
     this.name = "CredentialSwitchRetainedStop";
   }
+  get held(): boolean { return this.disposition === "held"; }
 }
+
+/**
+ * Issue #4201: the flight's checkpoint-independent cancel controller, as a stable facade. Steering
+ * owns the real controller and REPLACES it after an applied in-place switch (an AbortController cannot
+ * be reset), so every reader goes through `signal` at use time. Before a replacement this is the
+ * original controller verbatim; after one, `signal` follows the steering controller's fresh signal and
+ * `abort` (the runner's own stops) aborts a runner-side supplement that the same signal also watches.
+ */
+class FlightCancel {
+  private current: AbortSignal;
+  private supplement: AbortController | undefined;
+  constructor(private readonly original: AbortController) { this.current = original.signal; }
+  get signal(): AbortSignal { return this.current; }
+  abort(reason?: unknown): void {
+    if (this.supplement) this.supplement.abort(reason);
+    else this.original.abort(reason);
+  }
+  /** Steering's fresh cancel signal after an applied switch (SteeringChannel.onCancelSignalReplaced). */
+  replace(fresh: AbortSignal): void {
+    this.supplement = new AbortController();
+    this.current = AbortSignal.any([fresh, this.supplement.signal]);
+  }
+}
+
+/** Issue #4201: what the in-place credential switch decided; the hook maps each to its caller's action. */
+type InPlaceSwitchOutcome =
+  | { kind: "continue" }
+  | { kind: "gave_up" }
+  | { kind: "v1_release" }
+  | { kind: "fence_held"; held: boolean }
+  | { kind: "option_a" }
+  | { kind: "retained_stop" }
+  | { kind: "stale_stop" };
+
+/** Issue #4201: bounded same-report retries of the in-place hold and uncertain reports. */
+const IN_PLACE_REPORT_ATTEMPTS = 5;
+/** Issue #4201: bounded same-op retries of an apply whose answer was ambiguous. */
+const IN_PLACE_APPLY_ATTEMPTS = 3;
+/** Issue #4201: how long a `superseded` apply waits for the newer op to reach steering. */
+const SWITCH_SUPERSEDE_WAIT_MS = 30_000;
 
 /** Issue #1604 (D3): why a resumed claim parks when the inputs sent before its release cannot be
  *  read within the channel's bound. */
@@ -2737,10 +2784,16 @@ interface RunFlight {
   managedGoWorkDir?: string;
   readonly runScopedSecrets: string[];
   readonly runLog: Logger;
-  readonly redact: ReturnType<typeof makeRedactor>;
-  readonly redactText: ReturnType<typeof makeTextRedactor>;
+  /** Issue #4201: the ONE flight-scoped secret set every redaction sink reads at use time (the batcher's
+   *  payload and text redactors, failure_reason, the guarded lane, and through addSecret the logger), so a
+   *  token an in-place switch publishes later is scrubbed everywhere. */
+  readonly secrets: SecretSet;
+  /** Issue #4201: the run's current Anthropic credential; undefined for a claim with no token. */
+  readonly credential: CredentialHolder | undefined;
+  readonly redact: SecretSet["payload"];
+  readonly redactText: SecretSet["text"];
   readonly batcher: MessageBatcher;
-  readonly cancel: AbortController;
+  readonly cancel: FlightCancel;
   readonly steering: SteeringChannel;
   /** PRD #1247 M5b: the claim-lane generation THIS claim holds (from claim.claim_generation).
    *  Threaded onto every mutating report (the reportState closure) and every message batch (the
@@ -3327,6 +3380,12 @@ export interface RunnerOptions {
    *  settlement returns. Defaults to `codexBoundaryDeadlineMs`; a test shortens it without also
    *  bounding the unrelated recovery discovery that `codexBoundaryDeadlineMs` governs. */
   retainedSwitchVerificationMs?: number;
+  /** Issue #4201: the durable write-ahead ledger of in-place credential switch applies. ONE instance per
+   *  worker data dir, shared by every runner on it (see credential-switch-op-ledger.ts). Absent ⇒ the
+   *  in-place switch is not eligible and every switch takes the release path. */
+  credentialSwitchLedger?: CredentialSwitchOpLedger;
+  /** TEST-ONLY (issue #4201): how long a `superseded` apply waits for the newer op. Default 30s. */
+  switchSupersedeWaitMs?: number;
   /** Issue #1900 (test-only): overrides CODEX_FINALIZE_BOUNDARY_DEADLINE_MS, the finite deadline
    *  of the Codex finalize boundary. A 0/negative value falls back to the default. */
   codexFinalizeBoundaryDeadlineMs?: number;
@@ -3545,6 +3604,9 @@ export class RunRunner {
   private readonly predecessorFinalBudget: { successorPrepAllowanceMs: number; actionCapMs: number; settlementMarginMs: number };
   /** issue #3181: see RunnerOptions.retainedSwitchSettlementMs. */
   private readonly retainedSwitchSettlementMs: number;
+  /** Issue #4201: see RunnerOptions.credentialSwitchLedger / switchSupersedeWaitMs. */
+  private readonly credentialSwitchLedger: CredentialSwitchOpLedger | undefined;
+  private readonly switchSupersedeWaitMs: number;
   /** issue #3181: see RunnerOptions.retainedSwitchVerificationMs. */
   private readonly retainedSwitchVerificationMs: number;
   private readonly codexFinalizeBoundaryDeadlineMs: number;
@@ -3836,6 +3898,10 @@ export class RunRunner {
       opts.codexBoundaryDeadlineMs && opts.codexBoundaryDeadlineMs > 0
         ? opts.codexBoundaryDeadlineMs
         : 30_000;
+    this.credentialSwitchLedger = opts.credentialSwitchLedger;
+    this.switchSupersedeWaitMs =
+      typeof opts.switchSupersedeWaitMs === "number" && Number.isFinite(opts.switchSupersedeWaitMs) &&
+      opts.switchSupersedeWaitMs >= 0 ? opts.switchSupersedeWaitMs : SWITCH_SUPERSEDE_WAIT_MS;
     this.gateCheckpointDeadlineMs =
       typeof opts.gateCheckpointDeadlineMs === "number" && Number.isFinite(opts.gateCheckpointDeadlineMs) &&
       opts.gateCheckpointDeadlineMs > 0 ? opts.gateCheckpointDeadlineMs : 60_000;
@@ -6535,6 +6601,12 @@ export class RunRunner {
           // issue #3181: the retained successor could not prove its run processes stopped, and the
           // server confirmed the hold: the run is paused with its work and custody kept here.
           runLog.info("credential switch held; run processes unproven, work and custody kept for an owner Resume or Cancel", {
+            run_id: flight.runId,
+          });
+        } else if (err.disposition === "uncertain") {
+          // Issue #4201: an in-place apply may have committed; the run is an owner pause and neither token
+          // was used again.
+          runLog.info("credential switch outcome uncertain; run paused for the owner, work and custody kept", {
             run_id: flight.runId,
           });
         } else runLog.info("credential switch unconfirmed; retaining work and leaving the run non-terminal for requeue", {
@@ -13114,8 +13186,11 @@ export class RunRunner {
     if (claim.secrets.codex) {
       secrets.push(claim.secrets.codex.access_token, claim.secrets.codex.capability);
     }
-    const redact = makeRedactor(secrets);
-    const redactText = makeTextRedactor(secrets);
+    // Issue #4201: ONE live set. An in-place switch adds its new token to it, and every sink below reads
+    // the set at use time instead of a list frozen here.
+    const secretSet = new SecretSet(secrets);
+    const redact = secretSet.payload;
+    const redactText = secretSet.text;
     // PRD #1247 M5b: the claim-lane generation this claim holds. Server-side NOT NULL DEFAULT 0;
     // `?? 0` covers a pre-#1296 payload that omits the field. Held on the flight and stamped on
     // every mutating report + message batch so the server's per-query fence can engage.
@@ -13138,6 +13213,9 @@ export class RunRunner {
         // fall back to the batcher's own defaults when unset.
         ...(this.outbox ? { outbox: this.outbox } : {}),
         generation: claim.claim_generation ?? 0,
+        // Issue #4201: a frame's credential epoch ordinal reaches the wire only on an api that
+        // negotiated the apply feature (an older api strict-decodes unknown fields).
+        credentialEpochsNegotiated: () => this.client.hasFeature("credential_switch_apply_v1"),
         ...(this.transientTripMs !== undefined ? { transientTripMs: this.transientTripMs } : {}),
         ...(this.outboxSpillBufferBytes !== undefined
           ? { spillBufferBytes: this.outboxSpillBufferBytes }
@@ -13171,6 +13249,17 @@ export class RunRunner {
         claimGeneration,
       },
     );
+    // Issue #4201: an applied in-place switch makes steering replace its (spent) cancel controller;
+    // every runner reader follows through this facade, which tracks the fresh signal.
+    // Issue #4201: a newer claim generation retires the ledger entries of older ones (never the current
+    // generation's: an unresolved send there is the only memory that it may have committed).
+    if (this.credentialSwitchLedger && claimGeneration > 0 && !claim.secrets.codex) {
+      void this.credentialSwitchLedger.pruneGenerationsBelow(runId, claimGeneration).catch((err: unknown) => {
+        runLog.warn("credential switch ledger prune failed", { run_id: runId, error: errMessage(err) });
+      });
+    }
+    const flightCancel = new FlightCancel(cancel);
+    steering.onCancelSignalReplaced((fresh) => flightCancel.replace(fresh));
     // issue #552 M3: a graceful `uzi run stop` (PRD #517 M4) consumed into the worker's
     // stopRequested flag is lost if the worker dies before winding the park down. The
     // server re-delivers the durable runs.stop_kind='stopped' fact as claim.stop_pending
@@ -13265,10 +13354,13 @@ export class RunRunner {
       runHome,
       runScopedSecrets,
       runLog,
+      secrets: secretSet,
+      credential: claim.secrets.anthropic_oauth_token
+        ? new CredentialHolder({ token: claim.secrets.anthropic_oauth_token, ordinal: 0 }) : undefined,
       redact,
       redactText,
       batcher,
-      cancel,
+      cancel: flightCancel,
       steering,
       claimGeneration,
       sourcePublicationNegotiated: this.client.hasFeature("refresh_publication_context_v1"),
@@ -13392,6 +13484,8 @@ export class RunRunner {
             // issue #3181: the hold report is a switch outcome too; a switch tripped by a refused
             // approve would otherwise abort its own hold with the switch signal.
             body.status !== "credential_switch_held" &&
+            // Issue #4201: the in-place uncertain report is the switch's own outcome as well.
+            body.status !== "credential_switch_uncertain" &&
             steering.approveRefusedBySwitchPending()
           )
             throw new CredentialSwitchSignal();
@@ -13465,7 +13559,7 @@ export class RunRunner {
         // inputs poll, and the two transports compose (a switch trips at most once). Fed BEFORE the
         // stale_claim check below; the two never co-occur (workerStateAck omits the switch signal
         // from the stale_claim disposition), so ordering is immaterial to correctness.
-        if (ack.credentialSwitch) flight.steering.tripCredentialSwitch(ack.credentialSwitch.generation);
+        if (ack.credentialSwitch) flight.steering.tripCredentialSwitch(ack.credentialSwitch.generation, ack.credentialSwitch.op_id);
         // PRD #1497 M2 (D5/D16): recognise a SERVER-side wall park BEFORE the generic stale handling.
         // A fenced report whose ACK reads disposition:"stale_claim" (the fence rejected it) AND
         // status:"paused" + hold_reason:"budget_exhausted" (the sweep parked the row at the wall)
@@ -13492,6 +13586,14 @@ export class RunRunner {
           throw new StaleClaimError();
         }
         if (ack.status === "cancelled") this.observeCancellation(flight);
+        // Issue #4201: the ledger is cleaned up only at a terminal state (and keeps any entry still
+        // sending or ambiguous for this generation); never while a switch could still be applying.
+        if (this.credentialSwitchLedger && (body.status === "completed" || body.status === "failed") &&
+            ack.applied !== false && flight.steering.pendingCredentialSwitchOp() === undefined) {
+          void this.credentialSwitchLedger.cleanup(runId, flight.claimGeneration).catch((err: unknown) => {
+            runLog.warn("credential switch ledger cleanup failed", { run_id: runId, error: errMessage(err) });
+          });
+        }
         // Issue #3240: only an applied running ACK confirms pause_failed's continuing flight. Any other
         // answer (declined, or a non-running status) gets the ordinary non-running handling it skipped
         // above: the flight stops running and its context is retired, so no shell authority survives.
@@ -16283,8 +16385,9 @@ export class RunRunner {
       ...(flight.workerMemory ? {
         capturedMemory: () => this.captureWorkerMemory(flight),
         // Issue #2471: the run's redaction secrets for the guarded command lane's output windows.
-        guardedCommandSecrets: [...flight.runScopedSecrets, this.joinToken]
-          .filter((secret): secret is string => typeof secret === "string" && secret.length > 0),
+        // Issue #4201: the flight's live set (it holds the run-scoped secrets and the join token), so a
+        // token an in-place switch adds later is scrubbed from guarded command output too.
+        guardedCommandSecrets: flight.secrets,
         onMemoryAuthorityLost: (listener: (stop: Error) => void) => {
           const memory = flight.workerMemory!;
           (memory.authorityLost ??= new Set()).add(listener);
@@ -16334,6 +16437,7 @@ export class RunRunner {
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.
       redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
+      ...(flight.credential ? { credential: () => flight.credential!.current() } : {}),
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
       // and whether the intent summary is already set so the executor skips
       // re-generating it on a resume/re-claim (Decision 3). Both absent on older
@@ -16433,7 +16537,8 @@ export class RunRunner {
           }
         },
       } : {}),
-      signal: cancel.signal,
+      // Issue #4201: read at use time; an applied in-place switch replaces the spent cancel signal.
+      get signal(): AbortSignal { return cancel.signal; },
       terminalLifecycleSignal: steering.terminalLifecycleSignal(),
       lifecycleSignal: () => steering.lifecycleSignal(),
       onModelTurnSettled: async (processedEvents) => {
@@ -16501,7 +16606,7 @@ export class RunRunner {
       // place and must KEEP the flags to leave the run non-terminal for a requeue.
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
-      attemptCredentialSwitch: async () => {
+      attemptCredentialSwitch: async (opts) => {
         // Issue #3974: an owner cancel was committed while the switch was withheld. Do not enter the
         // switch (no capture, no credential_switch* report): throw the ordinary cancel error so the
         // executor lets it reach executeClaim's dispatchFailure, which reports "run cancelled".
@@ -16514,8 +16619,20 @@ export class RunRunner {
           throw new CandidateTransportInvariantError();
         }
         const outcome = await this.runGatedSink(flight, async () => {
+          // Issue #4201: the in-place switch goes first. It decides before anything destructive runs and
+          // falls through to today's release path only on a clean `v1_release`.
+          const inPlace = await this.inPlaceCredentialSwitch(claim, flight, runLog, opts?.site ?? "implement_turn", opts?.laneSettled ?? true);
+          switch (inPlace.kind) {
+            case "continue": return "applied" as const;
+            case "gave_up": return "gave_up" as const;
+            case "fence_held": throw new CredentialSwitchRetainedStop(inPlace.held ? "held" : "unconfirmed");
+            case "option_a": throw new CredentialSwitchRetainedStop("uncertain");
+            case "retained_stop": throw new CredentialSwitchRetainedStop();
+            case "stale_stop": throw new StaleClaimError();
+            case "v1_release": break;
+          }
           const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
-          if (outcome === "retained_held") throw new CredentialSwitchRetainedStop(true);
+          if (outcome === "retained_held") throw new CredentialSwitchRetainedStop("held");
           if (outcome === "retained_stop") {
             // The switch could not be confirmed (BLOCKING-2/3 rework). enterCredentialSwitch RETAINED
             // all work (the preserve flags stay set); STOP the flight NON-TERMINAL by throwing to
@@ -16544,6 +16661,12 @@ export class RunRunner {
         // The marker cleanup and the switch settle must leave the sink before the next tick starts.
         // A release or an uncertain settle keeps the interrupted lifecycle sticky.
         if (outcome === "gave_up") steering.rearmLifecycle();
+        if (outcome === "applied") {
+          // The held-state trip is spent and the credential moved: re-arm the lifecycle (as a give-up
+          // does) and point the context's token at the published credential.
+          steering.rearmLifecycle();
+          ctx.oauthToken = flight.credential!.current().token;
+        }
         if (outcome === "released") {
           pendingCheckedApproval = undefined;
           pendingCheckedRevise = undefined;
@@ -17520,7 +17643,7 @@ export class RunRunner {
           return { kind: "paused" } as const;
         };
         const checkAck = (ack: StateAck): void => {
-          if (ack.credentialSwitch) steering.tripCredentialSwitch(ack.credentialSwitch.generation);
+          if (ack.credentialSwitch) steering.tripCredentialSwitch(ack.credentialSwitch.generation, ack.credentialSwitch.op_id);
           if (ack.status === "paused" && ack.holdReason === "budget_exhausted") throw new ServerWallParkedError();
           if (ack.staleClaim || ack.credentialSwitchReleased) throw new StaleClaimError();
           if (ack.reason === "wall_pending" || ack.reason === "wall_expired") steering.seedPauseRequested("wall");
@@ -26809,6 +26932,294 @@ export class RunRunner {
   }
 
   /**
+   * Issue #4201: the in-place credential switch, behind `ctx.attemptCredentialSwitch`. Nothing here is
+   * destructive before it has decided: no capture, no teardown, no release report, no new attempt dir.
+   *
+   * Order, each step holding before the next:
+   *  1. Eligibility (synchronous; any miss is `v1_release` with no effect): the ledger, the holder, the
+   *     registration nonce, a pending op id, the negotiated apply capability, a Claude flight, and no
+   *     retained authority (the retained arm is a later unit).
+   *  2. PROOF under one MaintenanceBudget: the executor's lane is settled, the settle observed the run
+   *     empty, and the own-mode quiescence proof is not blocked (`settleSwitchQuiescence`). Unproven sends
+   *     `credential_switch_held` WITH the op id (bounded identical retries) and stops the flight held:
+   *     nothing is applied and no turn starts on either token.
+   *  3. Proven: hold sequence numbering and drain the transport (`holdForCredentialSwitch`), then apply
+   *     through the write-ahead ledger. `applied` publishes the token to every sink in one synchronous
+   *     block (secret set, logger, holder), releases the hold at the server's `message_seq`, and
+   *     re-arms steering. Every other outcome is mapped below.
+   *
+   * SEQ RULE: an apply that MAY have committed (uncertain, refused_committed, option A) never cancels the
+   * hold: cancel would number held frames from tail+1, where the server's `credential_switch` frame may
+   * already sit. They are released from tail+2.
+   */
+  private async inPlaceCredentialSwitch(
+    claim: ClaimResponse, flight: RunFlight, runLog: Logger, site: InPlaceSwitchSite, laneSettled: boolean,
+  ): Promise<InPlaceSwitchOutcome> {
+    const ledger = this.credentialSwitchLedger;
+    const holder = flight.credential;
+    const pending = flight.steering.pendingCredentialSwitchOp();
+    const nonce = this.client.registrationNonce();
+    const generation = flight.claimGeneration;
+    if (!ledger || !holder || !nonce || pending?.opId === undefined || pending.generation !== generation ||
+        !Number.isSafeInteger(generation) || generation <= 0 ||
+        !this.client.supportsInPlaceCredentialSwitch() || this.isCodexCapture(claim, flight) ||
+        flight.restorePredecessor !== undefined ||
+        flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
+        flight.completedRetainedSuccessor) return { kind: "v1_release" };
+    try {
+      return await this.runInPlaceSwitch(flight, runLog, site, laneSettled, { ledger, holder, nonce, generation, opId: pending.opId });
+    } catch (error) {
+      if (isRunOwnershipLost(error, flight.runId)) return { kind: "stale_stop" };
+      throw error;
+    }
+  }
+
+  private async runInPlaceSwitch(
+    flight: RunFlight, runLog: Logger, site: InPlaceSwitchSite, laneSettled: boolean,
+    fixed: { ledger: CredentialSwitchOpLedger; holder: CredentialHolder; nonce: string; generation: number; opId: string },
+  ): Promise<InPlaceSwitchOutcome> {
+    const { ledger, holder, nonce, generation } = fixed;
+    let opId = fixed.opId;
+    const lifecycle = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+    // Lifecycle changes (cancel, fence, shutdown, a pause) throw and keep their precedence; the switch's
+    // own abort of the shared signals is expected here. A moved or cleared op is handled by the caller.
+    const identity = (): void => {
+      this.retainedTerminalGuard(flight);
+      for (const signal of this.retainedLifecycleSignals(flight)) {
+        if (signal.aborted && !(signal.reason instanceof CredentialSwitchSignal)) throw new RetainedRecoveryStop();
+      }
+    };
+    identity();
+    runLog.info("in-place credential switch: proving the run quiescent", { run_id: flight.runId, generation, site });
+    const proof = await this.settleSwitchQuiescence(flight, identity, "in_place_credential_switch", laneSettled);
+    if (!proof.settled) {
+      // Unproven: keep everything, tell the owner (op-fenced), apply nothing. The flight stays inside the
+      // hook (so it keeps heartbeating) while the report retries, then stops held; executeClaim's finally
+      // joins the executor's operations and acknowledges the hold settled.
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      flight.keepGuardedInventoryOpen = true;
+      const latest = flight.steering.pendingCredentialSwitchOp()?.opId ?? opId;
+      const disposition = await this.holdRetainedSwitch(flight, runLog, lifecycle, identity, proof.detail, proof.survivors,
+        { opId: latest, attempts: IN_PLACE_REPORT_ATTEMPTS });
+      return { kind: "fence_held", held: disposition === "held" };
+    }
+    // The op may have moved while the proof ran; follow the newest. Nothing pending any more means the
+    // stamp cleared under us: continue on the old token with no report.
+    const moved = flight.steering.pendingCredentialSwitchOp();
+    if (moved?.opId === undefined || moved.generation !== generation) {
+      runLog.warn("in-place credential switch: the pending switch cleared during the proof; continuing on the current token", { run_id: flight.runId });
+      flight.steering.settleCredentialSwitch(opId, "cleared");
+      return { kind: "gave_up" };
+    }
+    opId = moved.opId;
+
+    let hold: BatcherSwitchHold;
+    try {
+      hold = flight.batcher.holdForCredentialSwitch();
+    } catch (error) {
+      runLog.warn("in-place credential switch: sequence hold unavailable; giving up on the old token", { run_id: flight.runId, error: errMessage(error) });
+      return this.inPlaceGiveUp(flight, runLog, opId, lifecycle);
+    }
+    let holdDone = false;
+    let mayHaveCommitted = false;
+    try {
+      const prepared = await hold.prepare(this.retainedSwitchSettlementMs, lifecycle)
+        .catch((): { prepared: false } => ({ prepared: false }));
+      identity();
+      if (!prepared.prepared) {
+        hold.cancel();
+        holdDone = true;
+        runLog.warn("in-place credential switch: the message transport could not be drained; giving up on the old token", { run_id: flight.runId });
+        return await this.inPlaceGiveUp(flight, runLog, opId, lifecycle);
+      }
+      let uncertainAttempts = 0;
+      for (;;) {
+        let result: LedgerApplyResult;
+        try {
+          result = await applyThroughLedger(this.client, ledger, flight.runId, { claimGeneration: generation, registerNonce: nonce, opId });
+        } catch (error) {
+          runLog.warn("in-place credential switch: the apply call threw; treating the outcome as uncertain", { run_id: flight.runId, error: errMessage(error) });
+          result = { kind: "uncertain", detail: "apply_threw" };
+        }
+        mayHaveCommitted = result.kind === "uncertain" || result.kind === "refused_committed";
+        switch (result.kind) {
+          case "applied": {
+            if (result.ordinal <= holder.current().ordinal) {
+              runLog.error("in-place credential switch: the applied epoch is not newer than the current one", { run_id: flight.runId, ordinal: result.ordinal });
+              mayHaveCommitted = true;
+              holdDone = true;
+              return await this.inPlaceOptionA(flight, runLog, opId, hold, lifecycle, identity);
+            }
+            // One synchronous block: no await between publishing the token to its redaction sinks and
+            // releasing the held frames, so no frame can carry the token unscrubbed.
+            flight.secrets.add(result.token);
+            this.log.addSecret(result.token);
+            flight.runScopedSecrets.push(result.token);
+            holder.publish({ token: result.token, ordinal: result.ordinal });
+            if (!hold.release({ messageSeq: result.messageSeq }) &&
+                !hold.release({ messageSeq: Math.max(result.messageSeq, flight.batcher.currentSeq()) })) {
+              runLog.error("in-place credential switch: the sequence hold could not be released", { run_id: flight.runId });
+            }
+            holdDone = true;
+            flight.steering.settleCredentialSwitch(opId, "applied");
+            runLog.info("in-place credential switch applied; continuing on the new token in place", {
+              run_id: flight.runId, generation, site, ordinal: result.ordinal, replay: result.replay,
+            });
+            return { kind: "continue" };
+          }
+          case "superseded": {
+            const next = await this.awaitNewerSwitchOp(flight, opId, lifecycle);
+            identity();
+            if (next !== undefined) {
+              opId = next;
+              uncertainAttempts = 0;
+              continue;
+            }
+            // No newer switch is pending (or it never reached this flight in time): nothing was applied and
+            // nothing is owed to the server for the superseded op. Late polls carrying it are ignored.
+            hold.cancel();
+            holdDone = true;
+            flight.steering.settleCredentialSwitch(opId, "cleared");
+            runLog.info("in-place credential switch superseded with no newer switch pending; continuing on the current token", { run_id: flight.runId });
+            return { kind: "gave_up" };
+          }
+          case "not_applied":
+          case "ledger_unavailable":
+            hold.cancel();
+            holdDone = true;
+            runLog.warn("in-place credential switch not applied; giving up on the old token", {
+              run_id: flight.runId, reason: result.kind === "not_applied" ? sanitizeForLog(result.reason, 128) : "ledger_unavailable",
+            });
+            return await this.inPlaceGiveUp(flight, runLog, opId, lifecycle);
+          case "route_absent":
+            // Clean (the ledger proved no earlier send): the api does not serve the route after all.
+            hold.cancel();
+            holdDone = true;
+            return { kind: "v1_release" };
+          case "fenced":
+            hold.cancel();
+            holdDone = true;
+            return { kind: "stale_stop" };
+          case "refused_committed":
+            holdDone = true;
+            return await this.inPlaceOptionA(flight, runLog, opId, hold, lifecycle, identity);
+          case "uncertain":
+            if (++uncertainAttempts < IN_PLACE_APPLY_ATTEMPTS) {
+              await this.waitRecoveryRetry(flight, true, undefined, lifecycle);
+              identity();
+              continue;
+            }
+            holdDone = true;
+            return await this.inPlaceOptionA(flight, runLog, opId, hold, lifecycle, identity);
+        }
+      }
+    } catch (error) {
+      if (!holdDone) {
+        if (mayHaveCommitted) this.releaseHoldPastPossibleApply(hold, flight, runLog);
+        else hold.cancel();
+      }
+      throw error;
+    }
+  }
+
+  /** SEQ RULE: release a hold whose apply may have committed so held frames number from tail+2. */
+  private releaseHoldPastPossibleApply(hold: BatcherSwitchHold, flight: RunFlight, runLog: Logger): void {
+    if (!hold.release({ messageSeq: flight.batcher.currentSeq() + 1 })) {
+      runLog.error("in-place credential switch: the sequence hold could not be released past a possible apply", { run_id: flight.runId });
+    }
+  }
+
+  /** Nothing was applied: clear the stamp on the old token (op-fenced) and continue, or retain and stop. */
+  private async inPlaceGiveUp(
+    flight: RunFlight, runLog: Logger, opId: string, signal: AbortSignal,
+  ): Promise<InPlaceSwitchOutcome> {
+    let cleared = false;
+    try {
+      const ack = await flight.reportState({ status: "credential_switch_failed", op_id: opId }, signal);
+      cleared = ack.applied === true;
+      if (!cleared) {
+        runLog.warn("in-place credential switch give-up: the server did not confirm the stamp cleared; retaining and stopping", {
+          run_id: flight.runId, server_status: ack.status ?? "unknown",
+        });
+      }
+    } catch (error) {
+      if (error instanceof StaleClaimError || error instanceof RetainedRecoveryStop) throw error;
+      runLog.warn("in-place credential switch give-up: could not confirm the stamp cleared; retaining and stopping", {
+        run_id: flight.runId, error: errMessage(error),
+      });
+    }
+    if (!cleared) {
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      flight.keepGuardedInventoryOpen = true;
+      return { kind: "retained_stop" };
+    }
+    flight.steering.settleCredentialSwitch(opId, "gave_up");
+    return { kind: "gave_up" };
+  }
+
+  /**
+   * Option A: an apply that may have committed. The run is reported `credential_switch_uncertain` (an owner
+   * pause), neither token is used again, and the work and custody stay on this worker. The report retries
+   * on a lost reply, and a positive ownership read (paused, no hold reason, this generation) also confirms.
+   */
+  private async inPlaceOptionA(
+    flight: RunFlight, runLog: Logger, opId: string, hold: BatcherSwitchHold, signal: AbortSignal, guard: () => void,
+  ): Promise<InPlaceSwitchOutcome> {
+    this.releaseHoldPastPossibleApply(hold, flight, runLog);
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.keepGuardedInventoryOpen = true;
+    let confirmed = false;
+    let refused = false;
+    for (let attempt = 0; attempt < IN_PLACE_REPORT_ATTEMPTS && !confirmed && !refused; attempt++) {
+      if (attempt > 0) await this.waitRecoveryRetry(flight, true, undefined, signal);
+      try {
+        const ack = await flight.reportState({ status: "credential_switch_uncertain", op_id: opId }, signal);
+        refused = ack.applied === false;
+        guard();
+        if (ack.credentialSwitchUncertain === true) confirmed = true;
+      } catch (error) {
+        guard();
+        if (error instanceof StaleClaimError || isRunOwnershipLost(error, flight.runId)) throw error;
+        runLog.warn("in-place credential switch uncertain report failed", { run_id: flight.runId, attempt, error: errMessage(error) });
+      }
+    }
+    if (!confirmed && !refused) {
+      try {
+        const own = await withForgeRetry(() => this.getObservedRunOwnership(flight, signal), { signal, log: runLog, schedule: [] });
+        guard();
+        confirmed = own.status === "paused" && own.claim_generation === flight.claimGeneration && own.hold_reason == null;
+      } catch (error) {
+        guard();
+        if (isRunOwnershipLost(error, flight.runId)) throw error;
+        runLog.warn("in-place credential switch uncertain ownership read failed", { run_id: flight.runId, error: errMessage(error) });
+      }
+    }
+    if (!confirmed) {
+      runLog.warn("in-place credential switch outcome uncertain and the report is unconfirmed; work and custody retained", { run_id: flight.runId });
+      return { kind: "retained_stop" };
+    }
+    flight.parked = true;
+    return { kind: "option_a" };
+  }
+
+  /** Wait (bounded) for steering to name a switch op other than `current`. `undefined` means none came:
+   *  the stamp cleared, or the newer op never reached this flight within the bound. */
+  private async awaitNewerSwitchOp(flight: RunFlight, current: string, signal: AbortSignal): Promise<string | undefined> {
+    const deadline = Date.now() + this.switchSupersedeWaitMs;
+    for (;;) {
+      const pending = flight.steering.pendingCredentialSwitchOp();
+      if (pending === undefined) return undefined;
+      if (pending.opId !== undefined && pending.opId !== current) return pending.opId;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || signal.aborted) return undefined;
+      await sleep(Math.min(10, remaining), signal);
+    }
+  }
+
+  /**
    * issue #3181: wait for the operations this flight's executor still owns (no kill, no abort, no
    * new work), then acknowledge a confirmed or possibly applied hold settled. A worker shutdown
    * stops the wait and the acknowledgement: the process exit ends those operations and the server
@@ -26896,6 +27307,17 @@ export class RunRunner {
   private async settleRetainedSwitch(
     flight: RunFlight, identity: () => void,
   ): Promise<{ settled: true } | { settled: false; detail: string; survivors: string }> {
+    return this.settleSwitchQuiescence(flight, identity, "retained_credential_switch");
+  }
+
+  /**
+   * The settlement proof shared by the retained switch and the in-place switch (issue #4201); `site`
+   * names the quiescence request. `laneSettled === false` is the executor's own word that its guarded
+   * lane did not settle (a failed or poisoned lane), which is unproven quiescence before any proof runs.
+   */
+  private async settleSwitchQuiescence(
+    flight: RunFlight, identity: () => void, site: string, laneSettled = true,
+  ): Promise<{ settled: true } | { settled: false; detail: string; survivors: string }> {
     const budget = new MaintenanceBudget(this.retainedSwitchSettlementMs);
     // Set once settlement is proven, BEFORE the last lifecycle check: a lifecycle throw after that
     // point propagates as the lifecycle change it is and never relabels a proven settlement unproven.
@@ -26911,6 +27333,11 @@ export class RunRunner {
       // scope because MaintenanceBudget.run would otherwise attach this allowance to that attempt
       // and leave every later await of the flight under a spent budget.
       return await MaintenanceBudget.withoutAttempt(() => MaintenanceBudget.run(budget, () => RetainedSwitchSettlement.run(async () => {
+        if (!laneSettled) {
+          const verdict = unsettled("guarded lane settlement failed", "settle unconfirmed");
+          identity();
+          return verdict;
+        }
         const settle = await this.settleForCredentialCapture(flight.executor, budget.remainingMs());
         if (settle.kind !== "observed_empty") {
           const verdict = unsettled(settle.errors.map((e) => e.message).join("; ") || "settle incomplete", "settle unconfirmed");
@@ -26919,7 +27346,7 @@ export class RunRunner {
         }
         identity();
         const proof = await this.quiesceRun(flight, flight.executor, {
-          mode: "own", site: "retained_credential_switch", propagateControl: true,
+          mode: "own", site, propagateControl: true,
         });
         if (proof.blocked) {
           const process = proof.outcome.process;
@@ -26952,6 +27379,9 @@ export class RunRunner {
    */
   private async holdRetainedSwitch(
     flight: RunFlight, runLog: Logger, signal: AbortSignal, guard: () => void, detail: string, survivors: string,
+    /** Issue #4201: the in-place switch's report. `opId` fences it; `attempts` bounds the identical retries,
+     *  with a backoff between them; a stale claim ends the retries (the caller stops with work retained). */
+    inPlace?: { opId: string; attempts: number },
   ): Promise<"held" | "stopped"> {
     // The flight is already marked `unproven` by settleRetainedSwitch. The owner feed carries only
     // the fixed `survivors` phrase; the sanitized raw `detail` stays in the worker log.
@@ -26980,15 +27410,19 @@ export class RunRunner {
     flight.retainedSwitchSettlement = "hold_pending";
     let confirmed = false;
     let refused = false;
-    for (let attempt = 0; attempt < 2 && !confirmed && !refused; attempt++) {
+    for (let attempt = 0; attempt < (inPlace?.attempts ?? 2) && !confirmed && !refused; attempt++) {
+      if (inPlace && attempt > 0) await this.waitRecoveryRetry(flight, true, undefined, signal);
       try {
-        const ack = await flight.reportState({ status: "credential_switch_held" }, signal);
+        const ack = await flight.reportState({
+          status: "credential_switch_held", ...(inPlace ? { op_id: inPlace.opId } : {}),
+        }, signal);
         refused = ack.applied === false;
         if (refused) flight.retainedSwitchSettlement = "unproven";
         guard();
         if (ack.credentialSwitchHeld === true) confirmed = true;
       } catch (error) {
         guard();
+        if (inPlace && (error instanceof StaleClaimError || isRunOwnershipLost(error, flight.runId))) throw error;
         runLog.warn("retained credential switch hold report failed", { run_id: flight.runId, attempt, error: errMessage(error) });
       }
     }
@@ -27002,6 +27436,7 @@ export class RunRunner {
           (own.hold_reason === "credential_switch_settling" || own.hold_reason === "credential_switch_unsettled");
       } catch (error) {
         guard();
+        if (inPlace && isRunOwnershipLost(error, flight.runId)) throw error;
         runLog.warn("retained credential switch hold ownership read failed", { run_id: flight.runId, error: errMessage(error) });
       }
     }

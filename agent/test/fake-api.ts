@@ -75,6 +75,19 @@ export class FakeApi {
   /** Issue #1604: a pending switch whose `credential_switch {generation}` signal rides every GET
    *  (the real server's transport). Absent keeps the #1673 shape: no signal on the GET. */
   private readonly switchSignalGeneration = new Map<string, number>();
+  /** Issue #4201: the op id of a pending switch, riding the GET /inputs `credential_switch` signal. */
+  private readonly switchOpIds = new Map<string, string>();
+  /** Issue #4201: scripted outcomes of POST /runs/{id}/credential-switch/apply, consumed in order. */
+  private readonly applyScripts = new Map<string, ApplyScript[]>();
+  /** Issue #4201: ops the fake already applied (the real server is idempotent per op: a retry replays). */
+  private readonly appliedOps = new Map<string, { token: string; ordinal: number; messageSeq: number }>();
+  private readonly appliedOrdinal = new Map<string, number>();
+  /** Issue #4201: every apply request, with the wire fields the server fences on. */
+  readonly applyRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
+  /** Issue #4201: every `credential_switch_uncertain` report. */
+  readonly uncertainRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
+  private readonly uncertainReplyDrops = new Map<string, number>();
+  private readonly uncertainRefusals = new Set<string>();
   /** Issue #1604: the claim generation that ACKed each input id, per run, so the server's
    *  own-revise APPLIED exemption under switch_pending (D6) can be mirrored. */
   private readonly ackGenerationByRun = new Map<string, Map<number, number>>();
@@ -692,7 +705,7 @@ export class FakeApi {
   // an owner Resume is refused until the settled acknowledgement moves it to credential_switch_unsettled.
   private readonly switchHolds = new Map<string, { state: "settling" | "unsettled"; generation: number }>();
   /** Every hold / hold-settled report received, with the wire fields the server fences on. */
-  readonly holdRequests: Array<{ runId: string; status: string; claim_generation?: number; register_nonce?: string }> = [];
+  readonly holdRequests: Array<{ runId: string; status: string; claim_generation?: number; register_nonce?: string; op_id?: string }> = [];
   private readonly holdReplyDrops = new Map<string, number>();
   private holdRefusals = new Set<string>();
 
@@ -730,6 +743,7 @@ export class FakeApi {
       runId, status: body.status,
       ...(body.claim_generation !== undefined ? { claim_generation: body.claim_generation } : {}),
       ...(body.register_nonce !== undefined ? { register_nonce: body.register_nonce } : {}),
+      ...((body as { op_id?: string }).op_id !== undefined ? { op_id: (body as { op_id?: string }).op_id } : {}),
     });
     if (!body.register_nonce) return send(400, { error: "register_nonce is required" });
     const generation = body.claim_generation as number;
@@ -876,9 +890,96 @@ export class FakeApi {
    *  and carries `credential_switch {generation}` (the server's transport), and APPLIED is refused
    *  switch_pending except for the claim's own ACKed revise_plan rows (D6). The worker's
    *  credential_switch (or credential_switch_failed) report clears it, as the server's release does. */
-  requestCredentialSwitch(runId: string, generation: number): void {
+  requestCredentialSwitch(runId: string, generation: number, opId?: string): void {
     this.switchPendingRuns.add(runId);
     this.switchSignalGeneration.set(runId, generation);
+    if (opId !== undefined) this.switchOpIds.set(runId, opId);
+  }
+
+  /** Issue #4201: script the next apply outcomes for this run (consumed in order). An empty queue
+   *  answers like an api without the route (chi's text/plain 404). */
+  scriptApply(runId: string, ...steps: ApplyScript[]): void {
+    this.applyScripts.set(runId, [...(this.applyScripts.get(runId) ?? []), ...steps]);
+  }
+
+  /** Issue #4201: apply the next `count` uncertain reports server-side, then drop the connection (a lost ACK). */
+  dropUncertainReplies(runId: string, count: number): void {
+    this.uncertainReplyDrops.set(runId, count);
+  }
+
+  /** Issue #4201: refuse (409, not applied) every uncertain report for this run until cleared. */
+  refuseUncertain(runId: string, refuse = true): void {
+    if (refuse) this.uncertainRefusals.add(runId); else this.uncertainRefusals.delete(runId);
+  }
+
+  /** Issue #4201: the server's apply of one op: appends the `credential_switch` feed frame at
+   *  max(seq)+1 and clears the pending switch; a repeat of the same op replays the same answer. */
+  private applySwitch(runId: string, opId: string, token: string): { token: string; ordinal: number; messageSeq: number; replay: boolean } {
+    const prior = this.appliedOps.get(opId);
+    if (prior) return { ...prior, replay: true };
+    const list = this.messagesByRun.get(runId) ?? [];
+    const seen = this.seenSeqByRun.get(runId) ?? new Set<number>();
+    const messageSeq = Math.max(0, ...list.map((m) => m.seq)) + 1;
+    seen.add(messageSeq);
+    list.push({ seq: messageSeq, kind: "credential_switch", payload: { op_id: opId } } as unknown as OutgoingMessage);
+    this.messagesByRun.set(runId, list);
+    this.seenSeqByRun.set(runId, seen);
+    const ordinal = (this.appliedOrdinal.get(runId) ?? 0) + 1;
+    this.appliedOrdinal.set(runId, ordinal);
+    const applied = { token, ordinal, messageSeq };
+    this.appliedOps.set(opId, applied);
+    this.switchPendingRuns.delete(runId);
+    this.switchSignalGeneration.delete(runId);
+    this.switchOpIds.delete(runId);
+    return { ...applied, replay: false };
+  }
+
+  private handleApply(res: http.ServerResponse, runId: string, json: Record<string, unknown>): void {
+    this.applyRequests.push({ runId, body: structuredClone(json) });
+    this.requestLog.push("apply");
+    const opId = String(json.op_id ?? "");
+    const step = this.appliedOps.has(opId) ? undefined : this.applyScripts.get(runId)?.shift();
+    const replyJson = (status: number, body: unknown): void => send(res, status, body);
+    if (this.appliedOps.has(opId) && !step) {
+      const a = this.applySwitch(runId, opId, "");
+      return replyJson(200, { outcome: "applied", token: a.token, ordinal: a.ordinal, message_seq: a.messageSeq, replay: true });
+    }
+    if (!step || step.outcome === "route_absent") {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("404 page not found\n");
+      return;
+    }
+    switch (step.outcome) {
+      case "applied": {
+        const a = this.applySwitch(runId, opId, step.token);
+        if (step.replyLost) { res.destroy(); return; }
+        return replyJson(200, { outcome: "applied", token: a.token, ordinal: a.ordinal, message_seq: a.messageSeq, replay: a.replay });
+      }
+      case "superseded":
+        if (step.newOpId !== undefined) this.switchOpIds.set(runId, step.newOpId);
+        return replyJson(200, { outcome: "superseded" });
+      case "not_applied": return replyJson(200, { outcome: "not_applied", reason: step.reason ?? "no_pending_switch" });
+      case "refused_committed": return replyJson(200, { outcome: "refused_committed", reason: step.reason ?? "already_committed" });
+      case "fenced": return replyJson(404, { error: "run not found for this worker" });
+      case "garbage": return replyJson(500, { error: "boom" });
+    }
+  }
+
+  private credentialSwitchUncertainState(runId: string, body: StateRequest, res: http.ServerResponse): void {
+    const raw = structuredClone(body) as unknown as Record<string, unknown>;
+    this.uncertainRequests.push({ runId, body: raw });
+    if (!body.register_nonce || typeof raw.op_id !== "string" || raw.op_id === "") return send(res, 400, { error: "invalid request body" });
+    if (this.uncertainRefusals.has(runId)) return send(res, 409, { applied: false, run: { id: runId, status: "running", hold_reason: null } });
+    this.states.push({ runId, body });
+    this.requestLog.push("state:credential_switch_uncertain");
+    this.setOwnershipStatus(runId, "paused", body.claim_generation as number);
+    const drops = this.uncertainReplyDrops.get(runId) ?? 0;
+    if (drops > 0) {
+      this.uncertainReplyDrops.set(runId, drops - 1);
+      res.destroy();
+      return;
+    }
+    send(res, 200, { run: { id: runId, status: "paused", hold_reason: null }, disposition: "uncertain" });
   }
 
   /** Issue #1604: drop every /state report for this run matching `matches` (the connection is
@@ -1581,6 +1682,9 @@ export class FakeApi {
       return reply(answer.status, answer.body, answer.drop);
     }
 
+    const applyMatch = /^\/api\/worker\/runs\/([^/]+)\/credential-switch\/apply$/.exec(p);
+    if (req.method === "POST" && applyMatch) return this.handleApply(res, applyMatch[1] as string, json);
+
     const runMatch =
       /^\/api\/worker\/runs\/([^/]+)\/(messages|state|inputs)$/.exec(p);
     if (runMatch) {
@@ -1641,7 +1745,7 @@ export class FakeApi {
         return sendInputs(200, {
           inputs: pending,
           receipts: true,
-          ...(signal !== undefined ? { credential_switch: { generation: signal } } : {}),
+          ...(signal !== undefined ? { credential_switch: { generation: signal, ...(switchPending && this.switchOpIds.has(runId) ? { op_id: this.switchOpIds.get(runId) } : {}) } } : {}),
           ...(this.nowSummary.has(runId) ? { now_summary: this.nowSummary.get(runId) } : {}),
         });
       }
@@ -2030,6 +2134,8 @@ export class FakeApi {
     // Mirror worker state decoding: PostgreSQL plans persist without NUL bytes.
     // worker_messages_poison_livedb_test.go exercises this server contract.
     if (body.plan_md !== undefined) body.plan_md = body.plan_md.replaceAll("\u0000", "");
+    if ((body.status as string) === "credential_switch_uncertain")
+      return this.credentialSwitchUncertainState(runId, body, res);
     if (body.status === "credential_switch_held" || body.status === "credential_switch_hold_settled")
       return this.credentialSwitchHoldState(runId, body, res);
     const typedRefusal = this.typedParkRefusal.get(runId);
@@ -2300,6 +2406,17 @@ export class FakeApi {
     return { credential_switch: { generation: armed.generation } };
   }
 }
+
+/** Issue #4201: one scripted answer of POST /runs/{id}/credential-switch/apply. `replyLost` applies the
+ *  op server-side and then drops the connection (the worker cannot tell it from a failure). */
+export type ApplyScript =
+  | { outcome: "applied"; token: string; replyLost?: boolean }
+  | { outcome: "superseded"; newOpId?: string }
+  | { outcome: "not_applied"; reason?: string }
+  | { outcome: "refused_committed"; reason?: string }
+  | { outcome: "fenced" }
+  | { outcome: "route_absent" }
+  | { outcome: "garbage" };
 
 /** PRD #1795: the approval-relevant payload of a gate presentation (plan_changed_files excluded). */
 export interface FakeGatePayload {
