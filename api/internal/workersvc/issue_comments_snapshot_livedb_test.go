@@ -61,7 +61,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 
 	const botID = int64(100)
 	const humanID = int64(42)
@@ -93,6 +93,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 		}
 	}
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("m2a-comments-%s@e2e", userID))
+	trackLiveDBUser(t, pool, userID)
 	// PRD #1429 M2: CreateRun now resolves a real D11 harness at create time, refusing with
 	// no_usable_credential when neither harness is usable — orthogonal to the comments-snapshot
 	// behaviour under test, so give the user a usable Anthropic token (Claude, byte-identical).

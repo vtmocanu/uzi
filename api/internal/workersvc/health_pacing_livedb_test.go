@@ -41,6 +41,7 @@ func TestHealthPacingStaticAndFenceLiveDB(t *testing.T) {
 			case "owner":
 				other := uuid.New()
 				e.exec(t, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", other, other.String()+"@e2e")
+				trackLiveDBUser(t, e.pool, other)
 				e.exec(t, tc.change, w, other)
 			case "custody":
 				e.exec(t, `INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded)

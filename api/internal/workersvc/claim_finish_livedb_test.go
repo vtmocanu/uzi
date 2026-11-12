@@ -918,6 +918,7 @@ func TestClaimOwnerMismatchFailsFencedLiveDB(t *testing.T) {
 
 	otherUser, otherConn, otherRepo := uuid.New(), uuid.New(), uuid.New()
 	env.exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, otherUser, fmt.Sprintf("ownmm-%s@e2e", otherUser))
+	trackLiveDBUser(t, env.pool, otherUser)
 	env.exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 	          VALUES ($1, $2, 'github', 'https://forge.e2e', 'bot', 1, $3)`, otherConn, otherUser, []byte("sealed-other"))
 	env.exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)

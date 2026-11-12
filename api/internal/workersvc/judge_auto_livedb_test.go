@@ -46,7 +46,7 @@ func TestJudgeAutoPicksHigherHeadroomLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 
 	q := store.New(pool)
 	svc := New(q, newBox(t), autoParams())
@@ -59,6 +59,7 @@ func TestJudgeAutoPicksHigherHeadroomLiveDB(t *testing.T) {
 		userID, fmt.Sprintf("judge-auto-%s@e2e", userID)); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
+	trackLiveDBUser(t, pool, userID)
 
 	insertToken := func(label string, first bool) uuid.UUID {
 		t.Helper()
