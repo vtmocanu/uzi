@@ -150,6 +150,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **The schedule modal no longer names Anthropic for schedules that may fire on Codex ([#3988](https://github.com/vtmocanu/uzi/pull/3988), [#4027](https://github.com/vtmocanu/uzi/pull/4027)).**
   Its header and "Wait on usage limit" help now use provider-neutral wording.
 
+- **Extend works on an interactive task parked at its time limit ([#4179](https://github.com/vtmocanu/uzi/pull/4179), [#4180](https://github.com/vtmocanu/uzi/pull/4180)).**
+  The web Extend chooser no longer says extensions are turned off when the run only lacks budget figures; it adds the time and resumes the run.
+
+- **Nightly Codex runtime adoption ([#4172](https://github.com/vtmocanu/uzi/pull/4172)).**
+  Scheduled RC planning accepts a committed maintainer adoption record matching the reviewed runtime lock, while retaining publication and coverage checks and refusing missing or stale records.
+
+- **Epoch cleanup safely retains artifacts when an executable cannot start ([#4171](https://github.com/vtmocanu/uzi/pull/4171), [#4184](https://github.com/vtmocanu/uzi/pull/4184)).**
+  Confirmed asynchronous spawn failures join output and close before settling native operations; uncertain child lifecycles still stop reclamation.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -282,6 +291,21 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **The Claude run lane now explicitly denies the native AskUserQuestion tool ([#4149](https://github.com/vtmocanu/uzi/pull/4149), [#4151](https://github.com/vtmocanu/uzi/pull/4151)).**
   Run clarification keeps going through uzi's own ask_user tool even if a future SDK or option change would offer the native one.
+
+- **Hosted Docker workers request pod-epoch runner scratch reclaim by default ([#4182](https://github.com/vtmocanu/uzi/pull/4182), [#4189](https://github.com/vtmocanu/uzi/pull/4189)).**
+  The chart maps a strict boolean to a startup-only worker request without supplying runtime attestation; disabling requires controller reconciliation and safe worker replacement with observed results, cannot stop an active pass or restore bytes, and leaves attempt deletion independently off by default.
+
+- **Recovery diagnostics explain pending cleanup and retirement outcomes ([#4183](https://github.com/vtmocanu/uzi/pull/4183), [#4186](https://github.com/vtmocanu/uzi/pull/4186)).**
+  Optional cleanup reasons and structured re-drive results distinguish retained-source checks without changing cleanup authority or retry behavior.
+
+- **Every forge caller now uses only the issue-tracker or code-host half it needs ([#4173](https://github.com/vtmocanu/uzi/pull/4173), [#4185](https://github.com/vtmocanu/uzi/pull/4185)).**
+  Issue sync, the board, posting comments and issue creation go through the issue tracker; the privilege check, settle, pipeline sync and CI reads go through the code host; autopilot and comment intake use both; behaviour is unchanged for GitLab, GitHub and Forgejo.
+
+- **The forge interface splits into an issue tracker and a code host ([#4173](https://github.com/vtmocanu/uzi/pull/4173), [#4175](https://github.com/vtmocanu/uzi/pull/4175)).**
+  The forge driver contract is now the union of an issue-tracker half (issues, labels, comments and issue state) and a code-host half (everything else); behaviour is unchanged for every forge.
+
+- **The pod-epoch runner scratch phase was introduced dark and default-off ([#4043](https://github.com/vtmocanu/uzi/pull/4043), [#4170](https://github.com/vtmocanu/uzi/pull/4170)).**
+  The original implementation used its own `EPOCH_SCRATCH_DELETION_ENABLED = false` gate and reported `scratch.state: "not_run"` without census or deletion; #4182 supersedes that activation policy with a startup request. Byte figures remain allocated-block estimates, not proof of freed storage.
 
 ### Security
 
