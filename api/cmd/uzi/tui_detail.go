@@ -1009,6 +1009,9 @@ func (m tuiModel) renderDetail() string {
 	for _, line := range workerExhaustionTUILines(d.run) {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}
+	for _, line := range spendLimitHoldTUILines(d.run) {
+		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
+	}
 	if line := fitDiskParkLine(d.run, m.width); line != "" {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}

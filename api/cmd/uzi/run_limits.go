@@ -233,6 +233,9 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			"For retained recovery exhausted (recovery_wait), Resume now requests another attempt; success is not assured. " +
 			"A finite retry stamp means timed retry, even after it is due; NULL means owner-held with no automatic resume. " +
 			"Cancel is terminal. Resume does not reset the retained recovery cap or promise a fresh archive or latest edits.\n\n" +
+			"For an Anthropic API spend limit (recovery_wait, anthropic_spend_limit), the run is owner-held with no automatic resume. " +
+			"Resume re-queues it and the next claim re-selects its credential, which may pick the capped token again, so raise the limit first " +
+			"or switch the credential with the run set-token command (not available for chat, judge, self_improve or job runs). Cancel is terminal.\n\n" +
 			"For worker memory pressure (recovery_wait), only owner Resume starts a fresh memory episode; " +
 			"Cancel is terminal. There is no automatic resume. Source/archive availability and latest edits remain unverified.\n\n" +
 			"For worker recovery exhausted (recovery_wait), only owner Resume starts a fresh recovery episode " +

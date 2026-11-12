@@ -1569,6 +1569,22 @@ it.each([null, "2099-01-01T00:00:00Z"])("adoption refusal history uses integrity
   expect(screen.queryByText("retained recovery retrying")).toBeNull();
 });
 
+// Issue #3767: the spend-limit label needs the recovery_wait status, not just the cause.
+it("spend-limit history shows the owner-hold label only while held, not for a queued run with a stale cause", async () => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "queued", recovery_wait_cause: "anthropic_spend_limit" } as Partial<RunListItem>)] });
+  renderIssueView();
+  expect(await screen.findByText("queued")).toBeTruthy();
+  expect(screen.queryByText("spend limit: owner hold")).toBeNull();
+  // Control: the same run held in recovery_wait renders the label.
+  cleanup();
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "anthropic_spend_limit" } as Partial<RunListItem>)] });
+  renderIssueView();
+  const badge = await screen.findByText("spend limit: owner hold");
+  expect(badge.classList.contains("text-warn")).toBe(true);
+});
+
 it.each([null, "2099-01-01T00:00:00Z"])("unwitnessed continuation history uses its hold label with timestamp %s", async (stamp) => {
   setAuth();
   mockApi.getIssue.mockResolvedValue({ issue: anIssue() });

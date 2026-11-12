@@ -919,6 +919,9 @@ type RunDTO struct {
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
 	// or about to fill; timed retries become owner holds with NULL retry at the cap, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
+	// "anthropic_spend_limit" (issue #3767) is an owner-held hold: the Anthropic API refused for a
+	// spend limit. It never retries on a timer; raise the limit and Resume, switch token with
+	// set-token, or Cancel.
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
@@ -990,7 +993,8 @@ type RunDTO struct {
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
-	// or retained_recovery_exhausted or capped data_volume_full park. An omitted key in a partial client read means
+	// or retained_recovery_exhausted or capped data_volume_full park, and every
+	// anthropic_spend_limit hold. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
 	// retained_continuation_unwitnessed is likewise always owner-held.
 	// retained_recovery_adoption_failed is always owner-held, even if a malformed
@@ -1827,6 +1831,9 @@ type RunSummaryItemDTO struct {
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
 	// or about to fill; timed retries become owner holds with NULL retry at the cap, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
+	// "anthropic_spend_limit" (issue #3767) is an owner-held hold: the Anthropic API refused for a
+	// spend limit. It never retries on a timer; raise the limit and Resume, switch token with
+	// set-token, or Cancel.
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
@@ -1898,7 +1905,8 @@ type RunSummaryItemDTO struct {
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
-	// or retained_recovery_exhausted or capped data_volume_full park. An omitted key in a partial client read means
+	// or retained_recovery_exhausted or capped data_volume_full park, and every
+	// anthropic_spend_limit hold. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
 	// retained_continuation_unwitnessed is likewise always owner-held.
 	// retained_recovery_adoption_failed is always owner-held, even if a malformed

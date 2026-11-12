@@ -406,6 +406,17 @@ export class HeldFeatureUnavailableError extends Error {
   }
 }
 
+/** Issue #3767: a spend-limit park was requested but the client no longer supports it (the feature
+ *  left the negotiated set, or the generation is not positive). Thrown BEFORE anything is sent and
+ *  never retryable: the runner fails the run with the provider message instead of looping or sending
+ *  an untyped park. */
+export class SpendLimitParkUnsupportedError extends Error {
+  constructor() {
+    super("spend-limit park requires support and a positive generation");
+    this.name = "SpendLimitParkUnsupportedError";
+  }
+}
+
 /** The typed outcome of {@link WorkerClient.publishHeld}. `ok: true` only means the api answered 2xx
  *  with a well-formed body; the caller must still require `body.state === "created"`. */
 export type HeldPublishResult =
@@ -473,7 +484,26 @@ function hasRevisionSourceFields(body: StateRequest): boolean {
 
 // Internal per-attempt evidence, minted only after reading the authenticated response through EOF.
 class StateDecodeRefusalError extends RequestError {}
-interface StateAttemptEvidence { ambiguous: boolean; refusals: number; refusedAfterAmbiguity?: boolean }
+interface StateAttemptEvidence {
+  ambiguous: boolean; refusals: number; refusedAfterAmbiguity?: boolean;
+  /** Any definite HTTP answer (any status) after an earlier ambiguous attempt. */
+  definiteAfterAmbiguity?: boolean;
+}
+
+// The api's generic invalid-state 400 body (worker_protocol.go state handler).
+const GENERIC_INVALID_STATE_ERROR =
+  "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed";
+
+/** True when a spend-limit park refusal means the server does not understand the cause: the strict
+ *  decode refusal, or a 400 whose body is exactly the generic invalid-state error. */
+function isUnsupportedSpendLimitRefusal(error: unknown): boolean {
+  if (error instanceof StateDecodeRefusalError) return true;
+  if (!(error instanceof RequestError) || error.status !== 400) return false;
+  try {
+    const decoded: unknown = JSON.parse(error.body);
+    return isRecord(decoded) && Object.keys(decoded).length === 1 && decoded.error === GENERIC_INVALID_STATE_ERROR;
+  } catch { return false; }
+}
 
 /** Match a small, complete 404 JSON object against exactly the expected keys and values. */
 export function isStrict404Body(err: unknown, expected: Readonly<Record<string, string>>): boolean {
@@ -2746,6 +2776,27 @@ export class WorkerClient {
         throw error;
       }
     }
+    if (body.recovery_cause === "anthropic_spend_limit") {
+      // Issue #3767: an owner-held spend-limit park. Sent once, exactly as given, fenced: it never
+      // takes the generic generation fallback or an untyped resend (an untyped park would be
+      // auto-retried by the api against a limit that cannot clear). A definite 4xx refusal closes
+      // only this feature's gate and propagates so the runner fails the run with the provider message.
+      if (!this.hasFeature("recovery_cause_anthropic_spend_limit") || body.status !== "recovery_wait" ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) < 1)
+        throw new SpendLimitParkUnsupportedError();
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        if (evidence.refusedAfterAmbiguity || evidence.definiteAfterAmbiguity)
+          throw new Error("spend-limit park outcome uncertain", { cause: error });
+        // Only an unsupported-protocol signal closes the gate: an unknown or server-only
+        // recovery_cause reaches ErrInvalidState and the generic 400 (service.go, state-report
+        // cause validation). Any other 4xx (404, a distinct 400, 401, ...) is about this run.
+        if (isUnsupportedSpendLimitRefusal(error)) this.dropFeature("recovery_cause_anthropic_spend_limit");
+        throw error;
+      }
+    }
     if (body.recovery_cause === "worker_memory_pressure") {
       // Snapshot once: caller mutation and transport retries cannot rebind this request.
       const outbound: PlanCrossCheckStateRequest = Object.freeze(JSON.parse(JSON.stringify(body)));
@@ -3213,6 +3264,7 @@ export class WorkerClient {
         if (evidence) {
           if (evidence.ambiguous && err instanceof RequestError && err.status === 400)
             evidence.refusedAfterAmbiguity = true;
+          if (evidence.ambiguous && err instanceof RequestError) evidence.definiteAfterAmbiguity = true;
           if (err instanceof StateDecodeRefusalError) evidence.refusals++;
           else evidence.ambiguous = true;
         }

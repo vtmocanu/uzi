@@ -170,18 +170,29 @@ func (s *Service) parkDataVolumeFull(ctx context.Context, wkr store.Worker, owne
 	return parked, 1, nil
 }
 
+// isOwnerNullHold identifies an owner-only recovery hold that a late worker report must not
+// disturb: the data-volume-full hold (NULL retry stamp) and the Anthropic spend-limit hold
+// (always NULL retry, issue #3767). It is not a finite retry park.
+func isOwnerNullHold(run store.Run) bool {
+	if run.Status != "recovery_wait" || !run.RecoveryWaitCause.Valid {
+		return false
+	}
+	return isDataVolumeFullHeld(run) || run.RecoveryWaitCause.String == recoveryCauseAnthropicSpendLimit
+}
+
 // isDataVolumeFullHeld identifies an owner-only disk hold, not a finite retry park.
 func isDataVolumeFullHeld(run store.Run) bool {
 	return run.Status == "recovery_wait" && run.RecoveryWaitCause.Valid && run.RecoveryWaitCause.String == recoveryCauseDataVolumeFull && !run.RecoveryRetryNotBefore.Valid
 }
 
 // A stamped worker cancellation still consumes the owner's stop verdict.
-func diskHoldRefusesReport(run store.Run, req StateRequest) bool {
-	// Typed disk reports retain their own required-generation validation and locked
+func ownerHoldRefusesReport(run store.Run, req StateRequest) bool {
+	// Each hold's own typed report retains its required-generation validation and locked
 	// lost-ACK/stale/cancel precedence, including reports onto an existing hold.
-	if req.State == "recovery_wait" && req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseDataVolumeFull {
+	if req.State == "recovery_wait" && req.RecoveryCause != nil &&
+		(*req.RecoveryCause == recoveryCauseDataVolumeFull || *req.RecoveryCause == recoveryCauseAnthropicSpendLimit) {
 		return false
 	}
-	return isDataVolumeFullHeld(run) && req.State != "cancelled" &&
+	return isOwnerNullHold(run) && req.State != "cancelled" &&
 		(req.State != "failed" || !run.StopKind.Valid || run.StopKind.String == "")
 }

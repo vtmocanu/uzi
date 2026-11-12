@@ -1563,6 +1563,10 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 - A park or the periodic reclaim drops a run's caches only once no process carrying the run's HOME is left alive (a complete reap or scan); otherwise the caches stay and a later reclaim pass retries. (AI-synced 2026-10-03, #1828)
 - Claude runs get a per-run, per-claim Go temp dir (`GOTMPDIR`) in the run HOME; a process-ended park and the periodic reclaim remove it only once no process of the run (by HOME, cwd or that `GOTMPDIR`) is left; older generations are removed at re-claim after the HOME reap; terminal cleanup removes it with the HOME. (AI-synced 2026-11-03, #3870)
 
+## Issue #3767 — Anthropic API spend-limit owner hold
+
+- An Anthropic API spend limit (organization or workspace) holds the run in `recovery_wait` (`anthropic_spend_limit`) for the owner, with no automatic retry or credential switch; it is detected by a narrow anchored text match because Anthropic exposes no structured signal, Resume re-uses the run's own credential selection, and credit depletion is out of scope. See [run-recovery-wait](../docs/run-recovery-wait.md#anthropic-api-spend-limit). (AI-synced 2026-11-11)
+
 ## Bug #1864 — Codex delegation still open when the lead's turn ends
 
 Tracked as GitHub issue vtmocanu/uzi#1864.

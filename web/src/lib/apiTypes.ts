@@ -4046,6 +4046,12 @@ export interface Run {
    *  claimed worker flight was never witnessed starting or departing within a bounded window;
    *  the claim was released, local work and custody are kept, and only the owner can Resume or
    *  Cancel. Owner-held with no automatic retry, and not an integrity refusal.
+   *  "anthropic_spend_limit" (issue #3767) means a Claude run's Anthropic API key hit its
+   *  organization or workspace spend limit. Owner-held, recovery_retry_not_before is null and
+   *  nothing resumes it automatically. The owner can Resume (the next claim re-selects the
+   *  credential through the run's own selection, which may pick the capped token again),
+   *  switch token (switchable kinds only) or Cancel. A queued run can keep this value stale
+   *  after set-token, so also require status === "recovery_wait".
    *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */

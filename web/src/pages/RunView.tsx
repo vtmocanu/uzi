@@ -43,6 +43,7 @@ import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
 import { forgeWaitMode, forgeWaitLabel, forgeWaitPhase, publicationHoldCopy } from "../lib/forgeCooldown";
 import { diskWaitMode, diskWaitLabel, diskWaitDescription } from "../lib/diskRecovery";
 import { credentialSwitchHold } from "../lib/credentialSwitchHold";
+import { isCredentialSwitchRefusedLane } from "../lib/credentialOverride";
 import {
   effectiveRunStatus,
   parkLabel,
@@ -1726,17 +1727,63 @@ function PublicationParkBody({ run, mode, retryAt, ownerProof, busy, onResume, o
   );
 }
 
-export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onResume = () => {}, onCancel = () => {} }: {
+// Issue #3767: a Claude run's Anthropic API key hit its spend limit. Owner-held, no timer, and
+// nothing resumes it automatically. Resume re-queues and the next claim re-selects the
+// credential through the run's own selection, which may pick the capped token again. Text
+// only: nothing here renders provider-supplied content.
+function SpendLimitPanel({ run, ownerProof, busy, onResume, onCancel, onSwitched }: {
+  run: Run;
+  ownerProof: boolean;
+  busy: boolean;
+  onResume: () => void;
+  onCancel: () => void;
+  onSwitched?: () => void;
+}) {
+  const canSwitch = !isCredentialSwitchRefusedLane(run) && run.harness !== "codex";
+  return (
+    <div className="rounded-xl border border-warn/40 bg-warn/10 p-4" data-testid="spend-limit-panel">
+      <p className="text-sm font-semibold text-warn">Anthropic API spend limit reached</p>
+      <p className="mt-1 text-sm text-fg">
+        Resume uses this run&apos;s current credential selection. If it still selects the capped token, raise the limit first.
+        {canSwitch && <> To choose another token now, use Switch token or <code>uzi run set-token</code>.</>}
+      </p>
+      <p className="mt-1.5 text-xs text-muted">This hold has no scheduled retry.</p>
+      {ownerProof ? (
+        <div className="mt-3 flex flex-wrap items-start gap-2">
+          <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+          {canSwitch && (
+            <SwitchTokenAction run={run} canSteer={ownerProof} onSwitched={onSwitched} triggerLabel="Run with another token" />
+          )}
+          {canSwitch && (
+            <Link
+              to="/settings"
+              className="inline-flex h-7 items-center rounded-lg px-2.5 text-xs font-medium text-muted hover:bg-raised hover:text-fg"
+            >
+              Manage tokens in Settings
+            </Link>
+          )}
+          <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>Cancel</Button>
+        </div>
+      ) : <p className="mt-1.5 text-xs text-muted">Only the run owner can resume or cancel this hold.</p>}
+    </div>
+  );
+}
+
+export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onResume = () => {}, onCancel = () => {}, onSwitched }: {
   run: Run;
   ownerProof?: boolean;
   busy?: boolean;
   onResume?: () => void;
   onCancel?: () => void;
+  onSwitched?: () => void;
 }) {
   // Only for a run actually recovering. Every other status (including terminal and the
   // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
+  if (run.recovery_wait_cause === "anthropic_spend_limit") {
+    return <SpendLimitPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} onSwitched={onSwitched} />;
+  }
   if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed" || run.recovery_wait_cause === "retained_continuation_unwitnessed")) {
     return <WorkerDecisionPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />;
   }
@@ -2029,7 +2076,8 @@ export function RunView() {
   const forgeHeld = run != null && forgeWaitMode(run) === "held";
   const diskHeld = run != null && diskWaitMode(run) === "held";
   const iterationHeld = run?.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
-  const ownerDecisionHold = policyBlocked || iterationHeld || forgeHeld || diskHeld || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
+  const spendLimitHeld = run?.status === "recovery_wait" && run.recovery_wait_cause === "anthropic_spend_limit";
+  const ownerDecisionHold = policyBlocked || iterationHeld || forgeHeld || diskHeld || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld || spendLimitHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -2136,7 +2184,7 @@ export function RunView() {
     setBusy(false);
   };
   const resumeWorkerHold = async () => {
-    if (!canSteer || !(forgeHeld || diskHeld || workerExhausted || memoryHeld || retainedRecovery) || run?.id !== id || (diskHeld && currentAction.current !== null)) return;
+    if (!canSteer || !(forgeHeld || diskHeld || workerExhausted || memoryHeld || retainedRecovery || spendLimitHeld) || run?.id !== id || (diskHeld && currentAction.current !== null)) return;
     const requestRunId = id;
     const isCurrent = startAction();
     try {
@@ -2466,6 +2514,8 @@ export function RunView() {
                     ? "worker_requeue_exhausted"
                   : run.recovery_wait_cause === "worker_memory_pressure"
                     ? "worker_memory_pressure"
+                  : run.recovery_wait_cause === "anthropic_spend_limit"
+                    ? "anthropic_spend_limit"
                     : "recovery_wait"
             : run?.status === "paused" && run.hold_reason === "iteration_budget_exhausted"
               ? `iteration_budget_exhausted${extendBudgetView(run, Date.now())?.remainingSec === 0 ? ":spent" : ""}`
@@ -2521,6 +2571,8 @@ export function RunView() {
             ? "Worker recovery needs your decision. Only the run owner can resume or cancel this hold. There is no scheduled retry."
           : parkKey === "worker_memory_pressure"
             ? "Worker memory pressure. Only the run owner can resume or cancel this hold. Resume starts a fresh memory episode. There is no scheduled retry."
+          : parkKey === "anthropic_spend_limit"
+            ? "Anthropic API spend limit reached. Only the run owner can resume or cancel this hold. There is no scheduled retry. Resume uses this run's current credential selection."
           : parkKey === "provider_outage"
             ? "The provider is unavailable. Retries automatically. If a provider recovery bound is enabled and reached, the run enters an owner hold."
           : parkKey.startsWith("publication:")
@@ -3199,6 +3251,7 @@ export function RunView() {
         busy={busy}
         onResume={() => { void resumeWorkerHold(); }}
         onCancel={() => { void cancelRun(); }}
+        onSwitched={refreshRun}
       />
 
 
