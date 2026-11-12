@@ -27157,7 +27157,13 @@ export class RunRunner {
           runLog.warn("in-place credential switch: the apply call threw; treating the outcome as uncertain", { run_id: flight.runId, error: errMessage(error) });
           result = { kind: "uncertain", detail: "apply_threw" };
         }
-        mayHaveCommitted = result.kind === "uncertain" || result.kind === "refused_committed";
+        // Sticky: once any send was ambiguous, a later `fenced` or `superseded` answer does not prove the
+        // earlier send did not commit (the server checks the fence before it replays an op).
+        if (result.kind === "uncertain" || result.kind === "refused_committed") mayHaveCommitted = true;
+        const dropHold = (): void => {
+          if (mayHaveCommitted) this.releaseHoldPastPossibleApply(hold, flight, runLog);
+          else hold.cancel();
+        };
         switch (result.kind) {
           case "applied": {
             if (result.ordinal <= holder.current().ordinal) {
@@ -27193,7 +27199,7 @@ export class RunRunner {
             }
             // No newer switch is pending (or it never reached this flight in time): nothing was applied and
             // nothing is owed to the server for the superseded op. Late polls carrying it are ignored.
-            hold.cancel();
+            dropHold();
             holdDone = true;
             flight.steering.settleCredentialSwitch(opId, "cleared");
             runLog.info("in-place credential switch superseded with no newer switch pending; continuing on the current token", { run_id: flight.runId });
@@ -27201,7 +27207,7 @@ export class RunRunner {
           }
           case "not_applied":
           case "ledger_unavailable":
-            hold.cancel();
+            dropHold();
             holdDone = true;
             runLog.warn("in-place credential switch not applied; giving up on the old token", {
               run_id: flight.runId, reason: result.kind === "not_applied" ? sanitizeForLog(result.reason, 128) : "ledger_unavailable",
@@ -27209,11 +27215,11 @@ export class RunRunner {
             return await this.inPlaceGiveUp(flight, runLog, opId, lifecycle);
           case "route_absent":
             // Clean (the ledger proved no earlier send): the api does not serve the route after all.
-            hold.cancel();
+            dropHold();
             holdDone = true;
             return { kind: "v1_release" };
           case "fenced":
-            hold.cancel();
+            dropHold();
             holdDone = true;
             return { kind: "stale_stop" };
           case "refused_committed":

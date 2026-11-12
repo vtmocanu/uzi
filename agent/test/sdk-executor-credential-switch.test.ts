@@ -927,6 +927,27 @@ describe("SdkExecutor — an applied in-place credential switch (issue #4201)", 
     });
   });
 
+  it("laneSettled is false when ONLY the guarded lane is poisoned (its quiesce succeeds)", async (t) => {
+    const { ClaudeCommandLane } = await import("../src/claude-command/lane.js");
+    const cancel = new AbortController();
+    t.mock.method(ClaudeCommandLane.prototype, "quiesce", async () => undefined);
+    t.mock.getter(ClaudeCommandLane.prototype, "poisoned", () => true);
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      (signal) => { cancel.abort(new CredentialSwitchSignal()); return hangUntilAbort(signal); },
+      doneTurn(),
+    ]);
+    const opts: Array<{ site: string; laneSettled: boolean } | undefined> = [];
+    const commands = { protect: () => ({}), unprotect: () => true };
+    const { ctx } = makeCtx({
+      signal: cancel.signal,
+      capturedMemory: () => ({ commands, context: {}, flight: {}, lifecycleRevision: 1 }) as never,
+      attemptCredentialSwitch: async (o) => { opts.push(o); throw new Error("stop here"); },
+    });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /stop here|unconfirmed/);
+    assert.deepEqual(opts, [{ site: "implement_turn", laneSettled: false }]);
+  });
+
   it("laneSettled is false when the guarded lane's quiesce failed after the switch trip took the carrier", async (t) => {
     const { ClaudeCommandLane, GuardedCommandUnconfirmedError } = await import("../src/claude-command/lane.js");
     const cancel = new AbortController();

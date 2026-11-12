@@ -2089,7 +2089,10 @@ export class WorkerClient {
     if (!out) return uncertain("malformed_response");
     switch (out.outcome) {
       case "applied": {
-        const { token, ordinal, message_seq: messageSeq, replay } = out;
+        const { ordinal, message_seq: messageSeq, replay } = out;
+        // Trim once here: rebindCredential writes the trimmed value into the env, so the secret set, the
+        // log registry and every other sink must see that same value.
+        const token = typeof out.token === "string" ? out.token.trim() : out.token;
         if (typeof token !== "string" || token.length < APPLY_TOKEN_MIN_LENGTH ||
             typeof ordinal !== "number" || !Number.isSafeInteger(ordinal) || ordinal < 1 ||
             typeof messageSeq !== "number" || !Number.isSafeInteger(messageSeq) || messageSeq < 0)

@@ -313,6 +313,14 @@ export async function applyThroughLedger(
         return { kind: "uncertain", detail: "ledger_record_failed" };
       }
       return result;
+    case "fenced":
+    case "superseded":
+    case "not_applied":
+      // A definite non-applied answer does not undo an earlier ambiguous send of the same op: the server
+      // checks the fence before it replays, so that send may have committed. Keep the memory.
+      if (wasAmbiguous) await ledger.record(runId, req.opId, "ambiguous", `${result.kind}_after_ambiguous`, req.claimGeneration).catch(() => undefined);
+      else await ledger.record(runId, req.opId, "settled", result.kind).catch(() => undefined);
+      return result;
     default:
       // A definite answer. If settling cannot be written the entry stays `sending` on disk, which
       // a later load reads as ambiguous: conservative, never wrong.

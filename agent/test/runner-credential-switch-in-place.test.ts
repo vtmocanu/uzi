@@ -7,7 +7,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { OutgoingMessage } from "../src/protocol.js";
 import os from "node:os";
 import { MessageBatcher, MAX_MESSAGE_BYTES } from "../src/batcher.js";
-import { RequestError, type WorkerClient } from "../src/client.js";
+import { RequestError, type CredentialSwitchApplyResult, type WorkerClient } from "../src/client.js";
 import { Outbox } from "../src/outbox.js";
 import { SecretSet } from "../src/redact.js";
 import { CredentialSwitchSignal } from "../src/steering.js";
@@ -454,6 +454,227 @@ describe("issue #4201 m2c: option A (an apply that may have committed)", () => {
     assert.equal(api.uncertainRequests.length, 3, "two lost replies, then the confirmed third");
     assert.ok(api.uncertainRequests.every((u) => u.body.op_id === "op-1"));
     assert.equal(r.turns.length, 2, "neither token ran again");
+  });
+});
+
+interface HoldSpy {
+  releases: Array<{ messageSeq?: number }>;
+  cancels: number;
+  batcher: MessageBatcher | undefined;
+  restore(): void;
+}
+
+/** Records how the runner disposes of the batcher's credential switch hold, and exposes the batcher. */
+function spyHold(): HoldSpy {
+  const real = MessageBatcher.prototype.holdForCredentialSwitch;
+  const spy: HoldSpy = { releases: [], cancels: 0, batcher: undefined, restore: () => { MessageBatcher.prototype.holdForCredentialSwitch = real; } };
+  MessageBatcher.prototype.holdForCredentialSwitch = function (this: MessageBatcher) {
+    const hold = real.call(this);
+    spy.batcher = this;
+    return {
+      ...hold,
+      release: (arg: Parameters<typeof hold.release>[0]) => { spy.releases.push({ messageSeq: arg?.messageSeq }); return hold.release(arg); },
+      cancel: () => { spy.cancels++; return hold.cancel(); },
+    };
+  };
+  return spy;
+}
+
+/**
+ * Replaces the client's apply call: the FIRST call commits the op on the server (the credential_switch frame
+ * lands at tail+1) and emits two worker frames into the open hold, then every call answers from `answers`
+ * (the last one repeats). This is the lost-reply shape: the server committed, the worker never learned it.
+ */
+function committedThenAnswers(spy: HoldSpy, answers: CredentialSwitchApplyResult[]): { calls: () => number; restore(): void } {
+  const real = client.applyCredentialSwitch.bind(client);
+  let calls = 0;
+  client.applyCredentialSwitch = (async (runId: string, req: Parameters<typeof real>[1]) => {
+    calls++;
+    if (calls === 1) {
+      (api as unknown as { applySwitch(r: string, o: string, t: string): unknown }).applySwitch(runId, req.opId, NEW_TOKEN);
+      spy.batcher!.emit({ kind: "text", agent: "lead", payload: { text: "held-1" } });
+      spy.batcher!.emit({ kind: "text", agent: "lead", payload: { text: "held-2" } });
+    }
+    return answers[Math.min(calls, answers.length) - 1]!;
+  }) as typeof client.applyCredentialSwitch;
+  return { calls: () => calls, restore: () => { client.applyCredentialSwitch = real; } };
+}
+
+/** The hold was released (never cancelled) past the possibly committed apply: held frames number from tail+2. */
+function assertReleasedPastPossibleApply(r: Result, spy: HoldSpy): void {
+  const server = feedFrames(r.runId).find((m) => (m.kind as string) === "credential_switch");
+  assert.ok(server, "the server committed its credential_switch frame");
+  const S = server.seq;
+  assert.equal(spy.cancels, 0, "the hold is never cancelled once an apply may have committed");
+  assert.deepEqual(spy.releases, [{ messageSeq: S }], "released so the first held frame is tail+2 (the server frame owns tail+1)");
+  const seqOf = (text: string): number | undefined => r.posted.find((m) => m.payload["text"] === text)?.seq;
+  assert.equal(seqOf("held-1"), S + 1);
+  assert.equal(seqOf("held-2"), S + 2);
+  assert.ok(!r.posted.some((m) => m.seq === S), `no worker frame took the server's seq ${S}`);
+}
+
+describe("issue #4201 m2c rework: a definite non-applied answer after an ambiguous send keeps the sequence rule and the ledger memory", () => {
+  const AMBIGUOUS: CredentialSwitchApplyResult = { kind: "uncertain", detail: "transport_error" };
+
+  it("uncertain then fenced: the hold is released past the possible apply, the op stays ambiguous, the flight stops", TIMEOUT, async () => {
+    const spy = spyHold();
+    const apply = committedThenAnswers(spy, [AMBIGUOUS, { kind: "fenced" }]);
+    try {
+      const r = await scenario({ site: "implement_turn", apply: [] });
+      assert.equal(apply.calls(), 2);
+      assertReleasedPastPossibleApply(r, spy);
+      assert.equal((await r.ledger.stateOf(r.runId, "op-1"))?.state, "ambiguous", "a fenced answer does not settle an op whose earlier send may have committed");
+      assert.ok(!statusesOf(r).includes("completed") && !statusesOf(r).includes("credential_switch"), statusesOf(r).join(","));
+    } finally { apply.restore(); spy.restore(); }
+  });
+
+  it("uncertain then superseded with no newer op: the hold is released past the possible apply, the op stays ambiguous", TIMEOUT, async () => {
+    const spy = spyHold();
+    const apply = committedThenAnswers(spy, [AMBIGUOUS, { kind: "superseded" }]);
+    try {
+      const r = await scenario({ site: "implement_turn", apply: [], extra: { switchSupersedeWaitMs: 50 } });
+      assert.equal(apply.calls(), 2);
+      assertReleasedPastPossibleApply(r, spy);
+      assert.equal((await r.ledger.stateOf(r.runId, "op-1"))?.state, "ambiguous");
+    } finally { apply.restore(); spy.restore(); }
+  });
+});
+
+describe("issue #4201 m2c rework: option A releases the hold past a possible apply (tail+2)", () => {
+  it("refused_committed: frames emitted while the hold is open number from tail+2; a server frame at tail+1 survives", TIMEOUT, async () => {
+    const spy = spyHold();
+    const apply = committedThenAnswers(spy, [{ kind: "refused_committed", reason: "already_committed" }]);
+    try {
+      const r = await scenario({ site: "implement_turn", apply: [] });
+      assert.equal(api.uncertainRequests.length, 1);
+      assertReleasedPastPossibleApply(r, spy);
+    } finally { apply.restore(); spy.restore(); }
+  });
+
+  it("uncertain on every retry: same sequence rule", TIMEOUT, async () => {
+    const spy = spyHold();
+    const apply = committedThenAnswers(spy, [{ kind: "uncertain", detail: "transport_error" }]);
+    try {
+      const r = await scenario({ site: "implement_turn", apply: [] });
+      assert.equal(apply.calls(), 3);
+      assert.equal(api.uncertainRequests.length, 1);
+      assertReleasedPastPossibleApply(r, spy);
+    } finally { apply.restore(); spy.restore(); }
+  });
+});
+
+describe("issue #4201 m2c rework: the in-place route is closed without the negotiated capability or feature", () => {
+  async function v1ReleaseRun(tweak: () => void) {
+    git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+    mockCommittedTracking(git, "cafef00dcafef00dcafef00dcafef00dcafef00d");
+    git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
+    git.trackingTip = (async () => "cafef00dcafef00dcafef00dcafef00dcafef00d") as typeof git.trackingTip;
+    git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+    newApi();
+    const claim = freshClaim(GEN);
+    negotiate();
+    tweak();
+    // Were the in-place route wrongly taken, this would apply.
+    api.scriptApply(claim.run_id, { outcome: "applied", token: NEW_TOKEN });
+    const sdk = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: scriptedQuery([planTurn(), hangTurn(() => {
+        api.overrideStateStatus(claim.run_id, "queued");
+        api.requestCredentialSwitch(claim.run_id, GEN, "op-1"); // the signal carries an op id
+      }), doneTurn()], []), client,
+    });
+    api.onState(claim.run_id, (b) => { if (b.status === "awaiting_approval") send(claim.run_id, row("approve_plan")); });
+    const { gitlab } = fakeGitlab();
+    await runnerWith(() => ({ executor: sdk }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1, planApprovalTimeoutMs: 20_000, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir),
+      quiesceRun: async () => CLEAN,
+    }).execute(claim);
+    return api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body.status as string);
+  }
+
+  for (const [name, tweak] of [
+    ["the worker did not register the capability", () => {
+      (client as unknown as { hasInPlaceCredentialSwitchCapability: boolean }).hasInPlaceCredentialSwitchCapability = false;
+    }],
+    ["the server does not advertise the feature", () => {
+      client.protocolFeatures = client.protocolFeatures.filter((f) => f !== "credential_switch_apply_v1");
+    }],
+  ] as const) {
+    it(`${name}: the v1 release path, no apply request, no in-place report`, TIMEOUT, async () => {
+      const s = await v1ReleaseRun(tweak);
+      assert.equal(applied().length, 0, "no apply request was sent");
+      assert.ok(s.includes("credential_switch"), `released as today: ${s.join(",")}`);
+      for (const status of ["credential_switch_held", "credential_switch_failed", "credential_switch_uncertain", "completed"])
+        assert.ok(!s.includes(status), `no ${status}: ${s.join(",")}`);
+      assert.equal(api.holdRequests.length, 0);
+      assert.equal(api.uncertainRequests.length, 0);
+    });
+  }
+});
+
+describe("issue #4201 m2c rework: each half of the lane-settled proof fences on its own", () => {
+  it("runner: the executor's laneSettlementProven() === false alone (settle otherwise confirmed) holds with the op id and applies nothing", TIMEOUT, async () => {
+    newApi();
+    negotiate();
+    const claim = freshClaim(GEN);
+    const runId = claim.run_id;
+    api.scriptApply(runId, { outcome: "applied", token: NEW_TOKEN });
+    const executor = {
+      laneSettlementProven: () => false,
+      run: async (ctx: import("../src/executor.js").RunContext) => {
+        api.requestCredentialSwitch(runId, GEN, "op-1");
+        assert.ok(await until(() => ctx.signal?.aborted === true, 10_000), "the switch aborted ctx.signal");
+        throw ctx.signal!.reason;
+      },
+    };
+    const { gitlab } = fakeGitlab();
+    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir), quiesceRun: async () => CLEAN,
+    }).execute(claim);
+    assert.deepEqual(api.holdRequests.filter((h) => h.status === "credential_switch_held").map((h) => h.op_id), ["op-1"]);
+    assert.equal(applied().length, 0, "no apply request");
+    assert.equal(api.uncertainRequests.length, 0);
+  });
+
+  // The executor's own poisoned-lane term (guardLane.poisoned) is pinned in sdk-executor-credential-switch.test.ts:
+  // the in-place scenarios here have no guarded lane (no capturedMemory), so it cannot be reached from this harness.
+});
+
+describe("issue #4201 m2c rework: the report retries are bounded", () => {
+  // IN_PLACE_REPORT_ATTEMPTS (runner.ts) is 5. Counted at the runner's reportState call (the client retries
+  // a dropped connection by itself, so wire requests are a multiple of the runner's attempts).
+  async function neverConfirmed(status: string, run: () => ReturnType<typeof scenario>) {
+    const realReport = client.reportState.bind(client);
+    let attempts = 0;
+    client.reportState = (async (runId: string, body: Parameters<typeof realReport>[1], ...rest: unknown[]) => {
+      if (body.status === status) { attempts++; throw new Error("transport down"); }
+      return (realReport as (...a: unknown[]) => unknown)(runId, body, ...rest);
+    }) as typeof client.reportState;
+    try {
+      const r = await run();
+      return { r, attempts };
+    } finally { client.reportState = realReport as typeof client.reportState; }
+  }
+
+  it("a hold report that never confirms is attempted exactly 5 times, then the flight stops with its work retained", TIMEOUT, async () => {
+    const { r, attempts } = await neverConfirmed("credential_switch_held", () => scenario({
+      site: "implement_turn", apply: [],
+      quiesce: (req) => (req.site === "in_place_credential_switch" ? BLOCKED : undefined),
+    }));
+    assert.equal(attempts, 5);
+    assert.equal(applied().length, 0);
+    assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
+    assert.equal(r.turns.length, 2, "no turn after the report");
+    assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "custody kept");
+  });
+
+  it("an uncertain report that never confirms is attempted exactly 5 times, then the flight stops with its work retained", TIMEOUT, async () => {
+    const { r, attempts } = await neverConfirmed("credential_switch_uncertain", () => scenario({
+      site: "implement_turn", apply: [{ outcome: "refused_committed" }],
+    }));
+    assert.equal(attempts, 5);
+    assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
+    assert.equal(r.turns.length, 2, "neither token ran again");
+    assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "custody kept");
   });
 });
 

@@ -1578,8 +1578,8 @@ export class SteeringChannel {
   /** CredentialSwitchSignal abort reasons whose switch settled: the signal is spent, not a stop. */
   private readonly settledSwitchSignals = new WeakSet<object>();
   private readonly cancelReplacedListeners = new Set<(signal: AbortSignal) => void>();
-  /** The first stop reason that reached the shared cancel controller while a pending switch had spent it
-   *  (abortCancel); an applied settle replays it onto the fresh controller (issue #4201 review BN1). */
+  /** The first stop reason that reached the shared cancel controller while a pending switch was
+   *  outstanding and a switch signal had spent it (abortCancel); an applied settle replays it onto the fresh controller (issue #4201 review BN1). */
   private deferredCancelAbort: { reason: unknown } | undefined;
   private latchedSwitchOpId: string | undefined;
   /** PRD #1247 M5b (MAJOR-6 rework): while > 0, a matching credential_switch signal is DEFERRED —
@@ -2006,8 +2006,11 @@ export class SteeringChannel {
       this.cancel.abort(reason);
       return;
     }
-    if (s.reason instanceof CredentialSwitchSignal && !this.settledSwitchSignals.has(s.reason) &&
-        this.deferredCancelAbort === undefined) this.deferredCancelAbort = { reason };
+    // Any switch signal counts, settled or not: a second switch that trips on a controller still spent
+    // by an earlier (settled) op's signal is pending, and its applied settle replaces the controller.
+    // The trip's own signal is not a stop to replay.
+    if (this.pendingSwitch !== undefined && s.reason instanceof CredentialSwitchSignal &&
+        !(reason instanceof CredentialSwitchSignal) && this.deferredCancelAbort === undefined) this.deferredCancelAbort = { reason };
   }
 
   /** A hold changes behaviour only while no switch is pending: with one pending, every path runs as

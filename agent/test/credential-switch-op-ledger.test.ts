@@ -93,6 +93,20 @@ describe("credential switch op ledger", () => {
     assert.equal(onDisk(dir)["op-1"].state, "clean_route_absent");
   });
 
+  for (const result of [{ kind: "fenced" }, { kind: "superseded" }, { kind: "not_applied", reason: "x" }] as CredentialSwitchApplyResult[]) {
+    it(`uncertain then ${result.kind} stays ambiguous (the first send may have committed), and the answer is still returned`, async () => {
+      const dir = tmp();
+      const first = new CredentialSwitchOpLedger(dir);
+      await applyThroughLedger(fakeClient([], { kind: "uncertain", detail: "x" }), first, RUN, REQ);
+      assert.deepEqual((await applyThroughLedger(fakeClient([], result), first, RUN, REQ)).kind, result.kind);
+      assert.equal(onDisk(dir)["op-1"].state, "ambiguous");
+      // Across a reload too, and a never-ambiguous op still settles.
+      assert.equal((await new CredentialSwitchOpLedger(dir).stateOf(RUN, "op-1"))?.state, "ambiguous");
+      await applyThroughLedger(fakeClient([], result), first, RUN, { ...REQ, opId: "op-2" });
+      assert.equal(onDisk(dir)["op-2"].state, "settled");
+    });
+  }
+
   it("uncertain then route_absent stays uncertain (sticky), in process and across a reload", async () => {
     const dir = tmp();
     const first = new CredentialSwitchOpLedger(dir);

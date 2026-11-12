@@ -2974,6 +2974,27 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
     }
   });
 
+  it("a stop that lands during a SECOND switch, whose controller is still spent by the first op's signal, survives its applied settle (review B2)", () => {
+    const cases: Array<[string, (ch: SteeringChannel) => void, (r: unknown) => boolean]> = [
+      ["cancel", (ch) => (ch as unknown as { commitCancel(): void }).commitCancel(), (r) => r instanceof Error && r.name === "AbortError"],
+      ["fence", (ch) => (ch as unknown as Private).endFencedFlight("stale"), (r) => r instanceof Error && r.name === "ClaimFencedSignal"],
+      ["pause now", (ch) => (ch as unknown as { route(k: string, b: string, id: number, r: boolean, c?: string): void }).route("pause", "now", 1, false, undefined), (r) => r instanceof PauseNowSignal],
+      ["pause wall", (ch) => (ch as unknown as { route(k: string, b: string, id: number, r: boolean, c?: string): void }).route("pause", "wall", 2, false, undefined), (r) => r instanceof PauseNowSignal],
+      ["disk stop", (ch) => ch.requestDiskStop(), (r) => r instanceof PauseNowSignal],
+    ];
+    for (const [name, act, matches] of cases) {
+      const { ch } = make();
+      ch.tripCredentialSwitch(GEN, "op-1");
+      ch.settleCredentialSwitch("op-1", "gave_up"); // the controller stays spent by op-1's signal
+      assert.equal(ch.cancelSignal().aborted, true, `${name}: precondition, the controller is still spent`);
+      ch.tripCredentialSwitch(GEN, "op-2"); // no new abort: it is already spent
+      act(ch);
+      ch.settleCredentialSwitch("op-2", "applied");
+      assert.equal(ch.cancelSignal().aborted, true, `${name}: the stop must abort the fresh signal`);
+      assert.ok(matches(ch.cancelSignal().reason), `${name}: reason ${String(ch.cancelSignal().reason)}`);
+    }
+  });
+
   it("a throwing replacement listener skips neither the re-arm nor later listeners", () => {
     const { ch } = make();
     ch.tripCredentialSwitch(GEN, "op-1");

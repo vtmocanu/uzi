@@ -96,6 +96,19 @@ describe("applyCredentialSwitch classification", () => {
     });
   }
 
+  it("trims the applied token once, so every sink sees the value the env gets, and checks the length after trimming", async () => {
+    const padded = json(200, { outcome: "applied", token: `  ${SECRET}\n`, ordinal: 1, message_seq: 5, replay: false });
+    const shortPadded = json(200, { outcome: "applied", token: "  short  ", ordinal: 1, message_seq: 5, replay: false });
+    for (const [reply, want] of [[padded, "applied"], [shortPadded, "uncertain"]] as const) {
+      const s = await server(() => reply);
+      try {
+        const got = await (await registered(s.url)).applyCredentialSwitch("run-1", REQ);
+        assert.equal(got.kind, want);
+        if (got.kind === "applied") assert.equal(got.token, SECRET);
+      } finally { await s.close(); }
+    }
+  });
+
   it("sends the documented request body to the documented path", async () => {
     const s = await server(() => json(200, { outcome: "superseded" }));
     try {
