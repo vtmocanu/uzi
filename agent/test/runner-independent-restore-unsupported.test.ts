@@ -68,8 +68,14 @@ function assertHeld(r: Rig, seen: { flight?: FlightView }, unsupported: string):
   assert.equal(logged(r, "restore unsupported predecessor hold unconfirmed").length, 0);
   assert.equal(guidance(r).length, 1, "one guidance line");
   assert.ok(guidance(r)[0]!.includes(`(${unsupported})`));
-  assert.ok(!guidance(r)[0]!.includes("admission-counted"), "no stale admission-counted wording");
-  assert.ok(guidance(r)[0]!.includes("custody hold limit"), "names the custody hold limit");
+  const g = guidance(r)[0]!;
+  assert.ok(!g.includes("admission-counted"), "no stale admission-counted wording");
+  assert.ok(g.includes("below the custody hold limit;"), "claims only while below the custody hold limit");
+  assert.ok(g.includes("opens at least one more hold") && !g.includes("opens another hold"), "a claimed Resume opens at least one more hold");
+  assert.ok(g.includes("holds from one original worker count as one admission unit toward the owner limit, but each stays open"),
+    "units clause");
+  assert.ok(g.includes("At the limit, Resume creates no claim and no hold."), "at the bound Resume creates no claim or hold");
+  assert.ok(!g.includes("unless"), "no remediation-style condition attached to the bound");
   assert.ok(guidance(r)[0]!.length < 1200 && !guidance(r)[0]!.endsWith("..."), "bounded, not truncated");
   assert.equal(itemSevenLines(r).filter(t => !t.includes(GUIDANCE)).length, 0, "no item-7 line after a confirmed park");
   assert.equal(seen.flight?.parked, true, "the flight records the confirmed park");
