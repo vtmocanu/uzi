@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -70,7 +71,11 @@ func TestPromoteRecoveryWaitNowMirrorsSweepPass(t *testing.T) {
 	// The early promote carries the common set plus the owner-driven streak reset, in the helper's
 	// sorted order.
 	ownerStreakReset := []string{"provider_park_count", "provider_park_streak_started_at"}
-	wantNow := append(append([]string{}, want...), ownerStreakReset...)
+	// The early promote ALSO carries claim_released_at, but only as the cause-scoped CASE asserted
+	// below (anthropic_spend_limit stamps now(), mirroring ResumeAnthropicSpendLimitHold so the old
+	// claim is fenced against a delayed old-generation failed report; every other cause keeps it).
+	const spendClaimFence = "claim_released_at"
+	wantNow := append(append(append([]string{}, want...), ownerStreakReset...), spendClaimFence)
 	sort.Strings(wantNow)
 	if !reflect.DeepEqual(now, wantNow) {
 		t.Fatalf("PromoteRecoveryWaitRunNow mutates %v, want exactly %v", now, wantNow)
@@ -81,7 +86,7 @@ func TestPromoteRecoveryWaitNowMirrorsSweepPass(t *testing.T) {
 	// Everything but the owner-driven streak reset must stay identical across the two paths.
 	nowCommon := make([]string, 0, len(now))
 	for _, c := range now {
-		if !slices.Contains(ownerStreakReset, c) {
+		if !slices.Contains(ownerStreakReset, c) && c != spendClaimFence {
 			nowCommon = append(nowCommon, c)
 		}
 	}
@@ -102,9 +107,21 @@ func TestPromoteRecoveryWaitNowMirrorsSweepPass(t *testing.T) {
 		mutated[c] = true
 	}
 	for _, c := range preserved {
+		// claim_released_at is allowed ONLY in PromoteRecoveryWaitRunNow and only as the exact
+		// cause-scoped CASE pinned below; the sweep and unlock passes must still preserve it.
+		if c == spendClaimFence && slices.Contains(now, c) &&
+			!slices.Contains(sweep, c) && !slices.Contains(unlock, c) {
+			continue
+		}
 		if mutated[c] {
 			t.Errorf("PromoteRecoveryWaitRunNow mutates %q, but it MUST be preserved (early promote must leave worker/session affinity and the recovery cadence intact)", c)
 		}
+	}
+	nowBlock := string(raw)
+	nowBlock = nowBlock[strings.Index(nowBlock, "-- name: PromoteRecoveryWaitRunNow"):]
+	const wantCase = "claim_released_at = CASE WHEN runs.recovery_wait_cause = 'anthropic_spend_limit' THEN now() ELSE runs.claim_released_at END"
+	if !strings.Contains(nowBlock, wantCase) {
+		t.Errorf("PromoteRecoveryWaitRunNow must set %q (cause-scoped fence, mirrors ResumeAnthropicSpendLimitHold)", wantCase)
 	}
 	// The automatic promotions preserve the provider-park streak: only the owner's early promote
 	// clears it.

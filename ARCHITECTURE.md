@@ -1717,6 +1717,8 @@ chain in the diagram above, with no intervening `running`.
   recovery journal and inventory schemas. It grants no custody or deletion authority.
   After timer promotion or owner Resume, existing proof-based release rules
   apply again; execution-claim release alone never permits source deletion.
+  An Anthropic spend-limit hold (`anthropic_spend_limit`, NULL retry) is owner-held
+  the same way as a NULL-retry `data_volume_full` hold: a worker's final proof does not release its custody.
   Archive availability remains independent of attention and does not release
   these causes' custody; other classifier decisions remain unchanged.
   See [ADR-2445](adr/2445-custody-admission-accounting.md),
