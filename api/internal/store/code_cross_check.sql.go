@@ -410,7 +410,7 @@ WITH expired AS (
  AND cc.outcome = 'pending' AND cc.deadline_at <= now()
  RETURNING cc.id, cc.lead_run_id, cc.stage, cc.round, cc.lead_claim_generation, cc.plan_md, cc.milestones, cc.required_capabilities, cc.required_tools, cc.size_class, cc.base_commit, cc.planning_diff, cc.candidate_digest, cc.checker_run_id, cc.checker_harness, cc.checker_model, cc.checker_effort, cc.verdict, cc.reason_class, cc.findings, cc.decided_at, cc.deadline_at, cc.created_at, cc.checker_model_source, cc.checker_effort_source, cc.automatic_revision_limit, cc.automatic_rounds_enabled, cc.interrupted_at, cc.wait_credited, cc.head_commit, cc.outcome, cc.code_context, cc.guidance_snapshot, cc.guidance_text, cc.guidance_digest, cc.repo_instructions_enabled, cc.repo_instructions_text, cc.repo_instructions_digest, cc.dispositions, cc.finalized_at, cc.repo_instructions_commit, cc.coverage
 ), cancelled AS (
- UPDATE runs child SET status = 'cancelled', finished_at = now(), updated_at = now(),
+ UPDATE runs child SET status = 'cancelled', status_since = now(), finished_at = now(), updated_at = now(),
  claim_released_at = now() FROM expired cc WHERE child.id = cc.checker_run_id
  AND child.status NOT IN ('completed','failed','cancelled')
 )
