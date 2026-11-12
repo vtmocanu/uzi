@@ -3849,7 +3849,8 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   without an automatic timer. Retained-source budget exhaustion can use cause
   `retained_recovery_exhausted`: three timed retries by default, then an owner
   hold with no countdown. An integrity refusal uses `retained_recovery_adoption_failed`,
-  requiring owner Resume or Cancel with no automatic retry; it also holds a run whose
+  requiring owner Resume or Cancel with no automatic retry (Resume is refused on the
+  `secret_remediation_active` detail); it also holds a run whose
   predecessor an independent restore does not support (canonical, hosted or no boundary
   record), where no adoption was attempted. A retained continuation
   whose departure was never witnessed uses the server-only cause
@@ -3972,7 +3973,7 @@ hold presentation and remedies are unchanged. See
 account hold waits for its account. `anthropic_spend_limit` has no timer and needs owner Resume, Switch token or Cancel. `codex_idle_stall`, `data_volume_full` and
 `retained_recovery_exhausted` retry when their timestamp is finite (even if due);
 explicit NULL instead needs owner Resume/Cancel, and omitted timing is unknown. `retained_recovery_adoption_failed` requires
-owner Resume/Cancel regardless of retry timing, including when it holds an unsupported restore predecessor. `pool_wait` instead clears only when a token is
+owner Resume/Cancel regardless of retry timing, including when it holds an unsupported restore predecessor. On the `secret_remediation_active` detail Resume is refused (409); export or operator recovery, then Cancel. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -4219,7 +4220,7 @@ for renewal bounds, storage risks and rollout requirements.
 a predecessor needs secret-scan remediation review, or this release does not support
 the predecessor for independent restore. The agent did not start. Local work and custody are
 preserved; the run is owner-held with no automatic retry, regardless of a
-displayed retry timestamp. In the remediation case, Resume holds again unless
+displayed retry timestamp. In the #4058 predecessor-remediation case, Resume holds again unless
 that remediation was resolved through a separately authorized route. The same cause
 also holds a run whose predecessor an independent restore does not support (canonical,
 hosted or no boundary record, when the earlier checks pass): the worker refused before
@@ -4230,10 +4231,29 @@ you cancel or discard it
 
 Read `uzi run recovery <id>` and export an available archive before deciding.
 Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,
-or `uzi run cancel <id>` to end the run. Resume preserves remaining wall time
+or `uzi run cancel <id>` to end the run, except on the active detail below. Resume preserves remaining wall time
 and may need `uzi run extend` first. It does not guarantee success: repeated
 adoption failure holds again. An earlier archive may omit latest local work.
 Timers, token changes and credential changes do not release this hold.
+
+The run's `recovery_wait_detail` (shown by `uzi run get --json`) can qualify the hold:
+
+- `secret_remediation_active`: the retained source still descends from a
+  secret-scan-flagged commit, so retrying unchanged cannot help. `uzi run get`, `list`,
+  `wait`, `inputs` and the TUI board and detail never offer Resume. They show both
+  routes, then Cancel: export an available archive (`uzi run export <id> --output <path>`,
+  which may omit later work kept on the worker; an archive is not proven to hold the
+  latest work), or an operator recovers the retained work from worker storage
+  ([Run recovery](run-recovery.md#retained-source-failure-and-local-proof)). `uzi run resume` and
+  `resume-now` return 409 before any write (no claim, generation, audit row or custody
+  release): "The retained source is held under an active secret-scan remediation; Resume
+  cannot succeed unchanged. An available recovery archive (`uzi run export <id>`) may
+  omit later work kept on the worker; an operator can recover the retained work from
+  worker storage. Cancel ends the run."
+- `remediation_proof_unknown`: the proof could not be verified, so a retry may help;
+  the output says so and Resume stays available.
+- absent: unclassified; the generic guidance above applies. The #4058 and #3644 holds
+  stay unclassified.
 
 Default wait and log follow stop for this owner decision, and the TUI marks
 NEEDS YOU. Explicit `--until` keeps its selected status set. See

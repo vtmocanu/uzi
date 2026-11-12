@@ -465,7 +465,8 @@ uzi version
   retained-source budget exhaustion, `retained_recovery_exhausted`, with three
   timed retries by default followed by an owner hold (NULL retry) — or
   an integrity refusal, `retained_recovery_adoption_failed`, owner Resume/Cancel
-  with no automatic retry regardless of retry timing — or an unwitnessed
+  with no automatic retry regardless of retry timing (on `recovery_wait_detail`
+  `secret_remediation_active` Resume is refused, 409) — or an unwitnessed
   retained-custody continuation, `retained_continuation_unwitnessed` (server-only; claim
   released, work and custody kept), owner Resume/Cancel only, no automatic retry, not an
   integrity refusal — or
@@ -536,7 +537,8 @@ uzi version
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
   `worker_requeue_exhausted`, `worker_memory_pressure`,
-  `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, `anthropic_spend_limit`
+  `retained_recovery_adoption_failed` (Resume refused on detail `secret_remediation_active`),
+  `retained_continuation_unwitnessed`, `anthropic_spend_limit`
   (spend-limit owner hold: Resume, `uzi run set-token` or Cancel), owner-held
   `retained_recovery_exhausted` (NULL retry), or a paused credential-switch hold (`credential_switch_settling` /
   `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
@@ -905,7 +907,11 @@ uzi version
   local work and custody are preserved, with no automatic retry regardless of
   retry timing. Read `uzi run recovery <id>` and export an available archive
   before owner Resume/Cancel. Resume requests another bounded attempt; success
-  is not assured and repeated adoption failure holds again. An unwitnessed continuation
+  is not assured and repeated adoption failure holds again. If `recovery_wait_detail` is
+  `secret_remediation_active` (source descends from a secret-scan-flagged commit), Resume and
+  `resume-now` return 409 and the CLI never offers them: export an available archive
+  (`uzi run export <id> --output <path>`; it may omit later work) or have an operator recover
+  from worker storage, then Cancel. `remediation_proof_unknown` means a retry may help. An unwitnessed continuation
   (`recovery_wait` / `retained_continuation_unwitnessed`, not an integrity refusal) is the
   same owner decision: claim released, work and custody kept, no automatic retry; export
   an available archive, then Resume or Cancel. Without a new owner

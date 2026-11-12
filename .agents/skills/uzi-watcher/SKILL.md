@@ -212,7 +212,10 @@ park of that cause retries itself and keeps polling. An integrity refusal,
 `STOP=recovery_wait:retained_recovery_adoption_failed`) regardless of retry timing:
 local work and custody are preserved, with no automatic retry. Back up available
 work, then ask the owner to Resume or Cancel; Resume requests a bounded attempt,
-not assured success, and another adoption failure holds again. A server-only
+not assured success, and another adoption failure holds again. With `recovery_wait_detail`
+`secret_remediation_active` Resume is refused (409): never Resume; export an available
+archive (may omit later work) or `scripts/backup-runs.sh`, then Cancel. `remediation_proof_unknown`:
+a retry may help. A server-only
 `retained_continuation_unwitnessed` park (claimed flight never witnessed starting;
 claim released, work and custody preserved, no automatic retry; not an integrity
 refusal) stops the same way (`STOP=recovery_wait:retained_continuation_unwitnessed`)
