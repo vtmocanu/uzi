@@ -112,11 +112,14 @@ Each user's saved Anthropic token is then their key for that gateway.
   each Claude Code alias. An empty field sends the alias as Claude Code resolves it.
 
 While a gateway is set, **Test** on a token sends one tiny request to the gateway:
-the gateway accepting the key reads as OK, a 401 or 403 as rejected, anything
-else as inconclusive. The usage poller pauses, because a gateway exposes no
+the gateway accepting the key reads as OK, a 401 as rejected, anything else
+(including a 403, often a per-key model rule) as inconclusive. The usage poller pauses, because a gateway exposes no
 Anthropic subscription windows; tokens then show no usage meter, and automatic
 token selection falls back as it does with the poller off. Workers pick a change
-up on their next heartbeat.
+up on their next heartbeat. Turn the gateway on before users save gateway keys:
+a key tested or polled against Anthropic first is marked rejected until its owner
+presses **Test** again. A saved gateway whose URL the operator no longer allows is
+blocked: Claude runs fail rather than send gateway keys to Anthropic.
 
 ## Run judge
 

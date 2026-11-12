@@ -226,13 +226,14 @@ An admin can route every Claude call through an Anthropic-compatible gateway (Li
 
 | Var | Default | Notes |
 |---|---|---|
-| `ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated hosts the gateway URL may name; every entry must be an absolute `https://` URL or boot fails. Empty allows none, so the feature stays off whatever an admin saves. Checked on save and at every use: removing a host stops workers, token tests and the poller from using it at once. |
+| `ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated `https://` URLs the gateway URL must equal or sit under (on a path-segment boundary). Keep the path on a shared gateway host, where the account lives in the path (for example a Cloudflare AI Gateway account), or an admin could pick any account on that host. A malformed or non-https entry fails boot; empty allows none. Checked on save and at every use: a saved gateway whose URL is no longer allowed is **blocked**, not off, so workers, token tests and the poller never send the saved gateway keys to Anthropic until it is allowlisted again or cleared. |
 
 What else a deployment needs:
 
 - **Worker egress.** Restricted-tier workers reach only `workers.fqdnEgress.allowFQDNs`; add the gateway host there. The isolated research lane's single `workers.isolatedLane.modelHost` must name the gateway host for lane runs to work.
 - **A private CA.** Workers trust an extra CA through `workers.extraCA`. The api verifies the gateway for token tests with Go's system roots, so a private-CA gateway also needs that CA in the api container's trust (for example `SSL_CERT_DIR`).
 - **Model names.** Claude Code resolves the `opus`, `sonnet`, `haiku` and `fable` aliases through the map; a concrete model id uzi or a repo pins is sent unchanged, so the gateway must route it.
+- **Redirects.** The token test never follows a redirect. The Claude CLI does, so with `x-api-key` the gateway must not redirect to another host.
 
 ## CI status integration (PRD #6)
 

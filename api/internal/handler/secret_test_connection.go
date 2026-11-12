@@ -161,6 +161,11 @@ func (h *Handler) testAnthropicSecret(ctx context.Context, userID, id uuid.UUID,
 	if err != nil {
 		return secretTestResult{Status: "inconclusive", Reason: "generic"}
 	}
+	if h.anthropicGatewayBlocked(ctx) {
+		// The token is a key for a gateway that cannot be used right now; Anthropic would
+		// refuse it and mark it rejected.
+		return secretTestResult{Status: "inconclusive", Reason: "generic"}
+	}
 	if gw := h.anthropicGateway(ctx); gw != nil {
 		// Behind a gateway the token is the gateway's key: api.anthropic.com would refuse
 		// it and mark it rejected. Ask the gateway instead.
@@ -202,17 +207,17 @@ func testAnthropicOutcome(ctx context.Context, client anthropicTester, plain []b
 }
 
 // testGatewayOutcome probes the gateway with the key. A 2xx clears any rejection (a
-// gateway has no subscription windows, so there is no gauge); 401/403 is the gateway
-// refusing the key; anything else (a 404 for an unknown model, a 5xx, a redirect, a
-// transport error) proves nothing about the key and is inconclusive.
+// gateway has no subscription windows, so there is no gauge); 401 is the gateway refusing
+// the key. Anything else proves nothing about the key and is inconclusive: a 403 is often
+// a per-key model restriction on the probe model, a 404 an unknown model, then a 5xx, a
+// redirect or a transport error.
 func testGatewayOutcome(ctx context.Context, client anthropicTester, gw anthropic.Gateway, plain []byte, clear, reject func() secretTestResult) secretTestResult {
 	err := client.GatewayProbe(ctx, gw, plain)
 	if err == nil {
 		return clear()
 	}
 	var providerErr *anthropic.Error
-	if errors.As(err, &providerErr) && providerErr.Kind == anthropic.KindHTTP &&
-		(providerErr.Status == http.StatusUnauthorized || providerErr.Status == http.StatusForbidden) {
+	if errors.As(err, &providerErr) && providerErr.Kind == anthropic.KindHTTP && providerErr.Status == http.StatusUnauthorized {
 		return reject()
 	}
 	return secretTestResult{Status: "inconclusive", Reason: "generic"}

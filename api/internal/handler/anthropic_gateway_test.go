@@ -35,11 +35,12 @@ func TestAnthropicGatewayWireFollowsSettingAndAllowlist(t *testing.T) {
 		got.Models["opus"] != "gw-opus" || got.Models["haiku"] != "gw-haiku" {
 		t.Fatalf("wire = %+v, want the configured gateway", got)
 	}
-	if w := gatewayHandler(nil, rows...).anthropicGatewayWire(context.Background()); w != nil {
-		t.Fatalf("empty allowlist: wire = %+v, want nil", w)
+	// Configured but unusable is BLOCKED, never off: the tokens are gateway keys.
+	if w := gatewayHandler(nil, rows...).anthropicGatewayWire(context.Background()); w == nil || !w.Blocked || w.BaseURL != "" {
+		t.Fatalf("empty allowlist: wire = %+v, want blocked", w)
 	}
-	if w := gatewayHandler([]string{"https://other.example.com"}, rows...).anthropicGatewayWire(context.Background()); w != nil {
-		t.Fatalf("host not allowlisted: wire = %+v, want nil", w)
+	if w := gatewayHandler([]string{"https://other.example.com"}, rows...).anthropicGatewayWire(context.Background()); w == nil || !w.Blocked {
+		t.Fatalf("host not allowlisted: wire = %+v, want blocked", w)
 	}
 	if w := gatewayHandler([]string{"https://gw.example.com"}).anthropicGatewayWire(context.Background()); w != nil {
 		t.Fatalf("no gateway configured: wire = %+v, want nil", w)
@@ -83,7 +84,7 @@ func TestGatewayOutcome(t *testing.T) {
 	}{
 		{"accepted", nil, "cleared"},
 		{"unauthorized", &anthropic.Error{Kind: anthropic.KindHTTP, Status: 401}, "rejected"},
-		{"forbidden", &anthropic.Error{Kind: anthropic.KindHTTP, Status: 403}, "rejected"},
+		{"forbidden: often a per-key model rule", &anthropic.Error{Kind: anthropic.KindHTTP, Status: 403}, "inconclusive"},
 		{"unknown model", &anthropic.Error{Kind: anthropic.KindHTTP, Status: 404}, "inconclusive"},
 		{"redirect", &anthropic.Error{Kind: anthropic.KindHTTP, Status: 307}, "inconclusive"},
 		{"transport", &anthropic.Error{Kind: anthropic.KindTransport}, "inconclusive"},

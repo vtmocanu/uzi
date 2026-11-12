@@ -9,6 +9,10 @@
 // exactly as before.
 
 export interface AnthropicGateway {
+  /** A gateway is configured but unusable (not allowlisted, invalid, or a wire this worker
+   *  cannot read). The CLI is then pointed at BLOCKED_BASE_URL so the saved token, a gateway
+   *  key, fails closed instead of reaching api.anthropic.com. */
+  blocked?: true;
   baseUrl: string;
   /** "authorization" (Bearer, ANTHROPIC_AUTH_TOKEN) or "x-api-key" (ANTHROPIC_API_KEY). */
   authHeader: "authorization" | "x-api-key";
@@ -20,22 +24,36 @@ export interface AnthropicGateway {
 export const GATEWAY_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
 type GatewayAlias = (typeof GATEWAY_ALIASES)[number];
 
+/** An unresolvable host (RFC 6761 .invalid): the CLI's calls fail at DNS, so no token leaves. */
+export const BLOCKED_BASE_URL = "https://anthropic-gateway-blocked.invalid";
+const BLOCKED: AnthropicGateway = { blocked: true, baseUrl: BLOCKED_BASE_URL, authHeader: "authorization", models: {} };
+
+/** The one model-name rule, shared verbatim with the api (settings_gateway.go) and the
+ *  admin card, so a value the api stores is never one this worker refuses. */
+const MODEL_RE = /^[A-Za-z0-9._:/@-]{1,200}$/;
+
 let current: AnthropicGateway | undefined;
 
 export function anthropicGateway(): AnthropicGateway | undefined {
   return current;
 }
 
-/** Replace the gateway from a register/heartbeat field. null, absent or malformed clears
- *  it: the worker then talks to Anthropic directly, as an api without the feature means. */
+/** Replace the gateway from a register/heartbeat field. null or absent clears it (no
+ *  gateway configured, or an api without the feature): the CLI talks to Anthropic. A
+ *  blocked or unreadable field blocks: a gateway exists, so the token is its key. */
 export function setAnthropicGatewayFromWire(wire: unknown): void {
   current = decodeAnthropicGateway(wire);
 }
 
 export function decodeAnthropicGateway(wire: unknown): AnthropicGateway | undefined {
+  if (wire === null || wire === undefined) return undefined;
+  return decodeConfigured(wire) ?? BLOCKED;
+}
+
+function decodeConfigured(wire: unknown): AnthropicGateway | undefined {
   if (typeof wire !== "object" || wire === null) return undefined;
-  const w = wire as { base_url?: unknown; auth_header?: unknown; models?: unknown };
-  if (typeof w.base_url !== "string") return undefined;
+  const w = wire as { base_url?: unknown; auth_header?: unknown; models?: unknown; blocked?: unknown };
+  if (w.blocked === true || typeof w.base_url !== "string") return undefined;
   let url: URL;
   try {
     url = new URL(w.base_url);
@@ -49,7 +67,7 @@ export function decodeAnthropicGateway(wire: unknown): AnthropicGateway | undefi
   if (w.models !== undefined && w.models !== null) {
     if (typeof w.models !== "object") return undefined;
     for (const [alias, model] of Object.entries(w.models as Record<string, unknown>)) {
-      if (!(GATEWAY_ALIASES as readonly string[]).includes(alias) || typeof model !== "string" || !/^[^\s=,]{1,200}$/.test(model)) return undefined;
+      if (!(GATEWAY_ALIASES as readonly string[]).includes(alias) || typeof model !== "string" || !MODEL_RE.test(model)) return undefined;
       models[alias as GatewayAlias] = model;
     }
   }

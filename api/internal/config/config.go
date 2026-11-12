@@ -1001,7 +1001,7 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.AgentSourceAllowedBaseURLs = agentSourceAllowed
-	gatewayAllowed, err := parseBaseURLAllowlist("ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS", getenv("ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS", ""))
+	gatewayAllowed, err := parseGatewayAllowlist(getenv("ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS", ""))
 	if err != nil {
 		return Config{}, err
 	}
@@ -2255,15 +2255,53 @@ func (c Config) AgentSourceBaseURLAllowed(raw string) bool {
 	return false
 }
 
-// AnthropicGatewayBaseURLAllowed reports whether raw's scheme+host is in
-// AnthropicGatewayAllowedBaseURLs; false when that list is empty. A path on raw is
-// allowed (gateways may serve the API under one); the host is what the list pins.
+// parseGatewayAllowlist parses ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS. Unlike the other
+// allowlists an entry KEEPS its path: on a shared gateway host (Cloudflare AI Gateway,
+// Portkey's cloud) the account lives in the path, and pinning only the host would let
+// an admin route every user's key to any account there. Each entry is
+// https://host[:port][/path], normalized (lowercase host, no trailing slash); a
+// malformed or non-https entry is a boot error; empty allows nothing.
+func parseGatewayAllowlist(raw string) ([]string, error) {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		norm, err := normalizeGatewayURL(part)
+		if err != nil {
+			return nil, fmt.Errorf("ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS: %w", err)
+		}
+		if !slices.Contains(out, norm) {
+			out = append(out, norm)
+		}
+	}
+	return out, nil
+}
+
+func normalizeGatewayURL(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("%q must be an https URL with no credentials, query or fragment", raw)
+	}
+	return "https://" + strings.ToLower(u.Host) + strings.TrimRight(u.EscapedPath(), "/"), nil
+}
+
+// AnthropicGatewayBaseURLAllowed reports whether raw is an allowlisted entry or lies
+// under one on a path-segment boundary (an entry https://gw.example.com/acct admits
+// https://gw.example.com/acct and https://gw.example.com/acct/anthropic, not
+// https://gw.example.com/acct2). False when the list is empty.
 func (c Config) AnthropicGatewayBaseURLAllowed(raw string) bool {
-	norm, err := NormalizeForgeBaseURL(raw)
+	norm, err := normalizeGatewayURL(raw)
 	if err != nil {
 		return false
 	}
-	return slices.Contains(c.AnthropicGatewayAllowedBaseURLs, norm)
+	for _, a := range c.AnthropicGatewayAllowedBaseURLs {
+		if norm == a || strings.HasPrefix(norm, a+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // IssueTrackerBaseURLAllowed reports whether raw normalizes to an allowlisted issue tracker base

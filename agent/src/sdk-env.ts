@@ -80,7 +80,8 @@ export interface SdkAttemptEnv {
  *  provision.ts's explicit allowlist (PATH override + NIX_SSL_CERT_FILE /
  *  LOCALE_ARCHIVE) — never a blind merge of devbox's shellenv. */
 export interface SdkEnv {
-  CLAUDE_CODE_OAUTH_TOKEN: string;
+  /** The token; undefined behind a gateway, where ANTHROPIC_AUTH_TOKEN / _API_KEY carry it. */
+  CLAUDE_CODE_OAUTH_TOKEN: string | undefined;
   HOME: string;
   PATH: string | undefined;
   /** undefined, except behind an x-api-key gateway, where it carries the token. */
@@ -183,12 +184,16 @@ export function buildSdkEnv(
   // (and protected above) so a provisioned var can neither redirect nor drop it.
   Object.assign(env, BROWSER_DISCOVERY_ENV);
   // An admin-configured Anthropic-compatible gateway: the saved token is that gateway's
-  // key. ANTHROPIC_AUTH_TOKEN (Bearer) or ANTHROPIC_API_KEY (x-api-key) outranks
-  // CLAUDE_CODE_OAUTH_TOKEN in Claude Code's auth precedence, and all three hold the same
-  // value, so whichever the CLI picks, only this token reaches only this host. Set AFTER
-  // the fold, and every key is protected above.
+  // key, sent as ANTHROPIC_AUTH_TOKEN (Bearer) or ANTHROPIC_API_KEY (x-api-key). A blocked
+  // gateway points at an unresolvable host, so the key fails closed. Set AFTER the fold,
+  // and every key is protected above.
   const gateway = anthropicGateway();
   if (gateway) {
+    // The OAuth variable goes: the token is a gateway key, and no CLI path may send it to
+    // an OAuth-only api.anthropic.com endpoint. Nonessential traffic (telemetry, update
+    // checks) is off too: a gateway deployment routes model calls, nothing else.
+    env.CLAUDE_CODE_OAUTH_TOKEN = undefined;
+    env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
     env.ANTHROPIC_BASE_URL = gateway.baseUrl;
     if (gateway.authHeader === "x-api-key") env.ANTHROPIC_API_KEY = oauthToken;
     else env.ANTHROPIC_AUTH_TOKEN = oauthToken;

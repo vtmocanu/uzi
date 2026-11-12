@@ -66,14 +66,25 @@ func TestAgentSourceBaseURLAllowed(t *testing.T) {
 }
 
 func TestAnthropicGatewayBaseURLAllowed(t *testing.T) {
-	c := Config{AnthropicGatewayAllowedBaseURLs: []string{"https://gw.example.com"}}
-	if !c.AnthropicGatewayBaseURLAllowed("https://GW.example.com/anthropic") {
-		t.Error("allowlisted host with a path refused")
+	c := Config{AnthropicGatewayAllowedBaseURLs: []string{"https://gw.example.com", "https://shared.example.com/v1/acct"}}
+	for _, ok := range []string{"https://GW.example.com/anthropic", "https://shared.example.com/v1/acct", "https://shared.example.com/v1/acct/gw/anthropic/"} {
+		if !c.AnthropicGatewayBaseURLAllowed(ok) {
+			t.Errorf("%q refused", ok)
+		}
 	}
-	if c.AnthropicGatewayBaseURLAllowed("https://evil.example.com") || c.AnthropicGatewayBaseURLAllowed("http://gw.example.com") {
-		t.Error("non-allowlisted or plain-http URL accepted")
+	for _, bad := range []string{"https://evil.example.com", "http://gw.example.com", "https://shared.example.com/v1/acct2",
+		"https://shared.example.com/v1", "https://shared.example.com"} {
+		if c.AnthropicGatewayBaseURLAllowed(bad) {
+			t.Errorf("%q allowed", bad)
+		}
 	}
 	if (Config{}).AnthropicGatewayBaseURLAllowed("https://gw.example.com") {
 		t.Error("an empty allowlist allowed a gateway")
+	}
+	if _, err := parseGatewayAllowlist("https://gw.example.com/acct/, http://x.example.com"); err == nil {
+		t.Error("a plain-http entry was accepted")
+	}
+	if got, err := parseGatewayAllowlist("https://GW.example.com/acct/"); err != nil || len(got) != 1 || got[0] != "https://gw.example.com/acct" {
+		t.Errorf("parse = %v, %v", got, err)
 	}
 }

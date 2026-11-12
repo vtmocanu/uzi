@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -16,6 +17,12 @@ import (
 // maxGatewayModelLen bounds one mapped model name; gateway model names are short
 // identifiers, so this only catches a pasted blob.
 const maxGatewayModelLen = 200
+
+// gatewayModelRE is the one model-name rule, shared verbatim by the worker decoder
+// (agent/src/anthropic-gateway.ts) and the admin card, so a value the api stores is
+// never one the worker refuses. It covers provider-prefixed and versioned names
+// (anthropic/claude-x, claude-x@20250101, bedrock/anthropic.claude-x:0).
+var gatewayModelRE = regexp.MustCompile(`^[A-Za-z0-9._:/@-]{1,200}$`)
 
 // AnthropicGateway returns the configured gateway, and false when the base URL is
 // empty (the feature is off). It does NOT check the operator allowlist: settings
@@ -36,6 +43,15 @@ func (c *Cache) AnthropicGateway(ctx context.Context) (anthropic.Gateway, bool, 
 		return anthropic.Gateway{}, false, nil
 	}
 	return anthropic.Gateway{BaseURL: base, AuthHeader: header, Models: models}, true, nil
+}
+
+// AnthropicGatewayConfigured reports whether an admin saved a gateway URL at all, valid
+// or not. A configured gateway that cannot be used (invalid, or its host no longer
+// allowlisted) is BLOCKED, not off: the saved tokens are gateway keys, so nothing may
+// send them to api.anthropic.com.
+func (c *Cache) AnthropicGatewayConfigured(ctx context.Context) bool {
+	base, _ := c.get(ctx, KeyAnthropicGatewayBaseURL)
+	return base != ""
 }
 
 // validateGatewayBaseURL: empty is off; otherwise an absolute https URL with no
@@ -88,8 +104,8 @@ func ParseGatewayModels(raw string) (map[string]string, error) {
 		if _, dup := out[alias]; dup {
 			return nil, fmt.Errorf("alias %q is mapped twice", alias)
 		}
-		if len(model) > maxGatewayModelLen || strings.ContainsAny(model, " \t\r\n=,") {
-			return nil, fmt.Errorf("model %q for %q must be a single name of at most %d characters", model, alias, maxGatewayModelLen)
+		if !gatewayModelRE.MatchString(model) {
+			return nil, fmt.Errorf("model %q for %q must be 1-%d characters of letters, digits and . _ : / @ -", model, alias, maxGatewayModelLen)
 		}
 		out[alias] = model
 	}

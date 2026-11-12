@@ -4,6 +4,9 @@ import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle, Select } from "../../components/ui";
 
 const ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
+// The one model-name rule, shared verbatim with the api (settings_gateway.go), the worker
+// (anthropic-gateway.ts) and the mock api.
+const GATEWAY_MODEL_RE = /^[A-Za-z0-9._:/@-]{1,200}$/;
 type Alias = (typeof ALIASES)[number];
 
 // Mirrors ParseGatewayModels in settings_gateway.go (the API rechecks every write).
@@ -36,7 +39,7 @@ function urlError(value: string): string | null {
 function modelError(models: Record<Alias, string>): string | null {
   for (const a of ALIASES) {
     const m = models[a].trim();
-    if (m !== "" && !/^[^\s=,]{1,200}$/.test(m)) return `${a}: a single name without spaces, "=" or ","`;
+    if (m !== "" && !GATEWAY_MODEL_RE.test(m)) return `${a}: 1-200 characters of letters, digits and . _ : / @ -`;
   }
   return null;
 }
@@ -94,9 +97,10 @@ export function AnthropicGatewayCard({ settings, onSaved }: {
         <p id="anthropic-gateway-description" className="mt-2 text-sm text-muted">
           Route every Claude call through an Anthropic-compatible gateway, such as LiteLLM, Portkey or Cloudflare AI Gateway,
           instead of Anthropic directly. Each user&rsquo;s saved Anthropic token is then their key for that gateway.
-          The host must be in the operator&rsquo;s <code>ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS</code>. Token tests ask the
-          gateway, and usage meters pause, because a gateway has no Anthropic subscription windows. Leave the URL
-          empty to talk to Anthropic directly.
+          The URL must be in the operator&rsquo;s <code>ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS</code>. Token tests ask the
+          gateway, and usage meters pause, because a gateway has no Anthropic subscription windows. Turn it on before
+          users save gateway keys, or have them press Test afterwards. Leave the URL empty to talk to Anthropic
+          directly.
         </p>
       </div>
       {error && <Alert message={error} />}
