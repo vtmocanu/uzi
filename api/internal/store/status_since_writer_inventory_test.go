@@ -32,7 +32,7 @@ import (
 // writers such as the cross-check child cancels. It does NOT see a
 // Go caller that transitions status by some other means, nor a status write in a migration
 // data-fix — those are out of the query-file corpus by construction. The pairing it does
-// enforce is the one that the 23 shipping status writers all satisfy today.
+// enforce is the one that every shipping status writer satisfies today.
 func TestEveryStatusWriteStampsStatusSince(t *testing.T) {
 	const queryDir = "queries"
 	entries, err := os.ReadDir(queryDir)
@@ -133,7 +133,7 @@ func TestEveryStatusWriteStampsStatusSince(t *testing.T) {
 		t.Fatalf("scanned %d named queries in %s/ — the scan did not run, this result is meaningless", scanned, queryDir)
 	}
 	if len(statusWriters) < 20 {
-		t.Fatalf("found only %d statements that assign runs.status (%v) — expected at least 20 (there are 23); "+
+		t.Fatalf("found only %d statements that assign runs.status (%v) — expected at least 20 (there are far more); "+
 			"the matcher is not seeing the status writers, so its green would be vacuous", len(statusWriters), statusWriters)
 	}
 
