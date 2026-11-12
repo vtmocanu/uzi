@@ -235,6 +235,33 @@ describe("JudgePanel skip state (#3257 M2)", () => {
       }
     });
 
+    it("a Run judge click ends the settle poll; it does not re-arm afterwards", async () => {
+      vi.useFakeTimers();
+      try {
+        mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null, skip: null });
+        mockApi.rerunJudge.mockResolvedValue(undefined as never);
+        renderRun(new Date().toISOString());
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        fireEvent.click(screen.getByRole("button", { name: "Run judge" }));
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        const afterClick = mockApi.getRunReview.mock.calls.length;
+        // Step in 4s chunks so React re-runs effects between ticks (a re-arm needs that).
+        for (let i = 0; i < 12; i++) {
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(4000);
+          });
+        }
+        // Only the in-flight poll's single tick (its empty answer ends it); no settle re-arm.
+        expect(mockApi.getRunReview.mock.calls.length - afterClick).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("does not re-poll a run that finished long ago", async () => {
       vi.useFakeTimers();
       try {

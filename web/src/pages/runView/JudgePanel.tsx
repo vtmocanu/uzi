@@ -438,6 +438,9 @@ export function JudgePanel({
   const rerun = async () => {
     setActionErr("");
     setRerunning(true);
+    // A click ends any settle poll for good: the in-flight poll owns this episode, and
+    // leaving `settling` set would re-arm it once `queued` clears.
+    setSettling(false);
     try {
       await api.rerunJudge(run.id);
       // No baseline write here on purpose. It used to live here, and being the ONLY writer
