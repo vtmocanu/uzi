@@ -12,7 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #4205 M1 migration 427: Down keeps worker_hibernation_events, so Up must be
+// PRD #4205 M1 migrations 427/428: Down keeps worker_hibernation_events, so Up must be
 // re-entrant over it and must refuse a leftover whose shape drifted.
 
 func hibernationMigrationDB(t *testing.T) (context.Context, string, *pgxpool.Pool) {
@@ -40,7 +40,7 @@ func hibWorker(ctx context.Context, t *testing.T, pool *pgxpool.Pool) (owner, wo
 func TestWorkerHibernationMigrationLifecycleLiveDB(t *testing.T) {
 	ctx, dsn, pool := hibernationMigrationDB(t)
 	owner, worker := hibWorker(ctx, t, pool)
-	if err := store.MigrateTo(ctx, dsn, 427); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 428); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(ctx, t, pool, `INSERT INTO worker_hibernation_events(owner_id,worker_id,actor_id,actor_label,action,op_id,reason,occurred_at)
@@ -53,20 +53,27 @@ func TestWorkerHibernationMigrationLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("Down with a non-none worker: %v", err)
 	}
 	if applied, _, _, vErr := store.SchemaVersionStatus(ctx, pool); vErr != nil || applied != 427 {
-		t.Fatalf("refused Down moved the version: %d %v", applied, vErr)
+		// 428 (wake history) rolled back cleanly; 427 refused and stayed applied.
+		t.Fatalf("refused Down left version %d: %v", applied, vErr)
+	}
+	if err = store.MigrateTo(ctx, dsn, 428); err != nil {
+		t.Fatal(err)
 	}
 	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM workers WHERE hibernation_state='preparing'"); n != 1 {
 		t.Fatalf("refused Down changed the worker: %d", n)
 	}
 
-	// Down refuses while wake history exists.
+	// Down of 428 refuses while wake history exists, and changes nothing.
 	mustExec(ctx, t, pool, `UPDATE workers SET hibernation_state='none', hibernation_op_id=NULL WHERE id=$1`, worker)
 	run := uuid.New()
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,kind,issue_title,issue_description,status) VALUES($1,$2,'chat','t','d','queued')`, run, owner)
 	mustExec(ctx, t, pool, `INSERT INTO hibernation_wakes(run_id,worker_id,first_woken_at) VALUES($1,$2,now())`, run, worker)
-	err = store.MigrateDownTo(ctx, dsn, 426)
+	err = store.MigrateDownTo(ctx, dsn, 427)
 	if err == nil || !strings.Contains(err.Error(), "rollback refused") {
 		t.Fatalf("Down with wake history: %v", err)
+	}
+	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM hibernation_wakes"); n != 1 {
+		t.Fatalf("refused Down changed wake history: %d", n)
 	}
 	mustExec(ctx, t, pool, `DELETE FROM hibernation_wakes`)
 
@@ -86,7 +93,7 @@ func TestWorkerHibernationMigrationLifecycleLiveDB(t *testing.T) {
 	}
 
 	// Up again keeps the row.
-	if err = store.MigrateTo(ctx, dsn, 427); err != nil {
+	if err = store.MigrateTo(ctx, dsn, 428); err != nil {
 		t.Fatalf("re-Up over the leftover events table: %v", err)
 	}
 	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM worker_hibernation_events"); n != 1 {
@@ -95,11 +102,19 @@ func TestWorkerHibernationMigrationLifecycleLiveDB(t *testing.T) {
 }
 
 func TestWorkerHibernationMigrationLeftoverShapeLiveDB(t *testing.T) {
-	for name, mutate := range map[string]string{
-		"dropped column": `ALTER TABLE worker_hibernation_events DROP COLUMN op_id`,
-		"nullable":       `ALTER TABLE worker_hibernation_events ALTER COLUMN op_id DROP NOT NULL`,
-		"extra column":   `ALTER TABLE worker_hibernation_events ADD COLUMN extra text`,
-		"wrong type":     `ALTER TABLE worker_hibernation_events ALTER COLUMN reason TYPE varchar(10)`,
+	const tbl = "worker_hibernation_events"
+	for name, tc := range map[string]struct{ mutate, want string }{
+		"dropped column": {`ALTER TABLE ` + tbl + ` DROP COLUMN op_id`, "unexpected shape"},
+		"nullable":       {`ALTER TABLE ` + tbl + ` ALTER COLUMN op_id DROP NOT NULL`, "unexpected shape"},
+		"extra column":   {`ALTER TABLE ` + tbl + ` ADD COLUMN extra text`, "unexpected shape"},
+		"wrong type":     {`ALTER TABLE ` + tbl + ` ALTER COLUMN reason TYPE varchar(10)`, "unexpected shape"},
+		"widened action check": {`ALTER TABLE ` + tbl + ` DROP CONSTRAINT ` + tbl + `_action_check;
+			ALTER TABLE ` + tbl + ` ADD CONSTRAINT ` + tbl + `_action_check CHECK (action IN ('hibernate','wake','sleep'))`, "unexpected constraints"},
+		"loosened actor bound": {`ALTER TABLE ` + tbl + ` DROP CONSTRAINT ` + tbl + `_actor_label_check;
+			ALTER TABLE ` + tbl + ` ADD CONSTRAINT ` + tbl + `_actor_label_check CHECK (char_length(actor_label) >= 1)`, "unexpected constraints"},
+		"extra check": {`ALTER TABLE ` + tbl + ` ADD CONSTRAINT extra_check CHECK (true)`, "unexpected constraints"},
+		"redefined index": {`DROP INDEX ` + tbl + `_worker_time_idx;
+			CREATE INDEX ` + tbl + `_worker_time_idx ON ` + tbl + ` (worker_id)`, "is missing or wrong"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx, dsn, pool := hibernationMigrationDB(t)
@@ -109,13 +124,45 @@ func TestWorkerHibernationMigrationLeftoverShapeLiveDB(t *testing.T) {
 			if err := store.MigrateDownTo(ctx, dsn, 426); err != nil {
 				t.Fatal(err)
 			}
-			mustExec(ctx, t, pool, mutate)
+			mustExec(ctx, t, pool, tc.mutate)
 			err := store.MigrateTo(ctx, dsn, 427)
-			if err == nil || !strings.Contains(err.Error(), "unexpected shape") {
-				t.Fatalf("Up over a mutated leftover must fail on the shape check: %v", err)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Up over a mutated leftover must fail with %q: %v", tc.want, err)
 			}
 			if applied, _, _, vErr := store.SchemaVersionStatus(ctx, pool); vErr != nil || applied != 426 {
 				t.Fatalf("failed Up left version %d: %v", applied, vErr)
+			}
+		})
+	}
+}
+
+// A bound CHECK that is absent from the leftover table is restored by Up (unlike
+// one present with a different definition, which Up refuses).
+func TestWorkerHibernationMigrationRestoresBoundChecksLiveDB(t *testing.T) {
+	ctx, dsn, pool := hibernationMigrationDB(t)
+	if err := store.MigrateTo(ctx, dsn, 427); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MigrateDownTo(ctx, dsn, 426); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(ctx, t, pool, `ALTER TABLE worker_hibernation_events
+		DROP CONSTRAINT worker_hibernation_events_actor_label_check,
+		DROP CONSTRAINT worker_hibernation_events_reason_check`)
+	if err := store.MigrateTo(ctx, dsn, 427); err != nil {
+		t.Fatalf("Up must re-add missing bound checks: %v", err)
+	}
+	for name, tc := range map[string]struct{ label, reason, con string }{
+		"empty actor label": {"", "r", "worker_hibernation_events_actor_label_check"},
+		"empty reason":      {"op", "", "worker_hibernation_events_reason_check"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			id := uuid.New()
+			_, err := pool.Exec(ctx, `INSERT INTO worker_hibernation_events(owner_id,worker_id,actor_id,actor_label,action,op_id,reason,occurred_at)
+				VALUES($1,$1,$1,$2,'wake',$1,$3,now())`, id, tc.label, tc.reason)
+			var pe *pgconn.PgError
+			if !errors.As(err, &pe) || pe.ConstraintName != tc.con {
+				t.Fatalf("%s not enforced: %v", tc.con, err)
 			}
 		})
 	}
@@ -151,21 +198,21 @@ func TestWorkerHibernationCheckConstraintsLiveDB(t *testing.T) {
 	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM pg_constraint WHERE conrelid='workers'::regclass AND NOT convalidated AND (conname LIKE '%hibernat%' OR conname LIKE 'workers_wake%')"); n != 0 {
 		t.Fatalf("%d hibernation constraints are not validated", n)
 	}
-	for name, set := range map[string]string{
-		"state outside enum":   `hibernation_state='sleeping'`,
-		"no op id":             `hibernation_state='preparing'`,
-		"hibernated no stamp":  `hibernation_state='hibernated', hibernation_op_id=gen_random_uuid()`,
-		"waking no request":    `hibernation_state='waking', hibernation_op_id=gen_random_uuid()`,
-		"ephemeral":            `hibernation_state='preparing', hibernation_op_id=gen_random_uuid(), ephemeral=true`,
-		"external":             `hibernation_state='preparing', hibernation_op_id=gen_random_uuid(), kind='external', hosted_size=NULL`,
-		"overbound wake error": `wake_error=repeat('x',501)`,
-		"overbound reason":     `hibernation_reason=repeat('x',501)`,
+	for name, tc := range map[string]struct{ set, con string }{
+		"state outside enum":   {`hibernation_state='sleeping', hibernation_op_id=gen_random_uuid()`, "workers_hibernation_state_check"},
+		"no op id":             {`hibernation_state='preparing'`, "workers_hibernation_coherent"},
+		"hibernated no stamp":  {`hibernation_state='hibernated', hibernation_op_id=gen_random_uuid()`, "workers_hibernated_at_set"},
+		"waking no request":    {`hibernation_state='waking', hibernation_op_id=gen_random_uuid()`, "workers_wake_requested_at_set"},
+		"ephemeral":            {`hibernation_state='preparing', hibernation_op_id=gen_random_uuid(), ephemeral=true`, "workers_hibernation_coherent"},
+		"external":             {`hibernation_state='preparing', hibernation_op_id=gen_random_uuid(), kind='external', hosted_size=NULL`, "workers_hibernation_coherent"},
+		"overbound wake error": {`wake_error=repeat('x',501)`, "workers_hibernation_text_bounds"},
+		"overbound reason":     {`hibernation_reason=repeat('x',501)`, "workers_hibernation_text_bounds"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := pool.Exec(ctx, "UPDATE workers SET "+set+" WHERE id=$1", worker)
+			_, err := pool.Exec(ctx, "UPDATE workers SET "+tc.set+" WHERE id=$1", worker)
 			var pe *pgconn.PgError
-			if !errors.As(err, &pe) || pe.Code != "23514" {
-				t.Fatalf("CHECK rejection: %v", err)
+			if !errors.As(err, &pe) || pe.Code != "23514" || pe.ConstraintName != tc.con {
+				t.Fatalf("CHECK rejection by %s: %v", tc.con, err)
 			}
 		})
 	}

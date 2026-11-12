@@ -134,12 +134,20 @@ func TestHibernationIntakeGoSQLParityLiveDB(t *testing.T) {
 				if goAccepts := store.WorkerAcceptsNewIntake(row); goAccepts != sqlAccepts {
 					t.Fatalf("Go=%v SQL=%v", goAccepts, sqlAccepts)
 				}
-				// A partial struct that omits HibernationState (an old-style caller) must
-				// still treat a non-none row as closed when it passes the field.
+				// A caller that copies only the intake fields must also copy HibernationState.
 				partial := store.Worker{ManualCordonedAt: row.ManualCordonedAt, DrainingSince: row.DrainingSince,
 					MaintenanceFenced: row.MaintenanceFenced, MaintenancePhase: row.MaintenancePhase, HibernationState: row.HibernationState}
 				if store.WorkerAcceptsNewIntake(partial) != sqlAccepts {
 					t.Fatalf("partial struct disagrees with SQL=%v", sqlAccepts)
+				}
+				// Documented Go behavior: an empty HibernationState is treated as awake
+				// (partial-struct callers predate the field), so it matches the "none" verdict.
+				partial.HibernationState = ""
+				partial.MaintenancePhase = row.MaintenancePhase
+				awake := store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: row.ManualCordonedAt, DrainingSince: row.DrainingSince,
+					MaintenanceFenced: row.MaintenanceFenced, MaintenancePhase: row.MaintenancePhase, HibernationState: "none"})
+				if store.WorkerAcceptsNewIntake(partial) != awake {
+					t.Fatalf("empty HibernationState must behave as none (accept=%v)", awake)
 				}
 				if state == "none" && name == "plain" && !sqlAccepts {
 					t.Fatal("control: an awake plain worker must accept intake")
@@ -161,6 +169,9 @@ func TestHibernationControllerSnapshotLiveDB(t *testing.T) {
 		setHibernationSQL(fx, w, state)
 		if state == "none" {
 			mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET kind='hosted', hosted_size='m', template_declared='base' WHERE id=$1`, w)
+		} else {
+			// Realistic podless shape: a non-awake worker has no pod and is offline.
+			mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET status='offline', last_heartbeat_at=now()-interval '1 hour' WHERE id=$1`, w)
 		}
 		want[w] = state
 	}
@@ -185,5 +196,54 @@ func TestHibernationControllerSnapshotLiveDB(t *testing.T) {
 	}
 	if seen != len(want) {
 		t.Fatalf("snapshot returned %d of %d workers", seen, len(want))
+	}
+}
+
+// The queued-health projection must agree with ClaimRun: a run pinned to its own
+// worker (a resume) is still not claimable while that worker is not awake, even
+// with a fresh heartbeat.
+func TestHibernationClaimableProjectionParityLiveDB(t *testing.T) {
+	for _, state := range hibernationStates {
+		t.Run(state, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM users WHERE id=$1`, fx.userID) })
+			w := fx.worker("w", capOf(4), false)
+			run := fx.queuedRun()
+			mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET worker_id=$2 WHERE id=$1`, run, w)
+			setHibernationSQL(fx, w, state)
+			mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET status='online', last_heartbeat_at=now() WHERE id=$1`, w)
+
+			now := time.Now()
+			row, err := fx.q.CountOnlineWorkersClaimableForRun(fx.ctx, store.CountOnlineWorkersClaimableForRunParams{
+				RunID:                    run,
+				CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+				CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+				HeartbeatCutoff:          pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true},
+				AffinityCutoff:           pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+				CapabilityAware:          true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, claimErr := fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{WorkerID: pgU(w), UserID: fx.userID,
+				CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+				CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+				AffinityCutoff:           pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+				SpreadCutoff:             pgtype.Timestamptz{Time: now.Add(-9 * time.Second), Valid: true},
+				HeartbeatCutoff:          pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true},
+				WorkerCaps:               []string{}, WorkerProtocolCaps: []string{}})
+			claimed := claimErr == nil
+			if claimErr != nil && !errors.Is(claimErr, pgx.ErrNoRows) {
+				t.Fatal(claimErr)
+			}
+			want := int64(0)
+			if state == "none" {
+				want = 1
+			}
+			if row.Claimable != want || row.AssignedClaimable != want || claimed != (state == "none") {
+				t.Fatalf("state %q: claimable=%d assigned_claimable=%d ClaimRun claimed=%v, want %d / %v",
+					state, row.Claimable, row.AssignedClaimable, claimed, want, state == "none")
+			}
+		})
 	}
 }

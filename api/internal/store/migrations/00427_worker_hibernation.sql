@@ -3,6 +3,9 @@ SET LOCAL lock_timeout = '5s';
 
 -- PRD #4205 M1: worker hibernation storage. Additive only; the state machine,
 -- controller arm and UI land in later milestones.
+-- Lock order: this migration locks workers only. hibernation_wakes (which needs
+-- a runs lock for its FK) lives in 00428 so Up never waits on runs while holding
+-- ACCESS EXCLUSIVE on workers.
 ALTER TABLE workers
  ADD COLUMN hibernation_state text NOT NULL DEFAULT 'none'
   CONSTRAINT workers_hibernation_state_check CHECK (hibernation_state IN ('none','preparing','hibernated','waking')),
@@ -24,21 +27,17 @@ ALTER TABLE workers
  ADD CONSTRAINT workers_hibernation_coherent CHECK (
   hibernation_state = 'none'
   OR (hibernation_op_id IS NOT NULL AND kind = 'hosted' AND NOT ephemeral)
- ) NOT VALID,
+ ),
  ADD CONSTRAINT workers_hibernated_at_set CHECK (
   hibernation_state <> 'hibernated' OR hibernated_at IS NOT NULL
- ) NOT VALID,
+ ),
  ADD CONSTRAINT workers_wake_requested_at_set CHECK (
   hibernation_state <> 'waking' OR wake_requested_at IS NOT NULL
- ) NOT VALID,
+ ),
  ADD CONSTRAINT workers_hibernation_text_bounds CHECK (
   (wake_error IS NULL OR char_length(wake_error) <= 500)
   AND (hibernation_reason IS NULL OR char_length(hibernation_reason) <= 500)
- ) NOT VALID;
-ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernation_coherent;
-ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernated_at_set;
-ALTER TABLE workers VALIDATE CONSTRAINT workers_wake_requested_at_set;
-ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernation_text_bounds;
+ );
 
 -- Audit history. Snapshot identifiers deliberately have no foreign keys: deletion
 -- must preserve history. Down keeps this table, so Up must be re-entrant and must
@@ -48,64 +47,79 @@ CREATE TABLE IF NOT EXISTS worker_hibernation_events (
  owner_id uuid NOT NULL,
  worker_id uuid NOT NULL,
  actor_id uuid NOT NULL,
- actor_label text NOT NULL CHECK (char_length(actor_label) BETWEEN 1 AND 200),
+ actor_label text NOT NULL,
  action text NOT NULL,
  op_id uuid NOT NULL,
- reason text CHECK (reason IS NULL OR char_length(reason) BETWEEN 1 AND 500),
+ reason text,
  occurred_at timestamptz NOT NULL
 );
 CREATE INDEX IF NOT EXISTS worker_hibernation_events_worker_time_idx
  ON worker_hibernation_events (worker_id, occurred_at);
 
--- +goose StatementBegin
-DO $$
-BEGIN
- IF NOT EXISTS (
-  SELECT 1 FROM pg_constraint
-  WHERE conrelid = 'worker_hibernation_events'::regclass
-    AND conname = 'worker_hibernation_events_action_check'
- ) THEN
-  ALTER TABLE worker_hibernation_events
-   ADD CONSTRAINT worker_hibernation_events_action_check CHECK (action IN ('hibernate','wake'));
- END IF;
-END;
-$$;
--- +goose StatementEnd
-
+-- Re-entrant validation of a leftover table: restore each named CHECK that is
+-- absent, then require the exact column shape, the exact set of CHECK and
+-- PRIMARY KEY constraint definitions and the exact index definition. A
+-- constraint or index that exists with a different definition RAISEs; it is
+-- never silently replaced.
 -- +goose StatementBegin
 DO $$
 DECLARE
- expected text[] := ARRAY[
+ expected_cols text[] := ARRAY[
   'id:uuid:NO', 'owner_id:uuid:NO', 'worker_id:uuid:NO', 'actor_id:uuid:NO',
   'actor_label:text:NO', 'action:text:NO', 'op_id:uuid:NO', 'reason:text:YES',
   'occurred_at:timestamp with time zone:NO'];
- actual text[];
- def text;
+ actual_cols text[];
+ expected_cons text[] := ARRAY[
+  'worker_hibernation_events_pkey=PRIMARY KEY (id)',
+  'worker_hibernation_events_actor_label_check=CHECK (((char_length(actor_label) >= 1) AND (char_length(actor_label) <= 200)))',
+  'worker_hibernation_events_action_check=CHECK ((action = ANY (ARRAY[''hibernate''::text, ''wake''::text])))',
+  'worker_hibernation_events_reason_check=CHECK (((reason IS NULL) OR ((char_length(reason) >= 1) AND (char_length(reason) <= 500))))'];
+ actual_cons text[];
+ idx text;
 BEGIN
  SELECT array_agg(column_name || ':' || data_type || ':' || is_nullable ORDER BY column_name)
-  INTO actual
+  INTO actual_cols
   FROM information_schema.columns
   WHERE table_schema = current_schema() AND table_name = 'worker_hibernation_events';
- IF actual IS DISTINCT FROM (SELECT array_agg(e ORDER BY split_part(e, ':', 1)) FROM unnest(expected) e) THEN
-  RAISE EXCEPTION 'worker_hibernation_events has an unexpected shape: %', actual;
+ IF actual_cols IS DISTINCT FROM (SELECT array_agg(e ORDER BY split_part(e, ':', 1)) FROM unnest(expected_cols) e) THEN
+  RAISE EXCEPTION 'worker_hibernation_events has an unexpected shape: %', actual_cols;
  END IF;
- SELECT pg_get_constraintdef(oid) INTO def FROM pg_constraint
-  WHERE conrelid = 'worker_hibernation_events'::regclass
-    AND conname = 'worker_hibernation_events_action_check' AND contype = 'c';
- IF def IS NULL OR def NOT LIKE '%hibernate%' OR def NOT LIKE '%wake%' THEN
-  RAISE EXCEPTION 'worker_hibernation_events_action_check is missing or wrong: %', def;
+
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'worker_hibernation_events'::regclass
+   AND conname = 'worker_hibernation_events_actor_label_check') THEN
+  ALTER TABLE worker_hibernation_events ADD CONSTRAINT worker_hibernation_events_actor_label_check
+   CHECK (char_length(actor_label) BETWEEN 1 AND 200);
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'worker_hibernation_events'::regclass
+   AND conname = 'worker_hibernation_events_action_check') THEN
+  ALTER TABLE worker_hibernation_events ADD CONSTRAINT worker_hibernation_events_action_check
+   CHECK (action IN ('hibernate','wake'));
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'worker_hibernation_events'::regclass
+   AND conname = 'worker_hibernation_events_reason_check') THEN
+  ALTER TABLE worker_hibernation_events ADD CONSTRAINT worker_hibernation_events_reason_check
+   CHECK (reason IS NULL OR char_length(reason) BETWEEN 1 AND 500);
+ END IF;
+
+ SELECT array_agg(conname || '=' || pg_get_constraintdef(oid) ORDER BY conname)
+  INTO actual_cons
+  FROM pg_constraint
+  WHERE conrelid = 'worker_hibernation_events'::regclass AND contype IN ('c', 'p');
+ IF actual_cons IS DISTINCT FROM (SELECT array_agg(e ORDER BY split_part(e, '=', 1)) FROM unnest(expected_cons) e) THEN
+  RAISE EXCEPTION 'worker_hibernation_events has unexpected constraints: %', actual_cons;
+ END IF;
+
+ SELECT pg_get_indexdef(indexrelid) INTO idx FROM pg_index
+  WHERE indrelid = 'worker_hibernation_events'::regclass
+    AND indexrelid = to_regclass('worker_hibernation_events_worker_time_idx');
+ IF idx IS NULL OR idx NOT IN (
+   'CREATE INDEX worker_hibernation_events_worker_time_idx ON worker_hibernation_events USING btree (worker_id, occurred_at)',
+   'CREATE INDEX worker_hibernation_events_worker_time_idx ON ' || current_schema() || '.worker_hibernation_events USING btree (worker_id, occurred_at)') THEN
+  RAISE EXCEPTION 'worker_hibernation_events_worker_time_idx is missing or wrong: %', idx;
  END IF;
 END;
 $$;
 -- +goose StatementEnd
-
--- First-wake memory: one row per run that has already woken a worker, so a run
--- wakes a sleeping worker at most once.
-CREATE TABLE hibernation_wakes (
- run_id uuid PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
- worker_id uuid NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
- first_woken_at timestamptz NOT NULL
-);
 
 ALTER TABLE controller_report_status
  ADD COLUMN hibernation_version int,
@@ -124,14 +138,14 @@ $$;
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
--- Refuse rollback while any worker is mid-hibernation or wake history exists.
+-- Refuse rollback while any worker is mid-hibernation.
 -- +goose StatementBegin
 DO $$
 BEGIN
- LOCK TABLE workers, hibernation_wakes IN ACCESS EXCLUSIVE MODE;
+ LOCK TABLE workers IN ACCESS EXCLUSIVE MODE;
  IF EXISTS (SELECT 1 FROM workers WHERE hibernation_state <> 'none')
-    OR EXISTS (SELECT 1 FROM hibernation_wakes) THEN
-  RAISE EXCEPTION 'worker hibernation state or wake history exists; rollback refused';
+  THEN
+  RAISE EXCEPTION 'worker hibernation state exists; rollback refused';
  END IF;
 END;
 $$;
@@ -147,7 +161,6 @@ LANGUAGE sql STABLE AS $$
 $$;
 -- +goose StatementEnd
 
-DROP TABLE hibernation_wakes;
 ALTER TABLE controller_report_status
  DROP COLUMN hibernation_version,
  DROP COLUMN hibernation_advertised_at,
