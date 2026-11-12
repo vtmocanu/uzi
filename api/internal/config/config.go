@@ -154,6 +154,13 @@ type Config struct {
 	// drops the token in the same object that carries this URL, so the two can never
 	// reach the SDK together. Empty with a URL set is a boot error (see Load).
 	AnthropicEndpointAPIKey string
+	// AnthropicEndpointModel is the model slug AnthropicEndpointURL serves (a gateway's
+	// own id, e.g. morph-kimik31). A custom endpoint is not Anthropic, so leaving the
+	// SDK's default model name in place addresses a model the endpoint does not serve
+	// and fails inside the provider, far from any uzi diagnostic. Empty with a URL set
+	// is a boot error for the same reason a missing key is: the deployment believes it
+	// is configured while every run is guaranteed to fail.
+	AnthropicEndpointModel string
 	// AgentSourceAllowedBaseURLs is the SEPARATE SSRF allowlist for the agent-source
 	// repo sync (PRD #602 M2): the only base URLs an agent-source clone may target.
 	// Normalized (scheme+host, no trailing slash), https only — same shape as
@@ -1028,6 +1035,7 @@ func Load() (Config, error) {
 	// pointed runs at a gateway and did not is worse than one that refuses to start.
 	cfg.AnthropicEndpointURL = strings.TrimSpace(getenv("ANTHROPIC_ENDPOINT_URL", ""))
 	cfg.AnthropicEndpointAPIKey = strings.TrimSpace(getenv("ANTHROPIC_ENDPOINT_API_KEY", ""))
+	cfg.AnthropicEndpointModel = strings.TrimSpace(getenv("ANTHROPIC_ENDPOINT_MODEL", ""))
 	if cfg.AnthropicEndpointURL != "" {
 		if !cfg.AnthropicEndpointBaseURLAllowed(cfg.AnthropicEndpointURL) {
 			return Config{}, fmt.Errorf("ANTHROPIC_ENDPOINT_URL %q is not in ANTHROPIC_ENDPOINT_ALLOWED_BASE_URLS", cfg.AnthropicEndpointURL)
@@ -1035,8 +1043,13 @@ func Load() (Config, error) {
 		if cfg.AnthropicEndpointAPIKey == "" {
 			return Config{}, fmt.Errorf("ANTHROPIC_ENDPOINT_URL is set but ANTHROPIC_ENDPOINT_API_KEY is empty; the endpoint has no credential to use")
 		}
+		if cfg.AnthropicEndpointModel == "" {
+			return Config{}, fmt.Errorf("ANTHROPIC_ENDPOINT_URL is set but ANTHROPIC_ENDPOINT_MODEL is empty; name the model the endpoint serves")
+		}
 	} else if cfg.AnthropicEndpointAPIKey != "" {
 		return Config{}, fmt.Errorf("ANTHROPIC_ENDPOINT_API_KEY is set but ANTHROPIC_ENDPOINT_URL is empty")
+	} else if cfg.AnthropicEndpointModel != "" {
+		return Config{}, fmt.Errorf("ANTHROPIC_ENDPOINT_MODEL is set but ANTHROPIC_ENDPOINT_URL is empty")
 	}
 	// PRD #1909 M6: the product-skills allowlist, default EMPTY (feature off, instance still boots).
 	productSkillsAllowed, err := parseBaseURLAllowlist("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", getenv("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", ""))

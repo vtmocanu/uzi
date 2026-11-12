@@ -17,7 +17,7 @@ func TestClaimAnthropicEndpoint(t *testing.T) {
 		t.Fatalf("unconfigured service bound a Claude run to %+v", got)
 	}
 
-	svc.SetAnthropicEndpoint("https://gateway.example", "key-123")
+	svc.SetAnthropicEndpoint("https://gateway.example", "key-123", "gateway-model-1")
 	if svc.anthropicEndpoint == nil {
 		t.Fatal("SetAnthropicEndpoint did not store the endpoint")
 	}
@@ -60,8 +60,8 @@ func TestClaimAnthropicOAuthToken(t *testing.T) {
 // reverts the service to today's behaviour rather than binding runs to "".
 func TestSetAnthropicEndpointEmptyLeavesFeatureOff(t *testing.T) {
 	svc := &Service{}
-	svc.SetAnthropicEndpoint("https://gateway.example", "key-123")
-	svc.SetAnthropicEndpoint("   ", "key-123")
+	svc.SetAnthropicEndpoint("https://gateway.example", "key-123", "gateway-model-1")
+	svc.SetAnthropicEndpoint("   ", "key-123", "gateway-model-1")
 	if svc.anthropicEndpoint != nil {
 		t.Fatalf("a blank base URL left the endpoint bound: %+v", svc.anthropicEndpoint)
 	}

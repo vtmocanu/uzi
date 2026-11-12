@@ -2338,12 +2338,12 @@ func (s *Service) SetForgeBaseURLAllowed(fn func(string) bool) { s.forgeBaseURLA
 // (PRD #229 D10). Call once at startup with the already-allowlist-checked
 // config.Config values. An empty baseURL leaves the feature off, so a deployment
 // that never configures it behaves exactly as before.
-func (s *Service) SetAnthropicEndpoint(baseURL, apiKey string) {
+func (s *Service) SetAnthropicEndpoint(baseURL, apiKey, model string) {
 	if strings.TrimSpace(baseURL) == "" {
 		s.anthropicEndpoint = nil
 		return
 	}
-	s.anthropicEndpoint = &ClaimAnthropicEndpoint{BaseURL: baseURL, APIKey: apiKey}
+	s.anthropicEndpoint = &ClaimAnthropicEndpoint{BaseURL: baseURL, APIKey: apiKey, Model: model}
 }
 
 // SetPublishFn overrides the go-git checkpoint publisher (PRD #122 M8). Production
