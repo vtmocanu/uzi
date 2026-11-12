@@ -90,18 +90,28 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 			return nil, fmt.Errorf("clear earlier job outputs: %w", err)
 		}
 	}
-	choice, err := s.claimSecretID(ctx, wkr, run)
-	if err != nil {
-		return nil, jobCredentialErr(err)
-	}
-	cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
-	if err != nil {
-		return nil, jobCredentialErr(err)
-	}
-	// emitSwitchMessage=false: a job is not credential-switchable (D-E), so it never emits a
-	// 'credential_switch' message and last_seq cannot diverge from run.LastSeq.
-	if _, err := s.recordRunCredential(ctx, run, cred, choice, false); err != nil {
-		return nil, err
+	// PRD #229 D10: an instance-wide custom endpoint REPLACES the subscription token on
+	// every Claude lane, jobs included. A bound job opens no token and records no
+	// credential epoch — there is nothing to open, and the ladder below would fail the
+	// claim on a token the job never uses. Without this a job on an endpoint-only
+	// instance has no credential at all and fails at claim.
+	anthropicEndpoint := s.claimAnthropicEndpoint(run)
+	var anthropic []byte
+	if anthropicEndpoint == nil {
+		choice, err := s.claimSecretID(ctx, wkr, run)
+		if err != nil {
+			return nil, jobCredentialErr(err)
+		}
+		cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
+		if err != nil {
+			return nil, jobCredentialErr(err)
+		}
+		// emitSwitchMessage=false: a job is not credential-switchable (D-E), so it never emits a
+		// 'credential_switch' message and last_seq cannot diverge from run.LastSeq.
+		if _, err := s.recordRunCredential(ctx, run, cred, choice, false); err != nil {
+			return nil, err
+		}
+		anthropic = cred.Token
 	}
 
 	inputs, err := s.q.ListJobInputsForClaim(ctx, run.ID)
@@ -214,10 +224,15 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		LastSeq:                    run.LastSeq,
 		IterationCount:             run.IterationCount,
 		RequeueCount:               run.RequeueCount,
-		Secrets:                    ClaimSecrets{AnthropicOAuthToken: string(cred.Token)},
-		Agents:                     []ClaimAgent{},
-		Skills:                     skills,
-		SkillsDropped:              skillDrops,
-		Config:                     cfg,
+		// PRD #229 D10: the same mutual exclusion the run lane applies, as data. A bound
+		// job carries the endpoint and NO token.
+		Secrets: ClaimSecrets{
+			AnthropicOAuthToken: claimAnthropicOAuthToken(anthropic, anthropicEndpoint),
+			AnthropicEndpoint:   anthropicEndpoint,
+		},
+		Agents:        []ClaimAgent{},
+		Skills:        skills,
+		SkillsDropped: skillDrops,
+		Config:        cfg,
 	}, nil
 }
