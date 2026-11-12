@@ -2,7 +2,7 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   api,
@@ -1478,6 +1478,14 @@ function codexHoldCopy(
  *
  * Exported like the sibling panels so its copy is reachable without mounting the page.
  */
+// Issue #4177: closed copy map for the adoption-failure detail classification.
+const ADOPTION_DETAIL_COPY = {
+  secret_remediation_active:
+    "Resume is unavailable: the retained source is held under an active secret-scan remediation, so Resume cannot succeed unchanged. To recover the work, either export an available recovery archive (uzi run export <run-id> --output <path>), which may omit later work kept on the worker, or ask an operator to recover the retained work from worker storage. Cancel ends the run.",
+  remediation_proof_unknown:
+    "The secret-scan remediation proof could not be verified, so a retry may help.",
+} as const;
+
 function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   run: Run;
   ownerProof: boolean;
@@ -1486,6 +1494,12 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   onCancel: () => void;
 }) {
   const adoptionFailed = run.recovery_wait_cause === "retained_recovery_adoption_failed";
+  // Closed set: only the two known values change anything; null, absent or any other value
+  // keeps the generic adoption-failure behaviour and the raw string is never rendered.
+  const adoptionDetail = adoptionFailed ? run.recovery_wait_detail : null;
+  const secretActive = adoptionDetail === "secret_remediation_active";
+  const proofUnknown = adoptionDetail === "remediation_proof_unknown";
+  const resumeReasonId = useId();
   const idleStall = run.recovery_wait_cause === "codex_idle_stall";
   // Owner-only, no timer, never an integrity refusal: the claimed continuation flight was
   // never witnessed, so the server released the claim. Always held, even if a malformed
@@ -1522,8 +1536,12 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
-      {adoptionFailed && <p className="mt-1.5 text-xs text-warn">
+      {adoptionFailed && !secretActive && <p className="mt-1.5 text-xs text-warn">
         Resume starts another recovery episode. If the underlying block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming.
+        {proofUnknown && ` ${ADOPTION_DETAIL_COPY.remediation_proof_unknown}`}
+      </p>}
+      {secretActive && <p id={resumeReasonId} className="mt-1.5 text-xs text-warn">
+        {ADOPTION_DETAIL_COPY.secret_remediation_active}
       </p>}
       {idleStall && <p className="mt-1.5 text-xs text-muted">Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.</p>}
       {!retained && <p className="mt-1.5 text-xs text-muted">
@@ -1559,7 +1577,7 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
       ) : <p className="mt-1.5 text-xs text-muted">Server recovery evidence is unavailable.</p>}
       {ownerProof ? (
         <div className="mt-3 flex gap-2">
-          <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+          <Button size="sm" disabled={busy || secretActive} aria-describedby={secretActive ? resumeReasonId : undefined} onClick={onResume}>Resume</Button>
           <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>Cancel</Button>
         </div>
       ) : <p className="mt-1.5 text-xs text-muted">Only the run owner can resume or cancel this hold.</p>}
