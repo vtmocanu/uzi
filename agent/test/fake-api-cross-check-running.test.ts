@@ -196,6 +196,47 @@ describe("FakeApi /state running rule", () => {
     assert.equal(ran, fixture.cases.length);
   });
 
+  it("refuses a running report from a non-source row even with an applied bound approval", async () => {
+    for (const [status, accepted] of [["paused", false], ["queued", false], ["claimed", true]] as const) {
+      const claim = makeClaim({ claim_generation: GENERATION, auto_approve: false, plan_cross_check_gated: true });
+      const runId = claim.run_id;
+      api.enqueueClaim(claim);
+      api.setInputClaimGeneration(runId, GENERATION);
+      assert.equal((await gate(runId, "plan A")).status, 200, `${status}: gate`);
+      const id = nextInput++;
+      api.appendInputs(runId, [{ id, kind: "approve_plan", body: "{}", gate_binding: "bound", gate_revision: api.gateOf(runId).revision }]);
+      assert.equal((await receipt(runId, "ack", id)).status, 200, `${status}: ack`);
+      assert.equal((await receipt(runId, "applied", id)).status, 200, `${status}: applied`);
+      api.setOwnershipStatus(runId, status, GENERATION);
+      const before = api.states.length;
+      const refusalsBefore = api.crossCheckRunningRefusals.length;
+      const res = await post(`${runId}/state`, { status: "running", claim_generation: GENERATION });
+      if (accepted) {
+        assert.equal(res.status, 200, `${status}: a source row with a valid approval is admitted`);
+        assert.equal(api.states.length, before + 1, `${status}: recorded`);
+      } else {
+        assert.equal(res.status, 409, `${status}: refused`);
+        assert.equal(res.json.run.status, status, `${status}: acks the unchanged status`);
+        assert.equal(api.states.length, before, `${status}: a refusal records nothing`);
+        assert.equal(api.crossCheckRunningRefusals.length, refusalsBefore + 1, `${status}: refusal recorded`);
+      }
+    }
+  });
+
+  it("an older claim registered later cannot replace a newer gated claim's lane", async () => {
+    const newer = makeClaim({ claim_generation: 2, auto_approve: false, plan_cross_check_gated: true });
+    const runId = newer.run_id;
+    api.enqueueClaim(newer);
+    api.setInputClaimGeneration(runId, 2);
+    assert.equal((await post(`${runId}/state`, { status: "awaiting_approval", plan_md: "plan A", claim_generation: 2 })).status, 200);
+    // A stale generation-1 ordinary claim for the same run reaches registerClaim afterwards (the
+    // RunRunner.execute wrapper registers before the runner's queued-duplicate gate).
+    api.registerClaim(makeClaim({ run_id: runId, claim_generation: 1, auto_approve: false }));
+    api.setOwnershipStatus(runId, "claimed", 2);
+    const res = await post(`${runId}/state`, { status: "running", claim_generation: 2 });
+    assert.equal(res.status, 409, "the unapproved gated lane still holds");
+  });
+
   it("accepts the pre-plan running report of a gated run", async () => {
     const claim = makeClaim({ claim_generation: GENERATION, auto_approve: false, plan_cross_check_gated: true });
     api.enqueueClaim(claim);
