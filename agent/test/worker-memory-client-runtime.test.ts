@@ -439,3 +439,61 @@ test("a throwing diagnostic logger never rejects the sampler", async () => {
   await runScripted(["A", "A", "P"], { warn: () => { attempts++; throw new Error("logger failure"); }, info: () => { attempts++; throw new Error("logger failure"); } });
   assert.equal(attempts, 2);
 });
+
+async function runRejected(warn: (m: string, f?: Record<string, unknown>) => void) {
+  let calls = 0;
+  const client = {
+    memoryIncarnation: { worker_id: worker, register_nonce: "nonce", revision: 1 },
+    subscribeMemoryInvalidation: () => () => {}, revokeMemoryAuthority: () => {},
+    reserveMemoryIntervention: async () => { throw new Error("unexpected"); },
+    reportMemoryInterventionOutcome: async () => { throw new Error("unexpected"); },
+  } as unknown as WorkerClient;
+  const psi = { avg10: 0, avg60: 0, avg300: 0, total: 0 };
+  const runtime = new WorkerMemoryRuntime(settings, client, { ...nullLogger(), warn }, {
+    reader: { sample: (): RuntimeSample => {
+      const now = performance.now();
+      return { available: true, sampleId: ++calls, startedAtMs: now, completedAtMs: now, currentBytes: 950, limitBytes: 1000,
+        stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 }, pressure: { some: psi, full: psi } };
+    } },
+  });
+  const context = runtime.begin({ run_id: run, worker_id: worker, register_nonce: "nonce",
+    claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1,
+    memory_policy: { version: 1, max_interventions: 2 }, memory_intervention_count: 0 }, {
+    prepareFeedback: () => {}, feedback: async () => {}, preparePreservation: () => {}, preserve: async () => {}, preservationBudgetMs: 200,
+  });
+  const entry = runtime.commands.register(context, {
+    source: "codex-model-command", toolId: "tool-secret-4219", attemptId: "attempt-secret-4219",
+    command: "command-secret-4219", root: { pid: 10, startTime: "10" },
+    observe: async () => {
+      const now = performance.now();
+      return { available: false, complete: false, startedAtMs: now, completedAtMs: now, rows: [{ pid: 10, startTime: "10", rssBytes: 5 }], detail: "busy" };
+    },
+    cancel: async () => {}, drain: async () => ({ confirmed: true }),
+  });
+  const running = runtime.run();
+  try { await until(() => calls >= 6); } finally { await runtime.stop(); await running; }
+  return { entry, calls };
+}
+
+test("#4219 runtime logs rejected candidates once with only the allowlisted fields", async () => {
+  const events: { msg: string; fields?: Record<string, unknown> }[] = [];
+  const { entry } = await runRejected((msg, fields) => { events.push({ msg, fields }); });
+  const rejected = events.filter((e) => e.msg === "worker memory guard: candidate observations rejected");
+  assert.equal(rejected.length, 1, "identical no-selection rejections are logged once");
+  const fields = rejected[0]!.fields!;
+  assert.deepEqual(Object.keys(fields).sort(), ["candidate_count", "rejections", "selected_command_id", "selected_run_id"]);
+  assert.deepEqual(fields, {
+    selected_run_id: null, selected_command_id: null, candidate_count: 1,
+    rejections: [{ run_id: run, command_id: entry.commandId, reasons: ["observation_unavailable"], observation_detail: "busy",
+      rss_bytes_approx: { unavailable: "unknown" } }],
+  });
+  const text = JSON.stringify(rejected);
+  for (const secret of ["tool-secret-4219", "attempt-secret-4219", "command-secret-4219"]) assert.equal(text.includes(secret), false, secret);
+});
+
+test("#4219 a throwing logger cannot stop the guard from sampling or the runtime from stopping", async () => {
+  let attempts = 0;
+  const { calls } = await runRejected(() => { attempts++; throw new Error("logger failure"); });
+  assert.ok(attempts >= 1);
+  assert.ok(calls >= 6);
+});

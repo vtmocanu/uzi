@@ -300,3 +300,27 @@ test("the stale re-sampling stops when the command is aborted", { timeout: 10000
   await new Promise((done) => setTimeout(done, 100));
   assert.equal(fake.calls(), after, "no observe is issued after the abort settled");
 });
+
+test("#4219 the adapter observation carries the evidence reason, identity_mismatch or retired as detail", { timeout: 10000 }, async () => {
+  const c = captured();
+  const root = fakeRoot();
+  const enrolled = await enrollClaudeCommand(c, mint(c), root.handle, 500);
+  assert.ok(enrolled);
+  const budget = () => ({ remainingMs: 500, signal: new AbortController().signal });
+  const complete = await enrolled.entry.observe(budget());
+  assert.equal(complete.available, true);
+  assert.equal("detail" in complete, false, "a complete observation has no detail");
+  for (const reason of ["unreadable", "oversize", "stale", "timeout", "busy", "transport"] as const) {
+    root.change({ event: "observe", id: 2, state: "unavailable", reason });
+    const o = await enrolled.entry.observe(budget());
+    assert.deepEqual([o.available, o.complete, o.rows, o.detail], [false, false, [], reason]);
+  }
+  root.change({ event: "observe", id: 3, state: "complete", supervisor: { pid: 50, startTime: "18446744073709551614" },
+    root: { pid: 51, startTime: ticks }, processes: [{ pid: 51, startTime: ticks, ppid: 50, rss: 100 }] });
+  assert.equal((await enrolled.entry.observe(budget())).detail, "identity_mismatch");
+  const aborted = new AbortController();
+  aborted.abort();
+  assert.equal((await enrolled.entry.observe({ remainingMs: 500, signal: aborted.signal })).detail, "retired");
+  c.commands.retire(c.context);
+  assert.equal((await enrolled.entry.observe(budget())).detail, "retired");
+});

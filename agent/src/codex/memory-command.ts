@@ -3,7 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { bindMemoryCallback, isBrokerModelCommand } from "./broker.js";
 import type { CodexRootHandle, ObservationOutcome } from "./launcher.js";
 import type { ExecutionRegistry, RegisteredRoot, ReapOutcome } from "./registry.js";
-import type { WorkerMemoryCommands } from "../worker-memory-commands.js";
+import { MemoryWaitTimeout, type WorkerMemoryCommands } from "../worker-memory-commands.js";
 
 type Entry = ReturnType<WorkerMemoryCommands["register"]>;
 type Observation = Awaited<ReturnType<Entry["observe"]>>;
@@ -15,7 +15,7 @@ export async function boundedCommandWait<T>(promise: Promise<T>, timeoutMs: numb
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("command cleanup/outcome deadline")), Math.max(1, timeoutMs));
+      timer = setTimeout(() => reject(new MemoryWaitTimeout("command cleanup/outcome deadline")), Math.max(1, timeoutMs));
     })]);
   } finally { if (timer) clearTimeout(timer); }
 }
@@ -85,7 +85,8 @@ export async function enrollMemoryCommand(
   const convert = (evidence: Awaited<ReturnType<CodexRootHandle["observe"]>>, startedAtMs: number): Observation => {
     const completedAtMs = performance.now();
     if (evidence.state !== "complete" || !same(evidence.supervisor, supervisor) || !same(evidence.root, primary)) {
-      return { available: false, complete: false, startedAtMs, completedAtMs, rows: [] };
+      return { available: false, complete: false, startedAtMs, completedAtMs, rows: [],
+        detail: evidence.state === "complete" ? "identity_mismatch" : evidence.reason };
     }
     return { available: true, complete: true, startedAtMs, completedAtMs,
       supervisor, primary, rows: evidence.processes.map(({ pid, startTime, rss }) => ({ pid, startTime, rssBytes: rss })) };
@@ -125,10 +126,10 @@ export async function enrollMemoryCommand(
     source: "codex-model-command", toolId: metadata.toolId, attemptId: metadata.attemptId,
     command: metadata.command, root: supervisor, primary,
     observe: async (budget) => {
-      if (!current() || budget?.signal.aborted) return { available: false, complete: false, startedAtMs: performance.now(), completedAtMs: performance.now(), rows: [] };
+      if (!current() || budget?.signal.aborted) return { available: false, complete: false, startedAtMs: performance.now(), completedAtMs: performance.now(), rows: [], detail: "retired" };
       const started = performance.now();
       const evidence = await boundedCommandWait(handle.observe(budget?.remainingMs ?? deadlineMs), budget?.remainingMs ?? deadlineMs);
-      if (!current() || budget?.signal.aborted) return { available: false, complete: false, startedAtMs: started, completedAtMs: performance.now(), rows: [] };
+      if (!current() || budget?.signal.aborted) return { available: false, complete: false, startedAtMs: started, completedAtMs: performance.now(), rows: [], detail: "retired" };
       return convert(evidence, started);
     },
     cancel: async (authority) => {

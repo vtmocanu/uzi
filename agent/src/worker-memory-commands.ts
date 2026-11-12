@@ -26,7 +26,21 @@ type Observation = {
   rows: readonly (Root & { rssBytes: number })[];
   supervisor?: Root;
   primary?: Root;
+  /** Diagnostic only: why an adapter reported the observation unavailable. Never read for authority. */
+  detail?: "unreadable" | "oversize" | "stale" | "timeout" | "busy" | "transport" | "identity_mismatch" | "retired";
 };
+/** Closed, canonical-order set of reasons a candidate observation is not selectable. */
+type RejectionReason = "unregistered" | "phase" | "observation_unavailable" | "stale" | "malformed"
+  | "overlap" | "pid_collision" | "identity_mismatch" | "missing_root";
+const REASON_ORDER: readonly RejectionReason[] = ["unregistered", "phase", "observation_unavailable", "stale",
+  "malformed", "overlap", "pid_collision", "identity_mismatch", "missing_root"];
+/** Copied strings and numbers only: never an Entry, command text or observation reference. */
+type Rejection = Readonly<{ index: number; runId: string; commandId: string; reasons: readonly RejectionReason[]; rssBytesApprox?: number }>;
+
+/** A bounded wait that expired on its own deadline, as opposed to an abort or a thrown failure. */
+export class MemoryWaitTimeout extends Error {
+  override name = "MemoryWaitTimeout";
+}
 type Budget = Readonly<{ remainingMs: number; signal: AbortSignal }>;
 type Entry = Readonly<{
   identity: string;
@@ -62,6 +76,15 @@ function fresh(o: Observation, now: number, age: number): boolean {
     && o.startedAtMs <= o.completedAtMs && o.completedAtMs <= now
     && now - o.startedAtMs <= age && Array.isArray(o.rows)
     && o.rows.length > 0 && o.rows.length <= 256;
+}
+
+/** Classify a freshness failure from fields fresh() already read; diagnostic only. */
+function freshnessClass(o: Observation): RejectionReason {
+  try {
+    if (o.available !== true || o.complete !== true) return "observation_unavailable";
+    if (!Array.isArray(o.rows) || o.rows.length === 0 || o.rows.length > 256) return "malformed";
+    return "stale";
+  } catch { return "malformed"; }
 }
 
 /** Worker-owned enrollment only. This registry neither launches nor inspects processes.
@@ -387,7 +410,15 @@ export class WorkerMemoryCommands {
    * RSS is approximate and is never cgroup usage or a drain/snapshot measurement.
    */
   select(candidates: readonly { entry: Entry; observation: Observation }[], now: number, maxAgeMs: number): Selection | undefined {
-    if (candidates.length > 256 || this.eligibleEntries() === undefined) return undefined;
+    return this.selectWithRejections(candidates, now, maxAgeMs).selection;
+  }
+
+  /** Same selection as select(), plus why each non-selected candidate was invalidated.
+   * Reasons are recorded beside each invalidation and never feed back into it.
+   */
+  selectWithRejections(candidates: readonly { entry: Entry; observation: Observation }[], now: number, maxAgeMs: number):
+    { selection?: Selection; rejected: readonly Rejection[] } {
+    if (candidates.length > 256 || this.eligibleEntries() === undefined) return { rejected: [] };
     const protectedPids = new Set<number>();
     for (const root of this.protectedRoots) protectedPids.add(root.root.pid);
     const enrolledPids = new Map<number, Entry[]>();
@@ -400,6 +431,14 @@ export class WorkerMemoryCommands {
       }
     }
     const invalid = new Set<number>();
+    const reasons = new Map<number, Set<RejectionReason>>();
+    const unsafeRows = new Set<number>();
+    const reject = (index: number, reason: RejectionReason): void => {
+      invalid.add(index);
+      const set = reasons.get(index) ?? new Set<RejectionReason>();
+      set.add(reason);
+      reasons.set(index, set);
+    };
     const owners = new Map<string, number[]>();
     const pidStarts = new Map<number, Set<string>>();
     const totals = new Map<number, number>();
@@ -408,18 +447,24 @@ export class WorkerMemoryCommands {
       const enrolled = entryOwners.get(entry) ?? [];
       enrolled.push(index);
       entryOwners.set(entry, enrolled);
-      if (!this.isRegistered(entry) || !this.phaseAdmits(entry.context) || !fresh(observation, now, maxAgeMs)) invalid.add(index);
-      if (!Array.isArray(observation.rows) || observation.rows.length > 256) return;
+      if (!this.isRegistered(entry)) reject(index, "unregistered");
+      else if (!this.phaseAdmits(entry.context)) reject(index, "phase");
+      else if (!fresh(observation, now, maxAgeMs)) reject(index, freshnessClass(observation));
+      if (!Array.isArray(observation.rows) || observation.rows.length > 256) {
+        reject(index, "malformed");
+        return;
+      }
       let total = 0;
       let hasRoot = false;
       const seen = new Set<string>();
       for (const row of observation.rows) {
         if (!row || !rootValid(row) || !Number.isSafeInteger(row.rssBytes) || row.rssBytes < 0) {
-          invalid.add(index);
+          reject(index, "malformed");
+          unsafeRows.add(index);
           continue;
         }
         const identity = key(row);
-        if (seen.has(identity)) invalid.add(index);
+        if (seen.has(identity)) reject(index, "overlap");
         seen.add(identity);
         const indices = owners.get(identity) ?? [];
         indices.push(index);
@@ -430,9 +475,12 @@ export class WorkerMemoryCommands {
         if (identity === key(entry.root)) hasRoot = true;
         // A PID collision with protected worker data is conservative, including reuse.
         if (protectedPids.has(row.pid)
-          || enrolledPids.get(row.pid)?.some((other) => other !== entry)) invalid.add(index);
+          || enrolledPids.get(row.pid)?.some((other) => other !== entry)) reject(index, "pid_collision");
         total += row.rssBytes;
-        if (!Number.isSafeInteger(total)) invalid.add(index);
+        if (!Number.isSafeInteger(total)) {
+          reject(index, "malformed");
+          unsafeRows.add(index);
+        }
       }
       if (entry.primary) {
         // Production observations come from the enrolled supervisor handle. The
@@ -440,10 +488,10 @@ export class WorkerMemoryCommands {
         if (!observation.supervisor || !rootValid(observation.supervisor)
           || key(observation.supervisor) !== key(entry.root)
           || !observation.primary || !rootValid(observation.primary)
-          || key(observation.primary) !== key(entry.primary)
-          || protectedPids.has(entry.root.pid) || protectedPids.has(entry.primary.pid)
+          || key(observation.primary) !== key(entry.primary)) reject(index, "identity_mismatch");
+        if (protectedPids.has(entry.root.pid) || protectedPids.has(entry.primary.pid)
           || enrolledPids.get(entry.root.pid)?.some((other) => other !== entry)
-          || enrolledPids.get(entry.primary.pid)?.some((other) => other !== entry)) invalid.add(index);
+          || enrolledPids.get(entry.primary.pid)?.some((other) => other !== entry)) reject(index, "pid_collision");
         for (const root of [entry.root, entry.primary]) {
           const identity = key(root);
           if (seen.has(identity)) continue;
@@ -454,13 +502,30 @@ export class WorkerMemoryCommands {
           starts.add(root.startTime);
           pidStarts.set(root.pid, starts);
         }
-      } else if (!hasRoot) invalid.add(index);
+      } else if (!hasRoot) reject(index, "missing_root");
       totals.set(index, total);
     });
-    for (const indices of entryOwners.values()) if (indices.length > 1) for (const index of indices) invalid.add(index);
+    for (const indices of entryOwners.values()) if (indices.length > 1) for (const index of indices) reject(index, "overlap");
     for (const [identity, indices] of owners) {
       const pid = Number(identity.split(":")[0]);
-      if (indices.length > 1 || (pidStarts.get(pid)?.size ?? 0) > 1) for (const index of indices) invalid.add(index);
+      if (indices.length > 1) for (const index of indices) reject(index, "overlap");
+      if ((pidStarts.get(pid)?.size ?? 0) > 1) for (const index of indices) reject(index, "pid_collision");
+    }
+    const rejected: Rejection[] = [];
+    for (const index of [...invalid].sort((a, b) => a - b)) {
+      // Diagnostic copy only: a failure here drops this row and never touches the selection below.
+      try {
+        const candidate = candidates[index];
+        if (!candidate) continue;
+        const o = candidate.observation;
+        const rssBytesApprox = o.available === true && o.complete === true && !unsafeRows.has(index) ? totals.get(index) : undefined;
+        const set = reasons.get(index) ?? new Set<RejectionReason>();
+        rejected.push(Object.freeze({
+          index, runId: candidate.entry.context.run_id, commandId: candidate.entry.commandId,
+          reasons: Object.freeze(REASON_ORDER.filter((reason) => set.has(reason))),
+          ...(rssBytesApprox !== undefined ? { rssBytesApprox } : {}),
+        }));
+      } catch { /* diagnostics are best effort */ }
     }
     const valid: Selection[] = [];
     candidates.forEach(({ entry, observation }, index) => {
@@ -479,7 +544,7 @@ export class WorkerMemoryCommands {
       || (BigInt(a.entry.root.startTime) < BigInt(b.entry.root.startTime) ? -1
         : BigInt(a.entry.root.startTime) > BigInt(b.entry.root.startTime) ? 1 : 0)
       || a.entry.identity.localeCompare(b.entry.identity));
-    return valid[0];
+    return { selection: valid[0], rejected: Object.freeze(rejected) };
   }
 
   /** The next adapter must obtain a fresh complete observation immediately before cancel.

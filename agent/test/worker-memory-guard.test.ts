@@ -319,6 +319,7 @@ async function fixture(options: {
   prepareFeedback?: MonitorPorts["prepareFeedback"];
   preparePreservation?: MonitorPorts["preparePreservation"];
   preservationBudgetMs?: MonitorPorts["preservationBudgetMs"];
+  rejections?: MonitorPorts["rejections"];
   feedback?: MonitorPorts["feedback"];
   preserve?: MonitorPorts["preserve"];
   autoReserve?: boolean;
@@ -395,6 +396,7 @@ async function fixture(options: {
     prepareFeedback: options.prepareFeedback,
     preparePreservation: options.preparePreservation,
     preservationBudgetMs: options.preservationBudgetMs,
+    ...(options.rejections ? { rejections: options.rejections } : {}),
     feedback: async (result, ctx, signal, ms) => { feedback.push(result); await options.feedback?.(result, ctx, signal, ms); },
     preserve: async (ctx, signal, ms) => { preserved.push(ctx); await options.preserve?.(ctx, signal, ms); },
   });
@@ -1483,7 +1485,7 @@ test("memory_diagnostics v1 snapshot for a hard intervention", async () => {
   assert.deepEqual(norm(diagnostics), {
     version: 1, metric: "working_set_v1", clock: "monotonic_ms", settings: pinnedSettings,
     trigger: section, authority: section, authority_same_as_trigger: true,
-    tree: { selected_rss_bytes_approx: 100, selected_started_at_ms: 0, selected_completed_at_ms: 0, candidates: 1, observation_failures: 0,
+    tree: { selected_rss_bytes_approx: 100, selected_started_at_ms: 0, selected_completed_at_ms: 0, candidates: 1, observation_failures: 0, rejections: [],
       cancel_check: { rss_bytes_approx: 100, started_at_ms: 0, completed_at_ms: 0 } },
   });
   assert.equal(Object.isFrozen(diagnostics), true);
@@ -1508,6 +1510,7 @@ test("memory_diagnostics v1 snapshot for an early intervention", async () => {
   const d = norm(diagnostics);
   assert.equal(d.trigger.decision, "early");
   assert.equal(d.trigger.sample_id, 2);
+  assert.deepEqual(d.tree.rejections, []);
   assert.deepEqual(d.trigger.stat_detail, { unavailable: "absent" });
   assert.deepEqual(d.trigger.early, {
     previous_sample_id: 1, previous_started_at_ms: 0, previous_completed_at_ms: 0, previous_working_set_bytes: 700,
@@ -1695,3 +1698,214 @@ for (const branch of ["a", "b", "c"] as const) {
     }
   });
 }
+
+// ---- #4219: why a candidate was not selected ----
+type Fix = Awaited<ReturnType<typeof fixture>>;
+const OTHER_RUN = "55555555-5555-4555-8555-555555555555";
+async function settleObservations(f: Fix) {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  assert.equal(f.timers.size, 1, "only the never-answering observation still holds its deadline timer");
+}
+const unavailableTree = (detail: string, pid = 20): TreeObservation => ({
+  available: false, complete: false, startedAtMs: 0, completedAtMs: 0, rows: [{ pid, startTime: "10", rssBytes: 500 }], detail,
+} as TreeObservation);
+const addTree = (f: Fix, pid: number, observe: () => Promise<TreeObservation>, extra: { toolId?: string; command?: string; context?: Fix["context"] } = {}) =>
+  f.commands.register(extra.context ?? f.context, {
+    source: "codex-model-command", toolId: extra.toolId ?? `tool-${pid}`, attemptId: "attempt",
+    root: { pid, startTime: "10" }, command: extra.command ?? "inert fixture", observe,
+    cancel: async () => {}, drain: async () => ({ confirmed: true }),
+  });
+async function drive(f: Fix, ack = true) {
+  f.monitor.tick();
+  await until(() => f.requests.length === 1);
+  if (ack) f.reservation.resolve(f.ack());
+  await f.monitor.settle();
+}
+const rowsOf = (diagnostics: unknown) => (diagnostics as { tree: { rejections: unknown } }).tree.rejections;
+type DiagTree = { selected_rss_bytes_approx: number; observation_failures: unknown; rejections: unknown };
+
+test("#4219 regression: a larger tree whose observation was unavailable is reported with its reason while the smaller valid tree is selected", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  const larger = addTree(f, 20, async () => unavailableTree("stale"));
+  try {
+    await drive(f);
+    const d = norm(diagnostics) as { tree: DiagTree };
+    assert.equal(d.tree.selected_rss_bytes_approx, 100);
+    assert.equal(f.signals(), 1);
+    assert.equal(f.feedback[0]?.outcome, "confirmed_drained");
+    assert.equal(d.tree.observation_failures, 1);
+    assert.deepEqual(rowsOf(diagnostics), [{
+      run_id: f.input.run_id, command_id: larger.commandId, reasons: ["observation_unavailable"],
+      observation_detail: "stale", rss_bytes_approx: { unavailable: "unknown" },
+    }]);
+  } finally { await f.monitor.stop(); }
+});
+
+test("#4219 a throwing observation of a larger tree is classified observation_threw and selection is unchanged", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  const larger = addTree(f, 20, async () => { throw new Error("boom"); });
+  try {
+    await drive(f);
+    const d = norm(diagnostics) as { tree: DiagTree };
+    assert.equal(d.tree.selected_rss_bytes_approx, 100);
+    assert.equal(f.signals(), 1);
+    assert.equal(f.feedback[0]?.outcome, "confirmed_drained");
+    assert.deepEqual(rowsOf(diagnostics), [{ run_id: f.input.run_id, command_id: larger.commandId,
+      reasons: ["observation_threw"], rss_bytes_approx: { unavailable: "unknown" } }]);
+  } finally { await f.monitor.stop(); }
+});
+
+test("#4219 a phase-filtered candidate is reported as phase with its adapter detail", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  const other = f.commands.begin({ ...f.input, run_id: OTHER_RUN, memory_policy: { version: 1, max_interventions: 2 } });
+  const held = addTree(f, 50, async () => { f.commands.holdPhase(other); return unavailableTree("timeout", 50); }, { context: other });
+  try {
+    await drive(f);
+    const d = norm(diagnostics) as { tree: DiagTree };
+    assert.equal(d.tree.selected_rss_bytes_approx, 100);
+    assert.equal(f.signals(), 1);
+    assert.equal(f.feedback[0]?.outcome, "confirmed_drained");
+    assert.deepEqual(rowsOf(diagnostics), [{ run_id: OTHER_RUN, command_id: held.commandId, reasons: ["phase"],
+      observation_detail: "timeout", rss_bytes_approx: { unavailable: "unknown" } }]);
+  } finally { await f.monitor.stop(); }
+});
+
+test("#4219 a larger tree that never answers exhausts the shared deadline: observation_timed_out and no signal", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  const larger = addTree(f, 20, () => new Promise<TreeObservation>(() => {}));
+  try {
+    f.monitor.tick();
+    await settleObservations(f);
+    f.advance(100);
+    await f.monitor.settle();
+    assert.equal(f.signals(), 0);
+    assert.equal(f.feedback[0]?.outcome, "no_signal");
+    assert.deepEqual(rowsOf(diagnostics), [{ run_id: f.input.run_id, command_id: larger.commandId,
+      reasons: ["observation_timed_out"], rss_bytes_approx: { unavailable: "unknown" } }]);
+  } finally { await f.monitor.stop(); }
+});
+
+test("#4219 an abort that the deadline timer did not fire is observation_interrupted, not a timeout", async () => {
+  const records: { rejections: unknown }[] = [];
+  const f = await fixture({ rejections: (record) => { records.push(record); } });
+  addTree(f, 20, () => new Promise<TreeObservation>(() => {}));
+  try {
+    f.monitor.tick();
+    await settleObservations(f);
+    f.invalidate();
+    await f.monitor.settle();
+    assert.equal(records.length, 1);
+    const rows = records[0]!.rejections as { reasons: string[] }[];
+    assert.deepEqual(rows.find((row) => row.reasons.includes("observation_interrupted"))?.reasons, ["observation_interrupted"]);
+    assert.equal(rows.some((row) => row.reasons.includes("observation_timed_out")), false);
+    assert.equal(f.signals(), 0);
+  } finally { await f.monitor.stop(); }
+});
+
+test("#4219 an adapter detail getter that throws reads unknown and cannot change the selection", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  const hostile = addTree(f, 20, async () => ({ available: false, complete: false, startedAtMs: 0, completedAtMs: 0, rows: [{ pid: 20, startTime: "10", rssBytes: 500 }],
+    get detail(): string { throw new Error("detail boom"); } }) as unknown as TreeObservation);
+  const odd = addTree(f, 30, async () => ({ ...unavailableTree("stale", 30), detail: "not-in-the-closed-set" }) as unknown as TreeObservation);
+  try {
+    await drive(f);
+    const d = norm(diagnostics) as { tree: DiagTree };
+    assert.equal(d.tree.selected_rss_bytes_approx, 100);
+    assert.equal(f.signals(), 1);
+    assert.equal(f.feedback[0]?.outcome, "confirmed_drained");
+    assert.equal(f.feedback[0]?.command_id, f.entry.commandId);
+    assert.equal(d.tree.observation_failures, 2);
+    assert.deepEqual(rowsOf(diagnostics), [
+      { run_id: f.input.run_id, command_id: hostile.commandId, reasons: ["observation_unavailable"], observation_detail: "unknown", rss_bytes_approx: { unavailable: "unknown" } },
+      { run_id: f.input.run_id, command_id: odd.commandId, reasons: ["observation_unavailable"], observation_detail: "unknown", rss_bytes_approx: { unavailable: "unknown" } },
+    ]);
+  } finally { await f.monitor.stop(); }
+});
+
+test("#4219 a projection that throws and a log port that throws never alter identity, signals, reservation or report", async () => {
+  for (const mode of ["projection", "log-port"] as const) {
+    let diagnostics: unknown;
+    const records: { rejections: unknown }[] = [];
+    const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; },
+      rejections: (record) => { records.push(record); if (mode === "log-port") throw new Error("logger boom"); } });
+    addTree(f, 20, async () => unavailableTree("busy"));
+    if (mode === "projection") {
+      const real = f.commands.selectWithRejections.bind(f.commands);
+      f.commands.selectWithRejections = (...args) => {
+        const out = real(...args);
+        return { selection: out.selection, rejected: [{ index: 0, runId: "x", commandId: "y", get reasons(): never { throw new Error("projection boom"); } }] };
+      };
+    }
+    try {
+      await drive(f);
+      const d = norm(diagnostics) as { tree: DiagTree };
+      assert.equal(f.feedback[0]?.run_id, f.input.run_id, mode);
+      assert.equal(f.feedback[0]?.command_id, f.entry.commandId, mode);
+      assert.equal(f.feedback[0]?.outcome, "confirmed_drained", mode);
+      assert.equal(f.signals(), 1, mode);
+      assert.equal(f.requests.length, 1, mode);
+      assert.ok(f.reports.length >= 1, mode);
+      assert.equal(d.tree.selected_rss_bytes_approx, 100, mode);
+      assert.equal(d.tree.observation_failures, 1, mode);
+      assert.equal(records.length, 1, mode);
+      if (mode === "projection") {
+        assert.deepEqual(d.tree.rejections, { unavailable: "error" });
+        assert.deepEqual(records[0]!.rejections, { unavailable: "error" });
+      } else {
+        assert.equal((d.tree.rejections as unknown[]).length, 1);
+      }
+    } finally { await f.monitor.stop(); }
+  }
+});
+
+test("#4219 log record and diagnostics hold only allowlisted keys and no command, tool id or exception text", async () => {
+  let diagnostics: unknown;
+  const records: unknown[] = [];
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; },
+    rejections: (record) => { records.push(record); } });
+  addTree(f, 20, async () => { throw new Error("exception-text-4219"); }, { toolId: "tool-id-4219", command: "command-text-4219 --flag" });
+  addTree(f, 30, async () => unavailableTree("oversize", 30), { toolId: "tool-id-4219-b", command: "command-text-4219-b" });
+  try {
+    await drive(f);
+    assert.equal(records.length, 1);
+    const record = records[0] as Record<string, unknown>;
+    assert.deepEqual(Object.keys(record).sort(), ["candidate_count", "rejections", "selected_command_id", "selected_run_id"]);
+    assert.equal(record.selected_run_id, f.input.run_id);
+    assert.equal(record.selected_command_id, f.entry.commandId);
+    assert.equal(record.candidate_count, 3);
+    for (const row of record.rejections as Record<string, unknown>[]) {
+      assert.ok(Object.keys(row).every((k) => ["run_id", "command_id", "reasons", "observation_detail", "rss_bytes_approx"].includes(k)), Object.keys(row).join());
+    }
+    const text = JSON.stringify(record) + JSON.stringify(diagnostics);
+    for (const secret of ["command-text-4219", "tool-id-4219", "exception-text-4219"]) assert.equal(text.includes(secret), false, secret);
+  } finally { await f.monitor.stop(); }
+});
+
+test("#4219 an unchanged no-selection rejection set is logged once; a changed one is logged again", async () => {
+  const records: { selected_run_id: string | null; rejections: unknown }[] = [];
+  let detail = "busy";
+  const f = await fixture({
+    observe: async () => ({ available: false, complete: false, startedAtMs: 0, completedAtMs: 0, rows: [], detail }) as unknown as TreeObservation,
+    rejections: (record) => { records.push(record); },
+  });
+  try {
+    f.monitor.tick();
+    await f.monitor.settle();
+    f.advance(1);
+    f.monitor.tick();
+    await f.monitor.settle();
+    assert.equal(records.length, 1, "identical no-selection record is skipped");
+    assert.equal(records[0]!.selected_run_id, null);
+    assert.equal(f.requests.length, 0);
+    detail = "stale";
+    f.advance(1);
+    f.monitor.tick();
+    await f.monitor.settle();
+    assert.equal(records.length, 2);
+  } finally { await f.monitor.stop(); }
+});
