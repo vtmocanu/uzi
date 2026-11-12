@@ -159,10 +159,10 @@ func triageLine(t apitypes.TriageDTO) string {
 
 // judgeSkipPhrase is the `uzi review show` line for a recorded judge skip (issue #3257). The
 // harness and reason are server enums, but a --json consumer and this table must not trust
-// them blindly: each maps to FIXED copy, and an unknown value falls back to generic copy
-// built from sanitised text, so nothing a server sends reaches the terminal raw.
+// them blindly: each maps to FIXED copy, and an unknown harness or reason falls back to fixed
+// generic copy, so no server-sent text reaches the terminal at all.
 func judgeSkipPhrase(skip *apitypes.JudgeSkipDTO) string {
-	harness := "The judge's harness"
+	harness := ""
 	switch skip.Harness {
 	case "claude":
 		harness = "Claude"
@@ -172,13 +172,21 @@ func judgeSkipPhrase(skip *apitypes.JudgeSkipDTO) string {
 	var why string
 	switch skip.Reason {
 	case "no_usable_credential":
-		why = harness + " had no usable credential."
+		if harness == "" {
+			why = "The judge's harness had no usable credential."
+		} else {
+			why = harness + " had no usable credential."
+		}
 	case "credential_disabled":
-		why = "the " + harness + " credential is disabled."
+		if harness == "" {
+			why = "the judge's credential is disabled."
+		} else {
+			why = "the " + harness + " credential is disabled."
+		}
 	case "codex_pool_unavailable":
 		why = "no pooled Codex account was available."
 	default:
-		why = "the judge could not run (" + sanitizeTTY(skip.Reason) + ")."
+		why = "the judge could not run."
 	}
 	return "Judge skipped " + skip.At.UTC().Format("2006-01-02") + ": " + why
 }

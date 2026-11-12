@@ -21,7 +21,7 @@ import (
 
 // judge_skip_livedb_test.go covers the visible judge skip of issue #3257: the automatic judge's
 // credential refusal is recorded in judge_skips (after every other gate, never for a rerun),
-// creating a judge clears the record in the same transaction, and the target-row lock keeps a
+// creating a judge clears the record in the same transaction, and the target advisory lock keeps a
 // late skip writer from recording over a judge that exists. Skipped unless
 // UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via ./e2e/run-store-it.sh.
 
@@ -179,6 +179,41 @@ func TestJudgeSkipNotRecordedWhenOtherGatesBlockLiveDB(t *testing.T) {
 			t.Fatalf("judge_skips rows = %d, want 0 behind the spend guard", n)
 		}
 	})
+	// The Claude pre-check (no Anthropic token) records a skip itself, so it must stay BEHIND
+	// Gate 4b and the spend guards. These two subtests run it with a chosen-Claude judge and no
+	// Anthropic token: hoisting the pre-check above either gate would record a skip here.
+	t.Run("claude judge without token: gate 4b fail origin", func(t *testing.T) {
+		env := setupCodexLiveDB(t)
+		userID, repoID := seedCodexOnlyOriginUser(t, env)
+		svc := judgeEnqueueSvc(env, userID)
+		setJudgeRunsOn(env, userID, "claude")
+		target := seedJudgeTarget(t, env, userID, repoID, "codex", 9514)
+		env.exec(`UPDATE runs SET status = 'failed', fail_origin = 'worker_residue_blocked' WHERE id = $1`, target.ID)
+		svc.maybeEnqueueJudge(env.ctx, mustRun(t, env, target.ID))
+		if n := judgeSkipCount(t, env, target.ID); n != 0 {
+			t.Fatalf("judge_skips rows = %d, want 0 behind Gate 4b for a token-less Claude judge", n)
+		}
+	})
+	t.Run("claude judge without token: spend guard daily budget", func(t *testing.T) {
+		env := setupCodexLiveDB(t)
+		userID, repoID := seedCodexOnlyOriginUser(t, env)
+		svc := judgeEnqueueSvc(env, userID)
+		svc.SetSettings(fakeSettings{enabled: true, dailyBudget: 1})
+		setJudgeRunsOn(env, userID, "claude")
+		earlier := seedJudgeTarget(t, env, userID, repoID, "codex", 9515)
+		prior, err := env.q.CreateJudgeRun(env.ctx, store.CreateJudgeRunParams{
+			UserID: userID, TargetRunID: pgconv.UUID(earlier.ID), IssueTitle: "t", TriggerSource: "judge", Harness: "claude",
+		})
+		if err != nil {
+			t.Fatalf("seed prior judge: %v", err)
+		}
+		env.exec(`UPDATE runs SET status = 'completed' WHERE id = $1`, prior.ID)
+		target := seedJudgeTarget(t, env, userID, repoID, "codex", 9516)
+		svc.maybeEnqueueJudge(env.ctx, target)
+		if n := judgeSkipCount(t, env, target.ID); n != 0 {
+			t.Fatalf("judge_skips rows = %d, want 0 behind the spend guard for a token-less Claude judge", n)
+		}
+	})
 }
 
 // TestJudgeRerunClearsSkipInSameCommitLiveDB: a rerun after a recorded skip creates the judge
@@ -226,14 +261,14 @@ func TestJudgeSkipSurvivesRollbackAfterDeleteLiveDB(t *testing.T) {
 	wantSkip(t, env, target.ID, "codex", JudgeSkipNoUsableCredential)
 }
 
-// waitForJudgeSkipLockWait polls until a backend is blocked on the target-row lock, or fails.
+// waitForJudgeSkipLockWait polls until a backend is blocked on the target advisory lock, or fails.
 func waitForJudgeSkipLockWait(t *testing.T, env codexTestEnv) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		var n int
 		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_stat_activity
-		    WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FOR NO KEY UPDATE%'`).Scan(&n); err != nil {
+		    WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%pg_advisory_xact_lock(1970956916%'`).Scan(&n); err != nil {
 			t.Fatalf("pg_stat_activity: %v", err)
 		}
 		if n > 0 {
@@ -306,6 +341,107 @@ func TestJudgeSkipLateWriterLiveDB(t *testing.T) {
 			t.Fatalf("judge_skips rows = %d, want 0 without a txBeginner", n)
 		}
 	})
+}
+
+// TestJudgeTargetLockIsAdvisoryLiveDB: while a creation is held after its insert, a second
+// connection sees exactly one granted advisory lock of class JudgeTargetLockClass keyed on the
+// target, and no row lock on the target is needed to hold it.
+func TestJudgeTargetLockIsAdvisoryLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, repoID := seedClaudeJudgeUser(t, env)
+	svc := judgeEnqueueSvc(env, userID)
+	target := seedJudgeTarget(t, env, userID, repoID, "claude", 9552)
+	checked := false
+	svc.judgeAfterInsertHook = func(context.Context) {
+		checked = true
+		var n int
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_locks
+		    WHERE locktype = 'advisory' AND classid = $1::oid AND objsubid = 2 AND granted
+		      AND objid::bigint = (hashtext($2::text)::bigint & 4294967295)`,
+			int64(uint32(store.JudgeTargetLockClass)), target.ID.String()).Scan(&n); err != nil {
+			t.Errorf("pg_locks: %v", err)
+			return
+		}
+		if n != 1 {
+			t.Errorf("granted advisory locks for the target = %d, want exactly 1", n)
+		}
+	}
+	svc.maybeEnqueueJudge(env.ctx, target)
+	if !checked {
+		t.Fatal("the after-insert hook never ran")
+	}
+	if _, _, ok := judgeForTarget(t, env, target.ID); !ok {
+		t.Fatal("no judge was created")
+	}
+}
+
+// TestJudgeCreateVsCredentialDeleteNoDeadlockLiveDB is the B1 regression: a Codex judge creation
+// held after its insert while another connection runs the real credential delete sequence
+// (LockSecretMutation, GetUserSecretForUpdate, DeleteUserSecret) for a credential the TARGET run
+// is bound to. The delete's runs_codex_secret_fk SET NULL cascade updates the target row; with a
+// row lock on the target that inverted lock order against the creation's Codex freeze (which
+// needs the secret) and deadlocked. With an advisory lock neither side may see SQLSTATE 40P01.
+func TestJudgeCreateVsCredentialDeleteNoDeadlockLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, _, repoID := env.seedCodexInfra(t)
+	seedDefaultAnthropicToken(t, env, userID)
+	key := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), codexToken("sk"))
+	makeCodexDefault(t, env, key)
+	svc := judgeEnqueueSvc(env, userID)
+	setJudgeRunsOn(env, userID, "codex")
+	target := seedJudgeTarget(t, env, userID, repoID, "codex", 9553)
+	env.exec(`UPDATE runs SET codex_secret_id = $2, codex_auth_mode = 'api_key' WHERE id = $1`, target.ID, key)
+
+	deleteDone := make(chan error, 1)
+	svc.judgeAfterInsertHook = func(context.Context) {
+		go func() {
+			deleteDone <- func() error {
+				tx, err := env.pool.Begin(env.ctx)
+				if err != nil {
+					return err
+				}
+				defer func() { _ = tx.Rollback(env.ctx) }()
+				q := store.New(tx)
+				if err := q.LockSecretMutation(env.ctx, userID); err != nil {
+					return err
+				}
+				if _, err := q.GetUserSecretForUpdate(env.ctx, store.GetUserSecretForUpdateParams{ID: key, UserID: userID}); err != nil {
+					return err
+				}
+				if _, err := q.DeleteUserSecret(env.ctx, store.DeleteUserSecretParams{ID: key, UserID: userID}); err != nil {
+					return err
+				}
+				return tx.Commit(env.ctx)
+			}()
+		}()
+		// Let the delete run to completion, or to a blocked state, before the creation goes on
+		// to its freeze: a lock-order inversion needs both sides mid-flight.
+		select {
+		case err := <-deleteDone:
+			deleteDone <- err
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	_, createErr := svc.RerunJudge(env.ctx, userID, false, target.ID)
+	var delErr error
+	select {
+	case delErr = <-deleteDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the credential delete never finished")
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(createErr, &pgErr) && pgErr.Code == "40P01" {
+		t.Fatalf("judge creation was a deadlock victim: %v", createErr)
+	}
+	if delErr != nil {
+		t.Fatalf("credential delete failed (a 40P01 here is the deadlock): %v", delErr)
+	}
+	var n int
+	if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM user_secrets WHERE id = $1`, key).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("credential rows after delete = %d (err %v), want 0", n, err)
+	}
+	t.Logf("creation outcome (FK/freeze error or success are both acceptable): %v", createErr)
 }
 
 // TestJudgeSkipCommittedAfterCreationBeganLiveDB: a skip committed by another connection after

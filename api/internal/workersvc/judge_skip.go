@@ -20,8 +20,8 @@ import (
 // The reason vocabulary of judge_skips.reason. JudgeSkipReasons is the ONE list; the table's
 // CHECK constraint repeats it and TestJudgeSkipReasonsMatchCheckLiveDB pins the two together.
 const (
-	JudgeSkipNoUsableCredential   = "no_usable_credential"
-	JudgeSkipCredentialDisabled   = "credential_disabled"
+	JudgeSkipNoUsableCredential   = "no_usable_credential" //nolint:gosec // G101: fixed skip reason code, not a credential
+	JudgeSkipCredentialDisabled   = "credential_disabled"  //nolint:gosec // G101: fixed skip reason code, not a credential
 	JudgeSkipCodexPoolUnavailable = "codex_pool_unavailable"
 )
 
@@ -77,15 +77,19 @@ func judgeSkipReasonFor(err error) (string, bool) {
 }
 
 // lockJudgeTargetForCreate is the first part of every judge insert closure, run on the
-// creating transaction q before CreateJudgeRun: assert READ COMMITTED, lock the target row,
-// and delete the target's skip record.
+// creating transaction q before CreateJudgeRun: assert READ COMMITTED, take the target's
+// advisory lock, and delete the target's skip record.
 //
+// The lock is a transaction-scoped advisory lock keyed on the target (store.JudgeTargetLockClass),
+// not a row lock, so it never conflicts with an FK cascade or any other writer of the run row.
 // The lock and the record/delete are separate statements on purpose. The skip writer
 // (recordJudgeSkip) takes the same lock before its NOT EXISTS check, so the two serialize on
-// the target row; under READ COMMITTED each later statement takes a fresh snapshot, so the
+// the target key; under READ COMMITTED each later statement takes a fresh snapshot, so the
 // writer's check sees a judge committed before the lock was granted, and this closure's
-// delete sees a skip committed before the lock was granted. A single statement would have
-// taken its snapshot before waiting for the lock.
+// delete sees a skip committed before the lock was granted. The existence read inside the lock
+// statement uses its pre-wait snapshot, which is fine: the reads that must be fresh are those
+// LATER statements, and they must never be folded into the lock statement. No fencing argument
+// relies on lock-before-read order inside the lock statement.
 func (s *Service) lockJudgeTargetForCreate(ctx context.Context, q Store, targetRunID uuid.UUID) error {
 	level, err := q.CurrentTransactionIsolation(ctx)
 	if err != nil {

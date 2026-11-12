@@ -458,6 +458,25 @@ func TestHTTPClientReviewPendingJudge(t *testing.T) {
 	}
 }
 
+// The envelope's "skip" key (issue #3257) decodes into the third return value; a mistagged
+// field would silently drop it and the CLI would print "not judged".
+func TestHTTPClientReviewSkip(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"review":null,"pending_judge":null,"skip":{"harness":"codex","reason":"no_usable_credential","at":"2026-11-10T23:30:00Z"}}`))
+	}))
+	defer srv.Close()
+	rv, pj, skip, err := newTestClient(srv).RunReview(context.Background(), "r1")
+	if err != nil || rv != nil || pj != nil {
+		t.Fatalf("rv=%v pj=%v err=%v, want (nil, nil, skip, nil)", rv, pj, err)
+	}
+	if skip == nil {
+		t.Fatal("skip = nil, want the decoded skip")
+	}
+	if skip.Harness != "codex" || skip.Reason != "no_usable_credential" || !skip.At.Equal(time.Date(2026, 11, 10, 23, 30, 0, 0, time.UTC)) {
+		t.Fatalf("skip = %+v", skip)
+	}
+}
+
 // A real 404 (run absent or not visible) is exit 4 — reserved, distinct from the
 // null-review exit-0 path above.
 func TestHTTPClientReview404(t *testing.T) {

@@ -591,6 +591,31 @@ func TestReviewShowJudgeSkip(t *testing.T) {
 			t.Errorf("an escape byte from the server reached the terminal: %q", out)
 		}
 	})
+	t.Run("an unknown reason with a newline cannot forge extra lines", func(t *testing.T) {
+		for _, harness := range []string{"codex", "gemini"} {
+			fc := &uzicli.FakeClient{
+				Reviews:    map[string]*apitypes.ReviewDTO{"r1": nil},
+				JudgeSkips: map[string]*apitypes.JudgeSkipDTO{"r1": {Harness: harness, Reason: "other\nrun r2: FORGED ROW", At: at}},
+			}
+			out, _, _ := runCLI(t, fakeEnv(fc), "review", "show", "r1")
+			if strings.Contains(out, "FORGED") || strings.Contains(out, "other") {
+				t.Errorf("harness %s: server reason text reached the terminal: %q", harness, out)
+			}
+			if lines := strings.Split(strings.TrimRight(out, "\n"), "\n"); len(lines) != 1 {
+				t.Errorf("harness %s: output has %d lines, want 1: %q", harness, len(lines), out)
+			}
+		}
+	})
+	t.Run("an unknown harness reads grammatically", func(t *testing.T) {
+		fc := &uzicli.FakeClient{
+			Reviews:    map[string]*apitypes.ReviewDTO{"r1": nil},
+			JudgeSkips: map[string]*apitypes.JudgeSkipDTO{"r1": {Harness: "gemini", Reason: "credential_disabled", At: at}},
+		}
+		out, _, _ := runCLI(t, fakeEnv(fc), "review", "show", "r1")
+		if !strings.Contains(out, "Judge skipped 2026-11-10: the judge's credential is disabled.") {
+			t.Errorf("unexpected copy for an unknown harness: %q", out)
+		}
+	})
 	t.Run("a pending judge outranks a stale skip", func(t *testing.T) {
 		fc := &uzicli.FakeClient{
 			Reviews:       map[string]*apitypes.ReviewDTO{"r1": nil},
