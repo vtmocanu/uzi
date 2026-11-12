@@ -2283,11 +2283,96 @@ ORDER BY e.claim_generation ASC;
 -- 'credential_switch' run message. pgx.ErrNoRows means there is NO prior epoch (a first claim), so
 -- no switch. NOT owner-scoped: the caller is inside the claim transaction with the run row locked,
 -- and this reads the run's OWN journal by run_id — the owner-scoped read is ListRunCredentialEpochs.
-SELECT run_id, claim_generation, secret_id, label, select_reason, applied_at
-FROM run_credential_epochs
-WHERE run_id = @run_id AND claim_generation < @claim_generation
-ORDER BY claim_generation DESC
+--
+-- Issue #4201: in-place applies journal child epochs in run_credential_switch_epochs, so the
+-- candidates are the union of both tables and the winner is the highest (generation, ordinal);
+-- a base epoch has ordinal 0. The output shape is unchanged.
+SELECT run_id, claim_generation, secret_id, label, select_reason, applied_at FROM (
+    SELECT b.run_id, b.claim_generation, 0 AS ordinal, b.secret_id, b.label, b.select_reason, b.applied_at
+    FROM run_credential_epochs b
+    WHERE b.run_id = @run_id AND b.claim_generation < @claim_generation
+    UNION ALL
+    SELECT c.run_id, c.claim_generation, c.ordinal, c.secret_id, c.label, c.select_reason, c.applied_at
+    FROM run_credential_switch_epochs c
+    WHERE c.run_id = @run_id AND c.claim_generation < @claim_generation
+) e
+ORDER BY claim_generation DESC, ordinal DESC
 LIMIT 1;
+
+-- name: RecordCodexCredentialEpoch :exec
+-- Issue #4201: the Codex claim's journal row without RecordRunCredentialEpoch's settled_switch CTE
+-- (Codex never takes the Claude held-switch path, so it must not clear a Claude switch stamp).
+-- Idempotent on the claim.
+INSERT INTO run_credential_epochs (run_id, claim_generation, secret_id, label, select_reason, applied_at)
+VALUES (@run_id, @claim_generation, sqlc.narg('secret_id'), sqlc.narg('label'), sqlc.narg('select_reason'), now())
+ON CONFLICT (run_id, claim_generation) DO NOTHING;
+
+-- name: InsertRunCredentialSwitchEpoch :one
+-- Issue #4201: journal one in-place applied switch. The ordinal is the next free one for the
+-- (run, generation); op_id is UNIQUE, so a retry of the same operation hits the unique violation
+-- (the caller reads it back with GetRunCredentialSwitchEpochByOp first). The caller holds the run
+-- row lock, which serializes concurrent ordinal computation.
+INSERT INTO run_credential_switch_epochs (
+    run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
+    label, select_reason, message_seq, old_cumulative)
+SELECT @run_id, @claim_generation::bigint,
+       (SELECT COALESCE(max(ordinal), 0) + 1 FROM run_credential_switch_epochs
+         WHERE run_id = @run_id AND claim_generation = @claim_generation::bigint),
+       @op_id, sqlc.narg('worker_id'), sqlc.narg('secret_id'), @secret_enablement_rev,
+       sqlc.narg('label'), sqlc.narg('select_reason'), @message_seq, sqlc.narg('old_cumulative')
+RETURNING run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
+          label, select_reason, message_seq, old_cumulative, applied_at;
+
+-- name: GetRunCredentialSwitchEpochByOp :one
+SELECT run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
+       label, select_reason, message_seq, old_cumulative, applied_at
+FROM run_credential_switch_epochs
+WHERE op_id = @op_id AND run_id = @run_id;
+
+-- name: MaxCommittedCredentialEpochOrdinal :one
+-- Highest applied child-epoch ordinal for the claim, 0 when none.
+SELECT COALESCE(max(ordinal), 0)::int FROM run_credential_switch_epochs
+WHERE run_id = @run_id AND claim_generation = @claim_generation;
+
+-- name: ClearCredentialSwitchStampByOp :execrows
+-- Issue #4201: withdraw the pending switch stamp, but only if it is still the operation named.
+UPDATE runs
+SET credential_switch_requested_at = NULL,
+    credential_switch_generation = NULL,
+    updated_at = now()
+WHERE id = @id AND credential_switch_op_id = @op_id;
+
+-- name: LockAnthropicSecretForApply :one
+-- Issue #4201: share-lock the Anthropic token an in-place apply is about to use, so a concurrent
+-- disable, rotate or delete (which take FOR UPDATE) waits for the apply transaction.
+SELECT id, user_id, kind, ciphertext, sealed_with, disabled_at, anthropic_rejected_at, enablement_rev
+FROM user_secrets
+WHERE id = @id AND user_id = @user_id AND kind = 'anthropic_token'
+FOR SHARE;
+
+-- name: StampWorkerCredentialSwitchApplyNonce :exec
+UPDATE workers SET credential_switch_apply_nonce = @nonce WHERE id = @id;
+
+-- name: ListRunCredentialSwitchEpochs :many
+-- Owner-scoped child epochs for one run, oldest first (the sibling of ListRunCredentialEpochs).
+SELECT e.run_id, e.claim_generation, e.ordinal, e.op_id, e.worker_id, e.secret_id,
+       e.secret_enablement_rev, e.label, e.select_reason, e.message_seq, e.old_cumulative, e.applied_at
+FROM run_credential_switch_epochs e
+JOIN runs r ON r.id = e.run_id
+WHERE e.run_id = @run_id AND r.user_id = @user_id
+ORDER BY e.claim_generation ASC, e.ordinal ASC;
+
+-- name: ListRunUsageByCredentialEpoch :many
+-- Issue #4201: the raw run_usage legs of one run with their epoch attribution, for Go-side
+-- telescoping per (claim_generation, credential_epoch_ordinal). Same columns the run_usage_totals
+-- view (00244) folds over: model, lineage_epoch, lineage_index, usage_basis, tokens and cost.
+SELECT run_id, session_id, model, lineage_epoch, lineage_index, usage_basis, claim_generation,
+       credential_epoch_ordinal, input_tokens, cache_read_tokens, cache_creation_tokens,
+       output_tokens, cost_usd, cost_status
+FROM run_usage
+WHERE run_id = @run_id
+ORDER BY claim_generation ASC NULLS FIRST, credential_epoch_ordinal ASC NULLS FIRST,
+         model ASC, lineage_index ASC, lineage_epoch ASC;
 
 -- name: SetRunCredentialOverride :execrows
 -- Write the per-run credential override columns for `uzi run set-token` (PRD #1247 M4,
@@ -4840,6 +4925,13 @@ UPDATE runs SET
     -- beginClaimMutation's worker lock, so status_since orders with the lock.
     status_since                   = clock_timestamp(),
     hold_reason                    = 'credential_switch_settling',
+    -- Issue #4201: hold identity. SET-list column refs read the OLD row, so this captures the op id
+    -- of the stamp being consumed here (the trigger nulls runs.credential_switch_op_id with the stamp).
+    -- The identity columns are nulled by trigger when hold_reason leaves the two switch holds.
+    credential_switch_hold_op_id          = runs.credential_switch_op_id,
+    credential_switch_hold_generation     = @generation::bigint,
+    credential_switch_hold_worker_id      = @worker_id,
+    credential_switch_hold_register_nonce = @register_nonce::text,
     credential_switch_requested_at = NULL,
     credential_switch_generation   = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -4847,10 +4939,15 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.worker_id = @worker_id
   AND runs.claim_generation = @generation
   AND runs.claim_released_at IS NULL
-  AND runs.status = 'running'
+  -- Issue #4201: an op-fenced hold (in-place apply) may also park a run in an awaiting_* state; the
+  -- legacy un-fenced caller stays running-only.
+  AND (runs.status = 'running'
+       OR (sqlc.narg('op_id')::uuid IS NOT NULL
+           AND runs.status IN ('awaiting_approval', 'awaiting_input', 'awaiting_followup')))
   AND runs.kind NOT IN ('job', 'cross_check')
   AND runs.credential_switch_requested_at IS NOT NULL
   AND runs.credential_switch_generation = @generation
+  AND (sqlc.narg('op_id')::uuid IS NULL OR runs.credential_switch_op_id = sqlc.narg('op_id')::uuid)
   -- Incarnation: the reporting process must be the CURRENT registration. An old incarnation's
   -- delayed hold, queued on the worker lock behind a re-registration that kept this run at the
   -- same claim_generation, carries the superseded nonce and is refused here.
@@ -4914,7 +5011,10 @@ WHERE r.id = sqlc.arg('run_id')::uuid AND r.status = 'paused'
 UPDATE runs SET
     credential_override_mode       = @mode,
     credential_override_secret_id  = @secret_id,
-    credential_switch_requested_at = now(),
+    -- Strictly increasing per run (issue #4201): the credential_switch_op_id trigger mints a new op id
+    -- whenever this value changes, so a restamp inside one transaction (now() would repeat) must
+    -- still differ from the previous stamp. Read the minted id back with GetRunCredentialSwitchOpID.
+    credential_switch_requested_at = GREATEST(clock_timestamp(), COALESCE(credential_switch_requested_at, '-infinity'::timestamptz) + interval '1 microsecond'),
     credential_switch_generation   = @generation,
     updated_at                     = now()
 WHERE id = @id
@@ -4938,7 +5038,15 @@ WHERE id = @id
   AND worker_id = @worker_id
   AND claim_generation = @generation
   AND claim_released_at IS NULL
-  AND credential_switch_requested_at IS NOT NULL;
+  AND credential_switch_requested_at IS NOT NULL
+  -- Issue #4201: optional op fence. NULL keeps the pre-existing "any pending stamp" behaviour.
+  AND (sqlc.narg('op_id')::uuid IS NULL OR runs.credential_switch_op_id = sqlc.narg('op_id')::uuid);
+
+-- name: GetRunCredentialSwitchOpID :one
+-- Issue #4201: the operation id the credential_switch_op_id trigger minted for the run's pending
+-- switch stamp (NULL when no stamp is pending). StampHeldCredentialSwitch stays :execrows; the
+-- caller reads the id back in the same transaction.
+SELECT credential_switch_op_id FROM runs WHERE id = @id;
 
 -- name: ClearPauseRequest :execrows
 -- Clear a pending pause request WITHOUT parking (PRD #1190 M1), for the worker's
@@ -8933,8 +9041,8 @@ RETURNING runs.id, runs.user_id, runs.status;
 -- run_messages.claim_generation -> run_credential_epochs). A legacy caller (NULL narg) stores NULL,
 -- byte-identical to before, and the fence behaviour is unchanged (the WHERE still reads the narg).
 WITH ins AS (
-    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload, claim_generation)
-    SELECT @run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload, sqlc.narg('claim_generation')::bigint
+    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload, claim_generation, credential_epoch_ordinal)
+    SELECT @run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload, sqlc.narg('claim_generation')::bigint, sqlc.narg('credential_epoch_ordinal')::int
     -- PRD #1497 M1 (D16): claim_released_at IS NULL is REQUIRED even for a generation-less (legacy)
     -- report, so a released OLD flight persists nothing whether or not it stamps a generation; a live
     -- claim still honours a NULL generation (the compatibility contract). ClaimRun clears the flag,
@@ -9108,7 +9216,7 @@ ORDER BY s.seq DESC NULLS LAST;
 -- ListRunMessagesForWorkerPage's, in the same order the ALTER TABLE adds them.
 -- Diverge and sqlc mints per-query Row types for BOTH, breaking workersvc.Store's
 -- []store.RunMessage contract (a compile error at cmd/server/main.go).
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation, credential_epoch_ordinal
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
@@ -9120,7 +9228,7 @@ ORDER BY seq ASC;
 -- Column order is IDENTICAL to ListRunMessagesAfter so the row stays
 -- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
 -- in the same order the ALTER TABLE adds them — see that query's note.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation, credential_epoch_ordinal
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC
@@ -9135,7 +9243,7 @@ LIMIT @lim;
 -- the row stays store.RunMessage. New columns must be APPENDED to ALL THREE of these
 -- queries in the same order the ALTER TABLE adds them — see ListRunMessagesAfter's
 -- note. Diverge and sqlc mints a per-query Row type, breaking that []store.RunMessage.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation, credential_epoch_ordinal
 FROM run_messages
 WHERE run_id = @run_id AND seq < @before_seq
 ORDER BY seq DESC
@@ -9194,10 +9302,10 @@ LIMIT @lim;
 -- never its evidence — the frame stamp on run_messages is the evidence.
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,
-    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, usage_basis, lineage_index, claim_generation, updated_at
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, usage_basis, lineage_index, claim_generation, credential_epoch_ordinal, updated_at
 ) VALUES (
     @run_id, @session_id, @model, @lineage_epoch,
-    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, @usage_basis, @lineage_index, sqlc.narg('claim_generation')::bigint, now()
+    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, @usage_basis, @lineage_index, sqlc.narg('claim_generation')::bigint, sqlc.narg('credential_epoch_ordinal')::int, now()
 )
 ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
@@ -9220,6 +9328,8 @@ ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     -- Provenance is set-once: keep an established non-null generation, never clobber it with a
     -- later same-leg frame's EXCLUDED (M9, D7). A NULL existing value adopts EXCLUDED.
     claim_generation      = COALESCE(run_usage.claim_generation, EXCLUDED.claim_generation),
+    -- Issue #4201: the epoch ordinal is provenance too, set-once like claim_generation.
+    credential_epoch_ordinal = COALESCE(run_usage.credential_epoch_ordinal, EXCLUDED.credential_epoch_ordinal),
     cost_status           = CASE
                                 WHEN run_usage.cost_status = EXCLUDED.cost_status THEN run_usage.cost_status
                                 ELSE 'unreported'
@@ -9755,7 +9865,7 @@ ORDER BY u.id;
 -- ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
 -- the `init` markers CountRunInitFramesBefore counts and the success result frames;
 -- error carries a failed turn's result frame. This is a few dozen rows per run.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation, credential_epoch_ordinal
 FROM run_messages
 WHERE run_id = @run_id AND kind IN ('status', 'error', 'progress_note', 'summary_usage')
 ORDER BY seq ASC;
@@ -9849,7 +9959,7 @@ WHERE r.id = @id AND r.user_id = @user_id AND r.kind NOT IN ('judge', 'job', 'cr
 -- Column order matches the table (see ListRunMessagesAfter) so the row stays
 -- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
 -- in the same order the ALTER TABLE adds them — see that query's note.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation, credential_epoch_ordinal
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC
