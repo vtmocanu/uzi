@@ -32,7 +32,7 @@ func TestFullClaimCarriesAttestedSourceLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close) // before any track call: the tracked delete needs the pool open
 	box := newBox(t)
 	q := store.New(pool)
 

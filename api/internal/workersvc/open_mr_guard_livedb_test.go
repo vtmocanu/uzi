@@ -49,7 +49,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close) // before any track call: the tracked delete needs the pool open
 	q := store.New(pool)
 	// nil box + nil forge: the guard fires (or does not) BEFORE any forge round-trip, and
 	// guardDefaultBranch is a no-op with a nil guard — the same minimal wiring the sibling
