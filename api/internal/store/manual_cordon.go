@@ -19,7 +19,10 @@ var ErrManualCordonEphemeral = errors.New("manual cordon is only supported for p
 func WorkerAcceptsNewIntake(w Worker) bool {
 	return !w.ManualCordonedAt.Valid && !w.DrainingSince.Valid && !w.MaintenanceFenced &&
 		w.MaintenancePhase != "requested" && w.MaintenancePhase != "ready" &&
-		w.MaintenancePhase != "stopping" && w.MaintenancePhase != "recycling"
+		w.MaintenancePhase != "stopping" && w.MaintenancePhase != "recycling" &&
+		// Not == "none": partial-struct callers leave HibernationState empty.
+		w.HibernationState != "preparing" && w.HibernationState != "hibernated" &&
+		w.HibernationState != "waking"
 }
 
 type cordonTxBeginner interface {

@@ -113,7 +113,38 @@ type DesiredWorker struct {
 	// token", never invent one, never clear the existing Secret on account of it,
 	// and never log this field.
 	JoinToken *string `json:"join_token"`
+	// Hibernation is set only while the worker is preparing, hibernated or waking
+	// (PRD #4205); omitted for an awake worker.
+	Hibernation *Hibernation `json:"hibernation,omitempty"`
 }
+
+// Hibernation is a worker's hibernation state as the controller sees it (PRD #4205).
+// State is one of preparing|hibernated|waking; the api sends the field only when the
+// worker is not awake, so a nil Hibernation means "awake" and an old controller that
+// does not know the field behaves exactly as before.
+type Hibernation struct {
+	State string `json:"state"`
+	OpID  string `json:"op_id"`
+}
+
+// HibernationTransition is the body the controller reports for one step of a
+// hibernation or wake operation (PRD #4205). The transition names are a closed set.
+type HibernationTransition struct {
+	OpID            string `json:"op_id"`
+	Transition      string `json:"transition"`
+	DeploymentUID   string `json:"deployment_uid"`
+	ResourceVersion string `json:"resource_version,omitempty"`
+	PodUID          string `json:"pod_uid,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+}
+
+// HibernationTransition.Transition values.
+const (
+	TransitionRefused     = "refused"
+	TransitionScalingDown = "scaling_down"
+	TransitionScaledDown  = "scaled_down"
+	TransitionReady       = "ready"
+)
 
 // ---------------------------------------------------------------------------
 // Status report (controller -> api), PRD #113 M3.
@@ -155,6 +186,9 @@ type StatusReport struct {
 	// independently.
 	WorkerImageTag string         `json:"worker_image_tag"`
 	Workers        []WorkerStatus `json:"workers"`
+	// Hibernation is the highest hibernation protocol version this controller speaks
+	// (PRD #4205); omitted by a controller that predates the feature.
+	Hibernation int `json:"hibernation,omitempty"`
 }
 
 // The closed phase enum, and it is the WIRE contract: the api matches on these

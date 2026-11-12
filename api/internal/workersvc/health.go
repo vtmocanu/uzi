@@ -1666,6 +1666,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 						DrainingSince:     worker.DrainingSince,
 						MaintenanceFenced: worker.MaintenanceFenced,
 						MaintenancePhase:  worker.MaintenancePhase,
+						HibernationState:  worker.HibernationState,
 					}) && !worker.Ephemeral && !worker.IsolatedLane &&
 						slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) &&
 						slices.Contains(worker.ProtocolCapabilities, requiredProtocol) &&

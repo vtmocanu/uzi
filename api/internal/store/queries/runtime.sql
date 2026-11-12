@@ -1171,6 +1171,8 @@ WITH checker_template_pins AS MATERIALIZED (
       -- NULL is unrestricted; the deadline includes the account's recovery spread.
       AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
       AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
+        -- Hibernation (PRD #4205) fences every claim, resume-pinned runs included.
+        AND c.hibernation_state = 'none'
         AND (fn_worker_accepts_new_intake(c)
              OR r.worker_id = c.id))
       AND r.kind <> 'chat' AND NOT r.cross_check_lane

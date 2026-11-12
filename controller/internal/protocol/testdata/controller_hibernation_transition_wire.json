@@ -1,0 +1,15 @@
+[
+  {
+    "op_id": "55555555-5555-5555-5555-555555555555",
+    "transition": "scaled_down",
+    "deployment_uid": "deployment-uid",
+    "resource_version": "12345",
+    "pod_uid": "66666666-6666-6666-6666-666666666666",
+    "reason": "pods absent"
+  },
+  {
+    "op_id": "55555555-5555-5555-5555-555555555555",
+    "transition": "scaling_down",
+    "deployment_uid": "deployment-uid"
+  }
+]
