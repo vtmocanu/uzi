@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,8 +29,9 @@ func advertisedWanted() []*plumbing.Reference {
 	return []*plumbing.Reference{plumbing.NewHashReference(wantedRef, plumbing.NewHash("1111111111111111111111111111111111111111"))}
 }
 
-// An ender returns a context and the function a stage calls to end it: cancel for a cancel
-// context; for a deadline context, wait until its short deadline has passed.
+// An ender returns a context and the function a stage calls to end it. Both kinds end ONLY
+// when the stage calls end, so scheduling delay before the stage can never end the context
+// early at a different stage.
 type ender func(t *testing.T) (context.Context, func())
 
 func cancelEnder(t *testing.T) (context.Context, func()) {
@@ -39,10 +41,41 @@ func cancelEnder(t *testing.T) (context.Context, func()) {
 }
 
 func deadlineEnder(t *testing.T) (context.Context, func()) {
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(20*time.Millisecond))
-	t.Cleanup(cancel)
-	return ctx, func() { <-ctx.Done() }
+	ctx := &stageDeadline{done: make(chan struct{})}
+	t.Cleanup(ctx.expire)
+	return ctx, ctx.expire
 }
+
+// stageDeadline is a context whose deadline expires when the stage calls expire, not on a
+// timer: Err becomes context.DeadlineExceeded before Done closes, as the Context contract
+// requires. Deadline reports none because no wall-clock deadline exists.
+type stageDeadline struct {
+	done chan struct{}
+	once sync.Once
+	mu   sync.Mutex
+	err  error
+}
+
+func (c *stageDeadline) expire() {
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.err = context.DeadlineExceeded
+		c.mu.Unlock()
+		close(c.done)
+	})
+}
+
+func (c *stageDeadline) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *stageDeadline) Done() <-chan struct{} { return c.done }
+
+func (c *stageDeadline) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+func (c *stageDeadline) Value(any) any { return nil }
 
 func TestFetchWantedPrefersContextError(t *testing.T) {
 	cases := []struct {
