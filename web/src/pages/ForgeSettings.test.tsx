@@ -243,6 +243,76 @@ describe("ForgeSettings privilege surfacing", () => {
   });
 });
 
+describe("ForgeSettings — duplicate-connection guard (issue #412)", () => {
+  const tokenInput = () => document.querySelector('input[type="password"]') as HTMLInputElement;
+  const replaceBox = () =>
+    screen.getByRole("checkbox", { name: /replace the existing connection/i }) as HTMLInputElement;
+
+  it("explains the 409 instead of showing a generic connect failure", async () => {
+    mockApi.createConnection.mockRejectedValue(
+      new ApiError(409, "a connection to this forge already exists", {
+        code: "forge_connection_exists",
+        connection_id: "conn-1",
+      }),
+    );
+    renderPage();
+    await screen.findByText("unchecked"); // page loaded
+    fireEvent.change(tokenInput(), { target: { value: "glpat-dup" } });
+    fireEvent.submit(document.querySelector("form") as HTMLFormElement);
+
+    // The copy names both real options, not just "it failed".
+    expect(await screen.findByText(/a connection to this forge already exists/i)).toBeTruthy();
+    expect(screen.getByText(/enable it on the existing connection below/i)).toBeTruthy();
+    expect(screen.getByText(/use Replace credential/i)).toBeTruthy();
+  });
+
+  it("sends replace=true only when the operator ticks the box", async () => {
+    mockApi.createConnection.mockResolvedValue({ connection: conn() });
+    renderPage();
+    await screen.findByText("unchecked");
+
+    // Unticked by default: a plain connect must never rotate a stored credential.
+    expect(replaceBox().checked).toBe(false);
+    fireEvent.change(tokenInput(), { target: { value: "glpat-new" } });
+    fireEvent.submit(document.querySelector("form") as HTMLFormElement);
+    await waitFor(() =>
+      expect(mockApi.createConnection).toHaveBeenCalledWith(
+        "https://gitlab.example.com",
+        "glpat-new",
+        "gitlab",
+        false,
+      ),
+    );
+
+    // Ticked: the explicit opt-in reaches the API.
+    mockApi.createConnection.mockClear();
+    fireEvent.click(replaceBox());
+    fireEvent.change(tokenInput(), { target: { value: "glpat-rotated" } });
+    fireEvent.submit(document.querySelector("form") as HTMLFormElement);
+    await waitFor(() =>
+      expect(mockApi.createConnection).toHaveBeenCalledWith(
+        "https://gitlab.example.com",
+        "glpat-rotated",
+        "gitlab",
+        true,
+      ),
+    );
+  });
+
+  it("clears the replace opt-in after a successful connect", async () => {
+    // A sticky checkbox would silently rotate the NEXT connection's credential.
+    mockApi.createConnection.mockResolvedValue({ connection: conn() });
+    renderPage();
+    await screen.findByText("unchecked");
+    fireEvent.click(replaceBox());
+    expect(replaceBox().checked).toBe(true);
+    fireEvent.change(tokenInput(), { target: { value: "glpat-rotated" } });
+    fireEvent.submit(document.querySelector("form") as HTMLFormElement);
+
+    await waitFor(() => expect(replaceBox().checked).toBe(false));
+  });
+});
+
 describe("ForgeSettings — forge-type picker (PRD #65 D11, lands dark)", () => {
   const tokenInput = () => document.querySelector('input[type="password"]') as HTMLInputElement;
 
