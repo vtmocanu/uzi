@@ -2965,7 +2965,12 @@ case "$SCENARIO" in
     dw_bounded_run 'DIAG_SLOW=25'
     [ "$(dw_count . "$S/limiter-calls")" = 3 ] || fail "budget: expected exactly 3 issued reads: $(cat "$S/limiter-calls")"
     [ "$(grep -c 'MISSING-EVIDENCE: docker wiring diagnostics: budget exhausted, skipped' <<< "$OUT")" = 4 ] || fail "budget: 4 skipped reads must be reported: $OUT"
-    [ "$(cut -d' ' -f1 "$S/limiter-calls" | tr '\n' ' ')" = '10 10 9 ' ] || fail "budget: per-read limits must be 10 10 9: $(cat "$S/limiter-calls")"
+    # SECONDS keeps counting real time on top of the simulated 25s steps, so a slow host can shave one
+    # second off the third read's remaining budget: its clamp is 9, or 8 when a real second ticked.
+    case "$(cut -d' ' -f1 "$S/limiter-calls" | tr '\n' ' ')" in
+      '10 10 9 ' | '10 10 8 ') ;;
+      *) fail "budget: per-read limits must be 10 10 then the clamped remainder (9, or 8 after a real tick): $(cat "$S/limiter-calls")" ;;
+    esac
     # The last read is clamped to the remaining budget (remaining 59, 32, 5), so the total stays bounded.
     dw_bounded_run 'DIAG_SLOW=27'
     [ "$(cut -d' ' -f1 "$S/limiter-calls" | tr '\n' ' ')" = '10 10 5 ' ] || fail "budget: the last read must be clamped to 5s: $(cat "$S/limiter-calls")"
