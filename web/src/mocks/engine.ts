@@ -659,6 +659,7 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
       appendMessage(runId, "status", null, { text: "cancel requested" });
       patchRun(runId, {
         ...(run.recovery_wait_cause === "worker_memory_pressure" ? { memory_hold: undefined, recovery_wait_cause: null } : {}),
+        ...(run.recovery_wait_cause === "anthropic_spend_limit" ? { recovery_wait_cause: null } : {}),
         status: run.status === "queued" ? "cancelled" : "failed",
         failure_reason: run.status === "queued" ? null : "run cancelled",
         // The server stamps the deliberate-stop signal (PRD #33), so a cancel that

@@ -138,6 +138,7 @@ const PARK_TABLE: Record<string, "automatic" | "owner"> = {
   codex_idle_stall_unknown: "owner",
   worker_requeue_exhausted: "owner",
   worker_memory_pressure: "owner",
+  anthropic_spend_limit: "owner",
 };
 
 // Documented divergences from the server's needs_owner / progressing tag in

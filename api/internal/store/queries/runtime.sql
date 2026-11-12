@@ -2635,6 +2635,8 @@ UPDATE runs SET
                ELSE 0 END,
     updated_at       = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = @id AND worker_id = @worker_id
@@ -3067,6 +3069,8 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = @id AND worker_id = @worker_id
@@ -3791,6 +3795,32 @@ WHERE id = @id AND worker_id = @worker_id
   AND kind NOT IN ('judge', 'job', 'cross_check')
 RETURNING *;
 
+-- name: ResumeAnthropicSpendLimitHold :one
+-- Owner Resume of an anthropic_spend_limit hold: one ordinary queued attempt whose next claim
+-- re-selects the credential through the run's own claim ladder (a run-pinned secret is kept; auto
+-- mode may pick another pooled token, issue #4163), no new allowance, grant or episode.
+-- Mirrors ResumeDataVolumeFullHold. The hold's recovery_wait_phase is not meaningful for this
+-- cause (the worker never writes one), so it is not consulted; stop_kind and the wall-budget
+-- clauses are kept, exactly as the disk resume.
+UPDATE runs SET
+    status = 'queued', status_since = now(),
+    recovery_wait_cause = NULL, recovery_retry_not_before = NULL,
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN runs.started_at IS NOT NULL
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
+    claim_released_at = now(),
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
+  AND recovery_wait_cause = 'anthropic_spend_limit' AND recovery_retry_not_before IS NULL
+  AND COALESCE(stop_kind, '') = ''
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
+       OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+          - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+RETURNING *;
+
 -- name: ResumeDataVolumeFullHold :one
 -- One ordinary queued attempt, without a new allowance, grant or episode.
 -- Custody and all recovery allowances survive Resume.
@@ -3990,6 +4020,10 @@ WHERE id = @id AND user_id = @user_id AND status = @status::text;
 -- cause fence below is what keeps this timer promoter off that cause, whatever its stamp: that
 -- hold is resumed only by the account (PromoteCodexAccountWaitRun, PRD #1590 D3).
 --
+-- anthropic_spend_limit is an owner-held hold (always a NULL stamp, so never promoted by NULL <= @now);
+-- it is fenced out by cause here too as defence in depth. Only the owner's Resume
+-- (ResumeAnthropicSpendLimitHold), set-token (PromoteRecoveryWaitRunNow) or Cancel moves it.
+--
 -- session_id, worker_id and recovery_retry_not_before are left in place as affinity/history
 -- exactly as PromoteLimitWaitRuns leaves limit_wait's. A stale recovery_retry_not_before
 -- cannot re-fire this statement because the status predicate has already moved.
@@ -4000,6 +4034,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'anthropic_spend_limit'
   AND runs.recovery_retry_not_before <= @now
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -4054,6 +4089,7 @@ WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FRO
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'anthropic_spend_limit'
   AND runs.recovery_retry_not_before <= @now
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -4085,7 +4121,8 @@ RETURNING id, user_id, status;
 
 -- name: PromoteRecoveryWaitRunNow :execrows
 -- The SINGLE-ROW early promote of ONE owner's recovery_wait run for `uzi run set-token`
--- (PRD #1247 M4, D4). Mirrors PromoteRecoveryWaitRuns' mutation set field-for-field, but
+-- (PRD #1247 M4, D4). Mirrors PromoteRecoveryWaitRuns' mutation set field-for-field (plus the
+-- owner streak reset and the spend-only claim fence below), but
 -- for one owner+run and WITHOUT the recovery_retry_not_before guard — the owner chose a
 -- new credential, so the run is returned to `queued` at once rather than sleeping to the
 -- capped recovery cadence.
@@ -4097,9 +4134,19 @@ RETURNING id, user_id, status;
 -- lifetime cap and this is not a new park). recovery_wait is not a usage limit, so there is
 -- no limit_dead_secret_id to preserve here.
 --
+-- The ONE cause-scoped exception to "left in place": for recovery_wait_cause =
+-- 'anthropic_spend_limit' this also stamps claim_released_at = now(), exactly as
+-- ResumeAnthropicSpendLimitHold does, so the old claim is fenced. Otherwise a delayed
+-- old-generation `failed` report (SetRunFailed is fenced by claim_released_at IS NULL plus
+-- generation) could overwrite the owner's set-token decision before the run is reclaimed;
+-- ClaimRun clears the stamp. Every other cause keeps claim_released_at unchanged.
+--
 -- Owner- and status-scoped (user_id + status = 'recovery_wait'): a run that moved out of
 -- recovery_wait between the verb's read and this write is a 0-row no-op the service
 -- surfaces as a 409 (raced), and a foreign run can never be promoted.
+--
+-- anthropic_spend_limit is deliberately NOT excluded: the owner chose a new credential, which
+-- is one of the three ways forward out of that hold (the others are Resume and Cancel).
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
@@ -4162,6 +4209,7 @@ UPDATE runs SET
     provider_park_count = 0, provider_park_streak_started_at = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
+    claim_released_at = CASE WHEN runs.recovery_wait_cause = 'anthropic_spend_limit' THEN now() ELSE runs.claim_released_at END,
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -4984,6 +5032,8 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
@@ -5222,6 +5272,8 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
@@ -5344,6 +5396,8 @@ UPDATE runs SET
     policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
@@ -5439,6 +5493,8 @@ UPDATE runs SET
     policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
@@ -10963,7 +11019,7 @@ SELECT id, runs.user_id, status, auto_approve,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
-       harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
+       harness, codex_material_revision, codex_secret_id, worker_id, claim_generation, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'

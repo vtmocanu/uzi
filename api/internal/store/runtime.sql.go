@@ -11272,7 +11272,7 @@ SELECT id, runs.user_id, status, auto_approve,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
-       harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
+       harness, codex_material_revision, codex_secret_id, worker_id, claim_generation, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
@@ -11391,6 +11391,7 @@ type ListActiveRunsForHealthRow struct {
 	CodexMaterialRevision     pgtype.Int8        `json:"codex_material_revision"`
 	CodexSecretID             pgtype.UUID        `json:"codex_secret_id"`
 	WorkerID                  pgtype.UUID        `json:"worker_id"`
+	ClaimGeneration           int64              `json:"claim_generation"`
 	ReleasedWorkerID          pgtype.UUID        `json:"released_worker_id"`
 	EgressProfileID           pgtype.UUID        `json:"egress_profile_id"`
 	JobProtocol               pgtype.Int2        `json:"job_protocol"`
@@ -11518,6 +11519,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.CodexMaterialRevision,
 			&i.CodexSecretID,
 			&i.WorkerID,
+			&i.ClaimGeneration,
 			&i.ReleasedWorkerID,
 			&i.EgressProfileID,
 			&i.JobProtocol,
@@ -18644,6 +18646,7 @@ UPDATE runs SET
     provider_park_count = 0, provider_park_streak_started_at = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
+    claim_released_at = CASE WHEN runs.recovery_wait_cause = 'anthropic_spend_limit' THEN now() ELSE runs.claim_released_at END,
     updated_at = now()
 WHERE runs.id = $1 AND runs.user_id = $2 AND runs.status = 'recovery_wait'
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -18673,7 +18676,8 @@ type PromoteRecoveryWaitRunNowParams struct {
 }
 
 // The SINGLE-ROW early promote of ONE owner's recovery_wait run for `uzi run set-token`
-// (PRD #1247 M4, D4). Mirrors PromoteRecoveryWaitRuns' mutation set field-for-field, but
+// (PRD #1247 M4, D4). Mirrors PromoteRecoveryWaitRuns' mutation set field-for-field (plus the
+// owner streak reset and the spend-only claim fence below), but
 // for one owner+run and WITHOUT the recovery_retry_not_before guard — the owner chose a
 // new credential, so the run is returned to `queued` at once rather than sleeping to the
 // capped recovery cadence.
@@ -18685,9 +18689,19 @@ type PromoteRecoveryWaitRunNowParams struct {
 // lifetime cap and this is not a new park). recovery_wait is not a usage limit, so there is
 // no limit_dead_secret_id to preserve here.
 //
+// The ONE cause-scoped exception to "left in place": for recovery_wait_cause =
+// 'anthropic_spend_limit' this also stamps claim_released_at = now(), exactly as
+// ResumeAnthropicSpendLimitHold does, so the old claim is fenced. Otherwise a delayed
+// old-generation `failed` report (SetRunFailed is fenced by claim_released_at IS NULL plus
+// generation) could overwrite the owner's set-token decision before the run is reclaimed;
+// ClaimRun clears the stamp. Every other cause keeps claim_released_at unchanged.
+//
 // Owner- and status-scoped (user_id + status = 'recovery_wait'): a run that moved out of
 // recovery_wait between the verb's read and this write is a 0-row no-op the service
 // surfaces as a 409 (raced), and a foreign run can never be promoted.
+//
+// anthropic_spend_limit is deliberately NOT excluded: the owner chose a new credential, which
+// is one of the three ways forward out of that hold (the others are Resume and Cancel).
 func (q *Queries) PromoteRecoveryWaitRunNow(ctx context.Context, arg PromoteRecoveryWaitRunNowParams) (int64, error) {
 	result, err := q.db.Exec(ctx, promoteRecoveryWaitRunNow, arg.ID, arg.UserID)
 	if err != nil {
@@ -18704,6 +18718,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'anthropic_spend_limit'
   AND runs.recovery_retry_not_before <= $1
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -18758,6 +18773,7 @@ WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FRO
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'anthropic_spend_limit'
   AND runs.recovery_retry_not_before <= $1
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -18795,6 +18811,10 @@ type PromoteRecoveryWaitRunsRow struct {
 // (ParkRunCodexAccountUnavailable, ParkRunningCodexAccountUnavailable and ParkQueuedCodexAccountUnavailablePage) write NULL. The
 // cause fence below is what keeps this timer promoter off that cause, whatever its stamp: that
 // hold is resumed only by the account (PromoteCodexAccountWaitRun, PRD #1590 D3).
+//
+// anthropic_spend_limit is an owner-held hold (always a NULL stamp, so never promoted by NULL <= @now);
+// it is fenced out by cause here too as defence in depth. Only the owner's Resume
+// (ResumeAnthropicSpendLimitHold), set-token (PromoteRecoveryWaitRunNow) or Cancel moves it.
 //
 // session_id, worker_id and recovery_retry_not_before are left in place as affinity/history
 // exactly as PromoteLimitWaitRuns leaves limit_wait's. A stale recovery_retry_not_before
@@ -21211,6 +21231,284 @@ WHERE id = $1
 func (q *Queries) ResetRunGateRefusals(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, resetRunGateRefusals, id)
 	return err
+}
+
+const resumeAnthropicSpendLimitHold = `-- name: ResumeAnthropicSpendLimitHold :one
+UPDATE runs SET
+    status = 'queued', status_since = now(),
+    recovery_wait_cause = NULL, recovery_retry_not_before = NULL,
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN runs.started_at IS NOT NULL
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
+    claim_released_at = now(),
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = $1 AND user_id = $2 AND status = 'recovery_wait'
+  AND recovery_wait_cause = 'anthropic_spend_limit' AND recovery_retry_not_before IS NULL
+  AND COALESCE(stop_kind, '') = ''
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
+       OR (COALESCE(runs.budget_wall_seconds, $3::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+          - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, retained_park_count, ignored_inferred_capabilities, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset, reserve_exempt_prior_pct, hinted_capabilities, capability_inference_evidence, idle_stall_park_count, forge_admission, codex_select_reason, recovery_wait_phase, plan_cross_check_gated, policy_preserve_required, policy_pending_fresh, policy_outcome_id, policy_continuation_mode, policy_resolved_at, policy_applying_worker_id, policy_applying_generation, policy_source_generation, policy_refusal_count, policy_refusal_tag, policy_refusal_phase, policy_refusal_correlation_id, policy_hold_published, harness_preferred, harness_decision_reason, harness_preferred_score, harness_other_score, harness_preferred_measured, harness_other_measured, harness_preferred_held, harness_other_held, harness_preferred_weekly_reset_at, harness_other_weekly_reset_at, registration_evidence_generation, registration_evidence_nonce, registration_evidence_epoch, snapshot_departed_generation, snapshot_departed_nonce, snapshot_departed_epoch, repo_agent_source_commit, repo_agent_source_required, agent_source_requested, agent_source_requested_basis, plan_agent_source, ci_fix_mr_iid, policy_required_head, policy_recovery_verified_generation, policy_recovery_verified_head, policy_hold_cause, policy_fresh_consumed_generation, policy_fresh_confirmed_generation
+`
+
+type ResumeAnthropicSpendLimitHoldParams struct {
+	ID                   uuid.UUID `json:"id"`
+	UserID               uuid.UUID `json:"user_id"`
+	GlobalTimeoutSeconds int32     `json:"global_timeout_seconds"`
+}
+
+// Owner Resume of an anthropic_spend_limit hold: one ordinary queued attempt whose next claim
+// re-selects the credential through the run's own claim ladder (a run-pinned secret is kept; auto
+// mode may pick another pooled token, issue #4163), no new allowance, grant or episode.
+// Mirrors ResumeDataVolumeFullHold. The hold's recovery_wait_phase is not meaningful for this
+// cause (the worker never writes one), so it is not consulted; stop_kind and the wall-budget
+// clauses are kept, exactly as the disk resume.
+func (q *Queries) ResumeAnthropicSpendLimitHold(ctx context.Context, arg ResumeAnthropicSpendLimitHoldParams) (Run, error) {
+	row := q.db.QueryRow(ctx, resumeAnthropicSpendLimitHold, arg.ID, arg.UserID, arg.GlobalTimeoutSeconds)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+		&i.LimitDeadSecretID,
+		&i.ReportOnly,
+		&i.ReportMd,
+		&i.CiConfigPaths,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
+		&i.ReviewTargetRunID,
+		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
+		&i.PreservedPatch,
+		&i.RequiredCapabilities,
+		&i.StopReason,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.Interactive,
+		&i.OpenFollowupID,
+		&i.PlanChangedFiles,
+		&i.ScopeCeiling,
+		&i.StatusSince,
+		&i.ReviewComments,
+		&i.BudgetPausedSeconds,
+		&i.MrReworkEnabled,
+		&i.TriggerSource,
+		&i.CheckpointTip,
+		&i.UsageRefolded,
+		&i.CodexSecretID,
+		&i.CodexAuthMode,
+		&i.CodexSecretLabel,
+		&i.CodexAccountKey,
+		&i.CodexMaterialRevision,
+		&i.CodexAccountRevision,
+		&i.CodexClaimEpoch,
+		&i.CodexCapHash,
+		&i.PauseRequestedAt,
+		&i.PauseMode,
+		&i.PauseAfterCount,
+		&i.CheckpointTipAt,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
+		&i.CompletionContractVersion,
+		&i.ContractRevision,
+		&i.CompletionContract,
+		&i.CompletionAttempts,
+		&i.LatestCompletionAttempt,
+		&i.MilestonesAgents,
+		&i.HoldReason,
+		&i.HoldCapturedHead,
+		&i.CompletionBudgetExhaustedAt,
+		&i.CompletionQuestionAt,
+		&i.BudgetExtensionSeconds,
+		&i.ClaimGeneration,
+		&i.Harness,
+		&i.RecoveryWaitCause,
+		&i.ForgeParkCount,
+		&i.CredentialOverrideMode,
+		&i.CredentialOverrideSecretID,
+		&i.ClaimReleasedAt,
+		&i.CredentialSwitchRequestedAt,
+		&i.CredentialSwitchGeneration,
+		&i.StaleRequeueGeneration,
+		&i.BudgetFinalizeSeconds,
+		&i.ReleasedWorkerID,
+		&i.ReleasedWorkerNonce,
+		&i.GateRevision,
+		&i.GatePresentationID,
+		&i.GatePresentedPayload,
+		&i.GatePayloadDigest,
+		&i.GateRefusalCount,
+		&i.GateRefusalGeneration,
+		&i.DiskParkCount,
+		&i.CheckpointContainsLatest,
+		&i.EgressProfileID,
+		&i.EgressSnapshot,
+		&i.JobType,
+		&i.FinalizeResumeGeneration,
+		&i.JobProtocol,
+		&i.FirstStartedAt,
+		&i.PlanCrossCheckRequired,
+		&i.PlanCrossCheckGateReason,
+		&i.IssueRawDigest,
+		&i.IssueSavedBody,
+		&i.IssueInputReason,
+		&i.AutoApproveBlockedReasons,
+		&i.PlanCrossCheckDiffRefusal,
+		&i.WorkerRecoveryEpisode,
+		&i.RequeueEpisodeBaseline,
+		&i.WorkerRecoveryEvidence,
+		&i.CrossCheckLane,
+		&i.CrossCheckLaneGeneration,
+		&i.CompletionFinalHead,
+		&i.CodeCrossCheckRequired,
+		&i.ProviderParkCount,
+		&i.ProviderParkStreakStartedAt,
+		&i.CiConfigGuard,
+		&i.MemoryEpisode,
+		&i.MemoryInterventionCount,
+		&i.MemoryPolicy,
+		&i.CompletionNonClosingReason,
+		&i.CiArtifactManifest,
+		&i.CheckpointAttestedSource,
+		&i.SourcePublicationIntent,
+		&i.ContinuedIssueIid,
+		&i.CheckpointCoordinates,
+		&i.RetainedParkCount,
+		&i.IgnoredInferredCapabilities,
+		&i.ReserveHoldReason,
+		&i.ReserveExemptUntil,
+		&i.ReserveExemptGrantedAt,
+		&i.ReserveExemptCredentialID,
+		&i.ReserveExemptWindowReset,
+		&i.ReserveExemptPriorPct,
+		&i.HintedCapabilities,
+		&i.CapabilityInferenceEvidence,
+		&i.IdleStallParkCount,
+		&i.ForgeAdmission,
+		&i.CodexSelectReason,
+		&i.RecoveryWaitPhase,
+		&i.PlanCrossCheckGated,
+		&i.PolicyPreserveRequired,
+		&i.PolicyPendingFresh,
+		&i.PolicyOutcomeID,
+		&i.PolicyContinuationMode,
+		&i.PolicyResolvedAt,
+		&i.PolicyApplyingWorkerID,
+		&i.PolicyApplyingGeneration,
+		&i.PolicySourceGeneration,
+		&i.PolicyRefusalCount,
+		&i.PolicyRefusalTag,
+		&i.PolicyRefusalPhase,
+		&i.PolicyRefusalCorrelationID,
+		&i.PolicyHoldPublished,
+		&i.HarnessPreferred,
+		&i.HarnessDecisionReason,
+		&i.HarnessPreferredScore,
+		&i.HarnessOtherScore,
+		&i.HarnessPreferredMeasured,
+		&i.HarnessOtherMeasured,
+		&i.HarnessPreferredHeld,
+		&i.HarnessOtherHeld,
+		&i.HarnessPreferredWeeklyResetAt,
+		&i.HarnessOtherWeeklyResetAt,
+		&i.RegistrationEvidenceGeneration,
+		&i.RegistrationEvidenceNonce,
+		&i.RegistrationEvidenceEpoch,
+		&i.SnapshotDepartedGeneration,
+		&i.SnapshotDepartedNonce,
+		&i.SnapshotDepartedEpoch,
+		&i.RepoAgentSourceCommit,
+		&i.RepoAgentSourceRequired,
+		&i.AgentSourceRequested,
+		&i.AgentSourceRequestedBasis,
+		&i.PlanAgentSource,
+		&i.CiFixMrIid,
+		&i.PolicyRequiredHead,
+		&i.PolicyRecoveryVerifiedGeneration,
+		&i.PolicyRecoveryVerifiedHead,
+		&i.PolicyHoldCause,
+		&i.PolicyFreshConsumedGeneration,
+		&i.PolicyFreshConfirmedGeneration,
+	)
+	return i, err
 }
 
 const resumeCodexIdleStall = `-- name: ResumeCodexIdleStall :one
@@ -23689,6 +23987,8 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = $13 AND worker_id = $14
@@ -23855,6 +24155,8 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = $3 AND worker_id = $4 AND (kind <> 'cross_check' OR claim_generation > 0)
@@ -23922,6 +24224,8 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = $4 AND worker_id = $5 AND (kind <> 'cross_check' OR claim_generation > 0)
@@ -24122,6 +24426,8 @@ UPDATE runs SET
     policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = $12 AND runs.worker_id = $13 AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
@@ -24643,6 +24949,8 @@ UPDATE runs SET
     policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = $5 AND worker_id = $6 AND (kind <> 'cross_check' OR claim_generation > 0)
@@ -26210,6 +26518,8 @@ UPDATE runs SET
                ELSE 0 END,
     updated_at       = now()
 WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  -- Owner-held Anthropic spend-limit hold (always NULL retry): the same late-report refusal.
+  AND NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'anthropic_spend_limit')
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = $23 AND worker_id = $24

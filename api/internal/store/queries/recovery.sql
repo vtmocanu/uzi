@@ -158,7 +158,7 @@ WHERE target.id = @id AND target.state = 'open' AND NOT target.inventory_guarded
       SELECT 1 FROM locked_run r
       WHERE r.status = 'recovery_wait'
         AND (r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
-             OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL))
+             OR (r.recovery_wait_cause IN ('data_volume_full', 'anthropic_spend_limit') AND r.recovery_retry_not_before IS NULL))
   );
 
 -- name: DiscardCaptureForOwner :one
@@ -282,7 +282,7 @@ WHERE h.state = 'open' AND NOT h.inventory_guarded
                     WHERE r.id = h.run_id
                       AND r.status = 'recovery_wait'
                       AND (r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
-                           OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL)))
+                           OR (r.recovery_wait_cause IN ('data_volume_full', 'anthropic_spend_limit') AND r.recovery_retry_not_before IS NULL)))
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id
@@ -396,7 +396,7 @@ WHERE run_id = @run_id
   AND state = 'open' AND NOT inventory_guarded
   AND NOT EXISTS (SELECT 1 FROM locked_run r WHERE r.status = 'recovery_wait'
       AND (r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
-           OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL)));
+           OR (r.recovery_wait_cause IN ('data_volume_full', 'anthropic_spend_limit') AND r.recovery_retry_not_before IS NULL)));
 
 -- name: GetCustodyHoldForSettle :one
 -- Issue #1582 M1: the exact hold the predecessor-settle endpoint names, scoped to its run so a
@@ -973,7 +973,7 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
   AND h.generation = @generation AND h.original_worker_id = @worker_id::uuid
   AND h.live_worker_id = @worker_id::uuid AND h.inventory_guarded AND h.state = 'open'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id
-    AND r.status = 'recovery_wait' AND r.recovery_wait_cause = 'data_volume_full'
+    AND r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('data_volume_full', 'anthropic_spend_limit')
     AND r.recovery_retry_not_before IS NULL)
   AND EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.user_id = h.user_id
     AND (r.claim_generation > h.generation OR (r.claim_generation = h.generation AND
@@ -1043,7 +1043,7 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
     AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IS NOT NULL
       AND (r.recovery_wait_cause IN ('worker_requeue_exhausted',
       'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
-           OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL))))
+           OR (r.recovery_wait_cause IN ('data_volume_full', 'anthropic_spend_limit') AND r.recovery_retry_not_before IS NULL))))
   AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = @final_capture_id::uuid
     AND c.hold_id = h.id AND c.run_id = h.run_id AND c.user_id = h.user_id
     AND c.original_worker_id = h.original_worker_id AND c.source_sha = @final_source_sha::text

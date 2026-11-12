@@ -60,7 +60,7 @@ func ScrubKnownTokens(s string) string {
 // trace. Log tails pass the driver's connection-PAT scrub (M1) plus a known-token
 // scrub here. A single unreadable trace degrades to an empty tail, not a
 // whole-snapshot failure.
-func BuildFailureSnapshot(ctx context.Context, f forge.Forge, projectID int64, ps store.PipelineStatus, maxJobs, logTailBytes int) (FailureSnapshot, error) {
+func BuildFailureSnapshot(ctx context.Context, f forge.CodeHost, projectID int64, ps store.PipelineStatus, maxJobs, logTailBytes int) (FailureSnapshot, error) {
 	snap := FailureSnapshot{
 		PipelineID: ps.PipelineID,
 		Ref:        ps.Ref,

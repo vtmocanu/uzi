@@ -56,6 +56,12 @@ type gitLab struct {
 	logClient *http.Client
 }
 
+// The driver implements both halves of the Forge contract (PRD #4173).
+var (
+	_ IssueTracker = (*gitLab)(nil)
+	_ CodeHost     = (*gitLab)(nil)
+)
+
 // newGitLab builds a GitLab driver against baseURL using token, with a bounded
 // per-call HTTP timeout. The official client's retryable transport already
 // honors 429 + Retry-After and backs off on 5xx; we route it through our

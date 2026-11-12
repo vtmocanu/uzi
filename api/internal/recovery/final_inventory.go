@@ -55,7 +55,7 @@ func finalInventoryEligible(hold store.RecoveryCustodyHold, workerID uuid.UUID, 
 	}
 	// Owner-held recovery causes leave custody for an owner decision (Resume/Cancel),
 	// even when the claim was released; a worker's FINAL proof must not end it implicitly.
-	if run.status == "recovery_wait" && run.parkCause.Valid && (run.parkCause.String == "worker_requeue_exhausted" || run.parkCause.String == "worker_memory_pressure" || run.parkCause.String == "retained_recovery_exhausted" || run.parkCause.String == "retained_recovery_adoption_failed" || run.parkCause.String == "retained_continuation_unwitnessed" || (run.parkCause.String == "data_volume_full" && !run.retry.Valid)) {
+	if run.status == "recovery_wait" && run.parkCause.Valid && (run.parkCause.String == "worker_requeue_exhausted" || run.parkCause.String == "worker_memory_pressure" || run.parkCause.String == "retained_recovery_exhausted" || run.parkCause.String == "retained_recovery_adoption_failed" || run.parkCause.String == "retained_continuation_unwitnessed" || ((run.parkCause.String == "data_volume_full" || run.parkCause.String == "anthropic_spend_limit") && !run.retry.Valid)) {
 		return false
 	}
 	// A forge_unreachable park is a pre-clone park of a generation that may have adopted nothing:

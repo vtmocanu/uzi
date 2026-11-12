@@ -292,7 +292,8 @@ func (s *Service) ResolvePublicationContext(ctx context.Context, w store.Worker,
 	if err != nil {
 		return publicationUnknown("forge_unknown")
 	}
-	summary, err := f.GetMergeRequestSummary(readCtx, snapshot.ProjectID, answer.Binding.MRIID)
+	var ch forge.CodeHost = f
+	summary, err := ch.GetMergeRequestSummary(readCtx, snapshot.ProjectID, answer.Binding.MRIID)
 	if err != nil {
 		return publicationUnknown("forge_unknown")
 	}

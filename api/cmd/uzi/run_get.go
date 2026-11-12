@@ -242,6 +242,10 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 					}
 					return drain()
 				}
+				if isSpendLimitHold(run) {
+					_, _ = fmt.Fprintf(env.Stderr, "run %s %s\n", cellText(args[0]), spendLimitHoldLine(run))
+					return drain()
+				}
 				if isForgeOwnerHold(run) {
 					for _, line := range append([]string{forgeParkLine(run)}, forgeHoldLines(run)...) {
 						_, _ = fmt.Fprintln(env.Stderr, line)

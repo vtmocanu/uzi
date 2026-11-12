@@ -3,7 +3,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { readEpochReclaimDeletionActivation } from "../src/pod-epoch-reclaim.js";
+import { readEpochReclaimDeletionActivation, readEpochScratchDeletionActivation } from "../src/pod-epoch-reclaim.js";
 
 const NAME = "UZI_EPOCH_RECLAIM_DELETION";
 const read = (env: Record<string, string | undefined>) => readEpochReclaimDeletionActivation(env as NodeJS.ProcessEnv);
@@ -47,4 +47,43 @@ test("the env name lives in one agent/src file and main parses it once from proc
   assert.ok(main.indexOf("readEpochReclaimDeletionActivation(process.env)") < main.indexOf("createPodEpoch("),
     "the activation is parsed before the epoch runtime exists");
   assert.ok(main.includes('"pod_epoch_reclaim_activation"'));
+});
+
+test("scratch: activation is off when unset, empty or 0, whatever else the env carries", () => {
+  assert.equal(readEpochScratchDeletionActivation({}), false);
+  assert.equal(readEpochScratchDeletionActivation({ UZI_EPOCH_SCRATCH_DELETION: "" }), false);
+  assert.equal(readEpochScratchDeletionActivation({ UZI_EPOCH_SCRATCH_DELETION: "0" }), false);
+  assert.equal(readEpochScratchDeletionActivation({ UZI_EPOCH_SCRATCH_DELETION: "0", UZI_EPOCH_LOCK: "1", DOCKER_HOST: "tcp://127.0.0.1:2375" }), false);
+});
+
+test("scratch: activation 1 needs the epoch lock and a Docker wiring signal (DOCKER_HOST or UZI_DIND_SOCKET)", () => {
+  assert.equal(readEpochScratchDeletionActivation({ UZI_EPOCH_SCRATCH_DELETION: "1", UZI_EPOCH_LOCK: "1", DOCKER_HOST: "tcp://127.0.0.1:2375" }), true);
+  assert.equal(readEpochScratchDeletionActivation({ UZI_EPOCH_SCRATCH_DELETION: "1", UZI_EPOCH_LOCK: "1", UZI_DIND_SOCKET: "/run/docker.sock" }), true);
+  const refusal = /^Error: UZI_EPOCH_SCRATCH_DELETION=1 requires an epoch-locked, Docker-wired worker \(UZI_EPOCH_LOCK=1 and DOCKER_HOST or UZI_DIND_SOCKET\)$/;
+  for (const env of [
+    { UZI_EPOCH_SCRATCH_DELETION: "1", DOCKER_HOST: "tcp://127.0.0.1:2375" },
+    { UZI_EPOCH_SCRATCH_DELETION: "1", UZI_EPOCH_LOCK: "1" },
+    { UZI_EPOCH_SCRATCH_DELETION: "1", UZI_EPOCH_LOCK: "1", DOCKER_HOST: "   " },
+    { UZI_EPOCH_SCRATCH_DELETION: "1", UZI_EPOCH_LOCK: "0", DOCKER_HOST: "tcp://127.0.0.1:2375" },
+  ]) assert.throws(() => readEpochScratchDeletionActivation(env), (e: Error) => refusal.test(String(e)), JSON.stringify(env));
+});
+
+test("scratch: any other activation value is a startup error, without trimming", () => {
+  for (const value of [" 1", "1 ", "true", "2", "on", "00", "false"]) {
+    assert.throws(() => readEpochScratchDeletionActivation({ UZI_EPOCH_SCRATCH_DELETION: value, UZI_EPOCH_LOCK: "1", DOCKER_HOST: "tcp://127.0.0.1:2375" }),
+      /^Error: UZI_EPOCH_SCRATCH_DELETION must be unset, empty, 0 or 1$/, JSON.stringify(value));
+  }
+});
+
+test("scratch activation is parsed once before runtime creation, wired and logged independently", async () => {
+  const main = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  assert.equal(main.match(/readEpochScratchDeletionActivation\(process\.env\)/g)?.length, 1);
+  assert.ok(main.indexOf("readEpochScratchDeletionActivation(process.env)") < main.indexOf("createPodEpoch("));
+  assert.match(main, /scratch: buildPodEpochScratchDeps\(\{ git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion \}\)/);
+  assert.match(main, /"pod_epoch_reclaim_activation", \{ deletion_requested: epochReclaimDeletion, scratch_requested: epochScratchDeletion \}/);
+  for (const attempt of ["0", "1"]) {
+    assert.equal(readEpochScratchDeletionActivation({ UZI_EPOCH_SCRATCH_DELETION: "0", UZI_EPOCH_RECLAIM_DELETION: attempt }), false);
+    assert.equal(readEpochScratchDeletionActivation({ UZI_EPOCH_SCRATCH_DELETION: "1", UZI_EPOCH_RECLAIM_DELETION: attempt,
+      UZI_EPOCH_LOCK: "1", UZI_DIND_SOCKET: "/run/docker.sock" }), true);
+  }
 });

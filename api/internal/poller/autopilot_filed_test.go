@@ -37,7 +37,7 @@ func filedCandidate(author string) (*apStore, *apRuns, *apFiledForge) {
 }
 
 func detectFiled(st *apStore, runs *apRuns, f *apFiledForge) {
-	NewAutopilot(st, runs, apLabeler{label: apLabel}).detect(context.Background(), repoRow(), f)
+	NewAutopilot(st, runs, apLabeler{label: apLabel}).detect(context.Background(), repoRow(), f, f)
 }
 
 func assertFiledLabelsRetained(t *testing.T, f *apFiledForge) {

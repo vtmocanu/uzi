@@ -1,6 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { copyFileSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -168,6 +169,51 @@ it("syncs the small tree and is idempotent", () => {
     assert.deepEqual(written, ["agent/src/codex/codex-runtime-probe.ts", "docs/pin.md", "e2e/codex-m4/large-resume.test.ts", "e2e/codex-m4/token-resume.test.ts"]);
     assert.equal(readFileSync(join(dir, "docs/pin.md"), "utf8"), `binary at ${INSTALL_ROOT}${NEXT.version}/bin/codex\n`);
     assert.deepEqual(syncCodexPins(dir), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("never rewrites a recorded adoption assertion, even malformed text containing a live pin", () => {
+  const file = "agent/codex/codex-package.adopted";
+  // Even an invalid assertion is not sync's to repair or re-certify.
+  for (const suffix of ["", `binary at ${INSTALL_ROOT}${current.version}/bin/codex\n`]) {
+    const assertion = `lock-sha256=${"a".repeat(64)}\nruntime-tag=rust-v${current.version}\n${suffix}`;
+    const dir = smallTree((files) => { files[LOCK] = bumped(realLock); files[file] = assertion; });
+    try {
+      assert.ok(!scannedPinFiles(dir).includes(file), "adoption is excluded from live-pin discovery");
+      assert.ok(!syncCodexPins(dir).includes(file));
+      assert.equal(readFileSync(join(dir, file), "utf8"), assertion, "sync does not certify adoption");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+it("a synchronized runtime bump still fails the release adoption guard until hand-recorded", () => {
+  const file = "agent/codex/codex-package.adopted";
+  const assertion = `lock-sha256=${createHash("sha256").update(realLock).digest("hex")}\nruntime-tag=rust-v${current.version}\n`;
+  const cutter = readFileSync(join(root, ".agents/skills/uzi-release/scripts/release-cut.sh"), "utf8");
+  // Exercise the real planner guard without the unrelated release ceremony.
+  const start = cutter.indexOf("codex_adoption_record_matches() {");
+  const end = cutter.indexOf("\n}\n", start);
+  assert.ok(start >= 0 && end > start);
+  const guard = `${cutter.slice(start, end + 3)}\ncodex_adoption_record_matches HEAD\n`;
+  const dir = smallTree((files) => { files[file] = assertion; });
+  const commit = () => { git(dir, "add", "-A"); git(dir, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "fixture"); };
+  const check = () => spawnSync("bash", ["-s"], { cwd: dir, input: guard, encoding: "utf8" });
+  try {
+    commit();
+    assert.equal(check().status, 0, "the original committed assertion authorizes its lock");
+    writeFileSync(join(dir, LOCK), bumped(realLock));
+    syncCodexPins(dir);
+    assert.equal(readFileSync(join(dir, file), "utf8"), assertion);
+    commit();
+    assert.equal(check().status, 1, "pin sync cannot authorize the bumped runtime for nightly release");
+    const nextLock = readFileSync(join(dir, LOCK));
+    writeFileSync(join(dir, file), `lock-sha256=${createHash("sha256").update(nextLock).digest("hex")}\nruntime-tag=rust-v${NEXT.version}\n`);
+    commit();
+    assert.equal(check().status, 0, "the explicit adoption update authorizes the new lock");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

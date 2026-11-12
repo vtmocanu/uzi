@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -126,6 +127,13 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 				return fmt.Sprintf("automatic retry not before %s; recorded cause %s; owner may inspect or Resume", blockerTime(r.RecoveryRetryNotBefore), cause)
 			}
 			return fmt.Sprintf("recorded cause %s; owner reviews retained recovery and chooses Resume; no timer", cause)
+		case recoveryCauseAnthropicSpendLimit:
+			// Non-switchable lanes (mirroring validateCredentialOverrideOn) cannot take a token override.
+			switch r.Kind.String {
+			case runkind.Chat, runkind.Judge, runkind.SelfImprove, runkind.Job:
+				return fmt.Sprintf("recorded cause %s; Anthropic API spend limit reached; owner action: raise the limit and Resume, or Cancel; no timer", cause)
+			}
+			return fmt.Sprintf("recorded cause %s; Anthropic API spend limit reached; owner action: raise the limit and Resume, set-token, or Cancel; no timer", cause)
 		case "worker_requeue_exhausted", recoveryCauseRetainedRecoveryAdoptionFailed, recoveryCauseRetainedContinuationUnwitnessed:
 			return fmt.Sprintf("recorded cause %s; owner reviews recovery evidence and chooses Resume; no timer", cause)
 		}
@@ -140,6 +148,11 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 	case "queued":
 		if r.HealthReason.Valid && apitypes.IsCodexAdmissionReason(r.HealthReason.String) {
 			r.HealthReason.String = "waiting: admission held"
+		}
+		if r.MissingRepoAgentSource {
+			// Shorter than the generic template: keep the independent capability fact
+			// and recorded blockers within the health evidence composition budget.
+			return fmt.Sprintf("assigned worker lacks required repo_agent_source_v1; recorded reason %s; hold %s; inspect run", blockerFact(r.HealthReason), blockerFact(r.HoldReason))
 		}
 		return fmt.Sprintf("own continuation must become claimable; recorded reason %s; hold %s; exact fence unavailable, inspect run", blockerFact(r.HealthReason), blockerFact(r.HoldReason))
 	default:

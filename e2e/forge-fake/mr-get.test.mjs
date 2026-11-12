@@ -51,6 +51,19 @@ test("shared fake serves a single MR/PR by iid in all three dialects", { timeout
   }));
   const gitRoot = path.join(scratch, "gitroot");
   mkdirSync(gitRoot);
+  const restoreRepos = ["restore45a", "restore45b", "restore52a", "restore52b"];
+  const restoreHeads = new Map();
+  for (const name of ["repo", "repo2", ...restoreRepos]) {
+    const bare = path.join(gitRoot, `${name}.git`);
+    const git = (...args) => execFileSync("git", ["--git-dir", bare, ...args], {
+      encoding: "utf8", input: "", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    }).trim();
+    execFileSync("git", ["init", "--bare", "-q", bare]);
+    const tree = git("hash-object", "-w", "-t", "tree", "--stdin");
+    const head = git("-c", "user.name=fixture", "-c", "user.email=fixture@e2e.invalid", "commit-tree", tree, "-m", name);
+    git("update-ref", "refs/heads/main", head);
+    restoreHeads.set(name, head);
+  }
   let diagnostics = "";
   child = spawn(process.execPath, [path.join(root, "e2e/forge-fake/forge-fake.mjs")], {
     cwd: root,
@@ -59,6 +72,8 @@ test("shared fake serves a single MR/PR by iid in all three dialects", { timeout
       FORGE_FAKE_PORT: "0", FORGE_FAKE_CERT: certPath, FORGE_FAKE_KEY: keyPath,
       FORGE_FAKE_STATE: statePath, FORGE_FAKE_BASE_URL: "https://configured.invalid",
       FORGE_FAKE_PROJECT: "group/repo", FORGE_FAKE_PROJECT2: "group/repo2",
+      FORGE_FAKE_PROJECT3: "group/restore45a", FORGE_FAKE_PROJECT4: "group/restore45b",
+      FORGE_FAKE_PROJECT5: "group/restore52a", FORGE_FAKE_PROJECT6: "group/restore52b",
       FORGE_FAKE_GIT_ROOT: gitRoot,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -110,6 +125,24 @@ test("shared fake serves a single MR/PR by iid in all three dialects", { timeout
       throw new Error(`${method} ${route} failed; child ${child.exitCode}/${child.signalCode}\n${diagnostics}`, { cause: error });
     }
   }
+
+  await t.test("independent-restore fixtures advertise distinct projects and smart-HTTP bares", async () => {
+    for (const [index, name] of restoreRepos.entries()) {
+      const res = await get(`/api/v4/projects/${index + 3}`);
+      assert.equal(res.status, 200);
+      assert.equal(res.body.path_with_namespace, `group/${name}`);
+      const output = execFileSync("git", ["-c", `http.sslCAInfo=${certPath}`, "ls-remote", `${origin}/group/${name}.git`, "refs/heads/main"], {
+        encoding: "utf8", timeout: 10000,
+        env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+      });
+      assert.equal(output.trim().split(/\s+/)[0], restoreHeads.get(name));
+    }
+    assert.equal(new Set(restoreRepos.map(name => restoreHeads.get(name))).size, 4);
+    assert.throws(() => execFileSync("git", ["-c", `http.sslCAInfo=${certPath}`, "ls-remote", `${origin}/group/no-such-fixture.git`, "refs/heads/main"], {
+      encoding: "utf8", timeout: 10000, stdio: "pipe",
+      env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    }), "an unknown project must not be served from another fixture's bare");
+  });
 
   await t.test("GitLab /merge_requests/:iid returns state, source_branch and iid", async () => {
     const route = "/api/v4/projects/1/merge_requests";

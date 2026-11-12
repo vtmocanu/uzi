@@ -270,6 +270,22 @@ nor triggers ordinary ephemeral capacity provisioning. Adding capacity or expedi
 the run does not bypass the hold. Moving between these two reasons keeps the expected
 wait episode; leaving both for a genuine wait restamps `health_since`.
 
+For a regular-intake continuation whose assigned worker lacks
+`repo_agent_source_v1`, either hold instead ends with
+"; assigned worker also lacks repo_agent_source_v1 required by this continuation".
+This suffix keeps the expected-wait classification and suppresses nudges; it does
+not predict placement after the deadline. After the hold, health diagnoses current
+prerequisites first, then fleet capability absence and the assigned dependency.
+At the final dependency fallback, "compatible worker currently unavailable" needs
+both a confirmed online source-capable peer and zero claimable workers in composed
+eligibility. A free peer is not a promise of claimability.
+
+The upgrade blocker diagnostic intentionally has broader scope than run health:
+for any queued assigned run, a source requirement **or** a recorded source commit
+plus an assigned worker missing the capability is an independent fact, including
+generation zero and cross-check or egress lanes. Stronger health reasons may take
+precedence without removing that upgrade fact.
+
 A running lead awaiting a required code cross-check also uses `waiting_worker`,
 with the reason "waiting until <UTC deadline> for code cross-check". The deadline
 is the persisted check deadline, formatted as RFC3339 UTC; it stays stable across

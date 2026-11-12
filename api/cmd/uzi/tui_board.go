@@ -234,7 +234,7 @@ func runBand(status string, isRevising bool) int {
 // holds also require the owner to Resume, Stop or Cancel. Both are NEEDS YOU. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if isDiskOwnerHold(r.RunDTO) || isIterationHold(r.RunDTO) || isForgeOwnerHold(r.RunDTO) || codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isCredentialsResetHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
+	if isDiskOwnerHold(r.RunDTO) || isIterationHold(r.RunDTO) || isForgeOwnerHold(r.RunDTO) || codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isCredentialsResetHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isSpendLimitHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)
@@ -245,6 +245,9 @@ func runBandOf(r apitypes.RunListItemDTO) int {
 func runStateWord(r apitypes.RunListItemDTO) string {
 	if isDiskOwnerHold(r.RunDTO) {
 		return "disk held"
+	}
+	if isSpendLimitHold(r.RunDTO) {
+		return "spend limit"
 	}
 	if isIterationHold(r.RunDTO) {
 		return "iter limit"
