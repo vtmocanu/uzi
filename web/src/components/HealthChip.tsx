@@ -40,7 +40,7 @@ export function HealthChip() {
 
   // The chip sits left of centre in the header, so a panel right-aligned to it can run past the
   // viewport's left edge at sm+. Prefer the chip's right edge, then its left edge, and only then
-  // clamp into the visible width, so the panel stays attached to the chip and off the sidebar.
+  // clamp into the visible width, so the panel stays attached to the chip.
   // Below sm the fixed bottom sheet places itself, so no inline style there (it would override
   // inset-x-4). The query uses Tailwind's rem breakpoint so both switch at the same width.
   const [panelLeft, setPanelLeft] = useState<number | null>(null);
@@ -60,9 +60,11 @@ export function HealthChip() {
       }
       const hostRect = host.getBoundingClientRect();
       const width = panel.offsetWidth;
+      // Floor at the content column (the shell's <main>), so a fixed sidebar is never covered.
+      const minLeft = Math.max(16, host.closest("main")?.getBoundingClientRect().left ?? 0);
       const max = document.documentElement.clientWidth - 16 - width;
-      const preferred = hostRect.right - width >= 16 ? hostRect.right - width : hostRect.left;
-      const abs = Math.max(16, Math.min(preferred, max));
+      const preferred = hostRect.right - width >= minLeft ? hostRect.right - width : hostRect.left;
+      const abs = Math.max(16, Math.min(Math.max(preferred, minLeft), max));
       setPanelLeft(abs - hostRect.left);
     };
     place();

@@ -1469,16 +1469,45 @@ describe("OverviewNext health chip popover", () => {
     }
   });
 
+  it("never covers a fixed sidebar left of the content column", async () => {
+    for (const width of [1280, 1440, 1600]) {
+      cleanup();
+      await page.viewport(width, 900);
+      mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+      // The shell's lg sidebar is a fixed 240px aside beside <main> (AppShell lg:pl-60).
+      render(
+        <MemoryRouter initialEntries={["/overview/next"]}>
+          <div style={{ paddingLeft: 240 }}>
+            <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+              <OverviewNext />
+            </main>
+          </div>
+        </MemoryRouter>,
+      );
+      const chip = await screen.findByRole("button", { name: /System health/ });
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "System health" });
+      await document.fonts.ready;
+      const mainLeft = document.querySelector("main")!.getBoundingClientRect().left;
+      const r = dialog.getBoundingClientRect();
+      expect.soft(r.left, `clear of the sidebar at ${width}px`).toBeGreaterThanOrEqual(mainLeft);
+      expect.soft(r.right, `inside the viewport at ${width}px`).toBeLessThanOrEqual(document.documentElement.clientWidth - 15);
+    }
+  });
+
   it("re-places the open panel on resize, switching to the bottom sheet below sm", async () => {
     await page.viewport(1280, 900);
     const chip = await mountChip();
     await userEvent.click(chip);
     const dialog = await screen.findByRole("dialog", { name: "System health" });
     await page.viewport(700, 900);
-    await expect.poll(() => dialog.getBoundingClientRect().left).toBeGreaterThanOrEqual(15);
-    expect(dialog.getBoundingClientRect().right, "right edge after resize to 700").toBeLessThanOrEqual(
-      document.documentElement.clientWidth - 15,
-    );
+    // At 700 the panel (640 wide) can only sit in [16, 44]: poll until it has been re-placed there.
+    await expect
+      .poll(() => {
+        const r = dialog.getBoundingClientRect();
+        return r.left >= 15 && r.right <= document.documentElement.clientWidth - 15;
+      })
+      .toBe(true);
     await page.viewport(500, 900);
     await expect
       .poll(() => Math.abs(dialog.getBoundingClientRect().left - 16))
