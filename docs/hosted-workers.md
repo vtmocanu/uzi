@@ -190,11 +190,15 @@ Operators rolling back past this feature, in order:
 1. Turn `worker_hibernation_enabled` off.
 2. Wait until no worker is `hibernating`, `hibernated` or `waking`. The sweeper
    wakes at most 10 workers per pass.
-3. Roll back migrations 00428, then 00427. Down refuses while any worker is not
-   awake or a wake record exists. Both rollbacks briefly take exclusive
-   locks (00427 on the workers table; 00428 on the runs and workers tables),
-   so do them in a quiet window.
-4. Only then run an older api: an older api cannot claim runs on the new schema.
+3. Stop the api. Rolling back 00429 drops `fn_placement_admitting_workers`, which
+   this api's ephemeral provisioning and demand-wake queries call, so this api
+   cannot keep serving once 00429 is down. Expect a brief outage window.
+4. Roll back migrations 00429, then 00428, then 00427. Down of 00428 and 00427
+   refuses while any worker is not awake or a wake record exists. The rollbacks
+   briefly take exclusive locks (00427 on the workers table; 00428 on the runs
+   and workers tables), so do them in a quiet window.
+5. Start the older api. An older api cannot claim runs on the new schema, so it
+   only runs once all three migrations are rolled back.
 
 If the controller is rolled back mid-operation, affected workers stay fenced in
 `waking` until a hibernation-capable controller returns.
