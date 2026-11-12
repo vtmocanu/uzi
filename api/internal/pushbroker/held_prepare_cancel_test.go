@@ -78,10 +78,18 @@ func newGatedHeldRemote(t *testing.T, f *gitFixture, gate string) *gatedHeldRemo
 	t.Helper()
 	r := &gatedHeldRemote{gate: gate, entered: make(chan struct{})}
 	release := make(chan struct{})
+	// block parks the gated request until the client goes away. It must then ABORT, never
+	// return: the server's request context ends only once the client has started closing the
+	// connection, and crypto/tls sends close_notify before it closes the socket. A handler
+	// that returned normally would let net/http flush an empty 200 into that window, and
+	// net/http's client accepts a response that races its own cancellation, so go-git would
+	// see "empty input" at list or an up-to-date fetch at post instead of the context cause
+	// (#4181). ErrAbortHandler closes the connection without writing a response.
 	block := func(req *http.Request) {
 		r.once.Do(func() { close(r.entered) })
 		select {
 		case <-req.Context().Done():
+			panic(http.ErrAbortHandler)
 		case <-release:
 		}
 	}
@@ -266,27 +274,114 @@ func TestPrepareHeldPackReportsContextCause(t *testing.T) {
 			remote := newGatedHeldRemote(t, f, stage)
 			opts.CloneURL = remote.cloneURL(f)
 
-			// The parent deadline is far below the 60 s internal ceiling, so it is the
-			// deadline that fires. It starts at call time; the gate is reached within it only
-			// if the fixture is fast, so the budget is generous relative to a local CGI hop.
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			start := time.Now()
-			_, err := pushbroker.PrepareHeldPack(ctx, opts)
-			elapsed := time.Since(start)
-			t.Logf("stage=%s elapsed=%v err=%v", stage, elapsed, err)
+			// The parent deadline is armed only once the gate is entered, so the fixture's
+			// setup time (TLS handshake, git subprocesses) can never use it up under load
+			// (#4181). It is far below the 60 s internal ceiling, so it is the deadline that
+			// fires.
+			ctx := newGateDeadline()
+			type result struct {
+				err error
+				at  time.Time
+			}
+			done := make(chan result, 1)
+			finished := make(chan struct{})
+			go func() {
+				defer close(finished)
+				_, err := pushbroker.PrepareHeldPack(ctx, opts)
+				done <- result{err, time.Now()}
+			}()
+			// Registered after the remote's cleanups, so it runs first (LIFO): it stops the
+			// timer, ends the context and waits for PrepareHeldPack while the server is up,
+			// so nothing started here outlives the subtest.
+			t.Cleanup(func() {
+				ctx.stop()
+				select {
+				case <-finished:
+				case <-time.After(promptReturn + 10*time.Second):
+					t.Error("PrepareHeldPack goroutine still running at cleanup")
+				}
+			})
 			select {
 			case <-remote.entered:
-			default:
-				t.Fatalf("handler gate never entered before the deadline; err = %v", err)
+			case <-time.After(30 * time.Second):
+				t.Fatal("handler gate never entered")
 			}
-			if err == nil {
-				t.Fatal("PrepareHeldPack succeeded against a blocked remote")
+			firedAt := ctx.arm(50 * time.Millisecond)
+			select {
+			case res := <-done:
+				elapsed := res.at.Sub(<-firedAt)
+				t.Logf("stage=%s elapsed after deadline=%v err=%v", stage, elapsed, res.err)
+				if res.err == nil {
+					t.Fatal("PrepareHeldPack succeeded against a blocked remote")
+				}
+				if elapsed > promptReturn {
+					t.Fatalf("returned %v after the deadline, want < %v", elapsed, promptReturn)
+				}
+				assertCause(t, stage, res.err, context.DeadlineExceeded, "context deadline exceeded", context.Canceled, "context canceled")
+			case <-time.After(promptReturn + 10*time.Second):
+				t.Fatal("PrepareHeldPack did not return after the parent deadline")
 			}
-			if elapsed > 3*time.Second+promptReturn {
-				t.Fatalf("returned after %v, want shortly after the 3s parent deadline", elapsed)
-			}
-			assertCause(t, stage, err, context.DeadlineExceeded, "context deadline exceeded", context.Canceled, "context canceled")
 		})
 	}
 }
+
+// gateDeadline is a parent context whose deadline is armed by the test once the handler gate
+// is entered. Once it fires, Err (and so context.Cause of every context derived from it, since
+// Value returns nil) is context.DeadlineExceeded, so PrepareHeldPack observes what an expired
+// parent deadline gives it after the gate. It is not a stdlib timer context: Deadline reports
+// none, so PrepareHeldPack's derived context keeps its own 60 s ceiling as its Deadline, and the
+// expiry reaches derived contexts through the context package's goroutine propagation.
+type gateDeadline struct {
+	done  chan struct{}
+	fired chan time.Time
+	once  sync.Once
+
+	mu    sync.Mutex
+	err   error
+	timer *time.Timer
+}
+
+func newGateDeadline() *gateDeadline {
+	return &gateDeadline{done: make(chan struct{}), fired: make(chan time.Time, 1)}
+}
+
+// fire ends the context once: Err is set before Done closes, as the Context contract requires.
+func (c *gateDeadline) fire() {
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.err = context.DeadlineExceeded
+		c.mu.Unlock()
+		c.fired <- time.Now()
+		close(c.done)
+	})
+}
+
+// arm starts the deadline d from now and returns a channel that yields the fire time.
+func (c *gateDeadline) arm(d time.Duration) <-chan time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.timer = time.AfterFunc(d, c.fire)
+	return c.fired
+}
+
+// stop stops a pending timer and ends the context, so nothing waits on it after the subtest.
+func (c *gateDeadline) stop() {
+	c.mu.Lock()
+	if c.timer != nil {
+		c.timer.Stop()
+	}
+	c.mu.Unlock()
+	c.fire()
+}
+
+func (c *gateDeadline) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *gateDeadline) Done() <-chan struct{} { return c.done }
+
+func (c *gateDeadline) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+func (c *gateDeadline) Value(any) any { return nil }
