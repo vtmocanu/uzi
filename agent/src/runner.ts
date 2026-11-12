@@ -1,3 +1,4 @@
+import type { RemediationRestrictionProgress } from "./git.js";
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
 import { validatePolicyHoldRequest } from "./protocol.js";
 import { checkpointCoordinatesForClaim, type CheckpointCoordinates } from "./checkpoint-coordinates.js";
@@ -3052,11 +3053,15 @@ interface RunFlight {
    *  checkpoint ticks within a flight (a fresh flight after a restart re-detects, which is fine —
    *  the finalize bridge in M3 is the correctness backstop). */
   steeredTips?: Set<string>;
+  /** Process-only denial fence. Never wraps or clears, including after a verified latch clear. */
+  remediationDenialRevision?: number;
   /** Restriction latch only. Never authorizes source use; launch re-reads durable proofs. */
   remediationRestrictions?: {
     roots: string[];
-    /** Process-only denial version; a failed read invalidates every admission already waiting. */
-    denialRevision?: number;
+    /** Only bootstrap mints this provenance; absent metadata is permanently sticky. */
+    clearable?: boolean;
+    contributions?: number;
+    safeEmptyPending?: object;
     /** Global negative findings, never a substitute for the current positive body. */
     flaggedOIDs?: string[];
     /** Worker-selected identity and bounded negative knowledge; never a consumer confirmation cache. */
@@ -4145,11 +4150,11 @@ export class RunRunner {
    */
   private async requireLaunchAuthority(flight: RunFlight): Promise<() => void> {
     // Capture before the first wait, including source-use authority acquisition.
-    const denialRevision = flight.remediationRestrictions?.denialRevision ?? 0;
+    const denialRevision = flight.remediationDenialRevision ?? 0;
     let record: RemediationRecovery | undefined;
     let recordBarePath: string | undefined;
     const checkRemediation = (): void => {
-      const currentRevision = flight.remediationRestrictions?.denialRevision ?? 0;
+      const currentRevision = flight.remediationDenialRevision ?? 0;
       if (!Number.isSafeInteger(currentRevision) || currentRevision < 0 || currentRevision !== denialRevision)
         throw new Error("remediation restriction confirmation changed");
       const proof = record;
@@ -4210,17 +4215,18 @@ export class RunRunner {
     const record = journal.remediationRecovery;
     if (!record) return;
     const state = flight.remediationRestrictions ??= { roots: [] };
+    state.clearable = false;
     state.flaggedOIDs = [...new Set([...(state.flaggedOIDs ?? []), ...record.flaggedOIDs])];
     state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from), ...(record.excludedRoots ?? [])])];
   }
 
   /** Reuse Git's inherited operation scope; the caller retains A until owned work settles. */
-  private withRemediationLifecycle<T>(signal: AbortSignal | undefined, action: () => Promise<T>, deadlineAt?: number): Promise<T> {
+  private withRemediationLifecycle<T>(signal: AbortSignal | undefined, action: () => Promise<T>, deadlineAt?: number, progress?: RemediationRestrictionProgress): Promise<T> {
     // Explicit cleanup selects its bounded lifecycle; ordinary live work defaults to global shutdown.
     // Selecting a lifecycle does not authenticate a source or grant source-use permission.
     return this.git.withRecoveryOperation(
       signal ?? this.shutdownSignal.signal,
-      Math.min(Date.now() + this.codexBoundaryDeadlineMs, deadlineAt ?? Infinity), action);
+      Math.min(Date.now() + this.codexBoundaryDeadlineMs, deadlineAt ?? Infinity), action, undefined, { restrictionProgress: progress });
   }
 
   /**
@@ -4233,36 +4239,73 @@ export class RunRunner {
   ): Promise<{ kind: "confirmed"; enrolled: boolean } | { kind: "unavailable" }> {
     if (!barePath && !branch && !flight.worktreePath && !flight.remediationRestrictions)
       return { kind: "confirmed", enrolled: false }; // Repo-less flight.
-    try {
-      if (!barePath || !branch) throw new Error("restriction identity unavailable");
-      const facts = await this.withRemediationLifecycle(signal, () =>
-        this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId), deadlineAt);
-      if (facts.enrolled) {
+    const initial = flight.remediationRestrictions;
+    const revision = flight.remediationDenialRevision ?? 0;
+    const contributions = initial?.contributions;
+    const runId = flight.runId;
+    const progress: RemediationRestrictionProgress = { cause: "unknown", observe: facts => {
+      if (facts.enrolled || facts.blocked) {
         const state = flight.remediationRestrictions ??= { roots: [] };
+        state.clearable = false;
         state.roots = [...new Set([...state.roots, ...facts.roots, ...facts.flaggedOIDs])];
         state.flaggedOIDs = [...new Set([...(state.flaggedOIDs ?? []), ...facts.flaggedOIDs])];
+        progress.cause = facts.blocked ? "blocked" : "enrolled_observed";
       }
+    } };
+    try {
+      if (!barePath || !branch) { progress.cause = "identity"; throw new Error("restriction identity unavailable"); }
+      const facts = await this.withRemediationLifecycle(signal, () =>
+        this.git.withRemediationRestrictionProgress(progress, () =>
+          this.git.readRemediationRestrictionFacts(barePath, branch, runId)), deadlineAt, progress);
+      // Also observe mocked readers that return facts without invoking the channel.
+      progress.observe!(facts);
       if (facts.blocked) throw new Error("restriction evidence is custody only");
+      if (!facts.enrolled && initial && flight.remediationRestrictions === initial &&
+          initial.clearable === true && initial.contributions === contributions && !flight.predecessorCapture &&
+          (flight.remediationDenialRevision ?? 0) === revision &&
+          flight.barePath === barePath && flight.branch === branch && flight.runId === runId &&
+          this.remediationLatchIsEmpty(flight)) delete flight.remediationRestrictions;
       return { kind: "confirmed", enrolled: facts.enrolled };
     } catch {
+      const existed = flight.remediationRestrictions;
       const state = flight.remediationRestrictions ??= { roots: [] };
-      const revision = state.denialRevision ?? 0;
-      // Never wrap or clear a denial. A new admission still needs fresh durable proofs.
-      state.denialRevision = Number.isSafeInteger(revision) && revision >= 0 && revision < Number.MAX_SAFE_INTEGER
-        ? revision + 1 : -1;
+      // Existing, injected and successor-capture latches can never acquire clearable provenance.
+      if (!existed) state.clearable = progress.cause === "pre_read_unavailable" && !progress.started && !progress.acquired &&
+        !flight.predecessorCapture;
+      else if (progress.cause !== "pre_read_unavailable" || progress.started || progress.acquired) state.clearable = false;
+      const current = flight.remediationDenialRevision ?? 0;
+      // Never wrap or clear this denial revision; a verified clear removes only the transient latch.
+      flight.remediationDenialRevision = Number.isSafeInteger(current) && current >= 0 && current < Number.MAX_SAFE_INTEGER
+        ? current + 1 : -1;
+      try { this.log.warn("remediation restriction read unavailable", { class: progress.cause ?? "unknown" }); }
+      catch { /* Diagnostics must not interrupt custody preservation. */ }
       flight.preserveRecoveryClone = true;
       return { kind: "unavailable" };
     }
   }
 
+  private remediationLatchIsEmpty(flight: RunFlight): boolean {
+    const state = flight.remediationRestrictions;
+    const pending = state?.pending;
+    const scan = flight.secretRemediation;
+    return !!state && !state.roots.length && !state.flaggedOIDs?.length &&
+      (!pending || (pending === state.safeEmptyPending && !pending.requiredOIDs.length &&
+        !pending.requireDenial && !pending.bindingUncertain && pending.runId === flight.runId &&
+        pending.barePath === flight.barePath && pending.branch === flight.branch &&
+        pending.clonePath === this.remediationSource(flight).clonePath &&
+        pending.attemptId === this.remediationSource(flight).attemptId)) &&
+      !scan?.known?.length && !scan?.blocked?.length && !scan?.flaggedCommits?.length &&
+      !scan?.flaggedFindings?.length && !scan?.withholdPaths && !scan?.overflow && !scan?.everKnown;
+  }
+
   /** Query the journal without discovery or normalization side effects. The exact attempt
    * comes from the worker-selected source, not from the evidence being authenticated. */
   private async restoreRemediationRestrictions(flight: RunFlight): Promise<RemediationRecovery | undefined> {
-    if (!flight.barePath && !flight.branch && !flight.worktreePath) {
-      if (flight.remediationRestrictions) throw new Error("remediation source identity unavailable");
-      return undefined; // Repo-less flights have no recovery journal.
-    }
     try {
+      if (!flight.barePath && !flight.branch && !flight.worktreePath) {
+        if (flight.remediationRestrictions) throw new Error("remediation source identity unavailable");
+        return undefined; // Repo-less flights have no recovery journal.
+      }
       if (!flight.barePath || !flight.branch || !flight.worktreePath ||
           (!flight.predecessorCapture && flight.runnerClone?.path !== flight.worktreePath))
         throw new Error("remediation source identity unavailable");
@@ -4274,11 +4317,12 @@ export class RunRunner {
         return undefined;
       }
       const state = flight.remediationRestrictions ??= { roots: [] };
+      state.clearable = false;
       state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from), ...(record.excludedRoots ?? [])])];
       return record;
     } catch (error) {
       // An unreadable enrollment is held, rather than silently treated as absent.
-      flight.remediationRestrictions ??= { roots: [] };
+      (flight.remediationRestrictions ??= { roots: [] }).clearable = false;
       throw error;
     }
   }
@@ -4322,20 +4366,41 @@ export class RunRunner {
       flight.sourceAdmissionRetired = true;
     };
     const remediation: { kind: "confirmed" | "denied" | "held" } = { kind: "confirmed" };
-    if (flight.remediationRestrictions?.pending && flight.sourceTailsJoined === true) {
+    if (flight.remediationRestrictions && flight.sourceTailsJoined === true) {
       remediation.kind = "held";
       try {
         // One bounded acquisition/confirmation attempt. Retire under the same owning A.
         // A callback can latch synchronously while the Git proof awaits; changed knowledge
         // keeps custody even if the earlier snapshot could be confirmed.
         await this.inFlightAuthority(flight, async () => {
-          const snapshot = canonicalJson(flight.remediationRestrictions!.pending!);
+          if (flight.remediationRestrictions?.clearable === true && this.remediationLatchIsEmpty(flight)) {
+            await this.bootstrapRemediationRestrictions(flight, flight.barePath, flight.branch, undefined,
+              Date.now() + this.sourceUseEndWaitMs);
+            if (!flight.remediationRestrictions) {
+              remediation.kind = "confirmed";
+              retire();
+              return;
+            }
+          }
+          const pending = flight.remediationRestrictions?.pending;
+          if (!flight.remediationRestrictions) {
+            remediation.kind = "confirmed";
+            retire();
+            return;
+          }
+          if (!pending) {
+            // A latch with no pending entry (sticky, or a clearable one the re-read did not clear) cannot be
+            // confirmed here: stay held, no publication, slots stay active.
+            retire();
+            return;
+          }
+          const snapshot = canonicalJson(pending);
           try {
             remediation.kind = await this.withRemediationLifecycle(undefined, () => this.confirmPendingRemediation(flight));
           }
           finally {
             retire();
-            if (canonicalJson(flight.remediationRestrictions!.pending!) !== snapshot) remediation.kind = "held";
+            if (canonicalJson(flight.remediationRestrictions?.pending) !== snapshot) remediation.kind = "held";
           }
         }, this.cleanupAuthorityWait(this.sourceUseEndWaitMs));
       } catch {
@@ -19838,6 +19903,9 @@ export class RunRunner {
         source.clonePath && source.clonePath === flight.worktreePath &&
         flight.barePath === barePath && flight.branch === branch) return [];
     const restrictions = flight.remediationRestrictions ??= { roots: [] };
+    restrictions.contributions = (restrictions.contributions ?? 0) + 1;
+    if (!Number.isSafeInteger(restrictions.contributions)) restrictions.clearable = false;
+    const hadPending = restrictions.pending;
     const pending = restrictions.pending ??= {
       runId: flight.runId, clonePath: source.clonePath, attemptId: source.attemptId,
       barePath: flight.barePath, branch: flight.branch,
@@ -19867,6 +19935,8 @@ export class RunRunner {
         else pending.requireDenial = true;
       }
     }
+    if (findings.length || pending.bindingUncertain || pending.requireDenial) restrictions.clearable = false;
+    else if (!hadPending && restrictions.clearable === true) restrictions.safeEmptyPending = pending;
     restrictions.roots = [...new Set([...restrictions.roots, ...pending.requiredOIDs])];
     if (pending.bindingUncertain) throw new Error("remediation source identity unavailable");
     if (invalid) throw new Error("remediation finding identity unavailable");
@@ -20694,7 +20764,7 @@ export class RunRunner {
     }) => Promise<T>,
     signal?: AbortSignal, deadlineAt?: number,
   ): Promise<T> {
-    const revision = flight.remediationRestrictions?.denialRevision ?? 0;
+    const revision = flight.remediationDenialRevision ?? 0;
     const selected = this.remediationSource(flight);
     const checkIdentity = () => {
       // Preserve the caller's exact lifecycle refusal before a failed evidence
@@ -20703,7 +20773,7 @@ export class RunRunner {
       this.assertFlightSourceAdmissible(flight);
       const current = this.remediationSource(flight);
       if (!Number.isSafeInteger(revision) || revision < 0 ||
-          (flight.remediationRestrictions?.denialRevision ?? 0) !== revision ||
+          (flight.remediationDenialRevision ?? 0) !== revision ||
           current.runId !== selected.runId || current.clonePath !== selected.clonePath ||
           current.attemptId !== selected.attemptId || flight.barePath !== barePath || flight.branch !== branch)
         throw new SecretRemediationPendingError();
@@ -28534,7 +28604,7 @@ export class RunRunner {
           let successor: RunnerClone;
           try {
             successor = await this.inFlightAuthority(flight, async () => {
-              const denialRevision = flight.remediationRestrictions?.denialRevision ?? 0;
+              const denialRevision = flight.remediationDenialRevision ?? 0;
               // Capture may retain bytes with custody-only facts; successor admission may not.
               const negative = await this.bootstrapRemediationRestrictions(flight);
               this.retainedLifecycleGuard(flight);
@@ -28547,7 +28617,7 @@ export class RunRunner {
                 const selected = this.remediationSource(flight);
                 const pending = flight.remediationRestrictions?.pending;
                 if (!Number.isSafeInteger(denialRevision) || denialRevision < 0 ||
-                    (flight.remediationRestrictions?.denialRevision ?? 0) !== denialRevision ||
+                    (flight.remediationDenialRevision ?? 0) !== denialRevision ||
                     selected.runId !== source.runId || selected.clonePath !== source.clonePath ||
                     selected.attemptId !== source.attemptId || flight.worktreePath !== source.clonePath ||
                     flight.barePath !== bare || flight.branch !== branch ||

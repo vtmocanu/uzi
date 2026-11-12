@@ -237,7 +237,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
     let restoreDenial: string | undefined;
     const recover = (runner as any).recoverRetainedClaim.bind(runner);
     t.mock.method(runner as any, "recoverRetainedClaim", async (...args: any[]) => {
-      if (mode === "historical-revision") args[1].remediationRestrictions = { roots: [], denialRevision: 7 };
+      if (mode === "historical-revision") args[1].remediationDenialRevision = 7;
       retained = true;
       try { return await recover(...args); } finally { retained = false; }
     });
@@ -413,7 +413,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       const admission = (runner as any).requireLaunchAuthority.bind(runner);
       t.mock.method(runner as any, "requireLaunchAuthority", async (f: any) => {
         const result = await admission(f);
-        assert.equal(f.remediationRestrictions.denialRevision ?? 0, 0);
+        assert.equal(f.remediationDenialRevision ?? 0, 0);
         const readFacts = cache.readRemediationRestrictionFacts.bind(cache);
         const faulty = t.mock.method(cache, "readRemediationRestrictionFacts",
           (...args: Parameters<typeof readFacts>) =>
@@ -422,7 +422,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
           // Control the promise-resolution gap at the production sink; no process proof.
           assert.deepEqual(await (runner as any).bootstrapRemediationRestrictions(f), { kind: "unavailable" });
         } finally { faulty.mock.restore(); }
-        assert.equal(f.remediationRestrictions.denialRevision, 1);
+        assert.equal(f.remediationDenialRevision, 1);
         return result;
       });
     }
@@ -450,7 +450,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       }
       assert.equal(models, succeeds ? 1 : 0, JSON.stringify({ states: api.states, logs }));
       if (mode === "historical-revision") {
-        assert.equal(flight.remediationRestrictions.denialRevision, 7, "fresh proof never resets historical denials");
+        assert.equal(flight.remediationDenialRevision, 7, "fresh proof never resets historical denials");
       }
       if (callbackError) throw callbackError;
       assert.equal(callbacks, mode === "missing-pending" || mode === "missing-RR" ? 0 : 1, JSON.stringify({ states: api.states, logs }));
@@ -461,7 +461,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       else assert.equal(actualPins, pins);
       assert.ok(fs.existsSync(clone.path));
       if (mode === "late-launch-denial") {
-        assert.equal(flight.remediationRestrictions.denialRevision, 1);
+        assert.equal(flight.remediationDenialRevision, 1);
         assert.equal(flight.preserveRecoveryClone, true);
         assert.equal(flight.worktreePath, read().clonePath);
         assert.equal(flight.attemptId, read().attemptId);
