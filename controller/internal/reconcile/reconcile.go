@@ -129,11 +129,10 @@ type ObservedWorker struct {
 	// absent or carries no value (the apiserver defaults an absent value to 1, but an
 	// absent observation is not the same as an observed 1).
 	DeploymentReplicas *int32
-	// HibernationOp / HibernationRefused are the values of the uzi.dev/hibernation-op
-	// and uzi.dev/hibernation-refused annotations on the Deployment object itself (never
-	// its pod template, which would roll the pod). "" when absent.
-	HibernationOp      string
-	HibernationRefused string
+	// HibernationOp is the value of the uzi.dev/hibernation-op annotation on the
+	// Deployment object itself (never its pod template, which would roll the pod). ""
+	// when absent.
+	HibernationOp string
 	// WorkerPodUIDs lists every pod labelled for this worker, terminating ones included
 	// (they still count as "a worker pod exists"), sorted. LivePodUID is the smallest UID
 	// among pods with no deletionTimestamp, "" when none. ReadyPodUID above already

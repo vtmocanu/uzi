@@ -2695,8 +2695,9 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	if err != nil {
 		return store.Worker{}, "", err
 	}
-	// PRD #4205: a Register against a waking worker is settlement evidence, recorded in
-	// this same transaction under the row lock taken above.
+	// PRD #4205: a Register against a waking worker is settlement evidence; against a
+	// preparing worker it retargets the admission pod. Both are recorded in this same
+	// transaction under the row lock taken above.
 	if prior.HibernationState == "waking" || prior.HibernationState == "preparing" {
 		if err := s.settleRegisteredWaking(ctx, qtx, store.Worker(row), registeredPodUID); err != nil {
 			return store.Worker{}, "", err

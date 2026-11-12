@@ -791,11 +791,33 @@ func TestHibernationPreparingRegisterTracksLivePodLiveDB(t *testing.T) {
 	f.want(id, "none")
 }
 
+// A Register without a pod identity, or one after scaling_down was recorded, must not
+// retarget the admission pod of a preparing worker.
+func TestHibernationPreparingRegisterDoesNotRetargetLiveDB(t *testing.T) {
+	f := newHibFx(t)
+	id, p1 := f.worker()
+	f.hibernate(id)
+	f.want(id, "preparing")
+	f.register(id, nil)
+	if got := f.row(id).HibernationAdmissionPodUid; !got.Valid || got.Bytes != p1 {
+		t.Fatalf("admission pod after a pod-less register = %v, want %v", got, p1)
+	}
+	f.mustApply(id, TransitionScalingDown, p1)
+	if !f.row(id).HibernationScalingDownAt.Valid {
+		t.Fatal("scaling_down was not recorded")
+	}
+	p2 := uuid.New()
+	f.register(id, &p2)
+	if got := f.row(id).HibernationAdmissionPodUid; !got.Valid || got.Bytes != p1 {
+		t.Fatalf("admission pod after scaling_down + register = %v, want %v", got, p1)
+	}
+}
+
 func TestHibernationFreeTextIsSanitizedLiveDB(t *testing.T) {
 	f := newHibFx(t)
 	id, pod := f.worker()
-	dirty := "ro\x1b[31mll\x1b[0m‮back"
-	f.actor.Label = "ad\x1b[31mmin‮"
+	dirty := "ro\x1b[31mll\x1b[0m\u202eback"
+	f.actor.Label = "ad\x1b[31mmin\u202e"
 	if _, err := f.svc.HibernateWorker(f.env.ctx, f.actor, id, dirty); err != nil {
 		t.Fatal(err)
 	}
@@ -804,24 +826,33 @@ func TestHibernationFreeTextIsSanitizedLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, v := range []string{reason, label} {
-		if strings.ContainsAny(v, "\x1b‮") {
+		if strings.ContainsAny(v, "\x1b\u202e") {
 			t.Fatalf("control or bidi characters survived: %q", v)
 		}
 	}
 	// A refused reason that sanitizes to nothing is a validation error (HTTP 400).
-	bad := f.tr(id, TransitionRefused, pod)
-	bad.Reason = "\x1b[31m‮"
 	var verr *HibernationValidationError
+	// An over-long reason is refused even when the cut would land on a space.
+	long := f.tr(id, TransitionRefused, pod)
+	long.Reason = strings.Repeat("a", 500) + " b"
+	if _, err := f.apply(id, long); !errors.As(err, &verr) {
+		t.Fatalf("501+ rune refused reason: %v", err)
+	}
+	if _, err := f.svc.HibernateWorker(f.env.ctx, f.actor, id, strings.Repeat("a", 500)+" b"); !errors.As(err, &verr) {
+		t.Fatalf("501+ rune hibernate reason: %v", err)
+	}
+	bad := f.tr(id, TransitionRefused, pod)
+	bad.Reason = "\x1b[31m\u202e"
 	if _, err := f.apply(id, bad); !errors.As(err, &verr) {
 		t.Fatalf("empty-after-sanitize refused reason: %v", err)
 	}
 	ok := f.tr(id, TransitionRefused, pod)
-	ok.Reason = "ro\x1b[31mll‮"
+	ok.Reason = "ro\x1b[31mll\u202e"
 	w, err := f.apply(id, ok)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.ContainsAny(w.HibernationReason.String, "\x1b‮") {
+	if strings.ContainsAny(w.HibernationReason.String, "\x1b\u202e") {
 		t.Fatalf("refused reason not sanitized: %q", w.HibernationReason.String)
 	}
 }

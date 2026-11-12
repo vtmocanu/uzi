@@ -210,10 +210,18 @@ func (s *Service) hibernationTx(ctx context.Context, workerID uuid.UUID, fn func
 	return tx.Commit(ctx)
 }
 
+// sanitizeHibernationText strips terminal sequences and flattens raw, then reports
+// whether the sanitized text exceeds hibernationTextMax runes. The length check runs on
+// the sanitized-but-untruncated text so an over-long reason is refused, never silently cut.
+func sanitizeHibernationText(raw string) (string, bool) {
+	text := store.ManualCordonText(raw, len(raw)+1)
+	return text, len([]rune(text)) > hibernationTextMax
+}
+
 // HibernateWorker admits none -> preparing, or returns a *HibernationRefusal.
 func (s *Service) HibernateWorker(ctx context.Context, actor HibernationActor, workerID uuid.UUID, reason string) (store.Worker, error) {
-	reason = store.ManualCordonText(reason, hibernationTextMax+1)
-	if len([]rune(reason)) > hibernationTextMax {
+	reason, tooLong := sanitizeHibernationText(reason)
+	if tooLong {
 		return store.Worker{}, &HibernationValidationError{Msg: "reason must be at most 500 characters"}
 	}
 	var out store.Worker
@@ -322,8 +330,8 @@ func hibernationAdvertisementFresh(adv store.GetControllerHibernationAdvertiseme
 // audit event). A worker already waking is a no-op that keeps its op. A worker that is
 // awake is ErrHibernationConflict. Not gated by the setting.
 func (s *Service) WakeWorker(ctx context.Context, actor *HibernationActor, workerID uuid.UUID, reason string) (store.Worker, error) {
-	reason = store.ManualCordonText(reason, hibernationTextMax+1)
-	if len([]rune(reason)) > hibernationTextMax {
+	reason, tooLong := sanitizeHibernationText(reason)
+	if tooLong {
 		return store.Worker{}, &HibernationValidationError{Msg: "reason must be at most 500 characters"}
 	}
 	var out store.Worker
@@ -394,10 +402,11 @@ func validateHibernationTransition(t *HibernationTransition) (opID uuid.UUID, po
 		podUID = hibernationUUID(p)
 	}
 	if t.Transition == TransitionRefused {
-		if t.Reason = store.ManualCordonText(t.Reason, hibernationTextMax+1); t.Reason == "" {
+		var tooLong bool
+		if t.Reason, tooLong = sanitizeHibernationText(t.Reason); t.Reason == "" {
 			return uuid.Nil, podUID, bad("reason is required")
 		}
-		if len([]rune(t.Reason)) > hibernationTextMax {
+		if tooLong {
 			return uuid.Nil, podUID, bad("reason must be at most 500 characters")
 		}
 	}
@@ -485,15 +494,19 @@ func (s *Service) ApplyTransition(ctx context.Context, workerID uuid.UUID, t Hib
 	return out, err
 }
 
-// settleRegisteredWaking records a worker Register against a waking row and tries to
-// settle. It runs inside the Register transaction, which already holds the row lock via
-// GetWorkerForUpdate; w is the post-RegisterWorker row.
+// settleRegisteredWaking records a worker Register against a preparing or waking row. For
+// a waking row it records the register evidence and tries to settle; for a preparing row
+// it only retargets the admission pod (see below). It runs inside the Register
+// transaction, which already holds the row lock via GetWorkerForUpdate; w is the
+// post-RegisterWorker row.
 func (s *Service) settleRegisteredWaking(ctx context.Context, q *store.Queries, w store.Worker, podUID pgtype.UUID) error {
 	if w.HibernationState == "preparing" {
 		// The pod that was live at admission is gone (a pod that Registers while the
 		// worker is still preparing is its replacement): track the live pod, or rule (a)
 		// of trySettle could never match the pod the controller later reports ready.
-		if !podUID.Valid || (w.HibernationAdmissionPodUid.Valid && w.HibernationAdmissionPodUid.Bytes == podUID.Bytes) {
+		// Once scaling_down is recorded the controller has fenced that pod, so the
+		// admission pod is final; and a Register without a pod identity has nothing to track.
+		if !podUID.Valid || w.HibernationScalingDownAt.Valid || (w.HibernationAdmissionPodUid.Valid && w.HibernationAdmissionPodUid.Bytes == podUID.Bytes) {
 			return nil
 		}
 		w.HibernationAdmissionPodUid = podUID

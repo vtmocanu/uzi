@@ -41,9 +41,9 @@ const (
 	// last scaled this Deployment. It lives on the Deployment object (not the pod
 	// template, which would roll the pod).
 	annotationHibernationOp = "uzi.dev/hibernation-op"
-	// annotationHibernationRefused is the fence: the op id the controller refused. It
-	// bumps the resourceVersion, so a scale-down patch computed before the refusal can
-	// no longer satisfy its precondition.
+	// annotationHibernationRefused is the refusal fence, valued "<op>/<UnixNano>-<seq>"
+	// (refusalFenceValue), unique per send. Writing it bumps the resourceVersion, so a
+	// scale-down patch computed before the refusal can no longer satisfy its precondition.
 	annotationHibernationRefused = "uzi.dev/hibernation-refused"
 )
 
@@ -89,7 +89,6 @@ func applyDeploymentHibernationEvidence(o *reconcile.ObservedWorker, d *appsv1.D
 		o.DeploymentReplicas = &r
 	}
 	o.HibernationOp = d.Annotations[annotationHibernationOp]
-	o.HibernationRefused = d.Annotations[annotationHibernationRefused]
 }
 
 // applyPodEvidence derives pod count, readiness and uids from one worker's pods (every
@@ -166,6 +165,14 @@ func (m *Materializer) createHibernationDeployment(ctx context.Context, w protoc
 		dep.Annotations = map[string]string{}
 	}
 	dep.Annotations[annotationHibernationOp] = w.Hibernation.OpID
+	// Same as the ordinary create path: a retained roll marker rides onto the new object.
+	if e := rollFrom(ctx, w.ID); e != nil && e.marker != nil {
+		raw, err := json.Marshal(e.marker)
+		if err != nil {
+			return err
+		}
+		dep.Annotations[annotationRoll] = string(raw)
+	}
 	if _, err := m.client.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create deployment: %w", err)
 	}

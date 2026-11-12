@@ -569,6 +569,28 @@ func TestWakingCreatesAMissingDeploymentAwakeWithTheOpAnnotation(t *testing.T) {
 	}
 }
 
+// A wake that has to create the Deployment carries a retained roll marker onto it, the
+// same as the ordinary create path.
+func TestWakingCreateCarriesTheRetainedRollMarker(t *testing.T) {
+	cfg := testConfig()
+	base := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m"}
+	marker := markedDeployment(t, cfg, base, false).Annotations[annotationRoll]
+	mirror := pvcFor("w1", "data")
+	mirror.Annotations = map[string]string{annotationRoll: marker}
+	rec := &hibRec{fakeCordoner: &fakeCordoner{}}
+	m, client := newMatWithCordoner(t, rec, pvcNix("w1", "20Gi"), mirror)
+	if err := hibTick(t, m, hibW(protocol.HibernationWaking, "wake-op")); err != nil {
+		t.Fatal(err)
+	}
+	d := hibGet(t, client)
+	if d.Annotations[annotationRoll] != marker {
+		t.Fatalf("created Deployment roll annotation = %q, want the retained marker %q", d.Annotations[annotationRoll], marker)
+	}
+	if d.Annotations[annotationHibernationOp] != "wake-op" {
+		t.Fatalf("op annotation = %q", d.Annotations[annotationHibernationOp])
+	}
+}
+
 func TestWakingBypassesBusyAndConvergesAStaleTemplate(t *testing.T) {
 	// Already at replicas 1 under the wake op, but the template is stale: converge it
 	// rather than wait forever for a Ready pod of the wrong template.
@@ -778,10 +800,25 @@ func TestMissingDeploymentUnderRollEvidenceIsNotCreatedWhilePreparing(t *testing
 	mirror.Annotations = map[string]string{annotationRoll: marker}
 	garbage := pvcFor("w1", "data")
 	garbage.Annotations = map[string]string{annotationRoll: "{not json"}
-	for name, claim := range map[string]*corev1.PersistentVolumeClaim{"retained marker": mirror, "raw garbage reservation": garbage} {
+	type tc struct {
+		claim *corev1.PersistentVolumeClaim
+		setup func(*fake.Clientset)
+	}
+	for name, c := range map[string]tc{
+		"retained marker":         {claim: mirror},
+		"raw garbage reservation": {claim: garbage},
+		"blocked snapshot": {claim: pvcFor("w1", "data"), setup: func(c *fake.Clientset) {
+			c.PrependReactor("list", "replicasets", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("replicasets unavailable")
+			})
+		}},
+	} {
 		t.Run(name, func(t *testing.T) {
 			rec := &hibRec{fakeCordoner: &fakeCordoner{}}
-			m, client := newMatWithCordoner(t, rec, pvcNix("w1", "20Gi"), claim)
+			m, client := newMatWithCordoner(t, rec, pvcNix("w1", "20Gi"), c.claim)
+			if c.setup != nil {
+				c.setup(client)
+			}
 			if err := hibTick(t, m, hibW(protocol.HibernationPreparing, "op-1")); err != nil {
 				t.Fatal(err)
 			}

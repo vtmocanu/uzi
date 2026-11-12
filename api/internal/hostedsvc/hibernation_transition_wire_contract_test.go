@@ -29,12 +29,27 @@ func TestHibernationTransitionConsumerContract(t *testing.T) {
 	want := []HibernationTransition{
 		{
 			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionScaledDown,
-			DeploymentUID: "deployment-uid", ResourceVersion: "12345",
+			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12345",
 			PodUID: "66666666-6666-6666-6666-666666666666", Reason: "pods absent",
 		},
 		{
+			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionScaledDown,
+			DeploymentUID: "77777777-7777-7777-7777-777777777777",
+		},
+		{
+			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionRefused,
+			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12346",
+			Reason: "worker busy",
+		},
+		{
 			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionScalingDown,
-			DeploymentUID: "deployment-uid",
+			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12347",
+			PodUID: "66666666-6666-6666-6666-666666666666",
+		},
+		{
+			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionReady,
+			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12348",
+			PodUID: "66666666-6666-6666-6666-666666666666",
 		},
 	}
 	if len(got) != len(want) {
