@@ -1126,6 +1126,12 @@ export interface Executor {
    */
   joinOwnedOperations?(): Promise<void>;
   /**
+   * Issue #4201: the executor's half of the in-place switch's quiescence proof for an executor that
+   * has already unwound (the runner's escaped-signal arm cannot ask a live executor). False when a
+   * guarded-lane quiesce failed or the lane is poisoned; absent means proven. Reads only.
+   */
+  laneSettlementProven?(): boolean;
+  /**
    * issue #1830: drop the run's rebuildable HOME caches IN PLACE (run-caches.ts dropRunCaches), for
    * a run the hard disk layer cannot park (it waits at a gate, or is finalizing). Kills no process
    * and aborts nothing: the executor leaves out any subtree a still-running step needs (the

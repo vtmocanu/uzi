@@ -980,6 +980,12 @@ export class Worker {
           // is safe to land now. An image WITHOUT this flag keeps working on legacy claims, and the
           // held-state `set-token` verb 409s naming the worker.
           "credential_switch_v1",
+          // Issue #4201: this image applies a pending Claude credential switch IN PLACE (proof before
+          // apply, the write-ahead op ledger, the post-apply seq rebase, the epoch ordinal on every frame)
+          // instead of releasing the claim. Advertised LAST of the m2 changes: once the api sees it, it
+          // keeps draining /inputs while a switch is pending, which only a worker that handles the
+          // switch in place can take.
+          "credential_switch_in_place_v1",
           // #2944: generation-stamped checkpoint/input/memory requests and fresh-transcript
           // checkpoint restoration. Distinct from the API feature milestone_reconciliation_v1.
           "milestone_reconciliation_claim_v1",

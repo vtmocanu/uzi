@@ -611,6 +611,12 @@ describe("SdkExecutor — an applied in-place credential switch (issue #4201)", 
     message: { content: [{ type: "tool_use", id: "ta", name: "mcp__uzi__ask_user", input: { questions: [{ question: "Which db?" }] } }] },
   } as unknown as SDKMessage);
 
+  const parkRunTurn = (): SDKMessage => ({
+    type: "assistant",
+    session_id: "sess-1",
+    message: { content: [{ type: "tool_use", id: "tp", name: "mcp__uzi__park_run", input: {} }] },
+  } as unknown as SDKMessage);
+
   function recordingTurns(scripts: Script[]): { queryFn: SdkQueryFn; turns: Array<{ token: string | undefined; resume: string | undefined; cwd: string | undefined }> } {
     const turns: Array<{ token: string | undefined; resume: string | undefined; cwd: string | undefined }> = [];
     const { queryFn: inner } = fakeTurns(scripts);
@@ -750,6 +756,24 @@ describe("SdkExecutor — an applied in-place credential switch (issue #4201)", 
         };
       },
     },
+    {
+      // The lead's park_run signal re-enters the owner question; a switch landing there re-asks it in place.
+      site: "question_reentry",
+      build: () => {
+        let n = 0;
+        return {
+          scripts: [[submitPlan("# Plan"), resultSuccess()], [parkRunTurn(), resultSuccess()], doneTurn()],
+          ctx: {
+            parkRunSupported: true,
+            requestParkRun: async () => {
+              if (++n === 1) throw new CredentialSwitchSignal();
+              return { kind: "answer", answers: ["keep going"] };
+            },
+          },
+          settles: () => n === 2, firstNewTurn: 2,
+        };
+      },
+    },
   ];
 
   for (const c of cases) {
@@ -770,6 +794,35 @@ describe("SdkExecutor — an applied in-place credential switch (issue #4201)", 
     });
   }
 
+  it("implement_ready: the iteration-park readiness step re-runs after an apply, then parks on the new credential", async (t) => {
+    // The readiness step is the callback runThroughSwitch wraps just before an iteration park; the switch lands
+    // inside it (identified by the stack, since nothing else names that step).
+    let fired = 0;
+    const real = SdkExecutor.prototype.closeAndSettlePlanSummary;
+    t.mock.method(SdkExecutor.prototype, "closeAndSettlePlanSummary", async function (this: SdkExecutor) {
+      if (fired === 0 && new Error().stack?.includes("parkIteration")) { fired++; throw new CredentialSwitchSignal(); }
+      return real.call(this);
+    });
+    const { queryFn, turns } = recordingTurns([[submitPlan("# Plan"), resultSuccess()], [resultSuccess()]]);
+    const hook = applying();
+    let parked = 0;
+    const { ctx } = makeCtx({
+      ...hook.overrides,
+      kind: "issue",
+      config: { max_iterations: 1, iteration_park_version: 1 },
+      reportIteration: async () => ({ completionAttempts: 0 }),
+      parkForIteration: async () => { parked++; return "parked"; },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(fired, 1, "the switch landed in the readiness step");
+    assert.deepEqual(hook.calls, [{ site: "implement_ready", laneSettled: true }]);
+    assert.strictEqual(result.switchReleased, undefined, "an apply never releases");
+    assert.strictEqual(parked, 1, "the park ran after the apply");
+    assert.deepEqual(result.iterationParked, { outcome: "parked" });
+    assert.strictEqual(ctx.oauthToken, NEW_OAUTH, "the context follows the published credential");
+    assert.ok(turns.every((x) => x.token === OAUTH), "no provider turn ran after the apply");
+  });
+
   it("implement_turn: the aborted turn restarts in place with the same resumeId and cwd on the new token", async () => {
     const { queryFn, turns } = recordingTurns([[submitPlan("# Plan"), resultSuccess()], doneTurn()]);
     const cancel = new AbortController();
@@ -787,6 +840,91 @@ describe("SdkExecutor — an applied in-place credential switch (issue #4201)", 
     assert.ok(turns.slice(0, -1).every((t) => t.token === OAUTH));
     assert.strictEqual(new Set(turns.map((t) => t.cwd)).size, 1);
     assert.ok(last.resume === undefined || last.resume === "sess-1", "the restart continues the same session");
+  });
+
+  // Issue #4201 m2d: resume refusal after an applied in-place switch. The restarted turn resumes the same
+  // session on the new credential; the new credential's account can refuse it.
+  describe("resume refusal after an applied switch", () => {
+    const initFrame = (session: string): SDKMessage =>
+      ({ type: "system", subtype: "init", session_id: session, model: "m" }) as unknown as SDKMessage;
+    /** A stream that fails before yielding any event (the CLI's pre-model resolution failure). */
+    const failingStream = (message: string): AsyncIterable<SDKMessage> => ({
+      [Symbol.asyncIterator]: () => ({ next: async () => { throw new Error(message); } }),
+    });
+    const refusal = (emits: EmittedMessage[]) =>
+      emits.filter((e) => e.kind === "status" && (e.payload as { event?: string }).event === "resume_lineage_break");
+
+    /** Plan turn, then the switch trips the first implement turn (reportIteration), the hook applies, and
+     *  `restart` scripts the turn the restart runs. */
+    async function drive(restart: Script) {
+      const { queryFn, turns } = recordingTurns([[initFrame("sess-1"), submitPlan("# Plan"), resultSuccess()], restart]);
+      const cancel = new AbortController();
+      const hook = applying();
+      const { ctx, emits } = makeCtx({
+        ...hook.overrides,
+        signal: cancel.signal,
+        reportIteration: async (n) => { if (n === 1) cancel.abort(new CredentialSwitchSignal()); return undefined; },
+      });
+      const outcome = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx).then(() => undefined, (e: unknown) => e);
+      return { turns, emits, outcome };
+    }
+
+    it("(a) an init session that is not the resumed one emits one lineage break and continues in the same cwd", async () => {
+      const r = await drive([initFrame("fresh-sess"), ...doneTurn("fresh-sess")]);
+      assert.strictEqual(r.outcome, undefined);
+      const restart = r.turns.at(-1)!;
+      assert.strictEqual(restart.token, NEW_OAUTH);
+      assert.strictEqual(restart.resume, "sess-1", "the restart asked to resume the switch's session");
+      const events = refusal(r.emits);
+      assert.strictEqual(events.length, 1, "exactly one lineage break");
+      assert.strictEqual((events[0]!.payload as { reason?: string }).reason, "credential_switch_resume_refused");
+      assert.strictEqual(new Set(r.turns.map((t) => t.cwd)).size, 1, "the cwd is unchanged");
+      assert.strictEqual(events[0]!.credentialEpochOrdinal, 1, "attributed to the new epoch");
+    });
+
+    it("a resumed init that matches emits no lineage break", async () => {
+      const r = await drive([initFrame("sess-1"), ...doneTurn("sess-1")]);
+      assert.strictEqual(r.outcome, undefined);
+      assert.strictEqual(refusal(r.emits).length, 0);
+    });
+
+    it("(b) an allowlisted transcript-incompatibility with no model evidence restarts once with resume unset", async () => {
+      let calls = 0;
+      const failing: Script = () => {
+        calls++;
+        // The first restart attempt fails before any model event; the retry runs the done turn.
+        if (calls === 1) return failingStream("No conversation found with session ID: sess-1");
+        return (async function* () { for (const m of doneTurn("fresh-2")) yield m; })();
+      };
+      const r = await drive(failing);
+      assert.strictEqual(r.outcome, undefined, String(r.outcome));
+      const resumes = r.turns.slice(1).map((t) => t.resume);
+      assert.strictEqual(resumes[0], "sess-1");
+      assert.strictEqual(resumes[1], undefined, "the one restart runs with resume unset");
+      assert.strictEqual(r.turns.length, 3);
+      assert.strictEqual(new Set(r.turns.map((t) => t.cwd)).size, 1, "same cwd");
+      assert.strictEqual(refusal(r.emits).length, 1);
+      assert.strictEqual((refusal(r.emits)[0]!.payload as { reason?: string }).reason, "credential_switch_resume_refused");
+    });
+
+    it("the same error after model evidence takes the ordinary path (the run fails, no restart)", async () => {
+      const failing: Script = () => (async function* () {
+        yield { type: "assistant", session_id: "sess-1", message: { content: [{ type: "text", text: "working" }] } } as unknown as SDKMessage;
+        throw new Error("No conversation found with session ID: sess-1");
+      })();
+      const r = await drive(failing);
+      assert.match(String(r.outcome), /No conversation found/);
+      assert.strictEqual(r.turns.length, 2, "no fresh-session restart");
+      assert.strictEqual(refusal(r.emits).length, 0);
+    });
+
+    it("another failure with no model evidence (auth) is not a refusal", async () => {
+      const failing: Script = () => failingStream("401 Unauthorized: invalid x-api-key");
+      const r = await drive(failing);
+      assert.match(String(r.outcome), /401/);
+      assert.strictEqual(r.turns.length, 2);
+      assert.strictEqual(refusal(r.emits).length, 0);
+    });
   });
 
   it("laneSettled is false when the guarded lane's quiesce failed after the switch trip took the carrier", async (t) => {

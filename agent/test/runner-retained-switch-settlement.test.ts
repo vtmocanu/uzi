@@ -20,6 +20,7 @@ import type { RunProcessReap } from "../src/run-procs.js";
 import { SdkExecutor } from "../src/sdk-executor.js";
 import { LiveAttemptRegistry, type QuiesceRunOutcome, type QuiesceRunRequest } from "../src/run-quiescence.js";
 import { CredentialSwitchSignal } from "../src/steering.js";
+import { CredentialSwitchOpLedger } from "../src/credential-switch-op-ledger.js";
 import { noProofReseed, nullLogger, recordingLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
@@ -146,12 +147,20 @@ interface Options {
   codexBoundaryDeadlineMs?: number;
   /** Block the first ownership read after the switch until it is aborted (verification deadline). */
   blockOwnership?: boolean;
+  /** Issue #4201 R1: negotiate the in-place apply and let gen 2's executor ask for the switch through
+   *  ctx.attemptCredentialSwitch with a pending op; the api answers `applied`. */
+  inPlaceApply?: boolean;
 }
 
 async function scenario(o: Options) {
   const { claim, bare, clone } = await seed(o.iid);
-  client.protocolFeatures = ["claim_generation_fence", ...(o.holdFeature === false ? [] : ["credential_switch_hold"])];
+  client.protocolFeatures = ["claim_generation_fence", ...(o.holdFeature === false ? [] : ["credential_switch_hold"]),
+    ...(o.inPlaceApply ? ["credential_switch_apply_v1"] : [])];
   (client as any).registerNonce = NONCE;
+  if (o.inPlaceApply) {
+    (client as any).hasInPlaceCredentialSwitchCapability = true;
+    api.scriptApply(claim.run_id, { outcome: "applied", token: ["sk-ant-oat01-", "RETAINED-NEWTOKEN-0123456789"].join("") });
+  }
   client.publishCheckpoint = async () => { throw new Error("publication unknown"); };
   const events: string[] = [];
   const retainedHome = path.join(homeDir, claim.run_id);
@@ -217,6 +226,12 @@ async function scenario(o: Options) {
           before = readJournal(bare, clone.branch);
           events.push("switch");
           switched = true;
+          if (o.inPlaceApply) {
+            flight.steering.tripCredentialSwitch(2, "op-retained");
+            events.push(`hook:${await ctx.attemptCredentialSwitch!({ site: "implement_turn", laneSettled: true })}`);
+            events.push(`custody:${flight.retainedLocalCustody === true}`);
+            throw new Error("fixture ends after the in-place apply");
+          }
           flight.steering.tripCredentialSwitch(2);
           if (o.inPlace) {
             // The state a switch tripped by a refused approve leaves: every report but the
@@ -243,6 +258,7 @@ async function scenario(o: Options) {
   const r = runnerWith(factory, gitlab, undefined, log.logger, {
     recoveryRetryMs: 1, quiesceRun, dockerHost: "unix:///nonexistent-docker.sock", liveAttempts: new LiveAttemptRegistry(),
     activeRuns: registry,
+    ...(o.inPlaceApply ? { credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir) } : {}),
     ...(o.settlementMs ? { retainedSwitchSettlementMs: o.settlementMs } : {}),
     ...(o.codexBoundaryDeadlineMs ? { codexBoundaryDeadlineMs: o.codexBoundaryDeadlineMs } : {}),
     ...(o.verificationMs ? { retainedSwitchVerificationMs: o.verificationMs } : {}),
@@ -352,6 +368,29 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
       assert.equal(env.counts.models3, 1, "gen 3 reached the model");
     });
   }
+
+  it("R1. a retained flight whose quiescence is proven applies in place: same proof site, no release, custody flags unchanged", TIMEOUT, async () => {
+    const env = await scenario({ iid: 31830, survivor: "none", inPlaceApply: true });
+    await env.run;
+    assert.equal(api.applyRequests.filter(a => a.runId === env.claim.run_id).length, 1, "one apply for the pending op");
+    assert.ok(env.events.includes("hook:applied"), env.events.join(","));
+    assert.ok(env.events.includes("quiesce:retained_credential_switch"), "the existing retained proof ran");
+    assert.ok(env.events.indexOf("quiesce:retained_credential_switch") < env.events.indexOf("hook:applied"), "proof before apply");
+    assert.equal(reports(env.claim.run_id, "credential_switch", HOLD, "credential_switch_failed").length, 0, "no release, hold or give-up");
+    assert.ok(!env.events.some(e => e.startsWith("enter:")), "the v1 release path never ran");
+    assert.ok(env.events.includes("custody:true"), "the flight kept its retained custody");
+    assertCustodyKept(env, false);
+  });
+
+  it("R1. a retained flight whose quiescence is not proven holds with the op id and applies nothing", TIMEOUT, async () => {
+    const env = await scenario({ iid: 31831, survivor: "permanent", inPlaceApply: true });
+    await env.run;
+    assert.equal(api.applyRequests.filter(a => a.runId === env.claim.run_id).length, 0, "nothing applied");
+    const held = api.holdRequests.filter(h => h.runId === env.claim.run_id && h.status === HOLD);
+    assert.deepEqual(held.map(h => h.op_id), ["op-retained"]);
+    assert.ok(!env.events.some(e => e.startsWith("enter:")));
+    assertCustodyKept(env, false);
+  });
 
   it("2. a verification deadline after a proven settlement stops as today, with no hold", TIMEOUT, async () => {
     // The settlement outlasts the verification allowance (60ms) yet fits its own (30s): the

@@ -10,6 +10,7 @@ import { MessageBatcher, MAX_MESSAGE_BYTES } from "../src/batcher.js";
 import { RequestError, type WorkerClient } from "../src/client.js";
 import { Outbox } from "../src/outbox.js";
 import { SecretSet } from "../src/redact.js";
+import { CredentialSwitchSignal } from "../src/steering.js";
 import { CredentialSwitchOpLedger, defaultLedgerFs } from "../src/credential-switch-op-ledger.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
@@ -47,6 +48,11 @@ const planTurn = (plan = "# PLAN\n- do it"): (() => AsyncIterable<SDKMessage>) =
   yield assistant([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: plan } }], SESSION);
   yield resultOk(SESSION);
 };
+const askTurn = (): (() => AsyncIterable<SDKMessage>) => async function* () {
+  yield initFrame();
+  yield assistant([{ type: "tool_use", id: "q", name: "mcp__uzi__ask_user", input: { questions: [{ question: "Which db?" }] } }], SESSION);
+  yield resultOk(SESSION);
+};
 const doneTurn = (text = "done implementing"): (() => AsyncIterable<SDKMessage>) => async function* () {
   yield initFrame();
   yield assistant([{ type: "text", text }, { type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} }], SESSION);
@@ -80,7 +86,7 @@ function scriptedQuery(turns: Array<(signal: AbortSignal) => AsyncIterable<SDKMe
   };
 }
 
-type Site = "plan_turn" | "plan_gate" | "plan_gate_revision" | "implement_turn";
+type Site = "plan_turn" | "plan_gate" | "plan_gate_revision" | "plan_gate_exhausted" | "ask_user" | "implement_turn" | "window";
 
 interface Setup {
   site: Site;
@@ -126,6 +132,7 @@ async function scenario(setup: Setup) {
   };
   const last = setup.lastTurn ?? doneTurn(`the new token is ${NEW_TOKEN}`);
   let gates = 0;
+  let asks = 0;
   let turnScripts: Array<(signal: AbortSignal) => AsyncIterable<SDKMessage>>;
   switch (setup.site) {
     case "plan_turn":
@@ -141,6 +148,35 @@ async function scenario(setup: Setup) {
       api.onState(runId, (b) => {
         if (b.status !== "awaiting_approval") return;
         if (++gates === 1) requestSwitch(); else send(runId, row("approve_plan"));
+      });
+      break;
+    case "window":
+      // The switch is already pending when the claim starts, so it arrives during the retained-recovery
+      // prologue (phaseClone). The prologue hold latches it; it is served at the first executor site.
+      requestSwitch();
+      turnScripts = [planTurn(), last];
+      api.onState(runId, (b) => { if (b.status === "awaiting_approval") send(runId, row("approve_plan")); });
+      break;
+    case "plan_gate_exhausted":
+      // plan_max_revisions 0: the first revise verdict is already the exhausted one, and the gate re-presents it.
+      claim.config = { ...claim.config, plan_max_revisions: 0 } as typeof claim.config;
+      turnScripts = [planTurn(), last];
+      api.onState(runId, (b) => {
+        if (b.status !== "awaiting_approval") return;
+        ++gates;
+        if (gates === 1) send(runId, row("revise_plan", "please revise"));
+        else if (gates === 2) requestSwitch();
+        else send(runId, row("approve_plan"));
+      });
+      break;
+    case "ask_user":
+      turnScripts = [planTurn(), askTurn(), last];
+      api.onState(runId, (b) => {
+        if (b.status === "awaiting_approval") send(runId, row("approve_plan"));
+        else if (b.status === "awaiting_input") {
+          if (++asks === 1) requestSwitch();
+          else send(runId, row("answer", JSON.stringify({ question_id: b.open_question_id, answers: ["postgres"] })));
+        }
       });
       break;
     case "plan_gate_revision":
@@ -169,7 +205,7 @@ async function scenario(setup: Setup) {
   try {
     await runnerWith(() => ({ executor: sdk }), gitlab, undefined, secretLog.logger, {
       recoveryRetryMs: 1, planApprovalTimeoutMs: 20_000, credentialSwitchLedger: ledger, quiesceRun,
-      switchSupersedeWaitMs: 2_000, ...setup.extra,
+      switchSupersedeWaitMs: 2_000, questionTimeoutMs: 20_000, ...setup.extra,
     }).execute(claim);
   } finally {
     client.postMessages = postMessages;
@@ -208,7 +244,7 @@ function assertSeqContinuity(r: Result): void {
 }
 
 describe("issue #4201 m2c: an applied in-place credential switch continues the run where it was", () => {
-  for (const site of ["plan_turn", "plan_gate", "plan_gate_revision", "implement_turn"] as const) {
+  for (const site of ["plan_turn", "plan_gate", "plan_gate_revision", "plan_gate_exhausted", "ask_user", "implement_turn"] as const) {
     it(`${site}: same worker, generation, cwd and session; new token; proof before apply; seq and redaction intact`, TIMEOUT, async () => {
       const r = await scenario({ site, apply: [{ outcome: "applied", token: NEW_TOKEN }] });
       // Applied exactly once, for op-1, fenced on the generation and registration nonce.
@@ -512,5 +548,125 @@ describe("issue #4201 m2c: SEQ RULE for an apply that may have committed", () =>
     hold2.cancel();
     await b2.close();
     assert.deepEqual(again.map((m) => m.seq), [8]);
+  });
+});
+
+describe("issue #4201 m2d: a switch that arrives during the prologue is latched and served at the first executor site", () => {
+  it("applied in place before any model turn; no window threw it, nothing was released or held", TIMEOUT, async () => {
+    const r = await scenario({ site: "window", apply: [{ outcome: "applied", token: NEW_TOKEN }] });
+    assert.deepEqual(applied().map((b) => b.op_id), ["op-1"]);
+    const s = statusesOf(r);
+    for (const status of ["credential_switch", "credential_switch_held", "credential_switch_failed", "credential_switch_uncertain", "failed"])
+      assert.ok(!s.includes(status), `no ${status} report: ${s.join(",")}`);
+    assert.ok(s.includes("completed"), s.join(","));
+    assert.ok(r.turns.length >= 2 && r.turns.every((t) => t.token === NEW_TOKEN), "every turn ran on the new token: the apply came first");
+    assert.deepEqual(r.attempts(), r.attemptsBefore, "no new attempt dir");
+    assert.ok(!r.states.some((b) => (b.status as string) === "queued"), "never a requeue");
+  });
+});
+
+describe("issue #4201 m2d: the signal escaped the executor (the escaped arm)", () => {
+  /** A stub executor that never handles the switch: it waits for it and rethrows (as a test executor does). */
+  async function escaped(quiesce: (req: QuiesceRunRequest) => QuiesceRunOutcome | undefined) {
+    newApi();
+    negotiate();
+    const claim = freshClaim(GEN);
+    const runId = claim.run_id;
+    api.scriptApply(runId, { outcome: "applied", token: NEW_TOKEN });
+    let ran = 0;
+    const executor = {
+      run: async (ctx: import("../src/executor.js").RunContext) => {
+        ran++;
+        api.requestCredentialSwitch(runId, GEN, "op-1");
+        assert.ok(await until(() => ctx.signal?.aborted === true, 10_000), "the switch aborted ctx.signal");
+        throw ctx.signal!.reason;
+      },
+    };
+    const { gitlab } = fakeGitlab();
+    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir),
+      quiesceRun: async (req) => quiesce(req) ?? CLEAN,
+    }).execute(claim);
+    return { runId, ran, states: api.states.filter((x) => x.runId === runId).map((x) => x.body) };
+  }
+
+  it("proven quiescent: credential_switch_uncertain with the op id; never a release, an apply or a requeue", TIMEOUT, async () => {
+    const r = await escaped(() => undefined);
+    const s: string[] = r.states.map((b) => b.status);
+    assert.equal(api.uncertainRequests.length, 1, s.join(","));
+    assert.equal(api.uncertainRequests[0]!.body.op_id, "op-1");
+    assert.equal(applied().length, 0, "the executor has unwound: nothing is applied");
+    for (const status of ["credential_switch", "queued", "completed", "failed"]) assert.ok(!s.includes(status), `no ${status}: ${s.join(",")}`);
+  });
+
+  it("unproven: credential_switch_held with the op id, then settled after the join; never a requeue", TIMEOUT, async () => {
+    const r = await escaped((req) => (req.site === "in_place_credential_switch" ? BLOCKED : undefined));
+    const s: string[] = r.states.map((b) => b.status);
+    const held = api.holdRequests.filter((h) => h.status === "credential_switch_held");
+    assert.deepEqual(held.map((h) => h.op_id), ["op-1"], s.join(","));
+    assert.equal(applied().length, 0);
+    assert.equal(api.uncertainRequests.length, 0);
+    for (const status of ["credential_switch", "queued", "completed", "failed"]) assert.ok(!s.includes(status), `no ${status}: ${s.join(",")}`);
+    assert.equal(api.holdState(r.runId), "unsettled");
+  });
+});
+
+describe("issue #4201 m2d: a stale claim while the hold report retries", () => {
+  it("stops stale with the work retained: no more retries, no apply, no completion", TIMEOUT, async () => {
+    let held = 0;
+    const realReport = client.reportState.bind(client);
+    // The first report fails in transport; the retry finds the claim already superseded: the api answers the
+    // stale_claim disposition the runner's reportState closure turns into a StaleClaimError.
+    client.reportState = (async (runId: string, body: Parameters<typeof realReport>[1], ...rest: unknown[]) => {
+      if (body.status === "credential_switch_held" && ++held === 1) throw new Error("transport down");
+      if (body.status === "credential_switch_held" && held === 2) return { applied: false, staleClaim: true, status: "queued" };
+      return (realReport as (...a: unknown[]) => unknown)(runId, body, ...rest);
+    }) as typeof client.reportState;
+    let r: Awaited<ReturnType<typeof scenario>>;
+    try {
+      r = await scenario({
+        site: "implement_turn", apply: [{ outcome: "applied", token: NEW_TOKEN }],
+        quiesce: (req) => (req.site === "in_place_credential_switch" ? BLOCKED : undefined),
+      });
+    } finally { client.reportState = realReport as typeof client.reportState; }
+    assert.equal(held, 2, "the report was not retried past the stale answer");
+    assert.equal(applied().length, 0);
+    const s = statusesOf(r);
+    assert.ok(!s.includes("completed") && !s.includes("failed") && !s.includes("credential_switch"), s.join(","));
+    assert.equal(r.turns.length, 2, "no turn after the stale stop");
+    assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "the source clone is retained");
+  });
+});
+
+describe("issue #4201 m2d: the checkpoint authority now aborts with the switch's own CredentialSwitchSignal (v1 routing)", () => {
+  it("a checkpoint stopped by a switch surfaces the switch, and the run still takes today's release path (never a failure)", TIMEOUT, async () => {
+    // No in-place negotiation: this is today's v1 path. Its capture double verifies a clean tree.
+    git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+    mockCommittedTracking(git, "cafef00dcafef00dcafef00dcafef00dcafef00d");
+    git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
+    git.trackingTip = (async () => "cafef00dcafef00dcafef00dcafef00dcafef00d") as typeof git.trackingTip;
+    git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+    newApi();
+    const claim = freshClaim(GEN);
+    const runId = claim.run_id;
+    let checkpointError: unknown = "returned";
+    const executor = {
+      run: async (ctx: import("../src/executor.js").RunContext) => {
+        api.overrideStateStatus(runId, "queued"); // the release requeues the run
+        api.requestCredentialSwitch(runId, GEN, "op-1");
+        assert.ok(await until(() => ctx.signal?.aborted === true, 10_000), "the switch aborted ctx.signal");
+        try { await ctx.checkpoint!({ reap: true }); } catch (error) { checkpointError = error; }
+        throw ctx.signal!.reason;
+      },
+    };
+    const { gitlab } = fakeGitlab();
+    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+    const s: string[] = api.states.filter((x) => x.runId === runId).map((x) => x.body.status);
+    assert.ok(s.includes("credential_switch"), `released as today: ${s.join(",")}`);
+    assert.ok(!s.includes("failed") && !s.includes("completed"), s.join(","));
+    // Whatever the checkpoint did, it never reported the interruption as an AbortError of its own.
+    assert.ok(checkpointError === "returned" || checkpointError instanceof Error, String(checkpointError));
+    assert.ok(!(checkpointError instanceof Error && checkpointError.name === "AbortError" && !(checkpointError instanceof CredentialSwitchSignal)),
+      `a checkpoint stopped by a switch must not surface a bare AbortError: ${String(checkpointError)}`);
   });
 });

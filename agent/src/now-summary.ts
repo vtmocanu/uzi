@@ -208,6 +208,10 @@ export interface NowSummaryDeps {
   runPass(opts: ReadOnlyModelPassOpts): Promise<string>;
   /** The pass options the controller does not own: token, homeRoot, queryFn, log. */
   pass: Pick<ReadOnlyModelPassOpts, "token" | "homeRoot" | "queryFn">;
+  /** Issue #4201: the run's live credential (token + epoch ordinal). Read ONCE at each call's start: the call
+   *  uses that token and every frame it emits carries that ordinal, even when an in-place switch lands
+   *  while the call is in flight. Absent (a stub, a test) keeps `pass.token` and the base epoch. */
+  credential?: () => Readonly<{ token: string; ordinal: number }>;
   /** The run's claim-secret redactor (RunContext.redactText), applied before any cap. Absent ⇒ identity. */
   redact?: (s: string) => string;
   now(): number;
@@ -225,6 +229,8 @@ interface InFlight {
   milestoneId: string;
   /** The newest usage the pass delivered, for stop()'s abandon branch. */
   usage: AdviceUsageSnapshot | undefined;
+  /** Issue #4201: the credential epoch ordinal snapshotted at the call's start (0 = base epoch). */
+  epoch: number;
 }
 
 export class NowSummaryController {
@@ -343,7 +349,7 @@ export class NowSummaryController {
     if (!finished) {
       call.abandoned = true;
       // Spend counts: the usage the pass delivered before it hung is posted unless the claim is lost.
-      if (call.usage && this.deps.steering.claimFence() === undefined) this.emitUsageOnly(call.milestoneId, call.usage);
+      if (call.usage && this.deps.steering.claimFence() === undefined) this.emitUsageOnly(call.milestoneId, call.usage, call.epoch);
       this.deps.log.warn("now summary: the aborted call did not settle within the stop bound; its late result is dropped");
     }
   }
@@ -424,7 +430,9 @@ export class NowSummaryController {
 
     let usage: AdviceUsageSnapshot | undefined;
     let text = "";
-    const call: InFlight = { ctrl, abandoned: false, done: Promise.resolve(), milestoneId, usage: undefined };
+    // Issue #4201: one snapshot of the credential per call, at the call's start.
+    const cred = this.deps.credential?.();
+    const call: InFlight = { ctrl, abandoned: false, done: Promise.resolve(), milestoneId, usage: undefined, epoch: cred?.ordinal ?? 0 };
     // Registered BEFORE the async body runs: a pass that throws synchronously settles inside the
     // first synchronous stretch of the body, and settle() must find the registration to clear.
     this.inflight = call;
@@ -433,6 +441,7 @@ export class NowSummaryController {
         const codex = this.deps.claim.codex;
         text = await this.deps.runPass({
           ...this.deps.pass,
+          ...(cred ? { token: cred.token } : {}),
           // The Codex harness ignores the token, so a Codex call never carries the Anthropic one.
           ...(codex ? { token: undefined, model: NOW_MODEL_CODEX, effort: NOW_EFFORT_CODEX, codex: { ...codex, refresh: "deny" as const } } : { model: NOW_MODEL }),
           systemPrompt: SYSTEM_PROMPT,
@@ -478,17 +487,18 @@ export class NowSummaryController {
         kind: "progress_note",
         agent: "worker",
         payload: { text, milestone_id: milestoneId, ...(usage ? { model_usage: usage } : {}) },
+        ...epochStamp(call.epoch),
       });
       this.postedMilestone = milestoneId;
     } else if (usage && this.deps.steering.claimFence() === undefined) {
-      this.emitUsageOnly(milestoneId, usage);
+      this.emitUsageOnly(milestoneId, usage, call.epoch);
     }
     this.syncEnabled();
     this.schedule();
   }
 
-  private emitUsageOnly(milestoneId: string, usage: AdviceUsageSnapshot): void {
-    this.deps.emit({ kind: "progress_note", agent: "worker", payload: { text: "", milestone_id: milestoneId, model_usage: usage } });
+  private emitUsageOnly(milestoneId: string, usage: AdviceUsageSnapshot, epoch: number): void {
+    this.deps.emit({ kind: "progress_note", agent: "worker", payload: { text: "", milestone_id: milestoneId, model_usage: usage }, ...epochStamp(epoch) });
   }
 
   /** The steering channel saw a new poll value for the setting: re-sync now. */
@@ -510,6 +520,11 @@ export class NowSummaryController {
     }
     this.wasEnabled = enabled;
   }
+}
+
+/** Issue #4201: stamp a frame with its call's credential epoch only above the base epoch. */
+function epochStamp(epoch: number): { credentialEpochOrdinal?: number } {
+  return epoch > 0 ? { credentialEpochOrdinal: epoch } : {};
 }
 
 function buildPrompt(title: string, frames: readonly NowFrame[]): string {

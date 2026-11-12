@@ -97,7 +97,7 @@ function usage(input: number, output: number, extra: Partial<AdviceUsageSnapshot
   };
 }
 
-function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../src/protocol.js").RunKind; enabled?: boolean; ignoreAbort?: boolean; redact?: (s: string) => string } = {}) {
+function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../src/protocol.js").RunKind; enabled?: boolean; ignoreAbort?: boolean; redact?: (s: string) => string; credential?: () => { token: string; ordinal: number } } = {}) {
   const clock = new FakeClock();
   const emitted: EmittedMessage[] = [];
   const calls: PassCall[] = [];
@@ -124,6 +124,7 @@ function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../sr
     },
     emit: (m) => void emitted.push(m),
     ...(over.redact ? { redact: over.redact } : {}),
+    ...(over.credential ? { credential: over.credential } : {}),
     runPass: (opts) =>
       new Promise<string>((resolve, reject) => {
         calls.push({ opts, resolve, reject });
@@ -1030,5 +1031,57 @@ describe("NowSummaryController: review-rework behaviours", () => {
       const text = String(h.notes()[0]!.text);
       assert.ok(text !== "" && !text.includes(fragment.slice(0, 6)));
     });
+  });
+});
+
+// Issue #4201 m2d: each call snapshots the run's credential at its START. It uses that token and every frame
+// it posts (the note, or the usage-only note) carries that epoch ordinal, even when an in-place switch
+// publishes a newer credential while the call is in flight.
+describe("NowSummaryController: credential epoch attribution (issue #4201)", () => {
+  it("a call started before an apply and settled after it keeps the old token and the base epoch", async () => {
+    const cred = { token: "old-token", ordinal: 0 };
+    const h = harness({ credential: () => ({ ...cred }) });
+    await running(h);
+    assert.equal(h.calls[0]!.opts.token, "old-token");
+    cred.token = "new-token"; cred.ordinal = 1; // the switch lands while the call is in flight
+    h.calls[0]!.opts.onUsage?.(usage(10, 5));
+    h.calls[0]!.resolve("Running the api gate");
+    await settle();
+    const note = h.emitted.find((m) => m.kind === "progress_note")!;
+    assert.equal(note.credentialEpochOrdinal, undefined, "the old-token note keeps the base epoch (field absent)");
+  });
+
+  it("a call started after the apply uses the new token and stamps epoch 1 on its note", async () => {
+    const cred = { token: "new-token", ordinal: 1 };
+    const h = harness({ credential: () => ({ ...cred }) });
+    await running(h);
+    assert.equal(h.calls[0]!.opts.token, "new-token");
+    h.calls[0]!.opts.onUsage?.(usage(10, 5));
+    h.calls[0]!.resolve("Running the api gate");
+    await settle();
+    assert.equal(h.emitted.find((m) => m.kind === "progress_note")!.credentialEpochOrdinal, 1);
+  });
+
+  it("a usage-only note (the text discarded) carries the call's start epoch, not the current one", async () => {
+    const cred = { token: "old-token", ordinal: 0 };
+    const h = harness({ credential: () => ({ ...cred }) });
+    await running(h);
+    h.st.enabled = false;
+    cred.token = "new-token"; cred.ordinal = 1;
+    h.calls[0]!.opts.onUsage?.(usage(7, 3));
+    h.calls[0]!.resolve("discarded");
+    await settle();
+    const usageOnly = h.emitted.filter((m) => m.kind === "progress_note" && m.payload.text === "" && m.payload.model_usage);
+    assert.equal(usageOnly.length, 1);
+    assert.equal(usageOnly[0]!.credentialEpochOrdinal, undefined);
+  });
+
+  it("without a credential view the dependency's token and the base epoch are used unchanged", async () => {
+    const h = harness();
+    await running(h);
+    assert.equal(h.calls[0]!.opts.token, "tok");
+    h.calls[0]!.resolve("note");
+    await settle();
+    assert.equal(h.emitted[0]!.credentialEpochOrdinal, undefined);
   });
 });

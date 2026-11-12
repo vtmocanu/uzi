@@ -1592,6 +1592,11 @@ type InPlaceSwitchOutcome =
   | { kind: "retained_stop" }
   | { kind: "stale_stop" };
 
+/** Issue #4201: the facts an eligible in-place switch is decided on (Runner.inPlaceSwitchContext). */
+interface InPlaceSwitchContext {
+  ledger: CredentialSwitchOpLedger; holder: CredentialHolder; nonce: string; generation: number; opId: string; retained: boolean;
+}
+
 /** Issue #4201: bounded same-report retries of the in-place hold and uncertain reports. */
 const IN_PLACE_REPORT_ATTEMPTS = 5;
 /** Issue #4201: bounded same-op retries of an apply whose answer was ambiguous. */
@@ -3089,6 +3094,10 @@ interface RunFlight {
    *  assigns the flight's worktreePath. While set, {@link RunRunner.quiesceRun} refuses P's targets and HOME, a retained credential
    *  switch stops before settling, and the teardown keeps P's HOME. It stays set on every other exit, a seed failure included. */
   restorePredecessor?: { clonePath: string; home: string | undefined; executor: Executor };
+  /** Issue #4201 (A.3): the steering hold opened at phaseClone entry for an in-place-eligible flight. It latches a
+   *  switch for the whole retained-recovery prologue (so no window throws it) and is closed with service:true
+   *  just before executor.run, or service:false on any exit. */
+  prologueSwitchHold?: CredentialSwitchHold;
   /** issue #3644: an unsupported-predecessor owner hold was requested (or attempted) for this flight; the park teardown that would
    *  otherwise reap and drop the caches of the HOME the flight holds must not run. */
   restoreUnsupportedHold?: boolean;
@@ -6632,6 +6641,14 @@ export class RunRunner {
           await this.reportGenericFailure(claim, flight, new CandidateTransportInvariantError());
           return;
         }
+        // Issue #4201 (R2): an apply-negotiated worker never releases or requeues here. The executor has
+        // unwound, so the proof decides between option A (proven) and the hold fence (unproven).
+        const escaped = this.inPlaceSwitchContext(claim, flight);
+        if (escaped) {
+          await this.escapedInPlaceSwitch(flight, runLog, escaped);
+          await batcher.close().catch(() => undefined);
+          return;
+        }
         if (flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
             flight.completedRetainedSuccessor || flight.restorePredecessor !== undefined) {
           if (await this.enterRetainedCredentialSwitch(claim, flight, runLog) === "held") {
@@ -6897,8 +6914,12 @@ export class RunRunner {
     } catch (err) {
       // A refusal after the restore swap (phaseClone never returned) must act on the successor's executor, not the disposed one.
       if (flight.restoreExecutorSwapped) executor = flight.executor;
+      // Issue #4201 (A.3): a flight that ends in the prologue discards its latched switch (the server stamp
+      // stays pending and the next claim serves it in place).
+      flight.prologueSwitchHold?.close({ service: false });
       await dispatchFailure(err, true);
     } finally {
+      flight.prologueSwitchHold?.close({ service: false });
       if (flight.restoreExecutorSwapped) executor = flight.executor;
       flight.forgeCloneSuccess?.abort();
       if (flight.policyHold) {
@@ -12700,6 +12721,12 @@ export class RunRunner {
       });
     // The description describes the exact successfully pushed candidate.
     const landedHead = flight.successfulPushedSha ?? "";
+    // Issue #4201: the editor pass reads the credential ONCE, here at the publication's start: it uses that
+    // token and its usage frame carries that epoch ordinal, whatever an in-place switch does meanwhile.
+    const descCredential = flight.credential?.current();
+    const descClaim = descCredential
+      ? { ...claim, secrets: { ...claim.secrets, anthropic_oauth_token: descCredential.token } }
+      : claim;
     const publisher = new PrDescriptionPublisher({
       forge,
       api: this.client,
@@ -12712,7 +12739,8 @@ export class RunRunner {
       // (publishing is awaited before it closes); a fenced (lost) claim emits nothing.
       emitUsage: (u) => {
         if (flight.steering.claimFence() !== undefined) return;
-        batcher.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "pr_description", model_usage: u } });
+        batcher.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "pr_description", model_usage: u },
+          ...(descCredential && descCredential.ordinal > 0 ? { credentialEpochOrdinal: descCredential.ordinal } : {}) });
       },
       forgeRetry,
       headLagRetryMs: this.prDescriptionHeadLagMs,
@@ -12725,7 +12753,7 @@ export class RunRunner {
       {
         runId,
         claimGeneration: flight.claimGeneration,
-        claim,
+        claim: descClaim,
         repoUrl: claim.repo.url,
         pat: claim.secrets.forge_pat,
         repoPath,
@@ -14294,6 +14322,10 @@ export class RunRunner {
     const runId = claim.run_id;
     const active: ActiveRun = (flight.active = { registrationToken: flight.registrationToken, claimGeneration: flight.claimGeneration, cancel, steering, shuttingDown: false, retainedLocalCustody: () => flight.retainedLocalCustody === true });
     this.activeRuns.set(runId, active);
+    // Issue #4201 (A.3): for an in-place-eligible flight a switch that arrives during the prologue is
+    // latched, not tripped, so none of the retained-recovery windows rethrows it. It is served at the
+    // first executor site (closed with service:true just before executor.run) and discarded on any exit.
+    if (this.inPlaceRouteOpen(claim, flight)) flight.prologueSwitchHold = steering.holdCredentialSwitch();
     if (this.shuttingDownGlobal) {
       active.shuttingDown = true;
       active.gracefulShutdownCheckpoint = steering.workerShutdown(this.shutdownDeadlineAt!);
@@ -14445,9 +14477,11 @@ export class RunRunner {
         // Discovery can stop before a source identity reaches the flight. Keep unknown
         // custody and preserve either typed abort reason after terminal precedence.
         this.retainedTerminalGuard(flight);
+        const unspentSwitch = (reason: unknown): boolean =>
+          reason instanceof CredentialSwitchSignal && !flight.steering.isSettledSwitchSignal(reason);
         if (error instanceof CredentialSwitchSignal ||
-            flight.cancel.signal.reason instanceof CredentialSwitchSignal ||
-            flight.steering.lifecycleSignal().reason instanceof CredentialSwitchSignal) {
+            unspentSwitch(flight.cancel.signal.reason) ||
+            unspentSwitch(flight.steering.lifecycleSignal().reason)) {
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
           flight.retainedLocalCustody = true;
@@ -16287,9 +16321,12 @@ export class RunRunner {
             },
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,
+            // Issue #4201: the call-start credential snapshot (token and epoch ordinal).
+            credential: () => flight.credential!.current(),
             runPass: runReadOnlyModelPass,
             pass: {
-              token: claim.secrets.anthropic_oauth_token,
+              // Placeholder only: every call overrides it with the credential snapshot (deps.credential).
+              token: flight.credential?.current().token ?? "",
               homeRoot: this.nowSummaryOpts.homeRoot,
               queryFn: this.nowSummaryOpts.queryFn,
             },
@@ -17915,6 +17952,10 @@ export class RunRunner {
         const checkRemediation = await this.requireLaunchAuthority(flight);
         let execution: Promise<ExecutorResult>;
         checkRemediation();
+        // Issue #4201 (A.3): the prologue is over. A switch latched during it trips here, synchronously, and
+        // the executor's first wait or turn rejects with it, which its site handles in place (proof before
+        // apply). Closed immediately before run so nothing awaits between the service and the executor.
+        flight.prologueSwitchHold?.close({ service: true });
         try { execution = executor.run(ctx); }
         catch (value) {
           executionRejection.executorRejected = true;
@@ -26698,7 +26739,12 @@ export class RunRunner {
     const cancel = flight.cancel.signal;
     // parkForPause/parkForWall rearm the current lifecycle after refusal; the shared
     // cancel controller retains its first PauseNowSignal for the rest of this flight.
-    return cancel.aborted && cancel.reason instanceof PauseNowSignal ? [lifecycle] : [cancel, lifecycle];
+    // Issue #4201: a CredentialSwitchSignal that steering marked settled (an in-place switch applied)
+    // is spent in the same way, so a retained flight that applied in place does not rethrow the old
+    // signal from every later guard.
+    const spent = (signal: AbortSignal): boolean => signal.aborted && flight.steering.isSettledSwitchSignal(signal.reason);
+    const live = spent(lifecycle) ? [] : [lifecycle];
+    return cancel.aborted && (cancel.reason instanceof PauseNowSignal || spent(cancel)) ? live : [cancel, ...live];
   }
 
   private retainedLifecycleGuard(flight: RunFlight): void {
@@ -26938,7 +26984,8 @@ export class RunRunner {
    * Order, each step holding before the next:
    *  1. Eligibility (synchronous; any miss is `v1_release` with no effect): the ledger, the holder, the
    *     registration nonce, a pending op id, the negotiated apply capability, a Claude flight, and no
-   *     retained authority (the retained arm is a later unit).
+   *     restore-route predecessor. A flight with retained authority is eligible (R1): it proves under the
+   *     `retained_credential_switch` site and keeps its custody flags.
    *  2. PROOF under one MaintenanceBudget: the executor's lane is settled, the settle observed the run
    *     empty, and the own-mode quiescence proof is not blocked (`settleSwitchQuiescence`). Unproven sends
    *     `credential_switch_held` WITH the op id (bounded identical retries) and stops the flight held:
@@ -26955,6 +27002,32 @@ export class RunRunner {
   private async inPlaceCredentialSwitch(
     claim: ClaimResponse, flight: RunFlight, runLog: Logger, site: InPlaceSwitchSite, laneSettled: boolean,
   ): Promise<InPlaceSwitchOutcome> {
+    const fixed = this.inPlaceSwitchContext(claim, flight);
+    if (!fixed) return { kind: "v1_release" };
+    try {
+      return await this.runInPlaceSwitch(flight, runLog, site, laneSettled, fixed);
+    } catch (error) {
+      if (isRunOwnershipLost(error, flight.runId)) return { kind: "stale_stop" };
+      throw error;
+    }
+  }
+
+  /**
+   * Eligibility for the in-place switch, synchronous and without effect: the ledger, the holder, the
+   * registration nonce, the negotiated apply capability, a Claude flight, no restore-route predecessor and
+   * a pending op id on this claim's generation. `undefined` means the v1 path. R1: retained authority does
+   * not make a flight ineligible; it only changes the proof's site and the custody flags kept on a hold.
+   */
+  /** The part of the eligibility that does not depend on a pending op (also decides the prologue hold). */
+  private inPlaceRouteOpen(claim: ClaimResponse, flight: RunFlight): boolean {
+    const generation = flight.claimGeneration;
+    return !!this.credentialSwitchLedger && !!flight.credential && !!this.client.registrationNonce() &&
+      Number.isSafeInteger(generation) && generation! > 0 &&
+      this.client.supportsInPlaceCredentialSwitch() && !this.isCodexCapture(claim, flight) &&
+      flight.restorePredecessor === undefined && !flight.completedRetainedSuccessor;
+  }
+
+  private inPlaceSwitchContext(claim: ClaimResponse, flight: RunFlight): InPlaceSwitchContext | undefined {
     const ledger = this.credentialSwitchLedger;
     const holder = flight.credential;
     const pending = flight.steering.pendingCredentialSwitchOp();
@@ -26962,23 +27035,63 @@ export class RunRunner {
     const generation = flight.claimGeneration;
     if (!ledger || !holder || !nonce || pending?.opId === undefined || pending.generation !== generation ||
         !Number.isSafeInteger(generation) || generation <= 0 ||
-        !this.client.supportsInPlaceCredentialSwitch() || this.isCodexCapture(claim, flight) ||
-        flight.restorePredecessor !== undefined ||
-        flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
-        flight.completedRetainedSuccessor) return { kind: "v1_release" };
+        !this.inPlaceRouteOpen(claim, flight)) return undefined;
+    // R1: a flight that carries retained authority (a retained episode or local custody) runs the same
+    // proof under its existing `retained_credential_switch` site and, once proven, applies in place with
+    // its custody flags left as they are. It never verifies-and-releases while the in-place route is open.
+    const retained = flight.retainedEpisode === true || flight.retainedLocalCustody === true || flight.retainedEpisodeCustody === true;
+    return { ledger, holder, nonce, generation, opId: pending.opId, retained };
+  }
+
+  /**
+   * R2: the switch signal escaped the executor (a stub executor, or an await no site wraps) and the
+   * executor has unwound, so no turn can continue on either token and nothing is applied. For an
+   * apply-negotiated worker the flight never requeues and never releases: a PROVEN-quiescent run is
+   * reported `credential_switch_uncertain` (option A, an owner pause: the standing override stays pending
+   * for the owner), an UNPROVEN one is fenced with `credential_switch_held`. Work and custody are kept
+   * either way. Never throws: any failure leaves the run non-terminal with its work retained.
+   */
+  private async escapedInPlaceSwitch(
+    flight: RunFlight, runLog: Logger, fixed: { opId: string; retained: boolean },
+  ): Promise<void> {
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.keepGuardedInventoryOpen = true;
+    if (fixed.retained) flight.retainedLocalCustody = true;
+    const lifecycle = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+    const identity = (): void => {
+      this.retainedTerminalGuard(flight);
+      for (const signal of this.retainedLifecycleSignals(flight)) {
+        if (signal.aborted && !(signal.reason instanceof CredentialSwitchSignal)) throw new RetainedRecoveryStop();
+      }
+    };
     try {
-      return await this.runInPlaceSwitch(flight, runLog, site, laneSettled, { ledger, holder, nonce, generation, opId: pending.opId });
+      identity();
+      const laneSettled = flight.executor.laneSettlementProven?.() ?? true;
+      const proof = await this.settleSwitchQuiescence(flight, identity,
+        fixed.retained ? "retained_credential_switch" : "in_place_credential_switch", laneSettled);
+      const opId = flight.steering.pendingCredentialSwitchOp()?.opId ?? fixed.opId;
+      if (!proof.settled) {
+        await this.holdRetainedSwitch(flight, runLog, lifecycle, identity, proof.detail, proof.survivors,
+          { opId, attempts: IN_PLACE_REPORT_ATTEMPTS });
+        return;
+      }
+      const outcome = await this.inPlaceOptionA(flight, runLog, opId, undefined, lifecycle, identity);
+      if (outcome.kind === "option_a") {
+        runLog.info("credential switch escaped the executor; run paused for the owner (outcome uncertain), work and custody kept", { run_id: flight.runId });
+      }
     } catch (error) {
-      if (isRunOwnershipLost(error, flight.runId)) return { kind: "stale_stop" };
-      throw error;
+      runLog.warn("credential switch escaped the executor and could not be settled; work and custody retained, run left non-terminal", {
+        run_id: flight.runId, error: errMessage(error),
+      });
     }
   }
 
   private async runInPlaceSwitch(
     flight: RunFlight, runLog: Logger, site: InPlaceSwitchSite, laneSettled: boolean,
-    fixed: { ledger: CredentialSwitchOpLedger; holder: CredentialHolder; nonce: string; generation: number; opId: string },
+    fixed: InPlaceSwitchContext,
   ): Promise<InPlaceSwitchOutcome> {
-    const { ledger, holder, nonce, generation } = fixed;
+    const { ledger, holder, nonce, generation, retained } = fixed;
     let opId = fixed.opId;
     const lifecycle = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
     // Lifecycle changes (cancel, fence, shutdown, a pause) throw and keep their precedence; the switch's
@@ -26991,7 +27104,8 @@ export class RunRunner {
     };
     identity();
     runLog.info("in-place credential switch: proving the run quiescent", { run_id: flight.runId, generation, site });
-    const proof = await this.settleSwitchQuiescence(flight, identity, "in_place_credential_switch", laneSettled);
+    const proof = await this.settleSwitchQuiescence(flight, identity,
+      retained ? "retained_credential_switch" : "in_place_credential_switch", laneSettled);
     if (!proof.settled) {
       // Unproven: keep everything, tell the owner (op-fenced), apply nothing. The flight stays inside the
       // hook (so it keeps heartbeating) while the report retries, then stops held; executeClaim's finally
@@ -26999,6 +27113,7 @@ export class RunRunner {
       flight.preserveRecoveryClone = true;
       flight.preserveSession = true;
       flight.keepGuardedInventoryOpen = true;
+      if (retained) flight.retainedLocalCustody = true;
       const latest = flight.steering.pendingCredentialSwitchOp()?.opId ?? opId;
       const disposition = await this.holdRetainedSwitch(flight, runLog, lifecycle, identity, proof.detail, proof.survivors,
         { opId: latest, attempts: IN_PLACE_REPORT_ATTEMPTS });
@@ -27165,9 +27280,10 @@ export class RunRunner {
    * on a lost reply, and a positive ownership read (paused, no hold reason, this generation) also confirms.
    */
   private async inPlaceOptionA(
-    flight: RunFlight, runLog: Logger, opId: string, hold: BatcherSwitchHold, signal: AbortSignal, guard: () => void,
+    flight: RunFlight, runLog: Logger, opId: string, hold: BatcherSwitchHold | undefined, signal: AbortSignal, guard: () => void,
   ): Promise<InPlaceSwitchOutcome> {
-    this.releaseHoldPastPossibleApply(hold, flight, runLog);
+    // `hold` is absent on the escaped arm (R2), where nothing was applied and no hold was opened.
+    if (hold) this.releaseHoldPastPossibleApply(hold, flight, runLog);
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
