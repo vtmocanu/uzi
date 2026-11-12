@@ -65,9 +65,16 @@ it("fits the whole by-user table in the card at a 1280px viewport, with every ce
     expect(r.right, el.textContent!).toBeLessThanOrEqual(cell.right);
   }
 
-  // (c) the header starts where the bar cells' content starts.
-  const contentLeft = (el: Element) => el.getBoundingClientRect().left + parseFloat(getComputedStyle(el).paddingLeft);
+  // (c) the header text starts where the bar cells' content starts. Measure the rendered header
+  // text, not the cell box: a header and its cells share one column box whatever their text-align,
+  // so a box measurement would pass with the header right-aligned again.
+  const textRange = document.createRange();
+  textRange.selectNodeContents(header);
+  const headerTextLeft = textRange.getBoundingClientRect().left;
   const barCells = screen.getAllByRole("row").slice(1).map((r) => r.lastElementChild!);
   expect(barCells.length).toBeGreaterThan(2);
-  for (const cell of barCells) expect(Math.abs(contentLeft(cell) - contentLeft(header))).toBeLessThanOrEqual(1);
+  for (const cell of barCells) {
+    const contentLeft = cell.firstElementChild!.firstElementChild!.getBoundingClientRect().left;
+    expect(Math.abs(contentLeft - headerTextLeft)).toBeLessThanOrEqual(1);
+  }
 });
