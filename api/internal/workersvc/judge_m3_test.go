@@ -185,7 +185,8 @@ func eligibleFixture(t *testing.T) (*fakeStore, *Service, store.Run) {
 	}
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
-	// PRD #1429 M3 (D4): the judge inherits the target's harness as an explicit selection,
+	// PRD #1429 M3 (D4): with the owner's "Judge runs on" choice unset (#3257), the judge
+	// inherits the target's harness as an explicit selection,
 	// and createRunResolved's non-live-DB fallback only ever resolves Claude (the fake
 	// asserts no wrong harness) — so a fixture without an explicit Claude harness would now
 	// refuse at create (errNoCredentialForHarness) instead of enqueueing. Every plain-fake
