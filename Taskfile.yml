@@ -378,6 +378,7 @@ tasks:
       - task: test:codex-proof-harness
       # Docker-free diagnostic regressions for the worker UID lane (#2397).
       - task: test:worker-uid-harness
+      - task: test:go-cache-preflight
       # hermetic (~instant): a fake `docker` on PATH, no daemon. Guards that
       # run-store-it.sh's teardown removes the throwaway Postgres ANONYMOUS VOLUME
       # (`docker rm -v`); the missing `-v` leaked one pg volume per run and filled
@@ -2993,6 +2994,11 @@ tasks:
       - task: test:agent:unit
       # PRD 1287 C1 / D7 point 5: M4 runs once after the complete local unit suite.
       - task: test:codex-m4
+
+  test:go-cache-preflight:
+    desc: nonproducing Go cache preflight regressions with owned Unix socket stubs
+    cmds:
+      - python3 -B -m unittest discover -s e2e/go-cache-admission -v
 
   test:worker-uid-harness:
     desc: Docker-free worker UID report checker and shell wrapper regressions
