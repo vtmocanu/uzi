@@ -853,6 +853,11 @@ type Config struct {
 	// advertised protocol feature and step B.
 	HeldPublication bool
 
+	// AdminRunDebug (UZI_ADMIN_RUN_DEBUG, default off) enables cross-user, read-only run debug
+	// reads for a live admin using a Bearer CLI token whose stored scope is admin_ro. Cookies
+	// and uzc_ tokens never qualify. Each newly authorized read writes one audit log line.
+	AdminRunDebug bool
+
 	// PublicationResume (issue #1324, RUN_PUBLICATION_RESUME_ENABLED) is the write-ahead
 	// publication intent switch. Unset or empty means on; parsed like UZI_HELD_PUBLICATION.
 	// Off stops advertising publication_resume_v1 and refuses NEW enrollment only: existing
@@ -1530,6 +1535,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.HeldPublication = heldPublication
+
+	adminRunDebug, err := parseOnOff("UZI_ADMIN_RUN_DEBUG", false)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AdminRunDebug = adminRunDebug
 
 	publicationResume, err := parseOnOff("RUN_PUBLICATION_RESUME_ENABLED", true)
 	if err != nil {

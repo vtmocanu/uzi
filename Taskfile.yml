@@ -1696,6 +1696,10 @@ tasks:
       # Also runs the issue tracker allowlist render check (PRD #4173 S3: the separate
       # ISSUE_TRACKER_ALLOWED_BASE_URLS, never worker egress), same no-workflow-edit wiring.
       - ./scripts/assert-issue-tracker-allowlist-render.sh
+      # Also runs the admin run debug render check (issue #4198: api.adminRunDebug.enabled
+      # renders UZI_ADMIN_RUN_DEBUG, reserved against api.config/api.secretEnv), same
+      # no-workflow-edit wiring.
+      - ./scripts/assert-admin-run-debug-render.sh
 
   render:pvc-expansion-check:
     desc: assert the chart renders the PVC expansion surface (DinD data-size env, ceiling guards, the get-only StorageClass ClusterRole)
@@ -1720,6 +1724,14 @@ tasks:
       # (CNPG subchart stripped), non-vacuous, needs helm + yq. Also run by
       # render:openshift-check.
       - ./scripts/assert-issue-tracker-allowlist-render.sh
+
+  render:admin-run-debug-check:
+    desc: assert the chart renders the api's UZI_ADMIN_RUN_DEBUG from api.adminRunDebug.enabled and reserves the key against api.config/api.secretEnv
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline
+      # (CNPG subchart stripped), non-vacuous, needs helm + yq. Also run by
+      # render:openshift-check.
+      - ./scripts/assert-admin-run-debug-render.sh
 
   render:drain-knobs-check:
     desc: assert the controller Deployment renders the drain-deadline + force-roll knobs (PRD 422 M5)

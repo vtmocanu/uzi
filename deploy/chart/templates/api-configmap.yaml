@@ -20,6 +20,17 @@ data:
   {{- fail "Do not set UZI_RELEASE_CHECK_TOKEN in api.config: it is a secret and api.config renders into a plaintext ConfigMap. Supply it via api.secretEnv (Infisical secretKeyRef)." }}
   {{- end }}
   {{- /*
+    UZI_ADMIN_RUN_DEBUG is reserved to api.adminRunDebug.enabled (issue #4198). Setting it in
+    api.config would emit a duplicate key (or a value the chart does not control), so any
+    presence fails the render, whatever the value.
+  */ -}}
+  {{- if hasKey .Values.api.config "UZI_ADMIN_RUN_DEBUG" }}
+  {{- fail "Set UZI_ADMIN_RUN_DEBUG through api.adminRunDebug.enabled, not api.config" }}
+  {{- end }}
+  {{- if (.Values.api.adminRunDebug).enabled }}
+  UZI_ADMIN_RUN_DEBUG: "true"
+  {{- end }}
+  {{- /*
     FORGE_ALLOWED_BASE_URLS rendered EXPLICITLY from the first-class forge.allowedBaseURLs
     value (PRD #808), NOT left to the api.config freeform map — so the SSRF allowlist and
     the worker egress FQDNs (worker-fqdn-egress.yaml) derive from ONE source list and the
