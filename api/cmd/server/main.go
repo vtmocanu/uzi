@@ -809,6 +809,16 @@ func run() error {
 		Lease: cfg.EphemeralLease,
 	})
 
+	// PRD #4205 M5: the demand-wake pass. Shares the claim knobs ClaimRun uses so its demand query
+	// agrees with what a woken worker could claim.
+	hibernationWaker := hostedsvc.NewHibernationWaker(q, wsvc, settingsCache, hostedsvc.HibernationWakerConfig{
+		WorkerAffinityGrace:     cfg.WorkerAffinityGrace,
+		WorkerStaleRequeueGrace: cfg.WorkerStaleRequeueGrace,
+		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
+		WorkerHeartbeatStale:    cfg.WorkerHeartbeatStale,
+		BackgroundGrace:         cfg.WorkerBackgroundGrace,
+	})
+
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,
 		sweeper.Pass{
 			Name: "vault_browser_slots_expired",
@@ -899,6 +909,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "worker_hibernation_settle",
 			Run:  wsvc.HibernationSettlePass,
+		},
+		// Hibernation demand wake (PRD #4205 M5): wakes a sleeping worker for a queued run no online
+		// worker can claim. It MUST run BEFORE ephemeral_workers_provision so sleeping capacity is
+		// used first and provisioning sees the recorded wake that suppresses a duplicate worker.
+		// Unconditional: it runs whatever ephemeral_workers_enabled and worker_hibernation_enabled say.
+		sweeper.Pass{
+			Name: "worker_hibernation_wake",
+			Run:  hibernationWaker.WakePass,
 		},
 		sweeper.Pass{
 			Name: "ephemeral_workers_provision",

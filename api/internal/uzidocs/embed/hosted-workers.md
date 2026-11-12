@@ -164,9 +164,20 @@ Preparation that does not finish within 10 minutes is withdrawn into a wake.
 A wake completes only when the new pod registers (or the original pod is still
 alive). A wake not confirmed within 15 minutes shows a wake error on the worker.
 
-For now a hibernated worker wakes only when an admin presses **Wake** or turns
-the setting off, which wakes every hibernated or still-hibernating worker. A run is not woken
-automatically.
+A hibernated worker wakes when an admin presses **Wake**, when the setting is turned
+off (every hibernated or still-hibernating worker, ten per sweep), or on demand. On
+demand means a queued run of any kind, chat, judge and cross-check included, that no
+online worker of its owner can claim but that a hibernated or still-hibernating worker of
+the same owner could claim once awake. The sweeper wakes one such worker per run, the one
+asleep longest, and a worker already waking is preferred, so one woken worker serves every
+run it is eligible for and no sibling is woken. A still-hibernating worker with demand is
+withdrawn into a wake. A queued run that only a full (saturated) online worker could take
+waits as before and does not wake anything. Demand wakes work whether
+`worker_hibernation_enabled` and `ephemeral_workers_enabled` are on or off, and run before
+ephemeral provisioning on the same sweep, so sleeping capacity is used first. While the
+wake is not older than 15 minutes (counted from the first wake of that run) no ephemeral
+worker is provisioned for that run; a run the woken worker cannot serve is unaffected, and
+after 15 minutes provisioning proceeds as today.
 
 Status shows in `uzi worker list` and `uzi admin workers`; see
 [CLI](./cli.md#hibernated-workers). The design is in

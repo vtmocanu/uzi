@@ -11776,6 +11776,7 @@ WITH checker_template_pins AS MATERIALIZED (
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+LEFT JOIN checker_template_pins ctp ON ctp.user_id = r.user_id
 WHERE r.status = 'queued'
   -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, so a new
   -- ephemeral worker could never serve it (ClaimRun bars it and the reaper removes the worker).
@@ -11831,87 +11832,25 @@ WHERE r.status = 'queued'
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
   AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
 
+  -- PRD #4205 M5: the per-worker placement block (capabilities, protocol, lane, lease and
+  -- cross-check predicates) lives in fn_placement_admitting_workers so the hibernation wake-demand
+  -- query evaluates the SAME predicates. This caller keeps the availability conjuncts the function
+  -- deliberately omits: online, not maintenance-fenced, awake, accepting intake (or the cross-check
+  -- own-worker arm).
   AND NOT EXISTS (
-      SELECT 1 FROM workers w
-      WHERE w.user_id = r.user_id
-        AND w.status = 'online'
+      SELECT 1
+      FROM fn_placement_admitting_workers(
+              r, ctp.codex_model,
+              @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz,
+              @ephemeral_lease::interval,
+              fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]),
+              @codex_curated_models::text[]) adm
+      JOIN workers w ON w.id = adm.worker_id
+      WHERE w.status = 'online'
         AND NOT w.maintenance_fenced
         AND w.hibernation_state = 'none'
         AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
-        AND (r.kind = 'cross_check' OR NOT w.ephemeral
-             -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
-             -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
-             -- provisioned for.
-             OR (fn_ephemeral_lease_admits(
-                    w.lease_since, w.lease_repo_id, w.lease_branch, NOT fn_worker_accepts_new_intake(w),
-                    @ephemeral_lease::interval, now(),
-                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false))
-                 -- The lease admits only runs outside the isolated lane.
-                 AND NOT w.isolated_lane))
-        -- Protocol requirements apply to persistent and leased workers alike.
-        AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
-                      OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
-      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
-      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
-      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, the side row's worker_id (not runs.worker_id, which resume writers clear); a NULL side worker_id is held. No affinity-ceiling release.
-      AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL AND pc.worker_id IS DISTINCT FROM w.id)
-        AND (r.completion_contract_version IS NULL
-                      OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
-        -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
-        -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
-        -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
-        AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
-        AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
-        AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
-      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
-                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
-                 AND (r.completion_contract_version IS NULL
-                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
-                 AND (
-                     NOT (
-                         r.harness = 'codex'
-                         AND r.kind NOT IN ('judge', 'chat')
-                         AND r.review_target_run_id IS NULL
-                         AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
-                                        ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY(@codex_curated_models::text[])),
-                             false)
-                     )
-                     OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
-                 )
-        AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
-             OR 'cross_check_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
-             OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
-             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
-             OR 'cross_check_owner_steering_v1' = ANY(w.protocol_capabilities))
-        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
-             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
-      AND (r.kind <> 'cross_check' OR EXISTS (
-          SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
-          WHERE protocol_check.checker_run_id = r.id
-            AND protocol_check.lead_run_id = r.target_run_id AND protocol_lead.user_id = r.user_id
-            AND protocol_lead.kind <> 'cross_check' AND protocol_check.stage IN ('plan','code')
-            AND protocol_check.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = protocol_check.lead_run_id AND latest.stage = protocol_check.stage)
-            AND ((protocol_check.stage = 'plan' AND protocol_check.verdict = 'pending') OR (protocol_check.stage = 'code' AND protocol_check.outcome = 'pending' AND protocol_check.interrupted_at IS NULL AND 'cross_check_code_v1' = ANY(w.protocol_capabilities) AND 'cross_check_lane_v1' = ANY(w.protocol_capabilities))) AND protocol_check.deadline_at > now()
-            AND (protocol_lead.status IN ('claimed','running') OR (protocol_check.stage = 'code' AND protocol_lead.status = 'awaiting_followup' AND protocol_lead.kind = 'task' AND protocol_lead.interactive)) AND protocol_lead.claim_released_at IS NULL
-            AND protocol_lead.claim_generation = protocol_check.lead_claim_generation
-            AND (protocol_check.round = 1 OR (protocol_check.automatic_rounds_enabled
-                AND protocol_check.round <= protocol_check.automatic_revision_limit + 1
-                AND 'cross_check_rounds_v1' = ANY(w.protocol_capabilities)))
-      ))
-      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL))) OR 'cross_check_pins_v1' = ANY(w.protocol_capabilities))
-        AND r.required_capabilities <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
   )
   -- The job arm: a job is placeable ONLY on an online, non-draining, non-ephemeral, NON-docker
   -- worker advertising 'job_runner_v1' (ClaimRun's non-bypassable job-runner clause). Only a job

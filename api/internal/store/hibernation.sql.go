@@ -12,6 +12,24 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const deleteHibernationWake = `-- name: DeleteHibernationWake :execrows
+DELETE FROM hibernation_wakes WHERE run_id = $1 AND worker_id = $2
+`
+
+type DeleteHibernationWakeParams struct {
+	RunID    uuid.UUID `json:"run_id"`
+	WorkerID uuid.UUID `json:"worker_id"`
+}
+
+// Guarded by the worker so a row recorded for another worker in the meantime survives.
+func (q *Queries) DeleteHibernationWake(ctx context.Context, arg DeleteHibernationWakeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteHibernationWake, arg.RunID, arg.WorkerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getControllerHibernationAdvertisement = `-- name: GetControllerHibernationAdvertisement :one
 SELECT hibernation_version, hibernation_advertised_at, poll_interval_seconds
 FROM controller_report_status WHERE id = 1
@@ -28,6 +46,96 @@ func (q *Queries) GetControllerHibernationAdvertisement(ctx context.Context) (Ge
 	var i GetControllerHibernationAdvertisementRow
 	err := row.Scan(&i.HibernationVersion, &i.HibernationAdvertisedAt, &i.PollIntervalSeconds)
 	return i, err
+}
+
+const getHibernationWake = `-- name: GetHibernationWake :one
+SELECT run_id, worker_id, first_woken_at FROM hibernation_wakes WHERE run_id = $1
+`
+
+func (q *Queries) GetHibernationWake(ctx context.Context, runID uuid.UUID) (HibernationWake, error) {
+	row := q.db.QueryRow(ctx, getHibernationWake, runID)
+	var i HibernationWake
+	err := row.Scan(&i.RunID, &i.WorkerID, &i.FirstWokenAt)
+	return i, err
+}
+
+const hibernationWakeSuppresses = `-- name: HibernationWakeSuppresses :one
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT r.user_id FROM runs r
+        WHERE r.id = $4 AND r.kind = 'cross_check' AND r.harness = 'codex'
+    ) owners
+)
+SELECT EXISTS (
+    SELECT 1
+    FROM hibernation_wakes hw
+    JOIN runs r ON r.id = hw.run_id
+    JOIN workers w ON w.id = hw.worker_id AND w.hibernation_state = 'waking'
+    LEFT JOIN checker_template_pins ctp ON ctp.user_id = r.user_id
+    JOIN fn_placement_admitting_workers(
+            r, ctp.codex_model,
+            $1::timestamptz, $2::timestamptz,
+            '0'::interval, false, $3::text[]) adm ON adm.worker_id = w.id
+    WHERE hw.run_id = $4
+      AND hw.first_woken_at > now() - $5::interval
+)::boolean AS suppressed
+`
+
+type HibernationWakeSuppressesParams struct {
+	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
+	CrossCheckAffinityCutoff pgtype.Timestamptz `json:"cross_check_affinity_cutoff"`
+	CodexCuratedModels       []string           `json:"codex_curated_models"`
+	RunID                    uuid.UUID          `json:"run_id"`
+	WakeTimeout              pgtype.Interval    `json:"wake_timeout"`
+}
+
+// Wake suppression for ephemeral provisioning (PRD #4205 M5, D9): true iff the run has a recorded
+// wake whose worker is still waking, is admitted for THIS run by fn_placement_admitting_workers
+// (so a run needing another capability or lane is never suppressed), and the FIRST wake is
+// younger than @wake_timeout (retries never reset first_woken_at).
+func (q *Queries) HibernationWakeSuppresses(ctx context.Context, arg HibernationWakeSuppressesParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hibernationWakeSuppresses,
+		arg.CrossCheckEvaluatedAt,
+		arg.CrossCheckAffinityCutoff,
+		arg.CodexCuratedModels,
+		arg.RunID,
+		arg.WakeTimeout,
+	)
+	var suppressed bool
+	err := row.Scan(&suppressed)
+	return suppressed, err
+}
+
+const insertHibernationWake = `-- name: InsertHibernationWake :one
+INSERT INTO hibernation_wakes (run_id, worker_id, first_woken_at)
+VALUES ($1, $2, $3)
+ON CONFLICT (run_id) DO NOTHING
+RETURNING run_id
+`
+
+type InsertHibernationWakeParams struct {
+	RunID        uuid.UUID          `json:"run_id"`
+	WorkerID     uuid.UUID          `json:"worker_id"`
+	FirstWokenAt pgtype.Timestamptz `json:"first_woken_at"`
+}
+
+// One wake per pending run: the PRIMARY KEY (run_id) is the guard. No row returned means
+// another pass already recorded a wake for this run.
+func (q *Queries) InsertHibernationWake(ctx context.Context, arg InsertHibernationWakeParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertHibernationWake, arg.RunID, arg.WorkerID, arg.FirstWokenAt)
+	var run_id uuid.UUID
+	err := row.Scan(&run_id)
+	return run_id, err
 }
 
 const insertWorkerHibernationEvent = `-- name: InsertWorkerHibernationEvent :exec
@@ -58,6 +166,201 @@ func (q *Queries) InsertWorkerHibernationEvent(ctx context.Context, arg InsertWo
 		arg.OccurredAt,
 	)
 	return err
+}
+
+const listHibernationWakeDemand = `-- name: ListHibernationWakeDemand :many
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex' AND r.status = 'queued'
+    ) owners
+)
+SELECT r.id AS run_id, r.user_id, cw.wake_worker_id::uuid AS worker_id
+FROM runs r
+LEFT JOIN checker_template_pins ctp ON ctp.user_id = r.user_id
+CROSS JOIN LATERAL (
+    SELECT
+        bool_or(w.status = 'online' AND w.hibernation_state = 'none'
+                AND ((fn_worker_accepts_new_intake(w)) OR (r.kind = 'cross_check' AND r.worker_id = w.id))) AS online_can_claim,
+        (array_agg(w.id ORDER BY (w.hibernation_state = 'waking') DESC, w.hibernated_at ASC NULLS LAST, w.id ASC)
+            FILTER (WHERE w.kind = 'hosted' AND NOT w.ephemeral
+                      AND w.hibernation_state IN ('hibernated', 'preparing', 'waking')
+                      -- fn_worker_accepts_new_intake(w) minus its hibernation clause: "as if awake".
+                      AND w.manual_cordoned_at IS NULL AND w.draining_since IS NULL AND NOT w.maintenance_fenced
+                      AND w.maintenance_phase NOT IN ('requested', 'ready', 'stopping', 'recycling')))[1] AS wake_worker_id
+    FROM workers w
+    -- A chat run has no placement predicates (ClaimChatRun has none); every other kind must be
+    -- admitted by the shared placement function.
+    LEFT JOIN fn_placement_admitting_workers(
+            r, ctp.codex_model,
+            $1::timestamptz, $2::timestamptz,
+            '0'::interval, false, $3::text[]) adm ON adm.worker_id = w.id
+    WHERE w.user_id = r.user_id
+      AND (r.kind = 'chat' OR adm.worker_id IS NOT NULL)
+      AND NOT w.maintenance_fenced
+      AND NOT w.isolated_lane
+      AND (
+          (r.kind = 'chat'
+           -- ClaimChatRun: no ephemeral claimant, owner/affinity gate. The released-incarnation
+           -- nonce clause is an intentional divergence (a Register rotates the nonce).
+           AND NOT w.ephemeral
+           AND (r.worker_id IS NULL OR r.worker_id = w.id OR r.updated_at < $4::timestamptz))
+          OR
+          (r.kind <> 'chat'
+           -- ClaimRun's docker allowlist and effective-capability conjunct.
+           AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), $5::uuid[], r.repo_id, r.kind, w.capabilities, r.required_capabilities, true)
+           AND fn_forge_origin_eligible(w, r, now())
+           -- ClaimRun's job-runner clause.
+           AND (r.kind <> 'job'
+                OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
+                    AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
+           -- ClaimRun's affinity pin: the run's own worker, a released pin, or the ceiling.
+           AND (r.kind = 'cross_check' OR r.worker_id IS NULL OR r.worker_id = w.id
+                OR r.updated_at < $4::timestamptz
+                OR NOT EXISTS (
+                    SELECT 1 FROM workers ow
+                    WHERE ow.id = r.worker_id
+                      AND fn_forge_origin_owner_pins(ow, r, now())
+                      AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
+                           OR (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $6::timestamptz)
+                           OR (r.kind <> 'cross_check'
+                               AND r.stale_requeue_generation = r.claim_generation
+                               AND COALESCE(r.status_since > $7::timestamptz, false))))))
+      )
+) cw
+WHERE r.status = 'queued'
+  AND r.egress_profile_id IS NULL
+  AND NOT r.cross_check_lane
+  AND (r.kind <> 'task' OR r.dispatched_at IS NOT NULL)
+  AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
+  AND r.reserve_hold_reason IS NULL
+  AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+  -- ClaimChatRun: a Codex-indicating chat run is claimed by no worker.
+  AND (r.kind <> 'chat' OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL))
+  AND cw.online_can_claim IS NOT TRUE
+  AND cw.wake_worker_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM workers w2 WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id)
+  AND NOT EXISTS (SELECT 1 FROM hibernation_wakes hw WHERE hw.run_id = r.id)
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $8) DESC, r.created_at ASC
+LIMIT $9
+`
+
+type ListHibernationWakeDemandParams struct {
+	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
+	CrossCheckAffinityCutoff pgtype.Timestamptz `json:"cross_check_affinity_cutoff"`
+	CodexCuratedModels       []string           `json:"codex_curated_models"`
+	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
+	DockerRepoAllowlist      []uuid.UUID        `json:"docker_repo_allowlist"`
+	HeartbeatCutoff          pgtype.Timestamptz `json:"heartbeat_cutoff"`
+	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
+	BackgroundGraceCutoff    pgtype.Timestamptz `json:"background_grace_cutoff"`
+	MaxRows                  int32              `json:"max_rows"`
+}
+
+type ListHibernationWakeDemandRow struct {
+	RunID    uuid.UUID `json:"run_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	WorkerID uuid.UUID `json:"worker_id"`
+}
+
+// The wake-demand trigger (PRD #4205 M5), the sibling of ListUnplaceableQueuedRunsForEphemeral:
+// queued runs of ANY kind (chat, judge and cross-check included) that no online, awake worker of
+// the owner can claim but that a hibernated or preparing persistent hosted worker could claim
+// once awake. One row per run, naming the worker to wake: a worker that is ALREADY waking first (a
+// run that arrives mid-wake attaches to it instead of waking a sibling, and DemandWake then only
+// records the row), otherwise the oldest hibernated_at, NULLs last, then lowest id.
+//
+// Eligibility is NOT reimplemented: the placement predicates come from fn_placement_admitting_workers
+// (the same function ListUnplaceableQueuedRunsForEphemeral calls) and the claim conjuncts below
+// mirror ClaimRun / ClaimChatRun, evaluated "as if the worker were online and accepting intake".
+// The per-worker conjuncts are written ONCE and feed both sides: the awake side asks "can an online
+// worker claim it" (then the run is not demand: saturation does not wake, a capable online worker
+// that is full blocks), the sleeping side picks the worker to wake.
+//
+// Intentional divergences from a real claim (the differential test records the same list): the
+// custody-admission limit, the per-lane spread, a released-incarnation nonce (a Register rotates
+// it), the weekly-reserve gate beyond the sweeper's marker, the Codex subscription quarantine and
+// the pending-overflow slot counts.
+//
+// Deliberately NOT carried over from the ephemeral trigger: its run-level capability-gap filter,
+// the per-user ephemeral opt-in and kind <> 'chat'.
+//
+// The hibernation_wakes anti-join sits before LIMIT so recorded wakes cannot crowd out demand.
+func (q *Queries) ListHibernationWakeDemand(ctx context.Context, arg ListHibernationWakeDemandParams) ([]ListHibernationWakeDemandRow, error) {
+	rows, err := q.db.Query(ctx, listHibernationWakeDemand,
+		arg.CrossCheckEvaluatedAt,
+		arg.CrossCheckAffinityCutoff,
+		arg.CodexCuratedModels,
+		arg.AffinityCutoff,
+		arg.DockerRepoAllowlist,
+		arg.HeartbeatCutoff,
+		arg.StaleRequeueCutoff,
+		arg.BackgroundGraceCutoff,
+		arg.MaxRows,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListHibernationWakeDemandRow{}
+	for rows.Next() {
+		var i ListHibernationWakeDemandRow
+		if err := rows.Scan(&i.RunID, &i.UserID, &i.WorkerID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listStaleHibernationWakes = `-- name: ListStaleHibernationWakes :many
+SELECT hw.run_id, hw.worker_id
+FROM hibernation_wakes hw
+JOIN workers w ON w.id = hw.worker_id
+JOIN runs r ON r.id = hw.run_id
+WHERE r.status <> 'queued' OR w.hibernation_state <> 'waking'
+ORDER BY hw.worker_id, hw.run_id
+LIMIT $1
+`
+
+type ListStaleHibernationWakesRow struct {
+	RunID    uuid.UUID `json:"run_id"`
+	WorkerID uuid.UUID `json:"worker_id"`
+}
+
+// Stale-recovery candidates: a wake whose run is no longer queued, or whose worker is no longer
+// waking (settled, re-hibernated, preparing again). The caller re-checks under the worker lock.
+func (q *Queries) ListStaleHibernationWakes(ctx context.Context, maxRows int32) ([]ListStaleHibernationWakesRow, error) {
+	rows, err := q.db.Query(ctx, listStaleHibernationWakes, maxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListStaleHibernationWakesRow{}
+	for rows.Next() {
+		var i ListStaleHibernationWakesRow
+		if err := rows.Scan(&i.RunID, &i.WorkerID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listStalePreparingWorkerIDs = `-- name: ListStalePreparingWorkerIDs :many
