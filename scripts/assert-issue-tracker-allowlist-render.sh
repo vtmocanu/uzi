@@ -209,7 +209,8 @@ for pair in \
   "$_userinfo|https://user:s3cret@forge.example.com" \
   "has a query|https://forge.example.com?private_token=s3cret" \
   "has a path|https://forge.example.com/secret%zz" \
-  "must be an absolute https URL with a host|https://[:::]"; do
+  "resolves to an IP-literal host|https://[:::]" \
+  "resolves to an IP-literal host|https://[2001:db8::1]"; do
   _frag=${pair%%|*}; _ent=${pair#*|}
   values_file "$WORK/eg.yaml" forge "https://good.example.com" "$_ent"
   if helm template uzi "$CHART" --namespace uzi --show-only templates/worker-fqdn-egress.yaml \
@@ -233,8 +234,8 @@ for pair in \
 done
 
 # Accepted shapes render as given, on both lists.
-_acc="https://forge.example.com https://forge.example.com/ https://forge.example.com:8443 https://forge.example.com:8443/"
-_want_acc="https://forge.example.com,https://forge.example.com/,https://forge.example.com:8443,https://forge.example.com:8443/"
+_acc="https://forge.example.com https://forge.example.com/ https://forge.example.com:8443 https://forge.example.com:8443/ https://[2001:db8::1] https://[2001:db8::1]:8443/"
+_want_acc="https://forge.example.com,https://forge.example.com/,https://forge.example.com:8443,https://forge.example.com:8443/,https://[2001:db8::1],https://[2001:db8::1]:8443/"
 # shellcheck disable=SC2086 # word-splitting the space-separated URL list is intended
 values_file "$WORK/acc-forge.yaml" forge $_acc
 # shellcheck disable=SC2086
