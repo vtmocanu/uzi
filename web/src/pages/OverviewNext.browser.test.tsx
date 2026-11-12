@@ -1475,13 +1475,13 @@ describe("OverviewNext health chip popover", () => {
     await userEvent.click(chip);
     const dialog = await screen.findByRole("dialog", { name: "System health" });
     await page.viewport(700, 900);
-    await expect.poll(() => dialog.getBoundingClientRect().left, "left edge after resize to 700").toBeGreaterThanOrEqual(15);
+    await expect.poll(() => dialog.getBoundingClientRect().left).toBeGreaterThanOrEqual(15);
     expect(dialog.getBoundingClientRect().right, "right edge after resize to 700").toBeLessThanOrEqual(
       document.documentElement.clientWidth - 15,
     );
     await page.viewport(500, 900);
     await expect
-      .poll(() => Math.abs(dialog.getBoundingClientRect().left - 16), "bottom-sheet left inset after resize to 500")
+      .poll(() => Math.abs(dialog.getBoundingClientRect().left - 16))
       .toBeLessThanOrEqual(1);
     expect(dialog.style.left, "no inline placement on the bottom sheet").toBe("");
   });
