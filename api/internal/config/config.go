@@ -2186,8 +2186,9 @@ func parseAllowedBaseURLs(raw string) ([]string, error) {
 
 // NormalizeForgeBaseURL validates and canonicalizes a forge base URL to
 // scheme://host[:port]. It requires the https scheme and a host, and strips any
-// path, query, or fragment. Used both to build the allowlist and to check a
-// user-supplied base_url against it.
+// path, query, or fragment. Used to check a user-supplied base_url against an
+// allowlist; the allowlists themselves are built by normalizeAllowlistEntry,
+// which refuses (rather than strips) userinfo, a path, a query or a fragment.
 func NormalizeForgeBaseURL(raw string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
