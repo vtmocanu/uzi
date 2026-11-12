@@ -52,6 +52,16 @@ peers_json() {
   printf '%s' "$_PEERS_CACHE"
 }
 
+# The cache above lives in shell variables, and callers usually reach it inside $(...)
+# subshells, whose assignments die with them. Warm it in the top-level shell right before
+# such a call, so one invocation fetches at most once (a failed fetch stays cached as "").
+# Each warm fires only when the call it precedes would fetch, so no-fetch paths stay free.
+peers_warm() { peers_json >/dev/null; }
+# Before $(self_identity [name uuid]): it fetches only when no uuid is given or exported.
+peers_warm_identity() { [ -n "${1:-${SESSION_PEERS_UUID:-}}" ] || peers_warm; }
+# Before $(owner_live <uuid> …) / $(registry_live <uuid>): is_live skips unknown-* owners.
+peers_warm_live() { case "${1:-}" in unknown-*) return 0;; esac; peers_warm; }
+
 # Prints "name<TAB>uuid<TAB>kind". $1/$2/$3 optional overrides (name uuid kind).
 self_identity() {
   local name="${1:-${SESSION_PEERS_NAME:-}}" uuid="${2:-${SESSION_PEERS_UUID:-}}" kind="${3:-${SESSION_PEERS_KIND:-}}" pj row

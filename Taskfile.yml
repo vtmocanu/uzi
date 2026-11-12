@@ -1353,7 +1353,7 @@ tasks:
       - ./scripts/govulncheck-toolchain.test.sh
 
   test:uzi-lander:
-    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance, land-prep merge mode, CHANGELOG union and release fold, the post-rebase CHANGELOG placement guard, orphan run-PR claims, and Go test failure attribution
+    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance, land-prep merge mode, CHANGELOG union and release fold, the post-rebase CHANGELOG placement guard, orphan run-PR claims, one session-peers registry fetch per claims/merge invocation, and Go test failure attribution
     cmds:
       - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/sanitize.test.sh
@@ -1377,6 +1377,7 @@ tasks:
       - python3 -B ./.agents/skills/uzi-lander/scripts/takeover-timeout.test.py
       - ./.agents/skills/uzi-lander/scripts/takeover-mr-rework.test.sh
       - python3 -B ./.agents/skills/uzi-lander/scripts/claims-atomic-lock.test.py
+      - ./.agents/skills/uzi-lander/scripts/claims-registry-fetch.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-run-claim.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-repo-fallback.test.sh
       - ./.agents/skills/uzi-lander/scripts/orphans.test.sh
