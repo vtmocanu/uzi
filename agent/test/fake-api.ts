@@ -18,8 +18,8 @@ import type {
 import { RunRunner } from "../src/runner.js";
 
 /** Issue #4158: every listening fake learns each claim a RunRunner executes, so the api's
- *  cross-check running rule applies by default, also to a claim a test hands straight to
- *  RunRunner.execute without going through the claim route or enqueueClaim. */
+ *  cross-check running rule (opt-in, FakeApi.modelCrossCheckRunningRule) also applies to a claim a
+ *  test hands straight to RunRunner.execute without going through the claim route or enqueueClaim. */
 const liveFakeApis = new Set<FakeApi>();
 const originalExecute = RunRunner.prototype.execute;
 RunRunner.prototype.execute = function (this: RunRunner, claim: ClaimResponse): Promise<void> {
@@ -574,8 +574,9 @@ export class FakeApi {
   requeueRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
     this.requeues++;
     const next = { ...claim, claim_generation: nextGeneration };
-    // The re-offered run is `claimed` until its first accepted `running` report, as on the server.
-    this.setOwnershipStatus(claim.run_id, "claimed", nextGeneration);
+    // Under the opt-in running model the re-offered run is `claimed` until its first accepted
+    // `running` report, as on the server; otherwise the fake keeps its historical `running`.
+    this.setOwnershipStatus(claim.run_id, this.modelCrossCheckRunningRule ? "claimed" : "running", nextGeneration);
     this.enqueueClaim(next);
     return next;
   }
@@ -589,7 +590,7 @@ export class FakeApi {
   redispatchRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
     this.redispatches++;
     const next = { ...claim, claim_generation: nextGeneration };
-    this.setOwnershipStatus(claim.run_id, "claimed", nextGeneration);
+    this.setOwnershipStatus(claim.run_id, this.modelCrossCheckRunningRule ? "claimed" : "running", nextGeneration);
     this.enqueueClaim(next);
     return next;
   }
@@ -616,7 +617,8 @@ export class FakeApi {
   /** Tell the fake which claim a run executes under, so the api's cross-check running rule (see
    *  {@link crossCheckRunningAdmitted}) applies to it. enqueueClaim, the claim route and every
    *  RunRunner.execute call (the module-level wrapper above) call it.
-   *  Only a cross-check claim (gated, or required) is modelled; an ordinary claim keeps the fake's
+   *  Only with modelCrossCheckRunningRule on, and only a cross-check claim (gated, or required; an
+   *  ordinary one too under modelOrdinaryRunningRule) is modelled; any other claim keeps the fake's
    *  accept-everything behaviour. */
   registerClaim(claim: ClaimResponse): void {
     this.claimByRun.set(claim.run_id, claim);
@@ -646,7 +648,13 @@ export class FakeApi {
     this.storedPlanByRun.set(runId, plan);
   }
 
-  /** Issue #4158: opt in to holding ORDINARY (non-cross-check) runs to the api's running rule too
+  /** Issue #4158: opt in to the api's SetRunRunning cross-check rule on the /state route (and to
+   *  the server's `claimed` re-offer and running-ownership flip that go with it). Off by default:
+   *  existing tests were written against an accept-all fake and are not yet migrated, so turning it
+   *  on by default is left to the follow-up that retires the live-switch path (#4201). */
+  modelCrossCheckRunningRule = false;
+
+  /** Issue #4158: with modelCrossCheckRunningRule on, also hold ORDINARY (non-cross-check) runs to the api's running rule too
    *  (their awaiting_approval arm needs any applied, non-superseded approve_plan). Off by default, so
    *  every other test keeps the fake's accept-everything behaviour for ordinary runs. */
   modelOrdinaryRunningRule = false;
@@ -654,7 +662,7 @@ export class FakeApi {
   /** The run's cross-check model, or undefined when the run is not modelled. */
   private crossCheckModel(runId: string): CrossCheckModel | undefined {
     const claim = this.claimByRun.get(runId);
-    if (!claim) return undefined;
+    if (!claim || !this.modelCrossCheckRunningRule) return undefined;
     const auto = this.autoApproveByRun.get(runId) === true;
     const lane: CrossCheckLane | undefined = claim.plan_cross_check_gated === true && !auto ? "gated"
       : claim.plan_cross_check_required === true ? (auto ? "required_auto" : "required")
@@ -2310,7 +2318,8 @@ export class FakeApi {
       const owned = this.ownershipByRun.get(runId);
       // SetRunRunning only moves a live row (claimed or a wait-for-human status); it refuses terminal,
       // paused, queued, limit_wait, pool_wait and recovery_wait rows, so those keep their status.
-      if (owned?.httpStatus === 200 && owned.status !== undefined && RUNNING_REPORT_SOURCES.has(owned.status))
+      if (this.modelCrossCheckRunningRule && owned?.httpStatus === 200 && owned.status !== undefined &&
+        RUNNING_REPORT_SOURCES.has(owned.status))
         this.ownershipByRun.set(runId, { ...owned, status: "running" });
     }
     this.timeline.push({ type: "state", runId, status: body.status, ...(body.plan_md !== undefined ? { plan_md: body.plan_md } : {}) });

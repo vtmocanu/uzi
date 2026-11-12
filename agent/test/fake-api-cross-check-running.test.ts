@@ -83,6 +83,7 @@ describe("FakeApi /state running rule", () => {
   beforeEach(async () => {
     api = new FakeApi(TOKEN);
     api.gateRevisions = true;
+    api.modelCrossCheckRunningRule = true;
     base = await api.listen();
   });
   afterEach(async () => {

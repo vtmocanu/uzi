@@ -1,4 +1,5 @@
-// Issue #4158: the fake api's cross-check running rule engages by default. A claim handed straight
+// Issue #4158: with FakeApi.modelCrossCheckRunningRule on, the fake api's cross-check running rule
+// engages for every claim a runner executes. A claim handed straight
 // to RunRunner.execute (no enqueueClaim, no claim route) must still be modelled, so the runner's
 // own `running` report is refused for a human-gated run holding an unapproved stored plan and
 // admitted once an applied approval bound to the current gate revision exists. Removing the
@@ -33,6 +34,7 @@ async function receipt(runId: string, kind: "ack" | "applied", id: number): Prom
 
 describe("fake api cross-check wiring through RunRunner.execute", () => {
   it("refuses the running report of an unapproved stored plan", async () => {
+    api.modelCrossCheckRunningRule = true;
     const c = gatedStoredPlanClaim();
     api.setInputClaimGeneration(c.run_id, 1);
     await runner(exec, fakeGitlab().gitlab).execute(c);
@@ -42,6 +44,7 @@ describe("fake api cross-check wiring through RunRunner.execute", () => {
   });
 
   it("admits the running report after an applied bound approval for the current revision", async () => {
+    api.modelCrossCheckRunningRule = true;
     const c = gatedStoredPlanClaim();
     api.setInputClaimGeneration(c.run_id, 1);
     const id = 41_999;
