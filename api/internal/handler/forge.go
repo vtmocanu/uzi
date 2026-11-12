@@ -21,6 +21,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -223,6 +224,13 @@ type createConnectionRequest struct {
 	ForgeType string `json:"forge_type"`
 	BaseURL   string `json:"base_url"`
 	Token     string `json:"token"`
+	// Replace is the explicit opt-in to rotate an EXISTING connection's credential.
+	// Without it, a create that targets a (user, forge_type, base_url) already
+	// connected is refused with 409 rather than silently overwriting the stored
+	// token and bot identity. That silent overwrite is issue #412: the Settings form
+	// reads as "add a repo", so a user re-submitting the same host destroyed the
+	// credential they already had. A plain bool, so absence means "do not replace".
+	Replace bool `json:"replace"`
 }
 
 // CreateConnection connects (or reconnects/rotates) a bot PAT. It validates the
@@ -242,6 +250,46 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Issue #412: a create that targets an already-connected (user, forge_type,
+	// base_url) must not silently rotate that connection's credential. The Settings
+	// form reads as "add a repo", so a user re-submitting the same host used to
+	// destroy the token and bot identity they already had. Refuse with 409 and name
+	// the existing connection, so the caller can either enable a repo on it (the
+	// thing they probably meant) or re-submit with replace=true to rotate it
+	// deliberately. Checked BEFORE validation so a refused create costs no upstream
+	// call and no token verification.
+	//
+	// The lookup uses the NORMALIZED base URL, because that is what the row stores:
+	// ConnectForge persists `https://` + lowercased host with any path dropped. A
+	// guard that compared the raw request value would miss an existing row whenever
+	// the user typed a trailing slash, a path, or a capital letter — and then fall
+	// straight through to the upsert it exists to prevent. A URL that does not
+	// normalize is left to validation, which rejects it with a 400.
+	//
+	// Nil-safe on h.q: the validation-only tests build a struct-literal Handler with
+	// no store (issue #223 pattern), and in production h.q is always wired.
+	if !req.Replace && h.q != nil {
+		normBaseURL, normErr := config.NormalizeForgeBaseURL(req.BaseURL)
+		if normErr != nil {
+			normBaseURL = req.BaseURL
+		}
+		existing, lookupErr := h.q.GetForgeConnectionByTarget(r.Context(), store.GetForgeConnectionByTargetParams{
+			UserID: user.ID, ForgeType: strings.TrimSpace(req.ForgeType), BaseUrl: normBaseURL,
+		})
+		switch {
+		case lookupErr == nil:
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"error":         "a connection to this forge already exists; enable a repository on it, or resend with replace=true to rotate its credential",
+				"code":          "forge_connection_exists",
+				"connection_id": existing.ID.String(),
+			})
+			return
+		case !errors.Is(lookupErr, pgx.ErrNoRows):
+			slog.Error("look up existing forge connection", "error", lookupErr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
 	conn, err := h.provisioner().ConnectForge(r.Context(), user.ID, req.ForgeType, req.BaseURL, req.Token)
 	if err != nil {
 		var pe *provisionsvc.Error

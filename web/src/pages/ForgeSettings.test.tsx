@@ -260,7 +260,7 @@ describe("ForgeSettings — forge-type picker (PRD #65 D11, lands dark)", () => 
 
     // The connect call still carries forge_type "gitlab" — byte-identical to before.
     await waitFor(() =>
-      expect(mockApi.createConnection).toHaveBeenCalledWith("https://gitlab.example.com", "glpat-ok", "gitlab"),
+      expect(mockApi.createConnection).toHaveBeenCalledWith("https://gitlab.example.com", "glpat-ok", "gitlab", false),
     );
   });
 
@@ -282,7 +282,7 @@ describe("ForgeSettings — forge-type picker (PRD #65 D11, lands dark)", () => 
 
     // Untouched selection still sends gitlab.
     await waitFor(() =>
-      expect(mockApi.createConnection).toHaveBeenCalledWith("https://gitlab.example.com", "glpat-ok", "gitlab"),
+      expect(mockApi.createConnection).toHaveBeenCalledWith("https://gitlab.example.com", "glpat-ok", "gitlab", false),
     );
   });
 
@@ -301,6 +301,7 @@ describe("ForgeSettings — forge-type picker (PRD #65 D11, lands dark)", () => 
         "https://gitlab.example.com",
         "tok-forgejo",
         "forgejo",
+        false,
       ),
     );
   });
@@ -429,7 +430,7 @@ describe("ForgeSettings — PAT reveal toggle (PRD #337)", () => {
     // Submit → connect resolves → setToken("") runs → the field re-masks.
     fireEvent.submit(document.querySelector("form") as HTMLFormElement);
     await waitFor(() =>
-      expect(mockApi.createConnection).toHaveBeenCalledWith("https://gitlab.example.com", "glpat-secret", "gitlab"),
+      expect(mockApi.createConnection).toHaveBeenCalledWith("https://gitlab.example.com", "glpat-secret", "gitlab", false),
     );
     await waitFor(() => expect(patInput().getAttribute("type")).toBe("password"));
     expect(screen.getByRole("button", { name: "Show token" }).getAttribute("aria-pressed")).toBe("false");
