@@ -613,9 +613,10 @@ func TestCustodyUnitsPerRunBoundBoundaryLiveDB(t *testing.T) {
 // run leaves the hard per-run bound in force. After the resume the run is queued, its health reason
 // is the per-run reason, a claim refuses it and the hold rows are untouched; discarding one hold
 // (own holds limit-1) then lets the same run claim, so the refusal was the bound and nothing else.
-// Not covered: ResumePublicationForgeHold needs an active run_publication_resume intent plus the
-// publication-capable worker guard, and ResumePausedRun resumes a paused run, not a custody park;
-// both feed the same ClaimRun clause, which does not depend on how the run reached queued.
+// ResumePublicationForgeHold is covered by TestCustodyRunHoldBoundPublicationResumeLiveDB and the
+// handler route POST /api/runs/{id}/resume-now by TestResumeNowCustodyRunHoldBoundLiveDB (handler
+// package). Not covered: ResumePausedRun resumes a paused run, not a custody park; it feeds the
+// same ClaimRun clause, which does not depend on how the run reached queued.
 func TestCustodyRunHoldBoundOwnerResumeVerbsLiveDB(t *testing.T) {
 	const limit = 3
 	env := setupCodexLiveDB(t)
@@ -689,6 +690,69 @@ func TestCustodyRunHoldBoundOwnerResumeVerbsLiveDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCustodyRunHoldBoundPublicationResumeLiveDB: the owner Resume of a publication-phase hold
+// (ResumePublicationForgeHold) queues the run, and the hard per-run bound still refuses its claim
+// when its own open holds equal the limit as one same-worker group (owner units below the limit).
+func TestCustodyRunHoldBoundPublicationResumeLiveDB(t *testing.T) {
+	const limit = 3
+	pf := newPublicationParkFixture(t, time.Hour)
+	f := &unitsFixture{custodyContinuationFixture: pf.custodyContinuationFixture, base: time.Now().Add(-time.Hour)}
+	f.setLimit(limit)
+	// Move the run to generation limit, hold two more group-eligible generations (the fixture
+	// opened generation 1), then park it as a publication owner hold at that generation.
+	pf.reclaim(t, limit)
+	pf.openHold(t, pf.runID, 2)
+	pf.openHold(t, pf.runID, 3)
+	held, applied, err := pf.hold1(limit, "publication_model_required")
+	if err != nil || !applied {
+		t.Fatalf("publication hold applied=%v err=%v", applied, err)
+	}
+	snap := f.holdRowSnapshot(t, pf.runID)
+	if ok, err := pf.svc.ResumePublicationForgeHold(pf.env.ctx, pf.userID, held); err != nil || !ok {
+		t.Fatalf("ResumePublicationForgeHold = %v, %v, want true", ok, err)
+	}
+	if r := pf.run(t); r.Status != "queued" {
+		t.Fatalf("status after resume = %s, want queued", r.Status)
+	}
+	now := time.Now()
+	if units := f.count(t, now); units >= limit {
+		t.Fatalf("precondition: owner units = %d, want below %d", units, limit)
+	}
+	if adm := f.admission(t, pf.runID, limit, now); !adm.RunHoldBoundReached || adm.ContinuationExempt || adm.OwnOpenHolds != limit {
+		t.Fatalf("admission after the publication resume = %+v, want bound reached, not exempt, own %d", adm, limit)
+	}
+	if got := f.healthReason(pf.runID, limit, now); got != apitypes.ReasonCustodyRunHoldBound {
+		t.Fatalf("health reason = %q, want %q", got, apitypes.ReasonCustodyRunHoldBound)
+	}
+	pf.expireCooldown()
+	if got, _ := f.claim(t); got != uuid.Nil {
+		t.Fatalf("claimed %s after the publication resume, want the bound run refused", got)
+	}
+	if after := f.holdRowSnapshot(t, pf.runID); after != snap {
+		t.Fatalf("resume and a refused claim changed hold rows:\nbefore=%s\nafter=%s", snap, after)
+	}
+	// Control: one hold fewer and the same queued run claims, so the refusal was the bound.
+	n, err := pf.env.q.DiscardCustodyHoldForOwner(pf.env.ctx, store.DiscardCustodyHoldForOwnerParams{
+		ReleaseEvidence: pgtype.Text{String: "owner_discard", Valid: true}, HoldID: f.firstOpenHold(t, pf.runID), RunID: pf.runID, UserID: pf.userID})
+	if err != nil || n != 1 {
+		t.Fatalf("control discard = %d, %v, want 1 row", n, err)
+	}
+	if got, _ := f.claim(t); got != pf.runID {
+		t.Fatalf("control: claimed %s with %d own holds, want the run %s", got, limit-1, pf.runID)
+	}
+}
+
+// firstOpenHold returns the id of the run's lowest-generation open hold.
+func (f *unitsFixture) firstOpenHold(t *testing.T, run uuid.UUID) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := f.env.pool.QueryRow(f.env.ctx,
+		`SELECT id FROM recovery_custody_holds WHERE run_id=$1 AND state='open' ORDER BY generation LIMIT 1`, run).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 // TestCustodyUnitsGroupedHoldReadsAndExactReleaseLiveDB: reads that name holds by worker return

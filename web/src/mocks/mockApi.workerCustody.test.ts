@@ -110,7 +110,15 @@ it("shows the per-run custody bound under custody-run-bound: blocked run while c
   }
   const after = mockApi.getRecoveryHolds();
   await vi.advanceTimersByTimeAsync(1000);
-  const next = (await after).aggregate;
+  const afterResp = await after;
+  const next = afterResp.aggregate;
   expect(next.open_holds).toBe(7);
   expect(next.blocked_runs).toBe(0);
+  // The surviving group still counts as one unit, represented by its oldest member.
+  const survivors = afterResp.holds.filter((h) => h.run_id === "run-custody-run-bound");
+  const counted = survivors.filter((h) => h.counts_toward_admission === true);
+  expect(next.admission_counted_holds).toBe(afterResp.holds.filter((h) => h.counts_toward_admission === true).length);
+  expect(counted).toHaveLength(1);
+  expect(counted[0].id).toBe("hold-rb-3");
+  expect(counted[0].admission_reason).toBe("earlier_generation");
 });

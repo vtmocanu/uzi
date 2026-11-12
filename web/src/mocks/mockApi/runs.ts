@@ -169,7 +169,23 @@ function currentCustodyHolds(): RecoveryCustodyHold[] {
   const scenario = mockScenario();
   const seeds =
     scenario === "overview-next" ? seedOverviewNextHolds() : scenario === "custody" ? seedCustodyHolds() : scenario === "custody-run-bound" ? seedRunBoundHolds() : [];
-  return seeds.filter((h) => !discardedHolds.has(h.id));
+  const survivors = seeds.filter((h) => !discardedHolds.has(h.id));
+  // The server counts a run's group as one unit while any member survives, represented by the
+  // oldest survivor (created_at, then id). Discarding the seeded representative promotes it.
+  const result = survivors.map((h) => ({ ...h }));
+  const runIds = new Set(seeds.map((h) => h.run_id));
+  for (const runId of runIds) {
+    const rep = seeds.find((h) => h.run_id === runId && h.counts_toward_admission === true);
+    if (!rep) continue;
+    const members = result.filter((h) => h.run_id === runId);
+    if (members.length === 0 || members.some((h) => h.counts_toward_admission === true)) continue;
+    const oldest = members.reduce((a, b) =>
+      a.created_at < b.created_at || (a.created_at === b.created_at && a.id < b.id) ? a : b,
+    );
+    oldest.counts_toward_admission = true;
+    oldest.admission_reason = rep.admission_reason;
+  }
+  return result;
 }
 
 function custodyResponse(): RecoveryCustodyHolds {

@@ -2009,15 +2009,18 @@ instead detached and the successor proceeded.
 - A claim lost before any running report, listing or registration evidence, with no restart, is reset
   uncharged by `SweepClaimedNeverStarted`, repeatedly, including after Resume. It is bounded only by
   the run's own open holds reaching `custody_hold_limit` L (default 8): then `ClaimRun` refuses and the
-  run stays queued with the custody-capacity reason. That queued state is not an owner park. Measured: 8
+  run stays queued with the per-run custody hold limit reason (issue #4162). That queued state is not an owner park. Measured: 8
   at L=8, 3 at L=3, 7 more after a park plus Resume.
 - A worker that is online with current presence parks as `recovery_wait` /
   `retained_continuation_unwitnessed`, uncharged (measured for a continuation claim whose running
   report never landed). The successor reports `running` before the orphan reclaim, so this arm and the
   uncharged reset above apply only when that first running report is lost or refused.
-- Run-lifetime bound: this run's own open holds stay at or below L, on the premise that none is
-  released. This does not claim that owner aggregate custody is a transactional ceiling, or that the
-  owner's other runs are always blocked.
+- Run-lifetime bound: a claim whose statement snapshot sees this run's own open holds at or above L
+  does not claim it (ADR-2445 D6 snapshot semantics), so sequential claims stop the run at L, as
+  measured above. This is an admission condition, not a transactional ceiling: concurrent claims are
+  not serialized against the run's holds, and no numerical overshoot bound is claimed. Nor does it
+  claim that owner aggregate custody is a transactional ceiling, or that the owner's other runs are
+  always blocked.
 - Disclosed: while held or queued, the run's open holds can reduce the owner's admission capacity (a run's open
   holds on one original worker, from any of its generations, count as one admission unit, ADR-2445's #4162 amendment). While held it blocks the worker's upgrade or drain, like any owner-held cause. Owner Cancel
   of a held successor is terminal and leaves its open hold or holds open (measured 1 to 1) for owner

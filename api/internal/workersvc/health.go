@@ -585,7 +585,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			nudge = false
 		}
 		// PRD #3454: maintenance is an expected, operator-announced wait; a worker-pickup nudge is noise.
-		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || leftAdmission || target == healthWaitingAccountCooldown {
+		// Leaving a Codex admission wait is also quiet (the run restarts its clock), EXCEPT when it
+		// enters the per-run custody bound (#4162): that is the run's own condition, so it nudges
+		// like any other entry into the bound, e.g. after an admin lowers custody_hold_limit.
+		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || (leftAdmission && !enteredRunBound) || target == healthWaitingAccountCooldown {
 			nudge = false
 		}
 		// PRD #3522 M3: the weekly usage reserve is the owner's own deliberate limit, not a stuck
