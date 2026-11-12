@@ -11,7 +11,7 @@ import (
 func TestClassifyUpgradeHibernationPrecedence(t *testing.T) {
 	now := time.Now()
 	signal := &RollSignal{Phase: PhaseStuck, ObservedAt: now, BlockingReason: "ImagePullBackOff"}
-	for _, state := range []string{"preparing", "hibernated", "waking"} {
+	for _, state := range []string{"preparing", "hibernated"} {
 		status, detail := ClassifyUpgrade(UpgradeInput{
 			Reported: "0.1.0", Kind: "hosted", CPVersion: "0.84.0", PinnedWorkerVersion: "0.84.0",
 			Signal: signal, Now: now, APIStartedAt: now, Hibernation: state,
@@ -22,6 +22,13 @@ func TestClassifyUpgradeHibernationPrecedence(t *testing.T) {
 		if want := map[string]string{"preparing": "hibernating"}[state]; want != "" && !strings.Contains(detail, want) {
 			t.Errorf("%s: detail %q does not name %q", state, detail, want)
 		}
+	}
+	// A waking worker has a pod coming up: normal classification, so upgrade_failed shows.
+	if status, _ := ClassifyUpgrade(UpgradeInput{
+		Reported: "0.1.0", Kind: "hosted", CPVersion: "0.84.0", PinnedWorkerVersion: "0.84.0",
+		Signal: signal, Now: now, APIStartedAt: now, Hibernation: "waking",
+	}, UpgradeParams{}); status != UpgradeStatusUpgradeFailed {
+		t.Errorf("waking: status %q, want upgrade_failed (not short-circuited)", status)
 	}
 	// "none" and "" keep the ordinary classification.
 	for _, state := range []string{"", "none"} {

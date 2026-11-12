@@ -74,3 +74,35 @@ func TestTUIWorkersHibernation(t *testing.T) {
 		}
 	}
 }
+
+// The worker DETAIL view draws wake_error through renderer.Plain; hostile control bytes
+// and bidi overrides must not reach it.
+func TestTUIWorkerDetailWakeErrorSanitized(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m.width, m.height = 200, 70
+	w := apitypes.WorkerDTO{ID: "b", Name: "napper", Status: "offline", HibernationState: "waking", WakeError: sp("bad \x1b[31mwake \u202eevil \x1b]0;pwn\x07")}
+	m.workers.rows = []workerRow{{w: w}}
+	m.workerDetail = workerDetailState{workerID: w.ID}
+	lines, _ := m.workerDetailLines(time.Now())
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(stripANSI(out), "wake error") {
+		t.Fatalf("detail lacks the wake error line:\n%s", out)
+	}
+	if strings.Contains(out, "\x1b]") || strings.Contains(out, "\u202e") || strings.Contains(out, "\x07") || strings.Contains(out, "\x1b[31mwake") {
+		t.Fatalf("wake_error reached the detail view unsanitized:\n%q", out)
+	}
+}
+
+func TestWorkerIntakeLabelHibernating(t *testing.T) {
+	for _, state := range []string{"preparing", "hibernated", "waking"} {
+		w := apitypes.WorkerDTO{HibernationState: state, EffectiveCordoned: true}
+		if got := workerIntakeLabel(w); got != "" {
+			t.Errorf("%s: intake label %q, want empty", state, got)
+		}
+	}
+	now := time.Now()
+	w := apitypes.WorkerDTO{HibernationState: "hibernated", ManualCordonedAt: &now}
+	if got := workerIntakeLabel(w); got != "cordoned (manual)" {
+		t.Errorf("manual cordon lost: %q", got)
+	}
+}

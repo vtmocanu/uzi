@@ -47,6 +47,10 @@ func workerIntakeLabel(w apitypes.WorkerDTO) string {
 	if w.ManualCordonedAt != nil {
 		return "cordoned (manual)"
 	}
+	// A hibernating worker's state column already says why it takes no work.
+	if hibernatingWorker(w) {
+		return ""
+	}
 	if w.EffectiveCordoned && w.DrainingSince == nil {
 		return "intake fenced"
 	}

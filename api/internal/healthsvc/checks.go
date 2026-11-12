@@ -161,25 +161,37 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 	c := s.base("fleet.roll")
 
 	hosted := make([]store.ListAllWorkersRow, 0, len(workers))
+	excluded := 0
 	for _, w := range workers {
-		// A hibernating worker has no pod to roll: it is neither rolling nor stuck (PRD #4205).
-		if w.Worker.Kind == "hosted" && !workersvc.IsHibernating(w.Worker.HibernationState) {
-			hosted = append(hosted, w)
+		if w.Worker.Kind != "hosted" {
+			continue
 		}
+		// A preparing or hibernated worker has no pod to roll: it is neither rolling nor
+		// stuck (PRD #4205). A waking worker stays counted so a stuck wake still surfaces.
+		if workersvc.IsPodless(w.Worker.HibernationState) {
+			excluded++
+			continue
+		}
+		hosted = append(hosted, w)
+	}
+	excludedNote := ""
+	if excluded > 0 {
+		excludedNote = fmt.Sprintf(" %d hibernated (excluded).", excluded)
 	}
 
-	// "Hosted workers are configured" — HostedWorkerVersion non-empty OR any hosted worker.
-	configured := s.cfg.HostedWorkerVersion != "" || len(hosted) > 0
-	if !configured {
+	if !s.hostedConfigured(workers) {
 		c.Severity = sevNA
 		c.Summary = "No hosted workers are configured on this deployment."
 		return c
 	}
 	if len(hosted) == 0 {
-		// Configured (a pinned tag) but no hosted worker rows: nothing is rolling, nothing
-		// is stuck, and we are not blind about any worker.
+		// Configured but nothing to roll: either no hosted rows (a pinned tag only) or
+		// every hosted worker is hibernated. Nothing is stuck and we are not blind.
 		c.Severity = sevOK
 		c.Summary = "No hosted workers are present."
+		if excluded > 0 {
+			c.Summary = fmt.Sprintf("No hosted workers are running; %d hibernated (excluded).", excluded)
+		}
 		return c
 	}
 
@@ -384,9 +396,9 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 
 	if failed == 0 {
 		c.Severity = sevOK
-		c.Summary = fmt.Sprintf("All %d hosted workers are rolling cleanly.", len(hosted))
+		c.Summary = fmt.Sprintf("All %d hosted workers are rolling cleanly.", len(hosted)) + excludedNote
 		if pacing != nil {
-			c.Summary = fmt.Sprintf("Worker roll %s to %s; waiting for replacement evidence.", pacing.State, safe(pacing.TargetImage))
+			c.Summary = fmt.Sprintf("Worker roll %s to %s; waiting for replacement evidence.", pacing.State, safe(pacing.TargetImage)) + excludedNote
 		}
 		return c
 	}
@@ -408,6 +420,9 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		{Label: "Stuck workers", Value: fmt.Sprintf("%d of %d", failed, len(hosted))},
 	}
 	addFailures(false)
+	if excluded > 0 {
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Hibernated (excluded)", Value: fmt.Sprintf("%d", excluded)})
+	}
 	if failed == len(hosted) {
 		c.Severity = sevDanger
 	} else {
