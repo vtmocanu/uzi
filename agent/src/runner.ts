@@ -1452,7 +1452,7 @@ class OrphanRemediationHold extends Error {
 const GUIDANCE_FLUSH_MS = 10_000;
 
 /** A restricted root that is not divergent from the source: an ancestor is active remediation, anything else unknown. */
-function relationRefusal(relation: "ancestor" | "divergent" | "unknown"): RetainedAdoptionRefusal {
+function relationRefusal(relation: "ancestor" | "unknown"): RetainedAdoptionRefusal {
   return relation === "ancestor" ? "secret_remediation_active" : "remediation_proof_unknown";
 }
 
@@ -28419,7 +28419,7 @@ export class RunRunner {
       return false;
     };
     // An `unknown` probe after the operation signal or the iteration deadline fired says nothing about the evidence.
-    const refuseRelation = (relation: "ancestor" | "divergent" | "unknown", interrupted: boolean): false =>
+    const refuseRelation = (relation: "ancestor" | "unknown", interrupted: boolean): false =>
       relation === "unknown" && interrupted ? false : noteCallbackRefusal(relationRefusal(relation));
     const fail = async (): Promise<never> => {
       this.retainedLifecycleGuard(flight);
@@ -28460,13 +28460,6 @@ export class RunRunner {
                   snapshot.journal.attemptId !== expectedSource.attemptId) throw new Error("recovery readback identity changed");
               persisted = snapshot.journal;
               persistedPaths = snapshot.paths;
-              // Issue #4177 crash rediscovery: a claim that adopted nothing itself (the refusal's in-memory class
-              // died with the previous process) re-derives the class from the blocked journal, read-only.
-              if (adoptionRefusal === undefined && observed === 0 && blocker === "adoption_failed" &&
-                  persisted.recovery?.stage === "blocked" && persisted.recovery.blocker === "adoption_failed") {
-                adoptionRefusal = await this.git.classifyBlockedRemediationAdoption(bare, branch, key, expectedSource);
-                this.retainedLifecycleGuard(flight);
-              }
             }
           });
       }
@@ -28477,6 +28470,24 @@ export class RunRunner {
         persistence = "; blocker persistence unavailable";
       }
       this.retainedLifecycleGuard(flight);
+      // Issue #4177 crash rediscovery: a claim that adopted nothing itself (the refusal's in-memory class died with the
+      // previous process) re-derives the class from the blocked journal, read-only. It runs in its OWN bounded
+      // operation after persistence is settled, and swallows every error and interruption: rediscovery can only add
+      // a detail, never change persistence or the outcome. Only an api that advertised the detail needs it.
+      if (adoptionRefusal === undefined && observed === 0 && blocker === "adoption_failed" && persistence === "" &&
+          persisted?.recovery?.stage === "blocked" && persisted.recovery.blocker === "adoption_failed" &&
+          this.client?.hasFeature(RETAINED_ADOPTION_DETAIL_FEATURE)) {
+        try {
+          await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
+            async () => {
+              adoptionRefusal = await this.git.classifyBlockedRemediationAdoption(bare, branch, key, expectedSource);
+            });
+        } catch (error) {
+          if (error instanceof CredentialSwitchSignal) throw error;
+          adoptionRefusal = undefined;
+        }
+        this.retainedLifecycleGuard(flight);
+      }
       const detail = blocker === "decoded_history_limit"
         ? source.recovery?.stage === "blocked"
           ? `previous decoded verification exhaustion; current cap ${formatRecoveryDecodedLimit(this.git.recoveryDecodedLimitBytes)}; prior cap not recorded`

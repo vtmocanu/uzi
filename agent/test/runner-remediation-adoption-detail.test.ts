@@ -4,6 +4,8 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { test, type TestContext } from "node:test";
 import { GitCache } from "../src/git.js";
+import { RequestError } from "../src/client.js";
+import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery.js";
 import { RunRunner } from "../src/runner.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
@@ -23,8 +25,12 @@ function command(dir: string, ...args: string[]): string {
 }
 
 type Mode = "active" | "git-unknown" | "callback-finding" | "callback-untrusted" | "callback-unknown" |
-  "no-token" | "deadline-rewrite" | "cold" | "cold-mismatch" | "cold-no-record" | "cold-captured";
-const COLD = new Set<Mode>(["cold", "cold-mismatch", "cold-no-record", "cold-captured"]);
+  "callback-interrupted" | "callback-guard" | "detail-400" |
+  "no-token" | "deadline-rewrite" | "cold" | "cold-mismatch" | "cold-ownedtip" | "cold-no-record" | "cold-slow" |
+  "cold-throws" | "cold-no-token" | "captured-journal-live" | "upload-failed";
+// Modes whose journal is already blocked (or captured) before this claim runs, so its in-memory refusal class is absent.
+const COLD = new Set<Mode>(["cold", "cold-mismatch", "cold-ownedtip", "cold-no-record", "cold-slow", "cold-throws",
+  "cold-no-token", "captured-journal-live"]);
 
 async function drive(t: TestContext, mode: Mode, iid: number) {
   const claim = gitlabClaim(iid, { claim_generation: 2, session_id: "predecessor-session" });
@@ -54,12 +60,13 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
   // Active: the owned source still contains the flagged commit. Otherwise a clean replacement divergent from it.
   const historical = command(bare, "-c", "user.name=t", "-c", "user.email=t@example.com",
     "commit-tree", base + "^{tree}", "-p", base, "-m", "historical only finding");
-  const containsFlag = mode === "active" || mode === "git-unknown" || mode === "no-token" || COLD.has(mode);
+  const containsFlag = mode === "active" || mode === "git-unknown" || mode === "no-token" ||
+    mode === "detail-400" || mode === "upload-failed" || COLD.has(mode);
   const s = commit(containsFlag ? "progress on the flagged tip" : "clean replacement",
     containsFlag ? q : mode === "callback-finding" ? historical : base);
   await fetch();
   assert.equal(await git.ancestry(bare, q, s), containsFlag ? "ancestor" : "divergent");
-  client.protocolFeatures = mode === "no-token" ? ["claim_generation_fence", ADOPTION]
+  client.protocolFeatures = mode === "no-token" || mode === "cold-no-token" ? ["claim_generation_fence", ADOPTION]
     : mode === "deadline-rewrite" ? ["claim_generation_fence", ADOPTION, DETAIL, "recovery_cause_retained_recovery_exhausted"]
     : ["claim_generation_fence", ADOPTION, DETAIL];
   const key = "uzi-recovery." + branch + ".clone";
@@ -72,7 +79,8 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
   const runner = new RunRunner(client, cache, runId => ({ homeDir: path.join(homeDir, runId), executor: {
     run: async () => { models++; throw new Error("fixture ends successor"); },
   } }), logs.logger, 20, undefined, { gitlab: fakeGitlab().gitlab,
-    teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1 });
+    teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1,
+    ...(mode === "cold-slow" ? { codexBoundaryDeadlineMs: 3000 } : {}) });
   api.setOwnershipStatus(claim.run_id, "running", 2);
   const coverageFor = () => cache.buildRecoveryCoverage(bare, {
     runId: claim.run_id, generation: 2, kind: "issue", branch, barePath: bare,
@@ -83,14 +91,38 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
     // refusal class died with it. This claim holds no owner grant and a brand new runner reads the journal cold.
     const key4 = `issue-${iid}`;
     const iteration = await cache.reserveRecoveryIteration(bare, branch, key4, source);
-    const coverage = await coverageFor();
+    // A real ownedTip mismatch: the captured restore source descends from the flagged commit (so the restricted roots
+    // WOULD classify active against it) but is not the tip the remediation record owns.
+    const s2 = mode === "cold-ownedtip" ? command(bare, "-c", "user.name=t", "-c", "user.email=t@example.com",
+      "commit-tree", base + "^{tree}", "-p", s, "-m", "unowned descendant") : undefined;
+    const coverage = s2 ? await cache.buildRecoveryCoverage(bare, {
+      runId: claim.run_id, generation: 2, kind: "issue", branch, barePath: bare,
+      defaultIdentity: { ref: "refs/remotes/origin/main", sha: base },
+    }, [q, s2], s2) : await coverageFor();
     await cache.recordRecoveryCapture(bare, branch, key4, source, iteration.attempts, coverage.sha,
-      mode === "cold-mismatch" ? base : s);
-    if (mode !== "cold-captured") await cache.blockRecoveryEpisode(bare, branch, key4, source, "adoption_failed", iteration);
+      s2 ?? (mode === "cold-mismatch" ? base : s));
+    if (mode !== "captured-journal-live") await cache.blockRecoveryEpisode(bare, branch, key4, source, "adoption_failed", iteration);
     if (mode === "cold-no-record") {
       const j = JSON.parse(journalRaw()); delete j.remediationRecovery;
       command(bare, "config", key, JSON.stringify(j));
     }
+  }
+  // Issue #1995 shape: an older archive was accepted, the latest upload failed, and the verified bundle is local only.
+  let custody: { accepted?: string; failed?: string; bundlePath?: string; uploads: UploadClient } | undefined;
+  if (mode === "upload-failed") {
+    const uploads = new UploadClient();
+    const coordinator = new RecoveryCoordinator({ client: uploads as unknown as RecoveryArchiveClient, git: cache, log: nullLogger(),
+      recoveryRoot: path.join(fx.dataDir, "recovery-4177"), workerToken: "worker-join-token-abcdef0123456789" });
+    const pinInput = { runId: claim.run_id, kind: "issue" as const, branch, generation: 1,
+      bareDir: path.basename(bare), defaultBranch: "main", finalizationPin: true };
+    const older = await coordinator.pin({ ...pinInput, sourceSha: q });
+    const accepted = await coordinator.captureAndUpload({ record: older!, barePath: bare, defaultBranch: "main" });
+    uploads.failNext = true;
+    // A later claim generation journals its own record, so the accepted archive of the older one cannot satisfy it.
+    const latest = await coordinator.pin({ ...pinInput, generation: 2, sourceSha: s });
+    const failed = await coordinator.captureAndUpload({ record: latest!, barePath: bare, defaultBranch: "main" });
+    const record = (await coordinator.inspect(claim.run_id)).find(r => r.sourceSha === s);
+    custody = { accepted: accepted.state, failed: `${failed.state}:${failed.reason}`, bundlePath: record?.bundlePath, uploads };
   }
   const coldBefore = COLD.has(mode) ? journalRaw() : undefined;
   const capture = cache.recordRecoveryCapture.bind(cache);
@@ -101,6 +133,17 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
   });
   let flight: any;
   const restore = (runner as any).restoreRemediationRestrictions.bind(runner);
+  // Crash rediscovery seam: counted always, slowed or failed per mode.
+  let classifierCalls = 0;
+  const classify = cache.classifyBlockedRemediationAdoption.bind(cache);
+  t.mock.method(cache, "classifyBlockedRemediationAdoption", async (...args: Parameters<typeof classify>) => {
+    classifierCalls++;
+    if (mode === "cold-slow") await new Promise(resolve => setTimeout(resolve, 3500));
+    if (mode === "cold-throws") throw new Error("bare lock contended");
+    // The rediscovery seam would say active; this flight's own unclassified refusal must still win.
+    if (mode === "callback-guard") return "secret_remediation_active" as const;
+    return classify(...args);
+  });
   let installed = false;
   t.mock.method(runner as any, "restoreRemediationRestrictions", async (f: any) => {
     flight = f;
@@ -108,7 +151,10 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
       installed = true;
       (runner as any).latchRemediationFindings(f, bare, branch, [{ commit: q }]);
     }
-    return restore(f);
+    const restored = await restore(f);
+    // An owned tip the callback's first guard refuses (a plain, unclassified refusal) while git's record would
+    // classify active.
+    return mode === "callback-guard" && restored ? { ...restored, ownedTip: base } : restored;
   });
   t.mock.method(cache, "secretScanCheckpointRange", async () => {
     if (!underB) return { trusted: true as const, findings: [] };
@@ -133,19 +179,31 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
     } };
     return prepare(...args);
   });
+  // The iteration deadline reads as passed only to the admission callback's own clock read right after its unknown
+  // probe, so the park itself is still a plain adoption failure and nothing else in the run sees the shift.
+  let probed = false;
+  if (mode === "callback-interrupted") {
+    const realNow = Date.now.bind(Date);
+    // Stack frames: 0 the message, 1 this mock, 2 node's mock wrapper, 3 the caller of Date.now.
+    t.mock.method(Date, "now", () => probed && (new Error().stack ?? "").split("\n")[3]?.includes("admitRemediationSource")
+      ? (probed = false, realNow() + 600_000) : realNow());
+  }
   const ancestry = cache.ancestry.bind(cache);
   t.mock.method(cache, "ancestry", async (...args: Parameters<typeof ancestry>) => {
     if (mode === "git-unknown" && args[1] === q && args[2] === s) return "unknown";
     if (mode === "callback-unknown" && underB) return "unknown";
+    if (mode === "callback-interrupted" && underB) { probed = true; return "unknown"; }
     return ancestry(...args);
   });
+  if (mode === "detail-400") api.failStateWhen(claim.run_id, b => b.recovery_detail !== undefined, { httpStatus: 400 });
   try {
     await runner.execute(claim);
     if (mode === "deadline-rewrite") t.mock.restoreAll();
     return {
       parks: api.states.filter(x => x.runId === claim.run_id && x.body.status === "recovery_wait").map(x => x.body as unknown as Record<string, unknown>),
       reported: api.states.filter(x => x.runId === claim.run_id).map(x => String(x.body.status)),
-      models, logs, bare, branch, q, s, base, originBefore, journal: () => JSON.parse(journalRaw()),
+      models, logs, classifierCalls, custody, wire: api.stateWire.filter(x => x.runId === claim.run_id).map(x => x.body as unknown as Record<string, unknown>),
+      bare, branch, q, s, base, originBefore, journal: () => JSON.parse(journalRaw()),
       raw: journalRaw, coldBefore, flight,
       origin: () => ({ all: command(fx.originPath, "rev-list", "--all"), main: command(fx.originPath, "rev-parse", "refs/heads/main") }),
       clonePath: clone.path,
@@ -154,6 +212,21 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
 }
 
 let counter = 4300;
+
+/** The archive api of issue #1995's live-recovery harness: accepts the first bundle, refuses the next with a transient 503. */
+class UploadClient {
+  uploads = 0; failNext = false; releases = 0;
+  async reserveRecoveryCapture() { return { capture_id: "server-capture-1", state: "preparing" as const }; }
+  async getRecoveryCaptureStatus(_run: string, captureId: string) { return { capture_id: captureId, state: "preparing" as const, manifest_bound: false }; }
+  async uploadRecoveryBundle(_run: string, captureId: string, _manifest: unknown, bundle: AsyncIterable<unknown>) {
+    for await (const _chunk of bundle) { /* drain */ }
+    this.uploads++;
+    if (this.failNext) throw new RequestError("POST", "/archives/x/upload", 503, JSON.stringify({ error: "msg", reason: "busy" }));
+    return { capture_id: captureId, state: "available" as const, manifest_bound: true };
+  }
+  async releaseRecoveryCustody(runId: string) { this.releases++; return { run_id: runId, released: true, holds_released: 1 }; }
+  async listRecoveryHolds(runId: string) { return { run_id: runId, holds: [] }; }
+}
 
 for (const [mode, expected] of [
   ["active", "secret_remediation_active"],
@@ -191,9 +264,11 @@ for (const [mode, expected] of [
 
 for (const [mode, expected] of [
   ["cold", "secret_remediation_active"],
-  ["cold-captured", "secret_remediation_active"],
   ["cold-mismatch", undefined],
+  ["cold-ownedtip", undefined],
   ["cold-no-record", undefined],
+  ["cold-slow", undefined],
+  ["cold-throws", undefined],
 ] as const) {
   test("cold worker rediscovers the refusal class from the journal: " + mode, async t => {
     const r = await drive(t, mode, counter++);
@@ -204,9 +279,75 @@ for (const [mode, expected] of [
       if (expected) assert.equal(park.recovery_detail, expected);
       else assert.ok(!("recovery_detail" in park), "an unverifiable record carries no class");
     }
+    assert.equal(r.classifierCalls, 1, "the claim rediscovered exactly once");
+    assert.ok(!r.reported.includes("failed"), "rediscovery never turns the park into a failure: " + JSON.stringify(r.reported));
     if (mode === "cold" || mode === "cold-mismatch") assert.equal(r.raw(), r.coldBefore, "rediscovery wrote no journal content");
   });
 }
+
+test("a live adoption after a captured journal classifies in memory and never rediscovers", async t => {
+  const r = await drive(t, "captured-journal-live", counter++);
+  assert.equal(r.models, 0);
+  assert.ok(r.parks.length >= 1, JSON.stringify({ reported: r.reported, logs: r.logs }));
+  for (const park of r.parks) {
+    assert.equal(park.recovery_cause, "retained_recovery_adoption_failed");
+    assert.equal(park.recovery_detail, "secret_remediation_active");
+  }
+  assert.equal(r.classifierCalls, 0, "this flight classified its own refusal");
+});
+
+test("an unclassified refusal in this flight is not replaced by a rediscovered class", async t => {
+  // The callback's first guard refuses this flight's adoption without a class. Rediscovery (stubbed to answer active)
+  // must not run and so cannot label the park with a refusal this flight never saw.
+  const r = await drive(t, "callback-guard", counter++);
+  assert.ok(r.parks.length >= 1, JSON.stringify({ reported: r.reported, logs: r.logs }));
+  assert.ok(r.parks.every(p => p.recovery_cause === "retained_recovery_adoption_failed" && !("recovery_detail" in p)), JSON.stringify(r.parks));
+  assert.equal(r.classifierCalls, 0);
+});
+
+test("an unknown probe after the iteration deadline fired carries no class", async t => {
+  const r = await drive(t, "callback-interrupted", counter++);
+  assert.ok(r.parks.length >= 1, JSON.stringify({ reported: r.reported, logs: r.logs }));
+  assert.ok(r.parks.every(p => p.recovery_cause === "retained_recovery_adoption_failed" && !("recovery_detail" in p)), JSON.stringify(r.parks));
+});
+
+test("an api that 400s the detail-bearing park is retried with the plain body and parks", async t => {
+  const r = await drive(t, "detail-400", counter++);
+  const detailed = r.wire.filter(b => b.recovery_detail !== undefined);
+  assert.equal(detailed.length, 1, "the detail was tried once and refused: " + JSON.stringify(r.wire));
+  assert.ok(r.parks.length >= 1, JSON.stringify({ reported: r.reported, logs: r.logs }));
+  assert.ok(r.parks.every(p => p.recovery_cause === "retained_recovery_adoption_failed" && p.claim_generation === 2 &&
+    !("recovery_detail" in p)), JSON.stringify(r.parks));
+  assert.ok(!r.reported.includes("failed"));
+});
+
+test("an upload that failed with the verified bundle local still parks with the detail and keeps custody", async t => {
+  const r = await drive(t, "upload-failed", counter++);
+  const custody = r.custody!;
+  assert.equal(custody.accepted, "uploaded", "the older archive was accepted");
+  assert.ok(custody.failed?.startsWith("needs_action"), "the latest upload failed: " + custody.failed);
+  assert.ok(custody.bundlePath && fs.existsSync(custody.bundlePath), "the local bundle is journaled on disk");
+  assert.ok(r.parks.length >= 1, JSON.stringify({ reported: r.reported, logs: r.logs }));
+  for (const park of r.parks) {
+    assert.equal(park.recovery_cause, "retained_recovery_adoption_failed");
+    assert.equal(park.recovery_detail, "secret_remediation_active");
+  }
+  assert.equal(custody.uploads.releases, 0, "custody was not released");
+  assert.equal(r.models, 0);
+  // The verified local bundle holds the retained source tip, and the retained source itself is untouched.
+  command(r.bare, "bundle", "verify", custody.bundlePath);
+  assert.ok(command(r.bare, "bundle", "list-heads", custody.bundlePath).split("\n").some(l => l.startsWith(r.s)),
+    "the bundle carries the retained source tip");
+  assert.ok(fs.existsSync(r.clonePath));
+  assert.equal(r.journal().recovery.blocker, "adoption_failed");
+});
+
+test("without the api token a cold claim does not even rediscover", async t => {
+  const r = await drive(t, "cold-no-token", counter++);
+  assert.ok(r.parks.length >= 1, JSON.stringify({ reported: r.reported, logs: r.logs }));
+  assert.ok(r.parks.every(p => p.recovery_cause === "retained_recovery_adoption_failed" && !("recovery_detail" in p)));
+  assert.equal(r.classifierCalls, 0, "rediscovery is gated on the advertised feature");
+});
 
 test("the detail is omitted without the api token; the park itself is unchanged", async t => {
   const plain = await drive(t, "no-token", counter++);

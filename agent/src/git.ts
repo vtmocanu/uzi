@@ -10693,7 +10693,8 @@ export class GitCache {
     Promise<RetainedAdoptionRefusal | undefined> {
     try {
       return await this.withLock(barePath, async () => {
-        const journal = await this.checkedRecovery(barePath, branch, key, expected);
+        // allowLegacyRepair=false: this read can never append an attempt-ledger entry.
+        const journal = await this.checkedRecovery(barePath, branch, key, expected, false, undefined, false);
         const recovery = journal.recovery;
         if (recovery?.stage !== "blocked" || recovery.blocker !== "adoption_failed" ||
             !journal.remediationRecovery || !recovery.restoreSource) return undefined;

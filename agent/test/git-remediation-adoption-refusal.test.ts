@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, test } from "node:test";
+import { afterEach, beforeEach, test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import type { BoundaryProcessSpawner } from "../src/git.js";
 import {
   GitCache, retainedAdoptionRefusal, annotateRetainedSuccessorError, type FetchAgentBranchOptions,
   type PositiveOwedCandidateContext,
@@ -125,22 +126,68 @@ test("an ancestor found after an unknown probe still classifies active", async t
   assert.equal(retainedAdoptionRefusal(error), "secret_remediation_active");
 });
 
-test("an interrupted operation yields no class even when a probe answered unknown", async t => {
-  const { q, d, reservation } = await activeScene();
-  const real = cache.ancestry.bind(cache);
-  const controller = new AbortController();
-  t.mock.method(cache, "ancestry", async (b: string, floor: string, tip: string) => {
-    if (floor === q && tip === d) { controller.abort(new Error("operation aborted")); return "unknown"; }
-    return real(b, floor, tip);
+// An operation interrupted during an `unknown` probe says nothing about the evidence. The classifier's own refusal
+// (not the surrounding lock's abort error) is captured at the adoption seam, so the guards are what is exercised.
+function captureAdoptionRefusal(t: TestContext): { error: () => Error | undefined; restore: (fn: () => void) => void } {
+  let captured: Error | undefined;
+  let onRefusal: (() => void) | undefined;
+  const under = (cache as any).remediationAdoptionUnderLock.bind(cache);
+  t.mock.method(cache as any, "remediationAdoptionUnderLock", async (...args: unknown[]) => {
+    try { return await under(...args); }
+    catch (error) { captured = error as Error; onRefusal?.(); throw error; }
   });
-  let caught: Error | undefined;
-  await assert.rejects(cache.withRecoveryOperation(controller.signal, Date.now() + 60_000, async () => {
-    try { await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), reservation.attempts, SUCCESSOR, admit); }
-    catch (error) { caught = error as Error; throw error; }
-  }));
-  assert.ok(caught);
-  assert.equal(retainedAdoptionRefusal(caught), undefined);
-});
+  return { error: () => captured, restore: fn => { onRefusal = fn; } };
+}
+const realPipes: BoundaryProcessSpawner = async request => {
+  const [command, ...args] = request.argv;
+  const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+  const completed = new Promise<{ code: number }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", code => resolve({ code: code ?? 128 }));
+  });
+  return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+    cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; } };
+};
+type Interruption = "deadline" | "boundary-abort";
+/** Run the refusal under an interruption that fires inside the matching probe, which answers unknown. */
+async function interruptedRefusal(t: TestContext, how: Interruption, reservation: { attempts: number },
+  matches: (floor: string, tip: string) => boolean): Promise<Error | undefined> {
+  const seam = captureAdoptionRefusal(t);
+  const real = cache.ancestry.bind(cache);
+  const realNow = Date.now.bind(Date);
+  const boundary = new AbortController();
+  let shifted: { mock: { restore(): void } } | undefined;
+  seam.restore(() => shifted?.mock.restore());
+  t.mock.method(cache, "ancestry", async (b: string, floor: string, tip: string) => {
+    if (!matches(floor, tip)) return real(b, floor, tip);
+    if (how === "deadline") shifted = t.mock.method(Date, "now", () => realNow() + 120_000);
+    else boundary.abort(new Error("boundary stopped"));
+    return "unknown";
+  });
+  const run = () => refusal(admit, reservation.attempts).catch(() => undefined);
+  if (how === "deadline") await cache.withRecoveryOperation(new AbortController().signal, realNow() + 60_000, run).catch(() => undefined);
+  else await cache.withBoundaryProcessSpawner(realPipes, boundary.signal, run).catch(() => undefined);
+  shifted?.mock.restore();
+  return seam.error();
+}
+
+for (const how of ["deadline", "boundary-abort"] as const) {
+  test("a restricted-root probe answering unknown after the " + how + " fired yields no class", async t => {
+    const { q, d, reservation } = await activeScene();
+    const error = await interruptedRefusal(t, how, reservation, (floor, tip) => floor === q && tip === d);
+    assert.ok(error, "the classifier's own refusal surfaced");
+    assert.equal(error.message, "remediation adoption source still restricted");
+    assert.equal(retainedAdoptionRefusal(error), undefined);
+  });
+
+  test("a replacement-ancestry probe answering unknown after the " + how + " fired yields no class", async t => {
+    const { replacement, s, reservation } = await rewrittenScene();
+    const error = await interruptedRefusal(t, how, reservation, (floor, tip) => floor === replacement && tip === s);
+    assert.ok(error, "the classifier's own refusal surfaced");
+    assert.equal(error.message, "remediation replacement ancestry unknown");
+    assert.equal(retainedAdoptionRefusal(error), undefined);
+  });
+}
 
 test("an unknown replacement-ancestry proof is classified proof unknown", async t => {
   const { replacement, s, reservation } = await rewrittenScene();
@@ -186,6 +233,23 @@ test("crash rediscovery gives no class for a clean source, a non-adoption block 
   assert.equal(await cache.classifyBlockedRemediationAdoption(bare, BRANCH, KEY, source()), undefined, "captured, not blocked");
   await cache.blockRecoveryEpisode(bare, BRANCH, KEY, source(), "adoption_failed", clean.reservation);
   assert.equal(await cache.classifyBlockedRemediationAdoption(bare, BRANCH, KEY, source()), undefined, "source is clean: adoption would proceed");
+});
+
+test("crash rediscovery gives no class for a captured, unblocked journal even when the source is active", async () => {
+  await activeScene();
+  assert.equal(await cache.classifyBlockedRemediationAdoption(bare, BRANCH, KEY, source()), undefined);
+});
+
+test("crash rediscovery reads the journal without legacy repair, so it can never append a ledger entry", async t => {
+  const { reservation } = await activeScene();
+  await cache.blockRecoveryEpisode(bare, BRANCH, KEY, source(), "adoption_failed", reservation);
+  // A repair-eligible journal needs fixtures this scene cannot build, so the read's own flag is pinned instead.
+  const reads: unknown[][] = [];
+  const checked = (cache as any).checkedRecovery.bind(cache);
+  t.mock.method(cache as any, "checkedRecovery", async (...args: unknown[]) => { reads.push(args); return checked(...args); });
+  assert.equal(await cache.classifyBlockedRemediationAdoption(bare, BRANCH, KEY, source()), "secret_remediation_active");
+  assert.ok(reads.length >= 1);
+  assert.ok(reads.every(args => args[6] === false), "allowLegacyRepair is false on every read");
 });
 
 test("crash rediscovery gives no class for another blocker", async () => {
