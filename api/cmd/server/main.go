@@ -817,6 +817,7 @@ func run() error {
 		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
 		WorkerHeartbeatStale:    cfg.WorkerHeartbeatStale,
 		BackgroundGrace:         cfg.WorkerBackgroundGrace,
+		Lease:                   cfg.EphemeralLease,
 	})
 
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,

@@ -81,14 +81,20 @@ RETURNING run_id;
 -- Guarded by the worker so a row recorded for another worker in the meantime survives.
 DELETE FROM hibernation_wakes WHERE run_id = @run_id AND worker_id = @worker_id;
 
+-- name: LockRunForShare :one
+-- Row lock for DemandWake, taken after the worker lock (the same worker-then-run order ClaimRun
+-- uses). The caller reads the status AFTER the lock, so a claim that won the race is seen.
+SELECT status FROM runs WHERE id = @id FOR SHARE;
+
 -- name: ListStaleHibernationWakes :many
--- Stale-recovery candidates: a wake whose run is no longer queued, or whose worker is no longer
--- waking (settled, re-hibernated, preparing again). The caller re-checks under the worker lock.
+-- Release candidates (PRD #4205 "One wake per pending run"): a wake row lives until its run is no
+-- longer queued. Only a run that left 'queued' (claimed, cancelled, finished) qualifies; a row
+-- whose worker settled to none or was re-hibernated is kept, so the run never wakes a worker twice.
+-- A deleted run's row goes with it (ON DELETE CASCADE). The caller re-checks under the locks.
 SELECT hw.run_id, hw.worker_id
 FROM hibernation_wakes hw
-JOIN workers w ON w.id = hw.worker_id
 JOIN runs r ON r.id = hw.run_id
-WHERE r.status <> 'queued' OR w.hibernation_state <> 'waking'
+WHERE r.status <> 'queued'
 ORDER BY hw.worker_id, hw.run_id
 LIMIT @max_rows;
 
@@ -122,7 +128,7 @@ SELECT EXISTS (
     JOIN fn_placement_admitting_workers(
             r, ctp.codex_model,
             @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz,
-            '0'::interval, false, @codex_curated_models::text[]) adm ON adm.worker_id = w.id
+            @ephemeral_lease::interval, false, @codex_curated_models::text[]) adm ON adm.worker_id = w.id
     WHERE hw.run_id = @run_id
       AND hw.first_woken_at > now() - @wake_timeout::interval
 )::boolean AS suppressed;
@@ -150,7 +156,10 @@ SELECT EXISTS (
 -- Deliberately NOT carried over from the ephemeral trigger: its run-level capability-gap filter,
 -- the per-user ephemeral opt-in and kind <> 'chat'.
 --
--- The hibernation_wakes anti-join sits before LIMIT so recorded wakes cannot crowd out demand.
+-- The hibernation_wakes anti-join sits before LIMIT so recorded wakes cannot crowd out demand. A
+-- row stays until its run leaves 'queued', so a run that already woke once never wakes again.
+-- @ephemeral_lease is the configured ephemeral lease: a run an online leased ephemeral worker can
+-- take via its lease is not demand.
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
            (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
@@ -177,6 +186,9 @@ CROSS JOIN LATERAL (
         (array_agg(w.id ORDER BY (w.hibernation_state = 'waking') DESC, w.hibernated_at ASC NULLS LAST, w.id ASC)
             FILTER (WHERE w.kind = 'hosted' AND NOT w.ephemeral
                       AND w.hibernation_state IN ('hibernated', 'preparing', 'waking')
+                      -- A waking worker whose wake failed must not capture new demand: a hibernated
+                      -- sibling is chosen instead.
+                      AND NOT (w.hibernation_state = 'waking' AND w.wake_error IS NOT NULL)
                       -- fn_worker_accepts_new_intake(w) minus its hibernation clause: "as if awake".
                       AND w.manual_cordoned_at IS NULL AND w.draining_since IS NULL AND NOT w.maintenance_fenced
                       AND w.maintenance_phase NOT IN ('requested', 'ready', 'stopping', 'recycling')))[1] AS wake_worker_id
@@ -186,7 +198,7 @@ CROSS JOIN LATERAL (
     LEFT JOIN fn_placement_admitting_workers(
             r, ctp.codex_model,
             @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz,
-            '0'::interval, false, @codex_curated_models::text[]) adm ON adm.worker_id = w.id
+            @ephemeral_lease::interval, false, @codex_curated_models::text[]) adm ON adm.worker_id = w.id
     WHERE w.user_id = r.user_id
       AND (r.kind = 'chat' OR adm.worker_id IS NOT NULL)
       AND NOT w.maintenance_fenced
@@ -221,6 +233,11 @@ CROSS JOIN LATERAL (
       )
 ) cw
 WHERE r.status = 'queued'
+  -- Cheap pre-filter: only owners with a sleeper can produce a row, so a fleet with none skips the
+  -- per-run lateral entirely. Behaviour-preserving: cw.wake_worker_id is NULL without such a worker.
+  AND EXISTS (SELECT 1 FROM workers hz
+              WHERE hz.user_id = r.user_id AND hz.kind = 'hosted' AND NOT hz.ephemeral
+                AND hz.hibernation_state IN ('hibernated', 'preparing', 'waking'))
   AND r.egress_profile_id IS NULL
   AND NOT r.cross_check_lane
   AND (r.kind <> 'task' OR r.dispatched_at IS NOT NULL)

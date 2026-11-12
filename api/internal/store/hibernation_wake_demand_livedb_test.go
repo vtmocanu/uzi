@@ -62,6 +62,12 @@ func hostedWorker(fx *fleetFixture, o wakeWorkerOpts) uuid.UUID {
 // wakeDemandFor lists the demand rows of the fixture user.
 func wakeDemandFor(fx *fleetFixture, allow []uuid.UUID) map[uuid.UUID]uuid.UUID {
 	fx.t.Helper()
+	return wakeDemandWith(fx, allow, 1000, pgtype.Interval{})
+}
+
+// wakeDemandWith is wakeDemandFor with an explicit scan LIMIT and ephemeral lease.
+func wakeDemandWith(fx *fleetFixture, allow []uuid.UUID, maxRows int32, lease pgtype.Interval) map[uuid.UUID]uuid.UUID {
+	fx.t.Helper()
 	now := time.Now()
 	rows, err := fx.q.ListHibernationWakeDemand(fx.ctx, store.ListHibernationWakeDemandParams{
 		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
@@ -70,7 +76,8 @@ func wakeDemandFor(fx *fleetFixture, allow []uuid.UUID) map[uuid.UUID]uuid.UUID 
 		DockerRepoAllowlist:      allow,
 		HeartbeatCutoff:          pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true},
 		BackgroundGraceCutoff:    pgtype.Timestamptz{Time: now.Add(-15 * time.Minute), Valid: true},
-		MaxRows:                  1000,
+		EphemeralLease:           lease,
+		MaxRows:                  maxRows,
 	})
 	if err != nil {
 		fx.t.Fatalf("ListHibernationWakeDemand: %v", err)
@@ -319,7 +326,7 @@ func TestHibernationWakeDemandMatchesClaimLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("a recorded wake and a run bound to an ephemeral worker drop out before LIMIT", func(t *testing.T) {
+	t.Run("a recorded wake and a run bound to an ephemeral worker are not listed", func(t *testing.T) {
 		fx := newFleetFixture(t)
 		t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM users WHERE id = $1`, fx.userID) })
 		h := hostedWorker(fx, wakeWorkerOpts{})
@@ -342,6 +349,77 @@ func TestHibernationWakeDemandMatchesClaimLiveDB(t *testing.T) {
 		}
 		if got[free] != h {
 			t.Errorf("run %s not listed for %s: %v", free, h, got)
+		}
+	})
+
+	t.Run("the recorded-wake and ephemeral-bound exclusions apply before LIMIT", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM users WHERE id = $1`, fx.userID) })
+		h := hostedWorker(fx, wakeWorkerOpts{})
+		setHibernated(fx, h, "hibernated")
+		// The two oldest runs are excluded; with MaxRows 1 the free run must still be listed.
+		woken, bound, free := fx.queuedRun(), fx.queuedRun(), fx.queuedRun()
+		mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET created_at = now() - interval '3 hours' WHERE id = $1`, woken)
+		mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET created_at = now() - interval '2 hours' WHERE id = $1`, bound)
+		mustExec(fx.ctx, t, fx.pool, `INSERT INTO hibernation_wakes (run_id, worker_id, first_woken_at) VALUES ($1, $2, now())`, woken, h)
+		if _, err := fx.q.CreateEphemeralHostedWorker(fx.ctx, store.CreateEphemeralHostedWorkerParams{
+			UserID: fx.userID, Name: "ephemeral-" + bound.String(), TokenHash: tokenHash(),
+			TemplateDeclared: pgtype.Text{String: "base", Valid: true}, HostedSize: pgtype.Text{String: "m", Valid: true},
+			DockerEnabled: pgtype.Bool{Bool: false, Valid: true}, EphemeralRunID: bound, AnthropicBindMode: "default",
+		}); err != nil {
+			t.Fatalf("CreateEphemeralHostedWorker: %v", err)
+		}
+		got := wakeDemandWith(fx, nil, 1, pgtype.Interval{})
+		if len(got) != 1 || got[free] != h {
+			t.Fatalf("MaxRows 1 returned %v, want only %s -> %s", got, free, h)
+		}
+	})
+
+	t.Run("a fleet with no sleeper lists nothing", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM users WHERE id = $1`, fx.userID) })
+		hostedWorker(fx, wakeWorkerOpts{}) // an awake worker is never woken
+		hostedWorker(fx, wakeWorkerOpts{cordoned: true})
+		fx.queuedRun()
+		fx.queuedRun()
+		if got := wakeDemandFor(fx, nil); len(got) != 0 {
+			t.Fatalf("no worker sleeps, yet demand = %v", got)
+		}
+	})
+
+	t.Run("a waking worker whose wake failed is skipped for a hibernated sibling", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM users WHERE id = $1`, fx.userID) })
+		failed, sibling := hostedWorker(fx, wakeWorkerOpts{}), hostedWorker(fx, wakeWorkerOpts{})
+		setHibernated(fx, failed, "waking")
+		setHibernated(fx, sibling, "hibernated")
+		mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET wake_error = 'scale up failed' WHERE id = $1`, failed)
+		run := fx.queuedRun()
+		if got := wakeDemandFor(fx, nil)[run]; got != sibling {
+			t.Fatalf("run %s demanded %s, want the hibernated sibling %s", run, got, sibling)
+		}
+		mustExec(fx.ctx, t, fx.pool, `DELETE FROM workers WHERE id = $1`, sibling)
+		if got, ok := wakeDemandFor(fx, nil)[run]; ok {
+			t.Fatalf("run %s demanded %s although the only candidate's wake failed", run, got)
+		}
+	})
+
+	t.Run("a run a live leased ephemeral worker can take through its lease does not wake a sleeper", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM users WHERE id = $1`, fx.userID) })
+		h := hostedWorker(fx, wakeWorkerOpts{})
+		setHibernated(fx, h, "hibernated")
+		seedLeasedWorker(fx, leaseRun{iid: i64p(41)}, 0)
+		follow := insertLeaseRun(fx, leaseRun{iid: i64p(41)}) // same repo and branch: the lease admits it
+		// The leased worker is a Docker worker (as seeded), so the repo must be allowlisted for it.
+		allow := []uuid.UUID{fx.repoID}
+		lease := pgtype.Interval{Microseconds: (2 * time.Hour).Microseconds(), Valid: true}
+		if got, ok := wakeDemandWith(fx, allow, 1000, lease)[follow]; ok {
+			t.Fatalf("run %s demanded %s although the leased worker can claim it", follow, got)
+		}
+		// Control: with the lease off the leased worker is no claimant and the sleeper is demanded.
+		if got := wakeDemandWith(fx, allow, 1000, pgtype.Interval{})[follow]; got != h {
+			t.Fatalf("control: run %s demanded %s, want the sleeper %s", follow, got, h)
 		}
 	})
 }

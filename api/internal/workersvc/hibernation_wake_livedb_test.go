@@ -53,8 +53,10 @@ func (f *hibFx) wakeWorker(run uuid.UUID) uuid.UUID {
 	return w
 }
 
+// demand reports whether the call recorded a wake row (woke or attached).
 func (f *hibFx) demand(svc *Service, run, worker uuid.UUID) (bool, error) {
-	return svc.DemandWake(f.env.ctx, run, worker)
+	res, err := svc.DemandWake(f.env.ctx, run, worker)
+	return res != DemandWakeNone, err
 }
 
 // faultBeginner wraps every transaction it opens so a test can fail the commit in a chosen way.
@@ -327,14 +329,18 @@ func TestDemandWakeLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("a stale row whose worker was re-hibernated is deleted and the demand recomputed", func(t *testing.T) {
+	t.Run("a row whose worker settled and was re-hibernated is kept: no second wake, first_woken_at unchanged", func(t *testing.T) {
 		f := newHibFx(t)
 		a, b := f.sleepingWorker(), f.sleepingWorker()
 		run := f.queuedRun()
-		if woke, err := f.demand(f.svc, run, a); err != nil || !woke {
-			t.Fatalf("first wake: %v, %v", woke, err)
+		if res, err := f.svc.DemandWake(f.env.ctx, run, a); err != nil || res != DemandWakeWoke {
+			t.Fatalf("first wake: %v, %v", res, err)
 		}
-		// The woken worker settles awake and is hibernated again, with the old row still naming it.
+		var first time.Time
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT first_woken_at FROM hibernation_wakes WHERE run_id = $1`, run).Scan(&first); err != nil {
+			t.Fatal(err)
+		}
+		// The woken worker settles awake and is hibernated again, with the row still naming it.
 		pod := uuid.New()
 		f.mustApply(a, TransitionReady, pod)
 		f.env.exec(`UPDATE workers SET registered_pod_uid = $2 WHERE id = $1`, a, pod)
@@ -342,22 +348,88 @@ func TestDemandWakeLiveDB(t *testing.T) {
 		f.register(a, &pod)
 		f.want(a, "none")
 		f.sleep(a, pod)
-		if f.wakeRows(run) != 1 {
-			t.Fatal("the stale row should still exist before recovery")
+		opA, opB := f.op(a), f.op(b)
+		for _, cand := range []uuid.UUID{a, b} {
+			if res, err := f.svc.DemandWake(f.env.ctx, run, cand); err != nil || res != DemandWakeNone {
+				t.Fatalf("second demand for %s = %v, %v; want none", cand, res, err)
+			}
 		}
-		// Recovery: the demand now picks the OTHER worker; the stale row (worker a, no longer
-		// waking) is deleted under both locks and replaced.
-		if woke, err := f.demand(f.svc, run, b); err != nil || !woke {
-			t.Fatalf("recomputed demand = %v, %v", woke, err)
+		// Release also leaves it: the run is still queued.
+		if n, err := f.svc.ReleaseStaleWake(f.env.ctx, run); err != nil || n {
+			t.Fatalf("release deleted a row of a still-queued run: %v, %v", n, err)
 		}
-		f.want(b, "waking")
 		f.want(a, "hibernated")
-		if f.wakeRows(run) != 1 || f.wakeWorker(run) != b {
-			t.Fatal("the row should now name the freshly woken worker")
+		f.want(b, "hibernated")
+		if f.op(a) != opA || f.op(b) != opB {
+			t.Fatal("a second wake minted an op id")
+		}
+		var after time.Time
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT first_woken_at FROM hibernation_wakes WHERE run_id = $1`, run).Scan(&after); err != nil {
+			t.Fatal(err)
+		}
+		if f.wakeRows(run) != 1 || f.wakeWorker(run) != a || !after.Equal(first) {
+			t.Fatalf("the row changed: rows=%d worker=%s first %v -> %v", f.wakeRows(run), f.wakeWorker(run), first, after)
 		}
 	})
 
-	t.Run("ReleaseStaleWake removes a row whose run left the queue or whose worker stopped waking", func(t *testing.T) {
+	t.Run("a run claimed between listing and DemandWake is not woken for", func(t *testing.T) {
+		f := newHibFx(t)
+		w := f.sleepingWorker()
+		run := f.queuedRun()
+		// A claim in flight: the run row is updated but not yet committed.
+		claim, err := f.env.pool.Begin(f.env.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = claim.Rollback(f.env.ctx) }()
+		if _, err := claim.Exec(f.env.ctx, `UPDATE runs SET status = 'running' WHERE id = $1`, run); err != nil {
+			t.Fatal(err)
+		}
+		type out struct {
+			res DemandWakeResult
+			err error
+		}
+		done := make(chan out, 1)
+		go func() {
+			res, err := f.svc.DemandWake(f.env.ctx, run, w)
+			done <- out{res, err}
+		}()
+		select {
+		case o := <-done:
+			t.Fatalf("DemandWake did not wait for the run lock: %v, %v", o.res, o.err)
+		case <-time.After(300 * time.Millisecond):
+		}
+		if err := claim.Commit(f.env.ctx); err != nil {
+			t.Fatal(err)
+		}
+		o := <-done
+		if o.err != nil || o.res != DemandWakeNone {
+			t.Fatalf("DemandWake = %v, %v; want none", o.res, o.err)
+		}
+		f.want(w, "hibernated")
+		if f.wakeRows(run) != 0 {
+			t.Fatal("a row was recorded for a claimed run")
+		}
+	})
+
+	t.Run("a waking worker whose wake failed does not capture demand", func(t *testing.T) {
+		f := newHibFx(t)
+		w := f.sleepingWorker()
+		first := f.queuedRun()
+		if res, err := f.svc.DemandWake(f.env.ctx, first, w); err != nil || res != DemandWakeWoke {
+			t.Fatalf("wake: %v, %v", res, err)
+		}
+		f.env.exec(`UPDATE workers SET wake_error = 'scale up failed' WHERE id = $1`, w)
+		second := f.queuedRun()
+		if res, err := f.svc.DemandWake(f.env.ctx, second, w); err != nil || res != DemandWakeNone {
+			t.Fatalf("a failed-wake worker captured demand: %v, %v", res, err)
+		}
+		if f.wakeRows(second) != 0 {
+			t.Fatal("a row was recorded against a failed wake")
+		}
+	})
+
+	t.Run("ReleaseStaleWake removes only a row whose run left the queue", func(t *testing.T) {
 		f := newHibFx(t)
 		a := f.sleepingWorker()
 		live, gone := f.queuedRun(), f.queuedRun()
@@ -374,11 +446,11 @@ func TestDemandWakeLiveDB(t *testing.T) {
 			t.Fatalf("a wake for a run that left the queue was kept: %v, %v", n, err)
 		}
 		f.env.exec(`UPDATE workers SET hibernation_state = 'hibernated', hibernated_at = now() WHERE id = $1`, a)
-		if n, err := f.svc.ReleaseStaleWake(f.env.ctx, live); err != nil || !n {
-			t.Fatalf("a wake whose worker stopped waking was kept: %v, %v", n, err)
+		if n, err := f.svc.ReleaseStaleWake(f.env.ctx, live); err != nil || n {
+			t.Fatalf("a wake whose worker stopped waking was released while its run is queued: %v, %v", n, err)
 		}
-		if f.wakeRows(live)+f.wakeRows(gone) != 0 {
-			t.Fatal("rows remain")
+		if f.wakeRows(live) != 1 || f.wakeRows(gone) != 0 {
+			t.Fatalf("rows: live=%d gone=%d", f.wakeRows(live), f.wakeRows(gone))
 		}
 	})
 }

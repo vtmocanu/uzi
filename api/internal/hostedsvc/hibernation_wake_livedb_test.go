@@ -274,15 +274,16 @@ func TestHibernationWakePassIsNotPacedAndOverflowsToTheNextPassLiveDB(t *testing
 		for i := 0; i < total; i++ {
 			e.queuedRun()
 		}
-		if got := e.wake(); got != int64(ephemeralProvisionBatch) {
-			t.Fatalf("first pass woke %d, want the LIMIT %d", got, ephemeralProvisionBatch)
+		// One worker moves to waking; the other runs of the scan attach to it (not counted as wakes).
+		if got := e.wake(); got != 1 {
+			t.Fatalf("first pass woke %d workers, want 1", got)
 		}
 		if e.wakeRows() != int(ephemeralProvisionBatch) {
 			t.Fatalf("rows after pass 1 = %d", e.wakeRows())
 		}
 		op := e.op(w)
-		if got := e.wake(); got != int64(total)-int64(ephemeralProvisionBatch) {
-			t.Fatalf("second pass woke %d, want the remaining %d", got, total-int(ephemeralProvisionBatch))
+		if got := e.wake(); got != 0 {
+			t.Fatalf("second pass moved %d workers, want 0 (the remainder attaches to the waking worker)", got)
 		}
 		if e.wakeRows() != total {
 			t.Fatalf("rows after pass 2 = %d, want %d", e.wakeRows(), total)
@@ -311,33 +312,55 @@ func TestHibernationWakePassNeverWakesASiblingLiveDB(t *testing.T) {
 	if e.state(newer) != "hibernated" || e.op(older) != op || e.wakeRows() != 1 {
 		t.Fatal("repeated passes woke a sibling or re-minted the op")
 	}
-	// A second run that arrives mid-wake attaches to the waking worker: one row more, no sibling.
+	// A second run that arrives mid-wake attaches to the waking worker: one row more, no sibling,
+	// and no worker transition to count.
 	e.queuedRun()
-	if got := e.wake(); got != 1 {
-		t.Fatalf("late run recorded %d wakes, want 1", got)
+	if got := e.wake(); got != 0 {
+		t.Fatalf("late run woke %d workers, want 0", got)
 	}
 	if e.state(newer) != "hibernated" || e.op(older) != op || e.wakeRows() != 2 {
 		t.Fatal("a run arriving mid-wake woke a sibling or re-minted the op")
 	}
 }
 
-func TestHibernationWakePassRecoversStaleRowsLiveDB(t *testing.T) {
+func TestHibernationWakePassKeepsRowsUntilTheRunLeavesTheQueueLiveDB(t *testing.T) {
 	e := newWakeEnv(t, false)
 	w := e.sleeper(nil, nil, time.Hour)
-	gone, stale := e.queuedRun(), e.queuedRun()
-	if got := e.wake(); got != 2 {
-		t.Fatalf("woke %d", got)
+	gone, kept := e.queuedRun(), e.queuedRun()
+	if got := e.wake(); got != 1 {
+		t.Fatalf("woke %d workers, want 1", got)
+	}
+	if e.wakeRows() != 2 {
+		t.Fatalf("rows = %d, want 2", e.wakeRows())
+	}
+	var firstWoken time.Time
+	if err := e.pool.QueryRow(e.ctx, `SELECT first_woken_at FROM hibernation_wakes WHERE run_id = $1`, kept).Scan(&firstWoken); err != nil {
+		t.Fatal(err)
 	}
 	// One run leaves the queue; the worker is re-hibernated with the other run's row still naming it.
 	e.exec(`UPDATE runs SET status = 'cancelled' WHERE id = $1`, gone)
 	e.exec(`UPDATE workers SET hibernation_state = 'hibernated', hibernated_at = now(), wake_requested_at = NULL WHERE id = $1`, w)
 	opBefore := e.op(w)
-	got := e.wake()
-	if e.count(`SELECT count(*) FROM hibernation_wakes WHERE run_id = $1`, gone) != 0 {
-		t.Fatal("the row of a run that left the queue was not deleted")
+	for i := 0; i < 2; i++ {
+		if got := e.wake(); got != 0 {
+			t.Fatalf("pass %d woke %d workers; a run that already woke once must not wake again", i, got)
+		}
 	}
-	if got != 1 || e.state(w) != "waking" || e.op(w) == opBefore {
-		t.Fatalf("the stale row of %s was not recomputed into a fresh wake: woke=%d state=%s", stale, got, e.state(w))
+	if e.count(`SELECT count(*) FROM hibernation_wakes WHERE run_id = $1`, gone) != 0 {
+		t.Fatal("the row of a run that left the queue was not released")
+	}
+	var after time.Time
+	if err := e.pool.QueryRow(e.ctx, `SELECT first_woken_at FROM hibernation_wakes WHERE run_id = $1`, kept).Scan(&after); err != nil {
+		t.Fatalf("the row of the still-queued run %s was deleted: %v", kept, err)
+	}
+	if !after.Equal(firstWoken) || e.state(w) != "hibernated" || e.op(w) != opBefore {
+		t.Fatalf("the still-queued run woke again: first_woken_at %v -> %v, state=%s", firstWoken, after, e.state(w))
+	}
+	// A run claimed away releases its row on the next pass.
+	e.exec(`UPDATE runs SET status = 'running' WHERE id = $1`, kept)
+	e.wake()
+	if e.wakeRows() != 0 {
+		t.Fatalf("rows = %d after the run left the queue, want 0", e.wakeRows())
 	}
 }
 

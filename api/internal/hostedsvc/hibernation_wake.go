@@ -18,7 +18,7 @@ import (
 // WakeService is the narrow workersvc surface the wake pass drives. *workersvc.Service satisfies
 // it; the methods own the transactions and the worker row locks.
 type WakeService interface {
-	DemandWake(ctx context.Context, runID, workerID uuid.UUID) (bool, error)
+	DemandWake(ctx context.Context, runID, workerID uuid.UUID) (workersvc.DemandWakeResult, error)
 	ReleaseStaleWake(ctx context.Context, runID uuid.UUID) (bool, error)
 }
 
@@ -41,6 +41,9 @@ type HibernationWakerConfig struct {
 	WorkerHeartbeatStale time.Duration
 	// BackgroundGrace mirrors the ordering input of the ephemeral trigger.
 	BackgroundGrace time.Duration
+	// Lease is the configured ephemeral lease (EphemeralConfig.Lease, UZI_EPHEMERAL_LEASE): a run an
+	// online leased ephemeral worker can take through its lease is not demand. Zero disables it.
+	Lease time.Duration
 }
 
 // HibernationWaker is the demand-wake sweeper pass (PRD #4205 M5). It runs before ephemeral
@@ -59,12 +62,11 @@ func NewHibernationWaker(q *store.Queries, svc WakeService, s WakeSettings, cfg 
 	return &HibernationWaker{q: q, svc: svc, settings: s, cfg: cfg, now: time.Now}
 }
 
-// WakePass is one tick. It first releases stale wake rows (run no longer queued, or the worker
-// no longer waking), then lists the runs that demand a sleeping worker and records one wake per
+// WakePass is one tick. It first releases stale wake rows (run no longer queued), then lists the runs that demand a sleeping worker and records one wake per
 // run through DemandWake. Demand wakes are not paced; the scan is bounded by ephemeralProvisionBatch
 // (a run beyond it is picked up by a later pass, since a woken run leaves the set). One run's
 // failure, including a commit of unknown outcome, is collected and never retried in this pass,
-// and never blocks the other runs. It returns the number of wakes newly recorded.
+// and never blocks the other runs. It returns the number of workers it actually moved to waking; a run attached to an already-waking worker is logged, not counted.
 func (w *HibernationWaker) WakePass(ctx context.Context) (int64, error) {
 	var errs []error
 
@@ -94,6 +96,7 @@ func (w *HibernationWaker) WakePass(ctx context.Context) (int64, error) {
 		DockerRepoAllowlist:      allowlist,
 		HeartbeatCutoff:          pgconv.Time(evaluatedAt.Add(-w.cfg.WorkerHeartbeatStale)),
 		StaleRequeueCutoff:       workersvc.StaleRequeueCutoff(evaluatedAt, w.cfg.WorkerStaleRequeueGrace),
+		EphemeralLease:           workersvc.LeaseInterval(w.cfg.Lease),
 		BackgroundGraceCutoff:    pgconv.Time(evaluatedAt.Add(-w.cfg.BackgroundGrace)),
 		MaxRows:                  ephemeralProvisionBatch,
 	})
@@ -104,14 +107,17 @@ func (w *HibernationWaker) WakePass(ctx context.Context) (int64, error) {
 
 	var woke int64
 	for _, d := range demand {
-		ok, derr := w.svc.DemandWake(ctx, d.RunID, d.WorkerID)
+		res, derr := w.svc.DemandWake(ctx, d.RunID, d.WorkerID)
 		if derr != nil {
 			errs = append(errs, fmt.Errorf("hostedsvc: demand wake run %s worker %s: %w", d.RunID, d.WorkerID, derr))
 			continue
 		}
-		if ok {
+		switch res {
+		case workersvc.DemandWakeWoke:
 			woke++
 			slog.Info("hibernation waker: woke worker for queued run", "run_id", d.RunID, "worker_id", d.WorkerID)
+		case workersvc.DemandWakeAttached:
+			slog.Info("hibernation waker: attached queued run to an already-waking worker", "run_id", d.RunID, "worker_id", d.WorkerID)
 		}
 	}
 	return woke, errors.Join(errs...)
@@ -127,6 +133,7 @@ func (p *EphemeralProvisioner) wakeSuppressesProvision(ctx context.Context, qtx 
 		CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: evaluatedAt.Add(-p.cfg.WorkerAffinityGrace), Valid: true},
 		CodexCuratedModels:       workersvc.CodexCuratedModels(),
 		RunID:                    runID,
+		EphemeralLease:           workersvc.LeaseInterval(p.cfg.Lease),
 		WakeTimeout:              durationToInterval(workersvc.WorkerWakeTimeout),
 	})
 }

@@ -73,7 +73,7 @@ WITH checker_template_pins AS MATERIALIZED (
             ORDER BY t.name LIMIT 1) AS codex_model
     FROM (
         SELECT r.user_id FROM runs r
-        WHERE r.id = $4 AND r.kind = 'cross_check' AND r.harness = 'codex'
+        WHERE r.id = $5 AND r.kind = 'cross_check' AND r.harness = 'codex'
     ) owners
 )
 SELECT EXISTS (
@@ -85,15 +85,16 @@ SELECT EXISTS (
     JOIN fn_placement_admitting_workers(
             r, ctp.codex_model,
             $1::timestamptz, $2::timestamptz,
-            '0'::interval, false, $3::text[]) adm ON adm.worker_id = w.id
-    WHERE hw.run_id = $4
-      AND hw.first_woken_at > now() - $5::interval
+            $3::interval, false, $4::text[]) adm ON adm.worker_id = w.id
+    WHERE hw.run_id = $5
+      AND hw.first_woken_at > now() - $6::interval
 )::boolean AS suppressed
 `
 
 type HibernationWakeSuppressesParams struct {
 	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
 	CrossCheckAffinityCutoff pgtype.Timestamptz `json:"cross_check_affinity_cutoff"`
+	EphemeralLease           pgtype.Interval    `json:"ephemeral_lease"`
 	CodexCuratedModels       []string           `json:"codex_curated_models"`
 	RunID                    uuid.UUID          `json:"run_id"`
 	WakeTimeout              pgtype.Interval    `json:"wake_timeout"`
@@ -107,6 +108,7 @@ func (q *Queries) HibernationWakeSuppresses(ctx context.Context, arg Hibernation
 	row := q.db.QueryRow(ctx, hibernationWakeSuppresses,
 		arg.CrossCheckEvaluatedAt,
 		arg.CrossCheckAffinityCutoff,
+		arg.EphemeralLease,
 		arg.CodexCuratedModels,
 		arg.RunID,
 		arg.WakeTimeout,
@@ -195,6 +197,9 @@ CROSS JOIN LATERAL (
         (array_agg(w.id ORDER BY (w.hibernation_state = 'waking') DESC, w.hibernated_at ASC NULLS LAST, w.id ASC)
             FILTER (WHERE w.kind = 'hosted' AND NOT w.ephemeral
                       AND w.hibernation_state IN ('hibernated', 'preparing', 'waking')
+                      -- A waking worker whose wake failed must not capture new demand: a hibernated
+                      -- sibling is chosen instead.
+                      AND NOT (w.hibernation_state = 'waking' AND w.wake_error IS NOT NULL)
                       -- fn_worker_accepts_new_intake(w) minus its hibernation clause: "as if awake".
                       AND w.manual_cordoned_at IS NULL AND w.draining_since IS NULL AND NOT w.maintenance_fenced
                       AND w.maintenance_phase NOT IN ('requested', 'ready', 'stopping', 'recycling')))[1] AS wake_worker_id
@@ -204,7 +209,7 @@ CROSS JOIN LATERAL (
     LEFT JOIN fn_placement_admitting_workers(
             r, ctp.codex_model,
             $1::timestamptz, $2::timestamptz,
-            '0'::interval, false, $3::text[]) adm ON adm.worker_id = w.id
+            $3::interval, false, $4::text[]) adm ON adm.worker_id = w.id
     WHERE w.user_id = r.user_id
       AND (r.kind = 'chat' OR adm.worker_id IS NOT NULL)
       AND NOT w.maintenance_fenced
@@ -214,11 +219,11 @@ CROSS JOIN LATERAL (
            -- ClaimChatRun: no ephemeral claimant, owner/affinity gate. The released-incarnation
            -- nonce clause is an intentional divergence (a Register rotates the nonce).
            AND NOT w.ephemeral
-           AND (r.worker_id IS NULL OR r.worker_id = w.id OR r.updated_at < $4::timestamptz))
+           AND (r.worker_id IS NULL OR r.worker_id = w.id OR r.updated_at < $5::timestamptz))
           OR
           (r.kind <> 'chat'
            -- ClaimRun's docker allowlist and effective-capability conjunct.
-           AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), $5::uuid[], r.repo_id, r.kind, w.capabilities, r.required_capabilities, true)
+           AND fn_worker_can_claim(COALESCE(w.docker_enabled, false), $6::uuid[], r.repo_id, r.kind, w.capabilities, r.required_capabilities, true)
            AND fn_forge_origin_eligible(w, r, now())
            -- ClaimRun's job-runner clause.
            AND (r.kind <> 'job'
@@ -226,19 +231,24 @@ CROSS JOIN LATERAL (
                     AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
            -- ClaimRun's affinity pin: the run's own worker, a released pin, or the ceiling.
            AND (r.kind = 'cross_check' OR r.worker_id IS NULL OR r.worker_id = w.id
-                OR r.updated_at < $4::timestamptz
+                OR r.updated_at < $5::timestamptz
                 OR NOT EXISTS (
                     SELECT 1 FROM workers ow
                     WHERE ow.id = r.worker_id
                       AND fn_forge_origin_owner_pins(ow, r, now())
                       AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
-                           OR (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $6::timestamptz)
+                           OR (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $7::timestamptz)
                            OR (r.kind <> 'cross_check'
                                AND r.stale_requeue_generation = r.claim_generation
-                               AND COALESCE(r.status_since > $7::timestamptz, false))))))
+                               AND COALESCE(r.status_since > $8::timestamptz, false))))))
       )
 ) cw
 WHERE r.status = 'queued'
+  -- Cheap pre-filter: only owners with a sleeper can produce a row, so a fleet with none skips the
+  -- per-run lateral entirely. Behaviour-preserving: cw.wake_worker_id is NULL without such a worker.
+  AND EXISTS (SELECT 1 FROM workers hz
+              WHERE hz.user_id = r.user_id AND hz.kind = 'hosted' AND NOT hz.ephemeral
+                AND hz.hibernation_state IN ('hibernated', 'preparing', 'waking'))
   AND r.egress_profile_id IS NULL
   AND NOT r.cross_check_lane
   AND (r.kind <> 'task' OR r.dispatched_at IS NOT NULL)
@@ -251,13 +261,14 @@ WHERE r.status = 'queued'
   AND cw.wake_worker_id IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM workers w2 WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id)
   AND NOT EXISTS (SELECT 1 FROM hibernation_wakes hw WHERE hw.run_id = r.id)
-ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $8) DESC, r.created_at ASC
-LIMIT $9
+ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $9) DESC, r.created_at ASC
+LIMIT $10
 `
 
 type ListHibernationWakeDemandParams struct {
 	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
 	CrossCheckAffinityCutoff pgtype.Timestamptz `json:"cross_check_affinity_cutoff"`
+	EphemeralLease           pgtype.Interval    `json:"ephemeral_lease"`
 	CodexCuratedModels       []string           `json:"codex_curated_models"`
 	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
 	DockerRepoAllowlist      []uuid.UUID        `json:"docker_repo_allowlist"`
@@ -295,11 +306,15 @@ type ListHibernationWakeDemandRow struct {
 // Deliberately NOT carried over from the ephemeral trigger: its run-level capability-gap filter,
 // the per-user ephemeral opt-in and kind <> 'chat'.
 //
-// The hibernation_wakes anti-join sits before LIMIT so recorded wakes cannot crowd out demand.
+// The hibernation_wakes anti-join sits before LIMIT so recorded wakes cannot crowd out demand. A
+// row stays until its run leaves 'queued', so a run that already woke once never wakes again.
+// @ephemeral_lease is the configured ephemeral lease: a run an online leased ephemeral worker can
+// take via its lease is not demand.
 func (q *Queries) ListHibernationWakeDemand(ctx context.Context, arg ListHibernationWakeDemandParams) ([]ListHibernationWakeDemandRow, error) {
 	rows, err := q.db.Query(ctx, listHibernationWakeDemand,
 		arg.CrossCheckEvaluatedAt,
 		arg.CrossCheckAffinityCutoff,
+		arg.EphemeralLease,
 		arg.CodexCuratedModels,
 		arg.AffinityCutoff,
 		arg.DockerRepoAllowlist,
@@ -329,9 +344,8 @@ func (q *Queries) ListHibernationWakeDemand(ctx context.Context, arg ListHiberna
 const listStaleHibernationWakes = `-- name: ListStaleHibernationWakes :many
 SELECT hw.run_id, hw.worker_id
 FROM hibernation_wakes hw
-JOIN workers w ON w.id = hw.worker_id
 JOIN runs r ON r.id = hw.run_id
-WHERE r.status <> 'queued' OR w.hibernation_state <> 'waking'
+WHERE r.status <> 'queued'
 ORDER BY hw.worker_id, hw.run_id
 LIMIT $1
 `
@@ -341,8 +355,10 @@ type ListStaleHibernationWakesRow struct {
 	WorkerID uuid.UUID `json:"worker_id"`
 }
 
-// Stale-recovery candidates: a wake whose run is no longer queued, or whose worker is no longer
-// waking (settled, re-hibernated, preparing again). The caller re-checks under the worker lock.
+// Release candidates (PRD #4205 "One wake per pending run"): a wake row lives until its run is no
+// longer queued. Only a run that left 'queued' (claimed, cancelled, finished) qualifies; a row
+// whose worker settled to none or was re-hibernated is kept, so the run never wakes a worker twice.
+// A deleted run's row goes with it (ON DELETE CASCADE). The caller re-checks under the locks.
 func (q *Queries) ListStaleHibernationWakes(ctx context.Context, maxRows int32) ([]ListStaleHibernationWakesRow, error) {
 	rows, err := q.db.Query(ctx, listStaleHibernationWakes, maxRows)
 	if err != nil {
@@ -440,6 +456,19 @@ func (q *Queries) ListWorkersToWakeOnDisable(ctx context.Context, maxRows int32)
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockRunForShare = `-- name: LockRunForShare :one
+SELECT status FROM runs WHERE id = $1 FOR SHARE
+`
+
+// Row lock for DemandWake, taken after the worker lock (the same worker-then-run order ClaimRun
+// uses). The caller reads the status AFTER the lock, so a claim that won the race is seen.
+func (q *Queries) LockRunForShare(ctx context.Context, id uuid.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, lockRunForShare, id)
+	var status string
+	err := row.Scan(&status)
+	return status, err
 }
 
 const upsertControllerHibernationAdvertisement = `-- name: UpsertControllerHibernationAdvertisement :exec
