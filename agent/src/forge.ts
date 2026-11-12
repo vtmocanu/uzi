@@ -497,7 +497,7 @@ export class ForgejoClient extends HttpForgeClient {
   }
 }
 
-/** GitHub REST driver (`api.github.com`, `Authorization: Bearer` header). PRs live at
+/** GitHub REST driver (`api.github.com`, or `<host>/api/v3` on GHES; `Authorization: Bearer` header). PRs live at
  *  `/repos/{owner}/{repo}/pulls`; the create response uses `number` (the iid) +
  *  `html_url` (the web URL). GitHub answers 422 (not 409) when a PR already exists for
  *  the same head/base, so it widens `duplicateStatuses()` (D9/R6). */
@@ -604,13 +604,12 @@ export function forgejoRepoParts(repoUrl: string): { apiBase: string; owner: str
 
 /**
  * Split a GitHub repo web URL into its API base + owner + repo (D3 host mapping).
- * Unlike Forgejo, GitHub's API lives on a DIFFERENT SUBDOMAIN, not a path: the web
- * host `github.com` maps to `api.github.com` (`https://github.com/owner/repo` →
- * base `https://api.github.com`). The last two path segments are owner/repo (a
- * trailing `.git` is stripped); there is no ROOT_URL subpath to preserve.
- * GHES (self-hosted, `api.v3` under a path) is out of scope for v1 (github.com only,
- * D3); for any non-github.com host we fall back to prefixing `api.`, but the
- * supported surface is github.com.
+ * github.com serves its API on a DIFFERENT SUBDOMAIN (`https://github.com/owner/repo`
+ * → base `https://api.github.com`, a leading `www.` ignored). GitHub Enterprise Server
+ * serves it on the web host under `/api/v3` (`https://ghe.example.com/owner/repo` →
+ * `https://ghe.example.com/api/v3`), the same base go-github's WithEnterpriseURLs
+ * derives on the API side. The last two path segments are owner/repo (a trailing
+ * `.git` is stripped).
  */
 export function githubRepoParts(repoUrl: string): { apiBase: string; owner: string; repo: string } {
   const u = new URL(repoUrl);
@@ -618,8 +617,8 @@ export function githubRepoParts(repoUrl: string): { apiBase: string; owner: stri
   const repo = (segs.pop() ?? "").replace(/\.git$/, "");
   const owner = segs.pop() ?? "";
   if (!owner || !repo) throw new ForgeError(0, "cannot derive owner/repo from GitHub repo URL");
-  const host = u.host === "github.com" ? "api.github.com" : `api.${u.host.replace(/^www\./, "")}`;
-  return { apiBase: `${u.protocol}//${host}`, owner, repo };
+  const apiBase = u.host.replace(/^www\./, "") === "github.com" ? `${u.protocol}//api.github.com` : `${u.protocol}//${u.host}/api/v3`;
+  return { apiBase, owner, repo };
 }
 
 function isHttps(url: string): boolean {

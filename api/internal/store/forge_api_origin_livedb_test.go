@@ -17,19 +17,36 @@ import (
 
 // Issue #1324 D9: direct publication/API failures feed the same advisory origin cooldown as
 // clone/fetch failures. These tests execute the generated ClaimRun and the generated observation and
-// success queries against a real Postgres. The fixture's repo lives at https://forge.e2e, so with a
-// github connection its API origin is https://api.forge.e2e and with a gitlab connection the API
-// origin equals the Git origin.
+// success queries against a real Postgres. The fixture moves its repo to https://github.com, so with a
+// github connection its API origin is https://api.github.com and with a gitlab connection the API
+// origin equals the Git origin. github.com is the one host whose API origin differs from its Git
+// origin: GitHub Enterprise Server serves its API on the web host (TestForgeAPIOriginGHESSharesGitOriginLiveDB).
 const (
-	apiFxGit = "https://forge.e2e"
-	apiFxAPI = "https://api.forge.e2e"
+	apiFxGit = "https://github.com"
+	apiFxAPI = "https://api.github.com"
 )
 
 func newForgeAPIFixture(t *testing.T, forgeType string) *rollAffinityFixture {
 	t.Helper()
 	fx := newRollAffinityFixture(t)
 	mustExec(fx.ctx, t, fx.pool, "UPDATE forge_connections SET forge_type=$1 WHERE user_id=$2", forgeType, fx.userID)
+	mustExec(fx.ctx, t, fx.pool, "UPDATE repos SET web_url=$1 WHERE id=$2", apiFxGit+"/g/r", fx.repoID)
 	return fx
+}
+
+// A GitHub Enterprise Server repo serves its API under /api/v3 on the web host, so its API origin is
+// its Git origin and both surfaces share one cooldown row, as on GitLab.
+func TestForgeAPIOriginGHESSharesGitOriginLiveDB(t *testing.T) {
+	fx := newForgeAPIFixture(t, "github")
+	mustExec(fx.ctx, t, fx.pool, "UPDATE repos SET web_url='https://ghe.example.com/g/r' WHERE id=$1", fx.repoID)
+	var origin, api string
+	if err := fx.pool.QueryRow(fx.ctx, "SELECT origin, api_origin FROM authorized_forge_origins WHERE repo_id=$1",
+		fx.repoID).Scan(&origin, &api); err != nil {
+		t.Fatal(err)
+	}
+	if origin != "https://ghe.example.com" || api != origin {
+		t.Fatalf("GHES origin=%q api_origin=%q, want both https://ghe.example.com", origin, api)
+	}
 }
 
 // apiFxRow inserts one cooldown row. A due row is expired, an undue one cools for a day.
