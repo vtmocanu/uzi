@@ -139,9 +139,10 @@ func (s *Service) claimAnthropicEndpoint(run store.Run) *ClaimAnthropicEndpoint 
 
 // claimAnthropicOAuthToken applies the PRD #229 D10 mutual exclusion as data: when an
 // endpoint is bound it IS the run's credential, so the subscription token is emptied
-// rather than left for a downstream consumer to deprioritize. Returning "" also drops
-// the key from the wire under omitempty on the worker side, so a bound run's claim
-// carries no subscription material at all.
+// rather than left for a downstream consumer to deprioritize. The field carries no
+// omitempty, so a bound claim still emits the key with an empty string — the exclusion
+// is visible on the wire rather than inferred from an absent key, and the worker's
+// `if (oauthToken)` guard treats "" as absent.
 func claimAnthropicOAuthToken(token []byte, endpoint *ClaimAnthropicEndpoint) string {
 	if endpoint != nil {
 		return ""

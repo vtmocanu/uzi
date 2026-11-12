@@ -5924,6 +5924,12 @@ export class RunRunner {
     const runScopedSecrets = [claim.secrets.forge_pat, gitBasic];
     if (claim.secrets.anthropic_oauth_token)
       runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
+    // PRD #229 D10: a bound endpoint's key is a credential and is scrubbed exactly like
+    // the subscription token it replaces. It reaches the SDK env rather than the claim
+    // body, but a provider error echoing it — or an env dump — must not survive into a
+    // run message. Absent on an unbound run, so that wire stays byte-identical.
+    if (claim.secrets.anthropic_endpoint?.api_key)
+      runScopedSecrets.push(claim.secrets.anthropic_endpoint.api_key);
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered

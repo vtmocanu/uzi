@@ -39,10 +39,17 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   // SDK talks to, so a provisioned var must never redirect it — the only writer is
   // the admin-allowlisted claim field, applied after the fold below.
   "ANTHROPIC_BASE_URL",
-  // PRD #229 D10: the model the endpoint serves. Protected for the same reason as the
-  // base URL — a provisioned var must never name a model the operator's endpoint does
-  // not serve, and the only writer is the admin-configured claim field below.
+  // PRD #229 D10: the model slots a bound endpoint pins. A provisioned var must never
+  // repoint a run at a model the operator did not configure — the endpoint's own model
+  // is the only writer, applied after the fold below.
   "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "CLAUDE_CODE_AUTO_MODE_MODEL",
   // PRD #229 D10: the auto-mode classifier calls Anthropic's own service, so a bound
   // run would egress repo context to the very vendor the endpoint exists to replace.
   // Pinned here so a provisioned var cannot switch it back on.
@@ -207,18 +214,36 @@ export function buildSdkEnv(
   if (endpoint) {
     env.ANTHROPIC_BASE_URL = endpoint.base_url;
     env.ANTHROPIC_AUTH_TOKEN = endpoint.api_key;
-    // A gateway serves its own model ids, so the SDK's resolved default addresses a
-    // model it does not have and the request fails provider-side. Set only when the
-    // claim carries a slug, so an endpoint fronting Anthropic keeps default resolution.
+    // The endpoint's model, on every slot. A gateway that speaks the Messages shape
+    // need not serve Anthropic's model names, so leaving the slots alone sends
+    // "claude-opus-5-5" to a host that has never heard of it and the run dies on its
+    // first turn. One endpoint carries one model, so every slot names the same one:
+    // the lead, the subagents, the small/fast lane and the auto-mode classifier all
+    // resolve to the model the operator actually configured.
     if (endpoint.model) {
       env.ANTHROPIC_MODEL = endpoint.model;
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL = endpoint.model;
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL = endpoint.model;
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = endpoint.model;
+      env.ANTHROPIC_DEFAULT_FABLE_MODEL = endpoint.model;
+      env.ANTHROPIC_SMALL_FAST_MODEL = endpoint.model;
+      env.CLAUDE_CODE_SUBAGENT_MODEL = endpoint.model;
+      env.CLAUDE_CODE_AUTO_MODE_MODEL = endpoint.model;
+      // A third-party gateway does not run Anthropic's server-side safety check, so
+      // auto mode would deny every action needing a verdict without ever prompting.
+      // 0 routes the verdict to Claude Code's own client-side classifier instead.
+      env.CLAUDE_CODE_AUTO_MODE_SERVER = "0";
+      // The model id is unknown to Claude Code, so its context-window guesses misfire
+      // and compaction fires at the wrong point. Let the API's own rejection decide.
+      env.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = "1";
     }
     env.ANTHROPIC_API_KEY = undefined;
     env.CLAUDE_CODE_OAUTH_TOKEN = undefined;
     // The auto-mode classifier is a separate Anthropic-side call that survives the
     // base-URL override and is the one piece of run traffic a bound endpoint does not
     // carry. Off for the same trust reason as the token: a bound run sends nothing to
-    // Anthropic.
+    // Anthropic. Set unconditionally, not only when a model slug is present: an
+    // endpoint fronting Anthropic still must not receive the classifier call.
     env.CLAUDE_CODE_AUTO_MODE_SERVER = "0";
   }
   return env;

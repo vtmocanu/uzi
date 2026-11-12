@@ -273,6 +273,73 @@ describe("Go concurrency defaults (issue #3382)", () => {
     assert.equal(env.ANTHROPIC_API_KEY, undefined);
   });
 
+  it("PRD #229 D10: a bound endpoint pins its model onto every slot", () => {
+    // A gateway that speaks the Messages shape need not serve Anthropic's model names.
+    // Leaving the slots alone sends "claude-opus-5-5" to a host that has never heard of
+    // it, and the run dies on its first turn with an error naming the gateway rather
+    // than the missing setting. One endpoint carries one model, so every slot names it.
+    const endpoint = {
+      base_url: "https://gateway.example",
+      api_key: "dummy-endpoint-key-do-not-scan-4444",
+      model: "gateway-model-1",
+    };
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, undefined, undefined, undefined, endpoint);
+    for (const key of [
+      "ANTHROPIC_MODEL",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "ANTHROPIC_DEFAULT_FABLE_MODEL",
+      "ANTHROPIC_SMALL_FAST_MODEL",
+      "CLAUDE_CODE_SUBAGENT_MODEL",
+      "CLAUDE_CODE_AUTO_MODE_MODEL",
+    ]) {
+      assert.equal(env[key], "gateway-model-1", `${key} did not name the endpoint's model`);
+    }
+    // A third-party gateway never runs Anthropic's server-side safety check, so auto
+    // mode would deny every action needing a verdict without prompting. 0 routes the
+    // verdict to Claude Code's own client-side classifier.
+    assert.equal(env.CLAUDE_CODE_AUTO_MODE_SERVER, "0");
+    // The model id is unknown to Claude Code, so its window guesses misfire and
+    // compaction fires at the wrong point; let the API's own rejection decide.
+    assert.equal(env.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT, "1");
+  });
+
+  it("PRD #229 D10: a provisioned model slot cannot repoint a bound run", () => {
+    const endpoint = {
+      base_url: "https://gateway.example",
+      api_key: "dummy-endpoint-key-do-not-scan-4444",
+      model: "gateway-model-1",
+    };
+    const env = buildSdkEnv(
+      FAKE_OAUTH,
+      HOME_DIR,
+      { ANTHROPIC_MODEL: "attacker-model", ANTHROPIC_DEFAULT_OPUS_MODEL: "attacker-model" },
+      undefined,
+      undefined,
+      undefined,
+      endpoint,
+    );
+    assert.equal(env.ANTHROPIC_MODEL, "gateway-model-1");
+    assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, "gateway-model-1");
+  });
+
+  it("PRD #229 D10: a provisioned model slot cannot reach the SDK at all", () => {
+    // The case the protected-key set actually guards. When the endpoint carries a
+    // model, the post-fold assignment would win anyway; the protection matters for
+    // the shape where nothing overwrites — so this asserts the fold itself refuses
+    // the key, which is what keeps a provisioned var from ever naming a model.
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+      ANTHROPIC_MODEL: "attacker-model",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "attacker-model",
+      CLAUDE_CODE_AUTO_MODE_SERVER: "1",
+    });
+    assert.equal(Object.hasOwn(env, "ANTHROPIC_MODEL"), false);
+    assert.equal(Object.hasOwn(env, "ANTHROPIC_DEFAULT_SONNET_MODEL"), false);
+    assert.equal(Object.hasOwn(env, "CLAUDE_CODE_AUTO_MODE_SERVER"), false);
+  });
+
+
   it("PRD #229 D10: no endpoint bound leaves the env byte-identical to a subscription run", () => {
     const bare = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
     const explicitUndefined = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, undefined, undefined, undefined, undefined);

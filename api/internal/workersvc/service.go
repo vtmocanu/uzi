@@ -2338,8 +2338,23 @@ func (s *Service) SetForgeBaseURLAllowed(fn func(string) bool) { s.forgeBaseURLA
 // (PRD #229 D10). Call once at startup with the already-allowlist-checked
 // config.Config values. An empty baseURL leaves the feature off, so a deployment
 // that never configures it behaves exactly as before.
+//
+// model is the slug the endpoint serves and is carried on every claim bound to it.
+// It is not optional: a gateway that speaks the Messages shape need not serve
+// Anthropic's model names, and a run that sends one anyway fails on its first turn
+// with a provider error naming the gateway rather than the missing setting. Config
+// Load refuses that shape at boot, so an empty model here means a caller bypassed
+// Load — the endpoint is left unbound rather than shipping a claim that cannot work.
+//
+// apiKey gets the same treatment as model, and for the same reason. Config Load
+// refuses a URL without a key, but this setter is the second writer and a caller
+// that reaches it directly bypassed that refusal. Binding an endpoint with no
+// credential would ship every Claude run on this instance to a gateway that rejects
+// it on the first turn, with the subscription token already emptied out of the
+// claim — the run has no credential at all, which is strictly worse than the
+// feature being off.
 func (s *Service) SetAnthropicEndpoint(baseURL, apiKey, model string) {
-	if strings.TrimSpace(baseURL) == "" {
+	if strings.TrimSpace(baseURL) == "" || strings.TrimSpace(model) == "" || strings.TrimSpace(apiKey) == "" {
 		s.anthropicEndpoint = nil
 		return
 	}
