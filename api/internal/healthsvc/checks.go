@@ -1381,11 +1381,11 @@ func (s *Service) checkCustodyHolds(ctx context.Context, now time.Time) apitypes
 	}
 	switch {
 	case withDecisions == 0:
-		c.Action = strPtr("No owner decision is currently required; admission resumes when admission units settle.")
+		c.Action = strPtr("No owner decision is currently required; admission resumes when counted holds settle.")
 	case withoutDecisions == 0:
-		c.Action = strPtr("Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when admission units settle.")
+		c.Action = strPtr("Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle.")
 	default:
-		c.Action = strPtr("Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when admission units settle. Other at-limit owners need no decision; admission resumes when their admission units settle.")
+		c.Action = strPtr("Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle. Other at-limit owners need no decision; admission resumes when their counted holds settle.")
 	}
 	return c
 }

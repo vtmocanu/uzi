@@ -951,17 +951,17 @@ func TestCustodyHoldsAdvice(t *testing.T) {
 		action        string
 	}{
 		{"no decisions", [][]store.ListCustodyHoldsForOwnerRow{{active, capturing, ready}}, "0", "1",
-			"No owner decision is currently required; admission resumes when admission units settle."},
+			"No owner decision is currently required; admission resumes when counted holds settle."},
 		{"decisions counted once", [][]store.ListCustodyHoldsForOwnerRow{{decision, sourceOnly, guarded}}, "1", "0",
-			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when admission units settle."},
+			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle."},
 		{"mixed", [][]store.ListCustodyHoldsForOwnerRow{{decision, sourceOnly}, {active, capturing, ready}}, "1", "1",
-			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when admission units settle. Other at-limit owners need no decision; admission resumes when their admission units settle."},
+			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle. Other at-limit owners need no decision; admission resumes when their counted holds settle."},
 		{"SQL decision overrides raw labels", [][]store.ListCustodyHoldsForOwnerRow{{{State: "released", HasAvailableCapture: true, Attention: "active", DecisionNeeded: true}}}, "1", "0",
-			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when admission units settle."},
+			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle."},
 		// A hold from the terminal predecessor still needs a decision even when
 		// the same owner's newer run has an active hold.
 		{"terminal predecessor", [][]store.ListCustodyHoldsForOwnerRow{{sourceOnly, active}}, "1", "0",
-			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when admission units settle."},
+			"Owners with decision-bearing holds can discard or resolve those holds as appropriate (uzi run recovery). Admission resumes when counted holds settle."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := &fakeStore{}

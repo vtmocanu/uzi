@@ -192,6 +192,7 @@ func (f *unitsFixture) requireUnits(t *testing.T, want int64, holds []uuid.UUID,
 	t.Helper()
 	probe := f.seedRun("queued", 0)
 	now := time.Now()
+	wantLimit := int32(want) //nolint:gosec // G115: want is a handful of admission units in a fixture.
 	if got := f.count(t, now); got != want {
 		t.Fatalf("fn_custody_admission_count = %d, want %d", got, want)
 	}
@@ -214,11 +215,11 @@ func (f *unitsFixture) requireUnits(t *testing.T, want int64, holds []uuid.UUID,
 			t.Fatalf("hold %d reported same_run_group, want every hold a singleton", i)
 		}
 	}
-	adm := f.admission(t, probe, int32(want), now)
+	adm := f.admission(t, probe, wantLimit, now)
 	if adm.AdmissionCountedHolds != want || adm.OpenHolds != int64(len(holds)) || adm.RunHoldBoundReached || adm.OwnOpenHolds != 0 {
 		t.Fatalf("admission for the probe = %+v, want counted %d / open %d / no per-run bound", adm, want, len(holds))
 	}
-	for _, limit := range []int32{int32(want), int32(want) + 1} {
+	for _, limit := range []int32{wantLimit, wantLimit + 1} {
 		agg := f.aggregate(t, limit, now)
 		blocked := int64(0)
 		wantReason := ""
@@ -233,14 +234,14 @@ func (f *unitsFixture) requireUnits(t *testing.T, want int64, holds []uuid.UUID,
 		}
 	}
 	before := f.openHolds(t)
-	f.setLimit(int32(want))
+	f.setLimit(wantLimit)
 	if got, _ := f.claim(t); got != uuid.Nil {
 		t.Fatalf("claimed %s at limit %d = units, want refused", got, want)
 	}
 	if n := f.openHolds(t); n != before {
 		t.Fatalf("refused claim changed open holds %d -> %d", before, n)
 	}
-	f.setLimit(int32(want) + 1)
+	f.setLimit(wantLimit + 1)
 	if got, _ := f.claim(t); got != probe {
 		t.Fatalf("claimed %s at limit %d, want the probe %s admitted one above the units", got, want+1, probe)
 	}

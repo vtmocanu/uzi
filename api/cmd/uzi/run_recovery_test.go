@@ -1263,7 +1263,7 @@ func TestRunRecoveryHumanAdmissionColumn(t *testing.T) {
 	for hold, want := range map[string]string{
 		"hold-a": "-",
 		"hold-b": "counted (decision_needed)",
-		"hold-z": "not counted",
+		"hold-z": "not counted (live_claim)",
 	} {
 		var row []string
 		for _, line := range lines[1:] {

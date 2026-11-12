@@ -527,7 +527,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// excludes the pause, but it is NOT nudge-eligible on that tick: the whole backlog leaves the
 		// hold at once, and nudging here would burst a Slack DM per run right after the lift. Accepted
 		// trade-off (PRD #3454 D12): a run still stuck after the lift is not nudged until it
-		// clears to ok and flags again; only that later ok->flagged episode nudges.
+		// clears to ok and flags again; only that later ok->flagged episode nudges. Carve-out
+		// (issue #4162): a run leaving the hold straight into the per-run custody bound
+		// (enteredRunBound below) does nudge on that tick, because entry into that bound always
+		// nudges, subject to the cooldown.
 		leftMaintenance := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			r.HealthReason.String == reasonMaintenance && reason != reasonMaintenance
 		leftAdmission := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
@@ -541,10 +544,12 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// reasonCustodyLimit that the episode reconciler covers. A run that moves from any other
 		// waiting_worker reason into the bound reason starts a new nudge-eligible episode: the
 		// owner learns about a bound no earlier DM described. Entry from ok is already covered by
-		// the r.Health == healthOK term. A run already carrying the bound reason does not
+		// the r.Health == healthOK term. A run leaving account cooldown straight into the bound
+		// also nudges, by design: entry into the per-run bound always nudges, subject to the
+		// cooldown. A run already carrying the bound reason does not
 		// re-nudge, and the cooldown term below still applies.
 		enteredRunBound := reason == apitypes.ReasonCustodyRunHoldBound &&
-			!(r.HealthReason.Valid && r.HealthReason.String == apitypes.ReasonCustodyRunHoldBound)
+			(!r.HealthReason.Valid || r.HealthReason.String != apitypes.ReasonCustodyRunHoldBound)
 		nudge := target != healthOK && (r.Health == healthOK || leftPin || enteredRunBound || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
@@ -1334,7 +1339,7 @@ func (s *Service) queuedPrerequisiteReason(ctx context.Context, now time.Time, r
 	// claim gates on (GetCustodyAdmissionForRun: the owner's admission-counted holds and the same
 	// limit value, read once per tick into th), so the pill and the claim never disagree. Issue
 	// #1751 / ADR-1751: a CONTINUATION-EXEMPT run (claim_generation >= 1 and its own open-hold
-	// count at least 1 and below the limit, the SAME expression ClaimRun's custody clause uses) is
+	// count at least 1 and below the limit, logically equivalent under the hard per-run bound to ClaimRun's custody clause) is
 	// admitted at/over the cap, so it never gets the custody reason; a run already holding
 	// limit holds of its own is not exempt and gets the per-run bound reason
 	// (apitypes.ReasonCustodyRunHoldBound), which outranks the owner-level reason. #3150: there is no

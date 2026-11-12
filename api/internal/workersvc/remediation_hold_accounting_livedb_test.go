@@ -177,7 +177,7 @@ func (f *cncFixture) rhDrainLostClaims(t *testing.T, run uuid.UUID, limit int, f
 }
 
 // rhAssertRefusedQueued asserts the end state of arm (c): ClaimRun refuses at own holds = limit,
-// the run stays a plain queued run (not a park, not failed) and health names the custody cap.
+// the run stays a plain queued run (not a park, not failed) and health names the per-run bound reason.
 func (f *cncFixture) rhAssertRefusedQueued(t *testing.T, run uuid.UUID, limit int32, wantRequeue int32, predRows string, pred uuid.UUID) {
 	t.Helper()
 	if got := f.ownOpenHolds(t, run); got != int64(limit) {

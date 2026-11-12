@@ -20,7 +20,7 @@ import (
 
 func readContractFixture(t *testing.T, name string, into any) {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "fixtures", "api-contract", name))
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "fixtures", "api-contract", name)) //nolint:gosec // G304: test reads a fixed repo-relative fixture path
 	if err != nil {
 		t.Fatalf("read fixture %s: %v", name, err)
 	}

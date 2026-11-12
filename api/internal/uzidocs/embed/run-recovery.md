@@ -2031,10 +2031,13 @@ that run's own holds to free it).
 When the owner limit is reached, or when any of your queued runs has reached its own
 hold limit while you are still below the owner limit, the dashboard shows a full-width alert beneath the page
 heading with your custody admission unit use, how many held sources need a decision, how
-many runs are blocked, and a **Review held work** button; if you connected
-Slack, you also get one coalesced direct message per blocked episode (not one
+many runs are blocked, and, when at least one hold needs a decision, a
+**Review held work** button; if you connected Slack, then when the owner limit is
+reached you also get one coalesced direct message per blocked episode (not one
 per run) carrying your open-hold and blocked-run counts, a link to the surface,
-and the exact discard command. In the per-run case the alert says a queued run has reached
+and the exact discard command. A queued run that reaches its own bound instead gets
+a threaded per-run run-health nudge on entry (subject to the nudge cooldown; see
+[Slack](./slack.md)). In the per-run case the alert says a queued run has reached
 its own custody hold limit and points to `uzi run recovery <run>` and
 `uzi run discard <run> --hold <id>`; it does not mean the owner is at capacity, and only the
 affected runs wait. The per-worker **retaining work** pills stay as
@@ -2070,7 +2073,7 @@ section so you can see what is consuming capacity without needing a decision.
 **Counting toward the limit** lists the non-decision holds the server confirms
 it counts, each with its run link, claim generation, worker, and the reason it
 counts (for example, no live claim backs it). A run's generations on the same
-original worker (the current one included) count as one unit: one row is the counted representative and the others
+original worker (the current one included unless it backs a healthy live claim, which counts 0) count as one unit: one row is the counted representative and the others
 are listed under "Counted with another hold" with the label "Counted once with this run's
 other holds on the same worker" (`uzi run recovery` prints `not counted (same_run_group)`). These rows are read-only: this is
 visibility only, and adds no new way to release or discard custody and changes
