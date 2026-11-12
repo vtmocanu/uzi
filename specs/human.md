@@ -1300,7 +1300,7 @@ Accepted plan approved 2026-10-07; qualifies #1742 above. See [ADR-1742 amendmen
 
 ## Fix #4246 — Startup bare-repo lock waits
 
-- A startup run whose wait on the worker's local bare-repo lock expires before acquisition retries in fresh rounds within a small per-claim allowance (never on owner stop, shutdown or claim fence) and, if the lock is still busy, fails visibly keeping its clone and custody. (AI-synced 2026-11-12, #4246)
+- A startup run whose wait on the worker's local bare-repo lock expires before acquisition retries in fresh rounds within a small per-claim allowance (never after an owner cancel, a fired pause or credential-switch signal, shutdown or a claim fence) and, if the lock is still busy, fails visibly keeping its clone and custody. (AI-synced 2026-11-12)
 
 ## Feature #3859 — Bounded refusal loop for retained continuations
 

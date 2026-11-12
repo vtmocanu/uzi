@@ -1263,20 +1263,26 @@ and never inside `withLock`.
 
 Accepted risks:
 
-- A server wall park only seeds a pause request, so it may be retried once
-  before its signal fires (bounded by the post-backoff stop check).
-- Each retried round advances the denial revision permanently; no captured
+- A pause seeded at claim time (`seedPauseRequested`, e.g. a server wall
+  park) aborts no signal, and `launchStop` does not read the pause mode, so
+  such a run may be retried up to the per-claim allowance before the
+  executor observes the pause at its first loop boundary.
+- Each failed round advances the denial revision permanently; no captured
   revision outlives its round.
 - A cancelled round may leave a clearable latch; a later verified read clears
   it or teardown holds it.
 - Worst-case authority occupancy is `(2 + RETAINED_DISCOVERY_RETRIES) *
   codexBoundaryDeadlineMs`, cumulative across both sites, never continuous.
-- The clone-retention restore resets the whole flag. This is safe because no
-  latch-free writer of it runs during a launch round.
+- The clone-retention restore resets the whole flag. It relies on no
+  latch-free writer of that flag running during a launch round; the writers on
+  the launch path were reviewed, but no test pins this.
 
 State is process-local; this amendment adds no storage-loss or power-loss
 durability guarantee.
 
 The focused "#4246" cases in
 [runner-remediation-bootstrap.test.ts](../agent/test/runner-remediation-bootstrap.test.ts)
-cover the retry rule, exhaustion, the sticky exceptions and clone retirement.
+cover the deadline retry, the cancel, pause, credential-switch, shutdown and
+claim-fence stops, unknown and early-timer aborts, exhaustion, the sticky
+exceptions and clone retirement. The terminal-lifecycle stop and a shorter
+parent deadline are covered by code review only.
