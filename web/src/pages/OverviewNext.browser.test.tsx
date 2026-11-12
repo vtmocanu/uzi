@@ -205,6 +205,32 @@ describe("OverviewNext issue work line", () => {
     });
   }
 
+  // #4167: an older run's stale "opened" must not put a merged PR at the PR open station.
+  for (const width of [1280, 375]) {
+    it(`leaves a PR merged per its newest run off the PR open station at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mockApi.listRuns.mockResolvedValue({
+        runs: [
+          aRun({ id: "stale", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "opened", finished_at: "2026-11-08T00:00:00Z" }),
+          aRun({ id: "merged", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "merged", finished_at: "2026-11-09T00:00:00Z" }),
+          aRun({ id: "open", status: "completed", issue_iid: 3700, mr_iid: 4200, mr_state: "opened", finished_at: "2026-11-09T00:00:00Z" }),
+        ],
+      });
+      render(
+        <MemoryRouter initialEntries={["/overview/next"]}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+            <OverviewNext />
+          </main>
+        </MemoryRouter>,
+      );
+      const card = await screen.findByRole("region", { name: "Issue work" });
+      const station = card.querySelector(`[data-stage="pr"]`) as HTMLElement;
+      await expect.poll(() => station.textContent ?? "").toContain("#3700");
+      expect(window.innerWidth).toBe(width);
+      expect(station.textContent ?? "").not.toContain("#3644");
+    });
+  }
+
   it("stops the flowing segments under prefers-reduced-motion", async () => {
     // The stylesheet is the contract: a media rule for reduced motion must set animation
     // none on .issue-line-flow. (Walks every sheet; a cross-origin sheet cannot be read.)
