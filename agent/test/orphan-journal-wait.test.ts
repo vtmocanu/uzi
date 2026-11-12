@@ -222,8 +222,9 @@ it("orphan journal reread: cancellation leaves the queued read inert and owner b
     if (++reads === 2) queued.resolve();
     return real(...args);
   });
-  const internals = git as unknown as { readRecoveryCapture(...args: unknown[]): Promise<unknown> };
-  const materialize = t.mock.method(internals, "readRecoveryCapture");
+  // The orphan fence read goes through readJournalFor, whose single journal read is resolveBranchJournalUnderLock.
+  const internals = git as unknown as { resolveBranchJournalUnderLock(...args: unknown[]): Promise<unknown> };
+  const materialize = t.mock.method(internals, "resolveBranchJournalUnderLock");
   const attempt = f.attempt();
   attempt.catch(() => undefined);
   try {
@@ -254,8 +255,9 @@ it("orphan journal reread: the remaining handoff allowance bounds an already que
     if (++reads === 2) queued.resolve();
     return real(...args);
   });
-  const internals = git as unknown as { readRecoveryCapture(...args: unknown[]): Promise<unknown> };
-  const materialize = t.mock.method(internals, "readRecoveryCapture");
+  // The orphan fence read goes through readJournalFor, whose single journal read is resolveBranchJournalUnderLock.
+  const internals = git as unknown as { resolveBranchJournalUnderLock(...args: unknown[]): Promise<unknown> };
+  const materialize = t.mock.method(internals, "resolveBranchJournalUnderLock");
   const attempt = f.attempt();
   let rejected: unknown;
   const settled = attempt.catch(error => { rejected = error; });

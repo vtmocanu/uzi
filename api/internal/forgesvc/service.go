@@ -432,7 +432,7 @@ func (s *Service) recordFindingGroupMatches(ctx context.Context, repoID uuid.UUI
 // never triggers the fetch. Operations on other pages are matched as FullSync
 // rotates to them. A failed fetch returns errFindingGroupScanIncomplete with
 // nothing recorded, so every claim stays.
-func (s *Service) reconcileFindingGroupMarkers(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, pending []store.FindingGroupClaimOperation) error {
+func (s *Service) reconcileFindingGroupMarkers(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.IssueTracker, pending []store.FindingGroupClaimOperation) error {
 	if s.groupDB == nil {
 		return nil
 	}
@@ -509,7 +509,7 @@ func (s *Service) ForgeForConnection(forgeType, baseURL string, tokenCiphertext 
 // partially change remote labels before returning an error. No compensation is
 // attempted. The returned issue is the re-cached row. Caller guards own closed
 // issue and manual-drag policy.
-func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error) {
+func (s *Service) AutoMove(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error) {
 	var current []string
 	if err := json.Unmarshal(issue.Labels, &current); err != nil {
 		current = []string{}
@@ -582,7 +582,7 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 // success updates the cache: apply uses a current-row delta, removal uses
 // RemoveCachedIssueLabel and never inserts a missing row. A forge error leaves
 // the cache untouched, but remote labels may have partially changed.
-func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, label, color string, apply bool) (store.Issue, error) {
+func (s *Service) SetIssueLabel(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue, label, color string, apply bool) (store.Issue, error) {
 	var current []string
 	if err := json.Unmarshal(issue.Labels, &current); err != nil {
 		current = []string{}
@@ -777,7 +777,7 @@ func (m Marks) Advance(next Marks) Marks {
 // forge error. There is deliberately no "the extra fetch is best-effort, log and
 // continue" path: a soft-fail would also report a mark for a window nobody read
 // (Decision 11a).
-func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (Marks, error) {
+func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.IssueTracker) (Marks, error) {
 	pendingGroups, finishGroups, advanceGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
 	defer finishGroups()
 	if pendingErr != nil {
@@ -893,7 +893,7 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 // misconfig ValidateMerged forbids): those issues are already covered by the uzi
 // fetch, so a third round trip would be pure duplicate work. Its mark then never
 // advances, which is correct — an unissued fetch is no evidence.
-func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, m Marks) (Marks, error) {
+func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.IssueTracker, m Marks) (Marks, error) {
 	_, finishGroups, _, pendingErr := s.pendingFindingGroups(ctx, repoID)
 	defer finishGroups()
 	if pendingErr != nil {

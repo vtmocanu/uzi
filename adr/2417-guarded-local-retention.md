@@ -6,8 +6,9 @@
 
 ## Amendment 2026-11-04: operator resolution of guarded local records (#3885)
 
-**Status**: Accepted for Case A. Case B is proposed, not accepted and not
-implemented (next section).
+**Status**: Accepted and implemented for Case A. Case B was accepted and
+implemented afterwards, see the
+[2026-11-10 Case B amendment](#amendment-2026-11-10-case-b-local-record-disposition-3885).
 
 A worker-local operator command now retires a guarded local recovery
 generation whose closed hold is backed by this record's own receipt or
@@ -20,7 +21,7 @@ on the retained-source channel (`local-records`, `resolve-local-record`) in
 `agent/src/recovery.ts`. Operator steps are in
 [Recovery docs](../docs/run-recovery.md).
 
-**Case A only.**
+**Case A (this amendment as first accepted).**
 
 - **A1**: the FINAL ACK is already persisted and the exact closed hold was
   released with a receipt matching the saved FINAL request (an ACK with a
@@ -84,25 +85,166 @@ ownership.
 
 Predecessor settlement (see the [ADR-1296 amendment](1296-durable-run-recovery.md#amendment-2969-predecessor-guarded-hold-settlement-is-built-and-disabled-in-production)) adds no cleanup authority. If a predecessor FINAL is ever ACKed while a later generation executes, the older generation's local records are not retired in that pass: they are retired by the ordinary `resumeInventory` / `forgetGenerationWithinCycle` path after the flight, and while the run executes the record is protected as `source_protected`. The covering-ACK rule above and the C1b/C2 pin boundaries ([ADR-3591](3591-prerequisite-closure.md)) are unchanged, and a pin still authorizes no local retirement. Custody accounting ([ADR-2445](2445-custody-admission-accounting.md)) and merged-predecessor discard ([ADR-2506](2506-merged-predecessor-discard.md)) are untouched. The pass is disabled in production, so no predecessor record is currently affected.
 
-## Proposed (not accepted): Case B local-record disposition (#3885)
+## Amendment 2026-11-10: Case B local-record disposition (#3885)
 
-Not accepted and not implemented. Today a generation in Case B refuses
-(typically `case_b_pending_owner_review`; the first failing check wins), and issue #3885 stays open for it. This section
-records the contract a later owner ruling would have to meet.
+**Status**: Accepted and implemented in the worker. This records implemented
+behavior, not live or deployment acceptance. Decisions on
+[#3885](https://github.com/vtmocanu/uzi/issues/3885):
+[2026-11-05](https://github.com/vtmocanu/uzi/issues/3885#issuecomment-6665697763),
+[2026-11-06](https://github.com/vtmocanu/uzi/issues/3885#issuecomment-6692111919),
+and the
+[2026-11-10 reconfirmation](https://github.com/vtmocanu/uzi/issues/3885#issuecomment-6762744472).
+This replaces the earlier "proposed, not accepted" section. Operator steps are
+in [Recovery docs](../docs/run-recovery.md#resolving-guarded-local-records).
 
-Case B is a guarded record whose closed hold is discarded, or was released
-without this record's matching ACK or receipt. Neither is preservation proof for
-this record. A later disposition would require all of:
+Case B is a generation where no record has `finalAcknowledged` and the closed
+hold is no preservation proof for the record: the hold was discarded, or it was
+released without a receipt matching the saved FINAL (or no FINAL was saved).
+The operator command can now retire that generation's **local records and
+bundles only**, on an explicit per-request confirmation. It adds no endpoint,
+schema, privilege or server authority, never synthesizes `finalAcknowledged`,
+and never converts abandonment into archive evidence.
 
-- an explicit owner-confirmed disposition bound to the exact
-  owner, repository, run, generation and original worker, and to the inspected
-  record and source descriptor;
-- fresh authoritative exact closed-hold and terminal-lifecycle evidence;
-- the existing source, consumer and process reproof before any deletion.
+### Classification and eligibility
 
-It would never synthesize `finalAcknowledged`, never convert abandonment into
-archive evidence, and never treat a closed observation as automatic deletion
-authority. Pins stay, and terminal protection stays.
+`local-records` classifies a Case B generation as `case_b_owner_discard` (hold
+discarded, `release_evidence` `owner_discard`) or `case_b_released_mismatch`
+(released without a receipt matching the saved FINAL, or with no saved FINAL).
+Only a generation in which no record has `finalAcknowledged` qualifies, in one
+of three shapes: (a) one saved FINAL with a persisted non-matching settlement;
+(b) one saved FINAL whose fresh exact read is discarded or released-mismatched;
+(c) no saved FINAL and exactly one guarded frozen aggregate. A replay-refused
+anchor (`final_retry_refused`, `credential_rejected`) qualifies only with a
+persisted non-matching settlement; otherwise `replay_refused_persisted` stays.
+The Case A names are unchanged except that `case_b_pending_owner_review` no
+longer exists: an acknowledged generation whose exact hold is discarded or
+mismatched is now `ack_evidence_inconsistent`.
+
+### Confirmation contract
+
+The digest binds a distinct Case B domain (`retained-local-record-case-b-v1`),
+the run, generation, class, hold and repo ids, the anchor and server capture
+ids, the immutable fields of the fresh exact observation (state, release
+evidence, receipt, completed-publication receipt, guarded flag, run status,
+original worker identity), the bare repository's
+`dev:ino` and refs, the record-directory names, the settlement names, a hash of
+**every** authenticated record of the run (not only this generation's), the
+source-evidence descriptor and the `laterCleanup` list. Resolve recomputes it
+under the journal lock and refuses `descriptor_changed` on any drift.
+
+Each request must carry `--case-b` (`action: "case_b"`). A Case B digest
+without it is refused `case_b_disposition_required`; the flag on a Case A
+generation is refused `case_b_action_mismatch`; any other action value is
+`invalid_request`. A worker without this change answers `invalid_request`.
+
+### Owner binding (amends "exact owner")
+
+The earlier proposal required a disposition "bound to the exact owner". The
+local socket proves pod access, not owner identity, and the worker-side
+`RecoveryExactHold` has no owner field. The binding is therefore: the run id,
+plus the server's owner- and run-authorized, original-worker-scoped exact read
+of the hold (the existing `getExactRecoveryHold` with the persisted
+`exactHoldBinding`). The deployment operator confirms each request on the
+owner's behalf. A server `owner_discard` event alone, or a stale digest, never
+authorizes anything. For an owner-discarded source the owner has accepted
+abandonment of dirty or unpublished local work; for a released mismatch no bytes
+are treated as abandoned. Case B removes no tree bytes either way.
+
+### Refusals
+
+Case B adds these refusals on top of the shared ones.
+
+- `run_hold_open`: any open hold of the run at any generation, including a
+  run-wide `run_open_holds` count above zero. Case A keeps its own-generation
+  `hold_open` check. `holds_unknown` also covers an absent or malformed
+  run-wide count: absent is never zero.
+- `settlement_evidence_inconsistent`: a persisted settlement disagrees with the
+  fresh read on the immutable fields.
+- `policy_discard_retained`: a `merged_predecessor_discard` outcome, even
+  confirmed. `case_b_discard_evidence_unsupported`: any other discard evidence.
+- Source evidence (next section), and
+  `inventory_source_not_quiescent:<check>` from the source boundary.
+
+### Source-evidence gate
+
+Case B needs two reads: the clone inventory with per-clone identity, and the
+worker-wide retained-source inspection filtered to this run and bare.
+Authority is conservative: the inventory must be verified; the inspection must
+report `partial === false` and `unreadable === 0`. `partialCauses` is
+diagnostic only and is never consulted for eligibility or the descriptor. A
+malformed shape is `source_evidence_incomplete`; no evidence reader is
+`source_evidence_unavailable`; no clone and no retained source for the run is
+`source_evidence_empty`; a source or part not present is `source_missing`;
+inventory and inspection naming different clone sets is
+`source_enumeration_mismatch`; any `blocker:` consumer is
+`source_not_exclusive:<blocker>`. The run's own local records are never a
+blocker. The descriptor (clone path, branch, head, `dev:ino`, retained-source
+shape, consumers) is bound into the digest.
+
+### Order and failure model
+
+Order: channel claim gate, authority A, capture cycle C (`skip`), journal
+pre-check J (released), the inventory source boundary S in record-disposition
+mode, J again with a fresh full re-assessment and digest equality, the source
+proof, then the first mutation. The proof keeps the execution tail and
+reservation, the live-attempt path check, quiescence before and after, and the
+clone identity (path, branch, HEAD, `dev:ino`) equal to what describe bound. It
+skips only the worktree cleanliness check, because the tree is left in place.
+
+Deletion order: canonical bundles, records without a binding, other
+binding-carrying records, the anchor last, then a nonrecursive `rmdir` if the
+run directory is empty. Quarantine and executing state, a pending generation
+report and terminal protection are re-read before every unlink. Client
+cancellation is honoured only before the first unlink; after it, failures
+return `partial`. It never deletes tree bytes, refs, pins, server archives,
+other generations' data or unbound files, and never releases, uploads or ACKs.
+
+Failure model: abrupt process kill only, verified by real `SIGKILL` of a child
+worker at each distinct on-disk state (every unlink) of three Case B
+owner-discard worlds
+(`agent/test/recovery-local-record-restart.test.ts`). Every surviving state
+re-describes as the same class; the digest changes once any file was removed
+(the old digest is then refused `descriptor_changed`) and is unchanged if
+nothing was removed; `not_found` once the anchor is gone. Storage or power loss is unspecified (rename-atomic, not
+fsynced). There is no autonomous retry: a fresh describe, a fresh confirmation
+and `--case-b` are required.
+
+### Retained classes
+
+These stay refused even when confirmed: merged-predecessor discard
+(`policy_discard_retained`); any generation (including a released mismatch) whose anchor has no
+persisted hold binding, or whose saved FINAL has an archive disposition with a
+missing or mismatched `serverCaptureId` (`binding_missing`, raised by the
+classification shared with Case A);
+`source_evidence_empty`; and a replay-refused anchor without a persisted
+settlement (`replay_refused_persisted`). A record that fails its MAC refuses the
+whole run (`record_unverified`).
+
+### Consequences
+
+- **Later-generation cleanup.** Retiring generation N can change a later
+  generation M's ACK-cleanup state (for example `pending` to `acknowledged`).
+  Describe lists this as `laterCleanup: [{generation, before, after}]`, and the
+  list is in the digest. The request never retires M. The existing autonomous ACK
+  cleanup, or a Case A resolve, may retire M afterwards.
+- **Per-pass RPC.** Pins stay, so each later maintenance pass may spend one
+  holds-list call on N's leftover owed contexts. This cost is expected from the
+  design and has not been measured.
+- **Follow-on source disposal.** After retirement `inspect` may show
+  `local_discard`: the existing epoch path reclaims only if its own predicates
+  pass, and that path runs only on the one opted-in canary worker, if any. Or it may show
+  `local_protected_discard`, which the epoch deletion recheck refuses; the
+  ordinary operator `discard --protected` runs its own checks. Record
+  retirement guarantees neither outcome and grants no source disposal.
+- **Known limit.** The completeness inspection covers every repository on the
+  worker within the inspect budget. A large or unreadable unrelated retained
+  source can make every Case B request refuse `source_evidence_incomplete`.
+
+### Boundaries
+
+This does not implement #4007's automatic reclamation, and it does not clear
+Git journals or recovery-owner metadata. Terminal protection, settlement-root
+entries and pins stay. The Case A behavior above is unchanged.
 
 ## Amendment 2026-10-29 — C1b pins do not authorize local retirement (#3591)
 

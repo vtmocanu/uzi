@@ -4,16 +4,24 @@ import type { ClientRequest, IncomingMessage, RequestOptions } from "node:http";
 export type PodEpochDaemonReason = "daemon_endpoint" | "daemon_aborted" | "daemon_deadline" |
   "daemon_timeout" | "daemon_transport" | "daemon_response" | "daemon_body_limit" |
   "daemon_inventory" | "daemon_predicate" | "daemon_event" | "daemon_event_invalid" |
-  "daemon_events_closed" | "daemon_closed";
+  "daemon_events_closed" | "daemon_closed" | "daemon_changed";
 export class PodEpochDaemonError extends Error {
   constructor(readonly reason: PodEpochDaemonReason) {
     super(reason); this.name = "PodEpochDaemonError";
   }
 }
+/** Bind-mount sources the barrier's own inspection saw, or `unknown` when any container's mount
+ * data was not in the shape this reader fully understands (the scratch phase then refuses). */
+export type PodEpochBindSources = { state: "read"; sources: string[] } | { state: "unknown" };
 export interface PodEpochDaemonGuard {
   readonly signal: AbortSignal;
   assertHealthy(): void;
   close(): Promise<void>;
+  /** Optional so existing fakes still type-check; the real barrier always provides both. */
+  bindSources?(): PodEpochBindSources;
+  /** Re-lists and re-inspects every container through the same allowlist and predicates; any
+   * change in the id set, a container State or a bind-source set vetoes with `daemon_changed`. */
+  refreshInventory?(): Promise<void>;
 }
 export interface PodEpochDaemonBarrierOptions {
   dockerHost: string;
@@ -44,6 +52,46 @@ function endpoint(host: string): RequestOptions {
 }
 function id(v: unknown): v is string {
   return typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
+}
+const BIND_LIMIT = 256;
+/** What the inspection says about one container's bind sources. `unknown` is sticky evidence the
+ * shape was not fully understood: a non-array Mounts, a bind without a string Source, Binds that
+ * is neither null nor an array of strings. Named volumes (a non-absolute Binds source) are ignored. */
+function bindSourcesOf(inspected: Record<string, unknown>, hostConfig: Record<string, unknown>):
+    { sources: string[]; unknown: boolean; entries: number } {
+  const sources: string[] = [];
+  let unknown = false;
+  let entries = 0;
+  const mounts = inspected.Mounts;
+  if (!Array.isArray(mounts)) unknown = true;
+  else for (const m of mounts) {
+    entries++;
+    if (!record(m)) { unknown = true; continue; }
+    if (m.Type !== "bind") continue;
+    if (typeof m.Source === "string") sources.push(m.Source); else unknown = true;
+  }
+  const hostMounts = hostConfig.Mounts;
+  if (hostMounts !== undefined && hostMounts !== null) {
+    if (!Array.isArray(hostMounts)) unknown = true;
+    else for (const m of hostMounts) {
+      entries++;
+      if (!record(m)) { unknown = true; continue; }
+      if (m.Type !== "bind") continue;
+      if (typeof m.Source === "string") sources.push(m.Source); else unknown = true;
+    }
+  }
+  const binds = hostConfig.Binds;
+  if (binds !== undefined && binds !== null) {
+    if (!Array.isArray(binds)) unknown = true;
+    else for (const b of binds) {
+      entries++;
+      if (typeof b !== "string") { unknown = true; continue; }
+      if (!b.startsWith("/")) continue;
+      const colon = b.indexOf(":");
+      sources.push(colon < 0 ? b : b.slice(0, colon));
+    }
+  }
+  return { sources, unknown, entries };
 }
 function stopped(v: unknown): boolean {
   return record(v) && v.Running === false && v.Restarting === false && v.Paused === false &&
@@ -183,6 +231,71 @@ export async function openPodEpochDaemonBarrier(
     })();
     return closed;
   };
+  type Seen = { state: string; sources: string[]; unknown: boolean; entries: number };
+  /** One full list-and-inspect pass; the first runs at open, later ones from refreshInventory. */
+  const scan = async (): Promise<Map<string, Seen>> => {
+    const containers = await get("/containers/json?all=1");
+    if (!Array.isArray(containers) || containers.length > 500) fail("daemon_inventory");
+    const ids = new Set<string>();
+    for (const entry of containers) {
+      if (!record(entry) || !id(entry.Id) || ids.has(entry.Id)) fail("daemon_inventory");
+      if (entry.State !== "exited" && entry.State !== "created") fail("daemon_predicate");
+      ids.add(entry.Id);
+    }
+    // Four workers consume the bounded inventory lazily. A veto aborts siblings;
+    // all workers settle before the error escapes (no early Promise.all rejection).
+    const list = [...ids];
+    const seen = new Map<string, Seen>();
+    let next = 0;
+    const workers = Array.from({ length: Math.min(4, list.length) }, async () => {
+      try {
+        while (next < list.length) {
+          assertHealthy();
+          const containerID = list[next++]!;
+          const inspected = await get(`/containers/${encodeURIComponent(containerID)}/json`);
+          if (!record(inspected) || inspected.Id !== containerID) fail("daemon_inventory");
+          if (!stopped(inspected.State) || !record(inspected.HostConfig) ||
+              !record(inspected.HostConfig.RestartPolicy) ||
+              inspected.HostConfig.RestartPolicy.Name !== "no") fail("daemon_predicate");
+          seen.set(containerID, { state: String((inspected.State as Record<string, unknown>).Status),
+            ...bindSourcesOf(inspected, inspected.HostConfig) });
+        }
+      } catch (error) {
+        veto(error instanceof PodEpochDaemonError ? error.reason : "daemon_transport");
+        throw error;
+      }
+    });
+    const results = await Promise.allSettled(workers);
+    assertHealthy();
+    if (results.some(result => result.status === "rejected")) fail("daemon_inventory");
+    return seen;
+  };
+  const signature = (seen: Map<string, Seen>): string => JSON.stringify([...seen].sort(([a], [b]) => a < b ? -1 : 1)
+    .map(([key, v]) => [key, v.state, v.unknown, [...v.sources].sort()]));
+  let baseline: Map<string, Seen> | undefined;
+  const bindSources = (): PodEpochBindSources => {
+    if (!baseline) return { state: "unknown" };
+    const all = new Set<string>();
+    let total = 0;
+    for (const v of baseline.values()) {
+      if (v.unknown) return { state: "unknown" };
+      total += v.entries;
+      for (const source of v.sources) all.add(source);
+    }
+    return total > BIND_LIMIT ? { state: "unknown" } : { state: "read", sources: [...all].sort() };
+  };
+  const refreshInventory = async (): Promise<void> => {
+    try {
+      assertHealthy();
+      const before = baseline ? signature(baseline) : undefined;
+      const again = await scan();
+      assertHealthy();
+      if (before === undefined || signature(again) !== before) fail("daemon_changed");
+    } catch (error) {
+      veto(error instanceof PodEpochDaemonError ? error.reason : "daemon_transport");
+      throw reason;
+    }
+  };
   try {
     const ping = await body(await request("/_ping"), 16);
     if (ping.toString("utf8") !== "OK") fail("daemon_response");
@@ -230,37 +343,7 @@ export async function openPodEpochDaemonBarrier(
     const info = await get("/info");
     if (!record(info) || !record(info.Swarm) || info.Swarm.LocalNodeState !== "inactive" ||
         info.LiveRestoreEnabled !== false) fail("daemon_predicate");
-    const containers = await get("/containers/json?all=1");
-    if (!Array.isArray(containers) || containers.length > 500) fail("daemon_inventory");
-    const ids = new Set<string>();
-    for (const entry of containers) {
-      if (!record(entry) || !id(entry.Id) || ids.has(entry.Id)) fail("daemon_inventory");
-      if (entry.State !== "exited" && entry.State !== "created") fail("daemon_predicate");
-      ids.add(entry.Id);
-    }
-    // Four workers consume the bounded inventory lazily. A veto aborts siblings;
-    // all workers settle before the error escapes (no early Promise.all rejection).
-    const list = [...ids];
-    let next = 0;
-    const workers = Array.from({ length: Math.min(4, list.length) }, async () => {
-      try {
-        while (next < list.length) {
-          assertHealthy();
-          const containerID = list[next++]!;
-          const inspected = await get(`/containers/${encodeURIComponent(containerID)}/json`);
-          if (!record(inspected) || inspected.Id !== containerID) fail("daemon_inventory");
-          if (!stopped(inspected.State) || !record(inspected.HostConfig) ||
-              !record(inspected.HostConfig.RestartPolicy) ||
-              inspected.HostConfig.RestartPolicy.Name !== "no") fail("daemon_predicate");
-        }
-      } catch (error) {
-        veto(error instanceof PodEpochDaemonError ? error.reason : "daemon_transport");
-        throw error;
-      }
-    });
-    const results = await Promise.allSettled(workers);
-    assertHealthy();
-    if (results.some(result => result.status === "rejected")) fail("daemon_inventory");
+    baseline = await scan();
     const volumes = await get("/volumes");
     if (!record(volumes) || !Array.isArray(volumes.Volumes) || volumes.Volumes.length > 500)
       fail("daemon_inventory");
@@ -274,7 +357,7 @@ export async function openPodEpochDaemonBarrier(
     for (const plugin of plugins)
       if (!record(plugin) || plugin.Enabled !== false) fail("daemon_predicate");
     assertHealthy();
-    return { signal: controller.signal, assertHealthy, close };
+    return { signal: controller.signal, assertHealthy, close, bindSources, refreshInventory };
   } catch (error) {
     veto(error instanceof PodEpochDaemonError ? error.reason : "daemon_transport");
     await close();

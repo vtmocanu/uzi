@@ -2006,6 +2006,9 @@ export interface CodexExecutorOptions {
    *  per-run `homeRoot`. Defaults to `path.dirname(provisionHomeDir)/provision` when
    *  omitted (parity with SdkExecutor). */
   readonly provisionRoot?: string;
+  /** issue #3644: the per-attempt provision directory name under `provisionRoot` (`<runId>.g<N>` for a restore's successor);
+   *  absent = `<runId>`. */
+  readonly dirKey?: string;
   /**
    * PRD #1493 M3: the command-sandbox enforcement mode this worker was configured
    * with (`config.codexCommandSandbox`). Threaded into `commandSandboxArgv` as the
@@ -3379,6 +3382,7 @@ export class CodexExecutor implements Executor {
         try {
           return await provisionRunToolsFn(ctx, {
             provisionRoot: this.provisionRoot, homeDir: this.provisionHomeDir, log: this.log,
+            ...(this.opts.dirKey === undefined ? {} : { dirKey: this.opts.dirKey }),
             provision: (input, deps) => {
               provisionGuard();
               const source = { ...process.env };

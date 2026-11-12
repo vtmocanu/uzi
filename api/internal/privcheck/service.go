@@ -46,7 +46,7 @@ func NewService(q Store, forges ForgeBuilder) *Service {
 // client (the save-time path in CreateConnection, which holds the plaintext
 // token and the bot identity). It makes at most one forge call (TokenInfo) and
 // persists nothing — the caller decides whether the violations block the save.
-func (s *Service) CheckToken(ctx context.Context, f forge.Forge, forgeType forge.Type, isAdmin bool) TokenReport {
+func (s *Service) CheckToken(ctx context.Context, f forge.CodeHost, forgeType forge.Type, isAdmin bool) TokenReport {
 	return s.checker.CheckToken(ctx, f, forgeType, isAdmin, s.now())
 }
 
@@ -55,7 +55,7 @@ func (s *Service) CheckToken(ctx context.Context, f forge.Forge, forgeType forge
 // StatusError report (so the badge reflects the problem) rather than a returned
 // error; only a genuine DB error (repo list, report write) returns an error.
 func (s *Service) CheckConnection(ctx context.Context, conn store.ForgeConnection) (Report, error) {
-	f, err := s.forges.ForgeForConnection(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
+	f, err := s.codeHostFor(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
 	if err != nil {
 		// Token can't be decrypted (key rotated) or the client won't build: record
 		// it, don't crash the sweep.
@@ -145,7 +145,7 @@ func (s *Service) GuardrailImpact(ctx context.Context) (ImpactReport, error) {
 		// at either step is not fatal: it marks every one of this connection's repos
 		// unevaluable (we could not read the forge to tell), never blocked and never
 		// safe.
-		f, buildErr := s.forges.ForgeForConnection(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
+		f, buildErr := s.codeHostFor(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
 		var (
 			botUserID int64
 			connErr   = buildErr
@@ -197,7 +197,7 @@ func (s *Service) GuardrailImpact(ctx context.Context) (ImpactReport, error) {
 // blocking set is the push/merge fields only) so that a repo whose forge
 // round-trips error is counted unevaluable exactly as the live gate would be
 // unable to clear it.
-func (s *Service) impactForRepo(ctx context.Context, f forge.Forge, botUserID int64, repo Repo) (blocked, ok bool) {
+func (s *Service) impactForRepo(ctx context.Context, f forge.CodeHost, botUserID int64, repo Repo) (blocked, ok bool) {
 	if repo.DefaultBranch == "" {
 		return false, false
 	}
@@ -254,7 +254,7 @@ type GuardResult struct {
 // Callers: the repo-enable gate (handler.SetRepoEnabled, M4). The run-create
 // service inserts and the claim backstop wire in at M5/M6.
 func (s *Service) GuardRepo(ctx context.Context, in GuardInput) GuardResult {
-	f, err := s.forges.ForgeForConnection(in.ForgeType, in.BaseURL, in.TokenCiphertext)
+	f, err := s.codeHostFor(in.ForgeType, in.BaseURL, in.TokenCiphertext)
 	if err != nil {
 		// Client won't build (token undecryptable, key rotated, misconfigured): we
 		// cannot read the forge, so we cannot clear the bot. Fail closed. The message
@@ -343,4 +343,14 @@ type SweepResult struct {
 	Violations   int
 	ReportErrors int // checked, but the report itself is StatusError
 	Errors       int // could not check at all (DB error persisting)
+}
+
+// codeHostFor builds the connection's driver and narrows it to the CodeHost
+// half, the only half the privilege checks use.
+func (s *Service) codeHostFor(forgeType, baseURL string, tokenCiphertext []byte) (forge.CodeHost, error) {
+	f, err := s.forges.ForgeForConnection(forgeType, baseURL, tokenCiphertext)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }

@@ -346,6 +346,14 @@ the worker is under an active secret-scan remediation record (issue #4058): the
 agent did not start, nothing was adopted, and neither quiescence nor adoption was
 attempted. See the remediation paragraph in [Run recovery](run-recovery.md).
 
+It also holds a run whose predecessor an independent restore does not support (a
+canonical-path predecessor, a predecessor met by a hosted worker, or one with no boundary record, when the
+earlier checks pass): the worker refused before any source effect, so nothing was
+adopted, no adoption blocker was recorded and no quiescence was proven. Resume holds
+again on the same release; an owner-held hosted run blocks its worker's ordinary image
+roll until you cancel or discard it. See
+[Run recovery](run-recovery.md#when-a-restarted-worker-continues-from-a-saved-pin-independent-restore).
+
 1. Read `uzi run recovery <id>` and export an available archive before deciding;
    an earlier archive may omit the latest local work.
 2. Choose `uzi run resume <id>` to request another bounded attempt, or
@@ -1285,7 +1293,7 @@ historical-evidence rules above remain in force.
   `retained_recovery_exhausted` has bounded timed retries followed by an owner
   hold (a capacity-only window is held for the owner below the cap); see [Retained recovery exhausted](#retained-recovery-exhausted).
   `retained_recovery_adoption_failed` instead requires owner Resume or Cancel,
-  with no automatic retry; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
+  with no automatic retry, including for an unsupported restore predecessor; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
   `retained_continuation_unwitnessed` is likewise owner Resume or Cancel with no
   automatic retry; see [Unwitnessed continuation hold](#unwitnessed-continuation-hold).
 - `limit_wait`: a usage-limit window must reset. See

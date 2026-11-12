@@ -189,7 +189,7 @@ func scoutVisitOrder(main, pr []forge.WorkflowRun, now time.Time) []scoutVisit {
 	return out
 }
 
-func collectScout(ctx context.Context, f forge.Forge, forgeType string, projectID int64, branch string, now time.Time, configs ...scoutCollectorConfig) scoutData {
+func collectScout(ctx context.Context, f forge.CodeHost, forgeType string, projectID int64, branch string, now time.Time, configs ...scoutCollectorConfig) scoutData {
 	config := scoutCollectorConfig{}
 	if len(configs) > 0 {
 		config = configs[0]
@@ -279,7 +279,7 @@ func collectScout(ctx context.Context, f forge.Forge, forgeType string, projectI
 
 // listScoutRuns reads one page of runs and keeps the terminal ones created in the window,
 // newest first.
-func listScoutRuns(ctx context.Context, f forge.Forge, projectID int64, opts forge.ListWorkflowRunsOptions, now time.Time, d *scoutData) ([]forge.WorkflowRun, bool) {
+func listScoutRuns(ctx context.Context, f forge.CodeHost, projectID int64, opts forge.ListWorkflowRunsOptions, now time.Time, d *scoutData) ([]forge.WorkflowRun, bool) {
 	if scoutStop(ctx, nil, d) {
 		return nil, true
 	}
@@ -306,7 +306,7 @@ func listScoutRuns(ctx context.Context, f forge.Forge, projectID int64, opts for
 
 // collectScoutLogs fetches tails for the top suspected-flake and failure candidates: the
 // failed execution of each, one per job identity, flakes first, at most scoutLogCalls.
-func collectScoutLogs(ctx context.Context, f forge.Forge, projectID int64, d *scoutData, now time.Time) {
+func collectScoutLogs(ctx context.Context, f forge.CodeHost, projectID int64, d *scoutData, now time.Time) {
 	st := scoutAggregate(d.Runs, now)
 	var picks []scoutLog
 	seen := map[jobKey]bool{}

@@ -101,7 +101,7 @@ func NewCIAutoFix(q ciAutofixStore, runs CIAutoFixRunStarter, notifier CIAutofix
 // Every per-candidate failure is log-and-skipped (the poller convention): a forge
 // blip or a DB error on one ref must not stall the tick or the other refs, and an
 // unrecorded pipeline simply re-evaluates next tick.
-func (d *CIAutoFix) detect(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge) {
+func (d *CIAutoFix) detect(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, ch forge.CodeHost, tr forge.IssueTracker) {
 	// PRD #914 fail-closed admin gate: CiAutofixEnabled propagates its store error
 	// (three-state read), and the detector — the caller that owns the fail-closed
 	// decision — maps a non-nil error to OFF. Absent → ON is resolved inside
@@ -127,13 +127,13 @@ func (d *CIAutoFix) detect(ctx context.Context, r store.ListEnabledReposWithConn
 		if ctx.Err() != nil {
 			return
 		}
-		d.detectOne(ctx, r, f, cand)
+		d.detectOne(ctx, r, ch, tr, cand)
 	}
 }
 
 // detectOne runs the loop-guard state machine for one candidate ref (PRD #71
 // sequence diagram): dedup, active-run swallow, no-progress / cap halt, or proceed.
-func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge, cand store.ListCIAutofixCandidateRefsRow) {
+func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, ch forge.CodeHost, tr forge.IssueTracker, cand store.ListCIAutofixCandidateRefsRow) {
 	ref := cand.Ref.String
 
 	// Scheduled-run branches (`uzi/prompt-…`, `uzi/self-improve/…`) do not parse to an
@@ -211,7 +211,7 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 		Sha:        cand.Sha,
 		WebUrl:     cand.PipelineWebUrl,
 	}
-	snap, err := workersvc.BuildFailureSnapshot(ctx, f, r.ForgeProjectID, ps, d.maxJobs, d.logTailBytes)
+	snap, err := workersvc.BuildFailureSnapshot(ctx, ch, r.ForgeProjectID, ps, d.maxJobs, d.logTailBytes)
 	if err != nil {
 		// Already PAT-redacted by the driver.
 		slog.Warn("poller: ci-autofix build snapshot", "repo", r.PathWithNamespace, "ref", ref, "error", err)
@@ -253,7 +253,7 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 			// The issue comment is the primary outward halt signal for an issue-backed
 			// branch (best-effort).
 			if ok {
-				if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, iid, haltCommentBody(reason, d.maxAttempts, cand.MrIid)); err != nil {
+				if _, err := tr.CreateIssueNote(ctx, r.ForgeProjectID, iid, haltCommentBody(reason, d.maxAttempts, cand.MrIid)); err != nil {
 					// Already PAT-redacted by the driver; the latch is set, so the comment is lost, not retried.
 					slog.Warn("poller: ci-autofix halt comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 				}
@@ -269,7 +269,7 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 	// 6. PROCEED: start an automatic ci_fix run. Resolve the guard's watch set (default
 	// globs unioned with the project's own ci_config_path); a fetch failure degrades to
 	// the defaults.
-	projectPath, err := f.ProjectCIConfigPath(ctx, r.ForgeProjectID)
+	projectPath, err := ch.ProjectCIConfigPath(ctx, r.ForgeProjectID)
 	if err != nil {
 		slog.Warn("poller: ci-autofix ci_config_path", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 		projectPath = ""
@@ -298,7 +298,7 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 			return
 		}
 		if ok {
-			if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, iid, startCommentBody(ref, cand.PipelineWebUrl)); err != nil {
+			if _, err := tr.CreateIssueNote(ctx, r.ForgeProjectID, iid, startCommentBody(ref, cand.PipelineWebUrl)); err != nil {
 				slog.Warn("poller: ci-autofix start comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 			}
 		}

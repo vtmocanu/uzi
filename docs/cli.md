@@ -552,8 +552,13 @@ A few worth knowing:
   least 60 seconds (the server's minimum), so `0`, anything under a minute, a
   negative value, or an unparseable one is a usage error (exit 2). Valid on any non-terminal run
   of a kind the sweep can time out (issue, task, prompt, self-improve,
-  mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
-  interactive-task run never times out, so extending one is a 409 (exit 5).
+  mr-rework, ci-fix), including a queued or parked one. A chat or judge
+  run, or an interactive task's session, has no server wall deadline, so
+  extending one is a 409 (exit 5), with one exception: the worker bounds each
+  follow-up of an interactive task with its wall budget and parks a follow-up
+  that uses it up (`paused`, `hold_reason: budget_exhausted`), and extend adds
+  the time to such a parked task and resumes it. No server deadline is
+  reported for an interactive run, so none is printed.
   `--by` is limited per request by the admin's maximum per extension
   (default 16h), not per run: you may extend the same run repeatedly, and
   each extension is an audited action. A request above that maximum, a
@@ -1530,7 +1535,9 @@ uzi run recovery <run-id> [--json]
   `retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed`: it remains `source_only`, or `needs_action` after a failed
   latest capture, even with an available archive or capture in flight. Retained
   exhaustion with a finite retry can retry automatically; its NULL retry requires
-  owner Resume/Cancel. Adoption failure always requires owner Resume/Cancel.
+  owner Resume/Cancel. Adoption failure always requires owner Resume/Cancel; so does
+  the same cause when the worker refused an unsupported predecessor of an independent restore
+  (no adoption was attempted).
   Archive readiness does not implicitly release this custody.
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
@@ -3827,7 +3834,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   without an automatic timer. Retained-source budget exhaustion can use cause
   `retained_recovery_exhausted`: three timed retries by default, then an owner
   hold with no countdown. An integrity refusal uses `retained_recovery_adoption_failed`,
-  requiring owner Resume or Cancel with no automatic retry. A retained continuation
+  requiring owner Resume or Cancel with no automatic retry; it also holds a run whose
+  predecessor an independent restore does not support (canonical, hosted or no boundary
+  record), where no adoption was attempted. A retained continuation
   whose departure was never witnessed uses the server-only cause
   `retained_continuation_unwitnessed`, with the same owner-only Resume or Cancel.
   See [Retained recovery exhausted](#retained-recovery-exhausted),
@@ -3948,7 +3957,7 @@ hold presentation and remedies are unchanged. See
 account hold waits for its account. `codex_idle_stall`, `data_volume_full` and
 `retained_recovery_exhausted` retry when their timestamp is finite (even if due);
 explicit NULL instead needs owner Resume/Cancel, and omitted timing is unknown. `retained_recovery_adoption_failed` requires
-owner Resume/Cancel regardless of retry timing. `pool_wait` instead clears only when a token is
+owner Resume/Cancel regardless of retry timing, including when it holds an unsupported restore predecessor. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -4191,12 +4200,18 @@ for renewal bounds, storage risks and rollout requirements.
 
 ### Retained recovery adoption failed
 
-`recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
-refused adoption, or that a predecessor's active secret-scan remediation record
-refused source use so the agent did not start. Local work and custody are
+`recovery_wait` / `retained_recovery_adoption_failed` means retained adoption failed,
+a predecessor needs secret-scan remediation review, or this release does not support
+the predecessor for independent restore. The agent did not start. Local work and custody are
 preserved; the run is owner-held with no automatic retry, regardless of a
 displayed retry timestamp. In the remediation case, Resume holds again unless
-that remediation was resolved through a separately authorized route.
+that remediation was resolved through a separately authorized route. The same cause
+also holds a run whose predecessor an independent restore does not support (canonical,
+hosted or no boundary record, when the earlier checks pass): the worker refused before
+any source effect, adopted nothing and proved no quiescence; Resume holds again on the
+same release, and an owner-held hosted run blocks its worker's ordinary image roll until
+you cancel or discard it
+([Run recovery](run-recovery.md#when-a-restarted-worker-continues-from-a-saved-pin-independent-restore)).
 
 Read `uzi run recovery <id>` and export an available archive before deciding.
 Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,

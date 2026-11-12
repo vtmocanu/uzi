@@ -534,3 +534,80 @@ test("pod epoch restores observable persistent worker and runner scratch in both
     }
   } finally { await f.close(); }
 });
+
+// Issue #4043: the scratch census and strict delete across the real UID split. The worker (uid 10001, with the
+// production SETUID/SETGID ambient caps) pins the 0700 runner-owned root through descriptors, reads it only
+// through the runner-uid census helper, and removes one runner-owned leaf with the runner-uid strict delete. The
+// worker itself cannot list the root, which is why the census is a runner-uid child. Classification is the only
+// fake in this lane (tmpfs, not ext4/XFS), so the worker-side filesystem gate is not exercised here.
+const SCRATCH_PROGRAM = `
+const [scratchUrl, rmUrl, uidUrl, leaf] = process.argv.slice(1);
+const fs = await import("node:fs");
+const cp = await import("node:child_process");
+const scratch = await import(scratchUrl), rm = await import(rmUrl), ids = await import(uidUrl);
+const out = { uid: process.getuid(), gid: process.getgid() };
+const layout = scratch.scratchLayout(process.env);
+out.layout = layout.mode;
+const pin = scratch.pinScratchRoot(layout);
+out.pinned = !("refused" in pin);
+if (!out.pinned) { out.refused = pin.refused; console.log(JSON.stringify(out)); process.exit(0); }
+try { fs.readdirSync(layout.root); out.workerCanList = true; } catch (e) { out.workerCanList = false; out.listCode = e.code; }
+const raw = await rm.censusScratchRoot(layout.root, pin.devIno, undefined, 60000);
+const parsed = scratch.parseScratchCensus(raw, pin.devIno);
+out.census = "refused" in parsed ? { refused: parsed.refused, code: raw.code } : { rootUid: parsed.rootUid,
+  entries: parsed.entries.map(e => ({ name: e.name, type: e.type, uid: e.uid, foreign: e.foreignUid, incomplete: e.incomplete })) };
+const entry = "refused" in parsed ? undefined : parsed.entries.find(e => e.name === leaf);
+if (entry) {
+  const lim = rm.SCRATCH_DELETE_LIMITS;
+  const w = ids.runnerCommand(process.execPath, ["-e", rm.PINNED_SUBTREE_SCRIPT, layout.root, leaf, String(lim.maxEntries),
+    String(lim.budgetMs), "remove", entry.devIno, "", "pinned", pin.devIno, "1", String(lim.maxDepth)]);
+  const r = cp.spawnSync(w.command, w.args, { env: { PATH: "/usr/bin:/bin" }, cwd: "/", encoding: "utf8", timeout: 60000 });
+  out.delete = { status: r.status, stdout: r.stdout, expect: entry.devIno };
+}
+console.log(JSON.stringify(out));
+`;
+
+test("pod epoch real split: the worker pins the runner scratch root, the runner-uid census reads it and the strict delete removes a leaf", { timeout: 90000 }, async () => {
+  assert.equal(process.platform, "linux", "image proof requires Linux; never skip");
+  assert.equal(process.getuid!(), 0, "image proof requires the shared root window");
+  const runnerRoot = "/data/runner/.tmp/uzi-runner", leaf = "scratch-real-leaf";
+  for (const [dir, mode] of [["/data/runner", 0o3775], ["/data/runner/.tmp", 0o755],
+    ["/data/runner/.tmp/uzi-worker", 0o700], [runnerRoot, 0o700]] as const) {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // Reclaim before chmod: this image intentionally has no FOWNER.
+    fs.chownSync(dir, 0, 0); fs.chmodSync(dir, mode);
+    const runner = dir === runnerRoot;
+    fs.chownSync(dir, runner ? 10002 : 10001, runner ? 10002 : 10001);
+  }
+  const leafDir = path.join(runnerRoot, leaf);
+  fs.rmSync(leafDir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(leafDir, "nested", "deeper"), { recursive: true });
+  fs.writeFileSync(path.join(leafDir, "nested", "deeper", "payload"), "x".repeat(4096));
+  fs.chownSync(leafDir, 10002, 10002);
+  fs.chownSync(path.join(leafDir, "nested"), 10002, 10002);
+  fs.chownSync(path.join(leafDir, "nested", "deeper"), 10002, 10002);
+  fs.chownSync(path.join(leafDir, "nested", "deeper", "payload"), 10002, 10002);
+  try {
+    const url = (relative: string) => new URL(relative, import.meta.url).href;
+    const worker = spawnSync("/bin/setpriv", ["--reuid", "worker", "--regid", "worker", "--init-groups",
+      "--bounding-set", "-all,+setuid,+setgid", "--inh-caps", "-all,+setuid,+setgid", "--ambient-caps", "-all,+setuid,+setgid", "--",
+      process.execPath, "--import", loader, "--input-type=module", "-e", SCRATCH_PROGRAM,
+      url("../../agent/src/pod-epoch-scratch.ts"), url("../../agent/src/rmtree.ts"), url("../../agent/src/runner-uid.ts"), leaf], {
+      env: { PATH: "/usr/local/bin:/usr/bin:/bin", TSX_DISABLE_CACHE: "1", UZI_UID_SPLIT: "1",
+        UZI_RUNNER_TMPDIR: runnerRoot, TMPDIR: "/data/runner/.tmp/uzi-worker" },
+      encoding: "utf8", timeout: 80000 });
+    assert.equal(worker.status, 0, worker.stderr);
+    const out = JSON.parse(worker.stdout.trim().split("\n").at(-1)!);
+    assert.equal(out.uid, 10001, "the pass runs as the worker");
+    assert.equal(out.layout, "split");
+    assert.equal(out.pinned, true, "the worker pins the 0700 runner-owned root: " + out.refused);
+    assert.equal(out.workerCanList, false, "the worker cannot list the runner root itself");
+    assert.equal(out.census.rootUid, 10002, JSON.stringify(out.census));
+    const entry = out.census.entries.find((e: { name: string }) => e.name === leaf);
+    assert.deepEqual(entry, { name: leaf, type: "dir", uid: 10002, foreign: false, incomplete: false });
+    assert.equal(out.delete.status, 0, JSON.stringify(out.delete));
+    assert.equal(out.delete.stdout, `UZI-SCRATCH-REMOVED ${out.delete.expect}\n`, "the runner-uid delete reports its own receipt");
+    assert.equal(fs.existsSync(leafDir), false);
+    assert.equal(fs.existsSync("/data/runner/.tmp/uzi-worker"), true, "the protected container name is untouched");
+  } finally { fs.rmSync(leafDir, { recursive: true, force: true }); }
+});

@@ -687,15 +687,278 @@ capture_fixture() {
     else . end | .[]' > "$SEQ_DIR/events"
 }
 capture_fixture guarded
-custody_case "guarded typed G+1 same-claim retries retain one distinct capture" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+custody_case "guarded typed G+1 same-claim retries retain one distinct capture" pass 'exact generation 2 captured' wait_same_claim_capture_resume R 2 0
 capture_fixture legacy
-custody_case "legacy typed G+1 same-claim capture still accepted" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+custody_case "legacy typed G+1 same-claim capture still accepted" pass 'exact generation 2 captured' wait_same_claim_capture_resume R 2 0
 capture_fixture single-upload
-custody_case "same-claim capture precedes fresh reseed" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+custody_case "same-claim capture precedes fresh reseed" pass 'exact generation 2 captured' wait_same_claim_capture_resume R 2 0
 for variant in wrong-generation wrong-order two-captures missing-id extra-claim wrong-seed-generation; do
   capture_fixture "$variant"
-  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_resume R 2 0
+  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' wait_same_claim_capture_resume R 2 0
 done
+
+# #3644 independent restore: the production log sequence, in production order (agent/src/runner.ts
+# "run claimed", agent/src/git.ts "runner clone: seeding" with seeded_from restore_pin, runner.ts
+# "independent restore seeded", then the admission line), and no bundle upload.
+eval "$(awk '/^wait_independent_restore_resume\(\) \{/,/^\}/' "$LIB")"
+RESTORE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+RESTORE_CID="$(printf 'b%.0s' $(seq 64))"
+RESTORE_PATH=/data/runner/repo/issue-1.attempt-20260101T000000Z-g2-0123456789abcdef
+restore_fixture() {
+  jq -nc --arg variant "$1" --arg sha "$RESTORE_SHA" --arg cid "$RESTORE_CID" --arg path "$RESTORE_PATH" '
+    {run_id:"R",msg:"run claimed"} as $claim |
+    {msg:"runner clone: seeding",branch:"agent/issue-1",seeded_from:"restore_pin",prior_commits:1,path:$path} as $seed |
+    {run_id:"R",msg:"independent restore seeded",slot:{kind:"compose",hostname:$cid[0:12],containerId:$cid},
+      crossCheck:"ok",verdict:{predecessorIncarnation:"p",boot:"same_boot"},binding:"on_default",pinGeneration:1,
+      sourceSha:$sha,captureId:"cap",recordState:"pending",attemptPath:$path,seededHead:$sha,claim_generation:2} as $restored |
+    {run_id:"R",msg:"recovery: prior open custody holds inventoried after clone",claim_generation:2} as $ready |
+    {run_id:"R",msg:"recovery: bundle uploaded (durable capture)",server_capture_id:"capture",server_state:"available"} as $capture |
+    [$claim,$claim,$seed,$restored,$ready] |
+    if $variant=="owed" then .[3].binding="owed"
+    elif $variant=="pin-ref" then .[3].binding="recovery_pin_ref"
+    elif $variant=="wrong-pin-generation" then .[3].pinGeneration=2
+    elif $variant=="extra-capture" then [.[0],.[1],$capture,.[2],.[3],.[4]]
+    elif $variant=="extra-claim" then . + [$claim]
+    elif $variant=="wrong-order" then [.[0],.[1],.[3],.[2],.[4]]
+    elif $variant=="admission-before-restore" then [.[0],.[1],.[2],.[4],.[3]]
+    elif $variant=="wrong-generation" then .[2].path="/data/runner/repo/issue-1.attempt-20260101T000000Z-g3-0123456789abcdef"
+    elif $variant=="mismatched-attempt-path" then .[3].attemptPath="/data/runner/repo/issue-1.attempt-20260101T000000Z-g2-fedcba9876543210"
+    elif $variant=="disallowed-binding" then .[3].binding="recovery_pin_ref"
+    elif $variant=="seeded-head-mismatch" then .[3].seededHead="cccccccccccccccccccccccccccccccccccccccc"
+    elif $variant=="short-source-sha" then .[3].sourceSha="aaaa" | .[3].seededHead="aaaa"
+    elif $variant=="slot-not-compose" then .[3].slot={kind:"hosted",podUid:"u",container:"worker"}
+    elif $variant=="cross-check-failed" then .[3].crossCheck="failed"
+    elif $variant=="empty-verdict" then .[3].verdict={}
+    elif $variant=="admission-wrong-generation" then .[4].claim_generation=3
+    elif $variant=="not-restore-pin-seed" then .[2].seeded_from="tracking"
+    elif $variant=="two-restore-lines" then [.[0],.[1],.[2],.[3],.[3],.[4]]
+    else . end | .[]' > "$SEQ_DIR/events"
+}
+restore_globals_case() {
+  wait_independent_restore_resume R 2 agent/issue-1 owed,on_default 0 >/dev/null
+  [ "$RESTORE_BINDING:$RESTORE_SOURCE_SHA:$RESTORE_SEEDED_HEAD:$RESTORE_ATTEMPT_PATH" = "$1:$RESTORE_SHA:$RESTORE_SHA:$RESTORE_PATH" ] \
+    || fail "restore fields not exported: $RESTORE_BINDING $RESTORE_SOURCE_SHA $RESTORE_SEEDED_HEAD $RESTORE_ATTEMPT_PATH"
+  [ "$RESTORE_CAPTURE_ID:$RESTORE_SLOT_CONTAINER:$RESTORE_SLOT_HOSTNAME" = "cap:$RESTORE_CID:${RESTORE_CID:0:12}" ] \
+    || fail "restore slot fields not exported"
+  [ "$RESTORE_PRED_INCARNATION" = p ] || fail "restore predecessor incarnation not exported: [$RESTORE_PRED_INCARNATION]"
+  echo 'restore fields exported'
+}
+restore_fixture valid
+custody_case "independent restore accepts on_default" pass 'restored independently' wait_independent_restore_resume R 2 agent/issue-1 on_default 0
+custody_case "independent restore exports the seeded fields" pass 'restore fields exported' restore_globals_case on_default
+restore_fixture owed
+custody_case "independent restore accepts owed" pass 'restored independently' wait_independent_restore_resume R 2 agent/issue-1 owed,on_default 0
+custody_case "independent restore exports the owed binding" pass 'restore fields exported' restore_globals_case owed
+restore_fixture pin-ref
+custody_case "independent restore accepts recovery_pin_ref when allowed" pass 'binding=recovery_pin_ref' wait_independent_restore_resume R 2 agent/issue-1 owed,on_default,recovery_pin_ref 0
+custody_case "independent restore refuses recovery_pin_ref when it is not allowed" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 2 agent/issue-1 owed,on_default 0
+restore_fixture owed
+custody_case "independent restore refuses owed when only on_default is allowed" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 2 agent/issue-1 on_default 0
+for variant in wrong-pin-generation extra-capture extra-claim wrong-order admission-before-restore wrong-generation mismatched-attempt-path \
+  disallowed-binding seeded-head-mismatch short-source-sha slot-not-compose cross-check-failed empty-verdict admission-wrong-generation \
+  not-restore-pin-seed two-restore-lines; do
+  restore_fixture "$variant"
+  custody_case "independent restore refuses $variant" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 2 agent/issue-1 owed,on_default 0
+done
+restore_fixture valid
+custody_case "independent restore refuses another branch" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 2 agent/issue-2 on_default 0
+custody_case "independent restore refuses another generation" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 3 agent/issue-1 on_default 0
+custody_case "independent restore needs the branch" fail 'needs the run' wait_independent_restore_resume R 2 "" on_default 0
+
+# Phase 52's wrapper: the run's branch comes from the database, the allowed bindings are owed,on_default,
+# and the seed witness runs only after the log sequence is proved.
+eval "$(awk '/^f42_run_branch\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
+f42_case() {
+  # runs.branch is NULL for a live issue run: only issue_iid is readable, as in the database.
+  rb_run_field() { case "$2" in issue_iid) echo "${F42_IID-1}";; branch) echo "";; *) echo "unexpected column $2" >&2; return 1;; esac; }
+  restore_assert_seed_witness() { echo "witnessed $1 $2 $3"; }
+  f42_assert_capture_resume R 2 0
+}
+f42_branch_case() {
+  rb_run_field() { echo "$F42_IID"; }
+  f42_run_branch R
+}
+restore_fixture owed
+custody_case "phase 52 accepts an owed pin and runs the seed witness" pass 'witnessed R agent/issue-1 2' f42_case
+F42_IID=7 custody_case "phase 52 branch derivation names the issue" pass 'agent/issue-7' f42_branch_case
+for bad in "" 0 007 x1; do
+  F42_IID="$bad" custody_case "phase 52 branch derivation refuses issue_iid [$bad]" fail "" f42_branch_case
+done
+restore_fixture owed
+F42_IID='' custody_case "phase 52 refuses a run without an issue_iid" fail 'cannot derive the branch' f42_case
+restore_fixture disallowed-binding
+custody_case "phase 52 refuses a recovery_pin_ref binding" fail 'independent-restore G+1 sequence' f42_case
+restore_fixture extra-capture
+custody_case "phase 52 refuses a bundle capture on the restore route" fail 'independent-restore G+1 sequence' f42_case
+
+# The seed-time witness: the bare's restore basis must agree with the log, and while S is live P must be
+# unchanged. The witness container is replaced by canned outputs (the real one needs the compose stack).
+eval "$(awk '/^restore_assert_seed_witness\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^_restore_p_slots\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^_restore_journal_value\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^_restore_journal_bare\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^restore_assert_agent_identity\(\) \{/,/^\}/' "$LIB")"
+witness_case() {
+  local variant="$1" pclone=/data/runner/repo/issue-1.attempt-20260101T000000Z-g1-1111111111111111
+  # Names here must not collide with the locals of restore_assert_seed_witness: the fakes below are dynamically scoped.
+  local pjournal restore run_state=running digest='digest=d1 head=ref: refs/heads/agent/issue-1 tip=t1' pin
+  pjournal="$(jq -nc --arg c "$pclone" '{runId:"R",clonePath:$c,attemptId:"20260101T000000Z-g1-1111111111111111"}')"
+  restore="$(jq -nc --arg c "$pclone" --arg sha "$RESTORE_SHA" '{restore:{version:1,predecessor:{clonePath:$c,generation:1},
+    slotOwner:{worker:"p",epoch:"e1"},pin:{captureId:"cap",generation:1,sourceSha:$sha,finalization:false},restoreTip:$sha},restoreStage:"ready",runId:"R"}')"
+  pin="$(jq -nc --arg sha "$RESTORE_SHA" '{runId:"R",branch:"agent/issue-1",generation:1,sourceSha:$sha,captureId:"cap",mac:"x"}')"
+  # Slot lines are "name<TAB>digest<TAB>owner<TAB>epoch": k1 is P's clone slot (owner p, epoch e1, the restore basis's
+  # slotOwner), k3 is another slot of the same process (p, epoch e2), k2 belongs to another worker (q).
+  local slots_before slots_after holds_before='h1 open 1' holds_after='h1 open 1' bound=on_default hmode=descendant sh="$RESTORE_SHA" anc=yes
+  slots_before="$(printf './k1.json\taaa\tp\te1\n./k2.json\tbbb\tq\te9\n./k3.json\teee\tp\te2\n')"; slots_after="$slots_before"
+  case "$variant" in
+    p-slot-changed) slots_after="$(printf './k1.json\tccc\tp\te1\n./k2.json\tbbb\tq\te9\n./k3.json\teee\tp\te2\n')";;
+    p-slot-removed) slots_after="$(printf './k2.json\tbbb\tq\te9\n./k3.json\teee\tp\te2\n')";;
+    same-owner-other-epoch-changed) slots_after="$(printf './k1.json\taaa\tp\te1\n./k2.json\tbbb\tq\te9\n./k3.json\tfff\tp\te2\n')";;
+    same-owner-other-epoch-removed) slots_after="$(printf './k1.json\taaa\tp\te1\n./k2.json\tbbb\tq\te9\n')";;
+    other-slot-changed) slots_after="$(printf './k1.json\taaa\tp\te1\n./k2.json\tccc\tq\te9\n./k3.json\teee\tp\te2\n')";;
+    other-slot-removed) slots_after="$(printf './k1.json\taaa\tp\te1\n./k3.json\teee\tp\te2\n')";;
+    no-p-slot) slots_before="$(printf './k2.json\tbbb\tq\te9\n./k3.json\teee\tp\te2\n')"; slots_after="$slots_before";;
+    two-p-slots) slots_before="$(printf './k1.json\taaa\tp\te1\n./k2.json\tbbb\tq\te9\n./k4.json\tggg\tp\te1\n')"; slots_after="$slots_before";;
+    slot-added) slots_after="$(printf './k1.json\taaa\tp\te1\n./k2.json\tbbb\tq\te9\n./k3.json\teee\tp\te2\n./k5.json\tddd\tp\te1\n')";;
+    hold-changed) holds_after='h1 released 1';;
+    hold-removed) holds_after='';;
+    binding-unevidenced|terminal-binding-unevidenced) bound=owed;;
+    head-exact-mismatch) hmode=exact; sh=cccccccccccccccccccccccccccccccccccccccc;;
+    head-exact-ok) hmode=exact;;
+    head-descendant) sh=cccccccccccccccccccccccccccccccccccccccc;;
+    head-not-descendant) sh=cccccccccccccccccccccccccccccccccccccccc; anc=no;;
+  esac
+  jq -nc --arg j "$pjournal" --arg c "$pclone" --arg d "$digest" --arg s "$slots_before" --arg h "$holds_before" \
+    '{journal:$j,clonePath:$c,digest:$d,slots:$s,holds:$h}' > "$SEQ_DIR/.restore-p-R.json"
+  printf '%s' "$slots_after" > "$SEQ_DIR/w-slots"; printf '%s' "$holds_after" > "$SEQ_DIR/w-holds"
+  printf '%s' "$bound" > "$SEQ_DIR/w-bound"; printf '%s' "$sh" > "$SEQ_DIR/w-shead"; printf '%s' "$anc" > "$SEQ_DIR/w-anc"
+  case "$variant" in
+    basis-tip) restore="$(jq -c --arg s cccccccccccccccccccccccccccccccccccccccc '.restore.restoreTip=$s' <<<"$restore")";;
+    basis-generation) restore="$(jq -c '.restore.pin.generation=2' <<<"$restore")";;
+    basis-capture) restore="$(jq -c '.restore.pin.captureId="other"' <<<"$restore")";;
+    basis-slot-owner-worker) restore="$(jq -c '.restore.slotOwner.worker="q"' <<<"$restore")";;
+    basis-no-slot-owner) restore="$(jq -c 'del(.restore.slotOwner)' <<<"$restore")";;
+    basis-predecessor) restore="$(jq -c '.restore.predecessor.clonePath="/elsewhere"' <<<"$restore")";;
+    no-restore) restore="";;
+    terminal) run_state=completed; digest='digest=changed head=x tip=y';;
+    terminal-no-restore) run_state=completed; restore="";;
+    terminal-pin-absent) run_state=completed; pin="";;
+    terminal-binding-unevidenced) run_state=completed;;
+    p-journal-changed) pjournal="${pjournal%\}},\"x\":1}";;
+    p-clone-changed) digest='digest=d2 head=ref: refs/heads/agent/issue-1 tip=t1';;
+    pin-sha) pin="$(jq -c '.sourceSha="dddddddddddddddddddddddddddddddddddddddd"' <<<"$pin")";;
+    pin-absent) pin="";;
+  esac
+  local other=''
+  [ "$variant" != other-run ] || other="$(jq -c '.runId="Z"' <<<"$restore")"
+  { printf 'bare\tuzi-recovery.agent/issue-1.clone\t%s\n' "$pjournal"
+    [ -z "$restore" ] || printf 'bare\tuzi-restore.agent/issue-1.journal\t%s\n' "$restore"
+    [ -z "$other" ] || printf 'bare\tuzi-restore.agent/issue-1.journal\t%s\n' "$other"
+  } > "$SEQ_DIR/w-journals"
+  printf '%s' "$digest" > "$SEQ_DIR/w-digest"
+  printf '%s' "$pin" > "$SEQ_DIR/w-pin"
+  db_psql() { echo "$run_state"; }
+  db_psql_rows() { cat "$SEQ_DIR/w-holds"; echo; }
+  restore_agent_identity() { echo "$RESTORE_CID ${RESTORE_CID:0:12}"; }
+  restore_witness_exec() {
+    case "$1" in
+      journals) cat "$SEQ_DIR/w-journals";;
+      digest) cat "$SEQ_DIR/w-digest";;
+      pin) [ -s "$SEQ_DIR/w-pin" ] && cat "$SEQ_DIR/w-pin";;
+      shead) cat "$SEQ_DIR/w-shead";;
+      slots) cat "$SEQ_DIR/w-slots";;
+      isanc) cat "$SEQ_DIR/w-anc";;
+      # bind BARE KIND RUN SHA GENERATION: evidenced only for the kind the bare is staged with, in the restore journal's bare.
+      bind) [ "$2:$3:$4:$5:$6" = "bare:$(cat "$SEQ_DIR/w-bound"):R:$RESTORE_SHA:1" ] && echo yes || echo no;;
+    esac
+  }
+  RESTORE_SOURCE_SHA="$RESTORE_SHA" RESTORE_SEEDED_HEAD="$RESTORE_SHA" RESTORE_CAPTURE_ID=cap RESTORE_SLOT_CONTAINER="$RESTORE_CID"
+  RESTORE_SLOT_HOSTNAME="${RESTORE_CID:0:12}" RESTORE_ATTEMPT_PATH="$RESTORE_PATH" RESTORE_BINDING=on_default RESTORE_PRED_INCARNATION=p
+  [ "$variant" != slot-hostname ] || RESTORE_SLOT_HOSTNAME=ffffffffffff
+  if [ "$variant" = slot-container ]; then
+    RESTORE_SLOT_CONTAINER="$(printf 'e%.0s' $(seq 64))"
+    RESTORE_SLOT_HOSTNAME="${RESTORE_SLOT_CONTAINER:0:12}"
+  fi
+  restore_assert_seed_witness R agent/issue-1 2 "$hmode"
+}
+custody_case "seed witness accepts a live restore" pass 'basis=pin=seed' witness_case valid
+custody_case "seed witness reports the binding it evidenced" pass 'on_default evidenced in the bare' witness_case valid
+custody_case "seed witness accepts a terminal run whose predecessor is gone" pass 'terminal run' witness_case terminal
+custody_case "seed witness accepts a terminal run whose pin record is gone, with a note" pass 'not readable' witness_case terminal-pin-absent
+custody_case "seed witness requires the retained basis of a terminal run" fail 'no restore journal' witness_case terminal-no-restore
+custody_case "seed witness requires a readable pin record for a live run" fail 'for live run R is not readable' witness_case pin-absent
+custody_case "seed witness refuses a binding the bare does not evidence" fail 'is not evidenced' witness_case binding-unevidenced
+custody_case "seed witness refuses an unevidenced binding on a terminal run too" fail 'is not evidenced' witness_case terminal-binding-unevidenced
+custody_case "seed witness accepts an authority slot set that only grew" pass 'clone authority slot and holds unchanged' witness_case slot-added
+custody_case "seed witness refuses a changed predecessor clone slot" fail 'predecessor-owned authority slot file changed' witness_case p-slot-changed
+custody_case "seed witness refuses a vanished predecessor clone slot" fail 'predecessor-owned authority slot file changed' witness_case p-slot-removed
+custody_case "seed witness accepts a changed slot of the same owner at another epoch" pass 'clone authority slot and holds unchanged' witness_case same-owner-other-epoch-changed
+custody_case "seed witness accepts a vanished slot of the same owner at another epoch" pass 'clone authority slot and holds unchanged' witness_case same-owner-other-epoch-removed
+custody_case "seed witness accepts a changed slot of another owner" pass 'clone authority slot and holds unchanged' witness_case other-slot-changed
+custody_case "seed witness accepts a vanished slot of another owner" pass 'clone authority slot and holds unchanged' witness_case other-slot-removed
+custody_case "seed witness requires a clone slot before the restart" fail 'exactly one authority slot owned by predecessor p at epoch e1 before the restart, found 0' witness_case no-p-slot
+custody_case "seed witness refuses two clone slots before the restart" fail 'found 2' witness_case two-p-slots
+custody_case "seed witness refuses a slotOwner worker that is not the predecessor incarnation" fail 'is not the predecessor incarnation' witness_case basis-slot-owner-worker
+custody_case "seed witness refuses a basis without a slotOwner" fail 'no readable slotOwner' witness_case basis-no-slot-owner
+custody_case "seed witness refuses a changed custody hold" fail 'custody holds of run R changed' witness_case hold-changed
+custody_case "seed witness refuses a vanished custody hold" fail 'custody holds of run R changed' witness_case hold-removed
+custody_case "seed witness accepts S at exactly the seeded head" pass 'exact)' witness_case head-exact-ok
+custody_case "seed witness refuses S away from the seeded head in exact mode" fail 'is not the seeded head' witness_case head-exact-mismatch
+custody_case "seed witness accepts S descending from the seeded head" pass 'descendant)' witness_case head-descendant
+custody_case "seed witness refuses S not descending from the seeded head" fail 'not an ancestor of the successor HEAD' witness_case head-not-descendant
+for variant in basis-tip basis-generation basis-capture; do
+  custody_case "seed witness refuses a $variant disagreement" fail 'disagrees with the log' witness_case "$variant"
+done
+custody_case "seed witness refuses a basis naming another predecessor clone" fail 'different predecessor clone' witness_case basis-predecessor
+custody_case "seed witness requires a restore journal for a live run" fail 'no restore journal' witness_case no-restore
+custody_case "seed witness refuses a pin record that disagrees" fail 'pin record' witness_case pin-sha
+custody_case "seed witness refuses a changed predecessor journal" fail 'predecessor journal of run R changed' witness_case p-journal-changed
+custody_case "seed witness refuses a changed predecessor clone" fail 'predecessor clone of run R changed' witness_case p-clone-changed
+custody_case "seed witness refuses a slot hostname that is not the id prefix" fail 'slot hostname' witness_case slot-hostname
+custody_case "seed witness refuses a slot that is not the agent container" fail 'logged slot container' witness_case slot-container
+custody_case "seed witness ignores a restore journal of another run" pass 'basis=pin=seed' witness_case other-run
+
+# The witness `slots` mode prints each slot file's owner and epoch through slot_fields, extracted here from the
+# script text the witness container runs. The slot lines are built like agent/src/completion-authority.ts seal
+# writes them (compact JSON, key order version, key, state, epoch, seq, owner, pending, ...), one with an
+# owner-shaped fragment inside a string field, which JSON escapes.
+# (the function's body is a heredoc holding shell functions of its own, so the range ends at the first brace line after it)
+eval "$(awk '/^_restore_witness_script\(\) \{/ { f = 1 } f { print } /^WITNESS$/ { w = 1 } w && /^\}/ { exit }' "$LIB")"
+eval "$(_restore_witness_script | awk '/^slot_fields\(\) \{/,/^\}/')"
+slot_fields_case() {
+  local key out version
+  key="$(printf 'a%.0s' $(seq 64))"
+  # The production slot version, read from the store's own constant so the fixture cannot drift from it.
+  version="$(sed -n 's/^const SLOT_VERSION = "\([^"]*\)";$/\1/p' "$ROOT/agent/src/completion-authority.ts")"
+  [ -n "$version" ] || fail "SLOT_VERSION not found in agent/src/completion-authority.ts"
+  line() { jq -nc --arg version "$version" --arg key "$key" --arg epoch "$1" --arg worker "$2" --arg fp "$3" \
+    '{version:$version,key:$key,state:"active",epoch:$epoch,seq:3,owner:{worker:$worker,executor:null},
+      pending:(if $fp == "" then null else {operation:"op",kind:"destructive",footprint:$fp,status:"running",residue:[]} end),
+      retiring:null,publication:null,codexMarked:false,mac:"m"}'; }
+  out="$(line 11111111-aaaa 22222222-bbbb '' | slot_fields)"
+  [ "$out" = "22222222-bbbb 11111111-aaaa" ] || fail "plain slot: worker/epoch [$out]"
+  out="$(line e2 w2 '{"owner":{"worker":"bad"' | slot_fields)"
+  [ "$out" = "w2 e2" ] || fail "slot with an owner-shaped fragment in a string field: [$out]"
+  line e3 w3 'x' | grep -q 'owner' || fail "fixture is not canonical slot JSON"
+  line e2 w2 '{"owner":{"worker":"bad"' | grep -qF '\"owner\":{\"worker\":\"bad\"' || fail "fixture does not carry the escaped fragment"
+  out="$(line e4 w4 '' | sed 's/^{"version":"[^"]*"/{"version":1/' | slot_fields)"
+  [ -z "$out" ] || fail "a slot with a non-production version must print nothing: [$out]"
+  out="$(printf '{"version":"%s","key":"k","owner":{"worker":"w"}}\n' "$version" | slot_fields)"
+  [ -z "$out" ] || fail "a record outside the canonical key order must print nothing: [$out]"
+  echo 'slot fields extracted'
+}
+custody_case "slot owner and epoch are read from canonical slot JSON, not from string fields" pass 'slot fields extracted' slot_fields_case
+
+identity_case() {
+  local fake_after="$2"
+  restore_agent_identity() { echo "$fake_after"; }
+  restore_assert_agent_identity "label" "$1"
+}
+custody_case "agent identity accepts the same container" pass 'same agent container' identity_case "$RESTORE_CID ${RESTORE_CID:0:12}" "$RESTORE_CID ${RESTORE_CID:0:12}"
+custody_case "agent identity refuses a recreated container" fail 'changed across the kill/start cycle' \
+  identity_case "$(printf 'e%.0s' $(seq 64)) eeeeeeeeeeee" "$RESTORE_CID ${RESTORE_CID:0:12}"
+custody_case "agent identity refuses a hostname that is not the id prefix" fail 'not the container id prefix' \
+  identity_case "$RESTORE_CID ffffffffffff" "$RESTORE_CID ffffffffffff"
 
 cap2_recovery_contract() {
   local mode="$1" RUN_KA=R RUN_KB=S fixture_generation=2
@@ -703,10 +966,11 @@ cap2_recovery_contract() {
   local RWC_KA RWC_KB
   [ "$mode" != extra-generation ] || fixture_generation=3
   db_psql() { case "$1" in *claim_generation*) echo "$fixture_generation";; *) echo 0;; esac; }
-  wait_same_claim_capture_resume() {
+  wait_independent_restore_resume() {
     [ "$mode" != missing-capture ] || fail 'cap2 recovery missing exact capture'
-    [ "$2:$4" = 2:agent/fixture ] || fail 'cap2 recovery lost generation or branch'
+    [ "$2:$3:$4" = 2:agent/fixture:on_default ] || fail 'cap2 recovery lost generation, branch or binding'
   }
+  restore_assert_seed_witness() { [ "$1:$2:$3" = "R:agent/fixture:2" ] || fail 'cap2 witness lost run, branch or generation'; }
   local definition
   definition="$(awk '/^assert_cap2_recovered_run\(\) \{/,/^\}/' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
   if [ -n "$definition" ]; then
@@ -1291,12 +1555,13 @@ fixture_phase_boundary() {
   local X=b4dec5cf-e6d4-413b-b3a8-0005a2835701 ED=b4dec5cf-e6d4-413b-b3a8-0005a2835702
   local RUN_KA=b4dec5cf-e6d4-413b-b3a8-0005a2835703 RUN_KB=b4dec5cf-e6d4-413b-b3a8-0005a2835704
   local RUN_F1=b4dec5cf-e6d4-413b-b3a8-0005a2835705 RUN_F2=b4dec5cf-e6d4-413b-b3a8-0005a2835706
+  local RUN_C=b4dec5cf-e6d4-413b-b3a8-0005a2835707
   # shellcheck disable=SC2034  # read by the extracted owning phase statements
-  local GEN_X0=1 GEN_X1=2 GEN_ED_ORIGINAL=1 GEN_KA_ORIGINAL=1 GEN_KB_ORIGINAL=1 GEN_F1=1 GEN_F2=1 GEN_F2_OBSERVED=3
+  local GEN_X0=1 GEN_X1=2 GEN_ED_ORIGINAL=1 GEN_KA_ORIGINAL=1 GEN_KB_ORIGINAL=1 GEN_F1=1 GEN_F2=1 GEN_F2_OBSERVED=3 GEN_C_ORIGINAL=1
   # shellcheck disable=SC2034  # read by the extracted phase-42 boundary
   local RA_RESTORE_AT=2026-10-08T09:08:20Z
   echo '{"holds":[]}' > "$SEQ_DIR/boundary-holds"
-  for entry in "$X:1" "$X:2" "$ED:1" "$RUN_KA:1" "$RUN_KB:1" "$RUN_F1:1" "$RUN_F2:1" "$RUN_F2:3" "$UUID:1"; do
+  for entry in "$X:1" "$X:2" "$ED:1" "$RUN_KA:1" "$RUN_KB:1" "$RUN_F1:1" "$RUN_F2:1" "$RUN_F2:3" "$RUN_C:1" "$RUN_C:2" "$UUID:1"; do
     run="${entry%:*}"; gen="${entry##*:}"; n=$((n + 1))
     jq --arg run "$run" --argjson gen "$gen" --arg id "$(printf 'b4dec5cf-e6d4-413b-b3a8-%012d' "$n")" \
       '.holds += [{id:$id,run_id:$run,generation:$gen,state:"open",attention:"source_only",has_available_capture:false}]' \
@@ -1323,7 +1588,7 @@ fixture_phase_boundary() {
   before="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
   eval "$(awk '/^[[:space:]]*resolve_fixture_source_hold /' "$ROOT/e2e/phases/$phase.sh")"
   after="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
-  [ "$before" = 9 ] && [ "$after" -lt 8 ] || fail 'next sweep still blocked by deliberate fixture holds'
+  [ "$before" = 11 ] && [ "$after" -lt 10 ] || fail 'next sweep still blocked by deliberate fixture holds'
   jq -e --arg run "$UUID" '[.holds[]|select(.run_id==$run)][0].state=="open"' "$SEQ_DIR/boundary-holds" >/dev/null \
     || fail 'completed outage case lost its evidence'
   echo 'own phase relieved capacity while completed outage evidence stayed open'
@@ -2383,6 +2648,318 @@ cal_phase42_first_recreate() {
   [ ! -s "$CAL_STATE/bad-argv" ] || echo "unexpected argv: $(cat "$CAL_STATE/bad-argv")"
 }
 cal_run "phase 42 snapshots the outgoing agent log before its first force-recreate" cal_phase42_first_recreate
+
+# --- #3644 Docker wiring posture lifecycle ---------------------------------------------------------
+# The agent resolves its Docker wiring ONCE, at (re)create, from a socket-reachability probe; the env line
+# only marks the sidecar as expected (a longer ready budget). The harness below models exactly that: a
+# snapshot of "is the socket reachable" taken ONLY when the agent container is created, with dind stopped
+# two ways (clean: the socket is removed; stale: the socket file lingers but the daemon is gone, so a
+# connect fails). The corrected-order rows run the SHIPPED docker_wire_prepare / docker_wire_assert /
+# docker_restore_posture extracted from lib.sh against the stubs; only the old-sequence negative row is
+# modelled inline. The lib.sh path can be overridden (DOCKER_WIRE_TEST_LIB) so a scratch copy with the old
+# order proves these rows go red; production always runs the shipped file.
+DW_LIB="${DOCKER_WIRE_TEST_LIB:-$LIB}"
+cat > "$SEQ_DIR/docker-wire-harness.sh" <<'DWHARNESS'
+#!/usr/bin/env bash
+set -euo pipefail
+LIB="$1" S="$2" SCENARIO="$3"
+mkdir -p "$S"
+ENVFILE="$S/e2e.env"
+RUNROOT="$S"
+LINE='UZI_DIND_SOCKET=/run/dind/docker.sock'
+SOCK_MODE="${SOCK_MODE:-clean}"
+COMPOSE=(fake_compose)
+DOCKER_WIRE_TIMEOUT=1
+
+reset_state() {
+  find "$S" -mindepth 1 -delete
+  : > "$S/calls"; : > "$S/rawcalls"; : > "$S/forbidden"; : > "$S/recreates"
+  printf 'FOO=1\n' > "$ENVFILE"
+}
+sleep() { command sleep 0.05; }
+say() { :; }
+pass() { echo "pass: $*"; }
+fail() { echo "fail: $*" >&2; exit 17; }
+wait_worker_online() { echo wait_worker_online >> "$S/calls"; }
+capture_agent_logs() { echo "capture $*" >> "$S/calls"; }
+docker() { [ "$1" = logs ] || return 1; cat "$S/log.$2"; }
+apiget() {
+  case "$1" in
+    /api/workers) jq -nc --argjson caps "$(cat "$S/api.caps" 2>/dev/null || echo '[]')" '{workers: [{id: "w-1", status: "online", capabilities: $caps}]}' ;;
+    *) return 1 ;;
+  esac
+}
+# The resolver model: reachability is read ONCE, here, when the container is created.
+agent_create() {
+  local n id reach=0 caps='[]' wired=false
+  n=$(( $(cat "$S/agent.n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$S/agent.n"
+  id="$(printf 'a%011d' "$n")"
+  echo "$id" > "$S/agent.id"
+  if { [ -e "$S/sock" ] && [ -e "$S/daemon" ]; } || [ -n "${STUCK_WIRED:-}" ]; then reach=1; wired=true; caps='["docker"]'; fi
+  printf 'recreate %s wired=%s envline=%s dind=%s\n' "$id" "$reach" \
+    "$(if grep -qxF "$LINE" "$ENVFILE"; then echo present; else echo absent; fi)" \
+    "$([ -f "$S/running.dind" ] && echo up || echo down)" >> "$S/recreates"
+  { echo "{\"msg\":\"docker wiring resolved\",\"docker_wired\":$wired}"
+    echo "{\"msg\":\"registered\",\"worker_id\":\"w-1\",\"capabilities\":$caps}"; } > "$S/log.$id"
+  [ -n "${STALE_API:-}" ] || echo "$caps" > "$S/api.caps"
+}
+fake_compose() {
+  local t svc
+  printf '%s\n' "$*" >> "$S/rawcalls"
+  while [ "${1:-}" = --profile ]; do shift 2; done
+  printf '%s\n' "$*" >> "$S/calls"
+  for t in "$@"; do case "$t" in -v | down | volume) echo "$*" >> "$S/forbidden" ;; esac; done
+  case "$1" in
+    ps)
+      [ -z "${PS_FAIL:-}" ] || return 1
+      svc="${!#}"
+      case "$svc" in
+        agent) [ ! -f "$S/agent.id" ] || cat "$S/agent.id" ;;
+        dind | dind-init) [ ! -f "$S/running.$svc" ] || echo "id-$svc" ;;
+      esac ;;
+    up)
+      case "${!#}" in
+        dind) [ -z "${DIND_UP_FAIL:-}" ] || { echo "${DIND_UP_MSG:-}"; return 1; }
+          : > "$S/running.dind"; : > "$S/running.dind-init"; : > "$S/daemon"; : > "$S/sock" ;;
+        agent) agent_create ;;
+        *) echo "unexpected up: $*" >> "$S/forbidden" ;;
+      esac ;;
+    stop)
+      shift
+      for svc in "$@"; do
+        rm -f "$S/running.$svc"
+        if [ "$svc" = dind ]; then rm -f "$S/daemon"; [ "$SOCK_MODE" != clean ] || rm -f "$S/sock"; fi
+      done ;;
+    rm)
+      shift
+      for svc in "$@"; do
+        [ "$svc" = -f ] && continue
+        [ ! -f "$S/running.$svc" ] || return 1
+        echo "removed $svc" >> "$S/removed"
+      done ;;
+    logs) cat "$S/agentlog.txt" 2>/dev/null || true ;;
+    *) echo "unexpected: $*" >> "$S/forbidden" ;;
+  esac
+}
+fn() { eval "$(awk -v n="$1" '$0 ~ ("^" n "\\(\\) \\{") { p = 1 } p { print } p && /^\}/ { exit }' "$LIB")"; }
+eval "$(awk '/^DOCKER_WIRE_LINE=/ { p = 1 } p { print } p && /^docker_restore_posture\(\) \{/ { q = 1 } q && /^\}/ { exit }' "$LIB")"
+for f in restore_agent_container hold_open_count assert_hold_count_le log_hold_census log_run_hold_census assert_no_open_run_holds \
+  _restore_journal_value restore_check_p_shape restore_assert_canonical_refusal; do fn "$f"; done
+for f in docker_wire_prepare docker_wire_assert docker_restore_posture docker_wire_exit_restore restore_agent_container; do
+  type "$f" >/dev/null 2>&1 || { echo "fail: $f not extracted from $LIB" >&2; exit 2; }
+done
+
+line_of() { grep -n -- "$1" "$S/calls" | "$2" -n 1 | cut -d: -f1; }
+expect_failure() {
+  local want="$1" out; shift
+  if out="$( ( "$@" ) 2>&1 )"; then fail "expected a failure containing [$want], got success: $out"; fi
+  case "$out" in *"$want"*) ;; *) fail "failure lacks [$want]: $out" ;; esac
+}
+start_wired_entry() {
+  : > "$S/running.dind"; : > "$S/running.dind-init"; : > "$S/daemon"; : > "$S/sock"
+  printf '%s\n' "$LINE" >> "$ENVFILE"
+  fake_compose up -d --no-deps --force-recreate agent
+  : > "$S/calls"; : > "$S/rawcalls"
+}
+
+reset_state
+case "$SCENARIO" in
+  shipped)
+    # Entry unwired. prepare wires; the phase's own recreate picks it up; restore returns the posture.
+    docker_wire_prepare
+    [ "$DOCKER_WIRE_OWNED" = 1 ] || fail "prepare did not record ownership"
+    grep -qxF "$LINE" "$ENVFILE" || fail "prepare did not append the env line"
+    fake_compose up -d --no-deps --force-recreate agent
+    docker_wire_assert 2
+    docker_restore_posture
+    last="$(tail -n 1 "$S/recreates")"
+    case "$last" in *"wired=0 envline=absent dind=down") ;; *) fail "final recreate was not an unwired one with the line gone and dind down: $last" ;; esac
+    s="$(line_of '^stop dind dind-init$' head)"; r="$(line_of '^rm -f dind dind-init$' head)"; u="$(line_of 'force-recreate agent' tail)"
+    { [ -n "$s" ] && [ -n "$r" ] && [ -n "$u" ] && [ "$s" -lt "$r" ] && [ "$r" -lt "$u" ]; } || fail "call order is not stop < rm < agent recreate (stop=$s rm=$r recreate=$u)"
+    [ "$(grep -c 'force-recreate agent' "$S/calls")" = 2 ] || fail "the agent must be recreated exactly once by the restore"
+    ! grep -qxF "$LINE" "$ENVFILE" || fail "the phase-owned env line was not removed"
+    grep -qx 'FOO=1' "$ENVFILE" || fail "unrelated env lines must survive"
+    [ ! -s "$S/forbidden" ] || fail "forbidden call: $(cat "$S/forbidden")"
+    [ "$DOCKER_WIRE_OWNED" = 0 ] || fail "ownership not cleared after the restore"
+    echo "OK ends UNWIRED ($SOCK_MODE socket removal): stop<rm<recreate, line gone, dind down at the recreate" ;;
+  already-wired)
+    start_wired_entry
+    before="$(cat "$S/agent.id")"
+    docker_wire_prepare
+    [ "${DOCKER_WIRE_OWNED:-}" = 0 ] || fail "an already wired entry must not be owned"
+    docker_restore_posture
+    ! grep -E '^(stop|rm|up)' "$S/calls" || fail "an already wired entry must not stop, remove or start anything"
+    [ "$(cat "$S/agent.id")" = "$before" ] || fail "an already wired entry must not recreate the agent"
+    grep -qxF "$LINE" "$ENVFILE" && [ -f "$S/running.dind" ] || fail "an already wired entry must keep its line and sidecar"
+    echo "OK entry posture already wired: nothing stopped, removed or recreated" ;;
+  old-sequence)
+    # Inline model of the OLD sequence only: remove the env line, recreate while dind still runs, stop dind,
+    # recreate only if the socket lingered.
+    docker_wire_prepare
+    fake_compose up -d --no-deps --force-recreate agent
+    { grep -vxF "$LINE" "$ENVFILE" > "$ENVFILE.t" || [ "$?" = 1 ]; }; cat "$ENVFILE.t" > "$ENVFILE"
+    fake_compose up -d --no-deps --force-recreate agent
+    fake_compose stop dind dind-init
+    if [ -e "$S/sock" ]; then fake_compose up -d --no-deps --force-recreate agent; fi
+    fake_compose rm -f dind dind-init
+    last="$(tail -n 1 "$S/recreates")"
+    if [ "$SOCK_MODE" = clean ]; then
+      case "$last" in *"wired=1 "*) echo "OK old sequence + clean socket removal ends WIRED (it never recreated): the lifecycle test distinguishes the sequences" ;; *) fail "old sequence unexpectedly unwired on clean removal: $last" ;; esac
+    else
+      case "$last" in *"wired=0 "*) echo "OK old sequence + stale socket ends UNWIRED only because the lingering file triggered the recreate" ;; *) fail "old sequence unexpectedly wired on a stale socket: $last" ;; esac
+    fi ;;
+  prepare-idempotent)
+    docker_wire_prepare
+    docker_wire_prepare
+    [ "$DOCKER_WIRE_OWNED" = 1 ] && [ "$DOCKER_WIRE_STARTED" = "dind-init dind" ] || fail "second prepare clobbered the recorded ownership ($DOCKER_WIRE_OWNED / $DOCKER_WIRE_STARTED)"
+    [ "$(grep -c '^up -d --wait dind$' "$S/calls")" = 1 ] || fail "the sidecar must be started once"
+    [ "$(grep -cxF "$LINE" "$ENVFILE")" = 1 ] || fail "the env line must appear once"
+    echo "OK second prepare is a no-op; ownership and single start/line kept" ;;
+  restore-idempotent)
+    docker_wire_prepare
+    fake_compose up -d --no-deps --force-recreate agent
+    docker_restore_posture
+    : > "$S/calls"
+    before="$(cat "$S/agent.id")"
+    docker_restore_posture
+    [ ! -s "$S/calls" ] || fail "a second restore after a successful one must issue no compose call: $(cat "$S/calls")"
+    [ "$(cat "$S/agent.id")" = "$before" ] || fail "a second restore must not recreate the agent"
+    docker_wire_exit_restore 0
+    [ ! -s "$S/calls" ] || fail "the exit restore after a successful restore must be a no-op: $(cat "$S/calls")"
+    echo "OK restore is idempotent: a second restore and the exit restore after it do nothing" ;;
+  exit-restore)
+    # A phase that fails between prepare and its restore: the exit hook restores the posture and keeps the status.
+    docker_wire_prepare
+    fake_compose up -d --no-deps --force-recreate agent
+    rc=0; docker_wire_exit_restore 3 2>/dev/null || rc=$?
+    [ "$rc" = 3 ] || fail "the exit restore must preserve the phase status 3, got $rc"
+    last="$(tail -n 1 "$S/recreates")"
+    case "$last" in *"wired=0 envline=absent dind=down") ;; *) fail "the exit restore did not leave an unwired agent: $last" ;; esac
+    ! grep -qxF "$LINE" "$ENVFILE" || fail "the exit restore left the env line"
+    # A restore that itself fails is reported loudly and still preserves the original status.
+    DOCKER_WIRE_OWNED=0; reset_state; docker_wire_prepare; fake_compose up -d --no-deps --force-recreate agent; STUCK_WIRED=1
+    rc=0; out="$(docker_wire_exit_restore 5 2>&1)" || rc=$?
+    [ "$rc" = 5 ] || fail "a failing exit restore must preserve the phase status 5, got $rc"
+    case "$out" in *LOUD*) ;; *) fail "a failing exit restore must be loud: $out" ;; esac
+    echo "OK exit restore: unwires on a failed phase, loud on its own failure, original status preserved" ;;
+  prepare-failures)
+    ( reset_state; DIND_UP_FAIL=1; expect_failure 'the DinD sidecar did not become healthy' docker_wire_prepare )
+    ( reset_state; DIND_UP_FAIL=1; DIND_UP_MSG='boom-from-compose'; expect_failure 'boom-from-compose' docker_wire_prepare )
+    ( reset_state; PS_FAIL=1; expect_failure 'cannot read the dind service state at entry' docker_wire_prepare )
+    ( reset_state; : > "$S/running.dind"; expect_failure 'inconsistent entry posture' docker_wire_prepare )
+    ( reset_state; printf '%s\n' "$LINE" >> "$ENVFILE"; expect_failure 'inconsistent entry posture' docker_wire_prepare )
+    echo "OK prepare failures name their cause (unhealthy sidecar, unreadable state, half-wired entry)" ;;
+  assert-failures)
+    ( reset_state; fake_compose up -d --no-deps --force-recreate agent
+      expect_failure 'lacks "docker_wired":true' docker_wire_assert 1 )
+    ( reset_state; : > "$S/daemon"; : > "$S/sock"; echo '[]' > "$S/api.caps"; STALE_API=1; fake_compose up -d --no-deps --force-recreate agent
+      expect_failure 'API worker row w-1 is [nodocker], want [docker]' docker_wire_assert 1 )
+    ( reset_state; : > "$S/daemon"; : > "$S/sock"; fake_compose up -d --no-deps --force-recreate agent
+      docker_wire_assert 1 )
+    echo "OK assert names its cause: no docker_wired:true in the new container, or no docker capability on the worker row" ;;
+  restore-failures)
+    ( reset_state; docker_wire_prepare; fake_compose up -d --no-deps --force-recreate agent; STUCK_WIRED=1
+      expect_failure 'logged "docker_wired":true although the sidecar must be unwired' docker_restore_posture )
+    ( reset_state; docker_wire_prepare; fake_compose up -d --no-deps --force-recreate agent; agent_create() { :; }
+      expect_failure 'was not recreated by the unwire step' docker_restore_posture )
+    ( reset_state; docker_wire_prepare; fake_compose up -d --no-deps --force-recreate agent; STALE_API=1
+      expect_failure 'API worker row w-1 is [docker], want [nodocker]' docker_restore_posture )
+    echo "OK restore verifies the FINAL container: still-wired log, no recreate, stale capability row" ;;
+  census)
+    apiget() { case "$1" in /api/recovery/holds) cat "$S/holds.json" ;; *) return 1 ;; esac; }
+    echo '{"aggregate":{"open_holds":3},"holds":[{"run_id":"R1","generation":1,"state":"open","attention":"source_only"},{"run_id":"R1","generation":2,"state":"released","attention":"none"},{"run_id":"R2","generation":1,"state":"discarded","attention":"none"}]}' > "$S/holds.json"
+    [ "$(hold_open_count)" = 3 ] || fail "hold_open_count"
+    assert_hold_count_le x 3 >/dev/null
+    expect_failure 'exceed the entry baseline 2' assert_hold_count_le x 2
+    expect_failure 'invalid baseline' assert_hold_count_le x abc
+    out="$(log_run_hold_census lbl R1 R3)"
+    case "$out" in *'run R1: (generation=1 state=open attention=source_only) (generation=2 state=released attention=none)'*'run R3: none'*) ;; *) fail "run attribution: $out" ;; esac
+    assert_no_open_run_holds x R2 R3 >/dev/null
+    expect_failure 'run R1 still has open custody holds beyond the declared discards: generation=1' assert_no_open_run_holds x R1 R2
+    echo '{"aggregate":{},"holds":[]}' > "$S/holds.json"
+    if hold_open_count >/dev/null 2>&1; then fail "a missing aggregate must not read as a count"; fi
+    echo 'garbage' > "$S/holds.json"
+    out="$(log_run_hold_census lbl R1)"; case "$out" in *unreadable*) ;; *) fail "unreadable holds must be reported: $out" ;; esac
+    echo "OK census helpers: count, baseline gate, run attribution, open-hold gate, unreadable inputs" ;;
+  p-shape)
+    ROWS=''
+    restore_witness_exec() { printf '%s\n' "$ROWS"; }
+    row() { ROWS="$(printf '/data/repos/x\tuzi-recovery.agent/issue-1.clone\t%s' "$1")"; }
+    shape() { restore_check_p_shape R agent/issue-1 "$1" 2>&1; }
+    row '{"runId":"R","clonePath":"/d/issue-1.attempt-abc","attemptId":"abc"}'
+    shape attempt >/dev/null || fail "an attempt-shaped journal must satisfy attempt"
+    out="$(shape canonical)" && fail "an attempt-shaped journal must not satisfy canonical"
+    case "$out" in *'not the canonical {runId, clonePath} shape'*) ;; *) fail "canonical refusal message: $out" ;; esac
+    row '{"runId":"R","clonePath":"/d/issue-1"}'
+    shape canonical >/dev/null || fail "{runId, clonePath} must satisfy canonical"
+    out="$(shape attempt)" && fail "a canonical journal must not satisfy attempt"
+    case "$out" in *'is not attempt-shaped'*) ;; *) fail "attempt refusal message: $out" ;; esac
+    row '{"runId":"R","clonePath":"/d/issue-1","attemptId":"abc"}'
+    shape canonical >/dev/null && fail "an extra journal key must not satisfy canonical"
+    row '{"runId":"R","clonePath":"/d/issue-1.attempt-abc"}'
+    shape canonical >/dev/null && fail "a .attempt- path must not satisfy canonical"
+    shape attempt >/dev/null && fail "an attemptId-less journal must not satisfy attempt"
+    row '{"runId":"OTHER","clonePath":"/d/issue-1"}'
+    out="$(shape canonical)" && fail "another run's journal must not count"
+    case "$out" in *'expected exactly one predecessor journal'*) ;; *) fail "missing journal message: $out" ;; esac
+    out="$(shape bogus)" && fail "an unknown mode must fail"
+    echo "OK predecessor shape: attempt vs exactly {runId, clonePath} at a canonical path" ;;
+  refusal)
+    db_psql() { cat "$S/dbrow"; }
+    apiget() { case "$1" in /api/runs/R/messages) cat "$S/feed.json" ;; *) return 1 ;; esac; }
+    good_log() {
+      echo '{"msg":"run claimed","run_id":"R"}'; echo '{"msg":"run claimed","run_id":"R"}'
+      echo 'noise before json {"msg":"independent restore refused; predecessor retained","unsupported":"canonical","run_id":"R"}'
+      echo '{"msg":"restore unsupported predecessor held","run_id":"R"}'
+    }
+    try() { # LOG_CMD DBROW FEED — fresh evidence, one bounded observation
+      "$1" > "$S/agentlog.txt"; printf '%s\n' "$2" > "$S/dbrow"; printf '%s\n' "$3" > "$S/feed.json"
+      restore_assert_canonical_refusal R 2 1
+    }
+    GOOD_ROW='recovery_wait|retained_recovery_adoption_failed||2'
+    GOOD_FEED='{"messages":[{"kind":"status","payload":{"text":"this release does not support this predecessor; it is held"}}]}'
+    ( try good_log "$GOOD_ROW" "$GOOD_FEED" >/dev/null )
+    unconfirmed_log() { good_log | sed 's/restore unsupported predecessor held/restore unsupported predecessor hold unconfirmed/'; }
+    ( try unconfirmed_log "$GOOD_ROW" "$GOOD_FEED" >/dev/null )
+    seeded_log() { good_log; echo '{"msg":"independent restore seeded","run_id":"R"}'; }
+    ( expect_failure 'independently restored' try seeded_log "$GOOD_ROW" "$GOOD_FEED" )
+    third_claim_log() { good_log; echo '{"msg":"run claimed","run_id":"R"}'; }
+    ( expect_failure 'claimed 3 times' try third_claim_log "$GOOD_ROW" "$GOOD_FEED" )
+    attempt_log() { good_log | sed 's/"canonical"/"attempt"/'; }
+    ( expect_failure 'missing: refusal-log' try attempt_log "$GOOD_ROW" "$GOOD_FEED" )
+    no_held_log() { good_log | grep -v 'predecessor held'; }
+    ( expect_failure 'missing: held-log' try no_held_log "$GOOD_ROW" "$GOOD_FEED" )
+    ( expect_failure 'feed-text' try good_log "$GOOD_ROW" '{"messages":[]}' )
+    ( expect_failure 'run-state([recovery_wait|worker_requeue_exhausted||2])' try good_log 'recovery_wait|worker_requeue_exhausted||2' "$GOOD_FEED" )
+    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed|2026-01-01 00:00:00+00|2])' try good_log 'recovery_wait|retained_recovery_adoption_failed|2026-01-01 00:00:00+00|2' "$GOOD_FEED" )
+    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed||3])' try good_log 'recovery_wait|retained_recovery_adoption_failed||3' "$GOOD_FEED" )
+    echo "OK canonical refusal: exactly one successor claim, no seed, frozen log + feed text, recovery_wait/adoption-failed with no retry stamp" ;;
+  *) echo "fail: unknown scenario $SCENARIO" >&2; exit 2 ;;
+esac
+DWHARNESS
+
+# dw_case NAME SCENARIO [VAR=VALUE...] — one harness scenario in a fresh bash process and state directory.
+dw_case() {
+  cases=$((cases + 1))
+  local name="$1" scenario="$2" out; shift 2
+  if out="$(env "$@" bash "$SEQ_DIR/docker-wire-harness.sh" "$DW_LIB" "$SEQ_DIR/dw-$cases" "$scenario" 2>&1)" && [[ "$out" == *$'\nOK '* || "$out" == OK\ * ]]; then
+    passed=$((passed + 1)); echo "PASS: $name"
+  else echo "FAIL: $name: $out"; fi
+}
+dw_case "docker wiring: corrected order (SHIPPED docker_restore_posture) ends UNWIRED with a clean socket removal" shipped SOCK_MODE=clean
+dw_case "docker wiring: corrected order (SHIPPED docker_restore_posture) ends UNWIRED with a stale socket file" shipped SOCK_MODE=stale
+dw_case "docker wiring: NEGATIVE old order (remove line, recreate, stop dind, recreate only if the socket lingered) ends WIRED on clean removal" old-sequence SOCK_MODE=clean
+dw_case "docker wiring: old order is only unwired when a stale socket file happens to linger" old-sequence SOCK_MODE=stale
+dw_case "docker wiring: an already wired entry posture issues no stop, rm or recreate" already-wired
+dw_case "docker wiring: prepare is idempotent and keeps its recorded ownership" prepare-idempotent
+dw_case "docker wiring: a second restore (and the exit restore after it) is a no-op" restore-idempotent
+dw_case "docker wiring: the exit restore unwires a failed phase, is loud on failure and keeps the status" exit-restore
+dw_case "docker wiring: prepare failures name their cause" prepare-failures
+dw_case "docker wiring: assert failures name their cause" assert-failures
+dw_case "docker wiring: restore verifies the FINAL container is unwired" restore-failures
+dw_case "hold census helpers: baseline, run attribution and open-hold gates" census
+dw_case "predecessor shape: attempt-shaped vs exactly {runId, clonePath}" p-shape
+dw_case "canonical refusal: one successor claim, no seed, frozen log and feed, recovery_wait/adoption-failed" refusal
 
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"

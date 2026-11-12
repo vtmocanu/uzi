@@ -599,6 +599,18 @@ type IssueProposal struct {
 	ConfirmingSince pgtype.Timestamptz `json:"confirming_since"`
 }
 
+type IssueTrackerConnection struct {
+	ID              uuid.UUID          `json:"id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	Kind            string             `json:"kind"`
+	BaseUrl         string             `json:"base_url"`
+	AccountID       string             `json:"account_id"`
+	AccountLogin    string             `json:"account_login"`
+	TokenCiphertext []byte             `json:"token_ciphertext"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	LastVerifiedAt  pgtype.Timestamptz `json:"last_verified_at"`
+}
+
 type JobFile struct {
 	ID              uuid.UUID          `json:"id"`
 	UserID          uuid.UUID          `json:"user_id"`

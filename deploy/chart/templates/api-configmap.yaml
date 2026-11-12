@@ -37,6 +37,25 @@ data:
   FORGE_ALLOWED_BASE_URLS: {{ join "," .Values.forge.allowedBaseURLs | quote }}
   {{- end }}
   {{- /*
+    ISSUE_TRACKER_ALLOWED_BASE_URLS rendered EXPLICITLY from the first-class
+    issueTracker.allowedBaseURLs value (PRD #4173 S3): the issue tracker SSRF allowlist,
+    SEPARATE from the forge one and never an input to the worker egress FQDN list (a worker
+    never calls an issue tracker). Every entry is validated by
+    uzi.issueTrackerAllowedBaseURLs (https, with a host) before it is rendered. Empty (the
+    default) renders no key, so no issue tracker connection can be created.
+
+    Setting BOTH issueTracker.allowedBaseURLs AND api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS
+    would emit a DUPLICATE ConfigMap key (the range above already emitted the api.config
+    one), so that combination is a hard render failure, like FORGE_ALLOWED_BASE_URLS.
+  */ -}}
+  {{- $issueTrackerURLs := fromJsonArray (include "uzi.issueTrackerAllowedBaseURLs" .) }}
+  {{- if $issueTrackerURLs }}
+  {{- if hasKey .Values.api.config "ISSUE_TRACKER_ALLOWED_BASE_URLS" }}
+  {{- fail "Set the issue tracker allowlist in EITHER issueTracker.allowedBaseURLs OR api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS, not both: both set would emit a duplicate ISSUE_TRACKER_ALLOWED_BASE_URLS ConfigMap key. Prefer issueTracker.allowedBaseURLs." }}
+  {{- end }}
+  ISSUE_TRACKER_ALLOWED_BASE_URLS: {{ join "," $issueTrackerURLs | quote }}
+  {{- end }}
+  {{- /*
     UZI_RELEASE_CHECK_* rendered EXPLICITLY from the first-class releaseCheck values
     (PRD #836), NOT left to the api.config freeform map — so the chart's seed defaults
     track the api's own config.go defaults and the create-only seeder is not fought.

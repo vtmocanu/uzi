@@ -34,9 +34,13 @@ import { HealthPlatformLine } from "../components/HealthPlatformLine";
 import { HealthChip } from "../components/HealthChip";
 import { PeopleChip } from "../components/PeopleChip";
 import { InShellHeader } from "../components/PageHeaderSlot";
-import { PageHeader } from "../components/ui";
+import { Button, PageHeader } from "../components/ui";
+import { useCommandMenu } from "../components/CommandMenuContext";
+import { SearchIcon } from "../components/icons";
+import { commandShortcutKeys, commandShortcutLabel } from "../lib/platform";
 
 export function OverviewNext() {
+  const commandMenu = useCommandMenu();
   const demo = useDemoMode();
   const { user } = useAuth();
   const { data, usageWindow, changeUsageWindow, adminRuns, adminUsers, holds, holdsFailed } = useOverviewData({
@@ -121,6 +125,18 @@ export function OverviewNext() {
           description={sentence}
           actions={
             <>
+              {commandMenu && (
+                <Button variant="secondary" size="sm" onClick={commandMenu.open} aria-keyshortcuts={commandShortcutKeys()}>
+                  <SearchIcon aria-hidden="true" />
+                  Search
+                  <kbd
+                    aria-hidden="true"
+                    className="ml-1 rounded border border-edge bg-surface px-1 font-mono text-[11px] text-muted"
+                  >
+                    {commandShortcutLabel()}
+                  </kbd>
+                </Button>
+              )}
               {isAdmin && <HealthChip />}
               {people && <PeopleChip model={people} onShowUsageByUser={showUsageByUser} />}
               <Link to="/dashboard" className="text-sm font-medium text-brand hover:text-brand-hover">

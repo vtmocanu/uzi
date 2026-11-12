@@ -9,6 +9,14 @@ import http from "node:http";
  */
 export const ENABLE_DELETION_FOR_TEST: symbol = Symbol.for("uzi.test.pod-epoch-reclaim.enable-deletion");
 
+/**
+ * Test-only activation override for runPodEpochShadow's runner-scratch phase (issue #4043), passed as
+ * `scratch.scratchTestGate`. Defined here, in a module nothing under agent/src imports; the literal is the one
+ * pod-epoch-reclaim.ts compares against, and test/pod-epoch-reclaim-scratch.test.ts asserts that no other
+ * agent/src file references it.
+ */
+export const ENABLE_SCRATCH_FOR_TEST: symbol = Symbol.for("uzi.test.pod-epoch-reclaim.scratch-gate");
+
 /** A minimal fake Docker daemon: healthy GET-only probes plus a held /events stream. */
 export async function daemon() {
   let events: http.ServerResponse | undefined;

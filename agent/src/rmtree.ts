@@ -435,13 +435,47 @@ function drain(dirFd, limit, spend, skip, each, onFirst) {
  * pinned; phase `listed` pauses after the leaf's first batch of names was read and before
  * any child in it is pinned; phase `emptied` pauses after a child directory was emptied and
  * before it is `rmdir`ed through its parent.
+ *
+ * Issue #4043 STRICT scratch mode: three trailing arguments after `<sync> <phase>` (`<sync>` may be
+ * the empty string, which turns the seams off): `<rootExpect> <oneFs> <maxDepth>`. Absent (every
+ * caller above), the script behaves exactly as described so far. `<rootExpect>` (`<dev>:<ino>`, or
+ * `""`/`-` for none) is compared with the pinned `<home>` right after it is pinned (exit 3 on a
+ * mismatch). `<oneFs>` `1` selects strict mode (only with `remove`, a single-component `<rel>`, a
+ * `<dev>:<ino>` `<expect>`, a `<rootExpect>` and a `<maxDepth>`; anything else exits 6):
+ *  - every directory pinned during the walk must be on the root's st_dev; another one is skipped
+ *    (neither entered nor removed) and the script ends with exit 9;
+ *  - before each descendant `rmdir` the name is re-pinned `O_NOFOLLOW` and its dev:ino compared with
+ *    the pin taken before descending; a mismatch keeps it (exit 3 at the end). A swap that lands
+ *    between that comparison and the `rmdir` can at worst remove an empty directory planted there;
+ *  - nothing is chmodded (no re-owning): an entry that cannot be opened or emptied is left (exit 4);
+ *  - the top-level leaf pin and its parent pin stay open until the script ends;
+ *  - descending beyond `<maxDepth>` stops (the directory is kept) and ends with exit 8;
+ *  - receipt: it prints `UZI-SCRATCH-REMOVED <dev>:<ino>` (the `<expect>`) and exits 0 ONLY IF this
+ *    process's own final `rmdir` of the name succeeded after the name pinned `<expect>`, AND the
+ *    still-open leaf pin then reports `<expect>` with `st_nlink` 0. A failed `rmdir` (ENOENT
+ *    included, e.g. another actor removed the emptied original) never prints one. Without a receipt
+ *    the exit is 4 when the original is still linked at its name, else 3.
+ * When several apply, the exit code precedence is 3 > 9 > 8 > 4. The extra test-only seam phases
+ * `rechecked` (after the descendant re-pin comparison, before its `rmdir`) and `final` (after the
+ * name pinned `<expect>`, before the final `rmdir`) exist only with a non-empty `<sync>`; so does the
+ * `<sync>.otherdev` file, whose content names a descendant that is then skipped as if on another st_dev (the seam can only skip, never equalise).
  */
-const PINNED_SUBTREE_SCRIPT = `${PINNED_PRELUDE}${STREAM_PRELUDE}
-const [home, rel, maxArg, budgetArg, mode = "remove", expect = "-", sync, phase = "pinned"] = process.argv.slice(1);
+export const PINNED_SUBTREE_SCRIPT = `${PINNED_PRELUDE}${STREAM_PRELUDE}
+const [home, rel, maxArg, budgetArg, mode = "remove", expect = "-", sync, phase = "pinned",
+  rootExpect = "", oneFs = "", maxDepthArg = ""] = process.argv.slice(1);
 const maxEntries = Number(maxArg);
 const budgetMs = Number(budgetArg);
 if (!home || !home.startsWith("/") || !rel || !(maxEntries >= 0) || !(budgetMs >= 0)) process.exit(6);
 if (mode !== "remove" && mode !== "empty") process.exit(6);
+if (oneFs !== "" && oneFs !== "1") process.exit(6);
+const strict = oneFs === "1";
+const maxDepth = strict ? Number(maxDepthArg) : Infinity;
+if (strict && (mode !== "remove" || rel.includes("/") || rel === "." || rel === ".." || !/^\\d+:\\d+$/.test(expect) || !/^\\d+:\\d+$/.test(rootExpect) ||
+    !(Number.isInteger(maxDepth) && maxDepth >= 0))) process.exit(6);
+let rootDev;
+let changed = false;
+let devSkipped = false;
+let depthHit = false;
 const deadline = Date.now() + budgetMs;
 let readCount = 0;
 let exhausted = false;
@@ -458,12 +492,22 @@ function pause(point) {
   const until = Date.now() + 10000;
   while (!fs.existsSync(sync + ".go") && Date.now() < until) Atomics.wait(cell, 0, 0, 10);
 }
+// Test seam, live only with a non-empty sync: sync.otherdev holding a name makes that descendant be skipped as another st_dev.
+function otherDev(name) {
+  if (!sync) return false;
+  try { return fs.readFileSync(sync + ".otherdev", "utf8") === name; } catch { return false; }
+}
 const verdict = (e) => (e.code === "ENOENT" ? 2 : e.code === "ELOOP" || e.code === "ENOTDIR" ? 3 : 7);
 const parts = rel.split("/");
 let parentFd;
 let leafPin;
 try {
   leafPin = fs.openSync(home, PIN);
+  if (rootExpect !== "" && rootExpect !== "-") {
+    const rootSt = fs.fstatSync(leafPin, { bigint: true });
+    if (rootSt.dev + ":" + rootSt.ino !== rootExpect) process.exit(3);
+    rootDev = rootSt.dev;
+  }
   for (const part of parts) {
     if (parentFd !== undefined) fs.closeSync(parentFd);
     parentFd = leafPin;
@@ -476,11 +520,12 @@ if (expect !== "-") {
   const st = fs.fstatSync(leafPin, { bigint: true });
   if (st.dev + ":" + st.ino !== expect) process.exit(3);
 }
+if (strict && fs.fstatSync(leafPin, { bigint: true }).dev !== rootDev) process.exit(9);
 const leafName = parts[parts.length - 1];
 const uid = process.getuid();
 function openOwned(pinFd) {
   const st = fs.fstatSync(pinFd);
-  if (st.uid === uid && (st.mode & 0o700) !== 0o700) {
+  if (!strict && st.uid === uid && (st.mode & 0o700) !== 0o700) {
     try { fs.chmodSync(FD + pinFd, (st.mode & 0o7777) | 0o700); } catch {}
   }
   return reopen(pinFd);
@@ -491,11 +536,12 @@ pause("pinned");
 const BATCH = 256;
 const gone = (err) => err.code === "ENOENT";
 // Remove one entry of the directory pinned at dirFd; true when its name is gone.
-function removeEntry(dirFd, e) {
+function removeEntry(dirFd, e, depth) {
   const p = at(dirFd, e.name);
   if (!e.isDir) {
     try { fs.unlinkSync(p); return true; } catch (err) { return gone(err); }
   }
+  if (depth + 1 > maxDepth) { depthHit = true; return false; }
   let pin;
   try { pin = fs.openSync(p, PIN); } catch (err) {
     // Swapped for a symlink or file since it was listed: remove that entry, never follow it.
@@ -504,11 +550,39 @@ function removeEntry(dirFd, e) {
     }
     return gone(err);
   }
+  let pinId;
+  if (strict) {
+    try {
+      const st = fs.fstatSync(pin, { bigint: true });
+      if (otherDev(e.name) || st.dev !== rootDev) { fs.closeSync(pin); devSkipped = true; return false; }
+      pinId = st.dev + ":" + st.ino;
+    } catch { fs.closeSync(pin); changed = true; return false; }
+  }
   let childFd;
   try { childFd = openOwned(pin); } catch { return false; } finally { fs.closeSync(pin); }
-  try { emptyDir(childFd, false); } finally { fs.closeSync(childFd); }
+  try { emptyDir(childFd, false, depth + 1); } finally { fs.closeSync(childFd); }
   if (exhausted) return false;
   pause("emptied");
+  if (strict) {
+    // Re-pin the name: it must still be the directory that was emptied.
+    try {
+      const again = fs.openSync(p, PIN);
+      let same;
+      try { const st = fs.fstatSync(again, { bigint: true }); same = st.dev + ":" + st.ino === pinId; }
+      finally { fs.closeSync(again); }
+      if (!same) { changed = true; return false; }
+    } catch (err) {
+      if (gone(err)) return true;
+      changed = true;
+      return false;
+    }
+    pause("rechecked");
+    try { fs.rmdirSync(p); return true; } catch (err) {
+      // A swap to a file after the comparison: kept, never unlinked.
+      if (err.code === "ENOTDIR") changed = true;
+      return gone(err);
+    }
+  }
   try { fs.rmdirSync(p); return true; } catch (err) {
     // Swapped for a symlink or file while it was being emptied: unlink that entry itself.
     if (err.code === "ENOTDIR") {
@@ -517,22 +591,52 @@ function removeEntry(dirFd, e) {
     return gone(err);
   }
 }
-function emptyDir(dirFd, isLeaf) {
+function emptyDir(dirFd, isLeaf, depth) {
   const stuck = new Set();
   drain(dirFd, BATCH, spend, stuck, (batch) => {
     let removed = 0;
     for (const e of batch) {
-      if (removeEntry(dirFd, e)) removed++;
+      if (removeEntry(dirFd, e, depth)) removed++;
       else stuck.add(e.name);
     }
     return removed;
   }, isLeaf ? () => pause("listed") : undefined);
 }
-emptyDir(leafFd, true);
+emptyDir(leafFd, true, 0);
 if (mode === "empty") {
   let left;
   try { left = readSome(leafFd, 1, new Set(), () => true).length; } catch { left = 1; }
   process.exit(exhausted ? 8 : left === 0 ? 0 : 4);
+}
+if (strict) {
+  // The leaf pin and its parent pin stay open to the end: the receipt reads the pin's st_nlink.
+  fs.closeSync(leafFd);
+  if (changed) process.exit(3);
+  if (devSkipped) process.exit(9);
+  if (exhausted || depthHit) process.exit(8);
+  const linked = () => {
+    try {
+      const fd = fs.openSync(at(parentFd, leafName), PIN);
+      const st = fs.fstatSync(fd, { bigint: true });
+      fs.closeSync(fd);
+      return st.dev + ":" + st.ino === expect ? "pinned" : "other";
+    } catch (e) {
+      return e.code === "ENOENT" ? "gone" : "other";
+    }
+  };
+  let ours = false;
+  if (linked() === "pinned") {
+    pause("final");
+    try { fs.rmdirSync(at(parentFd, leafName)); ours = true; } catch {}
+  }
+  if (ours) {
+    const st = fs.fstatSync(leafPin, { bigint: true });
+    if (st.dev + ":" + st.ino === expect && st.nlink === 0n) {
+      fs.writeSync(1, "UZI-SCRATCH-REMOVED " + expect + "\\n");
+      process.exit(0);
+    }
+  }
+  process.exit(linked() === "pinned" ? 4 : 3);
 }
 const pinned = fs.fstatSync(leafPin);
 fs.closeSync(leafFd);
@@ -859,7 +963,7 @@ const SELF_FD = "/proc/self/fd/";
 
 /** One path component: no separator, not `.`/`..`, not dash-leading (it becomes a bare
  *  `node -e` argument). Run ids and `mkdtemp` names (`uzi-judge-XXXXXX`) all fit. */
-const TREE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+export const TREE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 const TEARDOWN_COMPONENT_RE = /^(?![.-])[^\p{Cc}/\\]+$/u;
 function isTeardownComponent(name: string): boolean {
   return TEARDOWN_COMPONENT_RE.test(name);
@@ -1810,6 +1914,176 @@ export async function runAgentHelper(
       } catch { cancel(); }
     } else child.stdin?.end(input);
   });
+}
+
+/** Issue #4043: the constants the strict scratch delete (PINNED_SUBTREE_SCRIPT, `<oneFs>` 1) is
+ * launched with; the launch validator in git.ts admits exactly these. */
+export const SCRATCH_DELETE_LIMITS = { maxEntries: 2_000_000, budgetMs: 300_000, maxDepth: 256, killSlackMs: HELPER_SLACK_MS } as const;
+
+/** Caps the scratch census helper enforces. */
+const SCRATCH_CENSUS_LIMITS = { rootEntries: 4096, leafEntries: 200_000, totalEntries: 2_000_000, depth: 256 } as const;
+
+/**
+ * Issue #4043: the read-only scratch census, as
+ * `node -e <script> <root> <rootExpect> <leaf|-> <maxRoot> <maxLeaf> <maxTotal> <maxDepth> <budgetMs>`.
+ * It pins `<root>` component by component from `/` ({@link PINNED_PRELUDE}: a symlink or non-directory
+ * component exits 3, a missing one 2), prints the root's identity as the FIRST line
+ * (`{"root":"<dev>:<ino>","uid":N,"mode":N}`) and exits 3 when that differs from `<rootExpect>`. It then
+ * walks `lstat`-only through pinned descriptors (a symlink is never followed, a directory is descended
+ * only after an `O_NOFOLLOW` re-pin whose identity equals the `lstat`; a directory on another st_dev is
+ * reported, never entered) and prints one JSON line per top-level entry:
+ * `{name,type:"dir"|"other"|"absent"|"unreadable",dev,ino,uid,fsdiff,fuid,bytes,shared,ctime,inc}`
+ * (`unreadable` = an lstat error other than ENOENT; names are read as bytes, and one that is not valid
+ * UTF-8 is reported as a lone surrogate plus its hex bytes; `dev`/`ino`
+ * decimal strings; `bytes` = allocated bytes of directories and `nlink==1` entries, `shared` = those of
+ * `nlink>1` entries; `ctime` = the newest ctime in ms over the whole subtree including the entry itself;
+ * `fsdiff` = any subtree entry on another st_dev; `fuid` = any entry whose uid is not the root's; `inc` = a
+ * cap, the time budget or an unreadable entry made the numbers a lower bound). A final
+ * `{"end":true,"entries":N,"overflow":bool}` line is the only proof the listing finished. With `<leaf>`
+ * only that name is censused (`type:"absent"` when it is gone). Caps: `<maxRoot>` top-level entries
+ * (beyond: `overflow`), `<maxLeaf>` entries per leaf, `<maxTotal>` overall, depth `<maxDepth>`, and the
+ * helper's own `<budgetMs>` (the worker cannot always signal it: the uid split). A leaf past a cap is
+ * emitted `inc` without further walking. Exit 0 listed; 2/3/5/6/7 as the other pinned helpers.
+ */
+export const SCRATCH_CENSUS_SCRIPT = `${PINNED_PRELUDE}
+const [rootArg, expect, leafArg, maxRootArg, maxLeafArg, maxTotalArg, maxDepthArg, budgetArg] = process.argv.slice(1);
+const maxRoot = Number(maxRootArg), maxLeaf = Number(maxLeafArg), maxTotal = Number(maxTotalArg);
+const maxDepth = Number(maxDepthArg), budgetMs = Number(budgetArg);
+if (!rootArg || !rootArg.startsWith("/") || !(maxRoot >= 1) || !(maxLeaf >= 1) || !(maxTotal >= 1) ||
+    !(maxDepth >= 1) || !(budgetMs >= 0) || !expect) process.exit(6);
+const parts = rootArg.split("/").slice(1);
+if (parts.length === 0 || parts.some((x) => x === "" || x === "." || x === "..")) process.exit(6);
+if (leafArg !== "-" && (leafArg === "" || leafArg === "." || leafArg === ".." || leafArg.includes("/") || leafArg.includes("\\0"))) process.exit(6);
+const deadline = Date.now() + budgetMs;
+const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+// Entry names are bytes: every path below is a Buffer, so a name that is not valid UTF-8 is examined
+// as itself and never aliases another name through U+FFFD replacement.
+const atb = (fd, nameBuf) => Buffer.concat([Buffer.from(FD + fd + "/"), nameBuf]);
+// ignoreBOM keeps a leading U+FEFF, so a name is never reported as a different name.
+const strict = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+let rootPin;
+try {
+  rootPin = fs.openSync("/", PIN);
+  for (const part of parts) { const next = fs.openSync(at(rootPin, part), PIN); fs.closeSync(rootPin); rootPin = next; }
+} catch (e) {
+  process.exit(e.code === "ENOENT" ? 2 : e.code === "ELOOP" || e.code === "ENOTDIR" ? 3 : 7);
+}
+const rst = fs.fstatSync(rootPin, { bigint: true });
+const rootId = rst.dev + ":" + rst.ino;
+out({ root: rootId, uid: Number(rst.uid), mode: Number(rst.mode) & 0o7777 });
+if (rootId !== expect) process.exit(3);
+let rootFd;
+try { rootFd = reopen(rootPin); } catch { process.exit(7); }
+let total = 0;
+function note(L, st) {
+  const c = Number(st.ctimeMs);
+  if (c > L.ctime) L.ctime = c;
+  if (st.dev !== rst.dev) L.fsdiff = true;
+  if (st.uid !== rst.uid) L.fuid = true;
+  const b = Number(st.blocks) * 512;
+  if (st.isDirectory() || st.nlink <= 1n) L.bytes += b; else L.shared += b;
+}
+function room(L) {
+  if (L.inc) return false;
+  if (L.count >= maxLeaf || total >= maxTotal || Date.now() > deadline) { L.inc = true; return false; }
+  L.count++; total++;
+  return true;
+}
+function walk(L, dirFd, depth) {
+  let dir;
+  try { dir = fs.opendirSync(FD + dirFd, { encoding: "buffer" }); } catch { L.inc = true; return; }
+  try {
+    for (;;) {
+      let e;
+      try { e = dir.readSync(); } catch { L.inc = true; return; }
+      if (e === null || !room(L)) return;
+      const ep = atb(dirFd, Buffer.from(e.name));
+      let st;
+      try { st = fs.lstatSync(ep, { bigint: true }); } catch { L.inc = true; continue; }
+      note(L, st);
+      if (!st.isDirectory() || st.dev !== rst.dev) continue;
+      if (depth + 1 > maxDepth) { L.inc = true; continue; }
+      let child;
+      try {
+        const pin = fs.openSync(ep, PIN);
+        try {
+          const ps = fs.fstatSync(pin, { bigint: true });
+          if (ps.dev !== st.dev || ps.ino !== st.ino) { L.inc = true; continue; }
+          child = reopen(pin);
+        } finally { fs.closeSync(pin); }
+      } catch { L.inc = true; continue; }
+      try { walk(L, child, depth + 1); } finally { fs.closeSync(child); }
+    }
+  } finally {
+    dir.closeSync();
+  }
+}
+// The reported name: the string when the bytes are valid UTF-8, else a lone surrogate plus the hex
+// bytes (no valid name decodes to a lone surrogate, so it can neither collide nor be mistaken for one).
+function reportName(nameBuf) {
+  try { return strict.decode(nameBuf); } catch { return "\\ud800" + nameBuf.toString("hex"); }
+}
+function entry(nameBuf) {
+  const name = reportName(nameBuf);
+  const L = { count: 0, ctime: 0, bytes: 0, shared: 0, fsdiff: false, fuid: false, inc: false };
+  const ep = atb(rootFd, nameBuf);
+  let st;
+  try { st = fs.lstatSync(ep, { bigint: true }); } catch (e) {
+    if (e.code === "ENOENT") { out({ name, type: "absent" }); return; }
+    out({ name, type: "unreadable", dev: "0", ino: "0", uid: -1, fsdiff: false, fuid: false, bytes: 0, shared: 0, ctime: 0, inc: true });
+    return;
+  }
+  total++;
+  note(L, st);
+  const isDir = st.isDirectory();
+  if (total > maxTotal || Date.now() > deadline) L.inc = true;
+  else if (isDir && st.dev === rst.dev) {
+    try {
+      const pin = fs.openSync(ep, PIN);
+      let child;
+      try {
+        const ps = fs.fstatSync(pin, { bigint: true });
+        if (ps.dev !== st.dev || ps.ino !== st.ino) L.inc = true;
+        else child = reopen(pin);
+      } finally { fs.closeSync(pin); }
+      if (child !== undefined) { try { walk(L, child, 1); } finally { fs.closeSync(child); } }
+    } catch { L.inc = true; }
+  }
+  out({ name, type: isDir ? "dir" : "other", dev: String(st.dev), ino: String(st.ino), uid: Number(st.uid),
+    fsdiff: L.fsdiff, fuid: L.fuid, bytes: L.bytes, shared: L.shared, ctime: L.ctime, inc: L.inc });
+}
+let seen = 0, overflow = false;
+if (leafArg !== "-") { entry(Buffer.from(leafArg)); seen = 1; }
+else {
+  let dir;
+  try { dir = fs.opendirSync(FD + rootFd, { encoding: "buffer" }); } catch { process.exit(7); }
+  try {
+    for (;;) {
+      let e;
+      try { e = dir.readSync(); } catch { process.exit(7); }
+      if (e === null) break;
+      if (seen >= maxRoot) { overflow = true; break; }
+      seen++;
+      entry(Buffer.from(e.name));
+    }
+  } finally { dir.closeSync(); }
+}
+out({ end: true, entries: seen, overflow });
+`;
+
+/**
+ * Issue #4043: run {@link SCRATCH_CENSUS_SCRIPT} as the runner uid (the only uid that can read a 0700
+ * split root), joined on timeout and killed through the runner-group killer under the uid split, so a
+ * returned promise never leaves the census walking. `leaf` censuses a single top-level name.
+ */
+export async function censusScratchRoot(
+  root: string, rootExpect: string, leaf: string | undefined, timeoutMs: number,
+): Promise<{ code: number; stdout: string }> {
+  const lim = SCRATCH_CENSUS_LIMITS;
+  return runAgentHelper(runnerCommand, SCRATCH_CENSUS_SCRIPT,
+    [root, rootExpect, leaf ?? "-", String(lim.rootEntries), String(lim.leafEntries), String(lim.totalEntries),
+      String(lim.depth), String(Math.max(0, Math.floor(timeoutMs) - HELPER_SLACK_MS))],
+    timeoutMs, "", { joinOnTimeout: true, killAsHelperUid: helperUidKillerFor(runnerCommand) });
 }
 
 /**

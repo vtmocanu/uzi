@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolve, join } from "node:path";
-import { runPodEpochShadow, readPodEpochProjection, PodEpochSettlementError, EPOCH_RECLAIM_DELETION_ENABLED } from "../src/pod-epoch-reclaim.js";
+import { runPodEpochShadow, readPodEpochProjection, PodEpochSettlementError } from "../src/pod-epoch-reclaim.js";
 import { PodEpochDaemonError } from "../src/pod-epoch-daemon.js";
 import { WorkerClient } from "../src/client.js";
 import { buildPodEpochDeletionDeps } from "../src/main.js";
@@ -1130,15 +1130,114 @@ const noMutation = (w: ReturnType<typeof makeWorld>) => {
   assert.equal(w.spies.ended.length, 0); assert.equal(w.spies.reserved.length, 0);
 };
 
-test("with the production flag value no scope, proof or mutation exists even for an eligible attested pass", async () => {
-  assert.equal(EPOCH_RECLAIM_DELETION_ENABLED, false);
-  await withDeletion(2, w => { delete (w.options.deletion as { enableForTest?: symbol }).enableForTest; }, (w, result) => {
-    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "shadow_complete");
-    assert.equal(result.authority.result, "attested"); assert.equal(result.would_delete, 2);
-    noMutation(w); assert.equal(w.spies.begins, 0); assert.equal(w.spies.journalReads.length, 0);
-    assert.equal(result.deleted + result.settled + result.kept_after_refusal + result.kept_residue, 0);
-    assert.equal(result.reclaim_bytes_state, "unknown");
-    assert.deepEqual(w.events, ["handover"]);
+const withoutSentinel = (activation?: boolean) => (w: ReturnType<typeof makeWorld>) => {
+  const deps = w.options.deletion as { enableForTest?: symbol; activation?: boolean };
+  delete deps.enableForTest;
+  if (activation !== undefined) deps.activation = activation;
+};
+test("off: no sentinel and activation absent or false leaves no scope, proof or mutation for an eligible attested pass", async () => {
+  for (const activation of [undefined, false]) {
+    await withDeletion(2, withoutSentinel(activation), (w, result) => {
+      assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "shadow_complete");
+      assert.equal(result.authority.result, "attested"); assert.equal(result.would_delete, 2);
+      noMutation(w); assert.equal(w.spies.begins, 0); assert.equal(w.spies.journalReads.length, 0);
+      assert.equal(result.deleted + result.settled + result.kept_after_refusal + result.kept_residue, 0);
+      assert.equal(result.reclaim_bytes_state, "unknown");
+      assert.deepEqual(w.events, ["handover"]);
+    });
+  }
+});
+test("on: no sentinel and activation true deletes and settles exactly like the sentinel path", async () => {
+  const run = async (tune: (w: ReturnType<typeof makeWorld>) => void) => {
+    let seen: { result: unknown; events: string[]; reserved: string[]; ended: string[][]; proofs: unknown[] } | undefined;
+    await withDeletion(3, w => {
+      w.mutateSource = (s, i) => { if (i === 1) { s.presence = "missing"; s.sources[0]!.presence = "missing"; s.sources[0]!.allocatedBytes = null; } };
+      w.discard = (_o, path) => ({ kind: "done", sources: [{ clonePath: path, outcome: path === "/tree/1" ? "missing" : "removed" }],
+        metadata: "retired", tookOver: true });
+      tune(w);
+    }, (w, result) => {
+      seen = { result, events: w.events, reserved: w.spies.reserved, ended: w.spies.ended.map(e => e.paths),
+        proofs: w.spies.proofs.map(p => p.paths) };
+    });
+    return seen!;
+  };
+  const sentinel = await run(() => {});
+  const active = await run(withoutSentinel(true));
+  const strip = (r: any) => ({ ...r.result, elapsed_ms: undefined });
+  assert.equal((active.result as any).deleted, 2); assert.equal((active.result as any).settled, 1);
+  assert.equal((active.result as any).reason, "reclaim_complete");
+  assert.deepEqual(active.events, ["begin", "finish", "handover"]);
+  assert.deepEqual(active.reserved, ["run0", "run1", "run2"]);
+  assert.deepEqual(active.ended, [["/tree/0"], ["/tree/1"], ["/tree/2"]]);
+  assert.deepEqual(active.events, sentinel.events);
+  assert.deepEqual(active.proofs, sentinel.proofs);
+  assert.equal((active.result as any).deleted_bytes, (sentinel.result as any).deleted_bytes);
+  assert.equal(strip(active).verdict, strip(sentinel).verdict);
+});
+test("on, still non-effectful: activation never deletes after an early refusal, a partial verdict, a missing native scope or absent deps", async () => {
+  // The unattested-authority and aborted-pass cases below end the pass with a refusal before the deletion gate
+  // is evaluated, so they pin those refusals, not the gate's own `authority.result === "attested"` and
+  // `!controller.signal.aborted` conjuncts. The gate is reached only after decide("attested") and a synchronous
+  // check() that throws on an abort, so no test-world pass arrives there unattested or aborted; those two
+  // conjuncts stay unpinned.
+  const cases: Array<[string, (w: ReturnType<typeof makeWorld>) => void | Promise<void>]> = [
+    ["partial inventory", w => {
+      const discover = w.options.git.discoverEpochRetainedSources;
+      w.options.git.discoverEpochRetainedSources = async o => ({ ...await discover(o), inventoryComplete: false, unreadable: 1 });
+    }],
+    ["unattested authority", async w => { const raw = await fixture("v2/valid/contradicted.json"); w.options.readEvidence = async () => raw; }],
+    ["aborted pass", w => { w.parent.abort(); }],
+    ["no beginReclaim", w => { delete (w.options.ownership as { beginReclaim?: unknown }).beginReclaim; }],
+    ["absent deps", w => { delete w.options.deletion; }],
+  ];
+  for (const [label, tune] of cases) {
+    const d = await daemon();
+    try {
+      const w = deletionWorld(2); withoutSentinel(true)(w); await tune(w); w.options.dockerHost = d.host;
+      const result = await runPodEpochShadow(w.options);
+      noMutation(w); assert.equal(w.spies.begins, 0, label); assert.equal(w.spies.journalReads.length, 0, label);
+      assert.equal((result?.deleted ?? 0) + (result?.settled ?? 0), 0, label);
+      assert.notEqual(result?.reason, "reclaim_complete", label);
+    } finally { await d.close(); }
+  }
+});
+test("#3851 with activation on, measured candidates proceed, a locally short part stays kept and a pass-wide partial never deletes", async () => {
+  // A tree-local shortfall seen by the shadow keeps only that source.
+  await withDeletion(3, w => {
+    withoutSentinel(true)(w);
+    const base = w.mutateSource;
+    w.mutateSource = (s, i) => {
+      base(s, i);
+      if (i === 1) { s.bytesState = "unknown"; s.allocatedBytes = null; s.sources[0]!.allocatedBytes = null; s.sources[0]!.measurementShortfall = "eacces"; }
+    };
+  }, (w, result) => {
+    assert.equal(result.would_delete, 2); assert.equal(result.deleted, 2);
+    assert.deepEqual(w.spies.proofs.map(p => p.paths), [["/tree/0"], ["/tree/2"]]);
+    assert.ok(w.spies.reserved.every(run => run !== "run1"), "the short source is never reserved");
+    assert.ok(w.spies.ended.every(e => !e.paths.includes("/tree/1")));
+  });
+  // A pass-wide partial inspection never enters the deletion phase.
+  await withDeletion(2, w => {
+    withoutSentinel(true)(w);
+    const inspect = w.options.git.inspectRetainedSources;
+    w.options.git.inspectRetainedSources = async o => ({ ...await inspect(o), partial: true });
+  }, (w, result) => {
+    noMutation(w); assert.equal(w.spies.begins, 0); assert.equal(result.verdict, "partial");
+    assert.equal(result.deleted + result.settled, 0);
+  });
+  // A re-inspection that turns short refuses that source only (activation path).
+  await withDeletion(2, w => {
+    withoutSentinel(true)(w);
+    const inspections = [0, 0];
+    w.mutateSource = (s, i) => {
+      if (++inspections[i]! === 2 && i === 0) {
+        s.bytesState = "unknown"; s.allocatedBytes = null;
+        s.sources[0]!.allocatedBytes = null; s.sources[0]!.measurementShortfall = "eacces";
+      }
+    };
+  }, (w, result) => {
+    assert.equal(result.kept_after_refusal, 1); assert.equal(result.deleted, 1);
+    assert.deepEqual(w.spies.proofs.map(p => p.paths), [["/tree/1"]]);
   });
 });
 test("nothing under agent/src references the deletion override, which only pod-epoch-reclaim.ts defines", async () => {
@@ -1158,9 +1257,11 @@ test("nothing under agent/src references the deletion override, which only pod-e
     "exactly one comparison of enableForTest against the sentinel");
   assert.equal(definition.match(/TEST_ENABLE_DELETION\b/g)?.length, 2, "the sentinel is defined once and compared once");
   const built = buildPodEpochDeletionDeps({ authority: {} as never, runner: { withSourceReservation: async () => undefined },
-    git: {} as never, dockerHost: undefined });
+    git: {} as never, dockerHost: undefined, activation: false });
   assert.equal("enableForTest" in built, false, "the deps object main.ts builds has no enableForTest key");
-  assert.equal(definition.match(/export const EPOCH_RECLAIM_DELETION_ENABLED: boolean = false;/g)?.length, 1);
+  assert.equal(built.activation, false);
+  assert.equal(definition.match(/deps\.activation === true \|\| deps\.enableForTest/g)?.length, 1, "one gate expression");
+  assert.ok(!definition.includes("EPOCH_RECLAIM_DELETION_ENABLED"), "the compile-time constant is gone");
 });
 test("an eligible attested pass with the override deletes present sources, settles missing ones, then finishes before handover", async () => {
   await withDeletion(3, w => {

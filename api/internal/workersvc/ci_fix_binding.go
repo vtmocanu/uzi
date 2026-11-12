@@ -130,6 +130,7 @@ func (s *Service) resolveCIFixBinding(ctx context.Context, row store.GetRepoForU
 	if err != nil {
 		return pgtype.Int8{}, nil, ciFixLookupFailed("forge for connection", err)
 	}
+	var ch forge.CodeHost = f
 
 	var (
 		open        []int64
@@ -137,7 +138,7 @@ func (s *Service) resolveCIFixBinding(ctx context.Context, row store.GetRepoForU
 		reason      string
 	)
 	for _, iid := range cands {
-		sum, gerr := f.GetMergeRequestSummary(ctx, row.ForgeProjectID, iid)
+		sum, gerr := ch.GetMergeRequestSummary(ctx, row.ForgeProjectID, iid)
 		switch {
 		case gerr != nil && errors.Is(gerr, forge.ErrMergeRequestNotFound):
 			if reason == "" {

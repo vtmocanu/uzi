@@ -30,9 +30,10 @@ import { ATTEMPT_ID_RE } from "../attempt-path.js";
 import type { AuthorityRuntime, AuthorityScope } from "../authority-runtime.js";
 import type { DindPruneGate } from "../dind-prune.js";
 import type {
-  GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedInspectResult, RetainedLifecycleSnapshot, RetainedSourceSelector,
+  GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedHomeBinding, RetainedInspectResult, RetainedLifecycleSnapshot, RetainedSourceSelector,
 } from "../git.js";
 import type { Logger } from "../log.js";
+import { hasRetainedHomeMarker, removeRetainedHomeMarker } from "../retained-homes.js";
 import type { DescribeLocalRecordsResult, OperatorRequestSignals, ResolveLocalRecordResult } from "../recovery.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "../protocol.js";
 import { RUN_TERMINAL_STATUSES } from "../recovery-settlement.js";
@@ -80,7 +81,7 @@ export interface RetainedSourceRunnerPort {
   /** issue #3885: operator resolution of one guarded local record generation. The coordinator takes
    *  authority A itself, so the channel must call it outside any authority transaction. */
   resolveLocalRecord(
-    input: OperatorRequestSignals & { runId: string; generation: number; confirm: string },
+    input: OperatorRequestSignals & { runId: string; generation: number; confirm: string; action?: "case_b" },
   ): Promise<ResolveLocalRecordResult>;
 }
 
@@ -124,7 +125,7 @@ export interface RetainedSourceServerDeps {
 type Request =
   | { op: "inspect"; selector: RetainedSourceSelector | undefined }
   | { op: "local-records"; run: string }
-  | { op: "resolve-local-record"; run: string; generation: number; confirm: string }
+  | { op: "resolve-local-record"; run: string; generation: number; confirm: string; action?: "case_b" }
   | { op: "discard"; selector: RetainedSourceSelector; confirm: string; protectedSource: boolean };
 
 interface LastDisposition {
@@ -153,12 +154,19 @@ function parseRequest(line: string): Request | string {
   // issue #3885: the local-record ops take a bare run id (no attempt), so they branch off first.
   if (o.op === "local-records" || o.op === "resolve-local-record") {
     const keys = o.op === "local-records" ? ["op", "run"] : ["op", "run", "generation", "confirm"];
-    if (Object.keys(o).length !== keys.length || Object.keys(o).some((k) => !keys.includes(k))) return "invalid_request";
+    // `action` is an optional extra key of resolve-local-record only, and its sole legal value is "case_b".
+    const hasAction = o.op === "resolve-local-record" && Object.prototype.hasOwnProperty.call(o, "action");
+    const expected = hasAction ? [...keys, "action"] : keys;
+    if (Object.keys(o).length !== expected.length || Object.keys(o).some((k) => !expected.includes(k))) return "invalid_request";
     if (typeof o.run !== "string" || !OPERATOR_RUN_ID_RE.test(o.run)) return "invalid_request";
     if (o.op === "local-records") return { op: "local-records", run: o.run };
     const g = o.generation;
     if (!(typeof g === "number" && Number.isSafeInteger(g) && g > 0)) return "invalid_request";
     if (typeof o.confirm !== "string" || !CONFIRM_RE.test(o.confirm)) return "invalid_request";
+    if (hasAction) {
+      if (o.action !== "case_b") return "invalid_request";
+      return { op: "resolve-local-record", run: o.run, generation: g, confirm: o.confirm, action: "case_b" };
+    }
     return { op: "resolve-local-record", run: o.run, generation: g, confirm: o.confirm };
   }
   const allowed = ["op", "run", "generation", "attempt", "confirm", "protected"];
@@ -458,6 +466,7 @@ export class RetainedSourceServer {
         // (it would make the coordinator borrow it), and no withRetainedSourceBoundary.
         result = await this.deps.runner.resolveLocalRecord({
           runId: req.run, generation: req.generation, confirm: req.confirm,
+          ...(req.action ? { action: req.action } : {}),
           requestSignal, shutdownSignal: this.shutdown.signal, deadlineAt: now() + (this.deps.resolveDeadlineMs ?? RESOLVE_DEADLINE_MS),
         });
       } catch (err) {
@@ -636,6 +645,11 @@ export class RetainedSourceServer {
           const opts = {
             selector: sel, confirm: req.confirm, holds, lifecycle, isLivePath: ctx.isLivePath, quiesce: ctx.quiesce,
             barePath: ev.barePath, signal: this.shutdown.signal,
+            // issue #3644: the retained-home marker of an independent restore lives under the worker's data dir. The guarded discard of
+            // the predecessor finishes through the committed restore exit and removes it LAST; without these hooks that exit
+            // can never be planned or finished, and the predecessor's HOME and provision directory stay protected forever.
+            removeRetainedHomeMarker: (runId: string) => removeRetainedHomeMarker(this.deps.dataDir, runId),
+            hasRetainedHomeMarker: (runId: string, binding?: RetainedHomeBinding) => hasRetainedHomeMarker(this.deps.dataDir, runId, binding),
             ...(this.deps.deadlineMs === undefined ? {} : { deadlineMs: this.deps.deadlineMs }),
           };
           // 7. One bare-lock section inside GitCache.

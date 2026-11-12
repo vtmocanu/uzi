@@ -18,6 +18,7 @@ import type { RecoveryRecord } from "../../src/recovery.js";
 import { testLockOptions } from "../authority-test-support.js";
 import { nullLogger } from "../helpers.js";
 import { environment, type Fixture } from "./recovery-bindingless-compat.js";
+import { fakeSourceEvidence } from "./recovery-case-b-evidence.js";
 
 export const CHILD_AUTHORITY_TOKEN = "restart-child-authority-token";
 
@@ -28,7 +29,10 @@ export type KillAt =
   | "ack-tmp-written"     // the ACK temp file is on disk; the rename has not run
   | "ack-renamed"         // the ACK is durable; no cleanup has started
   | "after-begin-bare"    // the first shared-bare deletion is registered with the authority; the ref is untouched
-  | "after-bundle-unlink"; // the generation's bundle is gone; no record has been unlinked
+  | "after-bundle-unlink" // the generation's bundle is gone; no record has been unlinked
+  // issue #3885 Case B: stop at the n-th step of the record disposition (the m1 seam onOperatorDisposeStepForTest), counted from 0
+  // within the one resolution that runs. The parent learns the step sequence of a world from an unkilled control child.
+  | `case-b-step:${number}`;
 
 export interface ChildSpec {
   root: string;
@@ -39,6 +43,10 @@ export interface ChildSpec {
   attempts: string[];
   action: "describe" | "resolve";
   killAt?: KillAt;
+  /** issue #3885: resolve as the Case B disposition (the `case_b` action), with the injected fake source evidence. */
+  caseB?: boolean;
+  /** issue #3885: a digest to try (and have refused) before the freshly described one is confirmed. */
+  staleConfirm?: string;
   marker: string;
   result: string;
   /** Base URL of the fake worker API the parent hosts (http://127.0.0.1:<port>). */
@@ -127,6 +135,21 @@ if (at("ack-tmp-written") || at("ack-renamed") || at("after-bundle-unlink")) {
   });
 }
 
+// issue #3885 Case B: the physical source evidence is the shared injected fake (the same bytes in every process, so a digest
+// described by one process is the digest a fresh one computes); each disposition step is a named stop point.
+const steps: string[] = [];
+if (spec.caseB) {
+  let n = 0;
+  Object.assign(coordinator, {
+    operatorSourceEvidence: async () => fakeSourceEvidence(spec.runId, spec.context.barePath),
+    onOperatorDisposeStepForTest: async (step: { kind: string; path: string; phase: string }) => {
+      steps.push(`${step.kind}:${step.phase}:${path.basename(step.path)}`);
+      const point = `case-b-step:${n++}` as const;
+      if (spec.killAt === point) await block(point);
+    },
+  });
+}
+
 const sig = { requestSignal: new AbortController().signal, shutdownSignal: new AbortController().signal,
   deadlineAt: Date.now() + 90_000 };
 const described = await coordinator.describeLocalRecords(spec.runId, sig);
@@ -135,7 +158,13 @@ writeResult(out);
 if (spec.action === "resolve") {
   const generation = described.kind === "described" ? described.generations.find(g => g.generation === spec.generation) : undefined;
   const digest = generation?.digest ?? "0".repeat(64);
-  out["resolved"] = await coordinator.resolveLocalRecord({ runId: spec.runId, generation: spec.generation, confirm: digest, ...sig });
+  const action = spec.caseB ? { action: "case_b" as const } : {};
+  if (spec.staleConfirm !== undefined) {
+    out["stale"] = await coordinator.resolveLocalRecord({ runId: spec.runId, generation: spec.generation, confirm: spec.staleConfirm, ...action, ...sig });
+    writeResult(out);
+  }
+  out["resolved"] = await coordinator.resolveLocalRecord({ runId: spec.runId, generation: spec.generation, confirm: digest, ...action, ...sig });
+  out["steps"] = steps;
   writeResult(out);
 }
 process.exit(0);
