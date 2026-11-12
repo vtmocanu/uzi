@@ -300,6 +300,23 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             p.inventory(str(self.root))
 
+    def tree(self, name, version, files):
+        root = self.root/name
+        (root/"src").mkdir(parents=True)
+        (root/"VERSION").write_bytes(version)
+        for rel, body in files.items():
+            (root/"src"/rel).write_bytes(body)
+        return p.inventory(str(root))
+
+    def test_inventory_record_boundaries_are_unambiguous(self):
+        base = self.tree("base", b"go1.25.0\n", {"a.go": b"x", "b.go": b"y"})
+        # The first source record moved into VERSION and its file removed.
+        moved = self.tree("moved", b"go1.25.0\nsrc/a.go\0x\0", {"b.go": b"y"})
+        # The second record folded into the first file's content.
+        folded = self.tree("folded", b"go1.25.0\n", {"a.go": b"x\0src/b.go\0y"})
+        self.assertNotEqual(base["sha256"], moved["sha256"])
+        self.assertNotEqual(base["sha256"], folded["sha256"])
+
     def test_available_docker_never_proves_allocation(self):
         args = argparse.Namespace(manifest=None, endpoint="/fixture.sock", docker_version="fixture",
             image=None, repo_digest=None, go_root=None, source_sha256=None, experimental=True)

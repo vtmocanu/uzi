@@ -203,7 +203,14 @@ def inventory(raw_root):
     with version.open("rb") as f:
         v = f.read(1025)
     require(len(v) <= 1024 and re.match(rb"go[0-9]+\.[0-9]+", v))
-    digest = hashlib.sha256(v)
+    # Length-prefixed fields and a per-file content digest, so no byte can move
+    # between VERSION, a path and a file body without changing the aggregate.
+    digest = hashlib.sha256(b"uzi-go-source-inventory-v2\0")
+
+    def field(data):
+        digest.update(len(data).to_bytes(8, "big") + data)
+
+    field(v)
     started = time.monotonic()
     count = total = entries = 0
     pending = [root/"src"]
@@ -222,7 +229,8 @@ def inventory(raw_root):
             p = Path(base)/name
             require(not p.is_symlink() and p.is_file())
             count += 1
-            digest.update(str(p.relative_to(root)).encode()+b"\0")
+            field(str(p.relative_to(root)).encode())
+            body = hashlib.sha256()
             with p.open("rb") as f:
                 while True:
                     chunk = f.read(65536)
@@ -230,8 +238,8 @@ def inventory(raw_root):
                         break
                     total += len(chunk)
                     require(total <= 256*MIB and time.monotonic()-started < 10)
-                    digest.update(chunk)
-            digest.update(b"\0")
+                    body.update(chunk)
+            field(body.digest())
     require(count > 0)
     version_text = v.splitlines()[0].decode("ascii")
     require(re.fullmatch(r"go[0-9]+\.[0-9]+(?:\.[0-9]+)?", version_text))
