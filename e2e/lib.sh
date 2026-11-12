@@ -439,12 +439,132 @@ assert_no_open_run_holds() {
 # calling phase (each phase is its own subshell): DOCKER_WIRE_OWNED (1 when this phase wired the stack),
 # DOCKER_WIRE_STARTED (the sidecar services this phase started), DOCKER_WIRE_LINE_OWNED (1 when this phase
 # appended the env line). Never `down`, never `-v`, never a volume removal.
+# Each hard-kill/independent-restore fixture owns a distinct repository bare. A server hold discard
+# deliberately leaves P's local attribution in place, so another restore must not reuse that bare.
+RESTORE_FIXTURE_REPOS=()
+enable_restore_fixture_repo() {
+  local name="$1" connection project id
+  case "$name" in restore45a | restore45b | restore52a | restore52b) ;; *) return 1 ;; esac
+  connection="$(apiget /api/forge/connections | jq -er '.connections[0].id')" || return 1
+  project="$(apiget "/api/forge/connections/$connection/projects" | jq -ce --arg path "group/$name" \
+    '[.repos[] | select(.path_with_namespace==$path)] | if length==1 then .[0] else error("fixture repo missing or ambiguous") end')" || return 1
+  id="$(jq -er '.id' <<< "$project")" || return 1
+  jq -e '.enabled==false' <<< "$project" >/dev/null || { echo "restore fixture group/$name was already enabled; refusing reused fixture state" >&2; return 1; }
+  # Record ownership before the enable RPC: an unknown response must still be restored on exit.
+  RESTORE_FIXTURE_REPOS+=("$id")
+  apiput "/api/repos/$id" '{"enabled":true}' | jq -e '.repo.enabled==true' >/dev/null || return 1
+  # shellcheck disable=SC2034  # result consumed by the phase caller after this function returns
+  RESTORE_FIXTURE_REPO_ID="$id"
+  pass "independent restore fixture: group/$name (repo $id), isolated bare"
+}
+restore_fixture_repo_states() {
+  local id rc=0
+  for id in ${RESTORE_FIXTURE_REPOS[@]+"${RESTORE_FIXTURE_REPOS[@]}"}; do
+    if ! apiput "/api/repos/$id" '{"enabled":false}' | jq -e '.repo.enabled==false' >/dev/null; then
+      echo "restore fixture cleanup failed: repo $id remains owned by this phase" >&2
+      rc=1
+    fi
+  done
+  if [ "$rc" = 0 ]; then RESTORE_FIXTURE_REPOS=(); fi
+  return "$rc"
+}
+
 DOCKER_WIRE_LINE='UZI_DIND_SOCKET=/run/dind/docker.sock'
 # _docker_wire_service_running SERVICE — 0 running, 1 not running, 2 unreadable.
 _docker_wire_service_running() {
   local ids
   ids="$("${COMPOSE[@]}" --profile agent-docker ps -q "$1" 2>/dev/null)" || return 2
   [ -n "$ids" ]
+}
+# #4165 sidecar startup diagnostics. _docker_wire_diag_limiter names the timeout command that bounds every
+# diagnostic Docker read (the storage_diagnostic_snapshot convention); empty when neither is installed, and
+# then no Docker read is issued at all (never an unbounded daemon query).
+_docker_wire_diag_limiter() { command -v timeout || command -v gtimeout || true; }
+_dw_diag_missing() {
+  echo "MISSING-EVIDENCE: docker wiring diagnostics: $1" >&2
+  printf 'MISSING-EVIDENCE: %s\n' "$1" >> "$_dw_diagfile" 2>/dev/null || true
+}
+# _dw_diag_read OUTFILE CMD... — one bounded read into OUTFILE: at most min(cap, remaining budget) seconds
+# plus a 2s kill grace; not issued at all once the diagnostic budget is spent. Uses the caller's _dw_* locals.
+_dw_diag_read() {
+  local out="$1" remaining t rc=0
+  shift
+  remaining=$((_dw_budget - (SECONDS - _dw_start)))
+  if [ "$remaining" -le 0 ]; then
+    : > "$out" 2>/dev/null || true
+    _dw_diag_missing "budget exhausted, skipped: $*"
+    return 1
+  fi
+  t=$_dw_cap
+  if [ "$remaining" -lt "$t" ]; then t=$remaining; fi
+  "$_dw_limiter" -k 2 "$t" "$@" > "$out" 2>&1 || rc=$?
+  case "$rc" in
+    0) ;;
+    124 | 137) _dw_diag_missing "timed out after ${t}s: $*" ;;
+    *) _dw_diag_missing "read failed (exit $rc): $*" ;;
+  esac
+  return "$rc"
+}
+_dw_diag_show() {
+  echo "--- docker wiring diagnostics: $1" >&2
+  if [ -s "$2" ]; then cat "$2" >&2 || true; else echo "(no output)" >&2; fi
+}
+# _docker_wire_startup_diagnostics UPLOG — on a failed `up --wait dind`, BEFORE any cleanup removes the
+# containers: both sidecar services' state, log tails and selected inspect State fields (never the whole
+# object or its environment), plus the host's userns sysctls (read-only; on their own they do not establish
+# the cause). Evidence goes to stderr and a unique artifacts/docker-wiring/startup-* dir (never
+# artifacts/<phase>/, whose existence makes the driver skip its FAIL capture). Docker reads total at most
+# 62s (a 59s budget, since whole-second SECONDS can under-count elapsed time by up to 1s; 10s per read;
+# 2s kill grace). Always returns 0; call it in a subshell so nothing in it can pre-empt the caller's fail.
+_docker_wire_startup_diagnostics() {
+  local uplog="${1:-}" _dw_start=$SECONDS _dw_budget=59 _dw_cap=10 _dw_limiter="" _dw_diagfile=/dev/null
+  local d="" tmpd="" scratch svc id ids key val host="" fmt
+  fmt='name={{.Name}} ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}} Health={{if .State.Health}}{{.State.Health.Status}} FailingStreak={{.State.Health.FailingStreak}}{{else}}none{{end}}'
+  echo "docker wiring diagnostics: the DinD sidecar did not start; capturing its state before cleanup" >&2
+  if [ -n "${RUNROOT:-}" ] && mkdir -p "$RUNROOT/artifacts/docker-wiring" 2>/dev/null \
+    && d="$(mktemp -d "$RUNROOT/artifacts/docker-wiring/startup-XXXXXX" 2>/dev/null)"; then
+    _dw_diagfile="$d/diagnostics.txt"
+    echo "docker wiring diagnostics: evidence saved in $d" >&2
+    if [ -n "$uplog" ] && [ -f "$uplog" ]; then cp "$uplog" "$d/up.log" 2>/dev/null || true; fi
+  else
+    d=""
+    _dw_diag_missing "artifact dir unavailable (RUNROOT=${RUNROOT:-unset}); evidence is printed to the log only"
+    tmpd="$(mktemp -d 2>/dev/null)" || tmpd=""
+  fi
+  scratch="${d:-$tmpd}"
+  _dw_limiter="$(_docker_wire_diag_limiter)" || _dw_limiter=""
+  if [ -z "$_dw_limiter" ]; then
+    _dw_diag_missing "no timeout command; Docker reads skipped"
+  elif [ -z "$scratch" ]; then
+    _dw_diag_missing "no writable scratch dir; Docker reads skipped"
+  else
+    for svc in dind-init dind; do
+      _dw_diag_read "$scratch/.read" "${COMPOSE[@]}" --profile agent-docker ps -a "$svc" || true
+      _dw_diag_show "ps -a $svc" "$scratch/.read"
+      cat "$scratch/.read" >> "$scratch/ps.txt" 2>/dev/null || true
+      _dw_diag_read "$scratch/$svc.log" "${COMPOSE[@]}" --profile agent-docker logs --no-color --tail 80 "$svc" || true
+      _dw_diag_show "logs --tail 80 $svc" "$scratch/$svc.log"
+      _dw_diag_read "$scratch/.read" "${COMPOSE[@]}" --profile agent-docker ps -a -q "$svc" || true
+      ids="$(grep -E '^[[:alnum:]]+$' "$scratch/.read" 2>/dev/null | head -n 2)" || ids=""
+      for id in $ids; do
+        _dw_diag_read "$scratch/.read" docker inspect --format "$fmt" "$id" || true
+        _dw_diag_show "inspect State $svc ${id:0:12}" "$scratch/.read"
+        cat "$scratch/.read" >> "$scratch/inspect.txt" 2>/dev/null || true
+      done
+    done
+    rm -f "$scratch/.read" 2>/dev/null || true
+  fi
+  for key in kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces; do
+    val="$(cat "${DOCKER_WIRE_PROC_SYS:-/proc/sys}/${key//.//}" 2>/dev/null)" || val=""
+    host="$host$key=${val:-unavailable}"$'\n'
+  done
+  echo "--- docker wiring diagnostics: host userns posture (read-only; these values alone do not establish the cause)" >&2
+  printf '%s' "$host" >&2
+  if [ -n "$d" ]; then printf '%s' "$host" > "$d/host-userns.txt" 2>/dev/null || true; fi
+  echo "docker wiring diagnostics: elapsed_seconds=$((SECONDS - _dw_start))" >&2
+  printf 'elapsed_seconds=%s\n' "$((SECONDS - _dw_start))" >> "$_dw_diagfile" 2>/dev/null || true
+  if [ -n "$tmpd" ]; then rm -rf "$tmpd" 2>/dev/null || true; fi
+  return 0
 }
 # docker_wire_prepare — record the entry posture; when the stack is not already wired, start the sidecar and
 # append UZI_DIND_SOCKET to $ENVFILE. The caller performs its own agent force-recreate afterwards. A second
@@ -475,6 +595,7 @@ docker_wire_prepare() {
   DOCKER_WIRE_OWNED=1
   uplog="$(mktemp)" || fail "docker wiring: could not create a temp file for the sidecar start output"
   if ! "${COMPOSE[@]}" --profile agent-docker up -d --wait dind >"$uplog" 2>&1; then
+    ( _docker_wire_startup_diagnostics "$uplog" ) || true
     tail_out="$(tail -n 15 "$uplog" 2>/dev/null || true)"; rm -f "$uplog"
     fail "docker wiring: the DinD sidecar did not become healthy (up -d --wait dind): ${tail_out:-no compose output}"
   fi
@@ -1914,12 +2035,14 @@ chmod 0755 "$RUNROOT/fake-devbox"
 # commit. repo2 exists only for the PRD #42 M5 bounded-concurrency scenario: two
 # runs on two DIFFERENT repos must clone into independent bare-caches so the
 # per-repo GitCache lock (agent/src/git.ts) never serializes them. It stays
-# dormant for every other phase (the seed enables only group/repo, and no phase
-# clones repo2 until M5 enables the repo).
+# dormant until phase45 enables it. The four restore* projects are reserved for one
+# independent-restore fixture each; they start disabled and return to disabled on phase exit.
+# Their retained local predecessors are deliberately left intact in those dedicated bares.
 # The seed working copy is host-side and deleted right after its push: it must not read
 # host git config, where a global core.fsmonitor=true leaves a detached daemon behind.
 seed_git() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git "$@"; }
-for r in repo repo2; do
+E2E_REPOSITORIES=(repo repo2 restore45a restore45b restore52a restore52b)
+for r in "${E2E_REPOSITORIES[@]}"; do
   # --shared=0777 is LOAD-BEARING, not tidiness: this one bind-mounted bare is written
   # by MORE THAN ONE uid (forge-fake's receive-pack as root over smart-HTTP, the worker
   # as its own in-image uid over the local-path insteadOf push — the same multi-uid fact
@@ -1954,7 +2077,7 @@ for r in repo repo2; do
   seed_git -C "$RUNROOT" clone -q "$RUNROOT/fakeremote/$r.git" ".seedwc-$r"
   seed_git -C "$seedwc" checkout -q -b main
   printf '# %s\n\nSeeded by the uzi E2E harness.\n' "$r" > "$seedwc/README.md"
-  if [ "$r" = repo ]; then
+  if [ "$r" = repo ] || [ "$r" = restore45a ] || [ "$r" = restore52a ] || [ "$r" = restore52b ]; then
     # A repo-borne skill for the PRD #16 M6 opt-in path. Carries a capability key
     # (allowed-tools) that MUST be stripped when the flag is on; the worker loads only
     # name+description. It stays invisible unless the repo owner enables repo skills.
@@ -1993,7 +2116,7 @@ done
 # agent-branch push still lands. Installed AFTER the seed `main` push above (else it would
 # refuse the seed). POSIX sh + no external tools, so it is portable across the Alpine
 # (agent) and Debian (forge-fake) images.
-for r in repo repo2; do
+for r in "${E2E_REPOSITORIES[@]}"; do
   cat > "$RUNROOT/fakeremote/$r.git/hooks/pre-receive" <<'EOF'
 #!/bin/sh
 # uzi e2e: refuse any update to the protected branch main (see run-e2e.sh PRD #97 M1).
@@ -2045,11 +2168,10 @@ else
   cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
 [safe]
 	directory = *
-[url "/fakeremote/repo.git"]
-	insteadOf = https://forge-fake.e2e/group/repo.git
-[url "/fakeremote/repo2.git"]
-	insteadOf = https://forge-fake.e2e/group/repo2.git
 EOF
+  for r in "${E2E_REPOSITORIES[@]}"; do
+    printf '[url "/fakeremote/%s.git"]\n\tinsteadOf = https://forge-fake.e2e/group/%s.git\n' "$r" "$r" >> "$RUNROOT/agent-gitconfig/gitconfig"
+  done
   GIT_MODE="local bare remote via insteadOf"
 fi
 say "git remote mode: $GIT_MODE"

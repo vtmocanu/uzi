@@ -3252,7 +3252,10 @@ export interface StateRequest {
    *  (feature `recovery_cause_retained_recovery_exhausted`, timed or owner-held) and
    *  "retained_recovery_adoption_failed" for a confirmed persisted adoption refusal
    *  (feature `recovery_cause_retained_recovery_adoption_failed`, owner Resume or Cancel only,
-   *  no automatic retry). Both require a positive claim generation and exact fenced ACK;
+   *  no automatic retry). Issue #3767: "anthropic_spend_limit" parks a Claude lead whose terminal
+   *  was an Anthropic organization or workspace spend-limit 400 (feature
+   *  `recovery_cause_anthropic_spend_limit`; owner-held, the api writes a NULL retry; sent once,
+   *  fenced by a positive claim generation, never re-sent untyped). Both retained causes require a positive claim generation and exact fenced ACK;
    *  feature absence keeps the retained terminal fallback. The api validates its cause enum
    *  before SQL, and a legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park

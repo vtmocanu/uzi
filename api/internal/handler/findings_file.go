@@ -149,7 +149,7 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(ctx, repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		h.revertFindingClaim(ctx, finding)
 		slog.Error("file finding: build forge for connection", "error", err)
@@ -160,13 +160,13 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// EnsureLabels the marker and opted-in run labels BEFORE CreateIssue (D5/R5): Forgejo
 	// resolves label names to ids and errors on an unknown one, so required labels must pre-exist. A failure here reverts the
 	// claim and is a 502 (an upstream forge problem), not a duplicate issue.
-	if err := f.EnsureLabels(ctx, repo.ForgeProjectID, requiredLabels); err != nil {
+	if err := tr.EnsureLabels(ctx, repo.ForgeProjectID, requiredLabels); err != nil {
 		h.revertFindingClaim(ctx, finding)
 		httpx.Error(w, http.StatusBadGateway, "could not ensure the finding label on the forge: "+err.Error())
 		return
 	}
 
-	created, err := f.CreateIssue(ctx, repo.ForgeProjectID, title, description, filedLabels)
+	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, title, description, filedLabels)
 	if err != nil {
 		// The forge rejected the write: the claim reverts, nothing is persisted, the finding
 		// stays open and re-fileable. err is already PAT-redacted by the driver.

@@ -40,24 +40,24 @@ func TestLinkedTaskAutopilotTransitionLiveDB(t *testing.T) {
 					t.Fatalf("swallowed event caused create=%d comments=%d issue fetches=%d", len(runs.calls), len(f.noteAttempts), f.fetches)
 				}
 			}
-			ap.detect(e.ctx, repo, f)
+			ap.detect(e.ctx, repo, f, f)
 			receipt(10)
 			quiet()
 			e.exec("UPDATE runs SET status='completed',finished_at=now() WHERE id=$1", linkedID)
-			ap.detect(e.ctx, repo, f) // consumed application never replays after terminal
+			ap.detect(e.ctx, repo, f, f) // consumed application never replays after terminal
 			receipt(10)
 			quiet()
 			f.events[17] = append(f.events[17], remEvt(11, "owner"))
-			ap.detect(e.ctx, repo, f)
+			ap.detect(e.ctx, repo, f, f)
 			receipt(10)
 			quiet()
 			f.events[17] = append(f.events[17], addEvt(12, "owner"))
-			ap.detect(e.ctx, repo, f)
+			ap.detect(e.ctx, repo, f, f)
 			receipt(12)
 			if len(runs.calls) != 1 || runs.calls[0].iid != 17 || runs.calls[0].repoID != e.repo || len(f.noteAttempts) != 0 || f.fetches != 1 {
 				t.Fatalf("new application must create once: calls=%+v comments=%v fetches=%d", runs.calls, f.noteAttempts, f.fetches)
 			}
-			ap.detect(e.ctx, repo, f)
+			ap.detect(e.ctx, repo, f, f)
 			if len(runs.calls) != 1 || f.fetches != 1 || len(f.noteAttempts) != 0 {
 				t.Fatal("new event replayed")
 			}

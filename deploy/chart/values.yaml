@@ -83,6 +83,17 @@ imageVerification:
 forge:
   allowedBaseURLs: []
 
+# --- issueTracker: the API's issue tracker SSRF allowlist (PRD #4173 S3) -----------
+#
+# Renders into the api's ISSUE_TRACKER_ALLOWED_BASE_URLS env. It is SEPARATE from the
+# forge allowlist above: https base URLs only, and empty (the default) means no issue
+# tracker connection can be created. It never feeds the worker egress lists (forge.* does
+# that), because the worker never calls an issue tracker (S5). Set this per-cluster instead
+# of api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS (setting BOTH fails the render — see
+# api-configmap.yaml).
+issueTracker:
+  allowedBaseURLs: []
+
 # --- releaseCheck: the periodic GitHub release-availability check (PRD #836) -------
 #
 # The api periodically polls GitHub's releases API for vtmocanu/uzi and surfaces an
@@ -646,7 +657,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.87.0-rc.6"
+    tag: "0.87.0-rc.8"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -994,14 +1005,28 @@ workers:
   #     node root, gated behind acknowledgeNonRootlessNodeRoot (see below).
   # sysbox (runtimeClassName: sysbox-runc) remains the documented path to a
   # non-privileged tier once a cluster can run it; it is NOT installed and NOT required.
+  # One-worker epoch-reclaim attempt-deletion canary, OFF by default. The controller renders
+  # UZI_EPOCH_RECLAIM_DELETION=1 only into the pod template of the single persistent Docker
+  # worker whose id equals this value; no other worker's template changes. It must be empty
+  # or one lowercase UUID (no list, wildcard or padding). Clearing it takes effect at the
+  # next replacement/startup of that worker. Never move it to another UUID until the prior
+  # enabled incarnation is gone or off. See docs/run-recovery.md.
+  epochReclaim:
+    # Default-on scratch request for persistent Docker workers; strict boolean.
+    # false omits worker UZI_EPOCH_SCRATCH_DELETION after controller reconciliation.
+    # Startup-only: wait for safe replacement; ForceRoll must stay off.
+    # Supplies no attestation; empty runtime below keeps scratch. Attempt deletion stays canary-only.
+    scratchDeletion: true
+    deletionCanaryWorkerId: ""
   docker:
     podEpochReclaim:
       # The pass runs by default and keeping trees needs no declaration: unset keeps every
       # tree (deferred / runtime_not_declared, no candidate inventory) and still participates
       # in lifetime epoch locking. Setting containerd-runc or crio-crun is
-      # the operator's attestation of the FULL audited runtime/storage contract (a future
-      # hosted-Docker deletion will require it) and is cross-checked against observations.
-      # This release still deletes nothing; see deploy/README.md, Pod-epoch shadow reclaim.
+      # the operator's attestation of the FULL audited runtime/storage contract required
+      # for hosted-Docker deletion, and is cross-checked against observations.
+      # Attempt deletion runs only on workers.epochReclaim.deletionCanaryWorkerId;
+      # scratch cleanup is controlled separately by workers.epochReclaim.scratchDeletion.
       runtime: ""
     # Turning this on creates the privileged namespace, its quota/limits, the worker
     # SA + pull secret in it, and the controller's Role there. It also makes the

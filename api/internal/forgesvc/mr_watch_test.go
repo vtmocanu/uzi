@@ -62,7 +62,7 @@ func contains(ss []string, want string) bool {
 func run(t *testing.T, st *fakeStore, f *fakeForge) {
 	t.Helper()
 	svc := newTestService(st)
-	if err := svc.SyncMRStates(context.Background(), uuid.New(), testProjectID, f); err != nil {
+	if err := svc.SyncMRStates(context.Background(), uuid.New(), testProjectID, f, f); err != nil {
 		t.Fatalf("SyncMRStates: %v", err)
 	}
 }
@@ -336,7 +336,7 @@ func TestMRLockedClosedCancelsRework(t *testing.T) {
 	svc := newTestService(st)
 	svc.SetReworkCanceller(canceller)
 
-	if err := svc.SyncMRStates(context.Background(), repoID, testProjectID, f); err != nil {
+	if err := svc.SyncMRStates(context.Background(), repoID, testProjectID, f, f); err != nil {
 		t.Fatalf("SyncMRStates: %v", err)
 	}
 
@@ -460,7 +460,7 @@ func TestMRCandidateListErrorPropagates(t *testing.T) {
 	f := &fakeForge{}
 	svc := newTestService(st)
 
-	if err := svc.SyncMRStates(context.Background(), uuid.New(), testProjectID, f); err == nil {
+	if err := svc.SyncMRStates(context.Background(), uuid.New(), testProjectID, f, f); err == nil {
 		t.Fatal("a candidate-enumeration failure must surface so the poller logs it once")
 	}
 	if len(f.mrCalls) != 0 {

@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -172,7 +173,8 @@ func (s *Service) maybeFileProposal(ctx context.Context, run store.Run, proposal
 		return
 	}
 
-	created, err := f.CreateIssue(ctx, repo.ForgeProjectID, proposal.Title, proposal.Body, labels)
+	var tr forge.IssueTracker = f
+	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, proposal.Title, proposal.Body, labels)
 	if err != nil {
 		// err is already PAT-redacted by the driver. The pending audit row stays for
 		// diagnosis; nothing was filed.

@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"time"
@@ -85,8 +86,8 @@ type recoveryWaitWriter interface {
 }
 
 func (s *Service) setRecoveryWait(ctx context.Context, writer recoveryWaitWriter, cause pgtype.Text, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
-	if cause.Valid && cause.String == recoveryCauseCodexIdleStall && s.txBeginner == nil {
-		return 0, errors.New("idle stall park unavailable: no tx beginner")
+	if cause.Valid && (cause.String == recoveryCauseCodexIdleStall || cause.String == recoveryCauseAnthropicSpendLimit) && s.txBeginner == nil {
+		return 0, fmt.Errorf("%s park unavailable: no tx beginner", cause.String)
 	}
 	if s.txBeginner != nil {
 		locked, current, tx, err := s.beginClaimMutation(ctx, wkr, run.ID, req.ClaimGeneration)
@@ -133,7 +134,8 @@ func (s *Service) setRecoveryWaitLocked(ctx context.Context, writer recoveryWait
 		}
 	}
 	idle := cause.Valid && cause.String == recoveryCauseCodexIdleStall
-	if idle {
+	spend := cause.Valid && cause.String == recoveryCauseAnthropicSpendLimit
+	if idle || spend {
 		if req.ClaimGeneration == nil || *req.ClaimGeneration <= 0 {
 			return 0, ErrMissingClaimGeneration
 		}
@@ -148,6 +150,10 @@ func (s *Service) setRecoveryWaitLocked(ctx context.Context, writer recoveryWait
 		}
 	}
 	retry := pgconv.Time(s.now().Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter()))
+	if spend {
+		// Owner-held: a NULL retry is never promoted by the sweeper (NULL <= now is UNKNOWN).
+		retry = pgtype.Timestamptz{}
+	}
 	var idleCount pgtype.Int4
 	if idle {
 		count := run.IdleStallParkCount
@@ -179,7 +185,7 @@ func (s *Service) setRecoveryWaitLocked(ctx context.Context, writer recoveryWait
 // recoveryCauseStored retains ordinary causes with distinct owner controls.
 // Other typed parks have separate writers; empty_turn remains untyped.
 func recoveryCauseStored(cause *string) pgtype.Text {
-	if cause != nil && (*cause == recoveryCauseVaultLocked || *cause == recoveryCauseCodexIdleStall) {
+	if cause != nil && (*cause == recoveryCauseVaultLocked || *cause == recoveryCauseCodexIdleStall || *cause == recoveryCauseAnthropicSpendLimit) {
 		return pgtype.Text{String: *cause, Valid: true}
 	}
 	return pgtype.Text{}

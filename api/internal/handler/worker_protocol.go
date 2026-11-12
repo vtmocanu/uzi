@@ -475,6 +475,11 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// because an older api's strict decoder 400s productive_turns and because only a worker
 		// that handles a "paused" ack may receive one.
 		{"recovery_cause_provider_outage"},
+		// Issue #3767: this api accepts {status:"recovery_wait", recovery_cause:"anthropic_spend_limit"}
+		// and parks it as an owner-held hold with a NULL retry. Advertised UNCONDITIONALLY: a worker
+		// types the park only after seeing this token, because an older api answers an unknown
+		// recovery_cause 400 and the worker would fail the run.
+		{"recovery_cause_anthropic_spend_limit"},
 		// Fenced ordinary and disk recovery parks can atomically consume completed-turn evidence.
 		{"provider_progress_on_recovery_park_v1"},
 		// PRD #1809 M6 (D8): this api accepts checkpoint_contains_latest on a park report (the

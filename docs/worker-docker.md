@@ -288,8 +288,8 @@ per-pod `emptyDir`.
   leave capacity degraded. Existing run park-and-trim and supported manual
   settled-tree cleanup remain the reclaim paths; see
   [Run recovery](./run-recovery.md). PRD #3431 M1b settlement/deletion is
-  implemented behind an off-by-default gate, so production still deletes
-  nothing, and #3329's genuine-idle reclaim roll remains deferred; no new
+  implemented behind an off-by-default startup opt-in, so production deletes
+  nothing unless an operator selects one canary worker, and #3329's genuine-idle reclaim roll remains deferred; no new
   reclaim authority is granted. Data-pressure deferral neither requests nor
   clears drains: existing pressure drains persist until pressure clears,
   and the worker stays out of roll coverage. Independent Nix pressure can
@@ -366,14 +366,26 @@ A directory read or close failure, any other errno, a deadline, cancellation, a 
 pass-wide. See the
 [full #3775 diagnostic contract](../prds/3431-pod-epoch-reclaim.md#3775-partial-shadow-diagnostic-contract).
 
-**Production deletion is off.** The worker image contains a gated deletion
-phase (`EPOCH_RECLAIM_DELETION_ENABLED` is `false`), so a production pass still
-deletes no attempt trees, settles no records, releases no recovery holds and
-removes no stopped containers. Enabling it needs a separate owner decision under
-[PRD #3431](../prds/3431-pod-epoch-reclaim.md); hosted deletion acceptance and
+**Attempt deletion is off by default.** The worker image contains a deletion
+phase that runs only when the worker starts with `UZI_EPOCH_RECLAIM_DELETION=1`
+(read once at startup; `UZI_EPOCH_LOCK=1` and a Docker wiring required, else
+startup is refused). The chart sets it for at most one hosted Docker worker, via
+`workers.epochReclaim.deletionCanaryWorkerId` (default `""`, off), so every other
+pass still deletes no attempt trees, settles no records, releases no recovery
+holds and removes no stopped containers. The opt-in only permits attempting the
+phase; every gate stays required. See the
+[one-worker deletion canary checklist](./run-recovery.md#one-worker-deletion-canary-checklist)
+and [PRD #3431](../prds/3431-pod-epoch-reclaim.md); hosted deletion acceptance and
 the later idle-gated roll (#3329) are not shipped. Existing startup reapers and
 DinD maintenance retain their separate behavior. Compose and non-Docker workers
 are unchanged.
+
+Runner `TMPDIR` scratch reclaim is separate: the chart requests it by default
+through `workers.epochReclaim.scratchDeletion: true` for persistent Docker
+workers. The default empty runtime declaration supplies no attestation and
+keeps scratch. Every existing epoch, authority and settlement guard still
+applies. See [startup disable and observation](./run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation)
+for safe replacement, version skew and evidence; this is not a hot switch.
 
 When the phase is enabled it runs only for an `eligible`, `attested` pass and
 adds these fields to the `pod_epoch_reclaim` line: `deleted` and `deleted_bytes`
@@ -390,8 +402,16 @@ shadow fields are unchanged. With the gate off these counters stay `0` and
 every tree. See [Verified-epoch reclaim](./run-recovery.md#verified-epoch-reclaim-prd-3431)
 for the admitted shapes, budgets and crash residuals.
 
+The line also carries a `scratch` object for the runner `TMPDIR` scratch phase
+(#4043, #4182). The chart requests this phase by default, independently of
+attempt deletion. `state: "not_run"` means the scratch phase was not entered:
+it can reflect a request that is off, or a requested pass without both an
+`eligible` verdict and `attested` authority. Read `scratch_requested` on the startup activation line
+alongside the pass verdict and reason; `not_run` alone does not prove the
+request is off. See [Runner TMPDIR scratch](./worker-setup.md) for its fields.
+
 The administrator's `workers.docker.podEpochReclaim.runtime` defaults to unset.
-A fresh default-off pod logs `deferred` / `runtime_not_declared` immediately
+A fresh pod without a runtime declaration logs `deferred` / `runtime_not_declared` immediately
 after startup reaping, without waiting for predecessor evidence; keeping trees
 needs no declaration. Setting a value attests the full audited runtime/storage
 contract, and the worker cross-checks it against the controller's version-2

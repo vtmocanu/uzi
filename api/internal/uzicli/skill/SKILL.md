@@ -469,6 +469,10 @@ uzi version
   retained-custody continuation, `retained_continuation_unwitnessed` (server-only; claim
   released, work and custody kept), owner Resume/Cancel only, no automatic retry, not an
   integrity refusal — or
+  an Anthropic API spend limit, `anthropic_spend_limit` (a Claude run's lead hit its organization
+  or workspace spend limit; no timer, no automatic retry or credential switch, work and custody kept,
+  owner Resume, Switch token or Cancel). Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first. To choose another token now, use Switch token or `uzi run set-token`
+  (`uzi token list`, then `uzi run set-token <id> <label>`; not for chat, judge, self_improve or job runs) — or
   because the forge was unreachable at clone — cause `forge_unreachable`, with up to
   `RUN_FORGE_UNREACHABLE_MAX_PARKS` timed parks (`0` means unlimited), followed by an
   owner Resume/Cancel hold with NULL retry. Resume queues one bounded attempt without
@@ -532,7 +536,8 @@ uzi version
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
   `worker_requeue_exhausted`, `worker_memory_pressure`,
-  `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, owner-held
+  `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, `anthropic_spend_limit`
+  (spend-limit owner hold: Resume, `uzi run set-token` or Cancel), owner-held
   `retained_recovery_exhausted` (NULL retry), or a paused credential-switch hold (`credential_switch_settling` /
   `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and ordinary owner or lead pauses need `uzi run resume`. A
@@ -704,11 +709,17 @@ uzi version
   must be positive (`0`, negative or unparseable is a usage error, exit 2). The added time
   stacks on the frozen budget rather than replacing it. `--by` is capped per request by an admin-set maximum per extension (default 16h), not per run: a run may be extended repeatedly, up to a technical total limit.
   Owner-only, and valid on any non-terminal run of a kind the sweep can time out (issue, task,
-  prompt, self-improve, mr-rework, ci-fix), including a queued or parked one. A chat, judge or
-  interactive-task run never times out, an over-cap request, or extending while the admin has
+  prompt, self-improve, mr-rework, ci-fix), including a queued or parked one. A chat or judge run,
+  or an interactive task's session, has no server wall deadline, so extending one is a 409, with one
+  exception: the worker bounds each follow-up of an interactive task with its wall budget and parks
+  one that uses it up (`hold_reason: budget_exhausted`), and extend adds the time to such a parked
+  task and resumes it. An
+  over-cap request, or extending while the admin has
   turned extensions off, is a 409 (exit 5) with the server's message printed verbatim. Prints
   the new deadline and the run's total extension (with the per-extension maximum); `uzi run get` then shows the
-  extension on its `DEADLINE` row (`· +2h extended`).
+  extension on its `DEADLINE` row (`· +2h extended`). No server deadline is reported for an
+  interactive run, so for one extend prints only the resume confirmation and `run get` shows no
+  `DEADLINE` row.
 - `uzi run follow-up <run-id> [--message <text>]` — send a follow-up message. The
   message can also be piped on stdin instead of `--message`.
 - `uzi run answer <run-id> [--message <text>]` — answer the clarifying question a

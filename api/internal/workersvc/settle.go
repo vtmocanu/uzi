@@ -314,7 +314,7 @@ func (s *Service) settleCaptureBinding(ctx context.Context, runID, holdID uuid.U
 // forge seam is ErrForgesUnavailable; a run with no repo/connection behind it is not_eligible
 // (nothing to prove against); a forge that cannot be built is ancestry_unknown. A non-empty
 // reason is the retained answer.
-func (s *Service) settleForge(ctx context.Context, runID uuid.UUID, logUnknown func(string, error)) (forge.Forge, int64, string, error) {
+func (s *Service) settleForge(ctx context.Context, runID uuid.UUID, logUnknown func(string, error)) (forge.CodeHost, int64, string, error) {
 	if s.forges == nil {
 		return nil, 0, "", ErrForgesUnavailable
 	}
@@ -355,7 +355,7 @@ func settleHeadReason(head string, err error, step string, logUnknown func(strin
 // of (or equal to) head. Any explicit not_ancestor wins (not_ancestor); otherwise any error or
 // inconclusive answer is ancestry_unknown — only an error-free positive answer is proof. ""
 // means every candidate is proven.
-func proveSettleCandidates(ctx context.Context, f forge.Forge, projectID int64, head string, candidates []string, logUnknown func(string, error)) string {
+func proveSettleCandidates(ctx context.Context, f forge.CodeHost, projectID int64, head string, candidates []string, logUnknown func(string, error)) string {
 	notAncestor, unknown := false, false
 	asked := map[string]bool{}
 	for _, c := range candidates {

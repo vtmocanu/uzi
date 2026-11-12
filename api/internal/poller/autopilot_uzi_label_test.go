@@ -48,7 +48,8 @@ func TestDetectFiltersCandidatesOnBothLabels(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &apStore{}
-			NewAutopilot(st, &apRuns{}, tc.lab).detect(context.Background(), repoRow(), &apForge{})
+			af := &apForge{}
+			NewAutopilot(st, &apRuns{}, tc.lab).detect(context.Background(), repoRow(), af, af)
 
 			if len(st.candParams) != 1 {
 				t.Fatalf("expected one candidate query, got %d", len(st.candParams))
@@ -67,7 +68,8 @@ func TestDetectFiltersCandidatesOnBothLabels(t *testing.T) {
 // resolves both labels from compiled-in defaults.
 func TestDetectFallsBackWithoutASettingsReader(t *testing.T) {
 	st := &apStore{}
-	NewAutopilot(st, &apRuns{}, nil).detect(context.Background(), repoRow(), &apForge{})
+	af := &apForge{}
+	NewAutopilot(st, &apRuns{}, nil).detect(context.Background(), repoRow(), af, af)
 
 	if len(st.candParams) != 1 {
 		t.Fatalf("expected one candidate query, got %d", len(st.candParams))

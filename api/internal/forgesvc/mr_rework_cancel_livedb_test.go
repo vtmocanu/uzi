@@ -167,7 +167,7 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 		s := seed(t, 8531, 85310, "opened", false /* live */)
 		f := &fakeForge{mrByIID: map[int64]forge.MergeRequest{s.mrIID: forgeMR(s.mrIID, "merged")}}
 
-		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f); err != nil {
+		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f, f); err != nil {
 			t.Fatalf("SyncMRStates: %v", err)
 		}
 
@@ -187,7 +187,7 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 		s := seed(t, 8532, 85320, "opened", true /* live */)
 		f := &fakeForge{mrByIID: map[int64]forge.MergeRequest{s.mrIID: forgeMR(s.mrIID, "merged")}}
 
-		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f); err != nil {
+		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f, f); err != nil {
 			t.Fatalf("SyncMRStates: %v", err)
 		}
 
@@ -210,7 +210,7 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 		s := seed(t, 8533, 85330, "opened", false /* live */)
 		f := &fakeForge{mrByIID: map[int64]forge.MergeRequest{s.mrIID: forgeMR(s.mrIID, "locked")}}
 
-		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f); err != nil {
+		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f, f); err != nil {
 			t.Fatalf("SyncMRStates: %v", err)
 		}
 
@@ -234,7 +234,7 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 		s := seed(t, 8534, 85340, "closed", false /* live */)
 		f := &fakeForge{mrByIID: map[int64]forge.MergeRequest{s.mrIID: forgeMR(s.mrIID, "closed")}}
 
-		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f); err != nil {
+		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f, f); err != nil {
 			t.Fatalf("SyncMRStates: %v", err)
 		}
 
@@ -271,7 +271,7 @@ func TestMRReworkCancelOnMRCloseLiveDB(t *testing.T) {
 			updateErr: fmt.Errorf("forge unreachable"),
 		}
 
-		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f); err != nil {
+		if err := forgeSvc.SyncMRStates(ctx, s.repoID, forgeProjectID, f, f); err != nil {
 			t.Fatalf("SyncMRStates: %v", err)
 		}
 

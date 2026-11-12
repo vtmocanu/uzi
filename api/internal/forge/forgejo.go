@@ -65,6 +65,12 @@ type forgejo struct {
 	slugs map[int64]repoSlug
 }
 
+// The driver implements both halves of the Forge contract (PRD #4173).
+var (
+	_ IssueTracker = (*forgejo)(nil)
+	_ CodeHost     = (*forgejo)(nil)
+)
+
 // repoSlug is a repo's owner/name pair, the addressing the gitea SDK needs.
 type repoSlug struct {
 	owner string

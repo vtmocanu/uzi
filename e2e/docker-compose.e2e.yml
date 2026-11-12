@@ -21,10 +21,14 @@ services:
       FORGE_FAKE_EXPECT_PAT: e2e-dummy-forge-pat-000000
       # A SECOND served project for the PRD #42 M5 bounded-concurrency scenario:
       # two issues on two DIFFERENT repos so a cap-2 worker's two runs get
-      # independent git bare-caches. Every other phase uses only group/repo (the
-      # first project), and the seed enables only group/repo (UZI_SEED_FORGE_REPOS),
-      # so repo2 stays a disabled, invisible row until that scenario enables it.
+      # independent git bare-caches. The seed enables only group/repo; repo2 and
+      # the reserved restore projects stay disabled until their owning fixtures enable them.
       FORGE_FAKE_PROJECT2: group/repo2
+      # Reserved, initially disabled projects: one unused bare per independent-restore fixture.
+      FORGE_FAKE_PROJECT3: group/restore45a
+      FORGE_FAKE_PROJECT4: group/restore45b
+      FORGE_FAKE_PROJECT5: group/restore52a
+      FORGE_FAKE_PROJECT6: group/restore52b
       # Persist recorded state to a bind mount so it survives the restart-resilience
       # down/up. The fake is otherwise in-memory; a real forge does not forget its
       # issues/MRs when uzi restarts, and the MR-close phase reconciles against it.

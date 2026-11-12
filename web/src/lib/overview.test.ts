@@ -208,6 +208,7 @@ describe("parkDisposition", () => {
     ["completion_blocked", { status: "paused", completion_phase: "blocked" }, "owner"],
     ["worker_requeue_exhausted", { status: "recovery_wait", recovery_wait_cause: "worker_requeue_exhausted" }, "owner"],
     ["worker_memory_pressure", { status: "recovery_wait", recovery_wait_cause: "worker_memory_pressure" }, "owner"],
+    ["anthropic_spend_limit", { status: "recovery_wait", recovery_wait_cause: "anthropic_spend_limit", recovery_retry_not_before: null }, "owner"],
     [
       "retained_recovery_adoption_failed even with a stamp",
       { status: "recovery_wait", recovery_wait_cause: "retained_recovery_adoption_failed", recovery_retry_not_before: STAMP },

@@ -99,13 +99,17 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 		slog.Error("seed forge: build forge client failed; skipping seed", "error", err)
 		return nil
 	}
-	identity, err := f.VerifyToken(ctx)
+	// PRD #4173 D3: the token and project reads use the code-host half, the
+	// board columns below the issue-tracker half.
+	var ch forge.CodeHost = f
+	var tr forge.IssueTracker = f
+	identity, err := ch.VerifyToken(ctx)
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		slog.Error("seed forge: token verification failed; skipping seed (retries next boot)", "error", err)
 		return nil
 	}
-	projects, err := f.ListProjects(ctx)
+	projects, err := ch.ListProjects(ctx)
 	if err != nil {
 		slog.Error("seed forge: listing projects failed; skipping seed (retries next boot)", "error", err)
 		return nil
@@ -166,7 +170,7 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 		// and boot continues, like every other seed forge call; the operator
 		// fixes the forge access and reruns /server setup. A database error is
 		// boot-fatal, like every other seed database error.
-		if err := forgesvc.EnsureBoardColumns(ctx, q, f, repo.ID, repo.ForgeProjectID); err != nil {
+		if err := forgesvc.EnsureBoardColumns(ctx, q, tr, repo.ID, repo.ForgeProjectID); err != nil {
 			var seedErr *forgesvc.LabelSeedError
 			if !errors.As(err, &seedErr) {
 				return fmt.Errorf("seed forge: board columns for repo %q: %w", path, err)

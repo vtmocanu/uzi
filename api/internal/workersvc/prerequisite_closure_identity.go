@@ -26,7 +26,7 @@ func prerequisiteURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-func (s *Service) prerequisiteDriver(b prerequisiteBinding) (forge.Forge, error) {
+func (s *Service) prerequisiteDriver(b prerequisiteBinding) (forge.CodeHost, error) {
 	if s.forges == nil {
 		return nil, errors.New("prerequisite: forge unavailable")
 	}
@@ -35,7 +35,7 @@ func (s *Service) prerequisiteDriver(b prerequisiteBinding) (forge.Forge, error)
 
 // validate observes the stable ID using the same driver as ancestry. Callers
 // share their existing external deadline with Git and the second observation.
-func (b *prerequisiteBinding) validate(ctx context.Context, driver forge.Forge) error {
+func (b *prerequisiteBinding) validate(ctx context.Context, driver forge.CodeHost) error {
 	p, err := driver.GetProject(ctx, b.repo.ForgeProjectID)
 	if err != nil {
 		return err

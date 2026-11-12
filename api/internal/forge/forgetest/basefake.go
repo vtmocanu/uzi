@@ -50,6 +50,8 @@ type BaseFake struct{}
 // is NOT a call, so it creates no reachability for deadcode analysis — the
 // table-driven test in basefake_test.go is what invokes every method.
 var _ forge.Forge = (*BaseFake)(nil)
+var _ forge.IssueTracker = (*BaseFake)(nil)
+var _ forge.CodeHost = (*BaseFake)(nil)
 
 // RepositoryAuthorEligibility implements forge.Forge.
 func (*BaseFake) RepositoryAuthorEligibility(context.Context, int64, int64) (forge.AuthorEligibility, error) {

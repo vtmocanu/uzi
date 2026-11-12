@@ -74,9 +74,9 @@ func TestR3AutopilotDurableOverflowRetryLiveDB(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						NewAutopilot(st, runs, nil).handle(ctx, row, fresh, apLabel, cc, candIssue(7, "alice"), 9, "alice")
+						NewAutopilot(st, runs, nil).handle(ctx, row, fresh, fresh, apLabel, cc, candIssue(7, "alice"), 9, "alice")
 					} else {
-						NewAutopilot(st, runs, nil).detect(ctx, row, driver)
+						NewAutopilot(st, runs, nil).detect(ctx, row, driver, driver)
 					}
 					if len(runs.calls)+len(runs.resolutions) != 0 {
 						t.Fatal("failed capture reached harness/create")

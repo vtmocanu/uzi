@@ -656,6 +656,9 @@ func rootBlocksLabelled(rc store.GetSlackRunContextRow, base, emoji, label strin
 	if detail := providerStateDetail(rc); detail != "" {
 		ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets(detail)))
 	}
+	if detail := spendLimitStateDetail(rc); detail != "" {
+		ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets(detail)))
+	}
 	if done, total, ok := milestoneCounts(rc); ok {
 		ctxElems = append(ctxElems, slack.NewTextBlockObject(slack.MarkdownType,
 			fmt.Sprintf("🧩 %d/%d milestones", done, total), false, false))
@@ -724,6 +727,31 @@ func providerStateDetail(rc store.GetSlackRunContextRow) string {
 		}
 	}
 	return strings.Join(parts, " · ")
+}
+
+// spendLimitCause is the recovery_wait cause of an owner-held Anthropic spend-limit hold (issue #3767).
+const spendLimitCause = "anthropic_spend_limit"
+
+func spendLimitHold(rc store.GetSlackRunContextRow) bool {
+	return rc.Status == "recovery_wait" && rc.RecoveryWaitCause.Valid && rc.RecoveryWaitCause.String == spendLimitCause
+}
+
+// spendLimitStateDetail names the owner's ways out of an Anthropic spend-limit hold. The switch
+// sentence is omitted on the lanes that cannot take a token override (the same set as
+// validateCredentialOverrideOn in workersvc). It is static text: nothing from the worker's
+// failure reason is rendered.
+func spendLimitStateDetail(rc store.GetSlackRunContextRow) string {
+	if !spendLimitHold(rc) {
+		return ""
+	}
+	detail := "The Anthropic API spend limit was reached; this run waits for you. " +
+		"Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first."
+	switch rc.Kind {
+	case runkind.Chat, runkind.Judge, runkind.SelfImprove, runkind.Job:
+	default:
+		detail += " To choose another token now, use Switch token or `uzi run set-token`."
+	}
+	return detail + " Cancel from the run page."
 }
 
 // mrContextElem is the MR/PR context element for the root — `🔀 <url|MR !N>` in the
@@ -1183,6 +1211,9 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 		}
 		return "", rc.Status
 	case "recovery_wait":
+		if spendLimitHold(rc) {
+			return "⚠️", "Needs your attention · API spend limit"
+		}
 		if rc.RecoveryWaitCause.Valid && rc.RecoveryWaitCause.String == "provider_outage" {
 			return "🔄", "Recovering · provider outage"
 		}
