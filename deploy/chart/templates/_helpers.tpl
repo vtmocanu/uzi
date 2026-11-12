@@ -379,9 +379,11 @@ true
   and empty query/fragment for a bare "?" / "#", so URL-parsed fields cannot be trusted
   to catch those. Order matters: userinfo, separators, query, fragment, path, shape.
   An entry that passes the final anchored regex is made only of: https scheme, a host of
-  [A-Za-z0-9._-] or a bracketed IPv6 literal of [0-9A-Fa-f:.], an optional numeric port, an
-  optional trailing slash. Bracketed IPv6 literals (https://[2001:db8::1]:8443/) pass this
-  shape check, and this helper never calls urlParse on them. uzi.forgeEgressHosts refuses
+  [A-Za-z0-9._-] or a bracketed run of [0-9A-Fa-f:.], an optional numeric port, an
+  optional trailing slash. A bracketed host is only SHAPE-checked: https://[:::] or
+  https://[1] pass, so a passing entry is not guaranteed to be a valid IPv6 literal; an
+  invalid one renders here and is refused by the api at boot instead. This helper never
+  calls urlParse on them. uzi.forgeEgressHosts refuses
   a bracketed host itself, before its urlParse, because urlParse aborts the render echoing
   the raw entry when a bracketed host is not a valid IP.
 */}}
@@ -436,7 +438,7 @@ true
 {{- $u := urlParse (toString $e) }}
 {{- $host := $u.hostname }}
 {{- if regexMatch "^[0-9]+(\\.[0-9]+)+$" $host }}
-{{- fail (printf "forge.allowedBaseURLs entry %d resolves to an IP-literal host (%s). FQDN egress rules cannot express an IP address. Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." (add1 $i) $host) }}
+{{- fail (printf "forge.allowedBaseURLs entry %d resolves to an IP-literal host. FQDN egress rules cannot express an IP address. Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." (add1 $i)) }}
 {{- end }}
 {{- /* urlParse has no .port field; .host carries host[:port], so split it out (default 443). */}}
 {{- $port := "443" }}

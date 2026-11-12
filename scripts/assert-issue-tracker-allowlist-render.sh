@@ -206,12 +206,13 @@ done
 # uzi.forgeEgressHosts (worker-fqdn-egress.yaml) can reject a forge entry here. Removing its
 # uzi.validateBaseURLEntry include must redden these cases.
 for pair in \
-  "$_userinfo|https://user:s3cret@forge.example.com" \
-  "has a query|https://forge.example.com?private_token=s3cret" \
-  "has a path|https://forge.example.com/secret%zz" \
-  "resolves to an IP-literal host|https://[:::]" \
-  "resolves to an IP-literal host|https://[2001:db8::1]"; do
-  _frag=${pair%%|*}; _ent=${pair#*|}
+  "$_userinfo|https://user:s3cret@forge.example.com|" \
+  "has a query|https://forge.example.com?private_token=s3cret|" \
+  "has a path|https://forge.example.com/secret%zz|" \
+  "resolves to an IP-literal host|https://[:::]|[:::] :::" \
+  "resolves to an IP-literal host|https://[2001:db8::1]|[2001:db8::1] 2001:db8::1" \
+  "resolves to an IP-literal host|https://1.2.3.4|1.2.3.4"; do
+  _frag=${pair%%|*}; _rest=${pair#*|}; _ent=${_rest%%|*}; _extra=${_rest#*|}
   values_file "$WORK/eg.yaml" forge "https://good.example.com" "$_ent"
   if helm template uzi "$CHART" --namespace uzi --show-only templates/worker-fqdn-egress.yaml \
       --set api.enabled=false --set workers.enabled=true --set api.tls.enabled=true \
@@ -224,7 +225,9 @@ for pair in \
     exit 2
   fi
   _leak=0
-  for _f in "$_ent" s3cret secret; do
+  # _extra is a space-separated list of host strings the message must not print; intentionally unquoted.
+  # shellcheck disable=SC2086
+  for _f in "$_ent" s3cret secret $_extra; do
     if grep -F -q -- "$_f" "$WORK/eg.err"; then
       bad "(e) egress path: rejection of '$_ent' leaked '$_f' into the error"
       _leak=1
@@ -244,19 +247,19 @@ render "$WORK/acc-forge.out" api-configmap.yaml -f "$WORK/acc-forge.yaml"
 render "$WORK/acc-tracker.out" api-configmap.yaml -f "$WORK/acc-tracker.yaml"
 _got=$(yq '.data.FORGE_ALLOWED_BASE_URLS // "ABSENT"' "$WORK/acc-forge.out")
 if [ "$_got" = "ABSENT" ]; then
-  echo "BROKEN: FORGE_ALLOWED_BASE_URLS absent from a render with four entries" >&2
+  echo "BROKEN: FORGE_ALLOWED_BASE_URLS absent from a render with six entries" >&2
   exit 2
 elif [ "$_got" = "$_want_acc" ]; then
-  ok "(e) forge accepts bare host, trailing /, port, port and /"
+  ok "(e) forge accepts bare host, trailing /, port, port and /, bracketed IPv6 with and without port"
 else
   bad "(e) forge rendered '$_got', expected '$_want_acc'"
 fi
 _got=$(tracker_key "$WORK/acc-tracker.out")
 if [ "$_got" = "ABSENT" ]; then
-  echo "BROKEN: ISSUE_TRACKER_ALLOWED_BASE_URLS absent from a render with four entries" >&2
+  echo "BROKEN: ISSUE_TRACKER_ALLOWED_BASE_URLS absent from a render with six entries" >&2
   exit 2
 elif [ "$_got" = "$_want_acc" ]; then
-  ok "(e) issue tracker accepts bare host, trailing /, port, port and /"
+  ok "(e) issue tracker accepts bare host, trailing /, port, port and /, bracketed IPv6 with and without port"
 else
   bad "(e) issue tracker rendered '$_got', expected '$_want_acc'"
 fi
