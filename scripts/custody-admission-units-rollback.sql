@@ -13,8 +13,8 @@
 -- starting the previous image. It is non-destructive: it only replaces two functions and
 -- deletes one goose bookkeeping row; no hold, run, worker or capture state changes.
 --
--- If migration 00424 is renumbered at merge, update BOTH occurrences of 424 below (the guard
--- and the DELETE); the migration test custody_admission_units_migration_livedb_test.go fails
+-- If migration 00424 is renumbered at merge, update ALL FIVE occurrences of 424 below (the
+-- guard, the two refusal messages, the IS DISTINCT FROM comparison and the DELETE); the migration test custody_admission_units_migration_livedb_test.go fails
 -- when the number here differs from the migration filename prefix.
 --
 -- Usage: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/custody-admission-units-rollback.sql

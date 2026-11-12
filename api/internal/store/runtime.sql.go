@@ -1197,7 +1197,8 @@ WITH checker_template_pins AS MATERIALIZED (
       -- bound remains the backstop for unwitnessed ones (e.g. older agents). Once a single run holds
       -- @custody_hold_limit open holds of its own, it is refused outright (see the hard
       -- per-run bound below), whatever the owner count says. The
-      -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
+      -- exemption is mirrored, logically equivalent under that hard bound, by
+      -- GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
       -- agree.
       --
@@ -6432,7 +6433,7 @@ type GetCustodyAdmissionForRunRow struct {
 // admission_counted_holds is the shared admission-UNIT count compared against
 // @custody_hold_limit (ADR-2445, issue #4162: the live-claim-discounted count with one run's
 // holds on one original worker grouped into one unit); continuation_exempt is ClaimRun's
-// continuation exemption, byte-for-byte the same expression: the run was claimed before
+// continuation exemption, logically equivalent under the hard per-run bound: the run was claimed before
 // (claim_generation >= 1) AND its OWN open custody-hold count (owner-scoped) is at least 1 and
 // below @custody_hold_limit. own_open_holds is that same own count (every open hold of the run,
 // counted or not) and run_hold_bound_reached is ClaimRun's hard per-run bound: the limit is

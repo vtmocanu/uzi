@@ -719,8 +719,8 @@ ORDER BY h.created_at ASC;
 -- task/mr_rework). Issue #1751 / ADR-1751: a CONTINUATION-EXEMPT queued run (claim_generation >= 1
 -- AND its own owner-scoped open-hold count at least 1 and below @custody_hold_limit, the per-run
 -- bound that stops a never-started sweep loop) is NOT blocked by the owner arm — ClaimRun admits
--- it at/over the cap — so the owner arm excludes it with the SAME expression ClaimRun and
--- GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
+-- it at/over the cap — so the owner arm excludes it with an expression logically equivalent, under the
+-- hard per-run bound, to the one ClaimRun and GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
 -- Count columns are cast ::bigint so sqlc types them as int64, never interface{}.
 -- Every column is table-qualified and @user_id carries an explicit ::uuid cast: this is a
 -- SELECT over a single-row CTE, so sqlc's param-type inference cannot pick a single relation

@@ -97,7 +97,7 @@ func validateQueuedCustodyLocks(ctx context.Context, qtx *store.Queries, locks w
 }
 
 // parkQueuedCustody operates only inside the captured parent set. The hold-lock
-// statement finishes before the fresh owner/own-hold recount in the state writer.
+// statement finishes before the state writer's fresh own-hold recount (the writer no longer recounts the owner).
 func (s *Service) parkQueuedCustody(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, nonce pgtype.Text, limit int32, locks workerRecoveryLockSet, requeuedIDs []uuid.UUID) ([]store.WorkerRecoveryDisposition, error) {
 	if limit <= 0 {
 		return nil, nil

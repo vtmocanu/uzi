@@ -29,7 +29,8 @@ func TestHealthCustodyRunHoldBoundNudge(t *testing.T) {
 		{"ok to bound nudges", healthOK, pgtype.Text{}, pgtype.Timestamptz{}, true, true},
 		{"waiting_worker custody limit to bound nudges", healthWaitingWorker, txt(reasonCustodyLimit), pgtype.Timestamptz{}, true, true},
 		{"bound to bound does not nudge again", healthWaitingWorker, txt(apitypes.ReasonCustodyRunHoldBound), pgtype.Timestamptz{}, false, false},
-		{"waiting_worker maintenance to bound does not nudge", healthWaitingWorker, txt(reasonMaintenance), pgtype.Timestamptz{}, true, false},
+		{"waiting_worker generic reason to bound nudges", healthWaitingWorker, txt(reasonNoWorker), pgtype.Timestamptz{}, true, true},
+		{"waiting_worker maintenance to bound nudges", healthWaitingWorker, txt(reasonMaintenance), pgtype.Timestamptz{}, true, true},
 		{"entering bound within cooldown does not nudge", healthWaitingWorker, txt(reasonCustodyLimit), ago(5 * time.Minute), true, false},
 	}
 	for _, tc := range cases {
@@ -39,9 +40,13 @@ func TestHealthCustodyRunHoldBoundNudge(t *testing.T) {
 			r.Health = tc.health
 			r.HealthReason = tc.reason
 			r.HealthNotifiedAt = tc.notifiedAt
+			// Owner raw open holds (>= the run's own) reach the limit while the owner's
+			// admission-counted units stay below it, as a real same-run group would.
+			counted := int64(testCustodyLimit) - 1
 			fs := &healthFakeStore{
 				active:          []store.ListActiveRunsForHealthRow{r},
-				custodyHolds:    int64(testCustodyLimit) - 1, // owner below the limit
+				custodyHolds:    int64(testCustodyLimit),
+				custodyCounted:  &counted,
 				custodyOwnOpen:  int64(testCustodyLimit),
 				custodyRunBound: true,
 			}
@@ -73,14 +78,18 @@ func TestHealthCustodyRunHoldBoundNudge(t *testing.T) {
 	}
 }
 
-// TestHealthCustodyLimitStaysSuppressedFromOk is the control for the run-bound arm: the owner
-// level reasonCustodyLimit (no per-run bound) still never nudges, even from ok.
-func TestHealthCustodyLimitStaysSuppressedFromOk(t *testing.T) {
+// TestHealthCustodyLimitStaysSuppressedFromBound is the control for the run-bound arm: a run that
+// carried the bound reason, whose own holds then settle below the bound while the owner stays at
+// the limit, moves to the owner-level reasonCustodyLimit, which still never nudges.
+func TestHealthCustodyLimitStaysSuppressedFromBound(t *testing.T) {
 	r := runRow("queued")
 	r.StatusSince = ago(15 * time.Minute)
+	r.Health = healthWaitingWorker
+	r.HealthReason = pgtype.Text{String: apitypes.ReasonCustodyRunHoldBound, Valid: true}
 	fs := &healthFakeStore{
-		active:       []store.ListActiveRunsForHealthRow{r},
-		custodyHolds: int64(testCustodyLimit),
+		active:         []store.ListActiveRunsForHealthRow{r},
+		custodyHolds:   int64(testCustodyLimit),
+		custodyOwnOpen: int64(testCustodyLimit) - 1,
 	}
 	svc := healthSvc(fs, defaultHealthSettings())
 	b := &fakeBroadcaster{}

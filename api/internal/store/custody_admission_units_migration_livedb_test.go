@@ -215,14 +215,15 @@ func TestCustodyAdmissionUnitsRollbackScriptVersionLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	re := regexp.MustCompile(`(?:version_id = |IS DISTINCT FROM |goose version )(\d+)`)
+	re := regexp.MustCompile(`(?:version_id = |IS DISTINCT FROM |goose version )(\d+)|(\d+) is not the head`)
 	found := re.FindAllStringSubmatch(string(script), -1)
-	if len(found) < 3 {
-		t.Fatalf("script version references=%d, want the guard (2) and the DELETE", len(found))
+	if len(found) < 5 {
+		t.Fatalf("script version references=%d, want at least 5 (guard, two messages, IS DISTINCT FROM, DELETE)", len(found))
 	}
 	for _, m := range found {
-		if m[1] != strconv.FormatInt(ver, 10) {
-			t.Fatalf("script references version %s, migration is %d (renumber the script)", m[1], ver)
+		got := m[1] + m[2]
+		if got != strconv.FormatInt(ver, 10) {
+			t.Fatalf("script references version %s, migration is %d (renumber the script)", got, ver)
 		}
 	}
 }

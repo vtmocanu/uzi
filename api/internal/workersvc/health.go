@@ -538,15 +538,13 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		independentFault := reason == reasonPersistFailing || reason == reasonLooping ||
 			reason == reasonNearTimeout || reason == reasonOutcomeUndelivered
 		// Issue #4162: the per-run hold bound is the run's own condition, unlike the owner-level
-		// reasonCustodyLimit that the episode reconciler covers. A run that moves from the
-		// owner-level reasonCustodyLimit (waiting_worker) to the bound reason starts a new
-		// nudge-eligible episode: the owner learns about a bound the owner-level DM never
-		// described. Entry from ok is already covered by the r.Health == healthOK term; entry
-		// from any other waiting reason (e.g. a maintenance lift) does not nudge (PRD #3454 D12).
-		// A run already carrying the bound reason does not re-nudge, and the cooldown term below
-		// still applies.
-		enteredRunBound := reason == apitypes.ReasonCustodyRunHoldBound && r.Health == healthWaitingWorker &&
-			r.HealthReason.Valid && r.HealthReason.String == reasonCustodyLimit
+		// reasonCustodyLimit that the episode reconciler covers. A run that moves from any other
+		// waiting_worker reason into the bound reason starts a new nudge-eligible episode: the
+		// owner learns about a bound no earlier DM described. Entry from ok is already covered by
+		// the r.Health == healthOK term. A run already carrying the bound reason does not
+		// re-nudge, and the cooldown term below still applies.
+		enteredRunBound := reason == apitypes.ReasonCustodyRunHoldBound &&
+			!(r.HealthReason.Valid && r.HealthReason.String == apitypes.ReasonCustodyRunHoldBound)
 		nudge := target != healthOK && (r.Health == healthOK || leftPin || enteredRunBound || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
@@ -1338,7 +1336,8 @@ func (s *Service) queuedPrerequisiteReason(ctx context.Context, now time.Time, r
 	// #1751 / ADR-1751: a CONTINUATION-EXEMPT run (claim_generation >= 1 and its own open-hold
 	// count at least 1 and below the limit, the SAME expression ClaimRun's custody clause uses) is
 	// admitted at/over the cap, so it never gets the custody reason; a run already holding
-	// limit holds of its own is not exempt and gets it like new work. #3150: there is no
+	// limit holds of its own is not exempt and gets the per-run bound reason
+	// (apitypes.ReasonCustodyRunHoldBound), which outranks the owner-level reason. #3150: there is no
 	// disabled/zero limit; when the setting could not be read this tick (th.custodyLimitOK
 	// false, which is also the zero value) ClaimRun refuses too, so the rung reports
 	// reasonCustodyLimitUnavailable instead of guessing. The per-run read also runs below the

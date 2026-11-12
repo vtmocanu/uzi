@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -195,12 +196,15 @@ func (f *cncFixture) rhAssertRefusedQueued(t *testing.T, run uuid.UUID, limit in
 	if err != nil {
 		t.Fatal(err)
 	}
-	if adm.ContinuationExempt || adm.AdmissionCountedHolds < int64(limit) {
-		t.Fatalf("admission = %+v, want the exemption exhausted and the owner count at/over %d", adm, limit)
+	// Own open holds == limit (asserted above), so the hard per-run bound is what refuses the
+	// claim: the run is never exempt and its health reason is the per-run bound, which outranks
+	// the owner-level reason.
+	if adm.ContinuationExempt || !adm.RunHoldBoundReached || adm.OwnOpenHolds != int64(limit) {
+		t.Fatalf("admission = %+v, want the exemption exhausted and the per-run bound reached at %d own holds", adm, limit)
 	}
 	row := store.ListActiveRunsForHealthRow{ID: run, UserID: f.userID, Status: "queued", Kind: "issue"}
-	if got := f.svc.queuedReason(f.env.ctx, time.Now(), row, thWithLimit(limit)); got != reasonCustodyLimit {
-		t.Fatalf("health reason = %q, want %q", got, reasonCustodyLimit)
+	if got := f.svc.queuedReason(f.env.ctx, time.Now(), row, thWithLimit(limit)); got != apitypes.ReasonCustodyRunHoldBound {
+		t.Fatalf("health reason = %q, want %q", got, apitypes.ReasonCustodyRunHoldBound)
 	}
 	if got := f.rhHoldRows(t, pred); got != predRows {
 		t.Fatalf("the predecessor's custody rows changed:\n before %s\n after  %s", predRows, got)

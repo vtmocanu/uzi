@@ -167,9 +167,10 @@ func healthNudgeHead(health, reason string) string {
 			return "⏳ You've already responded; this run is waiting on its worker, not on you."
 		}
 		// Issue #4162: the per-run custody hold bound is neither an unclaimed-run wait
-		// nor an owner-capacity block, so neither sentence is true of it.
+		// nor an owner-capacity block, so neither sentence is true of it. The head must not
+		// restate the reason: healthNudgeBlocks appends the reason after the head.
 		if reason == apitypes.ReasonCustodyRunHoldBound {
-			return "⏳ This run has reached its own custody hold limit."
+			return "⏳ This queued run cannot start."
 		}
 		return "⏳ This run is still waiting for a worker to pick it up."
 	case healthApprovalIdle:
