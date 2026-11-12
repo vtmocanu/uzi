@@ -1,6 +1,6 @@
 # PRD #4203: Go cache admission proof — incomplete evidence report
 
-**Status**: Incomplete; nonproducing scaffold and evidence only; pending formal owner disposition.
+**Status**: Incomplete; nonproducing scaffold and evidence only. Formal partial delivery (2026-11-12) retains M4 and defers incomplete M1 and unstarted M2-M3. This nonclosing PR delivers the nonproducing scaffold and evidence only. No producing leg or A/B viability is established, no criterion is waived as met, and #4203/#2013 remain open. Owner production decision and the deferred prerequisites remain pending.
 **Issue**: #4203; parent #2013 remains open.
 **Scope**: Authorized M4 documentation of actual work, not a completed proof or production authorization.
 
@@ -52,7 +52,7 @@ UNVERIFIED includes unavailable prerequisites and legs not reached.
 | Performance, overlap, warm reuse and overshoot | UNVERIFIED, not reached | No hit rate, slowdown, recompilation time, peak storage, free-space delta or overlapping-producer/bypass measurement. |
 | B consideration | UNVERIFIED, not reached | Missing environment prerequisites and incompatible fixtures are not a failed A experiment. |
 | Docker aliases and isolation | UNVERIFIED, not run | No bind/symlink/hard-link/cache-variable alias fixture; Docker-wired boundary-only answer remains unchanged. |
-| Report and parent D21 | Proposed, pending owner | Evidence documentation only; formal owner disposition still needed. No deferred scope acceptance inferred. |
+| Report and parent D21 | Proposed, pending owner production decision | Evidence documentation only. Partial delivery authorization: done (M4 retained; M1-M3 deferred). Production policy and proof acceptance: pending. |
 | Required tests actually performed | FIXTURE-PROVEN | Nine pure tests passed at repair revision; watched repair red/green and integration checks are recorded below with their limits. |
 
 ## Frozen resource and comparison envelope
@@ -144,8 +144,4 @@ fixture, current safe nonsecret image and live-threshold provenance, and an owne
 resource/scope decision for the heavy representative matrix. This is a prerequisite
 proposal, not production enablement, a new privilege policy or a D13 exception.
 
-M1 unfinished and M2/M3 unstarted remain required scope awaiting formal owner
-disposition. Documenting that boundary does not accept deferral or complete those
-milestones. The owner must explicitly decide the retained and deferred scope;
-no such formal disposition is recorded here. Hosted proof and production acceptance
-are not established by this report.
+Formal partial delivery (2026-11-12) retains M4 and defers incomplete M1 and unstarted M2-M3. This nonclosing PR delivers the nonproducing scaffold and evidence only. No producing leg or A/B viability is established, no criterion is waived as met, and #4203/#2013 remain open. Owner production decision and the deferred prerequisites remain pending. Hosted proof and production acceptance are not established by this report.

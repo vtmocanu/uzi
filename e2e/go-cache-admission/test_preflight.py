@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import json
 import os
+import shutil
 import socket
 import threading
 from pathlib import Path
@@ -127,11 +128,15 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(result["legs"]["environment"]["status"], "FIXTURE-PROVEN")
 
     def test_unix_http_fixed_host_and_routes(self):
-        # A live directory fd keeps the absolute Unix path short without mocking validation.
-        directory_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
-        self.addCleanup(os.close, directory_fd)
-        endpoint = f"/proc/self/fd/{directory_fd}/s"
+        # AF_UNIX paths are short (about 104 bytes on macOS); use an owned short-path directory
+        # instead of /proc (Linux-only). Register cleanup before bind so a setup failure still closes.
+        short_parent = "/tmp" if os.path.isdir("/tmp") else None
+        socket_dir = tempfile.mkdtemp(prefix="gcp-", dir=short_parent)
+        self.addCleanup(shutil.rmtree, socket_dir, True)
+        os.chmod(socket_dir, 0o700)
+        endpoint = os.path.join(socket_dir, "s")
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
         server.settimeout(2)
         server.bind(endpoint)
         server.listen(2)
@@ -165,6 +170,15 @@ class PreflightTests(unittest.TestCase):
         for request, route in zip(requests, ("/version", "/images/sha256:"+"a"*64+"/json")):
             self.assertTrue(request.startswith(("GET "+route+" HTTP/1.1").encode()))
             self.assertIn(b"Host: localhost\r\n", request)
+
+    def test_unix_socket_setup_failure_closes_resources(self):
+        # A bind failure (here: missing parent) must still close the socket that was opened.
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        with self.assertRaises(OSError):
+            server.bind(os.path.join(tempfile.gettempdir(), "gcp-missing-parent-dir", "s"))
+        server.close()
+        self.assertEqual(server.fileno(), -1)
 
     def test_threshold(self):
         self.assertAlmostEqual(p.threshold(self.manifest(), 1000), 0.7)
