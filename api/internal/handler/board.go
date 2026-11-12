@@ -356,14 +356,14 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 		return true // already present — idempotent, no forge or DB work
 	}
 
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
 	// Color matches DefaultColumns' Human Review entry.
-	if err := f.EnsureLabels(r.Context(), repo.ForgeProjectID, []forge.Label{{Name: board.ColumnHumanReview, Color: "#6e49cb"}}); err != nil {
+	if err := tr.EnsureLabels(r.Context(), repo.ForgeProjectID, []forge.Label{{Name: board.ColumnHumanReview, Color: "#6e49cb"}}); err != nil {
 		slog.Warn("ensure Human Review label on the forge", "repo", repo.PathWithNamespace, "error", err)
 		return true // non-fatal: render with existing columns, retry next load
 	}
@@ -423,13 +423,13 @@ func humanReviewPlacement(cols []store.BoardColumn) (pos int, needed bool) {
 // writing an error) only when the label-seeding step fails; an import failure
 // is logged but non-fatal (the board still renders and Refresh retries).
 func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.GetRepoForUserRow) bool {
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	if err := forgesvc.EnsureBoardColumns(r.Context(), h.q, f, repo.ID, repo.ForgeProjectID); err != nil {
+	if err := forgesvc.EnsureBoardColumns(r.Context(), h.q, tr, repo.ID, repo.ForgeProjectID); err != nil {
 		var seedErr *forgesvc.LabelSeedError
 		if errors.As(err, &seedErr) {
 			httpx.Error(w, http.StatusBadGateway, "could not seed board labels on the forge: "+seedErr.Error())
@@ -439,7 +439,7 @@ func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.G
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	if _, err := h.svc.FullSync(r.Context(), repo.ID, repo.ForgeProjectID, f); err != nil {
+	if _, err := h.svc.FullSync(r.Context(), repo.ID, repo.ForgeProjectID, tr); err != nil {
 		// Non-fatal: the board renders empty and the poller/Refresh will fill it.
 		slog.Warn("initial board import failed", "repo", repo.PathWithNamespace, "error", err)
 	}
@@ -741,7 +741,7 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -752,7 +752,7 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		for i, n := range names {
 			labels[i] = forge.Label{Name: n, Color: defaultColumnColor}
 		}
-		if err := f.EnsureLabels(r.Context(), repo.ForgeProjectID, labels); err != nil {
+		if err := tr.EnsureLabels(r.Context(), repo.ForgeProjectID, labels); err != nil {
 			httpx.Error(w, http.StatusBadGateway, "could not ensure column labels on the forge: "+err.Error())
 			return
 		}
@@ -996,7 +996,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1014,11 +1014,11 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	var updated store.Issue
 	switch {
 	case isClose:
-		updated, err = h.svc.CloseIssue(r.Context(), f, repo.ForgeProjectID, issue)
+		updated, err = h.svc.CloseIssue(r.Context(), tr, repo.ForgeProjectID, issue)
 	case sourceClosed:
-		updated, err = h.svc.ReopenIssue(r.Context(), f, repo.ForgeProjectID, issue, cols, target)
+		updated, err = h.svc.ReopenIssue(r.Context(), tr, repo.ForgeProjectID, issue, cols, target)
 	default:
-		updated, err = h.svc.AutoMove(r.Context(), f, repo.ForgeProjectID, issue, cols, target)
+		updated, err = h.svc.AutoMove(r.Context(), tr, repo.ForgeProjectID, issue, cols, target)
 	}
 	if err != nil {
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue on the forge: "+err.Error())
@@ -1136,7 +1136,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1146,7 +1146,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	// failure the cache is untouched and the client keeps showing the pre-promote
 	// state. Applying a label the issue already carries is a local no-op success
 	// with no forge call, so a double click costs nothing.
-	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, forgesvc.PromoteLabelColor, true)
+	updated, err := h.svc.SetIssueLabel(r.Context(), tr, repo.ForgeProjectID, issue, label, forgesvc.PromoteLabelColor, true)
 	if err != nil {
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue label on the forge: "+err.Error())
 		return
@@ -1221,13 +1221,13 @@ func (h *Handler) SyncRepo(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if _, err := h.svc.FullSync(r.Context(), repo.ID, repo.ForgeProjectID, f); err != nil {
+	if _, err := h.svc.FullSync(r.Context(), repo.ID, repo.ForgeProjectID, tr); err != nil {
 		httpx.Error(w, http.StatusBadGateway, "sync failed: "+err.Error())
 		return
 	}

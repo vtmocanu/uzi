@@ -58,6 +58,55 @@ func TestPodEpochRuntimeConfig(t *testing.T) {
 	}
 }
 
+func TestEpochReclaimDeletionCanaryIDConfig(t *testing.T) {
+	const id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+	const key = "UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID"
+	cases := []struct {
+		name  string
+		set   bool
+		raw   string
+		valid bool
+	}{
+		{"unset", false, "", true},
+		{"empty", true, "", true},
+		{"exact", true, id, true},
+		{"uppercase", true, strings.ToUpper(id), false},
+		{"padded", true, " " + id, false},
+		{"trailing newline", true, id + "\n", false},
+		{"list", true, "a,b", false},
+		{"two uuids", true, id + "," + id, false},
+		{"wildcard", true, "*", false},
+		{"malformed", true, "abc", false},
+		{"no dashes", true, strings.ReplaceAll(id, "-", ""), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://api.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "token"))
+			t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "")
+			if tc.set {
+				t.Setenv(key, tc.raw)
+			} else {
+				t.Setenv(key, "")
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := Load()
+			if tc.valid {
+				if err != nil || cfg.WorkerEpochReclaimDeletionCanaryID != tc.raw {
+					t.Fatalf("id=%q err=%v", cfg.WorkerEpochReclaimDeletionCanaryID, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), key+" must be empty or one canonical lowercase UUID") {
+				t.Fatalf("invalid id accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadReadsTheTokenFromFileAndDefaultsTheKnobs(t *testing.T) {
 	setWorkerEnv(t)
 	t.Setenv("UZI_API_URL", "https://uzi.example.com/some/path")
@@ -1172,4 +1221,31 @@ func TestLoadParsesTheCommandSandboxMode(t *testing.T) {
 			t.Fatalf("err = %v, want a boot refusal naming UZI_CODEX_COMMAND_SANDBOX", err)
 		}
 	})
+}
+
+func TestEpochScratchDeletionConfig(t *testing.T) {
+	const key = "UZI_WORKER_EPOCH_SCRATCH_DELETION"
+	for _, raw := range []string{"unset", "", "false", "true", "False", "FALSE", "True", "TRUE", "0", "1", "t", "f", "T", "F", "yes", "no", " true", "true ", "false\n", "\ttrue", "null"} {
+		t.Run(raw, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://api.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "token"))
+			t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "")
+			t.Setenv(key, raw)
+			if raw == "unset" {
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := Load()
+			valid := raw == "unset" || raw == "" || raw == "false" || raw == "true"
+			if valid {
+				if err != nil || cfg.WorkerEpochScratchDeletion != (raw == "true") {
+					t.Fatalf("enabled=%v err=%v", cfg.WorkerEpochScratchDeletion, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("invalid value accepted: %v", err)
+			}
+		})
+	}
 }

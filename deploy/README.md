@@ -1094,13 +1094,16 @@ runs. See [adr/1598-codex-command-storage.md](../adr/1598-codex-command-storage.
 ### Pod-epoch shadow reclaim (PRD #3430)
 
 Hosted Docker workers now participate in epoch ownership and can report a
-`pod_epoch_reclaim` verdict before run admission. **Production deletion is off:
-the pass does not delete attempt trees, release holds or remove stopped
-containers.** The worker image carries a gated deletion phase from
-[PRD #3431](../prds/3431-pod-epoch-reclaim.md), compiled with its activation
-constant set to `false`; no chart value or environment variable turns it on, and
-enabling it needs a separate owner decision. Hosted deletion acceptance and
-#3329's idle-gated roll are not shipped. Existing startup reapers
+`pod_epoch_reclaim` verdict before run admission. **Attempt deletion is off
+by default: that phase does not delete attempt trees, release holds or remove
+stopped containers.** The worker image carries a deletion phase from
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) that runs only when the worker
+starts with `UZI_EPOCH_RECLAIM_DELETION=1` (read once at startup). The only
+supported way to set it is the one-worker canary selector
+`workers.epochReclaim.deletionCanaryWorkerId`, default `""` (off everywhere);
+there is no fleet-wide enable, hot kill switch or forced roll. See
+[One-worker deletion canary](#one-worker-deletion-canary) below. Hosted deletion
+acceptance and #3329's idle-gated roll are not shipped. Existing startup reapers
 and DinD maintenance are separate. Compose and
 non-Docker lanes are unchanged. See the [worker overview](../docs/worker-docker.md#pod-epoch-shadow-reclaim)
 and [design and implementation evidence](../prds/3430-pod-epoch-lock-shadow.md).
@@ -1113,10 +1116,20 @@ every tree, logs `deferred` / `runtime_not_declared` without waiting for evidenc
 and reports no candidates, while still taking part in lifetime epoch locking.
 Candidate inventory needs a declared value. Setting a value attests the
 **full audited runtime/storage contract** below for the nodes eligible for these
-workers (a future hosted-Docker deletion under PRD #3431 will require it). The
+workers (hosted-Docker deletion under PRD #3431 requires it). The
 declaration does not verify versions or storage itself; the controller and worker
-only cross-check it against observations (see *Reading verdicts*). This release
-deletes nothing either way.
+only cross-check it against observations (see *Reading verdicts*). Attempt deletion remains off except on a worker selected with the
+deletion canary below. Scratch reclaim is independently requested by default
+with `workers.epochReclaim.scratchDeletion: true`: the chart quotes controller
+`UZI_WORKER_EPOCH_SCRATCH_DELETION` as `"true"` or `"false"` (explicit false is
+preserved), and the controller emits worker `UZI_EPOCH_SCRATCH_DELETION=1` only
+for persistent Docker workers when enabled, omitting it otherwise. The value
+must be a boolean. This grants no attestation; undeclared/unattested keeps scratch.
+Older controllers or absent env leave scratch off; older workers ignore the env,
+so rendered `1` is not proof. The worker image must include #4171 (`7cd46526`).
+See [startup disable and observation](../docs/run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation)
+for safe replacement, evidence and startup-only limits; hosted observation and
+the keep-default decision remain pending on #4043.
 
 | Declaration | Audited stack |
 |---|---|
@@ -1260,9 +1273,9 @@ every tree). Admitted shapes, content-proof budgets and crash residuals are in
 
 The cross-checks have limits. Matching observations never prove the
 unobservable OCI-handler, crun/conmon, NRI, attachment or ownership-walk facts,
-and the kernel observation covers the successor's node only. In production
-nothing is deleted or settled: the PRD #3431 M1b deletion phase is switched off
-and its activation is separately gated by an owner decision.
+and the kernel observation covers the successor's node only. Attempt deletion is off by default and selector-gated; scratch reclaim is
+requested independently by default, with the same attestation requirement
+and unchanged mechanism protections described above.
 
 **Kernel allowlist (operator note).** Any kernel release outside the exact
 `crio-crun` allowlist above yields `kernel_unaudited` and defers, including after
@@ -1363,15 +1376,47 @@ base/candidate controls; exact-head PR CI is still pending. Before delivery,
 a formal owner partial decision must name the actual milestone IDs and the
 outstanding M1/M2c image/full-gate criteria and M3 live acceptance. Continuation
 guidance does not waive these checks. These pending proofs are not production
-verification; deletion stays off in production under #3431 pending an owner decision.
+verification; attempt deletion stays off in production under #3431 except on the one canary worker an operator selects.
 
 [PRD #3431](../prds/3431-pod-epoch-reclaim.md) records M1a's widened live
 acceptance as an owner-relayed assertion that this guide has not independently
-verified. The M1b deletion phase is implemented but off, and its hosted deletion
+verified. The M1b deletion phase is implemented and off by default (one-worker canary
+selector only), and its hosted deletion
 acceptance is owner-owned, pending and unverified. On real rolls, check
 strict-plain eligibility, protected and shared refusals, present versus missing
 classification, the declaration, contradiction and legacy-evidence behavior, and
 the measured caps. PRD #3430's items above stay pending.
+
+### One-worker deletion canary
+
+`workers.epochReclaim.deletionCanaryWorkerId` defaults to `""` (attempt deletion off everywhere).
+It does not gate scratch reclaim, which the chart requests by default as described above.
+It accepts empty or exactly one canonical lowercase UUID; a list, wildcard,
+uppercase, padded or non-string value fails chart rendering, and the controller
+(`UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID`, always a string) refuses to boot
+on a list, wildcard, uppercase or padded value. When the ID
+equals a persistent, non-isolated Docker worker's ID, the controller renders
+`UZI_EPOCH_RECLAIM_DELETION=1` into that worker's pod template only; no other
+template or spec hash changes, so only that worker rolls, through the existing
+pacing, idle, layout-migration and custody guards (no force roll, no PVC
+teardown; a busy worker can defer it indefinitely). An ID absent from the fleet
+logs `epoch-reclaim-deletion-canary-absent worker=<id>`, an ineligible one
+`epoch-reclaim-deletion-canary-ineligible worker=<id>`; no substitute is picked.
+The worker image pin is independent and is never changed by this value. Confirm
+activation from the worker's `pod_epoch_reclaim_activation` startup line
+(`deletion_requested: true`); an older image ignores the variable and emits none.
+
+Clearing the selector removes the env at that worker's next replacement; it does
+not stop a pass already running and cannot restore deleted bytes. Never move the
+selector to another UUID until the prior enabled incarnation is proven gone or
+off: the old worker keeps its env until its own replacement, so while its current
+pod has not finished its first pass, or a new pod for it starts (for example
+after an eviction), it can still attempt deletion and both workers can be enabled
+at once (an accepted limit). A same-pod restart re-runs a pass only if the first
+process died before the pod UID was durably consumed. Prerequisites, evidence and stop rules are in the
+[one-worker deletion canary checklist](../docs/run-recovery.md#one-worker-deletion-canary-checklist).
+Live enablement waits on the #3851 implementation in the deployed image and
+refreshed R9 measurements; hosted acceptance is pending.
 
 ### M4/M5 runbook: known items before go-live
 

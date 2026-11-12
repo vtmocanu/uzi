@@ -80,11 +80,14 @@ type Handler struct {
 	// leaves them unset); read only through productTokenListBound.
 	myProductTokenRowsOverride    int32
 	adminProductTokenRowsOverride int32
-	// forgeFactory, when non-nil, replaces h.svc.ForgeForConnection for the forge-view
-	// read routes (PRD #1255 M2a), so their handlers can be exercised against a
-	// forgetest.BaseFake without a live forge or a wired forgesvc.Service (the auth
-	// live-DB suite injects one). nil in production — New leaves it unset and
-	// forgeForConnection falls back to h.svc. Mirrors tmplWriteStore.
+	// forgeFactory, when non-nil, replaces forgesvc's IssueTrackerForRepo and
+	// CodeHostForRepo behind the repo-side wrappers issueTrackerForRepo and
+	// codeHostForRepo, for every repo-scoped handler on either half (PRD #1255 M2a
+	// introduced it for the forge-view read routes). It lets those handlers be
+	// exercised against a forgetest.BaseFake without a live forge or a wired
+	// forgesvc.Service (the forge-view and ci-fix live-DB suites inject one). nil in
+	// production — New leaves it unset and the wrappers fall back to h.svc. Mirrors
+	// tmplWriteStore.
 	forgeFactory func(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
 	// forgeMemo folds duplicate forge reads under the forge-view routes (PRD #1255
 	// M2b, D4): a short-TTL + singleflight memo so N terminals polling one PR cost
@@ -473,15 +476,32 @@ func (h *Handler) templateWriteStore() agentTemplateWriteStore {
 	return h.q
 }
 
-// forgeForConnection builds a forge driver for a repo's connection, going through the
-// injected forgeFactory when one is set (the forge-view auth test) and otherwise
-// through the real forgesvc.Service. nil-safe only when a factory is injected; in
-// production h.svc is always wired.
-func (h *Handler) forgeForConnection(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error) {
+// issueTrackerForRepo builds the issue-tracker half of a repo's forge, going through
+// the injected forgeFactory when one is set and otherwise through
+// forgesvc.Service.IssueTrackerForRepo. It returns a nil issue tracker whenever err != nil,
+// on both paths. nil-safe only when a factory is injected; in production h.svc is
+// always wired.
+func (h *Handler) issueTrackerForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.IssueTracker, error) {
 	if h.forgeFactory != nil {
-		return h.forgeFactory(forgeType, baseURL, tokenCiphertext)
+		f, err := h.forgeFactory(forgeType, baseURL, tokenCiphertext)
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
 	}
-	return h.svc.ForgeForConnection(forgeType, baseURL, tokenCiphertext)
+	return h.svc.IssueTrackerForRepo(ctx, repoID, forgeType, baseURL, tokenCiphertext)
+}
+
+// codeHostForRepo is issueTrackerForRepo for the code-host half.
+func (h *Handler) codeHostForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.CodeHost, error) {
+	if h.forgeFactory != nil {
+		f, err := h.forgeFactory(forgeType, baseURL, tokenCiphertext)
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
+	return h.svc.CodeHostForRepo(ctx, repoID, forgeType, baseURL, tokenCiphertext)
 }
 
 // memo returns the process-wide forge-view read memo (PRD #1255 M2b), constructing

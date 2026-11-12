@@ -573,7 +573,7 @@ func TestMRReworkProceedStartsRun(t *testing.T) {
 	// Two kept comments; max id 120 > high_water 0 → fire, advance to 120.
 	f := landedForge(mrwComment(100, landed(), mrwHeadSHA), mrwComment(120, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("CreateAutoMRReworkRun calls = %d, want 1", len(runs.calls))
@@ -609,7 +609,7 @@ func TestMRReworkPipelineRedNoFire(t *testing.T) {
 	runs := &mrwRuns{}
 	f := landedForge(mrwComment(120, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 || len(st.upserts) != 0 {
 		t.Fatalf("a red head pipeline must not fire: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
@@ -622,7 +622,7 @@ func TestMRReworkNoCachedPipelineNoFire(t *testing.T) {
 	runs := &mrwRuns{}
 	f := landedForge(mrwComment(120, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("an absent head pipeline must not fire, got %d runs", len(runs.calls))
@@ -635,7 +635,7 @@ func TestMRReworkReviewNotLandedYoungComment(t *testing.T) {
 	// Comment created NOW → inside the 5-minute quiet period → not landed.
 	f := landedForge(mrwComment(120, time.Now(), mrwHeadSHA))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("a comment still inside the quiet period must not fire, got %d runs", len(runs.calls))
@@ -648,7 +648,7 @@ func TestMRReworkStaleHeadSHANoFire(t *testing.T) {
 	// Landed, but written against a SUPERSEDED head SHA (!= the green pipeline's SHA).
 	f := landedForge(mrwComment(120, landed(), "oldsha00"))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("a comment on a stale head SHA must not fire, got %d runs", len(runs.calls))
@@ -665,7 +665,7 @@ func TestMRReworkCommentAtOrBelowHighWaterNoFire(t *testing.T) {
 	runs := &mrwRuns{}
 	f := landedForge(mrwComment(100, landed(), mrwHeadSHA), mrwComment(120, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 || len(st.upserts) != 0 {
 		t.Fatalf("no comment past the high-water must not fire: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
@@ -696,7 +696,7 @@ func TestMRReworkPostManualLedgerStateNoRefire(t *testing.T) {
 		notifier := &mrwNotifier{}
 		f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
 
-		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: cap}).detect(context.Background(), mrwRepoRow(), f)
+		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: cap}).detect(context.Background(), mrwRepoRow(), f, f)
 
 		if len(runs.calls) != 0 {
 			t.Fatalf("no comment past the manual high-water must not fire, got %d runs", len(runs.calls))
@@ -718,7 +718,7 @@ func TestMRReworkPostManualLedgerStateNoRefire(t *testing.T) {
 		// GATE 4 halts; halt_notified was reset by the manual cycle → it comments once more.
 		f := landedForge(mrwComment(200, landed(), mrwHeadSHA), mrwComment(300, landed(), mrwHeadSHA))
 
-		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: cap}).detect(context.Background(), mrwRepoRow(), f)
+		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: cap}).detect(context.Background(), mrwRepoRow(), f, f)
 
 		if len(runs.calls) != 0 {
 			t.Fatalf("a capped MR must not start a run, got %d", len(runs.calls))
@@ -744,7 +744,7 @@ func TestMRReworkStrictlyAboveHighWaterFires(t *testing.T) {
 	runs := &mrwRuns{}
 	f := landedForge(mrwComment(100, landed(), mrwHeadSHA), mrwComment(140, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("a comment above the high-water must fire, got %d runs", len(runs.calls))
@@ -769,7 +769,7 @@ func TestMRReworkAtCapHaltsOnceThenSilent(t *testing.T) {
 	f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
 	d := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5})
 
-	d.detect(context.Background(), mrwRepoRow(), f)
+	d.detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("a capped MR must not start a run, got %d", len(runs.calls))
@@ -792,7 +792,7 @@ func TestMRReworkAtCapHaltsOnceThenSilent(t *testing.T) {
 
 	// Second tick: the latch is set → NO second comment, NO second notify.
 	f2 := landedForge(mrwComment(200, landed(), mrwHeadSHA))
-	d.detect(context.Background(), mrwRepoRow(), f2)
+	d.detect(context.Background(), mrwRepoRow(), f2, f2)
 	if len(f2.notes) != 0 || len(notifier.calls) != 1 || len(st.haltSets) != 1 {
 		t.Fatalf("the halt latch must be silent on the next tick: notes=%d notifs=%d halts=%d",
 			len(f2.notes), len(notifier.calls), len(st.haltSets))
@@ -812,7 +812,7 @@ func TestMRReworkHaltedAndNotifiedSkipsListingAndLookups(t *testing.T) {
 	f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
 	d := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5})
 
-	d.detect(context.Background(), mrwRepoRow(), f)
+	d.detect(context.Background(), mrwRepoRow(), f, f)
 
 	if f.listCalls != 0 || len(f.lookups) != 0 {
 		t.Fatalf("a halted, notified MR must skip the listing and lookups: list=%d lookups=%d", f.listCalls, len(f.lookups))
@@ -825,7 +825,7 @@ func TestMRReworkHaltedAndNotifiedSkipsListingAndLookups(t *testing.T) {
 	// Raising the cap un-halts it: the next tick lists again and proceeds.
 	d2 := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 6})
 	f2 := landedForge(mrwComment(200, landed(), mrwHeadSHA))
-	d2.detect(context.Background(), mrwRepoRow(), f2)
+	d2.detect(context.Background(), mrwRepoRow(), f2, f2)
 	if f2.listCalls != 1 || len(runs.calls) != 1 {
 		t.Fatalf("under a raised cap the MR must be listed and reworked: list=%d runs=%d", f2.listCalls, len(runs.calls))
 	}
@@ -844,7 +844,7 @@ func TestMRReworkHaltLatchWriteFailsNoComment(t *testing.T) {
 	notifier := &mrwNotifier{}
 	f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(f.notes) != 0 || len(runs.calls) != 0 {
 		t.Fatalf("a failed latch write must post no comment and start no run: notes=%d runs=%d", len(f.notes), len(runs.calls))
@@ -869,7 +869,7 @@ func TestMRReworkHaltNotifyFailureRetriesNextTick(t *testing.T) {
 	f.ops = &ops
 	d := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5})
 
-	d.detect(context.Background(), mrwRepoRow(), f)
+	d.detect(context.Background(), mrwRepoRow(), f, f)
 	if len(st.haltSets) != 0 || len(f.notes) != 0 {
 		t.Fatalf("a failed notify must set no latch and post no comment, got latches=%d notes=%d", len(st.haltSets), len(f.notes))
 	}
@@ -879,7 +879,7 @@ func TestMRReworkHaltNotifyFailureRetriesNextTick(t *testing.T) {
 
 	notifier.err = nil
 	ops = ops[:0]
-	d.detect(context.Background(), mrwRepoRow(), f)
+	d.detect(context.Background(), mrwRepoRow(), f, f)
 	if got := strings.Join(ops, ","); got != "notify,halt,comment" {
 		t.Fatalf("retry tick ops = %q, want notify,halt,comment", got)
 	}
@@ -900,7 +900,7 @@ func TestMRReworkBranchInUseSwallows(t *testing.T) {
 	notifier := &mrwNotifier{}
 	f := landedForge(mrwComment(140, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("expected one create attempt, got %d", len(runs.calls))
@@ -930,7 +930,7 @@ func TestMRReworkNoCredentialForHarnessSkipsWithoutErrorDetail(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
-	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("expected one create attempt, got %+v", runs.calls)
@@ -973,7 +973,7 @@ func TestMRReworkActiveExistsSwallows(t *testing.T) {
 	runs := &mrwRuns{err: workersvc.ErrActiveMRReworkExists}
 	f := landedForge(mrwComment(140, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 1 || len(st.upserts) != 0 {
 		t.Fatalf("ErrActiveMRReworkExists must swallow with no ledger advance: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
@@ -986,7 +986,7 @@ func TestMRReworkAdminGateOffNoFire(t *testing.T) {
 	runs := &mrwRuns{}
 	f := landedForge(mrwComment(140, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: false, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: false, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 || len(st.evicts) != 0 {
 		t.Fatalf("admin gate off must be a full no-op (no candidates listed): runs=%d evicts=%d", len(runs.calls), len(st.evicts))
@@ -999,7 +999,7 @@ func TestMRReworkAdminGateErrorFailsClosed(t *testing.T) {
 	runs := &mrwRuns{}
 	f := landedForge(mrwComment(140, landed(), mrwHeadSHA))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, enabledErr: context.DeadlineExceeded, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, enabledErr: context.DeadlineExceeded, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("a settings read error must fail closed (no fire), got %d runs", len(runs.calls))
@@ -1016,7 +1016,7 @@ func TestMRReworkEmptyCandidatesReconcilesRepo(t *testing.T) {
 	runs := &mrwRuns{}
 	f := landedForge()
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("a merged/closed MR must not be acted on, got %d runs", len(runs.calls))
@@ -1046,7 +1046,7 @@ func TestMRReworkIssuelessBranchDecoupled(t *testing.T) {
 		// One kept comment, id 120 > high_water 0 → fire.
 		f := landedForge(mrwComment(120, landed(), mrwHeadSHA))
 
-		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 		if len(runs.calls) != 1 {
 			t.Fatalf("an issueless branch below cap must still fire the rework, got %d runs", len(runs.calls))
@@ -1072,7 +1072,7 @@ func TestMRReworkIssuelessBranchDecoupled(t *testing.T) {
 		// A new comment (id 200 > high_water 120) reaches the cap gate.
 		f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
 
-		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+		newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 		if len(runs.calls) != 0 {
 			t.Fatalf("a capped issueless MR must not start a run, got %d", len(runs.calls))
@@ -1104,7 +1104,7 @@ func TestMRReworkBotOnlyCommentsNoFire(t *testing.T) {
 	botComment.AuthorForgeUserID = mrwBotID
 	f := landedForge(botComment)
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("a bot-only comment set must not fire, got %d runs", len(runs.calls))
@@ -1140,7 +1140,7 @@ func TestMRReworkBotWalkthroughSummaryNoFire(t *testing.T) {
 	body := coderabbitSummaryMarker + "\n\nNo actionable comments were generated in the recent review."
 	f := landedForge(mrwSummaryComment(400, landed(), "coderabbitai[bot]", body))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 || len(st.upserts) != 0 {
 		t.Fatalf("a bot walkthrough/summary-only set must not fire or advance the ledger: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
@@ -1156,7 +1156,7 @@ func TestMRReworkHumanCodeRabbitControlCommentNoFire(t *testing.T) {
 			runs := &mrwRuns{}
 			f := landedForge(mrwSummaryComment(420, landed(), "maintainer", body))
 
-			newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+			newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 			if len(runs.calls) != 0 || len(st.upserts) != 0 {
 				t.Fatalf("a CodeRabbit control command must not fire or advance the ledger: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
@@ -1175,7 +1175,7 @@ func TestMRReworkInlineBotFindingFires(t *testing.T) {
 	inline.AuthorUsername = "coderabbitai[bot]"
 	f := landedForge(inline)
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("a bot INLINE finding must fire, got %d runs", len(runs.calls))
@@ -1192,7 +1192,7 @@ func TestMRReworkHumanTopLevelNoteFires(t *testing.T) {
 	runs := &mrwRuns{}
 	f := landedForge(mrwSummaryComment(130, landed(), "maintainer", "please also rename X before we merge"))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("a human top-level note must fire, got %d runs", len(runs.calls))
@@ -1211,7 +1211,7 @@ func TestMRReworkGitLabMarkerNonBotSummaryNoFire(t *testing.T) {
 	body := coderabbitSummaryMarker + "\n\nNo actionable comments were generated."
 	f := landedForge(mrwSummaryComment(410, landed(), "coderabbit", body))
 
-	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
+	newMRW(st, runs, nil, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f, f)
 
 	if len(runs.calls) != 0 || len(st.upserts) != 0 {
 		t.Fatalf("a marker-carrying summary from a non-bot login must not fire: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
@@ -1229,7 +1229,7 @@ func TestMRReworkSummaryThenLowerIdInlineFires(t *testing.T) {
 
 	// Tick 1: only a bot walkthrough with a HIGH id (300). No fire, no ledger advance.
 	f1 := landedForge(mrwSummaryComment(300, landed(), "coderabbitai[bot]", walkthrough))
-	d.detect(context.Background(), mrwRepoRow(), f1)
+	d.detect(context.Background(), mrwRepoRow(), f1, f1)
 	if len(runs.calls) != 0 || len(st.upserts) != 0 {
 		t.Fatalf("a summary-only tick must not fire or advance the ledger: runs=%d upserts=%d", len(runs.calls), len(st.upserts))
 	}
@@ -1237,7 +1237,7 @@ func TestMRReworkSummaryThenLowerIdInlineFires(t *testing.T) {
 	// Tick 2: the same walkthrough (300) plus a real inline finding with a LOWER id
 	// (200). Because tick 1 left high_water at 0, the id-200 inline still clears GATE 3.
 	f2 := landedForge(mrwSummaryComment(300, landed(), "coderabbitai[bot]", walkthrough), mrwComment(200, landed(), mrwHeadSHA))
-	d.detect(context.Background(), mrwRepoRow(), f2)
+	d.detect(context.Background(), mrwRepoRow(), f2, f2)
 	if len(runs.calls) != 1 {
 		t.Fatalf("a later inline finding with a lower id than the summary must still fire, got %d runs", len(runs.calls))
 	}

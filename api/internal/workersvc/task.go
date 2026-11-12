@@ -96,8 +96,9 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		if err != nil {
 			return store.Run{}, ErrForgeBuild
 		}
+		var tr forge.IssueTracker = f
 		fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		issue, err := forge.GetIssueBounded(fetchCtx, f, row.ForgeProjectID, *continuedIssueIID)
+		issue, err := forge.GetIssueBounded(fetchCtx, tr, row.ForgeProjectID, *continuedIssueIID)
 		cancel()
 		if err != nil {
 			var notFound *forge.IssueNotFoundError

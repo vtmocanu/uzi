@@ -101,7 +101,7 @@ type ciBuilder struct {
 	scrubErr error
 }
 
-func (b *ciBuilder) SetIssueLabel(context.Context, forge.Forge, int64, store.Issue, string, string, bool) (store.Issue, error) {
+func (b *ciBuilder) SetIssueLabel(context.Context, forge.IssueTracker, int64, store.Issue, string, string, bool) (store.Issue, error) {
 	panic("unexpected label removal")
 }
 func (b *ciBuilder) CIArtifactScrubber([]byte) (func(string) string, error) {

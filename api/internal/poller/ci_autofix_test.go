@@ -296,7 +296,7 @@ func TestCIAutofixAdminGateOffNoFire(t *testing.T) {
 	runs := &cfRuns{ops: &ops}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "panic: boom\nexit 1", ops: &ops}
 
-	newCFSet(st, runs, nil, cfSettings{enabled: false}).detect(context.Background(), cfRepoRow(), f)
+	newCFSet(st, runs, nil, cfSettings{enabled: false}).detect(context.Background(), cfRepoRow(), f, f)
 
 	if st.listed {
 		t.Fatalf("admin gate off must return before listing candidates")
@@ -314,7 +314,7 @@ func TestCIAutofixAdminGateErrorFailsClosed(t *testing.T) {
 	runs := &cfRuns{ops: &ops}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "panic: boom\nexit 1", ops: &ops}
 
-	newCFSet(st, runs, nil, cfSettings{enabled: true, enabledErr: context.DeadlineExceeded}).detect(context.Background(), cfRepoRow(), f)
+	newCFSet(st, runs, nil, cfSettings{enabled: true, enabledErr: context.DeadlineExceeded}).detect(context.Background(), cfRepoRow(), f, f)
 
 	if st.listed {
 		t.Fatalf("a settings read error must fail closed before listing candidates")
@@ -331,7 +331,7 @@ func TestCIAutofixProceedStartsRun(t *testing.T) {
 	notifier := &cfNotifier{ops: &ops}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "panic: boom\nexit 1", ops: &ops}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("CreateAutoCIFixRun calls = %d, want 1", len(runs.calls))
@@ -377,7 +377,7 @@ func TestCIAutofixDedupSkipsHandledPipeline(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(runs.calls) != 0 || len(st.upserts) != 0 || len(st.records) != 0 || len(f.notes) != 0 || len(notifier.calls) != 0 {
 		t.Fatalf("dedup must be a no-op: runs=%d upserts=%d records=%d notes=%d notifs=%d",
@@ -397,7 +397,7 @@ func TestCIAutofixCapHalts(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("capped halt must not start a run, got %d", len(runs.calls))
@@ -442,7 +442,7 @@ func TestCIAutofixNoProgressHalts(t *testing.T) {
 	runs := &cfRuns{}
 	notifier := &cfNotifier{}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("no-progress halt must not start a run, got %d", len(runs.calls))
@@ -478,7 +478,7 @@ func TestCIAutofixHaltLatchSilent(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(runs.calls) != 0 || len(st.haltSets) != 0 || len(f.notes) != 0 || len(notifier.calls) != 0 {
 		t.Fatalf("halt latch must be silent: runs=%d halts=%d notes=%d notifs=%d",
@@ -501,7 +501,7 @@ func TestCIAutofixActiveRunSwallowCaps(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(runs.calls) != 0 || len(f.notes) != 0 || len(notifier.calls) != 0 {
 		t.Fatalf("active-run swallow must not run/comment/notify: runs=%d notes=%d notifs=%d",
@@ -520,7 +520,7 @@ func TestCIAutofixCreateRaceSwallows(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("expected one create attempt, got %d", len(runs.calls))
@@ -545,7 +545,7 @@ func TestCIAutofixBranchInUseSwallows(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("expected one create attempt, got %d", len(runs.calls))
@@ -574,7 +574,7 @@ func TestCIAutofixIssuelessBranchFiresNoComment(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "panic: boom\nexit 1"}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	// The ci_fix run IS created for the issueless branch.
 	if len(runs.calls) != 1 {
@@ -612,7 +612,7 @@ func TestCIAutofixIssuelessBranchCapHaltsNoComment(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(runs.calls) != 0 {
 		t.Fatalf("capped halt must not start a run, got %d", len(runs.calls))
@@ -649,7 +649,7 @@ func TestCIAutofixHaltLatchWriteFailsNoComment(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(f.notes) != 0 {
 		t.Fatalf("a failed latch write must post NO comment, got %+v", f.notes)
@@ -678,7 +678,7 @@ func TestCIAutofixHaltNotifyFailureRetriesNextTick(t *testing.T) {
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom", ops: &ops}
 	cf := newCF(st, runs, notifier)
 
-	cf.detect(context.Background(), cfRepoRow(), f)
+	cf.detect(context.Background(), cfRepoRow(), f, f)
 	if len(st.haltSets) != 0 || len(f.notes) != 0 {
 		t.Fatalf("a failed notify must set no latch and post no comment, got latches=%d notes=%d", len(st.haltSets), len(f.notes))
 	}
@@ -688,7 +688,7 @@ func TestCIAutofixHaltNotifyFailureRetriesNextTick(t *testing.T) {
 
 	notifier.err = nil
 	ops = ops[:0]
-	cf.detect(context.Background(), cfRepoRow(), f)
+	cf.detect(context.Background(), cfRepoRow(), f, f)
 	if got := strings.Join(ops, ","); got != "notify,halt,comment" {
 		t.Fatalf("retry tick ops = %q, want notify,halt,comment", got)
 	}
@@ -730,7 +730,7 @@ func TestCIAutofixLatchResetsOnProceed(t *testing.T) {
 
 	// Step A: the SAME signature on a new pipeline (count 1 < cap 2) → no-progress halt.
 	st.candidates = []store.ListCIAutofixCandidateRefsRow{cfCand(9010)}
-	d.detect(ctx, cfRepoRow(), fA)
+	d.detect(ctx, cfRepoRow(), fA, fA)
 
 	if len(st.haltSets) != 1 {
 		t.Fatalf("step A: expected one halt latch, got %d", len(st.haltSets))
@@ -753,7 +753,7 @@ func TestCIAutofixLatchResetsOnProceed(t *testing.T) {
 		t.Fatalf("test needs two distinct signatures; both hashed to %s", sigA)
 	}
 	st.candidates = []store.ListCIAutofixCandidateRefsRow{cfCand(9020)}
-	d.detect(ctx, cfRepoRow(), fB)
+	d.detect(ctx, cfRepoRow(), fB, fB)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("step B: expected one proceed/run, got %d", len(runs.calls))
@@ -769,7 +769,7 @@ func TestCIAutofixLatchResetsOnProceed(t *testing.T) {
 	// NOT be suppressed by the earlier no-progress latch.
 	fC := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "error: totally different\nexit 2"}
 	st.candidates = []store.ListCIAutofixCandidateRefsRow{cfCand(9030)}
-	d.detect(ctx, cfRepoRow(), fC)
+	d.detect(ctx, cfRepoRow(), fC, fC)
 
 	if len(runs.calls) != 1 {
 		t.Fatalf("step C: cap halt must not start a run, got %d", len(runs.calls))
@@ -788,7 +788,7 @@ func TestCIAutofixNoCandidatesNoOp(t *testing.T) {
 	notifier := &cfNotifier{}
 	f := &cfForge{}
 
-	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 	if len(runs.calls) != 0 || len(st.upserts) != 0 || len(st.records) != 0 {
 		t.Fatal("empty candidate set must be a no-op")
@@ -830,7 +830,7 @@ func TestCIAutofixPRBindingRefusals(t *testing.T) {
 			notifier := &cfNotifier{}
 			f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 
-			newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+			newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
 
 			if len(runs.calls) != 1 {
 				t.Fatalf("create attempts = %d, want 1", len(runs.calls))
@@ -857,11 +857,11 @@ func TestCIAutofixUnavailableBindingRetriesNextTick(t *testing.T) {
 	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
 	cf := NewCIAutoFix(st, runs, &cfNotifier{}, cfSettings{enabled: true}, 5, 4096, 2, []string{".gitlab-ci.yml"})
 
-	cf.detect(context.Background(), cfRepoRow(), f)
+	cf.detect(context.Background(), cfRepoRow(), f, f)
 	if len(st.records) != 0 || len(st.upserts) != 0 {
 		t.Fatalf("tick 1 must record nothing: records=%d upserts=%d", len(st.records), len(st.upserts))
 	}
-	cf.detect(context.Background(), cfRepoRow(), f)
+	cf.detect(context.Background(), cfRepoRow(), f, f)
 	if runs.calls != 2 {
 		t.Fatalf("create calls after tick 2 = %d, want 2 (retried)", runs.calls)
 	}

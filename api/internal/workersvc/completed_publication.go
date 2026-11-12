@@ -155,7 +155,7 @@ func completedPublicationError(ctx context.Context, err error) string {
 	return "ancestry_unknown"
 }
 
-func proveCompletedPublication(ctx context.Context, f forge.Forge, id apitypes.CompletionIdentity) (string, string) {
+func proveCompletedPublication(ctx context.Context, f forge.CodeHost, id apitypes.CompletionIdentity) (string, string) {
 	if id.MRIID == nil || *id.MRIID <= 0 {
 		return "", "mr_missing"
 	}
@@ -253,7 +253,8 @@ func (s *Service) verifyCompletedPublication(ctx context.Context, w store.Worker
 	if err != nil {
 		return refuse("ancestry_unknown")
 	}
-	head, reason := proveCompletedPublication(proofCtx, f, id)
+	var ch forge.CodeHost = f
+	head, reason := proveCompletedPublication(proofCtx, ch, id)
 	if reason != "" {
 		return refuse(reason)
 	}

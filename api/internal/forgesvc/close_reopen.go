@@ -18,7 +18,7 @@ import (
 // left as the last sync/move stored them (a closed card renders in the Closed lane
 // via board.ResolveColumn regardless of its column labels), which is why this uses
 // the narrow UpdateIssueState query rather than UpsertIssueLabels.
-func (s *Service) CloseIssue(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue) (store.Issue, error) {
+func (s *Service) CloseIssue(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue) (store.Issue, error) {
 	// Diff-first: if the cache already reflects the desired state, skip the forge
 	// entirely and return the row unchanged (idempotent close, no forge call).
 	if issue.State == string(forge.StateClosed) {
@@ -55,7 +55,7 @@ func (s *Service) CloseIssue(ctx context.Context, f forge.Forge, forgeProjectID 
 // Partial failure: if the move half fails, the reopened-but-unmoved row (state opened,
 // board_position nulled) is returned with the error so the handler can surface a 502
 // for the move while the card still renders open — never lost.
-func (s *Service) ReopenIssue(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error) {
+func (s *Service) ReopenIssue(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error) {
 	if issue.State != string(forge.StateOpened) {
 		// Forge-first: reopen remotely before touching the cache. On failure the cache
 		// is untouched (no ReopenIssueState, no UpsertIssueLabels) and the card snaps back.

@@ -18,6 +18,7 @@ const epochLeaves = [
   'pod epoch real entrypoint fences protected initialization under EX and confines both UID bootstrap launches',
   'pod epoch private API CA survives both real UID launch chains without relaxing preload refusal',
   'pod epoch restores observable persistent worker and runner scratch in both UID modes and refuses invalid saved paths',
+  'pod epoch real split: the worker pins the runner scratch root, the runner-uid census reads it and the strict delete removes a leaf',
 ];
 // Issue #3907: the one lane whose container leaves /nix unmasked (a labelled named volume), so the
 // baked Chromium exists. Two literal leaves under one literal suite, gated by one INIT_SKIP.

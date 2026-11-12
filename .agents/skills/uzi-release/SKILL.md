@@ -23,7 +23,7 @@ Do NOT bake step details that live in the repo into your head. Read the source o
 - A green CI `report` confirms incident delivery only; inspect the failed phase, planned tag and uncited identities, then fix the cause. Prepare/watch failure still makes the run red.
 - An unconfirmed push receipt stops watch before publication recovery or verification. Inspect remote refs, then run local watch/verify against the same tag/SHA; this branch does not run automatic publication retries.
 - If promotion succeeds but diagnostics cannot be written, the cutter exits nonzero and retains its local stable tag. CI does not push; inspect local and remote refs before recovery.
-- Before local fallback, finish or stop any CI release run, inspect remote main/tags and resolve interrupted publication on the same tag. No local/CI race. A Codex lock change blocks CI planning; perform the adoption read and cut locally. On abandon the range starts at the highest stable, so an already adopted change can still require local fallback.
+- Before local fallback, finish or stop any CI release run, inspect remote main/tags and resolve interrupted publication on the same tag. No local/CI race. A Codex lock change without a valid committed adoption record blocks CI planning; perform the adoption read and commit the record, or cut locally. Abandon uses the highest stable boundary and checks the same HEAD record.
 - Nightly RC attempts are scheduled for 01:47 Europe/Bucharest only when repository variable `RELEASE_NIGHTLY_ENABLED` is exact `true` (default off). Observed scheduler delays can move cuts into daytime (ADR-3512). The shared plan may no-op; scheduled tip waiting is capped at three hours and the original run date's 13:00 pre-push cutoff. Neither applies to manual dispatch or recovery of a pushed tag. Only the user decides activation. Enablement is rechecked at job boundaries; pausing may stop a not-yet-pushed attempt there, possibly red with `nightly-disabled`. Cancel an in-flight run explicitly for an immediate stop; pushed-tag recovery is unaffected. The bounded attempt journal reports release-commit CI without success polling or reruns; tagged-smoke and targeted assertion recovery use the bounded exception above.
 - NEVER `docker compose -p uzi down -v` and never glob `uzi-` containers (see `CLAUDE.md` "Destructive operations"). This skill touches git, `gh`, and (if you have deploy access) `kubectl` only.
 - Work on `main` in the repo root worktree; `release-cut.sh` makes its own throwaway worktree for a promote. Never check the root worktree out onto another branch.
@@ -36,7 +36,25 @@ Do NOT bake step details that live in the repo into your head. Read the source o
 
 **Artifact membership.** Query the public OCI registry anonymously; no Packages PAT is needed. GitHub release and Actions evidence still uses `gh` read access. Pass `--ci` to the cutter in automation (also enabled by `CI=true`): an unknown worker-pin query or checkout identity refuses the cut. Local cuts retain a warning on query errors; a confirmed missing worker image always refuses.
 
-`release-cut.sh --plan [--version X.Y.Z] [--abandon-train]` reports the scheduled RC decision without fetching or changing Git state, CHANGELOG or fragments. Shared validators remove temporary snapshots but may leave an empty `.uzi/scratch` directory. Refresh refs first. Read `OP` (`nextrc`, `new-base`, `noop`, `blocked`), `BASE`, `TAG`, `REASON`, `SHIPPING_COUNT`, `PREVIOUS_TAG`, `PUBLICATION_STATE`, and `HEAD_SHA`; exit 0 includes no-op/blocked plans and some instrument failures (API or fragment reads); exit 2 is reserved for Git/history instruments, exit 3 for usage. An open train continues, otherwise 0.x defaults to the next minor; automatic 1.x needs a policy. A Codex runtime lock change in the plan range blocks with `codex-runtime-needs-local-cut`: perform the adoption read above and cut locally. Failed, pending, missing or unreadable previous publication blocks even a no-op. Only non-metadata shipping changes count, and notes or dependency citations must make them releasable. This recommendation does not remove manual empty-delta cuts or replace exact-tip CI checks.
+`release-cut.sh --plan [--version X.Y.Z] [--abandon-train]` reports the scheduled RC decision without fetching or changing Git state, CHANGELOG or fragments. Shared validators remove temporary snapshots but may leave an empty `.uzi/scratch` directory. Refresh refs first. Read `OP` (`nextrc`, `new-base`, `noop`, `blocked`), `BASE`, `TAG`, `REASON`, `SHIPPING_COUNT`, `PREVIOUS_TAG`, `PUBLICATION_STATE`, and `HEAD_SHA`; exit 0 includes no-op/blocked plans and some instrument failures (API or fragment reads); exit 2 is reserved for Git/history instruments, exit 3 for usage. An open train continues, otherwise 0.x defaults to the next minor; automatic 1.x needs a policy. A Codex runtime lock change in the plan range requires the committed adoption record below; a missing or invalid record blocks with `codex-runtime-needs-local-cut`. Perform the adoption read and commit the record, or cut locally. Failed, pending, missing or unreadable previous publication blocks even a no-op. Only non-metadata shipping changes count, and notes or dependency citations must make them releasable. This recommendation does not remove manual empty-delta cuts or replace exact-tip CI checks.
+
+### Committed Codex adoption (#4172)
+
+After reading the runtime release notes and reviewing its manifest, hand-update
+`agent/codex/codex-package.adopted`. Use exactly two LF-terminated lines, no extras:
+
+```text
+lock-sha256=SHA256_OF_RAW_LOCK_BYTES
+runtime-tag=CODEX_TAG_FROM_LOCK
+```
+
+Use `shasum -a 256 agent/codex/codex-package.lock` for the 64 lowercase hex digest;
+copy the lock's `CODEX_TAG` value for the second line. Commit both as mode 100644.
+Planning validates both blobs at its pinned HEAD, including the digest and tag;
+worktree-only files, symlinks and malformed or stale records do not authorize it.
+Pin sync and Renovate never write the record. A later lock edit needs a fresh
+adoption assertion. This records the maintainer's review, not a review by CI;
+publication, exact-tip coverage and release authorization remain separate gates.
 
 ## 2. Local fallback: cut inline with the deterministic scripts — do NOT dispatch a subagent
 Once step 1 holds (nothing wanted left unmerged, `main` green on the tip), cut the release **inline as the lead**, driving three bundled scripts. Do NOT dispatch the `release` subagent for this: a background subagent spawns a watch and then idles, so every wait becomes a manual re-ping (the "agent keeps dying" ping-pong), while the steps that actually need judgment — flake-vs-defect, whether to rerun, authoring the CHANGELOG — are the lead's regardless. `.claude/agents/release.md` stays the MECHANICS reference (what each step proves, the signing traps, deploy verify), but the driver is the lead + scripts, not that agent.

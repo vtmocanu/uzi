@@ -1207,6 +1207,7 @@ func (s *Service) selfImproveOpenMRs(ctx context.Context, run store.Run, rc stor
 		slog.Warn("self_improve claim: build forge for open-MR set", "run", run.ID.String(), "error", err)
 		return nil
 	}
+	var ch forge.CodeHost = f
 	rows, err := s.q.RecentSelfImproveMRRunsForRepo(ctx, store.RecentSelfImproveMRRunsForRepoParams{
 		RepoID: uuid.UUID(run.RepoID.Bytes),
 		Lim:    maxOpenSelfImproveMRCandidates,
@@ -1220,7 +1221,7 @@ func (s *Service) selfImproveOpenMRs(ctx context.Context, run store.Run, rc stor
 		if row.ID == run.ID || !row.MrIid.Valid {
 			continue // exclude self and any row without an MR iid
 		}
-		mr, err := f.GetMergeRequest(ctx, rc.ForgeProjectID, row.MrIid.Int64)
+		mr, err := ch.GetMergeRequest(ctx, rc.ForgeProjectID, row.MrIid.Int64)
 		if err != nil {
 			// Best-effort: this is advisory context, not the strict fire-time cap, so a
 			// per-candidate forge error skips only this candidate and the loop continues.

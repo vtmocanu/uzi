@@ -31,7 +31,7 @@ import (
 //
 // Like SyncMRStates it never returns a per-candidate error (log-and-skip); only a failure
 // to enumerate candidates surfaces to the poller.
-func (s *Service) SyncBoardFreeMRStates(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) error {
+func (s *Service) SyncBoardFreeMRStates(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.CodeHost) error {
 	candidates, err := s.q.ListBoardFreeMRStateWatchCandidates(ctx, repoID)
 	if err != nil {
 		return err
@@ -51,7 +51,7 @@ func (s *Service) SyncBoardFreeMRStates(ctx context.Context, repoID uuid.UUID, f
 // NULL bootstrap records without acting; opened->closed and ->merged cancel exactly once;
 // locked is transient (no cancel); a forge read failure or a cancel failure leaves mr_state
 // unadvanced so the next tick retries.
-func (s *Service) recordBoardFreeMRState(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, c store.ListBoardFreeMRStateWatchCandidatesRow) {
+func (s *Service) recordBoardFreeMRState(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.CodeHost, c store.ListBoardFreeMRStateWatchCandidatesRow) {
 	mr, err := f.GetMergeRequest(ctx, forgeProjectID, c.MrIid.Int64)
 	if err != nil {
 		slog.Warn("forgesvc: board-free MR-state read failed", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "error", err)

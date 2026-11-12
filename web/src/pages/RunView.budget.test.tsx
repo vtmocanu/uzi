@@ -272,6 +272,35 @@ describe("RunView — conditional Extend action (PRD #1189)", () => {
     });
     await waitFor(() => expect(submit).toHaveBeenCalledWith("extend", "7200"));
   });
+
+  // Issue #4179: an interactive task the worker parked at its per-follow-up time limit. The server
+  // projects no budget for an interactive run, so wall/total are null, yet its extend routes to
+  // ExtendAndResumeWallPark. The paused panel's Extend must offer a working chooser, not "turned off".
+  it("offers a working Extend on a wall-parked interactive task with no budget figures", async () => {
+    const { submit } = renderPage(
+      {
+        status: "paused",
+        kind: "task",
+        interactive: true,
+        hold_reason: "budget_exhausted",
+        started_at: new Date(Date.now() - 7 * 3600 * 1000).toISOString(),
+        budget_wall_seconds: null,
+        budget_total_seconds: null,
+        budget_used_seconds: 21766,
+        budget_extension_seconds: 7200,
+        budget_extension_cap_seconds: 57600,
+      },
+      true,
+    );
+    await screen.findByText("Add rate limiting");
+    fireEvent.click(screen.getAllByRole("button", { name: /extend time/i })[0]);
+    const dialog = screen.getAllByRole("dialog", { name: /extend this run/i })[0];
+    expect(within(dialog).queryByText(/extensions are turned off/i)).toBeNull();
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: /Extend by 2h/ }));
+    });
+    await waitFor(() => expect(submit).toHaveBeenCalledWith("extend", "7200"));
+  });
 });
 
 // The Extend header action AND the near-timeout panel are BOTH gated on

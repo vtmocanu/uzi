@@ -107,7 +107,7 @@ type responseLimitState struct {
 // (2 MiB success, at most 4 KiB error). Share the state with the issue driver so
 // SDK-discarded read errors retain their safe response provenance. Ordinary issue
 // reads keep each driver's existing policy.
-func GetIssueBounded(ctx context.Context, f Forge, projectID, iid int64) (Issue, error) {
+func GetIssueBounded(ctx context.Context, f IssueTracker, projectID, iid int64) (Issue, error) {
 	state := newResponseLimitState(issueResponseBytes)
 	state.continuationValidation = true
 	ctx = context.WithValue(ctx, ciRepairJSONKey{}, false)

@@ -146,16 +146,16 @@ func ProjectThread(a *Assessment, in []forge.IssueComment, botID int64) *Thread 
 // Fetch begins the deadline before the raw fetch and closes the assessment after
 // projecting comments. Valid raw capture survives child expiry, but parent
 // cancellation never becomes a successful capture.
-func Fetch(parent context.Context, f forge.Forge, project, iid, botID int64) (*Capture, error) {
-	return FetchWithTimeout(parent, f, project, iid, botID, AssessmentTimeout)
+func Fetch(parent context.Context, ch forge.CodeHost, tr forge.IssueTracker, project, iid, botID int64) (*Capture, error) {
+	return FetchWithTimeout(parent, ch, tr, project, iid, botID, AssessmentTimeout)
 }
 
 // FetchWithTimeout shares a bounded total deadline across raw capture and author
 // assessment. Successful raw capture survives child expiry, but not parent cancellation.
-func FetchWithTimeout(parent context.Context, f forge.Forge, project, iid, botID int64, timeout time.Duration) (*Capture, error) {
-	a := NewAssessmentWithTimeout(parent, f, project, timeout)
+func FetchWithTimeout(parent context.Context, ch forge.CodeHost, tr forge.IssueTracker, project, iid, botID int64, timeout time.Duration) (*Capture, error) {
+	a := NewAssessmentWithTimeout(parent, ch, project, timeout)
 	defer a.Close()
-	raw, err := f.GetIssue(a.Context(), project, iid)
+	raw, err := tr.GetIssue(a.Context(), project, iid)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +166,7 @@ func FetchWithTimeout(parent context.Context, f forge.Forge, project, iid, botID
 	d, _ := a.Author(raw)
 	c.Reason = Reason(d)
 	c.Issue.Author = AuthorName(raw.Author)
-	comments, err := f.ListIssueComments(a.Context(), project, iid)
+	comments, err := tr.ListIssueComments(a.Context(), project, iid)
 	if err != nil {
 		c.Thread = &Thread{Version: SnapshotVersion, Comments: []Comment{}, Unknown: true}
 	} else {
