@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { forgejoRepoParts, githubRepoParts, gitlabBaseUrl } from "../src/forge.js";
 
 // The API server derives a repo's authorized API origin in SQL (canonical_forge_api_origin, migration
-// 00392, redefined for GitHub Enterprise in 00428) and the worker derives its API base here. Both
+// 00392, redefined for GitHub Enterprise in 00432) and the worker derives its API base here. Both
 // read the same fixture so the two cannot drift: api/internal/store/forge_api_origin_livedb_test.go
 // runs the SQL half.
 
