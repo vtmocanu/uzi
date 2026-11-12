@@ -1,4 +1,5 @@
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
+import { RESUME_LINEAGE_BREAK_EVENT } from "./harness-messages.js";
 import { validatePolicyHoldRequest } from "./protocol.js";
 import { checkpointCoordinatesForClaim, type CheckpointCoordinates } from "./checkpoint-coordinates.js";
 import { prepareCIEvidence, validateCIRepairClaim, type PreparedCIEvidence } from "./ci-evidence.js";
@@ -30124,14 +30125,8 @@ export class RunRunner {
   }
 }
 
-/** PRD #332 / issue #334 — the `run_usage` lineage-break marker. Tagged onto the
- *  worker slog line AND the run-feed status payload emitted when a resume is DROPPED
- *  and the runner starts a FRESH SDK session (the ONLY path that breaks run_usage
- *  resume-lineage). Low-cardinality and stable so a maintainer can aggregate its
- *  frequency — e.g. `count(*) from run_messages where payload->>'event' =
- *  'resume_lineage_break'` — to decide whether #332's deferred Option B is worth a
- *  schema+protocol change. Renaming this literal silently breaks that aggregation. */
-export const RESUME_LINEAGE_BREAK_EVENT = "resume_lineage_break";
+// RESUME_LINEAGE_BREAK_EVENT lives in harness-messages.ts (re-exported here for existing importers).
+export { RESUME_LINEAGE_BREAK_EVENT };
 
 /** PRD #556 M2 (D5) — the positive counterpart to `resume_lineage_break`. Emitted
  *  when a re-claim RESOLVES its prior SDK session and CONTINUES it (M1 preserves the

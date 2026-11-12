@@ -2759,3 +2759,168 @@ describe("SteeringChannel — credential switch hold (#3953)", { timeout: 10_000
     await ready.stop();
   });
 });
+
+// Issue #4201 / #4095: the switch signal is de-duplicated by op id, and an applied in-place switch
+// re-arms the checkpoint authority only when the switch was its sole revoker.
+describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout: 10_000 }, () => {
+  const GEN = 7;
+  type Private = { endFencedFlight(reason: string): void };
+  function make(): { ch: SteeringChannel; cancel: AbortController; interrupts: () => number } {
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(fakeClient([]), "run-1", 1, nullLogger(), cancel, { claimGeneration: GEN });
+    let interrupts = 0;
+    ch.onCredentialSwitch(() => { interrupts++; });
+    return { ch, cancel, interrupts: () => interrupts };
+  }
+
+  it("a poll carrying op_id records the pair; a repeated poll for the same op trips once", async () => {
+    const cancel = new AbortController();
+    const client = withReceipts({
+      getInputs: async () => ({ inputs: [], credentialSwitch: { generation: GEN, op_id: "op-poll" } }),
+    } as unknown as WorkerClient);
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: GEN });
+    let interrupts = 0;
+    ch.onCredentialSwitch(() => { interrupts++; });
+    ch.start();
+    for (let n = 0; n < 300 && ch.pendingCredentialSwitchOp() === undefined; n++) await tick();
+    await tick(30);
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-poll" });
+    assert.equal(ch.pendingCredentialSwitch(), GEN);
+    assert.equal(interrupts, 1);
+    await ch.stop();
+  });
+
+  it("a signal without an op id keeps the generation-only behaviour", () => {
+    const { ch, interrupts } = make();
+    ch.tripCredentialSwitch(GEN);
+    ch.tripCredentialSwitch(GEN);
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN });
+    assert.equal(interrupts(), 1);
+  });
+
+  it("de-dupes by op id: the same op trips once", () => {
+    const { ch, interrupts } = make();
+    ch.tripCredentialSwitch(GEN, "op-1");
+    ch.tripCredentialSwitch(GEN, "op-1");
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-1" });
+    assert.equal(interrupts(), 1);
+  });
+
+  it("a newer op replaces a pending one without aborting again", () => {
+    const { ch, interrupts } = make();
+    ch.tripCredentialSwitch(GEN, "op-1");
+    const authority = ch.checkpointAuthoritySignal();
+    ch.tripCredentialSwitch(GEN, "op-2");
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-2" });
+    assert.equal(interrupts(), 1, "replacement does not re-abort");
+    assert.equal(ch.checkpointAuthoritySignal(), authority);
+  });
+
+  it("a settled op is ignored on a late poll, a new op after it trips normally", () => {
+    const { ch, interrupts } = make();
+    ch.tripCredentialSwitch(GEN, "op-1");
+    ch.settleCredentialSwitch("op-1", "applied");
+    assert.equal(ch.pendingCredentialSwitchOp(), undefined);
+    ch.tripCredentialSwitch(GEN, "op-1"); // the poll that raced the apply commit
+    assert.equal(ch.pendingCredentialSwitchOp(), undefined);
+    assert.equal(interrupts(), 1);
+    ch.tripCredentialSwitch(GEN, "op-2");
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-2" });
+    assert.equal(interrupts(), 2);
+  });
+
+  it("a signal latched by a hold keeps its op id through the service", () => {
+    const { ch } = make();
+    const hold = ch.holdCredentialSwitch();
+    ch.tripCredentialSwitch(GEN, "op-held");
+    hold.close({ service: true });
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-held" });
+  });
+
+  it("remembers only the last 16 settled ops", () => {
+    const { ch } = make();
+    for (let i = 0; i < 17; i++) ch.settleCredentialSwitch(`op-${i}`, "gave_up");
+    ch.tripCredentialSwitch(GEN, "op-0"); // evicted: trips again
+    assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-0" });
+    ch.settleCredentialSwitch("op-0", "gave_up");
+    ch.tripCredentialSwitch(GEN, "op-16"); // still remembered
+    assert.equal(ch.pendingCredentialSwitchOp(), undefined);
+  });
+
+  it("an applied switch that was the sole revoker re-arms the checkpoint authority", () => {
+    const { ch, cancel } = make();
+    ch.tripCredentialSwitch(GEN, "op-1");
+    const spent = ch.checkpointAuthoritySignal();
+    assert.equal(spent.aborted, true);
+    assert.ok(spent.reason instanceof CredentialSwitchSignal);
+    assert.ok(!ch.isSettledSwitchSignal(cancel.signal.reason), "not settled yet");
+    ch.settleCredentialSwitch("op-1", "applied");
+    assert.equal(spent.aborted, true, "the spent signal stays spent");
+    assert.notEqual(ch.checkpointAuthoritySignal(), spent);
+    assert.equal(ch.checkpointAuthoritySignal().aborted, false);
+    assert.ok(ch.isSettledSwitchSignal(cancel.signal.reason), "the spent cancel reason is recorded as settled");
+    assert.equal(ch.isSettledSwitchSignal(new CredentialSwitchSignal()), false);
+    // A later revoker still revokes the replacement.
+    ch.markCancelled();
+    assert.equal(ch.checkpointAuthoritySignal().aborted, true);
+  });
+
+  it("a gave-up or cleared switch does not re-arm", () => {
+    for (const outcome of ["gave_up", "cleared"] as const) {
+      const { ch } = make();
+      ch.tripCredentialSwitch(GEN, "op-1");
+      const spent = ch.checkpointAuthoritySignal();
+      ch.settleCredentialSwitch("op-1", outcome);
+      assert.equal(ch.checkpointAuthoritySignal(), spent);
+      assert.equal(ch.pendingCredentialSwitchOp(), undefined, "the pending switch is cleared either way");
+    }
+  });
+
+  const otherRevokers: Array<[string, (ch: SteeringChannel) => void]> = [
+    ["fence", (ch) => (ch as unknown as Private).endFencedFlight("stale")],
+    ["shutdown", (ch) => { ch.workerShutdown(Date.now() + 1000); }],
+    ["disk stop", (ch) => ch.requestDiskStop()],
+    ["cancel", (ch) => ch.markCancelled()],
+  ];
+  for (const [name, revoke] of otherRevokers) {
+    it(`an applied switch does not re-arm after a ${name} also revoked the authority`, () => {
+      const { ch } = make();
+      ch.tripCredentialSwitch(GEN, "op-1");
+      const spent = ch.checkpointAuthoritySignal();
+      revoke(ch);
+      ch.settleCredentialSwitch("op-1", "applied");
+      assert.equal(ch.checkpointAuthoritySignal(), spent);
+      assert.equal(ch.checkpointAuthoritySignal().aborted, true);
+    });
+
+    it(`an applied switch does not re-arm when a ${name} revoked the authority first`, () => {
+      const { ch } = make();
+      revoke(ch);
+      ch.tripCredentialSwitch(GEN, "op-1");
+      const spent = ch.checkpointAuthoritySignal();
+      ch.settleCredentialSwitch("op-1", "applied");
+      assert.equal(ch.checkpointAuthoritySignal(), spent);
+      assert.equal(ch.checkpointAuthoritySignal().aborted, true);
+    });
+  }
+
+  it("cancel-vs-apply race: a cancel landing before the apply settles keeps the authority revoked", () => {
+    const { ch } = make();
+    ch.tripCredentialSwitch(GEN, "op-1");
+    ch.markCancelled(); // the owner cancel committed while the apply was in flight
+    ch.settleCredentialSwitch("op-1", "applied");
+    assert.equal(ch.isCancelled(), true);
+    assert.equal(ch.checkpointAuthoritySignal().aborted, true);
+  });
+
+  it("cancel-vs-apply race: a cancel landing after the apply revokes the re-armed authority", () => {
+    const { ch } = make();
+    ch.tripCredentialSwitch(GEN, "op-1");
+    ch.settleCredentialSwitch("op-1", "applied");
+    const rearmed = ch.checkpointAuthoritySignal();
+    assert.equal(rearmed.aborted, false);
+    ch.markCancelled();
+    assert.equal(rearmed.aborted, true, "the cancel reaches the signal a reader fetched after the apply");
+    assert.equal(ch.checkpointAuthoritySignal(), rearmed);
+  });
+});

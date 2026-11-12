@@ -28,7 +28,7 @@ import { boundedCommandWait } from "../codex/memory-command.js";
 import { screenBashCommand } from "../guardrails.js";
 import type { Logger } from "../log.js";
 import type { WorkerMemoryPressureResult } from "../protocol.js";
-import { makeTextRedactor } from "../redact.js";
+import { SecretSet } from "../redact.js";
 import { sanitizeForLog } from "../run-quiescence.js";
 import { asText, type ToolTextResult } from "../tool-evidence.js";
 import type { RecordedRoot } from "../worker-spawn-mark.js";
@@ -104,8 +104,9 @@ export interface ClaudeCommandLaneOptions {
   readonly cliEnv: Readonly<Record<string, string | undefined>>;
   readonly secretPaths: readonly string[];
   readonly dockerWired: boolean;
-  /** Secrets redacted from the inline output. */
-  readonly secrets: readonly string[];
+  /** Secrets redacted from the inline output. A SecretSet is read live, so a secret added after
+   *  construction (an in-place credential switch) is scrubbed too. */
+  readonly secrets: readonly string[] | SecretSet;
   readonly log: Pick<Logger, "debug" | "info" | "warn">;
   /** Capture the worker-memory context for one turn (may throw the runner's retained stop). */
   readonly capturedMemory: () => CapturedMemoryContext;
@@ -192,6 +193,7 @@ export class ClaudeCommandLane {
   private readonly maxTimeoutMs: number;
   private readonly spillCapBytes: number;
   private readonly redact: (text: string) => string;
+  private readonly secretSet: SecretSet;
   /** The physical worktree the spill path is built from (see WRAPPER's parent check). */
   private readonly spillRoot: string;
   private readonly live = new Map<string, LiveCommand>();
@@ -216,7 +218,9 @@ export class ClaudeCommandLane {
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
     this.maxTimeoutMs = opts.maxTimeoutMs ?? MAX_COMMAND_TIMEOUT_MS;
     this.spillCapBytes = opts.spillCapBytes ?? SPILL_CAP_BYTES;
-    this.redact = makeTextRedactor([...opts.secrets]);
+    this.secretSet = opts.secrets instanceof SecretSet ? opts.secrets : new SecretSet([...opts.secrets]);
+    const set = this.secretSet;
+    this.redact = (s) => set.text(s);
     // The wrapper only spills when the spill parent is physically where it is named, so the path
     // must be built from the resolved worktree. When it cannot be resolved, hand the wrapper a
     // path it rejects (the command still runs, unspilled).
@@ -473,7 +477,7 @@ export class ClaudeCommandLane {
   ): Promise<ToolTextResult> {
     const { handle } = launched;
     // (9) Drain the transport from the moment it exists, so the command never blocks on it.
-    const output = new BoundedOutput(this.opts.secrets);
+    const output = new BoundedOutput(this.secretSet.values());
     const streams = [handle.transport.stdout, handle.transport.stderr] as const;
     streams.forEach((stream, source) => {
       stream?.on("data", (chunk: Buffer | string) => { output.write(source as 0 | 1, chunk); });

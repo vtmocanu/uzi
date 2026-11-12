@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import { watch } from "node:fs";
 import path from "node:path";
 import type { Logger } from "./log.js";
+import type { SecretSet } from "./redact.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { ExecutorSealResult, ExecutorTerminalSeal } from "./codex/executor-lifetime.js";
 import type { UsageSink } from "./usage-recorder.js";
@@ -134,7 +135,16 @@ export interface EmittedMessage {
   agentInstance?: string;
   agentLabel?: string;
   payload: Record<string, unknown>;
+  /** Issue #4201: the credential epoch this frame belongs to. Copied to the wire only when > 0
+   *  (the base epoch is the absent field), so an older api never receives it. */
+  credentialEpochOrdinal?: number;
 }
+
+/** Issue #4201: where an executor reached the in-place credential switch hook from. */
+export type InPlaceSwitchSite =
+  | "gate_resumed" | "plan_turn" | "plan_gate" | "plan_gate_exhausted" | "plan_source"
+  | "plan_gate_revision" | "implement_ready" | "question_reentry" | "ask_user"
+  | "follow_up" | "implement_turn" | "retained" | "escaped";
 
 /**
  * PRD #1497 M2: the outcome of a capture-first wall park ({@link RunContext.parkForWall}). See that
@@ -291,6 +301,9 @@ export interface RunContext {
   redactText?: (s: string) => string;
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
   oauthToken?: string;
+  /** Issue #4201: the run's current Anthropic credential, an immutable `{token, ordinal}` snapshot
+   *  that an in-place switch advances. Absent on stubs, which keep reading `oauthToken`. */
+  credential?: () => Readonly<{ token: string; ordinal: number }>;
   /** PRD #362 M3c: the model the inline run-summary generator runs on, resolved
    *  user-value-wins from users.summary_model over the instance summary_model at
    *  issue-run claim assembly. Absent ⇒ the generator uses the SDK/account default
@@ -333,7 +346,7 @@ export interface RunContext {
   capturedMemory?(): CapturedMemoryContext | undefined;
   /** Issue #2471: the run's redaction secrets, present with `capturedMemory`; the guarded Claude
    *  command lane redacts its inline output windows against them. Never sent to the model. */
-  guardedCommandSecrets?: readonly string[];
+  guardedCommandSecrets?: readonly string[] | SecretSet;
   /** Issue #2471: register a listener told, with the runner's own stop, when the worker memory
    *  runtime invalidates this flight's memory authority mid-run. Present with `capturedMemory`.
    *  Returns the unsubscribe. Not fired by epoch renewal, non-running reports or preservation. */
@@ -788,7 +801,7 @@ export interface RunContext {
    * Absent on the stub/test executors ⇒ the loop/waiters re-throw the CredentialSwitchSignal to the
    * runner's outer catch, byte-identical to the pre-fix behaviour.
    */
-  attemptCredentialSwitch?(): Promise<"released" | "gave_up">;
+  attemptCredentialSwitch?(opts?: { site: InPlaceSwitchSite; laneSettled: boolean }): Promise<"released" | "gave_up">;
   /**
    * PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED — a matching switch
    * signal is held (not tripped, the turn not aborted) for the duration, then honored at the next
