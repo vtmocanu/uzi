@@ -110,6 +110,11 @@ describe("scheduler capacity and provisioning", () => {
 
 function aWorker(over: Partial<Worker> = {}): Worker {
   return {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     id: "w1",
     name: "alpha",
     status: "online",

@@ -1,11 +1,15 @@
 import type { Worker } from "../lib/api";
 import { stripDisplayCell } from "../lib/safeText";
+import { isHibernating } from "../lib/workerHibernation";
 
 // Independent read-only pills: automatic wording/load semantics remain keyed on
 // draining_since and run/cross-check counts. Manual attribution is display-only.
 export function WorkerCordonBadge({ worker }: { worker: Worker }) {
   const manual = !!worker.manual_cordoned_at;
-  if (!worker.draining_since && !manual && !worker.effective_cordoned) return null;
+  // A hibernating worker reads effective_cordoned only because it takes no intake; its own
+  // chip (WorkerStatusBadge) says why, so it must not also read as "intake fenced".
+  const fenced = !!worker.effective_cordoned && !isHibernating(worker);
+  if (!worker.draining_since && !manual && !fenced) return null;
   const draining = worker.active_runs > 0 || worker.active_cross_checks > 0;
   const label = draining ? "draining" : "cordoned";
   const title = draining

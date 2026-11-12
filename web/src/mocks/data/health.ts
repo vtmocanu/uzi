@@ -331,6 +331,11 @@ export function noHostedWorkersDoc(): HealthDoc {
 // (the ones the admin list lacked before this PRD) are populated across users.
 function stuckHosted(over: Partial<AdminWorker>): AdminWorker {
   return {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     id: "w-stuck",
     name: "base.l-7c2e",
     status: "offline",
@@ -395,6 +400,11 @@ export function incidentFleetWorkers(): AdminWorker[] {
 // always agree; this only keeps the DEMO scenarios coherent. No upgrade_failed row here.
 function healthyHosted(over: Partial<AdminWorker>): AdminWorker {
   return {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     id: "w-ok",
     name: "base.l-7c2e",
     status: "online",

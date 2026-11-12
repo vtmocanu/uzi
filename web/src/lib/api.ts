@@ -163,6 +163,7 @@ import type {
   UserSettingsPatch,
   Worker,
   CodexAccountMode,
+  HibernationResult,
 } from "./apiTypes";
 export type * from "./apiTypes";
 export { DEFAULT_AUTOPILOT_LABEL, RATE_LIMIT_SOURCES } from "./apiTypes";
@@ -1976,6 +1977,13 @@ const realApi = {
 
   adminListWorkers: () =>
     request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
+  // Worker hibernation (PRD #4205): cookie admin writes. 200 {worker_id, state, op_id}. A
+  // refused request is a 409 {error, reason_code}; hibernationRefusalMessage maps the code to
+  // human text. The reason is optional and server-sanitized.
+  adminHibernateWorker: (id: string, reason?: string) =>
+    request<HibernationResult>("POST", `/admin/workers/${encodeURIComponent(id)}/hibernate`, reason ? { reason } : {}),
+  adminWakeWorker: (id: string, reason?: string) =>
+    request<HibernationResult>("POST", `/admin/workers/${encodeURIComponent(id)}/wake`, reason ? { reason } : {}),
   adminListRuns,
   // Admin cross-user blocked-repos list (PRD #66 M9, D8). Returns the envelope with
   // checks_unknown so the page can say "unknown" rather than "none blocked" (R1).

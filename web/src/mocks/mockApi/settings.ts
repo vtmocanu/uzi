@@ -166,6 +166,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   now_summary_enabled: "true",
   // PRD #529 / #649 M1: ephemeral worker auto-provisioning instance kill-switch, default OFF.
   ephemeral_workers_enabled: "false",
+  // PRD #4205: worker hibernation instance switch, default OFF.
+  worker_hibernation_enabled: "false",
   hosted_worker_quota: "2",
   custody_hold_limit: "8",
   // PRD #836: upstream release-check toggles, both default ON (the master air-gap
@@ -1013,6 +1015,7 @@ export const settingsApi = {
         key === "judge_enabled" ||
         key === "judge_enforce_all" ||
         key === "ephemeral_workers_enabled" ||
+        key === "worker_hibernation_enabled" ||
         key === "now_summary_enabled" ||
         key === "release_check_enabled" ||
         key === "release_check_banner_enabled" ||
