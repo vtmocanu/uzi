@@ -1799,6 +1799,7 @@ custody_model_phase() {
   sleep() { SECONDS=$((SECONDS + 1)); } # virtual clock for the negative window
   inventory_diagnostic_snapshot() { :; }
   wait_custody_headroom() { :; }
+  log_custody_entry_census() { :; }
   assert_earlier_held_custody_receipt() { :; }
   db_psql() {
     case "$1" in
@@ -1832,7 +1833,9 @@ custody_model_phase() {
       /api/recovery/holds)
         counted="$(model_counted)"; open="$counted"
         # A claimed run's fresh hold is open but excluded from admission counting.
-        if [ "$claim" != always ] && model_claimed; then open=$((counted + 1)); fi
+        # The wedge run does not exist before seeding, so the baseline read (before any seed)
+        # must not evaluate (and thereby latch) its claim.
+        if [ "$claim" != always ] && [ "$(cat "$M/seeds")" != 0 ] && model_claimed; then open=$((counted + 1)); fi
         # Aggregate-serving faults: seed-short serves counted=LIMIT-1 on the first read after
         # seeding; post-nodiff serves open == counted after the claim; post-high serves
         # counted >= LIMIT after the claim.

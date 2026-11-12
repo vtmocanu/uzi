@@ -1931,7 +1931,7 @@ the admission rules of the [ADR-1197 #3644 amendment](1197-transient-recovery-pa
   no `adoption_failed` blocker is persisted and no quiescence is proven.
 - **No effect on P.** The park changes none of P's bytes (journal, slot, clone, HOME,
   provision) and reaps nothing. Resume claims again, holds again unchanged on this
-  release, and adds a claim and an open custody hold. The parked run holds P's hold
+  release, and adds a claim and an open custody hold, except that a run already at its own `custody_hold_limit` bound is requeued with no claim and no hold (#4162). The parked run holds P's hold
   and the current generation's.
 - **Hosted.** An owner-held hosted run blocks its worker's ordinary image roll (the run is
   non-terminal) until the owner cancels or discards it.

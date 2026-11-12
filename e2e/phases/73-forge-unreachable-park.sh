@@ -248,6 +248,11 @@ pass "Case B: same claim held, count=2 retry=NULL, no terminal failure or judge"
 # Resume queues an ordinary attempt, not a cooldown/custody bypass. The API
 # rereads after the write: if cooldown expired, that response may already show
 # the ordinary claim. No fresh park allowance is granted.
+# Read RUN_B's own open holds BEFORE Resume (#4162): once Resume returns, a claim may already
+# have happened and added a hold, which would push the guard below into the "rehold not
+# exercised" branch even though Resume was admitted at a count below the bound.
+OWN_B="$(db_psql "SELECT count(*) FROM recovery_custody_holds WHERE run_id='$RUN_B' AND state='open'")"
+[[ "$OWN_B" =~ ^[0-9]+$ ]] || fail "invalid own open hold count for $RUN_B: $OWN_B"
 RESUMED_B="$(apipost "/api/runs/$RUN_B/resume-now" '')"
 printf '%s' "$RESUMED_B" | jq -e '(.run.status=="queued" or .run.status=="claimed" or .run.status=="running")
   and .run.forge_park_count==2
@@ -263,9 +268,7 @@ printf '%s' "$ADMISSION_B" | jq -e '.aggregate | [.admission_counted_holds,.cust
   || fail "invalid custody admission aggregate: $ADMISSION_B"
 # Issue #4162: admission is counted in units (a run's same-worker holds count once), and a
 # run whose own open holds reach the limit is refused by the hard per-run bound, so the
-# execution branch also needs RUN_B's own open holds below the limit.
-OWN_B="$(db_psql "SELECT count(*) FROM recovery_custody_holds WHERE run_id='$RUN_B' AND state='open'")"
-[[ "$OWN_B" =~ ^[0-9]+$ ]] || fail "invalid own open hold count for $RUN_B: $OWN_B"
+# execution branch also needs RUN_B's own open holds (read before Resume) below the limit.
 if printf '%s' "$ADMISSION_B" | jq -e --argjson own "$OWN_B" '.aggregate | .custody_hold_limit==0
     or (.custody_hold_limit>1 and .admission_counted_holds+1<=.custody_hold_limit
         and $own<.custody_hold_limit)' >/dev/null; then

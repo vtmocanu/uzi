@@ -845,7 +845,7 @@ uzi version
   `awaiting_input` or `awaiting_followup`, without a `needs_action`/`source_only` decision.
   Unknown/mismatched, old/future-generation, stale, released, terminal and other statuses
   remain counted; `active` attention alone is not eligibility. Of the remaining open holds, a run's
-  earlier generations on the same original worker count as one unit (heartbeat plays no part); others count singly.
+  open holds on the same original worker, from any of its generations, count as one unit (heartbeat plays no part); others count singly.
   Accounting releases nothing
   and leaves open-hold cleanup safeguards intact. Previously claimed queued continuations
   bypass owner admission with 1 to limit-1 own total open holds. A queued run whose own open holds

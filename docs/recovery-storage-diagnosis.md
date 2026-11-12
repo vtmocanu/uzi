@@ -361,12 +361,17 @@ ORDER BY h.run_id, h.generation, h.id;
 ROLLBACK;
 ```
 
-`total_open` is custody, not the admission count; `admission_counted` is admission units (a run's earlier generations on one original worker count once).
+`total_open` is custody, not the admission count; `admission_counted` is admission units (a run's open holds on one original worker count once, whatever their generation).
 [GetCustodyAggregateForOwner](../api/internal/store/queries/recovery.sql)
 uses `fn_custody_admission_count(owner, heartbeat_cutoff)`; the
 [function](../api/internal/store/migrations/00310_custody_admission_count.sql)
 discounts at most one qualifying healthy current-claim hold per run,
-with no owner-decision attention. Since #4162 (migration 00424, which replaces the function body) the remaining holds that are group-eligible count once per run and original worker, and the rest count singly. Unknown evidence remains counted.
+with no owner-decision attention. Since #4162 (the custody admission units migration, which replaces the function body) the remaining holds that are group-eligible count once per run and original worker, and the rest count singly. Unknown evidence remains counted.
+To run the previous api image against a database already upgraded to that migration, stop the
+upgraded api first, apply [`scripts/custody-admission-units-rollback.sql`](../scripts/custody-admission-units-rollback.sql)
+(it restores the earlier function bodies and removes the migration's goose row, and is valid
+only while that migration is the head), then roll the image back; it changes no hold, run,
+worker or capture state.
 Quota-linked rows do not establish which individual holds are discounted or
 the exact proportion of admission pressure caused by quota.
 

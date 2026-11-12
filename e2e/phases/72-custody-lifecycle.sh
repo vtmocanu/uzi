@@ -170,6 +170,15 @@ pass "preconditions: worker sampled online + idle at entry, owner has $C0 baseli
 # no seed proves an exact healthy live current-generation claim.
 # Each row gets a distinct generation. run_id is a plain column here: real owned run ids
 # are attached to the holds that get discarded, below.
+# Baseline grouped surplus (open - counted): since #4162 a baseline run's same-worker holds count
+# as one unit, so open_holds can exceed admission_counted_holds before anything is seeded. The
+# seeded holds are singletons (fresh gen_random_uuid ids), so they add equally to both; the
+# assertions below are relative to this surplus. The idle worker opens no new holds, so the
+# surplus can only shrink as baseline holds settle, never grow.
+BASE_LINE="$(custody_aggregate)" || fail "baseline custody aggregate unreadable"
+read -r BASE_COUNTED BASE_OPEN _ <<< "$BASE_LINE"
+BASE_SURPLUS=$((BASE_OPEN - BASE_COUNTED))
+[ "$BASE_SURPLUS" -ge 0 ] || fail "baseline open_holds=$BASE_OPEN < admission_counted_holds=$BASE_COUNTED"
 NEED=$LIMIT
 db_psql "INSERT INTO recovery_custody_holds
            (user_id, run_id, generation, state, original_worker_id, original_worker_identity)
@@ -185,7 +194,10 @@ SEEDED="$(db_psql "SELECT count(*) FROM recovery_custody_holds
 AGG_LINE="$(custody_aggregate)" || fail "custody aggregate unreadable"
 read -r AGG_COUNTED AGG_OPEN AGG_LIMIT <<< "$AGG_LINE"
 [ "$AGG_COUNTED" -ge "$LIMIT" ] || fail "aggregate.admission_counted_holds=$AGG_COUNTED < $LIMIT after seeding $LIMIT holds"
-[ "$AGG_OPEN" = "$AGG_COUNTED" ] || fail "aggregate.open_holds=$AGG_OPEN != admission_counted_holds=$AGG_COUNTED (every open hold should be admission-counted here)"
+# Every seeded hold is its own counted unit: open - counted may not exceed the baseline grouped surplus.
+AGG_SURPLUS=$((AGG_OPEN - AGG_COUNTED))
+{ [ "$AGG_SURPLUS" -ge 0 ] && [ "$AGG_SURPLUS" -le "$BASE_SURPLUS" ]; } \
+  || fail "aggregate.open_holds - admission_counted_holds=$AGG_SURPLUS outside 0..$BASE_SURPLUS (baseline grouped surplus; every seeded hold should be admission-counted; open=$AGG_OPEN counted=$AGG_COUNTED)"
 [ "$AGG_LIMIT" = "$LIMIT" ] || fail "aggregate.custody_hold_limit=$AGG_LIMIT != $LIMIT"
 pass "seeded $NEED open custody hold(s) over $C0 baseline hold(s); aggregate: admission_counted_holds=$AGG_COUNTED open_holds=$AGG_OPEN custody_hold_limit=$AGG_LIMIT"
 
@@ -319,8 +331,11 @@ uzi_cli run recovery "$WEDGE_RUN" --json \
   || fail "uzi run recovery did not list the fresh open hold $FRESH_ID on run $WEDGE_RUN"
 AGG_LINE="$(custody_aggregate)" || fail "custody aggregate unreadable"
 read -r AFTER_COUNTED AFTER_OPEN _ <<< "$AGG_LINE"
-[ $((AFTER_OPEN - AFTER_COUNTED)) -eq 1 ] \
-  || fail "open_holds - admission_counted_holds = $((AFTER_OPEN - AFTER_COUNTED)) after the healthy claim, want 1 (open=$AFTER_OPEN counted=$AFTER_COUNTED)"
+# Exactly one hold (the healthy live claim hold) is discounted on top of the baseline grouped
+# surplus, which may only have shrunk since it was sampled.
+AFTER_SURPLUS=$((AFTER_OPEN - AFTER_COUNTED))
+{ [ "$AFTER_SURPLUS" -ge 1 ] && [ "$AFTER_SURPLUS" -le $((BASE_SURPLUS + 1)) ]; } \
+  || fail "open_holds - admission_counted_holds = $AFTER_SURPLUS after the healthy claim, want 1 beyond the baseline grouped surplus $BASE_SURPLUS (open=$AFTER_OPEN counted=$AFTER_COUNTED)"
 [ "$AFTER_COUNTED" -lt "$LIMIT" ] || fail "admission_counted_holds=$AFTER_COUNTED still >= $LIMIT after the unblock"
 pass "episode cleared: blocked_runs=0, open_holds=$AFTER_OPEN, admission_counted_holds=$AFTER_COUNTED (< $LIMIT); fresh hold $FRESH_ID remains open"
 

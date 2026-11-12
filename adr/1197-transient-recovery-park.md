@@ -2018,8 +2018,8 @@ instead detached and the successor proceeded.
 - Run-lifetime bound: this run's own open holds stay at or below L, on the premise that none is
   released. This does not claim that owner aggregate custody is a transactional ceiling, or that the
   owner's other runs are always blocked.
-- Disclosed: while held or queued, the run's open holds can reduce the owner's admission capacity (earlier
-  generations on one original worker count as one admission unit, ADR-2445's #4162 amendment). While held it blocks the worker's upgrade or drain, like any owner-held cause. Owner Cancel
+- Disclosed: while held or queued, the run's open holds can reduce the owner's admission capacity (a run's open
+  holds on one original worker, from any of its generations, count as one admission unit, ADR-2445's #4162 amendment). While held it blocks the worker's upgrade or drain, like any owner-held cause. Owner Cancel
   of a held successor is terminal and leaves its open hold or holds open (measured 1 to 1) for owner
   discard; cleanup uses the existing owner discard after normal inspection.
 

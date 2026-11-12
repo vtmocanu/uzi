@@ -523,7 +523,7 @@ bound: it blocks only that run, whatever the owner's admission units. If
 `custody_hold_limit` is below the requeue budget the run stays `queued` with the
 per-run reason ("this run has reached its own custody hold limit; retained holds
 still protect its work; resolve or discard this run's own retained holds to let it
-start", not the owner `custody_limit` reason) instead of parking. Resume does not
+start", not the owner custody-limit wait) instead of parking. Resume does not
 bypass it and creates no further claim or hold; discard or settle that run's own
 holds to free it. Migration 00404's Down
 refuses while any run is parked at this cause (Resume or Cancel it first) and

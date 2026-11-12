@@ -1477,7 +1477,7 @@ from the configured `WorkerHeartbeatStale`), and status `claimed`, `running`,
 released, terminal and old/future-generation claims remain counted, as do decision holds;
 `active` attention alone does not establish eligibility. The discount releases nothing
 and does not permit pruning or teardown of held source. Of the remaining open holds, a run's
-earlier generations on the same original worker count as one unit together (whatever the
+open holds on the same original worker, from any of its generations, count as one unit together (whatever the
 worker's heartbeat); every other hold counts as one unit alone.
 
 New code runs wait at the admission limit. A previously claimed queued run with 1 to limit-1
@@ -1496,7 +1496,7 @@ uzi run recovery [--json]
   Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ADMISSION`, `ARCHIVE` (whether an
   available capture exists), `WORKER`, and `AGE`. `ADMISSION` is the server's per-hold
   custody admission membership: `counted (<reason>)`, `not counted (<reason>)` (for example
-  `not counted (same_run_group)`: one of a run's earlier generations on the same original worker,
+  `not counted (same_run_group)`: one of a run's open holds on the same original worker (any generation),
   covered by that group's counted representative), or `-` when the
   server did not report it (a non-open hold or an older server), which is unknown, never
   `not counted`. Run and hold ids are shown in full.

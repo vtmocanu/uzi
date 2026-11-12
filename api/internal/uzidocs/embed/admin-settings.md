@@ -327,7 +327,7 @@ the web. Admins: see [Instance maintenance mode](./instance-maintenance.md).
 The recovery custody admission limit, how many [admission
 units](./run-recovery.md#reviewing-and-resolving-held-work) one owner may have
 before uzi stops admitting their **new** runs, is one setting. A unit is one hold,
-except that a run's earlier generations on the same original worker count as one
+except that a run's open holds on the same original worker, from any of its generations, count as one
 unit together:
 
 | Setting | Default | Controls |

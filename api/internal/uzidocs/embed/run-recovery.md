@@ -1146,7 +1146,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Captures on file that are neither discarded nor expired (preparing, uploading, available, needs action; any other state also counts). Expired tombstones stay for audit but free their slot. |
-| Admission units per owner | 8 by default; the admin setting `custody_hold_limit` (1 to 1000) | After excluding at most one hold per run backing a healthy current claim without an owner decision, the remaining open holds that belong to one run's earlier generations on the same original worker count as **one unit** together (heartbeat freshness plays no part, so a dead worker's group is still one unit); every other open hold counts as one unit by itself. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs subject to custody admission until the counted pressure falls. Hold-free Plan and Code checker children (`kind = 'cross_check'`, both harness families) are exempt; judges and jobs gain no exemption. A requeued run with 1 to limit-1 of its own owner-scoped open holds remains exempt. A queued run whose own open holds (counted or not) reach the limit is not claimable at all, even when its owner is below the limit; only that run waits, Resume does not bypass it, and discarding or settling that run's own holds frees it. This admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past the limit. Admins change the limit in [Admin settings](./admin-settings.md#custody-hold-limit); it is not an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
+| Admission units per owner | 8 by default; the admin setting `custody_hold_limit` (1 to 1000) | After excluding at most one hold per run backing a healthy current claim without an owner decision, the remaining open holds of one run, from any of its generations, that share the same original worker count as **one unit** together (heartbeat freshness plays no part, so a dead worker's group is still one unit); every other open hold counts as one unit by itself. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs subject to custody admission until the counted pressure falls. Hold-free Plan and Code checker children (`kind = 'cross_check'`, both harness families) are exempt; judges and jobs gain no exemption. A requeued run with 1 to limit-1 of its own owner-scoped open holds remains exempt. A queued run whose own open holds (counted or not) reach the limit is not claimable at all, even when its owner is below the limit; only that run waits, Resume does not bypass it, and discarding or settling that run's own holds frees it. This admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past the limit. Admins change the limit in [Admin settings](./admin-settings.md#custody-hold-limit); it is not an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
 
 A byte refusal keeps the source retained. The archive's **Needs action**
 reason can read `storage quota exceeded`; current workers preserve a typed
@@ -2028,12 +2028,16 @@ A run that was interrupted and requeued while it has 1 to limit-1 of its own ope
 holds keeps resuming; once that one run alone holds the limit, it is not started at all
 (a per-run bound that applies even when you are below the owner limit; discard or settle
 that run's own holds to free it).
-When the owner limit is reached, the dashboard shows a full-width alert beneath the page
+When the owner limit is reached, or when any of your queued runs has reached its own
+hold limit while you are still below the owner limit, the dashboard shows a full-width alert beneath the page
 heading with your custody admission unit use, how many held sources need a decision, how
 many runs are blocked, and a **Review held work** button; if you connected
 Slack, you also get one coalesced direct message per blocked episode (not one
 per run) carrying your open-hold and blocked-run counts, a link to the surface,
-and the exact discard command. The per-worker **retaining work** pills stay as
+and the exact discard command. In the per-run case the alert says a queued run has reached
+its own custody hold limit and points to `uzi run recovery <run>` and
+`uzi run discard <run> --hold <id>`; it does not mean the owner is at capacity, and only the
+affected runs wait. The per-worker **retaining work** pills stay as
 row context.
 
 The **Workers** settings page is where you resolve them: the holds that need a
@@ -2065,8 +2069,8 @@ At or over the limit, the surface also shows an **Admission information**
 section so you can see what is consuming capacity without needing a decision.
 **Counting toward the limit** lists the non-decision holds the server confirms
 it counts, each with its run link, claim generation, worker, and the reason it
-counts (for example, no live claim backs it). A run's earlier generations on the same
-original worker count as one unit: one row is the counted representative and the others
+counts (for example, no live claim backs it). A run's generations on the same
+original worker (the current one included) count as one unit: one row is the counted representative and the others
 are listed under "Counted with another hold" with the label "Counted once with this run's
 other holds on the same worker" (`uzi run recovery` prints `not counted (same_run_group)`). These rows are read-only: this is
 visibility only, and adds no new way to release or discard custody and changes
@@ -2353,7 +2357,7 @@ without cancel and stops nonterminally.
   live worker can stay queued even at the cap: there is no universal hold at the cap.
   Each accepted generation opens a custody hold that counts toward `custody_hold_limit`.
   A parked unsupported run holds the predecessor's hold and the current generation's,
-  and an owner Resume adds a claim and a hold.
+  and an owner Resume adds a claim and a hold (except at the run's own custody bound, where Resume requeues the run but creates no claim and no hold).
 - The restore uses the single ordinary pin record of the dead generation. Several
   records refuse with `pin_ambiguous` and none with `no_eligible_pin`. Choosing among
   several records, and preferring a finalization pin, are not implemented.

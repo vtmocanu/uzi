@@ -291,8 +291,8 @@ changing the run.
   documented wall-release race before delivery, can leave another claim
   unconstrained.
 - Retained custody still counts toward the per-owner custody admission limit
-  (`custody_hold_limit`, default 8) as admission units: a run's earlier
-  generations on one original worker count as one unit. A queued run whose own
+  (`custody_hold_limit`, default 8) as admission units: a run's open
+  holds on one original worker, from any of its generations, count as one unit. A queued run whose own
   open holds reach the limit is not started even when its owner is below it. There
   is no force-clear or capacity exception.
 - A held, assigned worker can defer idle-only image rolls indefinitely (#3103).
