@@ -397,6 +397,30 @@ true
 {{- end }}
 
 {{- /*
+  uzi.issueTrackerAllowedBaseURLs: issueTracker.allowedBaseURLs (PRD #4173 S3) as a JSON
+  list, validated fail-CLOSED like uzi.forgeEgressHosts: an entry must be an absolute https
+  URL with a host, mirroring what the api refuses at boot. Unlike the forge list there is
+  no IP-literal check, because nothing here derives an FQDN egress rule from it (a worker
+  never calls an issue tracker).
+  Consumers: `fromJsonArray (include "uzi.issueTrackerAllowedBaseURLs" .)`.
+*/}}
+{{- define "uzi.issueTrackerAllowedBaseURLs" -}}
+{{- $out := list }}
+{{- range (.Values.issueTracker).allowedBaseURLs }}
+{{- /* Checked before urlParse: the list is joined with "," and the api splits on ",", so an entry holding one would smuggle in a second URL past the https check. */}}
+{{- if regexMatch "[,\\s]" (toString .) }}
+{{- fail (printf "issueTracker.allowedBaseURLs entry %q must not contain a comma or whitespace (the entries are joined with \",\" into ISSUE_TRACKER_ALLOWED_BASE_URLS; list each URL as its own entry)." .) }}
+{{- end }}
+{{- $u := urlParse . }}
+{{- if or (not $u.hostname) (ne $u.scheme "https") }}
+{{- fail (printf "issueTracker.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://tracker.example.com (it feeds ISSUE_TRACKER_ALLOWED_BASE_URLS; the api rejects the same input at boot)." .) }}
+{{- end }}
+{{- $out = append $out . }}
+{{- end }}
+{{- toJson $out }}
+{{- end }}
+
+{{- /*
   uzi.validateFQDNEgress: the shared preconditions for every FQDN-egress provider.
   An empty forge list would leave the api on its built-in default forge while the egress
   policy allows none, silently blocking clone/fetch on the kube-native tier.
@@ -847,7 +871,7 @@ true
   = true.
 */ -}}
 {{- define "uzi.apiConfigMapEnabled" -}}
-{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs .Values.releaseCheck (include "uzi.apiHostingEnabled" .) (include "uzi.dbStorageCapacityBytes" .)) -}}
+{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs (.Values.issueTracker).allowedBaseURLs .Values.releaseCheck (include "uzi.apiHostingEnabled" .) (include "uzi.dbStorageCapacityBytes" .)) -}}
 true
 {{- end -}}
 {{- end -}}
