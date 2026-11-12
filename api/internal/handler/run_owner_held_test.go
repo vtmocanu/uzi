@@ -1,9 +1,9 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -27,14 +27,14 @@ func TestSetRunCredentialOwnerHeldIs409(t *testing.T) {
 			if rec.Code != http.StatusConflict {
 				t.Fatalf("code = %d, want 409; body=%s", rec.Code, rec.Body.String())
 			}
-			if !strings.Contains(rec.Body.String(), tc.want) {
-				t.Fatalf("body %q does not carry %q", rec.Body.String(), tc.want)
+			var msg struct {
+				Error string `json:"error"`
 			}
-			if tc.name != "labelled" && strings.Contains(rec.Body.String(), "(hold:") {
-				t.Fatalf("unexpected label in %q", rec.Body.String())
+			if err := json.Unmarshal(rec.Body.Bytes(), &msg); err != nil {
+				t.Fatalf("decode body %q: %v", rec.Body.String(), err)
 			}
-			if strings.Contains(rec.Body.String(), "changed state") {
-				t.Fatalf("mapped as race: %q", rec.Body.String())
+			if msg.Error != tc.want {
+				t.Fatalf("error = %q, want exactly %q", msg.Error, tc.want)
 			}
 		})
 	}
