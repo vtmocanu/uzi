@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
@@ -166,6 +167,19 @@ func TestConnectForgeStoresSealedToken(t *testing.T) {
 	}
 	if st.conn == nil || string(st.conn.TokenCiphertext) != "sealed:tok" || st.conn.BotUsername != "bot" {
 		t.Fatalf("stored connection = %+v", st.conn)
+	}
+	// Issue #412: the stored base_url is the NORMALIZED value, not the caller's
+	// spelling. The handler's duplicate-create guard looks a target up by that same
+	// normalized form, so the two must agree — if this write path ever stored the raw
+	// request value, the guard would miss an existing row on every spelling that
+	// normalizes onto it (a trailing slash, a capital, a path) and silently fall
+	// through to the upsert it exists to prevent.
+	want, err := config.NormalizeForgeBaseURL("https://forge.example/")
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if st.conn.BaseUrl != want {
+		t.Fatalf("stored base_url = %q, want the normalized %q (the form the #412 guard looks up)", st.conn.BaseUrl, want)
 	}
 }
 
