@@ -86,11 +86,15 @@ func (g *github) githubAppBranchProtection(ctx context.Context, projectID int64,
 		// An absent bypass list is NOT an unreadable ruleset. GitHub returns
 		// bypass_actors only to a caller with write access to the ruleset, and an
 		// installation token holds none, so every App credential sees the field
-		// omitted. The binding evidence is the effective-rules response fetched
-		// above: it lists the rules that apply to THIS credential, and an "update"
-		// entry there means the credential is subject to the restriction. That is
-		// the same surface the PAT path has always trusted. A bypass list that IS
-		// returned is honoured below, so an App granted bypass is still reported.
+		// omitted. Treating absence as evidence of a bypass would block every App
+		// run on every protected branch.
+		// The safety argument is the direction of the error, not the effective-rules
+		// call: falling through reports the App as unable to push or merge, so an
+		// App that really is a bypass actor is UNDER-reported and uzi takes the PR
+		// route it does not strictly need. Being wrong here costs extra work, never
+		// a bypassed restriction. Do not "fix" this into an optimistic default.
+		// A bypass list that IS returned is honoured below, so an App granted
+		// bypass is still reported accurately.
 		if trimmed := bytes.TrimSpace(ruleset.BypassActors); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 			return BranchProtection{Protected: true}, nil
 		}
