@@ -231,6 +231,20 @@ const credentialSwitched = new Set<string>();
 const CREDENTIAL_SWITCH_SETTLING_REFUSAL =
   "the worker is still finishing its own operations for this run; try Resume again shortly, or Cancel the run";
 
+// Issue #4231: the server's ErrRunOwnerHeld text and runOwnerHeldLabels, verbatim
+// (api/internal/workersvc/run_credential.go). The mock seeds no policy-held recovery_wait run,
+// so only the recovery causes are mirrored.
+const OWNER_HELD_REFUSAL =
+  "this owner hold prevents switching the token; inspect the run's recovery options: Resume may re-hold it, Cancel ends the run";
+const OWNER_HOLD_LABELS: Record<string, string> = {
+  codex_account_unavailable: "codex account unavailable",
+  worker_requeue_exhausted: "worker requeue exhausted",
+  worker_memory_pressure: "worker memory pressure",
+  retained_recovery_adoption_failed: "retained recovery adoption failed",
+  retained_continuation_unwitnessed: "retained continuation unwitnessed",
+  retained_recovery_exhausted: "retained recovery exhausted",
+};
+
 // One applied epoch, so the history list renders with a token label + reason + time.
 const appliedEpochs = (): CredentialEpoch[] => [
   {
@@ -894,6 +908,11 @@ export const runsApi = {
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
     if (diskWaitMode(run) === "held")
       throw new ApiError(409, "data_volume_full held: use Resume before switching its token");
+    // Issue #4231: mirrors the server's ErrRunOwnerHeld / RunOwnerHeldError for the
+    // recovery_wait causes PromoteRecoveryWaitRunNow never promotes. Refuse, write nothing.
+    const ownerHoldLabel = run.status === "recovery_wait" && run.recovery_wait_cause
+      ? OWNER_HOLD_LABELS[run.recovery_wait_cause] : undefined;
+    if (ownerHoldLabel) throw new ApiError(409, `${OWNER_HELD_REFUSAL} (hold: ${ownerHoldLabel})`);
     credentialSwitched.add(id);
     patchRun(id, {
       credential_override: overrideToRead(body),
