@@ -229,7 +229,15 @@ func TestIssue4044HeldProjectionBoundaryLiveDB(t *testing.T) {
 	peer := f.e.seedSpreadWorker(t, issue4044Caps(true), 1)
 	hold := mhOpenHold(t, f.e, f.run, 9, f.owner)
 	f.refuse(t, f.params(peer, issue4044Caps(true)), hold)
-	f.health(t, deadline.Add(time.Microsecond), reasonAssignedRepoAgentSourceGap+sourcePeerUnavailableSuffix)
+	// After the ceiling the free capable peer, with a fresh heartbeat, can claim: the reason is the plain
+	// post-hold gap. The unavailable suffix belongs to the busy-peer case (TestIssue4044CapablePeerBusyThenFreeLiveDB).
+	after := deadline.Add(time.Microsecond)
+	f.e.exec(t, "UPDATE workers SET last_heartbeat_at=$2 WHERE id=$1", peer, after)
+	counts, err := f.svc.WorkerEligibilityForHealth(f.e.ctx, after, f.run)
+	if err != nil || counts.Claimable == 0 {
+		t.Fatalf("free capable peer after the ceiling should be claimable: counts=%+v err=%v", counts, err)
+	}
+	f.health(t, after, reasonAssignedRepoAgentSourceGap)
 }
 
 func TestIssue4044PeerAffinityReleaseLiveDB(t *testing.T) {
