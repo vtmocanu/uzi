@@ -81,7 +81,7 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, hint)
 			return
 		}
-		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "forge_unreachable" && run.RecoveryWaitCause.String != "data_volume_full" && run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted" && run.RecoveryWaitCause.String != "codex_idle_stall" && run.RecoveryWaitCause.String != "retained_recovery_adoption_failed" && run.RecoveryWaitCause.String != "retained_continuation_unwitnessed") {
+		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "forge_unreachable" && run.RecoveryWaitCause.String != "data_volume_full" && run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted" && run.RecoveryWaitCause.String != "codex_idle_stall" && run.RecoveryWaitCause.String != "retained_recovery_adoption_failed" && run.RecoveryWaitCause.String != "retained_continuation_unwitnessed" && run.RecoveryWaitCause.String != "anthropic_spend_limit") {
 			httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
 			return
 		}
@@ -89,6 +89,13 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		switch run.RecoveryWaitCause.String {
 		case "data_volume_full":
 			_, resumeErr = h.q.ResumeDataVolumeFullHold(r.Context(), store.ResumeDataVolumeFullHoldParams{
+				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
+			})
+		case "anthropic_spend_limit":
+			// Issue #3767: owner Resume of the spend-limit hold; the next claim re-selects the credential
+			// through the run's own claim ladder (a run-pinned secret is kept; auto mode may pick another
+			// pooled token, issue #4163).
+			_, resumeErr = h.q.ResumeAnthropicSpendLimitHold(r.Context(), store.ResumeAnthropicSpendLimitHoldParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
 			})
 		case "forge_unreachable":

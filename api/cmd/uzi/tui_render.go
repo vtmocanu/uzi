@@ -449,6 +449,9 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	if isDiskOwnerHold(r) {
 		return runToken{glyph: "!", word: "disk held", color: p.amber}
 	}
+	if isSpendLimitHold(r) {
+		return runToken{glyph: "!", word: "spend limit", color: p.amber}
+	}
 	if isIterationHold(r) {
 		return runToken{glyph: "⊘", word: "iter limit", color: p.amber}
 	}

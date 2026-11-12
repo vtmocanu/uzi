@@ -4638,7 +4638,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return store.Run{}, false, err
 	}
-	if diskHoldRefusesReport(owned, req) {
+	if ownerHoldRefusesReport(owned, req) {
 		if req.ClaimGeneration != nil && (owned.ClaimGeneration != *req.ClaimGeneration || owned.ClaimReleasedAt.Valid) {
 			return owned, false, ErrStaleClaim
 		}
@@ -4935,7 +4935,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
 		}
-		if diskHoldRefusesReport(locked, req) {
+		if ownerHoldRefusesReport(locked, req) {
 			return locked, false, nil
 		}
 		if locked.Status == "paused" && locked.HoldReason.String == IterationBudgetExhausted {
@@ -4993,7 +4993,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if err := validateSourcePublicationLive(locked, wkr, req); err != nil {
 			return locked, false, err
 		}
-		if diskHoldRefusesReport(locked, req) {
+		if ownerHoldRefusesReport(locked, req) {
 			return locked, false, nil
 		}
 		owned = locked
@@ -5036,7 +5036,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if err := recheckPublicationEnrollment(ctx, qtx, runID, workerLocked); err != nil {
 			return store.Run{}, false, err
 		}
-		if diskHoldRefusesReport(locked, req) {
+		if ownerHoldRefusesReport(locked, req) {
 			return locked, false, nil
 		}
 		owned = locked
