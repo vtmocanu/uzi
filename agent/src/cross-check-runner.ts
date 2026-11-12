@@ -217,7 +217,7 @@ export class CrossCheckRunner {
     try {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
       if (ack?.staleClaim) return;
-      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, claim.secrets.codex?.capability];
+      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, claim.secrets.anthropic_endpoint?.api_key, claim.secrets.codex?.capability];
       const b = new MessageBatcher(this.client, runId, claim.last_seq ?? 0, this.opts.batchMs ?? 500, this.log,
         makeRedactor(secrets), makeTextRedactor(secrets), {
           ...(this.opts.outbox ? { outbox: this.opts.outbox } : {}),
