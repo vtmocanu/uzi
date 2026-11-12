@@ -150,6 +150,11 @@ describe("HeldWorkCard", () => {
     for (const c of empty) expect(c.className).toContain("border-edge-strong");
   });
 
+  it("explains that a run's holds from one original worker usually count as one unit", () => {
+    mount(agg({ open_holds: 1, admission_counted_holds: 1 }));
+    expect(screen.getByText(/New runs wait for admission once all 8 custody units are taken\. A run's holds from the same original worker usually count as one unit; other holds count singly\./)).toBeTruthy();
+  });
+
   it("falls back to a proportional bar past 12 slots", () => {
     const { container } = mount(agg({ custody_hold_limit: 20, open_holds: 5, admission_counted_holds: 5 }));
     const fill = container.querySelector("[aria-hidden=true] > span") as HTMLElement;

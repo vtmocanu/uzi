@@ -101,4 +101,16 @@ it("shows the per-run custody bound under custody-run-bound: blocked run while c
   expect(aggregate.blocked_runs).toBe(1);
   expect(aggregate.admission_counted_holds!).toBeLessThan(aggregate.custody_hold_limit);
   expect(mockRuns.find((r) => r.id === "run-custody-run-bound")?.health_reason).toMatch(/own custody hold limit/);
+
+  // Discarding enough of the run's own holds (9 open -> 7, below the limit of 8) unblocks it.
+  for (const holdId of ["hold-rb-1", "hold-rb-2"]) {
+    const d = mockApi.discardHold("run-custody-run-bound", holdId);
+    await vi.advanceTimersByTimeAsync(1000);
+    await d;
+  }
+  const after = mockApi.getRecoveryHolds();
+  await vi.advanceTimersByTimeAsync(1000);
+  const next = (await after).aggregate;
+  expect(next.open_holds).toBe(7);
+  expect(next.blocked_runs).toBe(0);
 });

@@ -307,7 +307,7 @@ describe("custodyAlertView — self-hide, capacity, and blocked-run severity", (
   });
 
   it("respects an explicit zero admission_counted_holds and falls back only when absent", () => {
-    expect(custodyAlertView(agg({ open_holds: 9, admission_counted_holds: 0, blocked_runs: 1 }), 0)?.slotsUsed).toBe(0);
+    expect(custodyAlertView(agg({ open_holds: 9, admission_counted_holds: 0, decision_needed: 1, blocked_runs: 0 }), 0)?.slotsUsed).toBe(0);
     expect(custodyAlertView(agg({ open_holds: 9, blocked_runs: 1 }), 0)?.slotsUsed).toBe(9);
   });
 

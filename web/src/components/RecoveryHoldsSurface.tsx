@@ -202,7 +202,7 @@ export function RecoveryHoldsSurface() {
           {info.grouped.length > 0 && (
             <InfoSection
               label="Counted with another hold"
-              copy="A run's open holds on one worker count as one admission unit. These holds are covered by that unit and add nothing to the limit."
+              copy="A run's holds from the same original worker usually count as one admission unit; these holds are covered by that unit and add nothing to the limit."
               holds={info.grouped}
               showReason
             />

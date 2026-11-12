@@ -189,7 +189,14 @@ function custodyResponse(): RecoveryCustodyHolds {
       custody_hold_limit: custodyLimit,
       decision_needed: decisionNeeded,
       // Two queued code runs are wedged behind the owner limit in this scenario.
-      blocked_runs: counted >= custodyLimit ? 2 : mockScenario() === "custody-run-bound" ? 1 : 0,
+      // In custody-run-bound the one run is blocked while its own remaining open holds reach the limit.
+      blocked_runs:
+        counted >= custodyLimit
+          ? 2
+          : mockScenario() === "custody-run-bound" &&
+              open.filter((h) => h.run_id === "run-custody-run-bound").length >= custodyLimit
+            ? 1
+            : 0,
     },
     holds,
   };

@@ -51,10 +51,10 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
   const actionable = view.decisionNeeded > 0;
   const plural = view.blockedRuns > 1;
   // The per-run bound is freed only by discarding or settling that run's own holds. The web
-  // lists only holds that need a decision, so the owner's path for the typical active holds
-  // is the CLI (uzi run recovery / uzi run discard).
+  // cannot discard active holds, so the owner's path for the typical active holds is the CLI
+  // (uzi run recovery / uzi run export / uzi run discard).
   const runBoundLead = `${plural ? "Queued runs have" : "A queued run has"} reached ${plural ? "their own custody hold limits" : "its own custody hold limit"}.`;
-  const runBoundTail = `To let ${plural ? "them" : "it"} start, inspect ${plural ? "each run's" : "the run's"} holds with uzi run recovery <run> and discard them with uzi run discard <run> --hold <id>.`;
+  const runBoundTail = `To let ${plural ? "them" : "it"} start, inspect ${plural ? "each run's" : "the run's"} holds with uzi run recovery <run>, then settle or discard enough of ${plural ? "their" : "its"} own holds to bring ${plural ? "them" : "it"} below the limit (uzi run discard <run> --hold <id>; run uzi run export first if a hold may be the only copy of the work).`;
 
   return (
     <section

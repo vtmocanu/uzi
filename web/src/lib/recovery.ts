@@ -175,7 +175,7 @@ export interface CustodyAlertView {
   tone: "warning" | "danger";
   atLimit: boolean;
   // True when runs are blocked but the owner is below the limit: the blocked runs are at their
-  // own per-run custody hold bound (admission counts units, one run's holds on one worker once).
+  // own per-run custody hold bound (admission counts units; a run's holds from the same original worker usually count once).
   runBoundOnly: boolean;
   // "6 / 8 custody units used" — the admission-unit line.
   slotsLabel: string;
