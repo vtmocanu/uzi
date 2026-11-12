@@ -1017,6 +1017,9 @@ export function RunDefaults() {
               id="judge-runs-on"
               className="sm:max-w-xs"
               value={judgeRunsOn}
+              // Locked until the initial load lands: a choice made earlier would be saved, then
+              // overwritten on screen by the loaded (older) value.
+              disabled={loading}
               aria-busy={judgeRunsOnBusy || undefined}
               aria-describedby={`judge-runs-on-help${judgeHarnessUnusable ? " judge-runs-on-unusable" : ""}`}
               onChange={(e) => saveJudgeRunsOn(e.target.value as JudgeRunsOnChoice)}

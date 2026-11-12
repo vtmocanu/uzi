@@ -2616,6 +2616,17 @@ describe("Run defaults — Judge runs on (PRD #3257)", () => {
   const echoPut = () =>
     mockApi.putMySettings.mockImplementation(async (patch) => judgeSettings(patch.judge_runs_on ?? null));
 
+  it("keeps Judge runs on disabled until the initial load lands, so a load cannot overwrite a choice", async () => {
+    let finish: (v: { settings: UserSettings }) => void = () => {};
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
+    mockApi.getMySettings.mockReturnValue(new Promise((res) => { finish = res; }));
+    renderPage();
+    expect(runsOn().disabled).toBe(true);
+    finish(judgeSettings("claude"));
+    await waitFor(() => expect(runsOn().disabled).toBe(false));
+    expect(runsOn().value).toBe("claude");
+  });
+
   it("offers Same as the run, Claude and Codex in that order, defaulting to Same as the run", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
     mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
