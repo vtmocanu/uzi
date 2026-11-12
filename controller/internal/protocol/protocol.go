@@ -127,6 +127,16 @@ type Hibernation struct {
 	OpID  string `json:"op_id"`
 }
 
+// Hibernation.State values, and the protocol version this controller advertises in
+// StatusReport.Hibernation.
+const (
+	HibernationPreparing  = "preparing"
+	HibernationHibernated = "hibernated"
+	HibernationWaking     = "waking"
+
+	HibernationProtocolVersion = 1
+)
+
 // HibernationTransition is the body the controller reports for one step of a
 // hibernation or wake operation (PRD #4205). The transition names are a closed set.
 type HibernationTransition struct {

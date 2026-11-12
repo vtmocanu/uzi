@@ -122,6 +122,24 @@ type ObservedWorker struct {
 	PodsKnown      bool
 	WorkerPodCount int
 	ReadyPodUID    string
+	// Hibernation evidence (PRD #4205), all read fresh each tick: nothing about a
+	// hibernation step is remembered across ticks.
+	//
+	// DeploymentReplicas is the Deployment's spec.replicas; nil when the Deployment is
+	// absent or carries no value (the apiserver defaults an absent value to 1, but an
+	// absent observation is not the same as an observed 1).
+	DeploymentReplicas *int32
+	// HibernationOp / HibernationRefused are the values of the uzi.dev/hibernation-op
+	// and uzi.dev/hibernation-refused annotations on the Deployment object itself (never
+	// its pod template, which would roll the pod). "" when absent.
+	HibernationOp      string
+	HibernationRefused string
+	// WorkerPodUIDs lists every pod labelled for this worker, terminating ones included
+	// (they still count as "a worker pod exists"), sorted. LivePodUID is the smallest UID
+	// among pods with no deletionTimestamp, "" when none. ReadyPodUID above already
+	// excludes terminating pods.
+	WorkerPodUIDs []string
+	LivePodUID    string
 	// NixPVCSize is the observed /nix PVC's requested storage (spec.resources.requests[storage]),
 	// recorded ONLY from a LIVE (deletionTimestamp == nil) nix PVC. nil means "no live nix PVC
 	// observed" — the PVC is absent OR Terminating. M3's size-drift arm compares it against the
@@ -396,10 +414,20 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 	}
 	workers := make([]protocol.WorkerStatus, 0, len(observed))
 	reported := make(map[string]bool, len(observed))
+	// A worker that is preparing to hibernate or is hibernated has no pod on purpose;
+	// a roll-health row for it (even the synthetic rolling-gap one below) would show a
+	// deliberately parked worker as an upgrade in progress. Mark it reported so neither
+	// loop emits a row. A waking worker is reported normally: its pod is genuinely
+	// on its way.
+	for _, w := range desired {
+		if h := w.Hibernation; h != nil && (h.State == protocol.HibernationPreparing || h.State == protocol.HibernationHibernated) {
+			reported[w.ID] = true
+		}
+	}
 	for _, o := range observed {
 		// Without pod health, only a desired worker's pacing outcome supplies a
 		// rolling-gap fallback below. Otherwise an absent row means no signal.
-		if o.Roll.Phase == "" {
+		if o.Roll.Phase == "" || reported[o.ID] {
 			continue
 		}
 		reported[o.ID] = true
@@ -438,6 +466,7 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 		PollIntervalSeconds: int(l.interval.Seconds()),
 		WorkerImageTag:      l.workerImageTag,
 		Workers:             workers,
+		Hibernation:         protocol.HibernationProtocolVersion,
 	}
 	if err := l.reporter.Report(ctx, report); err != nil {
 		l.log.Warn("reporting roll health failed; reconciliation is unaffected", "error", err, "workers", len(workers))
