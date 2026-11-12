@@ -173,9 +173,7 @@ func TestMemoryParkSettledOwnerTransitionsDoNotLiftLiveDB(t *testing.T) {
 	}{
 		{"credential switch", func() error {
 			_, err := svc.SetRunCredential(f.e.ctx, f.w.UserID, f.b.RunID, CredentialOverrideModeAuto, nil)
-			if !errors.Is(err, ErrCredentialSwitchRaced) {
-				t.Fatalf("credential switch = %v", err)
-			}
+			requireRunOwnerHeld(t, err, "worker memory pressure")
 			return nil
 		}},
 		{"early promote", func() error {

@@ -4150,6 +4150,10 @@ RETURNING id, user_id, status;
 --
 -- anthropic_spend_limit is deliberately NOT excluded: the owner chose a new credential, which
 -- is one of the three ways forward out of that hold (the others are Resume and Cancel).
+--
+-- The owner-hold exclusions below (all but the three retry-stamp ones) are mirrored in Go by
+-- workersvc.recoveryWaitOwnerHold, so set-token refuses them with a specific error instead of a
+-- 0-row race. Change one, change the other.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'

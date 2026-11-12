@@ -18702,6 +18702,10 @@ type PromoteRecoveryWaitRunNowParams struct {
 //
 // anthropic_spend_limit is deliberately NOT excluded: the owner chose a new credential, which
 // is one of the three ways forward out of that hold (the others are Resume and Cancel).
+//
+// The owner-hold exclusions below (all but the three retry-stamp ones) are mirrored in Go by
+// workersvc.recoveryWaitOwnerHold, so set-token refuses them with a specific error instead of a
+// 0-row race. Change one, change the other.
 func (q *Queries) PromoteRecoveryWaitRunNow(ctx context.Context, arg PromoteRecoveryWaitRunNowParams) (int64, error) {
 	result, err := q.db.Exec(ctx, promoteRecoveryWaitRunNow, arg.ID, arg.UserID)
 	if err != nil {
