@@ -81,6 +81,16 @@ RETURNING run_id;
 -- Guarded by the worker so a row recorded for another worker in the meantime survives.
 DELETE FROM hibernation_wakes WHERE run_id = @run_id AND worker_id = @worker_id;
 
+-- name: WorkerHasPendingWakeDemand :one
+-- Hibernate admission (PRD #4205 M5): true iff a queued run has a recorded wake naming this worker.
+-- Such a run woke the worker and is still waiting for it, so hibernating again would strand the run
+-- (its row suppresses a second wake). Read after the worker lock.
+SELECT EXISTS (
+    SELECT 1 FROM hibernation_wakes hw
+    JOIN runs r ON r.id = hw.run_id
+    WHERE hw.worker_id = @worker_id AND r.status = 'queued'
+)::boolean AS pending;
+
 -- name: LockRunForShare :one
 -- Row lock for DemandWake, taken after the worker lock (the same worker-then-run order ClaimRun
 -- uses). The caller reads the status AFTER the lock, so a claim that won the race is seen.
@@ -103,6 +113,8 @@ LIMIT @max_rows;
 -- wake whose worker is still waking, is admitted for THIS run by fn_placement_admitting_workers
 -- (so a run needing another capability or lane is never suppressed), and the FIRST wake is
 -- younger than @wake_timeout (retries never reset first_woken_at).
+-- @ephemeral_lease cannot change the result here: the waking worker is always a persistent hosted
+-- worker, and the lease only admits ephemeral workers. It is passed for consistency with the demand query.
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
            (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END

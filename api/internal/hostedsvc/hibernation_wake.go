@@ -133,7 +133,9 @@ func (p *EphemeralProvisioner) wakeSuppressesProvision(ctx context.Context, qtx 
 		CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: evaluatedAt.Add(-p.cfg.WorkerAffinityGrace), Valid: true},
 		CodexCuratedModels:       workersvc.CodexCuratedModels(),
 		RunID:                    runID,
-		EphemeralLease:           workersvc.LeaseInterval(p.cfg.Lease),
-		WakeTimeout:              durationToInterval(workersvc.WorkerWakeTimeout),
+		// The lease cannot change the result: the waking worker is always persistent, and the lease only
+		// admits ephemeral workers. Passed for consistency with the demand query.
+		EphemeralLease: workersvc.LeaseInterval(p.cfg.Lease),
+		WakeTimeout:    durationToInterval(workersvc.WorkerWakeTimeout),
 	})
 }

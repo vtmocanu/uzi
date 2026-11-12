@@ -347,7 +347,11 @@ func TestDemandWakeLiveDB(t *testing.T) {
 		f.heartbeatNow(a)
 		f.register(a, &pod)
 		f.want(a, "none")
-		f.sleep(a, pod)
+		// HibernateWorker now refuses this sequence (pending_wake_demand), so write the state that a
+		// pre-refusal api, or a row that outlived its guard, could have left, to prove DemandWake's own
+		// one-wake-per-run guard still holds.
+		f.env.exec(`UPDATE workers SET hibernation_state = 'hibernated', hibernation_op_id = gen_random_uuid(), hibernated_at = now() WHERE id = $1`, a)
+		f.want(a, "hibernated")
 		opA, opB := f.op(a), f.op(b)
 		for _, cand := range []uuid.UUID{a, b} {
 			if res, err := f.svc.DemandWake(f.env.ctx, run, cand); err != nil || res != DemandWakeNone {
@@ -453,4 +457,36 @@ func TestDemandWakeLiveDB(t *testing.T) {
 			t.Fatalf("rows: live=%d gone=%d", f.wakeRows(live), f.wakeRows(gone))
 		}
 	})
+}
+
+func TestHibernateRefusedWhileAQueuedRunWokeTheWorkerLiveDB(t *testing.T) {
+	f := newHibFx(t)
+	w := f.sleepingWorker()
+	run := f.queuedRun()
+	if res, err := f.svc.DemandWake(f.env.ctx, run, w); err != nil || res != DemandWakeWoke {
+		t.Fatalf("wake: %v, %v", res, err)
+	}
+	// Settle the worker awake with the run still queued and still holding its wake row.
+	pod := uuid.New()
+	f.mustApply(w, TransitionReady, pod)
+	f.env.exec(`UPDATE workers SET registered_pod_uid = $2 WHERE id = $1`, w, pod)
+	f.heartbeatNow(w)
+	f.register(w, &pod)
+	f.want(w, "none")
+
+	_, err := f.svc.HibernateWorker(f.env.ctx, f.actor, w, "")
+	if got := refusalCode(err); got != RefusalPendingWakeDemand {
+		t.Fatalf("hibernate with a queued run that woke the worker = %q (%v), want %q", got, err, RefusalPendingWakeDemand)
+	}
+	f.want(w, "none")
+	if f.wakeRows(run) != 1 {
+		t.Fatal("the refusal released the wake row")
+	}
+
+	// The run leaves the queue (claimed away): the row is no longer pending demand.
+	f.env.exec(`UPDATE runs SET status = 'cancelled' WHERE id = $1`, run)
+	if _, err := f.svc.HibernateWorker(f.env.ctx, f.actor, w, ""); err != nil {
+		t.Fatalf("hibernate after the run left the queue: %v", err)
+	}
+	f.want(w, "preparing")
 }

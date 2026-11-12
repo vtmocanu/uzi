@@ -14,16 +14,8 @@ CREATE INDEX hibernation_wakes_worker_idx ON hibernation_wakes (worker_id);
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
--- Refuse rollback while wake history exists.
--- +goose StatementBegin
-DO $$
-BEGIN
- LOCK TABLE hibernation_wakes IN ACCESS EXCLUSIVE MODE;
- IF EXISTS (SELECT 1 FROM hibernation_wakes) THEN
-  RAISE EXCEPTION 'hibernation wake history exists; rollback refused';
- END IF;
-END;
-$$;
--- +goose StatementEnd
-
+-- Wake rows are transient demand memory (a row lives only while its run is queued), so Down does
+-- not refuse on them: refusing would stall a downgrade behind an idle queue. Down of 00427 still
+-- refuses while any worker is not awake. The table lock makes a concurrent wake insert wait.
+LOCK TABLE hibernation_wakes IN ACCESS EXCLUSIVE MODE;
 DROP TABLE hibernation_wakes;

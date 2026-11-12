@@ -63,19 +63,19 @@ func TestWorkerHibernationMigrationLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("refused Down changed the worker: %d", n)
 	}
 
-	// Down of 428 refuses while wake history exists, and changes nothing.
+	// Down of 428 does not refuse on wake rows: they are transient demand memory, and refusing
+	// would stall a downgrade behind an idle queue. Down of 427 (above) still refuses while a worker
+	// is not awake.
 	mustExec(ctx, t, pool, `UPDATE workers SET hibernation_state='none', hibernation_op_id=NULL WHERE id=$1`, worker)
 	run := uuid.New()
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,kind,issue_title,issue_description,status) VALUES($1,$2,'chat','t','d','queued')`, run, owner)
 	mustExec(ctx, t, pool, `INSERT INTO hibernation_wakes(run_id,worker_id,first_woken_at) VALUES($1,$2,now())`, run, worker)
-	err = store.MigrateDownTo(ctx, dsn, 427)
-	if err == nil || !strings.Contains(err.Error(), "rollback refused") {
-		t.Fatalf("Down with wake history: %v", err)
+	if err = store.MigrateDownTo(ctx, dsn, 427); err != nil {
+		t.Fatalf("Down of 428 with wake rows: %v", err)
 	}
-	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM hibernation_wakes"); n != 1 {
-		t.Fatalf("refused Down changed wake history: %d", n)
+	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM information_schema.tables WHERE table_name='hibernation_wakes'"); n != 0 {
+		t.Fatalf("Down of 428 left the wake table: %d", n)
 	}
-	mustExec(ctx, t, pool, `DELETE FROM hibernation_wakes`)
 
 	// Clean Down keeps the audit table and restores the old function body.
 	if err = store.MigrateDownTo(ctx, dsn, 426); err != nil {

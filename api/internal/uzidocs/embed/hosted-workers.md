@@ -193,8 +193,9 @@ Operators rolling back past this feature, in order:
 3. Stop the api. Rolling back 00429 drops `fn_placement_admitting_workers`, which
    this api's ephemeral provisioning and demand-wake queries call, so this api
    cannot keep serving once 00429 is down. Expect a brief outage window.
-4. Roll back migrations 00429, then 00428, then 00427. Down of 00428 and 00427
-   refuses while any worker is not awake or a wake record exists. The rollbacks
+4. Roll back migrations 00429, then 00428, then 00427. Down of 00427 refuses
+   while any worker is not awake; Down of 00428 drops the wake records, which
+   are transient demand memory, without refusing. The rollbacks
    briefly take exclusive locks (00427 on the workers table; 00428 on the runs
    and workers tables), so do them in a quiet window.
 5. Start the older api. An older api cannot claim runs on the new schema, so it

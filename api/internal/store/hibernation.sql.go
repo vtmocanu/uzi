@@ -104,6 +104,8 @@ type HibernationWakeSuppressesParams struct {
 // wake whose worker is still waking, is admitted for THIS run by fn_placement_admitting_workers
 // (so a run needing another capability or lane is never suppressed), and the FIRST wake is
 // younger than @wake_timeout (retries never reset first_woken_at).
+// @ephemeral_lease cannot change the result here: the waking worker is always a persistent hosted
+// worker, and the lease only admits ephemeral workers. It is passed for consistency with the demand query.
 func (q *Queries) HibernationWakeSuppresses(ctx context.Context, arg HibernationWakeSuppressesParams) (bool, error) {
 	row := q.db.QueryRow(ctx, hibernationWakeSuppresses,
 		arg.CrossCheckEvaluatedAt,
@@ -507,6 +509,24 @@ func (q *Queries) WorkerHasOpenCustodyHold(ctx context.Context, workerID pgtype.
 	var column_1 bool
 	err := row.Scan(&column_1)
 	return column_1, err
+}
+
+const workerHasPendingWakeDemand = `-- name: WorkerHasPendingWakeDemand :one
+SELECT EXISTS (
+    SELECT 1 FROM hibernation_wakes hw
+    JOIN runs r ON r.id = hw.run_id
+    WHERE hw.worker_id = $1 AND r.status = 'queued'
+)::boolean AS pending
+`
+
+// Hibernate admission (PRD #4205 M5): true iff a queued run has a recorded wake naming this worker.
+// Such a run woke the worker and is still waiting for it, so hibernating again would strand the run
+// (its row suppresses a second wake). Read after the worker lock.
+func (q *Queries) WorkerHasPendingWakeDemand(ctx context.Context, workerID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, workerHasPendingWakeDemand, workerID)
+	var pending bool
+	err := row.Scan(&pending)
+	return pending, err
 }
 
 const writeWorkerHibernation = `-- name: WriteWorkerHibernation :one

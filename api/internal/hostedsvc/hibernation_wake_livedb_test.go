@@ -337,10 +337,11 @@ func TestHibernationWakePassKeepsRowsUntilTheRunLeavesTheQueueLiveDB(t *testing.
 	if err := e.pool.QueryRow(e.ctx, `SELECT first_woken_at FROM hibernation_wakes WHERE run_id = $1`, kept).Scan(&firstWoken); err != nil {
 		t.Fatal(err)
 	}
-	// One run leaves the queue; the worker is re-hibernated with the other run's row still naming it.
+	// One run leaves the queue while the worker settles awake with the other run's row still naming
+	// it. (Re-hibernating it here is the stranding sequence HibernateWorker now refuses with
+	// pending_wake_demand; see TestHibernateRefusedWhileAQueuedRunWokeTheWorkerLiveDB.)
 	e.exec(`UPDATE runs SET status = 'cancelled' WHERE id = $1`, gone)
-	e.exec(`UPDATE workers SET hibernation_state = 'hibernated', hibernated_at = now(), wake_requested_at = NULL WHERE id = $1`, w)
-	opBefore := e.op(w)
+	e.exec(`UPDATE workers SET hibernation_state = 'none', hibernation_op_id = NULL, hibernated_at = NULL, wake_requested_at = NULL WHERE id = $1`, w)
 	for i := 0; i < 2; i++ {
 		if got := e.wake(); got != 0 {
 			t.Fatalf("pass %d woke %d workers; a run that already woke once must not wake again", i, got)
@@ -353,8 +354,8 @@ func TestHibernationWakePassKeepsRowsUntilTheRunLeavesTheQueueLiveDB(t *testing.
 	if err := e.pool.QueryRow(e.ctx, `SELECT first_woken_at FROM hibernation_wakes WHERE run_id = $1`, kept).Scan(&after); err != nil {
 		t.Fatalf("the row of the still-queued run %s was deleted: %v", kept, err)
 	}
-	if !after.Equal(firstWoken) || e.state(w) != "hibernated" || e.op(w) != opBefore {
-		t.Fatalf("the still-queued run woke again: first_woken_at %v -> %v, state=%s", firstWoken, after, e.state(w))
+	if !after.Equal(firstWoken) || e.state(w) != "none" {
+		t.Fatalf("the still-queued run's row changed: first_woken_at %v -> %v, state=%s", firstWoken, after, e.state(w))
 	}
 	// A run claimed away releases its row on the next pass.
 	e.exec(`UPDATE runs SET status = 'running' WHERE id = $1`, kept)
@@ -430,6 +431,51 @@ func TestHibernationWakeSuppressesEphemeralProvisioningLiveDB(t *testing.T) {
 		e.exec(`DELETE FROM hibernation_wakes WHERE run_id = $1`, run)
 		if got := e.provision(); got != 1 {
 			t.Fatalf("control: saturation provisioned %d, want 1", got)
+		}
+	})
+}
+
+// leasedEphemeral seeds an online ephemeral worker holding a live lease for run's repository and
+// branch, so it can take the run through its lease.
+func (e *wakeEnv) leasedEphemeral(run uuid.UUID) uuid.UUID {
+	e.t.Helper()
+	var iid int64
+	if err := e.pool.QueryRow(e.ctx, `SELECT issue_iid FROM runs WHERE id = $1`, run).Scan(&iid); err != nil {
+		e.t.Fatalf("issue_iid: %v", err)
+	}
+	id := uuid.New()
+	e.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, kind, hosted_size, template_declared, ephemeral,
+	                             last_heartbeat_at, lease_since, lease_repo_id, lease_branch)
+	        VALUES ($1, $2, $3, $4, 'online', 'hosted', 'm', 'base', true, now(), now(), $5, $6)`,
+		id, e.user, "leased-"+id.String(), append(id[:], id[:]...), e.repo, fmt.Sprintf("agent/issue-%d", iid))
+	return id
+}
+
+func TestHibernationWakePassHonoursTheConfiguredLeaseLiveDB(t *testing.T) {
+	t.Run("a leased ephemeral worker that can take the run through its lease: no sleeper is woken", func(t *testing.T) {
+		e := newWakeEnv(t, false)
+		e.waker.cfg.Lease = time.Hour
+		sleeper := e.sleeper(nil, nil, time.Hour)
+		run := e.queuedRun()
+		e.leasedEphemeral(run)
+		if got := e.wake(); got != 0 {
+			t.Fatalf("woke %d workers although a leased worker can take the run", got)
+		}
+		if e.state(sleeper) != "hibernated" || e.wakeRows() != 0 {
+			t.Fatalf("sleeper state=%s rows=%d, want hibernated and no wake row", e.state(sleeper), e.wakeRows())
+		}
+	})
+
+	t.Run("control: with no lease configured the same run wakes the sleeper", func(t *testing.T) {
+		e := newWakeEnv(t, false)
+		sleeper := e.sleeper(nil, nil, time.Hour)
+		run := e.queuedRun()
+		e.leasedEphemeral(run)
+		if got := e.wake(); got != 1 {
+			t.Fatalf("woke %d workers, want 1", got)
+		}
+		if e.state(sleeper) != "waking" {
+			t.Fatalf("sleeper state = %s, want waking", e.state(sleeper))
 		}
 	})
 }

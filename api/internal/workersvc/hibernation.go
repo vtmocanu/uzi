@@ -53,6 +53,7 @@ const (
 	RefusalBusy                   = "busy"
 	RefusalCustodyHold            = "custody_hold"
 	RefusalIntakeFenced           = "intake_fenced"
+	RefusalPendingWakeDemand      = "pending_wake_demand"
 )
 
 // HibernationRefusal is the typed reason an admission was refused.
@@ -310,6 +311,16 @@ func (s *Service) hibernateRefusal(ctx context.Context, q *store.Queries, w stor
 	}
 	if !store.WorkerAcceptsNewIntake(w) {
 		return RefusalIntakeFenced, nil
+	}
+	// A queued run that already woke this worker keeps its hibernation_wakes row, which suppresses a
+	// second wake; hibernating again would strand it until it leaves the queue. Read under the
+	// worker lock DemandWake also takes, so a concurrent wake is either seen here or waits.
+	pending, err := q.WorkerHasPendingWakeDemand(ctx, w.ID)
+	if err != nil {
+		return "", err
+	}
+	if pending {
+		return RefusalPendingWakeDemand, nil
 	}
 	return "", nil
 }

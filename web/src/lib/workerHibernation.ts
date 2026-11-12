@@ -39,6 +39,7 @@ const REFUSALS: Record<string, string> = {
   busy: "The worker is busy with runs. Wait for it to go idle.",
   custody_hold: "The worker holds unpublished work that needs an owner decision. Resolve the custody hold first.",
   intake_fenced: "The worker is cordoned, draining or rolling. Try again when it is accepting runs.",
+  pending_wake_demand: "A queued run woke this worker and is still waiting for it.",
   not_hibernating: "This worker is not hibernating.",
 };
 
