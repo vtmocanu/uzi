@@ -99,6 +99,7 @@ describe("OverviewNext for a non-admin", () => {
     expect(screen.queryByText(/Other users/)).toBeNull();
     // The health chip is admin-only.
     expect(screen.queryByRole("link", { name: /System health/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /System health/ })).toBeNull();
   });
 
   it("links back to the current Overview, and Dashboard links here", async () => {
@@ -213,9 +214,10 @@ describe("OverviewNext for an admin", () => {
   it("shows the health chip with the verdict for a non-passing document and a pass count for a clean one", async () => {
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     await mount();
-    const chip = screen.getByRole("link", { name: /System health/ });
-    expect(chip.getAttribute("href")).toBe("/admin/health");
+    const chip = screen.getByRole("button", { name: /System health/ });
     expect(chip.textContent).toContain("1 check needs attention");
+    expect(chip.getAttribute("aria-haspopup")).toBe("dialog");
+    expect(chip.getAttribute("aria-expanded")).toBe("false");
     cleanup();
     const clean = healthySilentDoc();
     mockApi.getAdminHealth.mockResolvedValue(clean);
