@@ -646,13 +646,19 @@ export class FakeApi {
     this.storedPlanByRun.set(runId, plan);
   }
 
+  /** Issue #4158: opt in to holding ORDINARY (non-cross-check) runs to the api's running rule too
+   *  (their awaiting_approval arm needs any applied, non-superseded approve_plan). Off by default, so
+   *  every other test keeps the fake's accept-everything behaviour for ordinary runs. */
+  modelOrdinaryRunningRule = false;
+
   /** The run's cross-check model, or undefined when the run is not modelled. */
   private crossCheckModel(runId: string): CrossCheckModel | undefined {
     const claim = this.claimByRun.get(runId);
     if (!claim) return undefined;
     const auto = this.autoApproveByRun.get(runId) === true;
     const lane: CrossCheckLane | undefined = claim.plan_cross_check_gated === true && !auto ? "gated"
-      : claim.plan_cross_check_required === true ? (auto ? "required_auto" : "required") : undefined;
+      : claim.plan_cross_check_required === true ? (auto ? "required_auto" : "required")
+      : this.modelOrdinaryRunningRule ? "ordinary" : undefined;
     if (lane === undefined) return undefined;
     const gate = this.gateByRun.get(runId);
     const seed = this.presentedSeedByRun.get(runId);

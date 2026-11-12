@@ -106,14 +106,12 @@ describe("FakeApi /state running rule", () => {
 
   it("agrees with every fixture case", async () => {
     let ran = 0;
-    const unmodelled: string[] = [];
+    const ordinaryAwaitingRan: string[] = [];
+    // The fake keeps an ordinary run's accept-everything behaviour by default; this test opts in so
+    // the route is held to the api's awaiting_approval arm for ordinary runs as well.
+    api.modelOrdinaryRunningRule = true;
     for (const c of fixture.cases) {
-      // The fake deliberately keeps an ordinary run's accept-everything behaviour (the pure rule
-      // above still covers these cases), so the route cannot be held to the api's awaiting_approval arm.
-      if (c.lane === "ordinary" && c.status === "awaiting_approval") {
-        unmodelled.push(c.name);
-        continue;
-      }
+      if (c.lane === "ordinary" && c.status === "awaiting_approval") ordinaryAwaitingRan.push(c.name);
       const autoStart = c.lane === "required_auto" || c.lane === "required_auto_parked";
       const claim = makeClaim({
         claim_generation: GENERATION,
@@ -190,8 +188,10 @@ describe("FakeApi /state running rule", () => {
       }
       ran++;
     }
-    assert.ok(unmodelled.length > 0 && unmodelled.every((n) => n.startsWith("ordinary/")), "only ordinary awaiting_approval cases are skipped");
-    assert.equal(ran + unmodelled.length, fixture.cases.length);
+    api.modelOrdinaryRunningRule = false;
+    // Every case, the ordinary awaiting_approval ones included, ran through the HTTP route.
+    assert.ok(ordinaryAwaitingRan.length > 0, "ordinary awaiting_approval cases ran through the route");
+    assert.equal(ran, fixture.cases.length);
   });
 
   it("accepts the pre-plan running report of a gated run", async () => {
