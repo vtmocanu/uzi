@@ -1437,7 +1437,11 @@ describe("OverviewNext health chip popover", () => {
 
     await userEvent.click(chip);
     await screen.findByRole("dialog", { name: "System health" });
-    await userEvent.click(document.body);
+    // Click on empty page: the greeting heading is inert text (not focusable) above the panel,
+    // so focus falls to <body> and the chip takes it back a frame later.
+    const heading = screen.getByRole("heading", { level: 1 });
+    expect(heading.tabIndex, "click target is not focusable").toBe(-1);
+    await userEvent.click(heading);
     expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
     await expect.poll(() => document.activeElement).toBe(chip);
   });
@@ -1450,8 +1454,11 @@ describe("OverviewNext health chip popover", () => {
     await document.fonts.ready;
     expect(window.innerWidth).toBe(375);
     const r = dialog.getBoundingClientRect();
-    expect(r.left).toBeGreaterThanOrEqual(0);
-    expect(r.right).toBeLessThanOrEqual(window.innerWidth);
+    // Bottom sheet with 1rem (16px) insets on the sides and bottom, fully inside the viewport.
+    expect.soft(Math.abs(r.left - 16), "left inset").toBeLessThanOrEqual(1);
+    expect.soft(Math.abs(window.innerWidth - r.right - 16), "right inset").toBeLessThanOrEqual(1);
+    expect.soft(Math.abs(window.innerHeight - r.bottom - 16), "bottom inset").toBeLessThanOrEqual(1);
+    expect.soft(r.top, "top inside the viewport").toBeGreaterThanOrEqual(0);
     expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
       window.innerWidth,
     );
