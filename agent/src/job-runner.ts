@@ -746,17 +746,23 @@ export class JobRunner {
     this.activeRuns?.add(runId, generation ?? 0);
     const token = claim.secrets?.anthropic_oauth_token?.trim();
     if (token) this.log.addSecret(token);
+    // PRD #229 D10: a bound endpoint is this job's Claude credential. The claim carries it
+    // INSTEAD of the subscription token, so gating on the token alone would fail every job on
+    // an endpoint-only instance after the server had already committed the claim.
+    const anthropicEndpoint = claim.secrets?.anthropic_endpoint;
+    const endpointKey = anthropicEndpoint?.api_key;
+    if (endpointKey) this.log.addSecret(endpointKey);
     let ws: JobWorkspace | undefined;
     let batcher: MessageBatcher | undefined;
     // The secrets every outgoing string is scrubbed of. A lane job adds its fetch credential the
     // moment the grant validates; one list builds the batcher's redactors AND the text redactor
     // finish() and the failure reports use.
-    let secrets: Array<string | undefined> = [token, this.joinToken];
+    let secrets: Array<string | undefined> = [token, endpointKey, this.joinToken];
     let redactText: TextRedactor = makeTextRedactor(secrets);
     let laneCredential: string | undefined;
     try {
       const job = claim.job;
-      if (!job || !token) {
+      if (!job || (!token && !anthropicEndpoint)) {
         await this.fail(runId, generation, !job ? "job claim carried no job block" : "job claim carried no Anthropic credential");
         return;
       }
@@ -782,7 +788,7 @@ export class JobRunner {
         }
         laneCredential = grant.credential;
         this.log.addSecret(laneCredential);
-        secrets = [token, this.joinToken, laneCredential];
+        secrets = [token, endpointKey, this.joinToken, laneCredential];
         redactText = makeTextRedactor(secrets);
       }
 
@@ -891,7 +897,7 @@ export class JobRunner {
         : undefined;
       const resultTool = buildJobResultServer(store, { workDir: ws.work, secretPaths: this.secretPaths });
       const options = buildJobSdkOptions({
-        env: (lane ? isolateSdkEnv(buildSdkEnv(token, ws.home)) : buildSdkEnv(token, ws.home)) as unknown as Record<string, string | undefined>,
+        env: (lane ? isolateSdkEnv(buildSdkEnv(token ?? "", ws.home, {}, undefined, undefined, undefined, anthropicEndpoint)) : buildSdkEnv(token ?? "", ws.home, {}, undefined, undefined, undefined, anthropicEndpoint)) as unknown as Record<string, string | undefined>,
         systemPrompt: (lane ? LANE_JOB_SYSTEM_PROMPT : JOB_SYSTEM_PROMPT) + (productSkills ? JOB_SKILLS_PROMPT_SUFFIX : ""),
         workDir: ws.work,
         log: runLog,
@@ -935,6 +941,7 @@ export class JobRunner {
       if (ws) await removeJobWorkspace(ws, runLog);
       this.activeRuns?.remove(runId);
       if (token) this.log.removeSecret(token);
+      if (endpointKey) this.log.removeSecret(endpointKey);
       if (laneCredential) this.log.removeSecret(laneCredential);
     }
   }
