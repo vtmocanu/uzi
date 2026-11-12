@@ -44,6 +44,21 @@ type JudgeSkip struct {
 // there. The transaction rolls back, so no judge is created and nothing is recorded.
 var errJudgeCreateIsolation = errors.New("judge creation requires a READ COMMITTED transaction")
 
+// errJudgeCreateRequiresTx fails a judge creation closed when the Service runs on a real
+// *store.Queries with no transaction beginner. createRunAtomic then takes its no-transaction
+// branch, so lockJudgeTargetForCreate would autocommit: the target lock would fence nothing
+// and the skip delete would not roll back with the judge insert. Nothing is created, deleted
+// or recorded. Production always wires SetTxBeginner, so this is a misconfiguration guard.
+var errJudgeCreateRequiresTx = errors.New("judge creation requires a transaction beginner")
+
+// judgeCreateLacksTx reports the hazardous configuration: a live store without a beginner.
+// The in-memory unit fakeStore is not a *store.Queries and runs its insert directly (see
+// createRunResolved), where no real lock or skip row exists, so it is exempt.
+func (s *Service) judgeCreateLacksTx() bool {
+	_, live := s.q.(*store.Queries)
+	return live && s.txBeginner == nil
+}
+
 // judgeSkipReasonFor maps a credential refusal from createRunResolved to its skip reason.
 // The precedence matters because the typed refusals wrap one another: a disabled credential
 // and an unavailable pool both wrap ErrNoCredentialForHarness. Any other error (including a

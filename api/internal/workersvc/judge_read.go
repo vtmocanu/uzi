@@ -289,6 +289,9 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 	// PRD #1429 M3 (D4); PRD #3257: routed through the M2 createRunResolved funnel with the
 	// JUDGE's harness as an EXPLICIT selection, so D11 resolution + the INSERT + (for a Codex
 	// judge) the binding freeze commit atomically.
+	if s.judgeCreateLacksTx() {
+		return store.Run{}, errJudgeCreateRequiresTx
+	}
 	judge, err := s.createRunResolved(ctx, target.UserID, &judgeHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		// Same guard as the automatic path: a rerun clears the target's skip record in the
 		// creating transaction. A rerun refusal records nothing (it is shown synchronously);

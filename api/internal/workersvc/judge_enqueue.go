@@ -294,6 +294,10 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// the judge is FROZEN onto that harness rather than silently alternating onto the other
 	// provider, and a chosen-but-unusable harness fails closed (ErrNoCredentialForHarness)
 	// instead of inserting a stranded row.
+	if s.judgeCreateLacksTx() {
+		slog.Warn("judge enqueue: no transaction beginner wired, no judge created and no skip recorded", "run", run.ID, "error", errJudgeCreateRequiresTx)
+		return
+	}
 	judge, err := s.createRunResolved(ctx, run.UserID, &judgeHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		if err := s.lockJudgeTargetForCreate(ctx, q, run.ID); err != nil {
 			return store.Run{}, err

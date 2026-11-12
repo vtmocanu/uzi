@@ -445,3 +445,34 @@ func TestJudgeSkipNotExistsUsesJudgeTargetIndexLiveDB(t *testing.T) {
 		t.Fatalf("plan does not use runs_judge_target_idx:\n%s", plan.String())
 	}
 }
+
+// TestJudgeCreateWithoutTxBeginnerFailsClosedLiveDB: a Service on the real store with no
+// transaction beginner must not create a judge, because createRunAtomic would run the lock and
+// the skip delete as autocommitted statements. Neither the automatic enqueue nor a rerun may
+// create a judge or delete the target's skip record, and the rerun reports the typed error.
+func TestJudgeCreateWithoutTxBeginnerFailsClosedLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, repoID := seedClaudeJudgeUser(t, env)
+	env.exec(`UPDATE users SET judge_enabled = true WHERE id = $1`, userID)
+	svc := New(env.q, env.box, testParams())
+	svc.SetSettings(fakeSettings{enabled: true})
+	if svc.txBeginner != nil {
+		t.Fatal("test setup: the Service must have no transaction beginner")
+	}
+	target := seedJudgeTarget(t, env, userID, repoID, "claude", 9601)
+	env.exec(`INSERT INTO judge_skips (target_run_id, harness, reason) VALUES ($1, 'claude', 'no_usable_credential')`, target.ID)
+
+	svc.maybeEnqueueJudge(env.ctx, target)
+	noJudgeAnywhere(t, env, target.ID, "automatic enqueue without a beginner")
+	wantSkip(t, env, target.ID, "claude", JudgeSkipNoUsableCredential)
+
+	_, err := svc.RerunJudge(env.ctx, userID, false, target.ID)
+	if !errors.Is(err, errJudgeCreateRequiresTx) {
+		t.Fatalf("RerunJudge err = %v, want errJudgeCreateRequiresTx", err)
+	}
+	noJudgeAnywhere(t, env, target.ID, "rerun without a beginner")
+	wantSkip(t, env, target.ID, "claude", JudgeSkipNoUsableCredential)
+	if n := judgeSkipCount(t, env, target.ID); n != 1 {
+		t.Fatalf("judge_skips rows = %d, want the 1 pre-seeded row", n)
+	}
+}
