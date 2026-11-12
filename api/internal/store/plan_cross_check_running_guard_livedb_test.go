@@ -14,8 +14,10 @@ import (
 
 // Issue #4158: SetRunRunning's cross-check guard against a REAL Postgres, driven from the shared
 // fixture fixtures/cross-check-running-guard/cases.json. The same file drives the agent fake's
-// running rule (agent/test/fake-api-cross-check-running.test.ts), so the fake cannot accept a
-// running report the api refuses without one of the two suites going red.
+// running rule (agent/test/fake-api-cross-check-running.test.ts), so for the lane, approval-binding,
+// status and plan_md-payload axes the fixture names, the fake cannot accept a running report the
+// api refuses without one of the two suites going red. The fake does not model the payload's
+// milestones, required_tools or size_class.
 
 type runningGuardCase struct {
 	Name            string `json:"name"`
@@ -184,6 +186,19 @@ func TestCrossCheckRunningGuardLiveDB(t *testing.T) {
 			}
 			if rows != want {
 				t.Fatalf("SetRunRunning rows = %d, want %d", rows, want)
+			}
+			// Assert the persisted status, not only the row count: an accepted report must leave
+			// the row running, and a refused one must leave the case's starting status in place.
+			var got string
+			if err := f.pool.QueryRow(ctx, `SELECT status FROM runs WHERE id = $1`, f.runID).Scan(&got); err != nil {
+				t.Fatalf("read run status: %v", err)
+			}
+			wantStatus := c.Status
+			if c.ExpectApplied {
+				wantStatus = "running"
+			}
+			if got != wantStatus {
+				t.Fatalf("run status after SetRunRunning = %q, want %q", got, wantStatus)
 			}
 			ran++
 		})

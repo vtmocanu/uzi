@@ -621,6 +621,10 @@ export class FakeApi {
    *  ordinary one too under modelOrdinaryRunningRule) is modelled; any other claim keeps the fake's
    *  accept-everything behaviour. */
   registerClaim(claim: ClaimResponse): void {
+    // Keep the newest claim generation: RunRunner.execute registers before the runner's queued-
+    // duplicate gate, so an older claim must not replace a newer one's lane.
+    const prev = this.claimByRun.get(claim.run_id);
+    if (prev !== undefined && (prev.claim_generation ?? 0) > (claim.claim_generation ?? 0)) return;
     this.claimByRun.set(claim.run_id, claim);
     // The row's auto_approve is monotone true -> false (SetRunAwaitingApproval clears it): the
     // first claim seeds it, a later claim may only turn it off.
@@ -695,6 +699,9 @@ export class FakeApi {
     const model = this.crossCheckModel(runId);
     if (!model) return undefined;
     const status = this.rowStatusByRun.get(runId) ?? "claimed";
+    // SetRunRunning moves only a live source row (or keeps a running one); paused, queued and the
+    // other non-source statuses are refused whatever the approval state.
+    if (status !== "running" && !RUNNING_REPORT_SOURCES.has(status)) return status;
     return crossCheckRunningAdmitted(model, this.crossCheckApprovals(runId), status) ? undefined : status;
   }
 
