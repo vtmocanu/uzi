@@ -60,42 +60,62 @@ def read_json(path):
     return json.loads(raw, object_pairs_hook=pairs, parse_int=bounded_int)
 
 
-def margin_fraction(raw):
-    # agent/src/config.ts marginFraction: invalid or blank => 0.1.
-    try:
-        if raw is None or str(raw).strip() == "":
-            return 0.1
-        value = float(raw)
-        return value if math.isfinite(value) and 0 <= value < 1 else 0.1
-    except (ValueError, TypeError, OverflowError):
+def margin_fraction(raw, state):
+    # A fail-closed subset of JS Number syntax; runtime invalid fallback is not evidence.
+    require(state in ("set", "unset"))
+    if state == "unset":
+        require(raw is None)
         return 0.1
+    require(type(raw) is str and len(raw) <= 256)
+    # Accept only ASCII whitespace here; Python strip also accepts non-JS whitespace.
+    token = raw.strip(" \t\r\n\v\f")
+    require(token and re.fullmatch(
+        r"(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|"
+        r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)", token))
+    if token.lower().startswith(("0x", "0b", "0o")):
+        value = float(int(token, 0))
+    else:
+        value = float(token)
+    require(math.isfinite(value) and 0 <= value < 1)
+    return value
 
 
 def threshold(manifest, now):
-    require(set(manifest) == {"schema", "provenance", "observed_at", "threshold", "margin"})
-    require(manifest["schema"] == 1 and manifest["provenance"] == "live-worker-config")
+    require(set(manifest) == {"schema", "provenance", "observed_at", "threshold", "margin", "margin_state"})
+    require(type(manifest["schema"]) is int and manifest["schema"] == 2 and manifest["provenance"] == "live-worker-config")
     stamp, value = manifest["observed_at"], manifest["threshold"]
     require(type(stamp) in (float, int) and math.isfinite(stamp) and 0 <= now-stamp <= 300)
     require(type(value) in (float, int) and math.isfinite(value) and 0 < value <= 1)
-    margin = margin_fraction(manifest["margin"])
+    margin = margin_fraction(manifest["margin"], manifest["margin_state"])
     return value-margin if value-margin > 0 else value
 
 
-def child_env(private, mode, verified_path="/usr/bin:/bin", cacheprog=None):
+def child_env(private, mode, toolchain_path=None, cacheprog=None):
     """Empty allowlist; creates nothing, inherits nothing."""
-    require(mode in ("DiskCache", "CacheProg") and verified_path == "/usr/bin:/bin")
-    for part in verified_path.split(":"):
+    require(mode in ("DiskCache", "CacheProg"))
+    require(type(toolchain_path) is str and 0 < len(toolchain_path) <= 4096)
+    parts = toolchain_path.split(":")
+    require(len(parts) <= 32)
+    for part in parts:
+        require(part and not any(c.isspace() or ord(c) < 32 for c in part))
         p = Path(part)
-        require(p.is_dir() and not p.stat().st_mode & stat.S_IWOTH)
+        require(p.is_absolute() and ".." not in p.parts)
+        # Resolve /bin and similar links; constructor checks are not trust attestation.
+        require(p.is_dir() and not p.resolve().stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+    for name in ("go", "cc"):
+        selected = next((Path(part)/name for part in parts
+                         if (Path(part)/name).is_file() and os.access(Path(part)/name, os.X_OK)), None)
+        require(selected is not None)
+        require(not selected.resolve().stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH))
     private = scratch_path(private)
-    env = dict(PATH=verified_path, LANG="C.UTF-8", TZ="UTC", GOTOOLCHAIN="local",
+    env = dict(PATH=toolchain_path, LANG="C.UTF-8", TZ="UTC", GOTOOLCHAIN="local",
                GOMAXPROCS="2", GOENV="off", GOFLAGS="",
                GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
     for key, name in (("HOME", "home"), ("GOPATH", "gopath"), ("GOMODCACHE", "modules"),
                       ("GOCACHE", "cache"), ("GOTMPDIR", "gotmp"), ("TMPDIR", "tmp")):
         env[key] = str(scratch_path(str(private/name)))
     if mode == "CacheProg":
-        require(cacheprog is not None)
+        require(type(cacheprog) is str and re.fullmatch(r"/[A-Za-z0-9_./+-]+", cacheprog))
         env["GOCACHEPROG"] = str(scratch_path(cacheprog))
     else:
         require(cacheprog is None)
@@ -108,12 +128,19 @@ def headroom(charges, soft, statfs=os.statvfs):
     before EACH launch and independently prove enforcement covering every sink.
     """
     require(math.isfinite(soft) and 0 < soft <= 1 and set(charges) == set(SINKS))
+    for name in SINKS:
+        require(type(charges[name]["bytes"]) is int and charges[name]["bytes"] >= 0)
+    require(charges["retained"]["bytes"] >= LIMITS["retained"])
+    require(charges["staging"]["bytes"] >= LIMITS["staging"])
+    require(sum(charges[name]["bytes"] for name in SINKS
+                if name not in ("retained", "staging")) >= LIMITS["work_modules_output_logs"])
+    require(sum(charges[name]["bytes"] for name in SINKS) == LIMITS["aggregate"])
     devices = {}
     for name in SINKS:
         entry = charges[name]
         p = scratch_path(entry["path"])
         b, i = entry["bytes"], entry["inodes"]
-        require(type(b) is int and b >= 0 and type(i) is int and i >= 0)
+        require(type(b) is int and b >= 0 and type(i) is int and i > 0)
         s = statfs(p)
         require(s.f_blocks > 0 and s.f_files > 0 and s.f_frsize > 0)
         dev = p.stat().st_dev
@@ -124,10 +151,14 @@ def headroom(charges, soft, statfs=os.statvfs):
 
 
 class UnixHTTP(http.client.HTTPConnection):
+    def __init__(self, endpoint, **kwargs):
+        self.endpoint = endpoint
+        super().__init__("localhost", **kwargs)
+
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(2)
-        self.sock.connect(self.host)
+        self.sock.connect(self.endpoint)
 
 
 def docker_get(endpoint, route):
@@ -220,13 +251,17 @@ def report(args):
         except (ValueError, OSError, KeyError, TypeError, OverflowError, RecursionError,
                 http.client.HTTPException):
             legs[name] = leg("UNVERIFIED", "missing-invalid-or-unavailable")
-    observe("threshold", lambda: leg("PROVEN", "current-manifest-shape-only",
-                                    soft=threshold(read_json(args.manifest), time.time())))
-    observe("environment", lambda: leg("PROVEN", "empty-allowlist-construction-only",
-        keys=sorted(child_env(str(SCRATCH/"go-cache-admission-private"), "DiskCache"))))
-    observe("docker", lambda: leg("PROVEN", "endpoint-version-match-only")
-            if docker_get(args.endpoint, "/version")["Version"] == args.docker_version and args.docker_version
-            else leg("NEGATIVE", "endpoint-version-mismatch"))
+    observe("threshold", lambda: leg("UNVERIFIED", "unauthenticated-manifest-shape-only",
+                                    shape_valid=True, calculated_soft=threshold(read_json(args.manifest), time.time())))
+    observe("environment", lambda: leg("FIXTURE-PROVEN", "empty-allowlist-construction-only",
+        keys=sorted(child_env(str(SCRATCH/"go-cache-admission-private"), "DiskCache",
+                              getattr(args, "toolchain_path", None)))))
+    def docker():
+        require(type(args.docker_version) is str and bool(args.docker_version.strip()))
+        return (leg("PROVEN", "endpoint-version-match-only")
+                if docker_get(args.endpoint, "/version")["Version"] == args.docker_version
+                else leg("NEGATIVE", "endpoint-version-mismatch"))
+    observe("docker", docker)
     def image():
         require(re.fullmatch(r"sha256:[0-9a-f]{64}", args.image or ""))
         item = docker_get(args.endpoint, "/images/"+args.image+"/json")
@@ -235,8 +270,9 @@ def report(args):
         return leg("PROVEN", "local-image-id-and-repodigest-only")
     observe("image", image)
     def source():
+        require(re.fullmatch(r"[0-9a-fA-F]{64}", args.source_sha256 or ""))
         facts = inventory(args.go_root)
-        return leg("PROVEN", "installed-source-pin-only", **facts) if facts["sha256"] == args.source_sha256 else leg("NEGATIVE", "source-pin-mismatch")
+        return leg("PROVEN", "installed-source-pin-only", **facts) if facts["sha256"] == args.source_sha256.lower() else leg("NEGATIVE", "source-pin-mismatch")
     observe("source", source)
     legs["allocation"] = leg("UNVERIFIED", "no-independent-enforcement-contract-for-all-sinks")
     legs["headroom"] = leg("UNVERIFIED", "all-sink-charge-map-and-enforcement-unavailable")
@@ -244,7 +280,7 @@ def report(args):
     for name, size in (("handler", 269), ("workersvc", 576)):
         legs[name] = leg("UNVERIFIED", "resource-incompatible", owner_observed_archive_bytes=size*MIB)
     legs["protocol"] = leg("UNVERIFIED", "later-gated-protocol-and-producer-not-implemented")
-    return dict(schema=1, scope="fixture-only", milestone="M1-preflight",
+    return dict(schema=2, scope="fixture-only", milestone="M1-preflight",
                 producer_launched=False, production_authorized=False, ab_trigger=False,
                 experimental=args.experimental, limits=LIMITS, frozen=FROZEN, legs=legs)
 
@@ -259,6 +295,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experimental", action="store_true", help="allow incomplete preflight exit only; never launch")
     parser.add_argument("--manifest")
+    parser.add_argument("--toolchain-path")
     parser.add_argument("--endpoint", default="/var/run/docker.sock")
     parser.add_argument("--docker-version")
     parser.add_argument("--image")

@@ -16,8 +16,8 @@ python3 -B -m unittest discover -s e2e/go-cache-admission -v
 
 Default exit is 2 (prerequisites not established). Experimental exit is 0 for
 preflight inspection only, including unavailable prerequisites; consult every
-leg's status. Neither exit authorizes production. JSON schema 1 is fixture-only,
-ASCII escaped, at most 64 KiB, with PROVEN/NEGATIVE/UNVERIFIED per leg. Raw probe
+leg's status. Neither exit authorizes production. JSON schema 2 is fixture-only,
+ASCII escaped, at most 64 KiB, with PROVEN/FIXTURE-PROVEN/NEGATIVE/UNVERIFIED per leg. Raw probe
 responses, errors, environment values, and supplied input strings are not echoed.
 ANSI, controls and bidi characters are escaped by the JSON encoder. No inherited
 environment or proxy/config is passed to probes: Docker uses direct Unix-socket
@@ -34,6 +34,9 @@ All inputs are optional so unavailable prerequisites can be inspected:
 - `--go-root`: existing absolute installed Go tree without symlink ancestors.
   Reads VERSION and src; never executes its tools. `--source-sha256` must match
   the deterministic source inventory digest.
+- `--toolchain-path`: explicit bounded absolute directory list, with no default or
+  inherited PATH; for example /opt/uzi-toolchain/bin:/usr/bin:/bin when those
+  directories satisfy the constructor checks. Missing input leaves environment UNVERIFIED.
 - `--manifest`: absolute existing regular JSON file beneath this worktree's
   .uzi/scratch, without symlink components or parent traversal. Maximum 64 KiB;
   integer tokens at most 20 characters, duplicate keys rejected. Malformed or
@@ -42,16 +45,23 @@ All inputs are optional so unavailable prerequisites can be inspected:
 The nonsecret threshold manifest has exactly these keys:
 
 ```json
-{"schema":1,"provenance":"live-worker-config","observed_at":0,"threshold":0.8,"margin":"0.1"}
+{"schema":2,"provenance":"live-worker-config","observed_at":0,"threshold":0.8,"margin_state":"set","margin":"0.1"}
 ```
 
 Replace observed_at with the actual Unix observation time of current live
 configuration; the example is deliberately stale. Freshness is at most 300 seconds,
 future times are rejected. Threshold must be numeric finite (0,1], never missing
-or defaulted to 0.9. Margin follows agent config's finite [0,1) rule with invalid
-or blank values defaulting to 0.1. Positive threshold-minus-margin is soft;
+or defaulted to 0.9. Margin requires explicit margin_state "set" or "unset". Unset requires JSON null
+margin and alone selects default 0.1. Set requires a nonblank string with finite
+[0,1) value, using decimal/exponent or unsigned 0x/0b/0o numeric syntax with
+ASCII surrounding whitespace only; underscores
+are rejected. This is intentionally stricter than agent config.ts's JS Number
+conversion and invalid-value fallback to 0.1; it does not claim full parser parity.
+Schema 1, missing state, implicit null/blank, bad states, and invalid numbers fail closed. Positive threshold-minus-margin is soft;
 otherwise soft is threshold. Provenance is an asserted source label, not
-authenticated proof of live worker configuration. Never put secrets in inputs.
+authenticated proof of live worker configuration. A wellformed manifest emits
+UNVERIFIED with shape_valid and calculated_soft facts; the label never proves
+live configuration. Never put secrets in inputs.
 
 The source digest starts with VERSION bytes, then sorted depth-first src file
 relative path, NUL, contents, NUL. Facts include file count, content bytes,
@@ -66,7 +76,9 @@ Docker body reads are capped at 64 KiB with two-second socket waits and a
 five-second body deadline; HTTP parsing also uses Python's finite header limits.
 Daemon version matching proves only endpoint identity observations.
 Image matching proves only local metadata, not runtime use or quotas.
-No arbitrary response fields are emitted. No connection is attempted in tests.
+No arbitrary response fields are emitted. A bounded local AF_UNIX HTTP stub tests both fixed routes and Host: localhost;
+this is a new local stub test, not a Docker or Go experiment. The connection
+endpoint is separate from the fixed HTTP host.
 
 ## Gates intentionally still closed
 
@@ -75,17 +87,27 @@ no quota flag, user-manifest assertion, or Docker-availability bypass. A later
 implementation needs independently verifiable enforcement covering home,
 GOPATH, modules, cache, Go temp, temp, work, output, logs, retained and staging,
 including bytes and inodes. `headroom` is a pure admission calculation seam:
-it requires all named sink charges, re-samples statvfs on every call, sums
+it requires all named sink charges and positive separately declared inode charges.
+Retained and staging must cover their frozen shares, remaining sinks together
+must cover the work share, and total bytes must equal exactly the approved 2 GiB.
+Metadata must fit within those shares; it cannot increase the ceiling.
+There is no known hard inode cap: inode calculations remain UNVERIFIED as live
+admission evidence. The helper re-samples statvfs on every call, sums
 projections per device and requires both projected usage fractions strictly
 below soft. It is not allocation enforcement. Later potential producing
 launches must call it immediately before every launch; M1 has none.
 
 The child environment builder creates nothing. It starts from an empty mapping,
-checks the fixed /usr/bin:/bin directories exist and are not world writable, and
+requires an explicit PATH (at most 4096 characters and 32 directories), checks
+absolute directory components and resolved targets for group/world write access,
+and deterministically finds the first executable regular go and cc files on that
+PATH (also rejecting group/world writable resolved files). /bin symlinks are allowed.
+These checks do not attest executable trust, image identity, or actual children.
+It emits only FIXTURE-PROVEN construction evidence when successful, and
 supplies only PATH, LANG=C.UTF-8, TZ=UTC, private scratch HOME/GOPATH/GOMODCACHE/
 GOCACHE/GOTMPDIR/TMPDIR, GOTOOLCHAIN=local, GOMAXPROCS=2, GOENV=off,
 GOFLAGS="", and GIT_CONFIG_GLOBAL/SYSTEM=/dev/null. DiskCache omits GOCACHEPROG;
-CacheProg explicitly requires a scratch path. Private directory provisioning,
+CacheProg explicitly requires a scratch path without whitespace or shell quoting. Private directory provisioning,
 executable trust, permissions and actual launch confinement remain later gates.
 
 Frozen constants/schema are in preflight.py: aggregate 2 GiB = retained 768 MiB +
@@ -106,5 +128,11 @@ near-threshold=5% remain frozen.
 Tests use only bounded fixtures in owned temporary directories beneath
 .uzi/scratch, with cleanup limited to their own directory. They exercise public
 functions with injected statfs/Docker observations, without launching any child.
-No live endpoint, Go workload, protocol producer, A/B experiment, full-stack or
+No live Docker endpoint, Go workload, protocol producer, A/B experiment, full-stack or
 repo-wide gate has been validated by these tests.
+
+The local socket stub uses two accepts, bounded request bytes, socket timeouts
+and a bounded join on a non-daemon thread, with socket/directory closure. Fixture
+setup creates root scratch before temporary directories, including in a fresh
+checkout. Tests never execute the fake go/cc files. All allocation/quota authority,
+actual child confinement and hard inode enforcement remain UNVERIFIED.

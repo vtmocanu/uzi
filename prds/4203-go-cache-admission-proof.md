@@ -95,6 +95,32 @@ No agent/** change was made by the scaffold units, so check:agent was not applic
 The full suite remains pending applicable exact-head CI; no pass is claimed.
 No repo-wide gate or producing validation is part of this M4 documentation work.
 
+## Single repair pass and remaining uncertainty
+
+The evidence-only delivery includes scaffold correctness repairs, not completion
+of M1, M2 or M3. Its focused tests are wired through test:go-cache-preflight in
+gate:repo; no workflow or producing job is added. Historical nine-test results above
+describe the earlier scaffold revision, not this repair's expanded suite.
+Repair verification is recorded in the delivery metadata with the committed range.
+
+The Unix-socket probe now uses a fixed HTTP host separate from its socket path.
+Missing operator expectations are UNVERIFIED. A syntactically valid threshold
+manifest remains unauthenticated and UNVERIFIED; an environment construction test
+establishes at most FIXTURE-PROVEN. Explicit unset-margin provenance is required
+for defaulting; invalid set values are rejected. Declared headroom charges must
+cover the unchanged complete byte ceiling; this still supplies no enforcement
+proof. Toolchain PATH selection is an explicit input, not inherited configuration.
+
+No bounded container posture was trialled, and the absence of an allocation
+contract does not prove that a compatible environment is impossible. Docker CLI
+reachability in the inventory was a separate read-only observation; local Unix
+socket stubs validate harness requests without contacting a Docker daemon.
+Image/source binding, live threshold provenance, actual child effects, protocol,
+unchanged cleanup, admission, producer comparisons, race builds, warm reuse and
+Docker aliases remain UNVERIFIED/not reached. These gaps are outside this
+nonclosing evidence delivery; no safety criterion is silently treated as passed.
+Exact-head PR CI remains pending and is not established by local checks.
+
 ## Proposed decision delta and smallest next step
 
 A-first consideration records a possible cooperative Go cache admission approach;
