@@ -76,9 +76,18 @@ function parseFile(text: string): Map<string, OpEntry> {
   return out;
 }
 
+/** Thrown by `markSending` when the write-ahead could not be made durable. `neverSent` is true only
+ *  when the ledger was readable and positively showed no prior entry for the op. */
+class WriteAheadError extends Error {
+  constructor(readonly neverSent: boolean, cause: unknown) {
+    super("credential switch ledger: write-ahead failed", { cause });
+  }
+}
+
 export class CredentialSwitchOpLedger {
   private readonly dir: string;
   private readonly cache = new Map<string, Map<string, OpEntry>>();
+  private readonly chains = new Map<string, Promise<void>>();
   private dirSynced = false;
   private tmpSeq = 0;
 
@@ -87,6 +96,16 @@ export class CredentialSwitchOpLedger {
   }
 
   private fileFor(runId: string): string { return path.join(this.dir, `${safeId("run id", runId)}.json`); }
+
+  /** Serialize every load+mutate+persist of one run: a promise chain per run id. */
+  private withLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.chains.get(runId) ?? Promise.resolve();
+    const result = prev.then(fn);
+    const tail = result.then(() => undefined, () => undefined);
+    this.chains.set(runId, tail);
+    void tail.then(() => { if (this.chains.get(runId) === tail) this.chains.delete(runId); });
+    return result;
+  }
 
   /** Load a run's entries (cached). Any `sending` entry is a send whose outcome was never recorded:
    *  it becomes `ambiguous` in memory here and is made durable by the next write (see `markSending`). */
@@ -127,64 +146,86 @@ export class CredentialSwitchOpLedger {
    */
   async markSending(runId: string, opId: string, generation: number): Promise<{ wasAmbiguous: boolean }> {
     safeId("op id", opId);
-    const entries = await this.load(runId);
-    const prior = entries.get(opId);
-    // `sending` here means an earlier send in this process never recorded its outcome.
-    const wasAmbiguous = prior?.state === "ambiguous" || prior?.state === "sending";
-    const previous = new Map([...entries].map(([k, v]) => [k, { ...v }] as const));
-    entries.set(opId, wasAmbiguous ? { ...prior, generation, state: "ambiguous" } : { generation, state: "sending" });
-    try {
-      await this.persist(runId, entries);
-    } catch (err) {
-      this.cache.set(runId, previous);
-      throw err;
-    }
-    return { wasAmbiguous };
+    this.fileFor(runId); // validates the run id before anything is locked or read
+    return this.withLock(runId, async () => {
+      let entries: Map<string, OpEntry>;
+      try { entries = await this.load(runId); }
+      catch (err) { throw new WriteAheadError(false, err); }
+      const prior = entries.get(opId);
+      // Only "no entry" and a proven clean route_absent are clean. `sending` means an earlier send
+      // never recorded its outcome; `settled` means the op got a definite answer once already.
+      const wasAmbiguous = prior !== undefined && prior.state !== "clean_route_absent";
+      const previous = new Map([...entries].map(([k, v]) => [k, { ...v }] as const));
+      if (prior?.state === "settled") entries.set(opId, { ...prior, generation });
+      else entries.set(opId, wasAmbiguous ? { ...prior, generation, state: "ambiguous" } : { generation, state: "sending" });
+      try {
+        await this.persist(runId, entries);
+      } catch (err) {
+        this.cache.set(runId, previous);
+        throw new WriteAheadError(prior === undefined, err);
+      }
+      return { wasAmbiguous };
+    });
   }
 
-  /** Record the post-response state. Throws when it cannot be made durable. */
-  async record(runId: string, opId: string, state: Exclude<OpState, "sending">, outcome?: string): Promise<void> {
-    const entries = await this.load(runId);
-    const prior = entries.get(opId);
-    if (!prior) throw new Error("credential switch ledger: no entry to record");
-    const previous = new Map([...entries].map(([k, v]) => [k, { ...v }] as const));
-    entries.set(opId, { generation: prior.generation, state, ...(outcome !== undefined ? { outcome } : {}) });
-    try {
-      await this.persist(runId, entries);
-    } catch (err) {
-      this.cache.set(runId, previous);
-      throw err;
-    }
+  /**
+   * Record the post-response state and return the state actually stored. Monotonic under the run
+   * lock: a `settled` entry is never degraded, and an `ambiguous` one never becomes
+   * `clean_route_absent`. Throws when the change cannot be made durable.
+   */
+  async record(runId: string, opId: string, state: Exclude<OpState, "sending">, outcome?: string): Promise<OpState> {
+    return this.withLock(runId, async () => {
+      const entries = await this.load(runId);
+      const prior = entries.get(opId);
+      if (!prior) throw new Error("credential switch ledger: no entry to record");
+      if (state !== "settled" && (prior.state === "settled" || (state === "clean_route_absent" && prior.state === "ambiguous")))
+        return prior.state;
+      const previous = new Map([...entries].map(([k, v]) => [k, { ...v }] as const));
+      entries.set(opId, { generation: prior.generation, state, ...(outcome !== undefined ? { outcome } : {}) });
+      try {
+        await this.persist(runId, entries);
+      } catch (err) {
+        this.cache.set(runId, previous);
+        throw err;
+      }
+      return state;
+    });
   }
 
   /** The current in-memory/disk state of an op, for diagnostics and tests. */
   async stateOf(runId: string, opId: string): Promise<OpEntry | undefined> {
-    const e = (await this.load(runId)).get(opId);
-    return e ? { ...e } : undefined;
+    return this.withLock(runId, async () => {
+      const e = (await this.load(runId)).get(opId);
+      return e ? { ...e } : undefined;
+    });
   }
 
   /** Drop entries from generations older than `generation`. */
   async pruneGenerationsBelow(runId: string, generation: number): Promise<void> {
-    const entries = await this.load(runId);
-    const previous = new Map([...entries].map(([k, v]) => [k, { ...v }] as const));
-    let changed = false;
-    for (const [opId, e] of entries) if (e.generation < generation) { entries.delete(opId); changed = true; }
-    if (!changed) return;
-    try {
-      await this.persist(runId, entries);
-    } catch (err) {
-      this.cache.set(runId, previous);
-      throw err;
-    }
+    return this.withLock(runId, async () => {
+      const entries = await this.load(runId);
+      const previous = new Map([...entries].map(([k, v]) => [k, { ...v }] as const));
+      let changed = false;
+      for (const [opId, e] of entries) if (e.generation < generation) { entries.delete(opId); changed = true; }
+      if (!changed) return;
+      try {
+        await this.persist(runId, entries);
+      } catch (err) {
+        this.cache.set(runId, previous);
+        throw err;
+      }
+    });
   }
 
   /** Remove the run's ledger file and make the removal durable. */
   async cleanup(runId: string): Promise<void> {
     const file = this.fileFor(runId);
-    this.cache.delete(runId);
-    await this.fs.rm(file);
-    await this.fs.fsyncDir(this.dir).catch((err: unknown) => {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    return this.withLock(runId, async () => {
+      this.cache.delete(runId);
+      await this.fs.rm(file);
+      await this.fs.fsyncDir(this.dir).catch((err: unknown) => {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      });
     });
   }
 }
@@ -192,10 +233,16 @@ export class CredentialSwitchOpLedger {
 export type LedgerApplyResult = CredentialSwitchApplyResult | { kind: "ledger_unavailable" };
 
 /**
- * Write-ahead -> send -> record -> final classification. `ledger_unavailable` means the write-ahead
- * failed and NOTHING was sent: the runner treats it as proven not-applied. After a send a ledger
- * failure never turns a definite answer into a guess, except that a `route_absent` whose clean
- * state cannot be recorded is reported `uncertain`.
+ * Write-ahead -> send -> record -> final classification. When the write-ahead fails NOTHING is sent,
+ * and the result is:
+ *  - `ledger_unavailable` ONLY when the ledger positively shows the op was never sent before (file
+ *    readable, no prior entry for the op) or the run/op id is invalid so nothing can be on disk:
+ *    the runner may treat that as proven not-applied.
+ *  - `uncertain` when a prior entry exists (ambiguous, sending or settled) or the file cannot be
+ *    read or parsed: a possibly-committed op cannot be told from a never-sent one.
+ * After a send a ledger failure never turns a definite answer into a guess, except that a
+ * `route_absent` that is not recorded as clean (a prior or concurrent ambiguous or settled state,
+ * or a failed write) is reported `uncertain`.
  */
 export async function applyThroughLedger(
   client: { applyCredentialSwitch(runId: string, req: CredentialSwitchApplyRequest): Promise<CredentialSwitchApplyResult> },
@@ -206,7 +253,8 @@ export async function applyThroughLedger(
   let wasAmbiguous: boolean;
   try {
     ({ wasAmbiguous } = await ledger.markSending(runId, req.opId, req.claimGeneration));
-  } catch {
+  } catch (err) {
+    if (err instanceof WriteAheadError && !err.neverSent) return { kind: "uncertain", detail: "ledger_unavailable_prior_state_unknown" };
     return { kind: "ledger_unavailable" };
   }
   const result = await client.applyCredentialSwitch(runId, req);
@@ -220,7 +268,10 @@ export async function applyThroughLedger(
         return { kind: "uncertain", detail: "route_absent_after_ambiguous_send" };
       }
       try {
-        await ledger.record(runId, req.opId, "clean_route_absent", "route_absent");
+        // The stored state may differ from the request: another send of this op may have turned
+        // it ambiguous or settled while this one was in flight.
+        const stored = await ledger.record(runId, req.opId, "clean_route_absent", "route_absent");
+        if (stored !== "clean_route_absent") return { kind: "uncertain", detail: "route_absent_after_ambiguous_send" };
       } catch {
         return { kind: "uncertain", detail: "ledger_record_failed" };
       }

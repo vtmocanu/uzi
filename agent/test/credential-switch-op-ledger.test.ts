@@ -156,13 +156,97 @@ describe("credential switch op ledger", () => {
     await new CredentialSwitchOpLedger(dir).cleanup("never-seen");
   });
 
-  it("a corrupt ledger file or an unsafe run id is unavailable, never sent", async () => {
+  it("a corrupt or unreadable ledger file is uncertain and an unsafe run id is unavailable, never sent", async () => {
     const dir = tmp();
     fs.mkdirSync(path.join(dir, "credential-switch-ops"));
     fs.writeFileSync(ledgerFile(dir), "{not json");
     const log: string[] = [];
-    assert.equal((await applyThroughLedger(fakeClient(log, { kind: "superseded" }), new CredentialSwitchOpLedger(dir), RUN, REQ)).kind, "ledger_unavailable");
+    assert.equal((await applyThroughLedger(fakeClient(log, { kind: "superseded" }), new CredentialSwitchOpLedger(dir), RUN, REQ)).kind, "uncertain");
+    const unreadable = new CredentialSwitchOpLedger(dir, spyFs([], { async readFile() { throw new Error("eio"); } }));
+    assert.equal((await applyThroughLedger(fakeClient(log, { kind: "superseded" }), unreadable, RUN, REQ)).kind, "uncertain");
     assert.equal((await applyThroughLedger(fakeClient(log, { kind: "superseded" }), new CredentialSwitchOpLedger(dir), "../evil", REQ)).kind, "ledger_unavailable");
     assert.ok(!log.includes("SEND"));
+  });
+
+  it("a failed write-ahead for an op already ambiguous or settled is uncertain, not unavailable", async () => {
+    for (const first of [{ kind: "uncertain", detail: "x" }, { kind: "superseded" }] as CredentialSwitchApplyResult[]) {
+      const dir = tmp();
+      await applyThroughLedger(fakeClient([], first), new CredentialSwitchOpLedger(dir), RUN, REQ);
+      const log: string[] = [];
+      const failing = new CredentialSwitchOpLedger(dir, spyFs(log, { async writeFileSynced() { throw new Error("ENOSPC"); } }));
+      const out = await applyThroughLedger(fakeClient(log, { kind: "superseded" }), failing, RUN, REQ);
+      assert.equal(out.kind, "uncertain", first.kind);
+      assert.ok(!log.includes("SEND"));
+    }
+  });
+
+  it("a settled op re-sent and answered route_absent is uncertain and stays settled", async () => {
+    const dir = tmp();
+    const ledger = new CredentialSwitchOpLedger(dir);
+    await applyThroughLedger(fakeClient([], { kind: "refused_committed", reason: "r" }), ledger, RUN, REQ);
+    const out = await applyThroughLedger(fakeClient([], { kind: "route_absent" }), ledger, RUN, REQ);
+    assert.equal(out.kind, "uncertain");
+    assert.equal(onDisk(dir)["op-1"].state, "settled");
+    assert.equal(onDisk(dir)["op-1"].outcome, "refused_committed");
+  });
+
+  it("concurrent sends of one op: a slow route_absent never overrides a fast uncertain", async () => {
+    const dir = tmp();
+    const ledger = new CredentialSwitchOpLedger(dir);
+    const delayed = (ms: number, result: CredentialSwitchApplyResult) => ({
+      async applyCredentialSwitch(): Promise<CredentialSwitchApplyResult> {
+        await new Promise(r => setTimeout(r, ms));
+        return result;
+      },
+    });
+    const [a, b] = await Promise.all([
+      applyThroughLedger(delayed(100, { kind: "route_absent" }), ledger, RUN, REQ),
+      applyThroughLedger(delayed(5, { kind: "uncertain", detail: "x" }), ledger, RUN, REQ),
+    ]);
+    assert.equal(a.kind, "uncertain");
+    assert.equal(b.kind, "uncertain");
+    assert.equal(onDisk(dir)["op-1"].state, "ambiguous");
+  });
+
+  it("concurrent first loads share one map, so no op is lost", async () => {
+    const dir = tmp();
+    let reads = 0;
+    const ledger = new CredentialSwitchOpLedger(dir, spyFs([], {
+      async readFile(file) {
+        const n = reads++;
+        const text = await defaultLedgerFs.readFile(file);
+        await new Promise(r => setTimeout(r, n === 0 ? 60 : 1));
+        return text;
+      },
+    }));
+    await Promise.all([ledger.markSending(RUN, "op-1", 1), ledger.markSending(RUN, "op-2", 1)]);
+    assert.deepEqual(Object.keys(onDisk(dir)).sort(), ["op-1", "op-2"]);
+  });
+
+  it("concurrent persists land in order: every resolved write-ahead is on disk", async () => {
+    const dir = tmp();
+    let writes = 0;
+    const ledger = new CredentialSwitchOpLedger(dir, spyFs([], {
+      async writeFileSynced(file, data) {
+        const n = writes++;
+        if (n === 1) await new Promise(r => setTimeout(r, 60)); // write 0 is the warm-up; op-1's is the slow one
+        await defaultLedgerFs.writeFileSynced(file, data);
+      },
+    }));
+    await ledger.markSending(RUN, "warm", 1); // loads the run and syncs the directory once
+    await Promise.all([ledger.markSending(RUN, "op-1", 1), ledger.markSending(RUN, "op-2", 1)]);
+    assert.deepEqual(Object.keys(onDisk(dir)).sort(), ["op-1", "op-2", "warm"]);
+  });
+
+  it("real fs adapter: write-ahead then reload round-trip in an OS tmpdir", async () => {
+    const dir = tmp();
+    const first = new CredentialSwitchOpLedger(dir, defaultLedgerFs);
+    assert.deepEqual(await first.markSending(RUN, "op-1", 3), { wasAmbiguous: false });
+    assert.equal(onDisk(dir)["op-1"].state, "sending");
+    assert.equal(fs.statSync(ledgerFile(dir)).mode & 0o777, 0o600);
+    assert.deepEqual(fs.readdirSync(path.join(dir, "credential-switch-ops")), [`${RUN}.json`]);
+    const reloaded = new CredentialSwitchOpLedger(dir, defaultLedgerFs);
+    assert.deepEqual(await reloaded.stateOf(RUN, "op-1"), { generation: 3, state: "ambiguous" });
+    assert.deepEqual(await reloaded.markSending(RUN, "op-1", 3), { wasAmbiguous: true });
   });
 });
