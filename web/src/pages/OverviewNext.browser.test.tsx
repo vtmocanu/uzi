@@ -13,6 +13,7 @@ import { healthySilentDoc, overviewNextDoc } from "../mocks/data";
 import { overviewNextOwnerWorkers } from "../mocks/data/overviewNext";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 import { useAuth } from "../auth/AuthContext";
+import { CommandMenuContext } from "../components/CommandMenuContext";
 
 // PRD #3878 M3: the preview's cards stack and never scroll sideways on a phone. Layout
 // needs a real engine, so this runs in Chromium; jsdom cannot see an overflow.
@@ -1479,7 +1480,14 @@ describe("OverviewNext health chip popover", () => {
         <MemoryRouter initialEntries={["/overview/next"]}>
           <div style={{ paddingLeft: 240 }}>
             <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
-              <OverviewNext />
+              {/* AppShell's content column, and the Search button (rendered only with a command
+                  menu), both push the chip right as in production; without them the old
+                  viewport-only floor never right-aligns over the sidebar and the case is vacuous. */}
+              <div className="mx-auto w-full max-w-[68rem]">
+                <CommandMenuContext.Provider value={{ open: () => {} }}>
+                  <OverviewNext />
+                </CommandMenuContext.Provider>
+              </div>
             </main>
           </div>
         </MemoryRouter>,
@@ -1501,7 +1509,7 @@ describe("OverviewNext health chip popover", () => {
     await userEvent.click(chip);
     const dialog = await screen.findByRole("dialog", { name: "System health" });
     await page.viewport(700, 900);
-    // At 700 the panel (640 wide) can only sit in [16, 44]: poll until it has been re-placed there.
+    // At 700 the panel (640 wide) must stay inside the viewport; the 500 step below proves re-placement.
     await expect
       .poll(() => {
         const r = dialog.getBoundingClientRect();
