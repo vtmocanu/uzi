@@ -792,7 +792,8 @@ uzi version
   (`worker_memory_pressure`, `worker_requeue_exhausted`, `codex_account_unavailable`, the
   `retained_*` causes, a pending policy outcome, or the NULL-retry `data_volume_full` /
   `forge_unreachable` / `codex_idle_stall` holds): it is refused (409, exit 5) with the hold
-  named and nothing written. Release it with `uzi run resume` or `uzi run cancel`;
+  named and nothing written. Inspect the run's recovery options: Resume may re-hold it;
+  Cancel ends the run;
   **running, or held at a gate/question/follow-up, on a worker that
   advertises the `credential_switch` capability** — the switch is only **requested**, not
   yet applied: the server signals it to the worker, which finishes quiescing and
