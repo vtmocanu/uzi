@@ -2111,23 +2111,66 @@ func parseCommaList(raw string) []string {
 	return out
 }
 
+// normalizeAllowlistEntry validates one allowlist entry strictly and returns it as
+// https://host[:port]. Unlike NormalizeForgeBaseURL, which strips, it REFUSES an entry
+// carrying userinfo, a path (other than a lone trailing slash), a query or a fragment,
+// so an operator typo such as https://tracker.example.com@evil.example.com can never be
+// silently reduced to a different host. pos is the 1-based position among the non-empty
+// entries. The returned error never contains the entry or any part of it, since an entry
+// may embed credentials.
+func normalizeAllowlistEntry(envName string, pos int, entry string) (string, error) {
+	refuse := func(reason string) (string, error) {
+		return "", fmt.Errorf("%s: entry %d: %s", envName, pos, reason)
+	}
+	const userinfo = "contains userinfo (user@ or user:password@ before the host); list the bare https://host[:port]"
+	if strings.Contains(entry, "@") {
+		return refuse(userinfo)
+	}
+	u, err := url.Parse(entry)
+	if err != nil {
+		return refuse("is not a valid URL")
+	}
+	if u.User != nil {
+		return refuse(userinfo)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return refuse("must use https")
+	}
+	if u.Host == "" || u.Opaque != "" {
+		return refuse("must be an absolute https URL with a host")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return refuse("has a path; only https://host[:port] with an optional trailing / is allowed")
+	}
+	if u.RawQuery != "" || u.ForceQuery || strings.Contains(entry, "?") {
+		return refuse("has a query")
+	}
+	if u.Fragment != "" || strings.Contains(entry, "#") {
+		return refuse("has a fragment")
+	}
+	return "https://" + strings.ToLower(u.Host), nil
+}
+
 // parseAllowedBaseURLs parses the comma-separated SSRF allowlist. Every entry
-// must be an absolute https URL; it is normalized to scheme://host[:port] with
-// no path or trailing slash so comparisons against a connection's base_url are
-// exact. An empty list or any non-https/malformed entry is a hard error — an
-// empty allowlist would silently forbid all connections, and a plain-http entry
-// would defeat the guard.
+// must be an absolute https URL of the bare form https://host[:port] (one trailing
+// slash tolerated); it is normalized to that form so comparisons against a
+// connection's base_url are exact. An entry with userinfo, a path, a query or a
+// fragment is refused, not stripped (normalizeAllowlistEntry). An empty list or any
+// non-https/malformed entry is a hard error — an empty allowlist would silently
+// forbid all connections, and a plain-http entry would defeat the guard.
 func parseAllowedBaseURLs(raw string) ([]string, error) {
 	var out []string
 	seen := map[string]struct{}{}
+	pos := 0
 	for _, part := range strings.Split(raw, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
-		norm, err := NormalizeForgeBaseURL(part)
+		pos++
+		norm, err := normalizeAllowlistEntry("FORGE_ALLOWED_BASE_URLS", pos, part)
 		if err != nil {
-			return nil, fmt.Errorf("FORGE_ALLOWED_BASE_URLS: %w", err)
+			return nil, err
 		}
 		if _, dup := seen[norm]; dup {
 			continue
@@ -2175,8 +2218,9 @@ func (c Config) ForgeBaseURLAllowed(raw string) bool {
 
 // parseAgentSourceAllowedBaseURLs parses the SEPARATE agent-source SSRF allowlist
 // (PRD #602 M2). Like parseAllowedBaseURLs, every PRESENT entry must be an absolute
-// https URL, normalized (scheme+host) via NormalizeForgeBaseURL and deduped, and a
-// non-https/malformed entry is a hard boot error (fail-closed on malformed). The
+// https URL, normalized to https://host[:port] via normalizeAllowlistEntry and deduped, and a
+// non-https/malformed entry, or one with userinfo, a path, a query or a fragment, is a
+// hard boot error (refused, not stripped; fail-closed on malformed). The
 // CRITICAL difference from parseAllowedBaseURLs: an EMPTY list is TOLERATED and
 // returns nil — the agent-source feature is off by default, so an unconfigured
 // instance must still boot. Nothing is allowed until the list is configured, which
@@ -2186,20 +2230,23 @@ func parseAgentSourceAllowedBaseURLs(raw string) ([]string, error) {
 }
 
 // parseBaseURLAllowlist is the shared parser of the optional (may-be-empty) https base-URL
-// allowlists: every present entry is normalized via NormalizeForgeBaseURL and deduped, a
-// non-https or malformed entry is a hard boot error naming envName, and an empty list returns nil
+// allowlists: every present entry is normalized via normalizeAllowlistEntry and deduped, a
+// non-https or malformed entry, or one with userinfo, a path, a query or a fragment (refused,
+// not stripped), is a hard boot error naming envName, and an empty list returns nil
 // (feature off).
 func parseBaseURLAllowlist(envName, raw string) ([]string, error) {
 	var out []string
 	seen := map[string]struct{}{}
+	pos := 0
 	for _, part := range strings.Split(raw, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
-		norm, err := NormalizeForgeBaseURL(part)
+		pos++
+		norm, err := normalizeAllowlistEntry(envName, pos, part)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", envName, err)
+			return nil, err
 		}
 		if _, dup := seen[norm]; dup {
 			continue
