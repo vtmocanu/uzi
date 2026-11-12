@@ -97,6 +97,14 @@ class PreflightTests(unittest.TestCase):
             inv.assert_not_called()
             for key in ("docker", "source", "environment"):
                 self.assertEqual(result["legs"][key]["status"], "UNVERIFIED")
+        args.image = "sha256:"+"c"*64
+        for digest in (None, "", "invalid"):
+            args.repo_digest = digest
+            with patch.object(p, "docker_get") as get:
+                result = p.report(args)
+            get.assert_not_called()
+            self.assertEqual(result["legs"]["image"]["status"], "UNVERIFIED")
+        args.image = None
         args.docker_version = "expected"
         args.source_sha256 = "a"*64
         with patch.object(p, "docker_get", return_value={"Version": "other"}), patch.object(

@@ -264,9 +264,9 @@ def report(args):
     observe("docker", docker)
     def image():
         require(re.fullmatch(r"sha256:[0-9a-f]{64}", args.image or ""))
+        require(re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", args.repo_digest or ""))
         item = docker_get(args.endpoint, "/images/"+args.image+"/json")
         require(item["Id"] == args.image and args.repo_digest in item["RepoDigests"])
-        require(re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", args.repo_digest or ""))
         return leg("PROVEN", "local-image-id-and-repodigest-only")
     observe("image", image)
     def source():

@@ -99,8 +99,8 @@ launches must call it immediately before every launch; M1 has none.
 
 The child environment builder creates nothing. It starts from an empty mapping,
 requires an explicit PATH (at most 4096 characters and 32 directories), checks
-absolute directory components and resolved targets for group/world write access,
-and deterministically finds the first executable regular go and cc files on that
+that each PATH entry is absolute and checks its final resolved directory for
+group/world write access (ancestor directories are not checked), and deterministically finds the first executable regular go and cc files on that
 PATH (also rejecting group/world writable resolved files). /bin symlinks are allowed.
 These checks do not attest executable trust, image identity, or actual children.
 It emits only FIXTURE-PROVEN construction evidence when successful, and

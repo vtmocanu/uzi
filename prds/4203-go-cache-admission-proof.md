@@ -121,6 +121,17 @@ Docker aliases remain UNVERIFIED/not reached. These gaps are outside this
 nonclosing evidence delivery; no safety criterion is silently treated as passed.
 Exact-head PR CI remains pending and is not established by local checks.
 
+Local repair timing: task test:go-cache-preflight passed 16 tests in 0.081 seconds,
+with 0.436 seconds wall time including Task/Python startup in one local run.
+Before wiring, gate:repo did not invoke this suite; the historical standalone
+nine-test run took 0.052 seconds and is not a paired CI timing baseline.
+The change adds one nonproducing suite invocation to the existing gate, not a new
+CI job. Successful socket tests use readiness and bounded I/O rather than sleeps;
+failure-path socket timeouts and a five-second join bound limit the owned stub.
+Affected CI step/job before-and-after, queue/cache effects and critical-path impact
+remain unmeasured. These local observations are not cache-workload performance
+evidence or permission to revise frozen experiment criteria.
+
 ## Proposed decision delta and smallest next step
 
 A-first consideration records a possible cooperative Go cache admission approach;
