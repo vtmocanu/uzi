@@ -299,6 +299,27 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 /etc/uzi/ca
 {{- end -}}
 
+{{- define "uzi.controllerWorkerExtraCADir" -}}
+/etc/uzi/worker-extra-ca
+{{- end -}}
+
+{{- /*
+  uzi.workerExtraCAConfigMap: the ConfigMap holding workers.extraCA, or empty when no
+  extra CA is configured. Inline pem wins a chart-owned name; both set is refused.
+*/ -}}
+{{- define "uzi.workerExtraCAConfigMap" -}}
+{{- $ca := .Values.workers.extraCA | default dict -}}
+{{- $cm := $ca.configMap | default dict -}}
+{{- if and $ca.pem $cm.name -}}
+{{- fail "workers.extraCA: set pem OR configMap.name, not both" -}}
+{{- end -}}
+{{- if $ca.pem -}}
+{{- printf "%s-worker-extra-ca" (include "uzi.fullname" .) -}}
+{{- else if $cm.name -}}
+{{- $cm.name -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "uzi.controllerFetcherCADir" -}}
 /etc/uzi/fetcher-ca
 {{- end -}}

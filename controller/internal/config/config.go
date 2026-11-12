@@ -88,6 +88,12 @@ type Config struct {
 	// stays verbatim.
 	APICAPEM []byte
 
+	// WorkerExtraCAPEM is an operator-supplied CA bundle (UZI_WORKER_EXTRA_CA_FILE) that
+	// workers trust ON TOP of the api's CA, for private-CA hosts a worker talks to: an
+	// LLM gateway, a self-hosted forge, a package mirror. It rides the same per-worker
+	// Secret entry as APICAPEM (appended, never replacing it). Empty means none.
+	WorkerExtraCAPEM []byte
+
 	// --- the worker namespace (M3) --------------------------------------------
 	// Everything below describes the pods this controller renders. It is all
 	// operator config: the api sends NAMES and this side owns every mapping to a
@@ -456,6 +462,9 @@ func Load() (Config, error) {
 	}
 
 	if err := loadAPICA(&cfg); err != nil {
+		return Config{}, err
+	}
+	if err := loadWorkerExtraCA(&cfg); err != nil {
 		return Config{}, err
 	}
 	if err := loadWorkerSettings(&cfg); err != nil {
@@ -1041,6 +1050,25 @@ func loadAPICA(cfg *Config) error {
 	// Kept raw as well: the pool verifies THIS process's hop, the PEM is what gets
 	// relayed into each worker's Secret so the worker can verify its own.
 	cfg.APICAPEM = pem
+	return nil
+}
+
+// loadWorkerExtraCA reads the optional extra CA bundle relayed to workers next to the
+// api's CA. A file holding no PEM certificate is a boot error, as for UZI_API_CA_FILE:
+// the operator who set it expects workers to trust something.
+func loadWorkerExtraCA(cfg *Config) error {
+	path := strings.TrimSpace(os.Getenv("UZI_WORKER_EXTRA_CA_FILE"))
+	if path == "" {
+		return nil
+	}
+	pem, err := os.ReadFile(path) //nolint:gosec // G304: the path is operator config (UZI_WORKER_EXTRA_CA_FILE), not user input; reading the mounted CA bundle by its configured path is intended.
+	if err != nil {
+		return fmt.Errorf("UZI_WORKER_EXTRA_CA_FILE: read %s: %w", path, err)
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM(pem) {
+		return fmt.Errorf("UZI_WORKER_EXTRA_CA_FILE: %s contains no PEM certificate", path)
+	}
+	cfg.WorkerExtraCAPEM = pem
 	return nil
 }
 

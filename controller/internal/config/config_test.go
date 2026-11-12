@@ -686,6 +686,49 @@ func TestLoadKeepsTheCAPEMForRelayToWorkers(t *testing.T) {
 	}
 }
 
+// The extra CA is optional, kept raw for relay, and a file with no certificate in it
+// aborts boot rather than leaving workers trusting nothing new.
+func TestLoadWorkerExtraCA(t *testing.T) {
+	base := func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+	}
+	t.Run("kept raw for relay", func(t *testing.T) {
+		base(t)
+		pem := caPEM(t)
+		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", writeCA(t, pem))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if string(cfg.WorkerExtraCAPEM) != string(pem) {
+			t.Error("WorkerExtraCAPEM must carry the raw bundle")
+		}
+	})
+	t.Run("unset is empty", func(t *testing.T) {
+		base(t)
+		cfg, err := Load()
+		if err != nil || cfg.WorkerExtraCAPEM != nil {
+			t.Fatalf("Load: err=%v extra=%q", err, cfg.WorkerExtraCAPEM)
+		}
+	})
+	t.Run("no PEM in it", func(t *testing.T) {
+		base(t)
+		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", writeCA(t, []byte("not a certificate")))
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_EXTRA_CA_FILE") {
+			t.Fatalf("Load: err = %v, want one naming UZI_WORKER_EXTRA_CA_FILE", err)
+		}
+	})
+	t.Run("missing file", func(t *testing.T) {
+		base(t)
+		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", filepath.Join(t.TempDir(), "absent.crt"))
+		if _, err := Load(); err == nil {
+			t.Fatal("Load: want error for an unreadable extra CA file, got nil")
+		}
+	})
+}
+
 // --- docker tier (PRD #83 M3) ----------------------------------------------
 
 // setDockerBaseEnv supplies everything Load needs to reach the docker-tier

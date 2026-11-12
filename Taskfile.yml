@@ -1747,6 +1747,13 @@ tasks:
       # non-vacuous, see the script header.
       - ./scripts/assert-workload-metadata-render.sh
 
+  render:extra-ca-check:
+    desc: assert workers.extraCA renders (off by default, inline pem, existing ConfigMap) and refuses both at once
+    cmds:
+      # Not in gate:repo (the lint job lacks helm); CI's helm-chart job runs it. Offline +
+      # non-vacuous, see the script header.
+      - ./scripts/assert-worker-extra-ca-render.sh
+
   render:ephemeral-docker-check:
     desc: assert effective Docker tier availability reaches the api Deployment
     cmds:

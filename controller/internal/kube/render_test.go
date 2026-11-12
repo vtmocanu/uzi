@@ -1023,6 +1023,35 @@ func TestSecretCarriesTheTokenAndRelaysTheCA(t *testing.T) {
 	}
 }
 
+// An operator's extra CA is appended to the api's CA in the same Secret entry, never
+// replacing it: Node reads ONE NODE_EXTRA_CA_CERTS file, so a worker that got only the
+// extra CA could no longer verify the api it claims runs from.
+func TestSecretAppendsTheExtraCAAfterTheAPICA(t *testing.T) {
+	api := "-----BEGIN CERTIFICATE-----\napi-ca\n-----END CERTIFICATE-----"
+	extra := "-----BEGIN CERTIFICATE-----\nextra-ca\n-----END CERTIFICATE-----\n"
+	cfg := testConfig()
+	cfg.APICAPEM, cfg.ExtraCAPEM = []byte(api), []byte(extra)
+	if got := string(RenderSecret(cfg, desired("abc"), "uzw_t").Data["ca.crt"]); got != api+"\n"+extra {
+		t.Fatalf("ca.crt = %q, want the api CA then the extra CA", got)
+	}
+
+	// Extra CA alone (api TLS off): it is the whole bundle and NODE_EXTRA_CA_CERTS points at it.
+	only := testConfig()
+	only.ExtraCAPEM = []byte(extra)
+	if got := string(RenderSecret(only, desired("abc"), "uzw_t").Data["ca.crt"]); got != extra {
+		t.Fatalf("ca.crt = %q, want the extra CA alone", got)
+	}
+	var found string
+	for _, e := range RenderDeployment(only, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "NODE_EXTRA_CA_CERTS" {
+			found = e.Value
+		}
+	}
+	if found != "/run/secrets/ca.crt" {
+		t.Errorf("NODE_EXTRA_CA_CERTS = %q with only an extra CA, want the relayed bundle's path", found)
+	}
+}
+
 func TestWorkerEnvDefaultsToSingleRunCap(t *testing.T) {
 	// testConfig() leaves MaxConcurrentRuns at its zero value, which must still render
 	// "1" — the default cap, so any RenderConfig{} built in a test keeps working. The

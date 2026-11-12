@@ -25,9 +25,11 @@ beforeEach(() => {
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
     ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
     UZI_RUNNER_PATH: process.env.UZI_RUNNER_PATH,
+    NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS,
     PATH: process.env.PATH,
   };
   delete process.env.UZI_RUNNER_PATH;
+  delete process.env.NODE_EXTRA_CA_CERTS;
   process.env.UZI_WORKER_TOKEN = FAKE_JOIN_TOKEN;
   process.env.UZI_FORGE_PAT = FAKE_PAT;
   process.env.ANTHROPIC_API_KEY = FAKE_API_KEY;
@@ -62,6 +64,13 @@ describe("buildSdkEnv", () => {
     if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
     if (process.env.UZI_SQLC_DIR) expected.add("UZI_SQLC_DIR");
     assert.deepStrictEqual(new Set(Object.keys(env)), expected);
+  });
+
+  it("hands the CLI the worker's CA bundle path, which a provisioned tool env cannot redirect", () => {
+    assert.ok(!("NODE_EXTRA_CA_CERTS" in buildSdkEnv(FAKE_OAUTH, HOME_DIR)));
+    process.env.NODE_EXTRA_CA_CERTS = "/run/secrets/ca.crt";
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, { NODE_EXTRA_CA_CERTS: "/tmp/attacker.pem" });
+    assert.strictEqual(env.NODE_EXTRA_CA_CERTS, "/run/secrets/ca.crt");
   });
 
   it("issue #3907: browser discovery points at the uzi-chromium wrapper and adds no Puppeteer/CHROME_BIN key", () => {

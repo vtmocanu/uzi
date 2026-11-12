@@ -34,6 +34,10 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   "HOME",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
+  // The worker's CA bundle (the controller Secret's ca.crt: the api CA plus any operator
+  // extra CA). Worker-set below; a provisioned var must never point the CLI's TLS trust
+  // at a file of its choosing.
+  "NODE_EXTRA_CA_CERTS",
   // Not a credential — the mandatory browser launch flag (see the base env below).
   // provision.ts's allowlist does not emit AGENT_BROWSER_ARGS today, so this is not a
   // live conflict; protecting it keeps the --no-sandbox guarantee durable against
@@ -171,6 +175,12 @@ export function buildSdkEnv(
   // Issue #3907: browser discovery points at the uzi-chromium wrapper, set AFTER the fold
   // (and protected above) so a provisioned var can neither redirect nor drop it.
   Object.assign(env, BROWSER_DISCOVERY_ENV);
+  // The worker's extra CA bundle reaches the CLI, so a private-CA host it calls (an
+  // Anthropic-compatible gateway) verifies. A path to public CA material, not a secret.
+  // Set AFTER the fold (and protected above). Under the opt-in uid-split profile the CLI
+  // runs as `runner`, which cannot read the root:worker 0440 Secret file; Node then warns
+  // and keeps the system roots, as before this key crossed.
+  if (process.env.NODE_EXTRA_CA_CERTS) env.NODE_EXTRA_CA_CERTS = process.env.NODE_EXTRA_CA_CERTS;
   // issue #1783 (R2): the attempt marker, set AFTER the fold (and protected above) so a
   // provisioned var can neither forge nor clear it. Absent attempt ⇒ no key at all.
   if (attempt) {

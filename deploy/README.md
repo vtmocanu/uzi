@@ -1540,6 +1540,13 @@ system roots are not also trusted). There is no skip-verification knob in this p
 and there must not be one — an unverified peer is the attack the encryption exists
 to stop.
 
+**Extra CA for private-CA hosts.** `workers.extraCA` adds a bundle the workers trust
+next to the api's CA: set `pem` inline, or `configMap.name`/`key` for an existing
+ConfigMap in the release namespace (a trust-manager `Bundle` target works). The
+controller appends it after the api CA in each worker's Secret, and the worker plus
+the Claude Code CLI it starts trust both. Like the api CA it is written at worker
+creation, so reprovision existing workers after adding or changing it.
+
 Related trap, worth one line so nobody "simplifies" the projection away: do **not**
 mount the `uzi-ca` Secret instead. That one holds the **CA private key**, which is
 strictly worse than the leaf's.
