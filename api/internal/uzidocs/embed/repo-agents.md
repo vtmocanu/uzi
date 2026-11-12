@@ -282,10 +282,20 @@ A run that reads repo agents is marked when it is created
 `repo_agent_source_v1` protocol capability claims a marked run or a run with a
 recorded revision, its first claim included. Judge, job, cross-check,
 task-review and chat runs do not read repo agents and are not marked. While no
-such worker is online, a queued run's health reason names the capability. A
+such worker is online, a regular-intake queued run's health reason names the
+capability once stronger prerequisites and owner holds have been resolved. A
 marked run that also carries an agent source request waits for a single worker
 reporting both `repo_agent_source_v1` and `agent_source_request_v1`, and its
 health reason says so when the two are split across workers.
+
+For an assigned regular-intake continuation, health also identifies an assigned
+worker missing this capability, even if a compatible peer is online. During an
+owner hold this is a suffix to the deadline; afterwards it is a dependency
+diagnosis, subject to stronger health reasons. Peer capability or a free slot
+alone does not establish claimability. Cross-check and egress lanes do not use
+this assigned-continuation diagnosis. The upgrade blocker view intentionally
+reports the independent assigned capability fact more broadly: any queued
+assignment with a requirement or recorded commit, regardless of generation or lane.
 
 When the API is older than the worker, nothing is recorded: each claim reads
 the agent folders at the configured default branch's commit at that time, and
