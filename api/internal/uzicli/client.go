@@ -748,9 +748,9 @@ type Client interface {
 	CreateCIFixRun(ctx context.Context, repoID, ref string) (CreatedRunResult, error)
 	// RecoveryArchives returns a run's owner-scoped durable-recovery summary — metadata
 	// ONLY, never raw bytes (PRD #1296 D6/D7): GET /api/runs/{id}/archives. RequireUser
-	// and strict owner-or-404 server-side (an admin viewing a foreign run is refused,
-	// mirroring ListRunInputs), so a uzc_/uza_ CLI token reaches its OWN runs and nobody
-	// else's. A run with no captures returns a zero-value summary (Supported=false,
+	// and owner-or-404 server-side (an admin viewing a foreign run is refused, mirroring
+	// ListRunInputs, unless the admin run debug predicate holds: an admin_ro token with
+	// UZI_ADMIN_RUN_DEBUG on), so a uzc_ CLI token reaches its OWN runs and nobody else's. A run with no captures returns a zero-value summary (Supported=false,
 	// Archives=[]), which the run-detail summary renders as an honest "none/unsupported"
 	// rather than a false claim of an available archive.
 	RecoveryArchives(ctx context.Context, runID string) (apitypes.RecoveryArchiveSummaryDTO, error)

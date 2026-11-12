@@ -8390,10 +8390,11 @@ func (s *Service) ListRunMessages(ctx context.Context, userID, runID uuid.UUID, 
 
 // ListFollowUpInputs returns a run's follow_up steer queue (newest-first, uncapped)
 // for the web/CLI queue (PRD #95). GetRun resolves owner-or-404 FIRST, so a non-owner
-// — including an admin_ro token on another user's run — gets ErrRunNotFound and the
-// handler 404s. This is strict owner-only (matching the follow-up WRITE), NOT the
-// owner-or-admin view: follow-ups are never in run_messages, so an owner-or-admin read
-// here would leak another user's steer text.
+// gets ErrRunNotFound for a run it does not own. This is strict owner-only (matching the
+// follow-up WRITE), NOT the owner-or-admin view: follow-ups are never in run_messages, so
+// an owner-or-admin read here would leak another user's steer text. The only cross-user
+// read is the handler's admin run debug path, which passes the run's owner as userID
+// after its own predicate and audit.
 func (s *Service) ListFollowUpInputs(ctx context.Context, userID, runID uuid.UUID) ([]store.RunUserInput, error) {
 	if _, err := s.GetRun(ctx, userID, runID); err != nil {
 		return nil, err

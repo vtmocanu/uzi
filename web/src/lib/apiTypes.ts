@@ -5976,6 +5976,8 @@ export interface HeldPublications {
 export interface RecoveryCustodyHolds {
   aggregate: RecoveryCustodyAggregate;
   holds: RecoveryCustodyHold[];
+  /** Whose holds these are; present only when the request named ?user= or ?run= (admin run debug). */
+  owner_id?: string;
 }
 
 /** Explicit owner consent; null binds legacy runs with no completion contract. */

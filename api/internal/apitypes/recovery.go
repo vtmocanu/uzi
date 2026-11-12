@@ -422,6 +422,10 @@ type RecoveryCustodyAggregateDTO struct {
 type RecoveryCustodyHoldsDTO struct {
 	Aggregate RecoveryCustodyAggregateDTO `json:"aggregate"`
 	Holds     []RecoveryCustodyHoldDTO    `json:"holds"`
+	// OwnerID names whose holds these are. Set only when the request named a ?user= or ?run=
+	// scope (admin run debug); omitted on the plain own-holds listing so that response is
+	// unchanged.
+	OwnerID string `json:"owner_id,omitempty"`
 }
 
 // RecoveryReconcileRequest names the saved archive identity for one ended generation.

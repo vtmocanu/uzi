@@ -10,11 +10,15 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/recovery"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -356,22 +360,35 @@ func (h *Handler) ListRecoveryArchives(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Strict owner-or-404, ignoring IsAdmin (mirrors ListRunInputs): an admin viewing a
-	// foreign run is refused. GetRun (not GetRunForViewer) is the authorization seam.
+	// Owner-or-404, ignoring IsAdmin (mirrors ListRunInputs): an admin viewing a foreign
+	// run is refused unless the admin run debug predicate holds (see
+	// adminRunDebugForeignRun). GetRun (not GetRunForViewer) is the owner authorization seam.
+	ownerID := user.ID
+	var (
+		debugActor store.User
+		debugToken uuid.UUID
+		debug      bool
+	)
 	if _, err := h.wsvc.GetRun(r.Context(), user.ID, runID); err != nil {
-		if errors.Is(err, workersvc.ErrRunNotFound) {
-			httpx.Error(w, http.StatusNotFound, "run not found")
+		if !errors.Is(err, workersvc.ErrRunNotFound) {
+			slog.Error("recovery archives: get run", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		slog.Error("recovery archives: get run", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
+		run, actor, tokenID, ok := h.adminRunDebugForeignRun(w, r, runID, "recovery archives")
+		if !ok {
+			return
+		}
+		ownerID, debugActor, debugToken, debug = run.UserID, actor, tokenID, true
 	}
-	summary, err := h.recovery().Summary(r.Context(), user.ID, runID)
+	summary, err := h.recovery().Summary(r.Context(), ownerID, runID)
 	if err != nil {
 		slog.Error("recovery archives: summary", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	if debug {
+		auditRunDebugRead(r, debugActor, debugToken, adminRunDebugRouteArchives, runID, ownerID)
 	}
 	httpx.JSON(w, http.StatusOK, summary)
 }
@@ -459,7 +476,9 @@ func (h *Handler) DiscardRecoveryArchive(w http.ResponseWriter, r *http.Request)
 // client-side. Mounted under RequireUser so a session cookie OR a uzc_/uza_ CLI Bearer reach it.
 // An optional ?state=open filter (PRD #1371) bounds the list to live custody for the web hot
 // poll; absent state returns all rows (the CLI's all-states contract). The aggregate is always
-// owner-wide, independent of the filter.
+// owner-wide, independent of the filter. Optional ?user=<uuid> or ?run=<uuid> (never both)
+// scope the list to another owner or to one run's holds; another owner's data is served only
+// when the admin run debug predicate holds, otherwise 404 (see listRecoveryHoldsScoped).
 func (h *Handler) ListRecoveryHolds(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -479,11 +498,115 @@ func (h *Handler) ListRecoveryHolds(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid state filter; only 'open' is supported")
 		return
 	}
-	holds, err := h.recovery().ListHoldsForOwner(r.Context(), user.ID, openOnly)
+	q := r.URL.Query()
+	userParam, runParam := q.Get("user"), q.Get("run")
+	if userParam != "" && runParam != "" {
+		httpx.Error(w, http.StatusBadRequest, "set only one of user or run")
+		return
+	}
+	if userParam == "" && runParam == "" {
+		holds, err := h.recovery().ListHoldsForOwner(r.Context(), user.ID, openOnly)
+		if err != nil {
+			slog.Error("recovery holds: list", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		httpx.JSON(w, http.StatusOK, holds)
+		return
+	}
+	h.listRecoveryHoldsScoped(w, r, user, userParam, runParam, openOnly)
+}
+
+// listRecoveryHoldsScoped serves ListRecoveryHolds for a ?user= or ?run= scope (exactly
+// one is non-empty). The caller's own user or own run is always allowed and unaudited;
+// another owner's holds need the admin run debug predicate and are audited once after the
+// read succeeds. Anything the predicate refuses is the same 404 as an unknown id.
+func (h *Handler) listRecoveryHoldsScoped(w http.ResponseWriter, r *http.Request, user store.User, userParam, runParam string, openOnly bool) {
+	ctx := r.Context()
+	owner := user.ID
+	var (
+		runFilter  string
+		debugRun   uuid.UUID
+		debugActor store.User
+		debugToken uuid.UUID
+		debug      bool
+	)
+	if userParam != "" {
+		target, err := uuid.Parse(userParam)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid user id")
+			return
+		}
+		if target != user.ID {
+			actor, tokenID, allowed := h.adminRunDebugActor(r)
+			if !allowed {
+				httpx.Error(w, http.StatusNotFound, "not found")
+				return
+			}
+			if _, err := h.q.GetUserByID(ctx, target); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					httpx.Error(w, http.StatusNotFound, "not found")
+					return
+				}
+				slog.Error("recovery holds: admin debug get user", "error", err)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			owner, debugActor, debugToken, debug = target, actor, tokenID, true
+		}
+	} else {
+		runID, err := uuid.Parse(runParam)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid run id")
+			return
+		}
+		runFilter = runID.String()
+		if _, err := h.wsvc.GetRun(ctx, user.ID, runID); err != nil {
+			if !errors.Is(err, workersvc.ErrRunNotFound) {
+				slog.Error("recovery holds: get run", "error", err)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			actor, tokenID, allowed := h.adminRunDebugActor(r)
+			if !allowed {
+				httpx.Error(w, http.StatusNotFound, "not found")
+				return
+			}
+			run, err := h.wsvc.GetRunForViewer(ctx, actor.ID, true, runID)
+			if err != nil {
+				if errors.Is(err, workersvc.ErrRunNotFound) {
+					httpx.Error(w, http.StatusNotFound, "not found")
+					return
+				}
+				slog.Error("recovery holds: admin debug get run", "error", err)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			owner, debugRun, debugActor, debugToken, debug = run.UserID, runID, actor, tokenID, true
+		}
+	}
+	holds, err := h.recovery().ListHoldsForOwner(ctx, owner, openOnly)
 	if err != nil {
 		slog.Error("recovery holds: list", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	holds.OwnerID = owner.String()
+	if runFilter != "" {
+		kept := make([]apitypes.RecoveryCustodyHoldDTO, 0, len(holds.Holds))
+		for _, hold := range holds.Holds {
+			if hold.RunID == runFilter {
+				kept = append(kept, hold)
+			}
+		}
+		holds.Holds = kept
+	}
+	if debug {
+		if debugRun != uuid.Nil {
+			auditRunDebugRead(r, debugActor, debugToken, adminRunDebugRouteHolds, debugRun, owner)
+		} else {
+			auditHoldsDebugRead(r, debugActor, debugToken, adminRunDebugRouteHolds, owner)
+		}
 	}
 	httpx.JSON(w, http.StatusOK, holds)
 }

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -8,8 +9,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // adminRunDebugMessage is the message of the single audit record written per
@@ -49,6 +52,31 @@ func (h *Handler) adminRunDebugActor(r *http.Request) (store.User, uuid.UUID, bo
 // every condition must hold.
 func adminRunDebugAllowed(flagOn bool, cred mw.CLICredential, credOK bool, user store.User, userOK bool) bool {
 	return flagOn && credOK && cred.Scope == clitoken.ScopeAdminRO && userOK && user.IsAdmin
+}
+
+// adminRunDebugForeignRun resolves a run the caller does not own for the three per-run
+// debug READS (inputs, archives, fetches); no write path calls it. It is reached only
+// after the owner path answered ErrRunNotFound. When the request may not take the debug
+// path it writes the same 404 as an unknown run, with no further query. Otherwise it
+// loads the run as an admin (not found is 404, other errors 500). ok=false means the
+// response is already written.
+func (h *Handler) adminRunDebugForeignRun(w http.ResponseWriter, r *http.Request, runID uuid.UUID, logTag string) (run store.Run, actor store.User, tokenID uuid.UUID, ok bool) {
+	actor, tokenID, allowed := h.adminRunDebugActor(r)
+	if !allowed {
+		httpx.Error(w, http.StatusNotFound, "run not found")
+		return store.Run{}, store.User{}, uuid.Nil, false
+	}
+	run, err := h.wsvc.GetRunForViewer(r.Context(), actor.ID, true, runID)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotFound) {
+			httpx.Error(w, http.StatusNotFound, "run not found")
+			return store.Run{}, store.User{}, uuid.Nil, false
+		}
+		slog.Error(logTag+": admin debug get run", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return store.Run{}, store.User{}, uuid.Nil, false
+	}
+	return run, actor, tokenID, true
 }
 
 func adminRunDebugBaseAttrs(actor store.User, tokenID uuid.UUID, route adminRunDebugRoute) []any {

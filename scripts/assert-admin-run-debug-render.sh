@@ -14,16 +14,16 @@
 # case that fails for a different reason than the one asserted, is a BROKEN INSTRUMENT
 # (exit 2), never a pass.
 #
-# FLAG-ONLY CASE (e): the other uzi.apiConfigMapEnabled triggers are nulled out with
-# --set <key>=null, so the flag is the only reason left to render the ConfigMap. Its
+# FLAG-ONLY CASE (f): the other uzi.apiConfigMapEnabled triggers are nulled out with
+# --set <key>=null (and database.mode=external), so the flag is the only reason left to render the ConfigMap. Its
 # negative control (the same overrides without the flag must render NO api ConfigMap)
 # proves the overrides really removed every other trigger; if it does not, the instrument
 # is broken (exit 2).
 #
 # EXIT CODES:
 #     2 = the instrument is broken (helm/yq/chart missing, a render that must succeed
-#         failed, an expected key absent, or a render failed for an unrelated reason)
-#     1 = a property does not hold
+#         failed, or a render failed for an unrelated reason)
+#     1 = a property does not hold (an expected key absent included)
 #     0 = every property holds
 set -eu
 
@@ -173,6 +173,10 @@ if [ "$(envfrom_name "$WORK/onlydep.yaml")" = "uzi-api-config" ]; then
 else
   bad "(f) flag-only api Deployment does not envFrom the ConfigMap"
 fi
+
+# A string value must trip the type guard on a flag-only install too (the ConfigMap template
+# has to be reached for the guard to fire).
+expect_fail "(f) flag-only string \"true\"" "$_BOOL_MSG" "$@" --set-string api.adminRunDebug.enabled=true
 
 if [ "$fail" -ne 0 ]; then
   echo "FAIL: UZI_ADMIN_RUN_DEBUG is NOT correctly rendered from api.adminRunDebug.enabled" >&2

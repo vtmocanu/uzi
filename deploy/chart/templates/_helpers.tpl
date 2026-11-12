@@ -871,7 +871,7 @@ true
   = true.
 */ -}}
 {{- define "uzi.apiConfigMapEnabled" -}}
-{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs (.Values.issueTracker).allowedBaseURLs (and (kindIs "bool" (.Values.api.adminRunDebug).enabled) (.Values.api.adminRunDebug).enabled) .Values.releaseCheck (include "uzi.apiHostingEnabled" .) (include "uzi.dbStorageCapacityBytes" .)) -}}
+{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs (.Values.issueTracker).allowedBaseURLs (.Values.api.adminRunDebug).enabled .Values.releaseCheck (include "uzi.apiHostingEnabled" .) (include "uzi.dbStorageCapacityBytes" .)) -}}
 true
 {{- end -}}
 {{- end -}}
