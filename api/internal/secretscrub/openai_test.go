@@ -96,10 +96,10 @@ func TestScrubLegacyPreservesWritePathProse(t *testing.T) {
 			t.Fatal("legacy Scrub changed write-path prose or OpenAI behavior")
 		}
 	}
-	// Legacy replacement order intentionally differs from history's span union.
+	// Both paths redact the union of overlapping spans as one placeholder.
 	input := "sk-ant-" + "AAAA" + "xoxb-" + strings.Repeat("B", 20)
-	if got := secretscrub.Scrub(input); got != "[redacted][redacted]" {
-		t.Fatal("legacy Scrub replacement order changed")
+	if got := secretscrub.Scrub(input); got != "[redacted]" {
+		t.Fatal("Scrub must redact overlapping credentials as one span")
 	}
 	if got := secretscrub.ScrubHistory(input); got != "[redacted]" {
 		t.Fatal("history must retain non-OpenAI overlap protection")

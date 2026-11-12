@@ -34,6 +34,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 )
 
 // Input is the fully-resolved, DB-free input to Render. The handler maps store rows
@@ -496,16 +498,14 @@ var secretShapes = []*regexp.Regexp{
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),                                                                       // AWS access key id
 	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`),                                                             // GitHub token
 	regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),                                                                  // Google API key
-	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`),                             // JWT
+	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*`),        // JWT/JWE; trailing segments keep overlaps bounded
 	regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`),              // PEM
 	regexp.MustCompile(`(?i)\b(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s:@/]+:[^\s@/]+@`), // DB URL creds
 	regexp.MustCompile(`(?i)authorization:\s*bearer\s+[A-Za-z0-9._~+/=-]+`),                                      // bearer header
 }
 
-// ScrubSecretShapes replaces every recognized secret shape with "[redacted]".
+// ScrubSecretShapes replaces every recognized secret shape with "[redacted]",
+// matching all shapes on the original input (secretscrub.RedactOverlapping).
 func ScrubSecretShapes(s string) string {
-	for _, re := range secretShapes {
-		s = re.ReplaceAllString(s, "[redacted]")
-	}
-	return s
+	return secretscrub.RedactOverlapping(s, secretShapes, "[redacted]")
 }
