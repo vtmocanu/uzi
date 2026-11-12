@@ -53,7 +53,7 @@ export function CustodyHoldLimitCard({ settings, onSaved }: {
       <div>
         <SectionTitle>Custody hold limit</SectionTitle>
         <p id="custody-limit-description" className="mt-2 text-sm text-muted">
-          Per-owner limit on custody admission units, from 1 to 1000 (default 8). A unit is one run's open holds on one worker, so a run's holds on the same worker count once. Once an owner reaches the limit, their new code runs wait. A single run whose own open holds reach the limit cannot start, even when the owner is below it. Raising it admits more work. Lowering it pauses new runs only; it never releases holds or cancels runs. One value applies to the whole deployment, to each owner separately.
+          Per-owner limit on custody admission units, from 1 to 1000 (default 8). A run's open holds from the same original worker usually count once, as one unit; other holds count singly. Once an owner reaches the limit, their new code runs wait. A single run whose own open holds reach the limit cannot start, even when the owner is below it. Raising it admits more work. Lowering it pauses new runs only; it never releases holds or cancels runs. One value applies to the whole deployment, to each owner separately.
         </p>
       </div>
       {error && <Alert message={error} />}

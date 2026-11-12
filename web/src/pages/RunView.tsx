@@ -1517,7 +1517,7 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
               : "Retry timing is unavailable. This does not establish an owner hold or an automatic retry date."}
         </> : <>{memoryHeld
           ? "Memory interventions have stopped. Resume starts a fresh memory episode. Cancel ends this run."
-          : "Automatic worker recovery has stopped. Only the run owner can resume or cancel this run. Resume requests one explicit attempt, even when the automatic recovery limit is zero."}
+          : "Automatic worker recovery has stopped. Only the run owner can resume or cancel this run. Resume requests one explicit attempt, even when the automatic recovery limit is zero. A run already at its own custody hold limit is not claimed by Resume (no claim, no hold) until its own holds are discarded or settled."}
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
@@ -1828,7 +1828,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
               {retryAt ? `Retry at ${retryAt}. ` : ""}Forge parks: {parkLabel}. The count and allowance are unchanged by Resume.
             </p>
             {forgeMode === "held" && <>
-              <p className="mt-1.5 text-xs text-muted">Resume permits one bounded ordinary attempt; it does not promise execution or reset counts, custody or grants. Origin cooldown, manual cordon, a custody limit of 1, or saturated capacity may still block admission.</p>
+              <p className="mt-1.5 text-xs text-muted">Resume permits one bounded ordinary attempt; it does not promise execution or reset counts, custody or grants. Origin cooldown, manual cordon, a custody limit of 1, saturated capacity, or this run being at its own custody hold limit (no claim, no hold) may still block admission.</p>
               {run.health_reason && <p className="mt-1.5 text-xs text-muted">Admission: {displayHealthReason(run)}</p>}
               {ownerProof ? <div className="mt-3 flex flex-wrap gap-2">
                 <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>

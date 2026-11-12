@@ -281,21 +281,21 @@ describe("custodyAlertView — self-hide, capacity, and blocked-run severity", (
   });
 
   it.each([0, 1])("shows danger below capacity with blocked runs and %i decisions", (decision_needed) => {
-    const v = custodyAlertView(agg({ open_holds: 5, decision_needed, blocked_runs: 1 }), 0);
+    const v = custodyAlertView(agg({ open_holds: 9, admission_counted_holds: 5, decision_needed, blocked_runs: 1 }), 0);
     expect(v?.tone).toBe("danger");
     expect(v?.atLimit).toBe(false);
     expect(v?.headline).toBe("A queued run reached its own custody hold limit");
   });
 
   it("flags a below-limit blocked run as its own per-run bound with the hold-limit headline", () => {
-    const v = custodyAlertView(agg({ open_holds: 6, admission_counted_holds: 2, blocked_runs: 1 }), 0);
+    const v = custodyAlertView(agg({ open_holds: 9, admission_counted_holds: 2, blocked_runs: 1 }), 0);
     expect(v?.headline).toBe("A queued run reached its own custody hold limit");
     expect(v?.runBoundOnly).toBe(true);
     expect(v?.slotsLabel).toBe("2 / 8 custody units used");
   });
 
   it("uses the plural per-run bound headline when several runs are blocked below the limit", () => {
-    const v = custodyAlertView(agg({ open_holds: 6, admission_counted_holds: 2, blocked_runs: 2 }), 0);
+    const v = custodyAlertView(agg({ open_holds: 16, admission_counted_holds: 2, blocked_runs: 2 }), 0);
     expect(v?.headline).toBe("Queued runs reached their own custody hold limits");
     expect(v?.runBoundOnly).toBe(true);
   });
@@ -307,8 +307,8 @@ describe("custodyAlertView — self-hide, capacity, and blocked-run severity", (
   });
 
   it("respects an explicit zero admission_counted_holds and falls back only when absent", () => {
-    expect(custodyAlertView(agg({ open_holds: 5, admission_counted_holds: 0, blocked_runs: 1 }), 0)?.slotsUsed).toBe(0);
-    expect(custodyAlertView(agg({ open_holds: 5, blocked_runs: 1 }), 0)?.slotsUsed).toBe(5);
+    expect(custodyAlertView(agg({ open_holds: 9, admission_counted_holds: 0, blocked_runs: 1 }), 0)?.slotsUsed).toBe(0);
+    expect(custodyAlertView(agg({ open_holds: 9, blocked_runs: 1 }), 0)?.slotsUsed).toBe(9);
   });
 
   it.each([4, 8, 9])("keeps decision-only holds at %i warning even at capacity", (open_holds) => {

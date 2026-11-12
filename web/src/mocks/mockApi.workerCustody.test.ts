@@ -89,3 +89,16 @@ it("keeps the custody holder deleted after its holds are discarded and it is del
   await vi.advanceTimersByTimeAsync(1000);
   expect((await listP).workers.some((w) => w.id === "wkr-jvm")).toBe(false);
 });
+
+it("shows the per-run custody bound under custody-run-bound: blocked run while counted units stay below the limit", async () => {
+  window.localStorage.setItem("uzi_mock_scenario", "custody-run-bound");
+  vi.useFakeTimers();
+  const p = mockApi.getRecoveryHolds();
+  await vi.advanceTimersByTimeAsync(1000);
+  const { aggregate } = await p;
+  expect(aggregate.open_holds).toBe(9);
+  expect(aggregate.admission_counted_holds).toBe(1);
+  expect(aggregate.blocked_runs).toBe(1);
+  expect(aggregate.admission_counted_holds!).toBeLessThan(aggregate.custody_hold_limit);
+  expect(mockRuns.find((r) => r.id === "run-custody-run-bound")?.health_reason).toMatch(/own custody hold limit/);
+});

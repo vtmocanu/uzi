@@ -390,7 +390,7 @@ describe("Held work card", () => {
 
   it("keeps blocked runs a danger headline with no review link and no held row", async () => {
     mockApi.getRecoveryHolds.mockResolvedValue({
-      aggregate: heldAggregate({ open_holds: 3, admission_counted_holds: 3, blocked_runs: 2 }),
+      aggregate: heldAggregate({ open_holds: 16, admission_counted_holds: 3, blocked_runs: 2 }),
       holds: [],
     });
     await mount();
@@ -419,7 +419,7 @@ describe("Held work card", () => {
   it("still shows the danger headline and the held row when a first-load endpoint rejects", async () => {
     mockApi.listRepos.mockRejectedValue(new Error("repos down"));
     mockApi.getRecoveryHolds.mockResolvedValue({
-      aggregate: heldAggregate({ open_holds: 3, admission_counted_holds: 3, decision_needed: 1, blocked_runs: 2 }),
+      aggregate: heldAggregate({ open_holds: 16, admission_counted_holds: 3, decision_needed: 1, blocked_runs: 2 }),
       holds: [decisionHold("a83c51f0-aaaa", "2026-07-05T10:00:00Z")],
     });
     await mount();

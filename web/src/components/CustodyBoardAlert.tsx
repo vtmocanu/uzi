@@ -45,10 +45,16 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
   const danger = view.tone === "danger";
   const accent = danger ? "text-danger" : "text-warn";
   // The Workers "Held work" panel is decision-only. Offer review and targeted advice
-  // only for pending decisions. Blocked runs can exist below capacity; their wait copy
-  // describes queued admission without attributing all holds to active work.
+  // only for pending decisions. A blocked run can also sit below the owner limit: the
+  // per-run bound (a run whose own open holds reach the limit) is never claimed, and that
+  // copy names the run's own holds rather than queued admission.
   const actionable = view.decisionNeeded > 0;
   const plural = view.blockedRuns > 1;
+  // The per-run bound is freed only by discarding or settling that run's own holds. The web
+  // lists only holds that need a decision, so the owner's path for the typical active holds
+  // is the CLI (uzi run recovery / uzi run discard).
+  const runBoundLead = `${plural ? "Queued runs have" : "A queued run has"} reached ${plural ? "their own custody hold limits" : "its own custody hold limit"}.`;
+  const runBoundTail = `To let ${plural ? "them" : "it"} start, inspect ${plural ? "each run's" : "the run's"} holds with uzi run recovery <run> and discard them with uzi run discard <run> --hold <id>.`;
 
   return (
     <section
@@ -74,15 +80,15 @@ export function CustodyBoardAlert({ recoveryWaitCount }: { recoveryWaitCount: nu
             <p className="text-sm text-muted">
               {view.runBoundOnly
                 ? actionable
-                  ? `${plural ? "Queued runs have" : "A queued run has"} reached ${plural ? "their" : "its"} own custody hold limit. Review the holds that need a decision and resolve or discard ${plural ? "those runs'" : "that run's"} own retained holds to let ${plural ? "them" : "it"} start.`
-                  : `${plural ? "Queued runs have" : "A queued run has"} reached ${plural ? "their" : "its"} own custody hold limit. Resolve or discard ${plural ? "those runs'" : "that run's"} own retained holds to let ${plural ? "them" : "it"} start.`
+                  ? `${runBoundLead} Review the holds that need a decision. ${runBoundTail}`
+                  : `${runBoundLead} ${runBoundTail}`
                 : actionable
                   ? danger
                     ? "Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work."
                     : "Review the holds that need a decision and choose how to preserve their work."
                   : danger
-                    ? "Queued code runs are waiting for custody admission; no action is needed. Admission resumes when admission units settle."
-                    : "Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when admission units settle."}
+                    ? "Queued code runs are waiting for custody admission; no action is needed. Admission resumes when counted holds settle."
+                    : "Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when counted holds settle."}
             </p>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
               <Count value={holds.aggregate.open_holds} singular="open custody hold" plural="open custody holds" />

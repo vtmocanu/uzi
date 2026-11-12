@@ -66,7 +66,7 @@ describe("CustodyBoardAlert", () => {
     expect(region.classList.contains("bg-danger/10")).toBe(false);
     expect(screen.getByText("Custody capacity reached").classList.contains("text-warn")).toBe(true);
     expect(screen.getByText(`${open_holds} / 8 custody units used`)).toBeTruthy();
-    expect(screen.getByText("Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when admission units settle.")).toBeTruthy();
+    expect(screen.getByText("Custody capacity is reached. New code runs will wait; no action is needed. Admission resumes when counted holds settle.")).toBeTruthy();
     expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
     expect(screen.queryByText(/needs? a decision/)).toBeNull();
     expect(screen.queryByText(/runs? blocked/)).toBeNull();
@@ -103,10 +103,10 @@ describe("CustodyBoardAlert", () => {
   });
 
   it("renders a below-limit blocked run as its own hold-limit case, not as unrelated waiting runs", async () => {
-    await renderAlert(holds({ open_holds: 4, admission_counted_holds: 2, blocked_runs: 1 }));
+    await renderAlert(holds({ open_holds: 9, admission_counted_holds: 2, blocked_runs: 1 }));
     expect(screen.getByRole("alert").classList.contains("bg-danger/10")).toBe(true);
     expect(screen.getByText("A queued run reached its own custody hold limit").classList.contains("text-danger")).toBe(true);
-    expect(screen.getByText("A queued run has reached its own custody hold limit. Resolve or discard that run's own retained holds to let it start.")).toBeTruthy();
+    expect(screen.getByText("A queued run has reached its own custody hold limit. To let it start, inspect the run's holds with uzi run recovery <run> and discard them with uzi run discard <run> --hold <id>.")).toBeTruthy();
     expect(screen.getByText("2 / 8 custody units used")).toBeTruthy();
     expect(screen.queryByText(/Queued code runs are waiting/)).toBeNull();
     expect(screen.queryByText(/New code runs will wait/)).toBeNull();
@@ -120,15 +120,19 @@ describe("CustodyBoardAlert", () => {
     expect(region.classList.contains("bg-danger/10")).toBe(true);
     expect(region.classList.contains("bg-warn/10")).toBe(false);
     expect(screen.getByText("Held work is blocking new runs").classList.contains("text-danger")).toBe(true);
-    expect(screen.getByText("Queued code runs are waiting for custody admission; no action is needed. Admission resumes when admission units settle.")).toBeTruthy();
+    expect(screen.getByText("Queued code runs are waiting for custody admission; no action is needed. Admission resumes when counted holds settle.")).toBeTruthy();
     expect(screen.getByText(/runs blocked/)).toBeTruthy();
     expect(screen.queryByText(/needs? a decision/)).toBeNull();
     expect(screen.queryByRole("link", { name: /Review held work/ })).toBeNull();
     expect(screen.queryByText(/Review the holds that need a decision/)).toBeNull();
   });
 
-  it.each([4, 8])("prioritizes blocked runs over decisions at %i and links to targeted review", async (open_holds) => {
-    await renderAlert(holds({ open_holds, decision_needed: 1, blocked_runs: 2 }));
+  it.each([
+    { open_holds: 16, admission_counted_holds: 3 },
+    { open_holds: 8, admission_counted_holds: 8 },
+  ])("prioritizes blocked runs over decisions at %j and links to targeted review", async (counts) => {
+    const open_holds = counts.admission_counted_holds;
+    await renderAlert(holds({ ...counts, decision_needed: 1, blocked_runs: 2 }));
     const region = screen.getByRole("alert");
     expect(region.getAttribute("aria-live")).toBe("assertive");
     expect(region.classList.contains("bg-danger/10")).toBe(true);
@@ -137,7 +141,7 @@ describe("CustodyBoardAlert", () => {
       screen.getByText(
         open_holds >= 8
           ? "Queued code runs are waiting for custody admission. Review the holds that need a decision and choose how to preserve their work."
-          : "Queued runs have reached their own custody hold limit. Review the holds that need a decision and resolve or discard those runs' own retained holds to let them start.",
+          : "Queued runs have reached their own custody hold limits. Review the holds that need a decision. To let them start, inspect each run's holds with uzi run recovery <run> and discard them with uzi run discard <run> --hold <id>.",
       ),
     ).toBeTruthy();
     expect(screen.getByText(/hold needs a decision/)).toBeTruthy();
@@ -156,7 +160,7 @@ describe("CustodyBoardAlert", () => {
     mockApi.getRecoveryHolds
       .mockResolvedValueOnce(holds({ open_holds: 2 }))
       .mockResolvedValueOnce(holds({ open_holds: 8 }))
-      .mockResolvedValueOnce(holds({ open_holds: 4, blocked_runs: 2 }))
+      .mockResolvedValueOnce(holds({ open_holds: 16, admission_counted_holds: 3, blocked_runs: 2 }))
       .mockResolvedValueOnce(holds({ open_holds: 8, decision_needed: 1 }))
       .mockResolvedValue(holds({ open_holds: 3 }));
     const { container } = render(

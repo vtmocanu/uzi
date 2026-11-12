@@ -21,7 +21,7 @@ function mount(a: RecoveryCustodyAggregate | null, recoveryWaitCount = 0) {
 }
 
 const cases: { name: string; a: RecoveryCustodyAggregate; used: number }[] = [
-  { name: "blocked", a: agg({ open_holds: 3, admission_counted_holds: 3, blocked_runs: 2 }), used: 3 },
+  { name: "blocked", a: agg({ open_holds: 16, admission_counted_holds: 3, blocked_runs: 2 }), used: 3 },
   { name: "capacity reached", a: agg({ open_holds: 8, admission_counted_holds: 8 }), used: 8 },
   { name: "decision needed", a: agg({ open_holds: 2, admission_counted_holds: 2, decision_needed: 2 }), used: 2 },
   { name: "healthy below the limit", a: agg({ open_holds: 2, admission_counted_holds: 2 }), used: 2 },
@@ -140,7 +140,7 @@ describe("HeldWorkCard", () => {
   });
 
   it("fills as many meter cells as slots are used, in the tone of the headline", () => {
-    const { container } = mount(agg({ open_holds: 3, admission_counted_holds: 3, blocked_runs: 1 }));
+    const { container } = mount(agg({ open_holds: 9, admission_counted_holds: 3, blocked_runs: 1 }));
     const cells = container.querySelectorAll("[aria-hidden=true] > span");
     expect(cells).toHaveLength(8);
     expect([...cells].filter((c) => c.className.includes("bg-danger"))).toHaveLength(3);

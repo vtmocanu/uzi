@@ -143,10 +143,32 @@ function seedOverviewNextHolds(): RecoveryCustodyHold[] {
   ];
 }
 
+// The `?mock=custody-run-bound` scenario: nine open, active holds of ONE run from one original
+// worker. The server counts them as one admission unit (the rest are same_run_group), so the owner
+// is far below the limit while the run's own open holds exceed it: the per-run bound.
+function seedRunBoundHolds(): RecoveryCustodyHold[] {
+  const t = (minsAgo: number) => new Date(Date.now() - minsAgo * 60_000).toISOString();
+  return Array.from({ length: 9 }, (_, i): RecoveryCustodyHold => ({
+    id: `hold-rb-${i + 1}`,
+    run_id: "run-custody-run-bound",
+    worker_id: "wkr-base-m",
+    worker_name: "base (M)",
+    generation: i + 1,
+    state: "open",
+    attention: "active",
+    inventory_guarded: false,
+    has_available_capture: false,
+    created_at: t(180 - i),
+    updated_at: t(20),
+    counts_toward_admission: i === 0,
+    admission_reason: i === 0 ? "earlier_generation" : "same_run_group",
+  }));
+}
+
 function currentCustodyHolds(): RecoveryCustodyHold[] {
   const scenario = mockScenario();
   const seeds =
-    scenario === "overview-next" ? seedOverviewNextHolds() : scenario === "custody" ? seedCustodyHolds() : [];
+    scenario === "overview-next" ? seedOverviewNextHolds() : scenario === "custody" ? seedCustodyHolds() : scenario === "custody-run-bound" ? seedRunBoundHolds() : [];
   return seeds.filter((h) => !discardedHolds.has(h.id));
 }
 
@@ -167,7 +189,7 @@ function custodyResponse(): RecoveryCustodyHolds {
       custody_hold_limit: custodyLimit,
       decision_needed: decisionNeeded,
       // Two queued code runs are wedged behind the owner limit in this scenario.
-      blocked_runs: counted >= custodyLimit ? 2 : 0,
+      blocked_runs: counted >= custodyLimit ? 2 : mockScenario() === "custody-run-bound" ? 1 : 0,
     },
     holds,
   };

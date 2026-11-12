@@ -1598,7 +1598,7 @@ describe("Codex admission read-time projection", () => {
     });
   });
   it("treats the server's per-run custody hold bound reason (api-contract fixture) as a preceding blocker", () => {
-    // The literal is apitypes.ReasonCustodyRunHoldBound; the fixture is generated from it.
+    // The literal is apitypes.ReasonCustodyRunHoldBound; the fixture is checked against it by api/cmd/uzi TestCustodyRunHoldBoundFixtureRenders.
     const reason = "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start";
     expect(boundFixture.health_reason).toBe(reason);
     expect(queuedBlockerPrecedesCodexAdmission({ status: boundFixture.status, health_reason: boundFixture.health_reason })).toBe(true);
