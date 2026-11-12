@@ -160,6 +160,19 @@ for (const mode of ["finish", "cancel"] as const) it(
   },
 );
 
+it("builds the SDK env from a bound endpoint when the claim carries no token (PRD #229 D10)", async () => {
+  const { queryFn, seen } = fakeQuery([realInit() as unknown as SDKMessage, resultSuccess()]);
+  const input = ctx();
+  // The server binds the endpoint and empties the token, so the run has no token at all.
+  input.oauthToken = "";
+  input.anthropicEndpoint = { base_url: "https://gateway.example/v1", api_key: "sk-gateway", model: "m-1" };
+  await new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: SECRET_PATHS }).run(input);
+  const env = seen.options!.env as Record<string, string | undefined>;
+  assert.equal(env.ANTHROPIC_BASE_URL, "https://gateway.example/v1");
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, "sk-gateway");
+  assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, undefined, "no subscription token travels beside an endpoint");
+});
+
 function options(gate = { passed: false }): SdkOptions {
   const fetch = buildFetchToolsServer({ fetcherUrl: "https://127.0.0.1:1", ca: "", credential: "cred", workspace, log: nullLogger() });
   return buildIsolatedSdkOptions({

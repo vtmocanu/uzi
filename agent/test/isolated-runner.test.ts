@@ -106,7 +106,7 @@ describe("IsolatedRunner: fail closed before anything starts", () => {
     ["no fetcher URL", {}, { fetcherUrl: undefined }, /UZI_FETCHER_URL/],
     ["no fetcher CA", {}, { fetcherCaFile: undefined }, /UZI_FETCHER_CA_FILE/],
     ["an empty credential", { isolated_fetch: { credential: "", profile: "p", hosts: [] } }, {}, /malformed isolated_fetch/],
-    ["no Anthropic token", { secrets: { forge_pat: "" } }, {}, /no Anthropic OAuth token/],
+    ["no Anthropic credential", { secrets: { forge_pat: "" } }, {}, /no Anthropic credential/],
   ];
   for (const [name, claimOver, optsOver, want] of cases) {
     it(`refuses ${name}: reports failed, runs no session, creates no workspace`, async () => {
@@ -123,6 +123,19 @@ describe("IsolatedRunner: fail closed before anything starts", () => {
       assert.equal(activeRuns.size, 0, "the run is no longer listed as active");
     });
   }
+
+  it("runs a profile-bound claim that carries an endpoint instead of a token (PRD #229 D10)", async () => {
+    const { client, states } = recordingClient();
+    const ran: IsolatedContext[] = [];
+    // The server binds the endpoint and empties the token, so the claim has no token at all.
+    await runner(client, { ran }).execute(isolatedClaim({
+      secrets: { forge_pat: "", anthropic_oauth_token: "",
+        anthropic_endpoint: { base_url: "https://gateway.example/v1", api_key: "sk-gateway", model: "m-1" } } as unknown as ClaimResponse["secrets"],
+    }));
+    assert.equal(ran.length, 1, "the session started");
+    assert.equal(ran[0]!.anthropicEndpoint?.api_key, "sk-gateway", "the endpoint reached the executor");
+    assert.deepEqual(states.map((s) => s.status), ["running", "completed"]);
+  });
 
   it("fails closed when the CA file cannot be read", async () => {
     const { client, states } = recordingClient();

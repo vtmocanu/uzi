@@ -32,6 +32,7 @@ import path from "node:path";
 import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 
 import type { EmittedMessage } from "./executor.js";
+import type { ClaimAnthropicEndpoint } from "./protocol.js";
 import { FETCH_SERVER_NAME, FETCH_TOOL_QUALIFIED, SOURCES_DIR } from "./fetch-tools.js";
 import {
   ASYNC_DEFERRAL_TOOLS,
@@ -357,6 +358,10 @@ const ISOLATED_SYSTEM_APPEND = [
 export interface IsolatedContext {
   runId: string;
   oauthToken: string;
+  /** PRD #229 D10: the instance's custom Anthropic-Messages endpoint, when one is bound.
+   *  It REPLACES oauthToken (which is then empty), so an endpoint-only instance can run a
+   *  profile-bound job. Absent ⇒ byte-identical env. */
+  anthropicEndpoint?: ClaimAnthropicEndpoint;
   /** The run workspace (absolute): the SDK cwd and the path guard's root. */
   workspace: string;
   /** The run's own SDK HOME (absolute). */
@@ -474,7 +479,7 @@ export class IsolatedExecutor {
     }, ctx.timeoutMs, { now: this.timeoutNow, unref: true });
 
     const options = buildIsolatedSdkOptions({
-      env: isolateSdkEnv(buildSdkEnv(ctx.oauthToken, ctx.homeDir)),
+      env: isolateSdkEnv(buildSdkEnv(ctx.oauthToken, ctx.homeDir, {}, undefined, undefined, undefined, ctx.anthropicEndpoint)),
       cwd: ctx.workspace,
       log: this.log,
       secretPaths: this.secretPaths,
