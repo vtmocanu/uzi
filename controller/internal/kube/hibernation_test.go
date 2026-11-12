@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -362,7 +363,7 @@ func TestRefusedCarriesTheFencePatchsResourceVersion(t *testing.T) {
 	if c.ResourceVersion != after.ResourceVersion || c.ResourceVersion == before.ResourceVersion {
 		t.Fatalf("refused rv = %q, want the fence patch's %q (not the observed %q)", c.ResourceVersion, after.ResourceVersion, before.ResourceVersion)
 	}
-	if after.Annotations[annotationHibernationRefused] != "op-1" {
+	if !strings.HasPrefix(after.Annotations[annotationHibernationRefused], "op-1/") {
 		t.Fatalf("fence annotation missing: %v", after.Annotations)
 	}
 	if *after.Spec.Replicas != 1 {
@@ -392,42 +393,80 @@ func TestFailClosedRefusalsIssueNoScaleDown(t *testing.T) {
 	malformed.Annotations = map[string]string{annotationRoll: "{not json"}
 	garbageMirror := pvcFor("w1", "data")
 	garbageMirror.Annotations = map[string]string{annotationRoll: "{not json"}
-	for name, tc := range map[string]struct {
-		objs []runtime.Object
-		mod  func(*protocol.DesiredWorker)
-	}{
-		"existing roll marker":     {objs: []runtime.Object{markedDeployment(t, cfg, base, false)}},
-		"malformed marker":         {objs: []runtime.Object{malformed}},
-		"retained raw reservation": {objs: []runtime.Object{hibCurrent(t, 1, ""), garbageMirror}},
-		"disk pressure":            {objs: []runtime.Object{hibCurrent(t, 1, "")}, mod: func(w *protocol.DesiredWorker) { w.DiskPressure = true }},
-		"dind maintenance":         {objs: []runtime.Object{hibCurrent(t, 1, "")}, mod: func(w *protocol.DesiredWorker) { w.DindMaintenance = &protocol.DindMaintenance{Phase: "requested"} }},
-		"worker busy":              {objs: []runtime.Object{hibCurrent(t, 1, "")}, mod: func(w *protocol.DesiredWorker) { w.Busy = true }},
+	type tc struct {
+		objs   []runtime.Object
+		noData bool
+		mod    func(*protocol.DesiredWorker)
+		setup  func(*fake.Clientset)
+		reason string
+	}
+	for name, c := range map[string]tc{
+		"existing roll marker":     {objs: []runtime.Object{markedDeployment(t, cfg, base, false)}, reason: refuseRollReservation},
+		"malformed marker":         {objs: []runtime.Object{malformed}, reason: refuseRollReservation},
+		"retained raw reservation": {objs: []runtime.Object{hibCurrent(t, 1, ""), garbageMirror}, noData: true, reason: refuseRollReservation},
+		"disk pressure":            {objs: []runtime.Object{hibCurrent(t, 1, "")}, mod: func(w *protocol.DesiredWorker) { w.DiskPressure = true }, reason: refuseDiskPressure},
+		"dind maintenance": {objs: []runtime.Object{hibCurrent(t, 1, "")}, mod: func(w *protocol.DesiredWorker) { w.DindMaintenance = &protocol.DindMaintenance{Phase: "requested"} },
+			reason: refuseDinDMaintenance},
+		"worker busy": {objs: []runtime.Object{hibCurrent(t, 1, "")}, mod: func(w *protocol.DesiredWorker) { w.Busy = true }, reason: refuseBusy},
+		"incomplete snapshot": {objs: []runtime.Object{hibCurrent(t, 1, "")}, reason: refuseRollBlocked, setup: func(c *fake.Clientset) {
+			c.PrependReactor("list", "replicasets", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("replicasets unavailable")
+			})
+		}},
+		"no roll evidence (ephemeral)": {objs: []runtime.Object{hibCurrent(t, 1, "")}, mod: func(w *protocol.DesiredWorker) { w.Ephemeral = true }, reason: refuseNoRollEvidence},
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec := &hibRec{fakeCordoner: &fakeCordoner{}}
-			var m *Materializer
-			var client *fake.Clientset
-			objs := tc.objs
-			if name != "retained raw reservation" {
-				objs = append([]runtime.Object{pvcNix("w1", "20Gi"), pvcFor("w1", "data")}, objs...)
-			} else {
+			objs := c.objs
+			if c.noData {
 				objs = append([]runtime.Object{pvcNix("w1", "20Gi")}, objs...)
+			} else {
+				objs = append([]runtime.Object{pvcNix("w1", "20Gi"), pvcFor("w1", "data")}, objs...)
 			}
-			m, client = newMatWithCordoner(t, rec, objs...)
+			m, client := newMatWithCordoner(t, rec, objs...)
+			if c.setup != nil {
+				c.setup(client)
+			}
 			w := hibW(protocol.HibernationPreparing, "op-1")
-			if tc.mod != nil {
-				tc.mod(&w)
+			if c.mod != nil {
+				c.mod(&w)
 			}
-			_ = hibTick(t, m, w)
+			if err := hibTick(t, m, w); err != nil {
+				t.Fatalf("refusal tick: %v", err)
+			}
 			if replicaPatches(client) != 0 {
 				t.Fatalf("a refusal case issued a replicas patch: %v", deploymentPatchBodies(client))
 			}
 			if got := rec.transitions(); len(got) != 1 || got[0] != protocol.TransitionRefused {
 				t.Fatalf("transitions = %v, want exactly [refused]", got)
 			}
+			if rec.calls[0].Reason != c.reason {
+				t.Fatalf("reason = %q, want %q", rec.calls[0].Reason, c.reason)
+			}
 			assertNothingDeleted(t, client)
 		})
 	}
+
+	t.Run("layout migration held", func(t *testing.T) {
+		f := lmSetup(t, "old", false, "20Gi")
+		rec := &hibRec{fakeCordoner: &fakeCordoner{}}
+		f.m.cordoner = rec
+		w := lmWorker(true)
+		w.Hibernation = &protocol.Hibernation{State: protocol.HibernationPreparing, OpID: "op-1"}
+		obs, err := f.m.Observe(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+			t.Fatalf("refusal tick: %v", err)
+		}
+		if replicaPatches(f.client) != 0 {
+			t.Fatalf("a refusal case issued a replicas patch: %v", deploymentPatchBodies(f.client))
+		}
+		if got := rec.transitions(); len(got) != 1 || got[0] != protocol.TransitionRefused || rec.calls[0].Reason != refuseLayoutHeld {
+			t.Fatalf("calls = %+v, want one refused with %s", rec.calls, refuseLayoutHeld)
+		}
+	})
 }
 
 func TestAwakeDriftedSiblingStillRollsWhenItsOnlyCoveragePeerIsHibernated(t *testing.T) {
@@ -620,5 +659,165 @@ func TestSecretAndVolumesSurviveEveryHibernationPath(t *testing.T) {
 		}
 		assertNothingDeleted(t, client)
 		assertNoSecretReads(t, client)
+	}
+}
+
+// noopKeepsRV makes the fake apiserver behave like a real one for a merge patch that
+// changes nothing: the object is returned as stored, with no resourceVersion bump.
+// The shared enforcing client bumps on every patch, which hides that a repeated
+// identical fence would not advance the resourceVersion.
+func noopKeepsRV(client *fake.Clientset) {
+	client.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		action := a.(k8stesting.PatchAction)
+		old, err := client.Tracker().Get(a.GetResource(), a.GetNamespace(), action.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		var patch map[string]any
+		if err := json.Unmarshal(action.GetPatch(), &patch); err != nil {
+			return true, nil, err
+		}
+		oldMeta := old.(*appsv1.Deployment)
+		md, _ := patch["metadata"].(map[string]any)
+		if md["uid"] != string(oldMeta.UID) || md["resourceVersion"] != oldMeta.ResourceVersion {
+			return false, nil, nil // let the enforcing reactor produce the conflict
+		}
+		delete(md, "uid")
+		delete(md, "resourceVersion")
+		stripped, _ := json.Marshal(patch)
+		raw, _ := json.Marshal(old)
+		merged, err := jsonpatch.MergePatch(raw, stripped)
+		if err != nil {
+			return true, nil, err
+		}
+		if jsonpatch.Equal(raw, merged) {
+			return true, old.DeepCopyObject(), nil
+		}
+		return false, nil, nil
+	})
+}
+
+// The fence must change the object every time it is sent, or a real apiserver leaves
+// the resourceVersion alone and the write is unprovable. A refused report that failed
+// is re-fenced and re-sent next tick.
+func TestRefusalFenceReadvancesAndIsResentAfterAFailedReport(t *testing.T) {
+	m, client, rec := hibEnv(t, hibDeployment(1, ""), hibPod("pod-uid-1", "x", true, false))
+	noopKeepsRV(client)
+	rec.err = errors.New("api 503")
+	w := hibW(protocol.HibernationPreparing, "op-1")
+	w.Busy = true
+
+	if err := hibTick(t, m, w); err == nil {
+		t.Fatal("tick 1 swallowed the failed refused report")
+	}
+	rv1 := hibGet(t, client).ResourceVersion
+	if err := hibTick(t, m, w); err == nil {
+		t.Fatal("tick 2 swallowed the failed refused report")
+	}
+	rv2 := hibGet(t, client).ResourceVersion
+	if rv1 == rv2 {
+		t.Fatalf("second fence did not advance the resourceVersion (%s)", rv1)
+	}
+	if got := rec.transitions(); len(got) != 2 || got[0] != protocol.TransitionRefused || got[1] != protocol.TransitionRefused {
+		t.Fatalf("transitions = %v, want refused re-sent", got)
+	}
+	if rec.calls[1].ResourceVersion != rv2 || rec.calls[0].ResourceVersion != rv1 {
+		t.Fatalf("refused rvs = %s, %s; fence rvs = %s, %s", rec.calls[0].ResourceVersion, rec.calls[1].ResourceVersion, rv1, rv2)
+	}
+	if replicaPatches(client) != 0 {
+		t.Fatal("a refusal tick patched replicas")
+	}
+}
+
+// A refusal reason that appears after the scale-down landed fences the object but
+// carries on with the op's progress, on every later tick, without erroring.
+func TestRefusalAfterScaleDownLandedKeepsReportingProgress(t *testing.T) {
+	m, client, rec := hibEnv(t, hibDeployment(1, ""), hibPod("pod-uid-1", "x", true, false))
+	noopKeepsRV(client)
+	w := hibW(protocol.HibernationPreparing, "op-1")
+
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	w.Busy = true // the reason appears only now
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if err := client.CoreV1().Pods(testConfig().Namespace).Delete(context.Background(), "pod-pod-uid-1", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatalf("tick 3: %v", err)
+	}
+	want := []string{protocol.TransitionScalingDown, protocol.TransitionScalingDown, protocol.TransitionScaledDown}
+	got := rec.transitions()
+	if len(got) != len(want) {
+		t.Fatalf("transitions = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("transitions = %v, want %v", got, want)
+		}
+	}
+	d := hibGet(t, client)
+	if last := rec.calls[2]; last.ResourceVersion != d.ResourceVersion || last.DeploymentUID != string(d.UID) {
+		t.Fatalf("scaled_down = %+v, deployment rv=%s", last, d.ResourceVersion)
+	}
+	if replicaPatches(client) != 1 {
+		t.Fatalf("replica patches = %d, want exactly the first scale-down", replicaPatches(client))
+	}
+}
+
+// A Deployment missing while a roll recycle is evidenced must not be recreated at zero
+// and nothing is reported: the api's preparing deadline moves the worker on.
+func TestMissingDeploymentUnderRollEvidenceIsNotCreatedWhilePreparing(t *testing.T) {
+	cfg := testConfig()
+	base := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m"}
+	marker := markedDeployment(t, cfg, base, false).Annotations[annotationRoll]
+	mirror := pvcFor("w1", "data")
+	mirror.Annotations = map[string]string{annotationRoll: marker}
+	garbage := pvcFor("w1", "data")
+	garbage.Annotations = map[string]string{annotationRoll: "{not json"}
+	for name, claim := range map[string]*corev1.PersistentVolumeClaim{"retained marker": mirror, "raw garbage reservation": garbage} {
+		t.Run(name, func(t *testing.T) {
+			rec := &hibRec{fakeCordoner: &fakeCordoner{}}
+			m, client := newMatWithCordoner(t, rec, pvcNix("w1", "20Gi"), claim)
+			if err := hibTick(t, m, hibW(protocol.HibernationPreparing, "op-1")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.AppsV1().Deployments(testConfig().Namespace).Get(context.Background(), "uzi-hw-w1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("a Deployment was created mid-roll: %v", err)
+			}
+			if len(rec.calls) != 0 {
+				t.Fatalf("reported %v", rec.transitions())
+			}
+		})
+	}
+}
+
+// A controller restarted mid-preparing finds the op annotation and replicas 0 with a pod
+// still present: it reports progress from what it reads, then scaled_down, and never
+// scales down a second time.
+func TestRestartMidPreparingResumesWithoutASecondScaleDown(t *testing.T) {
+	_, client, rec := hibEnv(t, hibDeployment(0, "op-1"), hibPod("pod-uid-1", "x", false, true))
+	m2 := New(client, testConfig(), testResolver(t), rec, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w := hibW(protocol.HibernationPreparing, "op-1")
+	if err := hibTick(t, m2, w); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.transitions(); len(got) != 1 || got[0] != protocol.TransitionScalingDown || rec.calls[0].PodUID != "pod-uid-1" {
+		t.Fatalf("restart tick = %+v, want scaling_down for the surviving pod", rec.calls)
+	}
+	if err := client.CoreV1().Pods(testConfig().Namespace).Delete(context.Background(), "pod-pod-uid-1", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hibTick(t, m2, w); err != nil {
+		t.Fatal(err)
+	}
+	if last := rec.calls[len(rec.calls)-1]; last.Transition != protocol.TransitionScaledDown {
+		t.Fatalf("final = %+v, want scaled_down", last)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 0 {
+		t.Fatalf("restart issued %d deployment patches, want none", n)
 	}
 }

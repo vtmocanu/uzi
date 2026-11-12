@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"sync/atomic"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +46,21 @@ const (
 	// no longer satisfy its precondition.
 	annotationHibernationRefused = "uzi.dev/hibernation-refused"
 )
+
+// Compile-time pin: the real api client is the hibernation channel the Materializer's
+// Cordoner type assertion looks for. Without it a signature drift would silently turn
+// every hibernation report into a no-op.
+var _ hibernationReporter = (*apiclient.Client)(nil)
+
+var refuseFenceSeq atomic.Uint64
+
+// refusalFenceValue is the annotation value of one refusal fence: "<op>/<unique>". It is
+// unique per send, never derived from the injectable clock alone, because a merge patch
+// that changes nothing does not advance a real apiserver's resourceVersion, and the
+// fence exists to advance it. The op id is the prefix up to the last "/".
+func refusalFenceValue(op string) string {
+	return op + "/" + strconv.FormatInt(time.Now().UnixNano(), 10) + "-" + strconv.FormatUint(refuseFenceSeq.Add(1), 10)
+}
 
 // Refusal reasons reported on a refused transition.
 const (
@@ -231,6 +249,13 @@ func (m *Materializer) hibernationRefusal(ctx context.Context, w protocol.Desire
 func (m *Materializer) hibernatePreparing(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) error {
 	op := w.Hibernation.OpID
 	if !obs.HasDeployment {
+		// Roll evidence that a recycle is in flight (a marker, a reservation, or a
+		// blocked snapshot) means the Deployment is missing mid-roll, not never-made:
+		// creating it here would fight the roll. Do nothing and let the api's preparing
+		// deadline move the worker on.
+		if e := rollFrom(ctx, w.ID); e != nil && (e.marker != nil || e.rawReservation || hasOpenReservation(e) || e.blocked != "") {
+			return nil
+		}
 		// Nothing runs, so there is nothing to protect and nothing to fence (a refusal
 		// carries the Deployment uid): the worker is created already asleep.
 		return m.createHibernationDeployment(ctx, w, obs, ns, spec, 0)
@@ -241,7 +266,7 @@ func (m *Materializer) hibernatePreparing(ctx context.Context, w protocol.Desire
 	name := deploymentName(w.ID)
 
 	if reason := m.hibernationRefusal(ctx, w, obs); reason != "" {
-		got, stale, err := m.conditionedPatch(ctx, ns, obs, name, map[string]any{"annotations": map[string]any{annotationHibernationRefused: op}}, nil)
+		got, stale, err := m.conditionedPatch(ctx, ns, obs, name, map[string]any{"annotations": map[string]any{annotationHibernationRefused: refusalFenceValue(op)}}, nil)
 		if err != nil || stale {
 			// No fence, no refusal this tick: a refusal the api acted on while a
 			// scale-down for this op could still land would be unsafe.
