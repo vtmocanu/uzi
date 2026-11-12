@@ -289,6 +289,7 @@ func TestCrossCheckChildStatusSinceExpireCodeLiveDB(t *testing.T) {
 		fx, deadline := setup(t, true)
 		aged := ageCrossCheckChild(ctx, t, fx.f.pool, fx.checkerID)
 		tx, _ := crossCheckTx(ctx, t, fx.f.pool)
+		pausedBefore := leadPausedSeconds(ctx, t, tx, fx.f.runID)
 		if err := expire(tx, fx); err != nil {
 			t.Fatal(err)
 		}
@@ -296,6 +297,13 @@ func TestCrossCheckChildStatusSinceExpireCodeLiveDB(t *testing.T) {
 		e := readCrossCheckEvidence(ctx, t, tx, fx.crossCheckID, "outcome")
 		if e.state != "failed" || e.reason != "timed_out" || !e.decided.Equal(deadline) {
 			t.Fatalf("evidence=%+v, want failed/timed_out decided at %s", e, deadline)
+		}
+		// Expiry leaves banking to BankCodeCrossCheckWait: no credit, no budget change here.
+		if e.wait {
+			t.Fatalf("wait_credited=true after ExpireCodeCrossCheck; banking belongs to BankCodeCrossCheckWait")
+		}
+		if got := leadPausedSeconds(ctx, t, tx, fx.f.runID); got != pausedBefore {
+			t.Fatalf("lead budget_paused_seconds=%d after expiry, want unchanged %d", got, pausedBefore)
 		}
 	})
 	t.Run("terminal_child_control", func(t *testing.T) {
