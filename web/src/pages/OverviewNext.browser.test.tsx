@@ -9,7 +9,7 @@ import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { api } from "../lib/api";
-import { healthySilentDoc } from "../mocks/data";
+import { healthySilentDoc, overviewNextDoc } from "../mocks/data";
 import { overviewNextOwnerWorkers } from "../mocks/data/overviewNext";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 import { useAuth } from "../auth/AuthContext";
@@ -1407,5 +1407,53 @@ describe("OverviewNext People chip", () => {
     expect(screen.queryByRole("dialog", { name: "People using uzi" })).toBeNull();
     expect(within(screen.getByRole("group", { name: "Usage scope" })).getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
     await expect.poll(() => document.activeElement?.id).toBe("overview-usage-by-user");
+  });
+});
+
+describe("OverviewNext health chip popover", () => {
+  function mountChip() {
+    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+    return screen.findByRole("button", { name: /System health/ });
+  }
+
+  it("opens on click, closes on Escape and on a click elsewhere, and returns focus to the chip", async () => {
+    await page.viewport(1280, 900);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    expect(dialog.checkVisibility(), "panel visible").toBe(true);
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+    expect(document.activeElement).toBe(chip);
+
+    await userEvent.click(chip);
+    await screen.findByRole("dialog", { name: "System health" });
+    await userEvent.click(document.body);
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+    await expect.poll(() => document.activeElement).toBe(chip);
+  });
+
+  it("stays inside the viewport as a bottom sheet at 375px", async () => {
+    await page.viewport(375, 900);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    await document.fonts.ready;
+    expect(window.innerWidth).toBe(375);
+    const r = dialog.getBoundingClientRect();
+    expect(r.left).toBeGreaterThanOrEqual(0);
+    expect(r.right).toBeLessThanOrEqual(window.innerWidth);
+    expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
+      window.innerWidth,
+    );
   });
 });
