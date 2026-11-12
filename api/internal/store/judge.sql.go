@@ -322,7 +322,7 @@ const currentTransactionIsolation = `-- name: CurrentTransactionIsolation :one
 SELECT current_setting('transaction_isolation')::text
 `
 
-// Issue #3257: the judge creation guard needs READ COMMITTED (see createJudgeGuarded), and
+// Issue #3257: the judge creation guard needs READ COMMITTED (see lockJudgeTargetForCreate), and
 // the pool's Begin is the only thing that decides the level, so the transaction asserts it.
 func (q *Queries) CurrentTransactionIsolation(ctx context.Context) (string, error) {
 	row := q.db.QueryRow(ctx, currentTransactionIsolation)
@@ -945,7 +945,8 @@ WHERE r.id = $1
 // conflicts with an FK cascade (runs_codex_secret_fk ON DELETE SET NULL during a credential
 // delete) or any other writer of the run row; a row lock here inverted lock order against
 // that delete and deadlocked. A row returned means the lock is held; no rows means the
-// target run is gone (and the advisory lock was never taken).
+// target run is gone; the lock may or may not be held then (the planner may evaluate it
+// first), which is harmless because the key does not depend on the row and it is XACT-scoped.
 //
 // The existence read in this statement uses the snapshot taken before any lock wait, which is
 // fine: the reads that must be fresh are the LATER, separate statements (the skip DELETE and

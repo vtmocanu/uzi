@@ -424,7 +424,7 @@ func dispReason(disposed bool, d store.RecommendationDisposition) string {
 // The response is {"review": …|null, "pending_judge": …|null, "skip": …|null} with ALL keys
 // always present and each nullable. "skip" (issue #3257) is the recorded reason the automatic
 // judge was not created, non-null only when there is no review and no pending judge.
-// review and pending_judge are independent. They are independent: an unjudged run with an
+// review and pending_judge are independent: an unjudged run with an
 // auto-judge in flight is review:null + pending_judge set, which is precisely the state
 // the panel could not previously distinguish from "never judged" — it showed "not judged
 // yet" next to a live button whose only possible outcome was a 409 from the
