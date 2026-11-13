@@ -195,6 +195,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A Claude run parks on a transient Cloudflare block page instead of failing ([#4271](https://github.com/vtmocanu/uzi/pull/4271), [#4272](https://github.com/vtmocanu/uzi/pull/4272)).**
   A 403 carrying the `Attention Required! | Cloudflare` page title is retried and parked as a provider outage, like a 529; every other 403 still fails fast.
 
+- **Database upgrades work on patched PostgreSQL minors ([#4273](https://github.com/vtmocanu/uzi/pull/4273), [#4274](https://github.com/vtmocanu/uzi/pull/4274)).**
+  Preserve intake-pause admission semantics while allowing run-table migrations on PostgreSQL 17.12, 16.16 and 18.7; repair fresh and pending schema upgrades without replacing function identity or grants.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -283,6 +286,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **An issue tracker allowlist in the Helm chart and compose ([#4173](https://github.com/vtmocanu/uzi/pull/4173)).**
   The Helm value `issueTracker.allowedBaseURLs`, with the compose `ISSUE_TRACKER_ALLOWED_BASE_URLS` pass-through, is empty by default, https-only and never used for worker egress; behaviour is unchanged for forges.
+
+- **Workload labels and annotations for clusters with strict admission policies ([#4237](https://github.com/vtmocanu/uzi/pull/4237)).**
+  `workloadLabels` / `workloadAnnotations` add metadata to every uzi Deployment and StatefulSet, hosted worker Deployments included, on the object's own metadata, without changing worker pod templates or their spec hashes; the controller restarts to load the configuration.
+
+- **Worker startup records the outcome of every `.retire-*` retirement scratch parent its bounded root listing reaches ([#4143](https://github.com/vtmocanu/uzi/pull/4143), [#4267](https://github.com/vtmocanu/uzi/pull/4267)).**
+  Observation only: one total line per startup whenever the runner root is a directory that was listed (none when it is missing, a symlink, not a directory or unlistable); each parent is kept and nothing is deleted, chowned or moved; bytes are measured read-only within one 30 s startup budget. Disable with chart `workers.epochReclaim.retireScratchOutcomes: false`; reclaim stays open pending a durable parent binding.
 
 ### Changed
 
@@ -384,6 +393,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **A retained-adoption hold on an active secret remediation no longer offers Resume ([#4177](https://github.com/vtmocanu/uzi/pull/4177), [#4254](https://github.com/vtmocanu/uzi/pull/4254)).**
   A closed-set `recovery_wait_detail` (`secret_remediation_active` or `remediation_proof_unknown`) now qualifies the adoption-failed park; Resume is refused with a 409 before any write on the active value, and the CLI, TUI and web show an available archive (which may omit later work) or operator recovery, then Cancel.
+
+- **Overview usage counts primary work runs ([#4209](https://github.com/vtmocanu/uzi/pull/4209), [#4269](https://github.com/vtmocanu/uzi/pull/4269)).**
+  Runs and failure rates exclude helper runs while their token and cost spend remains included and disclosed.
 
 ### Security
 
