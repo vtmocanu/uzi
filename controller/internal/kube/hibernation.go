@@ -140,9 +140,11 @@ func applyPodEvidence(o *reconcile.ObservedWorker, pods []corev1.Pod) {
 // eviction publishes phase Failed before it kills the containers. It fails closed: a
 // missing, short or extra status entry, an unnamed match, a running or waiting
 // container, or a pod with no regular containers all read as not stopped. Any
-// terminated reason counts, ContainerStatusUnknown included: a live kubelet writes it
-// only once the pod's termination has finished, and refusing it would hold the wake
-// for good behind an ordinary eviction's residue (PRD #4205 D27). A
+// terminated reason counts, ContainerStatusUnknown included: kubelet writes it when it
+// finalises a terminated pod or when the runtime no longer lists a container that was
+// running, so the runtime holds no such container, and refusing it would hold the wake
+// for good behind an ordinary eviction's residue (PRD #4205 D27; a deliberate
+// departure from ADR-1470's stricter roll-promotion reading). A
 // deletionTimestamp is irrelevant.
 func podStopped(p corev1.Pod) bool {
 	if p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
