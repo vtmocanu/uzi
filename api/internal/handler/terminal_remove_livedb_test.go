@@ -65,12 +65,23 @@ func seedTerminal(t *testing.T, f *salvageRemoveFixture, repo, run uuid.UUID, st
 	if state == "publishing" {
 		return
 	}
-	cliMustExec(t, f.pool, `UPDATE run_terminal_preservations SET state='live' WHERE run_id=$1`, run)
+	terminalGoLive(t, f, `run_id=$1 AND state='publishing'`, run)
 	if state == "live" {
 		return
 	}
 	cliMustExec(t, f.pool, `UPDATE run_terminal_preservations SET state='retiring', retire_tip=repeat('a',40),
 		retire_reason='issue_closed', retire_observed_at=now(), retire_decided_at=now() WHERE run_id=$1`, run)
+}
+
+// terminalGoLive moves the matching publishing rows to live. The CHECK requires a live row to carry
+// its tip, and the guard only lets the tip move to the tip of a published contribution; these
+// fixtures record no contribution (the guards under test do not read one), so the guard trigger is
+// off for this one statement. The CHECKs stay on.
+func terminalGoLive(t *testing.T, f *salvageRemoveFixture, where string, arg any) {
+	t.Helper()
+	cliMustExec(t, f.pool, `ALTER TABLE run_terminal_preservations DISABLE TRIGGER run_terminal_preservation_guard`)
+	defer cliMustExec(t, f.pool, `ALTER TABLE run_terminal_preservations ENABLE TRIGGER run_terminal_preservation_guard`)
+	cliMustExec(t, f.pool, `UPDATE run_terminal_preservations SET state='live', tip=repeat('a',40) WHERE `+where, arg)
 }
 
 // settleTerminal ends the row's life the way a completed retirement does, so the removal can
@@ -87,7 +98,8 @@ func newTerminalRemoveFixture(t *testing.T) *salvageRemoveFixture {
 	// the users -> runs cascade that cleanup performs. The walk follows the transition matrix.
 	t.Cleanup(func() {
 		for _, stmt := range []string{
-			`UPDATE run_terminal_preservations SET state='live' WHERE user_id=$1 AND state='publishing'`,
+			// A publishing row never recorded a tip, so it ends as not published (no live row without one).
+			`UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE user_id=$1 AND state='publishing'`,
 			`UPDATE run_terminal_preservations SET state='retiring', retire_tip=repeat('a',40), retire_reason='issue_closed',
 				retire_observed_at=now(), retire_decided_at=now() WHERE user_id=$1 AND state='live'`,
 			`UPDATE run_terminal_preservations SET state='abandoned', live_run_id=NULL WHERE user_id=$1 AND state='retiring'`,
@@ -124,7 +136,7 @@ func TestDeleteWithLiveTerminalPreservationIs409LiveDB(t *testing.T) {
 			rowSurvives(t, f, "run_terminal_preservations", "run_id", run, "a terminal 409")
 
 			if state != "retiring" {
-				cliMustExec(t, f.pool, `UPDATE run_terminal_preservations SET state='live' WHERE run_id=$1 AND state='publishing'`, run)
+				terminalGoLive(t, f, `run_id=$1 AND state='publishing'`, run)
 				cliMustExec(t, f.pool, `UPDATE run_terminal_preservations SET state='retiring', retire_tip=repeat('a',40), retire_reason='issue_closed',
 					retire_observed_at=now(), retire_decided_at=now() WHERE run_id=$1 AND state='live'`, run)
 			}

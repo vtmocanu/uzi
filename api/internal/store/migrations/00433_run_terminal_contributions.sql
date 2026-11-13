@@ -60,6 +60,9 @@ CREATE TABLE run_terminal_contributions (
         CHECK (disposition <> 'preserved' OR (state = 'prepared') = (create_invoked_at IS NULL)),
     CONSTRAINT run_terminal_contributions_abandoned_never_invoked_check
         CHECK (disposition = 'preserved' OR create_invoked_at IS NULL),
+    -- A refusal reason belongs to a refused contribution only.
+    CONSTRAINT run_terminal_contributions_refusal_state_check
+        CHECK (refusal_reason IS NULL OR state = 'refused'),
     CONSTRAINT run_terminal_contributions_published_stamp_check
         CHECK ((state = 'published') = (published_at IS NOT NULL))
 );

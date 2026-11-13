@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -27,7 +28,10 @@ const (
 
 var termStates = []string{"bound", "publishing", "live", "retiring", "deleted", "abandoned", "not_published"}
 
-// termAllowed is the preservation transition matrix the trigger must enforce.
+// termAllowed is the preservation transition matrix the trigger must enforce. publishing ->
+// not_published is conditional: it holds only while no tip, no first_published_at and no
+// invoked, publish_unknown or published contribution exists (the matrix fixture for publishing has
+// none of them; TestTerminalPreservationNotPublishedLiveDB covers the refusals).
 var termAllowed = map[string][]string{
 	"bound":         {"publishing", "not_published"},
 	"not_published": {"publishing"},
@@ -163,8 +167,11 @@ func (f *termFixture) toState(state string) store.RunTerminalPreservation {
 func (f *termFixture) transition(id uuid.UUID, from, to string) (int64, error) {
 	set := "state=$2"
 	switch to {
-	case "publishing", "live":
+	case "publishing":
 		set += ", live_run_id=run_id"
+	case "live":
+		// The live CHECK requires a tip; publishing -> live has a published contribution at it.
+		set += ", live_run_id=run_id, tip='" + termTipA + "'"
 	case "retiring":
 		set += ", live_run_id=run_id, retire_tip='" + termTipA + "', retire_reason='issue_closed', retire_observed_at=now(), retire_decided_at=now()"
 	case "deleted":
@@ -202,6 +209,10 @@ func TestTerminalPreservationMatrixLiveDB(t *testing.T) {
 				ft := *f
 				ft.t = t
 				p := ft.toState(from)
+				if from == "publishing" && to == "live" {
+					// The tip of a live row is the tip of a published contribution.
+					ft.publish(ft.insertContribution(p, 1, termTipA, nil))
+				}
 				n, err := ft.transition(p.ID, from, to)
 				if err != nil {
 					t.Fatalf("%s -> %s: %v", from, to, err)
@@ -251,6 +262,69 @@ func TestTerminalPreservationChecksLiveDB(t *testing.T) {
 	f.mustRows(1, `UPDATE run_terminal_preservations SET state='retiring', `+termRetireStamp+` WHERE id=$1`, live.ID, termTipA)
 	_, err = f.rows(`UPDATE run_terminal_preservations SET state='deleted', live_run_id=NULL WHERE id=$1`, live.ID)
 	heldCheckName(t, err, "run_terminal_preservations_deleted_at_check")
+
+	// A live row has read the ref back at a tip.
+	pub := f.insertPreservation(f.newRun())
+	f.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, pub.ID)
+	_, err = f.rows(`UPDATE run_terminal_preservations SET state='live' WHERE id=$1`, pub.ID)
+	heldCheckName(t, err, "run_terminal_preservations_live_tip_check")
+}
+
+// publishing -> not_published would clear the live pointer while a remote ref may exist: refused
+// once the row recorded a tip, and while any contribution of it may have created the ref.
+func TestTerminalPreservationNotPublishedLiveDB(t *testing.T) {
+	f := newTermFixture(t, "term_notpub_")
+
+	t.Run("live then publishing then not_published is refused", func(t *testing.T) {
+		ft := *f
+		ft.t = t
+		p, _ := ft.toLive(ft.newRun())
+		ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing' WHERE id=$1`, p.ID)
+		ft.mustRows(0, `UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE id=$1`, p.ID)
+		// The row is untouched: the pointer and the tip are still held.
+		ft.mustRows(1, `UPDATE run_terminal_preservations SET attempts=attempts WHERE id=$1 AND state='publishing' AND live_run_id IS NOT NULL AND tip IS NOT NULL`, p.ID)
+	})
+
+	t.Run("the CHECK backstops the guard", func(t *testing.T) {
+		ft := *f
+		ft.t = t
+		p, _ := ft.toLive(ft.newRun())
+		ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing' WHERE id=$1`, p.ID)
+		mustExec(ft.ctx, t, ft.pool, `ALTER TABLE run_terminal_preservations DISABLE TRIGGER run_terminal_preservation_guard`)
+		defer mustExec(ft.ctx, t, ft.pool, `ALTER TABLE run_terminal_preservations ENABLE TRIGGER run_terminal_preservation_guard`)
+		_, err := ft.rows(`UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE id=$1`, p.ID)
+		heldCheckName(t, err, "run_terminal_preservations_not_published_check")
+	})
+
+	t.Run("refused while a contribution may have created the ref", func(t *testing.T) {
+		ft := *f
+		ft.t = t
+		for _, state := range []string{"invoked", "publish_unknown", "published"} {
+			p := ft.insertPreservation(ft.newRun())
+			c := ft.insertContribution(p, 1, termTipA, nil)
+			ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, p.ID)
+			ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c.ID)
+			switch state {
+			case "publish_unknown":
+				ft.mustRows(1, `UPDATE run_terminal_contributions SET state='publish_unknown' WHERE id=$1`, c.ID)
+			case "published":
+				ft.mustRows(1, `UPDATE run_terminal_contributions SET state='published', published_at=now() WHERE id=$1`, c.ID)
+			}
+			ft.mustRows(0, `UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE id=$1`, p.ID)
+		}
+	})
+
+	t.Run("allowed while every contribution is unsent or refused", func(t *testing.T) {
+		ft := *f
+		ft.t = t
+		p := ft.insertPreservation(ft.newRun())
+		c := ft.insertContribution(p, 1, termTipA, nil)
+		ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, p.ID)
+		ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c.ID)
+		ft.mustRows(1, `UPDATE run_terminal_contributions SET state='refused', refusal_reason='create_refused' WHERE id=$1`, c.ID)
+		ft.insertContribution(p, 2, termTipB, nil) // prepared, never sent
+		ft.mustRows(1, `UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE id=$1`, p.ID)
+	})
 }
 
 func TestTerminalPreservationGuardLiveDB(t *testing.T) {
@@ -267,6 +341,10 @@ func TestTerminalPreservationGuardLiveDB(t *testing.T) {
 			"tip":             {"tip", "'" + termTipA + "'", ""},
 			"first published": {"first_published_at", "now()", ""},
 			"deleted_at":      {"deleted_at", "now()", ""},
+			"retire_tip":      {"retire_tip", "'" + termTipA + "'", ""},
+			"retire_reason":   {"retire_reason", "'issue_closed'", ""},
+			"retire_observed": {"retire_observed_at", "now()", ""},
+			"retire_decided":  {"retire_decided_at", "now()", ""},
 		} {
 			run := ft.newRun()
 			extraVal := ""
@@ -594,6 +672,9 @@ func TestTerminalContributionGuardLiveDB(t *testing.T) {
 		heldCheckName(t, err, "run_terminal_contributions_published_stamp_check")
 		_, err = ft.rows(`UPDATE run_terminal_contributions SET state='refused', refusal_reason='junk' WHERE id=$1`, c.ID)
 		heldCheckName(t, err, "run_terminal_contributions_refusal_reason_check")
+		// A refusal reason belongs to a refused contribution only.
+		_, err = ft.rows(`UPDATE run_terminal_contributions SET refusal_reason='foreign_tip' WHERE id=$1`, c.ID)
+		heldCheckName(t, err, "run_terminal_contributions_refusal_state_check")
 
 		// One contribution per (run, generation); the composite FK binds run to its preservation.
 		dup := ft.contributionParams(p, c.Generation, termTipA, nil)
@@ -787,5 +868,129 @@ func TestTerminalPreservationRollbackLiveDB(t *testing.T) {
 	}
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatalf("re-up: %v", err)
+	}
+}
+
+// termRefusal asserts a Down stopped with the refusal naming `want` and left both tables in place.
+func termRefusal(t *testing.T, err error, want string, pool interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Down error = %v, want the refusal %q", err, want)
+	}
+	var tables int
+	if qerr := pool.QueryRow(context.Background(), `SELECT count(*) FROM pg_class
+		WHERE relname IN ('run_terminal_preservations','run_terminal_contributions') AND relkind = 'r'`).Scan(&tables); qerr != nil {
+		t.Fatalf("count tables: %v", qerr)
+	}
+	// 432 alone leaves one table, the other cases two.
+	if tables == 0 {
+		t.Fatal("a refused Down dropped the tables")
+	}
+}
+
+// Each Down's own refusal fires, reached through the migration that owns it: a Down below it runs
+// first, so the rows are inserted only after the later migrations are rolled back.
+func TestTerminalPreservationRollbackRefusalsLiveDB(t *testing.T) {
+	// 00432: a pointer-bearing preservation with no contribution (00433 would not refuse it).
+	t.Run("00432 refuses a live pointer", func(t *testing.T) {
+		ctx, dsn, pool := heldMigratedPool(t, "term_rb432_")
+		f := heldNewHoldFixture(ctx, t, pool, false, "failed", nil)
+		ft := &termFixture{heldFixture: f, ctx: ctx, q: store.New(pool), t: t}
+		if err := store.MigrateDownTo(ctx, dsn, 432); err != nil {
+			t.Fatalf("Down to 432: %v", err)
+		}
+		p := ft.insertPreservation(f.run)
+		ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, p.ID)
+		termRefusal(t, store.MigrateDownTo(ctx, dsn, 431), "run_terminal_preservations has live rows", pool)
+		// Dropping the pointer is what unblocks it: the refusal was the only obstacle.
+		// The guard reads run_terminal_contributions, already rolled back: clear the pointer past it.
+		mustExec(ctx, t, pool, `ALTER TABLE run_terminal_preservations DISABLE TRIGGER run_terminal_preservation_guard`)
+		ft.mustRows(1, `UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE id=$1`, p.ID)
+		if err := store.MigrateDownTo(ctx, dsn, 431); err != nil {
+			t.Fatalf("Down after the pointer was cleared: %v", err)
+		}
+	})
+
+	// 00433: no pointer anywhere, but a push that may have created the ref.
+	for _, state := range []string{"invoked", "publish_unknown"} {
+		t.Run("00433 refuses an "+state+" contribution", func(t *testing.T) {
+			ctx, dsn, pool := heldMigratedPool(t, "term_rb433_")
+			f := heldNewHoldFixture(ctx, t, pool, false, "failed", nil)
+			ft := &termFixture{heldFixture: f, ctx: ctx, q: store.New(pool), t: t}
+			if err := store.MigrateDownTo(ctx, dsn, 433); err != nil {
+				t.Fatalf("Down to 433: %v", err)
+			}
+			p := ft.insertPreservation(f.run)
+			c := ft.insertContribution(p, 1, termTipA, nil)
+			ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c.ID)
+			if state == "publish_unknown" {
+				ft.mustRows(1, `UPDATE run_terminal_contributions SET state='publish_unknown' WHERE id=$1`, c.ID)
+			}
+			termRefusal(t, store.MigrateDownTo(ctx, dsn, 432), "run_terminal_contributions has live rows", pool)
+			ft.mustRows(1, `UPDATE run_terminal_contributions SET state='refused', refusal_reason='create_refused' WHERE id=$1`, c.ID)
+			if err := store.MigrateDownTo(ctx, dsn, 432); err != nil {
+				t.Fatalf("Down after the contribution was refused: %v", err)
+			}
+		})
+	}
+
+	// 00434 runs first on a full rollback: its refusal must stop it before the reasons are cleared.
+	for name, arrange := range map[string]func(ft *termFixture, run uuid.UUID){
+		"a live pointer": func(ft *termFixture, run uuid.UUID) {
+			p := ft.insertPreservation(run)
+			ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, p.ID)
+		},
+		"an invoked contribution": func(ft *termFixture, run uuid.UUID) {
+			p := ft.insertPreservation(run)
+			c := ft.insertContribution(p, 1, termTipA, nil)
+			ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c.ID)
+		},
+	} {
+		t.Run("00434 refuses "+name+" before clearing the reasons", func(t *testing.T) {
+			ctx, dsn, pool := heldMigratedPool(t, "term_rb434_")
+			f := heldNewHoldFixture(ctx, t, pool, false, "failed", nil)
+			ft := &termFixture{heldFixture: f, ctx: ctx, q: store.New(pool), t: t}
+			arrange(ft, f.run)
+			mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds DISABLE TRIGGER completed_publication_hold_guard`)
+			mustExec(ctx, t, pool, `UPDATE recovery_custody_holds SET completed_publication_reason='terminal_preservation_refused' WHERE id=$1`, f.hold)
+			mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds ENABLE TRIGGER completed_publication_hold_guard`)
+
+			termRefusal(t, store.MigrateDownTo(ctx, dsn, 431), "has live rows", pool)
+			var reason *string
+			if err := pool.QueryRow(ctx, `SELECT completed_publication_reason FROM recovery_custody_holds WHERE id=$1`, f.hold).Scan(&reason); err != nil ||
+				reason == nil || *reason != "terminal_preservation_refused" {
+				t.Fatalf("a refused rollback cleared the reason: %v err=%v", reason, err)
+			}
+		})
+	}
+}
+
+// The 00434 Down must clear the new reasons on a hold that carries a merged-predecessor discard
+// binding, which merged_predecessor_discard_guard rejects any change to unless it is disabled.
+func TestTerminalPreservationRollbackBoundHoldLiveDB(t *testing.T) {
+	ctx, dsn, pool := heldMigratedPool(t, "term_rbbind_")
+	f := heldNewHoldFixture(ctx, t, pool, false, "failed", nil)
+	// The binding is validated by the guard on the way in; the guards are off to seed the end state.
+	mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds DISABLE TRIGGER merged_predecessor_discard_guard`)
+	mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds DISABLE TRIGGER completed_publication_hold_guard`)
+	mustExec(ctx, t, pool, `UPDATE recovery_custody_holds SET state='discarded', live_worker_id=NULL, live_run_id=NULL,
+		release_evidence='merged_predecessor_discard', merged_predecessor_discard_binding='{}'::jsonb,
+		completed_publication_reason='terminal_preservation_pending' WHERE id=$1`, f.hold)
+	mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds ENABLE TRIGGER completed_publication_hold_guard`)
+	mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds ENABLE TRIGGER merged_predecessor_discard_guard`)
+
+	if err := store.MigrateDownTo(ctx, dsn, 431); err != nil {
+		t.Fatalf("Down with a bound hold: %v", err)
+	}
+	var reason *string
+	if err := pool.QueryRow(ctx, `SELECT completed_publication_reason FROM recovery_custody_holds WHERE id=$1`, f.hold).Scan(&reason); err != nil || reason != nil {
+		t.Fatalf("the new reason survived Down: %v err=%v", reason, err)
+	}
+	var enabled string
+	if err := pool.QueryRow(ctx, `SELECT tgenabled::text FROM pg_trigger
+		WHERE tgrelid='recovery_custody_holds'::regclass AND tgname='merged_predecessor_discard_guard'`).Scan(&enabled); err != nil || enabled != "O" {
+		t.Fatalf("merged_predecessor_discard_guard not re-enabled: %q %v", enabled, err)
 	}
 }

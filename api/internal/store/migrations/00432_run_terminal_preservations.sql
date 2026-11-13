@@ -65,7 +65,14 @@ CREATE TABLE run_terminal_preservations (
         CHECK ((state = 'deleted') = (deleted_at IS NOT NULL)),
     CONSTRAINT run_terminal_preservations_retire_stamp_check
         CHECK (state NOT IN ('retiring', 'deleted') OR (retire_tip IS NOT NULL AND retire_reason IS NOT NULL
-            AND retire_observed_at IS NOT NULL AND retire_decided_at IS NOT NULL))
+            AND retire_observed_at IS NOT NULL AND retire_decided_at IS NOT NULL)),
+    -- A live row has read the ref back at a tip.
+    CONSTRAINT run_terminal_preservations_live_tip_check
+        CHECK (state <> 'live' OR tip IS NOT NULL),
+    -- not_published means no ref was ever created: a row that recorded a tip or a first publish
+    -- may own a remote ref and can never become one.
+    CONSTRAINT run_terminal_preservations_not_published_check
+        CHECK (state <> 'not_published' OR (tip IS NULL AND first_published_at IS NULL))
 );
 
 -- The sweep's due list, by due time, over the states that still have work.
@@ -115,6 +122,15 @@ BEGIN
         OR (OLD.state = 'retiring' AND NEW.state IN ('deleted', 'abandoned'))
     ) THEN
         RETURN NULL;
+    END IF;
+    -- No ref was ever created: refuse while a push of this preservation may have created one
+    -- (invoked, publish_unknown) or did (published). The tip and first_published_at are held to
+    -- NULL by the not_published CHECK, but a contribution can be ahead of the preservation row.
+    IF NEW.state = 'not_published' AND OLD.state <> 'not_published' THEN
+        IF EXISTS (SELECT 1 FROM run_terminal_contributions c
+            WHERE c.preservation_id = NEW.id AND c.state IN ('invoked', 'publish_unknown', 'published')) THEN
+            RETURN NULL;
+        END IF;
     END IF;
     -- The tip moves forward only to the tip of a published contribution of this preservation,
     -- and only from the tip that contribution was prepared against (or from no tip at all).
