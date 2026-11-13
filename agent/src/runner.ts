@@ -27016,7 +27016,7 @@ export class RunRunner {
    *     `retained_credential_switch` site and keeps its custody flags.
    *  2. PROOF under one MaintenanceBudget: the executor's lane is settled, the settle observed the run
    *     empty, and the own-mode quiescence proof is not blocked (`settleSwitchQuiescence`). Unproven sends
-   *     `credential_switch_held` WITH the op id (bounded identical retries) and stops the flight held:
+   *     `credential_switch_held` WITH the op id (identical retries on a capped backoff until confirmed, refused, stale or a lifecycle stop) and stops the flight held:
    *     nothing is applied and no turn starts on either token.
    *  3. Proven: hold sequence numbering and drain the transport (`holdForCredentialSwitch`), then apply
    *     through the write-ahead ledger. `applied` publishes the token to every sink in one synchronous
