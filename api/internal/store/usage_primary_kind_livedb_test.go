@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -39,18 +43,17 @@ func (f *primaryKindFixture) exec(sql string, args ...any) {
 }
 
 type pkRun struct {
-	user      uuid.UUID
-	kind      string
-	status    string
-	origin    string
-	age       string // postgres interval before now()
-	harness   string // "" = claude
-	factor    int64  // 0 = no run_usage row
-	cost      string // cost_status for the usage row; "" = metered
-	patch     bool
-	mrIID     int64 // 0 = none
-	autoAppr  bool
-	hasTarget bool
+	user     uuid.UUID
+	kind     string
+	status   string
+	origin   string
+	age      string // postgres interval before now()
+	harness  string // "" = claude
+	factor   int64  // 0 = no run_usage row
+	cost     string // cost_status for the usage row; "" = metered
+	patch    bool
+	mrIID    int64 // 0 = none
+	autoAppr bool
 }
 
 // seed inserts one run with the schema-valid shape of its kind and an optional usage row.
@@ -174,12 +177,21 @@ func TestUsagePrimaryKindFunctionLiveDB(t *testing.T) {
 	}
 	// Inlining: STRICT, SECURITY DEFINER or a SET clause would stop PostgreSQL from inlining the
 	// function, leaving an opaque per-row call. The VERBOSE plan must show the expanded qual.
-	for name, q := range map[string]string{
-		"SelfUsage": `WITH scoped AS (SELECT r.created_at, r.kind FROM runs r WHERE r.user_id = $1 AND r.kind <> 'chat')
-		              SELECT count(*) FILTER (WHERE fn_usage_primary_kind(kind)) FROM scoped`,
-		"outcomes": `SELECT count(*) FROM runs WHERE user_id = $1 AND status IN ('completed','failed','cancelled') AND fn_usage_primary_kind(kind)`,
+	// The plans are those of the real sqlc statements, read from their generated constants.
+	landable := workersvc.AllHumanLandableFailOrigins()
+	for _, c := range []struct {
+		name string
+		args []any
+	}{
+		{"selfUsage", []any{e.userID}},
+		{"selfRunOutcomes", []any{e.userID, landable}},
+		{"adminUsageTotals", nil},
+		{"adminUsagePerUser", nil},
+		{"adminRunOutcomes", []any{landable}},
+		{"adminRunOutcomesPerUser", []any{landable}},
 	} {
-		rows, err := e.pool.Query(e.ctx, "EXPLAIN (VERBOSE) "+q, e.userID)
+		name := c.name
+		rows, err := e.pool.Query(e.ctx, "EXPLAIN (VERBOSE) "+sqlcConst(t, c.name), c.args...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -198,10 +210,51 @@ func TestUsagePrimaryKindFunctionLiveDB(t *testing.T) {
 		if strings.Contains(plan.String(), "fn_usage_primary_kind") {
 			t.Errorf("%s: fn_usage_primary_kind was not inlined:\n%s", name, plan.String())
 		}
-		if !strings.Contains(plan.String(), "ANY") {
-			t.Errorf("%s: expected an inlined kind = ANY (...) qual:\n%s", name, plan.String())
+		if !strings.Contains(plan.String(), "kind = ANY ('{issue,task,prompt,job,self_improve}'") {
+			t.Errorf("%s: expected the inlined primary-kind qual:\n%s", name, plan.String())
 		}
 	}
+}
+
+// sqlcConst returns the value of an unexported string constant of the generated
+// runtime.sql.go (a concatenation of string literals), so the plan check runs the real SQL.
+func sqlcConst(t *testing.T, name string) string {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), "runtime.sql.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eval func(ast.Expr) string
+	eval = func(x ast.Expr) string {
+		switch v := x.(type) {
+		case *ast.BasicLit:
+			s, err := strconv.Unquote(v.Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		case *ast.BinaryExpr:
+			return eval(v.X) + eval(v.Y)
+		case *ast.ParenExpr:
+			return eval(v.X)
+		}
+		t.Fatalf("const %s: unsupported expression %T", name, x)
+		return ""
+	}
+	for _, d := range file.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, s := range gd.Specs {
+			vs := s.(*ast.ValueSpec)
+			if len(vs.Names) == 1 && vs.Names[0].Name == name {
+				return eval(vs.Values[0])
+			}
+		}
+	}
+	t.Fatalf("const %s not found in runtime.sql.go", name)
+	return ""
 }
 
 func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
@@ -210,13 +263,18 @@ func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
 	ctx := f.ctx
 
 	type acc struct {
-		run, last7, claude, codex, l7claude, l7codex int64
-		in, out, cost, last7cost, sub, unrep         int64
+		run, last7, claude, codex, l7claude, l7codex       int64
+		in, cr, cc, out, cost, sub, unrep                  int64
+		l7in, l7cr, l7cc, l7out, last7cost, l7sub, l7unrep int64
+	}
+	// figures lists every usage sum in the order the row figures below use.
+	figures := func(a *acc) [14]int64 {
+		return [14]int64{a.in, a.cr, a.cc, a.out, a.cost, a.sub, a.unrep, a.l7in, a.l7cr, a.l7cc, a.l7out, a.last7cost, a.l7sub, a.l7unrep}
 	}
 	want := map[int]*acc{0: {}, 1: {}, 2: {}}
 	var factor int64 = 10
-	add := func(u int, r pkRun) {
-		f.seed(r)
+	add := func(u int, r pkRun) uuid.UUID {
+		id := f.seed(r)
 		a := want[u]
 		recent := r.age == "1 day" || r.age == "2 days"
 		primary := wantPrimaryKinds[r.kind]
@@ -228,7 +286,7 @@ func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
 			harness = "codex"
 		}
 		if r.factor == 0 || r.kind == "chat" { // chat usage is excluded from every usage figure
-			return
+			return id
 		}
 		if primary {
 			a.run++
@@ -247,6 +305,8 @@ func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
 			}
 		}
 		a.in += r.factor
+		a.cr += 2 * r.factor
+		a.cc += 3 * r.factor
 		a.out += 4 * r.factor
 		cost := int64(0)
 		switch r.cost {
@@ -254,13 +314,24 @@ func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
 			cost = r.factor * 5
 		case "subscription":
 			a.sub++
+			if recent {
+				a.l7sub++
+			}
 		case "unreported":
 			a.unrep++
+			if recent {
+				a.l7unrep++
+			}
 		}
 		a.cost += cost
 		if recent {
+			a.l7in += r.factor
+			a.l7cr += 2 * r.factor
+			a.l7cc += 3 * r.factor
+			a.l7out += 4 * r.factor
 			a.last7cost += cost
 		}
+		return id
 	}
 	// The fixture's own 30-day issue run (user 0) carries no usage.
 	for _, kind := range usagePrimaryRegistryKinds(t) {
@@ -292,8 +363,23 @@ func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
 		add(0, pkRun{user: users[0], kind: "ci_fix", status: "completed", age: "1 day", factor: factor, autoAppr: auto})
 	}
 	factor++
-	add(0, pkRun{user: users[0], kind: "ci_fix", status: "completed", age: "1 day", factor: factor, autoAppr: true})
-	f.exec(`UPDATE runs SET auto_approve = false WHERE kind = 'ci_fix' AND user_id = $1 AND auto_approve`, users[0])
+	cleared := add(0, pkRun{user: users[0], kind: "ci_fix", status: "completed", age: "1 day", factor: factor, autoAppr: true})
+	f.exec(`UPDATE runs SET auto_approve = false WHERE id = $1`, cleared)
+	// Both shapes must exist when counts are read: exactly one still-automatic ci_fix (the
+	// earlier auto=true seed) and the cleared one, each with usage.
+	var stillAuto, clearedAuto, withUsage int
+	if err := f.tx.QueryRow(ctx, `SELECT count(*) FROM runs r WHERE r.kind = 'ci_fix' AND r.user_id = $1 AND r.auto_approve`, users[0]).Scan(&stillAuto); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.tx.QueryRow(ctx, `SELECT count(*) FROM runs r WHERE r.id = $1 AND NOT r.auto_approve`, cleared).Scan(&clearedAuto); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.tx.QueryRow(ctx, `SELECT count(*) FROM run_usage u JOIN runs r ON r.id = u.run_id WHERE r.kind = 'ci_fix' AND r.user_id = $1 AND (r.auto_approve OR r.id = $2)`, users[0], cleared).Scan(&withUsage); err != nil {
+		t.Fatal(err)
+	}
+	if stillAuto != 1 || clearedAuto != 1 || withUsage != 2 {
+		t.Fatalf("fixture bug: automatic ci_fix %d (want 1), cleared %d (want 1), with usage %d (want 2)", stillAuto, clearedAuto, withUsage)
+	}
 	// A chat run with usage is excluded from everything.
 	f.seed(pkRun{user: users[0], kind: "chat", status: "completed", age: "1 day", factor: 999})
 	// User 2 has helper usage only.
@@ -309,10 +395,13 @@ func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := [7]int64{s.RunCount, s.LifetimeInputTokens, s.LifetimeOutputTokens, microsOf(t, s.LifetimeCostUsd), microsOf(t, s.Last7CostUsd), s.LifetimeSubscriptionRunCount, s.LifetimeUnreportedRunCount}
-		exp := [7]int64{a.run, a.in, a.out, a.cost, a.last7cost, a.sub, a.unrep}
-		if got != exp {
-			t.Errorf("SelfUsage user %d: got %v want %v", i, got, exp)
+		got := [14]int64{s.LifetimeInputTokens, s.LifetimeCacheReadTokens, s.LifetimeCacheCreationTokens, s.LifetimeOutputTokens, microsOf(t, s.LifetimeCostUsd), s.LifetimeSubscriptionRunCount, s.LifetimeUnreportedRunCount,
+			s.Last7InputTokens, s.Last7CacheReadTokens, s.Last7CacheCreationTokens, s.Last7OutputTokens, microsOf(t, s.Last7CostUsd), s.Last7SubscriptionRunCount, s.Last7UnreportedRunCount}
+		if got != figures(a) {
+			t.Errorf("SelfUsage user %d sums: got %v want %v", i, got, figures(a))
+		}
+		if s.RunCount != a.run {
+			t.Errorf("SelfUsage user %d run_count = %d, want %d", i, s.RunCount, a.run)
 		}
 	}
 
@@ -325,6 +414,7 @@ func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
 		t.Fatalf("per-user rows = %d, want 3 (helper-only user keeps a row)", len(per))
 	}
 	var sum acc
+	var sumFig [14]int64
 	for _, r := range per {
 		i := -1
 		for j, u := range users {
@@ -336,10 +426,18 @@ func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
 			t.Fatalf("unexpected user %s", r.UserID)
 		}
 		a := want[i]
-		got := [12]int64{r.RunCount, r.Last7RunCount, r.ClaudeRunCount, r.CodexRunCount, r.Last7ClaudeRunCount, r.Last7CodexRunCount, r.InputTokens, r.OutputTokens, microsOf(t, r.CostUsd), microsOf(t, r.Last7CostUsd), r.SubscriptionRunCount, r.UnreportedRunCount}
-		exp := [12]int64{a.run, a.last7, a.claude, a.codex, a.l7claude, a.l7codex, a.in, a.out, a.cost, a.last7cost, a.sub, a.unrep}
+		got := [6]int64{r.RunCount, r.Last7RunCount, r.ClaudeRunCount, r.CodexRunCount, r.Last7ClaudeRunCount, r.Last7CodexRunCount}
+		exp := [6]int64{a.run, a.last7, a.claude, a.codex, a.l7claude, a.l7codex}
 		if got != exp {
-			t.Errorf("AdminUsagePerUser user %d: got %v want %v", i, got, exp)
+			t.Errorf("AdminUsagePerUser user %d counts: got %v want %v", i, got, exp)
+		}
+		fig := [14]int64{r.InputTokens, r.CacheReadTokens, r.CacheCreationTokens, r.OutputTokens, microsOf(t, r.CostUsd), r.SubscriptionRunCount, r.UnreportedRunCount,
+			r.Last7InputTokens, r.Last7CacheReadTokens, r.Last7CacheCreationTokens, r.Last7OutputTokens, microsOf(t, r.Last7CostUsd), r.Last7SubscriptionRunCount, r.Last7UnreportedRunCount}
+		if fig != figures(a) {
+			t.Errorf("AdminUsagePerUser user %d sums: got %v want %v", i, fig, figures(a))
+		}
+		for k := range sumFig {
+			sumFig[k] += fig[k]
 		}
 		if r.ClaudeRunCount+r.CodexRunCount != r.RunCount || r.Last7ClaudeRunCount+r.Last7CodexRunCount != r.Last7RunCount {
 			t.Errorf("user %d: claude+codex != run_count", i)
@@ -354,17 +452,24 @@ func TestUsagePrimaryRunCountsLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var wantRun, wantIn, wantCost int64
+	var wantRun int64
+	var wantFig [14]int64
 	for _, a := range want {
 		wantRun += a.run
-		wantIn += a.in
-		wantCost += a.cost
+		for k, v := range figures(a) {
+			wantFig[k] += v
+		}
 	}
 	if tot.RunCount != wantRun || tot.RunCount != sum.run {
 		t.Errorf("AdminUsageTotals.RunCount = %d, want %d (per-user sum %d)", tot.RunCount, wantRun, sum.run)
 	}
-	if tot.LifetimeInputTokens != wantIn || microsOf(t, tot.LifetimeCostUsd) != wantCost {
-		t.Errorf("AdminUsageTotals tokens/cost = %d/%d, want %d/%d", tot.LifetimeInputTokens, microsOf(t, tot.LifetimeCostUsd), wantIn, wantCost)
+	totFig := [14]int64{tot.LifetimeInputTokens, tot.LifetimeCacheReadTokens, tot.LifetimeCacheCreationTokens, tot.LifetimeOutputTokens, microsOf(t, tot.LifetimeCostUsd), tot.LifetimeSubscriptionRunCount, tot.LifetimeUnreportedRunCount,
+		tot.Last7InputTokens, tot.Last7CacheReadTokens, tot.Last7CacheCreationTokens, tot.Last7OutputTokens, microsOf(t, tot.Last7CostUsd), tot.Last7SubscriptionRunCount, tot.Last7UnreportedRunCount}
+	if totFig != wantFig {
+		t.Errorf("AdminUsageTotals sums: got %v want %v", totFig, wantFig)
+	}
+	if totFig != sumFig {
+		t.Errorf("AdminUsageTotals sums %v != per-user sum %v", totFig, sumFig)
 	}
 	if sum.last7 != want[0].last7+want[1].last7+want[2].last7 {
 		t.Errorf("last7 per-user sum %d", sum.last7)
@@ -386,12 +491,19 @@ func TestUsagePrimaryRunOutcomesLiveDB(t *testing.T) {
 	for _, o := range workersvc.AllHumanLandableFailOrigins() {
 		landable[o] = true
 	}
-	primary := func(u int, kind, status, origin, age string, usage bool, patch bool) {
+	// The expected last (non-rejected, non-diverged) failure per user: all finished_at values
+	// equal the transaction's now(), so the newest failure is the one with the greatest id.
+	type lastFail struct {
+		id     uuid.UUID
+		origin string
+	}
+	lastFails := map[int]lastFail{}
+	primary := func(u int, kind, status, origin, age string, usage bool, patch bool) uuid.UUID {
 		var factor int64
 		if usage {
 			factor = 1
 		}
-		f.seed(pkRun{user: users[u], kind: kind, status: status, origin: origin, age: age, factor: factor, patch: patch})
+		id := f.seed(pkRun{user: users[u], kind: kind, status: status, origin: origin, age: age, factor: factor, patch: patch})
 		recent := age == "1 day" || age == "2 days"
 		e := want[u]
 		e.fin++
@@ -414,6 +526,9 @@ func TestUsagePrimaryRunOutcomesLiveDB(t *testing.T) {
 				o = "unknown"
 			}
 			origins[u][o]++
+			if lf, ok := lastFails[u]; !ok || id.String() > lf.id.String() {
+				lastFails[u] = lastFail{id: id, origin: o}
+			}
 			if recent {
 				l7origins[u][o]++
 				e.l7fail++
@@ -422,6 +537,7 @@ func TestUsagePrimaryRunOutcomesLiveDB(t *testing.T) {
 				e.nl++
 			}
 		}
+		return id
 	}
 	for _, kind := range []string{"issue", "task", "prompt", "job", "self_improve"} {
 		primary(0, kind, "completed", "", "1 day", true, false)
@@ -432,8 +548,12 @@ func TestUsagePrimaryRunOutcomesLiveDB(t *testing.T) {
 	primary(0, "issue", "failed", "base_diverged", "1 day", false, false)
 	primary(0, "issue", "failed", "workflow_scope_missing", "1 day", false, true)
 	primary(0, "issue", "failed", "", "10 days", false, false) // failure without usage still counts
-	primary(1, "issue", "completed", "", "1 day", true, false)
+	user1Done := primary(1, "issue", "completed", "", "1 day", true, false)
 	primary(1, "issue", "failed", "workflow_scope_missing", "10 days", false, true)
+	// A primary completion strictly after user 1's last failure, so completed_since_last_failure is 1
+	// before any helper exists; later helper completions (finished even later) must not add to it.
+	f.exec(`UPDATE runs SET finished_at = now() + interval '30 minutes', status_since = now() + interval '30 minutes' WHERE id = $1`, user1Done)
+	wantSince := map[int]int64{0: 0, 1: 1}
 
 	// Snapshot the primary-only answer, then add LATER failed helpers for every helper kind
 	// (manual and automatic ci_fix alike, recoverable ones carrying a preserved patch) and a
@@ -447,6 +567,10 @@ func TestUsagePrimaryRunOutcomesLiveDB(t *testing.T) {
 		selfBefore[i] = r
 	}
 	factoryBefore, err := q.AdminRunOutcomes(ctx, workersvc.AllHumanLandableFailOrigins())
+	if err != nil {
+		t.Fatal(err)
+	}
+	perBefore, err := q.AdminRunOutcomesPerUser(ctx, workersvc.AllHumanLandableFailOrigins())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,6 +658,27 @@ func TestUsagePrimaryRunOutcomesLiveDB(t *testing.T) {
 			if got != exps {
 				t.Errorf("AdminRunOutcomesPerUser user %d: got %v want %v", i, got, exps)
 			}
+			// The last-failure fields come from the primary runs alone: a newer helper failure
+			// and later helper completions must leave them as they were before the helpers.
+			var b *store.AdminRunOutcomesPerUserRow
+			for k := range perBefore {
+				if perBefore[k].UserID == u {
+					b = &perBefore[k]
+				}
+			}
+			if b == nil {
+				t.Fatalf("per-user %d missing from the pre-helper snapshot", i)
+			}
+			if r.LastFailedAt != b.LastFailedAt || r.LastFailedRunID != b.LastFailedRunID || r.LastFailedOrigin != b.LastFailedOrigin || r.CompletedSinceLastFailure != b.CompletedSinceLastFailure {
+				t.Errorf("AdminRunOutcomesPerUser user %d last-failure fields moved after helpers:\nbefore %v %v %q %d\nafter  %v %v %q %d", i,
+					b.LastFailedAt, b.LastFailedRunID, b.LastFailedOrigin, b.CompletedSinceLastFailure, r.LastFailedAt, r.LastFailedRunID, r.LastFailedOrigin, r.CompletedSinceLastFailure)
+			}
+			if lf := lastFails[i]; r.LastFailedRunID != lf.id || r.LastFailedOrigin != lf.origin || !r.LastFailedAt.Valid {
+				t.Errorf("AdminRunOutcomesPerUser user %d last failure = %v/%q (valid %v), want %v/%q", i, r.LastFailedRunID, r.LastFailedOrigin, r.LastFailedAt.Valid, lf.id, lf.origin)
+			}
+			if r.CompletedSinceLastFailure != wantSince[i] {
+				t.Errorf("AdminRunOutcomesPerUser user %d completed_since_last_failure = %d, want %d", i, r.CompletedSinceLastFailure, wantSince[i])
+			}
 			assertOrigins(t, fmt.Sprintf("per-user %d lifetime", i), r.FailOrigins, origins[i], r.Failed)
 			assertOrigins(t, fmt.Sprintf("per-user %d last7", i), r.Last7FailOrigins, l7origins[i], r.Last7Failed)
 		}
@@ -572,7 +717,7 @@ func assertOrigins(t *testing.T, label string, raw []byte, want map[string]int64
 		}
 	}
 	for k, v := range want {
-		if got[k] != v {
+		if _, seen := got[k]; !seen && v != 0 {
 			t.Errorf("%s: origin %s = %d, want %d", label, k, got[k], v)
 		}
 	}
