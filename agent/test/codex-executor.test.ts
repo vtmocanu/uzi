@@ -789,6 +789,56 @@ function makeExecutor(
   );
 }
 
+/** issue #4069: the late-cleanup sibling-ready wait. 3000ms from execute; path 1 restarts the 3000ms at the hold
+ *  release. A pending release decision or path 1 is bounded by a hard wall cap of 1500 (the reference waiter's own
+ *  deadline) + 3000ms from execute, so a reference waiter that never settles cannot stall the wait. `tick` must
+ *  yield a macrotask so timers (and a per-test timeout) still run. */
+async function waitSiblingReady(opts: {
+  ready: () => boolean;
+  state: () => { decided: "pending" | "path1" | "path2"; pendingDecision: boolean; releasedAt?: number };
+  executedAt: number;
+  now: () => number;
+  tick: () => Promise<void>;
+}): Promise<void> {
+  const cap = opts.executedAt + 1500 + 3000;
+  while (!opts.ready()) {
+    const { decided, pendingDecision, releasedAt } = opts.state();
+    const limit = decided === "path1" ? Math.min(releasedAt! + 3000, cap)
+      : pendingDecision ? cap : opts.executedAt + 3000;
+    if (opts.now() > limit) throw new Error("timed out waiting for independent sibling executes in its own source");
+    await opts.tick();
+  }
+}
+
+describe("late-cleanup sibling wait caps a stalled reference decision", () => {
+  const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+  const clock = (step: number) => { let t = 0; return { now: () => (t += step), at: () => t }; };
+  it("pending decision that never settles fails within 1500 + 3000ms of execute", async () => {
+    const c = clock(7);
+    await assert.rejects(waitSiblingReady({ ready: () => false, executedAt: 0, now: c.now, tick,
+      state: () => ({ decided: "pending", pendingDecision: true }) }), /timed out waiting for independent sibling/);
+    assert.ok(c.at() > 4500 && c.at() <= 4500 + 7, `failed at ${c.at()}`);
+  });
+  it("path 2 keeps the absolute 3000ms from execute", async () => {
+    const c = clock(7);
+    await assert.rejects(waitSiblingReady({ ready: () => false, executedAt: 0, now: c.now, tick,
+      state: () => ({ decided: "path2", pendingDecision: false }) }), /timed out/);
+    assert.ok(c.at() > 3000 && c.at() <= 3000 + 7, `failed at ${c.at()}`);
+  });
+  it("path 1 with a late release is capped at 1500 + 3000ms from execute", async () => {
+    const c = clock(7);
+    await assert.rejects(waitSiblingReady({ ready: () => false, executedAt: 0, now: c.now, tick,
+      state: () => ({ decided: "path1", pendingDecision: false, releasedAt: 2000 }) }), /timed out/);
+    assert.ok(c.at() > 4500 && c.at() <= 4500 + 7, `failed at ${c.at()}`);
+  });
+  it("path 1 with an early release keeps 3000ms from the release", async () => {
+    const c = clock(7);
+    await assert.rejects(waitSiblingReady({ ready: () => false, executedAt: 0, now: c.now, tick,
+      state: () => ({ decided: "path1", pendingDecision: false, releasedAt: 500 }) }), /timed out/);
+    assert.ok(c.at() > 3500 && c.at() <= 3500 + 7, `failed at ${c.at()}`);
+  });
+});
+
 describe("M3 actual runner memory Codex delivery", () => {
   // Hooks belong only to this nested suite; other Codex rigs keep their own lifecycle.
   m2Runner.installHarness();
@@ -1161,14 +1211,12 @@ describe("M3 actual runner memory Codex delivery", () => {
               await waitFor(() => siblingReady, "independent sibling executes in its own source", 3000, () => performance.now())
                 .catch(error => { throw failure(error); });
             } else {
-              // 3000ms from execute, except while the hold's release decision is pending (bounded by the
-              // reference waiter's own 1500ms deadline) or after path 1, whose 3000ms starts at the release.
-              while (!siblingReady) {
-                const pendingDecision = decided === "pending" && holdState === "held" && refStarted;
-                const limit = decided === "path1" ? releasedAt! + 3000 : executedAt + 3000;
-                if (!pendingDecision && performance.now() > limit) throw failure(new Error("timed out waiting for independent sibling executes in its own source"));
-                await new Promise<void>(resolve => setImmediate(resolve));
-              }
+              // 3000ms from execute, except while the hold's release decision is pending or after path 1, whose
+              // 3000ms starts at the release; both are hard-capped at 1500 + 3000ms from execute.
+              await waitSiblingReady({ ready: () => siblingReady, executedAt, now: () => performance.now(),
+                tick: () => new Promise<void>(resolve => setImmediate(resolve)),
+                state: () => ({ decided, pendingDecision: decided === "pending" && holdState === "held" && refStarted, releasedAt }) })
+                .catch(error => { throw failure(error); });
             }
           } finally { settleReady(); }
           assert.ok(siblingReads >= 1 && progresses.length >= 1, "sibling performed its restriction-facts read");
