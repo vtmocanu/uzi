@@ -57,7 +57,9 @@ func newRunExportCmd(env Env, gf *globalFlags) *cobra.Command {
 			runID := args[0]
 
 			// Fetch the metadata summary first — no bytes. This is also the ownership gate:
-			// a foreign/absent run is a 404 (exit 4) here, before any download is attempted.
+			// an absent run is a 404 (exit 4) here, and so is a foreign run unless the server
+			// serves it as an admin run debug read (200 with admin_debug_read, refused below),
+			// all before any download is attempted.
 			summary, err := c.RecoveryArchives(cmd.Context(), runID)
 			if err != nil {
 				return err
