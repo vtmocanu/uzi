@@ -3440,9 +3440,10 @@ export class SdkExecutor implements Executor {
         // Issue #4258: the advisory mid-run secret remediation seam, only at a boundary no control
         // owns and no system text owns (a clarification answer or verdict text in followUp, which
         // also covers a resume-preflight remediate just above, or a completion rework). The trigger
-        // stays pending for a later boundary otherwise. A cancel, pause, wall or credential switch
-        // arriving during the await is routed by the ordinary turn's interruption checks before
-        // any model event; remediate replaces this turn's prompt and adds no turn.
+        // stays pending for a later boundary otherwise. A terminal fence, sticky cancel or disk stop
+        // arriving during the await is stopped by the explicit post-await checks below; pause,
+        // wall, credential switch and shutdown are routed by the turn's own interruption checks
+        // before any model event. Remediate replaces this turn's prompt and adds no turn.
         if (!ctx.interactive && !state.tripReason && followUp === undefined && !completionRework &&
             ctx.midRunSecretRemediation) {
           const decision = await ctx.midRunSecretRemediation();

@@ -4892,6 +4892,8 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
     tick: () => Promise<string>;
     /** Replace one GitCache method for the duration of `fn`. */
     withStub: <T>(patch: Partial<Record<"ancestry" | "trackingTip" | "branchTip" | "secretScanCheckpointRange", unknown>>, fn: () => Promise<T>) => Promise<T>;
+    /** Replace the runner's fetch-back (the git seam the mid-run consumer revalidates through) for the duration of `fn`. */
+    withFetchBack: <T>(stub: () => Promise<unknown>, fn: () => Promise<T>) => Promise<T>;
   }
 
   /** git merge-base --is-ancestor as a tri-state, independent of any stubbed GitCache method. */
@@ -4945,6 +4947,12 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
                 const saved: Record<string, unknown> = {};
                 for (const [k, v] of Object.entries(patch)) { saved[k] = target[k]; target[k] = v; }
                 try { return await fn(); } finally { for (const [k, v] of Object.entries(saved)) target[k] = v; }
+              },
+              withFetchBack: async (stub, fn) => {
+                const target = runner as unknown as Record<string, unknown>;
+                const saved = target.fetchBackBestEffort;
+                target.fetchBackBestEffort = stub;
+                try { return await fn(); } finally { target.fetchBackBestEffort = saved; }
               },
             };
             await body(r);
@@ -5120,6 +5128,22 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
         });
       });
     }
+  });
+
+  it("a refused fetch-back rethrows PreservationRefusedError; the trigger stays and no attempt is spent", async () => {
+    await rig(4258_044, async (r) => {
+      await flagAndTick(r);
+      const before = r.state().midRunTrigger;
+      assert.ok(before);
+      await assert.rejects(
+        r.withFetchBack(async () => ({ kind: "refused" }), () => r.ctx.midRunSecretRemediation!()),
+        (e: unknown) => e instanceof Error && e.name === "PreservationRefusedError",
+      );
+      const s = r.state();
+      assert.deepEqual(s.midRunTrigger, before, "the trigger is kept");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+    });
   });
 
   it("unknown flagged-commit ancestry against the tip defers even when every floor is divergent", async () => {

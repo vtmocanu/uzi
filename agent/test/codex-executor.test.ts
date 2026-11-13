@@ -18344,6 +18344,38 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       });
     }
 
+    for (const decision of [{ action: "remediate", followUp: MID }, { action: "proceed" }] as SecretRemediationDecision[]) {
+    it(`a sticky cancel flipped only during the seam's await (${decision.action}) stops the run before any turn or follow-up pull`, async () => {
+      const rig = makeMultiEpochRig([script("th-1", [work, work, finish])]);
+      let cancelled = false;
+      let pullsAfter = 0;
+      let entered!: () => void;
+      const inSeam = new Promise<void>(resolve => { entered = resolve; });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const { ctx } = makeCtx({
+        ...base,
+        cancelRequested: () => cancelled,
+        pullFollowUps: () => { if (cancelled) pullsAfter++; return []; },
+        midRunSecretRemediation: async () => {
+          if (sentOf(rig).length === 0) return { action: "proceed" };
+          entered();
+          await gate;
+          return decision;
+        },
+      });
+      const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#4258 sticky cancel in await");
+      const settled = running.then(() => undefined, () => undefined);
+      await Promise.race([inSeam, settled.then(() => assert.fail("the seam was never called"))]);
+      cancelled = true; // sticky flag only: the signal is never aborted
+      release();
+      await assert.rejects(running, /cancel/i);
+      assert.equal(sentOf(rig).length, 1, "only the first work turn ran");
+      assert.ok(sentOf(rig).every(text => !text.includes(MID)));
+      assert.equal(pullsAfter, 0, "the owner follow-up queue is untouched after the cancel");
+    });
+    }
+
     const askTurn: TurnScript = (th, tn) => [toolCall(21, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, "c-ask-21")];
     const owners: Array<{ name: string; epochs: (rig?: never) => Responder[]; ctx: () => Partial<RunContext>; marker?: string }> = [
       {
@@ -18351,6 +18383,19 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
         epochs: () => [script("th-1", [askTurn, work, work, finish])],
         ctx: () => ({ askUser: async () => ({ kind: "answer", answers: ["CLARIFY-ANSWER-MARKER"] }) }),
         marker: "CLARIFY-ANSWER-MARKER",
+      },
+      {
+        // The ask turn also checkpoints, so the loop-top boundary carries clarificationPrompt.
+        name: "a checkpointed clarification answer",
+        epochs: () => [
+          script("th-1", [(th, tn) => [toolCall(20, "checkpoint", {}, th, tn, "c-cp-20"), ...askTurn(th, tn)]]),
+          script("th-1", [work, work, finish]),
+        ],
+        ctx: () => ({
+          checkpoint: async () => {},
+          askUser: async () => ({ kind: "answer", answers: ["CLARIFY-CKPT-MARKER"] }),
+        }),
+        marker: "CLARIFY-CKPT-MARKER",
       },
       {
         name: "a completion rework",

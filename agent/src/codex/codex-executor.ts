@@ -4567,9 +4567,11 @@ export class CodexExecutor implements Executor {
         // Issue #4258: the advisory mid-run secret remediation seam. Only at a boundary no
         // interruption owns and no system text owns (a clarification answer, completion rework or
         // code repair, which also covers a resume-preflight remediate just above); otherwise the
-        // trigger stays pending. An interruption arriving during the await is routed by
-        // driveCodexTurn's own start-of-turn pendingInterruption check before any model event;
-        // remediate replaces this turn's prompt and adds no turn. The completion-contract
+        // trigger stays pending. A sticky cancel arriving during the await is stopped by the
+        // explicit post-await check below; pause, wall, switch and shutdown are routed by the
+        // turn's own interruption checks (driveCodexTurn's start-of-turn pendingInterruption
+        // check) before any model event. Remediate replaces this turn's prompt and adds no turn.
+        // The completion-contract
         // guidance append below fires only when completionAnswered, so it does not apply here.
         if (!ctx.interactive && clarificationPrompt === undefined && completionFollowUp === undefined &&
             ctx.midRunSecretRemediation &&

@@ -508,12 +508,12 @@ describe("SdkExecutor mid-run secret remediation seam (Issue #4258)", () => {
     assert.ok(controlCalls >= 1, "control: the same shape non-interactively does consult the seam");
   });
 
-  const controls = ["cancel", "shutdown", "wall", "switch"] as const;
+  const controls = ["cancel", "shutdown", "pause", "wall", "switch"] as const;
   type Control = typeof controls[number];
   /** Wires one control onto a ctx; `fire` raises it. */
   function controlRig(control: Control): { overrides: Partial<RunContext>; fire: () => void; switches: () => number } {
     let cancelled = false;
-    let mode: "wall" | null = null;
+    let mode: "wall" | "now" | null = null;
     let pause: (() => void) | undefined;
     let credentialSwitch: (() => void) | undefined;
     let switches = 0;
@@ -528,10 +528,12 @@ describe("SdkExecutor mid-run secret remediation seam (Issue #4258)", () => {
         onCredentialSwitch: cb => { credentialSwitch = cb; },
         attemptCredentialSwitch: async () => { switches++; return "released"; },
         parkForWall: async () => "parked",
+        parkForPause: async () => true,
       },
       fire: () => {
         if (control === "cancel") cancelled = true;
         else if (control === "shutdown") abort.abort(new Error("shutdown"));
+        else if (control === "pause") { mode = "now"; assert.ok(pause); pause(); }
         else if (control === "wall") { mode = "wall"; assert.ok(pause); pause(); }
         else { assert.ok(credentialSwitch); credentialSwitch(); }
       },
@@ -540,8 +542,9 @@ describe("SdkExecutor mid-run secret remediation seam (Issue #4258)", () => {
   async function settle(control: Control, running: Promise<unknown>, rig: { switches: () => number }): Promise<void> {
     if (control === "cancel" || control === "shutdown") await assert.rejects(running, /cancel|shutdown/i);
     else {
-      const result = await running as { walled?: unknown; switchReleased?: boolean };
-      if (control === "wall") assert.ok(result.walled);
+      const result = await running as { walled?: unknown; pausedAt?: unknown; switchReleased?: boolean };
+      if (control === "pause") assert.ok(result.pausedAt);
+      else if (control === "wall") assert.ok(result.walled);
       else { assert.equal(rig.switches(), 1); assert.equal(result.switchReleased, true); }
     }
   }
@@ -555,7 +558,11 @@ describe("SdkExecutor mid-run secret remediation seam (Issue #4258)", () => {
       let calledBeforeFire = 0;
       const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(runCtx({
         ...rig.overrides,
-        reportIteration: async () => { if (++reports === 2) rig.fire(); return { completionAttempts: 0 }; },
+        reportIteration: async () => {
+          if (++reports === 2) rig.fire();
+          // An owner pause-now reaches the boundary through the running-report ACK.
+          return control === "pause" && reports >= 2 ? { completionAttempts: 0, pauseRequested: true } : { completionAttempts: 0 };
+        },
         midRunSecretRemediation: async () => {
           if (reports >= 2) calledAfterFire.push(prompts.length); else calledBeforeFire++;
           return prompts.length >= 1 ? { action: "remediate", followUp: MID } : { action: "proceed" };
@@ -590,6 +597,73 @@ describe("SdkExecutor mid-run secret remediation seam (Issue #4258)", () => {
       assert.equal(prompts.length, 1, "only the first work turn ran");
       assert.ok(prompts.every(p => !p.includes(MID)));
     });
+  }
+
+  /** Holds the seam open after the first work turn, runs `during`, then releases it with a `proceed`
+   *  (so the owner follow-up pull, which a remediate would skip, is observable) or a remediate.
+   *  `pullsAfter()` counts owner follow-up pulls made after `during` ran. */
+  async function arriveDuringAwait(
+    during: () => void, overrides: Partial<RunContext>, decision: SecretRemediationDecision = { action: "remediate", followUp: MID },
+  ): Promise<{ running: Promise<unknown>; prompts: string[]; pullsAfter: () => number }> {
+    const { queryFn, prompts } = fakeTurns([work(), work(), finish()]);
+    let fired = false;
+    let pulls = 0;
+    let entered!: () => void;
+    const inSeam = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(runCtx({
+      ...overrides,
+      pullFollowUps: () => { if (fired) pulls++; return []; },
+      midRunSecretRemediation: async () => {
+        if (prompts.length === 0) return { action: "proceed" };
+        entered();
+        await gate;
+        return decision;
+      },
+    }));
+    const settled = running.then(() => undefined, () => undefined);
+    await Promise.race([inSeam, settled.then(() => assert.fail("the seam was never called"))]);
+    fired = true;
+    during();
+    release();
+    return { running, prompts, pullsAfter: () => pulls };
+  }
+
+  const stopCases: Array<{ name: string; wire: () => { during: () => void; overrides: Partial<RunContext> }; rejects: (e: unknown) => boolean }> = [
+    {
+      name: "a terminal fence",
+      wire: () => { let fenced = false; return { during: () => { fenced = true; }, overrides: { claimFenced: () => fenced } }; },
+      rejects: e => e instanceof Error && /cancel/i.test(e.message),
+    },
+    {
+      name: "a terminal lifecycle signal",
+      wire: () => {
+        const lifecycle = new AbortController();
+        return { during: () => lifecycle.abort(new Error("terminal")), overrides: { terminalLifecycleSignal: lifecycle.signal } };
+      },
+      rejects: e => e instanceof Error && /cancel/i.test(e.message),
+    },
+    {
+      name: "a disk stop",
+      wire: () => {
+        let mode: "disk" | null = null;
+        return { during: () => { mode = "disk"; }, overrides: { pauseModeRequested: () => mode } };
+      },
+      rejects: e => e instanceof Error && e.constructor.name === "DiskParkSignal",
+    },
+  ];
+  for (const stop of stopCases) {
+    for (const decision of [{ action: "remediate", followUp: MID }, { action: "proceed" }] as SecretRemediationDecision[]) {
+      it(`${stop.name} arriving during the seam's await (${decision.action}) stops the run before any further turn or follow-up pull`, async () => {
+        const wired = stop.wire();
+        const { running, prompts, pullsAfter } = await arriveDuringAwait(wired.during, wired.overrides, decision);
+        await assert.rejects(running, stop.rejects);
+        assert.equal(prompts.length, 1, "only the first work turn ran");
+        assert.ok(prompts.every(p => !p.includes(MID)));
+        assert.equal(pullsAfter(), 0, "the owner follow-up queue is untouched after the stop");
+      });
+    }
   }
 
   type Owner = { name: string; scripts: SDKMessage[][]; ctx: () => Partial<RunContext>; ownerPromptMarker: string };
