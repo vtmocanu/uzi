@@ -14,10 +14,8 @@
 # Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, applies the
 # real goose migrations, seeds fixtures, and runs every *LiveDB test in the eight
 # packages that carry one (store, handler, forgesvc, schedsvc, workersvc, recovery, poller,
-# hostedsvc -- the
-# ALL_PKGS list below). ci.yml splits that list across two jobs with UZI_STORE_IT_GROUP:
-# `task test:livedb-workersvc` and `task test:codex-refresh-lostreply-e2e` (group rest);
-# `test-api-store-it` requires both.
+# hostedsvc -- the list on the `go test` line below; ci.yml runs this script once, via
+# `task test:codex-refresh-lostreply-e2e`, for both CI contexts).
 # Isolated: unique container + published loopback port, torn down on exit; never
 # touches the user's own stacks or DBs.
 #
@@ -44,60 +42,6 @@ PGIMAGE="${UZI_STORE_IT_PG_IMAGE:-postgres:17}"
 PGWAIT="${UZI_STORE_IT_PG_WAIT_SECS:-120}"
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
-
-# ALL_PKGS is the ONE list of packages carrying *LiveDB tests (see the sweep comment
-# below). UZI_STORE_IT_GROUP splits it for CI's two LiveDB jobs (#4232):
-#   unset      every package (the local default; unchanged behavior)
-#   workersvc  ./internal/workersvc/... alone (the longest package)
-#   rest       every other package, in list order; the opt-in combined proofs below
-#              follow this group's sweep on the same database (ADR-1766 amendment)
-# Any other value, the empty string included, refuses before Docker starts: a typo
-# must not quietly run nothing or everything. The opt-in proofs are refused with
-# `workersvc`, so a proof never runs after a partial sweep it was not designed to follow.
-ALL_PKGS=(
-  ./internal/store/...
-  ./internal/handler/...
-  ./internal/forgesvc/...
-  ./internal/schedsvc/...
-  ./internal/workersvc/...
-  ./internal/recovery/...
-  ./internal/poller/...
-  ./internal/hostedsvc/...
-)
-if [ -z "${UZI_STORE_IT_GROUP+set}" ]; then
-  PKGS=("${ALL_PKGS[@]}")
-else
-  case "$UZI_STORE_IT_GROUP" in
-    workersvc)
-      # Derived from ALL_PKGS, never a second copy: exactly one entry must match.
-      PKGS=()
-      for p in "${ALL_PKGS[@]}"; do
-        [ "$p" != ./internal/workersvc/... ] || PKGS+=("$p")
-      done
-      if [ "${#PKGS[@]}" -ne 1 ]; then
-        echo "run-store-it: UZI_STORE_IT_GROUP=workersvc matched ${#PKGS[@]} ALL_PKGS entries (want exactly 1)" >&2
-        exit 2
-      fi
-      for opt in UZI_TASK_CHECKPOINT_RECOVERY_E2E UZI_CODEX_REFRESH_LOSTREPLY_E2E \
-        UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E UZI_CI_ARTIFACTS_E2E UZI_STALE_WORKER_CANCEL_E2E; do
-        if [ -n "${!opt:-}" ]; then
-          echo "run-store-it: $opt is not allowed with UZI_STORE_IT_GROUP=workersvc (combined proofs follow the rest group or the full sweep)" >&2
-          exit 2
-        fi
-      done
-      ;;
-    rest)
-      PKGS=()
-      for p in "${ALL_PKGS[@]}"; do
-        [ "$p" = ./internal/workersvc/... ] || PKGS+=("$p")
-      done
-      ;;
-    *)
-      echo "run-store-it: invalid UZI_STORE_IT_GROUP='$UZI_STORE_IT_GROUP' (want workersvc or rest; unset it to run every package)" >&2
-      exit 2
-      ;;
-  esac
-fi
 
 cleanup() {
   local code=$?
@@ -174,8 +118,8 @@ cd "$ROOT/api"
 # here, not by ci.yml -- while their own skip messages named this script. A *LiveDB
 # test in a package this line does not list never runs anywhere, and `go test
 # ./...` prints `ok` for it all the same. When a *LiveDB test lands in a new
-# package, add the package to ALL_PKGS (the one list; ci.yml carries none), in the
-# same commit.
+# package, add the package HERE (the one list; ci.yml carries none), in the same
+# commit.
 #
 # -p 1 IS LOAD-BEARING, NOT A SPEED KNOB — do not drop it to parallelize the run.
 # go test runs PACKAGE binaries concurrently by default, and these packages share
@@ -194,14 +138,20 @@ cd "$ROOT/api"
 # second one failed on the UNIQUE constraint). Derive token hashes from a fresh
 # uuid, the way handler/hosted_provision_livedb_test.go documents.
 #
-# ALL_PKGS (near the top) is the ONE list (ci.yml runs this script, not a copy), and the
+# PKGS is the ONE list (ci.yml runs this script, not a copy), and the
 # per-package check below is what makes a stale list visible: a listed package that
 # contributes zero *LiveDB tests prints `ok <pkg> 0.01s [no tests to run]`, which the
 # aggregate exit code and the aggregate PASS count both read as green.
-#
-# PKGS, the selected group, is chosen before the database starts (UZI_STORE_IT_GROUP),
-# so the per-package guards check exactly the group that ran. A new package lands in
-# the `rest` group automatically.
+PKGS=(
+  ./internal/store/...
+  ./internal/handler/...
+  ./internal/forgesvc/...
+  ./internal/schedsvc/...
+  ./internal/workersvc/...
+  ./internal/recovery/...
+  ./internal/poller/...
+  ./internal/hostedsvc/...
+)
 # EXPLICIT XXXXXX template, NOT `mktemp -t <name>`: GNU coreutils rejects a `-t`
 # template with too few X's (it needs >=3 consecutive; this one had none) with "too
 # few X's in template", while BSD/macOS accepts it, so that form fails only on the

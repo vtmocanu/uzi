@@ -84,7 +84,7 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
 - **Per PR**: review lane done; one green PR CI run on the reviewed pushed head (its base may be
   stale); `MERGEABLE` (no conflict); migrations renumbered and `task check:migration-numbering`
   run locally. A PR adding a migration or touching data integrity also needs the
-  `LiveDB: N passed, 0 skipped` line from both `test-livedb-workersvc` and `test-codex-refresh-lostreply-e2e` on that head (SKILL.md step 5).
+  `test-codex-refresh-lostreply-e2e` job's `LiveDB: N passed, 0 skipped` line on that head (SKILL.md step 5).
 - **Batch**: 4-5 PRs, one per area. Two `agent/**` PRs may pair when their tests and jobs
   are separable. If both touch the worker image or packaged runtime, dispatch
   `gh workflow run codex-packaged-proof.yml --ref main` after both merge, confirm the run's
