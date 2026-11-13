@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -560,6 +561,11 @@ type RenderConfig struct {
 	// (json omitempty), so an install that clears it hashes exactly as before this
 	// field existed. Changing it re-hashes the template and rolls every worker.
 	NodeSelector map[string]string
+	// DeploymentLabels / DeploymentAnnotations are the operator's extra metadata on every
+	// worker Deployment's OWN metadata (never the pod template, so they move no spec
+	// hash). config refuses a label that would replace one objectLabels stamps.
+	DeploymentLabels      map[string]string
+	DeploymentAnnotations map[string]string
 	// Tolerations are rendered onto every worker pod, all three tiers. Nil renders no
 	// tolerations key (json omitempty), so an install without them hashes exactly as
 	// before this field existed. Changing them re-hashes the template and rolls.
@@ -1034,11 +1040,17 @@ func RenderDeployment(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Sp
 	tmpl.Annotations[AnnotationSpecHash] = hash
 
 	replicas := int32(1)
+	labels := maps.Clone(cfg.DeploymentLabels)
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	maps.Copy(labels, objectLabels(w.ID)) // provenance always wins
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      deploymentName(w.ID),
-			Namespace: cfg.namespaceFor(w),
-			Labels:    objectLabels(w.ID),
+			Name:        deploymentName(w.ID),
+			Namespace:   cfg.namespaceFor(w),
+			Labels:      labels,
+			Annotations: maps.Clone(cfg.DeploymentAnnotations),
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,

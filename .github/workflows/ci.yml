@@ -1022,6 +1022,9 @@ jobs:
       - name: Render and assert workers.nodeSelector and workers.tolerations
         # Offline (strips the CNPG subchart); default, override, null, {} and malformed values.
         run: task render:node-selector-check
+      - name: Render and assert workloadLabels and workloadAnnotations
+        # Offline (strips the CNPG subchart); unset, set, owned-label, non-string and reserved-key refusals.
+        run: task render:workload-metadata-check
       - name: Docker-tier fail-guards
         run: |
           # (1) docker on + NetworkPolicy off + no acknowledge -> MUST refuse to render.
