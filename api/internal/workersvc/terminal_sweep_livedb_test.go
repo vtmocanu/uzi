@@ -1122,7 +1122,7 @@ func (s slowIssueTracker) GetIssue(ctx context.Context, a, b int64) (forge.Issue
 }
 
 // The observation clock is read BEFORE the forge read: a forge read that outlasts
-// the maximum observation age (shrunk by retireMaxAgeOverride) leaves the observation stale at tx-R1,
+// the maximum observation age (shrunk by the terminal.retireMaxAge hook) leaves the observation stale at tx-R1,
 // so the row is skipped and nothing is deleted. Were the clock read after the answer, this observation
 // would look fresh and retire.
 func TestTerminalSweepSlowForgeReadIsStaleLiveDB(t *testing.T) {
@@ -1131,9 +1131,8 @@ func TestTerminalSweepSlowForgeReadIsStaleLiveDB(t *testing.T) {
 	f.live()
 	f.forges.issue = forge.Issue{State: "closed"}
 	// The real bound (15s) exceeds the forge read timeout, so shrink the bound below the read instead.
-	retireMaxAgeOverride = time.Second
-	t.Cleanup(func() { retireMaxAgeOverride = 0 })
-	f.svc.SetForges(slowIssueForges{termForges: f.forges, d: 2 * time.Second})
+	f.svc.terminal.retireMaxAge = 300 * time.Millisecond
+	f.svc.SetForges(slowIssueForges{termForges: f.forges, d: time.Second})
 	before := f.mustPres("live")
 	if n := f.sweep(); n != 0 {
 		t.Fatalf("changed %d rows, want 0", n)
@@ -1154,8 +1153,7 @@ func TestTerminalSweepSlowForgeReadIsStaleLiveDB(t *testing.T) {
 }
 
 // A bound row whose run was deleted (repo removal cascades runs; a bound row holds no live pointer, so
-// it survives) goes to not_published without a run lock (there is no run row to lock), on the first
-// pass, with no credential resolution or forge call. A second stale-bound row of another run is
+// it survives) goes to not_published without a run lock (there is no run row to lock), with no credential resolution or forge call. A second stale-bound row of another run is
 // queued behind it and must also finish; that only shows the pass continues past the run-gone item,
 // which the earlier code also did, so it is not a starvation proof.
 func TestTerminalSweepStaleBoundRunGoneLiveDB(t *testing.T) {
@@ -1195,5 +1193,36 @@ func TestTerminalSweepStaleBoundRunGoneLiveDB(t *testing.T) {
 	}
 	if f.allowCount() != 0 || f.forgeCalls() != 0 {
 		t.Fatal("the stale-bound lane resolved a credential or called the forge")
+	}
+}
+
+// A tx-R2 failure after the retiring decision committed (here the run moved to another repository, so
+// tx-R2's run lock reports a repository mismatch) backs off the RETIRING row itself: attempts counted,
+// last_error stamped, next_check_at in the future. Backing off the stale live row instead would match
+// nothing, leaving the retiring row due (next_check_at = now(), attempts 0) on every tick.
+func TestTerminalSweepRetireFinishErrorBacksOffRetiringLiveDB(t *testing.T) {
+	f := newSweepFix(t)
+	f.enableRetire()
+	f.live()
+	f.forges.issue = forge.Issue{State: "closed"}
+	other := uuid.New()
+	f.e.exec(t, `INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		SELECT $1, connection_id, 987655, 'g/moved', 'https://forge.e2e/g/moved', 'main', true FROM repos WHERE id = $2`, other, f.e.repoID)
+	f.svc.terminal.afterDelete = func() error {
+		f.e.exec(t, `UPDATE runs SET repo_id = $2 WHERE id = $1`, f.run, other)
+		return nil
+	}
+	if err := f.sweepErr(); err == nil {
+		t.Fatal("the pass reported no error for a tx-R2 repository mismatch")
+	}
+	got := f.mustPres("retiring")
+	if got.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (the retiring row backed off)", got.Attempts)
+	}
+	if !got.LastError.Valid || got.LastError.String == "" {
+		t.Fatalf("last_error = %+v, want it set", got.LastError)
+	}
+	if !got.NextCheckAt.Time.After(f.dbNow()) {
+		t.Fatalf("next_check_at = %v, want a future backoff", got.NextCheckAt.Time)
 	}
 }

@@ -93,14 +93,12 @@ const (
 	retireObservationMaxAge = 15 * time.Second
 )
 
-// retireMaxAgeOverride replaces retireObservationMaxAge when non-zero. Tests only (set and restored
-// by a sequential test): a forge read is bounded by terminalLifetimeTimeout, below the real bound, so
-// a stale-at-commit observation cannot otherwise be produced by a slow forge read.
-var retireMaxAgeOverride time.Duration
-
-func terminalRetireMaxAge() time.Duration {
-	if retireMaxAgeOverride > 0 {
-		return retireMaxAgeOverride
+// terminalRetireMaxAge is retireObservationMaxAge, or the per-service test hook terminal.retireMaxAge
+// when non-zero (tests only): a forge read is bounded by terminalLifetimeTimeout, below the real
+// bound, so a stale-at-commit observation cannot otherwise be produced by a slow forge read.
+func (s *Service) terminalRetireMaxAge() time.Duration {
+	if s.terminal.retireMaxAge > 0 {
+		return s.terminal.retireMaxAge
 	}
 	return retireObservationMaxAge
 }
@@ -625,7 +623,7 @@ func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTermina
 	}
 	retiring, err := tt.qt.MarkTerminalPreservationRetiring(ctx, store.MarkTerminalPreservationRetiringParams{
 		ID: pres.ID, Tip: pres.Tip.String, RetireReason: reason,
-		ObservedAt: pgtype.Timestamptz{Time: observedAt, Valid: true}, MaxAgeSeconds: terminalRetireMaxAge().Seconds(),
+		ObservedAt: pgtype.Timestamptz{Time: observedAt, Valid: true}, MaxAgeSeconds: s.terminalRetireMaxAge().Seconds(),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		// A stale observation (or a guard refusal): the decision is discarded without a state write and
