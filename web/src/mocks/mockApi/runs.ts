@@ -690,7 +690,7 @@ export const runsApi = {
       // PRD #1293 failed-run outcomes. Internally consistent: finished === completed +
       // cancelled + plan_rejected + base_diverged + failed, and sum(fail_origins) === failed. finished is a
       // different population from run_count (D2) — infra failures spend no tokens, so it sits
-      // a little above the 23 usage-bearing runs. Mirrors the u-vlad row below ("you").
+      // a little above the 23 primary work runs with usage. Mirrors the u-vlad row below ("you").
       // needs_landing (issue #1418) is the sub-cut of failed whose committed work is
       // human-landable (here the workflow-scope + push-secret failures); needs_landing <= failed.
       outcomes: {
