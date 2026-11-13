@@ -1127,6 +1127,18 @@ for persistent Docker workers when enabled, omitting it otherwise. The value
 must be a boolean. This grants no attestation; undeclared/unattested keeps scratch.
 Older controllers or absent env leave scratch off; older workers ignore the env,
 so rendered `1` is not proof. The worker image must include #4171 (`7cd46526`).
+
+`.retire-*` retirement scratch is observation only (#4143): each worker startup
+logs bounded per-parent and total outcome records and keeps every parent, with
+no reclaim. Chart `workers.epochReclaim.retireScratchOutcomes` is a strict
+boolean, default `true`; a non-boolean fails rendering. `false` makes the
+controller render worker `UZI_RETIRE_SCRATCH_OUTCOMES=0` on every worker (Docker
+or not); default renders are unchanged, so upgrading does not roll workers,
+while disabling rolls the worker template and takes effect at the next worker
+startup. `helm upgrade --reuse-values` from an older release lacks the key and
+fails the boolean guard, as `scratchDeletion` does: use
+`--reset-then-reuse-values` or `-f`. See
+[Disk-full residual](../docs/worker-docker.md#disk-full-residual-on-the-data-volume).
 See [startup disable and observation](../docs/run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation)
 for safe replacement, evidence and startup-only limits; hosted observation and
 the keep-default decision remain pending on #4043.

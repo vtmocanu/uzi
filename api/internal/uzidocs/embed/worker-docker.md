@@ -511,6 +511,55 @@ privileged reclaim and no per-run byte accounting, and no admission headroom
 is promised: run admission fails open when a disk sample is unknown and
 reopens after `UZI_DISK_ADMISSION_MAX_WAIT` (default 15 minutes).
 
+**`.retire-*` retirement scratch (observation only).** Each worker startup
+observes every `.retire-*` scratch parent under `<dataDir>/runner` and keeps
+all of them: nothing is deleted, chowned or moved. The existing `runner retire
+scratch retained` warning is unchanged. Two further log lines are added:
+
+- `runner retire scratch outcome`: up to 10 per startup, sorted. Fields are
+  name, kind, outcome (`kept`), reason, retained_source, empty, recent, bytes,
+  bytes_state and partial_reasons. `reason` is `protected_by_retained_source`
+  when a decoded recovery or restore journal's `clonePath` or
+  `retainedSources[].clonePath` names the parent or a path under it (a
+  rollback-repair pointer), otherwise `no_disposition_evidence`.
+  `retained_source` is `named`, `not_named` or `unknown`; `unknown` means the
+  journal read failed or hit a cap, the deadline or an abort.
+- `runner retire scratch total`: one per startup. Fields are parents_enumerated,
+  outcomes_omitted, kept, reclaimed (always 0), protected_by_retained_source,
+  no_disposition_evidence, bytes, bytes_state, partial_reasons,
+  enumeration_incomplete and retained_source_read.
+
+Bytes are allocated bytes (blocks x 512, hard links counted once) from a
+read-only, descriptor-relative walk as the worker uid that never follows
+symlinks. `bytes_state` is `measured`, `partial` or `unknown`; it is `measured`
+only when every parent was measured completely and the listing was complete.
+`partial_reasons` can name `entry_cap` (the 200000-entry global cap, or depth
+over 64), `time_cap`, `unreadable`, `cross_device`, `changed` and `vanished`.
+`outcomes_omitted` counts parents beyond the 10 rows; `enumeration_incomplete`
+means the root listing hit its 4096-entry budget. They are distinct.
+
+One 30 s startup budget covers the journal read and the walk, and startup
+waits for that plus git child settlement and handle closes. No hard real-time
+bound applies to an uninterruptible syscall such as a stalled mount. A
+synthetic measurement on local disk (10 parents of 1000 small files each plus 3
+bares) took a median of 970 ms (max 1639) with records on, against 13 ms off;
+with 0 parents or 4096 mostly unrelated names the difference was within a few
+ms. This is not a production measurement.
+
+Disable with the chart value `workers.epochReclaim.retireScratchOutcomes:
+false` (controller `UZI_WORKER_RETIRE_SCRATCH_OUTCOMES`, worker
+`UZI_RETIRE_SCRATCH_OUTCOMES=0`; see [configuration](./configuration.md)).
+Off restores the count-only inspector exactly.
+
+Nothing is reclaimed: no ordinary durable disposition binding proves this
+moved footprint (rollback repair can persist a protected moved-clone pointer),
+the rename into the scratch parent precedes the journal clear and the
+retired-ledger write, and the ledger names only the canonical clone path. A
+retired ledger, emptiness, age or the parent name grant nothing. The legacy
+stderr-proof repair (#4141, landed via #4152) does not certify remnants
+created by older code retroactively; #4137 is a distinct residual. Reclaim
+remains open on #4143 pending a durable parent-binding design.
+
 A worker holding custody can therefore fill its data volume, which impairs
 recovery bookkeeping, and then needs an operator. Use the supported inspect
 and discard procedure ([Retained sources with no open
