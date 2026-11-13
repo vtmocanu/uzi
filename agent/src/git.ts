@@ -487,9 +487,20 @@ const RETAINED_SUCCESSOR_REASONS = new Set([
   "wrapper_marker_parent", "wrapper_lineage_ancestry", "wrapper_source_parent",
   "final_head", "final_tree", "final_marker_restoration", "final_dirty_diff", "final_ancestry",
   "attempt_invalid", "iteration_before", "episode_pin_changed", "identity_used", "seed_failed",
-  "iteration_after", "post_adoption_check",
+  "iteration_after", "post_adoption_check", "remediation_active", "remediation_proof_unknown",
 ]);
 const retainedSuccessorDiagnostics = new WeakMap<Error, string>();
+
+/** Closed wire values the api accepts as `recovery_detail` on an adoption-failure park. */
+export type RetainedAdoptionRefusal = "secret_remediation_active" | "remediation_proof_unknown";
+
+/** The single map from a refusal's annotation to its wire value. Only the two remediation reasons map; every other
+ * refusal (and every unannotated error) is unclassified, which selects generic text and never permits adoption. */
+export function retainedAdoptionRefusal(error: unknown): RetainedAdoptionRefusal | undefined {
+  const reason = error instanceof Error ? retainedSuccessorDiagnostics.get(error) : undefined;
+  return reason === "remediation_active" ? "secret_remediation_active"
+    : reason === "remediation_proof_unknown" ? "remediation_proof_unknown" : undefined;
+}
 
 /** Attach only a fixed successor reason, without changing the thrown value's public surface.
  * Callers retain responsibility for excluding their abort and control-flow sentinels. */
@@ -10673,6 +10684,28 @@ export class GitCache {
     });
   }
 
+  /** Crash rediscovery for a blocked `adoption_failed` journal whose in-memory refusal class died with the previous
+   * process. Classification only, never admission: it re-runs the read-only remediation source selection under the
+   * bare lock and maps an annotated refusal to its wire value. Success, an unannotated refusal, an interrupted
+   * operation, a changed identity or any missing precondition all answer undefined (the generic text). Writes no
+   * ledger, pin or journal content; the evidence read may only re-sync the unchanged canonical journal bytes. */
+  async classifyBlockedRemediationAdoption(barePath: string, branch: string, key: string, expected: RecoverySource):
+    Promise<RetainedAdoptionRefusal | undefined> {
+    try {
+      return await this.withLock(barePath, async () => {
+        // allowLegacyRepair=false: this read can never append an attempt-ledger entry.
+        const journal = await this.checkedRecovery(barePath, branch, key, expected, false, undefined, false);
+        const recovery = journal.recovery;
+        if (recovery?.stage !== "blocked" || recovery.blocker !== "adoption_failed" ||
+            !journal.remediationRecovery || !recovery.restoreSource) return undefined;
+        try {
+          await this.remediationAdoptionUnderLock(barePath, branch, expected, recovery.restoreSource);
+          return undefined;
+        } catch (error) { return retainedAdoptionRefusal(error); }
+      });
+    } catch { return undefined; }
+  }
+
   /** Resolve only the exact charged source/reservation, or its explicitly verified handoff.
    * This handles a journal-root write landing before prepareRecoverySuccessor throws. */
   async recoveryReservationSnapshot(barePath: string, branch: string, key: string,
@@ -11229,12 +11262,44 @@ export class GitCache {
     if (!expected.attemptId || !src) throw new Error("remediation adoption source unavailable");
     const record = await this.readRemediationUnderLock(barePath, branch, { ...expected, attemptId: expected.attemptId });
     if (!record || record.ownedTip !== src) throw new Error("remediation adoption source unverified");
-    for (const oid of [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])]) {
-      if (await this.ancestry(barePath, oid, src) !== "divergent")
-        throw new Error("remediation adoption source still restricted");
+    const roots = [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])];
+    const restricted = await this.classifyRestrictedRoots(barePath, roots, src);
+    if (restricted !== "clear") {
+      const error = new Error("remediation adoption source still restricted");
+      if (restricted !== "unclassified") annotateRetainedSuccessorError(error, restricted);
+      throw error;
     }
     await this.proveRemediationForwardTarget(barePath, record, src);
     return record;
+  }
+
+  /** Classify why a restricted root is not divergent from the source. Stops at the first `ancestor` (active
+   * remediation); an `unknown` probe is passed over and, when no ancestor is found, means the proof is unknown.
+   * Once the operation signal or deadline has fired `ancestry` answers `unknown` for the wrong reason, so an
+   * interrupted refusal carries no class at all. Classification only: it never admits a source. */
+  private async classifyRestrictedRoots(barePath: string, roots: readonly string[], src: string):
+    Promise<"clear" | "remediation_active" | "remediation_proof_unknown" | "unclassified"> {
+    let unknown = false;
+    for (const oid of roots) {
+      const relation = await this.ancestry(barePath, oid, src);
+      if (relation === "ancestor") return "remediation_active";
+      if (relation === "unknown") unknown = true;
+    }
+    if (!unknown) return "clear";
+    try { this.checkRecoveryInterruption(); }
+    catch { return "unclassified"; }
+    if (this.boundaryProcesses.getStore()?.signal.aborted) return "unclassified";
+    return "remediation_proof_unknown";
+  }
+
+  /** The replacement-ancestry refusal, classified as an unknown proof unless the operation was interrupted
+   * (an aborted or expired probe answers `unknown` for reasons that say nothing about the evidence). */
+  private unknownReplacementAncestry(): Error {
+    const error = new Error("remediation replacement ancestry unknown");
+    let interrupted = this.boundaryProcesses.getStore()?.signal.aborted === true;
+    try { this.checkRecoveryInterruption(); } catch { interrupted = true; }
+    if (!interrupted) annotateRetainedSuccessorError(error, "remediation_proof_unknown");
+    return error;
   }
 
   /** Each target gets its own bounded ordered proof: at most 64 edges and 64 squared
@@ -11250,7 +11315,7 @@ export class GitCache {
       if (visiting.has(index) || visiting.size >= 64) return false;
       const edge = record.edges[index]!;
       const relation = await this.ancestry(barePath, edge.to, target);
-      if (relation === "unknown") throw new Error("remediation replacement ancestry unknown");
+      if (relation === "unknown") throw this.unknownReplacementAncestry();
       if (relation === "ancestor") { reached.add(index); return true; }
       const next = new Set(visiting).add(index);
       for (let i = 0; i < record.edges.length; i++) {
@@ -11259,7 +11324,7 @@ export class GitCache {
         // cover several partial rewrites; grant identity need not increase per edge.
         if (i <= index) continue;
         const progress = await this.ancestry(barePath, edge.to, later.from);
-        if (progress === "unknown") throw new Error("remediation replacement ancestry unknown");
+        if (progress === "unknown") throw this.unknownReplacementAncestry();
         if (progress === "ancestor" && await reaches(i, next)) { reached.add(index); return true; }
       }
       refused.add(index);

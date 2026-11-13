@@ -360,12 +360,13 @@ func (f *custodyUnitsLegacyFixture) counted() (open, counted int64) {
 func TestCustodyAdmissionUnitsLegacyBinaryCompatLiveDB(t *testing.T) {
 	ver := custodyUnitsMigrationVersion(t)
 	ctx, dsn := standIsolatedDB(t, "cau_legacy_")
-	if err := store.MigrateTo(ctx, dsn, ver); err != nil {
+	// Phase 1, current schema: the current generated queries (ClaimRun reads columns added after
+	// the migration under test) run at the actual migration head.
+	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
 	pool := custodyUnitsPool(ctx, t, dsn)
 	f := newCustodyUnitsLegacyFixture(ctx, t, pool)
-	before := f.snapshot()
 
 	// Grouped accounting: two holds of one run on one worker are one admission unit.
 	if open, counted := f.counted(); open != int64(f.limit) || counted != 1 {
@@ -380,6 +381,21 @@ func TestCustodyAdmissionUnitsLegacyBinaryCompatLiveDB(t *testing.T) {
 	_ = tx.Rollback(ctx)
 	if !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("current ClaimRun err=%v, want no rows (hard per-run bound)", err)
+	}
+
+	// Phase 2, historical schema: finish all current-query work above, then walk the real goose
+	// Downs back to the migration under test (the head of the previous image's world) and
+	// snapshot there, so columns removed by later Downs are not counted as a mutation.
+	if err := store.MigrateDownTo(ctx, dsn, ver); err != nil {
+		t.Fatalf("walk Downs to %d: %v", ver, err)
+	}
+	var applied int64
+	if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version WHERE is_applied").Scan(&applied); err != nil || applied != ver {
+		t.Fatalf("after the walk the goose head is %d (%v), want %d", applied, err, ver)
+	}
+	before := f.snapshot()
+	if open, counted := f.counted(); open != int64(f.limit) || counted != 1 {
+		t.Fatalf("grouped accounting at %d open=%d counted=%d, want open=%d counted=1", ver, open, counted, f.limit)
 	}
 
 	// Hazard: the previous image's ClaimRun has no per-run bound, so grouped accounting admits.

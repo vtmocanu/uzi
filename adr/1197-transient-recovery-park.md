@@ -2083,3 +2083,64 @@ queued even at the cap.
 
 **Fallback.** If the api lacks the feature, the worker does not park and the run follows the ordinary
 requeue paths.
+
+## Amendment 2026-11-12, #4177: a closed-set detail on the adoption-failed park; Resume refused on an active secret remediation
+
+Decision record (AI-synced 2026-11-12). This qualifies the #3527 owner hold
+([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)), whose Resume "requests a
+bounded attempt", for one confirmed class: when the retained source still descends from a
+secret-scan-flagged commit, retrying unchanged cannot help, so the owner is told that and Resume is
+refused instead of looping through another hold. The #4058 and #3644 holds above are not classified.
+
+**Decision.** A run on `recovery_wait` / `retained_recovery_adoption_failed` may carry a nullable
+`recovery_wait_detail` (migration 00433, a `NOT VALID` CHECK validated by 00434; numbers are re-assigned at
+landing), valid only on that status and cause.
+
+**The closed set.**
+
+- `secret_remediation_active`: a confirmed restricted ancestor. Retrying unchanged cannot help.
+- `remediation_proof_unknown`: the remediation proof could not be verified (an unknown ancestry probe or
+  an untrusted scan). A retry may help.
+- NULL: unclassified. The existing generic text applies and nothing new is permitted. An absent or NULL
+  classification never permits adoption; it only selects the generic refusal text.
+
+A confirmed restricted ancestor or a trusted scan finding is active; an unknown probe after an abort or
+deadline, a deadline that rewrites the blocker, and every other refusal give NULL. The Run DTO exposes the field only for that
+status and cause; it is not in the `/api/v1` OpenAPI.
+
+**Feature token and rollout order.** The worker reports the value as optional `recovery_detail` on the
+park, and only after the API advertises the register feature `recovery_detail_adoption_refusal_v1`,
+because an older API's strict decoder rejects the unknown field. Deploy API-first; a worker that has not
+seen the token sends no detail and the park is the generic hold. The API 400s any other value, state or
+cause, and a non-positive `claim_generation`.
+
+**Resume refusal and fence.** Owner Resume (`uzi run resume`, `resume-now`, the web Resume) on
+`secret_remediation_active` returns 409 before any write: no claim, no claim generation, no audit row and
+no custody released. The message names both routes and Cancel. The SQL resume query is fenced on the same
+predicate, so a concurrent writer cannot slip a Resume past the handler check. The CLI and TUI print no Resume
+command in this state, the web shows Resume disabled, and all three show both routes then Cancel: export an available archive
+(`uzi run export <id> --output <path>`) or operator recovery from retained worker storage
+([run recovery](../docs/run-recovery.md#retained-source-failure-and-local-proof)).
+
+**Crash-rediscovery failure model.** After a worker process crash between persisting the adoption
+blocker and the park, a fresh claim re-derives the class from the persisted journal, read-only and
+authenticated, in its own bounded operation isolated from blocker persistence. Anything it cannot verify
+gives NULL. This model covers a process crash only; nothing new is claimed for storage or power loss.
+
+**The bound.** A class known only from the refusal callback (not recoverable from the persisted journal)
+is NULL after a crash: the park falls back to the generic hold, which is the safe direction.
+
+**Limits.**
+
+- Capture and upload are unchanged. An available archive is not proven to hold the latest work and may
+  omit later work kept on the worker; operator recovery from worker storage is the other route.
+- The #4058 predecessor-remediation hold and the #3644 unsupported-predecessor hold stay unclassified
+  (NULL), so their Resume behavior is unchanged.
+- Worker trust: the class is reported by the worker, which could under-report it (a NULL or
+  `remediation_proof_unknown` where the truth is active). The detail narrows owner options only; it grants
+  no authority, and Resume still grants no remediation authority.
+
+**Down migration.** 00433's Down takes `ACCESS EXCLUSIVE` on `runs` under a 5 s `lock_timeout` before
+checking, as 00425 does, then refuses while any run is parked on this cause with
+`secret_remediation_active`, because dropping the column would erase the only record that Resume must be
+refused. Cancel those runs first.

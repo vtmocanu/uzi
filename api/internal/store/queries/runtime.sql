@@ -13148,6 +13148,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
+  AND NOT (runs.recovery_wait_cause = 'retained_recovery_adoption_failed' AND runs.recovery_wait_detail IS NOT DISTINCT FROM 'secret_remediation_active')
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -13204,12 +13205,13 @@ UPDATE runs SET
     worker_recovery_episode = runs.worker_recovery_episode + 1,
     requeue_episode_baseline = runs.requeue_count,
     stale_requeue_generation = NULL, worker_recovery_evidence = NULL,
-    recovery_wait_cause = NULL, recovery_retry_not_before = NULL,
+    recovery_wait_cause = NULL, recovery_wait_detail = NULL, recovery_retry_not_before = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
+  AND NOT (runs.recovery_wait_cause = 'retained_recovery_adoption_failed' AND runs.recovery_wait_detail IS NOT DISTINCT FROM 'secret_remediation_active')
   -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
   -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
@@ -13301,6 +13303,7 @@ RETURNING *;
 -- Called under GetRunOwnedByWorkerForUpdate. Execution release is not custody release.
 UPDATE runs SET status='recovery_wait', status_since=now(), updated_at=now(),
  recovery_wait_cause = @recovery_cause::text,
+ recovery_wait_detail = CASE WHEN @recovery_cause::text = 'retained_recovery_adoption_failed' THEN sqlc.narg('recovery_detail')::text END,
  recovery_wait_count=recovery_wait_count+1,
  retained_park_count=retained_park_count+CASE WHEN @counted::boolean THEN 1 ELSE 0 END,
  recovery_retry_not_before=sqlc.narg('retry_not_before')::timestamptz,

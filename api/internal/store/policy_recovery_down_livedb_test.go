@@ -18,11 +18,14 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// downFx is one isolated database migrated to 421 (the head, so the production queries run) with real
-// rows produced by those queries. The 419 rollback tests call mc() once their rows exist: it walks
-// 421 -> 420 -> 419 through migration 421's and 420's Downs, which for these fixtures (no one-claim
-// Fresh authorization) convert nothing, so the migration 419 Down then runs against exactly the rows
-// the production queries produced.
+// downFx is one isolated database migrated to the actual head, so the current generated queries run
+// and seed real rows. The historical-migration tests then call boundary(), which walks the real goose
+// Downs from the head back to 421 (the boundary these tests exercise); every snapshot is taken after
+// that walk, so columns removed by unrelated later Downs are not counted as a mutation by the Down
+// under test. mc() then walks 421 -> 420 -> 419 through migration 421's and 420's Downs, which for
+// these fixtures (no one-claim Fresh authorization) convert nothing, so the migration 419 Down runs
+// against exactly the rows the production queries produced. All current-query work must finish
+// before boundary() is called.
 type downFx struct {
 	t                   *testing.T
 	ctx                 context.Context
@@ -34,12 +37,15 @@ type downFx struct {
 	atMc                bool
 }
 
+// boundaryVersion is the schema the historical migration tests start from.
+const boundaryVersion = 421
+
 var recoveryColumns = []string{"policy_required_head", "policy_recovery_verified_generation", "policy_recovery_verified_head", "policy_hold_cause"}
 
 func newDownFx(t *testing.T) *downFx {
 	t.Helper()
 	ctx, dsn := standIsolatedDB(t, "policy_recovery_down_")
-	if err := store.MigrateTo(ctx, dsn, 421); err != nil {
+	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -57,12 +63,28 @@ func newDownFx(t *testing.T) *downFx {
 	return f
 }
 
-// mc rolls the head migration back to 419 so a test can exercise migration 419's own Down.
+// boundary walks the real goose Downs from the head to boundaryVersion. It is a no-op once at or
+// below it. Call it after all current-query seeding and before any snapshot or historical step.
+func (f *downFx) boundary() {
+	f.t.Helper()
+	if f.version() <= boundaryVersion {
+		return
+	}
+	if err := store.MigrateDownTo(f.ctx, f.dsn, boundaryVersion); err != nil {
+		f.t.Fatalf("Down to %d: %v", int64(boundaryVersion), err)
+	}
+	if got := f.version(); got != boundaryVersion {
+		f.t.Fatalf("Down to %d left version %d", int64(boundaryVersion), got)
+	}
+}
+
+// mc rolls the boundary migration back to 419 so a test can exercise migration 419's own Down.
 func (f *downFx) mc() {
 	f.t.Helper()
 	if f.atMc {
 		return
 	}
+	f.boundary()
 	for _, step := range []int64{420, 419} {
 		if err := store.MigrateDownTo(f.ctx, f.dsn, step); err != nil {
 			f.t.Fatalf("Down to %d: %v", step, err)
@@ -248,6 +270,7 @@ func TestPolicyRecoveryDownConvertsPausedAndQueuedLiveDB(t *testing.T) {
 	completed := f.running()
 	mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='completed',finished_at=now(),policy_required_head=$2 WHERE id=$1", completed, a)
 	converted := []uuid.UUID{paused, queuedPreserve, savedWork, verifiedPaused}
+	f.boundary()
 	before := map[uuid.UUID]map[string]any{}
 	for _, id := range append([]uuid.UUID{ordinary, completed}, converted...) {
 		before[id] = f.row(id)
@@ -324,6 +347,7 @@ func TestPolicyRecoveryDownIgnoresResolvedAttemptPathLiveDB(t *testing.T) {
 		return id
 	}
 	rows := []uuid.UUID{headless("queued"), headless("claimed"), headless("running"), verified("claimed"), verified("running")}
+	f.boundary()
 	before := map[uuid.UUID]map[string]any{}
 	for _, id := range rows {
 		before[id] = f.row(id)
@@ -395,6 +419,7 @@ func TestPolicyRecoveryDownConvertsHeadlessResolvedPreservingLiveDB(t *testing.T
 	queued := f.headlessPreserving()
 	paused := f.headlessPreserving()
 	mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='paused',hold_reason='credential_disabled' WHERE id=$1", paused)
+	f.boundary()
 	if err := store.MigrateDownTo(f.ctx, f.dsn, 418); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
@@ -424,6 +449,7 @@ func TestPolicyRecoveryDownRefusesOrphansLiveDB(t *testing.T) {
 	t.Run("verification without a required head", func(t *testing.T) {
 		f := newDownFx(t)
 		convertible := f.pausedPreserving(strings.Repeat("a", 40))
+		f.boundary()
 		orphan := f.running()
 		mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='queued',policy_recovery_verified_generation=3,policy_recovery_verified_head=$2 WHERE id=$1", orphan, strings.Repeat("d", 40))
 		f.refused("orphaned or malformed recovery identity")
@@ -441,6 +467,7 @@ func TestPolicyRecoveryDownRefusesOrphansLiveDB(t *testing.T) {
 	})
 	t.Run("malformed head that predates the shape check", func(t *testing.T) {
 		f := newDownFx(t)
+		f.boundary()
 		mustExec(f.ctx, t, f.pool, "ALTER TABLE runs DROP CONSTRAINT runs_policy_required_recovery_shape")
 		bad := f.running()
 		mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='queued',policy_required_head='NOT-A-SHA' WHERE id=$1", bad)
@@ -448,6 +475,7 @@ func TestPolicyRecoveryDownRefusesOrphansLiveDB(t *testing.T) {
 	})
 	t.Run("terminal orphan is ignored", func(t *testing.T) {
 		f := newDownFx(t)
+		f.boundary()
 		done := f.running()
 		mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='failed',finished_at=now(),policy_recovery_verified_generation=3 WHERE id=$1", done)
 		if err := store.MigrateDownTo(f.ctx, f.dsn, 418); err != nil {

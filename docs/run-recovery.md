@@ -599,6 +599,14 @@ A confirmed `adoption_failed` blocker can instead hold at `recovery_wait` /
 A temporary API connection failure of the ownership check after the successor
 is verified is retried in place first; see
 [Retained recovery adoption failed](run-recovery-wait.md#retained-recovery-adoption-failed).
+When the refusal confirms the retained source still descends from a secret-scan-flagged
+commit (and the API advertised `recovery_detail_adoption_refusal_v1`), the run carries
+`recovery_wait_detail` `secret_remediation_active` and owner
+Resume is refused (409, no claim, no generation, no audit row, no custody released):
+export an available archive (`uzi run export <id> --output <path>`, which may omit later
+work kept on the worker) or have an operator recover from retained worker storage (see
+the failed source-only paragraph below), then Cancel. `remediation_proof_unknown` means
+the proof could not be verified and a retry may help.
 A retained continuation whose `running` report the server refuses, and whose
 flight departed or showed presence without a witnessed departure, is charged
 against the requeue budget or held at `retained_continuation_unwitnessed`
@@ -2259,7 +2267,9 @@ start and the source requires review. **Resume** on this worker holds again and 
 open custody hold while this run's own open holds are below the custody hold limit (at the limit,
 Resume creates no further claim or hold); **Cancel** ends the run and leaves its open holds for you to discard.
 Run `uzi run recovery <predecessor-run-id>` to inspect the predecessor. Resume grants no remediation
-authority, and this page names no route that disposes of the remediation. While held or queued, the
+authority, and this page names no route that disposes of the remediation. This
+predecessor-remediation hold carries no `recovery_wait_detail` (#4177 classifies only the
+adoption refusal, not this hold or the unsupported-predecessor hold below). While held or queued, the
 run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`; its generations on one worker count as one unit), and a
 held run blocks its worker's upgrade or drain. If the api does not support the park, the worker does not
 park and the message says so; the run is then handled by the ordinary requeue paths. A worker restart
@@ -2304,7 +2314,8 @@ attribution and own-record checks pass, so with no pin or several pins it is ref
 same refusal: Resume claims again and holds again unchanged on this release and adds at
 least one open custody hold while this run's own open holds are below the custody hold limit (at the
 limit, Resume creates no further claim or hold), and Cancel ends the run. Without that
-capability the refusal is the ordinary nonterminal stop described below. The park
+capability the refusal is the ordinary nonterminal stop described below. Like the predecessor-remediation hold, this
+hold is unclassified: its `recovery_wait_detail` is NULL. The park
 changes no predecessor bytes (journal, slot, clone, HOME and provision directories stay
 as they were) and reaps nothing. Here the cause has a third meaning: continuation was
 refused because this release does not support the predecessor, not because an adoption

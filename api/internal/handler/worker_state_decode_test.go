@@ -102,6 +102,7 @@ type stateRequestMinusGateRevision struct {
 	PublicationHoldReason       *string                            `json:"publication_hold_reason,omitempty"`
 	DiskParkPreventive          *bool                              `json:"disk_park_preventive"`
 	RetainedCapacityOnly        *bool                              `json:"retained_capacity_only,omitempty"`
+	RecoveryDetail              *string                            `json:"recovery_detail,omitempty"`
 	ProductiveTurns             *int32                             `json:"productive_turns"`
 	ProviderProgressTurns       *int32                             `json:"provider_progress_turns"`
 	CheckpointContainsLatest    *bool                              `json:"checkpoint_contains_latest"`
