@@ -27363,44 +27363,47 @@ try {
       started = true;
       const holder = { since: performance.now() };
       this.lockHolders.set(key, holder);
-      if (restrictionProgress) restrictionProgress.acquired = true;
-      removeAbortListener();
-      let outcome: { ok: true; value: T } | { ok: false; error: unknown };
       try {
-        // The bare lock is already held here (started = true above), so a failure is post-acquisition
-        // and must stay sticky (#4191): it is never classified as pre-read unavailability.
+        if (restrictionProgress) restrictionProgress.acquired = true;
+        removeAbortListener();
+        let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+        try {
+          // The bare lock is already held here (started = true above), so a failure is post-acquisition
+          // and must stay sticky (#4191): it is never classified as pre-read unavailability.
+          try { this.checkRecoveryInterruption(); }
+          catch (error) {
+            if (restrictionProgress) restrictionProgress.cause = "unknown";
+            throw error;
+          }
+          const value = await fn();
+          try { this.checkRecoveryInterruption(); }
+          catch (error) {
+            if (restrictionProgress) restrictionProgress.cause = "post_read_expiry";
+            throw error;
+          }
+          outcome = { ok: true, value };
+        } catch (error) {
+          outcome = { ok: false, error };
+        }
+        // issue #1597 M2: a scope's pre-release hook runs while this lock is STILL held (the chain
+        // below does not advance until `run` returns), so a cancelled tick can settle its children and
+        // reconcile lock files before any other bare mutation starts. It never fails the op.
+        if (boundary?.beforeLockRelease) {
+          await boundary.beforeLockRelease(key).catch(() => undefined);
+        }
         try { this.checkRecoveryInterruption(); }
         catch (error) {
-          if (restrictionProgress) restrictionProgress.cause = "unknown";
-          throw error;
+          if (restrictionProgress?.started) restrictionProgress.cause = "post_read_expiry";
+          outcome = { ok: false, error };
         }
-        const value = await fn();
-        try { this.checkRecoveryInterruption(); }
-        catch (error) {
-          if (restrictionProgress) restrictionProgress.cause = "post_read_expiry";
-          throw error;
-        }
-        outcome = { ok: true, value };
-      } catch (error) {
-        outcome = { ok: false, error };
+        settled = true;
+        if (outcome.ok) resolveResult(outcome.value);
+        else rejectResult(outcome.error);
+      } finally {
+        // Diagnostic holder entry: cleared after beforeLockRelease (the lock is held through it), in the same
+        // tick the result is published, and even if the post-acquisition body throws.
+        if (this.lockHolders.get(key) === holder) this.lockHolders.delete(key);
       }
-      // issue #1597 M2: a scope's pre-release hook runs while this lock is STILL held (the chain
-      // below does not advance until `run` returns), so a cancelled tick can settle its children and
-      // reconcile lock files before any other bare mutation starts. It never fails the op.
-      if (boundary?.beforeLockRelease) {
-        await boundary.beforeLockRelease(key).catch(() => undefined);
-      }
-      try { this.checkRecoveryInterruption(); }
-      catch (error) {
-        if (restrictionProgress?.started) restrictionProgress.cause = "post_read_expiry";
-        outcome = { ok: false, error };
-      }
-      // Diagnostic holder entry: cleared only after beforeLockRelease (the lock is held through it) and
-      // before the result is published. Nothing above can throw past its own catch.
-      if (this.lockHolders.get(key) === holder) this.lockHolders.delete(key);
-      settled = true;
-      if (outcome.ok) resolveResult(outcome.value);
-      else rejectResult(outcome.error);
     };
     const next = prev.then(run, run);
     // Keep the serialization chain alive but swallow its stored result so one

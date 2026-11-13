@@ -284,6 +284,27 @@ describe("permit-scoped bare lock acquisition", () => {
       assert.equal(at(lines, 1).holder, "none");
       assert.equal(at(lines, 1).level, "debug");
     });
+
+    it("(g) a beforeLockRelease hook that throws synchronously still clears the holder entry", async () => {
+      const { rec, cache, internals } = setup();
+      const throwingHook = (() => { throw new Error("sync hook failure"); }) as unknown as (key: string) => Promise<void>;
+      // The holder's own result never settles on this path (pre-existing); only the chain advances.
+      // No later acquisition is made before the probe: a new holder would overwrite a leaked entry.
+      let entered!: () => void;
+      const enteredP = new Promise<void>((resolve) => { entered = resolve; });
+      void cache.withBoundaryProcessSpawner(noSpawn, new AbortController().signal,
+        () => internals.withLock("shared-bare", async () => { entered(); return "holder"; }), { beforeLockRelease: throwingHook });
+      await enteredP;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const late = new AbortController();
+      late.abort();
+      await assert.rejects(cache.withBoundaryProcessSpawner(noSpawn, late.signal,
+        () => internals.withLock("shared-bare", async () => "never")));
+      const lines = lockLines(rec.lines);
+      assert.equal(lines.length, 1);
+      assert.equal(at(lines, 0).holder, "none");
+      assert.equal(at(lines, 0).level, "debug");
+    });
   });
 });
 
