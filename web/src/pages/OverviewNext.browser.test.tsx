@@ -1450,9 +1450,9 @@ describe("OverviewNext health chip popover", () => {
     return screen.findByRole("button", { name: /System health/ });
   }
 
-  async function mountInColumn(width: number, sidebarWidth: number) {
+  async function mountInColumn(width: number, sidebarWidth: number, passing = false) {
     await page.viewport(width, 900);
-    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    mockApi.getAdminHealth.mockResolvedValue(passing ? healthySilentDoc() : overviewNextDoc());
     render(
       <MemoryRouter initialEntries={["/overview/next"]}>
         <div style={{ paddingLeft: sidebarWidth }}>
@@ -1475,6 +1475,42 @@ describe("OverviewNext health chip popover", () => {
     const p = panel.getBoundingClientRect();
     return Math.max(Math.abs(p.left - c.left), Math.abs(p.right - c.right));
   };
+
+  it("opens a passing panel across the content column, with four desktop areas", async () => {
+    const chip = await mountInColumn(1280, 240, true);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    await expect.poll(() => edgeError(panel)).toBeLessThanOrEqual(1);
+    expect(within(panel).getByText("System health: all 23 checks passing")).toBeTruthy();
+    const grid = panel.querySelector<HTMLElement>("[data-health-passing-grid]")!;
+    expect(getComputedStyle(grid).gridTemplateColumns.split(" ")).toHaveLength(4);
+    expect(within(panel).getByRole("link", { name: "Open health" }).getAttribute("href")).toBe("/admin/health");
+  });
+
+  it("keeps the passing panel as a one-column bottom sheet at 400px", async () => {
+    const chip = await mountInColumn(400, 0, true);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    const r = panel.getBoundingClientRect();
+    expect(Math.abs(r.left - 16)).toBeLessThanOrEqual(1);
+    expect(Math.abs(window.innerWidth - r.right - 16)).toBeLessThanOrEqual(1);
+    expect(getComputedStyle(panel.querySelector<HTMLElement>("[data-health-passing-grid]")!).gridTemplateColumns.split(" ")).toHaveLength(1);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+  });
+
+  it("opens and closes the passing-check disclosure with Enter and Space", async () => {
+    const chip = await mountInColumn(1280, 240);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    const summary = within(panel).getByText("22 other checks passing") as HTMLElement;
+    const details = summary.closest("details")!;
+    expect(details.open).toBe(false);
+    summary.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(details.open).toBe(true);
+    await userEvent.keyboard(" ");
+    expect(details.open).toBe(false);
+  });
 
   it("spans the content column at sm+ with the sidebar expanded or collapsed", async () => {
     for (const [width, sidebar] of [

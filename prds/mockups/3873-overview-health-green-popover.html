@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Health popover when green</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  .ember { --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+           --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154; --brand: 251 146 60; --warn: 251 191 36; --ok: 52 211 153; --danger: 248 113 113; --accent: 96 165 250; }
+  .dawn  { --bg: 242 244 247; --surface: 255 255 255; --raised: 235 238 243; --edge: 214 219 228; --edge-strong: 174 182 196;
+           --fg: 21 26 34; --muted: 74 85 103; --faint: 95 106 130; --brand: 185 60 11; --warn: 154 74 5; --ok: 4 120 87; --danger: 185 28 28; --accent: 37 99 235; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "IBM Plex Sans", system-ui, sans-serif; background: #111; color: #ddd; }
+  .intro { padding: 20px 24px 8px; }
+  .intro h1 { font-size: 18px; margin: 0 0 6px; color: #eee; }
+  .intro p { margin: 0 0 6px; font-size: 13px; color: #aaa; line-height: 1.5; max-width: 1100px; }
+  .wbtn { font: inherit; font-size: 12px; margin-right: 6px; padding: 3px 9px; border-radius: 6px; border: 1px solid #555; background: #222; color: #ddd; cursor: pointer; }
+  .wbtn.on { border-color: #fb923c; color: #fb923c; }
+  .stage { padding: 18px 24px 40px; background: rgb(var(--bg)); color: rgb(var(--fg)); overflow-x: auto; }
+  .variant-title { font-size: 13px; font-weight: 600; margin: 26px 0 4px; }
+  .variant-title .tag { font-weight: 500; font-size: 11px; padding: 1px 6px; border-radius: 4px; margin-left: 6px; border: 1px solid rgb(var(--edge)); color: rgb(var(--muted)); }
+  .variant-title .tag.rec { color: rgb(var(--brand)); border-color: rgb(var(--brand) / .5); }
+  .variant-note { font-size: 12px; color: rgb(var(--faint)); margin: 0 0 10px; max-width: 1000px; line-height: 1.5; }
+  .screen { display: flex; width: var(--vw); border: 1px solid rgb(var(--edge)); border-radius: 8px; overflow: hidden; }
+  .sidebar { width: 240px; flex: none; background: rgb(var(--surface)); border-right: 1px solid rgb(var(--edge)); padding: 16px; font-size: 13px; color: rgb(var(--muted)); }
+  .sidebar div { padding: 6px 8px; border-radius: 6px; }
+  .sidebar div.on { background: rgb(var(--raised)); color: rgb(var(--fg)); }
+  main { flex: 1; min-width: 0; padding: 24px; }
+  .col { max-width: 1088px; margin: 0 auto; position: relative; }
+  .hdr { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px 24px; margin-bottom: 20px; }
+  .hdr b { display: block; font-size: 22px; font-weight: 600; }
+  .hdr .t span { display: block; margin-top: 4px; font-size: 14px; color: rgb(var(--muted)); }
+  .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .chip, .btn { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px; border-radius: 999px; border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); font-size: 13px; white-space: nowrap; color: rgb(var(--fg)); }
+  .btn { border-radius: 8px; font-weight: 500; }
+  .chip.open { outline: 2px solid rgb(var(--accent) / .5); }
+  .chip.link { text-decoration: underline dotted rgb(var(--faint)); }
+  .badge { border-radius: 6px; padding: 1px 7px; font-weight: 500; font-size: 12px; white-space: nowrap; border: 1px solid; }
+  .b-ok { color: rgb(var(--ok)); border-color: rgb(var(--ok) / .5); background: rgb(var(--ok) / .12); }
+  .b-warn { color: rgb(var(--warn)); border-color: rgb(var(--warn) / .5); background: rgb(var(--warn) / .12); }
+  .b-danger { color: rgb(var(--danger)); border-color: rgb(var(--danger) / .5); background: rgb(var(--danger) / .12); }
+  .av i { font-style: normal; width: 22px; height: 22px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 9px; font-weight: 600; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge-strong)); margin-left: -5px; color: rgb(var(--muted)); }
+  .av i:first-child { margin-left: 0; }
+  kbd { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: rgb(var(--muted)); border: 1px solid rgb(var(--edge)); border-radius: 4px; padding: 0 4px; }
+  .back { font-size: 13px; font-weight: 500; color: rgb(var(--brand)); white-space: nowrap; }
+  .card { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: 14px; padding: 18px 20px; margin-bottom: 16px; }
+  .card h4 { margin: 0 0 12px; font-size: 15px; display: flex; justify-content: space-between; }
+  .card h4 small { font-weight: 400; color: rgb(var(--muted)); font-size: 13px; }
+  .row { display: flex; justify-content: space-between; padding: 8px 0; border-top: 1px solid rgb(var(--edge)); font-size: 14px; }
+  .pill { border: 1px solid rgb(var(--edge-strong)); border-radius: 999px; padding: 3px 12px; font-size: 13px; }
+  .track { display: flex; justify-content: space-between; font-size: 11px; letter-spacing: .06em; color: rgb(var(--faint)); padding-top: 26px; border-top: 2px dashed rgb(var(--edge)); margin-top: 12px; }
+  .panel { position: absolute; z-index: 5; top: 44px; left: 0; right: 0; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: 12px; box-shadow: 0 20px 50px rgb(0 0 0 / .35); }
+  .ph { display: flex; align-items: center; gap: 10px; padding: 14px 18px 4px; font-weight: 600; font-size: 15px; }
+  .ph .when { margin-left: auto; font-weight: 400; font-size: 12px; color: rgb(var(--faint)); }
+  .sub { padding: 0 18px 10px; font-size: 13px; color: rgb(var(--muted)); }
+  .groups { padding: 4px 18px 14px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 28px; }
+  .grp h5 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: rgb(var(--faint)); font-weight: 500; }
+  .ck { display: flex; align-items: baseline; gap: 7px; font-size: 13px; line-height: 1.55; color: rgb(var(--fg)); }
+  .ck .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; transform: translateY(-1px); background: rgb(var(--ok)); }
+  .ck.warn .dot { background: rgb(var(--warn)); } .ck.danger .dot { background: rgb(var(--danger)); }
+  .ck.warn, .ck.danger { font-weight: 600; }
+  .terse { padding: 2px 18px 14px; font-size: 13px; color: rgb(var(--muted)); line-height: 1.7; }
+  .terse b { color: rgb(var(--fg)); font-weight: 500; }
+  .check { display: flex; gap: 14px; padding: 10px 18px; }
+  .check .body { flex: 1; min-width: 0; font-size: 14px; line-height: 1.45; }
+  .check .body b { font-weight: 600; }
+  .check .desc { color: rgb(var(--muted)); }
+  .check .for { flex: none; font-size: 12px; color: rgb(var(--faint)); padding-top: 2px; }
+  .kv { margin-top: 4px; font-size: 13px; line-height: 1.6; color: rgb(var(--muted)); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 32px; }
+  .kv b { color: rgb(var(--fg)); font-weight: 600; }
+  .kv .wide { grid-column: 1 / -1; }
+  .docs { color: rgb(var(--brand)); }
+  .others { border-top: 1px solid rgb(var(--edge)); padding: 10px 18px; font-size: 13px; color: rgb(var(--muted)); }
+  .others summary { cursor: pointer; }
+  .pf { border-top: 1px solid rgb(var(--edge)); padding: 10px 18px; display: flex; justify-content: space-between; align-items: center; font-size: 14px; }
+  .pf .l { font-size: 12px; color: rgb(var(--faint)); }
+  .pf a { color: rgb(var(--accent)); text-decoration: none; }
+  .ghostnote { position: absolute; top: 46px; left: 0; font-size: 12px; color: rgb(var(--faint)); background: rgb(var(--surface)); border: 1px dashed rgb(var(--edge-strong)); border-radius: 8px; padding: 8px 12px; z-index: 5; }
+</style>
+</head>
+<body>
+<div class="intro">
+  <h1>Overview: health popover when every check passes</h1>
+  <p>Today a green chip is a plain link to the Health tab; warn or danger opens the popover. The options below make the chip always open a popover with "Open health" in its footer. The width and two-column details follow #4259 (spans the content column).</p>
+  <p>The check names and groups come from the live instance (23 checks, all ok at mock time); the groups are by check id prefix. The warn example reuses the screenshot's worker-roll check.</p>
+  <p>Screen width: <span id="widths"></span> &nbsp; Theme: <button class="wbtn" data-theme="ember">Ember</button><button class="wbtn" data-theme="dawn">Dawn</button></p>
+</div>
+<div class="stage ember" id="stage"></div>
+
+<script>
+  const GROUPS = [
+    ["Workers", ["Worker image roll", "Worker capacity", "Worker disk", "Run disk size", "Worker residue quarantine", "Worker memory authority"]],
+    ["Queue", ["Runs waiting for a worker", "Undispatched task runs"]],
+    ["Platform", ["Controller reporting", "Database", "Database size", "Background loops", "Maintenance mode"]],
+    ["Forge and Slack", ["CI watch capacity", "Forge issue sync", "Board drift", "Slack socket"]],
+    ["Schedules", ["Paused schedules"]],
+    ["Recovery", ["Recovery custody holds", "Recovery storage"]],
+    ["Releases and pricing", ["Upstream release", "Agent source update", "Codex price coverage"]],
+  ];
+  const TOTAL = GROUPS.reduce((n, g) => n + g[1].length, 0);
+  const shell = (chipHtml, panelHtml) => `
+  <div class="screen">
+    <aside class="sidebar"><div class="on">Overview</div><div>Board</div><div>Runs</div><div>Pull requests</div><div>Workers</div><div>Health</div><div>Settings</div></aside>
+    <main><div class="col">
+      <div class="hdr">
+        <div class="t"><b>Welcome, User A</b><span>Nothing needs you right now. 3 runs are executing across the factory for 2 people.</span></div>
+        <div class="actions">${chipHtml}
+          <span class="chip"><span class="av"><i>UA</i><i>UB</i><i>UC</i></span><strong>3 active now</strong><span style="color:rgb(var(--muted))">of 10</span></span>
+          <span class="btn">⌕ Search <kbd>⌘K</kbd></span><span class="back">Back to the current Overview</span>
+        </div>
+      </div>
+      ${panelHtml}
+      <div class="card"><h4>Runs <small>3 runs on the line, 1 other</small></h4><div class="track"><span>QUEUED</span><span>PLANNING</span><span>PLAN REVIEW</span><span>BUILDING</span><span>PR OPEN</span></div></div>
+      <div class="card"><h4>Usage <small>last 7 days</small></h4><div style="height:110px"></div></div>
+    </div></main>
+  </div>`;
+  const greenChip = (open, link) => `<span class="chip${open ? " open" : ""}${link ? " link" : ""}"><span class="badge b-ok">● OK</span>${TOTAL} of ${TOTAL} checks passing</span>`;
+  const footer = (left) => `<div class="pf"><span class="l">${left}</span><a href="#" onclick="return false">Open health →</a></div>`;
+  const grid = (warnName) => `<div class="groups">${GROUPS.map(([g, cs]) => `<div class="grp"><h5>${g}</h5>${cs.map((c) => `<div class="ck${c === warnName ? " warn" : ""}"><span class="dot"></span>${c}</div>`).join("")}</div>`).join("")}</div>`;
+  const variants = [
+    { title: "A. Today", tag: "green chip is a link", note: "Clicking the chip navigates to the Health tab; there is no popover. Shown with the hover/focus state only.",
+      html: () => shell(greenChip(false, true), `<div class="ghostnote">click → navigates to /admin/health</div>`) },
+    { title: "B. Terse green popover", tag: "one line per area", note: "Verdict, freshness and coverage in three short lines; the footer link reaches the Health tab. Smallest panel.",
+      html: () => shell(greenChip(true), `<div class="panel"><div class="ph"><span class="badge b-ok">● OK</span>System health: all ${TOTAL} checks passing<span class="when">checked 12s ago</span></div>
+        <div class="terse">${GROUPS.map(([g, cs]) => `<b>${g}</b> ${cs.length}`).join(" · ")}<br>No check is warning or failing; none is not applicable.</div>${footer("")}</div>`) },
+    { title: "C. Green popover with every check named", tag: "recommended", rec: true, note: "Same header and footer as B, plus every check by name with an ok dot, grouped by area in up to four columns. It shows exactly what is covered; hovering a name could show its one-line summary (title attribute).",
+      html: () => shell(greenChip(true), `<div class="panel"><div class="ph"><span class="badge b-ok">● OK</span>System health: all ${TOTAL} checks passing<span class="when">checked 12s ago</span></div>${grid()}${footer("")}</div>`) },
+    { title: "D. Warn, with C applied", tag: "for comparison", note: "Today's warn popover (after #4259) plus two small additions that keep it consistent with C: the 'checked' time in the header and a collapsed 'N other checks passing' line that expands to the same grid.",
+      html: () => shell(`<span class="chip open"><span class="badge b-warn">▲ Warn</span>1 check needs attention</span>`, `<div class="panel"><div class="ph"><span class="badge b-warn">▲ Warn</span>System health: 1 check needs attention<span class="when">checked 12s ago</span></div>
+        <div class="check"><span class="badge b-warn" style="align-self:flex-start">▲ Warn</span><div class="body"><b>Worker image roll</b> <span class="desc">Worker roll held at ghcr.io/vtmocanu/uzi/agent-base:0.87.0-rc.9: participant roll health stuck. 1 of 16 hosted workers stuck: unknown reason (1).</span>
+          <div class="kv"><div class="wide"><b>Target image:</b> ghcr.io/vtmocanu/uzi/agent-base:0.87.0-rc.9</div><div><b>Blocking reason:</b> participant roll health stuck</div><div><b>Failure causes:</b> unknown reason (1)</div><div><b>Stuck workers:</b> 1 of 16</div><div><span class="docs">Docs: worker-upgrades</span></div></div></div><span class="for">for 1h</span></div>
+        <details class="others"><summary>${TOTAL - 1} other checks passing</summary>${grid("Worker image roll")}</details>${footer("")}</div>`) },
+  ];
+  const stage = document.getElementById("stage");
+  function build() {
+    stage.innerHTML = "";
+    for (const v of variants) {
+      const t = document.createElement("div"); t.className = "variant-title";
+      t.innerHTML = `${v.title}<span class="tag${v.rec ? " rec" : ""}">${v.tag}</span>`;
+      const n = document.createElement("p"); n.className = "variant-note"; n.textContent = v.note;
+      const w = document.createElement("div"); w.innerHTML = v.html();
+      stage.append(t, n, w);
+    }
+  }
+  const W = [1280, 1440, 1920];
+  const wbox = document.getElementById("widths");
+  function setW(w) { document.documentElement.style.setProperty("--vw", w + "px"); wbox.querySelectorAll("button").forEach((b) => b.classList.toggle("on", +b.dataset.w === w)); build(); }
+  for (const w of W) { const b = document.createElement("button"); b.className = "wbtn"; b.dataset.w = w; b.textContent = w + " px"; b.onclick = () => setW(w); wbox.appendChild(b); }
+  document.querySelectorAll("[data-theme]").forEach((b) => b.onclick = () => { stage.className = "stage " + b.dataset.theme; document.querySelectorAll("[data-theme]").forEach((x) => x.classList.toggle("on", x === b)); });
+  document.querySelector('[data-theme="ember"]').classList.add("on");
+  setW(1440);
+</script>
+</body>
+</html>
