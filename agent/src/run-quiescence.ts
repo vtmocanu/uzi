@@ -2736,10 +2736,12 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
         { ...reapOptions,
           ...(req.reportBudget ? { reportBudget: req.reportBudget,
             deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : {}),
-          // A new gateDeadline would change procfs EACCES handling on an ordinary scan, so
-          // shrink only the timeout mechanism this path already used on its first proof.
+          // The raw helper's gateDeadline caps TMPDIR setup, child and cleanup without
+          // changing the serialized scan. An in-process gateDeadline would change procfs
+          // EACCES handling, so that path shrinks only its existing reap deadline.
           ...(retryDeadlineAt === undefined ? {} : viaHelper
-            ? { helperTimeoutMs: Math.max(1, Math.floor(Math.min(reapOptions.helperTimeoutMs ?? Infinity,
+            ? { deadlineAt: retryDeadlineAt,
+              helperTimeoutMs: Math.max(1, Math.floor(Math.min(reapOptions.helperTimeoutMs ?? Infinity,
               retryDeadlineAt - Date.now()))) }
             : { deadlineMs: Math.max(1, Math.floor(Math.min(reapOptions.deadlineMs ?? Infinity,
               retryDeadlineAt - Date.now()))) }),
