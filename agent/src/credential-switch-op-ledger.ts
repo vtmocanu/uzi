@@ -270,6 +270,17 @@ export class CredentialSwitchOpLedger {
 export type LedgerApplyResult = CredentialSwitchApplyResult | { kind: "ledger_unavailable" };
 
 /**
+ * The `not_applied` reasons that prove the op can NEVER commit (api credential_switch_apply.go): answered after
+ * the server's replay check, for an op that can never become applicable again. `no_pending_switch`: the op is
+ * not the pending one, and every new stamp mints a fresh op id (migration 00427 trigger). `generation_mismatch`:
+ * permanent because the stamp generation is fixed per op (the only writer that sets the op id sets the stamp
+ * generation with it; the other stamp writer only keeps or nulls the stamp), and the step-0 fence plus the
+ * increment-only runs.claim_generation rule out a delayed send landing at another generation. Every other
+ * not_applied reason leaves the op pending.
+ */
+export const NOT_APPLIED_PROOF_REASONS: ReadonlySet<string> = new Set(["no_pending_switch", "generation_mismatch"]);
+
+/**
  * Write-ahead -> send -> record -> final classification. When the write-ahead fails NOTHING is sent,
  * and the result is:
  *  - `ledger_unavailable` ONLY when the ledger positively shows the op was never sent before (file
@@ -281,14 +292,6 @@ export type LedgerApplyResult = CredentialSwitchApplyResult | { kind: "ledger_un
  * `route_absent` that is not recorded as clean (a prior or concurrent ambiguous or settled state,
  * or a failed write) is reported `uncertain`.
  */
-/**
- * The `not_applied` reasons that prove the op can NEVER commit (api credential_switch_apply.go): answered after
- * the server's replay check, for an op that can never become applicable again. `no_pending_switch`: the op is
- * not the pending one, and every new stamp mints a fresh op id (migration 00427 trigger). `generation_mismatch`:
- * the only stamp writer sets the op id and the stamp generation together, so an op's generation is fixed when
- * it is minted. Every other not_applied reason leaves the op pending.
- */
-export const NOT_APPLIED_PROOF_REASONS: ReadonlySet<string> = new Set(["no_pending_switch", "generation_mismatch"]);
 
 export async function applyThroughLedger(
   client: { applyCredentialSwitch(runId: string, req: CredentialSwitchApplyRequest): Promise<CredentialSwitchApplyResult> },

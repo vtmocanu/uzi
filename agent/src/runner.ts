@@ -27188,7 +27188,10 @@ export class RunRunner {
         // Sticky for this op: once a send of it was ambiguous, only an answer the server gives AFTER its
         // replay check proves it did not commit: `superseded`, and `not_applied` with a reason in
         // NOT_APPLIED_PROOF_REASONS (no_pending_switch, generation_mismatch). The replay of a committed op would
-        // have answered applied or refused_committed, in the same transaction under the run lock. `fenced` is
+        // have answered applied or refused_committed, in the same transaction under the run lock.
+        // generation_mismatch is permanent: the stamp generation is fixed per op (the other stamp writer only
+        // keeps or nulls it), and the step-0 fence plus the increment-only runs.claim_generation rule out a
+        // delayed send at another generation. `fenced` is
         // not proof, because the fence runs before the replay (credential_switch_apply.go). Any other
         // not_applied reason (credential_busy, vault_locked, ...) leaves the op pending, so a delayed earlier
         // send could still commit and the flag stays set.

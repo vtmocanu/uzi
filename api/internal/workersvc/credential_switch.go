@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -439,7 +440,10 @@ var ErrCredentialSwitchUncertainParkPending = errors.New("a wall or reserve paus
 // ErrCredentialSwitchUncertainParkPending. An idempotent replay (paused, no hold reason, same
 // generation, worker and current incarnation, operation still pending or journaled) converges to
 // applied; anything else is applied=false (the handler's ordinary 409).
-func (s *Service) uncertainCredentialSwitch(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest) (store.Run, bool, error) {
+//
+// parentTx is the claim-locked transaction the hold runs in (nil when the service has no transactional
+// store). A fresh hold also inserts the `credential_switch_uncertain` feed message in it.
+func (s *Service) uncertainCredentialSwitch(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest, parentTx pgx.Tx) (store.Run, bool, error) {
 	if req.ClaimGeneration == nil {
 		return store.Run{}, false, fmt.Errorf("%w: %s requires claim_generation", ErrInvalidState, stateCredentialSwitchUncertain)
 	}
@@ -460,6 +464,13 @@ func (s *Service) uncertainCredentialSwitch(ctx context.Context, owned store.Run
 	})
 	if err != nil {
 		return store.Run{}, false, err
+	}
+	if rows > 0 && parentTx != nil {
+		// Only the FRESH hold posts the feed message, in the hold's own transaction, so a replayed
+		// report (rows == 0) never posts a second one. SetState broadcasts it after the commit.
+		if err := s.insertUncertainSwitchMessage(ctx, store.New(parentTx), owned, gen, op); err != nil {
+			return store.Run{}, false, err
+		}
 	}
 	cur, err := s.runOwnedByWorker(ctx, owned.ID, wkr)
 	if err != nil {
@@ -500,6 +511,46 @@ func (s *Service) uncertainCredentialSwitch(ctx context.Context, owned store.Run
 		return store.Run{}, false, err
 	}
 	return cur, child.ClaimGeneration == gen, nil
+}
+
+// credentialSwitchUncertainMessageKind is the run_messages.kind of the owner-pause feed message a
+// fresh credential_switch_uncertain hold posts. The CLI and web render fixed text for it.
+const credentialSwitchUncertainMessageKind = "credential_switch_uncertain" //nolint:gosec // G101: a run_messages.kind label, not a credential
+
+// credentialSwitchUncertainPayload is that message's body: the operation and generation only.
+type credentialSwitchUncertainPayload struct {
+	OpID       string `json:"op_id"`
+	Generation int64  `json:"generation"`
+}
+
+// insertUncertainSwitchMessage writes the uncertain feed message at the server-picked seq
+// max(run.LastSeq, MAX(seq)) + 1 and advances runs.last_seq, through the caller's transaction queries.
+// The broadcast is parked on s.uncertainMessage for SetState to publish after the commit.
+func (s *Service) insertUncertainSwitchMessage(ctx context.Context, qtx *store.Queries, run store.Run, gen int64, op uuid.UUID) error {
+	maxSeq, err := qtx.MaxRunMessageSeq(ctx, run.ID)
+	if err != nil {
+		return fmt.Errorf("credential switch uncertain: max seq: %w", err)
+	}
+	seq := max(run.LastSeq, maxSeq) + 1
+	payload, err := json.Marshal(credentialSwitchUncertainPayload{OpID: op.String(), Generation: gen})
+	if err != nil {
+		return fmt.Errorf("credential switch uncertain: marshal message: %w", err)
+	}
+	ins, err := qtx.InsertRunMessage(ctx, store.InsertRunMessageParams{
+		RunID: run.ID, Seq: seq, Kind: credentialSwitchUncertainMessageKind, Payload: payload,
+		ClaimGeneration: pgconv.Int8Ptr(&gen),
+	})
+	if err != nil {
+		return fmt.Errorf("credential switch uncertain: insert message: %w", err)
+	}
+	if !ins.Inserted {
+		return fmt.Errorf("credential switch uncertain: message seq %d already occupied", seq)
+	}
+	if _, err := qtx.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: run.ID, Seq: seq, ClaimGeneration: pgconv.Int8Ptr(&gen)}); err != nil {
+		return fmt.Errorf("credential switch uncertain: advance last_seq: %w", err)
+	}
+	s.uncertainMessage = &pendingSwitchBroadcast{seq: seq, payload: payload}
+	return nil
 }
 
 // settleCredentialSwitchHold applies the credential_switch_hold_settled acknowledgement (issue

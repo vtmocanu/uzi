@@ -106,7 +106,7 @@ describe("credential switch op ledger", () => {
   });
 
   for (const result of [{ kind: "superseded" }, { kind: "not_applied", reason: "no_pending_switch" }, { kind: "not_applied", reason: "generation_mismatch" }] as CredentialSwitchApplyResult[]) {
-    it(`uncertain then ${result.kind} settles: the server answers it only after its replay check (review NB1)`, async () => {
+    it(`uncertain then ${result.kind === "not_applied" ? `${result.kind}:${result.reason}` : result.kind} settles: the server answers it only after its replay check (review NB1)`, async () => {
       const dir = tmp();
       const ledger = new CredentialSwitchOpLedger(dir);
       await applyThroughLedger(fakeClient([], { kind: "uncertain", detail: "x" }), ledger, RUN, REQ);
