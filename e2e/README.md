@@ -176,14 +176,11 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
 
 The script has since grown past that one query: it sweeps **every `*LiveDB` test in
 the seven packages that carry one**, `store`, `handler`, `forgesvc`, `schedsvc`,
-`workersvc`, `recovery` and `poller`, serially (`-p 1`, one shared database). CI splits that one sweep across two jobs with
-`UZI_STORE_IT_GROUP`: `test-livedb-workersvc` (`workersvc`) and
-`test-codex-refresh-lostreply-e2e` (`rest`, every other package, then the combined
-proofs). `test-api-store-it` is a thin context that requires both to have succeeded.
-Unset, the script sweeps every package; any other value, empty included, refuses. A
-`*LiveDB` test in a package the script's list does not name runs nowhere and still
-prints `ok`, so a new live-DB test in an eighth package must add that package to
-`ALL_PKGS` in the script (it joins the `rest` group).
+`workersvc`, `recovery` and `poller`, serially (`-p 1`, one shared database). CI runs this script once, in
+`test-codex-refresh-lostreply-e2e`, and `test-api-store-it` is a thin context that
+requires that run to have succeeded. A `*LiveDB` test in a package the script's list
+does not name runs nowhere and still prints `ok`, so a new live-DB test in an eighth
+package must add that package to `PKGS` in the script.
 
 The script runs each package in a separate Go invocation against the same DSN,
 appending to one log for the aggregate and per-package guards. Each invocation has
