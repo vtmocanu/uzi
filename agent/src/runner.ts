@@ -6647,6 +6647,7 @@ export class RunRunner {
         }
         // Issue #4201 (R2): an apply-negotiated worker never releases or requeues here. The executor has
         // unwound, so the proof decides between option A (proven) and the hold fence (unproven).
+        await this.awaitPendingSwitchOpId(claim, flight);
         const escaped = this.inPlaceSwitchContext(claim, flight) ?? this.closedInPlaceSwitch(claim, flight);
         if (escaped) {
           try {
@@ -27033,6 +27034,7 @@ export class RunRunner {
   private async inPlaceCredentialSwitch(
     claim: ClaimResponse, flight: RunFlight, runLog: Logger, site: InPlaceSwitchSite, laneSettled: boolean,
   ): Promise<InPlaceSwitchOutcome> {
+    await this.awaitPendingSwitchOpId(claim, flight);
     const fixed = this.inPlaceSwitchContext(claim, flight);
     if (!fixed) {
       // A negotiated worker whose route is closed for this flight (a restore predecessor, a completed
@@ -27461,6 +27463,28 @@ export class RunRunner {
   private inPlaceReportRetryable(error: unknown): boolean {
     if (error instanceof ReportPreconditionError) return false;
     return isTransient(error);
+  }
+
+  /**
+   * Issue #4201 (ADR Residual 9): when steering learned of the switch only through a refused APPLIED (a 409
+   * switch_pending carries no op id), the pending switch is op-less until the next inputs GET names it. Wait (bounded
+   * by switchSupersedeWaitMs) for that op id before choosing the in-place or escaped path, which both need one. Only
+   * for a non-Codex flight on a worker that negotiated in-place apply; every other case returns at once. If no op id
+   * arrives the caller proceeds exactly as before.
+   */
+  private async awaitPendingSwitchOpId(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+    const opless = (): boolean => {
+      const pending = flight.steering.pendingCredentialSwitchOp();
+      return pending !== undefined && pending.opId === undefined && pending.generation === flight.claimGeneration;
+    };
+    if (this.isCodexCapture(claim, flight) || !this.client.supportsInPlaceCredentialSwitch() || !opless()) return;
+    const signal = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+    const deadline = Date.now() + this.switchSupersedeWaitMs;
+    while (opless()) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || signal.aborted) return;
+      await sleep(Math.min(10, remaining), signal);
+    }
   }
 
   /** Wait (bounded) for steering to name a switch op other than `current`. `undefined` means none came:

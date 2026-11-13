@@ -2320,9 +2320,10 @@ export class FakeApi {
     }
     if (body.plan_agent_source !== undefined && this.planAgentSourceAckHold) await this.planAgentSourceAckHold;
     if (this.checkedTransport && body.status === "awaiting_approval") this.checkedFencedRuns.add(runId);
-    // Issue #4201: the api requires the registration nonce on an op-carrying credential_switch_failed report.
+    // Issue #4201: an op-carrying credential_switch_failed report without the registration nonce changes nothing and gets
+    // the ordinary not-applied 409.
     if (body.status === "credential_switch_failed" && (body as { op_id?: unknown }).op_id !== undefined && !(body as { register_nonce?: unknown }).register_nonce)
-      return send(res, 400, { error: "register_nonce is required" });
+      return send(res, 409, { applied: false, run: { id: runId, status: "running", hold_reason: null } });
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);
     this.lastRecordedStatus.set(runId, body.status);

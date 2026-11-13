@@ -132,6 +132,8 @@ interface Setup {
   quiesceGate?: Promise<void>;
   /** ask_user site: the test, not the fixture, answers the re-asked question. */
   noAutoAnswer?: boolean;
+  /** ask_user and implement_turn sites: the first park (turn) hands the test the request-the-switch function instead of requesting it. */
+  manualSwitch?: (request: () => void) => void;
   /** implement_turn site: the result frame that ends the plan turn, before the switch (default: no usage). */
   planResult?: SDKMessage;
 }
@@ -187,7 +189,8 @@ async function scenario(setup: Setup) {
       api.onState(runId, (b) => { if (b.status === "awaiting_approval") send(runId, row("approve_plan")); });
       break;
     case "implement_turn":
-      turnScripts = [planTurn(undefined, setup.planResult), hangTurn(requestSwitch), last];
+      turnScripts = [planTurn(undefined, setup.planResult),
+        hangTurn(setup.manualSwitch ? () => setup.manualSwitch!(requestSwitch) : requestSwitch), last];
       api.onState(runId, (b) => { if (b.status === "awaiting_approval") send(runId, row("approve_plan")); });
       break;
     case "plan_gate":
@@ -221,7 +224,7 @@ async function scenario(setup: Setup) {
       api.onState(runId, (b) => {
         if (b.status === "awaiting_approval") send(runId, row("approve_plan"));
         else if (b.status === "awaiting_input") {
-          if (++asks === 1) requestSwitch();
+          if (++asks === 1) { if (setup.manualSwitch) setup.manualSwitch(requestSwitch); else requestSwitch(); }
           else if (!setup.noAutoAnswer) send(runId, row("answer", JSON.stringify({ question_id: b.open_question_id, answers: ["postgres"] })));
         }
       });
@@ -520,6 +523,40 @@ describe("issue #4201 m5 (AC7): owner inputs sent while a switch is pending and 
     assert.ok(statusesOf(r).includes("completed"), `no retained stop: ${statusesOf(r).join(",")}`);
     assert.ok(r.turns.length >= 1 && r.turns.every((t) => t.token === OLD_TOKEN), `every turn ran on the old token: ${JSON.stringify(r.turns.map((t) => t.token))}`);
     assert.ok(r.turns.some((t) => t.prompt.includes("postgres-ANSWER")), "the answer reached the model");
+  });
+
+  it("Residual 9: the stamp lands between an input's ACK and its APPLIED, so only the refused APPLIED reveals the switch (no op id yet): the flight waits for the op id and still applies in place", TIMEOUT, async () => {
+    let request: (() => void) | undefined;
+    let runId = "";
+    const finished = scenario({
+      site: "implement_turn", apply: [{ outcome: "applied", token: NEW_TOKEN }],
+      before: (rid) => { runId = rid; api.inPlaceInputDrain = true; },
+      manualSwitch: (fn) => { request = fn; }, extra: { switchSupersedeWaitMs: 60_000 },
+    });
+    assert.ok(await until(() => request !== undefined, 30_000), "the first implement turn is running with no switch pending");
+    const releaseApplied = api.holdNextInputReceipt("applied");
+    const [input] = send(runId, row("follow_up", "STEER-ME-NOW"));
+    assert.ok(await until(() => api.isAcked(runId, input!.id), 10_000), "the steering message was ACKed");
+    // The stamp lands after the ACK and before the APPLIED is evaluated, so the refused APPLIED is the only thing that
+    // reveals it. The next GET, which carries the op id, is held, so the flight is at its switch site holding an op-less
+    // pending switch and must wait for the op id instead of releasing the claim (the v1 path).
+    const getHeld = api.holdNextInputGet(runId);
+    request!();
+    releaseApplied();
+    await getHeld.entered;
+    assert.equal(await until(() => api.states.some((s) => s.runId === runId && s.body.status === "credential_switch"), 8_000), false,
+      "no release was reported while the op id was missing");
+    assert.equal(applied().length, 0, "nothing was applied yet");
+    getHeld.release();
+    const r = await finished;
+    assert.deepEqual(applied().map((b) => b.op_id), ["op-1"], "one in-place apply, for the op id the delayed GET carried");
+    const s = statusesOf(r);
+    for (const status of ["credential_switch", "credential_switch_held", "credential_switch_failed", "credential_switch_uncertain", "failed"])
+      assert.ok(!s.includes(status), `no ${status} report: ${s.join(",")}`);
+    assert.ok(s.includes("completed"), s.join(","));
+    assert.ok(r.turns.some((t) => t.token === NEW_TOKEN), `a later turn ran on the new token: ${JSON.stringify(r.turns.map((t) => t.token))}`);
+    assert.ok(r.turns.filter((t) => t.token === NEW_TOKEN).every((t) => t.resume === SESSION), "the same session continued");
+    assert.ok(await until(() => api.isApplied(runId, input!.id), 10_000), "the refused APPLIED was retried after the settle, not dropped");
   });
 
   it("an owner pause is fetched and ACKed during the hold and APPLIED only after the apply, and is honoured: the executor acknowledges it and enters the pause park", TIMEOUT, async () => {

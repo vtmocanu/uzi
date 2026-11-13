@@ -1040,14 +1040,22 @@ func TestCredentialSwitchOpReportsNonceFenceLiveDB(t *testing.T) {
 			}
 		})
 	}
-	t.Run("an op-carrying failed report without a nonce is a 400", func(t *testing.T) {
-		run, op := f.run(t, "running")
-		f.noWrite(t, run, func() {
-			if _, applied, err := f.report(t, w, run, "credential_switch_failed", f.gen, "", &op); applied || !errors.Is(err, ErrInvalidState) {
-				t.Fatalf("applied=%v err=%v, want ErrInvalidState", applied, err)
-			}
-		})
-	})
+	for _, state := range []string{"credential_switch_failed", "credential_switch_uncertain"} {
+		for name, nonce := range map[string]string{"without a nonce": "", "with an overlong nonce": strings.Repeat("n", 129)} {
+			t.Run("an op-carrying "+state+" report "+name+" changes nothing and is not applied", func(t *testing.T) {
+				run, op := f.run(t, "running")
+				f.noWrite(t, run, func() {
+					if _, applied, err := f.report(t, w, run, state, f.gen, nonce, &op); applied || err != nil {
+						t.Fatalf("applied=%v err=%v, want applied=false and no error (the ordinary 409)", applied, err)
+					}
+				})
+				got := mustRun(t, f.env, run)
+				if got.Status != "running" || !got.CredentialSwitchRequestedAt.Valid {
+					t.Fatalf("status=%s stamp=%v, want the run untouched", got.Status, got.CredentialSwitchRequestedAt)
+				}
+			})
+		}
+	}
 	t.Run("the v1 op-less failed report needs no nonce", func(t *testing.T) {
 		run, _ := f.run(t, "running")
 		got, applied, err := f.report(t, w, run, "credential_switch_failed", f.gen, "", nil)

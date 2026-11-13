@@ -267,6 +267,36 @@ func TestCredentialSwitchCrashRecoveryLiveDB(t *testing.T) {
 			t.Fatal("the claim left the stamp pending")
 		}
 	})
+	t.Run("A-auto: an auto-bound worker and no run override, the next claim spends what claimSecretID chooses from the pool", func(t *testing.T) {
+		f := newApplyFx(t)
+		run, op := f.run(t, "running")
+		// The fixture's worker is auto-bound (BindModeAuto) with two pooled Anthropic tokens; drop the run's pinned override so the
+		// auto ranker, not the override, decides the next claim's credential.
+		f.env.exec(`UPDATE runs SET credential_override_mode = NULL, credential_override_secret_id = NULL WHERE id = $1`, run)
+		if w := f.worker(t); w.AnthropicBindMode != BindModeAuto {
+			t.Fatalf("worker bind mode = %q, want auto", w.AnthropicBindMode)
+		}
+		old, _ := f.reRegister(t, run)
+		f.delayedReports(t, run, op, old)
+		if !mustRun(t, f.env, run).CredentialSwitchRequestedAt.Valid {
+			t.Fatal("a superseded failed report cleared the stamp")
+		}
+		f.requeueViaRegister(t, run)
+		want, err := f.svc.claimSecretID(f.env.ctx, f.worker(t), mustRun(t, f.env, run))
+		if err != nil || want.secretID == nil {
+			t.Fatalf("claimSecretID = %+v err=%v, want a pooled token", want, err)
+		}
+		if *want.secretID != f.o.deadTok && *want.secretID != f.o.altTok {
+			t.Fatalf("claimSecretID chose %s, want one of the owner's pooled tokens", *want.secretID)
+		}
+		got := f.claimFor(t, run)
+		if !got.AnthropicSecretID.Valid || uuid.UUID(got.AnthropicSecretID.Bytes) != *want.secretID {
+			t.Fatalf("claim recorded secret %v, want the one claimSecretID chose (%s)", got.AnthropicSecretID, *want.secretID)
+		}
+		if got.CredentialSwitchRequestedAt.Valid || got.CredentialSwitchOpID.Valid {
+			t.Fatal("the claim left a pending switch stamp")
+		}
+	})
 	t.Run("B: a committed uncertain pause survives re-registration and only the owner's Resume requeues it", func(t *testing.T) {
 		f := newApplyFx(t)
 		run, op := f.run(t, "running")

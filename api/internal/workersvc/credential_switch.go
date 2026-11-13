@@ -211,13 +211,11 @@ func (s *Service) failCredentialSwitch(ctx context.Context, owned store.Run, wkr
 		return store.Run{}, false, err
 	}
 	// The op-carrying form is fenced to the current registration incarnation (issue #4201), like
-	// credential_switch_uncertain: a missing or malformed nonce is an invalid report (400), a
-	// superseded one matches 0 rows below (the ordinary 409). The op-less v1 form carries none.
+	// credential_switch_uncertain: a superseded, missing or malformed nonce matches 0 rows below (the
+	// ordinary not-applied 409 that writes nothing; a NULL nonce never equals the stored one). The op-less
+	// v1 form carries none.
 	var registerNonce pgtype.Text
-	if opID.Valid {
-		if !validHoldRegisterNonce(req.RegisterNonce) {
-			return store.Run{}, false, fmt.Errorf("%w: %s with op_id requires register_nonce", ErrInvalidState, stateCredentialSwitchFailed)
-		}
+	if opID.Valid && validHoldRegisterNonce(req.RegisterNonce) {
 		registerNonce = pgtype.Text{String: req.RegisterNonce, Valid: true}
 	}
 	rows, err := s.q.ClearCredentialSwitchByWorker(ctx, store.ClearCredentialSwitchByWorkerParams{
@@ -460,15 +458,18 @@ func (s *Service) uncertainCredentialSwitch(ctx context.Context, owned store.Run
 	if req.ClaimGeneration == nil {
 		return store.Run{}, false, fmt.Errorf("%w: %s requires claim_generation", ErrInvalidState, stateCredentialSwitchUncertain)
 	}
-	if !validHoldRegisterNonce(req.RegisterNonce) {
-		return store.Run{}, false, fmt.Errorf("%w: %s requires register_nonce", ErrInvalidState, stateCredentialSwitchUncertain)
-	}
 	opID, err := optionalSwitchOpID(req.OpID, stateCredentialSwitchUncertain)
 	if err != nil {
 		return store.Run{}, false, err
 	}
 	if !opID.Valid {
 		return store.Run{}, false, fmt.Errorf("%w: %s requires op_id", ErrInvalidState, stateCredentialSwitchUncertain)
+	}
+	if !validHoldRegisterNonce(req.RegisterNonce) {
+		// A missing or malformed nonce matches no registration: nothing is written and the worker gets the
+		// ordinary not-applied 409 (re-read worker-scoped so it learns the run's real state).
+		cur, rerr := s.runOwnedByWorker(ctx, owned.ID, wkr)
+		return cur, false, rerr
 	}
 	gen := *req.ClaimGeneration
 	op := uuid.UUID(opID.Bytes)

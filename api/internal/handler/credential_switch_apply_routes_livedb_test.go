@@ -228,6 +228,11 @@ func manyEntries(n int) string {
 func TestWorkerCredentialSwitchStateUncertainRouteLiveDB(t *testing.T) {
 	e := setupApplyRouteLiveDB(t)
 	path := "/api/worker/runs/" + e.run.String() + "/state"
+	// An op-carrying uncertain report with no nonce changes nothing and gets the ordinary not-applied 409.
+	noNonce := fmt.Sprintf(`{"status":"credential_switch_uncertain","claim_generation":%d,"op_id":%q}`, e.gen, e.op)
+	if rec := e.do(e.worker, "POST", path, noNonce); rec.Code != http.StatusConflict {
+		t.Fatalf("uncertain without a nonce: status %d body %s, want 409", rec.Code, rec.Body)
+	}
 	body := fmt.Sprintf(`{"status":"credential_switch_uncertain","claim_generation":%d,"register_nonce":%q,"op_id":%q}`, e.gen, applyRouteNonce, e.op)
 	rec := e.do(e.worker, "POST", path, body)
 	var ack map[string]any
@@ -268,8 +273,8 @@ func TestWorkerCredentialSwitchStateFailedRouteLiveDB(t *testing.T) {
 	if rec := failed("nonce-superseded"); rec.Code != http.StatusConflict || !stamped() {
 		t.Fatalf("superseded nonce: status %d body %s stamped=%v, want 409 and the stamp kept", rec.Code, rec.Body, stamped())
 	}
-	if rec := failed(""); rec.Code != http.StatusBadRequest || !stamped() {
-		t.Fatalf("op without a nonce: status %d body %s stamped=%v, want 400 and the stamp kept", rec.Code, rec.Body, stamped())
+	if rec := failed(""); rec.Code != http.StatusConflict || !stamped() {
+		t.Fatalf("op without a nonce: status %d body %s stamped=%v, want the ordinary not-applied 409 and the stamp kept", rec.Code, rec.Body, stamped())
 	}
 	if rec := failed(applyRouteNonce); rec.Code != http.StatusOK || stamped() {
 		t.Fatalf("current nonce: status %d body %s stamped=%v, want 200 and the stamp cleared", rec.Code, rec.Body, stamped())
