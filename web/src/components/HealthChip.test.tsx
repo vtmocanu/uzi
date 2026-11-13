@@ -171,6 +171,9 @@ describe("HealthChip popover", () => {
     refresh(view, healthySilentDoc());
     expect(document.activeElement).toBe(dialog());
     const check = dialog().querySelector<HTMLElement>("[data-passing-check]")!;
+    // The names are deliberately outside the tab order. Simulate a programmatic focus on a
+    // soon-to-be-removed item to keep the defensive live-transition focus path covered.
+    check.tabIndex = -1;
     check.focus();
     refresh(view, overviewNextDoc());
     expect(document.activeElement).toBe(dialog());
@@ -305,6 +308,9 @@ describe("HealthChip when nothing needs attention", () => {
     fireEvent.click(chip());
     const item = within(dialog()).getByText(doc.checks[0].title);
     expect(item.getAttribute("title")).toBe("safe summary");
+    expect(item.hasAttribute("tabindex")).toBe(false);
+    const srSummary = item.closest("li")!.querySelector(".sr-only")!;
+    expect(srSummary.textContent).toBe(": safe summary");
     expect(item.getAttribute("title")).not.toContain("\u202E");
     expect(item.getAttribute("title")).not.toContain("\u0001");
   });

@@ -52,14 +52,13 @@ export function HealthPassingChecks({ checks }: { checks: HealthCheck[] }) {
                     <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok" />
                     <span
                       data-passing-check
-                      tabIndex={0}
                       title={summary}
-                      aria-label={summary ? `${title}: ${summary}` : title}
-                      className="min-w-0 rounded-sm text-xs leading-relaxed text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand"
+                      className="min-w-0 text-xs leading-relaxed text-fg"
                       style={{ overflowWrap: "anywhere" }}
                     >
                       {title}
                     </span>
+                    {summary && <span className="sr-only">: {summary}</span>}
                   </li>
                 );
               })}
