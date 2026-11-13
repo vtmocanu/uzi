@@ -1969,8 +1969,10 @@ When the first process proof is non-quiescent solely for
 `unreadable_unattributed` entries, had no authority to kill unattributed
 processes and killed nothing, the worker may take one
 fresh root snapshot. It starts one new, complete process proof only if a newly
-recorded exact root has a PID among an unattributed entry's candidate PIDs and
-the applicable deadline still has time. The second proof supplies the verdict;
+recorded root matches both PID and start tick of an unattributed process or
+observed ancestor in the first scan's trace, and the applicable deadline still
+has time. Group/session candidates without a captured start tick cannot trigger
+the retry. The second proof supplies the verdict;
 the first proof's diagnostic trace never grants quiescence. A mixed blocker,
 absent root, reused PID with another start time, or expired budget remains
 unverified. This adds no kill authority and does not relax the #1854 rule.

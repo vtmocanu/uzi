@@ -2746,11 +2746,28 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       const freshOthers = req.registry.others(req.attempt?.marker);
       const fresh = collectLiveRoots(freshOthers, workerRunnerRootPids());
       const before = new Set(scan.liveRoots.map(root => `${root.pid}:${root.startTime}`));
-      const candidates = new Set(processResult.processes.flatMap(p =>
-        [p.pid, ...(p.attribution?.candidates.map(c => c.pid) ?? [])]));
-      if (fresh.roots.some(root => !before.has(`${root.pid}:${root.startTime}`) && candidates.has(root.pid))) {
+      // The trace only gates a NEW full proof; it never changes the old verdict. It carries a
+      // start tick for self and observed ancestors, but not for a group/session candidate that
+      // is not also an ancestor. Those PID-only candidates cannot authorize even a retry.
+      const exactCandidates = new Set(processResult.processes.flatMap(p => {
+        const trace = p.attribution;
+        if (!trace) return [];
+        const identities: string[] = [];
+        if (trace.startTime !== undefined && trace.candidates.some(c => c.role === "self" && c.pid === p.pid))
+          identities.push(`${p.pid}:${trace.startTime}`);
+        for (const ancestor of trace.ancestors) {
+          if (ancestor.startTime !== undefined && trace.candidates.some(c => c.role === "ancestor" && c.pid === ancestor.pid))
+            identities.push(`${ancestor.pid}:${ancestor.startTime}`);
+        }
+        return identities;
+      }));
+      if (fresh.roots.some(root => {
+        const identity = `${root.pid}:${root.startTime}`;
+        return !before.has(identity) && exactCandidates.has(identity);
+      })) {
         rootContext = fresh.context;
-        processResult = await prove({ ...scan, liveRoots: fresh.roots, liveMarkers: freshOthers.map(a => a.marker) });
+        processResult = await prove({ ...scan, liveRoots: fresh.roots, liveMarkers: freshOthers.map(a => a.marker),
+          mayKillUnreadableUnattributed: false });
         rootReproof = processResult.state === "quiescent" ? "quiescent" : "unverified";
       }
     }

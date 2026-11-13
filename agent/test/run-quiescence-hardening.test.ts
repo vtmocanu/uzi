@@ -212,7 +212,49 @@ describe("A-codex-sibling: a concurrent Codex attempt's non-dumpable supervisor"
       { targetUid: RUNNER, reap: deps },
     );
     assert.equal(out.process?.state, "unverified", "pid alone must not attribute the process");
-    assert.equal(out.process?.rootReproof, "unverified", "the second full proof still refused");
+    assert.equal(out.process?.rootReproof, "none", "a mismatched start tick cannot trigger the reproof");
+  });
+
+  it("#3915 an error reading a peer's fresh roots leaves the refusal unverified", async () => {
+    const registry = new LiveAttemptRegistry();
+    let afterSnapshot = false;
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => {
+      if (afterSnapshot) throw new Error("peer root read failed");
+      return [];
+    }));
+    const procs = codexProcs();
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => { afterSnapshot = true; return list(); };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "unverified");
+    assert.equal(out.process?.rootReproof, "none", "an unreadable peer root never authorizes a reproof");
+  });
+
+  it("#3915 a group-only candidate without a captured start tick cannot trigger reproof", async () => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs(); // supervisor pgid/sid is 5; pid 5 is not an observed ancestor
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: 5, startTime: DEFAULT_START });
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "unverified");
+    assert.equal(out.process?.rootReproof, "none", "a group PID alone carries no exact identity");
   });
 
   it("#3915 an expired deadline prevents the fresh-root reproof", async () => {
