@@ -422,6 +422,9 @@ export class NowSummaryController {
     const milestoneId = this.activeId as string;
     const title = this.frozen.find((m) => m.id === milestoneId)?.title ?? "";
     const frames = this.frames.slice();
+    // Issue #4201: one snapshot of the credential per call, at the call's start. Read BEFORE the
+    // lifecycle listener is registered: a dep that throws must not leak the listener.
+    const cred = this.deps.credential?.();
     const ctrl = new AbortController();
     const lifecycle = this.deps.steering.lifecycleSignal();
     const onLifecycle = (): void => ctrl.abort();
@@ -430,8 +433,6 @@ export class NowSummaryController {
 
     let usage: AdviceUsageSnapshot | undefined;
     let text = "";
-    // Issue #4201: one snapshot of the credential per call, at the call's start.
-    const cred = this.deps.credential?.();
     const call: InFlight = { ctrl, abandoned: false, done: Promise.resolve(), milestoneId, usage: undefined, epoch: cred?.ordinal ?? 0 };
     // Registered BEFORE the async body runs: a pass that throws synchronously settles inside the
     // first synchronous stretch of the body, and settle() must find the registration to clear.

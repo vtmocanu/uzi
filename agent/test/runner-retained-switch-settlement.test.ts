@@ -150,6 +150,8 @@ interface Options {
   /** Issue #4201 R1: negotiate the in-place apply and let gen 2's executor ask for the switch through
    *  ctx.attemptCredentialSwitch with a pending op; the api answers `applied`. */
   inPlaceApply?: boolean;
+  /** With inPlaceApply: the api's answer (default applied). `superseded` with no newer op is a give-up (the switch settles as cleared). */
+  applyOutcome?: "applied" | "superseded";
 }
 
 async function scenario(o: Options) {
@@ -159,7 +161,8 @@ async function scenario(o: Options) {
   (client as any).registerNonce = NONCE;
   if (o.inPlaceApply) {
     (client as any).hasInPlaceCredentialSwitchCapability = true;
-    api.scriptApply(claim.run_id, { outcome: "applied", token: ["sk-ant-oat01-", "RETAINED-NEWTOKEN-0123456789"].join("") });
+    api.scriptApply(claim.run_id, o.applyOutcome === "superseded" ? { outcome: "superseded" }
+      : { outcome: "applied", token: ["sk-ant-oat01-", "RETAINED-NEWTOKEN-0123456789"].join("") });
   }
   client.publishCheckpoint = async () => { throw new Error("publication unknown"); };
   const events: string[] = [];
@@ -230,6 +233,9 @@ async function scenario(o: Options) {
             flight.steering.tripCredentialSwitch(2, "op-retained");
             events.push(`hook:${await ctx.attemptCredentialSwitch!({ site: "implement_turn", laneSettled: true })}`);
             events.push(`custody:${flight.retainedLocalCustody === true}`);
+            // A later retained guard on the same flight must not rethrow the settled switch's old signal.
+            try { (r as any).retainedLifecycleGuard(flight); events.push("guard:ok"); }
+            catch (error) { events.push(`guard:threw:${(error as Error).constructor.name}`); }
             throw new Error("fixture ends after the in-place apply");
           }
           flight.steering.tripCredentialSwitch(2);
@@ -258,7 +264,7 @@ async function scenario(o: Options) {
   const r = runnerWith(factory, gitlab, undefined, log.logger, {
     recoveryRetryMs: 1, quiesceRun, dockerHost: "unix:///nonexistent-docker.sock", liveAttempts: new LiveAttemptRegistry(),
     activeRuns: registry,
-    ...(o.inPlaceApply ? { credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir) } : {}),
+    ...(o.inPlaceApply ? { credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir), switchSupersedeWaitMs: 50 } : {}),
     ...(o.settlementMs ? { retainedSwitchSettlementMs: o.settlementMs } : {}),
     ...(o.codexBoundaryDeadlineMs ? { codexBoundaryDeadlineMs: o.codexBoundaryDeadlineMs } : {}),
     ...(o.verificationMs ? { retainedSwitchVerificationMs: o.verificationMs } : {}),
@@ -381,6 +387,15 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     assert.ok(env.events.includes("custody:true"), "the flight kept its retained custody");
     assertCustodyKept(env, false);
   });
+
+  for (const applyOutcome of ["applied", "superseded"] as const) {
+    it(`4a. a retained flight whose in-place switch ${applyOutcome === "applied" ? "applied" : "settled as a give-up"} passes a later retained guard without rethrowing the old switch signal`, TIMEOUT, async () => {
+      const env = await scenario({ iid: applyOutcome === "applied" ? 31832 : 31833, survivor: "none", inPlaceApply: true, applyOutcome });
+      await env.run;
+      assert.ok(env.events.includes(applyOutcome === "applied" ? "hook:applied" : "hook:gave_up"), env.events.join(","));
+      assert.ok(env.events.includes("guard:ok"), `the later guard did not rethrow the spent switch: ${env.events.join(",")}`);
+    });
+  }
 
   it("R1. a retained flight whose quiescence is not proven holds with the op id and applies nothing", TIMEOUT, async () => {
     const env = await scenario({ iid: 31831, survivor: "permanent", inPlaceApply: true });

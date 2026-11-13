@@ -9,6 +9,7 @@ import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
+import { m3Calls } from "./m3-recovery-fixture.js";
 
 // PRD #1247 M5b — the SdkExecutor half of a held-state credential switch, driven directly (the
 // pause-honor.test.ts harness shape): a switch that lands MID-TURN must abort the in-flight SDK
@@ -905,6 +906,93 @@ describe("SdkExecutor — an applied in-place credential switch (issue #4201)", 
       assert.strictEqual(new Set(r.turns.map((t) => t.cwd)).size, 1, "same cwd");
       assert.strictEqual(refusal(r.emits).length, 1);
       assert.strictEqual((refusal(r.emits)[0]!.payload as { reason?: string }).reason, "credential_switch_resume_refused");
+    });
+
+    /** A turn script that records the prompt text its attempt was dispatched with. */
+    function withPrompts(scripts: Script[], prompts: string[]): SdkQueryFn {
+      let i = 0;
+      return (params) => {
+        const script = scripts[Math.min(i, scripts.length - 1)]!;
+        i++;
+        return (async function* () {
+          let text = "";
+          for await (const m of params.prompt) text += JSON.stringify(m);
+          prompts.push(text);
+          const out = typeof script === "function" ? script(params.options.abortController!.signal) : script;
+          if (Array.isArray(out)) for (const m of out) yield m;
+          else yield* out as AsyncIterable<SDKMessage>;
+        })();
+      };
+    }
+
+    /** A seeded resume parked at the plan gate whose first implement dispatch carries the interrupted-calls note.
+     *  The switch trips at the resumed gate and the hook applies, so the implement turn that follows is a new
+     *  ordinary turn (not an in-place restart) that resumes the session on the new credential. */
+    function seededCtx(extra: Partial<RunContext> = {}) {
+      const hook = applying();
+      let n = 0;
+      return makeCtx({
+        ...hook.overrides,
+        seeded: true, planApproved: false, resumePhase: "awaiting_approval", approvedPlan: "# Submitted plan", sessionId: "sess-1",
+        takeResumedGateEvent: async () => { if (++n === 1) throw new CredentialSwitchSignal(); return undefined; },
+        interruptedSnapshot: { base: "interrupted", interruptedEdits: false, commits: 0 },
+        config: { max_iterations: 5 },
+        getInterruptedCalls: () => m3Calls(),
+        ...extra,
+      } as Partial<RunContext>);
+    }
+
+    it("N3: the fresh-session restart re-sends the interrupted-calls note the refused attempt appended", async () => {
+      const prompts: string[] = [];
+      let calls = 0;
+      const refusedThenDone: Script = () => {
+        calls++;
+        if (calls === 1) return failingStream("No conversation found with session ID: sess-1");
+        return (async function* () { for (const m of doneTurn("fresh-2")) yield m; })();
+      };
+      const { ctx, emits } = seededCtx();
+      const outcome = await new SdkExecutor(nullLogger(), homeDir, { queryFn: withPrompts([refusedThenDone], prompts) }).run(ctx).then(() => undefined, (e: unknown) => e);
+      assert.strictEqual(outcome, undefined, String(outcome));
+      assert.strictEqual(prompts.length, 2, "the refused attempt and its one restart");
+      assert.match(prompts[0]!, /interrupted_calls_/, "the refused attempt carried the note");
+      assert.match(prompts[1]!, /could not be resumed after a credential switch/, "the restart is the fresh-session restart");
+      assert.match(prompts[1]!, /interrupted_calls_/, "the restart carries the note again");
+      assert.strictEqual(refusal(emits).length, 1);
+    });
+
+    it("N4: a first post-switch turn with no resume spends the flag; a later fresh init is not labelled a refusal", async () => {
+      const turn = (session: string, done: boolean): Script => [
+        initFrame(session),
+        ...(done ? doneTurn(session) : [
+          { type: "assistant", session_id: session, message: { content: [{ type: "text", text: "still working" }] } } as unknown as SDKMessage,
+          resultSuccess(session),
+        ]),
+      ];
+      const { queryFn, turns } = recordingTurns([turn("sess-a", false), turn("sess-b-fresh", true)]);
+      const { ctx, emits } = seededCtx({ sessionId: null });
+      const outcome = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx).then(() => undefined, (e: unknown) => e);
+      assert.strictEqual(outcome, undefined, String(outcome));
+      assert.strictEqual(turns[0]!.resume, undefined, "the first post-switch turn had nothing to resume");
+      assert.strictEqual(turns[1]!.resume, "sess-a", "a later turn resumes, and its fresh init is unrelated to the switch");
+      assert.strictEqual(refusal(emits).length, 0, "no credential_switch_resume_refused label on an unrelated fresh init");
+    });
+
+    it("N4: two fresh init frames in the one post-switch turn emit one lineage break, and a following refused resume adds none", async () => {
+      const calls: Script = () => (async function* () {
+        yield initFrame("fresh-1");
+        yield initFrame("fresh-2");
+        throw new Error("No conversation found with session ID: sess-1");
+      })();
+      const { queryFn } = recordingTurns([[initFrame("sess-1"), submitPlan("# Plan"), resultSuccess()], calls, doneTurn("fresh-3")]);
+      const cancel = new AbortController();
+      const hook = applying();
+      const { ctx, emits } = makeCtx({
+        ...hook.overrides, signal: cancel.signal,
+        reportIteration: async (n) => { if (n === 1) cancel.abort(new CredentialSwitchSignal()); return undefined; },
+      });
+      const outcome = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx).then(() => undefined, (e: unknown) => e);
+      assert.strictEqual(outcome, undefined, String(outcome));
+      assert.strictEqual(refusal(emits).length, 1, "at most one lineage break per applied switch");
     });
 
     it("the same error after model evidence takes the ordinary path (the run fails, no restart)", async () => {

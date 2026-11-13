@@ -6645,7 +6645,29 @@ export class RunRunner {
         // unwound, so the proof decides between option A (proven) and the hold fence (unproven).
         const escaped = this.inPlaceSwitchContext(claim, flight);
         if (escaped) {
-          await this.escapedInPlaceSwitch(flight, runLog, escaped);
+          try {
+            await this.escapedInPlaceSwitch(flight, runLog, escaped);
+          } catch (stop) {
+            // A cancel, fence, shutdown or lost ownership during the escaped proof or its reports.
+            await dispatchFailure(stop);
+            return;
+          }
+          await batcher.close().catch(() => undefined);
+          return;
+        }
+        if (flight.steering.isSettledSwitchSignal(err)) {
+          // Issue #4201 (N2): the spent signal of a switch that already APPLIED in place surfaced after the
+          // apply, with no newer op pending. The credential has moved server-side, so this is not a switch to
+          // release (a v1 release here would requeue an apply-negotiated worker's run after its apply) and it
+          // wraps no other error. Conservative: end the flight with the work and custody kept and no terminal
+          // report, leaving the run non-terminal for a reclaim (which runs on the applied token).
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.keepGuardedInventoryOpen = true;
+          flight.retainedLocalCustody = true;
+          runLog.warn("a settled credential switch signal surfaced after its apply; ending the flight with work and custody kept, no release", {
+            run_id: flight.runId,
+          });
           await batcher.close().catch(() => undefined);
           return;
         }
@@ -14477,11 +14499,12 @@ export class RunRunner {
         // Discovery can stop before a source identity reaches the flight. Keep unknown
         // custody and preserve either typed abort reason after terminal precedence.
         this.retainedTerminalGuard(flight);
-        const unspentSwitch = (reason: unknown): boolean =>
-          reason instanceof CredentialSwitchSignal && !flight.steering.isSettledSwitchSignal(reason);
+        // Discovery runs only inside phaseClone, before executor.run, and an in-place switch settles only
+        // from the executor's hook (or the escaped arm), so no switch signal can be settled yet here: no
+        // spent-signal exemption is needed, unlike retainedLifecycleSignals.
         if (error instanceof CredentialSwitchSignal ||
-            unspentSwitch(flight.cancel.signal.reason) ||
-            unspentSwitch(flight.steering.lifecycleSignal().reason)) {
+            flight.cancel.signal.reason instanceof CredentialSwitchSignal ||
+            flight.steering.lifecycleSignal().reason instanceof CredentialSwitchSignal) {
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
           flight.retainedLocalCustody = true;
@@ -16322,7 +16345,7 @@ export class RunRunner {
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,
             // Issue #4201: the call-start credential snapshot (token and epoch ordinal).
-            credential: () => flight.credential!.current(),
+            ...(flight.credential ? { credential: () => flight.credential!.current() } : {}),
             runPass: runReadOnlyModelPass,
             pass: {
               // Placeholder only: every call overrides it with the credential snapshot (deps.credential).
@@ -27049,7 +27072,8 @@ export class RunRunner {
    * apply-negotiated worker the flight never requeues and never releases: a PROVEN-quiescent run is
    * reported `credential_switch_uncertain` (option A, an owner pause: the standing override stays pending
    * for the owner), an UNPROVEN one is fenced with `credential_switch_held`. Work and custody are kept
-   * either way. Never throws: any failure leaves the run non-terminal with its work retained.
+   * either way. A cancel, fence, shutdown or lost ownership is rethrown (RetainedRecoveryStop /
+   * StaleClaimError) for executeClaim's dispatch; any other failure leaves the run non-terminal with its work retained.
    */
   private async escapedInPlaceSwitch(
     flight: RunFlight, runLog: Logger, fixed: { opId: string; retained: boolean },
@@ -27081,6 +27105,10 @@ export class RunRunner {
         runLog.info("credential switch escaped the executor; run paused for the owner (outcome uncertain), work and custody kept", { run_id: flight.runId });
       }
     } catch (error) {
+      // Mapped as runInPlaceSwitch's caller maps them: a lifecycle stop (cancel, fence, shutdown, an owner
+      // pause) is rethrown so executeClaim's dispatch keeps its precedence; ownership loss is a stale stop.
+      if (error instanceof RetainedRecoveryStop || error instanceof StaleClaimError) throw error;
+      if (isRunOwnershipLost(error, flight.runId)) throw new StaleClaimError();
       runLog.warn("credential switch escaped the executor and could not be settled; work and custody retained, run left non-terminal", {
         run_id: flight.runId, error: errMessage(error),
       });

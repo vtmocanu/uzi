@@ -4,6 +4,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { getEventListeners } from "node:events";
 
 import {
   HELD_CONTEXT_CALLBACKS,
@@ -1083,5 +1084,20 @@ describe("NowSummaryController: credential epoch attribution (issue #4201)", () 
     h.calls[0]!.resolve("note");
     await settle();
     assert.equal(h.emitted[0]!.credentialEpochOrdinal, undefined);
+  });
+
+  it("a credential dependency that throws leaves no lifecycle abort listener behind (one per retry otherwise)", async () => {
+    const h = harness({ credential: () => { throw new Error("no holder"); } });
+    const before = getEventListeners(h.st.life.signal, "abort").length;
+    h.c.start();
+    h.c.observeProgress(progress(["m1"]), frozen("m1", "m2"));
+    for (let i = 0; i < 3; i++) {
+      h.c.observeFrame(toolUse("lead", "Read", { file_path: `f${i}.md` }));
+      await h.clock.advance(60_000);
+    }
+    assert.equal(h.calls.length, 0, "a throwing dep starts no call");
+    assert.ok(h.warns.length > 0, "the failure is swallowed with a warning");
+    assert.equal(getEventListeners(h.st.life.signal, "abort").length, before, "no listener leaked");
+    await h.c.stop();
   });
 });

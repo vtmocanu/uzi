@@ -10,7 +10,7 @@ import { MessageBatcher, MAX_MESSAGE_BYTES } from "../src/batcher.js";
 import { RequestError, type CredentialSwitchApplyResult, type WorkerClient } from "../src/client.js";
 import { Outbox } from "../src/outbox.js";
 import { SecretSet } from "../src/redact.js";
-import { CredentialSwitchSignal } from "../src/steering.js";
+import { CredentialSwitchSignal, SteeringChannel } from "../src/steering.js";
 import { CredentialSwitchOpLedger, defaultLedgerFs } from "../src/credential-switch-op-ledger.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
@@ -20,6 +20,9 @@ import {
   api, assistant, client, fakeGitlab, fx, git, homeDir, installHarness, resultOk, runnerWith, secretRecordingLogger, worktreeDirFor,
 } from "./runner-harness.js";
 import { freshClaim, newApi, row, send, until } from "./gate-revision-harness.js";
+import { followSuccessfulPush } from "./publication-fixture.js";
+import { FakePrDescApi } from "./fake-pr-desc-api.js";
+import { SummaryRunner } from "../src/summary-runner.js";
 
 installHarness();
 
@@ -99,6 +102,8 @@ interface Setup {
   extra?: Record<string, unknown>;
   /** Runs once the claim exists, before the run starts. */
   before?: (runId: string) => void;
+  /** Runs with the forge fake the run publishes against, before the run starts. */
+  withGitlab?: (gl: ReturnType<typeof fakeGitlab>) => void;
 }
 
 const CLEAN: QuiesceRunOutcome = {
@@ -195,7 +200,9 @@ async function scenario(setup: Setup) {
   const attempts = (): string[] =>
     fs.existsSync(attemptDir) ? fs.readdirSync(attemptDir).filter((n) => n.includes(".attempt-")) : [];
   const attemptsBefore = attempts();
-  const { gitlab } = fakeGitlab();
+  const gl = fakeGitlab();
+  const { gitlab } = gl;
+  setup.withGitlab?.(gl);
   const proofOrder: string[] = [];
   const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
     const verdict = setup.quiesce?.(req);
@@ -285,6 +292,39 @@ describe("issue #4201 m2c: an applied in-place credential switch continues the r
       assert.equal(fs.existsSync(path.join(fx.dataDir, "credential-switch-ops", `${r.runId}.json`)), false, "cleaned up at the terminal state");
     });
   }
+});
+
+describe("issue #4201 m2d: the PR-description editor pass runs on the holder's token", () => {
+  it("an applied switch, then completion: the editor pass spawns on the NEW token and its summary_usage carries the start ordinal", TIMEOUT, async () => {
+    const editorTokens: Array<string | undefined> = [];
+    const queryFn = (async function* (params: { options: { env?: Record<string, string | undefined> } }) {
+      editorTokens.push(params.options.env?.CLAUDE_CODE_OAUTH_TOKEN);
+      yield {
+        type: "assistant",
+        message: {
+          id: "m1", model: "claude-haiku-4-5-20251001", role: "assistant",
+          content: [{ type: "text", text: JSON.stringify({ summary: "Adds a thing.", changes: ["c"], scope_notes: [], review_pointers: [] }) }],
+          usage: { input_tokens: 21, output_tokens: 4 },
+        },
+      };
+      yield { type: "result", subtype: "success", is_error: false };
+    }) as unknown as SdkQueryFn;
+    const summaryRunner = new SummaryRunner(nullLogger(), { queryFn, homeRoot: homeDir });
+    const r = await scenario({
+      site: "implement_turn",
+      apply: [{ outcome: "applied", token: NEW_TOKEN }],
+      extra: { summaryRunner },
+      before: () => { api.prDescription = new FakePrDescApi(); },
+      withGitlab: (gl) => { followSuccessfulPush(git, gl.pr, true); },
+    });
+    assert.deepEqual(applied().map((b) => b.op_id), ["op-1"]);
+    assert.ok(statusesOf(r).includes("completed"), `the run completed: ${statusesOf(r).join(",")}`);
+    assert.deepEqual(editorTokens, [NEW_TOKEN], "the PR-description pass ran once, on the post-apply token");
+    const usage = api.messages(r.runId).filter((m) => m.kind === "summary_usage");
+    assert.equal(usage.length, 1);
+    assert.equal((usage[0]!.payload as { pass: string }).pass, "pr_description");
+    assert.equal(usage[0]!.credential_epoch_ordinal, 1, "the pass's frame carries the epoch it started on");
+  });
 });
 
 describe("issue #4201 m2c: apply outcomes other than applied", () => {
@@ -786,6 +826,63 @@ describe("issue #4201 m2d: a switch that arrives during the prologue is latched 
   });
 });
 
+describe("issue #4201 m2d: a prologue that ends discards the latched switch", () => {
+  it("the prologue throws after a switch was latched: the hold is closed without service, nothing is applied, the stamp stays pending", TIMEOUT, async () => {
+    newApi();
+    negotiate();
+    const claim = freshClaim(GEN);
+    const runId = claim.run_id;
+    api.requestCredentialSwitch(runId, GEN, "op-1");
+    api.scriptApply(runId, { outcome: "applied", token: NEW_TOKEN });
+    const turns: TurnRecord[] = [];
+    const sdk = new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery([planTurn(), doneTurn()], turns), client });
+    const { gitlab } = fakeGitlab();
+    const r = runnerWith(() => ({ executor: sdk }), gitlab, undefined, nullLogger(), {
+      recoveryRetryMs: 1, planApprovalTimeoutMs: 20_000, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir), quiesceRun: async () => CLEAN,
+      switchSupersedeWaitMs: 2_000, questionTimeoutMs: 20_000,
+    });
+    // The prologue's clone step throws, after the first `running` ack latched the pending stamp under the hold.
+    type Steer = { credentialSwitchHoldOpen(): boolean; tripCredentialSwitch(generation: number, opId?: string): void; latchedSwitchGeneration?: number };
+    let steering: Steer | undefined;
+    let holdOpenAtThrow: boolean | undefined;
+    let latchedAtThrow: number | undefined;
+    const realClone = git.ensureClone.bind(git);
+    // Records how every hold opened on this run's channel was closed.
+    const closes: Array<{ service: boolean }> = [];
+    const proto = SteeringChannel.prototype;
+    const realHold = proto.holdCredentialSwitch;
+    proto.holdCredentialSwitch = function (this: SteeringChannel) {
+      const hold = realHold.call(this);
+      const close = hold.close.bind(hold);
+      hold.close = (o) => { closes.push({ service: o.service }); close(o); };
+      return hold;
+    };
+    git.ensureClone = (async () => {
+      steering = (r as unknown as { activeRuns: Map<string, { steering: Steer }> }).activeRuns.get(runId)!.steering;
+      holdOpenAtThrow = steering.credentialSwitchHoldOpen();
+      steering.tripCredentialSwitch(GEN, "op-1"); // the stamp is observed mid-prologue: the hold latches it
+      latchedAtThrow = steering.latchedSwitchGeneration;
+      throw new RequestError("GET", "/clone", 404, "repository not found");
+    }) as typeof git.ensureClone;
+    try {
+      await r.execute(claim);
+    } finally {
+      git.ensureClone = realClone;
+      proto.holdCredentialSwitch = realHold;
+    }
+    const r2 = { states: api.states };
+    assert.equal(holdOpenAtThrow, true, "the prologue hold was open when the prologue threw");
+    assert.equal(latchedAtThrow, GEN, "the switch was latched by the hold");
+    const s = r2.states.filter((x) => x.runId === runId).map((x) => x.body.status);
+    assert.ok(!s.includes("credential_switch") && !s.includes("credential_switch_held"), `the failed prologue is a failure, never a switch release: ${s.join(",")}`);
+    assert.equal(steering!.credentialSwitchHoldOpen(), false, "the prologue hold is closed when the flight ends");
+    assert.ok(closes.length >= 1 && closes.every((c) => !c.service), `the prologue hold was closed, and only ever to discard the latch: ${JSON.stringify(closes)}`);
+    assert.equal(applied().length, 0, "no switch was applied");
+    assert.equal(turns.length, 0, "no model turn ran");
+    assert.equal((api as unknown as { switchPendingRuns: Set<string> }).switchPendingRuns.has(runId), true, "the stamp is still pending server-side");
+  });
+});
+
 describe("issue #4201 m2d: the signal escaped the executor (the escaped arm)", () => {
   /** A stub executor that never handles the switch: it waits for it and rethrows (as a test executor does). */
   async function escaped(quiesce: (req: QuiesceRunRequest) => QuiesceRunOutcome | undefined) {
@@ -829,6 +926,72 @@ describe("issue #4201 m2d: the signal escaped the executor (the escaped arm)", (
     assert.equal(api.uncertainRequests.length, 0);
     for (const status of ["credential_switch", "queued", "completed", "failed"]) assert.ok(!s.includes(status), `no ${status}: ${s.join(",")}`);
     assert.equal(api.holdState(r.runId), "unsettled");
+  });
+});
+
+describe("issue #4201 m2d rework: the escaped arm keeps lifecycle stops and the settled-signal rule", () => {
+  type Ctx = import("../src/executor.js").RunContext;
+  type Steer = { markCancelled(): void };
+
+  it("N1: a cancel during the escaped proof is a cancel (reported, custody kept), not a swallowed settle failure", TIMEOUT, async () => {
+    newApi();
+    negotiate();
+    const claim = freshClaim(GEN);
+    const runId = claim.run_id;
+    api.scriptApply(runId, { outcome: "applied", token: NEW_TOKEN });
+    const executor = {
+      run: async (ctx: Ctx) => {
+        api.requestCredentialSwitch(runId, GEN, "op-1");
+        assert.ok(await until(() => ctx.signal?.aborted === true, 10_000), "the switch aborted ctx.signal");
+        throw ctx.signal!.reason;
+      },
+    };
+    const { gitlab } = fakeGitlab();
+    let rr!: ReturnType<typeof runnerWith>;
+    let cancelled = 0;
+    rr = runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir),
+      quiesceRun: async (req) => {
+        if (req.site === "in_place_credential_switch" && cancelled++ === 0) {
+          (rr as unknown as { activeRuns: Map<string, { steering: Steer }> }).activeRuns.get(runId)!.steering.markCancelled();
+        }
+        return CLEAN;
+      },
+    });
+    await rr.execute(claim);
+    const states = api.states.filter((x) => x.runId === runId).map((x) => x.body);
+    const s: string[] = states.map((b) => b.status);
+    assert.equal(cancelled >= 1, true, "the cancel landed during the escaped proof");
+    assert.equal(api.uncertainRequests.length, 0, `a cancelled flight reports no uncertain switch: ${s.join(",")}`);
+    assert.equal(applied().length, 0);
+    const failed = states.find((b) => b.status === "failed");
+    assert.ok(failed, `the cancel is reported through the retained-stop arm: ${s.join(",")}`);
+    assert.match(String((failed as { failure_reason?: string }).failure_reason ?? ""), /cancel/i);
+  });
+
+  it("N2: a spent switch signal surfacing after an apply never takes the v1 release", TIMEOUT, async () => {
+    newApi();
+    negotiate();
+    const claim = freshClaim(GEN);
+    const runId = claim.run_id;
+    api.scriptApply(runId, { outcome: "applied", token: NEW_TOKEN });
+    const executor = {
+      run: async (ctx: Ctx) => {
+        api.requestCredentialSwitch(runId, GEN, "op-1");
+        assert.ok(await until(() => ctx.signal?.aborted === true, 10_000), "the switch aborted ctx.signal");
+        const spent = ctx.signal!.reason;
+        assert.equal(await ctx.attemptCredentialSwitch!({ site: "implement_turn", laneSettled: true }), "applied");
+        throw spent; // the old, now settled, signal surfaces after the apply
+      },
+    };
+    const { gitlab } = fakeGitlab();
+    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir), quiesceRun: async () => CLEAN,
+    }).execute(claim);
+    const s: string[] = api.states.filter((x) => x.runId === runId).map((x) => x.body.status);
+    assert.deepEqual(applied().map((b) => b.op_id), ["op-1"], "the apply happened once");
+    for (const status of ["credential_switch", "credential_switch_uncertain", "credential_switch_held", "queued", "completed", "failed"])
+      assert.ok(!s.includes(status), `no ${status} after an applied switch: ${s.join(",")}`);
   });
 });
 

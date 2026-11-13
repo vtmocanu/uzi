@@ -852,6 +852,8 @@ interface RunDrive {
    *  (resume refusal: a fresh init session, or an allowlisted transcript-incompatibility with no model
    *  evidence, restarts in a fresh session in the same cwd). */
   postSwitchResume?: boolean;
+  /** Issue #4201: whether the resume-refused lineage break was already emitted for the latest applied switch. */
+  resumeRefusalEmitted?: boolean;
   /** Issue #4201: whether the most recent driveTurn was the one that consumed `postSwitchResume`, and
    *  whether it showed model evidence. Read by driveTurnWithEmptyRecovery's refusal arm. */
   lastTurnPostSwitch?: boolean;
@@ -4813,14 +4815,12 @@ export class SdkExecutor implements Executor {
     return live ? { token: live.token, ordinal: live.ordinal } : { token: fallbackToken, ordinal: 0 };
   }
 
-  /**
-   * Issue #4201: after an APPLIED in-place switch, point every copy of the run's token at the new
-   * credential: ctx.oauthToken, the shared SDK env object (which the guarded lane launches from),
-   * the drive carrier, and the abort listener (the old ctx.signal is spent).
-   */
   /** Issue #4201: tell the feed (and the worker log) that the switch's resume was refused and the run
    *  continues in a fresh session in the same working directory, so the lineage break is attributed. */
-  private emitCredentialResumeRefused(ctx: RunContext, epoch: number): void {
+  private emitCredentialResumeRefused(ctx: RunContext, state: RunDrive, epoch: number): void {
+    // At most once per applied switch, whichever arm (a fresh init, or a refused resume) sees the refusal first.
+    if (state.resumeRefusalEmitted === true) return;
+    state.resumeRefusalEmitted = true;
     this.log.info("resume session refused after a credential switch: continuing in a fresh session in the same working directory", {
       run_id: ctx.runId, reason: CREDENTIAL_SWITCH_RESUME_REFUSED, event: RESUME_LINEAGE_BREAK_EVENT,
     });
@@ -4837,11 +4837,17 @@ export class SdkExecutor implements Executor {
     });
   }
 
+  /**
+   * Issue #4201: after an APPLIED in-place switch, point every copy of the run's token at the new
+   * credential: ctx.oauthToken, the shared SDK env object (which the guarded lane launches from),
+   * the drive carrier, and the abort listener (the old ctx.signal is spent).
+   */
   private rebindCredential(ctx: RunContext, state: RunDrive): void {
     const token = (ctx.credential?.().token ?? ctx.oauthToken)?.trim();
     if (!token) return;
     ctx.oauthToken = token;
     state.postSwitchResume = true;
+    state.resumeRefusalEmitted = false;
     if (state.credentialEnv) state.credentialEnv.CLAUDE_CODE_OAUTH_TOKEN = token;
     state.rebindDrive?.(token);
     state.reattachSignal?.();
@@ -5124,10 +5130,12 @@ export class SdkExecutor implements Executor {
     // Issue #3174: recorded on entry so a pre-dispatch trip, which skips the finally below, leaves
     // this attempt's requested session rather than an earlier attempt's.
     state.lastTurnSessionId = resumeId;
-    // Issue #4201: the first resumed turn after an applied in-place switch is watched for a refused
-    // resume. The flag is spent by that one turn whatever its outcome.
-    const postSwitchResume = state.postSwitchResume === true && resumeId !== undefined;
-    if (postSwitchResume) state.postSwitchResume = false;
+    // Issue #4201: the first turn after an applied in-place switch spends the flag, whether or not it
+    // resumes a session; only a turn that did ask to resume is watched for a refused resume, so a later
+    // unrelated fresh init or transcript error is never attributed to the switch.
+    const armed = state.postSwitchResume === true;
+    if (armed) state.postSwitchResume = false;
+    const postSwitchResume = armed && resumeId !== undefined;
     state.lastTurnPostSwitch = postSwitchResume;
     state.lastTurnModelEvidence = false;
     // A trip may already be pending (e.g. a cancel that landed during the gate).
@@ -5306,7 +5314,7 @@ export class SdkExecutor implements Executor {
           if (event.freshSession === true) freshInit = true;
           // Issue #4201 (a): the SDK started a fresh session instead of resuming the one the switch
           // continued (ADR-1562 fresh_session). The turn already runs in a fresh session in the same cwd.
-          if (event.freshSession === true && postSwitchResume) this.emitCredentialResumeRefused(ctx, epoch);
+          if (event.freshSession === true && postSwitchResume) this.emitCredentialResumeRefused(ctx, state, epoch);
         } else if (event.sessionId && !(event.kind === "frame" && event.origin.kind === "subagent")) {
           turnSessionId = event.sessionId;
         }
@@ -5531,9 +5539,12 @@ export class SdkExecutor implements Executor {
     // original hook (whose once-only latch already fired).
     let lastSuffix = "";
     let replayAfterEventFree = false;
+    // Whether the original hook has run (its once-only latch fired), so a replay of lastSuffix is owed.
+    let hookConsulted = false;
     const dispatchHook = beforeDispatch
       ? (input: string): string => {
           if (replayAfterEventFree) return input + lastSuffix;
+          hookConsulted = true;
           const out = beforeDispatch(input);
           lastSuffix = out.startsWith(input) ? out.slice(input.length) : "";
           return out;
@@ -5636,8 +5647,11 @@ export class SdkExecutor implements Executor {
               resumeId !== undefined && isResumeTranscriptIncompatible(err)) {
             resumeRefusalSpent = true;
             resumeId = undefined;
+            // The refused attempt may have consumed beforeDispatch's once-only suffix (the interrupted-calls
+            // note, issue #3179): the restart re-sends exactly what that dispatch appended.
+            replayAfterEventFree = hookConsulted;
             prompt = RESUME_REFUSED_PROMPT_NOTE + prompt;
-            this.emitCredentialResumeRefused(ctx, ctx.credential?.().ordinal ?? 0);
+            this.emitCredentialResumeRefused(ctx, state, ctx.credential?.().ordinal ?? 0);
             continue;
           }
           // Any genuine (non-transient) failure fails the run, exactly as before.
