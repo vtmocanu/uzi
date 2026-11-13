@@ -62,6 +62,18 @@
     },
     {
       "customType": "regex",
+      "description": "Packaged-proof PostgreSQL defaults: preserve environment overrides while updating both scripts with the shared postgres group.",
+      "managerFilePatterns": [
+        "/^e2e/codex-m3b/(?:testserver|run-lifecycle)\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?:^|\\n)[ \\t]*(?:CDR_M3B_PG_IMAGE|PG_IMAGE)=\"\\$\\{CDR_M3B_PG_IMAGE:-(?<depName>postgres):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[0-9a-f]{64})\\}\"(?:\\r?\\n|$)"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
       "description": "Codex native runtime identity: keep the install version, manifest version, raw release tag and source commit together. Numeric consumers keep their existing lock keys. The two archive matches below are disjoint from this block.",
       "managerFilePatterns": ["/^agent/codex/codex-package\\.lock$/"],
       "matchStrings": ["CODEX_VERSION=\\d+\\.\\d+\\.\\d+\\nCODEX_MANIFEST_VERSION=\\d+\\.\\d+\\.\\d+\\nCODEX_TAG=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)\\nCODEX_SOURCE_COMMIT=(?<currentDigest>[0-9a-f]{40})"],
@@ -229,7 +241,7 @@
       "automerge": false
     },
     {
-      "description": "Postgres is pinned twice: docker-compose.yml (`postgres`) and ci.yml's test-codex-refresh-lostreply-e2e UZI_CI_PG_IMAGE env pin (the single LiveDB execution), which pulls through the mirror.gcr.io Docker Hub cache (`mirror.gcr.io/library/postgres`, #2621). Both must stay on the same tag and digest so the CI LiveDB lane tests the engine the stack ships, so they share one branch (#2622); scripts/check-postgres-pin-parity.sh gates the result.",
+      "description": "Keep root/deploy compose, mirrored LiveDB CI, chart simple mode and both packaged-proof PostgreSQL defaults on one tested tag and digest (#2622, #4275). The m3b paths trigger packaged-proof PR coverage; scripts/check-postgres-pin-parity.sh rejects partial bumps.",
       "matchDepNames": ["postgres", "mirror.gcr.io/library/postgres"],
       "groupName": "postgres"
     }

@@ -26,8 +26,13 @@ check() {
   printf 'jobs:\n  t:\n    env:\n%s\n    steps:\n      - run: ./scripts/docker-pull-fallback.sh %s\n' \
     "$4" "${5:-postgres:17}" > "$TMP/$1.ci.yml"
   printf 'PGIMAGE="${UZI_STORE_IT_PG_IMAGE:-%s}"\n' "${6:-postgres:17}" > "$TMP/$1.storeit.sh"
+  printf 'services:\n  db:\n    image: postgres:17@sha256:%s\n' "$A" > "$TMP/$1.deploy.yml"
+  printf 'unrelated:\n  tag: "ignore-me"\ndatabase:\n  mode: simple\n  simple:\n    image:\n      repository: postgres\n      tag: "17@sha256:%s"\n' "$A" > "$TMP/$1.chart.yml"
+  printf '  CDR_M3B_PG_IMAGE="${CDR_M3B_PG_IMAGE:-postgres:17@sha256:%s}"\n' "$A" > "$TMP/$1.server.sh"
+  printf 'PG_IMAGE="${CDR_M3B_PG_IMAGE:-postgres:17@sha256:%s}"\n' "$A" > "$TMP/$1.lifecycle.sh"
   rc=0
-  "$SUT" "$TMP/$1.compose.yml" "$TMP/$1.ci.yml" "$TMP/$1.storeit.sh" > "$TMP/$1.out" 2>&1 || rc=$?
+  "$SUT" "$TMP/$1.compose.yml" "$TMP/$1.ci.yml" "$TMP/$1.storeit.sh" \
+    "$TMP/$1.deploy.yml" "$TMP/$1.chart.yml" "$TMP/$1.server.sh" "$TMP/$1.lifecycle.sh" > "$TMP/$1.out" 2>&1 || rc=$?
   [ "$rc" = "$2" ] || fail "$1: exit $rc, want $2 ($(cat "$TMP/$1.out"))"
 }
 
@@ -53,8 +58,28 @@ check cishort 2 "    image: postgres:17@sha256:$A" "      UZI_CI_PG_IMAGE: mirro
 check wrongdup 2 "    image: postgres:17@sha256:$A" "      UZI_CI_PG_IMAGE: mirror.gcr.io/library/postgres:17@sha256:$A
       UZI_CI_PG_IMAGE: postgres:17@sha256:$A"
 
+# Every newly covered site must reject drift, absence, duplication and malformed
+# extraction. Mutate one site at a time so a missing check cannot pass vacuously.
+for site in deploy.yml chart.yml server.sh lifecycle.sh; do
+  for defect in drift tag missing duplicate malformed; do
+    check extra 0 "    image: postgres:17@sha256:$A" "      UZI_CI_PG_IMAGE: mirror.gcr.io/library/postgres:17@sha256:$A"
+    cp "$TMP/extra.$site" "$TMP/original"
+    case $defect in
+      drift) awk -v old="$A" -v new="$B" '{ gsub(old,new); print }' "$TMP/original" > "$TMP/extra.$site"; want=1 ;;
+      tag) awk '{ gsub(/17@/,"18@"); print }' "$TMP/original" > "$TMP/extra.$site"; want=1 ;;
+      missing) : > "$TMP/extra.$site"; want=2 ;;
+      duplicate) cat "$TMP/original" "$TMP/original" > "$TMP/extra.$site"; want=2 ;;
+      malformed) awk -v old="$A" '{ gsub(old,"abc"); print }' "$TMP/original" > "$TMP/extra.$site"; want=2 ;;
+    esac
+    rc=0
+    "$SUT" "$TMP/extra.compose.yml" "$TMP/extra.ci.yml" "$TMP/extra.storeit.sh" \
+      "$TMP/extra.deploy.yml" "$TMP/extra.chart.yml" "$TMP/extra.server.sh" "$TMP/extra.lifecycle.sh" > "$TMP/extra.out" 2>&1 || rc=$?
+    [ "$rc" = "$want" ] || fail "$site $defect: exit $rc, want $want ($(cat "$TMP/extra.out"))"
+  done
+done
+
 rc=0
 (cd "$ROOT" && "$SUT") > "$TMP/repo.out" 2>&1 || rc=$?
 [ "$rc" = 0 ] || fail "repo: docker-compose.yml and ci.yml postgres pins differ ($(cat "$TMP/repo.out"))"
 
-echo "check-postgres-pin-parity.test.sh: PASS (16 synthetic cases + real files)"
+echo "check-postgres-pin-parity.test.sh: PASS (16 original + 20 new drift/extraction cases + real files)"
