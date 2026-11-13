@@ -15,7 +15,10 @@ Uzi retries in place and, if the trouble persists, parks the run in
   turn count of zero and no model activity, plan, question, or completion.
 - A **transient Claude provider error** — a failed turn carrying a 408, 429,
   or 5xx status, including when its reason is not `api_error`; a failed
-  `api_error` with no status also qualifies.
+  `api_error` with no status also qualifies. So does a 403 whose error text
+  carries the Cloudflare block-page title `Attention Required! | Cloudflare`:
+  the provider's edge briefly answering with a challenge page, which clears on
+  its own.
 - A **transient Codex provider error** — on the Codex harness, a turn that
   ends failed because the provider was overloaded (`serverOverloaded`), had an
   internal server error (`internalServerError`), or had no flex capacity
@@ -37,7 +40,7 @@ after a turn that actually did work, missing turn-count metadata, a real
 wall timeout, and cancellation are not classified as a transient recovery.
 Measured Codex idle timeouts generally use the [idle-stall policy](#codex-idle-stalls) below; qualifying zero-output silence after a provider-reported retry uses [provider-outage recovery](#provider-outage-streaks) instead.
 
-A **permanent** provider error — for example 401, 403, or 400 (bad
+A **permanent** provider error — for example 401, any other 403, or 400 (bad
 credentials or a bad request) — is not a transient interruption. The run
 fails fast with an accurate reason and does not park here. On the Codex
 harness, a turn that ends with a transport failure carrying a permanent status
