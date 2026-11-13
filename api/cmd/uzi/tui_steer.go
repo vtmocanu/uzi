@@ -308,6 +308,21 @@ type runInputsMsg struct {
 	runID  string
 	inputs []apitypes.SteerInputDTO
 	err    error
+	// adminDebug is the response's admin_debug_read marker: the queue is another user's, served
+	// read-only under admin run debug (issue #4198).
+	adminDebug bool
+}
+
+// steerAccessForInputs is steerAccessFor for a probe result that may carry the admin run debug
+// marker. A 200 under admin debug proves the server let a non-owner READ the queue, not that the
+// write would be accepted (every steer verb stays owner-only), so it downgrades steerAllowed to
+// steerNotOwner. The chat and terminal verdicts keep precedence.
+func steerAccessForInputs(run apitypes.RunDTO, msg runInputsMsg) steerAccess {
+	access := steerAccessFor(run, msg.err)
+	if access == steerAllowed && msg.adminDebug {
+		return steerNotOwner
+	}
+	return access
 }
 
 // gateRevisionOf is the plan-gate revision a verdict on run is bound to (PRD #1795 D5): the
@@ -334,8 +349,8 @@ func (m tuiModel) submitSteerCmd(kind, body string, expectedGateRevision *int64)
 func (m tuiModel) fetchInputsCmd(runID string) tea.Cmd {
 	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
-		in, err := c.RunInputs(ctx, runID)
-		return runInputsMsg{runID: runID, gen: gen, inputs: in, err: err}
+		in, adminDebug, err := c.RunInputsMeta(ctx, runID)
+		return runInputsMsg{runID: runID, gen: gen, inputs: in, err: err, adminDebug: adminDebug}
 	}
 }
 

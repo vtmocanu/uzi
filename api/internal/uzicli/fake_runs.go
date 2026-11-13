@@ -172,6 +172,17 @@ func (f *FakeClient) RunInputs(_ context.Context, id string) ([]apitypes.SteerIn
 	return nil, Exitf(ExitNotFound, "run %s not found", id)
 }
 
+// RunInputsMeta is RunInputs plus the canned admin_debug_read marker: RunInputsAdminDebug[id]
+// true models a foreign run served under admin run debug. RunInputsMetaCalls counts calls.
+func (f *FakeClient) RunInputsMeta(ctx context.Context, id string) ([]apitypes.SteerInputDTO, bool, error) {
+	f.RunInputsMetaCalls++
+	in, err := f.RunInputs(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	return in, f.RunInputsAdminDebug[id], nil
+}
+
 // RunLeadConfigHistory mirrors the owner-or-admin endpoint: a key present in LeadConfigHistoryByID
 // is a visible run (return its history, possibly empty); a key absent is a non-owner / unknown run
 // -> ExitNotFound (exit 4), matching the server's 404. Entries is never nil on the way out.

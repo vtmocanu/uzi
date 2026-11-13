@@ -2607,6 +2607,15 @@ type SteerInputDTO struct {
 	InclusionReported bool       `json:"inclusion_reported"`
 }
 
+// RunInputsEnvelopeDTO is the GET /api/runs/{id}/inputs response: the steer queue under
+// "inputs" (always a JSON array, never null on the real wire) and, only on an admin run debug
+// read of another user's run (issue #4198), admin_debug_read=true so a client can mark the
+// view read-only. The marker is omitted otherwise, so an owner's response is unchanged.
+type RunInputsEnvelopeDTO struct {
+	Inputs         []SteerInputDTO `json:"inputs"`
+	AdminDebugRead bool            `json:"admin_debug_read,omitempty"`
+}
+
 // RunEventDTO is one /api/ws frame: the live-channel counterpart to the REST
 // reads above, shared by the web, the hub that emits it, and the uzi CLI.
 //

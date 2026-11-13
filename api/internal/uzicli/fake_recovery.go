@@ -65,6 +65,20 @@ func (f *FakeClient) RecoveryHolds(_ context.Context) (apitypes.RecoveryCustodyH
 	return f.RecoveryHoldsResult, nil
 }
 
+// RecoveryHoldsScoped records the (user, run) selector and returns RecoveryHoldsScopedResult
+// (RecoveryHoldsScopedErr, then the blanket Err, win). A test models a server predating admin
+// run debug by leaving OwnerID empty.
+func (f *FakeClient) RecoveryHoldsScoped(_ context.Context, userID, runID string) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	f.RecoveryHoldsScopedCalls = append(f.RecoveryHoldsScopedCalls, RecoveryHoldsScopedCall{UserID: userID, RunID: runID})
+	if f.RecoveryHoldsScopedErr != nil {
+		return apitypes.RecoveryCustodyHoldsDTO{}, f.RecoveryHoldsScopedErr
+	}
+	if f.Err != nil {
+		return apitypes.RecoveryCustodyHoldsDTO{}, f.Err
+	}
+	return f.RecoveryHoldsScopedResult, nil
+}
+
 // DiscardRecoveryHold records the (run, hold) discard IN ORDER — FIRST, so a test can assert a
 // discard was (or was NOT) attempted — then returns DiscardHoldErr (or the blanket Err). The
 // recording is the seam that proves a cancelled/declined prompt or a non-TTY refusal performed

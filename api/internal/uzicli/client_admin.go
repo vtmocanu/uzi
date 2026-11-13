@@ -1,7 +1,10 @@
 package uzicli
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -81,6 +84,50 @@ func (c *HTTPClient) AdminListRunSummaries(ctx context.Context) ([]apitypes.RunS
 		return nil, err
 	}
 	return env.Runs, nil
+}
+
+// errAdminRunDebugUnsupported is the clear refusal for a server that predates admin run debug.
+const errAdminRunDebugUnsupported = "this server does not support admin run debug listing (needs a server with UZI_ADMIN_RUN_DEBUG support)"
+
+// AdminListRunsDebug is GET /api/admin/runs?state=all (issue #4198). A server without the feature
+// ignores the query: it answers a bare JSON array or its active-runs envelope, which has no
+// "truncated" key. Either is refused so a partial listing is never shown as every run.
+func (c *HTTPClient) AdminListRunsDebug(ctx context.Context, userID, since string) (apitypes.AdminRunsDebugDTO, error) {
+	q := url.Values{}
+	q.Set("state", "all")
+	if userID != "" {
+		q.Set("user", userID)
+	}
+	if since != "" {
+		q.Set("since", since)
+	}
+	path := "/api/admin/runs?" + q.Encode()
+	resp, body, err := c.doJSONRead(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return apitypes.AdminRunsDebugDTO{}, err
+	}
+	if resp.StatusCode/100 != 2 {
+		return apitypes.AdminRunsDebugDTO{}, statusError(resp.StatusCode, body, resp.Header.Get("Retry-After"))
+	}
+	var keys map[string]json.RawMessage
+	if json.Unmarshal(body, &keys) != nil {
+		// Not a JSON object: an array (older server) or garbage.
+		if bytes.HasPrefix(bytes.TrimSpace(body), []byte("[")) {
+			return apitypes.AdminRunsDebugDTO{}, Exitf(ExitGeneric, "%s", errAdminRunDebugUnsupported)
+		}
+		return apitypes.AdminRunsDebugDTO{}, Exitf(ExitGeneric, "malformed response from uzi (%s)", "/api/admin/runs")
+	}
+	if _, ok := keys["truncated"]; !ok {
+		return apitypes.AdminRunsDebugDTO{}, Exitf(ExitGeneric, "%s", errAdminRunDebugUnsupported)
+	}
+	var out apitypes.AdminRunsDebugDTO
+	if err := json.Unmarshal(body, &out); err != nil {
+		return apitypes.AdminRunsDebugDTO{}, Exitf(ExitGeneric, "malformed response from uzi (%s): %v", "/api/admin/runs", err)
+	}
+	if out.Runs == nil {
+		out.Runs = []apitypes.RunSummaryItemDTO{}
+	}
+	return out, nil
 }
 
 // AdminHealth reads the admin health document (PRD #1484 M3): GET /api/admin/health,

@@ -1240,6 +1240,7 @@ func (h *Handler) ListRunInputs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := h.wsvc.ListFollowUpInputs(r.Context(), user.ID, id)
+	debug := false
 	if errors.Is(err, workersvc.ErrRunNotFound) {
 		run, actor, tokenID, ok := h.adminRunDebugForeignRun(w, r, id, "list run inputs")
 		if !ok {
@@ -1259,6 +1260,7 @@ func (h *Handler) ListRunInputs(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
+		debug = true
 		auditRunDebugRead(r, actor, tokenID, adminRunDebugRouteInputs, id, run.UserID)
 	} else if err != nil {
 		slog.Error("list run inputs", "error", err)
@@ -1269,7 +1271,7 @@ func (h *Handler) ListRunInputs(w http.ResponseWriter, r *http.Request) {
 	for _, i := range rows {
 		out = append(out, steerInputToDTO(i))
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"inputs": out})
+	httpx.JSON(w, http.StatusOK, apitypes.RunInputsEnvelopeDTO{Inputs: out, AdminDebugRead: debug})
 }
 
 // codexPoolUnavailableCode is the typed, nonsecret reason a refused Codex start carries beside the

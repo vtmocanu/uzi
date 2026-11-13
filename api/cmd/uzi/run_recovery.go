@@ -41,13 +41,17 @@ func parseRecoveryRunID(raw string) (string, error) {
 // newRunRecoveryCmd builds `uzi run recovery [run-id] [--json]`.
 func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 	recovery := &cobra.Command{
-		Use:   "recovery [run-id]",
+		Use:   "recovery [run-id | --user <uuid>]",
 		Short: "List open custody holds across your runs or all holds for one run",
 		Long: "Without a run id, show your open custody holds across all runs, oldest first, " +
 			"with exact run and hold ids, disposition, archive availability, worker, age, and the " +
 			"owner-wide custody summary. With a run id, show that run's retained holds: each hold's exact id, " +
 			"claim generation, server-derived disposition, the latest capture state, and retained captures' recorded prerequisite pins.\n\n" +
-			"Owner-only: you see only your own runs' holds. An `archive_ready` hold has a recovery " +
+			"Owner-only: you see only your own runs' holds, with one read-only exception. Admin run debug " +
+			"(server flag UZI_ADMIN_RUN_DEBUG, a live admin's admin_ro (uza_) token, audited) lets a run id that " +
+			"is not yours list that run's holds and captures, and `--user <uuid>` list another user's open holds " +
+			"owner-wide; `--user` takes no run id. Those views are metadata-only: `run discard` and `run export` stay owner-only. " +
+			"An `archive_ready` hold has a recovery " +
 			"archive: download it with `run export`; thin archives also require external commits and destination import verification. An unguarded hold can release when the archive is " +
 			"durable; guarded inventory requires verified final coverage or an explicit disposition. " +
 			"Eligible guarded COMPLETED issue/mr_rework/self_improve runs may instead release after " +
@@ -71,7 +75,11 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"including settled holds. With a run id, --json emits each of the run's hold DTOs " +
 			"plus a `captures` array listing that hold's " +
 			"recovery captures (id, state, source_sha, byte_size, created_at, checksum, ordered prerequisites, expiry, attempted head and optional prerequisite_closure); a capture id is what " +
-			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`.\n\n" +
+			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`. A capture whose hold " +
+			"is not among the listed holds (for example after the hold was released) is not dropped: when there is at " +
+			"least one, --json appends ONE final element `{\"run_id\": ..., \"unattached\": true, \"captures\": [...]}` " +
+			"after the hold elements, with the same capture shape and no generation, id or state keys; the human form " +
+			"prints a \"captures (no listed hold)\" table.\n\n" +
 			"While the server retains the run's last published checkpoint on origin, the hold also " +
 			"names where it lives: `refs/uzi-checkpoints/<checkpoint-key>`, or `refs/uzi-recovery/<run-id>` " +
 			"once a newer run on the same branch superseded it, with its tip and retention state " +
@@ -80,6 +88,9 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
 				return err
 			}
+			if cmd.Flags().Changed("user") && len(args) > 0 {
+				return uzicli.Exitf(uzicli.ExitUsage, "--user cannot be combined with a run id")
+			}
 			if len(args) == 1 {
 				_, err := parseRecoveryRunID(args[0])
 				return err
@@ -87,6 +98,18 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Changed("user") {
+				raw, _ := cmd.Flags().GetString("user")
+				id, err := uuid.Parse(raw)
+				if err != nil {
+					return uzicli.Exitf(uzicli.ExitUsage, "invalid --user %q: the full user UUID is required", cellText(raw))
+				}
+				c, err := env.client(gf)
+				if err != nil {
+					return err
+				}
+				return runRecoveryForUser(cmd.Context(), env, gf, c, id.String())
+			}
 			var runID string
 			if len(args) == 1 {
 				var err error
@@ -108,44 +131,105 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				return renderOwnerRecovery(env, gf, holds, reasons)
+				return renderOwnerRecovery(env, gf, holds, reasons, false)
 			}
-			// The endpoint is owner-wide; narrow to this run client-side.
-			var forRun []apitypes.RecoveryCustodyHoldDTO
-			for _, h := range holds.Holds {
-				if h.RunID == runID {
-					forRun = append(forRun, h)
-				}
-			}
-			reasons, err := recoveryFailureReasons(cmd.Context(), env, c, forRun, false)
-			if err != nil {
-				return err
-			}
-			// --json joins each hold's captures (#1417) so an agent reads the capture ids as
-			// data. Human output uses the same read for recorded pin observations.
-			// A run with no holds has nothing to join onto.
-			var archives []apitypes.RecoveryArchiveDTO
-			if len(forRun) > 0 {
-				summary, err := c.RecoveryArchives(cmd.Context(), runID)
-				switch {
-				case uzicli.ExitCodeFor(err) == uzicli.ExitNotFound:
-					// A released/discarded hold outlives its run (runs cascade-delete with
-					// their repo; holds keep a plain run_id), so the holds list still names a
-					// run whose archives read 404s. Degrade to every hold listing no captures
-					// rather than failing the whole listing.
-				case err != nil:
-					if gf.json {
-						return err
-					}
-					_, _ = fmt.Fprintln(env.Stderr, "warning: capture and prerequisite-pin metadata unavailable; protection unknown; custody remains as listed")
-				default:
-					archives = summary.Archives
-				}
-			}
-			return renderRunRecovery(env, gf, runID, forRun, archives, reasons)
+			return runRecoveryForRun(cmd.Context(), env, gf, c, runID, holds)
 		},
 	}
+	recovery.Flags().String("user", "", "list another user's open custody holds (admin run debug, read-only); takes no run id")
 	return recovery
+}
+
+// runRecoveryForUser is `run recovery --user <uuid>`: another user's holds under admin run debug.
+// Every --user listing is treated as a read-only foreign view because the CLI does not know the
+// caller's own id. A response without an owner_id naming exactly that user came from a server that
+// ignored the query (it answered with the caller's own holds), so it is refused.
+func runRecoveryForUser(ctx context.Context, env Env, gf *globalFlags, c uzicli.Client, userID string) error {
+	holds, err := c.RecoveryHoldsScoped(ctx, userID, "")
+	if err != nil {
+		return hintOnForeignReadRefusal(env, err)
+	}
+	if holds.OwnerID == "" || !strings.EqualFold(holds.OwnerID, userID) {
+		return uzicli.Exitf(uzicli.ExitGeneric, "the server did not return holds scoped to user %s; it may predate admin run debug", userID)
+	}
+	reasons, err := recoveryFailureReasons(ctx, env, c, holds.Holds, true)
+	if err != nil {
+		return err
+	}
+	if !gf.json {
+		_, _ = fmt.Fprintln(env.Stderr, adminRunDebugReadOnlyLine)
+	}
+	return renderOwnerRecovery(env, gf, holds, reasons, true)
+}
+
+// runRecoveryForRun lists one run's holds and captures. own is the caller's owner-wide hold list.
+// With no own hold for the run it asks the server for the run's holds (?run=), which serves
+// another user's run under admin run debug; those holds are re-filtered by run id (a server that
+// ignores the query answers owner-wide) and the view is read-only. Capture metadata is read even
+// when no hold lists, so captures whose hold is gone still surface; that read is best-effort when
+// there is no hold to join onto.
+func runRecoveryForRun(ctx context.Context, env Env, gf *globalFlags, c uzicli.Client, runID string,
+	own apitypes.RecoveryCustodyHoldsDTO) error {
+	// The endpoint is owner-wide; narrow to this run client-side.
+	forRun := holdsOfRun(own.Holds, runID)
+	readOnly := false
+	if len(forRun) == 0 {
+		scoped, err := c.RecoveryHoldsScoped(ctx, "", runID)
+		switch {
+		case uzicli.ExitCodeFor(err) == uzicli.ExitNotFound:
+			// Not the caller's run, or no such run; either way no holds to show. Say what a
+			// foreign-run read needs, and carry on: the command still succeeds with nothing.
+			_, _ = fmt.Fprintln(env.Stderr, adminRunDebugHint)
+		case err != nil:
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			_, _ = fmt.Fprintf(env.Stderr, "warning: could not check admin run debug holds for run %s: %s\n", cellText(runID), cellText(err.Error()))
+		default:
+			forRun = holdsOfRun(scoped.Holds, runID)
+			readOnly = len(forRun) > 0
+		}
+	}
+	reasons, err := recoveryFailureReasons(ctx, env, c, forRun, false)
+	if err != nil {
+		return err
+	}
+	// --json joins each hold's captures (#1417) so an agent reads the capture ids as
+	// data. Human output uses the same read for recorded pin observations.
+	var archives []apitypes.RecoveryArchiveDTO
+	summary, err := c.RecoveryArchives(ctx, runID)
+	switch {
+	case uzicli.ExitCodeFor(err) == uzicli.ExitNotFound:
+		// A released/discarded hold outlives its run (runs cascade-delete with
+		// their repo; holds keep a plain run_id), so the holds list still names a
+		// run whose archives read 404s. Degrade to every hold listing no captures
+		// rather than failing the whole listing.
+	case err != nil:
+		if len(forRun) > 0 && gf.json {
+			return err
+		}
+		_, _ = fmt.Fprintln(env.Stderr, "warning: capture and prerequisite-pin metadata unavailable; protection unknown; custody remains as listed")
+	default:
+		archives = summary.Archives
+		if summary.AdminDebugRead {
+			readOnly = true
+		}
+	}
+	if readOnly && !gf.json {
+		_, _ = fmt.Fprintln(env.Stderr, adminRunDebugReadOnlyLine)
+	}
+	return renderRunRecovery(env, gf, runID, forRun, archives, reasons, readOnly)
+}
+
+// holdsOfRun keeps the holds that belong to runID.
+func holdsOfRun(holds []apitypes.RecoveryCustodyHoldDTO, runID string) []apitypes.RecoveryCustodyHoldDTO {
+	var out []apitypes.RecoveryCustodyHoldDTO
+	for _, h := range holds {
+		if h.RunID == runID {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // recoveryFailureReasons makes at most one read per distinct relevant run in the
@@ -200,7 +284,10 @@ func printRecoveryFailureReasons(p *uzicli.Printer, holds []apitypes.RecoveryCus
 
 // renderOwnerRecovery shows only open holds in the human view. The JSON form preserves
 // the server's entire owner response, including settled holds and server order.
-func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyHoldsDTO, reasons map[string]string) error {
+//
+// readOnly marks another user's holds (admin run debug): the export and discard hints are
+// suppressed because both stay owner-only.
+func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyHoldsDTO, reasons map[string]string, readOnly bool) error {
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
 		if dto.Holds == nil {
@@ -269,7 +356,7 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 	a := dto.Aggregate
 	p.Printf("open_holds: %d  admission_units (admission_counted_holds): %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
 		a.OpenHolds, a.AdmissionCountedHolds, a.CustodyHoldLimit, a.DecisionNeeded, a.BlockedRuns)
-	if !gf.quiet {
+	if !gf.quiet && !readOnly {
 		first := true
 		for _, h := range open {
 			if line := sourceOnlyLine(h); line != "" {
@@ -397,6 +484,42 @@ type recoveryHoldJSON struct {
 	Captures []recoveryHoldCapture `json:"captures"`
 }
 
+// captureJSONOf maps one archive to the capture shape shared by hold elements and the
+// unattached element of `run recovery <run-id> --json`.
+func captureJSONOf(a apitypes.RecoveryArchiveDTO) recoveryHoldCapture {
+	return recoveryHoldCapture{
+		ID: a.ID, State: a.State, SourceSha: a.SourceSha, ByteSize: a.ByteSize, CreatedAt: a.CreatedAt,
+		Checksum: a.Checksum, PrerequisiteShas: a.PrerequisiteShas, ExpiresAt: a.ExpiresAt,
+		AttemptedHeadSha: a.AttemptedHeadSha, PrerequisiteClosure: a.PrerequisiteClosure,
+	}
+}
+
+// recoveryUnattachedJSON is the single trailing element of `run recovery <run-id> --json` that
+// carries captures whose hold is not among the listed holds. It has no generation, id or state:
+// it is not a hold.
+type recoveryUnattachedJSON struct {
+	RunID      string                `json:"run_id"`
+	Unattached bool                  `json:"unattached"`
+	Captures   []recoveryHoldCapture `json:"captures"`
+}
+
+// unattachedArchives returns the archives that name a hold id (non-empty) matching none of
+// the listed holds, in archive order. An empty hold_id (a server predating the field) is not
+// listed: unattributedCaptures warns about those instead.
+func unattachedArchives(holds []apitypes.RecoveryCustodyHoldDTO, archives []apitypes.RecoveryArchiveDTO) []apitypes.RecoveryArchiveDTO {
+	listed := make(map[string]bool, len(holds))
+	for _, h := range holds {
+		listed[h.ID] = true
+	}
+	var out []apitypes.RecoveryArchiveDTO
+	for _, a := range archives {
+		if a.HoldID != "" && !listed[a.HoldID] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // holdsWithCaptures attaches each archive to the hold whose id it names, in archive order.
 // Every hold gets a non-nil captures slice, so the JSON is [] and never null. An archive
 // whose hold_id names no listed hold (including an empty hold_id from a server predating
@@ -409,11 +532,7 @@ func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apity
 			if a.HoldID != h.ID {
 				continue
 			}
-			caps = append(caps, recoveryHoldCapture{
-				ID: a.ID, State: a.State, SourceSha: a.SourceSha, ByteSize: a.ByteSize, CreatedAt: a.CreatedAt,
-				Checksum: a.Checksum, PrerequisiteShas: a.PrerequisiteShas, ExpiresAt: a.ExpiresAt,
-				AttemptedHeadSha: a.AttemptedHeadSha, PrerequisiteClosure: a.PrerequisiteClosure,
-			})
+			caps = append(caps, captureJSONOf(a))
 		}
 		out = append(out, recoveryHoldJSON{recoveryOwnerHoldJSON: recoveryOwnerHoldJSON{RecoveryCustodyHoldDTO: h, TerminalRejection: terminalRejectionCopy(h), FailureReason: reasons[h.RunID]}, Captures: caps})
 	}
@@ -436,9 +555,13 @@ func unattributedCaptures(archives []apitypes.RecoveryArchiveDTO) int {
 // with its captures joined from archives; the human form prints one table row per hold with
 // its exact id, generation, disposition and capture state, plus a one-line hint when a hold
 // needs an owner decision.
+//
+// readOnly marks a view of another user's run (admin run debug): the export and discard hints
+// are suppressed because both stay owner-only.
 func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.RecoveryCustodyHoldDTO,
-	archives []apitypes.RecoveryArchiveDTO, reasons map[string]string) error {
+	archives []apitypes.RecoveryArchiveDTO, reasons map[string]string, readOnly bool) error {
 	p := env.printer(gf)
+	unattached := unattachedArchives(holds, archives)
 	if n := unattributedCaptures(archives); n > 0 {
 		// An older server sends no hold_id, so its captures join onto no hold.
 		// Warn in human and JSON modes, including quiet, and name the metadata-only
@@ -449,13 +572,24 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 	}
 	if p.Format == uzicli.FormatJSON {
 		// Never emit a null slice: an empty result is [] so a consuming agent iterates it.
-		return p.JSON(holdsWithCaptures(holds, archives, reasons))
+		out := make([]any, 0, len(holds)+1)
+		for _, h := range holdsWithCaptures(holds, archives, reasons) {
+			out = append(out, h)
+		}
+		if len(unattached) > 0 {
+			el := recoveryUnattachedJSON{RunID: runID, Unattached: true, Captures: make([]recoveryHoldCapture, 0, len(unattached))}
+			for _, a := range unattached {
+				el.Captures = append(el.Captures, captureJSONOf(a))
+			}
+			out = append(out, el)
+		}
+		return p.JSON(out)
 	}
 	if len(holds) == 0 {
 		if !gf.quiet {
 			p.Printf("run %s has no retained custody holds\n", cellText(runID))
 		}
-		return nil
+		return printUnattachedCaptures(p, gf, unattached)
 	}
 	rows := make([][]string, 0, len(holds))
 	decisionNeeded, exportable := 0, 0
@@ -512,7 +646,10 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 		}
 	}
 	printRecoveryFailureReasons(p, holds, reasons)
-	if !gf.quiet {
+	if err := printUnattachedCaptures(p, gf, unattached); err != nil {
+		return err
+	}
+	if !gf.quiet && !readOnly {
 		for _, h := range holds {
 			if line := sourceOnlyLine(h); line != "" {
 				p.Printf("%s\n", line)
@@ -521,6 +658,35 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 		printRecoveryHint(p, exportable, decisionNeeded, cellText(runID))
 	}
 	return nil
+}
+
+// printUnattachedCaptures prints the captures whose hold is not among the listed holds as a
+// table, or nothing when there are none. Every cell is server text and passes cellText.
+func printUnattachedCaptures(p *uzicli.Printer, gf *globalFlags, unattached []apitypes.RecoveryArchiveDTO) error {
+	if len(unattached) == 0 {
+		return nil
+	}
+	if !gf.quiet {
+		p.Printf("\ncaptures (no listed hold)\n")
+	}
+	rows := make([][]string, 0, len(unattached))
+	for _, a := range unattached {
+		size, expires := "-", "-"
+		if a.ByteSize != nil {
+			size = humanBytes(*a.ByteSize)
+		}
+		if a.ExpiresAt != nil {
+			expires = a.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		sha := cellText(shortSHA(strings.TrimSpace(a.SourceSha)))
+		if sha == "" {
+			sha = "-"
+		}
+		rows = append(rows, []string{
+			cellText(a.ID), cellText(a.State), sha, size, a.CreatedAt.UTC().Format(time.RFC3339), expires,
+		})
+	}
+	return p.Table([]string{"CAPTURE ID", "STATE", "SOURCE", "SIZE", "CREATED", "EXPIRES"}, rows)
 }
 
 // checkpointLine renders where a hold's retained published checkpoint lives on origin (PRD

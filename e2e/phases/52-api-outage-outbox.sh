@@ -1148,7 +1148,7 @@ while [ "$SECONDS" -lt "$F42_DEADLINE" ]; do
 done
 [ "$F42_CAPTURING" = 0 ] \
   || fail "case 8: a custody hold on run $RUN_F2 was still capturing after 60s: $F42_REC"
-[ "$(printf '%s' "$F42_REC" | jq -r 'length')" -gt 0 ] \
+[ "$(printf '%s' "$F42_REC" | jq -r '[.[] | select(.unattached != true)] | length')" -gt 0 ] \
   || fail "case 8: uzi run recovery lists no custody hold at all for the held run $RUN_F2"
 # Every OPEN hold is either an archive_ready one (with an available capture) or a source_only/needs_action one.
 F42_SILENT="$(printf '%s' "$F42_REC" | jq -r '[.[] | select(.state == "open" and (((.attention == "archive_ready") and (.has_available_capture // false)) or (.attention | IN("source_only", "needs_action")) | not)) | .id] | join(",")')"
@@ -1169,7 +1169,7 @@ for F42_ATT in $(printf '%s' "$F42_REC" | jq -r '[.[] | select(.state == "open")
     *) fail "case 8: the human recovery output for run $RUN_F2 has an open $F42_ATT hold but lacks '$F42_WANT': $F42_REC_TXT";;
   esac
 done
-pass "case 8: uzi run recovery on run $RUN_F2 shows no silent empty hold ($(printf '%s' "$F42_REC" | jq -r 'length') hold(s) listed)"
+pass "case 8: uzi run recovery on run $RUN_F2 shows no silent empty hold ($(printf '%s' "$F42_REC" | jq -r '[.[] | select(.unattached != true)] | length') hold(s) listed)"
 # End only this test-owned held run. Cancellation keeps its recovery evidence;
 # it also prevents a nonterminal fixture from leaking into later credential tests.
 apipost "/api/runs/$RUN_F2/inputs" '{"kind":"cancel","body":""}' >/dev/null

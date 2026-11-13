@@ -151,6 +151,8 @@ type adrdRoute struct {
 	auditKeys  func(f *adrdFixture) map[string]string
 	// ownerPath is the owner's own read of the same data (no audit).
 	ownerPath func(f *adrdFixture) string
+	// marker: the body carries admin_debug_read=true on a foreign read and never on the owner's.
+	marker bool
 }
 
 func adrdRoutes() []adrdRoute {
@@ -169,7 +171,7 @@ func adrdRoutes() []adrdRoute {
 					t.Errorf("inputs body lacks the owner's follow-up: %s", body)
 				}
 			},
-			auditRoute: "runs.inputs", auditKeys: runKeys,
+			auditRoute: "runs.inputs", auditKeys: runKeys, marker: true,
 		},
 		{
 			name: "archives", path: runPath("/archives"), ownerPath: runPath("/archives"),
@@ -179,7 +181,7 @@ func adrdRoutes() []adrdRoute {
 					t.Errorf("archives body lacks the owner's capture %s: %s", f.capture, body)
 				}
 			},
-			auditRoute: "runs.archives", auditKeys: runKeys,
+			auditRoute: "runs.archives", auditKeys: runKeys, marker: true,
 		},
 		{
 			name: "fetches", path: runPath("/fetches"), ownerPath: runPath("/fetches"),
@@ -270,6 +272,9 @@ func TestAdminRunDebugReadMatrixLiveDB(t *testing.T) {
 				t.Fatalf("admin_ro GET %s = %d, want 200\nbody: %s", path, rec.Code, rec.Body.String())
 			}
 			rt.check(t, f, rec.Body.String())
+			if got := strings.Contains(rec.Body.String(), `"admin_debug_read":true`); got != rt.marker {
+				t.Errorf("foreign read admin_debug_read:true present = %v, want %v: %s", got, rt.marker, rec.Body.String())
+			}
 			recs := audit.take(t)
 			if len(recs) != 1 {
 				t.Fatalf("authorized foreign read wrote %d audit records, want 1: %v", len(recs), recs)
@@ -292,6 +297,9 @@ func TestAdminRunDebugReadMatrixLiveDB(t *testing.T) {
 				t.Fatalf("owner GET %s = %d, want 200\nbody: %s", path, rec.Code, rec.Body.String())
 			}
 			rt.check(t, f, rec.Body.String())
+			if strings.Contains(rec.Body.String(), "admin_debug_read") {
+				t.Errorf("owner's own read carries admin_debug_read: %s", rec.Body.String())
+			}
 			if recs := audit.take(t); len(recs) != 0 {
 				t.Errorf("owner's own read wrote %d audit records, want 0: %v", len(recs), recs)
 			}

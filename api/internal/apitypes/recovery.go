@@ -73,6 +73,9 @@ type RecoveryArchiveSummaryDTO struct {
 	HasOpenHold bool                          `json:"has_open_hold"`
 	Counts      RecoveryArchiveStateCountsDTO `json:"counts"`
 	Archives    []RecoveryArchiveDTO          `json:"archives"`
+	// AdminDebugRead is true only on an admin run debug read of another user's run
+	// (issue #4198); omitted otherwise.
+	AdminDebugRead bool `json:"admin_debug_read,omitempty"`
 }
 
 // ── Worker-facing archive RPC (PRD #1296 M3 consumes; frozen here, D8) ────────────────

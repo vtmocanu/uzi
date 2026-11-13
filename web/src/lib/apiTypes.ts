@@ -4605,6 +4605,13 @@ export type RunSummaryItem = Omit<
   | "capability_provenance" | "lead_config" | "created_issues"
 >;
 
+/** The GET /api/runs/{id}/inputs response (Go RunInputsEnvelopeDTO, issue #4198): the steer
+ *  queue plus, only on an admin run debug read of another user's run, admin_debug_read=true. */
+export interface RunInputsEnvelope {
+  inputs: SteerInput[];
+  admin_debug_read?: boolean;
+}
+
 /** The GET /api/admin/runs?state=all response (Go AdminRunsDebugDTO, issue #4198 admin run
  *  debug listing): summary rows of every status, newest first. runs is always an array on the
  *  wire; truncated is true when more matching runs existed than the server's row cap. */
@@ -5905,6 +5912,8 @@ export interface RecoveryArchiveSummary {
   has_open_hold: boolean;
   counts: RecoveryArchiveStateCounts;
   archives: RecoveryArchive[];
+  /** True only on an admin run debug read of another user's run (issue #4198); omitted otherwise. */
+  admin_debug_read?: boolean;
 }
 
 // ── Owner-facing custody holds (PRD #1349 M1) ─────────────────────────────────

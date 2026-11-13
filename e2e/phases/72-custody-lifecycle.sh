@@ -283,7 +283,7 @@ done <<< "$HOLD_IDS_RAW"
 REC_JSON="$(uzi_cli run recovery "$WEDGE_RUN" --json)" || fail "uzi run recovery --json failed (exit $?)"
 WANT_IDS="$(printf '%s\n' "${HOLD_IDS[@]}" | jq -R . | jq -sc 'sort')"
 printf '%s' "$REC_JSON" | jq -e --argjson want "$WANT_IDS" \
-  'map({id, state}) | sort_by(.id) == ($want | map({id: ., state: "open"}))' >/dev/null \
+  'map(select(.unattached != true)) | map({id, state}) | sort_by(.id) == ($want | map({id: ., state: "open"}))' >/dev/null \
   || fail "uzi run recovery did not list exactly the $K open attached hold(s) on run $WEDGE_RUN (want $WANT_IDS; got $REC_JSON)"
 pass "owner CLI lists exactly the $K attached open hold(s) on run $WEDGE_RUN"
 

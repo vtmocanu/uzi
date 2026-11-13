@@ -1,0 +1,16 @@
+{
+  "inputs": [
+    {
+      "id": 1,
+      "kind": "x",
+      "body": "x",
+      "created_at": "2020-01-02T03:04:05Z",
+      "consumed_at": "2020-01-02T03:04:05Z",
+      "disposition": "x",
+      "applied_at": "2020-01-02T03:04:05Z",
+      "included_at": "2020-01-02T03:04:05Z",
+      "inclusion_reported": true
+    }
+  ],
+  "admin_debug_read": true
+}

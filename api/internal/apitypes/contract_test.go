@@ -77,6 +77,9 @@ func contractCases() []contractCase {
 		// Issue #4198: the admin run debug listing envelope; its runs slice is non-omitempty
 		// (the zero.json carries a null the handler normalizes to []).
 		newContractCase[AdminRunsDebugDTO]("admin_runs_debug"),
+		// Issue #4198: the run inputs envelope (GET /api/runs/{id}/inputs); inputs is
+		// non-omitempty (zero.json carries a null the handler normalizes to []).
+		newContractCase[RunInputsEnvelopeDTO]("run_inputs_envelope"),
 		newContractCase[CrossCheckHistoryDTO]("cross_check_history"),
 		newContractCase[CrossCheckHistoryAvailabilityDTO]("cross_check_history_availability"),
 		// M2 — the rest of the apitypes hot set.

@@ -96,6 +96,7 @@ import type {
   HeldPublication,
   HeldPublications,
   AdminRunsDebug,
+  RunInputsEnvelope,
   RecoveryCustodyHolds,
   GuardrailOverrideRequest,
   CodexAccountRateLimit,
@@ -246,6 +247,8 @@ import recoveryCustodyAggregateZero from "../../../fixtures/api-contract/recover
 import recoveryCustodyAggregateFull from "../../../fixtures/api-contract/recovery_custody_aggregate.full.json";
 import adminRunsDebugZero from "../../../fixtures/api-contract/admin_runs_debug.zero.json";
 import adminRunsDebugFull from "../../../fixtures/api-contract/admin_runs_debug.full.json";
+import runInputsEnvelopeZero from "../../../fixtures/api-contract/run_inputs_envelope.zero.json";
+import runInputsEnvelopeFull from "../../../fixtures/api-contract/run_inputs_envelope.full.json";
 import heldPublicationsZero from "../../../fixtures/api-contract/held_publications.zero.json";
 import heldPublicationsFull from "../../../fixtures/api-contract/held_publications.full.json";
 import recoveryCustodyHoldsZero from "../../../fixtures/api-contract/recovery_custody_holds.zero.json";
@@ -1631,6 +1634,19 @@ it("recovery held-publication fields match the Go contract and permit older serv
   void _adminRunsDebugExtra;
   void _adminRunsDebugZero;
   void _adminRunsDebugFull;
+}
+
+// ── RunInputsEnvelope (issue #4198) ──────────────────────────────────────────
+// inputs is non-omitempty, so zero.json carries a null the handler normalizes to [].
+{
+  const _runInputsMissing: never = null as unknown as Exclude<keyof RunInputsEnvelope, keyof typeof runInputsEnvelopeFull>;
+  const _runInputsExtra: never = null as unknown as Exclude<keyof typeof runInputsEnvelopeFull, keyof RunInputsEnvelope>;
+  const _runInputsZero: ZeroOf<RunInputsEnvelope, "inputs"> = runInputsEnvelopeZero;
+  const _runInputsFull: Widen<RunInputsEnvelope> = runInputsEnvelopeFull;
+  void _runInputsMissing;
+  void _runInputsExtra;
+  void _runInputsZero;
+  void _runInputsFull;
 }
 
 it("held publication rows carry exactly the Go key set", () => {

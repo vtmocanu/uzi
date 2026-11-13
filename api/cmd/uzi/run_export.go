@@ -33,7 +33,7 @@ func newRunExportCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Download a run's durable-recovery archive to a local file",
 		Long: "Download the durable-recovery archive (a Git bundle of the run's original committed " +
 			"history) captured when the run failed to publish, and write it to --output.\n\n" +
-			"Owner-only: you can export only your own runs. When more than one archive is available " +
+			"Owner-only: you can export only your own runs; an admin run debug read of another user's run (server flag UZI_ADMIN_RUN_DEBUG, read-only, audited) is metadata-only and export is refused. When more than one archive is available " +
 			"you must choose one with --capture <id>; export never silently picks an attempt. The " +
 			"download's byte count and checksum are verified against the server manifest before the " +
 			"file is published, and the destination is never overwritten (an existing file or symlink " +
@@ -61,6 +61,11 @@ func newRunExportCmd(env Env, gf *globalFlags) *cobra.Command {
 			summary, err := c.RecoveryArchives(cmd.Context(), runID)
 			if err != nil {
 				return err
+			}
+			// Admin run debug serves another user's archive METADATA only: refuse before any
+			// download rather than lean on the download route's own 404.
+			if summary.AdminDebugRead {
+				return uzicli.Exitf(uzicli.ExitNotFound, "run export of another user's run is refused: admin run debug is metadata-only; captures stay owner-only")
 			}
 			chosen, err := selectExportCapture(runID, summary, captureID)
 			var choice *captureChoiceError
@@ -365,6 +370,10 @@ func renderLandingHint(env Env, gf *globalFlags, run apitypes.RunDTO, summary ap
 		return
 	}
 	switch {
+	case hasAvailableArchive(summary) && summary.AdminDebugRead:
+		// Another user's run read under admin run debug: the archive is metadata-only here, so
+		// never suggest the export the server would refuse.
+		p.Printf("\nthis failed run has a recovery archive, but it belongs to another user: export is owner-only and admin run debug is metadata-only\n")
 	case hasAvailableArchive(summary):
 		// `uzi run export <run-id>` auto-selects a SOLE available capture, but refuses to guess
 		// between several — name a concrete `--capture <id>` then so the hint is a runnable

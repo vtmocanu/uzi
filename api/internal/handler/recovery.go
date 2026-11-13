@@ -389,6 +389,7 @@ func (h *Handler) ListRecoveryArchives(w http.ResponseWriter, r *http.Request) {
 	}
 	if debug {
 		auditRunDebugRead(r, debugActor, debugToken, adminRunDebugRouteArchives, runID, ownerID)
+		summary.AdminDebugRead = true
 	}
 	httpx.JSON(w, http.StatusOK, summary)
 }

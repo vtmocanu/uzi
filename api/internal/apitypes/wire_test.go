@@ -1414,6 +1414,14 @@ func TestRecoveryArchiveSummaryDTOTags(t *testing.T) {
 		"preparing", "uploading", "available", "needs_action", "expired", "discarded")
 	assertTags(t, "RecoveryArchiveSummaryDTO", RecoveryArchiveSummaryDTO{},
 		"supported", "legacy", "has_open_hold", "counts", "archives")
+	// admin_debug_read is omitempty (issue #4198): present only on an admin run debug read.
+	assertTags(t, "RecoveryArchiveSummaryDTO(admin debug)", RecoveryArchiveSummaryDTO{AdminDebugRead: true},
+		"supported", "legacy", "has_open_hold", "counts", "archives", "admin_debug_read")
+}
+
+func TestRunInputsEnvelopeDTOTags(t *testing.T) {
+	assertTags(t, "RunInputsEnvelopeDTO", RunInputsEnvelopeDTO{}, "inputs")
+	assertTags(t, "RunInputsEnvelopeDTO(admin debug)", RunInputsEnvelopeDTO{AdminDebugRead: true}, "inputs", "admin_debug_read")
 }
 
 // The worker-facing archive RPC shapes (M3 consumes; mirrored in agent/src/protocol.ts).
