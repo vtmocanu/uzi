@@ -212,8 +212,8 @@ backoff and single-flight state.
   and Docker wiring. On the worker an absent
   `UZI_DIND_BUILDER_PRUNE_ENABLED` means on, exactly `true` means on, and
   anything else means off. The controller reads
-  `UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED` (default true; an invalid value is a
-  boot error). The chart value is `workers.dindBuilderPruneEnabled: true`, a
+  `UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED` (default true; unset or blank is true, Go booleans such as
+  `true`/`false`/`1`/`0`/`t`/`f` are accepted, anything else is a boot error). The chart value is `workers.dindBuilderPruneEnabled: true`, a
   strict boolean. It is rendered on Docker workers only, always explicit, and
   is `"true"` iff enabled and the worker is not ephemeral.
 - **Opt-outs.** `workers.dindBuilderPruneEnabled: false` disables this leg
@@ -242,13 +242,14 @@ backoff and single-flight state.
   best-effort total-cache performance target, not a bound, and neither the
   24 hour floor nor the cap is a preservation authority.
 - **Limits.** Below 4 GiB of total cache the prune is a no-op. ADR-1759's
-  sample of three hosted workers (recorded 2026-10-31) showed 0 to 0.84 GB of build cache each
+  sample of three hosted workers (taken 2026-10-30, recorded 2026-10-31) showed 0 to 0.84 GB of build cache each
   ([ADR-1759](../adr/1759-dind-data-metering-and-prune.md#owner-decision--3653-parked-2026-10-31)),
   where this leg would free nothing. The #4291 measurement was one hosted
   worker at 86% with 18.03 GB of build cache in 104 records, none active; a
   manual size-bounded prune freed 14.91 GB. The real 24 hour floor and usage
   above 4 GiB were only exercised in scaled form, and the legacy graphdriver
-  store was not tested.
+  store was not tested. Relief on a hosted worker under real pressure is not
+  yet verified; that acceptance is maintainer-owned after deploy.
 - **Child process.** The environment is the shared Docker exec environment
   plus `DOCKER_BUILDKIT=1`. With that pin a missing or broken buildx fails hard;
   unpinned, the client falls back to the legacy builder, which the harness

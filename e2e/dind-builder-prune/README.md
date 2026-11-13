@@ -15,7 +15,7 @@ docker builder prune -f --filter type=regular --filter until=24h --max-used-spac
 
 It is separate from the component gates (`task gate`) and from CI. It starts owned throwaway
 DinD daemons. Measured on the gate run: about 230 s per posture and about 460 s in total (rootful
-230 s, rootless 227 s; the red A run takes 102 s), under a 1500-second overall deadline.
+230 s, rootless 227 s; the red A run takes about 100 s), under a 1500-second overall deadline.
 
 If a run is killed, reap its containers by hand: `docker ps -a --filter label=dbp-test.owner`, then
 `docker rm -fv <exact name>` after checking each container's `dbp-test.owner` label is yours.

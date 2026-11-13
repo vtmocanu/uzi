@@ -9,7 +9,7 @@
 
 ## Decision (summary)
 
-A docker-tier hosted worker now gets a second, unprivileged native sidecar, `dind-meter`, that mounts the `dind-data` PVC **read-only** and publishes a periodic statfs sample (bytes + inodes) for the worker to read and display as a "Disk dind" gauge. The worker itself never mounts `dind-data`. Separately, the worker watches that sample and, only when the volume is under sustained pressure, it is provably idle, and the api's heartbeat confirms it holds no unpublished work, runs a short allowlisted sequence of `docker image prune`/`docker builder prune` commands against the daemon. The legacy `disk_pressure` boolean remains `/nix`+`/data`-only. Separate per-volume wire flags now drive a DinD-only pressure-recycle arm under the stricter terminal-run maintenance gate (D7-D9), including optional anonymous-volume pruning. One exception (#3891, AI-synced 2026-11-04): a separate pressure-only leg runs the same frozen `docker volume prune -f` on a busy or custody-held non-ephemeral worker without closing the claim gate and without waiting for idle, terminal runs or custody (D8, "Exception — #3891"). The terminal/custody gates stay mandatory for PVC recycle, maintenance and everything else. A second exception (#4291, AI-synced 2026-11-13) adds a separate pressure-only leg that runs the frozen `docker builder prune -f --filter type=regular --filter until=24h --max-used-space 4GiB` on busy or custody-held non-ephemeral workers, also without touching the claim gate (D8, "Exception — #4291").
+A docker-tier hosted worker now gets a second, unprivileged native sidecar, `dind-meter`, that mounts the `dind-data` PVC **read-only** and publishes a periodic statfs sample (bytes + inodes) for the worker to read and display as a "Disk dind" gauge. The worker itself never mounts `dind-data`. Separately, the worker watches that sample and, only when the volume is under sustained pressure, it is provably idle, and the api's heartbeat confirms it holds no unpublished work, runs a short allowlisted sequence of `docker image prune`/`docker builder prune` commands against the daemon. The legacy `disk_pressure` boolean remains `/nix`+`/data`-only. Separate per-volume wire flags now drive a DinD-only pressure-recycle arm under the stricter terminal-run maintenance gate (D7-D9), including optional anonymous-volume pruning. Two pressure-only exceptions. The first (#3891, AI-synced 2026-11-04): a separate pressure-only leg runs the same frozen `docker volume prune -f` on a busy or custody-held non-ephemeral worker without closing the claim gate and without waiting for idle, terminal runs or custody (D8, "Exception — #3891"). The terminal/custody gates stay mandatory for PVC recycle, maintenance and everything else except these two legs. The second (#4291, AI-synced 2026-11-13) adds a separate pressure-only leg that runs the frozen `docker builder prune -f --filter type=regular --filter until=24h --max-used-space 4GiB` on busy or custody-held non-ephemeral workers, also without touching the claim gate (D8, "Exception — #4291").
 
 ## Context (original #1759 scope)
 
@@ -228,12 +228,16 @@ BuildKit cache can fill the data root even though the anonymous-volume leg
 loop, streak, backoff and single-flight state) trims unused regular build cache
 under sustained pressure on those workers.
 
-**Supersession, for this leg only.** This decision supersedes, for this leg only,
-the "Owner decision — #3653 parked (2026-10-31)" clause below that a revisit
-would still refuse unknown or stale custody. This leg never consults custody.
-Everything else in that section stands: the idle cache prune, image prunes, D5,
-the terminal-only maintenance gate and #2257 recycle keep their custody and
-terminal gates, and no image or volume prune is added.
+**Supersession, for this leg only.** For this leg only, the owner decision of
+2026-11-13 supersedes four parts of the "Owner decision — #3653 parked
+(2026-10-31)" section below: the custody clause (unknown or stale custody is
+still refused), the "every existing exclusion stays" clause, the revisit
+trigger's admission gates (no tracked execution, no running container, claims
+drained, fresh known custody), and the "not justified" conclusion. The leg
+checks none of these; it reads only the maintenance hold
+(`gate.heldBy("maintenance")`). What stays unchanged: the idle cache prune and
+its D5 custody gate, the image prunes, terminal maintenance (#2257), PVC recycle
+and the #3891 leg. No image or volume prune is added.
 
 - **Owner boundary.** The standard is "no worse than a fresh worker": the same
   preserved Git and capture inputs, with an empty ordinary build cache.
@@ -310,12 +314,14 @@ terminal gates, and no image or volume prune is added.
     v0.38.1), about 230 s per posture. Pressure went 89.7% to 22.3%. Red A
     (switch off): no relief, 88.5% to 88.5%.
 - **Limits.** Records sharing snapshots with a local image ("Shared") are never
-  pruned. Below 4 GiB of total cache the prune is a no-op: the 2026-10-31 sample
+  pruned. Below 4 GiB of total cache the prune is a no-op: the 2026-10-30 sample
   below showed 0 to 0.84 GB per worker, where this leg would free nothing. The
   #4291 measurement was one hosted worker at 86% with 18.03 GB of build cache in
   104 records, none active; a manual size-bounded prune freed 14.91 GB. The real
   24 hour floor and usage above 4 GiB were only exercised in scaled form. The
-  legacy graphdriver store was not tested.
+  legacy graphdriver store was not tested. Relief on a hosted worker under real
+  pressure is not yet verified; that acceptance is maintainer-owned after
+  deploy.
 
 ### D9 — Fresh bounded observation and replacement readiness
 
@@ -352,7 +358,7 @@ No new kind/SDK production E2E or paused-recycled-resumed result is claimed.
 
 - `dind-data` has a gauge and three reclaim paths: the original bounded cache prune, the stricter terminal-only maintenance path, and (#3891, AI-synced 2026-11-04) the pressure-only anonymous-volume leg that runs on busy or custody-held workers (D8, "Exception — #3891"). Maintenance may delete the entire DinD PVC, while preserving `/nix`, `/data`, worker UUID and join Secret; Deployment replacement keeps `/data/runner` (ADR-3153).
 - (AI-synced 2026-11-13, #4291) `dind-data` has a **fourth** reclaim path: the pressure-only builder-cache leg for unused regular build cache on busy or custody-held non-ephemeral workers, with no claim-gate, idle or custody gate (D8, "Exception — #4291"). It is separate from the idle cache prune, rides the master flag plus its own `workers.dindBuilderPruneEnabled`, and accepts ordinary regular build-cache misses ("no worse than a fresh worker").
-- **Residual: in the non-rootless posture, node root (an accepted residual of `prds/done/89-optional-nonrootless-dind.md`) can write the meter emptyDir's node-side backing directory, so it can, in principle, forge the meter's sample.** Mount-namespace separation only keeps the daemon's own mount namespace, and any container it runs, from reaching that file directly; it does not bound node root itself. What bounds the damage is the reader's strict validation (D2), D4's frozen allowlist, and D5's idle/custody gate together: a forged sample cannot bypass the strict maintenance gate; it can affect maintenance intent as well as the original cache-prune sequence. This is not a guarantee that forged pressure cannot cause scratch loss once the gate is satisfied. The #3891 leg is the exception to that gate: a forged sample can trigger an anonymous-volume prune without it, bounded to about one prune per ~90s under forged oscillation and one per hour after an `unknown` outcome (D2), with no privilege gained.
+- **Residual: in the non-rootless posture, node root (an accepted residual of `prds/done/89-optional-nonrootless-dind.md`) can write the meter emptyDir's node-side backing directory, so it can, in principle, forge the meter's sample.** Mount-namespace separation only keeps the daemon's own mount namespace, and any container it runs, from reaching that file directly; it does not bound node root itself. What bounds the damage is the reader's strict validation (D2), D4's frozen allowlist, and D5's idle/custody gate together: a forged sample cannot bypass the strict maintenance gate; it can affect maintenance intent as well as the original cache-prune sequence. This is not a guarantee that forged pressure cannot cause scratch loss once the gate is satisfied. The #3891 and #4291 legs are the exceptions to that gate: a forged sample can trigger an anonymous-volume prune (#3891) or a size-bounded regular builder-cache prune (#4291) without it, bounded to about one prune per ~90s under forged oscillation and one per hour after an `unknown` outcome (D2), with no privilege gained.
 - **Residual: docker compose has no equivalent meter or automatic prune.** A compose docker worker's `dinddata` volume is reclaimed only by the existing manual path (`docker compose down -v`, or `docker volume rm`).
 - **Residual: a filesystem reporting zero total inodes yields no valid sample** — btrfs commonly reports `files=0` this way — since the reader's statfs-relation check requires `files > 0`; the gauge and the prune both silently degrade to "no sample" there (no sample, no prune, no gauge), not a crash or a false trigger.
 - **Destructive default on upgrade**: #1760 adds automated DinD-only recycling for eligible persistent hosted Docker workers. Named volumes are not preserved (`/data/runner` is kept since ADR-3153); store deliverables in git/checkpoints/capture. Operators must explicitly opt out before stop with `UZI_WORKER_DISK_RECYCLE_ENABLED=false`; a stop already started finishes safely even if disabled.
@@ -565,9 +571,9 @@ neither busy-worker reclaim nor hosted reclaimed bytes.
 
 ## Owner decision — #3653 parked (2026-10-31)
 
-The maintainer kept D5's custody gate unchanged and parked #3653 (label `Later`). No builder-only exception was approved, and runtime behavior is unchanged.
+The maintainer kept D5's custody gate unchanged and parked #3653 (label `Later`). No builder-only exception was approved, and runtime behavior was unchanged when this was recorded.
 
-(AI-synced 2026-11-13, #4291) Revisited: an owner decision on 2026-11-13 approved a separate pressure-only builder-cache leg that does not consult custody, superseding the "unknown or stale custody is still refused" clause below for that leg only. See D8, "Exception — #4291". The rest of this section, including the sample and the facts below, is kept as the historical record.
+(AI-synced 2026-11-13, #4291) Revisited: an owner decision on 2026-11-13 approved a separate pressure-only builder-cache leg that does not consult custody. For that leg only it supersedes the custody clause, the "every existing exclusion stays" clause, the revisit trigger's admission gates and the "not justified" conclusion below; the idle cache prune and its D5 gate, image prunes, #2257 maintenance, PVC recycle and the #3891 leg are unchanged. See D8, "Exception — #4291". The rest of this section, including the sample and the facts below, is kept as the historical record.
 
 Why: a read-only sample of three persistent hosted docker-lane workers (2026-10-30, `docker system df` categories, which are not additive unique bytes) reported:
 
