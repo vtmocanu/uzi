@@ -2041,7 +2041,8 @@ function launchClock(t: any) {
   const realNow = Date.now.bind(Date);
   const realTimer = globalThis.setTimeout;
   let skew = 0, armed = false, expires: Array<() => void> = [];
-  const dateMock = t.mock.method(Date, "now", () => realNow() + skew);
+  let frozen: number | undefined;
+  const dateMock = t.mock.method(Date, "now", () => frozen ?? realNow() + skew);
   const timerMock = t.mock.method(globalThis, "setTimeout", (callback: () => void, delay?: number, ...rest: unknown[]) => {
     // Every deadline-window timer is captured in arm order: index 0 is the round's outer operation, index 1
     // the nested recovery operation the restriction-facts bootstrap opens for the same deadline.
@@ -2053,6 +2054,8 @@ function launchClock(t: any) {
      *  one; a caller that builds more than one clock in a test restores LIFO here instead. */
     restore: () => { timerMock.mock.restore(); dateMock.mock.restore(); },
     arm: () => { armed = true; expires = []; },
+    /** Pins Date.now to an absolute value (until restore), so real elapsed time cannot move it. */
+    freeze: (at: number) => { frozen = at; },
     /** elapsed=true advances the clock past the deadline first (a real expiry); false is an early notification.
      *  `nth` picks the captured timer: 0 the outer operation (default), 1 the nested one. */
     fire: (elapsed: boolean, nth = 0) => {
@@ -2288,7 +2291,9 @@ function applyStop(runner: RunRunner, flight: any, stop: DirectStop): void {
  */
 async function directLaunch(t: any, f: Awaited<ReturnType<typeof fixture>>, opts: {
   at: "facts" | "restore";
-  expiry?: "elapsed" | "early" | "none";
+  /** "just-before" freezes Date.now at the live round's deadlineAt - 10 (inside the former 20 ms slack
+   *  window, before the deadline) and then fires the round's own operation timer. */
+  expiry?: "elapsed" | "early" | "just-before" | "none";
   during?: (flight: any, runner: RunRunner) => void;
   afterFirstFailure?: (flight: any, runner: RunRunner) => void;
   preset?: (flight: any) => void;
@@ -2314,7 +2319,7 @@ async function directLaunch(t: any, f: Awaited<ReturnType<typeof fixture>>, opts
   const budget = new MaintenanceBudget(1000, () => wall);
   const method = opts.at === "facts" ? "readRemediationRestrictionFacts" : "readRuntimeRemediationRecovery";
   const orig = (cache[method] as (...args: any[]) => Promise<any>).bind(cache);
-  let captured: any;
+  let captured: any, liveRound: any, frozenAt: number | undefined;
   if (opts.lateUnavailable) {
     const withProgress = (cache as any).withRemediationRestrictionProgress.bind(cache);
     t.mock.method(cache as any, "withRemediationRestrictionProgress", (progress: any, action: any) => {
@@ -2334,7 +2339,12 @@ async function directLaunch(t: any, f: Awaited<ReturnType<typeof fixture>>, opts
       setImmediate(() => {
         opts.during?.(flight, runner);
         if (opts.budget) { wall = 5000; try { budget.check(); } catch { /* the abort is the point */ } }
-        if (opts.expiry !== "none" && !opts.budget) clock.fire((opts.expiry ?? "elapsed") === "elapsed");
+        if (opts.expiry === "just-before") {
+          assert.equal(typeof liveRound?.deadlineAt, "number", "the live round recorded its deadline");
+          frozenAt = liveRound.deadlineAt - 10;
+          clock.freeze(frozenAt!);
+          clock.fire(false);
+        } else if (opts.expiry !== "none" && !opts.budget) clock.fire((opts.expiry ?? "elapsed") === "elapsed");
       });
     }
     return orig(...args);
@@ -2344,6 +2354,7 @@ async function directLaunch(t: any, f: Awaited<ReturnType<typeof fixture>>, opts
   let firstError: unknown;
   t.mock.method(subject, "requireLaunchAuthority", async (...args: unknown[]) => {
     rounds++; clock.arm();
+    if (rounds === 1) liveRound = args[1];
     try { return await round(...args); }
     catch (error) {
       if (rounds === 1) {
@@ -2360,7 +2371,8 @@ async function directLaunch(t: any, f: Awaited<ReturnType<typeof fixture>>, opts
     await (opts.budget ? MaintenanceBudget.run(budget, run) : run());
   } catch (e) { error = e; }
   finally { release.release(); await holder; subject.codexBoundaryDeadlineMs = 5000; clock.restore(); }
-  return { error, firstError, rounds, flight, runner, subject, cache, diagnostics: abortLines(diagnostics), all: diagnostics };
+  return { error, firstError, rounds, flight, runner, subject, cache, diagnostics: abortLines(diagnostics), all: diagnostics,
+    deadlineAt: liveRound?.deadlineAt as number | undefined, frozenAt };
 }
 
 const ORIGINAL = { facts: /remediation restriction facts unavailable/, restore: /lock wait aborted/ };
@@ -2562,6 +2574,23 @@ for (const at of ["facts", "restore"] as const) {
       assert.ok(r.error);
       assert.match(String(r.error.message), ORIGINAL[at]);
       assert.equal(r.rounds, 1);
+      assert.equal(r.flight.launchLockRetries, undefined);
+      assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [[at === "facts" ? "restriction_facts" : "runtime_restore", "unknown"]]);
+    } finally { r.runner.shutdown(); }
+  });
+
+  // Pins the exact deadline predicate: an own-timer abort observed 10 ms before the round's deadline (inside
+  // the window a former 20 ms tolerance accepted) is unknown and fails closed, never retried.
+  test("#4246 an abort 10 ms before the round's deadline is unknown and not retried (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, expiry: "just-before" });
+    try {
+      assert.equal(typeof r.deadlineAt, "number");
+      assert.equal(r.frozenAt, r.deadlineAt! - 10, "Date.now frozen at the live round's deadline - 10");
+      assert.ok(r.frozenAt! < r.deadlineAt! && r.frozenAt! >= r.deadlineAt! - 20, "inside the former slack window");
+      assert.ok(r.error);
+      assert.match(String(r.error.message), ORIGINAL[at]);
+      assert.equal(r.rounds, 1, "no fresh round");
       assert.equal(r.flight.launchLockRetries, undefined);
       assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [[at === "facts" ? "restriction_facts" : "runtime_restore", "unknown"]]);
     } finally { r.runner.shutdown(); }

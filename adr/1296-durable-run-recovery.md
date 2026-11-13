@@ -1242,12 +1242,12 @@ actually ran under (`LaunchRound.lockScope`) aborted with
 not `predecessorCapture`; and the latch is clearable. For the restriction
 facts, `lockScope` is the bootstrap's nested recovery operation, whose
 deadline is clamped to the round's; for the runtime restore it is the round
-scope. The deadline check tolerates 20 ms of timer skew
-(`LAUNCH_DEADLINE_TIMER_SLACK_MS`), because Node timers can fire a few ms
-before wall-clock `Date.now()` reaches the deadline. This replaces an earlier
-check that allowed no slack and tested the outer scope only; it misclassified
-about a quarter of real expiries, when the nested timer fired before the outer
-one.
+scope. The deadline check is exact: `Date.now() >= deadlineAt` for the
+round's own deadline, with no tolerance. An abort observed while `Date.now()`
+is still short of that deadline (an enclosing deadline firing first, or an
+early notification) is classified unknown and fails closed. This replaces an
+earlier check that tested the outer scope only; it misclassified about a
+quarter of real expiries, when the nested timer fired before the outer one.
 
 A known control stop surfaces its own control to `dispatchFailure` through
 `launchControl`, instead of the lock-read failure it cut short. The known

@@ -1483,10 +1483,6 @@ type LaunchRound = {
   lockWait?: "restriction_facts" | "runtime_restore";
 };
 
-/** Node timers run on the monotonic clock and can fire a few ms before wall-clock Date.now reaches the
- *  deadline they were armed for. withLaunchLockRetry tolerates that much skew when classing a deadline abort. */
-const LAUNCH_DEADLINE_TIMER_SLACK_MS = 20;
-
 /** Message of the lock-wait abort in git.ts (GIT_LOCK_WAIT_ABORT_MESSAGE, not exported). */
 const RETAINED_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
 const RETAINED_DEADLINE_TEXT = "recovery deadline exhausted";
@@ -4288,8 +4284,8 @@ export class RunRunner {
    * new clock) within a per-claim allowance. A recognised owner/lifecycle stop surfaces its own control
    * through launchControl; only an unknown stop or another failure rethrows the original error. "Its own
    * deadline" means the scope the labelled wait ran under (round.lockScope) aborted with
-   * RecoveryDeadlineExhaustedError, with Date.now() within LAUNCH_DEADLINE_TIMER_SLACK_MS of the deadline
-   * (a monotonic timer can fire slightly before wall-clock time reaches it). The allowance is shared by
+   * RecoveryDeadlineExhaustedError and Date.now() has reached the round's deadline; an abort before then
+   * (an enclosing deadline, an early notification) is unknown and fails closed. The allowance is shared by
    * every call site and separate from retainedDiscoveryRetries.
    */
   private async withLaunchLockRetry<T>(flight: RunFlight, run: (round: LaunchRound) => Promise<T>): Promise<T> {
@@ -4312,7 +4308,7 @@ export class RunRunner {
         // Only a scope that actually aborted with RecoveryDeadlineExhaustedError qualifies, and that error is
         // raised only by the deadline timer and the `Date.now() >= deadline` pre-checks.
         const cls = stop ?? (round.deadlineAt !== undefined &&
-          Date.now() >= round.deadlineAt - LAUNCH_DEADLINE_TIMER_SLACK_MS &&
+          Date.now() >= round.deadlineAt &&
           round.lockScope?.aborted === true && round.lockScope.reason instanceof RecoveryDeadlineExhaustedError
           ? "deadline" : "unknown");
         try {
