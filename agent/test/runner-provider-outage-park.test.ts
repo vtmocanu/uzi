@@ -178,7 +178,7 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
     r.publishCheckpointBestEffort = (...a: unknown[]) => { hook(); return publish(...a); };
   }
   if (harness === "codex" && scenario.failReap) {
-    const settle =runner["settleCaptureRequest"].bind(runner);
+    const settle = runner["settleCaptureRequest"].bind(runner);
     runner["settleCaptureRequest"] = async (...args) => {
       await settle(...args);
       const held = args[1];
@@ -1333,15 +1333,22 @@ describe("3630 retained stop leaves the heartbeat snapshot", () => {
         error: () => new TransientRecoveryError("idle", { idleStallKind: "productive" }),
         duringTurn: () => { hasDuringTurn = activeRuns.has(claim.run_id); listedDuringTurn = listed(activeRuns, claim.run_id); },
       }, home);
-      let posts = 0;
+      let posts = 0, firstPostAt: number | undefined;
       const stop = api.dropStatesWhen(claim.run_id, body => body.recovery_cause === "codex_idle_stall" && ++posts > 1);
+      api.onState(claim.run_id, body => { if (body.recovery_cause === "codex_idle_stall") firstPostAt ??= clock.now(); });
       api.afterPersistState(claim.run_id, body => body.recovery_cause === "codex_idle_stall", "drop");
       t.mock.method(rig.runner as unknown as { waitRecoveryRetry: () => Promise<void> }, "waitRecoveryRetry",
-        async () => { clock.advance(240_000); });
+        async () => { clock.advance(130_000); });
       try { await rig.runner.execute(claim); } finally { stop(); }
 
       assert.equal(hasDuringTurn, true, "control: the run is registered during its turn");
       assert.equal(listedDuringTurn, true, "control: the heartbeat snapshot lists the run during its turn");
+      // The retry loop ends because the held capture's healthy deadline (120s) passes, NOT because the
+      // episode deadline (180s) does: the join must reach its dispositionStarted arm, never the
+      // expired-episode arm.
+      assert.ok(firstPostAt !== undefined);
+      const sinceEpisode = clock.now() - firstPostAt!;
+      assert.ok(sinceEpisode > 120_000 && sinceEpisode < 180_000, `episode still unexpired at the join (${sinceEpisode}ms)`);
       assert.equal(posts, 3, "one logical park disposition, retained by every bounded client attempt");
       assert.equal(parks(claim.run_id).length, 1, "at most one applied park");
       assert.equal(activeRuns.has(claim.run_id), false);
