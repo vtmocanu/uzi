@@ -2975,7 +2975,8 @@ its container restarts, see
 
 A [hibernated](hosted-workers.md#hibernation) hosted worker shows `hibernating`,
 `hibernated` or `waking` as its status in `uzi worker list` and
-`uzi admin workers`; a wake not confirmed in time shows `(wake error)` after it.
+`uzi admin workers`; a wake not confirmed in time shows `(wake error)` after it, and a manual
+cordon keeps its ` · cordoned (manual)` marker after the state.
 `--json` carries `hibernation_state`, `hibernation_reason`, `hibernated_at`,
 `wake_requested_at` and `wake_error`. `uzi tui` shows the state too. There is no
 write verb: hibernating and waking are web-only admin actions.

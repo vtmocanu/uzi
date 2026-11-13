@@ -501,7 +501,8 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 // Worker hibernation (PRD #4205) takes precedence over everything above: a worker whose
 // hibernation_state is not "none" reads `hibernating` (preparing), `hibernated` or `waking`
 // (plus ` (wake error)` when a wake past its timeout failed), never offline, cordoned or
-// outdated. The wake_error text itself is never put in a table cell.
+// outdated. The manual-cordon marker is the one exception: it is kept after the hibernation
+// label (`hibernated · cordoned (manual)`). The wake_error text itself is never put in a table cell.
 func statusCell(w apitypes.WorkerDTO) string {
 	if h := hibernationLabel(w); h != "" {
 		// The manual cordon is an operator decision that outlives the hibernation label, so it

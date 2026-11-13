@@ -52,6 +52,7 @@ type fakeStore struct {
 	capacityRows           []store.ListOwnersWaitingNoCapacityRow
 	capacityErr            error
 	capacityQueries        atomic.Int32
+	capacityParams         []store.ListOwnersWaitingNoCapacityParams
 	waitingQueries         atomic.Int32
 	waitingRows            []store.ListWaitingWorkerRunsRow
 	waitingErr             error
@@ -106,7 +107,8 @@ func (f *fakeStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, 
 	f.workerQueries.Add(1)
 	return f.workers, f.workersErr
 }
-func (f *fakeStore) ListOwnersWaitingNoCapacity(context.Context, store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
+func (f *fakeStore) ListOwnersWaitingNoCapacity(_ context.Context, arg store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
+	f.capacityParams = append(f.capacityParams, arg)
 	f.capacityQueries.Add(1)
 	return f.capacityRows, f.capacityErr
 }

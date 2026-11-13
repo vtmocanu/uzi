@@ -138,7 +138,8 @@ const (
 	reasonMaintenance = "waiting: uzi is in maintenance mode"
 	// reasonWakingFromHibernation (PRD #4205 M6) is emitted for a queued run whose recorded wake
 	// (hibernation_wakes) names a worker that is waking and has not failed its wake. It is an
-	// expected, transient wait mapped to the healthWaitingWorker enum like its siblings, so it never
+	// expected, transient wait mapped to the healthWaitingWorker enum like its siblings, with its
+	// per-run Slack nudge suppressed (the state is still written and broadcast), so it never
 	// escalates by itself: once the sweeper stamps wake_error (the wake outlived WorkerWakeTimeout)
 	// the run falls through to the ordinary queued reasons. Fixed string, no worker name.
 	reasonWakingFromHibernation = "your worker is waking from hibernation"
@@ -584,6 +585,11 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// PRD #3522 M3: the weekly usage reserve is the owner's own deliberate limit, not a stuck
 		// run; a worker-pickup nudge would say the opposite of the truth. State still written below.
 		if isReserveHoldReason(reason) {
+			nudge = false
+		}
+		// PRD #4205 M6: a wake of the owner's hibernated worker is an expected, transient wait
+		// (the sweeper fails it past WorkerWakeTimeout); a worker-pickup nudge per queued run is noise.
+		if reason == reasonWakingFromHibernation {
 			nudge = false
 		}
 		// Issues #2705/#3000: both owner-hold reasons are expected waiting; a worker-pickup

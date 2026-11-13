@@ -35,6 +35,8 @@ type healthFakeStore struct {
 	ownerCalls []uuid.UUID
 	// onlineErr forces CountOnlineWorkersForUser to fail.
 	onlineErr error
+	// wakingRuns answers RunHasWakingHibernationWake (PRD #4205 M6) by run id.
+	wakingRuns map[uuid.UUID]bool
 
 	Store
 	liveCrossCheck              map[uuid.UUID]bool
@@ -1303,6 +1305,10 @@ func TestHealthQueuedReasonChangeRewrites(t *testing.T) {
 	if !w.HealthSince.Valid || !w.HealthSince.Time.Equal(original.Time) {
 		t.Fatalf("health_since = %v, want the preserved original %v (a reason-only change must not reset it)", w.HealthSince, original)
 	}
+}
+
+func (f *healthFakeStore) RunHasWakingHibernationWake(_ context.Context, id uuid.UUID) (bool, error) {
+	return f.wakingRuns[id], nil
 }
 
 // stalledRunRow is a running run that will flag stalled (silent 10m, well under the

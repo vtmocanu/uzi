@@ -1,6 +1,7 @@
 package healthsvc
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -76,4 +77,20 @@ func TestFleetHibernationWake(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestFleetCapacityPassesWakeTimeout pins the wiring of the transient-wake window: the capacity
+// query must receive workersvc.WorkerWakeTimeout as a valid interval, else a stale wake would
+// never expire out of the "waking" exemption.
+func TestFleetCapacityPassesWakeTimeout(t *testing.T) {
+	f := &fakeStore{}
+	svc := newSvc(f, &fakeSettings{})
+	svc.checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled)
+	if len(f.capacityParams) != 1 {
+		t.Fatalf("ListOwnersWaitingNoCapacity calls = %d, want 1", len(f.capacityParams))
+	}
+	got := f.capacityParams[0].WakeTimeout
+	if !got.Valid || got.Microseconds != workersvc.WorkerWakeTimeout.Microseconds() {
+		t.Fatalf("WakeTimeout = %+v, want valid %v", got, workersvc.WorkerWakeTimeout)
+	}
 }
