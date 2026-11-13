@@ -97,11 +97,16 @@
 # (read from the authenticated edit history, never the live body) or a head review object
 # when comments were added, bound to that run (lib/greptile-verdict.sh, greptile_paired_verdict).
 # The script errs toward timeout (exit 2) rather than a false "ready".
+# GitHub quota handback (all modes): exit 12, RESULT=gh_rate_limited,
+# GH_RATE_LIMIT_RESOURCE/RESET/RESET_AT and GH_RETRY_AT (reset + 5s).
+# Re-arm after GH_RETRY_AT; this is never readiness or unknown-streak exhaustion.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/cr-signal.sh
 . "$HERE/lib/cr-signal.sh"
+# shellcheck source=lib/gh-ratelimit.sh
+. "$HERE/lib/gh-ratelimit.sh"
 # shellcheck source=lib/review-threads.sh
 . "$HERE/lib/review-threads.sh"
 # shellcheck source=lib/greptile-verdict.sh
@@ -152,6 +157,7 @@ unk() {
 # exit 9 once MAX_UNKNOWN such polls run back to back.
 unk_streak=0
 unknown_streak() {
+  gh_rate_limit_stop
   case ",$unk_why," in
     ,greptile_pending,) unk_streak=0 ;;
     *) unk_streak=$((unk_streak + 1)) ;;

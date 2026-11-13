@@ -277,6 +277,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    | 8 | PR conflicts with its base (`mergeable=CONFLICTING`): GitHub runs no CI on it | step 5 |
    | 9 | a lookup stayed unreadable for `--max-unknown` polls (default 5; no checks yet on a mergeable head is pending for `--ci-grace`, 15 min); `RESULT` names it | inspect that lookup; never merge on it |
    | 10 | active ci_fix, even with green CI, or recent terminal ci_fix while CI is red | follow *CI-fix branch ownership*; plain red without either remains exit 1 |
+   | 12 | `RESULT=gh_rate_limited`: GitHub core or GraphQL allowance exhausted | re-arm after `GH_RETRY_AT`; never treat this as ready, findings, or CodeRabbit quota |
 
    Let an auto-review that is already running finish; never re-trigger it. Greptile skips a
    conflicting PR and a head pushed after its trigger: trigger on the final head. `--reviewer` also
@@ -682,6 +683,17 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
   purge leaves a claimless trail; its 6-hour stale TTL starts when terminal claim cleanup
   preserves it, so `reap` never removes it during the same pass or a healthy post-merge watch.
   Nothing here is a lock on the PR itself, only on the merge step.
+
+GitHub quota exhaustion is separate from a review bot's quota. On failed or unknown reads,
+`watch-pr.sh`, `watch-prs-ci.sh`, `watch-run-ci.sh` and `cr-rate-limit.sh` consult the
+shared `lib/gh-ratelimit.sh`. Confirmed primary exhaustion exits 12 immediately with
+`GH_RATE_LIMITED=1`, `GH_RATE_LIMIT_RESOURCE`, `GH_RATE_LIMIT_RESET` (epoch),
+`GH_RATE_LIMIT_RESET_AT` (UTC) and `GH_RETRY_AT` (latest reset plus five seconds).
+Do not keep polling or spend the unknown-lookup budget. Arrange an owned continuation
+after that time, then re-arm against the current head and gates. This exit does not
+extend an observer's deadline or schedule a callback. Missing/unreadable quota data,
+secondary limits and zero allocations retain the existing error/unknown behavior.
+The uzi-watcher `watch-run.sh` and `watch-issue.sh` call only `uzi`, so need no GitHub quota path.
 
 ## Waiting, uniformly
 
