@@ -284,7 +284,8 @@ backoff and single-flight state.
   [e2e/dind-builder-prune/README.md](../e2e/dind-builder-prune/README.md)). On
   2026-11-13 it passed both postures (server 29.8.0 / API 1.56, BuildKit
   v0.33.0, client 29.9.2, buildx v0.38.1), about 137 s per posture, with the held
-  build proven still running and its record InUse past the floor across the prune,
+  build proven running and its record InUse and older than the floor before the
+  prune, and still running and InUse after it,
   and raw per-record bytes from the nested daemon's API; pressure fell from 89.8%
   to 22.3%, and with the switch off there was no relief (88.5% to 88.5%). The plan-time spike is archived in
   [e2e/dind-builder-prune/plan-evidence/](../e2e/dind-builder-prune/plan-evidence/README.md).
