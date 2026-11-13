@@ -199,13 +199,13 @@ Operators rolling back past this feature, in order:
 1. Turn `worker_hibernation_enabled` off.
 2. Wait until no worker is `hibernating`, `hibernated` or `waking`. The sweeper
    wakes at most 10 workers per pass.
-3. Stop the api. Rolling back 00438 is a no-op and 00437 drops `fn_placement_admitting_workers`, which
+3. Stop the api. Rolling back 00439 is a no-op and 00438 drops `fn_placement_admitting_workers`, which
    this api's ephemeral provisioning and demand-wake queries call, so this api
-   cannot keep serving once 00437 is down. Expect a brief outage window.
-4. Roll back migrations 00438, then 00437, then 00436, then 00435. Down of 00435 refuses
-   while any worker is not awake; Down of 00436 drops the wake records, which
+   cannot keep serving once 00438 is down. Expect a brief outage window.
+4. Roll back migrations 00439, then 00438, then 00437, then 00436. Down of 00436 refuses
+   while any worker is not awake; Down of 00437 drops the wake records, which
    are transient demand memory, without refusing. The rollbacks
-   briefly take exclusive locks (00435 on the workers table; 00436 on the runs
+   briefly take exclusive locks (00436 on the workers table; 00437 on the runs
    and workers tables), so do them in a quiet window.
 5. Start the older api. An older api cannot claim runs on the new schema, so it
    only runs once all four migrations are rolled back.

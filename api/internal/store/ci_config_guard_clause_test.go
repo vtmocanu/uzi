@@ -9,7 +9,7 @@ import (
 
 // TestCIConfigGuardClaimClauseCountPinned pins where the standalone ci_config_guard_v1 claim
 // clause (PRD #2865) lives in queries/runtime.sql: ListUnplaceableQueuedRunsForEphemeral executes
-// its copy from fn_placement_admitting_workers (migration 00437), so expandPlacementFunction appends
+// its copy from fn_placement_admitting_workers (migration 00438), so expandPlacementFunction appends
 // that body to each call site before counting. It must sit at every site that mirrors the
 // completion_interlock_v1 claim clause for ordinary runs, and nowhere else. A new mirror of the
 // claim gate that forgets the clause (or a stray copy) changes this table. The live-DB tests in
