@@ -1157,11 +1157,12 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// pure pod spec — nothing in agent/ parses a CA today and nothing needs to.
 		env = append(env, corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: cfg.caCertPath()})
 	}
-	if len(cfg.ExtraCAPEM) > 0 && !cfg.UIDSplit {
+	if len(cfg.ExtraCAPEM) > 0 && !(cfg.UIDSplit && !w.Isolated) {
 		// The Claude CLI's own trust (agent/src/sdk-env.ts): only when an extra CA exists,
 		// since the CLI never dials the api. Not under the uid split: the CLI then runs as
 		// `runner`, which cannot read the root:worker 0440 Secret file, and every Node
-		// process the agent starts would warn about it.
+		// process the agent starts would warn about it. An isolated lane worker never takes
+		// the split (see uidSplit below), so its CLI can read the file and gets the path.
 		env = append(env, corev1.EnvVar{Name: "UZI_CLI_CA_FILE", Value: cfg.caCertPath()})
 	}
 	if w.Isolated {

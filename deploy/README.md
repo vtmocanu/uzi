@@ -1544,7 +1544,7 @@ to stop.
 next to the api's CA: set `pem` inline, or `configMap.name`/`key` for an existing
 ConfigMap in the release namespace (a trust-manager `Bundle` target works). The
 controller appends it after the api CA in each worker's Secret, and the worker plus
-the Claude Code CLI it starts trust both (the CLI not under `workers.uidSplit`).
+the Claude Code CLI it starts trust both (the CLI not under `workers.uidSplit`, except on isolated-lane workers, which never take the split).
 Workers verify the api with that same bundle, so the extra CA is also trusted for the
 worker-to-api connection: keep it as narrow as your hosts allow. It needs
 `api.tls.enabled`, covers HTTPS from Node only (not git clone), and, like the api CA,

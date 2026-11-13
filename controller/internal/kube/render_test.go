@@ -1079,6 +1079,18 @@ func TestCLICAFileOnlyWithAnExtraCAAndNoUIDSplit(t *testing.T) {
 	}
 }
 
+// An isolated lane worker never takes the uid split (its CLI runs as the worker uid and can
+// read the Secret file), so workers.uidSplit must not withhold the CLI's extra CA from it.
+func TestCLICAFileOnIsolatedLaneEvenWithUIDSplit(t *testing.T) {
+	cfg := laneTestConfig()
+	cfg.APICAPEM = []byte("api")
+	cfg.ExtraCAPEM = []byte("extra")
+	cfg.UIDSplit = true
+	if got := envMap(laneWorkerContainer(t, cfg, desiredIsolated("abc")))["UZI_CLI_CA_FILE"]; got != "/run/secrets/ca.crt" {
+		t.Errorf("isolated lane + uid split: UZI_CLI_CA_FILE = %q, want the bundle path", got)
+	}
+}
+
 func TestWorkerEnvDefaultsToSingleRunCap(t *testing.T) {
 	// testConfig() leaves MaxConcurrentRuns at its zero value, which must still render
 	// "1" — the default cap, so any RenderConfig{} built in a test keeps working. The

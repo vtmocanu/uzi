@@ -476,7 +476,8 @@ workers:
   # Forgejo API. The controller appends it to the api CA in each worker's Secret. It does
   # not change git's or the toolchain's OpenSSL trust, so a private-CA forge still fails
   # at git clone. Needs api.tls.enabled. Under workers.uidSplit the CLI runs as another
-  # uid that cannot read the Secret, so it covers the worker process only.
+  # uid that cannot read the Secret, so it covers the worker process only (isolated-lane
+  # workers never take the split, so their CLI still gets it).
   # Workers verify the api with the same bundle, so the extra CA is ALSO trusted for the
   # worker-to-api connection, not only for outbound hosts: a broad corporate root here
   # can vouch for the api too. Prefer the narrowest CA that covers your hosts.
