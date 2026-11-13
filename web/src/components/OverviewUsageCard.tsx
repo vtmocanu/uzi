@@ -13,7 +13,7 @@ import { Card, SectionTitle } from "./ui";
 import type { UsageWindow } from "./UsageCards";
 import {
   failRate, failRateDelta, formatSince, summaryCost, perPrText, failureAgo,
-  FailedRunsBlock, TopCauses, SinceLastFailedRun, SegmentedToggle, WindowToggle, Th, Td,
+  FailedRunsBlock, TopCauses, SinceLastFailedRun, SegmentedToggle, WindowToggle, Th, Td, hasRecordedUsage, USAGE_SCOPE_NOTE,
 } from "./usageParts";
 
 // PRD #3881: the Overview preview's one Usage card. A You / All users scope toggle (admins
@@ -100,7 +100,7 @@ function CostCell({ cost, subscription, unreported, total }: { cost: number; sub
 
 const SHARE_TITLE = "Share of recorded API-equivalent cost in the selected period";
 const HARNESS_NOTE =
-  "share of each user's runs by harness, the same runs as the Runs column; cross-check runs count under the harness they ran on";
+  "share of each user's runs by harness, the same primary work runs as the Runs column";
 
 // Issue #4227: one combined bar per row. Its length is the row's share of the factory's cost
 // (ratio, unrounded); when the API sends the harness split, that length is divided into a Claude
@@ -184,7 +184,7 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
               <thead>
                 <tr>
                   <Th variant="preview" left>User</Th>
-                  <Th variant="preview" title="Runs with recorded usage in the period">Runs</Th>
+                  <Th variant="preview" title="Primary work runs with recorded usage in the period">Runs</Th>
                   <Th variant="preview">PRs</Th>
                   <Th variant="preview">Failed</Th>
                   <Th variant="preview" title="Failed of finished runs in the period">Fail rate</Th>
@@ -339,7 +339,8 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerI
             sub={`in ${formatTokens(selected.fresh)}, cached ${formatTokens(selected.cached)}, out ${formatTokens(selected.out)}`}
           />
         </div>
-        {usage.run_count === 0 && <p className="mt-3 text-xs text-muted">No token usage recorded yet.</p>}
+        <p className="mt-3 text-[11px] leading-relaxed text-muted">{USAGE_SCOPE_NOTE}</p>
+        {!hasRecordedUsage(usage) && <p className="mt-3 text-xs text-muted">No token usage recorded yet.</p>}
         <div className="mt-5 grid gap-6 border-t border-edge pt-4 md:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
           <div className="min-w-0 space-y-3">
             <FailedRunsBlock outcomes={outcomes} personal={personal} framed={false} />

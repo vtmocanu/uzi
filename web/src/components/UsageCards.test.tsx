@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, within } from "@testing-library/react"
 import { MemoryRouter } from "react-router-dom";
 import { useState } from "react";
 import { UsageCard, type UsageWindow } from "./UsageCards";
+import { USAGE_SCOPE_NOTE } from "./usageParts";
 import type { AdminUsage, RunOutcomes, SelfUsage } from "../lib/api";
 import { setDemoMode } from "../lib/demoMode";
 
@@ -139,7 +140,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect(you.getByText("350")).toBeTruthy();
     expect(factory.getByText("1.1k")).toBeTruthy();
     expect(you.getByText("0.0 pp vs all-time 10.0%")).toBeTruthy();
-    expect(you.queryByText(/runs with token usage/)).toBeNull();
+    expect(you.queryByText(/primary work runs with token usage/)).toBeNull();
     expect(view.getByRole("heading", { name: "Per user · last 7 days" })).toBeTruthy();
     const tableBefore = users.getByRole("table").textContent;
     fireEvent.click(allTime);
@@ -147,8 +148,8 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect(last7.getAttribute("aria-pressed")).toBe("false");
     expect(you.getByText("$1,235")).toBeTruthy();
     expect(factory.getByText("$2,469")).toBeTruthy();
-    expect(you.getByText("23 runs with token usage")).toBeTruthy();
-    expect(factory.getByText(/46 runs with token usage by 2 users since/)).toBeTruthy();
+    expect(you.getByText("23 primary work runs with token usage")).toBeTruthy();
+    expect(factory.getByText(/46 primary work runs with token usage since .* · 2 users with recorded usage/)).toBeTruthy();
     expect(you.queryByText(/pp vs all-time/)).toBeNull();
     expect(view.getByRole("heading", { name: "Per user · all time" })).toBeTruthy();
     expect(users.getByRole("table").textContent).not.toBe(tableBefore);
@@ -438,7 +439,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
       return f;
     };
     type Scope = ReturnType<typeof columns>["users"];
-    const slot = (scope: Scope) => scope.getByText(/\d+ PRs?\b|runs with token usage/).textContent;
+    const slot = (scope: Scope) => scope.getByText(/\d+ PRs?\b|primary work runs with token usage/).textContent;
     const prCells = (users: Scope) => {
       const headers = users.getAllByRole("columnheader").map((h) => h.textContent);
       const idx = headers.indexOf("PRs");
@@ -448,12 +449,12 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
 
     it("renders the lifetime row for the personal and factory columns and the PR text alone for 7 days", () => {
       const view = mount({ ...withPRs(), initial: "lifetime" }); const { you, factory } = columns(view);
-      expect(slot(you)).toBe("23 runs with token usage · 4 PRs · $308.64 per PR");
-      expect(slot(factory)).toMatch(/^46 runs with token usage by 2 users since .*2026 · 8 PRs · \$308\.64 per PR$/);
+      expect(slot(you)).toBe("23 primary work runs with token usage · 4 PRs · $308.64 per PR");
+      expect(slot(factory)).toMatch(/^46 primary work runs with token usage since .*2026 · 2 users with recorded usage · 8 PRs · \$308\.64 per PR$/);
       fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
       expect(slot(you)).toBe("2 PRs · $6.17 per PR");
       expect(slot(factory)).toBe("6 PRs · $6.17 per PR");
-      expect(you.queryByText(/runs with token usage/)).toBeNull();
+      expect(you.queryByText(/primary work runs with token usage/)).toBeNull();
     });
 
     it("uses the singular for exactly one PR", () => {
@@ -474,8 +475,8 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     it("says at least when the cost is incomplete and reuses the cost disclosure title", () => {
       const f = fixture(); f.self.lifetime_pr_count = 4; f.self.last7_pr_count = 2;
       const view = mount({ self: f.self, initial: "lifetime" });
-      const row = view.getByText(/runs with token usage/);
-      expect(row.textContent).toBe("23 runs with token usage · 4 PRs · at least $308.64 per PR");
+      const row = view.getByText(/primary work runs with token usage/);
+      expect(row.textContent).toBe("23 primary work runs with token usage · 4 PRs · at least $308.64 per PR");
       const span = view.getByText("at least $308.64 per PR");
       expect(span.tagName).toBe("SPAN");
       const costNote = view.getByText(/^\+ 8 runs without a cost estimate/);
@@ -515,12 +516,12 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
       const view = mount(f); const { you, factory, users } = columns(view);
       for (const period of ["Last 7 days", "All time"]) {
         fireEvent.click(view.getByRole("button", { name: period }));
-        expect(view.container.textContent).not.toMatch(/\bPRs?\b/);
+        expect((view.container.textContent ?? "").replace(USAGE_SCOPE_NOTE, "")).not.toMatch(/\bPRs?\b/);
         expect(users.getAllByRole("columnheader").map((h) => h.textContent)).not.toContain("PRs");
       }
       fireEvent.click(view.getByRole("button", { name: "All time" }));
-      expect(slot(you)).toBe("23 runs with token usage");
-      expect(factory.getByText(/runs with token usage/).textContent).toMatch(/^46 runs with token usage by 2 users since .*2026$/);
+      expect(slot(you)).toBe("23 primary work runs with token usage");
+      expect(factory.getByText(/primary work runs with token usage/).textContent).toMatch(/^46 primary work runs with token usage since .*2026 · 2 users with recorded usage$/);
     });
 
     it("omits the PRs column when one user lacks the selected window's count", () => {
@@ -533,6 +534,50 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     });
   });
 
+});
+
+describe("primary work scope (#4209)", () => {
+  const zeroBundle = () => bundle(0, 0, 0, 0);
+  const helperOnly = (): SelfUsage => {
+    const { self } = fixture();
+    return { ...self, run_count: 0, lifetime_subscription_run_count: 0, lifetime_unreported_run_count: 0,
+      last7_subscription_run_count: 0, last7_unreported_run_count: 0 };
+  };
+
+  it("shows helper-only spend and not the empty message when run_count is 0", () => {
+    const self = helperOnly();
+    const view = mount({ self, initial: "lifetime" });
+    expect(view.getByText("$1,235")).toBeTruthy();
+    expect(view.queryByText("No token usage recorded yet.")).toBeNull();
+  });
+
+  it("still shows the empty message when every usage figure is zero", () => {
+    const self = helperOnly();
+    self.lifetime = zeroBundle(); self.last_7_days = zeroBundle();
+    const view = mount({ self, initial: "lifetime" });
+    expect(view.getByText("No token usage recorded yet.")).toBeTruthy();
+  });
+
+  it("treats a subscription-only user as having recorded usage", () => {
+    const self = helperOnly();
+    self.lifetime = zeroBundle(); self.lifetime_subscription_run_count = 2;
+    const view = mount({ self, initial: "lifetime" });
+    expect(view.queryByText("No token usage recorded yet.")).toBeNull();
+  });
+
+  it("renders the scope note once under the columns and the primary-work Runs title", () => {
+    const view = mount({ ...fixture(), initial: "lifetime" });
+    expect(view.getAllByText(USAGE_SCOPE_NOTE)).toHaveLength(1);
+    expect(view.getByRole("columnheader", { name: "Runs" }).getAttribute("title"))
+      .toBe("Primary work runs with recorded usage in the period");
+  });
+
+  it("divides the full cost, helper spend included, by the PR count", () => {
+    const self = helperOnly(); self.lifetime_pr_count = 4;
+    const view = mount({ self, initial: "lifetime" });
+    expect(view.getByText(/^0 primary work runs with token usage/).textContent)
+      .toBe("0 primary work runs with token usage · 4 PRs · $308.64 per PR");
+  });
 });
 
 it.each([undefined, 3])("sums rejected outcomes with base_diverged=%s", (baseDiverged) => {
