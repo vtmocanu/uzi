@@ -74,7 +74,8 @@ cleanup() {
   trap - EXIT
   for name in "${containers[@]}"; do
     # A timed-out create may have succeeded. Verify ownership even on that path.
-    if owner=$(timeout --kill-after=2s 10s docker inspect \
+    # `container inspect` so a same-named image/network/volume never resolves.
+    if owner=$(timeout --kill-after=2s 10s docker container inspect \
       --format "{{index .Config.Labels \"$OWNER_LABEL\"}}" "$name" 2>&1); then
       if [[ $owner == "$token" ]]; then
         if timeout --kill-after=2s 60s docker rm -fv "$name" >/dev/null; then
@@ -87,7 +88,7 @@ cleanup() {
         echo "FAIL: cleanup ownership mismatch for $name" >&2
         cleanup_rc=1
       fi
-    elif [[ $owner == *'No such object'* || $owner == *'No such container'* ]]; then
+    elif [[ ${owner,,} == *'no such object'* || ${owner,,} == *'no such container'* ]]; then
       echo "CLEANUP $name does not exist (never created or already removed)"
     else
       # A daemon error or a timeout is not proof of absence: the container may still exist.

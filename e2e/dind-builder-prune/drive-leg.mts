@@ -76,6 +76,10 @@ function safeDockerHost(flags: Map<string, string>): string {
   const host = need(flags, "docker-host");
   if (!host.startsWith("tcp://")) throw new Error(`refusing --docker-host ${host}: only tcp:// is allowed`);
   if (host === process.env["DOCKER_HOST"]) throw new Error(`refusing --docker-host ${host}: equals this process's DOCKER_HOST`);
+  const hostname = new URL(host.replace(/^tcp:/, "http:")).hostname.replace(/^\[|\]$/g, "");
+  if (hostname === "localhost" || hostname === "::1" || hostname.startsWith("127.") || hostname === "0.0.0.0") {
+    throw new Error(`refusing --docker-host ${host}: loopback may be the worker's own daemon`);
+  }
   return host;
 }
 
