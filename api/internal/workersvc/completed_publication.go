@@ -199,6 +199,36 @@ func proveCompletedPublication(ctx context.Context, f forge.CodeHost, id apitype
 	}
 }
 
+// terminalContributionReader is the unlocked pre-check's read. It is a separate optional interface
+// (not part of completedPublicationReader) so a reader without it only loses the pre-check; the
+// locked check inside the write transaction is authoritative either way.
+type terminalContributionReader interface {
+	GetTerminalContributionByRunGeneration(context.Context, store.GetTerminalContributionByRunGenerationParams) (store.RunTerminalContribution, error)
+}
+
+// Completed-publication refusal reasons added by the terminal-preservation gate (#4007).
+const (
+	reasonTerminalPreservationPending = "terminal_preservation_pending"
+	reasonTerminalPreservationRefused = "terminal_preservation_refused"
+)
+
+// terminalGateReason maps the state of the contribution for exactly the completing claim's
+// generation to a refusal reason; "" lets the release proceed. published and recorded (an accepted
+// loss) proceed; an unfinished push is pending; a refused one is refused; a state this code does
+// not know fails closed as ancestry_unknown.
+func terminalGateReason(state string) string {
+	switch state {
+	case "published", "recorded":
+		return ""
+	case "prepared", "invoked", "publish_unknown":
+		return reasonTerminalPreservationPending
+	case "refused":
+		return reasonTerminalPreservationRefused
+	default:
+		return "ancestry_unknown"
+	}
+}
+
 func (s *Service) verifyCompletedPublication(ctx context.Context, w store.Worker, runID uuid.UUID, req StateRequest) (*apitypes.CompletedPublicationReceipt, string) {
 	q, ok := s.q.(completedPublicationReader)
 	if !ok || !completedPublicationCapable(w, req) {
@@ -239,6 +269,21 @@ func (s *Service) verifyCompletedPublication(ctx context.Context, w store.Worker
 	}
 	proofCtx, cancel := context.WithTimeout(ctx, completedPublicationDeadline)
 	defer cancel()
+	// Unlocked pre-check of the terminal-preservation gate, BEFORE any forge proof is spent. The
+	// sole opt-in is a contribution row for exactly this claim's generation: an inventory-guarded
+	// hold or the completed-publication capability alone never opts a run in.
+	if tr, ok := q.(terminalContributionReader); ok {
+		c, cerr := tr.GetTerminalContributionByRunGeneration(proofCtx, store.GetTerminalContributionByRunGenerationParams{RunID: runID, Generation: id.Generation})
+		switch {
+		case errors.Is(cerr, pgx.ErrNoRows):
+		case cerr != nil:
+			return refuse("ancestry_unknown")
+		default:
+			if reason := terminalGateReason(c.State); reason != "" {
+				return refuse(reason)
+			}
+		}
+	}
 	binding, err := q.GetCompletedPublicationBinding(proofCtx, store.GetCompletedPublicationBindingParams{
 		RepoID: uuid.MustParse(id.RepoID), UserID: w.UserID,
 	})
@@ -290,6 +335,37 @@ func (s *Service) verifyCompletedPublication(ctx context.Context, w store.Worker
 	}
 	if locked.ID != h.ID || string(locked.CompletionIdentity) != string(h.CompletionIdentity) || locked.State != "open" {
 		return refuse("identity_changed")
+	}
+	// Authoritative terminal-preservation gate. Lock order: worker, run, hold, preservation,
+	// contribution, repo binding. The pre-check above was unlocked, so a contribution that was
+	// published (or absent) then may have moved on; this FOR SHARE read decides.
+	//
+	// Release-writer classification (only ReleaseCompletedPublicationHold is gated):
+	//   - ReleaseCompletedPublicationHold: gated here; it is the release that claims the work is
+	//     on the forge, which a pending or refused terminal contribution contradicts.
+	//   - ReleaseHeldPublicationHold (held-publication release): not gated, its hold guard binds
+	//     the release to its own publication row, not to this merged-branch proof.
+	//   - ReleaseFinalInventoryHold and ReleaseFinalClosureHold (FINAL-archive and closure
+	//     releases): not gated, each is released on its own archive or pinned-closure evidence.
+	//   - DiscardCustodyHoldForOwner: not gated on purpose, the owner's explicit discard must never
+	//     be obstructed by a stuck terminal contribution.
+	//   - DiscardMergedPredecessorHold: not gated, it discards a predecessor hold on its own
+	//     merged-predecessor binding.
+	//   - ReleaseCustodyHoldExact: not gated, it is the generation-exact worker release of its own
+	//     hold and claims no publication.
+	if _, err = qt.GetTerminalPreservationForShare(writeCtx, runID); err == nil {
+		c, cerr := qt.GetTerminalContributionForShare(writeCtx, store.GetTerminalContributionForShareParams{RunID: runID, Generation: id.Generation})
+		switch {
+		case errors.Is(cerr, pgx.ErrNoRows):
+		case cerr != nil:
+			return refuse("ancestry_unknown")
+		default:
+			if reason := terminalGateReason(c.State); reason != "" {
+				return refuse(reason)
+			}
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return refuse("ancestry_unknown")
 	}
 	current, err := qt.LockCompletedPublicationBinding(writeCtx, store.LockCompletedPublicationBindingParams{RepoID: uuid.MustParse(id.RepoID), UserID: w.UserID})
 	if err != nil || current.ConnectionID.String() != id.ConnectionID || current.ProjectID != id.ProjectID ||

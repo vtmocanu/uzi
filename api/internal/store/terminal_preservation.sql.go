@@ -125,12 +125,85 @@ func (q *Queries) GetTerminalContributionByRunGeneration(ctx context.Context, ar
 	return i, err
 }
 
+const getTerminalContributionForShare = `-- name: GetTerminalContributionForShare :one
+SELECT id, preservation_id, run_id, generation, worker_id, user_id, hold_id, authority, tip, prior_tip, coverage_digest, manifest, disposition, state, refusal_reason, create_invoked_at, published_at, created_at, updated_at FROM run_terminal_contributions WHERE run_id = $1 AND generation = $2 FOR SHARE
+`
+
+type GetTerminalContributionForShareParams struct {
+	RunID      uuid.UUID `json:"run_id"`
+	Generation int64     `json:"generation"`
+}
+
+// The contribution of exactly one generation, taken after the preservation row. No row means the
+// run never opted in at that generation, and the gate is a no-op.
+func (q *Queries) GetTerminalContributionForShare(ctx context.Context, arg GetTerminalContributionForShareParams) (RunTerminalContribution, error) {
+	row := q.db.QueryRow(ctx, getTerminalContributionForShare, arg.RunID, arg.Generation)
+	var i RunTerminalContribution
+	err := row.Scan(
+		&i.ID,
+		&i.PreservationID,
+		&i.RunID,
+		&i.Generation,
+		&i.WorkerID,
+		&i.UserID,
+		&i.HoldID,
+		&i.Authority,
+		&i.Tip,
+		&i.PriorTip,
+		&i.CoverageDigest,
+		&i.Manifest,
+		&i.Disposition,
+		&i.State,
+		&i.RefusalReason,
+		&i.CreateInvokedAt,
+		&i.PublishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getTerminalPreservationByRun = `-- name: GetTerminalPreservationByRun :one
 SELECT id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, state, first_published_at, retire_tip, retire_reason, retire_observed_at, retire_decided_at, next_check_at, attempts, last_error, deleted_at, created_at, updated_at FROM run_terminal_preservations WHERE run_id = $1
 `
 
 func (q *Queries) GetTerminalPreservationByRun(ctx context.Context, runID uuid.UUID) (RunTerminalPreservation, error) {
 	row := q.db.QueryRow(ctx, getTerminalPreservationByRun, runID)
+	var i RunTerminalPreservation
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Ref,
+		&i.Tip,
+		&i.LifetimeAtBind,
+		&i.State,
+		&i.FirstPublishedAt,
+		&i.RetireTip,
+		&i.RetireReason,
+		&i.RetireObservedAt,
+		&i.RetireDecidedAt,
+		&i.NextCheckAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.DeletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getTerminalPreservationForShare = `-- name: GetTerminalPreservationForShare :one
+SELECT id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, state, first_published_at, retire_tip, retire_reason, retire_observed_at, retire_decided_at, next_check_at, attempts, last_error, deleted_at, created_at, updated_at FROM run_terminal_preservations WHERE run_id = $1 FOR SHARE
+`
+
+// The completed-publication gate's authoritative read (lock order: worker, run, hold, preservation,
+// contribution, repo binding). FOR SHARE keeps a concurrent tx2 outcome writer (FOR UPDATE on the
+// same row) from moving the contribution between this read and the hold release.
+func (q *Queries) GetTerminalPreservationForShare(ctx context.Context, runID uuid.UUID) (RunTerminalPreservation, error) {
+	row := q.db.QueryRow(ctx, getTerminalPreservationForShare, runID)
 	var i RunTerminalPreservation
 	err := row.Scan(
 		&i.ID,

@@ -1101,6 +1101,11 @@ var queryInventory = []queryPin{
 	// Issue #4007 slice A, M3: the worker route's writers. Each is a CAS on the expected state.
 	{"GetTerminalPreservationForUpdate", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
 		"direct call; asserts the locked read returns the run's preservation"},
+	// Issue #4007 slice A, M5: the completed-publication gate's authoritative reads.
+	{"GetTerminalPreservationForShare", "terminal_preservation.sql", "TestCompletedPublicationTerminalGateLiveDB",
+		"../workersvc: verifyCompletedPublication takes it FOR SHARE before the contribution; the gate cases pass through it"},
+	{"GetTerminalContributionForShare", "terminal_preservation.sql", "TestCompletedPublicationTerminalGateLiveDB",
+		"../workersvc: the pending, refused, published, recorded and other-generation cases decide the hold release"},
 	{"MarkTerminalPreservationPublishing", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
 		"direct call; asserts the live pointer is set and a wrong expected state or tip changes no row"},
 	{"MarkTerminalPreservationNotPublished", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",

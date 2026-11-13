@@ -104,6 +104,17 @@ LIMIT @lim::int;
 -- contribution). The tx2 outcome writers take it after the run lock.
 SELECT * FROM run_terminal_preservations WHERE run_id = @run_id FOR UPDATE;
 
+-- name: GetTerminalPreservationForShare :one
+-- The completed-publication gate's authoritative read (lock order: worker, run, hold, preservation,
+-- contribution, repo binding). FOR SHARE keeps a concurrent tx2 outcome writer (FOR UPDATE on the
+-- same row) from moving the contribution between this read and the hold release.
+SELECT * FROM run_terminal_preservations WHERE run_id = @run_id FOR SHARE;
+
+-- name: GetTerminalContributionForShare :one
+-- The contribution of exactly one generation, taken after the preservation row. No row means the
+-- run never opted in at that generation, and the gate is a no-op.
+SELECT * FROM run_terminal_contributions WHERE run_id = @run_id AND generation = @generation FOR SHARE;
+
 -- name: MarkTerminalPreservationPublishing :one
 -- bound, not_published, live or publishing -> publishing, setting the live pointer FIRST (before
 -- the contribution's prepared -> invoked marker, whose guard needs the preservation publishing).
