@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -53,6 +54,7 @@ type fakeStore struct {
 	capacityErr            error
 	capacityQueries        atomic.Int32
 	capacityParams         []store.ListOwnersWaitingNoCapacityParams
+	capacityParamsMu       sync.Mutex
 	waitingQueries         atomic.Int32
 	waitingRows            []store.ListWaitingWorkerRunsRow
 	waitingErr             error
@@ -108,7 +110,9 @@ func (f *fakeStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, 
 	return f.workers, f.workersErr
 }
 func (f *fakeStore) ListOwnersWaitingNoCapacity(_ context.Context, arg store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
+	f.capacityParamsMu.Lock()
 	f.capacityParams = append(f.capacityParams, arg)
+	f.capacityParamsMu.Unlock()
 	f.capacityQueries.Add(1)
 	return f.capacityRows, f.capacityErr
 }
