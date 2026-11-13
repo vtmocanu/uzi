@@ -12,13 +12,13 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #4205 M1 migrations 427/428 (430 validates 427's CHECKs): Down keeps worker_hibernation_events, so Up must be
+// PRD #4205 M1 migrations 435/436 (438 validates 435's CHECKs): Down keeps worker_hibernation_events, so Up must be
 // re-entrant over it and must refuse a leftover whose shape drifted.
 
 func hibernationMigrationDB(t *testing.T) (context.Context, string, *pgxpool.Pool) {
 	t.Helper()
 	ctx, dsn := standIsolatedDB(t, "hib_migration_")
-	if err := store.MigrateTo(ctx, dsn, 426); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 434); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -40,7 +40,7 @@ func hibWorker(ctx context.Context, t *testing.T, pool *pgxpool.Pool) (owner, wo
 func TestWorkerHibernationMigrationLifecycleLiveDB(t *testing.T) {
 	ctx, dsn, pool := hibernationMigrationDB(t)
 	owner, worker := hibWorker(ctx, t, pool)
-	if err := store.MigrateTo(ctx, dsn, 428); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 436); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(ctx, t, pool, `INSERT INTO worker_hibernation_events(owner_id,worker_id,actor_id,actor_label,action,op_id,reason,occurred_at)
@@ -48,37 +48,37 @@ func TestWorkerHibernationMigrationLifecycleLiveDB(t *testing.T) {
 
 	// Down refuses while a worker is mid-hibernation, and changes nothing.
 	mustExec(ctx, t, pool, `UPDATE workers SET hibernation_state='preparing', hibernation_op_id=gen_random_uuid() WHERE id=$1`, worker)
-	err := store.MigrateDownTo(ctx, dsn, 426)
+	err := store.MigrateDownTo(ctx, dsn, 434)
 	if err == nil || !strings.Contains(err.Error(), "rollback refused") {
 		t.Fatalf("Down with a non-none worker: %v", err)
 	}
-	if applied, _, _, vErr := store.SchemaVersionStatus(ctx, pool); vErr != nil || applied != 427 {
-		// 428 (wake history) rolled back cleanly; 427 refused and stayed applied.
+	if applied, _, _, vErr := store.SchemaVersionStatus(ctx, pool); vErr != nil || applied != 435 {
+		// 436 (wake history) rolled back cleanly; 435 refused and stayed applied.
 		t.Fatalf("refused Down left version %d: %v", applied, vErr)
 	}
-	if err = store.MigrateTo(ctx, dsn, 428); err != nil {
+	if err = store.MigrateTo(ctx, dsn, 436); err != nil {
 		t.Fatal(err)
 	}
 	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM workers WHERE hibernation_state='preparing'"); n != 1 {
 		t.Fatalf("refused Down changed the worker: %d", n)
 	}
 
-	// Down of 428 does not refuse on wake rows: they are transient demand memory, and refusing
-	// would stall a downgrade behind an idle queue. Down of 427 (above) still refuses while a worker
+	// Down of 436 does not refuse on wake rows: they are transient demand memory, and refusing
+	// would stall a downgrade behind an idle queue. Down of 435 (above) still refuses while a worker
 	// is not awake.
 	mustExec(ctx, t, pool, `UPDATE workers SET hibernation_state='none', hibernation_op_id=NULL WHERE id=$1`, worker)
 	run := uuid.New()
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,kind,issue_title,issue_description,status) VALUES($1,$2,'chat','t','d','queued')`, run, owner)
 	mustExec(ctx, t, pool, `INSERT INTO hibernation_wakes(run_id,worker_id,first_woken_at) VALUES($1,$2,now())`, run, worker)
-	if err = store.MigrateDownTo(ctx, dsn, 427); err != nil {
-		t.Fatalf("Down of 428 with wake rows: %v", err)
+	if err = store.MigrateDownTo(ctx, dsn, 435); err != nil {
+		t.Fatalf("Down of 436 with wake rows: %v", err)
 	}
 	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM information_schema.tables WHERE table_name='hibernation_wakes'"); n != 0 {
-		t.Fatalf("Down of 428 left the wake table: %d", n)
+		t.Fatalf("Down of 436 left the wake table: %d", n)
 	}
 
 	// Clean Down keeps the audit table and restores the old function body.
-	if err = store.MigrateDownTo(ctx, dsn, 426); err != nil {
+	if err = store.MigrateDownTo(ctx, dsn, 434); err != nil {
 		t.Fatal(err)
 	}
 	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM worker_hibernation_events"); n != 1 {
@@ -93,7 +93,7 @@ func TestWorkerHibernationMigrationLifecycleLiveDB(t *testing.T) {
 	}
 
 	// Up again keeps the row.
-	if err = store.MigrateTo(ctx, dsn, 428); err != nil {
+	if err = store.MigrateTo(ctx, dsn, 436); err != nil {
 		t.Fatalf("re-Up over the leftover events table: %v", err)
 	}
 	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM worker_hibernation_events"); n != 1 {
@@ -118,18 +118,18 @@ func TestWorkerHibernationMigrationLeftoverShapeLiveDB(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx, dsn, pool := hibernationMigrationDB(t)
-			if err := store.MigrateTo(ctx, dsn, 427); err != nil {
+			if err := store.MigrateTo(ctx, dsn, 435); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.MigrateDownTo(ctx, dsn, 426); err != nil {
+			if err := store.MigrateDownTo(ctx, dsn, 434); err != nil {
 				t.Fatal(err)
 			}
 			mustExec(ctx, t, pool, tc.mutate)
-			err := store.MigrateTo(ctx, dsn, 427)
+			err := store.MigrateTo(ctx, dsn, 435)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Up over a mutated leftover must fail with %q: %v", tc.want, err)
 			}
-			if applied, _, _, vErr := store.SchemaVersionStatus(ctx, pool); vErr != nil || applied != 426 {
+			if applied, _, _, vErr := store.SchemaVersionStatus(ctx, pool); vErr != nil || applied != 434 {
 				t.Fatalf("failed Up left version %d: %v", applied, vErr)
 			}
 		})
@@ -140,16 +140,16 @@ func TestWorkerHibernationMigrationLeftoverShapeLiveDB(t *testing.T) {
 // one present with a different definition, which Up refuses).
 func TestWorkerHibernationMigrationRestoresBoundChecksLiveDB(t *testing.T) {
 	ctx, dsn, pool := hibernationMigrationDB(t)
-	if err := store.MigrateTo(ctx, dsn, 427); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 435); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MigrateDownTo(ctx, dsn, 426); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 434); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(ctx, t, pool, `ALTER TABLE worker_hibernation_events
 		DROP CONSTRAINT worker_hibernation_events_actor_label_check,
 		DROP CONSTRAINT worker_hibernation_events_reason_check`)
-	if err := store.MigrateTo(ctx, dsn, 427); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 435); err != nil {
 		t.Fatalf("Up must re-add missing bound checks: %v", err)
 	}
 	for name, tc := range map[string]struct{ label, reason, con string }{
@@ -170,14 +170,14 @@ func TestWorkerHibernationMigrationRestoresBoundChecksLiveDB(t *testing.T) {
 
 func TestWorkerHibernationMigrationRestoresActionCheckLiveDB(t *testing.T) {
 	ctx, dsn, pool := hibernationMigrationDB(t)
-	if err := store.MigrateTo(ctx, dsn, 427); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 435); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MigrateDownTo(ctx, dsn, 426); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 434); err != nil {
 		t.Fatal(err)
 	}
 	mustExec(ctx, t, pool, `ALTER TABLE worker_hibernation_events DROP CONSTRAINT worker_hibernation_events_action_check`)
-	if err := store.MigrateTo(ctx, dsn, 427); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 435); err != nil {
 		t.Fatalf("Up must re-add a missing action check: %v", err)
 	}
 	owner := uuid.New()
@@ -193,14 +193,14 @@ func TestWorkerHibernationCheckConstraintsLiveDB(t *testing.T) {
 	ctx, dsn, pool := hibernationMigrationDB(t)
 	_, worker := hibWorker(ctx, t, pool)
 	const unvalidated = "SELECT count(*) FROM pg_constraint WHERE conrelid='workers'::regclass AND NOT convalidated AND (conname LIKE '%hibernat%' OR conname LIKE 'workers_wake%')"
-	if err := store.MigrateTo(ctx, dsn, 427); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 435); err != nil {
 		t.Fatal(err)
 	}
-	// 427 installs the five CHECKs NOT VALID; 430 validates them.
+	// 435 installs the five CHECKs NOT VALID; 438 validates them.
 	if n := scalarInt(ctx, t, pool, unvalidated); n != 5 {
-		t.Fatalf("after 427 want 5 unvalidated hibernation constraints, got %d", n)
+		t.Fatalf("after 435 want 5 unvalidated hibernation constraints, got %d", n)
 	}
-	if err := store.MigrateTo(ctx, dsn, 430); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 438); err != nil {
 		t.Fatal(err)
 	}
 	if n := scalarInt(ctx, t, pool, unvalidated); n != 0 {
