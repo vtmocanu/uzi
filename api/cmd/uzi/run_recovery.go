@@ -173,13 +173,22 @@ func runRecoveryForRun(ctx context.Context, env Env, gf *globalFlags, c uzicli.C
 	// The endpoint is owner-wide; narrow to this run client-side.
 	forRun := holdsOfRun(own.Holds, runID)
 	readOnly := false
+	// hinted keeps the prerequisites hint to one line per command, whichever read was refused.
+	hinted := false
+	hint := func() {
+		if !hinted {
+			hinted = true
+			_, _ = fmt.Fprintln(env.Stderr, adminRunDebugHint)
+		}
+	}
 	if len(forRun) == 0 {
 		scoped, err := c.RecoveryHoldsScoped(ctx, "", runID)
 		switch {
-		case uzicli.ExitCodeFor(err) == uzicli.ExitNotFound:
-			// Not the caller's run, or no such run; either way no holds to show. Say what a
-			// foreign-run read needs, and carry on: the command still succeeds with nothing.
-			_, _ = fmt.Fprintln(env.Stderr, adminRunDebugHint)
+		case isForeignReadRefusal(err):
+			// Not the caller's run, or no such run, or a refused foreign read (404 or 403);
+			// either way no holds to show. Say what a foreign-run read needs, and carry on:
+			// the command still succeeds with nothing.
+			hint()
 		case err != nil:
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
@@ -203,8 +212,15 @@ func runRecoveryForRun(ctx context.Context, env Env, gf *globalFlags, c uzicli.C
 		// A released/discarded hold outlives its run (runs cascade-delete with
 		// their repo; holds keep a plain run_id), so the holds list still names a
 		// run whose archives read 404s. Degrade to every hold listing no captures
-		// rather than failing the whole listing.
+		// rather than failing the whole listing. With no hold listed, the 404 may be a
+		// refused foreign-run read, so name the prerequisites (once).
+		if len(forRun) == 0 {
+			hint()
+		}
 	case err != nil:
+		if isForeignReadRefusal(err) {
+			hint()
+		}
 		if len(forRun) > 0 && gf.json {
 			return err
 		}

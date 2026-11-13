@@ -61,19 +61,22 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			"the {runs, truncated} envelope.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Flag presence, not value, decides: an explicitly empty --user or --since (e.g. an
+			// unset shell variable) is a usage error, never a silent widening to all owners.
+			userSet, sinceSet := cmd.Flags().Changed("user"), cmd.Flags().Changed("since")
 			if !runsAll {
-				if runsUser != "" || runsSince != "" {
+				if userSet || sinceSet {
 					return uzicli.Exitf(uzicli.ExitUsage, "--user and --since need --all")
 				}
 			} else {
-				if runsUser != "" {
+				if userSet {
 					id, err := uuid.Parse(runsUser)
 					if err != nil {
 						return uzicli.Exitf(uzicli.ExitUsage, "invalid --user %q: a user UUID is required", cellText(runsUser))
 					}
 					runsUser = id.String()
 				}
-				if runsSince != "" {
+				if sinceSet {
 					if _, err := time.Parse(time.RFC3339, runsSince); err != nil {
 						return uzicli.Exitf(uzicli.ExitUsage, "invalid --since %q: an RFC3339 time such as 2026-01-02T15:04:05Z is required", cellText(runsSince))
 					}

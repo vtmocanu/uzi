@@ -298,6 +298,10 @@ func TestAdminRunDebugHintOnRefusedReads(t *testing.T) {
 		{"run recovery run 404", &uzicli.FakeClient{RecoveryHoldsScopedErr: notFound}, []string{"run", "recovery", recoveryHeldRunID}, uzicli.ExitOK, true},
 		{"run recovery user 404", &uzicli.FakeClient{RecoveryHoldsScopedErr: notFound}, []string{"run", "recovery", "--user", debugOwnerID}, uzicli.ExitNotFound, true},
 		{"admin runs all 403", &uzicli.FakeClient{AdminRunsDebugErr: forbidden}, []string{"admin", "runs", "--all"}, uzicli.ExitAuth, true},
+		{"run recovery run scoped 403", &uzicli.FakeClient{RecoveryHoldsScopedErr: forbidden}, []string{"run", "recovery", recoveryHeldRunID}, uzicli.ExitOK, true},
+		{"run recovery user 403", &uzicli.FakeClient{RecoveryHoldsScopedErr: forbidden}, []string{"run", "recovery", "--user", debugOwnerID}, uzicli.ExitAuth, true},
+		{"run recovery archives 403", &uzicli.FakeClient{RecoveryArchivesErr: forbidden}, []string{"run", "recovery", recoveryHeldRunID}, uzicli.ExitOK, true},
+		{"run recovery archives 404 no holds", &uzicli.FakeClient{RecoveryArchivesErr: notFound}, []string{"run", "recovery", recoveryHeldRunID}, uzicli.ExitOK, true},
 		// Controls: a transport failure is not a refusal, so no hint.
 		{"run inputs unreachable", &uzicli.FakeClient{Err: uzicli.Exitf(uzicli.ExitUnreachable, "down")}, []string{"run", "inputs", recoveryHeldRunID}, uzicli.ExitUnreachable, false},
 	} {
@@ -376,6 +380,10 @@ func TestAdminRunsFlagValidation(t *testing.T) {
 		"bad user":          {"admin", "runs", "--all", "--user", "alice"},
 		"bad since":         {"admin", "runs", "--all", "--since", "yesterday"},
 		"date only since":   {"admin", "runs", "--all", "--since", "2026-01-02"},
+		"empty user":        {"admin", "runs", "--user", ""},
+		"empty since":       {"admin", "runs", "--since", ""},
+		"all empty user":    {"admin", "runs", "--all", "--user", ""},
+		"all empty since":   {"admin", "runs", "--all", "--since", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			fc := &uzicli.FakeClient{}
@@ -469,5 +477,29 @@ func TestSteerAccessIsReadOnlyUnderAdminDebugMarker(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The prerequisites hint prints at most once per command, even when both the scoped holds read and
+// the archives read are refused.
+func TestRunRecoveryHintPrintsOnce(t *testing.T) {
+	notFound := uzicli.Exitf(uzicli.ExitNotFound, "run not found")
+	fc := &uzicli.FakeClient{RecoveryHoldsScopedErr: notFound, RecoveryArchivesErr: notFound}
+	_, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID)
+	if code != uzicli.ExitOK || strings.Count(errb, adminRunDebugHint) != 1 {
+		t.Errorf("exit=%d stderr=%q; want exactly one hint", code, errb)
+	}
+}
+
+// An own run whose holds are listed keeps today's silent degrade on an archives 404 (a hold can
+// outlive its run): no admin-debug hint there.
+func TestRunRecoveryArchives404WithOwnHoldsHasNoHint(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{debugHold("hold-own", recoveryHeldRunID)}},
+		RecoveryArchivesErr: uzicli.Exitf(uzicli.ExitNotFound, "run not found"),
+	}
+	_, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID)
+	if code != uzicli.ExitOK || strings.Contains(errb, adminRunDebugHint) {
+		t.Errorf("exit=%d stderr=%q; want no hint", code, errb)
 	}
 }
