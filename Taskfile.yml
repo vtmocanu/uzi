@@ -1149,7 +1149,7 @@ tasks:
       - node ./scripts/ci-postgres.test.mjs
 
   test:renovate-postgres:
-    desc: hermetic CI Postgres pin extraction, digest updates and grouping
+    desc: hermetic shared Postgres pin extraction, digest updates and grouping
     cmds:
       - node ./scripts/renovate-postgres.test.mjs
 

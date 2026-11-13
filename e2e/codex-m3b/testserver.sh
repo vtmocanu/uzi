@@ -56,7 +56,7 @@ codex_m3b_up() {
   CDR_M3B_ROOT="$(cd "$CDR_M3B_DIR/../.." && pwd)"
   CDR_M3B_PG_NAME="cdr-codexm3b-pg-$$"
   CDR_M3B_PG_PORT="$(( 20000 + (RANDOM % 20000) ))"
-  CDR_M3B_PG_IMAGE="${CDR_M3B_PG_IMAGE:-postgres:17}"
+  CDR_M3B_PG_IMAGE="${CDR_M3B_PG_IMAGE:-postgres:17@sha256:846a7ddaa67a4b354ae1d21087b683901aa6113a4ed626d3787cfbf6c85e3e07}"
   CDR_M3B_PG_WAIT="${CDR_M3B_PG_WAIT_SECS:-120}"
 
   local pgpass
