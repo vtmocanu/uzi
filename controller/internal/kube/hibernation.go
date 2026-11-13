@@ -139,7 +139,8 @@ func applyPodEvidence(o *reconcile.ObservedWorker, pods []corev1.Pod) {
 // container is terminated. A terminal phase alone is not enough, because kubelet
 // eviction publishes phase Failed before it kills the containers. It fails closed: a
 // missing, short or extra status entry, an unnamed match, a running or waiting
-// container, or a pod with no regular containers all read as not stopped. A
+// container, a termination with reason ContainerStatusUnknown (its end was never
+// observed), or a pod with no regular containers all read as not stopped. A
 // deletionTimestamp is irrelevant.
 func podStopped(p corev1.Pod) bool {
 	if p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
@@ -175,7 +176,10 @@ func allTerminated(specNames []string, statuses []corev1.ContainerStatus) bool {
 	}
 	for _, n := range specNames {
 		s, ok := byName[n]
-		if !ok || s.State.Terminated == nil || s.State.Running != nil || s.State.Waiting != nil {
+		// ContainerStatusUnknown is kubelet's or PodGC's placeholder when the container's
+		// end was never observed (node loss): process death unproven (ADR-1470).
+		if !ok || s.State.Terminated == nil || s.State.Running != nil || s.State.Waiting != nil ||
+			s.State.Terminated.Reason == "ContainerStatusUnknown" {
 			return false
 		}
 	}
