@@ -582,6 +582,15 @@ one). It polls the api outbound, listens on nothing, and materializes each hoste
 worker's Deployment + Secret + PVCs into the `uzi-workers` namespace, which contains
 nothing else by design.
 
+### Workload metadata for admission policies
+
+`workloadLabels` and `workloadAnnotations` add labels and annotations to every
+Deployment and StatefulSet the chart renders and to every hosted worker Deployment the
+controller creates, e.g. a policy exemption annotation or a required owner label. They
+go on the workload's own metadata, not the pod template, so no worker or app pod rolls;
+an existing worker picks them up the next time the controller updates its Deployment.
+Values must be strings, and a label uzi already sets, or any `uzi.dev/` key, is refused.
+
 ### Expanding existing worker data volumes
 
 New persistent L workers request 50Gi of `/data` (#2013), and Docker workers' DinD
