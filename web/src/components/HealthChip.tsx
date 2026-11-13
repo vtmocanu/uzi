@@ -38,15 +38,13 @@ export function HealthChip() {
     if (returnFocus) triggerRef.current?.focus();
   }, []);
 
-  // The chip sits left of centre in the header, so a panel right-aligned to it can run past the
-  // viewport's left edge at sm+. Prefer the chip's right edge, then its left edge, and only then
-  // clamp into the visible width, so the panel stays attached to the chip.
-  // Below sm the fixed bottom sheet places itself, so no inline style there (it would override
-  // inset-x-4). The query uses Tailwind's rem breakpoint so both switch at the same width.
-  const [panelLeft, setPanelLeft] = useState<number | null>(null);
+  // At sm+ the Overview panel aligns with the shell's content column. A standalone chip has no
+  // column anchor, so it keeps the original chip-attached placement. Below sm the fixed bottom
+  // sheet places itself with CSS: no inline left or width may override its insets.
+  const [panelPlacement, setPanelPlacement] = useState<{ left: number; width?: number } | null>(null);
   useLayoutEffect(() => {
     if (!open) {
-      setPanelLeft(null);
+      setPanelPlacement(null);
       return;
     }
     // jsdom has no matchMedia: treat it as "not sm+" and leave the CSS placement alone.
@@ -55,23 +53,29 @@ export function HealthChip() {
       const host = hostRef.current;
       const panel = panelRef.current;
       if (!host || !panel || !mq?.matches) {
-        setPanelLeft(null);
+        setPanelPlacement(null);
         return;
       }
       const hostRect = host.getBoundingClientRect();
+      const column = host.closest<HTMLElement>("[data-page-content-column]");
+      if (column) {
+        const rect = column.getBoundingClientRect();
+        setPanelPlacement({ left: rect.left - hostRect.left, width: rect.width });
+        return;
+      }
+      // No shell anchor (for example a standalone component): preserve the original placement.
       const width = panel.offsetWidth;
       // Floor at the content column (the shell's <main>), so a fixed sidebar is never covered.
       const minLeft = Math.max(16, host.closest("main")?.getBoundingClientRect().left ?? 0);
       const max = document.documentElement.clientWidth - 16 - width;
       const preferred = hostRect.right - width >= minLeft ? hostRect.right - width : hostRect.left;
       const abs = Math.max(16, Math.min(Math.max(preferred, minLeft), max));
-      setPanelLeft(abs - hostRect.left);
+      setPanelPlacement({ left: abs - hostRect.left });
     };
     place();
     window.addEventListener("resize", place);
-    // The header is a wrapping flex row with live content: a sibling (Search, the People chip),
-    // the chip itself (a refreshed verdict) or the row can change size and move the chip without
-    // a window resize. The offset above is relative to the chip, so re-place on any of those.
+    // The header is a wrapping flex row with live content. A sibling, the chip, or the row can
+    // change size and move the chip without a window resize; the offset is relative to the chip.
     const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => place());
     const row = hostRef.current?.parentElement;
     if (ro && row) {
@@ -167,7 +171,7 @@ export function HealthChip() {
           role="dialog"
           aria-label="System health"
           tabIndex={-1}
-          style={panelLeft == null ? undefined : { left: panelLeft, right: "auto" }}
+          style={panelPlacement == null ? undefined : { left: panelPlacement.left, width: panelPlacement.width, right: "auto" }}
           // Below the chip at sm+ (placed by the layout effect above), a bottom sheet below sm.
           className="absolute right-0 top-full z-30 mt-2 max-h-[70vh] w-[min(40rem,calc(100vw-32px))] overflow-y-auto rounded-xl border border-edge bg-raised text-left shadow-2xl outline-hidden max-sm:fixed max-sm:inset-x-4 max-sm:bottom-4 max-sm:top-auto max-sm:mt-0 max-sm:max-h-[calc(100dvh-2rem)] max-sm:w-auto"
         >
@@ -178,7 +182,7 @@ export function HealthChip() {
             </div>
             <ul className="space-y-1.5">
               {attention.map((c) => (
-                <HealthCheckRow key={c.id} check={c} />
+                <HealthCheckRow key={c.id} check={c} twoColumnDetails />
               ))}
             </ul>
           </div>

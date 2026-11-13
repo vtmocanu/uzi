@@ -1450,6 +1450,77 @@ describe("OverviewNext health chip popover", () => {
     return screen.findByRole("button", { name: /System health/ });
   }
 
+  async function mountInColumn(width: number, sidebarWidth: number) {
+    await page.viewport(width, 900);
+    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <div style={{ paddingLeft: sidebarWidth }}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+            <div data-page-content-column className="mx-auto w-full max-w-[68rem]">
+              <CommandMenuContext.Provider value={{ open: () => {} }}>
+                <OverviewNext />
+              </CommandMenuContext.Provider>
+            </div>
+          </main>
+        </div>
+      </MemoryRouter>,
+    );
+    return screen.findByRole("button", { name: /System health/ });
+  }
+
+  const column = () => document.querySelector<HTMLElement>("[data-page-content-column]")!;
+  const edgeError = (panel: HTMLElement) => {
+    const c = column().getBoundingClientRect();
+    const p = panel.getBoundingClientRect();
+    return Math.max(Math.abs(p.left - c.left), Math.abs(p.right - c.right));
+  };
+
+  it("spans the content column at sm+ with the sidebar expanded or collapsed", async () => {
+    for (const [width, sidebar] of [
+      [640, 0], [768, 0], [1024, 240], [1280, 240], [1440, 240], [1920, 240], [1280, 56],
+    ]) {
+      cleanup();
+      const chip = await mountInColumn(width, sidebar);
+      await userEvent.click(chip);
+      const panel = await screen.findByRole("dialog", { name: "System health" });
+      await document.fonts.ready;
+      await expect.poll(() => edgeError(panel)).toBeLessThanOrEqual(1);
+      expect(panel.getBoundingClientRect().top).toBeGreaterThanOrEqual(chip.getBoundingClientRect().bottom);
+      const details = panel.querySelector<HTMLElement>("[data-health-evidence-grid]")!;
+      expect(getComputedStyle(details).display).toBe("grid");
+      expect(getComputedStyle(details).gridTemplateColumns.split(" ")).toHaveLength(2);
+    }
+  });
+
+  it("keeps the panel on the column when the header reflows without a window resize", async () => {
+    const chip = await mountInColumn(1280, 240);
+    const host = chip.parentElement!;
+    const preceding = document.createElement("span");
+    preceding.setAttribute("aria-hidden", "true");
+    preceding.style.cssText = "display:block;flex:0 0 auto;width:0;height:1px";
+    host.parentElement!.insertBefore(preceding, host);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    await expect.poll(() => edgeError(panel)).toBeLessThanOrEqual(1);
+    const before = chip.getBoundingClientRect().left;
+    preceding.style.width = "720px";
+    await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
+    await expect.poll(() => edgeError(panel)).toBeLessThanOrEqual(1);
+  });
+
+  it("keeps the bottom sheet when the column anchor exists below sm", async () => {
+    const chip = await mountInColumn(375, 0);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    const r = panel.getBoundingClientRect();
+    expect(Math.abs(r.left - 16)).toBeLessThanOrEqual(1);
+    expect(Math.abs(window.innerWidth - r.right - 16)).toBeLessThanOrEqual(1);
+    expect(panel.style.left).toBe("");
+    expect(panel.style.width).toBe("");
+    expect(getComputedStyle(panel.querySelector<HTMLElement>("[data-health-evidence-grid]")!).display).toBe("contents");
+  });
+
   it("opens on click, closes on Escape and on a click elsewhere, and returns focus to the chip", async () => {
     await page.viewport(1280, 900);
     const chip = await mountChip();

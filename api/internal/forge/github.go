@@ -27,7 +27,7 @@ const githubPerPage = 100
 // label create — the same accommodation the Forgejo driver makes.
 const githubDefaultLabelColor = "ededed"
 
-// github is the GitHub REST driver (D3/D5): github.com only, classic PAT,
+// github is the GitHub REST driver (D3/D5): github.com, or a GHES host via its /api/v3 base; classic PAT,
 // built on github.com/google/go-github/v92. Unlike the gitea SDK the Forgejo
 // driver uses, go-github takes ctx PER METHOD, so a SINGLE long-lived
 // *github.Client is safe to reuse across calls — no per-call client rebuild
@@ -79,10 +79,10 @@ var (
 // Base-URL handling (D3, reconciled with the no-GHES scope): production connects
 // with the WEB host https://github.com; the driver targets the default API host
 // api.github.com, which go-github uses out of the box — so an empty base or
-// github.com means "use go-github's default". Any OTHER base (the httptest URL a
-// test/fake points us at) is treated as the API base via WithEnterpriseURLs. This
-// is NOT GHES support (out of scope, not validated or advertised): it is the same
-// base-URL injection the gitlab/forgejo test harnesses use to reach a local server.
+// github.com means "use go-github's default". Any OTHER base is treated as the API
+// base via WithEnterpriseURLs, which appends /api/v3/: a GHES web host (the worker
+// derives the same <host>/api/v3 in agent/src/forge.ts), or the httptest URL a
+// test/fake points us at. CI exercises only the latter.
 func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
 	// Wrap the HTTP client's transport with the process-wide ETag RoundTripper
 	// (D4) so conditional GETs on the new read paths replay a cached 200 on 304

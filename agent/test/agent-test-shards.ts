@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-const shards = ["1/2", "2/2"] as const;
+const shards = ["1/3", "2/3", "3/3"] as const;
 
 function canonicalPath(value: unknown): value is string {
   return typeof value === "string"
@@ -20,7 +20,7 @@ export function selectAgentTests(
   }
   if (pins === null || typeof pins !== "object" || Array.isArray(pins)
     || Object.keys(pins).sort().join(",") !== shards.join(",")) {
-    throw new Error('Pins must have exactly the keys "1/2" and "2/2"');
+    throw new Error('Pins must have exactly the keys "1/3", "2/3" and "3/3"');
   }
   const assignments = new Map<string, string>();
   for (const key of shards) {
@@ -39,12 +39,12 @@ export function selectAgentTests(
     }
   }
   if (shard !== undefined && !shards.some((key) => key === shard)) {
-    throw new Error('Shard must be "1/2" or "2/2"');
+    throw new Error('Shard must be "1/3", "2/3" or "3/3"');
   }
   const selected = [...inventory].sort().filter((file) => {
     if (shard === undefined) return true;
     const assigned = assignments.get(file)
-      ?? shards[createHash("sha256").update(file, "utf8").digest()[0]! % 2];
+      ?? shards[createHash("sha256").update(file, "utf8").digest()[0]! % shards.length];
     return assigned === shard;
   });
   if (shard !== undefined && selected.length === 0) throw new Error(`Empty shard: ${shard}`);

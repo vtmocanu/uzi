@@ -1743,9 +1743,9 @@ const server = https.createServer(
 
         // Pull requests.
         if (method === "POST" && rest === "/pulls") {
-          // CreatePullRequest (the worker opens the PR — reached via the worker's
-          // api.github.com host mapping once runner.ts wires GitHubClient; also driven
-          // directly by the harness smoke). 422 on an existing OPEN PR for the same
+          // CreatePullRequest (the worker opens the PR — its GitHubClient derives
+          // <host>/api/v3 for a non-github.com host, which lands here, covered by
+          // test:forge-fake-contract; also driven directly by the harness smoke). 422 on an existing OPEN PR for the same
           // head/base — GitHub's generic-validation status, which the worker's
           // driver-declared duplicate set {409,422} catches (R6).
           const body = await readBody(req);

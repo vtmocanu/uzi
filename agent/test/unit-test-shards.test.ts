@@ -23,9 +23,10 @@ const survivingFiles = [
 function shardInvocation(files: readonly string[], shard: number): string[] {
   const canonical = files.map((file) => `test/${file.slice(0, -4)}`);
   return selectAgentTests(canonical, {
-    "1/2": ["test/runner-held-publication-fallbacks.test.ts"],
-    "2/2": ["test/runner-midturn-checkpoint.test.ts", "test/runner-retained-episode.test.ts"],
-  }, `${shard}/2`)
+    "1/3": ["test/runner-held-publication-fallbacks.test.ts"],
+    "2/3": ["test/runner-midturn-checkpoint.test.ts"],
+    "3/3": ["test/runner-retained-episode.test.ts"],
+  }, `${shard}/3`)
     .map((file) => `${file.slice(5)}.mjs`);
 }
 
@@ -40,9 +41,9 @@ function observeMembership(directory: string, files: readonly string[]): Map<str
   const membership = new Map<string, number>();
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT; // Each child must start an independent node:test runner.
-  // Exactly two sequential children per observation; a failed child blocks the
+  // Exactly three sequential children per observation; a failed child blocks the
   // observation. Each child has a 30s process bound as well as Node's test cap.
-  for (const shard of [1, 2]) {
+  for (const shard of [1, 2, 3]) {
     const args = [
       "--test",
       "--test-reporter=tap",
@@ -80,32 +81,34 @@ function observeMembership(directory: string, files: readonly string[]): Map<str
   return membership;
 }
 
-const emptyPins = { "1/2": [], "2/2": [] };
+const emptyPins = { "1/3": [], "2/3": [], "3/3": [] };
 const vectors = [
-  // SHA-256 first bytes: e7, 0c, 36, 68, 0b respectively.
-  ["test/a.test.ts", "2/2"],
-  ["test/b.test.ts", "1/2"],
-  ["test/worker.test.ts", "1/2"],
-  ["test/config.test.ts", "1/2"],
-  ["test/é.test.ts", "2/2"],
+  // SHA-256 first bytes: e7, 0c, 36, 68, 0b, d6 respectively (modulo three).
+  ["test/a.test.ts", "1/3"],
+  ["test/b.test.ts", "1/3"],
+  ["test/worker.test.ts", "1/3"],
+  ["test/config.test.ts", "3/3"],
+  ["test/é.test.ts", "3/3"],
+  ["test/scheduler.test.ts", "2/3"],
 ] as const;
 const inventory = vectors.map(([file]) => file);
 
 test("exact UTF-8 SHA-256 vectors, sorted results, order independence, and pin override", () => {
-  for (const shard of ["1/2", "2/2"]) {
+  for (const shard of ["1/3", "2/3", "3/3"]) {
     const expected = vectors.filter(([, expectedShard]) => expectedShard === shard)
       .map(([file]) => file).sort();
     assert.deepEqual(selectAgentTests(inventory, emptyPins, shard), expected);
     assert.deepEqual(selectAgentTests([...inventory].reverse(), emptyPins, shard), expected);
   }
-  const pins = { "1/2": ["test/a.test.ts"], "2/2": ["test/b.test.ts"] };
-  assert.ok(selectAgentTests(inventory, pins, "1/2").includes("test/a.test.ts"));
-  assert.ok(selectAgentTests(inventory, pins, "2/2").includes("test/b.test.ts"));
+  const pins = { "1/3": ["test/config.test.ts"], "2/3": ["test/a.test.ts"], "3/3": ["test/b.test.ts"] };
+  assert.ok(selectAgentTests(inventory, pins, "1/3").includes("test/config.test.ts"));
+  assert.ok(selectAgentTests(inventory, pins, "2/3").includes("test/a.test.ts"));
+  assert.ok(selectAgentTests(inventory, pins, "3/3").includes("test/b.test.ts"));
   assert.deepEqual(selectAgentTests(inventory, pins), [...inventory].sort());
 });
 
 test("unpinned add/delete and rename never move another path or edit pins", () => {
-  const pins = { "1/2": ["test/a.test.ts"], "2/2": [] };
+  const pins = { "1/3": [], "2/3": ["test/a.test.ts"], "3/3": [] };
   const original = JSON.stringify(pins);
   const variants = [
     [...inventory, "test/new.test.ts"],
@@ -113,7 +116,7 @@ test("unpinned add/delete and rename never move another path or edit pins", () =
     inventory.map((file) => file === "test/worker.test.ts" ? "test/renamed.test.ts" : file),
   ];
   for (const changed of variants) {
-    for (const shard of ["1/2", "2/2"]) {
+    for (const shard of ["1/3", "2/3", "3/3"]) {
       const before = selectAgentTests(inventory, pins, shard);
       const after = selectAgentTests(changed, pins, shard);
       for (const file of inventory.filter((file) => changed.includes(file))) {
@@ -128,21 +131,24 @@ test("unpinned add/delete and rename never move another path or edit pins", () =
 test("pin structures, canonical names, sortedness, duplicates and stale entries fail closed", () => {
   const badPins: unknown[] = [
     null, [], {}, { ...emptyPins, extra: [] },
-    { "1/2": [], "2/2": "test/a.test.ts" },
-    { "1/2": [1], "2/2": [] },
-    { "1/2": ["test/a.test.ts", "test/a.test.ts"], "2/2": [] },
-    { "1/2": ["test/a.test.ts"], "2/2": ["test/a.test.ts"] },
-    { "1/2": ["test/b.test.ts", "test/a.test.ts"], "2/2": [] },
+    { "1/3": [], "2/3": [], "3/3": "test/a.test.ts" },
+    { "1/2": [], "2/2": [] },
+    { "1/3": [], "2/3": [] },
+    { "1/3": [1], "2/3": [], "3/3": [] },
+    { "1/3": ["test/a.test.ts", "test/a.test.ts"], "2/3": [], "3/3": [] },
+    { "1/3": ["test/a.test.ts"], "2/3": ["test/a.test.ts"], "3/3": [] },
+    { "1/3": [], "2/3": ["test/a.test.ts"], "3/3": ["test/a.test.ts"] },
+    { "1/3": ["test/b.test.ts", "test/a.test.ts"], "2/3": [], "3/3": [] },
     ...["test/missing.test.ts", "/test/a.test.ts", "test/../a.test.ts",
       "test/sub/a.test.ts", "test\\a.test.ts", "test/a.ts", "test/a.test.ts.mjs"]
-      .map((file) => ({ "1/2": [file], "2/2": [] })),
+      .map((file) => ({ "1/3": [file], "2/3": [], "3/3": [] })),
   ];
   for (const pins of badPins) {
-    for (const shard of [undefined, "1/2"]) {
+    for (const shard of [undefined, "1/3"]) {
       assert.throws(() => selectAgentTests(inventory, pins, shard), Error, JSON.stringify(pins));
     }
   }
-  for (const invalid of ["1/3", "0/2", "3/2", "1", ""]) {
+  for (const invalid of ["1/2", "2/2", "0/3", "4/3", "1", ""]) {
     assert.throws(() => selectAgentTests(inventory, emptyPins, invalid), /Shard/);
   }
   for (const invalid of ["../test/a.test.ts", "/test/a.test.ts", "test/sub/a.test.ts", "test/a.test.ts.mjs",
@@ -152,11 +158,11 @@ test("pin structures, canonical names, sortedness, duplicates and stale entries 
   }
   assert.throws(() => selectAgentTests([], emptyPins), /Inventory/);
   assert.throws(() => selectAgentTests([inventory[0]!, inventory[0]!], emptyPins), /Inventory/);
-  assert.throws(() => selectAgentTests(["test/a.test.ts"], emptyPins, "1/2"), /Empty shard/);
+  assert.throws(() => selectAgentTests(["test/a.test.ts"], emptyPins, "2/3"), /Empty shard/);
 });
 
 const agentRoot = fileURLToPath(new URL("../", import.meta.url));
-const fixtureNames = ["a", "b", "config", "worker"];
+const fixtureNames = ["a", "b", "config", "scheduler", "worker"];
 const require = createRequire(import.meta.url);
 
 function launcherFixture(): string {
@@ -228,7 +234,7 @@ test("actual launcher runs the full inventory, each shard, filters, reporters an
     for (const name of fixtureNames) assert.ok(xml.includes("fixture:" + name), xml);
     assert.match(full.stdout, /fixture:a/);
     const union = new Set<string>();
-    for (const shard of ["1/2", "2/2"]) {
+    for (const shard of ["1/3", "2/3", "3/3"]) {
       const result = runLauncher(root, { UZI_AGENT_TEST_SHARD: shard });
       assert.ifError(result.error);
       assert.equal(result.status, 0, result.stdout + result.stderr);
@@ -251,7 +257,7 @@ test("actual launcher runs the full inventory, each shard, filters, reporters an
       assert.deepEqual(observed, expected.toSorted(), "filters must control the exact executed fixture set");
     };
     assertFiltered(["--test-name-pattern", "fixture:a"], ["a"]);
-    assertFiltered(["--test-skip-pattern=fixture:b"], ["a", "config", "worker"]);
+    assertFiltered(["--test-skip-pattern=fixture:b"], ["a", "config", "scheduler", "worker"]);
     assertFiltered(["--test-name-pattern=--unmatched"], []);
     assertFiltered(["--test-only"], ["a"]);
     const exactExit = path.join(root, "exit.cjs");
@@ -270,7 +276,7 @@ test("actual launcher rejects widening/override arguments, bad settings and malf
   const root = launcherFixture();
   try {
     for (const args of [
-      ["test/a.test.ts"], ["--test-shard=1/2"], ["--test-timeout=1"],
+      ["test/a.test.ts"], ["--test-shard=1/3"], ["--test-timeout=1"],
       ["--test-reporter=tap"], ["--test-reporter-destination=elsewhere"],
       ["--import=other"], ["--"], ["--test-name-pattern"], ["--test-name-pattern=["],
     ]) {
@@ -279,12 +285,12 @@ test("actual launcher rejects widening/override arguments, bad settings and malf
       assert.doesNotMatch(result.stdout, /fixture:/);
     }
     for (const extra of [
-      { UZI_AGENT_TEST_SHARD: "1/3" }, { UZI_AGENT_TEST_CONCURRENCY: "0" },
+      { UZI_AGENT_TEST_SHARD: "1/2" }, { UZI_AGENT_TEST_SHARD: "4/3" }, { UZI_AGENT_TEST_CONCURRENCY: "0" },
       { UZI_AGENT_TEST_CONCURRENCY: "x2" },
     ]) assert.equal(runLauncher(root, extra).status, 1);
     writeFileSync(path.join(root, "test-shards.json"), "{");
     assert.equal(runLauncher(root).status, 1);
-    writeFileSync(path.join(root, "test-shards.json"), '{"1/2":["test/missing.test.ts"],"2/2":[]}');
+    writeFileSync(path.join(root, "test-shards.json"), '{"1/3":["test/missing.test.ts"],"2/3":[],"3/3":[]}');
     assert.equal(runLauncher(root).status, 1);
     writeFileSync(path.join(root, "test-shards.json"), JSON.stringify(emptyPins));
     for (const name of fixtureNames) unlinkSync(path.join(root, "test", name + ".test.ts"));
@@ -303,7 +309,7 @@ for (const route of ["argument", "pin"] as const) {
     try {
       if (route === "pin") {
         writeFileSync(path.join(root, "test-shards.json"), JSON.stringify({
-          "1/2": ["test/" + payload + ".test.ts"], "2/2": [],
+          "1/3": ["test/" + payload + ".test.ts"], "2/3": [], "3/3": [],
         }));
       }
       const result = runLauncher(root, {}, route === "argument" ? ["--unknown-" + payload] : []);

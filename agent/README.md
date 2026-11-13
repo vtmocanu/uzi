@@ -39,23 +39,23 @@ npm start           # tsx src/main.ts  (needs the env vars below)
 process preload, a 120000 ms test timeout, and inherited environment and stdio.
 `UZI_AGENT_TEST_CONCURRENCY` sets a positive integer concurrency;
 `UZI_AGENT_TEST_JUNIT` adds spec output on stdout and JUnit at the named path.
-With `UZI_AGENT_TEST_SHARD=1/2` or `2/2`, the launcher selects explicit
+With `UZI_AGENT_TEST_SHARD=1/3`, `2/3` or `3/3`, the launcher selects explicit
 sorted top-level `test/*.test.ts` files. It never also passes native sharding.
 With no shard, it runs the entire inventory and still validates the pins.
 
 Ordinary additions and unpinned deletions need no pin edits. Unpinned paths use
-the first SHA-256 digest byte of their UTF-8 agent-relative path: even goes to
-1/2, odd to 2/2. Only a renamed unpinned file may move. The small
+the first SHA-256 digest byte of their UTF-8 agent-relative path, modulo three:
+0 goes to 1/3, 1 to 2/3 and 2 to 3/3. Only a renamed unpinned file may move. The small
 `test-shards.json` overrides heavy files; a pinned rename or deletion fails
 closed until its entry is updated. Arrays must remain sorted and unique,
-with exactly the two shard keys. This is not an inventory manifest.
+with exactly the three shard keys. This is not an inventory manifest.
 
 Re-pin newly heavy tests from CI per-file timings: seed each shard with the
 measured hashed remainder, add the M4 overhead to its shard after converting
 wall seconds to load at the CI concurrency, then place heavy tests longest
-first on the lighter shard. Keep unmeasured files hashed with unknown costs.
+first on the lightest shard. Keep unmeasured files hashed with unknown costs.
 Compare the resulting load estimates and run focused selector/launcher tests.
-Run both `task test:agent:shard` legs with matching JUnit destinations and M4
+Run all three `task test:agent:shard` legs with matching JUnit destinations and M4
 once in the shard-1 composition, then run `task check:agent-shards` over the
 actual reports and success marker. This independently proves the tracked-file
 union and disjointness before accepting new pins. See [ADR-3121](../adr/3121-stable-agent-test-shards.md)
