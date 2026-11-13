@@ -165,7 +165,9 @@ migration). If nothing was scaled down, a refusal returns the worker to normal.
 Preparation that does not finish within 10 minutes is withdrawn into a wake.
 
 A wake completes only when the new pod registers (or the original pod is still
-alive). A wake not confirmed within 15 minutes shows a wake error on the worker.
+alive). A wake not confirmed within 15 minutes records `wake_error` on the worker
+("wake not confirmed within 15m"), shown as a wake error. The worker stays waking, and the error clears once
+the wake settles.
 
 A wake from zero replicas waits until the old pod has fully stopped, meaning every
 container (init and ephemeral included) has terminated. A pod whose containers are

@@ -142,7 +142,9 @@ func applyPodEvidence(o *reconcile.ObservedWorker, pods []corev1.Pod) {
 // container, or a pod with no regular containers all read as not stopped. Any
 // terminated reason counts, ContainerStatusUnknown included: kubelet writes it when it
 // finalises a terminated pod or when the runtime no longer lists a container that was
-// running, so the runtime holds no such container, and refusing it would hold the wake
+// running. That is the kubelet's report, not proof of process death: after node loss
+// the reason can leave death unproven (ADR-1470), and an unreachable node's pod usually
+// keeps stale Running statuses instead. Refusing it would hold the wake
 // for good behind an ordinary eviction's residue (PRD #4205 D27; a deliberate
 // departure from ADR-1470's stricter roll-promotion reading). A
 // deletionTimestamp is irrelevant.
