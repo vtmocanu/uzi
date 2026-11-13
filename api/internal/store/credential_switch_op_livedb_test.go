@@ -219,6 +219,14 @@ func TestCredentialSwitchOpFenceAndHoldIdentityLiveDB(t *testing.T) {
 	if err != nil || n != 0 {
 		t.Fatalf("ClearCredentialSwitchStampByOp with a foreign op: rows=%d err=%v", n, err)
 	}
+	n, err = f.q.ClearCredentialSwitchByWorker(ctx, store.ClearCredentialSwitchByWorkerParams{ID: id, WorkerID: workerID, Generation: 1, OpID: op})
+	if err != nil || n != 0 {
+		t.Fatalf("clear with the matching op id and no register nonce: rows=%d err=%v", n, err)
+	}
+	n, err = f.q.ClearCredentialSwitchByWorker(ctx, store.ClearCredentialSwitchByWorkerParams{ID: id, WorkerID: workerID, Generation: 1, OpID: op, RegisterNonce: pgtype.Text{String: "nonce-stale", Valid: true}})
+	if err != nil || n != 0 {
+		t.Fatalf("clear with the matching op id and a wrong register nonce: rows=%d err=%v", n, err)
+	}
 	n, err = f.q.ClearCredentialSwitchByWorker(ctx, store.ClearCredentialSwitchByWorkerParams{ID: id, WorkerID: workerID, Generation: 1, OpID: op, RegisterNonce: pgtype.Text{String: "nonce-a", Valid: true}})
 	if err != nil || n != 1 {
 		t.Fatalf("clear with the matching op id: rows=%d err=%v", n, err)

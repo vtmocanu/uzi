@@ -47,7 +47,10 @@ type InputReceiptResult struct {
 // receiptInactiveReason reports why this worker's claim generation cannot consume inputs,
 // or "" when it can. A terminal run keeps its worker_id and generation, and a requeued run
 // keeps worker_id for affinity, so status is part of the fence: an ACK in flight across a
-// completion or a requeue must not mark a late cancel or verdict delivered.
+// completion or a requeue must not mark a late cancel or verdict delivered. A pending credential
+// switch makes the claim inactive (ReceiptSwitchPending) only for a worker whose /inputs drain is
+// fenced by it; an in-place worker (inPlaceSwitchDrains) keeps its claim and drains normally, so
+// its receipts behave as on an active claim.
 func receiptInactiveReason(run store.LockRunForInputReceiptRow, wkr store.Worker, generation int64) string {
 	switch {
 	case !run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID || run.ClaimGeneration != generation,
@@ -55,7 +58,7 @@ func receiptInactiveReason(run store.LockRunForInputReceiptRow, wkr store.Worker
 		return ReceiptStale
 	case run.ClaimReleasedAt.Valid:
 		return ReceiptReleased
-	case run.CredentialSwitchRequestedAt.Valid && run.CredentialSwitchGeneration.Valid && run.CredentialSwitchGeneration.Int64 == generation:
+	case run.CredentialSwitchRequestedAt.Valid && run.CredentialSwitchGeneration.Valid && run.CredentialSwitchGeneration.Int64 == generation && !inPlaceSwitchDrains(wkr):
 		return ReceiptSwitchPending
 	}
 	return ""

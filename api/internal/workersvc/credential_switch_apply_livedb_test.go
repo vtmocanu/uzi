@@ -1089,6 +1089,11 @@ func TestCredentialSwitchUncertainLiveDB(t *testing.T) {
 		if st := statusOf(t, f.env, run); st != "paused" {
 			t.Fatalf("status = %s, want paused and never queued", st)
 		}
+		// The crash-recovery path: a re-register must not requeue the paused run either.
+		f.reRegister(t, run)
+		if st := statusOf(t, f.env, run); st != "paused" {
+			t.Fatalf("status after re-register = %s, want paused and never queued", st)
+		}
 	})
 	t.Run("op id is required", func(t *testing.T) {
 		run, _ := f.run(t, "running")
@@ -1123,6 +1128,42 @@ func TestInputsDrainForInPlaceWorkerDuringPendingSwitchLiveDB(t *testing.T) {
 	}
 	if got.CredentialSwitch == nil || len(got.Inputs) != 0 {
 		t.Fatalf("a v1 worker must get the signal and no inputs: %+v", got)
+	}
+}
+
+// An in-place worker's receipts behave as on an active claim during a pending switch (the drain
+// is not fenced, so the ACK and APPLIED of what it drained must not be), while a v1-only worker
+// keeps switch_pending on its receipts.
+func TestReceiptsForInPlaceWorkerDuringPendingSwitchLiveDB(t *testing.T) {
+	f := newApplyFx(t)
+	run, _ := f.run(t, "running")
+	f.env.exec(`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'follow_up', 'steer me')`, run)
+	got, err := f.svc.ConsumeInputs(f.env.ctx, f.worker(t), run)
+	if err != nil || len(got.Inputs) != 1 {
+		t.Fatalf("drain: inputs=%d err=%v", len(got.Inputs), err)
+	}
+	ids := []int64{got.Inputs[0].ID}
+	res, err := f.svc.AckInputs(f.env.ctx, f.worker(t), run, f.gen, ids)
+	if err != nil || !res.Active || res.Reason != "" {
+		t.Fatalf("in-place ACK during a pending switch: res=%+v err=%v, want active success", res, err)
+	}
+	res, err = f.svc.ApplyInputs(f.env.ctx, f.worker(t), run, f.gen, ids)
+	if err != nil || !res.Active || res.Reason != "" {
+		t.Fatalf("in-place APPLIED during a pending switch: res=%+v err=%v, want active success", res, err)
+	}
+
+	// A v1-only worker: the ACK of a fresh row is refused with switch_pending.
+	run2, _ := f.run(t, "running")
+	f.env.exec(`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'follow_up', 'v1 steer')`, run2)
+	var id2 int64
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT id FROM run_user_inputs WHERE run_id = $1`, run2).Scan(&id2); err != nil {
+		t.Fatal(err)
+	}
+	f.env.exec(`UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, f.o.workerID, []string{capability.CredentialSwitchV1, capability.InputReceiptsV1})
+	_, err = f.svc.AckInputs(f.env.ctx, f.worker(t), run2, f.gen, []int64{id2})
+	var conflict *InputReceiptConflictError
+	if !errors.As(err, &conflict) || conflict.Reason != ReceiptSwitchPending {
+		t.Fatalf("v1 ACK during a pending switch: err=%v, want switch_pending conflict", err)
 	}
 }
 

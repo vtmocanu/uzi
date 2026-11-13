@@ -4,10 +4,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { OutgoingMessage } from "../src/protocol.js";
+import type { ClaimResponse, OutgoingMessage } from "../src/protocol.js";
 import { randomUUID } from "node:crypto";
 import type { Logger } from "../src/log.js";
-import type { ClaimResponse } from "../src/protocol.js";
 import os from "node:os";
 import { MessageBatcher, MAX_MESSAGE_BYTES } from "../src/batcher.js";
 import { RequestError, ReportPreconditionError, type CredentialSwitchApplyResult, type WorkerClient } from "../src/client.js";
@@ -403,9 +402,8 @@ describe("issue #4201 m5 (AC1): the follow_up and question_reentry sites apply i
 
 /**
  * Runs `site` with the in-place quiescence proof held open (the switch pending, nothing applied), sends `inputs`
- * meanwhile against the in-place server model (api.inPlaceInputDrain: GET drains during the pending switch, APPLIED for
- * these rows is refused switch_pending). Proves the worker routes them during the hold and that their APPLIED lands
- * only once the stamp clears, then returns the finished run with the input ids.
+ * meanwhile against the in-place server model (api.inPlaceInputDrain: GET drains and receipts are accepted as on an
+ * active claim during the pending switch). Proves the worker fetches, ACKs and APPLIES them during the hold, then returns the finished run with the input ids.
  */
 async function withInputsWhileSwitchPending(
   site: "ask_user" | "implement_turn",
@@ -441,37 +439,34 @@ async function withInputsWhileSwitchPending(
     const rows = send(runId, ...inputs(runId, question));
     assert.ok(rows.length >= 1);
     ids = rows.map((input) => input.id);
-    // The in-place server drains inputs during a pending switch, so the worker fetches and routes (ACKs) them DURING the
-    // hold, before any apply. Their APPLIED receipts are refused 409 switch_pending, so the worker parks the ids ready
-    // and the rows stay unapplied server-side until the stamp clears.
-    assert.ok(await until(() => ids.every((id) => api.isAcked(runId, id)), 10_000), "every input was fetched and routed during the hold");
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // The in-place server drains inputs during a pending switch and treats the claim as active for receipts, so the
+    // worker fetches and ACKs every input DURING the hold, before any apply.
+    assert.ok(await until(() => ids.every((id) => api.isAcked(runId, id)), 10_000), "every input was fetched and ACKed during the hold");
+    assert.ok(await until(() => ids.every((id) => api.isApplied(runId, id)), 10_000), "every input was APPLIED during the hold");
     assert.equal(applied().length, 0, "the switch is still unapplied: delivery did not wait for it");
-    assert.deepEqual(ids.map((id) => api.isApplied(runId, id)), ids.map(() => false), "no APPLIED receipt landed while the stamp was pending");
-    assert.ok(api.pendingInputRows(runId).length >= ids.length, "the rows are still pending server-side: none was lost");
   } finally { release(); }
   const r = await finished;
   assert.equal(applied().length, 1, "the held switch then applied");
-  for (const id of ids) assert.ok(api.isAcked(runId, id) && api.isApplied(runId, id), `input ${id} was routed and applied once the switch resolved`);
+  for (const id of ids) assert.ok(api.isAcked(runId, id) && api.isApplied(runId, id), `input ${id} was routed and applied by the end of the run`);
   return { r, runId, ids };
 }
 
-describe("issue #4201 m5 (AC7): owner inputs sent while a switch is pending and unapplied are routed during the hold and applied once it clears, never lost", () => {
-  it("an answer to the open question is routed during the hold, resolves the re-asked question and reaches the model on the new token", TIMEOUT, async () => {
+describe("issue #4201 m5 (AC7): owner inputs sent while a switch is pending and unapplied are fetched, ACKed and APPLIED or acted on during the hold, before the apply, never lost", () => {
+  it("an answer to the open question is fetched, ACKed and APPLIED during the hold, resolves the re-asked question and reaches the model on the new token", TIMEOUT, async () => {
     const { r } = await withInputsWhileSwitchPending("ask_user", (_runId, question) =>
       [row("answer", JSON.stringify({ question_id: question, answers: ["postgres-ANSWER"] }))]);
     assert.ok(r.turns.filter((t) => t.token === NEW_TOKEN).some((t) => t.prompt.includes("postgres-ANSWER")), "the answer reached the model after the apply");
     assert.ok(statusesOf(r).includes("completed"), statusesOf(r).join(","));
   });
 
-  it("a steering message is routed during the hold and reaches the model on the new token", TIMEOUT, async () => {
+  it("a steering message is fetched, ACKed and APPLIED during the hold and reaches the model on the new token", TIMEOUT, async () => {
     const { r } = await withInputsWhileSwitchPending("implement_turn", () => [row("follow_up", "STEER-ME-NOW")], true);
     assert.ok(r.turns.filter((t) => t.token === NEW_TOKEN).some((t) => t.prompt.includes("STEER-ME-NOW")),
       `the steering message reached the model after the apply: ${statusesOf(r).join(",")}`);
     assert.ok(statusesOf(r).includes("completed"), statusesOf(r).join(","));
   });
 
-  it("an owner pause is routed during the hold and is honoured: the executor acknowledges it and enters the pause park", TIMEOUT, async () => {
+  it("an owner pause is fetched, ACKed and APPLIED during the hold and is honoured: the executor acknowledges it and enters the pause park", TIMEOUT, async () => {
     const { r, runId } = await withInputsWhileSwitchPending("implement_turn", (runId) => {
       // The server decides the pause boundary: it stamps the request and answers the next running report with pause_requested.
       api.setPauseRequestedAck(runId);

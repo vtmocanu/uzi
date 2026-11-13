@@ -72,7 +72,8 @@ export class FakeApi {
   /** Runs with a pending switch: GET drains nothing (the server fence) and APPLIED is refused. */
   private readonly switchPendingRuns = new Set<string>();
   /** Issue #4201: the in-place-negotiated server DRAINS inputs (with receipts and the switch signal) while a switch
-   *  is pending; only APPLIED for non-revise rows is refused 409 switch_pending. Off: the v1 contract (GET drains nothing). */
+   *  is pending, and its ACK, APPLIED and discard are accepted as on an active claim. Off: the v1 contract (GET drains
+   *  nothing; APPLIED for non-revise rows is refused 409 switch_pending). */
   inPlaceInputDrain = false;
   private readonly delayedReceipts = new Map<ReceiptKind, number>();
   /** Issue #1604: a pending switch whose `credential_switch {generation}` signal rides every GET
@@ -1583,7 +1584,9 @@ export class FakeApi {
       const ownReviseOnly =
         active && Array.isArray(ids) && ids.length > 0 &&
         ids.every((id) => rows.some((row) => row.id === id && row.kind === "revise_plan") && ackGens?.get(id) === generation);
-      if (kind === "applied" && this.switchPendingRuns.has(runId) && !ownReviseOnly)
+      // An in-place-negotiated server (inPlaceInputDrain) treats the claim as active through the switch: ACK, APPLIED and
+      // discard behave as on an active claim (it keeps its claim, so there is no reclaim for the rows to wait for).
+      if (kind === "applied" && this.switchPendingRuns.has(runId) && !this.inPlaceInputDrain && !ownReviseOnly)
         return sendReceipt(409, { error: "input receipt conflicts with claim", reason: "switch_pending" });
       const delay = this.delayedReceipts.get(kind) ?? 0;
       if (delay > 0) await new Promise((r) => setTimeout(r, delay));

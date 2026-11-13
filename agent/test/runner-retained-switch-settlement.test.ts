@@ -423,10 +423,10 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     // AC1: the same generation, the same clone and no new attempt dir.
     const states = api.states.filter(s => s.runId === env.claim.run_id).map(s => s.body);
     assert.ok(states.every(b => b.claim_generation === undefined || b.claim_generation === 2), "the generation never changed");
-    assert.deepEqual(env.attempts(), env.attemptsAtTurn, "no new attempt dir after the switch");
     assert.equal(env.cwds.length, 1, "one executor turn");
     assert.ok(env.cwds[0] === env.clone.path || env.attemptsAtTurn.includes(path.basename(env.cwds[0]!)),
       `the turn ran in the retained flight's own clone, not a new one: ${env.cwds[0]}`);
+    assert.deepEqual(env.attempts(), env.attemptsAtTurn, "no new attempt dir after the switch");
   });
 
   for (const applyOutcome of ["applied", "superseded"] as const) {
