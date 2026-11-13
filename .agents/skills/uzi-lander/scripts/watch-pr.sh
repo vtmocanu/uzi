@@ -100,6 +100,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/cr-signal.sh
+. "$HERE/lib/cr-signal.sh"
 # shellcheck source=lib/review-threads.sh
 . "$HERE/lib/review-threads.sh"
 # shellcheck source=lib/greptile-verdict.sh
@@ -283,9 +285,11 @@ while [ "$i" -lt "$MAX" ]; do
   # `state` is `success` even when rate-limited, so only the description is read. Absent
   # (no context) = CR has not touched this head at all.
   cr_desc=""; cr_pending=0; cr_limited=0; cr_skipped=0; cr_absent=0; cr_status_at=""
-  if st=$(gh api "repos/$REPO/commits/$head/status" 2>/dev/null) && printf '%s' "$st" | jq -e 'has("statuses")' >/dev/null 2>&1; then
-    cr_desc=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null) || unk cr_status
-    cr_status_at=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.updated_at // empty' 2>/dev/null || true)
+  # Since 2026-11 CR reports through its `coderabbitai` check-run, not the status
+  # (lib/cr-signal.sh reads both, newest wins).
+  if cr_sig=$(cr_head_signal "$REPO" "$head"); then
+    cr_status_at=${cr_sig%%$'\t'*}; cr_desc=${cr_sig#*$'\t'}
+    [ "$cr_desc" = "$cr_sig" ] && { cr_desc=""; cr_status_at=""; }
     case "$cr_desc" in
       "") cr_absent=1 ;;
       *"in progress"*) cr_pending=1 ;;

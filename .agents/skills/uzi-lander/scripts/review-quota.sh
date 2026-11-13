@@ -22,6 +22,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
+# shellcheck source=lib/cr-signal.sh
+. "$HERE/lib/cr-signal.sh"
 
 REPO=${1:?usage: review-quota.sh OWNER/REPO}
 SD=$(state_dir) || SD=""
@@ -40,8 +42,7 @@ while IFS=$'\t' read -r num author draft head title; do
     *"[skip-cr]"*) elig="no ([skip-cr])";;
   esac
   [ "$draft" = "true" ] && elig="no (draft)"
-  desc=$(gh api "repos/$REPO/commits/$head/status" \
-    --jq '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null || true)
+  desc=$(cr_head_desc "$REPO" "$head" || true)
   case "$desc" in
     *"in progress"*) in_progress=$((in_progress+1));;
     *"rate limited"*) limited=$((limited+1));;

@@ -72,6 +72,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/greptile-verdict.sh"
 # shellcheck source=lib/pr-comments.sh
 . "$HERE/lib/pr-comments.sh"
+# shellcheck source=lib/cr-signal.sh
+. "$HERE/lib/cr-signal.sh"
 
 cr_only=0
 if [ "${1:-}" = "--cr-only" ]; then cr_only=1; shift; fi
@@ -141,8 +143,7 @@ for n in "$@"; do
   # The commit status description names WHY CR did not review (rate limited / skipped).
   crdesc=""
   if [ -n "$head" ]; then
-    crdesc=$(gh api "repos/${repo}/commits/${head}/status" \
-      --jq '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null || true)
+    crdesc=$(cr_head_desc "$repo" "$head" || true)
   fi
   cr_ok=0; cr_unconf=0
   if [ -n "$tally" ]; then

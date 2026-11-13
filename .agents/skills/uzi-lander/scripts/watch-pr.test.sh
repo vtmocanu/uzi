@@ -113,7 +113,7 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
       case "$MODE" in
         pending_findings|revovr_cr_pending) echo '{"statuses":[{"context":"CodeRabbit","description":"Review in progress"}]}' ;;
         cr_limited) echo '{"statuses":[{"context":"CodeRabbit","description":"Review rate limited","updated_at":"2026-09-23T10:00:00Z"}]}' ;;
-        greptile_*|prior_*|head_*) echo '{"statuses":[]}' ;;
+        greptile_*|prior_*|head_*|crrun_*) echo '{"statuses":[]}' ;;
         *) echo '{"statuses":[{"context":"CodeRabbit","description":"Review completed"}]}' ;;
       esac ;;
     *'/pulls/42/reviews'*)
@@ -157,6 +157,9 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
         greptile_outside_clean) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Greptile has reviewed the Pull Request.\n\n90 files reviewed, 0 comments added"}}]}' ;;
         prior_unparseable) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"Reviewed 90 files and raised 3 issues"}}]}' ;;
         head_unreadable) exit 1 ;;
+        # CodeRabbit reports only through its check-run (PR #4260, 2026-11-13).
+        crrun_skipped) echo '{"check_runs":[{"id":3,"app":{"slug":"coderabbitai"},"name":"CodeRabbit","status":"completed","conclusion":"skipped","completed_at":"2026-11-13T06:52:01Z","output":{"title":"Review skipped: 133 files exceed the limit of 100","summary":""}}]}' ;;
+        crrun_limited) echo '{"check_runs":[{"id":4,"app":{"slug":"coderabbitai"},"name":"CodeRabbit","status":"completed","conclusion":"neutral","completed_at":"2026-09-23T10:00:00Z","output":{"title":"Review rate limited","summary":""}}]}' ;;
         # Newest first, as the API lists them: the re-trigger (id 2) found something the first run did not.
         head_two_runs) echo '{"check_runs":[{"id":2,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 1 comments added"}},{"id":1,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"success","output":{"summary":"90 files reviewed, 0 comments added"}}]}' ;;
         *) echo '{"check_runs":[]}' ;;
@@ -226,6 +229,22 @@ bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WOR
 rc=$?
 set -e
 [ "$rc" -eq 5 ] || fail "an ack older than the rate-limit status suppressed it, rc=$rc: $(cat "$WORK/limited-old-ack.out")"
+# A skip or rate limit reported only through CodeRabbit's check-run (no commit status) is
+# still read: skipped exits 6 (route to Greptile), rate-limited exits 5.
+MODE="crrun_skipped"; export MODE
+printf '[]\n' > "$COMMENTS"
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/crrun-skipped.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 6 ] || fail "a check-run-only CodeRabbit skip was not reported, rc=$rc: $(cat "$WORK/crrun-skipped.out")"
+grep -q "exceed the limit of 100" "$WORK/crrun-skipped.out" || fail "skip reason not shown: $(cat "$WORK/crrun-skipped.out")"
+MODE="crrun_limited"; export MODE
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/crrun-limited.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 5 ] || fail "a check-run-only CodeRabbit rate limit was not reported, rc=$rc: $(cat "$WORK/crrun-limited.out")"
 # Findings are incomplete while a selected reviewer is still in progress; wait, do not edit.
 MODE="pending_findings"; export MODE
 printf '[]\n' > "$COMMENTS"
