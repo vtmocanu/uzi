@@ -1,7 +1,7 @@
 package main
 
 // run_recovery_owner_compat_test.go pins #4198's owner-compatibility contract for
-// `uzi run recovery <run-id>`: for the caller's own run, stdout, stderr and the exit status are
+// `uzi run recovery <run-id>`: for the caller's own existing run, stdout, stderr and the exit status are
 // exactly what main (171d368b8) printed, with the admin run debug server flag on or off (an
 // owner's archives summary never carries admin_debug_read either way; the handler half is
 // TestAdminRunDebugReadMatrixLiveDB). The golden strings were captured by running the same
@@ -103,8 +103,9 @@ func TestRunRecoveryOwnerOutputMatchesMain(t *testing.T) {
 // the context's own error, as a real HTTP client does.
 type ctxClient struct {
 	uzicli.Client
-	seam   string // "scoped" or "archives"
-	cancel context.CancelFunc
+	seam          string // "scoped" or "archives"
+	cancel        context.CancelFunc
+	archivesCalls int
 }
 
 func (c *ctxClient) block(ctx context.Context) error {
@@ -123,6 +124,7 @@ func (c *ctxClient) RecoveryHoldsScoped(ctx context.Context, userID, runID strin
 }
 
 func (c *ctxClient) RecoveryArchives(ctx context.Context, runID string) (apitypes.RecoveryArchiveSummaryDTO, error) {
+	c.archivesCalls++
 	if c.seam == "archives" {
 		return apitypes.RecoveryArchiveSummaryDTO{}, c.block(ctx)
 	}
@@ -165,6 +167,10 @@ func TestRunRecoveryNewReadsPropagateContextErrors(t *testing.T) {
 					}
 					if uzicli.ExitCodeFor(err) == uzicli.ExitOK {
 						t.Errorf("exit code for %v is 0", err)
+					}
+					// A context error on the scoped read stops the command there: no archives read follows.
+					if seam == "scoped" && c.archivesCalls != 0 {
+						t.Errorf("archives read %d time(s) after the scoped read saw %v; want 0", c.archivesCalls, wantErr)
 					}
 					if strings.Contains(out.String(), "no retained custody holds") || strings.TrimSpace(out.String()) == "[]" || out.Len() != 0 {
 						t.Errorf("stdout = %q, want no empty result rendered", out.String())
