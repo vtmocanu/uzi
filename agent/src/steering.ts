@@ -1997,9 +1997,10 @@ export class SteeringChannel {
     }
   }
 
-  /** Abort the shared cancel controller with `reason`. When it is already spent by a pending (not yet
-   *  settled) credential switch, the first such reason is kept, and an applied settle aborts the fresh
-   *  controller with it (settleCredentialSwitch). */
+  /** Abort the shared cancel controller with `reason`. While a switch is pending and the controller is
+   *  already spent by a CredentialSwitchSignal (this switch's, or an earlier settled one's), the first
+   *  non-switch reason is kept, and an applied settle aborts the fresh controller with it
+   *  (settleCredentialSwitch). Any settle clears it. */
   private abortCancel(reason?: unknown): void {
     const s = this.cancel.signal;
     if (!s.aborted) {

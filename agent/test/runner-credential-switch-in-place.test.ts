@@ -540,6 +540,21 @@ function committedThenAnswers(spy: HoldSpy, answers: CredentialSwitchApplyResult
   return { calls: () => calls, restore: () => { client.applyCredentialSwitch = real; } };
 }
 
+/** As committedThenAnswers, but the first (ambiguous) send was rolled back on the server: nothing commits. */
+function uncommittedThenAnswers(spy: HoldSpy, answers: CredentialSwitchApplyResult[]): { calls: () => number; restore(): void } {
+  const real = client.applyCredentialSwitch.bind(client);
+  let calls = 0;
+  client.applyCredentialSwitch = (async () => {
+    calls++;
+    if (calls === 1) {
+      spy.batcher!.emit({ kind: "text", agent: "lead", payload: { text: "held-1" } });
+      spy.batcher!.emit({ kind: "text", agent: "lead", payload: { text: "held-2" } });
+    }
+    return answers[Math.min(calls, answers.length) - 1]!;
+  }) as typeof client.applyCredentialSwitch;
+  return { calls: () => calls, restore: () => { client.applyCredentialSwitch = real; } };
+}
+
 /** The hold was released (never cancelled) past the possibly committed apply: held frames number from tail+2. */
 function assertReleasedPastPossibleApply(r: Result, spy: HoldSpy): void {
   const server = feedFrames(r.runId).find((m) => (m.kind as string) === "credential_switch");
@@ -568,16 +583,28 @@ describe("issue #4201 m2c rework: a definite non-applied answer after an ambiguo
     } finally { apply.restore(); spy.restore(); }
   });
 
-  it("uncertain then superseded with no newer op: the hold is released past the possible apply, the op stays ambiguous", TIMEOUT, async () => {
-    const spy = spyHold();
-    const apply = committedThenAnswers(spy, [AMBIGUOUS, { kind: "superseded" }]);
-    try {
-      const r = await scenario({ site: "implement_turn", apply: [], extra: { switchSupersedeWaitMs: 50 } });
-      assert.equal(apply.calls(), 2);
-      assertReleasedPastPossibleApply(r, spy);
-      assert.equal((await r.ledger.stateOf(r.runId, "op-1"))?.state, "ambiguous");
-    } finally { apply.restore(); spy.restore(); }
-  });
+  // The server answers superseded and not_applied only AFTER its replay check, in the same transaction
+  // under the run lock: a committed op would have replayed as applied. So after an uncertain send these two
+  // prove the op never committed, and the hold must be CANCELLED (frames continue at tail+1, no seq hole)
+  // and the ledger settled (review NB1).
+  for (const answer of [{ kind: "superseded" }, { kind: "not_applied", reason: "no_pending_switch" }] as CredentialSwitchApplyResult[]) {
+    it(`uncertain (rolled back) then ${answer.kind}: the hold is cancelled with no seq hole and the op settles`, TIMEOUT, async () => {
+      const spy = spyHold();
+      const apply = uncommittedThenAnswers(spy, [AMBIGUOUS, answer]);
+      try {
+        const r = await scenario({ site: "implement_turn", apply: [], extra: { switchSupersedeWaitMs: 50 } });
+        assert.equal(apply.calls(), 2);
+        assert.equal(spy.cancels, 1, "a proven non-commit cancels the hold");
+        assert.deepEqual(spy.releases, [], "never released past an apply that cannot exist");
+        assert.ok(!feedFrames(r.runId).some((m) => (m.kind as string) === "credential_switch"), "nothing committed");
+        const seqs = r.posted.map((m) => m.seq).sort((a, b) => a - b);
+        for (let i = 1; i < seqs.length; i++) assert.ok(seqs[i]! - seqs[i - 1]! <= 1, `no seq hole: ${seqs.join(",")}`);
+        assert.ok(r.posted.some((m) => m.payload["text"] === "held-1"), "the held frames were delivered");
+        // Settled, so terminal cleanup may already have removed it; never left ambiguous.
+        assert.notEqual((await r.ledger.stateOf(r.runId, "op-1"))?.state, "ambiguous");
+      } finally { apply.restore(); spy.restore(); }
+    });
+  }
 });
 
 describe("issue #4201 m2c rework: option A releases the hold past a possible apply (tail+2)", () => {

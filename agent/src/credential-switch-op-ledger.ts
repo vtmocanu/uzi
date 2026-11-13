@@ -314,12 +314,16 @@ export async function applyThroughLedger(
       }
       return result;
     case "fenced":
+      // `fenced` does not undo an earlier ambiguous send of the same op: the server checks the fence
+      // BEFORE it replays a committed op, so that send may have committed. Keep the memory.
+      if (wasAmbiguous) await ledger.record(runId, req.opId, "ambiguous", "fenced_after_ambiguous", req.claimGeneration).catch(() => undefined);
+      else await ledger.record(runId, req.opId, "settled", result.kind).catch(() => undefined);
+      return result;
     case "superseded":
     case "not_applied":
-      // A definite non-applied answer does not undo an earlier ambiguous send of the same op: the server
-      // checks the fence before it replays, so that send may have committed. Keep the memory.
-      if (wasAmbiguous) await ledger.record(runId, req.opId, "ambiguous", `${result.kind}_after_ambiguous`, req.claimGeneration).catch(() => undefined);
-      else await ledger.record(runId, req.opId, "settled", result.kind).catch(() => undefined);
+      // Both come AFTER the server's replay check, in the same transaction under the run lock: a committed
+      // op would have been answered applied or refused_committed. So they prove the op never committed.
+      await ledger.record(runId, req.opId, "settled", result.kind).catch(() => undefined);
       return result;
     default:
       // A definite answer. If settling cannot be written the entry stays `sending` on disk, which

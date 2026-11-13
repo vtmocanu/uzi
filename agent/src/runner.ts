@@ -27185,9 +27185,12 @@ export class RunRunner {
           runLog.warn("in-place credential switch: the apply call threw; treating the outcome as uncertain", { run_id: flight.runId, error: errMessage(error) });
           result = { kind: "uncertain", detail: "apply_threw" };
         }
-        // Sticky: once any send was ambiguous, a later `fenced` or `superseded` answer does not prove the
-        // earlier send did not commit (the server checks the fence before it replays an op).
+        // Sticky for this op: once a send of it was ambiguous, only an answer the server gives AFTER its
+        // replay check proves it did not commit. `superseded` and `not_applied` are such answers (the replay
+        // of a committed op would have answered applied or refused_committed, in the same transaction under
+        // the run lock); `fenced` is not, because the fence runs before the replay (credential_switch_apply.go).
         if (result.kind === "uncertain" || result.kind === "refused_committed") mayHaveCommitted = true;
+        if (result.kind === "superseded" || result.kind === "not_applied") mayHaveCommitted = false;
         const dropHold = (): void => {
           if (mayHaveCommitted) this.releaseHoldPastPossibleApply(hold, flight, runLog);
           else hold.cancel();
@@ -27223,6 +27226,7 @@ export class RunRunner {
             if (next !== undefined) {
               opId = next;
               uncertainAttempts = 0;
+              mayHaveCommitted = false;
               continue;
             }
             // No newer switch is pending (or it never reached this flight in time): nothing was applied and

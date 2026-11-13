@@ -93,7 +93,17 @@ describe("credential switch op ledger", () => {
     assert.equal(onDisk(dir)["op-1"].state, "clean_route_absent");
   });
 
-  for (const result of [{ kind: "fenced" }, { kind: "superseded" }, { kind: "not_applied", reason: "x" }] as CredentialSwitchApplyResult[]) {
+  for (const result of [{ kind: "superseded" }, { kind: "not_applied", reason: "x" }] as CredentialSwitchApplyResult[]) {
+    it(`uncertain then ${result.kind} settles: the server answers it only after its replay check (review NB1)`, async () => {
+      const dir = tmp();
+      const ledger = new CredentialSwitchOpLedger(dir);
+      await applyThroughLedger(fakeClient([], { kind: "uncertain", detail: "x" }), ledger, RUN, REQ);
+      assert.equal((await applyThroughLedger(fakeClient([], result), ledger, RUN, REQ)).kind, result.kind);
+      assert.equal(onDisk(dir)["op-1"].state, "settled");
+    });
+  }
+
+  for (const result of [{ kind: "fenced" }] as CredentialSwitchApplyResult[]) {
     it(`uncertain then ${result.kind} stays ambiguous (the first send may have committed), and the answer is still returned`, async () => {
       const dir = tmp();
       const first = new CredentialSwitchOpLedger(dir);
