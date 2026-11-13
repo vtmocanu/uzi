@@ -13,6 +13,7 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { BareCacheIdentityError, GitCache, ScratchProvisionError, ScratchPublicationError, bareDirName, gitEnv } from "../src/git.js";
 import { TickSpawner } from "../src/tick-spawner.js";
+import { GitBoundaryAbortError } from "../src/checkpoint-stop.js";
 
 let fx: Fixture;
 let git: GitCache;
@@ -125,6 +126,164 @@ describe("permit-scoped bare lock acquisition", () => {
     assert.equal(await holder, "holder");
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(queuedRan, false, "the forfeited slot stays skipped after the prior holder releases");
+  });
+
+  describe("lock-wait abort diagnostic", () => {
+    const MSG = "bare repo lock wait aborted before acquisition";
+    type Line = { level: string; msg: string; [k: string]: unknown };
+    type Internals = { withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> };
+    const noSpawn = async (): Promise<never> => { throw new Error("no subprocess expected"); };
+    const lockLines = (lines: unknown[]) => (lines as Line[]).filter((l) => l.msg === MSG);
+    const at = (lines: Line[], i: number): Line => { const l = lines[i]; assert.ok(l, `log line ${i}`); return l; };
+
+    /** A holder that has entered `shared-bare` and stays inside `fn` until released. */
+    async function hold(internals: Internals): Promise<{ release: () => void; done: Promise<string> }> {
+      let release!: () => void;
+      let entered!: () => void;
+      const enteredP = new Promise<void>((resolve) => { entered = resolve; });
+      const done = internals.withLock("shared-bare", async () => {
+        entered();
+        await new Promise<void>((resolve) => { release = resolve; });
+        return "holder";
+      });
+      await enteredP;
+      return { release, done };
+    }
+
+    function setup() {
+      const rec = recordingLogger();
+      const cache = new GitCache(fx.dataDir, rec.logger);
+      return { rec, cache, internals: cache as unknown as Internals };
+    }
+
+    it("(a) a boundary-scoped waiter behind a holder logs one warn naming the lock, both durations and the boundary", async () => {
+      const { rec, cache, internals } = setup();
+      const h = await hold(internals);
+      const abort = new AbortController();
+      const queued = cache.withBoundaryProcessSpawner(noSpawn, abort.signal,
+        () => internals.withLock("shared-bare", async () => "queued"));
+      abort.abort();
+      await assert.rejects(queued, (err: unknown) => {
+        assert.ok(err instanceof GitBoundaryAbortError);
+        assert.equal(err.message, "permit-held git lock wait aborted: boundary deadline exceeded");
+        return true;
+      });
+      const lines = lockLines(rec.lines);
+      assert.equal(lines.length, 1);
+      assert.equal(at(lines, 0).level, "warn");
+      assert.equal(at(lines, 0).bare, "shared-bare");
+      assert.equal(at(lines, 0).aborted_by, "boundary");
+      assert.equal(typeof at(lines, 0).waited_ms, "number");
+      assert.equal(typeof at(lines, 0).holder_held_ms, "number");
+      assert.equal(at(lines, 0).holder, undefined);
+      h.release();
+      assert.equal(await h.done, "holder");
+    });
+
+    it("(b) a caller-signal abort logs aborted_by caller and keeps the plain Error", async () => {
+      const { rec, internals } = setup();
+      const h = await hold(internals);
+      const abort = new AbortController();
+      const queued = internals.withLock("shared-bare", async () => "queued", abort.signal);
+      abort.abort();
+      await assert.rejects(queued, (err: unknown) => {
+        assert.ok(err instanceof Error && !(err instanceof GitBoundaryAbortError));
+        assert.equal(err.message, "permit-held git lock wait aborted: boundary deadline exceeded");
+        return true;
+      });
+      const lines = lockLines(rec.lines);
+      assert.equal(lines.length, 1);
+      assert.equal(at(lines, 0).level, "warn");
+      assert.equal(at(lines, 0).aborted_by, "caller");
+      h.release();
+      await h.done;
+    });
+
+    it("(c) an abort after acquisition logs nothing", async () => {
+      const { rec, internals } = setup();
+      const abort = new AbortController();
+      const h = await (async () => {
+        let release!: () => void;
+        let entered!: () => void;
+        const enteredP = new Promise<void>((resolve) => { entered = resolve; });
+        const done = internals.withLock("shared-bare", async () => {
+          entered();
+          await new Promise<void>((resolve) => { release = resolve; });
+          return "held";
+        }, abort.signal);
+        await enteredP;
+        return { release, done };
+      })();
+      abort.abort();
+      h.release();
+      assert.equal(await h.done, "held");
+      assert.equal(lockLines(rec.lines).length, 0);
+    });
+
+    it("(d) an uncontended abort at entry logs holder none at debug, never warn", async () => {
+      const { rec, cache, internals } = setup();
+      const h = await hold(internals);
+      h.release();
+      await h.done;
+      const abort = new AbortController();
+      abort.abort();
+      await assert.rejects(cache.withBoundaryProcessSpawner(noSpawn, abort.signal,
+        () => internals.withLock("shared-bare", async () => "never")));
+      const lines = lockLines(rec.lines);
+      assert.equal(lines.length, 1);
+      assert.equal(at(lines, 0).level, "debug");
+      assert.equal(at(lines, 0).holder, "none");
+      assert.equal(at(lines, 0).holder_held_ms, undefined);
+      assert.equal(at(lines, 0).aborted_by, "boundary");
+    });
+
+    it("(e) with the caller signal and the boundary both aborted, aborted_by follows the rejection's precedence (caller)", async () => {
+      const { rec, cache, internals } = setup();
+      const h = await hold(internals);
+      const boundary = new AbortController();
+      const caller = new AbortController();
+      boundary.abort();
+      caller.abort();
+      await assert.rejects(cache.withBoundaryProcessSpawner(noSpawn, boundary.signal,
+        () => internals.withLock("shared-bare", async () => "never", caller.signal)),
+      (err: unknown) => err instanceof Error && !(err instanceof GitBoundaryAbortError));
+      const lines = lockLines(rec.lines);
+      assert.equal(lines.length, 1);
+      assert.equal(at(lines, 0).aborted_by, "caller");
+      assert.equal(at(lines, 0).level, "warn");
+      h.release();
+      await h.done;
+    });
+
+    it("(f) a holder parked in its beforeLockRelease hook still counts as holding the lock, and is cleared after it", async () => {
+      const { rec, cache, internals } = setup();
+      let releaseHook!: () => void;
+      let hookEntered!: () => void;
+      const hookEnteredP = new Promise<void>((resolve) => { hookEntered = resolve; });
+      const holderDone = cache.withBoundaryProcessSpawner(noSpawn, new AbortController().signal,
+        () => internals.withLock("shared-bare", async () => "holder"),
+        { beforeLockRelease: async () => { hookEntered(); await new Promise<void>((resolve) => { releaseHook = resolve; }); } });
+      await hookEnteredP;
+      const abort = new AbortController();
+      const queued = cache.withBoundaryProcessSpawner(noSpawn, abort.signal,
+        () => internals.withLock("shared-bare", async () => "queued"));
+      abort.abort();
+      await assert.rejects(queued);
+      let lines = lockLines(rec.lines);
+      assert.equal(lines.length, 1);
+      assert.equal(at(lines, 0).level, "warn");
+      assert.equal(typeof at(lines, 0).holder_held_ms, "number");
+      releaseHook();
+      assert.equal(await holderDone, "holder");
+      const late = new AbortController();
+      late.abort();
+      await assert.rejects(cache.withBoundaryProcessSpawner(noSpawn, late.signal,
+        () => internals.withLock("shared-bare", async () => "never")));
+      lines = lockLines(rec.lines);
+      assert.equal(lines.length, 2);
+      assert.equal(at(lines, 1).holder, "none");
+      assert.equal(at(lines, 1).level, "debug");
+    });
   });
 });
 
