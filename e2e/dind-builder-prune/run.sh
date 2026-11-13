@@ -47,13 +47,14 @@ case "$expect_red" in
   *) echo "FAIL: DBP_EXPECT_RED must be empty or switch-off" >&2; exit 1 ;;
 esac
 if [[ $expect_red == switch-off ]]; then
-  postures="${DBP_POSTURES:-rootful}"
-  phases="${DBP_PHASES:-pressure}"
+  postures="${DBP_POSTURES-rootful}"
+  phases="${DBP_PHASES-pressure}"
 else
-  postures="${DBP_POSTURES:-rootful rootless}"
-  phases="${DBP_PHASES:-points real pressure}"
+  postures="${DBP_POSTURES-rootful rootless}"
+  phases="${DBP_PHASES-points real pressure}"
 fi
 has_phase() { [[ " $phases " == *" $1 "* ]]; }
+readonly REQUIRED_POSTURES='rootful rootless' REQUIRED_PHASES='points real pressure'
 
 containers=()
 failures=0
@@ -102,6 +103,20 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# ---- selection validation ----------------------------------------------------------------------
+# An unknown or empty selection is a hard error, never a silent no-op that could print PASS.
+read -ra sel_postures <<<"$postures"
+read -ra sel_phases <<<"$phases"
+((${#sel_postures[@]} > 0)) || fail "empty posture selection (DBP_POSTURES='${DBP_POSTURES-}'); valid: $REQUIRED_POSTURES"
+((${#sel_phases[@]} > 0)) || fail "empty phase selection (DBP_PHASES='${DBP_PHASES-}'); valid: $REQUIRED_PHASES"
+for sel in "${sel_postures[@]}"; do
+  [[ " $REQUIRED_POSTURES " == *" $sel "* ]] || fail "unknown posture '$sel' in DBP_POSTURES; valid: $REQUIRED_POSTURES"
+done
+for sel in "${sel_phases[@]}"; do
+  [[ " $REQUIRED_PHASES " == *" $sel "* ]] || fail "unknown phase '$sel' in DBP_PHASES; valid: $REQUIRED_PHASES"
+done
+ran=()
 
 # Each Docker call has a cap within the shared overall deadline.
 outer() {
@@ -189,17 +204,51 @@ print_versions() {
 # ---- records -----------------------------------------------------------------------------
 
 CUR=''
+API_CUR=''
+RAW_BYTES_NOTE_DONE=0
+# Raw per-record bytes. `docker system df -v --format json`, `docker buildx du --format json` and
+# `docker buildx du --verbose` (buildx v0.38.1, client 29.9.2) all print Size only as a formatted
+# string ("3.146MB"), so the harness reads the Engine API GET /system/df of the owned nested
+# daemon (BuildCache[].Size is an int64) with the container's own busybox wget over its TCP
+# listener. If that read fails the harness says so; it never invents numbers.
+api_snap() {
+  API_CUR="$PO/api-df-$1.json"
+  if outer 30 exec "$P_NAME" wget -q -O- http://127.0.0.1:2375/system/df >"$API_CUR" 2>"$API_CUR.err" \
+    && jq -e '.BuildCache | all(.[]; (.Size | type) == "number")' "$API_CUR" >/dev/null 2>&1; then
+    return 0
+  fi
+  rm -f "$API_CUR"
+  API_CUR=''
+  if ((!RAW_BYTES_NOTE_DONE)); then
+    RAW_BYTES_NOTE_DONE=1
+    echo "RAW BYTES UNAVAILABLE [$P]: GET /system/df on the nested daemon did not return numeric Size ($(head -c 200 "$PO/api-df-$1.json.err" 2>/dev/null | tr '\n' ' ')); records show formatted Size only"
+  fi
+  return 0
+}
 df_snap() {
   CUR="$PO/df-$1.json"
   inner 90 system df -v --format json >"$CUR"
   jq -e '.BuildCache' "$CUR" >/dev/null || fail "df json for $1 has no BuildCache"
+  api_snap "$1"
 }
 show_records() {
   df_snap "$1"
-  echo "--- records [$P/$1] (ID type shared inuse size lastUsedAt(UTC) description)"
-  jq -r '.BuildCache[] | [(.ID | rtrimstr("*")), .CacheType, "shared=" + (.Shared | tostring),
-    "inuse=" + (.InUse | tostring), (.Size | tostring), ((.LastUsedAt // "") | .[11:23]),
-    (.Description | .[0:56])] | @tsv' "$CUR" | sort -k6
+  echo "--- records [$P/$1] (ID type shared inuse size(formatted) rawbytes lastUsedAt(UTC) description)"
+  if [[ -n $API_CUR ]]; then
+    jq -r --slurpfile api "$API_CUR" '($api[0].BuildCache | map({key: (.ID | rtrimstr("*")), value: .Size}) | from_entries) as $b
+      | .BuildCache[] | (.ID | rtrimstr("*")) as $id | [$id, .CacheType, "shared=" + (.Shared | tostring),
+      "inuse=" + (.InUse | tostring), (.Size | tostring), "bytes=" + (($b[$id] // "missing") | tostring),
+      ((.LastUsedAt // "") | .[11:23]), (.Description | .[0:56])] | @tsv' "$CUR" | sort -k7
+    echo "raw bytes total [$P/$1]: $(jq -r '[.BuildCache[].Size] | add // 0' "$API_CUR") over $(jq -r '.BuildCache | length' "$API_CUR") records"
+  else
+    jq -r '.BuildCache[] | [(.ID | rtrimstr("*")), .CacheType, "shared=" + (.Shared | tostring),
+      "inuse=" + (.InUse | tostring), (.Size | tostring), "bytes=unavailable", ((.LastUsedAt // "") | .[11:23]),
+      (.Description | .[0:56])] | @tsv' "$CUR" | sort -k7
+  fi
+}
+rec_age() { # id -> whole seconds since the record's LastUsedAt (CUR, CLI JSON), empty if absent
+  jq -r --arg i "$1" '[.BuildCache[] | select((.ID | rtrimstr("*")) == $i) | .LastUsedAt][0]
+    | if . == null then empty else (now - (.[0:19] | sub(" "; "T") + "Z" | fromdateiso8601)) | floor end' "$CUR"
 }
 rec_id() { # type needle -> the first matching record ID in CUR
   jq -r --arg t "$1" --arg n "$2" '[.BuildCache[] | select(.CacheType == $t and (.Description | contains($n)))] | .[0].ID // empty | rtrimstr("*")' "$CUR"
@@ -253,20 +302,65 @@ base_df() { printf 'FROM %s\\nRUN %s\\n' "$FIXTURE_IMAGE" "$1"; }
 cm_df() { printf 'FROM %s\\nRUN --mount=type=cache,target=/c,id=%s %s\\n' "$FIXTURE_IMAGE" "$1" "$2"; }
 dd_cmd() { printf 'echo %s && dd if=/dev/urandom of=%s bs=1M count=%s' "$1" "$2" "$3"; }
 
-start_hold() { # ctx sleep-seconds
+# The hold build is event-driven: its last RUN step waits (bounded by HOLD_WAIT_S) for a sentinel
+# file in a shared cache mount, and the harness writes the sentinel with a second build only
+# AFTER the prune it protects against (release_hold). So the hold is provably active across P1.
+readonly HOLD_WAIT_S=900
+hold_df() { # held-base-df-text sentinel-id
+  printf '%sRUN --mount=type=cache,target=/sig,id=%s echo dbp-hold-wait && i=0 && while [ ! -e /sig/go ] && [ $i -lt %s ]; do sleep 1; i=$((i+1)); done; [ -e /sig/go ]\\n' \
+    "$1" "$2" "$HOLD_WAIT_S"
+}
+sig_df() { printf 'FROM %s\\nRUN --mount=type=cache,target=/sig,id=%s touch /sig/go\\n' "$FIXTURE_IMAGE" "$1"; }
+HOLD_PID=''
+start_hold() { # ctx
   rm -f "$PO/hold-$1.rc" "$PO/build-hold-$1.out"
   (
     rc=0
-    inner 200 build --progress=plain --output type=cacheonly "/spike/ctx/$1" >"$PO/build-hold-$1.out" 2>&1 || rc=$?
+    inner 960 build --progress=plain --output type=cacheonly "/spike/ctx/$1" >"$PO/build-hold-$1.out" 2>&1 || rc=$?
     echo "$rc" >"$PO/hold-$1.rc"
   ) &
+  HOLD_PID=$!
   local i
   for ((i = 0; i < 60; i++)); do
-    if grep -q "sleep $2" "$PO/build-hold-$1.out" 2>/dev/null; then break; fi
+    if grep -q 'dbp-hold-wait' "$PO/build-hold-$1.out" 2>/dev/null; then break; fi
     sleep 1
   done
-  grep -q "sleep $2" "$PO/build-hold-$1.out" 2>/dev/null || fail "[$P] hold build did not reach its sleep step"
+  grep -q 'dbp-hold-wait' "$PO/build-hold-$1.out" 2>/dev/null || fail "[$P] hold build did not reach its wait step"
   grep -q 'CACHED' "$PO/build-hold-$1.out" || fail "[$P] hold build did not reuse the cached held layer"
+}
+hold_alive() { # ctx -> 0 while the hold build process runs and has not recorded an rc
+  kill -0 "$HOLD_PID" 2>/dev/null && [[ ! -s $PO/hold-$1.rc ]]
+}
+release_hold() { # sigctx : writes the sentinel (a build that touches it in the shared cache mount)
+  echo "--- releasing the hold at $(date -u +%T.%3N) (sentinel build)"
+  build_ctx "release-$1" "$1" --output type=cacheonly
+}
+# Assert the lease is the reason the held record survives: the hold build is still running and the
+# held record is InUse=true in a FRESH df snapshot; need_age=1 also requires LastUsedAt older than
+# the scaled floor, so age exclusion cannot be what protects it.
+lease_check() { # label ctx id need_age(0|1)
+  local label=$1 ctx=$2 id=$3 need_age=$4 inuse age alive=no ok=1
+  df_snap "lease-$label"
+  inuse=$(rec_field "$id" .InUse)
+  age=$(rec_age "$id")
+  if hold_alive "$ctx"; then alive=yes; fi
+  echo "LEASE-PROOF[$P/$label] $(date -u +%T.%3N): hold build running=$alive; held record $id InUse=${inuse:-absent} LastUsedAt=$(rec_field "$id" .LastUsedAt) age=${age:-?}s floor=${FLOOR_S}s"
+  [[ $alive == yes ]] || ok=0
+  [[ $inuse == true ]] || ok=0
+  if ((need_age)) && ! { [[ -n $age ]] && ((age > FLOOR_S)); }; then ok=0; fi
+  local agemsg=''
+  if ((need_age)); then agemsg=", LastUsedAt age ${age}s > floor ${FLOOR_S}s"; fi
+  if ((ok)); then pass "lease proof $label: hold build running, held record InUse=true$agemsg"; else failc "lease proof $label: running=$alive InUse=${inuse:-absent} age=${age:-?}s (floor ${FLOOR_S}s, need_age=$need_age)"; fi
+}
+wait_held_aged() { # id : wait (bounded) until the held record's LastUsedAt is older than floor + margin
+  local id=$1 i age=''
+  for ((i = 0; i < FLOOR_S + 40; i++)); do
+    df_snap held-age
+    age=$(rec_age "$id")
+    if [[ -n $age ]] && ((age > FLOOR_S + 6)); then echo "held record $id LastUsedAt age ${age}s > floor ${FLOOR_S}s + margin"; return 0; fi
+    sleep 1
+  done
+  echo "held record $id never aged past the floor (age=${age:-absent}s)"
 }
 finish_hold() { # ctx -> prints the hold build rc
   local i
@@ -389,7 +483,8 @@ phase_points() {
 
   echo "--- fixtures (all built now; they age together)"
   mkctx held "$(base_df "$(dd_cmd dbp-held /h 1)")"
-  mkctx hold "$(base_df "$(dd_cmd dbp-held /h 1)")RUN echo dbp-hold && sleep 60\\n"
+  mkctx hold "$(hold_df "$(base_df "$(dd_cmd dbp-held /h 1)")" dbpsig-hold)"
+  mkctx sighold "$(sig_df dbpsig-hold)"
   mkctx ctrl "$(base_df "$(dd_cmd dbp-ctrl /c 1)")"
   mkctx recent "$(base_df "$(dd_cmd dbp-recent /r 1)")"
   mkctx cm "$(cm_df dbpcm "$(dd_cmd dbp-cm /c/f 2)")"
@@ -426,7 +521,7 @@ phase_points() {
   while ((SECONDS < until_t)); do sleep 1; done
 
   echo "--- hold: a concurrent build keeps the held record in use"
-  start_hold hold 60
+  start_hold hold
   show_records during-hold
   id_held=$(rec_id_inuse regular 'echo dbp-held &&')
   if [[ -n $id_held ]]; then pass "held record $id_held reports InUse=true during the hold build"; else failc 'no InUse record for the held layer during the hold build'; fi
@@ -460,15 +555,18 @@ phase_points() {
   assert_present 'point 6: cap above usage deletes nothing even though the record is old and regular (cap participates in the AND)' "$id_x1"
   assert_present 'point 6: cap above usage deletes nothing (second old record)' "$id_ctrl"
 
+  echo "--- lease sequencing: the held record must be older than the floor before P1 (so age cannot protect it)"
+  wait_held_aged "$id_held"
   echo "--- bump recent now so its last use is inside the floor"
   build_ctx bump-recent recent --output type=cacheonly
   show_records before-P1
   id_recent=$(rec_id regular 'echo dbp-recent &&')
   echo "IDs resolved after the hold started and recent was bumped: held=$id_held recent=$id_recent"
   scaled_argv 1MB
+  lease_check before-P1 hold "$id_held" 1
   run_prune P1 1 "${SCALED[@]}"
-  df_snap after-P1
   show_records after-P1
+  lease_check after-P1 hold "$id_held" 0
   if ((PRUNE_RC == 0)); then pass 'point 6: combined type + until + --max-used-space accepted (rc 0)'; else failc "P1 rc=$PRUNE_RC"; fi
   assert_absent 'point 1: old unused regular record is deleted (also the positive control for points 2-6)' "$id_ctrl"
   assert_absent 'point 1: second old unused regular record is deleted' "$id_x1"
@@ -482,8 +580,9 @@ phase_points() {
   local s
   for s in $shared_ids; do assert_present 'point 5: tagged image (shared) record survives' "$s"; done
   local hold_rc
+  release_hold sighold
   hold_rc=$(finish_hold hold)
-  if [[ $hold_rc == 0 ]]; then pass 'point 2: the held build then completed rc=0'; else failc "held build rc=$hold_rc"; fi
+  if [[ $hold_rc == 0 ]]; then pass 'point 2: the held build (released only after P1) then completed rc=0'; else failc "held build rc=$hold_rc"; fi
   local keep_out keep_rc=0
   inner 20 image ls dbp/keep
   keep_out=$(inner 60 run --rm dbp/keep cat /proof 2>&1) || keep_rc=$?
@@ -493,13 +592,13 @@ phase_points() {
   if ((keep_rc == 0)); then pass 'point 5: docker run --rm dbp/keep true rc 0'; else failc "docker run true rc=$keep_rc"; fi
 
   # Snapshot before P1b so the later assert_absent on the held record is not vacuous.
-  df_snap before-P1b
+  show_records before-P1b
   assert_present 'point 2 control precondition: formerly held record is still present before P1b' "$id_held"
   echo "--- control for point 2: once the hold released (and its own child record aged past the floor), the same prune deletes the formerly held record"
   local t_released=$SECONDS
   while ((SECONDS < t_released + FLOOR_S + 3)); do sleep 1; done
   run_prune P1b 1 "${SCALED[@]}"
-  df_snap after-P1b
+  show_records after-P1b
   assert_absent 'point 2 control: formerly held record is deleted once unheld (survival was due to the hold)' "$id_held"
   assert_present 'point 3: exec.cachemount still survives' "$id_cm"
   for s in $shared_ids; do assert_present 'point 5: tagged image (shared) record still survives' "$s"; done
@@ -536,7 +635,8 @@ phase_real() {
 phase_pressure() {
   echo "===== [$P] PRESSURE (TEST-ONLY scaled floor ${FLOOR_S}s, scaled cap 64MB; data root is a ${TMPFS_MB} MB tmpfs)"
   mkctx pheld "$(base_df "$(dd_cmd dbp-pheld /h 1)")"
-  mkctx phold "$(base_df "$(dd_cmd dbp-pheld /h 1)")RUN echo dbp-phold && sleep 50\\n"
+  mkctx phold "$(hold_df "$(base_df "$(dd_cmd dbp-pheld /h 1)")" dbpsig-phold)"
+  mkctx sigphold "$(sig_df dbpsig-phold)"
   mkctx precent "$(base_df "$(dd_cmd dbp-precent /r 1)")"
   mkctx pcm "$(cm_df dbppcm "$(dd_cmd dbp-pcm /c/f 2)")"
   mkctx pkeep "$(base_df 'echo dbp-pkeep > /proof')"
@@ -560,7 +660,11 @@ phase_pressure() {
   local until_t=$((t_fill + FLOOR_S + 3))
   while ((SECONDS < until_t)); do sleep 1; done
   echo "--- hold + recent bump (the held record is old and InUse; recent is used inside the floor)"
-  start_hold phold 50
+  start_hold phold
+  local pre_held
+  df_snap hold-id
+  pre_held=$(rec_id_inuse regular 'echo dbp-pheld &&')
+  wait_held_aged "$pre_held"
   build_ctx bump-precent precent --output type=cacheonly
   show_records pressure-before
   local id_held id_cm id_recent shared_ids
@@ -570,6 +674,7 @@ phase_pressure() {
   shared_ids=$(jq -r '.BuildCache[] | select(.Shared | tostring == "true") | .ID | rtrimstr("*")' "$CUR")
   echo "IDs: held=$id_held cachemount=$id_cm recent=$id_recent shared=$(printf '%s' "$shared_ids" | tr '\n' ' ')"
   [[ -n $id_held && -n $id_cm && -n $id_recent && -n $shared_ids ]] || fail "[$P] a pressure fixture record could not be resolved"
+  lease_check before-pressure-prune phold "$id_held" 1
   local pre_pct
   pre_pct=$(pressure_pct)
   local mark
@@ -595,11 +700,13 @@ phase_pressure() {
     if ! pct_ge "$post_pct" 75; then pass "post-prune own df ${post_pct}% < 75%"; else failc "post-prune own df ${post_pct}% >= 75%"; fi
     if [[ -n $reqs ]]; then pass "nested daemon log shows the prune request(s): $(printf '%s' "$reqs" | tr '\n' ';')"; else failc 'nested daemon log shows no prune request'; fi
   fi
+  lease_check after-pressure-prune phold "$id_held" 0
   assert_present 'pressure: held record survives' "$id_held"
   assert_present 'pressure: exec.cachemount record survives' "$id_cm"
   assert_present 'pressure: recently used record survives' "$id_recent"
   for c in $shared_ids; do assert_present 'pressure: tagged image (shared) record survives' "$c"; done
   local hold_rc keep_out keep_rc=0
+  release_hold sigphold
   hold_rc=$(finish_hold phold)
   if [[ $hold_rc == 0 ]]; then pass 'pressure: the held build completed rc=0'; else failc "pressure held build rc=$hold_rc"; fi
   keep_out=$(inner 60 run --rm dbp/pkeep cat /proof 2>&1) || keep_rc=$?
@@ -613,6 +720,7 @@ REFUSED_TEXT=$(sed -n 's/^const BUILDX_MISSING_TEXT = "\(.*\)";$/\1/p' "$REPO/ag
 echo "product refused match string: '$REFUSED_TEXT'"
 echo "output directory: $OUT"
 echo "postures: $postures; phases: $phases; expect-red: ${expect_red:-none}; deadline ${DBP_DEADLINE_S:-1500}s"
+echo "EFFECTIVE SELECTION: postures=[$postures] phases=[$phases] (required proof: postures=[$REQUIRED_POSTURES] phases=[$REQUIRED_PHASES]; env DBP_POSTURES='${DBP_POSTURES-}' DBP_PHASES='${DBP_PHASES-}' DBP_EXPECT_RED='${expect_red}')"
 
 timings=()
 for posture in $postures; do
@@ -628,9 +736,9 @@ for posture in $postures; do
   fi
   timings+=("$posture setup $((SECONDS - started))s")
   print_versions
-  if has_phase points; then phase_points; fi
-  if has_phase real; then phase_real; fi
-  if has_phase pressure; then phase_pressure; fi
+  if has_phase points; then phase_points; ran+=("$posture/points"); fi
+  if has_phase real; then phase_real; ran+=("$posture/real"); fi
+  if has_phase pressure; then phase_pressure; ran+=("$posture/pressure"); fi
   timings+=("$posture total $((SECONDS - started))s")
 done
 
@@ -645,8 +753,24 @@ if ((failures > 0)); then
   echo "RESULT: FAIL ($failures failed assertion(s))"
   exit 1
 fi
+ran_text="${ran[*]:-nothing}"
 if [[ $expect_red == switch-off ]]; then
+  if [[ " $ran_text " != *' rootful/pressure '* ]]; then
+    echo "RESULT: PARTIAL (RED A NOT RUN: it needs rootful/pressure; ran: $ran_text)"
+    exit 2
+  fi
   echo 'RESULT: RED A CONFIRMED (the harness fails as designed when the switch is off)'
-else
-  echo 'RESULT: PASS'
+  exit 0
 fi
+missing=()
+for rp in $REQUIRED_POSTURES; do
+  for rph in $REQUIRED_PHASES; do
+    [[ " $ran_text " == *" $rp/$rph "* ]] || missing+=("$rp/$rph")
+  done
+done
+if ((${#missing[@]} > 0)); then
+  echo "RESULT: PARTIAL (diagnostic only, not the required proof): ran $ran_text with $failures failures; not run: ${missing[*]}"
+  exit 2
+fi
+echo "proof complete: ran $ran_text"
+echo 'RESULT: PASS'

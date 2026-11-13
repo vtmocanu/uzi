@@ -14,8 +14,8 @@ docker builder prune -f --filter type=regular --filter until=24h --max-used-spac
 ```
 
 It is separate from the component gates (`task gate`) and from CI. It starts owned throwaway
-DinD daemons. Measured on the gate run: about 230 s per posture and about 460 s in total (rootful
-230 s, rootless 227 s; the red A run takes about 100 s), under a 1500-second overall deadline.
+DinD daemons. Measured on the gate run: about 135 s per posture and about 270 s in total (rootful
+133 s, rootless 135 s, measured after the event-driven hold; the red A run takes about 100 s), under a 1500-second overall deadline.
 
 If a run is killed, reap its containers by hand: `docker ps -a --filter label=dbp-test.owner`, then
 `docker rm -fv <exact name>` after checking each container's `dbp-test.owner` label is yours.
@@ -41,14 +41,29 @@ namespace, not published), and its data root on a size-limited `tmpfs` (320 MB) 
 filesystem can cross the 85% watermark. Every version is printed: client, buildx, server
 Version/APIVersion/MinAPIVersion/commit and BuildKit.
 
-Phases (`DBP_PHASES`, default `points real pressure`; `DBP_POSTURES`, default `rootful rootless`):
+Phases (`DBP_PHASES`, default `points real pressure`; `DBP_POSTURES`, default `rootful rootless`).
+The effective selection is printed on an `EFFECTIVE SELECTION:` line at the start of every run, so an
+inherited `DBP_*` value in the environment is visible and never silent.
+
+### Verdicts and exit codes
+
+- `RESULT: PASS` (exit 0) needs BOTH postures and EVERY required phase (`points`, `real`, `pressure`)
+  to have run with zero failed assertions and no blocked posture.
+- Any narrowed run (`DBP_POSTURES` or `DBP_PHASES` leaving out a posture or phase) ends with
+  `RESULT: PARTIAL (diagnostic only, not the required proof): ran <posture/phase list> ...` and exits 2,
+  even if everything it ran passed. It is for debugging, not proof.
+- An unknown posture or phase name, or an empty value (`DBP_PHASES=`), fails before any container is
+  created (exit 1, names the valid values).
+- `RESULT: FAIL` / `RESULT: BLOCKED` exit 1. `DBP_EXPECT_RED=switch-off` has its own verdict: exit 0 only
+  with `RESULT: RED A CONFIRMED` (it needs `rootful/pressure` to have run, otherwise PARTIAL, exit 2);
+  it never prints PASS.
 
 - **points 1-6**, each with a positive control deleted in the same prune; record IDs, CacheType, InUse,
   Shared and LastUsedAt are printed before and after, and every exit status is printed.
   1. an old unused regular record is deleted;
   2. a record held by a concurrent build survives while the unheld same-age control is deleted, the
      held build completes rc 0, and the formerly held record is deleted by the same prune once the
-     build has finished and aged past the floor;
+     build has finished and aged past the floor. The lease is proven, not assumed (see below);
   3. an `exec.cachemount` record survives while a regular control is deleted;
   4. a record used within the floor survives while an older control is deleted;
   5. a tagged image's (shared) records survive and `docker run --rm` of it works;
@@ -83,6 +98,32 @@ Phases (`DBP_PHASES`, default `points real pressure`; `DBP_POSTURES`, default `r
   scaled variant inside the nested daemon. PASS needs outcome `completed`, a post sample below 75%
   (the harness's own df and the controller's logged after-sample), and the held, cachemount, recent
   and tagged-image fixtures still present (the held build completing rc 0, the image still running).
+
+### Lease-proof sequencing (point 2 and the pressure held record)
+
+The hold build is event-driven. Its last `RUN` step waits, bounded by 900 s, for a sentinel file in a
+shared BuildKit cache mount, and the harness writes the sentinel with a second tiny build only after the
+prune it must survive. Before P1 the harness (1) waits until the held record's `LastUsedAt` is older than
+the scaled floor plus a margin, (2) bumps the `recent` record, then (3) takes a fresh `system df -v`
+snapshot and asserts the hold build process is still running and the held record is `InUse=true` with
+`LastUsedAt` older than the floor, so age exclusion cannot be what protects it (the line is
+`LEASE-PROOF[<posture>/before-P1] <time>: ...`). Right after P1 a second fresh snapshot asserts the hold
+build is still running and the held record is present and still `InUse=true`
+(`LEASE-PROOF[<posture>/after-P1]`). Only then is the sentinel written, the hold build must finish rc 0,
+and the later P1b prune must delete the formerly held record. The pressure phase uses the same hold and
+the same before/after checks around the controller's prune.
+
+### Raw byte evidence
+
+`docker system df -v --format json`, `docker buildx du --format json` and `docker buildx du --verbose`
+(client 29.9.2, buildx v0.38.1) expose only formatted size strings (for example `3.146MB`, `4.1kB`), no
+raw bytes. The Engine API `GET /system/df` of the owned nested daemon does (`BuildCache[].Size` is an
+int64), and the harness reads it with the nested container's busybox `wget` over the daemon's own TCP
+listener (127.0.0.1:2375 inside the container). Every `records [...]` listing prints `bytes=<n>` next to
+the ID and formatted size, followed by a `raw bytes total` line, for the fresh, built, during-hold,
+before-P1, after-P1, before-P1b, after-P1b and pressure snapshots. The raw API snapshots are kept as
+`api-df-<label>.json` in the output directory. If that read ever fails the harness prints
+`RAW BYTES UNAVAILABLE` and `bytes=unavailable`; it does not fabricate values.
 
 The fill uses `RUN dd` layers on the alpine base rather than `FROM scratch` + `COPY`: a COPY puts the
 blob in the build context, and BuildKit keeps context data as `source.local` records that
