@@ -268,8 +268,9 @@ export class CredentialSwitchOpLedger {
 }
 
 /**
- * `priorAmbiguous` rides on a `not_applied`, `superseded` or `fenced` answer when the ledger already held an
- * ambiguous (or crash-left `sending`) entry for the op before this send: an earlier send of it may have
+ * `priorAmbiguous` rides on a `not_applied`, `superseded` or `fenced` answer when the ledger already held any
+ * entry for the op other than `clean_route_absent` before this send (`ambiguous`, a crash-left `sending`, or
+ * `settled`, matching `wasAmbiguous` in the write-ahead step): an earlier send of it may have
  * committed, and the caller (the runner, whose own per-call memory starts empty after a restart) must carry that
  * memory unless the answer is itself proof of a non-commit (`superseded`, or a NOT_APPLIED_PROOF_REASONS reason).
  */

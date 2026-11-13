@@ -444,6 +444,13 @@ export type LeadConfigPostOutcome =
   | { kind: "http"; status: number; error?: string }
   | { kind: "transport"; error: unknown };
 
+/** Issue #4201: a state report refused locally, before any request, because its preconditions (an api
+ *  feature, the registration nonce, a claim generation, an op id) do not hold. Never transient: the same
+ *  report would be refused again. */
+export class ReportPreconditionError extends Error {
+  constructor(message: string) { super(message); this.name = "ReportPreconditionError"; }
+}
+
 export class RequestError extends Error {
   constructor(
     readonly method: string,
@@ -2838,7 +2845,7 @@ export class WorkerClient {
       if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE) || !nonce ||
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
           typeof body.op_id !== "string" || body.op_id === "")
-        throw new Error("credential switch uncertain report requires the credential_switch_apply_v1 feature, a registration nonce, a positive claim_generation and an op_id");
+        throw new ReportPreconditionError("credential switch uncertain report requires the credential_switch_apply_v1 feature, a registration nonce, a positive claim_generation and an op_id");
       return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     if (body.op_id !== undefined) {
@@ -2965,7 +2972,7 @@ export class WorkerClient {
       const nonce = this.registerNonce;
       if (!this.hasFeature(CREDENTIAL_SWITCH_HOLD_FEATURE) || !nonce ||
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0)
-        throw new Error("credential switch hold report requires the credential_switch_hold feature, a registration nonce and a positive claim_generation");
+        throw new ReportPreconditionError("credential switch hold report requires the credential_switch_hold feature, a registration nonce and a positive claim_generation");
       return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     if (body.status === "clarification_settled") {

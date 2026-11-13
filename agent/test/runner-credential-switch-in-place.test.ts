@@ -7,7 +7,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { OutgoingMessage } from "../src/protocol.js";
 import os from "node:os";
 import { MessageBatcher, MAX_MESSAGE_BYTES } from "../src/batcher.js";
-import { RequestError, type CredentialSwitchApplyResult, type WorkerClient } from "../src/client.js";
+import { RequestError, ReportPreconditionError, type CredentialSwitchApplyResult, type WorkerClient } from "../src/client.js";
 import { Outbox } from "../src/outbox.js";
 import { SecretSet } from "../src/redact.js";
 import { CredentialSwitchSignal, SteeringChannel } from "../src/steering.js";
@@ -942,6 +942,86 @@ describe("issue #4201: an unconfirmed in-place report keeps retrying while the c
     const { attempts } = await outage("credential_switch_uncertain", 0, "refuse", uncertainScenario);
     assert.equal(attempts, 1);
   });
+
+  // `behave(attempt, real)` answers each runner-level report of `status`. A regression that keeps retrying a
+  // deterministic failure gets a stale-claim answer after 7 calls, so it fails an assertion instead of hanging.
+  async function scripted(
+    status: string, behave: (attempt: number, real: () => Promise<unknown>) => Promise<unknown>, run: () => ReturnType<typeof scenario>,
+  ) {
+    const realReport = client.reportState.bind(client);
+    let attempts = 0;
+    client.reportState = (async (runId: string, body: Parameters<typeof realReport>[1], ...rest: unknown[]) => {
+      if (body.status !== status) return (realReport as (...a: unknown[]) => unknown)(runId, body, ...rest);
+      attempts++;
+      return behave(attempts, () => (realReport as (...a: unknown[]) => Promise<unknown>)(runId, body, ...rest));
+    }) as typeof client.reportState;
+    try {
+      const r = await run();
+      return { r, attempts };
+    } finally { client.reportState = realReport as typeof client.reportState; }
+  }
+  const STALE = { applied: false, staleClaim: true, status: "queued" };
+  const precondition = (): Error => new ReportPreconditionError("credential switch uncertain report requires the credential_switch_apply_v1 feature, a registration nonce, a positive claim_generation and an op_id");
+
+  for (const [label, status, make, failure] of [
+    ["a 400 RequestError", "credential_switch_held", heldScenario, () => new RequestError("POST", "/state", 400, "bad request")],
+    ["a 400 RequestError", "credential_switch_uncertain", uncertainScenario, () => new RequestError("POST", "/state", 400, "bad request")],
+    ["the client's local precondition throw", "credential_switch_held", heldScenario, precondition],
+    ["the client's local precondition throw", "credential_switch_uncertain", uncertainScenario, precondition],
+  ] as const) {
+    it(`${status}: ${label} is deterministic, so the in-place report stops at once unconfirmed with work and custody kept`, TIMEOUT, async () => {
+      const { r, attempts } = await scripted(status, async (n) => { if (n <= 7) throw failure(); return STALE; }, make);
+      assert.equal(attempts, 1, "a non-transient failure is not retried");
+      assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
+      assert.equal(r.turns.length, 2, "no turn after the report");
+      assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "custody kept");
+      assert.equal(r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain").length, 0, "no uncertain feed line");
+      assert.equal(api.holdState(r.runId), undefined, "no hold was confirmed");
+    });
+  }
+
+  it("an uncertain report whose every reply is lost ends confirmed by the ownership probe from the fifth attempt", TIMEOUT, async () => {
+    // The first report reaches the server (it pauses the run) and its reply is lost; every attempt fails at the transport.
+    const { r, attempts } = await scripted("credential_switch_uncertain", async (n, real) => {
+      if (n === 1) await real();
+      if (n > 7) return STALE;
+      throw new Error("transport down");
+    }, uncertainScenario);
+    assert.equal(attempts, 5, "the probe runs after attempt index 4 and confirms");
+    assert.ok(api.ownershipRequests.includes(r.runId), "the ownership read confirmed it");
+    assert.equal(r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain").length, 1, "exactly one feed line");
+    assert.equal(r.turns.length, 2, "neither token ran again");
+  });
+
+  it("a hold report whose every reply is lost ends confirmed by the ownership probe from the fifth attempt", TIMEOUT, async () => {
+    const { r, attempts } = await scripted("credential_switch_held", async (n, real) => {
+      if (n === 1) await real();
+      if (n > 7) return STALE;
+      throw new Error("transport down");
+    }, heldScenario);
+    assert.equal(attempts, 5, "the probe runs after attempt index 4 and confirms");
+    assert.notEqual(api.holdState(r.runId), undefined, "the hold the lost reply landed is confirmed");
+    assert.equal(r.turns.length, 2, "no turn after the report");
+  });
+
+  for (const [status, make] of [["credential_switch_held", heldScenario], ["credential_switch_uncertain", uncertainScenario]] as const) {
+    it(`${status}: a cancel delivered while the report retries ends the loop as a cancel, not a swallowed error`, TIMEOUT, async () => {
+      const real = SteeringChannel.prototype.isCancelled;
+      try {
+        const { r, attempts } = await scripted(status, async (n) => {
+          if (n === 1) SteeringChannel.prototype.isCancelled = () => true;
+          if (n <= 7) throw new Error("transport down");
+          return STALE;
+        }, make);
+        assert.equal(attempts, 1, "the cancel ended the loop");
+        assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
+        const failed = r.states.find((b) => b.status === "failed");
+        assert.ok(failed, `reported through the retained-stop arm: ${statusesOf(r).join(",")}`);
+        assert.match(String((failed as { failure_reason?: string }).failure_reason ?? ""), /cancel/i);
+        assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "custody kept");
+      } finally { SteeringChannel.prototype.isCancelled = real; }
+    });
+  }
 });
 
 describe("issue #4201 m2c: a token published later is scrubbed from every sink", () => {

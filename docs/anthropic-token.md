@@ -365,7 +365,13 @@ regardless of the worker.
   reporting a terminal state and the run stays non-terminal: an API without
   the `credential_switch_hold` protocol feature (mixed-version rollout), a
   hold report the API refuses or that stays unconfirmed after one retry and
-  an ownership read, and a retained flight whose ownership read shows the run
+  an ownership read (this is the v1, op-less path; an in-place, op-carrying
+  held or uncertain report instead retries transient failures, meaning
+  transport errors, 5xx, 408 and 429, on a capped exponential backoff, with an
+  ownership read from the fifth attempt, until it is confirmed, refused, the
+  claim goes stale or the run is stopped, and any other failure ends it
+  unconfirmed with work and custody kept), and a retained flight whose
+  ownership read shows the run
   at an `awaiting_*` gate. An unconfirmed report may already have applied; the
   worker still acknowledges it after its own operations join, as described in
   [Credential-switch holds](run-recovery.md#credential-switch-holds).

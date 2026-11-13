@@ -27,7 +27,7 @@ import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
-import { RequestError, SpendLimitParkUnsupportedError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
+import { RequestError, ReportPreconditionError, SpendLimitParkUnsupportedError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
 import type { ClarificationSettlement } from "./protocol.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
@@ -27016,7 +27016,7 @@ export class RunRunner {
    *     `retained_credential_switch` site and keeps its custody flags.
    *  2. PROOF under one MaintenanceBudget: the executor's lane is settled, the settle observed the run
    *     empty, and the own-mode quiescence proof is not blocked (`settleSwitchQuiescence`). Unproven sends
-   *     `credential_switch_held` WITH the op id (identical retries on a capped backoff until confirmed, refused, stale or a lifecycle stop) and stops the flight held:
+   *     `credential_switch_held` WITH the op id (identical retries of transient failures on a capped backoff until confirmed, refused, stale or a lifecycle stop; any other failure ends it unconfirmed) and stops the flight held:
    *     nothing is applied and no turn starts on either token.
    *  3. Proven: hold sequence numbering and drain the transport (`holdForCredentialSwitch`), then apply
    *     through the write-ahead ledger. `applied` publishes the token to every sink in one synchronous
@@ -27392,15 +27392,14 @@ export class RunRunner {
     let confirmed = false;
     let refused = false;
     // The flight stays alive (the worker's heartbeat is independent of this wait) and keeps custody: the report
-    // retries on a capped backoff through transport errors, 5xx and unreadable acks. It ends only on a
-    // confirmation, a definitive refusal (a reachable api answering applied:false), a stale claim or lost
-    // ownership (thrown to the stale stop with work retained), or a lifecycle stop (guard throws, or the wait ends
-    // on shutdown).
+    // retries on a capped backoff through transient failures only (transport errors, 5xx, 408, 429 and unreadable
+    // acks). It ends on a confirmation, a definitive refusal (a reachable api answering applied:false), a stale
+    // claim or lost ownership (thrown to the stale stop with work retained), a lifecycle stop (it arrives as
+    // guard()'s throw), or a non-transient failure (unconfirmed: retained_stop, work and custody kept).
     for (let attempt = 0; !confirmed && !refused; attempt++) {
       if (attempt > 0) {
         await this.waitRecoveryRetry(flight, true, this.inPlaceReportBackoffMs(attempt), signal);
         guard();
-        if (this.inPlaceReportWaitEnded(flight, signal)) break;
       }
       try {
         const ack = await flight.reportState({ status: "credential_switch_uncertain", op_id: opId }, signal);
@@ -27409,8 +27408,9 @@ export class RunRunner {
         if (ack.credentialSwitchUncertain === true) confirmed = true;
       } catch (error) {
         guard();
-        if (error instanceof StaleClaimError || isRunOwnershipLost(error, flight.runId)) throw error;
+        if (error instanceof StaleClaimError || error instanceof RetainedRecoveryStop || isRunOwnershipLost(error, flight.runId)) throw error;
         runLog.warn("in-place credential switch uncertain report failed", { run_id: flight.runId, attempt, error: errMessage(error) });
+        if (!this.inPlaceReportRetryable(error)) break;
       }
       if (!confirmed && !refused && attempt >= IN_PLACE_REPORT_PROBE_AFTER) {
         // A lost reply can leave the run paused server-side: a positive ownership read confirms it.
@@ -27444,9 +27444,12 @@ export class RunRunner {
     return this.recoveryRetryMs * 2 ** Math.min(attempt - 1, IN_PLACE_REPORT_MAX_DOUBLINGS);
   }
 
-  /** The wait ended because the flight is shutting down or its lifecycle signal fired: stop retrying, keep custody. */
-  private inPlaceReportWaitEnded(flight: RunFlight, signal: AbortSignal): boolean {
-    return signal.aborted || flight.active?.shuttingDown === true || this.shuttingDownGlobal;
+  /** Whether a failed in-place report is worth repeating: `isTransient` (transport, 5xx, 408, 429, an unreadable ack),
+   *  except the client's own local precondition throws from `reportState` (a plain `Error`, which `isTransient`
+   *  counts as transport), which no retry can change. */
+  private inPlaceReportRetryable(error: unknown): boolean {
+    if (error instanceof ReportPreconditionError) return false;
+    return isTransient(error);
   }
 
   /** Wait (bounded) for steering to name a switch op other than `current`. `undefined` means none came:
@@ -27615,7 +27618,7 @@ export class RunRunner {
   /**
    * issue #3181: the retained switch could not be settled. Keep work and custody, tell the feed, and
    * report `credential_switch_held` when the server supports it. Confirmed by a positive ACK or, when
-   * the report throws (one identical retry first), by an ownership read showing the run paused on a
+   * the report throws (one identical retry first on the v1 op-less path only), by an ownership read showing the run paused on a
    * switch-settling hold at this generation. An unconfirmed or refused hold is a residual
    * non-terminal stop. A possibly applied report still owes a post-join acknowledgement, even if
    * guard's deadline or a transport failure prevents confirmation; only a definitive refusal clears
@@ -27624,8 +27627,9 @@ export class RunRunner {
   private async holdRetainedSwitch(
     flight: RunFlight, runLog: Logger, signal: AbortSignal, guard: () => void, detail: string, survivors: string,
     /** Issue #4201: the in-place switch's report. `opId` fences it. It retries the identical report on a capped
-     *  backoff until confirmed or refused; a stale claim or lost ownership ends it (the caller stops with work
-     *  retained), as does a lifecycle stop. The v1 (op-less) report keeps its two attempts. */
+     *  backoff while the failure is transient, until confirmed or refused; a stale claim or lost ownership ends it
+     *  (the caller stops with work retained); a lifecycle stop arrives as guard()'s throw; any other failure ends it
+     *  unconfirmed. The v1 (op-less) report keeps its two attempts. */
     inPlace?: { opId: string },
   ): Promise<"held" | "stopped"> {
     // The flight is already marked `unproven` by settleRetainedSwitch. The owner feed carries only
@@ -27667,7 +27671,6 @@ export class RunRunner {
       if (inPlace && attempt > 0) {
         await this.waitRecoveryRetry(flight, true, this.inPlaceReportBackoffMs(attempt), signal);
         guard();
-        if (this.inPlaceReportWaitEnded(flight, signal)) break;
       }
       try {
         const ack = await flight.reportState({
@@ -27679,8 +27682,9 @@ export class RunRunner {
         if (ack.credentialSwitchHeld === true) confirmed = true;
       } catch (error) {
         guard();
-        if (inPlace && (error instanceof StaleClaimError || isRunOwnershipLost(error, flight.runId))) throw error;
+        if (inPlace && (error instanceof StaleClaimError || error instanceof RetainedRecoveryStop || isRunOwnershipLost(error, flight.runId))) throw error;
         runLog.warn("retained credential switch hold report failed", { run_id: flight.runId, attempt, error: errMessage(error) });
+        if (inPlace && !this.inPlaceReportRetryable(error)) break;
       }
       // In place the retries never end on their own, so past the first few identical (idempotent) reports a lost reply
       // is also checked against the server's view (a hold that did land confirms by the ownership read).

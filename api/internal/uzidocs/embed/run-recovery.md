@@ -408,7 +408,9 @@ without requesting a hold when the API lacks the `credential_switch_hold` protoc
 feature or the retained flight's ownership reads `awaiting_*`. A refused hold report
 also stops the flight without a hold.
 
-If a hold report stays unconfirmed after one retry and an ownership read, the hold
+If a hold report stays unconfirmed (for a v1 report, after one retry and an
+ownership read; an in-place report retries transient failures on a capped backoff
+until it is confirmed, refused or the claim goes stale), the hold
 may already exist on the server. After its own operations join, the worker still
 sends the fenced settlement acknowledgement, with bounded heartbeat retries if
 delivery is uncertain. If the hold never applied, that acknowledgement changes

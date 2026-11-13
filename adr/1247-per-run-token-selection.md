@@ -139,7 +139,7 @@ proof stays fail-closed:
 
 1. An API without the `credential_switch_hold` protocol feature (rollout skew): the worker
    sends neither hold report.
-2. A hold report that is refused, or unconfirmed after one retry and an ownership read.
+2. A v1 (op-less) hold report that is refused, or unconfirmed after one retry and an ownership read. An in-place (op-carrying) held or uncertain report instead retries transient failures (transport, 5xx, 408, 429) on a capped exponential backoff, with an ownership read from the fifth attempt, until it is confirmed, refused, the claim goes stale or a lifecycle stop arrives; any other failure ends it unconfirmed with work and custody kept (ADR-4201 D5).
 3. A retained flight whose ownership read shows `awaiting_*`.
 
 Also, `SetRunCredential` checks the fence before it writes the override and the resume
