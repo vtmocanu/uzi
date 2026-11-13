@@ -224,3 +224,56 @@ func TestSinceLastFailureBoundaries(t *testing.T) {
 		}
 	}
 }
+
+// TestAdminUsageHelpStatesBothDefinitions pins issue #4209: the help separates the RUNS
+// population (primary work runs with usage) from the outcome population (terminal primary
+// work runs, usage or not) and names the helper kinds whose tokens and cost still count.
+func TestAdminUsageHelpStatesBothDefinitions(t *testing.T) {
+	out, errOut, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "admin", "usage", "--help")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, errOut)
+	}
+	help := strings.Join(strings.Fields(out+errOut), " ")
+	for _, want := range []string{
+		"RUNS counts primary work runs (issue, task, prompt, job, self_improve) with recorded usage.",
+		"Finished, failed and fail rate count terminal primary work runs, including runs with no recorded usage.",
+		"Tokens and cost also include helper runs (judge, cross_check, mr_rework, ci_fix); chat is excluded.",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help missing %q\n%s", want, help)
+		}
+	}
+}
+
+// TestRenderAdminUsageHelperOnlyUser: a user whose only usage is helper runs has RunCount 0
+// but non-zero tokens; the RUNS cell shows 0 and the tokens still render.
+func TestRenderAdminUsageHelperOnlyUser(t *testing.T) {
+	u := apitypes.AdminUsageDTO{
+		Factory: apitypes.SelfUsageDTO{
+			Lifetime: apitypes.UsageDTO{InputTokens: 777, OutputTokens: 333, CostUSD: 1.5},
+			RunCount: 4,
+		},
+		Users: []apitypes.AdminUserUsageDTO{
+			{Email: "helper@example.com", Usage: apitypes.UsageDTO{InputTokens: 777, OutputTokens: 333, CostUSD: 1.5}, RunCount: 0},
+		},
+	}
+	out := renderUsageToString(t, u)
+	if !strings.Contains(out, "(runs=4)") {
+		t.Errorf("factory line missing (runs=4):\n%s", out)
+	}
+	var row string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "helper@example.com") {
+			row = line
+		}
+	}
+	fields := strings.Fields(row)
+	if len(fields) < 2 || fields[1] != "0" {
+		t.Fatalf("helper-only row RUNS cell = %v, want 0\nrow: %q", fields, row)
+	}
+	for _, want := range []string{"777", "333"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("helper-only row missing token %s: %q", want, row)
+		}
+	}
+}

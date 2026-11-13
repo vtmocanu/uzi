@@ -117,8 +117,10 @@ type RunOutcomeWindowsDTO struct {
 
 // SelfUsageDTO is the current user's own consumption (GET /api/usage) or, reused,
 // the factory-wide totals on the admin summary. run_count is the number of the
-// scope's runs that carry usage; the client reads run_count == 0 as "nothing yet"
-// rather than rendering fabricated zeros.
+// scope's primary work runs (issue, task, prompt, job, self_improve) that carry usage;
+// helper runs (judge, cross_check, mr_rework, ci_fix) add tokens and cost but not to
+// run_count. run_count == 0 does not mean no usage: read the token and cost values for
+// the "nothing yet" state rather than rendering fabricated zeros.
 type SelfUsageDTO struct {
 	Lifetime  UsageDTO `json:"lifetime"`
 	Last7Days UsageDTO `json:"last_7_days"`
@@ -181,8 +183,8 @@ type AdminUserUsageDTO struct {
 	Last7HarnessRuns *HarnessRunsDTO `json:"last7_harness_runs,omitempty"`
 }
 
-// HarnessRunsDTO is one window's usage-bearing run count split by harness (issue #3876). It
-// counts the same runs as the row's run count, so Claude + Codex equals that count.
+// HarnessRunsDTO is one window's primary work run count with usage, split by harness (issue
+// #3876). It counts the same primary runs as the row's run count, so Claude + Codex equals that count.
 type HarnessRunsDTO struct {
 	Claude int64 `json:"claude"`
 	Codex  int64 `json:"codex"`
