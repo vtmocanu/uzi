@@ -418,7 +418,11 @@ Mid-run checkpoints publish too, so a commit can be published before any pull
 request exists. To check, find the checkpoint ref and its tip with
 `uzi run recovery <run-id>`, fetch the forge branch and that ref, and run
 `git merge-base --is-ancestor <sha> <published tip>` for each offending SHA
-against each published tip. The feed lists at most five SHAs plus a remaining
+against each published tip, in a full (non-shallow) clone holding both
+commits. Exit 0 means the commit is published. Exit 1 means it is not
+reachable only when the history is complete; in a shallow or partial clone
+it can be wrong. Any error, or history you cannot fetch, means unknown:
+treat the commit as published. The feed lists at most five SHAs plus a remaining
 count; when a count appears, the listed SHAs alone cannot settle this, so
 check every commit in the default-branch..candidate range or cancel.
 

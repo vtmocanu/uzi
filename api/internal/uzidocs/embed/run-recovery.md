@@ -345,7 +345,10 @@ a SHA. Unknown projection uses fixed copy without commit content.
    rewrite history or force-push. Published history is the run branch as it
    exists on the forge and any [published checkpoint ref](#published-checkpoint-refs),
    not the local candidate; mid-run checkpoints count. Check each offending
-   SHA with `git merge-base --is-ancestor <sha> <published tip>`. When the
+   SHA with `git merge-base --is-ancestor <sha> <published tip>` in a full
+   (non-shallow) clone holding both commits: exit 0 means published; exit 1
+   means unpublished only when the history is complete; an error or
+   unavailable history means unknown, so treat it as published. When the
    feed shows a remaining count, the listed SHAs alone cannot settle this:
    check every commit in the default-branch..candidate range or cancel.
 2. For an offending commit reachable from published history, a Stop
