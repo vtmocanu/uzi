@@ -280,7 +280,14 @@ export function peopleModel(input: {
 
   let week: number | null = null;
   if (adminUsage != null && adminUsage.users.every((u) => typeof u.last7_run_count === "number")) {
-    week = adminUsage.users.filter((u) => (u.last7_run_count ?? 0) > 0).length;
+    // Issue #4209: last7_run_count counts primary work only, so a user whose only seven-day
+    // activity is helper runs (judge, cross-check, PR rework, CI fix) still counts when they spent.
+    week = adminUsage.users.filter((u) => {
+      if ((u.last7_run_count ?? 0) > 0) return true;
+      const w = u.last_7_days;
+      const spent = w != null && (w.input_tokens !== 0 || w.cache_read_tokens !== 0 || w.cache_creation_tokens !== 0 || w.output_tokens !== 0 || w.cost_usd !== 0);
+      return spent || (u.last7_subscription_run_count ?? 0) > 0 || (u.last7_unreported_run_count ?? 0) > 0;
+    }).length;
   }
 
   return {

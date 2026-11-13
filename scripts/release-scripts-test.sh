@@ -441,14 +441,57 @@ $body"
   short="$(git_c rev-parse --short HEAD)"
   citation="#1317"
   [ "$escape" != sha ] || citation="$short"
+  [ "$escape" != sha-full ] || citation="$(git_c rev-parse HEAD)"
+  # A citation written when git abbreviated to 7 must survive git abbreviating
+  # longer later (core.abbrev stands in for repository growth).
+  if [ "$escape" = sha-prefix ]; then
+    citation="$(git_c rev-parse HEAD | cut -c1-7)"
+    git_c config core.abbrev 12
+    short="$(git_c rev-parse --short HEAD)"
+  fi
+  [ "$escape" != sha-other ] || citation="deadbee"
+  case "$escape" in
+    sha-ambiguous|sha-git-fails|sha-tr-fails) citation="$(git_c rev-parse HEAD | cut -c1-7)" ;;
+  esac
+  # A tag spelled in hex that points at the merge is a ref, not a SHA citation.
+  if [ "$escape" = sha-tag ]; then git_c tag deadbee HEAD; citation="deadbee"; fi
+  # A token glued to a non-hex character is not a whole SHA token.
+  [ "$escape" != sha-glued ] || citation="$(git_c rev-parse HEAD | cut -c1-12)g"
+  # A citation under an older version's heading does not cover this release.
+  local older=""
+  [ "$escape" != sha-older-section ] || older=" ($(git_c rev-parse HEAD | cut -c1-12))"
   put CHANGELOG.md <<<"## [0.2.0]
 - Released ($citation)
 
 ## [0.1.0]
-- Initial"
+- Initial$older"
   chart 0.2.0
   commit "chore(release): v0.2.0"
-  out="$(cd "$REPO" && bash "$ORACLE" HEAD v0.1.0 0.2.0 2>&1)"; rc=$?
+  # Shims on PATH exercise the lookup's failure modes deterministically, without
+  # depending on generated hashes; every call they do not target passes through.
+  # sha-ambiguous: --disambiguate reports a second object (an ambiguous prefix).
+  # sha-git-fails: --disambiguate prints the merge's SHA, then exits 74.
+  # sha-tr-fails:  the word split prints its full output, then exits 73.
+  # A failing stage must stop the check (exit 2), never grant a citation.
+  local shim_path="$PATH" citation_shim="" real
+  case "$escape" in
+    sha-ambiguous|sha-git-fails)
+      citation_shim="$(mktemp -d)"; real="$(command -v git)"
+      if [ "$escape" = sha-ambiguous ]; then
+        printf '#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in --disambiguate=*) "%s" "$@"; echo 0000000000000000000000000000000000000000; exit 0;; esac; done\nexec "%s" "$@"\n' "$real" "$real" > "$citation_shim/git"
+      else
+        printf '#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in --disambiguate=*) "%s" "$@"; exit 74;; esac; done\nexec "%s" "$@"\n' "$real" "$real" > "$citation_shim/git"
+      fi
+      chmod +x "$citation_shim/git"; shim_path="$citation_shim:$PATH" ;;
+    sha-tr-fails)
+      citation_shim="$(mktemp -d)"; real="$(command -v tr)"
+      printf '#!/usr/bin/env bash\nif [ "$1" = -c ]; then "%s" "$@"; exit 73; fi\nexec "%s" "$@"\n' "$real" "$real" > "$citation_shim/tr"
+      chmod +x "$citation_shim/tr"; shim_path="$citation_shim:$PATH" ;;
+  esac
+  out="$(cd "$REPO" && PATH="$shim_path" bash "$ORACLE" HEAD v0.1.0 0.2.0 2>&1)"; rc=$?
+  [ -z "$citation_shim" ] || rm -rf "$citation_shim"
+  [ "$escape" != sha-prefix ] || git_c config --unset core.abbrev
+  [ "$escape" != sha-tag ] || git_c tag -d deadbee >/dev/null
   assert_eq "$label exit" "$expected" "$rc"
   if [ "$expected" = 1 ]; then
     if [ -z "$refs" ]; then
@@ -514,6 +557,15 @@ identity_regressions() {
   identity_case "union and dedup diagnostic" "Ship #902,issue-903,#902" "Fixes #904;Closes #903" 1 "#902, #903, #904"
   identity_case "SHA without refs" "Ship" "" 0 "" sha
   identity_case "SHA with wrong refs" "Ship (#902)" "Fixes #903" 0 "" sha
+  identity_case "SHA prefix shorter than the current abbreviation" "Ship" "" 0 "" sha-prefix
+  identity_case "full SHA" "Ship" "" 0 "" sha-full
+  identity_case "hex token naming no commit" "Ship" "" 1 "" sha-other
+  identity_case "hex-named tag at the merge" "Ship" "" 1 "" sha-tag
+  identity_case "SHA prefix glued to a letter" "Ship" "" 1 "" sha-glued
+  identity_case "SHA prefix under an older version" "Ship" "" 1 "" sha-older-section
+  identity_case "ambiguous SHA prefix" "Ship" "" 1 "" sha-ambiguous
+  identity_case "SHA lookup fails after printing the merge" "Ship" "" 2 "" sha-git-fails
+  identity_case "word split fails after printing" "Ship" "" 2 "" sha-tr-fails
   identity_case "Changelog none body" "Ship" "Changelog: none" 0 ""
   identity_case "Changelog none subject" "Changelog: none" "" 0 ""
   identity_case "CHANGELOG touched" "Ship" "" 0 "" touched
