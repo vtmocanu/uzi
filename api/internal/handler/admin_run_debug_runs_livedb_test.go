@@ -15,6 +15,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -328,19 +329,28 @@ func TestAdminRunDebugListRunsLiveDB(t *testing.T) {
 
 	t.Run("audit text carries no raw since or secret", func(t *testing.T) {
 		f.audit.take(t)
-		// An offset no CI or developer host runs in, so log timestamps cannot carry it.
-		sinceArg := base.In(time.FixedZone("", 5*3600+45*60)).Format(time.RFC3339)
+		sinceArg := base.In(time.FixedZone("", 2*3600)).Format(time.RFC3339)
 		f.get(t, "/api/admin/runs?state=all&user="+b.user.String()+"&since="+strings.ReplaceAll(sinceArg, "+", "%2B"))
 		out := f.audit.buf.String()
-		if strings.Contains(out, "+05:45") || strings.Contains(out, sinceArg) {
-			t.Errorf("audit output echoes the raw since argument:\n%s", out)
-		}
 		for _, secret := range []string{f.adminRO, f.adminUzc, adrlReport} {
 			if strings.Contains(out, secret) {
 				t.Errorf("audit output contains %q:\n%s", secret, out)
 			}
 		}
 		rec := f.oneAudit(t, "owner B listing")
+		// Check the record's own attributes, not the whole line: the log's timestamp is
+		// rendered in the host's zone and may legitimately carry any offset.
+		for k, v := range rec {
+			if k == "time" {
+				continue
+			}
+			if sv := fmt.Sprint(v); strings.Contains(sv, "+02:00") || strings.Contains(sv, sinceArg) {
+				t.Errorf("audit attribute %s echoes the raw since argument: %v", k, v)
+			}
+		}
+		if rec["since"] != base.Format(time.RFC3339Nano) {
+			t.Errorf("audit since = %v, want the normalised UTC %s", rec["since"], base.Format(time.RFC3339Nano))
+		}
 		if rec["returned"] != float64(2) {
 			t.Errorf("owner B audit returned = %v, want 2 (queued and running)", rec["returned"])
 		}
