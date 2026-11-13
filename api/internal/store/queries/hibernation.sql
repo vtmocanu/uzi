@@ -5,7 +5,7 @@
 
 -- name: WriteWorkerHibernation :one
 -- Persist the complete hibernation column set of one worker. The caller holds the row
--- lock; the CHECK constraints from migration 00436 still guard coherence.
+-- lock; the CHECK constraints from migration 00438 still guard coherence.
 UPDATE workers SET
     hibernation_state = @hibernation_state::text,
     hibernation_op_id = sqlc.narg('hibernation_op_id'),
