@@ -26,9 +26,10 @@ in production.
 ### A separate namespace and separate tables
 
 A terminal ref is `refs/uzi-terminal/<run-id>`, one per run. It is not a held
-publication and not a checkpoint or recovery ref. Two tables carry it, and
-neither references custody holds, `run_held_publications` or
-`checkpoint_retention`:
+publication and not a checkpoint or recovery ref. Two tables carry it. Neither
+references `run_held_publications` or `checkpoint_retention`; a contribution
+authorized by an open guarded custody hold names that hold (`hold_id`, an
+`ON DELETE RESTRICT` foreign key), and is otherwise independent of custody:
 
 - `run_terminal_preservations`: one row per run. States are `bound`,
   `publishing`, `live`, `retiring`, `deleted`, `abandoned` and
@@ -56,8 +57,9 @@ another namespace.
 ### Declared coverage, not proof of completeness
 
 Before a push, the broker verifies the worker's declared coverage: every
-declared root is reachable from the tip, each declared tree matches, and a full
-connectivity walk of the pack succeeds. A contribution reaching `published`
+declared root is reachable from the tip, each declared tree matches, and a
+connectivity walk of everything reachable from the tip (the pack plus the
+fetched bases) succeeds. A contribution reaching `published`
 means only that. It is not proof that the declared inventory is the run's whole
 inventory: omission detection is slice B and is not built.
 
@@ -72,8 +74,10 @@ inventory: omission detection is slice B and is not built.
   issue-bound run consults only its issue; an issue-less run with a merge
   request consults only the MR; otherwise it is `no_pr`.
 - **Send-winner rule**: at most one network send per generation. A marker is
-  committed before the push (tx1); only the request that sets it sends; every
-  other request, an ambiguous commit or a retry only lists the ref. The outcome
+  committed before the push (tx1); only the request that sets it sends. A losing request
+  never sends, and a request whose commit is ambiguous never sends; a retry
+  reconciles (lists the ref) when the marker is durable, and otherwise may win
+  afresh and send once, so the bound stays one send per generation. The outcome
   is recorded in tx2 on a context detached from the request deadline. No forge
   call runs inside a transaction. The shape follows ADR-2545 step A.
 - If the issue or MR is proven closed, the route records an abandoned
@@ -131,8 +135,8 @@ until those exist. Tests enable the lane through an unexported hook only.
 
 ### Gate scoping: the completed-release gate
 
-`ReleaseCompletedPublicationHold` (`api/internal/workersvc/completed_publication.go`)
-gains one scoped precondition. Only the branch-only completion release is
+`verifyCompletedPublication` (`api/internal/workersvc/completed_publication.go`)
+gains one scoped precondition before the `ReleaseCompletedPublicationHold` write. Only the branch-only completion release is
 gated, and only when a terminal contribution exists for exactly the completing
 generation:
 
@@ -155,8 +159,8 @@ power-loss claim beyond that, and remote durability is the forge's.
 
 | Crash point | Recovery |
 |---|---|
-| Before tx1 | No send; the stale-bound lane, or a retry |
-| tx1 commit ambiguous | No send; reconcile; an absent ref is never resent |
+| Before tx1 | No row, no send; a retry starts afresh |
+| tx1 commit ambiguous | The request does not send; a retry reconciles if the marker is durable, otherwise it may win afresh and send once |
 | After tx1, before tx2 | Reconcile |
 | tx2 ambiguous | Reconcile |
 | After the observation, before tx-R1 | No state change; a fresh observation next time |
@@ -171,7 +175,8 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
 
 ## Consequences
 
-- **Dark delivery.** No worker advertises the capability, so no row is created,
+- **Dark delivery.** No shipped worker advertises the capability (there is no
+  server-side switch: the capability is worker-reported), so no row is created,
   no ref is pushed, the gate never fires and the sweep lists zero rows. The
   schema, broker, route, sweep and gate are exercised by tests, not by
   production traffic.
@@ -193,6 +198,8 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
 
 - **B**: worker capture and publication (the caller of the route), omission
   detection, and teaching the agent decoders the two new completion reasons.
+  B must not advertise `recovery_terminal_preservation_v1` before D's owner
+  escape for removal-blocking refs lands.
 - **C**: reclaim and custody.
 - **C/D**: retirement enablement: a consumer-admission fence, a complete
   protection list, the indexes for the protection query, and then flipping the

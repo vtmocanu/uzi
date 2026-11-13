@@ -3436,12 +3436,12 @@ While a terminal ref of one of its runs may still be on the forge, removing the
 repo or the forge connection is refused with a 409. It reads like this:
 
 ```text
-this repo has 2 terminal-preservation ref(s) of finished runs still on the forge (refs/uzi-terminal/<run-id> (live); and 1 more); a ref clears when its retirement completes against the forge, so remove the repo after the block lifts
+this repo has 2 terminal-preservation ref(s) of finished runs still on the forge (refs/uzi-terminal/<run-id> (live); refs/uzi-terminal/<run-id> (live)); a ref clears when its retirement completes against the forge, so remove the repo after the block lifts
 ```
 
 For a connection it says `this connection`. The body also carries
 `terminal_refs` (up to five refs) and `terminal_count` (the total). Because
-retirement is switched off, the block does not lift on its own, and an owner
+retirement is switched off, a live ref's block does not lift on its own, and an owner
 escape for it is not built yet. Nothing creates these refs in this release, so
 you should not see this 409 from them.
 

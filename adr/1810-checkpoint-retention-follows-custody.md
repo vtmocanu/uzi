@@ -434,8 +434,11 @@ above.
 
 Terminal preservation is independent of checkpoint retention and of custody.
 Its `refs/uzi-terminal/<run-id>` namespace and tables are separate;
-`SettleRetainedCheckpoint` and supersession never touch them. The one
-interaction is a scoped precondition on the completed-publication release: the
+`SettleRetainedCheckpoint` and supersession never touch them. It touches custody in three
+narrow ways: a contribution may take its authority from (and reference, with a
+RESTRICT foreign key) an open guarded custody hold; an open custody hold keeps
+a terminal ref from retiring; and a scoped precondition on the
+completed-publication release: the
 branch-only completion release is refused (`terminal_preservation_pending` or
 `terminal_preservation_refused`) while a terminal contribution for exactly the
 completing generation is unfinished or refused. With no such row, behavior is
