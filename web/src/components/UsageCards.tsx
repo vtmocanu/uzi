@@ -9,10 +9,11 @@ import { maskEmail } from "../lib/demoMask";
 import { Card, SectionTitle, cx } from "./ui";
 import {
   failRate, failRateDelta, formatSince, summaryCost, perPrText,
-  FailedRunsBlock, TopCauses, SinceLastFailedRun, WindowToggle, Th, Td,
+  FailedRunsBlock, TopCauses, SinceLastFailedRun, WindowToggle, Th, Td, hasRecordedUsage, USAGE_SCOPE_NOTE,
 } from "./usageParts";
 import { breakdown, perUserRows } from "../lib/usageByUser";
 import { costShareRows } from "../lib/costShares";
+import { hasRecordedLifetimeUsage } from "../lib/usageRecorded";
 
 // PRD #40: one usage summary, with personal figures for everyone and factory
 // figures plus the selected-window per-user section only from the admin-gated response.
@@ -77,7 +78,7 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
             </ul>
           </div>
         </div>
-        {usage.run_count === 0 && <p className="mt-3 text-xs text-muted">No token usage recorded yet.</p>}
+        {!hasRecordedUsage(usage) && <p className="mt-3 text-xs text-muted">No token usage recorded yet.</p>}
       </div>
       <div><FailedRunsBlock outcomes={outcomes} personal={personal} /></div>
       <div><TopCauses outcomes={outcomes} personal={personal} /></div>
@@ -98,6 +99,8 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
   const failureOwner = admin?.users.find((u) => u.user_id === admin.factory.outcomes.lifetime.last_failed_user_id);
   const owner = failureOwner ? maskEmail(failureOwner.email, demo) : undefined;
   const since = admin ? formatSince(admin.earliest_run) : "";
+  // The API appends zero-usage rows for outcome-only users; count only users with recorded usage.
+  const usersWithUsage = admin ? admin.users.filter((u) => hasRecordedLifetimeUsage(u.usage, u.run_count, u.subscription_run_count, u.unreported_run_count)).length : 0;
   return (
     <Card className="min-w-0">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -105,9 +108,10 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
         <WindowToggle value={window} onChange={onWindowChange} />
       </div>
       <div className={cx("mt-4 grid gap-x-6 gap-y-3", admin && "md:grid-cols-2 md:grid-rows-[repeat(7,auto)]")}>
-        <UsageColumn usage={self} window={window} personal aligned={!!admin} runCountLine={`${self.run_count.toLocaleString("en-US")} ${self.run_count === 1 ? "run" : "runs"} with token usage`} />
-        {admin && <UsageColumn usage={admin.factory} window={window} personal={false} aligned owner={owner} runCountLine={`${admin.factory.run_count.toLocaleString("en-US")} runs with token usage by ${admin.users.length} ${admin.users.length === 1 ? "user" : "users"}${since ? ` since ${since}` : ""}`} />}
+        <UsageColumn usage={self} window={window} personal aligned={!!admin} runCountLine={`${self.run_count.toLocaleString("en-US")} primary work ${self.run_count === 1 ? "run" : "runs"} with token usage`} />
+        {admin && <UsageColumn usage={admin.factory} window={window} personal={false} aligned owner={owner} runCountLine={`${admin.factory.run_count.toLocaleString("en-US")} primary work runs with token usage${since ? ` since ${since}` : ""} · ${usersWithUsage} ${usersWithUsage === 1 ? "user" : "users"} with recorded usage`} />}
       </div>
+      <p className="mt-3 text-[11px] leading-relaxed text-muted">{USAGE_SCOPE_NOTE}</p>
       {admin && (
         <section aria-label={`Per-user usage, ${window === "lifetime" ? "all time" : "last 7 days"}`} className="mt-5 border-t border-edge pt-4">
           <h3 className="text-sm font-semibold text-fg">Per user · {window === "lifetime" ? "all time" : "last 7 days"}</h3>
@@ -136,7 +140,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
             <thead>
               <tr>
                 <Th left>User</Th>
-                <Th>Runs</Th>
+                <Th title="Primary work runs with recorded usage in the period">Runs</Th>
                 {showPRs && <Th>PRs</Th>}
                 <Th>Failed</Th>
                 <Th>Fail rate</Th>

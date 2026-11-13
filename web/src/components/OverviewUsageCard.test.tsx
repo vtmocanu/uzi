@@ -7,6 +7,7 @@ import { OverviewUsageCard } from "./OverviewUsageCard";
 import type { UsageWindow } from "./UsageCards";
 import type { AdminUsage, RunOutcomes, SelfUsage } from "../lib/api";
 import { setDemoMode } from "../lib/demoMode";
+import { USAGE_SCOPE_NOTE } from "./usageParts";
 
 const bundle = (input: number, cache: number, output: number, cost: number) => ({
   input_tokens: input, cache_read_tokens: cache, cache_creation_tokens: 0,
@@ -257,13 +258,43 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     expect(setItem).toHaveBeenCalledWith("uzi.overviewUsageScope", JSON.stringify("all"));
   });
 
+  describe("primary work scope (#4209)", () => {
+    const helperOnly = (): SelfUsage => {
+      const { self } = fixture();
+      return { ...self, run_count: 0, lifetime_subscription_run_count: 0, lifetime_unreported_run_count: 0,
+        last7_subscription_run_count: 0, last7_unreported_run_count: 0 };
+    };
+
+    it("shows helper-only spend and not the empty message when run_count is 0", () => {
+      const view = mount({ self: helperOnly() });
+      expect(view.getByText("$1,235")).toBeTruthy();
+      expect(view.queryByText("No token usage recorded yet.")).toBeNull();
+    });
+
+    it("still shows the empty message when every usage figure is zero", () => {
+      const self = helperOnly();
+      self.lifetime = bundle(0, 0, 0, 0); self.last_7_days = bundle(0, 0, 0, 0);
+      expect(mount({ self }).getByText("No token usage recorded yet.")).toBeTruthy();
+    });
+
+    it("renders the scope note", () => {
+      const view = mount({ self: fixture().self });
+      expect(view.getByText(USAGE_SCOPE_NOTE)).toBeTruthy();
+    });
+
+    it("divides the full cost, helper spend included, by the PR count", () => {
+      const self = helperOnly(); self.lifetime_pr_count = 4;
+      expect(mount({ self }).getByText("$308.64 per PR")).toBeTruthy();
+    });
+  });
+
   it("does not render the dropped side-by-side or run-count pieces", () => {
     const { self, admin } = fixture();
     const view = mount({ self, admin });
-    expect(view.queryByText(/runs with token usage/)).toBeNull();
+    expect(view.queryByText(/runs with token usage/i)).toBeNull();
     expect(view.getAllByRole("region", { name: /^(Your|Factory) usage$/ })).toHaveLength(1);
     fireEvent.click(view.getByRole("button", { name: "All users" }));
-    expect(view.queryByText(/runs with token usage/)).toBeNull();
+    expect(view.queryByText(/runs with token usage/i)).toBeNull();
     expect(view.getAllByRole("region", { name: /^(Your|Factory) usage$/ })).toHaveLength(1);
   });
 
@@ -433,7 +464,7 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     expect(headers(view)).toEqual(SPLIT_HEADERS);
     const th = section(view).getByRole("columnheader", { name: "Cost share · Claude / Codex" });
     expect(th.getAttribute("title")).toBe(
-      "Share of recorded API-equivalent cost in the selected period; Claude / Codex: share of each user's runs by harness, the same runs as the Runs column; cross-check runs count under the harness they ran on",
+      "Share of recorded API-equivalent cost in the selected period; Claude / Codex: share of each user's runs by harness, the same primary work runs as the Runs column",
     );
     expect(th.className).toContain("text-left");
     fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
@@ -493,7 +524,7 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     expect(th("Last failure").getAttribute("title")).toBe(
       "All time: the API serves the last failure time for all time only, so this column is the same in both windows",
     );
-    expect(th("Runs").getAttribute("title")).toBe("Runs with recorded usage in the period");
+    expect(th("Runs").getAttribute("title")).toBe("Primary work runs with recorded usage in the period");
     expect(th("Fail rate").getAttribute("title")).toBe("Failed of finished runs in the period");
     for (const h of section(view).getAllByRole("columnheader")) expect(h.getAttribute("scope")).toBe("col");
   });

@@ -302,3 +302,46 @@ remain pending on #4043, without a pre-enable canary/approval gate. Record image
 pod, epoch, requested state and actual deleted/kept reasons or fatal result;
 keep allocated-byte estimates, unattributed statfs delta and independent physical
 reclaim separate. No hosted evidence is claimed by this amendment.
+
+## Amendment 2026-11-13 — issue #4143: `.retire-*` scratch outcome records (observation only)
+
+Worker startup now observes every `.retire-*` retirement scratch parent the
+bounded root listing reaches under `<dataDir>/runner` (4096-entry budget;
+`enumeration_incomplete` marks a truncated listing) and emits bounded
+per-parent `runner retire scratch outcome` rows (at most 10, sorted, parents
+only) and exactly one `runner retire scratch total` line per startup (one per
+pod epoch on epoch workers) whenever records are on and the runner root exists
+and was listed, including with zero parents. A missing, non-directory or
+symlink runner root logs none; if the step throws,
+`runner retire scratch outcomes failed` replaces the total. With zero parents
+`retained_source_read` is `not_attempted` (no journal read or walk) and
+`bytes_state` is `measured` unless the listing was incomplete (`unknown`).
+Every parent is kept (`reclaimed` is always 0); nothing is deleted, chowned or
+moved, and the existing `runner retire scratch retained` warning is unchanged.
+A parent is `protected_by_retained_source` when a decoded recovery or restore
+journal's `clonePath` (predecessor, successor or tombstone) or
+`retainedSources[].clonePath` names it or a path under it; otherwise
+`no_disposition_evidence`. Bytes are allocated bytes from a
+read-only descriptor-relative walk (hard links once, no symlink following);
+`bytes_state` is `measured` only when every parent was measured completely and
+the listing was complete. One 30 s startup budget covers the journal read and
+the walk; an uninterruptible syscall has no hard real-time bound. Synthetic
+local-disk cost: median 970 ms (max 1639) for 10 parents of 1000 small files
+plus 3 bares, against 13 ms off; not a production measurement.
+
+Switches: worker `UZI_RETIRE_SCRATCH_OUTCOMES` (unset, empty or `1` on; `0`
+off; other values refuse startup), controller
+`UZI_WORKER_RETIRE_SCRATCH_OUTCOMES` (empty or `true` on; `false` off; other
+values a boot error) and strict-boolean chart
+`workers.epochReclaim.retireScratchOutcomes` (default `true`; `false` renders
+worker `UZI_RETIRE_SCRATCH_OUTCOMES=0` on every worker). Default renders are
+unchanged. Off restores the count-only inspector exactly.
+
+No reclaim, deliberately: no ordinary durable disposition binding proves the
+moved footprint (rollback repair can persist a protected moved-clone pointer);
+the rename into the scratch parent precedes the journal clear and the
+retired-ledger write, and the ledger names only the canonical clone path; a
+retired ledger, emptiness, age or the parent name grant nothing. The legacy
+stderr-proof repair (#4141, landed via #4152) does not certify remnants created
+by older code retroactively, and #4137 is a distinct residual. Reclaim remains
+open on #4143 pending a durable parent-binding design.

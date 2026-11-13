@@ -560,19 +560,5 @@ func migrationDownStatements(t *testing.T, name string) []string {
 		t.Fatalf("migration %s has no `-- +goose Down` block", name)
 	}
 	down := s[i+len("-- +goose Down"):]
-	var code strings.Builder
-	for _, line := range strings.Split(down, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "--") {
-			continue
-		}
-		code.WriteString(line)
-		code.WriteByte('\n')
-	}
-	var out []string
-	for _, stmt := range strings.Split(code.String(), ";") {
-		if strings.TrimSpace(stmt) != "" {
-			out = append(out, stmt)
-		}
-	}
-	return out
+	return splitMigrationStatements(t, down)
 }

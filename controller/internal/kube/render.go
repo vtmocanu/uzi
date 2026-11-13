@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -444,8 +445,12 @@ type RenderConfig struct {
 	EpochReclaimDeletionCanaryID string
 	// EpochScratchDeletion enables scratch cleanup for persistent DinD workers.
 	EpochScratchDeletion bool
-	RollConcurrency      int
-	RollTargetVersion    string
+	// RetireScratchOutcomesDisabled renders UZI_RETIRE_SCRATCH_OUTCOMES=0 into every
+	// worker pod. Negative on purpose: the zero value keeps the default (records on)
+	// and leaves existing templates byte-identical.
+	RetireScratchOutcomesDisabled bool
+	RollConcurrency               int
+	RollTargetVersion             string
 	// Namespace is the dedicated worker namespace: it contains nothing but hosted
 	// workers, which is what bounds a compromised controller.
 	Namespace string
@@ -556,6 +561,11 @@ type RenderConfig struct {
 	// (json omitempty), so an install that clears it hashes exactly as before this
 	// field existed. Changing it re-hashes the template and rolls every worker.
 	NodeSelector map[string]string
+	// DeploymentLabels / DeploymentAnnotations are the operator's extra metadata on every
+	// worker Deployment's OWN metadata (never the pod template, so they move no spec
+	// hash). config refuses a label that would replace one objectLabels stamps.
+	DeploymentLabels      map[string]string
+	DeploymentAnnotations map[string]string
 	// Tolerations are rendered onto every worker pod, all three tiers. Nil renders no
 	// tolerations key (json omitempty), so an install without them hashes exactly as
 	// before this field existed. Changing them re-hashes the template and rolls.
@@ -1030,11 +1040,17 @@ func RenderDeployment(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Sp
 	tmpl.Annotations[AnnotationSpecHash] = hash
 
 	replicas := int32(1)
+	labels := maps.Clone(cfg.DeploymentLabels)
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	maps.Copy(labels, objectLabels(w.ID)) // provenance always wins
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      deploymentName(w.ID),
-			Namespace: cfg.namespaceFor(w),
-			Labels:    objectLabels(w.ID),
+			Name:        deploymentName(w.ID),
+			Namespace:   cfg.namespaceFor(w),
+			Labels:      labels,
+			Annotations: maps.Clone(cfg.DeploymentAnnotations),
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
@@ -1107,6 +1123,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS", Value: strconv.FormatInt(cfg.MemoryGuardResponseBudgetMs, 10)},
 			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_MAX_INTERVENTIONS", Value: strconv.FormatInt(cfg.MemoryGuardMaxInterventions, 10)},
 		)
+	}
+	if cfg.RetireScratchOutcomesDisabled {
+		env = append(env, corev1.EnvVar{Name: "UZI_RETIRE_SCRATCH_OUTCOMES", Value: "0"})
 	}
 	if cfg.GoBuildParallelism > 0 {
 		env = append(env, corev1.EnvVar{Name: "WORKER_GO_BUILD_PARALLELISM", Value: strconv.Itoa(cfg.GoBuildParallelism)})
