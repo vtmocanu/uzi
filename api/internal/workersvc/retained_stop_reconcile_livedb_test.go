@@ -280,22 +280,31 @@ func TestRetainedStopOwnerCancelLiveDB(t *testing.T) {
 }
 
 // TestRetainedStopFenceBoundaryLiveDB: the omission acts only once status_since is older than the
-// missing fence (WorkerHeartbeatStale + WorkerHeartbeatInterval = 60s in testParams).
+// missing fence (WorkerHeartbeatStale + WorkerHeartbeatInterval = 60s in testParams). The older
+// row has a listed control (current generation, stays running), and one row is carried across the
+// boundary: omitted while fresh it stays running, then backdated past the fence an omitted
+// heartbeat requeues it.
 func TestRetainedStopFenceBoundaryLiveDB(t *testing.T) {
 	cases := []struct {
-		name  string
-		age   string // status_since = now() - age
-		fresh bool
+		name   string
+		age    string // status_since = now() - age
+		listed bool
+		fresh  bool
 	}{
-		{"newer_than_fence_stays_running", "10 seconds", true},
-		{"older_than_fence_requeues", "5 minutes", false},
+		{"newer_than_fence_stays_running", "10 seconds", false, true},
+		{"older_than_fence_requeues", "5 minutes", false, false},
+		{"control_older_than_fence_listed_stays_running", "5 minutes", true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newRetainedStopRig(t, nil)
 			id := r.seed(t, 1, 0)
 			r.env.exec(`UPDATE runs SET status_since = now() - $2::interval WHERE id = $1`, id, tc.age)
-			r.beat(t)
+			if tc.listed {
+				r.beat(t, entry(id, 1, "running", false))
+			} else {
+				r.beat(t)
+			}
 			if tc.fresh {
 				r.requireStayedRunning(t, id, 1, 0)
 				return
@@ -303,6 +312,16 @@ func TestRetainedStopFenceBoundaryLiveDB(t *testing.T) {
 			r.requireRequeued(t, id, 1, 1)
 		})
 	}
+	t.Run("same_row_backdated_past_fence_requeues", func(t *testing.T) {
+		r := newRetainedStopRig(t, nil)
+		id := r.seed(t, 1, 0)
+		r.env.exec(`UPDATE runs SET status_since = now() - interval '10 seconds' WHERE id = $1`, id)
+		r.beat(t)
+		r.requireStayedRunning(t, id, 1, 0)
+		r.env.exec(`UPDATE runs SET status_since = now() - interval '5 minutes' WHERE id = $1`, id)
+		r.beat(t)
+		r.requireRequeued(t, id, 1, 1)
+	})
 }
 
 // TestRetainedStopNullWallBudgetLiveDB: a timed non-interactive pre-attempt row with NULL
