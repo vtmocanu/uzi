@@ -1597,8 +1597,12 @@ interface InPlaceSwitchContext {
   ledger: CredentialSwitchOpLedger; holder: CredentialHolder; nonce: string; generation: number; opId: string; retained: boolean;
 }
 
-/** Issue #4201: bounded same-report retries of the in-place hold and uncertain reports. */
-const IN_PLACE_REPORT_ATTEMPTS = 5;
+/** Issue #4201: the in-place hold and uncertain reports retry on a capped exponential backoff (recoveryRetryMs
+ *  doubling, up to this many doublings) until confirmed, refused, or the claim or lifecycle ends the wait. */
+const IN_PLACE_REPORT_MAX_DOUBLINGS = 4;
+/** Issue #4201: from this attempt on, a failed in-place report is followed by an ownership read, which can confirm
+ *  a report whose reply was lost. */
+const IN_PLACE_REPORT_PROBE_AFTER = 4;
 /** Issue #4201: bounded same-op retries of an apply whose answer was ambiguous. */
 const IN_PLACE_APPLY_ATTEMPTS = 3;
 /** Issue #4201: how long a `superseded` apply waits for the newer op to reach steering. */
@@ -27140,7 +27144,7 @@ export class RunRunner {
       const opId = flight.steering.pendingCredentialSwitchOp()?.opId ?? fixed.opId;
       if (!proof.settled) {
         const disposition = await this.holdRetainedSwitch(flight, runLog, lifecycle, identity, proof.detail, proof.survivors,
-          { opId, attempts: IN_PLACE_REPORT_ATTEMPTS });
+          { opId });
         return { kind: "fence_held", held: disposition === "held" };
       }
       const outcome = await this.inPlaceOptionA(flight, runLog, opId, undefined, lifecycle, identity);
@@ -27189,7 +27193,7 @@ export class RunRunner {
       if (retained) flight.retainedLocalCustody = true;
       const latest = flight.steering.pendingCredentialSwitchOp()?.opId ?? opId;
       const disposition = await this.holdRetainedSwitch(flight, runLog, lifecycle, identity, proof.detail, proof.survivors,
-        { opId: latest, attempts: IN_PLACE_REPORT_ATTEMPTS });
+        { opId: latest });
       return { kind: "fence_held", held: disposition === "held" };
     }
     // The op may have moved while the proof ran; follow the newest. Nothing pending any more means the
@@ -27240,7 +27244,10 @@ export class RunRunner {
         // not proof, because the fence runs before the replay (credential_switch_apply.go). Any other
         // not_applied reason (credential_busy, vault_locked, ...) leaves the op pending, so a delayed earlier
         // send could still commit and the flag stays set.
-        if (result.kind === "uncertain" || result.kind === "refused_committed") mayHaveCommitted = true;
+        // Persisted ambiguity: the ledger held an ambiguous (or crash-left `sending`) entry for this op before this
+        // send, which this invocation's own memory cannot know after a restart or re-entry.
+        if (result.kind === "uncertain" || result.kind === "refused_committed" ||
+            (result.kind !== "ledger_unavailable" && result.priorAmbiguous === true)) mayHaveCommitted = true;
         if (result.kind === "superseded" || (result.kind === "not_applied" && NOT_APPLIED_PROOF_REASONS.has(result.reason))) mayHaveCommitted = false;
         const dropHold = (): void => {
           if (mayHaveCommitted) this.releaseHoldPastPossibleApply(hold, flight, runLog);
@@ -27384,8 +27391,17 @@ export class RunRunner {
     flight.keepGuardedInventoryOpen = true;
     let confirmed = false;
     let refused = false;
-    for (let attempt = 0; attempt < IN_PLACE_REPORT_ATTEMPTS && !confirmed && !refused; attempt++) {
-      if (attempt > 0) await this.waitRecoveryRetry(flight, true, undefined, signal);
+    // The flight stays alive (the worker's heartbeat is independent of this wait) and keeps custody: the report
+    // retries on a capped backoff through transport errors, 5xx and unreadable acks. It ends only on a
+    // confirmation, a definitive refusal (a reachable api answering applied:false), a stale claim or lost
+    // ownership (thrown to the stale stop with work retained), or a lifecycle stop (guard throws, or the wait ends
+    // on shutdown).
+    for (let attempt = 0; !confirmed && !refused; attempt++) {
+      if (attempt > 0) {
+        await this.waitRecoveryRetry(flight, true, this.inPlaceReportBackoffMs(attempt), signal);
+        guard();
+        if (this.inPlaceReportWaitEnded(flight, signal)) break;
+      }
       try {
         const ack = await flight.reportState({ status: "credential_switch_uncertain", op_id: opId }, signal);
         refused = ack.applied === false;
@@ -27396,16 +27412,17 @@ export class RunRunner {
         if (error instanceof StaleClaimError || isRunOwnershipLost(error, flight.runId)) throw error;
         runLog.warn("in-place credential switch uncertain report failed", { run_id: flight.runId, attempt, error: errMessage(error) });
       }
-    }
-    if (!confirmed && !refused) {
-      try {
-        const own = await withForgeRetry(() => this.getObservedRunOwnership(flight, signal), { signal, log: runLog, schedule: [] });
-        guard();
-        confirmed = own.status === "paused" && own.claim_generation === flight.claimGeneration && own.hold_reason == null;
-      } catch (error) {
-        guard();
-        if (isRunOwnershipLost(error, flight.runId)) throw error;
-        runLog.warn("in-place credential switch uncertain ownership read failed", { run_id: flight.runId, error: errMessage(error) });
+      if (!confirmed && !refused && attempt >= IN_PLACE_REPORT_PROBE_AFTER) {
+        // A lost reply can leave the run paused server-side: a positive ownership read confirms it.
+        try {
+          const own = await withForgeRetry(() => this.getObservedRunOwnership(flight, signal), { signal, log: runLog, schedule: [] });
+          guard();
+          confirmed = own.status === "paused" && own.claim_generation === flight.claimGeneration && own.hold_reason == null;
+        } catch (error) {
+          guard();
+          if (isRunOwnershipLost(error, flight.runId)) throw error;
+          runLog.warn("in-place credential switch uncertain ownership read failed", { run_id: flight.runId, error: errMessage(error) });
+        }
       }
     }
     if (!confirmed) {
@@ -27420,6 +27437,16 @@ export class RunRunner {
     } });
     flight.parked = true;
     return { kind: "option_a" };
+  }
+
+  /** Backoff before in-place report retry `attempt` (>= 1): recoveryRetryMs doubling, capped at 2^IN_PLACE_REPORT_MAX_DOUBLINGS. */
+  private inPlaceReportBackoffMs(attempt: number): number {
+    return this.recoveryRetryMs * 2 ** Math.min(attempt - 1, IN_PLACE_REPORT_MAX_DOUBLINGS);
+  }
+
+  /** The wait ended because the flight is shutting down or its lifecycle signal fired: stop retrying, keep custody. */
+  private inPlaceReportWaitEnded(flight: RunFlight, signal: AbortSignal): boolean {
+    return signal.aborted || flight.active?.shuttingDown === true || this.shuttingDownGlobal;
   }
 
   /** Wait (bounded) for steering to name a switch op other than `current`. `undefined` means none came:
@@ -27596,9 +27623,10 @@ export class RunRunner {
    */
   private async holdRetainedSwitch(
     flight: RunFlight, runLog: Logger, signal: AbortSignal, guard: () => void, detail: string, survivors: string,
-    /** Issue #4201: the in-place switch's report. `opId` fences it; `attempts` bounds the identical retries,
-     *  with a backoff between them; a stale claim ends the retries (the caller stops with work retained). */
-    inPlace?: { opId: string; attempts: number },
+    /** Issue #4201: the in-place switch's report. `opId` fences it. It retries the identical report on a capped
+     *  backoff until confirmed or refused; a stale claim or lost ownership ends it (the caller stops with work
+     *  retained), as does a lifecycle stop. The v1 (op-less) report keeps its two attempts. */
+    inPlace?: { opId: string },
   ): Promise<"held" | "stopped"> {
     // The flight is already marked `unproven` by settleRetainedSwitch. The owner feed carries only
     // the fixed `survivors` phrase; the sanitized raw `detail` stays in the worker log.
@@ -27627,8 +27655,20 @@ export class RunRunner {
     flight.retainedSwitchSettlement = "hold_pending";
     let confirmed = false;
     let refused = false;
-    for (let attempt = 0; attempt < (inPlace?.attempts ?? 2) && !confirmed && !refused; attempt++) {
-      if (inPlace && attempt > 0) await this.waitRecoveryRetry(flight, true, undefined, signal);
+    const ownershipConfirmsHold = async (): Promise<void> => {
+      const own = await withForgeRetry(() => this.getObservedRunOwnership(flight, signal), {
+        signal, log: runLog, schedule: [],
+      });
+      guard();
+      confirmed = own.status === "paused" && own.claim_generation === generation &&
+        (own.hold_reason === "credential_switch_settling" || own.hold_reason === "credential_switch_unsettled");
+    };
+    for (let attempt = 0; (inPlace !== undefined || attempt < 2) && !confirmed && !refused; attempt++) {
+      if (inPlace && attempt > 0) {
+        await this.waitRecoveryRetry(flight, true, this.inPlaceReportBackoffMs(attempt), signal);
+        guard();
+        if (this.inPlaceReportWaitEnded(flight, signal)) break;
+      }
       try {
         const ack = await flight.reportState({
           status: "credential_switch_held", ...(inPlace ? { op_id: inPlace.opId } : {}),
@@ -27642,18 +27682,21 @@ export class RunRunner {
         if (inPlace && (error instanceof StaleClaimError || isRunOwnershipLost(error, flight.runId))) throw error;
         runLog.warn("retained credential switch hold report failed", { run_id: flight.runId, attempt, error: errMessage(error) });
       }
+      // In place the retries never end on their own, so past the first few identical (idempotent) reports a lost reply
+      // is also checked against the server's view (a hold that did land confirms by the ownership read).
+      if (inPlace && !confirmed && !refused && attempt >= IN_PLACE_REPORT_PROBE_AFTER) {
+        try { await ownershipConfirmsHold(); } catch (error) {
+          guard();
+          if (isRunOwnershipLost(error, flight.runId)) throw error;
+          runLog.warn("retained credential switch hold ownership read failed", { run_id: flight.runId, error: errMessage(error) });
+        }
+      }
     }
-    if (!confirmed && !refused) {
+    if (!confirmed && !refused && !inPlace) {
       try {
-        const own = await withForgeRetry(() => this.getObservedRunOwnership(flight, signal), {
-          signal, log: runLog, schedule: [],
-        });
-        guard();
-        confirmed = own.status === "paused" && own.claim_generation === generation &&
-          (own.hold_reason === "credential_switch_settling" || own.hold_reason === "credential_switch_unsettled");
+        await ownershipConfirmsHold();
       } catch (error) {
         guard();
-        if (inPlace && isRunOwnershipLost(error, flight.runId)) throw error;
         runLog.warn("retained credential switch hold ownership read failed", { run_id: flight.runId, error: errMessage(error) });
       }
     }

@@ -588,13 +588,14 @@ describe("issue #4201 m2c: option A (an apply that may have committed)", () => {
     assert.equal(r.turns.length, 2, "neither token ran again");
   });
 
-  it("an uncertain report that never confirms leaves no feed line", TIMEOUT, async () => {
+  it("an uncertain report that is never confirmed (until the claim goes stale) leaves no feed line", TIMEOUT, async () => {
     const real = client.reportState.bind(client);
     let attempts = 0;
     client.reportState = (async (runId: string, body: Parameters<typeof real>[1], ...rest: unknown[]) => {
       if (body.status === "credential_switch_uncertain") {
-        // IN_PLACE_REPORT_ATTEMPTS is 5: the runner gives up after the fifth failure, so no attempt is ever answered.
         attempts++;
+        // Capped fake: a stale-claim answer after 8 calls ends the retries, so a regression fails the assertions below.
+        if (attempts > 8) return { applied: false, staleClaim: true, status: "queued" };
         throw new Error("transport down");
       }
       return (real as (...a: unknown[]) => unknown)(runId, body, ...rest);
@@ -603,7 +604,7 @@ describe("issue #4201 m2c: option A (an apply that may have committed)", () => {
     try {
       r = await scenario({ site: "implement_turn", apply: [{ outcome: "refused_committed" }] });
     } finally { client.reportState = real; }
-    assert.equal(attempts, 5, "the report is bounded at 5 attempts");
+    assert.equal(attempts, 9, "the report kept retrying past 5 attempts until the stale-claim answer");
     assert.deepEqual(r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain"), []);
   });
 });
@@ -738,6 +739,38 @@ describe("issue #4201 m2c rework: a definite non-applied answer after an ambiguo
   }
 });
 
+describe("issue #4201: an ambiguity persisted in the ledger reaches the runner (restart or re-entry)", () => {
+  /** A ledger that, on the FIRST markSending, first leaves the op the way an earlier invocation did. */
+  class PriorLedger extends CredentialSwitchOpLedger {
+    private seeded = false;
+    constructor(dir: string, private readonly prior: "ambiguous" | "sending") { super(dir); }
+    override async markSending(runId: string, opId: string, generation: number): Promise<{ wasAmbiguous: boolean }> {
+      if (!this.seeded) {
+        this.seeded = true;
+        await super.markSending(runId, opId, generation); // leaves `sending`: the crash-left shape
+        if (this.prior === "ambiguous") await this.record(runId, opId, "ambiguous", "uncertain", generation);
+      }
+      return super.markSending(runId, opId, generation);
+    }
+  }
+  for (const prior of ["ambiguous", "sending"] as const) {
+    it(`a prior ${prior} ledger entry, then an immediate not_applied:credential_busy: option A, no give-up, no turn on either token`, TIMEOUT, async () => {
+      const r = await scenario({
+        site: "implement_turn", apply: [{ outcome: "not_applied", reason: "credential_busy" }],
+        ledger: new PriorLedger(fx.dataDir, prior),
+      });
+      assert.equal(applied().length, 1, "one apply request");
+      assert.equal(api.uncertainRequests.length, 1, "credential_switch_uncertain was reported");
+      assert.equal(api.uncertainRequests[0]!.body.op_id, "op-1");
+      assert.ok(!statusesOf(r).includes("credential_switch_failed"), `no give-up: ${statusesOf(r).join(",")}`);
+      assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
+      assert.equal(r.turns.length, 2, "neither token ran again");
+      assert.ok(r.turns.every((t) => t.token === OLD_TOKEN));
+      assert.equal((await r.ledger.stateOf(r.runId, "op-1"))?.state, "ambiguous");
+    });
+  }
+});
+
 describe("issue #4201 m2c rework: option A releases the hold past a possible apply (tail+2)", () => {
   it("refused_committed: frames emitted while the hold is open number from tail+2; a server frame at tail+1 survives", TIMEOUT, async () => {
     const spy = spyHold();
@@ -837,19 +870,20 @@ describe("issue #4201 m2c rework: each half of the lane-settled proof fences on 
   // the in-place scenarios here have no guarded lane (no capturedMemory), so it cannot be reached from this harness.
 });
 
-describe("issue #4201 m2c rework: the report retries are bounded", () => {
-  // IN_PLACE_REPORT_ATTEMPTS (runner.ts) is 5. Counted at the runner's reportState call (the client retries
-  // a dropped connection by itself, so wire requests are a multiple of the runner's attempts).
-  async function neverConfirmed(status: string, run: () => ReturnType<typeof scenario>) {
+describe("issue #4201: an unconfirmed in-place report keeps retrying while the claim is live", () => {
+  // Counted at the runner's reportState call (the client retries a dropped connection by itself, so wire requests
+  // are a multiple of the runner's attempts). `outage` calls throw a transport error; call outage+1 answers
+  // `after`: a recovery (the real client), a stale claim, or a definitive refusal. A stale/refusal cap makes a
+  // regression fail an assertion within seconds instead of hanging until the test timeout.
+  async function outage(status: string, outageCalls: number, after: "recover" | "stale" | "refuse", run: () => ReturnType<typeof scenario>) {
     const realReport = client.reportState.bind(client);
     let attempts = 0;
     client.reportState = (async (runId: string, body: Parameters<typeof realReport>[1], ...rest: unknown[]) => {
       if (body.status === status) {
         attempts++;
-        // Past the bound the report answers stale_claim, which ends every retry loop: an unbounded loop then
-        // fails the `attempts` assertion within seconds instead of hanging until the test timeout.
-        if (attempts > 5) return { applied: false, staleClaim: true, status: "queued" };
-        throw new Error("transport down");
+        if (attempts <= outageCalls) throw new Error("transport down");
+        if (after === "stale") return { applied: false, staleClaim: true, status: "queued" };
+        if (after === "refuse") return { applied: false, status: "running" };
       }
       return (realReport as (...a: unknown[]) => unknown)(runId, body, ...rest);
     }) as typeof client.reportState;
@@ -858,27 +892,55 @@ describe("issue #4201 m2c rework: the report retries are bounded", () => {
       return { r, attempts };
     } finally { client.reportState = realReport as typeof client.reportState; }
   }
+  const heldScenario = () => scenario({
+    site: "implement_turn", apply: [],
+    quiesce: (req) => (req.site === "in_place_credential_switch" ? BLOCKED : undefined),
+  });
+  const uncertainScenario = () => scenario({ site: "implement_turn", apply: [{ outcome: "refused_committed" }] });
 
-  it("a hold report that never confirms is attempted exactly 5 times, then the flight stops with its work retained", TIMEOUT, async () => {
-    const { r, attempts } = await neverConfirmed("credential_switch_held", () => scenario({
-      site: "implement_turn", apply: [],
-      quiesce: (req) => (req.site === "in_place_credential_switch" ? BLOCKED : undefined),
-    }));
-    assert.equal(attempts, 5, "the hold report is bounded at 5 attempts");
+  it("a hold report outage longer than 5 attempts that then recovers ends confirmed (held in place)", TIMEOUT, async () => {
+    const { r, attempts } = await outage("credential_switch_held", 7, "recover", heldScenario);
+    assert.equal(attempts, 8, "seven failed attempts, then the confirmed eighth");
+    assert.equal(api.holdState(r.runId), "unsettled", "the hold is confirmed server-side");
+    assert.equal(applied().length, 0);
+    assert.equal(r.turns.length, 2, "no turn after the report");
+  });
+
+  it("a hold report that never recovers keeps retrying until a stale-claim answer ends it, work retained", TIMEOUT, async () => {
+    const { r, attempts } = await outage("credential_switch_held", 7, "stale", heldScenario);
+    assert.equal(attempts, 8, "retried past 5 attempts; the stale-claim answer ended it");
     assert.equal(applied().length, 0);
     assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
     assert.equal(r.turns.length, 2, "no turn after the report");
     assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "custody kept");
   });
 
-  it("an uncertain report that never confirms is attempted exactly 5 times, then the flight stops with its work retained", TIMEOUT, async () => {
-    const { r, attempts } = await neverConfirmed("credential_switch_uncertain", () => scenario({
-      site: "implement_turn", apply: [{ outcome: "refused_committed" }],
-    }));
-    assert.equal(attempts, 5, "the uncertain report is bounded at 5 attempts");
+  it("a definitively refused hold report stops at once (one attempt)", TIMEOUT, async () => {
+    const { r, attempts } = await outage("credential_switch_held", 0, "refuse", heldScenario);
+    assert.equal(attempts, 1);
+    assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
+    assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "custody kept");
+  });
+
+  it("an uncertain report outage longer than 5 attempts that then recovers ends confirmed (option A in place)", TIMEOUT, async () => {
+    const { r, attempts } = await outage("credential_switch_uncertain", 7, "recover", uncertainScenario);
+    assert.equal(attempts, 8, "seven failed attempts, then the confirmed eighth");
+    const frames = r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain");
+    assert.equal(frames.length, 1, "one feed line, only once confirmed");
+    assert.equal(r.turns.length, 2, "neither token ran again");
+  });
+
+  it("an uncertain report that never recovers keeps retrying until a stale-claim answer ends it, work retained", TIMEOUT, async () => {
+    const { r, attempts } = await outage("credential_switch_uncertain", 7, "stale", uncertainScenario);
+    assert.equal(attempts, 8, "retried past 5 attempts; the stale-claim answer ended it");
     assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
     assert.equal(r.turns.length, 2, "neither token ran again");
     assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "custody kept");
+  });
+
+  it("a definitively refused uncertain report stops at once (one attempt)", TIMEOUT, async () => {
+    const { attempts } = await outage("credential_switch_uncertain", 0, "refuse", uncertainScenario);
+    assert.equal(attempts, 1);
   });
 });
 

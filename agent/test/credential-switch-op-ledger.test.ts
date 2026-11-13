@@ -99,10 +99,15 @@ describe("credential switch op ledger", () => {
       const first = new CredentialSwitchOpLedger(dir);
       await applyThroughLedger(fakeClient([], { kind: "uncertain", detail: "x" }), first, RUN, REQ);
       const out = await applyThroughLedger(fakeClient([], { kind: "not_applied", reason }), first, RUN, REQ);
-      assert.deepEqual(out, { kind: "not_applied", reason }, "the answer is still returned");
+      assert.deepEqual(out, { kind: "not_applied", reason, priorAmbiguous: true }, "the answer is returned, flagged with the prior ambiguity");
       assert.equal(onDisk(dir)["op-1"].state, "ambiguous", reason);
       assert.equal((await new CredentialSwitchOpLedger(dir).stateOf(RUN, "op-1"))?.state, "ambiguous", reason);
     }
+  });
+
+  it("a never-ambiguous op's not_applied carries no priorAmbiguous flag", async () => {
+    const out = await applyThroughLedger(fakeClient([], { kind: "not_applied", reason: "credential_busy" }), new CredentialSwitchOpLedger(tmp()), RUN, REQ);
+    assert.deepEqual(out, { kind: "not_applied", reason: "credential_busy" });
   });
 
   for (const result of [{ kind: "superseded" }, { kind: "not_applied", reason: "no_pending_switch" }, { kind: "not_applied", reason: "generation_mismatch" }] as CredentialSwitchApplyResult[]) {

@@ -267,7 +267,13 @@ export class CredentialSwitchOpLedger {
   }
 }
 
-export type LedgerApplyResult = CredentialSwitchApplyResult | { kind: "ledger_unavailable" };
+/**
+ * `priorAmbiguous` rides on a `not_applied`, `superseded` or `fenced` answer when the ledger already held an
+ * ambiguous (or crash-left `sending`) entry for the op before this send: an earlier send of it may have
+ * committed, and the caller (the runner, whose own per-call memory starts empty after a restart) must carry that
+ * memory unless the answer is itself proof of a non-commit (`superseded`, or a NOT_APPLIED_PROOF_REASONS reason).
+ */
+export type LedgerApplyResult = (CredentialSwitchApplyResult & { priorAmbiguous?: true }) | { kind: "ledger_unavailable" };
 
 /**
  * The `not_applied` reasons that prove the op can NEVER commit (api credential_switch_apply.go): answered after
@@ -307,6 +313,7 @@ export async function applyThroughLedger(
     return { kind: "ledger_unavailable" };
   }
   const result = await client.applyCredentialSwitch(runId, req);
+  const flagged = (): LedgerApplyResult => (wasAmbiguous ? { ...result, priorAmbiguous: true } : result);
   switch (result.kind) {
     case "uncertain":
       await ledger.record(runId, req.opId, "ambiguous", "uncertain", req.claimGeneration).catch(() => undefined);
@@ -330,12 +337,12 @@ export async function applyThroughLedger(
       // BEFORE it replays a committed op, so that send may have committed. Keep the memory.
       if (wasAmbiguous) await ledger.record(runId, req.opId, "ambiguous", "fenced_after_ambiguous", req.claimGeneration).catch(() => undefined);
       else await ledger.record(runId, req.opId, "settled", result.kind).catch(() => undefined);
-      return result;
+      return flagged();
     case "superseded":
       // Answered AFTER the server's replay check, in the same transaction under the run lock: a committed
       // op would have been answered applied or refused_committed. So it proves the op never committed.
       await ledger.record(runId, req.opId, "settled", result.kind).catch(() => undefined);
-      return result;
+      return flagged();
     case "not_applied":
       // Only a reason in NOT_APPLIED_PROOF_REASONS is permanent proof that nothing committed. Every other reason
       // (credential_busy, vault_locked, credential_unavailable, ...) leaves the op pending, so a delayed earlier
@@ -343,7 +350,7 @@ export async function applyThroughLedger(
       if (wasAmbiguous && !NOT_APPLIED_PROOF_REASONS.has(result.reason))
         await ledger.record(runId, req.opId, "ambiguous", "not_applied_after_ambiguous", req.claimGeneration).catch(() => undefined);
       else await ledger.record(runId, req.opId, "settled", result.kind).catch(() => undefined);
-      return result;
+      return flagged();
     default:
       // A definite answer. If settling cannot be written the entry stays `sending` on disk, which
       // a later load reads as ambiguous: conservative, never wrong.
