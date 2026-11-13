@@ -38,6 +38,7 @@ import { Worker } from "./worker.js";
 import { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { createDindVolumePrune } from "./dind-volume-prune.js";
+import { createDindBuilderPrune } from "./dind-builder-prune.js";
 import { RetainedSourceServer } from "./ops/retained-source-server.js";
 import { DindMaintenanceController } from "./dind-maintenance.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
@@ -1020,11 +1021,14 @@ async function mainBody(): Promise<void> {
   // issue #3891: the pressure-only anonymous-volume leg rides on the same enablement
   // predicate and runs inside the controller's loop; it only reads the gate and needs no
   // idle probe or custody (it runs on busy and custody-held workers by design).
+  // issue #4291: the BuildKit regular-cache leg is the third such leg; it additionally needs
+  // UZI_DIND_BUILDER_PRUNE_ENABLED (absent means on) and likewise only reads the gate.
   const dindPrune = createDindPrune(config, {
     gate: dindGate,
     isIdle: () => worker?.isIdle() ?? false,
     log,
     volumeLeg: createDindVolumePrune(config, { gate: dindGate, log }),
+    builderLeg: createDindBuilderPrune(config, { gate: dindGate, log }),
   });
   if (dindPrune) log.info("dind prune enabled", { docker_host_wired: true });
   const dindMaintenance = config.dockerWiring.dockerHost !== undefined
