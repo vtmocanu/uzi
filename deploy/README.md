@@ -1544,10 +1544,13 @@ to stop.
 next to the api's CA: set `pem` inline, or `configMap.name`/`key` for an existing
 ConfigMap in the release namespace (a trust-manager `Bundle` target works). The
 controller appends it after the api CA in each worker's Secret, and the worker plus
-the Claude Code CLI it starts trust both (the CLI not under `workers.uidSplit`). It
-needs `api.tls.enabled`, covers HTTPS from Node only (not git clone), and, like the
-api CA, is written at worker creation: restart the controller after editing an
-existing ConfigMap, and reprovision existing workers after any change.
+the Claude Code CLI it starts trust both (the CLI not under `workers.uidSplit`).
+Workers verify the api with that same bundle, so the extra CA is also trusted for the
+worker-to-api connection: keep it as narrow as your hosts allow. It needs
+`api.tls.enabled`, covers HTTPS from Node only (not git clone), and, like the api CA,
+is written at worker creation: restart the controller after editing an existing
+ConfigMap, and reprovision existing workers after any change (a paced roll does not
+rewrite an existing worker's Secret).
 
 Related trap, worth one line so nobody "simplifies" the projection away: do **not**
 mount the `uzi-ca` Secret instead. That one holds the **CA private key**, which is
