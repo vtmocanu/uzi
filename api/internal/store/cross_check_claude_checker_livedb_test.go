@@ -418,14 +418,16 @@ func TestPlanCrossCheckClaudeChildPeerDeferralLiveDB(t *testing.T) {
 	}
 }
 
-// The requirement is written in all six runtime.sql claim and placement copies, next to the
-// cross_check_v1 conjunct each mirrors. The generated Go holds the text that executes.
+// The requirement is written in all six claim and placement copies, next to the cross_check_v1
+// conjunct each mirrors. The generated runtime.sql.go holds the text that executes for five of them;
+// the ListUnplaceableQueuedRunsForEphemeral copy executes from fn_placement_admitting_workers
+// (migration 00437), whose body expandPlacementFunction appends once per call site.
 func TestCrossCheckCodexLeadConjunctPresentInEverySQLCopy(t *testing.T) {
 	raw, err := os.ReadFile("runtime.sql.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	src := string(raw)
+	src := expandPlacementFunction(t, string(raw))
 	base := regexp.MustCompile(`'cross_check_v1' = ANY\(`).FindAllStringIndex(src, -1)
 	conj := regexp.MustCompile(`AND \(NOT \((\w+)\.kind = 'cross_check' AND \w+\.harness = 'claude' AND EXISTS \(SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = \w+\.id AND pc.stage = 'plan'\)\)\s+OR 'cross_check_codex_lead_v1' = ANY\(`).FindAllStringSubmatchIndex(src, -1)
 	if len(base) != 6 {

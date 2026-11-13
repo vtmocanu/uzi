@@ -80,7 +80,7 @@ func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for name, body := range namedQueryBlocks(string(raw)) {
+		for name, body := range expandedQueryBlocks(t, string(raw)) {
 			body = comments.ReplaceAllString(body, "")
 			sites := predicate.FindAllStringIndex(body, -1)
 			if len(sites) == 0 {

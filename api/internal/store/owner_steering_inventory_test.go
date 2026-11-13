@@ -67,6 +67,8 @@ func TestOwnerSteeringClauseParity(t *testing.T) {
 	const semantic, steering = "'cross_check_semantic_plan_v1'", "'cross_check_owner_steering_v1'"
 	var seen int
 	for name, body := range namedQueryBodies(t) {
+		// A query that calls fn_placement_admitting_workers executes its clauses from the function body.
+		body = expandPlacementFunction(t, body)
 		if !strings.Contains(body, semantic) {
 			continue
 		}
