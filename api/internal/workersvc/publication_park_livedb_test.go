@@ -628,7 +628,7 @@ func TestPublicationResumeCustodyLimitsLiveDB(t *testing.T) {
 // The API-origin seam: a git park honours the origin cooldown, an api park does not read it.
 // Issue #1324 D9: a publication park records the failure on the failing surface's origin. The git
 // surface observes the stamped Git origin, the api surface the server-derived API origin (distinct
-// here: a github connection), both with reason transient_publication_exhausted and the existing
+// here: a github.com repo; GitHub Enterprise Server shares one origin), both with reason transient_publication_exhausted and the existing
 // backoff. The retry stamp is the later of the capped backoff and the failing origin's cooldown, and
 // the other surface's origin is neither written nor consulted.
 func TestPublicationParkObservesFailingSurfaceOriginLiveDB(t *testing.T) {
@@ -644,6 +644,7 @@ func TestPublicationParkObservesFailingSurfaceOriginLiveDB(t *testing.T) {
 		t.Run(surface, func(t *testing.T) {
 			f := newPublicationParkFixture(t, 0)
 			f.env.exec(`UPDATE forge_connections SET forge_type='github' WHERE user_id=$1`, f.userID)
+			f.env.exec(`UPDATE repos SET web_url='https://github.com/group/repo' WHERE id=$1`, f.repoID)
 			f.env.exec(`UPDATE runs SET status='queued' WHERE id=$1`, f.runID)
 			got, gen := f.claim(t)
 			if got != f.runID {
