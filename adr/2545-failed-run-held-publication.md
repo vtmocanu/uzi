@@ -295,6 +295,15 @@ run's publications (ref, tip, state, timestamps, sanitized last error). The run
 page shows a held-publication panel. Forge-originated text is sanitized and
 secret-scrubbed before it is stored or shown.
 
+## Amendment (2026-11-13, #4007)
+
+Terminal preservation refs (`refs/uzi-terminal/<run-id>`) are a separate
+namespace with their own tables, not held publications. The held sweep
+(`SweepHeldPublications`) and `validManagedRef` never touch them, and the held
+publication state machine, retention clock and removal guard above are
+unchanged. Their own removal 409 is separate. See
+[ADR-4007](4007-terminal-preservation.md); slice A is dark.
+
 ## Consequences
 
 - Eligible terminal held work can land on its own forge, where `git fetch

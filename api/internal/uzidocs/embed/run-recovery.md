@@ -3415,6 +3415,51 @@ for the body). The block lifts once each ref is deleted or settled. An
 acknowledged ref clears at its retention expiry, or sooner with
 `uzi run held expire`.
 
+## Terminal preservation refs (slice A, inactive)
+
+A **terminal preservation ref** is a forge ref, `refs/uzi-terminal/<run-id>`,
+meant to keep a finished run's final work for as long as the run's issue or
+merge request is open. It is separate from held-work refs, checkpoint refs and
+custody holds, and none of those touch it.
+
+**Nothing creates one yet.** This release adds only the API groundwork. No
+worker asks the API to publish a terminal ref, so no such ref exists on your
+forge and the background sweep for them finds nothing to do. Capturing and
+publishing the work, and turning the feature on, are still to come.
+
+When refs do exist, they are **retained**: automatic retirement is built but
+switched off, so uzi does not delete a terminal ref on its own.
+
+### Removing a repo or forge connection
+
+While a terminal ref of one of its runs may still be on the forge, removing the
+repo or the forge connection is refused with a 409. It reads like this:
+
+```text
+this repo has 2 terminal-preservation ref(s) of finished runs still on the forge (refs/uzi-terminal/<run-id> (live); and 1 more); a ref clears when its retirement completes against the forge, so remove the repo after the block lifts
+```
+
+For a connection it says `this connection`. The body also carries
+`terminal_refs` (up to five refs) and `terminal_count` (the total). Because
+retirement is switched off, the block does not lift on its own, and an owner
+escape for it is not built yet. Nothing creates these refs in this release, so
+you should not see this 409 from them.
+
+### Two new completion refusal reasons
+
+A completion-publication release for a run can now be refused with one of two
+reasons, only when that run's completing generation has a terminal preservation
+record:
+
+- `terminal_preservation_pending`: the terminal push for that generation has
+  not finished or its outcome is not known yet.
+- `terminal_preservation_refused`: the terminal push for that generation was
+  refused.
+
+With no such record, completion behaves as before, and your own discard is
+never blocked. Since nothing creates a record yet, you should not see either
+reason today.
+
 ## Resuming an approved run in a fresh attempt
 
 When a run whose plan was already approved loses its session (for example a worker is replaced during a usage-limit wait) and continues in a fresh attempt, uzi can skip the plan gate for a plan that was already approved at the gate (by you, or automatically on an autopilot run). The new session is told what happened, so it does not mistake the plan for its own:
