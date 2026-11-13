@@ -1153,6 +1153,17 @@ describe("URL helpers", () => {
     });
   });
 
+  it("maps a GitHub Enterprise Server web URL to <host>/api/v3 on the same host, port kept", () => {
+    assert.deepStrictEqual(githubRepoParts("https://ghe.example.com/octo/repo.git"), {
+      apiBase: "https://ghe.example.com/api/v3",
+      owner: "octo",
+      repo: "repo",
+    });
+    assert.equal(githubRepoParts("https://ghe.example.com:8443/octo/repo").apiBase, "https://ghe.example.com:8443/api/v3");
+    assert.equal(githubRepoParts("https://github.com./octo/repo").apiBase, "https://api.github.com");
+    assert.equal(githubRepoParts("https://acme.ghe.com/octo/repo").apiBase, "https://api.acme.ghe.com");
+  });
+
   it("rejects a GitHub URL that has no owner/repo", () => {
     assert.throws(() => githubRepoParts("https://github.com/only-one"), (e: unknown) => e instanceof ForgeError);
   });
