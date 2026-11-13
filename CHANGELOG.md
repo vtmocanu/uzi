@@ -381,7 +381,7 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **GitLab merge-request reuse test coverage is extended (572893ef8).**
   The forge test double now records each merge request's source project.
 
-- **Improved credential redaction across log and issue text (3cec5121).**
+- **Improved credential redaction across log and issue text (3cec5121f).**
   Log, snapshot, Slack and issue-draft scrubbers share one redaction helper with added regression coverage.
 
 ## [0.86.1] - 2026-11-05
