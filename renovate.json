@@ -229,7 +229,7 @@
       "automerge": false
     },
     {
-      "description": "Postgres is pinned twice: docker-compose.yml (`postgres`) and ci.yml's workflow-level UZI_CI_PG_IMAGE env pin (both LiveDB jobs), which pulls through the mirror.gcr.io Docker Hub cache (`mirror.gcr.io/library/postgres`, #2621). Both must stay on the same tag and digest so the CI LiveDB lane tests the engine the stack ships, so they share one branch (#2622); scripts/check-postgres-pin-parity.sh gates the result.",
+      "description": "Postgres is pinned twice: docker-compose.yml (`postgres`) and ci.yml's test-codex-refresh-lostreply-e2e UZI_CI_PG_IMAGE env pin (the single LiveDB execution), which pulls through the mirror.gcr.io Docker Hub cache (`mirror.gcr.io/library/postgres`, #2621). Both must stay on the same tag and digest so the CI LiveDB lane tests the engine the stack ships, so they share one branch (#2622); scripts/check-postgres-pin-parity.sh gates the result.",
       "matchDepNames": ["postgres", "mirror.gcr.io/library/postgres"],
       "groupName": "postgres"
     }
