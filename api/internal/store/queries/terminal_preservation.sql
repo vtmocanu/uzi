@@ -179,8 +179,9 @@ RETURNING *;
 -- ---------------------------------------------------------------------------------------------
 
 -- name: GetTerminalSweepClock :one
--- The DATABASE clock, read immediately after a forge observation: it is the retire decision's
--- observed_at, compared in MarkTerminalPreservationRetiring against the same clock, so a skewed
+-- The DATABASE clock, read immediately BEFORE the forge observation (the earliest, conservative
+-- stamp): it is the retire decision's observed_at, compared in MarkTerminalPreservationRetiring
+-- against the same clock, so a skewed
 -- application clock cannot make a stale observation look fresh.
 SELECT clock_timestamp()::timestamptz AS observed_at;
 

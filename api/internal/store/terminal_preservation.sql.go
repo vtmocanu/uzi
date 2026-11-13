@@ -249,8 +249,9 @@ SELECT clock_timestamp()::timestamptz AS observed_at
 // The sweep (m4). Same CAS convention as the writers above; every state writer runs under the run
 // row lock (LockRunForHeldCleanup), taken before the preservation row.
 // ---------------------------------------------------------------------------------------------
-// The DATABASE clock, read immediately after a forge observation: it is the retire decision's
-// observed_at, compared in MarkTerminalPreservationRetiring against the same clock, so a skewed
+// The DATABASE clock, read immediately BEFORE the forge observation (the earliest, conservative
+// stamp): it is the retire decision's observed_at, compared in MarkTerminalPreservationRetiring
+// against the same clock, so a skewed
 // application clock cannot make a stale observation look fresh.
 func (q *Queries) GetTerminalSweepClock(ctx context.Context) (pgtype.Timestamptz, error) {
 	row := q.db.QueryRow(ctx, getTerminalSweepClock)

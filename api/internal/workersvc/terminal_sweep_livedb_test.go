@@ -1064,9 +1064,100 @@ func TestTerminalSweepIsolationFromHeldSweepLiveDB(t *testing.T) {
 	}
 }
 
+// A per-item error (here terminalLockRun's repository mismatch) must back the row off: attempts counted,
+// last_error stamped, next_check_at in the future, state untouched. Without the wrapper in
+// terminalSweepOne the row keeps next_check_at <= now and attempts 0 and is retried every tick.
+func TestTerminalSweepItemErrorBacksOffLiveDB(t *testing.T) {
+	f := newSweepFix(t)
+	p, err := f.e.q.InsertTerminalPreservation(f.e.ctx, store.InsertTerminalPreservationParams{
+		RunID: f.run, UserID: f.e.userID, RepoID: f.e.repoID, Ref: pushbroker.TerminalRef(f.run), LifetimeAtBind: "issue",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := uuid.New()
+	f.e.exec(t, `INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		SELECT $1, connection_id, 987654, 'g/mismatch', 'https://forge.e2e/g/mismatch', 'main', true FROM repos WHERE id = $2`, other, f.e.repoID)
+	f.e.exec(t, `UPDATE runs SET repo_id = $2 WHERE id = $1`, f.run, other)
+	f.e.exec(t, `UPDATE run_terminal_preservations SET next_check_at = now() - interval '1 minute' WHERE id = $1`, p.ID)
+	f.shiftClock(terminalBoundGrace + time.Minute)
+	if err := f.sweepErr(); err == nil {
+		t.Fatal("the pass reported no error for a repository mismatch")
+	}
+	got := f.mustPres("bound")
+	if got.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", got.Attempts)
+	}
+	if !got.LastError.Valid || got.LastError.String == "" {
+		t.Fatalf("last_error = %+v, want it set", got.LastError)
+	}
+	if !got.NextCheckAt.Time.After(f.dbNow()) {
+		t.Fatalf("next_check_at = %v, want a future backoff", got.NextCheckAt.Time)
+	}
+}
+
+// slowIssueForges is termForges with an issue read that takes d (or until the context ends).
+type slowIssueForges struct {
+	*termForges
+	d time.Duration
+}
+
+func (s slowIssueForges) IssueTrackerForRepo(ctx context.Context, repoID uuid.UUID, ft, base string, tok []byte) (forge.IssueTracker, error) {
+	tr, err := s.termForges.IssueTrackerForRepo(ctx, repoID, ft, base, tok)
+	return slowIssueTracker{IssueTracker: tr, d: s.d}, err
+}
+
+type slowIssueTracker struct {
+	forge.IssueTracker
+	d time.Duration
+}
+
+func (s slowIssueTracker) GetIssue(ctx context.Context, a, b int64) (forge.Issue, error) {
+	select {
+	case <-time.After(s.d):
+	case <-ctx.Done():
+		return forge.Issue{}, ctx.Err()
+	}
+	return s.IssueTracker.GetIssue(ctx, a, b)
+}
+
+// The observation clock is read BEFORE the forge read: a forge read that outlasts
+// the maximum observation age (shrunk by retireMaxAgeOverride) leaves the observation stale at tx-R1,
+// so the row is skipped and nothing is deleted. Were the clock read after the answer, this observation
+// would look fresh and retire.
+func TestTerminalSweepSlowForgeReadIsStaleLiveDB(t *testing.T) {
+	f := newSweepFix(t)
+	f.enableRetire()
+	f.live()
+	f.forges.issue = forge.Issue{State: "closed"}
+	// The real bound (15s) exceeds the forge read timeout, so shrink the bound below the read instead.
+	retireMaxAgeOverride = time.Second
+	t.Cleanup(func() { retireMaxAgeOverride = 0 })
+	f.svc.SetForges(slowIssueForges{termForges: f.forges, d: 2 * time.Second})
+	before := f.mustPres("live")
+	if n := f.sweep(); n != 0 {
+		t.Fatalf("changed %d rows, want 0", n)
+	}
+	after := f.mustPres("live")
+	if f.deleteCount() != 0 || after.RetireTip.Valid || after.Tip != before.Tip {
+		t.Fatalf("a stale observation retired: deletes=%d after=%+v", f.deleteCount(), after)
+	}
+	f.forges.mu.Lock()
+	reads := f.forges.getIssues
+	f.forges.mu.Unlock()
+	if reads != 1 {
+		t.Fatalf("issue reads = %d, want exactly the one slow read", reads)
+	}
+	if !after.NextCheckAt.Time.After(f.dbNow()) {
+		t.Fatalf("next_check_at = %v, want the discarded row backed off", after.NextCheckAt.Time)
+	}
+}
+
 // A bound row whose run was deleted (repo removal cascades runs; a bound row holds no live pointer, so
-// it survives) must not starve the due list: it goes to not_published without a run lock, and a healthy
-// row behind it is still processed.
+// it survives) goes to not_published without a run lock (there is no run row to lock), on the first
+// pass, with no credential resolution or forge call. A second stale-bound row of another run is
+// queued behind it and must also finish; that only shows the pass continues past the run-gone item,
+// which the earlier code also did, so it is not a starvation proof.
 func TestTerminalSweepStaleBoundRunGoneLiveDB(t *testing.T) {
 	f := newSweepFix(t)
 	p, err := f.e.q.InsertTerminalPreservation(f.e.ctx, store.InsertTerminalPreservationParams{

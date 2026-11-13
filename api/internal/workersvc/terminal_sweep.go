@@ -33,13 +33,14 @@ import (
 //     at any other tip: the contribution is refused foreign_tip and the preservation abandoned; the
 //     ref is never touched. A listing error backs off and changes no state.
 //   - bound (stale-bound): a bound row with no invoked contribution, after terminalBoundGrace, goes to
-//     not_published under the run lock.
+//     not_published under the run lock; a bound row whose run no longer exists (repo removal cascades
+//     runs) has no run row to lock and goes to not_published under the preservation row lock alone.
 //   - live and retiring (retire): PRODUCTION-DISABLED by terminalRetirementEnabled. Disabled, a due
 //     live or retiring row is only pushed out (one scheduling write; no forge call, no lifetime read,
 //     no delete). Enabled, the ordering is:
-//     1. forge observation, outside any transaction: the lifetime is re-derived with terminalLifetime
-//     (the one classification the route also uses) and observed_at is read from the DATABASE clock
-//     right after the answer;
+//     1. forge observation, outside any transaction: observed_at is read from the DATABASE clock
+//     BEFORE the forge read (the earliest, conservative stamp), then the lifetime is re-derived with
+//     terminalLifetime (the one classification the route also uses);
 //     2. tx-R1: run lock (NOWAIT), then the preservation row; the facts and every independent
 //     protection are re-checked; the observation must still be fresh on the database clock; then
 //     the irrevocable retiring is committed. A reopen between the forge answer and this commit
@@ -49,8 +50,10 @@ import (
 //     in which case the next pass repeats only step 3.
 //
 // Lock order wherever more than one is taken: run, preservation, contribution. Every state or tip
-// write is under the run row lock; a scheduling-only write (terminalSkip, terminalFail,
-// terminalPark) is a single statement and takes none.
+// write is under the run row lock, with one exception: the run-gone bound row (terminalSweepBound
+// via terminalLockPreservationOnly), whose run row no longer exists, is written under the
+// preservation row lock alone. A scheduling-only write (terminalSkip, terminalFail, terminalPark) is
+// a single statement and takes none.
 
 // terminalRetirementEnabled gates the retire lane in production. It is a constant, not a setting:
 // slice A ships the lane implemented and tested but off. Tests enable it with the unexported
@@ -89,6 +92,18 @@ const (
 	// freshness bound. It is below terminalSweepItemTimeout, so a stalled item is re-observed.
 	retireObservationMaxAge = 15 * time.Second
 )
+
+// retireMaxAgeOverride replaces retireObservationMaxAge when non-zero. Tests only (set and restored
+// by a sequential test): a forge read is bounded by terminalLifetimeTimeout, below the real bound, so
+// a stale-at-commit observation cannot otherwise be produced by a slow forge read.
+var retireMaxAgeOverride time.Duration
+
+func terminalRetireMaxAge() time.Duration {
+	if retireMaxAgeOverride > 0 {
+		return retireMaxAgeOverride
+	}
+	return retireObservationMaxAge
+}
 
 // The retire_reason vocabulary the sweep writes (a subset of the 00432 CHECK). no_pr never retires
 // in slice A: a run with neither issue nor merge request has no closure signal.
@@ -334,7 +349,8 @@ func (s *Service) terminalLockPreservationOnly(ctx context.Context, row store.Ru
 }
 
 // terminalSweepBound is the stale-bound lane: a bound row with no invoked contribution, after the
-// grace, is a run that never had a ref. Under the run lock it goes to not_published.
+// grace, is a run that never had a ref. Under the run lock it goes to not_published; when the run row
+// is gone it goes there under the preservation row lock alone (no run row exists to lock).
 func (s *Service) terminalSweepBound(ctx context.Context, row store.RunTerminalPreservation) (int64, error) {
 	if due := row.CreatedAt.Time.Add(terminalBoundGrace); s.now().Before(due) {
 		return 0, s.terminalPark(ctx, row, due.Sub(s.now()))
@@ -609,7 +625,7 @@ func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTermina
 	}
 	retiring, err := tt.qt.MarkTerminalPreservationRetiring(ctx, store.MarkTerminalPreservationRetiringParams{
 		ID: pres.ID, Tip: pres.Tip.String, RetireReason: reason,
-		ObservedAt: pgtype.Timestamptz{Time: observedAt, Valid: true}, MaxAgeSeconds: retireObservationMaxAge.Seconds(),
+		ObservedAt: pgtype.Timestamptz{Time: observedAt, Valid: true}, MaxAgeSeconds: terminalRetireMaxAge().Seconds(),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		// A stale observation (or a guard refusal): the decision is discarded without a state write and
@@ -626,6 +642,17 @@ func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTermina
 	}
 	// The decision is committed and irrevocable. 3. and 4. follow with no transaction open.
 	n, err := s.terminalRetireEffect(ctx, retiring)
+	var nb *terminalNoBackoff
+	if err != nil && !errors.As(err, &nb) {
+		// The row is retiring now, but terminalSweepOne holds the live row it was handed, and
+		// DeferTerminalPreservation matches on the expected state: backing off with that row would
+		// match nothing and the retiring row (due now) would loop every tick. Back off with the
+		// retiring row, then tell the caller it need not.
+		if werr := s.terminalFail(ctx, retiring, heldErrText(err, "")); werr != nil {
+			return 1 + n, errors.Join(err, werr)
+		}
+		return 1 + n, &terminalNoBackoff{err}
+	}
 	return 1 + n, err
 }
 
