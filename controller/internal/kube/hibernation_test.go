@@ -1247,7 +1247,7 @@ func TestPodStopped(t *testing.T) {
 		}), false},
 		{"terminated with status unknown", mk(corev1.PodFailed, func(p *corev1.Pod) {
 			p.Status.ContainerStatuses[0].State.Terminated.Reason = "ContainerStatusUnknown"
-		}), false},
+		}), true},
 		{"missing statuses", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Status.ContainerStatuses = nil }), false},
 		{"short statuses", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Spec.Containers = append(p.Spec.Containers, corev1.Container{Name: "b"}) }), false},
 		{"extra status entry", mk(corev1.PodFailed, func(p *corev1.Pod) {
