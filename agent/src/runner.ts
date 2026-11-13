@@ -18341,7 +18341,8 @@ export class RunRunner {
     //                  would run BEFORE this guard, so the guard alone would not protect P there.
     //   permitted      the seed's own beforeSeed sweep (S's executor, explicit P-free targets).
     //   covered else   settleForCredentialCapture and the credential switch: enterRetainedCredentialSwitch stops before settling
-    //                  (3.4 b); the finally's park reap and HOME teardown skip P's HOME (3.4 d, restoreUnsupportedHold).
+    //                  (3.4 b), and escapedInPlaceSwitch (the closed-route arm) skips settlement and goes straight to the op-fenced
+    //                  hold for a restore-route predecessor flight; the finally's park reap and HOME teardown skip P's HOME (3.4 d, restoreUnsupportedHold).
     //   unreachable    every site after the window: pause_park, iteration_park, wall_park, completion_hold, finalize, the milestone
     //                  checkpoint and the tick, handleRecoveryExhausted's disk/transient/credential parks (their errors are not
     //                  thrown by the route), the legacy recovery loop and the retained rehold (the route returns or stops before
@@ -27120,9 +27121,21 @@ export class RunRunner {
     };
     try {
       identity();
-      const laneSettled = laneSettledIn ?? flight.executor.laneSettlementProven?.() ?? true;
-      const proof = await this.settleSwitchQuiescence(flight, identity,
-        fixed.retained ? "retained_credential_switch" : "in_place_credential_switch", laneSettled);
+      // issue #3644 plan 3.4 (b): until the restore's seed returns, flight.executor IS the predecessor's executor and its
+      // processes, clone and HOME belong to the other incarnation. No settlement (it settles the executor's commands and plan
+      // summary, then reaps HOME-attributed processes) and no proof: go straight to the op-fenced hold, unproven.
+      const predecessor = flight.restorePredecessor !== undefined;
+      let proof: { settled: true } | { settled: false; detail: string; survivors: string };
+      if (predecessor) {
+        flight.retainedSwitchSettlement = "unproven";
+        runLog.warn("in-place credential switch deferred to a hold: the restore route's predecessor is untouchable until the successor is seeded",
+          { run_id: flight.runId });
+        proof = { settled: false, detail: "restore_predecessor_untouchable", survivors: "unverified" };
+      } else {
+        const laneSettled = laneSettledIn ?? flight.executor.laneSettlementProven?.() ?? true;
+        proof = await this.settleSwitchQuiescence(flight, identity,
+          fixed.retained ? "retained_credential_switch" : "in_place_credential_switch", laneSettled);
+      }
       const opId = flight.steering.pendingCredentialSwitchOp()?.opId ?? fixed.opId;
       if (!proof.settled) {
         const disposition = await this.holdRetainedSwitch(flight, runLog, lifecycle, identity, proof.detail, proof.survivors,

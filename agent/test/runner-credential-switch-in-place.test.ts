@@ -593,7 +593,8 @@ describe("issue #4201 m2c: option A (an apply that may have committed)", () => {
     let attempts = 0;
     client.reportState = (async (runId: string, body: Parameters<typeof real>[1], ...rest: unknown[]) => {
       if (body.status === "credential_switch_uncertain") {
-        if (++attempts > 5) return { applied: false, staleClaim: true, status: "queued" };
+        // IN_PLACE_REPORT_ATTEMPTS is 5: the runner gives up after the fifth failure, so no attempt is ever answered.
+        attempts++;
         throw new Error("transport down");
       }
       return (real as (...a: unknown[]) => unknown)(runId, body, ...rest);
@@ -602,6 +603,7 @@ describe("issue #4201 m2c: option A (an apply that may have committed)", () => {
     try {
       r = await scenario({ site: "implement_turn", apply: [{ outcome: "refused_committed" }] });
     } finally { client.reportState = real; }
+    assert.equal(attempts, 5, "the report is bounded at 5 attempts");
     assert.deepEqual(r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain"), []);
   });
 });

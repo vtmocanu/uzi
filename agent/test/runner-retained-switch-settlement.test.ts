@@ -221,6 +221,8 @@ async function scenario(o: Options) {
         if (confirmed && o.survivor === "settled-by-settle") survivors.pids.clear();
         return { confirmed };
       },
+      // Only for a restorePredecessor flight, whose executor is the predecessor's: a call here is a settlement touching it.
+      ...(o.restoreStub ? { closeAndSettlePlanSummary: async () => { events.push("closePlanSummary:g2"); } } : {}),
       joinOwnedOperations: async () => {
         events.push("join:start");
         counts.joins++;
@@ -239,7 +241,7 @@ async function scenario(o: Options) {
           switched = true;
           if (o.inPlaceApply) {
             flight.steering.tripCredentialSwitch(2, "op-retained");
-            if (o.restoreStub) flight.restorePredecessor = { clonePath: clone.path, home: undefined, executor: {} };
+            if (o.restoreStub) flight.restorePredecessor = { clonePath: clone.path, home: undefined, executor: flight.executor };
             if (o.rethrowSignal) throw new CredentialSwitchSignal();
             events.push(`hook:${await ctx.attemptCredentialSwitch!({ site: "implement_turn", laneSettled: true })}`);
             events.push(`custody:${flight.retainedLocalCustody === true}`);
@@ -282,6 +284,8 @@ async function scenario(o: Options) {
     ...(o.codexBoundaryDeadlineMs ? { codexBoundaryDeadlineMs: o.codexBoundaryDeadlineMs } : {}),
     ...(o.verificationMs ? { retainedSwitchVerificationMs: o.verificationMs } : {}),
   });
+  const settleCapture = (r as any).settleForCredentialCapture.bind(r);
+  (r as any).settleForCredentialCapture = async (...args: any[]) => { events.push("settleForCredentialCapture"); return settleCapture(...args); };
   const enter = (r as any).enterCredentialSwitch.bind(r);
   (r as any).enterCredentialSwitch = async (...args: any[]) => {
     const outcome = await enter(...args);
@@ -368,6 +372,14 @@ function assertNoCredentialedOps(env: Env, proven = true): void {
     assert.ok(settle >= 0 && settle < firstReport, `settle precedes the first report: ${env.events.join(",")}`);
     if (proven) assert.ok(proof >= 0 && proof < firstReport, "the quiescence proof precedes the first report");
   }
+}
+
+/** issue #3644 plan 3.4 (b): the restore route's predecessor gets no settlement (its executor is flight.executor until the swap). */
+function assertPredecessorUntouched(env: Env): void {
+  const after = env.events.slice(env.events.indexOf("switch") + 1);
+  for (const op of ["settleForCredentialCapture", "settle:g2", "closePlanSummary:g2", "quiesce:retained_credential_switch",
+    "quiesce:in_place_credential_switch"])
+    assert.ok(!after.includes(op), `${op} touched the predecessor: ${after.join(",")}`);
 }
 
 describe("issue #3181 m3: retained credential switch settles before it reports", { skip: process.platform !== "linux" }, () => {
@@ -742,17 +754,14 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
       assertCustodyKept(env, false);
     });
 
-    it("a restorePredecessor flight ends in option A or the op-fenced hold, sends no release and no op-less hold", TIMEOUT, async () => {
+    it("a restorePredecessor flight goes straight to the op-fenced hold with no settlement; no option A, no release, no op-less hold", TIMEOUT, async () => {
       const env = await scenario({ iid: 31883, survivor: "none", inPlaceApply: true, negotiated: true, restoreStub: true });
       await env.run;
       noV1(env);
       const id = env.claim.run_id;
-      const outcomes = [
-        ...api.holdRequests.filter(h => h.runId === id && h.status === HOLD).map(h => `held:${h.op_id}`),
-        ...api.uncertainRequests.filter(u => u.runId === id).map(u => `uncertain:${u.body.op_id}`),
-      ];
-      assert.equal(outcomes.length, 1, outcomes.join(","));
-      assert.match(outcomes[0]!, /^(held|uncertain):op-retained$/);
+      assert.deepEqual(api.holdRequests.filter(h => h.runId === id && h.status === HOLD).map(h => h.op_id), ["op-retained"]);
+      assert.equal(api.uncertainRequests.filter(u => u.runId === id).length, 0, "no option A");
+      assertPredecessorUntouched(env);
     });
 
     // executeClaim's outer catch: the executor rethrows the tripped signal, so the closed-route flight is
@@ -760,7 +769,7 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     for (const [name, extra, expectProven] of [
       ["a completed retained successor, proven", { iid: 31895, completedTurn: true, survivor: "none" }, true],
       ["a completed retained successor, unproven", { iid: 31896, completedTurn: true, survivor: "permanent" }, false],
-      ["a restorePredecessor flight, proven", { iid: 31897, restoreStub: true, survivor: "none" }, true],
+      ["a restorePredecessor flight (never settled)", { iid: 31897, restoreStub: true, survivor: "none" }, false],
     ] as const) {
       it(`the executor rethrows the switch signal (${name}): option A or the op-fenced hold, never a release or an op-less hold`, TIMEOUT, async () => {
         const env = await scenario({ inPlaceApply: true, negotiated: true, rethrowSignal: true, ...extra });
@@ -774,6 +783,7 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
         } else {
           assert.deepEqual([held, uncertain], [["op-retained"], []]);
         }
+        if (extra.restoreStub) assertPredecessorUntouched(env);
       });
     }
   });
