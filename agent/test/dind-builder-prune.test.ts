@@ -369,7 +369,10 @@ describe("attempt contract", () => {
     ["buildx missing", exited(1, "", "ERROR: BuildKit is enabled but the buildx component is missing or broken."), "refused"],
     ["buildx missing beats daemon text", exited(1, "", "Error response from daemon: x\nthe buildx component is missing or broken"), "refused"],
     ["daemon rejection", exited(1, "", "Error response from daemon: boom"), "rejected"],
-    ["rpc error", exited(1, "", "rpc error: code = Unavailable desc = closing transport"), "rejected"],
+    ["rpc transport loss", exited(1, "", "rpc error: code = Unavailable desc = closing transport"), "unknown"],
+    ["rpc canceled", exited(1, "", "rpc error: code = Canceled desc = context canceled"), "unknown"],
+    ["rpc deadline", exited(1, "", "rpc error: code = DeadlineExceeded desc = timed out"), "unknown"],
+    ["rpc non-transport code", exited(1, "", "rpc error: code = InvalidArgument desc = bad filter"), "rejected"],
     ["prune conflict", exited(1, "", "Error response from daemon: a prune operation is already running"), "conflict"],
     ["already running without a daemon error is not a conflict", exited(1, "", "something already running"), "unknown"],
     ["lost response (exit 1, no daemon error)", exited(1, "", "error during connect"), "unknown"],
@@ -830,6 +833,13 @@ describe("real child", () => {
       assert.equal((h.lines as Array<{ msg: string }>).filter((l) => l.msg.startsWith("dind-builder-prune-unsettled")).length, 1);
       assert.equal(rec(h.lines, "dind-builder-prune-unknown")?.reason, "settlement-unconfirmed");
 
+      // Real time with the escapee alive: the settle path must not have produced a `close`
+      // (destroying the pipes would make it fire within a few ms).
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(rec(h.lines, "dind-builder-prune-settled worker=w1"), undefined, "no settled line while the escapee lives");
+      assert.equal(h.settled.count, 0, "onSettled not called while the escapee lives");
+      assert.equal(await h.step(), "unsettled");
+
       for (const jump of [0, 61 * 60_000, 61 * 60_000]) {
         h.advance(jump);
         assert.equal(await h.step(), "unsettled");
@@ -855,6 +865,19 @@ describe("real child", () => {
     } finally {
       reap(escapee);
     }
+  });
+
+  it("overflow: stdout past the cap kills the group, close is confirmed, outcome unknown with kill_reason overflow", async () => {
+    const h = realHarness("overflow", { maxStdoutBytes: 64 * 1024 });
+    await h.step();
+    assert.equal(await h.step(), "unknown");
+    const { child } = pids(h.stateFile);
+    await waitFor(() => !isAlive(child), "overflowing child killed");
+    const unknown = rec(h.lines, "dind-builder-prune-unknown");
+    assert.equal(unknown?.kill_reason, "overflow");
+    assert.equal(unknown?.reason, undefined, "close was confirmed, so not settlement-unconfirmed");
+    assert.equal(rec(h.lines, "dind-builder-prune-unsettled"), undefined);
+    assert.equal(spawnCount(h.stateFile), 1);
   });
 
   it("worker exit: a process holding an unsettled child still exits by itself", async () => {

@@ -43,9 +43,12 @@
 // except `unknown`, which always waits the full hour):
 //   refused   nothing was submitted (buildx plugin missing, spawn failure, buildx CLI error).
 //   unknown   submitted but the result is unknown (timeout/abort/overflow kill, unconfirmed
-//             settlement, a non-zero exit with no daemon error).
+//             settlement, a non-zero exit with no daemon error, a gRPC transport loss such as
+//             `rpc error: code = Unavailable|Canceled|DeadlineExceeded`, which is not a daemon
+//             response).
 //   conflict  the daemon says a prune is already running (defensive).
-//   rejected  any other daemon error response. Prune may have removed some records first.
+//   rejected  any other daemon error response (`Error response from daemon:` or a non-transport
+//             `rpc error: code =`). Prune may have removed some records first.
 //   completed exit 0.
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -93,6 +96,9 @@ const DEFAULT_BUILDX_PLUGIN_PATH = "/usr/libexec/docker/cli-plugins/docker-build
  */
 const BUILDX_MISSING_TEXT = "buildx component is missing or broken";
 
+/** gRPC codes that mean the transport was lost, not that the daemon answered. */
+const TRANSPORT_RPC_CODES: ReadonlySet<string> = new Set(["Unavailable", "Canceled", "DeadlineExceeded"]);
+
 const NO_CLAIM_NOTE = "outcome not proven; no reclamation or preservation claimed";
 
 /** THE ONLY docker argv this leg ever runs, frozen. */
@@ -108,16 +114,25 @@ export const DIND_BUILDER_PRUNE_ARGV: readonly string[] = Object.freeze([
   "4GiB",
 ]);
 
-/** The leg's exact-match guard: throws unless `argv` is exactly {@link DIND_BUILDER_PRUNE_ARGV}. */
+/**
+ * An INDEPENDENT literal of the one allowed command (NUL-joined), deliberately not derived from
+ * {@link DIND_BUILDER_PRUNE_ARGV}, so widening that constant without also editing this literal
+ * fails at import.
+ */
+const EXPECTED_ARGV_JOINED =
+  "builder\u0000prune\u0000-f\u0000--filter\u0000type=regular\u0000--filter\u0000until=24h\u0000--max-used-space\u00004GiB";
+const EXPECTED_ARGV_LENGTH = 9;
+
+/** The leg's exact-match guard: throws unless `argv` equals the independent literal above. */
 export function assertDindBuilderArgvAllowed(argv: readonly string[]): void {
-  const a = DIND_BUILDER_PRUNE_ARGV;
-  if (!(a.length === argv.length && a.every((v, i) => v === argv[i]))) {
+  if (argv.length !== EXPECTED_ARGV_LENGTH || argv.join("\u0000") !== EXPECTED_ARGV_JOINED) {
     throw new Error("dind-builder-prune: refusing a docker argv outside the frozen command");
   }
 }
 
-// Module-load self-assertion: the frozen argv passes and nearby variants fail, so an edit that
-// widens the command fails at import (every worker boot and every test).
+// Module-load self-assertion: the exported constant must pass the guard (which compares against
+// the independent literal) and nearby variants must fail, so a widened constant throws at import
+// (every worker boot and every test).
 assertDindBuilderArgvAllowed(DIND_BUILDER_PRUNE_ARGV);
 {
   const f = DIND_BUILDER_PRUNE_ARGV;
@@ -176,6 +191,8 @@ export interface BuilderPruneExecOptions {
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
   settleTimeoutMs: number;
+  /** Stdout cap in bytes before the group is killed as overflow (default 16 MiB). */
+  maxStdoutBytes?: number;
   signal?: AbortSignal;
 }
 
@@ -233,7 +250,10 @@ const execBuilderPrune: BuilderPruneExec = (argv, opts) =>
     };
 
     const startKill = (reason: "timeout" | "abort" | "overflow"): void => {
-      killReason ??= reason;
+      // Signal the group at most once: a later call (more stdout after overflow, an abort after a
+      // timeout) must not re-send SIGKILL to a pgid that may have been recycled.
+      if (killReason) return;
+      killReason = reason;
       if (pruneTimer) clearTimeout(pruneTimer);
       if (child.pid !== undefined) killGroup(child.pid);
       if (settleTimer) return;
@@ -260,7 +280,7 @@ const execBuilderPrune: BuilderPruneExec = (argv, opts) =>
     child.stdout?.on("data", (chunk: Buffer) => {
       if (discard) return;
       stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_STDOUT_BYTES) {
+      if (stdoutBytes > (opts.maxStdoutBytes ?? MAX_STDOUT_BYTES)) {
         stdout = "";
         startKill("overflow");
         return;
@@ -305,6 +325,8 @@ export interface DindBuilderPruneOptions {
   pruneTimeoutMs?: number;
   /** How long to wait for the child's `close` after a kill (default 10 seconds). */
   settleTimeoutMs?: number;
+  /** Test-only: stdout cap before an overflow kill (default 16 MiB). */
+  maxStdoutBytes?: number;
   /** Test seam: the buildx plugin path the preflight checks. */
   pluginPath?: string;
   /** Test seam: the executable to spawn (default the docker client). */
@@ -343,7 +365,10 @@ function classifyPruneFailure(res: BuilderPruneExecResult): "refused" | "unknown
   if (res.signal) return "unknown";
   const text = `${res.stdout}\n${res.stderr}`;
   if (text.includes(BUILDX_MISSING_TEXT)) return "refused";
-  const daemon = text.includes("Error response from daemon:") || text.includes("rpc error: code =");
+  // A gRPC transport loss is not a daemon response: the request may have been submitted.
+  const rpc = /rpc error: code = (\w+)/.exec(text);
+  const daemon = text.includes("Error response from daemon:") || rpc !== null;
+  if (!text.includes("Error response from daemon:") && rpc && TRANSPORT_RPC_CODES.has(rpc[1]!)) return "unknown";
   if (daemon) return text.includes("already running") ? "conflict" : "rejected";
   // A numeric non-zero exit with no daemon response: the request may have been submitted.
   return "unknown";
@@ -365,6 +390,7 @@ export class DindBuilderPruneController {
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly pruneTimeoutMs: number;
   private readonly settleTimeoutMs: number;
+  private readonly maxStdoutBytes?: number;
   private readonly pluginPath: string;
   private readonly spawnFile: string;
   private readonly spawnArgvPrefix: readonly string[];
@@ -396,6 +422,7 @@ export class DindBuilderPruneController {
     this.sleep = opts.sleep ?? abortableSleep;
     this.pruneTimeoutMs = opts.pruneTimeoutMs ?? PRUNE_TIMEOUT_MS;
     this.settleTimeoutMs = opts.settleTimeoutMs ?? SETTLE_TIMEOUT_MS;
+    this.maxStdoutBytes = opts.maxStdoutBytes;
     this.pluginPath = opts.pluginPath ?? DEFAULT_BUILDX_PLUGIN_PATH;
     this.spawnFile = opts.spawnFile ?? DOCKER_BIN;
     this.spawnArgvPrefix = opts.spawnArgvPrefix ?? [];
@@ -545,6 +572,7 @@ export class DindBuilderPruneController {
       env,
       timeoutMs: this.pruneTimeoutMs,
       settleTimeoutMs: this.settleTimeoutMs,
+      ...(this.maxStdoutBytes !== undefined ? { maxStdoutBytes: this.maxStdoutBytes } : {}),
       ...(signal ? { signal } : {}),
     });
     if (res.kind === "killed" && res.unsettled) return this.latch(res.unsettled, res.reason, before);

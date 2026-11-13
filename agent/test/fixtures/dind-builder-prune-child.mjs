@@ -14,6 +14,8 @@
 //                      sleeps forever, then sleeps itself: killing this process group leaves a
 //                      pipe holder alive, so `close` never fires.
 //
+//   overflow           writes 1 MiB of stdout in chunks, then sleeps forever (tests pass a small cap).
+//
 // Every run appends a line to <stateFile>.spawns; sleep/escape modes write
 // {"child":pid,"grandchild":pid} to <stateFile> once the grandchild exists.
 
@@ -56,6 +58,13 @@ switch (mode) {
     if (mode === "daemon-then-sleep") process.stderr.write("Error response from daemon: boom\n");
     const grandchild = holder(mode === "escape");
     writeFileSync(stateFile, JSON.stringify({ child: process.pid, grandchild: grandchild.pid }));
+    forever();
+    break;
+  }
+  case "overflow": {
+    writeFileSync(stateFile, JSON.stringify({ child: process.pid }));
+    const chunk = Buffer.alloc(64 * 1024, 120);
+    for (let i = 0; i < 16; i++) process.stdout.write(chunk);
     forever();
     break;
   }
