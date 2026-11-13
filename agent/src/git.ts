@@ -3122,7 +3122,7 @@ export function readRetireScratchOutcomesActivation(env: NodeJS.ProcessEnv): boo
 
 type RetireScratchWalkReason = "entry_cap" | "time_cap" | "unreadable" | "cross_device" | "changed" | "vanished";
 type RetireScratchBytesState = "measured" | "partial" | "unknown";
-type RetireScratchSources = { state: "read"; paths: string[] } | { state: "unknown" };
+type RetireScratchSources = { state: "read"; paths: string[] } | { state: "unknown" } | { state: "not_attempted" };
 
 interface RetireScratchWalkCtx {
   now: () => number;
@@ -19224,8 +19224,13 @@ export class GitCache {
    *  issue #4143 — with `opts.outcomes` (the default in main.ts; `UZI_RETIRE_SCRATCH_OUTCOMES=0`
    *  turns it off and leaves exactly the warning above, with no journal read and no walk), the
    *  warning is followed by OBSERVATION records only: at most RETIRE_SCRATCH_REPORTED_PATHS
-   *  `runner retire scratch outcome` rows (every one `kept`) and one `runner retire scratch total`
-   *  over all parents. They never remove, change the owner of or reclaim anything.
+   *  `runner retire scratch outcome` rows (every one `kept`, only for parents) and exactly one
+   *  `runner retire scratch total` per startup whenever outcomes are on and the runner root was
+   *  listed (it exists and is a real directory), including with zero parents. A missing,
+   *  non-directory or symlink runner root emits no lines; if the step throws,
+   *  `runner retire scratch outcomes failed` replaces the total. With zero parents no journal
+   *  read or walk happens and `retained_source_read` is `not_attempted`. They never remove,
+   *  change the owner of or reclaim anything.
    *    - No ordinary durable disposition binding proves this moved footprint: rollback repair can
    *      persist a protected moved-clone pointer, but the rename precedes the journal clear and the
    *      retired-ledger write, so a parent can exist with nothing naming it. A retired ledger,
@@ -19324,7 +19329,10 @@ export class GitCache {
         paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(path.relative(root, p), 157)),
       });
     }
-    if (opts.outcomes && (observed.length > 0 || incomplete)) {
+    // Reaching here means the runner root exists, is a directory and was enumerated (a missing,
+    // non-directory or symlink root returned early above with no lines), so the total is emitted
+    // even with zero parents.
+    if (opts.outcomes) {
       try { await this.emitRetireScratchOutcomes(root, observed.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)), incomplete, deadline, opts); }
       catch (err) {
         this.log.warn("runner retire scratch outcomes failed", { error: sanitizeForLog(gitErrorMessage(err), 157) });
@@ -19407,8 +19415,8 @@ export class GitCache {
       beforeOpen?: (dirPath: string) => Promise<void>;
     }): Promise<void> {
     const signal = opts.signal ?? new AbortController().signal;
-    // No parents (enumeration truncated before any .retire-* name): nothing to attribute or walk.
-    const sources: RetireScratchSources = parents.length === 0 ? { state: "unknown" }
+    // No parents: nothing to attribute or walk, so no journal read is attempted.
+    const sources: RetireScratchSources = parents.length === 0 ? { state: "not_attempted" }
       : opts.readRetainedSources
         ? await opts.readRetainedSources().catch((): RetireScratchSources => ({ state: "unknown" }))
         : await this.readRetireScratchSources(signal, deadline, opts.limits);

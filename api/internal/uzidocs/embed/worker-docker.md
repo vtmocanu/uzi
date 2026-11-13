@@ -512,22 +512,34 @@ is promised: run admission fails open when a disk sample is unknown and
 reopens after `UZI_DISK_ADMISSION_MAX_WAIT` (default 15 minutes).
 
 **`.retire-*` retirement scratch (observation only).** Each worker startup
-observes every `.retire-*` scratch parent under `<dataDir>/runner` and keeps
-all of them: nothing is deleted, chowned or moved. The existing `runner retire
-scratch retained` warning is unchanged. Two further log lines are added:
+observes every `.retire-*` scratch parent the bounded root listing reaches
+(4096-entry budget; `enumeration_incomplete` marks a truncated listing) under
+`<dataDir>/runner` and keeps all of them: nothing is deleted, chowned or moved.
+The existing `runner retire scratch retained` warning is unchanged. Two further
+log lines are added:
 
-- `runner retire scratch outcome`: up to 10 per startup, sorted. Fields are
-  name, kind, outcome (`kept`), reason, retained_source, empty, recent, bytes,
-  bytes_state and partial_reasons. `reason` is `protected_by_retained_source`
-  when a decoded recovery or restore journal's `clonePath` or
+- `runner retire scratch outcome`: per-parent rows only, up to 10 per startup,
+  sorted. Fields are name, kind, outcome (`kept`), reason, retained_source,
+  empty, recent, bytes, bytes_state and partial_reasons. `reason` is
+  `protected_by_retained_source` when a decoded recovery or restore journal's
+  `clonePath` (predecessor, successor or tombstone) or
   `retainedSources[].clonePath` names the parent or a path under it (a
   rollback-repair pointer), otherwise `no_disposition_evidence`.
   `retained_source` is `named`, `not_named` or `unknown`; `unknown` means the
   journal read failed or hit a cap, the deadline or an abort.
-- `runner retire scratch total`: one per startup. Fields are parents_enumerated,
-  outcomes_omitted, kept, reclaimed (always 0), protected_by_retained_source,
-  no_disposition_evidence, bytes, bytes_state, partial_reasons,
-  enumeration_incomplete and retained_source_read.
+- `runner retire scratch total`: exactly one per startup (one per pod epoch on
+  epoch workers) whenever records are on and the runner root exists, is a
+  directory and was listed, including with zero parents. None is logged when the
+  runner root is missing, not a directory or a symlink. If the step throws, a
+  `runner retire scratch outcomes failed` warning replaces it. Fields are
+  parents_enumerated, outcomes_omitted, kept, reclaimed (always 0),
+  protected_by_retained_source, no_disposition_evidence, bytes, bytes_state,
+  partial_reasons, enumeration_incomplete and retained_source_read.
+  `retained_source_read` is `read`, `unknown` (the read was attempted and
+  failed) or `not_attempted` (no parents, so no journal read or walk happened).
+  With zero parents the total is `parents_enumerated: 0`, `kept: 0`, `bytes: 0`
+  and `bytes_state: measured` (a sum over zero parents is exact) unless
+  `enumeration_incomplete` is set, when it is `unknown`.
 
 Bytes are allocated bytes (blocks x 512, hard links counted once) from a
 read-only, descriptor-relative walk as the worker uid that never follows

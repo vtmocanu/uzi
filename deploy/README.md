@@ -1129,8 +1129,10 @@ Older controllers or absent env leave scratch off; older workers ignore the env,
 so rendered `1` is not proof. The worker image must include #4171 (`7cd46526`).
 
 `.retire-*` retirement scratch is observation only (#4143): each worker startup
-logs bounded per-parent and total outcome records and keeps every parent, with
-no reclaim. Chart `workers.epochReclaim.retireScratchOutcomes` is a strict
+logs bounded per-parent outcome rows (parents only) and one total line (whenever
+records are on and the runner root exists, even with zero parents; none when the
+root is missing; `runner retire scratch outcomes failed` replaces it if the step
+throws) and keeps every parent, with no reclaim. Chart `workers.epochReclaim.retireScratchOutcomes` is a strict
 boolean, default `true`; a non-boolean fails rendering. `false` makes the
 controller render worker `UZI_RETIRE_SCRATCH_OUTCOMES=0` on every worker (Docker
 or not); default renders are unchanged, so upgrading does not roll workers,

@@ -305,14 +305,23 @@ reclaim separate. No hosted evidence is claimed by this amendment.
 
 ## Amendment 2026-11-13 — issue #4143: `.retire-*` scratch outcome records (observation only)
 
-Worker startup now observes every `.retire-*` retirement scratch parent under
-`<dataDir>/runner` and emits bounded `runner retire scratch outcome` rows (at
-most 10, sorted) and one `runner retire scratch total` line. Every parent is
-kept (`reclaimed` is always 0); nothing is deleted, chowned or moved, and the
-existing `runner retire scratch retained` warning is unchanged. A parent is
-`protected_by_retained_source` only when a decoded recovery or restore
-journal's `clonePath` or `retainedSources[].clonePath` names it or a path under
-it; otherwise `no_disposition_evidence`. Bytes are allocated bytes from a
+Worker startup now observes every `.retire-*` retirement scratch parent the
+bounded root listing reaches under `<dataDir>/runner` (4096-entry budget;
+`enumeration_incomplete` marks a truncated listing) and emits bounded
+per-parent `runner retire scratch outcome` rows (at most 10, sorted, parents
+only) and exactly one `runner retire scratch total` line per startup (one per
+pod epoch on epoch workers) whenever records are on and the runner root exists
+and was listed, including with zero parents. A missing, non-directory or
+symlink runner root logs none; if the step throws,
+`runner retire scratch outcomes failed` replaces the total. With zero parents
+`retained_source_read` is `not_attempted` (no journal read or walk) and
+`bytes_state` is `measured` unless the listing was incomplete (`unknown`).
+Every parent is kept (`reclaimed` is always 0); nothing is deleted, chowned or
+moved, and the existing `runner retire scratch retained` warning is unchanged.
+A parent is `protected_by_retained_source` when a decoded recovery or restore
+journal's `clonePath` (predecessor, successor or tombstone) or
+`retainedSources[].clonePath` names it or a path under it; otherwise
+`no_disposition_evidence`. Bytes are allocated bytes from a
 read-only descriptor-relative walk (hard links once, no symlink following);
 `bytes_state` is `measured` only when every parent was measured completely and
 the listing was complete. One 30 s startup budget covers the journal read and

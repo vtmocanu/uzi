@@ -726,6 +726,32 @@ describe("retire scratch single total (#4143)", () => {
     assert.equal(t.parents_enumerated, 0);
     assert.equal(t.bytes_state, "unknown");
     assert.equal(t.enumeration_incomplete, true);
+    assert.equal(t.retained_source_read, "not_attempted");
+  });
+
+  it("a complete listing with no .retire-* parents emits exactly one measured zero total and never reads", async () => {
+    fs.mkdirSync(path.join(root, "repo-dir"));
+    let reads = 0;
+    await run({ readRetainedSources: async () => { reads++; return { state: "read", paths: [] }; } });
+    assert.equal(reads, 0);
+    assert.equal(rows().length, 0);
+    assert.equal(totals().length, 1);
+    const t = totals()[0]!;
+    assert.equal(t.parents_enumerated, 0);
+    assert.equal(t.outcomes_omitted, 0);
+    assert.equal(t.kept, 0);
+    assert.equal(t.bytes, 0);
+    assert.equal(t.bytes_state, "measured");
+    assert.equal(t.enumeration_incomplete, false);
+    assert.equal(t.retained_source_read, "not_attempted");
+  });
+
+  it("a missing runner root emits no lines", async () => {
+    fs.rmSync(root, { recursive: true });
+    let reads = 0;
+    await run({ readRetainedSources: async () => { reads++; return { state: "read", paths: [] }; } });
+    assert.equal(reads, 0);
+    assert.equal(rows().length + totals().length, 0);
   });
 });
 
@@ -881,7 +907,7 @@ describe("retire scratch outcomes switch (#4143)", () => {
     let reads = 0;
     await run({ outcomes: false, readRetainedSources: async () => { reads++; return { state: "read", paths: [] }; } });
     assert.equal(reads, 0);
-    assert.equal(rows().length + totals().length, 0);
+    assert.equal(rows().length + totals().length, 0, "no total either, even though a parent exists");
     const off = warnings();
     assert.equal(off.length, 1);
     await run({ readRetainedSources: async () => { reads++; return { state: "read", paths: [] }; } });
