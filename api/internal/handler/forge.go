@@ -1242,7 +1242,7 @@ func writeHeldConflict(w http.ResponseWriter, what string, count int64, rows []h
 // is always reported in terminal_count.
 const terminalRefListCap = 5
 
-// terminalRestrictConstraint is run_terminal_preservations' live pointer FK (migration 00432).
+// terminalRestrictConstraint is run_terminal_preservations' live pointer FK (migration 00436).
 // The handlers match it by name so only a terminal restriction maps to the terminal 409.
 const terminalRestrictConstraint = "run_terminal_preservations_live_run_id_fkey"
 

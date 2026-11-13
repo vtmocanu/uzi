@@ -36,7 +36,7 @@ import (
 const terminalBodyOverhead = 1 << 20
 
 // terminalMaxManifestBytes caps the raw manifest JSON before it is decoded into structs. It mirrors
-// the store's cap on the canonical manifest (the 00433 manifest CHECK, 256 KiB).
+// the store's cap on the canonical manifest (the 00437 manifest CHECK, 256 KiB).
 const terminalMaxManifestBytes = 256 << 10
 
 // terminalMaxBodyBytes caps the whole JSON body.
