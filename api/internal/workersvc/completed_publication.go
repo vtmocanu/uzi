@@ -338,9 +338,14 @@ func (s *Service) verifyCompletedPublication(ctx context.Context, w store.Worker
 	}
 	// Authoritative terminal-preservation gate. Lock order: worker, run, hold, preservation,
 	// contribution, repo binding. The pre-check above was unlocked, so a contribution that was
-	// published (or absent) then may have moved on; this FOR SHARE read decides.
+	// published (or absent) then may have moved on; this locked read decides. The serializer is the
+	// run row lock taken above: every contribution writer (route tx1/tx2, the sweep) takes the run
+	// row first, which also covers a contribution inserted after this read. FOR SHARE is defence in
+	// depth.
 	//
-	// Release-writer classification (only ReleaseCompletedPublicationHold is gated):
+	// Release-writer classification for the writers the plan names (only
+	// ReleaseCompletedPublicationHold is gated; other release writers, e.g. ReleaseCustodyHold, the
+	// predecessor ancestry releases and DiscardCrossRunHold, are out of this slice's scope):
 	//   - ReleaseCompletedPublicationHold: gated here; it is the release that claims the work is
 	//     on the forge, which a pending or refused terminal contribution contradicts.
 	//   - ReleaseHeldPublicationHold (held-publication release): not gated, its hold guard binds
@@ -351,8 +356,9 @@ func (s *Service) verifyCompletedPublication(ctx context.Context, w store.Worker
 	//     be obstructed by a stuck terminal contribution.
 	//   - DiscardMergedPredecessorHold: not gated, it discards a predecessor hold on its own
 	//     merged-predecessor binding.
-	//   - ReleaseCustodyHoldExact: not gated, it is the generation-exact worker release of its own
-	//     hold and claims no publication.
+	//   - ReleaseCustodyHoldExact: not gated; it may carry 'publication' evidence, but its
+	//     `NOT inventory_guarded` predicate means it can never release an inventory-guarded
+	//     completed-publication hold.
 	if _, err = qt.GetTerminalPreservationForShare(writeCtx, runID); err == nil {
 		c, cerr := qt.GetTerminalContributionForShare(writeCtx, store.GetTerminalContributionForShareParams{RunID: runID, Generation: id.Generation})
 		switch {

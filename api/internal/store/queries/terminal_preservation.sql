@@ -106,8 +106,9 @@ SELECT * FROM run_terminal_preservations WHERE run_id = @run_id FOR UPDATE;
 
 -- name: GetTerminalPreservationForShare :one
 -- The completed-publication gate's authoritative read (lock order: worker, run, hold, preservation,
--- contribution, repo binding). FOR SHARE keeps a concurrent tx2 outcome writer (FOR UPDATE on the
--- same row) from moving the contribution between this read and the hold release.
+-- contribution, repo binding). The gate is serialized by the run row lock it already holds: every
+-- contribution writer takes the run row first, which also covers a contribution inserted after
+-- this read. FOR SHARE is defence in depth.
 SELECT * FROM run_terminal_preservations WHERE run_id = @run_id FOR SHARE;
 
 -- name: GetTerminalContributionForShare :one

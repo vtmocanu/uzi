@@ -202,7 +202,7 @@ func TestCompletedPublicationTerminalGateLiveDB(t *testing.T) {
 			t.Fatalf("compare calls = %d, want 1 (the proof ran before the locked check)", g.f.compareCalls)
 		}
 	})
-	t.Run("owner_discard_is_not_obstructed", func(t *testing.T) {
+	t.Run("owner_discard_query_of_a_gate_refused_hold_succeeds", func(t *testing.T) {
 		g := newGateEnv(t)
 		g.contribute(t, 1, "invoked")
 		g.wantRefused(t, g.report(t), "terminal_preservation_pending")

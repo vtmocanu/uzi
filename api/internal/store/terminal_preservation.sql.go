@@ -200,8 +200,9 @@ SELECT id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, st
 `
 
 // The completed-publication gate's authoritative read (lock order: worker, run, hold, preservation,
-// contribution, repo binding). FOR SHARE keeps a concurrent tx2 outcome writer (FOR UPDATE on the
-// same row) from moving the contribution between this read and the hold release.
+// contribution, repo binding). The gate is serialized by the run row lock it already holds: every
+// contribution writer takes the run row first, which also covers a contribution inserted after
+// this read. FOR SHARE is defence in depth.
 func (q *Queries) GetTerminalPreservationForShare(ctx context.Context, runID uuid.UUID) (RunTerminalPreservation, error) {
 	row := q.db.QueryRow(ctx, getTerminalPreservationForShare, runID)
 	var i RunTerminalPreservation
