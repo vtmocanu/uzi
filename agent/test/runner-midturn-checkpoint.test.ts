@@ -4857,3 +4857,379 @@ describe("mid-turn checkpoint tick step logging (issue #3896)", () => {
     }
   });
 });
+
+// ── issue #4258 — the content-free mid-run trigger and its non-terminal consumer ─────────────
+//
+// A trusted mid-turn finding ABOVE every floor arms a pending trigger; `ctx.midRunSecretRemediation`
+// (called by the executor at an admitted work-turn boundary) revalidates from scratch and returns
+// ONLY proceed / remediate. The done/checkpoint/finalize guards keep holding publication regardless.
+
+describe("issue #4258 mid-run secret remediation consumer", () => {
+  type RState = {
+    attempts: number;
+    known?: unknown[];
+    blocked?: unknown[];
+    everKnown?: boolean;
+    cleanTip?: string;
+    flaggedCommits?: string[];
+    midRunTrigger?: { observation: number; tip: string };
+    midRunSeq?: number;
+  };
+  type MFlight = Record<string, unknown> & { secretRemediation?: RState };
+  interface Rig {
+    ctx: RunContext;
+    ctl: Ctl;
+    g: GitCache;
+    bare: string;
+    flight: () => MFlight;
+    state: () => RState;
+    /** Every uploaded tip, with the flagged SHAs the publish guard saw reachable or unknown. */
+    tips: string[];
+    violations: string[];
+    flagged: string[];
+    /** Make the clock pass the checkpoint time gate and fire one tick. */
+    tick: () => Promise<string>;
+    /** Replace one GitCache method for the duration of `fn`. */
+    withStub: <T>(patch: Partial<Record<"ancestry" | "trackingTip" | "branchTip" | "secretScanCheckpointRange", unknown>>, fn: () => Promise<T>) => Promise<T>;
+  }
+
+  /** git merge-base --is-ancestor as a tri-state, independent of any stubbed GitCache method. */
+  function ancestryOf(dir: string, a: string, d: string): "ancestor" | "divergent" | "unknown" {
+    try {
+      execFileSync("git", ["-C", dir, "merge-base", "--is-ancestor", a, d], { env: GIT_ENV, stdio: "ignore" });
+      return "ancestor";
+    } catch (e) {
+      return (e as { status?: number }).status === 1 ? "divergent" : "unknown";
+    }
+  }
+
+  /** Rewrite `flagged` out of history: drop it and everything after it, then commit clean content. */
+  function rewriteOut(tree: string, flagged: string, file: string): void {
+    gitIn(tree, ["reset", "-q", "--hard", `${flagged}^`]);
+    commitIn(tree, file, "rewritten clean\n");
+  }
+
+  async function rig(
+    iid: number,
+    body: (r: Rig) => Promise<void>,
+    opts: { executorTail?: boolean; seed?: (f: MFlight) => void } = {},
+  ): Promise<{ claimRunId: string; tips: string[]; violations: string[] }> {
+    const ctl = control();
+    const g = mkGit(fx.dataDir);
+    const tips: string[] = [];
+    const violations: string[] = [];
+    const flagged: string[] = [];
+    const bare = g.barePathFor(fx.originPath);
+    const pub = stubPublish(async (_n, tip, pack) => {
+      await drain(pack);
+      tips.push(tip);
+      for (const sha of flagged) {
+        const rel = ancestryOf(bare, sha, tip);
+        if (rel !== "divergent") violations.push(`${sha} ${rel} ${tip}`);
+      }
+      return LANDED;
+    });
+    const claim = gitlabClaim(iid);
+    const runner = mkRunner(g, () => ({
+      executor: {
+        run: async (ctx: RunContext) => {
+          await recordingTurnErrors(async () => {
+            const r: Rig = {
+              ctx, ctl, g, bare, tips, violations, flagged,
+              flight: () => { assert.ok(captured, "a checkpoint scan captured the flight"); return captured; },
+              state: () => { assert.ok(captured?.secretRemediation, "remediation state exists"); return captured.secretRemediation; },
+              tick: () => { ctl.advance(INTERVAL_MS + 1); return ctl.fire(); },
+              withStub: async (patch, fn) => {
+                const target = g as unknown as Record<string, unknown>;
+                const saved: Record<string, unknown> = {};
+                for (const [k, v] of Object.entries(patch)) { saved[k] = target[k]; target[k] = v; }
+                try { return await fn(); } finally { for (const [k, v] of Object.entries(saved)) target[k] = v; }
+              },
+            };
+            await body(r);
+          });
+          return { branch: ctx.branch };
+        },
+      },
+    }), ctl);
+    let captured: MFlight | undefined;
+    const internals = runner as unknown as { scanCheckpointForPublish: (f: MFlight, ...rest: unknown[]) => Promise<unknown> };
+    const origScan = internals.scanCheckpointForPublish.bind(runner);
+    internals.scanCheckpointForPublish = (f, ...rest) => { captured = f; opts.seed?.(f); return origScan(f, ...rest); };
+    try {
+      await runner.execute(claim);
+    } finally {
+      pub.restore();
+    }
+    return { claimRunId: claim.run_id, tips, violations };
+  }
+
+  /** commit a secret-shaped file, tick, and return its SHA with the trigger armed. */
+  async function flagAndTick(r: Rig, file = "cfg.env"): Promise<string> {
+    const sha = commitIn(r.ctx.worktreePath, file, `TOKEN=${runtimeSecret()}\n`);
+    r.flagged.push(sha);
+    assert.equal(await r.tick(), "secret_found");
+    return sha;
+  }
+
+  const untouched = (s: RState): void => {
+    assert.equal(s.blocked, undefined);
+    assert.equal(s.known, undefined);
+    assert.equal(s.everKnown, undefined);
+    assert.equal(s.cleanTip, undefined);
+  };
+
+  it("a trusted mid-turn finding above the floors arms a content-free trigger and yields exactly one mid-run remediate", async () => {
+    const out = await rig(4258_001, async (r) => {
+      const sha = await flagAndTick(r);
+      const s = r.state();
+      assert.equal(s.midRunSeq, 1);
+      assert.deepEqual(Object.keys(s.midRunTrigger!).sort(), ["observation", "tip"]);
+      assert.equal(s.midRunTrigger!.observation, 1);
+      assert.match(s.midRunTrigger!.tip, /^[0-9a-f]{40}$/);
+      assert.equal(s.attempts, 0, "arming is not a turn");
+      const d = await r.ctx.midRunSecretRemediation!();
+      assert.equal(d.action, "remediate");
+      if (d.action !== "remediate") return;
+      assert.match(d.followUp, /not published yet, so publication of your work is withheld/);
+      assert.doesNotMatch(d.followUp, /signal_done/);
+      assert.match(d.followUp, /attempt 1 of 2/);
+      assert.ok(d.followUp.includes("cfg.env") || d.followUp.length > 0);
+      assert.equal(s.attempts, 1);
+      assert.equal(s.midRunTrigger, undefined);
+      untouched(s);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      assert.equal(s.attempts, 1);
+      assert.ok(sha);
+    });
+    assert.deepEqual(out.violations, []);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(statusTexts(out.claimRunId).some((t) => /^mid-run checkpoint secret scan flagged 1 finding\(s\) .*attempt 1 of 2\)$/.test(t)), "the mid-run status feed line");
+  });
+
+  it("never publishes a flagged commit: before remediation, after a deletion-only commit, and a rewrite publishes again", async () => {
+    const out = await rig(4258_002, async (r) => {
+      const sha = await flagAndTick(r);
+      assert.equal(r.tips.length, 0, "the tick held publication");
+      // deletion-only follow-up commit before the boundary: the retained flagged commit still ships
+      commitIn(r.ctx.worktreePath, "cfg.env", "TOKEN=\n");
+      const first = await r.ctx.midRunSecretRemediation!();
+      assert.equal(first.action, "remediate");
+      assert.equal(await r.tick(), "secret_remediation_pending");
+      assert.equal(r.tips.length, 0, "a deletion-only commit does not clear the flagged commit");
+      rewriteOut(r.ctx.worktreePath, sha, "cfg.env");
+      assert.equal(ancestryOf(r.ctx.worktreePath, sha, "HEAD"), "divergent");
+      assert.equal(await r.tick(), "published", "positive control: the rewritten branch publishes");
+      assert.ok(r.tips.length >= 1);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+    });
+    assert.deepEqual(out.violations, []);
+  });
+
+  it("a deletion-only follow-up still remediates through the retained flagged commit when a fresh scan is clean", async () => {
+    await rig(4258_003, async (r) => {
+      const sha = await flagAndTick(r);
+      commitIn(r.ctx.worktreePath, "cfg.env", "TOKEN=\n");
+      const d = await r.withStub(
+        { secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }) },
+        () => r.ctx.midRunSecretRemediation!(),
+      );
+      assert.equal(d.action, "remediate");
+      assert.equal(r.state().attempts, 1);
+      assert.ok(r.state().flaggedCommits!.includes(sha));
+    });
+  });
+
+  it("finalize refuses to push while the flagged commit is reachable (push_secret_blocked)", async () => {
+    const iid = 4258_004;
+    const out = await rig(iid, async (r) => {
+      await flagAndTick(r);
+      assert.equal((await r.ctx.midRunSecretRemediation!()).action, "remediate");
+      // the lead does not rewrite: the turn ends with the flagged commit reachable
+    });
+    assertPushSecretBlocked(out.claimRunId);
+    assert.equal(refOr(fx.originPath, `refs/heads/agent/issue-${iid}`), null, "nothing was pushed");
+    assert.deepEqual(out.tips, []);
+    assert.deepEqual(out.violations, []);
+  });
+
+  describe("defers (proceed, trigger kept, attempts unchanged, nothing blocked or known)", () => {
+    const stubs: Array<{ name: string; run: (r: Rig, sha: string) => Promise<{ action: string }> }> = [
+      {
+        name: "an untrusted scan",
+        run: (r) => r.withStub({ secretScanCheckpointRange: async () => ({ trusted: false, findings: [], reason: "stubbed" }) },
+          () => r.ctx.midRunSecretRemediation!()),
+      },
+      {
+        name: "a stale tip",
+        run: (r) => r.withStub({ trackingTip: async () => "0".repeat(40) }, () => r.ctx.midRunSecretRemediation!()),
+      },
+      {
+        name: "a throw",
+        run: (r) => r.withStub({ branchTip: async () => { throw new Error("boom"); } }, () => r.ctx.midRunSecretRemediation!()),
+      },
+      {
+        name: "restriction uncertainty",
+        run: (r) => {
+          r.flight().remediationRestrictions = {
+            roots: [],
+            pending: { runId: "x", requiredOIDs: [], requireDenial: false, bindingUncertain: true },
+          };
+          return r.ctx.midRunSecretRemediation!();
+        },
+      },
+      {
+        name: "a required denial",
+        run: (r) => {
+          r.flight().remediationRestrictions = {
+            roots: [],
+            pending: { runId: "x", requiredOIDs: [], requireDenial: true, bindingUncertain: false },
+          };
+          return r.ctx.midRunSecretRemediation!();
+        },
+      },
+      {
+        name: "unknown ancestry of a retained flagged commit on a clean scan",
+        run: (r, sha) => r.withStub({
+          secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }),
+          ancestry: async (_b: string, a: string) => (a === sha ? "unknown" : "divergent"),
+        }, () => r.ctx.midRunSecretRemediation!()),
+      },
+      {
+        name: "unknown floor ancestry",
+        run: (r, sha) => r.withStub({
+          ancestry: async (_b: string, a: string, t: string) => (a === sha && t !== r.state().midRunTrigger!.tip ? "unknown" : "ancestor"),
+        }, () => r.ctx.midRunSecretRemediation!()),
+      },
+    ];
+    for (const [i, c] of stubs.entries()) {
+      it(c.name, async () => {
+        await rig(4258_010 + i, async (r) => {
+          // a clean published checkpoint first, so a published floor exists for the floor-unknown case
+          commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+          assert.equal(await r.tick(), "published");
+          const sha = await flagAndTick(r);
+          const before = r.state().midRunTrigger;
+          const d = await c.run(r, sha);
+          assert.equal(d.action, "proceed");
+          const s = r.state();
+          assert.deepEqual(s.midRunTrigger, before, "the trigger is kept");
+          assert.equal(s.attempts, 0);
+          untouched(s);
+        });
+      });
+    }
+  });
+
+  it("an ancestry at or below a floor arms no trigger and leaves the done gate's decision unchanged", async () => {
+    await rig(4258_020, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const sha = commitIn(r.ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+      const real = r.g.ancestry.bind(r.g);
+      assert.equal(await r.withStub(
+        { ancestry: async (b: string, a: string, t: string) => (a === sha ? "ancestor" : real(b, a, t)) },
+        () => r.tick(),
+      ), "secret_found");
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.midRunSeq, undefined);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const gate = await r.withStub(
+        { ancestry: async (b: string, a: string, t: string) => (a === sha ? "ancestor" : real(b, a, t)) },
+        () => r.ctx.secretRemediationGate!(),
+      );
+      assert.deepEqual(gate, { action: "proceed" }, "at a floor the done gate asks for no rewrite");
+      assert.equal(s.attempts, 0);
+      assert.ok(s.known && s.known.length > 0);
+    });
+  });
+
+  it("a floor change between observation and boundary: the fresh scan decides and no turn is given", async () => {
+    await rig(4258_021, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const sha = await flagAndTick(r);
+      assert.ok(r.state().midRunTrigger);
+      const real = r.g.ancestry.bind(r.g);
+      const d = await r.withStub(
+        { ancestry: async (b: string, a: string, t: string) => (a === sha && t !== r.state().midRunTrigger!.tip ? "ancestor" : real(b, a, t)) },
+        () => r.ctx.midRunSecretRemediation!(),
+      );
+      assert.deepEqual(d, { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.attempts, 0);
+      untouched(s);
+    });
+  });
+
+  it("a tip change that drops the commit: the fresh scan decides and no turn is given", async () => {
+    await rig(4258_022, async (r) => {
+      const sha = await flagAndTick(r);
+      rewriteOut(r.ctx.worktreePath, sha, "cfg.env");
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.attempts, 0);
+      untouched(s);
+    });
+  });
+
+  it("shares the attempt cap with the done gate: a mid-run turn plus gate turns never exceed 2", async () => {
+    await rig(4258_030, async (r) => {
+      await flagAndTick(r);
+      assert.equal((await r.ctx.midRunSecretRemediation!()).action, "remediate");
+      assert.equal((await r.ctx.secretRemediationGate!()).action, "remediate");
+      assert.equal(r.state().attempts, 2);
+      assert.equal((await r.ctx.secretRemediationGate!()).action, "fail");
+      assert.equal(r.state().attempts, 2);
+    });
+  });
+
+  it("an exhausted cap at the boundary: proceed, trigger cleared, blocked unset, restrictions kept", async () => {
+    await rig(4258_031, async (r) => {
+      await flagAndTick(r);
+      const before = JSON.stringify(r.flight().remediationRestrictions ?? null);
+      assert.ok(r.state().midRunTrigger);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.attempts, 2);
+      untouched(s);
+      assert.equal(JSON.stringify(r.flight().remediationRestrictions ?? null), before);
+    }, { seed: (f) => { f.secretRemediation ??= { attempts: 2 }; f.secretRemediation.attempts = 2; } });
+  });
+
+  it("the done gate clears a pending trigger, so no duplicate turn follows", async () => {
+    await rig(4258_032, async (r) => {
+      await flagAndTick(r);
+      assert.ok(r.state().midRunTrigger);
+      assert.equal((await r.ctx.secretRemediationGate!()).action, "remediate");
+      assert.equal(r.state().midRunTrigger, undefined);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      assert.equal(r.state().attempts, 1);
+    });
+  });
+
+  it("the resume preflight (unpublishedOnly gate) clears a pending trigger", async () => {
+    await rig(4258_033, async (r) => {
+      await flagAndTick(r);
+      assert.ok(r.state().midRunTrigger);
+      await r.ctx.secretRemediationGate!({ unpublishedOnly: true });
+      assert.equal(r.state().midRunTrigger, undefined);
+    });
+  });
+
+  it("a newer observation replaces an older pending trigger", async () => {
+    await rig(4258_034, async (r) => {
+      const a = await flagAndTick(r, "a.env");
+      const first = r.state().midRunTrigger!;
+      rewriteOut(r.ctx.worktreePath, a, "a.env");
+      await flagAndTick(r, "b.env");
+      const second = r.state().midRunTrigger!;
+      assert.equal(second.observation, first.observation + 1);
+      assert.notEqual(second.tip, first.tip);
+    });
+  });
+});
