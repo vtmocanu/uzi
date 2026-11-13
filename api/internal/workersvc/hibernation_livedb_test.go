@@ -856,3 +856,224 @@ func TestHibernationFreeTextIsSanitizedLiveDB(t *testing.T) {
 		t.Fatalf("refused reason not sanitized: %q", w.HibernationReason.String)
 	}
 }
+
+// PRD #4205 quick wake: a wake that arrives while the worker is preparing, with or without
+// scaling_down recorded. These pin the server contract the controller fix relies on.
+
+// quickWakeWorker seeds a worker, hibernates it (preparing) and wakes it by the given kind
+// ("admin" -> WakeWorker, "demand" -> DemandWake for a queued run the worker could claim).
+func (f *hibFx) quickWake(id uuid.UUID, kind string) {
+	f.t.Helper()
+	switch kind {
+	case "admin":
+		if _, err := f.svc.WakeWorker(f.env.ctx, &f.actor, id, "quick wake"); err != nil {
+			f.t.Fatalf("WakeWorker: %v", err)
+		}
+	case "demand":
+		run := f.queuedRun()
+		if woke, err := f.demand(f.svc, run, id); err != nil || !woke {
+			f.t.Fatalf("DemandWake = %v, %v; want true, nil", woke, err)
+		}
+	default:
+		f.t.Fatalf("unknown wake kind %q", kind)
+	}
+	f.want(id, "waking")
+}
+
+// wakeColumns is the settlement-relevant slice of a worker row.
+type wakeColumns struct {
+	State, WakeError, ScalingDownAt, WakeRequestedAt    string
+	Op, RegisteredPod, ReadyOp, ReadyPod, RegOp, RegPod string
+}
+
+func (f *hibFx) wakeColumns(id uuid.UUID) wakeColumns {
+	f.t.Helper()
+	w := f.row(id)
+	return wakeColumns{
+		State:           w.HibernationState,
+		WakeError:       fmt.Sprintf("%v/%q", w.WakeError.Valid, w.WakeError.String),
+		ScalingDownAt:   fmt.Sprint(w.HibernationScalingDownAt),
+		WakeRequestedAt: fmt.Sprint(w.WakeRequestedAt),
+		Op:              fmt.Sprint(w.HibernationOpID),
+		RegisteredPod:   fmt.Sprint(w.RegisteredPodUid),
+		ReadyOp:         fmt.Sprint(w.WakeReadyOpID),
+		ReadyPod:        fmt.Sprint(w.WakeReadyPodUid),
+		RegOp:           fmt.Sprint(w.WakeRegisterOpID),
+		RegPod:          fmt.Sprint(w.WakeRegisterPodUid),
+	}
+}
+
+// settleOnReplacement drives register(P2)+ready(P2) in the given order and expects none.
+func (f *hibFx) settleOnReplacement(id uuid.UUID, registerFirst bool) uuid.UUID {
+	f.t.Helper()
+	next := uuid.New()
+	f.env.exec(`UPDATE workers SET registered_pod_uid = $2 WHERE id = $1`, id, next)
+	f.heartbeatNow(id)
+	if registerFirst {
+		f.register(id, &next)
+		f.want(id, "waking")
+		f.mustApply(id, TransitionReady, next)
+	} else {
+		f.mustApply(id, TransitionReady, next)
+		f.want(id, "waking")
+		f.register(id, &next)
+	}
+	f.want(id, "none")
+	return next
+}
+
+func TestHibernationQuickWakeSettlesOnlyOnAFreshPodLiveDB(t *testing.T) {
+	for _, kind := range []string{"admin", "demand"} {
+		for _, oldPodRegisterFirst := range []bool{true, false} {
+			for _, newPodRegisterFirst := range []bool{true, false} {
+				name := fmt.Sprintf("%s wake, old pod register-first=%v, new pod register-first=%v", kind, oldPodRegisterFirst, newPodRegisterFirst)
+				t.Run(name, func(t *testing.T) {
+					f := newHibFx(t)
+					id, pod := f.worker()
+					f.register(id, &pod)
+					f.hibernate(id)
+					f.mustApply(id, TransitionScalingDown, pod)
+					f.want(id, "preparing")
+					f.quickWake(id, kind)
+					f.heartbeatNow(id)
+
+					// The old pod survived: it registers and the controller reports it ready.
+					if oldPodRegisterFirst {
+						f.register(id, &pod)
+						f.mustApply(id, TransitionReady, pod)
+					} else {
+						f.mustApply(id, TransitionReady, pod)
+						f.register(id, &pod)
+					}
+					f.want(id, "waking")
+					if n, err := f.svc.HibernationSettlePass(f.env.ctx); err != nil {
+						t.Fatalf("pass: %v", err)
+					} else if n != 0 {
+						t.Logf("pass changed %d rows", n)
+					}
+					f.want(id, "waking")
+
+					// Past the 15m wake timeout the error is recorded, the state is not.
+					f.env.exec(`UPDATE workers SET wake_requested_at = now() - interval '16 minutes' WHERE id = $1`, id)
+					if _, err := f.svc.HibernationSettlePass(f.env.ctx); err != nil {
+						t.Fatalf("timeout pass: %v", err)
+					}
+					row := f.row(id)
+					if row.HibernationState != "waking" || row.WakeError.String != "wake not confirmed within 15m" {
+						t.Fatalf("after timeout: state=%q wake_error=%q", row.HibernationState, row.WakeError.String)
+					}
+
+					// A second wake leaves the op (and the recorded error) unchanged.
+					before := f.wakeColumns(id)
+					if _, err := f.svc.WakeWorker(f.env.ctx, &f.actor, id, "again"); err != nil {
+						t.Fatalf("second wake: %v", err)
+					}
+					if after := f.wakeColumns(id); after != before {
+						t.Fatalf("second wake changed the row:\nbefore %+v\nafter  %+v", before, after)
+					}
+
+					// Only a fresh pod settles.
+					f.settleOnReplacement(id, newPodRegisterFirst)
+					if f.row(id).WakeError.Valid {
+						t.Fatalf("wake_error survived settlement: %q", f.row(id).WakeError.String)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestHibernationQuickWakeLostScalingDownLiveDB(t *testing.T) {
+	for _, registerFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("no scaling_down recorded, replacement pod settles, register-first=%v", registerFirst), func(t *testing.T) {
+			f := newHibFx(t)
+			id, pod := f.worker()
+			f.register(id, &pod)
+			f.hibernate(id)
+			f.quickWake(id, "admin")
+			if f.row(id).HibernationScalingDownAt.Valid {
+				t.Fatal("scaling_down_at unexpectedly recorded")
+			}
+			f.settleOnReplacement(id, registerFirst)
+		})
+	}
+
+	t.Run("a scaling_down carrying the old op after the wake conflicts and changes nothing", func(t *testing.T) {
+		f := newHibFx(t)
+		id, pod := f.worker()
+		f.register(id, &pod)
+		f.hibernate(id)
+		stale := f.tr(id, TransitionScalingDown, pod) // old op
+		f.quickWake(id, "admin")
+		if f.op(id) == stale.OpID {
+			t.Fatal("wake did not mint a fresh op")
+		}
+		before := f.wakeColumns(id)
+		if _, err := f.apply(id, stale); !errors.Is(err, ErrHibernationConflict) {
+			t.Fatalf("old-op scaling_down: %v, want ErrHibernationConflict", err)
+		}
+		if after := f.wakeColumns(id); after != before {
+			t.Fatalf("a conflicting scaling_down changed the row:\nbefore %+v\nafter  %+v", before, after)
+		}
+		if f.row(id).HibernationScalingDownAt.Valid {
+			t.Fatal("old-op scaling_down recorded scaling_down_at")
+		}
+	})
+}
+
+func TestHibernationQuickWakeReplayedAcksLiveDB(t *testing.T) {
+	t.Run("scaling_down applied twice is a no-op, then an old-op replay conflicts after the wake", func(t *testing.T) {
+		f := newHibFx(t)
+		id, pod := f.worker()
+		f.register(id, &pod)
+		f.hibernate(id)
+		first := f.tr(id, TransitionScalingDown, pod)
+		if _, err := f.apply(id, first); err != nil {
+			t.Fatalf("first scaling_down: %v", err)
+		}
+		recorded := f.wakeColumns(id)
+		if recorded.ScalingDownAt == fmt.Sprint(pgtype.Timestamptz{}) {
+			t.Fatal("scaling_down_at not recorded")
+		}
+		if _, err := f.apply(id, first); err != nil {
+			t.Fatalf("replayed scaling_down: %v", err)
+		}
+		if after := f.wakeColumns(id); after != recorded {
+			t.Fatalf("replay changed the row:\nbefore %+v\nafter  %+v", recorded, after)
+		}
+
+		f.quickWake(id, "admin")
+		before := f.wakeColumns(id)
+		if _, err := f.apply(id, first); !errors.Is(err, ErrHibernationConflict) {
+			t.Fatalf("old-op scaling_down replay after wake: %v, want ErrHibernationConflict", err)
+		}
+		if after := f.wakeColumns(id); after != before {
+			t.Fatalf("conflicting replay changed the row:\nbefore %+v\nafter  %+v", before, after)
+		}
+	})
+
+	t.Run("ready applied twice then register settles; a ready replay after settlement is accepted", func(t *testing.T) {
+		f := newHibFx(t)
+		id, pod := f.worker()
+		f.register(id, &pod)
+		f.hibernate(id)
+		f.mustApply(id, TransitionScalingDown, pod)
+		f.quickWake(id, "admin")
+		next := uuid.New()
+		f.env.exec(`UPDATE workers SET registered_pod_uid = $2 WHERE id = $1`, id, next)
+		f.heartbeatNow(id)
+		ready := f.tr(id, TransitionReady, next)
+		for i := 0; i < 2; i++ {
+			if _, err := f.apply(id, ready); err != nil {
+				t.Fatalf("ready #%d: %v", i+1, err)
+			}
+			f.want(id, "waking")
+		}
+		f.register(id, &next)
+		f.want(id, "none")
+		if _, err := f.apply(id, ready); err != nil {
+			t.Fatalf("ready replay after settlement: %v", err)
+		}
+		f.want(id, "none")
+	})
+}
