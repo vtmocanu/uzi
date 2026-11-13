@@ -9,7 +9,8 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { lstatSync, constants as fsConstants, createReadStream, createWriteStream, type Stats } from "node:fs";
+import { lstatSync, constants as fsConstants, createReadStream, createWriteStream, type BigIntStats, type Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import os from "node:os";
 import { isUtf8 } from "node:buffer";
 import path from "node:path";
@@ -3104,6 +3105,161 @@ const RESIDUE_ENUMERATION_BUDGET = 4096;
 const RETENTION_WARNING_KEYS = 128;
 const RETIRE_SCRATCH_ENUMERATION_BUDGET = 4096;
 const RETIRE_SCRATCH_REPORTED_PATHS = 10;
+const RETIRE_SCRATCH_OUTCOME_BUDGET_MS = 30_000;
+const RETIRE_SCRATCH_WALK_MAX_ENTRIES = 200_000;
+/** Each directory level holds one descriptor open; deeper trees are reported partial, not followed. */
+const RETIRE_SCRATCH_WALK_MAX_DEPTH = 64;
+
+/** Reads `UZI_RETIRE_SCRATCH_OUTCOMES`: whether startup adds the read-only per-parent observation
+ *  records after the `runner retire scratch retained` warning. On by default; `0` restores the
+ *  warning-only behavior. Anything else refuses startup. */
+export function readRetireScratchOutcomesActivation(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.UZI_RETIRE_SCRATCH_OUTCOMES;
+  if (raw === undefined || raw === "" || raw === "1") return true;
+  if (raw === "0") return false;
+  throw new Error("UZI_RETIRE_SCRATCH_OUTCOMES must be unset, empty, 0 or 1");
+}
+
+type RetireScratchWalkReason = "entry_cap" | "time_cap" | "unreadable" | "cross_device" | "changed" | "vanished";
+type RetireScratchBytesState = "measured" | "partial" | "unknown";
+type RetireScratchSources = { state: "read"; paths: string[] } | { state: "unknown" };
+
+interface RetireScratchWalkCtx {
+  now: () => number;
+  deadline: number;
+  signal?: AbortSignal;
+  /** Directory entries listed so far, across every parent. */
+  entries: number;
+  maxEntries: number;
+  /** dev:ino of every non-directory inode with nlink > 1 already counted. */
+  seen: Set<string>;
+  beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+}
+
+interface RetireScratchWalkAcc {
+  bytes: bigint;
+  /** Something (at least one lstat or fstat) was measured. */
+  measured: boolean;
+  reasons: Set<RetireScratchWalkReason>;
+}
+
+interface RetireScratchParentResult {
+  name: string;
+  recent: boolean;
+  kind: "dir" | "symlink" | "other";
+  bytes: bigint;
+  bytesState: RetireScratchBytesState;
+  reasons: RetireScratchWalkReason[];
+  empty: boolean;
+}
+
+function retireWalkErrorReason(err: unknown): RetireScratchWalkReason {
+  switch ((err as NodeJS.ErrnoException | undefined)?.code) {
+    case "ENOENT": return "vanished";
+    case "ELOOP": case "ENOTDIR": return "changed";
+    default: return "unreadable";
+  }
+}
+
+function retireWalkSpent(ctx: RetireScratchWalkCtx): "time_cap" | undefined {
+  return ctx.signal?.aborted || ctx.now() >= ctx.deadline ? "time_cap" : undefined;
+}
+
+function retireWalkAddBlocks(ctx: RetireScratchWalkCtx, acc: RetireScratchWalkAcc, st: BigIntStats, dedupe: boolean): void {
+  if (dedupe && st.nlink > 1n) {
+    const key = `${st.dev}:${st.ino}`;
+    if (ctx.seen.has(key)) return;
+    ctx.seen.add(key);
+  }
+  acc.bytes += st.blocks * 512n;
+  acc.measured = true;
+}
+
+const RETIRE_WALK_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
+
+/** Measure one directory that lstat reported as a directory, descriptor-relative and read-only. Returns
+ *  the number of names listed when the listing completed, undefined otherwise. Every handle is closed
+ *  in finally; descent goes through `/proc/self/fd/<fd>`, so a later swap of any ancestor name cannot
+ *  redirect it. */
+async function retireWalkDirectory(ctx: RetireScratchWalkCtx, acc: RetireScratchWalkAcc, openPath: string, display: string,
+  lst: BigIntStats, dev: bigint, depth: number): Promise<number | undefined> {
+  retireWalkAddBlocks(ctx, acc, lst, false);
+  if (depth > RETIRE_SCRATCH_WALK_MAX_DEPTH) { acc.reasons.add("entry_cap"); return undefined; }
+  let handle: FileHandle | undefined;
+  try {
+    handle = await fs.open(openPath, RETIRE_WALK_OPEN_FLAGS);
+    const before = await handle.stat({ bigint: true });
+    if (before.dev !== lst.dev || before.ino !== lst.ino) { acc.reasons.add("changed"); return undefined; }
+    if (before.dev !== dev) { acc.reasons.add("cross_device"); return undefined; }
+    const base = `/proc/self/fd/${handle.fd}`;
+    const names: string[] = [];
+    let complete = true;
+    const list = await fs.opendir(base);
+    try {
+      for (;;) {
+        const spent = retireWalkSpent(ctx);
+        if (spent) { acc.reasons.add(spent); complete = false; break; }
+        const entry = await list.read();
+        if (!entry) break;
+        if (ctx.entries >= ctx.maxEntries) { acc.reasons.add("entry_cap"); complete = false; break; }
+        ctx.entries++;
+        names.push(entry.name);
+      }
+    } finally {
+      await list.close().catch(() => undefined);
+    }
+    for (const name of names) {
+      const spent = retireWalkSpent(ctx);
+      if (spent) { acc.reasons.add(spent); complete = false; break; }
+      await ctx.beforeEntry?.(display, name);
+      const child = `${base}/${name}`;
+      let cst: BigIntStats;
+      try { cst = await fs.lstat(child, { bigint: true }); }
+      catch (err) { acc.reasons.add(retireWalkErrorReason(err)); continue; }
+      if (cst.isDirectory()) await retireWalkDirectory(ctx, acc, child, path.join(display, name), cst, dev, depth + 1);
+      else retireWalkAddBlocks(ctx, acc, cst, true);
+    }
+    const after = await handle.stat({ bigint: true });
+    if (after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs || after.nlink !== before.nlink)
+      acc.reasons.add("changed");
+    return complete ? names.length : undefined;
+  } catch (err) {
+    acc.reasons.add(retireWalkErrorReason(err));
+    return undefined;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function retireWalkParent(ctx: RetireScratchWalkCtx, rootFd: number, rootDev: bigint, root: string,
+  parent: { name: string; recent: boolean; kind: "dir" | "symlink" | "other" }): Promise<RetireScratchParentResult> {
+  const acc: RetireScratchWalkAcc = { bytes: 0n, measured: false, reasons: new Set() };
+  let kind = parent.kind;
+  let empty = false;
+  const spent = retireWalkSpent(ctx);
+  if (spent) acc.reasons.add(spent);
+  else {
+    try {
+      await ctx.beforeEntry?.(root, parent.name);
+      const openPath = `/proc/self/fd/${rootFd}/${parent.name}`;
+      const lst = await fs.lstat(openPath, { bigint: true });
+      if (lst.isSymbolicLink()) { kind = "symlink"; retireWalkAddBlocks(ctx, acc, lst, false); }
+      else if (!lst.isDirectory()) { kind = "other"; retireWalkAddBlocks(ctx, acc, lst, true); }
+      else {
+        kind = "dir";
+        const listed = await retireWalkDirectory(ctx, acc, openPath, path.join(root, parent.name), lst, rootDev, 0);
+        empty = listed === 0 && acc.reasons.size === 0;
+      }
+    } catch (err) {
+      acc.reasons.add(retireWalkErrorReason(err));
+    }
+  }
+  const reasons = [...acc.reasons].sort();
+  return {
+    name: parent.name, recent: parent.recent, kind, bytes: acc.bytes, reasons, empty,
+    bytesState: reasons.length === 0 ? "measured" : acc.measured ? "partial" : "unknown",
+  };
+}
 /** issue #3153 — `<dataDir>/runner` (and the TMPDIR under it) now lives on the persistent data
  *  volume, so bytes that cannot be deleted accumulate across pod replacements instead of vanishing
  *  with an emptyDir. This per-process counter counts FAILED REMOVAL ATTEMPTS (not distinct paths:
@@ -19060,9 +19216,49 @@ export class GitCache {
    *      are only probed for emptiness, never stat'ed or followed.
    *  Retained parents, parents skipped as recent, and an enumeration cut short by
    *  RETIRE_SCRATCH_ENUMERATION_BUDGET (charged on every entry read) are reported by ONE counted
-   *  warning `runner retire scratch retained` (bounded path list). Never recursive; never throws. */
-  async inspectRetireScratchAtStartup(processStartMs: number): Promise<{ retained: number }> {
+   *  warning `runner retire scratch retained` (bounded path list). Never throws.
+   *
+   *  issue #4143 — with `opts.outcomes` (the default in main.ts; `UZI_RETIRE_SCRATCH_OUTCOMES=0`
+   *  turns it off and leaves exactly the warning above, with no journal read and no walk), the
+   *  warning is followed by OBSERVATION records only: at most RETIRE_SCRATCH_REPORTED_PATHS
+   *  `runner retire scratch outcome` rows (every one `kept`) and one `runner retire scratch total`
+   *  over all parents. They never remove, change the owner of or reclaim anything.
+   *    - No ordinary durable disposition binding proves this moved footprint: rollback repair can
+   *      persist a protected moved-clone pointer, but the rename precedes the journal clear and the
+   *      retired-ledger write, so a parent can exist with nothing naming it. A retired ledger,
+   *      emptiness, age or name grants nothing. The legacy stderr-proof repair (#4141, landed via
+   *      #4152) does not certify old remnants retroactively.
+   *    - Attribution: one typed, read-only pass over every bare's config (`resolveBranchJournalUnderLock`
+   *      per recovery or restore branch, same lock, bounds and recovery operation as discovery) collects
+   *      only the `clonePath`s the journals name. A parent equal to, or an ancestor of, such a path is
+   *      `protected_by_retained_source`; every other parent is `no_disposition_evidence`. Any cap, abort,
+   *      deadline, lock or bare failure, or an undecodable value, makes the whole read `unknown`
+   *      (no further bares) and then no parent is claimed as named or not named.
+   *    - Walk: descriptor-relative and read-only as the worker uid. The runner root and each directory
+   *      are opened O_NOFOLLOW|O_DIRECTORY and reached through `/proc/self/fd/<fd>`; every entry is
+   *      classified by lstat, never by dirent type; only a directory whose fstat matches its lstat and
+   *      the parent's device is descended. Anything else counts its own allocated blocks and is never
+   *      opened. A directory whose mtime, ctime or nlink moves while it is walked is `changed`.
+   *      Bytes are allocated blocks * 512, a hard-linked inode once. All handles close in finally.
+   *    - Envelope: ONE absolute deadline (now + 30 s) for the whole invocation, never reset per bare,
+   *      branch or parent, plus a global cap of 200000 listed entries. The operation is awaited to
+   *      settlement (queued lock waits are cancelled; child processes and handles settle) before
+   *      startup continues, so the bound is the 30 s budget plus child settlement and handle closes.
+   *      There is no hard real-time bound for an uninterruptible syscall such as a stalled mount. */
+  async inspectRetireScratchAtStartup(processStartMs: number, opts: {
+    outcomes?: boolean;
+    signal?: AbortSignal;
+    /** Test hooks, never passed by main.ts. */
+    now?: () => number;
+    limits?: EpochRetainedLimits;
+    walkLimits?: { maxEntries?: number };
+    readRetainedSources?: () => Promise<RetireScratchSources>;
+    beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+  } = {}): Promise<{ retained: number }> {
     const root = path.resolve(this.runnerRoot);
+    const now = opts.now ?? Date.now;
+    const deadline = opts.outcomes ? now() + RETIRE_SCRATCH_OUTCOME_BUDGET_MS : 0;
+    const observed: Array<{ name: string; recent: boolean; kind: "dir" | "symlink" | "other" }> = [];
     const retained: string[] = [];
     let empty = 0;
     let skippedRecent = 0;
@@ -19088,8 +19284,10 @@ export class GitCache {
         const p = path.join(root, name);
         try {
           const st = await fs.lstat(p);
-          if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) { skippedRecent++; continue; }
+          const kind = st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : "other";
+          if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) { skippedRecent++; observed.push({ name, recent: true, kind }); continue; }
           retained.push(p);
+          observed.push({ name, recent: false, kind });
           if (st.isSymbolicLink() || !st.isDirectory()) continue;
           let isEmpty = true;
           const pd = await fs.opendir(p);
@@ -19101,7 +19299,7 @@ export class GitCache {
           if (isEmpty) empty++;
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
-          if (!retained.includes(p)) retained.push(p);
+          if (!retained.includes(p)) { retained.push(p); observed.push({ name, recent: false, kind: "other" }); }
         }
       }
     } catch (err) {
@@ -19122,7 +19320,146 @@ export class GitCache {
         paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(path.relative(root, p), 157)),
       });
     }
+    if (opts.outcomes && observed.length > 0) {
+      try { await this.emitRetireScratchOutcomes(root, observed.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)), incomplete, deadline, opts); }
+      catch (err) {
+        this.log.warn("runner retire scratch outcomes failed", { error: sanitizeForLog(gitErrorMessage(err), 157) });
+      }
+    }
     return { retained: retained.length };
+  }
+
+  /** issue #4143 — the typed, read-only journal read for {@link inspectRetireScratchAtStartup}. One
+   *  absolute `deadline`, awaited to settlement; any failure of any kind is `unknown`. */
+  private async readRetireScratchSources(signal: AbortSignal, deadline: number, limitsOverride: EpochRetainedLimits | undefined): Promise<RetireScratchSources> {
+    try {
+      const limits = this.epochLimits(limitsOverride);
+      const paths = new Set<string>();
+      let configBytes = 0;
+      let records = 0;
+      await this.epochRetained.run(limits, () => this.withRecoveryOperation(signal, deadline, async (combined) => {
+        for (const bare of await this.retainedBares(undefined, { strict: true })) {
+          this.checkRecoveryInterruption();
+          await this.withLock(bare, async () => {
+            const entries = await this.configEntries(bare);
+            // Charge before any decode: raw bytes, then records.
+            for (const item of entries) configBytes += Buffer.byteLength(item) + 1;
+            if (configBytes > limits.maxMetadataBytes) throw new Error("retire scratch metadata byte limit");
+            records += entries.length;
+            const branches = new Set<string>();
+            for (const item of entries) {
+              const nl = item.indexOf("\n");
+              const key = nl < 0 ? item : item.slice(0, nl);
+              const recovery = /^uzi-recovery\.(.+)\.clone$/.exec(key);
+              // A valueless recovery key is not a cleared value: undecodable evidence.
+              if (recovery && nl < 0) throw new Error("valueless recovery journal key");
+              const branch = recovery?.[1] ?? restoreKeyBranch(key);
+              if (branch !== undefined) branches.add(branch);
+            }
+            records += branches.size;
+            if (records > limits.maxMetadataRecords) throw new Error("retire scratch metadata record limit");
+            const closure = this.recoveryOperations.getStore()?.closureBudget;
+            const collect = (journal: RecoveryJournalEntry | undefined, raw: string): void => {
+              if (closure) {
+                closure.delivered += Buffer.byteLength(raw);
+                if (closure.delivered > closure.limit) throw new Error("retire scratch decoded journal limit");
+              }
+              for (const p of [journal?.clonePath, ...(journal?.retainedSources ?? []).map((s) => s.clonePath)]) {
+                if (p === undefined) continue;
+                paths.add(p);
+                if (paths.size > limits.maxSeenPaths) throw new Error("retire scratch path limit");
+              }
+            };
+            for (const branch of [...branches].sort()) {
+              const resolved = await this.resolveBranchJournalUnderLock(bare, branch, entries);
+              if (resolved.kind === "plain") collect(resolved.journal, resolved.raw);
+              else if (resolved.kind === "composite") {
+                collect(resolved.predecessor.journal, resolved.predecessor.raw);
+                if (resolved.successor.kind === "entry") collect(resolved.successor.journal, resolved.successor.raw);
+                else {
+                  collect(undefined, resolved.successor.raw);
+                  paths.add(resolved.successor.successor.clonePath);
+                  if (paths.size > limits.maxSeenPaths) throw new Error("retire scratch path limit");
+                }
+              }
+            }
+          }, combined);
+        }
+      }));
+      return { state: "read", paths: [...paths].sort() };
+    } catch {
+      return { state: "unknown" };
+    }
+  }
+
+  /** issue #4143 — the observation records. Every parent is `kept`; nothing here can change disk. */
+  private async emitRetireScratchOutcomes(root: string, parents: Array<{ name: string; recent: boolean; kind: "dir" | "symlink" | "other" }>,
+    incomplete: boolean, deadline: number, opts: {
+      outcomes?: boolean; signal?: AbortSignal; now?: () => number; limits?: EpochRetainedLimits; walkLimits?: { maxEntries?: number };
+      readRetainedSources?: () => Promise<RetireScratchSources>; beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+    }): Promise<void> {
+    const signal = opts.signal ?? new AbortController().signal;
+    const sources: RetireScratchSources = opts.readRetainedSources
+      ? await opts.readRetainedSources().catch((): RetireScratchSources => ({ state: "unknown" }))
+      : await this.readRetireScratchSources(signal, deadline, opts.limits);
+    const ctx: RetireScratchWalkCtx = {
+      now: opts.now ?? Date.now, deadline, signal, entries: 0,
+      maxEntries: opts.walkLimits?.maxEntries ?? RETIRE_SCRATCH_WALK_MAX_ENTRIES, seen: new Set(),
+      ...(opts.beforeEntry ? { beforeEntry: opts.beforeEntry } : {}),
+    };
+    const results: RetireScratchParentResult[] = [];
+    let rootHandle: FileHandle | undefined;
+    try {
+      let rootDev: bigint | undefined;
+      try {
+        rootHandle = await fs.open(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+        rootDev = (await rootHandle.stat({ bigint: true })).dev;
+      } catch { /* every parent is then reported unreadable below */ }
+      for (const parent of parents) {
+        if (rootHandle === undefined || rootDev === undefined) {
+          results.push({ name: parent.name, recent: parent.recent, kind: parent.kind, bytes: 0n, bytesState: "unknown", reasons: ["unreadable"], empty: false });
+          continue;
+        }
+        results.push(await retireWalkParent(ctx, rootHandle.fd, rootDev, root, parent));
+      }
+    } finally {
+      await rootHandle?.close().catch(() => undefined);
+    }
+    const named = (name: string): boolean => {
+      if (sources.state !== "read") return false;
+      const p = path.join(root, name);
+      return sources.paths.some((q) => [q, path.resolve(q)].some((c) => c === p || c.startsWith(`${p}/`)));
+    };
+    const row = (r: RetireScratchParentResult): {
+      retained_source: "named" | "not_named" | "unknown"; reason: "protected_by_retained_source" | "no_disposition_evidence";
+    } => {
+      if (sources.state !== "read") return { retained_source: "unknown", reason: "no_disposition_evidence" };
+      return named(r.name) ? { retained_source: "named", reason: "protected_by_retained_source" }
+        : { retained_source: "not_named", reason: "no_disposition_evidence" };
+    };
+    for (const r of results.slice(0, RETIRE_SCRATCH_REPORTED_PATHS)) {
+      this.log.info("runner retire scratch outcome", {
+        name: sanitizeForLog(r.name, 157), kind: r.kind, outcome: "kept", ...row(r),
+        empty: r.empty, recent: r.recent, bytes: Number(r.bytes), bytes_state: r.bytesState, partial_reasons: r.reasons,
+      });
+    }
+    const totalReasons = new Set<RetireScratchWalkReason>();
+    for (const r of results) for (const reason of r.reasons) totalReasons.add(reason);
+    const protectedCount = results.filter((r) => row(r).reason === "protected_by_retained_source").length;
+    const allMeasured = results.every((r) => r.bytesState === "measured");
+    this.log.info("runner retire scratch total", {
+      parents_enumerated: results.length,
+      outcomes_omitted: results.length - Math.min(results.length, RETIRE_SCRATCH_REPORTED_PATHS),
+      kept: results.length,
+      reclaimed: 0,
+      protected_by_retained_source: protectedCount,
+      no_disposition_evidence: results.length - protectedCount,
+      bytes: Number(results.reduce((n, r) => n + r.bytes, 0n)),
+      bytes_state: allMeasured && !incomplete ? "measured" : results.every((r) => r.bytesState === "unknown") ? "unknown" : "partial",
+      partial_reasons: [...totalReasons].sort(),
+      enumeration_incomplete: incomplete,
+      retained_source_read: sources.state,
+    });
   }
 
   /** issue #3153 — the ONE best-effort removal helper for scratch the worker created under the
