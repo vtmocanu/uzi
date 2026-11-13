@@ -1534,7 +1534,7 @@ func (m *Materializer) reserveRoll(ctx context.Context, e *rollEntry, r *rollMar
 		}
 		value = string(raw)
 	}
-	body, err := json.Marshal(map[string]any{"metadata": map[string]any{"uid": e.dep.UID, "resourceVersion": e.dep.ResourceVersion, "annotations": map[string]any{annotationRoll: value}}})
+	body, err := json.Marshal(map[string]any{"metadata": m.withOperatorMetadata(map[string]any{"uid": e.dep.UID, "resourceVersion": e.dep.ResourceVersion, "annotations": map[string]any{annotationRoll: value}})})
 	if err != nil {
 		return err
 	}

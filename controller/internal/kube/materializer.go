@@ -826,7 +826,7 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 			return fmt.Errorf("recycle reservation deployment unavailable")
 		}
 		if e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 0 {
-			body, err := json.Marshal(map[string]any{"metadata": map[string]any{"uid": e.dep.UID, "resourceVersion": e.dep.ResourceVersion}, "spec": map[string]any{"replicas": 0}})
+			body, err := json.Marshal(map[string]any{"metadata": m.withOperatorMetadata(map[string]any{"uid": e.dep.UID, "resourceVersion": e.dep.ResourceVersion}), "spec": map[string]any{"replicas": 0}})
 			if err != nil {
 				return err
 			}
@@ -1202,6 +1202,30 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	return nil
 }
 
+// withOperatorMetadata adds the operator's Deployment labels and annotations to a merge
+// patch's metadata, so every update the controller sends carries them: an admission
+// policy that also validates updates would otherwise refuse a reservation or scale-down
+// on a worker created before they were configured, and that worker could never roll. A
+// key the patch already sets (the roll marker) keeps its value.
+func (m *Materializer) withOperatorMetadata(meta map[string]any) map[string]any {
+	if len(m.cfg.DeploymentLabels) > 0 {
+		meta["labels"] = m.cfg.DeploymentLabels
+	}
+	if len(m.cfg.DeploymentAnnotations) > 0 {
+		ann, _ := meta["annotations"].(map[string]any)
+		if ann == nil {
+			ann = map[string]any{}
+		}
+		for k, v := range m.cfg.DeploymentAnnotations {
+			if _, set := ann[k]; !set {
+				ann[k] = v
+			}
+		}
+		meta["annotations"] = ann
+	}
+	return meta
+}
+
 // patchFor builds the merge patch that re-renders a drifted Deployment's pod
 // template. The selector is deliberately absent: it is immutable, and sending it
 // would be a rejected request at best.
@@ -1235,8 +1259,20 @@ func patchForWithAnnotations(dep *appsv1.Deployment, liveSelector map[string]str
 		return nil, err
 	}
 	meta := map[string]any{"uid": dep.UID, "resourceVersion": dep.ResourceVersion}
-	if len(annotations) > 0 {
-		meta["annotations"] = annotations
+	// The operator's Deployment metadata reaches an existing worker on its next drift
+	// roll. A merge patch adds and updates keys; one dropped from the values stays until
+	// the worker is reprovisioned. The caller's annotations (the hibernation op) are
+	// written in the same conditioned patch and win over a same-named operator key.
+	meta["labels"] = dep.Labels
+	merged := make(map[string]string, len(dep.Annotations)+len(annotations))
+	for k, v := range dep.Annotations {
+		merged[k] = v
+	}
+	for k, v := range annotations {
+		merged[k] = v
+	}
+	if len(merged) > 0 {
+		meta["annotations"] = merged
 	}
 	patch := map[string]any{
 		"metadata": meta,

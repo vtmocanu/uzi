@@ -1740,6 +1740,13 @@ tasks:
       # non-vacuous, see the script header.
       - ./scripts/assert-worker-node-selector-render.sh
 
+  render:workload-metadata-check:
+    desc: assert workloadLabels/workloadAnnotations reach every workload and the controller
+    cmds:
+      # Not in gate:repo (the lint job lacks helm); CI's helm-chart job runs it. Offline +
+      # non-vacuous, see the script header.
+      - ./scripts/assert-workload-metadata-render.sh
+
   render:ephemeral-docker-check:
     desc: assert effective Docker tier availability reaches the api Deployment
     cmds:
