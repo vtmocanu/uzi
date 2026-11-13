@@ -23,8 +23,8 @@
 # SQL in isolation (the store-level version is api/internal/store/recovery_exact_livedb_test.go
 # and api/internal/workersvc/claim_custody_livedb_test.go). It:
 #
-#   WEDGE   — seeds the owner with LIMIT open holds of its own, so admission-counted
-#             holds are at or above the limit independent of baseline settlement (an
+#   WEDGE   — seeds the owner with LIMIT open holds of its own, so admission units
+#             (admission_counted_holds, #4162) are at or above the limit independent of baseline settlement (an
 #             idle worker opens no new claim holds, so the baseline can only shrink as
 #             earlier phases' holds settle). It creates a code run, and shows it
 #             stays QUEUED with online + idle worker samples while
@@ -55,7 +55,7 @@
 #   same-worker two-generation release (M4) ....... api/internal/workersvc/custody_multihold_livedb_test.go
 #                                                    (TestSetStateCompletedSameWorkerMultiGenReleasesOnlyCurrentLiveDB)
 #   generation-exact reserve/release (M1/M4) ...... api/internal/recovery/reserve_release_generation_livedb_test.go
-#   default-limit (8) admission-counted holds block a claim (M1) api/internal/store/recovery_exact_livedb_test.go,
+#   default-limit (8) admission units block a claim (M1) api/internal/store/recovery_exact_livedb_test.go,
 #                                                    api/internal/workersvc/claim_custody_livedb_test.go,
 #                                                    api/internal/workersvc/claim_custody_limit_setting_livedb_test.go
 #                                                    (exact boundaries: blocked at the limit, admitted
@@ -166,9 +166,19 @@ pass "preconditions: worker sampled online + idle at entry, owner has $C0 baseli
 # abruptly-lost, capture-less sources sit 'open' awaiting an owner decision, and how
 # api/internal/store/recovery_exact_livedb_test.go seeds the same admission fixture.
 # live_worker_id/live_run_id stay NULL (no FK dependency), so ADR-2445 keeps every
-# seed admission-counted: no seed proves an exact healthy live current-generation claim.
+# seed a separate counted admission unit (null live ids never form a same-run group, #4162):
+# no seed proves an exact healthy live current-generation claim.
 # Each row gets a distinct generation. run_id is a plain column here: real owned run ids
 # are attached to the holds that get discarded, below.
+# Baseline grouped surplus (open - counted): since #4162 a baseline run's same-worker holds count
+# as one unit, so open_holds can exceed admission_counted_holds before anything is seeded. The
+# seeded holds are singletons (fresh gen_random_uuid ids), so they add equally to both; the
+# assertions below are relative to this surplus. The idle worker opens no new holds, so the
+# surplus can only shrink as baseline holds settle, never grow.
+BASE_LINE="$(custody_aggregate)" || fail "baseline custody aggregate unreadable"
+read -r BASE_COUNTED BASE_OPEN _ <<< "$BASE_LINE"
+BASE_SURPLUS=$((BASE_OPEN - BASE_COUNTED))
+[ "$BASE_SURPLUS" -ge 0 ] || fail "baseline open_holds=$BASE_OPEN < admission_counted_holds=$BASE_COUNTED"
 NEED=$LIMIT
 db_psql "INSERT INTO recovery_custody_holds
            (user_id, run_id, generation, state, original_worker_id, original_worker_identity)
@@ -184,7 +194,10 @@ SEEDED="$(db_psql "SELECT count(*) FROM recovery_custody_holds
 AGG_LINE="$(custody_aggregate)" || fail "custody aggregate unreadable"
 read -r AGG_COUNTED AGG_OPEN AGG_LIMIT <<< "$AGG_LINE"
 [ "$AGG_COUNTED" -ge "$LIMIT" ] || fail "aggregate.admission_counted_holds=$AGG_COUNTED < $LIMIT after seeding $LIMIT holds"
-[ "$AGG_OPEN" = "$AGG_COUNTED" ] || fail "aggregate.open_holds=$AGG_OPEN != admission_counted_holds=$AGG_COUNTED (every open hold should be admission-counted here)"
+# Every seeded hold is its own counted unit: open - counted may not exceed the baseline grouped surplus.
+AGG_SURPLUS=$((AGG_OPEN - AGG_COUNTED))
+{ [ "$AGG_SURPLUS" -ge 0 ] && [ "$AGG_SURPLUS" -le "$BASE_SURPLUS" ]; } \
+  || fail "aggregate.open_holds - admission_counted_holds=$AGG_SURPLUS outside 0..$BASE_SURPLUS (baseline grouped surplus; every seeded hold should be admission-counted; open=$AGG_OPEN counted=$AGG_COUNTED)"
 [ "$AGG_LIMIT" = "$LIMIT" ] || fail "aggregate.custody_hold_limit=$AGG_LIMIT != $LIMIT"
 pass "seeded $NEED open custody hold(s) over $C0 baseline hold(s); aggregate: admission_counted_holds=$AGG_COUNTED open_holds=$AGG_OPEN custody_hold_limit=$AGG_LIMIT"
 
@@ -224,7 +237,8 @@ pass "wedge reproduced: run $WEDGE_RUN stayed queued for ${NEG_WINDOW}s (worker 
 # The server's OWN custody-block signal: blocked_runs counts the owner's queued
 # non-exempt code-publishing runs when admission_counted_holds >= the limit
 # (recovery.sql GetCustodyAggregateForOwner, the same accounting ClaimRun and health.go's
-# reasonCustodyLimit use). Continuation's own-hold bound still uses total open holds.
+# reasonCustodyLimit use). Continuation's own-hold bound still uses total open holds, and since
+# #4162 a run at its own limit is a hard bound (blocked_runs counts it even below the owner limit).
 # >= 1 here establishes the server-observed custody block; the worker checks
 # establish online + idle only at the sampled boundaries.
 BLOCKED="$(apiget /api/recovery/holds | jq -r '.aggregate.blocked_runs')"
@@ -315,10 +329,22 @@ FRESH_ID="${FRESH_IDS[0]}"
 uzi_cli run recovery "$WEDGE_RUN" --json \
   | jq -e --arg h "$FRESH_ID" 'map(select(.id == $h and .state == "open")) | length == 1' >/dev/null \
   || fail "uzi run recovery did not list the fresh open hold $FRESH_ID on run $WEDGE_RUN"
-AGG_LINE="$(custody_aggregate)" || fail "custody aggregate unreadable"
+# One snapshot feeds both the aggregate and the exact per-hold check below.
+AFTER_SNAPSHOT="$(apiget /api/recovery/holds)" || fail "custody holds snapshot unreadable after the unblock"
+AGG_LINE="$(printf '%s' "$AFTER_SNAPSHOT" | jq -er '.aggregate | [.admission_counted_holds, .open_holds, .custody_hold_limit]
+    | if all(.[]; type == "number" and . >= 0 and . == floor) then map(tostring) | join(" ")
+      else error("invalid") end')" || fail "custody aggregate: invalid admission_counted_holds/open_holds/custody_hold_limit"
 read -r AFTER_COUNTED AFTER_OPEN _ <<< "$AGG_LINE"
-[ $((AFTER_OPEN - AFTER_COUNTED)) -eq 1 ] \
-  || fail "open_holds - admission_counted_holds = $((AFTER_OPEN - AFTER_COUNTED)) after the healthy claim, want 1 (open=$AFTER_OPEN counted=$AFTER_COUNTED)"
+# Exactly one hold (the healthy live claim hold) is discounted on top of the baseline grouped
+# surplus, which may only have shrunk since it was sampled.
+AFTER_SURPLUS=$((AFTER_OPEN - AFTER_COUNTED))
+{ [ "$AFTER_SURPLUS" -ge 1 ] && [ "$AFTER_SURPLUS" -le $((BASE_SURPLUS + 1)) ]; } \
+  || fail "open_holds - admission_counted_holds = $AFTER_SURPLUS after the healthy claim, want 1 beyond the baseline grouped surplus $BASE_SURPLUS (open=$AFTER_OPEN counted=$AFTER_COUNTED)"
+# The range above cannot tell a healthy live claim from a grouped baseline surplus when
+# BASE_SURPLUS >= 1, so pin the fresh hold itself from the same snapshot.
+printf '%s' "$AFTER_SNAPSHOT" | jq -e --arg h "$FRESH_ID" '[.holds[]? | select(.id == $h)]
+    | length == 1 and .[0].counts_toward_admission == false and .[0].admission_reason == "live_claim"' >/dev/null \
+  || fail "fresh hold $FRESH_ID is not (counts_toward_admission=false, admission_reason=live_claim) in /api/recovery/holds"
 [ "$AFTER_COUNTED" -lt "$LIMIT" ] || fail "admission_counted_holds=$AFTER_COUNTED still >= $LIMIT after the unblock"
 pass "episode cleared: blocked_runs=0, open_holds=$AFTER_OPEN, admission_counted_holds=$AFTER_COUNTED (< $LIMIT); fresh hold $FRESH_ID remains open"
 

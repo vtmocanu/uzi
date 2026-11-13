@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -111,8 +112,8 @@ func TestClaimCustodyLimitContinuationLiveDB(t *testing.T) {
 			for g := int64(1); g <= int64(limit); g++ {
 				f.seedHold(f.userID, run, g, "open")
 			}
-			if r := f.pillReason(t, run, thWithLimit(limit)); r != reasonCustodyLimit {
-				t.Fatalf("pill reason = %q for a run at its own-hold limit", r)
+			if r := f.pillReason(t, run, thWithLimit(limit)); r != apitypes.ReasonCustodyRunHoldBound {
+				t.Fatalf("pill reason = %q for a run at its own-hold limit, want the per-run hold bound reason", r)
 			}
 			if got, _ := f.claim(t); got != uuid.Nil {
 				t.Fatalf("claimed %s, want the run holding %d own holds blocked", got, limit)

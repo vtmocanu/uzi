@@ -320,6 +320,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// (0 = unlimited). All four surface for every run (SC5), independent of each other.
 		RecoveryWaitCause:      textPtrValue(r.RecoveryWaitCause.Valid, r.RecoveryWaitCause.String),
 		RecoveryWaitPhase:      textPtrValue(r.RecoveryWaitPhase.Valid, r.RecoveryWaitPhase.String),
+		RecoveryWaitDetail:     recoveryWaitDetailDTO(r),
 		RecoveryRetryNotBefore: timePtr(r.RecoveryRetryNotBefore.Valid, r.RecoveryRetryNotBefore.Time),
 		ForgeParkCount:         int(r.ForgeParkCount),
 		ForgeParkMax:           forgeParkMax,
@@ -958,4 +959,19 @@ func harnessDecisionForViewer(r store.Run, viewer store.User) *apitypes.HarnessD
 		PreferredMeasured: nullableFloat(r.HarnessPreferredMeasured), OtherMeasured: nullableFloat(r.HarnessOtherMeasured),
 		PreferredHeld: r.HarnessPreferredHeld.Bool, OtherHeld: r.HarnessOtherHeld.Bool,
 	}
+}
+
+// recoveryWaitDetailDTO is the single server-side reader gate for recovery_wait_detail (issue
+// #4177): the value surfaces only on a recovery_wait run parked at retained_recovery_adoption_failed
+// and only when it is in the closed set. Anything else is nil.
+func recoveryWaitDetailDTO(r store.Run) *string {
+	if r.Status != "recovery_wait" || !r.RecoveryWaitCause.Valid || r.RecoveryWaitCause.String != "retained_recovery_adoption_failed" || !r.RecoveryWaitDetail.Valid {
+		return nil
+	}
+	switch r.RecoveryWaitDetail.String {
+	case workersvc.RecoveryDetailSecretRemediationActive, workersvc.RecoveryDetailRemediationProofUnknown:
+		d := r.RecoveryWaitDetail.String
+		return &d
+	}
+	return nil
 }

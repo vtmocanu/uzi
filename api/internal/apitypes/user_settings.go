@@ -72,6 +72,10 @@ type UserSettingsDTO struct {
 	// harnesses are usable). `uzi settings get` displays it; there is deliberately no CLI
 	// setter for the user default (D3).
 	DefaultHarness *string `json:"default_harness"`
+	// JudgeRunsOn is the CLI decode mirror of the per-user "Judge runs on" harness (PRD
+	// #3257); null = same as the run. `uzi settings get` displays it; writes are
+	// cookie-only until #3264.
+	JudgeRunsOn *string `json:"judge_runs_on"`
 	// DefaultClaudeModel and DefaultCodexModel are the CLI decode mirrors of the retained
 	// per-harness worker-model lanes (PRD #1551 M1 / D2); each null = inherit. Fidelity only.
 	DefaultClaudeModel *string `json:"default_claude_model"`

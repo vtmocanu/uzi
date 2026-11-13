@@ -114,6 +114,7 @@ import type {
   MyCodexRateLimits,
   MyRateLimitsResponse,
   OverrideRequestState,
+  JudgeSkip,
   PendingJudge,
   PrivilegeReport,
   ProjectSyncOwnerKind,
@@ -1647,8 +1648,13 @@ const realApi = {
   // rerunJudge enqueues a fresh judge for a terminal run (owner-only spend), behind
   // the per-user spend limiter; the new verdict arrives asynchronously once the
   // judge run finishes, so callers re-fetch getRunReview.
+  // `skip` (issue #3257) is the third sibling: why the automatic judge was skipped, set only
+  // when review and pending_judge are both null. The current api always sends it (null when
+  // none); it is typed optional because api and web roll as separate Deployments, so a web pod
+  // can meet an api that predates the key. Readers normalize with `skip ?? null`, exactly as
+  // JudgePanel already does for pending_judge.
   getRunReview: (id: string) =>
-    request<{ review: RunReview | null; pending_judge: PendingJudge | null }>(
+    request<{ review: RunReview | null; pending_judge: PendingJudge | null; skip?: JudgeSkip | null }>(
       "GET",
       `/runs/${id}/review`,
     ),

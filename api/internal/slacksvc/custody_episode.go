@@ -217,7 +217,7 @@ func buildCustodyEpisodeNotification(baseURL string, userID uuid.UUID, openHolds
 }
 
 // custodyEpisodeFacts renders the aggregate as TRUSTED mrkdwn Facts: the open-hold count, the
-// admission-counted holds, blocked-run count, and the exact discard command as a `code` chip.
+// admission units, blocked-run count, and the exact discard command as a `code` chip.
 // All four are server-built
 // from closed ints and a compile-time literal, so the `*bold*`/`code` markup is intended (Facts
 // are ScrubSecrets'd but NOT mrkdwn-escaped by the notifier). The count facts always render (the
@@ -226,7 +226,7 @@ func buildCustodyEpisodeNotification(baseURL string, userID uuid.UUID, openHolds
 // pressure is not understated to nothing.
 func custodyEpisodeFacts(openHolds, admissionCountedHolds, blockedRuns int64) []string {
 	return []string{
-		fmt.Sprintf("*%d* admission-counted holds", admissionCountedHolds),
+		fmt.Sprintf("*%d* admission units", admissionCountedHolds),
 		fmt.Sprintf("*%d* held %s", openHolds, plural(openHolds, "source", "sources")),
 		fmt.Sprintf("*%d* blocked %s", blockedRuns, plural(blockedRuns, "run", "runs")),
 		"Discard held work: `" + custodyDiscardCommand + "`",

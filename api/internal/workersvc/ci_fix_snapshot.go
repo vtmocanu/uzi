@@ -11,6 +11,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/pipelinestatus"
+	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -47,12 +48,10 @@ var snapshotSecretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._\-]{16,}`),
 }
 
-// ScrubKnownTokens redacts known token shapes from snapshot log-tail content.
+// ScrubKnownTokens redacts known token shapes from snapshot log-tail content,
+// matching all shapes on the original input (secretscrub.RedactOverlapping).
 func ScrubKnownTokens(s string) string {
-	for _, re := range snapshotSecretPatterns {
-		s = re.ReplaceAllString(s, "[REDACTED]")
-	}
-	return s
+	return secretscrub.RedactOverlapping(s, snapshotSecretPatterns, "[REDACTED]")
 }
 
 // BuildFailureSnapshot freezes the failed pipeline into a self-contained

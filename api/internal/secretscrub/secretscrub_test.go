@@ -216,3 +216,32 @@ func TestGitHubRegexesDoNotOverMatch(t *testing.T) {
 		}
 	}
 }
+
+// TestNestedCredentialShapeLeavesNoTail pins the overlap bug: a credential whose
+// body embeds another family's shape must be redacted whole on every path. With
+// patterns applied one after another, the inner family was replaced first and the
+// shortened outer remainder no longer matched, leaving the tail in clear.
+func TestNestedCredentialShapeLeavesNoTail(t *testing.T) {
+	const tail = "TAILSECRETVALUE"
+	tokens := []string{
+		"uzp_AAAAAAAAghs_" + strings.Repeat("B", 16) + "-" + tail, // GitHub classic inside a uzi body
+		"uzp_AAAAAAAAxoxb-BBBB_" + tail,                           // Slack inside a uzi body
+		"glpat-AAAAxoxb-BBBB_" + tail,                             // Slack inside a GitLab PAT
+	}
+	for _, tok := range tokens {
+		for _, c := range []struct {
+			name string
+			fn   func(string) string
+			want string
+		}{
+			{"secretscrub.Scrub", secretscrub.Scrub, "[redacted]"},
+			{"secretscrub.ScrubHistory", secretscrub.ScrubHistory, "[redacted]"},
+			{"workersvc.ScrubKnownTokens", workersvc.ScrubKnownTokens, "[REDACTED]"},
+			{"issuedraft.ScrubSecretShapes", issuedraft.ScrubSecretShapes, "[redacted]"},
+		} {
+			if out := c.fn("leak " + tok + " end"); out != "leak "+c.want+" end" {
+				t.Errorf("%s(%q) = %q, want the whole credential replaced", c.name, tok, out)
+			}
+		}
+	}
+}

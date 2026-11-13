@@ -116,6 +116,17 @@ describe("issueLineModel counts", () => {
     expect(model.captions.prNote).toBe("Not counted as active");
   });
 
+  // #4167: a newer run that saw the merge outranks an older run's stale "opened".
+  it("keeps an issue out of the PR column when only an older run still says opened", () => {
+    const old = aRun({ id: "old", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "opened", repo_id: "r1", finished_at: "2026-11-08T00:00:00Z" });
+    const merged = aRun({ id: "new", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "merged", repo_id: "r1", finished_at: "2026-11-09T00:00:00Z" });
+    const model = issueLineModel({ ownRuns: [old, merged], otherRuns: [] });
+    expect(model.prs).toEqual([]);
+    const prIds = new Set(model.prs.map((r) => r.id));
+    expect(issueLineStage(old, prIds)).toBe("none");
+    expect(issueLineStage(merged, prIds)).toBe("none");
+  });
+
   it("counts a PR for the viewer only, never another user's", () => {
     const theirs = aRun({ id: "x", status: "completed", mr_iid: 9, mr_state: "opened", owner_email: "mira@uzi.local" });
     expect(issueLineModel({ ownRuns: [], otherRuns: [theirs] }).prs).toEqual([]);

@@ -299,6 +299,12 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   once per cooldown window (30 minutes by default, admin-tunable) even if the
   run flaps between flags in that time. An approval-idle nudge threads under
   the existing plan-gate message, right next to its action buttons.
+  A run that enters its own custody hold bound (its open holds reach `custody_hold_limit`
+  while your owner total may still be below it) gets a threaded nudge headed "⏳ This queued run
+  cannot start." followed by the reason (its own custody hold limit has been reached),
+  under the same cooldown; it is distinct from the owner-level custody DM (one coalesced
+  direct message per owner blocked episode, sent when the owner reaches the custody hold
+  limit; see [Run recovery](./run-recovery.md)).
   When the run recovers, the `⚠️ <flag>` context element drops off on its own
   and nudging stops — no action needed.
   A cross-check run is never nudged (see above).

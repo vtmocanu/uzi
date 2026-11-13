@@ -200,8 +200,8 @@ func TestGetRunReviewPendingJudgeEnvelope(t *testing.T) {
 		// pending_judge precedes review; the trim is for json.Encoder's trailing newline.
 		// This is the genuinely-unjudged run whose enabled "Run judge" button is the
 		// correct affordance — unchanged by #119.
-		if got := strings.TrimSpace(rec.Body.String()); got != `{"pending_judge":null,"review":null}` {
-			t.Fatalf("envelope = %s, want {\"pending_judge\":null,\"review\":null}", got)
+		if got := strings.TrimSpace(rec.Body.String()); got != `{"pending_judge":null,"review":null,"skip":null}` {
+			t.Fatalf("envelope = %s, want {\"pending_judge\":null,\"review\":null,\"skip\":null}", got)
 		}
 	})
 

@@ -2,7 +2,7 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   api,
@@ -1444,6 +1444,14 @@ function codexHoldCopy(
   }
 }
 
+// Issue #4177: closed copy map for the adoption-failure detail classification.
+const ADOPTION_DETAIL_COPY = {
+  secret_remediation_active:
+    "Resume is unavailable: the retained source is held under an active secret-scan remediation, so Resume cannot succeed unchanged. To recover the work, either export an available recovery archive (uzi run export <run-id> --output <path>), which may omit later work kept on the worker, or ask an operator to recover the retained work from worker storage. Cancel ends the run.",
+  remediation_proof_unknown:
+    "The secret-scan remediation proof could not be verified, so a retry may help.",
+} as const;
+
 /**
  * Issue #1197: the transient-recovery park panel — the analogue of PoolWaitPanel for
  * `recovery_wait`, and deliberately COPY ONLY.
@@ -1478,6 +1486,7 @@ function codexHoldCopy(
  *
  * Exported like the sibling panels so its copy is reachable without mounting the page.
  */
+
 function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   run: Run;
   ownerProof: boolean;
@@ -1486,6 +1495,12 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   onCancel: () => void;
 }) {
   const adoptionFailed = run.recovery_wait_cause === "retained_recovery_adoption_failed";
+  // Closed set: only the two known values change anything; null, absent or any other value
+  // keeps the generic adoption-failure behaviour and the raw string is never rendered.
+  const adoptionDetail = adoptionFailed ? run.recovery_wait_detail : null;
+  const secretActive = adoptionDetail === "secret_remediation_active";
+  const proofUnknown = adoptionDetail === "remediation_proof_unknown";
+  const resumeReasonId = useId();
   const idleStall = run.recovery_wait_cause === "codex_idle_stall";
   // Owner-only, no timer, never an integrity refusal: the claimed continuation flight was
   // never witnessed, so the server released the claim. Always held, even if a malformed
@@ -1510,7 +1525,8 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
           {adoptionFailed && "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. "}
           {unwitnessed && "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. "}
           {decisionHeld
-            ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
+            ? secretActive ? "This hold has no scheduled retry. Only the run owner can Cancel."
+              : "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
             : decisionRetrying
               ? idleStall ? `Automatic retry is scheduled not before ${new Date(retryMs).toLocaleString()}; it may still be pending when due. Only the run owner can Resume now or Cancel.`
                 : retryMs <= Date.now() ? "Automatic retry is due; the run will retry automatically. Only the run owner can Resume now or Cancel."
@@ -1518,12 +1534,16 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
               : "Retry timing is unavailable. This does not establish an owner hold or an automatic retry date."}
         </> : <>{memoryHeld
           ? "Memory interventions have stopped. Resume starts a fresh memory episode. Cancel ends this run."
-          : "Automatic worker recovery has stopped. Only the run owner can resume or cancel this run. Resume requests one explicit attempt, even when the automatic recovery limit is zero."}
+          : "Automatic worker recovery has stopped. Only the run owner can resume or cancel this run. Resume requests one explicit attempt, even when the automatic recovery limit is zero. Resume requeues the run, but a run at its own custody hold limit is not claimed and takes no new hold until enough of its own holds are discarded or settled."}
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
-      {adoptionFailed && <p className="mt-1.5 text-xs text-warn">
+      {adoptionFailed && !secretActive && <p className="mt-1.5 text-xs text-warn">
         Resume starts another recovery episode. If the underlying block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming.
+        {proofUnknown && ` ${ADOPTION_DETAIL_COPY.remediation_proof_unknown}`}
+      </p>}
+      {secretActive && <p id={resumeReasonId} className="mt-1.5 text-xs text-warn">
+        {ADOPTION_DETAIL_COPY.secret_remediation_active}
       </p>}
       {idleStall && <p className="mt-1.5 text-xs text-muted">Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.</p>}
       {!retained && <p className="mt-1.5 text-xs text-muted">
@@ -1559,7 +1579,7 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
       ) : <p className="mt-1.5 text-xs text-muted">Server recovery evidence is unavailable.</p>}
       {ownerProof ? (
         <div className="mt-3 flex gap-2">
-          <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+          <Button size="sm" disabled={busy || secretActive} aria-describedby={secretActive ? resumeReasonId : undefined} onClick={onResume}>Resume</Button>
           <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>Cancel</Button>
         </div>
       ) : <p className="mt-1.5 text-xs text-muted">Only the run owner can resume or cancel this hold.</p>}
@@ -1875,7 +1895,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
               {retryAt ? `Retry at ${retryAt}. ` : ""}Forge parks: {parkLabel}. The count and allowance are unchanged by Resume.
             </p>
             {forgeMode === "held" && <>
-              <p className="mt-1.5 text-xs text-muted">Resume permits one bounded ordinary attempt; it does not promise execution or reset counts, custody or grants. Origin cooldown, manual cordon, a custody limit of 1, or saturated capacity may still block admission.</p>
+              <p className="mt-1.5 text-xs text-muted">Resume permits one bounded ordinary attempt; it does not promise execution or reset counts, custody or grants. Origin cooldown, manual cordon, a custody limit of 1, saturated capacity, or this run being at its own custody hold limit (no claim, no hold) may still block admission. Resume requeues the run, but a run at its own custody hold limit is not claimed and takes no new hold until enough of its own holds are discarded or settled.</p>
               {run.health_reason && <p className="mt-1.5 text-xs text-muted">Admission: {displayHealthReason(run)}</p>}
               {ownerProof ? <div className="mt-3 flex flex-wrap gap-2">
                 <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
@@ -2508,7 +2528,11 @@ export function RunView() {
                       : `forge:${forgeWaitMode(run)}`
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
-                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed" || run.recovery_wait_cause === "retained_continuation_unwitnessed")
+                  : run.recovery_wait_cause === "retained_recovery_adoption_failed"
+                    ? // Issue #4177: the closed-set detail is part of the key so a detail change at
+                      // the same cause re-announces; null or any other value adds no suffix.
+                      `retained_recovery_adoption_failed${run.recovery_wait_detail === "secret_remediation_active" || run.recovery_wait_detail === "remediation_proof_unknown" ? `:${run.recovery_wait_detail}` : ""}`
+                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_continuation_unwitnessed")
                     ? effectiveRunStatus(run)
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
                     ? "worker_requeue_exhausted"
@@ -2551,7 +2575,9 @@ export function RunView() {
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
-          : parkKey === "retained_recovery_adoption_failed"
+          : parkKey === "retained_recovery_adoption_failed:secret_remediation_active"
+            ? "Integrity hold: the retained source is held under an active secret-scan remediation. The agent did not start. Local work and its custody are preserved. Resume is unavailable. Only the run owner can Cancel. There is no scheduled retry."
+          : parkKey.startsWith("retained_recovery_adoption_failed")
             ? "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "retained_continuation_unwitnessed"
             ? "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. Only the run owner can Resume or Cancel. There is no scheduled retry."

@@ -42,7 +42,7 @@ const cell = (harness: "claude" | "codex", extra: Partial<EffortSettingCell> = {
 beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey] } as never);
   mockApi.getMySettings.mockResolvedValue({ settings: {
-    default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, default_codex_effort: null,
+    default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, default_codex_effort: null,
     judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
     effort_settings: [cell("claude"), cell("codex", { catalog_default: {
       state: "known", effort: "medium", model: "gpt-6.1-sol", runtime_version: "0.164.0", observed_at: "2026-11-05T09:30:00Z" } })],

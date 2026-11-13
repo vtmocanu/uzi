@@ -166,7 +166,7 @@ func TestCustodyEpisodeCrossingSendsOneDM(t *testing.T) {
 	if n.Slack.Link != "https://uzi.example.com/workers" {
 		t.Errorf("Slack.Link = %q, want the /workers custody surface deep link", n.Slack.Link)
 	}
-	wantFacts := []string{"*8* admission-counted holds", "*11* held sources", "*3* blocked runs", "Discard held work: `" + custodyDiscardCommand + "`"}
+	wantFacts := []string{"*8* admission units", "*11* held sources", "*3* blocked runs", "Discard held work: `" + custodyDiscardCommand + "`"}
 	if !reflect.DeepEqual(n.Slack.Facts, wantFacts) {
 		t.Fatalf("facts = %v, want %v", n.Slack.Facts, wantFacts)
 	}

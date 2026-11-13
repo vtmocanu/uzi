@@ -50,7 +50,7 @@ type dispositionDoneMsg struct {
 func (m tuiModel) loadReviewCmd(runID string) tea.Cmd {
 	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
-		rv, pj, err := c.RunReview(ctx, runID)
+		rv, pj, _, err := c.RunReview(ctx, runID)
 		return reviewLoadedMsg{runID: runID, gen: gen, review: rv, pendingJudge: pj, err: err}
 	}
 }

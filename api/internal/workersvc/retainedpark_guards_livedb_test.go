@@ -90,9 +90,7 @@ func testRetainedParkNonOwnerGuardsLiveDB(t *testing.T, cause string) {
 		}},
 		{"token change service", func() error {
 			_, err := snapshotSvc(env, testParams()).SetRunCredential(env.ctx, user, run, CredentialOverrideModeAuto, nil)
-			if !errors.Is(err, ErrCredentialSwitchRaced) {
-				t.Fatalf("exhaustion token change error=%v", err)
-			}
+			requireRunOwnerHeld(t, err, runOwnerHeldLabels[cause])
 			return nil
 		}},
 		{"vault unlock", func() error {

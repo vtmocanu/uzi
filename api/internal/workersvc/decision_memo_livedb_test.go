@@ -499,6 +499,7 @@ func TestDecisionsMemoLineageScopingLiveDB(t *testing.T) {
 
 	otherUser := uuid.New()
 	e.exec(t, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, otherUser, fmt.Sprintf("memo-%s@e2e", otherUser))
+	trackLiveDBUser(t, e.pool, otherUser)
 	otherRepo := e.seedMemoRepo(t)
 
 	rework := e.seedRework(t, w, 1)

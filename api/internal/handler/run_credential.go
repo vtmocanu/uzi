@@ -87,6 +87,7 @@ func (h *Handler) SetRunCredential(w http.ResponseWriter, r *http.Request) {
 // same way.
 func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 	var workerUnsupported *workersvc.CredentialSwitchWorkerUnsupportedError
+	var ownerHeld *workersvc.RunOwnerHeldError
 	switch {
 	case errors.Is(err, workersvc.ErrRunNotFound):
 		httpx.Error(w, http.StatusNotFound, "run not found")
@@ -115,6 +116,10 @@ func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusConflict, workersvc.ErrForgeUnreachableHeld.Error())
 	case errors.Is(err, workersvc.ErrCodexIdleStallHeld):
 		httpx.Error(w, http.StatusConflict, workersvc.ErrCodexIdleStallHeld.Error())
+	case errors.As(err, &ownerHeld):
+		httpx.Error(w, http.StatusConflict, ownerHeld.Error())
+	case errors.Is(err, workersvc.ErrRunOwnerHeld):
+		httpx.Error(w, http.StatusConflict, workersvc.ErrRunOwnerHeld.Error())
 	case errors.Is(err, workersvc.ErrCredentialSwitchRaced):
 		httpx.Error(w, http.StatusConflict, "the run changed state while switching its token; retry")
 	default:

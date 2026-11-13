@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { GitCache, type EpochDiscardProof, type EpochDiscardProofOptions, type RetainedDiscardOptions } from "../src/git.js";
+import { restoreDigest } from "../src/restore-journal.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
@@ -88,6 +89,36 @@ async function refusal(proof: EpochDiscardProof, reason: string, over: Partial<R
   assert.ok(fs.existsSync(clonePath));
 }
 
+
+it("an epoch proof cannot authorize disposal of a subsequently restored predecessor", async () => {
+  const proof = git.createEpochDiscardProof(input);
+  const p = JSON.parse(raw) as { attemptId: string };
+  const root = fs.lstatSync(clonePath, { bigint: true });
+  await git.seedIndependentAttempt({
+    barePath: bare, branch: BRANCH, key: "issue-3431", runId: RUN,
+    attemptId: formatAttemptId(new Date("2026-01-02T00:00:00Z"), 2, "0000000000000002"),
+    predecessor: { clonePath, attemptId: p.attemptId, generation: 1, journalDigest: restoreDigest(raw),
+      slotOwner: { worker: "predecessor", epoch: "epoch" }, root: { dev: String(root.dev), ino: String(root.ino) } },
+    boundary: { predecessor: "a".repeat(64), successor: "b".repeat(64) },
+    pin: { captureId: "11111111-1111-4111-8111-111111111111", generation: 1,
+      sourceSha: gitIn(["rev-parse", "refs/remotes/origin/main"]), finalization: false },
+    defaultBranch: "main", predecessorUnchanged: async () => true, census: async () => ({ ok: true }),
+    beforeRestoreAttribution: async () => {}, isLive: () => false, beforeSeed: async () => {},
+  });
+  const config = fs.readFileSync(path.join(bare, "config"), "utf8");
+  let quiesced = false;
+  await refusal(proof, "descriptor_changed", { quiesce: async () => { quiesced = true; return true; } });
+  const current = await git.inspectRetainedSources({ selector: options.selector, barePath: bare, holds: options.holds,
+    lifecycle: options.lifecycle, epoch: true, isLivePath: options.isLivePath });
+  assert.equal(current.sources.length, 1);
+  const confirm = current.sources[0]!.descriptor;
+  const currentProof = git.createEpochDiscardProof({ ...input, confirm });
+  await refusal(currentProof, "restore_entry_retained", { confirm, quiesce: async () => { quiesced = true; return true; } });
+  assert.equal(quiesced, false, "epoch deletion never enters the owner-only restore exit");
+  assert.equal(fs.readFileSync(path.join(bare, "config"), "utf8"), config, "both journals and ledger remain unchanged");
+  assert.equal(journal(), raw);
+  assert.equal(pending, 0);
+});
 
 function cloneGit(...args: string[]): string {
   return execFileSync("git", ["-C", clonePath, ...args], { env: ENV, encoding: "utf8", stdio: "pipe" }).trim();

@@ -64,6 +64,10 @@ it.each([0, 3])("renders limit %s and historical evidence even after captures di
   expect(screen.getByText(/Server recovery evidence is incomplete/)).toBeTruthy();
   expect(screen.queryByText("The published checkpoint contains the latest work.")).toBeNull();
 });
+it("says Resume requeues but a run at its own custody hold limit is not claimed", () => {
+  render(view(held(), true));
+  expect(screen.getByText(/Resume requeues the run, but a run at its own custody hold limit is not claimed and takes no new hold until enough of its own holds are discarded or settled\./)).toBeTruthy();
+});
 it.each([undefined, false])("pending or non-owner proof %s cannot resume or cancel", (proof) => {
   render(view(held(), proof));
   expect(screen.getByText("Only the run owner can resume or cancel this hold.")).toBeTruthy();

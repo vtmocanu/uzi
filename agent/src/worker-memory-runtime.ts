@@ -122,6 +122,7 @@ export class WorkerMemoryRuntime {
       prepareFeedback: (context, result, diagnostics) => sink(context).prepareFeedback(context, result, diagnostics),
       preparePreservation: (context, result) => sink(context).preparePreservation(context, result),
       preservationBudgetMs: (context) => sink(context).preservationBudgetMs,
+      rejections: (record) => safeLog(() => log.warn("worker memory guard: candidate observations rejected", record)),
     });
   }
 

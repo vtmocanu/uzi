@@ -392,12 +392,12 @@ describe("Held work card", () => {
 
   it("keeps blocked runs a danger headline with no review link and no held row", async () => {
     mockApi.getRecoveryHolds.mockResolvedValue({
-      aggregate: heldAggregate({ open_holds: 3, admission_counted_holds: 3, blocked_runs: 2 }),
+      aggregate: heldAggregate({ open_holds: 16, admission_counted_holds: 3, blocked_runs: 2 }),
       holds: [],
     });
     await mount();
     const card = screen.getByRole("alert", { name: "Held work" });
-    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Held work is blocking new runs");
+    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Queued runs reached their own custody hold limits");
     expect(within(card).getByRole("heading", { level: 3 }).className).toContain("text-danger");
     expect(screen.queryByRole("link", { name: /^Review held work/ })).toBeNull();
     expect(screen.queryByText("Needs your decision")).toBeNull();
@@ -421,12 +421,12 @@ describe("Held work card", () => {
   it("still shows the danger headline and the held row when a first-load endpoint rejects", async () => {
     mockApi.listRepos.mockRejectedValue(new Error("repos down"));
     mockApi.getRecoveryHolds.mockResolvedValue({
-      aggregate: heldAggregate({ open_holds: 3, admission_counted_holds: 3, decision_needed: 1, blocked_runs: 2 }),
+      aggregate: heldAggregate({ open_holds: 16, admission_counted_holds: 3, decision_needed: 1, blocked_runs: 2 }),
       holds: [decisionHold("a83c51f0-aaaa", "2026-07-05T10:00:00Z")],
     });
     await mount();
     const card = screen.getByRole("alert", { name: "Held work" });
-    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Held work is blocking new runs");
+    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Queued runs reached their own custody hold limits");
     expect(within(card).getByRole("link", { name: "Review held work →" })).toBeTruthy();
     expect(within(screen.getByRole("region", { name: "Needs your decision" })).getByText(/Held work from run/)).toBeTruthy();
   });
@@ -975,6 +975,29 @@ describe("People chip (issue #4042)", () => {
 
 // PRD #3875 M1: the Search button in the header opens the shell's command menu.
 describe("OverviewNext Search button", () => {
+  it("follows the health and People chips, before the Back link", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    render(
+      <MemoryRouter>
+        <CommandMenuContext.Provider value={{ open: vi.fn() }}>
+          <OverviewNext />
+        </CommandMenuContext.Provider>
+      </MemoryRouter>,
+    );
+    await settle();
+
+    const health = screen.getByRole("button", { name: /^System health:/ });
+    const people = screen.getByRole("button", { name: /^People:/ });
+    const search = screen.getByRole("button", { name: /^Search/ });
+    const back = screen.getByRole("link", { name: "Back to the current Overview" });
+    const before = (a: Element, b: Element) =>
+      (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    expect(before(health, people)).toBe(true);
+    expect(before(people, search)).toBe(true);
+    expect(before(search, back)).toBe(true);
+  });
+
   it("calls the shell's open() on click, with the shortcut shown on the button", async () => {
     const open = vi.fn();
     render(

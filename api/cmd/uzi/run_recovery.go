@@ -267,7 +267,7 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 	}
 	printRecoveryFailureReasons(p, open, reasons)
 	a := dto.Aggregate
-	p.Printf("open_holds: %d  admission_counted_holds: %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
+	p.Printf("open_holds: %d  admission_units (admission_counted_holds): %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
 		a.OpenHolds, a.AdmissionCountedHolds, a.CustodyHoldLimit, a.DecisionNeeded, a.BlockedRuns)
 	if !gf.quiet {
 		first := true
@@ -651,14 +651,19 @@ func confirmDiscardHold(env Env, runID, holdID string) (bool, error) {
 }
 
 // admissionCell renders the server-derived custody admission membership of a hold (issue #2970):
-// "counted (<reason>)" or "counted", "not counted", or "-" when the server sent none (a non-open
-// hold, or an older server), which is unknown and never "not counted".
+// "counted (<reason>)" or "counted", "not counted (<reason>)" or "not counted" (a hold that is a
+// non-representative member of a same-run group reports "same_run_group"), or "-" when the server
+// sent none (a non-open hold, or an older server), which is unknown and never "not counted". The
+// reason is server text of an open vocabulary, so it always renders through cellText.
 func admissionCell(h apitypes.RecoveryCustodyHoldDTO) string {
 	switch {
 	case h.CountsTowardAdmission == nil:
 		return "-"
 	case !*h.CountsTowardAdmission:
-		return "not counted"
+		if h.AdmissionReason == "" {
+			return "not counted"
+		}
+		return "not counted (" + cellText(h.AdmissionReason) + ")"
 	case h.AdmissionReason == "":
 		return "counted"
 	default:

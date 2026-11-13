@@ -85,7 +85,7 @@ func (f *cncFixture) cnuSetCaptures(t *testing.T, run uuid.UUID, kind string, gu
 // cnuAssertDecisionCustody reads the run's open holds through the three real readers (the facts
 // view behind the custody listings, fn_custody_admission_members and fn_custody_admission_count)
 // and through ClaimRun's admission gate: every hold is decision-needed, never archive_ready or
-// active, and every hold counts against the owner's limit.
+// active, and the run's same-worker holds count as one admission unit against the owner's limit.
 func (f *cncFixture) cnuAssertDecisionCustody(t *testing.T, run uuid.UUID, wantAttention, what string) {
 	t.Helper()
 	ctx := f.env.ctx
@@ -118,7 +118,7 @@ func (f *cncFixture) cnuAssertDecisionCustody(t *testing.T, run uuid.UUID, wantA
 	if err != nil {
 		t.Fatal(err)
 	}
-	seen := 0
+	seen, countedMembers := 0, 0
 	for mrows.Next() {
 		var id uuid.UUID
 		var counted bool
@@ -130,8 +130,16 @@ func (f *cncFixture) cnuAssertDecisionCustody(t *testing.T, run uuid.UUID, wantA
 			continue
 		}
 		seen++
-		if !counted || reason != "decision_needed" {
-			t.Errorf("%s: hold %s counted=%v reason=%q, want counted with reason decision_needed", what, id, counted, reason)
+		// Issue #4162: the run's open holds on one original worker form ONE admission unit. The
+		// representative is counted and keeps the decision_needed reason (never discounted as a
+		// live claim); every other member is counted=false with same_run_group.
+		if counted {
+			countedMembers++
+			if reason != "decision_needed" {
+				t.Errorf("%s: counted hold %s reason=%q, want decision_needed", what, id, reason)
+			}
+		} else if reason != "same_run_group" {
+			t.Errorf("%s: uncounted hold %s reason=%q, want same_run_group", what, id, reason)
 		}
 	}
 	mrows.Close()
@@ -141,12 +149,15 @@ func (f *cncFixture) cnuAssertDecisionCustody(t *testing.T, run uuid.UUID, wantA
 	if seen != len(holds) {
 		t.Fatalf("%s: fn_custody_admission_members listed %d of the run's %d holds", what, seen, len(holds))
 	}
+	if countedMembers != 1 {
+		t.Fatalf("%s: %d counted members, want exactly 1 (one unit for the run's same-worker holds)", what, countedMembers)
+	}
 	var count int32
 	if err := f.env.pool.QueryRow(ctx, `SELECT fn_custody_admission_count($1, $2)::int`, f.userID, cutoff).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if want := f.openHolds(t); int64(count) != want {
-		t.Fatalf("%s: fn_custody_admission_count = %d, want every open hold (%d) counted", what, count, want)
+	if count != 1 {
+		t.Fatalf("%s: fn_custody_admission_count = %d, want 1 unit for the run's %d holds", what, count, len(holds))
 	}
 
 	// ClaimRun admission: a fresh run of the same owner is refused at a limit equal to the held
@@ -169,7 +180,7 @@ func (f *cncFixture) cnuAssertDecisionCustody(t *testing.T, run uuid.UUID, wantA
 }
 
 // TestUnwitnessedParkCustodyIsDecisionNeededLiveDB: both owner-held parks keep every open hold
-// in the decision-needed bucket whatever the capture says, and each hold counts.
+// in the decision-needed bucket whatever the capture says, and they count as one unit.
 func TestUnwitnessedParkCustodyIsDecisionNeededLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	parks := map[string]func(t *testing.T) (*cncFixture, uuid.UUID){

@@ -113,6 +113,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   now_summary_enabled: null,
   // PRD #1429 M1 (D3): per-user default harness; null = no preference (falls through D11).
   default_harness: null,
+  // PRD #3257: per-user "Judge runs on"; null = same as the run being reviewed.
+  judge_runs_on: null,
   harness_overflow_enabled: false,
   // Issue #3719: how a new Codex run chooses its login. Seeded "auto" so the demo shows the
   // pool at work (a pooled login sits in mocks/data/secrets.ts); the server's own default is
@@ -303,6 +305,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // PRD #1429 M1: optional so a pre-feature blob stays valid; absent/null reads as "no
     // preference" and the SEED fills default_harness=null on load (no key bump needed).
     (u.default_harness === undefined || u.default_harness === null || typeof u.default_harness === "string") &&
+    // PRD #3257: optional so a pre-feature blob stays valid; the SEED fills judge_runs_on=null.
+    (u.judge_runs_on === undefined || u.judge_runs_on === null || typeof u.judge_runs_on === "string") &&
     // Optional for older blobs; the seed fills the default-off overflow setting.
     (u.harness_overflow_enabled === undefined || typeof u.harness_overflow_enabled === "boolean") &&
     // Issue #3719: optional so a pre-feature blob stays valid; the SEED fills it on load.
@@ -779,6 +783,21 @@ function recordedEffectiveScenario(): RecordedEffectiveScenario {
   const found = RECORDED_EFFECTIVE_SCENARIOS.find(s => s.name === name);
   if (!found) throw new Error(`no recorded effective-settings scenario ${name}`);
   return found;
+}
+
+// PRD #3257: the recordings are all taken with "Judge runs on" unset, so the stored choice is
+// applied at response time, exactly as effective_settings.go derives it: an explicit choice is a
+// user_default judge_harness, and the other lane's judge_model cell gains the not_used note.
+// With the setting unset the recording is served unchanged.
+function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undefined): EffectiveSettings {
+  if (!runsOn) return view;
+  view.judge_harness = { value: runsOn, source: "user_default", fixed_at: "create", notes: [] };
+  view.models = view.models.map(c =>
+    c.setting === "judge_model" && c.harness !== runsOn && !c.notes.includes("not_used")
+      ? { ...c, notes: [...c.notes, "not_used"] }
+      : c,
+  );
+  return view;
 }
 
 // Absent and null request members mean the same choice, so key on the normalized triple.
@@ -1449,7 +1468,7 @@ export const settingsApi = {
   // overflowCodexDefault one (the recorded refused-alternative case); anything else the default.
   getEffectiveSettings: async (): Promise<EffectiveSettings> => {
     requireSession();
-    return delay(structuredClone(recordedEffectiveScenario().get), 60);
+    return delay(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
     requireSession();
@@ -1695,6 +1714,14 @@ export const settingsApi = {
         throw new ApiError(400, "default_harness: must be one of claude, codex");
       }
       next = { ...next, default_harness: patch.default_harness };
+    }
+    if (patch.judge_runs_on !== undefined) {
+      // Tri-state like default_harness (PRD #3257): null clears to "same as the run"; anything
+      // but claude|codex is a 400, as the server's validateJudgeRunsOn.
+      if (patch.judge_runs_on !== null && patch.judge_runs_on !== "claude" && patch.judge_runs_on !== "codex") {
+        throw new ApiError(400, "invalid judge_runs_on");
+      }
+      next = { ...next, judge_runs_on: patch.judge_runs_on };
     }
     // Every field validated: commit the staged copy in one shot, then persist.
     userSettings = next;

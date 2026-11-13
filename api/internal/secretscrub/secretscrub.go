@@ -59,29 +59,55 @@ var (
 	uziTokenPattern        = regexp.MustCompile(`uz[capfrsw]_[A-Za-z0-9_-]{16,}`)
 )
 
+// scrubPatterns is Scrub's pattern set. Order no longer matters: RedactOverlapping
+// matches every family on the original input.
+var scrubPatterns = []*regexp.Regexp{
+	slackTokenPattern, slackRefreshPattern, anthropicPattern, gitlabPATPattern,
+	githubClassicPattern, githubFineGrainPattern, uziTokenPattern,
+}
+
+// historyPatterns is ScrubHistory's set: Scrub's families plus the history-only
+// OpenAI pattern.
+var historyPatterns = []*regexp.Regexp{
+	slackTokenPattern, slackRefreshPattern, anthropicPattern, openaiPattern,
+	gitlabPATPattern, githubClassicPattern, githubFineGrainPattern, uziTokenPattern,
+}
+
 // Scrub replaces every recognised secret family with a placeholder.
 func Scrub(s string) string {
-	s = slackTokenPattern.ReplaceAllString(s, "[redacted]")
-	s = slackRefreshPattern.ReplaceAllString(s, "[redacted]")
-	s = anthropicPattern.ReplaceAllString(s, "[redacted]")
-	s = gitlabPATPattern.ReplaceAllString(s, "[redacted]")
-	s = githubClassicPattern.ReplaceAllString(s, "[redacted]")
-	s = githubFineGrainPattern.ReplaceAllString(s, "[redacted]")
-	s = uziTokenPattern.ReplaceAllString(s, "[redacted]")
-	return s
+	return RedactOverlapping(s, scrubPatterns, "[redacted]")
 }
 
 // ScrubHistory applies conservative, overlap-safe credential redaction only to
 // history displays. It deliberately recognizes credential shapes within text;
 // callers scrub the complete normalized value before applying display bounds.
 func ScrubHistory(s string) string {
-	// Match the original input and merge overlapping spans so history scrubbing cannot
-	// expose credential fragments by replacing another family first.
+	return RedactOverlapping(s, historyPatterns, "[redacted]")
+}
+
+// overlapWindow bounds how far back RedactOverlapping rescans after a match to
+// find another match of the same pattern starting inside it. It must be at least
+// the longest such overlap any registered pattern allows: a prefix character
+// outside its body class (sk- classic: 2 bytes; issuedraft gh[pousr]_ with an
+// alphanumeric body: 3) or a fixed-length body (AKIA: 19, AIza: 38). A pattern whose
+// overlap is unbounded must instead be written so its greedy match covers any
+// match starting inside it (the issuedraft JWT shape consumes trailing segments).
+const overlapWindow = 64
+
+// RedactOverlapping replaces every span any pattern matches in the ORIGINAL s with
+// placeholder, merging overlapping spans into one placeholder. Applying patterns
+// one after another is unsafe: a family matched inside another credential's body
+// (a uzp_ body containing ghs_<16 chars>) is replaced first, and the shortened
+// remainder of the outer credential no longer matches its own pattern, so its
+// tail survives. Every multi-pattern credential scrubber in this package and its
+// callers goes through here. Patterns must not match the empty string.
+//
+// Work is linear in len(s) times overlapWindow: after each match the scan resumes
+// at most overlapWindow bytes before its end, never at its start, so a body of
+// repeated prefixes ("uzc_uzc_...") cannot make it quadratic.
+func RedactOverlapping(s string, patterns []*regexp.Regexp, placeholder string) string {
 	var matches [][]int
-	for _, pattern := range []*regexp.Regexp{
-		slackTokenPattern, slackRefreshPattern, anthropicPattern, openaiPattern,
-		gitlabPATPattern, githubClassicPattern, githubFineGrainPattern, uziTokenPattern,
-	} {
+	for _, pattern := range patterns {
 		for offset := 0; offset < len(s); {
 			match := pattern.FindStringIndex(s[offset:])
 			if match == nil {
@@ -90,12 +116,7 @@ func ScrubHistory(s string) string {
 			match[0] += offset
 			match[1] += offset
 			matches = append(matches, match)
-			// A classic OpenAI body excludes hyphens: another sk- prefix can
-			// cross its end by two bytes. Other registered families include
-			// their prefix alphabet in their body, so internal matches cannot
-			// extend beyond the greedy match. Keep only that two-byte overlap
-			// instead of rescanning whole bodies (which would be quadratic).
-			offset = max(match[0]+1, match[1]-2)
+			offset = max(match[0]+1, match[1]-overlapWindow)
 		}
 	}
 	if len(matches) == 0 {
@@ -116,12 +137,12 @@ func ScrubHistory(s string) string {
 			continue
 		}
 		result.WriteString(s[previousEnd:start])
-		result.WriteString("[redacted]")
+		result.WriteString(placeholder)
 		previousEnd = end
 		start, end = match[0], match[1]
 	}
 	result.WriteString(s[previousEnd:start])
-	result.WriteString("[redacted]")
+	result.WriteString(placeholder)
 	result.WriteString(s[end:])
 	return result.String()
 }
@@ -131,6 +152,7 @@ func ScrubHistory(s string) string {
 // validation errors return Slack's error code (e.g. "invalid_auth"), not the token, so
 // this is defense-in-depth for error strings rather than a primary control.
 func ScrubSlackTokens(s string) string {
-	s = slackTokenPattern.ReplaceAllString(s, "[redacted]")
-	return slackRefreshPattern.ReplaceAllString(s, "[redacted]")
+	return RedactOverlapping(s, slackPatterns, "[redacted]")
 }
+
+var slackPatterns = []*regexp.Regexp{slackTokenPattern, slackRefreshPattern}

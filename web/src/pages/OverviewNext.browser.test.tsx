@@ -205,6 +205,32 @@ describe("OverviewNext issue work line", () => {
     });
   }
 
+  // #4167: an older run's stale "opened" must not put a merged PR at the PR open station.
+  for (const width of [1280, 375]) {
+    it(`leaves a PR merged per its newest run off the PR open station at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mockApi.listRuns.mockResolvedValue({
+        runs: [
+          aRun({ id: "stale", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "opened", finished_at: "2026-11-08T00:00:00Z" }),
+          aRun({ id: "merged", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "merged", finished_at: "2026-11-09T00:00:00Z" }),
+          aRun({ id: "open", status: "completed", issue_iid: 3700, mr_iid: 4200, mr_state: "opened", finished_at: "2026-11-09T00:00:00Z" }),
+        ],
+      });
+      render(
+        <MemoryRouter initialEntries={["/overview/next"]}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+            <OverviewNext />
+          </main>
+        </MemoryRouter>,
+      );
+      const card = await screen.findByRole("region", { name: "Issue work" });
+      const station = card.querySelector(`[data-stage="pr"]`) as HTMLElement;
+      await expect.poll(() => station.textContent ?? "").toContain("#3700");
+      expect(window.innerWidth).toBe(width);
+      expect(station.textContent ?? "").not.toContain("#3644");
+    });
+  }
+
   it("stops the flowing segments under prefers-reduced-motion", async () => {
     // The stylesheet is the contract: a media rule for reduced motion must set animation
     // none on .issue-line-flow. (Walks every sheet; a cross-origin sheet cannot be read.)
@@ -933,7 +959,7 @@ describe("OverviewNext held work card", () => {
     await page.viewport(400, 900);
     mountWithHolds();
     await screen.findByText("Capacity");
-    await screen.findByText("custody slots used");
+    await screen.findByText("custody units used");
     await document.fonts.ready;
     expect(window.innerWidth).toBe(400);
     const capacity = cardOf(/Capacity/).getBoundingClientRect();
@@ -956,7 +982,7 @@ describe("OverviewNext held work card", () => {
     await page.viewport(1100, 900);
     mountWithHolds();
     await screen.findByText("Capacity");
-    await screen.findByText("custody slots used");
+    await screen.findByText("custody units used");
     await document.fonts.ready;
     const capacity = cardOf(/Capacity/).getBoundingClientRect();
     const held = cardOf(/Held work/).getBoundingClientRect();
@@ -1480,9 +1506,9 @@ describe("OverviewNext health chip popover", () => {
         <MemoryRouter initialEntries={["/overview/next"]}>
           <div style={{ paddingLeft: 240 }}>
             <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
-              {/* AppShell's content column, and the Search button (rendered only with a command
-                  menu), both push the chip right as in production; without them the old
-                  viewport-only floor never right-aligns over the sidebar and the case is vacuous. */}
+              {/* AppShell's content column bounds the actions beside the fixed sidebar. A
+                  test-owned item before the chip below puts its right-aligned panel over
+                  the sidebar if the content-column floor is removed. */}
               <div className="mx-auto w-full max-w-[68rem]">
                 <CommandMenuContext.Provider value={{ open: () => {} }}>
                   <OverviewNext />
@@ -1493,6 +1519,11 @@ describe("OverviewNext health chip popover", () => {
         </MemoryRouter>,
       );
       const chip = await screen.findByRole("button", { name: /System health/ });
+      const host = chip.parentElement!;
+      const preceding = document.createElement("span");
+      preceding.setAttribute("aria-hidden", "true");
+      preceding.style.cssText = "display:block;flex:0 0 auto;width:220px;height:1px";
+      host.parentElement!.insertBefore(preceding, host);
       await userEvent.click(chip);
       const dialog = await screen.findByRole("dialog", { name: "System health" });
       await document.fonts.ready;
@@ -1516,14 +1547,20 @@ describe("OverviewNext health chip popover", () => {
       </MemoryRouter>,
     );
     const chip = await screen.findByRole("button", { name: /System health/ });
+    // Search now follows the health chip (#4248). Add a test-owned flex item before the chip
+    // before opening, so the panel's ResizeObserver sees this sibling change size later.
+    const host = chip.parentElement!;
+    const actions = host.parentElement!;
+    const preceding = document.createElement("span");
+    preceding.setAttribute("aria-hidden", "true");
+    preceding.style.cssText = "display:block;flex:0 0 auto;width:0;height:1px";
+    actions.insertBefore(preceding, host);
     await userEvent.click(chip);
     const dialog = await screen.findByRole("dialog", { name: "System health" });
     await document.fonts.ready;
-    // A live sibling grows (as a refreshed header control would) and pushes the chip right.
-    const search = screen.getByRole("button", { name: /Search/ });
     const before = chip.getBoundingClientRect().left;
     // Wide enough that a stale chip-relative offset would push the panel past the right edge.
-    search.style.width = "720px";
+    preceding.style.width = "720px";
     await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
     // Re-placed against the chip's new position: attached to it and inside the viewport.
     await expect

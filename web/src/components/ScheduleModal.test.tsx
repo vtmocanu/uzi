@@ -69,6 +69,7 @@ beforeEach(async () => {
     settings: {
       harness_overflow_enabled: false,
       default_harness: null,
+      judge_runs_on: null,
       default_model: null,
       default_effort: null,
       judge_model: null,

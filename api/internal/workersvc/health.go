@@ -534,7 +534,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// excludes the pause, but it is NOT nudge-eligible on that tick: the whole backlog leaves the
 		// hold at once, and nudging here would burst a Slack DM per run right after the lift. Accepted
 		// trade-off (PRD #3454 D12): a run still stuck after the lift is not nudged until it
-		// clears to ok and flags again; only that later ok->flagged episode nudges.
+		// clears to ok and flags again; only that later ok->flagged episode nudges. Carve-out
+		// (issue #4162): a run leaving the hold straight into the per-run custody bound
+		// (enteredRunBound below) does nudge on that tick, because entry into that bound always
+		// nudges, subject to the cooldown.
 		leftMaintenance := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			r.HealthReason.String == reasonMaintenance && reason != reasonMaintenance
 		leftAdmission := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
@@ -544,7 +547,17 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// Expiry into ordinary silence or approval age stays quiet across the cohort.
 		independentFault := reason == reasonPersistFailing || reason == reasonLooping ||
 			reason == reasonNearTimeout || reason == reasonOutcomeUndelivered
-		nudge := target != healthOK && (r.Health == healthOK || leftPin || (leftAccountCooldown && independentFault)) &&
+		// Issue #4162: the per-run hold bound is the run's own condition, unlike the owner-level
+		// reasonCustodyLimit that the episode reconciler covers. A run that moves from any other
+		// waiting_worker reason into the bound reason starts a new nudge-eligible episode: the
+		// owner learns about a bound no earlier DM described. Entry from ok is already covered by
+		// the r.Health == healthOK term. A run leaving account cooldown straight into the bound
+		// also nudges, by design: entry into the per-run bound always nudges, subject to the
+		// cooldown. A run already carrying the bound reason does not
+		// re-nudge, and the cooldown term below still applies.
+		enteredRunBound := reason == apitypes.ReasonCustodyRunHoldBound &&
+			(!r.HealthReason.Valid || r.HealthReason.String != apitypes.ReasonCustodyRunHoldBound)
+		nudge := target != healthOK && (r.Health == healthOK || leftPin || enteredRunBound || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
 		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner
@@ -579,7 +592,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			nudge = false
 		}
 		// PRD #3454: maintenance is an expected, operator-announced wait; a worker-pickup nudge is noise.
-		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || leftAdmission || target == healthWaitingAccountCooldown {
+		// Leaving a Codex admission wait is also quiet (the run restarts its clock), EXCEPT when it
+		// enters the per-run custody bound (#4162): that is the run's own condition, so it nudges
+		// like any other entry into the bound, e.g. after an admin lowers custody_hold_limit.
+		if reason == reasonMaintenance || apitypes.IsCodexAdmissionReason(reason) || (leftAdmission && !enteredRunBound) || target == healthWaitingAccountCooldown {
 			nudge = false
 		}
 		// PRD #3522 M3: the weekly usage reserve is the owner's own deliberate limit, not a stuck
@@ -1294,7 +1310,7 @@ type healthEligibilityResult struct {
 // must not keep outranking an active cooldown after maintenance ends.
 func QueuedReasonPrecedesCodexAdmission(reason string) bool {
 	switch reason {
-	case reasonHandoffSetup, reasonVaultLocked, reasonCustodyLimit,
+	case reasonHandoffSetup, reasonVaultLocked, reasonCustodyLimit, apitypes.ReasonCustodyRunHoldBound,
 		reasonCustodyLimitUnavailable, reasonCodexAccountUnavailable:
 		return true
 	default:
@@ -1338,9 +1354,10 @@ func (s *Service) queuedPrerequisiteReason(ctx context.Context, now time.Time, r
 	// claim gates on (GetCustodyAdmissionForRun: the owner's admission-counted holds and the same
 	// limit value, read once per tick into th), so the pill and the claim never disagree. Issue
 	// #1751 / ADR-1751: a CONTINUATION-EXEMPT run (claim_generation >= 1 and its own open-hold
-	// count at least 1 and below the limit, the SAME expression ClaimRun's custody clause uses) is
+	// count at least 1 and below the limit, logically equivalent under the hard per-run bound to ClaimRun's custody clause) is
 	// admitted at/over the cap, so it never gets the custody reason; a run already holding
-	// limit holds of its own is not exempt and gets it like new work. #3150: there is no
+	// limit holds of its own is not exempt and gets the per-run bound reason
+	// (apitypes.ReasonCustodyRunHoldBound), which outranks the owner-level reason. #3150: there is no
 	// disabled/zero limit; when the setting could not be read this tick (th.custodyLimitOK
 	// false, which is also the zero value) ClaimRun refuses too, so the rung reports
 	// reasonCustodyLimitUnavailable instead of guessing. The per-run read also runs below the
@@ -1844,7 +1861,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 
 func (s *Service) youngQueuedTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
 	if reason := s.queuedPrerequisiteReason(ctx, now, r, th); reason != "" {
-		if reason == reasonCustodyLimit {
+		if reason == reasonCustodyLimit || reason == apitypes.ReasonCustodyRunHoldBound {
 			return healthWaitingWorker, reason
 		}
 		return healthOK, ""
@@ -2023,7 +2040,8 @@ func (s *Service) repoNotDockerAllowedReason(ctx context.Context, ownerID uuid.U
 }
 
 // queuedCustodyReason shares the claim admission formula between the early
-// custody diagnostic and the full queued reason ladder. A failed per-run read
+// custody diagnostic and the full queued reason ladder. The per-run hold bound
+// (apitypes.ReasonCustodyRunHoldBound) is resolved before the owner-limit arm. A failed per-run read
 // falls through; an unavailable setting remains a distinct prerequisite.
 func (s *Service) queuedCustodyReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) string {
 	if r.Kind != "cross_check" {
@@ -2041,6 +2059,10 @@ func (s *Service) queuedCustodyReason(ctx context.Context, now time.Time, r stor
 		})
 		if cerr != nil {
 			slog.Error("health: read custody admission", "run_id", r.ID, "error", cerr)
+		} else if adm.RunHoldBoundReached {
+			// ClaimRun's hard per-run bound (issue #4162) refuses the run whatever the owner count
+			// says, so it is the binding cause and outranks the owner-limit reason.
+			return apitypes.ReasonCustodyRunHoldBound
 		} else if !adm.ContinuationExempt && adm.AdmissionCountedHolds >= int64(th.custodyLimit) {
 			return reasonCustodyLimit
 		}

@@ -487,9 +487,20 @@ const RETAINED_SUCCESSOR_REASONS = new Set([
   "wrapper_marker_parent", "wrapper_lineage_ancestry", "wrapper_source_parent",
   "final_head", "final_tree", "final_marker_restoration", "final_dirty_diff", "final_ancestry",
   "attempt_invalid", "iteration_before", "episode_pin_changed", "identity_used", "seed_failed",
-  "iteration_after", "post_adoption_check",
+  "iteration_after", "post_adoption_check", "remediation_active", "remediation_proof_unknown",
 ]);
 const retainedSuccessorDiagnostics = new WeakMap<Error, string>();
+
+/** Closed wire values the api accepts as `recovery_detail` on an adoption-failure park. */
+export type RetainedAdoptionRefusal = "secret_remediation_active" | "remediation_proof_unknown";
+
+/** The single map from a refusal's annotation to its wire value. Only the two remediation reasons map; every other
+ * refusal (and every unannotated error) is unclassified, which selects generic text and never permits adoption. */
+export function retainedAdoptionRefusal(error: unknown): RetainedAdoptionRefusal | undefined {
+  const reason = error instanceof Error ? retainedSuccessorDiagnostics.get(error) : undefined;
+  return reason === "remediation_active" ? "secret_remediation_active"
+    : reason === "remediation_proof_unknown" ? "remediation_proof_unknown" : undefined;
+}
 
 /** Attach only a fixed successor reason, without changing the thrown value's public surface.
  * Callers retain responsibility for excluding their abort and control-flow sentinels. */
@@ -1892,6 +1903,16 @@ export interface RemediationRecovery {
   excludedRoots?: string[];
   active?: RemediationGrant;
   edges: Array<{ from: string; to: string; grant: RemediationGrant; context: string; phase: "prepared" | "committed" }>;
+}
+
+/** Worker-owned, per-query diagnostics; never carries journal bytes or exception text. */
+export interface RemediationRestrictionProgress {
+  started?: boolean;
+  /** Set when withLock enters its locked section; any later failure is post-acquisition and sticky (#4191). */
+  acquired?: boolean;
+  cause?: "pre_read_unavailable" | "enrolled_observed" | "blocked" | "integrity" | "identity" |
+    "changed_facts" | "post_read_expiry" | "unknown";
+  observe?: (facts: RemediationRestrictionFacts) => void;
 }
 
 /** Negative evidence only; neither the data nor its fingerprint grants source use. */
@@ -4606,7 +4627,7 @@ export class GitCache {
 
   /** Local recovery clocks, including queued locks and actual child settlement. */
   async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget,
-    opts?: { closureBudget?: { delivered: number; limit: number } }): Promise<T> {
+    opts?: { closureBudget?: { delivered: number; limit: number }; restrictionProgress?: RemediationRestrictionProgress }): Promise<T> {
     // A caller-shared decoded-byte account is used by identity, but never above this cache's own ceiling.
     if (opts?.closureBudget) {
       // A NaN or negative limit is a refusal (0 admits nothing); anything else is capped at the ceiling.
@@ -4625,8 +4646,14 @@ export class GitCache {
       : undefined;
     if (Date.now() >= deadline) timeout.abort(new RecoveryDeadlineExhaustedError());
     const run = async (): Promise<T> => {
-      combined.throwIfAborted();
-      budget?.check();
+      try {
+        combined.throwIfAborted();
+        budget?.check();
+      } catch (error) {
+        if (opts?.restrictionProgress && !opts.restrictionProgress.started && !opts.restrictionProgress.acquired)
+          opts.restrictionProgress.cause = "pre_read_unavailable";
+        throw error;
+      }
       return this.recoveryOperations.run({ signal: combined, deadline, budget,
         // An explicit closureBudget is used by identity (never copied): the caller shares one mutable decoded-byte
         // account across several operations, independent of the ambient parent's.
@@ -4634,12 +4661,29 @@ export class GitCache {
         closureCache: parent?.closureCache ?? { identities: new Map(), entries: 0 },
       }, async () => {
         const result = await action(combined);
-        this.checkRecoveryInterruption();
+        try { this.checkRecoveryInterruption(); }
+        catch (error) {
+          if (opts?.restrictionProgress) opts.restrictionProgress.cause = "post_read_expiry";
+          throw error;
+        }
         return result;
       });
     };
     try { return await (budget ? MaintenanceBudget.run(budget, run) : run()); }
+    catch (error) {
+      // MaintenanceBudget.run checks the budget before entering `run`; classify that entry expiry only when it is
+      // positively the budget's own and no read has started.
+      if (opts?.restrictionProgress && !opts.restrictionProgress.started && !opts.restrictionProgress.acquired &&
+        this.isBudgetExpiry(error, budget))
+        opts.restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** Positive identity only: the error is a deadline expiry raised by one of these budgets (or the ambient one). */
+  private isBudgetExpiry(error: unknown, ...budgets: Array<MaintenanceBudget | undefined>): boolean {
+    return [...budgets, MaintenanceBudget.current()].some(b => b?.ownsExpiry(error) === true);
   }
 
   /** Central helpers also honor a budget scoped before any explicit recovery wrapper. */
@@ -9236,8 +9280,9 @@ export class GitCache {
    * throws. This never creates pins, opens a grant, or admits execution/publication of tracking. */
   async readRuntimeRemediationRecovery(barePath: string, branch: string,
     expectedSource: { runId: string; clonePath: string; attemptId?: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRecovery | undefined> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<RemediationRecovery | undefined> {
     return this.withLock(barePath, async () => {
+      if (progress) progress.started = true;
       // This read has no discovery/normalization effects. Legacy unenrolled sources need no
       // attempt identity; enrollment still requires the independently selected exact attempt.
       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
@@ -9245,7 +9290,7 @@ export class GitCache {
       if (!expectedSource.attemptId) throw new Error("remediation source identity unavailable");
       return this.readRemediationUnderLock(barePath, branch,
         { ...expectedSource, attemptId: expectedSource.attemptId }, durability, "runtime-restrictions");
-    });
+    }, undefined, progress);
   }
 
   /**
@@ -9254,11 +9299,19 @@ export class GitCache {
    * One two-read pass, no retries or writes; any unavailable evidence holds by throwing.
    * The fingerprint coordinates transient changes only, never eligibility or preservation.
    */
+  private readonly restrictionProgress = new AsyncLocalStorage<RemediationRestrictionProgress>();
+
+  /** Read-local context preserves the legacy three-argument custody reader seam. */
+  withRemediationRestrictionProgress<T>(progress: RemediationRestrictionProgress, action: () => Promise<T>): Promise<T> {
+    return this.restrictionProgress.run(progress, action);
+  }
+
   async readRemediationRestrictionFacts(barePath: string, branch: string, exactRunId: string,
     workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRestrictionFacts> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<RemediationRestrictionFacts> {
+    progress ??= this.restrictionProgress.getStore();
     return this.withRemediationRestrictionFacts(barePath, branch, exactRunId,
-      async facts => facts, workerSelectedSource, durability);
+      async facts => { progress?.observe?.(facts); return facts; }, workerSelectedSource, durability, progress);
   }
 
   /** Consume negative evidence while retaining B through awaited consumer completion.
@@ -9269,15 +9322,16 @@ export class GitCache {
   async withRemediationRestrictionFacts<T>(barePath: string, branch: string, exactRunId: string,
     consume: (facts: RemediationRestrictionFacts) => Promise<T>,
     workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
-    durability: MemoryParkDurability = {}): Promise<T> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<T> {
     // A caller-owned options object cannot redirect the identity while waiting for B.
     const source = workerSelectedSource && { runId: workerSelectedSource.runId,
       clonePath: workerSelectedSource.clonePath, attemptId: workerSelectedSource.attemptId };
     return this.withLock(barePath, async () => {
+      if (progress) progress.started = true;
       const facts = await this.remediationRestrictionFactsUnderLock(
-        barePath, branch, exactRunId, source, durability);
+        barePath, branch, exactRunId, source, durability, progress);
       return await consume(facts);
-    });
+    }, undefined, progress);
   }
 
   /** Admission consumes fresh negative evidence under B; false blocked is never a grant. */
@@ -9298,14 +9352,27 @@ export class GitCache {
   /** Shared by worker callbacks that already own B; never reacquire B here. */
   private async remediationRestrictionFactsUnderLock(barePath: string, branch: string, exactRunId: string,
     workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRestrictionFacts> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<RemediationRestrictionFacts> {
+    function fail(cause: NonNullable<RemediationRestrictionProgress["cause"]>, message: string): never {
+      if (progress) progress.cause = cause;
+      throw new Error(message);
+    }
+    const observe = (record: RemediationRecovery | undefined): void => {
+      if (!record || !progress) return;
+      progress.cause = "enrolled_observed";
+      progress.observe?.({ enrolled: true,
+        blocked: record.blocked !== false || record.excludedRoots === undefined || record.edges.some(e => e.phase !== "committed"),
+        flaggedOIDs: record.flaggedOIDs,
+        roots: [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])],
+        fingerprint: "" });
+    };
     try {
       if (!OWED_RUN_ID.test(exactRunId) || Buffer.byteLength(exactRunId) > 128 ||
           sanitizeForLog(exactRunId, Infinity) !== exactRunId || !validRemediationBranch(branch) ||
           Buffer.byteLength(branch) > 1024 || sanitizeForLog(branch, Infinity) !== branch)
-        throw new Error("invalid restriction identity");
+        fail("identity", "invalid restriction identity");
       if (workerSelectedSource && workerSelectedSource.runId !== exactRunId)
-        throw new Error("restriction source run mismatch");
+        fail("identity", "restriction source run mismatch");
       const read = async () => {
         const snapshot = await this.readRecoverySnapshot(barePath);
         // Unlike the legacy last-value reader, negative absence cannot ignore duplicates.
@@ -9313,32 +9380,36 @@ export class GitCache {
         const key = recoveryCaptureKey(branch);
         const activeEntries = entries.filter(e => e === key || e.startsWith(key + "\n"));
         if (activeEntries.length > 1 || activeEntries.some(e => !e.startsWith(key + "\n")))
-          throw new Error("ambiguous restriction journal");
+          fail("integrity", "ambiguous restriction journal");
         let activeRaw = activeEntries[0]?.slice(key.length + 1) || undefined;
-        let active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw);
+        let active: RecoveryJournalEntry | undefined;
+        try { active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw); }
+        catch { fail("integrity", "invalid restriction journal"); }
         // issue #3644: under a composite the active journal is S's entry (P is opaque and plain). A tombstone has none, so
         // `activeSource` stays undefined, syncJournalAndReadBack then compares that absence with P's non-empty raw and
         // throws: restriction facts REFUSE (fail closed) under a tombstone.
         let activeSource: { runId: string; clonePath: string; attemptId?: string } | undefined;
         if (this.restoreValueIn(entries, branch) !== undefined) {
           const composite = await this.resolveBranchJournalUnderLock(barePath, branch, entries);
-          if (composite.kind !== "composite") throw new Error("restriction restore composite unavailable");
+          if (composite.kind !== "composite") fail("integrity", "restriction restore composite unavailable");
           const live = composite.successor.kind === "entry" && composite.stage !== "retired" ? composite.successor : undefined;
           active = live?.journal;
           activeRaw = live?.raw;
           activeSource = live?.journal;
         }
+        if (active?.runId === exactRunId) observe(active.remediationRecovery);
         // Ordinary journals retain their legacy writer order. Strict parsing and the two
         // identical raw reads prove absence; only enrolled evidence requires canonical bytes.
         if (active?.remediationRecovery && recoveryJournalJson(active) !== activeRaw)
-          throw new Error("noncanonical restriction journal");
+          fail("integrity", "noncanonical restriction journal");
         if (workerSelectedSource) {
           const authenticated = await this.remediationSourceUnderLock(barePath, branch, workerSelectedSource, snapshot);
-          if (authenticated.raw !== activeRaw) throw new Error("restriction source changed");
+          if (authenticated.raw !== activeRaw) fail("changed_facts", "restriction source changed");
         }
         const protectedRaw: string[] = [];
         const protectedRecords = await this.protectedRecoveries(barePath, exactRunId, raw => protectedRaw.push(raw), snapshot);
-        if (protectedRecords.some(r => r.branch !== branch)) throw new Error("restriction custody branch mismatch");
+        for (const record of protectedRecords) observe(record.journal.remediationRecovery);
+        if (protectedRecords.some(r => r.branch !== branch)) fail("identity", "restriction custody branch mismatch");
         const relevant = active?.runId === exactRunId ? [active] : [];
         for (const journal of relevant) {
           const shape = parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot));
@@ -9347,15 +9418,22 @@ export class GitCache {
         }
         relevant.push(...protectedRecords.map(r => r.journal));
         if (relevant.some(j => j.remediationRecovery && j.remediationRecovery.branch !== branch))
-          throw new Error("restriction record branch mismatch");
+          fail("identity", "restriction record branch mismatch");
         return { activeRaw, protectedRaw, relevant, activeSource };
       };
       const first = await read();
-      await this.syncJournalAndReadBack(barePath, branch, first.activeRaw, durability, first.activeSource);
+      await this.syncJournalAndReadBack(barePath, branch, first.activeRaw, {
+        ...durability,
+        readback: async read => {
+          const back = durability.readback ? await durability.readback(read) : await read();
+          if (back !== first.activeRaw && progress) progress.cause = "changed_facts";
+          return back;
+        },
+      }, first.activeSource);
       const second = await read();
       if (first.activeRaw !== second.activeRaw ||
           JSON.stringify(first.protectedRaw) !== JSON.stringify(second.protectedRaw))
-        throw new Error("restriction read-back differs");
+        fail("changed_facts", "restriction read-back differs");
       const records = second.relevant.flatMap(j => j.remediationRecovery ? [j.remediationRecovery] : []);
       const flaggedOIDs = [...new Set(records.flatMap(r => r.flaggedOIDs))].sort();
       const roots = [...new Set(records.flatMap(r =>
@@ -9364,7 +9442,7 @@ export class GitCache {
       // Each stored record already passed its 64 KiB bound. Two identical active
       // and protected copies must not invent a smaller per-record limit.
       if (flaggedOIDs.length > 64 || roots.length > 1524)
-        throw new Error("restriction union overflow");
+        fail("integrity", "restriction union overflow");
       const fingerprint = createHash("sha256").update(JSON.stringify({
         runId: exactRunId, branch, source: workerSelectedSource ? { runId: workerSelectedSource.runId,
           clonePath: workerSelectedSource.clonePath, attemptId: workerSelectedSource.attemptId } : null,
@@ -10606,6 +10684,28 @@ export class GitCache {
     });
   }
 
+  /** Crash rediscovery for a blocked `adoption_failed` journal whose in-memory refusal class died with the previous
+   * process. Classification only, never admission: it re-runs the read-only remediation source selection under the
+   * bare lock and maps an annotated refusal to its wire value. Success, an unannotated refusal, an interrupted
+   * operation, a changed identity or any missing precondition all answer undefined (the generic text). Writes no
+   * ledger, pin or journal content; the evidence read may only re-sync the unchanged canonical journal bytes. */
+  async classifyBlockedRemediationAdoption(barePath: string, branch: string, key: string, expected: RecoverySource):
+    Promise<RetainedAdoptionRefusal | undefined> {
+    try {
+      return await this.withLock(barePath, async () => {
+        // allowLegacyRepair=false: this read can never append an attempt-ledger entry.
+        const journal = await this.checkedRecovery(barePath, branch, key, expected, false, undefined, false);
+        const recovery = journal.recovery;
+        if (recovery?.stage !== "blocked" || recovery.blocker !== "adoption_failed" ||
+            !journal.remediationRecovery || !recovery.restoreSource) return undefined;
+        try {
+          await this.remediationAdoptionUnderLock(barePath, branch, expected, recovery.restoreSource);
+          return undefined;
+        } catch (error) { return retainedAdoptionRefusal(error); }
+      });
+    } catch { return undefined; }
+  }
+
   /** Resolve only the exact charged source/reservation, or its explicitly verified handoff.
    * This handles a journal-root write landing before prepareRecoverySuccessor throws. */
   async recoveryReservationSnapshot(barePath: string, branch: string, key: string,
@@ -11162,12 +11262,44 @@ export class GitCache {
     if (!expected.attemptId || !src) throw new Error("remediation adoption source unavailable");
     const record = await this.readRemediationUnderLock(barePath, branch, { ...expected, attemptId: expected.attemptId });
     if (!record || record.ownedTip !== src) throw new Error("remediation adoption source unverified");
-    for (const oid of [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])]) {
-      if (await this.ancestry(barePath, oid, src) !== "divergent")
-        throw new Error("remediation adoption source still restricted");
+    const roots = [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])];
+    const restricted = await this.classifyRestrictedRoots(barePath, roots, src);
+    if (restricted !== "clear") {
+      const error = new Error("remediation adoption source still restricted");
+      if (restricted !== "unclassified") annotateRetainedSuccessorError(error, restricted);
+      throw error;
     }
     await this.proveRemediationForwardTarget(barePath, record, src);
     return record;
+  }
+
+  /** Classify why a restricted root is not divergent from the source. Stops at the first `ancestor` (active
+   * remediation); an `unknown` probe is passed over and, when no ancestor is found, means the proof is unknown.
+   * Once the operation signal or deadline has fired `ancestry` answers `unknown` for the wrong reason, so an
+   * interrupted refusal carries no class at all. Classification only: it never admits a source. */
+  private async classifyRestrictedRoots(barePath: string, roots: readonly string[], src: string):
+    Promise<"clear" | "remediation_active" | "remediation_proof_unknown" | "unclassified"> {
+    let unknown = false;
+    for (const oid of roots) {
+      const relation = await this.ancestry(barePath, oid, src);
+      if (relation === "ancestor") return "remediation_active";
+      if (relation === "unknown") unknown = true;
+    }
+    if (!unknown) return "clear";
+    try { this.checkRecoveryInterruption(); }
+    catch { return "unclassified"; }
+    if (this.boundaryProcesses.getStore()?.signal.aborted) return "unclassified";
+    return "remediation_proof_unknown";
+  }
+
+  /** The replacement-ancestry refusal, classified as an unknown proof unless the operation was interrupted
+   * (an aborted or expired probe answers `unknown` for reasons that say nothing about the evidence). */
+  private unknownReplacementAncestry(): Error {
+    const error = new Error("remediation replacement ancestry unknown");
+    let interrupted = this.boundaryProcesses.getStore()?.signal.aborted === true;
+    try { this.checkRecoveryInterruption(); } catch { interrupted = true; }
+    if (!interrupted) annotateRetainedSuccessorError(error, "remediation_proof_unknown");
+    return error;
   }
 
   /** Each target gets its own bounded ordered proof: at most 64 edges and 64 squared
@@ -11183,7 +11315,7 @@ export class GitCache {
       if (visiting.has(index) || visiting.size >= 64) return false;
       const edge = record.edges[index]!;
       const relation = await this.ancestry(barePath, edge.to, target);
-      if (relation === "unknown") throw new Error("remediation replacement ancestry unknown");
+      if (relation === "unknown") throw this.unknownReplacementAncestry();
       if (relation === "ancestor") { reached.add(index); return true; }
       const next = new Set(visiting).add(index);
       for (let i = 0; i < record.edges.length; i++) {
@@ -11192,7 +11324,7 @@ export class GitCache {
         // cover several partial rewrites; grant identity need not increase per edge.
         if (i <= index) continue;
         const progress = await this.ancestry(barePath, edge.to, later.from);
-        if (progress === "unknown") throw new Error("remediation replacement ancestry unknown");
+        if (progress === "unknown") throw this.unknownReplacementAncestry();
         if (progress === "ancestor" && await reaches(i, next)) { reached.add(index); return true; }
       }
       refused.add(index);
@@ -26765,13 +26897,25 @@ try {
    * promptly and forfeits its slot without running `fn`. The stored chain still
    * waits for the prior holder before it settles, so a cancelled waiter can never
    * let a later mutation overtake the holder and violate serialization. */
-  private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal, restrictionProgress?: RemediationRestrictionProgress): Promise<T> {
     const prev = this.locks.get(key) ?? Promise.resolve();
     const boundary = this.boundaryProcesses.getStore();
-    const recovery = this.recoveryOperation();
+    let recovery: ReturnType<typeof this.recoveryOperation>;
+    try { recovery = this.recoveryOperation(); }
+    catch (error) {
+      // Only a positively identified maintenance-budget expiry before any read is a clearable interruption.
+      if (restrictionProgress && !restrictionProgress.started && !restrictionProgress.acquired
+        && this.isBudgetExpiry(error, this.recoveryOperations.getStore()?.budget)) restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     const report = this.reportProofs.getStore();
     this.checkReportProof();
-    this.checkRecoveryInterruption();
+    try {
+      this.checkRecoveryInterruption();
+    } catch (error) {
+      if (restrictionProgress && !restrictionProgress.acquired) restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     const signals = [boundary?.signal, recovery?.signal, report?.signal, MaintenanceBudget.signal()].filter((s): s is AbortSignal => s !== undefined);
     const scope = signals.length ? { signal: AbortSignal.any(signals) } : undefined;
     const softSignal = boundary?.softSignal;
@@ -26787,6 +26931,7 @@ try {
     const abortBeforeAcquisition = (): void => {
       if (started || settled) return;
       settled = true;
+      if (restrictionProgress) restrictionProgress.cause = "pre_read_unavailable";
       removeAbortListener();
       rejectResult(signal?.aborted ? new Error(GIT_LOCK_WAIT_ABORT_MESSAGE) : scope?.signal.aborted
         ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE, undefined, boundary?.capture?.signal)
@@ -26812,12 +26957,23 @@ try {
         return;
       }
       started = true;
+      if (restrictionProgress) restrictionProgress.acquired = true;
       removeAbortListener();
       let outcome: { ok: true; value: T } | { ok: false; error: unknown };
       try {
-        this.checkRecoveryInterruption();
+        // The bare lock is already held here (started = true above), so a failure is post-acquisition
+        // and must stay sticky (#4191): it is never classified as pre-read unavailability.
+        try { this.checkRecoveryInterruption(); }
+        catch (error) {
+          if (restrictionProgress) restrictionProgress.cause = "unknown";
+          throw error;
+        }
         const value = await fn();
-        this.checkRecoveryInterruption();
+        try { this.checkRecoveryInterruption(); }
+        catch (error) {
+          if (restrictionProgress) restrictionProgress.cause = "post_read_expiry";
+          throw error;
+        }
         outcome = { ok: true, value };
       } catch (error) {
         outcome = { ok: false, error };
@@ -26829,7 +26985,10 @@ try {
         await boundary.beforeLockRelease(key).catch(() => undefined);
       }
       try { this.checkRecoveryInterruption(); }
-      catch (error) { outcome = { ok: false, error }; }
+      catch (error) {
+        if (restrictionProgress?.started) restrictionProgress.cause = "post_read_expiry";
+        outcome = { ok: false, error };
+      }
       settled = true;
       if (outcome.ok) resolveResult(outcome.value);
       else rejectResult(outcome.error);

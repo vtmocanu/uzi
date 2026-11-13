@@ -467,6 +467,19 @@ type PendingJudgeDTO struct {
 	EnqueuedAt time.Time `json:"enqueued_at"`
 }
 
+// JudgeSkipDTO is the recorded reason the automatic judge of a run was skipped (issue #3257):
+// the judge's harness had no usable credential. Harness is "claude" or "codex"; Reason is the
+// closed set "no_usable_credential" | "credential_disabled" | "codex_pool_unavailable"
+// (workersvc.JudgeSkipReasons); At is when it was recorded. Like PendingJudgeDTO it is a
+// SIBLING key on the review response ({"review": ..., "pending_judge": ..., "skip": ...}),
+// always present and null when nothing was skipped. It is non-null only for an unjudged run
+// with no judge in flight.
+type JudgeSkipDTO struct {
+	Harness string    `json:"harness"`
+	Reason  string    `json:"reason"`
+	At      time.Time `json:"at"`
+}
+
 // JudgeRunDTO is the judge run's own timing + token/cost usage for the reviewed run's
 // panel (PRD #69 M6, Decision 10). Judge spend is the owner's own token spend: the judge
 // run posts its observed model usage as a result frame, so foldRunUsage writes a

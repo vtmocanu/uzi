@@ -240,7 +240,15 @@ func TestMergedPredecessorAutomaticPollingLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if list.Aggregate.OpenHolds != aggregateBefore.Aggregate.OpenHolds-1 || list.Aggregate.AdmissionCountedHolds != aggregateBefore.Aggregate.AdmissionCountedHolds-1 {
+			// Admission counts units (issue #4162): on the same worker the discarded
+			// generation-1 hold shares one unit with the run's generation-2 hold, which
+			// stays open, so only the open count falls; on another worker it was a unit
+			// of its own.
+			wantCountedDrop := 1
+			if sameWorker {
+				wantCountedDrop = 0
+			}
+			if list.Aggregate.OpenHolds != aggregateBefore.Aggregate.OpenHolds-1 || list.Aggregate.AdmissionCountedHolds != aggregateBefore.Aggregate.AdmissionCountedHolds-wantCountedDrop {
 				t.Fatal("nonancestor aggregate did not fall")
 			}
 			for _, h := range list.Holds {

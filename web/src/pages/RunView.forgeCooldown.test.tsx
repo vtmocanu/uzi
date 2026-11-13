@@ -54,6 +54,10 @@ it.each([undefined, false, true])("only confirmed owner proof %s exposes held ac
   expect(screen.getByText(/Export requires a verified available recovery archive/)).toBeTruthy();
   expect(screen.queryByRole("link", { name: /download|export/i })).toBeNull();
 });
+it("held forge park carries the per-run custody bound note", () => {
+  render(view(forge(), true));
+  expect(screen.getByText(/this run being at its own custody hold limit \(no claim, no hold\) may still block admission\. Resume requeues the run, but a run at its own custody hold limit is not claimed and takes no new hold until enough of its own holds are discarded or settled\./)).toBeTruthy();
+});
 it("requires canSteer even after owner proof and uses normal Resume and Cancel", async () => {
   const { rerender } = render(view(forge(), true, false));
   expect(screen.queryByRole("button", { name: /^Resume$/ })).toBeNull();

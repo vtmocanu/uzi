@@ -357,9 +357,55 @@ roll until you cancel or discard it. See
 1. Read `uzi run recovery <id>` and export an available archive before deciding;
    an earlier archive may omit the latest local work.
 2. Choose `uzi run resume <id>` to request another bounded attempt, or
-   `uzi run cancel <id>` to end the run. Resume does not guarantee success.
+   `uzi run cancel <id>` to end the run. Resume does not guarantee success. On
+   `secret_remediation_active` Resume is refused (409): export an available
+   archive or have an operator recover from worker storage, then Cancel.
 3. If adoption fails again, the run holds again. Without a fresh owner Resume,
    redispatch reholds without another capture or model turn.
+
+**Recovery detail (#4177).** A run on this cause can carry a closed-set
+`recovery_wait_detail` (the Run field; valid only on `recovery_wait` /
+`retained_recovery_adoption_failed`):
+
+- `secret_remediation_active`: the retained source still descends from a
+  secret-scan-flagged commit, so retrying unchanged cannot help.
+- `remediation_proof_unknown`: the worker could not verify the remediation
+  proof (an unknown ancestry probe or an untrusted scan), so a retry may help.
+- Absent (NULL): unclassified. The generic text above applies and nothing new is
+  permitted; a missing classification never permits adoption.
+
+On `secret_remediation_active`, owner Resume (`uzi run resume`, `resume-now`, the
+web Resume) is refused with a 409 before any write: no claim, no claim
+generation, no audit row and no custody released. The message is "The retained
+source is held under an active secret-scan remediation; Resume cannot succeed
+unchanged. An available recovery archive (`uzi run export <id>`) may omit later
+work kept on the worker; an operator can recover the retained work from worker
+storage. Cancel ends the run." The resume SQL is fenced on the same predicate.
+The two routes are an available archive (`uzi run export <id> --output <path>`,
+which may omit later work; an archive is not proven to hold the latest work) or
+operator recovery from retained worker storage (see
+[Run recovery](run-recovery.md#retained-source-failure-and-local-proof), the
+failed source-only paragraph), then Cancel. `uzi run get`, `list`, `wait`, `inputs`,
+and the TUI print no Resume command in this state and the web run page shows Resume
+disabled with the reason; for
+`remediation_proof_unknown` they say a retry may help.
+
+The worker reports the detail as optional `recovery_detail` on the park, only
+after the API advertises the register feature
+`recovery_detail_adoption_refusal_v1`; the API 400s any other value, state,
+cause or a non-positive `claim_generation`. Deploy the API first. A confirmed
+restricted ancestor or a trusted scan finding gives `secret_remediation_active`;
+an unknown ancestry probe or an untrusted scan gives `remediation_proof_unknown`;
+an unknown probe after an abort or deadline, a deadline that rewrites the blocker,
+and every other refusal give no detail. After a worker process crash between
+persisting the blocker and the park, a fresh claim re-derives the class from the
+persisted journal, read-only and authenticated, in its own bounded operation;
+anything it cannot verify gives no detail, so a class known only from a
+callback is NULL after such a crash. This covers a process crash only and claims
+nothing for storage or power loss. A worker could under-report the class: the
+detail is advisory text for the owner, not an authority. The #4058 predecessor
+remediation hold and the unsupported-predecessor hold stay unclassified. See the
+[ADR-1197 #4177 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-11-12-4177-a-closed-set-detail-on-the-adoption-failed-park-resume-refused-on-an-active-secret-remediation).
 
 A valid legacy budget-exhaustion renewal on an upgraded worker records its raw
 owner baseline before recovery work. If adoption then fails, the next owner
@@ -518,9 +564,14 @@ Nothing restarts the worker for you.
 Boundaries. Workers that provide neither witness (an old agent that sends no
 registration evidence and never lists the run in a snapshot) and workers that
 re-register between refusals are not witnessed; they remain bounded only by the per-run custody
-bound (`custody_hold_limit`, default 8, ADR-1751 D2a), which can still block the
-owner. If `custody_hold_limit` is below the requeue budget the run stays
-`queued` with health `custody_limit` instead of parking. Migration 00404's Down
+bound (`custody_hold_limit`, default 8, ADR-1751 D2a), which since #4162 is a hard
+bound: it blocks only that run, whatever the owner's admission units. If
+`custody_hold_limit` is below the requeue budget the run stays `queued` with the
+per-run reason ("this run has reached its own custody hold limit; retained holds
+still protect its work; resolve or discard this run's own retained holds to let it
+start", not the owner custody-limit wait) instead of parking. Resume does not
+bypass it and creates no further claim or hold; discard or settle that run's own
+holds to free it. Migration 00404's Down
 refuses while any run is parked at this cause (Resume or Cancel it first) and
 clears the cause on other rows.
 
@@ -1377,7 +1428,7 @@ historical-evidence rules above remain in force.
   `retained_recovery_exhausted` has bounded timed retries followed by an owner
   hold (a capacity-only window is held for the owner below the cap); see [Retained recovery exhausted](#retained-recovery-exhausted).
   `retained_recovery_adoption_failed` instead requires owner Resume or Cancel,
-  with no automatic retry, including for an unsupported restore predecessor; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
+  with no automatic retry, including for an unsupported restore predecessor; Resume is refused on the `secret_remediation_active` detail; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
   `retained_continuation_unwitnessed` is likewise owner Resume or Cancel with no
   automatic retry; see [Unwitnessed continuation hold](#unwitnessed-continuation-hold).
   `anthropic_spend_limit` is owner Resume, Switch token or Cancel with no timer;
