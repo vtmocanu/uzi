@@ -4710,8 +4710,8 @@ export interface HarnessRuns {
 export interface AdminUsage {
   factory: SelfUsage;
   users: AdminUsageUser[];
-  /** ISO timestamp of the factory's earliest primary work run with recorded usage (for the "since
-   *  <date>" line); null when the factory has no usage yet (PRD #40). */
+  /** ISO timestamp of the factory's earliest usage-bearing run's creation time (helper runs included;
+   *  for the "since <date>" line); null when the factory has no usage yet (PRD #40). */
   earliest_run: string | null;
 }
 

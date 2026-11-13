@@ -544,6 +544,18 @@ describe("primary work scope (#4209)", () => {
       last7_subscription_run_count: 0, last7_unreported_run_count: 0 };
   };
 
+  it("counts only users with recorded usage, not outcome-only zero rows", () => {
+    const f = fixture();
+    const zeroRow = {
+      ...f.admin.users[0], user_id: "idle", email: "idle.person@example.com", usage: zeroBundle(),
+      run_count: 0, subscription_run_count: 0, unreported_run_count: 0,
+    };
+    f.admin.users.push(zeroRow);
+    const view = mount({ ...f, initial: "lifetime" });
+    const { factory } = columns(view);
+    expect(factory.getByText(/primary work runs with token usage/).textContent).toMatch(/ · 2 users with recorded usage$/);
+  });
+
   it("shows helper-only spend and not the empty message when run_count is 0", () => {
     const self = helperOnly();
     const view = mount({ self, initial: "lifetime" });

@@ -13,6 +13,7 @@ import {
 } from "./usageParts";
 import { breakdown, perUserRows } from "../lib/usageByUser";
 import { costShareRows } from "../lib/costShares";
+import { hasRecordedLifetimeUsage } from "../lib/usageRecorded";
 
 // PRD #40: one usage summary, with personal figures for everyone and factory
 // figures plus the selected-window per-user section only from the admin-gated response.
@@ -98,6 +99,8 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
   const failureOwner = admin?.users.find((u) => u.user_id === admin.factory.outcomes.lifetime.last_failed_user_id);
   const owner = failureOwner ? maskEmail(failureOwner.email, demo) : undefined;
   const since = admin ? formatSince(admin.earliest_run) : "";
+  // The API appends zero-usage rows for outcome-only users; count only users with recorded usage.
+  const usersWithUsage = admin ? admin.users.filter((u) => hasRecordedLifetimeUsage(u.usage, u.run_count, u.subscription_run_count, u.unreported_run_count)).length : 0;
   return (
     <Card className="min-w-0">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -106,7 +109,7 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
       </div>
       <div className={cx("mt-4 grid gap-x-6 gap-y-3", admin && "md:grid-cols-2 md:grid-rows-[repeat(7,auto)]")}>
         <UsageColumn usage={self} window={window} personal aligned={!!admin} runCountLine={`${self.run_count.toLocaleString("en-US")} primary work ${self.run_count === 1 ? "run" : "runs"} with token usage`} />
-        {admin && <UsageColumn usage={admin.factory} window={window} personal={false} aligned owner={owner} runCountLine={`${admin.factory.run_count.toLocaleString("en-US")} primary work runs with token usage${since ? ` since ${since}` : ""} · ${admin.users.length} ${admin.users.length === 1 ? "user" : "users"} with recorded usage`} />}
+        {admin && <UsageColumn usage={admin.factory} window={window} personal={false} aligned owner={owner} runCountLine={`${admin.factory.run_count.toLocaleString("en-US")} primary work runs with token usage${since ? ` since ${since}` : ""} · ${usersWithUsage} ${usersWithUsage === 1 ? "user" : "users"} with recorded usage`} />}
       </div>
       <p className="mt-3 text-[11px] leading-relaxed text-muted">{USAGE_SCOPE_NOTE}</p>
       {admin && (

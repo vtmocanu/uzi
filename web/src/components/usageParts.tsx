@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { failureRecency } from "../lib/failureRecency";
+import { hasRecordedLifetimeUsage } from "../lib/usageRecorded";
 import { useNow } from "../lib/useNow";
 import { stripUnsafeChars } from "../lib/safeText";
 import type { RunOutcomes, SelfUsage } from "../lib/api";
@@ -21,14 +22,7 @@ export const USAGE_SCOPE_NOTE =
 // run_count 0 yet real spend. "Nothing recorded" is true only when tokens, cost, the
 // subscription/unreported counts and the run count are all zero.
 export function hasRecordedUsage(usage: SelfUsage): boolean {
-  const l = usage.lifetime;
-  return (
-    l.input_tokens + l.cache_read_tokens + l.cache_creation_tokens + l.output_tokens !== 0 ||
-    l.cost_usd !== 0 ||
-    usage.lifetime_subscription_run_count !== 0 ||
-    usage.lifetime_unreported_run_count !== 0 ||
-    usage.run_count > 0
-  );
+  return hasRecordedLifetimeUsage(usage.lifetime, usage.run_count, usage.lifetime_subscription_run_count, usage.lifetime_unreported_run_count);
 }
 
 // failureRecency for a cell that reads "<value> ago": only a duration gets " ago"; the
