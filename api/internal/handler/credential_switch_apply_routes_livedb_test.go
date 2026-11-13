@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -128,6 +129,9 @@ func (e *applyRouteEnv) applyPath() string {
 
 func TestWorkerCredentialSwitchApplyRouteLiveDB(t *testing.T) {
 	e := setupApplyRouteLiveDB(t)
+	// AC5: capture everything the server logs (slog, and the standard log package it redirects) from here on.
+	logs := captureSlog(t)
+	slog.Info("credential switch apply route test: log capture canary")
 
 	t.Run("applied response is no-store and carries the token", func(t *testing.T) {
 		rec := e.do(e.worker, "POST", e.applyPath(), e.applyBody(e.op))
@@ -167,6 +171,13 @@ func TestWorkerCredentialSwitchApplyRouteLiveDB(t *testing.T) {
 		var leaked int
 		if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM run_messages WHERE run_id = $1 AND payload::text LIKE '%' || $2 || '%'`, e.run, e.plain).Scan(&leaked); err != nil || leaked != 0 {
 			t.Fatalf("run_messages carrying the token = %d (err %v)", leaked, err)
+		}
+		got := logs.String()
+		if !strings.Contains(got, "log capture canary") {
+			t.Fatal("the log capture is not wired: the canary record is missing")
+		}
+		if strings.Contains(got, e.plain) {
+			t.Fatal("the token appears in the server's logs")
 		}
 	})
 
@@ -233,6 +244,35 @@ func TestWorkerCredentialSwitchStateUncertainRouteLiveDB(t *testing.T) {
 	var refusal map[string]any
 	if rec.Code != http.StatusConflict || json.Unmarshal(rec.Body.Bytes(), &refusal) != nil || refusal["reason"] != "park_pending" {
 		t.Fatalf("wall-pending uncertain: status %d body %s, want 409 park_pending", rec.Code, rec.Body)
+	}
+}
+
+// Issue #4201 m5.8: the op-carrying failed report is fenced to the current registration incarnation.
+func TestWorkerCredentialSwitchStateFailedRouteLiveDB(t *testing.T) {
+	e := setupApplyRouteLiveDB(t)
+	path := "/api/worker/runs/" + e.run.String() + "/state"
+	failed := func(nonce string) *httptest.ResponseRecorder {
+		body := fmt.Sprintf(`{"status":"credential_switch_failed","claim_generation":%d,"op_id":%q}`, e.gen, e.op)
+		if nonce != "" {
+			body = fmt.Sprintf(`{"status":"credential_switch_failed","claim_generation":%d,"register_nonce":%q,"op_id":%q}`, e.gen, nonce, e.op)
+		}
+		return e.do(e.worker, "POST", path, body)
+	}
+	stamped := func() bool {
+		var pending bool
+		if err := e.pool.QueryRow(context.Background(), `SELECT credential_switch_requested_at IS NOT NULL FROM runs WHERE id = $1`, e.run).Scan(&pending); err != nil {
+			t.Fatal(err)
+		}
+		return pending
+	}
+	if rec := failed("nonce-superseded"); rec.Code != http.StatusConflict || !stamped() {
+		t.Fatalf("superseded nonce: status %d body %s stamped=%v, want 409 and the stamp kept", rec.Code, rec.Body, stamped())
+	}
+	if rec := failed(""); rec.Code != http.StatusBadRequest || !stamped() {
+		t.Fatalf("op without a nonce: status %d body %s stamped=%v, want 400 and the stamp kept", rec.Code, rec.Body, stamped())
+	}
+	if rec := failed(applyRouteNonce); rec.Code != http.StatusOK || stamped() {
+		t.Fatalf("current nonce: status %d body %s stamped=%v, want 200 and the stamp cleared", rec.Code, rec.Body, stamped())
 	}
 }
 

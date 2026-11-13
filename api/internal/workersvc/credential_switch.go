@@ -189,7 +189,9 @@ func (s *Service) releaseCredentialSwitch(ctx context.Context, owned store.Run, 
 //   - non-zero → re-read, emit a best-effort observability note (the note NEVER fails the report;
 //     the stamp CLEAR is the load-bearing behavior), and return (run, true, nil).
 //
-// ACCEPTED TRADEOFF (matches pause_failed): the clear carries no per-request discriminator, so a
+// The op-carrying form additionally requires the current registration nonce (see the clear below).
+//
+// ACCEPTED TRADEOFF (matches pause_failed, for the op-less v1 form): the clear carries no per-request discriminator, so a
 // lost-ack REDELIVERY of a give-up at the same still-held claim generation can clear a switch the
 // owner RE-REQUESTED in the window between the first give-up and the redelivery — the re-request is
 // silently withdrawn and the owner re-issues it. This mirrors ClearPauseRequest / pause_failed
@@ -208,11 +210,22 @@ func (s *Service) failCredentialSwitch(ctx context.Context, owned store.Run, wkr
 	if err != nil {
 		return store.Run{}, false, err
 	}
+	// The op-carrying form is fenced to the current registration incarnation (issue #4201), like
+	// credential_switch_uncertain: a missing or malformed nonce is an invalid report (400), a
+	// superseded one matches 0 rows below (the ordinary 409). The op-less v1 form carries none.
+	var registerNonce pgtype.Text
+	if opID.Valid {
+		if !validHoldRegisterNonce(req.RegisterNonce) {
+			return store.Run{}, false, fmt.Errorf("%w: %s with op_id requires register_nonce", ErrInvalidState, stateCredentialSwitchFailed)
+		}
+		registerNonce = pgtype.Text{String: req.RegisterNonce, Valid: true}
+	}
 	rows, err := s.q.ClearCredentialSwitchByWorker(ctx, store.ClearCredentialSwitchByWorkerParams{
-		ID:         owned.ID,
-		WorkerID:   pgconv.UUID(wkr.ID),
-		Generation: gen,
-		OpID:       opID,
+		ID:            owned.ID,
+		WorkerID:      pgconv.UUID(wkr.ID),
+		Generation:    gen,
+		OpID:          opID,
+		RegisterNonce: registerNonce,
 	})
 	if err != nil {
 		return store.Run{}, false, err

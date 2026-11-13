@@ -2856,6 +2856,12 @@ export class WorkerClient {
       if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE)) {
         const { op_id: _opId, ...withoutOp } = body;
         body = withoutOp;
+      } else if (body.status === "credential_switch_failed") {
+        // The api fences an op-carrying failed report on the current registration: 400 without the
+        // nonce, a not-applied 409 with a stale one. The v1 shape above carries none.
+        const nonce = this.registerNonce;
+        if (!nonce) throw new ReportPreconditionError("credential switch failed report with an op_id requires a registration nonce");
+        body = { ...body, register_nonce: nonce };
       }
     }
     if (body.source_publication !== undefined) {

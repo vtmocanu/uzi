@@ -762,6 +762,40 @@ func TestApplyCredentialSwitchAttributionLiveDB(t *testing.T) {
 	if ord := afterRefold["1/100"]; ord == nil || *ord != -1 {
 		t.Fatalf("the leg fed by the ordinal-1-before-apply frame must stay unattributed after a refold, got %v", fmtOrd2(afterRefold))
 	}
+
+	// AC3: the apply changes no usage total. A control run with no apply receives the same fixed legs
+	// (the apply's own feed message takes one seq, so the control's later legs sit one seq lower).
+	totals := func(id uuid.UUID) string {
+		t.Helper()
+		var in, cacheRead, cacheCreate, out int64
+		var cost string
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd::text
+		    FROM run_usage_totals WHERE run_id = $1`, id).Scan(&in, &cacheRead, &cacheCreate, &out, &cost); err != nil {
+			t.Fatalf("read run_usage_totals for %s: %v", id, err)
+		}
+		return fmt.Sprintf("in=%d cache_read=%d cache_create=%d out=%d cost=%s", in, cacheRead, cacheCreate, out, cost)
+	}
+	control, _ := f.run(t, "running")
+	appendControl := func(msgs ...IncomingMessage) {
+		t.Helper()
+		if err := f.svc.AppendMessagesForClaim(f.env.ctx, w, control, msgs, &gen); err != nil {
+			t.Fatalf("append to control: %v", err)
+		}
+	}
+	appendControl(epochInit(6), epochResult(7, i32(1), "m", 100, 10, 0.5))
+	appendControl(epochInit(8), epochResult(9, i32(0), "m", 40, 4, 0.25))
+	cb := int32(9)
+	appendControl(
+		epochInit(cb+1), epochResult(cb+2, i32(1), "m", 70, 7, 0.1),
+		epochInit(cb+3), epochResult(cb+4, i32(5), "m", 30, 3, 0.05),
+		epochInit(cb+5), epochResult(cb+6, nil, "m", 20, 2, 0.02),
+	)
+	if got := totals(control); !strings.HasPrefix(got, "in=260 ") {
+		t.Fatalf("control totals = %s, want the five fixed legs folded (260 input tokens)", got)
+	}
+	if got, want := totals(run), totals(control); got != want {
+		t.Fatalf("run_usage_totals with an apply = %s, want the no-switch control's %s", got, want)
+	}
 }
 
 func fmtOrd(m map[int32]*int32) string {
@@ -891,18 +925,86 @@ func TestCredentialSwitchFailedWithOpLiveDB(t *testing.T) {
 	w := f.worker(t)
 	run, op := f.run(t, "running")
 	other := uuid.New()
-	if _, applied, err := f.report(t, w, run, "credential_switch_failed", f.gen, "", &other); err != nil || applied {
+	if _, applied, err := f.report(t, w, run, "credential_switch_failed", f.gen, applyFixtureNonce, &other); err != nil || applied {
 		t.Fatalf("failed with another op: applied=%v err=%v, want it to clear nothing", applied, err)
 	}
 	if !mustRun(t, f.env, run).CredentialSwitchRequestedAt.Valid {
 		t.Fatal("the stamp must survive a give-up naming another operation")
 	}
-	if _, applied, err := f.report(t, w, run, "credential_switch_failed", f.gen, "", &op); err != nil || !applied {
+	if _, applied, err := f.report(t, w, run, "credential_switch_failed", f.gen, applyFixtureNonce, &op); err != nil || !applied {
 		t.Fatalf("failed with the pending op: applied=%v err=%v", applied, err)
 	}
 	if mustRun(t, f.env, run).CredentialSwitchRequestedAt.Valid {
 		t.Fatal("the stamp must be cleared")
 	}
+}
+
+// reRegister runs the real Register for the fixture worker, attesting run as still running at f.gen
+// (so Register leaves it claimed rather than requeueing it), and returns the superseded nonce and the
+// new one.
+func (f applyFx) reRegister(t *testing.T, run uuid.UUID) (oldNonce, newNonce string) {
+	t.Helper()
+	oldNonce = f.worker(t).SnapshotRegisterNonce.String
+	snap := &ActiveSnapshot{Active: []ActiveRunEntry{entry(run, f.gen, "running", true)}}
+	_, newNonce, err := f.svc.Register(f.env.ctx, f.worker(t), "v-test", "", nil, nil, applyNegotiatedCaps, snap)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if newNonce == oldNonce {
+		t.Fatal("Register did not rotate the nonce")
+	}
+	return oldNonce, newNonce
+}
+
+// Issue #4201 m5.8: the op-carrying failed report is fenced to the current registration incarnation,
+// as the uncertain report already is. The v1 op-less failed report keeps today's behaviour.
+func TestCredentialSwitchOpReportsNonceFenceLiveDB(t *testing.T) {
+	f := newApplyFx(t)
+	w := f.worker(t)
+	t.Run("matching nonce: failed clears the stamp and the run keeps running", func(t *testing.T) {
+		run, op := f.run(t, "running")
+		got, applied, err := f.report(t, w, run, "credential_switch_failed", f.gen, applyFixtureNonce, &op)
+		if err != nil || !applied || got.Status != "running" || got.CredentialSwitchRequestedAt.Valid || got.CredentialSwitchOpID.Valid {
+			t.Fatalf("failed: status=%s stamp=%v op=%v applied=%v err=%v", got.Status, got.CredentialSwitchRequestedAt, got.CredentialSwitchOpID, applied, err)
+		}
+	})
+	t.Run("matching nonce: uncertain pauses the run and keeps the worker", func(t *testing.T) {
+		run, op := f.run(t, "running")
+		got, applied, err := f.report(t, w, run, "credential_switch_uncertain", f.gen, applyFixtureNonce, &op)
+		if err != nil || !applied || got.Status != "paused" || got.HoldReason.Valid || !got.WorkerID.Valid {
+			t.Fatalf("uncertain: status=%s hold=%v worker=%v applied=%v err=%v", got.Status, got.HoldReason, got.WorkerID, applied, err)
+		}
+	})
+	for _, state := range []string{"credential_switch_failed", "credential_switch_uncertain"} {
+		t.Run("a superseded nonce changes nothing: "+state, func(t *testing.T) {
+			run, op := f.run(t, "running")
+			old, _ := f.reRegister(t, run)
+			f.noWrite(t, run, func() {
+				if _, applied, err := f.report(t, f.worker(t), run, state, f.gen, old, &op); err != nil || applied {
+					t.Fatalf("%s with the superseded nonce: applied=%v err=%v, want refused", state, applied, err)
+				}
+			})
+			got := mustRun(t, f.env, run)
+			if got.Status != "running" || !got.CredentialSwitchRequestedAt.Valid || got.HoldReason.Valid || !got.WorkerID.Valid {
+				t.Fatalf("status=%s stamp=%v hold=%v worker=%v, want the run untouched", got.Status, got.CredentialSwitchRequestedAt, got.HoldReason, got.WorkerID)
+			}
+		})
+	}
+	t.Run("an op-carrying failed report without a nonce is a 400", func(t *testing.T) {
+		run, op := f.run(t, "running")
+		f.noWrite(t, run, func() {
+			if _, applied, err := f.report(t, w, run, "credential_switch_failed", f.gen, "", &op); applied || !errors.Is(err, ErrInvalidState) {
+				t.Fatalf("applied=%v err=%v, want ErrInvalidState", applied, err)
+			}
+		})
+	})
+	t.Run("the v1 op-less failed report needs no nonce", func(t *testing.T) {
+		run, _ := f.run(t, "running")
+		got, applied, err := f.report(t, w, run, "credential_switch_failed", f.gen, "", nil)
+		if err != nil || !applied || got.CredentialSwitchRequestedAt.Valid || got.Status != "running" {
+			t.Fatalf("v1 failed: stamp=%v status=%s applied=%v err=%v", got.CredentialSwitchRequestedAt, got.Status, applied, err)
+		}
+	})
 }
 
 func TestCredentialSwitchUncertainLiveDB(t *testing.T) {
@@ -973,6 +1075,19 @@ func TestCredentialSwitchUncertainLiveDB(t *testing.T) {
 		run, op := f.run(t, "running")
 		if _, applied, err := f.report(t, w, run, "credential_switch_uncertain", f.gen, "nonce-stale", &op); err != nil || applied {
 			t.Fatalf("applied=%v err=%v, want refused", applied, err)
+		}
+	})
+	t.Run("AC11: after refused_committed the uncertain report leaves the run paused and not requeued", func(t *testing.T) {
+		run, op := f.run(t, "running")
+		f.want(t, f.apply(t, run, f.req(op)), ApplyOutcomeApplied, "")
+		f.env.exec(`UPDATE user_secrets SET enablement_rev = enablement_rev + 1 WHERE id = $1`, f.newTok)
+		f.want(t, f.apply(t, run, f.req(op)), ApplyOutcomeRefusedCommitted, "")
+		got, applied, err := f.report(t, w, run, "credential_switch_uncertain", f.gen, applyFixtureNonce, &op)
+		if err != nil || !applied || got.Status != "paused" || got.HoldReason.Valid || !got.WorkerID.Valid || got.ClaimReleasedAt.Valid {
+			t.Fatalf("uncertain after refused_committed: status=%s hold=%v worker=%v released=%v applied=%v err=%v", got.Status, got.HoldReason, got.WorkerID, got.ClaimReleasedAt, applied, err)
+		}
+		if st := statusOf(t, f.env, run); st != "paused" {
+			t.Fatalf("status = %s, want paused and never queued", st)
 		}
 	})
 	t.Run("op id is required", func(t *testing.T) {

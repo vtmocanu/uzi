@@ -71,6 +71,9 @@ export class FakeApi {
   private readonly switchAfterAck = new Set<string>();
   /** Runs with a pending switch: GET drains nothing (the server fence) and APPLIED is refused. */
   private readonly switchPendingRuns = new Set<string>();
+  /** Issue #4201: the in-place-negotiated server DRAINS inputs (with receipts and the switch signal) while a switch
+   *  is pending; only APPLIED for non-revise rows is refused 409 switch_pending. Off: the v1 contract (GET drains nothing). */
+  inPlaceInputDrain = false;
   private readonly delayedReceipts = new Map<ReceiptKind, number>();
   /** Issue #1604: a pending switch whose `credential_switch {generation}` signal rides every GET
    *  (the real server's transport). Absent keeps the #1673 shape: no signal on the GET. */
@@ -1747,7 +1750,7 @@ export class FakeApi {
         const rows = this.inputsByRun.get(runId) ?? [];
         const applied = this.appliedByRun.get(runId) ?? new Set<number>();
         const switchPending = this.switchPendingRuns.has(runId);
-        const pending = (switchPending
+        const pending = (switchPending && !this.inPlaceInputDrain
           ? []
           : rows.filter((row) => !applied.has(row.id)).sort((a, b) => a.id - b.id)
         ).slice(0, this.inputPageSize ?? Infinity);
@@ -2314,6 +2317,9 @@ export class FakeApi {
     }
     if (body.plan_agent_source !== undefined && this.planAgentSourceAckHold) await this.planAgentSourceAckHold;
     if (this.checkedTransport && body.status === "awaiting_approval") this.checkedFencedRuns.add(runId);
+    // Issue #4201: the api requires the registration nonce on an op-carrying credential_switch_failed report.
+    if (body.status === "credential_switch_failed" && (body as { op_id?: unknown }).op_id !== undefined && !(body as { register_nonce?: unknown }).register_nonce)
+      return send(res, 400, { error: "register_nonce is required" });
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);
     this.lastRecordedStatus.set(runId, body.status);

@@ -2373,20 +2373,27 @@ UPDATE runs
 SET credential_switch_requested_at = NULL,
     credential_switch_generation = NULL,
     updated_at = now()
-WHERE id = $1
-  AND worker_id = $2
-  AND claim_generation = $3
-  AND claim_released_at IS NULL
-  AND credential_switch_requested_at IS NOT NULL
+WHERE runs.id = $1
+  AND runs.worker_id = $2
+  AND runs.claim_generation = $3
+  AND runs.claim_released_at IS NULL
+  AND runs.credential_switch_requested_at IS NOT NULL
   -- Issue #4201: optional op fence. NULL keeps the pre-existing "any pending stamp" behaviour.
   AND ($4::uuid IS NULL OR runs.credential_switch_op_id = $4::uuid)
+  -- Issue #4201: the op-carrying form is also fenced to the CURRENT registration incarnation, like
+  -- SetRunCredentialSwitchUncertainHold: a delayed give-up from a superseded incarnation clears nothing.
+  -- The op-less v1 form (op_id NULL) carries no nonce and is not fenced here.
+  AND ($4::uuid IS NULL
+       OR EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.snapshot_register_nonce = $5::text))
 `
 
 type ClearCredentialSwitchByWorkerParams struct {
-	ID         uuid.UUID   `json:"id"`
-	WorkerID   pgtype.UUID `json:"worker_id"`
-	Generation int64       `json:"generation"`
-	OpID       pgtype.UUID `json:"op_id"`
+	ID            uuid.UUID   `json:"id"`
+	WorkerID      pgtype.UUID `json:"worker_id"`
+	Generation    int64       `json:"generation"`
+	OpID          pgtype.UUID `json:"op_id"`
+	RegisterNonce pgtype.Text `json:"register_nonce"`
 }
 
 // PRD #1247 M5 (D3/D14): a bounded capture-failure give-up (a credential_switch_failed worker
@@ -2400,6 +2407,7 @@ func (q *Queries) ClearCredentialSwitchByWorker(ctx context.Context, arg ClearCr
 		arg.WorkerID,
 		arg.Generation,
 		arg.OpID,
+		arg.RegisterNonce,
 	)
 	if err != nil {
 		return 0, err

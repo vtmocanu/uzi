@@ -5,6 +5,9 @@ import fs from "node:fs";
 import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { OutgoingMessage } from "../src/protocol.js";
+import { randomUUID } from "node:crypto";
+import type { Logger } from "../src/log.js";
+import type { ClaimResponse } from "../src/protocol.js";
 import os from "node:os";
 import { MessageBatcher, MAX_MESSAGE_BYTES } from "../src/batcher.js";
 import { RequestError, ReportPreconditionError, type CredentialSwitchApplyResult, type WorkerClient } from "../src/client.js";
@@ -76,7 +79,7 @@ const hangTurn = (onStart: () => void): ((signal: AbortSignal) => AsyncIterable<
   },
 });
 
-interface TurnRecord { resume: string | undefined; token: string | undefined; env: unknown; cwd: string | undefined }
+interface TurnRecord { resume: string | undefined; token: string | undefined; env: unknown; cwd: string | undefined; prompt: string }
 
 function scriptedQuery(turns: Array<(signal: AbortSignal) => AsyncIterable<SDKMessage>>, record: TurnRecord[]): SdkQueryFn {
   let i = 0;
@@ -84,15 +87,33 @@ function scriptedQuery(turns: Array<(signal: AbortSignal) => AsyncIterable<SDKMe
     const script = turns[Math.min(i, turns.length - 1)]!;
     i++;
     const env = params.options.env as Record<string, string | undefined>;
-    record.push({ resume: params.options.resume, token: env.CLAUDE_CODE_OAUTH_TOKEN, env, cwd: params.options.cwd });
+    const turn: TurnRecord = { resume: params.options.resume, token: env.CLAUDE_CODE_OAUTH_TOKEN, env, cwd: params.options.cwd, prompt: "" };
+    record.push(turn);
     return (async function* () {
-      for await (const _ of params.prompt) { /* drain */ }
+      for await (const p of params.prompt) turn.prompt += JSON.stringify(p);
       yield* script(params.options.abortController!.signal);
     })();
   };
 }
 
-type Site = "plan_turn" | "plan_gate" | "plan_gate_revision" | "plan_gate_exhausted" | "ask_user" | "implement_turn" | "window";
+type Site = "plan_turn" | "plan_gate" | "plan_gate_revision" | "plan_gate_exhausted" | "ask_user" | "implement_turn" | "window"
+  | "follow_up" | "question_reentry";
+
+const parkRunTurn = (): (() => AsyncIterable<SDKMessage>) => async function* () {
+  yield initFrame();
+  yield assistant([{ type: "tool_use", id: "pr", name: "mcp__uzi__park_run", input: {} }], SESSION);
+  yield resultOk(SESSION);
+};
+
+/** An interactive task claim: it parks at awaiting_followup after every clean signal_done instead of finalizing. */
+function interactiveTaskClaim(): ClaimResponse {
+  const runId = randomUUID();
+  return freshClaim(GEN, {
+    run_id: runId, kind: "task", interactive: true, issue_iid: null, issue_title: "Handoff: interactive session",
+    issue_description: "Work with me interactively.", branch: `uzi/task/${runId}`, base_branch: "develop", open_mr: false,
+    repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+  });
+}
 
 interface Setup {
   site: Site;
@@ -107,6 +128,10 @@ interface Setup {
   before?: (runId: string) => void;
   /** Runs with the forge fake the run publishes against, before the run starts. */
   withGitlab?: (gl: ReturnType<typeof fakeGitlab>) => void;
+  /** Holds the in-place quiescence proof (so the switch stays pending and unapplied) until it settles. */
+  quiesceGate?: Promise<void>;
+  /** ask_user site: the test, not the fixture, answers the re-asked question. */
+  noAutoAnswer?: boolean;
 }
 
 const CLEAN: QuiesceRunOutcome = {
@@ -119,10 +144,22 @@ const BLOCKED: QuiesceRunOutcome = {
 async function scenario(setup: Setup) {
   newApi();
   negotiate();
-  const claim = freshClaim(GEN);
+  const claim = setup.site === "follow_up" ? interactiveTaskClaim()
+    : setup.site === "question_reentry" ? freshClaim(GEN, { park_run_supported: true })
+      : freshClaim(GEN);
   const runId = claim.run_id;
   setup.before?.(runId);
   const secretLog = secretRecordingLogger();
+  // Every line any logger of the run is handed (msg and fields), so a test can prove a token never reached one.
+  const logLines: string[] = [];
+  const tee = (base: Logger): Logger => {
+    const rec = (level: "debug" | "info" | "warn" | "error") => (msg: string, fields?: Record<string, unknown>): void => {
+      logLines.push(`${level} ${msg} ${JSON.stringify(fields ?? {})}`);
+      base[level](msg, fields);
+    };
+    return { ...base, debug: rec("debug"), info: rec("info"), warn: rec("warn"), error: rec("error"), child: (f) => tee(base.child(f)) };
+  };
+  const runLogger = tee(secretLog.logger);
   const ledgerWrites: string[] = [];
   const ledger = setup.ledger ?? new CredentialSwitchOpLedger(fx.dataDir, {
     ...defaultLedgerFs, writeFileSynced: async (file, data) => { ledgerWrites.push(data); return defaultLedgerFs.writeFileSynced(file, data); },
@@ -183,7 +220,33 @@ async function scenario(setup: Setup) {
         if (b.status === "awaiting_approval") send(runId, row("approve_plan"));
         else if (b.status === "awaiting_input") {
           if (++asks === 1) requestSwitch();
-          else send(runId, row("answer", JSON.stringify({ question_id: b.open_question_id, answers: ["postgres"] })));
+          else if (!setup.noAutoAnswer) send(runId, row("answer", JSON.stringify({ question_id: b.open_question_id, answers: ["postgres"] })));
+        }
+      });
+      break;
+    case "follow_up":
+      // The task parks at awaiting_followup after its first clean done. The switch lands while it idles there; the
+      // second park report is the re-armed wait after the in-place apply, which gets the follow-up; the third ends it.
+      turnScripts = [planTurn(), doneTurn(), last];
+      api.onState(runId, (b) => {
+        if (b.status === "awaiting_approval") send(runId, row("approve_plan"));
+        if (b.status !== "awaiting_followup") return;
+        if (++gates === 1) requestSwitch();
+        else if (gates === 2) send(runId, row("follow_up", "one more thing"));
+        else send(runId, row("stop"));
+      });
+      break;
+    case "question_reentry":
+      // The lead's park_run signal: the pause request is refused, so the owner question opens, and the switch lands there.
+      api.parkRunGeneration = GEN;
+      api.parkRunOwnership = { status: "running", claim_generation: GEN, hold_reason: null, claim_released: false };
+      api.workerPauseRefused = true;
+      turnScripts = [planTurn(), parkRunTurn(), last];
+      api.onState(runId, (b) => {
+        if (b.status === "awaiting_approval") send(runId, row("approve_plan"));
+        else if (b.status === "awaiting_input") {
+          if (++asks === 1) requestSwitch();
+          else send(runId, row("answer", JSON.stringify({ question_id: b.open_question_id, answers: ["keep going"] })));
         }
       });
       break;
@@ -198,7 +261,7 @@ async function scenario(setup: Setup) {
       });
       break;
   }
-  const sdk = new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery(turnScripts, turns), client });
+  const sdk = new SdkExecutor(runLogger, homeDir, { queryFn: scriptedQuery(turnScripts, turns), client });
   const attemptDir = path.dirname(worktreeDirFor(claim.issue_iid as number));
   const attempts = (): string[] =>
     fs.existsSync(attemptDir) ? fs.readdirSync(attemptDir).filter((n) => n.includes(".attempt-")) : [];
@@ -209,11 +272,14 @@ async function scenario(setup: Setup) {
   const proofOrder: string[] = [];
   const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
     const verdict = setup.quiesce?.(req);
-    if (req.site === "in_place_credential_switch") { api.requestLog.push("quiesce:in_place_credential_switch"); proofOrder.push(req.site); }
+    if (req.site === "in_place_credential_switch") {
+      api.requestLog.push("quiesce:in_place_credential_switch"); proofOrder.push(req.site);
+      await setup.quiesceGate;
+    }
     return verdict ?? CLEAN;
   };
   try {
-    await runnerWith(() => ({ executor: sdk }), gitlab, undefined, secretLog.logger, {
+    await runnerWith(() => ({ executor: sdk }), gitlab, undefined, runLogger, {
       recoveryRetryMs: 1, planApprovalTimeoutMs: 20_000, credentialSwitchLedger: ledger, quiesceRun,
       switchSupersedeWaitMs: 2_000, questionTimeoutMs: 20_000, ...setup.extra,
     }).execute(claim);
@@ -221,7 +287,7 @@ async function scenario(setup: Setup) {
     client.postMessages = postMessages;
   }
   const states = api.states.filter((s) => s.runId === runId).map((s) => s.body);
-  return { claim, runId, turns, posted, states, ledger, ledgerWrites, attempts, attemptsBefore, proofOrder, secretLog };
+  return { claim, runId, turns, posted, states, ledger, ledgerWrites, attempts, attemptsBefore, proofOrder, secretLog, logLines };
 }
 type Result = Awaited<ReturnType<typeof scenario>>;
 
@@ -289,12 +355,133 @@ describe("issue #4201 m2c: an applied in-place credential switch continues the r
       // The logger's registry was told of the token the moment it was published, and evicted it at the end.
       assert.ok(r.secretLog.added.includes(NEW_TOKEN), "the log registry scrubs the new token");
       assert.ok(r.secretLog.removed.includes(NEW_TOKEN), "and evicts it when the run ends");
+      // AC5: no line the worker logged (runner, executor, children) carries the new token.
+      assert.ok(r.logLines.length > 0, "the worker logged something");
+      const leaked = r.logLines.find((l) => l.includes(NEW_TOKEN));
+      assert.equal(leaked, undefined, "the new token appears in no log line");
       // The ledger wrote the op ahead, settled it, never stored the token, and was cleaned at the terminal state.
       assert.ok(r.ledgerWrites.some((w) => w.includes('"sending"')) && r.ledgerWrites.some((w) => w.includes('"settled"')));
       assert.ok(r.ledgerWrites.every((w) => !w.includes(NEW_TOKEN)), "the token is never persisted");
       assert.equal(fs.existsSync(path.join(fx.dataDir, "credential-switch-ops", `${r.runId}.json`)), false, "cleaned up at the terminal state");
     });
   }
+});
+
+/** The per-site invariants of an in-place switch (AC1), for a site the main loop's table does not cover. */
+function assertInPlaceInvariants(r: Result): void {
+  assert.deepEqual(applied().map((b) => [b.op_id, b.claim_generation, b.register_nonce]), [["op-1", GEN, NONCE]], `applied exactly once: ${statusesOf(r).join(",")} ${JSON.stringify(r.states.filter((b) => b.status === "failed").map((b) => b.failure_reason))}`);
+  const s = statusesOf(r);
+  for (const status of ["credential_switch", "credential_switch_held", "credential_switch_failed", "credential_switch_uncertain", "failed"])
+    assert.ok(!s.includes(status), `no ${status} report: ${s.join(",")}`);
+  assert.ok(s.includes("completed"), `the run completed: ${s.join(",")}`);
+  assert.ok(r.states.every((b) => b.claim_generation === undefined || b.claim_generation === GEN), "the generation never changed");
+  assert.deepEqual(r.attempts(), r.attemptsBefore, "no new attempt dir");
+  assert.equal(new Set(r.turns.map((t) => t.cwd)).size, 1, "one cwd for every turn");
+  const firstNew = r.turns.findIndex((t) => t.token === NEW_TOKEN);
+  assert.ok(firstNew >= 1, `a later turn spawned on the new token: ${JSON.stringify(r.turns.map((t) => t.token))}`);
+  assert.ok(r.turns.slice(0, firstNew).every((t) => t.token === OLD_TOKEN), "earlier turns ran on the old token");
+  assert.ok(r.turns.slice(firstNew).every((t) => t.token === NEW_TOKEN && t.resume === SESSION), "later turns resume the same session on the new token");
+  assert.equal(r.logLines.find((l) => l.includes(NEW_TOKEN)), undefined, "the new token appears in no log line");
+}
+
+describe("issue #4201 m5 (AC1): the follow_up and question_reentry sites apply in place at runner level", () => {
+  it("follow_up: an interactive task idling between turns applies in place and the follow-up turn runs on the new token", TIMEOUT, async () => {
+    const r = await scenario({ site: "follow_up", apply: [{ outcome: "applied", token: NEW_TOKEN }] });
+    assertInPlaceInvariants(r);
+    assert.ok(statusesOf(r).filter((x) => x === "awaiting_followup").length >= 2, "the wait was re-armed after the apply");
+    assert.ok(api.requestLog.includes("quiesce:in_place_credential_switch"), "quiescence was proven first");
+  });
+
+  it("question_reentry: the park_run owner question re-asked in place after the apply, then the answer continues on the new token", TIMEOUT, async () => {
+    const r = await scenario({ site: "question_reentry", apply: [{ outcome: "applied", token: NEW_TOKEN }] });
+    assertInPlaceInvariants(r);
+    assert.equal(statusesOf(r).filter((x) => x === "awaiting_input").length, 2, "the question was asked, then re-asked after the apply");
+    assert.equal(api.workerPauseRequests.length, 1, "the explicit park was attempted once, not repeated by the re-entry");
+    assert.ok(!statusesOf(r).includes("paused"), "the run did not park");
+  });
+});
+
+/**
+ * Runs `site` with the in-place quiescence proof held open (the switch pending, nothing applied), sends `inputs`
+ * meanwhile against the in-place server model (api.inPlaceInputDrain: GET drains during the pending switch, APPLIED for
+ * these rows is refused switch_pending). Proves the worker routes them during the hold and that their APPLIED lands
+ * only once the stamp clears, then returns the finished run with the input ids.
+ */
+async function withInputsWhileSwitchPending(
+  site: "ask_user" | "implement_turn",
+  inputs: (runId: string, question: string | undefined) => Parameters<typeof send> extends [string, ...infer R] ? R : never,
+  /** Waits for the inputs to be routed first, so a steering message cannot race the run's last turn. */
+  settleFirst = false,
+) {
+  let release!: () => void;
+  const hold = new Promise<void>((resolve) => { release = resolve; });
+  let runId = "";
+  let ids: number[] = [];
+  let finalCalls = 0;
+  // The first turn after the apply ends without signal_done once the inputs are routed, so the loop turns again and
+  // pulls them into the next prompt; the second one completes.
+  const settlingTurn = (): AsyncIterable<SDKMessage> => (async function* () {
+    if (++finalCalls === 1) {
+      await until(() => ids.length > 0 && ids.every((id) => api.isAcked(runId, id)), 10_000);
+      yield initFrame();
+      yield assistant([{ type: "text", text: "continuing" }], SESSION);
+      yield resultOk(SESSION);
+      return;
+    }
+    yield* doneTurn()();
+  })();
+  const finished = scenario({
+    site, apply: [{ outcome: "applied", token: NEW_TOKEN }], quiesceGate: hold, noAutoAnswer: true,
+    before: (id) => { runId = id; api.inPlaceInputDrain = true; }, ...(settleFirst ? { lastTurn: settlingTurn } : {}),
+  });
+  try {
+    assert.ok(await until(() => api.requestLog.includes("quiesce:in_place_credential_switch"), 30_000), "the proof is running (held)");
+    assert.equal(applied().length, 0, "the switch is pending and unapplied");
+    const question = api.states.filter((s) => s.runId === runId && s.body.status === "awaiting_input").at(-1)?.body.open_question_id;
+    const rows = send(runId, ...inputs(runId, question));
+    assert.ok(rows.length >= 1);
+    ids = rows.map((input) => input.id);
+    // The in-place server drains inputs during a pending switch, so the worker fetches and routes (ACKs) them DURING the
+    // hold, before any apply. Their APPLIED receipts are refused 409 switch_pending, so the worker parks the ids ready
+    // and the rows stay unapplied server-side until the stamp clears.
+    assert.ok(await until(() => ids.every((id) => api.isAcked(runId, id)), 10_000), "every input was fetched and routed during the hold");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(applied().length, 0, "the switch is still unapplied: delivery did not wait for it");
+    assert.deepEqual(ids.map((id) => api.isApplied(runId, id)), ids.map(() => false), "no APPLIED receipt landed while the stamp was pending");
+    assert.ok(api.pendingInputRows(runId).length >= ids.length, "the rows are still pending server-side: none was lost");
+  } finally { release(); }
+  const r = await finished;
+  assert.equal(applied().length, 1, "the held switch then applied");
+  for (const id of ids) assert.ok(api.isAcked(runId, id) && api.isApplied(runId, id), `input ${id} was routed and applied once the switch resolved`);
+  return { r, runId, ids };
+}
+
+describe("issue #4201 m5 (AC7): owner inputs sent while a switch is pending and unapplied are routed during the hold and applied once it clears, never lost", () => {
+  it("an answer to the open question is routed during the hold, resolves the re-asked question and reaches the model on the new token", TIMEOUT, async () => {
+    const { r } = await withInputsWhileSwitchPending("ask_user", (_runId, question) =>
+      [row("answer", JSON.stringify({ question_id: question, answers: ["postgres-ANSWER"] }))]);
+    assert.ok(r.turns.filter((t) => t.token === NEW_TOKEN).some((t) => t.prompt.includes("postgres-ANSWER")), "the answer reached the model after the apply");
+    assert.ok(statusesOf(r).includes("completed"), statusesOf(r).join(","));
+  });
+
+  it("a steering message is routed during the hold and reaches the model on the new token", TIMEOUT, async () => {
+    const { r } = await withInputsWhileSwitchPending("implement_turn", () => [row("follow_up", "STEER-ME-NOW")], true);
+    assert.ok(r.turns.filter((t) => t.token === NEW_TOKEN).some((t) => t.prompt.includes("STEER-ME-NOW")),
+      `the steering message reached the model after the apply: ${statusesOf(r).join(",")}`);
+    assert.ok(statusesOf(r).includes("completed"), statusesOf(r).join(","));
+  });
+
+  it("an owner pause is routed during the hold and is honoured: the executor acknowledges it and enters the pause park", TIMEOUT, async () => {
+    const { r, runId } = await withInputsWhileSwitchPending("implement_turn", (runId) => {
+      // The server decides the pause boundary: it stamps the request and answers the next running report with pause_requested.
+      api.setPauseRequestedAck(runId);
+      return [row("pause", "milestone")];
+    });
+    // The executor acknowledged the pause and entered the pause park (this fixture's checkpoint cannot publish, so the
+    // park ends as pause_failed and the run carries on; what is pinned is that the request was honoured, not lost).
+    assert.ok(api.messages(runId).some((m) => (m.payload as { directive?: string }).directive === "pause"), "the pause was acknowledged in the feed");
+    assert.ok(statusesOf(r).includes("paused") || statusesOf(r).includes("pause_failed"), `the pause park was entered: ${statusesOf(r).join(",")}`);
+  });
 });
 
 describe("issue #4201 m2d: the PR-description editor pass runs on the holder's token", () => {
@@ -457,6 +644,26 @@ describe("issue #4201 m2c: apply outcomes other than applied", () => {
     assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "the source clone is retained");
     assert.equal(r.turns.length, 2, "no turn ran after the fence");
   });
+});
+
+describe("issue #4201 m5: op-carrying failed and uncertain reports are fenced on the flight's registration nonce", () => {
+  const cases: Array<[string, ApplyScript, string]> = [
+    ["a proven unapplied refusal (not_applied)", { outcome: "not_applied", reason: "no_pending_switch" }, "credential_switch_failed"],
+    ["refused_committed", { outcome: "refused_committed", reason: "already_committed" }, "credential_switch_uncertain"],
+  ];
+  for (const [name, script, status] of cases) {
+    it(`${name}: the /state body sent through WorkerClient.reportState carries the apply request's register_nonce`, TIMEOUT, async () => {
+      const r = await scenario({ site: "implement_turn", apply: [script] });
+      const reports = r.states.filter((b) => b.status === status);
+      assert.equal(reports.length, 1, statusesOf(r).join(","));
+      const nonce = (reports[0] as { register_nonce?: string }).register_nonce;
+      assert.ok(typeof nonce === "string" && nonce !== "", "the report carries a non-empty register_nonce");
+      assert.equal((reports[0] as { op_id?: string }).op_id, "op-1");
+      const sent = applied().map((b) => b.register_nonce);
+      assert.ok(sent.length >= 1 && sent.every((n) => n === nonce), `the apply request(s) carried the same nonce: ${JSON.stringify(sent)}`);
+      assert.equal(nonce, NONCE);
+    });
+  }
 });
 
 describe("issue #4201 m2c: an unproven quiescence fences instead of applying", () => {
@@ -1213,9 +1420,16 @@ describe("issue #4201 m2d: the signal escaped the executor (the escaped arm)", (
     const runId = claim.run_id;
     api.scriptApply(runId, { outcome: "applied", token: NEW_TOKEN });
     let ran = 0;
+    const cwds: string[] = [];
+    const attemptDir = path.dirname(worktreeDirFor(0));
+    const attempts = (): string[] =>
+      fs.existsSync(attemptDir) ? fs.readdirSync(attemptDir).filter((n) => n.includes(".attempt-")).sort() : [];
+    const attemptsAtTurn: string[] = [];
     const executor = {
       run: async (ctx: import("../src/executor.js").RunContext) => {
         ran++;
+        cwds.push(ctx.worktreePath);
+        attemptsAtTurn.push(...attempts());
         api.requestCredentialSwitch(runId, GEN, "op-1");
         assert.ok(await until(() => ctx.signal?.aborted === true, 10_000), "the switch aborted ctx.signal");
         throw ctx.signal!.reason;
@@ -1226,7 +1440,14 @@ describe("issue #4201 m2d: the signal escaped the executor (the escaped arm)", (
       recoveryRetryMs: 1, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir),
       quiesceRun: async (req) => quiesce(req) ?? CLEAN,
     }).execute(claim);
-    return { runId, ran, states: api.states.filter((x) => x.runId === runId).map((x) => x.body) };
+    return { runId, ran, cwds, attemptsAtTurn, attempts, states: api.states.filter((x) => x.runId === runId).map((x) => x.body) };
+  }
+
+  /** The escaped arm neither moves the flight to another generation nor creates another clone. */
+  function assertSameFlight(r: Awaited<ReturnType<typeof escaped>>): void {
+    assert.ok(r.states.every((b) => b.claim_generation === undefined || b.claim_generation === GEN), "the generation never changed");
+    assert.deepEqual(r.attempts(), r.attemptsAtTurn, "no attempt dir was created by the switch");
+    assert.equal(r.cwds.length, 1, "the executor ran once, in one cwd");
   }
 
   it("proven quiescent: credential_switch_uncertain with the op id; never a release, an apply or a requeue", TIMEOUT, async () => {
@@ -1236,6 +1457,7 @@ describe("issue #4201 m2d: the signal escaped the executor (the escaped arm)", (
     assert.equal(api.uncertainRequests[0]!.body.op_id, "op-1");
     assert.equal(applied().length, 0, "the executor has unwound: nothing is applied");
     for (const status of ["credential_switch", "queued", "completed", "failed"]) assert.ok(!s.includes(status), `no ${status}: ${s.join(",")}`);
+    assertSameFlight(r);
   });
 
   it("unproven: credential_switch_held with the op id, then settled after the join; never a requeue", TIMEOUT, async () => {
@@ -1247,6 +1469,7 @@ describe("issue #4201 m2d: the signal escaped the executor (the escaped arm)", (
     assert.equal(api.uncertainRequests.length, 0);
     for (const status of ["credential_switch", "queued", "completed", "failed"]) assert.ok(!s.includes(status), `no ${status}: ${s.join(",")}`);
     assert.equal(api.holdState(r.runId), "unsettled");
+    assertSameFlight(r);
   });
 
   it("a Codex flight on a negotiated worker never takes the in-place fence: no hold and no uncertain report, as before m3a", TIMEOUT, async () => {

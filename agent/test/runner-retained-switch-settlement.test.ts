@@ -185,6 +185,9 @@ async function scenario(o: Options) {
   const ownOperation = gate();
   cleanups.push(pending.open, ownOperation.open);
   const counts = { models2: 0, models3: 0, joins: 0, holdAttempts: 0, settledAttempts: 0 };
+  const cwds: string[] = [];
+  const attemptsAtTurn: string[] = [];
+  const attempts = (): string[] => fs.readdirSync(path.dirname(clone.path)).filter(n => n.includes(".attempt-")).sort();
   let flight: any;
   let before: any;
   let generation = 0;
@@ -232,6 +235,9 @@ async function scenario(o: Options) {
       run: async (ctx: RunContext) => {
         if (gen > 2) { counts.models3++; events.push("model:g3"); throw new Error("fixture ends gen 3"); }
         counts.models2++;
+        cwds.push(ctx.worktreePath);
+        // The retained successor's own claim-time attempt dir exists by now; the switch must add none.
+        attemptsAtTurn.push(...attempts());
         events.push("model:g2");
         try {
           if (o.survivor !== "none") survivors.pids.add(PID);
@@ -335,7 +341,7 @@ async function scenario(o: Options) {
   if (o.refuseHold) api.refuseHold(HOLD);
   const run = r.execute(claim);
   return {
-    claim, bare, clone, r, run, events, marks, survivors, pending, ownOperation, counts, log, registry, retainedHome,
+    claim, bare, clone, r, run, events, cwds, attempts, attemptsAtTurn, marks, survivors, pending, ownOperation, counts, log, registry, retainedHome,
     flight: () => flight, before: () => before, wasBlocked: () => blocked,
     async gen3() {
       api.setOwnershipStatus(claim.run_id, "running", 3);
@@ -414,6 +420,13 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     assert.ok(!env.events.some(e => e.startsWith("enter:")), "the v1 release path never ran");
     assert.ok(env.events.includes("custody:true"), "the flight kept its retained custody");
     assertCustodyKept(env, false);
+    // AC1: the same generation, the same clone and no new attempt dir.
+    const states = api.states.filter(s => s.runId === env.claim.run_id).map(s => s.body);
+    assert.ok(states.every(b => b.claim_generation === undefined || b.claim_generation === 2), "the generation never changed");
+    assert.deepEqual(env.attempts(), env.attemptsAtTurn, "no new attempt dir after the switch");
+    assert.equal(env.cwds.length, 1, "one executor turn");
+    assert.ok(env.cwds[0] === env.clone.path || env.attemptsAtTurn.includes(path.basename(env.cwds[0]!)),
+      `the turn ran in the retained flight's own clone, not a new one: ${env.cwds[0]}`);
   });
 
   for (const applyOutcome of ["applied", "superseded"] as const) {

@@ -201,7 +201,7 @@ describe("credential switch state reports carry op_id", () => {
         assert.equal(s.posts.length, 1);
         assert.equal(s.posts[0]!.body.op_id, "op-1");
         assert.equal(s.posts[0]!.body.status, status);
-        if (status !== "credential_switch_failed") assert.equal(s.posts[0]!.body.register_nonce, "nonce-1");
+        assert.equal(s.posts[0]!.body.register_nonce, "nonce-1");
       } finally { await s.close(); }
     });
   }
@@ -222,7 +222,25 @@ describe("credential switch state reports carry op_id", () => {
     try {
       await (await registered(s.url)).reportState("run-1", report("credential_switch_failed", { op_id: "op-1" }));
       assert.equal("op_id" in s.posts[0]!.body, false);
+      assert.equal("register_nonce" in s.posts[0]!.body, false);
     } finally { await s.close(); }
+  });
+
+  it("the v1 failed body (no op_id) carries no register_nonce", async () => {
+    const s = await server(() => json(200, { run: { status: "running" } }));
+    try {
+      await (await registered(s.url)).reportState("run-1", report("credential_switch_failed"));
+      assert.equal("register_nonce" in s.posts[0]!.body, false);
+    } finally { await s.close(); }
+  });
+
+  it("refuses an op-carrying failed report client-side when there is no registration nonce", async () => {
+    const noNonce = await server(() => json(200, { run: { status: "running" } }), { worker_id: "w", protocol_features: FEATURES });
+    try {
+      await assert.rejects((await registered(noNonce.url)).reportState("run-1", report("credential_switch_failed", { op_id: "op-1" })),
+        (e: unknown) => e instanceof ReportPreconditionError && /nonce/.test(e.message));
+      assert.equal(noNonce.posts.length, 0);
+    } finally { await noNonce.close(); }
   });
 
   // Issue #4201: the client's local refusals are a typed ReportPreconditionError, which the runner's in-place report

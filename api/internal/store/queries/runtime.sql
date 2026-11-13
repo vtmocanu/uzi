@@ -5076,13 +5076,19 @@ UPDATE runs
 SET credential_switch_requested_at = NULL,
     credential_switch_generation = NULL,
     updated_at = now()
-WHERE id = @id
-  AND worker_id = @worker_id
-  AND claim_generation = @generation
-  AND claim_released_at IS NULL
-  AND credential_switch_requested_at IS NOT NULL
+WHERE runs.id = @id
+  AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @generation
+  AND runs.claim_released_at IS NULL
+  AND runs.credential_switch_requested_at IS NOT NULL
   -- Issue #4201: optional op fence. NULL keeps the pre-existing "any pending stamp" behaviour.
-  AND (sqlc.narg('op_id')::uuid IS NULL OR runs.credential_switch_op_id = sqlc.narg('op_id')::uuid);
+  AND (sqlc.narg('op_id')::uuid IS NULL OR runs.credential_switch_op_id = sqlc.narg('op_id')::uuid)
+  -- Issue #4201: the op-carrying form is also fenced to the CURRENT registration incarnation, like
+  -- SetRunCredentialSwitchUncertainHold: a delayed give-up from a superseded incarnation clears nothing.
+  -- The op-less v1 form (op_id NULL) carries no nonce and is not fenced here.
+  AND (sqlc.narg('op_id')::uuid IS NULL
+       OR EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.snapshot_register_nonce = sqlc.narg('register_nonce')::text));
 
 -- name: GetRunCredentialSwitchOpID :one
 -- Issue #4201: the operation id the credential_switch_op_id trigger minted for the run's pending
