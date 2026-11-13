@@ -130,6 +130,9 @@ func TestIntakePauseRowtypeFreshCatalogLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
+	// Deliberately conservative fresh-schema policy (#4273): reject every parsed
+	// function body or argument default in public, not only table-rowtype inputs.
+	// This is broader than the minimal predicate for this PostgreSQL refusal.
 	var parsed int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_proc
  WHERE pronamespace='public'::regnamespace AND (prosqlbody IS NOT NULL OR proargdefaults IS NOT NULL)`).Scan(&parsed); err != nil {
