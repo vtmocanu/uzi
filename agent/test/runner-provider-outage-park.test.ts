@@ -1333,9 +1333,11 @@ describe("3630 retained stop leaves the heartbeat snapshot", () => {
         error: () => new TransientRecoveryError("idle", { idleStallKind: "productive" }),
         duringTurn: () => { hasDuringTurn = activeRuns.has(claim.run_id); listedDuringTurn = listed(activeRuns, claim.run_id); },
       }, home);
-      let posts = 0, firstPostAt: number | undefined;
+      let posts = 0;
       const stop = api.dropStatesWhen(claim.run_id, body => body.recovery_cause === "codex_idle_stall" && ++posts > 1);
-      api.onState(claim.run_id, body => { if (body.recovery_cause === "codex_idle_stall") firstPostAt ??= clock.now(); });
+      const spied = rig.runner as unknown as { newCaptureEpisode: (...a: unknown[]) => unknown; withCaptureDisposition: (...a: unknown[]) => unknown };
+      const episodeSpy = t.mock.method(spied, "newCaptureEpisode");
+      const dispositionSpy = t.mock.method(spied, "withCaptureDisposition");
       api.afterPersistState(claim.run_id, body => body.recovery_cause === "codex_idle_stall", "drop");
       t.mock.method(rig.runner as unknown as { waitRecoveryRetry: () => Promise<void> }, "waitRecoveryRetry",
         async () => { clock.advance(130_000); });
@@ -1343,12 +1345,17 @@ describe("3630 retained stop leaves the heartbeat snapshot", () => {
 
       assert.equal(hasDuringTurn, true, "control: the run is registered during its turn");
       assert.equal(listedDuringTurn, true, "control: the heartbeat snapshot lists the run during its turn");
-      // The retry loop ends because the held capture's healthy deadline (120s) passes, NOT because the
-      // episode deadline (180s) does: the join must reach its dispositionStarted arm, never the
+      // The retry loop ends because the held capture's healthy deadline passes, NOT because the
+      // episode deadline does: the join must reach its dispositionStarted arm, never the
       // expired-episode arm.
-      assert.ok(firstPostAt !== undefined);
-      const sinceEpisode = clock.now() - firstPostAt!;
-      assert.ok(sinceEpisode > 120_000 && sinceEpisode < 180_000, `episode still unexpired at the join (${sinceEpisode}ms)`);
+      assert.equal(episodeSpy.mock.callCount(), 1, "exactly one capture episode for the run");
+      // The first disposition runs inside the held capture region (persisted as the first park POST);
+      // the join must not re-enter a second, join-time disposition after the unknown ACK.
+      assert.equal(dispositionSpy.mock.callCount(), 0, "no join-time disposition after the unknown ACK");
+      const episode = episodeSpy.mock.calls[0]!.result as { healthyDeadlineAt: number; deadlineAt: number };
+      const joinedAt = clock.now();
+      assert.ok(episode.healthyDeadlineAt <= joinedAt && joinedAt < episode.deadlineAt,
+        `join must occur after the healthy deadline and before the episode deadline (elapsed ${joinedAt - episode.healthyDeadlineAt}ms past healthy, ${episode.deadlineAt - joinedAt}ms before deadline)`);
       assert.equal(posts, 3, "one logical park disposition, retained by every bounded client attempt");
       assert.equal(parks(claim.run_id).length, 1, "at most one applied park");
       assert.equal(activeRuns.has(claim.run_id), false);
@@ -1376,9 +1383,14 @@ describe("3630 retained stop leaves the heartbeat snapshot", () => {
         // Local capture is verified; the episode deadline passes before any park disposition starts.
         beforePublish: () => { if (!advanced) { advanced = true; clock.advance(240_000); } },
       }, home);
+      const spied = rig.runner as unknown as { newCaptureEpisode: (...a: unknown[]) => unknown; withCaptureDisposition: (...a: unknown[]) => unknown };
+      const episodeSpy = t.mock.method(spied, "newCaptureEpisode");
+      const dispositionSpy = t.mock.method(spied, "withCaptureDisposition");
       await rig.runner.execute(claim);
 
       assert.equal(advanced, true, "the clock was advanced inside the capture region");
+      assert.equal(episodeSpy.mock.callCount(), 1, "exactly one capture episode for the run (no renewed episode)");
+      assert.equal(dispositionSpy.mock.callCount(), 0, "no park disposition was attempted");
       assert.equal(listedDuringTurn, true, "control: the heartbeat snapshot lists the run during its turn");
       assert.equal(parks(claim.run_id).length, 0, "no park disposition was started");
       assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed"].includes(s.body.status ?? "")));
