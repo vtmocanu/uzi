@@ -89,16 +89,25 @@ func expandPlacementFunction(t *testing.T, text string) string {
 
 // TestPlacementAdmittingWorkersCarriesEveryInlineClause pins that the function holds every clause
 // of the per-worker block ListUnplaceableQueuedRunsForEphemeral carried inline before PRD #4205 M5.
-// The counts are those of the removed block.
+// The counts are those of the removed block. It pins the owner scoping, the ephemeral/lease arm
+// with its Docker-preference conjunct, the structural predicates and each capability consequent;
+// the capability antecedents are pinned by the per-clause count tests (ci_config_guard,
+// repo_agent_source, semantic, agent_source_request, cross-check), which also read this body.
 func TestPlacementAdmittingWorkersCarriesEveryInlineClause(t *testing.T) {
 	body := placementFunctionBody(t, "migrations")
 	want := map[string]int{
-		"fn_cross_check_child_eligible(":                   1,
-		"fn_ephemeral_lease_admits(":                       1,
-		"AND NOT w.isolated_lane":                          1,
-		"pc.worker_id IS DISTINCT FROM w.id":               1,
-		"protocol_check.round = (SELECT max(latest.round)": 1,
-		"r.required_capabilities <@":                       1,
+		// Owner scoping: without it the wake-demand caller could pick another user's worker.
+		"WHERE w.user_id = r.user_id":                                            1,
+		"(r.kind = 'cross_check' OR NOT w.ephemeral":                             1,
+		"NOT fn_worker_accepts_new_intake(w),":                                   1,
+		"p_ephemeral_lease, now(),":                                              1,
+		"(NOT p_docker_preference_applies OR COALESCE(w.docker_enabled, false))": 1,
+		"fn_cross_check_child_eligible(":                                         1,
+		"fn_ephemeral_lease_admits(":                                             1,
+		"AND NOT w.isolated_lane":                                                1,
+		"pc.worker_id IS DISTINCT FROM w.id":                                     1,
+		"protocol_check.round = (SELECT max(latest.round)":                       1,
+		"r.required_capabilities <@":                                             1,
 	}
 	for _, c := range []string{
 		"milestone_reconciliation_claim_v1", "task_checkpoint_coordinates_v1", "publication_resume_v1",

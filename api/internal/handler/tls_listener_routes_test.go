@@ -116,7 +116,7 @@ func TestThePlainListenerStillServesEverything(t *testing.T) {
 		{http.MethodPost, "/api/controller/status"},
 	} {
 		if !routes.Match(chi.NewRouteContext(), tc.method, tc.path) {
-			t.Errorf("%s %s = 404 on the PLAIN listener; the subset router must not have narrowed it", tc.method, tc.path)
+			t.Errorf("%s %s is not mounted on the PLAIN listener; the subset router must not have narrowed it", tc.method, tc.path)
 		}
 	}
 }
