@@ -702,7 +702,7 @@ func (q *Queries) RecordTerminalContributionUnknown(ctx context.Context, id uuid
 
 const scheduleTerminalPreservationCheck = `-- name: ScheduleTerminalPreservationCheck :execrows
 UPDATE run_terminal_preservations SET
-    next_check_at = $1, last_error = $2::text, updated_at = now()
+    next_check_at = $1, last_error = COALESCE($2::text, last_error), updated_at = now()
 WHERE id = $3
 `
 
@@ -713,7 +713,8 @@ type ScheduleTerminalPreservationCheckParams struct {
 }
 
 // A single-row scheduling write (no state, no tip, so it needs no run lock): when the sweep next
-// looks at the row, and the scrubbed outcome text of the last attempt.
+// looks at the row, and the scrubbed outcome text of the last attempt. A NULL text keeps the
+// existing last_error (a scheduling write must not erase the last recorded failure).
 func (q *Queries) ScheduleTerminalPreservationCheck(ctx context.Context, arg ScheduleTerminalPreservationCheckParams) (int64, error) {
 	result, err := q.db.Exec(ctx, scheduleTerminalPreservationCheck, arg.NextCheckAt, arg.LastError, arg.ID)
 	if err != nil {

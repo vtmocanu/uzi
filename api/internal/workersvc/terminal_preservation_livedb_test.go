@@ -203,7 +203,9 @@ type termFix struct {
 }
 
 // newTermFix seeds a run for the capable worker. "flight" is the worker's own running run at claim
-// generation 1; "hold" is the same run failed, with an open inventory-guarded hold of generation 1.
+// generation 1; "hold" is the same run failed with its claim released, an open inventory-guarded
+// hold of generation 1 and a milestone reconciliation row (the shape that makes the claim-mutation
+// reconciliation fence refuse stale_claim for a terminal run).
 func newTermFix(t *testing.T, mode string) *termFix {
 	t.Helper()
 	e := setupInterlockLiveDB(t)
@@ -235,7 +237,16 @@ func newTermFix(t *testing.T, mode string) *termFix {
 		e.exec(t, `INSERT INTO recovery_custody_holds
 			(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded)
 			VALUES ($1,$2,$3,$4,1,'open',$5,'term-ident',$5,$4,true)`, f.hold, e.userID, e.repoID, f.run, wid)
-		e.exec(t, `UPDATE runs SET status='failed', fail_origin='agent_failure' WHERE id=$1`, f.run)
+		e.exec(t, `UPDATE runs SET status='failed', fail_origin='agent_failure', claim_released_at=now() WHERE id=$1`, f.run)
+		var input int64
+		if err := e.pool.QueryRow(e.ctx, `INSERT INTO run_user_inputs(run_id, kind, body) VALUES ($1, 'approve_plan', '') RETURNING id`, f.run).Scan(&input); err != nil {
+			t.Fatal(err)
+		}
+		e.exec(t, `INSERT INTO run_milestone_reconciliations(id, run_id, owner_id, gate_revision, presentation_id,
+			gate_digest, reset_state_digest, worker_id, claim_generation, reason, consent, before_state, after_state,
+			applied_input_id, stop_cutoff)
+			VALUES ($1, $2, $3, 1, $4, $5, 'fixture', $6, 1, 'fixture', '{}', '{}', '{}', $7, $7)`,
+			uuid.New(), f.run, e.userID, uuid.New(), []byte{1}, wid, input)
 	}
 	return f
 }
@@ -453,6 +464,36 @@ func TestTerminalOpenGuardedHoldLiveDB(t *testing.T) {
 			t.Fatalf("contribution = %+v", c)
 		}
 	})
+	// The fixture is the realistic hold shape: a terminal run whose claim is released and that has a
+	// reconciliation row, which beginClaimMutation's fence would refuse as stale_claim.
+	t.Run("a released, reconciled terminal run publishes through the hold", func(t *testing.T) {
+		f := newTermFix(t, "hold")
+		var released bool
+		var reconciliations int
+		if err := f.e.pool.QueryRow(f.e.ctx, `SELECT claim_released_at IS NOT NULL, (SELECT count(*) FROM run_milestone_reconciliations WHERE run_id=$1)
+			FROM runs WHERE id=$1`, f.run).Scan(&released, &reconciliations); err != nil || !released || reconciliations != 1 {
+			t.Fatalf("fixture released=%v reconciliations=%d err=%v", released, reconciliations, err)
+		}
+		res, err := f.publish(f.req(1, termTip1, ""))
+		if err != nil || res.State != "published" {
+			t.Fatalf("result = %+v, %v", res, err)
+		}
+		if c, _ := f.con(1); c.Authority != "open_guarded_hold" {
+			t.Fatalf("authority = %s", c.Authority)
+		}
+	})
+	// The hold is for generation 1, but the run is running at generation 2 on another worker: the held
+	// V2 predicates (a terminal run) refuse it with no write.
+	t.Run("a hold of an earlier generation is refused while the run runs elsewhere", func(t *testing.T) {
+		f := newTermFix(t, "hold")
+		other := f.e.seedWorker(t, f.worker.ProtocolCapabilities)
+		f.e.exec(t, `UPDATE runs SET status='running', claim_generation=2, worker_id=$2, claim_released_at=NULL WHERE id=$1`, f.run, other)
+		_, err := f.publish(f.req(1, termTip1, ""))
+		if r := termReason(t, err); r != apitypes.TerminalReasonUnsupported {
+			t.Fatalf("reason = %s, want %s", r, apitypes.TerminalReasonUnsupported)
+		}
+		f.assertNothing("hold while the run is live elsewhere")
+	})
 	cases := []struct {
 		name   string
 		mutate func(f *termFix)
@@ -467,16 +508,16 @@ func TestTerminalOpenGuardedHoldLiveDB(t *testing.T) {
 		{"closed hold", func(f *termFix) {
 			f.rawHold(`UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL,
 				released_at=now() WHERE id=$1`)
-		}, 1, apitypes.TerminalReasonHoldMissing},
+		}, 1, "stale_claim"},
 		{"discarded hold", func(f *termFix) {
 			f.rawHold(`UPDATE recovery_custody_holds SET state='discarded', live_worker_id=NULL, live_run_id=NULL,
 				release_evidence='owner_discard', released_at=now() WHERE id=$1`)
-		}, 1, apitypes.TerminalReasonHoldMissing},
+		}, 1, "stale_claim"},
 		// The hold lookup only finds guarded holds, so an unguarded one is no hold at all: the
-		// terminal run then has no authority, the current_flight status refusal.
+		// terminal run, whose claim is released, then has no authority: a stale claim.
 		{"hold not guarded", func(f *termFix) {
 			f.rawHold(`UPDATE recovery_custody_holds SET inventory_guarded=false WHERE id=$1`)
-		}, 1, apitypes.TerminalReasonUnsupported},
+		}, 1, "stale_claim"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

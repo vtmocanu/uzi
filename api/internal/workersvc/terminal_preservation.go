@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -261,6 +262,28 @@ func (s *Service) TerminalPreservationAdmit(wkr store.Worker) error {
 	return nil
 }
 
+// TerminalPreservationGate is the pre-body authorization: it reads no body, makes no forge call and
+// writes nothing. The run must belong to the worker's user and lane (an unknown or foreign run is
+// ErrRunNotOwned), and the worker must have reported the capability. The generation lives in the
+// body, so the generation-bound predicates (current flight or an exact guarded hold) are applied by
+// PublishTerminal once the body is read.
+func (s *Service) TerminalPreservationGate(ctx context.Context, wkr store.Worker, runID uuid.UUID) error {
+	if err := s.TerminalPreservationAdmit(wkr); err != nil {
+		return err
+	}
+	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrRunNotOwned
+	}
+	if err != nil {
+		return fmt.Errorf("terminal preservation run: %w", err)
+	}
+	if (run.Kind == "cross_check" && run.ClaimGeneration == 0) || laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
+		return ErrRunNotOwned
+	}
+	return nil
+}
+
 // canonicalTerminalManifest validates m against the authenticated run, generation and worker,
 // canonicalises it (sorted slices, fixed field order, no credentials) and returns the canonical
 // JSON, its sha256 digest and the roots the pack verification must prove.
@@ -342,13 +365,26 @@ func terminalFlightEligible(wkr store.Worker, run store.Run, generation int64) (
 	return true, nil
 }
 
-// terminalHoldScope is the open_guarded_hold predicate set (the held V2 predicates of heldScope):
-// an exact open inventory-guarded hold of this run and generation, whose original and live worker
-// is the caller and whose run, repo and owner match.
+// terminalHoldScope is the open_guarded_hold predicate set, the held V2 predicates of heldScope: a
+// terminal run (failed, cancelled or completed) of a kind that opens custody holds, whose claim
+// generation has reached the hold's, with an exact open inventory-guarded hold of this run and
+// generation whose original and live worker is the caller and whose run, repo and owner match. A
+// missing or non-matching hold is checked first (hold_missing); a run that is not terminal, or is
+// of another kind, is then unsupported (the current_flight status refusal), and a generation the
+// run never reached has no hold.
 func terminalHoldScope(wkr store.Worker, run store.Run, hold store.RecoveryCustodyHold, found bool, generation int64) *TerminalRefusal {
 	if !found || hold.State != "open" || !hold.InventoryGuarded || !hold.LiveWorkerID.Valid ||
 		uuid.UUID(hold.LiveWorkerID.Bytes) != wkr.ID || hold.OriginalWorkerID != wkr.ID ||
 		hold.RunID != run.ID || hold.LiveRunID != pgconv.UUID(run.ID) || hold.Generation != generation {
+		return terminalRefuse(apitypes.TerminalReasonHoldMissing)
+	}
+	if run.Status != "failed" && run.Status != "cancelled" && run.Status != "completed" {
+		return terminalRefuse(apitypes.TerminalReasonUnsupported)
+	}
+	if !slices.Contains(heldHoldKinds, run.Kind) {
+		return terminalRefuse(apitypes.TerminalReasonUnsupported)
+	}
+	if generation <= 0 || run.ClaimGeneration < generation {
 		return terminalRefuse(apitypes.TerminalReasonHoldMissing)
 	}
 	if !hold.RepoID.Valid || run.RepoID != hold.RepoID || hold.UserID != wkr.UserID || run.UserID != wkr.UserID {
@@ -394,7 +430,7 @@ func terminalAuthority(wkr store.Worker, run store.Run, generation int64, getHol
 	// custody record) which does not qualify is reported by the hold; one with no hold at all is
 	// unsupported, the current_flight status refusal.
 	var statusRefusal *TerminalRefusal
-	if flightErr != nil && !(errors.As(flightErr, &statusRefusal) && found) {
+	if flightErr != nil && (!errors.As(flightErr, &statusRefusal) || !found) {
 		return "", store.RecoveryCustodyHold{}, flightErr
 	}
 	return "", store.RecoveryCustodyHold{}, holdRefusal
@@ -449,7 +485,7 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 	if (run.Kind == "cross_check" && run.ClaimGeneration == 0) || laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
 		return TerminalPublishResult{}, ErrRunNotOwned
 	}
-	if _, _, err := terminalAuthority(wkr, run, req.Generation, func() (store.RecoveryCustodyHold, bool, error) {
+	preAuthority, _, err := terminalAuthority(wkr, run, req.Generation, func() (store.RecoveryCustodyHold, bool, error) {
 		h, err := tr.GetHeldPublicationHold(ctx, store.GetHeldPublicationHoldParams{
 			RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID, Generation: req.Generation,
 		})
@@ -457,10 +493,19 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 			return h, false, nil
 		}
 		return h, err == nil, err
-	}); err != nil {
+	})
+	if err != nil {
 		return TerminalPublishResult{}, err
 	}
 
+	// The preservation is read BEFORE the contribution. A winner commits both rows in one
+	// transaction, so a preservation read as publishing guarantees the contribution read after it is
+	// visible; the opposite order could see no contribution and an already-publishing preservation
+	// and refuse an identical retry that should reconcile.
+	pres, perr := tr.GetTerminalPreservationByRun(ctx, runID)
+	if perr != nil && !errors.Is(perr, pgx.ErrNoRows) {
+		return TerminalPublishResult{}, fmt.Errorf("terminal preservation row: %w", perr)
+	}
 	existing, err := tr.GetTerminalContributionByRunGeneration(ctx, store.GetTerminalContributionByRunGenerationParams{RunID: runID, Generation: req.Generation})
 	found := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -474,19 +519,14 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 			return s.terminalReconcile(ctx, runID, req.Generation)
 		}
 	}
-	pres, perr := tr.GetTerminalPreservationByRun(ctx, runID)
-	if perr != nil && !errors.Is(perr, pgx.ErrNoRows) {
-		return TerminalPublishResult{}, fmt.Errorf("terminal preservation row: %w", perr)
-	}
+	// A retired preservation is final and refused here. A publication in flight and a prior tip that
+	// differs from the preservation's are only snapshots when this generation has no contribution
+	// yet: a concurrent identical request may be about to create it, so tx1 decides them under the
+	// locks.
 	if perr == nil {
-		if refusal := terminalPreservationRefusal(pres, found); refusal != nil {
+		if refusal := terminalPreservationRefusal(pres, found); refusal != nil && (found || refusal.Reason != apitypes.TerminalReasonPublicationInFlight) {
 			return TerminalPublishResult{}, refusal
 		}
-		if !found && pres.Tip.String != req.PriorTip {
-			return TerminalPublishResult{}, terminalRefuse(apitypes.TerminalReasonPriorTipMismatch)
-		}
-	} else if req.PriorTip != "" {
-		return TerminalPublishResult{}, terminalRefuse(apitypes.TerminalReasonPriorTipMismatch)
 	}
 
 	// The lifetime read, then the pack preparation, both before any transaction. An existing
@@ -506,7 +546,7 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 		}
 	}
 
-	bound, err := s.terminalBind(ctx, wkr, run, req, digest, canon, lt)
+	bound, err := s.terminalBind(ctx, wkr, run, preAuthority, req, digest, canon, lt)
 	if err != nil {
 		return TerminalPublishResult{}, err
 	}
@@ -527,7 +567,7 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 		hold, herr := tr.GetHeldPublicationHold(ctx, store.GetHeldPublicationHoldParams{
 			RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID, Generation: req.Generation,
 		})
-		if herr != nil || !bound.con.HoldID.Valid || hold.ID != uuid.UUID(bound.con.HoldID.Bytes) || terminalHoldScope(wkr, run, hold, true, req.Generation) != nil {
+		if herr != nil || !bound.con.HoldID.Valid || hold.ID != uuid.UUID(bound.con.HoldID.Bytes) || terminalHoldScope(wkr, bound.run, hold, true, req.Generation) != nil {
 			return terminalResult(bound.pres, bound.con), nil
 		}
 	}
@@ -641,24 +681,51 @@ type terminalBinding struct {
 	pres      store.RunTerminalPreservation
 	con       store.RunTerminalContribution
 	authority string
+	run       store.Run // the run row read under the lock
 	winner    bool
 }
 
 // terminalWriteMiss reports a state writer that changed no row. The caller is inside its
-// transaction, holding the run lock, so the re-read is authoritative: a row still in the state the
+// transaction, holding the run lock, so the re-read is authoritative: the row the writer targets
+// (the contribution of generation when onContribution, else the preservation) still in the state the
 // writer expected means a guard refused the change (an illegal transition); anything else is a lost
 // race. Either way the caller rolls back.
-func terminalWriteMiss(ctx context.Context, qt *store.Queries, what string, runID uuid.UUID, expectedState string) error {
-	cur, err := qt.GetTerminalPreservationByRun(ctx, runID)
+func terminalWriteMiss(ctx context.Context, qt *store.Queries, what string, runID uuid.UUID, generation int64, onContribution bool, expectedState string) error {
+	var (
+		cur  string
+		rerr error
+	)
+	if onContribution {
+		var c store.RunTerminalContribution
+		c, rerr = qt.GetTerminalContributionByRunGeneration(ctx, store.GetTerminalContributionByRunGenerationParams{RunID: runID, Generation: generation})
+		cur = c.State
+	} else {
+		var p store.RunTerminalPreservation
+		p, rerr = qt.GetTerminalPreservationByRun(ctx, runID)
+		cur = p.State
+	}
 	switch {
-	case err == nil && cur.State == expectedState:
-		slog.Error("terminal preservation: illegal transition", "run", runID, "writer", what, "state", cur.State)
-	case err == nil:
-		slog.Warn("terminal preservation: lost race", "run", runID, "writer", what, "expected", expectedState, "state", cur.State)
+	case rerr == nil && cur == expectedState:
+		slog.Error("terminal preservation: illegal transition", "run", runID, "writer", what, "state", cur)
+	case rerr == nil:
+		slog.Warn("terminal preservation: lost race", "run", runID, "writer", what, "expected", expectedState, "state", cur)
 	default:
 		slog.Warn("terminal preservation: lost race, row unreadable", "run", runID, "writer", what)
 	}
 	return fmt.Errorf("terminal preservation %s: no row updated", what)
+}
+
+// terminalSchedule runs the scheduling write and treats zero rows as a failure: the caller rolls
+// back rather than commit a row the sweep would never look at.
+func terminalSchedule(ctx context.Context, qt *store.Queries, arg store.ScheduleTerminalPreservationCheckParams) error {
+	n, err := qt.ScheduleTerminalPreservationCheck(ctx, arg)
+	if err != nil {
+		return fmt.Errorf("terminal preservation schedule: %w", err)
+	}
+	if n == 0 {
+		return errors.New("terminal preservation schedule: no row updated")
+	}
+	return nil
 }
 
 // terminalBind is tx1. With the worker, run, hold and preservation locked in that order it
@@ -669,15 +736,17 @@ func terminalWriteMiss(ctx context.Context, qt *store.Queries, what string, runI
 // goes prepared -> invoked. A proven-closed lifetime instead records the abandonment and sends
 // nothing. winner is true only if both rows changed AND the commit succeeded; every other request,
 // including one whose COMMIT result is ambiguous, only lists and reconciles.
-func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.Run, req TerminalPublishRequest, digest string, canon []byte, lt TerminalLifetime) (b terminalBinding, err error) {
+func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.Run, preAuthority string, req TerminalPublishRequest, digest string, canon []byte, lt TerminalLifetime) (b terminalBinding, err error) {
 	runID := run.ID
 	var (
 		tx pgx.Tx
 		qt *store.Queries
 	)
-	if run.WorkerID == pgconv.UUID(wkr.ID) {
-		// The worker's own run: the claim-mutation locks (worker, then run). Their reconciliation
-		// fence is applied; the explicit current_flight predicates are applied again below.
+	if preAuthority == terminalAuthorityCurrentFlight {
+		// A live flight: the claim-mutation locks (worker, then run), whose reconciliation fence
+		// applies to a live claim. The explicit current_flight predicates are applied again below.
+		// An open_guarded_hold publishes for a terminal run whose claim is already released, which
+		// that fence would refuse, so it takes the plain locks below, as held publication's step B.
 		g := req.Generation
 		var locked store.Run
 		_, locked, tx, err = s.beginClaimMutation(ctx, wkr, runID, &g)
@@ -690,7 +759,7 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 		run = locked
 		qt = store.New(tx)
 	} else {
-		tx, err = s.txBeginner.Begin(ctx)
+		tx, err = s.beginReadCommitted(ctx)
 		if err != nil {
 			return b, fmt.Errorf("terminal preservation begin: %w", err)
 		}
@@ -736,6 +805,12 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 	})
 	if err != nil {
 		return b, err
+	}
+	b.run = run
+	if authority != preAuthority {
+		// The run's state moved between the unlocked pre-check and the locks: the class the lock
+		// path was chosen for no longer holds, so the request is stale and retries from the pre-check.
+		return b, ErrStaleClaim
 	}
 	if !run.RepoID.Valid {
 		return b, terminalRefuse(apitypes.TerminalReasonIdentityChanged)
@@ -800,16 +875,16 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 			p2, merr := qt.MarkTerminalPreservationNotPublished(ctx, pres.ID)
 			if merr != nil {
 				if errors.Is(merr, pgx.ErrNoRows) {
-					return b, terminalWriteMiss(ctx, qt, "mark not_published", runID, pres.State)
+					return b, terminalWriteMiss(ctx, qt, "mark not_published", runID, req.Generation, false, pres.State)
 				}
 				return b, fmt.Errorf("terminal preservation not_published: %w", merr)
 			}
 			pres = p2
 		case pres.State != terminalStateNotPublished:
-			if _, serr := qt.ScheduleTerminalPreservationCheck(ctx, store.ScheduleTerminalPreservationCheckParams{
+			if serr := terminalSchedule(ctx, qt, store.ScheduleTerminalPreservationCheckParams{
 				ID: pres.ID, NextCheckAt: pgtype.Timestamptz{Time: s.now(), Valid: true},
 			}); serr != nil {
-				return b, fmt.Errorf("terminal preservation schedule: %w", serr)
+				return b, serr
 			}
 		}
 		if err = tx.Commit(ctx); err != nil {
@@ -825,14 +900,19 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 		ID: pres.ID, ExpectedState: pres.State, ExpectedTip: pres.Tip,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return b, terminalWriteMiss(ctx, qt, "mark publishing", runID, pres.State)
+		return b, terminalWriteMiss(ctx, qt, "mark publishing", runID, req.Generation, false, pres.State)
 	}
 	if err != nil {
 		return b, fmt.Errorf("terminal preservation publishing: %w", err)
 	}
 	con2, err := qt.MarkTerminalContributionInvoked(ctx, con.ID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return b, terminalWriteMiss(ctx, qt, "mark invoked", runID, terminalStatePublishing)
+		return b, terminalWriteMiss(ctx, qt, "mark invoked", runID, req.Generation, true, terminalContributionPrepared)
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		// The one-unresolved-push-per-preservation index: another generation's push is unresolved.
+		return b, terminalRefuse(apitypes.TerminalReasonPublicationInFlight)
 	}
 	if err != nil {
 		return b, fmt.Errorf("terminal preservation marker: %w", err)
@@ -875,7 +955,7 @@ func (s *Service) terminalRecordOutcome(ctx context.Context, runID uuid.UUID, ge
 	}
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalOutcomeWriteTimeout)
 	defer cancel()
-	tx, err := s.txBeginner.Begin(wctx)
+	tx, err := s.beginReadCommitted(wctx)
 	if err != nil {
 		return zeroP, zeroC, err
 	}
@@ -895,12 +975,13 @@ func (s *Service) terminalRecordOutcome(ctx context.Context, runID uuid.UUID, ge
 	if con.State != terminalContributionInvoked && con.State != terminalContributionUnknown {
 		return pres, con, nil
 	}
+	expected := con.State
 	next := func(d time.Duration) pgtype.Timestamptz { return pgtype.Timestamptz{Time: s.now().Add(d), Valid: true} }
 	switch rec.outcome {
 	case pushbroker.TerminalApplied:
 		con, err = qt.RecordTerminalContributionPublished(wctx, store.RecordTerminalContributionPublishedParams{ID: con.ID, ExpectedState: con.State})
 		if errors.Is(err, pgx.ErrNoRows) {
-			return zeroP, zeroC, terminalWriteMiss(wctx, qt, "record published", runID, pres.State)
+			return zeroP, zeroC, terminalWriteMiss(wctx, qt, "record published", runID, generation, true, expected)
 		}
 		if err != nil {
 			return zeroP, zeroC, fmt.Errorf("terminal preservation published: %w", err)
@@ -917,7 +998,7 @@ func (s *Service) terminalRecordOutcome(ctx context.Context, runID uuid.UUID, ge
 			ID: con.ID, ExpectedState: con.State, RefusalReason: pgtype.Text{String: reason, Valid: true},
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
-			return zeroP, zeroC, terminalWriteMiss(wctx, qt, "record refused", runID, pres.State)
+			return zeroP, zeroC, terminalWriteMiss(wctx, qt, "record refused", runID, generation, true, expected)
 		}
 		if err != nil {
 			return zeroP, zeroC, fmt.Errorf("terminal preservation refused: %w", err)
@@ -930,22 +1011,22 @@ func (s *Service) terminalRecordOutcome(ctx context.Context, runID uuid.UUID, ge
 		if con.State == terminalContributionInvoked {
 			con, err = qt.RecordTerminalContributionUnknown(wctx, con.ID)
 			if errors.Is(err, pgx.ErrNoRows) {
-				return zeroP, zeroC, terminalWriteMiss(wctx, qt, "record unknown", runID, pres.State)
+				return zeroP, zeroC, terminalWriteMiss(wctx, qt, "record unknown", runID, generation, true, terminalContributionInvoked)
 			}
 			if err != nil {
 				return zeroP, zeroC, fmt.Errorf("terminal preservation unknown: %w", err)
 			}
 		}
-		if _, err = qt.ScheduleTerminalPreservationCheck(wctx, store.ScheduleTerminalPreservationCheckParams{
+		if err = terminalSchedule(wctx, qt, store.ScheduleTerminalPreservationCheckParams{
 			ID: pres.ID, NextCheckAt: next(terminalUnknownRetryAfter),
 			LastError: pgtype.Text{String: rec.lastErr, Valid: rec.lastErr != ""},
 		}); err != nil {
-			return zeroP, zeroC, fmt.Errorf("terminal preservation schedule: %w", err)
+			return zeroP, zeroC, err
 		}
 		pres, err = qt.GetTerminalPreservationByRun(wctx, runID)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return zeroP, zeroC, terminalWriteMiss(wctx, qt, "settle preservation", runID, terminalStatePublishing)
+		return zeroP, zeroC, terminalWriteMiss(wctx, qt, "settle preservation", runID, generation, false, terminalStatePublishing)
 	}
 	if err != nil {
 		return zeroP, zeroC, fmt.Errorf("terminal preservation settle: %w", err)

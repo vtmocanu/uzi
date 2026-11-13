@@ -132,9 +132,10 @@ RETURNING *;
 
 -- name: ScheduleTerminalPreservationCheck :execrows
 -- A single-row scheduling write (no state, no tip, so it needs no run lock): when the sweep next
--- looks at the row, and the scrubbed outcome text of the last attempt.
+-- looks at the row, and the scrubbed outcome text of the last attempt. A NULL text keeps the
+-- existing last_error (a scheduling write must not erase the last recorded failure).
 UPDATE run_terminal_preservations SET
-    next_check_at = @next_check_at, last_error = sqlc.narg('last_error')::text, updated_at = now()
+    next_check_at = @next_check_at, last_error = COALESCE(sqlc.narg('last_error')::text, last_error), updated_at = now()
 WHERE id = @id;
 
 -- name: MarkTerminalContributionInvoked :one

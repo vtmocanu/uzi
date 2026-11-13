@@ -48,7 +48,7 @@ func (f *fakeTerminalSvc) AcquireHeldPublishSlot() (func(), bool) {
 	return func() { f.mu.Lock(); f.releases++; f.mu.Unlock() }, true
 }
 
-func (f *fakeTerminalSvc) TerminalPreservationAdmit(store.Worker) error {
+func (f *fakeTerminalSvc) TerminalPreservationGate(context.Context, store.Worker, uuid.UUID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.admitN++
@@ -193,6 +193,46 @@ func TestWorkerRunTerminalPreservationBodyValidation(t *testing.T) {
 	})
 }
 
+// The raw manifest is bounded before it is parsed: a manifest that is well-formed and would decode
+// cleanly into the struct is still refused once its raw bytes pass the cap, so the size check, not
+// the decode, is what refuses it.
+func TestDecodeTerminalRequestBoundsManifestBeforeParsing(t *testing.T) {
+	manifest := func(pad int) string {
+		return `{"run_id":"` + strings.Repeat("r", pad) + `","generation":2,"worker_id":"w","roots":[],"abandoned":[]}`
+	}
+	body := func(m string) []byte {
+		return []byte(`{"generation":2,"tip":"` + termHTTPTip + `","disposition":"preserve","manifest":` + m + `}`)
+	}
+	small := manifest(10)
+	if _, err := decodeTerminalRequest(body(small)); err != nil {
+		t.Fatalf("a small manifest was refused: %v", err)
+	}
+	// Exactly at the cap: accepted. One byte over: refused, though both parse identically.
+	atCap := manifest(terminalMaxManifestBytes - len(manifest(0)))
+	if len(atCap) != terminalMaxManifestBytes {
+		t.Fatalf("fixture is %d bytes, want %d", len(atCap), terminalMaxManifestBytes)
+	}
+	if _, err := decodeTerminalRequest(body(atCap)); err != nil {
+		t.Fatalf("a manifest at the cap was refused: %v", err)
+	}
+	var probe apitypes.TerminalManifest
+	over := manifest(terminalMaxManifestBytes - len(manifest(0)) + 1)
+	if err := json.Unmarshal([]byte(over), &probe); err != nil {
+		t.Fatalf("the oversized manifest must itself be decodable, got %v", err)
+	}
+	_, err := decodeTerminalRequest(body(over))
+	if err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("an oversized manifest: err = %v, want a too-large refusal", err)
+	}
+
+	f := newFakeTerminalSvc()
+	rec := httptest.NewRecorder()
+	terminalHandler(f).WorkerRunTerminalPreservation(rec, termReq(string(body(over))))
+	if rec.Code != http.StatusBadRequest || f.publishN != 0 {
+		t.Fatalf("status = %d publish=%d, want 400 and no service call", rec.Code, f.publishN)
+	}
+}
+
 func TestWorkerRunTerminalPreservationNoWorker401(t *testing.T) {
 	rec := httptest.NewRecorder()
 	terminalHandler(newFakeTerminalSvc()).WorkerRunTerminalPreservation(rec, httptest.NewRequest(http.MethodPost, "/x", strings.NewReader("{}")))
@@ -215,6 +255,16 @@ func TestWorkerRunTerminalPreservationGateOrder(t *testing.T) {
 		}
 		if f.publishN != 0 || f.releases != 1 {
 			t.Fatalf("publish=%d releases=%d", f.publishN, f.releases)
+		}
+	})
+	t.Run("a run the worker's user does not own is 404 and the body is never read", func(t *testing.T) {
+		f := newFakeTerminalSvc()
+		f.admit = workersvc.ErrRunNotOwned
+		req := reqWithWorkerAndParam(http.MethodPost, "/x", poisonReader{t}, uuid.New())
+		rec := httptest.NewRecorder()
+		terminalHandler(f).WorkerRunTerminalPreservation(rec, req)
+		if rec.Code != http.StatusNotFound || f.publishN != 0 || f.releases != 1 {
+			t.Fatalf("status = %d publish=%d releases=%d body %q", rec.Code, f.publishN, f.releases, rec.Body.String())
 		}
 	})
 	t.Run("busy", func(t *testing.T) {

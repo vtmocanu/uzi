@@ -175,6 +175,13 @@ func TestTerminalPreservationWritersLiveDB(t *testing.T) {
 		if err != nil || n != 1 {
 			t.Fatalf("schedule rows=%d err=%v", n, err)
 		}
+		// A scheduling write with no text keeps the recorded failure instead of erasing it.
+		if n, err = ft.q.ScheduleTerminalPreservationCheck(ft.ctx, store.ScheduleTerminalPreservationCheckParams{ID: p.ID, NextCheckAt: termIn(2 * time.Hour)}); err != nil || n != 1 {
+			t.Fatalf("schedule without text rows=%d err=%v", n, err)
+		}
+		if kept, err := ft.q.GetTerminalPreservationByRun(ft.ctx, p.RunID); err != nil || kept.LastError.String != "timeout" {
+			t.Fatalf("last_error after a text-less schedule = %+v err=%v, want timeout", kept.LastError, err)
+		}
 		if _, err := ft.q.RecordTerminalContributionPublished(ft.ctx, store.RecordTerminalContributionPublishedParams{ID: c.ID, ExpectedState: "publish_unknown"}); err != nil {
 			t.Fatalf("publish_unknown -> published: %v", err)
 		}
@@ -234,12 +241,36 @@ func TestTerminalInvokeVersusNotPublishedLiveDB(t *testing.T) {
 		ft.mustRows(1, `UPDATE run_terminal_contributions SET state='refused', refusal_reason='create_refused' WHERE id=$1`, c1.ID)
 		return p, ft.insertContribution(p, 2, termTipB, nil)
 	}
-	// waitBlocked polls until a session is waiting on a lock, so the interleaving is real.
-	waitBlocked := func(ft *termFixture) {
+	type result struct {
+		rows int64
+		err  error
+	}
+	// second runs sql on its own dedicated connection and returns that backend's pid with the
+	// channel its result arrives on, so the wait below can name exactly this session.
+	second := func(ft *termFixture, sql string, args ...any) (int32, <-chan result) {
+		conn, err := ft.pool.Acquire(ft.ctx)
+		if err != nil {
+			ft.t.Fatal(err)
+		}
+		var pid int32
+		if err := conn.QueryRow(ft.ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			conn.Release()
+			ft.t.Fatal(err)
+		}
+		out := make(chan result, 1)
+		go func() {
+			defer conn.Release()
+			tag, err := conn.Exec(ft.ctx, sql, args...)
+			out <- result{tag.RowsAffected(), err}
+		}()
+		return pid, out
+	}
+	// waitBlocked polls until that specific session is waiting on a lock, so the interleaving is real.
+	waitBlocked := func(ft *termFixture, pid int32) {
 		deadline := time.Now().Add(15 * time.Second)
 		for time.Now().Before(deadline) {
 			var n int
-			if err := ft.pool.QueryRow(ft.ctx, `SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()`).Scan(&n); err != nil {
+			if err := ft.pool.QueryRow(ft.ctx, `SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'`, pid).Scan(&n); err != nil {
 				ft.t.Fatal(err)
 			}
 			if n > 0 {
@@ -247,7 +278,7 @@ func TestTerminalInvokeVersusNotPublishedLiveDB(t *testing.T) {
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
-		ft.t.Fatal("the second session never blocked on the first's lock")
+		ft.t.Fatalf("session %d never blocked on the first's lock", pid)
 	}
 
 	t.Run("invoke commits first: not_published is refused", func(t *testing.T) {
@@ -263,16 +294,8 @@ func TestTerminalInvokeVersusNotPublishedLiveDB(t *testing.T) {
 		if err != nil || tag.RowsAffected() != 1 {
 			t.Fatalf("invoke rows=%d err=%v", tag.RowsAffected(), err)
 		}
-		type result struct {
-			rows int64
-			err  error
-		}
-		out := make(chan result, 1)
-		go func() {
-			n, err := ft.rows(`UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE id=$1`, p.ID)
-			out <- result{n, err}
-		}()
-		waitBlocked(&ft)
+		pid, out := second(&ft, `UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE id=$1`, p.ID)
+		waitBlocked(&ft, pid)
 		if err := a.Commit(ft.ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -298,16 +321,8 @@ func TestTerminalInvokeVersusNotPublishedLiveDB(t *testing.T) {
 		if err != nil || tag.RowsAffected() != 1 {
 			t.Fatalf("not_published rows=%d err=%v", tag.RowsAffected(), err)
 		}
-		type result struct {
-			rows int64
-			err  error
-		}
-		out := make(chan result, 1)
-		go func() {
-			n, err := ft.rows(`UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c2.ID)
-			out <- result{n, err}
-		}()
-		waitBlocked(&ft)
+		pid, out := second(&ft, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c2.ID)
+		waitBlocked(&ft, pid)
 		if err := b.Commit(ft.ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -319,6 +334,21 @@ func TestTerminalInvokeVersusNotPublishedLiveDB(t *testing.T) {
 		if err := ft.pool.QueryRow(ft.ctx, `SELECT state FROM run_terminal_contributions WHERE id=$1`, c2.ID).Scan(&state); err != nil || state != "prepared" {
 			t.Fatalf("the contribution must still be prepared, got %q err=%v", state, err)
 		}
+	})
+
+	t.Run("a second unresolved push on one preservation is refused by the index", func(t *testing.T) {
+		ft := *f
+		ft.t = t
+		p := ft.insertPreservation(ft.newRun())
+		c1 := ft.insertContribution(p, 1, termTipA, nil)
+		c2 := ft.insertContribution(p, 2, termTipB, nil)
+		ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, p.ID)
+		ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c1.ID)
+		_, err := ft.rows(`UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c2.ID)
+		heldCheckName(t, err, "idx_run_terminal_contributions_unresolved")
+		// Once the first push is decided, the second may be invoked.
+		ft.mustRows(1, `UPDATE run_terminal_contributions SET state='refused', refusal_reason='create_refused' WHERE id=$1`, c1.ID)
+		ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c2.ID)
 	})
 
 	t.Run("a bound preservation refuses the invoke", func(t *testing.T) {

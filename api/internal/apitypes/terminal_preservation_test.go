@@ -24,13 +24,13 @@ func TestTerminalPreservationRequestStrictDecode(t *testing.T) {
 		t.Fatalf("decode = %+v, %v", r, err)
 	}
 	for name, bad := range map[string]string{
-		"top level":   `{"generation":1,"extra":true}`,
-		"manifest":    `{"manifest":{"extra":1}}`,
-		"root":        `{"manifest":{"roots":[{"nope":1}]}}`,
-		"abandoned":   `{"manifest":{"abandoned":[{"nope":1}]}}`,
-		"extents":     `{"manifest":{"abandoned":[{"extents":{"nope":1}}]}}`,
-		"wrong type":  `{"generation":"2"}`,
-		"credentials": `{"manifest":{"roots":[{"pat":"x"}]}}`,
+		"top level":          `{"generation":1,"extra":true}`,
+		"manifest":           `{"manifest":{"extra":1}}`,
+		"root":               `{"manifest":{"roots":[{"nope":1}]}}`,
+		"abandoned":          `{"manifest":{"abandoned":[{"nope":1}]}}`,
+		"extents":            `{"manifest":{"abandoned":[{"extents":{"nope":1}}]}}`,
+		"wrong type":         `{"generation":"2"}`,
+		"foreign root field": `{"manifest":{"roots":[{"pat":"x"}]}}`,
 	} {
 		if _, err := decode(bad); err == nil {
 			t.Errorf("%s: accepted %s", name, bad)

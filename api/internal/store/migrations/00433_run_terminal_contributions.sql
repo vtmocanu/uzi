@@ -43,7 +43,7 @@ CREATE TABLE run_terminal_contributions (
         'recorded'          -- an abandonment decision was recorded; nothing was pushed
     )),
     refusal_reason text CONSTRAINT run_terminal_contributions_refusal_reason_check CHECK (refusal_reason IN (
-        'create_refused', 'update_refused', 'foreign_tip', 'ci_config_guard', 'pack_invalid', 'tip_missing')),
+        'create_refused', 'update_refused', 'foreign_tip')),
     create_invoked_at timestamptz,
     published_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -68,6 +68,10 @@ CREATE TABLE run_terminal_contributions (
 );
 
 CREATE INDEX idx_run_terminal_contributions_preservation ON run_terminal_contributions (preservation_id);
+-- At most one unresolved push per preservation: a second concurrent invoker is refused by the
+-- database, not only by the writers' guards.
+CREATE UNIQUE INDEX idx_run_terminal_contributions_unresolved ON run_terminal_contributions (preservation_id)
+    WHERE state IN ('invoked', 'publish_unknown');
 -- The RESTRICT FK's referencing side, so a hold delete does not scan the table.
 CREATE INDEX idx_run_terminal_contributions_hold ON run_terminal_contributions (hold_id)
     WHERE hold_id IS NOT NULL;
@@ -150,7 +154,7 @@ CREATE TRIGGER run_terminal_contribution_delete_guard BEFORE DELETE ON run_termi
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
-LOCK TABLE run_terminal_contributions IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE run_terminal_contributions IN ACCESS EXCLUSIVE MODE;
 -- A contribution whose ref may still exist is the only record of the tip pushed to it: refuse the
 -- rollback rather than forget it. The ref may exist while its preservation bears the live pointer,
 -- and an unresolved push (invoked, publish_unknown) may have created it. Drain or delete the

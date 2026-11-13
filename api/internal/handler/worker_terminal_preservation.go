@@ -30,9 +30,14 @@ import (
 // deadlines (heldUploadBudget, heldServiceBudget, heldResponseGrace), its process-wide slot pool
 // (AcquireHeldPublishSlot) and its pack cap (maxPackBytes, here applied to the base64 text).
 
-// terminalBodyOverhead is what the JSON body may carry beyond the base64 pack: the manifest (the
-// store caps its canonical form at 256 KiB) and the scalar fields.
+// terminalBodyOverhead is what the JSON body may carry beyond the base64 pack: the manifest and the
+// scalar fields. It is an upper bound on the transport only; the manifest has its own, much smaller
+// cap (terminalMaxManifestBytes), applied to its raw bytes before they are parsed.
 const terminalBodyOverhead = 1 << 20
+
+// terminalMaxManifestBytes caps the raw manifest JSON before it is decoded into structs. It mirrors
+// the store's cap on the canonical manifest (the 00433 manifest CHECK, 256 KiB).
+const terminalMaxManifestBytes = 256 << 10
 
 // terminalMaxBodyBytes caps the whole JSON body.
 var terminalMaxBodyBytes = int64(base64.StdEncoding.EncodedLen(maxPackBytes)) + terminalBodyOverhead
@@ -43,7 +48,7 @@ var terminalTipRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // test Handler can set terminalSvc to a fake without a database.
 type terminalPublisher interface {
 	AcquireHeldPublishSlot() (release func(), ok bool)
-	TerminalPreservationAdmit(wkr store.Worker) error
+	TerminalPreservationGate(ctx context.Context, wkr store.Worker, runID uuid.UUID) error
 	PublishTerminal(ctx context.Context, wkr store.Worker, runID uuid.UUID, req workersvc.TerminalPublishRequest) (workersvc.TerminalPublishResult, error)
 }
 
@@ -58,8 +63,9 @@ func (h *Handler) terminalPublisher() terminalPublisher {
 }
 
 // WorkerRunTerminalPreservation is the route. Order: authentication (RequireWorker), a concurrency
-// slot, the pre-body capability check (no body read, no write), the deadlines, the body read capped
-// at terminalMaxBodyBytes, a strict decode, field validation, and the service call.
+// slot, the pre-body gate (the worker's capability and the run's ownership: no body read, no write),
+// the deadlines, the body read capped at terminalMaxBodyBytes, a strict decode, field validation,
+// and the service call.
 func (h *Handler) WorkerRunTerminalPreservation(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
@@ -83,7 +89,7 @@ func (h *Handler) WorkerRunTerminalPreservation(w http.ResponseWriter, r *http.R
 	}
 	defer release()
 
-	if err := svc.TerminalPreservationAdmit(wkr); err != nil {
+	if err := svc.TerminalPreservationGate(r.Context(), wkr, runID); err != nil {
 		writeTerminalError(w, runID, wkr, err)
 		return
 	}
@@ -124,20 +130,45 @@ func (h *Handler) WorkerRunTerminalPreservation(w http.ResponseWriter, r *http.R
 	})
 }
 
+// terminalEnvelope is apitypes.TerminalPreservationRequest with the manifest held as raw JSON, so
+// its size is bounded before it is parsed into structs.
+type terminalEnvelope struct {
+	Generation  int64           `json:"generation"`
+	Tip         string          `json:"tip"`
+	PriorTip    string          `json:"prior_tip,omitempty"`
+	Manifest    json.RawMessage `json:"manifest"`
+	Disposition string          `json:"disposition"`
+	Pack        string          `json:"pack,omitempty"`
+}
+
 // decodeTerminalRequest strictly decodes and validates the body: unknown fields (at any depth) and
-// trailing data are refused, the generation is required, the tips are 40-hex, the disposition is
-// preserve, the manifest entry counts are within their caps and the pack is standard base64. The
-// manifest's own run, generation and worker are checked by the service against the authenticated
-// values.
+// trailing data are refused, the manifest is refused above terminalMaxManifestBytes BEFORE it is
+// parsed, the generation is required, the tips are 40-hex, the disposition is preserve, the
+// manifest entry counts are within their caps and the pack is standard base64. The manifest's own
+// run, generation and worker are checked by the service against the authenticated values.
 func decodeTerminalRequest(body []byte) (workersvc.TerminalPublishRequest, error) {
-	var in apitypes.TerminalPreservationRequest
+	var top terminalEnvelope
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil {
+	if err := dec.Decode(&top); err != nil {
 		return workersvc.TerminalPublishRequest{}, errors.New("invalid terminal preservation body")
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return workersvc.TerminalPublishRequest{}, errors.New("invalid terminal preservation body")
+	}
+	if len(top.Manifest) > terminalMaxManifestBytes {
+		return workersvc.TerminalPublishRequest{}, errors.New("terminal manifest too large")
+	}
+	in := apitypes.TerminalPreservationRequest{
+		Generation: top.Generation, Tip: top.Tip, PriorTip: top.PriorTip, Disposition: top.Disposition, Pack: top.Pack,
+	}
+	mdec := json.NewDecoder(bytes.NewReader(top.Manifest))
+	mdec.DisallowUnknownFields()
+	if err := mdec.Decode(&in.Manifest); err != nil {
+		return workersvc.TerminalPublishRequest{}, errors.New("invalid terminal preservation manifest")
+	}
+	if _, err := mdec.Token(); !errors.Is(err, io.EOF) {
+		return workersvc.TerminalPublishRequest{}, errors.New("invalid terminal preservation manifest")
 	}
 	switch {
 	case in.Generation < 1:

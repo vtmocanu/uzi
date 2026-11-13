@@ -495,10 +495,13 @@ func TestTerminalContributionGuardLiveDB(t *testing.T) {
 	gen := int64(0)
 	next := func() int64 { gen++; return gen }
 
-	// contributionIn builds a contribution of p in the given state by legal moves.
+	// contributionIn builds a contribution in the given state by legal moves, on a preservation of
+	// its own: a preservation may have only one unresolved (invoked or publish_unknown) push.
 	contributionIn := func(state string) store.RunTerminalContribution {
+		pp := f.insertPreservation(f.newRun())
+		f.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, pp.ID)
 		if state == "recorded" {
-			params := f.contributionParams(p, next(), termTipA, nil)
+			params := f.contributionParams(pp, next(), termTipA, nil)
 			params.Disposition = "closed_issue_abandoned"
 			row, err := f.q.InsertTerminalContribution(f.ctx, params)
 			if err != nil {
@@ -506,7 +509,7 @@ func TestTerminalContributionGuardLiveDB(t *testing.T) {
 			}
 			return row
 		}
-		c := f.insertContribution(p, next(), termTipA, nil)
+		c := f.insertContribution(pp, next(), termTipA, nil)
 		switch state {
 		case "invoked", "published", "publish_unknown", "refused":
 			f.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c.ID)

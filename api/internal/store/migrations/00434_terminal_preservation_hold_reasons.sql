@@ -26,10 +26,13 @@ SET LOCAL lock_timeout = '5s';
 -- and 00432 Downs make, repeated here because this Down runs first and would otherwise null the
 -- reasons of a rollback that those two then refuse.
 -- Lock order matches the writers' (worker, run, hold, preservation, contribution): the hold table
--- first, so this Down cannot deadlock against a request that holds a hold row and waits for a
--- preservation.
-LOCK TABLE recovery_custody_holds IN SHARE ROW EXCLUSIVE MODE;
-LOCK TABLE run_terminal_preservations, run_terminal_contributions IN SHARE ROW EXCLUSIVE MODE;
+-- first. ACCESS EXCLUSIVE is the mode every later statement here needs (the DROP TABLEs and the
+-- CHECK swap), so no lock upgrade happens mid-transaction, which is the usual deadlock shape.
+-- A writer already holding a row lock blocks this statement until it finishes (bounded by the
+-- lock_timeout above), and once the locks are held no writer can start; the order above is the
+-- writers' own, so the Down never waits on a lock a writer would take later.
+LOCK TABLE recovery_custody_holds IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE run_terminal_preservations, run_terminal_contributions IN ACCESS EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$
 BEGIN
