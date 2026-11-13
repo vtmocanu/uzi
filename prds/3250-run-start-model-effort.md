@@ -20,7 +20,7 @@
 
 **Delivery:**
 - One PRD, one uzi run, one PR, two serial milestones: M1 covers the API, claim, hold, CLI and run page; M2 is the web Run options dialog. Default harness.
-- Migrations: use the next free numbers above the implementation base's head (00436 at this refresh, so 00437 is next), one for the columns and backfill and the adjacent next one for CHECK validation. Renumber at landing with `task migration:renumber` if main advances; #4269 may take 00437 first.
+- Migrations: use the next free numbers above the implementation base's head (00437 at this refresh, so 00438 is next), one for the columns and backfill and the adjacent next one for CHECK validation. Renumber at landing with `task migration:renumber` if main advances.
 - No implementation or validation step touches `.github/workflows/**`. LiveDB tests need Docker.
 - P adds no HTTP route, so it adds no `route_limiter_mounts_test.go` or `cli_auth_livedb_test.go` row. It extends F's existing start-preview route.
 
@@ -273,7 +273,7 @@ Caller-facing behavior (the coder chooses the names; the behavior is binding):
   4. No pairing CHECK (D11).
 - **Column/backfill migration, Down:** drop the two constraints, then the three columns.
 - **Adjacent validation migration (the `00205` / `00227` shape):** `VALIDATE CONSTRAINT` for both, under SHARE UPDATE EXCLUSIVE; its Down is a no-op.
-- At this refresh, main's highest migration is `00436_intake_pause_string_body.sql`, so `00437` and `00438` would be the next pair. Choose the next free adjacent pair on the implementation base and run `task migration:renumber` at landing; do not reserve these draft numbers.
+- At this refresh, main's highest migration is `00437_usage_primary_kind.sql`, so `00438` and `00439` would be the next pair. Choose the next free adjacent pair on the implementation base and run `task migration:renumber` at landing; do not reserve these draft numbers.
 - Regenerate sqlc. `CreateRun` lists the new columns explicitly (the `runtime.sql` silently-omittable warning).
 
 ### 8. Extend the landed F start preview
@@ -403,7 +403,7 @@ Landing obligations on the exact PR head: full `test:api`, `test:web`, `test:web
 
 ## Decision Log
 
-- **Refresh 2026-11-13, no scope change.** H, C, B, G and F's implementation seams are now on main. P extends the existing resolver, lead-config matrices and start-preview route, including F's per-harness alternatives. The highest migration at the refresh base is 00436, so draft 00352/00356 numbers are retired. All owner decisions below remain in force: opt-in choices only, byte-identical one-click Start, unchanged automatic origins and existing hold copy.
+- **Refresh 2026-11-13, no scope change.** H, C, B, G and F's implementation seams are now on main. P extends the existing resolver, lead-config matrices and start-preview route, including F's per-harness alternatives. The highest migration at the refresh base is 00437, so draft 00352/00356 numbers are retired. All owner decisions below remain in force: opt-in choices only, byte-identical one-click Start, unchanged automatic origins and existing hold copy.
 - **User decision 2026-10-21 (P1).** Move the inline harness and token pickers into the Run options dialog; one-click Start run with defaults stays.
 - **User decision 2026-10-21 (P2).** Auto-approve at start goes to #3151.
 - **User decision 2026-10-21 (P3).** Only curated Codex models are allowed per run; Claude custom IDs are allowed.
