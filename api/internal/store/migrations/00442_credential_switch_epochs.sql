@@ -17,7 +17,7 @@ CREATE TABLE run_credential_switch_epochs (
     ordinal integer NOT NULL CHECK (ordinal >= 1),
     op_id uuid NOT NULL UNIQUE,
     worker_id uuid,
-    secret_id uuid, -- FK to user_secrets added in 00432 (one busy parent table per migration)
+    secret_id uuid, -- FK to user_secrets added in 00443 (one busy parent table per migration)
     secret_enablement_rev bigint NOT NULL,
     label text,
     select_reason text,
