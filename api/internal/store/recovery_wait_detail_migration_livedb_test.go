@@ -17,7 +17,7 @@ import (
 // active secret remediation. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 func TestRecoveryWaitDetailMigrationLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "recovery_wait_detail_migration_")
-	if err := store.MigrateTo(ctx, dsn, 427); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 432); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -36,7 +36,7 @@ func TestRecoveryWaitDetailMigrationLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,worker_id,kind,issue_iid,issue_title,issue_description,status,claim_generation)
  VALUES($1,$2,$3,$4,'issue',4177,'detail','fixture','running',1)`, run, user, repo, worker)
 
-	if err := store.MigrateTo(ctx, dsn, 428); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 433); err != nil {
 		t.Fatal(err)
 	}
 	var valid bool
@@ -90,7 +90,7 @@ func TestRecoveryWaitDetailMigrationLiveDB(t *testing.T) {
 	}
 	_ = tx.Rollback(ctx)
 
-	if err := store.MigrateTo(ctx, dsn, 429); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 434); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conrelid='runs'::regclass AND conname='runs_recovery_wait_detail_check'").Scan(&valid); err != nil || !valid {
