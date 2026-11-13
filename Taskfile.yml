@@ -1360,10 +1360,12 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/lib/sanitize.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/freshness.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/greptile-verdict.test.sh
+      - ./.agents/skills/uzi-lander/scripts/lib/cr-signal.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/required-checks.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/net-retry.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/ci-fix.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
+      - ./.agents/skills/uzi-lander/scripts/review-quota.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-guards.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-basemove.test.sh
