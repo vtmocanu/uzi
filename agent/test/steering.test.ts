@@ -2816,6 +2816,87 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
     assert.equal(ch.checkpointAuthoritySignal(), authority);
   });
 
+  // An applied-phase switch_pending refusal belongs to the in-place switch when the pending op has an op id or the flight
+  // already settled one at this generation: it rejects nobody and trips nothing (v1, with neither, is the test at
+  // "takes the credential-switch path on a switch_pending APPLIED").
+  const until = async (ready: () => boolean): Promise<void> => {
+    for (let n = 0; n < 300 && !ready(); n++) await tick();
+    assert.ok(ready(), "condition reached");
+  };
+  function appliedRefusalClient(row: UserInput) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const calls = { applied: 0, gets: 0 };
+    const client = {
+      getInputs: async () => { calls.gets++; return { receipts: true, inputs: calls.gets === 1 ? [row] : [] }; },
+      ackInputs: async () => ({ inputs: [row], active: true }),
+      applyInputs: async () => {
+        if (++calls.applied === 1) {
+          await gate;
+          throw new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "switch_pending" }));
+        }
+        return { inputs: [row], active: true };
+      },
+    } as unknown as WorkerClient;
+    return { client, calls, release };
+  }
+
+  it("an applied 409 switch_pending under an in-place pending op parks the batch, resolves the waiting report and does not trip again", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    const { client, calls, release } = appliedRefusalClient(row);
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: GEN });
+    let interrupts = 0;
+    ch.onCredentialSwitch(() => { interrupts++; });
+    ch.start();
+    try {
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "seven" });
+      await tick();
+      ch.tripCredentialSwitch(GEN, "op-1");
+      assert.equal(interrupts, 1);
+      const waiting = ch.awaitReceiptSettlement();
+      release();
+      await waiting; // resolves: the in-place give-up's report must not be rejected into a retained stop
+      assert.equal(interrupts, 1, "the receipt refusal does not trip again");
+      assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-1" });
+      assert.equal(calls.applied, 1, "parked: no APPLIED retry while the switch is pending");
+      ch.settleCredentialSwitch("op-1", "gave_up");
+      await until(() => calls.applied >= 2);
+      assert.equal(ch.claimFence(), undefined);
+    } finally {
+      release();
+      await ch.stop();
+    }
+  });
+
+  it("a late applied 409 switch_pending after settleCredentialSwitch('applied') starts no switch and returns the ids to ready", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    const { client, calls, release } = appliedRefusalClient(row);
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: GEN });
+    let interrupts = 0;
+    ch.onCredentialSwitch(() => { interrupts++; });
+    ch.start();
+    try {
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "seven" });
+      await tick();
+      ch.tripCredentialSwitch(GEN, "op-1");
+      ch.settleCredentialSwitch("op-1", "applied");
+      const waiting = ch.awaitReceiptSettlement();
+      release(); // the refusal raced the stamp clear
+      await waiting;
+      assert.equal(ch.pendingCredentialSwitchOp(), undefined, "no phantom op-less switch");
+      assert.equal(ch.pendingCredentialSwitch(), undefined);
+      assert.equal(interrupts, 1, "no second abort");
+      assert.equal(cancel.signal.aborted, true, "only the original op's controller was ever aborted");
+      assert.equal(ch.cancelSignal().aborted, false, "the fresh controller is not aborted by the late refusal");
+      await until(() => calls.applied >= 2);
+    } finally {
+      release();
+      await ch.stop();
+    }
+  });
+
   it("a settled op is ignored on a late poll, a new op after it trips normally", () => {
     const { ch, interrupts } = make();
     ch.tripCredentialSwitch(GEN, "op-1");

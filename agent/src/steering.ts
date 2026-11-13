@@ -778,6 +778,17 @@ export class SteeringChannel {
           this.releaseHeld();
           return;
         }
+        if (reason === "switch_pending" && this.inPlaceSwitchContext()) {
+          // In place: the claim stays and the apply or give-up settles the switch. Keep the batch unapplied (APPLIED
+          // removes a row from replay), reject nobody and trip nothing. While the switch is pending the ids wait in
+          // heldForSwitch (settleCredentialSwitch returns them to the ready lane); once it is settled they are ready
+          // for the next poll's APPLIED.
+          if (this.pendingSwitch !== undefined) {
+            for (const id of this.held.ids) if (!this.heldForSwitch.includes(id)) this.heldForSwitch.push(id);
+          } else this.markReady([...this.held.ids]);
+          this.releaseHeld();
+          return;
+        }
         // A pending switch (no hold): take the EXISTING credential-switch path, never a generic
         // failure. The reports waiting now reject with a CredentialSwitchSignal (so the
         // executor/runner enter the switch release, which never reports `failed`), the batch is
@@ -1155,6 +1166,22 @@ export class SteeringChannel {
       this.endFencedFlight(reason!);
       return "stop";
     }
+    if (reason === "switch_pending" && this.inPlaceSwitchContext()) {
+      // In place (see inPlaceSwitchContext): reject nobody, trip nothing. A still-pending switch parks the ids (the
+      // settle returns them to the ready lane); a settled one keeps them ready and retries after the poll interval.
+      this.log.warn("steering: an in-place switch refused an applied receipt; keeping the inputs unapplied until it settles", {
+        run_id: this.runId,
+        count,
+      });
+      if (this.pendingSwitch !== undefined) {
+        this.parkReady(ids);
+        if (ids.some((id) => this.takenApproveIds.has(id))) this.approveRefusedBySwitch = true;
+        this.settleWaiters();
+        return "continue";
+      }
+      this.settleWaiters();
+      return "retry";
+    }
     if (reason === "switch_pending" && !reviseBatch) {
       // Only a revise batch is accepted under a pending switch. Park these ids (state v): a switch
       // that gives up (rearmCredentialSwitch) moves them back to the ready lane, a release leaves
@@ -1215,6 +1242,15 @@ export class SteeringChannel {
       return "stop";
     }
     return "retry";
+  }
+
+  /** Issue #4201: whether a switch_pending refusal of an APPLIED belongs to an IN-PLACE switch: the pending switch carries
+   *  an op id, or this flight already settled an in-place op at the current claim generation (a late refusal that raced
+   *  the stamp clear). The switch signal of an in-place switch always arrives with its op id through the GET or ack, so
+   *  such a refusal must neither reject the waiting reports (that would turn an in-place give-up into a retained stop)
+   *  nor trip a switch (a phantom op-less one would take the v1 release). v1 (no op id, nothing settled) is unchanged. */
+  private inPlaceSwitchContext(): boolean {
+    return this.pendingSwitch?.opId !== undefined || this.inPlaceSettledGeneration === this.claimGeneration;
   }
 
   /** Move ready ids to the parked set (state v). */
@@ -1575,6 +1611,10 @@ export class SteeringChannel {
   /** Issue #4201: ops already settled (applied, gave up or cleared), last SETTLED_OPS_MAX. A late poll
    *  that still carries one (it raced the apply commit) is ignored. */
   private readonly settledOps = new Set<string>();
+  /** Issue #4201: the claim generation at which this flight last settled an in-place op (applied, gave up or cleared).
+   *  settledOps alone has no generation; with pendingSwitch it tells a late receipt refusal that the switch is an
+   *  in-place one, so it is never turned into a phantom op-less switch. */
+  private inPlaceSettledGeneration: number | undefined;
   /** CredentialSwitchSignal abort reasons whose switch settled: the signal is spent, not a stop. */
   private readonly settledSwitchSignals = new WeakSet<object>();
   private readonly cancelReplacedListeners = new Set<(signal: AbortSignal) => void>();
@@ -1962,6 +2002,7 @@ export class SteeringChannel {
   settleCredentialSwitch(opId: string, outcome: "applied" | "gave_up" | "cleared"): void {
     this.settledOps.delete(opId);
     this.settledOps.add(opId);
+    this.inPlaceSettledGeneration = this.claimGeneration;
     while (this.settledOps.size > SETTLED_OPS_MAX) {
       const oldest = this.settledOps.values().next().value as string;
       this.settledOps.delete(oldest);

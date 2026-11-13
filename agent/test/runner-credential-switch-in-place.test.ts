@@ -410,8 +410,8 @@ async function withInputsWhileSwitchPending(
   inputs: (runId: string, question: string | undefined) => Parameters<typeof send> extends [string, ...infer R] ? R : never,
   /** Waits for the inputs to be routed first, so a steering message cannot race the run's last turn. */
   settleFirst = false,
-  /** The switch ends in option A (refused_committed -> uncertain pause) instead of applying. */
-  optionA = false,
+  /** How the held switch ends: applied (default) or option A (refused_committed -> uncertain pause). */
+  ending: "applied" | "option_a" = "applied",
 ) {
   let release!: () => void;
   const hold = new Promise<void>((resolve) => { release = resolve; });
@@ -431,7 +431,8 @@ async function withInputsWhileSwitchPending(
     yield* doneTurn()();
   })();
   const finished = scenario({
-    site, apply: [optionA ? { outcome: "refused_committed" } : { outcome: "applied", token: NEW_TOKEN }], quiesceGate: hold, noAutoAnswer: true,
+    site, apply: [ending === "option_a" ? { outcome: "refused_committed" }
+      : { outcome: "applied", token: NEW_TOKEN }], quiesceGate: hold, noAutoAnswer: true,
     before: (id) => { runId = id; api.inPlaceInputDrain = true; }, ...(settleFirst ? { lastTurn: settlingTurn } : {}),
   });
   try {
@@ -451,7 +452,7 @@ async function withInputsWhileSwitchPending(
     assert.equal(applied().length, 0, "the switch is still unapplied: delivery did not wait for it");
   } finally { release(); }
   const r = await finished;
-  if (optionA) return { r, runId, ids };
+  if (ending === "option_a") return { r, runId, ids };
   assert.equal(applied().length, 1, "the held switch then applied");
   for (const id of ids) assert.ok(api.isAcked(runId, id) && api.isApplied(runId, id), `input ${id} was routed and applied by the end of the run`);
   return { r, runId, ids };
@@ -473,13 +474,49 @@ describe("issue #4201 m5 (AC7): owner inputs sent while a switch is pending and 
   });
 
   it("an answer that arrives during the hold of a switch that ends in option A is never accepted as APPLIED, so the next claim replays it", TIMEOUT, async () => {
-    const { runId, ids } = await withInputsWhileSwitchPending("ask_user", (_runId, question) =>
-      [row("answer", JSON.stringify({ question_id: question, answers: ["postgres-ANSWER"] }))], false, true);
+    const { r, runId, ids } = await withInputsWhileSwitchPending("ask_user", (_runId, question) =>
+      [row("answer", JSON.stringify({ question_id: question, answers: ["postgres-ANSWER"] }))], false, "option_a");
     assert.equal(applied().length, 1, "the apply was attempted and answered refused_committed");
     // The worker keeps offering APPLIED while the row is routed; the stamp stays pending after the uncertain pause, so the
     // server refuses every one and the row stays unapplied, replayable by the next claim.
     assert.deepEqual(ids.map((id) => api.isApplied(runId, id)), ids.map(() => false), "no APPLIED was ever accepted: the row stays unapplied, replayable by the next claim");
     assert.ok(ids.every((id) => api.isAcked(runId, id)), "the row was ACKed during the hold");
+    // A retained stop must not pass: the uncertain pause was reported and confirmed.
+    assert.equal(api.uncertainRequests.length, 1, "one credential_switch_uncertain report");
+    assert.equal(r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain").length, 1, "the credential_switch_uncertain feed frame was posted (only after a confirmed report)");
+    assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
+  });
+
+  it("an owner answer whose APPLIED is still in flight when the switch gives up does not turn the give-up into a retained stop: the run continues on the OLD token and the answer is APPLIED and acted on", TIMEOUT, async () => {
+    // The APPLIED reply is held, so the in-place give-up's credential_switch_failed report is already waiting on the
+    // receipt settlement when the server's switch_pending refusal arrives.
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    let runId = "";
+    const finished = scenario({
+      site: "ask_user", apply: [{ outcome: "not_applied", reason: "credential_busy" }], quiesceGate: hold, noAutoAnswer: true,
+      before: (rid) => { runId = rid; api.inPlaceInputDrain = true; },
+    });
+    let releaseApplied = (): void => undefined;
+    try {
+      assert.ok(await until(() => api.requestLog.includes("quiesce:in_place_credential_switch"), 30_000), "the proof is running (held)");
+      const question = api.states.filter((s) => s.runId === runId && s.body.status === "awaiting_input").at(-1)?.body.open_question_id;
+      releaseApplied = api.holdNextInputReceipt("applied");
+      const [input] = send(runId, row("answer", JSON.stringify({ question_id: question, answers: ["postgres-ANSWER"] })));
+      assert.ok(await until(() => api.isAcked(runId, input!.id), 10_000), "the answer was ACKed during the hold");
+    } finally { release(); }
+    // The give-up report goes out only after the apply attempt, and now waits behind the held APPLIED.
+    assert.ok(await until(() => api.requestLog.includes("apply"), 30_000), "the apply was attempted");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(api.states.some((s) => s.runId === runId && s.body.status === "credential_switch_failed"), false, "the give-up report is waiting behind the receipt");
+    releaseApplied();
+    const r = await finished;
+    const failed = api.states.filter((s) => s.runId === runId && s.body.status === "credential_switch_failed");
+    assert.equal(failed.length, 1, `exactly one credential_switch_failed report: ${statusesOf(r).join(",")}`);
+    assert.ok((failed[0]!.body as { op_id?: string }).op_id !== undefined, "it carries the op id");
+    assert.ok(statusesOf(r).includes("completed"), `no retained stop: ${statusesOf(r).join(",")}`);
+    assert.ok(r.turns.length >= 1 && r.turns.every((t) => t.token === OLD_TOKEN), `every turn ran on the old token: ${JSON.stringify(r.turns.map((t) => t.token))}`);
+    assert.ok(r.turns.some((t) => t.prompt.includes("postgres-ANSWER")), "the answer reached the model");
   });
 
   it("an owner pause is fetched and ACKed during the hold and APPLIED only after the apply, and is honoured: the executor acknowledges it and enters the pause park", TIMEOUT, async () => {
