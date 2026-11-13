@@ -60,7 +60,7 @@ func rawElements(t *testing.T, out string) []string {
 func TestRunRecoveryCapturesOnlyJSON(t *testing.T) {
 	fc := &uzicli.FakeClient{
 		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
-			recoveryHeldRunID: {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{debugCapture("cap-orphan", "released-hold")}},
+			recoveryHeldRunID: {Supported: true, AdminDebugRead: true, Archives: []apitypes.RecoveryArchiveDTO{debugCapture("cap-orphan", "released-hold")}},
 		},
 	}
 	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID, "--json")
@@ -90,7 +90,7 @@ func TestRunRecoveryMixedJSONKeepsHoldElementAndAppendsUnattached(t *testing.T) 
 			RecoveryHoldsResult: holds,
 			RunByID:             map[string]apitypes.RunDTO{recoveryHeldRunID: {ID: recoveryHeldRunID, Status: "completed"}},
 			RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
-				recoveryHeldRunID: {Supported: true, Archives: archives},
+				recoveryHeldRunID: {Supported: true, AdminDebugRead: true, Archives: archives},
 			},
 		}
 		out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID, "--json")
@@ -125,7 +125,7 @@ func TestRunRecoveryMixedJSONKeepsHoldElementAndAppendsUnattached(t *testing.T) 
 func TestRunRecoveryUnattachedHumanTable(t *testing.T) {
 	fc := &uzicli.FakeClient{
 		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
-			recoveryHeldRunID: {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{debugCapture("cap-orphan", "released-hold")}},
+			recoveryHeldRunID: {Supported: true, AdminDebugRead: true, Archives: []apitypes.RecoveryArchiveDTO{debugCapture("cap-orphan", "released-hold")}},
 		},
 	}
 	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID)
@@ -143,6 +143,9 @@ func TestRunRecoveryForeignRunViaScopedRead(t *testing.T) {
 	fc := &uzicli.FakeClient{
 		RecoveryHoldsResult:       recoveryHoldsFixtureOtherRunOnly(),
 		RecoveryHoldsScopedResult: apitypes.RecoveryCustodyHoldsDTO{OwnerID: debugOwnerID, Holds: []apitypes.RecoveryCustodyHoldDTO{debugHold("hold-foreign", recoveryHeldRunID)}},
+		// The server marks the capture-metadata read of another user's run; that marker is what
+		// confirms the scoped holds belong to a foreign run.
+		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{recoveryHeldRunID: {Supported: true, AdminDebugRead: true}},
 	}
 	client := &countingRecoveryClient{Client: fc}
 	out, errb, code := runCLI(t, fakeEnv(client), "run", "recovery", recoveryHeldRunID)
@@ -208,11 +211,48 @@ func TestRunRecoveryStaleServerScopedHoldsAreFilteredOut(t *testing.T) {
 	}
 }
 
-func TestRunRecoveryScopedReadOtherErrorWarnsAndContinues(t *testing.T) {
+// A scoped-read failure that is neither a refusal nor a cancellation is silent: main never made
+// that read, so the owner's output stays main's empty result.
+func TestRunRecoveryScopedReadOtherErrorIsSilentAndContinues(t *testing.T) {
 	fc := &uzicli.FakeClient{RecoveryHoldsScopedErr: uzicli.Exitf(uzicli.ExitUnreachable, "boom")}
 	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID, "--json")
-	if code != uzicli.ExitOK || strings.TrimSpace(out) != "[]" || !strings.Contains(errb, "warning: could not check admin run debug holds") {
-		t.Errorf("exit=%d stdout=%q stderr=%q; want a warning and an empty result", code, out, errb)
+	if code != uzicli.ExitOK || out != "[]\n" || errb != "" {
+		t.Errorf("exit=%d stdout=%q stderr=%q; want main's silent empty result", code, out, errb)
+	}
+}
+
+// Scoped holds are shown only when the capture-metadata read confirms an admin debug read; when
+// that read fails they are dropped, because the owner's own run gets the same scoped answer.
+func TestRunRecoveryScopedHoldsNeedAConfirmedDebugRead(t *testing.T) {
+	scoped := apitypes.RecoveryCustodyHoldsDTO{OwnerID: debugOwnerID, Holds: []apitypes.RecoveryCustodyHoldDTO{debugHold("hold-foreign", recoveryHeldRunID)}}
+	for name, archErr := range map[string]error{
+		"archives 404": uzicli.Exitf(uzicli.ExitNotFound, "run not found"),
+		"archives 500": uzicli.Exitf(uzicli.ExitGeneric, "server error (500)"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			fc := &uzicli.FakeClient{RecoveryHoldsScopedResult: scoped, RecoveryArchivesErr: archErr}
+			out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID)
+			if code != uzicli.ExitOK || out != "run "+recoveryHeldRunID+" has no retained custody holds\n" || strings.Contains(errb, adminRunDebugReadOnlyLine) {
+				t.Errorf("exit=%d stdout=%q stderr=%q; want main's empty result and no read-only view", code, out, errb)
+			}
+		})
+	}
+}
+
+// The renderer gates the unattached listing on its own parameter, never on readOnly.
+func TestRenderRunRecoveryReadOnlyDoesNotShowUnattached(t *testing.T) {
+	holds := []apitypes.RecoveryCustodyHoldDTO{debugHold("hold-1", recoveryHeldRunID)}
+	archives := []apitypes.RecoveryArchiveDTO{debugCapture("cap-1", "hold-1"), debugCapture("cap-orphan", "unlisted-hold")}
+	for _, js := range []bool{false, true} {
+		var out, errb bytes.Buffer
+		env := fakeEnv(&uzicli.FakeClient{})
+		env.Stdout, env.Stderr = &out, &errb
+		if err := renderRunRecovery(env, &globalFlags{json: js}, recoveryHeldRunID, holds, archives, nil, true, false); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out.String(), "unattached") || strings.Contains(out.String(), "cap-orphan") || strings.Contains(out.String(), "no listed hold") {
+			t.Errorf("json=%v: read-only render listed the unattached capture:\n%s", js, out.String())
+		}
 	}
 }
 
@@ -298,9 +338,11 @@ func TestAdminRunDebugHintOnRefusedReads(t *testing.T) {
 		{"run recovery run 404", &uzicli.FakeClient{RecoveryHoldsScopedErr: notFound}, []string{"run", "recovery", recoveryHeldRunID}, uzicli.ExitOK, true},
 		{"run recovery user 404", &uzicli.FakeClient{RecoveryHoldsScopedErr: notFound}, []string{"run", "recovery", "--user", debugOwnerID}, uzicli.ExitNotFound, true},
 		{"admin runs all 403", &uzicli.FakeClient{AdminRunsDebugErr: forbidden}, []string{"admin", "runs", "--all"}, uzicli.ExitAuth, true},
-		{"run recovery run scoped 403", &uzicli.FakeClient{RecoveryHoldsScopedErr: forbidden}, []string{"run", "recovery", recoveryHeldRunID}, uzicli.ExitOK, true},
+		// run recovery <run-id> hints only on a 404, the refusal shape both of its per-run reads
+		// give a foreign run; a 401/403 there stays silent like main's owner output.
+		{"run recovery run scoped 403", &uzicli.FakeClient{RecoveryHoldsScopedErr: forbidden}, []string{"run", "recovery", recoveryHeldRunID}, uzicli.ExitOK, false},
 		{"run recovery user 403", &uzicli.FakeClient{RecoveryHoldsScopedErr: forbidden}, []string{"run", "recovery", "--user", debugOwnerID}, uzicli.ExitAuth, true},
-		{"run recovery archives 403", &uzicli.FakeClient{RecoveryArchivesErr: forbidden}, []string{"run", "recovery", recoveryHeldRunID}, uzicli.ExitOK, true},
+		{"run recovery archives 403", &uzicli.FakeClient{RecoveryArchivesErr: forbidden}, []string{"run", "recovery", recoveryHeldRunID}, uzicli.ExitOK, false},
 		{"run recovery archives 404 no holds", &uzicli.FakeClient{RecoveryArchivesErr: notFound}, []string{"run", "recovery", recoveryHeldRunID}, uzicli.ExitOK, true},
 		// Controls: a transport failure is not a refusal, so no hint.
 		{"run inputs unreachable", &uzicli.FakeClient{Err: uzicli.Exitf(uzicli.ExitUnreachable, "down")}, []string{"run", "inputs", recoveryHeldRunID}, uzicli.ExitUnreachable, false},

@@ -303,6 +303,21 @@ func TestAdminRunDebugReadMatrixLiveDB(t *testing.T) {
 			if recs := audit.take(t); len(recs) != 0 {
 				t.Errorf("owner's own read wrote %d audit records, want 0: %v", len(recs), recs)
 			}
+			// The same owner read with the flag OFF is unchanged too: the CLI keys owner
+			// compatibility on the marker's absence, whichever way the deployment is set.
+			f.h.cfg.AdminRunDebug = false
+			rec = bearerReq(f.router, http.MethodGet, rt.ownerPath(f), f.ownerUzc)
+			f.h.cfg.AdminRunDebug = true
+			if rec.Code != http.StatusOK {
+				t.Fatalf("flag off: owner GET %s = %d, want 200\nbody: %s", path, rec.Code, rec.Body.String())
+			}
+			rt.check(t, f, rec.Body.String())
+			if strings.Contains(rec.Body.String(), "admin_debug_read") {
+				t.Errorf("flag off: owner's own read carries admin_debug_read: %s", rec.Body.String())
+			}
+			if recs := audit.take(t); len(recs) != 0 {
+				t.Errorf("flag off: owner's own read wrote %d audit records, want 0: %v", len(recs), recs)
+			}
 
 			// Flag ON, every other caller: the same 404 an unknown run gets.
 			refused := map[string]*httptest.ResponseRecorder{

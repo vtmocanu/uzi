@@ -72,7 +72,7 @@ func TestPrerequisiteSharedCases(t *testing.T) {
 			env := Env{Stdout: &out, Stderr: &stderr}
 			// Closed/completed holds retain all capture metadata too.
 			holds := []apitypes.RecoveryCustodyHoldDTO{{ID: "hold-1", State: "released"}}
-			if err := renderRunRecovery(env, &globalFlags{}, recoveryHeldRunID, holds, summary.Archives, nil, false); err != nil {
+			if err := renderRunRecovery(env, &globalFlags{}, recoveryHeldRunID, holds, summary.Archives, nil, false, false); err != nil {
 				t.Fatal(err)
 			}
 			fc := &uzicli.FakeClient{RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: holds}, RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{recoveryHeldRunID: summary}}
@@ -170,7 +170,7 @@ func TestPrerequisiteRecoveryJSONPreservesMetadata(t *testing.T) {
 	var out, stderr bytes.Buffer
 	env := Env{Stdout: &out, Stderr: &stderr}
 	holds := []apitypes.RecoveryCustodyHoldDTO{{ID: "h", State: "released"}, {ID: "empty", State: "discarded"}}
-	if err := renderRunRecovery(env, &globalFlags{json: true}, recoveryHeldRunID, holds, []apitypes.RecoveryArchiveDTO{a, b, {ID: "foreign", HoldID: "other"}}, nil, false); err != nil {
+	if err := renderRunRecovery(env, &globalFlags{json: true}, recoveryHeldRunID, holds, []apitypes.RecoveryArchiveDTO{a, b, {ID: "foreign", HoldID: "other"}}, nil, false, false); err != nil {
 		t.Fatal(err)
 	}
 	start := strings.Index(out.String(), "\"captures\":")
@@ -197,9 +197,7 @@ func TestPrerequisiteRecoveryJSONPreservesMetadata(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
 		t.Fatal(err)
 	}
-	// The foreign capture (hold "other" is not listed) rides in the trailing unattached element.
-	if len(rows) != 3 || len(rows[0].Captures) != 2 || rows[1].Captures == nil || len(rows[1].Captures) != 0 ||
-		len(rows[2].Captures) != 1 || rows[2].Captures[0].ID != "foreign" {
+	if len(rows) != 2 || len(rows[0].Captures) != 2 || rows[1].Captures == nil || len(rows[1].Captures) != 0 {
 		t.Fatalf("hold attachment/order lost: %s", out.String())
 	}
 	for i, want := range []apitypes.RecoveryArchiveDTO{a, b} {

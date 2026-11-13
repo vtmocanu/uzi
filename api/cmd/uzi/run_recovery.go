@@ -172,32 +172,8 @@ func runRecoveryForRun(ctx context.Context, env Env, gf *globalFlags, c uzicli.C
 	own apitypes.RecoveryCustodyHoldsDTO) error {
 	// The endpoint is owner-wide; narrow to this run client-side.
 	forRun := holdsOfRun(own.Holds, runID)
-	readOnly := false
-	// hinted keeps the prerequisites hint to one line per command, whichever read was refused.
-	hinted := false
-	hint := func() {
-		if !hinted {
-			hinted = true
-			_, _ = fmt.Fprintln(env.Stderr, adminRunDebugHint)
-		}
-	}
 	if len(forRun) == 0 {
-		scoped, err := c.RecoveryHoldsScoped(ctx, "", runID)
-		switch {
-		case isForeignReadRefusal(err):
-			// Not the caller's run, or no such run, or a refused foreign read (404 or 403);
-			// either way no holds to show. Say what a foreign-run read needs, and carry on:
-			// the command still succeeds with nothing.
-			hint()
-		case err != nil:
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			_, _ = fmt.Fprintf(env.Stderr, "warning: could not check admin run debug holds for run %s: %s\n", cellText(runID), cellText(err.Error()))
-		default:
-			forRun = holdsOfRun(scoped.Holds, runID)
-			readOnly = len(forRun) > 0
-		}
+		return runRecoveryWithoutOwnHold(ctx, env, gf, c, runID)
 	}
 	reasons, err := recoveryFailureReasons(ctx, env, c, forRun, false)
 	if err != nil {
@@ -206,35 +182,76 @@ func runRecoveryForRun(ctx context.Context, env Env, gf *globalFlags, c uzicli.C
 	// --json joins each hold's captures (#1417) so an agent reads the capture ids as
 	// data. Human output uses the same read for recorded pin observations.
 	var archives []apitypes.RecoveryArchiveDTO
+	debugRead := false
 	summary, err := c.RecoveryArchives(ctx, runID)
 	switch {
 	case uzicli.ExitCodeFor(err) == uzicli.ExitNotFound:
 		// A released/discarded hold outlives its run (runs cascade-delete with
 		// their repo; holds keep a plain run_id), so the holds list still names a
 		// run whose archives read 404s. Degrade to every hold listing no captures
-		// rather than failing the whole listing. With no hold listed, the 404 may be a
-		// refused foreign-run read, so name the prerequisites (once).
-		if len(forRun) == 0 {
-			hint()
-		}
+		// rather than failing the whole listing.
 	case err != nil:
-		if isForeignReadRefusal(err) {
-			hint()
-		}
-		if len(forRun) > 0 && gf.json {
+		if gf.json {
 			return err
 		}
 		_, _ = fmt.Fprintln(env.Stderr, "warning: capture and prerequisite-pin metadata unavailable; protection unknown; custody remains as listed")
 	default:
 		archives = summary.Archives
-		if summary.AdminDebugRead {
-			readOnly = true
-		}
+		debugRead = summary.AdminDebugRead
 	}
-	if readOnly && !gf.json {
+	if debugRead && !gf.json {
 		_, _ = fmt.Fprintln(env.Stderr, adminRunDebugReadOnlyLine)
 	}
-	return renderRunRecovery(env, gf, runID, forRun, archives, reasons, readOnly)
+	return renderRunRecovery(env, gf, runID, forRun, archives, reasons, debugRead, debugRead)
+}
+
+// runRecoveryWithoutOwnHold serves `run recovery <run-id>` when none of the caller's own holds
+// names the run. It asks for the run's holds (?run=) and its capture metadata, and uses either
+// ONLY when the capture metadata read succeeded as an admin run debug read
+// (summary.AdminDebugRead): the scoped holds endpoint also answers for the caller's own run and
+// carries no debug marker, so the marker is the one signal that this is another user's run.
+// Every other outcome renders exactly what an owner saw before these reads existed (no holds,
+// nothing on stderr), except a 404, which names the admin run debug prerequisites once, and a
+// cancelled or expired context, which fails the command.
+func runRecoveryWithoutOwnHold(ctx context.Context, env Env, gf *globalFlags, c uzicli.Client, runID string) error {
+	// hinted keeps the prerequisites hint to one line per command, whichever read was refused.
+	hinted := false
+	hint := func(err error) {
+		// 404 is the refusal shape both endpoints give a foreign-run read; the caller's own
+		// existing run never gets it, so the owner sees no hint.
+		if !hinted && uzicli.ExitCodeFor(err) == uzicli.ExitNotFound {
+			hinted = true
+			_, _ = fmt.Fprintln(env.Stderr, adminRunDebugHint)
+		}
+	}
+	scoped, scopedErr := c.RecoveryHoldsScoped(ctx, "", runID)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	hint(scopedErr)
+	summary, archErr := c.RecoveryArchives(ctx, runID)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	hint(archErr)
+	if archErr != nil || !summary.AdminDebugRead {
+		// Not a confirmed debug read: the owner's own run (or an unreadable one). Any scoped
+		// holds are dropped, so a hold that opened between the two holds reads does not surface.
+		return renderRunRecovery(env, gf, runID, nil, nil, nil, false, false)
+	}
+	var forRun []apitypes.RecoveryCustodyHoldDTO
+	if scopedErr == nil {
+		// A server that ignores ?run= answers owner-wide, so re-filter by run id.
+		forRun = holdsOfRun(scoped.Holds, runID)
+	}
+	reasons, err := recoveryFailureReasons(ctx, env, c, forRun, false)
+	if err != nil {
+		return err
+	}
+	if !gf.json {
+		_, _ = fmt.Fprintln(env.Stderr, adminRunDebugReadOnlyLine)
+	}
+	return renderRunRecovery(env, gf, runID, forRun, summary.Archives, reasons, true, true)
 }
 
 // holdsOfRun keeps the holds that belong to runID.
@@ -573,11 +590,18 @@ func unattributedCaptures(archives []apitypes.RecoveryArchiveDTO) int {
 // needs an owner decision.
 //
 // readOnly marks a view of another user's run (admin run debug): the export and discard hints
-// are suppressed because both stay owner-only.
+// are suppressed because both stay owner-only. showUnattached (set only from an archives summary
+// marked admin_debug_read) adds the captures whose hold is not listed; it is never derived from
+// readOnly.
 func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.RecoveryCustodyHoldDTO,
-	archives []apitypes.RecoveryArchiveDTO, reasons map[string]string, readOnly bool) error {
+	archives []apitypes.RecoveryArchiveDTO, reasons map[string]string, readOnly, showUnattached bool) error {
 	p := env.printer(gf)
-	unattached := unattachedArchives(holds, archives)
+	// Captures whose hold is not listed are shown only on an admin run debug read of another
+	// user's run; the owner's own output stays exactly as before #4198.
+	var unattached []apitypes.RecoveryArchiveDTO
+	if showUnattached {
+		unattached = unattachedArchives(holds, archives)
+	}
 	if n := unattributedCaptures(archives); n > 0 {
 		// An older server sends no hold_id, so its captures join onto no hold.
 		// Warn in human and JSON modes, including quiet, and name the metadata-only
