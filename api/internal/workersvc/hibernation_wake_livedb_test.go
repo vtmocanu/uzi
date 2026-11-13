@@ -329,7 +329,7 @@ func TestDemandWakeLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("a row whose worker settled and was re-hibernated is kept: no second wake, first_woken_at unchanged", func(t *testing.T) {
+	t.Run("a row whose worker settled awake is kept: no second wake, no sibling, first_woken_at unchanged", func(t *testing.T) {
 		f := newHibFx(t)
 		a, b := f.sleepingWorker(), f.sleepingWorker()
 		run := f.queuedRun()
@@ -340,31 +340,25 @@ func TestDemandWakeLiveDB(t *testing.T) {
 		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT first_woken_at FROM hibernation_wakes WHERE run_id = $1`, run).Scan(&first); err != nil {
 			t.Fatal(err)
 		}
-		// The woken worker settles awake and is hibernated again, with the row still naming it.
+		// The woken worker settles awake with the run still queued and the row still naming it.
 		pod := uuid.New()
 		f.mustApply(a, TransitionReady, pod)
 		f.env.exec(`UPDATE workers SET registered_pod_uid = $2 WHERE id = $1`, a, pod)
 		f.heartbeatNow(a)
 		f.register(a, &pod)
 		f.want(a, "none")
-		// HibernateWorker now refuses this sequence (pending_wake_demand), so write the state that a
-		// pre-refusal api, or a row that outlived its guard, could have left, to prove DemandWake's own
-		// one-wake-per-run guard still holds.
-		f.env.exec(`UPDATE workers SET hibernation_state = 'hibernated', hibernation_op_id = gen_random_uuid(), hibernated_at = now() WHERE id = $1`, a)
-		f.want(a, "hibernated")
-		opA, opB := f.op(a), f.op(b)
+		opB := f.op(b)
 		for _, cand := range []uuid.UUID{a, b} {
 			if res, err := f.svc.DemandWake(f.env.ctx, run, cand); err != nil || res != DemandWakeNone {
 				t.Fatalf("second demand for %s = %v, %v; want none", cand, res, err)
 			}
 		}
-		// Release also leaves it: the run is still queued.
 		if n, err := f.svc.ReleaseStaleWake(f.env.ctx, run); err != nil || n {
-			t.Fatalf("release deleted a row of a still-queued run: %v, %v", n, err)
+			t.Fatalf("release deleted a row of a still-queued run whose worker is awake: %v, %v", n, err)
 		}
-		f.want(a, "hibernated")
+		f.want(a, "none")
 		f.want(b, "hibernated")
-		if f.op(a) != opA || f.op(b) != opB {
+		if f.op(b) != opB {
 			t.Fatal("a second wake minted an op id")
 		}
 		var after time.Time
@@ -373,6 +367,47 @@ func TestDemandWakeLiveDB(t *testing.T) {
 		}
 		if f.wakeRows(run) != 1 || f.wakeWorker(run) != a || !after.Equal(first) {
 			t.Fatalf("the row changed: rows=%d worker=%s first %v -> %v", f.wakeRows(run), f.wakeWorker(run), first, after)
+		}
+	})
+
+	t.Run("a row whose worker was re-hibernated (state set via SQL) is deleted and the demand recomputed", func(t *testing.T) {
+		f := newHibFx(t)
+		a, b := f.sleepingWorker(), f.sleepingWorker()
+		run := f.queuedRun()
+		if res, err := f.svc.DemandWake(f.env.ctx, run, a); err != nil || res != DemandWakeWoke {
+			t.Fatalf("first wake: %v, %v", res, err)
+		}
+		pod := uuid.New()
+		f.mustApply(a, TransitionReady, pod)
+		f.env.exec(`UPDATE workers SET registered_pod_uid = $2 WHERE id = $1`, a, pod)
+		f.heartbeatNow(a)
+		f.register(a, &pod)
+		f.want(a, "none")
+		// HibernateWorker refuses this while the run is queued, so write the state a pre-refusal api
+		// could have left. The row names a worker that is asleep again.
+		f.env.exec(`UPDATE workers SET hibernation_state = 'hibernated', hibernation_op_id = gen_random_uuid(), hibernated_at = now() WHERE id = $1`, a)
+		// A candidate other than the row's worker takes the run: the stale row is replaced.
+		if res, err := f.svc.DemandWake(f.env.ctx, run, b); err != nil || res != DemandWakeWoke {
+			t.Fatalf("demand after the re-hibernation = %v, %v; want a fresh wake", res, err)
+		}
+		f.want(b, "waking")
+		f.want(a, "hibernated")
+		if f.wakeRows(run) != 1 || f.wakeWorker(run) != b {
+			t.Fatalf("rows=%d worker=%s, want one row naming the new candidate", f.wakeRows(run), f.wakeWorker(run))
+		}
+
+		// Same recovery when the candidate is the row's own worker, through ReleaseStaleWake.
+		run2 := f.queuedRun()
+		c := f.sleepingWorker()
+		if res, err := f.svc.DemandWake(f.env.ctx, run2, c); err != nil || res != DemandWakeWoke {
+			t.Fatalf("wake: %v, %v", res, err)
+		}
+		f.env.exec(`UPDATE workers SET hibernation_state = 'hibernated', hibernated_at = now() WHERE id = $1`, c)
+		if n, err := f.svc.ReleaseStaleWake(f.env.ctx, run2); err != nil || !n {
+			t.Fatalf("a row whose worker is asleep again was kept: %v, %v", n, err)
+		}
+		if f.wakeRows(run2) != 0 {
+			t.Fatal("the stale row survived the release")
 		}
 	})
 
@@ -449,9 +484,10 @@ func TestDemandWakeLiveDB(t *testing.T) {
 		if n, err := f.svc.ReleaseStaleWake(f.env.ctx, gone); err != nil || !n {
 			t.Fatalf("a wake for a run that left the queue was kept: %v, %v", n, err)
 		}
-		f.env.exec(`UPDATE workers SET hibernation_state = 'hibernated', hibernated_at = now() WHERE id = $1`, a)
+		// A worker that settled awake keeps the row of a still-queued run.
+		f.env.exec(`UPDATE workers SET hibernation_state = 'none', hibernation_op_id = NULL, hibernated_at = NULL, wake_requested_at = NULL WHERE id = $1`, a)
 		if n, err := f.svc.ReleaseStaleWake(f.env.ctx, live); err != nil || n {
-			t.Fatalf("a wake whose worker stopped waking was released while its run is queued: %v, %v", n, err)
+			t.Fatalf("a wake whose worker settled awake was released while its run is queued: %v, %v", n, err)
 		}
 		if f.wakeRows(live) != 1 || f.wakeRows(gone) != 0 {
 			t.Fatalf("rows: live=%d gone=%d", f.wakeRows(live), f.wakeRows(gone))

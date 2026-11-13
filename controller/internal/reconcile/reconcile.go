@@ -117,8 +117,11 @@ type ObservedWorker struct {
 	// for any state including Terminating (issue #3890). Internal to the controller:
 	// the materializer's size-only PVC expansion reads them, and nothing here is sent
 	// on the wire. nil when no such claim was observed.
-	DataClaim      *ClaimObservation
-	DinDClaim      *ClaimObservation
+	DataClaim *ClaimObservation
+	DinDClaim *ClaimObservation
+	// NixClaim is the observed /nix claim (any state), read only by the hibernation
+	// arm's non-destructive expansion of an undersized retained claim.
+	NixClaim       *ClaimObservation
 	PodsKnown      bool
 	WorkerPodCount int
 	ReadyPodUID    string

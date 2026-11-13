@@ -395,6 +395,22 @@ func TestHibernationWakeSuppressesEphemeralProvisioningLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("a waking worker that no longer accepts intake does not suppress provisioning", func(t *testing.T) {
+		e := newWakeEnv(t, true)
+		sleeper := e.sleeper([]string{"jvm"}, nil, time.Hour)
+		e.queuedRun("jvm")
+		if e.wake() != 1 {
+			t.Fatal("no wake")
+		}
+		if got := e.provision(); got != 0 {
+			t.Fatalf("control: provisioned %d although a healthy wake covers the run", got)
+		}
+		e.exec(`UPDATE workers SET manual_cordoned_at = now(), manual_cordoned_by = user_id, manual_cordoned_by_label = 'op' WHERE id = $1`, sleeper)
+		if got := e.provision(); got != 1 || e.ephemeralWorkers() != 1 {
+			t.Fatalf("a cordoned waking worker can never serve the run; provisioning must proceed, created %d", got)
+		}
+	})
+
 	t.Run("a run needing another capability is not suppressed", func(t *testing.T) {
 		e := newWakeEnv(t, true)
 		e.sleeper([]string{"jvm"}, nil, time.Hour)

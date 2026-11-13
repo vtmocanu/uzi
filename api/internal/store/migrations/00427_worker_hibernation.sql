@@ -7,8 +7,7 @@ SET LOCAL lock_timeout = '5s';
 -- a runs lock for its FK) lives in 00428 so Up never waits on runs while holding
 -- ACCESS EXCLUSIVE on workers.
 ALTER TABLE workers
- ADD COLUMN hibernation_state text NOT NULL DEFAULT 'none'
-  CONSTRAINT workers_hibernation_state_check CHECK (hibernation_state IN ('none','preparing','hibernated','waking')),
+ ADD COLUMN hibernation_state text NOT NULL DEFAULT 'none',
  ADD COLUMN hibernation_op_id uuid,
  ADD COLUMN hibernation_requested_at timestamptz,
  ADD COLUMN hibernated_at timestamptz,
@@ -23,21 +22,30 @@ ALTER TABLE workers
  ADD COLUMN wake_register_op_id uuid,
  ADD COLUMN wake_register_pod_uid uuid;
 
+-- Staged CHECKs: added NOT VALID (no table scan under the ACCESS EXCLUSIVE lock), then validated
+-- (SHARE UPDATE EXCLUSIVE, which does not block reads or writes). Every column is new, so the
+-- validation cannot fail on existing rows.
 ALTER TABLE workers
+ ADD CONSTRAINT workers_hibernation_state_check CHECK (hibernation_state IN ('none','preparing','hibernated','waking')) NOT VALID,
  ADD CONSTRAINT workers_hibernation_coherent CHECK (
   hibernation_state = 'none'
   OR (hibernation_op_id IS NOT NULL AND kind = 'hosted' AND NOT ephemeral)
- ),
+ ) NOT VALID,
  ADD CONSTRAINT workers_hibernated_at_set CHECK (
   hibernation_state <> 'hibernated' OR hibernated_at IS NOT NULL
- ),
+ ) NOT VALID,
  ADD CONSTRAINT workers_wake_requested_at_set CHECK (
   hibernation_state <> 'waking' OR wake_requested_at IS NOT NULL
- ),
+ ) NOT VALID,
  ADD CONSTRAINT workers_hibernation_text_bounds CHECK (
   (wake_error IS NULL OR char_length(wake_error) <= 500)
   AND (hibernation_reason IS NULL OR char_length(hibernation_reason) <= 500)
- );
+ ) NOT VALID;
+ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernation_state_check;
+ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernation_coherent;
+ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernated_at_set;
+ALTER TABLE workers VALIDATE CONSTRAINT workers_wake_requested_at_set;
+ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernation_text_bounds;
 
 -- Audit history. Snapshot identifiers deliberately have no foreign keys: deletion
 -- must preserve history. Down keeps this table, so Up must be re-entrant and must

@@ -330,7 +330,7 @@ func TestHibernationWakeDemandMatchesClaimLiveDB(t *testing.T) {
 		fx := newFleetFixture(t)
 		t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM users WHERE id = $1`, fx.userID) })
 		h := hostedWorker(fx, wakeWorkerOpts{})
-		setHibernated(fx, h, "hibernated")
+		setHibernated(fx, h, "waking") // a recorded wake names a waking worker
 		woken, bound, free := fx.queuedRun(), fx.queuedRun(), fx.queuedRun()
 		mustExec(fx.ctx, t, fx.pool, `INSERT INTO hibernation_wakes (run_id, worker_id, first_woken_at) VALUES ($1, $2, now())`, woken, h)
 		if _, err := fx.q.CreateEphemeralHostedWorker(fx.ctx, store.CreateEphemeralHostedWorkerParams{
@@ -356,7 +356,7 @@ func TestHibernationWakeDemandMatchesClaimLiveDB(t *testing.T) {
 		fx := newFleetFixture(t)
 		t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM users WHERE id = $1`, fx.userID) })
 		h := hostedWorker(fx, wakeWorkerOpts{})
-		setHibernated(fx, h, "hibernated")
+		setHibernated(fx, h, "waking") // a recorded wake names a waking worker
 		// The two oldest runs are excluded; with MaxRows 1 the free run must still be listed.
 		woken, bound, free := fx.queuedRun(), fx.queuedRun(), fx.queuedRun()
 		mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET created_at = now() - interval '3 hours' WHERE id = $1`, woken)
@@ -372,6 +372,18 @@ func TestHibernationWakeDemandMatchesClaimLiveDB(t *testing.T) {
 		got := wakeDemandWith(fx, nil, 1, pgtype.Interval{})
 		if len(got) != 1 || got[free] != h {
 			t.Fatalf("MaxRows 1 returned %v, want only %s -> %s", got, free, h)
+		}
+	})
+
+	t.Run("a row whose worker is hibernated again is stale and does not exclude its run", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, `DELETE FROM users WHERE id = $1`, fx.userID) })
+		h := hostedWorker(fx, wakeWorkerOpts{})
+		setHibernated(fx, h, "hibernated")
+		run := fx.queuedRun()
+		mustExec(fx.ctx, t, fx.pool, `INSERT INTO hibernation_wakes (run_id, worker_id, first_woken_at) VALUES ($1, $2, now())`, run, h)
+		if got := wakeDemandFor(fx, nil); got[run] != h {
+			t.Fatalf("run %s with a stale row (worker asleep again) is not listed for %s: %v", run, h, got)
 		}
 	})
 

@@ -167,8 +167,8 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		if w.Worker.Kind != "hosted" {
 			continue
 		}
-		// A preparing or hibernated worker has no pod to roll: it is neither rolling nor
-		// stuck (PRD #4205). A waking worker stays counted so a stuck wake still surfaces.
+		// A preparing, hibernated or waking worker is outside the roll: it is neither rolling
+		// nor stuck (PRD #4205). A wake that fails is reported by fleet.hibernation_wake.
 		if workersvc.IsPodless(w.Worker.HibernationState) {
 			excluded++
 			continue

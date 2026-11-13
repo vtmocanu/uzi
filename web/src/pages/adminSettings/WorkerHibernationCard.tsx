@@ -27,7 +27,9 @@ export function WorkerHibernationCard({
     setNotice("");
     setBusy(true);
     try {
-      const resp = await api.updateSettings({ worker_hibernation_enabled: String(enabled) });
+      const resp = await api.updateSettings({
+        worker_hibernation_enabled: String(enabled),
+      });
       onSaved(resp);
       setEnabled(resp.settings.worker_hibernation_enabled === "true");
       setNotice("Worker hibernation settings saved.");
@@ -43,12 +45,16 @@ export function WorkerHibernationCard({
       <div>
         <SectionTitle>Worker hibernation</SectionTitle>
         <p className="mt-2 text-sm text-muted">
-          When on, an admin can hibernate an idle persistent hosted worker: its pod is scaled down
-          and its storage is kept, so it costs nothing while it sleeps. A hibernated worker takes no
-          new runs and does not count as available capacity. Turning this off wakes{" "}
-          <strong className="text-fg">every hibernated or hibernating worker</strong> (at most 10 per pass, so a
-          large fleet wakes over several passes). Waking a worker never depends on this
-          setting. Off by default.
+          When on, an admin can hibernate an idle persistent hosted worker: its
+          pod is scaled down and its storage is kept, which releases the pod's
+          CPU and memory requests while the storage (and its cost) stays. A
+          hibernated worker takes no new runs and does not count as available
+          capacity. Turning this off wakes{" "}
+          <strong className="text-fg">
+            every hibernated or hibernating worker
+          </strong>{" "}
+          (at most 10 per pass, so a large fleet wakes over several passes).
+          Waking a worker never depends on this setting. Off by default.
         </p>
       </div>
 

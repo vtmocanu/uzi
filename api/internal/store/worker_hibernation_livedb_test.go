@@ -36,11 +36,13 @@ func TestHibernationClaimFenceLiveDB(t *testing.T) {
 		pin   bool   // pin the run to the claimant (a resume)
 		chat  bool
 		cross bool
+		job   bool // a job-runner claim: the worker advertises the job lane protocol capabilities
 	}{
 		{name: "ordinary"},
 		{name: "resume-pinned", pin: true},
 		{name: "judge", shape: `kind='judge', repo_id=NULL, issue_iid=NULL, branch=NULL, target_run_id=$2`},
 		{name: "cross_check", cross: true},
+		{name: "job", shape: `kind='job', repo_id=NULL, issue_iid=NULL, branch=NULL, job_type='research'`, job: true},
 		{name: "chat", shape: `kind='chat', repo_id=NULL, issue_iid=NULL, branch=NULL`, chat: true},
 		{name: "chat-pinned", shape: `kind='chat', repo_id=NULL, issue_iid=NULL, branch=NULL`, chat: true, pin: true},
 	}
@@ -57,6 +59,10 @@ func TestHibernationClaimFenceLiveDB(t *testing.T) {
 					mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, w, caps)
 					run, _ = seedClaudeChild(fx, w, 1)
 				} else {
+					if c.job {
+						// ClaimRun's job-runner clause: job_runner_v1 and job_files_v1.
+						caps = []string{"job_runner_v1", "job_files_v1"}
+					}
 					target := fx.queuedRun()
 					mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET status='completed' WHERE id=$1`, target)
 					run = fx.queuedRun()

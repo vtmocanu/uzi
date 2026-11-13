@@ -98,20 +98,23 @@ SELECT status FROM runs WHERE id = @id FOR SHARE;
 
 -- name: ListStaleHibernationWakes :many
 -- Release candidates (PRD #4205 "One wake per pending run"): a wake row lives until its run is no
--- longer queued. Only a run that left 'queued' (claimed, cancelled, finished) qualifies; a row
--- whose worker settled to none or was re-hibernated is kept, so the run never wakes a worker twice.
+-- longer queued. A run that left 'queued' (claimed, cancelled, finished) qualifies, and so does a row
+-- whose worker is hibernated or preparing again (the wake can no longer serve the run). A row whose
+-- worker settled to none is kept while the run is queued, so the run never wakes a worker twice.
 -- A deleted run's row goes with it (ON DELETE CASCADE). The caller re-checks under the locks.
 SELECT hw.run_id, hw.worker_id
 FROM hibernation_wakes hw
 JOIN runs r ON r.id = hw.run_id
-WHERE r.status <> 'queued'
+JOIN workers w ON w.id = hw.worker_id
+WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
 ORDER BY hw.worker_id, hw.run_id
 LIMIT @max_rows;
 
 -- name: HibernationWakeSuppresses :one
 -- Wake suppression for ephemeral provisioning (PRD #4205 M5, D9): true iff the run has a recorded
 -- wake whose worker is still waking, is admitted for THIS run by fn_placement_admitting_workers
--- (so a run needing another capability or lane is never suppressed), and the FIRST wake is
+-- (so a run needing another capability or lane is never suppressed), would accept intake as if awake
+-- (not cordoned, draining or in maintenance; forge-origin eligible), and the FIRST wake is
 -- younger than @wake_timeout (retries never reset first_woken_at).
 -- @ephemeral_lease cannot change the result here: the waking worker is always a persistent hosted
 -- worker, and the lease only admits ephemeral workers. It is passed for consistency with the demand query.
@@ -143,6 +146,12 @@ SELECT EXISTS (
             @ephemeral_lease::interval, false, @codex_curated_models::text[]) adm ON adm.worker_id = w.id
     WHERE hw.run_id = @run_id
       AND hw.first_woken_at > now() - @wake_timeout::interval
+      -- The waking worker must accept intake as if awake (fn_worker_accepts_new_intake minus its
+      -- hibernation clause) and be forge-origin eligible, exactly as the demand query requires of a
+      -- wake target; otherwise the wake can never serve the run and provisioning must proceed.
+      AND w.manual_cordoned_at IS NULL AND w.draining_since IS NULL AND NOT w.maintenance_fenced
+      AND w.maintenance_phase NOT IN ('requested', 'ready', 'stopping', 'recycling')
+      AND (r.kind = 'chat' OR fn_forge_origin_eligible(w, r, now()))
 )::boolean AS suppressed;
 
 -- name: ListHibernationWakeDemand :many
@@ -169,7 +178,8 @@ SELECT EXISTS (
 -- the per-user ephemeral opt-in and kind <> 'chat'.
 --
 -- The hibernation_wakes anti-join sits before LIMIT so recorded wakes cannot crowd out demand. A
--- row stays until its run leaves 'queued', so a run that already woke once never wakes again.
+-- row stays until its run leaves 'queued', so a run that already woke once never wakes again, unless
+-- the row's worker is hibernated or preparing again: such a row is stale and does not exclude the run.
 -- @ephemeral_lease is the configured ephemeral lease: a run an online leased ephemeral worker can
 -- take via its lease is not demand.
 WITH checker_template_pins AS MATERIALIZED (
@@ -261,7 +271,8 @@ WHERE r.status = 'queued'
   AND cw.online_can_claim IS NOT TRUE
   AND cw.wake_worker_id IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM workers w2 WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id)
-  AND NOT EXISTS (SELECT 1 FROM hibernation_wakes hw WHERE hw.run_id = r.id)
+  AND NOT EXISTS (SELECT 1 FROM hibernation_wakes hw JOIN workers hww ON hww.id = hw.worker_id
+                  WHERE hw.run_id = r.id AND hww.hibernation_state NOT IN ('hibernated', 'preparing'))
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.created_at ASC
 LIMIT @max_rows;
 

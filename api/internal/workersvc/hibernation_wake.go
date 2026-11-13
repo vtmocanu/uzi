@@ -1,9 +1,11 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -37,9 +39,11 @@ const (
 // SHARE (worker-then-run, as ClaimRun), and the run's status is re-read under that lock: a run that
 // is no longer queued is never woken for.
 //
-//   - A run that already has a wake row never gets another: one wake per pending run. The row
-//     lives until the run leaves 'queued' (ReleaseStaleWake), so a worker that settled or was
-//     re-hibernated does not trigger a second wake, and no sibling is woken.
+//   - A run that already has a wake row never gets another while that row's worker is waking or
+//     settled awake: one wake per pending run, and no sibling is woken. The row lives until the run
+//     leaves 'queued' (ReleaseStaleWake). A row whose worker is hibernated or preparing again (a
+//     recovery path: HibernateWorker refuses to re-hibernate under a queued run's wake) is deleted
+//     under that worker's lock and the run is treated as fresh demand.
 //   - A waking candidate whose wake_error is set is refused: a failed wake must not capture demand.
 //   - A candidate that is already waking only gets the row (DemandWakeAttached). Otherwise it moves
 //     to waking through moveToWaking with a fresh op id (a preparing worker is withdrawn the same
@@ -59,13 +63,33 @@ func (s *Service) DemandWake(ctx context.Context, runID, workerID uuid.UUID) (De
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
 
-	w, err := q.GetWorkerForUpdate(ctx, workerID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return DemandWakeNone, nil // the candidate was deleted
+	// The row's worker (when it is not the candidate) is locked together with the candidate, in id
+	// order, so two passes touching the same pair cannot deadlock. The row is read again under the
+	// locks: one re-pointed meanwhile is left to the next pass.
+	ids := []uuid.UUID{workerID}
+	if prior, perr := q.GetHibernationWake(ctx, runID); perr == nil {
+		if prior.WorkerID != workerID {
+			ids = append(ids, prior.WorkerID)
+		}
+	} else if !errors.Is(perr, pgx.ErrNoRows) {
+		return DemandWakeNone, perr
 	}
-	if err != nil {
-		return DemandWakeNone, err
+	sort.Slice(ids, func(i, j int) bool { return bytes.Compare(ids[i][:], ids[j][:]) < 0 })
+	locked := make(map[uuid.UUID]store.Worker, len(ids))
+	for _, id := range ids {
+		lw, lerr := q.GetWorkerForUpdate(ctx, id)
+		if errors.Is(lerr, pgx.ErrNoRows) {
+			if id == workerID {
+				return DemandWakeNone, nil // the candidate was deleted
+			}
+			continue // the row's worker was deleted; its row went with it
+		}
+		if lerr != nil {
+			return DemandWakeNone, lerr
+		}
+		locked[id] = lw
 	}
+	w := locked[workerID]
 
 	status, err := q.LockRunForShare(ctx, runID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -78,8 +102,18 @@ func (s *Service) DemandWake(ctx context.Context, runID, workerID uuid.UUID) (De
 		return DemandWakeNone, nil
 	}
 
-	if _, gerr := q.GetHibernationWake(ctx, runID); gerr == nil {
-		return DemandWakeNone, nil // already woke once for this run: reuse or no second wake
+	if cur, gerr := q.GetHibernationWake(ctx, runID); gerr == nil {
+		rw, held := locked[cur.WorkerID]
+		if !held || (rw.HibernationState != "hibernated" && rw.HibernationState != "preparing") {
+			// Waking: reuse. Settled awake: the run already woke once, and no sibling is woken.
+			return DemandWakeNone, nil
+		}
+		// The row's worker went back to sleep while the run was still queued (a recovery path:
+		// HibernateWorker refuses this while the run is queued). The wake can no longer serve the
+		// run, so the row is dropped and the run is fresh demand.
+		if _, derr := q.DeleteHibernationWake(ctx, store.DeleteHibernationWakeParams{RunID: runID, WorkerID: cur.WorkerID}); derr != nil {
+			return DemandWakeNone, derr
+		}
 	} else if !errors.Is(gerr, pgx.ErrNoRows) {
 		return DemandWakeNone, gerr
 	}
@@ -122,8 +156,9 @@ func (s *Service) DemandWake(ctx context.Context, runID, workerID uuid.UUID) (De
 	return res, nil
 }
 
-// ReleaseStaleWake deletes run runID's wake row only when the run is no longer queued (or no longer
-// exists). A row whose worker settled or was re-hibernated is kept: the run already woke once.
+// ReleaseStaleWake deletes run runID's wake row when the run is no longer queued (or no longer
+// exists), or when the row's worker is hibernated or preparing again (the wake can no longer serve
+// the run). A row whose worker settled awake is kept while the run is queued: it already woke once.
 // The worker is locked first and the staleness is re-checked under the lock, so a wake being
 // recorded concurrently is never torn. It reports whether a row was deleted.
 func (s *Service) ReleaseStaleWake(ctx context.Context, runID uuid.UUID) (bool, error) {
@@ -164,7 +199,8 @@ func (s *Service) ReleaseStaleWake(ctx context.Context, runID uuid.UUID) (bool, 
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return false, err
 	}
-	stale := errors.Is(err, pgx.ErrNoRows) || run.Status != "queued"
+	stale := errors.Is(err, pgx.ErrNoRows) || run.Status != "queued" ||
+		w.HibernationState == "hibernated" || w.HibernationState == "preparing"
 	if !stale {
 		return false, nil
 	}

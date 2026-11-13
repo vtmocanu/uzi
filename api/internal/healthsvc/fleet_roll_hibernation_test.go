@@ -18,7 +18,7 @@ func TestFleetRollExcludesHibernatingWorkers(t *testing.T) {
 		r.Worker.HibernationState = state
 		return r
 	}
-	for _, state := range []string{"preparing", "hibernated"} {
+	for _, state := range []string{"preparing", "hibernated", "waking"} {
 		t.Run(state+" only", func(t *testing.T) {
 			workers := []store.ListAllWorkersRow{hib("w1", state)}
 			svc := New(Config{
@@ -41,17 +41,6 @@ func TestFleetRollExcludesHibernatingWorkers(t *testing.T) {
 		c := svc.checkFleetRoll(fixedNow, workers, true)
 		if c.Severity == sevNA || !strings.Contains(c.Summary, "hibernated (excluded)") {
 			t.Fatalf("severity %q summary %q", c.Severity, c.Summary)
-		}
-	})
-	t.Run("waking worker with a failure is still reported", func(t *testing.T) {
-		workers := []store.ListAllWorkersRow{hib("w1", "waking")}
-		svc := New(Config{
-			Store: &fakeStore{workers: workers}, Settings: &fakeSettings{healthEnabled: true},
-			Now: func() time.Time { return fixedNow }, HostedWorkerVersion: "0.84.0",
-		})
-		c := svc.checkFleetRoll(fixedNow, workers, true)
-		if c.Severity != sevDanger || !strings.Contains(c.Summary, "1 of 1 hosted workers stuck") {
-			t.Fatalf("severity %q summary %q: stuck wake hidden", c.Severity, c.Summary)
 		}
 	})
 	t.Run("awake stuck worker still counted", func(t *testing.T) {

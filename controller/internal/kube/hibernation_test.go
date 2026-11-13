@@ -8,11 +8,14 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -856,5 +859,53 @@ func TestRestartMidPreparingResumesWithoutASecondScaleDown(t *testing.T) {
 	}
 	if n := len(deploymentPatchBodies(client)); n != 0 {
 		t.Fatalf("restart issued %d deployment patches, want none", n)
+	}
+}
+
+// A woken (or held) worker whose Deployment is gone and whose retained /nix claim is
+// below the render size is stuck behind the placement gate unless the claim is grown in
+// place. The claim is patched upward; once it is live at size the Deployment is created.
+func TestMissingDeploymentWithUndersizedNixClaimExpandsThenCreates(t *testing.T) {
+	for _, state := range []string{protocol.HibernationWaking, protocol.HibernationHibernated} {
+		nix := pvcNix("w1", "4Gi")
+		sc := "standard"
+		nix.UID, nix.ResourceVersion = "uid-nix", "7"
+		nix.Spec.StorageClassName = &sc
+		nix.Status.Phase = corev1.ClaimBound
+		class := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: sc}, AllowVolumeExpansion: boolp(true)}
+		rec := &hibRec{fakeCordoner: &fakeCordoner{}}
+		logs := &strings.Builder{}
+		m, client := newMatWithRecycle(t, rec, DrainPolicy{Deadline: 24 * time.Hour}, RecyclePolicy{Enabled: true}, logs, nix, pvcFor("w1", "data"), class)
+		m.cfg = testConfig()
+		op := "op-" + state
+
+		if err := hibTick(t, m, hibW(state, op)); err != nil {
+			t.Fatalf("%s: %v", state, err)
+		}
+		got, err := client.CoreV1().PersistentVolumeClaims(testConfig().Namespace).Get(context.Background(), "uzi-hw-w1-nix", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if q := got.Spec.Resources.Requests[corev1.ResourceStorage]; q.Cmp(resource.MustParse("20Gi")) != 0 {
+			t.Fatalf("%s: nix claim request = %s, want 20Gi; log: %s", state, q.String(), logs.String())
+		}
+		if _, err := client.AppsV1().Deployments(testConfig().Namespace).Get(context.Background(), "uzi-hw-w1", metav1.GetOptions{}); err == nil {
+			t.Fatalf("%s: deployment created over an undersized claim in the same tick", state)
+		}
+		assertNothingDeleted(t, client)
+
+		// Next tick: the claim is live at size, so the placement gate opens.
+		if err := hibTick(t, m, hibW(state, op)); err != nil {
+			t.Fatalf("%s: %v", state, err)
+		}
+		d := hibGet(t, client)
+		want := int32(1)
+		if state == protocol.HibernationHibernated {
+			want = 0
+		}
+		if d.Spec.Replicas == nil || *d.Spec.Replicas != want {
+			t.Fatalf("%s: deployment replicas = %v, want %d", state, d.Spec.Replicas, want)
+		}
+		assertNothingDeleted(t, client)
 	}
 }

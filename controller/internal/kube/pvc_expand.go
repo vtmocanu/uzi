@@ -43,6 +43,7 @@ type claimKind int
 const (
 	claimData claimKind = iota
 	claimDinD
+	claimNix // expanded only through expandClaimsFor(nixOnly), by the hibernation arm
 )
 
 const maxClaimErrorLen = 200
@@ -128,8 +129,11 @@ func claimGate(w protocol.DesiredWorker, kind claimKind, e *rollEntry, uncertain
 // worker with no roll entry, use Observe's claim. /data with a roll entry uses the
 // roll snapshot's claim exclusively, which must agree with Observe on identity.
 func claimSnapshot(w protocol.DesiredWorker, kind claimKind, e *rollEntry, obs reconcile.ObservedWorker) (*reconcile.ClaimObservation, string) {
-	if kind == claimDinD {
+	switch kind {
+	case claimDinD:
 		return obs.DinDClaim, ""
+	case claimNix:
+		return obs.NixClaim, ""
 	}
 	if e == nil {
 		return obs.DataClaim, ""
@@ -170,10 +174,25 @@ func kindOfClaim(id, name string) (claimKind, bool) {
 // logs and continues on every failure: a refused expansion must not abort the
 // reconcile of the Deployment below it.
 func (m *Materializer) expandClaims(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) {
+	m.expandClaimsFor(ctx, w, obs, ns, spec, false)
+}
+
+// expandClaimsFor is expandClaims; nixOnly instead converges just the /nix claim, for the
+// hibernation arm. A hibernating worker sits outside every roll pool (its roll entry is
+// never admitted), so that mode reads the claim without the roll gates: the patch is
+// size-only, upward, and touches nothing but the claim. Elsewhere an undersized /nix
+// claim is the recycle arm's, never expanded.
+func (m *Materializer) expandClaimsFor(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec, nixOnly bool) {
 	tick, _ := ctx.Value(rollTickKey{}).(*rollTick)
 	e := rollFrom(ctx, w.ID)
+	if nixOnly {
+		e = nil
+	}
 	for _, pvc := range RenderPVCs(m.cfg, w, spec) {
 		kind, ok := kindOfClaim(w.ID, pvc.Name)
+		if nixOnly {
+			kind, ok = claimNix, pvc.Name == nixPVCName(w.ID)
+		}
 		if !ok {
 			continue
 		}

@@ -377,7 +377,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			}
 		case nixPVCName(id):
 			o.HasNixPVC = true // exists-in-ANY-state (UNCHANGED)
-			if !terminating {  // never source size or mint time from a Terminating PVC
+			nixClaim := claimObservationOf(ns, id, p)
+			o.NixClaim = &nixClaim // any state, Terminating included
+			if !terminating {      // never source size or mint time from a Terminating PVC
 				sz := p.Spec.Resources.Requests[corev1.ResourceStorage]
 				o.NixPVCSize = &sz // live nix size; nil while absent OR Terminating
 				t := p.CreationTimestamp.Time
@@ -1001,6 +1003,13 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	if w.Hibernation != nil {
 		if err := m.ensurePVCs(ctx, w, obs, ns, spec); err != nil {
 			return err
+		}
+		// A worker with no Deployment is placed only over claims live at the render
+		// size (deploymentPlacementBlocked), so an undersized retained claim must be
+		// grown in place first. Size-only and upward: no claim is ever deleted or
+		// recycled on a hibernation path.
+		if legacy && !obs.HasDeployment {
+			m.expandClaimsFor(ctx, w, obs, ns, spec, true)
 		}
 		return m.reconcileHibernation(ctx, w, obs, ns, spec)
 	}

@@ -375,10 +375,9 @@ func ClassifyUpgradeWithTarget(in UpgradeInput, p UpgradeParams) (status, detail
 func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail string, resolvedTarget string) {
 	p = p.withDefaults()
 	if IsPodless(in.Hibernation) {
-		// Precedence: a podless hibernation state first. "unknown" raises no upgrade alert,
-		// and the detail names the state; the DTO carries hibernation_state for display
-		// surfaces. A waking worker has a pod coming up, so it classifies normally and an
-		// upgrade_failed diagnostic is not hidden behind a stuck wake.
+		// Precedence: any non-none hibernation state first, waking included. "unknown" raises
+		// no upgrade alert, and the detail names the state; the DTO carries hibernation_state
+		// for display surfaces. A wake that fails is reported by fleet.hibernation_wake.
 		return UpgradeStatusUnknown, "worker is " + hibernationLabel(in.Hibernation), in.CPVersion
 	}
 	hosted := in.Kind == "hosted"
@@ -481,11 +480,12 @@ func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail
 	return status, detail, target
 }
 
-// IsPodless reports whether a workers.hibernation_state value means the worker has no
-// pod to roll or version-check: preparing (being scaled down) or hibernated. A waking
-// worker is deliberately excluded, so a stuck wake still surfaces roll failures.
+// IsPodless reports whether a workers.hibernation_state value means the worker is outside the
+// roll and version machinery: preparing (being scaled down), hibernated, or waking (its pod is
+// still coming up, so it has no settled version to check). A failed wake is reported by
+// fleet.hibernation_wake, not by the roll or upgrade classifiers.
 func IsPodless(state string) bool {
-	return state == "preparing" || state == "hibernated"
+	return state != "" && state != "none"
 }
 
 func hibernationLabel(state string) string {
