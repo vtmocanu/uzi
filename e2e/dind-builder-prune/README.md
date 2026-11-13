@@ -176,7 +176,7 @@ JSON snapshots land in `.uzi/scratch/dbp-<token>/` (override with `DBP_OUT`).
 archive, checksummed in its own README, and not executed by any target.
 
 The nested TCP listener is attached to a labelled, per-invocation bridge network,
-not the default bridge. Only this invocation's daemon and plugin fixture join it.
+not the default bridge. Only containers created by this invocation join it.
 Each posture checks reachability from an owned probe on that private bridge,
 then checks that the same probe cannot reach the listener from the default
 bridge. Cleanup removes labelled containers first and their labelled networks
