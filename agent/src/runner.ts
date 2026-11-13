@@ -27014,7 +27014,7 @@ export class RunRunner {
    * destructive before it has decided: no capture, no teardown, no release report, no new attempt dir.
    *
    * Order, each step holding before the next:
-   *  1. Eligibility (synchronous; any miss is `v1_release` with no effect): the ledger, the holder, the
+   *  1. Eligibility (after a bounded wait for an op-less pending switch's op id, awaitPendingSwitchOpId; then synchronous, and any miss is `v1_release` with no effect): the ledger, the holder, the
    *     registration nonce, a pending op id, the negotiated apply capability, a Claude flight, and no
    *     restore-route predecessor. A flight with retained authority is eligible (R1): it proves under the
    *     `retained_credential_switch` site and keeps its custody flags.

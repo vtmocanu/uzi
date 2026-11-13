@@ -988,7 +988,9 @@ export class FakeApi {
   private credentialSwitchUncertainState(runId: string, body: StateRequest, res: http.ServerResponse): void {
     const raw = structuredClone(body) as unknown as Record<string, unknown>;
     this.uncertainRequests.push({ runId, body: raw });
-    if (!body.register_nonce || typeof raw.op_id !== "string" || raw.op_id === "") return send(res, 400, { error: "invalid request body" });
+    if (typeof raw.op_id !== "string" || raw.op_id === "") return send(res, 400, { error: "invalid request body" });
+    // As the api: a missing registration nonce on an op-carrying report changes nothing and is a not-applied 409.
+    if (!body.register_nonce) return send(res, 409, { applied: false, run: { id: runId, status: "running", hold_reason: null } });
     if (this.uncertainRefusals.has(runId)) return send(res, 409, { applied: false, run: { id: runId, status: "running", hold_reason: null } });
     this.states.push({ runId, body });
     this.requestLog.push("state:credential_switch_uncertain");

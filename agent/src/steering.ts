@@ -811,10 +811,6 @@ export class SteeringChannel {
         // dropped for the next claim to replay, and the switch is tripped as the GET's signal would.
         // The failure is not sticky, so the release report, finding nothing pending, goes out.
         if (reason === "switch_pending") {
-          // Issue #4201 (Residual 9): this refusal carries no op id, so it cannot yet be told from a v1 switch. Remember the
-          // dropped ids: if the next GET names an op id for this op-less switch, they wait for the in-place settle
-          // (see maybeTripCredentialSwitch) instead of being lost to a claim that never replays them.
-          for (const id of this.held.ids) if (!this.oplessDroppedIds.includes(id)) this.oplessDroppedIds.push(id);
           this.rejectHeld(new CredentialSwitchSignal());
           this.maybeTripCredentialSwitch(this.claimGeneration);
           return;
@@ -1662,8 +1658,6 @@ export class SteeringChannel {
   /** Ids of a routed batch whose APPLIED a switch refused during a hold: kept unapplied (a release
    *  leaves them for the next claim) and returned to the ready lane by rearmCredentialSwitch. */
   private readonly heldForSwitch: number[] = [];
-  /** Issue #4201 (Residual 9): ids an op-less switch_pending refusal dropped; they move to heldForSwitch if that switch's op id arrives. */
-  private readonly oplessDroppedIds: number[] = [];
   /** PRD #1247 M5b: a RE-ARMABLE interrupt the executor registers (via ctx.onCredentialSwitch),
    *  the exact analog of pauseNowInterrupt — invoked on the matching switch so a switch drops the
    *  in-flight turn even after the shared cancel controller has already fired once (an
@@ -2013,7 +2007,6 @@ export class SteeringChannel {
     // Issue #1604: the claim stays active and the switch is cleared, so the plan-gate inputs a
     // pending switch refused are due their APPLIED again.
     this.approveRefusedBySwitch = false;
-    this.oplessDroppedIds.length = 0;
     if (this.parkedReady.length > 0) this.markReady(this.parkedReady.splice(0));
     if (this.heldForSwitch.length > 0) this.markReady(this.heldForSwitch.splice(0));
   }
@@ -2825,14 +2818,7 @@ export class SteeringChannel {
     if (this.pendingSwitch !== undefined) {
       // Already tripped once — idempotent. A NEWER op while one is pending replaces the pending op id
       // (what a `superseded` apply waits for) without aborting again (#4095).
-      if (opId !== undefined && opId !== this.pendingSwitch.opId) {
-        // An op-less switch (revealed only by a refused APPLIED) just learned its op id: it is in place, so the batch that
-        // refusal dropped waits for the settle like an in-place refusal's (the held path's switch_pending branch).
-        if (this.pendingSwitch.opId === undefined) {
-          for (const id of this.oplessDroppedIds.splice(0)) if (!this.heldForSwitch.includes(id)) this.heldForSwitch.push(id);
-        }
-        this.pendingSwitch = { generation, opId };
-      }
+      if (opId !== undefined && opId !== this.pendingSwitch.opId) this.pendingSwitch = { generation, opId };
       return;
     }
     this.pendingSwitch = opId === undefined ? { generation } : { generation, opId };
