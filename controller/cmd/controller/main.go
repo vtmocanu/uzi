@@ -154,7 +154,8 @@ func main() {
 		SecretMountPath: cfg.WorkerSecretMountPath,
 		// The docker worker's gated DinD prune (issue #1759) rides the disk self-heal
 		// toggle: one knob governs every automatic reclaim.
-		DinDPruneEnabled: cfg.WorkerDiskRecycleEnabled,
+		DinDPruneEnabled:        cfg.WorkerDiskRecycleEnabled,
+		DinDBuilderPruneEnabled: cfg.WorkerDinDBuilderPruneEnabled,
 		// The isolated research lane (PRD #1906 M5). Empty namespace = lane off: an
 		// isolated worker is then skipped, never rendered into Namespace. The fetcher URL
 		// and CA reach isolated pods only (UZI_FETCHER_URL, and UZI_FETCHER_CA_FILE

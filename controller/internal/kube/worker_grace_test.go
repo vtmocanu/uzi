@@ -23,7 +23,7 @@ func graceCases() []graceCase {
 	ephemeral.Ephemeral = true
 	return []graceCase{
 		{"plain", testConfig(), desired("w1"), "62873a66420e91e389056f04007450d8d5340e9f8ca8b8e86bd0c56339922d46"},
-		{"docker", dockerTestConfig(), desiredDocker("w1"), "405f77daac7790c3fc992cef8ff19eb7bae2df7d165c5339266560ae26b1c9c7"},
+		{"docker", dockerTestConfig(), desiredDocker("w1"), "2a73202367435560d8b135909eac17f1aaa1106807e33b0b7f234647e3ad0d72"},
 		{"ephemeral", testConfig(), ephemeral, "62873a66420e91e389056f04007450d8d5340e9f8ca8b8e86bd0c56339922d46"},
 	}
 }
