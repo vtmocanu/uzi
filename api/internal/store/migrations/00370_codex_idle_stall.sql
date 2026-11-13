@@ -1,4 +1,13 @@
 -- +goose Up
+-- Keep the existing function identity and grants while removing parsed-body
+-- dependencies that block defaulted ADD COLUMN on patched PostgreSQL minors (#4273).
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION fn_run_admitted_during_intake_pause(r runs) RETURNS boolean
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+ SELECT r.claim_generation > 0 OR r.kind = 'cross_check';
+$$;
+-- +goose StatementEnd
+
 ALTER TABLE runs ADD COLUMN idle_stall_park_count integer NOT NULL DEFAULT 0;
 ALTER TABLE runs ADD CONSTRAINT runs_idle_stall_park_count_nonnegative CHECK (idle_stall_park_count >= 0) NOT VALID;
 ALTER TABLE runs DROP CONSTRAINT runs_recovery_wait_cause_check;
