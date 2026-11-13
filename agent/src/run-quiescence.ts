@@ -2786,10 +2786,17 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       inProcessReproof = true;
       return { liveRoots: fresh.roots, liveMarkers: freshOthers.map(a => a.marker) };
     };
-    const prove = (candidate: ScanRequest, retryDeadlineAt?: number): Promise<ProcessQuiescence> => scoped
-      ? reapScopedRunProcesses(retryDeadlineAt === undefined ? req : { ...req, deadlineAt: retryDeadlineAt }, candidate, deps).catch(() =>
-        ({ state: "unverified", processes: [], killed: [], detail: "scoped reaper refused or failed" }))
-      : reapRunProcesses(req.reportBudget ? { ...candidate, reportDeadline: req.reportBudget.deadline } : candidate,
+    const prove = async (candidate: ScanRequest, retryDeadlineAt?: number): Promise<ProcessQuiescence> => {
+      if (scoped) {
+        // runClosedReaper may throw before returning a promise. Keep the original mapping for
+        // both synchronous admission refusals and asynchronous scoped-helper failures.
+        try {
+          return await reapScopedRunProcesses(retryDeadlineAt === undefined ? req : { ...req, deadlineAt: retryDeadlineAt }, candidate, deps);
+        } catch {
+          return { state: "unverified", processes: [], killed: [], detail: "scoped reaper refused or failed" };
+        }
+      }
+      return reapRunProcesses(req.reportBudget ? { ...candidate, reportDeadline: req.reportBudget.deadline } : candidate,
         { ...reapOptions,
           ...(!viaHelper && scan.mayKillUnreadableUnattributed !== true
             ? { refreshAfterUnattributed: refreshInProcess } : {}),
@@ -2805,6 +2812,7 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
             : { deadlineMs: Math.max(1, Math.floor(Math.min(reapOptions.deadlineMs ?? Infinity,
               retryDeadlineAt - Date.now()))) }),
         });
+    };
     processResult = await prove(scan);
     if (inProcessReproof) rootReproof = processResult.state === "quiescent" ? "quiescent" : "unverified";
 
