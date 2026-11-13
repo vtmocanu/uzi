@@ -33,9 +33,8 @@ func canonicalTargetSQL(ctx context.Context, t *testing.T, pool *pgxpool.Pool, r
 // migrationUpStatements reads the goose `-- +goose Up` block out of a migration file and
 // returns its individual SQL statements, so the test executes the MIGRATION'S EXACT SQL
 // against pre-canonical rows rather than a re-typed copy that could silently drift from what
-// ships. Comment lines are stripped BEFORE splitting on `;` — the migration's own prose
-// contains a semicolon (e.g. "...canonicalizes at write (handler.canonicalizeTarget); this
-// pass..."), so splitting first would tear a comment mid-line into a bogus "statement".
+// ships. The replay splitter preserves goose statement blocks, including their internal
+// semicolons, and strips prose comments before splitting ordinary SQL statements.
 func migrationUpStatements(t *testing.T, name string) []string {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join("migrations", name))
@@ -49,22 +48,50 @@ func migrationUpStatements(t *testing.T, name string) []string {
 	if i := strings.Index(up, "-- +goose Down"); i >= 0 {
 		up = up[:i]
 	}
-	// Drop whole `--` comment lines first (every comment in this migration is a full-line
-	// comment; no SQL statement carries a trailing inline comment), then split on `;`.
+	return splitMigrationStatements(t, up)
+}
+
+func splitMigrationStatements(t *testing.T, sql string) []string {
+	t.Helper()
 	var code strings.Builder
-	for _, line := range strings.Split(up, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+	var out []string
+	flushPlain := func() {
+		for _, stmt := range strings.Split(code.String(), ";") {
+			if stmt = strings.TrimSpace(stmt); stmt != "" {
+				out = append(out, stmt)
+			}
+		}
+		code.Reset()
+	}
+	inBlock := false
+	for _, line := range strings.Split(sql, "\n") {
+		switch strings.TrimSpace(line) {
+		case "-- +goose StatementBegin":
+			if inBlock {
+				t.Fatal("nested goose statement block in migration replay")
+			}
+			flushPlain()
+			inBlock = true
+			continue
+		case "-- +goose StatementEnd":
+			if !inBlock {
+				t.Fatal("goose statement end without begin in migration replay")
+			}
+			out = append(out, strings.TrimSpace(code.String()))
+			code.Reset()
+			inBlock = false
+			continue
+		}
+		if !inBlock && strings.HasPrefix(strings.TrimSpace(line), "--") {
 			continue
 		}
 		code.WriteString(line)
 		code.WriteByte('\n')
 	}
-	var out []string
-	for _, stmt := range strings.Split(code.String(), ";") {
-		if strings.TrimSpace(stmt) != "" {
-			out = append(out, stmt)
-		}
+	if inBlock {
+		t.Fatal("unterminated goose statement block in migration replay")
 	}
+	flushPlain()
 	return out
 }
 
