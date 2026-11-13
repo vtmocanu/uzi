@@ -28476,7 +28476,7 @@ export class RunRunner {
       // a detail, never change persistence or the outcome. Only an api that advertised the detail needs it.
       if (adoptionRefusal === undefined && observed === 0 && blocker === "adoption_failed" && persistence === "" &&
           persisted?.recovery?.stage === "blocked" && persisted.recovery.blocker === "adoption_failed" &&
-          this.client?.hasFeature(RETAINED_ADOPTION_DETAIL_FEATURE)) {
+          this.client?.protocolFeatures?.includes(RETAINED_ADOPTION_DETAIL_FEATURE) === true) {
         try {
           await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
             async () => {
