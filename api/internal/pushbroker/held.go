@@ -137,65 +137,14 @@ func PrepareHeldPack(ctx context.Context, o HeldPackOptions) (*PreparedHeldPack,
 	if !validRefUnder(ref, HeldRefPrefix) {
 		return nil, ErrInvalidRef
 	}
-	for _, b := range o.BaseRefs {
-		if !validRefUnder(b, "refs/heads/") && !validManagedRef(b) {
-			return nil, ErrInvalidRef
-		}
-	}
-	if len(o.Pack) == 0 {
-		return nil, ErrPackInvalid
-	}
-	if err := scanPackBudget(ctx, o.Pack); err != nil {
+	_, _, err := prepareFetchedPack(ctx, packPrep{
+		CloneURL: o.CloneURL, Username: o.Username, PAT: o.PAT,
+		Branch: o.Branch, WorkBranch: o.WorkBranch, CheckpointKey: o.CheckpointKey, DefaultBranch: o.DefaultBranch,
+		BaseRefs: o.BaseRefs, Tip: o.Tip, Pack: o.Pack,
+		CIConfigGuard: o.CIConfigGuard, CIConfigPaths: o.CIConfigPaths,
+	})
+	if err != nil {
 		return nil, err
-	}
-
-	repo, err := git.Init(memory.NewStorage(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("pushbroker: init: %w", err)
-	}
-	remote, err := repo.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{o.CloneURL}})
-	if err != nil {
-		return nil, fmt.Errorf("pushbroker: create remote: %w", err)
-	}
-	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
-
-	want := map[string]string{}
-	addHead := func(b string) {
-		if b != "" {
-			want["refs/heads/"+b] = "refs/remotes/origin/" + b
-		}
-	}
-	workBranch, checkpointKey := checkpointNames(o.Branch, o.WorkBranch, o.CheckpointKey)
-	addHead(workBranch)
-	addHead(o.DefaultBranch)
-	if checkpointKey != "" {
-		want[checkpointRefPrefix+checkpointKey] = checkpointRefPrefix + checkpointKey
-	}
-	for _, b := range o.BaseRefs {
-		if strings.HasPrefix(b, "refs/heads/") {
-			want[b] = "refs/remotes/origin/" + strings.TrimPrefix(b, "refs/heads/")
-		} else {
-			want[b] = b
-		}
-	}
-	if err := fetchWantedRefs(ctx, remote, auth, want); err != nil {
-		return nil, err
-	}
-	if err := packfile.UpdateObjectStorage(repo.Storer, bytes.NewReader(o.Pack)); err != nil {
-		return nil, fmt.Errorf("pushbroker: apply pack: %w", err)
-	}
-	tip := plumbing.NewHash(o.Tip)
-	tipCommit, err := object.GetCommit(repo.Storer, tip)
-	if err != nil {
-		if errors.Is(err, plumbing.ErrObjectNotFound) {
-			return nil, ErrTipMissing
-		}
-		return nil, fmt.Errorf("pushbroker: read declared tip: %w", err)
-	}
-	if o.CIConfigGuard {
-		if err := ciConfigGuard(ctx, repo, tipCommit, o.DefaultBranch, o.CIConfigPaths); err != nil {
-			return nil, err
-		}
 	}
 	// The send needs only the URL, so it gets a fresh remote rather than one that pins the
 	// storer holding every fetched base object.
@@ -203,7 +152,7 @@ func PrepareHeldPack(ctx context.Context, o HeldPackOptions) (*PreparedHeldPack,
 	if err != nil {
 		return nil, err
 	}
-	return &PreparedHeldPack{ref: ref, tip: tip, pack: o.Pack, remote: sendRemote, o: o}, nil
+	return &PreparedHeldPack{ref: ref, tip: plumbing.NewHash(o.Tip), pack: o.Pack, remote: sendRemote, o: o}, nil
 }
 
 // SendHeldCreate sends the single create command for a prepared pack: Old = zero hash, New = the
@@ -253,4 +202,98 @@ func joinHeldCause(pushErr, other error) error {
 		return errors.New("pushbroker: held create outcome unknown")
 	}
 	return errors.Join(pushErr, other)
+}
+
+// packPrep is the preparation input shared by PrepareHeldPack and PrepareTerminalPack. The caller
+// has already validated its own target ref and tip shape; the helper validates the base refs,
+// budgets and applies the pack on the server-fetched bases and proves the tip is present.
+type packPrep struct {
+	CloneURL, Username, PAT                          string
+	Branch, WorkBranch, CheckpointKey, DefaultBranch string
+	BaseRefs                                         []string
+	// ExtraBaseRefs are further full refs fetched under their own name. They are validated by the
+	// caller, not here (the terminal ref is not a ref any generic path accepts).
+	ExtraBaseRefs []string
+	Tip           string
+	Pack          []byte
+	// AllowEmptyPack admits a nil/empty Pack (no objects shipped); the tip must then already be
+	// present in the fetched bases.
+	AllowEmptyPack bool
+	CIConfigGuard  bool
+	CIConfigPaths  []string
+}
+
+// prepareFetchedPack is the read-only core of both preparations: base-ref validation, pack
+// budget, base fetch, in-memory apply, tip lookup and the ci-config guard. It returns the
+// in-memory repository and the tip commit so a caller can verify further. Nothing is sent.
+func prepareFetchedPack(ctx context.Context, in packPrep) (*git.Repository, *object.Commit, error) {
+	for _, b := range in.BaseRefs {
+		if !validRefUnder(b, "refs/heads/") && !validManagedRef(b) {
+			return nil, nil, ErrInvalidRef
+		}
+	}
+	havePack := len(in.Pack) != 0
+	if !havePack && !in.AllowEmptyPack {
+		return nil, nil, ErrPackInvalid
+	}
+	if havePack {
+		if err := scanPackBudget(ctx, in.Pack); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	repo, err := git.Init(memory.NewStorage(), nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("pushbroker: init: %w", err)
+	}
+	remote, err := repo.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{in.CloneURL}})
+	if err != nil {
+		return nil, nil, fmt.Errorf("pushbroker: create remote: %w", err)
+	}
+	auth := authFor(Options{Username: in.Username, PAT: in.PAT})
+
+	want := map[string]string{}
+	addHead := func(b string) {
+		if b != "" {
+			want["refs/heads/"+b] = "refs/remotes/origin/" + b
+		}
+	}
+	workBranch, checkpointKey := checkpointNames(in.Branch, in.WorkBranch, in.CheckpointKey)
+	addHead(workBranch)
+	addHead(in.DefaultBranch)
+	if checkpointKey != "" {
+		want[checkpointRefPrefix+checkpointKey] = checkpointRefPrefix + checkpointKey
+	}
+	for _, b := range in.BaseRefs {
+		if strings.HasPrefix(b, "refs/heads/") {
+			want[b] = "refs/remotes/origin/" + strings.TrimPrefix(b, "refs/heads/")
+		} else {
+			want[b] = b
+		}
+	}
+	for _, b := range in.ExtraBaseRefs {
+		want[b] = b
+	}
+	if err := fetchWantedRefs(ctx, remote, auth, want); err != nil {
+		return nil, nil, err
+	}
+	if havePack {
+		if err := packfile.UpdateObjectStorage(repo.Storer, bytes.NewReader(in.Pack)); err != nil {
+			return nil, nil, fmt.Errorf("pushbroker: apply pack: %w", err)
+		}
+	}
+	tip := plumbing.NewHash(in.Tip)
+	tipCommit, err := object.GetCommit(repo.Storer, tip)
+	if err != nil {
+		if errors.Is(err, plumbing.ErrObjectNotFound) {
+			return nil, nil, ErrTipMissing
+		}
+		return nil, nil, fmt.Errorf("pushbroker: read declared tip: %w", err)
+	}
+	if in.CIConfigGuard {
+		if err := ciConfigGuard(ctx, repo, tipCommit, in.DefaultBranch, in.CIConfigPaths); err != nil {
+			return nil, nil, err
+		}
+	}
+	return repo, tipCommit, nil
 }
