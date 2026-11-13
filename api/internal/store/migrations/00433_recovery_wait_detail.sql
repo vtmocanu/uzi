@@ -1,7 +1,7 @@
 -- Issue #4177: closed-set sub-cause of a retained_recovery_adoption_failed park. The worker
 -- reports it; NULL means unclassified and never permits anything new. secret_remediation_active
 -- means retrying unchanged cannot help (Resume is refused); remediation_proof_unknown means a
--- retry may help. The CHECK is added NOT VALID and validated by 00429 so this holds only a
+-- retry may help. The CHECK is added NOT VALID and validated by 00434 so this holds only a
 -- brief lock.
 
 -- +goose Up
@@ -27,7 +27,7 @@ BEGIN
     WHERE status = 'recovery_wait' AND recovery_wait_cause = 'retained_recovery_adoption_failed'
       AND recovery_wait_detail = 'secret_remediation_active';
     IF n > 0 THEN
-        RAISE EXCEPTION 'refusing to roll back 00428: % run(s) are parked in recovery_wait at retained_recovery_adoption_failed under an active secret remediation; Cancel those runs first', n;
+        RAISE EXCEPTION 'refusing to roll back 00433: % run(s) are parked in recovery_wait at retained_recovery_adoption_failed under an active secret remediation; Cancel those runs first', n;
     END IF;
 END
 $$;

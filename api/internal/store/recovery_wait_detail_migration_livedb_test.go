@@ -12,8 +12,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #4177: migration 00428 adds runs.recovery_wait_detail with a closed-set CHECK installed
-// NOT VALID, 00429 validates it, and 00428's Down refuses while a run is still parked under an
+// Issue #4177: migration 00433 adds runs.recovery_wait_detail with a closed-set CHECK installed
+// NOT VALID, 00434 validates it, and 00433's Down refuses while a run is still parked under an
 // active secret remediation. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 func TestRecoveryWaitDetailMigrationLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "recovery_wait_detail_migration_")
@@ -41,7 +41,7 @@ func TestRecoveryWaitDetailMigrationLiveDB(t *testing.T) {
 	}
 	var valid bool
 	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conrelid='runs'::regclass AND conname='runs_recovery_wait_detail_check'").Scan(&valid); err != nil || valid {
-		t.Fatalf("00428 must install the CHECK NOT VALID: valid=%v err=%v", valid, err)
+		t.Fatalf("00433 must install the CHECK NOT VALID: valid=%v err=%v", valid, err)
 	}
 	_, err = pool.Exec(ctx, "UPDATE runs SET recovery_wait_detail='not_in_the_set' WHERE id=$1", run)
 	var pgerr *pgconn.PgError
@@ -50,13 +50,13 @@ func TestRecoveryWaitDetailMigrationLiveDB(t *testing.T) {
 	}
 	mustExec(ctx, t, pool, "UPDATE runs SET status='recovery_wait', recovery_wait_cause='retained_recovery_adoption_failed', recovery_wait_detail='secret_remediation_active' WHERE id=$1", run)
 
-	b, err := os.ReadFile(filepath.Join("migrations", "00428_recovery_wait_detail.sql"))
+	b, err := os.ReadFile(filepath.Join("migrations", "00433_recovery_wait_detail.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	i := strings.Index(string(b), "-- +goose Down")
 	if i < 0 {
-		t.Fatal("00428 has no Down block")
+		t.Fatal("00433 has no Down block")
 	}
 	down := string(b)[i+len("-- +goose Down"):]
 
@@ -65,7 +65,7 @@ func TestRecoveryWaitDetailMigrationLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, down); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00428") {
+	if _, err := tx.Exec(ctx, down); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00433") {
 		t.Fatalf("Down with a live active park: %v, want refusal", err)
 	}
 	_ = tx.Rollback(ctx)
@@ -94,6 +94,6 @@ func TestRecoveryWaitDetailMigrationLiveDB(t *testing.T) {
 		t.Fatalf("validate: %v", err)
 	}
 	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conrelid='runs'::regclass AND conname='runs_recovery_wait_detail_check'").Scan(&valid); err != nil || !valid {
-		t.Fatalf("00429 must validate the CHECK: valid=%v err=%v", valid, err)
+		t.Fatalf("00434 must validate the CHECK: valid=%v err=%v", valid, err)
 	}
 }

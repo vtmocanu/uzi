@@ -2093,7 +2093,7 @@ secret-scan-flagged commit, retrying unchanged cannot help, so the owner is told
 refused instead of looping through another hold. The #4058 and #3644 holds above are not classified.
 
 **Decision.** A run on `recovery_wait` / `retained_recovery_adoption_failed` may carry a nullable
-`recovery_wait_detail` (migration 00428, a `NOT VALID` CHECK validated by 00429; numbers are re-assigned at
+`recovery_wait_detail` (migration 00433, a `NOT VALID` CHECK validated by 00434; numbers are re-assigned at
 landing), valid only on that status and cause.
 
 **The closed set.**
@@ -2140,7 +2140,7 @@ is NULL after a crash: the park falls back to the generic hold, which is the saf
   `remediation_proof_unknown` where the truth is active). The detail narrows owner options only; it grants
   no authority, and Resume still grants no remediation authority.
 
-**Down migration.** 00428's Down takes `ACCESS EXCLUSIVE` on `runs` under a 5 s `lock_timeout` before
+**Down migration.** 00433's Down takes `ACCESS EXCLUSIVE` on `runs` under a 5 s `lock_timeout` before
 checking, as 00425 does, then refuses while any run is parked on this cause with
 `secret_remediation_active`, because dropping the column would erase the only record that Resume must be
 refused. Cancel those runs first.
