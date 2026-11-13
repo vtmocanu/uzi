@@ -1131,25 +1131,87 @@ func TestInputsDrainForInPlaceWorkerDuringPendingSwitchLiveDB(t *testing.T) {
 	}
 }
 
-// An in-place worker's receipts behave as on an active claim during a pending switch (the drain
-// is not fenced, so the ACK and APPLIED of what it drained must not be), while a v1-only worker
-// keeps switch_pending on its receipts.
+// An in-place worker's /inputs drain is not fenced by a pending switch, so its ACK is not either. Its
+// APPLIED is: an applied row leaves the replay list, so it must wait until the switch has settled in
+// place (a switch ending in a hold, a pause or a crash must leave the row for the next claim). A v1-only
+// worker keeps switch_pending on its receipts.
 func TestReceiptsForInPlaceWorkerDuringPendingSwitchLiveDB(t *testing.T) {
 	f := newApplyFx(t)
-	run, _ := f.run(t, "running")
-	f.env.exec(`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'follow_up', 'steer me')`, run)
-	got, err := f.svc.ConsumeInputs(f.env.ctx, f.worker(t), run)
-	if err != nil || len(got.Inputs) != 1 {
-		t.Fatalf("drain: inputs=%d err=%v", len(got.Inputs), err)
+	replays := func(run uuid.UUID, id int64) bool {
+		t.Helper()
+		rows, err := f.svc.q.ListReplayRunInputs(f.env.ctx, run)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range rows {
+			if r.ID == id {
+				return true
+			}
+		}
+		return false
 	}
-	ids := []int64{got.Inputs[0].ID}
-	res, err := f.svc.AckInputs(f.env.ctx, f.worker(t), run, f.gen, ids)
+	consumed := func(id int64) (gen int64, worker uuid.UUID) {
+		t.Helper()
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT consumed_claim_generation, consumed_worker_id FROM run_user_inputs WHERE id = $1`, id).Scan(&gen, &worker); err != nil {
+			t.Fatal(err)
+		}
+		return gen, worker
+	}
+	drain := func(run uuid.UUID, body string) int64 {
+		t.Helper()
+		f.env.exec(`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'follow_up', $2)`, run, body)
+		got, err := f.svc.ConsumeInputs(f.env.ctx, f.worker(t), run)
+		if err != nil || len(got.Inputs) != 1 {
+			t.Fatalf("drain: inputs=%d err=%v", len(got.Inputs), err)
+		}
+		return got.Inputs[0].ID
+	}
+	var conflict *InputReceiptConflictError
+
+	run, op := f.run(t, "running")
+	id := drain(run, "steer me")
+	res, err := f.svc.AckInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{id})
 	if err != nil || !res.Active || res.Reason != "" {
 		t.Fatalf("in-place ACK during a pending switch: res=%+v err=%v, want active success", res, err)
 	}
-	res, err = f.svc.ApplyInputs(f.env.ctx, f.worker(t), run, f.gen, ids)
-	if err != nil || !res.Active || res.Reason != "" {
-		t.Fatalf("in-place APPLIED during a pending switch: res=%+v err=%v, want active success", res, err)
+	if g, w := consumed(id); g != f.gen || w != f.o.workerID {
+		t.Fatalf("ACK stamped generation %d worker %s, want %d %s", g, w, f.gen, f.o.workerID)
+	}
+	if _, err = f.svc.ApplyInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{id}); !errors.As(err, &conflict) || conflict.Reason != ReceiptSwitchPending {
+		t.Fatalf("in-place APPLIED under the stamp: err=%v, want switch_pending conflict", err)
+	}
+	if !replays(run, id) {
+		t.Fatal("a row ACKed but not APPLIED under the stamp must stay in the replay list")
+	}
+	// Once the switch has settled in place (the stamp is cleared), APPLIED lands and the row leaves replay.
+	f.want(t, f.apply(t, run, f.req(op)), ApplyOutcomeApplied, "")
+	if res, err = f.svc.ApplyInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{id}); err != nil || !res.Active {
+		t.Fatalf("in-place APPLIED after the stamp cleared: res=%+v err=%v", res, err)
+	}
+	if replays(run, id) {
+		t.Fatal("an applied row must leave the replay list")
+	}
+
+	// A switch that ends in the uncertain pause: the row ACKed under the stamp is replayed to the next claim.
+	run3, op3 := f.run(t, "running")
+	id3 := drain(run3, "survive the pause")
+	if _, err = f.svc.AckInputs(f.env.ctx, f.worker(t), run3, f.gen, []int64{id3}); err != nil {
+		t.Fatal(err)
+	}
+	if got, applied, err := f.report(t, f.worker(t), run3, "credential_switch_uncertain", f.gen, applyFixtureNonce, &op3); err != nil || !applied || got.Status != "paused" {
+		t.Fatalf("uncertain: status=%s applied=%v err=%v", got.Status, applied, err)
+	}
+	// Owner Resume and a reclaim at gen+1, emulated by the state they leave behind.
+	f.env.exec(`UPDATE runs SET status = 'running', claim_generation = $2, claim_released_at = NULL,
+	               credential_switch_requested_at = NULL, credential_switch_generation = NULL WHERE id = $1`, run3, f.gen+1)
+	if !replays(run3, id3) {
+		t.Fatal("a row ACKed under a switch that ended in a pause must be replayed to the next claim")
+	}
+	if _, err = f.svc.AckInputs(f.env.ctx, f.worker(t), run3, f.gen+1, []int64{id3}); err != nil {
+		t.Fatalf("ACK on the new claim: %v", err)
+	}
+	if g, _ := consumed(id3); g != f.gen+1 {
+		t.Fatalf("consumed_claim_generation = %d after the new claim's ACK, want %d", g, f.gen+1)
 	}
 
 	// A v1-only worker: the ACK of a fresh row is refused with switch_pending.
@@ -1161,7 +1223,6 @@ func TestReceiptsForInPlaceWorkerDuringPendingSwitchLiveDB(t *testing.T) {
 	}
 	f.env.exec(`UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, f.o.workerID, []string{capability.CredentialSwitchV1, capability.InputReceiptsV1})
 	_, err = f.svc.AckInputs(f.env.ctx, f.worker(t), run2, f.gen, []int64{id2})
-	var conflict *InputReceiptConflictError
 	if !errors.As(err, &conflict) || conflict.Reason != ReceiptSwitchPending {
 		t.Fatalf("v1 ACK during a pending switch: err=%v, want switch_pending conflict", err)
 	}

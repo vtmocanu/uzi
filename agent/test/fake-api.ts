@@ -72,8 +72,8 @@ export class FakeApi {
   /** Runs with a pending switch: GET drains nothing (the server fence) and APPLIED is refused. */
   private readonly switchPendingRuns = new Set<string>();
   /** Issue #4201: the in-place-negotiated server DRAINS inputs (with receipts and the switch signal) while a switch
-   *  is pending, and its ACK, APPLIED and discard are accepted as on an active claim. Off: the v1 contract (GET drains
-   *  nothing; APPLIED for non-revise rows is refused 409 switch_pending). */
+   *  is pending, and its ACK is accepted; APPLIED for non-revise rows is
+   *  still refused 409 switch_pending until the stamp clears. Off: the v1 contract (GET drains nothing). */
   inPlaceInputDrain = false;
   private readonly delayedReceipts = new Map<ReceiptKind, number>();
   /** Issue #1604: a pending switch whose `credential_switch {generation}` signal rides every GET
@@ -1584,9 +1584,9 @@ export class FakeApi {
       const ownReviseOnly =
         active && Array.isArray(ids) && ids.length > 0 &&
         ids.every((id) => rows.some((row) => row.id === id && row.kind === "revise_plan") && ackGens?.get(id) === generation);
-      // An in-place-negotiated server (inPlaceInputDrain) treats the claim as active through the switch: ACK, APPLIED and
-      // discard behave as on an active claim (it keeps its claim, so there is no reclaim for the rows to wait for).
-      if (kind === "applied" && this.switchPendingRuns.has(runId) && !this.inPlaceInputDrain && !ownReviseOnly)
+      // The in-place-negotiated server (inPlaceInputDrain) accepts the ACK of what it drained, but still refuses APPLIED
+      // while the stamp is pending: an applied row leaves replay, so it waits until the switch has settled in place.
+      if (kind === "applied" && this.switchPendingRuns.has(runId) && !ownReviseOnly)
         return sendReceipt(409, { error: "input receipt conflicts with claim", reason: "switch_pending" });
       const delay = this.delayedReceipts.get(kind) ?? 0;
       if (delay > 0) await new Promise((r) => setTimeout(r, delay));

@@ -86,7 +86,7 @@ On the worker, a negotiated Claude flight with a pending op whose in-place route
 
 **Wire rule for the failed report.** An op-carrying `credential_switch_failed` report must carry `register_nonce`: a missing one gets 400, and a stale one (a superseded registration) gets a not-applied 409 that changes nothing. The op-less v1 failed report is unchanged.
 
-**Inputs during a pending switch.** An in-place worker (capabilities `credential_switch_in_place_v1` and `input_receipts_v1`) keeps its claim through the switch, so there is no reclaim for its inputs to wait for. Its `/inputs` drain and its ACK, APPLIED and discard receipts behave as on an active claim while a switch is pending, and the switch signal rides alongside the inputs. A v1 worker keeps the older contract: signal and no drain, and its receipts are refused `switch_pending`.
+**Inputs during a pending switch.** An in-place worker (capabilities `credential_switch_in_place_v1` and `input_receipts_v1`) keeps its claim through the switch, so there is no reclaim for its inputs to wait for. Its `/inputs` drain and its ACK behave as on an active claim while a switch is pending, and the switch signal rides alongside the inputs. Its APPLIED (and discard) receipts do not: they are refused `switch_pending` until the switch has settled in place, because an APPLIED row leaves the replay list. An input drained during a switch that then ends in a hold, an owner pause or a crash therefore stays unapplied and is replayed by the next claim (at-least-once). The existing revise_plan APPLIED and approve_plan discard allowances still apply. A v1 worker keeps the older contract: signal and no drain, and its ACKs and its other receipts are refused `switch_pending`.
 
 ## Owner decisions of 2026-11-12
 
