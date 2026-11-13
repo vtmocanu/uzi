@@ -14,6 +14,7 @@ import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWal
 import { PassThrough } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import { readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -866,6 +867,8 @@ describe("M3 actual runner memory Codex delivery", () => {
       let refTask: Promise<void> | undefined;
       let settleReady: () => void = () => {};
       let signalQueued: (queued: boolean) => void = () => {};
+      let signalHoldRequest: (requested: boolean) => void = () => {};
+      let holdTask: Promise<void> | undefined;
       if (exhausted) {
         // Empty source-only capture: fake effect handles cannot execute Git commands.
         m2Runner.git.worktreeStatus = async () => { captureStatusReads++; return []; };
@@ -1074,15 +1077,42 @@ describe("M3 actual runner memory Codex delivery", () => {
             return facts;
           });
           if (lateCapture) t.mock.method(Date, "now", () => realNow() + skew);
-          let armed = false, holdTaken = false, refState: "pending" | "aborted" | "acquired" = "pending";
+          let armed = false, holdState = "none" as "none" | "held" | "released";
+          let refState = "pending" as "pending" | "aborted" | "acquired", refStarted = false;
+          let decided = "pending" as "pending" | "path1" | "path2", releasedAt: number | undefined;
+          let siblingDeadline: number | undefined, siblingOpSignal: AbortSignal | undefined;
+          void queued.then(started => { refStarted = started; });
+          // Identity of the sibling's bootstrap: a test-owned AsyncLocalStorage marks only calls made inside
+          // runner.bootstrapRemediationRestrictions for the sibling flight, so an owner round never matches.
+          const siblingScope = new AsyncLocalStorage<true>();
+          const bootstrapOriginal = (runner as any).bootstrapRemediationRestrictions.bind(runner) as (...args: any[]) => Promise<unknown>;
+          t.mock.method(runner as any, "bootstrapRemediationRestrictions", (...args: any[]) =>
+            args[0]?.runId === sibling.run_id ? siblingScope.run(true, () => bootstrapOriginal(...args)) : bootstrapOriginal(...args));
           const recoveryOriginal = m2Runner.git.withRecoveryOperation.bind(m2Runner.git) as (...args: unknown[]) => Promise<unknown>;
           const readyWait = new Promise<void>(resolve => { settleReady = resolve; });
+          const holdRequested = new Promise<boolean>(resolve => { signalHoldRequest = resolve; });
+          let holdReady!: () => void;
+          const holdReadyWait = new Promise<void>(resolve => { holdReady = resolve; });
           t.mock.method(gitAny, "withRecoveryOperation", async (...args: unknown[]) => {
             const progress = (args[4] as { restrictionProgress?: { cause?: string } } | undefined)?.restrictionProgress;
-            if (!armed || !progress) return recoveryOriginal(...args);
+            if (!armed || !progress || !siblingScope.getStore()) return recoveryOriginal(...args);
             progresses.push(progress);
-            if (!lateCapture && !holdTaken) {
-              holdTaken = true;
+            siblingDeadline = args[1] as number;
+            const action = args[2] as (signal: AbortSignal) => Promise<unknown>;
+            args = [...args];
+            args[2] = (signal: AbortSignal) => { siblingOpSignal = signal; return action(signal); };
+            if (!lateCapture && holdState === "none") {
+              // The test side takes the hold from its own context, before the sibling's read queues.
+              holdState = "held";
+              signalHoldRequest(true);
+              await holdReadyWait;
+            }
+            return recoveryOriginal(...args);
+          });
+          if (!lateCapture) {
+            // Both tasks start from the test's own async context so they inherit none of the sibling's scope.
+            holdTask = (async () => {
+              if (!await holdRequested) return;
               let openGate!: () => void, acquiredHold!: () => void;
               const holdGate = new Promise<void>(resolve => { openGate = resolve; });
               const acquired = new Promise<void>(resolve => { acquiredHold = resolve; });
@@ -1090,11 +1120,8 @@ describe("M3 actual runner memory Codex delivery", () => {
               holdDone = lockOriginal(bareKey, async () => { acquiredHold(); await holdGate; });
               void holdDone.catch(() => {});
               await Promise.race([acquired, holdDone]);
-            }
-            return recoveryOriginal(...args);
-          });
-          if (!lateCapture) {
-            // Started from the test's own async context so it inherits none of the sibling's operation scope.
+              holdReady();
+            })();
             refTask = (async () => {
               if (!await queued) return;
               try {
@@ -1102,17 +1129,36 @@ describe("M3 actual runner memory Codex delivery", () => {
                   () => lockOriginal(bareKey, async () => undefined));
                 refState = "acquired";
               } catch { refState = "aborted"; }
-              // The abort is the release event. Unfixed path (sibling already expired pre-acquire): keep the
-              // lock until the sibling-ready wait has settled.
-              if (progresses[0]?.cause === "pre_read_unavailable") await readyWait;
+              // The abort is the single decision event. Path 2 (the sibling's own lock wait is already over:
+              // recorded pre-read cause, its effective operation signal aborted, or its deadline reached):
+              // keep the hold until the sibling-ready wait settles. Path 1: release now and restart the
+              // sibling's 3000ms clock from the release.
+              const siblingOver = progresses[0]?.cause === "pre_read_unavailable" ||
+                siblingOpSignal?.aborted === true || (siblingDeadline !== undefined && siblingDeadline <= Date.now());
+              if (siblingOver) { decided = "path2"; await readyWait; }
+              else { releasedAt = performance.now(); decided = "path1"; }
               releaseHold();
+              holdState = "released";
             })();
           }
           armed = true;
+          const executedAt = performance.now();
           siblingWork = runner.execute(sibling);
+          const failure = (error: unknown) => new Error(`${String(error)}; refState=${refState}; hold=${holdState}; decided=${decided}; sibling causes=${JSON.stringify(progresses.map(p => p.cause))}; sibling states=${JSON.stringify(m2Runner.api.states.filter(s => s.runId === sibling.run_id))}; launch/remediation lines=${JSON.stringify(ownerLog.lines.filter(l => /launch round|remediation|restriction/.test(JSON.stringify(l))))}; owner=${JSON.stringify(ownerLog.lines)}`);
           try {
-            await waitFor(() => siblingReady, "independent sibling executes in its own source", 3000, () => performance.now())
-              .catch(error => { throw new Error(`${String(error)}; sibling causes=${JSON.stringify(progresses.map(p => p.cause))}; sibling states=${JSON.stringify(m2Runner.api.states.filter(s => s.runId === sibling.run_id))}; launch/remediation lines=${JSON.stringify(ownerLog.lines.filter(l => /launch round|remediation|restriction/.test(JSON.stringify(l))))}; owner=${JSON.stringify(ownerLog.lines)}`); });
+            if (lateCapture) {
+              await waitFor(() => siblingReady, "independent sibling executes in its own source", 3000, () => performance.now())
+                .catch(error => { throw failure(error); });
+            } else {
+              // 3000ms from execute, except while the hold's release decision is pending (bounded by the
+              // reference waiter's own 1500ms deadline) or after path 1, whose 3000ms starts at the release.
+              while (!siblingReady) {
+                const pendingDecision = decided === "pending" && holdState === "held" && refStarted;
+                const limit = decided === "path1" ? releasedAt! + 3000 : executedAt + 3000;
+                if (!pendingDecision && performance.now() > limit) throw failure(new Error("timed out waiting for independent sibling executes in its own source"));
+                await new Promise<void>(resolve => setImmediate(resolve));
+              }
+            }
           } finally { settleReady(); }
           assert.ok(siblingReads >= 1 && progresses.length >= 1, "sibling performed its restriction-facts read");
           for (const progress of progresses)
@@ -1207,8 +1253,10 @@ describe("M3 actual runner memory Codex delivery", () => {
         releaseCleanup();
         releaseSibling();
         signalQueued(false);
+        signalHoldRequest(false);
         settleReady();
         releaseHold();
+        await holdTask?.catch(() => {});
         await refTask?.catch(() => {});
         releaseHold();
         await holdDone?.catch(() => {});
