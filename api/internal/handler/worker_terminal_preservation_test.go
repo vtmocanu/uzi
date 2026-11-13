@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -124,8 +125,6 @@ func TestWorkerRunTerminalPreservationBodyValidation(t *testing.T) {
 		})},
 		"trailing data":         {termBody(t, nil) + `{}`},
 		"not json":              {"nope"},
-		"no generation":         {termBody(t, func(m map[string]any) { delete(m, "generation") })},
-		"zero generation":       {termBody(t, set("generation", 0))},
 		"negative generation":   {termBody(t, set("generation", -1))},
 		"string generation":     {termBody(t, set("generation", "2"))},
 		"no tip":                {termBody(t, func(m map[string]any) { delete(m, "tip") })},
@@ -183,6 +182,28 @@ func TestWorkerRunTerminalPreservationBodyValidation(t *testing.T) {
 		}
 	})
 
+	// A missing or zero generation is not a malformed body: it reaches the service, whose
+	// ErrMissingClaimGeneration is the 409 missing_claim_generation.
+	for name, mutate := range map[string]func(map[string]any){
+		"missing generation": func(m map[string]any) { delete(m, "generation") },
+		"zero generation":    set("generation", 0),
+	} {
+		t.Run(name+" reaches the service", func(t *testing.T) {
+			f := newFakeTerminalSvc()
+			f.publish = func(_ context.Context, req workersvc.TerminalPublishRequest) (workersvc.TerminalPublishResult, error) {
+				if req.Generation != 0 {
+					t.Errorf("generation = %d, want 0", req.Generation)
+				}
+				return workersvc.TerminalPublishResult{}, workersvc.ErrMissingClaimGeneration
+			}
+			rec := httptest.NewRecorder()
+			terminalHandler(f).WorkerRunTerminalPreservation(rec, termReq(termBody(t, mutate)))
+			if rec.Code != http.StatusConflict || termWireReason(t, rec) != "missing_claim_generation" || f.publishN != 1 {
+				t.Fatalf("status = %d reason %q publish=%d, body %q", rec.Code, termWireReason(t, rec), f.publishN, rec.Body.String())
+			}
+		})
+	}
+
 	t.Run("a body without a pack and without a prior tip is valid", func(t *testing.T) {
 		f := newFakeTerminalSvc()
 		rec := httptest.NewRecorder()
@@ -204,7 +225,7 @@ func TestDecodeTerminalRequestBoundsManifestBeforeParsing(t *testing.T) {
 		return []byte(`{"generation":2,"tip":"` + termHTTPTip + `","disposition":"preserve","manifest":` + m + `}`)
 	}
 	small := manifest(10)
-	if _, err := decodeTerminalRequest(body(small)); err != nil {
+	if _, err := decodeTerminalRequest(bytes.NewReader(body(small))); err != nil {
 		t.Fatalf("a small manifest was refused: %v", err)
 	}
 	// Exactly at the cap: accepted. One byte over: refused, though both parse identically.
@@ -212,7 +233,7 @@ func TestDecodeTerminalRequestBoundsManifestBeforeParsing(t *testing.T) {
 	if len(atCap) != terminalMaxManifestBytes {
 		t.Fatalf("fixture is %d bytes, want %d", len(atCap), terminalMaxManifestBytes)
 	}
-	if _, err := decodeTerminalRequest(body(atCap)); err != nil {
+	if _, err := decodeTerminalRequest(bytes.NewReader(body(atCap))); err != nil {
 		t.Fatalf("a manifest at the cap was refused: %v", err)
 	}
 	var probe apitypes.TerminalManifest
@@ -220,7 +241,7 @@ func TestDecodeTerminalRequestBoundsManifestBeforeParsing(t *testing.T) {
 	if err := json.Unmarshal([]byte(over), &probe); err != nil {
 		t.Fatalf("the oversized manifest must itself be decodable, got %v", err)
 	}
-	_, err := decodeTerminalRequest(body(over))
+	_, err := decodeTerminalRequest(bytes.NewReader(body(over)))
 	if err == nil || !strings.Contains(err.Error(), "too large") {
 		t.Fatalf("an oversized manifest: err = %v, want a too-large refusal", err)
 	}
@@ -311,6 +332,7 @@ func TestWorkerRunTerminalPreservationErrorMapping(t *testing.T) {
 		{"prior_tip_mismatch", refusal(apitypes.TerminalReasonPriorTipMismatch), http.StatusConflict, "prior_tip_mismatch", false},
 		{"preservation_retired", refusal(apitypes.TerminalReasonPreservationRetired), http.StatusConflict, "preservation_retired", false},
 		{"publication_in_flight", refusal(apitypes.TerminalReasonPublicationInFlight), http.StatusConflict, "publication_in_flight", true},
+		{"authority_changed", refusal(apitypes.TerminalReasonAuthorityChanged), http.StatusConflict, "authority_changed", true},
 		{"pack_invalid", refusal(apitypes.TerminalReasonPackInvalid), http.StatusUnprocessableEntity, "pack_invalid", false},
 		{"pack_too_large", refusal(apitypes.TerminalReasonPackTooLarge), http.StatusRequestEntityTooLarge, "pack_too_large", false},
 		{"tip_missing", refusal(apitypes.TerminalReasonTipMissing), http.StatusUnprocessableEntity, "tip_missing", false},

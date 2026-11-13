@@ -46,10 +46,6 @@ func TestTerminalPreservationGateLiveDB(t *testing.T) {
 			other := f.e.seedWorker(t, f.worker.ProtocolCapabilities)
 			f.worker = store.Worker{ID: other, UserID: f.e.userID, ProtocolCapabilities: f.worker.ProtocolCapabilities}
 		}},
-		{"a terminal run with no hold", "hold", func(f *termFix) {
-			f.rawHold(`UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL,
-				released_at=now() WHERE id=$1`)
-		}},
 		{"an unknown run", "flight", func(f *termFix) { f.run = uuid.New() }},
 	}
 	for _, tc := range refused {
@@ -61,6 +57,76 @@ func TestTerminalPreservationGateLiveDB(t *testing.T) {
 			}
 			f.assertNothing(tc.name)
 		})
+	}
+}
+
+// The worker's OWN run that is terminal, or whose claim is released, and that has no hold of this
+// worker gets the typed refusal (unsupported / stale_claim), not a 404, with no body read and no
+// write. A run the worker does not own stays ErrRunNotOwned (above).
+func TestTerminalPreservationGateOwnRunRefusalsLiveDB(t *testing.T) {
+	releasedHold := `UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL,
+		released_at=now() WHERE id=$1`
+	cases := []struct {
+		name   string
+		mode   string
+		mutate func(f *termFix)
+		check  func(err error) bool
+	}{
+		{"a completed run still naming the worker, no hold", "flight", func(f *termFix) {
+			f.e.exec(t, `UPDATE runs SET status='completed' WHERE id=$1`, f.run)
+		}, func(err error) bool { return termReasonOf(err) == apitypes.TerminalReasonUnsupported }},
+		{"a failed run with its claim released and no hold", "hold", func(f *termFix) { f.rawHold(releasedHold) },
+			func(err error) bool { return errors.Is(err, ErrStaleClaim) }},
+		{"a running run whose claim is released, no hold", "flight", func(f *termFix) {
+			f.e.exec(t, `UPDATE runs SET claim_released_at=now() WHERE id=$1`, f.run)
+		}, func(err error) bool { return errors.Is(err, ErrStaleClaim) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTermFix(t, tc.mode)
+			tc.mutate(f)
+			if err := f.svc.TerminalPreservationGate(f.e.ctx, f.worker, f.run); !tc.check(err) {
+				t.Fatalf("gate = %v", err)
+			}
+			f.assertNothing(tc.name)
+		})
+	}
+}
+
+func termReasonOf(err error) string {
+	var r *TerminalRefusal
+	if errors.As(err, &r) {
+		return r.Reason
+	}
+	return ""
+}
+
+// The reconciliation fence is the other way the flight lock path can refuse after a current_flight
+// pre-check: a run_milestone_reconciliations row makes beginClaimMutation return ErrStaleClaim. That
+// too is the retryable authority_changed, so the retry can be classified afresh.
+func TestTerminalAuthorityChangedOnReconciliationFenceLiveDB(t *testing.T) {
+	f := newTermFix(t, "flight")
+	var input int64
+	if err := f.e.pool.QueryRow(f.e.ctx, `INSERT INTO run_user_inputs(run_id, kind, body) VALUES ($1, 'approve_plan', '') RETURNING id`, f.run).Scan(&input); err != nil {
+		t.Fatal(err)
+	}
+	f.e.exec(t, `INSERT INTO run_milestone_reconciliations(id, run_id, owner_id, gate_revision, presentation_id,
+		gate_digest, reset_state_digest, worker_id, claim_generation, reason, consent, before_state, after_state,
+		applied_input_id, stop_cutoff)
+		VALUES ($1, $2, $3, 1, $4, $5, 'fixture', $6, 1, 'fixture', '{}', '{}', '{}', $7, $7)`,
+		uuid.New(), f.run, f.e.userID, uuid.New(), []byte{1}, f.worker.ID, input)
+	_, err := f.publish(f.req(1, termTip1, ""))
+	if r := termReason(t, err); r != apitypes.TerminalReasonAuthorityChanged {
+		t.Fatalf("err = %v, want authority_changed (a stale_claim would tell the worker to stop)", err)
+	}
+	if _, ok := f.pres(); ok {
+		t.Fatal("a refused bind left a preservation row")
+	}
+	if _, ok := f.con(1); ok {
+		t.Fatal("a refused bind left a contribution row")
+	}
+	if _, sends, _ := f.fake.counts(); sends != 0 {
+		t.Fatalf("sends = %d, want 0", sends)
 	}
 }
 

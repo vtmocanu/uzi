@@ -425,6 +425,12 @@ func TestTerminalCurrentFlightRefusalsLiveDB(t *testing.T) {
 		{"paused run", 1, `UPDATE runs SET status='paused' WHERE id=$1`, nil, apitypes.TerminalReasonUnsupported},
 		{"push_secret_blocked", 1, `UPDATE runs SET fail_origin='push_secret_blocked' WHERE id=$1`, nil, apitypes.TerminalReasonExcludedOrigin},
 		{"another worker's run", 1, "other", nil, apitypes.TerminalReasonHoldMissing},
+		// The current_flight scope is the held run kinds: a running cross_check run (claim generation 1,
+		// so it is not the generation-0 NotOwned shape) is unsupported. The egress-profile refusal
+		// (run.EgressProfileID.Valid) has no row here: only an isolated-lane worker passes the lane
+		// check for a profile-bound run, and seeding the profile and lane is not cheap with this fixture.
+		{"cross_check run", 1, `UPDATE runs SET kind='cross_check', harness='codex', issue_iid=NULL, target_run_id=id,
+			report_only=true, budget_wall_seconds=3600 WHERE id=$1`, nil, apitypes.TerminalReasonUnsupported},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -712,6 +718,64 @@ func TestTerminalTx1CommitErrorSendsNothingLiveDB(t *testing.T) {
 	}
 	if _, sends, _ := f.fake.counts(); sends != 1 {
 		t.Fatalf("sends = %d, want 1", sends)
+	}
+}
+
+// A tx1 COMMIT that reports an error even though it landed (a lost ACK): this request is not the
+// winner and sends nothing. The marker is durable, so a retry only reconciles and still never sends.
+func TestTerminalTx1CommitAckLostSendsNothingLiveDB(t *testing.T) {
+	f := newTermFix(t, "flight")
+	calls := 0
+	f.svc.terminal.afterCommit = func(err error) error {
+		calls++
+		if err != nil {
+			return err
+		}
+		return errors.New("injected lost commit acknowledgement")
+	}
+	if _, err := f.publish(f.req(1, termTip1, "")); err == nil {
+		t.Fatal("want the commit error")
+	}
+	if calls != 1 {
+		t.Fatalf("afterCommit calls = %d, want 1", calls)
+	}
+	if _, sends, _ := f.fake.counts(); sends != 0 {
+		t.Fatalf("sends = %d after an unacknowledged commit, want 0", sends)
+	}
+	p, _ := f.pres()
+	c, _ := f.con(1)
+	if p.State != "publishing" || c.State != "invoked" {
+		t.Fatalf("the commit landed: preservation=%s contribution=%s, want publishing/invoked", p.State, c.State)
+	}
+	f.svc.terminal.afterCommit = nil
+	res, err := f.publish(f.req(1, termTip1, ""))
+	if err != nil || res.State != "invoked" {
+		t.Fatalf("retry = %+v, %v", res, err)
+	}
+	if _, sends, _ := f.fake.counts(); sends != 0 {
+		t.Fatalf("sends = %d after the retry, want 0: it only reconciles", sends)
+	}
+}
+
+// A guarded hold that settles after tx1 committed suppresses the send, and the contribution is
+// recorded publish_unknown (tx2) so the sweep's reconcile lane owns it.
+func TestTerminalHoldSettledAfterTx1RecordsUnknownLiveDB(t *testing.T) {
+	f := newTermFix(t, "hold")
+	f.svc.terminal.beforeSend = func() {
+		f.rawHold(`UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL,
+			released_at=now() WHERE id=$1`)
+	}
+	res, err := f.publish(f.req(1, termTip1, ""))
+	if err != nil || res.State != "publish_unknown" || res.PreservationState != "publishing" {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	if _, sends, _ := f.fake.counts(); sends != 0 {
+		t.Fatalf("sends = %d, want 0: a settled hold suppresses the send", sends)
+	}
+	c, _ := f.con(1)
+	p, _ := f.pres()
+	if c.State != "publish_unknown" || p.State != "publishing" || !p.LastError.Valid || !p.NextCheckAt.Valid {
+		t.Fatalf("contribution=%s preservation=%+v, want publish_unknown, publishing, scheduled with a last_error", c.State, p)
 	}
 }
 

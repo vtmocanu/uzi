@@ -98,22 +98,27 @@ func (h *Handler) WorkerRunTerminalPreservation(w http.ResponseWriter, r *http.R
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(start.Add(heldUploadBudget))
 	_ = rc.SetWriteDeadline(start.Add(heldUploadBudget + heldServiceBudget + heldResponseGrace))
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, terminalMaxBodyBytes))
+	// The body is decoded straight from the size-capped reader: there is no separate full-body []byte
+	// and no string copy of the pack. Worst-case per-upload buffer budget: the json.Decoder's internal
+	// buffer holding the base64 text (up to ~85.4 MiB, transiently up to twice that while it grows)
+	// plus the decoded pack (up to 64 MiB). Held step A buffers one raw pack of up to 64 MiB, so a
+	// terminal upload costs roughly 2.3x to 3.7x of one held upload, bounded by the shared slot pool.
+	rd := &readErrTracker{r: http.MaxBytesReader(w, r.Body, terminalMaxBodyBytes)}
+	req, err := decodeTerminalRequest(rd)
 	if err != nil {
-		var tooLarge *http.MaxBytesError
-		var netErr net.Error
-		switch {
-		case errors.As(err, &tooLarge):
-			httpx.ErrorReason(w, http.StatusRequestEntityTooLarge, "terminal preservation body too large", apitypes.TerminalReasonPackTooLarge)
-		case errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()):
-			httpx.Error(w, http.StatusRequestTimeout, "terminal preservation upload timed out")
-		default:
-			httpx.Error(w, http.StatusBadRequest, "could not read terminal preservation body")
+		if rd.err != nil && !errors.Is(rd.err, io.EOF) {
+			var tooLarge *http.MaxBytesError
+			var netErr net.Error
+			switch {
+			case errors.As(rd.err, &tooLarge):
+				httpx.ErrorReason(w, http.StatusRequestEntityTooLarge, "terminal preservation body too large", apitypes.TerminalReasonPackTooLarge)
+			case errors.Is(rd.err, os.ErrDeadlineExceeded) || (errors.As(rd.err, &netErr) && netErr.Timeout()):
+				httpx.Error(w, http.StatusRequestTimeout, "terminal preservation upload timed out")
+			default:
+				httpx.Error(w, http.StatusBadRequest, "could not read terminal preservation body")
+			}
+			return
 		}
-		return
-	}
-	req, err := decodeTerminalRequest(body)
-	if err != nil {
 		httpx.ErrorReason(w, http.StatusBadRequest, err.Error(), "invalid_request")
 		return
 	}
@@ -138,7 +143,25 @@ type terminalEnvelope struct {
 	PriorTip    string          `json:"prior_tip,omitempty"`
 	Manifest    json.RawMessage `json:"manifest"`
 	Disposition string          `json:"disposition"`
-	Pack        string          `json:"pack,omitempty"`
+	// Pack is decoded from its standard-base64 text by encoding/json directly into bytes, so no string
+	// copy of the (up to ~85 MiB) text is made. The wire form is apitypes.TerminalPreservationRequest.Pack.
+	Pack []byte `json:"pack,omitempty"`
+}
+
+// readErrTracker remembers the first non-nil error its reader returned, so the caller can tell a
+// transport failure (a cap hit, a deadline) from a malformed body after the decoder has wrapped or
+// swallowed it.
+type readErrTracker struct {
+	r   io.Reader
+	err error
+}
+
+func (t *readErrTracker) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if err != nil && t.err == nil {
+		t.err = err
+	}
+	return n, err
 }
 
 // decodeTerminalRequest strictly decodes and validates the body: unknown fields (at any depth) and
@@ -146,9 +169,9 @@ type terminalEnvelope struct {
 // parsed, the generation is required, the tips are 40-hex, the disposition is preserve, the
 // manifest entry counts are within their caps and the pack is standard base64. The manifest's own
 // run, generation and worker are checked by the service against the authenticated values.
-func decodeTerminalRequest(body []byte) (workersvc.TerminalPublishRequest, error) {
+func decodeTerminalRequest(body io.Reader) (workersvc.TerminalPublishRequest, error) {
 	var top terminalEnvelope
-	dec := json.NewDecoder(bytes.NewReader(body))
+	dec := json.NewDecoder(body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&top); err != nil {
 		return workersvc.TerminalPublishRequest{}, errors.New("invalid terminal preservation body")
@@ -160,7 +183,7 @@ func decodeTerminalRequest(body []byte) (workersvc.TerminalPublishRequest, error
 		return workersvc.TerminalPublishRequest{}, errors.New("terminal manifest too large")
 	}
 	in := apitypes.TerminalPreservationRequest{
-		Generation: top.Generation, Tip: top.Tip, PriorTip: top.PriorTip, Disposition: top.Disposition, Pack: top.Pack,
+		Generation: top.Generation, Tip: top.Tip, PriorTip: top.PriorTip, Disposition: top.Disposition,
 	}
 	mdec := json.NewDecoder(bytes.NewReader(top.Manifest))
 	mdec.DisallowUnknownFields()
@@ -171,7 +194,9 @@ func decodeTerminalRequest(body []byte) (workersvc.TerminalPublishRequest, error
 		return workersvc.TerminalPublishRequest{}, errors.New("invalid terminal preservation manifest")
 	}
 	switch {
-	case in.Generation < 1:
+	case in.Generation < 0:
+		// A missing or zero generation is not a malformed body: it reaches the service, which answers
+		// ErrMissingClaimGeneration (409 missing_claim_generation).
 		return workersvc.TerminalPublishRequest{}, errors.New("invalid terminal generation")
 	case !terminalTipRe.MatchString(in.Tip):
 		return workersvc.TerminalPublishRequest{}, errors.New("invalid terminal tip")
@@ -182,18 +207,11 @@ func decodeTerminalRequest(body []byte) (workersvc.TerminalPublishRequest, error
 	case len(in.Manifest.Roots) > apitypes.TerminalManifestMaxRoots || len(in.Manifest.Abandoned) > apitypes.TerminalManifestMaxAbandoned:
 		return workersvc.TerminalPublishRequest{}, errors.New("terminal manifest has too many entries")
 	}
-	var pack []byte
-	if in.Pack != "" {
-		var err error
-		if pack, err = base64.StdEncoding.DecodeString(in.Pack); err != nil {
-			return workersvc.TerminalPublishRequest{}, errors.New("invalid terminal pack encoding")
-		}
-		if len(pack) > maxPackBytes {
-			return workersvc.TerminalPublishRequest{}, errors.New("terminal pack too large")
-		}
+	if len(top.Pack) > maxPackBytes {
+		return workersvc.TerminalPublishRequest{}, errors.New("terminal pack too large")
 	}
 	return workersvc.TerminalPublishRequest{
-		Generation: in.Generation, Tip: in.Tip, PriorTip: in.PriorTip, Manifest: in.Manifest, Pack: pack,
+		Generation: in.Generation, Tip: in.Tip, PriorTip: in.PriorTip, Manifest: in.Manifest, Pack: top.Pack,
 	}, nil
 }
 
@@ -220,7 +238,7 @@ func writeTerminalError(w http.ResponseWriter, runID uuid.UUID, wkr store.Worker
 		case apitypes.TerminalReasonForgeUnavailable:
 			status = http.StatusServiceUnavailable
 			w.Header().Set("Retry-After", "30")
-		case apitypes.TerminalReasonPublicationInFlight:
+		case apitypes.TerminalReasonPublicationInFlight, apitypes.TerminalReasonAuthorityChanged:
 			w.Header().Set("Retry-After", "30")
 		}
 		httpx.ErrorReason(w, status, "terminal preservation refused", refusal.Reason)

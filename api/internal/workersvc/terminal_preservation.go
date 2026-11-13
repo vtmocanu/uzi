@@ -137,10 +137,11 @@ type terminalHooks struct {
 	sendCreate   func(context.Context, *pushbroker.PreparedTerminalPack) (pushbroker.TerminalOutcome, error)
 	sendUpdate   func(context.Context, *pushbroker.PreparedTerminalPack) (pushbroker.TerminalOutcome, error)
 	list         func(context.Context, pushbroker.ListRefsOptions, uuid.UUID) (string, bool, error)
-	beforeCommit func() error // inside tx1, after the writes and before its COMMIT
-	beforeBind   func()       // after the unlocked pre-checks, before tx1 begins
-	beforeSend   func()       // after tx1 committed, before the push
-	outcome      func() error // inside tx2, before its COMMIT
+	beforeCommit func() error      // inside tx1, after the writes and before its COMMIT
+	afterCommit  func(error) error // given tx1's winner COMMIT result; may turn success into an error (a lost ACK)
+	beforeBind   func()            // after the unlocked pre-checks, before tx1 begins
+	beforeSend   func()            // after tx1 committed, before the push
+	outcome      func() error      // inside tx2, before its COMMIT
 }
 
 func (h terminalHooks) prepareFn() func(context.Context, pushbroker.TerminalPackOptions) (*pushbroker.PreparedTerminalPack, error) {
@@ -290,17 +291,30 @@ func (s *Service) TerminalPreservationGate(ctx context.Context, wkr store.Worker
 	if (run.Kind == "cross_check" && run.ClaimGeneration == 0) || laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
 		return ErrRunNotOwned
 	}
-	if run.WorkerID == pgconv.UUID(wkr.ID) && (run.Status == "claimed" || run.Status == "running") {
+	own := run.WorkerID == pgconv.UUID(wkr.ID)
+	if own && !run.ClaimReleasedAt.Valid && (run.Status == "claimed" || run.Status == "running") {
+		if terminalFlightKindRefused(run) {
+			return terminalRefuse(apitypes.TerminalReasonUnsupported)
+		}
 		return nil
 	}
 	held, err := tr.HasOpenGuardedHoldForWorker(ctx, store.HasOpenGuardedHoldForWorkerParams{RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID})
 	if err != nil {
 		return fmt.Errorf("terminal preservation hold: %w", err)
 	}
-	if !held {
+	if held {
+		return nil
+	}
+	if !own {
 		return ErrRunNotOwned
 	}
-	return nil
+	// The worker's own run, with no hold: the typed refusals terminalAuthority gives a request
+	// that carries a generation. A released claim is stale (the worker stops silently); a status
+	// the flight does not allow is unsupported.
+	if run.ClaimReleasedAt.Valid {
+		return ErrStaleClaim
+	}
+	return terminalRefuse(apitypes.TerminalReasonUnsupported)
 }
 
 // canonicalTerminalManifest validates m against the authenticated run, generation and worker,
@@ -381,7 +395,16 @@ func terminalFlightEligible(wkr store.Worker, run store.Run, generation int64) (
 	if run.Status != "claimed" && run.Status != "running" {
 		return false, terminalRefuse(apitypes.TerminalReasonUnsupported)
 	}
+	if terminalFlightKindRefused(run) {
+		return false, terminalRefuse(apitypes.TerminalReasonUnsupported)
+	}
 	return true, nil
+}
+
+// terminalFlightKindRefused is the current_flight scope: the run kinds held publication supports
+// (heldHoldKinds), and never a run bound to an egress profile. Both are unsupported.
+func terminalFlightKindRefused(run store.Run) bool {
+	return !slices.Contains(heldHoldKinds, run.Kind) || run.EgressProfileID.Valid
 }
 
 // terminalHoldScope is the open_guarded_hold predicate set, the held V2 predicates of heldScope: a
@@ -484,6 +507,11 @@ func terminalResult(p store.RunTerminalPreservation, c store.RunTerminalContribu
 func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID uuid.UUID, req TerminalPublishRequest) (TerminalPublishResult, error) {
 	if err := s.TerminalPreservationAdmit(wkr); err != nil {
 		return TerminalPublishResult{}, err
+	}
+	// The generation is required; checked before the manifest so a missing one is not reported as a
+	// manifest mismatch.
+	if req.Generation <= 0 {
+		return TerminalPublishResult{}, ErrMissingClaimGeneration
 	}
 	canon, digest, roots, refusal := canonicalTerminalManifest(req.Manifest, runID, wkr.ID, req.Generation)
 	if refusal != nil {
@@ -600,23 +628,31 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 	if s.terminal.beforeSend != nil {
 		s.terminal.beforeSend()
 	}
+	// suppressed is why the send is skipped; a skipped send is recorded as publish_unknown (tx2), the
+	// step-5 "otherwise" outcome, so the sweep's reconcile lane owns it. Never resend.
+	suppressed := ""
 	if bound.authority == terminalAuthorityGuardedHold {
-		// A settlement observed here suppresses the send but preserves the invocation marker. A failed
-		// read also fails closed. Reconciliation owns this unknown outcome; never resend.
+		// A settlement observed here suppresses the send. A failed read also fails closed.
 		hold, herr := tr.GetHeldPublicationHold(ctx, store.GetHeldPublicationHoldParams{
 			RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID, Generation: req.Generation,
 		})
 		if herr != nil || !bound.con.HoldID.Valid || hold.ID != uuid.UUID(bound.con.HoldID.Bytes) || terminalHoldScope(wkr, bound.run, hold, true, req.Generation) != nil {
-			return terminalResult(bound.pres, bound.con), nil
+			suppressed = "send suppressed: the guarded hold settled after the invoke marker"
 		}
+	}
+	if suppressed == "" && prepared == nil {
+		suppressed = "send suppressed: no prepared pack"
 	}
 	var (
 		outcome pushbroker.TerminalOutcome
 		sendErr error
 	)
-	if req.PriorTip == "" {
+	switch {
+	case suppressed != "":
+		outcome, sendErr = pushbroker.TerminalUnknown, errors.New(suppressed)
+	case req.PriorTip == "":
 		outcome, sendErr = s.terminal.sendCreateFn()(ctx, prepared)
-	} else {
+	default:
 		outcome, sendErr = s.terminal.sendUpdateFn()(ctx, prepared)
 	}
 	rec := terminalOutcomeRecord{outcome: outcome}
@@ -790,8 +826,11 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 		g := req.Generation
 		var locked store.Run
 		_, locked, tx, err = s.beginClaimMutation(ctx, wkr, runID, &g)
-		if errors.Is(err, ErrRunNotOwned) {
-			// The pre-check found the run on this worker, so the claim moved since: the class changed.
+		if errors.Is(err, ErrRunNotOwned) || errors.Is(err, ErrStaleClaim) {
+			// The pre-check found the run on this worker as a live flight, so the claim moved since, or
+			// the reconciliation fence (validateReconciledGeneration, when a run_milestone_reconciliations
+			// row exists) now refuses it: the class changed. The retry is classified afresh (for example
+			// onto open_guarded_hold).
 			return b, terminalRefuse(apitypes.TerminalReasonAuthorityChanged)
 		}
 		if err != nil {
@@ -970,7 +1009,11 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 			return b, err
 		}
 	}
-	if err = tx.Commit(ctx); err != nil {
+	err = tx.Commit(ctx)
+	if s.terminal.afterCommit != nil {
+		err = s.terminal.afterCommit(err)
+	}
+	if err != nil {
 		// The COMMIT result is unknown: the marker may or may not be durable. This request is NOT the
 		// winner and never sends; a retry reads the row and either reconciles or wins afresh.
 		return b, fmt.Errorf("terminal preservation commit: %w", err)
