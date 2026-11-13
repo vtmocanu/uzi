@@ -6643,7 +6643,7 @@ export class RunRunner {
         }
         // Issue #4201 (R2): an apply-negotiated worker never releases or requeues here. The executor has
         // unwound, so the proof decides between option A (proven) and the hold fence (unproven).
-        const escaped = this.inPlaceSwitchContext(claim, flight);
+        const escaped = this.inPlaceSwitchContext(claim, flight) ?? this.closedInPlaceSwitch(claim, flight);
         if (escaped) {
           try {
             await this.escapedInPlaceSwitch(flight, runLog, escaped);
@@ -27026,7 +27026,18 @@ export class RunRunner {
     claim: ClaimResponse, flight: RunFlight, runLog: Logger, site: InPlaceSwitchSite, laneSettled: boolean,
   ): Promise<InPlaceSwitchOutcome> {
     const fixed = this.inPlaceSwitchContext(claim, flight);
-    if (!fixed) return { kind: "v1_release" };
+    if (!fixed) {
+      // A negotiated worker whose route is closed for this flight (a restore predecessor, a completed
+      // retained successor, no ledger or holder) must not release: the api refuses the v1 release for it.
+      const closed = this.closedInPlaceSwitch(claim, flight);
+      if (!closed) return { kind: "v1_release" };
+      try {
+        return await this.escapedInPlaceSwitch(flight, runLog, closed, laneSettled);
+      } catch (error) {
+        if (isRunOwnershipLost(error, flight.runId)) return { kind: "stale_stop" };
+        throw error;
+      }
+    }
     try {
       return await this.runInPlaceSwitch(flight, runLog, site, laneSettled, fixed);
     } catch (error) {
@@ -27048,6 +27059,21 @@ export class RunRunner {
       Number.isSafeInteger(generation) && generation! > 0 &&
       this.client.supportsInPlaceCredentialSwitch() && !this.isCodexCapture(claim, flight) &&
       flight.restorePredecessor === undefined && !flight.completedRetainedSuccessor;
+  }
+
+  /**
+   * A pending, op-fenced switch on this claim's generation for a worker that negotiated in-place apply,
+   * on a flight whose in-place route is closed (see inPlaceRouteOpen). Such a flight never takes the v1
+   * release or an op-less hold: the api refuses both with `credential_switch_release_retired`. It gets the
+   * escaped-arm treatment instead (proof, then option A or the op-fenced hold). Without the negotiated
+   * capability, or without a pending op, it is `undefined` and the v1 path stays as it was.
+   */
+  private closedInPlaceSwitch(claim: ClaimResponse, flight: RunFlight): { opId: string; retained: boolean } | undefined {
+    const pending = flight.steering.pendingCredentialSwitchOp();
+    if (!this.client.supportsInPlaceCredentialSwitch() || pending?.opId === undefined ||
+        pending.generation !== flight.claimGeneration || this.inPlaceRouteOpen(claim, flight)) return undefined;
+    const retained = flight.retainedEpisode === true || flight.retainedLocalCustody === true || flight.retainedEpisodeCustody === true;
+    return { opId: pending.opId, retained };
   }
 
   private inPlaceSwitchContext(claim: ClaimResponse, flight: RunFlight): InPlaceSwitchContext | undefined {
@@ -27076,8 +27102,8 @@ export class RunRunner {
    * StaleClaimError) for executeClaim's dispatch; any other failure leaves the run non-terminal with its work retained.
    */
   private async escapedInPlaceSwitch(
-    flight: RunFlight, runLog: Logger, fixed: { opId: string; retained: boolean },
-  ): Promise<void> {
+    flight: RunFlight, runLog: Logger, fixed: { opId: string; retained: boolean }, laneSettledIn?: boolean,
+  ): Promise<InPlaceSwitchOutcome> {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
@@ -27091,19 +27117,20 @@ export class RunRunner {
     };
     try {
       identity();
-      const laneSettled = flight.executor.laneSettlementProven?.() ?? true;
+      const laneSettled = laneSettledIn ?? flight.executor.laneSettlementProven?.() ?? true;
       const proof = await this.settleSwitchQuiescence(flight, identity,
         fixed.retained ? "retained_credential_switch" : "in_place_credential_switch", laneSettled);
       const opId = flight.steering.pendingCredentialSwitchOp()?.opId ?? fixed.opId;
       if (!proof.settled) {
-        await this.holdRetainedSwitch(flight, runLog, lifecycle, identity, proof.detail, proof.survivors,
+        const disposition = await this.holdRetainedSwitch(flight, runLog, lifecycle, identity, proof.detail, proof.survivors,
           { opId, attempts: IN_PLACE_REPORT_ATTEMPTS });
-        return;
+        return { kind: "fence_held", held: disposition === "held" };
       }
       const outcome = await this.inPlaceOptionA(flight, runLog, opId, undefined, lifecycle, identity);
       if (outcome.kind === "option_a") {
         runLog.info("credential switch escaped the executor; run paused for the owner (outcome uncertain), work and custody kept", { run_id: flight.runId });
       }
+      return outcome;
     } catch (error) {
       // Mapped as runInPlaceSwitch's caller maps them: a lifecycle stop (cancel, fence, shutdown, an owner
       // pause) is rethrown so executeClaim's dispatch keeps its precedence; ownership loss is a stale stop.
@@ -27112,6 +27139,7 @@ export class RunRunner {
       runLog.warn("credential switch escaped the executor and could not be settled; work and custody retained, run left non-terminal", {
         run_id: flight.runId, error: errMessage(error),
       });
+      return { kind: "retained_stop" };
     }
   }
 
@@ -27334,6 +27362,11 @@ export class RunRunner {
   ): Promise<InPlaceSwitchOutcome> {
     // `hold` is absent on the escaped arm (R2), where nothing was applied and no hold was opened.
     if (hold) this.releaseHoldPastPossibleApply(hold, flight, runLog);
+    // The owner-pause feed line is the worker's own frame, emitted once here (not per report retry) at a
+    // seq the worker owns, after the held frames were released past the possible apply.
+    flight.batcher.emit({ kind: "credential_switch_uncertain", agent: "worker", payload: {
+      op_id: opId, generation: flight.claimGeneration,
+    } });
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;

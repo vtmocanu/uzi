@@ -2039,10 +2039,6 @@ type Service struct {
 	// the window in which a concurrent provision can bind another ephemeral worker to the claimed
 	// run. TEST-ONLY: nil in production, where the call is skipped.
 	leaseClaimWindow func()
-	// uncertainMessage is the credential_switch_uncertain feed message a fresh uncertain hold inserted
-	// in the claim-locked transaction, parked on that transaction's bound service for SetState to
-	// broadcast after the commit. Never copied by boundClaimControlService.
-	uncertainMessage *pendingSwitchBroadcast
 	// completionInterlock reads the completion-interlock switch createRun consults to decide
 	// whether to stamp completion_contract_version=1 on a new unseeded issue
 	// run (PRD #1226 M1, D1; #1626). Optional (nil-safe); set via
@@ -4735,9 +4731,6 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				"run", runID, "worker", wkr.ID, "generation", current.ClaimGeneration)
 		}
 		if applied && s.bcast != nil {
-			if m := locked.uncertainMessage; m != nil {
-				s.bcast.PublishMessage(runID, m.seq, credentialSwitchUncertainMessageKind, "", "", "", m.payload, s.now())
-			}
 			s.bcast.PublishState(runID, current.Status)
 		}
 		// clarification_settled skips s.notify: the run returns to the gate it already
@@ -4816,7 +4809,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		return s.settleCredentialSwitchHold(ctx, owned, wkr, req)
 	}
 	if req.State == stateCredentialSwitchUncertain {
-		return s.uncertainCredentialSwitch(ctx, owned, wkr, req, parentTx)
+		return s.uncertainCredentialSwitch(ctx, owned, wkr, req)
 	}
 	if req.State == stateClarificationSettled {
 		return s.settleClarificationToGate(ctx, owned, wkr, req)

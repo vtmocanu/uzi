@@ -391,7 +391,11 @@ export type MessageKind =
    *  (Decision 8). Emitted by the runner instead of `paused`; the run stays running. Payload
    *  `{ text: string }` — the human-readable reason, WORKER-authored (the server carries none
    *  on the pause_failed report). A free-form run_messages kind. */
-  | "pause_failed";
+  | "pause_failed"
+  /** Issue #4201: the worker's own feed line for an in-place credential switch whose outcome it could
+   *  not establish (option A, an owner pause). Payload `{ op_id, generation }`. Worker-emitted through
+   *  the batcher so it takes a seq the worker owns; the api writes no such message. */
+  | "credential_switch_uncertain";
 
 /** run_user_inputs.kind (PRD #4 §Schema; PRD #41 adds `revise_plan` — the user asks
  *  for a new plan version at the gate, body = their feedback text; PRD #88 adds

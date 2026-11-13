@@ -908,27 +908,6 @@ func TestCredentialSwitchFailedWithOpLiveDB(t *testing.T) {
 func TestCredentialSwitchUncertainLiveDB(t *testing.T) {
 	f := newApplyFx(t)
 	w := f.worker(t)
-	// uncertainMsgs returns the run's credential_switch_uncertain feed messages (seq, payload JSON).
-	uncertainMsgs := func(t *testing.T, run uuid.UUID) (seqs []int32, payloads []string) {
-		t.Helper()
-		rows, err := f.env.pool.Query(f.env.ctx, `SELECT seq, payload::text FROM run_messages WHERE run_id = $1 AND kind = 'credential_switch_uncertain' ORDER BY seq`, run)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var seq int32
-			var p string
-			if err := rows.Scan(&seq, &p); err != nil {
-				t.Fatal(err)
-			}
-			seqs, payloads = append(seqs, seq), append(payloads, p)
-		}
-		if err := rows.Err(); err != nil {
-			t.Fatal(err)
-		}
-		return seqs, payloads
-	}
 	for _, status := range []string{"running", "awaiting_approval"} {
 		t.Run(status+" parks paused with no hold reason", func(t *testing.T) {
 			run, op := f.run(t, status)
@@ -937,22 +916,14 @@ func TestCredentialSwitchUncertainLiveDB(t *testing.T) {
 			if err != nil || !applied || got.Status != "paused" || got.HoldReason.Valid || !got.WorkerID.Valid || got.OpenQuestionID.String != "q-9" || got.ClaimReleasedAt.Valid {
 				t.Fatalf("uncertain: status=%s hold=%v worker=%v question=%v applied=%v err=%v", got.Status, got.HoldReason, got.WorkerID, got.OpenQuestionID, applied, err)
 			}
-			seqs, payloads := uncertainMsgs(t, run)
-			if len(seqs) != 1 {
-				t.Fatalf("after the fresh hold: %d credential_switch_uncertain messages, want exactly 1", len(seqs))
-			}
-			want := fmt.Sprintf(`{"op_id": %q, "generation": %d}`, op.String(), f.gen)
-			if payloads[0] != want {
-				t.Fatalf("payload = %s, want %s", payloads[0], want)
-			}
-			if got := mustRun(t, f.env, run).LastSeq; got != seqs[0] {
-				t.Fatalf("last_seq = %d, want the message seq %d", got, seqs[0])
+			// The worker emits the feed message through its own batcher at a seq it owns; the server
+			// writes none, so it cannot collide with the worker's live frames.
+			var n int
+			if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*) FROM run_messages WHERE run_id = $1 AND kind = 'credential_switch_uncertain'`, run).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("server-written credential_switch_uncertain messages = %d (err %v), want 0", n, err)
 			}
 			if _, applied, err := f.report(t, w, run, "credential_switch_uncertain", f.gen, applyFixtureNonce, &op); err != nil || !applied {
 				t.Fatalf("replay: applied=%v err=%v, want it to converge", applied, err)
-			}
-			if seqs, _ := uncertainMsgs(t, run); len(seqs) != 1 {
-				t.Fatalf("after a replayed report: %d messages, want still 1", len(seqs))
 			}
 		})
 	}
@@ -987,9 +958,6 @@ func TestCredentialSwitchUncertainLiveDB(t *testing.T) {
 		unknown := uuid.New()
 		if _, applied, err := f.report(t, w, run, "credential_switch_uncertain", f.gen, applyFixtureNonce, &unknown); err != nil || applied {
 			t.Fatalf("applied=%v err=%v, want refused", applied, err)
-		}
-		if seqs, _ := uncertainMsgs(t, run); len(seqs) != 0 {
-			t.Fatalf("a refused report posted %d messages, want none", len(seqs))
 		}
 	})
 	t.Run("a foreign worker is refused", func(t *testing.T) {

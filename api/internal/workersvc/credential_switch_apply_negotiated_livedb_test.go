@@ -82,6 +82,13 @@ func TestV1ReleaseRetiredForApplyNegotiatedWorkerLiveDB(t *testing.T) {
 			t.Fatalf("status=%s claim_released_at=%v, want running and unreleased", got.Status, got.ClaimReleasedAt)
 		}
 	})
+	t.Run("a release with no claim_generation is an invalid report before it is a retired one", func(t *testing.T) {
+		run := f.heldV1Run(t)
+		_, applied, err := f.svc.SetState(f.env.ctx, f.worker(t), run, StateRequest{State: "credential_switch"})
+		if applied || !errors.Is(err, ErrInvalidState) || errors.Is(err, ErrCredentialSwitchReleaseRetired) {
+			t.Fatalf("release without a generation: applied=%v err=%v, want ErrInvalidState and not ErrCredentialSwitchReleaseRetired", applied, err)
+		}
+	})
 	t.Run("an un-fenced v1 hold is refused and nothing is written", func(t *testing.T) {
 		run := f.heldV1Run(t)
 		f.noWrite(t, run, func() {

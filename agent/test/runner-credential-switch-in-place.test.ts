@@ -526,6 +526,22 @@ describe("issue #4201 m2c: option A (an apply that may have committed)", () => {
     assert.ok(!statusesOf(r).includes("credential_switch"), "never released");
   });
 
+  it("option A emits exactly one worker-owned credential_switch_uncertain frame, after the held frames, losing and duplicating none", TIMEOUT, async () => {
+    const r = await scenario({ site: "implement_turn", apply: [{ outcome: "refused_committed", reason: "already_committed" }] });
+    const frames = r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain");
+    assert.equal(frames.length, 1, "exactly one uncertain frame");
+    assert.deepEqual(frames[0]!.payload, { op_id: "op-1", generation: GEN });
+    const seqs = r.posted.map((m) => m.seq);
+    assert.equal(new Set(seqs).size, seqs.length, "no seq was sent twice");
+    const others = r.posted.filter((m) => m !== frames[0]);
+    const lastHeld = Math.max(...others.map((m) => m.seq));
+    assert.ok(frames[0]!.seq > lastHeld || others.every((m) => m.seq < frames[0]!.seq), "the uncertain frame follows every frame emitted before it");
+    const stored = feedFrames(r.runId).filter((m) => (m.kind as string) === "credential_switch_uncertain");
+    assert.deepEqual(stored.map((m) => m.seq), [frames[0]!.seq], "the api stored it once, at the worker's seq");
+    const missing = Array.from({ length: Math.max(...seqs) }, (_, i) => i + 1).filter((q) => !seqs.includes(q));
+    assert.ok(missing.length <= 1, `at most the one slot reserved for a possible server frame is unused: ${missing.join(",")}`);
+  });
+
   it("the uncertain report is retried through lost replies, then confirmed", TIMEOUT, async () => {
     const r = await scenario({
       site: "implement_turn", apply: [{ outcome: "refused_committed" }], before: (id) => api.dropUncertainReplies(id, 2),

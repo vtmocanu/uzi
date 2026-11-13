@@ -152,6 +152,10 @@ interface Options {
   inPlaceApply?: boolean;
   /** With inPlaceApply: the api's answer (default applied). `superseded` with no newer op is a give-up (the switch settles as cleared). */
   applyOutcome?: "applied" | "superseded";
+  /** With inPlaceApply: the fake api behaves as the real one for a negotiated registration (it refuses the v1 release and an op-less hold). */
+  negotiated?: boolean;
+  /** With inPlaceApply: the flight carries a restore-route predecessor while the switch is asked for (its in-place route is closed). */
+  restoreStub?: boolean;
 }
 
 async function scenario(o: Options) {
@@ -161,6 +165,7 @@ async function scenario(o: Options) {
   (client as any).registerNonce = NONCE;
   if (o.inPlaceApply) {
     (client as any).hasInPlaceCredentialSwitchCapability = true;
+    if (o.negotiated) api.negotiateApply();
     api.scriptApply(claim.run_id, o.applyOutcome === "superseded" ? { outcome: "superseded" }
       : { outcome: "applied", token: ["sk-ant-oat01-", "RETAINED-NEWTOKEN-0123456789"].join("") });
   }
@@ -231,6 +236,7 @@ async function scenario(o: Options) {
           switched = true;
           if (o.inPlaceApply) {
             flight.steering.tripCredentialSwitch(2, "op-retained");
+            if (o.restoreStub) flight.restorePredecessor = { clonePath: clone.path, home: undefined, executor: {} };
             events.push(`hook:${await ctx.attemptCredentialSwitch!({ site: "implement_turn", laneSettled: true })}`);
             events.push(`custody:${flight.retainedLocalCustody === true}`);
             // A later retained guard on the same flight must not rethrow the settled switch's old signal.
@@ -249,7 +255,10 @@ async function scenario(o: Options) {
           if (o.completedTurn) throw new CredentialSwitchSignal();
           await ctx.onModelTurnSettled!(1);
           throw new Error("switch signal expected");
-        } finally { ex.killAgentTree(); }
+        } finally {
+          if (o.restoreStub && flight) flight.restorePredecessor = undefined;
+          ex.killAgentTree();
+        }
       },
     };
     return { homeDir: path.join(homeDir, runId), executor: ex };
@@ -699,6 +708,48 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     assertNoCredentialedOps(env);
     assert.equal(fs.readFileSync(path.join(env.clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
     assert.equal(fs.readFileSync(path.join(env.retainedHome, "session"), "utf8"), "predecessor session");
+  });
+
+  describe("issue #4201 m3a: a negotiated worker whose in-place route is closed never takes the v1 release", () => {
+    const noV1 = (env: Env): void => {
+      const id = env.claim.run_id;
+      assert.equal(reports(id, "credential_switch").length, 0, "no v1 credential_switch release was sent");
+      assert.deepEqual(api.holdRequests.filter(h => h.runId === id && h.op_id === undefined && h.status === HOLD), [], "no op-less hold was sent");
+      assert.deepEqual(api.retiredSwitchRefusals.filter(x => x.runId === id), [], "the api refused nothing as retired");
+      assert.ok(!env.events.some(e => e.startsWith("enter:")), `enterCredentialSwitch never ran: ${env.events.join(",")}`);
+      assert.equal(api.applyRequests.filter(a => a.runId === id).length, 0, "the in-place apply route stays closed");
+    };
+
+    it("a completed retained successor with its quiescence proven reports credential_switch_uncertain (option A), never a release", TIMEOUT, async () => {
+      const env = await scenario({ iid: 31881, survivor: "none", inPlaceApply: true, negotiated: true, completedTurn: true });
+      await env.run;
+      assert.ok(env.flight().completedRetainedSuccessor);
+      noV1(env);
+      assert.deepEqual(api.uncertainRequests.filter(u => u.runId === env.claim.run_id).map(u => u.body.op_id), ["op-retained"]);
+      assertCustodyKept(env, false);
+    });
+
+    it("a completed retained successor whose quiescence is not proven fences with credential_switch_held carrying the op id", TIMEOUT, async () => {
+      const env = await scenario({ iid: 31882, survivor: "permanent", inPlaceApply: true, negotiated: true, completedTurn: true });
+      await env.run;
+      noV1(env);
+      assert.deepEqual(api.holdRequests.filter(h => h.runId === env.claim.run_id && h.status === HOLD).map(h => h.op_id), ["op-retained"]);
+      assert.equal(api.uncertainRequests.filter(u => u.runId === env.claim.run_id).length, 0);
+      assertCustodyKept(env, false);
+    });
+
+    it("a restorePredecessor flight ends in option A or the op-fenced hold, sends no release and no op-less hold", TIMEOUT, async () => {
+      const env = await scenario({ iid: 31883, survivor: "none", inPlaceApply: true, negotiated: true, restoreStub: true });
+      await env.run;
+      noV1(env);
+      const id = env.claim.run_id;
+      const outcomes = [
+        ...api.holdRequests.filter(h => h.runId === id && h.status === HOLD).map(h => `held:${h.op_id}`),
+        ...api.uncertainRequests.filter(u => u.runId === id).map(u => `uncertain:${u.body.op_id}`),
+      ];
+      assert.equal(outcomes.length, 1, outcomes.join(","));
+      assert.match(outcomes[0]!, /^(held|uncertain):op-retained$/);
+    });
   });
 
   it("8. a survivor that is only this flight's own worker child is joined, reaped, and released", TIMEOUT, async () => {

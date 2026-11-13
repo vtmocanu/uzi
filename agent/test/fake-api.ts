@@ -734,6 +734,22 @@ export class FakeApi {
     return "resumed";
   }
 
+  /** Reports the fake refused with 409 credential_switch_release_retired (a negotiated registration's v1 release or op-less hold). */
+  readonly retiredSwitchRefusals: Array<{ runId: string; status: string }> = [];
+
+  private forcedApplyNegotiated = false;
+
+  /** For a test whose client negotiates in-place apply without registering: the fake then behaves as the api does for it. */
+  negotiateApply(): void {
+    this.forcedApplyNegotiated = true;
+  }
+
+  /** The newest registration advertised credential_switch_in_place_v1, which the api stamps as negotiated. */
+  private currentRegistrationNegotiatedApply(): boolean {
+    return this.forcedApplyNegotiated ||
+      (this.registers[this.registers.length - 1]?.protocol_capabilities?.includes("credential_switch_in_place_v1") ?? false);
+  }
+
   private credentialSwitchHoldState(runId: string, body: StateRequest, res: http.ServerResponse): void {
     const send = (status: number, payload: unknown): void => {
       res.writeHead(status, { "Content-Type": "application/json" });
@@ -2136,6 +2152,14 @@ export class FakeApi {
     if (body.plan_md !== undefined) body.plan_md = body.plan_md.replaceAll("\u0000", "");
     if ((body.status as string) === "credential_switch_uncertain")
       return this.credentialSwitchUncertainState(runId, body, res);
+    // Mirrors the api (issue #4201 m3a): a registration that negotiated in-place apply never releases a
+    // claim for a switch, and an op-less credential_switch_held is refused too. Nothing is recorded.
+    if (this.currentRegistrationNegotiatedApply() &&
+        (body.status === "credential_switch" ||
+         (body.status === "credential_switch_held" && (body as { op_id?: string }).op_id === undefined))) {
+      this.retiredSwitchRefusals.push({ runId, status: body.status });
+      return send(res, 409, { error: "credential switch release is retired for an in-place apply worker", reason: "credential_switch_release_retired" });
+    }
     if (body.status === "credential_switch_held" || body.status === "credential_switch_hold_settled")
       return this.credentialSwitchHoldState(runId, body, res);
     const typedRefusal = this.typedParkRefusal.get(runId);

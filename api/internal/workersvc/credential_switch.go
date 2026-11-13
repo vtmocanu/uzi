@@ -2,7 +2,6 @@ package workersvc
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -116,17 +115,17 @@ func stateUsesForUpdateFence(state string, owned store.Run) bool {
 //   - otherwise (an unexpected state: terminal, or never in a held state at this generation) →
 //     applied=false, a 409 that changed nothing, so the worker learns the run's real state.
 func (s *Service) releaseCredentialSwitch(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest) (store.Run, bool, error) {
+	if req.ClaimGeneration == nil {
+		// A capability worker ALWAYS stamps the generation on a release; without it the release
+		// cannot fence to an exact claim, so this is an invalid report (→ 400), not a silent no-op.
+		return store.Run{}, false, fmt.Errorf("%w: credential_switch requires claim_generation", ErrInvalidState)
+	}
 	// Issue #4201 m3a: a worker whose CURRENT registration negotiated in-place apply never releases
 	// a claim for a switch; the v1 release is refused with nothing written.
 	if retired, err := s.applyNegotiated(ctx, wkr.ID); err != nil {
 		return store.Run{}, false, err
 	} else if retired {
 		return owned, false, ErrCredentialSwitchReleaseRetired
-	}
-	if req.ClaimGeneration == nil {
-		// A capability worker ALWAYS stamps the generation on a release; without it the release
-		// cannot fence to an exact claim, so this is an invalid report (→ 400), not a silent no-op.
-		return store.Run{}, false, fmt.Errorf("%w: credential_switch requires claim_generation", ErrInvalidState)
 	}
 	gen := *req.ClaimGeneration
 	rows, err := s.q.ReleaseCredentialSwitch(ctx, store.ReleaseCredentialSwitchParams{
@@ -295,7 +294,8 @@ func (s *Service) runHoldSettling(ctx context.Context, runID uuid.UUID) (bool, e
 // ErrCredentialSwitchReleaseRetired refuses a v1 credential_switch release, or an un-fenced
 // credential_switch_held, from a worker whose current registration negotiated in-place apply
 // (issue #4201 m3a). Nothing was written. The handler answers 409 with reason
-// "credential_switch_release_retired". The m2 agent never sends either, so a worker that does is a bug.
+// "credential_switch_release_retired". A negotiated agent never sends either: for a switch it cannot
+// apply in place it takes the owner pause or the op-fenced hold instead.
 var ErrCredentialSwitchReleaseRetired = errors.New("credential switch release is retired for an in-place apply worker")
 
 // CredentialSwitchApplyFeature is the /protocol feature this api advertises for in-place apply.
@@ -441,9 +441,9 @@ var ErrCredentialSwitchUncertainParkPending = errors.New("a wall or reserve paus
 // generation, worker and current incarnation, operation still pending or journaled) converges to
 // applied; anything else is applied=false (the handler's ordinary 409).
 //
-// parentTx is the claim-locked transaction the hold runs in (nil when the service has no transactional
-// store). A fresh hold also inserts the `credential_switch_uncertain` feed message in it.
-func (s *Service) uncertainCredentialSwitch(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest, parentTx pgx.Tx) (store.Run, bool, error) {
+// The `credential_switch_uncertain` feed message is NOT written here: the worker emits it itself
+// through its own batcher, at a seq it owns, so it cannot collide with the worker's live frames.
+func (s *Service) uncertainCredentialSwitch(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest) (store.Run, bool, error) {
 	if req.ClaimGeneration == nil {
 		return store.Run{}, false, fmt.Errorf("%w: %s requires claim_generation", ErrInvalidState, stateCredentialSwitchUncertain)
 	}
@@ -464,13 +464,6 @@ func (s *Service) uncertainCredentialSwitch(ctx context.Context, owned store.Run
 	})
 	if err != nil {
 		return store.Run{}, false, err
-	}
-	if rows > 0 && parentTx != nil {
-		// Only the FRESH hold posts the feed message, in the hold's own transaction, so a replayed
-		// report (rows == 0) never posts a second one. SetState broadcasts it after the commit.
-		if err := s.insertUncertainSwitchMessage(ctx, store.New(parentTx), owned, gen, op); err != nil {
-			return store.Run{}, false, err
-		}
 	}
 	cur, err := s.runOwnedByWorker(ctx, owned.ID, wkr)
 	if err != nil {
@@ -511,46 +504,6 @@ func (s *Service) uncertainCredentialSwitch(ctx context.Context, owned store.Run
 		return store.Run{}, false, err
 	}
 	return cur, child.ClaimGeneration == gen, nil
-}
-
-// credentialSwitchUncertainMessageKind is the run_messages.kind of the owner-pause feed message a
-// fresh credential_switch_uncertain hold posts. The CLI and web render fixed text for it.
-const credentialSwitchUncertainMessageKind = "credential_switch_uncertain" //nolint:gosec // G101: a run_messages.kind label, not a credential
-
-// credentialSwitchUncertainPayload is that message's body: the operation and generation only.
-type credentialSwitchUncertainPayload struct {
-	OpID       string `json:"op_id"`
-	Generation int64  `json:"generation"`
-}
-
-// insertUncertainSwitchMessage writes the uncertain feed message at the server-picked seq
-// max(run.LastSeq, MAX(seq)) + 1 and advances runs.last_seq, through the caller's transaction queries.
-// The broadcast is parked on s.uncertainMessage for SetState to publish after the commit.
-func (s *Service) insertUncertainSwitchMessage(ctx context.Context, qtx *store.Queries, run store.Run, gen int64, op uuid.UUID) error {
-	maxSeq, err := qtx.MaxRunMessageSeq(ctx, run.ID)
-	if err != nil {
-		return fmt.Errorf("credential switch uncertain: max seq: %w", err)
-	}
-	seq := max(run.LastSeq, maxSeq) + 1
-	payload, err := json.Marshal(credentialSwitchUncertainPayload{OpID: op.String(), Generation: gen})
-	if err != nil {
-		return fmt.Errorf("credential switch uncertain: marshal message: %w", err)
-	}
-	ins, err := qtx.InsertRunMessage(ctx, store.InsertRunMessageParams{
-		RunID: run.ID, Seq: seq, Kind: credentialSwitchUncertainMessageKind, Payload: payload,
-		ClaimGeneration: pgconv.Int8Ptr(&gen),
-	})
-	if err != nil {
-		return fmt.Errorf("credential switch uncertain: insert message: %w", err)
-	}
-	if !ins.Inserted {
-		return fmt.Errorf("credential switch uncertain: message seq %d already occupied", seq)
-	}
-	if _, err := qtx.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: run.ID, Seq: seq, ClaimGeneration: pgconv.Int8Ptr(&gen)}); err != nil {
-		return fmt.Errorf("credential switch uncertain: advance last_seq: %w", err)
-	}
-	s.uncertainMessage = &pendingSwitchBroadcast{seq: seq, payload: payload}
-	return nil
 }
 
 // settleCredentialSwitchHold applies the credential_switch_hold_settled acknowledgement (issue

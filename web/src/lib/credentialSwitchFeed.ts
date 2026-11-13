@@ -5,8 +5,9 @@
 // switch inside one claim generation (the run kept its worker and working directory), and is
 // absent on a claim-time switch (an older worker released and re-claimed the run).
 //
-// `credential_switch_uncertain` marks a switch whose outcome could not be established: the run
-// is parked as a plain owner pause and the owner resumes it. Its copy is fixed; nothing from
+// `credential_switch_uncertain` is posted by the worker itself (through its own message batcher, at a
+// seq it owns) when a switch's outcome could not be established: the run is parked as a plain owner
+// pause and the owner resumes it. Its copy is fixed; nothing from
 // the payload is interpolated, so an unexpected shape cannot change what it says.
 //
 // The token label is user-authored and goes through sanitizeLabel (React escaping does not
