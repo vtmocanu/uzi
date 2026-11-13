@@ -150,6 +150,7 @@ func (m *Materializer) maintenanceObservation(ctx context.Context, id, ns string
 		}
 	}
 	o.PodsKnown, o.WorkerPodCount, o.ReadyPodUID = true, 0, ""
+	o.TerminalPodCount = 0 // recounted below as WorkerPodCount is; never inherited stale
 	var current []corev1.Pod
 	for _, pod := range pods {
 		// Count worker-labelled pods and any pod mounting the data root, even if

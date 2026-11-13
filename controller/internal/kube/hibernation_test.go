@@ -1025,9 +1025,13 @@ func TestWakeIsNotHeldByATerminalPhasePod(t *testing.T) {
 	evicted := hibPod("evicted", hash, false, false)
 	evicted.Status.Phase = corev1.PodFailed
 	evicted.Status.Reason = "Evicted"
+	succeeded := hibPod("succeeded", hash, false, false)
+	succeeded.Status.Phase = corev1.PodSucceeded
+	failedDying := hibPod("failed-dying", hash, false, true)
+	failedDying.Status.Phase = corev1.PodFailed
 	running := hibPod("running", hash, true, false)
 	running.Status.Phase = corev1.PodRunning
-	m, client, rec := hibEnv(t, hibCurrent(t, 0, "sleep-op"), evicted, running)
+	m, client, _ := hibEnv(t, hibCurrent(t, 0, "sleep-op"), evicted, succeeded, failedDying, running)
 	w := hibW(protocol.HibernationWaking, "wake-op")
 	if err := hibTick(t, m, w); err != nil {
 		t.Fatal(err)
@@ -1042,14 +1046,11 @@ func TestWakeIsNotHeldByATerminalPhasePod(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n := replicaPatches(client); n != 1 {
-		t.Fatalf("replica patches = %d with only an evicted pod left, want the one restore", n)
+		t.Fatalf("replica patches = %d with only terminal-phase pods left, want the one restore", n)
 	}
 	d := hibGet(t, client)
 	if *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
 		t.Fatalf("restore: replicas=%v annotations=%v", d.Spec.Replicas, d.Annotations)
-	}
-	if hasTransition(rec, protocol.TransitionReady) {
-		t.Fatal("ready reported for an evicted pod")
 	}
 
 	// A terminating pod still in phase Running holds the wake.

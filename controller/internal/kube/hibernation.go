@@ -387,7 +387,8 @@ func (m *Materializer) wakeHeldForPods(w protocol.DesiredWorker, obs reconcile.O
 // in-pod workdir that a woken-from-zero worker does not have.
 //
 // A wake that finds the Deployment at zero (or absent) holds there until one complete
-// pod observation shows none of the worker's pods, terminating ones included. Restoring
+// pod observation shows no worker pod that has yet to reach a terminal phase (terminating
+// pods included; see wakeHeldForPods). Restoring
 // replicas earlier can let the original admission pod survive the scale-down, and once
 // the api has recorded scaling_down it never settles a wake on that pod (trySettle rule
 // (a)), so the worker would stay waking for good. Waiting until the pods are gone forces
