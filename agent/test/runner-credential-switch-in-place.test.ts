@@ -11,9 +11,10 @@ import { RequestError, type CredentialSwitchApplyResult, type WorkerClient } fro
 import { Outbox } from "../src/outbox.js";
 import { SecretSet } from "../src/redact.js";
 import { CredentialSwitchSignal, SteeringChannel } from "../src/steering.js";
+import { CredentialHolder } from "../src/credential-holder.js";
 import { CredentialSwitchOpLedger, defaultLedgerFs } from "../src/credential-switch-op-ledger.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 import type { ApplyScript } from "./fake-api.js";
 import type { QuiesceRunOutcome, QuiesceRunRequest } from "../src/run-quiescence.js";
 import {
@@ -325,6 +326,44 @@ describe("issue #4201 m2d: the PR-description editor pass runs on the holder's t
     assert.equal((usage[0]!.payload as { pass: string }).pass, "pr_description");
     assert.equal(usage[0]!.credential_epoch_ordinal, 1, "the pass's frame carries the epoch it started on");
   });
+
+  it("a newer credential published while the editor pass is in flight: the frame still carries the START ordinal", TIMEOUT, async () => {
+    // The run's holder is private to the flight: capture it when the apply publishes into it.
+    const holders: CredentialHolder[] = [];
+    const realPublish = CredentialHolder.prototype.publish;
+    CredentialHolder.prototype.publish = function (this: CredentialHolder, next) { holders.push(this); return realPublish.call(this, next); };
+    let publishedAtOrdinal: number | undefined;
+    const queryFn = (async function* () {
+      // A later switch lands while the pass runs: the holder moves on to ordinal 2.
+      const holder = holders[0]!;
+      holder.publish({ token: ["sk-ant-oat01-", "LATER-0123456789"].join(""), ordinal: 2 });
+      publishedAtOrdinal = holder.current().ordinal;
+      yield {
+        type: "assistant",
+        message: {
+          id: "m1", model: "claude-haiku-4-5-20251001", role: "assistant",
+          content: [{ type: "text", text: JSON.stringify({ summary: "Adds a thing.", changes: ["c"], scope_notes: [], review_pointers: [] }) }],
+          usage: { input_tokens: 21, output_tokens: 4 },
+        },
+      };
+      yield { type: "result", subtype: "success", is_error: false };
+    }) as unknown as SdkQueryFn;
+    const summaryRunner = new SummaryRunner(nullLogger(), { queryFn, homeRoot: homeDir });
+    let r: Awaited<ReturnType<typeof scenario>>;
+    try {
+      r = await scenario({
+        site: "implement_turn",
+        apply: [{ outcome: "applied", token: NEW_TOKEN }],
+        extra: { summaryRunner },
+        before: () => { api.prDescription = new FakePrDescApi(); },
+        withGitlab: (gl) => { followSuccessfulPush(git, gl.pr, true); },
+      });
+    } finally { CredentialHolder.prototype.publish = realPublish; }
+    assert.equal(publishedAtOrdinal, 2, "the holder moved to ordinal 2 during the pass");
+    const usage = api.messages(r.runId).filter((m) => m.kind === "summary_usage");
+    assert.equal(usage.length, 1);
+    assert.equal(usage[0]!.credential_epoch_ordinal, 1, "the frame carries the ordinal read at publication start, not the one current at emit time");
+  });
 });
 
 describe("issue #4201 m2c: apply outcomes other than applied", () => {
@@ -583,10 +622,30 @@ describe("issue #4201 m2c rework: a definite non-applied answer after an ambiguo
     } finally { apply.restore(); spy.restore(); }
   });
 
-  // The server answers superseded and not_applied only AFTER its replay check, in the same transaction
-  // under the run lock: a committed op would have replayed as applied. So after an uncertain send these two
-  // prove the op never committed, and the hold must be CANCELLED (frames continue at tail+1, no seq hole)
-  // and the ledger settled (review NB1).
+  // A not_applied whose reason leaves the op pending (anything but no_pending_switch) does NOT prove the
+  // earlier send never committed: a delayed send could still land. Option A, never the give-up.
+  for (const reason of ["credential_busy", "vault_locked", "generation_mismatch"]) {
+    it(`uncertain then not_applied:${reason}: option A, hold released past the possible apply, op stays ambiguous`, TIMEOUT, async () => {
+      const spy = spyHold();
+      const apply = committedThenAnswers(spy, [AMBIGUOUS, { kind: "not_applied", reason }]);
+      try {
+        const r = await scenario({ site: "implement_turn", apply: [] });
+        assert.equal(apply.calls(), 2);
+        assertReleasedPastPossibleApply(r, spy);
+        assert.equal(api.uncertainRequests.length, 1, "credential_switch_uncertain was reported");
+        assert.equal(api.uncertainRequests[0]!.body.op_id, "op-1");
+        assert.ok(!statusesOf(r).includes("credential_switch_failed"), `no give-up: ${statusesOf(r).join(",")}`);
+        assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
+        assert.equal(r.turns.length, 2, "neither token ran again");
+        assert.equal((await r.ledger.stateOf(r.runId, "op-1"))?.state, "ambiguous", "the ledger keeps the memory of the possible commit");
+      } finally { apply.restore(); spy.restore(); }
+    });
+  }
+
+  // The server answers superseded and not_applied:no_pending_switch only AFTER its replay check, in the same
+  // transaction under the run lock: a committed op would have replayed as applied. So after an uncertain send
+  // these two prove the op never committed, and the hold must be CANCELLED (frames continue at tail+1, no seq
+  // hole) and the ledger settled (review NB1).
   for (const answer of [{ kind: "superseded" }, { kind: "not_applied", reason: "no_pending_switch" }] as CredentialSwitchApplyResult[]) {
     it(`uncertain (rolled back) then ${answer.kind}: the hold is cancelled with no seq hole and the op settles`, TIMEOUT, async () => {
       const spy = spyHold();
@@ -713,7 +772,13 @@ describe("issue #4201 m2c rework: the report retries are bounded", () => {
     const realReport = client.reportState.bind(client);
     let attempts = 0;
     client.reportState = (async (runId: string, body: Parameters<typeof realReport>[1], ...rest: unknown[]) => {
-      if (body.status === status) { attempts++; throw new Error("transport down"); }
+      if (body.status === status) {
+        attempts++;
+        // Past the bound the report answers stale_claim, which ends every retry loop: an unbounded loop then
+        // fails the `attempts` assertion within seconds instead of hanging until the test timeout.
+        if (attempts > 5) return { applied: false, staleClaim: true, status: "queued" };
+        throw new Error("transport down");
+      }
       return (realReport as (...a: unknown[]) => unknown)(runId, body, ...rest);
     }) as typeof client.reportState;
     try {
@@ -727,7 +792,7 @@ describe("issue #4201 m2c rework: the report retries are bounded", () => {
       site: "implement_turn", apply: [],
       quiesce: (req) => (req.site === "in_place_credential_switch" ? BLOCKED : undefined),
     }));
-    assert.equal(attempts, 5);
+    assert.equal(attempts, 5, "the hold report is bounded at 5 attempts");
     assert.equal(applied().length, 0);
     assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
     assert.equal(r.turns.length, 2, "no turn after the report");
@@ -738,7 +803,7 @@ describe("issue #4201 m2c rework: the report retries are bounded", () => {
     const { r, attempts } = await neverConfirmed("credential_switch_uncertain", () => scenario({
       site: "implement_turn", apply: [{ outcome: "refused_committed" }],
     }));
-    assert.equal(attempts, 5);
+    assert.equal(attempts, 5, "the uncertain report is bounded at 5 attempts");
     assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
     assert.equal(r.turns.length, 2, "neither token ran again");
     assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "custody kept");
@@ -1012,13 +1077,58 @@ describe("issue #4201 m2d rework: the escaped arm keeps lifecycle stops and the 
       },
     };
     const { gitlab } = fakeGitlab();
-    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+    const rec = recordingLogger();
+    await runnerWith(() => ({ executor }), gitlab, undefined, rec.logger, {
       recoveryRetryMs: 1, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir), quiesceRun: async () => CLEAN,
     }).execute(claim);
     const s: string[] = api.states.filter((x) => x.runId === runId).map((x) => x.body.status);
     assert.deepEqual(applied().map((b) => b.op_id), ["op-1"], "the apply happened once");
     for (const status of ["credential_switch", "credential_switch_uncertain", "credential_switch_held", "queued", "completed", "failed"])
       assert.ok(!s.includes(status), `no ${status} after an applied switch: ${s.join(",")}`);
+    // Custody kept and no terminal or hold report of any kind: the settled-signal arm ended the flight.
+    assert.equal(fs.existsSync(worktreeDirFor(claim.issue_iid as number)), true, "the source clone is retained");
+    assert.equal(api.holdRequests.length, 0, "no hold report");
+    assert.equal(api.uncertainRequests.length, 0, "no uncertain report");
+    assert.ok((rec.lines as Array<{ msg?: string }>).some((l) => l.msg?.startsWith("a settled credential switch signal surfaced after its settlement")),
+      "the settled-signal arm ran");
+  });
+
+  it("a stale claim during the escaped proof's hold report is a stale stop with the work retained, not a swallowed warning", TIMEOUT, async () => {
+    newApi();
+    negotiate();
+    const claim = freshClaim(GEN);
+    const runId = claim.run_id;
+    api.scriptApply(runId, { outcome: "applied", token: NEW_TOKEN });
+    const executor = {
+      run: async (ctx: Ctx) => {
+        api.requestCredentialSwitch(runId, GEN, "op-1");
+        assert.ok(await until(() => ctx.signal?.aborted === true, 10_000), "the switch aborted ctx.signal");
+        throw ctx.signal!.reason;
+      },
+    };
+    // The proof is unprovable, so the hold report goes out; the api answers it with the stale_claim disposition.
+    let held = 0;
+    const realReport = client.reportState.bind(client);
+    client.reportState = (async (id: string, body: Parameters<typeof realReport>[1], ...rest: unknown[]) => {
+      if (body.status === "credential_switch_held") { held++; return { applied: false, staleClaim: true, status: "queued" }; }
+      return (realReport as (...a: unknown[]) => unknown)(id, body, ...rest);
+    }) as typeof client.reportState;
+    const rec = recordingLogger();
+    const { gitlab } = fakeGitlab();
+    try {
+      await runnerWith(() => ({ executor }), gitlab, undefined, rec.logger, {
+        recoveryRetryMs: 1, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir),
+        quiesceRun: async (req) => (req.site === "in_place_credential_switch" ? BLOCKED : CLEAN),
+      }).execute(claim);
+    } finally { client.reportState = realReport as typeof client.reportState; }
+    const msgs = (rec.lines as Array<{ msg?: string }>).map((l) => l.msg ?? "");
+    const s: string[] = api.states.filter((x) => x.runId === runId).map((x) => x.body.status);
+    assert.equal(held, 1, "the held report was answered stale once and not retried");
+    assert.ok(msgs.some((m) => m.startsWith("run claim superseded server-side (stale_claim)")), `the stale stop arm ran: ${msgs.join(" | ")}`);
+    assert.ok(!msgs.some((m) => m.includes("could not be settled")), "the stale claim was not swallowed as a settle warning");
+    assert.deepEqual(s.filter((x) => ["completed", "failed", "credential_switch", "credential_switch_uncertain"].includes(x)), [], s.join(","));
+    assert.equal(applied().length, 0);
+    assert.equal(fs.existsSync(worktreeDirFor(claim.issue_iid as number)), true, "the source clone is retained");
   });
 });
 

@@ -6656,16 +6656,16 @@ export class RunRunner {
           return;
         }
         if (flight.steering.isSettledSwitchSignal(err)) {
-          // Issue #4201 (N2): the spent signal of a switch that already APPLIED in place surfaced after the
-          // apply, with no newer op pending. The credential has moved server-side, so this is not a switch to
-          // release (a v1 release here would requeue an apply-negotiated worker's run after its apply) and it
-          // wraps no other error. Conservative: end the flight with the work and custody kept and no terminal
-          // report, leaving the run non-terminal for a reclaim (which runs on the applied token).
+          // Issue #4201 (N2): the spent signal of a switch that steering already marked settled (any outcome:
+          // applied, gave_up or cleared) surfaced after that settlement, with no newer op pending. It wraps no
+          // other error and is not a switch to release (a v1 release here would requeue an apply-negotiated
+          // worker's run after an apply). Conservative: end the flight with the work and custody kept and no
+          // terminal report, leaving the run non-terminal for a reclaim.
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
           flight.keepGuardedInventoryOpen = true;
           flight.retainedLocalCustody = true;
-          runLog.warn("a settled credential switch signal surfaced after its apply; ending the flight with work and custody kept, no release", {
+          runLog.warn("a settled credential switch signal surfaced after its settlement; ending the flight with work and custody kept, no release", {
             run_id: flight.runId,
           });
           await batcher.close().catch(() => undefined);
@@ -27189,8 +27189,11 @@ export class RunRunner {
         // replay check proves it did not commit. `superseded` and `not_applied` are such answers (the replay
         // of a committed op would have answered applied or refused_committed, in the same transaction under
         // the run lock); `fenced` is not, because the fence runs before the replay (credential_switch_apply.go).
+        // Of `not_applied` only the reason `no_pending_switch` is permanent proof: the other reasons
+        // (credential_busy, vault_locked, generation_mismatch, ...) leave the op pending, so a delayed earlier
+        // send could still commit and the flag stays set.
         if (result.kind === "uncertain" || result.kind === "refused_committed") mayHaveCommitted = true;
-        if (result.kind === "superseded" || result.kind === "not_applied") mayHaveCommitted = false;
+        if (result.kind === "superseded" || (result.kind === "not_applied" && result.reason === "no_pending_switch")) mayHaveCommitted = false;
         const dropHold = (): void => {
           if (mayHaveCommitted) this.releaseHoldPastPossibleApply(hold, flight, runLog);
           else hold.cancel();
@@ -27239,6 +27242,12 @@ export class RunRunner {
           }
           case "not_applied":
           case "ledger_unavailable":
+            // A not_applied that is not permanent proof, after a send that may have committed, cannot be
+            // given up on: option A keeps both tokens unused and releases the hold past the possible apply.
+            if (mayHaveCommitted && result.kind === "not_applied") {
+              holdDone = true;
+              return await this.inPlaceOptionA(flight, runLog, opId, hold, lifecycle, identity);
+            }
             dropHold();
             holdDone = true;
             runLog.warn("in-place credential switch not applied; giving up on the old token", {

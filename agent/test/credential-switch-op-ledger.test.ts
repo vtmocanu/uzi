@@ -93,7 +93,19 @@ describe("credential switch op ledger", () => {
     assert.equal(onDisk(dir)["op-1"].state, "clean_route_absent");
   });
 
-  for (const result of [{ kind: "superseded" }, { kind: "not_applied", reason: "x" }] as CredentialSwitchApplyResult[]) {
+  it("uncertain then not_applied with a reason that leaves the op pending stays ambiguous, in process and across a reload", async () => {
+    for (const reason of ["credential_busy", "vault_locked", "generation_mismatch"]) {
+      const dir = tmp();
+      const first = new CredentialSwitchOpLedger(dir);
+      await applyThroughLedger(fakeClient([], { kind: "uncertain", detail: "x" }), first, RUN, REQ);
+      const out = await applyThroughLedger(fakeClient([], { kind: "not_applied", reason }), first, RUN, REQ);
+      assert.deepEqual(out, { kind: "not_applied", reason }, "the answer is still returned");
+      assert.equal(onDisk(dir)["op-1"].state, "ambiguous", reason);
+      assert.equal((await new CredentialSwitchOpLedger(dir).stateOf(RUN, "op-1"))?.state, "ambiguous", reason);
+    }
+  });
+
+  for (const result of [{ kind: "superseded" }, { kind: "not_applied", reason: "no_pending_switch" }] as CredentialSwitchApplyResult[]) {
     it(`uncertain then ${result.kind} settles: the server answers it only after its replay check (review NB1)`, async () => {
       const dir = tmp();
       const ledger = new CredentialSwitchOpLedger(dir);
