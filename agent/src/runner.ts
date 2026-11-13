@@ -1476,8 +1476,16 @@ type LaunchRound = {
   startedAt: number;
   deadlineAt?: number;
   scope?: AbortSignal;
+  /** The signal the labelled lock wait actually ran under: the bootstrap's nested recovery-operation
+   *  scope for "restriction_facts" (its own deadline timer can fire before `scope` aborts), or `scope`
+   *  itself for "runtime_restore", which reads directly in the outer operation. */
+  lockScope?: AbortSignal;
   lockWait?: "restriction_facts" | "runtime_restore";
 };
+
+/** Node timers run on the monotonic clock and can fire a few ms before wall-clock Date.now reaches the
+ *  deadline they were armed for. withLaunchLockRetry tolerates that much skew when classing a deadline abort. */
+const LAUNCH_DEADLINE_TIMER_SLACK_MS = 20;
 
 /** Message of the lock-wait abort in git.ts (GIT_LOCK_WAIT_ABORT_MESSAGE, not exported). */
 const RETAINED_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
@@ -4277,8 +4285,12 @@ export class RunRunner {
   /**
    * Runs one launch-time remediation round at a time. A round whose bare-lock wait aborted before the lock
    * was acquired, only because its own deadline expired, is retried as a fresh round (new A acquisition,
-   * new clock) within a per-claim allowance; every other failure is rethrown unchanged. The allowance is
-   * shared by every call site and separate from retainedDiscoveryRetries.
+   * new clock) within a per-claim allowance. A recognised owner/lifecycle stop surfaces its own control
+   * through launchControl; only an unknown stop or another failure rethrows the original error. "Its own
+   * deadline" means the scope the labelled wait ran under (round.lockScope) aborted with
+   * RecoveryDeadlineExhaustedError, with Date.now() within LAUNCH_DEADLINE_TIMER_SLACK_MS of the deadline
+   * (a monotonic timer can fire slightly before wall-clock time reaches it). The allowance is shared by
+   * every call site and separate from retainedDiscoveryRetries.
    */
   private async withLaunchLockRetry<T>(flight: RunFlight, run: (round: LaunchRound) => Promise<T>): Promise<T> {
     // A failed round's catch holds the recovery-clone retention through the launch-retry writer (see
@@ -4297,8 +4309,11 @@ export class RunRunner {
       } catch (error) {
         if (!round.lockWait) throw error;
         const stop = this.launchStop(flight);
-        const cls = stop ?? (round.deadlineAt !== undefined && Date.now() >= round.deadlineAt &&
-          round.scope?.aborted === true && round.scope.reason instanceof RecoveryDeadlineExhaustedError
+        // Only a scope that actually aborted with RecoveryDeadlineExhaustedError qualifies, and that error is
+        // raised only by the deadline timer and the `Date.now() >= deadline` pre-checks.
+        const cls = stop ?? (round.deadlineAt !== undefined &&
+          Date.now() >= round.deadlineAt - LAUNCH_DEADLINE_TIMER_SLACK_MS &&
+          round.lockScope?.aborted === true && round.lockScope.reason instanceof RecoveryDeadlineExhaustedError
           ? "deadline" : "unknown");
         try {
           flight.runLog.warn("launch round lock wait aborted",
@@ -4384,11 +4399,14 @@ export class RunRunner {
         progress.cause = facts.blocked ? "blocked" : "enrolled_observed";
       }
     } };
+    let readScope: AbortSignal | undefined;
     try {
       if (!barePath || !branch) { progress.cause = "identity"; throw new Error("restriction identity unavailable"); }
-      const facts = await this.withRemediationLifecycle(signal, () =>
-        this.git.withRemediationRestrictionProgress(progress, () =>
-          this.git.readRemediationRestrictionFacts(barePath, branch, runId)), deadlineAt, progress);
+      const facts = await this.withRemediationLifecycle(signal, nested => {
+        readScope = nested;
+        return this.git.withRemediationRestrictionProgress(progress, () =>
+          this.git.readRemediationRestrictionFacts(barePath, branch, runId));
+      }, deadlineAt, progress);
       // Also observe mocked readers that return facts without invoking the channel.
       progress.observe!(facts);
       if (facts.blocked) throw new Error("restriction evidence is custody only");
@@ -4400,8 +4418,12 @@ export class RunRunner {
       return { kind: "confirmed", enrolled: facts.enrolled };
     } catch {
       // Independent of latch clearability: only the lock-wait stage matters to a launch-round retry.
-      if (round && progress.cause === "pre_read_unavailable" && !progress.started && !progress.acquired)
+      if (round && progress.cause === "pre_read_unavailable" && !progress.started && !progress.acquired) {
         round.lockWait = "restriction_facts";
+        // The nested scope the read ran under; if the nested operation rejected before its action started,
+        // no nested scope exists and the outer round scope is the only signal to judge.
+        round.lockScope = readScope ?? round.scope;
+      }
       const existed = flight.remediationRestrictions;
       const state = flight.remediationRestrictions ??= { roots: [] };
       // Existing, injected and successor-capture latches can never acquire clearable provenance.
@@ -4461,7 +4483,10 @@ export class RunRunner {
       return record;
     } catch (error) {
       const preAcquisition = !!progress && progress.cause === "pre_read_unavailable" && !progress.started && !progress.acquired;
-      if (round && preAcquisition) round.lockWait = "runtime_restore";
+      if (round && preAcquisition) {
+        round.lockWait = "runtime_restore";
+        round.lockScope = round.scope; // Read directly in the outer operation (git.readRuntimeRemediationRecovery withLock).
+      }
       if (round && preAcquisition && before === undefined && flight.remediationRestrictions === undefined &&
           !flight.predecessorCapture) {
         // A lock wait that never acquired B saw no journal bytes: hold the launch as clearable so a fresh

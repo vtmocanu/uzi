@@ -2040,21 +2040,25 @@ const ABORT_LINE = "launch round lock wait aborted";
 function launchClock(t: any) {
   const realNow = Date.now.bind(Date);
   const realTimer = globalThis.setTimeout;
-  let skew = 0, armed = false, expire: (() => void) | undefined;
+  let skew = 0, armed = false, expires: Array<() => void> = [];
   const dateMock = t.mock.method(Date, "now", () => realNow() + skew);
   const timerMock = t.mock.method(globalThis, "setTimeout", (callback: () => void, delay?: number, ...rest: unknown[]) => {
-    if (armed && !expire && typeof delay === "number" && delay > LAUNCH_MS - 1000 && delay <= LAUNCH_MS) expire = callback;
+    // Every deadline-window timer is captured in arm order: index 0 is the round's outer operation, index 1
+    // the nested recovery operation the restriction-facts bootstrap opens for the same deadline.
+    if (armed && typeof delay === "number" && delay > LAUNCH_MS - 1000 && delay <= LAUNCH_MS) expires.push(callback);
     return (realTimer as any)(callback, delay, ...rest);
   });
   return {
     /** node:test restores mocks FIFO at test end, which would leave a first wrapper installed under a second
      *  one; a caller that builds more than one clock in a test restores LIFO here instead. */
     restore: () => { timerMock.mock.restore(); dateMock.mock.restore(); },
-    arm: () => { armed = true; expire = undefined; },
-    /** elapsed=true advances the clock past the deadline first (a real expiry); false is an early notification. */
-    fire: (elapsed: boolean) => {
-      assert.ok(expire, "the round's operation timer was installed");
-      const callback = expire; expire = undefined; armed = false;
+    arm: () => { armed = true; expires = []; },
+    /** elapsed=true advances the clock past the deadline first (a real expiry); false is an early notification.
+     *  `nth` picks the captured timer: 0 the outer operation (default), 1 the nested one. */
+    fire: (elapsed: boolean, nth = 0) => {
+      const callback = expires[nth];
+      assert.ok(callback, "the round's operation timer #" + nth + " was installed (captured " + expires.length + ")");
+      expires = []; armed = false;
       if (elapsed) skew += LAUNCH_MS;
       callback();
     },
@@ -2074,6 +2078,9 @@ async function driveExecute(t: any, iid: number, decide: (site: "clone" | "launc
   onRead?: (site: "clone" | "launch", round: number) => void;
   /** Runs once, inside the first launch-round backoff wait, before the wait is delegated. */
   onBackoff?: (flight: any, runner: RunRunner) => void | Promise<void>;
+  /** Expire the NESTED operation's timer (the second deadline-window timer) instead of the outer one, so the
+   *  read's wait rejects while the round's outer scope is still unaborted. */
+  nestedTimer?: boolean;
 } = {}) {
   const claim = gitlabClaim(iid);
   const stub = new StubExecutor(nullLogger());
@@ -2117,7 +2124,7 @@ async function driveExecute(t: any, iid: number, decide: (site: "clone" | "launc
           await entered.promise;
           if (round.hold.mode === "new_release_on_abort") round.release = until.release; else releases.push(until.release);
         }
-        setImmediate(() => clock.fire(true));
+        setImmediate(() => clock.fire(true, opts.nestedTimer ? 1 : 0));
       }
       return orig(...args);
     }));
@@ -2203,6 +2210,32 @@ test("#4246 phaseClone exhaustion fails visibly after exactly three rounds and k
   assert.notEqual(command(r.flight.barePath, "config", "--get", "uzi-recovery." + r.flight.branch + ".clone"), "",
     "the recovery journal (custody) is kept");
   assert.deepEqual(r.custody, { reaps: 0, settles: 0 }, "keepCustody: no provider reap and no custody settle");
+});
+
+test("#4246 a launch round retries when only the nested restriction-facts timer fired and the outer scope is unaborted", async t => {
+  const r = await driveExecute(t, 4264,
+    (site, round) => site === "launch" && round === 1 ? { method: "readRemediationRestrictionFacts", mode: "new_release_on_abort" } : undefined,
+    { nestedTimer: true });
+  assert.equal(r.counts.launch, 2, "one expired round, then one fresh round");
+  assert.equal(r.runs, 1, "the executor ran once");
+  assert.deepEqual(r.failed, [], "the run did not fail at startup");
+  assert.equal(r.diagnostics.length, 1);
+  assert.equal(r.diagnostics[0].label, "restriction_facts");
+  assert.equal(r.diagnostics[0].abort, "deadline");
+});
+
+test("#4246 setFlight(false) clears the launch-retry writer, other writers are kept", () => {
+  const cleared = new FlightRetention();
+  cleared.recoveryClone.setLaunchRetry(true);
+  assert.equal(cleared.recoveryClone.value, true, "the launch-retry writer holds the flag");
+  cleared.recoveryClone.setFlight(false);
+  assert.equal(cleared.recoveryClone.value, false, "an explicit flight-level release supersedes the launch-retry writer");
+
+  const kept = new FlightRetention();
+  kept.recoveryClone.setLaunchRetry(true);
+  kept.recoveryClone.setFlight(true);
+  kept.recoveryClone.setLaunchRetry(false);
+  assert.equal(kept.recoveryClone.value, true, "a flight-level hold survives the launch-retry release");
 });
 
 const cloneJournal = (flight: any) => command(flight.barePath, "config", "--get", "uzi-recovery." + flight.branch + ".clone");
@@ -2363,6 +2396,30 @@ for (const at of ["facts", "restore"] as const) {
         } finally { r.runner.shutdown(); }
       });
     }
+  }
+}
+
+// A committed cancel (steering's real commitCancel: sticky cancelled flag plus the cancel and terminal
+// aborts) must surface "run cancelled", guarding the cancel-before-terminal precedence in launchControl.
+for (const at of ["facts", "restore"] as const) {
+  for (const phase of ["during the wait", "during backoff"] as const) {
+    test("#4246 a committed cancel surfaces run cancelled " + phase + " (" + at + ")", async t => {
+      const f = await fixture(false);
+      const during = phase === "during the wait";
+      const commit = (flight: any) => (flight.steering as any).commitCancel();
+      const r = await directLaunch(t, f, {
+        at, retryMs: during ? undefined : 300, expiry: "elapsed",
+        during: during ? commit : undefined,
+        afterFirstFailure: during ? undefined : flight => { setTimeout(() => commit(flight), 20); },
+      });
+      try {
+        assert.ok(r.error, "the cancel's own control is thrown");
+        assert.equal(r.error.message, "run cancelled");
+        assert.equal(r.flight.steering.isCancelled(), true);
+        assert.equal(r.rounds, 1, "no fresh round");
+        assert.doesNotMatch(String(r.error.message), ORIGINAL[at], "not the lock-read failure");
+      } finally { r.runner.shutdown(); }
+    });
   }
 }
 
