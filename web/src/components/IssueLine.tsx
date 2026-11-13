@@ -8,7 +8,7 @@
 import { useId, type ReactNode } from "react";
 import type { RunSummaryItem } from "../lib/api";
 import { maskEmail } from "../lib/demoMask";
-import { crossCheckTag, runRef, type CrossCheckTag, type IssueLineModel, type IssueStage, type IssueWorkScope, type LineEntry } from "../lib/issueLine";
+import { issueLineTag, runRef, type IssueLineTag, type IssueLineModel, type IssueStage, type IssueWorkScope, type LineEntry } from "../lib/issueLine";
 import { stripUnsafeChars } from "../lib/safeText";
 import { ActivityIcon, ChatIcon, ClockIcon } from "./icons";
 import { Badge, RUN_STATUS_TONES, type BadgeTone } from "./ui";
@@ -60,10 +60,11 @@ const STATIONS: Station[] = [
 // The inner pill of a cross-check tag. An outline only: a fill would stack on the chip's own
 // tint and pull 11px coloured text under AA 4.5:1 (#4082 review), so the tone lives in the
 // text and its border alone. A plain check reads in the foreground colour, as the mock's .why.chk.
-const TAG_CLASSES: Record<CrossCheckTag["tone"], string> = {
+const TAG_CLASSES: Record<IssueLineTag["tone"], string> = {
   check: "text-fg",
   warn: "text-warn",
   danger: "text-danger",
+  info: "bg-info/10 text-info",
 };
 
 function RunBadges({
@@ -82,7 +83,7 @@ function RunBadges({
   return (
     <span className="mt-2 flex min-w-0 flex-wrap gap-1">
       {shown.map(({ run, own }) => {
-        const tag = crossCheckTag(run, stage);
+        const tag = issueLineTag(run, stage);
         // Another user's run names its owner on hover, masked in demo mode; a tag adds its meaning.
         const ownerPart = !own && run.owner_email ? maskEmail(run.owner_email, demo) : undefined;
         const title = [ownerPart, tag?.title].filter(Boolean).join(" · ");
@@ -93,7 +94,10 @@ function RunBadges({
               <>
                 {/* A real space, so the chip reads "#N cross-checking" to assistive tech and copy. */}{" "}
                 {/* One bordered box that may break inside itself in a narrow station, never past it. */}
-                <span className={`inline-block max-w-full rounded border border-current/40 px-1 ${TAG_CLASSES[tag.tone]}`}>{stripUnsafeChars(tag.text)}</span>
+                <span className={`inline-block max-w-full rounded border border-current/40 px-1 ${TAG_CLASSES[tag.tone]}`}>
+                  {tag.pulse && <span aria-hidden="true" className="mr-1 inline-block size-1.5 rounded-full bg-info motion-safe:animate-pulse" />}
+                  {stripUnsafeChars(tag.text)}
+                </span>
               </>
             )}
           </Badge>

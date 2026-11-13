@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Issue line completion tags</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  .ember { --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+           --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154; --brand: 251 146 60;
+           --plan: 129 140 248; --gate: 217 119 6; --build: 96 165 250; --pr: 52 211 153; --info: 125 211 252; }
+  .dawn  { --bg: 242 244 247; --surface: 255 255 255; --raised: 235 238 243; --edge: 214 219 228; --edge-strong: 174 182 196;
+           --fg: 21 26 34; --muted: 74 85 103; --faint: 95 106 130; --brand: 185 60 11;
+           --plan: 79 70 229; --gate: 161 98 7; --build: 37 99 235; --pr: 4 120 87; --info: 3 105 161; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "IBM Plex Sans", system-ui, sans-serif; background: #111; color: #ddd; }
+  .intro { padding: 20px 24px 8px; }
+  .intro h1 { font-size: 18px; margin: 0 0 6px; color: #eee; }
+  .intro p { margin: 0 0 6px; font-size: 13px; color: #aaa; line-height: 1.5; max-width: 1100px; }
+  .wbtn { font: inherit; font-size: 12px; margin-right: 6px; padding: 3px 9px; border-radius: 6px; border: 1px solid #555; background: #222; color: #ddd; cursor: pointer; }
+  .wbtn.on { border-color: #fb923c; color: #fb923c; }
+  .stage { padding: 18px 24px 40px; background: rgb(var(--bg)); color: rgb(var(--fg)); }
+  .variant-title { font-size: 13px; font-weight: 600; margin: 26px 0 4px; }
+  .variant-title .tag { font-weight: 500; font-size: 11px; padding: 1px 6px; border-radius: 4px; margin-left: 6px; border: 1px solid rgb(var(--edge)); color: rgb(var(--muted)); }
+  .variant-title .tag.rec { color: rgb(var(--brand)); border-color: rgb(var(--brand) / .5); }
+  .variant-note { font-size: 12px; color: rgb(var(--faint)); margin: 0 0 10px; max-width: 1000px; line-height: 1.5; }
+  .card { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: 16px; padding: 22px 26px 26px; max-width: 1088px; }
+  .card-h { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+  .card-h h3 { margin: 0; font-size: 13px; letter-spacing: .08em; color: rgb(var(--muted)); font-weight: 600; }
+  .card-h span { font-size: 13px; color: rgb(var(--muted)); }
+  .line { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); position: relative; }
+  .rail { position: absolute; left: 12px; right: calc(20% - 12px); top: 11px; height: 2px; background: rgb(var(--edge-strong)); }
+  .st { position: relative; padding-right: 12px; }
+  .node { width: 22px; height: 22px; border-radius: 50%; border: 2px solid rgb(var(--edge-strong)); background: rgb(var(--surface)); position: relative; z-index: 1; }
+  .node.plan { background: rgb(var(--plan)); border-color: rgb(var(--plan)); box-shadow: 0 0 0 5px rgb(var(--plan) / .2); }
+  .node.gate { transform: rotate(45deg) scale(.85); border-radius: 3px; border-color: rgb(var(--gate)); }
+  .node.build { background: rgb(var(--build)); border-color: rgb(var(--build)); box-shadow: 0 0 0 5px rgb(var(--build) / .2); }
+  .node.pr { border-color: rgb(var(--pr)); }
+  .lbl { margin-top: 14px; font-size: 12px; letter-spacing: .08em; color: rgb(var(--muted)); }
+  .num { font-size: 34px; font-weight: 600; line-height: 1.2; }
+  .num.gate { color: rgb(var(--gate)); }
+  .num small { font-size: 15px; color: rgb(var(--muted)); font-weight: 500; }
+  .cap { font-size: 13px; color: rgb(var(--muted)); min-height: 19px; }
+  .cap b { color: rgb(var(--info)); font-weight: 500; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .rc { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; padding: 2px 8px; border-radius: 8px; border: 1px solid; font-weight: 500; white-space: nowrap; }
+  .rc.plan { color: rgb(var(--plan)); border-color: rgb(var(--plan) / .45); background: rgb(var(--plan) / .08); }
+  .rc.gate { color: rgb(var(--gate)); border-color: rgb(var(--gate) / .45); background: rgb(var(--gate) / .08); }
+  .rc.build { color: rgb(var(--build)); border-color: rgb(var(--build) / .45); background: rgb(var(--build) / .08); }
+  .rc.pr { color: rgb(var(--pr)); border-color: rgb(var(--pr) / .45); background: rgb(var(--pr) / .08); }
+  .t { font-size: 12px; padding: 0 6px; border-radius: 5px; border: 1px solid rgb(var(--edge-strong)); color: rgb(var(--fg)); background: rgb(var(--raised)); font-weight: 500; }
+  .t.info { border-color: rgb(var(--info) / .5); color: rgb(var(--info)); background: rgb(var(--info) / .08); }
+  .t.info::before { content: "●"; font-size: 8px; margin-right: 4px; vertical-align: 1px; animation: p 1.6s ease-in-out infinite; }
+  @keyframes p { 50% { opacity: .35; } }
+  .note-under { margin-top: 12px; font-size: 12px; color: rgb(var(--faint)); }
+</style>
+</head>
+<body>
+<div class="intro">
+  <h1>Overview Issue work: completion check on the Building chips</h1>
+  <p>Sample matches your screenshot (#4198 is "Checking completion · 99%" in the runs list), plus #4201 reworking unmet milestones and #4230 in a code cross-check during completion, to show the tie-break.</p>
+  <p>Theme: <button class="wbtn" data-theme="ember">Ember</button><button class="wbtn" data-theme="dawn">Dawn</button></p>
+</div>
+<div class="stage ember" id="stage"></div>
+<script>
+  const chip = (cls, n, tag) => `<span class="rc ${cls}">#${n}${tag ? ` <span class="${tag.cls}" title="${tag.title}">${tag.text}</span>` : ""}</span>`;
+  const T = {
+    xc: { cls: "t", text: "cross-checking", title: "Plan cross-check in progress" },
+    xcCode: { cls: "t", text: "cross-checking", title: "Code cross-check in progress (advisory, does not block)" },
+    check: { cls: "t info", text: "checking completion", title: "Checking completion: verifying every milestone is met" },
+    rework: { cls: "t info", text: "reworking milestones", title: "Reworking unmet milestones after the completion check" },
+  };
+  function card(build, buildCap) {
+    return `<div class="card">
+      <div class="card-h"><h3>ISSUE WORK</h3><span>6 runs on the line, 1 other</span></div>
+      <div class="line"><div class="rail"></div>
+        <div class="st"><div class="node"></div><div class="lbl">QUEUED</div><div class="num">0</div><div class="cap">Queue empty</div></div>
+        <div class="st"><div class="node plan"></div><div class="lbl">PLANNING</div><div class="num">1</div><div class="cap">Lead drafting a plan</div><div class="chips">${chip("plan", 4268, T.xc)}</div></div>
+        <div class="st"><div class="node gate"></div><div class="lbl">PLAN REVIEW</div><div class="num gate">1</div><div class="cap">Waiting on you</div><div class="chips">${chip("gate", 4276)}</div></div>
+        <div class="st"><div class="node build"></div><div class="lbl">BUILDING</div><div class="num">4</div><div class="cap">${buildCap}</div><div class="chips">${build}</div></div>
+        <div class="st"><div class="node pr"></div><div class="lbl">PR OPEN</div><div class="num">3 <small>PRs</small></div><div class="cap">PR state as last seen by uzi</div><div class="chips">${chip("pr", 4258)}${chip("pr", 4007)}${chip("pr", 4205)}</div></div>
+      </div></div>`;
+  }
+  const variants = [
+    { title: "A. Today", tag: "no completion state", note: "Only the cross-check tag exists. #4198 and #4201 look like any building run, though the runs list says Checking completion / Reworking unmet milestones.",
+      html: card(chip("build", 4198) + chip("build", 4201) + chip("build", 4230, T.xcCode) + chip("build", 4209), "Implement, review, validate") },
+    { title: "B. Tags only", tag: "chip tags", note: "Chips carry the completion phase in the pill's words (shortened 'reworking milestones'), pulsing info tone like the pill. Completion wins over a code cross-check on the same run (#4230 shows checking completion; the cross-check stays in its tooltip). Caption unchanged.",
+      html: card(chip("build", 4198, T.check) + chip("build", 4201, T.rework) + chip("build", 4230, { ...T.check, title: "Checking completion; code cross-check also running (advisory)" }) + chip("build", 4209), "Implement, review, validate") },
+    { title: "C. Tags plus caption", tag: "recommended", rec: true, note: "B, and the Building caption counts the phases when any run is in one: '1 building · 2 checking completion · 1 reworking'. With none, the caption stays 'Implement, review, validate'.",
+      html: card(chip("build", 4198, T.check) + chip("build", 4201, T.rework) + chip("build", 4230, { ...T.check, title: "Checking completion; code cross-check also running (advisory)" }) + chip("build", 4209), "1 building · <b>2 checking completion</b> · <b>1 reworking</b>") },
+    { title: "C, real data from the screenshot", tag: "your instance now", note: "Only #4198 is in its completion check.",
+      html: card(chip("build", 4198, T.check) + chip("build", 4201), "1 building · <b>1 checking completion</b>") },
+  ];
+  const stage = document.getElementById("stage");
+  for (const v of variants) {
+    const t = document.createElement("div"); t.className = "variant-title"; t.innerHTML = `${v.title}<span class="tag${v.rec ? " rec" : ""}">${v.tag}</span>`;
+    const n = document.createElement("p"); n.className = "variant-note"; n.textContent = v.note;
+    const w = document.createElement("div"); w.innerHTML = v.html;
+    stage.append(t, n, w);
+  }
+  document.querySelectorAll("[data-theme]").forEach((b) => b.onclick = () => { stage.className = "stage " + b.dataset.theme; document.querySelectorAll("[data-theme]").forEach((x) => x.classList.toggle("on", x === b)); });
+  document.querySelector('[data-theme="ember"]').classList.add("on");
+</script>
+</body>
+</html>

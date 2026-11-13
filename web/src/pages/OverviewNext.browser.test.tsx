@@ -179,6 +179,36 @@ describe("OverviewNext issue work line", () => {
     expect(bays[0].top).toBeGreaterThanOrEqual(Math.max(...rects.map((r) => r.bottom)));
   });
 
+  it("fits completion tags and the longest Building caption at desktop and phone widths", async () => {
+    for (const width of [1280, 400]) {
+      cleanup();
+      await page.viewport(width, 900);
+      mockApi.listRuns.mockResolvedValue({ runs: [
+        aRun({ id: "checking", status: "running", issue_iid: 4198, completion_phase: "checking" }),
+        aRun({ id: "reworking", status: "running", issue_iid: 4201, completion_phase: "reworking" }),
+        aRun({ id: "both", status: "running", issue_iid: 4230, completion_phase: "checking", cross_check_active: "code" }),
+        aRun({ id: "plain", status: "running", issue_iid: 4209 }),
+      ] });
+      render(
+        <MemoryRouter initialEntries={["/overview/next"]}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8"><OverviewNext /></main>
+        </MemoryRouter>,
+      );
+      const card = await screen.findByRole("region", { name: "Issue work" });
+      const building = card.querySelector<HTMLElement>('[data-stage="building"]')!;
+      await expect.poll(() => building.textContent ?? "").toContain("1 building · 2 checking completion · 1 reworking");
+      await document.fonts.ready;
+      const edge = building.getBoundingClientRect().right;
+      for (const label of ["#4198", "#4201", "#4230"]) {
+        const chip = within(building).getByText(label);
+        expect(chip.getBoundingClientRect().right, `${label} at ${width}px`).toBeLessThanOrEqual(edge + 1);
+      }
+      const caption = within(building).getByText("1 building · 2 checking completion · 1 reworking");
+      expect(caption.getBoundingClientRect().right).toBeLessThanOrEqual(edge + 1);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+    }
+  });
+
   for (const width of [400, 320]) {
     it(`stacks the line vertically at ${width}px with no horizontal overflow`, async () => {
       await page.viewport(width, 900);
