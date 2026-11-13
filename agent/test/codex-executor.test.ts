@@ -869,6 +869,7 @@ describe("M3 actual runner memory Codex delivery", () => {
       let signalQueued: (queued: boolean) => void = () => {};
       let signalHoldRequest: (requested: boolean) => void = () => {};
       let holdTask: Promise<void> | undefined;
+      let disarm: () => void = () => {}, resolveHoldReady: () => void = () => {};
       if (exhausted) {
         // Empty source-only capture: fake effect handles cannot execute Git commands.
         m2Runner.git.worktreeStatus = async () => { captureStatusReads++; return []; };
@@ -1064,7 +1065,7 @@ describe("M3 actual runner memory Codex delivery", () => {
             return lockOriginal(...args);
           });
           const realNow = Date.now.bind(Date);
-          let skew = 0, skewed = false, siblingReads = 0;
+          let skew = 0, skewed = false, entrySkewed = false, siblingReads = 0;
           const queued = new Promise<boolean>(resolve => { signalQueued = resolve; });
           const readOriginal = m2Runner.git.readRemediationRestrictionFacts.bind(m2Runner.git);
           t.mock.method(m2Runner.git, "readRemediationRestrictionFacts", async (...args: Parameters<typeof readOriginal>) => {
@@ -1072,11 +1073,16 @@ describe("M3 actual runner memory Codex delivery", () => {
             siblingReads++;
             const read = readOriginal(...args); // queues on the bare lock synchronously
             signalQueued(true);
+            // Late cleanup only: a Node timer can fire about 1ms before Date.now() reaches its deadline, which
+            // would make the launch retry classify the sibling's own expiry as unknown. This one-time, forward-only
+            // 5ms skew (about 1500ms before any deadline, after the nested operation's timer is armed) models the
+            // CI signature deterministically: the expiry is classified as the round's own deadline.
+            if (!lateCapture && !entrySkewed) { entrySkewed = true; skew = 5; }
             const facts = await read;
             if (lateCapture && !skewed) { skewed = true; skew = 600; }
             return facts;
           });
-          if (lateCapture) t.mock.method(Date, "now", () => realNow() + skew);
+          t.mock.method(Date, "now", () => realNow() + skew);
           let armed = false, holdState = "none" as "none" | "held" | "released";
           let refState = "pending" as "pending" | "aborted" | "acquired", refStarted = false;
           let decided = "pending" as "pending" | "path1" | "path2", releasedAt: number | undefined;
@@ -1097,7 +1103,8 @@ describe("M3 actual runner memory Codex delivery", () => {
             const progress = (args[4] as { restrictionProgress?: { cause?: string } } | undefined)?.restrictionProgress;
             if (!armed || !progress || !siblingScope.getStore()) return recoveryOriginal(...args);
             progresses.push(progress);
-            siblingDeadline = args[1] as number;
+            // Effective deadline: withRecoveryOperation takes min(deadline, parent operation's deadline).
+            siblingDeadline = Math.min(args[1] as number, gitAny.recoveryOperations.getStore()?.deadline ?? Infinity);
             const action = args[2] as (signal: AbortSignal) => Promise<unknown>;
             args = [...args];
             args[2] = (signal: AbortSignal) => { siblingOpSignal = signal; return action(signal); };
@@ -1130,7 +1137,8 @@ describe("M3 actual runner memory Codex delivery", () => {
                 refState = "acquired";
               } catch { refState = "aborted"; }
               // The abort is the single decision event. Path 2 (the sibling's own lock wait is already over:
-              // recorded pre-read cause, its effective operation signal aborted, or its deadline reached):
+              // recorded pre-read cause, its operation signal aborted, or its effective deadline, the minimum with
+              // the parent operation's, reached):
               // keep the hold until the sibling-ready wait settles. Path 1: release now and restart the
               // sibling's 3000ms clock from the release.
               const siblingOver = progresses[0]?.cause === "pre_read_unavailable" ||
@@ -1141,6 +1149,8 @@ describe("M3 actual runner memory Codex delivery", () => {
               holdState = "released";
             })();
           }
+          disarm = () => { armed = false; };
+          resolveHoldReady = holdReady;
           armed = true;
           const executedAt = performance.now();
           siblingWork = runner.execute(sibling);
@@ -1253,7 +1263,9 @@ describe("M3 actual runner memory Codex delivery", () => {
         releaseCleanup();
         releaseSibling();
         signalQueued(false);
+        disarm();
         signalHoldRequest(false);
+        resolveHoldReady();
         settleReady();
         releaseHold();
         await holdTask?.catch(() => {});
