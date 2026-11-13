@@ -27229,7 +27229,8 @@ export class RunRunner {
         return await this.inPlaceGiveUp(flight, runLog, opId, lifecycle);
       }
       // The old credential's last known cumulative reading, read once after the drain and sent
-      // unchanged on every same-op retry. Informational only; omitted when there is none.
+      // unchanged on every same-op retry and for the newer op after a `superseded` answer. Informational
+      // only; omitted when there is none.
       const oldCumulative = flight.batcher.lastSessionCumulative();
       let uncertainAttempts = 0;
       for (;;) {

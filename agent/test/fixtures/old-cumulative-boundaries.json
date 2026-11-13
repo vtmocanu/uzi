@@ -392,6 +392,38 @@
    "name": "empty object is undefined",
    "modelUsage": {},
    "expected": null
+  },
+  {
+   "name": "model id with NUL skipped, sibling kept",
+   "modelUsage": {
+    "a\u0000b": {
+     "inputTokens": 1
+    },
+    "ok": {
+     "inputTokens": 2
+    }
+   },
+   "expected": {
+    "ok.inputTokens": 2
+   }
+  },
+  {
+   "name": "model id with tab skipped",
+   "modelUsage": {
+    "a\tb": {
+     "inputTokens": 1
+    }
+   },
+   "expected": null
+  },
+  {
+   "name": "model id with DEL skipped",
+   "modelUsage": {
+    "ab": {
+     "inputTokens": 1
+    }
+   },
+   "expected": null
   }
  ],
  "violations": [

@@ -10,6 +10,7 @@ import type { Logger } from "../src/log.js";
 import os from "node:os";
 import { MessageBatcher, MAX_MESSAGE_BYTES } from "../src/batcher.js";
 import { RequestError, ReportPreconditionError, type CredentialSwitchApplyResult, type WorkerClient } from "../src/client.js";
+import { projectResult } from "../src/harness-messages.js";
 import { Outbox } from "../src/outbox.js";
 import { SecretSet } from "../src/redact.js";
 import { CredentialSwitchSignal, SteeringChannel } from "../src/steering.js";
@@ -620,7 +621,33 @@ describe("issue #4201 m2c: apply outcomes other than applied", () => {
       usage: { input_tokens: 999, output_tokens: 999 },
       modelUsage: { "claude-test": { inputTokens: 120, outputTokens: 34, cacheReadInputTokens: 5, cacheCreationInputTokens: 6, costUSD: 0.5 } },
     } as unknown as SDKMessage;
-    const r = await scenario({ site: "implement_turn", planResult, apply: [{ outcome: "applied", token: NEW_TOKEN, replyLost: true }] });
+    // Between the lost-reply send and its retry, a NEWER session-cumulative frame passes the flight's batcher
+    // (which the hold keeps buffering): the retry must still carry the reading fixed before the first send.
+    const heldBatchers: MessageBatcher[] = [];
+    const holdFn = MessageBatcher.prototype.holdForCredentialSwitch;
+    MessageBatcher.prototype.holdForCredentialSwitch = function (this: MessageBatcher) { heldBatchers.push(this); return holdFn.call(this); };
+    const applyFn = client.applyCredentialSwitch.bind(client);
+    let sends = 0;
+    client.applyCredentialSwitch = (async (...args: Parameters<typeof applyFn>) => {
+      try {
+        return await applyFn(...args);
+      } finally {
+        if (++sends === 1) {
+          heldBatchers[0]!.emit(projectResult({
+            outcome: "success", subtype: "success", errors: [], usageBasis: "session_cumulative",
+            wire: { usage: {}, modelUsage: { "claude-test": { inputTokens: 9999 } }, num_turns: 1, duration_ms: 1, total_cost_usd: 0 },
+          }));
+        }
+      }
+    }) as typeof client.applyCredentialSwitch;
+    let r: Awaited<ReturnType<typeof scenario>>;
+    try {
+      r = await scenario({ site: "implement_turn", planResult, apply: [{ outcome: "applied", token: NEW_TOKEN, replyLost: true }] });
+    } finally {
+      MessageBatcher.prototype.holdForCredentialSwitch = holdFn;
+      client.applyCredentialSwitch = applyFn;
+    }
+    assert.equal(sends, 2, "the lost-reply send and its retry");
     const want = {
       "claude-test.cacheCreationInputTokens": 6, "claude-test.cacheReadInputTokens": 5,
       "claude-test.inputTokens": 120, "claude-test.outputTokens": 34,
