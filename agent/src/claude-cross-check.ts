@@ -24,6 +24,7 @@ import type { ActivitySettle, CheckActivityRecorder } from "./cross-check-activi
 import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 
 import type { ClaimResponse } from "./protocol.js";
+import type { ClaimAnthropicEndpoint } from "./protocol.js";
 import type { Logger } from "./log.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { CODE_VERDICT_SCHEMA, PLAN_VERDICT_SCHEMA, codeCrossCheckBrief, codeCrossCheckBriefWithGuidance, codeGuidanceOf, crossCheckBrief, crossCheckPrompt, CrossCheckMalformedError, validateCodeFindings, validateVerdict } from "./codex/cross-check.js";
@@ -146,6 +147,10 @@ export function buildClaudeCrossCheckOptions(input: {
   cwd: string;
   homeDir: string;
   oauthToken: string;
+  /** PRD #229 D10: the instance's custom Anthropic-Messages endpoint, when one is bound.
+   *  It REPLACES the subscription token as this checker's credential, so a checker on an
+   *  endpoint-only instance has something to talk to. Absent ⇒ byte-identical env. */
+  anthropicEndpoint?: ClaimAnthropicEndpoint;
   log: Logger;
   secretPaths: readonly string[];
   gate: InitGate;
@@ -163,7 +168,7 @@ export function buildClaudeCrossCheckOptions(input: {
   const options: SdkOptions = {
     cwd: input.cwd,
     // A full replacement: only these keys reach the SDK child (sdk-env.ts).
-    env: isolateSdkEnv(buildSdkEnv(input.oauthToken, input.homeDir)) as unknown as Record<string, string | undefined>,
+    env: isolateSdkEnv(buildSdkEnv(input.oauthToken, input.homeDir, {}, undefined, undefined, undefined, input.anthropicEndpoint)) as unknown as Record<string, string | undefined>,
     // Guardrail invariant #6 (semgrep/settings-sources-isolation.yml): nothing from disk, so a
     // cloned repo's .claude/ can grant the checker nothing. Keep this a LITERAL.
     settingSources: [],
@@ -439,7 +444,12 @@ export class ClaudeCrossCheck {
     if (claim.kind !== "cross_check") throw new Error("cross-check requires a cross_check claim");
     if (claim.secrets.codex) throw new Error("cross-check Claude path refuses a Codex credential");
     const token = claim.secrets.anthropic_oauth_token?.trim();
-    if (!token) throw new CrossCheckCheckerUnavailableError();
+    // PRD #229 D10: the endpoint is this checker's credential when one is bound; the claim
+    // then carries no token at all. Requiring a token made the Claude checker unavailable on
+    // exactly the deployment the endpoint feature exists for, so the review stage of every
+    // run there had no checker.
+    const anthropicEndpoint = claim.secrets.anthropic_endpoint;
+    if (!token && !anthropicEndpoint) throw new CrossCheckCheckerUnavailableError();
     const prompt = crossCheckPrompt(claim);
     const code = claim.cross_check?.stage === "code";
     const effort = claim.config?.default_effort;
@@ -449,7 +459,8 @@ export class ClaudeCrossCheck {
     const model = claim.config?.default_model?.trim();
     const modelPinned = claim.cross_check?.model_source === "pin";
 
-    this.log.addSecret(token);
+    if (token) this.log.addSecret(token);
+    if (anthropicEndpoint?.api_key) this.log.addSecret(anthropicEndpoint.api_key);
     const gate: InitGate = { passed: false };
     const abort = new AbortController();
     const onCancel = (): void => abort.abort(signal.reason);
@@ -472,7 +483,7 @@ export class ClaudeCrossCheck {
     let nativeClean = false;
     try {
       const options = buildClaudeCrossCheckOptions({
-        cwd: checkout, homeDir: home, oauthToken: token, log: this.log, secretPaths: this.opts.secretPaths, gate,
+        cwd: checkout, homeDir: home, oauthToken: token ?? "", anthropicEndpoint, log: this.log, secretPaths: this.opts.secretPaths, gate,
         brief: code ? codeCrossCheckBriefWithGuidance("Read, Grep and Glob", codeGuidanceOf(claim)) : crossCheckBrief("Read, Grep and Glob"), maxTurns: this.opts.maxTurns,
         outputSchema: schema,
         ...(budget ? { toolBudgetHook: budget.hook } : {}),
@@ -593,7 +604,8 @@ export class ClaudeCrossCheck {
       } catch (error) {
         failure ??= { error };
       } finally {
-        this.log.removeSecret(token);
+        if (token) this.log.removeSecret(token);
+        if (anthropicEndpoint?.api_key) this.log.removeSecret(anthropicEndpoint.api_key);
       }
     }
     if ((code || confirmNativeCleanup) && !nativeClean) throw new CrossCheckConfinementError("cleanup_unconfirmed", failure ? priorCrossCheckFailure(failure.error) : undefined);

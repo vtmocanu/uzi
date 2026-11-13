@@ -217,7 +217,7 @@ export class CrossCheckRunner {
     try {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
       if (ack?.staleClaim) return;
-      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, claim.secrets.codex?.capability];
+      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, claim.secrets.anthropic_endpoint?.api_key, claim.secrets.codex?.capability];
       const b = new MessageBatcher(this.client, runId, claim.last_seq ?? 0, this.opts.batchMs ?? 500, this.log,
         makeRedactor(secrets), makeTextRedactor(secrets), {
           ...(this.opts.outbox ? { outbox: this.opts.outbox } : {}),
@@ -234,7 +234,7 @@ export class CrossCheckRunner {
       // Single-family custody: a Codex checker holds only a Codex credential, a Claude checker only
       // the Anthropic token (PRD #2460); a claim carrying both, or neither, is invalid.
       const family = selectCodexBinding(claim.secrets).kind;
-      const hasAnthropic = Boolean(claim.secrets.anthropic_oauth_token);
+      const hasAnthropic = Boolean(claim.secrets.anthropic_oauth_token || claim.secrets.anthropic_endpoint);
       const checker = family === "codex" ? (hasAnthropic ? undefined : this.model)
         : hasAnthropic ? this.claudeModel : undefined;
       familyName = checker === this.model ? "codex" : checker === this.claudeModel ? "claude" : "unknown";

@@ -536,12 +536,37 @@ type ClaimSecrets struct {
 	ForgeUsername       string `json:"forge_username"`
 	ForgePAT            string `json:"forge_pat"`
 	AnthropicOAuthToken string `json:"anthropic_oauth_token"`
+	// AnthropicEndpoint binds this run's Claude harness to an admin-allowlisted
+	// custom Anthropic-Messages-compatible endpoint (PRD #229 D10). omitempty is
+	// load-bearing: an ordinary run leaves it nil so the emitted JSON carries no
+	// `anthropic_endpoint` key and a deployment with none bound stays byte-identical
+	// to today's wire.
+	//
+	// When it IS present, AnthropicOAuthToken is empty: a custom base URL must never
+	// receive the subscription token, and claim assembly enforces that structurally
+	// rather than by convention. Never logged — it carries a usable API key.
+	AnthropicEndpoint *ClaimAnthropicEndpoint `json:"anthropic_endpoint,omitempty"`
 	// Codex is the Codex credential this claim spends, present ONLY for a Codex-bound
 	// run whose frozen binding can be opened (PRD #1147 M2, activated by PRD #1429). omitempty is
 	// load-bearing: an ordinary Claude run leaves it nil so the emitted JSON is
 	// BYTE-IDENTICAL to today's wire (no `codex` key), and an old worker that never
 	// learns the key keeps working. Never logged — it carries a usable access token.
 	Codex *ClaimCodexSecrets `json:"codex,omitempty"`
+}
+
+// ClaimAnthropicEndpoint is the admin-allowlisted custom model endpoint a run's
+// Claude harness talks to instead of Anthropic's API (PRD #229 D10). The base URL
+// is checked against Config.AnthropicEndpointAllowedBaseURLs at bind time, so a
+// stored value can only ever name a host an operator already approved — repo
+// contents travel to this endpoint, which is why the run cannot choose it.
+type ClaimAnthropicEndpoint struct {
+	BaseURL string `json:"base_url"`
+	// APIKey is the endpoint's own credential. It replaces the subscription OAuth
+	// token for this run and is never sent alongside one.
+	APIKey string `json:"api_key"`
+	// Model is the endpoint's model slug (e.g. a gateway-specific id). Empty leaves
+	// the run's normal model resolution alone.
+	Model string `json:"model,omitempty"`
 }
 
 // ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run

@@ -1124,7 +1124,14 @@ func judgeDefaultChoice(c secretChoice) secretChoice {
 func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
 	var anthropic []byte
 	recordedLastSeq := run.LastSeq
-	if run.Harness != harnessCodex {
+	// PRD #229 D10: an instance-wide custom endpoint outranks the judge binding the same
+	// way it outranks the run lane's ladder. A bound judge opens no token and records no
+	// credential epoch — there is nothing to open, and running judgeChoice anyway would
+	// fail the claim on a token the judge never uses. Without this a judge run on an
+	// endpoint-only instance has no credential at all and fails at claim, which would
+	// leave such an instance able to plan and implement but unable to REVIEW.
+	anthropicEndpoint := s.claimAnthropicEndpoint(run)
+	if run.Harness != harnessCodex && anthropicEndpoint == nil {
 		// The run owner's JUDGE binding resolves the credential — and deliberately NOT the
 		// claiming worker's binding, even though a judge run is claimed by an ordinary
 		// worker through the same ClaimRun lane. Under PRD #104 D1 the judge lane is bound
@@ -1300,7 +1307,11 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 			// repo. The wire still carries the (empty) forge_pat key because a judge run
 			// rides the ordinary ClaimPayload; the no-PAT guarantee is that assembly
 			// never decrypts one, asserted in judge_test.go.
-			AnthropicOAuthToken: string(anthropic),
+			// PRD #229 D10: the same mutual exclusion the run lane applies, as data. A
+			// bound judge carries the endpoint and NO token, so no downstream consumer
+			// has to remember to prefer one.
+			AnthropicOAuthToken: claimAnthropicOAuthToken(anthropic, anthropicEndpoint),
+			AnthropicEndpoint:   anthropicEndpoint,
 		},
 		Agents:        []ClaimAgent{},
 		Skills:        []ClaimSkill{},

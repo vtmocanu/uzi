@@ -30,7 +30,7 @@ export interface CoverageBudget {
    * Must be idempotent by reservation id. Failure blocks further review calls. */
   settle(reservation: CoverageReservation, usage: { tokens: number; conservative: boolean; invoked: boolean; status: "success" | "schema_error" | "transport_error" | "unknown" }): Promise<void>;
 }
-type PassInputs = Pick<ReadOnlyModelPassOpts, "token" | "model" | "homeRoot" | "queryFn" | "codex" | "log" | "teardownTestDeps">;
+type PassInputs = Pick<ReadOnlyModelPassOpts, "token" | "model" | "homeRoot" | "queryFn" | "codex" | "log" | "teardownTestDeps" | "anthropicEndpoint">;
 
 export interface BoundedCoverageTestTransport {
   /** Explicit dormant test seam only. Neither shipped live harness has a whole-call

@@ -469,3 +469,33 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     assert.ok(!prompt.includes("CLAIM_LIST_TITLE"));
   });
 });
+
+// PRD #229 D10: the runner derives the Now controller's `claude` flag from the claim. It
+// used to read only `anthropic_oauth_token`, so an endpoint-only claim produced
+// `claude: false` and the Now summary was silently disabled — no error, no note, nothing.
+// This drives the RUNNER (not the controller) so the derivation itself is covered: the
+// controller-level tests cannot see it, which is why the sabotage of this line stayed green.
+describe("RunRunner Now summary — bound custom endpoint (PRD #229 D10)", () => {
+  it("an endpoint-only claim still produces a Now summary", async () => {
+    const calls: { options: unknown; prompt: unknown }[] = [];
+    const claim = claimFor(2610, {
+      secrets: {
+        forge_pat: "fixture-forge-pat-000000",
+        anthropic_oauth_token: "",
+        anthropic_endpoint: { base_url: "https://gateway.example", api_key: "sk-gateway", model: "gateway-model-1" },
+      },
+    });
+    api.nowSummary.set(claim.run_id, true);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-endpoint-"));
+    try {
+      await runnerFor(workingExecutor(() => notesOf(claim.run_id).length > 0), { homeRoot, queryFn: summaryQuery(calls) }).execute(claim);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+    assert.equal(notesOf(claim.run_id).length, 1, "an endpoint-only claim must still get a Now summary");
+    assert.equal(calls.length, 1);
+    const opts = calls[0]!.options as { env?: Record<string, string> };
+    assert.equal(opts.env?.ANTHROPIC_BASE_URL, "https://gateway.example",
+      "the Now pass must reach the SDK with the bound endpoint");
+  });
+});

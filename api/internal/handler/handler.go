@@ -620,6 +620,10 @@ func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox
 	// handler tests construct a Handler with no workersvc.
 	if wsvc != nil {
 		wsvc.SetForgeBaseURLAllowed(cfg.ForgeBaseURLAllowed)
+		// PRD #229 D10: bind Claude runs to the instance's custom Anthropic-Messages
+		// endpoint. Empty config leaves it nil, so a deployment without one behaves
+		// exactly as before.
+		wsvc.SetAnthropicEndpoint(cfg.AnthropicEndpointURL, cfg.AnthropicEndpointAPIKey, cfg.AnthropicEndpointModel)
 	}
 	// Build the run-now scheduler from the same concretes main.go wires into the
 	// standalone background scheduler (Store/RunCreator/ForgeBuilder/SettingsReader).

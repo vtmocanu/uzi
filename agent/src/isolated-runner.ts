@@ -133,7 +133,10 @@ export function preflightReason(
   if (!opts.fetcherUrl || !opts.fetcherCaFile) {
     return "this worker is not configured for the isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE are required)";
   }
-  if (!secrets?.anthropic_oauth_token?.trim()) return "profile-bound claim carried no Anthropic OAuth token";
+  // PRD #229 D10: a bound endpoint IS the credential (the claim carries it instead of a
+  // token), so demanding a token refused every profile-bound run on an endpoint-only
+  // instance — the one deployment shape the endpoint exists for.
+  if (!secrets?.anthropic_oauth_token?.trim() && !secrets?.anthropic_endpoint) return "profile-bound claim carried no Anthropic credential";
   return undefined;
 }
 
@@ -215,8 +218,12 @@ export class IsolatedRunner {
     const runLog = this.log.child({ run_id: runId, kind: "isolated" });
     const grant = validGrant(claim.isolated_fetch);
     const token = claim.secrets?.anthropic_oauth_token?.trim() ?? "";
+    // PRD #229 D10: the endpoint replaces the token as this run's credential, so its key is
+    // scrubbed exactly like the token it stands in for.
+    const anthropicEndpoint = claim.secrets?.anthropic_endpoint;
+    const endpointKey = anthropicEndpoint?.api_key;
     // Registered before anything can log; evicted in the finally.
-    const runSecrets = [token, grant?.credential ?? ""].filter((s) => s.length > 0);
+    const runSecrets = [token, endpointKey ?? "", grant?.credential ?? ""].filter((s) => s.length > 0);
     for (const s of runSecrets) this.log.addSecret(s);
     this.opts.activeRuns?.add(runId, generation);
 
@@ -228,7 +235,7 @@ export class IsolatedRunner {
       return;
     }
 
-    const secrets = [token, grant.credential, this.opts.joinToken];
+    const secrets = [token, endpointKey, grant.credential, this.opts.joinToken];
     const redactText = makeTextRedactor(secrets);
     const runDir = path.join(this.opts.dataDir, "isolated", runId);
     let batcher: MessageBatcher | undefined;
@@ -285,6 +292,7 @@ export class IsolatedRunner {
       await this.executor.run({
         runId,
         oauthToken: token,
+        anthropicEndpoint,
         workspace,
         homeDir,
         prompt: buildPrompt(claim, grant),

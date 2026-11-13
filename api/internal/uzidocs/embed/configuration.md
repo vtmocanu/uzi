@@ -210,6 +210,28 @@ repo's own restatement. There is no env var for it — the response caps
 handler and the per-session call budget (40 calls) is a fixed constant in
 the agent's forge tool server, neither configurable.
 
+## Custom model endpoint (PRD #229 D10)
+
+Point the Claude path at an Anthropic-Messages-compatible endpoint instead of
+Anthropic's API. Repo contents travel to whichever endpoint a run's Claude side
+talks to, so the endpoint is operator configuration, not a per-run or per-repo
+choice: an arbitrary base URL would be an exfiltration channel.
+
+| Var | Default | Notes |
+|---|---|---|
+| `ANTHROPIC_ENDPOINT_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for the custom endpoint host; every entry must be an absolute `https://` URL, and a malformed entry fails the boot. An **empty** list turns the feature off, so an unconfigured instance behaves exactly as before. Matching is on the normalized origin (scheme + host), and a URL carrying userinfo is refused outright. |
+| `ANTHROPIC_ENDPOINT_URL` | *(empty)* | The custom endpoint every Claude run on this instance is bound to, e.g. a hosted gateway serving `/v1/messages`. Must appear on `ANTHROPIC_ENDPOINT_ALLOWED_BASE_URLS` or the boot fails. Empty ⇒ the feature is off. |
+| `ANTHROPIC_ENDPOINT_API_KEY` | *(empty)* | The credential for `ANTHROPIC_ENDPOINT_URL`'s endpoint. It **replaces** the per-run subscription token, which is then excluded from both the claim and the SDK child env — the two never travel together. Setting this without a URL, or a URL without this, is a boot error. |
+| `ANTHROPIC_ENDPOINT_MODEL` | *(empty)* | The model slug the endpoint serves, e.g. a gateway's own model id. **Required whenever `ANTHROPIC_ENDPOINT_URL` is set**: a custom endpoint does not serve Anthropic's model names, and the SDK's resolved default would address a model the host does not have, failing inside the provider rather than at boot. The value is pinned onto every model slot the SDK resolves — the lead, every subagent, the small/fast lane and the auto-mode classifier — because one endpoint carries one model, and an agent definition's own `model:` outranks `CLAUDE_CODE_SUBAGENT_MODEL`, so a template pin left in place asks the endpoint for a model it does not serve. A second model on the same host is a second endpoint, not a list here. Setting this without a URL is a boot error. |
+
+When an endpoint is bound, the run's claim carries no subscription token at
+all and `buildSdkEnv` sets `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` while
+clearing `CLAUDE_CODE_OAUTH_TOKEN` in the same object. The endpoint's model
+replaces the resolved model for the lead and every subagent, because an agent
+definition's own `model:` outranks `CLAUDE_CODE_SUBAGENT_MODEL` and the
+builtin roles all pin one. A Codex run is never bound: it has its own
+credential block and does not talk to an Anthropic-shaped endpoint.
+
 ## Agent-source repo sync (PRD #602)
 
 See [Agent source](agent-source.md) for the admin-facing setup (URL, ref,

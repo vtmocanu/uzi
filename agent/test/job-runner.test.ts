@@ -714,6 +714,38 @@ describe("JobRunner (PRD #1908 M4)", () => {
     assert.strictEqual((seen.options!.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN, "sk-fixture-model-credential");
   });
 
+  it("runs a job on an endpoint-only claim: the endpoint key rides the env and the subscription token is absent", async () => {
+    const { client, calls } = fakeClient();
+    const seen: { options?: SdkOptions } = {};
+    const qf = scripted(async function* ({ options }) {
+      yield INIT_OK;
+      const res = await callSubmit(options, GOOD_RESULT);
+      assert.strictEqual(res.isError, undefined);
+      yield RESULT_OK;
+    }, seen);
+    // PRD #229 D10: the server sends the endpoint INSTEAD of the token, so a job on an
+    // endpoint-only instance has no token at all. Gating on the token failed it at start.
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim({
+      secrets: { forge_pat: "", anthropic_oauth_token: "", anthropic_endpoint: { base_url: "https://gateway.example/v1", api_key: "sk-gateway", model: "m-1" } },
+    }));
+
+    assert.deepStrictEqual(calls.order, ["state:running", "result", "state:completed"], "the job ran to completion");
+    const env = seen.options!.env as Record<string, string | undefined>;
+    assert.strictEqual(env.ANTHROPIC_BASE_URL, "https://gateway.example/v1");
+    assert.strictEqual(env.ANTHROPIC_AUTH_TOKEN, "sk-gateway");
+    assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, undefined, "the subscription token never travels beside an endpoint");
+  });
+
+  it("still fails a claim carrying neither a token nor an endpoint", async () => {
+    const { client, calls } = fakeClient();
+    const qf = scripted(async function* () { yield RESULT_OK; });
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim({
+      secrets: { forge_pat: "", anthropic_oauth_token: "" },
+    }));
+    assert.deepStrictEqual(calls.order, ["state:failed"]);
+    assert.match(calls.states[0]!.body.failure_reason!, /no Anthropic credential/);
+  });
+
   it("fails a job that ends without a submitted result, with a clear reason, and posts no result", async () => {
     const { client, calls } = fakeClient();
     const qf = scripted(async function* () {

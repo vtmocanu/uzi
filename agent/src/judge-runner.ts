@@ -36,6 +36,7 @@ import type { CodexBinding } from "./codex/select.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import { errMessage } from "./util.js";
 import type {
+  ClaimAnthropicEndpoint,
   ClaimResponse,
   JudgeSignal,
   JudgeTraceResponse,
@@ -324,11 +325,16 @@ export class JudgeRunner {
         usageMessage = judged.usageMessage;
       } else {
         const token = claim.secrets?.anthropic_oauth_token?.trim();
-        if (!token) {
-          this.log.warn("judge claim carried no Anthropic token; using deterministic fallback", { run_id: judgeRunId });
+        // PRD #229 D10: a bound endpoint IS the judge's credential, so it satisfies the same
+        // requirement the subscription token does. Without this an endpoint-only instance
+        // (no token at all) silently degraded every judge to the deterministic fallback —
+        // a review that looks real but never consulted a model.
+        const endpoint = claim.secrets?.anthropic_endpoint;
+        if (!token && !endpoint) {
+          this.log.warn("judge claim carried no Anthropic token or endpoint; using deterministic fallback", { run_id: judgeRunId });
           review = fallbackReview(claim.judge_signal);
         } else {
-          const judged = await this.judge(claim, trace, token);
+          const judged = await this.judge(claim, trace, token ?? "", endpoint);
           review = judged.review;
           usageMessage = judged.usageMessage;
         }
@@ -503,6 +509,7 @@ export class JudgeRunner {
     claim: ClaimResponse,
     trace: ReducedJudgeTrace,
     token: string,
+    endpoint?: ClaimAnthropicEndpoint,
   ): Promise<{ review: ReviewRequest; usageMessage?: EmittedMessage }> {
     const model = (claim.judge_model ?? "").trim();
     try {
@@ -514,7 +521,7 @@ export class JudgeRunner {
         claim.target_cost_status ?? null,
         claim.target_cost_usd ?? null,
       );
-      const { text, result } = await this.runModel(token, model, prompt, claim.config?.default_effort);
+      const { text, result } = await this.runModel(token, model, prompt, claim.config?.default_effort, endpoint);
       return { review: calibrateReview(parseReview(text, model), claim.failure_class ?? null), usageMessage: result };
     } catch (err) {
       if (err instanceof LimitReachedError) throw err;
@@ -589,7 +596,13 @@ export class JudgeRunner {
     }
   }
 
-  private async runModel(token: string, model: string, prompt: string, effort?: EffortLevel): Promise<{ text: string; result?: EmittedMessage }> {
+  private async runModel(
+    token: string,
+    model: string,
+    prompt: string,
+    effort?: EffortLevel,
+    anthropicEndpoint?: ClaimAnthropicEndpoint,
+  ): Promise<{ text: string; result?: EmittedMessage }> {
     // The terminal success frame mapped to a run message (PRD #69 M6): mapSdkMessage
     // routes a result frame through mapResult, which carries event:"result" + modelUsage
     // — the only fields the API's foldRunUsage reads. Surfaced to execute() to post so a
@@ -598,6 +611,7 @@ export class JudgeRunner {
     let result: EmittedMessage | undefined;
     const text = await runReadOnlyModelPass({
       token,
+      anthropicEndpoint,
       model,
       effort,
       systemPrompt: JUDGE_SYSTEM_PROMPT,

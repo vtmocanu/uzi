@@ -1127,7 +1127,14 @@ export interface ClaimSecrets {
   forge_pat: string;
   // The Anthropic subscription OAuth token (M3 sets it as
   // CLAUDE_CODE_OAUTH_TOKEN). Unused in M2; captured so the shape is stable.
+  // EMPTY whenever anthropic_endpoint is present: a custom base URL never receives
+  // the subscription token (PRD #229 D10).
   anthropic_oauth_token?: string;
+  /** An admin-allowlisted custom Anthropic-Messages-compatible model endpoint this
+   *  run's Claude harness talks to instead of Anthropic's API (PRD #229 D10).
+   *  Present ONLY when the run's owner has one bound; ordinary runs omit it so
+   *  their wire is byte-identical. See {@link ClaimAnthropicEndpoint}. */
+  anthropic_endpoint?: ClaimAnthropicEndpoint;
   // Bot login for the git commit identity + MR authorship. Used in M4; M2
   // ignores it.
   forge_username?: string;
@@ -1135,6 +1142,20 @@ export interface ClaimSecrets {
    *  run; ordinary Claude claims omit it so their wire is
    *  byte-identical. See {@link ClaimCodexSecrets}. */
   codex?: ClaimCodexSecrets;
+}
+
+/** A custom model endpoint a run's Claude harness talks to instead of Anthropic's
+ *  API (PRD #229 D10). The server checked the base URL against its admin allowlist
+ *  before this ever reached the worker, so the worker treats it as trusted config,
+ *  not as a URL to validate: repo contents travel here, and the run cannot choose
+ *  where that goes. */
+export interface ClaimAnthropicEndpoint {
+  base_url: string;
+  /** The endpoint's own credential. Replaces the subscription OAuth token for this
+   *  run and is never sent alongside one. */
+  api_key: string;
+  /** The endpoint's model slug. Empty leaves normal model resolution alone. */
+  model?: string;
 }
 
 /** PRD #3244: provenance tokens of a lead agent's requested model / effort. Closed sets, pinned to

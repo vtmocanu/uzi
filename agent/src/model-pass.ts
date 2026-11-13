@@ -36,7 +36,7 @@ import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
 import { codexDeferralReason, type WorkerClient } from "./client.js"; // client.ts imports no runner/model-pass, so the value import of codexDeferralReason adds no cycle
 import { postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
-import type { StateRequest } from "./protocol.js";
+import type { ClaimAnthropicEndpoint, StateRequest } from "./protocol.js";
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
 import type { CodexBinding } from "./codex/select.js"; // type-only — erased at runtime, no construction here
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
@@ -52,6 +52,11 @@ export interface ReadOnlyModelPassOpts {
    *  judge/review claim carries no Anthropic token at all (PRD #1429 M3, D4's auditor
    *  invariant: no anthropic_oauth_token, no run_credential_epochs row). */
   token?: string;
+  /** PRD #229 D10: the instance's custom Anthropic-Messages endpoint, when one is bound.
+   *  It REPLACES `token` on the Claude path, so an advice pass on an endpoint-only instance
+   *  (no subscription token at all) still has a credential. Mutually exclusive with `token`
+   *  by construction on the server; omit on the Codex path. */
+  anthropicEndpoint?: ClaimAnthropicEndpoint;
   /** The model id; applied to the query only when non-empty. */
   model?: string;
   /** Reasoning effort; applied to the query only when set. */
@@ -246,12 +251,16 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
   if (opts.codex) return runCodexAdviceModelPass(opts, opts.codex);
 
   const token = opts.token;
-  if (!token) {
+  // PRD #229 D10: a bound endpoint IS the credential, so it satisfies the same requirement
+  // a subscription token does. Exactly one of the two is present — claim assembly never sets
+  // both, and buildSdkEnv drops the token when an endpoint is bound — so an absent pair is
+  // still the programming error it was.
+  if (!token && !opts.anthropicEndpoint) {
     // Defensive, not a runtime condition to degrade from: every existing Claude caller
     // (judge-runner.ts/review-runner.ts) already checked for a non-empty token before ever
     // calling this function without `codex` set (see their own "no anthropic token" fallback
     // branches). Reaching here with neither is a programming error.
-    throw new Error(`${opts.label} model pass requires a token or a codex claim`);
+    throw new Error(`${opts.label} model pass requires a token, an endpoint, or a codex claim`);
   }
   const homeDir = await fs.mkdtemp(path.join(opts.homeRoot, opts.homePrefix));
   // PRD #1809 D7: unregistered after the cleanup attempt in the finally below (or on the
@@ -312,12 +321,13 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     ...(usage.observe ? { usageObserver: usage.observe } : {}),
   };
   const runPromise = new ClaudeAdviceHarness({
-    token,
+    token: token ?? "",
     homeDir,
     abort,
     queryFn: opts.queryFn,
     denyReason: opts.denyReason,
     log: opts.log,
+    anthropicEndpoint: opts.anthropicEndpoint,
     rawResultShim: opts.onResult,
   })
     .run(request, policy)

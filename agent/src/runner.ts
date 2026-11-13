@@ -5924,6 +5924,12 @@ export class RunRunner {
     const runScopedSecrets = [claim.secrets.forge_pat, gitBasic];
     if (claim.secrets.anthropic_oauth_token)
       runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
+    // PRD #229 D10: a bound endpoint's key is a credential and is scrubbed exactly like
+    // the subscription token it replaces. It reaches the SDK env rather than the claim
+    // body, but a provider error echoing it — or an env dump — must not survive into a
+    // run message. Absent on an unbound run, so that wire stays byte-identical.
+    if (claim.secrets.anthropic_endpoint?.api_key)
+      runScopedSecrets.push(claim.secrets.anthropic_endpoint.api_key);
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
@@ -13355,6 +13361,10 @@ export class RunRunner {
     const secrets = [
       claim.secrets.forge_pat,
       claim.secrets.anthropic_oauth_token,
+      // PRD #229 D10: the endpoint key reaches the SDK env rather than the claim body, but a
+      // provider error echoing it must not survive into a run message. Absent on an unbound
+      // run, so that wire stays byte-identical.
+      claim.secrets.anthropic_endpoint?.api_key,
       this.joinToken,
       gitBasic,
     ];
@@ -16427,7 +16437,10 @@ export class RunRunner {
             steering,
             claim: {
               kind: resolveRunKind(claim.kind),
-              claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
+              // PRD #229 D10: a bound endpoint is a Claude credential too, so an
+              // endpoint-only instance still gets Now summaries. Gating on the token alone
+              // silently disabled them there.
+              claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || !!claim.secrets.anthropic_endpoint),
               ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory, claim.claim_generation),
             },
             emit: (m) => batcher.emit(m),
@@ -16435,6 +16448,7 @@ export class RunRunner {
             runPass: runReadOnlyModelPass,
             pass: {
               token: claim.secrets.anthropic_oauth_token,
+              anthropicEndpoint: claim.secrets.anthropic_endpoint,
               homeRoot: this.nowSummaryOpts.homeRoot,
               queryFn: this.nowSummaryOpts.queryFn,
             },
@@ -16581,6 +16595,9 @@ export class RunRunner {
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.
       redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
+      // PRD #229 D10: present only when this run's owner has an admin-allowlisted
+      // custom endpoint bound. Claim assembly never sets it alongside an oauth token.
+      anthropicEndpoint: claim.secrets.anthropic_endpoint,
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
       // and whether the intent summary is already set so the executor skips
       // re-generating it on a resume/re-claim (Decision 3). Both absent on older

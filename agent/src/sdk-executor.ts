@@ -71,6 +71,7 @@ import {
   type AgentSelectionParse,
   type AgentSource,
   type AskUserQuestion,
+  type ClaimAnthropicEndpoint,
   type ClaimConfig,
   type Milestone,
   type MilestoneProgress,
@@ -869,6 +870,9 @@ interface RunDrive {
  */
 interface DriveState {
   oauthToken: string;
+  /** PRD #229 D10: the admin-allowlisted custom endpoint this run talks to, when one is
+   *  bound. Undefined on a subscription run, which is every run that predates the feature. */
+  anthropicEndpoint: ClaimAnthropicEndpoint | undefined;
   toolEnv: Awaited<ReturnType<typeof provisionRunTools>>["toolEnv"];
   provisionDir: Awaited<ReturnType<typeof provisionRunTools>>["provisionDir"];
   depsAbort: AbortController;
@@ -937,6 +941,20 @@ interface DriveState {
 
 /** issue #3181: a reap whose joins outlived the maintenance budget: nothing was proven, so it is incomplete. */
 const unconfirmedJoinReap = (): RunProcessReap => ({ killed: [], left: [], complete: false });
+
+/** PRD #229 D10: does this run put the lead's model on every subagent too?
+ *
+ *  A bound custom endpoint serves exactly one model id, and `AgentDefinition.model`
+ *  outranks `CLAUDE_CODE_SUBAGENT_MODEL` whenever it is set — so a template pin left in
+ *  place (every builtin pins `opus` or `sonnet`) asks the endpoint for a model it does
+ *  not have and dies on the subagent's first turn. True under the operator's own
+ *  override flag as well, which is the pre-endpoint behaviour.
+ *
+ *  One definition rather than a spelled-out predicate per call site: the roster guards
+ *  live in three places, two of them inside closures, and a fourth added later silently
+ *  missing the endpoint case is exactly the drift this function exists to prevent. */
+const useLeadModelFor = (ctx: RunContext): boolean =>
+  Boolean(ctx.anthropicEndpoint?.model) || Boolean(ctx.config?.override_subagent_model);
 
 export class SdkExecutor implements Executor {
   /** Issue #1604: see Executor.resumesAtGate — the plan gate reads a resumed claim's pending
@@ -1588,7 +1606,12 @@ export class SdkExecutor implements Executor {
    */
   private async phaseSetup(ctx: RunContext, observeState: (state: RunDrive) => void): Promise<DriveState> {
     const oauthToken = ctx.oauthToken?.trim();
-    if (!oauthToken) {
+    const anthropicEndpoint = ctx.anthropicEndpoint;
+    // PRD #229 D10: a bound custom endpoint IS this run's credential, so it satisfies the
+    // same requirement a subscription token does. Exactly one of the two is present —
+    // claim assembly never sets both, and buildSdkEnv drops the token when an endpoint is
+    // bound — so an absent pair is still the fail-fast it was before.
+    if (!oauthToken && !anthropicEndpoint) {
       // OAuth is the sole supported credential (no API keys). Detect its
       // absence up front and fail fast rather than spawning a doomed CLI.
       throw new Error(REASON_NO_TOKEN);
@@ -1620,7 +1643,7 @@ export class SdkExecutor implements Executor {
 
     // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the
     // agent starts is positively attributable to this attempt by the quiescence reaper.
-    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir);
+    const env = buildSdkEnv(oauthToken ?? "", this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, anthropicEndpoint);
     // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
     // probe runs as the runner uid with this SDK env in its own process group: a baseline for
     // what the lead's commands can do, NOT provably identical to an SDK Bash tool call (the SDK
@@ -1767,12 +1790,17 @@ export class SdkExecutor implements Executor {
       config: ctx.config,
       ...(assembled.leadModel !== undefined ? { templateModel: assembled.leadModel } : {}),
     });
-    const leadModel = leadRequest.model;
+    // PRD #229 D10: a bound endpoint serves its own model ids. The SDK's explicit
+    // `model` option (set from leadModel below) OUTRANKS ANTHROPIC_MODEL in the env,
+    // so the slug has to replace the resolved model here or every request names a
+    // model the gateway does not have and fails inside the provider.
+    const boundModel = ctx.anthropicEndpoint?.model;
+    const leadModel = boundModel || leadRequest.model;
     // PRD #305: apply the run's model to every OWN subagent now, before planTurnSubagents
     // copies them and before the own-source implement path reuses them, so both the plan
     // turn and an own-source implement follow the lead model. The repo roster is built
     // later and overridden where it is built. Off/no-model = pins win (byte-identical).
-    if (ctx.config?.override_subagent_model && leadModel) {
+    if (useLeadModelFor(ctx) && leadModel) {
       applySubagentModelOverride(assembled.subagents, leadModel);
     }
     // The names come from the RESULT, never from `assembled.subagents`. They feed
@@ -1799,7 +1827,7 @@ export class SdkExecutor implements Executor {
     const guarded = ctx.capturedMemory !== undefined;
     const planShaped = guarded ? shapeGuardedGrants(planTurn.subagents) : undefined;
     const planAgents = planShaped ? planShaped.agents : planTurn.subagents;
-    if (planSource === "repo" && ctx.config?.override_subagent_model && leadModel) {
+    if (planSource === "repo" && useLeadModelFor(ctx) && leadModel) {
       applySubagentModelOverride(planAgents, leadModel);
     }
     const planUnavailable: UnavailableRole[] = planShaped ? planShaped.unavailable : [];
@@ -2177,7 +2205,8 @@ export class SdkExecutor implements Executor {
     let resumeId = ctx.sessionId ?? undefined;
 
     return {
-      oauthToken,
+      oauthToken: oauthToken ?? "",
+      anthropicEndpoint,
       toolEnv,
       provisionDir,
       depsAbort,
@@ -2230,6 +2259,7 @@ export class SdkExecutor implements Executor {
       state,
       idleMs,
       oauthToken,
+      anthropicEndpoint,
       planSubagentNames,
       planSource,
       subagentCanWrite,
@@ -2396,9 +2426,11 @@ export class SdkExecutor implements Executor {
       // token, and a client to POST to — a stub/e2e run without a token or client is
       // unaffected. resolvePrdInput is memoized ONCE per run (a single file read) and
       // reused by BOTH hooks; it never throws.
+      // PRD #229 D10: a bound endpoint is a credential too, so an endpoint-only instance
+      // still gets its summaries. Gating on the token alone silently skipped them there.
       const summariesOn =
         isRunSummaryKind(ctx.kind) &&
-        !!oauthToken &&
+        (!!oauthToken || !!anthropicEndpoint) &&
         !!this.client;
       const prdInputP: Promise<PrdInput> | undefined = summariesOn
         ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log)
@@ -2425,7 +2457,8 @@ export class SdkExecutor implements Executor {
             const prd = await prdInputP!;
             if (flight.abandoned || flight.ctrl.signal.aborted || ctx.claimFenced?.() || ctx.cancelRequested?.()) return;
             const summary = await this.summaryRunner.generateIntentSummary({
-              token: oauthToken,
+              token: oauthToken ?? "",
+              anthropicEndpoint,
               model: ctx.summaryModel ?? "",
               issueTitle: ctx.issueTitle,
               issueBody: ctx.issueDescription,
@@ -3001,7 +3034,9 @@ export class SdkExecutor implements Executor {
       // roster (the primary case: an auto-approved scheduled run resolves to the repo
       // roster). Own-source defs were copied by reference from the already-overridden
       // assembled.subagents, so this repeat is idempotent for them.
-      if (ctx.config?.override_subagent_model && leadModel) {
+      // A bound endpoint serves one model, so the repo roster cannot keep its pins
+      // either (PRD #229 D10); same predicate as the two plan-side guards above.
+      if (useLeadModelFor(ctx) && leadModel) {
         applySubagentModelOverride(selectedSubagents, leadModel);
       }
       // Issue #2471: a guard-bound run shapes the implement roster the same way as the plan roster.

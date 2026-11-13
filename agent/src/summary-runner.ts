@@ -30,7 +30,7 @@ import { CODEX_PR_DESCRIPTION_MODEL } from "./codex/pr-description-model.js"; //
 import { CODEX_SUMMARY_EFFORT, DEFAULT_CODEX_SUMMARY_MODEL } from "./codex/summary-model.js"; // leaf value import
 import { isCodexRoleModel } from "./codex/render.js";
 import type { DeliveryContext } from "./pr-description-context.js";
-import type { PrDescriptionDiagram } from "./protocol.js";
+import type { ClaimAnthropicEndpoint, PrDescriptionDiagram } from "./protocol.js";
 import type { AdviceUsageSnapshot } from "./harness.js";
 
 /** Why a Codex intent or plan summary was skipped because the run's Codex credential could not be
@@ -97,8 +97,12 @@ export interface PlanSummaryResult {
 export interface IntentSummaryInput {
   /** Claim shape selects Codex when present and valid; malformed Codex fails closed.
    *  With no Codex block, the legacy token/model inputs below are used unchanged. */
-  claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown } };
+  claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown; readonly anthropic_endpoint?: ClaimAnthropicEndpoint } };
+  /** The subscription token. Empty when a bound endpoint supplies the credential instead. */
   token: string;
+  /** PRD #229 D10: the instance's custom endpoint, when one is bound. It REPLACES the
+   *  token, so an endpoint-only instance still produces summaries. */
+  anthropicEndpoint?: ClaimAnthropicEndpoint;
   /** The resolved summary model. Claude lane: used as is. Codex lane (#3248): used when it is a
    *  Codex role model, else the built-in fallback (an older server sends the Claude value). */
   model: string;
@@ -145,7 +149,7 @@ export interface DeliverySummaryClaimView {
   readonly claim_generation?: number;
   /** The resolved Claude summary model (PRD #362); unused on a Codex claim. */
   readonly summary_model?: string | null;
-  readonly secrets: { readonly anthropic_oauth_token?: string; readonly codex?: unknown };
+  readonly secrets: { readonly anthropic_oauth_token?: string; readonly codex?: unknown; readonly anthropic_endpoint?: ClaimAnthropicEndpoint };
 }
 
 export interface DeliverySummaryInput {
@@ -360,9 +364,10 @@ export class SummaryRunner {
       };
     }
     const token = claim.secrets.anthropic_oauth_token?.trim();
-    if (!token) return fail("the claim carries no Anthropic token");
+    if (!token && !claim.secrets.anthropic_endpoint) return fail("the claim carries no Anthropic token");
+    const endpoint = claim.secrets.anthropic_endpoint;
     const model = claim.summary_model?.trim() ?? "";
-    return { token, model: isValidModel(model) ? model : DEFAULT_DELIVERY_SUMMARY_MODEL };
+    return { token: token ?? "", model: isValidModel(model) ? model : DEFAULT_DELIVERY_SUMMARY_MODEL, ...(endpoint ? { anthropicEndpoint: endpoint } : {}) };
   }
 
   /** Generate the intent summary: 1-3 plain-English sentences on what this run will
@@ -458,7 +463,7 @@ export class SummaryRunner {
           },
         };
       } else {
-        harness = { token: input.token, model: input.model };
+        harness = { token: input.token, model: input.model, ...(input.anthropicEndpoint ? { anthropicEndpoint: input.anthropicEndpoint } : {}) };
       }
       return await runReadOnlyModelPass({
         ...harness,

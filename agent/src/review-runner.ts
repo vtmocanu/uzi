@@ -36,7 +36,7 @@ import type { CodexBinding } from "./codex/select.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import { CODEX_TASK_REVIEW_MODEL } from "./codex/task-review-model.js"; // PRD #1551 M2: leaf value import (no runtime dep on the heavy codex-executor)
 import { errMessage } from "./util.js";
-import type { ClaimResponse, TaskReviewFinding, TaskReviewRequest } from "./protocol.js";
+import type { ClaimAnthropicEndpoint, ClaimResponse, TaskReviewFinding, TaskReviewRequest } from "./protocol.js";
 
 // Wall-clock cap on the single reviewer model turn, mirroring JUDGE_MODEL_TIMEOUT_MS.
 // Without it a review run whose model call hangs or retries indefinitely only ends when
@@ -258,11 +258,16 @@ export class ReviewRunner {
           review = await this.reviewCodex(claim, diff, selection.binding, onUsage, signal);
         } else {
           const token = claim.secrets?.anthropic_oauth_token?.trim();
-          if (!token) {
-            this.log.warn("review claim carried no Anthropic token; posting failed review", { run_id: reviewRunId });
+          // PRD #229 D10: a bound endpoint IS the reviewer's credential, so it satisfies the
+          // same requirement the subscription token does. Without this an endpoint-only
+          // instance posted a failed review on every task, which reads as a broken reviewer
+          // rather than a missing credential.
+          const endpoint = claim.secrets?.anthropic_endpoint;
+          if (!token && !endpoint) {
+            this.log.warn("review claim carried no Anthropic token or endpoint; posting failed review", { run_id: reviewRunId });
             review = { status: "failed", summary: "No Anthropic token available for review.", findings: [] };
           } else {
-            review = await this.review(claim, diff, token, onUsage);
+            review = await this.review(claim, diff, token ?? "", onUsage, endpoint);
           }
         }
       }
@@ -371,10 +376,11 @@ export class ReviewRunner {
   private async review(
     claim: ClaimResponse, diff: string, token: string,
     onUsage: (snapshot: AdviceUsageSnapshot) => void,
+    anthropicEndpoint?: ClaimAnthropicEndpoint,
   ): Promise<TaskReviewRequest> {
     try {
       const prompt = buildReviewPrompt(diff);
-      const text = await this.runModel(token, prompt, onUsage);
+      const text = await this.runModel(token, prompt, onUsage, anthropicEndpoint);
       return parseTaskReview(text);
     } catch (err) {
       this.log.warn("review model call failed; posting failed review", {
@@ -429,9 +435,15 @@ export class ReviewRunner {
     }
   }
 
-  private async runModel(token: string, prompt: string, onUsage: (snapshot: AdviceUsageSnapshot) => void): Promise<string> {
+  private async runModel(
+    token: string,
+    prompt: string,
+    onUsage: (snapshot: AdviceUsageSnapshot) => void,
+    anthropicEndpoint?: ClaimAnthropicEndpoint,
+  ): Promise<string> {
     return runReadOnlyModelPass({
       token,
+      anthropicEndpoint,
       systemPrompt: REVIEW_SYSTEM_PROMPT,
       prompt,
       homeRoot: this.homeRoot,

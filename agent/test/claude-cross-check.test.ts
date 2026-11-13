@@ -362,8 +362,23 @@ describe("ClaudeCrossCheck.run", () => {
       assert.deepEqual(r.added, [], "the token was never registered");
     });
 
-    it("raises CrossCheckCheckerUnavailableError for a pinned effort the SDK cannot take", async () => {
-      const claim = claudeClaim({ config: { default_model: "sonnet", default_effort: "extreme" as never } }, { effort_source: "pin" });
+    it("runs on an endpoint-only claim: the endpoint is the credential and the token is absent", async () => {
+      // PRD #229 D10: the claim carries the endpoint INSTEAD of the token, so an
+      // endpoint-only instance's checker had no credential and every cross-check there
+      // reported the checker unavailable.
+      const claim = claudeClaim({ secrets: { forge_pat: "", anthropic_oauth_token: "",
+        anthropic_endpoint: { base_url: "https://gateway.example/v1", api_key: "sk-gateway", model: "m-1" } } as ClaimResponse["secrets"] });
+      const r = rig([initFrame(), resultFrame(APPROVE)], { claim });
+      assert.equal(await r.run(), APPROVE, "the checker ran and returned its verdict");
+      const env = r.seen.options!.env as Record<string, string | undefined>;
+      assert.equal(env.ANTHROPIC_BASE_URL, "https://gateway.example/v1");
+      assert.equal(env.ANTHROPIC_AUTH_TOKEN, "sk-gateway");
+      assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, undefined, "no subscription token travels beside an endpoint");
+      assert.ok(r.added.includes("sk-gateway"), "the endpoint key is registered with the redactor");
+      assert.equal(r.secrets.size, 0, "and evicted when the run ends");
+    });
+
+    it("raises CrossCheckCheckerUnavailableError for a pinned effort the SDK cannot take", async () => {      const claim = claudeClaim({ config: { default_model: "sonnet", default_effort: "extreme" as never } }, { effort_source: "pin" });
       await assert.rejects(rig([initFrame(), resultFrame(APPROVE)], { claim }).run(), CrossCheckCheckerUnavailableError);
     });
 

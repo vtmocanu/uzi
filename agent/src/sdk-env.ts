@@ -22,6 +22,7 @@
 // `bash`, and coreutils.
 
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
+import type { ClaimAnthropicEndpoint } from "./protocol.js";
 import { goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } from "./worker-spawn-mark.js";
@@ -34,6 +35,25 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   "HOME",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
+  // PRD #229 D10: the model endpoint. Repo contents travel to whatever base URL the
+  // SDK talks to, so a provisioned var must never redirect it — the only writer is
+  // the admin-allowlisted claim field, applied after the fold below.
+  "ANTHROPIC_BASE_URL",
+  // PRD #229 D10: the model slots a bound endpoint pins. A provisioned var must never
+  // repoint a run at a model the operator did not configure — the endpoint's own model
+  // is the only writer, applied after the fold below.
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "CLAUDE_CODE_AUTO_MODE_MODEL",
+  // PRD #229 D10: the auto-mode classifier calls Anthropic's own service, so a bound
+  // run would egress repo context to the very vendor the endpoint exists to replace.
+  // Pinned here so a provisioned var cannot switch it back on.
+  "CLAUDE_CODE_AUTO_MODE_SERVER",
   // Not a credential — the mandatory browser launch flag (see the base env below).
   // provision.ts's allowlist does not emit AGENT_BROWSER_ARGS today, so this is not a
   // live conflict; protecting it keeps the --no-sandbox guarantee durable against
@@ -71,11 +91,13 @@ export interface SdkAttemptEnv {
  *  provision.ts's explicit allowlist (PATH override + NIX_SSL_CERT_FILE /
  *  LOCALE_ARCHIVE) — never a blind merge of devbox's shellenv. */
 export interface SdkEnv {
-  CLAUDE_CODE_OAUTH_TOKEN: string;
+  /** Present for a subscription run; explicitly `undefined` when a custom endpoint is
+   *  bound (PRD #229 D10), because a custom base URL never receives this token. */
+  CLAUDE_CODE_OAUTH_TOKEN: string | undefined;
   HOME: string;
   PATH: string | undefined;
   ANTHROPIC_API_KEY: undefined;
-  ANTHROPIC_AUTH_TOKEN: undefined;
+  ANTHROPIC_AUTH_TOKEN: string | undefined;
   [key: string]: string | undefined;
 }
 
@@ -103,6 +125,11 @@ export interface SdkEnv {
  *                   Set as GOTMPDIR AFTER the toolEnv fold and the Go concurrency env, so
  *                   a provisioned GOTMPDIR cannot override it. Undefined ⇒ no key from
  *                   this parameter (a provisioned GOTMPDIR behaves as before).
+ * @param endpoint   PRD #229 D10: an admin-allowlisted custom Anthropic-Messages-compatible
+ *                   model endpoint. When present, the SDK is pointed at it with the
+ *                   endpoint's OWN key and the subscription OAuth token is structurally
+ *                   dropped — a custom base URL must never receive it. Undefined ⇒ output
+ *                   is byte-identical to before this parameter existed.
  */
 export function buildSdkEnv(
   oauthToken: string,
@@ -111,6 +138,7 @@ export function buildSdkEnv(
   dockerHost?: string,
   attempt?: SdkAttemptEnv,
   goWorkDir?: string,
+  endpoint?: ClaimAnthropicEndpoint,
 ): SdkEnv {
   const env: SdkEnv = {
     CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
@@ -177,6 +205,46 @@ export function buildSdkEnv(
     env[RUN_ATTEMPT_ENV] = attempt.marker;
     env[RUN_CLONE_ENV] = attempt.clonePath;
     env[RUN_CLONE_KEY_ENV] = attempt.cloneKey;
+  }
+  // PRD #229 D10: a custom endpoint replaces Anthropic's API for this run. Set AFTER
+  // the fold (the keys stay protected above), and the subscription token is cleared in
+  // the SAME object that carries the custom URL — there is no code path where
+  // CLAUDE_CODE_OAUTH_TOKEN and a non-default ANTHROPIC_BASE_URL both reach the SDK.
+  // That is the trust boundary, enforced structurally rather than by ordering.
+  if (endpoint) {
+    env.ANTHROPIC_BASE_URL = endpoint.base_url;
+    env.ANTHROPIC_AUTH_TOKEN = endpoint.api_key;
+    // The endpoint's model, on every slot. A gateway that speaks the Messages shape
+    // need not serve Anthropic's model names, so leaving the slots alone sends
+    // "claude-opus-5-5" to a host that has never heard of it and the run dies on its
+    // first turn. One endpoint carries one model, so every slot names the same one:
+    // the lead, the subagents, the small/fast lane and the auto-mode classifier all
+    // resolve to the model the operator actually configured.
+    if (endpoint.model) {
+      env.ANTHROPIC_MODEL = endpoint.model;
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL = endpoint.model;
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL = endpoint.model;
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = endpoint.model;
+      env.ANTHROPIC_DEFAULT_FABLE_MODEL = endpoint.model;
+      env.ANTHROPIC_SMALL_FAST_MODEL = endpoint.model;
+      env.CLAUDE_CODE_SUBAGENT_MODEL = endpoint.model;
+      env.CLAUDE_CODE_AUTO_MODE_MODEL = endpoint.model;
+      // A third-party gateway does not run Anthropic's server-side safety check, so
+      // auto mode would deny every action needing a verdict without ever prompting.
+      // 0 routes the verdict to Claude Code's own client-side classifier instead.
+      env.CLAUDE_CODE_AUTO_MODE_SERVER = "0";
+      // The model id is unknown to Claude Code, so its context-window guesses misfire
+      // and compaction fires at the wrong point. Let the API's own rejection decide.
+      env.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = "1";
+    }
+    env.ANTHROPIC_API_KEY = undefined;
+    env.CLAUDE_CODE_OAUTH_TOKEN = undefined;
+    // The auto-mode classifier is a separate Anthropic-side call that survives the
+    // base-URL override and is the one piece of run traffic a bound endpoint does not
+    // carry. Off for the same trust reason as the token: a bound run sends nothing to
+    // Anthropic. Set unconditionally, not only when a model slug is present: an
+    // endpoint fronting Anthropic still must not receive the classifier call.
+    env.CLAUDE_CODE_AUTO_MODE_SERVER = "0";
   }
   return env;
 }
