@@ -20460,8 +20460,9 @@ export class RunRunner {
    * Issue #4258 — the NON-TERMINAL mid-run consumer (`RunContext.midRunSecretRemediation`). Returns only
    * proceed or remediate; never fail, and it never sets `blocked`, `known`, `everKnown` or `cleanTip`.
    * It revalidates from scratch (fresh fetch-back, tip agreement, restriction certainty, fresh scan);
-   * the trigger's stored tip is never used. Anything uncertain DEFERS (trigger kept, no state written,
-   * attempts unchanged) and the done gate stays the authority. Shares `attempts` with the done gate.
+   * the trigger's stored tip is never used. Anything uncertain DEFERS: the trigger is kept, no turn is given and no attempt
+   * is spent, and the done gate stays the authority. If `persistRemediationScan` throws after the
+   * restrictions and flaggedCommits were recorded, that recorded state stays, which fails closed. Shares `attempts` with the done gate.
    */
   private async runMidRunSecretRemediation(
     flight: RunFlight,
@@ -20494,15 +20495,21 @@ export class RunRunner {
       const reach = await this.classifyFlaggedReachability(state, barePath, cloneTip);
       if (reach.includes("unknown")) return defer("flagged_ancestry_unknown");
       const retained = state.flaggedFindings ?? [];
-      const findings: SecretFinding[] = [];
+      // Every fresh finding is kept as is (a commit adding two secret files yields two); only
+      // ancestor-reachable retained findings whose commit the fresh scan did not report are appended.
+      const findings: SecretFinding[] = [...scanned.findings];
       const seen = new Set<string>();
-      const add = (f: SecretFinding): void => {
+      for (const f of scanned.findings) if (typeof f.commit === "string") seen.add(f.commit.toLowerCase());
+      reach.forEach((r, i) => {
+        const f = retained[i];
+        if (r !== "ancestor" || !f) return;
         const key = typeof f.commit === "string" ? f.commit.toLowerCase() : undefined;
-        if (key !== undefined) { if (seen.has(key)) return; seen.add(key); }
+        if (key !== undefined) {
+          if (seen.has(key)) return;
+          seen.add(key);
+        }
         findings.push(f);
-      };
-      for (const f of scanned.findings) add(f);
-      reach.forEach((r, i) => { if (r === "ancestor" && retained[i]) add(retained[i]!); });
+      });
       if (findings.length === 0) return clear();
       const verdict = await this.classifyFindingFloors(flight, barePath, findings, floorCandidates);
       if (verdict === "unknown") return defer("floor_ancestry_unknown");

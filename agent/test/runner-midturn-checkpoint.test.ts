@@ -4872,6 +4872,7 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
     everKnown?: boolean;
     cleanTip?: string;
     flaggedCommits?: string[];
+    overflow?: boolean;
     midRunTrigger?: { observation: number; tip: string };
     midRunSeq?: number;
   };
@@ -4994,7 +4995,7 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
       assert.match(d.followUp, /not published yet, so publication of your work is withheld/);
       assert.doesNotMatch(d.followUp, /signal_done/);
       assert.match(d.followUp, /attempt 1 of 2/);
-      assert.ok(d.followUp.includes("cfg.env") || d.followUp.length > 0);
+      assert.ok(d.followUp.includes("cfg.env"), d.followUp);
       assert.equal(s.attempts, 1);
       assert.equal(s.midRunTrigger, undefined);
       untouched(s);
@@ -5119,6 +5120,68 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
         });
       });
     }
+  });
+
+  it("unknown flagged-commit ancestry against the tip defers even when every floor is divergent", async () => {
+    await rig(4258_040, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const sha = await flagAndTick(r);
+      const before = r.state().midRunTrigger;
+      assert.ok(before);
+      const tip = before.tip;
+      const real = r.g.ancestry.bind(r.g);
+      const d = await r.withStub({
+        secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }),
+        ancestry: async (b: string, a: string, t: string) => (a === sha ? (t === tip ? "unknown" : "divergent") : real(b, a, t)),
+      }, () => r.ctx.midRunSecretRemediation!());
+      assert.equal(d.action, "proceed");
+      const s = r.state();
+      assert.deepEqual(s.midRunTrigger, before, "the trigger is kept");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+    });
+  });
+
+  it("an unknown floor ancestry during the tick arms no trigger", async () => {
+    await rig(4258_041, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const sha = commitIn(r.ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+      const real = r.g.ancestry.bind(r.g);
+      assert.equal(await r.withStub(
+        { ancestry: async (b: string, a: string, t: string) => (a === sha ? "unknown" : real(b, a, t)) },
+        () => r.tick(),
+      ), "secret_found");
+      assert.equal(r.state().midRunTrigger, undefined);
+      assert.equal(r.state().midRunSeq, undefined);
+    });
+  });
+
+  it("a flight whose flagged-commit list already overflowed arms no trigger", async () => {
+    await rig(4258_042, async (r) => {
+      commitIn(r.ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+      await r.tick();
+      assert.equal(r.state().overflow, true);
+      assert.equal(r.state().midRunTrigger, undefined);
+      assert.equal(r.state().midRunSeq, undefined);
+    }, { seed: (f) => { f.secretRemediation ??= { attempts: 0 }; f.secretRemediation.overflow = true; } });
+  });
+
+  it("a commit adding two secret files yields two findings at the boundary", async () => {
+    await rig(4258_043, async (r) => {
+      fs.writeFileSync(path.join(r.ctx.worktreePath, "aaa.env"), `TOKEN=${runtimeSecret()}\n`);
+      fs.writeFileSync(path.join(r.ctx.worktreePath, "bbb.env"), `TOKEN=${runtimeSecret()}\n`);
+      gitIn(r.ctx.worktreePath, ["add", "-A"]);
+      gitIn(r.ctx.worktreePath, [...IDENT, "commit", "-m", "work two secrets"]);
+      r.flagged.push(gitIn(r.ctx.worktreePath, ["rev-parse", "HEAD"]));
+      assert.equal(await r.tick(), "secret_found");
+      const d = await r.ctx.midRunSecretRemediation!();
+      assert.equal(d.action, "remediate");
+      if (d.action !== "remediate") return;
+      assert.equal((d.followUp.match(/\(rule github-pat\)/g) ?? []).length, 2, d.followUp);
+      assert.ok(d.followUp.includes("aaa.env") && d.followUp.includes("bbb.env"), d.followUp);
+    });
   });
 
   it("an ancestry at or below a floor arms no trigger and leaves the done gate's decision unchanged", async () => {
