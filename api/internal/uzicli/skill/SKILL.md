@@ -788,7 +788,13 @@ uzi version
   call it: **queued** — the override just applies at the next claim, nothing else changes;
   **parked** (`limit_wait`, `pool_wait`, `recovery_wait`, `paused`) — a single-row promote
   returns it to **queued** immediately, so the next claim spends the chosen token without
-  waiting out the park; **running, or held at a gate/question/follow-up, on a worker that
+  waiting out the park. The exception is a `recovery_wait` run on an owner hold
+  (`worker_memory_pressure`, `worker_requeue_exhausted`, `codex_account_unavailable`, the
+  `retained_*` causes, a pending policy outcome, or the NULL-retry `data_volume_full` /
+  `forge_unreachable` / `codex_idle_stall` holds): it is refused (409, exit 5) with the hold
+  named and nothing written. Inspect the run's recovery options: Resume may re-hold it;
+  Cancel ends the run;
+  **running, or held at a gate/question/follow-up, on a worker that
   advertises the `credential_switch` capability** — the switch is only **requested**, not
   yet applied: the server signals it to the worker, which finishes quiescing and
   **releases** its claim (banking the elapsed time like a pause) before the switch is
