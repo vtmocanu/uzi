@@ -677,14 +677,23 @@ func TestTerminalSweepRetireLiveDB(t *testing.T) {
 		f.live()
 		f.forges.issue = forge.Issue{State: "closed"}
 		f.svc.terminal.afterObserve = func(at *time.Time) { *at = at.Add(-(retireObservationMaxAge + time.Minute)) }
-		before := f.snapshot()
+		before := f.mustPres("live")
 		if n := f.sweep(); n != 0 {
 			t.Fatalf("changed %d rows", n)
 		}
-		if f.snapshot() != before || f.deleteCount() != 0 {
-			t.Fatalf("a stale observation wrote or deleted: deletes=%d", f.deleteCount())
+		after := f.mustPres("live")
+		staleReads := f.forges.getIssues
+		if f.deleteCount() != 0 || after.Tip != before.Tip || after.Attempts != before.Attempts || after.RetireTip.Valid {
+			t.Fatalf("a stale observation wrote state or deleted: deletes=%d before=%+v after=%+v", f.deleteCount(), before, after)
+		}
+		if !after.NextCheckAt.Time.After(f.dbNow()) {
+			t.Fatalf("next_check_at = %v, want the discarded row backed off", after.NextCheckAt.Time)
+		}
+		if n := f.sweep(); n != 0 || f.forges.getIssues != staleReads {
+			t.Fatalf("a backed-off row was observed again (n=%d)", n)
 		}
 		observed := f.forges.getIssues
+		f.due()
 		f.svc.terminal.afterObserve = nil
 		f.sweep()
 		f.mustPres("deleted")
@@ -1052,5 +1061,48 @@ func TestTerminalSweepIsolationFromHeldSweepLiveDB(t *testing.T) {
 	f.mustPres("deleted")
 	if heldRows() != beforeHeld {
 		t.Fatal("SweepTerminalPreservations touched a run_held_publications row")
+	}
+}
+
+// A bound row whose run was deleted (repo removal cascades runs; a bound row holds no live pointer, so
+// it survives) must not starve the due list: it goes to not_published without a run lock, and a healthy
+// row behind it is still processed.
+func TestTerminalSweepStaleBoundRunGoneLiveDB(t *testing.T) {
+	f := newSweepFix(t)
+	p, err := f.e.q.InsertTerminalPreservation(f.e.ctx, store.InsertTerminalPreservationParams{
+		RunID: f.run, UserID: f.e.userID, RepoID: f.e.repoID, Ref: pushbroker.TerminalRef(f.run), LifetimeAtBind: "issue",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second, healthy stale-bound row for another run of the same owner, queued behind the first.
+	other := f.e.seedLegacyRunningRun(t, f.worker.ID)
+	f.e.exec(t, `INSERT INTO run_terminal_preservations (run_id, user_id, repo_id, ref, lifetime_at_bind, created_at, next_check_at)
+		VALUES ($1, $2, $3, $4, 'issue', now() - interval '2 hours', now() - interval '1 minute')`,
+		other, f.e.userID, f.e.repoID, pushbroker.TerminalRef(other))
+	f.e.exec(t, `UPDATE run_terminal_preservations SET next_check_at = now() - interval '2 minutes' WHERE id = $1`, p.ID)
+	f.e.exec(t, `DELETE FROM runs WHERE id = $1`, f.run)
+	f.shiftClock(terminalBoundGrace + time.Minute)
+	for i := 0; i < 2; i++ {
+		if err := f.sweepErr(); err != nil {
+			t.Fatalf("pass %d: %v", i+1, err)
+		}
+	}
+	got, err := f.e.q.GetTerminalPreservationByRun(f.e.ctx, f.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "not_published" {
+		t.Fatalf("run-gone bound row = %+v, want not_published", got)
+	}
+	healthy, err := f.e.q.GetTerminalPreservationByRun(f.e.ctx, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if healthy.State != "not_published" {
+		t.Fatalf("the row behind it = %+v, want not_published", healthy)
+	}
+	if f.allowCount() != 0 || f.forgeCalls() != 0 {
+		t.Fatal("the stale-bound lane resolved a credential or called the forge")
 	}
 }

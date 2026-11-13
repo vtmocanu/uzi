@@ -84,8 +84,9 @@ const (
 	// terminalRetireKeepRecheck is when a row kept by an independent protection is looked at again.
 	terminalRetireKeepRecheck = time.Hour
 	// retireObservationMaxAge is how old a forge observation may be, on the database clock, when the
-	// retiring decision commits. It is below terminalSweepItemTimeout and above the lifetime read's
-	// own timeout plus the run-lock wait, so a healthy item passes and a stalled one is re-observed.
+	// retiring decision commits. The observation is stamped from the database clock read BEFORE the
+	// forge read, so the bound covers the forge read plus the run-lock wait and is the effective
+	// freshness bound. It is below terminalSweepItemTimeout, so a stalled item is re-observed.
 	retireObservationMaxAge = 15 * time.Second
 )
 
@@ -123,8 +124,9 @@ func (s *Service) terminalRetireOn() bool {
 	return terminalRetirementEnabled || s.terminal.retireEnabled
 }
 
-// SweepTerminalPreservations runs one pass and returns the number of preservation rows whose state
-// it changed. It is always registered; see the file comment for the empty-pass contract.
+// SweepTerminalPreservations runs one pass and returns the number of state transitions it made
+// (preservation or contribution; a retire that decides and then finishes counts 2, a
+// contribution-only change counts 1). It is always registered; see the file comment for the empty-pass contract.
 func (s *Service) SweepTerminalPreservations(ctx context.Context) (int64, error) {
 	tq, ok := s.q.(terminalSweepQueries)
 	if !ok {
@@ -171,6 +173,28 @@ func (s *Service) terminalSweepOne(ctx context.Context, row store.RunTerminalPre
 			err = s.terminalFail(ictx, row, msg)
 		}
 	}()
+	n, err = s.terminalSweepLane(ictx, row)
+	var nb *terminalNoBackoff
+	if err != nil && !errors.As(err, &nb) {
+		// A per-item error must never leave next_check_at unchanged: the row would stay at the head of
+		// the due list and be retried every tick. Every lane has rolled its transaction back by now.
+		if werr := s.terminalFail(ictx, row, heldErrText(err, "")); werr != nil {
+			return n, errors.Join(err, werr)
+		}
+	}
+	return n, err
+}
+
+// terminalNoBackoff marks an error the per-item backoff must not wrap: a failed backoff write itself
+// or an injected crash that leaves the row exactly as it is.
+type terminalNoBackoff struct{ error }
+
+func (e *terminalNoBackoff) Unwrap() error { return e.error }
+
+// errTerminalRunGone is terminalLockRun's result when the run row no longer exists.
+var errTerminalRunGone = errors.New("terminal sweep: the run no longer exists")
+
+func (s *Service) terminalSweepLane(ictx context.Context, row store.RunTerminalPreservation) (int64, error) {
 	switch row.State {
 	case terminalStateBound:
 		return s.terminalSweepBound(ictx, row)
@@ -180,7 +204,7 @@ func (s *Service) terminalSweepOne(ctx context.Context, row store.RunTerminalPre
 		return s.terminalSweepLive(ictx, row)
 	case "retiring":
 		if !s.terminalRetireOn() {
-			return 0, s.terminalPark(ictx, row, terminalRetireRecheck, "")
+			return 0, s.terminalPark(ictx, row, terminalRetireRecheck)
 		}
 		return s.terminalRetireEffect(ictx, row)
 	}
@@ -204,19 +228,19 @@ func (s *Service) terminalDeferWrite(ctx context.Context, row store.RunTerminalP
 		ExpectedState: row.State,
 	})
 	if err != nil {
-		return fmt.Errorf("terminal sweep: defer: %s", secretscrub.Scrub(err.Error()))
+		return &terminalNoBackoff{fmt.Errorf("terminal sweep: defer: %s", secretscrub.Scrub(err.Error()))}
 	}
 	return nil
 }
 
 // terminalSkip defers a busy or not-yet-due row without counting an attempt.
-func (s *Service) terminalSkip(ctx context.Context, row store.RunTerminalPreservation, msg string) error {
-	return s.terminalDeferWrite(ctx, row, terminalSweepSkipBackoff, msg, 0)
+func (s *Service) terminalSkip(ctx context.Context, row store.RunTerminalPreservation) error {
+	return s.terminalDeferWrite(ctx, row, terminalSweepSkipBackoff, "", 0)
 }
 
 // terminalPark pushes a row out by delay without counting an attempt.
-func (s *Service) terminalPark(ctx context.Context, row store.RunTerminalPreservation, delay time.Duration, msg string) error {
-	return s.terminalDeferWrite(ctx, row, delay, msg, 0)
+func (s *Service) terminalPark(ctx context.Context, row store.RunTerminalPreservation, delay time.Duration) error {
+	return s.terminalDeferWrite(ctx, row, delay, "", 0)
 }
 
 // terminalFail backs a row off after a failed or inconclusive attempt and counts it.
@@ -267,6 +291,10 @@ func (s *Service) terminalLockRun(ctx context.Context, row store.RunTerminalPres
 		return nil, pres, false, e
 	}
 	repo, err := tt.qt.LockRunForHeldCleanup(ctx, row.RunID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		tt.rollback()
+		return nil, pres, false, errTerminalRunGone
+	}
 	if err != nil {
 		return fail(fmt.Errorf("terminal sweep: run lock: %w", err))
 	}
@@ -284,18 +312,44 @@ func (s *Service) terminalLockRun(ctx context.Context, row store.RunTerminalPres
 	return tt, pres, false, nil
 }
 
+// terminalLockPreservationOnly is terminalLockRun for a run that no longer exists: there is no run row
+// to lock, so only the preservation row is (FOR UPDATE, under the lock timeout).
+func (s *Service) terminalLockPreservationOnly(ctx context.Context, row store.RunTerminalPreservation) (tt *terminalSweepTx, pres store.RunTerminalPreservation, busy bool, err error) {
+	tx, err := s.beginReadCommitted(ctx)
+	if err != nil {
+		return nil, pres, false, fmt.Errorf("terminal sweep: begin: %s", secretscrub.Scrub(err.Error()))
+	}
+	tt = &terminalSweepTx{ctx: ctx, tx: tx, qt: store.New(tx)}
+	if _, err = tx.Exec(ctx, "SET LOCAL lock_timeout = '"+terminalSweepLockTimeout+"'"); err == nil {
+		pres, err = tt.qt.GetTerminalPreservationForUpdate(ctx, row.RunID)
+	}
+	if err != nil {
+		tt.rollback()
+		if isLockNotAvailable(err) {
+			return nil, pres, true, nil
+		}
+		return nil, pres, false, fmt.Errorf("terminal sweep: preservation lock: %w", err)
+	}
+	return tt, pres, false, nil
+}
+
 // terminalSweepBound is the stale-bound lane: a bound row with no invoked contribution, after the
 // grace, is a run that never had a ref. Under the run lock it goes to not_published.
 func (s *Service) terminalSweepBound(ctx context.Context, row store.RunTerminalPreservation) (int64, error) {
 	if due := row.CreatedAt.Time.Add(terminalBoundGrace); s.now().Before(due) {
-		return 0, s.terminalPark(ctx, row, due.Sub(s.now()), "")
+		return 0, s.terminalPark(ctx, row, due.Sub(s.now()))
 	}
 	tt, pres, busy, err := s.terminalLockRun(ctx, row)
+	if errors.Is(err, errTerminalRunGone) {
+		// Repo removal cascades runs but a bound row holds no live pointer, so it survives. No ref was
+		// ever created and no run row exists to lock: the transition needs only the preservation lock.
+		tt, pres, busy, err = s.terminalLockPreservationOnly(ctx, row)
+	}
 	if err != nil {
 		return 0, err
 	}
 	if busy {
-		return 0, s.terminalSkip(ctx, row, "")
+		return 0, s.terminalSkip(ctx, row)
 	}
 	defer tt.rollback()
 	if pres.State != terminalStateBound || pres.Tip.Valid {
@@ -346,7 +400,7 @@ func (s *Service) terminalSweepReconcile(ctx context.Context, row store.RunTermi
 	}
 	if con.State == terminalContributionInvoked && con.CreateInvokedAt.Valid {
 		if due := con.CreateInvokedAt.Time.Add(terminalReconcileGrace); s.now().Before(due) {
-			return 0, s.terminalPark(ctx, row, due.Sub(s.now()), "") // still the route's own request
+			return 0, s.terminalPark(ctx, row, due.Sub(s.now())) // still the route's own request
 		}
 	}
 	f, err := s.heldRemote(ctx, row.RunID)
@@ -373,7 +427,7 @@ func (s *Service) terminalSweepReconcile(ctx context.Context, row store.RunTermi
 			return 0, s.terminalFail(ctx, row, heldErrText(fmt.Errorf("record reconciled publication: %w", err), f.PAT))
 		}
 		return boolToInt(con2.State == "published"), nil
-	case present && !(con.PriorTip.Valid && tip == con.PriorTip.String):
+	case present && (!con.PriorTip.Valid || tip != con.PriorTip.String):
 		return s.terminalSweepForeign(ctx, row, con.Generation)
 	case present:
 		return s.terminalSweepUnknown(ctx, row, con.Generation, "ref still at the prior tip")
@@ -391,7 +445,7 @@ func (s *Service) terminalSweepUnknown(ctx context.Context, row store.RunTermina
 		return 0, err
 	}
 	if busy {
-		return 0, s.terminalSkip(ctx, row, "")
+		return 0, s.terminalSkip(ctx, row)
 	}
 	defer tt.rollback()
 	if pres.State != terminalStatePublishing {
@@ -439,7 +493,7 @@ func (s *Service) terminalSweepForeign(ctx context.Context, row store.RunTermina
 		return 0, err
 	}
 	if busy {
-		return 0, s.terminalSkip(ctx, row, "")
+		return 0, s.terminalSkip(ctx, row)
 	}
 	defer tt.rollback()
 	if pres.State != terminalStatePublishing {
@@ -477,7 +531,7 @@ func (s *Service) terminalSweepForeign(ctx context.Context, row store.RunTermina
 // terminalSweepLive is retire steps 1-2 for a live row: the forge observation, then the decision.
 func (s *Service) terminalSweepLive(ctx context.Context, row store.RunTerminalPreservation) (int64, error) {
 	if !s.terminalRetireOn() {
-		return 0, s.terminalPark(ctx, row, terminalRetireRecheck, "")
+		return 0, s.terminalPark(ctx, row, terminalRetireRecheck)
 	}
 	tq, ok := s.q.(terminalSweepQueries)
 	if !ok {
@@ -489,14 +543,15 @@ func (s *Service) terminalSweepLive(ctx context.Context, row store.RunTerminalPr
 	}
 	// 1. Forge observation, outside any transaction. The lifetime is re-derived at every observation,
 	// so a run that gained a merge request is classified by it.
-	lt := s.terminalLifetime(ctx, run)
+	// The clock is read BEFORE the forge read, so observedAt is the conservative (earliest) stamp.
 	clock, err := tq.GetTerminalSweepClock(ctx)
 	if err != nil {
 		return 0, s.terminalFail(ctx, row, heldErrText(fmt.Errorf("clock: %w", err), ""))
 	}
+	lt := s.terminalLifetime(ctx, run)
 	if !lt.ClosedProven {
 		// Not proven closed (open, unknown, a forge error, or a run with no closure signal): keep.
-		return 0, s.terminalPark(ctx, row, terminalRetireRecheck, "")
+		return 0, s.terminalPark(ctx, row, terminalRetireRecheck)
 	}
 	reason := terminalRetirePRClosed
 	if lt.Class == terminalLifetimeIssue {
@@ -516,7 +571,7 @@ func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTermina
 		return 0, err
 	}
 	if busy {
-		return 0, s.terminalSkip(ctx, row, "")
+		return 0, s.terminalSkip(ctx, row)
 	}
 	defer tt.rollback()
 	if pres.State != "live" || !pres.Tip.Valid || pres.Tip != row.Tip {
@@ -557,10 +612,11 @@ func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTermina
 		ObservedAt: pgtype.Timestamptz{Time: observedAt, Valid: true}, MaxAgeSeconds: retireObservationMaxAge.Seconds(),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		// A stale observation (or a guard refusal): the decision is discarded without a write and the
-		// row, still due, is observed afresh on the next pass.
+		// A stale observation (or a guard refusal): the decision is discarded without a state write and
+		// the row is backed off (scheduling only, no attempt counted) so it is not re-observed every tick.
 		slog.Warn("terminal sweep: retire decision discarded", "run", row.RunID)
-		return 0, nil
+		tt.rollback() // release the row lock before the scheduling write
+		return 0, s.terminalSkip(ctx, row)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("terminal sweep: retiring: %w", err)
@@ -606,7 +662,7 @@ func (s *Service) terminalRetireEffect(ctx context.Context, row store.RunTermina
 		})
 		if s.terminal.afterDelete != nil {
 			if herr := s.terminal.afterDelete(); herr != nil {
-				return 0, herr // a crash after the remote effect: the row stays retiring
+				return 0, &terminalNoBackoff{herr} // a crash after the remote effect: the row stays retiring
 			}
 		}
 		switch out {
@@ -635,7 +691,7 @@ func (s *Service) terminalRetireFinish(ctx context.Context, row store.RunTermina
 		return 0, err
 	}
 	if busy {
-		return 0, s.terminalSkip(wctx, row, "")
+		return 0, s.terminalSkip(wctx, row)
 	}
 	defer tt.rollback()
 	if pres.State != "retiring" {
