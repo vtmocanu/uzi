@@ -13,8 +13,11 @@ type graceCase struct {
 	name string
 	cfg  RenderConfig
 	w    protocol.DesiredWorker
-	// baseHash is specHash(podTemplate(...)) for this exact fixed config at commit
-	// f943b2590f760ea186aa39355b362f20e66fd21e, before the grace period was set.
+	// baseHash is specHash(podTemplate(...)) for this exact fixed config with the
+	// grace period unset. The plain and ephemeral rows are unchanged since commit
+	// f943b2590f760ea186aa39355b362f20e66fd21e (before the grace period was set);
+	// the docker row was re-baselined for #4291's new always-explicit docker-only
+	// UZI_DIND_BUILDER_PRUNE_ENABLED env.
 	baseHash string
 }
 
