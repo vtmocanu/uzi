@@ -76,7 +76,7 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"plus a `captures` array listing that hold's " +
 			"recovery captures (id, state, source_sha, byte_size, created_at, checksum, ordered prerequisites, expiry, attempted head and optional prerequisite_closure); a capture id is what " +
 			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`. A capture whose hold " +
-			"is not among the listed holds (for example a capture recorded against another run's hold) is not dropped: when there is at " +
+			"is not among the listed holds (for example when the hold list could not be read, or a hold opened between the two reads) is not dropped: when there is at " +
 			"least one, --json appends ONE final element `{\"run_id\": ..., \"unattached\": true, \"captures\": [...]}` " +
 			"after the hold elements, with the same capture shape and no generation, id or state keys; the human form " +
 			"prints a \"captures (no listed hold)\" table.\n\n" +
