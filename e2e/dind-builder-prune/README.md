@@ -174,3 +174,10 @@ JSON snapshots land in `.uzi/scratch/dbp-<token>/` (override with `DBP_OUT`).
 
 `plan-evidence/` holds the owner-accepted plan-time spike that first established points 1-6; it is an
 archive, checksummed in its own README, and not executed by any target.
+
+The nested TCP listener is attached to a labelled, per-invocation bridge network,
+not the default bridge. Only this invocation's daemon and plugin fixture join it.
+Each posture checks reachability from an owned probe on that private bridge,
+then checks that the same probe cannot reach the listener from the default
+bridge. Cleanup removes labelled containers first and their labelled networks
+last, by exact name. A foreign attachment is never disconnected to force cleanup.

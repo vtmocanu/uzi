@@ -3,7 +3,8 @@
 #
 # Safety: the worker's own Docker daemon is shared. This script only pulls images and
 # creates/starts/execs/cps/inspects/logs its OWN containers (dbp-test-<hex>-*), and removes
-# them by exact name after verifying the ownership label. Every prune/build/system command
+# them and their private bridge networks by exact name after verifying ownership labels.
+# Every prune/build/system command
 # runs against an owned nested daemon (docker exec into it, or its own TCP address).
 # No clock is altered.
 set -euo pipefail
@@ -57,6 +58,7 @@ has_phase() { [[ " $phases " == *" $1 "* ]]; }
 readonly REQUIRED_POSTURES='rootful rootless' REQUIRED_PHASES='points real pressure'
 
 containers=()
+networks=()
 failures=0
 blocked=0
 results=()
@@ -94,6 +96,29 @@ cleanup() {
     else
       # A daemon error or a timeout is not proof of absence: the container may still exist.
       echo "FAIL: cannot verify cleanup ownership for $name: ${owner:-no output}" >&2
+      cleanup_rc=1
+    fi
+  done
+  # Networks follow containers: never detach an endpoint to force removal. Any
+  # unexpected attachment or unverifiable ownership leaves the network and fails cleanup.
+  for name in "${networks[@]}"; do
+    if owner=$(timeout --kill-after=2s 10s docker network inspect \
+      --format "{{index .Labels \"$OWNER_LABEL\"}}" "$name" 2>&1); then
+      if [[ $owner == "$token" ]]; then
+        if timeout --kill-after=2s 10s docker network rm "$name" >/dev/null; then
+          echo "CLEANUP removed network $name"
+        else
+          echo "FAIL: cleanup could not remove network $name" >&2
+          cleanup_rc=1
+        fi
+      else
+        echo "FAIL: cleanup ownership mismatch for network $name" >&2
+        cleanup_rc=1
+      fi
+    elif [[ ${owner,,} == *'no such network'* || ${owner,,} == *'no such object'* || $owner == *"network $name not found"* ]]; then
+      echo "CLEANUP network $name does not exist"
+    else
+      echo "FAIL: cannot verify cleanup ownership for network $name: ${owner:-no output}" >&2
       cleanup_rc=1
     fi
   done
@@ -143,14 +168,15 @@ sh_in() {
 # ---- posture lifecycle -------------------------------------------------------------------
 
 P='-'
-P_NAME='' P_IMAGE='' P_USER='' P_SOCK='' P_DATA='' P_IP='' PO=''
+P_NETWORK='' P_NAME='' P_IMAGE='' P_USER='' P_SOCK='' P_DATA='' P_IP='' PO=''
 
 start_posture() {
   P=$1
   P_NAME="dbp-test-$token-$P"
+  P_NETWORK="bpnet-$token-$P"
   PO="$OUT/$P"
   mkdir -p "$PO"
-  local -a create=(create --name "$P_NAME" --label "$OWNER_LABEL=$token" --privileged --network bridge -e DOCKER_TLS_CERTDIR=)
+  local -a create=(create --name "$P_NAME" --label "$OWNER_LABEL=$token" --privileged --network "$P_NETWORK" -e DOCKER_TLS_CERTDIR=)
   local tmpfs_opts="rw,exec,suid,dev,size=${TMPFS_MB}m"
   if [[ $P == rootful ]]; then
     P_IMAGE=$ROOTFUL_IMAGE P_USER=0 P_SOCK=unix:///var/run/docker.sock P_DATA=/var/lib/docker
@@ -164,6 +190,9 @@ start_posture() {
   if ! outer 10 image inspect "$P_IMAGE" >/dev/null 2>&1; then
     outer 300 pull "$P_IMAGE" >/dev/null 2>&1 || { echo "pull of $P_IMAGE failed"; return 1; }
   fi
+  networks+=("$P_NETWORK")
+  outer 15 network create --driver bridge --label "$OWNER_LABEL=$token" "$P_NETWORK" >/dev/null \
+    || { echo "network create of $P_NETWORK failed"; return 1; }
   containers+=("$P_NAME")
   outer 30 "${create[@]}" >/dev/null || { echo "create of $P_NAME failed"; return 1; }
   outer 30 start "$P_NAME" >/dev/null || { echo "start of $P_NAME failed"; return 1; }
@@ -183,8 +212,36 @@ start_posture() {
     echo 'nested daemon did not become ready'
     return 1
   fi
-  P_IP=$(outer 10 inspect --format '{{.NetworkSettings.Networks.bridge.IPAddress}}' "$P_NAME") || return 1
+  P_IP=$(outer 10 inspect --format "{{with index .NetworkSettings.Networks \"$P_NETWORK\"}}{{.IPAddress}}{{end}}" "$P_NAME") || return 1
   [[ $P_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad container IP '$P_IP'"; return 1; }
+  verify_network_isolation
+}
+
+# A positive control on the private bridge, then the same probe on the default
+# bridge. The unauthenticated listener must be unreachable from unrelated containers.
+verify_network_isolation() {
+  local probe="dbp-test-$token-$P-network-probe"
+  if ! outer 10 image inspect "$FIXTURE_IMAGE" >/dev/null 2>&1; then
+    outer 300 pull "$FIXTURE_IMAGE" >/dev/null || return 1
+  fi
+  containers+=("$probe")
+  outer 15 create --name "$probe" --label "$OWNER_LABEL=$token" --network "$P_NETWORK" \
+    "$FIXTURE_IMAGE" sleep 1800 >/dev/null || return 1
+  outer 15 start "$probe" >/dev/null || return 1
+  outer 10 exec "$probe" wget -T 2 -t 1 -q -O- "http://$P_IP:2375/_ping" >/dev/null \
+    || { echo "FAIL: private-network positive control cannot reach nested dockerd"; return 1; }
+  outer 10 network disconnect "$P_NETWORK" "$probe" || return 1
+  outer 10 network connect bridge "$probe" || return 1
+  local probe_rc=0
+  outer 10 exec "$probe" wget -T 2 -t 1 -q -O- "http://$P_IP:2375/_ping" >/dev/null 2>&1 || probe_rc=$?
+  if ((probe_rc == 0)); then
+    echo "FAIL: default-bridge container can reach the unauthenticated nested dockerd"
+    return 1
+  elif ((probe_rc != 1)); then
+    echo "FAIL: isolation probe failed to run reliably (rc=$probe_rc), not evidence of isolation"
+    return 1
+  fi
+  pass 'private-network control reaches dockerd; default-bridge probe cannot'
   return 0
 }
 
@@ -197,7 +254,7 @@ print_versions() {
   inner 15 buildx version
   inner 30 buildx inspect | grep -E '^(Name|Driver|Status|BuildKit version)|BuildKit version' | head -5 || true
   inner 15 info --format 'storage driver={{.Driver}} security={{range .SecurityOptions}}{{.}} {{end}}'
-  echo "nested daemon: unix $P_SOCK and tcp://$P_IP:2375 (unpublished, tls disabled), --debug on"
+  echo "nested daemon: unix $P_SOCK and tcp://$P_IP:2375 (unpublished, tls disabled, owned network $P_NETWORK), --debug on"
   echo "data root $P_DATA is a size-limited tmpfs of ${TMPFS_MB} MB"
 }
 
@@ -406,7 +463,7 @@ setup_noplug() {
   NP="$P_NAME-noplug"
   containers+=("$NP")
   if ! outer 10 image inspect "$FIXTURE_IMAGE" >/dev/null 2>&1; then outer 120 pull "$FIXTURE_IMAGE" >/dev/null; fi
-  outer 30 create --name "$NP" --label "$OWNER_LABEL=$token" --network bridge "$FIXTURE_IMAGE" sleep 1800 >/dev/null
+  outer 30 create --name "$NP" --label "$OWNER_LABEL=$token" --network "$P_NETWORK" "$FIXTURE_IMAGE" sleep 1800 >/dev/null
   outer 30 start "$NP" >/dev/null
   outer 20 cp "$CLIENT_BIN" "$NP:/opt/docker"
   local dirs
