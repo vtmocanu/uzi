@@ -41,7 +41,7 @@ func TestTerminalPreservationRequestStrictDecode(t *testing.T) {
 // The wire reasons are distinct, non-empty tokens, and the stored ones match the column's CHECK.
 func TestTerminalReasonVocabulary(t *testing.T) {
 	all := []string{
-		TerminalReasonCreateRefused, TerminalReasonUpdateRefused, TerminalReasonUnsupported, TerminalReasonHoldMissing,
+		TerminalReasonSendSuppressed, TerminalReasonCreateRefused, TerminalReasonUpdateRefused, TerminalReasonUnsupported, TerminalReasonHoldMissing,
 		TerminalReasonIdentityChanged, TerminalReasonExcludedOrigin, TerminalReasonManifestInvalid, TerminalReasonManifestMismatch,
 		TerminalReasonGenerationBound, TerminalReasonPriorTipMismatch, TerminalReasonPreservationRetired, TerminalReasonPublicationInFlight,
 		TerminalReasonForgeUnavailable, TerminalReasonPackInvalid, TerminalReasonPackTooLarge, TerminalReasonTipMissing,

@@ -87,8 +87,9 @@ type TerminalPreservationResponse struct {
 // refusal_reason column (its CHECK). The second group is wire-only: a refusal made before any row
 // is written, never stored.
 const (
-	TerminalReasonCreateRefused = "create_refused"
-	TerminalReasonUpdateRefused = "update_refused"
+	TerminalReasonSendSuppressed = "send_suppressed"
+	TerminalReasonCreateRefused  = "create_refused"
+	TerminalReasonUpdateRefused  = "update_refused"
 
 	TerminalReasonUnsupported         = "unsupported"
 	TerminalReasonHoldMissing         = "hold_missing"

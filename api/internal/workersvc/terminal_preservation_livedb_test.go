@@ -757,25 +757,63 @@ func TestTerminalTx1CommitAckLostSendsNothingLiveDB(t *testing.T) {
 	}
 }
 
-// A guarded hold that settles after tx1 committed suppresses the send, and the contribution is
-// recorded publish_unknown (tx2) so the sweep's reconcile lane owns it.
-func TestTerminalHoldSettledAfterTx1RecordsUnknownLiveDB(t *testing.T) {
-	f := newTermFix(t, "hold")
-	f.svc.terminal.beforeSend = func() {
-		f.rawHold(`UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL,
-			released_at=now() WHERE id=$1`)
-	}
-	res, err := f.publish(f.req(1, termTip1, ""))
-	if err != nil || res.State != "publish_unknown" || res.PreservationState != "publishing" {
-		t.Fatalf("result = %+v, %v", res, err)
-	}
-	if _, sends, _ := f.fake.counts(); sends != 0 {
-		t.Fatalf("sends = %d, want 0: a settled hold suppresses the send", sends)
-	}
-	c, _ := f.con(1)
-	p, _ := f.pres()
-	if c.State != "publish_unknown" || p.State != "publishing" || !p.LastError.Valid || !p.NextCheckAt.Valid {
-		t.Fatalf("contribution=%s preservation=%+v, want publish_unknown, publishing, scheduled with a last_error", c.State, p)
+// A known local no-send is definitive, unlike an interrupted send or a crash after tx1.
+func TestTerminalHoldSettledAfterTx1RecordsNotSentLiveDB(t *testing.T) {
+	for _, update := range []bool{false, true} {
+		name := "create"
+		if update {
+			name = "update"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newTermFix(t, "hold")
+			gen, tip, prior := int64(1), termTip1, ""
+			sendsBefore := 0
+			var first time.Time
+			if update {
+				if res, err := f.publish(f.req(1, termTip1, "")); err != nil || res.State != "published" {
+					t.Fatalf("initial publish=%+v, %v", res, err)
+				}
+				p, _ := f.pres()
+				first = p.FirstPublishedAt.Time
+				f.e.exec(t, `UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL, released_at=now() WHERE id=$1`, f.hold)
+				f.hold = uuid.New()
+				f.e.exec(t, `UPDATE runs SET claim_generation=2 WHERE id=$1`, f.run)
+				f.e.exec(t, `INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded)
+      VALUES($1,$2,$3,$4,2,'open',$5,'term-ident',$5,$4,true)`, f.hold, f.e.userID, f.e.repoID, f.run, f.worker.ID)
+				gen, tip, prior, sendsBefore = 2, termTip2, termTip1, 1
+			}
+			f.svc.terminal.beforeSend = func() {
+				f.rawHold(`UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL, released_at=now() WHERE id=$1`)
+			}
+			res, err := f.publish(f.req(gen, tip, prior))
+			wantPres := "not_published"
+			if update {
+				wantPres = "live"
+			}
+			if err != nil || res.State != "refused" || res.Reason != "send_suppressed" || res.PreservationState != wantPres {
+				t.Fatalf("result=%+v, %v", res, err)
+			}
+			if _, sends, _ := f.fake.counts(); sends != sendsBefore {
+				t.Fatalf("sends=%d, want %d", sends, sendsBefore)
+			}
+			c, _ := f.con(gen)
+			p, _ := f.pres()
+			if c.State != "refused" || c.RefusalReason.String != "send_suppressed" || p.State != wantPres || !p.LastError.Valid {
+				t.Fatalf("contribution=%+v preservation=%+v", c, p)
+			}
+			if !update && (p.LiveRunID.Valid || p.Tip.Valid) {
+				t.Fatalf("create left a live pointer: %+v", p)
+			}
+			if update && (!p.LiveRunID.Valid || p.Tip.String != termTip1 || !p.FirstPublishedAt.Time.Equal(first)) {
+				t.Fatalf("update lost prior publication: %+v", p)
+			}
+			// A settled row is never sent again, even when the caller repeats its request.
+			f.svc.terminal.beforeSend = nil
+			_, _ = f.publish(f.req(gen, tip, prior))
+			if _, sends, _ := f.fake.counts(); sends != sendsBefore {
+				t.Fatalf("retry sent: %d", sends)
+			}
+		})
 	}
 }
 
@@ -901,17 +939,18 @@ func TestTerminalPrepareRefusalsWriteNothingLiveDB(t *testing.T) {
 		err    error
 		reason string
 	}{
-		"pack too large":  {pushbroker.ErrPackTooLarge, apitypes.TerminalReasonPackTooLarge},
-		"pack invalid":    {fmt.Errorf("%w: x", pushbroker.ErrPackInvalid), apitypes.TerminalReasonPackInvalid},
-		"invalid ref":     {pushbroker.ErrInvalidRef, apitypes.TerminalReasonPackInvalid},
-		"tip missing":     {pushbroker.ErrTipMissing, apitypes.TerminalReasonTipMissing},
-		"ci config guard": {pushbroker.ErrCIConfigGuard, apitypes.TerminalReasonCIConfigGuard},
-		"not descendant":  {pushbroker.ErrNotDescendant, apitypes.TerminalReasonNotDescendant},
-		"root":            {pushbroker.ErrTerminalRootUnreachable, apitypes.TerminalReasonRootUnreachable},
-		"tree":            {pushbroker.ErrTerminalTreeMismatch, apitypes.TerminalReasonTreeMismatch},
-		"walk":            {pushbroker.ErrTerminalWalkTooLarge, apitypes.TerminalReasonWalkTooLarge},
-		"prior moved":     {pushbroker.ErrTerminalPriorMoved, apitypes.TerminalReasonForeignTip},
-		"transport":       {errors.New("dial tcp: i/o timeout"), apitypes.TerminalReasonForgeUnavailable},
+		"pack too large":          {pushbroker.ErrPackTooLarge, apitypes.TerminalReasonPackTooLarge},
+		"pack invalid":            {fmt.Errorf("%w: x", pushbroker.ErrPackInvalid), apitypes.TerminalReasonPackInvalid},
+		"invalid ref":             {pushbroker.ErrInvalidRef, apitypes.TerminalReasonPackInvalid},
+		"tip missing":             {pushbroker.ErrTipMissing, apitypes.TerminalReasonTipMissing},
+		"ci config guard":         {pushbroker.ErrCIConfigGuard, apitypes.TerminalReasonCIConfigGuard},
+		"not descendant":          {pushbroker.ErrNotDescendant, apitypes.TerminalReasonNotDescendant},
+		"root":                    {pushbroker.ErrTerminalRootUnreachable, apitypes.TerminalReasonRootUnreachable},
+		"tree":                    {pushbroker.ErrTerminalTreeMismatch, apitypes.TerminalReasonTreeMismatch},
+		"walk":                    {pushbroker.ErrTerminalWalkTooLarge, apitypes.TerminalReasonWalkTooLarge},
+		"prior moved":             {pushbroker.ErrTerminalPriorMoved, apitypes.TerminalReasonForeignTip},
+		"transport":               {errors.New("dial tcp: i/o timeout"), apitypes.TerminalReasonForgeUnavailable},
+		"advertisement oversized": {pushbroker.ErrRefAdvertisementTooLarge, apitypes.TerminalReasonForgeUnavailable},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

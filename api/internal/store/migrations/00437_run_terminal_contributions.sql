@@ -43,7 +43,7 @@ CREATE TABLE run_terminal_contributions (
         'recorded'          -- an abandonment decision was recorded; nothing was pushed
     )),
     refusal_reason text CONSTRAINT run_terminal_contributions_refusal_reason_check CHECK (refusal_reason IN (
-        'create_refused', 'update_refused', 'foreign_tip')),
+        'create_refused', 'update_refused', 'foreign_tip', 'send_suppressed')),
     create_invoked_at timestamptz,
     published_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),

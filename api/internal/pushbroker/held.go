@@ -219,8 +219,11 @@ type packPrep struct {
 	// AllowEmptyPack admits a nil/empty Pack (no objects shipped); the tip must then already be
 	// present in the fetched bases.
 	AllowEmptyPack bool
-	CIConfigGuard  bool
-	CIConfigPaths  []string
+	// CheckAdvertisement requires a bounded discovery preflight before the base fetch.
+	// Terminal publication uses the same limit as its confirming read-back.
+	CheckAdvertisement bool
+	CIConfigGuard      bool
+	CIConfigPaths      []string
 }
 
 // prepareFetchedPack is the read-only core of both preparations: base-ref validation, pack
@@ -273,6 +276,14 @@ func prepareFetchedPack(ctx context.Context, in packPrep) (*git.Repository, *obj
 	}
 	for _, b := range in.ExtraBaseRefs {
 		want[b] = b
+	}
+	// Refuse an origin whose discovery already exceeds the confirming read's cap,
+	// before the caller can commit an invoke marker. This is point-in-time evidence:
+	// a later remote ref change can still make send/read-back ambiguous.
+	if in.CheckAdvertisement {
+		if _, err := boundedRefTips(ctx, in.CloneURL, auth, nil); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := fetchWantedRefs(ctx, remote, auth, want); err != nil {
 		return nil, nil, err

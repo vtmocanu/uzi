@@ -667,8 +667,8 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 	if s.terminal.beforeSend != nil {
 		s.terminal.beforeSend()
 	}
-	// suppressed is why the send is skipped; a skipped send is recorded as publish_unknown (tx2), the
-	// step-5 "otherwise" outcome, so the sweep's reconcile lane owns it. Never resend.
+	// A local decision to skip both send functions is a proven no-send, not an ambiguous
+	// remote outcome. Persist it as a refusal; a crash before that write still reconciles.
 	suppressed := ""
 	if bound.authority == terminalAuthorityGuardedHold {
 		// A settlement observed here suppresses the send. A failed read also fails closed.
@@ -694,7 +694,7 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 	default:
 		outcome, sendErr = s.terminal.sendUpdateFn()(ctx, prepared)
 	}
-	rec := terminalOutcomeRecord{outcome: outcome}
+	rec := terminalOutcomeRecord{outcome: outcome, notSent: suppressed != ""}
 	if sendErr != nil {
 		// The remote's ng text is untrusted: delete unsafe runes, redact the connection PAT and any
 		// recognised secret family, collapse whitespace and bound it before it reaches a log or a row.
@@ -1068,9 +1068,11 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 	return b, nil
 }
 
-// terminalOutcomeRecord is what the send proved: the outcome and the scrubbed text of its error.
+// terminalOutcomeRecord carries a send result or this request's definitive local no-send.
+// notSent is never inferred from a remote error or reconstructed after a crash.
 type terminalOutcomeRecord struct {
 	outcome pushbroker.TerminalOutcome
+	notSent bool
 	lastErr string
 }
 
@@ -1114,8 +1116,8 @@ func (s *Service) terminalRecordOutcome(ctx context.Context, runID uuid.UUID, ge
 	}
 	expected := con.State
 	next := func(d time.Duration) pgtype.Timestamptz { return pgtype.Timestamptz{Time: s.now().Add(d), Valid: true} }
-	switch rec.outcome {
-	case pushbroker.TerminalApplied:
+	switch {
+	case !rec.notSent && rec.outcome == pushbroker.TerminalApplied:
 		con, err = qt.RecordTerminalContributionPublished(wctx, store.RecordTerminalContributionPublishedParams{ID: con.ID, ExpectedState: con.State})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return zeroP, zeroC, terminalWriteMiss(wctx, qt, "record published", runID, generation, true, expected)
@@ -1126,10 +1128,13 @@ func (s *Service) terminalRecordOutcome(ctx context.Context, runID uuid.UUID, ge
 		pres, err = qt.SettleTerminalPreservationLive(wctx, store.SettleTerminalPreservationLiveParams{
 			ID: pres.ID, Tip: pgtype.Text{String: con.Tip, Valid: true}, ExpectedTip: pres.Tip, NextCheckAt: next(terminalLiveRecheck),
 		})
-	case pushbroker.TerminalRefused:
+	case rec.notSent || rec.outcome == pushbroker.TerminalRefused:
 		reason := apitypes.TerminalReasonCreateRefused
 		if con.PriorTip.Valid {
 			reason = apitypes.TerminalReasonUpdateRefused
+		}
+		if rec.notSent {
+			reason = apitypes.TerminalReasonSendSuppressed
 		}
 		con, err = qt.RecordTerminalContributionRefused(wctx, store.RecordTerminalContributionRefusedParams{
 			ID: con.ID, ExpectedState: con.State, RefusalReason: pgtype.Text{String: reason, Valid: true},

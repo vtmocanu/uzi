@@ -160,9 +160,11 @@ func (o TerminalOutcome) String() string {
 // present, the ci-config guard passes (when set), every object reachable from the tip is present
 // (shallow-fetched base snapshots are the only permitted gaps in history), every declared root is a
 // reachable commit with its declared tree and, for an update, PriorTip is a proper ancestor of the
-// tip. It sends nothing. Errors: ErrInvalidRef (malformed inputs), ErrPackInvalid (including a
+// tip. A bounded discovery preflight rejects origins already exceeding the read-back cap.
+// It sends nothing. Errors: ErrInvalidRef (malformed inputs), ErrPackInvalid (including a
 // missing object), ErrPackTooLarge, ErrTipMissing, ErrCIConfigGuard, ErrTerminalRootUnreachable,
-// ErrTerminalTreeMismatch, ErrTerminalWalkTooLarge, ErrTerminalPriorMoved (update: the fetched
+// ErrTerminalTreeMismatch, ErrTerminalWalkTooLarge, ErrRefAdvertisementTooLarge,
+// ErrTerminalPriorMoved (update: the fetched
 // terminal ref is absent or not at PriorTip) and ErrNotDescendant (prior tip).
 //
 // Producer rule: bases are fetched at depth 1, so only each fetched base tip (default branch, work
@@ -197,7 +199,7 @@ func PrepareTerminalPack(ctx context.Context, o TerminalPackOptions) (*PreparedT
 	in := packPrep{
 		CloneURL: o.CloneURL, Username: o.Username, PAT: o.PAT,
 		WorkBranch: o.WorkBranch, CheckpointKey: o.CheckpointKey, DefaultBranch: o.DefaultBranch,
-		BaseRefs: o.BaseRefs, Tip: o.Tip, Pack: o.Pack, AllowEmptyPack: true,
+		BaseRefs: o.BaseRefs, Tip: o.Tip, Pack: o.Pack, AllowEmptyPack: true, CheckAdvertisement: true,
 		CIConfigGuard: o.CIConfigGuard, CIConfigPaths: o.CIConfigPaths,
 	}
 	if !prior.IsZero() {

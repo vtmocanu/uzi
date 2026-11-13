@@ -217,3 +217,17 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
 - **D**: activation, and an owner escape for removal-blocking refs, with CLI.
 - **E**: fleet rollout.
 - **Purge** of finished rows.
+
+### Review corrections: preparation and a proven local no-send
+
+Terminal preparation checks the existing 1 MiB discovery limit before fetching
+bases and before an invoke marker can be committed. This preflight does not
+freeze remote refs: a later advertisement change can still leave a send or
+read-back ambiguous, which continues to reconcile without another send.
+
+If the request that committed the marker then suppresses both send functions,
+its definitive local no-send is recorded as `refused` with `send_suppressed`.
+A create settles to `not_published` and clears its live pointer. An update stays
+`live` at the prior tip and keeps its first-publication time. A crash before
+recording this evidence, an ambiguous database write or any actual interrupted
+send retains the existing reconcile-only behavior.
