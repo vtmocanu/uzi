@@ -41,8 +41,13 @@ function stubHooks(settleGate: Gate): { hooks: GitAuthorityHooks; outcomes: unkn
   };
 }
 
-const pending = <T>(promise: Promise<T>, ms = 100): Promise<"pending" | "settled"> =>
-  Promise.race([promise.then(() => "settled" as const), new Promise<"pending">((resolve) => { setTimeout(() => resolve("pending"), ms).unref(); })]);
+async function pending<T>(promise: Promise<T>, ms = 100): Promise<"pending" | "settled"> {
+  // Keep the bound referenced while it is the only event-loop handle, then clear it if work settles first.
+  let timer: NodeJS.Timeout | undefined;
+  const bound = new Promise<"pending">((resolve) => { timer = setTimeout(() => resolve("pending"), ms); });
+  try { return await Promise.race([promise.then(() => "settled" as const), bound]); }
+  finally { clearTimeout(timer); }
+}
 
 async function fixtureBare(t: TestContext): Promise<{ dataDir: string; bare: string; plain: GitCache; originPath: string }> {
   const fx = makeFixture();
