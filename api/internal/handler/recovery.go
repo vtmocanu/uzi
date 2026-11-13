@@ -603,7 +603,7 @@ func (h *Handler) listRecoveryHoldsScoped(w http.ResponseWriter, r *http.Request
 	}
 	if debug {
 		if debugRun != uuid.Nil {
-			auditRunDebugRead(r, debugActor, debugToken, adminRunDebugRouteHolds, debugRun, owner)
+			auditHoldsRunDebugRead(r, debugActor, debugToken, adminRunDebugRouteHolds, owner, debugRun)
 		} else {
 			auditHoldsDebugRead(r, debugActor, debugToken, adminRunDebugRouteHolds, owner)
 		}

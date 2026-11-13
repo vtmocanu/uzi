@@ -227,6 +227,18 @@ func TestAuditHoldsDebugRead(t *testing.T) {
 	})
 }
 
+func TestAuditHoldsRunDebugRead(t *testing.T) {
+	c := captureAdminRunDebug(t)
+	actor, tok, owner, run := store.User{ID: uuid.New()}, uuid.New(), uuid.New(), uuid.New()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", nil)
+	auditHoldsRunDebugRead(req, actor, tok, adminRunDebugRouteHolds, owner, run)
+	got := requireOneAudit(t, c)
+	assertAttrs(t, got, map[string]any{
+		"actor_user_id": actor.ID.String(), "token_id": tok.String(), "route": "recovery.holds",
+		"target_owner_id": owner.String(), "run_id": run.String(),
+	})
+}
+
 func TestAuditRunsListDebugRead(t *testing.T) {
 	actor, tok := store.User{ID: uuid.New()}, uuid.New()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", nil)

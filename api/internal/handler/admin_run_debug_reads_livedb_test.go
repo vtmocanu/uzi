@@ -227,7 +227,11 @@ func adrdRoutes() []adrdRoute {
 					t.Errorf("aggregate.open_holds = %d, want the owner-wide 2", dto.Aggregate.OpenHolds)
 				}
 			},
-			auditRoute: "recovery.holds", auditKeys: runKeys,
+			// Holds narrowed to a run carry the holds-listing target_owner_id plus the run id.
+			auditKeys: func(f *adrdFixture) map[string]string {
+				return map[string]string{"target_owner_id": f.owner.String(), "run_id": f.run.String()}
+			},
+			auditRoute: "recovery.holds",
 		},
 	}
 }

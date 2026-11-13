@@ -101,6 +101,14 @@ func auditHoldsDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID, r
 	adminRunDebugLogger().InfoContext(r.Context(), adminRunDebugMessage, attrs...)
 }
 
+// auditHoldsRunDebugRead records a cross-user read of another owner's recovery holds narrowed
+// to one run (?run=): the holds-listing fields (target_owner_id) plus the run id.
+func auditHoldsRunDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID, route adminRunDebugRoute, targetOwnerID, runID uuid.UUID) {
+	attrs := append(adminRunDebugBaseAttrs(actor, tokenID, route),
+		"target_owner_id", targetOwnerID.String(), "run_id", runID.String())
+	adminRunDebugLogger().InfoContext(r.Context(), adminRunDebugMessage, attrs...)
+}
+
 // auditRunsListDebugRead records an all-states admin run listing. ownerFilter nil
 // means all owners; since is omitted from the record when nil.
 func auditRunsListDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID, route adminRunDebugRoute, ownerFilter *uuid.UUID, since *time.Time, returned int) {
