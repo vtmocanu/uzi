@@ -71,6 +71,8 @@ services:
       # Issue tracker SSRF allowlist (PRD #4173 S3): separate from the forge one, https
       # only, empty by default (no issue tracker connection can be created). Not worker egress.
       ISSUE_TRACKER_ALLOWED_BASE_URLS: ${ISSUE_TRACKER_ALLOWED_BASE_URLS:-}
+      # Hosts an admin may route Claude through (admin settings "Claude gateway"); empty = none.
+      ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS: ${ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS:-}
       FORGE_POLL_INTERVAL: ${FORGE_POLL_INTERVAL:-60s}
       FORGE_RECONCILE_EVERY: ${FORGE_RECONCILE_EVERY:-10}
       FORGE_HTTP_TIMEOUT: ${FORGE_HTTP_TIMEOUT:-15s}

@@ -195,6 +195,10 @@ const SEED_APP_SETTINGS: AppSettings = {
   docker_repo_allowlist: "",
   // Issue #2347: trusted review-bot allowlist, default empty (no bot trusted, fail closed).
   mr_review_trusted_bots: "",
+  // Anthropic-compatible gateway (admin "Claude gateway"), off by default.
+  anthropic_gateway_base_url: "",
+  anthropic_gateway_auth_header: "authorization",
+  anthropic_gateway_models: "",
   // PRD #84 M2: capability-aware scheduling kill-switch, default ON.
   capability_aware_scheduling: "true",
   // Issue #1626: completion interlock kill-switch, default ON (Claude issue runs only).
@@ -1271,6 +1275,36 @@ export const settingsApi = {
         const problem = trustedBotsValueError(value);
         if (problem) throw new ApiError(400, `mr_review_trusted_bots: ${problem}`);
         nonSecret.mr_review_trusted_bots = value;
+        continue;
+      }
+      // The Anthropic-compatible gateway keys, following settings_gateway.go. The mock has
+      // no operator allowlist: any https URL stands in for an allowlisted one.
+      if (key === "anthropic_gateway_base_url") {
+        if (value !== "") {
+          let u: URL | undefined;
+          try { u = new URL(value); } catch { u = undefined; }
+          if (!u || u.protocol !== "https:" || u.username || u.password || u.search || u.hash || value !== value.trim()) {
+            throw new ApiError(400, `${key}: must be an https URL with no credentials, query or fragment`);
+          }
+        }
+        (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      if (key === "anthropic_gateway_auth_header") {
+        if (value !== "authorization" && value !== "x-api-key") throw new ApiError(400, `${key}: must be authorization or x-api-key`);
+        (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      if (key === "anthropic_gateway_models") {
+        const seen = new Set<string>();
+        for (const pair of value.trim() === "" ? [] : value.split(",")) {
+          const [alias, model, extra] = pair.split("=").map((p) => p.trim());
+          if (extra !== undefined || !["opus", "sonnet", "haiku", "fable"].includes(alias ?? "") || !/^[A-Za-z0-9._:/@-]{1,200}$/.test(model ?? "") || seen.has(alias!)) {
+            throw new ApiError(400, `${key}: ${JSON.stringify(pair)} must be alias=model`);
+          }
+          seen.add(alias!);
+        }
+        (nonSecret as Record<string, string>)[key] = value;
         continue;
       }
       if (key !== "autopilot_label" && key !== "uzi_label") {

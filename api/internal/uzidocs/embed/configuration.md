@@ -220,6 +220,21 @@ one operator-only piece is the SSRF allowlist for the clone target, a
 |---|---|---|
 | `AGENT_SOURCE_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for the agent-source clone URL; every entry must be a bare `https://host[:port]` (optional trailing `/`); an entry with userinfo, a path, a query or a fragment fails boot (previously reduced silently to the host). Unlike `FORGE_ALLOWED_BASE_URLS`, an **empty** list is not a boot error — the feature is off by default, so an unconfigured instance still boots — but it does mean nothing is allowed until you set at least one entry here, no matter what an admin saves in the URL field. |
 
+## Anthropic-compatible gateway
+
+An admin can route every Claude call through an Anthropic-compatible gateway (LiteLLM, Portkey, Cloudflare AI Gateway, a corporate proxy) under **Admin settings → Claude gateway**. Every user's saved Anthropic token is then sent to that gateway as its key, so the operator decides which hosts are possible:
+
+| Var | Default | Notes |
+|---|---|---|
+| `ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated `https://` URLs the gateway URL must equal or sit under (on a path-segment boundary). Keep the path on a shared gateway host, where the account lives in the path (for example a Cloudflare AI Gateway account), or an admin could pick any account on that host. A malformed or non-https entry fails boot; empty allows none. Checked on save and at every use: a saved gateway whose URL is no longer allowed is **blocked**, not off, so workers, token tests and the poller never send the saved gateway keys to Anthropic until it is allowlisted again or cleared. |
+
+What else a deployment needs:
+
+- **Worker egress.** Restricted-tier workers reach only `workers.fqdnEgress.allowFQDNs`; add the gateway host there. The isolated research lane's single `workers.isolatedLane.modelHost` must name the gateway host for lane runs to work.
+- **A private CA.** Workers trust an extra CA through `workers.extraCA`. The api verifies the gateway for token tests with Go's system roots, so a private-CA gateway also needs that CA in the api container's trust (for example `SSL_CERT_DIR`).
+- **Model names.** Claude Code resolves the `opus`, `sonnet`, `haiku` and `fable` aliases through the map; a concrete model id uzi or a repo pins is sent unchanged, so the gateway must route it.
+- **Redirects.** The token test never follows a redirect. The Claude CLI does, so with `x-api-key` the gateway must not redirect to another host.
+
 ## CI status integration (PRD #6)
 
 uzi caches the latest pipeline per **watched ref** (a repo's default branch, plus the branches of that repo's recent agent runs) on the same poll tick as the issue sync — no second loop or interval — and renders it as a status badge on the repos list, the board header, and each card. A failed pipeline offers a **Fix CI** button that queues a plan-gated `ci_fix` agent run; when that run's fix branch pipeline concludes, the sync stamps the run `verified` or `fix_failed` ("uzi verifies its work"). See [ARCHITECTURE.md](../ARCHITECTURE.md) for the full pipeline-sync + verification design.

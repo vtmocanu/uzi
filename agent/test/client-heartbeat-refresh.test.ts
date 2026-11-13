@@ -273,3 +273,24 @@ it("register quota rejects fractional and negative values", async () => {
     assert.equal(f.client.workerOutboxMaxPending, undefined);
   }
 });
+
+it("register and every ordinary heartbeat set or clear the Anthropic-compatible gateway", async () => {
+  const { anthropicGateway, setAnthropicGatewayFromWire } = await import("../src/anthropic-gateway.js");
+  try {
+    const gw = { base_url: "https://gw.example.com", auth_header: "authorization", models: { opus: "gw-opus" } };
+    const f = fixture({ anthropic_gateway: gw });
+    await f.client.register("w");
+    assert.equal(anthropicGateway()?.baseUrl, "https://gw.example.com");
+    f.setReply(() => json({ protocol_features: [] }));
+    await f.client.heartbeat();
+    assert.equal(anthropicGateway()?.baseUrl, "https://gw.example.com", "an older api pod omitting the field must not clear it");
+    f.setReply(() => json({ anthropic_gateway: null }));
+    await f.client.heartbeat();
+    assert.equal(anthropicGateway(), undefined, "a null heartbeat field turns the gateway off");
+    f.setReply(() => json({ anthropic_gateway: { ...gw, auth_header: "x-api-key" } }));
+    await f.client.heartbeat();
+    assert.equal(anthropicGateway()?.authHeader, "x-api-key");
+  } finally {
+    setAnthropicGatewayFromWire(null);
+  }
+});

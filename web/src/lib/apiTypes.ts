@@ -1428,6 +1428,13 @@ export interface AppSettings {
   // are withheld from automatic MR rework; a listed bot's comments are ingested (still as
   // untrusted evidence). Empty (the default) trusts no bot. Rules: lib/trustedReviewBots.ts.
   mr_review_trusted_bots: string;
+  // Anthropic-compatible gateway (admin card "Claude gateway"): the https base URL every
+  // Claude call routes through ("" = Anthropic directly), how the key is sent
+  // ("authorization" | "x-api-key"), and comma-separated alias=model pairs. Optional so an
+  // older API that lacks them reads as off.
+  anthropic_gateway_base_url?: string;
+  anthropic_gateway_auth_header?: string;
+  anthropic_gateway_models?: string;
   // Capability-aware scheduling kill-switch (PRD #84 M2). The text "true"/"false"
   // (default "true"). When on, a run is routed only to a worker that can run it
   // (e.g. a docker-needing run only to a docker worker). Turning it OFF reverts to

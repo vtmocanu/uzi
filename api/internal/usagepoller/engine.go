@@ -125,7 +125,19 @@ type Engine struct {
 	// notifier delivers the early-reset alert (PRD #1020 M3). Optional and nil-safe:
 	// nil (the default) means detection runs and logs but does not deliver.
 	notifier EarlyResetNotifier
+
+	// gatewayOn reports whether Claude traffic routes through an Anthropic-compatible
+	// gateway (SetGatewayCheck). Optional; nil means never.
+	gatewayOn func(context.Context) bool
 }
+
+// SetGatewayCheck wires the gateway check. While it reports true the poller polls
+// nothing: the saved tokens are gateway keys, which api.anthropic.com refuses (the
+// probe would mark every one rejected), and a gateway exposes no Anthropic subscription
+// windows to read. Every token then reads as unmeasured, which auto-selection already
+// handles (autoselect.Policy.MaxStaleness). Re-evaluated on every poll, so turning the
+// gateway off resumes polling without a restart.
+func (e *Engine) SetGatewayCheck(on func(context.Context) bool) { e.gatewayOn = on }
 
 // SetNotifier wires the early-reset alert collaborator (PRD #1020 M3). Call once at
 // startup, before the engine runs. A nil notifier
@@ -318,6 +330,9 @@ func (e *Engine) openToken(ctx context.Context, row store.GetAnthropicTokenToPol
 // feature exists to support (a throttled subscription alongside a working console
 // key).
 func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev, successGeneration int64, ignoreBackoff, notifyEarly bool, open func() ([]byte, error)) {
+	if e.gatewayOn != nil && e.gatewayOn(ctx) {
+		return
+	}
 	if ignoreBackoff {
 		e.clearBackoff(secretID)
 	} else if e.inBackoff(secretID) {

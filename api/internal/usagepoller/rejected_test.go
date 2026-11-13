@@ -103,3 +103,30 @@ func TestOldPollCannotRejectOrClearAfterReplacement(t *testing.T) {
 		})
 	}
 }
+
+// Behind an Anthropic-compatible gateway the saved tokens are gateway keys: the poller
+// must not send them to api.anthropic.com (whose 401 would mark every one rejected), and
+// it resumes as soon as the gateway is turned off.
+func TestGatewayPausesPollingAndNeverRejects(t *testing.T) {
+	id := uuid.New()
+	st := newFakeStore(id)
+	cl := &fakeClient{
+		usage: func([]byte) (anthropic.Reading, error) { return anthropic.Reading{}, httpErr(401) },
+		probe: func([]byte) (anthropic.Reading, error) { return anthropic.Reading{}, httpErr(401) },
+	}
+	e, _ := newEngine(t, st, &fakeOpener{}, cl, true)
+	on := true
+	e.SetGatewayCheck(func(context.Context) bool { return on })
+	open := func() ([]byte, error) { return []byte("gateway-key"), nil }
+
+	e.pollToken(context.Background(), id, id, 0, 0, true, false, open)
+	if u, p := cl.calls(); u != 0 || p != 0 || st.rejected[id] {
+		t.Fatalf("gateway on: usage=%d probe=%d rejected=%v, want no calls and no rejection", u, p, st.rejected[id])
+	}
+
+	on = false
+	e.pollToken(context.Background(), id, id, 0, 0, true, false, open)
+	if u, _ := cl.calls(); u != 1 {
+		t.Fatalf("gateway off: usage calls = %d, want polling to resume", u)
+	}
+}

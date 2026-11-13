@@ -363,6 +363,8 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// returned at register so the worker can size its own pending-outcome quota to match the
 		// server's WORKER_OUTBOX_MAX_PENDING without a separate config channel.
 		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
+		// The Anthropic-compatible gateway every Claude call routes through, or null.
+		"anthropic_gateway": h.anthropicGatewayWire(r.Context()),
 	})
 }
 
@@ -697,6 +699,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		"worker":                    dto,
 		"protocol_features":         h.advertisedFeatures(),
 		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
+		"anthropic_gateway":         h.anthropicGatewayWire(r.Context()),
 	}
 	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {
 		response["dind_maintenance"] = maintenance
@@ -1175,6 +1178,15 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	// Every claim lane can release the owner's Anthropic token. While a gateway is
+	// configured (blocked included) that token is a gateway key, and a worker that does not
+	// route through the gateway would send it to api.anthropic.com: such a worker claims
+	// nothing until it upgrades.
+	if h.settings != nil && h.settings.AnthropicGatewayConfigured(r.Context()) &&
+		!slices.Contains(wkr.ProtocolCapabilities, capability.AnthropicGatewayV1) {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 

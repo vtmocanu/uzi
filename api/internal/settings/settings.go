@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/anthropic"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/theme"
@@ -477,6 +478,13 @@ func Validate(key, value string) error {
 		KeyReleaseCheckEnabled, KeyReleaseCheckBannerEnabled,
 		KeyAppLogoKeepName, KeyBrandPlaque:
 		return validateBool(value)
+	case KeyAnthropicGatewayBaseURL:
+		return validateGatewayBaseURL(value)
+	case KeyAnthropicGatewayAuthHeader:
+		return validateEnum(value, anthropic.AuthHeaderBearer, anthropic.AuthHeaderAPIKey)
+	case KeyAnthropicGatewayModels:
+		_, err := ParseGatewayModels(value)
+		return err
 	case KeyMrReworkCap:
 		return validateMrReworkCap(value)
 	case KeyMrReviewTrustedBots:

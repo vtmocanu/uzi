@@ -3,6 +3,7 @@ import {
   validatePolicyRecoveryVerifiedRequest, decodePolicyRecoveryVerifiedReply, POLICY_RECOVERY_VERIFIED_MAX_BYTES,
   type PolicyRecoveryVerifiedRequest, type PolicyRecoveryVerifiedReply,
 } from "./protocol.js";
+import { setAnthropicGatewayFromWire } from "./anthropic-gateway.js";
 import { decodeCodexOperationDecision, validCodexOperationRequest } from "./codex-operation-admission.js";
 import type { CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
@@ -1916,6 +1917,7 @@ export class WorkerClient {
     // exists); an ordinary worker passes undefined and the register wire stays byte-identical.
     if (initialSnapshot !== undefined) body.active_snapshot = this.snapshotForServer(initialSnapshot);
     const res = (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
+    setAnthropicGatewayFromWire(res.anthropic_gateway);
     if (interruptedEpoch !== this.interruptedEpoch) return res;
     this.interruptedIdentity = interruptedRegistration(res.worker_id, res.register_nonce, interruptedEpoch);
     if (memoryRevision !== this.memoryRegistrationRevision) return res;
@@ -2155,6 +2157,7 @@ export class WorkerClient {
     }
     if (typeof decoded !== "object" || decoded === null) return undefined;
     if (applyAdverts) {
+      setAnthropicGatewayFromWire((decoded as { anthropic_gateway?: unknown }).anthropic_gateway);
       const adverts = decoded as { protocol_features?: unknown; worker_outbox_max_pending?: unknown };
       if (Array.isArray(adverts.protocol_features) && adverts.protocol_features.every((f) => typeof f === "string")) {
         this.replaceServerFeatures(adverts.protocol_features);

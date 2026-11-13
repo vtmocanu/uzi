@@ -636,6 +636,9 @@ export interface RegisterResponse {
    *  api that does not advertise `active_run_snapshot`; the register-carried snapshot (#1391)
    *  is the one snapshot exempt from the nonce (none exists yet at that point). */
   register_nonce?: string;
+  /** The Anthropic-compatible gateway every Claude CLI call routes through (admin setting),
+   *  or null when off. Also on every heartbeat; see anthropic-gateway.ts. */
+  anthropic_gateway?: unknown;
 }
 
 /**

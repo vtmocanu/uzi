@@ -5,6 +5,7 @@ package settings
 
 import (
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/anthropic"
 	"github.com/vtmocanu/uzi/api/internal/theme"
 )
 
@@ -180,6 +181,20 @@ const (
 	//   - agent_source_interval: reconcile cadence, a Go duration with a 1m floor.
 	// The engine-managed agent_source_last_sync_* keys are deliberately absent from
 	// Defaults (selfimprove precedent) until M3/M4 write them.
+	// Anthropic-compatible gateway keys: route every Claude call through a gateway
+	// (LiteLLM, Portkey, Cloudflare AI Gateway, a corporate proxy) instead of
+	// api.anthropic.com. Admin-writable, no seeded row; an empty base URL is off.
+	//   - anthropic_gateway_base_url: https URL Claude Code reads as
+	//     ANTHROPIC_BASE_URL. When non-empty it is ADDITIONALLY checked against the
+	//     operator's ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS in the handler and at use,
+	//     because every user's saved token is sent there.
+	//   - anthropic_gateway_auth_header: "authorization" (Bearer) or "x-api-key".
+	//   - anthropic_gateway_models: comma-separated alias=model pairs (opus, sonnet,
+	//     haiku, fable) mapping Claude Code's aliases to gateway model names.
+	KeyAnthropicGatewayBaseURL    = "anthropic_gateway_base_url"
+	KeyAnthropicGatewayAuthHeader = "anthropic_gateway_auth_header"
+	KeyAnthropicGatewayModels     = "anthropic_gateway_models"
+
 	KeyAgentSourceRepoURL  = "agent_source_repo_url"
 	KeyAgentSourceRef      = "agent_source_ref"
 	KeyAgentSourceEnabled  = "agent_source_enabled"
@@ -508,6 +523,11 @@ var Defaults = map[string]string{
 	// synthesizes to these defaults, and no migration adds them.
 	KeySlackEnabled:  DefaultSlackEnabled,
 	KeyPublicBaseURL: DefaultPublicBaseURL,
+	// Anthropic-compatible gateway: off (empty base URL) unless an admin sets it.
+	KeyAnthropicGatewayBaseURL:    "",
+	KeyAnthropicGatewayAuthHeader: anthropic.AuthHeaderBearer,
+	KeyAnthropicGatewayModels:     "",
+
 	// PRD #46 admin-writable keys. No seeded row (an absent row synthesizes to these
 	// defaults).
 	KeyJudgeEnabled:         DefaultJudgeEnabled,

@@ -21,6 +21,7 @@
 // (resume). PATH is inherited so the bundled Claude Code CLI can find `git`,
 // `bash`, and coreutils.
 
+import { anthropicGateway, GATEWAY_ALIASES } from "./anthropic-gateway.js";
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
 import { goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
@@ -34,6 +35,14 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   "HOME",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
+  // The Anthropic-compatible gateway (anthropic-gateway.ts): worker-set below, so a
+  // provisioned tool env can never point the CLI, and with it the user's token, at
+  // another host, nor remap a model alias.
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
   // Not a credential — the mandatory browser launch flag (see the base env below).
   // provision.ts's allowlist does not emit AGENT_BROWSER_ARGS today, so this is not a
   // live conflict; protecting it keeps the --no-sandbox guarantee durable against
@@ -71,11 +80,14 @@ export interface SdkAttemptEnv {
  *  provision.ts's explicit allowlist (PATH override + NIX_SSL_CERT_FILE /
  *  LOCALE_ARCHIVE) — never a blind merge of devbox's shellenv. */
 export interface SdkEnv {
-  CLAUDE_CODE_OAUTH_TOKEN: string;
+  /** The token; undefined behind a gateway, where ANTHROPIC_AUTH_TOKEN / _API_KEY carry it. */
+  CLAUDE_CODE_OAUTH_TOKEN: string | undefined;
   HOME: string;
   PATH: string | undefined;
-  ANTHROPIC_API_KEY: undefined;
-  ANTHROPIC_AUTH_TOKEN: undefined;
+  /** undefined, except behind an x-api-key gateway, where it carries the token. */
+  ANTHROPIC_API_KEY: string | undefined;
+  /** undefined, except behind a Bearer gateway, where it carries the token. */
+  ANTHROPIC_AUTH_TOKEN: string | undefined;
   [key: string]: string | undefined;
 }
 
@@ -171,6 +183,25 @@ export function buildSdkEnv(
   // Issue #3907: browser discovery points at the uzi-chromium wrapper, set AFTER the fold
   // (and protected above) so a provisioned var can neither redirect nor drop it.
   Object.assign(env, BROWSER_DISCOVERY_ENV);
+  // An admin-configured Anthropic-compatible gateway: the saved token is that gateway's
+  // key, sent as ANTHROPIC_AUTH_TOKEN (Bearer) or ANTHROPIC_API_KEY (x-api-key). A blocked
+  // gateway points at an unresolvable host, so the key fails closed. Set AFTER the fold,
+  // and every key is protected above.
+  const gateway = anthropicGateway();
+  if (gateway) {
+    // The OAuth variable goes: the token is a gateway key, and no CLI path may send it to
+    // an OAuth-only api.anthropic.com endpoint. Nonessential traffic (telemetry, update
+    // checks) is off too: a gateway deployment routes model calls, nothing else.
+    env.CLAUDE_CODE_OAUTH_TOKEN = undefined;
+    env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+    env.ANTHROPIC_BASE_URL = gateway.baseUrl;
+    if (gateway.authHeader === "x-api-key") env.ANTHROPIC_API_KEY = oauthToken;
+    else env.ANTHROPIC_AUTH_TOKEN = oauthToken;
+    for (const alias of GATEWAY_ALIASES) {
+      const model = gateway.models[alias];
+      if (model) env[`ANTHROPIC_DEFAULT_${alias.toUpperCase()}_MODEL`] = model;
+    }
+  }
   // issue #1783 (R2): the attempt marker, set AFTER the fold (and protected above) so a
   // provisioned var can neither forge nor clear it. Absent attempt ⇒ no key at all.
   if (attempt) {

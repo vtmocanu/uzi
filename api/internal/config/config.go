@@ -145,6 +145,12 @@ type Config struct {
 	// means nothing is allowed until an admin configures it (AgentSourceBaseURLAllowed
 	// returns false on a nil list).
 	AgentSourceAllowedBaseURLs []string
+	// AnthropicGatewayAllowedBaseURLs (ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS) are the only
+	// hosts the admin's anthropic_gateway_base_url may name. Every user's saved Anthropic
+	// token is sent to the gateway (by the token test, and by every run), so the operator,
+	// not the admin UI, decides where that may be. Same shape as AgentSourceAllowedBaseURLs:
+	// normalized scheme+host, https only, EMPTY by default, and empty allows nothing.
+	AnthropicGatewayAllowedBaseURLs []string
 	// ProductSkillsAllowedBaseURLs is the SEPARATE SSRF allowlist for product skill sets
 	// (PRD #1909 D9, UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS): the only base URLs a product's
 	// skills_repo_url may target. Same shape as AgentSourceAllowedBaseURLs (normalized
@@ -995,6 +1001,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.AgentSourceAllowedBaseURLs = agentSourceAllowed
+	gatewayAllowed, err := parseGatewayAllowlist(getenv("ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AnthropicGatewayAllowedBaseURLs = gatewayAllowed
 	// PRD #1909 M6: the product-skills allowlist, default EMPTY (feature off, instance still boots).
 	productSkillsAllowed, err := parseBaseURLAllowlist("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", getenv("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", ""))
 	if err != nil {
@@ -2286,6 +2297,62 @@ func (c Config) AgentSourceBaseURLAllowed(raw string) bool {
 	}
 	for _, a := range c.AgentSourceAllowedBaseURLs {
 		if a == norm {
+			return true
+		}
+	}
+	return false
+}
+
+// parseGatewayAllowlist parses ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS. Unlike the other
+// allowlists an entry KEEPS its path: on a shared gateway host (Cloudflare AI Gateway,
+// Portkey's cloud) the account lives in the path, and pinning only the host would let
+// an admin route every user's key to any account there. Each entry is
+// https://host[:port][/path], normalized (lowercase host, no trailing slash); a
+// malformed or non-https entry is a boot error; empty allows nothing.
+func parseGatewayAllowlist(raw string) ([]string, error) {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		norm, err := normalizeGatewayURL(part)
+		if err != nil {
+			return nil, fmt.Errorf("ANTHROPIC_GATEWAY_ALLOWED_BASE_URLS: %w", err)
+		}
+		if !slices.Contains(out, norm) {
+			out = append(out, norm)
+		}
+	}
+	return out, nil
+}
+
+func normalizeGatewayURL(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("%q must be an https URL with no credentials, query or fragment", raw)
+	}
+	// A dot segment, plain or percent-encoded, could resolve outside an allowlisted path on
+	// the receiving side (…/acct/../other).
+	for _, seg := range strings.Split(u.EscapedPath(), "/") {
+		if dec, err := url.PathUnescape(seg); err != nil || dec == "." || dec == ".." {
+			return "", fmt.Errorf("%q must not contain dot path segments", raw)
+		}
+	}
+	return "https://" + strings.ToLower(u.Host) + strings.TrimRight(u.EscapedPath(), "/"), nil
+}
+
+// AnthropicGatewayBaseURLAllowed reports whether raw is an allowlisted entry or lies
+// under one on a path-segment boundary (an entry https://gw.example.com/acct admits
+// https://gw.example.com/acct and https://gw.example.com/acct/anthropic, not
+// https://gw.example.com/acct2). False when the list is empty.
+func (c Config) AnthropicGatewayBaseURLAllowed(raw string) bool {
+	norm, err := normalizeGatewayURL(raw)
+	if err != nil {
+		return false
+	}
+	for _, a := range c.AnthropicGatewayAllowedBaseURLs {
+		if norm == a || strings.HasPrefix(norm, a+"/") {
 			return true
 		}
 	}
