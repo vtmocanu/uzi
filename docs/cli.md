@@ -1565,7 +1565,7 @@ uzi run recovery <run-id> [--json]
   `uzi run export --capture`; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
   its run) or the server predates capture-hold linking. Captures whose hold is not among the
-  listed holds (for example after a hold was released) arrive as one final element
+  listed holds (for example a capture recorded against another run's hold) arrive as one final element
   `{"run_id": "<run-id>", "unattached": true, "captures": [ ... ]}` after the hold elements, with
   no `generation`, `id` or `state` keys, so scripts that read holds should skip elements with
   `unattached: true`. Owner-only, except under
