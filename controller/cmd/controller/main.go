@@ -125,6 +125,8 @@ func main() {
 		StorageClass:                cfg.WorkerStorageClass,
 		PriorityClassName:           cfg.WorkerPriorityClassName,
 		NodeSelector:                cfg.WorkerNodeSelector,
+		DeploymentLabels:            cfg.WorkerDeploymentLabels,
+		DeploymentAnnotations:       cfg.WorkerDeploymentAnnotations,
 		Tolerations:                 cfg.WorkerTolerations,
 		MaxConcurrentRuns:           cfg.WorkerMaxConcurrentRuns,
 		MemoryGuardEnabled:          cfg.WorkerMemoryGuardEnabled,

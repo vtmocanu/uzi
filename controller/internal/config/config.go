@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -136,6 +137,13 @@ type Config struct {
 	// kubernetes.io/arch=amd64, because the published agent images are amd64 only and
 	// would crash-loop on an arm64 node of a mixed-arch cluster.
 	WorkerNodeSelector map[string]string
+	// WorkerDeploymentLabels / WorkerDeploymentAnnotations are extra metadata on every
+	// worker Deployment (UZI_WORKER_DEPLOYMENT_LABELS / _ANNOTATIONS, JSON objects of
+	// string to string), for admission policies that key on Deployment metadata. The
+	// chart passes its workloadLabels / workloadAnnotations. A label may not replace one
+	// the controller stamps: those are its teardown provenance.
+	WorkerDeploymentLabels      map[string]string
+	WorkerDeploymentAnnotations map[string]string
 	// WorkerTolerations are rendered onto every worker pod, all three tiers
 	// (UZI_WORKER_TOLERATIONS, a JSON array of Kubernetes tolerations). Unset, empty,
 	// "null" or "[]" means none, which keeps the pod template hash unchanged.
@@ -514,6 +522,12 @@ func loadWorkerSettings(cfg *Config) error {
 		return err
 	}
 	cfg.WorkerNodeSelector = sel
+	if cfg.WorkerDeploymentLabels, err = parseDeploymentMetadata("UZI_WORKER_DEPLOYMENT_LABELS", true); err != nil {
+		return err
+	}
+	if cfg.WorkerDeploymentAnnotations, err = parseDeploymentMetadata("UZI_WORKER_DEPLOYMENT_ANNOTATIONS", false); err != nil {
+		return err
+	}
 	tol, err := parseTolerations(os.Getenv("UZI_WORKER_TOLERATIONS"))
 	if err != nil {
 		return err
@@ -836,6 +850,54 @@ func parseNodeSelector(raw string) (map[string]string, error) {
 		return nil, nil
 	}
 	return sel, nil
+}
+
+// controllerLabelKeys are the labels the controller stamps on every object it creates
+// (kube.objectLabels): provenance, so operator metadata may never replace one. Kept as
+// literals because config must not import kube; TestDeploymentLabelsRefuseControllerKeys
+// pins them against the kube constants.
+var controllerLabelKeys = []string{"app.kubernetes.io/name", "app.kubernetes.io/component", "app.kubernetes.io/managed-by", "uzi.dev/hosted-worker-id"}
+
+// parseDeploymentMetadata reads one of the worker Deployment metadata variables: a JSON
+// object of string to string. Keys must be qualified names; label values must be
+// valid label values and may not use a controller-owned key. Unset, "null" or "{}"
+// means none. Refused at boot, since the API server would otherwise reject every
+// worker Deployment and workers would simply never appear.
+func parseDeploymentMetadata(name string, labels bool) (map[string]string, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" || raw == "null" {
+		return nil, nil
+	}
+	var members map[string]*string
+	if err := json.Unmarshal([]byte(raw), &members); err != nil {
+		return nil, fmt.Errorf("%s=%q is not a JSON object of string to string: %w", name, raw, err)
+	}
+	out := make(map[string]string, len(members))
+	for k, v := range members {
+		if v == nil {
+			return nil, fmt.Errorf("%s: key %q has a null value; give it a string value or remove the key", name, k)
+		}
+		if errs := validation.IsQualifiedName(k); len(errs) > 0 {
+			return nil, fmt.Errorf("%s: key %q is not a valid key: %s", name, k, strings.Join(errs, "; "))
+		}
+		// uzi.dev/ is the controller's own namespace (worker id, spec hash, roll marker...).
+		if strings.HasPrefix(k, "uzi.dev/") {
+			return nil, fmt.Errorf("%s: %q uses the reserved uzi.dev/ prefix", name, k)
+		}
+		if labels {
+			if slices.Contains(controllerLabelKeys, k) {
+				return nil, fmt.Errorf("%s: %q is set by the controller and cannot be overridden", name, k)
+			}
+			if errs := validation.IsValidLabelValue(*v); len(errs) > 0 {
+				return nil, fmt.Errorf("%s: value %q for key %q is not a valid label value: %s", name, *v, k, strings.Join(errs, "; "))
+			}
+		}
+		out[k] = *v
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // parseTolerations reads UZI_WORKER_TOLERATIONS, a JSON array of tolerations, and

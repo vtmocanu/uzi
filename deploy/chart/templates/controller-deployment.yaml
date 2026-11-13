@@ -25,6 +25,12 @@ metadata:
   labels:
     {{- include "uzi.labels" . | nindent 4 }}
     app.kubernetes.io/component: controller
+    {{- with include "uzi.workloadLabels" . }}
+    {{- . | nindent 4 }}
+    {{- end }}
+  {{- with include "uzi.workloadAnnotations" . }}
+  {{- . | nindent 2 }}
+  {{- end }}
 spec:
   replicas: {{ .Values.workers.controller.replicaCount }}
   strategy:
@@ -158,6 +164,17 @@ spec:
             {{- end }}
             {{- with $nodeSelector }}
             - name: UZI_WORKER_NODE_SELECTOR
+              value: {{ toJson . | quote }}
+            {{- end }}
+            # workloadLabels / workloadAnnotations reach the worker Deployments too, as JSON
+            # objects; the controller validates them at boot (a label may not replace one
+            # it stamps, since those are its teardown provenance).
+            {{- with .Values.workloadLabels }}
+            - name: UZI_WORKER_DEPLOYMENT_LABELS
+              value: {{ toJson . | quote }}
+            {{- end }}
+            {{- with .Values.workloadAnnotations }}
+            - name: UZI_WORKER_DEPLOYMENT_ANNOTATIONS
               value: {{ toJson . | quote }}
             {{- end }}
             # The worker pods' tolerations, as a JSON array. An empty list or null renders

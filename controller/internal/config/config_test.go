@@ -1249,3 +1249,47 @@ func TestEpochScratchDeletionConfig(t *testing.T) {
 		})
 	}
 }
+
+// Worker Deployment metadata: JSON objects, validated at boot, and a label may not
+// replace one the controller stamps (its teardown provenance).
+func TestParseDeploymentMetadata(t *testing.T) {
+	const labels, annotations = "UZI_WORKER_DEPLOYMENT_LABELS", "UZI_WORKER_DEPLOYMENT_ANNOTATIONS"
+	t.Setenv(labels, `{"team":"platform"}`)
+	t.Setenv(annotations, `{"policy.example.com/skip-probes":"true","note":"free text, spaces ok"}`)
+	l, err := parseDeploymentMetadata(labels, true)
+	if err != nil || l["team"] != "platform" {
+		t.Fatalf("labels = %v, err = %v", l, err)
+	}
+	a, err := parseDeploymentMetadata(annotations, false)
+	if err != nil || a["note"] != "free text, spaces ok" {
+		t.Fatalf("annotations = %v, err = %v", a, err)
+	}
+	for _, raw := range []string{"", "null", "{}"} {
+		t.Setenv(labels, raw)
+		if got, err := parseDeploymentMetadata(labels, true); err != nil || got != nil {
+			t.Errorf("%q: got %v err %v, want none", raw, got, err)
+		}
+	}
+	for name, raw := range map[string]string{
+		"not an object":    `["a"]`,
+		"null member":      `{"team":null}`,
+		"bad key":          `{"bad key":"x"}`,
+		"bad label value":  `{"team":"has spaces"}`,
+		"controller label": `{"app.kubernetes.io/managed-by":"x"}`,
+		"worker id label":  `{"uzi.dev/hosted-worker-id":"x"}`,
+		"reserved prefix":  `{"uzi.dev/anything":"x"}`,
+	} {
+		t.Setenv(labels, raw)
+		if _, err := parseDeploymentMetadata(labels, true); err == nil {
+			t.Errorf("%s: %s accepted", name, raw)
+		}
+	}
+}
+
+// uzi.dev/ annotations (spec hash, roll marker, generation) are the controller's own.
+func TestDeploymentAnnotationsRefuseTheReservedPrefix(t *testing.T) {
+	t.Setenv("UZI_WORKER_DEPLOYMENT_ANNOTATIONS", `{"uzi.dev/image-roll":"x"}`)
+	if _, err := parseDeploymentMetadata("UZI_WORKER_DEPLOYMENT_ANNOTATIONS", false); err == nil {
+		t.Fatal("a uzi.dev/ annotation was accepted")
+	}
+}
