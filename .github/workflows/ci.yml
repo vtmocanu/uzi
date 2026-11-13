@@ -42,6 +42,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# The one Postgres pin for both LiveDB producers (test-livedb-workersvc and
+# test-codex-refresh-lostreply-e2e). Same engine as docker-compose.yml
+# (scripts/check-postgres-pin-parity.sh gates the parity). Each producer pulls it in a
+# step so mirror quota errors get bounded retries and a Docker Hub fallback before the
+# database starts.
+env:
+  UZI_CI_PG_IMAGE: mirror.gcr.io/library/postgres:17@sha256:846a7ddaa67a4b354ae1d21087b683901aa6113a4ed626d3787cfbf6c85e3e07
+
 # A PR may skip component gates only after changes proves every changed file
 # is an added/modified input in the audited allowlist. Unknown paths, deletions,
 # renames and failed classification keep the full gates; main always runs them.
@@ -323,41 +331,98 @@ jobs:
   # The live-DB gate (required check `test-api-store-it`). The *LiveDB tests
   # self-skip unless UZI_TEST_DATABASE_URL is set, so `go test` above prints a green
   # `ok` while every one of them is skipped. The serial seven-package LiveDB sweep, with
-  # its ran/skipped guards, therefore runs exactly ONCE per CI run, inside
-  # test-codex-refresh-lostreply-e2e (via e2e/run-store-it.sh, which then runs the
-  # combined proofs on the same database, as ADR-1766 requires). This job runs nothing:
-  # it turns that single execution's result into this required context. It fails unless
-  # the producer's result is exactly `success`, so a failed, cancelled, timed-out or
-  # (when this job runs) skipped producer reddens BOTH contexts. Like `test-agent`, it
-  # uses always(): only the audited component-safe PR case in which the producer
-  # itself skipped may skip it, so a cancelled workflow or producer cannot leave it
-  # skipped. `needs:` names the producer, so renaming or removing it makes the workflow
+  # its ran/skipped guards, runs exactly ONCE per CI run, split across two producers by
+  # e2e/run-store-it.sh's UZI_STORE_IT_GROUP (#4232): test-livedb-workersvc sweeps
+  # workersvc alone, and test-codex-refresh-lostreply-e2e sweeps the other six packages
+  # and then runs the combined proofs on that same database (ADR-1766 amendment). This
+  # job runs nothing: it turns both executions' results into this required context. It
+  # fails unless EACH producer's result is exactly `success`, so a failed, cancelled,
+  # timed-out or (when this job runs) skipped producer reddens it. Like `test-agent`, it
+  # uses always(): only the audited component-safe PR case in which both producers
+  # skipped may skip it, so a cancelled workflow or producer cannot leave it skipped.
+  # `needs:` names both producers, so renaming or removing either makes the workflow
   # invalid instead of silently green.
   test-api-store-it:
-    needs: [changes, test-codex-refresh-lostreply-e2e]
+    needs: [changes, test-livedb-workersvc, test-codex-refresh-lostreply-e2e]
     if: >-
       always() &&
       (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
       needs.changes.outputs.skip_components != '1' ||
+      needs.test-livedb-workersvc.result != 'skipped' ||
       needs.test-codex-refresh-lostreply-e2e.result != 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require the single LiveDB sweep execution to have succeeded
+      - name: Require both LiveDB sweep producers to have succeeded
         env:
-          PRODUCER_RESULT: ${{ needs['test-codex-refresh-lostreply-e2e'].result }}
+          WORKERSVC_RESULT: ${{ needs['test-livedb-workersvc'].result }}
+          REST_RESULT: ${{ needs['test-codex-refresh-lostreply-e2e'].result }}
         run: |
-          if [ "$PRODUCER_RESULT" != success ]; then
-            echo "test-codex-refresh-lostreply-e2e (the single LiveDB sweep + combined proofs) result: ${PRODUCER_RESULT:-<missing>}"
-            exit 1
+          rc=0
+          if [ "$WORKERSVC_RESULT" != success ]; then
+            echo "test-livedb-workersvc (LiveDB sweep, workersvc) result: ${WORKERSVC_RESULT:-<missing>}"
+            rc=1
           fi
+          if [ "$REST_RESULT" != success ]; then
+            echo "test-codex-refresh-lostreply-e2e (LiveDB sweep of the other six packages + combined proofs) result: ${REST_RESULT:-<missing>}"
+            rc=1
+          fi
+          exit "$rc"
 
-  # The single LiveDB execution (producer for itself and for test-api-store-it): the
-  # canonical recipe `task test:codex-refresh-lostreply-e2e` = checkpoint-chain bridge,
-  # then e2e/run-store-it.sh with UZI_CODEX_REFRESH_LOSTREPLY_E2E=1: the serial
-  # seven-package LiveDB sweep (-race -p 1, per-package timeouts, aggregate and
-  # per-package no-skip guards), then the four combined proofs on that same throwaway
-  # database (ADR-1766 "Required combined acceptance proof"). Run on every PR/main push
+  # LiveDB producer 1 of 2 (#4232): workersvc, the longest package, alone on its own
+  # throwaway Postgres (`task test:livedb-workersvc`, UZI_STORE_IT_GROUP=workersvc). Go
+  # only; the combined proofs and the bridge stay in the other producer. Same pinned
+  # Postgres, pull fallback and component-skip condition as that job.
+  test-livedb-workersvc:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
+      needs.changes.outputs.skip_components != '1')
+    runs-on: ubuntu-latest
+    # workersvc alone measured 936s of the 2026-11 combined sweep (run 43367001027) plus
+    # about 4m of setup; its own package deadline in run-store-it.sh is 45m.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version: "1.27"
+          check-latest: true
+          cache: false
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: api-livedb-workersvc
+          module: api
+      - uses: ./.github/actions/setup-task
+      - name: Pull the pinned Postgres (mirror first, Docker Hub fallback)
+        id: pg
+        run: |
+          ref=$(./scripts/docker-pull-fallback.sh --print-ref "${UZI_CI_PG_IMAGE#mirror.gcr.io/}")
+          docker tag "$ref" uzi-ci-pg:pinned
+          docker image inspect uzi-ci-pg:pinned > /dev/null
+          echo "ref=uzi-ci-pg:pinned" >> "$GITHUB_OUTPUT"
+      - name: LiveDB sweep (workersvc)
+        env:
+          UZI_STORE_IT_PG_IMAGE: ${{ steps.pg.outputs.ref }}
+        run: task test:livedb-workersvc
+      - name: Save Go cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
+        with:
+          key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
+
+  # LiveDB producer 2 of 2 (for itself and for test-api-store-it): the canonical recipe
+  # `task test:codex-refresh-lostreply-e2e` = checkpoint-chain bridge, then
+  # e2e/run-store-it.sh with UZI_CODEX_REFRESH_LOSTREPLY_E2E=1 and UZI_STORE_IT_GROUP=rest:
+  # the serial LiveDB sweep of every package except workersvc (-race -p 1, per-package
+  # timeouts, aggregate and per-package no-skip guards), then the four combined proofs on
+  # that same throwaway database (ADR-1766 "Required combined acceptance proof" and its
+  # #4232 amendment; test-livedb-workersvc sweeps workersvc). Run on every PR/main push
   # except audited component-independent PRs; ubuntu-latest supplies Docker for the
   # throwaway database, which uses the pinned Postgres digest.
   test-codex-refresh-lostreply-e2e:
@@ -367,17 +432,11 @@ jobs:
       (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
       needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
-    # One full sweep plus the bridge and proofs. Measured history of this job (before
-    # consolidation): 25m on main (2026-10-22), 31-33m after #3120, 23-43m on main by
-    # 2026-10-30, and 2,600-3,613s in recent runs, cancelled at its old 60m cap on PR
-    # #3888. The duration of the consolidated execution is not yet measured; 75 is
-    # headroom over that history, and a run nearing it is a re-measurement signal.
+    # The sweep minus workersvc, plus the bridge and proofs. The full consolidated
+    # execution measured a 2,845s median on main (2026-11), of which workersvc was about
+    # 936s. 75 stays until the split execution is re-measured; a run nearing it is a
+    # re-measurement signal.
     timeout-minutes: 75
-    env:
-      # Same engine as docker-compose.yml (scripts/check-postgres-pin-parity.sh gates
-      # the parity). Pulled in a step so mirror quota errors get bounded retries and a
-      # Docker Hub fallback before the database starts.
-      UZI_CI_PG_IMAGE: mirror.gcr.io/library/postgres:17@sha256:846a7ddaa67a4b354ae1d21087b683901aa6113a4ed626d3787cfbf6c85e3e07
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
@@ -413,9 +472,10 @@ jobs:
           docker tag "$ref" uzi-ci-pg:pinned
           docker image inspect uzi-ci-pg:pinned > /dev/null
           echo "ref=uzi-ci-pg:pinned" >> "$GITHUB_OUTPUT"
-      - name: LiveDB sweep and combined Codex lost refresh reply proof
+      - name: LiveDB sweep (all but workersvc) and combined Codex lost refresh reply proof
         env:
           UZI_STORE_IT_PG_IMAGE: ${{ steps.pg.outputs.ref }}
+          UZI_STORE_IT_GROUP: rest
         run: task test:codex-refresh-lostreply-e2e
       - name: Save Go cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'

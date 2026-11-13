@@ -45,6 +45,9 @@ chmod +x "$FAKEBIN/docker"
 
 PATH="$FAKEBIN:$PATH"
 export PATH
+# Every scenario before the group section below runs with the group UNSET (the full
+# sweep), whatever the calling environment carries.
+unset UZI_STORE_IT_GROUP
 
 fails=0
 
@@ -438,6 +441,59 @@ for scenario in checkpoint-success checkpoint-disabled checkpoint-go-fail checkp
       assert_case "non-1 value leaves seven-package sweep unchanged" test "$calls" -eq 7
     fi
   done
+done
+
+# Issue #4232: UZI_STORE_IT_GROUP splits the sweep across CI's two LiveDB jobs.
+# Unset (above, and the explicit `unset` case here) runs all seven packages; the two
+# named groups partition them; the empty string, any other value, and an opt-in proof
+# with the workersvc group refuse with exit 2 before Docker starts a database.
+group_line() { # $1 dsn, $2 package, $3 timeout
+  printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t%s\t-run\tLiveDB$\t./internal/%s/...\n' "$1" "$3" "$2"
+}
+for scenario in group-unset group-workersvc group-rest group-rest-proof group-empty group-invalid group-workersvc-proof group-workersvc-checkpoint; do
+  case_dir="$TMP/$scenario"
+  mkdir -p "$case_dir"
+  group_env=(env -u UZI_STORE_IT_GROUP)
+  proof="" checkpoint=""
+  case "$scenario" in
+    group-workersvc) group_env=(env UZI_STORE_IT_GROUP=workersvc) ;;
+    group-rest) group_env=(env UZI_STORE_IT_GROUP=rest) ;;
+    group-rest-proof) group_env=(env UZI_STORE_IT_GROUP=rest); proof=1 ;;
+    group-empty) group_env=(env UZI_STORE_IT_GROUP=) ;;
+    group-invalid) group_env=(env UZI_STORE_IT_GROUP=a) ;;
+    group-workersvc-proof) group_env=(env UZI_STORE_IT_GROUP=workersvc); proof=1 ;;
+    group-workersvc-checkpoint) group_env=(env UZI_STORE_IT_GROUP=workersvc); checkpoint=1 ;;
+  esac
+  rc=0
+  "${group_env[@]}" PATH="$READYBIN:$PATH" CASE_DIR="$case_dir" SCENARIO="$scenario" TMPDIR="$case_dir" \
+    UZI_STORE_IT_PG_WAIT_SECS=1 UZI_CODEX_REFRESH_LOSTREPLY_E2E="$proof" UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E="" \
+    UZI_CI_ARTIFACTS_E2E="" UZI_STALE_WORKER_CANCEL_E2E="" UZI_TASK_CHECKPOINT_RECOVERY_E2E="$checkpoint" \
+    bash "$SCRIPT" > "$case_dir/output" 2>&1 || rc=$?
+  case "$scenario" in
+    group-empty|group-invalid|group-workersvc-proof|group-workersvc-checkpoint)
+      assert_case "invalid group selection exits 2" test "$rc" -eq 2
+      assert_case "invalid group selection starts no database" \
+        bash -c '! grep -qs "^run " "$1"' _ "$case_dir/docker.log"
+      assert_case "invalid group selection runs no Go" test ! -e "$case_dir/go.log"
+      continue ;;
+  esac
+  assert_case "valid group selection exits zero" test "$rc" -eq 0
+  dsn="$(cut -f1 "$case_dir/go.log" | head -n 1)"
+  : > "$case_dir/expected"
+  case "$scenario" in
+    group-unset) want=(store:20m handler:20m forgesvc:10m schedsvc:10m workersvc:45m recovery:10m poller:10m) ;;
+    group-workersvc) want=(workersvc:45m) ;;
+    group-rest|group-rest-proof) want=(store:20m handler:20m forgesvc:10m schedsvc:10m recovery:10m poller:10m) ;;
+  esac
+  for entry in "${want[@]}"; do group_line "$dsn" "${entry%%:*}" "${entry#*:}" >> "$case_dir/expected"; done
+  if [ "$scenario" = group-rest-proof ]; then
+    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall)E2E$\t./internal/handler/...\n' \
+      "$dsn" >> "$case_dir/expected"
+  fi
+  assert_case "group runs exactly its packages in order, then any proof, on one DSN" \
+    cmp -s "$case_dir/expected" "$case_dir/go.log"
+  assert_case "group aggregate guard counts only the selected packages" \
+    grep -qF "LiveDB: ${#want[@]} passed, 0 skipped" "$case_dir/output"
 done
 
 if [ "$fails" -eq 0 ]; then

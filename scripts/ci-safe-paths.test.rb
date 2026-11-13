@@ -86,13 +86,13 @@ assert = lambda do |actual, expected, label|
   raise "#{label}: expected #{expected.inspect}, got #{actual.inspect}" unless actual == expected
   checks += 1
 end
-components = %w[validate-api lint-api test-api test-api-store-it test-codex-refresh-lostreply-e2e validate-controller lint-controller test-controller validate-web test-web test-web-browser validate-agent test-agent-shard]
+components = %w[validate-api lint-api test-api test-api-store-it test-livedb-workersvc test-codex-refresh-lostreply-e2e validate-controller lint-controller test-controller validate-web test-web test-web-browser validate-agent test-agent-shard]
 context = {
   'github.event_name' => 'pull_request', 'github.ref' => 'refs/pull/1/merge', 'needs.changes.result' => 'success',
   'needs.changes.outputs.skip_components' => '1',
   'needs.changes.outputs.worker_uid' => 'false', 'needs.validate-agent.result' => 'success',
   'needs.test-agent-shard.result' => 'skipped', 'needs.test-agent-worker-uid.result' => 'skipped',
-  'needs.test-codex-refresh-lostreply-e2e.result' => 'skipped'
+  'needs.test-livedb-workersvc.result' => 'skipped', 'needs.test-codex-refresh-lostreply-e2e.result' => 'skipped'
 }
 run_job = lambda do |job, overrides = {}|
   source = jobs.fetch(job)['if']
@@ -246,37 +246,46 @@ end
 assert.call(File.read(File.join(root, 'agent/test/codex-pins.ts')).include?('":(exclude)changelog.d/**"'), true, 'agent pin scan excludes changelog.d')
 component_refs, _, refs_status = Open3.capture3('git', '-C', root, 'grep', '-l', '-F', 'changelog.d', '--', 'api', 'web', 'controller', 'agent', 'docs', 'deploy/chart', 'e2e', ':!agent/test/codex-pins.ts')
 assert.call([refs_status.exitstatus, component_refs], [1, ''], 'no direct component reference to changelog.d')
-# One LiveDB execution backs both required contexts: the producer carries the canonical
-# recipe (the sweep with its livedb-skip-guard, then the combined proofs); test-api-store-it
-# only aggregates the producer's result.
+# One LiveDB sweep per CI run, split across two producers (#4232): test-livedb-workersvc
+# runs `task test:livedb-workersvc`; test-codex-refresh-lostreply-e2e runs the canonical
+# recipe on the rest group (the sweep with its livedb-skip-guard, then the combined
+# proofs). test-api-store-it only aggregates both results.
 producer = jobs.fetch('test-codex-refresh-lostreply-e2e')
-assert.call(producer.fetch('steps').any? { |step| step['run'] == 'task test:codex-refresh-lostreply-e2e' }, true, 'single LiveDB execution runs the canonical recipe')
+workersvc_producer = jobs.fetch('test-livedb-workersvc')
+assert.call(producer.fetch('steps').select { |step| step['run'] == 'task test:codex-refresh-lostreply-e2e' }.map { |step| step.dig('env', 'UZI_STORE_IT_GROUP') }, ['rest'], 'rest producer runs the canonical recipe on the rest group')
+assert.call(workersvc_producer.fetch('steps').count { |step| step['run'] == 'task test:livedb-workersvc' }, 1, 'workersvc producer runs its recipe once')
+assert.call(workersvc_producer.fetch('steps').any? { |step| step.fetch('env', {}).key?('UZI_STORE_IT_GROUP') }, false, 'workersvc group comes from the Taskfile recipe')
 assert.call(File.read(File.join(root, 'e2e/run-store-it.sh')).include?('"$ROOT/scripts/livedb-skip-guard.sh" "$LOG"'), true, 'LiveDB proof retained in the recipe')
-assert.call(jobs.values.flat_map { |j| j.fetch('steps', []).map { |s| s['run'].to_s } }.grep(/livedb-skip-guard|-run 'LiveDB\$'|run-store-it/), [], 'no workflow step carries a second LiveDB sweep')
+assert.call(jobs.values.flat_map { |j| j.fetch('steps', []).map { |s| s['run'].to_s } }.grep(/livedb-skip-guard|-run 'LiveDB\$'|run-store-it/), [], 'no workflow step carries a third LiveDB sweep')
 aggregator = jobs.fetch('test-api-store-it')
-assert.call(Array(aggregator['needs']).sort, %w[changes test-codex-refresh-lostreply-e2e], 'store-it context waits for the single execution')
-assert.call(producer.fetch('timeout-minutes'), 75, 'producer headroom for one full sweep')
+assert.call(Array(aggregator['needs']).sort, %w[changes test-codex-refresh-lostreply-e2e test-livedb-workersvc], 'store-it context waits for both producers')
+assert.call(producer.fetch('timeout-minutes'), 75, 'rest producer headroom')
+assert.call(workersvc_producer.fetch('timeout-minutes'), 60, 'workersvc producer headroom')
 agg_run = aggregator.fetch('steps').first.fetch('run')
-assert.call(aggregator.fetch('steps').first.fetch('env'), {'PRODUCER_RESULT' => "${{ needs['test-codex-refresh-lostreply-e2e'].result }}"}, 'aggregator reads the producer result')
-{'success' => true, 'failure' => false, 'cancelled' => false, 'skipped' => false, '' => false}.each do |result, ok|
-  _, _, status = Open3.capture3({'PRODUCER_RESULT' => result}, 'bash', '-e', '-c', agg_run)
-  assert.call(status.success?, ok, "store-it context for producer result #{result.inspect}")
+assert.call(aggregator.fetch('steps').first.fetch('env'), {'WORKERSVC_RESULT' => "${{ needs['test-livedb-workersvc'].result }}", 'REST_RESULT' => "${{ needs['test-codex-refresh-lostreply-e2e'].result }}"}, 'aggregator reads both producer results')
+results = ['success', 'failure', 'cancelled', 'skipped', '']
+results.product(results).each do |workersvc, rest|
+  _, _, status = Open3.capture3({'WORKERSVC_RESULT' => workersvc, 'REST_RESULT' => rest}, 'bash', '-e', '-c', agg_run)
+  assert.call(status.success?, workersvc == 'success' && rest == 'success', "store-it context for producer results #{[workersvc, rest].inspect}")
 end
-# Activation fails closed: only the audited component-safe case with a skipped producer
-# may skip the aggregator. Cancellation (evaluator `cancelled` true), a failed, cancelled
-# or missing producer, and unknown classification all run it (and the check above is red).
+# Activation fails closed: only the audited component-safe case with BOTH producers
+# skipped may skip the aggregator. Cancellation (evaluator `cancelled` true), a failed,
+# cancelled or missing producer, and unknown classification all run it (and the check
+# above is red).
 store_it = 'test-api-store-it'
-producer_result = 'needs.test-codex-refresh-lostreply-e2e.result'
-assert.call(run_job.call(store_it), false, 'safe PR with skipped producer skips both contexts together')
-%w[failure cancelled success].each do |result|
-  assert.call(run_job.call(store_it, producer_result => result), true, "safe PR still runs aggregator after producer #{result}")
-  assert.call(run_job.call(store_it, producer_result => result, 'needs.changes.outputs.skip_components' => '0'), true, "aggregator runs after producer #{result}")
+producer_results = %w[needs.test-livedb-workersvc.result needs.test-codex-refresh-lostreply-e2e.result]
+assert.call(run_job.call(store_it), false, 'safe PR with both producers skipped skips the context')
+producer_results.each do |producer_result|
+  %w[failure cancelled success].each do |result|
+    assert.call(run_job.call(store_it, producer_result => result), true, "safe PR still runs aggregator after #{producer_result} #{result}")
+    assert.call(run_job.call(store_it, producer_result => result, 'needs.changes.outputs.skip_components' => '0'), true, "aggregator runs after #{producer_result} #{result}")
+  end
+  [['cancelled', true, 'failure'], ['cancelled', true, 'cancelled'], ['cancelled', true, '']].each do |_, cancelled, result|
+    assert.call(run_job.call(store_it, 'cancelled' => cancelled, producer_result => result, 'needs.changes.outputs.skip_components' => '0'), true, "workflow cancellation still runs aggregator (#{producer_result} #{result.inspect})")
+  end
 end
-assert.call(run_job.call(store_it, producer_result => 'skipped', 'needs.changes.outputs.skip_components' => '0'), true, 'non-safe PR runs aggregator (red) even if producer skipped')
-assert.call(run_job.call(store_it, 'cancelled' => true), false, 'cancelled workflow with a skipped safe producer: nothing to report')
-[['cancelled', true, 'failure'], ['cancelled', true, 'cancelled'], ['cancelled', true, '']].each do |_, cancelled, result|
-  assert.call(run_job.call(store_it, 'cancelled' => cancelled, producer_result => result, 'needs.changes.outputs.skip_components' => '0'), true, "workflow cancellation still runs aggregator (producer #{result.inspect})")
-end
+assert.call(run_job.call(store_it, 'needs.changes.outputs.skip_components' => '0'), true, 'non-safe PR runs aggregator (red) even if both producers skipped')
+assert.call(run_job.call(store_it, 'cancelled' => true), false, 'cancelled workflow with skipped safe producers: nothing to report')
 assert.call(jobs.fetch(store_it)['if'].include?('always()'), true, 'aggregator uses always()')
 assert.call(jobs.fetch(store_it)['if'].include?('cancelled()'), false, 'aggregator never keys skipping on cancelled()')
 brew_workflow = YAML.safe_load(File.read(File.join(root, '.github/workflows/brew.yml')))
