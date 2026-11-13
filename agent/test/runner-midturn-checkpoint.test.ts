@@ -4915,7 +4915,7 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
   async function rig(
     iid: number,
     body: (r: Rig) => Promise<void>,
-    opts: { executorTail?: boolean; seed?: (f: MFlight) => void } = {},
+    opts: { executorTail?: boolean; seed?: (f: MFlight) => void; log?: Logger } = {},
   ): Promise<{ claimRunId: string; tips: string[]; violations: string[] }> {
     const ctl = control();
     const g = mkGit(fx.dataDir);
@@ -4960,7 +4960,7 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
           return { branch: ctx.branch };
         },
       },
-    }), ctl);
+    }), ctl, {}, opts.log);
     let captured: MFlight | undefined;
     const internals = runner as unknown as { scanCheckpointForPublish: (f: MFlight, ...rest: unknown[]) => Promise<unknown> };
     const origScan = internals.scanCheckpointForPublish.bind(runner);
@@ -5273,39 +5273,67 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
   // non-ASCII), so the runner-level names here are plain ASCII that the report keeps. Control/bidi
   // escaping itself is pinned in secret-finding-render.test.ts. A secret-shaped path in the scan makes
   // the runner withhold every path (fail closed), so the two shapes run as separate cases.
-  async function hostileRun(iid: number, name: string, content: string, secret: string) {
+  // `ruleId` (optional) replaces the rule id of every finding the mid-run consumer's FRESH scan
+  // returns (the stub sits on GitCache.secretScanCheckpointRange, the seam scanRemediationRange calls),
+  // because real gitleaks only ever reports well-formed ids.
+  async function hostileRun(iid: number, name: string, content: string, secret: string, ruleId?: string) {
     let followUp = "";
+    const { logger, lines } = recordingLogger();
     const out = await rig(iid, async (r) => {
       r.flagged.push(commitIn(r.ctx.worktreePath, name, content));
       assert.equal(await r.tick(), "secret_found");
-      const d = await r.ctx.midRunSecretRemediation!();
+      const real = r.g.secretScanCheckpointRange.bind(r.g);
+      const hostile = async (...a: Parameters<GitCache["secretScanCheckpointRange"]>) => {
+        const s = await real(...a);
+        return ruleId !== undefined && s.trusted ? { ...s, findings: s.findings.map((f) => ({ ...f, ruleId })) } : s;
+      };
+      const d = await r.withStub({ secretScanCheckpointRange: hostile }, () => r.ctx.midRunSecretRemediation!());
       assert.equal(d.action, "remediate");
       if (d.action === "remediate") followUp = d.followUp;
-    });
+    }, { log: logger });
     assert.ok(followUp.length > 0);
     // eslint-disable-next-line no-control-regex
     const unsafe = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/;
     const strings = (v: unknown): string[] =>
       typeof v === "string" ? [v] : v && typeof v === "object" ? Object.values(v).flatMap(strings) : [];
-    const emitted = [followUp, ...api.messages(out.claimRunId).flatMap((m) => strings(m.payload))];
+    const logEntries = (lines as Array<Record<string, unknown>>).filter(
+      (l) => typeof l.msg === "string" && l.msg.startsWith("mid-run checkpoint secret scan flagged commits above the checkpoint floor"),
+    );
+    assert.equal(logEntries.length, 1, "exactly one mid-run run-log entry");
+    const logFindings = strings(logEntries[0]!.findings);
+    assert.ok(logFindings.length > 0, "the run-log entry carries rendered findings");
+    const emitted = [followUp, ...api.messages(out.claimRunId).flatMap((m) => strings(m.payload)), ...strings(logEntries[0])];
     for (const text of emitted) {
       assert.ok(!text.includes(secret), "no raw secret value");
       assert.ok(!unsafe.test(text), `no raw control byte in ${JSON.stringify(text.slice(0, 80))}`);
     }
-    assert.ok(statusTexts(out.claimRunId).some((t) => t.startsWith("mid-run checkpoint secret scan flagged")), "the status line was emitted");
-    return { followUp, emitted };
+    const statusLine = statusTexts(out.claimRunId).find((t) => t.startsWith("mid-run checkpoint secret scan flagged"));
+    assert.ok(statusLine, "the status line was emitted");
+    return { followUp, emitted, logFindings, statusLine };
   }
 
   it("a token used as the flagged file name is withheld from the follow-up and the feed", async () => {
     const secret = runtimeSecret();
-    const { followUp } = await hostileRun(4258_024, `${secret}.env`, `TOKEN=${secret}\n`, secret);
+    const { followUp, logFindings } = await hostileRun(4258_024, `${secret}.env`, `TOKEN=${secret}\n`, secret);
     assert.ok(/\b[0-9a-f]{12} \[path withheld\]:1 \(rule github-pat\)/.test(followUp), followUp);
+    assert.ok(logFindings.every((f) => /^[0-9a-f]{12} \[path withheld\]:1 \(rule github-pat\)$/.test(f)), JSON.stringify(logFindings));
+  });
+
+  it("a hostile rule id (secret-shaped, with ANSI escapes) renders as the withheld rule marker in the feed, the run log and the follow-up", async () => {
+    const secret = runtimeSecret();
+    const ruleId = `github-pat\u001b[31m${secret}\u001b[0m`;
+    const { followUp, logFindings, statusLine } = await hostileRun(4258_026, "plain-rule.env", `TOKEN=${secret}\n`, secret, ruleId);
+    assert.ok(/\(rule \[rule withheld\]\)/.test(followUp), followUp);
+    assert.ok(logFindings.length > 0 && logFindings.every((f) => f.endsWith("(rule [rule withheld])")), JSON.stringify(logFindings));
+    assert.ok(/\(rule \[rule withheld\]\);/.test(statusLine), statusLine);
+    assert.ok(!statusLine.includes("github-pat"), statusLine);
   });
 
   it("a flagged file name shaped like a forged finding label renders as one JSON-quoted value", async () => {
     const forgedName = "a.ts:1 (rule x); bbbbbbbbbbbb evil.ts";
     const secret = runtimeSecret();
-    const { followUp, emitted } = await hostileRun(4258_025, forgedName, `TOKEN=${secret}\n`, secret);
+    const { followUp, emitted, logFindings } = await hostileRun(4258_025, forgedName, `TOKEN=${secret}\n`, secret);
+    assert.ok(logFindings.length > 0 && logFindings.every((f) => f.includes(JSON.stringify(forgedName).slice(0, -1)) && !f.replaceAll(JSON.stringify(forgedName).slice(0, -1), "").includes(forgedName)), JSON.stringify(logFindings));
     // gitleaks may append a trailing tab to a name containing spaces (a git diff header quirk); it is
     // escaped by the renderer, so allow an optional escaped suffix inside the quotes.
     const quoted = JSON.stringify(forgedName).slice(0, -1);
