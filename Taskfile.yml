@@ -2875,15 +2875,6 @@ tasks:
         mkdir -p .uzi/scratch
         UZI_STALE_WORKER_CANCEL_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
 
-  test:livedb-workersvc:
-    desc: LiveDB sweep of the workersvc package alone on a throwaway Postgres (the second CI LiveDB producer)
-    cmds:
-      # ci.yml runs this beside `test:codex-refresh-lostreply-e2e` with UZI_STORE_IT_GROUP=rest;
-      # `test-api-store-it` requires both. Locally, a bare ./e2e/run-store-it.sh still sweeps every package.
-      - |
-        mkdir -p .uzi/scratch
-        UZI_STORE_IT_GROUP=workersvc TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
-
   test:codex-refresh-lostreply-e2e:
     desc: Linux-only combined Codex lost refresh reply proof (real HTTP, Postgres and worker), plus the checkpoint chain bridge
     preconditions:
