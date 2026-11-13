@@ -1373,7 +1373,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       )}
 
       <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
-        <div className={cx(!fullBleed && "mx-auto w-full max-w-[68rem]")}>
+        <div data-page-content-column={fullBleed ? undefined : ""} className={cx(!fullBleed && "mx-auto w-full max-w-[68rem]")}>
           {/* Header slot (PRD #3878): a page that wants its header above the banners (the
               /overview/next preview) portals it here through InShellHeader. Empty on every
               other page, where `empty:hidden` leaves it out of layout. Its position, like
