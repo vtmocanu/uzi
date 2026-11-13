@@ -213,6 +213,13 @@ afterEach(() => {
 });
 
 describe("AppShell navigation", () => {
+  it("marks the shared content column for anchored Overview panels", () => {
+    const view = renderShell("/dashboard");
+    const column = view.container.querySelector("[data-page-content-column]");
+    expect(column).not.toBeNull();
+    expect(column?.contains(screen.getByText("content"))).toBe(true);
+  });
+
   it("renders the grouped nav with board children that carry forge icons, and no standalone Forge entry", async () => {
     renderShell("/dashboard");
 

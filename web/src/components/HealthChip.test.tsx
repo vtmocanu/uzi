@@ -165,7 +165,35 @@ describe("HealthChip popover", () => {
     expect(within(card).getByText("and 2 more")).toBeTruthy();
   });
 
-  it("uses the wide panel width and keeps the mobile bottom-sheet classes", () => {
+  it("lays out panel evidence in two columns, widening values over 40 characters only there", () => {
+    const doc = ownerOnlyDoc();
+    const check = doc.checks.find((c) => c.id === "queue.waiting")!;
+    check.doc = "worker-capacity";
+    check.evidence = [
+      { label: "Short", value: "x".repeat(40) },
+      { label: "Long image", value: "y".repeat(41) },
+    ];
+    mount(doc);
+    fireEvent.click(chip());
+    const row = within(dialog()).getByText(check.title).closest("li")!;
+    const grid = row.querySelector("[data-health-evidence-grid]");
+    expect(grid).not.toBeNull();
+    expect(grid!.className).toContain("grid-cols-2");
+    const entries = grid!.querySelectorAll("[data-health-evidence-entry]");
+    expect(entries).toHaveLength(3); // two evidence values and the docs link
+    expect(entries[0].className).not.toContain("col-span-2");
+    expect(entries[1].className).toContain("col-span-2");
+    expect(entries[1].textContent).toContain("y".repeat(41));
+
+    cleanup();
+    current = doc;
+    render(<MemoryRouter><HealthOverviewCard /></MemoryRouter>);
+    const card = screen.getByRole("alert", { name: "System health" });
+    expect(card.querySelector("[data-health-evidence-grid]")).toBeNull();
+    expect(within(card).getByText((_, el) => el?.tagName === "SPAN" && el.textContent === `Long image: ${"y".repeat(41)}`)).toBeTruthy();
+  });
+
+  it("keeps the chip-attached fallback width and mobile bottom-sheet classes", () => {
     mount(overviewNextDoc());
     fireEvent.click(chip());
     const cls = dialog().className;

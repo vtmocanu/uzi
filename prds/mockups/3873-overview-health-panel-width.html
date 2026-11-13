@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Health panel width</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  .ember { --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+           --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154; --brand: 251 146 60; --warn: 251 191 36; --accent: 96 165 250; }
+  .dawn  { --bg: 242 244 247; --surface: 255 255 255; --raised: 235 238 243; --edge: 214 219 228; --edge-strong: 174 182 196;
+           --fg: 21 26 34; --muted: 74 85 103; --faint: 95 106 130; --brand: 185 60 11; --warn: 154 74 5; --accent: 37 99 235; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "IBM Plex Sans", system-ui, sans-serif; background: #111; color: #ddd; }
+  .intro { padding: 20px 24px 8px; }
+  .intro h1 { font-size: 18px; margin: 0 0 6px; color: #eee; }
+  .intro p { margin: 0 0 6px; font-size: 13px; color: #aaa; line-height: 1.5; }
+  .wbtn { font: inherit; font-size: 12px; margin-right: 6px; padding: 3px 9px; border-radius: 6px; border: 1px solid #555; background: #222; color: #ddd; cursor: pointer; }
+  .wbtn.on { border-color: #fb923c; color: #fb923c; }
+  .stage { padding: 18px 24px 40px; background: rgb(var(--bg)); color: rgb(var(--fg)); overflow-x: auto; }
+  .variant-title { font-size: 13px; font-weight: 600; margin: 26px 0 4px; }
+  .variant-title .tag { font-weight: 500; font-size: 11px; padding: 1px 6px; border-radius: 4px; margin-left: 6px; border: 1px solid rgb(var(--edge)); color: rgb(var(--muted)); }
+  .variant-title .tag.rec { color: rgb(var(--brand)); border-color: rgb(var(--brand) / .5); }
+  .variant-note { font-size: 12px; color: rgb(var(--faint)); margin: 0 0 10px; max-width: 900px; }
+  /* screen = sidebar + main */
+  .screen { display: flex; width: var(--vw); border: 1px solid rgb(var(--edge)); border-radius: 8px; overflow: hidden; }
+  .sidebar { width: 240px; flex: none; background: rgb(var(--surface)); border-right: 1px solid rgb(var(--edge)); padding: 16px; font-size: 13px; color: rgb(var(--muted)); }
+  .sidebar div { padding: 6px 8px; border-radius: 6px; }
+  .sidebar div.on { background: rgb(var(--raised)); color: rgb(var(--fg)); }
+  main { flex: 1; min-width: 0; padding: 24px; }
+  .col { max-width: 1088px; margin: 0 auto; position: relative; }
+  .hdr { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px 24px; margin-bottom: 20px; }
+  .hdr b { display: block; font-size: 22px; font-weight: 600; }
+  .hdr .t span { display: block; margin-top: 4px; font-size: 14px; color: rgb(var(--muted)); max-width: 896px; }
+  .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .chip, .btn { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px; border-radius: 999px; border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); font-size: 13px; white-space: nowrap; color: rgb(var(--fg)); }
+  .btn { border-radius: 8px; font-weight: 500; }
+  .chip.open { outline: 2px solid rgb(var(--accent) / .5); }
+  .warn { color: rgb(var(--warn)); border: 1px solid rgb(var(--warn) / .5); background: rgb(var(--warn) / .12); border-radius: 6px; padding: 1px 7px; font-weight: 500; font-size: 12px; white-space: nowrap; }
+  .av i { font-style: normal; width: 22px; height: 22px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 9px; font-weight: 600; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge-strong)); margin-left: -5px; color: rgb(var(--muted)); }
+  .av i:first-child { margin-left: 0; }
+  kbd { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: rgb(var(--muted)); border: 1px solid rgb(var(--edge)); border-radius: 4px; padding: 0 4px; }
+  .back { font-size: 13px; font-weight: 500; color: rgb(var(--brand)); white-space: nowrap; }
+  .card { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: 14px; padding: 18px 20px; margin-bottom: 16px; }
+  .card h4 { margin: 0 0 12px; font-size: 15px; display: flex; justify-content: space-between; }
+  .card h4 small { font-weight: 400; color: rgb(var(--muted)); font-size: 13px; }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-top: 1px solid rgb(var(--edge)); font-size: 14px; }
+  .row span:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pill { border: 1px solid rgb(var(--edge-strong)); border-radius: 999px; padding: 3px 12px; font-size: 13px; flex: none; margin-left: 12px; }
+  .track { display: flex; justify-content: space-between; font-size: 11px; letter-spacing: .06em; color: rgb(var(--faint)); padding-top: 26px; border-top: 2px dashed rgb(var(--edge)); margin-top: 12px; }
+  /* panel */
+  .panel { position: absolute; z-index: 5; top: 44px; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: 12px; box-shadow: 0 20px 50px rgb(0 0 0 / .35); }
+  .panel .ph { display: flex; align-items: center; gap: 10px; padding: 16px 18px 6px; font-weight: 600; font-size: 15px; }
+  .check { display: flex; gap: 14px; padding: 12px 18px; }
+  .check + .check { border-top: 1px solid rgb(var(--edge)); }
+  .check .body { flex: 1; min-width: 0; font-size: 14px; line-height: 1.45; }
+  .check .body b { font-weight: 600; }
+  .check .desc { color: rgb(var(--muted)); }
+  .check .for { flex: none; font-size: 12px; color: rgb(var(--faint)); padding-top: 2px; }
+  .kv { margin-top: 6px; font-size: 13px; line-height: 1.6; color: rgb(var(--muted)); }
+  .kv b { color: rgb(var(--fg)); font-weight: 600; }
+  .kv .docs { color: rgb(var(--brand)); }
+  .panel.two .kv { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 32px; }
+  .panel.two .kv .wide { grid-column: 1 / -1; }
+  .panel.prose .desc { max-width: 75ch; display: inline; }
+  .img { overflow-wrap: anywhere; }
+  .nobr { white-space: nowrap; }
+  .pf { border-top: 1px solid rgb(var(--edge)); padding: 12px 18px; text-align: right; font-size: 14px; color: rgb(var(--accent)); }
+  .measure { position: absolute; top: -18px; font-size: 10px; color: rgb(var(--faint)); font-family: "IBM Plex Mono", monospace; }
+  .edge-guide { position: absolute; top: 0; bottom: 0; border-left: 1px dashed rgb(var(--brand) / .5); pointer-events: none; }
+</style>
+</head>
+<body>
+<div class="intro">
+  <h1>Overview: System health panel width</h1>
+  <p>A: today (640 px, attached to the chip). B: as wide as the content column, so its edges line up with the cards below. C: B, with the detail rows in two columns so the panel is shorter. Phones keep today's bottom sheet in all three.</p>
+  <p>The sample data matches your screenshot, plus a second check so you can see how several checks stack. The dashed orange lines mark the content column's edges (68rem = 1088 px max, centred, as in AppShell).</p>
+  <p>Screen width (240 px sidebar included): <span id="widths"></span>
+     &nbsp; Theme: <button class="wbtn" data-theme="ember">Ember</button><button class="wbtn" data-theme="dawn">Dawn</button>
+     &nbsp; <label><input type="checkbox" id="second" checked> second check</label></p>
+</div>
+<div class="stage ember" id="stage"></div>
+
+<template id="screen">
+  <div class="screen">
+    <aside class="sidebar"><div class="on">Overview</div><div>Board</div><div>Runs</div><div>Pull requests</div><div>Schedules</div><div>Workers</div><div>Settings</div></aside>
+    <main>
+      <div class="col">
+        <div class="edge-guide" style="left:0"></div><div class="edge-guide" style="right:0"></div>
+        <div class="hdr">
+          <div class="t"><b>Welcome, User A</b><span>4 decisions are waiting on you. 4 runs are executing.</span></div>
+          <div class="actions">
+            <span class="chip open"><span class="warn">▲ Warn</span>1 check needs attention</span>
+            <span class="chip"><span class="av"><i>UA</i><i>UB</i><i>UC</i></span><strong>3 active now</strong><span style="color:rgb(var(--muted))">of 10</span></span>
+            <span class="btn">⌕ Search <kbd>⌘K</kbd></span>
+            <span class="back">Back to the current Overview</span>
+          </div>
+        </div>
+        <div class="slot"></div>
+        <div class="card"><h4>Needs your decision <small>4 decisions</small></h4>
+          <div class="row"><span>vtmocanu/uzi #4198 Admin debug reads of other users' runs · waiting 19h</span><span class="pill">Resume</span></div>
+          <div class="row"><span>vtmocanu/uzi #4209 Plan ready for review · waiting 2h</span><span class="pill">Review plan</span></div>
+          <div class="row"><span>vtmocanu/uzi #4156 Question from the run · waiting 40m</span><span class="pill">Answer</span></div>
+        </div>
+        <div class="card"><h4>Runs <small>4 runs on the line, 0 other</small></h4>
+          <div class="track"><span>QUEUED</span><span>PLANNING</span><span>PLAN REVIEW</span><span>BUILDING</span><span>PR OPEN</span></div>
+        </div>
+        <div class="card"><h4>Usage <small>last 7 days</small></h4><div style="height:90px"></div></div>
+      </div>
+    </main>
+  </div>
+</template>
+
+<template id="panel">
+  <div class="panel" role="dialog" aria-label="System health">
+    <div class="ph"><span class="warn">▲ Warn</span>System health: <span class="cnt">1 check needs</span> attention</div>
+    <div class="check">
+      <span class="warn" style="align-self:flex-start">▲ Warn</span>
+      <div class="body"><b>Worker image roll</b> <span class="desc">Worker roll held at <span class="img">ghcr.io/vtmocanu/uzi/agent-base:0.87.0-rc.9</span>: participant roll health stuck. 1 of 16 hosted workers stuck: unknown reason (1).</span>
+        <div class="kv">
+          <div class="wide"><b>Target image:</b> <span class="img">ghcr.io/vtmocanu/uzi/agent-base:0.87.0-rc.9</span></div>
+          <div><b>Blocking reason:</b> participant roll health stuck</div>
+          <div><b>Failure causes:</b> unknown reason (1)</div>
+          <div class="wide"><b>Retained image / version coverage:</b> <span class="img">ghcr.io/vtmocanu/uzi/agent-base:0.87.0-rc.8 / 0.87.0-rc.8+g60ff656</span></div>
+          <div><b>Stuck workers:</b> 1 of 16</div>
+          <div><span class="docs">Docs: worker-upgrades</span></div>
+        </div>
+      </div>
+      <span class="for">for 1h</span>
+    </div>
+    <div class="check second">
+      <span class="warn" style="align-self:flex-start">▲ Warn</span>
+      <div class="body"><b>Data volume</b> <span class="desc">2 of 16 workers are above 85% of their data volume; new runs may park on a full disk.</span>
+        <div class="kv">
+          <div><b>Workers above threshold:</b> 2 of 16</div>
+          <div><b>Highest use:</b> 91% (worker 7)</div>
+          <div><span class="docs">Docs: worker-storage</span></div>
+        </div>
+      </div>
+      <span class="for">for 3h</span>
+    </div>
+    <div class="pf">Open health</div>
+  </div>
+</template>
+
+<script>
+  const variants = [
+    { key: "a", title: "A. Today", tag: "640 px, attached to the chip", note: "The right edge stops partway across the decision card; the long image name wraps at its hyphen." },
+    { key: "b", title: "B. Content-column width", tag: "edges match the cards", note: "Left and right edges line up with the cards. Lines run long at wide screens (the description can reach ~140 characters)." },
+    { key: "c", title: "C. Content-column width, two-column details", tag: "recommended", rec: true, note: "Same width as B; the detail rows use two columns (image names keep a full row), so the panel is shorter and the width does work." },
+  ];
+  const stage = document.getElementById("stage");
+  function build() {
+    stage.innerHTML = "";
+    const vw = +getComputedStyle(document.documentElement).getPropertyValue("--vw").replace("px", "");
+    for (const v of variants) {
+      const t = document.createElement("div");
+      t.className = "variant-title";
+      t.innerHTML = `${v.title}<span class="tag${v.rec ? " rec" : ""}">${v.tag}</span>`;
+      const n = document.createElement("p"); n.className = "variant-note"; n.textContent = v.note;
+      stage.append(t, n);
+      const scr = document.getElementById("screen").content.cloneNode(true);
+      const col = scr.querySelector(".col");
+      const p = document.getElementById("panel").content.cloneNode(true).firstElementChild;
+      if (!document.getElementById("second").checked) { p.querySelector(".second").remove(); }
+      else p.querySelector(".cnt").textContent = "2 checks need";
+      if (v.key === "a") {
+        p.style.left = "0"; p.style.width = "640px";
+        p.querySelectorAll(".kv > div").forEach((d) => d.classList.remove("wide"));
+      } else {
+        p.style.left = "0"; p.style.right = "0";
+        if (v.key === "c") p.classList.add("two");
+        else p.querySelectorAll(".kv > div").forEach((d) => d.classList.remove("wide"));
+      }
+      const m = document.createElement("span"); m.className = "measure"; p.appendChild(m);
+      col.appendChild(p);
+      stage.appendChild(scr);
+      requestAnimationFrame(() => { m.textContent = Math.round(p.getBoundingClientRect().width) + " px wide × " + Math.round(p.getBoundingClientRect().height) + " px tall"; });
+    }
+  }
+  const W = [1280, 1440, 1680, 1920, 2560];
+  const wbox = document.getElementById("widths");
+  function setW(w) {
+    document.documentElement.style.setProperty("--vw", w + "px");
+    wbox.querySelectorAll("button").forEach((b) => b.classList.toggle("on", +b.dataset.w === w));
+    build();
+  }
+  for (const w of W) { const b = document.createElement("button"); b.className = "wbtn"; b.dataset.w = w; b.textContent = w + " px"; b.onclick = () => setW(w); wbox.appendChild(b); }
+  document.querySelectorAll("[data-theme]").forEach((b) => b.onclick = () => {
+    stage.className = "stage " + b.dataset.theme;
+    document.querySelectorAll("[data-theme]").forEach((x) => x.classList.toggle("on", x === b));
+  });
+  document.querySelector('[data-theme="ember"]').classList.add("on");
+  document.getElementById("second").onchange = build;
+  setW(1920);
+</script>
+</body>
+</html>
