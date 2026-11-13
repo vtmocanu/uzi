@@ -1744,8 +1744,10 @@ effect on the next request. Each newly authorized cross-user read writes one aud
   metadata-only). `run discard` stays owner-only too. The TUI shows no steer controls on a foreign run.
 - **Hints.** When a 404 or 403 comes back from `run inputs`, `run fetches`, `run recovery` or
   `admin runs --all`, the CLI prints `hint: reading another user's run needs the server flag
-  UZI_ADMIN_RUN_DEBUG (chart api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr. The
-  error and its exit code are unchanged.
+  UZI_ADMIN_RUN_DEBUG (chart api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr, at
+  most once per command. The error and its exit code are unchanged, except that `run recovery <run-id>`
+  treats a refused holds or capture read as best-effort: it prints the hint and still exits 0. An
+  archives 404 on a run whose hold you own stays silent (a hold can outlive its run).
 
 ### A failed run's salvage copy: `refs/uzi-salvage/<run-id>`
 
