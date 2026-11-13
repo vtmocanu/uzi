@@ -1,7 +1,7 @@
 import { AssertionError } from "node:assert/strict";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
-import fsp from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { TestContext } from "node:test";
@@ -61,14 +61,44 @@ export async function withinBound<T>(work: Promise<T>, ms: number, message: stri
   finally { clearTimeout(timer); }
 }
 
-/** Read a FIFO to EOF; fails when no writer reaches it within `ms`. fifoDir teardown releases the blocked open. */
+/**
+ * Read a FIFO to EOF; fails by name when no writer connects and finishes within `ms`, or as soon as any of `raceWith`
+ * rejects. The open is O_NONBLOCK (it returns at once, with or without a writer) and the fd is read through a net.Socket,
+ * so this process never sits in a blocking FIFO open. Linux reports end-of-file on a FIFO read end only after a writer
+ * has connected and gone since the open, so no data is not mistaken for EOF before a writer arrives.
+ */
 export function readFifoBounded(fifo: string, ms: number, what: string, ...raceWith: Promise<never>[]): Promise<string> {
-  return withinBound(fsp.readFile(fifo, "utf8"), ms, `no writer reached ${what} within ${ms}ms`, ...raceWith);
+  const fd = fs.openSync(fifo, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  const socket = new net.Socket({ fd, readable: true, writable: false });
+  let text = "";
+  socket.setEncoding("utf8");
+  const read = new Promise<string>((resolve, reject) => {
+    socket.on("data", (chunk: string) => { text += chunk; });
+    socket.once("end", () => resolve(text));
+    socket.once("error", reject);
+  });
+  return withinBound(read, ms, `no writer reached ${what} within ${ms}ms`, ...raceWith).finally(() => { socket.destroy(); });
 }
 
-/** Write to a FIFO; fails when no reader opens it within `ms`. fifoDir teardown releases the blocked open. */
-export function writeFifoBounded(fifo: string, data: string, ms: number, what: string): Promise<void> {
-  return withinBound(fsp.writeFile(fifo, data), ms, `no reader for ${what} within ${ms}ms`);
+/**
+ * Write to a FIFO; fails by name when no reader has it open within `ms`. Each attempt is an O_NONBLOCK write open, which
+ * fails with ENXIO at once while there is no reader and is retried every 10 ms; a reader blocked in its own open counts.
+ */
+export async function writeFifoBounded(fifo: string, data: string, ms: number, what: string): Promise<void> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    let fd: number;
+    try {
+      fd = fs.openSync(fifo, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENXIO") throw error;
+      if (Date.now() >= deadline) throw new AssertionError({ message: `no reader for ${what} within ${ms}ms` });
+      await new Promise<void>((resolve) => { setTimeout(resolve, 10).unref(); });
+      continue;
+    }
+    try { fs.writeSync(fd, data); } finally { fs.closeSync(fd); }
+    return;
+  }
 }
 
 export interface ManualClock {
@@ -141,7 +171,7 @@ function releaseFifoOpens(fifo: string): void {
 export interface FifoDir { dir: string; path(name: string): string; pid?: string }
 
 /**
- * A temp directory of named FIFOs. Teardown (one t.after, so the order is fixed): SIGKILL the helper whose pid is in the
+ * A temp directory of named FIFOs. The in-process helpers above never block in a FIFO open; teardown (one t.after, so the order is fixed): SIGKILL the helper whose pid is in the
  * pid file, release every open still blocked on a FIFO (a FIFO open with no partner otherwise outlives the test and keeps
  * the test process alive), then remove the directory. Deliberately not makeTmp: that registers its own rmSync first.
  */
@@ -163,7 +193,7 @@ export function fifoDir(t: TestContext, prefix: string, fifos: string[], opts: {
   return { dir, path: at, ...(pid === undefined ? {} : { pid }) };
 }
 
-export const agentRoot =path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+export const agentRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const supportUrl = new URL(import.meta.url).href;
 const lockUrl = new URL("../src/authority-lock.ts", import.meta.url).href;
 

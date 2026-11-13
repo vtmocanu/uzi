@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
-import fsp from "node:fs/promises";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
 import { CloneResidueBlockedError, GitCache } from "../src/git.js";
@@ -146,8 +145,7 @@ async function startHeldPin(t: TestContext, runId: string, deadlineMs: number, s
     throw new assert.AssertionError({ message: `cleanup settled before its update-ref child was armed: ${JSON.stringify(result)}` });
   });
   settledFirst.catch(() => undefined); // the cleanup settles at the end of every run; only the race below may observe it
-  const armed = withinBound(readFifoBounded(fifos.path("armed"), BOUND_MS, "the armed FIFO").then(() => undefined),
-    BOUND_MS, `the update-ref child was not armed within ${BOUND_MS}ms`, settledFirst);
+  const armed = readFifoBounded(fifos.path("armed"), BOUND_MS, "the armed FIFO (the update-ref child was not armed)", settledFirst).then(() => undefined);
   return { git, clock, cleanup, outcomes, settleGate, settleEntered, go: fifos.path("go"), armed };
 }
 
@@ -197,19 +195,32 @@ test("issue #4066 pendingWork: the prepared-abort grace runs on the cleanup's cl
   assert.equal(outcomes.length, 0, "a child ended by a signal is never joined, so nothing settled");
 });
 
-test("fifoDir teardown releases pending FIFO opens and removes its directory", async (t) => {
-  let pendingRead!: Promise<string>;
-  let pendingWrite!: Promise<string>;
-  let dir!: string;
-  await t.test("inner", (st) => {
-    const fifos = fifoDir(st, "fifo-dir-selfcheck-", ["r", "w"]);
-    dir = fifos.dir;
-    // Neither open has a partner: each blocks until the inner test's teardown releases it.
-    pendingRead = fsp.readFile(fifos.path("r")).then(() => "settled", () => "settled");
-    pendingWrite = fsp.writeFile(fifos.path("w"), "x").then(() => "settled", () => "settled");
+test("bounded FIFO helpers never leave a pending open", async (t) => {
+  const fifos = fifoDir(t, "fifo-helpers-", ["r", "w", "r2", "w2"]);
+  const ownOpens = (): number => process.getActiveResourcesInfo().filter((name) => name === "FSReqCallback" || name === "PipeWrap" || name === "Pipe").length;
+  const settle = (): Promise<void> => new Promise((resolve) => { setImmediate(() => setImmediate(resolve)); });
+  await settle();
+  const before = ownOpens();
+
+  // Negative half: the peer never arrives, so each helper fails by name within its short bound and holds nothing open.
+  await assert.rejects(readFifoBounded(fifos.path("r"), 200, "the r FIFO"), /no writer reached the r FIFO within 200ms/);
+  await assert.rejects(writeFifoBounded(fifos.path("w"), "x", 200, "the w FIFO"), /no reader for the w FIFO within 200ms/);
+  await settle();
+  assert.equal(ownOpens(), before, `pending resources after the bounded calls: ${JSON.stringify(process.getActiveResourcesInfo())}`);
+
+  // Positive half: a writer arriving later is read to EOF, and a reader blocked in its own open receives the write.
+  const read = readFifoBounded(fifos.path("r2"), BOUND_MS, "the r2 FIFO");
+  execFileSync("sh", ["-c", `echo x > '${fifos.path("r2")}'`]);
+  assert.equal(await read, "x\n");
+  const echoed = new Promise<string>((resolve, reject) => {
+    const child = spawn("sh", ["-c", `read v < '${fifos.path("w2")}'; echo "$v"`], { stdio: ["ignore", "pipe", "inherit"] });
+    let out = "";
+    child.stdout.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
+    child.once("error", reject);
+    child.once("close", () => resolve(out));
   });
-  assert.deepEqual(await withinBound(Promise.all([pendingRead, pendingWrite]), 5_000, "a blocked FIFO open outlived its teardown"), ["settled", "settled"]);
-  assert.equal(fs.existsSync(dir), false, "the directory is removed");
+  await writeFifoBounded(fifos.path("w2"), "hello\n", BOUND_MS, "the w2 FIFO");
+  assert.equal(await withinBound(echoed, BOUND_MS, "the reader child never exited"), "hello\n");
 });
 
 test("issue #4066 pendingWork: an attempt that finishes within its bound is never counted", async (t) => {
