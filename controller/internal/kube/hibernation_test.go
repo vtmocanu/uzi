@@ -909,3 +909,27 @@ func TestMissingDeploymentWithUndersizedNixClaimExpandsThenCreates(t *testing.T)
 		assertNothingDeleted(t, client)
 	}
 }
+
+// A retained /nix claim whose class cannot expand logs its skip once across ticks: the
+// reporter's live set must include the nix claim or the dedup state is pruned every tick.
+func TestNixClaimExpandSkipLoggedOnceAcrossTicks(t *testing.T) {
+	nix := pvcNix("w1", "4Gi")
+	sc := "standard"
+	nix.UID, nix.ResourceVersion = "uid-nix", "7"
+	nix.Spec.StorageClassName = &sc
+	nix.Status.Phase = corev1.ClaimBound
+	class := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: sc}, AllowVolumeExpansion: boolp(false)}
+	rec := &hibRec{fakeCordoner: &fakeCordoner{}}
+	logs := &strings.Builder{}
+	m, _ := newMatWithRecycle(t, rec, DrainPolicy{Deadline: 24 * time.Hour}, RecyclePolicy{Enabled: true}, logs, nix, pvcFor("w1", "data"), class)
+	m.cfg = testConfig()
+	for i := 0; i < 3; i++ {
+		if err := hibTick(t, m, hibW(protocol.HibernationHibernated, "op-nix-once")); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+	}
+	line := "pvc-expand-skipped worker=w1 pvc=" + nixPVCName("w1") + " reason=class-not-expandable"
+	if n := strings.Count(logs.String(), line); n != 1 {
+		t.Fatalf("skip logged %d times over 3 ticks, want 1; log: %s", n, logs.String())
+	}
+}

@@ -22,7 +22,8 @@ ALTER TABLE workers
  ADD COLUMN wake_register_op_id uuid,
  ADD COLUMN wake_register_pod_uid uuid;
 
--- Staged CHECKs: added NOT VALID (no table scan under the ACCESS EXCLUSIVE lock), then validated
+-- Staged CHECKs: added NOT VALID so no workers scan happens under the ACCESS EXCLUSIVE lock the
+-- ADD COLUMN above holds for this transaction. 00430 validates them in its own transaction
 -- (SHARE UPDATE EXCLUSIVE, which does not block reads or writes). Every column is new, so the
 -- validation cannot fail on existing rows.
 ALTER TABLE workers
@@ -41,11 +42,6 @@ ALTER TABLE workers
   (wake_error IS NULL OR char_length(wake_error) <= 500)
   AND (hibernation_reason IS NULL OR char_length(hibernation_reason) <= 500)
  ) NOT VALID;
-ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernation_state_check;
-ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernation_coherent;
-ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernated_at_set;
-ALTER TABLE workers VALIDATE CONSTRAINT workers_wake_requested_at_set;
-ALTER TABLE workers VALIDATE CONSTRAINT workers_hibernation_text_bounds;
 
 -- Audit history. Snapshot identifiers deliberately have no foreign keys: deletion
 -- must preserve history. Down keeps this table, so Up must be re-entrant and must

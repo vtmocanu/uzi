@@ -373,7 +373,7 @@ func resizeState(c *reconcile.ClaimObservation) (token, reason string) {
 func (m *Materializer) reportClaimStates(desired []protocol.DesiredWorker, observed map[string]reconcile.ObservedWorker, tick *rollTick) {
 	live := map[string]bool{}
 	for _, o := range observed {
-		for _, c := range []*reconcile.ClaimObservation{o.DataClaim, o.DinDClaim} {
+		for _, c := range []*reconcile.ClaimObservation{o.DataClaim, o.DinDClaim, o.NixClaim} {
 			if c != nil {
 				live[c.Namespace+"/"+c.Name] = true
 			}

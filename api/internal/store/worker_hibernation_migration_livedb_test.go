@@ -12,7 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #4205 M1 migrations 427/428: Down keeps worker_hibernation_events, so Up must be
+// PRD #4205 M1 migrations 427/428 (430 validates 427's CHECKs): Down keeps worker_hibernation_events, so Up must be
 // re-entrant over it and must refuse a leftover whose shape drifted.
 
 func hibernationMigrationDB(t *testing.T) (context.Context, string, *pgxpool.Pool) {
@@ -192,10 +192,18 @@ func TestWorkerHibernationMigrationRestoresActionCheckLiveDB(t *testing.T) {
 func TestWorkerHibernationCheckConstraintsLiveDB(t *testing.T) {
 	ctx, dsn, pool := hibernationMigrationDB(t)
 	_, worker := hibWorker(ctx, t, pool)
+	const unvalidated = "SELECT count(*) FROM pg_constraint WHERE conrelid='workers'::regclass AND NOT convalidated AND (conname LIKE '%hibernat%' OR conname LIKE 'workers_wake%')"
 	if err := store.MigrateTo(ctx, dsn, 427); err != nil {
 		t.Fatal(err)
 	}
-	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM pg_constraint WHERE conrelid='workers'::regclass AND NOT convalidated AND (conname LIKE '%hibernat%' OR conname LIKE 'workers_wake%')"); n != 0 {
+	// 427 installs the five CHECKs NOT VALID; 430 validates them.
+	if n := scalarInt(ctx, t, pool, unvalidated); n != 5 {
+		t.Fatalf("after 427 want 5 unvalidated hibernation constraints, got %d", n)
+	}
+	if err := store.MigrateTo(ctx, dsn, 430); err != nil {
+		t.Fatal(err)
+	}
+	if n := scalarInt(ctx, t, pool, unvalidated); n != 0 {
 		t.Fatalf("%d hibernation constraints are not validated", n)
 	}
 	for name, tc := range map[string]struct{ set, con string }{

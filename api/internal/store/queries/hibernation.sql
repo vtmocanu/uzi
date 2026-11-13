@@ -111,10 +111,11 @@ ORDER BY hw.worker_id, hw.run_id
 LIMIT @max_rows;
 
 -- name: HibernationWakeSuppresses :one
--- Wake suppression for ephemeral provisioning (PRD #4205 M5, D9): true iff the run has a recorded
+-- Wake suppression for ephemeral provisioning (PRD #4205 M5, D9). It checks placement, intake-as-awake
+-- and forge origin only; it does not repeat every clause of the demand query. True iff the run has a recorded
 -- wake whose worker is still waking, is admitted for THIS run by fn_placement_admitting_workers
 -- (so a run needing another capability or lane is never suppressed), would accept intake as if awake
--- (not cordoned, draining or in maintenance; forge-origin eligible), and the FIRST wake is
+-- (not cordoned, draining or in maintenance), passes the forge-origin check, and the FIRST wake is
 -- younger than @wake_timeout (retries never reset first_woken_at).
 -- @ephemeral_lease cannot change the result here: the waking worker is always a persistent hosted
 -- worker, and the lease only admits ephemeral workers. It is passed for consistency with the demand query.
