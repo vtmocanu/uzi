@@ -64,7 +64,7 @@ const TAG_CLASSES: Record<IssueLineTag["tone"], string> = {
   check: "text-fg",
   warn: "text-warn",
   danger: "text-danger",
-  info: "bg-info/10 text-info",
+  info: "text-info",
 };
 
 function RunBadges({

@@ -146,6 +146,7 @@ describe("IssueLine", () => {
     const building = station(/^Building/);
     expect(building.textContent).toContain("1 building · 2 checking completion · 1 reworking");
     expect(within(building).getByText("#4198").textContent).toBe("#4198 checking completion");
+    expect(within(within(building).getByText("#4198")).getByText("checking completion").className).not.toContain("bg-info");
     expect(within(building).getByText("#4198").getAttribute("title")).toBe("Checking completion");
     expect(within(building).getByText("#4201").textContent).toBe("#4201 reworking milestones");
     expect(within(building).getByText("#4201").getAttribute("title")).toBe("Reworking unmet milestones");
