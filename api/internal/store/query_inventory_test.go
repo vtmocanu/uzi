@@ -1075,6 +1075,9 @@ var queryInventory = []queryPin{
 		"../handler: runs_dto.go batch lookup behind the run reads; asserts queue_reason for queued " +
 			"runs while paused and its absence once lifted. Also called from workersvc/jobs.go"},
 	// Issue #4007 slice A, M1: the terminal preservation store. Later milestones add their writers.
+	{"HasOpenGuardedHoldForWorker", "terminal_preservation.sql", "TestTerminalPreservationGateLiveDB",
+		"../workersvc: the TerminalPreservationGate hold predicate; asserts an open guarded hold of this worker " +
+			"passes and a run with no hold of this worker is refused with no write"},
 	{"InsertTerminalPreservation", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
 		"direct call; asserts the insert-or-load contract on a repeated insert"},
 	{"GetTerminalPreservationByRun", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",

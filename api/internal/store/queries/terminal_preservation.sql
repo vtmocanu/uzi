@@ -4,6 +4,16 @@
 -- machines; every writer is a CAS on the expected state, so a lost race reads as 0 rows.
 -- Lock order, wherever more than one is taken: worker, run, hold, preservation, contribution.
 
+-- name: HasOpenGuardedHoldForWorker :one
+-- The pre-body gate's hold predicate, which needs no generation: an open inventory-guarded hold of
+-- the run whose original and live worker are both the caller. Unlocked and indexed
+-- (idx_recovery_custody_holds_run); the generation-exact reads decide the publication itself.
+SELECT EXISTS (
+    SELECT 1 FROM recovery_custody_holds
+    WHERE run_id = @run_id AND user_id = @user_id AND state = 'open' AND inventory_guarded
+      AND original_worker_id = @worker_id::uuid AND live_worker_id = @worker_id::uuid
+) AS held;
+
 -- name: InsertTerminalPreservation :one
 -- Insert-or-load by run_id. A conflict returns the EXISTING row, unchanged (the no-op update locks
 -- it for the rest of the transaction), so the caller compares the returned identity against its own

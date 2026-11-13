@@ -46,7 +46,7 @@ func TestTerminalReasonVocabulary(t *testing.T) {
 		TerminalReasonGenerationBound, TerminalReasonPriorTipMismatch, TerminalReasonPreservationRetired, TerminalReasonPublicationInFlight,
 		TerminalReasonForgeUnavailable, TerminalReasonPackInvalid, TerminalReasonPackTooLarge, TerminalReasonTipMissing,
 		TerminalReasonCIConfigGuard, TerminalReasonNotDescendant, TerminalReasonRootUnreachable, TerminalReasonTreeMismatch,
-		TerminalReasonWalkTooLarge, TerminalReasonForeignTip,
+		TerminalReasonWalkTooLarge, TerminalReasonForeignTip, TerminalReasonAuthorityChanged,
 	}
 	seen := map[string]bool{}
 	for _, r := range all {
@@ -57,5 +57,8 @@ func TestTerminalReasonVocabulary(t *testing.T) {
 	}
 	if TerminalReasonCreateRefused != "create_refused" || TerminalReasonUpdateRefused != "update_refused" {
 		t.Fatal("the stored refusal reasons must match run_terminal_contributions_refusal_reason_check")
+	}
+	if TerminalReasonAuthorityChanged != "authority_changed" {
+		t.Fatal("the retryable authority-change reason is wire vocabulary the worker matches by value")
 	}
 }

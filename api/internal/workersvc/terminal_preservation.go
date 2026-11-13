@@ -127,6 +127,7 @@ type terminalReader interface {
 	GetTerminalPreservationByRun(context.Context, uuid.UUID) (store.RunTerminalPreservation, error)
 	GetTerminalContributionByRunGeneration(context.Context, store.GetTerminalContributionByRunGenerationParams) (store.RunTerminalContribution, error)
 	GetHeldPublicationHold(context.Context, store.GetHeldPublicationHoldParams) (store.RecoveryCustodyHold, error)
+	HasOpenGuardedHoldForWorker(context.Context, store.HasOpenGuardedHoldForWorkerParams) (bool, error)
 }
 
 // terminalHooks are the route's broker seams and fault-injection points. The zero value uses the
@@ -137,6 +138,7 @@ type terminalHooks struct {
 	sendUpdate   func(context.Context, *pushbroker.PreparedTerminalPack) (pushbroker.TerminalOutcome, error)
 	list         func(context.Context, pushbroker.ListRefsOptions, uuid.UUID) (string, bool, error)
 	beforeCommit func() error // inside tx1, after the writes and before its COMMIT
+	beforeBind   func()       // after the unlocked pre-checks, before tx1 begins
 	beforeSend   func()       // after tx1 committed, before the push
 	outcome      func() error // inside tx2, before its COMMIT
 }
@@ -263,13 +265,20 @@ func (s *Service) TerminalPreservationAdmit(wkr store.Worker) error {
 }
 
 // TerminalPreservationGate is the pre-body authorization: it reads no body, makes no forge call and
-// writes nothing. The run must belong to the worker's user and lane (an unknown or foreign run is
-// ErrRunNotOwned), and the worker must have reported the capability. The generation lives in the
-// body, so the generation-bound predicates (current flight or an exact guarded hold) are applied by
-// PublishTerminal once the body is read.
+// writes nothing. The capability is required, the run must belong to the worker's user and lane, and
+// the worker must hold a stake in it that needs no generation: the run is currently claimed or
+// running on this worker, or an open inventory-guarded hold of the run has this worker as both
+// original and live worker. Anything else, including a same-user run of another worker, is
+// ErrRunNotOwned, so a capable worker cannot occupy the shared upload slots with runs that are not
+// its own and nothing leaks. The generation lives in the body, so the generation-bound predicates
+// are applied by PublishTerminal once the body is read.
 func (s *Service) TerminalPreservationGate(ctx context.Context, wkr store.Worker, runID uuid.UUID) error {
 	if err := s.TerminalPreservationAdmit(wkr); err != nil {
 		return err
+	}
+	tr, ok := s.q.(terminalReader)
+	if !ok {
+		return errors.New("terminal preservation: queries are not wired")
 	}
 	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -279,6 +288,16 @@ func (s *Service) TerminalPreservationGate(ctx context.Context, wkr store.Worker
 		return fmt.Errorf("terminal preservation run: %w", err)
 	}
 	if (run.Kind == "cross_check" && run.ClaimGeneration == 0) || laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
+		return ErrRunNotOwned
+	}
+	if run.WorkerID == pgconv.UUID(wkr.ID) && (run.Status == "claimed" || run.Status == "running") {
+		return nil
+	}
+	held, err := tr.HasOpenGuardedHoldForWorker(ctx, store.HasOpenGuardedHoldForWorkerParams{RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID})
+	if err != nil {
+		return fmt.Errorf("terminal preservation hold: %w", err)
+	}
+	if !held {
 		return ErrRunNotOwned
 	}
 	return nil
@@ -404,8 +423,10 @@ func terminalExcludedOrigin(run store.Run) *TerminalRefusal {
 // terminalAuthority decides the authority class from the SERVER state (never the payload) and
 // applies that class's predicates. current_flight wins when the run is this worker's live flight at
 // exactly this generation; otherwise an exact open guarded hold gives open_guarded_hold. When neither
-// holds, the current_flight refusal (stale, released, wrong status) is reported if the run is the
-// worker's, else the hold refusal. getHold supplies the hold read: unlocked for the pre-check, the
+// holds, the reason is: stale_claim for a worker's run whose claim is not this generation or was
+// released (the worker stops silently); unsupported for the worker's run in a status the flight
+// does not allow and with no hold at all; otherwise the hold's own refusal (hold_missing,
+// identity_changed or unsupported). getHold supplies the hold read: unlocked for the pre-check, the
 // locking GetFinalInventoryHold inside tx1.
 func terminalAuthority(wkr store.Worker, run store.Run, generation int64, getHold func() (store.RecoveryCustodyHold, bool, error)) (string, store.RecoveryCustodyHold, error) {
 	if refusal := terminalExcludedOrigin(run); refusal != nil {
@@ -426,9 +447,12 @@ func terminalAuthority(wkr store.Worker, run store.Run, generation int64, getHol
 	if holdRefusal == nil {
 		return terminalAuthorityGuardedHold, hold, nil
 	}
-	// A stale or released claim is reported as such. A terminal run that has a hold (the worker's
-	// custody record) which does not qualify is reported by the hold; one with no hold at all is
-	// unsupported, the current_flight status refusal.
+	// Reason taxonomy when neither class applies. A claim that is not the current one is stale_claim
+	// (the worker stops silently); this covers a failed or cancelled run that still names the worker
+	// with its claim released, whatever its holds. A run whose worker_id was cleared reaches the hold
+	// refusal instead. A completed run still holding the worker's claim fails the status
+	// predicate and is unsupported when it has no hold at all. A terminal run that has a hold which does
+	// not qualify is reported by the hold (hold_missing, identity_changed or unsupported).
 	var statusRefusal *TerminalRefusal
 	if flightErr != nil && (!errors.As(flightErr, &statusRefusal) || !found) {
 		return "", store.RecoveryCustodyHold{}, flightErr
@@ -527,6 +551,18 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 		if refusal := terminalPreservationRefusal(pres, found); refusal != nil && (found || refusal.Reason != apitypes.TerminalReasonPublicationInFlight) {
 			return TerminalPublishResult{}, refusal
 		}
+		// A prior tip that differs from a settled (not publishing) preservation's cannot become right
+		// under the locks, so it is refused here, before any forge call. Only the in-flight
+		// publishing case is left to tx1, where a winner's commit may still move the tip.
+		if pres.State != terminalStatePublishing {
+			want := req.PriorTip
+			if found {
+				want = existing.PriorTip.String
+			}
+			if want != pres.Tip.String {
+				return TerminalPublishResult{}, terminalRefuse(apitypes.TerminalReasonPriorTipMismatch)
+			}
+		}
 	}
 
 	// The lifetime read, then the pack preparation, both before any transaction. An existing
@@ -546,6 +582,9 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 		}
 	}
 
+	if s.terminal.beforeBind != nil {
+		s.terminal.beforeBind()
+	}
 	bound, err := s.terminalBind(ctx, wkr, run, preAuthority, req, digest, canon, lt)
 	if err != nil {
 		return TerminalPublishResult{}, err
@@ -739,8 +778,9 @@ func terminalSchedule(ctx context.Context, qt *store.Queries, arg store.Schedule
 func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.Run, preAuthority string, req TerminalPublishRequest, digest string, canon []byte, lt TerminalLifetime) (b terminalBinding, err error) {
 	runID := run.ID
 	var (
-		tx pgx.Tx
-		qt *store.Queries
+		tx           pgx.Tx
+		qt           *store.Queries
+		lockedWorker store.Worker
 	)
 	if preAuthority == terminalAuthorityCurrentFlight {
 		// A live flight: the claim-mutation locks (worker, then run), whose reconciliation fence
@@ -750,6 +790,10 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 		g := req.Generation
 		var locked store.Run
 		_, locked, tx, err = s.beginClaimMutation(ctx, wkr, runID, &g)
+		if errors.Is(err, ErrRunNotOwned) {
+			// The pre-check found the run on this worker, so the claim moved since: the class changed.
+			return b, terminalRefuse(apitypes.TerminalReasonAuthorityChanged)
+		}
 		if err != nil {
 			return b, err
 		}
@@ -758,13 +802,18 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 		}
 		run = locked
 		qt = store.New(tx)
+		// beginClaimMutation already holds the worker lock; this re-read returns the locked row.
+		if lockedWorker, err = qt.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+			return b, fmt.Errorf("terminal preservation worker lock: %w", err)
+		}
 	} else {
 		tx, err = s.beginReadCommitted(ctx)
 		if err != nil {
 			return b, fmt.Errorf("terminal preservation begin: %w", err)
 		}
 		qt = store.New(tx)
-		if _, err = qt.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+		if lockedWorker, err = qt.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
 			_ = tx.Rollback(context.WithoutCancel(ctx))
 			return b, fmt.Errorf("terminal preservation worker lock: %w", err)
 		}
@@ -780,10 +829,6 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
-	lockedWorker, err := qt.GetWorkerForUpdate(ctx, wkr.ID)
-	if err != nil {
-		return b, fmt.Errorf("terminal preservation worker lock: %w", err)
-	}
 	if lockedWorker.UserID != wkr.UserID {
 		return b, ErrRunNotOwned
 	}
@@ -808,9 +853,11 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 	}
 	b.run = run
 	if authority != preAuthority {
-		// The run's state moved between the unlocked pre-check and the locks: the class the lock
-		// path was chosen for no longer holds, so the request is stale and retries from the pre-check.
-		return b, ErrStaleClaim
+		// The run's state moved between the unlocked pre-check and the locks (for example running to
+		// completed with a guarded hold): the class the lock path was chosen for no longer holds. This is
+		// the retryable authority_changed 409, not stale_claim (which tells the worker to stop silently):
+		// the worker retries and the next request is classified afresh from the pre-check.
+		return b, terminalRefuse(apitypes.TerminalReasonAuthorityChanged)
 	}
 	if !run.RepoID.Valid {
 		return b, terminalRefuse(apitypes.TerminalReasonIdentityChanged)
@@ -910,8 +957,9 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 		return b, terminalWriteMiss(ctx, qt, "mark invoked", runID, req.Generation, true, terminalContributionPrepared)
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "idx_run_terminal_contributions_unresolved" {
 		// The one-unresolved-push-per-preservation index: another generation's push is unresolved.
+		// Any other unique violation is an internal error, handled below.
 		return b, terminalRefuse(apitypes.TerminalReasonPublicationInFlight)
 	}
 	if err != nil {

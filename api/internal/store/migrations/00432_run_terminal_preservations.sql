@@ -183,7 +183,9 @@ SET LOCAL lock_timeout = '5s';
 -- which plpgsql plans only when a branch is reached: a preservation UPDATE that reaches one in that
 -- window would fail. Nothing here exercises that window; roll the chain back with writers stopped.
 -- Close the check-then-drop window: no live row may be inserted between the check and the DROP.
-LOCK TABLE run_terminal_preservations IN ACCESS EXCLUSIVE MODE;
+-- DROP TABLE also takes ACCESS EXCLUSIVE on runs (a foreign-key target); name both up front in the
+-- writers' order (run, then preservation) so the Down cannot deadlock with a writer.
+LOCK TABLE runs, run_terminal_preservations IN ACCESS EXCLUSIVE MODE;
 -- A pointer-bearing row owns (or may own) a remote ref that nothing else records: refuse the
 -- rollback rather than forget it. Drain or delete the refs/uzi-terminal refs first.
 -- +goose StatementBegin

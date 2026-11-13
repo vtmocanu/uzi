@@ -164,6 +164,36 @@ func (q *Queries) GetTerminalPreservationForUpdate(ctx context.Context, runID uu
 	return i, err
 }
 
+const hasOpenGuardedHoldForWorker = `-- name: HasOpenGuardedHoldForWorker :one
+
+SELECT EXISTS (
+    SELECT 1 FROM recovery_custody_holds
+    WHERE run_id = $1 AND user_id = $2 AND state = 'open' AND inventory_guarded
+      AND original_worker_id = $3::uuid AND live_worker_id = $3::uuid
+) AS held
+`
+
+type HasOpenGuardedHoldForWorkerParams struct {
+	RunID    uuid.UUID `json:"run_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	WorkerID uuid.UUID `json:"worker_id"`
+}
+
+// Issue #4007: a terminal run's preservation ref refs/uzi-terminal/<run-id>
+// (run_terminal_preservations) and the per-generation contribution records pushed into it
+// (run_terminal_contributions), migrations 00432 and 00433. The guard triggers enforce the state
+// machines; every writer is a CAS on the expected state, so a lost race reads as 0 rows.
+// Lock order, wherever more than one is taken: worker, run, hold, preservation, contribution.
+// The pre-body gate's hold predicate, which needs no generation: an open inventory-guarded hold of
+// the run whose original and live worker are both the caller. Unlocked and indexed
+// (idx_recovery_custody_holds_run); the generation-exact reads decide the publication itself.
+func (q *Queries) HasOpenGuardedHoldForWorker(ctx context.Context, arg HasOpenGuardedHoldForWorkerParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasOpenGuardedHoldForWorker, arg.RunID, arg.UserID, arg.WorkerID)
+	var held bool
+	err := row.Scan(&held)
+	return held, err
+}
+
 const insertTerminalContribution = `-- name: InsertTerminalContribution :one
 INSERT INTO run_terminal_contributions
     (preservation_id, run_id, generation, worker_id, user_id, hold_id, authority, tip, prior_tip,
@@ -233,7 +263,6 @@ func (q *Queries) InsertTerminalContribution(ctx context.Context, arg InsertTerm
 }
 
 const insertTerminalPreservation = `-- name: InsertTerminalPreservation :one
-
 INSERT INTO run_terminal_preservations (run_id, user_id, repo_id, ref, lifetime_at_bind)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (run_id) DO UPDATE SET updated_at = run_terminal_preservations.updated_at
@@ -248,11 +277,6 @@ type InsertTerminalPreservationParams struct {
 	LifetimeAtBind string    `json:"lifetime_at_bind"`
 }
 
-// Issue #4007: a terminal run's preservation ref refs/uzi-terminal/<run-id>
-// (run_terminal_preservations) and the per-generation contribution records pushed into it
-// (run_terminal_contributions), migrations 00432 and 00433. The guard triggers enforce the state
-// machines; every writer is a CAS on the expected state, so a lost race reads as 0 rows.
-// Lock order, wherever more than one is taken: worker, run, hold, preservation, contribution.
 // Insert-or-load by run_id. A conflict returns the EXISTING row, unchanged (the no-op update locks
 // it for the rest of the transaction), so the caller compares the returned identity against its own
 // and refuses on a mismatch rather than overwriting it.

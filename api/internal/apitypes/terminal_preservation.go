@@ -109,4 +109,9 @@ const (
 	TerminalReasonTreeMismatch        = "tree_mismatch"
 	TerminalReasonWalkTooLarge        = "walk_too_large"
 	TerminalReasonForeignTip          = "foreign_tip"
+	// TerminalReasonAuthorityChanged is the retryable 409 for a run whose authority class moved
+	// (for example running to completed) between the unlocked pre-check and the locked re-decision.
+	// Unlike stale_claim, which tells the worker to stop silently, the worker retries and is then
+	// classified afresh.
+	TerminalReasonAuthorityChanged = "authority_changed"
 )

@@ -390,10 +390,16 @@ func TestTerminalPublishUpdateAdvancesTipLiveDB(t *testing.T) {
 		t.Fatalf("creates=%d updates=%d, want 1 and 1", f.fake.creates, f.fake.updates)
 	}
 	// A prior tip that is not the preservation's tip is refused before anything is written.
+	// The preservation is live (not publishing), so the refusal comes from the unlocked pre-check,
+	// before the pack is prepared.
+	preparesBefore, _, _ := f.fake.counts()
 	f.e.exec(t, `UPDATE runs SET claim_generation=3 WHERE id=$1`, f.run)
 	_, err = f.publish(f.req(3, termTip3, termTip1))
 	if r := termReason(t, err); r != apitypes.TerminalReasonPriorTipMismatch {
 		t.Fatalf("reason = %s", r)
+	}
+	if prepares, _, _ := f.fake.counts(); prepares != preparesBefore {
+		t.Fatalf("prepares = %d, want %d: the mismatch must be refused before preparation", prepares, preparesBefore)
 	}
 	if _, ok := f.con(3); ok {
 		t.Fatal("a refused prior tip left a contribution row")

@@ -154,7 +154,10 @@ CREATE TRIGGER run_terminal_contribution_delete_guard BEFORE DELETE ON run_termi
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
-LOCK TABLE run_terminal_contributions IN ACCESS EXCLUSIVE MODE;
+-- DROP TABLE takes ACCESS EXCLUSIVE on every table its foreign keys reference, the reverse of the
+-- writers' order (run, hold, preservation, contribution). Name every lock up front in the writers'
+-- order so the Down never waits on a lock a writer takes later.
+LOCK TABLE recovery_custody_holds, run_terminal_preservations, run_terminal_contributions IN ACCESS EXCLUSIVE MODE;
 -- A contribution whose ref may still exist is the only record of the tip pushed to it: refuse the
 -- rollback rather than forget it. The ref may exist while its preservation bears the live pointer,
 -- and an unresolved push (invoked, publish_unknown) may have created it. Drain or delete the
