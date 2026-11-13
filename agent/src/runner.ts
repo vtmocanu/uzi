@@ -3353,6 +3353,11 @@ export interface RunnerOptions {
    *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. The finalize
    *  boundary uses its own deadline (`codexFinalizeBoundaryDeadlineMs`, issue #1900). */
   codexBoundaryDeadlineMs?: number;
+  /** TEST-ONLY (issue #4069): the worker-memory hold/closing budget (preparePreservation, the exhausted-allowance
+   *  hold, and the feedback batcher close). Defaults to `codexBoundaryDeadlineMs`; a test shortens it without also
+   *  bounding the unrelated launch remediation rounds that `codexBoundaryDeadlineMs` governs. A non-positive value
+   *  falls back to the default. */
+  memoryHoldDeadlineMs?: number;
   /** TEST-ONLY (issue #3980): shortens the 60s deadline `prepareGateCheckpoint` enforces on a Claude
    *  changed-plan gate checkpoint. A non-positive or non-finite value falls back to 60s. */
   gateCheckpointDeadlineMs?: number;
@@ -3583,6 +3588,8 @@ export class RunRunner {
   private readonly heldSeamCancelObserveMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
+  /** issue #4069: see RunnerOptions.memoryHoldDeadlineMs. */
+  private readonly memoryHoldDeadlineMs: number;
   private readonly gateCheckpointDeadlineMs: number;
   /** issue #2969: the predecessor FINAL pass budget (constants unless a test shortens them). */
   private readonly predecessorFinalBudget: { successorPrepAllowanceMs: number; actionCapMs: number; settlementMarginMs: number };
@@ -3879,6 +3886,10 @@ export class RunRunner {
       opts.codexBoundaryDeadlineMs && opts.codexBoundaryDeadlineMs > 0
         ? opts.codexBoundaryDeadlineMs
         : 30_000;
+    this.memoryHoldDeadlineMs =
+      opts.memoryHoldDeadlineMs && opts.memoryHoldDeadlineMs > 0
+        ? opts.memoryHoldDeadlineMs
+        : this.codexBoundaryDeadlineMs;
     this.gateCheckpointDeadlineMs =
       typeof opts.gateCheckpointDeadlineMs === "number" && Number.isFinite(opts.gateCheckpointDeadlineMs) &&
       opts.gateCheckpointDeadlineMs > 0 ? opts.gateCheckpointDeadlineMs : 60_000;
@@ -13898,7 +13909,7 @@ export class RunRunner {
         const memory = flight.workerMemory;
         if (memory && (memory.hold || memory.feedback.size)) {
           // Cleanup owns a fresh budget even when the feedback/capture deadline expired.
-          const deadline = Date.now() + this.codexBoundaryDeadlineMs;
+          const deadline = Date.now() + this.memoryHoldDeadlineMs;
           memory.closingDeadline = deadline;
           const expiry = AbortSignal.timeout(Math.max(0, deadline - Date.now()));
           const signal = args[0] ? AbortSignal.any([args[0], expiry]) : expiry;
@@ -26053,7 +26064,7 @@ export class RunRunner {
         if (captured.flight !== flight || memory.hold) return;
         this.retainWorkerMemoryCustody(flight);
         memory.hold = Object.freeze({ context: captured,
-          deadline: Date.now() + this.codexBoundaryDeadlineMs,
+          deadline: Date.now() + this.memoryHoldDeadlineMs,
           humanRevision: memory.revisionContext === captured,
           origin: this.memoryHoldOrigin(flight),
           interventionIds: Object.freeze([result.intervention_id]) });
@@ -26064,7 +26075,7 @@ export class RunRunner {
         await this.joinWorkerMemory(this.startWorkerMemoryPreservation(flight),
           Math.min(memory.hold.deadline, Date.now() + remainingMs), signal);
       },
-      preservationBudgetMs: this.codexBoundaryDeadlineMs,
+      preservationBudgetMs: this.memoryHoldDeadlineMs,
     });
     memory.context = context;
     // A persisted exhausted allowance has no new victim or outcome. Capture the
@@ -26072,7 +26083,7 @@ export class RunRunner {
     // original owner operation used by pressure-triggered preservation.
     if (runtime.commands.remaining(context) === 0) {
       this.retainWorkerMemoryCustody(flight);
-      memory.hold = Object.freeze({ context, deadline: Date.now() + this.codexBoundaryDeadlineMs,
+      memory.hold = Object.freeze({ context, deadline: Date.now() + this.memoryHoldDeadlineMs,
         humanRevision: memory.revisionContext === context, origin: this.memoryHoldOrigin(flight),
         interventionIds: Object.freeze([]) });
       this.retireWorkerMemory(flight);

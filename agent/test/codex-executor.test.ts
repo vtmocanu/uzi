@@ -860,6 +860,12 @@ describe("M3 actual runner memory Codex delivery", () => {
       let siblingWork: Promise<void> | undefined;
       let captureEntered = false, cleanupEntered = false;
       let captureStatusReads = 0;
+      // issue #4069: test-owned bare-lock hold, reference waiter and sibling probes (late modes only).
+      let releaseHold: () => void = () => {};
+      let holdDone: Promise<unknown> | undefined;
+      let refTask: Promise<void> | undefined;
+      let settleReady: () => void = () => {};
+      let signalQueued: (queued: boolean) => void = () => {};
       if (exhausted) {
         // Empty source-only capture: fake effect handles cannot execute Git commands.
         m2Runner.git.worktreeStatus = async () => { captureStatusReads++; return []; };
@@ -971,7 +977,10 @@ describe("M3 actual runner memory Codex delivery", () => {
           return { branch: ctx.branch, pausedAt: { completedCount: 0 } };
         } } },
         m2Runner.fakeGitlab().gitlab, undefined, ownerLog.logger,
-        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: lateCapture ? 500 : late ? 1500 : 5000 });
+        // The memory hold is shortened on its own option so the independent sibling's launch remediation
+        // rounds keep the full 5s boundary (issue #4069).
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000,
+          memoryHoldDeadlineMs: lateCapture ? 500 : late ? 1500 : 5000 });
       const running = runner.execute(f.claim);
       let duplicate: Promise<void> | undefined;
       // Rescue only our fake roots/transport, never host processes. Owner waits allow 6s;
@@ -1039,9 +1048,83 @@ describe("M3 actual runner memory Codex delivery", () => {
           await fs.mkdir(siblingHome, { recursive: true });
           m2Runner.api.setOwnershipStatus(sibling.run_id, "running", 1);
           f.pressure(100);
+          // issue #4069 probes. Signature A (post-read expiry): a forward-only skew after the sibling's real
+          // restriction read. Signature B (pre-acquire lock-wait expiry): a held bare lock whose release is
+          // the abort of a production-deadline reference waiter queued behind the sibling.
+          const gitAny = m2Runner.git as any;
+          const lockOriginal = gitAny.withLock.bind(m2Runner.git) as (...args: unknown[]) => Promise<unknown>;
+          const bareKey = m2Runner.git.barePathFor(m2Runner.fx.originPath);
+          const progresses: Array<{ cause?: string }> = [];
+          const progressKeys: string[] = [];
+          t.mock.method(gitAny, "withLock", (...args: unknown[]) => {
+            if (args[3] && progresses.includes(args[3] as { cause?: string })) progressKeys.push(String(args[0]));
+            return lockOriginal(...args);
+          });
+          const realNow = Date.now.bind(Date);
+          let skew = 0, skewed = false, siblingReads = 0;
+          const queued = new Promise<boolean>(resolve => { signalQueued = resolve; });
+          const readOriginal = m2Runner.git.readRemediationRestrictionFacts.bind(m2Runner.git);
+          t.mock.method(m2Runner.git, "readRemediationRestrictionFacts", async (...args: Parameters<typeof readOriginal>) => {
+            if (args[2] !== sibling.run_id) return readOriginal(...args);
+            siblingReads++;
+            const read = readOriginal(...args); // queues on the bare lock synchronously
+            signalQueued(true);
+            const facts = await read;
+            if (lateCapture && !skewed) { skewed = true; skew = 600; }
+            return facts;
+          });
+          if (lateCapture) t.mock.method(Date, "now", () => realNow() + skew);
+          let armed = false, holdTaken = false, refState: "pending" | "aborted" | "acquired" = "pending";
+          const recoveryOriginal = m2Runner.git.withRecoveryOperation.bind(m2Runner.git) as (...args: unknown[]) => Promise<unknown>;
+          const readyWait = new Promise<void>(resolve => { settleReady = resolve; });
+          t.mock.method(gitAny, "withRecoveryOperation", async (...args: unknown[]) => {
+            const progress = (args[4] as { restrictionProgress?: { cause?: string } } | undefined)?.restrictionProgress;
+            if (!armed || !progress) return recoveryOriginal(...args);
+            progresses.push(progress);
+            if (!lateCapture && !holdTaken) {
+              holdTaken = true;
+              let openGate!: () => void, acquiredHold!: () => void;
+              const holdGate = new Promise<void>(resolve => { openGate = resolve; });
+              const acquired = new Promise<void>(resolve => { acquiredHold = resolve; });
+              releaseHold = openGate;
+              holdDone = lockOriginal(bareKey, async () => { acquiredHold(); await holdGate; });
+              void holdDone.catch(() => {});
+              await Promise.race([acquired, holdDone]);
+            }
+            return recoveryOriginal(...args);
+          });
+          if (!lateCapture) {
+            // Started from the test's own async context so it inherits none of the sibling's operation scope.
+            refTask = (async () => {
+              if (!await queued) return;
+              try {
+                await recoveryOriginal(new AbortController().signal, Date.now() + 1500,
+                  () => lockOriginal(bareKey, async () => undefined));
+                refState = "acquired";
+              } catch { refState = "aborted"; }
+              // The abort is the release event. Unfixed path (sibling already expired pre-acquire): keep the
+              // lock until the sibling-ready wait has settled.
+              if (progresses[0]?.cause === "pre_read_unavailable") await readyWait;
+              releaseHold();
+            })();
+          }
+          armed = true;
           siblingWork = runner.execute(sibling);
-          await waitFor(() => siblingReady, "independent sibling executes in its own source")
-            .catch(error => { throw new Error(`${String(error)}; sibling states=${JSON.stringify(m2Runner.api.states.filter(s => s.runId === sibling.run_id))}; owner=${JSON.stringify(ownerLog.lines)}`); });
+          try {
+            await waitFor(() => siblingReady, "independent sibling executes in its own source", 3000, () => performance.now())
+              .catch(error => { throw new Error(`${String(error)}; sibling causes=${JSON.stringify(progresses.map(p => p.cause))}; sibling states=${JSON.stringify(m2Runner.api.states.filter(s => s.runId === sibling.run_id))}; launch/remediation lines=${JSON.stringify(ownerLog.lines.filter(l => /launch round|remediation|restriction/.test(JSON.stringify(l))))}; owner=${JSON.stringify(ownerLog.lines)}`); });
+          } finally { settleReady(); }
+          assert.ok(siblingReads >= 1 && progresses.length >= 1, "sibling performed its restriction-facts read");
+          for (const progress of progresses)
+            assert.ok(progress.cause !== "pre_read_unavailable" && progress.cause !== "post_read_expiry",
+              `sibling saw restriction cause ${String(progress.cause)}`);
+          if (lateCapture) assert.equal(skewed, true, "forward skew applied after the sibling's real read");
+          else {
+            await refTask;
+            assert.equal(refState, "aborted", "reference waiter aborted pre-acquire on its own deadline");
+            assert.ok(progressKeys.length >= 1 && progressKeys.every(key => key === bareKey),
+              "sibling restriction read locks the bare path the test held");
+          }
           assert.notEqual(siblingClone, m2Runner.worktreeDirFor(2396));
           assert.notEqual(siblingHome, m2Runner.homeDir);
           t.mock.method(runner as any, "gateQueuedDuplicate", async () => { duplicateGateCalls++; return false; });
@@ -1123,6 +1206,12 @@ describe("M3 actual runner memory Codex delivery", () => {
         releaseCapture();
         releaseCleanup();
         releaseSibling();
+        signalQueued(false);
+        settleReady();
+        releaseHold();
+        await refTask?.catch(() => {});
+        releaseHold();
+        await holdDone?.catch(() => {});
         finishes.forEach(finish => finish());
         transport.end();
         try { await withTimeout(running, 12000, "M3 runner cleanup"); }
@@ -1464,10 +1553,10 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
 function tick(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
-async function waitFor(cond: () => boolean, label: string, ms = 3000): Promise<void> {
-  const start = Date.now();
+async function waitFor(cond: () => boolean, label: string, ms = 3000, now: () => number = () => Date.now()): Promise<void> {
+  const start = now();
   while (!cond()) {
-    if (Date.now() - start > ms) throw new Error(`timed out waiting for ${label}`);
+    if (now() - start > ms) throw new Error(`timed out waiting for ${label}`);
     await tick();
   }
 }
