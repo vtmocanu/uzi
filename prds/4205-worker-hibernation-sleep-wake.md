@@ -126,7 +126,7 @@ A new hibernation module owns the state machine:
   - A ForceRoll does not scale up.
   - A missing Deployment is created at replicas 0.
   - No roll marker or pacing slot is taken.
-- **`waking`:** one `patchFor` write applies the current template and replicas 1. Then report `ready` with the Ready pod's UID.
+- **`waking`:** a Deployment at replicas 0 (or absent) is held there until one complete pod list shows none of the worker's pods, terminating ones included (D27). Then one `patchFor` write applies the current template and replicas 1. Then report `ready` with the Ready pod's UID. A Deployment still at replicas 1 (a wake before any scale-down) gets the same write at once and keeps its pod.
 - It never deletes the worker's PVCs or Secret.
 - **Pacing and roll health.**
   - Hibernated and preparing workers are left out of the `planRoll` pools and coverage (`roll_pacing.go` ~181-238).
@@ -182,8 +182,8 @@ A new hibernation module owns the state machine:
   - A stale op id is rejected.
   - Each illegal transition is refused.
   - Demand while `preparing` withdraws the hibernation, in both cases:
-    - before `scaled_down`, where the same pod UID settles without a new pod;
-    - after `scaled_down`, where only a new pod UID settles.
+    - before `scaling_down` is recorded, where the same pod UID settles without a new pod;
+    - once `scaling_down` is recorded (with or without `scaled_down`), where only a new pod UID settles.
   - The wake pass runs before ephemeral provisioning and suppresses a duplicate ephemeral worker only for the demanding run, within the timeout from its first wake.
   - A run needing another capability is not suppressed.
   - Repeated passes do not wake a sibling.
@@ -207,7 +207,7 @@ A new hibernation module owns the state machine:
   - An ambiguous patch result is resolved by re-reading the Deployment before `ready` is sent.
   - After a restart, state is rebuilt from the snapshot and the annotations.
   - PVCs and the Secret survive.
-  - Waking patches replicas to 1.
+  - Waking patches replicas to 1, but from replicas 0 or an absent Deployment only once a complete pod list shows no worker pod; a failed pod list holds the wake.
   - Follow the existing materializer recycle tests.
 - **Contract.** The poll-wire golden is re-recorded (never hand-authored) and both module contract tests run with `-count=1`.
 - **Web.** Vitest for the settings card, the Workers buttons and the status chip, covering a refusal message.
@@ -262,3 +262,4 @@ A live hosted-k8s check (hibernate, wake on demand, PVCs intact) is filed as a l
 - **D24. Chat continue (AI decision, 2026-11-13).** It loses its pin to a hibernated worker, and demand wakes one.
 - **D25. Downgrade (AI decision, 2026-11-13).** Disable, wait until all workers are awake, stop the api, Down 00439, 00438, 00437, then 00436, and start the older api. An older api cannot claim on the new schema.
 - **D26. LiveDB sweep (AI decision, 2026-11-13).** `hostedsvc` is added to the LiveDB sweep list.
+- **D27. Quick wake holds at zero (AI decision, 2026-11-13; MR review).** A wake that finds the Deployment at replicas 0 (or absent) keeps it there until a complete pod list shows none of the worker's pods, terminating ones included, and only then restores replicas 1. Restoring at once could let the admission pod survive the scale-down, and once `scaling_down` is recorded settlement never accepts that pod, so the worker stayed `waking` for good. The settlement guard is unchanged. A scale-down that landed but whose `scaling_down` report was lost now also forces a replacement pod, which settles through ready plus Register. Only an explicit 0 holds: nil replicas (a real apiserver defaults it to 1) restores at once. Rows already stuck under the earlier controller are not repaired, because the feature was never released.

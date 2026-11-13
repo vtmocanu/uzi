@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
@@ -635,17 +636,181 @@ func TestTerminatingReadyPodIsNeverReportedReady(t *testing.T) {
 	}
 }
 
+// hibPods is the Pods client the wake-hold tests use to model a pod's life.
+func hibPods(c *fake.Clientset) corev1client.PodInterface {
+	return c.CoreV1().Pods(testConfig().Namespace)
+}
+
+func hibAddPod(t *testing.T, c *fake.Clientset, p *corev1.Pod) {
+	t.Helper()
+	if _, err := hibPods(c).Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func hibDeletePod(t *testing.T, c *fake.Clientset, uid string) {
+	t.Helper()
+	if err := hibPods(c).Delete(context.Background(), "pod-"+uid, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func hibMarkTerminating(t *testing.T, c *fake.Clientset, uid string) {
+	t.Helper()
+	p, err := hibPods(c).Get(context.Background(), "pod-"+uid, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := metav1.Now()
+	p.DeletionTimestamp = &now
+	if _, err := hibPods(c).Update(context.Background(), p, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func hibFreshMaterializer(t *testing.T, c *fake.Clientset, rec *hibRec) *Materializer {
+	t.Helper()
+	return New(c, testConfig(), testResolver(t), rec, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// quickWakeSequence drives a wake that arrives while the admission pod p1 still exists
+// over a Deployment at zero, one tick per step, taking the Materializer for each tick
+// from next.
+func quickWakeSequence(t *testing.T, client *fake.Clientset, rec *hibRec, next func() *Materializer) {
+	t.Helper()
+	hash := currentHash(t, "w1", 0)
+	w := hibW(protocol.HibernationWaking, "wake-op")
+
+	if err := hibTick(t, next(), w); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 0 {
+		t.Fatalf("wake patched the deployment %d times while the admission pod is live", n)
+	}
+	if r := hibGet(t, client).Spec.Replicas; r == nil || *r != 0 || len(rec.calls) != 0 {
+		t.Fatalf("replicas=%v calls=%v, want 0 and nothing reported", r, rec.transitions())
+	}
+
+	hibMarkTerminating(t, client, "p1")
+	if err := hibTick(t, next(), w); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 0 || len(rec.calls) != 0 {
+		t.Fatalf("terminating pod: patches=%d calls=%v, want neither", n, rec.transitions())
+	}
+
+	hibDeletePod(t, client, "p1")
+	if err := hibTick(t, next(), w); err != nil {
+		t.Fatal(err)
+	}
+	if n := replicaPatches(client); n != 1 {
+		t.Fatalf("replica patches = %d, want exactly one once the pod is gone", n)
+	}
+	d := hibGet(t, client)
+	if d.Spec.Replicas == nil || *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
+		t.Fatalf("restore: replicas=%v annotations=%v", d.Spec.Replicas, d.Annotations)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("reported %v on the restoring tick", rec.transitions())
+	}
+
+	hibAddPod(t, client, hibPod("p2", hash, true, false))
+	if err := hibTick(t, next(), w); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].Transition != protocol.TransitionReady || rec.calls[0].PodUID != "p2" {
+		t.Fatalf("calls = %+v, want a single ready for p2", rec.calls)
+	}
+	if n := replicaPatches(client); n != 1 {
+		t.Fatalf("replica patches = %d after ready, want still one", n)
+	}
+}
+
+func TestQuickWakeHoldsZeroUntilTheAdmissionPodIsGone(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	m, client, rec := hibEnv(t, hibCurrent(t, 0, "sleep-op"), hibPod("p1", hash, true, false))
+	quickWakeSequence(t, client, rec, func() *Materializer { return m })
+}
+
+func TestQuickWakeHoldSurvivesControllerRestart(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	_, client, rec := hibEnv(t, hibCurrent(t, 0, "sleep-op"), hibPod("p1", hash, true, false))
+	quickWakeSequence(t, client, rec, func() *Materializer { return hibFreshMaterializer(t, client, rec) })
+}
+
+// The scaling_down report was lost but its scale-down patch landed; a wake that follows
+// while the pod still exists must hold, then restore only once the pod is gone.
+func TestQuickWakeAfterLostScalingDownReportHoldsThenRestores(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	m, client, rec := hibEnv(t, hibCurrent(t, 1, ""), hibPod("p1", hash, true, false))
+	rec.err = errors.New("api unreachable")
+	prep := hibW(protocol.HibernationPreparing, "sleep-op")
+	for i := 0; i < 3; i++ {
+		_ = hibTick(t, m, prep) // report failures are surfaced; the patch is what matters here
+		if r := hibGet(t, client).Spec.Replicas; r != nil && *r == 0 {
+			break
+		}
+	}
+	if r := hibGet(t, client).Spec.Replicas; r == nil || *r != 0 {
+		t.Fatalf("scale-down did not land: replicas=%v", r)
+	}
+	if replicaPatches(client) != 1 {
+		t.Fatalf("scale-down patches = %d, want 1", replicaPatches(client))
+	}
+
+	rec.err = nil
+	rec.calls = nil
+	wake := hibW(protocol.HibernationWaking, "wake-op")
+	if err := hibTick(t, m, wake); err != nil {
+		t.Fatal(err)
+	}
+	if n := replicaPatches(client); n != 1 {
+		t.Fatalf("wake restored replicas while the pod exists (replica patches = %d)", n)
+	}
+	if hasTransition(rec, protocol.TransitionReady) {
+		t.Fatal("ready reported for the surviving admission pod")
+	}
+
+	hibDeletePod(t, client, "p1")
+	if err := hibTick(t, m, wake); err != nil {
+		t.Fatal(err)
+	}
+	if n := replicaPatches(client); n != 2 {
+		t.Fatalf("replica patches = %d, want exactly one restore after the pod is gone", n)
+	}
+	if d := hibGet(t, client); *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
+		t.Fatalf("restore: replicas=%v annotations=%v", d.Spec.Replicas, d.Annotations)
+	}
+
+	hibAddPod(t, client, hibPod("p2", hash, true, false))
+	if err := hibTick(t, m, wake); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].Transition != protocol.TransitionReady || rec.calls[0].PodUID != "p2" {
+		t.Fatalf("calls = %+v, want ready for p2 only", rec.calls)
+	}
+}
+
 func TestAmbiguousWakePatchErrorReportsNoReady(t *testing.T) {
 	hash := currentHash(t, "w1", 0)
-	m, client, rec := hibEnv(t, hibCurrent(t, 0, "sleep-op"), hibPod("pod-uid-7", hash, true, false))
+	m, client, rec := hibEnv(t, hibCurrent(t, 0, "sleep-op"), hibPod("p1", hash, true, false))
 	fail := true
+	patchCalls := 0
 	client.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		patchCalls++
 		if fail {
 			return true, nil, errors.New("timeout: outcome unknown")
 		}
 		return false, nil, nil
 	})
 	w := hibW(protocol.HibernationWaking, "wake-op")
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if patchCalls != 0 {
+		t.Fatalf("patch issued with the original pod present: %d", patchCalls)
+	}
+	hibDeletePod(t, client, "p1")
 	if err := hibTick(t, m, w); err == nil {
 		t.Fatal("ambiguous wake patch error was swallowed")
 	}
@@ -659,11 +824,195 @@ func TestAmbiguousWakePatchErrorReportsNoReady(t *testing.T) {
 	if len(rec.calls) != 0 {
 		t.Fatal("ready reported on the tick that patched; it must re-read first")
 	}
+	hibAddPod(t, client, hibPod("p2", hash, true, false))
 	if err := hibTick(t, m, w); err != nil {
 		t.Fatal(err)
 	}
-	if len(rec.calls) != 1 || rec.calls[0].Transition != protocol.TransitionReady {
-		t.Fatalf("calls = %v", rec.transitions())
+	if len(rec.calls) != 1 || rec.calls[0].Transition != protocol.TransitionReady || rec.calls[0].PodUID != "p2" {
+		t.Fatalf("calls = %+v", rec.calls)
+	}
+}
+
+// The wake patch committed but its response was lost: the next observation sees replicas
+// 1 under the wake op, so nothing is patched again and ready names the fresh pod.
+func TestWakePatchCommittedButResponseLostDoesNotRepatch(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	_, client, rec := hibEnv(t, hibCurrent(t, 0, "sleep-op"))
+	gvr := appsv1.SchemeGroupVersion.WithResource("deployments")
+	applied := false
+	client.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if applied {
+			return false, nil, nil
+		}
+		applied = true
+		obj, err := client.Tracker().Get(gvr, testConfig().Namespace, "uzi-hw-w1")
+		if err != nil {
+			return true, nil, err
+		}
+		d := obj.(*appsv1.Deployment).DeepCopy()
+		one := int32(1)
+		d.Spec.Replicas = &one
+		d.Annotations = map[string]string{annotationHibernationOp: "wake-op"}
+		d.ResourceVersion += "1"
+		if err := client.Tracker().Update(gvr, d, testConfig().Namespace); err != nil {
+			return true, nil, err
+		}
+		return true, nil, errors.New("connection reset: response lost")
+	})
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	if err := hibTick(t, hibFreshMaterializer(t, client, rec), w); err == nil {
+		t.Fatal("lost patch response was swallowed")
+	}
+	if !applied {
+		t.Fatal("the patch never reached the apiserver")
+	}
+	before := replicaPatches(client)
+
+	m2 := hibFreshMaterializer(t, client, rec)
+	hibAddPod(t, client, hibPod("fresh", hash, true, false))
+	if err := hibTick(t, m2, w); err != nil {
+		t.Fatal(err)
+	}
+	if after := replicaPatches(client); after != before {
+		t.Fatalf("replica patches went from %d to %d; the committed patch must not be repeated", before, after)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].Transition != protocol.TransitionReady || rec.calls[0].PodUID != "fresh" {
+		t.Fatalf("calls = %+v, want ready for the fresh pod", rec.calls)
+	}
+}
+
+func TestLostReadyAckIsResentWithoutADeploymentWrite(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	m, client, rec := hibEnv(t, hibCurrent(t, 1, "wake-op"), hibPod("p1", hash, true, false))
+	rec.err = errors.New("ack lost")
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	_ = hibTick(t, m, w) // the report error is surfaced or logged; either way the ready was attempted
+	rec.err = nil
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 2 {
+		t.Fatalf("calls = %v, want ready sent twice", rec.transitions())
+	}
+	for _, c := range rec.calls {
+		if c.Transition != protocol.TransitionReady || c.PodUID != "p1" || c.OpID != "wake-op" {
+			t.Fatalf("call = %+v, want ready for p1 under wake-op", c)
+		}
+	}
+	if n := len(deploymentPatchBodies(client)); n != 0 {
+		t.Fatalf("deployment patches = %d, want none", n)
+	}
+}
+
+// A failed pod list leaves PodsKnown false: the wake must neither restore replicas nor
+// create the Deployment, then proceed once the list works.
+func TestWakeHeldWhenPodListFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		objs []runtime.Object
+	}{
+		{"zero replicas", []runtime.Object{hibCurrent(t, 0, "sleep-op")}},
+		{"absent deployment", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, client, rec := hibEnv(t, tc.objs...)
+			failList := true
+			client.PrependReactor("list", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				if failList {
+					return true, nil, errors.New("pods list unavailable")
+				}
+				return false, nil, nil
+			})
+			w := hibW(protocol.HibernationWaking, "wake-op")
+			for i := 0; i < 2; i++ {
+				if err := hibTick(t, m, w); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, a := range client.Actions() {
+				if a.GetResource().Resource == "deployments" && (a.GetVerb() == "patch" || a.GetVerb() == "create" || a.GetVerb() == "update") {
+					t.Fatalf("deployment %s issued while the pod list failed", a.GetVerb())
+				}
+			}
+			if len(rec.calls) != 0 {
+				t.Fatalf("reported %v while the pod list failed", rec.transitions())
+			}
+
+			failList = false
+			if err := hibTick(t, m, w); err != nil {
+				t.Fatal(err)
+			}
+			d := hibGet(t, client)
+			if d.Spec.Replicas == nil || *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
+				t.Fatalf("restore: replicas=%v annotations=%v", d.Spec.Replicas, d.Annotations)
+			}
+		})
+	}
+}
+
+// A wake before the scale-down patch landed finds replicas 1: the admission pod is kept,
+// not replaced.
+func TestWakeBeforeScaleDownKeepsTheSamePod(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	m, client, rec := hibEnv(t, hibCurrent(t, 1, ""), hibPod("p1", hash, true, false))
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 1 {
+		t.Fatalf("patches = %d, want exactly one", n)
+	}
+	d := hibGet(t, client)
+	if *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" || d.Spec.Template.Annotations[AnnotationSpecHash] != hash {
+		t.Fatalf("deployment: replicas=%v annotations=%v hash=%q", d.Spec.Replicas, d.Annotations, d.Spec.Template.Annotations[AnnotationSpecHash])
+	}
+	assertNothingDeleted(t, client)
+	if _, err := hibPods(client).Get(context.Background(), "pod-p1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("admission pod lost: %v", err)
+	}
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].Transition != protocol.TransitionReady || rec.calls[0].PodUID != "p1" {
+		t.Fatalf("calls = %+v, want ready for p1", rec.calls)
+	}
+}
+
+func TestWakeWithMissingDeploymentWaitsForLingeringPods(t *testing.T) {
+	m, client, _ := hibEnv(t, hibPod("old", "x", false, true))
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range client.Actions() {
+		if a.GetResource().Resource == "deployments" && a.GetVerb() == "create" {
+			t.Fatal("deployment created while a pod of the worker lingers")
+		}
+	}
+	hibDeletePod(t, client, "old")
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	d := hibGet(t, client)
+	if d.Spec.Replicas == nil || *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
+		t.Fatalf("created: replicas=%v annotations=%v", d.Spec.Replicas, d.Annotations)
+	}
+}
+
+// An unset replicas field is not a scale-down, so it restores at once.
+func TestWakeWithNilReplicasRestoresAtOnce(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	d := hibCurrent(t, 1, "")
+	d.Spec.Replicas = nil
+	m, client, _ := hibEnv(t, d, hibPod("p1", hash, true, false))
+	if err := hibTick(t, m, hibW(protocol.HibernationWaking, "wake-op")); err != nil {
+		t.Fatal(err)
+	}
+	if n := replicaPatches(client); n != 1 {
+		t.Fatalf("replica patches = %d, want one on the first tick", n)
+	}
+	if r := hibGet(t, client).Spec.Replicas; r == nil || *r != 1 {
+		t.Fatalf("replicas = %v, want 1", r)
 	}
 }
 

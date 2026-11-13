@@ -359,16 +359,48 @@ func (m *Materializer) hibernateHold(ctx context.Context, w protocol.DesiredWork
 	return err
 }
 
+// wakeHeldForPods reports that a wake must not bring a pod up yet: the pod list was not
+// read completely this tick, or some pod of the worker (terminating included) still
+// exists. It logs the hold so a slow wake is visible before the api's wake timeout.
+func (m *Materializer) wakeHeldForPods(w protocol.DesiredWorker, obs reconcile.ObservedWorker) bool {
+	switch {
+	case !obs.PodsKnown:
+		m.log.Info("wake held: worker pods not observed", "worker_id", w.ID)
+		return true
+	case obs.WorkerPodCount > 0:
+		m.log.Info("wake held: worker pods remain", "worker_id", w.ID, "pods", obs.WorkerPodCount)
+		return true
+	}
+	return false
+}
+
 // hibernateWake brings a hibernated worker back at its current template. It
 // deliberately bypasses the busy/migration-held deferral that guards a drift roll: the
 // worker has no pod and no run, and an old-layout custody hold protects a pod's
 // in-pod workdir that a woken-from-zero worker does not have.
+//
+// A wake that finds the Deployment at zero (or absent) holds there until one complete
+// pod observation shows none of the worker's pods, terminating ones included. Restoring
+// replicas earlier can let the original admission pod survive the scale-down, and once
+// the api has recorded scaling_down it never settles a wake on that pod (trySettle rule
+// (a)), so the worker would stay waking for good. Waiting until the pods are gone forces
+// a fresh pod, which settles through ready plus its Register. The decision is read from
+// the cluster every tick, so a restart or a lost acknowledgement re-derives it.
 func (m *Materializer) hibernateWake(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) error {
 	op := w.Hibernation.OpID
 	if !obs.HasDeployment {
+		if m.wakeHeldForPods(w, obs) {
+			return nil
+		}
 		return m.createHibernationDeployment(ctx, w, obs, ns, spec, 1)
 	}
 	if obs.DeploymentTerminating {
+		return nil
+	}
+	// Only an explicit zero holds. A nil replicas field is what the fake client stores
+	// for an unset one; a real apiserver defaults it to 1, and scaling_down can only be
+	// recorded after a write of 0, so nil restores at once.
+	if obs.DeploymentReplicas != nil && *obs.DeploymentReplicas == 0 && m.wakeHeldForPods(w, obs) {
 		return nil
 	}
 	dep := RenderDeployment(m.cfg, w, spec)
