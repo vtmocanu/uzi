@@ -369,6 +369,7 @@ describe("attempt contract", () => {
     ["buildx missing", exited(1, "", "ERROR: BuildKit is enabled but the buildx component is missing or broken."), "refused"],
     ["buildx missing beats daemon text", exited(1, "", "Error response from daemon: x\nthe buildx component is missing or broken"), "refused"],
     ["daemon rejection", exited(1, "", "Error response from daemon: boom"), "rejected"],
+    ["daemon-prefixed rpc Unavailable", exited(1, "", "Error response from daemon: rpc error: code = Unavailable desc = x"), "rejected"],
     ["rpc transport loss", exited(1, "", "rpc error: code = Unavailable desc = closing transport"), "unknown"],
     ["rpc canceled", exited(1, "", "rpc error: code = Canceled desc = context canceled"), "unknown"],
     ["rpc deadline", exited(1, "", "rpc error: code = DeadlineExceeded desc = timed out"), "unknown"],
@@ -868,11 +869,22 @@ describe("real child", () => {
   });
 
   it("overflow: stdout past the cap kills the group, close is confirmed, outcome unknown with kill_reason overflow", async () => {
-    const h = realHarness("overflow", { maxStdoutBytes: 64 * 1024 });
-    await h.step();
-    assert.equal(await h.step(), "unknown");
-    const { child } = pids(h.stateFile);
-    await waitFor(() => !isAlive(child), "overflowing child killed");
+    const h = realHarness("overflow", { maxStdoutBytes: 64 * 1024, pruneTimeoutMs: 5_000 });
+    const realKill = process.kill;
+    let groupKills = 0;
+    process.kill = ((pid: number, signal?: string | number) => {
+      if (pid < 0 && signal === "SIGKILL") groupKills++;
+      return realKill.call(process, pid, signal);
+    }) as typeof process.kill;
+    try {
+      await h.step();
+      assert.equal(await h.step(), "unknown");
+      const { child } = pids(h.stateFile);
+      await waitFor(() => !isAlive(child), "overflowing child killed");
+    } finally {
+      process.kill = realKill;
+    }
+    assert.equal(groupKills, 1, "the process group is SIGKILLed exactly once");
     const unknown = rec(h.lines, "dind-builder-prune-unknown");
     assert.equal(unknown?.kill_reason, "overflow");
     assert.equal(unknown?.reason, undefined, "close was confirmed, so not settlement-unconfirmed");
