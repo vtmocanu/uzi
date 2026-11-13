@@ -328,10 +328,11 @@ func TestAdminRunDebugListRunsLiveDB(t *testing.T) {
 
 	t.Run("audit text carries no raw since or secret", func(t *testing.T) {
 		f.audit.take(t)
-		sinceArg := base.In(time.FixedZone("", 2*3600)).Format(time.RFC3339)
+		// An offset no CI or developer host runs in, so log timestamps cannot carry it.
+		sinceArg := base.In(time.FixedZone("", 5*3600+45*60)).Format(time.RFC3339)
 		f.get(t, "/api/admin/runs?state=all&user="+b.user.String()+"&since="+strings.ReplaceAll(sinceArg, "+", "%2B"))
 		out := f.audit.buf.String()
-		if strings.Contains(out, "+02:00") || strings.Contains(out, sinceArg) {
+		if strings.Contains(out, "+05:45") || strings.Contains(out, sinceArg) {
 			t.Errorf("audit output echoes the raw since argument:\n%s", out)
 		}
 		for _, secret := range []string{f.adminRO, f.adminUzc, adrlReport} {
