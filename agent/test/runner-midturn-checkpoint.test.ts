@@ -5251,6 +5251,49 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
     });
   });
 
+  it("a real published floor descending from the flagged commit, added after observation: the fresh classification decides and no turn is given", async () => {
+    await rig(4258_023, async (r) => {
+      const sha = await flagAndTick(r);
+      assert.ok(r.state().midRunTrigger);
+      // No ancestry stub: real commits descend from the flagged one and the later one becomes a published floor.
+      const floor = commitIn(r.ctx.worktreePath, "clean-a.txt", "a\n");
+      commitIn(r.ctx.worktreePath, "clean-b.txt", "b\n");
+      assert.equal(ancestryOf(r.ctx.worktreePath, sha, floor), "ancestor");
+      const flight = r.flight() as { publishedRealTips?: string[] };
+      (flight.publishedRealTips ??= []).push(floor);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.attempts, 0);
+      untouched(s);
+    });
+  });
+
+  it("hostile flagged-file metadata reaches neither the status feed nor the follow-up as a raw secret or control byte", async () => {
+    const secret = runtimeSecret();
+    const hostileName = `evil\u001b[2K\u202e${secret}\u0007.env`;
+    let followUp = "";
+    const out = await rig(4258_024, async (r) => {
+      const sha = commitIn(r.ctx.worktreePath, hostileName, `TOKEN=${secret}\n`);
+      r.flagged.push(sha);
+      assert.equal(await r.tick(), "secret_found");
+      const d = await r.ctx.midRunSecretRemediation!();
+      assert.equal(d.action, "remediate");
+      if (d.action === "remediate") followUp = d.followUp;
+    });
+    assert.ok(followUp.length > 0);
+    // eslint-disable-next-line no-control-regex
+    const unsafe = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/;
+    const strings = (v: unknown): string[] =>
+      typeof v === "string" ? [v] : v && typeof v === "object" ? Object.values(v).flatMap(strings) : [];
+    const emitted = [followUp, ...api.messages(out.claimRunId).flatMap((m) => strings(m.payload))];
+    for (const text of emitted) {
+      assert.ok(!text.includes(secret), "no raw secret value");
+      assert.ok(!unsafe.test(text), `no raw control byte in ${JSON.stringify(text.slice(0, 80))}`);
+    }
+    assert.ok(statusTexts(out.claimRunId).some((t) => t.startsWith("mid-run checkpoint secret scan flagged")), "the status line was emitted");
+  });
+
   it("a tip change that drops the commit: the fresh scan decides and no turn is given", async () => {
     await rig(4258_022, async (r) => {
       const sha = await flagAndTick(r);

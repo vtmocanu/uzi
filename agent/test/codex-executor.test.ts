@@ -18376,6 +18376,54 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
     });
     }
 
+    const terminalCases: Array<{ name: string; wire: () => { during: () => void; overrides: Partial<RunContext> } }> = [
+      {
+        name: "a terminal fence",
+        wire: () => { let fenced = false; return { during: () => { fenced = true; }, overrides: { claimFenced: () => fenced } }; },
+      },
+      {
+        name: "a terminal lifecycle signal",
+        wire: () => {
+          const lifecycle = new AbortController();
+          return { during: () => lifecycle.abort(new Error("terminal")), overrides: { terminalLifecycleSignal: lifecycle.signal } };
+        },
+      },
+    ];
+    for (const stop of terminalCases) {
+      for (const decision of [{ action: "remediate", followUp: MID }, { action: "proceed" }] as SecretRemediationDecision[]) {
+        it(`${stop.name} arriving during the seam's await (${decision.action}) stops the run before any further turn or follow-up pull`, async () => {
+          const rig = makeMultiEpochRig([script("th-1", [work, work, finish])]);
+          const wired = stop.wire();
+          let fired = false;
+          let pullsAfter = 0;
+          let entered!: () => void;
+          const inSeam = new Promise<void>(resolve => { entered = resolve; });
+          let release!: () => void;
+          const gate = new Promise<void>(resolve => { release = resolve; });
+          const { ctx } = makeCtx({
+            ...base, ...wired.overrides,
+            pullFollowUps: () => { if (fired) pullsAfter++; return []; },
+            midRunSecretRemediation: async () => {
+              if (sentOf(rig).length === 0) return { action: "proceed" };
+              entered();
+              await gate;
+              return decision;
+            },
+          });
+          const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `#4258 ${stop.name} in await`);
+          const settled = running.then(() => undefined, () => undefined);
+          await Promise.race([inSeam, settled.then(() => assert.fail("the seam was never called"))]);
+          fired = true;
+          wired.during();
+          release();
+          await assert.rejects(running);
+          assert.equal(sentOf(rig).length, 1, "only the first work turn ran");
+          assert.ok(sentOf(rig).every(text => !text.includes(MID)));
+          assert.equal(pullsAfter, 0, "the owner follow-up queue is untouched after the stop");
+        });
+      }
+    }
+
     const askTurn: TurnScript = (th, tn) => [toolCall(21, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, "c-ask-21")];
     const owners: Array<{ name: string; epochs: (rig?: never) => Responder[]; ctx: () => Partial<RunContext>; marker?: string }> = [
       {
@@ -18388,7 +18436,7 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
         // The ask turn also checkpoints, so the loop-top boundary carries clarificationPrompt.
         name: "a checkpointed clarification answer",
         epochs: () => [
-          script("th-1", [(th, tn) => [toolCall(20, "checkpoint", {}, th, tn, "c-cp-20"), ...askTurn(th, tn)]]),
+          script("th-1", [(th, tn, n) => [toolCall(20, "checkpoint", {}, th, tn, "c-cp-20"), ...askTurn(th, tn, n)]]),
           script("th-1", [work, work, finish]),
         ],
         ctx: () => ({

@@ -235,6 +235,8 @@ export function buildSecretRemediationFollowUp(
     midRun
       ? "Then re-run your checks and continue your task; publication resumes once no flagged commit is reachable."
       : "Then re-run your checks and call signal_done again.",
-    `This is attempt ${opts.attempt} of ${opts.maxAttempts}; after the last attempt the run fails.`,
+    midRun
+      ? `This is attempt ${opts.attempt} of ${opts.maxAttempts}; once the attempts are exhausted the run fails at its done point.`
+      : `This is attempt ${opts.attempt} of ${opts.maxAttempts}; after the last attempt the run fails.`,
   ].join("\n");
 }

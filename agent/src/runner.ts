@@ -20585,6 +20585,9 @@ export class RunRunner {
    *    push_secret_blocked
    *  - trusted, all findings above every floor, attempts < cap => remediate (attempts++)
    *  - trusted, findings above the floors, attempts == cap => blocked, fail
+   *
+   * Every call also clears a pending issue #4258 mid-run trigger (`state.midRunTrigger`): the
+   * done and resume gates own the decision from here, so no duplicate mid-run turn follows.
    */
   private async runSecretRemediationGate(
     flight: RunFlight,
