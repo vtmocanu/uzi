@@ -20,6 +20,41 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end -}}
 
+{{- /*
+  workloadLabels / workloadAnnotations: the operator's extra metadata for every
+  Deployment and StatefulSet the chart renders (values.yaml). Each renders the bare
+  map, or nothing when unset. A label may not replace one the chart sets: those keys
+  feed selectors and NetworkPolicies, so a collision fails the render.
+*/ -}}
+{{- define "uzi.workloadLabels" -}}
+{{- $extra := .Values.workloadLabels | default dict -}}
+{{- $owned := include "uzi.labels" . | fromYaml -}}
+{{- range $k, $v := $extra -}}
+{{- if or (hasKey $owned $k) (eq $k "app.kubernetes.io/component") (hasPrefix "uzi.dev/" $k) -}}
+{{- fail (printf "workloadLabels: %q is set by the chart and cannot be overridden" $k) -}}
+{{- end -}}
+{{- if not (kindIs "string" $v) -}}
+{{- fail (printf "workloadLabels: %q must be a string (quote it)" $k) -}}
+{{- end -}}
+{{- end -}}
+{{- with $extra }}{{ toYaml . }}{{ end -}}
+{{- end -}}
+
+{{- define "uzi.workloadAnnotations" -}}
+{{- range $k, $v := .Values.workloadAnnotations | default dict -}}
+{{- if hasPrefix "uzi.dev/" $k -}}
+{{- fail (printf "workloadAnnotations: %q uses the reserved uzi.dev/ prefix" $k) -}}
+{{- end -}}
+{{- if not (kindIs "string" $v) -}}
+{{- fail (printf "workloadAnnotations: %q must be a string (quote it)" $k) -}}
+{{- end -}}
+{{- end -}}
+{{- with .Values.workloadAnnotations -}}
+annotations:
+  {{- toYaml . | nindent 2 }}
+{{- end -}}
+{{- end -}}
+
 {{- define "uzi.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "uzi.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}

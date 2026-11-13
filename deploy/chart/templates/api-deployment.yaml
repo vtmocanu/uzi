@@ -22,6 +22,12 @@ metadata:
   labels:
     {{- include "uzi.labels" . | nindent 4 }}
     app.kubernetes.io/component: api
+    {{- with include "uzi.workloadLabels" . }}
+    {{- . | nindent 4 }}
+    {{- end }}
+  {{- with include "uzi.workloadAnnotations" . }}
+  {{- . | nindent 2 }}
+  {{- end }}
 spec:
   replicas: {{ .Values.api.replicaCount }}
   strategy:

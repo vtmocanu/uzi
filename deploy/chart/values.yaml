@@ -444,6 +444,17 @@ api:
     # host->pod probe traffic; CONFIRM at M6 before trusting empty.
     probeCIDRs: []
 
+# Extra metadata on every workload uzi creates: the chart's Deployments and StatefulSet
+# (api, web, controller, fetcher, simple postgres) and every hosted worker Deployment
+# the controller renders. For admission policies that key on workload metadata (an
+# exemption annotation, a required owner label). Values must be strings. Object metadata
+# only, never the pod template, so no worker or app pod rolls (the controller restarts to
+# read them); a hosted worker picks them up on the controller's next update to its
+# Deployment. A label uzi sets, or any uzi.dev/ key, is refused at render and at the
+# controller's boot.
+workloadLabels: {}
+workloadAnnotations: {}
+
 # --- hosted workers: the namespace, its RBAC, its policies, the controller -------
 #
 # M3 built the security ENVELOPE (namespace, RBAC, quotas, policies); M6 added the
