@@ -3911,10 +3911,12 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   the only change between them is `settling` to `unsettled`, when the worker acknowledges.
   On a worker with in-place switching, `run set-token` on a live Claude run
   switches the token without releasing the claim (same worker, same working
-  directory, same session id; a refused resume continues in a fresh session
-  with a `resume_lineage_break` notice, reason `credential_switch_resume_refused`).
+  directory; it resumes the same session where the provider allows, otherwise
+  a fresh session in the same directory with a `resume_lineage_break` notice,
+  reason `credential_switch_resume_refused`).
   If the worker cannot prove whether that switch took effect, the run is
-  `paused` with no hold reason and a `credential_switch_uncertain` message:
+  `paused` with no hold reason and a `credential_switch_uncertain` message in
+  the run feed (posted by the worker):
   `uzi run resume <id>` re-resolves the token from the run's current choice
   and continues. See [Paused after an uncertain token switch](./run-pause.md#paused-after-an-uncertain-token-switch).
   A `paused` run created with `--require-base` can also be **held because

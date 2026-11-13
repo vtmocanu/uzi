@@ -645,13 +645,15 @@ idempotent `POST /api/worker/runs/{id}/credential-switch/apply` route, which in
 one transaction journals a child epoch (`run_credential_switch_epochs`),
 withdraws the switch stamp and appends the `credential_switch` feed message,
 and returns the token only after COMMIT. The worker, claim generation and
-working directory stay the same and the SDK restarts on the new token with the
-same resume id. A worker without the capability still crosses an actual claim
+working directory stay the same and the SDK restarts on the new token,
+resuming the same session where the provider allows (otherwise a fresh session
+in the same directory, with a notice). A worker without the capability still crosses an actual claim
 boundary: it releases the claim (`claim_released_at` fence) and the next claim
 delivers the token. Where quiescence cannot be proven the run is held `paused`
 for the owner (`credential_switch_settling`, then `credential_switch_unsettled`)
 instead; an apply whose outcome the worker cannot prove becomes a plain owner
-pause (`credential_switch_uncertain`). See
+pause (`credential_switch_uncertain`; the worker posts that feed line itself
+through its own message stream, not the server). See
 [adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md) and
 [adr/4201-in-place-credential-switch.md](adr/4201-in-place-credential-switch.md).
 

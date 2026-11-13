@@ -346,9 +346,9 @@ regardless of the worker.
   that supports **in-place switching** (and an api that serves it), the run
   keeps its worker, claim and working directory: the worker proves its own
   processes stopped, gets the new token from one fenced step, and restarts
-  the agent on it with the same session. If the provider refuses that
-  session, the run continues in a fresh session in the same directory and the
-  feed notes the break (`resume_lineage_break`, reason
+  the agent on it, resuming the same session where the provider allows. If the
+  provider refuses that session, the run continues in a fresh session in the
+  same directory and the feed notes the break (`resume_lineage_break`, reason
   `credential_switch_resume_refused`). An older worker releases its claim at
   the next opportunity instead, losing at most the step in flight (the run
   page says so before you confirm); the next claim then carries the token. Switching to a token that looks tight can warn instead of refuse
@@ -377,7 +377,8 @@ regardless of the worker.
   processes stopped, but it cannot tell whether the new token took effect (the
   reply was lost, or the token can no longer be handed out). It does not guess
   and does not go back to the old token: the run **pauses for you** with no
-  hold reason and a `credential_switch_uncertain` message in its feed. Choose
+  hold reason and a `credential_switch_uncertain` message in its feed (the
+  worker posts it, so you see it in the run feed). Choose
   **Resume** (`uzi run resume <run-id>`); Resume re-reads the token from the
   run's current choice, so whatever `set-token` last set is the token that
   runs. See [Paused after an uncertain token switch](run-pause.md#paused-after-an-uncertain-token-switch).

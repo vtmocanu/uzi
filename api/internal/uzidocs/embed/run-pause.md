@@ -338,7 +338,8 @@ If you switch a running run's token with `uzi run set-token` and the worker
 cannot prove whether the switch took effect (the confirmation was lost, or the
 token can no longer be handed out), the run **pauses for you**. It is an
 ordinary pause: `hold_reason` is empty, the worker, session and open question
-are kept, and the feed shows a `credential_switch_uncertain` message. Neither
+are kept, and the run feed shows a `credential_switch_uncertain` message, which the
+worker itself posts. Neither
 the old nor the new token is used again until you act.
 
 To continue, **Resume** it (`uzi run resume <id>`, or the run page's
