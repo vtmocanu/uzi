@@ -98,11 +98,15 @@ func applyDeploymentHibernationEvidence(o *reconcile.ObservedWorker, d *appsv1.D
 func applyPodEvidence(o *reconcile.ObservedWorker, pods []corev1.Pod) {
 	o.PodsKnown = true
 	o.WorkerPodCount = len(pods)
+	o.TerminalPodCount = 0
 	o.ReadyPodUID, o.LivePodUID = "", ""
 	o.WorkerPodUIDs = nil
 	for _, p := range pods {
 		if p.UID != "" {
 			o.WorkerPodUIDs = append(o.WorkerPodUIDs, string(p.UID))
+		}
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			o.TerminalPodCount++
 		}
 		if p.DeletionTimestamp != nil || p.UID == "" {
 			continue
@@ -360,15 +364,18 @@ func (m *Materializer) hibernateHold(ctx context.Context, w protocol.DesiredWork
 }
 
 // wakeHeldForPods reports that a wake must not bring a pod up yet: the pod list was not
-// read completely this tick, or some pod of the worker (terminating included) still
-// exists. It logs the hold so a slow wake is visible before the api's wake timeout.
+// read completely this tick, or some pod of the worker that has not reached a terminal
+// phase (terminating included) still exists. A Succeeded or Failed pod (an evicted one,
+// which a ReplicaSet at zero leaves in place) has no running container and can never be
+// reported Ready, so it cannot be the admission pod surviving the wake, and it does not
+// hold the wake. It logs the hold so a slow wake is visible before the api's wake timeout.
 func (m *Materializer) wakeHeldForPods(w protocol.DesiredWorker, obs reconcile.ObservedWorker) bool {
 	switch {
 	case !obs.PodsKnown:
 		m.log.Info("wake held: worker pods not observed", "worker_id", w.ID)
 		return true
-	case obs.WorkerPodCount > 0:
-		m.log.Info("wake held: worker pods remain", "worker_id", w.ID, "pods", obs.WorkerPodCount)
+	case obs.WorkerPodCount-obs.TerminalPodCount > 0:
+		m.log.Info("wake held: worker pods remain", "worker_id", w.ID, "pods", obs.WorkerPodCount-obs.TerminalPodCount)
 		return true
 	}
 	return false

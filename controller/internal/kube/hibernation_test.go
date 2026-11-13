@@ -1016,6 +1016,54 @@ func TestWakeWithNilReplicasRestoresAtOnce(t *testing.T) {
 	}
 }
 
+// An evicted pod (phase Failed, no deletionTimestamp) is what kubelet eviction leaves
+// behind, and a ReplicaSet at zero does not delete it. It has no running container and
+// can never be Ready, so it must not hold a wake forever; a Running pod beside it still
+// does, and so does a terminating one.
+func TestWakeIsNotHeldByATerminalPhasePod(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	evicted := hibPod("evicted", hash, false, false)
+	evicted.Status.Phase = corev1.PodFailed
+	evicted.Status.Reason = "Evicted"
+	running := hibPod("running", hash, true, false)
+	running.Status.Phase = corev1.PodRunning
+	m, client, rec := hibEnv(t, hibCurrent(t, 0, "sleep-op"), evicted, running)
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if n := replicaPatches(client); n != 0 {
+		t.Fatalf("wake restored replicas while a running pod remains (replica patches = %d)", n)
+	}
+	if err := client.CoreV1().Pods(testConfig().Namespace).Delete(context.Background(), "pod-running", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if n := replicaPatches(client); n != 1 {
+		t.Fatalf("replica patches = %d with only an evicted pod left, want the one restore", n)
+	}
+	d := hibGet(t, client)
+	if *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
+		t.Fatalf("restore: replicas=%v annotations=%v", d.Spec.Replicas, d.Annotations)
+	}
+	if hasTransition(rec, protocol.TransitionReady) {
+		t.Fatal("ready reported for an evicted pod")
+	}
+
+	// A terminating pod still in phase Running holds the wake.
+	dying := hibPod("dying", hash, false, true)
+	dying.Status.Phase = corev1.PodRunning
+	m2, client2, _ := hibEnv(t, hibCurrent(t, 0, "sleep-op"), dying)
+	if err := hibTick(t, m2, w); err != nil {
+		t.Fatal(err)
+	}
+	if n := replicaPatches(client2); n != 0 {
+		t.Fatalf("wake restored replicas while a terminating running pod remains (replica patches = %d)", n)
+	}
+}
+
 func TestSecretAndVolumesSurviveEveryHibernationPath(t *testing.T) {
 	for _, state := range []string{protocol.HibernationPreparing, protocol.HibernationHibernated, protocol.HibernationWaking} {
 		m, client, _ := hibEnv(t, hibDeployment(1, ""), hibPod("p", "x", true, false))

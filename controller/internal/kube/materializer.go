@@ -412,7 +412,8 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// Unselected, for the same reason as the two lists above: a label selector would
 	// make the unmanaged-pod check below structurally blind to exactly what it looks
 	// for. Pods inherit the pod template's labels, so IsOurs works on them unchanged.
-	// Pod-list failure preserves legacy provisioning and reporting behaviour.
+	// Pod-list failure preserves legacy provisioning and reporting behaviour, except that
+	// a hibernation wake is held (hibernateWake) until a list succeeds.
 	// PodsKnown stays false. Fenced DinD maintenance rechecks pods through
 	// maintenanceObservation and waits on any read failure.
 	pods, err := m.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})

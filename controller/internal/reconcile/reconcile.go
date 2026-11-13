@@ -124,7 +124,12 @@ type ObservedWorker struct {
 	NixClaim       *ClaimObservation
 	PodsKnown      bool
 	WorkerPodCount int
-	ReadyPodUID    string
+	// TerminalPodCount is how many of the WorkerPodCount pods are in phase Succeeded or
+	// Failed (an evicted pod, say): every container has exited and the pod can never be
+	// Ready again. Read only by the hibernation wake hold; zero (unset) means "count
+	// every pod", which holds a wake rather than releasing it.
+	TerminalPodCount int
+	ReadyPodUID      string
 	// Hibernation evidence (PRD #4205), all read fresh each tick: nothing about a
 	// hibernation step is remembered across ticks.
 	//

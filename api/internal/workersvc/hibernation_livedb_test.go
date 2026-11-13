@@ -860,8 +860,9 @@ func TestHibernationFreeTextIsSanitizedLiveDB(t *testing.T) {
 // PRD #4205 quick wake: a wake that arrives while the worker is preparing, with or without
 // scaling_down recorded. These pin the server contract the controller fix relies on.
 
-// quickWakeWorker seeds a worker, hibernates it (preparing) and wakes it by the given kind
-// ("admin" -> WakeWorker, "demand" -> DemandWake for a queued run the worker could claim).
+// quickWake wakes a preparing worker by the given kind ("admin" -> WakeWorker, "demand" ->
+// DemandWake for a queued run the worker could claim) and expects waking. The caller seeds
+// and hibernates the worker.
 func (f *hibFx) quickWake(id uuid.UUID, kind string) {
 	f.t.Helper()
 	switch kind {
@@ -946,10 +947,9 @@ func TestHibernationQuickWakeSettlesOnlyOnAFreshPodLiveDB(t *testing.T) {
 						f.register(id, &pod)
 					}
 					f.want(id, "waking")
-					if n, err := f.svc.HibernationSettlePass(f.env.ctx); err != nil {
+					// The settle pass retries settlement and still refuses the old pod.
+					if _, err := f.svc.HibernationSettlePass(f.env.ctx); err != nil {
 						t.Fatalf("pass: %v", err)
-					} else if n != 0 {
-						t.Logf("pass changed %d rows", n)
 					}
 					f.want(id, "waking")
 
