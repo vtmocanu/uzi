@@ -229,7 +229,10 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 	usage := &cobra.Command{
 		Use:   "usage",
 		Short: "Show token/cost usage across the factory",
-		Args:  cobra.NoArgs,
+		Long: "RUNS counts primary work runs (issue, task, prompt, job, self_improve) with recorded usage. " +
+			"Finished, failed and fail rate count terminal primary work runs, including runs with no recorded usage. " +
+			"Tokens and cost also include helper runs (judge, cross_check, mr_rework, ci_fix); chat is excluded.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if usageWindow != "lifetime" && usageWindow != "last_7_days" {
 				return uzicli.Exitf(uzicli.ExitUsage, "invalid --window %q: choose lifetime or last_7_days", usageWindow)

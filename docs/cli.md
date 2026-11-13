@@ -261,15 +261,16 @@ A few worth knowing:
 
 - **`uzi admin usage --window lifetime|last_7_days` selects the human report's
   window (default `lifetime`).** The factory summary and per-user rows use
-  the same window for usage-bearing runs, tokens, API-equivalent cost, outcomes and
-  recoverable failures. Failure rate is failed runs divided by finished runs,
-  including runs without usage; `RUNS` counts runs with usage. Cost shows
-  `$0.00` for metered zero and discloses runs without a cost estimate and
-  unreported runs. Incomplete totals include recorded partial costs.
-  Recoverable work may already have been landed.
-  The table's `CLAUDE/CODEX` column shows the selected window's runs by
-  harness (the same runs as `RUNS`, so the two numbers sum to it; cross-check
-  runs count under the harness they ran on). The column is omitted against an
+  the same window. `RUNS` counts primary work runs (issue, task, prompt, job,
+  self_improve) with recorded usage. Finished, failed and the failure rate
+  count terminal primary work runs, including runs without usage; failure rate
+  is failed runs divided by finished runs. Tokens and API-equivalent cost also
+  include helper runs (judge, cross_check, mr_rework, ci_fix); chat is
+  excluded. Cost shows `$0.00` for metered zero and discloses runs without a
+  cost estimate and unreported runs. Incomplete totals include recorded partial
+  costs. Recoverable work may already have been landed.
+  The table's `CLAUDE/CODEX` column splits the selected window's same primary
+  runs as `RUNS` by harness, so the two numbers sum to it. The column is omitted against an
   older API without the split.
   `--json` returns the complete API response with both windows and additive
   per-user seven-day fields, plus `harness_runs` / `last7_harness_runs` per

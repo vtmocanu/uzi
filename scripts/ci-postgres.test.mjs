@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Execute the workflow's actual Postgres pull shell with fake Docker/sleep, no daemon,
-// and pin the single-LiveDB-execution wiring of ci.yml's two required contexts.
+// and pin the two-producer LiveDB wiring (#4232) behind the required test-api-store-it.
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -11,36 +11,56 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const workflow = readFileSync(path.join(root, ".github/workflows/ci.yml"), "utf8");
 const jobBody = (name) => workflow.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:|^  # -{10})`, "m"))?.[1];
 
-// The producer owns the one execution: pinned digest, pull step, and the canonical task.
-const job = jobBody("test-codex-refresh-lostreply-e2e");
-assert.ok(job, "single LiveDB producer job must exist");
-assert.doesNotMatch(job, /^    services:/m, "services pull before fallback steps can run");
-const image = job.match(/^      UZI_CI_PG_IMAGE: (\S+)$/m)?.[1];
-assert.ok(image, "pin must be present");
-assert.match(image, /^mirror\.gcr\.io\/library\/postgres:[^@\s]+@sha256:[0-9a-f]{64}$/, "producer must use the pinned digest");
-assert.doesNotMatch(job, /docker-pull-fallback\.sh postgres:/, "no floating pre-pull may replace the pinned digest");
-assert.match(job, /^    timeout-minutes: 75$/m, "headroom for one full sweep");
-assert.match(job, /^        run: task test:codex-refresh-lostreply-e2e$/m, "producer runs the canonical recipe once");
+// One workflow-level pin feeds both producers; no job carries its own.
+assert.equal((workflow.match(/^\s*UZI_CI_PG_IMAGE:/gm) ?? []).length, 1, "exactly one Postgres pin in ci.yml");
+const image = workflow.match(/^  UZI_CI_PG_IMAGE: (\S+)$/m)?.[1];
+assert.ok(image, "workflow-level pin must be present");
+assert.match(image, /^mirror\.gcr\.io\/library\/postgres:[^@\s]+@sha256:[0-9a-f]{64}$/, "producers use the pinned digest");
 const code = workflow.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
-assert.equal((code.match(/task test:codex-refresh-lostreply-e2e/g) ?? []).length, 1, "recipe appears once in ci.yml");
 assert.equal((code.match(/run-store-it\.sh|-run 'LiveDB\$'|livedb\.log|livedb-skip-guard/g) ?? []).length, 0,
-  "no job may carry its own LiveDB sweep; the recipe owns it");
-assert.match(job, /^          UZI_STORE_IT_PG_IMAGE: \$\{\{ steps\.pg\.outputs\.ref \}\}$/m, "database image comes from the pulled digest ref");
-const block = job.match(/      - name: Pull the pinned Postgres[^\n]*\n        id: pg\n        run: \|\n((?:          [^\n]*\n)+)/)?.[1];
-assert.ok(block, "pinned pull block must exist");
-const script = block.replace(/^          /gm, "");
+  "no job may carry its own LiveDB sweep; the recipes own it");
 
-// The aggregation job runs nothing but the producer-result check.
+// Each producer owns its share of the one sweep: pull step, pulled ref, canonical task once.
+const producers = [
+  { name: "test-livedb-workersvc", task: "test:livedb-workersvc", timeout: 60, group: null },
+  { name: "test-codex-refresh-lostreply-e2e", task: "test:codex-refresh-lostreply-e2e", timeout: 75, group: "rest" },
+];
+const blocks = [];
+for (const p of producers) {
+  const job = jobBody(p.name);
+  assert.ok(job, `LiveDB producer ${p.name} must exist`);
+  assert.doesNotMatch(job, /^    services:/m, "services pull before fallback steps can run");
+  assert.doesNotMatch(job, /docker-pull-fallback\.sh postgres:/, "no floating pre-pull may replace the pinned digest");
+  assert.match(job, new RegExp(`^    timeout-minutes: ${p.timeout}$`, "m"), `${p.name} timeout headroom`);
+  assert.match(job, new RegExp(`^        run: task ${p.task}$`, "m"), `${p.name} runs its canonical recipe`);
+  assert.equal((code.match(new RegExp(`task ${p.task}\\b`, "g")) ?? []).length, 1, `${p.task} appears once in ci.yml`);
+  assert.match(job, /^          UZI_STORE_IT_PG_IMAGE: \$\{\{ steps\.pg\.outputs\.ref \}\}$/m, "database image comes from the pulled digest ref");
+  const groups = job.match(/^          UZI_STORE_IT_GROUP: (\S+)$/gm) ?? [];
+  assert.deepEqual(groups, p.group ? [`          UZI_STORE_IT_GROUP: ${p.group}`] : [], `${p.name} sweep group`);
+  const block = job.match(/      - name: Pull the pinned Postgres[^\n]*\n        id: pg\n        run: \|\n((?:          [^\n]*\n)+)/)?.[1];
+  assert.ok(block, `${p.name} pinned pull block must exist`);
+  blocks.push(block);
+}
+assert.equal(blocks[0], blocks[1], "both producers pull Postgres identically");
+const script = blocks[0].replace(/^          /gm, "");
+const workersvcTask = readFileSync(path.join(root, "Taskfile.yml"), "utf8").match(/^  test:livedb-workersvc:\n((?:    [^\n]*\n|\n)+?)(?=^  \S)/m)?.[1];
+assert.match(workersvcTask ?? "", /UZI_STORE_IT_GROUP=workersvc TMPDIR=\S+ \.\/e2e\/run-store-it\.sh/, "workersvc recipe selects its group");
+
+// The aggregation job runs nothing but the two producer-result checks.
 const agg = jobBody("test-api-store-it");
 assert.ok(agg, "required context test-api-store-it must exist");
-assert.match(agg, /^    needs: \[changes, test-codex-refresh-lostreply-e2e\]$/m, "aggregator needs the producer");
+assert.match(agg, /^    needs: \[changes, test-livedb-workersvc, test-codex-refresh-lostreply-e2e\]$/m, "aggregator needs both producers");
 assert.doesNotMatch(agg, /^      UZI_CI_PG_IMAGE:|go test|docker /m, "aggregator must not run its own sweep or database");
 const aggRun = agg.match(/        run: \|\n((?:          [^\n]*\n)+)/)?.[1]?.replace(/^          /gm, "");
 assert.ok(aggRun, "aggregator check block must exist");
-assert.match(agg, /PRODUCER_RESULT: \$\{\{ needs\['test-codex-refresh-lostreply-e2e'\]\.result \}\}/);
-for (const [result, want] of [["success", 0], ["failure", 1], ["cancelled", 1], ["skipped", 1], ["", 1]]) {
-  const r = spawnSync("bash", ["-e", "-c", aggRun], { encoding: "utf8", env: { ...process.env, PRODUCER_RESULT: result } });
-  assert.equal(r.status, want, `aggregator with producer result ${JSON.stringify(result)}`);
+assert.match(agg, /WORKERSVC_RESULT: \$\{\{ needs\['test-livedb-workersvc'\]\.result \}\}/);
+assert.match(agg, /REST_RESULT: \$\{\{ needs\['test-codex-refresh-lostreply-e2e'\]\.result \}\}/);
+const results = ["success", "failure", "cancelled", "skipped", ""];
+for (const a of results) {
+  for (const b of results) {
+    const r = spawnSync("bash", ["-e", "-c", aggRun], { encoding: "utf8", env: { ...process.env, WORKERSVC_RESULT: a, REST_RESULT: b } });
+    assert.equal(r.status, a === "success" && b === "success" ? 0 : 1, `aggregator with producer results ${JSON.stringify([a, b])}`);
+  }
 }
 
 const temp = mkdtempSync(path.join(tmpdir(), "ci-postgres-test-"));
@@ -119,4 +139,4 @@ printf 'sleep %s\\n' "$*" >> "$PG_TEST_LOG"
 } finally {
   rmSync(temp, { recursive: true, force: true });
 }
-console.log("CI Postgres contract: PASS (single execution, pinned digest, hub fallback, pull exhaustion, aggregation)");
+console.log("CI Postgres contract: PASS (two producers, one pinned digest, hub fallback, pull exhaustion, aggregation)");

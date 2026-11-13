@@ -11,7 +11,7 @@ import { startMainWatchdog } from "./main-watchdog.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { WorkerClient, RequestError } from "./client.js";
-import { GitCache, type GitCacheOptions } from "./git.js";
+import { GitCache, readRetireScratchOutcomesActivation, type GitCacheOptions } from "./git.js";
 import { StubExecutor, waitForStubOutboxCut } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
 import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
@@ -471,6 +471,8 @@ async function mainBody(): Promise<void> {
   }
   const epochReclaimDeletion = readEpochReclaimDeletionActivation(process.env);
   const epochScratchDeletion = readEpochScratchDeletionActivation(process.env);
+  // Read here so an invalid value refuses startup, like the activation switches above.
+  const retireScratchOutcomes = readRetireScratchOutcomesActivation(process.env);
   const epochEnabled = process.env.UZI_EPOCH_LOCK === "1";
   if (epochEnabled && process.env.UZI_DATA_DIR !== "/data") {
     throw new Error("epoch workers require UZI_DATA_DIR=/data");
@@ -1149,8 +1151,11 @@ async function mainBody(): Promise<void> {
   // Issue #3153: `<dataDir>/runner` persists across pod replacements, so inspect `.retire-*`
   // scratch parents a previous process left behind. Strictly before worker.run() (the claim loop
   // and every retire/recovery path). Removes nothing: every parent, empty ones included, is retained
-  // and counted in one warning. Never throws, never recursive. Parents newer than this process are skipped.
-  await git.inspectRetireScratchAtStartup(Date.now() - process.uptime() * 1000)
+  // and counted in one warning. Never throws. Parents newer than this process are not counted as retained.
+  // Unless UZI_RETIRE_SCRATCH_OUTCOMES=0 it then adds read-only, bounded observation records (one
+  // absolute 30 s budget, the abort signal of this process); it still removes nothing.
+  await git.inspectRetireScratchAtStartup(Date.now() - process.uptime() * 1000,
+    { outcomes: retireScratchOutcomes, signal: controller.signal })
     .catch((err) => log.warn("runner retire scratch inspection threw", { error: errMessage(err) }));
 
   if (config.homeReclaimEnabled) {

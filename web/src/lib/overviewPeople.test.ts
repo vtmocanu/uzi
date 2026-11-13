@@ -276,6 +276,33 @@ describe("week and usage action", () => {
     expect(model({ adminUsage: usage([3, 0, 1, 0]) }).week).toBe(2);
   });
 
+  describe("helper-only users (#4209)", () => {
+    const zero = { input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0, cost_status: "" };
+    const withRows = (rows: Array<Record<string, unknown>>) =>
+      ({
+        factory: {},
+        earliest_run: null,
+        users: rows.map((r, i) => ({ user_id: `u${i}`, email: `u${i}@x.io`, ...r })),
+      }) as unknown as AdminUsage;
+
+    it("counts a user with no primary runs but non-zero seven-day helper spend", () => {
+      const tokens = { last7_run_count: 0, last_7_days: { ...zero, output_tokens: 900 } };
+      const cost = { last7_run_count: 0, last_7_days: { ...zero, cost_usd: 1.5 } };
+      const sub = { last7_run_count: 0, last_7_days: zero, last7_subscription_run_count: 2 };
+      const unrep = { last7_run_count: 0, last_7_days: zero, last7_unreported_run_count: 1 };
+      expect(model({ adminUsage: withRows([tokens, cost, sub, unrep]) }).week).toBe(4);
+    });
+
+    it("does not count a user whose seven-day usage is all zero", () => {
+      const idle = { last7_run_count: 0, last_7_days: zero, last7_subscription_run_count: 0, last7_unreported_run_count: 0 };
+      expect(model({ adminUsage: withRows([idle]) }).week).toBe(0);
+    });
+
+    it("counts a primary-run user without any usage bundle", () => {
+      expect(model({ adminUsage: withRows([{ last7_run_count: 2 }, { last7_run_count: 0 }]) }).week).toBe(1);
+    });
+  });
+
   it("is null without usage or when a row lacks the count", () => {
     expect(model({ adminUsage: null }).week).toBeNull();
     expect(model({ adminUsage: undefined }).week).toBeNull();

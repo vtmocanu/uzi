@@ -8568,7 +8568,7 @@ func (s *Service) RunCredentialEpochs(ctx context.Context, runID, userID uuid.UU
 }
 
 // SelfUsage returns the user's own lifetime + last-7-days usage totals and their
-// usage-bearing run count (PRD #40 M3, GET /api/usage).
+// primary work run count with usage (PRD #40 M3, GET /api/usage).
 func (s *Service) SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error) {
 	return s.q.SelfUsage(ctx, userID)
 }

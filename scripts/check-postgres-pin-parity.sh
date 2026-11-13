@@ -4,7 +4,7 @@
 #   check-postgres-pin-parity.sh [<compose-file> <ci-workflow> <store-it-script>]
 #     defaults: docker-compose.yml .github/workflows/ci.yml e2e/run-store-it.sh
 #
-# 1. ci.yml's UZI_CI_PG_IMAGE (the single LiveDB job, test-codex-refresh-lostreply-e2e) pins the same tag AND digest as
+# 1. ci.yml's workflow-level UZI_CI_PG_IMAGE (both LiveDB jobs) pins the same tag AND digest as
 #    docker-compose.yml's db. The CI step pulls through mirror.gcr.io
 #    (Docker Hub's anonymous rate limit), so Renovate sees two packages (`postgres`,
 #    `mirror.gcr.io/library/postgres`). renovate.json groups them into one branch

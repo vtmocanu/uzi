@@ -4656,8 +4656,10 @@ export interface RunOutcomes {
 }
 
 // SelfUsage is the caller's own consumption (GET /api/usage, PRD #40): lifetime and
-// last-7-days totals plus the count of their usage-bearing runs. run_count === 0
-// means "nothing yet" — the card renders that state, not fabricated zeros.
+// last-7-days totals plus the count of their primary work runs with recorded usage
+// (issue #4209: helper runs add tokens and cost but not run_count). run_count === 0 alone no
+// longer means "nothing yet": a helper-only user has spend. The card renders the empty state
+// only when tokens, cost and run counts are all zero (hasRecordedUsage).
 export interface SelfUsage {
   lifetime: RunUsage;
   last_7_days: RunUsage;
@@ -4704,9 +4706,9 @@ export interface AdminUsageUser {
   /** Issue #3686: this user's lifetime and seven-day PR counts. Absent on older APIs. */
   pr_count?: number;
   last7_pr_count?: number;
-  /** Issue #3876: this user's lifetime and seven-day runs split by harness. The same runs as
-   *  run_count / last7_run_count, so each split sums to its window's count; a cross-check run
-   *  counts under the harness it ran on. Absent on older APIs. */
+  /** Issue #3876: this user's lifetime and seven-day runs split by harness. The same primary
+   *  work runs as run_count / last7_run_count, so each split sums to its window's count.
+   *  Absent on older APIs. */
   harness_runs?: HarnessRuns;
   last7_harness_runs?: HarnessRuns;
 }
@@ -4723,8 +4725,8 @@ export interface HarnessRuns {
 export interface AdminUsage {
   factory: SelfUsage;
   users: AdminUsageUser[];
-  /** ISO timestamp of the factory's earliest usage-bearing run (for the "since
-   *  <date>" line); null when the factory has no usage yet (PRD #40). */
+  /** ISO timestamp of the factory's earliest usage-bearing run's creation time (helper runs included;
+   *  for the "since <date>" line); null when the factory has no usage yet (PRD #40). */
   earliest_run: string | null;
 }
 

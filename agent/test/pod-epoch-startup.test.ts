@@ -42,6 +42,13 @@ function contract(text: string): void {
     assert.ok(restore < at(symbol), "runtime TMPDIR restored before " + symbol);
     assert.ok(consume < at(symbol), "epoch consumed before " + symbol);
   }
+  // Issue #4143: the retire-scratch observation switch is read at startup (an invalid value refuses it),
+  // handed to the inspector with the abort signal, and the inspector runs before the epoch pass.
+  assert.ok(at("readRetireScratchOutcomesActivation(process.env)") < at("git.inspectRetireScratchAtStartup("),
+    "the retire scratch observation switch is read before the inspector runs");
+  assert.match(main, /git\.inspectRetireScratchAtStartup\(Date\.now\(\) - process\.uptime\(\) \* 1000,\s*\{ outcomes: retireScratchOutcomes, signal: controller\.signal \}\)/,
+    "main passes the switch and the abort signal to the inspector");
+  assert.ok(at("git.inspectRetireScratchAtStartup(") < at("await runPodEpochShadow("), "the inspector precedes the epoch shadow pass");
   const acquisition = main.slice(acquire, main.indexOf(": undefined", acquire));
   assert.match(acquisition, /signal: controller.signal/, "bounded acquisition receives early cancellation");
   assert.match(acquisition, /firstMode: epochBootstrap.firstMode/, "selector chooses the first lock mode");
