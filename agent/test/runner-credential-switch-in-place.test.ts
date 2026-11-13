@@ -51,10 +51,10 @@ function negotiate(): void {
 
 const initFrame = (session = SESSION): SDKMessage =>
   ({ type: "system", subtype: "init", session_id: session, model: "m" }) as unknown as SDKMessage;
-const planTurn = (plan = "# PLAN\n- do it"): (() => AsyncIterable<SDKMessage>) => async function* () {
+const planTurn = (plan = "# PLAN\n- do it", result: SDKMessage = resultOk(SESSION)): (() => AsyncIterable<SDKMessage>) => async function* () {
   yield initFrame();
   yield assistant([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: plan } }], SESSION);
-  yield resultOk(SESSION);
+  yield result;
 };
 const askTurn = (): (() => AsyncIterable<SDKMessage>) => async function* () {
   yield initFrame();
@@ -131,6 +131,8 @@ interface Setup {
   quiesceGate?: Promise<void>;
   /** ask_user site: the test, not the fixture, answers the re-asked question. */
   noAutoAnswer?: boolean;
+  /** implement_turn site: the result frame that ends the plan turn, before the switch (default: no usage). */
+  planResult?: SDKMessage;
 }
 
 const CLEAN: QuiesceRunOutcome = {
@@ -184,7 +186,7 @@ async function scenario(setup: Setup) {
       api.onState(runId, (b) => { if (b.status === "awaiting_approval") send(runId, row("approve_plan")); });
       break;
     case "implement_turn":
-      turnScripts = [planTurn(), hangTurn(requestSwitch), last];
+      turnScripts = [planTurn(undefined, setup.planResult), hangTurn(requestSwitch), last];
       api.onState(runId, (b) => { if (b.status === "awaiting_approval") send(runId, row("approve_plan")); });
       break;
     case "plan_gate":
@@ -610,6 +612,28 @@ describe("issue #4201 m2c: apply outcomes other than applied", () => {
     assert.ok(statusesOf(r).includes("completed") && !statusesOf(r).some((x) => x.startsWith("credential_switch")));
     assert.equal(r.turns.at(-1)!.token, NEW_TOKEN);
     assertSeqContinuity(r);
+  });
+
+  it("implement_turn: the apply carries the old credential's last session-cumulative modelUsage as old_cumulative, identical on a same-op retry", TIMEOUT, async () => {
+    const planResult = {
+      ...resultOk(SESSION),
+      usage: { input_tokens: 999, output_tokens: 999 },
+      modelUsage: { "claude-test": { inputTokens: 120, outputTokens: 34, cacheReadInputTokens: 5, cacheCreationInputTokens: 6, costUSD: 0.5 } },
+    } as unknown as SDKMessage;
+    const r = await scenario({ site: "implement_turn", planResult, apply: [{ outcome: "applied", token: NEW_TOKEN, replyLost: true }] });
+    const want = {
+      "claude-test.cacheCreationInputTokens": 6, "claude-test.cacheReadInputTokens": 5,
+      "claude-test.inputTokens": 120, "claude-test.outputTokens": 34,
+    };
+    assert.deepEqual(applied().map((b) => b.op_id), ["op-1", "op-1"], "the same op is sent again");
+    assert.deepEqual(applied().map((b) => b.old_cumulative), [want, want]);
+    assert.ok(statusesOf(r).includes("completed"));
+  });
+
+  it("implement_turn: with no session-cumulative reading the field is omitted", TIMEOUT, async () => {
+    await scenario({ site: "implement_turn", apply: [{ outcome: "applied", token: NEW_TOKEN }] });
+    assert.equal(applied().length, 1);
+    assert.ok(!("old_cumulative" in applied()[0]!), "no old_cumulative key");
   });
 
   for (const site of ["implement_turn", "plan_gate"] as const) {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 
@@ -103,6 +104,46 @@ func TestValidateCredentialSwitchApplyRequest(t *testing.T) {
 	longKey.OldCumulative = json.RawMessage(`{"` + strings.Repeat("k", 200) + `":1}`)
 	if _, _, err := ValidateCredentialSwitchApplyRequest(longKey); err != nil {
 		t.Fatalf("a 200-byte key must be accepted: %v", err)
+	}
+}
+
+// TestOldCumulativeSharedFixture reads the fixture the agent test asserts oldCumulativeFromModelUsage
+// against (agent/test/fixtures/old-cumulative-boundaries.json): every map the worker may send must pass
+// the server's validation, and the boundary violations must fail it.
+func TestOldCumulativeSharedFixture(t *testing.T) {
+	raw, err := os.ReadFile("../../../agent/test/fixtures/old-cumulative-boundaries.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fx struct {
+		Cases []struct {
+			Name     string          `json:"name"`
+			Expected json.RawMessage `json:"expected"`
+		} `json:"cases"`
+		Violations []struct {
+			Name string `json:"name"`
+			Raw  string `json:"raw"`
+		} `json:"violations"`
+	}
+	if err := json.Unmarshal(raw, &fx); err != nil || len(fx.Cases) == 0 || len(fx.Violations) == 0 {
+		t.Fatalf("fixture: %d cases, %d violations, err %v", len(fx.Cases), len(fx.Violations), err)
+	}
+	op := uuid.New().String()
+	req := func(cum json.RawMessage) CredentialSwitchApplyRequest {
+		return CredentialSwitchApplyRequest{ClaimGeneration: 1, RegisterNonce: "n", OpID: op, OldCumulative: cum}
+	}
+	for _, c := range fx.Cases {
+		if string(c.Expected) == "null" {
+			continue
+		}
+		if _, cum, err := ValidateCredentialSwitchApplyRequest(req(c.Expected)); err != nil || len(cum) == 0 {
+			t.Fatalf("%s: the worker's output %s was refused: %v", c.Name, c.Expected, err)
+		}
+	}
+	for _, v := range fx.Violations {
+		if _, _, err := ValidateCredentialSwitchApplyRequest(req(json.RawMessage(v.Raw))); !errors.Is(err, ErrInvalidApplyRequest) {
+			t.Fatalf("%s: err = %v, want ErrInvalidApplyRequest", v.Name, err)
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import type { OutgoingMessage, StateAck, PlanCrossCheckReconciliation } from "./
 import type { PayloadRedactor, TextRedactor } from "./redact.js";
 import { clampUtf8Bytes } from "./decisions-memo.js";
 import { emptyCounts, countsTotal, sanitizePayload, sanitizeText } from "./sanitize.js";
+import { oldCumulativeFromModelUsage } from "./old-cumulative.js";
 import { UsageRecorder } from "./usage-recorder.js";
 import { errMessage, sleep } from "./util.js";
 
@@ -434,6 +435,27 @@ export class MessageBatcher {
     this.usage = new UsageRecorder({ client, runId, claimGeneration: this.generation, log });
   }
 
+  /** The newest session-cumulative `modelUsage` reading as an old_cumulative map (see
+   *  oldCumulativeFromModelUsage); undefined before any such result frame and after a fresh session. */
+  private sessionCumulative: Record<string, number> | undefined;
+
+  /** The last known cumulative reading of the current session, for the in-place credential switch's
+   *  apply. Informational only. */
+  lastSessionCumulative(): Record<string, number> | undefined {
+    return this.sessionCumulative === undefined ? undefined : { ...this.sessionCumulative };
+  }
+
+  private captureSessionCumulative(msg: EmittedMessage): void {
+    const p = msg.payload;
+    if (p["event"] === "init" && p["fresh_session"] === true) {
+      // A new session starts a new cumulative count.
+      this.sessionCumulative = undefined;
+    } else if (p["event"] === "result" && p["usage_basis"] === "session_cumulative" &&
+        (msg.kind === "status" || msg.kind === "error")) {
+      this.sessionCumulative = oldCumulativeFromModelUsage(p["modelUsage"], this.log);
+    }
+  }
+
   emit(msg: EmittedMessage): void {
     if (this.closed) {
       // A post-close emit CANNOT be delivered — close() has already drained — but
@@ -452,6 +474,7 @@ export class MessageBatcher {
       });
       return;
     }
+    this.captureSessionCumulative(msg);
     if (!this.reservation && !this.switchHold) this.seq += 1;
     // SANITIZE BEFORE REDACT, and the order is a security property, not a style
     // choice. The redactors are exact-substring matchers (`redact.ts`), so a secret

@@ -27228,11 +27228,17 @@ export class RunRunner {
         runLog.warn("in-place credential switch: the message transport could not be drained; giving up on the old token", { run_id: flight.runId });
         return await this.inPlaceGiveUp(flight, runLog, opId, lifecycle);
       }
+      // The old credential's last known cumulative reading, read once after the drain and sent
+      // unchanged on every same-op retry. Informational only; omitted when there is none.
+      const oldCumulative = flight.batcher.lastSessionCumulative();
       let uncertainAttempts = 0;
       for (;;) {
         let result: LedgerApplyResult;
         try {
-          result = await applyThroughLedger(this.client, ledger, flight.runId, { claimGeneration: generation, registerNonce: nonce, opId });
+          result = await applyThroughLedger(this.client, ledger, flight.runId, {
+            claimGeneration: generation, registerNonce: nonce, opId,
+            ...(oldCumulative !== undefined ? { oldCumulative } : {}),
+          });
         } catch (error) {
           runLog.warn("in-place credential switch: the apply call threw; treating the outcome as uncertain", { run_id: flight.runId, error: errMessage(error) });
           result = { kind: "uncertain", detail: "apply_threw" };

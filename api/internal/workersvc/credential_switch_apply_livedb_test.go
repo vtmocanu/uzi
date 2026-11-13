@@ -191,6 +191,56 @@ func TestApplyCredentialSwitchReplayLiveDB(t *testing.T) {
 	})
 }
 
+func TestApplyCredentialSwitchOldCumulativeLiveDB(t *testing.T) {
+	f := newApplyFx(t)
+	stored := func(run uuid.UUID) string {
+		var s *string
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT old_cumulative::text FROM run_credential_switch_epochs WHERE run_id = $1 AND ordinal = 1`, run).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		if s == nil {
+			return "<null>"
+		}
+		return *s
+	}
+
+	// An invalid shape is refused before anything is written.
+	badRun, badOp := f.run(t, "running")
+	f.noWrite(t, badRun, func() {
+		req := f.req(badOp)
+		req.OldCumulative = json.RawMessage(`{"m.inputTokens":1234567890123456789}`)
+		if _, err := f.svc.ApplyCredentialSwitch(f.env.ctx, f.worker(t), badRun, req); !errors.Is(err, ErrInvalidApplyRequest) {
+			t.Fatalf("err = %v, want ErrInvalidApplyRequest", err)
+		}
+	})
+
+	run, op := f.run(t, "running")
+	req := f.req(op)
+	req.OldCumulative = json.RawMessage(`{"claude-x.outputTokens": 7, "claude-x.inputTokens":12}`)
+	f.want(t, f.apply(t, run, req), ApplyOutcomeApplied, "")
+	const want = `{"claude-x.inputTokens": 12, "claude-x.outputTokens": 7}`
+	if got := stored(run); got != want {
+		t.Fatalf("old_cumulative = %s, want %s", got, want)
+	}
+
+	// A same-op replay, even one that names a different reading, leaves the stored value unchanged.
+	again := f.req(op)
+	again.OldCumulative = json.RawMessage(`{"other":1}`)
+	if res := f.apply(t, run, again); !res.Replay {
+		t.Fatalf("replay = %+v", res)
+	}
+	if got := stored(run); got != want {
+		t.Fatalf("after replay old_cumulative = %s, want %s", got, want)
+	}
+
+	// An apply that names no reading stores NULL.
+	run2, op2 := f.run(t, "running")
+	f.want(t, f.apply(t, run2, f.req(op2)), ApplyOutcomeApplied, "")
+	if got := stored(run2); got != "<null>" {
+		t.Fatalf("old_cumulative = %s, want NULL", got)
+	}
+}
+
 func TestApplyCredentialSwitchRefusedCommittedLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
