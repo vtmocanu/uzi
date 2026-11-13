@@ -606,7 +606,7 @@ type WriteWorkerHibernationParams struct {
 // workersvc/hibernation.go reads the locked row, decides, and writes the whole
 // hibernation column set back with WriteWorkerHibernation.
 // Persist the complete hibernation column set of one worker. The caller holds the row
-// lock; the CHECK constraints from migration 00427 still guard coherence.
+// lock; the CHECK constraints from migration 00435 still guard coherence.
 func (q *Queries) WriteWorkerHibernation(ctx context.Context, arg WriteWorkerHibernationParams) (Worker, error) {
 	row := q.db.QueryRow(ctx, writeWorkerHibernation,
 		arg.HibernationState,

@@ -4,7 +4,7 @@ SET LOCAL lock_timeout = '5s';
 -- PRD #4205 M1: worker hibernation storage. Additive only; the state machine,
 -- controller arm and UI land in later milestones.
 -- Lock order: this migration locks workers only. hibernation_wakes (which needs
--- a runs lock for its FK) lives in 00428 so Up never waits on runs while holding
+-- a runs lock for its FK) lives in 00436 so Up never waits on runs while holding
 -- ACCESS EXCLUSIVE on workers.
 ALTER TABLE workers
  ADD COLUMN hibernation_state text NOT NULL DEFAULT 'none',
@@ -23,7 +23,7 @@ ALTER TABLE workers
  ADD COLUMN wake_register_pod_uid uuid;
 
 -- Staged CHECKs: added NOT VALID so no workers scan happens under the ACCESS EXCLUSIVE lock the
--- ADD COLUMN above holds for this transaction. 00430 validates them in its own transaction
+-- ADD COLUMN above holds for this transaction. 00438 validates them in its own transaction
 -- (SHARE UPDATE EXCLUSIVE, which does not block reads or writes). Every column is new, so the
 -- validation cannot fail on existing rows.
 ALTER TABLE workers
