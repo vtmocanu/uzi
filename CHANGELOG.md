@@ -29,6 +29,13 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ## [Unreleased]
 
+## [0.86.2] - 2026-11-13
+
+### Fixed
+
+- **Database upgrades work on patched PostgreSQL minors ([#4273](https://github.com/vtmocanu/uzi/pull/4273), [#4274](https://github.com/vtmocanu/uzi/pull/4274)).**
+  Preserve intake-pause admission semantics while allowing run-table migrations on PostgreSQL 17.12, 16.16 and 18.7; repair fresh and pending schema upgrades without replacing function identity or grants. A fresh install on the chart's default database (floating `postgres:17`, now 17.12) failed to migrate on 0.86.1; existing 0.86.x installs keep the earlier function body, which is harmless at rest and is converted on upgrade to 0.87.
+
 ## [0.86.1] - 2026-11-05
 
 ### Added
@@ -6501,7 +6508,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.86.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.86.2...HEAD
+[0.86.2]: https://github.com/vtmocanu/uzi/compare/v0.86.1...v0.86.2
 [0.86.1]: https://github.com/vtmocanu/uzi/compare/v0.86.0...v0.86.1
 [0.86.0]: https://github.com/vtmocanu/uzi/compare/v0.85.2...v0.86.0
 [0.85.2]: https://github.com/vtmocanu/uzi/compare/v0.85.1...v0.85.2
