@@ -722,7 +722,13 @@ describe("real child", () => {
       await h.step();
       assert.equal(await h.step(), "completed");
       const env = JSON.parse(readFileSync(h.stateFile, "utf8")) as Record<string, string>;
-      assert.deepEqual(env, { ...dockerExecEnvironment(HOST), DOCKER_BUILDKIT: "1" });
+      const expected: NodeJS.ProcessEnv = { ...dockerExecEnvironment(HOST), DOCKER_BUILDKIT: "1" };
+      // Node's spawn adds this one macOS runtime variable from its parent even
+      // with an explicit env. Keep the worker-env assertion exact on every host.
+      if (process.platform === "darwin" && process.env.__CF_USER_TEXT_ENCODING !== undefined) {
+        expected.__CF_USER_TEXT_ENCODING = process.env.__CF_USER_TEXT_ENCODING;
+      }
+      assert.deepEqual(env, expected);
       configDirs.add(dockerExecEnvironment(HOST).DOCKER_CONFIG as string);
     } finally {
       if (saved === undefined) delete process.env.UZI_BUILDER_PRUNE_SECRET;
