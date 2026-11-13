@@ -29,7 +29,7 @@ function fixture(files: Record<string, string>): string {
   for (const file of ["run-unit-tests.ts", "agent-test-shards.ts", "agent-report.ts", "agent-report-reporter.ts"]) {
     cpSync(path.join(agentRoot, "test", file), path.join(root, "test", file));
   }
-  writeFileSync(path.join(root, "test-shards.json"), JSON.stringify({ "1/2": [], "2/2": [] }));
+  writeFileSync(path.join(root, "test-shards.json"), JSON.stringify({ "1/3": [], "2/3": [], "3/3": [] }));
   writeFileSync(path.join(root, "test/setup/hermetic-proc.ts"), "export {};\n");
   for (const [name, body] of Object.entries(files)) writeFileSync(path.join(root, "test", name), body);
   return root;
