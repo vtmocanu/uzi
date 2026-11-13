@@ -179,6 +179,27 @@ describe("HealthChip popover", () => {
     expect(document.activeElement).toBe(dialog());
   });
 
+  it("recovers focus when an attention refresh removes the passing-check disclosure", () => {
+    const doc = healthySilentDoc();
+    for (const check of doc.checks.slice(1)) check.severity = "warn";
+    doc.counts = { ...doc.counts, ok: 1, warn: doc.checks.length - 1 };
+    doc.status = "warn";
+    const view = mount(doc);
+    fireEvent.click(chip());
+    const summary = within(dialog()).getByText("1 other check passing");
+    summary.focus();
+    expect(document.activeElement).toBe(summary);
+
+    const next = {
+      ...doc,
+      checks: doc.checks.map((check) => ({ ...check, severity: "warn" as const })),
+      counts: { ...doc.counts, ok: 0, warn: doc.checks.length },
+    };
+    refresh(view, next);
+    expect(dialog().querySelector("details")).toBeNull();
+    expect(document.activeElement).toBe(dialog());
+  });
+
   it("does not steal outside focus on a live pass/warn transition", () => {
     render(<button type="button">elsewhere</button>);
     const view = mount(overviewNextDoc());

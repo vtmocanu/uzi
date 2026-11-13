@@ -59,7 +59,7 @@ export function HealthChip() {
     if (oldFocus && !oldFocus.isConnected && panel && !panel.contains(document.activeElement)) {
       panel.focus({ preventScroll: true });
     }
-  }, [passing, open]);
+  }, [doc, passing, open]);
 
   const close = useCallback((returnFocus: boolean) => {
     setOpen(false);
