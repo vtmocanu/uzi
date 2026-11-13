@@ -338,13 +338,23 @@ completion projection cannot be confirmed. The feed names up to five
 offending SHAs and a remaining count, or reports unreadable messages without
 a SHA. Unknown projection uses fixed copy without commit content.
 
-1. For unpublished commits on a declared or owner-partial run without Stop,
-   use `uzi run decide <id> --continue --guidance "<text>"`. Name the SHAs
-   and ask the lead to reword its own unpublished commits. The worker does
-   not rewrite history or force-push.
-2. For published history or a Stop directive, cancel and manually deliver
-   the preserved work through the recovery paths on this page. Stop resumes
-   into finalization without another lead turn. Partial and accept decisions
+1. When no offending commit is reachable from published history, on a
+   declared or owner-partial run without Stop, use
+   `uzi run decide <id> --continue --guidance "<text>"`. Name the SHAs and
+   ask the lead to reword its own unpublished commits. The worker does not
+   rewrite history or force-push. Published history is the run branch as it
+   exists on the forge and any [published checkpoint ref](#published-checkpoint-refs),
+   not the local candidate; mid-run checkpoints count. Check each offending
+   SHA with `git merge-base --is-ancestor <sha> <published tip>`. When the
+   feed shows a remaining count, the listed SHAs alone cannot settle this:
+   check every commit in the default-branch..candidate range or cancel.
+2. For an offending commit reachable from published history, a Stop
+   directive, or a hold that returns after a reword, cancel and manually
+   deliver the preserved work with corrected messages through the recovery
+   paths on this page. Continue cannot clear such a hold, because finalize
+   re-parents published checkpoint floors into the push candidate and the
+   push-time rescan refuses the same commit again. Stop resumes into
+   finalization without another lead turn. Partial and accept decisions
    cannot repair commit history.
 3. Check the available recovery evidence before replacing the worker.
    Pre-push holds skip remote checkpoint publication. If bounded capture
