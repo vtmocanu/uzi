@@ -13,13 +13,15 @@ import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { test } from "node:test";
 import { GitCache, type CheckpointRange } from "../src/git.js";
-import { RunRunner } from "../src/runner.js";
+import { FlightRetention, RunRunner, StaleClaimError } from "../src/runner.js";
 import { SteeringChannel } from "../src/steering.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import { legacyProtectedDetach } from "./legacy-protected-detach.js";
-import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runner as runnerFor } from "./runner-harness.js";
+import { StubExecutor } from "../src/executor.js";
+import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
 
 installHarness();
 const BRANCH = "agent/issue-3747", KEY = "issue-3747";
@@ -79,7 +81,15 @@ async function fixture(enrolled = true) {
     const cancel = new AbortController();
     const steering = new SteeringChannel(client, claim.run_id, 5, nullLogger(), cancel, { claimGeneration: 2 });
     // This is a fresh flight: no prior process-local remediation knowledge.
+    const retention = new FlightRetention();
     const flight: any = {
+      retention,
+      get keepGuardedInventoryOpen(): boolean { return retention.guardedInventoryOpen.value; },
+      set keepGuardedInventoryOpen(on: boolean) { retention.guardedInventoryOpen.setFlight(on); },
+      get preserveSession(): boolean { return retention.session.value; },
+      set preserveSession(on: boolean) { retention.session.setFlight(on); },
+      get preserveRecoveryClone(): boolean { return retention.recoveryClone.value; },
+      set preserveRecoveryClone(on: boolean) { retention.recoveryClone.setFlight(on); },
       runId: claim.run_id, branch: BRANCH, barePath: bare, worktreePath: clone.path, runnerClone: clone,
       runKind: "issue", claimGeneration: 2, claimGenerations: new Map(),
       runLog: nullLogger(), batcher: { emit: () => {} }, reportedPublishOutcomes: new Set(),
@@ -2015,4 +2025,694 @@ for (const transport of ["push", "pack"] as const) {
       } finally { f.runner.shutdown(); }
     });
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// issue #4246: a launch round whose bare-lock wait aborts before acquisition is retried as a fresh
+// round within a per-claim allowance. Real bare lock, real restore wrapper, no real 30s waits.
+// ---------------------------------------------------------------------------------------------
+
+type LockMethod = "readRemediationRestrictionFacts" | "readRuntimeRemediationRecovery";
+const LAUNCH_MS = 4321; // distinctive, so the clock hook recognises the round's own operation timer
+const ABORT_LINE = "launch round lock wait aborted";
+
+/** Skews Date.now and captures the first matching operation timer so a test expires a round without waiting. */
+function launchClock(t: any) {
+  const realNow = Date.now.bind(Date);
+  const realTimer = globalThis.setTimeout;
+  let skew = 0, armed = false, expires: Array<() => void> = [];
+  let frozen: number | undefined;
+  const dateMock = t.mock.method(Date, "now", () => frozen ?? realNow() + skew);
+  const timerMock = t.mock.method(globalThis, "setTimeout", (callback: () => void, delay?: number, ...rest: unknown[]) => {
+    // Every deadline-window timer is captured in arm order: index 0 is the round's outer operation, index 1
+    // the nested recovery operation the restriction-facts bootstrap opens for the same deadline.
+    if (armed && typeof delay === "number" && delay > LAUNCH_MS - 1000 && delay <= LAUNCH_MS) expires.push(callback);
+    return (realTimer as any)(callback, delay, ...rest);
+  });
+  return {
+    /** node:test restores mocks FIFO at test end, which would leave a first wrapper installed under a second
+     *  one; a caller that builds more than one clock in a test restores LIFO here instead. */
+    restore: () => { timerMock.mock.restore(); dateMock.mock.restore(); },
+    arm: () => { armed = true; expires = []; },
+    /** Pins Date.now to an absolute value (until restore), so real elapsed time cannot move it. */
+    freeze: (at: number) => { frozen = at; },
+    /** elapsed=true advances the clock past the deadline first (a real expiry); false is an early notification.
+     *  `nth` picks the captured timer: 0 the outer operation (default), 1 the nested one. */
+    fire: (elapsed: boolean, nth = 0) => {
+      const callback = expires[nth];
+      assert.ok(callback, "the round's operation timer #" + nth + " was installed (captured " + expires.length + ")");
+      expires = []; armed = false;
+      if (elapsed) skew += LAUNCH_MS;
+      callback();
+    },
+  };
+}
+
+const failedReports = (runId: string) => api.states.filter(s => s.runId === runId && s.body.status === "failed").map(s => s.body as any);
+const abortLines = (calls: unknown[][]) => calls.filter(c => c[0] === ABORT_LINE).map(c => c[1] as any);
+
+type Hold = { method: LockMethod; mode: "new_release_on_abort" | "new_until_end" | "existing" };
+
+/** Full runner.execute with an independent holder of the real bare lock injected at chosen launch rounds. */
+async function driveExecute(t: any, iid: number, decide: (site: "clone" | "launch", round: number) => Hold | undefined, opts: {
+  /** Extra RunnerOptions, e.g. a real authority runtime. */
+  extra?: Record<string, unknown>;
+  /** Runs inside every lock read made by a clone or launch round, before it proceeds. */
+  onRead?: (site: "clone" | "launch", round: number) => void;
+  /** Runs once, inside the first launch-round backoff wait, before the wait is delegated. */
+  onBackoff?: (flight: any, runner: RunRunner) => void | Promise<void>;
+  /** Expire the NESTED operation's timer (the second deadline-window timer) instead of the outer one, so the
+   *  read's wait rejects while the round's outer scope is still unaborted. */
+  nestedTimer?: boolean;
+} = {}) {
+  const claim = gitlabClaim(iid);
+  const stub = new StubExecutor(nullLogger());
+  const origRun = stub.run.bind(stub);
+  let flight: any, runs = 0, atLaunch: unknown = "unset";
+  t.mock.method(stub, "run", async (...args: Parameters<typeof origRun>) => {
+    runs++; atLaunch = flight?.remediationRestrictions; return origRun(...args);
+  });
+  const runner = runnerFor(stub, fakeGitlab().gitlab, undefined, { recoveryRetryMs: 1, ...opts.extra });
+  const subject = runner as any;
+  const defaultMs = subject.codexBoundaryDeadlineMs;
+  const clock = launchClock(t);
+  const hold = AsyncLocalStorage.bind((bare: string, entered: { release: () => void }, until: Promise<void>) =>
+    git.withBareLock(bare, async () => { entered.release(); await until; }));
+  const holders: Promise<void>[] = [], releases: Array<() => void> = [], diagnostics: unknown[][] = [];
+  const counts = { clone: 0, launch: 0 };
+  let current: { hold?: Hold; injected: boolean; release?: () => void; site: "clone" | "launch"; n: number } | undefined;
+  for (const [name, site] of [["cloneRemediationRound", "clone"], ["requireLaunchAuthority", "launch"]] as const) {
+    const orig = subject[name].bind(subject);
+    t.mock.method(subject, name, async (...args: unknown[]) => {
+      const n = ++counts[site];
+      const round = { hold: decide(site, n), injected: false, site, n } as NonNullable<typeof current>;
+      current = round;
+      if (round.hold) { subject.codexBoundaryDeadlineMs = LAUNCH_MS; clock.arm(); }
+      try { return await orig(...args); }
+      catch (error) { round.release?.(); throw error; }
+      finally { subject.codexBoundaryDeadlineMs = defaultMs; current = undefined; }
+    });
+  }
+  const gitMocks: Array<{ mock: { restore(): void } }> = [];
+  for (const method of ["readRemediationRestrictionFacts", "readRuntimeRemediationRecovery"] as const) {
+    const orig = (git[method] as (...args: any[]) => Promise<any>).bind(git);
+    gitMocks.push(t.mock.method(git, method, async (...args: any[]) => {
+      const round = current;
+      if (round) opts.onRead?.(round.site, round.n);
+      if (round?.hold && round.hold.method === method && !round.injected) {
+        round.injected = true;
+        if (round.hold.mode !== "existing") {
+          const entered = latch(), until = latch();
+          holders.push(hold(args[0], entered, until.promise));
+          await entered.promise;
+          if (round.hold.mode === "new_release_on_abort") round.release = until.release; else releases.push(until.release);
+        }
+        setImmediate(() => clock.fire(true, opts.nestedTimer ? 1 : 0));
+      }
+      return orig(...args);
+    }));
+  }
+  // Pass-through spies on the provider reap and custody settle that reportGenericFailure skips under keepCustody.
+  const custody = { reaps: 0, settles: 0 };
+  for (const [name, key] of [["reapRecoveryProviderForSettle", "reaps"], ["reapThenSettleRecoveryGeneration", "settles"],
+    ["settleRecoveryGeneration", "settles"]] as const) {
+    const orig = subject[name].bind(subject);
+    t.mock.method(subject, name, async (...args: unknown[]) => { custody[key]++; return orig(...args); });
+  }
+  const retry = subject.withLaunchLockRetry.bind(subject);
+  t.mock.method(subject, "withLaunchLockRetry", async (...args: any[]) => {
+    if (flight !== args[0]) {
+      flight = args[0];
+      const warn = flight.runLog.warn.bind(flight.runLog);
+      t.mock.method(flight.runLog, "warn", (...a: unknown[]) => { diagnostics.push(a); return warn(...a); });
+    }
+    try { return await retry(...args); }
+    catch (error) { for (const release of releases) release(); throw error; }
+  });
+  if (opts.onBackoff) {
+    const wait = subject.waitRecoveryRetry.bind(subject);
+    let backoffs = 0;
+    t.mock.method(subject, "waitRecoveryRetry", async (...args: any[]) => {
+      if (args[0] === flight && flight.launchLockRetries >= 1 && backoffs++ === 0) await opts.onBackoff!(flight, runner);
+      return wait(...args);
+    });
+  }
+  try { await runner.execute(claim); }
+  finally {
+    for (const release of releases) release();
+    await Promise.allSettled(holders);
+    runner.shutdown();
+    // Restore the globals in reverse install order, so a later driveExecute starts from unwrapped globals.
+    for (const mocked of gitMocks.reverse()) mocked.mock.restore();
+    clock.restore();
+  }
+  return { claim, flight, runs, atLaunch, counts, custody, runner, diagnostics: abortLines(diagnostics), raw: diagnostics, failed: failedReports(claim.run_id) };
+}
+
+for (const [method, label] of [["readRemediationRestrictionFacts", "restriction_facts"],
+  ["readRuntimeRemediationRecovery", "runtime_restore"]] as const) {
+  test("#4246 launch round retries a lock wait that expired before acquisition: " + label, async t => {
+    const r = await driveExecute(t, label === "restriction_facts" ? 4246 : 4247,
+      (site, round) => site === "launch" && round === 1 ? { method, mode: "new_release_on_abort" } : undefined);
+    assert.equal(r.counts.launch, 2, "one expired round, then one fresh round");
+    assert.equal(r.runs, 1, "the executor ran once");
+    assert.deepEqual(r.failed, [], "the run did not fail at startup");
+    assert.equal(r.atLaunch, undefined, "the clearable latch was lifted by the fresh round before launch");
+    assert.equal(r.diagnostics.length, 1);
+    assert.equal(r.diagnostics[0].label, label);
+    assert.equal(r.diagnostics[0].abort, "deadline");
+    assert.equal(typeof r.diagnostics[0].elapsed_ms, "number");
+    assert.deepEqual(Object.keys(r.diagnostics[0]).sort(), ["abort", "elapsed_ms", "label"]);
+  });
+}
+
+test("#4246 phaseClone round retries a lock wait that expired before acquisition", async t => {
+  const r = await driveExecute(t, 4248,
+    (site, round) => site === "clone" && round === 1 ? { method: "readRuntimeRemediationRecovery", mode: "new_release_on_abort" } : undefined);
+  assert.equal(r.counts.clone, 2);
+  assert.equal(r.counts.launch, 1);
+  assert.equal(r.runs, 1);
+  assert.deepEqual(r.failed, []);
+  assert.equal(r.atLaunch, undefined);
+  assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [["runtime_restore", "deadline"]]);
+});
+
+test("#4246 phaseClone exhaustion fails visibly after exactly three rounds and keeps the clone and custody", async t => {
+  const r = await driveExecute(t, 4249, (site, round) => site === "clone"
+    ? { method: "readRemediationRestrictionFacts", mode: round === 1 ? "new_until_end" : "existing" } : undefined);
+  assert.equal(r.counts.clone, 3, "the first round plus the two allowed retries");
+  assert.equal(r.counts.launch, 0);
+  assert.equal(r.runs, 0, "no model turn");
+  assert.equal(r.failed.length, 1, "exactly one failure report");
+  assert.match(r.failed[0].failure_reason, /local repository lock busy after bounded retries; local work and custody retained/);
+  assert.equal(r.failed[0].fail_origin, undefined);
+  assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), Array(3).fill(["restriction_facts", "deadline"]));
+  assert.equal(r.flight.preserveRecoveryClone, true);
+  assert.equal(r.flight.preserveSession, true);
+  assert.equal(fs.existsSync(r.flight.worktreePath), true, "the clone is kept");
+  assert.notEqual(command(r.flight.barePath, "config", "--get", "uzi-recovery." + r.flight.branch + ".clone"), "",
+    "the recovery journal (custody) is kept");
+  assert.deepEqual(r.custody, { reaps: 0, settles: 0 }, "keepCustody: no provider reap and no custody settle");
+});
+
+test("#4246 a launch round retries when only the nested restriction-facts timer fired and the outer scope is unaborted", async t => {
+  const r = await driveExecute(t, 4264,
+    (site, round) => site === "launch" && round === 1 ? { method: "readRemediationRestrictionFacts", mode: "new_release_on_abort" } : undefined,
+    { nestedTimer: true });
+  assert.equal(r.counts.launch, 2, "one expired round, then one fresh round");
+  assert.equal(r.runs, 1, "the executor ran once");
+  assert.deepEqual(r.failed, [], "the run did not fail at startup");
+  assert.equal(r.diagnostics.length, 1);
+  assert.equal(r.diagnostics[0].label, "restriction_facts");
+  assert.equal(r.diagnostics[0].abort, "deadline");
+});
+
+test("#4246 setFlight(false) clears the launch-retry writer, other writers are kept", () => {
+  const cleared = new FlightRetention();
+  cleared.recoveryClone.setLaunchRetry(true);
+  assert.equal(cleared.recoveryClone.value, true, "the launch-retry writer holds the flag");
+  cleared.recoveryClone.setFlight(false);
+  assert.equal(cleared.recoveryClone.value, false, "an explicit flight-level release supersedes the launch-retry writer");
+
+  const kept = new FlightRetention();
+  kept.recoveryClone.setLaunchRetry(true);
+  kept.recoveryClone.setFlight(true);
+  kept.recoveryClone.setLaunchRetry(false);
+  assert.equal(kept.recoveryClone.value, true, "a flight-level hold survives the launch-retry release");
+});
+
+const cloneJournal = (flight: any) => command(flight.barePath, "config", "--get", "uzi-recovery." + flight.branch + ".clone");
+
+test("#4246 a launch that recovers via a retry completes and retires its clone like an uncontended run", async t => {
+  const base = await driveExecute(t, 4251, () => undefined);
+  const retried = await driveExecute(t, 4252,
+    (site, round) => site === "launch" && round === 1 ? { method: "readRemediationRestrictionFacts", mode: "new_release_on_abort" } : undefined);
+  assert.equal(retried.counts.launch, 2, "one expired round, then one fresh round");
+  assert.equal(retried.runs, 1);
+  assert.deepEqual(retried.failed, []);
+  assert.equal(retried.flight.remediationRestrictions, undefined);
+  assert.equal(retried.flight.preserveRecoveryClone, base.flight.preserveRecoveryClone);
+  assert.equal(retried.flight.preserveRecoveryClone, false, "the failed round's retention was undone");
+  assert.equal(fs.existsSync(retried.flight.worktreePath), fs.existsSync(base.flight.worktreePath));
+  assert.equal(fs.existsSync(retried.flight.worktreePath), false, "the clone is retired");
+  assert.equal(cloneJournal(retried.flight), cloneJournal(base.flight));
+  assert.equal(cloneJournal(retried.flight), "", "the recovery journal is cleared");
+});
+
+test("#4246 the retry allowance is shared between the clone and launch sites", async t => {
+  const r = await driveExecute(t, 4250, (site, round) => {
+    if (site === "clone") return round === 1 ? { method: "readRemediationRestrictionFacts", mode: "new_release_on_abort" } : undefined;
+    return { method: "readRemediationRestrictionFacts", mode: round === 1 ? "new_until_end" : "existing" };
+  });
+  assert.equal(r.counts.clone, 2, "phaseClone spent one retry");
+  assert.equal(r.counts.launch, 2, "the launch site had only two rounds left");
+  assert.equal(r.runs, 0);
+  assert.equal(r.failed.length, 1);
+  assert.match(r.failed[0].failure_reason, /local repository lock busy/);
+  assert.equal(r.failed[0].fail_origin, undefined);
+  assert.equal(r.flight.launchLockRetries, 2);
+  assert.equal(r.flight.retainedDiscoveryRetries, undefined, "separate from the discovery allowance");
+  assert.deepEqual(r.custody, { reaps: 0, settles: 0 }, "keepCustody: no provider reap and no custody settle");
+});
+
+type DirectStop = "cancel" | "pause" | "credential_switch" | "shutdown" | "claim_fence";
+function applyStop(runner: RunRunner, flight: any, stop: DirectStop): void {
+  const subject = runner as any;
+  if (stop === "cancel") flight.cancel.abort(new Error("controlled cancellation"));
+  else if (stop === "pause") { flight.cancel.abort(new PauseNowSignal()); flight.steering.abortLifecycle(new PauseNowSignal(), false); }
+  else if (stop === "credential_switch") flight.steering.abortLifecycle(new CredentialSwitchSignal(), false);
+  else if (stop === "shutdown") { subject.shuttingDownGlobal = true; subject.shutdownSignal.abort(); }
+  else flight.steering.fence = "released";
+}
+
+/**
+ * The retry helper around one real launch round on a fixture flight. A holder of the real bare lock is
+ * injected at the chosen read; `during` and `expiry` then race the queued wait.
+ */
+async function directLaunch(t: any, f: Awaited<ReturnType<typeof fixture>>, opts: {
+  at: "facts" | "restore";
+  /** "just-before" freezes Date.now at the live round's deadlineAt - 10 (inside the former 20 ms slack
+   *  window, before the deadline) and then fires the round's own operation timer. */
+  expiry?: "elapsed" | "early" | "just-before" | "none";
+  during?: (flight: any, runner: RunRunner) => void;
+  afterFirstFailure?: (flight: any, runner: RunRunner) => void;
+  preset?: (flight: any) => void;
+  /** Drop the holder as soon as the first round fails, so the fresh round reads an uncontended lock. */
+  releaseAfterFirstFailure?: boolean;
+  budget?: boolean;
+  retryMs?: number;
+  breakRead?: boolean;
+  /** The real read acquires the lock, then its cause is forced to pre_read_unavailable and it throws. */
+  lateUnavailable?: boolean;
+}) {
+  const { cache, runner, subject, flight } = f.fresh();
+  flight.executor = {};
+  opts.preset?.(flight);
+  if (opts.retryMs !== undefined) subject.recoveryRetryMs = opts.retryMs;
+  subject.codexBoundaryDeadlineMs = LAUNCH_MS;
+  const clock = launchClock(t);
+  const diagnostics: unknown[][] = [];
+  t.mock.method(flight.runLog, "warn", (...a: unknown[]) => { diagnostics.push(a); });
+  const entered = latch(), release = latch();
+  const hold = AsyncLocalStorage.bind(() => cache.withBareLock(f.bare, async () => { entered.release(); await release.promise; }));
+  let holder: Promise<void> | undefined, rounds = 0, wall = 0;
+  const budget = new MaintenanceBudget(1000, () => wall);
+  const method = opts.at === "facts" ? "readRemediationRestrictionFacts" : "readRuntimeRemediationRecovery";
+  const orig = (cache[method] as (...args: any[]) => Promise<any>).bind(cache);
+  let captured: any, liveRound: any, frozenAt: number | undefined;
+  if (opts.lateUnavailable) {
+    const withProgress = (cache as any).withRemediationRestrictionProgress.bind(cache);
+    t.mock.method(cache as any, "withRemediationRestrictionProgress", (progress: any, action: any) => {
+      captured = progress; return withProgress(progress, action);
+    });
+  }
+  t.mock.method(cache, method, async (...args: any[]) => {
+    if (opts.lateUnavailable) {
+      const progress = opts.at === "facts" ? captured : args[4];
+      await orig(...args);
+      assert.equal(!!progress.started || !!progress.acquired, true, "the real read reached the lock");
+      progress.cause = "pre_read_unavailable";
+      throw new Error("late-unavailable-sentinel");
+    }
+    if (rounds === 1 && !holder && !opts.breakRead) {
+      holder = hold(); await entered.promise;
+      setImmediate(() => {
+        opts.during?.(flight, runner);
+        if (opts.budget) { wall = 5000; try { budget.check(); } catch { /* the abort is the point */ } }
+        if (opts.expiry === "just-before") {
+          assert.equal(typeof liveRound?.deadlineAt, "number", "the live round recorded its deadline");
+          frozenAt = liveRound.deadlineAt - 10;
+          clock.freeze(frozenAt!);
+          clock.fire(false);
+        } else if (opts.expiry !== "none" && !opts.budget) clock.fire((opts.expiry ?? "elapsed") === "elapsed");
+      });
+    }
+    return orig(...args);
+  });
+  if (opts.breakRead) t.mock.method(cache as any, "readRecoveryCaptureWithRaw", async () => { throw new Error("private-read-sentinel"); });
+  const round = subject.requireLaunchAuthority.bind(subject);
+  let firstError: unknown;
+  t.mock.method(subject, "requireLaunchAuthority", async (...args: unknown[]) => {
+    rounds++; clock.arm();
+    if (rounds === 1) liveRound = args[1];
+    try { return await round(...args); }
+    catch (error) {
+      if (rounds === 1) {
+        firstError = error;
+        if (opts.releaseAfterFirstFailure) release.release();
+        opts.afterFirstFailure?.(flight, runner);
+      }
+      throw error;
+    }
+  });
+  let error: any;
+  try {
+    const run = () => subject.withLaunchLockRetry(flight, (r: unknown) => subject.requireLaunchAuthority(flight, r));
+    await (opts.budget ? MaintenanceBudget.run(budget, run) : run());
+  } catch (e) { error = e; }
+  finally { release.release(); await holder; subject.codexBoundaryDeadlineMs = 5000; clock.restore(); }
+  return { error, firstError, rounds, flight, runner, subject, cache, diagnostics: abortLines(diagnostics), all: diagnostics,
+    deadlineAt: liveRound?.deadlineAt as number | undefined, frozenAt };
+}
+
+const ORIGINAL = { facts: /remediation restriction facts unavailable/, restore: /lock wait aborted/ };
+
+for (const at of ["facts", "restore"] as const) {
+  for (const stop of ["cancel", "pause", "credential_switch", "shutdown", "claim_fence"] as const) {
+    for (const phase of ["during the wait", "during backoff"] as const) {
+      test("#4246 no retry when " + stop + " lands " + phase + " (" + at + ")", async t => {
+        const f = await fixture(false);
+        const during = phase === "during the wait";
+        const r = await directLaunch(t, f, {
+          at, retryMs: during ? undefined : 300,
+          expiry: "elapsed",
+          during: during ? (flight, runner) => applyStop(runner, flight, stop) : undefined,
+          afterFirstFailure: during ? undefined : (flight, runner) => { setTimeout(() => applyStop(runner, flight, stop), 20); },
+        });
+        try {
+          assert.ok(r.error, "the stop's own control is thrown");
+          if (stop === "pause") assert.ok(r.error instanceof PauseNowSignal, "pause surfaces PauseNowSignal");
+          else if (stop === "credential_switch") assert.ok(r.error instanceof CredentialSwitchSignal, "switch surfaces CredentialSwitchSignal");
+          else if (stop === "claim_fence") assert.ok(r.error instanceof StaleClaimError, "a fence surfaces StaleClaimError");
+          else if (stop === "shutdown") assert.equal(r.error.message, "worker shutdown");
+          else {
+            assert.equal(r.error, r.flight.cancel.signal.reason, "cancel surfaces its own reason");
+            assert.equal(r.error.message, "controlled cancellation");
+          }
+          assert.doesNotMatch(String(r.error.message), ORIGINAL[at], "not the lock-read failure");
+          assert.equal(r.rounds, 1, "no fresh round");
+          assert.equal(r.diagnostics.length, 1, "exactly one diagnostic");
+          assert.equal(r.diagnostics[0].label, at === "facts" ? "restriction_facts" : "runtime_restore");
+          assert.equal(r.diagnostics[0].abort, during ? stop : "deadline");
+          if (!during) assert.equal(r.flight.launchLockRetries, 1, "the backoff was entered and then interrupted");
+        } finally { r.runner.shutdown(); }
+      });
+    }
+  }
+}
+
+// A committed cancel (steering's real commitCancel: sticky cancelled flag plus the cancel and terminal
+// aborts) must surface "run cancelled", guarding the cancel-before-terminal precedence in launchControl.
+for (const at of ["facts", "restore"] as const) {
+  for (const phase of ["during the wait", "during backoff"] as const) {
+    test("#4246 a committed cancel surfaces run cancelled " + phase + " (" + at + ")", async t => {
+      const f = await fixture(false);
+      const during = phase === "during the wait";
+      const commit = (flight: any) => (flight.steering as any).commitCancel();
+      const r = await directLaunch(t, f, {
+        at, retryMs: during ? undefined : 300, expiry: "elapsed",
+        during: during ? commit : undefined,
+        afterFirstFailure: during ? undefined : flight => { setTimeout(() => commit(flight), 20); },
+      });
+      try {
+        assert.ok(r.error, "the cancel's own control is thrown");
+        assert.equal(r.error.message, "run cancelled");
+        assert.equal(r.flight.steering.isCancelled(), true);
+        assert.equal(r.rounds, 1, "no fresh round");
+        assert.doesNotMatch(String(r.error.message), ORIGINAL[at], "not the lock-read failure");
+      } finally { r.runner.shutdown(); }
+    });
+  }
+}
+
+// Retention: a successful retry releases only what the failed round itself latched.
+for (const at of ["facts", "restore"] as const) {
+  test("#4246 a plain recovered retry leaves no clone retention behind (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, releaseAfterFirstFailure: true });
+    try {
+      assert.equal(r.error, undefined, "the fresh round succeeded");
+      assert.equal(r.rounds, 2);
+      assert.equal(r.flight.remediationRestrictions, undefined, "the clearable latch was lifted");
+      assert.equal(r.flight.preserveRecoveryClone, false);
+    } finally { r.runner.shutdown(); }
+  });
+
+  test("#4246 a retention set before the retry survives a recovered retry (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, releaseAfterFirstFailure: true, preset: flight => { flight.preserveRecoveryClone = true; } });
+    try {
+      assert.equal(r.error, undefined);
+      assert.equal(r.rounds, 2);
+      assert.equal(r.flight.remediationRestrictions, undefined, "the latch cleared");
+      assert.equal(r.flight.preserveRecoveryClone, true, "another path's retention is not undone");
+    } finally { r.runner.shutdown(); }
+  });
+
+  test("#4246 a retention set during the backoff survives a recovered retry (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, {
+      at, releaseAfterFirstFailure: true, retryMs: 300,
+      afterFirstFailure: flight => { setTimeout(() => { flight.preserveRecoveryClone = true; }, 20); },
+    });
+    try {
+      assert.equal(r.error, undefined);
+      assert.equal(r.rounds, 2);
+      assert.equal(r.flight.remediationRestrictions, undefined, "the latch cleared");
+      assert.equal(r.flight.preserveRecoveryClone, true, "a retention taken while waiting is not undone");
+    } finally { r.runner.shutdown(); }
+  });
+}
+
+// Control surfacing: an unrecognized or terminal stop around a lock-wait abort.
+for (const at of ["facts", "restore"] as const) {
+  for (const phase of ["during the wait", "during backoff"] as const) {
+    const during = phase === "during the wait";
+    const timing = (apply: (flight: any) => void) => ({
+      at, retryMs: during ? undefined : 300, expiry: "elapsed" as const,
+      during: during ? apply : undefined,
+      afterFirstFailure: during ? undefined : (flight: any) => { setTimeout(() => apply(flight), 20); },
+    });
+
+    test("#4246 an unrecognized lifecycle abort rethrows the original lock-read error " + phase + " (" + at + ")", async t => {
+      const f = await fixture(false);
+      const r = await directLaunch(t, f, timing(flight => flight.steering.abortLifecycle(new Error("unrecognized"), false)));
+      try {
+        assert.ok(r.firstError, "the first round failed");
+        assert.equal(r.error, r.firstError, "the original error object is rethrown unchanged");
+        assert.equal(r.rounds, 1);
+        assert.equal(r.diagnostics.length, 1);
+        assert.equal(r.diagnostics[0].abort, during ? "unknown" : "deadline");
+      } finally { r.runner.shutdown(); }
+    });
+
+    test("#4246 a terminal abort surfaces its own reason " + phase + " (" + at + ")", async t => {
+      const f = await fixture(false);
+      const sentinel = new Error("terminal-sentinel");
+      const r = await directLaunch(t, f, timing(flight => flight.steering.abortLifecycle(sentinel, true)));
+      try {
+        assert.equal(r.error, sentinel);
+        assert.equal(r.rounds, 1);
+        assert.equal(r.diagnostics[0].abort, during ? "terminal" : "deadline");
+      } finally { r.runner.shutdown(); }
+    });
+  }
+}
+
+// Execute level: a pause or credential switch landing in the backoff takes its normal control path.
+for (const stop of ["pause", "credential_switch"] as const) {
+  test("#4246 an owner " + stop + " arriving during the launch backoff ends in its control handling, not a failure", async t => {
+    const r = await driveExecute(t, stop === "pause" ? 4261 : 4262,
+      (site, round) => site === "launch" && round === 1 ? { method: "readRemediationRestrictionFacts", mode: "new_release_on_abort" } : undefined,
+      { onBackoff: (flight, runner) => applyStop(runner, flight, stop) });
+    assert.equal(r.counts.launch, 1, "no fresh round after the stop");
+    assert.equal(r.runs, 0, "no model turn");
+    assert.deepEqual(r.failed.map(s => s.failure_reason), [], "not a failed / agent_failure report");
+    const seen = api.states.filter(s => s.runId === r.claim.run_id).map(s => String(s.body.status));
+    // The PauseNowSignal arm runs handlePausePark: it reports "paused" on a park, or "pause_failed" and leaves
+    // the run running when no checkpoint exists yet (this pre-launch case). Either way it is never "failed".
+    if (stop === "pause") assert.ok(seen.includes("paused") || seen.includes("pause_failed"), "the pause was handled: " + seen.join(","));
+    else assert.ok(seen.some(s => s.startsWith("credential_switch")), "the switch was handled: " + seen.join(","));
+  });
+}
+
+// A real authority runtime around the retry: every round is its own transaction and none spans the backoff.
+test("#4246 an authority-backed retry takes a fresh transaction per round and holds none across the backoff", async t => {
+  const lifetime = await acquireWorkerLifetime(fx.dataDir, testLockOptions());
+  const authority = new AuthorityRuntime({ lifetime, workerToken: "fixture-worker", timeoutMs: 5000 });
+  const roundTransactions = new Map<number, unknown>();
+  let backoffTransaction: unknown = "unset", independentTransaction = false;
+  const r = await driveExecute(t, 4263,
+    (site, round) => site === "launch" && round === 1 ? { method: "readRemediationRestrictionFacts", mode: "new_release_on_abort" } : undefined,
+    {
+      extra: { authority },
+      onRead: (site, round) => { if (site === "launch" && !roundTransactions.has(round)) roundTransactions.set(round, activeAuthorityTransaction(lifetime)); },
+      onBackoff: async () => {
+        backoffTransaction = activeAuthorityTransaction(lifetime);
+        await authority.withTransaction(async () => {});
+        independentTransaction = true;
+      },
+    });
+  assert.equal(r.counts.launch, 2);
+  assert.deepEqual([...roundTransactions.keys()], [1, 2]);
+  const [first, second] = [roundTransactions.get(1), roundTransactions.get(2)];
+  assert.ok(first, "round 1 read inside an authority transaction");
+  assert.ok(second, "round 2 read inside an authority transaction");
+  assert.notEqual(first, second, "a different transaction per round");
+  assert.equal(backoffTransaction, undefined, "no transaction is held across the backoff");
+  assert.equal(independentTransaction, true, "an independent transaction completed during the backoff");
+  assert.equal(r.runs, 1, "the executor ran once");
+  assert.deepEqual(r.failed, []);
+});
+
+for (const at of ["facts", "restore"] as const) {
+  test("#4246 an unidentified abort is classified unknown and not retried (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, budget: true });
+    try {
+      assert.ok(r.error);
+      assert.equal(r.rounds, 1);
+      assert.equal(r.flight.launchLockRetries, undefined);
+      assert.deepEqual(r.diagnostics.map(d => d.abort), ["unknown"]);
+    } finally { r.runner.shutdown(); }
+  });
+
+  test("#4246 an early timer notification before the deadline elapsed is unknown and not retried (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, expiry: "early" });
+    try {
+      assert.ok(r.error);
+      assert.match(String(r.error.message), ORIGINAL[at]);
+      assert.equal(r.rounds, 1);
+      assert.equal(r.flight.launchLockRetries, undefined);
+      assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [[at === "facts" ? "restriction_facts" : "runtime_restore", "unknown"]]);
+    } finally { r.runner.shutdown(); }
+  });
+
+  // Pins the exact deadline predicate: an own-timer abort observed 10 ms before the round's deadline (inside
+  // the window a former 20 ms tolerance accepted) is unknown and fails closed, never retried.
+  test("#4246 an abort 10 ms before the round's deadline is unknown and not retried (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, expiry: "just-before" });
+    try {
+      assert.equal(typeof r.deadlineAt, "number");
+      assert.equal(r.frozenAt, r.deadlineAt! - 10, "Date.now frozen at the live round's deadline - 10");
+      assert.ok(r.frozenAt! < r.deadlineAt! && r.frozenAt! >= r.deadlineAt! - 20, "inside the former slack window");
+      assert.ok(r.error);
+      assert.match(String(r.error.message), ORIGINAL[at]);
+      assert.equal(r.error, r.firstError, "the original round error is rethrown unchanged");
+      assert.equal(r.rounds, 1, "no fresh round");
+      assert.equal(r.flight.launchLockRetries, undefined);
+      assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [[at === "facts" ? "restriction_facts" : "runtime_restore", "unknown"]]);
+    } finally { r.runner.shutdown(); }
+  });
+
+  test("#4246 a pre-existing sticky latch is never retried or lifted (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, preset: flight => { flight.remediationRestrictions = { roots: [], clearable: false }; } });
+    try {
+      assert.ok(r.error);
+      assert.equal(r.rounds, 1);
+      assert.equal(r.flight.remediationRestrictions.clearable, false);
+      assert.deepEqual(r.diagnostics.map(d => d.abort), ["deadline"], "the abort is still diagnosed once");
+    } finally { r.runner.shutdown(); }
+  });
+
+  test("#4246 a successor capture is never retried (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, preset: flight => { flight.predecessorCapture = true; } });
+    try {
+      assert.ok(r.error);
+      assert.equal(r.rounds, 1);
+      assert.equal(r.flight.remediationRestrictions.clearable, false);
+      assert.equal(r.flight.launchLockRetries, undefined);
+      assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [[at === "facts" ? "restriction_facts" : "runtime_restore", "deadline"]]);
+    } finally { r.runner.shutdown(); }
+  });
+}
+
+test("#4246 a denial landing during the real restore lock wait stays sticky and is not retried", async t => {
+  const f = await fixture(false);
+  const r = await directLaunch(t, f, { at: "restore", during: flight => {
+    (flight.remediationRestrictions ??= { roots: [] }).clearable = false;
+    flight.remediationDenialRevision = (flight.remediationDenialRevision ?? 0) + 1;
+  } });
+  try {
+    assert.ok(r.error);
+    assert.equal(r.rounds, 1, "no fresh round and no launch");
+    assert.equal(r.flight.remediationRestrictions.clearable, false, "the concurrent denial is not made clearable");
+    assert.deepEqual(r.diagnostics.map(d => [d.label, d.abort]), [["runtime_restore", "deadline"]]);
+  } finally { r.runner.shutdown(); }
+});
+
+for (const at of ["facts", "restore"] as const) {
+  test("#4246 a read that acquired the lock stays sticky even if its cause is forced to pre_read_unavailable (" + at + ")", async t => {
+    const f = await fixture(false);
+    const r = await directLaunch(t, f, { at, lateUnavailable: true });
+    try {
+      assert.ok(r.error);
+      assert.match(String(r.error.message), /late-unavailable-sentinel|unavailable/);
+      assert.equal(r.rounds, 1, "no retry");
+      assert.ok(r.flight.remediationRestrictions, "a latch is held");
+      assert.equal(r.flight.remediationRestrictions.clearable, false, "the latch is sticky");
+      assert.deepEqual(r.diagnostics, [], "no lock-wait diagnostic");
+      assert.equal(r.flight.launchLockRetries, undefined);
+    } finally { r.runner.shutdown(); }
+  });
+}
+
+test("#4246 a restore failure after the lock was acquired is sticky and carries no lock-wait diagnostic", async t => {
+  const f = await fixture(false);
+  const r = await directLaunch(t, f, { at: "restore", breakRead: true });
+  try {
+    assert.ok(r.error);
+    assert.equal(r.rounds, 1);
+    assert.equal(r.flight.remediationRestrictions.clearable, false);
+    assert.deepEqual(r.diagnostics, []);
+    assert.equal(r.flight.launchLockRetries, undefined);
+    assert.equal(JSON.stringify(r.all).includes("private-read-sentinel"), false);
+  } finally { r.runner.shutdown(); }
+});
+
+test("#4246 the lock-wait diagnostic carries no path, ref or message", async t => {
+  const f = await fixture(false);
+  const r = await directLaunch(t, f, { at: "facts", expiry: "elapsed" });
+  try {
+    const text = JSON.stringify(r.all);
+    for (const secret of [f.bare, BRANCH, f.base, "boundary deadline"]) assert.equal(text.includes(secret), false, secret);
+  } finally { r.runner.shutdown(); }
+});
+
+for (const enrolled of [false, true]) {
+  test("#4246 teardown revalidation of a restore-site latch: " + (enrolled ? "enrolled journal stays held" : "clearable latch lifts only on a fresh unenrolled read"), async t => {
+    const f = await sourceImportFixture(enrolled);
+    f.subject.codexBoundaryDeadlineMs = LAUNCH_MS;
+    const clock = launchClock(t);
+    const entered = latch(), release = latch();
+    const hold = AsyncLocalStorage.bind(() => f.cache.withBareLock(f.bare, async () => { entered.release(); await release.promise; }));
+    let holder: Promise<void> | undefined;
+    const orig = f.cache.readRuntimeRemediationRecovery.bind(f.cache);
+    t.mock.method(f.cache, "readRuntimeRemediationRecovery", async (...args: Parameters<typeof orig>) => {
+      if (!holder) {
+        holder = hold(); await entered.promise;
+        setImmediate(() => clock.fire(true));
+      }
+      return orig(...args);
+    });
+    const round: any = { startedAt: Date.now() };
+    clock.arm();
+    try {
+      await assert.rejects(f.subject.requireLaunchAuthority(f.flight, round));
+    } finally { release.release(); await holder; f.subject.codexBoundaryDeadlineMs = 5000; }
+    try {
+      assert.equal(round.lockWait, "runtime_restore");
+      assert.ok(f.flight.remediationRestrictions, "a latch is left at the end of the flight");
+      assert.equal(f.flight.remediationRestrictions.clearable, !enrolled);
+      let published = 0;
+      t.mock.method(f.subject, "publishFlightSource", async () => { published++; return "published"; });
+      const facts = t.mock.method(f.cache, "readRemediationRestrictionFacts");
+      f.flight.completionSourceBound = { clonePath: f.clone.path };
+      f.flight.sourceTailsJoined = true;
+      const end = await f.subject.endFlightSourceUse(f.flight, nullLogger());
+      if (enrolled) {
+        assert.ok(f.flight.remediationRestrictions, "latch kept");
+        assert.equal(published, 0, "no publication under an enrolled journal");
+        assert.deepEqual(end.endedSlots, []);
+      } else {
+        assert.ok(facts.mock.callCount() >= 1, "a fresh facts read was made");
+        assert.equal(f.flight.remediationRestrictions, undefined, "verified absence cleared the latch");
+        assert.equal(published, 1);
+      }
+    } finally { f.runner.shutdown(); }
+  });
 }

@@ -1464,6 +1464,25 @@ class RetainedDiscoveryExhaustedError extends Error {
   constructor() { super("retained recovery discovery retries exhausted"); }
 }
 
+/** Thrown by withLaunchLockRetry when fresh launch-round retries (shared per claim) found the bare lock
+ *  still busy. A visible failure that keeps local work and custody; never a silent loop. */
+class LaunchLockBusyError extends Error {
+  constructor() { super("local repository lock busy after bounded retries; local work and custody retained"); }
+}
+
+/** One attempt of a launch-time remediation round (see withLaunchLockRetry). The round fills it in as it
+ *  runs so the retry helper can tell a lock wait that aborted before acquisition from any other failure. */
+type LaunchRound = {
+  startedAt: number;
+  deadlineAt?: number;
+  scope?: AbortSignal;
+  /** The signal the labelled lock wait actually ran under: the bootstrap's nested recovery-operation
+   *  scope for "restriction_facts" (its own deadline timer can fire before `scope` aborts), or `scope`
+   *  itself for "runtime_restore", which reads directly in the outer operation. */
+  lockScope?: AbortSignal;
+  lockWait?: "restriction_facts" | "runtime_restore";
+};
+
 /** Message of the lock-wait abort in git.ts (GIT_LOCK_WAIT_ABORT_MESSAGE, not exported). */
 const RETAINED_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
 const RETAINED_DEADLINE_TEXT = "recovery deadline exhausted";
@@ -2540,16 +2559,24 @@ type MemoryFlight = {
  * writer; the pending-policy admission is a second, independent writer. A flag reads true while any
  * writer holds it, so releasing the admission after a successful reconciliation clears only what the
  * admission itself added: retained recovery, capture seeding and the retainedEpisode/predecessorCapture
- * vetoes keep theirs.
+ * vetoes keep theirs. A third writer, the launch-round retry (withLaunchLockRetry), holds the
+ * recovery-clone flag only for what a failed launch round latched; a successful retry releases that
+ * writer alone, while any explicit flight-level write (setFlight) supersedes it, so a retention another
+ * path asked for before or during the backoff is never undone.
  */
 class RetentionFlag {
   private byFlight = false;
   private byAdmission = false;
-  get value(): boolean { return this.byFlight || this.byAdmission; }
-  setFlight(on: boolean): void { this.byFlight = on; }
+  private byLaunchRetry = false;
+  get value(): boolean { return this.byFlight || this.byAdmission || this.byLaunchRetry; }
+  setFlight(on: boolean): void {
+    this.byFlight = on;
+    if (!on) this.byLaunchRetry = false;
+  }
   setAdmission(on: boolean): void { this.byAdmission = on; }
+  setLaunchRetry(on: boolean): void { this.byLaunchRetry = on; }
 }
-class FlightRetention {
+export class FlightRetention {
   readonly recoveryClone = new RetentionFlag();
   readonly session = new RetentionFlag();
   readonly guardedInventoryOpen = new RetentionFlag();
@@ -2723,6 +2750,10 @@ interface RunFlight {
   retainedLocalCustody?: boolean;
   /** Retries spent by discoverRetained on confirmed operational errors; in-memory, per claim. */
   retainedDiscoveryRetries?: number;
+  /** Fresh launch-round retries spent by withLaunchLockRetry after a bare-lock wait aborted before
+   *  acquisition; in-memory, per claim, shared by the phaseClone and executor-launch sites and
+   *  separate from retainedDiscoveryRetries. */
+  launchLockRetries?: number;
   ciEvidence?: PreparedCIEvidence;
   /** issue #3644: what an independent restore seeded this flight from, for the feed line phaseResume emits. */
   restoreSeedNote?: { captureId: string; generation: number; sourceSha: string };
@@ -4148,7 +4179,7 @@ export class RunRunner {
    * The executor-launch gate: with an authority runtime, the executor is not started on a clone unless the
    * flight's lease is the current lease for that clone and (Codex) carries this executor's incarnation.
    */
-  private async requireLaunchAuthority(flight: RunFlight): Promise<() => void> {
+  private async requireLaunchAuthority(flight: RunFlight, round?: LaunchRound): Promise<() => void> {
     // Capture before the first wait, including source-use authority acquisition.
     const denialRevision = flight.remediationDenialRevision ?? 0;
     let record: RemediationRecovery | undefined;
@@ -4182,11 +4213,16 @@ export class RunRunner {
       }
     };
     // Restrictions apply even on workers without a source-use authority runtime.
-    await this.inFlightAuthority(flight, () => this.withRemediationLifecycle(this.retainedLifecycleSignal(flight), async () => {
+    await this.inFlightAuthority(flight, () => {
+      // The clock starts after A is held; a round records it so the retry helper can classify expiry.
+      const deadlineAt = Date.now() + this.codexBoundaryDeadlineMs;
+      if (round) round.deadlineAt = deadlineAt;
+      return this.withRemediationLifecycle(this.retainedLifecycleSignal(flight), async scope => {
+      if (round) round.scope = scope;
       recordBarePath = flight.barePath;
-      const negative = await this.bootstrapRemediationRestrictions(flight);
+      const negative = await this.bootstrapRemediationRestrictions(flight, undefined, undefined, undefined, undefined, round);
       if (negative.kind === "unavailable") throw new Error("remediation restriction facts unavailable");
-      record = await this.restoreRemediationRestrictions(flight);
+      record = await this.restoreRemediationRestrictions(flight, round);
       checkRemediation();
       if (!record) return;
       const scan = await this.scanRemediationRange(flight, flight.barePath!, flight.branch!, record.ownedTip, { explicitTip: true });
@@ -4201,7 +4237,8 @@ export class RunRunner {
       for (const root of flight.remediationRestrictions!.roots)
         if (await this.git.ancestry(flight.barePath!, root, record.ownedTip) !== "divergent")
           throw new Error("remediation continuation history restricted");
-    }), this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+      }, deadlineAt);
+    }, this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
     if (this.authority && flight.runnerClone)
       await this.authority.assertLaunchable(flight.runnerClone.path, flight.sourceLease, flight.executor.executorIncarnation,
         this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
@@ -4209,6 +4246,111 @@ export class RunRunner {
     // a denial can latch during the promise-resolution gap before the caller resumes.
     checkRemediation();
     return checkRemediation;
+  }
+
+  /** The phaseClone remediation round: one bounded bootstrap + restore under A, with today's errors. */
+  private async cloneRemediationRound(flight: RunFlight, round?: LaunchRound): Promise<void> {
+    await this.inFlightAuthority(flight, () => {
+      const deadlineAt = Date.now() + this.codexBoundaryDeadlineMs;
+      if (round) round.deadlineAt = deadlineAt;
+      return this.withRemediationLifecycle(this.retainedLifecycleSignal(flight), async scope => {
+        if (round) round.scope = scope;
+        const negative = await this.bootstrapRemediationRestrictions(flight, undefined, undefined, undefined, undefined, round);
+        if (negative.kind === "unavailable") throw new Error("remediation restriction facts unavailable");
+        await this.restoreRemediationRestrictions(flight, round);
+      }, deadlineAt);
+    }, this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+  }
+
+  /** Non-throwing: which owner/lifecycle stop, if any, is in force for this flight's launch rounds. */
+  private launchStop(flight: RunFlight):
+    "claim_fence" | "terminal" | "shutdown" | "credential_switch" | "pause" | "cancel" | "unknown" | undefined {
+    if (flight.steering.claimFence() !== undefined) return "claim_fence";
+    if (flight.steering.terminalLifecycleSignal().aborted) return "terminal";
+    if (this.shutdownSignal.signal.aborted || flight.active?.shuttingDown || this.shuttingDownGlobal) return "shutdown";
+    if (flight.steering.isCancelled()) return "cancel";
+    for (const signal of this.retainedLifecycleSignals(flight)) {
+      if (!signal.aborted) continue;
+      if (signal.reason instanceof CredentialSwitchSignal) return "credential_switch";
+      if (signal.reason instanceof PauseNowSignal) return "pause";
+      return signal === flight.cancel.signal ? "cancel" : "unknown";
+    }
+    return undefined;
+  }
+
+  /**
+   * Runs one launch-time remediation round at a time. A round whose bare-lock wait aborted before the lock
+   * was acquired, only because its own deadline expired, is retried as a fresh round (new A acquisition,
+   * new clock) within a per-claim allowance. A recognised owner/lifecycle stop surfaces its own control
+   * through launchControl; only an unknown stop or another failure rethrows the original error. "Its own
+   * deadline" means the scope the labelled wait ran under (round.lockScope) aborted with
+   * RecoveryDeadlineExhaustedError and Date.now() has reached the round's deadline; an abort before then
+   * (an enclosing deadline, an early notification) is unknown and fails closed. The allowance is shared by
+   * every call site and separate from retainedDiscoveryRetries.
+   */
+  private async withLaunchLockRetry<T>(flight: RunFlight, run: (round: LaunchRound) => Promise<T>): Promise<T> {
+    // A failed round's catch holds the recovery-clone retention through the launch-retry writer (see
+    // RetentionFlag), alongside the clearable restriction latch. When a later round recovers (the fresh
+    // verified read cleared the latch), the run is uncontended again, so only that writer is released;
+    // a retention any other path asked for, before or during the backoff, stays. Otherwise terminal
+    // retirement would keep the clone and journal of a run that completed normally.
+    let retriedHere = false;
+    for (;;) {
+      const round: LaunchRound = { startedAt: Date.now() };
+      try {
+        const result = await run(round);
+        if (retriedHere && flight.remediationRestrictions === undefined)
+          flight.retention.recoveryClone.setLaunchRetry(false);
+        return result;
+      } catch (error) {
+        if (!round.lockWait) throw error;
+        const stop = this.launchStop(flight);
+        // Only a scope that actually aborted with RecoveryDeadlineExhaustedError qualifies, and that error is
+        // raised only by the deadline timer and the `Date.now() >= deadline` pre-checks.
+        const cls = stop ?? (round.deadlineAt !== undefined &&
+          Date.now() >= round.deadlineAt &&
+          round.lockScope?.aborted === true && round.lockScope.reason instanceof RecoveryDeadlineExhaustedError
+          ? "deadline" : "unknown");
+        try {
+          flight.runLog.warn("launch round lock wait aborted",
+            { label: round.lockWait, elapsed_ms: Date.now() - round.startedAt, abort: cls });
+        } catch { /* Diagnostics must not change the launch outcome. */ }
+        if (cls !== "deadline" || flight.predecessorCapture || flight.remediationRestrictions?.clearable !== true)
+          throw stop !== undefined ? this.launchControl(flight, error) : error;
+        const retry = (flight.launchLockRetries ?? 0) + 1;
+        // Exhaustion only throws; the execute catch arm for LaunchLockBusyError sets the retention flags.
+        if (retry > RETAINED_DISCOVERY_RETRIES) throw new LaunchLockBusyError();
+        flight.launchLockRetries = retry;
+        retriedHere = true;
+        await this.waitRecoveryRetry(flight, true, this.recoveryRetryMs * 2 ** (retry - 1),
+          this.retainedLifecycleSignal(flight)).catch(() => undefined);
+        if (this.launchStop(flight)) throw this.launchControl(flight, error);
+      }
+    }
+  }
+
+  /**
+   * The error a launch round surfaces when an owner/lifecycle stop is in force, so dispatchFailure sees
+   * the stop's own control (pause, credential switch, cancel, shutdown, terminal reason, claim fence)
+   * instead of the lock-read failure that the stop cut short. An unrecognized stop yields `original`
+   * unchanged. Precedence mirrors the interrupted() guard of the publication reconciliation loop; cancel
+   * precedes terminal because a committed cancel also aborts the terminal lifecycle.
+   */
+  private launchControl(flight: RunFlight, original: unknown): unknown {
+    if (flight.steering.claimFence() !== undefined) return new StaleClaimError();
+    if (flight.steering.isCancelled()) return new Error("run cancelled");
+    if (this.shutdownSignal.signal.aborted || flight.active?.shuttingDown || this.shuttingDownGlobal)
+      return new Error("worker shutdown");
+    const terminal = flight.steering.terminalLifecycleSignal();
+    if (terminal.aborted) return terminal.reason;
+    for (const signal of this.retainedLifecycleSignals(flight)) {
+      if (!signal.aborted) continue;
+      const reason: unknown = signal.reason;
+      if (reason instanceof PauseNowSignal || reason instanceof CredentialSwitchSignal) return reason;
+      if (signal === flight.cancel.signal) return reason;
+      break;
+    }
+    return original;
   }
 
   private rememberRemediationRestrictions(flight: RunFlight, journal: RecoveryJournalEntry): void {
@@ -4221,7 +4363,7 @@ export class RunRunner {
   }
 
   /** Reuse Git's inherited operation scope; the caller retains A until owned work settles. */
-  private withRemediationLifecycle<T>(signal: AbortSignal | undefined, action: () => Promise<T>, deadlineAt?: number, progress?: RemediationRestrictionProgress): Promise<T> {
+  private withRemediationLifecycle<T>(signal: AbortSignal | undefined, action: (signal: AbortSignal) => Promise<T>, deadlineAt?: number, progress?: RemediationRestrictionProgress): Promise<T> {
     // Explicit cleanup selects its bounded lifecycle; ordinary live work defaults to global shutdown.
     // Selecting a lifecycle does not authenticate a source or grant source-use permission.
     return this.git.withRecoveryOperation(
@@ -4236,6 +4378,7 @@ export class RunRunner {
    */
   private async bootstrapRemediationRestrictions(
     flight: RunFlight, barePath = flight.barePath, branch = flight.branch, signal?: AbortSignal, deadlineAt?: number,
+    round?: LaunchRound,
   ): Promise<{ kind: "confirmed"; enrolled: boolean } | { kind: "unavailable" }> {
     if (!barePath && !branch && !flight.worktreePath && !flight.remediationRestrictions)
       return { kind: "confirmed", enrolled: false }; // Repo-less flight.
@@ -4252,11 +4395,14 @@ export class RunRunner {
         progress.cause = facts.blocked ? "blocked" : "enrolled_observed";
       }
     } };
+    let readScope: AbortSignal | undefined;
     try {
       if (!barePath || !branch) { progress.cause = "identity"; throw new Error("restriction identity unavailable"); }
-      const facts = await this.withRemediationLifecycle(signal, () =>
-        this.git.withRemediationRestrictionProgress(progress, () =>
-          this.git.readRemediationRestrictionFacts(barePath, branch, runId)), deadlineAt, progress);
+      const facts = await this.withRemediationLifecycle(signal, nested => {
+        readScope = nested;
+        return this.git.withRemediationRestrictionProgress(progress, () =>
+          this.git.readRemediationRestrictionFacts(barePath, branch, runId));
+      }, deadlineAt, progress);
       // Also observe mocked readers that return facts without invoking the channel.
       progress.observe!(facts);
       if (facts.blocked) throw new Error("restriction evidence is custody only");
@@ -4267,6 +4413,13 @@ export class RunRunner {
           this.remediationLatchIsEmpty(flight)) delete flight.remediationRestrictions;
       return { kind: "confirmed", enrolled: facts.enrolled };
     } catch {
+      // Independent of latch clearability: only the lock-wait stage matters to a launch-round retry.
+      if (round && progress.cause === "pre_read_unavailable" && !progress.started && !progress.acquired) {
+        round.lockWait = "restriction_facts";
+        // The nested scope the read ran under; if the nested operation rejected before its action started,
+        // no nested scope exists and the outer round scope is the only signal to judge.
+        round.lockScope = readScope ?? round.scope;
+      }
       const existed = flight.remediationRestrictions;
       const state = flight.remediationRestrictions ??= { roots: [] };
       // Existing, injected and successor-capture latches can never acquire clearable provenance.
@@ -4279,7 +4432,9 @@ export class RunRunner {
         ? current + 1 : -1;
       try { this.log.warn("remediation restriction read unavailable", { class: progress.cause ?? "unknown" }); }
       catch { /* Diagnostics must not interrupt custody preservation. */ }
-      flight.preserveRecoveryClone = true;
+      // A launch round's latch is the retry writer's, so a recovered retry releases only that.
+      if (round) flight.retention.recoveryClone.setLaunchRetry(true);
+      else flight.preserveRecoveryClone = true;
       return { kind: "unavailable" };
     }
   }
@@ -4300,7 +4455,9 @@ export class RunRunner {
 
   /** Query the journal without discovery or normalization side effects. The exact attempt
    * comes from the worker-selected source, not from the evidence being authenticated. */
-  private async restoreRemediationRestrictions(flight: RunFlight): Promise<RemediationRecovery | undefined> {
+  private async restoreRemediationRestrictions(flight: RunFlight, round?: LaunchRound): Promise<RemediationRecovery | undefined> {
+    const before = flight.remediationRestrictions;
+    const progress: RemediationRestrictionProgress | undefined = round ? { cause: "unknown" } : undefined;
     try {
       if (!flight.barePath && !flight.branch && !flight.worktreePath) {
         if (flight.remediationRestrictions) throw new Error("remediation source identity unavailable");
@@ -4311,7 +4468,7 @@ export class RunRunner {
         throw new Error("remediation source identity unavailable");
       const attemptId = flight.predecessorCapture ? flight.remediationPredecessorAttempt : flight.runnerClone?.attemptId;
       const record = await this.git.readRuntimeRemediationRecovery(flight.barePath, flight.branch,
-        { runId: flight.runId, clonePath: flight.worktreePath, ...(attemptId ? { attemptId } : {}) });
+        { runId: flight.runId, clonePath: flight.worktreePath, ...(attemptId ? { attemptId } : {}) }, undefined, progress);
       if (!record) {
         if (flight.remediationRestrictions) throw new Error("remediation enrollment disappeared");
         return undefined;
@@ -4321,8 +4478,24 @@ export class RunRunner {
       state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from), ...(record.excludedRoots ?? [])])];
       return record;
     } catch (error) {
-      // An unreadable enrollment is held, rather than silently treated as absent.
-      (flight.remediationRestrictions ??= { roots: [] }).clearable = false;
+      const preAcquisition = !!progress && progress.cause === "pre_read_unavailable" && !progress.started && !progress.acquired;
+      if (round && preAcquisition) {
+        round.lockWait = "runtime_restore";
+        round.lockScope = round.scope; // Read directly in the outer operation (git.readRuntimeRemediationRecovery withLock).
+      }
+      if (round && preAcquisition && before === undefined && flight.remediationRestrictions === undefined &&
+          !flight.predecessorCapture) {
+        // A lock wait that never acquired B saw no journal bytes: hold the launch as clearable so a fresh
+        // facts read can lift it, with the same denial-revision rule as the bootstrap catch.
+        flight.remediationRestrictions = { roots: [], clearable: true };
+        const current = flight.remediationDenialRevision ?? 0;
+        flight.remediationDenialRevision = Number.isSafeInteger(current) && current >= 0 && current < Number.MAX_SAFE_INTEGER
+          ? current + 1 : -1;
+        flight.retention.recoveryClone.setLaunchRetry(true);
+      } else {
+        // An unreadable enrollment is held, rather than silently treated as absent.
+        (flight.remediationRestrictions ??= { roots: [] }).clearable = false;
+      }
       throw error;
     }
   }
@@ -6683,6 +6856,12 @@ export class RunRunner {
         flight.keepGuardedInventoryOpen = true;
         flight.stoppedSourceKept = true;
         flight.sourceExitDenied = true;
+        await this.reportGenericFailure(claim, flight, err, { keepCustody: true });
+      } else if (err instanceof LaunchLockBusyError && !flight.steering.isCancelled()) {
+        // Bounded launch-round retries found the local repository lock still busy: end visibly with the
+        // clone, session and custody kept (no fail_origin, no model turn ran).
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
         await this.reportGenericFailure(claim, flight, err, { keepCustody: true });
       } else if (codexDeferralOf(err) !== undefined) {
         // Codex credentials were deferred by a vault lock, an unknown boundary refresh,
@@ -14757,11 +14936,7 @@ export class RunRunner {
       /^[0-9a-f]{40}$/.test(flight.runnerClone.adoptedSource) ? flight.runnerClone.adoptedSource : undefined;
     await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId,
       peeledMarker);
-    await this.inFlightAuthority(flight, () => this.withRemediationLifecycle(this.retainedLifecycleSignal(flight), async () => {
-      const negative = await this.bootstrapRemediationRestrictions(flight);
-      if (negative.kind === "unavailable") throw new Error("remediation restriction facts unavailable");
-      await this.restoreRemediationRestrictions(flight);
-    }), this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+    await this.withLaunchLockRetry(flight, round => this.cloneRemediationRound(flight, round));
     batcher.emit({
       kind: "status",
       agent: "worker",
@@ -17853,7 +18028,7 @@ export class RunRunner {
         flight.evidenceProcessJoined = undefined;
         if (flight.evidenceCommands) flight.evidenceCommands.confirmed = false;
         // issue #3404 M2 U3: never start the executor on a clone whose source-use epoch is not this flight's.
-        const checkRemediation = await this.requireLaunchAuthority(flight);
+        const checkRemediation = await this.withLaunchLockRetry(flight, round => this.requireLaunchAuthority(flight, round));
         let execution: Promise<ExecutorResult>;
         checkRemediation();
         try { execution = executor.run(ctx); }
