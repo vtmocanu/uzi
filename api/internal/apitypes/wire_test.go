@@ -958,6 +958,10 @@ var workerDTOKeys = []string{
 	// Issue #3142: when the api first gated this worker's run-lane claims for lost memory
 	// authority (api clock). Null when not gated; overlaid from an in-process tracker.
 	"memory_authority_lost_at",
+	// PRD #4205: worker hibernation lifecycle. hibernation_state is always present;
+	// the reason, hibernated_at, wake_requested_at and wake_error are null outside the
+	// state that sets them. Display-only for the workers UI.
+	"hibernation_state", "hibernation_reason", "hibernated_at", "wake_requested_at", "wake_error",
 }
 
 func TestWorkerDTOTags(t *testing.T) {

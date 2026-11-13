@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 )
 
@@ -91,7 +93,17 @@ func TestTLSListenerServesOnlyTheWorkerAndControllerSurface(t *testing.T) {
 // have narrowed the full router.
 func TestThePlainListenerStillServesEverything(t *testing.T) {
 	h := newControllerHandler(t, &pollStore{}, true)
-	srv := controllerRoutes(h)
+	// Assert MOUNTING via chi route matching rather than executing handlers: this Handler has
+	// no pool, so serving GET /api/health would panic at h.pool.Ping (the Recoverer would
+	// swallow it into a 500 and the != 404 check would pass while logging a stack trace).
+	// Mux.Match walks mounted subrouters, so nested routes are covered.
+	routes, ok := controllerRoutes(h).(chi.Routes)
+	if !ok {
+		t.Fatalf("controllerRoutes returned %T, which does not implement chi.Routes", controllerRoutes(h))
+	}
+	if routes.Match(chi.NewRouteContext(), http.MethodGet, "/api/definitely-not-a-route") {
+		t.Fatal("a nonexistent path matched; the mount check would be vacuous")
+	}
 
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodPost, "/api/auth/login"},
@@ -103,9 +115,7 @@ func TestThePlainListenerStillServesEverything(t *testing.T) {
 		// would 404 in production while every unit test passed.
 		{http.MethodPost, "/api/controller/status"},
 	} {
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
-		if rec.Code == http.StatusNotFound {
+		if !routes.Match(chi.NewRouteContext(), tc.method, tc.path) {
 			t.Errorf("%s %s = 404 on the PLAIN listener; the subset router must not have narrowed it", tc.method, tc.path)
 		}
 	}
