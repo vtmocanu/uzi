@@ -790,9 +790,10 @@ function makeExecutor(
 }
 
 /** issue #4069: the late-cleanup sibling-ready wait. 3000ms from execute; path 1 restarts the 3000ms at the hold
- *  release. A pending release decision or path 1 is bounded by a hard wall cap of 1500 (the reference waiter's own
- *  deadline) + 3000ms from execute, so a reference waiter that never settles cannot stall the wait. `tick` must
- *  yield a macrotask so timers (and a per-test timeout) still run. */
+ *  release. A pending release decision or path 1 is bounded by a hard wall cap anchored at execute, 1500 + 3000ms
+ *  (the reference waiter's 1500ms starts only once the sibling's read queues, so the cap may shorten path 1's window
+ *  by that queueing delay), so a reference waiter that never settles cannot stall the wait. `tick` must yield a
+ *  macrotask so timers (and a per-test timeout) still run. */
 async function waitSiblingReady(opts: {
   ready: () => boolean;
   state: () => { decided: "pending" | "path1" | "path2"; pendingDecision: boolean; releasedAt?: number };
@@ -803,7 +804,7 @@ async function waitSiblingReady(opts: {
   const cap = opts.executedAt + 1500 + 3000;
   while (!opts.ready()) {
     const { decided, pendingDecision, releasedAt } = opts.state();
-    const limit = decided === "path1" ? Math.min(releasedAt! + 3000, cap)
+    const limit = decided === "path1" ? Math.min((releasedAt ?? Infinity) + 3000, cap)
       : pendingDecision ? cap : opts.executedAt + 3000;
     if (opts.now() > limit) throw new Error("timed out waiting for independent sibling executes in its own source");
     await opts.tick();
@@ -813,27 +814,35 @@ async function waitSiblingReady(opts: {
 describe("late-cleanup sibling wait caps a stalled reference decision", () => {
   const tick = () => new Promise<void>(resolve => setImmediate(resolve));
   const clock = (step: number) => { let t = 0; return { now: () => (t += step), at: () => t }; };
+  // Each case self-bounds `ready` at 10s on the fake clock: a missing limit resolves the wait, so assert.rejects
+  // fails cleanly instead of spinning past the per-test timeout.
   it("pending decision that never settles fails within 1500 + 3000ms of execute", async () => {
     const c = clock(7);
-    await assert.rejects(waitSiblingReady({ ready: () => false, executedAt: 0, now: c.now, tick,
+    await assert.rejects(waitSiblingReady({ ready: () => c.at() > 10_000, executedAt: 0, now: c.now, tick,
       state: () => ({ decided: "pending", pendingDecision: true }) }), /timed out waiting for independent sibling/);
     assert.ok(c.at() > 4500 && c.at() <= 4500 + 7, `failed at ${c.at()}`);
   });
   it("path 2 keeps the absolute 3000ms from execute", async () => {
     const c = clock(7);
-    await assert.rejects(waitSiblingReady({ ready: () => false, executedAt: 0, now: c.now, tick,
+    await assert.rejects(waitSiblingReady({ ready: () => c.at() > 10_000, executedAt: 0, now: c.now, tick,
       state: () => ({ decided: "path2", pendingDecision: false }) }), /timed out/);
     assert.ok(c.at() > 3000 && c.at() <= 3000 + 7, `failed at ${c.at()}`);
   });
   it("path 1 with a late release is capped at 1500 + 3000ms from execute", async () => {
     const c = clock(7);
-    await assert.rejects(waitSiblingReady({ ready: () => false, executedAt: 0, now: c.now, tick,
+    await assert.rejects(waitSiblingReady({ ready: () => c.at() > 10_000, executedAt: 0, now: c.now, tick,
       state: () => ({ decided: "path1", pendingDecision: false, releasedAt: 2000 }) }), /timed out/);
     assert.ok(c.at() > 4500 && c.at() <= 4500 + 7, `failed at ${c.at()}`);
   });
+  it("an undecided wait that is not pending keeps 3000ms from execute", async () => {
+    const c = clock(7);
+    await assert.rejects(waitSiblingReady({ ready: () => c.at() > 10_000, executedAt: 0, now: c.now, tick,
+      state: () => ({ decided: "pending", pendingDecision: false }) }), /timed out/);
+    assert.ok(c.at() > 3000 && c.at() <= 3000 + 7, `failed at ${c.at()}`);
+  });
   it("path 1 with an early release keeps 3000ms from the release", async () => {
     const c = clock(7);
-    await assert.rejects(waitSiblingReady({ ready: () => false, executedAt: 0, now: c.now, tick,
+    await assert.rejects(waitSiblingReady({ ready: () => c.at() > 10_000, executedAt: 0, now: c.now, tick,
       state: () => ({ decided: "path1", pendingDecision: false, releasedAt: 500 }) }), /timed out/);
     assert.ok(c.at() > 3500 && c.at() <= 3500 + 7, `failed at ${c.at()}`);
   });
