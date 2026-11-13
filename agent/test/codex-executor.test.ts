@@ -1073,11 +1073,12 @@ describe("M3 actual runner memory Codex delivery", () => {
             siblingReads++;
             const read = readOriginal(...args); // queues on the bare lock synchronously
             signalQueued(true);
-            // Late cleanup only: a Node timer can fire about 1ms before Date.now() reaches its deadline, which
-            // would make the launch retry classify the sibling's own expiry as unknown. This one-time, forward-only
-            // 5ms skew (about 1500ms before any deadline, after the nested operation's timer is armed) models the
-            // CI signature deterministically: the expiry is classified as the round's own deadline.
-            if (!lateCapture && !entrySkewed) { entrySkewed = true; skew = 5; }
+            // Late cleanup only: a Node timer is armed from libuv's cached loop time and can fire before Date.now()
+            // reaches its deadline, which makes withLaunchLockRetry classify the sibling's own expiry as unknown
+            // (a production classification quirk reported separately from #4069). This one-time, forward-only
+            // 50ms skew, applied after the nested operation's timer is armed and at least ~1500ms before any
+            // deadline, covers an early fire of up to 50ms so the expiry is classified as the round's own deadline.
+            if (!lateCapture && !entrySkewed) { entrySkewed = true; skew = 50; }
             const facts = await read;
             if (lateCapture && !skewed) { skewed = true; skew = 600; }
             return facts;
