@@ -172,3 +172,86 @@ RETURNING *;
 UPDATE run_terminal_contributions SET state = 'publish_unknown', updated_at = now()
 WHERE id = @id AND state = 'invoked'
 RETURNING *;
+
+-- ---------------------------------------------------------------------------------------------
+-- The sweep (m4). Same CAS convention as the writers above; every state writer runs under the run
+-- row lock (LockRunForHeldCleanup), taken before the preservation row.
+-- ---------------------------------------------------------------------------------------------
+
+-- name: GetTerminalSweepClock :one
+-- The DATABASE clock, read immediately after a forge observation: it is the retire decision's
+-- observed_at, compared in MarkTerminalPreservationRetiring against the same clock, so a skewed
+-- application clock cannot make a stale observation look fresh.
+SELECT clock_timestamp()::timestamptz AS observed_at;
+
+-- name: DeferTerminalPreservation :execrows
+-- A scheduling-only write that may also count a failed attempt (attempt_bump 0 for a plain skip).
+-- A NULL text keeps the existing last_error. It changes no state and no tip, so it needs no run lock;
+-- the expected state keeps a stale item from rescheduling a row another writer already moved on.
+UPDATE run_terminal_preservations SET
+    next_check_at = @next_check_at,
+    last_error = COALESCE(sqlc.narg('last_error')::text, last_error),
+    attempts = attempts + @attempt_bump::int,
+    updated_at = now()
+WHERE id = @id AND state = @expected_state::text;
+
+-- name: MarkTerminalPreservationAbandoned :one
+-- publishing or retiring -> abandoned: the ref is at a foreign tip and is never touched again. The
+-- live pointer is cleared (an abandoned row owns no ref).
+UPDATE run_terminal_preservations SET
+    state = 'abandoned', live_run_id = NULL, last_error = sqlc.narg('last_error')::text, updated_at = now()
+WHERE id = @id AND state = @expected_state::text AND state IN ('publishing', 'retiring')
+RETURNING *;
+
+-- name: MarkTerminalPreservationDeleted :one
+-- retiring -> deleted: the ref was CAS-deleted or confirmed absent. The live pointer is cleared.
+UPDATE run_terminal_preservations SET
+    state = 'deleted', live_run_id = NULL, deleted_at = now(), last_error = NULL, updated_at = now()
+WHERE id = @id AND state = 'retiring'
+RETURNING *;
+
+-- name: MarkTerminalPreservationRetiring :one
+-- live -> retiring, the irrevocable retirement decision (tx-R1). The observation must be fresh ON THE
+-- DATABASE CLOCK at this statement: observed_at older than max_age_seconds matches no row, and the
+-- caller discards the decision without writing. retire_decided_at is the same clock.
+UPDATE run_terminal_preservations SET
+    state = 'retiring', retire_tip = @tip::text, retire_reason = @retire_reason::text,
+    retire_observed_at = @observed_at::timestamptz, retire_decided_at = clock_timestamp(),
+    last_error = NULL, attempts = 0, next_check_at = now(), updated_at = now()
+WHERE id = @id AND state = 'live' AND tip = @tip::text
+  AND clock_timestamp() - @observed_at::timestamptz <= make_interval(secs => @max_age_seconds::float8)
+RETURNING *;
+
+-- name: GetTerminalRetireBlocker :one
+-- The independent retirement protections, re-checked under the run lock in tx-R1. Returns the first
+-- one that holds as a typed reason, or '' when none does. The reason is written to last_error, so it
+-- is a closed vocabulary and never forge text.
+SELECT COALESCE(
+    (CASE WHEN r.status NOT IN ('completed', 'failed', 'cancelled') THEN 'run_nonterminal' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM worker_active_runs w WHERE w.run_id = r.id) THEN 'claim_live' END),
+    (CASE WHEN r.fail_origin IN ('push_secret_blocked', 'worker_residue_blocked') THEN 'excluded_origin' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = r.id AND h.state = 'open')
+        THEN 'custody_hold_open' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM run_terminal_contributions c
+        WHERE c.run_id = r.id AND c.state IN ('prepared', 'invoked', 'publish_unknown'))
+        THEN 'contribution_unresolved' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM runs o
+        WHERE o.id <> r.id AND o.status NOT IN ('completed', 'failed', 'cancelled')
+          AND (o.then_fix_of_run_id = r.id OR o.review_target_run_id = r.id
+               OR o.target_run_id = r.id OR o.resume_of_run_id = r.id))
+        THEN 'dependent_run_active' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM runs o
+        WHERE o.id <> r.id AND o.repo_id = r.repo_id AND o.kind IN ('mr_rework', 'ci_fix')
+          AND o.status NOT IN ('completed', 'failed', 'cancelled')
+          AND ((r.mr_iid IS NOT NULL AND o.mr_iid = r.mr_iid)
+               OR (r.branch IS NOT NULL AND o.pipeline_ref = r.branch)))
+        THEN 'mr_run_active' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM cross_checks cc
+        WHERE (cc.lead_run_id = r.id OR cc.checker_run_id = r.id)
+          AND (cc.verdict = 'pending' OR EXISTS (SELECT 1 FROM runs o
+              WHERE o.id IN (cc.lead_run_id, cc.checker_run_id) AND o.id <> r.id
+                AND o.status NOT IN ('completed', 'failed', 'cancelled'))))
+        THEN 'cross_check_active' END),
+    ''
+)::text AS blocker
+FROM runs r WHERE r.id = @run_id;

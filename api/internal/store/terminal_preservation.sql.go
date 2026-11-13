@@ -55,6 +55,40 @@ func (q *Queries) CountLiveTerminalPreservationsForRepo(ctx context.Context, arg
 	return count, err
 }
 
+const deferTerminalPreservation = `-- name: DeferTerminalPreservation :execrows
+UPDATE run_terminal_preservations SET
+    next_check_at = $1,
+    last_error = COALESCE($2::text, last_error),
+    attempts = attempts + $3::int,
+    updated_at = now()
+WHERE id = $4 AND state = $5::text
+`
+
+type DeferTerminalPreservationParams struct {
+	NextCheckAt   pgtype.Timestamptz `json:"next_check_at"`
+	LastError     pgtype.Text        `json:"last_error"`
+	AttemptBump   int32              `json:"attempt_bump"`
+	ID            uuid.UUID          `json:"id"`
+	ExpectedState string             `json:"expected_state"`
+}
+
+// A scheduling-only write that may also count a failed attempt (attempt_bump 0 for a plain skip).
+// A NULL text keeps the existing last_error. It changes no state and no tip, so it needs no run lock;
+// the expected state keeps a stale item from rescheduling a row another writer already moved on.
+func (q *Queries) DeferTerminalPreservation(ctx context.Context, arg DeferTerminalPreservationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferTerminalPreservation,
+		arg.NextCheckAt,
+		arg.LastError,
+		arg.AttemptBump,
+		arg.ID,
+		arg.ExpectedState,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getTerminalContributionByRunGeneration = `-- name: GetTerminalContributionByRunGeneration :one
 SELECT id, preservation_id, run_id, generation, worker_id, user_id, hold_id, authority, tip, prior_tip, coverage_digest, manifest, disposition, state, refusal_reason, create_invoked_at, published_at, created_at, updated_at FROM run_terminal_contributions WHERE run_id = $1 AND generation = $2
 `
@@ -162,6 +196,67 @@ func (q *Queries) GetTerminalPreservationForUpdate(ctx context.Context, runID uu
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const getTerminalRetireBlocker = `-- name: GetTerminalRetireBlocker :one
+SELECT COALESCE(
+    (CASE WHEN r.status NOT IN ('completed', 'failed', 'cancelled') THEN 'run_nonterminal' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM worker_active_runs w WHERE w.run_id = r.id) THEN 'claim_live' END),
+    (CASE WHEN r.fail_origin IN ('push_secret_blocked', 'worker_residue_blocked') THEN 'excluded_origin' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = r.id AND h.state = 'open')
+        THEN 'custody_hold_open' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM run_terminal_contributions c
+        WHERE c.run_id = r.id AND c.state IN ('prepared', 'invoked', 'publish_unknown'))
+        THEN 'contribution_unresolved' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM runs o
+        WHERE o.id <> r.id AND o.status NOT IN ('completed', 'failed', 'cancelled')
+          AND (o.then_fix_of_run_id = r.id OR o.review_target_run_id = r.id
+               OR o.target_run_id = r.id OR o.resume_of_run_id = r.id))
+        THEN 'dependent_run_active' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM runs o
+        WHERE o.id <> r.id AND o.repo_id = r.repo_id AND o.kind IN ('mr_rework', 'ci_fix')
+          AND o.status NOT IN ('completed', 'failed', 'cancelled')
+          AND ((r.mr_iid IS NOT NULL AND o.mr_iid = r.mr_iid)
+               OR (r.branch IS NOT NULL AND o.pipeline_ref = r.branch)))
+        THEN 'mr_run_active' END),
+    (CASE WHEN EXISTS (SELECT 1 FROM cross_checks cc
+        WHERE (cc.lead_run_id = r.id OR cc.checker_run_id = r.id)
+          AND (cc.verdict = 'pending' OR EXISTS (SELECT 1 FROM runs o
+              WHERE o.id IN (cc.lead_run_id, cc.checker_run_id) AND o.id <> r.id
+                AND o.status NOT IN ('completed', 'failed', 'cancelled'))))
+        THEN 'cross_check_active' END),
+    ''
+)::text AS blocker
+FROM runs r WHERE r.id = $1
+`
+
+// The independent retirement protections, re-checked under the run lock in tx-R1. Returns the first
+// one that holds as a typed reason, or ” when none does. The reason is written to last_error, so it
+// is a closed vocabulary and never forge text.
+func (q *Queries) GetTerminalRetireBlocker(ctx context.Context, runID uuid.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, getTerminalRetireBlocker, runID)
+	var blocker string
+	err := row.Scan(&blocker)
+	return blocker, err
+}
+
+const getTerminalSweepClock = `-- name: GetTerminalSweepClock :one
+
+SELECT clock_timestamp()::timestamptz AS observed_at
+`
+
+// ---------------------------------------------------------------------------------------------
+// The sweep (m4). Same CAS convention as the writers above; every state writer runs under the run
+// row lock (LockRunForHeldCleanup), taken before the preservation row.
+// ---------------------------------------------------------------------------------------------
+// The DATABASE clock, read immediately after a forge observation: it is the retire decision's
+// observed_at, compared in MarkTerminalPreservationRetiring against the same clock, so a skewed
+// application clock cannot make a stale observation look fresh.
+func (q *Queries) GetTerminalSweepClock(ctx context.Context) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, getTerminalSweepClock)
+	var observed_at pgtype.Timestamptz
+	err := row.Scan(&observed_at)
+	return observed_at, err
 }
 
 const hasOpenGuardedHoldForWorker = `-- name: HasOpenGuardedHoldForWorker :one
@@ -532,6 +627,85 @@ func (q *Queries) MarkTerminalContributionInvoked(ctx context.Context, id uuid.U
 	return i, err
 }
 
+const markTerminalPreservationAbandoned = `-- name: MarkTerminalPreservationAbandoned :one
+UPDATE run_terminal_preservations SET
+    state = 'abandoned', live_run_id = NULL, last_error = $1::text, updated_at = now()
+WHERE id = $2 AND state = $3::text AND state IN ('publishing', 'retiring')
+RETURNING id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, state, first_published_at, retire_tip, retire_reason, retire_observed_at, retire_decided_at, next_check_at, attempts, last_error, deleted_at, created_at, updated_at
+`
+
+type MarkTerminalPreservationAbandonedParams struct {
+	LastError     pgtype.Text `json:"last_error"`
+	ID            uuid.UUID   `json:"id"`
+	ExpectedState string      `json:"expected_state"`
+}
+
+// publishing or retiring -> abandoned: the ref is at a foreign tip and is never touched again. The
+// live pointer is cleared (an abandoned row owns no ref).
+func (q *Queries) MarkTerminalPreservationAbandoned(ctx context.Context, arg MarkTerminalPreservationAbandonedParams) (RunTerminalPreservation, error) {
+	row := q.db.QueryRow(ctx, markTerminalPreservationAbandoned, arg.LastError, arg.ID, arg.ExpectedState)
+	var i RunTerminalPreservation
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Ref,
+		&i.Tip,
+		&i.LifetimeAtBind,
+		&i.State,
+		&i.FirstPublishedAt,
+		&i.RetireTip,
+		&i.RetireReason,
+		&i.RetireObservedAt,
+		&i.RetireDecidedAt,
+		&i.NextCheckAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.DeletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const markTerminalPreservationDeleted = `-- name: MarkTerminalPreservationDeleted :one
+UPDATE run_terminal_preservations SET
+    state = 'deleted', live_run_id = NULL, deleted_at = now(), last_error = NULL, updated_at = now()
+WHERE id = $1 AND state = 'retiring'
+RETURNING id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, state, first_published_at, retire_tip, retire_reason, retire_observed_at, retire_decided_at, next_check_at, attempts, last_error, deleted_at, created_at, updated_at
+`
+
+// retiring -> deleted: the ref was CAS-deleted or confirmed absent. The live pointer is cleared.
+func (q *Queries) MarkTerminalPreservationDeleted(ctx context.Context, id uuid.UUID) (RunTerminalPreservation, error) {
+	row := q.db.QueryRow(ctx, markTerminalPreservationDeleted, id)
+	var i RunTerminalPreservation
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Ref,
+		&i.Tip,
+		&i.LifetimeAtBind,
+		&i.State,
+		&i.FirstPublishedAt,
+		&i.RetireTip,
+		&i.RetireReason,
+		&i.RetireObservedAt,
+		&i.RetireDecidedAt,
+		&i.NextCheckAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.DeletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const markTerminalPreservationNotPublished = `-- name: MarkTerminalPreservationNotPublished :one
 UPDATE run_terminal_preservations SET state = 'not_published', updated_at = now()
 WHERE id = $1 AND state = 'bound' AND tip IS NULL
@@ -585,6 +759,61 @@ type MarkTerminalPreservationPublishingParams struct {
 // the contribution's prepared -> invoked marker, whose guard needs the preservation publishing).
 func (q *Queries) MarkTerminalPreservationPublishing(ctx context.Context, arg MarkTerminalPreservationPublishingParams) (RunTerminalPreservation, error) {
 	row := q.db.QueryRow(ctx, markTerminalPreservationPublishing, arg.ID, arg.ExpectedState, arg.ExpectedTip)
+	var i RunTerminalPreservation
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Ref,
+		&i.Tip,
+		&i.LifetimeAtBind,
+		&i.State,
+		&i.FirstPublishedAt,
+		&i.RetireTip,
+		&i.RetireReason,
+		&i.RetireObservedAt,
+		&i.RetireDecidedAt,
+		&i.NextCheckAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.DeletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const markTerminalPreservationRetiring = `-- name: MarkTerminalPreservationRetiring :one
+UPDATE run_terminal_preservations SET
+    state = 'retiring', retire_tip = $1::text, retire_reason = $2::text,
+    retire_observed_at = $3::timestamptz, retire_decided_at = clock_timestamp(),
+    last_error = NULL, attempts = 0, next_check_at = now(), updated_at = now()
+WHERE id = $4 AND state = 'live' AND tip = $1::text
+  AND clock_timestamp() - $3::timestamptz <= make_interval(secs => $5::float8)
+RETURNING id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, state, first_published_at, retire_tip, retire_reason, retire_observed_at, retire_decided_at, next_check_at, attempts, last_error, deleted_at, created_at, updated_at
+`
+
+type MarkTerminalPreservationRetiringParams struct {
+	Tip           string             `json:"tip"`
+	RetireReason  string             `json:"retire_reason"`
+	ObservedAt    pgtype.Timestamptz `json:"observed_at"`
+	ID            uuid.UUID          `json:"id"`
+	MaxAgeSeconds float64            `json:"max_age_seconds"`
+}
+
+// live -> retiring, the irrevocable retirement decision (tx-R1). The observation must be fresh ON THE
+// DATABASE CLOCK at this statement: observed_at older than max_age_seconds matches no row, and the
+// caller discards the decision without writing. retire_decided_at is the same clock.
+func (q *Queries) MarkTerminalPreservationRetiring(ctx context.Context, arg MarkTerminalPreservationRetiringParams) (RunTerminalPreservation, error) {
+	row := q.db.QueryRow(ctx, markTerminalPreservationRetiring,
+		arg.Tip,
+		arg.RetireReason,
+		arg.ObservedAt,
+		arg.ID,
+		arg.MaxAgeSeconds,
+	)
 	var i RunTerminalPreservation
 	err := row.Scan(
 		&i.ID,

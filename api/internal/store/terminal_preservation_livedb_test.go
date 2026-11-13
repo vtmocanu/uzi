@@ -35,7 +35,7 @@ var termStates = []string{"bound", "publishing", "live", "retiring", "deleted", 
 var termAllowed = map[string][]string{
 	"bound":         {"publishing", "not_published"},
 	"not_published": {"publishing"},
-	"publishing":    {"live", "not_published"},
+	"publishing":    {"live", "not_published", "abandoned"},
 	"live":          {"publishing", "retiring"},
 	"retiring":      {"deleted", "abandoned"},
 }

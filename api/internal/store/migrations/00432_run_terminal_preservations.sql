@@ -116,7 +116,9 @@ BEGIN
     ELSIF NOT (
         (OLD.state = 'bound' AND NEW.state IN ('publishing', 'not_published'))
         OR (OLD.state = 'not_published' AND NEW.state = 'publishing')
-        OR (OLD.state = 'publishing' AND NEW.state IN ('live', 'not_published'))
+        -- publishing -> abandoned: a reconcile found the ref at a foreign tip (neither the tip being
+        -- published nor its prior tip), which is never touched or retried.
+        OR (OLD.state = 'publishing' AND NEW.state IN ('live', 'not_published', 'abandoned'))
         OR (OLD.state = 'live' AND NEW.state IN ('publishing', 'retiring'))
         -- Irrevocable: a retiring row only ever finishes.
         OR (OLD.state = 'retiring' AND NEW.state IN ('deleted', 'abandoned'))

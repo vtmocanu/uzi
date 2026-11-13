@@ -1119,6 +1119,23 @@ var queryInventory = []queryPin{
 		"direct call; asserts a refusal needs its reason and the expected state"},
 	{"RecordTerminalContributionUnknown", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
 		"direct call; asserts invoked -> publish_unknown once"},
+	// Issue #4007 slice A, M4: the sweep's lanes (reconcile, stale-bound, retire).
+	{"GetTerminalSweepClock", "terminal_preservation.sql", "TestTerminalSweepRetireLiveDB",
+		"../workersvc: the retire observation's database-clock stamp; asserts a stale observation is discarded " +
+			"with no write and a fresh one retires"},
+	{"DeferTerminalPreservation", "terminal_preservation.sql", "TestTerminalSweepReconcileLiveDB",
+		"../workersvc: the sweep's backoff and skip write; asserts attempts and next_check_at move on a listing error " +
+			"and the state does not"},
+	{"MarkTerminalPreservationAbandoned", "terminal_preservation.sql", "TestTerminalSweepReconcileLiveDB",
+		"../workersvc: a foreign tip found by the reconcile lane; asserts publishing -> abandoned, the pointer cleared " +
+			"and the ref never deleted"},
+	{"MarkTerminalPreservationRetiring", "terminal_preservation.sql", "TestTerminalSweepRetireLiveDB",
+		"../workersvc: tx-R1; asserts the stamped decision, and no row for a stale observation or a moved tip"},
+	{"MarkTerminalPreservationDeleted", "terminal_preservation.sql", "TestTerminalSweepRetireIrrevocableLiveDB",
+		"../workersvc: tx-R2; asserts retiring -> deleted with the pointer cleared and deleted_at set"},
+	{"GetTerminalRetireBlocker", "terminal_preservation.sql", "TestTerminalSweepRetireLiveDB",
+		"../workersvc: the independent protections re-checked under the run lock; asserts each keeps the ref and " +
+			"writes its typed reason"},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)

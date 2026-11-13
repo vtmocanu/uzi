@@ -142,6 +142,13 @@ type terminalHooks struct {
 	beforeBind   func()            // after the unlocked pre-checks, before tx1 begins
 	beforeSend   func()            // after tx1 committed, before the push
 	outcome      func() error      // inside tx2, before its COMMIT
+
+	// The sweep's retire lane (terminal_sweep.go). retireEnabled is set only by tests: production
+	// retirement is gated by the terminalRetirementEnabled constant.
+	del           func(context.Context, pushbroker.DeleteTerminalOptions) (pushbroker.TerminalDeleteOutcome, error)
+	retireEnabled bool
+	afterObserve  func(observedAt *time.Time) // after the forge observation, before tx-R1
+	afterDelete   func() error                // after the remote delete, before tx-R2; an error ends the item there
 }
 
 func (h terminalHooks) prepareFn() func(context.Context, pushbroker.TerminalPackOptions) (*pushbroker.PreparedTerminalPack, error) {
@@ -170,6 +177,13 @@ func (h terminalHooks) listFn() func(context.Context, pushbroker.ListRefsOptions
 		return h.list
 	}
 	return pushbroker.ListTerminalTip
+}
+
+func (h terminalHooks) deleteFn() func(context.Context, pushbroker.DeleteTerminalOptions) (pushbroker.TerminalDeleteOutcome, error) {
+	if h.del != nil {
+		return h.del
+	}
+	return pushbroker.DeleteTerminal
 }
 
 // TerminalLifetimeForges is the forge surface the lifetime classification reads through: the issue
