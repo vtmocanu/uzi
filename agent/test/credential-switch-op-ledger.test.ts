@@ -94,7 +94,7 @@ describe("credential switch op ledger", () => {
   });
 
   it("uncertain then not_applied with a reason that leaves the op pending stays ambiguous, in process and across a reload", async () => {
-    for (const reason of ["credential_busy", "vault_locked", "generation_mismatch"]) {
+    for (const reason of ["credential_busy", "vault_locked", "credential_unavailable"]) {
       const dir = tmp();
       const first = new CredentialSwitchOpLedger(dir);
       await applyThroughLedger(fakeClient([], { kind: "uncertain", detail: "x" }), first, RUN, REQ);
@@ -105,7 +105,7 @@ describe("credential switch op ledger", () => {
     }
   });
 
-  for (const result of [{ kind: "superseded" }, { kind: "not_applied", reason: "no_pending_switch" }] as CredentialSwitchApplyResult[]) {
+  for (const result of [{ kind: "superseded" }, { kind: "not_applied", reason: "no_pending_switch" }, { kind: "not_applied", reason: "generation_mismatch" }] as CredentialSwitchApplyResult[]) {
     it(`uncertain then ${result.kind} settles: the server answers it only after its replay check (review NB1)`, async () => {
       const dir = tmp();
       const ledger = new CredentialSwitchOpLedger(dir);

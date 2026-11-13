@@ -239,7 +239,7 @@ import {
 } from "./residue-quarantine.js";
 import { SecretSet } from "./redact.js";
 import { CredentialHolder } from "./credential-holder.js";
-import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult } from "./credential-switch-op-ledger.js";
+import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult, NOT_APPLIED_PROOF_REASONS } from "./credential-switch-op-ledger.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { CodexSessionStore } from "./codex/session-state.js";
 import { selectCodexBinding } from "./codex/select.js";
@@ -27186,14 +27186,14 @@ export class RunRunner {
           result = { kind: "uncertain", detail: "apply_threw" };
         }
         // Sticky for this op: once a send of it was ambiguous, only an answer the server gives AFTER its
-        // replay check proves it did not commit. `superseded` and `not_applied` are such answers (the replay
-        // of a committed op would have answered applied or refused_committed, in the same transaction under
-        // the run lock); `fenced` is not, because the fence runs before the replay (credential_switch_apply.go).
-        // Of `not_applied` only the reason `no_pending_switch` is permanent proof: the other reasons
-        // (credential_busy, vault_locked, generation_mismatch, ...) leave the op pending, so a delayed earlier
+        // replay check proves it did not commit: `superseded`, and `not_applied` with a reason in
+        // NOT_APPLIED_PROOF_REASONS (no_pending_switch, generation_mismatch). The replay of a committed op would
+        // have answered applied or refused_committed, in the same transaction under the run lock. `fenced` is
+        // not proof, because the fence runs before the replay (credential_switch_apply.go). Any other
+        // not_applied reason (credential_busy, vault_locked, ...) leaves the op pending, so a delayed earlier
         // send could still commit and the flag stays set.
         if (result.kind === "uncertain" || result.kind === "refused_committed") mayHaveCommitted = true;
-        if (result.kind === "superseded" || (result.kind === "not_applied" && result.reason === "no_pending_switch")) mayHaveCommitted = false;
+        if (result.kind === "superseded" || (result.kind === "not_applied" && NOT_APPLIED_PROOF_REASONS.has(result.reason))) mayHaveCommitted = false;
         const dropHold = (): void => {
           if (mayHaveCommitted) this.releaseHoldPastPossibleApply(hold, flight, runLog);
           else hold.cancel();

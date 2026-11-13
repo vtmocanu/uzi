@@ -624,7 +624,7 @@ describe("issue #4201 m2c rework: a definite non-applied answer after an ambiguo
 
   // A not_applied whose reason leaves the op pending (anything but no_pending_switch) does NOT prove the
   // earlier send never committed: a delayed send could still land. Option A, never the give-up.
-  for (const reason of ["credential_busy", "vault_locked", "generation_mismatch"]) {
+  for (const reason of ["credential_busy", "vault_locked", "credential_unavailable"]) {
     it(`uncertain then not_applied:${reason}: option A, hold released past the possible apply, op stays ambiguous`, TIMEOUT, async () => {
       const spy = spyHold();
       const apply = committedThenAnswers(spy, [AMBIGUOUS, { kind: "not_applied", reason }]);
@@ -646,7 +646,7 @@ describe("issue #4201 m2c rework: a definite non-applied answer after an ambiguo
   // transaction under the run lock: a committed op would have replayed as applied. So after an uncertain send
   // these two prove the op never committed, and the hold must be CANCELLED (frames continue at tail+1, no seq
   // hole) and the ledger settled (review NB1).
-  for (const answer of [{ kind: "superseded" }, { kind: "not_applied", reason: "no_pending_switch" }] as CredentialSwitchApplyResult[]) {
+  for (const answer of [{ kind: "superseded" }, { kind: "not_applied", reason: "no_pending_switch" }, { kind: "not_applied", reason: "generation_mismatch" }] as CredentialSwitchApplyResult[]) {
     it(`uncertain (rolled back) then ${answer.kind}: the hold is cancelled with no seq hole and the op settles`, TIMEOUT, async () => {
       const spy = spyHold();
       const apply = uncommittedThenAnswers(spy, [AMBIGUOUS, answer]);

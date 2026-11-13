@@ -281,6 +281,15 @@ export type LedgerApplyResult = CredentialSwitchApplyResult | { kind: "ledger_un
  * `route_absent` that is not recorded as clean (a prior or concurrent ambiguous or settled state,
  * or a failed write) is reported `uncertain`.
  */
+/**
+ * The `not_applied` reasons that prove the op can NEVER commit (api credential_switch_apply.go): answered after
+ * the server's replay check, for an op that can never become applicable again. `no_pending_switch`: the op is
+ * not the pending one, and every new stamp mints a fresh op id (migration 00427 trigger). `generation_mismatch`:
+ * the only stamp writer sets the op id and the stamp generation together, so an op's generation is fixed when
+ * it is minted. Every other not_applied reason leaves the op pending.
+ */
+export const NOT_APPLIED_PROOF_REASONS: ReadonlySet<string> = new Set(["no_pending_switch", "generation_mismatch"]);
+
 export async function applyThroughLedger(
   client: { applyCredentialSwitch(runId: string, req: CredentialSwitchApplyRequest): Promise<CredentialSwitchApplyResult> },
   ledger: CredentialSwitchOpLedger,
@@ -325,10 +334,10 @@ export async function applyThroughLedger(
       await ledger.record(runId, req.opId, "settled", result.kind).catch(() => undefined);
       return result;
     case "not_applied":
-      // Only `no_pending_switch` is permanent proof that nothing committed. Every other reason (credential_busy,
-      // vault_locked, credential_unavailable, generation_mismatch, ...) leaves the op pending, so a delayed
-      // earlier send could still commit: after an ambiguous send keep the memory. A never-ambiguous op settles.
-      if (wasAmbiguous && result.reason !== "no_pending_switch")
+      // Only a reason in NOT_APPLIED_PROOF_REASONS is permanent proof that nothing committed. Every other reason
+      // (credential_busy, vault_locked, credential_unavailable, ...) leaves the op pending, so a delayed earlier
+      // send could still commit: after an ambiguous send keep the memory. A never-ambiguous op settles.
+      if (wasAmbiguous && !NOT_APPLIED_PROOF_REASONS.has(result.reason))
         await ledger.record(runId, req.opId, "ambiguous", "not_applied_after_ambiguous", req.claimGeneration).catch(() => undefined);
       else await ledger.record(runId, req.opId, "settled", result.kind).catch(() => undefined);
       return result;
