@@ -1,6 +1,6 @@
 # PRD #4205: Worker hibernation: sleep and wake a persistent hosted worker
 
-**Epic**: #4204. **Status**: Draft. **Blocked by**: none.
+**Epic**: #4204. **Status**: Implemented (M1, M2); live hosted-k8s acceptance pending. **Blocked by**: none.
 
 ## Problem
 
@@ -90,7 +90,7 @@ A new hibernation module owns the state machine:
 **Authoritative transitions.** Controller status reports stay display-only: by contract, the `StatusReport` comment in `protocol.go` says no claim, heartbeat or register path reads them, and `handler.go:1507` agrees. Lifecycle transitions instead use a dedicated control-write route, `POST /api/controller/workers/{workerID}/hibernation`.
 
 - **Mounting:** next to `drain` and `dind-maintenance` (`handler.go:1511-1512`), in the same pattern as `api/internal/handler/controller_dind_maintenance.go`, with `DisallowUnknownFields`.
-- **Request body:** `{op_id, transition, deployment_uid, pod_uid?, reason?}`.
+- **Request body:** `{op_id, transition, deployment_uid, pod_uid?, resource_version?, reason?}`.
 - **Transitions:**
   - `refused`: the controller found a roll marker, pacing entry, disk-pressure recycle or DinD maintenance in flight, and carries the reason.
     - The api reverts to `none` only when the refusal is proven pre-patch: no `scaling_down` was sent and the resourceVersion is unchanged since admission.
@@ -247,3 +247,18 @@ A live hosted-k8s check (hibernate, wake on demand, PVCs intact) is filed as a l
 - **D11. Settle on Register.** Register is row-locked and nonce-rotating. A heartbeat cannot identify the new pod.
 - **D8. Transitions go through a dedicated controller route, not the status report.** Status reports are display-only today, and lifecycle authority must be validated per op. A stale Kubernetes mutation is fenced by resourceVersion-conditioned patches. Convergence alone could interrupt a worker after it has claimed a run. Claims stay fenced until earlier mutations are resolved.
 - **D9. Wake suppression is per run.** Owner-wide suppression would starve runs needing another capability, and it would wake siblings repeatedly.
+- **D12. Controls live on Admin → Health (AI decision, 2026-11-13).** Admin → Workers did not exist (PRD #4212 is Draft), so the controls sit in the "Fleet, all users" table and move with #4212.
+- **D13. Roll admission and cordon (AI decision, 2026-11-13).** Waking workers are also excluded from roll admission, and workers in any state but `none` read `effective_cordoned`.
+- **D14. Audit scope (AI decision, 2026-11-13).** The audit table records only admin hibernate and wake. System transitions are on the row (`hibernation_reason`) and in logs.
+- **D15. Pre-patch proof for `refused` (AI decision, 2026-11-13).** The controller writes a unique annotation-only fence patch, which advances the resourceVersion, and refuses only when the fenced object lacks the op annotation. This stands in for "resourceVersion unchanged since admission", which the api never learns. `resource_version` carries the fence resourceVersion.
+- **D16. Roll evidence (AI decision, 2026-11-13).** Hibernating workers stay in the roll snapshot so reservation and marker evidence is readable, and are excluded after it. Preparing fails closed on any roll evidence, and a missing Deployment under roll evidence is neither created nor refused.
+- **D17. Re-entrant audit table (AI decision, 2026-11-13).** Down keeps it, and a re-Up validates it only when it pre-existed.
+- **D18. Op scoping (AI decision, 2026-11-13).** Resets are op-scoped and settle evidence is op-bound. A Register while preparing re-targets the admission pod until a scale-down is recorded.
+- **D19. Demand-wake recording (AI decision, 2026-11-13).** One transaction: worker lock, run `FOR SHARE`, insert `ON CONFLICT DO NOTHING`, transition. A commit error is an unknown outcome resolved by the next pass. This is atomicity only, with no storage-durability claim.
+- **D20. One wake per pending run (AI decision, 2026-11-13).** The wake row is kept until the run leaves the queue. The approved plan's "delete stale rows and re-demand" step was dropped because it allowed repeat wakes. Hibernate is refused (`pending_wake_demand`) while a queued run's wake names the worker, so a run is never stranded.
+- **D21. Provisioning suppression (AI decision, 2026-11-13).** Applied at the shared `provisionOne` boundary for all triggers, only while the worker is waking and within 15 minutes of the first wake.
+- **D22. Shared placement (AI decision, 2026-11-13).** The placement predicate is extracted into the set-returning inlinable function `fn_placement_admitting_workers`. The demand query adds `fn_worker_can_claim` and `fn_forge_origin_eligible`. Documented divergences from `ClaimRun`: custody-admission limit, recovery spread, released nonce, pending overflow, weekly reserve and Codex quarantine.
+- **D23. Candidate selection (AI decision, 2026-11-13).** Candidates include an already-waking worker (with no failed wake), so one woken worker serves several runs. A sleeper pre-filter keeps the pass cheap when nothing hibernates, and the scan is `LIMIT`ed to the ephemeral batch.
+- **D24. Chat continue (AI decision, 2026-11-13).** It loses its pin to a hibernated worker, and demand wakes one.
+- **D25. Downgrade (AI decision, 2026-11-13).** Disable, wait until all workers are awake, stop the api, Down 00429, 00428, then 00427, and start the older api. An older api cannot claim on the new schema.
+- **D26. LiveDB sweep (AI decision, 2026-11-13).** `hostedsvc` is added to the LiveDB sweep list.

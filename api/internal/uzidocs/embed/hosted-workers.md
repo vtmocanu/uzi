@@ -154,6 +154,9 @@ Hibernate is refused, with a reason, when the worker:
 - has an open recovery custody hold;
 - is under a manual or controller cordon, or in a maintenance or DinD phase;
 - has no registered pod identity;
+- is named by the wake of a queued run that is still waiting for it (code
+  `pending_wake_demand`; the wake row is kept until the run leaves the queue, so a
+  run is never stranded);
 - or the controller has not advertised hibernation support recently.
 
 The controller can still refuse after the request is accepted (a roll marker or
@@ -178,6 +181,12 @@ ephemeral provisioning on the same sweep, so sleeping capacity is used first. Wh
 wake is not older than 15 minutes (counted from the first wake of that run) no ephemeral
 worker is provisioned for that run; a run the woken worker cannot serve is unaffected, and
 after 15 minutes provisioning proceeds as today.
+
+**Health.** While a run waits for a waking worker, its owner sees the reason "your
+worker is waking from hibernation". The `fleet.capacity` check treats a wake younger
+than 15 minutes as transient. Admins get an instance-scoped **Admin → Health** check,
+`fleet.hibernation_wake`, that warns when a wake failed or is not confirmed within 15
+minutes (it lists up to 10 workers); see [Admin health](admin-health.md).
 
 Status shows in `uzi worker list` and `uzi admin workers`; see
 [CLI](./cli.md#hibernated-workers). The design is in

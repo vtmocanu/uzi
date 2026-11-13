@@ -1866,7 +1866,7 @@ Design record: issue #4078 (epic #3873); target mock `prds/mockups/3873-overview
     **on user request** (Settings → Workers; opt-in, quota-bounded). NOT delivered,
     still deferred: the **when-queued-work-appears trigger**, autoscaling,
     scale-to-zero, and the chat-agent case — a #58 worker is persistent and runs
-    until deleted. [design detail in specs/ai.md §264-275] Manual hibernation now delivers per-worker scale-to-zero (#4205). (AI-synced 2026-11-12)
+    until deleted. [design detail in specs/ai.md §264-275] Manual hibernation now delivers per-worker scale-to-zero (#4205); owners see "your worker is waking from hibernation" and admins get a `fleet.hibernation_wake` health check. (AI-synced 2026-11-13)
 - Auto-creating bot accounts / bot role enforcement (forge ships with user-managed bots).
 - Forgejo driver — DELIVERED by PRD #65 (2026-07-17): full-parity second driver behind the forge-generic interface; no longer deferred.
 - Agent runtime/execution (spawn, file writes, Anthropic API calls) — PRD #4.
