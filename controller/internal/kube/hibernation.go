@@ -139,15 +139,13 @@ func applyPodEvidence(o *reconcile.ObservedWorker, pods []corev1.Pod) {
 // container is terminated. A terminal phase alone is not enough, because kubelet
 // eviction publishes phase Failed before it kills the containers. It fails closed: a
 // missing, short or extra status entry, an unnamed match, a running or waiting
-// container, or a pod with no regular containers all read as not stopped. Any
-// terminated reason counts, ContainerStatusUnknown included: kubelet writes it when it
-// finalises a terminated pod or when the runtime no longer lists a container that was
-// running. That is the kubelet's report, not proof of process death: after node loss
-// the reason can leave death unproven (ADR-1470), and an unreachable node's pod usually
-// keeps stale Running statuses instead. Refusing it would hold the wake
-// for good behind an ordinary eviction's residue (PRD #4205 D27; a deliberate
-// departure from ADR-1470's stricter roll-promotion reading). A
-// deletionTimestamp is irrelevant.
+// container, a termination with reason ContainerStatusUnknown, or a pod with no
+// regular containers all read as not stopped. ContainerStatusUnknown means the
+// container's end was never observed, so process death is unproven (ADR-1470). The
+// accepted residual: eviction residue with an unknown status holds the wake until the
+// api's wake timeout records wake_error, and keeps holding it until the pod is removed;
+// an admin may force-delete it only after confirming the node is down or fenced from its
+// storage (docs/hosted-workers.md). A deletionTimestamp is irrelevant.
 func podStopped(p corev1.Pod) bool {
 	if p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
 		return false
@@ -182,7 +180,10 @@ func allTerminated(specNames []string, statuses []corev1.ContainerStatus) bool {
 	}
 	for _, n := range specNames {
 		s, ok := byName[n]
-		if !ok || s.State.Terminated == nil || s.State.Running != nil || s.State.Waiting != nil {
+		// ContainerStatusUnknown is kubelet's or PodGC's placeholder when the container's
+		// end was never observed: process death unproven (ADR-1470).
+		if !ok || s.State.Terminated == nil || s.State.Running != nil || s.State.Waiting != nil ||
+			s.State.Terminated.Reason == "ContainerStatusUnknown" {
 			return false
 		}
 	}

@@ -174,9 +174,11 @@ container (init and ephemeral included) has terminated. A pod whose containers a
 still running or stopping holds the wake, including a `Failed` (evicted) pod that is
 still being killed and a pod that is still terminating. A `Succeeded` or `Failed` pod
 kept only by a finalizer, with every container terminated, does not hold it. A container
-still waiting, for example one that never left init, counts as not stopped, so such a
-pod holds the wake (a wake error appears after 15 minutes) until the pod is removed.
-The typical stuck case is a pod on an unreachable node: it keeps its last running
+whose end Kubernetes could not confirm (terminated with reason `ContainerStatusUnknown`,
+which does not prove the process died) or that is still waiting, for example one that
+never left init, counts as not stopped. Such a pod, typically eviction residue, holds
+the wake: after 15 minutes the worker records `wake_error`, and the wake keeps waiting
+until the pod is removed. Another stuck case is a pod on an unreachable node: it keeps its last running
 container statuses, so it holds the wake, and the wake may not recover until the node
 or the pod object is removed.
 

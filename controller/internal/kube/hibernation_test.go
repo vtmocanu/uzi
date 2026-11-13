@@ -1166,6 +1166,93 @@ func TestWakeHeldByFailedPodWithLiveContainers(t *testing.T) {
 	}
 }
 
+// A ContainerStatusUnknown termination is kubelet's or PodGC's report that the
+// container's end was never observed; it does not prove the process died (ADR-1470).
+// An evicted pod carrying one, on a regular, init or ephemeral container, keeps
+// holding the wake: no restore from replicas 0, no create of a missing Deployment and
+// no ready. The same pod with a known terminated reason lets the wake proceed.
+func TestWakeHeldByContainerStatusUnknown(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	term := func(reason string) corev1.ContainerState {
+		return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: reason}}
+	}
+	mk := func(kind, reason string) *corev1.Pod {
+		p := hibPod("evicted", hash, true, false)
+		p.Status.Phase = corev1.PodFailed
+		p.Status.Reason = "Evicted"
+		p.Spec.Containers = []corev1.Container{{Name: "worker"}}
+		p.Spec.InitContainers = []corev1.Container{{Name: "init"}}
+		p.Spec.EphemeralContainers = []corev1.EphemeralContainer{{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "dbg"}}}
+		st := func(k string) corev1.ContainerState {
+			if k == kind {
+				return term(reason)
+			}
+			return term("Error")
+		}
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{hibCS("worker", st("regular"))}
+		p.Status.InitContainerStatuses = []corev1.ContainerStatus{hibCS("init", st("init"))}
+		p.Status.EphemeralContainerStatuses = []corev1.ContainerStatus{hibCS("dbg", st("ephemeral"))}
+		return p
+	}
+	created := func(c *fake.Clientset) bool {
+		for _, a := range c.Actions() {
+			if a.GetResource().Resource == "deployments" && a.GetVerb() == "create" {
+				return true
+			}
+		}
+		return false
+	}
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	for _, kind := range []string{"regular", "init", "ephemeral"} {
+		for _, reason := range []string{"ContainerStatusUnknown", "Error"} {
+			held := reason == "ContainerStatusUnknown"
+			t.Run(kind+"/"+reason+"/replicas zero", func(t *testing.T) {
+				m, client, rec := hibEnv(t, hibCurrent(t, 0, "sleep-op"), mk(kind, reason))
+				if err := hibTick(t, m, w); err != nil {
+					t.Fatal(err)
+				}
+				if hasTransition(rec, protocol.TransitionReady) {
+					t.Fatalf("ready reported from an evicted pod: %+v", rec.calls)
+				}
+				n := replicaPatches(client)
+				if held {
+					if n != 0 {
+						t.Fatalf("wake restored replicas behind a ContainerStatusUnknown container (replica patches = %d)", n)
+					}
+					return
+				}
+				if n != 1 {
+					t.Fatalf("replica patches = %d with every container known terminated, want the one restore", n)
+				}
+				if d := hibGet(t, client); *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
+					t.Fatalf("restore: replicas=%v annotations=%v", d.Spec.Replicas, d.Annotations)
+				}
+			})
+			t.Run(kind+"/"+reason+"/deployment missing", func(t *testing.T) {
+				m, client, rec := hibEnv(t, mk(kind, reason))
+				if err := hibTick(t, m, w); err != nil {
+					t.Fatal(err)
+				}
+				if hasTransition(rec, protocol.TransitionReady) {
+					t.Fatalf("ready reported from an evicted pod: %+v", rec.calls)
+				}
+				if held {
+					if created(client) {
+						t.Fatal("deployment created behind a ContainerStatusUnknown container")
+					}
+					return
+				}
+				if !created(client) {
+					t.Fatal("deployment not created with every container known terminated")
+				}
+				if d := hibGet(t, client); d.Spec.Replicas == nil || *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
+					t.Fatalf("created: replicas=%v annotations=%v", d.Spec.Replicas, d.Annotations)
+				}
+			})
+		}
+	}
+}
+
 func TestApplyPodEvidenceTerminalPodSuppliesNoReadiness(t *testing.T) {
 	for _, phase := range []corev1.PodPhase{corev1.PodSucceeded, corev1.PodFailed} {
 		t.Run(string(phase), func(t *testing.T) {
@@ -1247,6 +1334,15 @@ func TestPodStopped(t *testing.T) {
 		}), false},
 		{"terminated with status unknown", mk(corev1.PodFailed, func(p *corev1.Pod) {
 			p.Status.ContainerStatuses[0].State.Terminated.Reason = "ContainerStatusUnknown"
+		}), false},
+		{"init terminated with status unknown", mk(corev1.PodFailed, func(p *corev1.Pod) {
+			init1(p, corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "ContainerStatusUnknown"}})
+		}), false},
+		{"ephemeral terminated with status unknown", mk(corev1.PodFailed, func(p *corev1.Pod) {
+			eph(p, corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "ContainerStatusUnknown"}})
+		}), false},
+		{"terminated with a known reason", mk(corev1.PodFailed, func(p *corev1.Pod) {
+			p.Status.ContainerStatuses[0].State.Terminated.Reason = "Error"
 		}), true},
 		{"missing statuses", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Status.ContainerStatuses = nil }), false},
 		{"short statuses", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Spec.Containers = append(p.Spec.Containers, corev1.Container{Name: "b"}) }), false},
