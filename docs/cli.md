@@ -1564,7 +1564,12 @@ uzi run recovery <run-id> [--json]
   prerequisite_closure. Its ids are accepted by
   `uzi run export --capture`; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
-  its run) or the server predates capture-hold linking. Owner-only.
+  its run) or the server predates capture-hold linking. Captures whose hold is not among the
+  listed holds (for example after a hold was released) arrive as one final element
+  `{"run_id": "<run-id>", "unattached": true, "captures": [ ... ]}` after the hold elements, with
+  no `generation`, `id` or `state` keys, so scripts that read holds should skip elements with
+  `unattached: true`. Owner-only, except under
+  [admin run debug](#admin-run-debug-reading-other-users-runs).
 - While the server retains the run's last published checkpoint on origin (PRD #1810), the
   human-readable output adds a line per hold naming where it lives: `hold <id> checkpoint:
   <ref> @ <12-char tip> (<state>)`, where `<ref>` is `refs/uzi-checkpoints/<checkpoint-key>` or, once
@@ -1682,42 +1687,6 @@ uzi run held expire <run-id> [--yes]
   there was nothing to do. `--json` prints the endpoint's object (`expired`, and the
   affected `publications`).
 
-### Admin run debug: reading other users' runs
-
-Off by default. A deployment turns it on with `UZI_ADMIN_RUN_DEBUG` (chart value
-`api.adminRunDebug.enabled`; see [configuration](./configuration.md#admin-run-debug-issue-4198)).
-When it is on, a live admin using an `admin_ro` (`uza_`) CLI token can read, never change, another
-user's run data. A browser cookie or a `uzc_` token never qualifies, and demoting the admin takes
-effect on the next request. Each newly authorized cross-user read writes one audit log line.
-
-- **`uzi run inputs <id>` and `uzi run fetches <id>`** work on a foreign run. A foreign chat run still
-  reads as not found. A debug-served inputs or archives response carries `admin_debug_read: true`.
-- **`uzi run recovery --user <uuid>`** lists that user's open custody holds, owner-wide. `--user` takes the
-  full user UUID, no run id, and prints a one-line read-only notice on stderr.
-- **`uzi run recovery <run-id>`** on a foreign run lists that run's holds and capture metadata. With
-  `--json`, captures whose hold is not among the listed holds arrive as ONE final element after the
-  hold elements, carrying no `generation`, `id` or `state` keys:
-
-```json
-{"run_id": "<run-id>", "unattached": true, "captures": [ ... ]}
-```
-
-  Each entry in `captures` has the same shape as a hold's `captures` entries above. The human view
-  prints a `captures (no listed hold)` table instead.
-- **`uzi admin runs --all [--user <uuid>] [--since <rfc3339>]`** lists runs of every status, newest
-  first (`created_at`, then `id`), capped at 500 rows, with the same run-kind exclusions as the active
-  listing (chat, judge and cross-check runs). `--user` limits it to one owner, `--since` to runs
-  created at or after an RFC3339 time. `--user` and `--since` without `--all` exit 2. When the cap is hit
-  the CLI prints `note: showing the newest 500 runs; narrow with --user or --since` on stderr. `--json`
-  prints a `{runs, truncated}` envelope of summary rows instead of the table.
-- **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
-  `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
-  metadata-only). `run discard` stays owner-only too. The TUI shows no steer controls on a foreign run.
-- **Hints.** When a 404 or 403 comes back from `run inputs`, `run fetches`, `run recovery` or
-  `admin runs --all`, the CLI prints `hint: reading another user's run needs the server flag
-  UZI_ADMIN_RUN_DEBUG (chart api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr. The
-  error and its exit code are unchanged.
-
 Held-ref cleanup does not depend on `UZI_HELD_PUBLICATION`: with the feature switched off,
 refs already published are still deleted at their expiry, and `uzi run held expire` still
 works. The switch also keeps exact-hold reconciliation and immutable FINAL replay
@@ -1738,6 +1707,45 @@ ref that is then acknowledged follows the retention rule. Remove the repo after 
 The body also carries `held_refs` (**at most 5** refs, each named with its state in the error
 text; any further ones are only counted, as `and N more`) and `held_count` (the true total).
 Retry the removal once the refs are deleted or settled.
+
+### Admin run debug: reading other users' runs
+
+Off by default. A deployment turns it on with `UZI_ADMIN_RUN_DEBUG` (chart value
+`api.adminRunDebug.enabled`; see [configuration](./configuration.md#admin-run-debug-issue-4198)).
+When it is on, a live admin using an `admin_ro` (`uza_`) CLI token can read, never change, another
+user's run data. A browser cookie or a `uzc_` token never qualifies, and demoting the admin takes
+effect on the next request. Each newly authorized cross-user read writes one audit log line.
+
+- **`uzi run inputs <id>` and `uzi run fetches <id>`** work on a foreign run. A foreign chat run still
+  reads as not found. A debug-served inputs or archives response carries `admin_debug_read: true`.
+- **`uzi run recovery --user <uuid>`** lists that user's open custody holds, owner-wide; with `--json` it
+  prints the whole holds DTO (aggregate plus every hold, settled ones included), as the no-argument
+  `--json` does. `--user` takes the full user UUID, no run id. Without `--json` it also prints a
+  one-line read-only notice on stderr.
+- **`uzi run recovery <run-id>`** on a foreign run lists that run's holds and capture metadata. With
+  `--json`, captures whose hold is not among the listed holds arrive as ONE final element after the
+  hold elements (the same element an owner's own run can show), carrying no `generation`, `id` or
+  `state` keys:
+
+```json
+{"run_id": "<run-id>", "unattached": true, "captures": [ ... ]}
+```
+
+  Each entry in `captures` has the same shape as a hold's `captures` entries above. The human view
+  prints a `captures (no listed hold)` table instead.
+- **`uzi admin runs --all [--user <uuid>] [--since <rfc3339>]`** lists runs of every status, newest
+  first (`created_at`, then `id`), capped at 500 rows, with the same run-kind exclusions as the active
+  listing (chat, judge and cross-check runs). `--user` limits it to one owner, `--since` to runs
+  created at or after an RFC3339 time. `--user` and `--since` without `--all` exit 2. When the cap is hit
+  the CLI prints `note: showing the newest 500 runs; narrow with --user or --since` on stderr. `--json`
+  prints a `{runs, truncated}` envelope of summary rows instead of the table.
+- **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
+  `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
+  metadata-only). `run discard` stays owner-only too. The TUI shows no steer controls on a foreign run.
+- **Hints.** When a 404 or 403 comes back from `run inputs`, `run fetches`, `run recovery` or
+  `admin runs --all`, the CLI prints `hint: reading another user's run needs the server flag
+  UZI_ADMIN_RUN_DEBUG (chart api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr. The
+  error and its exit code are unchanged.
 
 ### A failed run's salvage copy: `refs/uzi-salvage/<run-id>`
 

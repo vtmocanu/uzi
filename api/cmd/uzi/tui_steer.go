@@ -79,8 +79,9 @@ type steerState2 struct {
 // ListFollowUpInputs resolves ownership with `s.GetRun(ctx, userID, runID)`
 // (service.go:2128-2132) and SubmitInput's FIRST statement is the same
 // `s.GetRun(ctx, userID, runID)` (service.go:2239) — one function, not two that agree.
-// So RunInputs succeeding is not an approximation of "may steer": it is the same
-// predicate the write will evaluate, evaluated by the same code. A client-side id
+// So RunInputs succeeding (without the admin_debug_read marker, see below) is not an
+// approximation of "may steer": it is the same predicate the write will evaluate,
+// evaluated by the same code. A client-side id
 // comparison would be a SECOND copy of that rule, free to drift from it — the exact
 // failure D6 exists to prevent.
 //
