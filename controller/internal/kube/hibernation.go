@@ -258,7 +258,9 @@ func (m *Materializer) conditionedPatch(ctx context.Context, ns string, obs reco
 		return nil, false, fmt.Errorf("hibernation mutation requires observed UID/resourceVersion")
 	}
 	meta["uid"], meta["resourceVersion"] = obs.DeploymentUID, obs.DeploymentResourceVersion
-	patch := map[string]any{"metadata": meta}
+	// The operator's labels and annotations ride every update (an admission policy may
+	// validate updates); the caller's own annotation keys keep their values.
+	patch := map[string]any{"metadata": m.withOperatorMetadata(meta)}
 	if spec != nil {
 		patch["spec"] = spec
 	}

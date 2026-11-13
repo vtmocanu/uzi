@@ -3,11 +3,14 @@ package kube
 import (
 	"context"
 	"maps"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
 // The operator's Deployment metadata (chart workloadLabels / workloadAnnotations) lands
@@ -94,5 +97,43 @@ func TestWithOperatorMetadataKeepsThePatchesOwnKeys(t *testing.T) {
 	}
 	if got := (&Materializer{}).withOperatorMetadata(map[string]any{"uid": "u"}); len(got) != 1 {
 		t.Fatalf("no operator metadata configured: meta = %v, want it unchanged", got)
+	}
+}
+
+// Hibernation's conditioned patches (scale-down, refusal fence, hold) carry the operator
+// metadata too, and the caller's hibernation annotation keeps its value.
+func TestHibernationConditionedPatchCarriesOperatorMetadata(t *testing.T) {
+	spec := testSpec(t, "base", "m")
+	w := desired("abc")
+	live := RenderDeployment(testConfig(), w, spec)
+	client := fake.NewSimpleClientset(live)
+	ctx := context.Background()
+	got, err := client.AppsV1().Deployments(live.Namespace).Get(ctx, live.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.UID, got.ResourceVersion = "uid-1", "1"
+	if _, err := client.AppsV1().Deployments(live.Namespace).Update(ctx, got, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.DeploymentLabels = map[string]string{"team": "platform"}
+	cfg.DeploymentAnnotations = map[string]string{"policy.example.com/skip-probes": "true", annotationHibernationOp: "operator"}
+	m := &Materializer{client: client, cfg: cfg}
+	obs := reconcile.ObservedWorker{DeploymentUID: "uid-1", DeploymentResourceVersion: "1"}
+	if _, _, err := m.conditionedPatch(ctx, live.Namespace, obs, live.Name,
+		map[string]any{"annotations": map[string]any{annotationHibernationOp: "op-1"}},
+		map[string]any{"replicas": 0}); err != nil && !strings.Contains(err.Error(), "advanced resourceVersion") {
+		t.Fatal(err)
+	}
+	patched, err := client.AppsV1().Deployments(live.Namespace).Get(ctx, live.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if patched.Labels["team"] != "platform" || patched.Annotations["policy.example.com/skip-probes"] != "true" {
+		t.Errorf("hibernation patch labels=%v annotations=%v, want the operator metadata", patched.Labels, patched.Annotations)
+	}
+	if patched.Annotations[annotationHibernationOp] != "op-1" {
+		t.Errorf("hibernation op annotation = %q, want the caller's op-1", patched.Annotations[annotationHibernationOp])
 	}
 }
