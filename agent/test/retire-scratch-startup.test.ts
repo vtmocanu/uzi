@@ -227,8 +227,19 @@ const run = (opts: Opts = {}, start = OLD) => git.inspectRetireScratchAtStartup(
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const fdCount = () => fs.readdirSync("/proc/self/fd").length;
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
-/** Allocated bytes by an independent tool (du counts a hard-linked inode once). */
-const du = (p: string): number => Number(execFileSync("du", ["-s", "-B1", p], { env: GIT_ENV }).toString().split(/\s/)[0]);
+/** Allocated bytes of the listed fixture paths: lstat blocks * 512, an inode (hard link) once. */
+function alloc(...paths: string[]): number {
+  const seen = new Set<string>();
+  let total = 0;
+  for (const p of paths) {
+    const st = fs.lstatSync(p);
+    const key = `${st.dev}:${st.ino}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    total += st.blocks * 512;
+  }
+  return total;
+}
 
 function mkParent(name: string, files: Record<string, string | Buffer> = {}): string {
   const p = path.join(root, name);
@@ -308,7 +319,7 @@ describe("retire scratch outcome records (#4143)", () => {
     assert.equal(r.reason, "no_disposition_evidence");
     assert.equal(r.retained_source, "not_named");
     assert.equal(r.bytes_state, "measured");
-    assert.equal(r.bytes, du(path.join(root, ".retire-empty")));
+    assert.equal(r.bytes, alloc(path.join(root, ".retire-empty")));
     assert.deepEqual(r.partial_reasons, []);
     assert.equal(r.recent, false);
   });
@@ -322,7 +333,8 @@ describe("retire scratch outcome records (#4143)", () => {
     assert.equal(r.reason, "no_disposition_evidence");
     assert.equal(r.retained_source, "not_named");
     assert.equal(r.empty, false);
-    assert.equal(r.bytes, du(parent));
+    const j = (...s: string[]) => path.join(parent, ...s);
+    assert.equal(r.bytes, alloc(parent, j("clone"), j("clone", "src"), j("clone", "src", "a.txt"), j("clone", ".git")));
     assert.equal(totals()[0]!.retained_source_read, "read");
   });
 
@@ -342,12 +354,15 @@ describe("retire scratch outcome records (#4143)", () => {
     fs.mkdirSync(path.join(a, "clone", "removed-dir"));
     const r = await observeOne(".retire-partial");
     assert.equal(r.bytes_state, "measured");
-    assert.equal(r.bytes, du(a));
+    const ja = (...s: string[]) => path.join(a, ...s);
+    assert.equal(r.bytes, alloc(a, ja("clone"), ja("clone", "node_modules"), ja("clone", "node_modules", "x"),
+      ja("clone", "node_modules", "x", "y.js"), ja("clone", "keep"), ja("clone", "removed-dir")));
     lines.length = 0;
     const b = mkParent(".retire-foreign", { "uid-unknown/.hidden": "h", "uid-unknown/sub/f": "f" });
     fs.rmSync(a, { recursive: true });
     const rb = await observeOne(".retire-foreign");
-    assert.equal(rb.bytes, du(b));
+    const jb = (...s: string[]) => path.join(b, ...s);
+    assert.equal(rb.bytes, alloc(b, jb("uid-unknown"), jb("uid-unknown", ".hidden"), jb("uid-unknown", "sub"), jb("uid-unknown", "sub", "f")));
   });
 
   it("a mode-000 directory inside is partial with the unreadable reason, never opened by name", async (t) => {
@@ -393,9 +408,9 @@ describe("retire scratch outcome records (#4143)", () => {
     const byName = new Map(rows().map((r) => [r.name, r]));
     assert.equal(byName.get(".retire-link")!.kind, "symlink");
     assert.ok(byName.get(".retire-link")!.bytes < 1024 * 1024, "the symlink target is not counted");
-    assert.equal(byName.get(".retire-link")!.bytes, du(path.join(root, ".retire-link")));
+    assert.equal(byName.get(".retire-link")!.bytes, alloc(path.join(root, ".retire-link")));
     assert.equal(byName.get(".retire-file")!.kind, "other");
-    assert.equal(byName.get(".retire-file")!.bytes, du(path.join(root, ".retire-file")));
+    assert.equal(byName.get(".retire-file")!.bytes, alloc(path.join(root, ".retire-file")));
     assert.equal(byName.get(".retire-file")!.bytes_state, "measured");
   });
 });
@@ -588,6 +603,18 @@ describe("retire scratch budget and settlement (#4143)", () => {
     });
   }
 
+  it("decoded journal bytes are charged before the resolver parses them", async () => {
+    const rec = recordingLogger();
+    const small = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({ recoveryDecodedLimitBytes: 10 }));
+    setConfig(mkBare(), RECOVERY, journal(path.join(root, "slug", "r1"))); // well over 10 bytes
+    const seam = small as unknown as Record<string, (...a: unknown[]) => unknown>;
+    const resolver = mock.method(seam, "resolveBranchJournalUnderLock", seam.resolveBranchJournalUnderLock!.bind(small));
+    await small.inspectRetireScratchAtStartup(OLD, { outcomes: true });
+    assert.equal(resolver.mock.callCount(), 0, "the resolver (and its parse) never ran once the budget was exceeded");
+    const total = rec.lines.find((l) => (l as { msg?: string }).msg === TOTAL) as Total | undefined;
+    assert.equal(total?.retained_source_read, "unknown");
+  });
+
   it("a clock past the deadline mid-walk caps the walk with time_cap", async () => {
     mkParent(".retire-big", Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`f${i}`, "x".repeat(4096)])));
     const t0 = Date.now();
@@ -651,7 +678,7 @@ describe("retire scratch output bound (#4143)", () => {
     for (let i = 0; i < 25; i++) parents.push(mkParent(`.retire-${String(i).padStart(2, "0")}`, { "clone/f": "x".repeat(1000 * (i + 1)) }));
     setConfig(mkBare(), RECOVERY, journal(path.join(parents[3]!, "clone"), { retainedSources: [
       { runId: "run1", clonePath: path.join(parents[20]!, "clone") }, { runId: "run1", clonePath: path.join(parents[24]!, "clone") }] }));
-    const expectedBytes = parents.reduce((n, p) => n + du(p), 0);
+    const expectedBytes = parents.reduce((n, p) => n + alloc(p, path.join(p, "clone"), path.join(p, "clone", "f")), 0);
     await run();
     assert.equal(rows().length, 10);
     assert.deepEqual(rows().map((r) => r.name), parents.slice(0, 10).map((p) => path.basename(p)));
@@ -687,13 +714,29 @@ describe("retire scratch output bound (#4143)", () => {
   });
 });
 
+describe("retire scratch single total (#4143)", () => {
+  it("an enumeration truncated before any .retire-* name still emits one unknown total and reads nothing", async () => {
+    for (let i = 0; i < 4097; i++) fs.writeFileSync(path.join(root, `junk-${i}`), "x");
+    let reads = 0;
+    await run({ readRetainedSources: async () => { reads++; return { state: "read", paths: [] }; } });
+    assert.equal(reads, 0);
+    assert.equal(rows().length, 0);
+    assert.equal(totals().length, 1);
+    const t = totals()[0]!;
+    assert.equal(t.parents_enumerated, 0);
+    assert.equal(t.bytes_state, "unknown");
+    assert.equal(t.enumeration_incomplete, true);
+  });
+});
+
 describe("retire scratch walk (#4143)", () => {
   it("measures an exact allocated total with a hard link counted once", async () => {
     const p = mkParent(".retire-w", { "a/one": Buffer.alloc(100_000, 1), "b/c/two": Buffer.alloc(9000, 2) });
     fs.linkSync(path.join(p, "a/one"), path.join(p, "b/c/one-again"));
     fs.symlinkSync("../a", path.join(p, "b/link"));
     await observeOne(".retire-w");
-    assert.equal(rows()[0]!.bytes, du(p));
+    const w = (...s: string[]) => path.join(p, ...s);
+    assert.equal(rows()[0]!.bytes, alloc(p, w("a"), w("b"), w("b", "c"), w("a", "one"), w("b", "c", "two"), w("b", "c", "one-again"), w("b", "link")));
     assert.equal(rows()[0]!.bytes_state, "measured");
   });
 
@@ -735,6 +778,37 @@ describe("retire scratch walk (#4143)", () => {
     assert.equal(r.kind, "symlink");
     assert.ok(r.bytes < 1024 * 1024);
     assert.deepEqual(snapshot(outside), outsideBefore);
+  });
+
+  it("a directory swapped for a symlink between its lstat and its open is opened with O_NOFOLLOW and never resolves outside", async () => {
+    const p = mkParent(".retire-o", { "d/inner": "x" });
+    const outside = path.join(fx.dataDir, "outside");
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, "big"), Buffer.alloc(1024 * 1024, 7));
+    const outsideIno = fs.statSync(outside).ino;
+    const opens: Array<{ target: string; flags: number }> = [];
+    const resolvedInos: number[] = [];
+    const realOpen = fsp.open.bind(fsp);
+    mock.method(fsp, "open", async (target: string, flags?: number, mode?: number) => {
+      const handle = await realOpen(target, flags, mode);
+      opens.push({ target: String(target), flags: Number(flags) });
+      resolvedInos.push((await handle.stat()).ino);
+      return handle;
+    });
+    await run({
+      readRetainedSources: async () => ({ state: "read", paths: [] }),
+      beforeOpen: async (dir) => {
+        if (dir !== path.join(p, "d")) return;
+        fs.rmSync(path.join(p, "d"), { recursive: true });
+        fs.symlinkSync(outside, path.join(p, "d"));
+      },
+    });
+    assert.ok(opens.length >= 2, "the walk opened the root and the parent");
+    for (const o of opens) assert.ok((o.flags & fs.constants.O_NOFOLLOW) !== 0, `open of ${o.target} lacks O_NOFOLLOW`);
+    assert.ok(!resolvedInos.includes(outsideIno), "no walk open resolved to the outside directory");
+    const r = rows()[0]!;
+    assert.ok(r.partial_reasons.includes("changed"));
+    assert.ok(r.bytes < 1024 * 1024);
   });
 
   it("an ancestor swapped after its open still measures the descendant through the original inode", async () => {

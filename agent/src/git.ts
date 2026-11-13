@@ -3134,6 +3134,8 @@ interface RetireScratchWalkCtx {
   /** dev:ino of every non-directory inode with nlink > 1 already counted. */
   seen: Set<string>;
   beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+  /** Test hook: runs after lstat reported `dirPath` as a directory and before it is opened. */
+  beforeOpen?: (dirPath: string) => Promise<void>;
 }
 
 interface RetireScratchWalkAcc {
@@ -3187,6 +3189,7 @@ async function retireWalkDirectory(ctx: RetireScratchWalkCtx, acc: RetireScratch
   if (depth > RETIRE_SCRATCH_WALK_MAX_DEPTH) { acc.reasons.add("entry_cap"); return undefined; }
   let handle: FileHandle | undefined;
   try {
+    await ctx.beforeOpen?.(display);
     handle = await fs.open(openPath, RETIRE_WALK_OPEN_FLAGS);
     const before = await handle.stat({ bigint: true });
     if (before.dev !== lst.dev || before.ino !== lst.ino) { acc.reasons.add("changed"); return undefined; }
@@ -19254,6 +19257,7 @@ export class GitCache {
     walkLimits?: { maxEntries?: number };
     readRetainedSources?: () => Promise<RetireScratchSources>;
     beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+    beforeOpen?: (dirPath: string) => Promise<void>;
   } = {}): Promise<{ retained: number }> {
     const root = path.resolve(this.runnerRoot);
     const now = opts.now ?? Date.now;
@@ -19320,7 +19324,7 @@ export class GitCache {
         paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(path.relative(root, p), 157)),
       });
     }
-    if (opts.outcomes && observed.length > 0) {
+    if (opts.outcomes && (observed.length > 0 || incomplete)) {
       try { await this.emitRetireScratchOutcomes(root, observed.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)), incomplete, deadline, opts); }
       catch (err) {
         this.log.warn("runner retire scratch outcomes failed", { error: sanitizeForLog(gitErrorMessage(err), 157) });
@@ -19359,11 +19363,7 @@ export class GitCache {
             records += branches.size;
             if (records > limits.maxMetadataRecords) throw new Error("retire scratch metadata record limit");
             const closure = this.recoveryOperations.getStore()?.closureBudget;
-            const collect = (journal: RecoveryJournalEntry | undefined, raw: string): void => {
-              if (closure) {
-                closure.delivered += Buffer.byteLength(raw);
-                if (closure.delivered > closure.limit) throw new Error("retire scratch decoded journal limit");
-              }
+            const collect = (journal: RecoveryJournalEntry | undefined): void => {
               for (const p of [journal?.clonePath, ...(journal?.retainedSources ?? []).map((s) => s.clonePath)]) {
                 if (p === undefined) continue;
                 paths.add(p);
@@ -19371,13 +19371,20 @@ export class GitCache {
               }
             };
             for (const branch of [...branches].sort()) {
+              // Charge the decoded bytes the resolver will parse BEFORE it parses them.
+              if (closure) {
+                const pPrefix = `${recoveryCaptureKey(branch)}\n`;
+                const pRaw = entries.filter((item) => item.startsWith(pPrefix)).at(-1)?.slice(pPrefix.length) ?? "";
+                closure.delivered += Buffer.byteLength(pRaw) + Buffer.byteLength(this.restoreValueIn(entries, branch) ?? "");
+                if (closure.delivered > closure.limit) throw new Error("retire scratch decoded journal limit");
+              }
               const resolved = await this.resolveBranchJournalUnderLock(bare, branch, entries);
-              if (resolved.kind === "plain") collect(resolved.journal, resolved.raw);
+              if (resolved.kind === "plain") collect(resolved.journal);
               else if (resolved.kind === "composite") {
-                collect(resolved.predecessor.journal, resolved.predecessor.raw);
-                if (resolved.successor.kind === "entry") collect(resolved.successor.journal, resolved.successor.raw);
+                collect(resolved.predecessor.journal);
+                if (resolved.successor.kind === "entry") collect(resolved.successor.journal);
                 else {
-                  collect(undefined, resolved.successor.raw);
+                  collect(undefined);
                   paths.add(resolved.successor.successor.clonePath);
                   if (paths.size > limits.maxSeenPaths) throw new Error("retire scratch path limit");
                 }
@@ -19397,23 +19404,29 @@ export class GitCache {
     incomplete: boolean, deadline: number, opts: {
       outcomes?: boolean; signal?: AbortSignal; now?: () => number; limits?: EpochRetainedLimits; walkLimits?: { maxEntries?: number };
       readRetainedSources?: () => Promise<RetireScratchSources>; beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+      beforeOpen?: (dirPath: string) => Promise<void>;
     }): Promise<void> {
     const signal = opts.signal ?? new AbortController().signal;
-    const sources: RetireScratchSources = opts.readRetainedSources
-      ? await opts.readRetainedSources().catch((): RetireScratchSources => ({ state: "unknown" }))
-      : await this.readRetireScratchSources(signal, deadline, opts.limits);
+    // No parents (enumeration truncated before any .retire-* name): nothing to attribute or walk.
+    const sources: RetireScratchSources = parents.length === 0 ? { state: "unknown" }
+      : opts.readRetainedSources
+        ? await opts.readRetainedSources().catch((): RetireScratchSources => ({ state: "unknown" }))
+        : await this.readRetireScratchSources(signal, deadline, opts.limits);
     const ctx: RetireScratchWalkCtx = {
       now: opts.now ?? Date.now, deadline, signal, entries: 0,
       maxEntries: opts.walkLimits?.maxEntries ?? RETIRE_SCRATCH_WALK_MAX_ENTRIES, seen: new Set(),
       ...(opts.beforeEntry ? { beforeEntry: opts.beforeEntry } : {}),
+      ...(opts.beforeOpen ? { beforeOpen: opts.beforeOpen } : {}),
     };
     const results: RetireScratchParentResult[] = [];
     let rootHandle: FileHandle | undefined;
     try {
       let rootDev: bigint | undefined;
       try {
-        rootHandle = await fs.open(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
-        rootDev = (await rootHandle.stat({ bigint: true })).dev;
+        if (parents.length > 0) {
+          rootHandle = await fs.open(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+          rootDev = (await rootHandle.stat({ bigint: true })).dev;
+        }
       } catch { /* every parent is then reported unreadable below */ }
       for (const parent of parents) {
         if (rootHandle === undefined || rootDev === undefined) {
