@@ -11,7 +11,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -157,16 +156,12 @@ func TestRunRecoveryNewReadsPropagateContextErrors(t *testing.T) {
 					if mode == "json" {
 						args = append(args, "--json")
 					}
-					// Main runs with Cobra's background context, so execute the root command
-					// with the controlled one (as vault_test.go does).
-					root := newRootCmd(env)
-					root.SetArgs(args)
-					err := root.ExecuteContext(ctx)
-					if !errors.Is(err, wantErr) {
-						t.Fatalf("err = %v, want %v", err, wantErr)
+					code := mainContext(ctx, env, args)
+					if code == uzicli.ExitOK {
+						t.Errorf("exit code = 0, want non-zero for %v", wantErr)
 					}
-					if uzicli.ExitCodeFor(err) == uzicli.ExitOK {
-						t.Errorf("exit code for %v is 0", err)
+					if !strings.Contains(errb.String(), "uzi: "+wantErr.Error()) {
+						t.Errorf("stderr = %q, want the CLI error line carrying %q", errb.String(), wantErr.Error())
 					}
 					// A context error on the scoped read stops the command there: no archives read follows.
 					if seam == "scoped" && c.archivesCalls != 0 {

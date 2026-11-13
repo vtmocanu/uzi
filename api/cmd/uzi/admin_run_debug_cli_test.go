@@ -545,3 +545,31 @@ func TestRunRecoveryArchives404WithOwnHoldsHasNoHint(t *testing.T) {
 		t.Errorf("exit=%d stderr=%q; want no hint", code, errb)
 	}
 }
+
+// The "no hold id" warning is printed only where captures can be shown: with a listed hold or on
+// an admin debug read. With neither, the renderer stays silent, as main did for a holdless run.
+func TestRenderRunRecoveryNoHoldIDWarningNeedsHoldsOrDebugRead(t *testing.T) {
+	legacy := []apitypes.RecoveryArchiveDTO{{ID: "cap-legacy", State: "available"}}
+	for _, tc := range []struct {
+		name           string
+		holds          []apitypes.RecoveryCustodyHoldDTO
+		showUnattached bool
+		warn           bool
+	}{
+		{"no holds, not a debug read", nil, false, false},
+		{"no holds, debug read", nil, true, true},
+		{"listed hold", []apitypes.RecoveryCustodyHoldDTO{debugHold("hold-1", recoveryHeldRunID)}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errb bytes.Buffer
+			env := fakeEnv(&uzicli.FakeClient{})
+			env.Stdout, env.Stderr = &out, &errb
+			if err := renderRunRecovery(env, &globalFlags{json: true}, recoveryHeldRunID, tc.holds, legacy, nil, tc.showUnattached, tc.showUnattached); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(errb.String(), "carry no hold id"); got != tc.warn {
+				t.Errorf("warning present = %v, want %v; stderr=%q", got, tc.warn, errb.String())
+			}
+		})
+	}
+}

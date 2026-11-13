@@ -602,7 +602,8 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 	if showUnattached {
 		unattached = unattachedArchives(holds, archives)
 	}
-	if n := unattributedCaptures(archives); n > 0 {
+	// Only where captures can be shown at all: with a listed hold, or on an admin debug read.
+	if n := unattributedCaptures(archives); n > 0 && (len(holds) > 0 || showUnattached) {
 		// An older server sends no hold_id, so its captures join onto no hold.
 		// Warn in human and JSON modes, including quiet, and name the metadata-only
 		// listing; run export needs --output and fetches a sole capture.
