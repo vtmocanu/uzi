@@ -14,9 +14,9 @@
 -- has no issue. The one-active-judge-per-target partial unique index (00057) makes a
 -- duplicate raise 23505, which the caller treats as "already being judged" (a no-op).
 -- harness (PRD #1429 M1, was #1332 M5A / D2): now the @harness PARAMETER supplied by the M5B
--- create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. A judge inherits its
--- target run's harness as an explicit selection (D4); M3 wires that real value. Every current
--- caller passes string(HarnessClaude) as a mechanical stopgap.
+-- create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. The caller passes the
+-- judge's resolved harness (#3257): the owner's explicit "Judge runs on" choice when set,
+-- otherwise the target run's harness as an explicit selection (PRD #1429 D4).
 INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status, trigger_source, harness)
 VALUES (@user_id, 'judge', @target_run_id, @issue_title, @issue_description, 'queued', @trigger_source, @harness)
 RETURNING *;
@@ -243,3 +243,55 @@ WHERE rr.target_run_id = @target_run_id;
 SELECT * FROM review_recommendations
 WHERE review_id = @review_id
 ORDER BY created_at ASC, id ASC;
+
+-- name: LockRunForJudge :one
+-- Issue #3257: the per-target lock that serializes judge creation against the skip writer.
+-- It is a transaction-scoped ADVISORY lock keyed on the target, NOT a row lock, so it never
+-- conflicts with an FK cascade (runs_codex_secret_fk ON DELETE SET NULL during a credential
+-- delete) or any other writer of the run row; a row lock here inverted lock order against
+-- that delete and deadlocked. A row returned means the lock is held; no rows means the
+-- target run is gone; the lock may or may not be held then (the planner may evaluate it
+-- first), which is harmless because the key does not depend on the row and it is XACT-scoped.
+--
+-- The existence read in this statement uses the snapshot taken before any lock wait, which is
+-- fine: the reads that must be fresh are the LATER, separate statements (the skip DELETE and
+-- RecordJudgeSkip's NOT EXISTS), which must never be folded into this one. No fencing argument
+-- relies on lock-before-read order inside this statement.
+--
+-- Two-int advisory lock: class 1970956916 = 0x757A6A74 ("uzjt"), the value of
+-- store.JudgeTargetLockClass in migrate.go; TestJudgeTargetLockClassMatchesSQL pins this literal
+-- to it. XACT-scoped: released on commit or rollback, so it must run on a transaction-bound
+-- Queries (on a bare pool it would release immediately).
+SELECT r.id
+FROM runs r
+WHERE r.id = sqlc.arg(id)
+  AND pg_advisory_xact_lock(1970956916, hashtext(sqlc.arg(id)::uuid::text)) IS NOT NULL;
+
+-- name: RecordJudgeSkip :execrows
+-- Issue #3257: record why the automatic judge was skipped, unless any judge run (active or
+-- terminal) already exists for the target. One row per target: a later refusal overwrites
+-- the reason. Callers hold LockRunForJudge's lock, in a READ COMMITTED transaction, so the
+-- NOT EXISTS sees every judge run committed before the lock was granted. Zero rows means a
+-- judge exists and nothing was recorded.
+INSERT INTO judge_skips (target_run_id, harness, reason)
+SELECT @target_run_id::uuid, @harness::text, @reason::text
+WHERE NOT EXISTS (
+    SELECT 1 FROM runs WHERE kind = 'judge' AND target_run_id = @target_run_id::uuid
+)
+ON CONFLICT (target_run_id) DO UPDATE
+SET harness = EXCLUDED.harness, reason = EXCLUDED.reason, created_at = now();
+
+-- name: DeleteJudgeSkipForTarget :exec
+-- Issue #3257: creating a judge for a target clears its skip record, in the creating
+-- transaction (so a rolled-back create keeps the record).
+DELETE FROM judge_skips WHERE target_run_id = @target_run_id;
+
+-- name: GetJudgeSkipForTarget :one
+-- Issue #3257: the recorded skip for a target, for the review panel. No visibility check
+-- here: the caller applies GetRunForViewer first, like GetActiveJudgeRunForTarget.
+SELECT target_run_id, harness, reason, created_at FROM judge_skips WHERE target_run_id = @target_run_id;
+
+-- name: CurrentTransactionIsolation :one
+-- Issue #3257: the judge creation guard needs READ COMMITTED (see lockJudgeTargetForCreate), and
+-- the pool's Begin is the only thing that decides the level, so the transaction asserts it.
+SELECT current_setting('transaction_isolation')::text;

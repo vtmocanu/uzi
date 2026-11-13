@@ -181,12 +181,12 @@ async function contracts(t) {
   // Only the fetchFn seam is adapted. This does not cover DNS or default fetch.
   const fetchFn = (dialect) => async (url, init) => {
     const generated = new URL(url);
-    const expectedOrigin = dialect === "github" ? "https://api.contract.invalid" : "https://contract.invalid";
-    assert.equal(generated.origin, expectedOrigin, "unexpected generated API origin");
-    const prefix = dialect === "gitlab" ? "/api/v4/projects/group%2Frepo/merge_requests" : dialect === "forgejo" ? "/api/v1/repos/group/repo/pulls" : "/repos/group/repo/pulls";
+    // Every dialect, GitHub Enterprise Server included, serves its API on the web host.
+    assert.equal(generated.origin, "https://contract.invalid", "unexpected generated API origin");
+    const prefix = dialect === "gitlab" ? "/api/v4/projects/group%2Frepo/merge_requests" : dialect === "forgejo" ? "/api/v1/repos/group/repo/pulls" : "/api/v3/repos/group/repo/pulls";
     assert.ok(generated.pathname === prefix || generated.pathname.startsWith(prefix + "/"), `unexpected generated API path ${generated.pathname}`);
     assert.equal(init.redirect, "error");
-    const mapped = new URL((dialect === "github" ? "/api/v3" : "") + generated.pathname + generated.search, endpoint);
+    const mapped = new URL(generated.pathname + generated.search, endpoint);
     return await new Promise((resolve, reject) => {
       const req = https.request(mapped, { ca, method: init.method, headers: init.headers, signal: init.signal }, (res) => {
         const chunks = [];
@@ -260,7 +260,12 @@ async function contracts(t) {
     let output = "";
     const started = performance.now();
     go = spawn(command[0], command.slice(1), { cwd: path.join(root, "api"),
-      env: { ...goEnv, SSL_CERT_FILE: cert, HTTPS_PROXY: "", HTTP_PROXY: "", ALL_PROXY: "", NO_PROXY: "127.0.0.1",
+      // api/go.mod targets Go 1.26, whose x509sslcertoverrideplatform default (0) makes
+      // macOS ignore SSL_CERT_FILE; =1 makes the Go child trust the fake there too (#4238).
+      // Tied to that go line: drop this once api/go.mod says go 1.27 or later.
+      env: { ...goEnv, SSL_CERT_FILE: cert,
+        GODEBUG: [goEnv.GODEBUG, "x509sslcertoverrideplatform=1"].filter(Boolean).join(","),
+        HTTPS_PROXY: "", HTTP_PROXY: "", ALL_PROXY: "", NO_PROXY: "127.0.0.1",
         UZI_FORGE_FAKE_REQUIRED: "1", UZI_FORGE_FAKE_MANIFEST: manifestPath },
       stdio: ["ignore", "pipe", "pipe"] });
     for (const stream of [go.stdout, go.stderr]) stream.on("data", (data) => {

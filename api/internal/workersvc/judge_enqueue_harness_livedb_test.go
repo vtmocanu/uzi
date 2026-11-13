@@ -7,8 +7,9 @@ import (
 )
 
 // judge_enqueue_harness_livedb_test.go is the PRD #1429 M3 regression suite for Gate 4's
-// harness-aware repair (judge_enqueue.go): the judge inherits the just-completed target
-// run's harness as an EXPLICIT selection, routed through the M2 createRunResolved funnel.
+// harness-aware repair (judge_enqueue.go): with the owner's "Judge runs on" choice unset
+// (#3257), the judge inherits the just-completed target run's harness as an EXPLICIT
+// selection, routed through the M2 createRunResolved funnel.
 // Before this repair Gate 4 required an Anthropic-token presence
 // (GetUserSecretCiphertext), which silently starved a Codex-only owner of any judge run at
 // all — this proves the fix. Reuses the codexTestEnv fixtures. Skipped unless

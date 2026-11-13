@@ -77,7 +77,10 @@ imageVerification:
 # One list, two consumers, so they can never diverge (PRD #808): it renders into the
 # api's FORGE_ALLOWED_BASE_URLS env (the SSRF allowlist) AND into the kube-native
 # worker FQDN egress allow-list (worker-fqdn-egress.yaml derives one Allow per host).
-# https base URLs only. Empty (the default) leaves the api on its own built-in default
+# Each entry must be a bare https://host[:port] (an optional trailing / is fine); userinfo,
+# a path, a query or a fragment fails the render (the message never echoes the entry).
+# Values supplied through api.config bypass the chart and fail at api boot instead.
+# Empty (the default) leaves the api on its own built-in default
 # and emits no forge egress FQDN. Set this per-cluster instead of api.config.FORGE_ALLOWED_BASE_URLS
 # (setting BOTH fails the render — see api-configmap.yaml).
 forge:
@@ -86,8 +89,10 @@ forge:
 # --- issueTracker: the API's issue tracker SSRF allowlist (PRD #4173 S3) -----------
 #
 # Renders into the api's ISSUE_TRACKER_ALLOWED_BASE_URLS env. It is SEPARATE from the
-# forge allowlist above: https base URLs only, and empty (the default) means no issue
-# tracker connection can be created. It never feeds the worker egress lists (forge.* does
+# forge allowlist above: each entry must be a bare https://host[:port] (optional trailing /;
+# userinfo, a path, a query, a fragment, a comma or whitespace fails the render, and the
+# message never echoes the entry; a value supplied through api.config fails at api boot
+# instead). Empty (the default) means no issue tracker connection can be created. It never feeds the worker egress lists (forge.* does
 # that), because the worker never calls an issue tracker (S5). Set this per-cluster instead
 # of api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS (setting BOTH fails the render — see
 # api-configmap.yaml).
@@ -428,6 +433,17 @@ api:
     # host->pod probe traffic; CONFIRM at M6 before trusting empty.
     probeCIDRs: []
 
+# Extra metadata on every workload uzi creates: the chart's Deployments and StatefulSet
+# (api, web, controller, fetcher, simple postgres) and every hosted worker Deployment
+# the controller renders. For admission policies that key on workload metadata (an
+# exemption annotation, a required owner label). Values must be strings. Object metadata
+# only, never the pod template, so no worker or app pod rolls (the controller restarts to
+# read them); a hosted worker picks them up on the controller's next update to its
+# Deployment. A label uzi sets, or any uzi.dev/ key, is refused at render and at the
+# controller's boot.
+workloadLabels: {}
+workloadAnnotations: {}
+
 # --- hosted workers: the namespace, its RBAC, its policies, the controller -------
 #
 # M3 built the security ENVELOPE (namespace, RBAC, quotas, policies); M6 added the
@@ -657,7 +673,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.87.0-rc.8"
+    tag: "0.87.0-rc.10"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -1017,6 +1033,10 @@ workers:
     # Startup-only: wait for safe replacement; ForceRoll must stay off.
     # Supplies no attestation; empty runtime below keeps scratch. Attempt deletion stays canary-only.
     scratchDeletion: true
+    # Default-on per-startup observation records for `.retire-*` retirement scratch parents
+    # (kept only; no reclaim). false renders worker UZI_RETIRE_SCRATCH_OUTCOMES=0 after
+    # controller reconciliation; takes effect at the next worker startup.
+    retireScratchOutcomes: true
     deletionCanaryWorkerId: ""
   docker:
     podEpochReclaim:

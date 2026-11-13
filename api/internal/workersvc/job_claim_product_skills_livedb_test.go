@@ -77,6 +77,7 @@ func TestProductJobClaimSkillsLiveDB(t *testing.T) {
 		usr := e.seedSkill(t, "mine-"+suffix, "user", &u, nil, "user body")
 		tmpl := uuid.New()
 		e.exec(`INSERT INTO agent_templates (id, name, description, prompt_body) VALUES ($1, $2, 'd', 'b')`, tmpl, "t-"+suffix)
+		trackLiveDBTemplate(t, e.pool, tmpl)
 		e.exec(`INSERT INTO agent_skill_allocations (template_id, skill_id, user_id) VALUES ($1, $2, NULL), ($1, $3, NULL)`, tmpl, g, b)
 		e.exec(`INSERT INTO agent_skill_allocations (template_id, skill_id, user_id) VALUES ($1, $2, $3)`, tmpl, usr, u)
 
@@ -220,11 +221,13 @@ func TestNonJobRunNeverReceivesProductSkillsLiveDB(t *testing.T) {
 
 	prod := uuid.New()
 	env.exec(`INSERT INTO products (id, name) VALUES ($1, $2)`, prod, "prod-"+prod.String())
+	trackLiveDBProduct(t, env.pool, prod)
 	psID, gID := uuid.New(), uuid.New()
 	env.exec(`INSERT INTO skills (id, name, description, body, scope, product_id) VALUES ($1, $2, 'd', 'PRODUCT-ONLY-BODY', 'product', $3)`, psID, "p-"+suffix, prod)
 	env.exec(`INSERT INTO skills (id, name, description, body, scope) VALUES ($1, $2, 'd', 'global body', 'global')`, gID, "g-"+suffix)
 	tmpl := uuid.New()
 	env.exec(`INSERT INTO agent_templates (id, name, description, prompt_body) VALUES ($1, $2, 'd', 'b')`, tmpl, "t-"+suffix)
+	trackLiveDBTemplate(t, env.pool, tmpl)
 	env.exec(`INSERT INTO agent_skill_allocations (template_id, skill_id, user_id) VALUES ($1, $2, NULL), ($1, $3, NULL)`, tmpl, gID, psID)
 	env.exec(`INSERT INTO agent_skill_allocations (template_id, skill_id, user_id) VALUES ($1, $2, $3)`, tmpl, psID, f.userID)
 

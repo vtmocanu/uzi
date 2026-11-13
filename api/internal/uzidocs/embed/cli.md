@@ -260,15 +260,16 @@ A few worth knowing:
 
 - **`uzi admin usage --window lifetime|last_7_days` selects the human report's
   window (default `lifetime`).** The factory summary and per-user rows use
-  the same window for usage-bearing runs, tokens, API-equivalent cost, outcomes and
-  recoverable failures. Failure rate is failed runs divided by finished runs,
-  including runs without usage; `RUNS` counts runs with usage. Cost shows
-  `$0.00` for metered zero and discloses runs without a cost estimate and
-  unreported runs. Incomplete totals include recorded partial costs.
-  Recoverable work may already have been landed.
-  The table's `CLAUDE/CODEX` column shows the selected window's runs by
-  harness (the same runs as `RUNS`, so the two numbers sum to it; cross-check
-  runs count under the harness they ran on). The column is omitted against an
+  the same window. `RUNS` counts primary work runs (issue, task, prompt, job,
+  self_improve) with recorded usage. Finished, failed and the failure rate
+  count terminal primary work runs, including runs without usage; failure rate
+  is failed runs divided by finished runs. Tokens and API-equivalent cost also
+  include helper runs (judge, cross_check, mr_rework, ci_fix); chat is
+  excluded. Cost shows `$0.00` for metered zero and discloses runs without a
+  cost estimate and unreported runs. Incomplete totals include recorded partial
+  costs. Recoverable work may already have been landed.
+  The table's `CLAUDE/CODEX` column splits the selected window's same primary
+  runs as `RUNS` by harness, so the two numbers sum to it. The column is omitted against an
   older API without the split.
   `--json` returns the complete API response with both windows and additive
   per-user seven-day fields, plus `harness_runs` / `last7_harness_runs` per
@@ -934,7 +935,10 @@ A few worth knowing:
   hidden, deprecated alias) prints the judge's verdict, summary,
   recommendations, and triage tally for a run — see
   [Run judge](./judge.md#reading-a-review-from-the-cli) for the full `--json`
-  contract. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
+  contract. A run whose judge was skipped for a credential reason prints
+  `Judge skipped <date>: <reason>` (for example `Judge skipped 2026-11-12:
+  Codex had no usable credential.`) instead of "not judged", and `--json`
+  keeps the `skip` object. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
   `undo`/`stats`, plus `file` to turn a recommendation into a forge issue)
   triages recommendations, per run or across all of them — see
   [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli)
@@ -1472,19 +1476,23 @@ before native bundle verification/import.
 ### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
 
 A run's custody hold protects its committed-but-unpublished work per claim generation.
-The owner admission limit is the admin setting `custody_hold_limit` (default 8 counted
-holds; see [Admin settings](./admin-settings.md#custody-hold-limit)). `open_holds` is total open custody;
-`admission_counted_holds` excludes at most one hold per run backing a healthy, valid live
+The owner admission limit is the admin setting `custody_hold_limit` (default 8
+admission units; see [Admin settings](./admin-settings.md#custody-hold-limit)). `open_holds` is total open custody;
+`admission_counted_holds` counts admission units: it first excludes at most one hold per run backing a healthy, valid live
 current-generation claim without an owner decision. That requires exact owner/run/live-run
 and worker identity, an unreleased claim, a fresh non-null heartbeat (inclusive cutoff
 from the configured `WorkerHeartbeatStale`), and status `claimed`, `running`,
 `awaiting_approval`, `awaiting_input` or `awaiting_followup`. Missing, mismatched, stale,
 released, terminal and old/future-generation claims remain counted, as do decision holds;
 `active` attention alone does not establish eligibility. The discount releases nothing
-and does not permit pruning or teardown of held source.
+and does not permit pruning or teardown of held source. Of the remaining open holds, a run's
+open holds on the same original worker, from any of its generations, count as one unit together (whatever the
+worker's heartbeat); every other hold counts as one unit alone.
 
 New code runs wait at the admission limit. A previously claimed queued run with 1 to limit-1
-of its own total open holds can still resume; at the limit it loses that exemption. Concurrent
+of its own total open holds can still resume. A queued run whose own open holds (counted or not)
+reach the limit is not started even when its owner is below the limit, and an owner Resume does not
+bypass it; discard or settle that run's own holds to free it. Concurrent
 claims and later heartbeat staleness can exceed the limit: it is a statement-snapshot
 admission gate, not a strict ceiling. To find what held work you have, start here before
 choosing a run to export or an exact hold to discard:
@@ -1496,13 +1504,16 @@ uzi run recovery [--json]
 - The human view shows only open holds across your runs, oldest first by `created_at`.
   Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ADMISSION`, `ARCHIVE` (whether an
   available capture exists), `WORKER`, and `AGE`. `ADMISSION` is the server's per-hold
-  custody admission membership: `counted (<reason>)`, `not counted`, or `-` when the
+  custody admission membership: `counted (<reason>)`, `not counted (<reason>)` (for example
+  `not counted (same_run_group)`: one of a run's open holds on the same original worker (any generation),
+  covered by that group's counted representative), or `-` when the
   server did not report it (a non-open hold or an older server), which is unknown, never
   `not counted`. Run and hold ids are shown in full.
-  Below the table it prints the owner-wide `open_holds`, `admission_counted_holds`,
+  Below the table it prints the owner-wide `open_holds`, `admission_units (admission_counted_holds): N`,
   `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate. Read
-  `admission_counted_holds` against the limit for capacity, and `open_holds` for total
-  custody. `blocked_runs` excludes continuations eligible for the exemption. If the
+  `admission_counted_holds` (admission units) against the limit for capacity, and `open_holds` for total
+  custody. `blocked_runs` excludes continuations eligible for the exemption, and also counts queued runs
+  stopped by the hard per-run bound (their own open holds at the limit), even when the owner is below it. If the
   server cannot read a valid `custody_hold_limit`, the listing returns an error instead of
   guessing a limit; an admin saves a valid value in Admin → Instance settings. For each
   `source_only` hold it reports retained source and archive availability independently.
@@ -1535,7 +1546,8 @@ uzi run recovery <run-id> [--json]
   `retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed`: it remains `source_only`, or `needs_action` after a failed
   latest capture, even with an available archive or capture in flight. Retained
   exhaustion with a finite retry can retry automatically; its NULL retry requires
-  owner Resume/Cancel. Adoption failure always requires owner Resume/Cancel; so does
+  owner Resume/Cancel. Adoption failure always requires an owner decision (Resume/Cancel; Cancel only for
+`secret_remediation_active`, where Resume is refused); so does
   the same cause when the worker refused an unsupported predecessor of an independent restore
   (no adoption was attempted).
   An open hold at `recovery_wait` / `anthropic_spend_limit` (no retry time) is owner-held
@@ -3411,6 +3423,14 @@ reports the error. `uzi settings get` shows `Default harness: automatic
 after Codex account mode, then the same overflow line; its decoded settings
 JSON includes `harness_overflow_enabled`.
 
+`uzi settings get` ends with a `Judge runs on:` line for the per-user
+[Judge runs on](./judge.md#judge-runs-on) setting: `Judge runs on: Same as the
+run (default)` when unset, otherwise `Judge runs on: Claude (your setting)` or
+`Judge runs on: Codex (your setting)`. `--json` carries the stored
+`judge_runs_on` (`claude`, `codex` or `null`) and, in `effective`, the
+`judge_harness` cell. The setting is changed in **Settings → Run defaults →
+Run judge**; there is no CLI write verb for it.
+
 Overflow applies at creation to new implicit issue runs started manually,
 by autopilot or by a schedule, with both harnesses usable, and only when your
 default harness is an explicit Claude or Codex: with the default automatic it
@@ -3831,7 +3851,8 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   without an automatic timer. Retained-source budget exhaustion can use cause
   `retained_recovery_exhausted`: three timed retries by default, then an owner
   hold with no countdown. An integrity refusal uses `retained_recovery_adoption_failed`,
-  requiring owner Resume or Cancel with no automatic retry; it also holds a run whose
+  requiring owner Resume or Cancel with no automatic retry (Resume is refused on the
+  `secret_remediation_active` detail); it also holds a run whose
   predecessor an independent restore does not support (canonical, hosted or no boundary
   record), where no adoption was attempted. A retained continuation
   whose departure was never witnessed uses the server-only cause
@@ -3968,7 +3989,7 @@ hold presentation and remedies are unchanged. See
 account hold waits for its account. `anthropic_spend_limit` has no timer and needs owner Resume, Switch token or Cancel. `codex_idle_stall`, `data_volume_full` and
 `retained_recovery_exhausted` retry when their timestamp is finite (even if due);
 explicit NULL instead needs owner Resume/Cancel, and omitted timing is unknown. `retained_recovery_adoption_failed` requires
-owner Resume/Cancel regardless of retry timing, including when it holds an unsupported restore predecessor. `pool_wait` instead clears only when a token is
+owner Resume/Cancel regardless of retry timing, including when it holds an unsupported restore predecessor. On the `secret_remediation_active` detail Resume is refused (409); export or operator recovery, then Cancel. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -4215,7 +4236,7 @@ for renewal bounds, storage risks and rollout requirements.
 a predecessor needs secret-scan remediation review, or this release does not support
 the predecessor for independent restore. The agent did not start. Local work and custody are
 preserved; the run is owner-held with no automatic retry, regardless of a
-displayed retry timestamp. In the remediation case, Resume holds again unless
+displayed retry timestamp. In the #4058 predecessor-remediation case, Resume holds again unless
 that remediation was resolved through a separately authorized route. The same cause
 also holds a run whose predecessor an independent restore does not support (canonical,
 hosted or no boundary record, when the earlier checks pass): the worker refused before
@@ -4226,10 +4247,29 @@ you cancel or discard it
 
 Read `uzi run recovery <id>` and export an available archive before deciding.
 Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,
-or `uzi run cancel <id>` to end the run. Resume preserves remaining wall time
+or `uzi run cancel <id>` to end the run, except on the active detail below. Resume preserves remaining wall time
 and may need `uzi run extend` first. It does not guarantee success: repeated
 adoption failure holds again. An earlier archive may omit latest local work.
 Timers, token changes and credential changes do not release this hold.
+
+The run's `recovery_wait_detail` (shown by `uzi run get --json`) can qualify the hold:
+
+- `secret_remediation_active`: the retained source still descends from a
+  secret-scan-flagged commit, so retrying unchanged cannot help. `uzi run get`, `list`,
+  `wait`, `inputs` and the TUI board and detail never offer Resume. They show both
+  routes, then Cancel: export an available archive (`uzi run export <id> --output <path>`,
+  which may omit later work kept on the worker; an archive is not proven to hold the
+  latest work), or an operator recovers the retained work from worker storage
+  ([Run recovery](run-recovery.md#retained-source-failure-and-local-proof)). `uzi run resume` and
+  `resume-now` return 409 before any write (no claim, generation, audit row or custody
+  release): "The retained source is held under an active secret-scan remediation; Resume
+  cannot succeed unchanged. An available recovery archive (`uzi run export <id>`) may
+  omit later work kept on the worker; an operator can recover the retained work from
+  worker storage. Cancel ends the run."
+- `remediation_proof_unknown`: the proof could not be verified, so a retry may help;
+  the output says so and Resume stays available.
+- absent: unclassified; the generic guidance above applies. The #4058 and #3644 holds
+  stay unclassified.
 
 Default wait and log follow stop for this owner decision, and the TUI marks
 NEEDS YOU. Explicit `--until` keeps its selected status set. See

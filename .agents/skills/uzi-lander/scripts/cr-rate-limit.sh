@@ -50,6 +50,8 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/cr-signal.sh
+. "$HERE/lib/cr-signal.sh"
 WATCH_PR_SCRIPT="${UZI_LANDER_WATCH_PR_SCRIPT:-$HERE/watch-pr.sh}"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
@@ -82,13 +84,12 @@ done
 # across BSD and GNU date. Fractional seconds are stripped first.
 iso2epoch() { jq -rn --arg t "$1" '$t|sub("\\.[0-9]+";"")|fromdateiso8601' 2>/dev/null; }
 
-# CodeRabbit's commit-status description on the PR head ("Review rate limited", "Review in
+# CodeRabbit's description on the PR head (status or check-run, lib/cr-signal.sh) ("Review rate limited", "Review in
 # progress", "Review skipped: …", or empty when CR never touched the head).
 cr_status() {
   local head
   head=$(gh pr view "$PR" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null) || return 1
-  gh api "repos/$REPO/commits/$head/status" \
-    --jq '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null
+  cr_head_desc "$REPO" "$head"
 }
 
 # Find the newest reset statement on the PR. Prints "<epoch-of-reset>\t<source>" or nothing.

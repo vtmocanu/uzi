@@ -290,7 +290,8 @@ export class TransientRecoveryError extends Error {
 
 /**
  * issue #1088: a single Anthropic SDK turn ended in a TRANSIENT provider error
- * (429/500/502/503/529/overloaded, or a status-less transport api error). Thrown on
+ * (429/500/502/503/529/overloaded, a status-less transport api error, or a 403 Cloudflare
+ * edge block page, issue #4271). Thrown on
  * driveTurn's failed-terminal throw-path (in place of materializing the generic
  * `Error(provider error: …)`), caught by {@link SdkExecutor.driveTurnWithEmptyRecovery}
  * which retries it with the existing bounded in-process backoff and, on a sustained
@@ -445,7 +446,9 @@ function foreignCliTermination(err: Error): string | undefined {
  * the SDK can report a 529 with no `terminal_reason`, and materialize already treats
  * `terminal_reason === "api_error" || apiErrorStatus != null` as an api error. The status
  * still goes through `isTransientStatus` (client.ts: 408, 429, >=500 incl. 529), so a
- * permanent 401/403/400 is never parked forever in the uncapped recovery park. Only a
+ * permanent 401/403/400 is never parked forever in the uncapped recovery park. The one
+ * exception is a 403 Cloudflare edge block page ({@link isCloudflareEdgeBlock}, issue
+ * #4271): it may clear without a credential change and is retried/parked like any transient provider error. Only a
  * status-less failure falls back to `terminal_reason === "api_error"`: that is a
  * transport/network failure and retryable, while a status-less failure without it is not
  * a provider error at all.
@@ -456,8 +459,29 @@ function foreignCliTermination(err: Error): string | undefined {
 function isProviderTransient(t: HarnessTerminal): boolean {
   return (
     t.outcome === "failed" &&
-    (t.apiErrorStatus != null ? isTransientStatus(t.apiErrorStatus) : t.terminalReason === "api_error")
+    (t.apiErrorStatus != null
+      ? isTransientStatus(t.apiErrorStatus) || isCloudflareEdgeBlock(t)
+      : t.terminalReason === "api_error")
   );
+}
+
+/**
+ * issue #4271: the `<title>` of the Cloudflare block/challenge page the Anthropic API edge can
+ * briefly answer with (HTTP 403). The bundled CLI maps a first-party 401/403 to
+ * `Failed to authenticate. API Error: <detail>`, and for an HTML error body `<detail>` is the
+ * page title; a real Anthropic 403 is JSON and shows its `error.message` instead. No structured
+ * SDK field distinguishes the two, so this exact, case-sensitive text is the only discriminator.
+ * If the provider text changes, the 403 is no longer matched and the run fails fast as before
+ * (the `classifySpendLimitTerminal` pattern in limit.ts).
+ */
+const CLOUDFLARE_BLOCK_PAGE_TITLE = "Attention Required! | Cloudflare";
+
+/**
+ * issue #4271: a 403 whose result text carries {@link CLOUDFLARE_BLOCK_PAGE_TITLE}, with or
+ * without `terminal_reason`. Every other 403 (and every 401/400) stays permanent.
+ */
+function isCloudflareEdgeBlock(t: HarnessTerminal): boolean {
+  return t.apiErrorStatus === 403 && typeof t.resultText === "string" && t.resultText.includes(CLOUDFLARE_BLOCK_PAGE_TITLE);
 }
 
 // PRD #517 M3/M5: the FALLBACK idle bound for an INTERACTIVE task's follow-up park — how
@@ -5378,11 +5402,12 @@ export class SdkExecutor implements Executor {
           Date.now(),
         );
         // issue #1088: a usage-limit death (limitFacts) still wins and materializes the
-        // TYPED LimitReachedError. Otherwise, a TRANSIENT provider error (429/5xx/529 or
-        // a status-less transport api_error) is thrown as a ProviderTransientError so the
+        // TYPED LimitReachedError. Otherwise, a TRANSIENT provider error (429/5xx/529, a
+        // status-less transport api_error, or a 403 Cloudflare edge block page, issue #4271)
+        // is thrown as a ProviderTransientError so the
         // recovery wrapper retries it and, on a sustained outage, PARKS via recovery_wait
-        // instead of terminal-failing. Permanent api errors (401/403/400) fail through
-        // materialize as before (isProviderTransient's isTransientStatus check excludes them).
+        // instead of terminal-failing. Every other api error (401, a non-Cloudflare 403, 400)
+        // fails through materialize as before (isProviderTransient excludes them).
         //
         // Issue #3767: a lead spend-limit 400 is an owner-held park candidate and is classified
         // FIRST, so neither stale rate-limit evidence (limitFacts) nor the transient branch can
@@ -5471,7 +5496,8 @@ export class SdkExecutor implements Executor {
    * issue #1197 (D-RC2b) + issue #1088: drive one turn, then bounded/budget-safe/
    * cancel-safe in-process retries when — and ONLY when — that turn either returned
    * POSITIVELY empty (0 turns, no model activity, no plan/questions/done), threw a
-   * {@link ProviderTransientError} (a 429/5xx/529 or status-less transport api error), OR
+   * {@link ProviderTransientError} (a 429/5xx/529, a status-less transport api error or a
+   * 403 Cloudflare edge block page), OR
    * threw an {@link EventFreeStreamError} (issue #3179: the stream ended with no events and
    * no terminal; the same prompt is re-driven, and the interrupted-calls note the preceding
    * dispatch appended, if any, is re-sent only after such an attempt).

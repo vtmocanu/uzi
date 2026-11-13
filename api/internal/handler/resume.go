@@ -85,6 +85,13 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
 			return
 		}
+		// Issue #4177: an active secret-scan remediation cannot be resumed unchanged. Refused before
+		// any write, so no claim, generation, hold or audit row is created. An absent or unknown
+		// detail never lands here and keeps the generic path.
+		if secretRemediationActive(run) {
+			httpx.Error(w, http.StatusConflict, secretRemediationResumeRefusal(runID))
+			return
+		}
 		var resumeErr error
 		switch run.RecoveryWaitCause.String {
 		case "data_volume_full":
@@ -129,6 +136,14 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		}
 		if resumeErr != nil {
 			if errors.Is(resumeErr, pgx.ErrNoRows) {
+				// The write is fenced on the same predicate; a park that classified itself active
+				// between the read and the write is the refusal, not a generic changed hold.
+				if run.RecoveryWaitCause.String == "retained_recovery_adoption_failed" {
+					if cur, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID}); err == nil && secretRemediationActive(cur) {
+						httpx.Error(w, http.StatusConflict, secretRemediationResumeRefusal(runID))
+						return
+					}
+				}
 				httpx.Error(w, http.StatusConflict, "run cannot resume: hold changed or no remaining budget")
 				return
 			}
@@ -347,4 +362,17 @@ func (h *Handler) resumePolicyHold(w http.ResponseWriter, r *http.Request, userI
 		slog.Error("resume policy hold", "run", runID, "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+// secretRemediationActive reports whether the run is parked at retained_recovery_adoption_failed
+// with the closed-set detail secret_remediation_active. Any other state, cause, NULL or unknown
+// value is false, so an unclassified park keeps the generic resume path.
+func secretRemediationActive(run store.Run) bool {
+	return run.Status == "recovery_wait" &&
+		run.RecoveryWaitCause.Valid && run.RecoveryWaitCause.String == "retained_recovery_adoption_failed" &&
+		run.RecoveryWaitDetail.Valid && run.RecoveryWaitDetail.String == workersvc.RecoveryDetailSecretRemediationActive
+}
+
+func secretRemediationResumeRefusal(runID uuid.UUID) string {
+	return fmt.Sprintf("The retained source is held under an active secret-scan remediation; Resume cannot succeed unchanged. An available recovery archive (uzi run export %s) may omit later work kept on the worker; an operator can recover the retained work from worker storage. Cancel ends the run.", runID)
 }

@@ -20,6 +20,41 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end -}}
 
+{{- /*
+  workloadLabels / workloadAnnotations: the operator's extra metadata for every
+  Deployment and StatefulSet the chart renders (values.yaml). Each renders the bare
+  map, or nothing when unset. A label may not replace one the chart sets: those keys
+  feed selectors and NetworkPolicies, so a collision fails the render.
+*/ -}}
+{{- define "uzi.workloadLabels" -}}
+{{- $extra := .Values.workloadLabels | default dict -}}
+{{- $owned := include "uzi.labels" . | fromYaml -}}
+{{- range $k, $v := $extra -}}
+{{- if or (hasKey $owned $k) (eq $k "app.kubernetes.io/component") (hasPrefix "uzi.dev/" $k) -}}
+{{- fail (printf "workloadLabels: %q is set by the chart and cannot be overridden" $k) -}}
+{{- end -}}
+{{- if not (kindIs "string" $v) -}}
+{{- fail (printf "workloadLabels: %q must be a string (quote it)" $k) -}}
+{{- end -}}
+{{- end -}}
+{{- with $extra }}{{ toYaml . }}{{ end -}}
+{{- end -}}
+
+{{- define "uzi.workloadAnnotations" -}}
+{{- range $k, $v := .Values.workloadAnnotations | default dict -}}
+{{- if hasPrefix "uzi.dev/" $k -}}
+{{- fail (printf "workloadAnnotations: %q uses the reserved uzi.dev/ prefix" $k) -}}
+{{- end -}}
+{{- if not (kindIs "string" $v) -}}
+{{- fail (printf "workloadAnnotations: %q must be a string (quote it)" $k) -}}
+{{- end -}}
+{{- end -}}
+{{- with .Values.workloadAnnotations -}}
+annotations:
+  {{- toYaml . | nindent 2 }}
+{{- end -}}
+{{- end -}}
+
 {{- define "uzi.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "uzi.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
@@ -363,6 +398,55 @@ true
 {{- end -}}
 
 {{- /*
+  uzi.validateBaseURLEntry: the ONE shape check for an allowlist base URL entry
+  (forge.allowedBaseURLs, issueTracker.allowedBaseURLs). It only ever fails; it renders
+  nothing, so include it as `{{- include "uzi.validateBaseURLEntry" (dict ...) -}}`.
+  Args (dict): "key" (the values key, for the message), "pos" (1-based entry position),
+  "entry" (the raw value), "rejectSeparators" (bool: also refuse a comma or whitespace,
+  for lists that are joined with "," into one env var).
+
+  NO fail message prints the entry or any part of it: an entry can carry credentials
+  (https://user:pw@host, ?private_token=...) and a render error ends up in CI logs and
+  Argo UI. Messages are "<key> entry <pos>: <reason>".
+
+  Every check runs on the RAW string, before any urlParse: sprig's urlParse aborts the
+  render with the raw text on malformed input, and reports empty userinfo for "https://@h"
+  and empty query/fragment for a bare "?" / "#", so URL-parsed fields cannot be trusted
+  to catch those. Order matters: userinfo, separators, query, fragment, path, shape.
+  An entry that passes the final anchored regex is made only of: https scheme, a host of
+  [A-Za-z0-9._-] or a bracketed run of [0-9A-Fa-f:.], an optional numeric port, an
+  optional trailing slash. A bracketed host is only SHAPE-checked: https://[:::] or
+  https://[1] pass, so a passing entry is not guaranteed to be a valid IPv6 literal; an
+  invalid one renders here and is refused by the api at boot instead. This helper never
+  calls urlParse on them. uzi.forgeEgressHosts refuses
+  a bracketed host itself, before its urlParse, because urlParse aborts the render echoing
+  the raw entry when a bracketed host is not a valid IP.
+*/}}
+{{- define "uzi.validateBaseURLEntry" -}}
+{{- $raw := toString .entry }}
+{{- $where := printf "%s entry %d" .key (int .pos) }}
+{{- if contains "@" $raw }}
+{{- fail (printf "%s: must not contain userinfo (user@ or user:password@); list the bare https://host[:port]" $where) }}
+{{- end }}
+{{- if and .rejectSeparators (regexMatch "[,\\s]" $raw) }}
+{{- /* The list is joined with "," and the api splits on ",", so an entry holding one would smuggle in a second URL past the https check. */}}
+{{- fail (printf "%s: must not contain a comma or whitespace (the entries are joined with \",\" into ISSUE_TRACKER_ALLOWED_BASE_URLS; list each URL as its own entry)" $where) }}
+{{- end }}
+{{- if contains "?" $raw }}
+{{- fail (printf "%s: has a query; only https://host[:port] with an optional trailing / is allowed" $where) }}
+{{- end }}
+{{- if contains "#" $raw }}
+{{- fail (printf "%s: has a fragment; only https://host[:port] with an optional trailing / is allowed" $where) }}
+{{- end }}
+{{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/]*/." $raw }}
+{{- fail (printf "%s: has a path; only https://host[:port] with an optional trailing / is allowed" $where) }}
+{{- end }}
+{{- if not (regexMatch "^(?i:https)://([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?/?$" $raw) }}
+{{- fail (printf "%s: must be an absolute https URL with a host, e.g. https://github.com (non-ASCII hosts use the xn-- form)" $where) }}
+{{- end }}
+{{- end }}
+
+{{- /*
   uzi.forgeEgressHosts: the worker egress destinations DERIVED from forge.allowedBaseURLs
   (PRD #808), as a JSON list of {"host": ..., "port": ...}. It is the ONE derivation every
   FQDN-egress provider consumes (Antrea ANNP, OVN EgressFirewall), so a forge host is
@@ -372,21 +456,24 @@ true
   (default 443), so a non-standard forge port does NOT diverge from the api, which preserves
   the port in NormalizeForgeBaseURL.
 
-  Validated fail-CLOSED to mirror the api: NormalizeForgeBaseURL refuses to boot on a
-  scheme-less / hostless entry, so a render that would emit an empty name (match-nothing at
-  best, match-anything at worst) is a hard render failure rather than a malformed rule.
+  Validated fail-CLOSED to mirror the api: every entry goes through uzi.validateBaseURLEntry
+  first (so urlParse only ever sees a well-formed bare https://host[:port]), and a render
+  that would emit an empty name (match-nothing at best, match-anything at worst) is a hard
+  render failure rather than a malformed rule.
   Consumers: `fromJsonArray (include "uzi.forgeEgressHosts" .)`.
 */}}
 {{- define "uzi.forgeEgressHosts" -}}
 {{- $out := list }}
-{{- range .Values.forge.allowedBaseURLs }}
-{{- $u := urlParse . }}
-{{- $host := $u.hostname }}
-{{- if or (not $host) (ne $u.scheme "https") }}
-{{- fail (printf "forge.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://github.com (it feeds both FORGE_ALLOWED_BASE_URLS and the worker egress FQDN list; the api's NormalizeForgeBaseURL rejects the same input at boot)." .) }}
+{{- range $i, $e := .Values.forge.allowedBaseURLs }}
+{{- include "uzi.validateBaseURLEntry" (dict "key" "forge.allowedBaseURLs" "pos" (add1 $i) "entry" $e "rejectSeparators" false) -}}
+{{- /* A bracketed host is refused BEFORE urlParse: urlParse aborts echoing the raw entry on a bracketed non-IP, and the message must not print the entry. */}}
+{{- if regexMatch "^(?i:https)://\\[" (toString $e) }}
+{{- fail (printf "forge.allowedBaseURLs entry %d resolves to an IP-literal host. FQDN egress rules cannot express an IP address. Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." (add1 $i)) }}
 {{- end }}
-{{- if or (contains ":" $host) (regexMatch "^[0-9]+(\\.[0-9]+)+$" $host) }}
-{{- fail (printf "forge.allowedBaseURLs entry %q resolves to an IP-literal host (%s). FQDN egress rules cannot express an IP address, and the derived port parsing breaks on a bracketed IPv6 literal (splitting the host on ':' yields an invalid port). Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." . $host) }}
+{{- $u := urlParse (toString $e) }}
+{{- $host := $u.hostname }}
+{{- if regexMatch "^[0-9]+(\\.[0-9]+)+$" $host }}
+{{- fail (printf "forge.allowedBaseURLs entry %d resolves to an IP-literal host. FQDN egress rules cannot express an IP address. Configure a DNS hostname, or express an IP-literal forge with an ipBlock-based egress policy instead." (add1 $i)) }}
 {{- end }}
 {{- /* urlParse has no .port field; .host carries host[:port], so split it out (default 443). */}}
 {{- $port := "443" }}
@@ -398,24 +485,18 @@ true
 
 {{- /*
   uzi.issueTrackerAllowedBaseURLs: issueTracker.allowedBaseURLs (PRD #4173 S3) as a JSON
-  list, validated fail-CLOSED like uzi.forgeEgressHosts: an entry must be an absolute https
-  URL with a host, mirroring what the api refuses at boot. Unlike the forge list there is
-  no IP-literal check, because nothing here derives an FQDN egress rule from it (a worker
-  never calls an issue tracker).
+  list, validated fail-CLOSED like uzi.forgeEgressHosts: every entry goes through
+  uzi.validateBaseURLEntry (bare https://host[:port], optional trailing /; no userinfo,
+  path, query or fragment; no comma or whitespace), mirroring what the api refuses at boot.
+  Unlike the forge list there is no IP-literal check, because nothing here derives an FQDN
+  egress rule from it (a worker never calls an issue tracker). Entries are returned as given.
   Consumers: `fromJsonArray (include "uzi.issueTrackerAllowedBaseURLs" .)`.
 */}}
 {{- define "uzi.issueTrackerAllowedBaseURLs" -}}
 {{- $out := list }}
-{{- range (.Values.issueTracker).allowedBaseURLs }}
-{{- /* Checked before urlParse: the list is joined with "," and the api splits on ",", so an entry holding one would smuggle in a second URL past the https check. */}}
-{{- if regexMatch "[,\\s]" (toString .) }}
-{{- fail (printf "issueTracker.allowedBaseURLs entry %q must not contain a comma or whitespace (the entries are joined with \",\" into ISSUE_TRACKER_ALLOWED_BASE_URLS; list each URL as its own entry)." .) }}
-{{- end }}
-{{- $u := urlParse . }}
-{{- if or (not $u.hostname) (ne $u.scheme "https") }}
-{{- fail (printf "issueTracker.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://tracker.example.com (it feeds ISSUE_TRACKER_ALLOWED_BASE_URLS; the api rejects the same input at boot)." .) }}
-{{- end }}
-{{- $out = append $out . }}
+{{- range $i, $e := (.Values.issueTracker).allowedBaseURLs }}
+{{- include "uzi.validateBaseURLEntry" (dict "key" "issueTracker.allowedBaseURLs" "pos" (add1 $i) "entry" $e "rejectSeparators" true) -}}
+{{- $out = append $out $e }}
 {{- end }}
 {{- toJson $out }}
 {{- end }}

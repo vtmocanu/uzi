@@ -9,38 +9,14 @@ import { maskEmail } from "../lib/demoMask";
 import { Card, SectionTitle, cx } from "./ui";
 import {
   failRate, failRateDelta, formatSince, summaryCost, perPrText,
-  FailedRunsBlock, TopCauses, SinceLastFailedRun, WindowToggle, Th, Td,
+  FailedRunsBlock, TopCauses, SinceLastFailedRun, WindowToggle, Th, Td, hasRecordedUsage, USAGE_SCOPE_NOTE,
 } from "./usageParts";
 import { breakdown, perUserRows } from "../lib/usageByUser";
+import { costShareRows } from "../lib/costShares";
+import { hasRecordedLifetimeUsage } from "../lib/usageRecorded";
 
 // PRD #40: one usage summary, with personal figures for everyone and factory
 // figures plus the selected-window per-user section only from the admin-gated response.
-
-// Largest-remainder (Hamilton) rounding: integer percentages that sum to exactly
-// 100. Floor each row's raw share, then award the leftover point(s) to the largest
-// fractional remainders. Deterministic tie-break (the leftover often ties): larger
-// raw total first, then row order — so per-row output is pinnable. Integer-exact
-// (remainder == total*100 % factoryTotal) so ties compare exactly. Guards a
-// non-positive factory total to all zeros; forcing 100 is correct only because the
-// rows partition the factory total (AdminUsagePerUser and AdminUsageTotals sum the
-// same non-chat runs).
-function costShares(totals: number[], factoryTotal: number): number[] {
-  if (factoryTotal <= 0) return totals.map(() => 0);
-  const scaled = totals.map((t) => t * 100);
-  const floors = scaled.map((s) => Math.floor(s / factoryTotal));
-  const remainders = scaled.map((s, i) => s - floors[i] * factoryTotal); // exact s % factoryTotal
-  const leftover = 100 - floors.reduce((a, b) => a + b, 0);
-  const order = totals
-    .map((_, i) => i)
-    .sort((a, b) => {
-      if (remainders[b] !== remainders[a]) return remainders[b] - remainders[a]; // largest remainder first
-      if (totals[b] !== totals[a]) return totals[b] - totals[a]; // then larger raw total
-      return a - b; // then row order
-    });
-  const shares = floors.slice();
-  for (let k = 0; k < leftover && k < shares.length; k++) shares[order[k]] += 1;
-  return shares;
-}
 
 // PRD #1429 M4b (D7) superseded PRD #40 Decision 8's "$0 renders '—'" heuristic: an
 // aggregate's cost_usd retains recorded API-equivalent costs, including partial
@@ -102,7 +78,7 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
             </ul>
           </div>
         </div>
-        {usage.run_count === 0 && <p className="mt-3 text-xs text-muted">No token usage recorded yet.</p>}
+        {!hasRecordedUsage(usage) && <p className="mt-3 text-xs text-muted">No token usage recorded yet.</p>}
       </div>
       <div><FailedRunsBlock outcomes={outcomes} personal={personal} /></div>
       <div><TopCauses outcomes={outcomes} personal={personal} /></div>
@@ -123,6 +99,8 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
   const failureOwner = admin?.users.find((u) => u.user_id === admin.factory.outcomes.lifetime.last_failed_user_id);
   const owner = failureOwner ? maskEmail(failureOwner.email, demo) : undefined;
   const since = admin ? formatSince(admin.earliest_run) : "";
+  // The API appends zero-usage rows for outcome-only users; count only users with recorded usage.
+  const usersWithUsage = admin ? admin.users.filter((u) => hasRecordedLifetimeUsage(u.usage, u.run_count, u.subscription_run_count, u.unreported_run_count)).length : 0;
   return (
     <Card className="min-w-0">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -130,9 +108,10 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
         <WindowToggle value={window} onChange={onWindowChange} />
       </div>
       <div className={cx("mt-4 grid gap-x-6 gap-y-3", admin && "md:grid-cols-2 md:grid-rows-[repeat(7,auto)]")}>
-        <UsageColumn usage={self} window={window} personal aligned={!!admin} runCountLine={`${self.run_count.toLocaleString("en-US")} ${self.run_count === 1 ? "run" : "runs"} with token usage`} />
-        {admin && <UsageColumn usage={admin.factory} window={window} personal={false} aligned owner={owner} runCountLine={`${admin.factory.run_count.toLocaleString("en-US")} runs with token usage by ${admin.users.length} ${admin.users.length === 1 ? "user" : "users"}${since ? ` since ${since}` : ""}`} />}
+        <UsageColumn usage={self} window={window} personal aligned={!!admin} runCountLine={`${self.run_count.toLocaleString("en-US")} primary work ${self.run_count === 1 ? "run" : "runs"} with token usage`} />
+        {admin && <UsageColumn usage={admin.factory} window={window} personal={false} aligned owner={owner} runCountLine={`${admin.factory.run_count.toLocaleString("en-US")} primary work runs with token usage${since ? ` since ${since}` : ""} · ${usersWithUsage} ${usersWithUsage === 1 ? "user" : "users"} with recorded usage`} />}
       </div>
+      <p className="mt-3 text-[11px] leading-relaxed text-muted">{USAGE_SCOPE_NOTE}</p>
       {admin && (
         <section aria-label={`Per-user usage, ${window === "lifetime" ? "all time" : "last 7 days"}`} className="mt-5 border-t border-edge pt-4">
           <h3 className="text-sm font-semibold text-fg">Per user · {window === "lifetime" ? "all time" : "last 7 days"}</h3>
@@ -150,10 +129,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
   if (window === "last_7_days" && !available) {
     return <p className="mt-2 text-sm text-muted">Seven-day per-user usage is unavailable. Upgrade the API to view this period.</p>;
   }
-  const factoryMicroUSD = Math.round(factory.cost * 1e6);
-  const shares = factoryMicroUSD > 0
-    ? costShares(rows.map((r) => Math.round(r.b.cost * 1e6)), factoryMicroUSD)
-    : undefined;
+  const shares = costShareRows(rows.map((r) => r.b.cost), factory.cost);
   return (
     <>
       {rows.length === 0 ? (
@@ -164,7 +140,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
             <thead>
               <tr>
                 <Th left>User</Th>
-                <Th>Runs</Th>
+                <Th title="Primary work runs with recorded usage in the period">Runs</Th>
                 {showPRs && <Th>PRs</Th>}
                 <Th>Failed</Th>
                 <Th>Fail rate</Th>
@@ -178,7 +154,7 @@ function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: Usage
             <tbody>
               {rows.map((u, i) => {
                 // Rank uses unrounded recorded cost; shares use integer microdollars.
-                // Largest-remainder rounding (see costShares) makes shares sum to 100%.
+                // Largest-remainder rounding (see costShareRows) makes shares sum to 100%.
                 const pct = shares?.[i];
                 // This user's selected cost_usd includes recorded partial costs —
                 // disclose their own subscription/unreported counts beside it rather than

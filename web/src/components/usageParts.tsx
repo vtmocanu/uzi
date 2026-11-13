@@ -1,9 +1,10 @@
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { failureRecency } from "../lib/failureRecency";
+import { hasRecordedLifetimeUsage } from "../lib/usageRecorded";
 import { useNow } from "../lib/useNow";
 import { stripUnsafeChars } from "../lib/safeText";
-import type { RunOutcomes } from "../lib/api";
+import type { RunOutcomes, SelfUsage } from "../lib/api";
 import { failOriginLabel } from "../lib/failOriginLabel";
 import type { aggregateDisclosure } from "../lib/costStatus";
 import { cx } from "./ui";
@@ -11,6 +12,18 @@ import type { UsageWindow } from "./UsageCards";
 
 // Presentation pieces shared by the current Overview's UsageCard (UsageCards.tsx) and the
 // Overview preview's OverviewUsageCard, so the two cannot drift before PRD #3877.
+
+// Issue #4209: run counts and failure rates cover primary work; tokens and cost also include
+// helper runs. One literal for both Usage cards, rendered under the KPI grid.
+export const USAGE_SCOPE_NOTE =
+  "Runs and failure rates count primary work: issues, tasks, prompts, jobs and self-improve. Cost and tokens also include helper runs (judge, cross-check, PR rework, CI fix).";
+
+// Issue #4209: run_count counts only primary work runs, so a helper-only user has
+// run_count 0 yet real spend. "Nothing recorded" is true only when tokens, cost, the
+// subscription/unreported counts and the run count are all zero.
+export function hasRecordedUsage(usage: SelfUsage): boolean {
+  return hasRecordedLifetimeUsage(usage.lifetime, usage.run_count, usage.lifetime_subscription_run_count, usage.lifetime_unreported_run_count);
+}
 
 // failureRecency for a cell that reads "<value> ago": only a duration gets " ago"; the
 // "Unavailable", "–" and "no failures" words stand alone.
@@ -231,13 +244,15 @@ export function WindowToggle({ value, onChange, className, steadyWidth }: { valu
 // first column names its row.
 type TableVariant = "current" | "preview";
 
-export function Th({ children, left, title, variant = "current" }: { children: ReactNode; left?: boolean; title?: string; variant?: TableVariant }) {
+// `start` (preview only) left-aligns a column header or cell without making it a row header,
+// for the By user table's combined cost-share / Claude-Codex bar column.
+export function Th({ children, left, start, title, variant = "current" }: { children: ReactNode; left?: boolean; start?: boolean; title?: string; variant?: TableVariant }) {
   if (variant === "preview") {
     return (
       <th
         scope="col"
         title={title}
-        className={cx("whitespace-nowrap border-b border-edge px-2.5 py-2 text-[11px] font-medium uppercase tracking-[0.04em] text-faint", left ? "text-left" : "text-right")}
+        className={cx("whitespace-nowrap border-b border-edge px-2.5 py-2 text-[11px] font-medium uppercase tracking-[0.04em] text-faint", left || start ? "text-left" : "text-right")}
       >
         {children}
       </th>
@@ -259,6 +274,7 @@ export function Th({ children, left, title, variant = "current" }: { children: R
 export function Td({
   children,
   left,
+  start,
   total,
   cost,
   title,
@@ -266,6 +282,7 @@ export function Td({
 }: {
   children?: ReactNode;
   left?: boolean;
+  start?: boolean;
   total?: boolean;
   cost?: boolean;
   title?: string;
@@ -274,7 +291,7 @@ export function Td({
   if (variant === "preview") {
     const cls = cx(
       "whitespace-nowrap px-2.5 py-2 align-top tabular-nums",
-      left ? "text-left" : "text-right",
+      left || start ? "text-left" : "text-right",
       total ? "border-t-2 border-edge-strong font-semibold text-fg" : "border-b border-edge/50 text-fg",
     );
     if (left) return <th scope="row" title={title} className={cx(cls, !total && "font-normal")}>{children}</th>;

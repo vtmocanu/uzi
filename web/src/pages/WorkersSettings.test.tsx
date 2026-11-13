@@ -1079,7 +1079,7 @@ describe("WorkersSettings hosted delete confirms; external delete does not (PRD 
     it("renders the callout inside the acted-on row, focused, with exact links and a plain-text overflow", async () => {
       await refuse();
       expect(row().contains(callout())).toBe(true);
-      expect(document.activeElement).toBe(callout());
+      await waitFor(() => expect(document.activeElement).toBe(callout()));
       expect(callout().textContent).toContain("Fix login");
 
       const list = within(callout()).getByRole("list", { name: LIST });

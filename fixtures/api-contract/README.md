@@ -65,6 +65,14 @@ ordering under database collations. Re-record the corpus from the Go test's
 printed replacement JSON with `UZI_TEST_DATABASE_URL` set; a skipped test does
 not verify it.
 
+Issue #4162 adds hand-authored new-server samples for custody admission units:
+`recovery_custody_holds.grouped.json` (a `same_run_group` member beside its
+group's representative; counted flags sum to `admission_counted_holds`),
+`recovery_custody_holds.grouped-zero.json` (explicit-zero aggregate) and
+`run.custody_run_hold_bound.json` (a queued run carrying the per-run hold-bound
+health reason). `TestCustodyAdmissionUnitsGroupedFixturesLiveDB` decodes them
+strictly into the Go DTOs; client tests render them.
+
 ### M2 `ZeroOf` exemptions, each cited (Decision 7)
 
 Every exemption below is a field the TS type says never-null while the Go **mapper**

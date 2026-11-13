@@ -51,7 +51,7 @@ func TestAdminJudgeAggregateLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	svc := New(q, newBox(t), testParams())
 
@@ -69,6 +69,7 @@ func TestAdminJudgeAggregateLiveDB(t *testing.T) {
 		userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
 		mustExec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 			userID, fmt.Sprintf("adminjudge-%s-%s@e2e", tag, userID))
+		trackLiveDBUser(t, pool, userID)
 		mustExec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 			 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
 		mustExec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)

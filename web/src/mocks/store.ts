@@ -172,6 +172,8 @@ function seed(): MockState {
   // carries a scheduled judge. An empty log rather than no entry: getRunMessages 404s on
   // an unseeded id, which the real API does not do for a run that exists.
   messages.set("run-unjudged", []);
+  // PRD #3257 M2: the judge-skipped fixture, an empty log for the same reason.
+  messages.set("run-judge-skipped", []);
   // Generated history runs reuse the done transcript (the closed-MR run precedent
   // above): opening one from the past list shows a full run view, not a 404 alert.
   // Shared row objects, same as closed-MR run — nothing mutates a seeded message.

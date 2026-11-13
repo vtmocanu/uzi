@@ -165,8 +165,11 @@ type PrRun = Pick<
   "status" | "kind" | "mr_iid" | "mr_state" | "repo_id" | "finished_at" | "created_at"
 >;
 
-// The viewer's completed issue runs whose MR is still open, one per (repo, MR): when several
-// runs share an MR the newest wins.
+// The viewer's completed issue runs whose MR is still open, one per (repo, MR). The newest
+// completed issue run per (repo, MR) is picked first and the MR state is read from that run
+// alone: the server's MR watcher (ListMRWatchCandidates) refreshes only the newest run per
+// issue, so an older run's stale "opened" must never count (#4167). A newest run whose state
+// is not yet observed (null) therefore hides the MR until the watcher syncs it.
 export function openPrs<T extends PrRun>(runs: ReadonlyArray<T>): T[] {
   const newest = (r: T) => {
     const t = Date.parse(r.finished_at ?? r.created_at);
@@ -174,12 +177,12 @@ export function openPrs<T extends PrRun>(runs: ReadonlyArray<T>): T[] {
   };
   const byMr = new Map<string, T>();
   for (const r of runs) {
-    if (r.status !== "completed" || r.kind !== "issue" || r.mr_iid == null || r.mr_state !== "opened") continue;
+    if (r.status !== "completed" || r.kind !== "issue" || r.mr_iid == null) continue;
     const key = `${r.repo_id}:${r.mr_iid}`;
     const prev = byMr.get(key);
     if (!prev || newest(r) > newest(prev)) byMr.set(key, r);
   }
-  return [...byMr.values()];
+  return [...byMr.values()].filter((r) => r.mr_state === "opened");
 }
 
 export type DecisionKind = "plan" | "question" | "park" | "pr";

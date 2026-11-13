@@ -105,7 +105,7 @@ const successorReasons = [
   "wrapper_marker_parent", "wrapper_lineage_ancestry", "wrapper_source_parent",
   "final_head", "final_tree", "final_marker_restoration", "final_dirty_diff", "final_ancestry",
   "attempt_invalid", "iteration_before", "episode_pin_changed", "identity_used", "seed_failed",
-  "iteration_after", "post_adoption_check",
+  "iteration_after", "post_adoption_check", "remediation_active", "remediation_proof_unknown",
 ];
 for (const reason of successorReasons) {
   it("M1 fixed successor allowlist: " + reason, () => {

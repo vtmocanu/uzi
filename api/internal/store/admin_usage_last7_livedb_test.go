@@ -131,8 +131,11 @@ func TestAdminUsageSevenDayWindowsLiveDB(t *testing.T) {
 		t.Fatal("outcomes-only user has usage")
 	}
 	// Independent expected token totals, microdollars, counts and cost exclusions.
+	// Issue #4209: run_count slots (5 and 13) count primary work runs only. The judge
+	// (factor 5) and cross_check (factor 6) rows still feed tokens, cost and the
+	// disclosure counts, but no longer the run counts: user 0 is 4 lifetime, 3 in 7 days.
 	wantUsage := map[uuid.UUID][16]int64{
-		users[0]: {21, 42, 63, 84, 70, 6, 1, 1, 19, 38, 57, 76, 60, 5, 1, 1},
+		users[0]: {21, 42, 63, 84, 70, 4, 1, 1, 19, 38, 57, 76, 60, 3, 1, 1},
 		users[1]: {15, 30, 45, 60, 75, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 		users[3]: {9, 18, 27, 36, 0, 1, 1, 0, 9, 18, 27, 36, 0, 1, 1, 0},
 	}
@@ -156,9 +159,9 @@ func TestAdminUsageSevenDayWindowsLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	factory := [16]int64{totals.LifetimeInputTokens, totals.LifetimeCacheReadTokens, totals.LifetimeCacheCreationTokens, totals.LifetimeOutputTokens, microsOf(t, totals.LifetimeCostUsd), totals.RunCount, totals.LifetimeSubscriptionRunCount, totals.LifetimeUnreportedRunCount,
-		totals.Last7InputTokens, totals.Last7CacheReadTokens, totals.Last7CacheCreationTokens, totals.Last7OutputTokens, microsOf(t, totals.Last7CostUsd), 6, totals.Last7SubscriptionRunCount, totals.Last7UnreportedRunCount}
+		totals.Last7InputTokens, totals.Last7CacheReadTokens, totals.Last7CacheCreationTokens, totals.Last7OutputTokens, microsOf(t, totals.Last7CostUsd), 4, totals.Last7SubscriptionRunCount, totals.Last7UnreportedRunCount}
 	// AdminUsageTotals has no seven-day run count; assert that slot independently.
-	if sums != factory || sums != [16]int64{45, 90, 135, 180, 145, 9, 2, 1, 28, 56, 84, 112, 60, 6, 2, 1} {
+	if sums != factory || sums != [16]int64{45, 90, 135, 180, 145, 7, 2, 1, 28, 56, 84, 112, 60, 4, 2, 1} {
 		t.Fatalf("factory usage: sums %v factory %v", sums, factory)
 	}
 

@@ -438,7 +438,14 @@ export class ClaudeCommandLane {
         supervisorBin: SUPERVISOR_BIN,
         onSpawned: (root, child) => {
           live.child = child;
-          if (root.startTime !== undefined) this.roots.set(live.id, { pid: root.pid, startTime: root.startTime });
+          if (root.startTime !== undefined) {
+            this.roots.set(live.id, { pid: root.pid, startTime: root.startTime });
+            try {
+              this.opts.log.info("guarded command supervisor root recorded", {
+                run_id: captured.context.run_id, pid: root.pid, start_time: root.startTime,
+              });
+            } catch { /* Diagnostics must not turn a recorded launch into a failed launch. */ }
+          }
           // issue #3915: an unrecorded supervisor exempts nothing, so a peer run's quiescence
           // proof cannot attribute it. Say so where the pod log keeps it.
           else this.opts.log.warn("guarded command supervisor root not recorded: start time unreadable", { pid: root.pid });
@@ -555,7 +562,15 @@ export class ClaudeCommandLane {
         try { pressure = await boundedCommandWait(prepared, this.cleanupMs); } catch { pressureLost = true; }
       }
       enrolled?.unregister();
+      const recordedRoot = this.roots.get(live.id);
       this.roots.delete(live.id);
+      if (recordedRoot) {
+        try {
+          this.opts.log.info("guarded command supervisor root disposed", {
+            run_id: captured.context.run_id, pid: recordedRoot.pid, start_time: recordedRoot.startTime,
+          });
+        } catch { /* Diagnostics must not change the confirmed disposal outcome. */ }
+      }
 
       // (12) Result.
       if (pressure) return this.pressureResult(captured, enrolled, metadata.commandId, pressure);

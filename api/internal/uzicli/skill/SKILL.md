@@ -465,7 +465,8 @@ uzi version
   retained-source budget exhaustion, `retained_recovery_exhausted`, with three
   timed retries by default followed by an owner hold (NULL retry) — or
   an integrity refusal, `retained_recovery_adoption_failed`, owner Resume/Cancel
-  with no automatic retry regardless of retry timing — or an unwitnessed
+  with no automatic retry regardless of retry timing (on `recovery_wait_detail`
+  `secret_remediation_active` Resume is refused, 409) — or an unwitnessed
   retained-custody continuation, `retained_continuation_unwitnessed` (server-only; claim
   released, work and custody kept), owner Resume/Cancel only, no automatic retry, not an
   integrity refusal — or
@@ -536,7 +537,8 @@ uzi version
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
   `worker_requeue_exhausted`, `worker_memory_pressure`,
-  `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, `anthropic_spend_limit`
+  `retained_recovery_adoption_failed` (Resume refused on detail `secret_remediation_active`),
+  `retained_continuation_unwitnessed`, `anthropic_spend_limit`
   (spend-limit owner hold: Resume, `uzi run set-token` or Cancel), owner-held
   `retained_recovery_exhausted` (NULL retry), or a paused credential-switch hold (`credential_switch_settling` /
   `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
@@ -788,7 +790,13 @@ uzi version
   call it: **queued** — the override just applies at the next claim, nothing else changes;
   **parked** (`limit_wait`, `pool_wait`, `recovery_wait`, `paused`) — a single-row promote
   returns it to **queued** immediately, so the next claim spends the chosen token without
-  waiting out the park; **running, or held at a gate/question/follow-up, on a worker that
+  waiting out the park. The exception is a `recovery_wait` run on an owner hold
+  (`worker_memory_pressure`, `worker_requeue_exhausted`, `codex_account_unavailable`, the
+  `retained_*` causes, a pending policy outcome, or the NULL-retry `data_volume_full` /
+  `forge_unreachable` / `codex_idle_stall` holds): it is refused (409, exit 5) with the hold
+  named and nothing written. Inspect the run's recovery options: Resume may re-hold it;
+  Cancel ends the run;
+  **running, or held at a gate/question/follow-up, on a worker that
   advertises the `credential_switch` capability** — the switch is only **requested**, not
   yet applied: the server signals it to the worker, which finishes quiescing and
   **releases** its claim (banking the elapsed time like a pause) before the switch is
@@ -845,20 +853,24 @@ uzi version
 - `uzi run recovery [<run-id>] [--json]` — start without a run id to find what held work
   you have before export or discard. The human view lists only open custody holds across
   your runs in `created_at` order, with full `RUN ID` and `HOLD ID`, `GEN`, `DISPOSITION`,
-  `ADMISSION` (`counted (<reason>)`, `not counted`, or `-` when the server did not report it: unknown, never `not counted`), `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
-  `open_holds`, `admission_counted_holds`, `custody_hold_limit`, `decision_needed`, and
+  `ADMISSION` (`counted (<reason>)`, `not counted (<reason>)` such as `not counted (same_run_group)`, or `-` when the server did not report it: unknown, never `not counted`), `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
+  `open_holds`, `admission_units (admission_counted_holds): N`, `custody_hold_limit`, `decision_needed`, and
   `blocked_runs` aggregate (the listing errors if the server cannot read a valid
-  `custody_hold_limit`; an admin saves one). Capacity uses admission count against the configured `custody_hold_limit` (default 8);
+  `custody_hold_limit`; an admin saves one). Capacity uses admission units (`admission_counted_holds`) against the configured `custody_hold_limit` (default 8);
   `open_holds` remains total custody. At most one hold per run is excluded when it backs
   an exact-owner/run/live-run, unreleased current-generation claim on a matching existing
   same-owner worker with a fresh non-null heartbeat (inclusive configured
   `WorkerHeartbeatStale` cutoff), in `claimed`, `running`, `awaiting_approval`,
   `awaiting_input` or `awaiting_followup`, without a `needs_action`/`source_only` decision.
   Unknown/mismatched, old/future-generation, stale, released, terminal and other statuses
-  remain counted; `active` attention alone is not eligibility. Accounting releases nothing
+  remain counted; `active` attention alone is not eligibility. Of the remaining open holds, a run's
+  open holds on the same original worker, from any of its generations, count as one unit (heartbeat plays no part); others count singly.
+  Accounting releases nothing
   and leaves open-hold cleanup safeguards intact. Previously claimed queued continuations
-  bypass owner admission with 1 to limit-1 own total open holds, losing that exemption at the limit;
-  `blocked_runs` excludes exempt continuations. Concurrent claims and late staleness can
+  bypass owner admission with 1 to limit-1 own total open holds. A queued run whose own open holds
+  (counted or not) reach the limit is not claimable even when its owner is below the limit, and owner
+  Resume does not bypass it (discard or settle that run's own holds); `blocked_runs` excludes exempt
+  continuations and includes such hard-bound runs. Concurrent claims and late staleness can
   exceed the limit under the statement-snapshot gate. The current API emits the new field
   even at zero; the CLI falls back to total only when an older API omits it, preserving
   explicit zero. The human view also prints
@@ -895,7 +907,11 @@ uzi version
   local work and custody are preserved, with no automatic retry regardless of
   retry timing. Read `uzi run recovery <id>` and export an available archive
   before owner Resume/Cancel. Resume requests another bounded attempt; success
-  is not assured and repeated adoption failure holds again. An unwitnessed continuation
+  is not assured and repeated adoption failure holds again. If `recovery_wait_detail` is
+  `secret_remediation_active` (source descends from a secret-scan-flagged commit), Resume and
+  `resume-now` return 409 and the CLI never offers them: export an available archive
+  (`uzi run export <id> --output <path>`; it may omit later work) or have an operator recover
+  from worker storage, then Cancel. `remediation_proof_unknown` means a retry may help. An unwitnessed continuation
   (`recovery_wait` / `retained_continuation_unwitnessed`, not an integrity refusal) is the
   same owner decision: claim released, work and custody kept, no automatic retry; export
   an available archive, then Resume or Cancel. Without a new owner

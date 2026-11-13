@@ -15,6 +15,7 @@ import type {
   JudgeOccurrence,
   JudgeRecommendationGroup,
   JudgeSettledMember,
+  JudgeSkip,
   PendingJudge,
   RecommendationCategory,
   ReviewVerdict,
@@ -23,7 +24,7 @@ import type {
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { coordKey, recommendationLabel } from "../../lib/judge";
-import { mockAdminScenarioReviews, mockPendingJudges, mockReviews, type MockReview } from "../data";
+import { mockAdminScenarioReviews, mockJudgeSkips, mockPendingJudges, mockReviews, type MockReview } from "../data";
 import { getRun, nextRunId } from "../store";
 import { repos } from "./forge";
 import { delay, mockScenario, requireAdmin, requireSession } from "./shared";
@@ -51,6 +52,13 @@ const adminExtraReviews: MockReview[] = mockAdminScenarioReviews.map((r) => ({
 // copy is what getRunReview reads and rerunJudge guards against.
 const pendingJudges: Record<string, PendingJudge> = Object.fromEntries(
   Object.entries(mockPendingJudges).map(([id, p]) => [id, { ...p }]),
+);
+
+// The recorded automatic-judge skips (PRD #3257), the same mutable-copy pattern. getRunReview
+// reads it; rerunJudge refuses a skipped target (the demo owner still has no usable credential
+// for the judge's harness), so no mock judge is ever created over a skip row.
+const judgeSkips: Record<string, JudgeSkip> = Object.fromEntries(
+  Object.entries(mockJudgeSkips).map(([id, s]) => [id, { ...s }]),
 );
 
 // recomputeTriage buckets a review's recommendations through the SAME precedence
@@ -673,10 +681,13 @@ export const judgeApi = {
     if (!getRun(id)) throw new ApiError(404, "run not found");
     const review = reviews.find((r) => r.target_run_id === id);
     const pending = pendingJudges[id];
+    // Read precedence review > pending judge > skip, as GetRunReviewPanel applies it.
+    const skip = !review && !pending ? judgeSkips[id] : undefined;
     return delay(
       {
         review: review ? reviewDTO(review) : null,
         pending_judge: pending ? { ...pending } : null,
+        skip: skip ? { ...skip } : null,
       },
       60,
     );
@@ -987,6 +998,15 @@ export const judgeApi = {
     // exercisable in mock mode instead of only against a live database.
     if (pendingJudges[id]) {
       throw new ApiError(409, "a judge run is already in progress for this run");
+    }
+    // PRD #3257: a skipped target's owner still has no usable credential for the judge's
+    // harness in the demo, so Run judge returns the real 422 (handler RerunJudge's
+    // no_credential_for_harness body) and the panel shows it inline. No judge is created on
+    // the other harness.
+    const skip = judgeSkips[id];
+    if (skip) {
+      const message = `the judge's harness (${skip.harness}) has no usable credential`;
+      throw new ApiError(422, message, { error: message, code: "no_credential_for_harness" });
     }
     // A mock judge run: no worker executes it, so the seeded review is unchanged —
     // the panel just shows the in-flight note. Cloning the target run yields a

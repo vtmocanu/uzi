@@ -1263,7 +1263,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
       AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind, @worker_caps::text[], r.required_capabilities, @capability_aware::boolean)
       -- PRD #1296 M1 (D2/D4): custody-admission. Block the claim when the run's OWNER
-      -- already holds >= @custody_hold_limit admission-counted open holds (ADR-2445) — the
+      -- already holds >= @custody_hold_limit admission units (ADR-2445) — the
       -- owner has too much unpublished work awaiting recovery disposition. A gated claim
       -- matches no row, so the run stays queued (the health resolver surfaces a distinct
       -- custody-limit reason against this SAME predicate in a later milestone). This is an
@@ -1290,20 +1290,33 @@ WITH checker_template_pins AS MATERIALIZED (
       -- and loops forever; the owner cap used to stop that loop. Issue #3859 charges a
       -- WITNESSED departure of such a continuation (SweepClaimedNeverStartedCohort), so this
       -- bound remains the backstop for unwitnessed ones (e.g. older agents). Once a single run holds
-      -- @custody_hold_limit open holds of its own, it faces the owner cap like new work. The
-      -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
+      -- @custody_hold_limit open holds of its own, it is refused outright (see the hard
+      -- per-run bound below), whatever the owner count says. The
+      -- exemption is mirrored, logically equivalent under that hard bound, by
+      -- GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
       -- agree.
+      --
+      -- Issue #4162 / ADR-2445 amendment: the bound is HARD. A run whose own open holds (every
+      -- open hold, counted or not) reach @custody_hold_limit is refused here whatever the owner
+      -- count says; it is ANDed with the owner arm below, not ORed. The owner count is in
+      -- admission UNITS (fn_custody_admission_count groups one run's holds on one original
+      -- worker into a single unit). This is an admission gate with ADR-2445 D6 statement-snapshot
+      -- semantics, not a transactional ceiling: the predicate is evaluated in the candidate scan
+      -- before FOR UPDATE OF r SKIP LOCKED, so a claim plus requeue committed between another
+      -- claimant's snapshot and its row lock can be missed. Sequential claims see every
+      -- committed hold. A refused claim inserts no hold (the generation hold INSERT is fed only
+      -- by the claimed row).
       -- Report-only checkers open no custody hold; their exemption is independent
       -- of the bounded continuation exemption for code-publishing runs above.
       AND (@custody_hold_limit::int <= 0
            OR r.kind = 'cross_check'
-           OR (r.claim_generation >= 1
-               AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
-                             WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
-               AND (SELECT count(*) FROM recovery_custody_holds oh2
-                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int)
-           OR (SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)) < @custody_hold_limit::int)
+           OR ((SELECT count(*) FROM recovery_custody_holds oh2
+                  WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int
+               AND ((r.claim_generation >= 1
+                     AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                   WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open'))
+                    OR (SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)) < @custody_hold_limit::int)))
       -- PRD #3522 M3: the weekly usage reserve admission gate. @reserve_on is true only when the run
       -- owner has a threshold set (users.weekly_reserve_pct); every other @reserve_* param is then
       -- precomputed in Go (workersvc/usage_reserve.go, reserveSnapshot) from the owner's fresh
@@ -2060,16 +2073,19 @@ HAVING count(*) >= @custody_hold_limit::int AND @custody_hold_limit::int > 0;
 
 -- name: GetCustodyAdmissionForRun :one
 -- Issue #1751 / ADR-1751: the per-run custody-admission facts the health resolver reads so
--- its reasonCustodyLimit pill agrees with ClaimRun. open_holds is total open custody;
--- admission_counted_holds is the shared live-claim-discounted count compared against
--- @custody_hold_limit (ADR-2445); continuation_exempt is ClaimRun's continuation exemption, byte-for-byte
--- the same expression: the run was claimed before (claim_generation >= 1) AND its OWN open
--- custody-hold count (owner-scoped) is at least 1 and below @custody_hold_limit. The upper bound
--- stops a run that the never-started sweep keeps requeueing from opening holds forever (see
--- ClaimRun). A continuation-exempt run is never blocked by the custody cap. The separate
--- kind='cross_check' exemption is handled before this health read; hold-free children do not
--- become continuation-exempt. A run that does not exist (or
--- belongs to another owner), or a non-positive limit, yields continuation_exempt = false.
+-- its custody pills agree with ClaimRun. open_holds is total open custody;
+-- admission_counted_holds is the shared admission-UNIT count compared against
+-- @custody_hold_limit (ADR-2445, issue #4162: the live-claim-discounted count with one run's
+-- holds on one original worker grouped into one unit); continuation_exempt is ClaimRun's
+-- continuation exemption, logically equivalent under the hard per-run bound: the run was claimed before
+-- (claim_generation >= 1) AND its OWN open custody-hold count (owner-scoped) is at least 1 and
+-- below @custody_hold_limit. own_open_holds is that same own count (every open hold of the run,
+-- counted or not) and run_hold_bound_reached is ClaimRun's hard per-run bound: the limit is
+-- positive and own_open_holds >= the limit. A bound-reached run is refused by ClaimRun even when
+-- the owner is below the limit. The separate kind='cross_check' exemption is handled before this
+-- health read; hold-free children do not become continuation-exempt. A run that does not exist
+-- (or belongs to another owner), or a non-positive limit, yields continuation_exempt = false and
+-- run_hold_bound_reached = false.
 SELECT
     fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)::bigint AS admission_counted_holds,
     (SELECT count(*) FROM recovery_custody_holds h
@@ -2080,7 +2096,17 @@ SELECT
                       AND (SELECT count(*) FROM recovery_custody_holds oh2
                              WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int)
                 FROM runs r
-                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid), false)::boolean AS continuation_exempt;
+                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid), false)::boolean AS continuation_exempt,
+    COALESCE((SELECT count(*) FROM recovery_custody_holds oh2
+                WHERE oh2.user_id = @user_id::uuid AND oh2.run_id = @run_id::uuid
+                  AND oh2.state = 'open'
+                  AND EXISTS (SELECT 1 FROM runs r
+                                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid)), 0)::bigint AS own_open_holds,
+    COALESCE((SELECT (@custody_hold_limit::int > 0
+                      AND (SELECT count(*) FROM recovery_custody_holds oh2
+                             WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') >= @custody_hold_limit::int)
+                FROM runs r
+                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid), false)::boolean AS run_hold_bound_reached;
 
 -- name: GetRunClaimContext :one
 -- The repo + connection facts the claim payload needs, alongside the run. The
@@ -2431,10 +2457,13 @@ WHERE id = @id AND user_id = @user_id;
 -- "Consumed" here means APPLIED and not discarded (issue #1604): an approve the worker
 -- discarded as stale is settled by DiscardRunInputRows with disposition 'superseded', and
 -- that row never opens the gate.
--- claimed→running and running→running are unaffected (the guard only narrows the
--- awaiting_approval source status); autopilot never enters awaiting_approval.
--- Required cross-check runs additionally match the current published payload and
--- an applied, bound approval for its current gate revision.
+-- For ordinary runs claimed→running and running→running are unaffected (this guard
+-- only narrows the awaiting_approval source status); autopilot never enters
+-- awaiting_approval. Cross-check runs are NOT exempt: when
+-- (plan_cross_check_required OR plan_cross_check_gated) AND NOT auto_approve and
+-- plan_md is set, EVERY entry to running, claimed→running included, needs the
+-- current presented payload to match and an applied, bound approval for the current
+-- gate revision (the status-independent clause below, issue #4158).
 UPDATE runs SET
     -- Startup/recovery reports do not resolve an interrupted required plan check.
     -- SetRunAutopilotPlan clears on canonical application; the guards below admit
@@ -4210,6 +4239,10 @@ RETURNING id, user_id, status;
 --
 -- anthropic_spend_limit is deliberately NOT excluded: the owner chose a new credential, which
 -- is one of the three ways forward out of that hold (the others are Resume and Cancel).
+--
+-- The owner-hold exclusions below (all but the three retry-stamp ones) are mirrored in Go by
+-- workersvc.recoveryWaitOwnerHold, so set-token refuses them with a specific error instead of a
+-- 0-row race. Change one, change the other.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
@@ -9462,9 +9495,12 @@ WHERE run_id = ANY(@run_ids::uuid[]);
 
 -- name: SelfUsage :one
 -- The requesting user's own usage (PRD #40 M3, GET /api/usage): lifetime totals,
--- last-7-days totals, and the count of their runs that carry usage. Windowed on the
+-- last-7-days totals, and run_count: the count of their PRIMARY work runs (issue, task,
+-- prompt, job, self_improve; fn_usage_primary_kind, issue #4209) that carry usage. Tokens,
+-- cost and the subscription/unreported counts still sum every non-chat run's usage, helper
+-- runs included: they measure billed work. Windowed on the
 -- run's created_at (laptop scale ≈ when it spent). COALESCE(...,0) so a user with no
--- usage gets zeros + run_count 0 (the client reads run_count==0 as "nothing yet").
+-- usage gets zeros + run_count 0.
 -- Chat runs are excluded (belt-and-suspenders: the fold never writes chat rows).
 -- PRD #1332 M5A (D2): each dollar sum now travels with subscription/unreported RUN COUNTS
 -- for the SAME window, so no partial dollar total can read as complete — a run is counted by
@@ -9477,12 +9513,12 @@ WHERE run_id = ANY(@run_ids::uuid[]);
 -- a generic plan nested-loop the full fold per run row; the lateral makes run_id a per-row
 -- qual that pushes down to run_usage_pkey, so only this user's legs are folded. CROSS (not
 -- LEFT) keeps the inner-join semantics: a run with no usage contributes no row, so run_count
--- still counts only runs that carry usage. The LIMIT 1 is a semantic no-op (the view's
+-- still counts only runs that carry usage (primary kinds only). The LIMIT 1 is a semantic no-op (the view's
 -- outermost GROUP BY run_id yields at most one row per run) kept as a FENCE: without it the
 -- planner may pull the lateral subquery back up into a plain join and lose the per-row
 -- pushdown this rewrite exists for.
 WITH scoped AS (
-    SELECT r.created_at, t.cost_status,
+    SELECT r.created_at, r.kind, t.cost_status,
            t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
     FROM runs r
     CROSS JOIN LATERAL (
@@ -9509,19 +9545,20 @@ SELECT
     COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
     count(*) FILTER (WHERE cost_status = 'subscription' AND created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
     count(*) FILTER (WHERE cost_status = 'unreported'   AND created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
-    count(*)::bigint AS run_count
+    count(*) FILTER (WHERE fn_usage_primary_kind(kind))::bigint AS run_count
 FROM scoped;
 
 -- name: AdminUsageTotals :one
 -- Factory-wide totals across ALL users' runs (PRD #40 M3, GET /api/admin/usage).
 -- Same shape as SelfUsage without the user filter; at the same snapshot and cutoff
 -- this equals the SUM of AdminUsagePerUser rows (both read run_usage_totals joined
--- to non-chat runs). Separate handler reads may observe concurrent changes.
+-- to non-chat runs). run_count counts primary work runs only (fn_usage_primary_kind,
+-- issue #4209); sums include helper spend. Separate handler reads may observe concurrent changes.
 -- PRD #1332 M5A (D2): the factory-wide dollar sums carry subscription/unreported RUN COUNTS
 -- for both windows, mirroring SelfUsage, so a partial dollar total can never read as
 -- complete. M5A adds no public DTO field for the counts; M5B consumes them.
 WITH scoped AS (
-    SELECT r.created_at, t.cost_status,
+    SELECT r.created_at, r.kind, t.cost_status,
            t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
     FROM run_usage_totals t
     JOIN runs r ON r.id = t.run_id
@@ -9542,16 +9579,19 @@ SELECT
     COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
     count(*) FILTER (WHERE cost_status = 'subscription' AND created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
     count(*) FILTER (WHERE cost_status = 'unreported'   AND created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
-    count(*)::bigint AS run_count,
-    -- The earliest usage-bearing run's creation time, for the factory card's "since
-    -- <date>" (PRD #40 M6). NULL when the factory has no usage yet.
+    count(*) FILTER (WHERE fn_usage_primary_kind(kind))::bigint AS run_count,
+    -- The earliest usage-bearing non-chat run's creation time (helper runs included: it
+    -- dates the spend), for the factory card's "since <date>" (PRD #40 M6). NULL when the
+    -- factory has no usage yet.
     MIN(created_at)::timestamptz AS earliest_run
 FROM scoped;
 
 -- name: AdminUsagePerUser :many
--- Both windows over usage-bearing non-chat runs. Lifetime groups remain present
--- even when their seven-day totals are zero; at the same snapshot and cutoff,
--- each window sums to the factory.
+-- Both windows over usage-bearing non-chat runs. Token, cost and disclosure sums include
+-- helper runs; run_count, last7_run_count and the harness run counts count primary work
+-- runs only (fn_usage_primary_kind, issue #4209), so a helper-only user keeps a row with
+-- run_count 0. Lifetime groups remain present even when their seven-day totals are zero;
+-- at the same snapshot and cutoff, each window sums to the factory.
 SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.input_tokens), 0)::bigint          AS input_tokens,
     COALESCE(SUM(t.cache_read_tokens), 0)::bigint      AS cache_read_tokens,
@@ -9560,8 +9600,8 @@ SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.cost_usd), 0)::numeric              AS cost_usd,
     count(*) FILTER (WHERE t.cost_status = 'subscription')::bigint AS subscription_run_count,
     count(*) FILTER (WHERE t.cost_status = 'unreported')::bigint   AS unreported_run_count,
-    count(t.run_id)::bigint AS run_count,
-    count(t.run_id) FILTER (WHERE r.created_at >= now() - interval '7 days')::bigint AS last7_run_count,
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind))::bigint AS run_count,
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind) AND r.created_at >= now() - interval '7 days')::bigint AS last7_run_count,
     COALESCE(SUM(t.input_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_input_tokens,
     COALESCE(SUM(t.cache_read_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_cache_read_tokens,
     COALESCE(SUM(t.cache_creation_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_cache_creation_tokens,
@@ -9569,13 +9609,13 @@ SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.cost_usd) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
     count(*) FILTER (WHERE t.cost_status = 'subscription' AND r.created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
     count(*) FILTER (WHERE t.cost_status = 'unreported' AND r.created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
-    -- Runs by harness (issue #3876), the same population as run_count / last7_run_count.
+    -- Runs by harness (issue #3876), the same primary-work population as run_count / last7_run_count.
     -- runs.harness is NOT NULL with CHECK (harness IN ('claude','codex')) (migrations
     -- 00226/00227), so per window claude + codex == run_count.
-    count(t.run_id) FILTER (WHERE r.harness = 'claude')::bigint AS claude_run_count,
-    count(t.run_id) FILTER (WHERE r.harness = 'codex')::bigint AS codex_run_count,
-    count(t.run_id) FILTER (WHERE r.harness = 'claude' AND r.created_at >= now() - interval '7 days')::bigint AS last7_claude_run_count,
-    count(t.run_id) FILTER (WHERE r.harness = 'codex' AND r.created_at >= now() - interval '7 days')::bigint AS last7_codex_run_count
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind) AND r.harness = 'claude')::bigint AS claude_run_count,
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind) AND r.harness = 'codex')::bigint AS codex_run_count,
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind) AND r.harness = 'claude' AND r.created_at >= now() - interval '7 days')::bigint AS last7_claude_run_count,
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind) AND r.harness = 'codex' AND r.created_at >= now() - interval '7 days')::bigint AS last7_codex_run_count
 FROM run_usage_totals t
 JOIN runs r ON r.id = t.run_id
 JOIN users u ON u.id = r.user_id
@@ -9654,9 +9694,12 @@ ORDER BY u.id;
 -- These count over `runs` DIRECTLY, NOT run_usage_totals (D1): a run that fails at
 -- provisioning / credential lookup / guardrail has no usage row, so a rate computed
 -- over the usage join would systematically hide the infra failures this number exists
--- to surface. The predicate matches what the Runs page lists: terminal runs only
--- (status IN ('completed','failed','cancelled')) and the ListRunsForUser kind filter
--- (D2: chat/judge failures and cross-check child outcomes are not factory run outcomes). Windowed on created_at (D3), the same
+-- to surface. Issue #4209: outcomes count terminal PRIMARY work runs only, the population
+-- fn_usage_primary_kind defines (issue, task, prompt, job, self_improve), over terminal
+-- runs only (status IN ('completed','failed','cancelled')). Helper runs (chat, judge,
+-- cross_check, mr_rework, ci_fix, manual and automatic alike) are not factory run outcomes.
+-- This no longer mirrors the Runs page: ListRunsForUser still lists mr_rework and ci_fix.
+-- Windowed on created_at (D3), the same
 -- axis as the usage 7-day figures, so the two 7-day numbers on one card describe the
 -- same set of runs. plan_rejected is split out of failed (D4): rejecting a plan is the
 -- owner's decision, kept in the denominator and its own bar segment but out of the
@@ -9682,7 +9725,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE user_id = @user_id AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND kind NOT IN ('chat', 'judge', 'cross_check')
+      AND fn_usage_primary_kind(kind)
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
 SELECT
@@ -9691,7 +9734,7 @@ SELECT
     COALESCE((SELECT f.origin FROM last_failure f), '')::text AS last_failed_origin,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.user_id = @user_id AND r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check')
+       WHERE r3.user_id = @user_id AND r3.status = 'completed' AND fn_usage_primary_kind(r3.kind)
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
@@ -9736,20 +9779,20 @@ SELECT
               FROM runs r2
               WHERE r2.user_id = @user_id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = @user_id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE runs.user_id = @user_id
   AND status IN ('completed', 'failed', 'cancelled')
-  AND kind NOT IN ('chat', 'judge', 'cross_check');
+  AND fn_usage_primary_kind(kind);
 
 -- name: AdminRunOutcomes :one
 -- Factory-wide run outcome counts for BOTH windows (PRD #1293 M1); same shape as
@@ -9761,7 +9804,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND kind NOT IN ('chat', 'judge', 'cross_check')
+      AND fn_usage_primary_kind(kind)
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
 SELECT
@@ -9771,7 +9814,7 @@ SELECT
     COALESCE((SELECT f.user_id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_failed_user_id,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check')
+       WHERE r3.status = 'completed' AND fn_usage_primary_kind(r3.kind)
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
@@ -9808,18 +9851,18 @@ SELECT
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE status IN ('completed', 'failed', 'cancelled')
-  AND kind NOT IN ('chat', 'judge', 'cross_check');
+  AND fn_usage_primary_kind(kind);
 
 -- name: AdminRunOutcomesPerUser :many
 -- Per-user lifetime and seven-day outcome counts for the admin factory breakdown (PRD #1293 M1, D5).
@@ -9831,7 +9874,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND kind NOT IN ('chat', 'judge', 'cross_check')
+      AND fn_usage_primary_kind(kind)
     ORDER BY user_id, COALESCE(finished_at, status_since) DESC, id DESC
 )
 SELECT u.id AS user_id, u.email,
@@ -9840,7 +9883,7 @@ SELECT u.id AS user_id, u.email,
     COALESCE((SELECT f.origin FROM last_failure f WHERE f.user_id = u.id), '')::text AS last_failed_origin,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.user_id = u.id AND r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check') AND f.user_id = u.id
+       WHERE r3.user_id = u.id AND r3.status = 'completed' AND fn_usage_primary_kind(r3.kind) AND f.user_id = u.id
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS finished,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
@@ -9880,19 +9923,19 @@ SELECT u.id AS user_id, u.email,
               FROM runs r2
               WHERE r2.user_id = u.id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               GROUP BY 1) o) AS fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = u.id AND r2.created_at >= now() - interval '7 days'
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs r
 JOIN users u ON u.id = r.user_id
 WHERE r.status IN ('completed', 'failed', 'cancelled')
-  AND r.kind NOT IN ('chat', 'judge', 'cross_check')
+  AND fn_usage_primary_kind(r.kind)
 GROUP BY u.id, u.email
 ORDER BY u.id;
 
@@ -11151,7 +11194,7 @@ SELECT id, runs.user_id, status, auto_approve,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
-       harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
+       harness, codex_material_revision, codex_secret_id, worker_id, claim_generation, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
@@ -13184,7 +13227,7 @@ WITH expired AS (
     RETURNING cc.*
 ), cancelled AS (
     UPDATE runs child SET plan_cross_check_gate_reason = NULL,
-    status = 'cancelled', finished_at = now(), updated_at = now(),
+    status = 'cancelled', status_since = now(), finished_at = now(), updated_at = now(),
         claim_released_at = now()
     FROM expired e WHERE child.id = e.checker_run_id AND child.status NOT IN ('completed', 'failed', 'cancelled')
 ), banked AS (
@@ -13219,7 +13262,7 @@ WITH leads AS MATERIALIZED (
     RETURNING cc.*
 ), cancelled AS (
     UPDATE runs child SET plan_cross_check_gate_reason = NULL,
-    status = 'cancelled', finished_at = now(), updated_at = now(),
+    status = 'cancelled', status_since = now(), finished_at = now(), updated_at = now(),
         claim_released_at = now()
     FROM superseded cc WHERE child.id = cc.checker_run_id
       AND child.status NOT IN ('completed', 'failed', 'cancelled')
@@ -13273,6 +13316,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
+  AND NOT (runs.recovery_wait_cause = 'retained_recovery_adoption_failed' AND runs.recovery_wait_detail IS NOT DISTINCT FROM 'secret_remediation_active')
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -13329,12 +13373,13 @@ UPDATE runs SET
     worker_recovery_episode = runs.worker_recovery_episode + 1,
     requeue_episode_baseline = runs.requeue_count,
     stale_requeue_generation = NULL, worker_recovery_evidence = NULL,
-    recovery_wait_cause = NULL, recovery_retry_not_before = NULL,
+    recovery_wait_cause = NULL, recovery_wait_detail = NULL, recovery_retry_not_before = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
+  AND NOT (runs.recovery_wait_cause = 'retained_recovery_adoption_failed' AND runs.recovery_wait_detail IS NOT DISTINCT FROM 'secret_remediation_active')
   -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
   -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
@@ -13426,6 +13471,7 @@ RETURNING *;
 -- Called under GetRunOwnedByWorkerForUpdate. Execution release is not custody release.
 UPDATE runs SET status='recovery_wait', status_since=now(), updated_at=now(),
  recovery_wait_cause = @recovery_cause::text,
+ recovery_wait_detail = CASE WHEN @recovery_cause::text = 'retained_recovery_adoption_failed' THEN sqlc.narg('recovery_detail')::text END,
  recovery_wait_count=recovery_wait_count+1,
  retained_park_count=retained_park_count+CASE WHEN @counted::boolean THEN 1 ELSE 0 END,
  recovery_retry_not_before=sqlc.narg('retry_not_before')::timestamptz,

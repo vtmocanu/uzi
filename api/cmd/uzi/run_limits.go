@@ -315,7 +315,9 @@ func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			"are mutually exclusive.\n\n" +
 			"On a QUEUED run it takes effect at the next claim; on a PARKED run (limit_wait, " +
 			"pool_wait, recovery_wait, paused) it promotes the run back to `queued` at once so the " +
-			"next claim spends the chosen token. On a RUNNING or gated run held by a capable worker " +
+			"next claim spends the chosen token. A recovery_wait run on an owner hold (for example worker " +
+			"memory pressure, worker requeue exhausted or a retained recovery cause) is refused (409, exit 5) " +
+			"with the hold named and nothing written; use Resume or Cancel. On a RUNNING or gated run held by a capable worker " +
 			"the switch is REQUESTED and takes effect when the worker releases its claim; it is refused " +
 			"(409, exit 5) when no live worker holds the run or the holding worker predates the " +
 			"credential_switch capability. A foreign or unknown run — or an unknown token label — is " +

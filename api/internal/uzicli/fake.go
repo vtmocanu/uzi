@@ -58,6 +58,7 @@ type FakeClient struct {
 	LeadConfigHistoryByID map[string]apitypes.LeadConfigHistoryDTO
 	Reviews               map[string]*apitypes.ReviewDTO
 	PendingJudges         map[string]*apitypes.PendingJudgeDTO
+	JudgeSkips            map[string]*apitypes.JudgeSkipDTO
 	Workers               []apitypes.WorkerDTO
 	CordonWorkerResult    apitypes.WorkerDTO
 	UncordonWorkerResult  apitypes.WorkerDTO

@@ -5,12 +5,13 @@
 // in one scroll; the discriminator is that everything here shapes future runs,
 // while everything on Account is who you are and what you hold.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
 import { CrossCheckDefaults } from "../components/CrossCheckDefaults";
 import { UsageReserveSetting } from "../components/UsageReserveSetting";
-import type { UserSettings, BindMode, ModelSettingCell } from "../lib/apiTypes";
+import type { UserSettings, BindMode, Harness, ModelSettingCell } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton, Toggle } from "../components/ui";
@@ -50,6 +51,15 @@ function modelInEffect(cell: ModelSettingCell): string {
   return `In effect: ${cell.resolved_model} \u00b7 ${modelSettingSourceLabel("model", cell.source)}`;
 }
 
+// A judge lane's line under its select (PRD #3257): the In-effect line, or, when the judge
+// runs on the other harness, "Not used: ..." followed by the model this lane would use.
+function judgeLaneNote(cell: ModelSettingCell | undefined, notUsed: string): string {
+  if (!notUsed) return cell ? modelInEffect(cell) : "";
+  return cell
+    ? `${notUsed} \u00b7 ${cell.resolved_model} (${modelSettingSourceLabel("model", cell.source)})`
+    : notUsed;
+}
+
 // The two summary lanes save independently, so a response may carry a stale sibling cell
 // when saves land out of order. Take only the saved lane's cell from the response and keep
 // the rest of the committed cells; a response without that cell (older server) leaves them be.
@@ -67,6 +77,20 @@ function mergeSummaryCell(
 }
 
 const CUSTOM_EMPTY_MESSAGE = "Enter a model ID, or choose Default.";
+
+// PRD #3257 "Judge runs on": "" is Same as the run (stored NULL), else the one harness every
+// judge runs on. The help line under the select says what each choice does to a judged run.
+type JudgeRunsOnChoice = "" | Harness;
+const HARNESS_LABEL: Record<Harness, string> = { claude: "Claude", codex: "Codex" };
+
+function judgeRunsOnHelp(choice: JudgeRunsOnChoice): string {
+  if (choice === "") {
+    return "Claude runs use the Claude judge model, Codex runs the Codex model. Pick Claude or Codex to judge every run on one harness.";
+  }
+  const on = HARNESS_LABEL[choice];
+  const other = HARNESS_LABEL[choice === "claude" ? "codex" : "claude"];
+  return `Every run is judged on ${on}, so ${other} runs get a ${on} judge. If ${on} can't run, the judge is skipped, never charged to ${other}.`;
+}
 
 export function RunDefaults() {
   const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel, uziLabel } = useAuth();
@@ -333,6 +357,53 @@ export function RunDefaults() {
   const [claudeUsable, setClaudeUsable] = useState(false);
   const [codexUsable, setCodexUsable] = useState(false);
 
+  // PRD #3257: "Judge runs on", saved the moment it changes. The select shows the pending
+  // choice while the PUT is in flight and falls back to the stored value on failure. It is
+  // never gated on credential usability, and nothing here rewrites it when a credential goes
+  // away: an explicit choice without a usable credential stays saved and the card says so.
+  const [judgeRunsOn, setJudgeRunsOn] = useState<JudgeRunsOnChoice>("");
+  const [judgeRunsOnBusy, setJudgeRunsOnBusy] = useState(false);
+  const [judgeRunsOnError, setJudgeRunsOnError] = useState("");
+
+  // The select stays enabled while saving (disabling the focused control drops keyboard
+  // focus to <body>), so a change made mid-save is queued, latest wins, and sent after the
+  // in-flight PUT: one request at a time, in order. A failure falls back to the last saved
+  // value and drops the queue.
+  const judgeRunsOnSaving = useRef(false);
+  const judgeRunsOnQueued = useRef<JudgeRunsOnChoice | null>(null);
+
+  const saveJudgeRunsOn = async (next: JudgeRunsOnChoice) => {
+    setJudgeRunsOnError("");
+    setJudgeRunsOn(next);
+    if (judgeRunsOnSaving.current) {
+      judgeRunsOnQueued.current = next;
+      return;
+    }
+    judgeRunsOnSaving.current = true;
+    setJudgeRunsOnBusy(true);
+    // No save is in flight, so the shown value is the stored one.
+    let stored = judgeRunsOn;
+    let target: JudgeRunsOnChoice | null = next;
+    try {
+      while (target !== null) {
+        const { settings } = await api.putMySettings({ judge_runs_on: target === "" ? null : target });
+        stored = settings.judge_runs_on ?? "";
+        setCommittedSettings(current => current && ({ ...current, judge_runs_on: settings.judge_runs_on }));
+        const queued = judgeRunsOnQueued.current;
+        judgeRunsOnQueued.current = null;
+        target = queued !== null && queued !== stored ? queued : null;
+      }
+      setJudgeRunsOn(stored);
+    } catch (err) {
+      judgeRunsOnQueued.current = null;
+      setJudgeRunsOn(stored);
+      setJudgeRunsOnError(errorMessage(err, "Failed to change where the judge runs"));
+    } finally {
+      judgeRunsOnSaving.current = false;
+      setJudgeRunsOnBusy(false);
+    }
+  };
+
   // Per-user judge models, one per harness (PRD #69 M2, PRD #3245): "" = Default (the
   // instance value, then the built-in). Each lane keeps its own saved snapshot so one
   // "Save judge models" sends only the lanes that changed. Busy is shared: one request.
@@ -408,6 +479,7 @@ export function RunDefaults() {
       setSavedEffort(eff);
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
       setNowSummaryEnabled(settings.now_summary_enabled ?? null);
+      setJudgeRunsOn(settings.judge_runs_on ?? "");
       // PRD #1429 M4a, D3: harness-aware credential facts, computed on ALL secrets
       // (not the anthropic_token-only slice below, which the judge picker uses).
       setClaudeUsable(hasAnthropicToken(rows));
@@ -613,6 +685,34 @@ export function RunDefaults() {
   const showClaudeLane = claudeUsable || !codexUsable;
   const showCodexLane = codexUsable;
   const bothLanes = showClaudeLane && showCodexLane;
+
+  // PRD #3257: the judge-model lanes add one rule to the worker-lane rule above: the harness
+  // the judge explicitly runs on keeps its lane even without a usable credential, so the user
+  // can still see and set the model that judge would use. The other lane, when shown, is
+  // dimmed as not used.
+  const showClaudeJudgeLane = showClaudeLane || judgeRunsOn === "claude";
+  const showCodexJudgeLane = showCodexLane || judgeRunsOn === "codex";
+  const judgeOn = judgeRunsOn === "" ? null : HARNESS_LABEL[judgeRunsOn];
+  const claudeJudgeNotUsed = judgeRunsOn === "codex";
+  const codexJudgeNotUsed = judgeRunsOn === "claude";
+  const judgeHarnessUnusable =
+    (judgeRunsOn === "claude" && !claudeUsable) || (judgeRunsOn === "codex" && !codexUsable);
+  const notUsedCopy = judgeOn ? `Not used: the judge runs on ${judgeOn}` : "";
+
+  // The enforced banner's model clause: the one model in play when the judge runs on a fixed
+  // harness, both lanes when it follows the run. An older server without judge_models falls
+  // back to the session's effective (Claude) model.
+  const claudeJudgeResolved = claudeJudgeCell?.resolved_model ?? effectiveJudgeModel;
+  let enforcedJudgeModels = "";
+  if (judgeRunsOn === "codex") {
+    if (codexJudgeCell) enforcedJudgeModels = ` (Codex, with ${codexJudgeCell.resolved_model})`;
+  } else if (judgeRunsOn === "claude") {
+    if (claudeJudgeResolved) enforcedJudgeModels = ` (Claude, with ${claudeJudgeResolved})`;
+  } else if (claudeJudgeCell && codexJudgeCell) {
+    enforcedJudgeModels = ` (Claude runs on ${claudeJudgeCell.resolved_model}, Codex runs on ${codexJudgeCell.resolved_model})`;
+  } else if (effectiveJudgeModel) {
+    enforcedJudgeModels = ` (Claude runs on ${effectiveJudgeModel})`;
+  }
 
   // The active-lane badge follows the EFFECTIVE harness (D11), the same resolver the
   // rest of the web mirrors: "inherit" resolves to a USABLE stored default, else the
@@ -860,8 +960,8 @@ export function RunDefaults() {
           <SectionTitle>Run judge</SectionTitle>
           <p className="mt-2 text-sm text-muted">
             With the run judge on, each of your <strong className="text-fg">finished</strong> runs is
-            reviewed by an LLM on the <strong className="text-fg">credential of the run&rsquo;s harness</strong>:
-            your Anthropic token for a Claude run, your Codex credential for a Codex run. It reads
+            reviewed by an LLM using <strong className="text-fg">your own credential for the harness it runs on</strong>,
+            chosen below: your Anthropic token on Claude, your Codex credential on Codex. It reads
             the run trace and produces a verdict plus recommendations (a missing worker tool, an agent or
             template to improve, and so on). Results appear on the Judge page and on the run&rsquo;s page,
             plus a Slack DM when your Slack account is linked. It only recommends and never changes code. Your
@@ -869,25 +969,22 @@ export function RunDefaults() {
           </p>
         </div>
 
-        {/* Enforced-mode banner (PRD #69 M4, PRD #3245). When the admin turns on
+        {/* Enforced-mode banner (PRD #69 M4, PRD #3245, PRD #3257). When the admin turns on
             enforce-all, the judge runs on EVERY finished run regardless of the opt-in
-            below, still on the user's own credential for the run's harness — so the honest
-            opt-out is removing that credential, not this toggle. It names both resolved
-            judge models; an older server without judge_models falls back to the Claude
-            lane's effective_judge_model. */}
+            below, still on the user's own credential for the harness the judge runs on — so
+            the honest opt-out is removing that credential, not this toggle. It names the
+            resolved judge model(s) in play; an older server without judge_models falls back
+            to the Claude lane's effective_judge_model. */}
         {judgeEnforcedByAdmin && (
           <Alert
             tone="warning"
             message={
               `Your admin has ENFORCED the run judge: every one of your finished runs is judged on ` +
-              `your own credential for the run's harness` +
-              (claudeJudgeCell && codexJudgeCell
-                ? ` (Claude runs on ${claudeJudgeCell.resolved_model}, Codex runs on ${codexJudgeCell.resolved_model})`
-                : effectiveJudgeModel
-                  ? ` (Claude runs on ${effectiveJudgeModel})`
-                  : "") +
-              `, whether or not the opt-in below is on. The only way to opt out is to remove your ` +
-              `credential for that harness.`
+              `your own credential for the harness the judge runs on` +
+              enforcedJudgeModels +
+              `, whether or not the opt-in below is on. If you chose Claude or Codex under Judge runs on ` +
+              `and that harness has no usable credential, the judge is skipped. The only way to opt out is ` +
+              `to remove your credential for that harness.`
             }
           />
         )}
@@ -910,6 +1007,41 @@ export function RunDefaults() {
           <span className="text-fg">Judge my finished runs</span>
         </label>
 
+        {/* PRD #3257: where the judge runs. Placed first among the judge's controls because it
+            decides which of the token picker and model lanes below are read. Always shown: it
+            is not gated on a usable credential (unlike the model lanes) nor on enforcement,
+            and its stored value is never changed for the user. */}
+        <div className="space-y-1.5">
+          <Field label="Judge runs on" htmlFor="judge-runs-on">
+            <Select
+              id="judge-runs-on"
+              className="sm:max-w-xs"
+              value={judgeRunsOn}
+              // Locked until the initial load lands: a choice made earlier would be saved, then
+              // overwritten on screen by the loaded (older) value.
+              disabled={loading}
+              aria-busy={judgeRunsOnBusy || undefined}
+              aria-describedby={`judge-runs-on-help${judgeHarnessUnusable ? " judge-runs-on-unusable" : ""}`}
+              onChange={(e) => saveJudgeRunsOn(e.target.value as JudgeRunsOnChoice)}
+            >
+              <option value="">Same as the run</option>
+              <option value="claude">Claude</option>
+              <option value="codex">Codex</option>
+            </Select>
+          </Field>
+          <p id="judge-runs-on-help" className="text-xs text-faint">
+            {judgeRunsOnHelp(judgeRunsOn)}
+          </p>
+          {judgeOn && judgeHarnessUnusable && (
+            <p id="judge-runs-on-unusable" className="text-xs text-warn" role="status">
+              {judgeOn} has no usable credential, so the judge is skipped on every run until you add one
+              in <Link to="/settings" className="underline underline-offset-2">Account &amp; tokens</Link>.
+              Your choice stays saved.
+            </p>
+          )}
+          {judgeRunsOnError && <Alert message={judgeRunsOnError} />}
+        </div>
+
         {/* The judge token picker (PRD #104 M4/M6, #1140 M3). Without it "the judge
             lane can burn a different token, set from the web UI" is unreachable, which
             is why it is required and not a nicety. Shown with one OR more tokens: with
@@ -917,51 +1049,62 @@ export function RunDefaults() {
             showing since auto is the default. Hidden only at zero tokens. */}
         {secrets.length >= 1 && (
           <Field label="Token the judge spends">
-            <Select
-              aria-label="Token the judge spends"
-              // Driven by the MODE first (mirroring the worker picker): an auto judge
-              // lane selects the sentinel; a pinned one selects its token's label; and
-              // a pinned binding whose token was deleted arrives here as effective mode
-              // "default" with a null pointer — so it shows the default-token option.
-              // The label is resolved from `secrets` by id BEFORE the DTO's own label:
-              // GET /api/auth/me never fills judge_anthropic_secret_label (only the
-              // PUT /me/judge response does, handler.go toDTO), so on a fresh page load a
-              // pinned lane would otherwise render as "Use my default token", and the
-              // next picker change would silently replace the pin.
-              value={
-                user?.judge_anthropic_bind_mode === "auto"
-                  ? AUTO_OPTION
-                  : user?.judge_anthropic_bind_mode === "pinned"
-                    ? (secrets.find((s) => s.id === user.judge_anthropic_secret_id)?.label ??
-                      user.judge_anthropic_secret_label ??
-                      "")
-                    : ""
-              }
-              disabled={judgeBusy}
-              onChange={(e) => setJudgeBinding(e.target.value)}
-            >
-              {/* Copy mirrors the worker picker (WorkersSettings.tsx, F15): the two
-                  account-level choices read as sentences, and a token NAMED "default"
-                  shows "(your default)" so "default (default)" never appears. */}
-              <option value="">Use my default token</option>
-              <option value={AUTO_OPTION}>Auto-select from the pool</option>
-              <optgroup label="Pin to a token">
-                {/* PRD #1732 D5: a disabled token cannot be newly bound, so it is not
-                    offered; the one the judge is ALREADY pinned to stays visible and
-                    marked (D2 keeps the binding; retrospectives wait on it). */}
-                {secrets
-                  .filter((s) => s.enabled !== false || s.id === user?.judge_anthropic_secret_id)
-                  .map((s) => (
-                    <option key={s.id} value={s.label} disabled={s.enabled === false}>
-                      {s.label}
-                      {s.is_default ? " (your default)" : ""}
-                      {s.enabled === false ? " (disabled)" : ""}
-                    </option>
-                  ))}
-              </optgroup>
-            </Select>
+            {/* PRD #3257: when every judge runs on Codex this Anthropic token is never spent,
+                so the picker is dimmed (still operable, so the binding can be set ahead of a
+                switch back) and says why, in full contrast, beneath it. */}
+            <div className={claudeJudgeNotUsed ? "opacity-45" : undefined}>
+              <Select
+                aria-label="Token the judge spends"
+                aria-describedby={claudeJudgeNotUsed ? "judge-token-not-used" : undefined}
+                // Driven by the MODE first (mirroring the worker picker): an auto judge
+                // lane selects the sentinel; a pinned one selects its token's label; and
+                // a pinned binding whose token was deleted arrives here as effective mode
+                // "default" with a null pointer — so it shows the default-token option.
+                // The label is resolved from `secrets` by id BEFORE the DTO's own label:
+                // GET /api/auth/me never fills judge_anthropic_secret_label (only the
+                // PUT /me/judge response does, handler.go toDTO), so on a fresh page load a
+                // pinned lane would otherwise render as "Use my default token", and the
+                // next picker change would silently replace the pin.
+                value={
+                  user?.judge_anthropic_bind_mode === "auto"
+                    ? AUTO_OPTION
+                    : user?.judge_anthropic_bind_mode === "pinned"
+                      ? (secrets.find((s) => s.id === user.judge_anthropic_secret_id)?.label ??
+                        user.judge_anthropic_secret_label ??
+                        "")
+                      : ""
+                }
+                disabled={judgeBusy}
+                onChange={(e) => setJudgeBinding(e.target.value)}
+              >
+                {/* Copy mirrors the worker picker (WorkersSettings.tsx, F15): the two
+                    account-level choices read as sentences, and a token NAMED "default"
+                    shows "(your default)" so "default (default)" never appears. */}
+                <option value="">Use my default token</option>
+                <option value={AUTO_OPTION}>Auto-select from the pool</option>
+                <optgroup label="Pin to a token">
+                  {/* PRD #1732 D5: a disabled token cannot be newly bound, so it is not
+                      offered; the one the judge is ALREADY pinned to stays visible and
+                      marked (D2 keeps the binding; retrospectives wait on it). */}
+                  {secrets
+                    .filter((s) => s.enabled !== false || s.id === user?.judge_anthropic_secret_id)
+                    .map((s) => (
+                      <option key={s.id} value={s.label} disabled={s.enabled === false}>
+                        {s.label}
+                        {s.is_default ? " (your default)" : ""}
+                        {s.enabled === false ? " (disabled)" : ""}
+                      </option>
+                    ))}
+                </optgroup>
+              </Select>
+            </div>
+            {claudeJudgeNotUsed && (
+              <p id="judge-token-not-used" className="mt-1.5 text-xs text-muted">
+                {notUsedCopy}
+              </p>
+            )}
             <p className="mt-1.5 text-xs text-faint">
-              Used when the judge reviews a Claude run. Retrospectives can bill a different account from
+              Used whenever the judge runs on Claude. Retrospectives can bill a different account from
               the runs they review — point them at a cheaper console key while your runs stay on a
               subscription.
             </p>
@@ -980,27 +1123,30 @@ export function RunDefaults() {
         {/* Per-user judge models, one per harness (PRD #69 M2, PRD #3245). Default
             follows the instance value, then the built-in; pinning one here overrides it
             for YOUR judged runs only, and applies in enforced mode too. Each lane is shown
-            by the same rule as the worker-model lanes (showClaudeLane / showCodexLane);
-            the Codex lane offers only the curated models. */}
+            by the worker-model lane rule (showClaudeLane / showCodexLane), plus the lane of
+            the harness the judge explicitly runs on (PRD #3257); the other lane is dimmed
+            as not used. The Codex lane offers only the curated models. */}
         <div className="space-y-3">
-          <div className={`grid gap-4${showClaudeLane && showCodexLane ? " sm:grid-cols-2" : ""}`}>
-            {showClaudeLane && (
+          <div className={`grid gap-4${showClaudeJudgeLane && showCodexJudgeLane ? " sm:grid-cols-2" : ""}`}>
+            {showClaudeJudgeLane && (
               <div className="space-y-1.5">
                 <Field label="Claude judge model" htmlFor="judge-model">
-                  <ModelSelect
-                    id="judge-model"
-                    harness="claude"
-                    value={judgeModel}
-                    onChange={setJudgeModel}
-                    onCustomModeChange={setJudgeModelCustom}
-                    defaultLabel={modelDefaultLabel(claudeJudgeCell)}
-                    customAriaLabel="Custom Claude judge model ID"
-                    ariaDescribedBy={claudeJudgeCell ? "judge-model-effect" : undefined}
-                  />
+                  <div className={claudeJudgeNotUsed ? "opacity-45" : undefined}>
+                    <ModelSelect
+                      id="judge-model"
+                      harness="claude"
+                      value={judgeModel}
+                      onChange={setJudgeModel}
+                      onCustomModeChange={setJudgeModelCustom}
+                      defaultLabel={modelDefaultLabel(claudeJudgeCell)}
+                      customAriaLabel="Custom Claude judge model ID"
+                      ariaDescribedBy={claudeJudgeCell || claudeJudgeNotUsed ? "judge-model-effect" : undefined}
+                    />
+                  </div>
                 </Field>
-                {claudeJudgeCell && (
-                  <p id="judge-model-effect" className="text-xs text-faint">
-                    {modelInEffect(claudeJudgeCell)}
+                {(claudeJudgeCell || claudeJudgeNotUsed) && (
+                  <p id="judge-model-effect" className={`text-xs ${claudeJudgeNotUsed ? "text-muted" : "text-faint"}`}>
+                    {judgeLaneNote(claudeJudgeCell, claudeJudgeNotUsed ? notUsedCopy : "")}
                   </p>
                 )}
                 {judgeCustomEmpty && (
@@ -1011,24 +1157,26 @@ export function RunDefaults() {
                 {judgeModelWarning && <Alert message={judgeModelWarning} tone="warning" />}
               </div>
             )}
-            {showCodexLane && (
+            {showCodexJudgeLane && (
               <div className="space-y-1.5">
                 <Field label="Codex judge model" htmlFor="codex-judge-model">
-                  <ModelSelect
-                    id="codex-judge-model"
-                    harness="codex"
-                    allowCustom={false}
-                    value={codexJudgeModel}
-                    onChange={setCodexJudgeModel}
-                    onCustomModeChange={setCodexJudgeModelCustom}
-                    defaultLabel={modelDefaultLabel(codexJudgeCell)}
-                    customAriaLabel="Custom Codex judge model ID"
-                    ariaDescribedBy={codexJudgeCell ? "codex-judge-model-effect" : undefined}
-                  />
+                  <div className={codexJudgeNotUsed ? "opacity-45" : undefined}>
+                    <ModelSelect
+                      id="codex-judge-model"
+                      harness="codex"
+                      allowCustom={false}
+                      value={codexJudgeModel}
+                      onChange={setCodexJudgeModel}
+                      onCustomModeChange={setCodexJudgeModelCustom}
+                      defaultLabel={modelDefaultLabel(codexJudgeCell)}
+                      customAriaLabel="Custom Codex judge model ID"
+                      ariaDescribedBy={codexJudgeCell || codexJudgeNotUsed ? "codex-judge-model-effect" : undefined}
+                    />
+                  </div>
                 </Field>
-                {codexJudgeCell && (
-                  <p id="codex-judge-model-effect" className="text-xs text-faint">
-                    {modelInEffect(codexJudgeCell)}
+                {(codexJudgeCell || codexJudgeNotUsed) && (
+                  <p id="codex-judge-model-effect" className={`text-xs ${codexJudgeNotUsed ? "text-muted" : "text-faint"}`}>
+                    {judgeLaneNote(codexJudgeCell, codexJudgeNotUsed ? notUsedCopy : "")}
                   </p>
                 )}
                 {codexJudgeCustomEmpty && (
@@ -1041,7 +1189,9 @@ export function RunDefaults() {
             )}
           </div>
           <p className="text-xs text-faint">
-            The judge runs on the harness of the run it reviews, so each harness has its own judge model.
+            {judgeOn
+              ? `The judge runs on ${judgeOn} for every run, so only the ${judgeOn} judge model is used; the other stays saved. `
+              : "With Same as the run, the judge runs on the harness of the run it reviews, so each harness has its own judge model. "}
             Leave it on Default to follow your instance&rsquo;s choice; pin a cheaper model to spend less.
           </p>
           <Button
@@ -1059,6 +1209,10 @@ export function RunDefaults() {
             Save judge models
           </Button>
         </div>
+        <p className="border-t border-edge pt-3 text-xs text-faint">
+          If the judge&rsquo;s harness can&rsquo;t run, the judge is skipped, never charged to the other
+          provider.
+        </p>
       </Card>
 
       {/* Per-user run-summary models (PRD #362 M2, PRD #3248), one per harness. Each run

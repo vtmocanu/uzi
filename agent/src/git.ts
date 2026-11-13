@@ -9,7 +9,8 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { lstatSync, constants as fsConstants, createReadStream, createWriteStream, type Stats } from "node:fs";
+import { lstatSync, constants as fsConstants, createReadStream, createWriteStream, type BigIntStats, type Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import os from "node:os";
 import { isUtf8 } from "node:buffer";
 import path from "node:path";
@@ -487,9 +488,20 @@ const RETAINED_SUCCESSOR_REASONS = new Set([
   "wrapper_marker_parent", "wrapper_lineage_ancestry", "wrapper_source_parent",
   "final_head", "final_tree", "final_marker_restoration", "final_dirty_diff", "final_ancestry",
   "attempt_invalid", "iteration_before", "episode_pin_changed", "identity_used", "seed_failed",
-  "iteration_after", "post_adoption_check",
+  "iteration_after", "post_adoption_check", "remediation_active", "remediation_proof_unknown",
 ]);
 const retainedSuccessorDiagnostics = new WeakMap<Error, string>();
+
+/** Closed wire values the api accepts as `recovery_detail` on an adoption-failure park. */
+export type RetainedAdoptionRefusal = "secret_remediation_active" | "remediation_proof_unknown";
+
+/** The single map from a refusal's annotation to its wire value. Only the two remediation reasons map; every other
+ * refusal (and every unannotated error) is unclassified, which selects generic text and never permits adoption. */
+export function retainedAdoptionRefusal(error: unknown): RetainedAdoptionRefusal | undefined {
+  const reason = error instanceof Error ? retainedSuccessorDiagnostics.get(error) : undefined;
+  return reason === "remediation_active" ? "secret_remediation_active"
+    : reason === "remediation_proof_unknown" ? "remediation_proof_unknown" : undefined;
+}
 
 /** Attach only a fixed successor reason, without changing the thrown value's public surface.
  * Callers retain responsibility for excluding their abort and control-flow sentinels. */
@@ -1894,6 +1906,16 @@ export interface RemediationRecovery {
   edges: Array<{ from: string; to: string; grant: RemediationGrant; context: string; phase: "prepared" | "committed" }>;
 }
 
+/** Worker-owned, per-query diagnostics; never carries journal bytes or exception text. */
+export interface RemediationRestrictionProgress {
+  started?: boolean;
+  /** Set when withLock enters its locked section; any later failure is post-acquisition and sticky (#4191). */
+  acquired?: boolean;
+  cause?: "pre_read_unavailable" | "enrolled_observed" | "blocked" | "integrity" | "identity" |
+    "changed_facts" | "post_read_expiry" | "unknown";
+  observe?: (facts: RemediationRestrictionFacts) => void;
+}
+
 /** Negative evidence only; neither the data nor its fingerprint grants source use. */
 interface RemediationRestrictionFacts {
   readonly enrolled: boolean;
@@ -3083,6 +3105,164 @@ const RESIDUE_ENUMERATION_BUDGET = 4096;
 const RETENTION_WARNING_KEYS = 128;
 const RETIRE_SCRATCH_ENUMERATION_BUDGET = 4096;
 const RETIRE_SCRATCH_REPORTED_PATHS = 10;
+const RETIRE_SCRATCH_OUTCOME_BUDGET_MS = 30_000;
+const RETIRE_SCRATCH_WALK_MAX_ENTRIES = 200_000;
+/** Each directory level holds one descriptor open; deeper trees are reported partial, not followed. */
+const RETIRE_SCRATCH_WALK_MAX_DEPTH = 64;
+
+/** Reads `UZI_RETIRE_SCRATCH_OUTCOMES`: whether startup adds the read-only per-parent observation
+ *  records after the `runner retire scratch retained` warning. On by default; `0` restores the
+ *  warning-only behavior. Anything else refuses startup. */
+export function readRetireScratchOutcomesActivation(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.UZI_RETIRE_SCRATCH_OUTCOMES;
+  if (raw === undefined || raw === "" || raw === "1") return true;
+  if (raw === "0") return false;
+  throw new Error("UZI_RETIRE_SCRATCH_OUTCOMES must be unset, empty, 0 or 1");
+}
+
+type RetireScratchWalkReason = "entry_cap" | "time_cap" | "unreadable" | "cross_device" | "changed" | "vanished";
+type RetireScratchBytesState = "measured" | "partial" | "unknown";
+type RetireScratchSources = { state: "read"; paths: string[] } | { state: "unknown" } | { state: "not_attempted" };
+
+interface RetireScratchWalkCtx {
+  now: () => number;
+  deadline: number;
+  signal?: AbortSignal;
+  /** Directory entries listed so far, across every parent. */
+  entries: number;
+  maxEntries: number;
+  /** dev:ino of every non-directory inode with nlink > 1 already counted. */
+  seen: Set<string>;
+  beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+  /** Test hook: runs after lstat reported `dirPath` as a directory and before it is opened. */
+  beforeOpen?: (dirPath: string) => Promise<void>;
+}
+
+interface RetireScratchWalkAcc {
+  bytes: bigint;
+  /** Something (at least one lstat or fstat) was measured. */
+  measured: boolean;
+  reasons: Set<RetireScratchWalkReason>;
+}
+
+interface RetireScratchParentResult {
+  name: string;
+  recent: boolean;
+  kind: "dir" | "symlink" | "other";
+  bytes: bigint;
+  bytesState: RetireScratchBytesState;
+  reasons: RetireScratchWalkReason[];
+  empty: boolean;
+}
+
+function retireWalkErrorReason(err: unknown): RetireScratchWalkReason {
+  switch ((err as NodeJS.ErrnoException | undefined)?.code) {
+    case "ENOENT": return "vanished";
+    case "ELOOP": case "ENOTDIR": return "changed";
+    default: return "unreadable";
+  }
+}
+
+function retireWalkSpent(ctx: RetireScratchWalkCtx): "time_cap" | undefined {
+  return ctx.signal?.aborted || ctx.now() >= ctx.deadline ? "time_cap" : undefined;
+}
+
+function retireWalkAddBlocks(ctx: RetireScratchWalkCtx, acc: RetireScratchWalkAcc, st: BigIntStats, dedupe: boolean): void {
+  if (dedupe && st.nlink > 1n) {
+    const key = `${st.dev}:${st.ino}`;
+    if (ctx.seen.has(key)) return;
+    ctx.seen.add(key);
+  }
+  acc.bytes += st.blocks * 512n;
+  acc.measured = true;
+}
+
+const RETIRE_WALK_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
+
+/** Measure one directory that lstat reported as a directory, descriptor-relative and read-only. Returns
+ *  the number of names listed when the listing completed, undefined otherwise. Every handle is closed
+ *  in finally; descent goes through `/proc/self/fd/<fd>`, so a later swap of any ancestor name cannot
+ *  redirect it. */
+async function retireWalkDirectory(ctx: RetireScratchWalkCtx, acc: RetireScratchWalkAcc, openPath: string, display: string,
+  lst: BigIntStats, dev: bigint, depth: number): Promise<number | undefined> {
+  retireWalkAddBlocks(ctx, acc, lst, false);
+  if (depth > RETIRE_SCRATCH_WALK_MAX_DEPTH) { acc.reasons.add("entry_cap"); return undefined; }
+  let handle: FileHandle | undefined;
+  try {
+    await ctx.beforeOpen?.(display);
+    handle = await fs.open(openPath, RETIRE_WALK_OPEN_FLAGS);
+    const before = await handle.stat({ bigint: true });
+    if (before.dev !== lst.dev || before.ino !== lst.ino) { acc.reasons.add("changed"); return undefined; }
+    if (before.dev !== dev) { acc.reasons.add("cross_device"); return undefined; }
+    const base = `/proc/self/fd/${handle.fd}`;
+    const names: string[] = [];
+    let complete = true;
+    const list = await fs.opendir(base);
+    try {
+      for (;;) {
+        const spent = retireWalkSpent(ctx);
+        if (spent) { acc.reasons.add(spent); complete = false; break; }
+        const entry = await list.read();
+        if (!entry) break;
+        if (ctx.entries >= ctx.maxEntries) { acc.reasons.add("entry_cap"); complete = false; break; }
+        ctx.entries++;
+        names.push(entry.name);
+      }
+    } finally {
+      await list.close().catch(() => undefined);
+    }
+    for (const name of names) {
+      const spent = retireWalkSpent(ctx);
+      if (spent) { acc.reasons.add(spent); complete = false; break; }
+      await ctx.beforeEntry?.(display, name);
+      const child = `${base}/${name}`;
+      let cst: BigIntStats;
+      try { cst = await fs.lstat(child, { bigint: true }); }
+      catch (err) { acc.reasons.add(retireWalkErrorReason(err)); continue; }
+      if (cst.isDirectory()) await retireWalkDirectory(ctx, acc, child, path.join(display, name), cst, dev, depth + 1);
+      else retireWalkAddBlocks(ctx, acc, cst, true);
+    }
+    const after = await handle.stat({ bigint: true });
+    if (after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs || after.nlink !== before.nlink)
+      acc.reasons.add("changed");
+    return complete ? names.length : undefined;
+  } catch (err) {
+    acc.reasons.add(retireWalkErrorReason(err));
+    return undefined;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function retireWalkParent(ctx: RetireScratchWalkCtx, rootFd: number, rootDev: bigint, root: string,
+  parent: { name: string; recent: boolean; kind: "dir" | "symlink" | "other" }): Promise<RetireScratchParentResult> {
+  const acc: RetireScratchWalkAcc = { bytes: 0n, measured: false, reasons: new Set() };
+  let kind = parent.kind;
+  let empty = false;
+  const spent = retireWalkSpent(ctx);
+  if (spent) acc.reasons.add(spent);
+  else {
+    try {
+      await ctx.beforeEntry?.(root, parent.name);
+      const openPath = `/proc/self/fd/${rootFd}/${parent.name}`;
+      const lst = await fs.lstat(openPath, { bigint: true });
+      if (lst.isSymbolicLink()) { kind = "symlink"; retireWalkAddBlocks(ctx, acc, lst, true); }
+      else if (!lst.isDirectory()) { kind = "other"; retireWalkAddBlocks(ctx, acc, lst, true); }
+      else {
+        kind = "dir";
+        const listed = await retireWalkDirectory(ctx, acc, openPath, path.join(root, parent.name), lst, rootDev, 0);
+        empty = listed === 0 && acc.reasons.size === 0;
+      }
+    } catch (err) {
+      acc.reasons.add(retireWalkErrorReason(err));
+    }
+  }
+  const reasons = [...acc.reasons].sort();
+  return {
+    name: parent.name, recent: parent.recent, kind, bytes: acc.bytes, reasons, empty,
+    bytesState: reasons.length === 0 ? "measured" : acc.measured ? "partial" : "unknown",
+  };
+}
 /** issue #3153 — `<dataDir>/runner` (and the TMPDIR under it) now lives on the persistent data
  *  volume, so bytes that cannot be deleted accumulate across pod replacements instead of vanishing
  *  with an emptyDir. This per-process counter counts FAILED REMOVAL ATTEMPTS (not distinct paths:
@@ -4606,7 +4786,7 @@ export class GitCache {
 
   /** Local recovery clocks, including queued locks and actual child settlement. */
   async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget,
-    opts?: { closureBudget?: { delivered: number; limit: number } }): Promise<T> {
+    opts?: { closureBudget?: { delivered: number; limit: number }; restrictionProgress?: RemediationRestrictionProgress }): Promise<T> {
     // A caller-shared decoded-byte account is used by identity, but never above this cache's own ceiling.
     if (opts?.closureBudget) {
       // A NaN or negative limit is a refusal (0 admits nothing); anything else is capped at the ceiling.
@@ -4625,8 +4805,14 @@ export class GitCache {
       : undefined;
     if (Date.now() >= deadline) timeout.abort(new RecoveryDeadlineExhaustedError());
     const run = async (): Promise<T> => {
-      combined.throwIfAborted();
-      budget?.check();
+      try {
+        combined.throwIfAborted();
+        budget?.check();
+      } catch (error) {
+        if (opts?.restrictionProgress && !opts.restrictionProgress.started && !opts.restrictionProgress.acquired)
+          opts.restrictionProgress.cause = "pre_read_unavailable";
+        throw error;
+      }
       return this.recoveryOperations.run({ signal: combined, deadline, budget,
         // An explicit closureBudget is used by identity (never copied): the caller shares one mutable decoded-byte
         // account across several operations, independent of the ambient parent's.
@@ -4634,12 +4820,29 @@ export class GitCache {
         closureCache: parent?.closureCache ?? { identities: new Map(), entries: 0 },
       }, async () => {
         const result = await action(combined);
-        this.checkRecoveryInterruption();
+        try { this.checkRecoveryInterruption(); }
+        catch (error) {
+          if (opts?.restrictionProgress) opts.restrictionProgress.cause = "post_read_expiry";
+          throw error;
+        }
         return result;
       });
     };
     try { return await (budget ? MaintenanceBudget.run(budget, run) : run()); }
+    catch (error) {
+      // MaintenanceBudget.run checks the budget before entering `run`; classify that entry expiry only when it is
+      // positively the budget's own and no read has started.
+      if (opts?.restrictionProgress && !opts.restrictionProgress.started && !opts.restrictionProgress.acquired &&
+        this.isBudgetExpiry(error, budget))
+        opts.restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** Positive identity only: the error is a deadline expiry raised by one of these budgets (or the ambient one). */
+  private isBudgetExpiry(error: unknown, ...budgets: Array<MaintenanceBudget | undefined>): boolean {
+    return [...budgets, MaintenanceBudget.current()].some(b => b?.ownsExpiry(error) === true);
   }
 
   /** Central helpers also honor a budget scoped before any explicit recovery wrapper. */
@@ -9236,8 +9439,9 @@ export class GitCache {
    * throws. This never creates pins, opens a grant, or admits execution/publication of tracking. */
   async readRuntimeRemediationRecovery(barePath: string, branch: string,
     expectedSource: { runId: string; clonePath: string; attemptId?: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRecovery | undefined> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<RemediationRecovery | undefined> {
     return this.withLock(barePath, async () => {
+      if (progress) progress.started = true;
       // This read has no discovery/normalization effects. Legacy unenrolled sources need no
       // attempt identity; enrollment still requires the independently selected exact attempt.
       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
@@ -9245,7 +9449,7 @@ export class GitCache {
       if (!expectedSource.attemptId) throw new Error("remediation source identity unavailable");
       return this.readRemediationUnderLock(barePath, branch,
         { ...expectedSource, attemptId: expectedSource.attemptId }, durability, "runtime-restrictions");
-    });
+    }, undefined, progress);
   }
 
   /**
@@ -9254,11 +9458,19 @@ export class GitCache {
    * One two-read pass, no retries or writes; any unavailable evidence holds by throwing.
    * The fingerprint coordinates transient changes only, never eligibility or preservation.
    */
+  private readonly restrictionProgress = new AsyncLocalStorage<RemediationRestrictionProgress>();
+
+  /** Read-local context preserves the legacy three-argument custody reader seam. */
+  withRemediationRestrictionProgress<T>(progress: RemediationRestrictionProgress, action: () => Promise<T>): Promise<T> {
+    return this.restrictionProgress.run(progress, action);
+  }
+
   async readRemediationRestrictionFacts(barePath: string, branch: string, exactRunId: string,
     workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRestrictionFacts> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<RemediationRestrictionFacts> {
+    progress ??= this.restrictionProgress.getStore();
     return this.withRemediationRestrictionFacts(barePath, branch, exactRunId,
-      async facts => facts, workerSelectedSource, durability);
+      async facts => { progress?.observe?.(facts); return facts; }, workerSelectedSource, durability, progress);
   }
 
   /** Consume negative evidence while retaining B through awaited consumer completion.
@@ -9269,15 +9481,16 @@ export class GitCache {
   async withRemediationRestrictionFacts<T>(barePath: string, branch: string, exactRunId: string,
     consume: (facts: RemediationRestrictionFacts) => Promise<T>,
     workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
-    durability: MemoryParkDurability = {}): Promise<T> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<T> {
     // A caller-owned options object cannot redirect the identity while waiting for B.
     const source = workerSelectedSource && { runId: workerSelectedSource.runId,
       clonePath: workerSelectedSource.clonePath, attemptId: workerSelectedSource.attemptId };
     return this.withLock(barePath, async () => {
+      if (progress) progress.started = true;
       const facts = await this.remediationRestrictionFactsUnderLock(
-        barePath, branch, exactRunId, source, durability);
+        barePath, branch, exactRunId, source, durability, progress);
       return await consume(facts);
-    });
+    }, undefined, progress);
   }
 
   /** Admission consumes fresh negative evidence under B; false blocked is never a grant. */
@@ -9298,14 +9511,27 @@ export class GitCache {
   /** Shared by worker callbacks that already own B; never reacquire B here. */
   private async remediationRestrictionFactsUnderLock(barePath: string, branch: string, exactRunId: string,
     workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRestrictionFacts> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<RemediationRestrictionFacts> {
+    function fail(cause: NonNullable<RemediationRestrictionProgress["cause"]>, message: string): never {
+      if (progress) progress.cause = cause;
+      throw new Error(message);
+    }
+    const observe = (record: RemediationRecovery | undefined): void => {
+      if (!record || !progress) return;
+      progress.cause = "enrolled_observed";
+      progress.observe?.({ enrolled: true,
+        blocked: record.blocked !== false || record.excludedRoots === undefined || record.edges.some(e => e.phase !== "committed"),
+        flaggedOIDs: record.flaggedOIDs,
+        roots: [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])],
+        fingerprint: "" });
+    };
     try {
       if (!OWED_RUN_ID.test(exactRunId) || Buffer.byteLength(exactRunId) > 128 ||
           sanitizeForLog(exactRunId, Infinity) !== exactRunId || !validRemediationBranch(branch) ||
           Buffer.byteLength(branch) > 1024 || sanitizeForLog(branch, Infinity) !== branch)
-        throw new Error("invalid restriction identity");
+        fail("identity", "invalid restriction identity");
       if (workerSelectedSource && workerSelectedSource.runId !== exactRunId)
-        throw new Error("restriction source run mismatch");
+        fail("identity", "restriction source run mismatch");
       const read = async () => {
         const snapshot = await this.readRecoverySnapshot(barePath);
         // Unlike the legacy last-value reader, negative absence cannot ignore duplicates.
@@ -9313,32 +9539,36 @@ export class GitCache {
         const key = recoveryCaptureKey(branch);
         const activeEntries = entries.filter(e => e === key || e.startsWith(key + "\n"));
         if (activeEntries.length > 1 || activeEntries.some(e => !e.startsWith(key + "\n")))
-          throw new Error("ambiguous restriction journal");
+          fail("integrity", "ambiguous restriction journal");
         let activeRaw = activeEntries[0]?.slice(key.length + 1) || undefined;
-        let active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw);
+        let active: RecoveryJournalEntry | undefined;
+        try { active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw); }
+        catch { fail("integrity", "invalid restriction journal"); }
         // issue #3644: under a composite the active journal is S's entry (P is opaque and plain). A tombstone has none, so
         // `activeSource` stays undefined, syncJournalAndReadBack then compares that absence with P's non-empty raw and
         // throws: restriction facts REFUSE (fail closed) under a tombstone.
         let activeSource: { runId: string; clonePath: string; attemptId?: string } | undefined;
         if (this.restoreValueIn(entries, branch) !== undefined) {
           const composite = await this.resolveBranchJournalUnderLock(barePath, branch, entries);
-          if (composite.kind !== "composite") throw new Error("restriction restore composite unavailable");
+          if (composite.kind !== "composite") fail("integrity", "restriction restore composite unavailable");
           const live = composite.successor.kind === "entry" && composite.stage !== "retired" ? composite.successor : undefined;
           active = live?.journal;
           activeRaw = live?.raw;
           activeSource = live?.journal;
         }
+        if (active?.runId === exactRunId) observe(active.remediationRecovery);
         // Ordinary journals retain their legacy writer order. Strict parsing and the two
         // identical raw reads prove absence; only enrolled evidence requires canonical bytes.
         if (active?.remediationRecovery && recoveryJournalJson(active) !== activeRaw)
-          throw new Error("noncanonical restriction journal");
+          fail("integrity", "noncanonical restriction journal");
         if (workerSelectedSource) {
           const authenticated = await this.remediationSourceUnderLock(barePath, branch, workerSelectedSource, snapshot);
-          if (authenticated.raw !== activeRaw) throw new Error("restriction source changed");
+          if (authenticated.raw !== activeRaw) fail("changed_facts", "restriction source changed");
         }
         const protectedRaw: string[] = [];
         const protectedRecords = await this.protectedRecoveries(barePath, exactRunId, raw => protectedRaw.push(raw), snapshot);
-        if (protectedRecords.some(r => r.branch !== branch)) throw new Error("restriction custody branch mismatch");
+        for (const record of protectedRecords) observe(record.journal.remediationRecovery);
+        if (protectedRecords.some(r => r.branch !== branch)) fail("identity", "restriction custody branch mismatch");
         const relevant = active?.runId === exactRunId ? [active] : [];
         for (const journal of relevant) {
           const shape = parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot));
@@ -9347,15 +9577,22 @@ export class GitCache {
         }
         relevant.push(...protectedRecords.map(r => r.journal));
         if (relevant.some(j => j.remediationRecovery && j.remediationRecovery.branch !== branch))
-          throw new Error("restriction record branch mismatch");
+          fail("identity", "restriction record branch mismatch");
         return { activeRaw, protectedRaw, relevant, activeSource };
       };
       const first = await read();
-      await this.syncJournalAndReadBack(barePath, branch, first.activeRaw, durability, first.activeSource);
+      await this.syncJournalAndReadBack(barePath, branch, first.activeRaw, {
+        ...durability,
+        readback: async read => {
+          const back = durability.readback ? await durability.readback(read) : await read();
+          if (back !== first.activeRaw && progress) progress.cause = "changed_facts";
+          return back;
+        },
+      }, first.activeSource);
       const second = await read();
       if (first.activeRaw !== second.activeRaw ||
           JSON.stringify(first.protectedRaw) !== JSON.stringify(second.protectedRaw))
-        throw new Error("restriction read-back differs");
+        fail("changed_facts", "restriction read-back differs");
       const records = second.relevant.flatMap(j => j.remediationRecovery ? [j.remediationRecovery] : []);
       const flaggedOIDs = [...new Set(records.flatMap(r => r.flaggedOIDs))].sort();
       const roots = [...new Set(records.flatMap(r =>
@@ -9364,7 +9601,7 @@ export class GitCache {
       // Each stored record already passed its 64 KiB bound. Two identical active
       // and protected copies must not invent a smaller per-record limit.
       if (flaggedOIDs.length > 64 || roots.length > 1524)
-        throw new Error("restriction union overflow");
+        fail("integrity", "restriction union overflow");
       const fingerprint = createHash("sha256").update(JSON.stringify({
         runId: exactRunId, branch, source: workerSelectedSource ? { runId: workerSelectedSource.runId,
           clonePath: workerSelectedSource.clonePath, attemptId: workerSelectedSource.attemptId } : null,
@@ -10606,6 +10843,28 @@ export class GitCache {
     });
   }
 
+  /** Crash rediscovery for a blocked `adoption_failed` journal whose in-memory refusal class died with the previous
+   * process. Classification only, never admission: it re-runs the read-only remediation source selection under the
+   * bare lock and maps an annotated refusal to its wire value. Success, an unannotated refusal, an interrupted
+   * operation, a changed identity or any missing precondition all answer undefined (the generic text). Writes no
+   * ledger, pin or journal content; the evidence read may only re-sync the unchanged canonical journal bytes. */
+  async classifyBlockedRemediationAdoption(barePath: string, branch: string, key: string, expected: RecoverySource):
+    Promise<RetainedAdoptionRefusal | undefined> {
+    try {
+      return await this.withLock(barePath, async () => {
+        // allowLegacyRepair=false: this read can never append an attempt-ledger entry.
+        const journal = await this.checkedRecovery(barePath, branch, key, expected, false, undefined, false);
+        const recovery = journal.recovery;
+        if (recovery?.stage !== "blocked" || recovery.blocker !== "adoption_failed" ||
+            !journal.remediationRecovery || !recovery.restoreSource) return undefined;
+        try {
+          await this.remediationAdoptionUnderLock(barePath, branch, expected, recovery.restoreSource);
+          return undefined;
+        } catch (error) { return retainedAdoptionRefusal(error); }
+      });
+    } catch { return undefined; }
+  }
+
   /** Resolve only the exact charged source/reservation, or its explicitly verified handoff.
    * This handles a journal-root write landing before prepareRecoverySuccessor throws. */
   async recoveryReservationSnapshot(barePath: string, branch: string, key: string,
@@ -11162,12 +11421,44 @@ export class GitCache {
     if (!expected.attemptId || !src) throw new Error("remediation adoption source unavailable");
     const record = await this.readRemediationUnderLock(barePath, branch, { ...expected, attemptId: expected.attemptId });
     if (!record || record.ownedTip !== src) throw new Error("remediation adoption source unverified");
-    for (const oid of [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])]) {
-      if (await this.ancestry(barePath, oid, src) !== "divergent")
-        throw new Error("remediation adoption source still restricted");
+    const roots = [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])];
+    const restricted = await this.classifyRestrictedRoots(barePath, roots, src);
+    if (restricted !== "clear") {
+      const error = new Error("remediation adoption source still restricted");
+      if (restricted !== "unclassified") annotateRetainedSuccessorError(error, restricted);
+      throw error;
     }
     await this.proveRemediationForwardTarget(barePath, record, src);
     return record;
+  }
+
+  /** Classify why a restricted root is not divergent from the source. Stops at the first `ancestor` (active
+   * remediation); an `unknown` probe is passed over and, when no ancestor is found, means the proof is unknown.
+   * Once the operation signal or deadline has fired `ancestry` answers `unknown` for the wrong reason, so an
+   * interrupted refusal carries no class at all. Classification only: it never admits a source. */
+  private async classifyRestrictedRoots(barePath: string, roots: readonly string[], src: string):
+    Promise<"clear" | "remediation_active" | "remediation_proof_unknown" | "unclassified"> {
+    let unknown = false;
+    for (const oid of roots) {
+      const relation = await this.ancestry(barePath, oid, src);
+      if (relation === "ancestor") return "remediation_active";
+      if (relation === "unknown") unknown = true;
+    }
+    if (!unknown) return "clear";
+    try { this.checkRecoveryInterruption(); }
+    catch { return "unclassified"; }
+    if (this.boundaryProcesses.getStore()?.signal.aborted) return "unclassified";
+    return "remediation_proof_unknown";
+  }
+
+  /** The replacement-ancestry refusal, classified as an unknown proof unless the operation was interrupted
+   * (an aborted or expired probe answers `unknown` for reasons that say nothing about the evidence). */
+  private unknownReplacementAncestry(): Error {
+    const error = new Error("remediation replacement ancestry unknown");
+    let interrupted = this.boundaryProcesses.getStore()?.signal.aborted === true;
+    try { this.checkRecoveryInterruption(); } catch { interrupted = true; }
+    if (!interrupted) annotateRetainedSuccessorError(error, "remediation_proof_unknown");
+    return error;
   }
 
   /** Each target gets its own bounded ordered proof: at most 64 edges and 64 squared
@@ -11183,7 +11474,7 @@ export class GitCache {
       if (visiting.has(index) || visiting.size >= 64) return false;
       const edge = record.edges[index]!;
       const relation = await this.ancestry(barePath, edge.to, target);
-      if (relation === "unknown") throw new Error("remediation replacement ancestry unknown");
+      if (relation === "unknown") throw this.unknownReplacementAncestry();
       if (relation === "ancestor") { reached.add(index); return true; }
       const next = new Set(visiting).add(index);
       for (let i = 0; i < record.edges.length; i++) {
@@ -11192,7 +11483,7 @@ export class GitCache {
         // cover several partial rewrites; grant identity need not increase per edge.
         if (i <= index) continue;
         const progress = await this.ancestry(barePath, edge.to, later.from);
-        if (progress === "unknown") throw new Error("remediation replacement ancestry unknown");
+        if (progress === "unknown") throw this.unknownReplacementAncestry();
         if (progress === "ancestor" && await reaches(i, next)) { reached.add(index); return true; }
       }
       refused.add(index);
@@ -18928,9 +19219,55 @@ export class GitCache {
    *      are only probed for emptiness, never stat'ed or followed.
    *  Retained parents, parents skipped as recent, and an enumeration cut short by
    *  RETIRE_SCRATCH_ENUMERATION_BUDGET (charged on every entry read) are reported by ONE counted
-   *  warning `runner retire scratch retained` (bounded path list). Never recursive; never throws. */
-  async inspectRetireScratchAtStartup(processStartMs: number): Promise<{ retained: number }> {
+   *  warning `runner retire scratch retained` (bounded path list). Never throws.
+   *
+   *  issue #4143 — with `opts.outcomes` (the default in main.ts; `UZI_RETIRE_SCRATCH_OUTCOMES=0`
+   *  turns it off and leaves exactly the warning above, with no journal read and no walk), the
+   *  warning is followed by OBSERVATION records only: at most RETIRE_SCRATCH_REPORTED_PATHS
+   *  `runner retire scratch outcome` rows (every one `kept`, only for parents) and exactly one
+   *  `runner retire scratch total` per startup whenever outcomes are on and the runner root was
+   *  listed (it exists and is a real directory), including with zero parents. A missing,
+   *  non-directory or symlink runner root emits no lines; if the step throws,
+   *  `runner retire scratch outcomes failed` replaces the total. With zero parents no journal
+   *  read or walk happens and `retained_source_read` is `not_attempted`. They never remove,
+   *  change the owner of or reclaim anything.
+   *    - No ordinary durable disposition binding proves this moved footprint: rollback repair can
+   *      persist a protected moved-clone pointer, but the rename precedes the journal clear and the
+   *      retired-ledger write, so a parent can exist with nothing naming it. A retired ledger,
+   *      emptiness, age or name grants nothing. The legacy stderr-proof repair (#4141, landed via
+   *      #4152) does not certify old remnants retroactively.
+   *    - Attribution: one typed, read-only pass over every bare's config (`resolveBranchJournalUnderLock`
+   *      per recovery or restore branch, same lock, bounds and recovery operation as discovery) collects
+   *      only the `clonePath`s the journals name. A parent equal to, or an ancestor of, such a path is
+   *      `protected_by_retained_source`; every other parent is `no_disposition_evidence`. Any cap, abort,
+   *      deadline, lock or bare failure, or an undecodable value, makes the whole read `unknown`
+   *      (no further bares) and then no parent is claimed as named or not named.
+   *    - Walk: descriptor-relative and read-only as the worker uid. The runner root and each directory
+   *      are opened O_NOFOLLOW|O_DIRECTORY and reached through `/proc/self/fd/<fd>`; every entry is
+   *      classified by lstat, never by dirent type; only a directory whose fstat matches its lstat and
+   *      the parent's device is descended. Anything else counts its own allocated blocks and is never
+   *      opened. A directory whose mtime, ctime or nlink moves while it is walked is `changed`.
+   *      Bytes are allocated blocks * 512, a hard-linked inode once. All handles close in finally.
+   *    - Envelope: ONE absolute deadline (now + 30 s) for the whole invocation, never reset per bare,
+   *      branch or parent, plus a global cap of 200000 listed entries. The operation is awaited to
+   *      settlement (queued lock waits are cancelled; child processes and handles settle) before
+   *      startup continues, so the bound is the 30 s budget plus child settlement and handle closes.
+   *      There is no hard real-time bound for an uninterruptible syscall such as a stalled mount. */
+  async inspectRetireScratchAtStartup(processStartMs: number, opts: {
+    outcomes?: boolean;
+    signal?: AbortSignal;
+    /** Test hooks, never passed by main.ts. */
+    now?: () => number;
+    limits?: EpochRetainedLimits;
+    walkLimits?: { maxEntries?: number };
+    readRetainedSources?: () => Promise<RetireScratchSources>;
+    beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+    beforeOpen?: (dirPath: string) => Promise<void>;
+  } = {}): Promise<{ retained: number }> {
     const root = path.resolve(this.runnerRoot);
+    const now = opts.now ?? Date.now;
+    const deadline = opts.outcomes ? now() + RETIRE_SCRATCH_OUTCOME_BUDGET_MS : 0;
+    const observed: Array<{ name: string; recent: boolean; kind: "dir" | "symlink" | "other" }> = [];
     const retained: string[] = [];
     let empty = 0;
     let skippedRecent = 0;
@@ -18956,8 +19293,10 @@ export class GitCache {
         const p = path.join(root, name);
         try {
           const st = await fs.lstat(p);
-          if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) { skippedRecent++; continue; }
+          const kind = st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : "other";
+          if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) { skippedRecent++; observed.push({ name, recent: true, kind }); continue; }
           retained.push(p);
+          observed.push({ name, recent: false, kind });
           if (st.isSymbolicLink() || !st.isDirectory()) continue;
           let isEmpty = true;
           const pd = await fs.opendir(p);
@@ -18969,7 +19308,7 @@ export class GitCache {
           if (isEmpty) empty++;
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
-          if (!retained.includes(p)) retained.push(p);
+          if (!retained.includes(p)) { retained.push(p); observed.push({ name, recent: false, kind: "other" }); }
         }
       }
     } catch (err) {
@@ -18990,7 +19329,178 @@ export class GitCache {
         paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(path.relative(root, p), 157)),
       });
     }
+    // Reaching here means the runner root exists, is a directory and was enumerated (a missing,
+    // non-directory or symlink root returned early above with no lines), so the total is emitted
+    // even with zero parents.
+    if (opts.outcomes) {
+      try { await this.emitRetireScratchOutcomes(root, observed.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)), incomplete, deadline, opts); }
+      catch (err) {
+        this.log.warn("runner retire scratch outcomes failed", { error: sanitizeForLog(gitErrorMessage(err), 157) });
+      }
+    }
     return { retained: retained.length };
+  }
+
+  /** issue #4143 — the typed, read-only journal read for {@link inspectRetireScratchAtStartup}. One
+   *  absolute `deadline`, awaited to settlement; any failure of any kind is `unknown`. */
+  private async readRetireScratchSources(signal: AbortSignal, deadline: number, limitsOverride: EpochRetainedLimits | undefined,
+    now: () => number): Promise<RetireScratchSources> {
+    try {
+      const limits = this.epochLimits(limitsOverride);
+      const paths = new Set<string>();
+      let configBytes = 0;
+      let records = 0;
+      await this.epochRetained.run(limits, () => this.withRecoveryOperation(signal, deadline, async (combined) => {
+        for (const bare of await this.retainedBares(undefined, { strict: true })) {
+          this.checkRecoveryInterruption();
+          await this.withLock(bare, async () => {
+            const entries = await this.configEntries(bare);
+            // Charge before any decode: raw bytes, then records (both before the key-parsing loop).
+            for (const item of entries) configBytes += Buffer.byteLength(item) + 1;
+            if (configBytes > limits.maxMetadataBytes) throw new Error("retire scratch metadata byte limit");
+            records += entries.length;
+            if (records > limits.maxMetadataRecords) throw new Error("retire scratch metadata record limit");
+            const branches = new Set<string>();
+            // Last recovery raw value per branch, one pass, for the closure pre-charge below.
+            const lastRecoveryRaw = new Map<string, string>();
+            for (const item of entries) {
+              const nl = item.indexOf("\n");
+              const key = nl < 0 ? item : item.slice(0, nl);
+              const recovery = /^uzi-recovery\.(.+)\.clone$/.exec(key);
+              // A valueless recovery key is not a cleared value: undecodable evidence.
+              if (recovery && nl < 0) throw new Error("valueless recovery journal key");
+              if (recovery) lastRecoveryRaw.set(recovery[1]!, item.slice(nl + 1));
+              const branch = recovery?.[1] ?? restoreKeyBranch(key);
+              if (branch !== undefined) branches.add(branch);
+            }
+            records += branches.size;
+            if (records > limits.maxMetadataRecords) throw new Error("retire scratch metadata record limit");
+            const closure = this.recoveryOperations.getStore()?.closureBudget;
+            const collect = (journal: RecoveryJournalEntry | undefined): void => {
+              for (const p of [journal?.clonePath, ...(journal?.retainedSources ?? []).map((s) => s.clonePath)]) {
+                if (p === undefined) continue;
+                paths.add(p);
+                if (paths.size > limits.maxSeenPaths) throw new Error("retire scratch path limit");
+              }
+            };
+            for (const branch of [...branches].sort()) {
+              // Bounded by the one absolute deadline even when every await settles on a microtask.
+              if (now() >= deadline) throw new Error("retire scratch deadline");
+              this.checkRecoveryInterruption();
+              // Charge the decoded bytes the resolver will parse BEFORE it parses them.
+              if (closure) {
+                const pRaw = lastRecoveryRaw.get(branch) ?? "";
+                closure.delivered += Buffer.byteLength(pRaw) + Buffer.byteLength(this.restoreValueIn(entries, branch) ?? "");
+                if (closure.delivered > closure.limit) throw new Error("retire scratch decoded journal limit");
+              }
+              const resolved = await this.resolveBranchJournalUnderLock(bare, branch, entries);
+              if (resolved.kind === "plain") collect(resolved.journal);
+              else if (resolved.kind === "composite") {
+                collect(resolved.predecessor.journal);
+                if (resolved.successor.kind === "entry") collect(resolved.successor.journal);
+                else {
+                  collect(undefined);
+                  paths.add(resolved.successor.successor.clonePath);
+                  if (paths.size > limits.maxSeenPaths) throw new Error("retire scratch path limit");
+                }
+              }
+            }
+          }, combined);
+        }
+      }));
+      return { state: "read", paths: [...paths].sort() };
+    } catch {
+      return { state: "unknown" };
+    }
+  }
+
+  /** issue #4143 — the observation records. Every parent is `kept`; nothing here can change disk. */
+  private async emitRetireScratchOutcomes(root: string, parents: Array<{ name: string; recent: boolean; kind: "dir" | "symlink" | "other" }>,
+    incomplete: boolean, deadline: number, opts: {
+      outcomes?: boolean; signal?: AbortSignal; now?: () => number; limits?: EpochRetainedLimits; walkLimits?: { maxEntries?: number };
+      readRetainedSources?: () => Promise<RetireScratchSources>; beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+      beforeOpen?: (dirPath: string) => Promise<void>;
+    }): Promise<void> {
+    const signal = opts.signal ?? new AbortController().signal;
+    // No parents: nothing to attribute or walk, so no journal read is attempted.
+    let sources: RetireScratchSources = parents.length === 0 ? { state: "not_attempted" }
+      : opts.readRetainedSources
+        ? await opts.readRetainedSources().catch((): RetireScratchSources => ({ state: "unknown" }))
+        : await this.readRetireScratchSources(signal, deadline, opts.limits, opts.now ?? Date.now);
+    const ctx: RetireScratchWalkCtx = {
+      now: opts.now ?? Date.now, deadline, signal, entries: 0,
+      maxEntries: opts.walkLimits?.maxEntries ?? RETIRE_SCRATCH_WALK_MAX_ENTRIES, seen: new Set(),
+      ...(opts.beforeEntry ? { beforeEntry: opts.beforeEntry } : {}),
+      ...(opts.beforeOpen ? { beforeOpen: opts.beforeOpen } : {}),
+    };
+    // Classify each source once, while the shared budget still admits work. Rows and
+    // totals only look up a top-level parent name, never re-scan/normalize every path.
+    const namedParents = new Set<string>();
+    if (sources.state === "read") {
+      const prefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+      for (const source of sources.paths) {
+        if (retireWalkSpent(ctx)) break;
+        const normalized = path.resolve(source);
+        if (!normalized.startsWith(prefix)) continue;
+        const relative = normalized.slice(prefix.length);
+        const slash = relative.indexOf(path.sep);
+        namedParents.add(slash < 0 ? relative : relative.slice(0, slash));
+      }
+      if (retireWalkSpent(ctx)) {
+        sources = { state: "unknown" };
+        namedParents.clear();
+      }
+    }
+    const results: RetireScratchParentResult[] = [];
+    let rootHandle: FileHandle | undefined;
+    try {
+      let rootDev: bigint | undefined;
+      try {
+        if (parents.length > 0) {
+          rootHandle = await fs.open(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+          rootDev = (await rootHandle.stat({ bigint: true })).dev;
+        }
+      } catch { /* every parent is then reported unreadable below */ }
+      for (const parent of parents) {
+        if (rootHandle === undefined || rootDev === undefined) {
+          results.push({ name: parent.name, recent: parent.recent, kind: parent.kind, bytes: 0n, bytesState: "unknown", reasons: ["unreadable"], empty: false });
+          continue;
+        }
+        results.push(await retireWalkParent(ctx, rootHandle.fd, rootDev, root, parent));
+      }
+    } finally {
+      await rootHandle?.close().catch(() => undefined);
+    }
+    const row = (r: RetireScratchParentResult): {
+      retained_source: "named" | "not_named" | "unknown"; reason: "protected_by_retained_source" | "no_disposition_evidence";
+    } => {
+      if (sources.state !== "read") return { retained_source: "unknown", reason: "no_disposition_evidence" };
+      return namedParents.has(r.name) ? { retained_source: "named", reason: "protected_by_retained_source" }
+        : { retained_source: "not_named", reason: "no_disposition_evidence" };
+    };
+    for (const r of results.slice(0, RETIRE_SCRATCH_REPORTED_PATHS)) {
+      this.log.info("runner retire scratch outcome", {
+        name: sanitizeForLog(r.name, 157), kind: r.kind, outcome: "kept", ...row(r),
+        empty: r.empty, recent: r.recent, bytes: Number(r.bytes), bytes_state: r.bytesState, partial_reasons: r.reasons,
+      });
+    }
+    const totalReasons = new Set<RetireScratchWalkReason>();
+    for (const r of results) for (const reason of r.reasons) totalReasons.add(reason);
+    const protectedCount = results.filter((r) => row(r).reason === "protected_by_retained_source").length;
+    const allMeasured = results.every((r) => r.bytesState === "measured");
+    this.log.info("runner retire scratch total", {
+      parents_enumerated: results.length,
+      outcomes_omitted: results.length - Math.min(results.length, RETIRE_SCRATCH_REPORTED_PATHS),
+      kept: results.length,
+      reclaimed: 0,
+      protected_by_retained_source: protectedCount,
+      no_disposition_evidence: results.length - protectedCount,
+      bytes: Number(results.reduce((n, r) => n + r.bytes, 0n)),
+      bytes_state: allMeasured && !incomplete ? "measured" : results.every((r) => r.bytesState === "unknown") ? "unknown" : "partial",
+      partial_reasons: [...totalReasons].sort(),
+      enumeration_incomplete: incomplete,
+      retained_source_read: sources.state,
+    });
   }
 
   /** issue #3153 — the ONE best-effort removal helper for scratch the worker created under the
@@ -26765,13 +27275,25 @@ try {
    * promptly and forfeits its slot without running `fn`. The stored chain still
    * waits for the prior holder before it settles, so a cancelled waiter can never
    * let a later mutation overtake the holder and violate serialization. */
-  private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal, restrictionProgress?: RemediationRestrictionProgress): Promise<T> {
     const prev = this.locks.get(key) ?? Promise.resolve();
     const boundary = this.boundaryProcesses.getStore();
-    const recovery = this.recoveryOperation();
+    let recovery: ReturnType<typeof this.recoveryOperation>;
+    try { recovery = this.recoveryOperation(); }
+    catch (error) {
+      // Only a positively identified maintenance-budget expiry before any read is a clearable interruption.
+      if (restrictionProgress && !restrictionProgress.started && !restrictionProgress.acquired
+        && this.isBudgetExpiry(error, this.recoveryOperations.getStore()?.budget)) restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     const report = this.reportProofs.getStore();
     this.checkReportProof();
-    this.checkRecoveryInterruption();
+    try {
+      this.checkRecoveryInterruption();
+    } catch (error) {
+      if (restrictionProgress && !restrictionProgress.acquired) restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     const signals = [boundary?.signal, recovery?.signal, report?.signal, MaintenanceBudget.signal()].filter((s): s is AbortSignal => s !== undefined);
     const scope = signals.length ? { signal: AbortSignal.any(signals) } : undefined;
     const softSignal = boundary?.softSignal;
@@ -26787,6 +27309,7 @@ try {
     const abortBeforeAcquisition = (): void => {
       if (started || settled) return;
       settled = true;
+      if (restrictionProgress) restrictionProgress.cause = "pre_read_unavailable";
       removeAbortListener();
       rejectResult(signal?.aborted ? new Error(GIT_LOCK_WAIT_ABORT_MESSAGE) : scope?.signal.aborted
         ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE, undefined, boundary?.capture?.signal)
@@ -26812,12 +27335,23 @@ try {
         return;
       }
       started = true;
+      if (restrictionProgress) restrictionProgress.acquired = true;
       removeAbortListener();
       let outcome: { ok: true; value: T } | { ok: false; error: unknown };
       try {
-        this.checkRecoveryInterruption();
+        // The bare lock is already held here (started = true above), so a failure is post-acquisition
+        // and must stay sticky (#4191): it is never classified as pre-read unavailability.
+        try { this.checkRecoveryInterruption(); }
+        catch (error) {
+          if (restrictionProgress) restrictionProgress.cause = "unknown";
+          throw error;
+        }
         const value = await fn();
-        this.checkRecoveryInterruption();
+        try { this.checkRecoveryInterruption(); }
+        catch (error) {
+          if (restrictionProgress) restrictionProgress.cause = "post_read_expiry";
+          throw error;
+        }
         outcome = { ok: true, value };
       } catch (error) {
         outcome = { ok: false, error };
@@ -26829,7 +27363,10 @@ try {
         await boundary.beforeLockRelease(key).catch(() => undefined);
       }
       try { this.checkRecoveryInterruption(); }
-      catch (error) { outcome = { ok: false, error }; }
+      catch (error) {
+        if (restrictionProgress?.started) restrictionProgress.cause = "post_read_expiry";
+        outcome = { ok: false, error };
+      }
       settled = true;
       if (outcome.ok) resolveResult(outcome.value);
       else rejectResult(outcome.error);

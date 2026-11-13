@@ -3323,6 +3323,11 @@ export interface StateRequest {
    *  a timer. Sent only when the api advertised `retained_recovery_capacity_hold_v1` at register; absent
    *  is today's counted park. */
   retained_capacity_only?: boolean;
+  /** Issue #4177: qualifies a `retained_recovery_adoption_failed` park with why the retained adoption was refused.
+   *  Only with state `recovery_wait`, that cause and a positive `claim_generation`; closed set. Sent only when
+   *  the api advertised `recovery_detail_adoption_refusal_v1` at register (an older api 400s the unknown field).
+   *  Absent selects the generic text and never permits adoption. */
+  recovery_detail?: "secret_remediation_active" | "remediation_proof_unknown";
   /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit
    *  park, the owner pause park, a recovery park including the mid-run `data_volume_full` one),
    *  whether that published checkpoint contains the run's latest committed work. `false` when the

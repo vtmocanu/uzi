@@ -459,6 +459,10 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// park and holds it owner-side without counting it. A worker sends the marker ONLY after
 		// seeing this token, because an older api's strict decoder 400s the unknown field.
 		{workersvc.RetainedCapacityHoldFeature},
+		// Issue #4177: this api accepts recovery_detail on a retained_recovery_adoption_failed park
+		// and refuses Resume for the secret_remediation_active value. A worker sends the field ONLY
+		// after seeing this token, because an older api's strict decoder 400s the unknown field.
+		{workersvc.RecoveryDetailFeature},
 		// Issue #3859: this api accepts the nested registration_evidence object on a `running`
 		// report ({register_nonce, claim_generation, registration_epoch}) and answers
 		// registration_evidence "recorded" | "refused" on the ACK, whether or not the status write

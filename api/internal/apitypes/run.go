@@ -940,6 +940,14 @@ type RunDTO struct {
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// RecoveryWaitDetail is the closed-set sub-cause of a retained_recovery_adoption_failed park
+	// (issue #4177): "secret_remediation_active" (retrying unchanged cannot help; Resume is
+	// refused with a 409) or "remediation_proof_unknown" (a retry may help). The server sets it
+	// only when status is recovery_wait, the cause is retained_recovery_adoption_failed and the
+	// stored value is in that set; it is omitted otherwise. Absent means unclassified and only
+	// selects the generic text; it never permits anything new. Clients render only a known value
+	// and never print the raw string.
+	RecoveryWaitDetail *string `json:"recovery_wait_detail,omitempty"`
 	// RecoveryWaitPhase (issue #1324) says which part of the run the 'recovery_wait' park
 	// interrupted. "publication" is a forge outage met while publishing: the run keeps its
 	// publication intent and resumes publication only. Null for every other park (the pre-clone
@@ -1872,6 +1880,14 @@ type RunSummaryItemDTO struct {
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// RecoveryWaitDetail is the closed-set sub-cause of a retained_recovery_adoption_failed park
+	// (issue #4177): "secret_remediation_active" (retrying unchanged cannot help; Resume is
+	// refused with a 409) or "remediation_proof_unknown" (a retry may help). The server sets it
+	// only when status is recovery_wait, the cause is retained_recovery_adoption_failed and the
+	// stored value is in that set; it is omitted otherwise. Absent means unclassified and only
+	// selects the generic text; it never permits anything new. Clients render only a known value
+	// and never print the raw string.
+	RecoveryWaitDetail *string `json:"recovery_wait_detail,omitempty"`
 	// RecoveryWaitPhase (issue #1324) says which part of the run the 'recovery_wait' park
 	// interrupted. "publication" is a forge outage met while publishing: the run keeps its
 	// publication intent and resumes publication only. Null for every other park (the pre-clone
@@ -2212,6 +2228,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		LimitWaitCount:                item.LimitWaitCount,
 		RateLimitType:                 item.RateLimitType,
 		RecoveryWaitCause:             item.RecoveryWaitCause,
+		RecoveryWaitDetail:            item.RecoveryWaitDetail,
 		RecoveryWaitPhase:             item.RecoveryWaitPhase,
 		PublicationWaitStartedAt:      item.PublicationWaitStartedAt,
 		PublicationWaitLimitSeconds:   item.PublicationWaitLimitSeconds,
@@ -2405,6 +2422,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			LimitWaitCount:                s.LimitWaitCount,
 			RateLimitType:                 s.RateLimitType,
 			RecoveryWaitCause:             s.RecoveryWaitCause,
+			RecoveryWaitDetail:            s.RecoveryWaitDetail,
 			RecoveryWaitPhase:             s.RecoveryWaitPhase,
 			PublicationWaitStartedAt:      s.PublicationWaitStartedAt,
 			PublicationWaitLimitSeconds:   s.PublicationWaitLimitSeconds,

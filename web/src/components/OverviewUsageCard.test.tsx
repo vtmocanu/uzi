@@ -7,6 +7,7 @@ import { OverviewUsageCard } from "./OverviewUsageCard";
 import type { UsageWindow } from "./UsageCards";
 import type { AdminUsage, RunOutcomes, SelfUsage } from "../lib/api";
 import { setDemoMode } from "../lib/demoMode";
+import { USAGE_SCOPE_NOTE } from "./usageParts";
 
 const bundle = (input: number, cache: number, output: number, cost: number) => ({
   input_tokens: input, cache_read_tokens: cache, cache_creation_tokens: 0,
@@ -257,13 +258,43 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     expect(setItem).toHaveBeenCalledWith("uzi.overviewUsageScope", JSON.stringify("all"));
   });
 
+  describe("primary work scope (#4209)", () => {
+    const helperOnly = (): SelfUsage => {
+      const { self } = fixture();
+      return { ...self, run_count: 0, lifetime_subscription_run_count: 0, lifetime_unreported_run_count: 0,
+        last7_subscription_run_count: 0, last7_unreported_run_count: 0 };
+    };
+
+    it("shows helper-only spend and not the empty message when run_count is 0", () => {
+      const view = mount({ self: helperOnly() });
+      expect(view.getByText("$1,235")).toBeTruthy();
+      expect(view.queryByText("No token usage recorded yet.")).toBeNull();
+    });
+
+    it("still shows the empty message when every usage figure is zero", () => {
+      const self = helperOnly();
+      self.lifetime = bundle(0, 0, 0, 0); self.last_7_days = bundle(0, 0, 0, 0);
+      expect(mount({ self }).getByText("No token usage recorded yet.")).toBeTruthy();
+    });
+
+    it("renders the scope note", () => {
+      const view = mount({ self: fixture().self });
+      expect(view.getByText(USAGE_SCOPE_NOTE)).toBeTruthy();
+    });
+
+    it("divides the full cost, helper spend included, by the PR count", () => {
+      const self = helperOnly(); self.lifetime_pr_count = 4;
+      expect(mount({ self }).getByText("$308.64 per PR")).toBeTruthy();
+    });
+  });
+
   it("does not render the dropped side-by-side or run-count pieces", () => {
     const { self, admin } = fixture();
     const view = mount({ self, admin });
-    expect(view.queryByText(/runs with token usage/)).toBeNull();
+    expect(view.queryByText(/runs with token usage/i)).toBeNull();
     expect(view.getAllByRole("region", { name: /^(Your|Factory) usage$/ })).toHaveLength(1);
     fireEvent.click(view.getByRole("button", { name: "All users" }));
-    expect(view.queryByText(/runs with token usage/)).toBeNull();
+    expect(view.queryByText(/runs with token usage/i)).toBeNull();
     expect(view.getAllByRole("region", { name: /^(Your|Factory) usage$/ })).toHaveLength(1);
   });
 
@@ -356,7 +387,9 @@ describe("OverviewUsageCard (#3881 M1)", () => {
 });
 
 describe("OverviewUsageCard by-user table (#3881 M2)", () => {
-  const HEADERS = ["User", "Runs", "PRs", "Failed", "Fail rate", "Last failure", "Cost"];
+  const BASE_HEADERS = ["User", "Runs", "PRs", "Failed", "Fail rate", "Last failure", "Cost"];
+  const HEADERS = [...BASE_HEADERS, "Cost share"];
+  const SPLIT_HEADERS = [...BASE_HEADERS, "Cost share · Claude / Codex"];
   const withPRs = (admin: AdminUsage) => {
     admin.users.forEach((u, i) => { u.pr_count = 10 + i; u.last7_pr_count = 1 + i; });
   };
@@ -374,6 +407,13 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
       return typeof name === "string" ? first === name : name.test(first);
     })!;
   const PRS = 2;
+  const SHARE = 7;
+  // A cell's fill segments, in order: its class (bg-*) and inline width.
+  const fills = (cell: HTMLElement) =>
+    Array.from(cell.querySelectorAll<HTMLElement>("[aria-hidden='true'] > span")).map((f) => ({
+      cls: Array.from(f.classList).find((c) => c.startsWith("bg-"))!, width: f.style.width,
+    }));
+  const widths = (cell: HTMLElement) => fills(cell).map((f) => parseFloat(f.width));
 
   it("appears only in the Factory scope", () => {
     const { self, admin } = fixture();
@@ -396,7 +436,7 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     expect(section(view).getByText("last 7 days, by cost")).toBeTruthy();
   });
 
-  it("has exactly the same seven headers with and without PR counts, in both windows, when the API sends no harness split", () => {
+  it("has exactly the same eight headers with and without PR counts, in both windows, when the API sends no harness split", () => {
     const { self, admin } = fixture();
     withPRs(admin);
     const view = factoryView({ self, admin });
@@ -409,67 +449,72 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     expect(headers(second)).toEqual(HEADERS);
     fireEvent.click(second.getByRole("button", { name: "Last 7 days" }));
     expect(headers(second)).toEqual(HEADERS);
-    expect(second.queryByRole("columnheader", { name: /Tokens|Out|Cost share/ })).toBeNull();
+    expect(second.queryByRole("columnheader", { name: /Tokens|Out|Claude/ })).toBeNull();
   });
 
   // Issue #3876: the Claude / Codex column.
   const withHarness = (admin: AdminUsage) => {
     admin.users.forEach((u) => { u.harness_runs = { claude: 20, codex: 3 }; u.last7_harness_runs = { claude: 2, codex: 1 }; });
   };
-  const HARNESS = 7;
 
-  it("adds Claude / Codex as the eighth and last header when the API sends the split, in both windows", () => {
+  it("names the last header for both halves when the API sends the split, in both windows", () => {
     const { self, admin } = fixture();
     withHarness(admin);
     const view = factoryView({ self, admin });
-    expect(headers(view)).toEqual([...HEADERS, "Claude / Codex"]);
-    expect(section(view).getByRole("columnheader", { name: "Claude / Codex" }).getAttribute("title")).toBe(
-      "Share of each user's runs by harness, the same runs as the Runs column; cross-check runs count under the harness they ran on",
+    expect(headers(view)).toEqual(SPLIT_HEADERS);
+    const th = section(view).getByRole("columnheader", { name: "Cost share · Claude / Codex" });
+    expect(th.getAttribute("title")).toBe(
+      "Share of recorded API-equivalent cost in the selected period; Claude / Codex: share of each user's runs by harness, the same primary work runs as the Runs column",
     );
+    expect(th.className).toContain("text-left");
     fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
-    expect(headers(view)).toEqual([...HEADERS, "Claude / Codex"]);
-    // The Factory row keeps the table rectangular with an empty cell.
-    const total = cells(rowOf(view, "Factory"));
-    expect(total).toHaveLength(8);
-    expect(total[HARNESS]).toBe("");
+    expect(headers(view)).toEqual(SPLIT_HEADERS);
+    expect(cells(rowOf(view, "Factory"))).toHaveLength(8);
   });
 
-  it("shows a 7-day user's 7 Claude / 3 Codex runs as 70 / 30, with the counts in the title", () => {
+  it("shows a 7-day user's 7 Claude / 3 Codex runs as 70 / 30, with the split in the cell title", () => {
     const { self, admin } = fixture();
     withHarness(admin);
     admin.users[0].last7_harness_runs = { claude: 7, codex: 3 };
+    admin.factory.last_7_days = bundle(300, 600, 150, 24.68); // the two users' costs sum to it
     const view = factoryView({ self, admin });
     fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
-    const cell = rowOf(view, /^owner\./).children[HARNESS] as HTMLElement;
-    expect(cell.textContent).toBe("70 / 30");
-    expect(cell.getAttribute("title")).toBe("7 Claude, 3 Codex runs");
+    const cell = rowOf(view, /^owner\./).children[SHARE] as HTMLElement;
+    expect(cell.textContent).toBe("50%70 / 30");
+    expect(cell.getAttribute("title")).toBe("50% of factory cost; runs 70% Claude, 30% Codex");
     expect(cell.querySelector("[aria-hidden='true']")).toBeTruthy();
-    expect(cells(rowOf(view, /^other\./))[HARNESS]).toBe("67 / 33");
+    expect(cells(rowOf(view, /^other\./))[SHARE]).toBe("50%67 / 33");
   });
 
-  it("omits the column against a response without the split, keeping the other headers", () => {
+  it("keeps the other headers and reads 'Cost share' alone against a response without the split", () => {
     const { self, admin } = fixture();
     const view = factoryView({ self, admin });
-    expect(section(view).queryByRole("columnheader", { name: "Claude / Codex" })).toBeNull();
+    expect(section(view).queryByRole("columnheader", { name: /Claude/ })).toBeNull();
     for (const h of HEADERS) expect(section(view).getByRole("columnheader", { name: h })).toBeTruthy();
-    expect(cells(rowOf(view, "Factory"))).toHaveLength(7);
+    expect(section(view).getByRole("columnheader", { name: "Cost share" }).getAttribute("title")).toBe(
+      "Share of recorded API-equivalent cost in the selected period",
+    );
+    expect(cells(rowOf(view, "Factory"))).toHaveLength(8);
     cleanup();
     const full = fixture();
     withHarness(full.admin);
     const second = factoryView({ self: full.self, admin: full.admin });
-    expect(section(second).getByRole("columnheader", { name: "Claude / Codex" })).toBeTruthy();
+    expect(section(second).getByRole("columnheader", { name: "Cost share · Claude / Codex" })).toBeTruthy();
   });
 
-  it("reads a dash for a user with no runs in the window", () => {
+  it("draws a cost-only bar and no figure for a user with no runs in the window", () => {
     const { self, admin } = fixture();
     withHarness(admin);
     admin.users[1].last7_harness_runs = { claude: 0, codex: 0 };
+    admin.factory.last_7_days = bundle(300, 600, 150, 24.68); // the two users' costs sum to it
     const view = factoryView({ self, admin });
     fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
-    const cell = rowOf(view, /^other\./).children[HARNESS] as HTMLElement;
-    expect(cell.textContent).toBe("—");
-    expect(cell.getAttribute("title")).toBeNull();
-    expect(cells(rowOf(view, /^owner\./))[HARNESS]).toBe("67 / 33");
+    const cell = rowOf(view, /^other\./).children[SHARE] as HTMLElement;
+    expect(cell.textContent).toBe("50%");
+    expect(cell.getAttribute("title")).toBe("50% of factory cost");
+    expect(fills(cell).map((f) => f.cls)).toEqual(["bg-brand"]);
+    expect(widths(cell)).toEqual([50]);
+    expect(cells(rowOf(view, /^owner\./))[SHARE]).toBe("50%67 / 33");
   });
 
   it("titles the headers and scopes them to their columns", () => {
@@ -479,7 +524,7 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     expect(th("Last failure").getAttribute("title")).toBe(
       "All time: the API serves the last failure time for all time only, so this column is the same in both windows",
     );
-    expect(th("Runs").getAttribute("title")).toBe("Runs with recorded usage in the period");
+    expect(th("Runs").getAttribute("title")).toBe("Primary work runs with recorded usage in the period");
     expect(th("Fail rate").getAttribute("title")).toBe("Failed of finished runs in the period");
     for (const h of section(view).getAllByRole("columnheader")) expect(h.getAttribute("scope")).toBe("col");
   });
@@ -588,22 +633,40 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     expect(cells(rowOf(view, /^owner\./))[1]).toBe("23");
   });
 
-  it("discloses the Factory row's own incomplete cost, per window", () => {
+  it("discloses the Factory row's own incomplete cost as chips, per window", () => {
     const { self, admin } = fixture();
     Object.assign(admin.factory, {
       lifetime_subscription_run_count: 5, lifetime_unreported_run_count: 3,
       last7_subscription_run_count: 2, last7_unreported_run_count: 1,
     });
     const view = factoryView({ self, admin });
-    const note = () => within(rowOf(view, "Factory")).getByText(/^\+ /);
-    expect(note().textContent).toBe("+ 5 runs without a cost estimate and 3 unreported runs");
-    expect(note().getAttribute("title")).toBe(
-      "Runs without a cost estimate: tokens only; Unreported runs: cost incomplete; recorded partial costs included",
+    const chips = (row: HTMLElement) => within(row).queryAllByRole("note").map((c) => c.getAttribute("aria-label"));
+    expect(chips(rowOf(view, "Factory"))).toEqual(["5 runs without a cost estimate", "3 unreported runs"]);
+    const first = within(rowOf(view, "Factory")).getByRole("note", { name: "5 runs without a cost estimate" });
+    expect(first.textContent).toBe("+5 no est.");
+    expect(first.getAttribute("title")).toBe("5 runs without a cost estimate: tokens only, no dollar figure");
+    expect(first.getAttribute("tabindex")).toBe("0");
+    expect(within(rowOf(view, "Factory")).getByRole("note", { name: "3 unreported runs" }).getAttribute("title")).toBe(
+      "3 unreported runs: cost incomplete; recorded partial costs included",
     );
-    // A user row keeps its own counts.
-    expect(within(rowOf(view, /^owner\./)).getByText(/^\+ /).textContent).toBe("+ 4 runs without a cost estimate and 1 unreported run");
+    // A user row keeps its own counts, singular for one.
+    expect(chips(rowOf(view, /^owner\./))).toEqual(["4 runs without a cost estimate", "1 unreported run"]);
+    expect(within(rowOf(view, /^owner\./)).getByRole("note", { name: "1 unreported run" }).textContent).toBe("+1 unrep.");
     fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
-    expect(note().textContent).toBe("+ 2 runs without a cost estimate and 1 unreported run");
+    expect(chips(rowOf(view, "Factory"))).toEqual(["2 runs without a cost estimate", "1 unreported run"]);
+    expect(chips(rowOf(view, /^owner\./))).toEqual([]);
+  });
+
+  it("renders a chip only for a non-zero count, with en-US grouping", () => {
+    const { self, admin } = fixture();
+    Object.assign(admin.factory, { lifetime_subscription_run_count: 1270, lifetime_unreported_run_count: 0 });
+    admin.users[0].subscription_run_count = 0; admin.users[0].unreported_run_count = 0;
+    admin.users[1].subscription_run_count = 0; admin.users[1].unreported_run_count = 2;
+    const view = factoryView({ self, admin });
+    expect(within(rowOf(view, "Factory")).getAllByRole("note").map((c) => c.textContent)).toEqual(["+1,270 no est."]);
+    expect(within(rowOf(view, /^owner\./)).queryAllByRole("note")).toEqual([]);
+    expect(within(rowOf(view, /^other\./)).getAllByRole("note").map((c) => c.textContent)).toEqual(["+2 unrep."]);
+    expect(section(view).queryByText(/^\+ /)).toBeNull();
   });
 
   it("names the scroll wrapper as a region and each row's first cell as a row header", () => {
@@ -680,5 +743,116 @@ describe("OverviewUsageCard controlled scope and By user focus (#4042)", () => {
     const view = render(<Controlled self={self} admin={admin} scope="you" onScopeChange={() => {}} focusByUser={0} />);
     view.rerender(<Controlled self={self} admin={admin} scope="all" onScopeChange={() => {}} focusByUser={1} />);
     expect(document.activeElement).toBe(view.getByRole("region", { name: "By user" }));
+  });
+});
+
+describe("OverviewUsageCard cost share and Claude / Codex bar (#4227)", () => {
+  const SHARE = 7;
+  const view = (props: Parameters<typeof Harness>[0]) => {
+    const v = mount(props);
+    fireEvent.click(v.getByRole("button", { name: "All users" }));
+    return v;
+  };
+  const rowOf = (v: ReturnType<typeof mount>, name: RegExp | string) =>
+    within(v.getByRole("region", { name: "By user" })).getAllByRole("row").find((r) => {
+      const first = r.firstElementChild?.textContent ?? "";
+      return typeof name === "string" ? first === name : name.test(first);
+    })!;
+  const cell = (v: ReturnType<typeof mount>, name: RegExp | string) => rowOf(v, name).children[SHARE] as HTMLElement;
+  const segments = (c: HTMLElement) =>
+    Array.from(c.querySelectorAll<HTMLElement>("[aria-hidden='true'] > span")).map((f) => ({
+      cls: Array.from(f.classList).find((k) => k.startsWith("bg-")), width: parseFloat(f.style.width),
+    }));
+  // owner 75, other 20, third 5 (the tiny one): factory 100 dollars.
+  const uneven = (harness: boolean) => {
+    const { self, admin } = fixture();
+    const third = { ...admin.users[1], user_id: "third", email: "third.person@example.com" };
+    admin.users.push(third);
+    admin.users[0].usage = bundle(1, 1, 1, 75);
+    admin.users[1].usage = bundle(1, 1, 1, 24.999);
+    third.usage = bundle(1, 1, 1, 0.001);
+    admin.factory.lifetime = bundle(3, 3, 3, 100);
+    if (harness) {
+      admin.users[0].harness_runs = { claude: 61, codex: 39 };
+      admin.users[1].harness_runs = { claude: 100, codex: 0 };
+      third.harness_runs = { claude: 0, codex: 0 };
+    }
+    return { self, admin };
+  };
+
+  it("displays shares that sum to 100 and a Factory share of 100%", () => {
+    const v = view(uneven(true));
+    const pcts = ["owner", "other", "third"].map((n) => parseInt(cell(v, new RegExp(`^${n}\\.`)).textContent!, 10));
+    expect(pcts.reduce((a, b) => a + b, 0)).toBe(100);
+    expect(pcts).toEqual([75, 25, 0]);
+    expect(cell(v, "Factory").textContent).toMatch(/^100%/);
+  });
+
+  it("shows a small nonzero share as 0% while the fill keeps the raw ratio", () => {
+    const v = view(uneven(false));
+    const c = cell(v, /^third\./);
+    expect(c.textContent).toBe("0%");
+    const [seg] = segments(c);
+    expect(seg.width).toBeGreaterThan(0);
+    expect(seg.width).toBeCloseTo(0.001, 6);
+    expect(c.getAttribute("title")).toBe("0% of factory cost");
+  });
+
+  it("splits each bar by the row's runs, and the Factory bar by the summed counts", () => {
+    const v = view(uneven(true));
+    expect(segments(cell(v, /^owner\./))).toEqual([
+      { cls: "bg-brand-claude", width: 75 * 0.61 }, { cls: "bg-muted", width: 75 * 0.39 },
+    ]);
+    expect(cell(v, /^owner\./).textContent).toBe("75%61 / 39");
+    expect(cell(v, /^other\./).textContent).toBe("25%100 / 0");
+    const [full, none] = segments(cell(v, /^other\./)).map((s) => s.width);
+    expect(full).toBeCloseTo(24.999, 6);
+    expect(none).toBe(0);
+    // Factory: 161 Claude and 39 Codex runs -> 81 / 19, full length.
+    expect(cell(v, "Factory").textContent).toBe("100%81 / 19");
+    expect(segments(cell(v, "Factory"))).toEqual([
+      { cls: "bg-brand-claude", width: 81 }, { cls: "bg-muted", width: 19 },
+    ]);
+    expect(cell(v, /^owner\./).getAttribute("title")).toBe("75% of factory cost; runs 61% Claude, 39% Codex");
+    // A row with no runs gets a cost-only bar and no figure.
+    expect(segments(cell(v, /^third\./)).map((s) => s.cls)).toEqual(["bg-brand"]);
+    expect(cell(v, /^third\./).textContent).toBe("0%");
+  });
+
+  it("without the split: header 'Cost share', one bar segment, no runs figure, no harness wording", () => {
+    const v = view(uneven(false));
+    const region = within(v.getByRole("region", { name: "By user" }));
+    expect(region.getByRole("columnheader", { name: "Cost share" })).toBeTruthy();
+    expect(segments(cell(v, /^owner\./))).toEqual([{ cls: "bg-brand", width: 75 }]);
+    expect(cell(v, /^owner\./).textContent).toBe("75%");
+    expect(cell(v, "Factory").textContent).toBe("100%");
+    const text = region.getByRole("table").outerHTML;
+    expect(text).not.toMatch(/Claude|Codex|harness/);
+    expect(region.queryByText(/Claude runs/)).toBeNull();
+    expect(region.getByText("Bar length: cost share of the factory")).toBeTruthy();
+  });
+
+  it("shows the legend swatches only with the split", () => {
+    const v = view(uneven(true));
+    expect(within(v.getByRole("region", { name: "By user" })).getByText("Claude runs")).toBeTruthy();
+    expect(within(v.getByRole("region", { name: "By user" })).getByText("Codex runs")).toBeTruthy();
+  });
+
+  it("reads a dash and draws no fill when the factory recorded no cost", () => {
+    const { self, admin } = uneven(true);
+    admin.users.forEach((u) => { u.usage = bundle(1, 1, 1, 0); });
+    admin.factory.lifetime = bundle(3, 3, 3, 0);
+    const v = view({ self, admin });
+    for (const name of [/^owner\./, /^other\./, "Factory"]) {
+      expect(segments(cell(v, name))).toEqual([]);
+      expect(cell(v, name).textContent).toMatch(/^—/);
+    }
+    // The runs figure still shows when a split exists.
+    expect(cell(v, /^owner\./).textContent).toBe("—61 / 39");
+    expect(cell(v, /^owner\./).getAttribute("title")).toBe(
+      "No recorded factory cost in the selected period; runs 61% Claude, 39% Codex",
+    );
+    expect(cell(v, /^third\./).getAttribute("title")).toBe("No recorded factory cost in the selected period");
+    expect(within(v.getByRole("region", { name: "By user" })).queryByText(/Bar length/)).toBeNull();
   });
 });

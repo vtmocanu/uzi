@@ -174,7 +174,10 @@ export interface CustodyAlertView {
   // Capacity alone does not establish that any run is currently blocked.
   tone: "warning" | "danger";
   atLimit: boolean;
-  // "6 / 8 custody slots used" — the safety-slot line.
+  // True when runs are blocked but the owner is below the limit: the blocked runs are at their
+  // own per-run custody hold bound (admission counts units; a run's holds from the same original worker usually count once).
+  runBoundOnly: boolean;
+  // "6 / 8 custody units used" — the admission-unit line.
   slotsLabel: string;
   slotsUsed: number;
   slotsLimit: number;
@@ -213,14 +216,19 @@ export function custodyAlertView(
   return {
     tone: agg.blocked_runs > 0 ? "danger" : "warning",
     atLimit,
-    slotsLabel: `${capacityUsed} / ${agg.custody_hold_limit} custody slots used`,
+    runBoundOnly: agg.blocked_runs > 0 && !atLimit,
+    slotsLabel: `${capacityUsed} / ${agg.custody_hold_limit} custody units used`,
     slotsUsed: capacityUsed,
     slotsLimit: agg.custody_hold_limit,
     decisionNeeded: agg.decision_needed,
     blockedRuns: agg.blocked_runs,
     recoveryWaitCount,
     headline: agg.blocked_runs > 0
-      ? "Held work is blocking new runs"
+      ? atLimit
+        ? "Held work is blocking new runs"
+        : agg.blocked_runs > 1
+          ? "Queued runs reached their own custody hold limits"
+          : "A queued run reached its own custody hold limit"
       : agg.decision_needed > 0
         ? "Held work needs your attention"
         : "Custody capacity reached",
@@ -350,6 +358,7 @@ const ADMISSION_REASON_LABELS: Record<string, string> = {
   unknown_evidence: "Run or worker evidence is missing",
   identity_mismatch: "Hold does not match the run's current claim",
   stale_heartbeat: "Worker heartbeat is stale",
+  same_run_group: "Counted once with this run's other holds on the same worker",
 };
 
 // admissionReasonLabel maps the server's closed admission_reason vocabulary to plain copy.
@@ -361,24 +370,30 @@ export function admissionReasonLabel(reason: string | undefined): string {
 
 // admissionInfoHolds lists the open holds that are NOT decision rows while the owner is at
 // the custody limit, split by what the server reported: `counted` (counts_toward_admission
-// true) and `unreported` (field absent, e.g. an older server; absent is never false).
-// Holds reported false are excluded. Both are empty below the limit or when it is disabled.
+// true), `grouped` (counts_toward_admission false with admission_reason same_run_group: a
+// non-representative hold counted once with its run's other holds on the same worker; it
+// never counts toward capacity) and `unreported` (field absent, e.g. an older server; absent
+// is never false). Other holds reported false are excluded. All are empty below the limit or
+// when it is disabled.
 export function admissionInfoHolds(resp: RecoveryCustodyHolds): {
   counted: RecoveryCustodyHold[];
+  grouped: RecoveryCustodyHold[];
   unreported: RecoveryCustodyHold[];
 } {
   const agg = resp.aggregate;
   const counted: RecoveryCustodyHold[] = [];
+  const grouped: RecoveryCustodyHold[] = [];
   const unreported: RecoveryCustodyHold[] = [];
   if (!(agg.custody_hold_limit > 0 && recoveryCapacityUsed(agg) >= agg.custody_hold_limit)) {
-    return { counted, unreported };
+    return { counted, grouped, unreported };
   }
   for (const h of resp.holds) {
     if (h.state !== "open" || isOwnerDecisionRow(h)) continue;
     if (h.counts_toward_admission === true) counted.push(h);
     else if (h.counts_toward_admission === undefined) unreported.push(h);
+    else if (h.admission_reason === "same_run_group") grouped.push(h);
   }
-  return { counted, unreported };
+  return { counted, grouped, unreported };
 }
 
 function attentionView(hold: RecoveryCustodyHold): Omit<CustodyHoldView, "checkpoint" | "terminalRejection"> {

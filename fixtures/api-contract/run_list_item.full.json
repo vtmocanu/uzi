@@ -760,6 +760,7 @@
   "limit_wait_count": 1,
   "rate_limit_type": "x",
   "recovery_wait_cause": "x",
+  "recovery_wait_detail": "x",
   "recovery_wait_phase": "x",
   "publication_wait_started_at": "2020-01-02T03:04:05Z",
   "publication_wait_limit_seconds": 1,

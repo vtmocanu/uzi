@@ -37,6 +37,11 @@ import (
 //   - ErrCredentialSwitchRunTerminal → the run is completed/failed/cancelled.
 //   - ErrCredentialSwitchRaced → the run moved out of the parked state between the read and
 //     the early-promote write (a concurrent claim/cancel), so the promote found 0 rows.
+//   - ErrRunOwnerHeld (via *RunOwnerHeldError) → a recovery_wait run whose cause is an owner
+//     hold (policy hold, pending policy outcome, worker memory pressure, requeue exhaustion,
+//     retained recovery causes, codex account unavailable): the early promote would match 0
+//     rows by design, so the verb refuses with a specific 409 naming the hold instead of the
+//     generic "state changed" race. See recoveryWaitOwnerHold.
 //
 // A HELD run whose worker LACKS the credential_switch capability is refused with
 // CredentialSwitchWorkerUnsupportedError (a struct error, so the 409 can name the worker).
@@ -48,6 +53,9 @@ var (
 	ErrForgeUnreachableHeld            = errors.New("forge_unreachable held: use Resume before switching its token")
 	ErrCodexIdleStallHeld              = errors.New("codex_idle_stall held: use Resume before switching its token")
 	ErrCredentialSwitchRaced           = errors.New("credential switch: run state changed, retry")
+	// ErrRunOwnerHeld is the owner-facing 409 text for a set-token on a recovery_wait run held by an
+	// owner-only hold that PromoteRecoveryWaitRunNow never promotes (see recoveryWaitOwnerHold).
+	ErrRunOwnerHeld = errors.New("this owner hold prevents switching the token; inspect the run's recovery options: Resume may re-hold it, Cancel ends the run")
 	// ErrCredentialsResetHeld is the owner-facing 409 text for a Resume or set-token on a run held on
 	// credentials_reset (PRD #3989 M3): only the credential promoter releases that hold.
 	ErrCredentialsResetHeld = errors.New("credentials were reset; add a credential in Settings and the run resumes automatically")
@@ -65,6 +73,64 @@ type CredentialSwitchWorkerUnsupportedError struct {
 
 func (e *CredentialSwitchWorkerUnsupportedError) Error() string {
 	return fmt.Sprintf("credential switch: worker %q (%s) does not support credential_switch; it must be upgraded to a version that advertises the capability", e.WorkerName, e.WorkerID)
+}
+
+// runOwnerHeldPendingOutcome is the runOwnerHeldLabels key for a policy outcome that is set but
+// not yet resolved (policy_outcome_id set, policy_resolved_at NULL).
+const runOwnerHeldPendingOutcome = "policy_outcome_pending"
+
+// runOwnerHeldLabels is the fixed vocabulary naming an owner hold in RunOwnerHeldError. Labels are
+// resolved only by lookup here; an unknown or empty key yields no label.
+var runOwnerHeldLabels = map[string]string{
+	"codex_policy_hold":                          "policy hold",
+	runOwnerHeldPendingOutcome:                   "pending policy outcome",
+	recoveryCauseCodexAccountUnavailable:         "codex account unavailable",
+	"worker_requeue_exhausted":                   "worker requeue exhausted",
+	recoveryCauseWorkerMemoryPressure:            "worker memory pressure",
+	recoveryCauseRetainedRecoveryAdoptionFailed:  "retained recovery adoption failed",
+	recoveryCauseRetainedContinuationUnwitnessed: "retained continuation unwitnessed",
+	recoveryCauseRetainedRecoveryExhausted:       "retained recovery exhausted",
+}
+
+// RunOwnerHeldError refuses a set-token on a recovery_wait run held by an owner-only hold. Label
+// is a runOwnerHeldLabels value (empty when unknown) and is appended to the generic text.
+type RunOwnerHeldError struct{ Label string }
+
+func (e *RunOwnerHeldError) Error() string {
+	if e.Label == "" {
+		return ErrRunOwnerHeld.Error()
+	}
+	return ErrRunOwnerHeld.Error() + " (hold: " + e.Label + ")"
+}
+
+// Unwrap lets errors.Is match ErrRunOwnerHeld and nothing else.
+func (e *RunOwnerHeldError) Unwrap() error { return ErrRunOwnerHeld }
+
+// recoveryWaitOwnerHold reports whether a locked recovery_wait run is held by an owner hold that
+// PromoteRecoveryWaitRunNow (store/queries/runtime.sql) never promotes, with its label. It mirrors
+// that query's exclusions, minus the three per-cause retry-stamp checks (data_volume_full,
+// forge_unreachable, codex_idle_stall), which keep their own sentinels in setCredentialAndPromote.
+// Keep the two in step.
+func recoveryWaitOwnerHold(locked store.LockRunForCredentialSwitchRow) (label string, held bool) {
+	if locked.Status != "recovery_wait" {
+		return "", false
+	}
+	if locked.HoldReason.Valid && locked.HoldReason.String == "codex_policy_hold" {
+		return runOwnerHeldLabels["codex_policy_hold"], true
+	}
+	if locked.PolicyOutcomeID.Valid && !locked.PolicyResolvedAt.Valid {
+		return runOwnerHeldLabels[runOwnerHeldPendingOutcome], true
+	}
+	if !locked.RecoveryWaitCause.Valid {
+		return "", false
+	}
+	switch c := locked.RecoveryWaitCause.String; c {
+	case recoveryCauseCodexAccountUnavailable, "worker_requeue_exhausted", recoveryCauseWorkerMemoryPressure,
+		recoveryCauseRetainedRecoveryAdoptionFailed, recoveryCauseRetainedContinuationUnwitnessed,
+		recoveryCauseRetainedRecoveryExhausted:
+		return runOwnerHeldLabels[c], true
+	}
+	return "", false
 }
 
 // SetRunCredentialResult is what SetRunCredential returns on success: the re-read run (so
@@ -344,6 +410,13 @@ func (s *Service) setCredentialAndPromote(ctx context.Context, observed store.Ru
 		if locked.Status != observed.Status || locked.ClaimGeneration != observed.ClaimGeneration ||
 			locked.StatusSince.Valid != observed.StatusSince.Valid || !locked.StatusSince.Time.Equal(observed.StatusSince.Time) {
 			return ErrCredentialSwitchRaced
+		}
+		// Deliberately AFTER the observed-row comparison: a run that moved since it was read is a
+		// race (retry), while a row that is still the observed one and owner-held is a specific
+		// refusal. It precedes the override write so nothing is written. A change of cause alone,
+		// leaving status_since, is not detected as a move and so lands here as owner-held.
+		if label, held := recoveryWaitOwnerHold(locked); held {
+			return &RunOwnerHeldError{Label: label}
 		}
 		if _, err := q.SetRunCredentialOverride(ctx, store.SetRunCredentialOverrideParams{
 			Mode:     pgOverrideMode(resolved),

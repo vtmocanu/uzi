@@ -742,6 +742,13 @@ type Store interface {
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
 	CreateJudgeRun(ctx context.Context, arg store.CreateJudgeRunParams) (store.Run, error)
+	// Visible judge skip (issue #3257): the creation guard (isolation, target lock, skip
+	// delete) and the skip writer/reader. See judge_skip.go.
+	CurrentTransactionIsolation(ctx context.Context) (string, error)
+	LockRunForJudge(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
+	DeleteJudgeSkipForTarget(ctx context.Context, targetRunID uuid.UUID) error
+	RecordJudgeSkip(ctx context.Context, arg store.RecordJudgeSkipParams) (int64, error)
+	GetJudgeSkipForTarget(ctx context.Context, targetRunID uuid.UUID) (store.JudgeSkip, error)
 	// Per-user judge spend guards (PRD #69 M5 Decision 9, Gate 5). Read-only count
 	// queries feeding the cooldown and daily-budget backstops in maybeEnqueueJudge.
 	// LastJudgeEnqueuedAt returns a NULLABLE timestamp (NULL ⇒ user never judged).
@@ -2176,6 +2183,12 @@ type Service struct {
 	codexSelectHook            func(ctx context.Context)
 	codexSelectLockedHook      func(ctx context.Context)
 	codexSelectBeforeFenceHook func(ctx context.Context, picked uuid.UUID)
+	// judgeBeforeLockHook / judgeAfterInsertHook are test seams in the judge insert closures
+	// (issue #3257): the first runs in the creating transaction after the isolation check and
+	// before the target lock, the second after the judge INSERT and before the commit. Nil in
+	// production.
+	judgeBeforeLockHook  func(ctx context.Context)
+	judgeAfterInsertHook func(ctx context.Context)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every
@@ -4496,6 +4509,14 @@ type StateRequest struct {
 	// httpx.DecodeJSON rejects unknown fields, so a worker sends it only once the api advertises
 	// the retained_recovery_capacity_hold_v1 feature.
 	RetainedCapacityOnly *bool `json:"retained_capacity_only,omitempty"`
+	// RecoveryDetail qualifies a recovery_cause "retained_recovery_adoption_failed" park (issue
+	// #4177) with a closed-set sub-cause: "secret_remediation_active" (retrying unchanged cannot
+	// help; Resume is refused) or "remediation_proof_unknown" (a retry may help). Absent means
+	// unclassified and never permits anything new. SetState rejects any other value, state or
+	// cause, or a missing or non-positive claim_generation, as ErrInvalidState (400) before any
+	// SQL (validateRecoveryDetail). httpx.DecodeJSON rejects unknown fields, so a worker sends it
+	// only once the api advertises the recovery_detail_adoption_refusal_v1 feature.
+	RecoveryDetail *string `json:"recovery_detail,omitempty"`
 	// ProductiveTurns qualifies a recovery_cause "provider_outage" park (PRD #1733): the number
 	// of model turns the PARKING FLIGHT completed without error since its claim. A positive value
 	// is progress and starts a new provider-park streak at this park; zero or absent continues
@@ -4643,6 +4664,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	}
 	// Issue #4046: before the memory-pressure early return so no marker bypasses validation.
 	if err := validateRetainedCapacityOnly(req); err != nil {
+		return store.Run{}, false, err
+	}
+	if err := validateRecoveryDetail(req); err != nil {
 		return store.Run{}, false, err
 	}
 	if err := validateReportOnlyShape(req); err != nil {
@@ -8595,7 +8619,7 @@ func (s *Service) RunCredentialEpochs(ctx context.Context, runID, userID uuid.UU
 }
 
 // SelfUsage returns the user's own lifetime + last-7-days usage totals and their
-// usage-bearing run count (PRD #40 M3, GET /api/usage).
+// primary work run count with usage (PRD #40 M3, GET /api/usage).
 func (s *Service) SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error) {
 	return s.q.SelfUsage(ctx, userID)
 }

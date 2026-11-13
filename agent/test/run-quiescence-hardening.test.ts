@@ -24,7 +24,7 @@ import {
 } from "../src/run-quiescence.js";
 import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 import { defaultCheckRunner } from "../src/self-improve.js";
-import { makeFakeProcRoot, scopedRealView, withQuiescenceView } from "./fake-proc.js";
+import { makeFakeProcRoot, plantFakeProc, scopedRealView, withQuiescenceView } from "./fake-proc.js";
 import { realProcfsSkip } from "./real-procfs.js";
 import { RecoveryMaintenance, MaintenanceResources } from "../src/recovery-maintenance.js";
 import { RUN_ATTEMPT_ENV, registerWorkerRunnerRoot, workerSpawnNonce } from "../src/worker-spawn-mark.js";
@@ -174,12 +174,244 @@ describe("A-codex-sibling: a concurrent Codex attempt's non-dumpable supervisor"
     assert.equal(out.process?.state, "quiescent", out.process?.detail ?? "no process detail reported");
   });
 
+  it("#3915 re-proves with a peer root recorded after the first snapshot", async () => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs();
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: SUP, startTime: DEFAULT_START });
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true, dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.deepEqual(roots, [{ pid: SUP, startTime: DEFAULT_START }], "the peer registered before process enumeration");
+    assert.equal(out.process?.state, "quiescent", "a newly recorded peer root must not block this run");
+    assert.equal(out.process?.rootReproof, "quiescent");
+  });
+
+  it("#3915 the in-process rescan sees a late peer root without renewing its wall deadline", async t => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs();
+    const deps = fakeDeps(procs);
+    let elapsed = 0;
+    const base = Date.now();
+    t.mock.method(Date, "now", () => base + elapsed);
+    deps.now = () => Date.now();
+    deps.sleep = async ms => { elapsed += ms; };
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: SUP, startTime: DEFAULT_START });
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "quiescent", "a fresh in-process pass saw the exact peer root");
+    assert.equal(out.process?.rootReproof, "quiescent");
+    assert.ok(elapsed < 5000, "no new allowance was granted to the retry");
+  });
+
+  it("#3915 a late root with a stale start time cannot clear the proof", async () => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs();
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: SUP, startTime: DEFAULT_START - 1 });
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true, dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "unverified", "pid alone must not attribute the process");
+    assert.equal(out.process?.rootReproof, "none", "a mismatched start tick cannot trigger the reproof");
+  });
+
+  it("#3915 an error reading a peer's fresh roots leaves the refusal unverified", async () => {
+    const registry = new LiveAttemptRegistry();
+    let afterSnapshot = false;
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => {
+      if (afterSnapshot) throw new Error("peer root read failed");
+      return [];
+    }));
+    const procs = codexProcs();
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => { afterSnapshot = true; return list(); };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "unverified");
+    assert.equal(out.process?.rootReproof, "none", "an unreadable peer root never authorizes a reproof");
+  });
+
+  it("#3915 a group-only candidate without a captured start tick cannot trigger reproof", async () => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs(); // supervisor pgid/sid is 5; pid 5 is not an observed ancestor
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: 5, startTime: DEFAULT_START });
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "unverified");
+    assert.equal(out.process?.rootReproof, "none", "a group PID alone carries no exact identity");
+  });
+
+  it("#3915 a pgid that is also an observed ancestor keeps its exact root identity", async () => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs: Record<number, FakeProc> = {
+      [SELF]: { uid: RUNNER, ppid: 1 },
+      300: { uid: RUNNER, ppid: 1, pgid: 300, sid: 5, cwd: "/elsewhere", env: {} },
+      301: { uid: RUNNER, ppid: 300, pgid: 300, sid: 5, cwd: "EACCES", env: "EACCES" },
+    };
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: 300, startTime: DEFAULT_START });
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "quiescent", "the exact ancestor root clears the fresh proof");
+    assert.equal(out.process?.rootReproof, "quiescent");
+  });
+
+  it("#3915 an expired deadline prevents the fresh-root reproof", async () => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs();
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    let expired = false;
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: SUP, startTime: DEFAULT_START });
+      expired = true;
+      return list();
+    };
+    const deadline = Date.now() + 1000;
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry, get deadlineAt() { return expired ? Date.now() - 1 : deadline; } },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "unverified");
+    assert.equal(out.process?.rootReproof, "none", "no second proof started after expiry");
+  });
+
+  it("#3915 a first proof that spent its own allowance gets no fresh helper budget", async t => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs();
+    const deps = { ...fakeDeps(procs), deadlineMs: 500 };
+    let wall = 10_000;
+    t.mock.method(Date, "now", () => wall);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) {
+        roots.push({ pid: SUP, startTime: DEFAULT_START });
+        wall += 1000; // the first proof ran past its original 500 ms wall allowance
+      }
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "unverified");
+    assert.equal(out.process?.rootReproof, "none", "the retry cannot renew the first proof's budget");
+  });
+
+  it("#3915 a mixed unreadable and clone-residue verdict does not re-prove", async () => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs();
+    procs[302] = { uid: RUNNER, ppid: 1, cwd: CLONE, env: {} };
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: SUP, startTime: DEFAULT_START });
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "capture", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "unverified");
+    assert.ok(out.process?.processes.some(p => p.pid === 302), "clone residue remains a blocker");
+    assert.equal(out.process?.rootReproof, "none", "the mixed verdict starts no second proof");
+  });
+
+  it("#3915 a first proof that reaped clone residue does not start another proof", async () => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs();
+    procs[302] = { uid: RUNNER, ppid: 1, cwd: CLONE, env: {} };
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: SUP, startTime: DEFAULT_START });
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "unverified");
+    assert.deepEqual(out.process?.killed, [302], "the first proof did reap its own residue");
+    assert.equal(out.process?.rootReproof, "none", "effects in the first proof veto the reproof");
+  });
+
   it("control: the same supervisor with no recorded root is unverified (the pre-fix behaviour)", async () => {
     const registry = new LiveAttemptRegistry();
     registry.add(claude);
     registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => []));
     const out = await quiesce(registry, codexProcs());
     assert.equal(out.process?.state, "unverified");
+    assert.equal(out.process?.rootReproof, "none", "no new root means no reproof");
     assert.deepEqual(out.process?.processes.map((p) => p.pid).sort(), [SUP, 301]);
   });
 
@@ -398,6 +630,36 @@ describe("A-helper-tmp: the uid-split TMPDIR setup runs mktemp/rm asynchronously
 });
 
 describe("A-helper: request on stdin, private TMPDIR, tsx cache off, one bounded verdict", () => {
+  it("#3915 the raw helper re-proves with a peer root recorded after its first input snapshot", async t => {
+    const procRoot = makeFakeProcRoot();
+    t.after(() => fs.rmSync(procRoot, { recursive: true, force: true }));
+    plantFakeProc(procRoot, 300, { uid: ME, ppid: 1, pgid: 5, sid: 5,
+      comm: "uzi-codex-super", env: "unreadable", cwd: "/", startTime: DEFAULT_START });
+    const registry = new LiveAttemptRegistry();
+    const current = newRunAttempt("run-17", 1, CLONE, () => []);
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(current);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    let helperStarts = 0;
+    const result = await withQuiescenceView({ procRoot, deadlineMs: 50 }, () => quiesceRunAttempt(
+      { mode: "own", attempt: current, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: ME, reap: { viaHelper: true, helperTmp: recordingTmp(),
+        spawnHelper: (_command, args, opts) => {
+          helperStarts++;
+          if (helperStarts === 1) roots.push({ pid: 300, startTime: DEFAULT_START });
+          const child = spawn(process.execPath, args.slice(args.indexOf("--import")), {
+            cwd: opts.cwd, env: opts.env, stdio: ["pipe", "pipe", "pipe"],
+          });
+          spawned.push(child);
+          return child;
+        } } },
+    ));
+    assert.equal(helperStarts, 2, "one full proof per root snapshot");
+    assert.equal(result.process?.state, "quiescent", result.process?.detail ?? "no process result");
+    assert.equal(result.process?.rootReproof, "quiescent");
+  });
+
   it("serializes the solitary permission only for an explicit clear claim and empty registry under uid split", async () => {
     const previous = process.env.UZI_UID_SPLIT;
     process.env.UZI_UID_SPLIT = "1";

@@ -228,7 +228,7 @@ func isolatedCoordinateDatabase(t *testing.T) codexTestEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return codexTestEnv{ctx: ctx, pool: pool, q: store.New(pool), box: box, exec: func(sql string, args ...any) {
+	return codexTestEnv{ctx: ctx, pool: pool, q: store.New(pool), box: box, isolated: true, exec: func(sql string, args ...any) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, sql, args...); err != nil {
 			t.Fatalf("isolated fixture SQL: %v", err)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove both Node test shards ran every tracked agent test file exactly once."""
+"""Prove the three Node test shards ran every tracked agent test file exactly once."""
 
 import argparse
 import re
@@ -10,11 +10,11 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-REPORTS = ("shard-1.xml", "shard-2.xml")
+REPORTS = ("shard-1.xml", "shard-2.xml", "shard-3.xml")
 
 
 def latest_reports(report_dir):
-    """Select each shard independently; a partial rerun need not rerun both legs."""
+    """Select each shard independently; a partial rerun need not rerun every leg."""
     artifacts = sorted(report_dir.glob("agent-tests-*"))
     if not artifacts:
         # Keep the standalone flat-report input used by local checks.
@@ -24,7 +24,7 @@ def latest_reports(report_dir):
         errors.append("flat reports cannot be mixed with per-attempt artifacts")
     latest = {}
     for artifact in artifacts:
-        match = re.fullmatch(r"agent-tests-([12])-attempt-([1-9][0-9]*)", artifact.name)
+        match = re.fullmatch(r"agent-tests-([1-3])-attempt-([1-9][0-9]*)", artifact.name)
         if not match or not artifact.is_dir():
             errors.append(f"unrecognized shard artifact: {artifact.name}")
             continue
@@ -85,8 +85,9 @@ def check_reports(report_dir, expected):
     marker = paths[REPORTS[0]].with_suffix(".codex-m4")
     if not marker.is_file() or marker.read_text().strip() != "passed":
         errors.append("Codex M4 did not complete in shard 1")
-    if paths[REPORTS[1]].with_suffix(".codex-m4").exists():
-        errors.append("Codex M4 also ran in shard 2")
+    for shard, name in enumerate(REPORTS[1:], 2):
+        if paths[name].with_suffix(".codex-m4").exists():
+            errors.append(f"Codex M4 also ran in shard {shard}")
     for name in REPORTS:
         path = paths[name]
         if not path.is_file():
@@ -106,11 +107,13 @@ def check_reports(report_dir, expected):
         except (ET.ParseError, ValueError) as exc:
             errors.append(f"{name}: {exc}")
     if len(observed) == len(REPORTS):
-        first, second = (observed[name] for name in REPORTS)
-        repeated = first & second
-        actual = first | second
+        seen, repeated = set(), set()
+        for name in REPORTS:
+            repeated |= seen & observed[name]
+            seen |= observed[name]
+        actual = seen
         if repeated:
-            errors.append("files ran in both shards: " + describe_files(repeated))
+            errors.append("files ran in more than one shard: " + describe_files(repeated))
         if missing := expected - actual:
             errors.append("tracked files not run: " + describe_files(missing))
         if unexpected := actual - expected:
@@ -133,8 +136,10 @@ def self_test():
 
     with tempfile.TemporaryDirectory(prefix="uzi-agent-shard-check-") as tmp:
         directory = Path(tmp)
+        expected.add("agent/test/d.test.ts")
         write(directory / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
         write(directory / REPORTS[1], ["agent/test/b.test.ts"])
+        write(directory / REPORTS[2], ["agent/test/d.test.ts"])
         (directory / "shard-1.codex-m4").write_text("passed\n")
         errors, _ = check_reports(directory, expected)
         if errors:
@@ -143,42 +148,52 @@ def self_test():
         errors, _ = check_reports(directory, expected)
         require(errors, "did not complete", "missing M4 run went unnoticed")
         (directory / "shard-1.codex-m4").write_text("passed\n")
-        (directory / "shard-2.codex-m4").write_text("passed\n")
-        errors, _ = check_reports(directory, expected)
-        require(errors, "also ran", "duplicate M4 run went unnoticed")
-        (directory / "shard-2.codex-m4").unlink()
+        for extra in ("shard-2.codex-m4", "shard-3.codex-m4"):
+            (directory / extra).write_text("passed\n")
+            errors, _ = check_reports(directory, expected)
+            require(errors, "also ran", f"duplicate M4 run went unnoticed ({extra})")
+            (directory / extra).unlink()
         write(directory / REPORTS[1], ["agent/test/a.test.ts", "agent/test/b.test.ts"])
         errors, _ = check_reports(directory, expected)
-        require(errors, "both shards", "duplicate shard index went unnoticed")
+        require(errors, "more than one shard", "duplicate across shards 1 and 2 went unnoticed")
         write(directory / REPORTS[1], ["agent/test/b.test.ts"])
+        write(directory / REPORTS[2], ["agent/test/b.test.ts", "agent/test/d.test.ts"])
+        errors, _ = check_reports(directory, expected)
+        require(errors, "more than one shard", "duplicate across shards 2 and 3 went unnoticed")
+        write(directory / REPORTS[2], ["agent/test/d.test.ts"])
         write(directory / REPORTS[0], ["agent/test/a.test.ts"])
         errors, _ = check_reports(directory, expected)
         require(errors, "not run", "dropped test file went unnoticed")
         write(directory / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
-        write(directory / REPORTS[1], ["agent/test/b.test.ts", "agent/test/d.test.ts"])
+        write(directory / REPORTS[2], ["agent/test/d.test.ts", "agent/test/e.test.ts"])
         errors, _ = check_reports(directory, expected)
         require(errors, "untracked or unintended", "unexpected test file went unnoticed")
-        write(directory / REPORTS[1], [])
-        errors, _ = check_reports(directory, expected)
-        require(errors, "no tests ran", "empty shard went unnoticed")
-        (directory / REPORTS[1]).unlink()
-        errors, _ = check_reports(directory, expected)
-        require(errors, "expected exactly", "missing shard report went unnoticed")
+        write(directory / REPORTS[2], ["agent/test/d.test.ts"])
+        for index in (1, 2):
+            write(directory / REPORTS[index], [])
+            errors, _ = check_reports(directory, expected)
+            require(errors, "no tests ran", f"empty shard {index + 1} went unnoticed")
+            (directory / REPORTS[index]).unlink()
+            errors, _ = check_reports(directory, expected)
+            require(errors, "expected exactly", f"missing shard {index + 1} report went unnoticed")
+            write(directory / REPORTS[index], ["agent/test/b.test.ts"] if index == 1 else ["agent/test/d.test.ts"])
         attempts = directory / "attempts"
         attempts.mkdir()
         old = attempts / "agent-tests-1-attempt-1"
         retried = attempts / "agent-tests-1-attempt-2"
         second = attempts / "agent-tests-2-attempt-1"
-        for artifact in (old, retried, second):
+        third = attempts / "agent-tests-3-attempt-1"
+        for artifact in (old, retried, second, third):
             artifact.mkdir()
         write(old / REPORTS[0], ["agent/test/a.test.ts", "agent/test/b.test.ts"])
         write(retried / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
         write(second / REPORTS[1], ["agent/test/b.test.ts"])
+        write(third / REPORTS[2], ["agent/test/d.test.ts"])
         (retried / "shard-1.codex-m4").write_text("passed\n")
         errors, _ = check_reports(attempts, expected)
         if errors:
             raise RuntimeError(f"self-test failed: latest reports from different attempts were refused; errors={errors}")
-        # A whole-workflow rerun selects both new legs and ignores old payloads.
+        # A whole-workflow rerun selects every new leg and ignores old payloads.
         second_retry = attempts / "agent-tests-2-attempt-2"
         second_retry.mkdir()
         write(second_retry / REPORTS[1], ["agent/test/b.test.ts"])
@@ -204,6 +219,14 @@ def self_test():
         (tenth / REPORTS[0]).unlink()
         errors, _ = check_reports(attempts, expected)
         require(errors, "expected exactly", "a missing latest report fell back to an older report")
+        (third / REPORTS[2]).unlink()
+        write(tenth / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
+        errors, _ = check_reports(attempts, expected)
+        require(errors, "expected exactly", "a missing shard 3 artifact report went unnoticed")
+        stray = attempts / "agent-tests-4-attempt-1"
+        stray.mkdir()
+        errors, _ = check_reports(attempts, expected)
+        require(errors, "unrecognized shard artifact", "a fourth shard artifact went unnoticed")
     print("agent shard checker self-test passed: file union, M4 count, mixed-attempt reruns, numeric ordering and stale-report cases")
 
 
@@ -229,7 +252,7 @@ def main():
         for error in errors:
             print(f"FAIL: {error}")
         return 1
-    print(f"PASS: {len(expected)} tracked agent test files ran exactly once across two shards")
+    print(f"PASS: {len(expected)} tracked agent test files ran exactly once across {len(REPORTS)} shards")
     return 0
 
 

@@ -246,7 +246,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    Adoption failure is an integrity hold: retained adoption or a predecessor remediation
    record refused source use (the agent did not start), with local work and custody
    preserved and no automatic retry. Resume requests a bounded attempt; success is not assured,
-   and repeated failure holds again. Unwitnessed means a claimed flight was never seen starting; claim released, work and custody kept, no automatic retry, not an integrity refusal. `paused` stops the poller because it never
+   and repeated failure holds again; on `recovery_wait_detail` `secret_remediation_active` Resume is refused (409), so export an available archive (may omit later work) or operator recovery, then Cancel. Unwitnessed means a claimed flight was never seen starting; claim released, work and custody kept, no automatic retry, not an integrity refusal. `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
    with `hold_reason: budget_exhausted` (PRD #1497), never `failed`: extend it (`uzi run
    extend RUN --by 2h`) and re-arm the poller; an owner pause waits for its owner.
@@ -328,7 +328,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
      “Already reviewed the last commit.” Decide whether the existing coverage plus a local
      review is sufficient for this risk class. If a bot review is still warranted, post
      `@coderabbitai full review` once and return to step 2; never auto-post it.
-   - **File-limit refusal (status or command reply).** `N files exceed the limit of 100`,
+   - **File-limit refusal (check-run, status or command reply).** `N files exceed the limit of 100`,
      including CodeRabbit's answer to `@coderabbitai full review`, means switch to Greptile: post
      `@greptileai review`, then `--reviewer greptile --reviewer-grace 2`. A command reply need
      not change the commit status, so do not wait for a particular watcher exit.
@@ -427,7 +427,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    `--fresh`. After a merge or renumber, regenerate sqlc (a renumber reorders generated
    columns) and run the full gate on CI: a clean merge can still break a signature one side changed. Resolve a conflicted generated `*.sql.go` by regenerating it
    after its `queries/*.sql`, never by hand. When either side adds a migration, require the
-   `test-codex-refresh-lostreply-e2e` job's `LiveDB: N passed, 0 skipped` line (`test-api-store-it` only mirrors that job's result) on the exact head, since a test
+   `LiveDB: N passed, 0 skipped` line from both `test-livedb-workersvc` and `test-codex-refresh-lostreply-e2e` (`test-api-store-it` only mirrors their results) on the exact head, since a test
    pinned to an older schema can break on the other side's new columns.
    Ordinary PRs add their own lowercase UUID-v4 fragment before a PR exists, initially citing
    the relevant issue; see [fragment guidance](../../../changelog.d/README.md). Do not union

@@ -930,8 +930,11 @@ void _releaseCheckStatusFull;
 // whose zero marshals null (GET always emits them). The start-preview response omits
 // `alternatives` when empty (omitempty), so its zero fixture simply lacks the key.
 {
-  type SettingsZero = Omit<ZeroOf<EffectiveSettings, "harnesses" | "start" | "models" | "efforts">, "cross_check"> & {
+  // judge_harness (PRD #3257) is a value, not a pointer: its zero marshals notes as null (a Go
+  // nil slice) while every real GET builds []; the TS type is right to say never-null.
+  type SettingsZero = Omit<ZeroOf<EffectiveSettings, "harnesses" | "start" | "models" | "efforts">, "cross_check" | "judge_harness"> & {
     cross_check: { models: EffectiveModelCell[] | null; efforts: EffectiveEffortCell[] | null };
+    judge_harness: Omit<Widen<HarnessValue>, "notes"> & { notes: string[] | null };
   };
   const zero: SettingsZero = effectiveSettingsZero;
   const full: Widen<EffectiveSettings> = effectiveSettingsFull;

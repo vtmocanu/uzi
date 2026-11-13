@@ -9,7 +9,7 @@
 
 services:
   db:
-    image: postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
+    image: postgres:17@sha256:846a7ddaa67a4b354ae1d21087b683901aa6113a4ed626d3787cfbf6c85e3e07
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-uzi}

@@ -26,11 +26,13 @@ import (
 //
 // # WHAT THIS DOES NOT COVER
 //
-// It matches the literal `UPDATE runs SET` in the .sql files, so it sees CTE-embedded
-// writers (ClaimRun, ClaimChatRun) whose UPDATE is present as a literal. It does NOT see a
+// It matches `UPDATE runs SET` (optionally aliased, `UPDATE runs child SET` or
+// `UPDATE runs AS child SET`) in the .sql files, so it sees CTE-embedded
+// writers (ClaimRun, ClaimChatRun) whose UPDATE is present as a literal, and aliased
+// writers such as the cross-check child cancels. It does NOT see a
 // Go caller that transitions status by some other means, nor a status write in a migration
 // data-fix — those are out of the query-file corpus by construction. The pairing it does
-// enforce is the one that the 23 shipping status writers all satisfy today.
+// enforce is the one that every shipping status writer satisfies today.
 func TestEveryStatusWriteStampsStatusSince(t *testing.T) {
 	const queryDir = "queries"
 	entries, err := os.ReadDir(queryDir)
@@ -51,7 +53,9 @@ func TestEveryStatusWriteStampsStatusSince(t *testing.T) {
 	// scan. A literal marker would let a future status writer formatted that way escape
 	// the guard entirely — the vacuity guard below keeps the count at 20+ while silently
 	// stopping coverage of it (CodeRabbit #657). \s+ (not \s*) keeps the keywords distinct.
-	markerRe := regexp.MustCompile(`UPDATE\s+runs\s+SET`)
+	// The optional alias group makes aliased writers (`UPDATE runs child SET`) visible too;
+	// the match still ends at the SET keyword, so the clause extraction below is unchanged.
+	markerRe := regexp.MustCompile(`UPDATE\s+runs(?:\s+(?:AS\s+)?\w+)?\s+SET`)
 
 	var scanned int            // total named queries seen
 	var statusWriters []string // names whose SET clause assigns runs.status
@@ -129,7 +133,7 @@ func TestEveryStatusWriteStampsStatusSince(t *testing.T) {
 		t.Fatalf("scanned %d named queries in %s/ — the scan did not run, this result is meaningless", scanned, queryDir)
 	}
 	if len(statusWriters) < 20 {
-		t.Fatalf("found only %d statements that assign runs.status (%v) — expected at least 20 (there are 23); "+
+		t.Fatalf("found only %d statements that assign runs.status (%v) — expected at least 20 (there are far more); "+
 			"the matcher is not seeing the status writers, so its green would be vacuous", len(statusWriters), statusWriters)
 	}
 

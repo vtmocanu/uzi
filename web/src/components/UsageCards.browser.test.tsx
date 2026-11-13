@@ -8,6 +8,7 @@ import { MemoryRouter } from "react-router-dom";
 import { UsageCard, type UsageWindow } from "./UsageCards";
 import type { AdminUsage, SelfUsage } from "../lib/api";
 import { mockApi } from "../mocks/mockApi";
+import { USAGE_SCOPE_NOTE } from "./usageParts";
 
 afterEach(cleanup);
 
@@ -62,8 +63,9 @@ it("keeps the PR count row (row 6) aligned across both columns in both windows",
   expect(factory.children[5].textContent).toBe("14 PRs · at least $1.11 per PR");
   aligned();
   fireEvent.click(screen.getByRole("button", { name: "All time" }));
-  expect(personal.children[5].textContent).toContain("23 runs with token usage · 18 PRs");
-  expect(factory.children[5].textContent).toContain("79 runs with token usage by 4 users");
+  expect(personal.children[5].textContent).toContain("23 primary work runs with token usage · 18 PRs");
+  expect(factory.children[5].textContent).toContain("79 primary work runs with token usage");
+  expect(factory.children[5].textContent).toContain("4 users with recorded usage");
   expect(factory.children[5].textContent).toContain("61 PRs");
   aligned();
 });
@@ -130,4 +132,26 @@ it("stacks at 375px, uses 44px mobile targets and retains its own keyboard outli
     expect(style.outlineWidth).toBe("2px");
     expect(style.outlineOffset).toBe("2px");
   } finally { reset.remove(); }
+});
+
+// Issue #4209: the scope note must wrap inside its card, never clip or push past it.
+function expectNoteInsideCard(note: HTMLElement) {
+  let card: HTMLElement | null = note.parentElement;
+  while (card && parseFloat(getComputedStyle(card).borderTopWidth) === 0) card = card.parentElement;
+  expect(card).toBeTruthy();
+  const n = note.getBoundingClientRect();
+  const c = card!.getBoundingClientRect();
+  expect(n.height).toBeGreaterThan(0);
+  expect(note.scrollWidth).toBeLessThanOrEqual(note.clientWidth);
+  expect(n.right).toBeLessThanOrEqual(c.right);
+  expect(n.left).toBeGreaterThanOrEqual(c.left);
+  expect(getComputedStyle(note).whiteSpace).not.toBe("nowrap");
+}
+
+it.each([1000, 400])("keeps the scope note visible and inside its card at %ipx", async (width) => {
+  await page.viewport(width, 900);
+  await mount();
+  const note = screen.getByText(USAGE_SCOPE_NOTE);
+  expect(note.getBoundingClientRect().width).toBeGreaterThan(0);
+  expectNoteInsideCard(note);
 });

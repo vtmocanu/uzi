@@ -47,7 +47,7 @@ func TestInputInclusionLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	svc := New(q, newBox(t), testParams())
 	svc.SetTxBeginner(pool)
@@ -61,6 +61,7 @@ func TestInputInclusionLiveDB(t *testing.T) {
 	}
 	userID := uuid.New()
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("incl-%s@e2e", userID))
+	trackLiveDBUser(t, pool, userID)
 	newWorker := func(caps ...string) store.Worker {
 		t.Helper()
 		id := uuid.New()

@@ -49,7 +49,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close) // before any track call: the tracked delete needs the pool open
 	q := store.New(pool)
 	// nil box + nil forge: the guard fires (or does not) BEFORE any forge round-trip, and
 	// guardDefaultBranch is a no-op with a nil guard — the same minimal wiring the sibling
@@ -74,6 +74,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		}
 		exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 			userID, fmt.Sprintf("omr-%s-%s@e2e", tag, userID))
+		trackLiveDBUser(t, pool, userID)
 		// PRD #1429 M2: CreateRun now resolves a real D11 harness at create time; give the
 		// user a usable Anthropic token (Claude, byte-identical) — orthogonal to the
 		// open-MR guard behaviour under test.

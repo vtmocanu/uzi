@@ -69,3 +69,30 @@ suite evolves. Focused tests exercise actual fixture subprocesses and prove
 successful execution, no cancellations, nonempty disjoint shards, and full
 union before checking stable membership. Integrated validation must also run
 the existing hermetic-proc-default proof through the launcher.
+
+## Amendment: three shards (#4232, 2026-11-13)
+
+The agent suite now runs in three shards, 1/3, 2/3 and 3/3. Unpinned paths use
+the first SHA-256 digest byte modulo three. The pin file has exactly those three
+sorted arrays, and check:agent-shards requires three disjoint JUnit reports whose
+union is every tracked file, with M4 once, in shard 1. Concurrency, the test
+timeout and M4 placement are unchanged.
+
+The change moves most memberships once. After it, the membership contract above
+holds unchanged: adding or deleting an unpinned path moves no other path.
+
+Why: on five consecutive green main runs (43302113088 through 43367001027) the
+slowest CI job was agent shard 1, median 3950 s against 2954 s for shard 2 and
+2845 s for the LiveDB job. Two balanced shards would still take about 3300 s
+each, above the LiveDB job.
+
+Pin provenance: per-file wall durations (duration_ms in each shard's
+progress.json, which includes process lifetime) from the attempt-1 artifacts of
+six green main runs, 43291940611 through 43367001027, taking the median per
+file. Every tracked file had a measurement. Allocation seeds every shard with
+its hashed remainder, adds M4's 45 wall seconds times concurrency three to
+shard 1, then moves the heaviest file that fits from the heaviest to the
+lightest shard until the spread is within 2% of the mean shard load. Pins that
+equal the hash assignment are dropped, leaving seven. The estimated loads are
+6575, 6576 and 6706 load seconds, about 2200 wall seconds per shard at
+concurrency three. These are estimates; verify against measured main runs.

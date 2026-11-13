@@ -1172,3 +1172,62 @@ test("#3851: an unmeasured attempt sibling does not gate scratch, and a byte-inc
     assert.equal(result.scratch.kept.incomplete, 1);
   });
 });
+
+// Issue #4143 (observation only): a `.retire-<uuid>` parent is never a scratch leaf the pass may remove. Its name
+// fails the leaf-name rule (name_refused), so it is never admitted, whatever the verdict.
+const RETIRE_PARENT = ".retire-0b7e1c52-4a64-4f0e-9a43-0c5f0d8a7e11";
+async function retireParentTree(w: World): Promise<string[]> {
+  const parent = join(w.root, RETIRE_PARENT);
+  await mkdir(join(parent, "clone", "sub"), { recursive: true });
+  await writeFile(join(parent, "clone", "sub", "f.txt"), "precious".repeat(700));
+  return retireParentNow(w);
+}
+function retireParentNow(w: World): string[] {
+  const out: string[] = [];
+  const walk = (p: string, rel: string): void => {
+    const st = fs.lstatSync(p);
+    out.push(`${rel}|${st.mode.toString(8)}|${st.size}|${st.mtimeMs}|${st.isFile() ? fs.readFileSync(p, "utf8").length : ""}`);
+    if (st.isDirectory()) for (const n of fs.readdirSync(p).sort()) walk(join(p, n), `${rel}/${n}`);
+  };
+  walk(join(w.root, RETIRE_PARENT), ".");
+  return out;
+}
+
+test("#4143: an eligible, attested pass keeps a .retire-<uuid> parent byte-identical and never admits it", {
+  skip: HAS_PROC_FD ? false : "no /proc/self/fd on this host: the pinned walk refuses here by design",
+}, async () => {
+  await withWorld(["ok-1"], async w => {
+    const before = await retireParentTree(w);
+    const result = await run(w);
+    assert.equal(result.verdict, "eligible");
+    assert.equal(result.authority.result, "attested");
+    assert.equal(result.scratch.state, "ran");
+    assert.equal(result.scratch.kept.name_refused, 1, "the retire parent is refused by name");
+    assert.equal(result.scratch.eligible, 1, "only the ordinary leaf is admitted");
+    assert.ok(!w.calls.discards.some(n => n.startsWith(".retire-")), "never offered to the delete path");
+    assert.deepEqual(retireParentNow(w), before);
+    await untouched(w, [RETIRE_PARENT]);
+  });
+});
+
+test("#4143: a partial or deferred pass never touches a .retire-<uuid> parent", async () => {
+  const cases: Array<[string, (w: World) => void]> = [
+    ["a partial inventory", w => {
+      const discover = w.options.git.discoverEpochRetainedSources;
+      w.options.git.discoverEpochRetainedSources = async o => ({ ...await discover(o), inventoryComplete: false, unreadable: 1 });
+    }],
+    ["same-pod restart (consumption existing)", w => { w.options.consumption = { result: "existing", mayEvaluate: false }; }],
+  ];
+  for (const [label, tune] of cases) {
+    await withWorld(["ok-1"], async w => {
+      const before = await retireParentTree(w);
+      tune(w);
+      w.discard = async () => assert.fail("must not delete");
+      const result = await runPodEpochShadow(w.options);
+      if (result) assert.equal(result.scratch.state, "not_run", label);
+      noScratchWork(w);
+      assert.deepEqual(retireParentNow(w), before, label);
+      await untouched(w, ["ok-1", RETIRE_PARENT]);
+    });
+  }
+});

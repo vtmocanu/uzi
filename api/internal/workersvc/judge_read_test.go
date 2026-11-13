@@ -200,7 +200,7 @@ func TestGetRunReviewPanel(t *testing.T) {
 	t.Run("not visible: no pending read at all", func(t *testing.T) {
 		fs := &fakeStore{runByIDErr: pgx.ErrNoRows, pendingJudgeRow: activeJudge}
 		svc := New(fs, newBox(t), testParams())
-		review, pending, err := svc.GetRunReviewPanel(context.Background(), owner, false, target)
+		review, pending, _, err := svc.GetRunReviewPanel(context.Background(), owner, false, target)
 		if err != ErrRunNotFound {
 			t.Fatalf("err = %v, want ErrRunNotFound", err)
 		}
@@ -221,7 +221,7 @@ func TestGetRunReviewPanel(t *testing.T) {
 			pendingJudgeRow:   activeJudge,
 		}
 		svc := New(fs, newBox(t), testParams())
-		review, pending, err := svc.GetRunReviewPanel(context.Background(), owner, false, target)
+		review, pending, _, err := svc.GetRunReviewPanel(context.Background(), owner, false, target)
 		if err != nil {
 			t.Fatalf("GetRunReviewPanel: %v", err)
 		}
@@ -248,7 +248,7 @@ func TestGetRunReviewPanel(t *testing.T) {
 		fs := &fakeStore{runByID: visibleRun(), pendingJudgeRow: activeJudge}
 		judged(fs)
 		svc := New(fs, newBox(t), testParams())
-		review, pending, err := svc.GetRunReviewPanel(context.Background(), owner, false, target)
+		review, pending, _, err := svc.GetRunReviewPanel(context.Background(), owner, false, target)
 		if err != nil {
 			t.Fatalf("GetRunReviewPanel: %v", err)
 		}
@@ -267,7 +267,7 @@ func TestGetRunReviewPanel(t *testing.T) {
 		fs := &fakeStore{runByID: visibleRun(), pendingJudgeErr: pgx.ErrNoRows}
 		judged(fs)
 		svc := New(fs, newBox(t), testParams())
-		review, pending, err := svc.GetRunReviewPanel(context.Background(), owner, false, target)
+		review, pending, _, err := svc.GetRunReviewPanel(context.Background(), owner, false, target)
 		if err != nil {
 			t.Fatalf("GetRunReviewPanel: %v", err)
 		}
@@ -286,7 +286,7 @@ func TestGetRunReviewPanel(t *testing.T) {
 			pendingJudgeErr:   pgx.ErrNoRows,
 		}
 		svc := New(fs, newBox(t), testParams())
-		review, pending, err := svc.GetRunReviewPanel(context.Background(), owner, false, target)
+		review, pending, _, err := svc.GetRunReviewPanel(context.Background(), owner, false, target)
 		if err != nil {
 			t.Fatalf("GetRunReviewPanel: %v", err)
 		}
@@ -304,7 +304,7 @@ func TestGetRunReviewPanel(t *testing.T) {
 			pendingJudgeRow:   activeJudge,
 		}
 		svc := New(fs, newBox(t), testParams())
-		_, pending, err := svc.GetRunReviewPanel(context.Background(), uuid.New(), true, target)
+		_, pending, _, err := svc.GetRunReviewPanel(context.Background(), uuid.New(), true, target)
 		if err != nil || pending == nil {
 			t.Fatalf("admin panel read: pending=%+v err=%v; the pending signal rides the SAME "+
 				"owner-or-admin gate as the review", pending, err)
