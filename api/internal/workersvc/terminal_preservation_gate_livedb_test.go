@@ -11,8 +11,9 @@ import (
 )
 
 // The pre-body gate admits only a run the worker has a stake in that needs no generation: its own
-// claimed or running flight, or a run with an open guarded hold of this worker. Every other shape is
-// the same ErrRunNotOwned, and the gate writes nothing.
+// claimed or running flight, or a run with an open guarded hold of this worker. The worker's own
+// non-flight run gets a typed refusal (TestTerminalPreservationGateOwnRunRefusalsLiveDB); every
+// other shape is the same ErrRunNotOwned, and the gate writes nothing.
 func TestTerminalPreservationGateLiveDB(t *testing.T) {
 	gate := func(f *termFix) error {
 		return f.svc.TerminalPreservationGate(f.e.ctx, f.worker, f.run)
@@ -115,7 +116,14 @@ func TestTerminalAuthorityChangedOnReconciliationFenceLiveDB(t *testing.T) {
 		applied_input_id, stop_cutoff)
 		VALUES ($1, $2, $3, 1, $4, $5, 'fixture', $6, 1, 'fixture', '{}', '{}', '{}', $7, $7)`,
 		uuid.New(), f.run, f.e.userID, uuid.New(), []byte{1}, f.worker.ID, input)
+	// The fence only fires when the claim moved between the unlocked pre-check (which classified
+	// this request current_flight) and the lock: release the claim in that window, so
+	// beginClaimMutation's reconciled-generation check returns ErrStaleClaim.
+	f.svc.terminal.beforeBind = func() {
+		f.e.exec(t, `UPDATE runs SET claim_released_at=now() WHERE id=$1`, f.run)
+	}
 	_, err := f.publish(f.req(1, termTip1, ""))
+	f.svc.terminal.beforeBind = nil
 	if r := termReason(t, err); r != apitypes.TerminalReasonAuthorityChanged {
 		t.Fatalf("err = %v, want authority_changed (a stale_claim would tell the worker to stop)", err)
 	}

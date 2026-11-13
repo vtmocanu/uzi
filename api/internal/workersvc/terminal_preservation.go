@@ -269,7 +269,9 @@ func (s *Service) TerminalPreservationAdmit(wkr store.Worker) error {
 // writes nothing. The capability is required, the run must belong to the worker's user and lane, and
 // the worker must hold a stake in it that needs no generation: the run is currently claimed or
 // running on this worker, or an open inventory-guarded hold of the run has this worker as both
-// original and live worker. Anything else, including a same-user run of another worker, is
+// original and live worker. The worker's own run that is not an eligible flight (claim released,
+// terminal status, or a refused kind or egress profile) and has no such hold gets the typed refusal
+// (stale_claim or unsupported). Anything else, including a same-user run of another worker, is
 // ErrRunNotOwned, so a capable worker cannot occupy the shared upload slots with runs that are not
 // its own and nothing leaks. The generation lives in the body, so the generation-bound predicates
 // are applied by PublishTerminal once the body is read.

@@ -99,10 +99,12 @@ func (h *Handler) WorkerRunTerminalPreservation(w http.ResponseWriter, r *http.R
 	_ = rc.SetReadDeadline(start.Add(heldUploadBudget))
 	_ = rc.SetWriteDeadline(start.Add(heldUploadBudget + heldServiceBudget + heldResponseGrace))
 	// The body is decoded straight from the size-capped reader: there is no separate full-body []byte
-	// and no string copy of the pack. Worst-case per-upload buffer budget: the json.Decoder's internal
-	// buffer holding the base64 text (up to ~85.4 MiB, transiently up to twice that while it grows)
-	// plus the decoded pack (up to 64 MiB). Held step A buffers one raw pack of up to 64 MiB, so a
-	// terminal upload costs roughly 2.3x to 3.7x of one held upload, bounded by the shared slot pool.
+	// and no string copy of the pack. Worst-case per-upload buffer budget (unmeasured, from the
+	// encoding/json v1 source): the json.Decoder's buffer ends at ~128 MiB for a body near the cap
+	// (~192 MiB transiently while it grows), plus the decoded pack (up to 64 MiB), plus an unquote
+	// copy of the base64 text (~86 MiB) when the pack string carries a JSON escape: up to ~280 MiB,
+	// about 4.4x one held step-A upload (one raw pack of up to 64 MiB). The real-bytes cap and the
+	// shared slot pool bound the total.
 	rd := &readErrTracker{r: http.MaxBytesReader(w, r.Body, terminalMaxBodyBytes)}
 	req, err := decodeTerminalRequest(rd)
 	if err != nil {
@@ -166,7 +168,8 @@ func (t *readErrTracker) Read(p []byte) (int, error) {
 
 // decodeTerminalRequest strictly decodes and validates the body: unknown fields (at any depth) and
 // trailing data are refused, the manifest is refused above terminalMaxManifestBytes BEFORE it is
-// parsed, the generation is required, the tips are 40-hex, the disposition is preserve, the
+// parsed, a negative generation is refused (a missing or zero one reaches the service, which refuses
+// it missing_claim_generation), the tips are 40-hex, the disposition is preserve, the
 // manifest entry counts are within their caps and the pack is standard base64. The manifest's own
 // run, generation and worker are checked by the service against the authenticated values.
 func decodeTerminalRequest(body io.Reader) (workersvc.TerminalPublishRequest, error) {
