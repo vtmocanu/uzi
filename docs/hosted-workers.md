@@ -167,6 +167,22 @@ Preparation that does not finish within 10 minutes is withdrawn into a wake.
 A wake completes only when the new pod registers (or the original pod is still
 alive). A wake not confirmed within 15 minutes shows a wake error on the worker.
 
+A wake from zero replicas waits until the old pod has fully stopped, meaning every
+container (init and ephemeral included) has terminated. A pod whose containers are
+still running or stopping holds the wake, including a `Failed` (evicted) pod that is
+still being killed and a pod that is still terminating. A pod kept only by a finalizer
+after all its containers have terminated does not hold it. After 15 minutes without
+confirmation the worker records a wake error. The typical stuck case is a pod on an
+unreachable node: it keeps its last running container statuses, so it holds the wake,
+and the wake does not recover on its own.
+
+Force-deleting such a pod removes the API object but does not prove its containers
+stopped. They may still hold the worker's ReadWriteOnce data volume, and the wake would
+then start a new pod beside them. Before force-deleting, confirm the node is really down
+(powered off or fenced from its storage); otherwise recover the node so kubelet can
+finish the shutdown. The wake proceeds on the first controller tick after the pod is
+gone.
+
 A hibernated worker wakes when an admin presses **Wake**, when the setting is turned
 off (every hibernated or still-hibernating worker, ten per sweep), or on demand. On
 demand means a queued run of any kind, chat, judge and cross-check included, that no
