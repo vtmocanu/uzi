@@ -53,13 +53,6 @@ func newDownFx(t *testing.T) *downFx {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	// The generated runs row type carries every column of the current head, but this fixture stops
-	// at 421 so the policy Downs can be walked. Add the later runs columns the production queries
-	// project (migration 427's, issue #4201) as plain columns; the walked Downs (421 and below)
-	// never touch them, and the fixture is never migrated forward again.
-	mustExec(ctx, t, pool, `ALTER TABLE runs ADD COLUMN credential_switch_op_id uuid,
- ADD COLUMN credential_switch_hold_op_id uuid, ADD COLUMN credential_switch_hold_generation bigint,
- ADD COLUMN credential_switch_hold_worker_id uuid, ADD COLUMN credential_switch_hold_register_nonce text`)
 	f := &downFx{t: t, ctx: ctx, dsn: dsn, pool: pool, q: store.New(pool), owner: uuid.New(), worker: uuid.New(), iid: 3607}
 	conn, repo := uuid.New(), uuid.New()
 	f.repo = repo
