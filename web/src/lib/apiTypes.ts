@@ -1370,7 +1370,7 @@ export interface AppSettings {
   // key already round-trips through GET/PUT /admin/settings.
   ephemeral_workers_enabled: string;
   // Worker hibernation instance switch (PRD #4205): "true"/"false", default "false".
-  // Turning it off wakes every hibernated worker (at most 10 per pass); waking on demand
+  // Turning it off wakes every hibernated worker (at most 10 per pass); waking
   // never depends on it. Optional so older responses and fixtures still type-check.
   worker_hibernation_enabled?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.

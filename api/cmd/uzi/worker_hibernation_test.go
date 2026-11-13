@@ -23,6 +23,7 @@ func TestStatusCellHibernation(t *testing.T) {
 		{"preparing", apitypes.WorkerDTO{Status: "online", HibernationState: "preparing"}, "hibernating"},
 		{"hibernated beats offline", apitypes.WorkerDTO{Status: "offline", HibernationState: "hibernated"}, "hibernated"},
 		{"hibernated beats cordon", apitypes.WorkerDTO{Status: "offline", DrainingSince: &ts, EffectiveCordoned: true, HibernationState: "hibernated"}, "hibernated"},
+		{"hibernated keeps manual cordon marker", apitypes.WorkerDTO{Status: "offline", ManualCordonedAt: &ts, EffectiveCordoned: true, HibernationState: "hibernated"}, "hibernated · cordoned (manual)"},
 		{"waking", apitypes.WorkerDTO{Status: "offline", HibernationState: "waking"}, "waking"},
 		{"waking with wake error", apitypes.WorkerDTO{Status: "offline", HibernationState: "waking", WakeError: &werr}, "waking (wake error)"},
 		{"empty wake error ignored", apitypes.WorkerDTO{Status: "offline", HibernationState: "waking", WakeError: strPtrT("")}, "waking"},

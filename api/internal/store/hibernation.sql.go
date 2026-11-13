@@ -473,6 +473,27 @@ func (q *Queries) LockRunForShare(ctx context.Context, id uuid.UUID) (string, er
 	return status, err
 }
 
+const runHasWakingHibernationWake = `-- name: RunHasWakingHibernationWake :one
+SELECT EXISTS (
+    SELECT 1 FROM hibernation_wakes hw
+    JOIN workers w ON w.id = hw.worker_id
+    WHERE hw.run_id = $1
+      AND w.hibernation_state = 'waking'
+      AND w.wake_error IS NULL
+)::boolean AS waking
+`
+
+// Owner health (PRD #4205 M6): true iff the run has a recorded wake whose worker is still waking
+// and has not failed its wake (wake_error NULL). The sweeper sets wake_error once the first wake is
+// older than the wake timeout, so a failed or overdue wake stops matching and the run falls through
+// to the ordinary queued reasons.
+func (q *Queries) RunHasWakingHibernationWake(ctx context.Context, runID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, runHasWakingHibernationWake, runID)
+	var waking bool
+	err := row.Scan(&waking)
+	return waking, err
+}
+
 const upsertControllerHibernationAdvertisement = `-- name: UpsertControllerHibernationAdvertisement :exec
 INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds)
 VALUES (1, $1, $2, $1, $3)

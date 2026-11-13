@@ -12803,6 +12803,17 @@ WHERE r.health = 'waiting_worker'
   -- genuine-wait flag after both holds end. A NULL health_reason must stay included,
   -- hence the COALESCE.
   AND NOT COALESCE(r.health_reason LIKE 'waiting until %', false)
+  -- PRD #4205 M6: a run whose recorded wake names a worker that is still waking, inside
+  -- @wake_timeout of the FIRST wake, is a transient wait for a worker coming back, not a capacity
+  -- gap. Past the timeout (or once the worker's wake failed) it counts again.
+  AND NOT EXISTS (
+      SELECT 1 FROM hibernation_wakes hw
+      JOIN workers hww ON hww.id = hw.worker_id
+      WHERE hw.run_id = r.id
+        AND hww.hibernation_state = 'waking'
+        AND hww.wake_error IS NULL
+        AND hw.first_woken_at > now() - @wake_timeout::interval
+  )
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id

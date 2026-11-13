@@ -504,6 +504,11 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 // outdated. The wake_error text itself is never put in a table cell.
 func statusCell(w apitypes.WorkerDTO) string {
 	if h := hibernationLabel(w); h != "" {
+		// The manual cordon is an operator decision that outlives the hibernation label, so it
+		// keeps its marker (the TUI and web show it beside the state too).
+		if w.ManualCordonedAt != nil {
+			h += " · cordoned (manual)"
+		}
 		return h
 	}
 	s := w.Status

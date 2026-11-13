@@ -47,6 +47,7 @@ var checkMeta = map[string]struct {
 	"fleet.rundisk":          {"owner", groupWorkers, "Run disk size", "hosted-workers"},
 	"fleet.quarantine":       {"owner", groupWorkers, "Worker residue quarantine", "hosted-workers"},
 	"fleet.memory_authority": {"owner", groupWorkers, "Worker memory authority", "hosted-workers"},
+	"fleet.hibernation_wake": {"instance", groupWorkers, "Hibernation wakes", "hosted-workers"},
 	"queue.waiting":          {"owner", groupQueue, "Runs waiting for a worker", ""},
 	"queue.undispatched":     {"owner", groupQueue, "Undispatched task runs", ""},
 	"controller.report":      {"instance", groupControl, "Controller reporting", "hosted-workers"},
@@ -446,6 +447,7 @@ func (s *Service) checkFleetCapacityWithWorkers(ctx context.Context, now time.Ti
 	}
 	rows, err := s.cfg.Store.ListOwnersWaitingNoCapacity(ctx, store.ListOwnersWaitingNoCapacityParams{
 		HeartbeatCutoff: pgconv.Time(now.Add(-s.heartbeatStale())), RollReason: workersvc.ReasonWorkersUpgrading,
+		WakeTimeout: pgtype.Interval{Microseconds: workersvc.WorkerWakeTimeout.Microseconds(), Valid: true},
 	})
 	if err != nil {
 		return degradeUnknown(c, "fleet.capacity", err)
@@ -694,6 +696,57 @@ func (s *Service) checkFleetMemoryAuthority(now time.Time, workers []store.ListA
 	}
 	c.Action = strPtr("Restart the worker's container: memory authority returns only with a fresh registration. Until then the api withholds guard-bound runs (every run-lane kind except judge, job, cross-check, review and isolated-fetch runs) from it; read memory_authority_lost_at in `uzi admin workers --json`.")
 	c.Since = sincePtr(oldest)
+	return c
+}
+
+// checkFleetHibernationWake (PRD #4205 M6) warns when a hosted worker's wake failed (wake_error is
+// set) or has been waking longer than workersvc.WorkerWakeTimeout since wake_requested_at. It reads
+// the worker list Evaluate already holds, so it adds no query. `na` when no hosted workers are
+// configured. The summary is fixed text; evidence is the full count plus at most
+// maxQuarantineEvidence sanitized worker names.
+func (s *Service) checkFleetHibernationWake(now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
+	c := s.base("fleet.hibernation_wake")
+	if !s.hostedConfigured(workers) {
+		c.Severity = sevNA
+		c.Summary = "No hosted workers are configured on this deployment."
+		return c
+	}
+	var names []string
+	var oldest time.Time
+	for _, row := range workers {
+		w := row.Worker
+		if w.Kind != "hosted" {
+			continue
+		}
+		failed := w.WakeError.Valid && w.WakeError.String != ""
+		slow := w.HibernationState == "waking" && w.WakeRequestedAt.Valid &&
+			now.Sub(w.WakeRequestedAt.Time) > workersvc.WorkerWakeTimeout
+		if !failed && !slow {
+			continue
+		}
+		names = append(names, orDash(safe(w.Name)))
+		if w.WakeRequestedAt.Valid && (oldest.IsZero() || w.WakeRequestedAt.Time.Before(oldest)) {
+			oldest = w.WakeRequestedAt.Time
+		}
+	}
+	if len(names) == 0 {
+		c.Severity = sevOK
+		c.Summary = "No hosted worker has a failed or overdue wake."
+		return c
+	}
+	c.Severity = sevWarn
+	c.Summary = "Some hosted workers failed to wake from hibernation or are overdue."
+	c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Workers", Value: fmt.Sprintf("%d", len(names))})
+	for i, n := range names {
+		if i == maxQuarantineEvidence {
+			break
+		}
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Worker", Value: n})
+	}
+	c.Action = strPtr("Runs queued for a hibernated worker are not starting. Check the worker's pod and the controller logs; `uzi admin workers --json` shows wake_error.")
+	if !oldest.IsZero() {
+		c.Since = sincePtr(oldest)
+	}
 	return c
 }
 

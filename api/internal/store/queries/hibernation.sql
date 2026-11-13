@@ -264,3 +264,16 @@ WHERE r.status = 'queued'
   AND NOT EXISTS (SELECT 1 FROM hibernation_wakes hw WHERE hw.run_id = r.id)
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.created_at ASC
 LIMIT @max_rows;
+
+-- name: RunHasWakingHibernationWake :one
+-- Owner health (PRD #4205 M6): true iff the run has a recorded wake whose worker is still waking
+-- and has not failed its wake (wake_error NULL). The sweeper sets wake_error once the first wake is
+-- older than the wake timeout, so a failed or overdue wake stops matching and the run falls through
+-- to the ordinary queued reasons.
+SELECT EXISTS (
+    SELECT 1 FROM hibernation_wakes hw
+    JOIN workers w ON w.id = hw.worker_id
+    WHERE hw.run_id = @run_id
+      AND w.hibernation_state = 'waking'
+      AND w.wake_error IS NULL
+)::boolean AS waking;

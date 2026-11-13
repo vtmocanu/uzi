@@ -12432,18 +12432,30 @@ WHERE r.health = 'waiting_worker'
   -- genuine-wait flag after both holds end. A NULL health_reason must stay included,
   -- hence the COALESCE.
   AND NOT COALESCE(r.health_reason LIKE 'waiting until %', false)
+  -- PRD #4205 M6: a run whose recorded wake names a worker that is still waking, inside
+  -- @wake_timeout of the FIRST wake, is a transient wait for a worker coming back, not a capacity
+  -- gap. Past the timeout (or once the worker's wake failed) it counts again.
+  AND NOT EXISTS (
+      SELECT 1 FROM hibernation_wakes hw
+      JOIN workers hww ON hww.id = hw.worker_id
+      WHERE hw.run_id = r.id
+        AND hww.hibernation_state = 'waking'
+        AND hww.wake_error IS NULL
+        AND hw.first_woken_at > now() - $2::interval
+  )
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND fn_worker_accepts_new_intake(w)
         AND w.last_heartbeat_at IS NOT NULL
-        AND w.last_heartbeat_at >= $2
+        AND w.last_heartbeat_at >= $3
   )
 ORDER BY CASE WHEN isfinite(r.health_since) THEN 0 ELSE 1 END, r.health_since, r.id
 `
 
 type ListOwnersWaitingNoCapacityParams struct {
 	RollReason      string             `json:"roll_reason"`
+	WakeTimeout     pgtype.Interval    `json:"wake_timeout"`
 	HeartbeatCutoff pgtype.Timestamptz `json:"heartbeat_cutoff"`
 }
 
@@ -12475,7 +12487,7 @@ type ListOwnersWaitingNoCapacityRow struct {
 // Expected plan cross-check waits are excluded:
 // an owned check finishing is not a lead waiting for worker admission.
 func (q *Queries) ListOwnersWaitingNoCapacity(ctx context.Context, arg ListOwnersWaitingNoCapacityParams) ([]ListOwnersWaitingNoCapacityRow, error) {
-	rows, err := q.db.Query(ctx, listOwnersWaitingNoCapacity, arg.RollReason, arg.HeartbeatCutoff)
+	rows, err := q.db.Query(ctx, listOwnersWaitingNoCapacity, arg.RollReason, arg.WakeTimeout, arg.HeartbeatCutoff)
 	if err != nil {
 		return nil, err
 	}

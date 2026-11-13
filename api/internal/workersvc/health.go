@@ -136,6 +136,12 @@ const (
 	// fn_run_admitted_during_intake_pause): ClaimRun matches no row for it, so no worker gap is the
 	// cause. Same fixed-string contract and healthWaitingWorker enum as its siblings.
 	reasonMaintenance = "waiting: uzi is in maintenance mode"
+	// reasonWakingFromHibernation (PRD #4205 M6) is emitted for a queued run whose recorded wake
+	// (hibernation_wakes) names a worker that is waking and has not failed its wake. It is an
+	// expected, transient wait mapped to the healthWaitingWorker enum like its siblings, so it never
+	// escalates by itself: once the sweeper stamps wake_error (the wake outlived WorkerWakeTimeout)
+	// the run falls through to the ordinary queued reasons. Fixed string, no worker name.
+	reasonWakingFromHibernation = "your worker is waking from hibernation"
 	// reasonStaleRequeuePinPrefix opens both expected owner-hold reasons: stale requeue
 	// (#2705) and draining or maintenance (#3000). Unlike its fixed
 	// siblings they embed values (the deadline and the worker name). isStaleRequeuePinReason
@@ -1404,6 +1410,17 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	}
 	if early {
 		return ""
+	}
+	// PRD #4205 M6: a hibernated worker is not online, so without this rung the run would read
+	// "no online worker". A failed read falls through rather than inventing a reason.
+	if q, ok := s.q.(interface {
+		RunHasWakingHibernationWake(context.Context, uuid.UUID) (bool, error)
+	}); ok {
+		if waking, werr := q.RunHasWakingHibernationWake(ctx, r.ID); werr != nil {
+			slog.Error("health: read hibernation wake", "run_id", r.ID, "error", werr)
+		} else if waking {
+			return reasonWakingFromHibernation
+		}
 	}
 	if eligibilityErr == nil && eligibility.ForgeBlocked > 0 && eligibility.Claimable == 0 {
 		return reasonForgeOriginWait
