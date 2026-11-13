@@ -1506,9 +1506,9 @@ describe("OverviewNext health chip popover", () => {
         <MemoryRouter initialEntries={["/overview/next"]}>
           <div style={{ paddingLeft: 240 }}>
             <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
-              {/* AppShell's content column, and the Search button (rendered only with a command
-                  menu), both push the chip right as in production; without them the old
-                  viewport-only floor never right-aligns over the sidebar and the case is vacuous. */}
+              {/* AppShell's content column bounds the actions beside the fixed sidebar. A
+                  test-owned item before the chip below puts its right-aligned panel over
+                  the sidebar if the content-column floor is removed. */}
               <div className="mx-auto w-full max-w-[68rem]">
                 <CommandMenuContext.Provider value={{ open: () => {} }}>
                   <OverviewNext />
@@ -1519,6 +1519,11 @@ describe("OverviewNext health chip popover", () => {
         </MemoryRouter>,
       );
       const chip = await screen.findByRole("button", { name: /System health/ });
+      const host = chip.parentElement!;
+      const preceding = document.createElement("span");
+      preceding.setAttribute("aria-hidden", "true");
+      preceding.style.cssText = "display:block;flex:0 0 auto;width:220px;height:1px";
+      host.parentElement!.insertBefore(preceding, host);
       await userEvent.click(chip);
       const dialog = await screen.findByRole("dialog", { name: "System health" });
       await document.fonts.ready;
@@ -1542,14 +1547,20 @@ describe("OverviewNext health chip popover", () => {
       </MemoryRouter>,
     );
     const chip = await screen.findByRole("button", { name: /System health/ });
+    // Search now follows the health chip (#4248). Add a test-owned flex item before the chip
+    // before opening, so the panel's ResizeObserver sees this sibling change size later.
+    const host = chip.parentElement!;
+    const actions = host.parentElement!;
+    const preceding = document.createElement("span");
+    preceding.setAttribute("aria-hidden", "true");
+    preceding.style.cssText = "display:block;flex:0 0 auto;width:0;height:1px";
+    actions.insertBefore(preceding, host);
     await userEvent.click(chip);
     const dialog = await screen.findByRole("dialog", { name: "System health" });
     await document.fonts.ready;
-    // A live sibling grows (as a refreshed header control would) and pushes the chip right.
-    const search = screen.getByRole("button", { name: /Search/ });
     const before = chip.getBoundingClientRect().left;
     // Wide enough that a stale chip-relative offset would push the panel past the right edge.
-    search.style.width = "720px";
+    preceding.style.width = "720px";
     await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
     // Re-placed against the chip's new position: attached to it and inside the viewport.
     await expect
