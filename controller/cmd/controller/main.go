@@ -88,14 +88,15 @@ func main() {
 	}
 
 	materializerCfg := kube.RenderConfig{
-		RollConcurrency:              cfg.RollConcurrency,
-		RollTargetVersion:            cfg.RollTargetVersion,
-		Namespace:                    cfg.WorkerNamespace,
-		DockerNamespace:              cfg.WorkerDockerNamespace,
-		PodEpochRuntime:              cfg.WorkerPodEpochRuntime,
-		EpochReclaimDeletionCanaryID: cfg.WorkerEpochReclaimDeletionCanaryID,
-		EpochScratchDeletion:         cfg.WorkerEpochScratchDeletion,
-		DinDImage:                    cfg.WorkerDinDImage,
+		RollConcurrency:               cfg.RollConcurrency,
+		RollTargetVersion:             cfg.RollTargetVersion,
+		Namespace:                     cfg.WorkerNamespace,
+		DockerNamespace:               cfg.WorkerDockerNamespace,
+		PodEpochRuntime:               cfg.WorkerPodEpochRuntime,
+		EpochReclaimDeletionCanaryID:  cfg.WorkerEpochReclaimDeletionCanaryID,
+		EpochScratchDeletion:          cfg.WorkerEpochScratchDeletion,
+		RetireScratchOutcomesDisabled: !cfg.WorkerRetireScratchOutcomes,
+		DinDImage:                     cfg.WorkerDinDImage,
 		// Config carries the POSITIVE `rootless` bool (matching the chart value); the
 		// render side carries the NEGATIVE `non-rootless` so its zero value is the safe
 		// rootless posture. Invert here, at the one wiring point.
@@ -125,6 +126,8 @@ func main() {
 		StorageClass:                cfg.WorkerStorageClass,
 		PriorityClassName:           cfg.WorkerPriorityClassName,
 		NodeSelector:                cfg.WorkerNodeSelector,
+		DeploymentLabels:            cfg.WorkerDeploymentLabels,
+		DeploymentAnnotations:       cfg.WorkerDeploymentAnnotations,
 		Tolerations:                 cfg.WorkerTolerations,
 		MaxConcurrentRuns:           cfg.WorkerMaxConcurrentRuns,
 		MemoryGuardEnabled:          cfg.WorkerMemoryGuardEnabled,

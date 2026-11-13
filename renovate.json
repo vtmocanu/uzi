@@ -6,6 +6,12 @@
     ":dependencyDashboard",
     "helpers:pinGitHubActionDigests"
   ],
+  "logLevelRemap": [
+    {
+      "matchMessage": "/did not have a releaseTimestamp/",
+      "newLogLevel": "info"
+    }
+  ],
   "labels": ["dependencies", "renovate"],
   "postUpdateOptions": ["gomodTidy", "npmInstallTwice"],
   "npmrc": "allow-remote=all",

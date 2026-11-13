@@ -53,7 +53,9 @@ From the bot account's **Settings → Developer settings → Personal access tok
 - **Only a classic token (`ghp_…`) is supported.** A fine-grained token
   (`github_pat_…`) does not expose its scopes for uzi to verify, so uzi refuses it
   at connect rather than saving an unverifiable token.
-- **github.com only.** GitHub Enterprise Server is not supported.
+- **github.com is the tested host.** On GitHub Enterprise Server, set the
+  connection to the web host (`https://ghe.example.com`); uzi reaches the API at
+  `<host>/api/v3`, as GHES serves it. CI does not exercise a GHES instance.
 
 **A `workflow`-scoped token is deliberately refused.** Requiring exactly `repo`
 means an agent's push that adds or edits a file under `.github/workflows/` will

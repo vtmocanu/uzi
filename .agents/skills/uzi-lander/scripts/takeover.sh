@@ -77,6 +77,8 @@ fi
 . "$HERE/lib/review-threads.sh"
 # shellcheck source=lib/freshness.sh
 . "$HERE/lib/freshness.sh"
+# shellcheck source=lib/cr-signal.sh
+. "$HERE/lib/cr-signal.sh"
 # shellcheck source=lib/pr-comments.sh
 . "$HERE/lib/pr-comments.sh"
 # shellcheck source=lib/required-checks.sh
@@ -241,10 +243,7 @@ echo "CI_FAIL=$ci_fail"; echo "CI_PENDING=$ci_pend"; echo "CI_CANCELLED=$ci_canc
 # CodeRabbit on the head: commit-status description + a VERDICT review on the head (signal
 # a: APPROVED or a tally) + the walkthrough marker (c). A tally-less non-APPROVED review on
 # the head is an UNCONFIRMED finding (grouped findings live in its body).
-st=$(gh api "repos/$REPO/commits/$head/status" 2>/dev/null || true)
-if printf '%s' "$st" | jq -e 'has("statuses")' >/dev/null 2>&1; then
-  cr_desc=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty')
-else cr_desc=""; UNKNOWN=1; fi
+cr_desc=$(cr_head_desc "$REPO" "$head") || { cr_desc=""; UNKNOWN=1; }
 echo "CR_STATUS='${cr_desc:-absent}'"
 cr_reviewed=0; cr_unconfirmed=0
 rev_raw=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo 'x')

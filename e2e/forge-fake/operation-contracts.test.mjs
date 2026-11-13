@@ -181,12 +181,12 @@ async function contracts(t) {
   // Only the fetchFn seam is adapted. This does not cover DNS or default fetch.
   const fetchFn = (dialect) => async (url, init) => {
     const generated = new URL(url);
-    const expectedOrigin = dialect === "github" ? "https://api.contract.invalid" : "https://contract.invalid";
-    assert.equal(generated.origin, expectedOrigin, "unexpected generated API origin");
-    const prefix = dialect === "gitlab" ? "/api/v4/projects/group%2Frepo/merge_requests" : dialect === "forgejo" ? "/api/v1/repos/group/repo/pulls" : "/repos/group/repo/pulls";
+    // Every dialect, GitHub Enterprise Server included, serves its API on the web host.
+    assert.equal(generated.origin, "https://contract.invalid", "unexpected generated API origin");
+    const prefix = dialect === "gitlab" ? "/api/v4/projects/group%2Frepo/merge_requests" : dialect === "forgejo" ? "/api/v1/repos/group/repo/pulls" : "/api/v3/repos/group/repo/pulls";
     assert.ok(generated.pathname === prefix || generated.pathname.startsWith(prefix + "/"), `unexpected generated API path ${generated.pathname}`);
     assert.equal(init.redirect, "error");
-    const mapped = new URL((dialect === "github" ? "/api/v3" : "") + generated.pathname + generated.search, endpoint);
+    const mapped = new URL(generated.pathname + generated.search, endpoint);
     return await new Promise((resolve, reject) => {
       const req = https.request(mapped, { ca, method: init.method, headers: init.headers, signal: init.signal }, (res) => {
         const chunks = [];

@@ -86,7 +86,7 @@ func decodeFailOrigins(raw []byte) (map[string]int64, error) {
 }
 
 // SelfUsage returns the requesting user's own usage (PRD #40): lifetime and
-// last-7-days totals, usage-bearing run count, failed-run outcomes (PRD #1293),
+// last-7-days totals (helper runs included), primary work run count with usage, failed-run outcomes (PRD #1293),
 // and subscription/unreported counts. RequireUser accepts a session or CLI Bearer;
 // every self query uses the authenticated user's context ID.
 func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {

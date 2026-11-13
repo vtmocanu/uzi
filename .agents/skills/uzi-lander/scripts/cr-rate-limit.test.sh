@@ -161,17 +161,20 @@ fi
 if [ "${1:-}" = api ]; then
   case "$*" in
     *'/issues/'*'/comments'*) cat "$COMMENTS"; exit 0 ;;
+    *'/commits/'*'/check-runs'*) echo '{"check_runs":[]}'; exit 0 ;;
     *'/commits/'*'/status'*)
+      # lib/cr-signal.sh reads the raw status JSON.
+      st() { jq -nc --arg d "$1" '{statuses:[{context:"CodeRabbit",description:$d,updated_at:"2026-01-01T00:00:00Z"}]}'; }
       if [ "$MODE" = query ]; then
-        echo 'Review completed'
+        st 'Review completed'
       elif [ "$MODE" = available ]; then
-        echo 'Review rate limited'
+        st 'Review rate limited'
       else
         n=0; [ -f "$STATUS_COUNT" ] && n=$(cat "$STATUS_COUNT")
         n=$((n + 1)); echo "$n" > "$STATUS_COUNT"
         # --interval 0 uses a no-op sleep, so move the bounded wait clock on polls.
         if [ "$MODE" = wait ]; then advance_clock 15; fi
-        if [ "$n" -le 2 ]; then echo 'Review rate limited'; else echo 'Review completed'; fi
+        if [ "$n" -le 2 ]; then st 'Review rate limited'; else st 'Review completed'; fi
       fi
       exit 0 ;;
   esac

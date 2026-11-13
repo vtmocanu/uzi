@@ -18558,7 +18558,11 @@ export class RunRunner {
           detail: sanitizeForLog(outcome.process?.detail ?? ""),
           processes: describeProcesses(outcome.process),
           root_context: describeRootContext(outcome.process),
+          root_reproof: outcome.process?.rootReproof ?? "none",
         });
+      } else if (outcome.process?.rootReproof === "quiescent") {
+        try { flight.runLog.info("run quiescence root reproof succeeded", { site: opts.site, root_reproof: "quiescent" }); }
+        catch { /* Diagnostics cannot change a completed proof. */ }
       } else if (outcome.process && outcome.process.killed.length > 0) {
         flight.runLog.info("run quiescence reaped residual processes", {
           site: opts.site,

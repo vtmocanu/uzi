@@ -1360,10 +1360,12 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/lib/sanitize.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/freshness.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/greptile-verdict.test.sh
+      - ./.agents/skills/uzi-lander/scripts/lib/cr-signal.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/required-checks.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/net-retry.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/ci-fix.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
+      - ./.agents/skills/uzi-lander/scripts/review-quota.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-guards.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-basemove.test.sh
@@ -1737,6 +1739,13 @@ tasks:
       # Not in gate:repo (the lint job lacks helm); CI's helm-chart job runs it. Offline +
       # non-vacuous, see the script header.
       - ./scripts/assert-worker-node-selector-render.sh
+
+  render:workload-metadata-check:
+    desc: assert workloadLabels/workloadAnnotations reach every workload and the controller
+    cmds:
+      # Not in gate:repo (the lint job lacks helm); CI's helm-chart job runs it. Offline +
+      # non-vacuous, see the script header.
+      - ./scripts/assert-workload-metadata-render.sh
 
   render:ephemeral-docker-check:
     desc: assert effective Docker tier availability reaches the api Deployment
@@ -3034,15 +3043,15 @@ tasks:
           fi
 
   test:agent:shard:
-    desc: agent unit-test shard for CI (exactly 1/2 or 2/2; no M4)
+    desc: agent unit-test shard for CI (exactly 1/3, 2/3 or 3/3; no M4)
     preconditions:
-      - sh: 'case "${UZI_AGENT_TEST_SHARD:-}:${UZI_AGENT_TEST_JUNIT:-}" in 1/2:shard-1.xml|2/2:shard-2.xml) exit 0;; *) exit 1;; esac'
-        msg: 'set UZI_AGENT_TEST_SHARD=1/2 or 2/2 and matching UZI_AGENT_TEST_JUNIT=shard-N.xml'
+      - sh: 'case "${UZI_AGENT_TEST_SHARD:-}:${UZI_AGENT_TEST_JUNIT:-}" in 1/3:shard-1.xml|2/3:shard-2.xml|3/3:shard-3.xml) exit 0;; *) exit 1;; esac'
+        msg: 'set UZI_AGENT_TEST_SHARD=N/3 (N = 1, 2 or 3) and matching UZI_AGENT_TEST_JUNIT=shard-N.xml'
     cmds:
       - task: test:agent:unit
 
   check:agent-shards:
-    desc: agent - verify two JUnit shards cover every tracked test file once
+    desc: agent - verify three JUnit shards cover every tracked test file once
     preconditions:
       - sh: '[ -n "${UZI_AGENT_SHARD_REPORT_DIR:-}" ]'
         msg: 'UZI_AGENT_SHARD_REPORT_DIR must name the downloaded shard reports'
@@ -3132,7 +3141,7 @@ tasks:
       # tmpdir-leak-guard.test.sh (issue #2020) is the same kind of self-test: it proves a
       # leftover is reported with its ledger evidence and the exit codes are unchanged.
       - |
-        if [ "${UZI_AGENT_TEST_SHARD:-}" != "2/2" ]; then
+        if [ -z "${UZI_AGENT_TEST_SHARD:-}" ] || [ "${UZI_AGENT_TEST_SHARD}" = "1/3" ]; then
           ../scripts/real-procfs-skip-check.test.sh
           ../scripts/tmpdir-leak-guard.test.sh
         fi

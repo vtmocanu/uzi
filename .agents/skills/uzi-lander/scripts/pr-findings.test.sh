@@ -74,9 +74,11 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
         prior_pending|prior_pending_resolved) echo '{"check_runs":[{"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"in_progress","conclusion":null,"output":{"summary":""}}]}' ;;
         *) echo '{"check_runs":[{"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","output":{"summary":""}}]}' ;;
       esac ;;
-    *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*) echo '' ;;
+    *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/status'*) echo '{"statuses":[]}' ;;
     *'/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/check-runs'*)
       case "$MODE" in
+        # CodeRabbit's own check-run lookup fails; Greptile's listing reads empty.
+        cr_unknown) case "$*" in *check_name=CodeRabbit*) exit 1 ;; *) echo '{"check_runs":[]}' ;; esac ;;
         prior_*|issue_unreadable|cr_ca_clean|cr_ca_findings) echo '{"check_runs":[]}' ;;
         head_unreadable) exit 1 ;;
         head_failed) echo '{"check_runs":[{"id":10,"app":{"slug":"greptile-apps"},"name":"Greptile Review","status":"completed","conclusion":"failure","output":{"summary":""}}]}' ;;
@@ -286,6 +288,13 @@ set -e
 [ "$rc" -eq 3 ] || fail "unreadable issue comments exited rc=$rc, want 3: $(cat "$WORK/issue-unreadable.out")"
 grep -q 'earlier verdict UNREADABLE' "$WORK/issue-unreadable.out" || fail "unreadable issue comments were not surfaced: $(cat "$WORK/issue-unreadable.out")"
 grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/issue-unreadable.out" || fail "comment cleared on unreadable issue comments: $(cat "$WORK/issue-unreadable.out")"
+
+# An unreadable CodeRabbit signal with no CR verdict reads UNKNOWN and not clean, never absent.
+MODE="cr_unknown"; export MODE
+set +e
+PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/cr-unknown.out" 2>&1
+set -e
+grep -q 'NO CodeRabbit review — DO NOT treat as clean: UNKNOWN' "$WORK/cr-unknown.out" || fail "unreadable CodeRabbit signal not reported UNKNOWN: $(cat "$WORK/cr-unknown.out")"
 
 # A head check-runs request that FAILED is not "Greptile never ran": with CodeRabbit having
 # approved the head, treating it as `absent` let a clean earlier verdict drop a real anchored

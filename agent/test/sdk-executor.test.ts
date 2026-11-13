@@ -7443,7 +7443,8 @@ describe("SdkExecutor empty-turn limit routing (PRD #1349 M3)", () => {
 // `subtype:"success"` api-error frame. It must (a) retry with the existing bounded in-process
 // backoff and, on a sustained outage, PARK via TransientRecoveryError (recovery_wait) instead
 // of terminal-failing, and (b) never report the self-contradictory "agent run failed: success".
-// A PERMANENT api error (401/403/400) is NOT retried/parked — it fails, labelled with its status.
+// A PERMANENT api error (401/403/400) is NOT retried/parked — it fails, labelled with its status;
+// the one exception is a 403 Cloudflare edge block page (issue #4271), which is transient.
 describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
   const OVERLOADED_529 = "API Error: 529 Overloaded. This is a server-side issue…";
   const fast = (queryFn: SdkQueryFn, maxRetries: number): SdkExecutorOptions => ({
@@ -7718,6 +7719,52 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
     assert.ok(!(err instanceof TransientRecoveryError), "a status-less non-api_error failure is never parked");
     assert.ok(!(err instanceof ProviderTransientError), "nor classified provider-transient");
   });
+
+  // issue #4271: the Anthropic edge can briefly answer with a Cloudflare block page (HTTP 403).
+  // The bundled CLI shows that HTML page's <title>; only that exact title makes a 403 transient.
+  const CF_CHALLENGE = "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare";
+  for (const withReason of [true, false]) {
+    it(`parks (providerOrigin) a sustained Cloudflare 403 block page after bounded retries (terminal_reason=${withReason}) (issue #4271)`, async () => {
+      const frame = (): SDKMessage => (withReason ? resultApiError(403, CF_CHALLENGE) : noReasonResult(403, CF_CHALLENGE));
+      const { queryFn, turns } = fakeTurns([[frame()], [frame()], [frame()]]);
+      const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx));
+      assert.ok(err instanceof TransientRecoveryError, "a Cloudflare block page parks instead of failing");
+      assert.strictEqual(err.providerOrigin, true, "typed as a provider outage");
+      assert.strictEqual(turns.length, 3, "the initial drive plus 2 bounded retries");
+    });
+  }
+
+  it("retries a Cloudflare 403 block page and recovers on the next successful turn (issue #4271)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [resultApiError(403, CF_CHALLENGE)],
+      [submitPlan("# The Plan"), resultSuccess()],
+      [assistantText("impl"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.deepStrictEqual(probe.gated, ["# The Plan"]);
+    assert.strictEqual(turns.length, 3, "challenge turn + retried plan + implement");
+  });
+
+  for (const [status, text] of [
+    [403, 'API Error: 403 {"type":"error","error":{"type":"permission_error","message":"Your API key does not have permission"}}'],
+    [403, "Failed to authenticate. API Error: 403 Forbidden"],
+    [403, "Failed to authenticate. API Error: 403 Access denied | example.com used Cloudflare to restrict access"],
+    [403, "Failed to authenticate. API Error: 403 attention required! | cloudflare"],
+    [401, "Failed to authenticate. API Error: 401 Attention Required! | Cloudflare"],
+    [400, "API Error: 400 Attention Required! | Cloudflare"],
+  ] as const) {
+    it(`keeps ${status} "${text.slice(0, 60)}" permanent: fails at once, never parked (issue #4271)`, async () => {
+      const { queryFn, turns } = fakeTurns([[resultApiError(status, text)]]);
+      const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx));
+      assert.ok(err instanceof Error);
+      assert.ok(!(err instanceof TransientRecoveryError), "never parked");
+      assert.ok(!(err instanceof ProviderTransientError), "not classified transient");
+      assert.match(err.message, new RegExp(String(status)), "the failure names the status");
+      assert.strictEqual(turns.length, 1, "no retries");
+    });
+  }
 
   it("pins limit-over-transient precedence: a limit-bearing transient 529 throws LimitReachedError, never a provider-transient park", async () => {
     // The `!limitFacts &&` guard in driveTurn is load-bearing HERE: this terminal is

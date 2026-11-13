@@ -231,6 +231,46 @@ if ! git log --first-parent --format=%H "$PREV..$REF" > "$HISTORY_FILE"; then
   echo 'assert-changelog-covers-release: changelog-coverage-error: could not read first-parent history' >&2
   exit 2
 fi
+
+# The section's SHA citation candidates: whole hexadecimal tokens of 7 to 40
+# characters, lowercased. A merge counts as cited by one when the token is a
+# prefix of the merge's full SHA and names no other object (see cites_sha).
+# Comparing prefixes, rather than the current `git rev-parse --short` output,
+# keeps a citation valid after git lengthens its default abbreviation as the
+# repository grows: `3cec5121` written for one candidate printed as `3cec5121f`
+# by the next and refused the cut. Ref names are never consulted, so a tag or
+# branch spelled in hex cannot stand in for a commit.
+citation_error() {
+  echo "assert-changelog-covers-release: changelog-coverage-error: $1" >&2
+  exit 2
+}
+# Each stage writes a file and its status is checked on its own: a stage that
+# fails after printing part of its output must stop the check, never let that
+# partial output count as a citation. grep alone may exit 1 (no hex tokens).
+TOKENS_FILE="$WORK/sha-tokens"
+LC_ALL=C tr -c '0-9A-Za-z' '\n' < "$SECTION_FILE" > "$WORK/section-words" \
+  || citation_error "could not split the [$BASE] section into words"
+hex_status=0
+LC_ALL=C grep -xE '[0-9A-Fa-f]{7,40}' "$WORK/section-words" > "$WORK/section-hex" || hex_status=$?
+[ "$hex_status" -le 1 ] || citation_error "could not select SHA tokens from the [$BASE] section"
+LC_ALL=C tr 'A-F' 'a-f' < "$WORK/section-hex" > "$TOKENS_FILE" \
+  || citation_error "could not normalise SHA tokens from the [$BASE] section"
+cites_sha() { # cites_sha <full-sha>: 0 when a token is a unique prefix of it
+  local token objects
+  while read -r token; do
+    case "$1" in
+      "$token"*) ;;
+      *) continue ;;
+    esac
+    # --disambiguate lists every object with that prefix, without touching refs.
+    # Credit only a successful lookup whose complete output is this one SHA.
+    objects="$(git rev-parse --disambiguate="$token" 2>/dev/null)" \
+      || citation_error "could not look up SHA prefix $token"
+    [ "$objects" != "$1" ] || return 0
+  done < "$TOKENS_FILE"
+  return 1
+}
+
 missing=0
 if [ -n "$RESULT_FILE" ]; then RESULT_MISSING="$WORK/uncited.tsv"; : > "$RESULT_MISSING"; fi
 record_missing() {
@@ -361,9 +401,8 @@ while read -r sha; do
   # does not require having predicted the need before merging.
   #
   # Checked BEFORE the issue-number path so it also rescues a merge that cites the
-  # wrong number, and matched with `-F` -- a SHA is a literal, and this file's
-  # neighbours are full of patterns that were read as regexes.
-  if grep -qF -- "$short" "$SECTION_FILE"; then continue; fi
+  # wrong number. A SHA is a literal: cites_sha compares strings, never a regex.
+  if cites_sha "$sha"; then continue; fi
 
   if [ -z "$refs" ]; then
     if [ "$missing" = 0 ]; then printf '\nFAIL: merges not accounted for in the [%s] section:\n\n' "$BASE"; fi
