@@ -520,13 +520,11 @@ test("the supervisor root is recorded synchronously at spawn and removed on a co
     "guarded command supervisor root recorded", "guarded command supervisor root disposed",
   ]);
   for (const entry of rootLogs) {
-    assert.deepEqual(Object.keys(entry.fields).sort(), ["command_id", "pid", "run_id", "start_time"]);
+    assert.deepEqual(Object.keys(entry.fields).sort(), ["pid", "run_id", "start_time"]);
     assert.equal(entry.fields.run_id, "11111111-1111-4111-8111-111111111111");
     assert.equal(entry.fields.pid, 77);
     assert.equal(entry.fields.start_time, 9001);
-    assert.match(String(entry.fields.command_id), /^[0-9a-f-]{36}$/);
   }
-  assert.equal(rootLogs[0]?.fields.command_id, rootLogs[1]?.fields.command_id);
 
   // A root whose start time could not be read cannot be recorded by identity. issue #3915: it
   // is logged, since a peer run's quiescence proof then cannot attribute that supervisor.

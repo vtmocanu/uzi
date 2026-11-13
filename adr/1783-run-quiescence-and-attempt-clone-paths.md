@@ -1972,13 +1972,16 @@ fresh root snapshot. It starts one new, complete process proof only if a newly
 recorded root matches both PID and start tick of an unattributed process or
 observed ancestor in the first scan's trace, and the applicable deadline still
 has time. Group/session candidates without a captured start tick cannot trigger
-the retry. The second proof supplies the verdict;
+the retry. Both process scans share the first proof's helper or in-process time
+allowance and any shorter caller, report or capture deadline; the second gets
+only what remains. Private-temp cleanup retains its existing bounded join.
+The second proof supplies the verdict;
 the first proof's diagnostic trace never grants quiescence. A mixed blocker,
 absent root, reused PID with another start time, or expired budget remains
 unverified. This adds no kill authority and does not relax the #1854 rule.
 
 The worker logs the reproof outcome on a refusal and records guarded-command
-supervisor spawn and confirmed disposal by run ID, command ID, PID and start
+supervisor spawn and confirmed disposal by run ID, PID and start
 time. These records are diagnostic only. The observed occurrence supports the
 snapshot-race explanation but does not establish which claim spawned its
 supervisor.

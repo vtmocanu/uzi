@@ -2718,12 +2718,32 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
         docker: { state: "not_wired", removed: [], detail: "" },
       };
     }
-    const prove = (candidate: ScanRequest): Promise<ProcessQuiescence> => scoped
-      ? reapScopedRunProcesses(req, candidate, deps).catch(() =>
+    // Both process scans share the first proof's absolute allowance. A late-root retry does not
+    // buy another helper/reap timeout; private-temp cleanup retains its existing bounded join.
+    const scope = scopes.getStore();
+    const ambient = MaintenanceBudget.current();
+    const firstStartedAt = Date.now();
+    const viaHelper = !scoped && (reapOptions.viaHelper ?? uidSplitActive());
+    const proofAllowanceMs = scoped ? HELPER_TIMEOUT_MS : viaHelper
+      ? reapOptions.helperTimeoutMs ?? HELPER_TIMEOUT_MS : reapOptions.deadlineMs ?? REAP_DEADLINE_MS;
+    const proofDeadlineAt = Math.min(firstStartedAt + proofAllowanceMs,
+      req.deadlineAt ?? Infinity, req.reportBudget?.deadline ?? Infinity,
+      scope?.deadlineAt ?? Infinity, ambient ? firstStartedAt + ambient.remainingMs() : Infinity);
+    const prove = (candidate: ScanRequest, retryDeadlineAt?: number): Promise<ProcessQuiescence> => scoped
+      ? reapScopedRunProcesses(retryDeadlineAt === undefined ? req : { ...req, deadlineAt: retryDeadlineAt }, candidate, deps).catch(() =>
         ({ state: "unverified", processes: [], killed: [], detail: "scoped reaper refused or failed" }))
       : reapRunProcesses(req.reportBudget ? { ...candidate, reportDeadline: req.reportBudget.deadline } : candidate,
-        req.reportBudget ? { ...reapOptions, reportBudget: req.reportBudget,
-          deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : reapOptions);
+        { ...reapOptions,
+          ...(req.reportBudget ? { reportBudget: req.reportBudget,
+            deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : {}),
+          // A new gateDeadline would change procfs EACCES handling on an ordinary scan, so
+          // shrink only the timeout mechanism this path already used on its first proof.
+          ...(retryDeadlineAt === undefined ? {} : viaHelper
+            ? { helperTimeoutMs: Math.max(1, Math.floor(Math.min(reapOptions.helperTimeoutMs ?? Infinity,
+              retryDeadlineAt - Date.now()))) }
+            : { deadlineMs: Math.max(1, Math.floor(Math.min(reapOptions.deadlineMs ?? Infinity,
+              retryDeadlineAt - Date.now()))) }),
+        });
     processResult = await prove(scan);
 
     // A peer can launch a non-dumpable supervisor after the worker snapshots roots but before
@@ -2735,12 +2755,9 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       processResult.state === "unverified" && processResult.killed.length === 0 &&
       processResult.processes.length > 0 &&
       processResult.processes.every(p => p.reason === "unreadable_unattributed");
-    const now = Date.now();
-    const scope = scopes.getStore();
-    const ambient = MaintenanceBudget.current();
-    const timeLeft = (req.deadlineAt === undefined || now < req.deadlineAt) &&
-      (req.reportBudget === undefined || (!req.reportBudget.signal.aborted && now < req.reportBudget.deadline)) &&
-      (!scope || (!scope.signal.aborted && now < scope.deadlineAt)) &&
+    const timeLeft = Date.now() < proofDeadlineAt &&
+      (req.reportBudget === undefined || !req.reportBudget.signal.aborted) &&
+      (!scope || !scope.signal.aborted) &&
       (!ambient || (!ambient.signal.aborted && ambient.remainingMs() > 0));
     if (onlyUnattributed && timeLeft) {
       const freshOthers = req.registry.others(req.attempt?.marker);
@@ -2764,10 +2781,10 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       if (fresh.roots.some(root => {
         const identity = `${root.pid}:${root.startTime}`;
         return !before.has(identity) && exactCandidates.has(identity);
-      })) {
+      }) && Date.now() < proofDeadlineAt) {
         rootContext = fresh.context;
         processResult = await prove({ ...scan, liveRoots: fresh.roots, liveMarkers: freshOthers.map(a => a.marker),
-          mayKillUnreadableUnattributed: false });
+          mayKillUnreadableUnattributed: false }, proofDeadlineAt);
         rootReproof = processResult.state === "quiescent" ? "quiescent" : "unverified";
       }
     }

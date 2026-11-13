@@ -24,7 +24,7 @@ import {
 } from "../src/run-quiescence.js";
 import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 import { defaultCheckRunner } from "../src/self-improve.js";
-import { makeFakeProcRoot, scopedRealView, withQuiescenceView } from "./fake-proc.js";
+import { makeFakeProcRoot, plantFakeProc, scopedRealView, withQuiescenceView } from "./fake-proc.js";
 import { realProcfsSkip } from "./real-procfs.js";
 import { RecoveryMaintenance, MaintenanceResources } from "../src/recovery-maintenance.js";
 import { RUN_ATTEMPT_ENV, registerWorkerRunnerRoot, workerSpawnNonce } from "../src/worker-spawn-mark.js";
@@ -279,6 +279,32 @@ describe("A-codex-sibling: a concurrent Codex attempt's non-dumpable supervisor"
     );
     assert.equal(out.process?.state, "unverified");
     assert.equal(out.process?.rootReproof, "none", "no second proof started after expiry");
+  });
+
+  it("#3915 a first proof that spent its own allowance gets no fresh helper budget", async t => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs();
+    const deps = { ...fakeDeps(procs), deadlineMs: 500 };
+    let wall = 10_000;
+    t.mock.method(Date, "now", () => wall);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) {
+        roots.push({ pid: SUP, startTime: DEFAULT_START });
+        wall += 1000; // the first proof ran past its original 500 ms wall allowance
+      }
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "unverified");
+    assert.equal(out.process?.rootReproof, "none", "the retry cannot renew the first proof's budget");
   });
 
   it("#3915 a mixed unreadable and clone-residue verdict does not re-prove", async () => {
@@ -552,6 +578,36 @@ describe("A-helper-tmp: the uid-split TMPDIR setup runs mktemp/rm asynchronously
 });
 
 describe("A-helper: request on stdin, private TMPDIR, tsx cache off, one bounded verdict", () => {
+  it("#3915 the raw helper re-proves with a peer root recorded after its first input snapshot", async t => {
+    const procRoot = makeFakeProcRoot();
+    t.after(() => fs.rmSync(procRoot, { recursive: true, force: true }));
+    plantFakeProc(procRoot, 300, { uid: ME, ppid: 1, pgid: 5, sid: 5,
+      comm: "uzi-codex-super", env: "unreadable", cwd: "/", startTime: DEFAULT_START });
+    const registry = new LiveAttemptRegistry();
+    const current = newRunAttempt("run-17", 1, CLONE, () => []);
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(current);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    let helperStarts = 0;
+    const result = await withQuiescenceView({ procRoot, deadlineMs: 50 }, () => quiesceRunAttempt(
+      { mode: "own", attempt: current, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: ME, reap: { viaHelper: true, helperTmp: recordingTmp(),
+        spawnHelper: (_command, args, opts) => {
+          helperStarts++;
+          if (helperStarts === 1) roots.push({ pid: 300, startTime: DEFAULT_START });
+          const child = spawn(process.execPath, args.slice(args.indexOf("--import")), {
+            cwd: opts.cwd, env: opts.env, stdio: ["pipe", "pipe", "pipe"],
+          });
+          spawned.push(child);
+          return child;
+        } } },
+    ));
+    assert.equal(helperStarts, 2, "one full proof per root snapshot");
+    assert.equal(result.process?.state, "quiescent", result.process?.detail ?? "no process result");
+    assert.equal(result.process?.rootReproof, "quiescent");
+  });
+
   it("serializes the solitary permission only for an explicit clear claim and empty registry under uid split", async () => {
     const previous = process.env.UZI_UID_SPLIT;
     process.env.UZI_UID_SPLIT = "1";

@@ -438,7 +438,7 @@ export class ClaudeCommandLane {
             this.roots.set(live.id, { pid: root.pid, startTime: root.startTime });
             try {
               this.opts.log.info("guarded command supervisor root recorded", {
-                run_id: captured.context.run_id, pid: root.pid, start_time: root.startTime, command_id: commandId,
+                run_id: captured.context.run_id, pid: root.pid, start_time: root.startTime,
               });
             } catch { /* Diagnostics must not turn a recorded launch into a failed launch. */ }
           }
@@ -564,7 +564,6 @@ export class ClaudeCommandLane {
         try {
           this.opts.log.info("guarded command supervisor root disposed", {
             run_id: captured.context.run_id, pid: recordedRoot.pid, start_time: recordedRoot.startTime,
-            command_id: metadata.commandId,
           });
         } catch { /* Diagnostics must not change the confirmed disposal outcome. */ }
       }
