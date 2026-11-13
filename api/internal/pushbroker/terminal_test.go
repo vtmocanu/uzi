@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -215,8 +216,8 @@ func TestTerminalUpdateRefusals(t *testing.T) {
 		}
 		f.git("push", "--force", "origin", base+":"+terminalRefName()) // a racer moves the ref
 		out, err := pushbroker.SendTerminalUpdate(ctx, p)
-		if err == nil || (out != pushbroker.TerminalRefused && out != pushbroker.TerminalUnknown) {
-			t.Fatalf("SendTerminalUpdate = %v, %v; want refused or unknown with a cause", out, err)
+		if out != pushbroker.TerminalRefused || !errors.Is(err, pushbroker.ErrTerminalRefused) {
+			t.Fatalf("SendTerminalUpdate = %v, %v; want refused", out, err)
 		}
 		if got := f.originRef(terminalRefName()); got != base {
 			t.Fatalf("ref = %q, want the racer's %s untouched", got, base)
@@ -328,6 +329,107 @@ func TestTerminalMissingObjectRefused(t *testing.T) {
 	p, err := pushbroker.PrepareTerminalPack(context.Background(), terminalOpts(url, tip, out.Bytes()))
 	if !errors.Is(err, pushbroker.ErrPackInvalid) || p != nil {
 		t.Fatalf("PrepareTerminalPack = %v, %v; want ErrPackInvalid", p, err)
+	}
+}
+
+// termDeepFixture is a file:// origin whose main holds three commits, so the depth-1 fetched base
+// (the third) has an unfetched parent. It returns the third commit as base.
+func termDeepFixture(t *testing.T) (f *gitFixture, url, base string) {
+	t.Helper()
+	f = newGitFixture(t)
+	f.commit("a.txt", "one\n", "c1")
+	f.commit("a.txt", "two\n", "c2")
+	base = f.commit("a.txt", "three\n", "c3")
+	f.pushMain()
+	return f, f.cloneURL(), base
+}
+
+// objectsPack packs the `rev-list --objects` lines of tip ^base minus any line drop() selects.
+func objectsPack(t *testing.T, f *gitFixture, tip, base string, drop func(line string) bool) []byte {
+	t.Helper()
+	var keep []string
+	for _, l := range strings.Split(strings.TrimSpace(f.git("rev-list", tip, "^"+base, "--objects")), "\n") {
+		if !drop(l) {
+			keep = append(keep, l)
+		}
+	}
+	cmd := exec.Command("git", "-C", f.work, "pack-objects", "--stdout") //nolint:gosec // G204: test helper against a test-owned temp repo.
+	cmd.Env = cleanGitEnv()
+	cmd.Stdin = strings.NewReader(strings.Join(keep, "\n") + "\n")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("pack-objects: %v", err)
+	}
+	return out.Bytes()
+}
+
+// The shallow-boundary rule: history may run out only at a depth-1 fetched base tip.
+func TestTerminalShallowBoundary(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("history that meets the shallow base is accepted", func(t *testing.T) {
+		f, url, base := termDeepFixture(t)
+		tip := f.commit("held.txt", "held work\n", "wip")
+		p, err := pushbroker.PrepareTerminalPack(ctx, terminalOpts(url, tip, f.pack(tip, base)))
+		if err != nil || p == nil {
+			t.Fatalf("PrepareTerminalPack = %v, %v; want accepted", p, err)
+		}
+	})
+
+	t.Run("a non-boundary commit with an absent parent is refused", func(t *testing.T) {
+		f, url, base := termDeepFixture(t)
+		c4 := f.commit("b.txt", "four\n", "c4") // never on origin
+		f.commit("c.txt", "five\n", "c5")
+		tip := f.commit("d.txt", "six\n", "c6")
+		// The pack carries every tree and blob (including c4's b.txt) and commits c5 and c6, but
+		// not the c4 commit itself, so c5 names an absent parent that is not a shallow base.
+		pack := objectsPack(t, f, tip, base, func(l string) bool { return strings.HasPrefix(l, c4) })
+		p, err := pushbroker.PrepareTerminalPack(ctx, terminalOpts(url, tip, pack))
+		if !errors.Is(err, pushbroker.ErrPackInvalid) || p != nil {
+			t.Fatalf("PrepareTerminalPack = %v, %v; want ErrPackInvalid", p, err)
+		}
+	})
+
+	t.Run("a missing tree is refused", func(t *testing.T) {
+		f, url, base := termDeepFixture(t)
+		if err := os.MkdirAll(filepath.Join(f.work, "dir"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(f.work, "dir", "x.txt"), "nested\n")
+		f.git("add", "dir/x.txt")
+		f.git("commit", "-m", "nested")
+		tip := strings.TrimSpace(f.git("rev-parse", "HEAD"))
+		pack := objectsPack(t, f, tip, base, func(l string) bool { return strings.HasSuffix(l, " dir") })
+		p, err := pushbroker.PrepareTerminalPack(ctx, terminalOpts(url, tip, pack))
+		if !errors.Is(err, pushbroker.ErrPackInvalid) || p != nil {
+			t.Fatalf("PrepareTerminalPack = %v, %v; want ErrPackInvalid", p, err)
+		}
+	})
+}
+
+// A moved or deleted terminal ref is reported as such at prepare, not as a bad pack.
+func TestTerminalUpdatePriorMoved(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		move func(f *gitFixture, base string)
+	}{
+		{"moved", func(f *gitFixture, base string) { f.git("push", "--force", "origin", base+":"+terminalRefName()) }},
+		{"deleted", func(f *gitFixture, _ string) { f.git("push", "origin", ":"+terminalRefName()) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, url, base, tip, pack := termFileFixture(t)
+			mustCreateTerminal(t, terminalOpts(url, tip, pack))
+			tip2 := f.commit("more.txt", "more\n", "more work")
+			tc.move(f, base)
+			o := terminalOpts(url, tip2, f.pack(tip2, tip))
+			o.PriorTip = tip
+			p, err := pushbroker.PrepareTerminalPack(ctx, o)
+			if !errors.Is(err, pushbroker.ErrTerminalPriorMoved) || p != nil {
+				t.Fatalf("PrepareTerminalPack = %v, %v; want ErrTerminalPriorMoved", p, err)
+			}
+		})
 	}
 }
 
@@ -475,8 +577,10 @@ func TestTerminalPrepareLocalOrigin(t *testing.T) {
 	})
 }
 
-// Send and delete over file:// so they run without git-http-backend. The file transport's
-// receive-pack does enforce the old-value compare-and-swap, so the moved-ref cases are real.
+// Send and delete over file:// so they run without git-http-backend. go-git's file transport execs
+// the host's git-receive-pack binary (not an in-process server), and that binary enforces the
+// old-value compare-and-swap with an explicit "ng", so the moved-ref and second-create outcomes
+// are deterministically TerminalRefused here. This depends on git being installed on the test host.
 func TestTerminalSendAndDeleteLocalOrigin(t *testing.T) {
 	ctx := context.Background()
 
@@ -492,8 +596,8 @@ func TestTerminalSendAndDeleteLocalOrigin(t *testing.T) {
 		}
 		f.git("push", "--force", "origin", base+":"+terminalRefName())
 		out, err := pushbroker.SendTerminalCreate(ctx, p2)
-		if out == pushbroker.TerminalApplied || err == nil {
-			t.Fatalf("second create = %v, %v; want not applied", out, err)
+		if out != pushbroker.TerminalRefused || !errors.Is(err, pushbroker.ErrTerminalRefused) {
+			t.Fatalf("second create = %v, %v; want refused", out, err)
 		}
 		if got := f.originRef(terminalRefName()); got != base {
 			t.Fatalf("existing ref moved to %q", got)
@@ -530,8 +634,8 @@ func TestTerminalSendAndDeleteLocalOrigin(t *testing.T) {
 		}
 		f.git("push", "--force", "origin", base+":"+terminalRefName())
 		out, err := pushbroker.SendTerminalUpdate(ctx, p)
-		if err == nil || (out != pushbroker.TerminalRefused && out != pushbroker.TerminalUnknown) {
-			t.Fatalf("SendTerminalUpdate = %v, %v; want refused or unknown", out, err)
+		if out != pushbroker.TerminalRefused || !errors.Is(err, pushbroker.ErrTerminalRefused) {
+			t.Fatalf("SendTerminalUpdate = %v, %v; want refused", out, err)
 		}
 		if got := f.originRef(terminalRefName()); got != base {
 			t.Fatalf("ref = %q, want the racer's %s untouched", got, base)

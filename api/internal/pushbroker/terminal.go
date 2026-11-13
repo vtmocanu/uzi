@@ -61,6 +61,9 @@ var (
 	// ErrTerminalRefused wraps the remote's explicit refusal of a terminal create or update. The
 	// text after the sentinel is the remote's own, untrusted, and must be scrubbed and bounded.
 	ErrTerminalRefused = errors.New("pushbroker: terminal write refused by the remote")
+	// ErrTerminalPriorMoved means an update's terminal ref is absent or no longer at PriorTip when
+	// fetched at prepare time; nothing was written.
+	ErrTerminalPriorMoved = errors.New("pushbroker: terminal ref is not at the prior tip")
 	// ErrTerminalRefMoved means a CAS delete found the terminal ref at a tip other than the
 	// expected one: something newer owns it and nothing was removed.
 	ErrTerminalRefMoved = errors.New("pushbroker: terminal ref is not at the expected tip")
@@ -159,7 +162,14 @@ func (o TerminalOutcome) String() string {
 // reachable commit with its declared tree and, for an update, PriorTip is a proper ancestor of the
 // tip. It sends nothing. Errors: ErrInvalidRef (malformed inputs), ErrPackInvalid (including a
 // missing object), ErrPackTooLarge, ErrTipMissing, ErrCIConfigGuard, ErrTerminalRootUnreachable,
-// ErrTerminalTreeMismatch, ErrTerminalWalkTooLarge and ErrNotDescendant (prior tip).
+// ErrTerminalTreeMismatch, ErrTerminalWalkTooLarge, ErrTerminalPriorMoved (update: the fetched
+// terminal ref is absent or not at PriorTip) and ErrNotDescendant (prior tip).
+//
+// Producer rule: bases are fetched at depth 1, so only each fetched base tip (default branch, work
+// branch, checkpoint ref, BaseRefs and, on update, the terminal ref) is present without its
+// history. The declared tip must therefore descend one of those fetched base tips, or the pack must
+// carry the history down to one; a commit whose parent is in neither is ErrPackInvalid. Declared
+// roots must be reachable from the tip within the pack plus those depth-1 bases.
 func PrepareTerminalPack(ctx context.Context, o TerminalPackOptions) (*PreparedTerminalPack, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxTerminalPrepareDuration)
 	defer cancel()
@@ -196,6 +206,15 @@ func PrepareTerminalPack(ctx context.Context, o TerminalPackOptions) (*PreparedT
 	repo, tipCommit, err := prepareFetchedPack(ctx, in)
 	if err != nil {
 		return nil, err
+	}
+
+	if !prior.IsZero() {
+		// The terminal ref was fetched as a base. A ref that is gone or no longer at PriorTip is a
+		// moved or deleted ref, not a bad pack: say so before the walk reports a missing object.
+		cur, rerr := repo.Storer.Reference(plumbing.ReferenceName(ref))
+		if rerr != nil || cur.Hash() != prior {
+			return nil, fmt.Errorf("%w: %s", ErrTerminalPriorMoved, ref)
+		}
 	}
 
 	shallow, err := repo.Storer.Shallow()
