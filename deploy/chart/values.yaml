@@ -1022,6 +1022,10 @@ workers:
     # Startup-only: wait for safe replacement; ForceRoll must stay off.
     # Supplies no attestation; empty runtime below keeps scratch. Attempt deletion stays canary-only.
     scratchDeletion: true
+    # Default-on per-startup observation records for `.retire-*` retirement scratch parents
+    # (kept only; no reclaim). false renders worker UZI_RETIRE_SCRATCH_OUTCOMES=0 after
+    # controller reconciliation; takes effect at the next worker startup.
+    retireScratchOutcomes: true
     deletionCanaryWorkerId: ""
   docker:
     podEpochReclaim:
