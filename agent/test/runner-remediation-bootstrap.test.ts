@@ -2589,6 +2589,7 @@ for (const at of ["facts", "restore"] as const) {
       assert.equal(r.frozenAt, r.deadlineAt! - 10, "Date.now frozen at the live round's deadline - 10");
       assert.ok(r.frozenAt! < r.deadlineAt! && r.frozenAt! >= r.deadlineAt! - 20, "inside the former slack window");
       assert.ok(r.error);
+      assert.equal(r.error, r.firstError, "the original round error is rethrown unchanged");
       assert.match(String(r.error.message), ORIGINAL[at]);
       assert.equal(r.rounds, 1, "no fresh round");
       assert.equal(r.flight.launchLockRetries, undefined);
