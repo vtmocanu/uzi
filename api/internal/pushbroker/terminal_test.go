@@ -515,18 +515,23 @@ func TestDeleteTerminal(t *testing.T) {
 }
 
 // A forge that never answers the push must end as unknown, promptly, never refused. The gated
-// handler aborts on the request context so the server can shut down.
+// handler also has an explicit cleanup release: cancelling a client request with an unread POST
+// body does not necessarily cancel the server request context before Server.Close waits for it.
 func TestSendTerminalCreateHungRemoteIsUnknown(t *testing.T) {
 	f, remote, _, _, tip, pack := heldHTTPFixture(t)
 	inner := remote.srv.Config.Handler
+	release := make(chan struct{})
 	front := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-receive-pack") {
-			<-r.Context().Done()
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
 			panic(http.ErrAbortHandler)
 		}
 		inner.ServeHTTP(w, r)
 	}))
-	t.Cleanup(front.Close)
+	t.Cleanup(func() { close(release); front.Close() })
 	url := front.URL + "/" + filepath.Base(f.bare)
 
 	p, err := pushbroker.PrepareTerminalPack(context.Background(), terminalOpts(url, tip, pack))

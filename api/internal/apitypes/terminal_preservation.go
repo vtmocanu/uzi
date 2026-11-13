@@ -1,9 +1,10 @@
 package apitypes
 
 // Terminal preservation (issue #4007): POST /api/worker/runs/{id}/terminal-preservation. The worker
-// of a terminal run (or an earlier generation of a live one) uploads its final work as one pack and
-// the API creates or fast-forwards refs/uzi-terminal/<run-id> with the stored credential. The
-// repository, user, worker, ref and credential are derived server-side; the worker names only the
+// of an eligible current flight uploads work for exactly its current claim generation. A terminal
+// run may also publish through its original worker's exact open inventory-guarded hold, including
+// an earlier generation. The API creates or fast-forwards refs/uzi-terminal/<run-id> with the stored
+// credential. The repository, user, worker, ref and credential are derived server-side; the worker names only the
 // generation, the tip, the tip the ref is expected to be at, and its coverage manifest.
 
 // TerminalDispositionPreserve is the only disposition a worker may request. Whether the work is
