@@ -1093,6 +1093,36 @@ for scratch_bad in 0 1 null '{a,b}'; do
   fi
   grep -F 'workers.epochReclaim.scratchDeletion must be a boolean' "$WORK/scratch-invalid.log" >/dev/null
 done
+# Retirement-scratch outcome records are a real boolean; explicit false must survive rendering.
+for retire_state in default true false; do
+  if [ "$retire_state" = default ]; then
+    helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true > "$WORK/retire.yaml"
+    retire_expected=true
+  else
+    helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true \
+      --set "workers.epochReclaim.retireScratchOutcomes=$retire_state" > "$WORK/retire.yaml"
+    retire_expected=$retire_state
+  fi
+  awk -v expected="\"$retire_expected\"" '
+    /- name: UZI_WORKER_RETIRE_SCRATCH_OUTCOMES/ { pending=1; count++; next }
+    pending && /^[[:space:]]*value:/ { if ($2 != expected) bad=1; pending=0 }
+    END { if (bad || count != 1 || pending) exit 1 }
+  ' "$WORK/retire.yaml"
+done
+for retire_bad in false true "" 0 null; do
+  if helm template uzi "$STRIPPED" --set-string "workers.epochReclaim.retireScratchOutcomes=$retire_bad" > "$WORK/retire-invalid.log" 2>&1; then
+    echo "FAIL: string retire scratch outcomes accepted: $retire_bad" >&2
+    exit 1
+  fi
+  grep -F 'workers.epochReclaim.retireScratchOutcomes must be a boolean' "$WORK/retire-invalid.log" >/dev/null
+done
+for retire_bad in 0 1 null '{a,b}'; do
+  if helm template uzi "$STRIPPED" --set "workers.epochReclaim.retireScratchOutcomes=$retire_bad" > "$WORK/retire-invalid.log" 2>&1; then
+    echo "FAIL: nonboolean retire scratch outcomes accepted: $retire_bad" >&2
+    exit 1
+  fi
+  grep -F 'workers.epochReclaim.retireScratchOutcomes must be a boolean' "$WORK/retire-invalid.log" >/dev/null
+done
 # Epoch-reclaim deletion canary: one lowercase UUID or empty, rendered verbatim.
 canary_uuid=0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d
 for canary_id in '' "$canary_uuid"; do

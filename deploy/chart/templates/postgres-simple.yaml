@@ -58,6 +58,12 @@ metadata:
   labels:
     {{- include "uzi.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgres
+    {{- with include "uzi.workloadLabels" . }}
+    {{- . | nindent 4 }}
+    {{- end }}
+  {{- with include "uzi.workloadAnnotations" . }}
+  {{- . | nindent 2 }}
+  {{- end }}
 spec:
   serviceName: {{ $name }}
   replicas: 1

@@ -9,6 +9,8 @@ import (
 
 // Every non-chat predicate site has a disposition. Load predicates must use the
 // per-claim marker; excluding every child would lose legacy run-slot accounting.
+// The three *RunOutcomes queries left this inventory in #4209: they use fn_usage_primary_kind
+// (see usage_primary_kind_sql_test.go) instead of a hand-written non-chat list.
 func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 	type disposition struct {
 		file, name string
@@ -35,15 +37,12 @@ func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 		{"runtime", "LockFailRunsMissingFromSnapshot", 4, "snapshot fences and lifecycle locks retain children"},
 		{"runtime", "failRunsMissingFromSnapshotLocked", 8, "snapshot fences and lifecycle failure retain children"},
 		{"runtime", "RequeueRunsMissingFromSnapshot", 6, "snapshot fences and lifecycle recovery retain children"},
-		{"runtime", "SelfUsage", 1, "usage measures actual billed work, including children"},
-		{"runtime", "AdminUsageTotals", 1, "usage measures actual billed work, including children"},
-		{"runtime", "AdminUsagePerUser", 1, "usage measures actual billed work, including children"},
+		{"runtime", "SelfUsage", 1, "usage sums measure actual billed work including children; run counts use fn_usage_primary_kind (#4209)"},
+		{"runtime", "AdminUsageTotals", 1, "usage sums measure actual billed work including children; run counts use fn_usage_primary_kind (#4209)"},
+		{"runtime", "AdminUsagePerUser", 1, "usage sums measure actual billed work including children; run counts use fn_usage_primary_kind (#4209)"},
 		{"runtime", "SelfPRCounts", 1, "cross_check and judge runners never report mr_iid; a child echoing its parent's PR dedups to the earlier parent"},
 		{"runtime", "FactoryPRCounts", 1, "cross_check and judge runners never report mr_iid; a child echoing its parent's PR dedups to the earlier parent"},
 		{"runtime", "PRCountsPerUser", 1, "cross_check and judge runners never report mr_iid; a child echoing its parent's PR dedups to the earlier parent"},
-		{"runtime", "SelfRunOutcomes", 5, ""},
-		{"runtime", "AdminRunOutcomes", 5, ""},
-		{"runtime", "AdminRunOutcomesPerUser", 5, ""},
 		{"runtime", "CreateGateVerdictInput", 1, "gate content identity, not lane occupancy"},
 		{"runtime", "CreateRunReviseInputIfUnderCap", 1, "gate content identity, not lane occupancy"},
 		{"runtime", "CreateApprovePlanInput", 1, "gate content identity, not lane occupancy"},

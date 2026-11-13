@@ -377,7 +377,7 @@ jobs:
       # Same engine as docker-compose.yml (scripts/check-postgres-pin-parity.sh gates
       # the parity). Pulled in a step so mirror quota errors get bounded retries and a
       # Docker Hub fallback before the database starts.
-      UZI_CI_PG_IMAGE: mirror.gcr.io/library/postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
+      UZI_CI_PG_IMAGE: mirror.gcr.io/library/postgres:17@sha256:846a7ddaa67a4b354ae1d21087b683901aa6113a4ed626d3787cfbf6c85e3e07
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
@@ -1022,6 +1022,9 @@ jobs:
       - name: Render and assert workers.nodeSelector and workers.tolerations
         # Offline (strips the CNPG subchart); default, override, null, {} and malformed values.
         run: task render:node-selector-check
+      - name: Render and assert workloadLabels and workloadAnnotations
+        # Offline (strips the CNPG subchart); unset, set, owned-label, non-string and reserved-key refusals.
+        run: task render:workload-metadata-check
       - name: Docker-tier fail-guards
         run: |
           # (1) docker on + NetworkPolicy off + no acknowledge -> MUST refuse to render.
