@@ -81,7 +81,7 @@ legacy nix/data recycling keep their existing override behavior.
 
 **Exception (#3891, AI-synced 2026-11-04):** this terminal-only readiness gate
 and the D5 custody gate remain mandatory for DinD maintenance, PVC recycle and
-every other cleanup. The carve-outs are the narrow pressure-only
+every other cleanup. The first carve-out is the narrow pressure-only
 anonymous-volume leg described under D8, "Exception — #3891".
 (AI-synced 2026-11-13, #4291: a second carve-out, the pressure-only builder-cache
 leg described under D8, "Exception — #4291". It likewise never touches the claim
