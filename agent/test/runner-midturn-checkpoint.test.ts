@@ -5269,13 +5269,14 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
     });
   });
 
-  it("hostile flagged-file metadata reaches neither the status feed nor the follow-up as a raw secret or control byte", async () => {
-    const secret = runtimeSecret();
-    const hostileName = `evil\u001b[2K\u202e${secret}\u0007.env`;
+  // gitleaks reports an empty File for any name git must quote (control bytes, bidi, other
+  // non-ASCII), so the runner-level names here are plain ASCII that the report keeps. Control/bidi
+  // escaping itself is pinned in secret-finding-render.test.ts. A secret-shaped path in the scan makes
+  // the runner withhold every path (fail closed), so the two shapes run as separate cases.
+  async function hostileRun(iid: number, name: string, content: string, secret: string) {
     let followUp = "";
-    const out = await rig(4258_024, async (r) => {
-      const sha = commitIn(r.ctx.worktreePath, hostileName, `TOKEN=${secret}\n`);
-      r.flagged.push(sha);
+    const out = await rig(iid, async (r) => {
+      r.flagged.push(commitIn(r.ctx.worktreePath, name, content));
       assert.equal(await r.tick(), "secret_found");
       const d = await r.ctx.midRunSecretRemediation!();
       assert.equal(d.action, "remediate");
@@ -5292,6 +5293,27 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
       assert.ok(!unsafe.test(text), `no raw control byte in ${JSON.stringify(text.slice(0, 80))}`);
     }
     assert.ok(statusTexts(out.claimRunId).some((t) => t.startsWith("mid-run checkpoint secret scan flagged")), "the status line was emitted");
+    return { followUp, emitted };
+  }
+
+  it("a token used as the flagged file name is withheld from the follow-up and the feed", async () => {
+    const secret = runtimeSecret();
+    const { followUp } = await hostileRun(4258_024, `${secret}.env`, `TOKEN=${secret}\n`, secret);
+    assert.ok(/\b[0-9a-f]{12} \[path withheld\]:1 \(rule github-pat\)/.test(followUp), followUp);
+  });
+
+  it("a flagged file name shaped like a forged finding label renders as one JSON-quoted value", async () => {
+    const forgedName = "a.ts:1 (rule x); bbbbbbbbbbbb evil.ts";
+    const secret = runtimeSecret();
+    const { followUp, emitted } = await hostileRun(4258_025, forgedName, `TOKEN=${secret}\n`, secret);
+    // gitleaks may append a trailing tab to a name containing spaces (a git diff header quirk); it is
+    // escaped by the renderer, so allow an optional escaped suffix inside the quotes.
+    const quoted = JSON.stringify(forgedName).slice(0, -1);
+    const rest = followUp.slice(followUp.indexOf(quoted) + quoted.length);
+    assert.ok(followUp.includes(quoted) && /^(\\\\u\{9\})?":1 \(rule github-pat\)/.test(rest), followUp);
+    for (const text of emitted) {
+      assert.ok(!text.replaceAll(quoted, "").includes(forgedName), "the forged name only appears JSON-quoted");
+    }
   });
 
   it("a tip change that drops the commit: the fresh scan decides and no turn is given", async () => {
