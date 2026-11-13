@@ -432,12 +432,12 @@ above.
 
 ## Amendment (2026-11-13, #4007)
 
-Terminal preservation is independent of checkpoint retention and of custody.
+Terminal preservation is independent of checkpoint retention.
 Its `refs/uzi-terminal/<run-id>` namespace and tables are separate;
 `SettleRetainedCheckpoint` and supersession never touch them. It touches custody in three
 narrow ways: a contribution may take its authority from (and reference, with a
-RESTRICT foreign key) an open guarded custody hold; an open custody hold keeps
-a terminal ref from retiring; and a scoped precondition on the
+RESTRICT foreign key) an open guarded custody hold; an open custody hold of the
+run blocks the retire decision; and a scoped precondition on the
 completed-publication release: the
 branch-only completion release is refused (`terminal_preservation_pending` or
 `terminal_preservation_refused`) while a terminal contribution for exactly the

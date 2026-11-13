@@ -31,8 +31,9 @@ import (
 // Terminal preservation (issue #4007), the worker route's service: the worker of a terminal run
 // uploads one pack and the API creates or fast-forwards refs/uzi-terminal/<run-id> with the stored
 // connection credential. It follows held-work publication's step A (held_publish.go): a marker is
-// committed BEFORE the network call, only the request that wins the marker sends, and every other
-// request (a loser, an ambiguous commit, a retry) only lists the ref. No forge call runs inside a
+// committed BEFORE the network call and only the request that wins the marker sends. A loser and a
+// request whose commit is ambiguous never send; a retry reconciles (lists the ref) when the marker
+// is durable, and otherwise may win afresh and send once. No forge call runs inside a
 // transaction.
 //
 // Lock order wherever more than one is taken: worker, run, hold, preservation, contribution.
@@ -826,8 +827,9 @@ func terminalSchedule(ctx context.Context, qt *store.Queries, arg store.Schedule
 // winner of the push by the rows its two conditional UPDATEs affect: the preservation goes to
 // publishing with its live pointer FIRST (the contribution guard needs it), then the contribution
 // goes prepared -> invoked. A proven-closed lifetime instead records the abandonment and sends
-// nothing. winner is true only if both rows changed AND the commit succeeded; every other request,
-// including one whose COMMIT result is ambiguous, only lists and reconciles.
+// nothing. winner is true only if both rows changed AND the commit succeeded. A request whose COMMIT result
+// is ambiguous returns an error and never sends; a retry then reconciles if the marker is durable,
+// or may win afresh.
 func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.Run, preAuthority string, req TerminalPublishRequest, digest string, canon []byte, lt TerminalLifetime) (b terminalBinding, err error) {
 	runID := run.ID
 	var (

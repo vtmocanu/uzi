@@ -1,6 +1,6 @@
-# ADR-4007: a run's terminal work is preserved under its own forge ref namespace, independent of custody
+# ADR-4007: a run's terminal work is preserved under its own forge ref namespace, separate from held work and checkpoint retention
 
-**Status**: Accepted (slice A implemented API-side and dark: nothing advertises the capability, so no ref is created, no gate fires and the sweep lists no rows; slices B to E and the retirement switch are deferred, see below)
+**Status**: Accepted (slice A implemented API-side and dark: no shipped worker advertises the capability, so no ref is created, no gate fires and the sweep lists no rows; slices B to E and the retirement switch are deferred, see below)
 **Date**: 2026-11-13
 **Issue**: [vtmocanu/uzi#4007](https://github.com/vtmocanu/uzi/issues/4007)
 **Refs**: #4007, #2545, #1810, #1867, #2507, #1296
@@ -29,7 +29,9 @@ A terminal ref is `refs/uzi-terminal/<run-id>`, one per run. It is not a held
 publication and not a checkpoint or recovery ref. Two tables carry it. Neither
 references `run_held_publications` or `checkpoint_retention`; a contribution
 authorized by an open guarded custody hold names that hold (`hold_id`, an
-`ON DELETE RESTRICT` foreign key), and is otherwise independent of custody:
+`ON DELETE RESTRICT` foreign key). The other custody interactions are an open
+custody hold of the run blocking the retire decision, and the scoped
+completed-release gate (below):
 
 - `run_terminal_preservations`: one row per run. States are `bound`,
   `publishing`, `live`, `retiring`, `deleted`, `abandoned` and

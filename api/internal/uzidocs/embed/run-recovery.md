@@ -3419,8 +3419,8 @@ acknowledged ref clears at its retention expiry, or sooner with
 
 A **terminal preservation ref** is a forge ref, `refs/uzi-terminal/<run-id>`,
 meant to keep a finished run's final work for as long as the run's issue or
-merge request is open. It is separate from held-work refs, checkpoint refs and
-custody holds, and none of those touch it.
+merge request is open. It is separate from held-work refs and checkpoint refs,
+and neither touches it.
 
 **Nothing creates one yet.** This release adds only the API groundwork. No
 worker asks the API to publish a terminal ref, so no such ref exists on your
