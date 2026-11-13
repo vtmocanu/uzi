@@ -94,11 +94,16 @@ func applyDeploymentHibernationEvidence(o *reconcile.ObservedWorker, d *appsv1.D
 // applyPodEvidence derives pod count, readiness and uids from one worker's pods (every
 // pod labelled for it, terminating ones included). It needs o.SpecHash already set: a
 // Ready pod counts only when it carries the Deployment template's spec hash and has no
-// deletionTimestamp.
+// deletionTimestamp. A pod in a terminal phase (Succeeded or Failed) is counted in
+// TerminalPodCount (and in StoppedPodCount when podStopped proves every container
+// terminated) and keeps its UID in WorkerPodUIDs, but never supplies LivePodUID or
+// ReadyPodUID: kubelet eviction publishes the phase before it kills the containers and
+// the pod keeps its stale Ready condition, so a terminal phase is no readiness evidence.
 func applyPodEvidence(o *reconcile.ObservedWorker, pods []corev1.Pod) {
 	o.PodsKnown = true
 	o.WorkerPodCount = len(pods)
 	o.TerminalPodCount = 0
+	o.StoppedPodCount = 0
 	o.ReadyPodUID, o.LivePodUID = "", ""
 	o.WorkerPodUIDs = nil
 	for _, p := range pods {
@@ -107,6 +112,10 @@ func applyPodEvidence(o *reconcile.ObservedWorker, pods []corev1.Pod) {
 		}
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			o.TerminalPodCount++
+			if podStopped(p) {
+				o.StoppedPodCount++
+			}
+			continue
 		}
 		if p.DeletionTimestamp != nil || p.UID == "" {
 			continue
@@ -123,6 +132,54 @@ func applyPodEvidence(o *reconcile.ObservedWorker, pods []corev1.Pod) {
 		}
 	}
 	sort.Strings(o.WorkerPodUIDs)
+}
+
+// podStopped reports positive evidence that no container of the pod is running: the
+// phase is Succeeded or Failed AND the status of every regular, init and ephemeral
+// container is terminated. A terminal phase alone is not enough, because kubelet
+// eviction publishes phase Failed before it kills the containers. It fails closed: a
+// missing, short or extra status entry, an unnamed match, a running or waiting
+// container, or a pod with no regular containers all read as not stopped. A
+// deletionTimestamp is irrelevant.
+func podStopped(p corev1.Pod) bool {
+	if p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
+		return false
+	}
+	if len(p.Spec.Containers) == 0 {
+		return false
+	}
+	names := func(specs []corev1.Container) []string {
+		out := make([]string, 0, len(specs))
+		for _, c := range specs {
+			out = append(out, c.Name)
+		}
+		return out
+	}
+	ephNames := make([]string, 0, len(p.Spec.EphemeralContainers))
+	for _, c := range p.Spec.EphemeralContainers {
+		ephNames = append(ephNames, c.Name)
+	}
+	return allTerminated(names(p.Spec.Containers), p.Status.ContainerStatuses) &&
+		allTerminated(names(p.Spec.InitContainers), p.Status.InitContainerStatuses) &&
+		allTerminated(ephNames, p.Status.EphemeralContainerStatuses)
+}
+
+// allTerminated reports that statuses cover exactly the spec names and each is terminated.
+func allTerminated(specNames []string, statuses []corev1.ContainerStatus) bool {
+	if len(statuses) != len(specNames) {
+		return false
+	}
+	byName := make(map[string]corev1.ContainerStatus, len(statuses))
+	for _, s := range statuses {
+		byName[s.Name] = s
+	}
+	for _, n := range specNames {
+		s, ok := byName[n]
+		if !ok || s.State.Terminated == nil || s.State.Running != nil || s.State.Waiting != nil {
+			return false
+		}
+	}
+	return len(byName) == len(specNames)
 }
 
 // deploymentPlacementBlocked reports that a Deployment must not be created yet: a nix
@@ -364,18 +421,22 @@ func (m *Materializer) hibernateHold(ctx context.Context, w protocol.DesiredWork
 }
 
 // wakeHeldForPods reports that a wake must not bring a pod up yet: the pod list was not
-// read completely this tick, or some pod of the worker that has not reached a terminal
-// phase (terminating included) still exists. A Succeeded or Failed pod (an evicted one,
-// which a ReplicaSet at zero leaves in place) has no running container and can never be
-// reported Ready, so it cannot be the admission pod surviving the wake, and it does not
-// hold the wake. It logs the hold so a slow wake is visible before the api's wake timeout.
+// read completely this tick, or some pod of the worker is not positively stopped
+// (terminating ones included). Only a pod in phase Succeeded or Failed whose every
+// container status is terminated (podStopped) stops holding the wake: an evicted pod,
+// which a ReplicaSet at zero leaves in place, then cannot be the admission pod surviving
+// the wake. A terminal phase alone does not release the hold, since kubelet eviction
+// publishes Failed before it kills the containers. It logs the hold so a slow wake is
+// visible before the api's wake timeout.
 func (m *Materializer) wakeHeldForPods(w protocol.DesiredWorker, obs reconcile.ObservedWorker) bool {
 	switch {
 	case !obs.PodsKnown:
 		m.log.Info("wake held: worker pods not observed", "worker_id", w.ID)
 		return true
-	case obs.WorkerPodCount-obs.TerminalPodCount > 0:
-		m.log.Info("wake held: worker pods remain", "worker_id", w.ID, "pods", obs.WorkerPodCount-obs.TerminalPodCount)
+	case obs.WorkerPodCount-obs.StoppedPodCount > 0:
+		m.log.Info("wake held: worker pods remain", "worker_id", w.ID,
+			"live_pods", obs.WorkerPodCount-obs.StoppedPodCount,
+			"terminal_pods", obs.TerminalPodCount, "stopped_pods", obs.StoppedPodCount)
 		return true
 	}
 	return false
@@ -387,8 +448,8 @@ func (m *Materializer) wakeHeldForPods(w protocol.DesiredWorker, obs reconcile.O
 // in-pod workdir that a woken-from-zero worker does not have.
 //
 // A wake that finds the Deployment at zero (or absent) holds there until one complete
-// pod observation shows no worker pod that has yet to reach a terminal phase (terminating
-// pods included; see wakeHeldForPods). Restoring
+// pod observation shows every worker pod positively stopped (terminating pods included;
+// see wakeHeldForPods and podStopped). Restoring
 // replicas earlier can let the original admission pod survive the scale-down, and once
 // the api has recorded scaling_down it never settles a wake on that pod (trySettle rule
 // (a)), so the worker would stay waking for good. Waiting until the pods are gone forces

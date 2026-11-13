@@ -25,6 +25,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
 // hibRec is a Cordoner that also records hibernation transitions.
@@ -1017,18 +1018,21 @@ func TestWakeWithNilReplicasRestoresAtOnce(t *testing.T) {
 }
 
 // An evicted pod (phase Failed, no deletionTimestamp) is what kubelet eviction leaves
-// behind, and a ReplicaSet at zero does not delete it. It has no running container and
-// can never be Ready, so it must not hold a wake forever; a Running pod beside it still
-// does, and so does a terminating one.
+// behind, and a ReplicaSet at zero does not delete it. Once every container status is
+// terminated it cannot be the admission pod surviving the wake, so it must not hold a
+// wake forever; a Running pod beside it still does, and so does a terminating one.
 func TestWakeIsNotHeldByATerminalPhasePod(t *testing.T) {
 	hash := currentHash(t, "w1", 0)
 	evicted := hibPod("evicted", hash, false, false)
 	evicted.Status.Phase = corev1.PodFailed
 	evicted.Status.Reason = "Evicted"
+	hibStopContainers(evicted)
 	succeeded := hibPod("succeeded", hash, false, false)
 	succeeded.Status.Phase = corev1.PodSucceeded
+	hibStopContainers(succeeded)
 	failedDying := hibPod("failed-dying", hash, false, true)
 	failedDying.Status.Phase = corev1.PodFailed
+	hibStopContainers(failedDying)
 	running := hibPod("running", hash, true, false)
 	running.Status.Phase = corev1.PodRunning
 	m, client, _ := hibEnv(t, hibCurrent(t, 0, "sleep-op"), evicted, succeeded, failedDying, running)
@@ -1062,6 +1066,200 @@ func TestWakeIsNotHeldByATerminalPhasePod(t *testing.T) {
 	}
 	if n := replicaPatches(client2); n != 0 {
 		t.Fatalf("wake restored replicas while a terminating running pod remains (replica patches = %d)", n)
+	}
+}
+
+// hibStopContainers gives the pod one regular container whose status is terminated.
+func hibStopContainers(p *corev1.Pod) {
+	p.Spec.Containers = []corev1.Container{{Name: "worker"}}
+	p.Status.ContainerStatuses = []corev1.ContainerStatus{hibCS("worker", corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137}})}
+}
+
+func hibCS(name string, st corev1.ContainerState) corev1.ContainerStatus {
+	return corev1.ContainerStatus{Name: name, State: st}
+}
+
+func hibTerm() corev1.ContainerState {
+	return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}
+}
+
+func hibRun() corev1.ContainerState {
+	return corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}
+}
+
+func hibWait() corev1.ContainerState {
+	return corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}}
+}
+
+// A terminal phase is not shutdown evidence: kubelet eviction publishes Failed before it
+// kills the containers, so a Failed pod with a live container, or with no container
+// status to prove otherwise, keeps holding the wake until every status is terminated.
+func TestWakeHeldByFailedPodWithLiveContainers(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	mk := func(mut func(p *corev1.Pod)) *corev1.Pod {
+		p := hibPod("evicted", hash, true, false)
+		p.Status.Phase = corev1.PodFailed
+		p.Status.Reason = "Evicted"
+		mut(p)
+		return p
+	}
+	two := func(p *corev1.Pod) {
+		p.Spec.Containers = []corev1.Container{{Name: "a"}, {Name: "b"}}
+	}
+	cases := []struct {
+		name string
+		mut  func(p *corev1.Pod)
+	}{
+		{"one regular container still running", func(p *corev1.Pod) {
+			two(p)
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{hibCS("a", hibTerm()), hibCS("b", hibRun())}
+		}},
+		{"running ephemeral container", func(p *corev1.Pod) {
+			p.Spec.Containers = []corev1.Container{{Name: "a"}}
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{hibCS("a", hibTerm())}
+			p.Spec.EphemeralContainers = []corev1.EphemeralContainer{{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "dbg"}}}
+			p.Status.EphemeralContainerStatuses = []corev1.ContainerStatus{hibCS("dbg", hibRun())}
+		}},
+		{"waiting init container", func(p *corev1.Pod) {
+			p.Spec.Containers = []corev1.Container{{Name: "a"}}
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{hibCS("a", hibTerm())}
+			p.Spec.InitContainers = []corev1.Container{{Name: "init"}}
+			p.Status.InitContainerStatuses = []corev1.ContainerStatus{hibCS("init", hibWait())}
+		}},
+		{"spec containers but no statuses", func(p *corev1.Pod) { two(p) }},
+		{"fewer statuses than spec containers", func(p *corev1.Pod) {
+			two(p)
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{hibCS("a", hibTerm())}
+		}},
+	}
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, client, _ := hibEnv(t, hibCurrent(t, 0, "sleep-op"), mk(tc.mut))
+			if err := hibTick(t, m, w); err != nil {
+				t.Fatal(err)
+			}
+			if n := replicaPatches(client); n != 0 {
+				t.Fatalf("wake restored replicas while the Failed pod may still run a container (replica patches = %d)", n)
+			}
+			if tc.name != "one regular container still running" {
+				return
+			}
+			p, err := hibPods(client).Get(context.Background(), "pod-evicted", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{hibCS("a", hibTerm()), hibCS("b", hibTerm())}
+			if _, err := hibPods(client).Update(context.Background(), p, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := hibTick(t, m, w); err != nil {
+				t.Fatal(err)
+			}
+			if n := replicaPatches(client); n != 1 {
+				t.Fatalf("replica patches = %d once every container is terminated, want the one restore", n)
+			}
+			if d := hibGet(t, client); *d.Spec.Replicas != 1 {
+				t.Fatalf("restore: replicas=%v", d.Spec.Replicas)
+			}
+		})
+	}
+}
+
+func TestApplyPodEvidenceTerminalPodSuppliesNoReadiness(t *testing.T) {
+	for _, phase := range []corev1.PodPhase{corev1.PodSucceeded, corev1.PodFailed} {
+		t.Run(string(phase), func(t *testing.T) {
+			pod := corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{UID: "retained-old-pod", Annotations: map[string]string{AnnotationSpecHash: "current"}},
+				Status: corev1.PodStatus{
+					Phase:      phase,
+					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+				},
+			}
+			obs := reconcile.ObservedWorker{SpecHash: "current"}
+			applyPodEvidence(&obs, []corev1.Pod{pod})
+			if obs.TerminalPodCount != 1 {
+				t.Fatalf("TerminalPodCount = %d, want 1", obs.TerminalPodCount)
+			}
+			if obs.ReadyPodUID != "" {
+				t.Fatalf("ReadyPodUID = %q, a terminal-phase pod must not supply readiness", obs.ReadyPodUID)
+			}
+		})
+	}
+}
+
+func TestApplyPodEvidenceTerminalOldPodBesideNewReadyPod(t *testing.T) {
+	ready := []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	old := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "a-old", Annotations: map[string]string{AnnotationSpecHash: "current"}},
+		Status:     corev1.PodStatus{Phase: corev1.PodFailed, Conditions: ready},
+	}
+	fresh := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "z-new", Annotations: map[string]string{AnnotationSpecHash: "current"}},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, Conditions: ready},
+	}
+	for name, pods := range map[string][]corev1.Pod{"old first": {old, fresh}, "new first": {fresh, old}} {
+		t.Run(name, func(t *testing.T) {
+			obs := reconcile.ObservedWorker{SpecHash: "current"}
+			applyPodEvidence(&obs, pods)
+			if obs.ReadyPodUID != "z-new" || obs.LivePodUID != "z-new" {
+				t.Fatalf("ReadyPodUID=%q LivePodUID=%q, want both z-new", obs.ReadyPodUID, obs.LivePodUID)
+			}
+		})
+	}
+}
+
+func TestPodStopped(t *testing.T) {
+	mk := func(phase corev1.PodPhase, mut func(p *corev1.Pod)) corev1.Pod {
+		p := corev1.Pod{Status: corev1.PodStatus{Phase: phase}}
+		p.Spec.Containers = []corev1.Container{{Name: "a"}}
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{hibCS("a", hibTerm())}
+		if mut != nil {
+			mut(&p)
+		}
+		return p
+	}
+	init1 := func(p *corev1.Pod, st corev1.ContainerState) {
+		p.Spec.InitContainers = []corev1.Container{{Name: "i"}}
+		p.Status.InitContainerStatuses = []corev1.ContainerStatus{hibCS("i", st)}
+	}
+	eph := func(p *corev1.Pod, st corev1.ContainerState) {
+		p.Spec.EphemeralContainers = []corev1.EphemeralContainer{{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "e"}}}
+		p.Status.EphemeralContainerStatuses = []corev1.ContainerStatus{hibCS("e", st)}
+	}
+	cases := []struct {
+		name string
+		pod  corev1.Pod
+		want bool
+	}{
+		{"all terminated", mk(corev1.PodFailed, nil), true},
+		{"succeeded all terminated", mk(corev1.PodSucceeded, nil), true},
+		{"all terminated with init and ephemeral", mk(corev1.PodFailed, func(p *corev1.Pod) { init1(p, hibTerm()); eph(p, hibTerm()) }), true},
+		{"all terminated and deleting", mk(corev1.PodFailed, func(p *corev1.Pod) { now := metav1.Now(); p.DeletionTimestamp = &now }), true},
+		{"running", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Status.ContainerStatuses[0].State = hibRun() }), false},
+		{"waiting", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Status.ContainerStatuses[0].State = hibWait() }), false},
+		{"empty state", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Status.ContainerStatuses[0].State = corev1.ContainerState{} }), false},
+		{"terminated and running together", mk(corev1.PodFailed, func(p *corev1.Pod) {
+			p.Status.ContainerStatuses[0].State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}, Running: &corev1.ContainerStateRunning{}}
+		}), false},
+		{"missing statuses", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Status.ContainerStatuses = nil }), false},
+		{"short statuses", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Spec.Containers = append(p.Spec.Containers, corev1.Container{Name: "b"}) }), false},
+		{"extra status entry", mk(corev1.PodFailed, func(p *corev1.Pod) {
+			p.Status.ContainerStatuses = append(p.Status.ContainerStatuses, hibCS("ghost", hibTerm()))
+		}), false},
+		{"status for a different name", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Status.ContainerStatuses[0].Name = "other" }), false},
+		{"init running", mk(corev1.PodFailed, func(p *corev1.Pod) { init1(p, hibRun()) }), false},
+		{"init waiting", mk(corev1.PodFailed, func(p *corev1.Pod) { init1(p, hibWait()) }), false},
+		{"ephemeral running", mk(corev1.PodFailed, func(p *corev1.Pod) { eph(p, hibRun()) }), false},
+		{"running phase with terminated statuses", mk(corev1.PodRunning, nil), false},
+		{"no spec containers", mk(corev1.PodFailed, func(p *corev1.Pod) { p.Spec.Containers, p.Status.ContainerStatuses = nil, nil }), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := podStopped(tc.pod); got != tc.want {
+				t.Fatalf("podStopped = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

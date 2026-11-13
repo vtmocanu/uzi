@@ -125,11 +125,16 @@ type ObservedWorker struct {
 	PodsKnown      bool
 	WorkerPodCount int
 	// TerminalPodCount is how many of the WorkerPodCount pods are in phase Succeeded or
-	// Failed (an evicted pod, say): every container has exited and the pod can never be
-	// Ready again. Read only by the hibernation wake hold; zero (unset) means "count
-	// every pod", which holds a wake rather than releasing it.
+	// Failed (an evicted pod, say). A terminal phase is not proof that containers have
+	// exited: kubelet eviction publishes Failed before it kills them. Informational for
+	// the wake hold, which reads StoppedPodCount instead.
 	TerminalPodCount int
-	ReadyPodUID      string
+	// StoppedPodCount is how many of the WorkerPodCount pods are in a terminal phase AND
+	// carry a terminated status for every regular, init and ephemeral container (positive
+	// shutdown evidence). Read only by the hibernation wake hold; zero (unset) means
+	// "every pod holds the wake", which fails closed.
+	StoppedPodCount int
+	ReadyPodUID     string
 	// Hibernation evidence (PRD #4205), all read fresh each tick: nothing about a
 	// hibernation step is remembered across ticks.
 	//
@@ -143,8 +148,9 @@ type ObservedWorker struct {
 	HibernationOp string
 	// WorkerPodUIDs lists every pod labelled for this worker, terminating ones included
 	// (they still count as "a worker pod exists"), sorted. LivePodUID is the smallest UID
-	// among pods with no deletionTimestamp, "" when none. ReadyPodUID above already
-	// excludes terminating pods.
+	// among pods with no deletionTimestamp and not in a terminal phase (Succeeded or
+	// Failed), "" when none. ReadyPodUID above likewise excludes terminating and
+	// terminal-phase pods.
 	WorkerPodUIDs []string
 	LivePodUID    string
 	// NixPVCSize is the observed /nix PVC's requested storage (spec.resources.requests[storage]),
