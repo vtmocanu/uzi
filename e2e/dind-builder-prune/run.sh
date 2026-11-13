@@ -205,7 +205,6 @@ print_versions() {
 
 CUR=''
 API_CUR=''
-RAW_BYTES_NOTE_DONE=0
 # Raw per-record bytes. `docker system df -v --format json`, `docker buildx du --format json` and
 # `docker buildx du --verbose` (buildx v0.38.1, client 29.9.2) all print Size only as a formatted
 # string ("3.146MB"), so the harness reads the Engine API GET /system/df of the owned nested
@@ -219,10 +218,8 @@ api_snap() {
   fi
   rm -f "$API_CUR"
   API_CUR=''
-  if ((!RAW_BYTES_NOTE_DONE)); then
-    RAW_BYTES_NOTE_DONE=1
-    echo "RAW BYTES UNAVAILABLE [$P]: GET /system/df on the nested daemon did not return numeric Size ($(head -c 200 "$PO/api-df-$1.json.err" 2>/dev/null | tr '\n' ' ')); records show formatted Size only"
-  fi
+  # Raw bytes are part of the evidence contract: a missing read fails the run (no PASS).
+  failc "raw bytes unavailable for snapshot $1: GET /system/df on the nested daemon did not return numeric Size ($(head -c 200 "$PO/api-df-$1.json.err" 2>/dev/null | tr '\n' ' '))"
   return 0
 }
 df_snap() {
@@ -248,7 +245,9 @@ show_records() {
 }
 rec_age() { # id -> whole seconds since the record's LastUsedAt (CUR, CLI JSON), empty if absent
   jq -r --arg i "$1" '[.BuildCache[] | select((.ID | rtrimstr("*")) == $i) | .LastUsedAt][0]
-    | if . == null then empty else (now - (.[0:19] | sub(" "; "T") + "Z" | fromdateiso8601)) | floor end' "$CUR"
+    | if . == null then empty
+      elif (test("\\+0000 UTC$") | not) then error("LastUsedAt is not UTC: \(.)")
+      else (now - (.[0:19] | sub(" "; "T") + "Z" | fromdateiso8601)) | floor end' "$CUR"
 }
 rec_id() { # type needle -> the first matching record ID in CUR
   jq -r --arg t "$1" --arg n "$2" '[.BuildCache[] | select(.CacheType == $t and (.Description | contains($n)))] | .[0].ID // empty | rtrimstr("*")' "$CUR"

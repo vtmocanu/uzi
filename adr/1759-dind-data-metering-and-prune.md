@@ -311,8 +311,11 @@ and the #3891 leg. No image or volume prune is added.
   - Tracked harness (M3): `task test:dind-builder-prune`
     ([README](../e2e/dind-builder-prune/README.md)). On 2026-11-13 it passed both
     postures (server 29.8.0 / API 1.56, BuildKit v0.33.0, client 29.9.2, buildx
-    v0.38.1), about 230 s per posture. Pressure went 89.7% to 22.3%. Red A
-    (switch off): no relief, 88.5% to 88.5%.
+    v0.38.1), about 137 s per posture; PASS requires both postures and every phase.
+    The held build was proven running with its record InUse and older than the
+    scaled floor before and after the prune, and raw per-record bytes came from the
+    nested daemon's API. Pressure went 89.8% to 22.3%. Red A (switch off): no
+    relief, 88.5% to 88.5%.
 - **Limits.** Records sharing snapshots with a local image ("Shared") are never
   pruned. Below 4 GiB of total cache the prune is a no-op: the 2026-10-30 sample
   below showed 0 to 0.84 GB per worker, where this leg would free nothing. The

@@ -14,8 +14,8 @@ docker builder prune -f --filter type=regular --filter until=24h --max-used-spac
 ```
 
 It is separate from the component gates (`task gate`) and from CI. It starts owned throwaway
-DinD daemons. Measured on the gate run: about 135 s per posture and about 270 s in total (rootful
-133 s, rootless 135 s, measured after the event-driven hold; the red A run takes about 100 s), under a 1500-second overall deadline.
+DinD daemons. Measured on the gate run: about 137 s per posture and about 275 s in total (rootful
+137 s, rootless 137 s, measured after the event-driven hold; the red A run takes about 60 s (57 s measured)), under a 1500-second overall deadline.
 
 If a run is killed, reap its containers by hand: `docker ps -a --filter label=dbp-test.owner`, then
 `docker rm -fv <exact name>` after checking each container's `dbp-test.owner` label is yours.
@@ -123,7 +123,7 @@ listener (127.0.0.1:2375 inside the container). Every `records [...]` listing pr
 the ID and formatted size, followed by a `raw bytes total` line, for the fresh, built, during-hold,
 before-P1, after-P1, before-P1b, after-P1b and pressure snapshots. The raw API snapshots are kept as
 `api-df-<label>.json` in the output directory. If that read ever fails the harness prints
-`RAW BYTES UNAVAILABLE` and `bytes=unavailable`; it does not fabricate values.
+a `FAIL` line and `bytes=unavailable`, so the run cannot PASS; it does not fabricate values. Record ages are computed only from `+0000 UTC` LastUsedAt values; any other zone aborts the run.
 
 The fill uses `RUN dd` layers on the alpine base rather than `FROM scratch` + `COPY`: a COPY puts the
 blob in the build context, and BuildKit keeps context data as `source.local` records that
