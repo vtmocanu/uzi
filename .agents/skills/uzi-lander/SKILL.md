@@ -328,7 +328,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
      “Already reviewed the last commit.” Decide whether the existing coverage plus a local
      review is sufficient for this risk class. If a bot review is still warranted, post
      `@coderabbitai full review` once and return to step 2; never auto-post it.
-   - **File-limit refusal (status or command reply).** `N files exceed the limit of 100`,
+   - **File-limit refusal (check-run, status or command reply).** `N files exceed the limit of 100`,
      including CodeRabbit's answer to `@coderabbitai full review`, means switch to Greptile: post
      `@greptileai review`, then `--reviewer greptile --reviewer-grace 2`. A command reply need
      not change the commit status, so do not wait for a particular watcher exit.
@@ -427,7 +427,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    `--fresh`. After a merge or renumber, regenerate sqlc (a renumber reorders generated
    columns) and run the full gate on CI: a clean merge can still break a signature one side changed. Resolve a conflicted generated `*.sql.go` by regenerating it
    after its `queries/*.sql`, never by hand. When either side adds a migration, require the
-   `test-codex-refresh-lostreply-e2e` job's `LiveDB: N passed, 0 skipped` line (`test-api-store-it` only mirrors that job's result) on the exact head, since a test
+   `LiveDB: N passed, 0 skipped` line from both `test-livedb-workersvc` and `test-codex-refresh-lostreply-e2e` (`test-api-store-it` only mirrors their results) on the exact head, since a test
    pinned to an older schema can break on the other side's new columns.
    Ordinary PRs add their own lowercase UUID-v4 fragment before a PR exists, initially citing
    the relevant issue; see [fragment guidance](../../../changelog.d/README.md). Do not union

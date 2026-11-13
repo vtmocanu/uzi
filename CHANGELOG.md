@@ -186,6 +186,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **One run's repeated retained holds no longer fill an owner's custody capacity ([#4162](https://github.com/vtmocanu/uzi/pull/4162), [#4216](https://github.com/vtmocanu/uzi/pull/4216)).**
   A run's open holds on the same original worker, from any of its generations, now count as one admission unit toward `custody_hold_limit`, while a queued run whose own open holds reach the limit stays unstarted (Resume does not bypass it; discard or settle that run's own holds) and every hold stays open until released by proof or discarded.
 
+- **GitHub Enterprise Server pull requests open against the right API ([#4234](https://github.com/vtmocanu/uzi/pull/4234)).**
+  The worker now calls `<host>/api/v3` on a GitHub Enterprise Server instead of a nonexistent `api.<host>` subdomain, and the origin cooldown keys the GHES API on the web host.
+
+- **A newly started peer supervisor no longer blocks another run's quiescence ([#3915](https://github.com/vtmocanu/uzi/pull/3915), [#4264](https://github.com/vtmocanu/uzi/pull/4264)).**
+  If a peer records its exact process root after the worker's first root snapshot, the worker makes one bounded full process reproof with fresh roots. Unrecorded or mismatched processes remain blocked.
+
+- **A Claude run parks on a transient Cloudflare block page instead of failing ([#4271](https://github.com/vtmocanu/uzi/pull/4271), [#4272](https://github.com/vtmocanu/uzi/pull/4272)).**
+  A 403 carrying the `Attention Required! | Cloudflare` page title is retried and parked as a provider outage, like a 529; every other 403 still fails fast.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -370,6 +379,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Document the cross-check plan-gate token-switch limitation ([#4158](https://github.com/vtmocanu/uzi/pull/4158), [#4220](https://github.com/vtmocanu/uzi/pull/4220)).**
   The Anthropic tokens guide now warns that switching tokens at a Plan cross-check human gate can leave the run unable to restart, pending #4201.
 
+- **The Overview preview's System health panel spans its content column ([#4259](https://github.com/vtmocanu/uzi/pull/4259), [#4261](https://github.com/vtmocanu/uzi/pull/4261)).**
+  At tablet and desktop widths, check details use two columns and long evidence has the full panel width; the phone bottom sheet stays the same.
+
+- **A retained-adoption hold on an active secret remediation no longer offers Resume ([#4177](https://github.com/vtmocanu/uzi/pull/4177), [#4254](https://github.com/vtmocanu/uzi/pull/4254)).**
+  A closed-set `recovery_wait_detail` (`secret_remediation_active` or `remediation_proof_unknown`) now qualifies the adoption-failed park; Resume is refused with a 409 before any write on the active value, and the CLI, TUI and web show an available archive (which may omit later work) or operator recovery, then Cancel.
+
 ### Security
 
 - **A run can no longer rewrite the repo agents its later claims use ([#3913](https://github.com/vtmocanu/uzi/pull/3913), [#3940](https://github.com/vtmocanu/uzi/pull/3940)).**
@@ -383,6 +398,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Improved credential redaction across log and issue text (3cec5121).**
   Log, snapshot, Slack and issue-draft scrubbers share one redaction helper with added regression coverage.
+
+- **Release reference for the credential redaction change (3cec5121f).**
+  The same change as the entry above, listed under its current short commit ID.
 
 ## [0.86.1] - 2026-11-05
 

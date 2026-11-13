@@ -72,6 +72,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/greptile-verdict.sh"
 # shellcheck source=lib/pr-comments.sh
 . "$HERE/lib/pr-comments.sh"
+# shellcheck source=lib/cr-signal.sh
+. "$HERE/lib/cr-signal.sh"
 
 cr_only=0
 if [ "${1:-}" = "--cr-only" ]; then cr_only=1; shift; fi
@@ -138,11 +140,11 @@ for n in "$@"; do
   # the OLDER commit, so this cannot forge a "reviewed" on an unreviewed head.
   if [ "$cr_walk" -eq 0 ] && [ -n "$wt_body" ] && [ -n "$head" ] \
      && printf '%s' "$wt_body" | grep -qF "change_assessment_commit:\"$head\""; then cr_walk=1; fi
-  # The commit status description names WHY CR did not review (rate limited / skipped).
+  # CR's check-run title / status description names WHY it did not review (lib/cr-signal.sh).
+  # Unreadable is UNKNOWN, never absent; it only feeds the not-clean reason below.
   crdesc=""
   if [ -n "$head" ]; then
-    crdesc=$(gh api "repos/${repo}/commits/${head}/status" \
-      --jq '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null || true)
+    crdesc=$(cr_head_desc "$repo" "$head") || crdesc="UNKNOWN"
   fi
   cr_ok=0; cr_unconf=0
   if [ -n "$tally" ]; then
@@ -169,6 +171,7 @@ for n in "$@"; do
       *"rate limited"*) reason="RATE LIMITED — CR did not review (scripts/cr-rate-limit.sh for the reset)" ;;
       *"in progress"*)  reason="IN PROGRESS — wait for it" ;;
       *"skipped"*)      reason="SKIPPED: ${crdesc}" ;;
+      UNKNOWN)          reason="UNKNOWN — CodeRabbit check-run/status unreadable; re-run before deciding" ;;
     esac
     echo "  ⚠️  NO CodeRabbit review — DO NOT treat as clean: ${reason}"
   fi

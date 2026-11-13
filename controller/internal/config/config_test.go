@@ -1223,6 +1223,33 @@ func TestLoadParsesTheCommandSandboxMode(t *testing.T) {
 	})
 }
 
+func TestRetireScratchOutcomesConfig(t *testing.T) {
+	const key = "UZI_WORKER_RETIRE_SCRATCH_OUTCOMES"
+	for _, raw := range []string{"unset", "", "true", "false", "True", "0", "1", "yes", " true", "null"} {
+		t.Run(raw, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://api.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "token"))
+			t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "")
+			t.Setenv(key, raw)
+			if raw == "unset" {
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := Load()
+			valid := raw == "unset" || raw == "" || raw == "false" || raw == "true"
+			if valid {
+				if err != nil || cfg.WorkerRetireScratchOutcomes != (raw != "false") {
+					t.Fatalf("enabled=%v err=%v", cfg.WorkerRetireScratchOutcomes, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("invalid value accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestEpochScratchDeletionConfig(t *testing.T) {
 	const key = "UZI_WORKER_EPOCH_SCRATCH_DELETION"
 	for _, raw := range []string{"unset", "", "false", "true", "False", "FALSE", "True", "TRUE", "0", "1", "t", "f", "T", "F", "yes", "no", " true", "true ", "false\n", "\ttrue", "null"} {

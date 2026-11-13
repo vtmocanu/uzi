@@ -10,6 +10,7 @@ import { OverviewUsageCard } from "./OverviewUsageCard";
 import type { UsageWindow } from "./UsageCards";
 import type { AdminUsage, SelfUsage } from "../lib/api";
 import { mockApi } from "../mocks/mockApi";
+import { USAGE_SCOPE_NOTE } from "./usageParts";
 
 afterEach(cleanup);
 
@@ -77,4 +78,25 @@ it("fits the whole by-user table in the card at a 1280px viewport, with every ce
     const contentLeft = cell.firstElementChild!.firstElementChild!.getBoundingClientRect().left;
     expect(Math.abs(contentLeft - headerTextLeft)).toBeLessThanOrEqual(1);
   }
+});
+
+// Issue #4209: the scope note must wrap inside its card, never clip or push past it.
+function expectNoteInsideCard(note: HTMLElement) {
+  let card: HTMLElement | null = note.parentElement;
+  while (card && parseFloat(getComputedStyle(card).borderTopWidth) === 0) card = card.parentElement;
+  expect(card).toBeTruthy();
+  const n = note.getBoundingClientRect();
+  const c = card!.getBoundingClientRect();
+  expect(n.height).toBeGreaterThan(0);
+  expect(note.scrollWidth).toBeLessThanOrEqual(note.clientWidth);
+  expect(n.right).toBeLessThanOrEqual(c.right);
+  expect(n.left).toBeGreaterThanOrEqual(c.left);
+  expect(getComputedStyle(note).whiteSpace).not.toBe("nowrap");
+}
+
+it.each([1280, 400])("keeps the scope note visible and inside its card at %ipx", async (width) => {
+  await mount(width);
+  const note = screen.getByText(USAGE_SCOPE_NOTE);
+  expect(note.getBoundingClientRect().width).toBeGreaterThan(0);
+  expectNoteInsideCard(note);
 });

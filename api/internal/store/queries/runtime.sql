@@ -9339,9 +9339,12 @@ WHERE run_id = ANY(@run_ids::uuid[]);
 
 -- name: SelfUsage :one
 -- The requesting user's own usage (PRD #40 M3, GET /api/usage): lifetime totals,
--- last-7-days totals, and the count of their runs that carry usage. Windowed on the
+-- last-7-days totals, and run_count: the count of their PRIMARY work runs (issue, task,
+-- prompt, job, self_improve; fn_usage_primary_kind, issue #4209) that carry usage. Tokens,
+-- cost and the subscription/unreported counts still sum every non-chat run's usage, helper
+-- runs included: they measure billed work. Windowed on the
 -- run's created_at (laptop scale ≈ when it spent). COALESCE(...,0) so a user with no
--- usage gets zeros + run_count 0 (the client reads run_count==0 as "nothing yet").
+-- usage gets zeros + run_count 0.
 -- Chat runs are excluded (belt-and-suspenders: the fold never writes chat rows).
 -- PRD #1332 M5A (D2): each dollar sum now travels with subscription/unreported RUN COUNTS
 -- for the SAME window, so no partial dollar total can read as complete — a run is counted by
@@ -9354,12 +9357,12 @@ WHERE run_id = ANY(@run_ids::uuid[]);
 -- a generic plan nested-loop the full fold per run row; the lateral makes run_id a per-row
 -- qual that pushes down to run_usage_pkey, so only this user's legs are folded. CROSS (not
 -- LEFT) keeps the inner-join semantics: a run with no usage contributes no row, so run_count
--- still counts only runs that carry usage. The LIMIT 1 is a semantic no-op (the view's
+-- still counts only runs that carry usage (primary kinds only). The LIMIT 1 is a semantic no-op (the view's
 -- outermost GROUP BY run_id yields at most one row per run) kept as a FENCE: without it the
 -- planner may pull the lateral subquery back up into a plain join and lose the per-row
 -- pushdown this rewrite exists for.
 WITH scoped AS (
-    SELECT r.created_at, t.cost_status,
+    SELECT r.created_at, r.kind, t.cost_status,
            t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
     FROM runs r
     CROSS JOIN LATERAL (
@@ -9386,19 +9389,20 @@ SELECT
     COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
     count(*) FILTER (WHERE cost_status = 'subscription' AND created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
     count(*) FILTER (WHERE cost_status = 'unreported'   AND created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
-    count(*)::bigint AS run_count
+    count(*) FILTER (WHERE fn_usage_primary_kind(kind))::bigint AS run_count
 FROM scoped;
 
 -- name: AdminUsageTotals :one
 -- Factory-wide totals across ALL users' runs (PRD #40 M3, GET /api/admin/usage).
 -- Same shape as SelfUsage without the user filter; at the same snapshot and cutoff
 -- this equals the SUM of AdminUsagePerUser rows (both read run_usage_totals joined
--- to non-chat runs). Separate handler reads may observe concurrent changes.
+-- to non-chat runs). run_count counts primary work runs only (fn_usage_primary_kind,
+-- issue #4209); sums include helper spend. Separate handler reads may observe concurrent changes.
 -- PRD #1332 M5A (D2): the factory-wide dollar sums carry subscription/unreported RUN COUNTS
 -- for both windows, mirroring SelfUsage, so a partial dollar total can never read as
 -- complete. M5A adds no public DTO field for the counts; M5B consumes them.
 WITH scoped AS (
-    SELECT r.created_at, t.cost_status,
+    SELECT r.created_at, r.kind, t.cost_status,
            t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
     FROM run_usage_totals t
     JOIN runs r ON r.id = t.run_id
@@ -9419,16 +9423,19 @@ SELECT
     COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
     count(*) FILTER (WHERE cost_status = 'subscription' AND created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
     count(*) FILTER (WHERE cost_status = 'unreported'   AND created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
-    count(*)::bigint AS run_count,
-    -- The earliest usage-bearing run's creation time, for the factory card's "since
-    -- <date>" (PRD #40 M6). NULL when the factory has no usage yet.
+    count(*) FILTER (WHERE fn_usage_primary_kind(kind))::bigint AS run_count,
+    -- The earliest usage-bearing non-chat run's creation time (helper runs included: it
+    -- dates the spend), for the factory card's "since <date>" (PRD #40 M6). NULL when the
+    -- factory has no usage yet.
     MIN(created_at)::timestamptz AS earliest_run
 FROM scoped;
 
 -- name: AdminUsagePerUser :many
--- Both windows over usage-bearing non-chat runs. Lifetime groups remain present
--- even when their seven-day totals are zero; at the same snapshot and cutoff,
--- each window sums to the factory.
+-- Both windows over usage-bearing non-chat runs. Token, cost and disclosure sums include
+-- helper runs; run_count, last7_run_count and the harness run counts count primary work
+-- runs only (fn_usage_primary_kind, issue #4209), so a helper-only user keeps a row with
+-- run_count 0. Lifetime groups remain present even when their seven-day totals are zero;
+-- at the same snapshot and cutoff, each window sums to the factory.
 SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.input_tokens), 0)::bigint          AS input_tokens,
     COALESCE(SUM(t.cache_read_tokens), 0)::bigint      AS cache_read_tokens,
@@ -9437,8 +9444,8 @@ SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.cost_usd), 0)::numeric              AS cost_usd,
     count(*) FILTER (WHERE t.cost_status = 'subscription')::bigint AS subscription_run_count,
     count(*) FILTER (WHERE t.cost_status = 'unreported')::bigint   AS unreported_run_count,
-    count(t.run_id)::bigint AS run_count,
-    count(t.run_id) FILTER (WHERE r.created_at >= now() - interval '7 days')::bigint AS last7_run_count,
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind))::bigint AS run_count,
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind) AND r.created_at >= now() - interval '7 days')::bigint AS last7_run_count,
     COALESCE(SUM(t.input_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_input_tokens,
     COALESCE(SUM(t.cache_read_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_cache_read_tokens,
     COALESCE(SUM(t.cache_creation_tokens) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::bigint AS last7_cache_creation_tokens,
@@ -9446,13 +9453,13 @@ SELECT u.id AS user_id, u.email,
     COALESCE(SUM(t.cost_usd) FILTER (WHERE r.created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
     count(*) FILTER (WHERE t.cost_status = 'subscription' AND r.created_at >= now() - interval '7 days')::bigint AS last7_subscription_run_count,
     count(*) FILTER (WHERE t.cost_status = 'unreported' AND r.created_at >= now() - interval '7 days')::bigint AS last7_unreported_run_count,
-    -- Runs by harness (issue #3876), the same population as run_count / last7_run_count.
+    -- Runs by harness (issue #3876), the same primary-work population as run_count / last7_run_count.
     -- runs.harness is NOT NULL with CHECK (harness IN ('claude','codex')) (migrations
     -- 00226/00227), so per window claude + codex == run_count.
-    count(t.run_id) FILTER (WHERE r.harness = 'claude')::bigint AS claude_run_count,
-    count(t.run_id) FILTER (WHERE r.harness = 'codex')::bigint AS codex_run_count,
-    count(t.run_id) FILTER (WHERE r.harness = 'claude' AND r.created_at >= now() - interval '7 days')::bigint AS last7_claude_run_count,
-    count(t.run_id) FILTER (WHERE r.harness = 'codex' AND r.created_at >= now() - interval '7 days')::bigint AS last7_codex_run_count
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind) AND r.harness = 'claude')::bigint AS claude_run_count,
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind) AND r.harness = 'codex')::bigint AS codex_run_count,
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind) AND r.harness = 'claude' AND r.created_at >= now() - interval '7 days')::bigint AS last7_claude_run_count,
+    count(t.run_id) FILTER (WHERE fn_usage_primary_kind(r.kind) AND r.harness = 'codex' AND r.created_at >= now() - interval '7 days')::bigint AS last7_codex_run_count
 FROM run_usage_totals t
 JOIN runs r ON r.id = t.run_id
 JOIN users u ON u.id = r.user_id
@@ -9531,9 +9538,12 @@ ORDER BY u.id;
 -- These count over `runs` DIRECTLY, NOT run_usage_totals (D1): a run that fails at
 -- provisioning / credential lookup / guardrail has no usage row, so a rate computed
 -- over the usage join would systematically hide the infra failures this number exists
--- to surface. The predicate matches what the Runs page lists: terminal runs only
--- (status IN ('completed','failed','cancelled')) and the ListRunsForUser kind filter
--- (D2: chat/judge failures and cross-check child outcomes are not factory run outcomes). Windowed on created_at (D3), the same
+-- to surface. Issue #4209: outcomes count terminal PRIMARY work runs only, the population
+-- fn_usage_primary_kind defines (issue, task, prompt, job, self_improve), over terminal
+-- runs only (status IN ('completed','failed','cancelled')). Helper runs (chat, judge,
+-- cross_check, mr_rework, ci_fix, manual and automatic alike) are not factory run outcomes.
+-- This no longer mirrors the Runs page: ListRunsForUser still lists mr_rework and ci_fix.
+-- Windowed on created_at (D3), the same
 -- axis as the usage 7-day figures, so the two 7-day numbers on one card describe the
 -- same set of runs. plan_rejected is split out of failed (D4): rejecting a plan is the
 -- owner's decision, kept in the denominator and its own bar segment but out of the
@@ -9559,7 +9569,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE user_id = @user_id AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND kind NOT IN ('chat', 'judge', 'cross_check')
+      AND fn_usage_primary_kind(kind)
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
 SELECT
@@ -9568,7 +9578,7 @@ SELECT
     COALESCE((SELECT f.origin FROM last_failure f), '')::text AS last_failed_origin,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.user_id = @user_id AND r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check')
+       WHERE r3.user_id = @user_id AND r3.status = 'completed' AND fn_usage_primary_kind(r3.kind)
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
@@ -9613,20 +9623,20 @@ SELECT
               FROM runs r2
               WHERE r2.user_id = @user_id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = @user_id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE runs.user_id = @user_id
   AND status IN ('completed', 'failed', 'cancelled')
-  AND kind NOT IN ('chat', 'judge', 'cross_check');
+  AND fn_usage_primary_kind(kind);
 
 -- name: AdminRunOutcomes :one
 -- Factory-wide run outcome counts for BOTH windows (PRD #1293 M1); same shape as
@@ -9638,7 +9648,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND kind NOT IN ('chat', 'judge', 'cross_check')
+      AND fn_usage_primary_kind(kind)
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
 SELECT
@@ -9648,7 +9658,7 @@ SELECT
     COALESCE((SELECT f.user_id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS last_failed_user_id,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check')
+       WHERE r3.status = 'completed' AND fn_usage_primary_kind(r3.kind)
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS lifetime_finished,
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
@@ -9685,18 +9695,18 @@ SELECT
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs
 WHERE status IN ('completed', 'failed', 'cancelled')
-  AND kind NOT IN ('chat', 'judge', 'cross_check');
+  AND fn_usage_primary_kind(kind);
 
 -- name: AdminRunOutcomesPerUser :many
 -- Per-user lifetime and seven-day outcome counts for the admin factory breakdown (PRD #1293 M1, D5).
@@ -9708,7 +9718,7 @@ WITH last_failure AS MATERIALIZED (
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
     WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
-      AND kind NOT IN ('chat', 'judge', 'cross_check')
+      AND fn_usage_primary_kind(kind)
     ORDER BY user_id, COALESCE(finished_at, status_since) DESC, id DESC
 )
 SELECT u.id AS user_id, u.email,
@@ -9717,7 +9727,7 @@ SELECT u.id AS user_id, u.email,
     COALESCE((SELECT f.origin FROM last_failure f WHERE f.user_id = u.id), '')::text AS last_failed_origin,
     COALESCE((SELECT count(*)::bigint
        FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
-       WHERE r3.user_id = u.id AND r3.status = 'completed' AND r3.kind NOT IN ('chat', 'judge', 'cross_check') AND f.user_id = u.id
+       WHERE r3.user_id = u.id AND r3.status = 'completed' AND fn_usage_primary_kind(r3.kind) AND f.user_id = u.id
        GROUP BY f.id), 0)::bigint AS completed_since_last_failure,
     count(*)::bigint                                                                       AS finished,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
@@ -9757,19 +9767,19 @@ SELECT u.id AS user_id, u.email,
               FROM runs r2
               WHERE r2.user_id = u.id
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               GROUP BY 1) o) AS fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = u.id AND r2.created_at >= now() - interval '7 days'
               AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
-              AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
+              AND fn_usage_primary_kind(r2.kind)
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs r
 JOIN users u ON u.id = r.user_id
 WHERE r.status IN ('completed', 'failed', 'cancelled')
-  AND r.kind NOT IN ('chat', 'judge', 'cross_check')
+  AND fn_usage_primary_kind(r.kind)
 GROUP BY u.id, u.email
 ORDER BY u.id;
 
