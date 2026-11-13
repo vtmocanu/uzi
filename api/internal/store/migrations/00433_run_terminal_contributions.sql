@@ -43,7 +43,7 @@ CREATE TABLE run_terminal_contributions (
         'recorded'          -- an abandonment decision was recorded; nothing was pushed
     )),
     refusal_reason text CONSTRAINT run_terminal_contributions_refusal_reason_check CHECK (refusal_reason IN (
-        'create_refused', 'foreign_tip', 'ci_config_guard', 'pack_invalid', 'tip_missing')),
+        'create_refused', 'update_refused', 'foreign_tip', 'ci_config_guard', 'pack_invalid', 'tip_missing')),
     create_invoked_at timestamptz,
     published_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -60,9 +60,9 @@ CREATE TABLE run_terminal_contributions (
         CHECK (disposition <> 'preserved' OR (state = 'prepared') = (create_invoked_at IS NULL)),
     CONSTRAINT run_terminal_contributions_abandoned_never_invoked_check
         CHECK (disposition = 'preserved' OR create_invoked_at IS NULL),
-    -- A refusal reason belongs to a refused contribution only.
+    -- A refusal reason belongs to a refused contribution, and a refused contribution always has one.
     CONSTRAINT run_terminal_contributions_refusal_state_check
-        CHECK (refusal_reason IS NULL OR state = 'refused'),
+        CHECK ((state = 'refused') = (refusal_reason IS NOT NULL)),
     CONSTRAINT run_terminal_contributions_published_stamp_check
         CHECK ((state = 'published') = (published_at IS NOT NULL))
 );
@@ -103,6 +103,15 @@ BEGIN
         OR (OLD.state = 'publish_unknown' AND NEW.state IN ('published', 'refused'))
     ) THEN
         RETURN NULL;
+    END IF;
+    -- A push may be marked only while its preservation is publishing. The preservation row is
+    -- locked FOR SHARE, so a concurrent preservation -> not_published (which needs FOR UPDATE on that
+    -- row) either commits first and this marker is refused, or waits for this transaction and then
+    -- sees an invoked contribution and is refused by the preservation guard.
+    IF OLD.state = 'prepared' AND NEW.state = 'invoked' THEN
+        PERFORM 1 FROM run_terminal_preservations p
+            WHERE p.id = NEW.preservation_id AND p.state = 'publishing' FOR SHARE;
+        IF NOT FOUND THEN RETURN NULL; END IF;
     END IF;
     RETURN NEW;
 END $$;

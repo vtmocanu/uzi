@@ -178,6 +178,10 @@ CREATE TRIGGER run_terminal_preservation_delete_guard BEFORE DELETE ON run_termi
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
+-- The previous migration's Down drops run_terminal_contributions before this one runs. Until the
+-- DROP FUNCTION below, run_terminal_preservation_guard still names that table inside its nested IFs,
+-- which plpgsql plans only when a branch is reached: a preservation UPDATE that reaches one in that
+-- window would fail. Nothing here exercises that window; roll the chain back with writers stopped.
 -- Close the check-then-drop window: no live row may be inserted between the check and the DROP.
 LOCK TABLE run_terminal_preservations IN SHARE ROW EXCLUSIVE MODE;
 -- A pointer-bearing row owns (or may own) a remote ref that nothing else records: refuse the

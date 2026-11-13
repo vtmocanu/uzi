@@ -25,6 +25,10 @@ SET LOCAL lock_timeout = '5s';
 -- A rolled-back chain must refuse before it clears anything: the same live-rows refusal the 00433
 -- and 00432 Downs make, repeated here because this Down runs first and would otherwise null the
 -- reasons of a rollback that those two then refuse.
+-- Lock order matches the writers' (worker, run, hold, preservation, contribution): the hold table
+-- first, so this Down cannot deadlock against a request that holds a hold row and waits for a
+-- preservation.
+LOCK TABLE recovery_custody_holds IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE run_terminal_preservations, run_terminal_contributions IN SHARE ROW EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$

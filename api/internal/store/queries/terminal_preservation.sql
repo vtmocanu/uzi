@@ -81,3 +81,83 @@ JOIN forge_connections c ON c.id = p.connection_id
 WHERE c.id = @connection_id::uuid AND c.user_id = @user_id::uuid
 ORDER BY s.created_at ASC, s.run_id ASC
 LIMIT @lim::int;
+
+-- ---------------------------------------------------------------------------------------------
+-- Writers (m3). Every state or tip writer is a CAS: the expected state (and the old tip) are in the
+-- WHERE, so a lost race and a guard-refused change (the guards RETURN NULL) both read as zero rows.
+-- The caller rolls back on zero rows, re-reads under the run lock and logs "illegal transition" when
+-- the row is still in the state it expected.
+-- ---------------------------------------------------------------------------------------------
+
+-- name: GetTerminalPreservationForUpdate :one
+-- The locked read of the run's preservation (lock order: worker, run, hold, preservation,
+-- contribution). The tx2 outcome writers take it after the run lock.
+SELECT * FROM run_terminal_preservations WHERE run_id = @run_id FOR UPDATE;
+
+-- name: MarkTerminalPreservationPublishing :one
+-- bound, not_published, live or publishing -> publishing, setting the live pointer FIRST (before
+-- the contribution's prepared -> invoked marker, whose guard needs the preservation publishing).
+UPDATE run_terminal_preservations SET
+    state = 'publishing', live_run_id = run_id, updated_at = now()
+WHERE id = @id AND state = @expected_state::text
+  AND tip IS NOT DISTINCT FROM sqlc.narg('expected_tip')::text
+RETURNING *;
+
+-- name: MarkTerminalPreservationNotPublished :one
+-- bound -> not_published: the abandonment of a run that never had a ref.
+UPDATE run_terminal_preservations SET state = 'not_published', updated_at = now()
+WHERE id = @id AND state = 'bound' AND tip IS NULL
+RETURNING *;
+
+-- name: SettleTerminalPreservationLive :one
+-- publishing -> live at a new tip: the tip advances only to the tip of a published contribution of
+-- this preservation prepared against the old tip (the guard), and first_published_at is set once.
+UPDATE run_terminal_preservations SET
+    state = 'live', tip = @tip, first_published_at = COALESCE(first_published_at, now()),
+    last_error = NULL, attempts = 0, next_check_at = @next_check_at, updated_at = now()
+WHERE id = @id AND state = 'publishing'
+  AND tip IS NOT DISTINCT FROM sqlc.narg('expected_tip')::text
+RETURNING *;
+
+-- name: SettleTerminalPreservationRefused :one
+-- publishing -> live (it had a tip: the ref is as before) or not_published (it had none: no ref was
+-- created), after the contribution was recorded refused. The text is already scrubbed and bounded.
+UPDATE run_terminal_preservations SET
+    state = CASE WHEN tip IS NULL THEN 'not_published' ELSE 'live' END,
+    live_run_id = CASE WHEN tip IS NULL THEN NULL ELSE live_run_id END,
+    last_error = sqlc.narg('last_error')::text, next_check_at = @next_check_at, updated_at = now()
+WHERE id = @id AND state = 'publishing'
+  AND tip IS NOT DISTINCT FROM sqlc.narg('expected_tip')::text
+RETURNING *;
+
+-- name: ScheduleTerminalPreservationCheck :execrows
+-- A single-row scheduling write (no state, no tip, so it needs no run lock): when the sweep next
+-- looks at the row, and the scrubbed outcome text of the last attempt.
+UPDATE run_terminal_preservations SET
+    next_check_at = @next_check_at, last_error = sqlc.narg('last_error')::text, updated_at = now()
+WHERE id = @id;
+
+-- name: MarkTerminalContributionInvoked :one
+-- prepared -> invoked: the single winner of a push is the request this returns a row to (and whose
+-- transaction then commits).
+UPDATE run_terminal_contributions SET state = 'invoked', create_invoked_at = now(), updated_at = now()
+WHERE id = @id AND state = 'prepared'
+RETURNING *;
+
+-- name: RecordTerminalContributionPublished :one
+-- invoked or publish_unknown -> published: the ref was read back at the tip.
+UPDATE run_terminal_contributions SET state = 'published', published_at = now(), updated_at = now()
+WHERE id = @id AND state = @expected_state::text AND state IN ('invoked', 'publish_unknown')
+RETURNING *;
+
+-- name: RecordTerminalContributionRefused :one
+-- invoked or publish_unknown -> refused, with the refusal reason.
+UPDATE run_terminal_contributions SET state = 'refused', refusal_reason = @refusal_reason, updated_at = now()
+WHERE id = @id AND state = @expected_state::text AND state IN ('invoked', 'publish_unknown')
+RETURNING *;
+
+-- name: RecordTerminalContributionUnknown :one
+-- invoked -> publish_unknown: the outcome could not be proven, reconcile only.
+UPDATE run_terminal_contributions SET state = 'publish_unknown', updated_at = now()
+WHERE id = @id AND state = 'invoked'
+RETURNING *;

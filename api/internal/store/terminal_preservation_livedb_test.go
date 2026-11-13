@@ -413,6 +413,8 @@ func TestTerminalPreservationGuardLiveDB(t *testing.T) {
 		// Never back to NULL, never to an unpublished or foreign tip.
 		ft.mustRows(0, `UPDATE run_terminal_preservations SET tip=NULL WHERE id=$1`, p.ID)
 		ft.mustRows(0, `UPDATE run_terminal_preservations SET tip=$2 WHERE id=$1`, p.ID, termTipB)
+		// A marker needs a publishing preservation, so the live row goes back to publishing first.
+		ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing' WHERE id=$1`, p.ID)
 		ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c2.ID)
 		ft.mustRows(1, `UPDATE run_terminal_contributions SET state='published', published_at=now() WHERE id=$1`, c2.ID)
 		ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c3.ID)
@@ -487,6 +489,9 @@ func TestTerminalPreservationGuardLiveDB(t *testing.T) {
 func TestTerminalContributionGuardLiveDB(t *testing.T) {
 	f := newTermFixture(t, "term_contrib_")
 	p := f.insertPreservation(f.newRun())
+	// The prepared -> invoked marker needs its preservation publishing (migration 00433), so every
+	// contribution below that is built past prepared shares this publishing preservation.
+	f.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, p.ID)
 	gen := int64(0)
 	next := func() int64 { gen++; return gen }
 
@@ -924,12 +929,15 @@ func TestTerminalPreservationRollbackRefusalsLiveDB(t *testing.T) {
 			}
 			p := ft.insertPreservation(f.run)
 			c := ft.insertContribution(p, 1, termTipA, nil)
+			ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, p.ID)
 			ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c.ID)
 			if state == "publish_unknown" {
 				ft.mustRows(1, `UPDATE run_terminal_contributions SET state='publish_unknown' WHERE id=$1`, c.ID)
 			}
 			termRefusal(t, store.MigrateDownTo(ctx, dsn, 432), "run_terminal_contributions has live rows", pool)
 			ft.mustRows(1, `UPDATE run_terminal_contributions SET state='refused', refusal_reason='create_refused' WHERE id=$1`, c.ID)
+			// The preservation still bears its live pointer, which the 00433 Down also refuses on.
+			ft.mustRows(1, `UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE id=$1`, p.ID)
 			if err := store.MigrateDownTo(ctx, dsn, 432); err != nil {
 				t.Fatalf("Down after the contribution was refused: %v", err)
 			}
@@ -945,6 +953,7 @@ func TestTerminalPreservationRollbackRefusalsLiveDB(t *testing.T) {
 		"an invoked contribution": func(ft *termFixture, run uuid.UUID) {
 			p := ft.insertPreservation(run)
 			c := ft.insertContribution(p, 1, termTipA, nil)
+			ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, p.ID)
 			ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c.ID)
 		},
 	} {

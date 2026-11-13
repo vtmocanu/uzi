@@ -1095,6 +1095,27 @@ var queryInventory = []queryPin{
 		"../handler: the DELETE /api/forge/connections/{id} pre-check"},
 	{"ListLiveTerminalRefsForConnection", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
 		"../handler: names the refs/uzi-terminal ref in the connection-removal 409"},
+	// Issue #4007 slice A, M3: the worker route's writers. Each is a CAS on the expected state.
+	{"GetTerminalPreservationForUpdate", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the locked read returns the run's preservation"},
+	{"MarkTerminalPreservationPublishing", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the live pointer is set and a wrong expected state or tip changes no row"},
+	{"MarkTerminalPreservationNotPublished", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts bound -> not_published once and a refused repeat"},
+	{"SettleTerminalPreservationLive", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the tip advance needs a published contribution and the old tip, and first_published_at is kept"},
+	{"SettleTerminalPreservationRefused", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts back to live with a tip, to not_published without one, and refusal while a push may exist"},
+	{"ScheduleTerminalPreservationCheck", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the single-row scheduling write"},
+	{"MarkTerminalContributionInvoked", "terminal_preservation.sql", "TestTerminalInvokeVersusNotPublishedLiveDB",
+		"direct and two-session; asserts the marker needs a publishing preservation in both interleavings"},
+	{"RecordTerminalContributionPublished", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts invoked and publish_unknown -> published and a wrong expected state changes no row"},
+	{"RecordTerminalContributionRefused", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts a refusal needs its reason and the expected state"},
+	{"RecordTerminalContributionUnknown", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts invoked -> publish_unknown once"},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)

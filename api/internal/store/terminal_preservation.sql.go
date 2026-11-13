@@ -123,6 +123,47 @@ func (q *Queries) GetTerminalPreservationByRun(ctx context.Context, runID uuid.U
 	return i, err
 }
 
+const getTerminalPreservationForUpdate = `-- name: GetTerminalPreservationForUpdate :one
+
+SELECT id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, state, first_published_at, retire_tip, retire_reason, retire_observed_at, retire_decided_at, next_check_at, attempts, last_error, deleted_at, created_at, updated_at FROM run_terminal_preservations WHERE run_id = $1 FOR UPDATE
+`
+
+// ---------------------------------------------------------------------------------------------
+// Writers (m3). Every state or tip writer is a CAS: the expected state (and the old tip) are in the
+// WHERE, so a lost race and a guard-refused change (the guards RETURN NULL) both read as zero rows.
+// The caller rolls back on zero rows, re-reads under the run lock and logs "illegal transition" when
+// the row is still in the state it expected.
+// ---------------------------------------------------------------------------------------------
+// The locked read of the run's preservation (lock order: worker, run, hold, preservation,
+// contribution). The tx2 outcome writers take it after the run lock.
+func (q *Queries) GetTerminalPreservationForUpdate(ctx context.Context, runID uuid.UUID) (RunTerminalPreservation, error) {
+	row := q.db.QueryRow(ctx, getTerminalPreservationForUpdate, runID)
+	var i RunTerminalPreservation
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Ref,
+		&i.Tip,
+		&i.LifetimeAtBind,
+		&i.State,
+		&i.FirstPublishedAt,
+		&i.RetireTip,
+		&i.RetireReason,
+		&i.RetireObservedAt,
+		&i.RetireDecidedAt,
+		&i.NextCheckAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.DeletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const insertTerminalContribution = `-- name: InsertTerminalContribution :one
 INSERT INTO run_terminal_contributions
     (preservation_id, run_id, generation, worker_id, user_id, hold_id, authority, tip, prior_tip,
@@ -430,4 +471,356 @@ func (q *Queries) ListTerminalPreservationsDue(ctx context.Context, lim int32) (
 		return nil, err
 	}
 	return items, nil
+}
+
+const markTerminalContributionInvoked = `-- name: MarkTerminalContributionInvoked :one
+UPDATE run_terminal_contributions SET state = 'invoked', create_invoked_at = now(), updated_at = now()
+WHERE id = $1 AND state = 'prepared'
+RETURNING id, preservation_id, run_id, generation, worker_id, user_id, hold_id, authority, tip, prior_tip, coverage_digest, manifest, disposition, state, refusal_reason, create_invoked_at, published_at, created_at, updated_at
+`
+
+// prepared -> invoked: the single winner of a push is the request this returns a row to (and whose
+// transaction then commits).
+func (q *Queries) MarkTerminalContributionInvoked(ctx context.Context, id uuid.UUID) (RunTerminalContribution, error) {
+	row := q.db.QueryRow(ctx, markTerminalContributionInvoked, id)
+	var i RunTerminalContribution
+	err := row.Scan(
+		&i.ID,
+		&i.PreservationID,
+		&i.RunID,
+		&i.Generation,
+		&i.WorkerID,
+		&i.UserID,
+		&i.HoldID,
+		&i.Authority,
+		&i.Tip,
+		&i.PriorTip,
+		&i.CoverageDigest,
+		&i.Manifest,
+		&i.Disposition,
+		&i.State,
+		&i.RefusalReason,
+		&i.CreateInvokedAt,
+		&i.PublishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const markTerminalPreservationNotPublished = `-- name: MarkTerminalPreservationNotPublished :one
+UPDATE run_terminal_preservations SET state = 'not_published', updated_at = now()
+WHERE id = $1 AND state = 'bound' AND tip IS NULL
+RETURNING id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, state, first_published_at, retire_tip, retire_reason, retire_observed_at, retire_decided_at, next_check_at, attempts, last_error, deleted_at, created_at, updated_at
+`
+
+// bound -> not_published: the abandonment of a run that never had a ref.
+func (q *Queries) MarkTerminalPreservationNotPublished(ctx context.Context, id uuid.UUID) (RunTerminalPreservation, error) {
+	row := q.db.QueryRow(ctx, markTerminalPreservationNotPublished, id)
+	var i RunTerminalPreservation
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Ref,
+		&i.Tip,
+		&i.LifetimeAtBind,
+		&i.State,
+		&i.FirstPublishedAt,
+		&i.RetireTip,
+		&i.RetireReason,
+		&i.RetireObservedAt,
+		&i.RetireDecidedAt,
+		&i.NextCheckAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.DeletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const markTerminalPreservationPublishing = `-- name: MarkTerminalPreservationPublishing :one
+UPDATE run_terminal_preservations SET
+    state = 'publishing', live_run_id = run_id, updated_at = now()
+WHERE id = $1 AND state = $2::text
+  AND tip IS NOT DISTINCT FROM $3::text
+RETURNING id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, state, first_published_at, retire_tip, retire_reason, retire_observed_at, retire_decided_at, next_check_at, attempts, last_error, deleted_at, created_at, updated_at
+`
+
+type MarkTerminalPreservationPublishingParams struct {
+	ID            uuid.UUID   `json:"id"`
+	ExpectedState string      `json:"expected_state"`
+	ExpectedTip   pgtype.Text `json:"expected_tip"`
+}
+
+// bound, not_published, live or publishing -> publishing, setting the live pointer FIRST (before
+// the contribution's prepared -> invoked marker, whose guard needs the preservation publishing).
+func (q *Queries) MarkTerminalPreservationPublishing(ctx context.Context, arg MarkTerminalPreservationPublishingParams) (RunTerminalPreservation, error) {
+	row := q.db.QueryRow(ctx, markTerminalPreservationPublishing, arg.ID, arg.ExpectedState, arg.ExpectedTip)
+	var i RunTerminalPreservation
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Ref,
+		&i.Tip,
+		&i.LifetimeAtBind,
+		&i.State,
+		&i.FirstPublishedAt,
+		&i.RetireTip,
+		&i.RetireReason,
+		&i.RetireObservedAt,
+		&i.RetireDecidedAt,
+		&i.NextCheckAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.DeletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const recordTerminalContributionPublished = `-- name: RecordTerminalContributionPublished :one
+UPDATE run_terminal_contributions SET state = 'published', published_at = now(), updated_at = now()
+WHERE id = $1 AND state = $2::text AND state IN ('invoked', 'publish_unknown')
+RETURNING id, preservation_id, run_id, generation, worker_id, user_id, hold_id, authority, tip, prior_tip, coverage_digest, manifest, disposition, state, refusal_reason, create_invoked_at, published_at, created_at, updated_at
+`
+
+type RecordTerminalContributionPublishedParams struct {
+	ID            uuid.UUID `json:"id"`
+	ExpectedState string    `json:"expected_state"`
+}
+
+// invoked or publish_unknown -> published: the ref was read back at the tip.
+func (q *Queries) RecordTerminalContributionPublished(ctx context.Context, arg RecordTerminalContributionPublishedParams) (RunTerminalContribution, error) {
+	row := q.db.QueryRow(ctx, recordTerminalContributionPublished, arg.ID, arg.ExpectedState)
+	var i RunTerminalContribution
+	err := row.Scan(
+		&i.ID,
+		&i.PreservationID,
+		&i.RunID,
+		&i.Generation,
+		&i.WorkerID,
+		&i.UserID,
+		&i.HoldID,
+		&i.Authority,
+		&i.Tip,
+		&i.PriorTip,
+		&i.CoverageDigest,
+		&i.Manifest,
+		&i.Disposition,
+		&i.State,
+		&i.RefusalReason,
+		&i.CreateInvokedAt,
+		&i.PublishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const recordTerminalContributionRefused = `-- name: RecordTerminalContributionRefused :one
+UPDATE run_terminal_contributions SET state = 'refused', refusal_reason = $1, updated_at = now()
+WHERE id = $2 AND state = $3::text AND state IN ('invoked', 'publish_unknown')
+RETURNING id, preservation_id, run_id, generation, worker_id, user_id, hold_id, authority, tip, prior_tip, coverage_digest, manifest, disposition, state, refusal_reason, create_invoked_at, published_at, created_at, updated_at
+`
+
+type RecordTerminalContributionRefusedParams struct {
+	RefusalReason pgtype.Text `json:"refusal_reason"`
+	ID            uuid.UUID   `json:"id"`
+	ExpectedState string      `json:"expected_state"`
+}
+
+// invoked or publish_unknown -> refused, with the refusal reason.
+func (q *Queries) RecordTerminalContributionRefused(ctx context.Context, arg RecordTerminalContributionRefusedParams) (RunTerminalContribution, error) {
+	row := q.db.QueryRow(ctx, recordTerminalContributionRefused, arg.RefusalReason, arg.ID, arg.ExpectedState)
+	var i RunTerminalContribution
+	err := row.Scan(
+		&i.ID,
+		&i.PreservationID,
+		&i.RunID,
+		&i.Generation,
+		&i.WorkerID,
+		&i.UserID,
+		&i.HoldID,
+		&i.Authority,
+		&i.Tip,
+		&i.PriorTip,
+		&i.CoverageDigest,
+		&i.Manifest,
+		&i.Disposition,
+		&i.State,
+		&i.RefusalReason,
+		&i.CreateInvokedAt,
+		&i.PublishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const recordTerminalContributionUnknown = `-- name: RecordTerminalContributionUnknown :one
+UPDATE run_terminal_contributions SET state = 'publish_unknown', updated_at = now()
+WHERE id = $1 AND state = 'invoked'
+RETURNING id, preservation_id, run_id, generation, worker_id, user_id, hold_id, authority, tip, prior_tip, coverage_digest, manifest, disposition, state, refusal_reason, create_invoked_at, published_at, created_at, updated_at
+`
+
+// invoked -> publish_unknown: the outcome could not be proven, reconcile only.
+func (q *Queries) RecordTerminalContributionUnknown(ctx context.Context, id uuid.UUID) (RunTerminalContribution, error) {
+	row := q.db.QueryRow(ctx, recordTerminalContributionUnknown, id)
+	var i RunTerminalContribution
+	err := row.Scan(
+		&i.ID,
+		&i.PreservationID,
+		&i.RunID,
+		&i.Generation,
+		&i.WorkerID,
+		&i.UserID,
+		&i.HoldID,
+		&i.Authority,
+		&i.Tip,
+		&i.PriorTip,
+		&i.CoverageDigest,
+		&i.Manifest,
+		&i.Disposition,
+		&i.State,
+		&i.RefusalReason,
+		&i.CreateInvokedAt,
+		&i.PublishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const scheduleTerminalPreservationCheck = `-- name: ScheduleTerminalPreservationCheck :execrows
+UPDATE run_terminal_preservations SET
+    next_check_at = $1, last_error = $2::text, updated_at = now()
+WHERE id = $3
+`
+
+type ScheduleTerminalPreservationCheckParams struct {
+	NextCheckAt pgtype.Timestamptz `json:"next_check_at"`
+	LastError   pgtype.Text        `json:"last_error"`
+	ID          uuid.UUID          `json:"id"`
+}
+
+// A single-row scheduling write (no state, no tip, so it needs no run lock): when the sweep next
+// looks at the row, and the scrubbed outcome text of the last attempt.
+func (q *Queries) ScheduleTerminalPreservationCheck(ctx context.Context, arg ScheduleTerminalPreservationCheckParams) (int64, error) {
+	result, err := q.db.Exec(ctx, scheduleTerminalPreservationCheck, arg.NextCheckAt, arg.LastError, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const settleTerminalPreservationLive = `-- name: SettleTerminalPreservationLive :one
+UPDATE run_terminal_preservations SET
+    state = 'live', tip = $1, first_published_at = COALESCE(first_published_at, now()),
+    last_error = NULL, attempts = 0, next_check_at = $2, updated_at = now()
+WHERE id = $3 AND state = 'publishing'
+  AND tip IS NOT DISTINCT FROM $4::text
+RETURNING id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, state, first_published_at, retire_tip, retire_reason, retire_observed_at, retire_decided_at, next_check_at, attempts, last_error, deleted_at, created_at, updated_at
+`
+
+type SettleTerminalPreservationLiveParams struct {
+	Tip         pgtype.Text        `json:"tip"`
+	NextCheckAt pgtype.Timestamptz `json:"next_check_at"`
+	ID          uuid.UUID          `json:"id"`
+	ExpectedTip pgtype.Text        `json:"expected_tip"`
+}
+
+// publishing -> live at a new tip: the tip advances only to the tip of a published contribution of
+// this preservation prepared against the old tip (the guard), and first_published_at is set once.
+func (q *Queries) SettleTerminalPreservationLive(ctx context.Context, arg SettleTerminalPreservationLiveParams) (RunTerminalPreservation, error) {
+	row := q.db.QueryRow(ctx, settleTerminalPreservationLive,
+		arg.Tip,
+		arg.NextCheckAt,
+		arg.ID,
+		arg.ExpectedTip,
+	)
+	var i RunTerminalPreservation
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Ref,
+		&i.Tip,
+		&i.LifetimeAtBind,
+		&i.State,
+		&i.FirstPublishedAt,
+		&i.RetireTip,
+		&i.RetireReason,
+		&i.RetireObservedAt,
+		&i.RetireDecidedAt,
+		&i.NextCheckAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.DeletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const settleTerminalPreservationRefused = `-- name: SettleTerminalPreservationRefused :one
+UPDATE run_terminal_preservations SET
+    state = CASE WHEN tip IS NULL THEN 'not_published' ELSE 'live' END,
+    live_run_id = CASE WHEN tip IS NULL THEN NULL ELSE live_run_id END,
+    last_error = $1::text, next_check_at = $2, updated_at = now()
+WHERE id = $3 AND state = 'publishing'
+  AND tip IS NOT DISTINCT FROM $4::text
+RETURNING id, run_id, user_id, repo_id, live_run_id, ref, tip, lifetime_at_bind, state, first_published_at, retire_tip, retire_reason, retire_observed_at, retire_decided_at, next_check_at, attempts, last_error, deleted_at, created_at, updated_at
+`
+
+type SettleTerminalPreservationRefusedParams struct {
+	LastError   pgtype.Text        `json:"last_error"`
+	NextCheckAt pgtype.Timestamptz `json:"next_check_at"`
+	ID          uuid.UUID          `json:"id"`
+	ExpectedTip pgtype.Text        `json:"expected_tip"`
+}
+
+// publishing -> live (it had a tip: the ref is as before) or not_published (it had none: no ref was
+// created), after the contribution was recorded refused. The text is already scrubbed and bounded.
+func (q *Queries) SettleTerminalPreservationRefused(ctx context.Context, arg SettleTerminalPreservationRefusedParams) (RunTerminalPreservation, error) {
+	row := q.db.QueryRow(ctx, settleTerminalPreservationRefused,
+		arg.LastError,
+		arg.NextCheckAt,
+		arg.ID,
+		arg.ExpectedTip,
+	)
+	var i RunTerminalPreservation
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Ref,
+		&i.Tip,
+		&i.LifetimeAtBind,
+		&i.State,
+		&i.FirstPublishedAt,
+		&i.RetireTip,
+		&i.RetireReason,
+		&i.RetireObservedAt,
+		&i.RetireDecidedAt,
+		&i.NextCheckAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.DeletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
