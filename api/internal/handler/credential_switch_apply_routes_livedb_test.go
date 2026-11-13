@@ -235,3 +235,79 @@ func TestWorkerCredentialSwitchStateUncertainRouteLiveDB(t *testing.T) {
 		t.Fatalf("wall-pending uncertain: status %d body %s, want 409 park_pending", rec.Code, rec.Body)
 	}
 }
+
+// Issue #4201 m3a: a worker whose current registration negotiated in-place apply gets a typed 409 for
+// the v1 release, and registration through the real route is what stamps the negotiation.
+func TestWorkerCredentialSwitchV1ReleaseRetiredRouteLiveDB(t *testing.T) {
+	ctx := context.Background()
+	state := func(e *applyRouteEnv, body string) (int, map[string]any) {
+		rec := e.do(e.worker, "POST", "/api/worker/runs/"+e.run.String()+"/state", body)
+		var out map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
+	}
+	release := func(e *applyRouteEnv) string {
+		return fmt.Sprintf(`{"status":"credential_switch","claim_generation":%d}`, e.gen)
+	}
+
+	t.Run("negotiated registration: 409 with a stable reason and nothing written", func(t *testing.T) {
+		e := setupApplyRouteLiveDB(t)
+		if _, err := e.pool.Exec(ctx, `UPDATE workers SET credential_switch_apply_nonce = snapshot_register_nonce WHERE id = $1`, e.worker); err != nil {
+			t.Fatal(err)
+		}
+		code, out := state(e, release(e))
+		if code != http.StatusConflict || out["reason"] != "credential_switch_release_retired" {
+			t.Fatalf("v1 release: status %d body %v, want 409 credential_switch_release_retired", code, out)
+		}
+		var status string
+		var released bool
+		if err := e.pool.QueryRow(ctx, `SELECT status, claim_released_at IS NOT NULL FROM runs WHERE id = $1`, e.run).Scan(&status, &released); err != nil || status != "running" || released {
+			t.Fatalf("run status=%s released=%v err=%v, want running and unreleased", status, released, err)
+		}
+		// The un-fenced v1 hold gets the same refusal; the op-fenced hold is accepted.
+		code, out = state(e, fmt.Sprintf(`{"status":"credential_switch_held","claim_generation":%d,"register_nonce":%q}`, e.gen, applyRouteNonce))
+		if code != http.StatusConflict || out["reason"] != "credential_switch_release_retired" {
+			t.Fatalf("v1 hold: status %d body %v, want 409 credential_switch_release_retired", code, out)
+		}
+		code, out = state(e, fmt.Sprintf(`{"status":"credential_switch_held","claim_generation":%d,"register_nonce":%q,"op_id":%q}`, e.gen, applyRouteNonce, e.op))
+		if code != http.StatusOK || out["disposition"] != "held" {
+			t.Fatalf("op-fenced hold: status %d body %v, want 200 held", code, out)
+		}
+	})
+	t.Run("old replica re-registration: the v1 release is accepted", func(t *testing.T) {
+		e := setupApplyRouteLiveDB(t)
+		if _, err := e.pool.Exec(ctx, `UPDATE workers SET credential_switch_apply_nonce = snapshot_register_nonce WHERE id = $1`, e.worker); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.pool.Exec(ctx, `UPDATE workers SET snapshot_register_nonce = 'nonce-old-replica' WHERE id = $1`, e.worker); err != nil {
+			t.Fatal(err)
+		}
+		if code, out := state(e, release(e)); code != http.StatusOK {
+			t.Fatalf("mid-roll v1 release: status %d body %v, want 200", code, out)
+		}
+	})
+	t.Run("register stamps the nonce only when the capability is advertised", func(t *testing.T) {
+		e := setupApplyRouteLiveDB(t)
+		register := func(caps string) {
+			rec := e.do(e.worker, "POST", "/api/worker/register", fmt.Sprintf(`{"version":"1.0.0","protocol_capabilities":%s}`, caps))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("register: status %d body %s", rec.Code, rec.Body)
+			}
+		}
+		stamped := func() (apply, snap string) {
+			if err := e.pool.QueryRow(ctx, `SELECT coalesce(credential_switch_apply_nonce, ''), coalesce(snapshot_register_nonce, '') FROM workers WHERE id = $1`, e.worker).Scan(&apply, &snap); err != nil {
+				t.Fatal(err)
+			}
+			return apply, snap
+		}
+		register(`["credential_switch_in_place_v1"]`)
+		first, snap := stamped()
+		if first == "" || first != snap {
+			t.Fatalf("after an in-place registration apply=%q snapshot=%q, want equal and set", first, snap)
+		}
+		register(`[]`)
+		if apply, snap := stamped(); apply != first || apply == snap {
+			t.Fatalf("after a registration without the capability apply=%q snapshot=%q, want the stale %q", apply, snap, first)
+		}
+	})
+}

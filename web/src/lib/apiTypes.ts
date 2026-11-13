@@ -4396,6 +4396,17 @@ export interface CredentialEpoch {
   usage?: CredentialEpochUsage;
 }
 
+/** CredentialSwitchMessagePayload is the body of a `credential_switch` run message (PRD #1247
+ *  M9; api/internal/workersvc/secretchoice.go). label is user-authored (null when unlabelled);
+ *  ordinal is n >= 1 for the nth in-place switch in a claim (issue #4201) and absent on a
+ *  claim-time switch. */
+export interface CredentialSwitchMessagePayload {
+  label: string | null;
+  select_reason: string;
+  secret_id: string;
+  ordinal?: number;
+}
+
 /** CredentialEpochUsage is one credential epoch's spend (issue #4201). */
 export interface CredentialEpochUsage {
   input_tokens: number;

@@ -37,7 +37,7 @@ func TestCredentialSwitchMigrationsLockOneBusyTableEach(t *testing.T) {
 	}
 	seen := 0
 	for _, f := range files {
-		raw, err := os.ReadFile(f)
+		raw, err := os.ReadFile(f) //nolint:gosec // G304: f comes from a Glob over this package's own migrations dir, not from input.
 		if err != nil {
 			t.Fatal(err)
 		}

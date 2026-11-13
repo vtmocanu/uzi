@@ -636,16 +636,24 @@ the token rides the claim rather than the worker, re-pointing a worker is
 complete server-side — no restart, no re-minted join token. Since PRD #1247
 `claimSecretID` also consults, ahead of the worker's own bind mode, a
 per-run (or per-schedule) credential override the owner can set or change at
-any time — queued, parked, at the plan gate, or mid-run — and a mid-run
-switch never rewrites a live claim in place: it reuses the same custody
-`runs.claim_generation` (below) plus a new `claim_released_at` fence to force
-the switch to cross an actual claim boundary, so the run always resumes with
-the new token rather than swapping it out from under a running turn. For a
-run carrying retained recovery authority the worker first proves the run's
-processes stopped; if it cannot, the run is held `paused` for the owner
-(`credential_switch_settling`, then `credential_switch_unsettled`) instead of
-releasing the claim; see
-[adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md).
+any time — queued, parked, at the plan gate, or mid-run. A mid-run switch
+reuses the same custody `runs.claim_generation` (below) as its fence. On a
+worker that negotiated `credential_switch_in_place_v1` (against an api serving
+`credential_switch_apply_v1`) it is applied **in place** (issue #4201): once
+the worker has proven its own processes quiescent, it asks the fenced,
+idempotent `POST /api/worker/runs/{id}/credential-switch/apply` route, which in
+one transaction journals a child epoch (`run_credential_switch_epochs`),
+withdraws the switch stamp and appends the `credential_switch` feed message,
+and returns the token only after COMMIT. The worker, claim generation and
+working directory stay the same and the SDK restarts on the new token with the
+same resume id. A worker without the capability still crosses an actual claim
+boundary: it releases the claim (`claim_released_at` fence) and the next claim
+delivers the token. Where quiescence cannot be proven the run is held `paused`
+for the owner (`credential_switch_settling`, then `credential_switch_unsettled`)
+instead; an apply whose outcome the worker cannot prove becomes a plain owner
+pause (`credential_switch_uncertain`). See
+[adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md) and
+[adr/4201-in-place-credential-switch.md](adr/4201-in-place-credential-switch.md).
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens, by default the soonest weekly

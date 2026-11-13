@@ -507,7 +507,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// a per-message credential_epoch_ordinal on the message append. Advertised UNCONDITIONALLY:
 		// a worker applies a switch in place ONLY after seeing this token, because an older api 404s
 		// the route and 400s the unknown fields and state.
-		{"credential_switch_apply_v1"},
+		{workersvc.CredentialSwitchApplyFeature},
 		// Issue #3985: this api accepts {status:"clarification_settled", claim_generation,
 		// clarification_settlement:{question_id, revision_input_id, gate_revision}} and answers it
 		// with disposition "clarification_settled". It returns a plan cross-check run parked at
@@ -1561,6 +1561,13 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			httpx.JSON(w, http.StatusConflict, map[string]any{
 				"run":    h.workerRunDTO(r.Context(), run),
 				"reason": "park_pending",
+			})
+		case errors.Is(err, workersvc.ErrCredentialSwitchReleaseRetired):
+			// Issue #4201 m3a: the worker's current registration negotiated in-place apply, so a v1
+			// release (or an un-fenced hold) is a protocol bug. Nothing was written.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    h.workerRunDTO(r.Context(), run),
+				"reason": "credential_switch_release_retired",
 			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			// Issue #2950: a machine-readable reason so the worker can BLOCK (not retire) its

@@ -3905,6 +3905,18 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   registration (the refusal lifts on the worker's acknowledgement, a stale
   heartbeat, worker removal or re-registration), and `run cancel` always works; see
   [Credential-switch holds](run-recovery.md#credential-switch-holds).
+  `settling` means the worker is still finishing its own operations; `unsettled`
+  means it finished them but did not prove the run's processes stopped (nothing
+  was applied, and the next claim re-proves that). They are distinct states;
+  the only change between them is `settling` to `unsettled`, when the worker acknowledges.
+  On a worker with in-place switching, `run set-token` on a live Claude run
+  switches the token without releasing the claim (same worker, same working
+  directory, same session id; a refused resume continues in a fresh session
+  with a `resume_lineage_break` notice, reason `credential_switch_resume_refused`).
+  If the worker cannot prove whether that switch took effect, the run is
+  `paused` with no hold reason and a `credential_switch_uncertain` message:
+  `uzi run resume <id>` re-resolves the token from the run's current choice
+  and continues. See [Paused after an uncertain token switch](./run-pause.md#paused-after-an-uncertain-token-switch).
   A `paused` run created with `--require-base` can also be **held because
   its kept work is not attested** (`hold_reason: base_attestation_missing`):
   it continued its own work, but no checkpoint proves that work was produced

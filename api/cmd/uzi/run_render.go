@@ -2011,6 +2011,8 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 	// Diagnostics use that sanitizer too; other payloads keep the generic row.
 	if line, ok := activityMessageLine(m.Kind, m.Payload); ok {
 		payload = capCell(cellText(line), 200)
+	} else if line, ok := credentialSwitchMessageLine(m.Kind, m.Payload); ok {
+		payload = line
 	} else if m.Kind == "status" {
 		var diagnostic struct {
 			Event string  `json:"event"`
@@ -2024,6 +2026,33 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 	}
 	p.Printf("#%-4d %-16s %-*s %s\n", m.Seq, m.Kind, actorCellWidth, actorCell(m), payload)
 	return nil
+}
+
+// credentialSwitchMessageLine renders the two in-place credential-switch feed messages (issue #4201).
+// A `credential_switch` message carrying an ordinal is an applied in-place switch ("switched in place
+// to <label>"); one without it is the claim path's message and keeps the generic payload row. A
+// `credential_switch_uncertain` message is the owner pause for an outcome the worker could not prove.
+// The label is USER-AUTHORED, so it goes through the same capCell(cellText(...)) composition as every
+// other worker-bound cell; the uncertain text is fixed and reads nothing from the payload.
+func credentialSwitchMessageLine(kind string, raw json.RawMessage) (string, bool) {
+	switch kind {
+	case "credential_switch":
+		var p struct {
+			Label   *string `json:"label"`
+			Ordinal int32   `json:"ordinal"`
+		}
+		if json.Unmarshal(raw, &p) != nil || p.Ordinal <= 0 {
+			return "", false
+		}
+		label := "another token"
+		if p.Label != nil && cellText(*p.Label) != "" {
+			label = cellText(*p.Label)
+		}
+		return capCell("switched in place to "+label, 200), true
+	case "credential_switch_uncertain":
+		return "token switch outcome unknown; run paused; resume to retry", true
+	}
+	return "", false
 }
 
 // actorCellWidth bounds the human table's actor column. The payload column beside

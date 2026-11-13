@@ -332,6 +332,29 @@ transaction, so a `RAISE` rolls it back fully, and holds `ACCESS EXCLUSIVE` on
 `runs` while it runs. Design rationale:
 [ADR-3607](../adr/3607-compact-policy-hold-m1-isolation.md#consent-and-continuity-m2m3).
 
+## Paused after an uncertain token switch
+
+If you switch a running run's token with `uzi run set-token` and the worker
+cannot prove whether the switch took effect (the confirmation was lost, or the
+token can no longer be handed out), the run **pauses for you**. It is an
+ordinary pause: `hold_reason` is empty, the worker, session and open question
+are kept, and the feed shows a `credential_switch_uncertain` message. Neither
+the old nor the new token is used again until you act.
+
+To continue, **Resume** it (`uzi run resume <id>`, or the run page's
+**Resume**). Resume re-resolves the token from the run's current choice, so the
+token you last set is the one the run spends; to pick a different one first,
+run `uzi run set-token <id> <label>`. Cancel works as always.
+
+This is different from a held switch (`credential_switch_settling` then
+`credential_switch_unsettled`), which means the worker could **not prove its
+processes stopped** and nothing was applied; see
+[Credential-switch holds](run-recovery.md#credential-switch-holds). Settling
+lifts only on the worker's acknowledgement, a stale heartbeat, worker removal
+or re-registration, never on elapsed time. A worker without in-place switching
+keeps the release-and-reclaim path and does not produce this pause.
+Design: [ADR-4201](../adr/4201-in-place-credential-switch.md).
+
 ## Not the same as a completion hold
 
 A `paused` run is not always a pause **you** asked for. A run with the

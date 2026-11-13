@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // PRD #1247 M8 — the CLI half: `uzi run get` surfaces the per-run token CHOICE, the in-flight
@@ -246,4 +249,68 @@ func credTokenValueContains(out, want string) bool {
 		}
 	}
 	return false
+}
+
+// renderFeedMessage renders one message through the human `run logs` row.
+func renderFeedMessage(t *testing.T, kind, payload string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	p := uzicli.NewPrinter(&buf, false, false, true, false)
+	if err := renderMessage(p, apitypes.MessageDTO{Seq: 9, Kind: kind, Payload: json.RawMessage(payload)}); err != nil {
+		t.Fatalf("renderMessage: %v", err)
+	}
+	return buf.String()
+}
+
+// TestRenderMessageInPlaceCredentialSwitch pins the issue #4201 feed rows: an applied in-place switch
+// (the credential_switch message carrying an ordinal) names the new token, the claim path's message
+// without an ordinal keeps the generic payload row, and the uncertain owner pause reads its fixed text.
+func TestRenderMessageInPlaceCredentialSwitch(t *testing.T) {
+	got := renderFeedMessage(t, "credential_switch", `{"label":"codex-b","select_reason":"pinned","secret_id":"s","ordinal":2}`)
+	if !strings.Contains(got, "switched in place to codex-b") {
+		t.Errorf("in-place switch row = %q", got)
+	}
+	if got := renderFeedMessage(t, "credential_switch", `{"label":null,"select_reason":"pinned","secret_id":"s","ordinal":1}`); !strings.Contains(got, "switched in place to another token") {
+		t.Errorf("unlabelled in-place switch row = %q", got)
+	}
+	claim := renderFeedMessage(t, "credential_switch", `{"label":"codex-b","select_reason":"pinned","secret_id":"s"}`)
+	if strings.Contains(claim, "in place") || !strings.Contains(claim, "select_reason") {
+		t.Errorf("claim-path switch row must keep the generic payload, got %q", claim)
+	}
+	if got := renderFeedMessage(t, "credential_switch_uncertain", `{"anything":"ignored"}`); !strings.Contains(got, "token switch outcome unknown; run paused; resume to retry") || strings.Contains(got, "ignored") {
+		t.Errorf("uncertain row = %q", got)
+	}
+}
+
+// TestRenderMessageInPlaceSwitchLabelSanitized: the label is user-authored; a control sequence or a
+// newline in it must not reach the terminal, and an over-long label is capped.
+func TestRenderMessageInPlaceSwitchLabelSanitized(t *testing.T) {
+	payload := func(label string) string {
+		b, err := json.Marshal(map[string]any{"label": label, "ordinal": 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	got := renderFeedMessage(t, "credential_switch", payload("evil\u001b[2Jname\nINJECTED"))
+	if strings.ContainsAny(got, "\x1b") || strings.Count(got, "\n") != 1 {
+		t.Errorf("label reached the terminal unsanitised: %q", got)
+	}
+	long := renderFeedMessage(t, "credential_switch", payload(strings.Repeat("x", 500)))
+	if len(long) > 400 {
+		t.Errorf("long label not capped, row length %d", len(long))
+	}
+}
+
+// TestCredentialSwitchHoldCopyDoesNotImplyRelease: an in-place worker opens the switch holds with its
+// claim kept, so the owner-facing copy for both holds says nothing about a release or a reclaim.
+func TestCredentialSwitchHoldCopyDoesNotImplyRelease(t *testing.T) {
+	for _, reason := range []string{holdCredentialSwitchSettling, holdCredentialSwitchUnsettled} {
+		r := apitypes.RunDTO{ID: "run-1", Status: statusPaused, HoldReason: sptr(reason)}
+		for _, text := range []string{credentialSwitchHoldLine(r), credentialSwitchAction(r), pausedHoldNotice(r)} {
+			if text == "" || strings.Contains(strings.ToLower(text), "releas") || strings.Contains(strings.ToLower(text), "reclaim") {
+				t.Errorf("%s copy %q must be non-empty and free of release/reclaim wording", reason, text)
+			}
+		}
+	}
 }

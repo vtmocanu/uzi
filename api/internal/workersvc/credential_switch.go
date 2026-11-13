@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -114,6 +115,13 @@ func stateUsesForUpdateFence(state string, owned store.Run) bool {
 //   - otherwise (an unexpected state: terminal, or never in a held state at this generation) →
 //     applied=false, a 409 that changed nothing, so the worker learns the run's real state.
 func (s *Service) releaseCredentialSwitch(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest) (store.Run, bool, error) {
+	// Issue #4201 m3a: a worker whose CURRENT registration negotiated in-place apply never releases
+	// a claim for a switch; the v1 release is refused with nothing written.
+	if retired, err := s.applyNegotiated(ctx, wkr.ID); err != nil {
+		return store.Run{}, false, err
+	} else if retired {
+		return owned, false, ErrCredentialSwitchReleaseRetired
+	}
 	if req.ClaimGeneration == nil {
 		// A capability worker ALWAYS stamps the generation on a release; without it the release
 		// cannot fence to an exact claim, so this is an invalid report (→ 400), not a silent no-op.
@@ -283,6 +291,44 @@ func (s *Service) runHoldSettling(ctx context.Context, runID uuid.UUID) (bool, e
 	})
 }
 
+// ErrCredentialSwitchReleaseRetired refuses a v1 credential_switch release, or an un-fenced
+// credential_switch_held, from a worker whose current registration negotiated in-place apply
+// (issue #4201 m3a). Nothing was written. The handler answers 409 with reason
+// "credential_switch_release_retired". The m2 agent never sends either, so a worker that does is a bug.
+var ErrCredentialSwitchReleaseRetired = errors.New("credential switch release is retired for an in-place apply worker")
+
+// CredentialSwitchApplyFeature is the /protocol feature this api advertises for in-place apply.
+const CredentialSwitchApplyFeature = "credential_switch_apply_v1" //nolint:gosec // G101: a protocol feature VOCABULARY name, not a credential.
+
+// stampApplyNonce stamps workers.credential_switch_apply_nonce with the registration nonce when the
+// worker advertised credential_switch_in_place_v1 and this api serves CredentialSwitchApplyFeature
+// (always, so only the capability is checked). It returns the column value for the registered row.
+// An older api replica's registration rewrites snapshot_register_nonce without stamping, which
+// leaves the two differing, so applyNegotiated reads false and the v1 reports stay accepted.
+func (s *Service) stampApplyNonce(ctx context.Context, q interface {
+	StampWorkerCredentialSwitchApplyNonce(ctx context.Context, arg store.StampWorkerCredentialSwitchApplyNonceParams) error
+}, workerID uuid.UUID, protocolCaps []string, nonce string) (pgtype.Text, error) {
+	if !slices.Contains(protocolCaps, capability.CredentialSwitchInPlaceV1) {
+		return pgtype.Text{}, nil
+	}
+	v := pgconv.TextOrNull(nonce)
+	if err := q.StampWorkerCredentialSwitchApplyNonce(ctx, store.StampWorkerCredentialSwitchApplyNonceParams{ID: workerID, Nonce: v}); err != nil {
+		return pgtype.Text{}, err
+	}
+	return v, nil
+}
+
+// applyNegotiated reports whether the worker's CURRENT registration negotiated in-place apply:
+// credential_switch_apply_nonce equals snapshot_register_nonce.
+func (s *Service) applyNegotiated(ctx context.Context, workerID uuid.UUID) (bool, error) {
+	w, err := s.q.GetWorkerByID(ctx, workerID)
+	if err != nil {
+		return false, err
+	}
+	return w.CredentialSwitchApplyNonce.Valid && w.SnapshotRegisterNonce.Valid &&
+		w.CredentialSwitchApplyNonce.String == w.SnapshotRegisterNonce.String, nil
+}
+
 // holdCredentialSwitch applies the credential_switch_held report (issue #3181): the worker could
 // not prove its local release settled, so instead of releasing the claim the run is PAUSED with
 // hold_reason credential_switch_settling. One fenced statement (HoldCredentialSwitchUnsettled)
@@ -304,6 +350,17 @@ func (s *Service) holdCredentialSwitch(ctx context.Context, owned store.Run, wkr
 	opID, err := optionalSwitchOpID(req.OpID, stateCredentialSwitchHeld)
 	if err != nil {
 		return store.Run{}, false, err
+	}
+	// Issue #4201 m3a: for an apply-negotiated registration only an op-fenced hold is accepted. The
+	// fenced statement below admits it only when op_id is the pending runs.credential_switch_op_id,
+	// and the replay branch only when the persisted hold identity matches (holdIdentityMatches), so
+	// the one shape left to refuse here is the un-fenced v1 hold. Nothing is written.
+	if !opID.Valid {
+		if retired, err := s.applyNegotiated(ctx, wkr.ID); err != nil {
+			return store.Run{}, false, err
+		} else if retired {
+			return owned, false, ErrCredentialSwitchReleaseRetired
+		}
 	}
 	rows, err := s.q.HoldCredentialSwitchUnsettled(ctx, store.HoldCredentialSwitchUnsettledParams{
 		ID: owned.ID, WorkerID: pgconv.UUID(wkr.ID), Generation: gen, RegisterNonce: req.RegisterNonce, OpID: opID,

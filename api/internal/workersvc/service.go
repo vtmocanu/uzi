@@ -1022,6 +1022,9 @@ type Store interface {
 	// credential_switch_unsettled behind the incarnation fence; CredentialSwitchHoldSettling is
 	// the fence ResumePausedRun refuses on, as a read.
 	HoldCredentialSwitchUnsettled(ctx context.Context, arg store.HoldCredentialSwitchUnsettledParams) (int64, error)
+	// StampWorkerCredentialSwitchApplyNonce records, at registration, that the registration with
+	// this nonce negotiated in-place credential apply (issue #4201 m3a); see applyNegotiated.
+	StampWorkerCredentialSwitchApplyNonce(ctx context.Context, arg store.StampWorkerCredentialSwitchApplyNonceParams) error
 	SettleCredentialSwitchHold(ctx context.Context, arg store.SettleCredentialSwitchHoldParams) (int64, error)
 	CredentialSwitchHoldSettling(ctx context.Context, arg store.CredentialSwitchHoldSettlingParams) (bool, error)
 	// SettleRunClarificationToGate / GetClarificationGateSettlementReplay are the issue #3985
@@ -2657,6 +2660,9 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 		if err != nil {
 			return store.Worker{}, "", err
 		}
+		if row.CredentialSwitchApplyNonce, err = s.stampApplyNonce(ctx, s.q, wkr.ID, protocolCaps, nonce); err != nil {
+			return store.Worker{}, "", err
+		}
 		// The snapshot is never persisted here, but a valid finalize list still applies via s.q.
 		if err := runAttested(s.q); err != nil {
 			return store.Worker{}, "", err
@@ -2707,6 +2713,9 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	// (b) Rotate the nonce + reset the epoch (folded into RegisterWorker's update).
 	row, err := qtx.RegisterWorker(ctx, regParams)
 	if err != nil {
+		return store.Worker{}, "", err
+	}
+	if row.CredentialSwitchApplyNonce, err = s.stampApplyNonce(ctx, qtx, wkr.ID, protocolCaps, nonce); err != nil {
 		return store.Worker{}, "", err
 	}
 	// Validate before any snapshot/FK write and capture the conservative union,
