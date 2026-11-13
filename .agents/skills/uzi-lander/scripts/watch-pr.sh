@@ -278,8 +278,8 @@ while [ "$i" -lt "$MAX" ]; do
     unk ci_checks
   fi
 
-  # CodeRabbit's commit STATUS on the head (context "CodeRabbit"): its description is the
-  # one place CR states why it did NOT review — "Review rate limited", "Review skipped:
+  # CodeRabbit's check-run title or legacy commit-status description on the head
+  # (lib/cr-signal.sh): the one place CR states why it did NOT review — "Review rate limited", "Review skipped:
   # reviews are disabled for this base branch" / "147 files exceed the limit of 100" /
   # "ignored keyword in the PR title" — and "Review in progress" while it works. The
   # `state` is `success` even when rate-limited, so only the description is read. Absent

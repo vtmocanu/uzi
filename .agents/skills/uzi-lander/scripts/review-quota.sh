@@ -32,7 +32,7 @@ prs=$(gh pr list --repo "$REPO" --state open --limit 50 \
   --json number,title,author,isDraft,headRefOid,updatedAt 2>/dev/null) || { echo "gh pr list failed" >&2; exit 3; }
 
 echo "== open PRs on $REPO (CodeRabbit status on head) =="
-in_progress=0; limited=0; eligible=0
+in_progress=0; limited=0; eligible=0; unknown=0
 while IFS=$'\t' read -r num author draft head title; do
   [ -z "$num" ] && continue
   elig="yes"
@@ -42,7 +42,7 @@ while IFS=$'\t' read -r num author draft head title; do
     *"[skip-cr]"*) elig="no ([skip-cr])";;
   esac
   [ "$draft" = "true" ] && elig="no (draft)"
-  desc=$(cr_head_desc "$REPO" "$head" || true)
+  desc=$(cr_head_desc "$REPO" "$head") || { desc="UNKNOWN"; unknown=$((unknown+1)); }
   case "$desc" in
     *"in progress"*) in_progress=$((in_progress+1));;
     *"rate limited"*) limited=$((limited+1));;
@@ -84,6 +84,8 @@ fi
 echo
 echo "CR_IN_PROGRESS=$in_progress"
 echo "CR_LIMITED=$limited"
+# Counts above are a floor while any head was unreadable.
+echo "CR_UNKNOWN=$unknown"
 echo "CR_ELIGIBLE_OPEN=$eligible"
 echo "UPCOMING_PUSHES=$upcoming"
 exit 0

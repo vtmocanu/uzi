@@ -53,6 +53,24 @@ want "newer status" "Review rate limited"
 set_case '{"statuses":[]}' "{\"check_runs\":[$(run 9 in_progress null 2026-11-13T07:00:00Z null ''),$(run 8 completed '"skipped"' 2026-11-13T06:52:01Z '"2026-11-13T06:52:01Z"' 'Review skipped: x')]}"
 want "in progress" "Review in progress"
 
+# Conservative precedence: a pending review is never hidden.
+# A queued check-run (no timestamps) beats an older skip status.
+set_case '{"statuses":[{"context":"CodeRabbit","description":"Review skipped: x","updated_at":"2026-11-13T06:00:00Z"}]}' \
+  '{"check_runs":[{"id":7,"app":{"slug":"coderabbitai"},"name":"CodeRabbit","status":"queued","conclusion":null,"started_at":null,"completed_at":null,"output":{"title":null}}]}'
+want "queued check-run vs older skip" "Review in progress"
+# An in-progress status at the same time as a finished check-run stays in progress.
+set_case '{"statuses":[{"context":"CodeRabbit","description":"Review in progress","updated_at":"2026-11-13T07:00:00Z"}]}' \
+  "{\"check_runs\":[$(run 5 completed '"success"' 2026-11-13T06:59:00Z '"2026-11-13T07:00:00Z"' 'Finished')]}"
+want "equal-time in-progress status" "Review in progress"
+# Settled tie: the check-run (current channel) wins.
+set_case '{"statuses":[{"context":"CodeRabbit","description":"Review completed","updated_at":"2026-11-13T07:00:00Z"}]}' \
+  "{\"check_runs\":[$(run 5 completed '"skipped"' 2026-11-13T06:59:00Z '"2026-11-13T07:00:00Z"' 'Review skipped: y')]}"
+want "settled tie" "Review skipped: y"
+# A settled status with no timestamp counts as newest.
+set_case '{"statuses":[{"context":"CodeRabbit","description":"Review rate limited"}]}' \
+  "{\"check_runs\":[$(run 5 completed '"success"' 2026-11-13T06:59:00Z '"2026-11-13T07:00:00Z"' 'Finished')]}"
+want "undated status" "Review rate limited"
+
 # Another app's run is ignored; nothing from CodeRabbit is absent ("").
 set_case '{"statuses":[{"context":"ci","description":"ok","updated_at":"2026-11-13T06:00:00Z"}]}' \
   '{"check_runs":[{"id":1,"app":{"slug":"github-actions"},"name":"CI","status":"completed","conclusion":"success","completed_at":"2026-11-13T06:00:00Z","output":{"title":"Review skipped: not CR"}}]}'
@@ -64,4 +82,4 @@ if cr_head_desc test/repo deadbeef >/dev/null; then fail "unreadable check-runs 
 set_case 'garbage' '{"check_runs":[]}'
 if cr_head_desc test/repo deadbeef >/dev/null; then fail "garbage status was not rc 1"; fi
 
-echo "PASS cr-signal: check-run skip, legacy status, newer channel wins, in progress, other apps ignored, fail closed"
+echo "PASS cr-signal: check-run skip, legacy status, newer channel wins, in progress, pending never hidden, ties to check-run, undated newest, other apps ignored, fail closed"
