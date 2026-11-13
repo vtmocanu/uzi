@@ -497,7 +497,11 @@ test("a launch that fails after the supervisor spawned kills it, poisons the lan
 
 test("the supervisor root is recorded synchronously at spawn and removed on a confirmed drain", { timeout: 10000 }, async () => {
   const gate = deferred<void>();
+  const rootLogs: Array<{ msg: string; fields: Record<string, unknown> }> = [];
   const h = harness({
+    log: { ...log, info: (msg: string, fields?: Record<string, unknown>) => {
+      if (msg.startsWith("guarded command supervisor root ")) rootLogs.push({ msg, fields: fields ?? {} });
+    } },
     launch: async (spec) => {
       const root = fakeRoot();
       spec.onSpawned?.({ pid: 77, startTime: 9001 }, root.child);
@@ -512,6 +516,17 @@ test("the supervisor root is recorded synchronously at spawn and removed on a co
   gate.resolve();
   assert.match(text(await pending), /^Exit code: 0/);
   assert.deepEqual(h.lane.recordedRoots(), [], "dropped after the drain");
+  assert.deepEqual(rootLogs.map(entry => entry.msg), [
+    "guarded command supervisor root recorded", "guarded command supervisor root disposed",
+  ]);
+  for (const entry of rootLogs) {
+    assert.deepEqual(Object.keys(entry.fields).sort(), ["command_id", "pid", "run_id", "start_time"]);
+    assert.equal(entry.fields.run_id, "11111111-1111-4111-8111-111111111111");
+    assert.equal(entry.fields.pid, 77);
+    assert.equal(entry.fields.start_time, 9001);
+    assert.match(String(entry.fields.command_id), /^[0-9a-f-]{36}$/);
+  }
+  assert.equal(rootLogs[0]?.fields.command_id, rootLogs[1]?.fields.command_id);
 
   // A root whose start time could not be read cannot be recorded by identity. issue #3915: it
   // is logged, since a peer run's quiescence proof then cannot attribute that supervisor.
@@ -525,6 +540,21 @@ test("the supervisor root is recorded synchronously at spawn and removed on a co
   await noTime.call({ command: "echo hi" });
   assert.deepEqual(noTime.lane.recordedRoots(), []);
   assert.deepEqual(warns, [["guarded command supervisor root not recorded: start time unreadable", { pid: 78 }]]);
+});
+
+test("a failing supervisor-root info logger cannot change launch or confirmed disposal", async () => {
+  const h = harness({
+    log: { ...log, info: () => { throw new Error("diagnostic sink failed"); } },
+    launch: async spec => {
+      const root = fakeRoot({ supervisorPid: 79 });
+      spec.onSpawned?.({ pid: 79, startTime: 9002 }, root.child);
+      setImmediate(() => root.exitWith(0));
+      return { handle: root.handle, child: root.child };
+    },
+  });
+  assert.match(text(await h.call({ command: "echo hi" })), /^Exit code: 0/);
+  assert.equal(h.lane.poisoned, false);
+  assert.deepEqual(h.lane.recordedRoots(), []);
 });
 
 // -- deadline, abort, output -------------------------------------------------------------------

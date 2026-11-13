@@ -1957,3 +1957,26 @@ worker-uid namespace-teardown proof locally; the LiveDB regression locally. The
 end-to-end phase 45 and 52 helpers are tested hermetically only (`lib.test.sh`); the
 live end-to-end run is pending exact-head CI. Hosted slots, power-loss durability and
 rollback after a restore are not claimed.
+
+## Amendment 2026-11-13: one fresh-root reproof after a concurrent launch (#3915)
+
+The worker snapshots other live attempts' exact PID and start-time roots before its
+process helper enumerates procfs. A peer may record a new supervisor root between
+those steps. The helper then reports that non-dumpable process as
+`unreadable_unattributed`, even though a later root snapshot can identify it.
+
+When the first process proof is non-quiescent solely for
+`unreadable_unattributed` entries, had no authority to kill unattributed
+processes and killed nothing, the worker may take one
+fresh root snapshot. It starts one new, complete process proof only if a newly
+recorded exact root has a PID among an unattributed entry's candidate PIDs and
+the applicable deadline still has time. The second proof supplies the verdict;
+the first proof's diagnostic trace never grants quiescence. A mixed blocker,
+absent root, reused PID with another start time, or expired budget remains
+unverified. This adds no kill authority and does not relax the #1854 rule.
+
+The worker logs the reproof outcome on a refusal and records guarded-command
+supervisor spawn and confirmed disposal by run ID, command ID, PID and start
+time. These records are diagnostic only. The observed occurrence supports the
+snapshot-race explanation but does not establish which claim spawned its
+supervisor.

@@ -1401,6 +1401,8 @@ export interface ProcessQuiescence {
   /** Pids SIGKILLed during the reap. */
   killed: number[];
   detail: string;
+  /** Worker-side only: whether a fresh-root process reproof ran. Never supplied by the helper. */
+  rootReproof?: "none" | "quiescent" | "unverified";
   /** issue #3915: the other-attempt roots the scan was given. Set by {@link quiesceRunAttempt} on
    *  the worker side, never by the helper. */
   rootContext?: RootContext;
@@ -2680,6 +2682,7 @@ export function collectLiveRoots(
 export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRunDeps = {}): Promise<QuiesceRunOutcome> {
   let processResult: ProcessQuiescence | undefined;
   let rootContext: RootContext | undefined;
+  let rootReproof: "none" | "quiescent" | "unverified" = "none";
   const producerWorkLimits = req.producerWorkLimits === undefined ? deps.reap?.producerWorkLimits : req.producerWorkLimits;
   try {
     validateProducerWorkLimits(producerWorkLimits, req.mode, req.workerWide);
@@ -2708,19 +2711,49 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       liveRoots: collected.roots,
       workerNonce: workerSpawnNonce(),
     };
-    if (uidSplitActive() && hasReaperCaptureScope()) {
+    const scoped = uidSplitActive() && hasReaperCaptureScope();
+    if (scoped) {
       if (producerWorkLimits !== undefined) return {
         process: { state: "unverified", processes: [], killed: [], detail: "scoped producer work limits unsupported" },
         docker: { state: "not_wired", removed: [], detail: "" },
       };
-      try {
-        processResult = await reapScopedRunProcesses(req, scan, deps);
-      } catch {
-        processResult = { state: "unverified", processes: [], killed: [], detail: "scoped reaper refused or failed" };
+    }
+    const prove = (candidate: ScanRequest): Promise<ProcessQuiescence> => scoped
+      ? reapScopedRunProcesses(req, candidate, deps).catch(() =>
+        ({ state: "unverified", processes: [], killed: [], detail: "scoped reaper refused or failed" }))
+      : reapRunProcesses(req.reportBudget ? { ...candidate, reportDeadline: req.reportBudget.deadline } : candidate,
+        req.reportBudget ? { ...reapOptions, reportBudget: req.reportBudget,
+          deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : reapOptions);
+    processResult = await prove(scan);
+
+    // A peer can launch a non-dumpable supervisor after the worker snapshots roots but before
+    // the helper enumerates procfs. Never bless the old verdict from its diagnostic trace: only
+    // one fresh, complete process proof may clear that refusal. Retry only when the first scan
+    // had no unattributed-process kill authority and killed nothing, so this path cannot extend
+    // a kill window or add effects after a partial reap.
+    const onlyUnattributed = scan.mayKillUnreadableUnattributed !== true &&
+      processResult.state === "unverified" && processResult.killed.length === 0 &&
+      processResult.processes.length > 0 &&
+      processResult.processes.every(p => p.reason === "unreadable_unattributed");
+    const now = Date.now();
+    const scope = scopes.getStore();
+    const ambient = MaintenanceBudget.current();
+    const timeLeft = (req.deadlineAt === undefined || now < req.deadlineAt) &&
+      (req.reportBudget === undefined || (!req.reportBudget.signal.aborted && now < req.reportBudget.deadline)) &&
+      (!scope || (!scope.signal.aborted && now < scope.deadlineAt)) &&
+      (!ambient || (!ambient.signal.aborted && ambient.remainingMs() > 0));
+    if (onlyUnattributed && timeLeft) {
+      const freshOthers = req.registry.others(req.attempt?.marker);
+      const fresh = collectLiveRoots(freshOthers, workerRunnerRootPids());
+      const before = new Set(scan.liveRoots.map(root => `${root.pid}:${root.startTime}`));
+      const candidates = new Set(processResult.processes.flatMap(p =>
+        [p.pid, ...(p.attribution?.candidates.map(c => c.pid) ?? [])]));
+      if (fresh.roots.some(root => !before.has(`${root.pid}:${root.startTime}`) && candidates.has(root.pid))) {
+        rootContext = fresh.context;
+        processResult = await prove({ ...scan, liveRoots: fresh.roots, liveMarkers: freshOthers.map(a => a.marker) });
+        rootReproof = processResult.state === "quiescent" ? "quiescent" : "unverified";
       }
-    } else processResult = await reapRunProcesses(req.reportBudget ? { ...scan, reportDeadline: req.reportBudget.deadline } : scan,
-      req.reportBudget ? { ...reapOptions, reportBudget: req.reportBudget,
-        deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : reapOptions);
+    }
   }
   // issue #3980: the Docker request is admitted only before the gate deadline and bounded by what is
   // left; past it nothing is sent and a quiescent process verdict is withdrawn (unverified).
@@ -2741,7 +2774,12 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
   if (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) {
     processResult = { state: "unverified", processes: [], killed: processResult?.killed ?? [], detail: "maintenance deadline exhausted" };
   }
-  if (processResult && processResult.state !== "quiescent" && rootContext) processResult = { ...processResult, rootContext };
+  if (processResult && rootReproof !== "none") {
+    processResult = { ...processResult, rootReproof: processResult.state === "quiescent" ? "quiescent" : "unverified" };
+  }
+  if (processResult && processResult.state !== "quiescent" && rootContext) {
+    processResult = { ...processResult, rootContext, rootReproof: processResult.rootReproof ?? "none" };
+  }
   return { process: processResult, docker };
 }
 

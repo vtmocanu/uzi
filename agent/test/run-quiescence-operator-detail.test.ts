@@ -219,6 +219,7 @@ describe("issue #1783 M2: the run's failure_reason and warn line name the blocki
     assert.ok(reason.includes(`pid ${PID} "ssh-agent" could not be attributed`), reason);
     const warn = notQuiescentLines(lines).find((l) => l.site === "finalize");
     assert.ok(warn, "the finalize proof logged its block");
+    assert.equal(warn.root_reproof, "none", "ordinary refusals name the absence of a root reproof");
     assert.match(String(warn.detail), /pid 4242 "ssh-agent" could not be attributed/);
     assert.deepEqual(
       (warn.processes as Array<Record<string, unknown>>).map((p) => [p.pid, p.comm, p.attribution]),
