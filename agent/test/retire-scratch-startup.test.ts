@@ -225,6 +225,8 @@ const rows = (): Row[] => lines.filter((l) => (l as { msg?: string }).msg === OU
 const totals = (): Total[] => lines.filter((l) => (l as { msg?: string }).msg === TOTAL) as Total[];
 const run = (opts: Opts = {}, start = OLD) => git.inspectRetireScratchAtStartup(start, { outcomes: true, ...opts });
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
+const PROC_FD_REQUIRED = { skip: HAS_PROC_FD ? false : "no /proc/self/fd on this host: the pinned walk refuses here by design" };
 const fdCount = () => fs.readdirSync("/proc/self/fd").length;
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 /** Allocated bytes of the listed fixture paths: lstat blocks * 512, an inode (hard link) once. */
@@ -311,7 +313,7 @@ async function observeOne(parentName: string, opts: Opts = {}, start = OLD): Pro
 }
 
 describe("retire scratch outcome records (#4143)", () => {
-  it("an empty parent is kept with no disposition evidence", async () => {
+  it("an empty parent is kept with no disposition evidence", PROC_FD_REQUIRED, async () => {
     mkParent(".retire-empty");
     const r = await observeOne(".retire-empty");
     assert.equal(r.kind, "dir");
@@ -324,7 +326,7 @@ describe("retire scratch outcome records (#4143)", () => {
     assert.equal(r.recent, false);
   });
 
-  it("an interrupted rename (journal names the canonical path, which is absent) is kept, not named", async () => {
+  it("an interrupted rename (journal names the canonical path, which is absent) is kept, not named", PROC_FD_REQUIRED, async () => {
     const parent = mkParent(".retire-rename", { "clone/src/a.txt": "work", "clone/.git": "gitdir: x" });
     const canonical = path.join(root, "slug", "issue-1");
     assert.equal(fs.existsSync(canonical), false);
@@ -349,7 +351,7 @@ describe("retire scratch outcome records (#4143)", () => {
     assert.equal(r.retained_source, "not_named");
   });
 
-  it("a partial worker-side removal and an unknown-owner remnant are kept and measured", async () => {
+  it("a partial worker-side removal and an unknown-owner remnant are kept and measured", PROC_FD_REQUIRED, async () => {
     const a = mkParent(".retire-partial", { "clone/node_modules/x/y.js": "y".repeat(5000), "clone/keep": "k" });
     fs.mkdirSync(path.join(a, "clone", "removed-dir"));
     const r = await observeOne(".retire-partial");
@@ -365,7 +367,7 @@ describe("retire scratch outcome records (#4143)", () => {
     assert.equal(rb.bytes, alloc(b, jb("uid-unknown"), jb("uid-unknown", ".hidden"), jb("uid-unknown", "sub"), jb("uid-unknown", "sub", "f")));
   });
 
-  it("a mode-000 directory inside is partial with the unreadable reason, never opened by name", async (t) => {
+  it("a mode-000 directory inside is partial with the unreadable reason, never opened by name", PROC_FD_REQUIRED, async (t) => {
     const parent = mkParent(".retire-locked", { "open/f": "x" });
     const locked = path.join(parent, "locked");
     fs.mkdirSync(locked);
@@ -394,7 +396,7 @@ describe("retire scratch outcome records (#4143)", () => {
     assert.equal(warnings()[0]!.count, 0);
   });
 
-  it("a symlink parent and a regular-file parent count only their own lstat and are never followed", async () => {
+  it("a symlink parent and a regular-file parent count only their own lstat and are never followed", PROC_FD_REQUIRED, async () => {
     const outside = path.join(fx.dataDir, "outside");
     fs.mkdirSync(outside);
     fs.writeFileSync(path.join(outside, "big"), Buffer.alloc(1024 * 1024, 1));
@@ -412,6 +414,24 @@ describe("retire scratch outcome records (#4143)", () => {
     assert.equal(byName.get(".retire-file")!.kind, "other");
     assert.equal(byName.get(".retire-file")!.bytes, alloc(path.join(root, ".retire-file")));
     assert.equal(byName.get(".retire-file")!.bytes_state, "measured");
+  });
+
+  it("an unsupported proc-fd host reports unknown bytes and leaves every parent unchanged", async () => {
+    mkParent(".retire-unsupported", { "clone/f": "retained work" });
+    const before = snapshot(root);
+    const lstat = fsp.lstat.bind(fsp);
+    mock.method(fsp, "lstat", (...args: Parameters<typeof fsp.lstat>) => {
+      if (String(args[0]).startsWith("/proc/self/fd/")) {
+        return Promise.reject(Object.assign(new Error("proc-fd unavailable"), { code: "ENOENT" }));
+      }
+      return lstat(...args);
+    });
+    await run({ readRetainedSources: async () => ({ state: "read", paths: [] }) });
+    assert.deepEqual(snapshot(root), before);
+    assert.equal(rows()[0]!.outcome, "kept");
+    assert.equal(rows()[0]!.bytes_state, "unknown");
+    assert.equal(totals()[0]!.bytes_state, "unknown");
+    assert.equal(totals()[0]!.reclaimed, 0);
   });
 });
 
@@ -673,7 +693,7 @@ describe("retire scratch budget and settlement (#4143)", () => {
     assert.equal(total?.retained_source_read, "unknown");
   });
 
-  it("a clock past the deadline mid-walk caps the walk with time_cap", async () => {
+  it("a clock past the deadline mid-walk caps the walk with time_cap", PROC_FD_REQUIRED, async () => {
     mkParent(".retire-big", Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`f${i}`, "x".repeat(4096)])));
     const t0 = Date.now();
     let late = false;
@@ -696,7 +716,7 @@ describe("retire scratch budget and settlement (#4143)", () => {
     assert.equal(totals()[0]!.bytes_state, "unknown");
   });
 
-  it("settles before returning: the lock re-acquires at once, no git child and no handle remains", async () => {
+  it("settles before returning: the lock re-acquires at once, no git child and no handle remains", PROC_FD_REQUIRED, async () => {
     for (const n of ["r1", "r2"]) setConfig(mkBare(n), RECOVERY, journal(path.join(root, "slug", n)));
     mkParent(".retire-b", { "d/e/f": "x" });
     const gitChildren = (): number => {
@@ -720,7 +740,7 @@ describe("retire scratch budget and settlement (#4143)", () => {
     assert.equal(fdCount(), fdsBefore, "no descriptor leaked");
   });
 
-  it("leaks no descriptor after a cap stop or an unknown read", async () => {
+  it("leaks no descriptor after a cap stop or an unknown read", PROC_FD_REQUIRED, async () => {
     mkParent(".retire-c", Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`d${i}/f`, "x"])));
     const before = fdCount();
     await run({ walkLimits: { maxEntries: 3 } });
@@ -731,6 +751,72 @@ describe("retire scratch budget and settlement (#4143)", () => {
 });
 
 describe("retire scratch output bound (#4143)", () => {
+  it("an expired budget does not normalize retained paths for many parents", async () => {
+    for (let i = 0; i < 64; i++) mkParent(`.retire-${i}`);
+    const paths = Array.from({ length: 128 }, (_, i) => `/retire-classification-fixture/${i}/clone`);
+    const before = snapshot(root);
+    const start = Date.now();
+    let expired = false;
+    let normalized = 0;
+    const resolve = path.resolve.bind(path);
+    mock.method(path, "resolve", (...args: string[]) => {
+      if (args[0]?.startsWith("/retire-classification-fixture/")) normalized++;
+      return resolve(...args);
+    });
+    await run({ now: () => expired ? start + 31_000 : start,
+      readRetainedSources: async () => { expired = true; return { state: "read", paths }; } });
+    assert.equal(normalized, 0, "expired classification must not scan or normalize source paths");
+    assert.equal(totals()[0]!.retained_source_read, "unknown");
+    assert.ok(rows().every(r => r.outcome === "kept" && r.retained_source === "unknown"));
+    assert.deepEqual(snapshot(root), before);
+  });
+
+  it("normalizes each retained path once across many parents and the total", async () => {
+    const parents = Array.from({ length: 64 }, (_, i) => mkParent(`.retire-${i}`));
+    const paths = Array.from({ length: 128 }, (_, i) => `${parents[i % parents.length]}/clone/${i}`);
+    const start = Date.now();
+    const normalized = new Map<string, number>();
+    const resolve = path.resolve.bind(path);
+    mock.method(path, "resolve", (...args: string[]) => {
+      if (paths.includes(args[0]!)) {
+        const count = (normalized.get(args[0]!) ?? 0) + 1;
+        normalized.set(args[0]!, count);
+        assert.equal(count, 1, "a source path is normalized once, not once per parent or output row");
+      }
+      return resolve(...args);
+    });
+    await run({ now: () => start, readRetainedSources: async () => ({ state: "read", paths }) });
+    assert.equal(normalized.size, paths.length);
+    assert.equal(totals()[0]!.protected_by_retained_source, parents.length);
+    assert.equal(totals()[0]!.outcomes_omitted, parents.length - 10);
+    assert.ok(rows().every(r => r.outcome === "kept" && r.retained_source === "named"));
+  });
+
+  for (const stop of ["deadline", "abort"] as const) {
+    it(`stops retained-path classification on ${stop} and reports all attribution unknown`, async () => {
+      const parent = mkParent(".retire-stop");
+      const paths = Array.from({ length: 16 }, (_, i) => `${parent}/clone/${i}`);
+      const start = Date.now();
+      const controller = new AbortController();
+      let stopped = false;
+      let normalized = 0;
+      const resolve = path.resolve.bind(path);
+      mock.method(path, "resolve", (...args: string[]) => {
+        if (paths.includes(args[0]!)) {
+          normalized++;
+          if (normalized === 3) { stopped = true; if (stop === "abort") controller.abort(); }
+        }
+        return resolve(...args);
+      });
+      await run({ now: () => stopped && stop === "deadline" ? start + 31_000 : start,
+        signal: controller.signal, readRetainedSources: async () => ({ state: "read", paths }) });
+      assert.equal(normalized, 3, "no further path is processed after cancellation or expiry");
+      assert.equal(totals()[0]!.retained_source_read, "unknown");
+      assert.equal(totals()[0]!.protected_by_retained_source, 0);
+      assert.equal(rows()[0]!.retained_source, "unknown");
+    });
+  }
+
   it("25 parents give 10 rows and a total over all of them", async () => {
     const parents: string[] = [];
     for (let i = 0; i < 25; i++) parents.push(mkParent(`.retire-${String(i).padStart(2, "0")}`, { "clone/f": "x".repeat(1000 * (i + 1)) }));
@@ -746,8 +832,12 @@ describe("retire scratch output bound (#4143)", () => {
     assert.equal(t[0]!.outcomes_omitted, 15);
     assert.equal(t[0]!.kept, 25);
     assert.equal(t[0]!.reclaimed, 0);
-    assert.equal(t[0]!.bytes, expectedBytes, "bytes cover all 25, not just the reported rows");
-    assert.equal(t[0]!.bytes_state, "measured");
+    if (HAS_PROC_FD) {
+      assert.equal(t[0]!.bytes, expectedBytes, "bytes cover all 25, not just the reported rows");
+      assert.equal(t[0]!.bytes_state, "measured");
+    } else {
+      assert.equal(t[0]!.bytes_state, "unknown");
+    }
     assert.equal(t[0]!.protected_by_retained_source, 3);
     assert.equal(t[0]!.no_disposition_evidence, 22);
     assert.equal(t[0]!.protected_by_retained_source + t[0]!.no_disposition_evidence, 25);
@@ -813,7 +903,7 @@ describe("retire scratch single total (#4143)", () => {
   });
 });
 
-describe("retire scratch walk (#4143)", () => {
+describe("retire scratch walk (#4143)", PROC_FD_REQUIRED, () => {
   it("two hard-linked symlink parents count their one inode once", async (t) => {
     const a = path.join(root, ".retire-a");
     fs.symlinkSync("t".repeat(300), a);

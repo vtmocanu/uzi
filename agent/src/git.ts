@@ -19423,7 +19423,7 @@ export class GitCache {
     }): Promise<void> {
     const signal = opts.signal ?? new AbortController().signal;
     // No parents: nothing to attribute or walk, so no journal read is attempted.
-    const sources: RetireScratchSources = parents.length === 0 ? { state: "not_attempted" }
+    let sources: RetireScratchSources = parents.length === 0 ? { state: "not_attempted" }
       : opts.readRetainedSources
         ? await opts.readRetainedSources().catch((): RetireScratchSources => ({ state: "unknown" }))
         : await this.readRetireScratchSources(signal, deadline, opts.limits, opts.now ?? Date.now);
@@ -19433,6 +19433,24 @@ export class GitCache {
       ...(opts.beforeEntry ? { beforeEntry: opts.beforeEntry } : {}),
       ...(opts.beforeOpen ? { beforeOpen: opts.beforeOpen } : {}),
     };
+    // Classify each source once, while the shared budget still admits work. Rows and
+    // totals only look up a top-level parent name, never re-scan/normalize every path.
+    const namedParents = new Set<string>();
+    if (sources.state === "read") {
+      const prefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+      for (const source of sources.paths) {
+        if (retireWalkSpent(ctx)) break;
+        const normalized = path.resolve(source);
+        if (!normalized.startsWith(prefix)) continue;
+        const relative = normalized.slice(prefix.length);
+        const slash = relative.indexOf(path.sep);
+        namedParents.add(slash < 0 ? relative : relative.slice(0, slash));
+      }
+      if (retireWalkSpent(ctx)) {
+        sources = { state: "unknown" };
+        namedParents.clear();
+      }
+    }
     const results: RetireScratchParentResult[] = [];
     let rootHandle: FileHandle | undefined;
     try {
@@ -19453,16 +19471,11 @@ export class GitCache {
     } finally {
       await rootHandle?.close().catch(() => undefined);
     }
-    const named = (name: string): boolean => {
-      if (sources.state !== "read") return false;
-      const p = path.join(root, name);
-      return sources.paths.some((q) => [q, path.resolve(q)].some((c) => c === p || c.startsWith(`${p}/`)));
-    };
     const row = (r: RetireScratchParentResult): {
       retained_source: "named" | "not_named" | "unknown"; reason: "protected_by_retained_source" | "no_disposition_evidence";
     } => {
       if (sources.state !== "read") return { retained_source: "unknown", reason: "no_disposition_evidence" };
-      return named(r.name) ? { retained_source: "named", reason: "protected_by_retained_source" }
+      return namedParents.has(r.name) ? { retained_source: "named", reason: "protected_by_retained_source" }
         : { retained_source: "not_named", reason: "no_disposition_evidence" };
     };
     for (const r of results.slice(0, RETIRE_SCRATCH_REPORTED_PATHS)) {
