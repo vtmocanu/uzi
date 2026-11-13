@@ -3246,7 +3246,7 @@ async function retireWalkParent(ctx: RetireScratchWalkCtx, rootFd: number, rootD
       await ctx.beforeEntry?.(root, parent.name);
       const openPath = `/proc/self/fd/${rootFd}/${parent.name}`;
       const lst = await fs.lstat(openPath, { bigint: true });
-      if (lst.isSymbolicLink()) { kind = "symlink"; retireWalkAddBlocks(ctx, acc, lst, false); }
+      if (lst.isSymbolicLink()) { kind = "symlink"; retireWalkAddBlocks(ctx, acc, lst, true); }
       else if (!lst.isDirectory()) { kind = "other"; retireWalkAddBlocks(ctx, acc, lst, true); }
       else {
         kind = "dir";
@@ -19343,7 +19343,8 @@ export class GitCache {
 
   /** issue #4143 — the typed, read-only journal read for {@link inspectRetireScratchAtStartup}. One
    *  absolute `deadline`, awaited to settlement; any failure of any kind is `unknown`. */
-  private async readRetireScratchSources(signal: AbortSignal, deadline: number, limitsOverride: EpochRetainedLimits | undefined): Promise<RetireScratchSources> {
+  private async readRetireScratchSources(signal: AbortSignal, deadline: number, limitsOverride: EpochRetainedLimits | undefined,
+    now: () => number): Promise<RetireScratchSources> {
     try {
       const limits = this.epochLimits(limitsOverride);
       const paths = new Set<string>();
@@ -19354,17 +19355,21 @@ export class GitCache {
           this.checkRecoveryInterruption();
           await this.withLock(bare, async () => {
             const entries = await this.configEntries(bare);
-            // Charge before any decode: raw bytes, then records.
+            // Charge before any decode: raw bytes, then records (both before the key-parsing loop).
             for (const item of entries) configBytes += Buffer.byteLength(item) + 1;
             if (configBytes > limits.maxMetadataBytes) throw new Error("retire scratch metadata byte limit");
             records += entries.length;
+            if (records > limits.maxMetadataRecords) throw new Error("retire scratch metadata record limit");
             const branches = new Set<string>();
+            // Last recovery raw value per branch, one pass, for the closure pre-charge below.
+            const lastRecoveryRaw = new Map<string, string>();
             for (const item of entries) {
               const nl = item.indexOf("\n");
               const key = nl < 0 ? item : item.slice(0, nl);
               const recovery = /^uzi-recovery\.(.+)\.clone$/.exec(key);
               // A valueless recovery key is not a cleared value: undecodable evidence.
               if (recovery && nl < 0) throw new Error("valueless recovery journal key");
+              if (recovery) lastRecoveryRaw.set(recovery[1]!, item.slice(nl + 1));
               const branch = recovery?.[1] ?? restoreKeyBranch(key);
               if (branch !== undefined) branches.add(branch);
             }
@@ -19379,10 +19384,12 @@ export class GitCache {
               }
             };
             for (const branch of [...branches].sort()) {
+              // Bounded by the one absolute deadline even when every await settles on a microtask.
+              if (now() >= deadline) throw new Error("retire scratch deadline");
+              this.checkRecoveryInterruption();
               // Charge the decoded bytes the resolver will parse BEFORE it parses them.
               if (closure) {
-                const pPrefix = `${recoveryCaptureKey(branch)}\n`;
-                const pRaw = entries.filter((item) => item.startsWith(pPrefix)).at(-1)?.slice(pPrefix.length) ?? "";
+                const pRaw = lastRecoveryRaw.get(branch) ?? "";
                 closure.delivered += Buffer.byteLength(pRaw) + Buffer.byteLength(this.restoreValueIn(entries, branch) ?? "");
                 if (closure.delivered > closure.limit) throw new Error("retire scratch decoded journal limit");
               }
@@ -19419,7 +19426,7 @@ export class GitCache {
     const sources: RetireScratchSources = parents.length === 0 ? { state: "not_attempted" }
       : opts.readRetainedSources
         ? await opts.readRetainedSources().catch((): RetireScratchSources => ({ state: "unknown" }))
-        : await this.readRetireScratchSources(signal, deadline, opts.limits);
+        : await this.readRetireScratchSources(signal, deadline, opts.limits, opts.now ?? Date.now);
     const ctx: RetireScratchWalkCtx = {
       now: opts.now ?? Date.now, deadline, signal, entries: 0,
       maxEntries: opts.walkLimits?.maxEntries ?? RETIRE_SCRATCH_WALK_MAX_ENTRIES, seen: new Set(),

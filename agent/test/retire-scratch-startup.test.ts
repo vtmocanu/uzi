@@ -585,6 +585,64 @@ describe("retire scratch budget and settlement (#4143)", () => {
     assert.equal(totals()[0]!.retained_source_read, "unknown");
   });
 
+  it("an abort inside bare enumeration is unknown and no bare is locked or read afterwards", async () => {
+    for (const n of ["r1", "r2"]) setConfig(mkBare(n), RECOVERY, journal(path.join(root, "slug", n)));
+    const calls = spy();
+    const stop = new AbortController();
+    const seam = git as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    const enumerate = seam.retainedBares!.bind(git);
+    mock.method(seam, "retainedBares", async (...a: unknown[]) => {
+      stop.abort();
+      const bares = await enumerate(...a);
+      calls.withLock.length = 0;
+      calls.configs.length = 0;
+      return bares;
+    });
+    await run({ signal: stop.signal });
+    assert.equal(totals()[0]!.retained_source_read, "unknown");
+    assert.equal(calls.withLock.length, 0, "no bare lock after the abort");
+    assert.equal(calls.configs.length, 0, "no config read after the abort");
+  });
+
+  it("the branch loop stops at the deadline even when every await settles on a microtask", async () => {
+    const bare = mkBare();
+    for (let i = 1; i <= 6; i++) setConfig(bare, `uzi-recovery.agent/issue-${i}.clone`, "");
+    const seam = git as unknown as Record<string, (...a: unknown[]) => unknown>;
+    const resolver = mock.method(seam, "resolveBranchJournalUnderLock", seam.resolveBranchJournalUnderLock!.bind(git));
+    const t0 = Date.now();
+    await run({ now: () => (resolver.mock.callCount() >= 2 ? t0 + 31_000 : t0) });
+    assert.equal(totals()[0]!.retained_source_read, "unknown");
+    assert.ok(resolver.mock.callCount() < 6, `the resolver ran ${resolver.mock.callCount()} times for 6 branches`);
+  });
+
+  it("every git call settles before the inspector resolves, even past the deadline", async () => {
+    setConfig(mkBare(), RECOVERY, journal(path.join(root, "slug", "r1")));
+    const seam = git as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    const realRunGit = seam.runGit!.bind(git);
+    let seq = 0;
+    let late = false;
+    let first = true;
+    const settled: number[] = [];
+    mock.method(seam, "runGit", (...a: unknown[]) => {
+      const slow = first;
+      first = false;
+      const p = (async () => {
+        if (slow) { await sleep(150); late = true; }
+        return realRunGit(...a);
+      })();
+      const idx = settled.push(-1) - 1;
+      const mark = (): void => { settled[idx] = ++seq; };
+      p.then(mark, mark);
+      return p;
+    });
+    const t0 = Date.now();
+    await run({ now: () => (late ? t0 + 31_000 : t0) });
+    const resolvedAt = ++seq;
+    assert.ok(settled.length > 0, "git was called");
+    assert.ok(settled.every((s) => s > 0 && s < resolvedAt), `every git call settled first: ${settled.join(",")} < ${resolvedAt}`);
+    assert.equal(totals()[0]!.retained_source_read, "unknown");
+  });
+
   const limitCases: Array<[string, NonNullable<Opts["limits"]>, number]> = [
     ["maxBares", { maxBares: 1 }, 0],
     ["maxMetadataBytes", { maxMetadataBytes: 16 }, 1],
@@ -756,6 +814,17 @@ describe("retire scratch single total (#4143)", () => {
 });
 
 describe("retire scratch walk (#4143)", () => {
+  it("two hard-linked symlink parents count their one inode once", async (t) => {
+    const a = path.join(root, ".retire-a");
+    fs.symlinkSync("t".repeat(300), a);
+    fs.linkSync(a, path.join(root, ".retire-b"));
+    if (fs.lstatSync(a).nlink !== 2 || fs.lstatSync(a).blocks === 0) { t.skip("filesystem cannot hard-link or allocate blocks for a symlink"); return; }
+    await run();
+    assert.equal(rows().length, 2);
+    assert.equal(totals()[0]!.bytes, alloc(a), "the shared inode is counted once");
+    assert.equal(totals()[0]!.bytes_state, "measured");
+  });
+
   it("measures an exact allocated total with a hard link counted once", async () => {
     const p = mkParent(".retire-w", { "a/one": Buffer.alloc(100_000, 1), "b/c/two": Buffer.alloc(9000, 2) });
     fs.linkSync(path.join(p, "a/one"), path.join(p, "b/c/one-again"));
