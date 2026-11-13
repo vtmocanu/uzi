@@ -37,7 +37,7 @@ func canonicalTargetSQL(ctx context.Context, t *testing.T, pool *pgxpool.Pool, r
 // semicolons, and strips prose comments before splitting ordinary SQL statements.
 func migrationUpStatements(t *testing.T, name string) []string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("migrations", name))
+	b, err := os.ReadFile(filepath.Join("migrations", name)) //nolint:gosec // G304: test reads a repo-local migration file by fixed name under migrations/, not user input
 	if err != nil {
 		t.Fatalf("read migration %s: %v", name, err)
 	}
