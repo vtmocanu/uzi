@@ -13543,7 +13543,10 @@ export class RunRunner {
             steering.approveRefusedBySwitchPending()
           )
             throw new CredentialSwitchSignal();
-          await steering.awaitReceiptSettlement(signal);
+          await steering.awaitReceiptSettlement(signal, {
+            switchOutcome: body.status === "credential_switch" || body.status === "credential_switch_failed" ||
+              body.status === "credential_switch_held" || body.status === "credential_switch_uncertain",
+          });
         }
         // A control/receipt fence may have ended the flight while this report waited.
         // It permits no resume or competing terminal outcome through the stopped claim.

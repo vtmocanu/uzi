@@ -2854,9 +2854,9 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
       await tick();
       ch.tripCredentialSwitch(GEN, "op-1");
       assert.equal(interrupts, 1);
-      const waiting = ch.awaitReceiptSettlement();
+      const waiting = ch.awaitReceiptSettlement(undefined, { switchOutcome: true });
       release();
-      await waiting; // resolves: the in-place give-up's report must not be rejected into a retained stop
+      await waiting; // resolves: the in-place give-up's own report must not be rejected into a retained stop
       assert.equal(interrupts, 1, "the receipt refusal does not trip again");
       assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-1" });
       assert.equal(calls.applied, 1, "parked: no APPLIED retry while the switch is pending");
@@ -2891,6 +2891,59 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
       assert.equal(cancel.signal.aborted, true, "only the original op's controller was ever aborted");
       assert.equal(ch.cancelSignal().aborted, false, "the fresh controller is not aborted by the late refusal");
       await until(() => calls.applied >= 2);
+    } finally {
+      release();
+      await ch.stop();
+    }
+  });
+
+  const settles = (p: Promise<void>, ms = 400): Promise<"resolved" | "rejected:CredentialSwitchSignal" | string> =>
+    Promise.race([
+      p.then(() => "resolved", (err: Error) => `rejected:${err.name}`),
+      new Promise<string>((r) => setTimeout(() => r("still waiting"), ms)),
+    ]);
+
+  it("a second switch deferred by a plan-revision window after an applied settle: an applied 409 rejects the waiter into the switch path, not the settled branch", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    const { client, release } = appliedRefusalClient(row);
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: GEN });
+    ch.start();
+    try {
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "seven" });
+      await tick();
+      ch.tripCredentialSwitch(GEN, "op-1");
+      ch.settleCredentialSwitch("op-1", "applied");
+      ch.beginCredentialSwitchDefer();
+      ch.tripCredentialSwitch(GEN, "op-2"); // deferred: pendingSwitch stays unset
+      assert.equal(ch.pendingCredentialSwitchOp(), undefined);
+      const waiting = ch.awaitReceiptSettlement();
+      release();
+      assert.equal(await settles(waiting), "rejected:CredentialSwitchSignal");
+    } finally {
+      release();
+      await ch.stop();
+    }
+  });
+
+  it("after a give-up (spent controller) a second switch's applied 409 rejects a non-switch waiter and lets the switch's own report go", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    const { client, release } = appliedRefusalClient(row);
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: GEN });
+    ch.start();
+    try {
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "seven" });
+      await tick();
+      ch.tripCredentialSwitch(GEN, "op-1");
+      ch.settleCredentialSwitch("op-1", "gave_up");
+      ch.tripCredentialSwitch(GEN, "op-2"); // pending again; the give-up left the controller spent, so nothing aborts the waiters
+      assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-2" });
+      const other = ch.awaitReceiptSettlement(); // e.g. a `running` report that needs its answer applied
+      const own = ch.awaitReceiptSettlement(undefined, { switchOutcome: true }); // the switch's own credential_switch_failed
+      release();
+      assert.equal(await settles(other), "rejected:CredentialSwitchSignal", "the input is only parked: this report must not go out");
+      assert.equal(await settles(own), "resolved", "the switch's own outcome report is not held behind the refusal");
     } finally {
       release();
       await ch.stop();

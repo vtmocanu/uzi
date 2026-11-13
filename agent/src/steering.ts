@@ -505,7 +505,7 @@ export class SteeringChannel {
   /** Why the flight ended from this channel (a given-up receipt or a fenced claim): a park
    *  armed after that rejects at once instead of waiting on a poll loop that has stopped. */
   private flightEnded: Error | undefined;
-  private readonly receiptWaiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+  private readonly receiptWaiters: Array<{ resolve: () => void; reject: (err: Error) => void; switchOutcome: boolean }> = [];
   private readonly receiptDeadlineMs: number;
   /** Why this flight was fenced (released | stale), once it was; the runner then stops quietly. */
   private fence: string | undefined;
@@ -614,7 +614,7 @@ export class SteeringChannel {
    *  APPLIED inputs) see the follow-up, verdict or answer that caused the report. Rejects with
    *  InputReceiptError once the receipt is given up, so no guarded report goes out as if the
    *  input were applied. */
-  async awaitReceiptSettlement(signal?: AbortSignal): Promise<void> {
+  async awaitReceiptSettlement(signal?: AbortSignal, opts?: { switchOutcome?: boolean }): Promise<void> {
     if (this.receiptFailure) throw this.receiptFailure;
     if (!this.receiptPending()) return;
     // Abort-aware: a cancel, pause or switch trip (the shared controller) or the report's own
@@ -636,6 +636,7 @@ export class SteeringChannel {
       const waiter = {
         resolve: () => { done(); resolve(); },
         reject: (err: Error) => { done(); reject(err); },
+        switchOutcome: opts?.switchOutcome === true,
       };
       const onAbort = (): void => {
         const i = this.receiptWaiters.indexOf(waiter);
@@ -698,6 +699,20 @@ export class SteeringChannel {
   private settleWaiters(): void {
     if (this.receiptPending()) return;
     for (const w of this.receiptWaiters.splice(0)) w.resolve();
+  }
+
+  /** Issue #4201: an in-place switch refused an applied receipt and its ids were parked until the switch settles. A
+   *  parked id no longer counts as pending, so a waiting report would otherwise resolve with its input unapplied (a
+   *  `running` report would then be refused by the server's question guard). Only the switch's own outcome reports
+   *  (credential_switch_failed, _held, _uncertain, and the v1 release) may go on; every other waiter is rejected into
+   *  the switch path. Needed because a give-up leaves the cancel controller spent, so a second switch's trip cannot
+   *  abort the waiters the way an applied settle's fresh controller does. */
+  private rejectNonSwitchWaiters(): void {
+    const own: typeof this.receiptWaiters = [];
+    for (const w of this.receiptWaiters.splice(0)) {
+      if (w.switchOutcome) own.push(w); else w.reject(new CredentialSwitchSignal());
+    }
+    this.receiptWaiters.push(...own);
   }
 
   private releaseHeld(): void {
@@ -785,6 +800,7 @@ export class SteeringChannel {
           // for the next poll's APPLIED.
           if (this.pendingSwitch !== undefined) {
             for (const id of this.held.ids) if (!this.heldForSwitch.includes(id)) this.heldForSwitch.push(id);
+            this.rejectNonSwitchWaiters();
           } else this.markReady([...this.held.ids]);
           this.releaseHeld();
           return;
@@ -1176,6 +1192,7 @@ export class SteeringChannel {
       if (this.pendingSwitch !== undefined) {
         this.parkReady(ids);
         if (ids.some((id) => this.takenApproveIds.has(id))) this.approveRefusedBySwitch = true;
+        this.rejectNonSwitchWaiters();
         this.settleWaiters();
         return "continue";
       }
@@ -2782,6 +2799,9 @@ export class SteeringChannel {
     if (generation !== this.claimGeneration) return; // a stale signal for a superseded claim
     // Issue #4201: a signal for an op that already settled (it raced the apply commit) is spent.
     if (opId !== undefined && this.settledOps.has(opId)) return;
+    // Issue #4201: any new signal for this generation (deferred or not) ends the window in which a switch_pending
+    // refusal can still be a settled op's stale stamp; from here a refusal belongs to the new switch.
+    this.inPlaceSettledGeneration = undefined;
     // A switch hold (holdCredentialSwitch): latch the generation and return BEFORE anything is
     // aborted, so the flight looks exactly like one that has not yet polled the stamp. The hold's
     // service-close replays this call at depth 0.
@@ -3126,6 +3146,7 @@ export class SteeringChannel {
           // empty one). It is not an input row — it is the server's "a switch is pending for the
           // current claim" fact — and acting on it releases the claim.
           if (credentialSwitch) this.maybeTripCredentialSwitch(credentialSwitch.generation, credentialSwitch.op_id);
+          else this.inPlaceSettledGeneration = undefined; // no stamp is pending any more: a refusal cannot be a stale one
           // Issue #3974: a withheld switch hides every input row, cancel included; one probe per poll.
           if (credentialSwitch && this.withheldSwitchCancelEligible(credentialSwitch.generation)) {
             await this.probeWithheldSwitchCancel(credentialSwitch.generation);
