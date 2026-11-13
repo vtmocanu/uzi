@@ -206,6 +206,18 @@ type TerminalLifetime struct {
 	ClosedProven bool
 	// Disposition is preserved, or the abandonment disposition a proven closure records.
 	Disposition string
+	// RepoID, IssueIid and MrIid are the association the classification was made from, as found on
+	// the run passed to terminalLifetime. A decision that rests on this classification is only valid
+	// while the locked run still has the same association (see matchesAssociation).
+	RepoID   pgtype.UUID
+	IssueIid pgtype.Int8
+	MrIid    pgtype.Int8
+}
+
+// matchesAssociation reports whether run still has the repo, issue and merge request the
+// classification observed.
+func (l TerminalLifetime) matchesAssociation(run store.Run) bool {
+	return l.RepoID == run.RepoID && l.IssueIid == run.IssueIid && l.MrIid == run.MrIid
 }
 
 // terminalLifetime classifies run's lifetime. It is the ONE classification used at bind and, in the
@@ -215,12 +227,18 @@ type TerminalLifetime struct {
 //     closed when the issue tracker returns State "closed" for a real issue (not a pull request
 //     answered by a shared issue endpoint).
 //   - issue-less with mr_iid: only the merge request counts, proven closed when merged or closed.
-//   - otherwise no_pr, which never abandons.
+//   - otherwise no_pr: it has no closure signal and never abandons; the retire lane retires it only
+//     by age, terminalNoPRRetention after its first publication.
 //
 // A lookup error, a missing binding or forge wiring, and any other state are NOT proven: the work is
-// preserved. It makes forge calls, so no transaction may be open around it.
+// preserved. The result records the association it classified from, so the caller can refuse a
+// decision once the locked run no longer matches it. It makes forge calls, so no transaction may be
+// open around it.
 func (s *Service) terminalLifetime(ctx context.Context, run store.Run) TerminalLifetime {
-	l := TerminalLifetime{Class: terminalLifetimeNoPR, Disposition: TerminalDispositionPreserved}
+	l := TerminalLifetime{
+		Class: terminalLifetimeNoPR, Disposition: TerminalDispositionPreserved,
+		RepoID: run.RepoID, IssueIid: run.IssueIid, MrIid: run.MrIid,
+	}
 	switch {
 	case run.IssueIid.Valid:
 		l.Class = terminalLifetimeIssue
@@ -613,7 +631,10 @@ func (s *Service) PublishTerminal(ctx context.Context, wkr store.Worker, runID u
 
 	// The lifetime read, then the pack preparation, both before any transaction. An existing
 	// prepared contribution keeps its own (preserved) disposition.
-	lt := TerminalLifetime{Class: terminalLifetimeNoPR, Disposition: TerminalDispositionPreserved}
+	lt := TerminalLifetime{
+		Class: terminalLifetimeNoPR, Disposition: TerminalDispositionPreserved,
+		RepoID: run.RepoID, IssueIid: run.IssueIid, MrIid: run.MrIid,
+	}
 	if !found {
 		lt = s.terminalLifetime(ctx, run)
 	}
@@ -915,6 +936,12 @@ func (s *Service) terminalBind(ctx context.Context, wkr store.Worker, run store.
 		// completed with a guarded hold): the class the lock path was chosen for no longer holds. This is
 		// the retryable authority_changed 409, not stale_claim (which tells the worker to stop silently):
 		// the worker retries and the next request is classified afresh from the pre-check.
+		return b, terminalRefuse(apitypes.TerminalReasonAuthorityChanged)
+	}
+	// The lifetime was observed on the unlocked run read. A run whose repo, issue or merge request
+	// moved since is a different association: refuse retryably before any write or send, on every
+	// path, so no preserve or abandonment decision rests on an association the run no longer has.
+	if !lt.matchesAssociation(run) {
 		return b, terminalRefuse(apitypes.TerminalReasonAuthorityChanged)
 	}
 	if !run.RepoID.Valid {

@@ -112,7 +112,15 @@ result returns before any credential resolution, forge call or write. Lanes:
   5. Record `deleted` (ref absent) or `abandoned` (foreign tip), or stay
      `retiring` with backoff when the outcome is uncertain.
 
-  `no_pr` runs never retire in slice A: they have no closure signal.
+  A `no_pr` run (no issue, no merge request) has no closure signal; it becomes
+  eligible (`no_pr_expired`) once the observation is at least 30 days after the
+  ref's first verified publication. `first_published_at` is set once, so a later
+  update never renews the clock.
+
+  Every decision is bound to the association it observed: the observation
+  records the run's repo, issue and merge request, and tx-R1 (like the route's
+  tx1) re-reads the locked run and discards the decision if any of them changed.
+  A run that gained an issue or MR is classified by it at the next observation.
 
 Lock order wherever several are taken: worker, run, hold, preservation,
 contribution.

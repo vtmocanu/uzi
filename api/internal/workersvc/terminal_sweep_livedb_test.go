@@ -589,6 +589,24 @@ func TestTerminalSweepRetireDisabledByDefaultLiveDB(t *testing.T) {
 	}
 }
 
+// A no_pr row past its expiry is not deleted while retirement is disabled (the production default).
+func TestTerminalSweepNoPRExpiryDisabledByDefaultLiveDB(t *testing.T) {
+	f := newSweepFix(t)
+	f.issueless(0)
+	f.live()
+	if f.svc.terminalRetireOn() {
+		t.Fatal("retirement must be off by default")
+	}
+	f.svc.terminal.afterObserve = func(at *time.Time) { *at = at.Add(terminalNoPRRetention * 2) }
+	if n := f.sweep(); n != 0 {
+		t.Fatalf("changed %d rows", n)
+	}
+	p := f.mustPres("live")
+	if f.deleteCount() != 0 || p.RetireTip.Valid || f.forgeCalls() != 0 || f.allowCount() != 0 {
+		t.Fatalf("deletes=%d preservation=%+v forgeCalls=%d allowed=%d", f.deleteCount(), p, f.forgeCalls(), f.allowCount())
+	}
+}
+
 func (f *sweepFix) enableRetire() { f.svc.terminal.retireEnabled = true }
 
 // retireStamp asserts the row carries a complete retire stamp.
@@ -812,7 +830,19 @@ func TestTerminalSweepRetireLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("a run with neither issue nor merge request never retires", func(t *testing.T) {
+	// A no_pr row (neither issue nor merge request) has no closure signal: it retires only by age, from
+	// its FIRST publication. The observation clock is shifted through afterObserve, since the database
+	// clock cannot be moved and first_published_at cannot be rewritten (the 00432 trigger).
+	shiftObservation := func(f *sweepFix, d time.Duration) {
+		f.svc.terminal.afterObserve = func(at *time.Time) { *at = at.Add(d) }
+	}
+	noPRForgeUntouched := func(t *testing.T, f *sweepFix) {
+		t.Helper()
+		if f.forges.getIssues != 0 || f.forges.getMRs != 0 {
+			t.Fatalf("issueReads=%d mrReads=%d, want no forge read for a no_pr run", f.forges.getIssues, f.forges.getMRs)
+		}
+	}
+	t.Run("a no_pr run younger than the retention keeps and is parked until its expiry", func(t *testing.T) {
 		f := newSweepFix(t)
 		f.enableRetire()
 		f.issueless(0)
@@ -822,12 +852,166 @@ func TestTerminalSweepRetireLiveDB(t *testing.T) {
 		if p := f.mustPres("live"); p.LifetimeAtBind != "no_pr" {
 			t.Fatalf("lifetime_at_bind = %q", p.LifetimeAtBind)
 		}
+		shiftObservation(f, terminalNoPRRetention-time.Minute)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("changed %d rows", n)
+		}
+		p := f.mustPres("live")
+		if f.deleteCount() != 0 || p.RetireTip.Valid {
+			t.Fatalf("deletes=%d preservation=%+v", f.deleteCount(), p)
+		}
+		noPRForgeUntouched(t, f)
+		now := f.dbNow()
+		if !p.NextCheckAt.Time.After(now) || p.NextCheckAt.Time.After(now.Add(5*time.Minute)) {
+			t.Fatalf("next_check_at = %v, want about a minute out (the expiry is sooner than the usual recheck)", p.NextCheckAt.Time)
+		}
+	})
+	t.Run("a no_pr run far from its expiry is parked for the usual recheck", func(t *testing.T) {
+		f := newSweepFix(t)
+		f.enableRetire()
+		f.issueless(0)
+		f.live()
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("changed %d rows", n)
+		}
+		p := f.mustPres("live")
+		if f.deleteCount() != 0 || !p.NextCheckAt.Time.After(f.dbNow().Add(23*time.Hour)) {
+			t.Fatalf("deletes=%d next_check_at=%v", f.deleteCount(), p.NextCheckAt.Time)
+		}
+	})
+	t.Run("a no_pr run past the retention retires with no_pr_expired", func(t *testing.T) {
+		f := newSweepFix(t)
+		f.enableRetire()
+		f.issueless(0)
+		f.live()
+		shiftObservation(f, terminalNoPRRetention+time.Minute)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("changed %d rows, want 2 (retiring, deleted)", n)
+		}
+		p := f.mustPres("deleted")
+		// (retireStamp is not used: the shifted observation is deliberately later than the decision.)
+		if !p.RetireDecidedAt.Valid || !p.RetireObservedAt.Valid || p.RetireReason.String != "no_pr_expired" || p.RetireTip.String != termTip1 || p.LifetimeAtBind != "no_pr" {
+			t.Fatalf("preservation = %+v", p)
+		}
+		if f.deleteCount() != 1 || f.deletes[0].ExpectedTip != termTip1 {
+			t.Fatalf("deletes = %+v, want one CAS delete at %s", f.deletes, termTip1)
+		}
+		noPRForgeUntouched(t, f)
+	})
+	t.Run("a no_pr expiry still honours the independent protections", func(t *testing.T) {
+		f := newSweepFix(t)
+		f.enableRetire()
+		f.issueless(0)
+		f.live()
+		f.openHold()
+		shiftObservation(f, terminalNoPRRetention+time.Minute)
+		f.sweep()
+		if p := f.mustPres("live"); p.LastError.String != "retire kept: custody_hold_open" || f.deleteCount() != 0 {
+			t.Fatalf("last_error = %q deletes=%d", p.LastError.String, f.deleteCount())
+		}
+	})
+	t.Run("a no_pr run with no first publication keeps", func(t *testing.T) {
+		f := newSweepFix(t)
+		f.enableRetire()
+		f.issueless(0)
+		f.live()
+		// The trigger forbids clearing first_published_at, so the row the sweep is handed is the
+		// stand-in: the list read cannot return what the table cannot hold, so drive the lane directly.
+		row := f.mustPres("live")
+		row.FirstPublishedAt = pgtype.Timestamptz{}
+		shiftObservation(f, terminalNoPRRetention*10)
+		if n, err := f.svc.terminalSweepLive(f.e.ctx, row); err != nil || n != 0 {
+			t.Fatalf("terminalSweepLive = %d, %v", n, err)
+		}
+		f.mustPres("live")
+		if f.deleteCount() != 0 {
+			t.Fatal("deleted a row with no first publication")
+		}
+	})
+	t.Run("a later update of the ref does not renew the no_pr clock", func(t *testing.T) {
+		f := newSweepFix(t)
+		f.enableRetire()
+		f.issueless(0)
+		if res, err := f.publish(f.req(1, termTip1, "")); err != nil || res.PreservationState != "live" {
+			t.Fatalf("publish gen 1 = %+v, %v", res, err)
+		}
+		first := f.mustPres("live").FirstPublishedAt
+		if !first.Valid {
+			t.Fatal("first_published_at not set at the first publication")
+		}
+		time.Sleep(20 * time.Millisecond)
+		if res, err := f.publishGen2(); err != nil || res.State != "published" {
+			t.Fatalf("publish gen 2 = %+v, %v", res, err)
+		}
+		p := f.mustPres("live")
+		if p.Tip.String != termTip2 || !p.FirstPublishedAt.Time.Equal(first.Time) {
+			t.Fatalf("tip=%q first_published_at %v -> %v, want the tip moved and the clock unchanged", p.Tip.String, first.Time, p.FirstPublishedAt.Time)
+		}
+		f.terminal()
+		f.due()
+		// Exactly at the first publication's expiry: "at or past" retires.
+		f.svc.terminal.afterObserve = func(at *time.Time) { *at = first.Time.Add(terminalNoPRRetention) }
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("changed %d rows, want 2", n)
+		}
+		if p := f.mustPres("deleted"); p.RetireReason.String != "no_pr_expired" || p.RetireTip.String != termTip2 {
+			t.Fatalf("preservation = %+v", p)
+		}
+	})
+	t.Run("a no_pr run that gained an open merge request before the observation keeps past the retention", func(t *testing.T) {
+		f := newSweepFix(t)
+		f.enableRetire()
+		f.issueless(0)
+		f.live()
+		f.e.exec(t, `UPDATE runs SET mr_iid=7 WHERE id=$1`, f.run)
+		f.forges.mr = forge.MergeRequestSummary{State: forge.MRStateOpened}
+		shiftObservation(f, terminalNoPRRetention+time.Minute)
 		if n := f.sweep(); n != 0 {
 			t.Fatalf("changed %d rows", n)
 		}
 		f.mustPres("live")
-		if f.deleteCount() != 0 || f.forges.getIssues != 0 || f.forges.getMRs != 0 {
-			t.Fatalf("deletes=%d issueReads=%d mrReads=%d", f.deleteCount(), f.forges.getIssues, f.forges.getMRs)
+		if f.deleteCount() != 0 || f.forges.getMRs != 1 {
+			t.Fatalf("deletes=%d mrReads=%d, want the open MR read and no delete", f.deleteCount(), f.forges.getMRs)
+		}
+	})
+	t.Run("a merge request that appears between the observation and the decision discards a no_pr expiry", func(t *testing.T) {
+		f := newSweepFix(t)
+		f.enableRetire()
+		f.issueless(0)
+		f.live()
+		f.svc.terminal.afterObserve = func(at *time.Time) {
+			*at = at.Add(terminalNoPRRetention + time.Minute)
+			f.e.exec(t, `UPDATE runs SET mr_iid=7 WHERE id=$1`, f.run)
+		}
+		before := f.mustPres("live")
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("changed %d rows", n)
+		}
+		after := f.mustPres("live")
+		if f.deleteCount() != 0 || after.RetireTip.Valid || after.Attempts != before.Attempts || !after.NextCheckAt.Time.After(f.dbNow()) {
+			t.Fatalf("deletes=%d before=%+v after=%+v", f.deleteCount(), before, after)
+		}
+	})
+	t.Run("a closed issue replaced between the observation and the decision is discarded", func(t *testing.T) {
+		for name, change := range map[string]string{
+			"issue replaced":     `UPDATE runs SET issue_iid = issue_iid + 1000 WHERE id=$1`,
+			"issue to merge req": `UPDATE runs SET kind='ci_fix', issue_iid=NULL, mr_iid=7, pipeline_id=1, pipeline_ref='refs/heads/x' WHERE id=$1`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				f := newSweepFix(t)
+				f.enableRetire()
+				f.live()
+				f.forges.issue = forge.Issue{State: "closed"}
+				f.svc.terminal.afterObserve = func(*time.Time) { f.e.exec(t, change, f.run) }
+				before := f.mustPres("live")
+				if n := f.sweep(); n != 0 {
+					t.Fatalf("changed %d rows", n)
+				}
+				after := f.mustPres("live")
+				if f.deleteCount() != 0 || after.RetireTip.Valid || after.Attempts != before.Attempts || !after.NextCheckAt.Time.After(f.dbNow()) {
+					t.Fatalf("deletes=%d before=%+v after=%+v", f.deleteCount(), before, after)
+				}
+			})
 		}
 	})
 

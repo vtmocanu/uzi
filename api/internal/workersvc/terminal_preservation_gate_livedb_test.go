@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -176,5 +177,37 @@ func TestTerminalAuthorityChangedUnderLocksLiveDB(t *testing.T) {
 	}
 	if c, _ := f.con(1); c.Authority != "open_guarded_hold" || uuid.UUID(c.HoldID.Bytes) != hold {
 		t.Fatalf("retry contribution = %+v", c)
+	}
+}
+
+// The lifetime is observed on the unlocked run read. A run whose issue or merge request moved before
+// tx1 locked it is a different association: the bind is refused with the retryable authority_changed,
+// writing nothing and sending nothing, rather than recording an abandonment for an issue the run no
+// longer has.
+func TestTerminalBindRefusesChangedAssociationLiveDB(t *testing.T) {
+	cases := []struct{ name, change string }{
+		{"issue replaced", `UPDATE runs SET issue_iid = issue_iid + 1000 WHERE id=$1`},
+		{"issue cleared and merge request set", `UPDATE runs SET kind='ci_fix', issue_iid=NULL, mr_iid=77, pipeline_id=1, pipeline_ref='refs/heads/x' WHERE id=$1`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTermFix(t, "flight")
+			f.forges.issue = forge.Issue{State: "closed"} // the pre-tx lifetime is ClosedProven
+			f.svc.terminal.beforeBind = func() { f.e.exec(t, tc.change, f.run) }
+			_, err := f.publish(f.req(1, termTip1, ""))
+			f.svc.terminal.beforeBind = nil
+			if r := termReason(t, err); r != apitypes.TerminalReasonAuthorityChanged {
+				t.Fatalf("err = %v, want authority_changed", err)
+			}
+			if _, ok := f.pres(); ok {
+				t.Fatal("a refused bind left a preservation row")
+			}
+			if _, ok := f.con(1); ok {
+				t.Fatal("a refused bind left a contribution row")
+			}
+			if _, sends, _ := f.fake.counts(); sends != 0 {
+				t.Fatalf("sends = %d, want 0", sends)
+			}
+		})
 	}
 }

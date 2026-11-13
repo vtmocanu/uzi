@@ -103,12 +103,18 @@ func (s *Service) terminalRetireMaxAge() time.Duration {
 	return retireObservationMaxAge
 }
 
-// The retire_reason vocabulary the sweep writes (a subset of the 00432 CHECK). no_pr never retires
-// in slice A: a run with neither issue nor merge request has no closure signal.
+// The retire_reason vocabulary the sweep writes (a subset of the 00432 CHECK). A no_pr run (neither
+// issue nor merge request) has no closure signal, so it retires only by age.
 const (
 	terminalRetireIssueClosed = "issue_closed"
 	terminalRetirePRClosed    = "pr_closed"
+	terminalRetireNoPRExpired = "no_pr_expired"
 )
+
+// terminalNoPRRetention is how long after its first publication a no_pr row becomes retirement
+// eligible. first_published_at is set once (the 00432 trigger refuses a change), so a later update of
+// the ref never renews it.
+const terminalNoPRRetention = 30 * 24 * time.Hour
 
 // terminalSweepQueries is the query surface the pass needs beyond Store, satisfied by *store.Queries.
 type terminalSweepQueries interface {
@@ -563,23 +569,38 @@ func (s *Service) terminalSweepLive(ctx context.Context, row store.RunTerminalPr
 		return 0, s.terminalFail(ctx, row, heldErrText(fmt.Errorf("clock: %w", err), ""))
 	}
 	lt := s.terminalLifetime(ctx, run)
-	if !lt.ClosedProven {
-		// Not proven closed (open, unknown, a forge error, or a run with no closure signal): keep.
-		return 0, s.terminalPark(ctx, row, terminalRetireRecheck)
-	}
-	reason := terminalRetirePRClosed
-	if lt.Class == terminalLifetimeIssue {
-		reason = terminalRetireIssueClosed
-	}
 	observedAt := clock.Time
 	if s.terminal.afterObserve != nil {
 		s.terminal.afterObserve(&observedAt)
 	}
-	return s.terminalRetireDecide(ctx, row, run, reason, observedAt)
+	var reason string
+	switch {
+	case lt.Class == terminalLifetimeNoPR:
+		// No closure signal: eligible only once the observation clock is at or past the expiry. A row
+		// with no first publication keeps.
+		if !row.FirstPublishedAt.Valid {
+			return 0, s.terminalPark(ctx, row, terminalRetireRecheck)
+		}
+		expiry := row.FirstPublishedAt.Time.Add(terminalNoPRRetention)
+		if observedAt.Before(expiry) {
+			return 0, s.terminalPark(ctx, row, min(terminalRetireRecheck, expiry.Sub(observedAt)))
+		}
+		reason = terminalRetireNoPRExpired
+	case !lt.ClosedProven:
+		// Not proven closed (open, unknown or a forge error): keep.
+		return 0, s.terminalPark(ctx, row, terminalRetireRecheck)
+	case lt.Class == terminalLifetimeIssue:
+		reason = terminalRetireIssueClosed
+	default:
+		reason = terminalRetirePRClosed
+	}
+	return s.terminalRetireDecide(ctx, row, lt, reason, observedAt)
 }
 
-// terminalRetireDecide is tx-R1, then (when the decision commits) the remote effect.
-func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTerminalPreservation, run store.Run, reason string, observedAt time.Time) (int64, error) {
+// terminalRetireDecide is tx-R1, then (when the decision commits) the remote effect. The decision
+// rests on lt, so the run, once locked, must still have the association lt observed; otherwise the
+// decision is discarded without a state write and re-observed on a later pass.
+func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTerminalPreservation, lt TerminalLifetime, reason string, observedAt time.Time) (int64, error) {
 	tt, pres, busy, err := s.terminalLockRun(ctx, row)
 	if err != nil {
 		return 0, err
@@ -590,6 +611,16 @@ func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTermina
 	defer tt.rollback()
 	if pres.State != "live" || !pres.Tip.Valid || pres.Tip != row.Tip {
 		return 0, nil // the row moved on (or its tip did): a later observation decides
+	}
+	// The run is locked (FOR NO KEY UPDATE), so this plain read cannot change underneath the decision.
+	run, err := tt.qt.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: row.RunID, UserID: row.UserID})
+	if err != nil {
+		return 0, fmt.Errorf("terminal sweep: run: %w", err)
+	}
+	if !lt.matchesAssociation(run) {
+		slog.Warn("terminal sweep: retire decision discarded, the run's association changed", "run", row.RunID)
+		tt.rollback()
+		return 0, s.terminalSkip(ctx, row)
 	}
 	blocker, err := tt.qt.GetTerminalRetireBlocker(ctx, row.RunID)
 	if errors.Is(err, pgx.ErrNoRows) {
