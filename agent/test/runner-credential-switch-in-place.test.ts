@@ -24,6 +24,7 @@ import { freshClaim, newApi, row, send, until } from "./gate-revision-harness.js
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { SummaryRunner } from "../src/summary-runner.js";
+import { codexRig, FakeCodexExecutor } from "./runner-codex-sinks-fixture.js";
 
 installHarness();
 
@@ -549,6 +550,59 @@ describe("issue #4201 m2c: option A (an apply that may have committed)", () => {
     assert.equal(api.uncertainRequests.length, 3, "two lost replies, then the confirmed third");
     assert.ok(api.uncertainRequests.every((u) => u.body.op_id === "op-1"));
     assert.equal(r.turns.length, 2, "neither token ran again");
+    const frames = r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain");
+    assert.equal(frames.length, 1, "three reports, one feed line");
+  });
+
+  it("three runner-level report attempts (two fail, the third confirms) leave exactly one feed line", TIMEOUT, async () => {
+    // The client retries a dropped reply itself, so wire-level drops do not make the runner loop: fail the
+    // runner's own reportState call twice.
+    const real = client.reportState.bind(client);
+    let attempts = 0;
+    client.reportState = (async (runId: string, body: Parameters<typeof real>[1], ...rest: unknown[]) => {
+      if (body.status === "credential_switch_uncertain" && ++attempts <= 2) throw new Error("transport down");
+      return (real as (...a: unknown[]) => unknown)(runId, body, ...rest);
+    }) as typeof client.reportState;
+    let r: Result;
+    try {
+      r = await scenario({ site: "implement_turn", apply: [{ outcome: "refused_committed" }] });
+    } finally { client.reportState = real; }
+    assert.equal(attempts, 3, "the runner attempted the report three times");
+    const frames = r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain");
+    assert.equal(frames.length, 1, "three attempts, one feed line");
+    assert.deepEqual(frames[0]!.payload, { op_id: "op-1", generation: GEN });
+  });
+
+  it("an api-refused uncertain report leaves no credential_switch_uncertain feed line (the run is not paused)", TIMEOUT, async () => {
+    const real = client.reportState.bind(client);
+    client.reportState = (async (runId: string, body: Parameters<typeof real>[1], ...rest: unknown[]) => {
+      if (body.status === "credential_switch_uncertain") return { applied: false, status: "running" };
+      return (real as (...a: unknown[]) => unknown)(runId, body, ...rest);
+    }) as typeof client.reportState;
+    let r: Result;
+    try {
+      r = await scenario({ site: "implement_turn", apply: [{ outcome: "refused_committed" }] });
+    } finally { client.reportState = real; }
+    assert.deepEqual(r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain"), []);
+    assert.deepEqual(feedFrames(r.runId).filter((m) => (m.kind as string) === "credential_switch_uncertain"), []);
+    assert.equal(r.turns.length, 2, "neither token ran again");
+  });
+
+  it("an uncertain report that never confirms leaves no feed line", TIMEOUT, async () => {
+    const real = client.reportState.bind(client);
+    let attempts = 0;
+    client.reportState = (async (runId: string, body: Parameters<typeof real>[1], ...rest: unknown[]) => {
+      if (body.status === "credential_switch_uncertain") {
+        if (++attempts > 5) return { applied: false, staleClaim: true, status: "queued" };
+        throw new Error("transport down");
+      }
+      return (real as (...a: unknown[]) => unknown)(runId, body, ...rest);
+    }) as typeof client.reportState;
+    let r: Result;
+    try {
+      r = await scenario({ site: "implement_turn", apply: [{ outcome: "refused_committed" }] });
+    } finally { client.reportState = real; }
+    assert.deepEqual(r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain"), []);
   });
 });
 
@@ -1034,6 +1088,28 @@ describe("issue #4201 m2d: the signal escaped the executor (the escaped arm)", (
     assert.equal(api.uncertainRequests.length, 0);
     for (const status of ["credential_switch", "queued", "completed", "failed"]) assert.ok(!s.includes(status), `no ${status}: ${s.join(",")}`);
     assert.equal(api.holdState(r.runId), "unsettled");
+  });
+
+  it("a Codex flight on a negotiated worker never takes the in-place fence: no hold and no uncertain report, as before m3a", TIMEOUT, async () => {
+    newApi();
+    negotiate();
+    const claim = freshClaim(GEN);
+    const runId = claim.run_id;
+    api.scriptApply(runId, { outcome: "applied", token: NEW_TOKEN });
+    const rig = codexRig();
+    const executor = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      api.requestCredentialSwitch(runId, GEN, "op-1");
+      assert.ok(await until(() => ctx.signal?.aborted === true, 10_000), "the switch aborted ctx.signal");
+      throw ctx.signal!.reason;
+    });
+    const { gitlab } = fakeGitlab();
+    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+      recoveryRetryMs: 1, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir),
+      quiesceRun: async () => CLEAN,
+    }).execute(claim);
+    assert.deepEqual(api.holdRequests.filter((h) => h.runId === runId), [], "no credential_switch_held");
+    assert.equal(api.uncertainRequests.filter((u) => u.runId === runId).length, 0);
+    assert.equal(applied().length, 0, "Codex never applies in place");
   });
 });
 

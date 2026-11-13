@@ -27063,14 +27063,17 @@ export class RunRunner {
 
   /**
    * A pending, op-fenced switch on this claim's generation for a worker that negotiated in-place apply,
-   * on a flight whose in-place route is closed (see inPlaceRouteOpen). Such a flight never takes the v1
+   * on a Claude flight whose in-place route is closed because of a restore-route predecessor or a completed
+   * retained successor (see inPlaceRouteOpen). Such a flight never takes the v1
    * release or an op-less hold: the api refuses both with `credential_switch_release_retired`. It gets the
-   * escaped-arm treatment instead (proof, then option A or the op-fenced hold). Without the negotiated
-   * capability, or without a pending op, it is `undefined` and the v1 path stays as it was.
+   * escaped-arm treatment instead (proof, then option A or the op-fenced hold). Closed-route cases handled:
+   * a restore-route predecessor, a completed retained successor, and a flight lacking a ledger, holder,
+   * registration nonce or claim generation. `undefined` for: no negotiated capability, no pending op on this
+   * generation, an open route, and a Codex flight (Codex never switches in place and keeps its prior behaviour).
    */
   private closedInPlaceSwitch(claim: ClaimResponse, flight: RunFlight): { opId: string; retained: boolean } | undefined {
     const pending = flight.steering.pendingCredentialSwitchOp();
-    if (!this.client.supportsInPlaceCredentialSwitch() || pending?.opId === undefined ||
+    if (this.isCodexCapture(claim, flight) || !this.client.supportsInPlaceCredentialSwitch() || pending?.opId === undefined ||
         pending.generation !== flight.claimGeneration || this.inPlaceRouteOpen(claim, flight)) return undefined;
     const retained = flight.retainedEpisode === true || flight.retainedLocalCustody === true || flight.retainedEpisodeCustody === true;
     return { opId: pending.opId, retained };
@@ -27362,11 +27365,6 @@ export class RunRunner {
   ): Promise<InPlaceSwitchOutcome> {
     // `hold` is absent on the escaped arm (R2), where nothing was applied and no hold was opened.
     if (hold) this.releaseHoldPastPossibleApply(hold, flight, runLog);
-    // The owner-pause feed line is the worker's own frame, emitted once here (not per report retry) at a
-    // seq the worker owns, after the held frames were released past the possible apply.
-    flight.batcher.emit({ kind: "credential_switch_uncertain", agent: "worker", payload: {
-      op_id: opId, generation: flight.claimGeneration,
-    } });
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
@@ -27400,6 +27398,12 @@ export class RunRunner {
       runLog.warn("in-place credential switch outcome uncertain and the report is unconfirmed; work and custody retained", { run_id: flight.runId });
       return { kind: "retained_stop" };
     }
+    // The owner-pause feed line is the worker's own frame, emitted once and only now that the pause is
+    // confirmed (a refused or unconfirmed report leaves the run unpaused, so no line), at a seq the worker
+    // owns because the held frames were released past the possible apply above.
+    flight.batcher.emit({ kind: "credential_switch_uncertain", agent: "worker", payload: {
+      op_id: opId, generation: flight.claimGeneration,
+    } });
     flight.parked = true;
     return { kind: "option_a" };
   }

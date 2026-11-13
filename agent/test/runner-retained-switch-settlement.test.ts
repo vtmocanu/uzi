@@ -156,6 +156,9 @@ interface Options {
   negotiated?: boolean;
   /** With inPlaceApply: the flight carries a restore-route predecessor while the switch is asked for (its in-place route is closed). */
   restoreStub?: boolean;
+  /** With inPlaceApply: the executor rethrows the tripped CredentialSwitchSignal instead of asking for the
+   *  switch (a stub executor), so it reaches executeClaim's outer catch with the in-place route closed. */
+  rethrowSignal?: boolean;
 }
 
 async function scenario(o: Options) {
@@ -237,6 +240,7 @@ async function scenario(o: Options) {
           if (o.inPlaceApply) {
             flight.steering.tripCredentialSwitch(2, "op-retained");
             if (o.restoreStub) flight.restorePredecessor = { clonePath: clone.path, home: undefined, executor: {} };
+            if (o.rethrowSignal) throw new CredentialSwitchSignal();
             events.push(`hook:${await ctx.attemptCredentialSwitch!({ site: "implement_turn", laneSettled: true })}`);
             events.push(`custody:${flight.retainedLocalCustody === true}`);
             // A later retained guard on the same flight must not rethrow the settled switch's old signal.
@@ -256,7 +260,7 @@ async function scenario(o: Options) {
           await ctx.onModelTurnSettled!(1);
           throw new Error("switch signal expected");
         } finally {
-          if (o.restoreStub && flight) flight.restorePredecessor = undefined;
+          if (o.restoreStub && !o.rethrowSignal && flight) flight.restorePredecessor = undefined;
           ex.killAgentTree();
         }
       },
@@ -750,6 +754,28 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
       assert.equal(outcomes.length, 1, outcomes.join(","));
       assert.match(outcomes[0]!, /^(held|uncertain):op-retained$/);
     });
+
+    // executeClaim's outer catch: the executor rethrows the tripped signal, so the closed-route flight is
+    // routed there (not through ctx.attemptCredentialSwitch).
+    for (const [name, extra, expectProven] of [
+      ["a completed retained successor, proven", { iid: 31895, completedTurn: true, survivor: "none" }, true],
+      ["a completed retained successor, unproven", { iid: 31896, completedTurn: true, survivor: "permanent" }, false],
+      ["a restorePredecessor flight, proven", { iid: 31897, restoreStub: true, survivor: "none" }, true],
+    ] as const) {
+      it(`the executor rethrows the switch signal (${name}): option A or the op-fenced hold, never a release or an op-less hold`, TIMEOUT, async () => {
+        const env = await scenario({ inPlaceApply: true, negotiated: true, rethrowSignal: true, ...extra });
+        await env.run;
+        noV1(env);
+        const id = env.claim.run_id;
+        const held = api.holdRequests.filter(h => h.runId === id && h.status === HOLD).map(h => h.op_id);
+        const uncertain = api.uncertainRequests.filter(u => u.runId === id).map(u => u.body.op_id);
+        if (expectProven) {
+          assert.deepEqual([held, uncertain], [[], ["op-retained"]]);
+        } else {
+          assert.deepEqual([held, uncertain], [["op-retained"], []]);
+        }
+      });
+    }
   });
 
   it("8. a survivor that is only this flight's own worker child is joined, reaped, and released", TIMEOUT, async () => {
