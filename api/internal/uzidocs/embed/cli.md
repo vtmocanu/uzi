@@ -1742,14 +1742,16 @@ effect on the next request. Each newly authorized cross-user read writes one aud
 - **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
   `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
   metadata-only). `run discard` stays owner-only too. The TUI shows no steer controls on a foreign run.
-- **Hints.** When a 404 or 403 comes back from `run inputs`, `run fetches`, `run recovery` or
-  `admin runs --all`, the CLI prints `hint: reading another user's run needs the server flag
+- **Hints.** When a read that admin run debug could serve is refused or not found (a 404, 401 or 403
+  from `run inputs`, `run fetches`, `run recovery <run-id>`'s per-run reads, `run recovery --user` or
+  `admin runs --all`), the CLI prints `hint: reading another user's run needs the server flag
   UZI_ADMIN_RUN_DEBUG (chart api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr, at
-  most once per command, after a refused foreign-run read. The error and its exit code are unchanged,
-  except that `run recovery <run-id>` treats a refused per-run holds read, or a refused capture read
-  when no hold is listed, as best-effort: it prints the hint and still exits 0. With `--json`, a
-  refused capture read on a run whose hold is listed still exits with the error. An archives 404 on a
-  run whose hold you own stays silent (a hold can outlive its run).
+  most once per command. The CLI cannot tell such a refusal from a missing run or an expired token,
+  so the hint is advisory. It never changes the exit code: commands that fail on the error still
+  fail with it, and `run recovery <run-id>` keeps its best-effort per-run reads (a refused read leaves
+  an empty or capture-less result and exits 0, except that with `--json` a capture read failing with
+  anything other than a 404 on a run whose hold is listed exits with that error). A capture read 404
+  on a run whose hold is listed prints no hint (a hold can outlive its run).
 
 ### A failed run's salvage copy: `refs/uzi-salvage/<run-id>`
 
