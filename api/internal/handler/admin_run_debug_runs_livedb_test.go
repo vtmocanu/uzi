@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -233,7 +234,9 @@ func TestAdminRunDebugListRunsLiveDB(t *testing.T) {
 	f := adrlNewListFixture(t)
 	pool := f.pool
 	a, b := adrlSeedOwner(t, pool), adrlSeedOwner(t, pool)
-	base := time.Now().UTC().Truncate(time.Second).Add(-10 * time.Minute)
+	// Seeded in the future: the LiveDB sweep shares one database with other packages, whose
+	// recent runs could otherwise fill an unfiltered page (500 cap) inside the since window.
+	base := time.Now().UTC().Truncate(time.Second).Add(30 * 24 * time.Hour)
 
 	aOld, aCompleted, aFailed, aCancelled := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	tieLo, tieHi := adrlIDPair()
@@ -502,7 +505,8 @@ func TestAdminRunDebugListRunsRefusedLiveDB(t *testing.T) {
 		if on.Code != http.StatusOK || off.Code != http.StatusOK {
 			t.Fatalf("legacy listing: flag on %d, flag off %d, want 200 both\non: %s\noff: %s", on.Code, off.Code, on.Body.String(), off.Body.String())
 		}
-		if on.Body.String() != off.Body.String() {
+		// budget_used_seconds is derived from the clock, so two reads may straddle a second.
+		if adrlStripClock(on.Body.String()) != adrlStripClock(off.Body.String()) {
 			t.Errorf("legacy listing differs with the flag:\non:  %s\noff: %s", on.Body.String(), off.Body.String())
 		}
 		var env map[string]json.RawMessage
@@ -519,4 +523,11 @@ func TestAdminRunDebugListRunsRefusedLiveDB(t *testing.T) {
 			t.Errorf("legacy listing wrote %d audit records, want 0: %v", len(recs), recs)
 		}
 	})
+}
+
+var adrlClockField = regexp.MustCompile(`"budget_used_seconds":-?[0-9]+`)
+
+// adrlStripClock blanks the clock-derived budget_used_seconds values, keeping every other byte.
+func adrlStripClock(body string) string {
+	return adrlClockField.ReplaceAllString(body, `"budget_used_seconds":0`)
 }
