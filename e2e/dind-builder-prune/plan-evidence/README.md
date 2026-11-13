@@ -13,16 +13,16 @@ archive: no task target executes them, and they are kept byte-identical to what 
 
 | File (committed name) | Original name | sha256 |
 | --- | --- | --- |
-| `full.sh.txt` | `full.sh` | `d7a434b0a8167ebea845f405375807629c51214b2884c796b3b1ef8946d514ff` |
+| `full.sh` | `full.sh` | `d7a434b0a8167ebea845f405375807629c51214b2884c796b3b1ef8946d514ff` |
 | `lib.sh.txt` | `lib.sh` | `bc0949b1673f004ce548e15ecc49e5880d0016a382b2666a42c5a87d7b197802` |
 | `full-rootful.log` | `full-rootful.log` | `97bb16f47dc38e4eaa4d2c04e056cf7a0118d5daf5c57b7bbb94f16603da6e7f` |
 | `full-rootless.log` | `full-rootless.log` | `3234841665187e2747cbd83dd6dbece10698abbdaf18eb6f7ebbf6b196ffbcf5` |
 | `containers-created.txt` | `containers-created.txt` | `b95efefd703f25b0ce6c357c1eadbda3252e6d5ae5542ec86e7bfb982c8ac8ad` |
 
-The two scripts carry a `.txt` suffix because the archived `lib.sh` has a ShellCheck
-warning (SC2034) and must not be edited. The suffix keeps the bytes exact without
-exempting or weakening `task lint:shell`, which still checks `full.sh.txt` through its
-shebang.
+`lib.sh` is archived as `lib.sh.txt` because it has a ShellCheck warning (SC2034)
+and must not be edited. It has no shebang, so `task lint:shell` (tracked `*.sh` plus
+shell-shebang files) does not select the `.txt` copy, and no lint exemption is needed.
+`full.sh` keeps its original name: it is clean at the gate's severity and stays linted.
 
 ## What ran
 
