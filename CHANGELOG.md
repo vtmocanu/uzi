@@ -159,6 +159,33 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Epoch cleanup safely retains artifacts when an executable cannot start ([#4171](https://github.com/vtmocanu/uzi/pull/4171), [#4184](https://github.com/vtmocanu/uzi/pull/4184)).**
   Confirmed asynchronous spawn failures join output and close before settling native operations; uncertain child lifecycles still stop reclamation.
 
+- **Set-token on an owner-held recovery park now names the hold ([#4231](https://github.com/vtmocanu/uzi/pull/4231), [#4250](https://github.com/vtmocanu/uzi/pull/4250)).**
+  `uzi run set-token` on a run on an owner recovery hold, such as worker memory pressure, worker requeue exhaustion or a retained recovery cause used to fail with a generic "run changed state" 409; it now returns a 409 naming the hold and pointing to Resume or Cancel, and writes nothing.
+
+- **Overview preview no longer shows a merged PR as open ([#4167](https://github.com/vtmocanu/uzi/pull/4167), [#4215](https://github.com/vtmocanu/uzi/pull/4215)).**
+  When several runs share a pull request, the newest run's PR state now decides, so an older run's stale "opened" state no longer counts the PR in the PR open column, the Review PR items or the run counts.
+
+- **A cancelled checkpoint or held publication is no longer reported as a CI-config guard refusal ([#4223](https://github.com/vtmocanu/uzi/pull/4223), [#4239](https://github.com/vtmocanu/uzi/pull/4239)).**
+  When the caller's context ends while pushbroker is fetching the base refs, the fetch now reports the cancellation or deadline instead of an "empty input" error or a false "up to date", so a guarded publication is no longer refused as "default tip unreadable" because of a cancellation.
+
+- **A busy local repository lock no longer fails a run at startup ([#4246](https://github.com/vtmocanu/uzi/pull/4246), [#4251](https://github.com/vtmocanu/uzi/pull/4251)).**
+  A launch-round wait on the worker's shared bare-repo lock that expires before acquisition now retries in fresh rounds within a small per-claim allowance (never after an owner cancel, a fired pause or credential-switch signal, shutdown or a claim fence; a pause or credential switch arriving during the retry is handled as that pause or switch, not reported as a failure); if the lock stays busy the run fails visibly with its clone and custody kept.
+
+- **The bundled uzi-cli skill and the demo mode describe the owner-hold set-token refusal ([#4231](https://github.com/vtmocanu/uzi/pull/4231), [#4253](https://github.com/vtmocanu/uzi/pull/4253)).**
+  The skill no longer says set-token promotes every parked run, and the mock API returns the same named-hold 409 as the server for owner-held recovery parks.
+
+- **Queued continuations explain missing worker capabilities ([#4044](https://github.com/vtmocanu/uzi/pull/4044), [#4196](https://github.com/vtmocanu/uzi/pull/4196)).**
+  Run health and upgrade blockers name a missing repo agent source capability, including when no source commit has been recorded, without changing claim or rollout safety checks.
+
+- **Finished work can publish after a transient metadata wait recovers ([#4191](https://github.com/vtmocanu/uzi/pull/4191), [#4195](https://github.com/vtmocanu/uzi/pull/4195)).**
+  A fresh verified read can clear a temporary safety hold while real remediation holds remain in force.
+
+- **Cancelled cross-check runs record when they were cancelled ([#4240](https://github.com/vtmocanu/uzi/pull/4240), [#4247](https://github.com/vtmocanu/uzi/pull/4247)).**
+  When a plan or code cross-check is timed out, superseded or settled because its lead stopped, the cancelled check run's `status_since` (for example in `uzi run get --json`) is now its cancellation time, not the time it entered its previous status.
+
+- **One run's repeated retained holds no longer fill an owner's custody capacity ([#4162](https://github.com/vtmocanu/uzi/pull/4162), [#4216](https://github.com/vtmocanu/uzi/pull/4216)).**
+  A run's open holds on the same original worker, from any of its generations, now count as one admission unit toward `custody_hold_limit`, while a queued run whose own open holds reach the limit stays unstarted (Resume does not bypass it; discard or settle that run's own holds) and every hold stays open until released by proof or discarded.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -233,7 +260,25 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Owners can resume a Codex run held on a provider policy refusal ([#3607](https://github.com/vtmocanu/uzi/pull/3607), [#4071](https://github.com/vtmocanu/uzi/pull/4071)).**
   An eligible run now pauses as `codex_policy_hold` instead of failing, and the owner resumes it per episode with `fresh_from_saved_work`, `preserve` or `fresh_one_claim`; rollback is drain-only (see docs/run-pause.md).
 
+- **An Anthropic API spend limit now holds the run for you instead of failing it ([#3767](https://github.com/vtmocanu/uzi/pull/3767), [#4190](https://github.com/vtmocanu/uzi/pull/4190)).**
+  A Claude run whose lead hits the organization or workspace spend limit parks in `recovery_wait` (`anthropic_spend_limit`) with no timer or automatic retry; Resume re-selects the credential through the run's own selection, Switch token or `uzi run set-token` picks another token on switchable kinds, and Cancel ends it. Detection is a narrow text match on the provider message because Anthropic exposes no structured signal; credit depletion is not covered, and the hold needs both a worker and an api that support it.
+
+- **Choose which harness your judge runs on, and see why a judge was skipped ([#3257](https://github.com/vtmocanu/uzi/pull/3257), [#4225](https://github.com/vtmocanu/uzi/pull/4225)).**
+  A new "Judge runs on" setting (Same as the run, Claude or Codex) applies to the automatic judge and the Run judge button; an explicit choice without a usable credential skips the judge instead of using the other provider. A skipped judge now shows its reason on the run page and in `uzi review show`, with a link to Run defaults and the Run judge button; the record is one latest entry per run and any new judge clears it.
+
+- **Experimental preflight reports missing Go cache proof prerequisites ([#4203](https://github.com/vtmocanu/uzi/pull/4203)).**
+  The incomplete evidence report distinguishes host observations and pure fixture tests from unverified allocation, protocol and performance proof; it authorizes no production cache backend or eviction.
+
+- **Issue tracker connections and a YouTrack driver, not yet reachable from any repo ([#4173](https://github.com/vtmocanu/uzi/pull/4173)).**
+  A YouTrack driver for every issue-side operation, one contract suite run against it and the GitLab, GitHub and Forgejo drivers, and issue tracker connections stored with the token sealed and an https base URL on the separate `ISSUE_TRACKER_ALLOWED_BASE_URLS` allowlist (empty by default, so none can be created yet); behaviour is unchanged for every forge.
+
+- **An issue tracker allowlist in the Helm chart and compose ([#4173](https://github.com/vtmocanu/uzi/pull/4173)).**
+  The Helm value `issueTracker.allowedBaseURLs`, with the compose `ISSUE_TRACKER_ALLOWED_BASE_URLS` pass-through, is empty by default, https-only and never used for worker egress; behaviour is unchanged for forges.
+
 ### Changed
+
+- **Routine dependency updates ([#4188](https://github.com/vtmocanu/uzi/pull/4188)).**
+  Dependency manifest and image bumps that carry no entry of their own.
 
 - **Routine dependency updates ([#4021](https://github.com/vtmocanu/uzi/pull/4021), [#4030](https://github.com/vtmocanu/uzi/pull/4030), [#4029](https://github.com/vtmocanu/uzi/pull/4029), [#4124](https://github.com/vtmocanu/uzi/pull/4124)).**
   Dependency manifest and image bumps that carry no entry of their own.
@@ -307,6 +352,24 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **The pod-epoch runner scratch phase was introduced dark and default-off ([#4043](https://github.com/vtmocanu/uzi/pull/4043), [#4170](https://github.com/vtmocanu/uzi/pull/4170)).**
   The original implementation used its own `EPOCH_SCRATCH_DELETION_ENABLED = false` gate and reported `scratch.state: "not_run"` without census or deletion; #4182 supersedes that activation policy with a startup request. Byte figures remain allocated-block estimates, not proof of freed storage.
 
+- **Overview preview header keeps its status chips together ([#4248](https://github.com/vtmocanu/uzi/pull/4248), [#4249](https://github.com/vtmocanu/uzi/pull/4249)).**
+  Search follows the health and People chips and precedes the Back link; its shortcut and behavior stay the same.
+
+- **Memory interventions report which commands were rejected and why ([#4219](https://github.com/vtmocanu/uzi/pull/4219), [#4229](https://github.com/vtmocanu/uzi/pull/4229)).**
+  The `worker_memory_pressure` diagnostics and a worker warning now list, best effort, each candidate command the guard could not select, with a closed-set reason and its tree size when known; which command is cancelled is unchanged.
+
+- **Overview preview's By user table shows each user's cost share split by Claude and Codex ([#4227](https://github.com/vtmocanu/uzi/pull/4227), [#4233](https://github.com/vtmocanu/uzi/pull/4233)).**
+  One "Cost share · Claude / Codex" column replaces the clipped Claude / Codex figures, incomplete-cost notes become short "+N no est." / "+N unrep." chips, and the table fits a 1280 px window without sideways scrolling.
+
+- **Base-URL allowlist entries with userinfo, a path, a query or a fragment now refuse boot ([#4194](https://github.com/vtmocanu/uzi/pull/4194), [#4241](https://github.com/vtmocanu/uzi/pull/4241)).**
+  Such entries were previously reduced silently to their host; the Helm values `forge.allowedBaseURLs` and `issueTracker.allowedBaseURLs` fail the render for the same entries, so list bare `https://host[:port]` entries.
+
+- **The Overview preview's health chip shows each check that needs attention ([#4166](https://github.com/vtmocanu/uzi/pull/4166), [#4200](https://github.com/vtmocanu/uzi/pull/4200)).**
+  For admins on /overview/next, the chip opens a System health popover with every check that needs attention, its evidence and a link to the Health tab; when every check passes it stays a link.
+
+- **Document the cross-check plan-gate token-switch limitation ([#4158](https://github.com/vtmocanu/uzi/pull/4158), [#4220](https://github.com/vtmocanu/uzi/pull/4220)).**
+  The Anthropic tokens guide now warns that switching tokens at a Plan cross-check human gate can leave the run unable to restart, pending #4201.
+
 ### Security
 
 - **A run can no longer rewrite the repo agents its later claims use ([#3913](https://github.com/vtmocanu/uzi/pull/3913), [#3940](https://github.com/vtmocanu/uzi/pull/3940)).**
@@ -317,6 +380,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **GitLab merge-request reuse test coverage is extended (572893ef8).**
   The forge test double now records each merge request's source project.
+
+- **Improved credential redaction across log and issue text (3cec5121).**
+  Log, snapshot, Slack and issue-draft scrubbers share one redaction helper with added regression coverage.
 
 ## [0.86.1] - 2026-11-05
 
