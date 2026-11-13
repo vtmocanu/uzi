@@ -75,11 +75,11 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"including settled holds. With a run id, --json emits each of the run's hold DTOs " +
 			"plus a `captures` array listing that hold's " +
 			"recovery captures (id, state, source_sha, byte_size, created_at, checksum, ordered prerequisites, expiry, attempted head and optional prerequisite_closure); a capture id is what " +
-			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`. A capture whose hold " +
-			"is not among the listed holds (for example when the hold list could not be read, or a hold opened between the two reads) is not dropped: when there is at " +
-			"least one, --json appends ONE final element `{\"run_id\": ..., \"unattached\": true, \"captures\": [...]}` " +
-			"after the hold elements, with the same capture shape and no generation, id or state keys; the human form " +
-			"prints a \"captures (no listed hold)\" table.\n\n" +
+			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`. Only on an admin " +
+			"run debug read of another user's run (never for your own run), a capture whose hold is not among the listed " +
+			"holds is not dropped: when there is at least one, --json appends ONE final element " +
+			"`{\"run_id\": ..., \"unattached\": true, \"captures\": [...]}` after the hold elements, with the same " +
+			"capture shape and no generation, id or state keys; the human form prints a \"captures (no listed hold)\" table.\n\n" +
 			"While the server retains the run's last published checkpoint on origin, the hold also " +
 			"names where it lives: `refs/uzi-checkpoints/<checkpoint-key>`, or `refs/uzi-recovery/<run-id>` " +
 			"once a newer run on the same branch superseded it, with its tip and retention state " +

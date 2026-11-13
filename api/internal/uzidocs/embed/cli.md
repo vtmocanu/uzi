@@ -1565,12 +1565,10 @@ uzi run recovery <run-id> [--json]
   prerequisite_closure. Its ids are accepted by
   `uzi run export --capture`; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
-  its run) or the server predates capture-hold linking. Captures whose hold is not among the
-  listed holds (for example when the hold list could not be read, or a hold opened between the two reads) arrive as one final element
-  `{"run_id": "<run-id>", "unattached": true, "captures": [ ... ]}` after the hold elements, with
-  no `generation`, `id` or `state` keys, so scripts that read holds should skip elements with
-  `unattached: true`. Owner-only, except under
-  [admin run debug](#admin-run-debug-reading-other-users-runs).
+  its run) or the server predates capture-hold linking. A capture whose hold is not among the
+  listed holds is attached nowhere in your own run's output. Owner-only, except under
+  [admin run debug](#admin-run-debug-reading-other-users-runs), whose read of another user's run
+  can also end with one `unattached` element (described there); your own run never shows it.
 - While the server retains the run's last published checkpoint on origin (PRD #1810), the
   human-readable output adds a line per hold naming where it lives: `hold <id> checkpoint:
   <ref> @ <12-char tip> (<state>)`, where `<ref>` is `refs/uzi-checkpoints/<checkpoint-key>` or, once
@@ -1723,10 +1721,13 @@ effect on the next request. Each newly authorized cross-user read writes one aud
   prints the whole holds DTO (aggregate plus every hold, settled ones included), as the no-argument
   `--json` does. `--user` takes the full user UUID, no run id. Without `--json` it also prints a
   one-line read-only notice on stderr.
-- **`uzi run recovery <run-id>`** on a foreign run lists that run's holds and capture metadata. With
-  `--json`, captures whose hold is not among the listed holds arrive as ONE final element after the
-  hold elements (the same element an owner's own run can show), carrying no `generation`, `id` or
-  `state` keys:
+- **`uzi run recovery <run-id>`** on a foreign run lists that run's holds and capture metadata. The
+  holds are shown only when the run's capture metadata read succeeds as an admin debug read
+  (`admin_debug_read: true`); if that read fails the result is empty, as for a run you cannot read.
+  Only on such a debug read, and never for your own run, captures whose hold is not among the
+  listed holds arrive with `--json` as ONE final element after the hold elements, carrying no
+  `generation`, `id` or `state` keys, so scripts that read holds should skip elements with
+  `unattached: true`:
 
 ```json
 {"run_id": "<run-id>", "unattached": true, "captures": [ ... ]}
@@ -1744,15 +1745,17 @@ effect on the next request. Each newly authorized cross-user read writes one aud
   `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
   metadata-only). `run discard` stays owner-only too. The TUI shows no steer controls on a foreign run.
 - **Hints.** When a read that admin run debug could serve is refused or not found (a 404, 401 or 403
-  from `run inputs`, `run fetches`, `run recovery <run-id>`'s per-run reads, `run recovery --user` or
-  `admin runs --all`), the CLI prints `hint: reading another user's run needs the server flag
-  UZI_ADMIN_RUN_DEBUG (chart api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr, at
-  most once per command. The CLI cannot tell such a refusal from a missing run or an expired token,
-  so the hint is advisory. It never changes the exit code: commands that fail on the error still
-  fail with it, and `run recovery <run-id>` keeps its best-effort per-run reads (a refused read leaves
-  an empty or capture-less result and exits 0, except that with `--json` a capture read failing with
-  anything other than a 404 on a run whose hold is listed exits with that error). A capture read 404
-  on a run whose hold is listed prints no hint (a hold can outlive its run).
+  from `run inputs`, `run fetches`, `run recovery --user` or `admin runs --all`), the CLI prints
+  `hint: reading another user's run needs the server flag UZI_ADMIN_RUN_DEBUG (chart
+  api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr, at most once per command.
+  `uzi run recovery <run-id>` prints it only when you hold nothing on the run and one of its per-run
+  reads (the run's holds or its capture metadata) returns 404, the answer a refused foreign read
+  gets; its other per-run read failures (401, 403, server errors) stay silent and leave the normal
+  empty result with exit 0, and a cancelled or timed-out read fails the command. The CLI cannot tell
+  a refusal from a missing run or an expired token, so the hint is advisory. It never changes the
+  exit code: commands that fail on the error still fail with it. When one of your own holds lists
+  the run, `run recovery <run-id>` prints no hint (a hold can outlive its run), and with `--json` a
+  capture read failing with anything other than a 404 exits with that error.
 
 ### A failed run's salvage copy: `refs/uzi-salvage/<run-id>`
 

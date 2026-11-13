@@ -678,7 +678,7 @@ Tracked as GitLab issue vtmocanu/uzi#95; PRD at `prds/done/95-activity-pane-v2.m
   - Show a real "who's alive": glance at the pane and see each agent's state — working / waiting / done / blocked. [user 2026-07-20]
   - A follow-up must not vanish silently — show that it exists and whether the worker has picked it up. [user 2026-07-20]
   - The steer queue distinguishes received by the worker, routed by steering, and included in a prompt; it never says "delivered" for a follow-up no prompt included, and never claims the agent acted on it. Owner follow-ups reach the lead on both harnesses. (AI-synced 2026-10-01, issue #1800)
-  - An opt-in deployment flag (off by default) lets a live admin's `admin_ro` CLI token read other users' run inputs, archive metadata, fetches, recovery holds and an all-states run listing; reads are audited and read-only, and are the exception to the owner-only steer queue. (AI-synced 2026-11-13, #4198)
+  - An opt-in deployment flag (off by default) lets a live admin's `admin_ro` CLI token read other users' non-chat run inputs, archive metadata, fetches, recovery holds and an all-states run listing; reads are audited and read-only, and are the exception to the owner-only steer queue. Foreign chat-run inputs stay owner-only (404). (AI-synced 2026-11-13, #4198)
 - Authorized behavior change: collapse-by-default logs + an opt-in "Follow live" toggle REPLACE the global auto-scroll. [user 2026-07-20, supersedes the Feature #11 default "activity feed auto-scrolls (follows) live runs"]
 
 ## Feature #108 — Worker retry loop: stop losing runs to unsaveable messages
