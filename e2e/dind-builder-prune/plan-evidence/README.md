@@ -26,8 +26,9 @@ shebang.
 
 ## What ran
 
-- Owned, disposable nested daemons only (`bpspike-*` containers on the worker's daemon,
-  each removed by exact name; see `containers-created.txt`). No prune, builder or system
+- Owned, disposable nested daemons only (`bpspike-*` containers on the worker's daemon).
+  `containers-created.txt` lists the names created; the two archived runs log their own
+  exact-name cleanup, and removal of the others rests on the spike operator's report. No prune, builder or system
   command ran against a shared daemon, and no clock was altered.
 - Both postures from the chart-pinned images: `docker:29-dind` (rootful) and
   `docker:29-dind-rootless`.
@@ -65,8 +66,10 @@ Rootless (`full-rootless.log`):
   `RUN_KEEP_RC=0`, `RUN_TRUE_RC=0`.
 
 Both postures: with the cap above usage (P2, `--max-used-space 4GiB`) nothing was
-deleted. With the cap just below usage (P3), least-recently-used eligible records were
-deleted until usage fell under it. Records sharing snapshots with a local image
-(`shared=true`) are never deleted by this argv.
+deleted. With the cap just below usage (P3), two eligible records were deleted per posture
+until usage fell under it (BuildKit removes child records before their parents, so the
+oldest record is not always the first to go). In P4 (scaled argv), records sharing
+snapshots with a local image (`shared=true`) were not deleted.
 
-The tracked, repeatable integration proof is `e2e/dind-builder-prune/run.sh`.
+The tracked, repeatable integration proof is the harness in the parent directory
+(`e2e/dind-builder-prune/`).
