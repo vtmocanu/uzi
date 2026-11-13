@@ -363,6 +363,11 @@ func (m *Materializer) hibernateHold(ctx context.Context, w protocol.DesiredWork
 // deliberately bypasses the busy/migration-held deferral that guards a drift roll: the
 // worker has no pod and no run, and an old-layout custody hold protects a pod's
 // in-pod workdir that a woken-from-zero worker does not have.
+//
+// A Deployment at an explicit zero is held there, with no write and no report, until a
+// complete pod observation shows no pod of the worker left (terminating ones included).
+// Only then does the single restoring patch run. This covers a quick wake, where the api
+// moved preparing to waking while the original pod was still stopping.
 func (m *Materializer) hibernateWake(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) error {
 	op := w.Hibernation.OpID
 	if !obs.HasDeployment {
@@ -370,6 +375,16 @@ func (m *Materializer) hibernateWake(ctx context.Context, w protocol.DesiredWork
 	}
 	if obs.DeploymentTerminating {
 		return nil
+	}
+	// A Deployment scaled to zero (by this or an earlier op) is restored only once a complete
+	// observation shows that no pod of the worker remains, terminating ones included. Restoring
+	// earlier can keep the original pod alive; the api never settles that pod after scaling_down
+	// (trySettle), so the worker would stay in waking for good. nil replicas is excluded: a real
+	// apiserver defaults it to 1.
+	if obs.DeploymentReplicas != nil && *obs.DeploymentReplicas == 0 {
+		if !obs.PodsKnown || obs.WorkerPodCount > 0 {
+			return nil
+		}
 	}
 	dep := RenderDeployment(m.cfg, w, spec)
 	wantHash := dep.Spec.Template.Annotations[AnnotationSpecHash]
