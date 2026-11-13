@@ -1365,6 +1365,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/lib/net-retry.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/ci-fix.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
+      - ./.agents/skills/uzi-lander/scripts/review-quota.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-guards.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-basemove.test.sh

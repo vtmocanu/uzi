@@ -62,6 +62,11 @@ want "queued check-run vs older skip" "Review in progress"
 set_case '{"statuses":[{"context":"CodeRabbit","description":"Review in progress","updated_at":"2026-11-13T07:00:00Z"}]}' \
   "{\"check_runs\":[$(run 5 completed '"success"' 2026-11-13T06:59:00Z '"2026-11-13T07:00:00Z"' 'Finished')]}"
 want "equal-time in-progress status" "Review in progress"
+# Strictly ordered: a later completion beats a stale in-progress status, and keeps its time.
+set_case '{"statuses":[{"context":"CodeRabbit","description":"Review in progress","updated_at":"2026-11-13T10:00:00Z"}]}' \
+  "{\"check_runs\":[$(run 5 completed '"success"' 2026-11-13T10:04:00Z '"2026-11-13T10:05:00Z"' 'Finished')]}"
+want "stale pending status" "Finished"
+sig=$(cr_head_signal test/repo deadbeef); [ "${sig%%$'\t'*}" = "2026-11-13T10:05:00Z" ] || fail "completion lost its timestamp: $sig"
 # Settled tie: the check-run (current channel) wins.
 set_case '{"statuses":[{"context":"CodeRabbit","description":"Review completed","updated_at":"2026-11-13T07:00:00Z"}]}' \
   "{\"check_runs\":[$(run 5 completed '"skipped"' 2026-11-13T06:59:00Z '"2026-11-13T07:00:00Z"' 'Review skipped: y')]}"
