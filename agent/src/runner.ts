@@ -27067,7 +27067,8 @@ export class RunRunner {
    * on a Claude flight whose in-place route is closed because of a restore-route predecessor or a completed
    * retained successor (see inPlaceRouteOpen). Such a flight never takes the v1
    * release or an op-less hold: the api refuses both with `credential_switch_release_retired`. It gets the
-   * escaped-arm treatment instead (proof, then option A or the op-fenced hold). Closed-route cases handled:
+   * escaped-arm treatment instead (proof, then option A or the op-fenced hold; a restore-route predecessor
+   * gets no proof and goes straight to the op-fenced hold, #3644 3.4(b)). Closed-route cases handled:
    * a restore-route predecessor, a completed retained successor, and a flight lacking a ledger, holder,
    * registration nonce or claim generation. `undefined` for: no negotiated capability, no pending op on this
    * generation, an open route, and a Codex flight (Codex never switches in place and keeps its prior behaviour).

@@ -241,7 +241,7 @@ async function scenario(o: Options) {
           switched = true;
           if (o.inPlaceApply) {
             flight.steering.tripCredentialSwitch(2, "op-retained");
-            if (o.restoreStub) flight.restorePredecessor = { clonePath: clone.path, home: undefined, executor: flight.executor };
+            if (o.restoreStub) flight.restorePredecessor = { clonePath: clone.path, home: flight.runHome, executor: flight.executor };
             if (o.rethrowSignal) throw new CredentialSwitchSignal();
             events.push(`hook:${await ctx.attemptCredentialSwitch!({ site: "implement_turn", laneSettled: true })}`);
             events.push(`custody:${flight.retainedLocalCustody === true}`);
@@ -375,10 +375,13 @@ function assertNoCredentialedOps(env: Env, proven = true): void {
 }
 
 /** issue #3644 plan 3.4 (b): the restore route's predecessor gets no settlement (its executor is flight.executor until the swap). */
-function assertPredecessorUntouched(env: Env): void {
+/** `reap` also pins the 3.4(d) home-directory guard on the park-reap path a confirmed hold makes reachable.
+ *  Only the rethrow fixture keeps restorePredecessor set through executeClaim's finally, as production does
+ *  (the hook fixture clears it itself), so only that case can assert it. */
+function assertPredecessorUntouched(env: Env, reap = false): void {
   const after = env.events.slice(env.events.indexOf("switch") + 1);
   for (const op of ["settleForCredentialCapture", "settle:g2", "closePlanSummary:g2", "quiesce:retained_credential_switch",
-    "quiesce:in_place_credential_switch"])
+    "quiesce:in_place_credential_switch", ...(reap ? ["reap:g2"] : [])])
     assert.ok(!after.includes(op), `${op} touched the predecessor: ${after.join(",")}`);
 }
 
@@ -783,7 +786,7 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
         } else {
           assert.deepEqual([held, uncertain], [["op-retained"], []]);
         }
-        if (extra.restoreStub) assertPredecessorUntouched(env);
+        if (extra.restoreStub) assertPredecessorUntouched(env, true);
       });
     }
   });
