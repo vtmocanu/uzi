@@ -445,8 +445,9 @@ export type LeadConfigPostOutcome =
   | { kind: "transport"; error: unknown };
 
 /** Issue #4201: a state report refused locally, before any request, because its preconditions (an api
- *  feature, the registration nonce, a claim generation, an op id) do not hold. Never transient: the same
- *  report would be refused again. */
+ *  feature, the registration nonce, a claim generation, an op id) do not hold. Not retried by the in-place
+ *  report loops: a retry of the same flight's report cannot be relied on to change it, so the flight stops
+ *  unconfirmed with custody kept (fail closed). */
 export class ReportPreconditionError extends Error {
   constructor(message: string) { super(message); this.name = "ReportPreconditionError"; }
 }

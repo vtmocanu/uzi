@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { nullLogger } from "./helpers.js";
-import { WorkerClient, type PlanCrossCheckStateRequest } from "../src/client.js";
+import { ReportPreconditionError, WorkerClient, type PlanCrossCheckStateRequest } from "../src/client.js";
 
 // Issue #4201 m2a: the worker-side client of POST /runs/{id}/credential-switch/apply, the op_id on
 // the credential_switch signal, and the op-fenced credential switch state reports.
@@ -225,23 +225,29 @@ describe("credential switch state reports carry op_id", () => {
     } finally { await s.close(); }
   });
 
+  // Issue #4201: the client's local refusals are a typed ReportPreconditionError, which the runner's in-place report
+  // loops treat as non-transient (a plain Error would be retried as a transport failure).
+  const isPrecondition = (e: unknown): boolean => e instanceof ReportPreconditionError && /requires/.test(e.message);
+
   it("refuses an uncertain report client-side without nonce, op_id, generation or feature", async () => {
     const s = await server(() => json(200, { run: { status: "running" } }));
     try {
       const c = await registered(s.url);
-      await assert.rejects(c.reportState("run-1", report("credential_switch_uncertain")), /requires/);
-      await assert.rejects(c.reportState("run-1", report("credential_switch_uncertain", { op_id: "" })), /requires/);
-      await assert.rejects(c.reportState("run-1", report("credential_switch_uncertain", { op_id: "op-1", claim_generation: 0 })), /requires/);
+      await assert.rejects(c.reportState("run-1", report("credential_switch_uncertain")), isPrecondition);
+      await assert.rejects(c.reportState("run-1", report("credential_switch_uncertain", { op_id: "" })), isPrecondition);
+      await assert.rejects(c.reportState("run-1", report("credential_switch_uncertain", { op_id: "op-1", claim_generation: 0 })), isPrecondition);
       assert.equal(s.posts.length, 0);
     } finally { await s.close(); }
     const noNonce = await server(() => json(200, { run: { status: "running" } }), { worker_id: "w", protocol_features: FEATURES });
     try {
-      await assert.rejects((await registered(noNonce.url)).reportState("run-1", report("credential_switch_uncertain", { op_id: "op-1" })), /requires/);
+      await assert.rejects((await registered(noNonce.url)).reportState("run-1", report("credential_switch_uncertain", { op_id: "op-1" })), isPrecondition);
       assert.equal(noNonce.posts.length, 0);
     } finally { await noNonce.close(); }
     const noFeature = await server(() => json(200, { run: { status: "running" } }), { worker_id: "w", register_nonce: "n", protocol_features: [] });
     try {
-      await assert.rejects((await registered(noFeature.url)).reportState("run-1", report("credential_switch_uncertain", { op_id: "op-1" })), /requires/);
+      await assert.rejects((await registered(noFeature.url)).reportState("run-1", report("credential_switch_uncertain", { op_id: "op-1" })), isPrecondition);
+      // The hold report's own precondition throw site (no credential_switch_hold feature) is typed too.
+      await assert.rejects((await registered(noFeature.url)).reportState("run-1", report("credential_switch_held", { op_id: "op-1" })), isPrecondition);
       assert.equal(noFeature.posts.length, 0);
     } finally { await noFeature.close(); }
   });

@@ -410,7 +410,8 @@ also stops the flight without a hold.
 
 If a hold report stays unconfirmed (for a v1 report, after one retry and an
 ownership read; an in-place report retries transient failures on a capped backoff
-until it is confirmed, refused or the claim goes stale), the hold
+until it is confirmed, refused, the claim goes stale or a lifecycle stop arrives,
+and any other failure ends it unconfirmed at once), the hold
 may already exist on the server. After its own operations join, the worker still
 sends the fenced settlement acknowledgement, with bounded heartbeat retries if
 delivery is uncertain. If the hold never applied, that acknowledgement changes

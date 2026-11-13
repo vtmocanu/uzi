@@ -24,6 +24,7 @@ import { freshClaim, newApi, row, send, until } from "./gate-revision-harness.js
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { SummaryRunner } from "../src/summary-runner.js";
+import { RetainedRecoveryStop } from "../src/runner.js";
 import { codexRig, FakeCodexExecutor } from "./runner-codex-sinks-fixture.js";
 
 installHarness();
@@ -977,6 +978,20 @@ describe("issue #4201: an unconfirmed in-place report keeps retrying while the c
       assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "custody kept");
       assert.equal(r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain").length, 0, "no uncertain feed line");
       assert.equal(api.holdState(r.runId), undefined, "no hold was confirmed");
+    });
+  }
+
+  // The flight's own report wrapper throws RetainedRecoveryStop when an iteration park has begun (runner.ts, the
+  // `flight.iterationParkState !== "none"` check) while guard() still passes. That stop must end the loop, not be
+  // retried as a transient failure.
+  for (const [status, make] of [["credential_switch_held", heldScenario], ["credential_switch_uncertain", uncertainScenario]] as const) {
+    it(`${status}: a RetainedRecoveryStop from the report itself ends the loop at once (it is rethrown, not retried)`, TIMEOUT, async () => {
+      const { r, attempts } = await scripted(status, async (n) => { if (n <= 7) throw new RetainedRecoveryStop(); return STALE; }, make);
+      assert.equal(attempts, 1, "a retained stop is not retried");
+      assert.ok(!statusesOf(r).includes("completed"), statusesOf(r).join(","));
+      assert.equal(r.turns.length, 2, "no turn after the report");
+      assert.equal(fs.existsSync(worktreeDirFor(r.claim.issue_iid as number)), true, "custody kept");
+      assert.equal(r.posted.filter((m) => (m.kind as string) === "credential_switch_uncertain").length, 0, "no uncertain feed line");
     });
   }
 

@@ -1380,7 +1380,7 @@ const GUARDED_COMMAND_SETTLE_MS = GUARDED_LANE_JOIN_MS;
  * (no failed report), keeping the clone + HOME so the sweeper's requeue lets a reclaim resume the
  * retained work. Local, like TerminalReportError / StaleClaimError.
  */
-class RetainedRecoveryStop extends Error {
+export class RetainedRecoveryStop extends Error {
   constructor(options?: ErrorOptions) { super("retained recovery stopped; custody retained", options); }
 }
 
@@ -27444,9 +27444,10 @@ export class RunRunner {
     return this.recoveryRetryMs * 2 ** Math.min(attempt - 1, IN_PLACE_REPORT_MAX_DOUBLINGS);
   }
 
-  /** Whether a failed in-place report is worth repeating: `isTransient` (transport, 5xx, 408, 429, an unreadable ack),
-   *  except the client's own local precondition throws from `reportState` (a plain `Error`, which `isTransient`
-   *  counts as transport), which no retry can change. */
+  /** Whether a failed in-place report is worth repeating: `isTransient` (transport, 5xx, 408, 429; an unparseable
+   *  ack is not an error and simply leaves the report unconfirmed, while an oversized one throws
+   *  `ResponseBodyOverflowError`, which is not transient), except the client's local precondition refusal
+   *  (`ReportPreconditionError`, which `isTransient` alone would count as transport, being no `RequestError`). */
   private inPlaceReportRetryable(error: unknown): boolean {
     if (error instanceof ReportPreconditionError) return false;
     return isTransient(error);
