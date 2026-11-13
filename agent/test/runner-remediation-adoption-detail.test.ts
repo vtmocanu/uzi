@@ -33,7 +33,9 @@ const COLD = new Set<Mode>(["cold", "cold-mismatch", "cold-ownedtip", "cold-no-r
   "cold-no-token", "captured-journal-live"]);
 
 async function drive(t: TestContext, mode: Mode, iid: number) {
-  const claim = gitlabClaim(iid, { claim_generation: 2, session_id: "predecessor-session" });
+  const claim = gitlabClaim(iid, { claim_generation: 2, session_id: "predecessor-session",
+    // The runner's retained capture reaches captureAndUpload (the archive path) only for an inventory-guarded claim.
+    ...(mode === "upload-failed" ? { inventory_guarded: true } : {}) });
   const branch = `agent/issue-${iid}`;
   const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
   const bare = await git.ensureClone(fx.originPath);
@@ -76,10 +78,16 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
     testGitCacheOptions({ gitleaksBin: (git as any).gitleaksBin }));
   let models = 0, underB = false;
   const logs = recordingLogger();
+  // The runner's OWN recovery coordinator (RunRunner opts.recovery): same cache, same recoveryRoot, same archive
+  // client, so its own capture path is the one that meets the failing upload.
+  const uploads = new UploadClient();
+  const coordinator = new RecoveryCoordinator({ client: uploads as unknown as RecoveryArchiveClient, git: cache, log: nullLogger(),
+    recoveryRoot: cache.recoveryRoot, workerToken: "worker-join-token-abcdef0123456789" });
   const runner = new RunRunner(client, cache, runId => ({ homeDir: path.join(homeDir, runId), executor: {
     run: async () => { models++; throw new Error("fixture ends successor"); },
   } }), logs.logger, 20, undefined, { gitlab: fakeGitlab().gitlab,
     teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1,
+    ...(mode === "upload-failed" ? { recovery: coordinator } : {}),
     ...(mode === "cold-slow" ? { codexBoundaryDeadlineMs: 3000 } : {}) });
   api.setOwnershipStatus(claim.run_id, "running", 2);
   const coverageFor = () => cache.buildRecoveryCoverage(bare, {
@@ -107,22 +115,15 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
       command(bare, "config", key, JSON.stringify(j));
     }
   }
-  // Issue #1995 shape: an older archive was accepted, the latest upload failed, and the verified bundle is local only.
-  let custody: { accepted?: string; failed?: string; bundlePath?: string; uploads: UploadClient } | undefined;
+  // Issue #1995 shape: an older archive was accepted through the runner's coordinator; from then on every upload
+  // fails, so the runner's own capture of the retained source leaves its verified bundle local only.
+  let custody: { accepted?: string; uploads: UploadClient; coordinator: RecoveryCoordinator } | undefined;
   if (mode === "upload-failed") {
-    const uploads = new UploadClient();
-    const coordinator = new RecoveryCoordinator({ client: uploads as unknown as RecoveryArchiveClient, git: cache, log: nullLogger(),
-      recoveryRoot: path.join(fx.dataDir, "recovery-4177"), workerToken: "worker-join-token-abcdef0123456789" });
-    const pinInput = { runId: claim.run_id, kind: "issue" as const, branch, generation: 1,
-      bareDir: path.basename(bare), defaultBranch: "main", finalizationPin: true };
-    const older = await coordinator.pin({ ...pinInput, sourceSha: q });
+    const older = await coordinator.pin({ runId: claim.run_id, kind: "issue" as const, branch, generation: 1,
+      bareDir: path.basename(bare), defaultBranch: "main", finalizationPin: true, sourceSha: q });
     const accepted = await coordinator.captureAndUpload({ record: older!, barePath: bare, defaultBranch: "main" });
-    uploads.failNext = true;
-    // A later claim generation journals its own record, so the accepted archive of the older one cannot satisfy it.
-    const latest = await coordinator.pin({ ...pinInput, generation: 2, sourceSha: s });
-    const failed = await coordinator.captureAndUpload({ record: latest!, barePath: bare, defaultBranch: "main" });
-    const record = (await coordinator.inspect(claim.run_id)).find(r => r.sourceSha === s);
-    custody = { accepted: accepted.state, failed: `${failed.state}:${failed.reason}`, bundlePath: record?.bundlePath, uploads };
+    uploads.failAll = true;
+    custody = { accepted: accepted.state, uploads, coordinator };
   }
   const coldBefore = COLD.has(mode) ? journalRaw() : undefined;
   const capture = cache.recordRecoveryCapture.bind(cache);
@@ -203,7 +204,7 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
       parks: api.states.filter(x => x.runId === claim.run_id && x.body.status === "recovery_wait").map(x => x.body as unknown as Record<string, unknown>),
       reported: api.states.filter(x => x.runId === claim.run_id).map(x => String(x.body.status)),
       models, logs, classifierCalls, custody, wire: api.stateWire.filter(x => x.runId === claim.run_id).map(x => x.body as unknown as Record<string, unknown>),
-      bare, branch, q, s, base, originBefore, journal: () => JSON.parse(journalRaw()),
+      runId: claim.run_id, bare, branch, q, s, base, originBefore, journal: () => JSON.parse(journalRaw()),
       raw: journalRaw, coldBefore, flight,
       origin: () => ({ all: command(fx.originPath, "rev-list", "--all"), main: command(fx.originPath, "rev-parse", "refs/heads/main") }),
       clonePath: clone.path,
@@ -215,17 +216,21 @@ let counter = 4300;
 
 /** The archive api of issue #1995's live-recovery harness: accepts the first bundle, refuses the next with a transient 503. */
 class UploadClient {
-  uploads = 0; failNext = false; releases = 0;
+  uploads = 0; failAll = false; releases = 0; failed = 0;
   async reserveRecoveryCapture() { return { capture_id: "server-capture-1", state: "preparing" as const }; }
   async getRecoveryCaptureStatus(_run: string, captureId: string) { return { capture_id: captureId, state: "preparing" as const, manifest_bound: false }; }
   async uploadRecoveryBundle(_run: string, captureId: string, _manifest: unknown, bundle: AsyncIterable<unknown>) {
     for await (const _chunk of bundle) { /* drain */ }
     this.uploads++;
-    if (this.failNext) throw new RequestError("POST", "/archives/x/upload", 503, JSON.stringify({ error: "msg", reason: "busy" }));
+    if (this.failAll) { this.failed++; throw new RequestError("POST", "/archives/x/upload", 503, JSON.stringify({ error: "msg", reason: "busy" })); }
     return { capture_id: captureId, state: "available" as const, manifest_bound: true };
   }
   async releaseRecoveryCustody(runId: string) { this.releases++; return { run_id: runId, released: true, holds_released: 1 }; }
-  async listRecoveryHolds(runId: string) { return { run_id: runId, holds: [] }; }
+  hasFeature(feature: string) { return feature === "recovery_inventory_v1"; }
+  /** One open inventory-guarded hold for the successor's generation: the runner's retained capture is the guarded kind. */
+  async listRecoveryHolds(runId: string) {
+    return { run_id: runId, holds: [{ hold_id: "11111111-1111-4111-8111-111111111111", generation: 2, inventory_guarded: true, has_available_capture: false }] };
+  }
 }
 
 for (const [mode, expected] of [
@@ -325,19 +330,33 @@ test("an upload that failed with the verified bundle local still parks with the 
   const r = await drive(t, "upload-failed", counter++);
   const custody = r.custody!;
   assert.equal(custody.accepted, "uploaded", "the older archive was accepted");
-  assert.ok(custody.failed?.startsWith("needs_action"), "the latest upload failed: " + custody.failed);
-  assert.ok(custody.bundlePath && fs.existsSync(custody.bundlePath), "the local bundle is journaled on disk");
+  // The failing upload was met by the runner's own capture (the accepted one was the only success before execute).
+  assert.ok(custody.uploads.failed >= 1, "the runner's own capture attempted an upload and it failed");
+  // The runner's coordinator holds the generation-2 record its own capture journaled: needs_action, bundle local only.
+  const records = await custody.coordinator.inspect(r.runId);
+  const record = records.find(x => x.generation === 2 && x.state === "needs_action" && x.bundlePath);
+  assert.ok(record, "the runner journaled a local, not-uploaded bundle: " + JSON.stringify(records.map(x => [x.generation, x.state])));
+  assert.ok(fs.existsSync(record!.bundlePath!), "the runner's local bundle is on disk");
   assert.ok(r.parks.length >= 1, JSON.stringify({ reported: r.reported, logs: r.logs }));
   for (const park of r.parks) {
     assert.equal(park.recovery_cause, "retained_recovery_adoption_failed");
     assert.equal(park.recovery_detail, "secret_remediation_active");
   }
-  assert.equal(custody.uploads.releases, 0, "custody was not released");
+  assert.equal(custody.uploads.releases, 0, "custody was not released on the runner's client");
   assert.equal(r.models, 0);
-  // The verified local bundle holds the retained source tip, and the retained source itself is untouched.
-  command(r.bare, "bundle", "verify", custody.bundlePath);
-  assert.ok(command(r.bare, "bundle", "list-heads", custody.bundlePath).split("\n").some(l => l.startsWith(r.s)),
-    "the bundle carries the retained source tip");
+  command(r.bare, "bundle", "verify", record!.bundlePath!);
+  // The bundle's head is the capture's coverage tip; the retained source tip is reachable from it. Import it into a
+  // throwaway copy so the retained bare is never touched.
+  const heads = command(r.bare, "bundle", "list-heads", record!.bundlePath!).split("\n").map(l => l.split(" ")[0]!);
+  const copy = fs.mkdtempSync(path.join(fx.dataDir, "bundle-check-"));
+  try {
+    command(copy, "init", "--bare", "-q");
+    command(copy, "fetch", "-q", r.bare, "+refs/*:refs/src/*");
+    command(copy, "fetch", "-q", record!.bundlePath!, "+refs/*:refs/bundle/*");
+    assert.ok(heads.length > 0, "the bundle lists heads");
+    assert.ok(heads.some(h => { try { command(copy, "merge-base", "--is-ancestor", r.s, h); return true; } catch { return false; } }),
+      "the retained source tip is among the bundle heads or reachable from one");
+  } finally { fs.rmSync(copy, { recursive: true, force: true }); }
   assert.ok(fs.existsSync(r.clonePath));
   assert.equal(r.journal().recovery.blocker, "adoption_failed");
 });

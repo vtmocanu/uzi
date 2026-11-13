@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -91,7 +92,18 @@ func TestResumeRecoveryWaitDetailFenceLiveDB(t *testing.T) {
 		return rec.Body.Bytes()
 	}
 
+	// The owner's archive list (the service call behind GET recovery archives) must be unchanged by the refusal.
+	archiveList := func() any {
+		t.Helper()
+		summary, err := svc.Summary(e.ctx, e.user, e.run)
+		if err != nil {
+			t.Fatalf("archive list: %v", err)
+		}
+		return summary
+	}
+
 	e.parkAdoptionFailed(&active)
+	listBefore := archiveList()
 	if !bytes.Equal(download(), data) {
 		t.Fatal("pre-refusal download is not byte-identical")
 	}
@@ -121,6 +133,9 @@ func TestResumeRecoveryWaitDetailFenceLiveDB(t *testing.T) {
 	}
 	if !bytes.Equal(download(), data) {
 		t.Fatal("post-refusal download is not byte-identical")
+	}
+	if listAfter := archiveList(); !reflect.DeepEqual(listBefore, listAfter) {
+		t.Fatalf("refused Resume changed the archive list: %+v -> %+v", listBefore, listAfter)
 	}
 
 	// Absent and unknown classifications never refuse; they resume as before.
