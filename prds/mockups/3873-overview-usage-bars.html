@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- Overview redesign follow-up (epic #3873): the "By user" usage table with one combined bar per row
+     (length = cost share, segments = Claude / Codex share of runs), compact cost-note chips and
+     left-aligned bar headers. Sample data only, no backend. Open in a browser; it follows the OS
+     light/dark setting (Dawn / Ember tokens). IBM Plex loads from Google Fonts here; the product bundles it. -->
+<title>Usage Bars Proposal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one Overview "By user" card, the real app's Ember (dark) / Dawn (light) tokens (combined-bar layout). */
+:root {
+  --bg: #f2f4f7; --surface: #ffffff; --raised: #ebeef3; --edge: #d6dbe4; --edge-strong: #aeb6c4;
+  --fg: #151a22; --muted: #4a5567; --faint: #5f6a82;
+  --brand: #b93c0b; --claude: #d97757; --codex: #7a859a;
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #080a0f; --surface: #0f121a; --raised: #171b26; --edge: #272d3c; --edge-strong: #3a4256;
+  --fg: #e4e8f0; --muted: #949eb0; --faint: #7a859a;
+  --brand: #fb923c; --claude: #d97757; --codex: #949eb0; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #080a0f; --surface: #0f121a; --raised: #171b26; --edge: #272d3c; --edge-strong: #3a4256;
+  --fg: #e4e8f0; --muted: #949eb0; --faint: #7a859a;
+  --brand: #fb923c; --claude: #d97757; --codex: #949eb0; color-scheme: dark }
+
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.45;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 28px 48px }
+.wrap { max-width: 1180px; margin: 0 auto; display: grid; gap: 18px }
+h1 { font-size: 18px; font-weight: 600; margin: 0; text-wrap: balance }
+.lede { color: var(--muted); margin: 4px 0 0; max-width: 70ch }
+.note { color: var(--muted); font-size: 13px; max-width: 75ch; margin: 0 }
+.card { background: var(--surface); border: 1px solid var(--edge); border-radius: 12px; padding: 18px 20px; min-width: 0 }
+.card-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 12px }
+.card-head h2 { font-size: 14px; font-weight: 600; margin: 0 }
+.card-head span { color: var(--faint); font-size: 12px }
+.scroll { overflow-x: auto; margin-top: 10px }
+table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 860px }
+.disc { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; margin-top: 4px }
+.chip { font-family: var(--sans); font-weight: 400; font-size: 11px; color: var(--muted); background: var(--raised);
+  border: 1px solid var(--edge); border-radius: 999px; padding: 0 7px; line-height: 17px; cursor: help; white-space: nowrap }
+.chip:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px }
+th { text-align: right; font-size: 11px; font-weight: 500; letter-spacing: .06em; text-transform: uppercase; color: var(--faint);
+  padding: 8px 10px; border-bottom: 1px solid var(--edge); white-space: nowrap }
+th.l, td.l { text-align: left }
+th.b, td.b { text-align: left; padding-left: 18px }
+td.b .cell { justify-content: flex-start }
+td.b .fig { text-align: right }
+td { text-align: right; padding: 10px; border-bottom: 1px solid var(--edge); vertical-align: top; font-variant-numeric: tabular-nums; white-space: nowrap }
+td .sub { display: block; color: var(--faint); font-size: 11.5px; margin-top: 2px; white-space: nowrap }
+td.cost { font-family: var(--mono); font-weight: 500 }
+tr.total td { border-top: 1px solid var(--edge-strong); border-bottom: 0; font-weight: 600 }
+.you { color: var(--faint); font-weight: 400 }
+.bar { display: inline-flex; height: 6px; width: 96px; border-radius: 3px; overflow: hidden; background: var(--raised); vertical-align: middle }
+.bar > i { display: block; height: 100% }
+.bar .share { background: var(--brand) }
+.bar .c { background: var(--claude) }
+.bar .x { background: var(--codex) }
+.cell { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end }
+.fig { min-width: 4.2em; text-align: right; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 10px }
+.legend span { display: inline-flex; align-items: center; gap: 6px }
+.sw { width: 10px; height: 6px; border-radius: 2px; display: inline-block }
+.cmp { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px }
+.cmp div { background: var(--surface); border: 1px solid var(--edge); border-radius: 10px; padding: 12px 14px; min-width: 0 }
+.cmp b { display: block; font-size: 13px; margin-bottom: 4px }
+.cmp p { margin: 0; color: var(--muted); font-size: 13px }
+@media (prefers-reduced-motion: no-preference) { .bar > i { transition: width .3s ease } }
+</style>
+
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Overview usage: cost share split by harness</h1>
+    <p class="lede">Mock of the new Overview's "By user" table (admin, Factory scope). Example users and numbers, not real data. Chosen layout: one combined bar. Every existing column stays.</p>
+  </header>
+  <p class="note" id="vnote"></p>
+
+  <section class="card" aria-label="By user">
+    <div class="card-head"><h2>By user</h2><span>all time, by cost</span></div>
+    <div class="scroll" role="region" aria-label="By user, scrollable">
+      <table id="t"><thead id="th"></thead><tbody id="tb"></tbody></table>
+    </div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <div class="cmp">
+    <div><b>One combined bar</b><p>Bar length is the user's cost share; its two segments are their Claude and Codex share of runs. Narrower, but one bar carries two meanings.</p></div>
+    <div><b>Fix either way</b><p>Today's Claude / Codex figures are clipped ("100 /", "61 / 3"). The mock gives the figure a fixed width so "61 / 39" and "100 / 0" always show, and the header reads "Claude / Codex".</p></div>
+    <div><b>Aligned bar headers</b><p>Bar columns are left-aligned: the header starts where the figure and bar block starts, so it no longer looks shifted as on today's Overview.</p></div>
+    <div><b>Narrow cost notes</b><p>The long "+ 270 runs without a cost estimate and 46 unreported runs" line becomes two small chips under the cost: "+270 no est." and "+46 unrep.". Hover or focus a chip for the full sentence. The table now fits without horizontal scroll from about 900px wide.</p></div>
+  </div>
+</div>
+
+<script>
+const rows = [
+  { u: "user-a@example.com", you: true, runs: 4079, prs: 1264, failed: 264, fin: 2143, last: "1d ago", cost: 47636, noest: 270, unrep: 46, c: 61 },
+  { u: "user-b@example.com", runs: 199, prs: 122, failed: 11, fin: 182, last: "2h ago", cost: 10210, c: 100 },
+  { u: "user-c@example.com", runs: 837, prs: 286, failed: 34, fin: 576, last: "11d ago", cost: 8447, c: 100 },
+  { u: "user-d@example.com", runs: 135, prs: 118, failed: 8, fin: 142, last: "10d ago", cost: 3856, unrep: 2, c: 100 },
+  { u: "user-e@example.com", runs: 33, prs: 27, failed: 2, fin: 33, last: "6d ago", cost: 683.92, c: 100 },
+  { u: "user-f@example.com", runs: 34, prs: 24, failed: 6, fin: 36, last: "16d ago", cost: 391.68, c: 100 },
+  { u: "user-g@example.com", runs: 3, prs: 0, failed: 0, fin: 2, last: "no failures", cost: 55.30, c: 100 },
+  { u: "user-h@example.com", runs: 2, prs: 0, failed: 0, fin: 2, last: "no failures", cost: 1.96, c: 100 },
+];
+const total = rows.reduce((s, r) => s + r.cost, 0);
+// Largest-remainder rounding so shares sum to 100, as the old Overview does.
+const raw = rows.map(r => r.cost / total * 100), fl = raw.map(Math.floor);
+let left = 100 - fl.reduce((a, b) => a + b, 0);
+raw.map((v, i) => [v - fl[i], i]).sort((a, b) => b[0] - a[0]).slice(0, left).forEach(([, i]) => fl[i]++);
+const fmt$ = v => "$" + (v >= 1000 ? Math.round(v).toLocaleString("en-US") : v.toFixed(2));
+const n = v => v.toLocaleString("en-US");
+const pct = (a, b) => b ? (a / b * 100).toFixed(1) + "%" : "0.0%";
+// Compact disclosure: short chips, full sentence in the tooltip and the accessible name.
+function disc(noest, unrep) {
+  const chips = [];
+  if (noest) chips.push(`<span class="chip" tabindex="0" title="${n(noest)} runs without a cost estimate: tokens only, no dollar figure" aria-label="${n(noest)} runs without a cost estimate">+${n(noest)} no est.</span>`);
+  if (unrep) chips.push(`<span class="chip" tabindex="0" title="${n(unrep)} unreported runs: cost incomplete; recorded partial costs included" aria-label="${n(unrep)} unreported runs">+${n(unrep)} unrep.</span>`);
+  return chips.length ? `<span class="disc">${chips.join("")}</span>` : "";
+}
+
+function shareCell(i) { return `<span class="cell"><span class="fig">${fl[i]}%</span><span class="bar" aria-hidden="true"><i class="share" style="width:${raw[i]}%"></i></span></span>`; }
+function splitCell(c) { return `<span class="cell"><span class="bar" aria-hidden="true"><i class="c" style="width:${c}%"></i><i class="x" style="width:${100 - c}%"></i></span><span class="fig">${c} / ${100 - c}</span></span>`; }
+function comboCell(i, c) {
+  const w = raw[i];
+  return `<span class="cell"><span class="fig">${fl[i]}%</span><span class="bar" style="width:140px" aria-hidden="true"><i class="c" style="width:${w * c / 100}%"></i><i class="x" style="width:${w * (100 - c) / 100}%"></i></span><span class="fig">${c} / ${100 - c}</span></span>`;
+}
+
+function render(v) {
+  const head = ["<th class='l'>User</th>", "<th>Runs</th>", "<th>PRs</th>", "<th>Failed</th>", "<th>Fail rate</th>", "<th>Last failure</th>", "<th>Cost</th>"];
+  if (v === "a") head.push("<th class='b'>Claude / Codex</th>", "<th class='b'>Cost share</th>"); else head.push("<th class='b'>Cost share · Claude / Codex</th>");
+  document.getElementById("th").innerHTML = "<tr>" + head.join("") + "</tr>";
+  let body = rows.map((r, i) => {
+    const extra = v === "a" ? `<td class="b" title="${r.c}% Claude, ${100 - r.c}% Codex runs">${splitCell(r.c)}</td><td class="b">${shareCell(i)}</td>`
+                            : `<td class="b" title="${fl[i]}% of factory cost; runs ${r.c}% Claude, ${100 - r.c}% Codex">${comboCell(i, r.c)}</td>`;
+    return `<tr><td class="l">${r.u}${r.you ? ' <span class="you">(you)</span>' : ""}</td><td>${n(r.runs)}</td><td>${n(r.prs)}</td><td>${n(r.failed)}</td>
+      <td>${pct(r.failed, r.fin)}<span class="sub">of ${n(r.fin)} finished</span></td><td>${r.last}</td>
+      <td class="cost">${fmt$(r.cost)}<br>${disc(r.noest, r.unrep)}</td>${extra}</tr>`;
+  }).join("");
+  const T = rows.reduce((a, r) => ({ runs: a.runs + r.runs, prs: a.prs + r.prs, failed: a.failed + r.failed, fin: a.fin + r.fin }), { runs: 0, prs: 0, failed: 0, fin: 0 });
+  const tc = Math.round(rows.reduce((s, r) => s + r.runs * r.c, 0) / T.runs);
+  const totExtra = v === "a" ? `<td class="b">${splitCell(tc)}</td><td class="b"><span class="cell"><span class="fig">100%</span><span class="bar" aria-hidden="true"><i class="share" style="width:100%"></i></span></span></td>`
+                             : `<td class="b">${comboCell(0, tc).replace(/width:[0-9.]+%"><\/i><i class="x" style="width:[0-9.]+%/, `width:${tc}%"></i><i class="x" style="width:${100 - tc}%`).replace(/^<span class="cell"><span class="fig">\d+%/, '<span class="cell"><span class="fig">100%')}</td>`;
+  body += `<tr class="total"><td class="l">Factory</td><td>${n(T.runs)}</td><td>${n(T.prs)}</td><td>${n(T.failed)}</td>
+    <td>${pct(T.failed, T.fin)}<span class="sub">of ${n(T.fin)} finished</span></td><td>2h ago</td>
+    <td class="cost">${fmt$(total)}<br>${disc(270, 48)}</td>${totExtra}</tr>`;
+  document.getElementById("tb").innerHTML = body;
+  document.getElementById("legend").innerHTML = v === "a"
+    ? `<span><i class="sw" style="background:var(--brand)"></i>Cost share of the factory</span><span><i class="sw" style="background:var(--claude)"></i>Claude runs</span><span><i class="sw" style="background:var(--codex)"></i>Codex runs</span>`
+    : `<span>Bar length: cost share of the factory</span><span><i class="sw" style="background:var(--claude)"></i>Claude runs</span><span><i class="sw" style="background:var(--codex)"></i>Codex runs</span>`;
+  document.getElementById("vnote").textContent = v === "a"
+    ? "Option A: the old Overview's cost-share bar comes back next to the existing Claude / Codex bar."
+    : "Option B: one bar per row. Its length is the cost share; its colours split that length by the user's Claude and Codex runs.";
+}
+render("b");
+</script>
+</body>
+</html>

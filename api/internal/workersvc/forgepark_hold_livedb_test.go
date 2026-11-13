@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -211,8 +212,8 @@ func TestForgeParkResumeCustodyLimitOneLiveDB(t *testing.T) {
 		t.Fatalf("Resume bypassed own custody limit: %s", got)
 	}
 	row := store.ListActiveRunsForHealthRow{ID: id, UserID: f.userID, Status: "queued", Kind: "issue"}
-	if got := f.svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(1)); got != reasonCustodyLimit {
-		t.Fatalf("reason=%q want %q", got, reasonCustodyLimit)
+	if got := f.svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(1)); got != apitypes.ReasonCustodyRunHoldBound {
+		t.Fatalf("reason=%q want %q", got, apitypes.ReasonCustodyRunHoldBound)
 	}
 	run, err := env.q.GetRunByID(env.ctx, id)
 	if err != nil || run.ClaimGeneration != 1 || run.ForgeParkCount != 1 || f.openHolds(t) != 1 {

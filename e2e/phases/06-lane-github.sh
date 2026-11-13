@@ -16,12 +16,10 @@
 #
 # Connection mechanism (same shape as the Forgejo lane): the harness flips the
 # boot-seeded connection's forge_type to 'github' directly in the THROWAWAY test DB
-# rather than creating a github connection through the product. This is a NETWORK-
-# ALIASING workaround, not a gate one: post-M10 CreateConnection accepts github, but
-# the driver derives its API host as api.<web-host>, which for the fake would be
-# api.forge-fake.e2e — a name the e2e overlay does not alias — whereas the seeded
-# base_url (https://forge-fake.e2e) plus go-github's /api/v3 enterprise mount lands
-# the driver on the fake's shared table directly. migration 00102's CHECK admits
+# rather than creating a github connection through the product, reusing the seeded
+# connection. With the seeded base_url (https://forge-fake.e2e) both drivers target
+# the fake's shared /api/v3 table: go-github's enterprise mount on the api side, and
+# the worker's <host>/api/v3 derivation for a non-github.com host. migration 00102's CHECK admits
 # 'github', the sealed PAT is forge-agnostic (a classic-PAT shape — no github_pat_
 # prefix), and the base_url is unchanged. Test state only — no api/seed change.
 #
@@ -30,10 +28,11 @@
 # ProjectRole + branch-protection rulesets (D6), issue create + R4 PR filter, the
 # Actions two-field status/conclusion collapse (D8), and the CI-fix trigger gate.
 # It does NOT drive a worker run: the worker's GitHubClient (agent/src/forge.ts) IS
-# wired into runner.ts (the 3-way forge pick), but its api.github.com host derivation
-# has no network alias here — so the worker PR path is validated at the FAKE (direct
-# /api/v3 /pulls create+dup smoke) and by the runner-push-mr unit test, rather than
-# through a live claim in this lane. See the run report.
+# wired into runner.ts (the 3-way forge pick). For this non-github.com host it derives
+# https://forge-fake.e2e/api/v3, the fake's own table, but this lane still does not
+# claim a run: the worker PR path is validated at the FAKE (direct /api/v3 /pulls
+# create+dup smoke), by the runner-push-mr unit test and by test:forge-fake-contract,
+# rather than through a live claim in this lane. See the run report.
 # =============================================================================
 say "PRD #238 M8 (GitHub lane): flip the seeded connection to github in the test DB"
 GHFLIP="$(db_psql "UPDATE forge_connections SET forge_type='github' WHERE forge_type='gitlab' RETURNING id")"

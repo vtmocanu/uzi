@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -87,7 +88,7 @@ func TestClaimedNeverStartedOldAgentRefusalLoopLiveDB(t *testing.T) {
 		t.Errorf("claimed %s at the custody limit, want idle", got)
 	}
 	row := store.ListActiveRunsForHealthRow{ID: run, UserID: f.userID, Status: "queued", Kind: "issue"}
-	if got := f.svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(limit)); got != reasonCustodyLimit {
-		t.Errorf("health reason = %q, want %q", got, reasonCustodyLimit)
+	if got := f.svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(limit)); got != apitypes.ReasonCustodyRunHoldBound {
+		t.Errorf("health reason = %q, want %q (per-run hold bound)", got, apitypes.ReasonCustodyRunHoldBound)
 	}
 }

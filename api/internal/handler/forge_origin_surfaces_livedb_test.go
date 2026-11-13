@@ -45,23 +45,26 @@ func TestForgeOriginSurfacesOverlayLiveDB(t *testing.T) {
 				}
 				return
 			}
-			insert("https://forge.example", 1, true, false)
-			insert("https://api.forge.example", 2, false, true)
+			// Use github.com for the distinct Git/API-origin case; GHES shares one origin (it
+			// serves its API under /api/v3 on the web host), so it has one row like GitLab.
+			cliMustExec(t, pool, "UPDATE repos SET web_url='https://github.com/group/repo' WHERE id=$1", repo)
+			insert("https://github.com", 1, true, false)
+			insert("https://api.github.com", 2, false, true)
 			h.overlayRunForgeOriginCooldowns(ctx, &d)
 			rows := h.workerForgeOriginCooldowns(ctx, []uuid.UUID{worker})[worker]
 			got := map[string]string{}
 			for _, r := range rows {
 				got[r.Origin] = strings.Join(r.Surfaces, ",")
 			}
-			if len(rows) != 2 || got["https://forge.example"] != "git" || got["https://api.forge.example"] != "api" {
+			if len(rows) != 2 || got["https://github.com"] != "git" || got["https://api.github.com"] != "api" {
 				t.Fatalf("worker rows: %+v", rows)
 			}
-			if d.ForgeOriginCooldown == nil || d.ForgeOriginCooldown.Origin != "https://api.forge.example" ||
+			if d.ForgeOriginCooldown == nil || d.ForgeOriginCooldown.Origin != "https://api.github.com" ||
 				strings.Join(d.ForgeOriginCooldown.Surfaces, ",") != "api" {
 				t.Fatalf("run projection should be the later-deadline API row: %+v", d.ForgeOriginCooldown)
 			}
 			// A row for an origin the repo no longer authorizes is not shown.
-			cliMustExec(t, pool, "DELETE FROM forge_origin_cooldowns WHERE worker_id=$1 AND origin='https://forge.example'", worker)
+			cliMustExec(t, pool, "DELETE FROM forge_origin_cooldowns WHERE worker_id=$1 AND origin='https://github.com'", worker)
 			cliMustExec(t, pool, "UPDATE repos SET web_url='https://elsewhere.example/group/repo' WHERE id=$1", repo)
 			cliMustExec(t, pool, "INSERT INTO forge_origin_cooldowns(user_id,worker_id,origin,cooled_until,last_reason,observed_at,git_unverified,api_unverified) VALUES($1,$2,'https://api.stale.example',$3,'transient_publication_exhausted',now(),false,true)",
 				owner, worker, time.Now().Add(time.Hour))

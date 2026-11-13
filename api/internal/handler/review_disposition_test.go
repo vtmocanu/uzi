@@ -45,6 +45,12 @@ type dispStore struct {
 	// expects and what keeps their assertions about the review half unchanged.
 	pendingJudge *store.GetActiveJudgeRunForTargetRow
 
+	// skip backs the issue #3257 judge-skip read; nil means no recorded skip (pgx.ErrNoRows).
+	// skipLookups counts the reads, so a test can assert the read is not made when a review
+	// or a pending judge supersedes the record, or the viewer cannot see the run.
+	skip        *store.JudgeSkip
+	skipLookups int
+
 	// judgeRunUsage backs the PRD #69 M6 judge-run timing+usage read the review READ path
 	// now makes. nil returns pgx.ErrNoRows ("no judge-run detail"), which keeps the
 	// judge_run field omitted and every pre-#69 assertion about the review half unchanged.
@@ -109,6 +115,24 @@ func (s *dispStore) GetActiveJudgeRunForTarget(_ context.Context, _ pgtype.UUID)
 	}
 	return *s.pendingJudge, nil
 }
+func (s *dispStore) GetJudgeSkipForTarget(_ context.Context, _ uuid.UUID) (store.JudgeSkip, error) {
+	s.note("GetJudgeSkipForTarget")
+	s.skipLookups++
+	if s.skip == nil {
+		return store.JudgeSkip{}, pgx.ErrNoRows
+	}
+	return *s.skip, nil
+}
+
+// The judge creation guard (issue #3257) runs against the fake on RerunJudge: READ COMMITTED,
+// a target lock that always succeeds, and a skip delete that is a no-op.
+func (s *dispStore) CurrentTransactionIsolation(context.Context) (string, error) {
+	return "read committed", nil
+}
+func (s *dispStore) LockRunForJudge(_ context.Context, id uuid.UUID) (uuid.UUID, error) {
+	return id, nil
+}
+func (s *dispStore) DeleteJudgeSkipForTarget(context.Context, uuid.UUID) error { return nil }
 func (s *dispStore) ListDispositionsForReview(_ context.Context, _ uuid.UUID) ([]store.RecommendationDisposition, error) {
 	s.note("ListDispositionsForReview")
 	return s.disps, nil

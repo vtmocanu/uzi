@@ -14,7 +14,7 @@
 # secret and no write scope -- the boundary is unchanged.
 #
 # The jobs use Taskfile gate targets. Most gates run flat in parallel; agent
-# tests use two file shards plus an always-run
+# tests use three file shards plus an always-run
 # required-check aggregator named `test-agent`. The recipes live in Taskfile.yml
 # so local and CI cannot diverge; `lint-repo` invokes the composed
 # `task gate:repo` because its members are repo-wide checks with no component.
@@ -658,12 +658,12 @@ jobs:
       !cancelled() &&
       (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
       needs.changes.outputs.skip_components != '1')
-    name: test-agent-shard (${{ matrix.shard }}/2)
+    name: test-agent-shard (${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
@@ -677,7 +677,7 @@ jobs:
           go-version: "1.27"
           check-latest: true
           cache: false
-      # Both shards build the same tool with the same flags; shard 1 alone saves.
+      # Every shard builds the same tool with the same flags; shard 1 alone saves.
       - uses: ./.github/actions/go-cache
         id: gocache
         with:
@@ -696,7 +696,7 @@ jobs:
       # both (the GitLab alpine job had to `apk add git bash`).
       - name: test:agent shard
         env:
-          UZI_AGENT_TEST_SHARD: ${{ format('{0}/2', matrix.shard) }}
+          UZI_AGENT_TEST_SHARD: ${{ format('{0}/3', matrix.shard) }}
           UZI_AGENT_TEST_JUNIT: shard-${{ matrix.shard }}.xml
         run: task test:agent:shard
       # Revisit placement only if the slowest agent leg exceeds the next CI job by >60s on main.
@@ -708,7 +708,7 @@ jobs:
           task test:codex-m4
           printf 'passed\n' > "agent/shard-${SHARD_INDEX}.codex-m4"
       # The JUnit file names the files Node ACTUALLY ran. The marker proves M4
-      # completed in one leg; an accidental M4 run in leg 2 makes its own marker.
+      # completed in one leg; an accidental M4 run in leg 2 or 3 makes its own marker.
       - name: Save executed-file report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2

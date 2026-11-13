@@ -423,6 +423,7 @@ SD=$(state_dir) || SD=""
 LOCK=""
 if [ -n "$SD" ]; then
   LOCK="$SD/locks/merge"
+  peers_warm_identity
   me=$(self_identity) || { echo "cannot verify merge-lock owner" >&2; exit 3; }
   my_uuid=$(printf '%s' "$me" | cut -f2); my_name=$(printf '%s' "$me" | cut -f1)
   if ! atomic_mkdir "$LOCK" 2>/dev/null; then

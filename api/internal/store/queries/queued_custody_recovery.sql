@@ -232,14 +232,14 @@ WHERE r.worker_id = @worker_id AND r.id = ANY(@locked_parent_ids::uuid[])
         AND f.stop_kind IS NOT DISTINCT FROM r.stop_kind
         AND f.stop_reason IS NOT DISTINCT FROM r.stop_reason
         AND f.hold_reason IS NOT DISTINCT FROM r.hold_reason)
-  -- Same owner count and bounded continuation exemption as ClaimRun. An own
+  -- The park needs only the run's own in-range open holds at the limit (ClaimRun's hard per-run
+  -- bound, issue #4162); the owner admission count is deliberately not required here. An own
   -- open hold is also mandatory, so ordinary and generation-zero work cannot park.
   AND @custody_hold_limit::integer > 0
   AND (SELECT count(*) FROM recovery_custody_holds h
       WHERE h.id = ANY(@locked_hold_ids::uuid[])
         AND h.run_id = r.id AND h.user_id = r.user_id AND h.state = 'open'
         AND h.generation BETWEEN 1 AND r.claim_generation) >= @custody_hold_limit
-  AND fn_custody_admission_count(r.user_id, @heartbeat_cutoff::timestamptz) >= @custody_hold_limit
   -- A fresh current-generation execution or pending outcome still owns this run.
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
       WHERE a.worker_id = r.worker_id AND a.run_id = r.id AND a.claim_generation = r.claim_generation

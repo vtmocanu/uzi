@@ -34,16 +34,16 @@ const KEY = process.env.FORGE_FAKE_KEY || "/certs/key.pem";
 const STATE_FILE = process.env.FORGE_FAKE_STATE || "/tmp/forge-fake-state.json";
 const BASE = process.env.FORGE_FAKE_BASE_URL || "https://forge-fake.e2e";
 
-// The projects this fake serves. The first (group/repo) is always present; a
-// SECOND (FORGE_FAKE_PROJECT2, e.g. group/repo2) is added only when that env is
-// set. path_with_namespace + web_url must match what the harness seeds
+// The first project (group/repo) is always present; optional projects
+// (FORGE_FAKE_PROJECT2 through6) are added only when configured.
+// path_with_namespace + web_url must match what the harness seeds
 // (UZI_SEED_FORGE_REPOS) and what the worker derives the MR/clone URLs from.
 //
 // The second project exists solely for the PRD #42 M5 bounded-concurrency
 // scenario, which runs two issues on two DIFFERENT repos so a cap-2 worker's two
 // runs get independent git bare-caches (no per-repo GitCache serialization). Every
-// OTHER harness phase touches only the first project, and resolveProject() falls
-// back to it, so single-project behavior is byte-identical when the env is unset.
+// The four reserved restore projects keep crashed predecessors out of other fixtures' bares.
+// resolveProject() still falls back to the first for legacy issue/MR routes.
 function makeProject(id, pathWithNamespace) {
   return {
     id,
@@ -53,7 +53,10 @@ function makeProject(id, pathWithNamespace) {
   };
 }
 const PROJECTS = [makeProject(1, process.env.FORGE_FAKE_PROJECT || "group/repo")];
-if (process.env.FORGE_FAKE_PROJECT2) PROJECTS.push(makeProject(2, process.env.FORGE_FAKE_PROJECT2));
+for (let id = 2; id <= 6; id++) {
+  const configured = process.env[`FORGE_FAKE_PROJECT${id}`];
+  if (configured) PROJECTS.push(makeProject(id, configured));
+}
 const PROJECT = PROJECTS[0]; // back-compat alias for the single-project references
 
 // The GitLab accounts this fake knows by id. 1 is the connection's bot (GET /api/v4/user);
@@ -76,7 +79,7 @@ function resolveProject(idParam) {
 }
 
 // --- git smart-HTTP (optional; the E2E_GIT_SMART_HTTP variant) ----------------
-// Serves the single bare repo under GIT_ROOT via `git http-backend`, gated on an
+// Serves each project's own bare under GIT_ROOT via `git http-backend`, gated on an
 // HTTP Basic credential. This lets the harness assert the worker sends
 // git-over-HTTPS *Basic* auth (the M6 fix) — which the default local-path remote
 // cannot exercise. Dormant in the default harness (the worker never git-talks to
@@ -729,14 +732,25 @@ function handleGit(req, res, url) {
   // local-path bare is the same host dir, so this counter is the only transport signal).
   if (req.method === "POST" && /\/git-receive-pack$/.test(url.pathname)) gitStats.receivePackPosts++;
   if (req.method === "POST" && /\/git-upload-pack$/.test(url.pathname)) gitStats.uploadPackPosts++;
-  // Map any /<ns…>/<repo>.git/<rest> onto the single bare repo GIT_ROOT/repo.git.
+  // Keep the same per-project bare on both transports; aliasing every path to repo.git would
+  // make the independent-restore fixture repositories share upstream refs and content.
+  const requested = decodeURIComponent(url.pathname.slice(1).split(".git", 1)[0]);
+  const project = PROJECTS.find(p => p.path_with_namespace === requested);
+  if (!project) {
+    // An unknown project must not silently reach another fixture's bare.
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("404 (forge-fake git: unknown project)");
+    log("git 404 unknown project", req.method, url.pathname);
+    return;
+  }
+  const bareName = project.path_with_namespace.split("/").pop();
   const rest = url.pathname.replace(/^.*?\.git/, "");
   const cgi = spawn(GIT_HTTP_BACKEND, [], {
     env: {
       ...process.env,
       GIT_PROJECT_ROOT: GIT_ROOT,
       GIT_HTTP_EXPORT_ALL: "1",
-      PATH_INFO: `/repo.git${rest}`,
+      PATH_INFO: `/${bareName}.git${rest}`,
       REQUEST_METHOD: req.method || "GET",
       QUERY_STRING: url.search.replace(/^\?/, ""),
       CONTENT_TYPE: req.headers["content-type"] || "",
@@ -1729,9 +1743,9 @@ const server = https.createServer(
 
         // Pull requests.
         if (method === "POST" && rest === "/pulls") {
-          // CreatePullRequest (the worker opens the PR — reached via the worker's
-          // api.github.com host mapping once runner.ts wires GitHubClient; also driven
-          // directly by the harness smoke). 422 on an existing OPEN PR for the same
+          // CreatePullRequest (the worker opens the PR — its GitHubClient derives
+          // <host>/api/v3 for a non-github.com host, which lands here, covered by
+          // test:forge-fake-contract; also driven directly by the harness smoke). 422 on an existing OPEN PR for the same
           // head/base — GitHub's generic-validation status, which the worker's
           // driver-declared duplicate set {409,422} catches (R6).
           const body = await readBody(req);

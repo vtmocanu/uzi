@@ -1325,7 +1325,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- claiming worker's effective caps (@worker_caps ∪ docker), gated by @capability_aware.
       AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind, @worker_caps::text[], r.required_capabilities, @capability_aware::boolean)
       -- PRD #1296 M1 (D2/D4): custody-admission. Block the claim when the run's OWNER
-      -- already holds >= @custody_hold_limit admission-counted open holds (ADR-2445) — the
+      -- already holds >= @custody_hold_limit admission units (ADR-2445) — the
       -- owner has too much unpublished work awaiting recovery disposition. A gated claim
       -- matches no row, so the run stays queued (the health resolver surfaces a distinct
       -- custody-limit reason against this SAME predicate in a later milestone). This is an
@@ -1352,20 +1352,33 @@ WITH checker_template_pins AS MATERIALIZED (
       -- and loops forever; the owner cap used to stop that loop. Issue #3859 charges a
       -- WITNESSED departure of such a continuation (SweepClaimedNeverStartedCohort), so this
       -- bound remains the backstop for unwitnessed ones (e.g. older agents). Once a single run holds
-      -- @custody_hold_limit open holds of its own, it faces the owner cap like new work. The
-      -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
+      -- @custody_hold_limit open holds of its own, it is refused outright (see the hard
+      -- per-run bound below), whatever the owner count says. The
+      -- exemption is mirrored, logically equivalent under that hard bound, by
+      -- GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
       -- agree.
+      --
+      -- Issue #4162 / ADR-2445 amendment: the bound is HARD. A run whose own open holds (every
+      -- open hold, counted or not) reach @custody_hold_limit is refused here whatever the owner
+      -- count says; it is ANDed with the owner arm below, not ORed. The owner count is in
+      -- admission UNITS (fn_custody_admission_count groups one run's holds on one original
+      -- worker into a single unit). This is an admission gate with ADR-2445 D6 statement-snapshot
+      -- semantics, not a transactional ceiling: the predicate is evaluated in the candidate scan
+      -- before FOR UPDATE OF r SKIP LOCKED, so a claim plus requeue committed between another
+      -- claimant's snapshot and its row lock can be missed. Sequential claims see every
+      -- committed hold. A refused claim inserts no hold (the generation hold INSERT is fed only
+      -- by the claimed row).
       -- Report-only checkers open no custody hold; their exemption is independent
       -- of the bounded continuation exemption for code-publishing runs above.
       AND (@custody_hold_limit::int <= 0
            OR r.kind = 'cross_check'
-           OR (r.claim_generation >= 1
-               AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
-                             WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
-               AND (SELECT count(*) FROM recovery_custody_holds oh2
-                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int)
-           OR (SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)) < @custody_hold_limit::int)
+           OR ((SELECT count(*) FROM recovery_custody_holds oh2
+                  WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int
+               AND ((r.claim_generation >= 1
+                     AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                   WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open'))
+                    OR (SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)) < @custody_hold_limit::int)))
       -- PRD #3522 M3: the weekly usage reserve admission gate. @reserve_on is true only when the run
       -- owner has a threshold set (users.weekly_reserve_pct); every other @reserve_* param is then
       -- precomputed in Go (workersvc/usage_reserve.go, reserveSnapshot) from the owner's fresh
@@ -2122,16 +2135,19 @@ HAVING count(*) >= @custody_hold_limit::int AND @custody_hold_limit::int > 0;
 
 -- name: GetCustodyAdmissionForRun :one
 -- Issue #1751 / ADR-1751: the per-run custody-admission facts the health resolver reads so
--- its reasonCustodyLimit pill agrees with ClaimRun. open_holds is total open custody;
--- admission_counted_holds is the shared live-claim-discounted count compared against
--- @custody_hold_limit (ADR-2445); continuation_exempt is ClaimRun's continuation exemption, byte-for-byte
--- the same expression: the run was claimed before (claim_generation >= 1) AND its OWN open
--- custody-hold count (owner-scoped) is at least 1 and below @custody_hold_limit. The upper bound
--- stops a run that the never-started sweep keeps requeueing from opening holds forever (see
--- ClaimRun). A continuation-exempt run is never blocked by the custody cap. The separate
--- kind='cross_check' exemption is handled before this health read; hold-free children do not
--- become continuation-exempt. A run that does not exist (or
--- belongs to another owner), or a non-positive limit, yields continuation_exempt = false.
+-- its custody pills agree with ClaimRun. open_holds is total open custody;
+-- admission_counted_holds is the shared admission-UNIT count compared against
+-- @custody_hold_limit (ADR-2445, issue #4162: the live-claim-discounted count with one run's
+-- holds on one original worker grouped into one unit); continuation_exempt is ClaimRun's
+-- continuation exemption, logically equivalent under the hard per-run bound: the run was claimed before
+-- (claim_generation >= 1) AND its OWN open custody-hold count (owner-scoped) is at least 1 and
+-- below @custody_hold_limit. own_open_holds is that same own count (every open hold of the run,
+-- counted or not) and run_hold_bound_reached is ClaimRun's hard per-run bound: the limit is
+-- positive and own_open_holds >= the limit. A bound-reached run is refused by ClaimRun even when
+-- the owner is below the limit. The separate kind='cross_check' exemption is handled before this
+-- health read; hold-free children do not become continuation-exempt. A run that does not exist
+-- (or belongs to another owner), or a non-positive limit, yields continuation_exempt = false and
+-- run_hold_bound_reached = false.
 SELECT
     fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)::bigint AS admission_counted_holds,
     (SELECT count(*) FROM recovery_custody_holds h
@@ -2142,7 +2158,17 @@ SELECT
                       AND (SELECT count(*) FROM recovery_custody_holds oh2
                              WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int)
                 FROM runs r
-                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid), false)::boolean AS continuation_exempt;
+                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid), false)::boolean AS continuation_exempt,
+    COALESCE((SELECT count(*) FROM recovery_custody_holds oh2
+                WHERE oh2.user_id = @user_id::uuid AND oh2.run_id = @run_id::uuid
+                  AND oh2.state = 'open'
+                  AND EXISTS (SELECT 1 FROM runs r
+                                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid)), 0)::bigint AS own_open_holds,
+    COALESCE((SELECT (@custody_hold_limit::int > 0
+                      AND (SELECT count(*) FROM recovery_custody_holds oh2
+                             WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') >= @custody_hold_limit::int)
+                FROM runs r
+                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid), false)::boolean AS run_hold_bound_reached;
 
 -- name: GetRunClaimContext :one
 -- The repo + connection facts the claim payload needs, alongside the run. The
@@ -2404,10 +2430,13 @@ WHERE id = @id AND user_id = @user_id;
 -- "Consumed" here means APPLIED and not discarded (issue #1604): an approve the worker
 -- discarded as stale is settled by DiscardRunInputRows with disposition 'superseded', and
 -- that row never opens the gate.
--- claimed→running and running→running are unaffected (the guard only narrows the
--- awaiting_approval source status); autopilot never enters awaiting_approval.
--- Required cross-check runs additionally match the current published payload and
--- an applied, bound approval for its current gate revision.
+-- For ordinary runs claimed→running and running→running are unaffected (this guard
+-- only narrows the awaiting_approval source status); autopilot never enters
+-- awaiting_approval. Cross-check runs are NOT exempt: when
+-- (plan_cross_check_required OR plan_cross_check_gated) AND NOT auto_approve and
+-- plan_md is set, EVERY entry to running, claimed→running included, needs the
+-- current presented payload to match and an applied, bound approval for the current
+-- gate revision (the status-independent clause below, issue #4158).
 UPDATE runs SET
     -- Startup/recovery reports do not resolve an interrupted required plan check.
     -- SetRunAutopilotPlan clears on canonical application; the guards below admit
@@ -4183,6 +4212,10 @@ RETURNING id, user_id, status;
 --
 -- anthropic_spend_limit is deliberately NOT excluded: the owner chose a new credential, which
 -- is one of the three ways forward out of that hold (the others are Resume and Cancel).
+--
+-- The owner-hold exclusions below (all but the three retry-stamp ones) are mirrored in Go by
+-- workersvc.recoveryWaitOwnerHold, so set-token refuses them with a specific error instead of a
+-- 0-row race. Change one, change the other.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait'
@@ -11055,7 +11088,7 @@ SELECT id, runs.user_id, status, auto_approve,
        health, health_reason, health_since, health_notified_at,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
-       harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
+       harness, codex_material_revision, codex_secret_id, worker_id, claim_generation, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
@@ -13088,7 +13121,7 @@ WITH expired AS (
     RETURNING cc.*
 ), cancelled AS (
     UPDATE runs child SET plan_cross_check_gate_reason = NULL,
-    status = 'cancelled', finished_at = now(), updated_at = now(),
+    status = 'cancelled', status_since = now(), finished_at = now(), updated_at = now(),
         claim_released_at = now()
     FROM expired e WHERE child.id = e.checker_run_id AND child.status NOT IN ('completed', 'failed', 'cancelled')
 ), banked AS (
@@ -13123,7 +13156,7 @@ WITH leads AS MATERIALIZED (
     RETURNING cc.*
 ), cancelled AS (
     UPDATE runs child SET plan_cross_check_gate_reason = NULL,
-    status = 'cancelled', finished_at = now(), updated_at = now(),
+    status = 'cancelled', status_since = now(), finished_at = now(), updated_at = now(),
         claim_released_at = now()
     FROM superseded cc WHERE child.id = cc.checker_run_id
       AND child.status NOT IN ('completed', 'failed', 'cancelled')
@@ -13177,6 +13210,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
+  AND NOT (runs.recovery_wait_cause = 'retained_recovery_adoption_failed' AND runs.recovery_wait_detail IS NOT DISTINCT FROM 'secret_remediation_active')
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -13233,12 +13267,13 @@ UPDATE runs SET
     worker_recovery_episode = runs.worker_recovery_episode + 1,
     requeue_episode_baseline = runs.requeue_count,
     stale_requeue_generation = NULL, worker_recovery_evidence = NULL,
-    recovery_wait_cause = NULL, recovery_retry_not_before = NULL,
+    recovery_wait_cause = NULL, recovery_wait_detail = NULL, recovery_retry_not_before = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
+  AND NOT (runs.recovery_wait_cause = 'retained_recovery_adoption_failed' AND runs.recovery_wait_detail IS NOT DISTINCT FROM 'secret_remediation_active')
   -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
   -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
@@ -13330,6 +13365,7 @@ RETURNING *;
 -- Called under GetRunOwnedByWorkerForUpdate. Execution release is not custody release.
 UPDATE runs SET status='recovery_wait', status_since=now(), updated_at=now(),
  recovery_wait_cause = @recovery_cause::text,
+ recovery_wait_detail = CASE WHEN @recovery_cause::text = 'retained_recovery_adoption_failed' THEN sqlc.narg('recovery_detail')::text END,
  recovery_wait_count=recovery_wait_count+1,
  retained_park_count=retained_park_count+CASE WHEN @counted::boolean THEN 1 ELSE 0 END,
  recovery_retry_not_before=sqlc.narg('retry_not_before')::timestamptz,

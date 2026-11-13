@@ -115,5 +115,13 @@
         ]
       }
     ]
+  },
+  "judge_harness": {
+    "value": "x",
+    "source": "x",
+    "fixed_at": "x",
+    "notes": [
+      "x"
+    ]
   }
 }

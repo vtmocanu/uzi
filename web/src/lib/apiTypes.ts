@@ -252,7 +252,7 @@ type EffectiveModelSource =
   | "cross_check_pin" | "cross_check_worker_default";
 type EffectiveEffortSource =
   | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default";
-type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create";
+type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create" | "same_as_run";
 type EffectiveCredentialSource =
   | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
 type EffectiveRefusal =
@@ -297,7 +297,8 @@ export interface Credential {
 }
 
 /** PRD #3254: a predicted harness. `value` is null with source chosen_at_create when a
- *  creation-time policy (a note: automatic_weekly_reset or overflow) picks it at creation. */
+ *  creation-time policy (a note: automatic_weekly_reset or overflow) picks it at creation. The
+ *  judge_harness cell (PRD #3257) is null with source same_as_run when "Judge runs on" is unset. */
 export interface HarnessValue {
   value: string | null;
   source: EffectiveHarnessSource;
@@ -329,6 +330,8 @@ export interface EffectiveSettings {
   models: EffectiveModelCell[];
   efforts: EffectiveEffortCell[];
   cross_check: { models: EffectiveModelCell[]; efforts: EffectiveEffortCell[] };
+  /** PRD #3257: the harness a judge run would use; always present. */
+  judge_harness: HarnessValue;
 }
 
 export interface StartPreviewCredentialOverride {
@@ -519,6 +522,9 @@ export interface UserSettings {
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
   default_harness: Harness | null;
+  /** Per-user "Judge runs on" (PRD #3257); null = same as the run being reviewed. One of
+   *  claude|codex when set. Always present on the wire, like default_harness. */
+  judge_runs_on: Harness | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -574,6 +580,9 @@ export interface UserSettingsPatch {
   /** Per-user default harness (PRD #1429 M1 / D3); present-value sets the pin (claude|codex),
    *  present-null clears back to "no preference", absent leaves it unchanged. */
   default_harness?: Harness | null;
+  /** Per-user "Judge runs on" (PRD #3257); same tri-state as default_harness: a value sets the
+   *  judge harness, null clears back to "same as the run", absent leaves it unchanged. */
+  judge_runs_on?: Harness | null;
 }
 
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),
@@ -4047,6 +4056,13 @@ export interface Run {
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
+  /** Issue #4177: closed-set classification of a `retained_recovery_adoption_failed` hold,
+   *  set only for status `recovery_wait` with that cause. "secret_remediation_active": the
+   *  retained source is held under an active secret-scan remediation, so Resume cannot succeed
+   *  unchanged (the server refuses it with a 409). "remediation_proof_unknown": the remediation
+   *  proof could not be verified; a retry may help. Null, absent or any other value selects the
+   *  generic adoption-failure copy and never permits adoption. Never render the raw string. */
+  recovery_wait_detail?: "secret_remediation_active" | "remediation_proof_unknown" | null;
   /** Issue #1324: which part of the run a `recovery_wait` park interrupted. "publication"
    *  is a forge outage met while publishing: the run keeps its publication intent and
    *  resumes publication only. Null for every other park. Render an unrecognised value
@@ -5085,6 +5101,19 @@ export interface RunReview {
 export interface PendingJudge {
   state: "scheduled" | "running";
   enqueued_at: string;
+}
+
+// JudgeSkip is the recorded reason the AUTOMATIC judge of a run was skipped (issue #3257,
+// apitypes.JudgeSkipDTO): the judge's harness had no usable credential. A third sibling key on
+// the review envelope, always present and null when nothing was skipped; the server sets it
+// only when `review` and `pending_judge` are both null (read precedence review > pending >
+// skip). `harness` and `reason` are fixed server codes, typed as strings on purpose: the panel
+// maps each KNOWN code to fixed copy and renders generic fixed copy for anything else, so a
+// future code never reaches the page as raw text. `at` is when the skip was recorded.
+export interface JudgeSkip {
+  harness: string;
+  reason: string;
+  at: string;
 }
 
 // IssueDraft is the templated, human-editable draft for filing a forge issue from a

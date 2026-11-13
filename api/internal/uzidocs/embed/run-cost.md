@@ -112,6 +112,21 @@ pricing behavior. Its tokens remain, but its numeric zero is a storage
 placeholder, not a dollar estimate. Older runs are not backfilled: stored
 per-model totals lack the per-response evidence needed for the >272K tier.
 
+**One-time maintainer backfill (2026-11-12).** On one deployment, the
+maintainer chose a one-off SQL backfill of finished runs whose cost was
+`subscription` or `unreported` at zero. It priced each run's recorded per-model
+tokens from the price tables above and stored the result as `metered`.
+Codex rows used the short-prompt Standard rates times a calibration factor:
+the ratio of response-priced cost to short-prompt-priced cost measured on that
+deployment's fully metered runs of the same harness. Claude side-channel rows
+used the cache-write duration recorded in their usage payloads. These figures
+are estimates, not response-level pricing. The factor was measured on a single
+model and applied to others. Runs whose token accounting was incomplete keep
+only their recorded tokens, so their real cost may be higher. A later usage
+refold or a replayed legacy frame can revert a backfilled row. This was a
+one-off exception: uzi does not backfill automatically, and the policy above
+still holds.
+
 The UI shows metered zero as **$0.00**. A metered sub-label is
 "API-equivalent · Claude SDK", "API-equivalent · uzi price table" for Codex,
 or "API-equivalent" when the harness is unspecified. Legacy rows show

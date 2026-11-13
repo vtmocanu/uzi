@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { WorkerMemoryPressureResult } from "../src/protocol.js";
-import { WorkerMemoryCommands } from "../src/worker-memory-commands.js";
+import { MemoryWaitTimeout, WorkerMemoryCommands } from "../src/worker-memory-commands.js";
 
 const contextInput = () => ({
   run_id: "11111111-1111-4111-8111-111111111111", worker_id: "22222222-2222-4222-8222-222222222222", register_nonce: "nonce",
@@ -497,4 +497,109 @@ test("review: absent primary collision with unobserved sibling must refuse selec
     rows: [{ pid: 12, startTime: "10", rssBytes: 100 }] };
   assert.equal(commands.select([{ entry: a, observation }], 100, 200), undefined,
     "an absent primary must retain conservative PID overlap protection");
+});
+
+// ---- #4219: selector rejection reasons ----
+const reasonsOf = (registry: WorkerMemoryCommands, entry: Entry, o: Observation, now = 100, age = 200) => {
+  const { selection, rejected } = registry.selectWithRejections([{ entry, observation: o }], now, age);
+  return { selection, rejected, reasons: rejected[0]?.reasons };
+};
+
+test("rejection reasons: one case per class, with the RSS reported only for a fully valid available observation", () => {
+  const { registry, context } = setup();
+  const entry = enroll(registry, context);
+  const big = Array.from({ length: 257 }, (_, i) => row(1000 + i));
+  const cases: [string, Observation, readonly string[], number | undefined][] = [
+    ["observation_unavailable", { ...observation(), available: false }, ["observation_unavailable"], undefined],
+    ["incomplete", { ...observation(), complete: false }, ["observation_unavailable"], undefined],
+    ["empty rows", observation([]), ["malformed", "missing_root"], undefined],
+    ["missing rows array", { ...observation(), rows: undefined } as unknown as Observation, ["malformed"], undefined],
+    ["more than 256 rows", observation(big), ["malformed"], undefined],
+    ["invalid row", observation([row(10), { pid: -1, startTime: "10", rssBytes: 1 }]), ["malformed"], undefined],
+    ["unsafe total", observation([row(10, Number.MAX_SAFE_INTEGER), row(11, Number.MAX_SAFE_INTEGER)]), ["malformed"], undefined],
+    ["duplicate row", observation([row(10), row(10)]), ["overlap"], 200],
+    ["pid start-time reuse", observation([row(10), row(10, 100, "11")]), ["pid_collision"], 200],
+    ["missing root", observation([row(11)]), ["missing_root"], 100],
+  ];
+  const stale = reasonsOf(registry, entry, observation([row(10)], 0), 100, 50);
+  assert.deepEqual([stale.selection, stale.reasons, stale.rejected[0]?.rssBytesApprox], [undefined, ["stale"], 100]);
+  for (const [label, o, expected, rss] of cases) {
+    const out = reasonsOf(registry, entry, o);
+    assert.equal(out.selection, undefined, label);
+    assert.deepEqual(out.reasons, expected, label);
+    assert.equal(out.rejected[0]?.rssBytesApprox, rss, label);
+    assert.equal(out.rejected[0]?.runId, context.run_id, label);
+    assert.equal(out.rejected[0]?.commandId, entry.commandId, label);
+    assert.equal(out.rejected[0]?.index, 0, label);
+  }
+});
+
+test("rejection reasons: unregistered, phase-held, protected pid, same entry twice and shared identities", () => {
+  const { registry, context } = setup();
+  const phased = enroll(registry, context, 10);
+  registry.holdPhase(context);
+  assert.deepEqual(reasonsOf(registry, phased, observation()).reasons, ["phase"]);
+  const second = setup();
+  const drained = enroll(second.registry, second.context, 10);
+  second.registry.recordDrain(drained, { confirmed: true });
+  assert.deepEqual(reasonsOf(second.registry, drained, observation()).reasons, ["unregistered"]);
+  const third = setup();
+  const protectedEntry = enroll(third.registry, third.context, 10);
+  third.registry.protect("worker", { pid: 10, startTime: "5" });
+  assert.deepEqual(reasonsOf(third.registry, protectedEntry, observation()).reasons, ["pid_collision"]);
+  const fourth = setup();
+  const twice = enroll(fourth.registry, fourth.context, 10);
+  const both = fourth.registry.selectWithRejections([{ entry: twice, observation: observation() }, { entry: twice, observation: observation() }], 100, 200);
+  assert.equal(both.selection, undefined);
+  assert.deepEqual(both.rejected.map((r) => [r.index, r.reasons]), [[0, ["overlap"]], [1, ["overlap"]]]);
+  const fifth = setup();
+  const a = enroll(fifth.registry, fifth.context, 10);
+  const b = enroll(fifth.registry, fifth.context, 20);
+  const shared = fifth.registry.selectWithRejections([{ entry: a, observation: observation([row(10)]) }, { entry: b, observation: observation([row(10), row(20)]) }], 100, 200);
+  assert.equal(shared.selection, undefined);
+  assert.deepEqual(shared.rejected.map((r) => r.reasons), [["overlap"], ["overlap", "pid_collision"]]);
+});
+
+test("rejection reasons: supervisor or primary attestation mismatch is identity_mismatch", () => {
+  const { registry, context } = setup();
+  const entry = registry.register(context, {
+    source: "codex-model-command", toolId: "tool", attemptId: "attempt", command: "fixture",
+    root: { pid: 9, startTime: "9" }, primary: { pid: 10, startTime: "11" },
+    observe: async () => observation(), cancel: async () => {}, drain: async () => ({ confirmed: false }),
+  });
+  const adopted = { ...observation([row(12)]), supervisor: entry.root, primary: entry.primary };
+  assert.equal(reasonsOf(registry, entry, adopted).selection?.entry, entry);
+  for (const patch of [{ supervisor: undefined }, { primary: undefined }, { supervisor: { pid: 9, startTime: "8" } }, { primary: { pid: 10, startTime: "12" } }]) {
+    assert.deepEqual(reasonsOf(registry, entry, { ...adopted, ...patch }).reasons, ["identity_mismatch"]);
+  }
+});
+
+test("rejection reasons are deduped and listed in canonical order", () => {
+  const { registry, context } = setup();
+  const entry = enroll(registry, context);
+  const out = reasonsOf(registry, entry, { ...observation([row(10), row(10), row(-3 as number)], 0), available: false });
+  assert.deepEqual(out.reasons, ["observation_unavailable", "malformed", "overlap"]);
+});
+
+test("selectWithRejections picks exactly what select picks and reports the losers", () => {
+  const { registry, context } = setup();
+  const a = enroll(registry, context, 10);
+  const b = enroll(registry, context, 20);
+  const candidates = [{ entry: a, observation: observation([row(10, 100)]) }, { entry: b, observation: observation([row(20, 300)]) }];
+  const picked = registry.select(candidates, 100, 200);
+  const both = registry.selectWithRejections(candidates, 100, 200);
+  assert.equal(both.selection?.entry, picked?.entry);
+  assert.equal(both.selection?.rssBytesApprox, picked?.rssBytesApprox);
+  assert.deepEqual(both.rejected, []);
+  const mixed = registry.selectWithRejections([candidates[0]!, { entry: b, observation: { ...observation([row(20, 300)]), available: false } }], 100, 200);
+  assert.equal(mixed.selection?.entry, a);
+  assert.deepEqual(mixed.rejected.map((r) => [r.index, r.commandId, r.reasons]), [[1, b.commandId, ["observation_unavailable"]]]);
+  assert.deepEqual(registry.selectWithRejections(Array.from({ length: 257 }, () => candidates[0]!), 100, 200), { rejected: [] });
+});
+
+test("MemoryWaitTimeout is a named Error", () => {
+  const error = new MemoryWaitTimeout("memory IO interrupted");
+  assert.ok(error instanceof Error);
+  assert.equal(error.name, "MemoryWaitTimeout");
+  assert.equal(error.message, "memory IO interrupted");
 });

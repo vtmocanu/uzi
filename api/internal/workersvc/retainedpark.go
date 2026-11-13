@@ -41,6 +41,42 @@ func validateRetainedCapacityOnly(req StateRequest) error {
 	return nil
 }
 
+// RecoveryDetailFeature is the register feature token an api advertises once it accepts
+// StateRequest.RecoveryDetail (issue #4177). A worker sends the field only after seeing it.
+const RecoveryDetailFeature = "recovery_detail_adoption_refusal_v1"
+
+// Closed set of recovery_wait_detail values for a retained_recovery_adoption_failed park.
+const (
+	// RecoveryDetailSecretRemediationActive: retrying unchanged cannot help; Resume is refused.
+	RecoveryDetailSecretRemediationActive = "secret_remediation_active"
+	// RecoveryDetailRemediationProofUnknown: a retry may help.
+	RecoveryDetailRemediationProofUnknown = "remediation_proof_unknown"
+)
+
+// validateRecoveryDetail refuses a recovery_detail unless it rides a recovery_wait park with
+// cause retained_recovery_adoption_failed, a positive claim_generation and a closed-set value.
+// A nil field passes. It runs before any SQL or registration-evidence write.
+func validateRecoveryDetail(req StateRequest) error {
+	if req.RecoveryDetail == nil {
+		return nil
+	}
+	switch *req.RecoveryDetail {
+	case RecoveryDetailSecretRemediationActive, RecoveryDetailRemediationProofUnknown:
+	default:
+		return fmt.Errorf("%w: unknown recovery_detail", ErrInvalidState)
+	}
+	if req.State != "recovery_wait" {
+		return fmt.Errorf("%w: recovery_detail requires state recovery_wait", ErrInvalidState)
+	}
+	if req.RecoveryCause == nil || *req.RecoveryCause != recoveryCauseRetainedRecoveryAdoptionFailed {
+		return fmt.Errorf("%w: recovery_detail requires recovery_cause %q", ErrInvalidState, recoveryCauseRetainedRecoveryAdoptionFailed)
+	}
+	if req.ClaimGeneration == nil || *req.ClaimGeneration <= 0 {
+		return fmt.Errorf("%w: recovery_detail requires positive claim_generation", ErrInvalidState)
+	}
+	return nil
+}
+
 // claimRecoveryEpisode projects harness recovery restarts without changing the stored
 // worker-death allowance or its finalize/requeue predicates.
 func claimRecoveryEpisode(run store.Run) int64 {
@@ -99,6 +135,7 @@ func (s *Service) parkRetainedRecovery(ctx context.Context, wkr store.Worker, ow
 		ID: run.ID, WorkerID: workerID, ClaimGeneration: *req.ClaimGeneration,
 		RecoveryCause: *req.RecoveryCause, Counted: counted, RetryNotBefore: retry, SessionID: sessionID,
 		CheckpointContainsLatest: checkpoint,
+		RecoveryDetail:           pgconv.TextPtr(req.RecoveryDetail),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return run, 0, nil

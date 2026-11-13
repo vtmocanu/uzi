@@ -2209,6 +2209,18 @@ mockRuns.push({
   usage_estimated_tail: null,
 });
 
+// PRD #3257 M2: the judge-skipped fixture. A terminal Claude issue run with no review and no
+// pending judge, paired with a mockJudgeSkips row, so /runs/run-judge-skipped shows the run-review
+// panel's skip notice. Derived from run-unjudged (whose own job is the never-judged state and
+// must stay skip-free) so every other field stays realistic.
+mockRuns.push({
+  ...mockRuns.find((r) => r.id === "run-unjudged")!,
+  id: "run-judge-skipped", issue_iid: 21,
+  issue_title: "Rotate worker registration tokens on a schedule",
+  issue_description: "", branch: "agent/issue-21",
+  mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/44", mr_iid: 44,
+});
+
 // PRD #3708: gated plan cross-check runs (checked before your review), from the parked gate.
 mockRuns.push(...gatedCrossCheckRuns(mockRuns.find((r) => r.id === "run-awaiting")!));
 
@@ -2238,6 +2250,14 @@ for (const [id, max, sourceOnly] of [
     },
   });
 }
+// Per-run custody bound: open /runs/run-custody-run-bound under ?mock=custody-run-bound. The
+// literal is apitypes.ReasonCustodyRunHoldBound (api/internal/apitypes/recovery.go); the run's
+// own open holds reach the limit while the owner's counted units stay below it.
+mockRuns.push({
+  ...pausedBase, id: "run-custody-run-bound", status: "queued", hold_reason: null,
+  health: "ok", health_since: null,
+  health_reason: "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
+});
 // Issue #3767: a Claude run held on its Anthropic API key's spend limit. Owner-held (explicit
 // null retry stamp); open /runs/run-spend-limit-hold.
 mockRuns.push({

@@ -45,10 +45,12 @@ func (f *downFx) freshValidated() bool {
 	return v
 }
 
-// toMf steps the head fixture (421) down to 420 through migration 421's Down: no conversion and no
-// refusal, the Fresh columns stay and the shape check is NOT VALID. It is a no-op once at 420.
+// toMf walks the head fixture down to the 421 boundary, then through migration 421's Down to 420:
+// no conversion and no refusal, the Fresh columns stay and the shape check is NOT VALID. It is a
+// no-op once at 420. Finish all current-query seeding before calling it.
 func (f *downFx) toMf() {
 	f.t.Helper()
+	f.boundary()
 	if f.version() != 421 {
 		return
 	}
@@ -77,15 +79,16 @@ func (f *downFx) mfRefused(wantMsg string) {
 // still guards new writes, and Down drops exactly its two columns.
 func TestPolicyFreshOneClaimMigrationLiveDB(t *testing.T) {
 	f := newDownFx(t)
-	if f.version() != 421 || f.columns(freshColumns...) != 2 {
+	if f.version() <= boundaryVersion || f.columns(freshColumns...) != 2 {
 		t.Fatalf("head fixture: version %d, %d fresh columns", f.version(), f.columns(freshColumns...))
 	}
+	// The current-query seeding happens at the head, before any Down.
+	id := f.queuedPreserving(strings.Repeat("a", 40))
 	f.toMf()
 	var validated bool
 	if err := f.pool.QueryRow(f.ctx, "SELECT convalidated FROM pg_constraint WHERE conname=$1", freshShapeConstraint).Scan(&validated); err != nil || validated {
 		t.Fatalf("shape check must be NOT VALID (validated=%v, err=%v)", validated, err)
 	}
-	id := f.queuedPreserving(strings.Repeat("a", 40))
 	var nulls bool
 	if err := f.pool.QueryRow(f.ctx, "SELECT policy_fresh_consumed_generation IS NULL AND policy_fresh_confirmed_generation IS NULL FROM runs WHERE id=$1", id).Scan(&nulls); err != nil || !nulls {
 		t.Fatalf("a row without Fresh history must carry NULL stamps: %v %v", nulls, err)
@@ -122,6 +125,7 @@ func TestPolicyFreshOneClaimMigrationLiveDB(t *testing.T) {
 func TestPolicyFreshOneClaimValidateMigrationLiveDB(t *testing.T) {
 	f := newDownFx(t)
 	id := f.consumedFresh(2, true)
+	f.boundary()
 	validated := func() bool {
 		var v bool
 		if err := f.pool.QueryRow(f.ctx, "SELECT convalidated FROM pg_constraint WHERE conname=$1", freshShapeConstraint).Scan(&v); err != nil {
@@ -177,6 +181,7 @@ func TestPolicyFreshOneClaimDownConvertsActiveLiveDB(t *testing.T) {
 
 	converted := []uuid.UUID{pending, pausedPending, unconfirmed}
 	kept := []uuid.UUID{confirmed, plainPreserving, ordinary, terminal, retired}
+	f.boundary()
 	before := map[uuid.UUID]map[string]any{}
 	for _, id := range append(append([]uuid.UUID{}, converted...), kept...) {
 		before[id] = f.row(id)
@@ -239,6 +244,7 @@ func TestPolicyFreshOneClaimDownRefusesLiveRowsLiveDB(t *testing.T) {
 				f := newDownFx(t)
 				convertible := f.queuedFresh(strings.Repeat("a", 40))
 				active := tc.seed(f)
+				f.boundary()
 				mustExec(f.ctx, t, f.pool, "UPDATE runs SET status=$2 WHERE id=$1", active, live)
 				f.mfRefused("a live run still carries a one-claim fresh authorization")
 				if got := f.row(convertible)["status"]; got != "queued" {
@@ -282,12 +288,14 @@ func TestPolicyFreshOneClaimDownRefusesOrphansLiveDB(t *testing.T) {
 	t.Run("consumed without the preserving constraint", func(t *testing.T) {
 		f := newDownFx(t)
 		orphan := f.consumedFresh(2, true)
+		f.boundary()
 		mustExec(f.ctx, t, f.pool, "UPDATE runs SET policy_preserve_required=false WHERE id=$1", orphan)
 		f.mfRefused(orphanMsg)
 	})
 	t.Run("pending and consumed together", func(t *testing.T) {
 		f := newDownFx(t)
 		orphan := f.queuedFresh(strings.Repeat("a", 40))
+		f.boundary()
 		mustExec(f.ctx, t, f.pool, "UPDATE runs SET policy_fresh_consumed_generation=2 WHERE id=$1", orphan)
 		f.mfRefused(orphanMsg)
 	})
@@ -327,6 +335,7 @@ func TestPolicyFreshOneClaimHistoryRetiredThenDownLiveDB(t *testing.T) {
 		f.claimAt(id, 3, "running")
 		runs = append(runs, id)
 	}
+	f.boundary()
 	before := map[uuid.UUID]map[string]any{}
 	for _, id := range runs {
 		before[id] = f.row(id)
@@ -366,14 +375,18 @@ func TestPolicyShapeAFullRollbackWalkLiveDB(t *testing.T) {
 			t.Fatalf("after Up to %d the version is %d (%v)", v, got, err)
 		}
 	}
-	f := newDownFx(t) // a fresh isolated database migrated 0 -> 421
-	if f.version() != 421 {
-		t.Fatalf("head fixture at version %d, want 421", f.version())
+	f := newDownFx(t) // a fresh isolated database migrated 0 -> head
+	if f.version() <= boundaryVersion {
+		t.Fatalf("head fixture at version %d, want above %d", f.version(), int64(boundaryVersion))
 	}
 	a := strings.Repeat("a", 40)
 	requiredHead := f.pausedPreserving(a)
 	freshPending := f.queuedFresh(a)
 	rows := []uuid.UUID{requiredHead, freshPending}
+	f.boundary()
+	if f.version() != 421 {
+		t.Fatalf("boundary at version %d, want 421", f.version())
+	}
 	before := map[uuid.UUID]map[string]any{}
 	for _, id := range rows {
 		before[id] = f.row(id)

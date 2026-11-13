@@ -21,6 +21,13 @@ const button = () => screen.getByRole("button", { name: "Save custody hold limit
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
 describe("CustodyHoldLimitCard", () => {
+  it("describes units and the per-run bound", () => {
+    render(<Harness />);
+    const text = document.getElementById("custody-limit-description")!.textContent!;
+    expect(text).toContain("A run's open holds from the same original worker usually count once, as one unit; other holds count singly.");
+    expect(text).toContain("A single run whose own open holds reach the limit cannot start, even when the owner is below it.");
+  });
+
   it("renders the stored value and keeps Save disabled until changed", () => {
     render(<Harness initial="5" />);
     expect(input().value).toBe("5");

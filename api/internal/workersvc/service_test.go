@@ -1527,6 +1527,22 @@ func (f *fakeStore) CreateJudgeRun(_ context.Context, arg store.CreateJudgeRunPa
 	}
 	return store.Run{ID: uuid.New(), Kind: runkind.Judge, UserID: arg.UserID, TargetRunID: arg.TargetRunID}, nil
 }
+
+// Judge skip (issue #3257): the unit fake runs on READ COMMITTED (what the creation guard
+// asserts), locks always succeed, and records the skip rows a test reads back.
+func (f *fakeStore) CurrentTransactionIsolation(context.Context) (string, error) {
+	return "read committed", nil
+}
+func (f *fakeStore) LockRunForJudge(_ context.Context, id uuid.UUID) (uuid.UUID, error) {
+	return id, nil
+}
+func (f *fakeStore) DeleteJudgeSkipForTarget(context.Context, uuid.UUID) error { return nil }
+func (f *fakeStore) RecordJudgeSkip(context.Context, store.RecordJudgeSkipParams) (int64, error) {
+	return 1, nil
+}
+func (f *fakeStore) GetJudgeSkipForTarget(context.Context, uuid.UUID) (store.JudgeSkip, error) {
+	return store.JudgeSkip{}, pgx.ErrNoRows
+}
 func (f *fakeStore) GetActiveJudgeRunForWorkerTarget(context.Context, store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error) {
 	return f.activeJudgeRun, f.activeJudgeRunErr
 }
@@ -1909,7 +1925,8 @@ func (f *fakeStore) ListOpenCustodyHoldsForWorker(_ context.Context, arg store.L
 	return f.listCustodyRows, f.listCustodyErr
 }
 func (f *fakeStore) GetCustodyAdmissionForRun(_ context.Context, _ store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error) {
-	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.openCustodyHolds, AdmissionCountedHolds: f.openCustodyHolds}, nil
+	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.openCustodyHolds, AdmissionCountedHolds: f.openCustodyHolds,
+		OwnOpenHolds: f.openCustodyHolds, RunHoldBoundReached: false}, nil
 }
 func (f *fakeStore) ListReleasableCustodyHolds(_ context.Context) ([]store.ListReleasableCustodyHoldsRow, error) {
 	return f.releasableHolds, nil

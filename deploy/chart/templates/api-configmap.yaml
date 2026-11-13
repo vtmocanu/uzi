@@ -46,6 +46,10 @@ data:
     combination is a hard render failure rather than a last-wins silent pick.
   */ -}}
   {{- if .Values.forge.allowedBaseURLs }}
+  {{- /* Validated here too (not only in uzi.forgeEgressHosts) so a malformed entry fails the render with egress off. */ -}}
+  {{- range $i, $e := .Values.forge.allowedBaseURLs }}
+  {{- include "uzi.validateBaseURLEntry" (dict "key" "forge.allowedBaseURLs" "pos" (add1 $i) "entry" $e "rejectSeparators" false) -}}
+  {{- end }}
   {{- if hasKey .Values.api.config "FORGE_ALLOWED_BASE_URLS" }}
   {{- fail "Set the forge allowlist in EITHER forge.allowedBaseURLs OR api.config.FORGE_ALLOWED_BASE_URLS, not both: both set would emit a duplicate FORGE_ALLOWED_BASE_URLS ConfigMap key. Prefer forge.allowedBaseURLs (it also drives the worker egress FQDN list)." }}
   {{- end }}
@@ -56,7 +60,7 @@ data:
     issueTracker.allowedBaseURLs value (PRD #4173 S3): the issue tracker SSRF allowlist,
     SEPARATE from the forge one and never an input to the worker egress FQDN list (a worker
     never calls an issue tracker). Every entry is validated by
-    uzi.issueTrackerAllowedBaseURLs (https, with a host) before it is rendered. Empty (the
+    uzi.issueTrackerAllowedBaseURLs (bare https://host[:port]; userinfo, path, query and fragment are refused) before it is rendered. Empty (the
     default) renders no key, so no issue tracker connection can be created.
 
     Setting BOTH issueTracker.allowedBaseURLs AND api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS

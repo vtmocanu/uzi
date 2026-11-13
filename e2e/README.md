@@ -123,6 +123,27 @@ Results and artifacts (written under the rundir, `$RUNROOT`):
   point-in-time: logs emitted between it and the operation are not guaranteed captured, and
   this is not a continuous collector. Kept only when the rundir is kept (a red run, a LEAK
   sentinel, `KEEP_RUNDIR` or `KEEP_STACK`; under `KEEP_STACK` no teardown snapshot is taken).
+- `artifacts/docker-wiring/startup-*/`: written when a phase's in-phase DinD sidecar start
+  (`docker_wire_prepare`, phases 45 and 52) fails, before the exit trap removes the
+  containers (#4165): `up.log`, `ps.txt`, `dind-init.log` / `dind.log` (`--tail 80`),
+  `inspect.txt` (selected `State` fields only), `host-userns.txt` (the host's userns sysctls,
+  read-only) and `diagnostics.txt`. Every Docker read is bounded by `timeout`/`gtimeout`
+  (at most 62s in total) and skipped with a `MISSING-EVIDENCE` line when neither exists; the
+  phase still fails with its original message.
+
+Independent-restore fixtures use four reserved projects: phase 45 KA/KB use
+`group/restore45a` and `group/restore45b`; phase 52 cases 7/8 use `group/restore52a`
+and `group/restore52b`. Each has its own seeded upstream bare, worker-cache URL and
+protected `main`. They start disabled and return to disabled when the owning phase
+exits; `REPO_ID` stays unchanged. Ordinary cap-2 A/B and phase-52 cases 1-6 keep
+their original repositories. The main-repo fixtures retain their repository-agent
+roster; the KB fixture retains the original repo2/builtin posture.
+
+A completed restore's predecessor remains attributed on the worker even after its
+server custody hold is released. Reusing that bare for another restore must still
+refuse `census_foreign_active`; a different branch does not isolate the fixture.
+The dedicated bares avoid that cross-fixture residue without deleting sources or
+weakening the census. A kept stack is not a fresh fixture allocation.
 
 Fail-soft behavior: a red run now prints `summary.md` (every failing phase, not
 just the first) to stdout **before** teardown, and the suite exits `1` iff any
@@ -330,8 +351,7 @@ toolchain, as with the other Go test targets.
   https clone/push URL the api hands out. The worker's clone → worktree → commit
   → **push** path runs for real against it; the branch-pushed assertion reads the
   bare repo directly. This local-path leg stays the fast, hermetic default for
-  every phase (and is the only transport that keeps `repo.git`/`repo2.git` as two
-  independent bares, which the PRD #42 two-repo concurrency phase requires).
+  every phase. Both transports keep each configured project on its own upstream bare.
 - **git-over-HTTPS Basic auth is exercised on EVERY default run** (PRD #97 M1). A
   local-path push ignores all `http.*` config, so it never sends the worker's
   `Authorization: Basic` header — the exact blind spot the shipped
@@ -341,10 +361,9 @@ toolchain, as with the other Go test targets.
   lacking a valid `Authorization: Basic` (`uzi-bot:PAT`)**. A run that reaches
   `completed` with its branch on the bare therefore proves the worker sent Basic; a
   credential-injection regression turns the run red. (The opt-in
-  `E2E_GIT_SMART_HTTP=1` variant routes the *whole* suite over smart-HTTP; because
-  `forge-fake` collapses every repo path to one bare, that variant's #42 phase
-  asserts against the one shared bare — the default run keeps the full independent-
-  bare check.)
+  `E2E_GIT_SMART_HTTP=1` variant routes the *whole* suite over smart-HTTP;
+  each configured project resolves to its own seeded bare, so the variant keeps the
+  same independent-bare assertions as the default run.)
 - **`main` is never touched — and the fake remote enforces it** (PRD #97 M1). Each
   seeded bare carries a `pre-receive` hook that refuses `refs/heads/main`, so the
   "push to main is refused" assertion is real, not vacuous. The backstop is

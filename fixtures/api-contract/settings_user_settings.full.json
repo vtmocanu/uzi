@@ -37,6 +37,7 @@
   "dark_theme": "x",
   "typeface": "x",
   "default_harness": "x",
+  "judge_runs_on": "x",
   "judge_models": [
     {
       "harness": "x",

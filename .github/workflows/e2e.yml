@@ -107,6 +107,13 @@ jobs:
             default-load=true
             image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
+      # #4165: Ubuntu 24.04 runners set kernel.apparmor_restrict_unprivileged_userns=1, a host-wide AppArmor
+      # restriction that makes the rootless DinD sidecar's rootlesskit fail with "fork/exec /proc/self/exe:
+      # operation not permitted". This relaxes it on the disposable runner VM only; the rootless daemon and
+      # the Compose isolation configuration are unchanged.
+      - name: Allow unprivileged user namespaces for the rootless DinD sidecar
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Run compose E2E (stub executor)
         # Pin the harness rundir to a known path so the upload + issue steps can find
         # its artifacts (RUNROOT defaults to a $$-suffixed temp dir otherwise).

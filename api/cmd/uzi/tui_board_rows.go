@@ -666,6 +666,10 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 		if isRecoveryDecisionHold(r.RunDTO) {
 			line = "Owner-held · Resume now/Cancel · detail: enter"
 		}
+		if secretRemediationActiveDetail(r.RunDTO) {
+			// Issue #4177: the server refuses Resume for an active secret-scan remediation.
+			line = "Owner-held · Cancel · detail: enter"
+		}
 		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}

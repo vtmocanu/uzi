@@ -1,0 +1,103 @@
+{
+  "aggregate": {
+    "open_holds": 6,
+    "admission_counted_holds": 3,
+    "custody_hold_limit": 3,
+    "decision_needed": 1,
+    "blocked_runs": 1
+  },
+  "holds": [
+    {
+      "inventory_guarded": false,
+      "id": "c3d4e5f6-0000-4000-8000-000000000001",
+      "run_id": "9a7e2d10-3c44-4f0b-8a11-0c0de0000a01",
+      "generation": 1,
+      "state": "open",
+      "attention": "source_only",
+      "worker_id": "5b1c0f52-6d0e-4a52-9c1b-1f0a7d3e1001",
+      "worker_name": "hosted-1",
+      "has_available_capture": false,
+      "created_at": "2026-11-10T09:01:00Z",
+      "updated_at": "2026-11-10T09:01:00Z",
+      "counts_toward_admission": true,
+      "admission_reason": "run_not_live"
+    },
+    {
+      "inventory_guarded": false,
+      "id": "c3d4e5f6-0000-4000-8000-000000000002",
+      "run_id": "9a7e2d10-3c44-4f0b-8a11-0c0de0000a01",
+      "generation": 2,
+      "state": "open",
+      "attention": "source_only",
+      "worker_id": "5b1c0f52-6d0e-4a52-9c1b-1f0a7d3e1001",
+      "worker_name": "hosted-1",
+      "has_available_capture": false,
+      "created_at": "2026-11-10T09:05:00Z",
+      "updated_at": "2026-11-10T09:05:00Z",
+      "counts_toward_admission": false,
+      "admission_reason": "same_run_group"
+    },
+    {
+      "inventory_guarded": false,
+      "id": "c3d4e5f6-0000-4000-8000-000000000003",
+      "run_id": "9a7e2d10-3c44-4f0b-8a11-0c0de0000a01",
+      "generation": 3,
+      "state": "open",
+      "attention": "source_only",
+      "worker_id": "5b1c0f52-6d0e-4a52-9c1b-1f0a7d3e1001",
+      "worker_name": "hosted-1",
+      "has_available_capture": false,
+      "created_at": "2026-11-10T09:09:00Z",
+      "updated_at": "2026-11-10T09:09:00Z",
+      "counts_toward_admission": false,
+      "admission_reason": "same_run_group"
+    },
+    {
+      "inventory_guarded": false,
+      "id": "c3d4e5f6-0000-4000-8000-000000000004",
+      "run_id": "9a7e2d10-3c44-4f0b-8a11-0c0de0000a02",
+      "generation": 1,
+      "state": "open",
+      "attention": "archive_ready",
+      "worker_id": "5b1c0f52-6d0e-4a52-9c1b-1f0a7d3e1002",
+      "worker_name": "hosted-2",
+      "has_available_capture": true,
+      "capture_state": "available",
+      "created_at": "2026-11-10T09:12:00Z",
+      "updated_at": "2026-11-10T09:12:00Z",
+      "counts_toward_admission": true,
+      "admission_reason": "terminal_run"
+    },
+    {
+      "inventory_guarded": false,
+      "id": "c3d4e5f6-0000-4000-8000-000000000005",
+      "run_id": "9a7e2d10-3c44-4f0b-8a11-0c0de0000a03",
+      "generation": 1,
+      "state": "open",
+      "attention": "active",
+      "worker_id": "5b1c0f52-6d0e-4a52-9c1b-1f0a7d3e1003",
+      "worker_name": "hosted-3",
+      "has_available_capture": false,
+      "created_at": "2026-11-10T09:20:00Z",
+      "updated_at": "2026-11-10T09:20:00Z",
+      "counts_toward_admission": false,
+      "admission_reason": "live_claim"
+    },
+    {
+      "inventory_guarded": false,
+      "id": "c3d4e5f6-0000-4000-8000-000000000006",
+      "run_id": "9a7e2d10-3c44-4f0b-8a11-0c0de0000a04",
+      "generation": 1,
+      "state": "open",
+      "attention": "needs_action",
+      "worker_id": "5b1c0f52-6d0e-4a52-9c1b-1f0a7d3e1002",
+      "worker_name": "hosted-2",
+      "has_available_capture": false,
+      "capture_state": "needs_action",
+      "created_at": "2026-11-10T09:30:00Z",
+      "updated_at": "2026-11-10T09:30:00Z",
+      "counts_toward_admission": true,
+      "admission_reason": "decision_needed"
+    }
+  ]
+}

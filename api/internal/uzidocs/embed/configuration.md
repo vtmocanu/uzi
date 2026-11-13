@@ -156,7 +156,7 @@ These extend the core table above; `UZI_SECRET_KEY` (which also encrypts forge b
 
 | Var | Default | Notes |
 |---|---|---|
-| `FORGE_ALLOWED_BASE_URLS` | `https://github.com` | Comma-separated SSRF allowlist: the only forge base URLs a connection may target. Every entry must be an absolute `https://` URL; boot fails if the list is empty or any entry is malformed or non-`https`. The Forge tab (under Settings) offers exactly this set in its base-URL dropdown. |
+| `FORGE_ALLOWED_BASE_URLS` | `https://github.com` | Comma-separated SSRF allowlist: the only forge base URLs a connection may target. Every entry must be a bare `https://host[:port]` (an optional trailing `/` is fine); boot fails if the list is empty or any entry is malformed, non-`https`, or carries userinfo, a path, a query or a fragment (these were previously reduced silently to the host). `ISSUE_TRACKER_ALLOWED_BASE_URLS` applies the same entry rule, but an empty list is allowed (no issue tracker connection can be created). The Helm values `forge.allowedBaseURLs` and `issueTracker.allowedBaseURLs` fail the render for entries with userinfo, a path, a query or a fragment, and for other shapes the chart does not accept (the chart is stricter: ASCII host only, IDNs in `xn--` form; forge entries used with FQDN worker egress must be DNS hostnames, not IP literals). A bracketed IPv6 literal such as `https://[2001:db8::1]` is only shape-checked by the chart, so an invalid one (for example `https://[:::]`) renders and is refused by the api at boot instead; values set via `api.config.*` also fail at api boot. The Forge tab (under Settings) offers exactly this set in its base-URL dropdown. |
 | `FORGE_POLL_INTERVAL` | `60s` (`1m`) | Per-enabled-repo incremental sync cadence (Go duration). An invalid or non-positive value falls back to the default. See "Freshness contract" below. |
 | `FORGE_RECONCILE_EVERY` | `10` | Every Nth incremental poll is a full reconcile instead (fetches the complete `uzi`-labeled issue set with no `updated_after` bound, diffs, and evicts cache rows the forge no longer returns). A non-positive or unparseable value falls back to the default, same as the other numeric/duration vars here (the poller itself additionally clamps any value `< 1` to `1` — every poll becomes a full reconcile — as defense in depth, but that path isn't reachable through this env var). The very first poll after a repo is enabled is always a full reconcile regardless of this setting, since it has to seed the cache. |
 | `FORGE_HTTP_TIMEOUT` | `15s` | Hard per-call timeout on every outbound HTTP request to the forge (connect, projects, labels, issues, label updates). Closes the untimeouted-`http.DefaultClient` wart entirely. |
@@ -218,7 +218,7 @@ one operator-only piece is the SSRF allowlist for the clone target, a
 
 | Var | Default | Notes |
 |---|---|---|
-| `AGENT_SOURCE_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for the agent-source clone URL; every entry must be an absolute `https://` URL or boot fails. Unlike `FORGE_ALLOWED_BASE_URLS`, an **empty** list is not a boot error — the feature is off by default, so an unconfigured instance still boots — but it does mean nothing is allowed until you set at least one entry here, no matter what an admin saves in the URL field. |
+| `AGENT_SOURCE_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for the agent-source clone URL; every entry must be a bare `https://host[:port]` (optional trailing `/`); an entry with userinfo, a path, a query or a fragment fails boot (previously reduced silently to the host). Unlike `FORGE_ALLOWED_BASE_URLS`, an **empty** list is not a boot error — the feature is off by default, so an unconfigured instance still boots — but it does mean nothing is allowed until you set at least one entry here, no matter what an admin saves in the URL field. |
 
 ## CI status integration (PRD #6)
 
@@ -335,6 +335,7 @@ The body holds, for a manual start of an issue run with no model and no Anthropi
 | `models` | Eight cells: worker model, judge model, run-summary model and task-review model, each for Claude then Codex. |
 | `efforts` | Four cells: worker effort and task-review effort, each for Claude then Codex. |
 | `cross_check` | Eight cells: plan then code, Claude then Codex, as `models` and `efforts`. |
+| `judge_harness` | One cell, always present: the harness a [judge](./judge.md#judge-runs-on) run would use (`value`, `source`, `fixed_at`, `notes`). An explicit **Judge runs on** choice is `value` `claude` or `codex` with `source` `user_default`; unset is `value` null with `source` `same_as_run`, because the judge follows the harness of the run it reviews, known only once that run exists. `fixed_at` is `create` in both cases. |
 
 Each model and effort cell carries the stored choice, what **Default** would mean, the resolved value, its `source`, `fixed_at` and `notes`. An empty `resolved_model` means the runtime decides (note `sdk_default`); a null `resolved_effort` means nothing is sent. A Codex effort cell also carries the [catalog default](./worker-effort.md#what-the-codex-catalog-default-means).
 
@@ -344,7 +345,8 @@ Each model and effort cell carries the stored choice, what **Default** would mea
 |---|---|---|
 | Harness | The harness you pick for this start; else your default harness (skipped, with note `user_default_harness_unusable`, when it has no usable credential); else automatic. | `run_override`, `user_default`, `automatic`, `chosen_at_create` |
 | Worker model | Your model lane for the harness; else the `lead` template's pin; else the built-in (Codex `gpt-6.1-sol`; Claude has none, so the SDK or account decides). | `user_default`, `template`, `builtin` |
-| Judge and run-summary model | Your lane; else the instance default; else the built-in. If the instance settings cannot be read, the built-in applies and the cell carries note `instance_settings_unavailable`. | `user_default`, `instance_default`, `builtin` |
+| Judge and run-summary model | Your lane; else the instance default; else the built-in. If the instance settings cannot be read, the built-in applies and the cell carries note `instance_settings_unavailable`. The `judge_model` cell of the lane the judge will not run on (your explicit **Judge runs on** choice names the other harness) also carries note `not_used`. | `user_default`, `instance_default`, `builtin` |
+| Judge harness | Your **Judge runs on** choice (`claude` or `codex`); else the harness of the run being reviewed. | `user_default`, `same_as_run` |
 | Task-review model | A built-in you cannot configure. Codex carries note `not_configurable`; the Claude review sends no model, so the SDK decides. | `builtin` |
 | Worker effort | Your effort preference for the harness, then the product default. | see [Reasoning effort](./worker-effort.md) |
 | Task-review effort | Neither review pass sends an effort (note `not_sent`). | `builtin` |
@@ -754,7 +756,12 @@ The `worker_memory_pressure` feed event also carries an optional
 `memory_diagnostics` object with the decision metric, thresholds and
 `memory.stat` breakdown, including `active_file`, `file_dirty` and
 `file_writeback`. These are diagnostics only: the metric is unchanged and the
-guard still does not use dirty/writeback. See
+guard still does not use dirty/writeback. Its `tree.rejections` lists, best effort,
+each candidate command the guard could not select, by run and command ID, with a
+closed-set reason (for example `observation_timed_out`,
+`observation_unavailable` with the supervisor's `stale`, `overlap` or
+`pid_collision`) and the tree RSS when it is known. The worker also logs these
+rejections as a warning, even when no command was selected. See
 [ADR-2396](../adr/2396-worker-memory-guard.md).
 
 Cgroup memory PSI (`memory.pressure`) is optional. A read failing with exactly
@@ -1047,7 +1054,7 @@ See [Jobs](jobs.md#job-files) for what a job file is and [Agent skills](skills.m
 | `UZI_STORED_FILES_BUDGET_BYTES` | `4294967296` (4 GiB) | The shared ceiling on **job-file bytes plus recovery-archive bytes**, reservations included. Both stores admit against it, and recovery wins a conflict: see [Recovering unpublished work](run-recovery.md#shared-stored-file-budget). |
 | `UZI_JOB_FILES_RETENTION` | `168h` (7 days) | How long a finished job's files or CI repair inputs stay downloadable, counted from when the job or repair run ends. After it the bytes are deleted and the file row stays as an expired record (a download is 410 `file_expired`). |
 | `UZI_JOB_UPLOAD_TTL` | `1h` | How long an uploaded input that no job has attached stays before it expires. |
-| `UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for a product's skills repo URL; every entry must be an absolute `https://` URL or boot fails. A **separate** list from `AGENT_SOURCE_ALLOWED_BASE_URLS`, so enabling one never widens the other. An **empty** list is not a boot error: it turns product skill sets **off**. No product skills repo URL can be saved, a sync is refused, and claim-time delivery stops too, so skills a product already has applied stay in the database but no job receives them until you set an entry again. |
+| `UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for a product's skills repo URL; every entry must be a bare `https://host[:port]` (optional trailing `/`); an entry with userinfo, a path, a query or a fragment fails boot (previously reduced silently to the host). A **separate** list from `AGENT_SOURCE_ALLOWED_BASE_URLS`, so enabling one never widens the other. An **empty** list is not a boot error: it turns product skill sets **off**. No product skills repo URL can be saved, a sync is refused, and claim-time delivery stops too, so skills a product already has applied stay in the database but no job receives them until you set an entry again. |
 
 CI-watch artifact inputs reuse sealed job-file storage, the per-owner and instance quotas above, and the shared stored-files budget; they do not use the job upload size limits. See [Artifact repair evidence](./scheduling.md#artifact-repair-evidence) for GitHub-only fetching, manifest and logs-only fallbacks, worker capabilities and pending acceptance.
 

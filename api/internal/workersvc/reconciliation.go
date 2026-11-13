@@ -149,6 +149,9 @@ func (s *Service) SetStateReportWithReconciliation(ctx context.Context, worker s
 	if err := validateRetainedCapacityOnly(req); err != nil {
 		return result, err
 	}
+	if err := validateRecoveryDetail(req); err != nil {
+		return result, err
+	}
 	if err := validateRegistrationEvidence(req); err != nil {
 		return result, err
 	}

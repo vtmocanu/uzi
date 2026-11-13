@@ -337,6 +337,7 @@ func TestProfileBoundJobClaimAssemblyLiveDB(t *testing.T) {
 	usr := e.seedSkill(t, "mine-"+suffix, "user", &u, nil, "user body")
 	tmpl := uuid.New()
 	e.exec(`INSERT INTO agent_templates (id, name, description, prompt_body) VALUES ($1, $2, 'd', 'b')`, tmpl, "t-"+suffix)
+	trackLiveDBTemplate(t, e.pool, tmpl)
 	e.exec(`INSERT INTO agent_skill_allocations (template_id, skill_id, user_id) VALUES ($1, $2, NULL)`, tmpl, g)
 	e.exec(`INSERT INTO agent_skill_allocations (template_id, skill_id, user_id) VALUES ($1, $2, $3)`, tmpl, usr, u)
 

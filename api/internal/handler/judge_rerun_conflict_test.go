@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -31,6 +32,13 @@ type rerunStore struct {
 	// is produced (workersvc/judge_read.go: errors.As + Code == "23505").
 	createJudgeErr error
 	created        int
+	// judgeRunsOn is the owner's users.judge_runs_on (PRD #3257) that RerunJudge reads to
+	// resolve the judge harness; the zero value is "same as the run".
+	judgeRunsOn pgtype.Text
+}
+
+func (s *rerunStore) GetUserByID(_ context.Context, id uuid.UUID) (store.User, error) {
+	return store.User{ID: id, JudgeRunsOn: s.judgeRunsOn}, nil
 }
 
 func (s *rerunStore) GetUserSecretCiphertext(_ context.Context, _ store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
@@ -184,6 +192,39 @@ func TestRerunJudgeConflictMessages(t *testing.T) {
 				"so the re-fetch-and-converge path is unreachable", got)
 		}
 	})
+}
+
+// TestRerunJudgeNoCredentialNamesJudgeHarness pins the 422 a rerun returns when the judge's
+// harness has no usable credential (PRD #3257): the code is unchanged and the message names
+// the JUDGE's harness (here the owner's explicit Codex choice on a Claude run), not the
+// target run's. The fake store is not a *store.Queries, so createRunResolved refuses the
+// explicit Codex selection, which is the no-fallback refusal under test.
+func TestRerunJudgeNoCredentialNamesJudgeHarness(t *testing.T) {
+	ds, runID, _ := oneRecStore()
+	ds.run.Harness = string(workersvc.HarnessClaude)
+	st := &rerunStore{dispStore: ds, judgeRunsOn: pgtype.Text{String: "codex", Valid: true}}
+	h := newRunsHandler(t, st)
+	h.wsvc.SetSettings(judgeSwitch{enabled: true})
+
+	rec := httptest.NewRecorder()
+	h.RerunJudge(rec, rerunReq(store.User{ID: st.ownerID}, runID))
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("RerunJudge with an unusable explicit Codex judge = %d, want 422; body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %s: %v", rec.Body.String(), err)
+	}
+	if body["code"] != "no_credential_for_harness" {
+		t.Fatalf("code = %q, want no_credential_for_harness", body["code"])
+	}
+	if want := "the judge's harness (codex) has no usable credential"; body["error"] != want {
+		t.Fatalf("error = %q, want %q", body["error"], want)
+	}
+	if st.created != 0 {
+		t.Fatalf("CreateJudgeRun ran %d times; a refused explicit choice must create nothing", st.created)
+	}
 }
 
 // errorMessage reads httpx.Error's {"error": …} envelope. Decoding into a map rather than

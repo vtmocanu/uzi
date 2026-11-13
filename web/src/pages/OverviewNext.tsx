@@ -125,6 +125,8 @@ export function OverviewNext() {
           description={sentence}
           actions={
             <>
+              {isAdmin && <HealthChip />}
+              {people && <PeopleChip model={people} onShowUsageByUser={showUsageByUser} />}
               {commandMenu && (
                 <Button variant="secondary" size="sm" onClick={commandMenu.open} aria-keyshortcuts={commandShortcutKeys()}>
                   <SearchIcon aria-hidden="true" />
@@ -137,8 +139,6 @@ export function OverviewNext() {
                   </kbd>
                 </Button>
               )}
-              {isAdmin && <HealthChip />}
-              {people && <PeopleChip model={people} onShowUsageByUser={showUsageByUser} />}
               <Link to="/dashboard" className="text-sm font-medium text-brand hover:text-brand-hover">
                 Back to the current Overview
               </Link>
