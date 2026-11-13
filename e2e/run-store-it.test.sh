@@ -496,6 +496,24 @@ for scenario in group-unset group-workersvc group-rest group-rest-proof group-em
     grep -qF "LiveDB: ${#want[@]} passed, 0 skipped" "$case_dir/output"
 done
 
+# The workersvc group is derived from ALL_PKGS, not a second list: a copy of the script
+# whose ALL_PKGS lost (or duplicated) the entry must refuse the group before Docker.
+for scenario in group-workersvc-missing group-workersvc-duplicate; do
+  case_dir="$TMP/$scenario"
+  mkdir -p "$case_dir/copy/e2e"
+  awk -v mode="$scenario" '
+    $0 == "  ./internal/workersvc/..." { n++; if (mode == "group-workersvc-missing") next; print; print; next }
+    { print }
+    END { if (n != 1) exit 1 }' "$SCRIPT" > "$case_dir/copy/e2e/run-store-it.sh"
+  rc=0
+  env UZI_STORE_IT_GROUP=workersvc PATH="$READYBIN:$PATH" CASE_DIR="$case_dir" SCENARIO="$scenario" \
+    TMPDIR="$case_dir" UZI_STORE_IT_PG_WAIT_SECS=1 bash "$case_dir/copy/e2e/run-store-it.sh" > "$case_dir/output" 2>&1 || rc=$?
+  assert_case "workersvc group without exactly one ALL_PKGS entry exits 2" test "$rc" -eq 2
+  assert_case "workersvc group names the ALL_PKGS mismatch" grep -qF 'ALL_PKGS entries (want exactly 1)' "$case_dir/output"
+  assert_case "workersvc ALL_PKGS mismatch starts no database" \
+    bash -c '! grep -qs "^run " "$1"' _ "$case_dir/docker.log"
+done
+
 if [ "$fails" -eq 0 ]; then
   printf '\nrun-store-it teardown test: all assertions passed\n'
   exit 0

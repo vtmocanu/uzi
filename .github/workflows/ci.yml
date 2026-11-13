@@ -392,10 +392,12 @@ jobs:
           go-version: "1.27"
           check-latest: true
           cache: false
+      # Restores test-api's class READ-ONLY (no save step here): that job already builds
+      # workersvc with -race, and a new main-saved class would compete for the repo's
+      # Actions cache. Hit rate and cold-build cost are measured in the pilot (#4232).
       - uses: ./.github/actions/go-cache
-        id: gocache
         with:
-          class: api-livedb-workersvc
+          class: api-test
           module: api
       - uses: ./.github/actions/setup-task
       - name: Pull the pinned Postgres (mirror first, Docker Hub fallback)
@@ -409,12 +411,6 @@ jobs:
         env:
           UZI_STORE_IT_PG_IMAGE: ${{ steps.pg.outputs.ref }}
         run: task test:livedb-workersvc
-      - name: Save Go cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/go-cache-save
-        with:
-          key: ${{ steps.gocache.outputs.key }}
-          paths: ${{ steps.gocache.outputs.paths }}
 
   # LiveDB producer 2 of 2 (for itself and for test-api-store-it): the canonical recipe
   # `task test:codex-refresh-lostreply-e2e` = checkpoint-chain bridge, then

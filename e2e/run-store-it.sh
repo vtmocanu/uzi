@@ -67,7 +67,15 @@ if [ -z "${UZI_STORE_IT_GROUP+set}" ]; then
 else
   case "$UZI_STORE_IT_GROUP" in
     workersvc)
-      PKGS=(./internal/workersvc/...)
+      # Derived from ALL_PKGS, never a second copy: exactly one entry must match.
+      PKGS=()
+      for p in "${ALL_PKGS[@]}"; do
+        [ "$p" != ./internal/workersvc/... ] || PKGS+=("$p")
+      done
+      if [ "${#PKGS[@]}" -ne 1 ]; then
+        echo "run-store-it: UZI_STORE_IT_GROUP=workersvc matched ${#PKGS[@]} ALL_PKGS entries (want exactly 1)" >&2
+        exit 2
+      fi
       for opt in UZI_TASK_CHECKPOINT_RECOVERY_E2E UZI_CODEX_REFRESH_LOSTREPLY_E2E \
         UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E UZI_CI_ARTIFACTS_E2E UZI_STALE_WORKER_CANCEL_E2E; do
         if [ -n "${!opt:-}" ]; then

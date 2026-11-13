@@ -527,11 +527,13 @@ Amendment (2026-11-13, issue #4232): CI splits that sweep across two jobs, each 
 throwaway database, through `e2e/run-store-it.sh`'s `UZI_STORE_IT_GROUP`. `test-livedb-workersvc`
 sweeps `workersvc` alone; `test-codex-refresh-lostreply-e2e` sweeps the other six packages, in
 their existing order, then runs the combined proofs on that database. `test-api-store-it`
-requires both to succeed. The combined proofs now follow a partial sweep. That is safe because
-they do not depend on sweep residue. `TestCodexRefreshLostReplyE2E`, `TestCodexRetainedStopE2E`
-and `TestRecoveryRestoreWorkerClientSmallE2E` each migrate a fresh per-test schema, and
-`TestPrerequisiteClosureReleaseE2E` uses the ephemeral database from `newPrerequisiteClosureEnv`. The
-sweep-then-proof order, its no-skip guards, and every package's coverage per CI run are
+requires both to succeed. The combined proofs now follow a partial sweep, and the `workersvc`
+sweep runs concurrently on its own database, so the former global sweep-then-proof order
+holds only within the rest job. That is safe because the proofs do not depend on sweep
+residue: `TestCodexRefreshLostReplyE2E` and `TestCodexRetainedStopE2E` each migrate a fresh
+per-test schema, and `TestPrerequisiteClosureReleaseE2E` and
+`TestRecoveryRestoreWorkerClientSmallE2E` use the ephemeral database from
+`newPrerequisiteClosureEnv`. The no-skip guards and every package's coverage per CI run are
 unchanged. The script refuses an opt-in proof with the `workersvc` group, and refuses any
 other group value, the empty string included. Without the variable the local target still
 runs the full seven-package sweep before the proofs.
