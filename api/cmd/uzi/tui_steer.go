@@ -84,6 +84,10 @@ type steerState2 struct {
 // comparison would be a SECOND copy of that rule, free to drift from it — the exact
 // failure D6 exists to prevent.
 //
+// One exception (issue #4198): under the admin run debug flag a non-owner admin's uza_
+// token can READ the queue, so a 200 there is not proof of write access. A debug-served 200
+// carries admin_debug_read, and steerAccessForInputs maps it to steerNotOwner.
+//
 // A 404 here means "not the owner" rather than "no such run", because the run has
 // already loaded through the viewer path by this point: visibility is established, so
 // the only thing the owner-only endpoint can be refusing is ownership.

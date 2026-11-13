@@ -257,6 +257,25 @@ Registration controls and PAT least-privilege verification. See [auth-design.md]
 | `UZI_ALLOWED_EMAIL_DOMAINS` | — (empty = all) | Comma-separated registration email-domain allowlist, matched case-insensitively, **exact match only** (no subdomain wildcards: `a.example.com` does not match `example.com`). Empty/unset allows every domain (today's open behavior; the compose demo stays zero-config). A rejected domain returns `403` with the allowed list named. The domain is taken from the parsed address, so display-name forms (`Alice <alice@example.com>`) are handled correctly. The seed admin is **exempt** — an allowlist that excludes your own seed email never causes a bootstrap lockout. |
 | `UZI_PRIVILEGE_CHECK_INTERVAL` | `24h` | Cadence of the background PAT least-privilege re-check sweep (Go duration). When enabled (`> 0`), the sweep runs a boot pass shortly after start — back-filling never-checked (grandfathered) connections so an over-privileged token surfaces without waiting a full interval — then re-checks on the interval. `0` **disables the sweep entirely, including that boot pass**: it is the one duration knob where `0` is honored, not treated as "unset". With `0`, a never-checked connection therefore stays `unchecked` until its owner runs the on-demand "Check privileges" button — only the save-time check (which blocks an over-privileged token at connect) still runs regardless. A negative or otherwise malformed value falls back to the default. |
 
+### Admin run debug (issue #4198)
+
+The steer queue is otherwise owner-only ([PRD #95](../prds/done/95-activity-pane-v2.md) Decision 8). This is the deployment's opt-in exception for debugging other users' runs from the CLI. It is read-only.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_ADMIN_RUN_DEBUG` | `false` | Chart: `api.adminRunDebug.enabled`. **Off by default.** When on, a request authenticated by a Bearer CLI token whose stored scope is `admin_ro` (a `uza_` token) and that belongs to a live admin may read another user's run **inputs** (steer queue; a foreign chat run still 404s), **archive metadata**, **fetches**, **recovery holds** (`GET /api/recovery/holds?user=<uuid>` or `?run=<run-id>`, exactly one) and an all-states run listing (`GET /api/admin/runs?state=all`, optionally `user` and `since`; every status, newest first, at most 500 rows with a `truncated` flag, chat, judge and cross-check runs excluded). `state`, `user` or `since` without the flag and token get `403` naming the prerequisites. Cookies and `uzc_` tokens never qualify, and admin-ness is read live, so demotion applies on the next request. |
+
+What stays denied on a foreign run, flag or not: every write, archive download and `uzi run export`. Inputs and archives responses served this way carry `admin_debug_read: true`. See [cli.md](./cli.md#admin-run-debug-reading-other-users-runs) for the commands.
+
+Each newly authorized cross-user read writes one Info log line, `admin run debug read`, before the response is sent. Owner reads log nothing new. Fields:
+
+- every line: `actor_user_id`, `token_id`, `route`;
+- per-run reads (`route` is `runs.inputs`, `runs.archives` or `runs.fetches`): `run_id`, `owner_id`;
+- holds by user (`route` `recovery.holds`): `target_owner_id`; holds by run: `target_owner_id` and `run_id`;
+- the listing (`route` `admin.runs`): `owner_filter` (a user UUID or `all`), `since` (only when given), `returned`.
+
+The line never carries credentials, input bodies, fetch URLs or archive bytes.
+
 ## OIDC single sign-on (PRD #45)
 
 See [oidc.md](oidc.md) for the operator setup guide (Keycloak and Pocket ID walkthroughs, break-glass, troubleshooting) and [auth-design.md](auth-design.md#oidc-single-sign-on) for the design.
