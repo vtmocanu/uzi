@@ -1,6 +1,6 @@
 # ADR-4201: In-place Claude credential switch
 
-**Status**: Accepted (issue #4201; the worker, the apply route, the epoch journal and the worker-side holds have landed; the m3a release-path server gate is committed; m3b is not done)
+**Status**: Accepted (issue #4201; the worker, the apply route, the epoch journal, the worker-side holds, the m3a release-path server gate, the nonce fence on the op-carrying failed report, the in-place input ACK during a pending switch and the `old_cumulative` reading have landed; m3b is not done, blocked by the fleet capability cutoff)
 **Date**: 2026-11-13
 **Deciders**: the maintainer + agent team; owner decisions of 2026-11-12 are listed below.
 **Amends**: [ADR-1247](1247-per-run-token-selection.md) Seam 2 ("a switch happens only at a claim boundary"). Seams 1 and 3 and the fence column are unchanged.
@@ -30,6 +30,7 @@ The hard part is not the transaction. It is that the apply can **commit and lose
 - The token is returned **only after COMMIT**, in a `Cache-Control: no-store` response.
 - A replay by op id returns the same bytes, or `refused_committed` when the token can no longer be handed out (rotated, disabled, rejected or deleted since, or the vault is locked or the secret is not decryptable at replay time). The worker cannot reconstruct that state, so it reports uncertain (D5).
 - Outcomes are `applied`, `superseded` (a newer request replaced the named op), `not_applied` with a closed reason vocabulary, `refused_committed` and `fenced`.
+- The same registration-nonce fence covers every op-carrying worker report of the switch, not only the apply: the held report (D4), the uncertain report (D5) and the failed (give-up) report all name `op_id` and must carry the current `register_nonce`, so a delayed report from a superseded incarnation commits nothing (D8's wire rule; the op-less v1 reports are unchanged).
 
 An op id is minted by a database trigger whenever the switch stamp changes; stamps that existed before the upgrade are backfilled (migration 00427). A request therefore always names a specific operation, and a newer `set-token` supersedes an older one instead of being applied under its id.
 
