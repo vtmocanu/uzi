@@ -223,6 +223,77 @@ test("bounded FIFO helpers never leave a pending open", async (t) => {
   assert.equal(await withinBound(echoed, BOUND_MS, "the reader child never exited"), "hello\n");
 });
 
+interface Exit { code: number | null; signal: NodeJS.Signals | null; out: string; err: string }
+
+/** Poll `probe` every 20 ms until it holds; fails by name after `ms` of real time. */
+async function pollUntil(probe: () => boolean, ms: number, message: string): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!probe()) {
+    if (Date.now() >= deadline) throw new assert.AssertionError({ message });
+    await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+  }
+}
+
+/**
+ * True once `pid` is parked in a FIFO open. Where the kernel names its wait channel (this host reports
+ * "wait_for_partner"; others "fifo_open") that name is required; where it does not (unreadable or "0"), the process
+ * state must be S for 3 consecutive polls, which the caller drives.
+ */
+function blockedInFifoOpen(pid: number, sleepingPolls: { n: number }): boolean {
+  const procDir = path.join("/proc", String(pid));
+  let wchan = "";
+  try { wchan = fs.readFileSync(path.join(procDir, "wchan"), "utf8").trim(); } catch { /* fall back to the state */ }
+  if (wchan !== "" && wchan !== "0") return /fifo_open|wait_for_partner/.test(wchan);
+  let state = "";
+  try {
+    const stat = fs.readFileSync(path.join(procDir, "stat"), "utf8");
+    state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
+  } catch { /* gone */ }
+  sleepingPolls.n = state === "S" ? sleepingPolls.n + 1 : 0;
+  return sleepingPolls.n >= 3;
+}
+
+test("fifoDir teardown reaps its helper, releases child processes blocked on its FIFOs, and removes its directory", async (t) => {
+  const children: ChildProcess[] = [];
+  t.after(() => { for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+  const track = (child: ChildProcess): Promise<Exit> => {
+    children.push(child);
+    const exit: Exit = { code: null, signal: null, out: "", err: "" };
+    child.stdout?.on("data", (chunk: Buffer) => { exit.out += chunk.toString("utf8"); });
+    child.stderr?.on("data", (chunk: Buffer) => { exit.err += chunk.toString("utf8"); });
+    return new Promise<Exit>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => { exit.code = code; exit.signal = signal; resolve(exit); });
+    });
+  };
+
+  let dir = "";
+  let helperExit!: Promise<Exit>;
+  let readerExit!: Promise<Exit>;
+  let writerExit!: Promise<Exit>;
+  await t.test("inner", async (st) => {
+    const f = fifoDir(st, "fifo-teardown-", ["r", "w"], { pidFile: true });
+    dir = f.dir;
+    helperExit = track(spawn("sh", ["-c", `echo $$ > '${f.pid}'; exec sleep 1000`], { stdio: "ignore" }));
+    readerExit = track(spawn("sh", ["-c", `read v < '${f.path("r")}'; echo "got:$v"`], { stdio: ["ignore", "pipe", "inherit"] }));
+    writerExit = track(spawn("sh", ["-c", `echo x > '${f.path("w")}'`], { stdio: ["ignore", "inherit", "pipe"] }));
+    await pollUntil(() => fs.existsSync(f.pid!) && fs.readFileSync(f.pid!, "utf8").trim() !== "", 10_000, "the helper never wrote its pid file");
+    for (const child of [children[1]!, children[2]!]) {
+      const polls = { n: 0 };
+      await pollUntil(() => blockedInFifoOpen(child.pid!, polls), 10_000, `child ${child.pid} never blocked in its FIFO open`);
+    }
+  });
+
+  assert.ok(dir !== "", "the inner test ran");
+  const [helper, reader, writer] = await withinBound(Promise.all([helperExit, readerExit, writerExit]), 10_000,
+    "teardown left a child alive: the helper was not killed or a blocked FIFO open was not released");
+  assert.equal(helper.signal, "SIGKILL", "the helper was reaped by the pid-file kill");
+  assert.equal(reader.code, 0, `the blocked reader was released with EOF: ${reader.err}`);
+  assert.match(reader.out, /^got:/);
+  assert.doesNotMatch(writer.err, /No such file/, "the blocked writer was released by the read-side open, not by the directory going away");
+  assert.equal(fs.existsSync(dir), false, "the directory was removed");
+});
+
 test("issue #4066 pendingWork: an attempt that finishes within its bound is never counted", async (t) => {
   const { dataDir, bare, plain } = await fixtureBare(t);
   const sourceSha = execFileSync("git", ["-C", bare, "rev-parse", "refs/remotes/origin/main"], { encoding: "utf8" }).trim();

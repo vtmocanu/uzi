@@ -48,14 +48,15 @@ function pidAlive(pid: number): boolean {
 
 /**
  * Wait for `work`, failing with a named AssertionError after `ms` of REAL time or as soon as any of `raceWith` rejects.
- * The timer is unref'd and cleared; a `work` left pending is never an unhandled rejection.
+ * The timer is referenced (the awaited work may hold no handle of its own, and an unref'd bound would let the event loop
+ * drain so node:test cancels the test instead of this named failure) and is cleared in finally; a `work` left pending is
+ * never an unhandled rejection.
  */
 export async function withinBound<T>(work: Promise<T>, ms: number, message: string, ...raceWith: Promise<never>[]): Promise<T> {
   work.catch(() => undefined);
   let timer: NodeJS.Timeout | undefined;
   const expired = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => reject(new AssertionError({ message })), ms);
-    timer.unref();
   });
   try { return await Promise.race([work, expired, ...raceWith]); }
   finally { clearTimeout(timer); }
@@ -93,7 +94,7 @@ export async function writeFifoBounded(fifo: string, data: string, ms: number, w
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENXIO") throw error;
       if (Date.now() >= deadline) throw new AssertionError({ message: `no reader for ${what} within ${ms}ms` });
-      await new Promise<void>((resolve) => { setTimeout(resolve, 10).unref(); });
+      await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
       continue;
     }
     try { fs.writeSync(fd, data); } finally { fs.closeSync(fd); }
@@ -147,8 +148,7 @@ export function manualClock(): ManualClock {
         const timer = setTimeout(() => {
           watchers.delete(watcher);
           reject(new AssertionError({ message: `no timer matching ${pred.toString()} was scheduled within ${realBoundMs}ms` }));
-        }, realBoundMs);
-        timer.unref();
+        }, realBoundMs); // referenced: nothing else holds the loop open while waiting
         const watcher = { pred, wake: () => { clearTimeout(timer); watchers.delete(watcher); resolve(); } };
         watchers.add(watcher);
       });
