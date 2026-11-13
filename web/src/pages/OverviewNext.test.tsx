@@ -223,7 +223,7 @@ describe("OverviewNext for an admin", () => {
     mockApi.getAdminHealth.mockResolvedValue(clean);
     await mount();
     const applicable = clean.checks.length - clean.counts.na;
-    expect(screen.getByRole("link", { name: /System health/ }).textContent).toContain(
+    expect(screen.getByRole("button", { name: /System health/ }).textContent).toContain(
       `${clean.counts.ok} of ${applicable} checks passing`,
     );
   });
