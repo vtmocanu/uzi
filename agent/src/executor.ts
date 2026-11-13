@@ -652,7 +652,9 @@ export interface RunContext {
   secretRemediationGate?(options?: { unpublishedOnly: true }): Promise<SecretRemediationDecision>;
   /**
    * Issue #4258: the advisory, NON-TERMINAL mid-run secret remediation consumer. The executor calls it
-   * at an admitted work-turn boundary (never at the done point). The runner re-validates everything
+   * at an admitted work-turn boundary (never at the done point, never on an interactive run, and
+   * only when no interruption and no system text such as a clarification answer, completion rework,
+   * code repair or resume-preflight remediation owns the turn; otherwise the trigger stays pending). The runner re-validates everything
    * from scratch (a pending content-free trigger recorded by the mid-turn checkpoint scan is only a
    * hint) and returns ONLY `proceed` or `remediate` (with a mid-run rewrite follow-up); it never
    * returns `fail`. It never changes the authority of the done, checkpoint or finalize guards, which

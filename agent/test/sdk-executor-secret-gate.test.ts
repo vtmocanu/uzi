@@ -407,3 +407,248 @@ describe("SdkExecutor code cross-check on the last allowed iteration", () => {
     });
   }
 });
+
+/**
+ * Issue #4258 m2 — the advisory, non-terminal mid-run seam ctx.midRunSecretRemediation. The executor
+ * calls it at an admitted work-turn boundary only: not interactive, no control pending, no system
+ * text (clarification answer, completion rework, code repair, resume preflight) owning the turn.
+ * remediate replaces that turn's prompt and adds no turn; proceed changes nothing.
+ */
+function assistantText(text: string, sessionId = "sess-1"): SDKMessage {
+  return { type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text }] } } as unknown as SDKMessage;
+}
+function askUserTurn(question: string, sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: { content: [{ type: "tool_use", id: "ta", name: "mcp__uzi__ask_user", input: { questions: [{ question }] } }] },
+  } as unknown as SDKMessage;
+}
+const MID = "MIDRUN-REMEDIATE-MARKER: rewrite the flagged commit";
+const work = (): SDKMessage[] => [assistantText("working"), resultSuccess()];
+const finish = (): SDKMessage[] => [signalDone(), resultSuccess()];
+
+/** A mid-run seam that models a trigger latched by the first turn: it stays `proceed` until a work
+ *  turn has been dispatched, then returns remediate `times` times. Records the prompt count at each call. */
+function midSeam(prompts: string[], times = 1): { seam: () => Promise<SecretRemediationDecision>; seenAt: number[] } {
+  const seenAt: number[] = [];
+  let left = times;
+  return {
+    seenAt,
+    seam: async () => {
+      seenAt.push(prompts.length);
+      if (prompts.length >= 1 && left > 0) { left--; return { action: "remediate", followUp: MID }; }
+      return { action: "proceed" };
+    },
+  };
+}
+const runCtx = (overrides: Partial<RunContext> = {}): RunContext => makeCtx({
+  kind: "issue", seeded: true, planApproved: true, approvedPlan: "approved", config: { max_iterations: 8 }, ...overrides,
+});
+
+describe("SdkExecutor mid-run secret remediation seam (Issue #4258)", () => {
+  it("remediate owns exactly the next boundary's turn without signal_done, then work resumes", async () => {
+    const { queryFn, prompts } = fakeTurns([work(), work(), finish()]);
+    const mid = midSeam(prompts);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(runCtx({ midRunSecretRemediation: () => mid.seam() }));
+    assert.equal(prompts.length, 3, "the guidance replaces a boundary's prompt and adds no turn");
+    assert.equal(prompts[0]!.includes(MID), false);
+    assert.equal(prompts[1]!.includes(MID), true);
+    assert.equal(prompts[2]!.includes(MID), false);
+    assert.equal(mid.seenAt[0], 0, "the first boundary only asks; nothing is latched before a work turn");
+  });
+
+  it("an owner follow-up queued at that boundary rides the following turn, receipt after it", async () => {
+    const { queryFn, prompts } = fakeTurns([work(), work(), finish()]);
+    const mid = midSeam(prompts);
+    const OWNER = "OWNER-FOLLOWUP-MARKER-4258";
+    let pulled = false;
+    const included: number[] = [];
+    const promptsAtReceipt: number[] = [];
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(runCtx({
+      midRunSecretRemediation: () => mid.seam(),
+      pullFollowUps: () => (prompts.length >= 1 && !pulled ? (pulled = true, [{ id: 7, body: OWNER }]) : []),
+      followUpIncluded: id => { included.push(id); promptsAtReceipt.push(prompts.length); },
+    }));
+    assert.equal(prompts.length, 3);
+    assert.equal(prompts[1]!.includes(MID), true);
+    assert.equal(prompts[1]!.includes(OWNER), false, "system guidance owns its turn; the follow-up waits");
+    assert.equal(prompts[2]!.includes(OWNER), true);
+    assert.deepEqual(included, [7]);
+    assert.deepEqual(promptsAtReceipt, [3], "receipt follows the turn that carried it");
+  });
+
+  it("proceed leaves every prompt byte-identical to a run without the seam", async () => {
+    const base = fakeTurns([work(), work(), finish()]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn: base.queryFn }).run(runCtx());
+    const withSeam = fakeTurns([work(), work(), finish()]);
+    let calls = 0;
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn: withSeam.queryFn }).run(runCtx({
+      midRunSecretRemediation: async () => { calls++; return { action: "proceed" }; },
+    }));
+    assert.ok(calls >= 2);
+    assert.deepEqual(withSeam.prompts, base.prompts);
+  });
+
+  it("an interactive run never calls the seam", async () => {
+    const { queryFn, prompts } = fakeTurns([work(), finish()]);
+    let calls = 0;
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+      kind: "task", interactive: true, seeded: true, planApproved: true, approvedPlan: "approved",
+      awaitFollowUp: async () => ({ kind: "ended", reason: "idle" }),
+      midRunSecretRemediation: async () => { calls++; return { action: "remediate", followUp: MID }; },
+    }));
+    assert.equal(calls, 0);
+    assert.ok(prompts.every(p => !p.includes(MID)));
+    const control = fakeTurns([work(), finish()]);
+    let controlCalls = 0;
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn: control.queryFn }).run(runCtx({
+      midRunSecretRemediation: async () => { controlCalls++; return { action: "proceed" }; },
+    }));
+    assert.ok(controlCalls >= 1, "control: the same shape non-interactively does consult the seam");
+  });
+
+  const controls = ["cancel", "shutdown", "wall", "switch"] as const;
+  type Control = typeof controls[number];
+  /** Wires one control onto a ctx; `fire` raises it. */
+  function controlRig(control: Control): { overrides: Partial<RunContext>; fire: () => void; switches: () => number } {
+    let cancelled = false;
+    let mode: "wall" | null = null;
+    let pause: (() => void) | undefined;
+    let credentialSwitch: (() => void) | undefined;
+    let switches = 0;
+    const abort = new AbortController();
+    return {
+      switches: () => switches,
+      overrides: {
+        ...(control === "shutdown" ? { signal: abort.signal } : {}),
+        cancelRequested: () => cancelled,
+        pauseModeRequested: () => mode,
+        onPauseNow: cb => { pause = cb; },
+        onCredentialSwitch: cb => { credentialSwitch = cb; },
+        attemptCredentialSwitch: async () => { switches++; return "released"; },
+        parkForWall: async () => "parked",
+      },
+      fire: () => {
+        if (control === "cancel") cancelled = true;
+        else if (control === "shutdown") abort.abort(new Error("shutdown"));
+        else if (control === "wall") { mode = "wall"; assert.ok(pause); pause(); }
+        else { assert.ok(credentialSwitch); credentialSwitch(); }
+      },
+    };
+  }
+  async function settle(control: Control, running: Promise<unknown>, rig: { switches: () => number }): Promise<void> {
+    if (control === "cancel" || control === "shutdown") await assert.rejects(running, /cancel|shutdown/i);
+    else {
+      const result = await running as { walled?: unknown; switchReleased?: boolean };
+      if (control === "wall") assert.ok(result.walled);
+      else { assert.equal(rig.switches(), 1); assert.equal(result.switchReleased, true); }
+    }
+  }
+
+  for (const control of controls) {
+    it(`${control} pending at the boundary is honoured and the seam is not called there`, async () => {
+      const { queryFn, prompts } = fakeTurns([work(), work(), finish()]);
+      const rig = controlRig(control);
+      let reports = 0;
+      const calledAfterFire: number[] = [];
+      let calledBeforeFire = 0;
+      const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(runCtx({
+        ...rig.overrides,
+        reportIteration: async () => { if (++reports === 2) rig.fire(); return { completionAttempts: 0 }; },
+        midRunSecretRemediation: async () => {
+          if (reports >= 2) calledAfterFire.push(prompts.length); else calledBeforeFire++;
+          return prompts.length >= 1 ? { action: "remediate", followUp: MID } : { action: "proceed" };
+        },
+      }));
+      await settle(control, running, rig);
+      assert.ok(calledBeforeFire >= 1, "control: the seam is consulted at an uncontrolled boundary");
+      assert.deepEqual(calledAfterFire, []);
+      assert.ok(prompts.every(p => !p.includes(MID)), "no model turn carries the guidance");
+    });
+
+    it(`${control} arriving during the seam's await wins before any model event`, async () => {
+      const { queryFn, prompts } = fakeTurns([work(), work(), finish()]);
+      const rig = controlRig(control);
+      let entered!: () => void;
+      const inSeam = new Promise<void>(resolve => { entered = resolve; });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(runCtx({
+        ...rig.overrides,
+        midRunSecretRemediation: async () => {
+          if (prompts.length === 0) return { action: "proceed" };
+          entered();
+          await gate;
+          return { action: "remediate", followUp: MID };
+        },
+      }));
+      await Promise.race([inSeam, running.then(() => assert.fail("the seam was never called"))]);
+      rig.fire();
+      release();
+      await settle(control, running, rig);
+      assert.equal(prompts.length, 1, "only the first work turn ran");
+      assert.ok(prompts.every(p => !p.includes(MID)));
+    });
+  }
+
+  type Owner = { name: string; scripts: SDKMessage[][]; ctx: () => Partial<RunContext>; ownerPromptMarker: string };
+  const owners: Owner[] = [
+    {
+      name: "a clarification answer",
+      scripts: [[askUserTurn("which one?"), resultSuccess()], work(), work(), finish()],
+      ctx: () => ({ askUser: async () => ({ kind: "answer", answers: ["CLARIFY-ANSWER-MARKER"] }) }),
+      ownerPromptMarker: "CLARIFY-ANSWER-MARKER",
+    },
+    {
+      name: "a completion rework",
+      scripts: [finish(), work(), work(), finish()],
+      ctx: () => {
+        let attempts = 0;
+        return {
+          completionInterlock: true, checkpoint: async () => {},
+          recordCompletionAttempt: async () => ({ unmet: ++attempts === 1 ? ["M1"] : [], attemptCount: attempts }),
+        };
+      },
+      ownerPromptMarker: "M1",
+    },
+    {
+      name: "a code-repair follow-up",
+      scripts: [finish(), work(), work(), finish()],
+      ctx: () => {
+        let checks = 0;
+        return { codeCrossCheckGate: async () => (++checks === 1 ? { action: "repair", followUp: "REPAIR-MARKER-4258" } : { action: "proceed" }) };
+      },
+      ownerPromptMarker: "REPAIR-MARKER-4258",
+    },
+  ];
+  for (const owner of owners) {
+    it(`${owner.name} owns the turn, the seam is not called that boundary, and the trigger stays pending`, async () => {
+      const { queryFn, prompts } = fakeTurns(owner.scripts);
+      const mid = midSeam(prompts);
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(runCtx({ ...owner.ctx(), midRunSecretRemediation: () => mid.seam() }));
+      assert.ok(prompts[1]!.includes(owner.ownerPromptMarker), "the system text owns the first boundary's turn");
+      assert.equal(prompts[1]!.includes(MID), false);
+      assert.equal(mid.seenAt.includes(1), false, "not called at the boundary the text owns");
+      assert.ok(mid.seenAt.includes(2), "the pending trigger is consumed at the next free boundary");
+      assert.equal(prompts[2]!.includes(MID), true);
+    });
+  }
+
+  it("a resume preflight remediate at the same boundary suppresses the mid-run call there only", async () => {
+    const { queryFn, prompts } = fakeTurns([work(), work()]);
+    const PRE = "PREFLIGHT-REMEDIATE-MARKER";
+    const seenAt: number[] = [];
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+      kind: "issue", resumed: true, sessionId: null, seeded: true, planApproved: true, approvedPlan: "approved",
+      config: { max_iterations: 2, iteration_park_version: 1 },
+      reportIteration: async () => ({ completionAttempts: 0 }), parkForIteration: async () => "parked",
+      secretRemediationGate: async () => ({ action: "remediate", followUp: PRE }),
+      midRunSecretRemediation: async () => { seenAt.push(prompts.length); return { action: "remediate", followUp: MID }; },
+    }));
+    assert.equal(prompts.length, 2);
+    assert.ok(prompts[0]!.includes(PRE) && !prompts[0]!.includes(MID));
+    assert.deepEqual(seenAt, [1], "called only at the next boundary, after the preflight text was spent");
+    assert.ok(prompts[1]!.includes(MID));
+  });
+});
