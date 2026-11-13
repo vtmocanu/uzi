@@ -68,6 +68,17 @@ function need(flags: Map<string, string>, name: string): string {
   return v;
 }
 
+/**
+ * The production prune must never be pointed at the worker's own daemon: only an explicit
+ * tcp:// address that differs from this process's DOCKER_HOST is accepted (no unix sockets).
+ */
+function safeDockerHost(flags: Map<string, string>): string {
+  const host = need(flags, "docker-host");
+  if (!host.startsWith("tcp://")) throw new Error(`refusing --docker-host ${host}: only tcp:// is allowed`);
+  if (host === process.env["DOCKER_HOST"]) throw new Error(`refusing --docker-host ${host}: equals this process's DOCKER_HOST`);
+  return host;
+}
+
 interface Capture {
   lines: string[];
   fields: Array<{ msg: string; fields: Record<string, unknown> }>;
@@ -144,7 +155,8 @@ function pruneClientsAlive(): string[] {
     if (!/^\d+$/.test(entry)) continue;
     try {
       const cmd = readFileSync(`/proc/${entry}/cmdline`, "utf8").replaceAll("\u0000", " ");
-      if (cmd.includes("builder prune") && cmd.includes("--max-used-space 4GiB")) found.push(`${entry}: ${cmd.trim()}`);
+      // docker/cli rewrites `builder` to `buildx` for the plugin child, so match the stable tail.
+      if (cmd.includes(" prune") && cmd.includes("--max-used-space 4GiB")) found.push(`${entry}: ${cmd.trim()}`);
     } catch {
       // The process exited between readdir and read.
     }
@@ -179,7 +191,7 @@ function newController(dockerHost: string, cap: Capture, extra: Record<string, u
 }
 
 async function realMode(flags: Map<string, string>): Promise<number> {
-  const dockerHost = need(flags, "docker-host");
+  const dockerHost = safeDockerHost(flags);
   say(`real exec path against ${dockerHost}; the sample is SYNTHETIC here (only the exec path is under test)`);
   say(`TICK_MS in production is ${TICK_MS}; this driver ticks every 1.1 s with distinct epochs`);
 
@@ -208,7 +220,7 @@ async function realMode(flags: Map<string, string>): Promise<number> {
   setTimeout(() => ac.abort(), 40);
   const outcome2 = await ctrl2.tick(ac.signal);
   const settledMs = Date.now() - startedAt;
-  say(`ABORT mid-prune outcome=${outcome2} after ${settledMs} ms`);
+  say(`ABORT of a just-started prune client, outcome=${outcome2} after ${settledMs} ms`);
   await sleepMs(500);
   const alive = pruneClientsAlive();
   const killedByAbort = cap2.fields.some(
@@ -243,7 +255,7 @@ function makeShim(flags: Map<string, string>): BuilderPruneExec {
   const sock = need(flags, "inner-sock");
   const floorS = need(flags, "floor-s");
   const cap = need(flags, "cap");
-  const dockerHost = need(flags, "docker-host");
+  const dockerHost = safeDockerHost(flags);
   return (argv, opts): Promise<BuilderPruneExecResult> => {
     if (JSON.stringify(argv) !== JSON.stringify(PRODUCTION_ARGV_LITERAL)) {
       throw new Error(`shim received a non-production argv: ${JSON.stringify(argv)}`);
@@ -284,7 +296,7 @@ function makeShim(flags: Map<string, string>): BuilderPruneExec {
 }
 
 async function pressureMode(flags: Map<string, string>): Promise<number> {
-  const dockerHost = need(flags, "docker-host");
+  const dockerHost = safeDockerHost(flags);
   const container = need(flags, "container");
   const user = need(flags, "user");
   const dataPath = need(flags, "data-path");

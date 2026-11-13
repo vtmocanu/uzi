@@ -8,7 +8,8 @@
 # No clock is altered.
 set -euo pipefail
 
-# Pins match deploy/chart/values.yaml.
+# The daemon image pins match deploy/chart/values.yaml; the alpine fixture pin matches
+# e2e/dind-recycle/run.sh (the chart does not carry an alpine pin).
 readonly ROOTFUL_IMAGE='docker:29-dind@sha256:5efed980cba3fc126cf54e21a5a6ff8849d05b6e0623d6e7612f48e9cd6cd17e'
 readonly ROOTLESS_IMAGE='docker:29-dind-rootless@sha256:e17fa54c2ffd511d8407c746eec77f7814e6f74fe20caf822dad1870599984c0'
 readonly FIXTURE_IMAGE='alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6'
@@ -74,16 +75,24 @@ cleanup() {
   for name in "${containers[@]}"; do
     # A timed-out create may have succeeded. Verify ownership even on that path.
     if owner=$(timeout --kill-after=2s 10s docker inspect \
-      --format "{{index .Config.Labels \"$OWNER_LABEL\"}}" "$name" 2>/dev/null); then
+      --format "{{index .Config.Labels \"$OWNER_LABEL\"}}" "$name" 2>&1); then
       if [[ $owner == "$token" ]]; then
-        timeout --kill-after=2s 60s docker rm -fv "$name" >/dev/null || cleanup_rc=1
-        echo "CLEANUP removed $name"
+        if timeout --kill-after=2s 60s docker rm -fv "$name" >/dev/null; then
+          echo "CLEANUP removed $name"
+        else
+          echo "FAIL: cleanup could not remove $name" >&2
+          cleanup_rc=1
+        fi
       else
         echo "FAIL: cleanup ownership mismatch for $name" >&2
         cleanup_rc=1
       fi
-    else
+    elif [[ $owner == *'No such object'* || $owner == *'No such container'* ]]; then
       echo "CLEANUP $name does not exist (never created or already removed)"
+    else
+      # A daemon error or a timeout is not proof of absence: the container may still exist.
+      echo "FAIL: cannot verify cleanup ownership for $name: ${owner:-no output}" >&2
+      cleanup_rc=1
     fi
   done
   if ((original != 0)); then exit "$original"; fi
@@ -467,6 +476,8 @@ phase_points() {
   assert_present 'point 3: exec.cachemount survives while the old regular control was deleted' "$id_cm"
   assert_present 'point 4: record used within the floor survives while the older control was deleted' "$id_recent"
   assert_absent 'point 6 (AND): old + regular + over the cap is deleted' "$id_cabs"
+  assert_absent 'plugin control (broken non-executable case) is deletable by the scaled prune' "$id_cbn"
+  assert_absent 'plugin control (broken executable case) is deletable by the scaled prune' "$id_cbe"
   local s
   for s in $shared_ids; do assert_present 'point 5: tagged image (shared) record survives' "$s"; done
   local hold_rc
@@ -480,6 +491,9 @@ phase_points() {
   inner 60 run --rm dbp/keep true || keep_rc=$?
   if ((keep_rc == 0)); then pass 'point 5: docker run --rm dbp/keep true rc 0'; else failc "docker run true rc=$keep_rc"; fi
 
+  # Snapshot before P1b so the later assert_absent on the held record is not vacuous.
+  df_snap before-P1b
+  assert_present 'point 2 control precondition: formerly held record is still present before P1b' "$id_held"
   echo "--- control for point 2: once the hold released (and its own child record aged past the floor), the same prune deletes the formerly held record"
   local t_released=$SECONDS
   while ((SECONDS < t_released + FLOOR_S + 3)); do sleep 1; done

@@ -14,17 +14,22 @@ docker builder prune -f --filter type=regular --filter until=24h --max-used-spac
 ```
 
 It is separate from the component gates (`task gate`) and from CI. It starts owned throwaway
-DinD daemons and takes roughly ten minutes (about 4 minutes per posture, under a 1500-second
-overall deadline).
+DinD daemons. Measured on the gate run: about 230 s per posture and about 460 s in total (rootful
+230 s, rootless 227 s; the red A run takes 102 s), under a 1500-second overall deadline.
+
+If a run is killed, reap its containers by hand: `docker ps -a --filter label=dbp-test.owner`, then
+`docker rm -fv <exact name>` after checking each container's `dbp-test.owner` label is yours.
 
 ## Requirements
 
 Bash, GNU `timeout`, `jq`, `curl`, `node` with `agent/node_modules` installed (the worker installs it at
 run start; the harness fails, never installs), and Docker access that may start privileged
-containers. The worker's own client `/usr/bin/docker` (29.9.2) and
-`/usr/libexec/docker/cli-plugins/docker-buildx` (v0.38.1) are copied into the nested containers, the
-same pair the real controller runs. The pinned images are the chart's: `docker:29-dind`, the rootless
-`docker:29-dind-rootless`, and the fixture `alpine:3.24` (all by digest). Missing docker, client or
+containers. The worker's own client `/usr/bin/docker` and
+`/usr/libexec/docker/cli-plugins/docker-buildx` are copied into the nested containers, the
+same pair the real controller runs (as measured 2026-11-13: docker 29.9.2, buildx v0.38.1; the
+harness prints the actual versions at run time). The daemon images are the chart's pins:
+`docker:29-dind` and the rootless `docker:29-dind-rootless`; the fixture `alpine:3.24` pin matches
+`e2e/dind-recycle/run.sh` (all by digest). Missing docker, client or
 plugin, a setup error, or a failed assertion fails the run; there are no skips. A posture that cannot
 start prints `BLOCKED: <posture>: <evidence>` and the run exits non-zero.
 
@@ -60,13 +65,13 @@ Phases (`DBP_PHASES`, default `points real pressure`; `DBP_POSTURES`, default `r
   executable `docker-buildx`. Each runs the frozen argv and a labelled scaled argv, must exit non-zero
   with the product's refused match string (read from `BUILDX_MISSING_TEXT`), leave a deletable control
   record in place (the scaled argv would delete it if a prune ran), and leave no `/build/prune`,
-  `/grpc` or `/session` request in the nested daemon's debug log during the case. The detector is
-  validated first: a real prune must show `/grpc` and `/session` requests. The same absent case
+  `/grpc` or `/session` request in the nested daemon's debug log during the case (the detector
+  fires on any one of those three). The detector is validated first: a real prune must trip it. The same absent case
   without the pin is recorded as `CONTRAST`, not asserted.
 - **real path**: `drive-leg.mts real` runs the production argv through the real controller exec path
   (default spawn, `/usr/bin/docker`, the default plugin path, `dockerExecEnvironment` plus
   `DOCKER_BUILDKIT=1`) against `tcp://<nested IP>:2375` and requires outcome `completed`; then aborts
-  mid-prune and requires a group kill, confirmed settlement inside the 10 s bound, no `-unsettled` log
+  a just-started prune client and requires a group kill, confirmed settlement inside the 10 s bound, no `-unsettled` log
   and no surviving client; then a fresh controller completes again. The sample is synthetic there (only
   the exec path is under test). If the nested IP is unreachable from the worker the phase reports that
   as a limitation and fails; it is never faked.
@@ -87,7 +92,9 @@ command.
 ## Red demonstrations
 
 - `DBP_EXPECT_RED=switch-off task test:dind-builder-prune` runs only the rootful pressure fixture with
-  `UZI_DIND_BUILDER_PRUNE_ENABLED=false` (`createDindBuilderPrune` returns undefined, no leg). It
+  `dindBuilderPruneEnabled: false` passed straight to `createDindBuilderPrune` (it returns undefined,
+  no leg). This does not exercise environment parsing of `UZI_DIND_BUILDER_PRUNE_ENABLED`; the agent
+  unit tests cover that. It
   asserts that the driver exits 3 (no relief, pressure unchanged, no prune request in the daemon log)
   and prints `RED A CONFIRMED`. `DBP_SWITCH=off` without the expectation makes the same run a plain
   FAIL.
@@ -109,8 +116,8 @@ in the real-path phase.
 - Behaviour at real volume sizes, ordering among thousands of records, or a multi-hour build.
 - The Kubernetes lifecycle: the dind-meter sidecar and its sample file, maintenance fencing, custody,
   restarts, or the worker's ticks every 30 seconds (this driver ticks every 1.1 s with distinct epochs).
-- The legacy graphdriver (overlay2 without the containerd store); the nested daemons use the
-  containerd snapshotter that the chart's daemon uses.
+- Any particular storage driver: the harness prints the nested daemon's storage driver but does not
+  assert it, so the legacy graphdriver versus the containerd snapshotter is not pinned.
 - The rootless posture on a real node's storage; here its data root is a tmpfs.
 - Concurrent prune races beyond one held build.
 
