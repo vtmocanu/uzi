@@ -1979,6 +1979,10 @@ The second proof supplies the verdict;
 the first proof's diagnostic trace never grants quiescence. A mixed blocker,
 absent root, reused PID with another start time, or expired budget remains
 unverified. This adds no kill authority and does not relax the #1854 rule.
+On a single-uid in-process scan, the one fresh-root proof uses the next full
+rescan inside the original reap deadline; it does not reserve or renew time.
+Raw and scoped helper paths take their one second proof after the first verdict,
+within that first proof's remaining allowance.
 
 The worker logs the reproof outcome on a refusal and records guarded-command
 supervisor spawn and confirmed disposal by run ID, PID and start

@@ -195,6 +195,33 @@ describe("A-codex-sibling: a concurrent Codex attempt's non-dumpable supervisor"
     assert.equal(out.process?.rootReproof, "quiescent");
   });
 
+  it("#3915 the in-process rescan sees a late peer root without renewing its wall deadline", async t => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs = codexProcs();
+    const deps = fakeDeps(procs);
+    let elapsed = 0;
+    const base = Date.now();
+    t.mock.method(Date, "now", () => base + elapsed);
+    deps.now = () => Date.now();
+    deps.sleep = async ms => { elapsed += ms; };
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: SUP, startTime: DEFAULT_START });
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "quiescent", "a fresh in-process pass saw the exact peer root");
+    assert.equal(out.process?.rootReproof, "quiescent");
+    assert.ok(elapsed < 5000, "no new allowance was granted to the retry");
+  });
+
   it("#3915 a late root with a stale start time cannot clear the proof", async () => {
     const registry = new LiveAttemptRegistry();
     const roots: Array<{ pid: number; startTime: number }> = [];
@@ -255,6 +282,31 @@ describe("A-codex-sibling: a concurrent Codex attempt's non-dumpable supervisor"
     );
     assert.equal(out.process?.state, "unverified");
     assert.equal(out.process?.rootReproof, "none", "a group PID alone carries no exact identity");
+  });
+
+  it("#3915 a pgid that is also an observed ancestor keeps its exact root identity", async () => {
+    const registry = new LiveAttemptRegistry();
+    const roots: Array<{ pid: number; startTime: number }> = [];
+    registry.add(claude);
+    registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => roots));
+    const procs: Record<number, FakeProc> = {
+      [SELF]: { uid: RUNNER, ppid: 1 },
+      300: { uid: RUNNER, ppid: 1, pgid: 300, sid: 5, cwd: "/elsewhere", env: {} },
+      301: { uid: RUNNER, ppid: 300, pgid: 300, sid: 5, cwd: "EACCES", env: "EACCES" },
+    };
+    const deps = fakeDeps(procs);
+    const list = deps.table.listPids.bind(deps.table);
+    deps.table.listPids = () => {
+      if (roots.length === 0) roots.push({ pid: 300, startTime: DEFAULT_START });
+      return list();
+    };
+    const out = await quiesceRunAttempt(
+      { mode: "own", attempt: claude, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry },
+      { targetUid: RUNNER, reap: deps },
+    );
+    assert.equal(out.process?.state, "quiescent", "the exact ancestor root clears the fresh proof");
+    assert.equal(out.process?.rootReproof, "quiescent");
   });
 
   it("#3915 an expired deadline prevents the fresh-root reproof", async () => {

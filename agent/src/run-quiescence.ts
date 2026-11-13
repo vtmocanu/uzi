@@ -1428,6 +1428,10 @@ export interface ReapDeps {
   /** issue #3980: absolute epoch-ms deadline (see {@link QuiesceRunRequest.deadlineAt}). Unlike
    *  `reportBudget` it keeps the normal multi-pass loop and kill behaviour, only capped at the deadline. */
   deadlineAt?: number;
+  /** Worker-side in-process path only: offer one newly recorded exact peer root after an
+   *  all-unattributed scan, before the next full scan within the same reap deadline. */
+  refreshAfterUnattributed?: (blockers: readonly QuiesceProcess[]) =>
+    Pick<ScanRequest, "liveRoots" | "liveMarkers"> | undefined;
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -1527,6 +1531,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   const selfPid = deps.selfPid ?? process.pid;
   const killed: number[] = [];
   let last: ScanResult;
+  let scanRequest = req;
   for (;;) {
     if (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) {
       return { state: "unverified", processes: [], killed, detail: "maintenance deadline exhausted" };
@@ -1536,7 +1541,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     if (gateDeadline !== undefined && now() >= gateDeadline) {
       return { state: "unverified", processes: [], killed, detail: "process proof deadline" };
     }
-    last = scanOnce(req, table, selfPid, deps.excludeAllDescendants ?? false);
+    last = scanOnce(scanRequest, table, selfPid, deps.excludeAllDescendants ?? false);
     if (last.tableError || tableFailure || helperWork.getStore()?.failed || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline) ||
         (gateDeadline !== undefined && now() >= gateDeadline)) {
       return { state: "unverified", processes: [], killed, detail: last.tableError ?? String(tableFailure ?? (helperWork.getStore()?.failed ? "helper work exhausted" : "process proof deadline")) };
@@ -1549,6 +1554,18 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       if (ambient) await ambient.raceIO(() => sleep(Math.min(EXCLUSIVE_IDLE_INTERVAL_MS, remaining!())));
       else await sleep(EXCLUSIVE_IDLE_INTERVAL_MS);
       continue;
+    }
+    // The worker may have recorded a peer root since the last scan began. A refreshed list
+    // authorizes no reclassification of `last`; only the next full scan can clear it.
+    if (deps.refreshAfterUnattributed && killed.length === 0 && last.kill.length === 0 &&
+        last.survivors.length === 0 && last.unverified.length > 0 &&
+        last.unverified.every(p => p.reason === "unreadable_unattributed") &&
+        (remaining ? remaining() > 0 : now() < deadline)) {
+      const fresh = deps.refreshAfterUnattributed(last.unverified);
+      if (fresh) {
+        scanRequest = { ...scanRequest, ...fresh, mayKillUnreadableUnattributed: false };
+        continue;
+      }
     }
     // An unreadable pid is rescanned too: a process caught mid-execve (or mid-exit) can read
     // back EACCES for an instant. Only one that stays unattributable to the deadline counts.
@@ -2678,6 +2695,32 @@ export function collectLiveRoots(
   };
 }
 
+/** A new exact root may justify another full scan, never a change to the old verdict. The
+ *  diagnostic trace carries start ticks for self and observed ancestors only; group/session
+ *  PIDs without an observed ancestor identity do not qualify. */
+function hasFreshExactRoot(
+  previous: readonly RecordedRoot[], blockers: readonly QuiesceProcess[], fresh: readonly RecordedRoot[],
+): boolean {
+  const before = new Set(previous.map(root => `${root.pid}:${root.startTime}`));
+  const exactCandidates = new Set(blockers.flatMap(p => {
+    const trace = p.attribution;
+    if (!trace) return [];
+    const identities: string[] = [];
+    if (trace.startTime !== undefined && trace.candidates.some(c => c.role === "self" && c.pid === p.pid))
+      identities.push(`${p.pid}:${trace.startTime}`);
+    for (const ancestor of trace.ancestors) {
+      // Candidate roles deduplicate by PID: an ancestor that is also pgid/sid keeps that
+      // earlier role, but its observed start tick still gives an exact identity.
+      if (ancestor.startTime !== undefined) identities.push(`${ancestor.pid}:${ancestor.startTime}`);
+    }
+    return identities;
+  }));
+  return fresh.some(root => {
+    const identity = `${root.pid}:${root.startTime}`;
+    return !before.has(identity) && exactCandidates.has(identity);
+  });
+}
+
 /** The process reap (unless skipped), then the Docker teardown. Never throws. */
 export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRunDeps = {}): Promise<QuiesceRunOutcome> {
   let processResult: ProcessQuiescence | undefined;
@@ -2729,11 +2772,27 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
     const proofDeadlineAt = Math.min(firstStartedAt + proofAllowanceMs,
       req.deadlineAt ?? Infinity, req.reportBudget?.deadline ?? Infinity,
       scope?.deadlineAt ?? Infinity, ambient ? firstStartedAt + ambient.remainingMs() : Infinity);
+    const timeLeft = () => Date.now() < proofDeadlineAt &&
+      (req.reportBudget === undefined || !req.reportBudget.signal.aborted) &&
+      (!scope || !scope.signal.aborted) &&
+      (!ambient || (!ambient.signal.aborted && ambient.remainingMs() > 0));
+    let inProcessReproof = false;
+    const refreshInProcess = (blockers: readonly QuiesceProcess[]) => {
+      if (inProcessReproof || !timeLeft()) return undefined;
+      const freshOthers = req.registry.others(req.attempt?.marker);
+      const fresh = collectLiveRoots(freshOthers, workerRunnerRootPids());
+      if (!hasFreshExactRoot(scan.liveRoots, blockers, fresh.roots)) return undefined;
+      rootContext = fresh.context;
+      inProcessReproof = true;
+      return { liveRoots: fresh.roots, liveMarkers: freshOthers.map(a => a.marker) };
+    };
     const prove = (candidate: ScanRequest, retryDeadlineAt?: number): Promise<ProcessQuiescence> => scoped
       ? reapScopedRunProcesses(retryDeadlineAt === undefined ? req : { ...req, deadlineAt: retryDeadlineAt }, candidate, deps).catch(() =>
         ({ state: "unverified", processes: [], killed: [], detail: "scoped reaper refused or failed" }))
       : reapRunProcesses(req.reportBudget ? { ...candidate, reportDeadline: req.reportBudget.deadline } : candidate,
         { ...reapOptions,
+          ...(!viaHelper && scan.mayKillUnreadableUnattributed !== true
+            ? { refreshAfterUnattributed: refreshInProcess } : {}),
           ...(req.reportBudget ? { reportBudget: req.reportBudget,
             deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : {}),
           // The raw helper's gateDeadline caps TMPDIR setup, child and cleanup without
@@ -2747,43 +2806,22 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
               retryDeadlineAt - Date.now()))) }),
         });
     processResult = await prove(scan);
+    if (inProcessReproof) rootReproof = processResult.state === "quiescent" ? "quiescent" : "unverified";
 
     // A peer can launch a non-dumpable supervisor after the worker snapshots roots but before
     // the helper enumerates procfs. Never bless the old verdict from its diagnostic trace: only
     // one fresh, complete process proof may clear that refusal. Retry only when the first scan
     // had no unattributed-process kill authority and killed nothing, so this path cannot extend
     // a kill window or add effects after a partial reap.
-    const onlyUnattributed = scan.mayKillUnreadableUnattributed !== true &&
+    const onlyUnattributed = (scoped || viaHelper || req.reportBudget !== undefined) &&
+      !inProcessReproof && scan.mayKillUnreadableUnattributed !== true &&
       processResult.state === "unverified" && processResult.killed.length === 0 &&
       processResult.processes.length > 0 &&
       processResult.processes.every(p => p.reason === "unreadable_unattributed");
-    const timeLeft = Date.now() < proofDeadlineAt &&
-      (req.reportBudget === undefined || !req.reportBudget.signal.aborted) &&
-      (!scope || !scope.signal.aborted) &&
-      (!ambient || (!ambient.signal.aborted && ambient.remainingMs() > 0));
-    if (onlyUnattributed && timeLeft) {
+    if (onlyUnattributed && timeLeft()) {
       const freshOthers = req.registry.others(req.attempt?.marker);
       const fresh = collectLiveRoots(freshOthers, workerRunnerRootPids());
-      const before = new Set(scan.liveRoots.map(root => `${root.pid}:${root.startTime}`));
-      // The trace only gates a NEW full proof; it never changes the old verdict. It carries a
-      // start tick for self and observed ancestors, but not for a group/session candidate that
-      // is not also an ancestor. Those PID-only candidates cannot authorize even a retry.
-      const exactCandidates = new Set(processResult.processes.flatMap(p => {
-        const trace = p.attribution;
-        if (!trace) return [];
-        const identities: string[] = [];
-        if (trace.startTime !== undefined && trace.candidates.some(c => c.role === "self" && c.pid === p.pid))
-          identities.push(`${p.pid}:${trace.startTime}`);
-        for (const ancestor of trace.ancestors) {
-          if (ancestor.startTime !== undefined && trace.candidates.some(c => c.role === "ancestor" && c.pid === ancestor.pid))
-            identities.push(`${ancestor.pid}:${ancestor.startTime}`);
-        }
-        return identities;
-      }));
-      if (fresh.roots.some(root => {
-        const identity = `${root.pid}:${root.startTime}`;
-        return !before.has(identity) && exactCandidates.has(identity);
-      }) && Date.now() < proofDeadlineAt) {
+      if (hasFreshExactRoot(scan.liveRoots, processResult.processes, fresh.roots) && timeLeft()) {
         rootContext = fresh.context;
         processResult = await prove({ ...scan, liveRoots: fresh.roots, liveMarkers: freshOthers.map(a => a.marker),
           mayKillUnreadableUnattributed: false }, proofDeadlineAt);
