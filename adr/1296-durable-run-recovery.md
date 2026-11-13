@@ -1236,10 +1236,34 @@ adds this bounded fresh-round retry.
 A round is retried only when all hold: its lock wait aborted before
 acquisition; no stop fired (owner cancel, pause, credential switch, shutdown,
 terminal lifecycle, claim fence), checked without throwing and never by testing
-the shared cancel controller directly; the round's own absolute deadline
-elapsed and its scope aborted with `RecoveryDeadlineExhaustedError`; it is not
-`predecessorCapture`; and the latch is clearable. Anything else (unknown abort,
-early timer, parent deadline, budget) rethrows unchanged and fails closed.
+the shared cancel controller directly; the scope the labelled lock wait
+actually ran under (`LaunchRound.lockScope`) aborted with
+`RecoveryDeadlineExhaustedError` and the round's own deadline elapsed; it is
+not `predecessorCapture`; and the latch is clearable. For the restriction
+facts, `lockScope` is the bootstrap's nested recovery operation, whose
+deadline is clamped to the round's; for the runtime restore it is the round
+scope. The deadline check tolerates 20 ms of timer skew
+(`LAUNCH_DEADLINE_TIMER_SLACK_MS`), because Node timers can fire a few ms
+before wall-clock `Date.now()` reaches the deadline. This replaces an earlier
+check that allowed no slack and tested the outer scope only; it misclassified
+about a quarter of real expiries, when the nested timer fired before the outer
+one.
+
+A known control stop surfaces its own control to `dispatchFailure` through
+`launchControl`, instead of the lock-read failure it cut short. The known
+stops are pause, credential switch, cancel, shutdown, terminal lifecycle and
+claim fence, with this precedence: claim fence gives `StaleClaimError`; a
+committed cancel gives "run cancelled"; shutdown gives "worker shutdown"; a
+terminal lifecycle gives its reason; a retained lifecycle signal carrying
+`PauseNowSignal` or `CredentialSwitchSignal`, or the flight cancel signal,
+gives its reason. This applies at the pre-retry check and when a stop
+interrupts or follows the backoff. Only an unknown stop, such as an
+unrecognised non-terminal lifecycle reason, rethrows the original lock-read
+error unchanged; so do other non-retryable failures (unknown abort, early
+timer, parent deadline, budget), which fail closed. This refines the issue
+text "rethrow the original error unchanged"; issue #4246 has a comment
+recording the refinement.
+
 Each retry re-enters the whole round: fresh denial-revision capture, a new
 source-use authority A acquisition (released during the backoff), a new
 `codexBoundaryDeadlineMs` lifecycle, and a fresh bootstrap and restore.
@@ -1252,9 +1276,13 @@ is not used; there is no new Git error class and no cause on
 Exhaustion throws `LaunchLockBusyError` ("local repository lock busy after
 bounded retries; local work and custody retained"), reported as a generic
 failure (`agent_failure`, no new `fail_origin`) with `keepCustody`; the clone
-and session are preserved. A launch that recovers through a retry restores the
-clone-retention flag the failed round set, once the fresh round's verified read
-has cleared the latch, so a completed run retires its clone normally.
+and session are preserved. The round-path latch catches record their clone
+retention as a separate launch-retry writer (`byLaunchRetry`, set through
+`setLaunchRetry`). A launch that recovers through a retry, once the fresh
+round's verified read has cleared the latch, withdraws only that writer, so a
+completed run retires its clone normally. Any other retention reason survives,
+whether it was set before the retry or during the retry or backoff. An explicit
+`preserveRecoveryClone = false` release clears it too, as before.
 
 Diagnostics: the helper logs one bounded line per launch-round lock-wait abort
 with the label (`restriction_facts` or `runtime_restore`), elapsed ms and abort
@@ -1273,9 +1301,9 @@ Accepted risks:
   it or teardown holds it.
 - Worst-case authority occupancy is `(2 + RETAINED_DISCOVERY_RETRIES) *
   codexBoundaryDeadlineMs`, cumulative across both sites, never continuous.
-- The clone-retention restore resets the whole flag. It relies on no
-  latch-free writer of that flag running during a launch round; the writers on
-  the launch path were reviewed, but no test pins this.
+- The park/stop-time `Object.defineProperty` snapshot in `ownTerminalRelease`
+  detaches the `preserveRecoveryClone` accessor from the retention flag. It
+  runs only after both launch rounds, so no interaction exists today.
 
 State is process-local; this amendment adds no storage-loss or power-loss
 durability guarantee.
@@ -1283,6 +1311,13 @@ durability guarantee.
 The focused "#4246" cases in
 [runner-remediation-bootstrap.test.ts](../agent/test/runner-remediation-bootstrap.test.ts)
 cover the deadline retry, the cancel, pause, credential-switch, shutdown and
-claim-fence stops, unknown and early-timer aborts, exhaustion, the sticky
-exceptions and clone retirement. The terminal-lifecycle stop and a shorter
-parent deadline are covered by code review only.
+claim-fence stops, the terminal-lifecycle stop and the committed cancel,
+unknown-reason controls, the execute-level pause and
+credential-switch-during-backoff controls, unknown and early-timer aborts, the
+nested-timer race, the authority-backed retry (source-use authority released
+during backoff and reacquired), exhaustion, the sticky exceptions, clone
+retirement and the retention-survival controls.
+[runner-launch-lock-regression.test.ts](../agent/test/runner-launch-lock-regression.test.ts)
+holds a base-compatible execute regression that fails on the PR base. A
+launch-round lock wait under a shorter parent deadline is covered by code
+review only.
