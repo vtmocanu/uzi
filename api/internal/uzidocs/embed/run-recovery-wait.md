@@ -17,8 +17,8 @@ Uzi retries in place and, if the trouble persists, parks the run in
   or 5xx status, including when its reason is not `api_error`; a failed
   `api_error` with no status also qualifies. So does a 403 whose error text
   carries the Cloudflare block-page title `Attention Required! | Cloudflare`:
-  the provider's edge briefly answering with a challenge page, which clears on
-  its own.
+  the provider's edge answering with a block or challenge page, which may clear
+  without a credential change.
 - A **transient Codex provider error** — on the Codex harness, a turn that
   ends failed because the provider was overloaded (`serverOverloaded`), had an
   internal server error (`internalServerError`), or had no flex capacity
@@ -42,7 +42,9 @@ Measured Codex idle timeouts generally use the [idle-stall policy](#codex-idle-s
 
 A **permanent** provider error — for example 401, any other 403, or 400 (bad
 credentials or a bad request) — is not a transient interruption. The run
-fails fast with an accurate reason and does not park here. On the Codex
+keeps its existing handling: it fails fast with an accurate reason and does
+not park here, except where a dedicated path applies (a lead spend-limit 400
+has its own owner hold). On the Codex
 harness, a turn that ends with a transport failure carrying a permanent status
 (400, 401, 403, and so on), or with an authentication, model, or other
 non-transport failure, is not retried here either.

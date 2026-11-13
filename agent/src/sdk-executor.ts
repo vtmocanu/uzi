@@ -438,7 +438,7 @@ function foreignCliTermination(err: Error): string | undefined {
  * still goes through `isTransientStatus` (client.ts: 408, 429, >=500 incl. 529), so a
  * permanent 401/403/400 is never parked forever in the uncapped recovery park. The one
  * exception is a 403 Cloudflare edge block page ({@link isCloudflareEdgeBlock}, issue
- * #4271): it clears on its own and is retried/parked like any transient provider error. Only a
+ * #4271): it may clear without a credential change and is retried/parked like any transient provider error. Only a
  * status-less failure falls back to `terminal_reason === "api_error"`: that is a
  * transport/network failure and retryable, while a status-less failure without it is not
  * a provider error at all.
