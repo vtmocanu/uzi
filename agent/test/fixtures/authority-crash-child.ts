@@ -21,7 +21,7 @@ import type { AuthorityFsOps } from "../../src/completion-authority.js";
 import { GitCache, type PositiveOwedCandidateContext } from "../../src/git.js";
 import type { Logger } from "../../src/log.js";
 import { armShutdownResultDeadline, finishWorkerShutdown, type ShutdownLog } from "../../src/shutdown-barrier.js";
-import { testLockOptions } from "../authority-test-support.js";
+import { manualClock, testLockOptions } from "../authority-test-support.js";
 
 export interface Barrier { armed: string; go: string; done: string; pid: string }
 export interface ChildConfig {
@@ -62,8 +62,10 @@ export interface ChildConfig {
   shutdownBudgetMs?: number;
   /** retentionDelete timeoutMs / closeWaitMs for the unsettled-delete scenarios. */
   rmTimeoutMs?: number;
-  /** pin-cleanup: the archived recovery pin and the caller's deadline (ms from the call). */
-  pin?: { runId: string; generation: number; sourceSha: string; deadlineMs: number };
+  /** pin-cleanup: the archived recovery pin and the caller's deadline (ms on the manual clock from the call). The deadline
+   *  passes when the test writes an `advance` line to stdin. `eligibleStallMs` makes the FIRST isEligible call busy-wait that
+   *  many real milliseconds (a pre-spawn phase that outlasts a wall-clock budget; issue #4091). */
+  pin?: { runId: string; generation: number; sourceSha: string; deadlineMs: number; eligibleStallMs?: number };
   /** pin-cleanup: where the git wrapper script is written (put first on PATH). */
   wrapDir?: string;
 }
@@ -142,13 +144,15 @@ async function runShutdownScenario(cfg: ChildConfig): Promise<void> {
     } },
   });
   const hooked = { authority: rt.hooks, authorityRequired: true } as const;
+  // issue #4091: the pin cleanup runs on a manual clock, so a slow host cannot spend its deadline before its child exists.
+  const clock = manualClock();
   let closed = 0;
   const gitLog = forwardingLogger((_level, message) => {
     if (message.startsWith("runner-uid delete exited and left the unsettled record")) say(`CLOSED:${++closed}`);
   });
   const rmTimeout = cfg.rmTimeoutMs ?? 100;
   const rigs = [cfg.barrier, cfg.barrier2].filter((b): b is Barrier => b !== null && b !== undefined);
-  const git = cfg.scenario === "pin-cleanup" ? new GitCache(cfg.dataDir, gitLog, undefined, hooked) : new GitCache(cfg.dataDir, gitLog, undefined, {
+  const git = cfg.scenario === "pin-cleanup" ? new GitCache(cfg.dataDir, gitLog, undefined, { ...hooked, archivedPinClockForTest: clock }) : new GitCache(cfg.dataDir, gitLog, undefined, {
     ...hooked,
     retentionDelete: {
       split: true,
@@ -267,11 +271,27 @@ async function runShutdownScenario(cfg: ChildConfig): Promise<void> {
       'exec /usr/bin/git "$@"', "",
     ].join("\n"), { mode: 0o755 });
     process.env.PATH = `${cfg.wrapDir}:${process.env.PATH}`;
-    setTimeout(() => say("DEADLINE-PASSED"), pin.deadlineMs + 100);
-    const deadline = Date.now() + pin.deadlineMs;
+    // The test passes the caller's deadline by writing `advance` to stdin, once the child is armed.
+    let commands = "";
+    process.stdin.on("data", (chunk: Buffer) => {
+      commands += chunk.toString("utf8");
+      for (let i = commands.indexOf("\n"); i >= 0; i = commands.indexOf("\n")) {
+        const command = commands.slice(0, i);
+        commands = commands.slice(i + 1);
+        if (command === "advance") { clock.advance(pin.deadlineMs + 100); say("DEADLINE-PASSED"); }
+      }
+    });
+    const deadline = clock.now() + pin.deadlineMs;
+    let eligibleCalls = 0;
+    const isEligible = (): boolean => {
+      if (eligibleCalls++ === 0 && pin.eligibleStallMs) {
+        for (const until = Date.now() + pin.eligibleStallMs; Date.now() < until;) { /* synchronous stall */ }
+      }
+      return true;
+    };
     producer = rt.withTransaction(() => git.cleanupArchivedRecoveryPin({
       runId: pin.runId, generation: pin.generation, sourceSha: pin.sourceSha,
-      recoveryPinBareDir: path.basename(cfg.bare), isEligible: () => true, deadline,
+      recoveryPinBareDir: path.basename(cfg.bare), isEligible, deadline,
     }));
     say(`CLEANUP:${JSON.stringify(await producer)}`);
   }
