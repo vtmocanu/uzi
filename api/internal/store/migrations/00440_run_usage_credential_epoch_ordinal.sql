@@ -1,6 +1,6 @@
 -- +goose Up
 -- Issue #4201: per-leg credential epoch attribution; NULL means "the claim's base epoch". Its own
--- migration for the lock-order reason in 00428.
+-- migration for the lock-order reason in 00439.
 SET LOCAL lock_timeout = '5s';
 ALTER TABLE run_usage ADD COLUMN credential_epoch_ordinal integer;
 

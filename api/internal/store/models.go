@@ -1327,12 +1327,12 @@ type Run struct {
 	PolicyHoldCause                   pgtype.Text        `json:"policy_hold_cause"`
 	PolicyFreshConsumedGeneration     pgtype.Int8        `json:"policy_fresh_consumed_generation"`
 	PolicyFreshConfirmedGeneration    pgtype.Int8        `json:"policy_fresh_confirmed_generation"`
+	RecoveryWaitDetail                pgtype.Text        `json:"recovery_wait_detail"`
 	CredentialSwitchOpID              pgtype.UUID        `json:"credential_switch_op_id"`
 	CredentialSwitchHoldOpID          pgtype.UUID        `json:"credential_switch_hold_op_id"`
 	CredentialSwitchHoldGeneration    pgtype.Int8        `json:"credential_switch_hold_generation"`
 	CredentialSwitchHoldWorkerID      pgtype.UUID        `json:"credential_switch_hold_worker_id"`
 	CredentialSwitchHoldRegisterNonce pgtype.Text        `json:"credential_switch_hold_register_nonce"`
-	RecoveryWaitDetail                pgtype.Text        `json:"recovery_wait_detail"`
 }
 
 type RunCompletionAttempt struct {
