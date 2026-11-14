@@ -808,6 +808,8 @@ export interface RunContext {
    * runner's outer catch, byte-identical to the pre-fix behaviour.
    */
   attemptCredentialSwitch?(opts?: { site: InPlaceSwitchSite; laneSettled: boolean }): Promise<"released" | "gave_up" | "applied">;
+  /** Codex-only settled-boundary coordinator; only confirmed continuations return. */
+  attemptCodexCredentialSwitch?(opts: { site: InPlaceSwitchSite; laneSettled: boolean }): Promise<"continued_A" | "resumed_B" | "fresh_B">;
   /**
    * PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED — a matching switch
    * signal is held (not tripped, the turn not aborted) for the duration, then honored at the next

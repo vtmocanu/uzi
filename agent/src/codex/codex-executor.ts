@@ -88,7 +88,7 @@ import { type CodexErrorClassification, CodexTurnFailedError, formatCodexClassif
 import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type UsableSavedRollout, type CodexSuspendedEpoch, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
-import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes } from "../steering.js";
+import { CredentialSwitchSignal, PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
@@ -380,9 +380,11 @@ const TRANSIENT_RETRY_MAX = 2;
 const TRANSIENT_BACKOFF_BASE_MS = 2_000;
 const TRANSIENT_BACKOFF_SLICE_MS = 250;
 
-/** The trip reason an aborted run signal maps to: a PauseNowSignal is a pause, anything else a cancel. */
+const REASON_SWITCH = "codex credential switch";
+
+/** Steering switches and pauses are distinct from terminal cancellation. */
 function reasonForSignal(signal: AbortSignal | undefined): string {
-  return signal?.reason instanceof PauseNowSignal ? REASON_PAUSE : REASON_CANCEL;
+  return signal?.reason instanceof CredentialSwitchSignal ? REASON_SWITCH : signal?.reason instanceof PauseNowSignal ? REASON_PAUSE : REASON_CANCEL;
 }
 
 /** Issue #1764: one handling path's snapshot of the pause-now state, taken before its first await. */
@@ -440,7 +442,17 @@ class CodexVaultLockState {
  * captured; one that arrived during its awaits stays pending and trips the next turn at its start.
  */
 class CodexPauseNowState {
-  /** Bumped by every ctx.onPauseNow interrupt (steering fires it for `now` and `wall`). */
+  /** Switch generations are consumed only after a confirmed coordinator continuation. */
+  switchSeq = 0;
+  handledSwitchSeq = 0;
+  readonly handledSwitchSignals = new WeakSet<AbortSignal>();
+  switchToken?: { seq: number; signal?: AbortSignal; error: CredentialSwitchSignal };
+  continueSwitch?: (site: import("../executor.js").InPlaceSwitchSite) => Promise<ProviderEpoch>;
+  interruptSwitch(): void {
+    this.switchSeq++;
+    this.activeTurnTrip?.(REASON_SWITCH);
+  }
+  /** Bumped by every ctx.onPauseNow interrupt. */
   private seq = 0;
   /** The newest generation a handling path consumed without parking. */
   private handledSeq = 0;
@@ -3238,12 +3250,13 @@ export class CodexExecutor implements Executor {
     // onPauseNow is last-wins and fires on every `now`/`wall` pause). Each turn installs its own trip.
     const pauseNow = new CodexPauseNowState(ctx.signal);
     ctx.onPauseNow?.(() => pauseNow.interrupt());
+    ctx.onCredentialSwitch?.(() => pauseNow.interruptSwitch());
     // Issue #1764: the lifecycle signal for epoch startup. It forwards only a genuine (non-pause)
     // abort of ctx.signal; deferred safety retains the listener until terminal disposal,
     // otherwise the finally below removes it.
     const lifecycleAbort = new AbortController();
     const forwardLifecycleAbort = (): void => {
-      if (!(ctx.signal?.reason instanceof PauseNowSignal)) lifecycleAbort.abort(ctx.signal?.reason);
+      if (!(ctx.signal?.reason instanceof PauseNowSignal) && !(ctx.signal?.reason instanceof CredentialSwitchSignal)) lifecycleAbort.abort(ctx.signal?.reason);
     };
     if (ctx.signal?.aborted) forwardLifecycleAbort();
     else ctx.signal?.addEventListener("abort", forwardLifecycleAbort, { once: true });
@@ -4164,6 +4177,42 @@ export class CodexExecutor implements Executor {
         });
       };
       this.liveEpochSuspension = suspendEpoch;
+      pauseNow.continueSwitch = async site => {
+        const token = pauseNow.switchToken ?? this.captureSwitch(ctx, pauseNow);
+        const guard = (): void => {
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted || ctx.claimFenced?.() ||
+              (ctx.signal?.aborted && reasonForSignal(ctx.signal) === REASON_CANCEL))
+            throw new Error(REASON_CANCEL);
+        };
+        guard();
+        if (!ctx.attemptCodexCredentialSwitch) throw token.error;
+        const outcome = await ctx.attemptCodexCredentialSwitch({ site, laneSettled: true });
+        guard();
+        if (outcome !== "continued_A" && outcome !== "resumed_B" && outcome !== "fresh_B") throw token.error;
+        pauseNow.handledSwitchSeq = Math.max(pauseNow.handledSwitchSeq, token.seq);
+        if (token.signal) pauseNow.handledSwitchSignals.add(token.signal);
+        if (pauseNow.switchToken === token) pauseNow.switchToken = undefined;
+        return epoch!;
+      };
+      // Each successful continuation retries only this held callback. Cancellation or any
+      // noncontinuation stops the loop; newer switch generations remain pending.
+      const retryHeldSwitch = async <T>(site: import("../executor.js").InPlaceSwitchSite, callback: () => Promise<T>): Promise<T> => {
+        for (;;) {
+          try {
+            const pending = this.pendingInterruption(ctx, pauseNow, wall);
+            if (pending === REASON_CANCEL) throw new Error(REASON_CANCEL);
+            if (pending === REASON_SWITCH) throw new CredentialSwitchSignal();
+            const result = await callback();
+            if (ctx.cancelRequested?.() || ctx.claimFenced?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            return result;
+          }
+          catch (error) {
+            if (!(error instanceof CredentialSwitchSignal)) throw error;
+            this.captureSwitch(ctx, pauseNow, error);
+            await pauseNow.continueSwitch!(site);
+          }
+        }
+      };
 
       // Issue #1782: a refused in-turn wall park may already have reaped the provider root (the
       // runner's capture runs the Codex boundary before the owner's extension is known), which
@@ -4278,10 +4327,10 @@ export class CodexExecutor implements Executor {
         if (ctx.autoApprove) {
           // The runner emits its existing auto-approval notice and returns a sentinel.
           // Do not echo that sentinel as a human answer.
-          await ctx.askUser(questions);
+          await retryHeldSwitch("ask_user", () => ctx.askUser!(questions));
           return unansweredPrompt(questions);
         }
-        let verdict = await ctx.askUser(questions);
+        let verdict = await retryHeldSwitch("ask_user", () => ctx.askUser!(questions));
         questionBudget.asked++;
         // The worker callback owns explicit owner retries and the shared parked-time budget.
         if (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && requestPark) {
@@ -4505,7 +4554,7 @@ export class CodexExecutor implements Executor {
         // Issue #1789: from the first gate submission until approval the server row is
         // awaiting_approval and can never park, so a vault-lock latch must not change a turn's outcome.
         pauseNow.vaultLock.gateOpen = true;
-        let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), undefined, planResult.semanticSubmission);
+        let verdict = await retryHeldSwitch("plan_gate", () => ctx.gatePlan!(planMd!, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), undefined, planResult.semanticSubmission));
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         // Human revises only: an automatic (cross-check) round never spends this budget, so a later
         // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
@@ -4558,7 +4607,7 @@ export class CodexExecutor implements Executor {
           if (planMd === undefined || planMd.trim().length === 0) {
             throw new TrustedExecutionRefusal("codex plan turn produced no plan on revision");
           }
-          verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), settles, planResult.semanticSubmission);
+          verdict = await retryHeldSwitch("plan_gate_revision", () => ctx.gatePlan!(planMd!, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), settles, planResult.semanticSubmission));
           silentRevision = undefined;
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
@@ -5039,7 +5088,7 @@ export class CodexExecutor implements Executor {
               shared.selection.current, shared.repoInstructions, at, shared.scrubProjected, beforeReapingSink, pauseNow,
               recreateEpochAfterReap, completion, onProgress, undefined, async () => {
                 await beforeReapingSink();
-                disposition = await ctx.requestParkRun!(at);
+                disposition = await retryHeldSwitch("ask_user", () => ctx.requestParkRun!(at));
                 return { done: false };
               });
             if (outcome.kind === "turn") return disposition!;
@@ -5235,8 +5284,8 @@ export class CodexExecutor implements Executor {
           }
           if (leadRequest || completionStallStreak >= STALL_LIMIT) {
             const holdReason = leadRequest ? REASON_COMPLETION_LEAD_REQUESTED : REASON_COMPLETION_NO_PROGRESS;
-            const decision = await ctx.askCompletionQuestion?.(unmet, leadRequest
-              ? { kind: "lead_request", reason: leadRequest.reason } : { kind: "no_progress" });
+            const decision = await retryHeldSwitch("ask_user", async () => ctx.askCompletionQuestion?.(unmet, leadRequest
+              ? { kind: "lead_request", reason: leadRequest.reason } : { kind: "no_progress" }));
             if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
             // A timeout keeps the question open; do not report running to resolve it.
             if (await checkRequestBoundary(decision?.outcome === "continue")) {
@@ -5303,7 +5352,7 @@ export class CodexExecutor implements Executor {
             // a lead completion attempt.
             const { unmet } = await recordAttempt([]);
             epochNeedsRecreate = true;
-            const decision = await ctx.askCompletionQuestion?.(unmet, { kind: "no_progress_stall" });
+            const decision = await retryHeldSwitch("ask_user", async () => ctx.askCompletionQuestion?.(unmet, { kind: "no_progress_stall" }));
             if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
             if (decision?.outcome === "continue") {
               completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones,
@@ -6355,13 +6404,24 @@ export class CodexExecutor implements Executor {
    * PauseNowSignal) always trips, and a NEWER owner/wall pause arrives as a fresh generation, never
    * through this spent signal.
    */
+  private captureSwitch(ctx: RunContext, state: CodexPauseNowState, error?: CredentialSwitchSignal) {
+    return state.switchToken ??= {
+      seq: state.switchSeq,
+      signal: ctx.signal?.reason instanceof CredentialSwitchSignal ? ctx.signal : undefined,
+      error: ctx.signal?.reason instanceof CredentialSwitchSignal ? ctx.signal.reason : error ?? new CredentialSwitchSignal(),
+    };
+  }
+
   private pendingInterruption(ctx: RunContext, pauseNow: CodexPauseNowState, wall: RunWall): string | undefined {
-    if (ctx.signal?.aborted) {
+    if (ctx.cancelRequested?.() || ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted) return REASON_CANCEL;
+    if (ctx.signal?.aborted && !(ctx.signal.reason instanceof CredentialSwitchSignal &&
+        pauseNow.handledSwitchSignals.has(ctx.signal))) {
       const mode = ctx.pauseModeRequested?.();
       const stalePause = ctx.signal.reason instanceof PauseNowSignal &&
         (mode == null || (pauseNow.sharedAbortHandled && mode !== "wall"));
       if (!stalePause) return reasonForSignal(ctx.signal);
     }
+    if (pauseNow.switchSeq > pauseNow.handledSwitchSeq) return REASON_SWITCH;
     if (pauseNow.pending) return REASON_PAUSE;
     if (wall.remainingMs <= 0) return REASON_WALL;
     return undefined;
@@ -6401,6 +6461,7 @@ export class CodexExecutor implements Executor {
   }
 
   private tripError(reason: string, pauseToken: PauseNowToken, processedEvents: number, retryClassification?: Readonly<CodexErrorClassification>): Error {
+    if (reason === REASON_SWITCH) return new CredentialSwitchSignal();
     return new CodexTurnTripError(reason, pauseToken, processedEvents, retryClassification);
   }
 
@@ -6470,11 +6531,23 @@ export class CodexExecutor implements Executor {
       resumeId = fresh.resumeSessionId;
       buildPhaseBroker = fresh.buildPhaseBroker;
     };
+    const continueSwitch = async (error: unknown): Promise<void> => {
+      const token = this.captureSwitch(ctx, pauseNow, error instanceof CredentialSwitchSignal ? error : undefined);
+      if (ctx.cancelRequested?.() || ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted ||
+          (ctx.signal?.aborted && reasonForSignal(ctx.signal) === REASON_CANCEL)) throw new Error(REASON_CANCEL);
+      if (!pauseNow.continueSwitch) throw token.error;
+      const current = await pauseNow.continueSwitch(phase === "plan" ? "plan_turn" : "implement_turn");
+      harness = current.harness;
+      registry = current.registry;
+      resumeId = current.resumeSessionId;
+      buildPhaseBroker = current.buildPhaseBroker;
+    };
     turnLoop: for (;;) {
       try {
         // Use consumable lifecycle state, not the sticky pause mode, before releasing again.
         const pending = this.pendingInterruption(ctx, pauseNow, wall);
         if (ctx.cancelRequested?.() || pending === REASON_CANCEL) throw new Error(REASON_CANCEL);
+        if (pending === REASON_SWITCH) { this.captureSwitch(ctx, pauseNow); throw new CredentialSwitchSignal(); }
         if (this.captureMayHaveDrained?.()) {
           if (pending !== undefined) throw new CodexTurnTripError(pending, pauseNow.capture());
           if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
@@ -6495,6 +6568,10 @@ export class CodexExecutor implements Executor {
         // the next turn trips at its start and every boundary reconcile defers on the latch.
         return { kind: "turn", result };
       } catch (caught) {
+        if (caught instanceof CredentialSwitchSignal || (caught instanceof CodexTurnTripError && caught.message === REASON_SWITCH)) {
+          await continueSwitch(caught);
+          continue turnLoop;
+        }
         let err: unknown = caught instanceof PauseNowSignal
           ? new CodexTurnTripError(REASON_PAUSE, pauseNow.capture()) : caught;
         // Issue #1789: a vault-lock latch in force turns the turn's failure into a deferral. Cancel
@@ -6568,6 +6645,10 @@ export class CodexExecutor implements Executor {
         // At most one idle capture and one declined hold; each new interruption leaves
         // the idle arm and follows the existing pause/wall route with its own snapshot.
         routeTrip: for (;;) {
+          if (err instanceof CodexTurnTripError && err.message === REASON_SWITCH) {
+            await continueSwitch(err);
+            continue turnLoop;
+          }
           const msg = err instanceof Error ? err.message : "";
           // Issue #1764: the interrupt generation this path handles, captured before any await; a
           // newer `now`/`wall` that lands during an await below stays pending for the re-drive.

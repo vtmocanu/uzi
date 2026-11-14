@@ -103,7 +103,7 @@ import type { OutgoingMessage, WorkerRunMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import { REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
 import { PlanRejectedError, PlanRevisionReplacedError, type RunContext, type EmittedMessage, type Executor, type WallParkOutcome, type SecretRemediationDecision } from "../src/executor.js";
-import { PauseNowSignal, SteeringChannel, followUpRunes, MAX_FOLLOW_UP_BATCH_RUNES } from "../src/steering.js";
+import { CredentialSwitchSignal, PauseNowSignal, SteeringChannel, followUpRunes, MAX_FOLLOW_UP_BATCH_RUNES } from "../src/steering.js";
 import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
 import * as m2Runner from "./runner-harness.js";
 import { followSuccessfulPush as m2FollowPush } from "./publication-fixture.js";
@@ -31385,4 +31385,184 @@ describe("CodexExecutor: replacement B boundary", () => {
       });
     }
   }
+});
+
+describe("CodexExecutor credential switch continuation", () => {
+  for (const hooked of [false, true]) {
+    it(hooked ? "continues A on the same implement epoch" : "preserves an unhandled switch signal", async () => {
+      let interrupt: (() => void) | undefined;
+      const controller = new AbortController();
+      const original = new CredentialSwitchSignal();
+      let calls = 0;
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount > 1) c.transport.push(signalDone()).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      const { ctx } = makeCtx({
+        signal: controller.signal,
+        onCredentialSwitch: cb => { interrupt = cb; },
+        ...(hooked ? { attemptCodexCredentialSwitch: async () => { calls++; return "continued_A" as const; } } : {}),
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      const outcome = running.then(value => ({ value }), error => ({ error }));
+      await waitFor(() => rig.transport.turnStartCount === 1, "first turn");
+      controller.abort(original);
+      interrupt?.();
+      const settled = await withTimeout(outcome, 3000, "switch settles");
+      if (hooked) {
+        assert.ok("value" in settled);
+        assert.equal(calls, 1);
+        assert.equal(rig.transport.turnStartCount, 2);
+      } else {
+        assert.ok("error" in settled);
+        assert.strictEqual(settled.error, original);
+      }
+    });
+  }
+  for (const mode of ["rearm", "during", "terminal"] as const) {
+    it(`handles switch generation race: ${mode}`, async () => {
+      let interrupt!: () => void;
+      let controller = new AbortController();
+      const terminal = new AbortController();
+      let calls = 0;
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount > (mode === "rearm" ? 2 : 1))
+            c.transport.push(signalDone()).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      const { ctx } = makeCtx({
+        get signal() { return controller.signal; },
+        terminalLifecycleSignal: terminal.signal,
+        onCredentialSwitch: cb => { interrupt = cb; },
+        attemptCodexCredentialSwitch: async () => {
+          calls++;
+          if (calls === 1 && mode !== "rearm") await held;
+          controller = new AbortController();
+          return "continued_A";
+        },
+      });
+      // makeCtx spreads overrides, so restore the Runner's rearmable getter.
+      Object.defineProperty(ctx, "signal", { get: () => controller.signal });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      const outcome = run.then(value => ({ value }), error => ({ error }));
+      await waitFor(() => rig.transport.turnStartCount === 1, "first turn");
+      controller.abort(new CredentialSwitchSignal()); interrupt();
+      await waitFor(() => calls === 1, "first handler");
+      if (mode === "rearm") await waitFor(() => rig.transport.turnStartCount === 2, "second turn");
+      if (mode === "terminal") terminal.abort(new Error("terminal fixture"));
+      else interrupt();
+      release();
+      const result = await withTimeout(outcome, 3000, "race settles");
+      if (mode === "terminal") assert.ok("error" in result);
+      else {
+        assert.ok("value" in result);
+        assert.equal(calls, 2, "a newer generation must get its own handler");
+      }
+    });
+  }
+
+  for (const site of ["question", "gate"] as const) {
+    it(`re-presents the same held ${site} after confirmed A continuation`, async () => {
+      const original = new CredentialSwitchSignal();
+      let calls = 0;
+      let switches = 0;
+      const candidates: unknown[] = [];
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) c.transport.push(toolCall(1,
+            site === "question" ? "ask_user" : "submit_plan",
+            site === "question" ? { questions: [{ question: "Which target?" }] } : { plan_md: "held candidate" },
+            "th-1", "tn-1", "held")).push(turnCompleted("completed"));
+          else c.transport.push(signalDone()).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      const { ctx } = makeCtx({
+        ...(site === "gate" ? { planApproved: false, approvedPlan: undefined } : {}),
+        attemptCodexCredentialSwitch: async () => { switches++; return "continued_A"; },
+        askUser: async questions => {
+          candidates.push(questions);
+          if (++calls === 1) throw original;
+          return { kind: "answered", answers: ["target A"] };
+        },
+        gatePlan: async plan => {
+          candidates.push(plan);
+          if (++calls === 1) throw original;
+          return { kind: "reject", reason: "fixture finished" };
+        },
+      });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (site === "gate") await assert.rejects(run, /fixture finished/);
+      else await run;
+      assert.equal(switches, 1);
+      assert.equal(calls, 2);
+      assert.strictEqual(candidates[0], candidates[1]);
+    });
+  }
+
+  for (const replacement of [false, true]) {
+    it(replacement ? "adopts actual suspended B without recreating it again" : "continues the active plan prompt on A", async () => {
+      let interrupt!: () => void;
+      const controller = new AbortController();
+      const quiet: Responder = c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount > 1) c.transport.push(toolCall(2, "submit_plan", { plan_md: "continued plan" },
+            "th-1", "tn-1", "plan")).push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      };
+      const rig = makeMultiEpochRig([quiet, epochResponder("th-1", "tn-B", (t, th, tn) =>
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn)))]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const { ctx } = makeCtx({
+        signal: controller.signal,
+        ...(replacement ? {} : { planApproved: false, approvedPlan: undefined }),
+        onCredentialSwitch: cb => { interrupt = cb; },
+        attemptCodexCredentialSwitch: async () => {
+          if (!replacement) return "continued_A";
+          const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+          const lease = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          const saved = await lease.persistRollout(bounds);
+          assert.equal(saved.kind, "usable");
+          assert.equal(await lease.teardown(bounds), true);
+          await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+          await lease.restartAndResume("th-1", bounds);
+          await lease.finishB(bounds);
+          return "resumed_B";
+        },
+        gatePlan: async () => ({ kind: "reject", reason: "continued plan reached gate" }),
+      });
+      const running = exec.run(ctx);
+      const outcome = running.then(value => ({ value }), error => ({ error }));
+      await waitFor(() => rig.epochs[0]!.transport.turnStartCount === 1, "active A turn");
+      controller.abort(new CredentialSwitchSignal()); interrupt();
+      const result = await withTimeout(outcome, 5000, "plan or B continuation");
+      if (replacement) {
+        assert.ok("value" in result, "B completed the retried implement prompt");
+        assert.equal(rig.providerLaunches(), 2);
+        assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+      } else {
+        assert.ok("error" in result);
+        assert.match(String(result.error), /continued plan reached gate/);
+        assert.equal(rig.providerLaunches(), 1);
+      }
+    });
+  }
+
 });
