@@ -15,7 +15,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
-	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -1291,11 +1290,16 @@ func TestReceiptsForInPlaceWorkerDuringPendingSwitchLiveDB(t *testing.T) {
 func TestRecordCodexEpochIdempotentLiveDB(t *testing.T) {
 	f := newApplyFx(t)
 	run, op := f.run(t, "running")
-	codexSecret := f.env.seedAnthropicSecret(t, f.o.userID, "codex-alias", false)
+	codexSecret := f.env.seedStaticAPIKey(t, f.o.userID, "codex-alias", "test-api-key")
+	if err := f.svc.FreezeCodexBinding(f.env.ctx, f.o.userID, run, codexSecret, codexAuthModeAPIKey); err != nil {
+		t.Fatal(err)
+	}
 	r := mustRun(t, f.env, run)
-	r.CodexSecretID = pgconv.UUID(codexSecret)
-	f.svc.recordCodexEpoch(context.Background(), r)
-	f.svc.recordCodexEpoch(context.Background(), r)
+	for range 2 {
+		if err := f.svc.recordCodexEpoch(context.Background(), r); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var n int
 	var reason, label string
 	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT count(*), max(select_reason), max(label) FROM run_credential_epochs WHERE run_id = $1 AND claim_generation = $2 AND secret_id = $3`, run, f.gen, codexSecret).Scan(&n, &reason, &label); err != nil || n != 1 || reason != "codex_binding" || label != "codex-alias" {

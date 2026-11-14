@@ -4416,6 +4416,12 @@ export interface CredentialOverride {
  *  and reused, so switch detection keys on the id, not the label); null when the token was
  *  deleted. */
 export interface CredentialEpoch {
+  /** Nullable historical Codex snapshots are omitted rather than reconstructed. */
+  codex_auth_mode?: string;
+  codex_material_revision?: number;
+  codex_account_key?: string;
+  codex_account_id?: string;
+  codex_claim_epoch?: number;
   claim_generation: number;
   secret_id: string | null;
   label: string | null;

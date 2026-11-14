@@ -358,7 +358,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// are skipped, so it opens no Anthropic credential, never calls SetRunAnthropicSecret and carries
 	// no anthropic_oauth_token (anthropic stays nil → AnthropicOAuthToken == ""). Its credential
 	// epoch (the bound Codex secret, select_reason codex_binding) is journaled by recordCodexEpoch
-	// once the Codex secrets below are attached (issue #4201).
+	// inside the exact-mint finish transaction, before payload delivery (issue #4202).
 	// Its Codex secrets are attached just below, in the harnessCodex block after the payload
 	// literal. A Claude run keeps the exact existing ladder — byte-identical.
 	var anthropic []byte

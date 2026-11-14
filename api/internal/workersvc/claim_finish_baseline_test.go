@@ -18,6 +18,7 @@ type baselineClaimStore struct {
 	replace                          bool
 	committed                        bool
 	writes, begins                   int
+	recorded                         store.RecordCodexCredentialEpochParams
 }
 type baselineClaimTx struct {
 	*fakeClaimFinishTx
@@ -42,6 +43,7 @@ func (t *baselineClaimTx) GetRunCodexAuthContext(context.Context, uuid.UUID) (st
 	}, nil
 }
 func (t *baselineClaimTx) RecordCodexCredentialEpoch(_ context.Context, arg store.RecordCodexCredentialEpochParams) error {
+	t.owner.recorded = arg
 	t.owner.writes++
 	t.wrote = true
 	return t.owner.writeErr
@@ -88,10 +90,12 @@ func TestFinishRunClaimCodexBaseline(t *testing.T) {
 			run.Status = "claimed"
 			run.WorkerID = pgconv.UUID(id.workerID)
 			run.CodexSecretID = pgconv.UUID(uuid.New())
+			run.CodexSecretLabel = pgconv.TextOrNull("baseline-alias")
 			run.CodexMaterialRevision = pgtype.Int8{Int64: 1, Valid: true}
 			run.CodexAuthMode = pgconv.TextOrNull(codexAuthModeAPIKey)
 			// The claim snapshot predates mint 7; the payload names the actual mint.
 			locked := run
+			locked.CodexSecretLabel = pgconv.TextOrNull("locked-baseline-alias")
 			locked.CodexClaimEpoch = 7
 			locked.CodexCapHash = hashCodexCapability("baseline-test-capability")
 			bs := &baselineClaimStore{fakeStore: fs, run: locked, writeErr: tc.writeErr, commitErr: tc.commitErr, rollbackErr: tc.rollbackErr, replace: tc.replace}
@@ -106,6 +110,13 @@ func TestFinishRunClaimCodexBaseline(t *testing.T) {
 			if (got != nil) != tc.wantPayload || bs.begins != tc.wantBegins || bs.writes != 1 ||
 				(fs.claimFailed != nil) != tc.wantFailed || bs.committed != tc.wantCommitted {
 				t.Fatalf("payload=%v begins=%d writes=%d failed=%v committed=%v err=%v", got != nil, bs.begins, bs.writes, fs.claimFailed, bs.committed, err)
+			}
+			wantRecord := store.RecordCodexCredentialEpochParams{
+				RunID: run.ID, ClaimGeneration: run.ClaimGeneration, SecretID: run.CodexSecretID,
+				Label: locked.CodexSecretLabel, SelectReason: pgconv.TextOrNull(selectReasonCodexBinding),
+			}
+			if bs.recorded != wantRecord {
+				t.Fatalf("baseline args = %+v, want %+v", bs.recorded, wantRecord)
 			}
 			if fs.claimFailed != nil && (fs.claimFailed.ClaimGeneration != run.ClaimGeneration || fs.claimFailed.WorkerID != run.WorkerID) {
 				t.Fatal("settlement changed claim identity")
