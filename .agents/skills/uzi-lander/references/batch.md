@@ -47,7 +47,7 @@ Watch several PRs' CI at once with `S/watch-prs-ci.sh <PR> [<PR>...]` in the bac
 ## 3. Order the green batch
 
 **Our PRs first, the routine Renovate minor/patch batch last** (most green patches
-automerge in the weekly window; one still open is landed here: references/renovate.md). Renovate rebases its own PRs
+automerge in the weekly window; the ones still open are landed here, batched into one PR when CI-sufficient: references/renovate.md). Renovate rebases its own PRs
 only in its Saturday-morning window, so landing ours first keeps them fresh for the next window (between
 windows they stay stale or conflicting: references/renovate.md); the reverse re-stales
 ours against the new deps. It also isolates dependency breakage (features settled, then deps)
