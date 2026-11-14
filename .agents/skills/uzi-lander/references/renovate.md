@@ -58,13 +58,17 @@ PR on your own branch instead of rebasing and CI-ing each: one CI run instead of
 - **Keep out**: agent runtimes (their own adoption PR), majors still being vetted, tool/analyzer
   and k8s node-image bumps (below), worker-toolchain refreshes, holds, and any PR red for a
   reason of its own. A PR red only from a main-side failure since fixed on `main` may go in.
-- `S/renovate-batch.sh PR [PR...]` validates every PR (open, base `main`, `renovate/*` head),
-  then makes a worktree on `chore/renovate-batch-<date>` off fresh `origin/main` and
-  cherry-picks each PR's exact head unchanged (`-x`), in the order given. A conflicting PR is
-  skipped cleanly (exit 1, `SKIP_REASON_<PR>`); land it alone or wait for Renovate's rebase.
-  It prints the PR-body table and never pushes.
-- **Regenerate each touched lockfile** (`npm install --package-lock-only`, `go mod tidy`) and
-  expect no diff. A diff means two picks interacted: commit it separately and explain it.
+- `S/renovate-batch.sh PR [PR...]` validates every PR (open, base `main`, `renovate/*` head
+  equal to the fetched commit), pins `BASE` from fresh `origin/main`, makes a worktree on
+  `chore/renovate-batch-<date>` there and cherry-picks each PR's exact commits unchanged
+  (`-x`), in the order given. A conflicting PR is skipped after a verified rollback (exit 1,
+  `SKIP_REASON_<PR>`); land it alone or wait for Renovate's rebase. Exit 4 stopped mid-batch
+  on uncertain state: inspect `DIR` before anything else. It prints the PR-body table and
+  never pushes.
+- **Regenerate each touched lockfile** (`npm install --package-lock-only --ignore-scripts`,
+  `go mod tidy`) and expect no diff. Attribute any diff (two picks interacting, or an npm/Go
+  version, platform or resolver difference); commit an intended one separately with its cause,
+  and drop unexplained churn.
 - Open `chore(deps): batch N Renovate updates (<short list>)` with the table, the excluded PRs
   and why. It is Renovate-class for step 2. A red job attributable to one update: revert that
   pick on the branch, push, and hold its PR.
