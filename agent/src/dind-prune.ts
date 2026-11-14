@@ -36,6 +36,10 @@
 // (dind-volume-prune.ts), which has its own loop, runs even on a busy or custody-held
 // worker, never closes this gate, and never removes images, build cache, containers or
 // named volumes.
+// Issue #4291 adds a third separate leg (dind-builder-prune.ts) for BuildKit regular build
+// cache: same shape (own loop, never closes this gate, runs on busy or custody-held workers),
+// one frozen `builder prune` argv capped by age and total size, and never images, volumes or
+// containers.
 //
 // The commands run as the WORKER uid, not through the runner-uid wrapper: they carry no
 // model or repo input (the argv is a frozen constant, validated again at exec time),
@@ -55,6 +59,7 @@ import type { Config } from "./config.js";
 import type { Logger } from "./log.js";
 import { readDindMeterSample, type DindMeterSample } from "./dind-meter.js";
 import type { DindVolumePruneController } from "./dind-volume-prune.js";
+import type { DindBuilderPruneController } from "./dind-builder-prune.js";
 import { errMessage, sleep as abortableSleep } from "./util.js";
 
 /** Pressure threshold: a sample at or above this fraction of bytes OR inodes is "over". */
@@ -295,6 +300,9 @@ export interface DindPruneOptions {
    *  has its own loop/streak/backoff, runs concurrently with this controller's loop and
    *  never closes the gate. Type-only import: no runtime edge from this module to the leg. */
   volumeLeg?: DindVolumePruneController;
+  /** Issue #4291: the pressure-only BuildKit regular-cache prune leg (dind-builder-prune.ts).
+   *  Same shape as {@link volumeLeg}: own loop, never closes the gate, type-only import. */
+  builderLeg?: DindBuilderPruneController;
 }
 
 /**
@@ -342,6 +350,7 @@ export class DindPruneController {
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly volumeLeg?: DindVolumePruneController;
+  private readonly builderLeg?: DindBuilderPruneController;
 
   private workerId?: string;
   private custody?: { retaining: boolean | undefined; atMs: number };
@@ -375,12 +384,14 @@ export class DindPruneController {
     this.now = opts.now ?? Date.now;
     this.sleep = opts.sleep ?? abortableSleep;
     this.volumeLeg = opts.volumeLeg;
+    this.builderLeg = opts.builderLeg;
   }
 
   /** The api-assigned worker id, once registration returns it. */
   setWorkerId(id: string | undefined): void {
     if (id) this.workerId = id;
     this.volumeLeg?.setWorkerId(id);
+    this.builderLeg?.setWorkerId(id);
   }
 
   /** Record the custody flag from a SUCCESSFUL heartbeat (undefined when the response
@@ -398,10 +409,11 @@ export class DindPruneController {
     this.lastBusyAtMs = this.now();
   }
 
-  /** Runs the cache loop and, when wired, the volume leg's independent loop (issue #3891)
-   *  concurrently. Neither can starve the other; the leg's loop never rejects. */
+  /** Runs the cache loop and, when wired, the volume leg's (issue #3891) and builder leg's
+   *  (issue #4291) independent loops concurrently. None can starve another; a leg's loop never
+   *  rejects. */
   async loop(signal: AbortSignal): Promise<void> {
-    await Promise.all([this.cacheLoop(signal), this.volumeLeg?.loop(signal)]);
+    await Promise.all([this.cacheLoop(signal), this.volumeLeg?.loop(signal), this.builderLeg?.loop(signal)]);
   }
 
   /** Evaluate every TICK_MS until abort. Never throws. */

@@ -532,15 +532,27 @@ work while letting this worker's own parked runs and pinned plan checkers
 finish; maintenance fencing still closes claims. It then fences claims and
 requires fresh custody clearance and zero local activity before gated
 anonymous-volume pruning or stop. No timer, forced park, or force-roll
-override bypasses this DinD gate. The one exception is a separate
-pressure-only anonymous-volume prune (#3891): after two fresh samples at or above
+override bypasses this DinD gate. There are two pressure-only exceptions. The
+first is a separate anonymous-volume prune (#3891): after two fresh samples at or above
 85% of bytes or inodes it runs `docker volume prune -f` on a busy or custody-held
 persistent Docker worker without closing claims or waiting for idle, terminal
 runs or custody. It is not recycle, touches no PVC, and is enabled by the same
 default-on flag, so already-enabled workers get it once the fixed worker deploys;
-`workers.diskRecycleEnabled: false` opts out of it, but also of PVC recycle and
-the cache prune, and rolls non-ephemeral Docker worker pods. See
+`workers.diskRecycleEnabled: false` opts out of it, but also of PVC recycle,
+the cache prune and the builder-cache leg below, and rolls non-ephemeral Docker
+worker pods. See
 [Pressure-only anonymous-volume prune](./worker-docker.md#pressure-only-anonymous-volume-prune).
+A second, separate pressure-only leg (#4291) runs
+`docker builder prune -f --filter type=regular --filter until=24h --max-used-space 4GiB`
+on busy or custody-held persistent Docker workers under the same pressure rule,
+again without closing claims or consulting idle, terminal runs or custody. It
+needs the master flag and its own default-on chart value
+`workers.dindBuilderPruneEnabled: true` (a strict boolean); `false` opts out of
+this leg only. Adding the env rolls every Docker worker pod once after the
+controller upgrade, through the normal drift roll that waits for idle unless the
+global `workers.forceRoll` is set. Below 4 GiB of total cache it frees nothing,
+and records shared with a local image are never pruned. See
+[Pressure-only builder-cache prune](./worker-docker.md#pressure-only-builder-cache-prune).
 Legacy recycle (plain nix/data; Docker Nix-only) associated with
 spec-hash/generation drift also waits indefinitely for idle. Only independent
 nondrifted pressure/nix-size maintenance retains the compatible deadline; global

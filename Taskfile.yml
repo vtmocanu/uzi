@@ -1239,6 +1239,16 @@ tasks:
       # All prune commands use its inner Unix socket; no host daemon prune.
       - bash ./e2e/dind-recycle/run.sh
 
+  test:dind-builder-prune:
+    desc: "disposable DinD proof for the #4291 builder-cache prune leg"
+    cmds:
+      # Separate from component gates and not part of `task gate` or CI: it starts owned
+      # throwaway DinD daemons (dbp-test-*), one per posture (rootful, rootless), and drives the
+      # real agent controller against them. Every prune runs against an owned daemon only.
+      # Needs agent/node_modules (the worker installs it at run start); ~10 minutes.
+      - cd agent && npx tsc --noEmit -p ../e2e/dind-builder-prune/tsconfig.json
+      - bash ./e2e/dind-builder-prune/run.sh
+
   test:e2e-reclaim:
     desc: behavioral test of the e2e leaked-project reclaim safety contract (fake docker, hermetic)
     cmds:
