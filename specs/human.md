@@ -1899,7 +1899,7 @@ Design record: issue #4335 (epic #3873); target mock `prds/mockups/3873-overview
 
 - One shared count backs both surfaces: builtin and global agent templates plus the viewer's own private ("Mine") templates; another user's private templates never count, for an admin too, and the lead counts. "Ride your runs" counts templates toggled on under In my runs, minus a private template shadowed by a builtin or global of the same name (the rule behind the Agents page's shadowed badge). (AI-synced 2026-11-14)
 - The Agents page shows one summary line under its description: total, how many ride your runs, per-scope totals (zero scopes omitted) and, for admins only, the global-default count; hidden while loading and on a load error. (AI-synced 2026-11-14)
-- Every user gets an Agents chip on the new Overview header after the People and Repos chips and before Search: "K agents in your runs of N", opening a popover with per-scope totals and "on" counts, an admin-only global-defaults row and a Manage agents link. Its allocation read is made once, never polled, and a failure hides only the chip; the old Overview makes no new request. (AI-synced 2026-11-14)
+- Every user gets an Agents chip on the new Overview header before Search, after the admin-only People chip and, once #4334 lands, after the Repos chip: "K agents in your runs of N", opening a popover with per-scope totals and "on" counts, an admin-only global-defaults row and a Manage agents link. Its allocation read is made once, never polled, and a failure hides only the chip; the old Overview makes no new request. (AI-synced 2026-11-14)
 
 ## Feature #4209: Primary work run counts in usage
 
