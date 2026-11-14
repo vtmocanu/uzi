@@ -5413,6 +5413,101 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
     }, { seed: (f) => { f.secretRemediation ??= { attempts: 2 }; f.secretRemediation.attempts = 2; } });
   });
 
+  const publishUnscanned = (r: Rig) => (r.runner as unknown as {
+    publishCheckpointOutcome: (f: unknown, bare: string, branch: string) => Promise<{ published: boolean }>;
+  }).publishCheckpointOutcome(r.flight(), r.bare, r.ctx.branch);
+
+  it("temporarily unknown floor ancestry on a divergent rewrite: deferred, new commit recorded, an unscanned publish holds", async () => {
+    await rig(4258_036, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const a = await flagAndTick(r);
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      const real = r.g.ancestry.bind(r.g);
+      const d = await r.withStub(
+        { ancestry: async (bp: string, x: string, t: string) => (x === b && t !== b ? "unknown" : real(bp, x, t)) },
+        () => r.ctx.midRunSecretRemediation!(),
+      );
+      assert.deepEqual(d, { action: "proceed" });
+      const s = r.state();
+      assert.ok(s.midRunTrigger, "the defer keeps the trigger");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+      assert.ok(s.flaggedCommits?.includes(b), "the fresh trusted finding is recorded before the defer");
+      const before = r.tips.length;
+      assert.equal((await publishUnscanned(r)).published, false);
+      assert.equal(r.tips.length, before, "nothing containing the flagged commit was uploaded");
+    });
+  });
+
+  it("unknown retained-commit ancestry on a divergent rewrite: deferred, new commit recorded, an unscanned publish holds", async () => {
+    await rig(4258_038, async (r) => {
+      const a = await flagAndTick(r);
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      const real = r.g.ancestry.bind(r.g);
+      const d = await r.withStub(
+        { ancestry: async (bp: string, x: string, t: string) => (x === a ? "unknown" : real(bp, x, t)) },
+        () => r.ctx.midRunSecretRemediation!(),
+      );
+      assert.deepEqual(d, { action: "proceed" });
+      const s = r.state();
+      assert.ok(s.midRunTrigger, "the defer keeps the trigger");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+      assert.ok(s.flaggedCommits?.includes(b), "the fresh trusted finding is recorded before the defer");
+      const before = r.tips.length;
+      assert.equal((await publishUnscanned(r)).published, false);
+      assert.equal(r.tips.length, before);
+    });
+  });
+
+  it("a fresh finding that would overflow the flagged-commit list: deferred, overflow fails closed, an unscanned publish holds", async () => {
+    await rig(4258_039, async (r) => {
+      const a = await flagAndTick(r);
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.ok(s.midRunTrigger, "the defer keeps the trigger");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+      assert.equal(s.overflow, true, "the list that cannot hold the new commit fails closed");
+      const before = r.tips.length;
+      assert.equal((await publishUnscanned(r)).published, false);
+      assert.equal(r.tips.length, before);
+    }, { ctlHooks: { flaggedCommitsCap: 1 } });
+  });
+
+  it("a local-only checkpoint floor containing the finding: at_floor clears, the commit is recorded and an unscanned publish holds", async () => {
+    await rig(4258_037, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const a = await flagAndTick(r);
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      const local = commitIn(r.ctx.worktreePath, "clean-b.txt", "b\n");
+      const flight = r.flight() as { checkpointFloor?: string; publishedRealTips?: string[] };
+      assert.ok(!(flight.publishedRealTips ?? []).includes(local));
+      flight.checkpointFloor = local;
+      assert.equal(ancestryOf(r.ctx.worktreePath, b, local), "ancestor");
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined, "at_floor clears the trigger");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+      assert.ok(s.flaggedCommits?.includes(b), "the commit behind the local-only floor is recorded");
+      const before = r.tips.length;
+      assert.equal((await publishUnscanned(r)).published, false);
+      assert.equal(r.tips.length, before, "the local-only bridge containing the flagged commit was not uploaded");
+    });
+  });
+
   it("the done gate clears a pending trigger, so no duplicate turn follows", async () => {
     await rig(4258_032, async (r) => {
       await flagAndTick(r);
