@@ -634,3 +634,122 @@ describe("hibernation cache prune: the default step runner", () => {
     assert.deepEqual(resultOf(r), { steps: ["image_prune_dangling:unknown", "builder_prune:not_started"], throughout: true });
   });
 });
+
+describe("hibernation cache prune: a ready whose heartbeat response was lost", () => {
+  /** A ready handed to a heartbeat that reached the api (which committed started) but failed here. */
+  async function lostReady() {
+    const h = harness();
+    h.hb(h.proj("requested"));
+    await h.ctl.tick();
+    h.hb(h.proj("requested"));
+    await h.ctl.tick();
+    const ready = h.ctl.report();
+    assert.equal(ready?.kind, "ready");
+    h.ctl.reported(ready, "failed");
+    h.advance(1000);
+    h.ctl.observe(undefined, undefined, h.now()); // the heartbeat failed: custody is now unknown
+    return h;
+  }
+
+  it("never refuses after a possibly delivered ready, reports not_started on started and again on unknown, then releases on settled", async () => {
+    const h = await lostReady();
+    assert.equal(h.ctl.report(), undefined, "no refused after a possibly delivered ready");
+    h.hb(h.proj("started", { reconcile_seq: 2 }));
+    await flush();
+    const first = h.ctl.report();
+    assert.deepEqual(resultOf(first), { steps: ["image_prune_dangling:not_started", "builder_prune:not_started"], throughout: true });
+    h.ctl.reported(first!, "sent");
+    assert.equal(h.ctl.report(), undefined);
+    h.advance(11 * 60_000);
+    h.hb(h.proj("unknown", { reconcile_seq: 3 }));
+    assert.deepEqual(resultOf(h.ctl.report()), { steps: ["image_prune_dangling:not_started", "builder_prune:not_started"], throughout: true });
+    assert.ok(h.gate.onlyHeldBy("hibernation"), "held until settled");
+    h.hb(h.proj("settled", { reconcile_seq: 4 }));
+    assert.equal(h.gate.claimsClosed(), false);
+    assert.equal(h.calls.filter((c) => c.kind === "step").length, 0);
+  });
+
+  it("a cancel observed after a possibly delivered ready is not refused either", async () => {
+    const h = await lostReady();
+    h.hb(h.proj("requested", { cancel_requested: true }));
+    assert.equal(h.ctl.report(), undefined);
+    h.hb(h.proj("started", { reconcile_seq: 2, cancel_requested: true }));
+    assert.deepEqual(resultOf(h.ctl.report()).steps, ["image_prune_dangling:not_started", "builder_prune:not_started"]);
+  });
+
+  it("a refusal the api rejected as already started is followed by a not_started result", async () => {
+    const h = harness();
+    h.hb(h.proj("requested"));
+    await h.ctl.tick();
+    h.advance(61_000); // never armed: custody predates nothing it can use
+    await h.ctl.tick();
+    const refused = h.ctl.report();
+    assert.equal(refused?.kind, "refused");
+    h.ctl.reported(refused, "dropped");
+    h.hb(h.proj("started", { reconcile_seq: 2 }));
+    assert.deepEqual(resultOf(h.ctl.report()).steps, ["image_prune_dangling:not_started", "builder_prune:not_started"]);
+  });
+
+  it("unknown for a declined key reports not_started and unknown for a never-acted key reports it with throughout false", async () => {
+    const h = harness();
+    h.hb(h.proj("unknown", { reconcile_seq: 2 }));
+    assert.deepEqual(resultOf(h.ctl.report()), { steps: ["image_prune_dangling:not_started", "builder_prune:not_started"], throughout: false });
+    assert.equal(h.gate.claimsClosed(), false);
+  });
+});
+
+describe("hibernation cache prune: custody age and the gate seam", () => {
+  function withInterval(heartbeatIntervalMs: number, gate = new DindPruneGate()) {
+    let time = 1_700_000_000_000;
+    const ctl = new HibernationCachePruneController({
+      gate, dockerHost: "tcp://dind:2375", heartbeatIntervalMs, isIdle: () => true, log: nullLogger(),
+      exec: async () => "1.45", now: () => time, sleep: async () => {}, runStep: async () => OK,
+    });
+    ctl.register(NONCE);
+    const proj = (phase: HibernationCachePrune["phase"]): HibernationCachePrune =>
+      ({ op_id: OP, register_nonce: NONCE, phase, cancel_requested: false, reconcile_seq: 1 });
+    const hb = (p: HibernationCachePrune | null | undefined) => { time += 1000; ctl.observe(p, false, time); };
+    return { ctl, proj, hb, advance: (ms: number) => { time += ms; }, steps: () => 0 };
+  }
+
+  it("clamps the accepted custody age to the api's 45s even with a 30s heartbeat interval", async () => {
+    const h = withInterval(30_000);
+    h.hb(h.proj("requested"));
+    await h.ctl.tick();
+    h.hb(h.proj("requested"));
+    await h.ctl.tick();
+    h.advance(46_000);
+    const r = h.ctl.report();
+    assert.deepEqual({ kind: r?.kind, reason: r?.reason }, { kind: "refused", reason: "custody_stale" });
+  });
+
+  it("still readies with 30s heartbeats when the custody evidence is within 45s", async () => {
+    const h = withInterval(30_000);
+    h.hb(h.proj("requested"));
+    await h.ctl.tick();
+    h.hb(h.proj("requested"));
+    await h.ctl.tick();
+    h.advance(40_000);
+    assert.equal(h.ctl.report()?.kind, "ready");
+  });
+
+  it("another gate owner that left the generation untouched still makes the hold non-exclusive", async () => {
+    class OtherHolderGate extends DindPruneGate {
+      other = false;
+      override onlyHeldBy(owner: GateOwner): boolean { return !this.other && super.onlyHeldBy(owner); }
+    }
+    const gate = new OtherHolderGate();
+    const h = withInterval(15_000, gate);
+    h.hb(h.proj("requested"));
+    await h.ctl.tick();
+    h.hb(h.proj("requested"));
+    await h.ctl.tick();
+    const ready = h.ctl.report();
+    assert.equal(ready?.kind, "ready");
+    h.ctl.reported(ready, "sent");
+    gate.other = true; // held by a second owner with no close/open since the pin
+    h.hb(h.proj("started"));
+    await flush();
+    assert.deepEqual(resultOf(h.ctl.report()), { steps: ["image_prune_dangling:not_started", "builder_prune:not_started"], throughout: false });
+  });
+});

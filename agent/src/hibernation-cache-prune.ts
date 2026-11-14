@@ -32,6 +32,8 @@ const PROBE_TIMEOUT_MS = 30_000;
 const ACQUIRE_BOUND_MS = 60_000;
 /** A started projection older than this since ready was sent is not trusted to start work. */
 const START_WINDOW_MS = 45_000;
+/** The api's bound on the age of the custody evidence in a ready report. */
+const CUSTODY_MAX_AGE_MS = 45_000;
 
 /** The only two commands a step may run, in order. */
 const STEPS: readonly { readonly command: HibernationPruneCommand; readonly argv: readonly string[] }[] = Object.freeze([
@@ -201,13 +203,24 @@ export class HibernationCachePruneController {
   }
 
   private onUnknown(a: Attempt): void {
-    if (a.disposition === undefined && !a.tombstoned) {
-      a.tombstoned = true;
-      a.disposition = "declined";
-      a.refusalDone = true;
+    if (a.disposition === "executing") return;
+    const fresh = a.disposition === undefined && !a.tombstoned;
+    this.notStartedResult(a);
+    if (fresh) {
       a.releasePending = true;
       this.releaseIfSettled();
     }
+  }
+
+  /** A key that never ran a step but sees started/unknown reports every step not_started (the
+   *  evidence the api accepts), measured for exclusivity before any release. No-op once a result
+   *  exists or a child is executing. */
+  private notStartedResult(a: Attempt): void {
+    if (a.disposition === "executing" || a.result) return;
+    a.disposition = "declined";
+    a.tombstoned = true;
+    a.refusalDone = true; // the api is past requested: a refusal can only be rejected
+    a.result = { steps: notStarted(), throughout: this.exclusive(a) };
   }
 
   private onSettled(a: Attempt): void {
@@ -217,7 +230,8 @@ export class HibernationCachePruneController {
   }
 
   private onStarted(a: Attempt): void {
-    if (a.tombstoned || a.disposition !== undefined) return;
+    if (a.disposition === "executing") return;
+    if (a.tombstoned || a.disposition !== undefined) { this.notStartedResult(a); return; }
     const timely = a.armed && a.readySentAt !== undefined && this.now() - a.readySentAt <= START_WINDOW_MS;
     if (!timely || a.cancel || this.child || this.stopping || this.unsafe(a) !== undefined) {
       this.declineWithResult(a);
@@ -252,23 +266,28 @@ export class HibernationCachePruneController {
     if (!this.deps.isIdle()) { this.lastBusyAt = this.now(); return "active_work"; }
     const c = this.custody;
     const age = c ? this.now() - c.sentAt : Infinity;
-    if (!c || c.retaining !== false || age < 0 || age > 2 * this.deps.heartbeatIntervalMs || c.sentAt <= this.lastBusyAt) {
+    // The api accepts custody evidence up to 45s old, whatever the heartbeat interval.
+    const maxAge = Math.min(2 * this.deps.heartbeatIntervalMs, CUSTODY_MAX_AGE_MS);
+    if (!c || c.retaining !== false || age < 0 || age > maxAge || c.sentAt <= this.lastBusyAt) {
       return "custody_stale";
     }
     return undefined;
   }
 
+  /** Once a ready may have reached the api (sent and not known dropped by a 409) it may already
+   *  have committed started, where a refusal can only be rejected: decline silently and let the
+   *  started/unknown projection carry a not_started result instead. */
   private refuse(a: Attempt, reason: Reason): void {
     a.disposition = "declined";
     a.tombstoned = true;
+    if (a.readySentAt !== undefined && !a.readyDropped) { a.refusalDone = true; return; }
     a.refusal = reason;
   }
 
   /** Reports every step not_started; the gate stays held until settled/none, like any result. */
   private declineWithResult(a: Attempt): void {
     a.disposition = "declined";
-    a.tombstoned = true;
-    a.result = { steps: notStarted(), throughout: this.exclusive(a) };
+    this.notStartedResult(a);
   }
 
   /** Run the two steps in order; no further step after a cancel, a failed revalidation or a
@@ -319,7 +338,7 @@ export class HibernationCachePruneController {
       const reason = this.unsafe(a);
       if (reason) {
         this.refuse(a, reason);
-        return { ...base, kind: "refused", reason };
+        return a.refusal ? { ...base, kind: "refused", reason } : undefined;
       }
       a.readySentAt = this.now();
       return {
