@@ -556,7 +556,12 @@ describe("renderCodexRun — prompts", () => {
     const rendered = renderCodexRun(runRequest({ agents: { a: agent(), b: agent({ prompt: "BODY" }) } }));
     assert.equal(rendered.perRolePrompts.size, 2);
     for (const prompt of rendered.perRolePrompts.values()) {
-      assert.ok(prompt.replace(/\s+/g, " ").includes(rule), "carries the go clean prohibition");
+      const flatPrompt = prompt.replace(/\s+/g, " ");
+      assert.ok(flatPrompt.includes(rule), "carries the go clean prohibition");
+      // The lead-only cleanup permission must never reach a subagent.
+      for (const leadOnly of ["completed validation-wave boundary", "Run `go clean -cache` only"]) {
+        assert.ok(!flatPrompt.includes(leadOnly), `subagent prompt carries lead-only ${JSON.stringify(leadOnly)}`);
+      }
     }
   });
 

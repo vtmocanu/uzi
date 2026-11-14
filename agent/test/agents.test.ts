@@ -130,7 +130,12 @@ describe("assembleAgents", () => {
     const emptyBodied: AgentTemplate = { ...reviewer, name: "blank", prompt_body: "" };
     const { subagents } = assembleAgents([reviewer, emptyBodied]);
     for (const name of ["reviewer", "blank"]) {
-      assert.ok(subagents[name]?.prompt?.replace(/\s+/g, " ").includes(rule), `${name}: carries the go clean prohibition`);
+      const flatPrompt = subagents[name]?.prompt?.replace(/\s+/g, " ") ?? "";
+      assert.ok(flatPrompt.includes(rule), `${name}: carries the go clean prohibition`);
+    // The lead-only cleanup permission must never reach a subagent.
+    for (const leadOnly of ["completed validation-wave boundary", "Run `go clean -cache` only"]) {
+      assert.ok(!flatPrompt.includes(leadOnly), `subagent prompt carries lead-only ${JSON.stringify(leadOnly)}`);
+    }
     }
   });
 

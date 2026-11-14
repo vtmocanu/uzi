@@ -1334,9 +1334,11 @@ describe("lead Go build-cache cleanup rule (issue #4346)", () => {
   const CACHE_RULE_PHRASES = [
     // When: settled boundary, including earlier-wave survivors, no new consumer until settled.
     "completed validation-wave boundary",
+    "anywhere in this run",
     "including survivors from earlier waves",
     "A returned dispatch is not proof that its build children settled",
     "skip and report",
+    "do not inspect other processes to manufacture proof",
     "Launch no new cache consumer until the cleanup command settles",
     // Condition: thresholds, unknown readings, hysteresis.
     "at least 12 GiB",
@@ -1345,8 +1347,10 @@ describe("lead Go build-cache cleanup rule (issue #4346)", () => {
     "keep the warm cache",
     "re-arm that trigger only after a fresh reading below 70%",
     "not an enforced cap",
+    "Fresh cache growth to at least 12 GiB may independently trigger another attempt",
     // Ownership.
     "`go env GOCACHE` in the same tool environment that built the code",
+    "confirm by its canonical path that it is this run's own cache",
     "no `GOCACHEPROG` backend",
     "If ownership is unknown, keep the cache and say so",
     "do not require it to sit inside HOME",
@@ -1354,6 +1358,9 @@ describe("lead Go build-cache cleanup rule (issue #4346)", () => {
     "Run `go clean -cache` only",
     "never `-modcache`",
     "never a manual `rm`",
+    "never another run's paths",
+    "never reset `HOME` or `GOCACHE`",
+    "the before/after size",
     "report a failed cleanup as failed",
     // Validation unchanged.
     "Never narrow a required check, drop `-race`, or waive a frozen acceptance criterion",
