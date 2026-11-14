@@ -407,7 +407,7 @@ func checkRunState(r apitypes.RunDTO, isRevising bool) (glyph, word, tone string
 			(r.Status == "claimed" || r.Status == "running" || r.Status == "awaiting_approval")) {
 		return "", "", ""
 	}
-	if r.Status == "awaiting_approval" && !isRevising && r.PlanCrossCheckGateReason != nil && *r.PlanCrossCheckGateReason != "" {
+	if r.Status == "awaiting_approval" && !isRevising && (r.PlanCrossCheckRequired || r.PlanCrossCheckGated) && r.PlanCrossCheckGateReason != nil && *r.PlanCrossCheckGateReason != "" {
 		switch *r.PlanCrossCheckGateReason {
 		case "revise", "revisions_exhausted":
 			return "⚑", "xchk revise", "warn"

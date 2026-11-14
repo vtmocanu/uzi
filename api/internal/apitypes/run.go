@@ -319,7 +319,8 @@ type RunDTO struct {
 	PlanCrossCheckGated      bool    `json:"plan_cross_check_gated,omitempty"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
 	// CrossCheckActive reports the currently live plan or advisory code cross-check.
-	// The single-run read and list share the same closed vocabulary: "plan", "code", or null.
+	// GetRun and the run lists compute it with the same live semantics and closed
+	// vocabulary: "plan", "code", or null. Other RunDTO responses leave it null.
 	CrossCheckActive *string `json:"cross_check_active"`
 	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
 	// while PlanCrossCheckGateReason is planning_diff_refused; otherwise nil.

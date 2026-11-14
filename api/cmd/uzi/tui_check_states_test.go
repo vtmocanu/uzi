@@ -15,6 +15,43 @@ import (
 
 func checkPtr(s string) *string { return &s }
 
+// Match each state on its own run row. A whole-board substring search for "checking"
+// would also match "xchecking" and would pass after the checking state disappeared.
+var demoCheckRows = []struct{ id, glyph, word string }{
+	{"c0de0005", "‖", "compl blocked"},
+	{"b2c3d4e5", "⚑", "xchk revise"},
+	{"c0de0006", "⚑", "xchk blocked"},
+	{"c0de0007", "⚑", "xchk n/a"},
+	{"d0e1f2a3", "◈", "xchecking"},
+	{"c0de0003", "◎", "checking"},
+	{"c0de0004", "⊕", "reworking"},
+	{"c0de0001", "◈", "xchecking"},
+}
+
+func assertDemoCheckRows(t *testing.T, board string) {
+	t.Helper()
+	for _, want := range demoCheckRows {
+		found := false
+		for _, line := range strings.Split(board, "\n") {
+			fields := strings.Fields(line)
+			for i, field := range fields {
+				if field != want.id {
+					continue
+				}
+				found = true
+				words := strings.Fields(want.word)
+				if i == 0 || !strings.Contains(fields[i-1], want.glyph) || i+len(words) >= len(fields) ||
+					strings.Join(fields[i+1:i+1+len(words)], " ") != want.word {
+					t.Errorf("row %s lacks exact glyph+word %q %q: %q", want.id, want.glyph, want.word, line)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("demo board lacks run %s:\n%s", want.id, board)
+		}
+	}
+}
+
 func TestTUICompletionAndCrossCheckTokens(t *testing.T) {
 	p := newPalette(true)
 	cases := []struct {
@@ -26,12 +63,12 @@ func TestTUICompletionAndCrossCheckTokens(t *testing.T) {
 		{"blocked", "‖", "compl blocked", "danger", apitypes.RunDTO{Status: statusPaused, CompletionPhase: "blocked"}},
 		{"plan live", "◈", "xchecking", "check", apitypes.RunDTO{Status: "running", CrossCheckActive: checkPtr("plan")}},
 		{"code live", "◈", "xchecking", "check", apitypes.RunDTO{Status: "running", CrossCheckActive: checkPtr("code")}},
-		{"plan revision", "⚑", "xchk revise", "warn", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckGateReason: checkPtr("revise")}},
-		{"exhausted", "⚑", "xchk revise", "warn", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckGateReason: checkPtr("revisions_exhausted")}},
-		{"plan blocked", "⚑", "xchk blocked", "danger", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckGateReason: checkPtr("block")}},
-		{"plan unavailable", "⚑", "xchk n/a", "warn", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckGateReason: checkPtr("worker_unsupported")}},
+		{"plan revision", "⚑", "xchk revise", "warn", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckRequired: true, PlanCrossCheckGateReason: checkPtr("revise")}},
+		{"exhausted", "⚑", "xchk revise", "warn", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckRequired: true, PlanCrossCheckGateReason: checkPtr("revisions_exhausted")}},
+		{"plan blocked", "⚑", "xchk blocked", "danger", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckRequired: true, PlanCrossCheckGateReason: checkPtr("block")}},
+		{"plan unavailable", "⚑", "xchk n/a", "warn", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckRequired: true, PlanCrossCheckGateReason: checkPtr("worker_unsupported")}},
 		{"completion beats code", "◎", "checking", "check", apitypes.RunDTO{Status: "running", CompletionPhase: "checking", CrossCheckActive: checkPtr("code")}},
-		{"gate beats active", "⚑", "xchk revise", "warn", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckGateReason: checkPtr("revise"), CrossCheckActive: checkPtr("plan")}},
+		{"gate beats active", "⚑", "xchk revise", "warn", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckRequired: true, PlanCrossCheckGateReason: checkPtr("revise"), CrossCheckActive: checkPtr("plan")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -71,7 +108,9 @@ func TestTUICompletionAndCrossCheckPrecedence(t *testing.T) {
 		{"human stop", "stopped", apitypes.RunDTO{Status: "failed", StopKind: checkPtr("plan_rejected"), CompletionPhase: "blocked"}},
 		{"stalled health", "stalled", apitypes.RunDTO{Status: "running", Health: "stalled", CompletionPhase: "checking"}},
 		{"account cooldown", "account cooldown", apitypes.RunDTO{Status: "running", Health: "waiting_account_cooldown", CompletionPhase: "checking"}},
-		{"revision in flight", "revising", apitypes.RunDTO{Status: "awaiting_approval", IsRevising: true, PlanCrossCheckGateReason: checkPtr("revise")}},
+		{"revision in flight", "revising", apitypes.RunDTO{Status: "awaiting_approval", IsRevising: true, PlanCrossCheckRequired: true, PlanCrossCheckGateReason: checkPtr("revise")}},
+		{"unbacked gate reason", "plan gate", apitypes.RunDTO{Status: "awaiting_approval", PlanCrossCheckGateReason: checkPtr("revise")}},
+		{"completion question stays input", "needs input", apitypes.RunDTO{Status: "awaiting_input", CompletionPhase: "blocked"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := p.runStateToken(tc.r, tc.r.IsRevising).word; got != tc.want {
@@ -85,9 +124,9 @@ func TestTUICompletionAndCrossCheckViewTones(t *testing.T) {
 	now := time.Now()
 	rows := []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "neutral-1", Kind: "issue", Status: "running", CreatedAt: now}},
-		{RunDTO: apitypes.RunDTO{ID: "gate-1", Kind: "issue", Status: "awaiting_approval", PlanCrossCheckGateReason: checkPtr("revise"), CreatedAt: now.Add(-time.Second)}},
-		{RunDTO: apitypes.RunDTO{ID: "gate-2", Kind: "issue", Status: "awaiting_approval", PlanCrossCheckGateReason: checkPtr("block"), CreatedAt: now.Add(-2 * time.Second)}},
-		{RunDTO: apitypes.RunDTO{ID: "gate-3", Kind: "issue", Status: "awaiting_approval", PlanCrossCheckGateReason: checkPtr("worker_unsupported"), CreatedAt: now.Add(-3 * time.Second)}},
+		{RunDTO: apitypes.RunDTO{ID: "gate-1", Kind: "issue", Status: "awaiting_approval", PlanCrossCheckRequired: true, PlanCrossCheckGateReason: checkPtr("revise"), CreatedAt: now.Add(-time.Second)}},
+		{RunDTO: apitypes.RunDTO{ID: "gate-2", Kind: "issue", Status: "awaiting_approval", PlanCrossCheckRequired: true, PlanCrossCheckGateReason: checkPtr("block"), CreatedAt: now.Add(-2 * time.Second)}},
+		{RunDTO: apitypes.RunDTO{ID: "gate-3", Kind: "issue", Status: "awaiting_approval", PlanCrossCheckRequired: true, PlanCrossCheckGateReason: checkPtr("worker_unsupported"), CreatedAt: now.Add(-3 * time.Second)}},
 		{RunDTO: apitypes.RunDTO{ID: "xcheck-1", Kind: "issue", Status: "running", CrossCheckActive: checkPtr("plan"), CreatedAt: now.Add(-4 * time.Second)}},
 		{RunDTO: apitypes.RunDTO{ID: "check-1", Kind: "issue", Status: "running", CompletionPhase: "checking", CreatedAt: now.Add(-time.Minute)}},
 		{RunDTO: apitypes.RunDTO{ID: "rework-1", Kind: "issue", Status: "running", CompletionPhase: "reworking", CreatedAt: now.Add(-2 * time.Minute)}},
@@ -158,23 +197,15 @@ func TestTUICompletionBlockedNeedsYouBandAndSummary(t *testing.T) {
 func TestTUICompletionAndCrossCheckAsciiBoardAndDetail(t *testing.T) {
 	run := apitypes.RunDTO{ID: "check-001", Kind: "issue", Status: "running", CompletionPhase: "reworking",
 		CrossCheckActive: checkPtr("code"), CompletionUnmet: []string{"m3\x1b[2J\u202e"}, CompletionAttempts: 2}
-	rows := []apitypes.RunListItemDTO{{RunDTO: run}}
-	m := tuiTestModel(t, &uzicli.FakeClient{Runs: rows}, "")
-	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: rows})
+	client := newDemoClient()
+	m := tuiTestModel(t, client, "")
+	m.height = 80
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: client.Runs})
 	m = next.(tuiModel)
 	next, _ = m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 	m = next.(tuiModel)
 	board := stripANSI(m.renderBoard())
-	row := ""
-	for _, line := range strings.Split(board, "\n") {
-		if strings.Contains(line, "check-00") {
-			row = line
-			break
-		}
-	}
-	if !strings.Contains(row, "⊕") || !strings.Contains(row, "reworking") {
-		t.Fatalf("Ascii board lost the state word/glyph:\n%s", board)
-	}
+	assertDemoCheckRows(t, board)
 
 	d := tuiTestModel(t, &uzicli.FakeClient{}, run.ID)
 	d = applyDetail(d, run, nil)
@@ -215,11 +246,7 @@ func TestTUIDemoHasEveryCheckState(t *testing.T) {
 	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: client.Runs})
 	m = next.(tuiModel)
 	board := stripANSI(m.renderBoard())
-	for _, word := range []string{"checking", "reworking", "compl blocked", "xchecking", "xchk revise", "xchk blocked", "xchk n/a"} {
-		if !strings.Contains(board, word) {
-			t.Errorf("demo board lacks %q:\n%s", word, board)
-		}
-	}
+	assertDemoCheckRows(t, board)
 	for _, r := range client.Runs {
 		if r.CompletionPhase == "" && r.CrossCheckActive == nil && r.PlanCrossCheckGateReason == nil {
 			continue

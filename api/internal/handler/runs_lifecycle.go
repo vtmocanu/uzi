@@ -509,7 +509,8 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	}
 }
 
-// GetRun returns one run visible to the viewer (owner, or any run for an admin).
+// detailCrossCheckActive reuses the live probes mirrored by the list query. It is
+// called only after GetRun's viewer gate, so the unscoped probes disclose nothing.
 func (h *Handler) detailCrossCheckActive(ctx context.Context, run store.Run) (*string, error) {
 	if h.q == nil { // unit handlers without a store have no live-check rows to read
 		return nil, nil
@@ -542,6 +543,7 @@ func (h *Handler) detailCrossCheckActive(ctx context.Context, run store.Run) (*s
 	return crossCheckActive(false, true), nil
 }
 
+// GetRun returns one run visible to the viewer (owner, or any run for an admin).
 func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
