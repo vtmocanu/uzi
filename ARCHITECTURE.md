@@ -206,7 +206,8 @@ a running one.
   run was started (`runs.model_source = 'run_override'`), else the frozen
   schedule pin (`schedule_pin`), then the owner's per-harness lane, the selected
   lead's harness pin, then the SDK/account default for Claude or `gpt-6.1-sol`
-  for Codex. A run-chosen model or effort is validated at create (422
+  for Codex. A run-chosen model or effort is validated at create (a bad
+  shape is a 400; a model the harness cannot run is a 422
   `model_incompatible_with_harness`), frozen across requeue and reclaim, and,
   if the claim can no longer honor it, parks the run `paused` on hold
   `run_override_unavailable` instead of substituting another value
