@@ -47,7 +47,9 @@ const HIST_TITLES = [
   "Fix double-count in phase folding",
   "Prune completed judge meta-runs",
 ] as const;
-const HIST_REPOS = ["repo-uzi", "repo-atlas", "repo-payments"] as const;
+// repo-payments is left out on purpose: it is the guardrail-blocked repo and never ran, so the
+// Overview Repos chip's "never ran" idle count has a real row in the demo (issue #4334).
+const HIST_REPOS = ["repo-uzi", "repo-atlas"] as const;
 const HIST_WORKERS = ["w-laptop", "w-ci", "w-nas", "w-hosted-eu", "w-mira"] as const;
 
 function histRun(i: number, minsBack: number): Run {
@@ -235,7 +237,9 @@ export const mockOtherUserRuns: Run[] = [
     // (PRD #32), and with own rows filtered out the waiting-for-unlock badge has no
     // business on this list at all.
     id: "run-andrei-queued",
-    repo_id: "repo-uzi",
+    // A DISABLED repo (repo-www) with a non-terminal run: the Overview Repos chip lists a
+    // disabled repo only while it has listed active work (issue #4334).
+    repo_id: "repo-www",
     issue_iid: 77,
     issue_title: "Add retry budget to the seed sync",
     issue_description: "Another user's queued run — factory-card demo fixture.",

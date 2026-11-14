@@ -96,6 +96,7 @@ import type {
   HeldPublication,
   HeldPublications,
   AdminRunsDebug,
+  AdminRepoActivity,
   RunInputsEnvelope,
   RecoveryCustodyHolds,
   GuardrailOverrideRequest,
@@ -247,6 +248,8 @@ import recoveryCustodyAggregateZero from "../../../fixtures/api-contract/recover
 import recoveryCustodyAggregateFull from "../../../fixtures/api-contract/recovery_custody_aggregate.full.json";
 import adminRunsDebugZero from "../../../fixtures/api-contract/admin_runs_debug.zero.json";
 import adminRunsDebugFull from "../../../fixtures/api-contract/admin_runs_debug.full.json";
+import adminRepoActivityZero from "../../../fixtures/api-contract/admin_repo_activity.zero.json";
+import adminRepoActivityFull from "../../../fixtures/api-contract/admin_repo_activity.full.json";
 import runInputsEnvelopeZero from "../../../fixtures/api-contract/run_inputs_envelope.zero.json";
 import runInputsEnvelopeFull from "../../../fixtures/api-contract/run_inputs_envelope.full.json";
 import heldPublicationsZero from "../../../fixtures/api-contract/held_publications.zero.json";
@@ -1636,6 +1639,19 @@ it("recovery held-publication fields match the Go contract and permit older serv
   void _adminRunsDebugFull;
 }
 
+// ── AdminRepoActivity (issue #4334) ──────────────────────────────────────────
+// repos is non-omitempty, so zero.json carries a null the handler normalizes to [].
+{
+  const _adminRepoActivityMissing: never = null as unknown as Exclude<keyof AdminRepoActivity, keyof typeof adminRepoActivityFull>;
+  const _adminRepoActivityExtra: never = null as unknown as Exclude<keyof typeof adminRepoActivityFull, keyof AdminRepoActivity>;
+  const _adminRepoActivityZero: ZeroOf<AdminRepoActivity, "repos"> = adminRepoActivityZero;
+  const _adminRepoActivityFull: Widen<AdminRepoActivity> = adminRepoActivityFull;
+  void _adminRepoActivityMissing;
+  void _adminRepoActivityExtra;
+  void _adminRepoActivityZero;
+  void _adminRepoActivityFull;
+}
+
 // ── RunInputsEnvelope (issue #4198) ──────────────────────────────────────────
 // inputs is non-omitempty, so zero.json carries a null the handler normalizes to [].
 {
@@ -1975,6 +1991,8 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "recovery_custody_holds", nullable: true },
   // issue #2545: held_publications' publications slice is non-omitempty (zero.json carries a null).
   { stem: "held_publications", nullable: true },
+  // issue #4334: admin_repo_activity's repos slice is non-omitempty (zero.json carries a null).
+  { stem: "admin_repo_activity", nullable: true },
   // issue #1432: the admin override-request queue row. findings is a non-omitempty
   // slice the handler normalizes to [], so its zero.json carries a null (the nil-slice
   // marshal) that the "findings" ZeroOf exemption above accounts for.

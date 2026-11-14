@@ -28,6 +28,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       getRecoveryHolds: vi.fn(),
       getAdminHealth: vi.fn(),
       listUsers: vi.fn(),
+      adminRepoActivity: vi.fn(),
     },
   };
 });
@@ -37,7 +38,7 @@ const mockApi = vi.mocked(api);
 const admin = { ...aUser, is_admin: true };
 
 // Every endpoint a non-admin must never reach.
-const adminEndpoints = () => [mockApi.adminListRuns, mockApi.getAdminUsage, mockApi.getAdminHealth, mockApi.listUsers];
+const adminEndpoints = () => [mockApi.adminListRuns, mockApi.getAdminUsage, mockApi.getAdminHealth, mockApi.listUsers, mockApi.adminRepoActivity];
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -55,6 +56,7 @@ beforeEach(() => {
   mockApi.adminListRuns.mockResolvedValue({ runs: [] });
   mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
   mockApi.listUsers.mockResolvedValue({ users: [] });
+  mockApi.adminRepoActivity.mockResolvedValue({ repos: [] });
   mockApi.getRecoveryHolds.mockResolvedValue(noHolds());
 });
 
@@ -973,9 +975,69 @@ describe("People chip (issue #4042)", () => {
   });
 });
 
+describe("Repos chip (issue #4334)", () => {
+  const chip = () => screen.getByRole("button", { name: /^Repos:/ });
+  const dialog = () => within(screen.getByRole("dialog", { name: "Repos in uzi" }));
+  const day = 24 * 3_600_000;
+  const repoRun = (id: string, over: Record<string, unknown>) => aRun({ id, owner_email: "mira@uzi.local", ...over });
+
+  function seedRepos() {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        repoRun("a-1", { status: "running", repo_id: "repo-a", repo_path: "org/alpha" }),
+        repoRun("b-1", { status: "queued", repo_id: "repo-off", repo_path: "org/disabled" }),
+        repoRun("c-1", { status: "completed", repo_id: "repo-c", repo_path: "org/charlie" }),
+      ],
+    });
+    mockApi.adminRepoActivity.mockResolvedValue({
+      repos: [
+        { id: "repo-a", path_with_namespace: "org/alpha", enabled: true, last_run_at: new Date(Date.now() - 60_000).toISOString() },
+        { id: "repo-c", path_with_namespace: "org/charlie", enabled: true, last_run_at: new Date(Date.now() - 2 * day).toISOString() },
+        { id: "repo-n", path_with_namespace: "org/never", enabled: true, last_run_at: null },
+      ],
+    });
+  }
+
+  it("counts active repos against the total, including an active disabled repo the read lacks", async () => {
+    seedRepos();
+    await mount();
+    expect(chip().getAttribute("aria-label")).toBe("Repos: 2 active now of 4");
+    await act(async () => {
+      fireEvent.click(chip());
+    });
+    expect(dialog().getByText("org/disabled")).toBeTruthy();
+    expect(dialog().getByText("Run within 7 days, nothing active")).toBeTruthy();
+    expect(dialog().getByText("2d ago")).toBeTruthy();
+    expect(dialog().getByText("1 never ran")).toBeTruthy();
+  });
+
+  it("reads the repo list once, not on the polls", async () => {
+    seedRepos();
+    await mount();
+    await settle(65_000);
+    expect(mockApi.adminRepoActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the active count and drops the total when the read fails", async () => {
+    seedRepos();
+    mockApi.adminRepoActivity.mockRejectedValue(new Error("down"));
+    await mount();
+    expect(chip().getAttribute("aria-label")).toBe("Repos: 2 active now");
+  });
+
+  it("gives a non-admin no chip and never calls the endpoint", async () => {
+    await mount();
+    await settle(30_000);
+    expect(screen.queryByRole("button", { name: /^Repos:/ })).toBeNull();
+    expect(mockApi.adminRepoActivity).not.toHaveBeenCalled();
+  });
+});
+
 // PRD #3875 M1: the Search button in the header opens the shell's command menu.
 describe("OverviewNext Search button", () => {
-  it("follows the health and People chips, before the Back link", async () => {
+  it("follows the health, People and Repos chips, before the Back link", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     render(
@@ -989,12 +1051,14 @@ describe("OverviewNext Search button", () => {
 
     const health = screen.getByRole("button", { name: /^System health:/ });
     const people = screen.getByRole("button", { name: /^People:/ });
+    const repos = screen.getByRole("button", { name: /^Repos:/ });
     const search = screen.getByRole("button", { name: /^Search/ });
     const back = screen.getByRole("link", { name: "Back to the old Overview" });
     const before = (a: Element, b: Element) =>
       (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
     expect(before(health, people)).toBe(true);
-    expect(before(people, search)).toBe(true);
+    expect(before(people, repos)).toBe(true);
+    expect(before(repos, search)).toBe(true);
     expect(before(search, back)).toBe(true);
   });
 

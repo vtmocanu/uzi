@@ -45,6 +45,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       getMyCodexRateLimits: vi.fn(),
       getMySettings: vi.fn(),
       version: vi.fn(),
+      adminRepoActivity: vi.fn(),
     },
   };
 });
@@ -98,6 +99,7 @@ beforeEach(() => {
   mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null } } as never);
   mockApi.version.mockResolvedValue({ version: "9.9.9-test", founded: "2026-07-03" } as never);
   mockApi.listUsers.mockResolvedValue({ users: [] });
+  mockApi.adminRepoActivity.mockResolvedValue({ repos: [] });
   mockApi.getRecoveryHolds.mockResolvedValue({
     aggregate: { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
     holds: [],
@@ -1519,6 +1521,78 @@ describe("OverviewNext People chip", () => {
     expect(within(screen.getByRole("group", { name: "Usage scope" })).getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
     await expect.poll(() => document.activeElement?.id).toBe("overview-usage-by-user");
   });
+});
+
+// #4334: the admin Repos chip's popover stays inside the viewport (below the chip on desktop, a
+// bottom sheet on a phone), Escape hands focus back to the chip, and the page never scrolls sideways.
+describe("OverviewNext Repos chip", () => {
+  const LONG_PATH = "an-organisation-with-a-long-name/a-repository-with-an-exceedingly-long-name-for-layout";
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
+
+  beforeEach(() => {
+    localStorage.clear();
+    document.documentElement.dataset.font = "plex";
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "p1", status: "running", repo_id: "repo-1", repo_path: LONG_PATH, owner_email: "priya@uzi.local" }),
+        aRun({ id: "p2", status: "queued", repo_id: "repo-1", repo_path: LONG_PATH, owner_email: "sam@uzi.local" }),
+        aRun({ id: "p3", status: "awaiting_input", repo_id: "repo-2", repo_path: "org/short", owner_email: "sam@uzi.local" }),
+        aRun({ id: "p4", status: "running", repo_id: "repo-off", repo_path: "org/disabled", owner_email: "lena@uzi.local" }),
+      ],
+    });
+    mockApi.adminRepoActivity.mockResolvedValue({
+      repos: [
+        { id: "repo-1", path_with_namespace: LONG_PATH, enabled: true, last_run_at: hoursAgo(1) },
+        { id: "repo-2", path_with_namespace: "org/short", enabled: true, last_run_at: hoursAgo(2) },
+        { id: "repo-3", path_with_namespace: LONG_PATH + "-recent", enabled: true, last_run_at: hoursAgo(50) },
+        { id: "repo-4", path_with_namespace: "org/old", enabled: true, last_run_at: hoursAgo(24 * 12) },
+        { id: "repo-5", path_with_namespace: "org/never", enabled: true, last_run_at: null },
+      ],
+    });
+  });
+  afterEach(() => {
+    delete document.documentElement.dataset.font;
+  });
+
+  for (const [width, height] of [
+    [1280, 900],
+    [400, 900],
+  ] as const) {
+    it(`opens inside the viewport and closes on Escape back to the chip at ${width}x${height}`, async () => {
+      await page.viewport(width, height);
+      render(
+        <MemoryRouter initialEntries={["/overview/next"]}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+            <OverviewNext />
+          </main>
+        </MemoryRouter>,
+      );
+      const chip = await screen.findByRole("button", { name: /^Repos: \d+ active now of \d+$/ });
+      await document.fonts.ready;
+      expect(window.innerWidth).toBe(width);
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "Repos in uzi" });
+      expect(chip.getAttribute("aria-expanded")).toBe("true");
+      expect(within(dialog).getByText("org/disabled")).toBeTruthy();
+      expect(within(dialog).getByText(/never ran/)).toBeTruthy();
+      const r = dialog.getBoundingClientRect();
+      expect.soft(r.left, "dialog left").toBeGreaterThanOrEqual(0);
+      expect.soft(r.top, "dialog top").toBeGreaterThanOrEqual(0);
+      expect.soft(r.right, "dialog right").toBeLessThanOrEqual(window.innerWidth);
+      expect.soft(r.bottom, "dialog bottom").toBeLessThanOrEqual(window.innerHeight);
+      for (const li of dialog.querySelectorAll<HTMLElement>("li")) {
+        expect.soft(li.getBoundingClientRect().right, li.textContent?.slice(0, 30)).toBeLessThanOrEqual(r.right + 1);
+      }
+      expect(document.documentElement.scrollWidth, "no horizontal scroll").toBeLessThanOrEqual(
+        document.documentElement.clientWidth,
+      );
+
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog", { name: "Repos in uzi" })).toBeNull();
+      expect(chip.getAttribute("aria-expanded")).toBe("false");
+      expect(document.activeElement).toBe(chip);
+    });
+  }
 });
 
 describe("OverviewNext health chip popover", () => {

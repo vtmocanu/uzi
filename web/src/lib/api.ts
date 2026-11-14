@@ -28,6 +28,7 @@ import type {
   CrossCheckHistoryAvailabilityDTO,
   CrossCheckHistoryParams,
   AdminBlockedRepos,
+  AdminRepoActivity,
   AdminMaintenance,
   MaintenanceState,
   AdminDockerAllowlistRepos,
@@ -1995,6 +1996,9 @@ const realApi = {
   // checks_unknown so the page can say "unknown" rather than "none blocked" (R1).
   adminListBlockedRepos: () =>
     request<AdminBlockedRepos>("GET", "/admin/blocked-repos"),
+  // Admin repo activity for the Overview Repos chip (issue #4334): every enabled repo plus
+  // every disabled repo with a listed non-terminal run, each with its last run time.
+  adminRepoActivity: () => request<AdminRepoActivity>("GET", "/admin/repo-activity"),
   // Egress profiles, "site lists" (PRD #1906 M1/M1w). Reads sit in the admin read group;
   // create/replace/delete are cookie-only admin writes (request() echoes the CSRF cookie).
   // A refused write is a 422 whose body carries `problems` (see egressProfileProblems).

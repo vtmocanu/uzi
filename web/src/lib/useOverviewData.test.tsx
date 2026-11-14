@@ -23,6 +23,7 @@ vi.mock("./api", async (importOriginal) => {
       adminListRuns: vi.fn(),
       getRecoveryHolds: vi.fn(),
       listUsers: vi.fn(),
+      adminRepoActivity: vi.fn(),
     },
   };
 });
@@ -47,6 +48,7 @@ beforeEach(() => {
   mockApi.adminListRuns.mockResolvedValue({ runs: [] });
   mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(1));
   mockApi.listUsers.mockResolvedValue({ users: [] });
+  mockApi.adminRepoActivity.mockResolvedValue({ repos: [] });
 });
 
 afterEach(() => {
@@ -341,6 +343,57 @@ describe("useOverviewData admin users", () => {
     first.resolve({ users: [user("old")] });
     await settle();
     expect(emails(result.current.adminUsers.users)).toEqual(["new@uzi.local"]);
+  });
+});
+
+describe("useOverviewData admin repo activity", () => {
+  const row = (id: string) => ({ id, path_with_namespace: `org/${id}`, enabled: true, last_run_at: null });
+
+  it("loads once on mount and on no poll", async () => {
+    mockApi.adminRepoActivity.mockResolvedValue({ repos: [row("a")] });
+    const { result } = renderHook(() => useOverviewData({ includeAdminRepoActivity: true }));
+    await settle();
+    expect(mockApi.adminRepoActivity).toHaveBeenCalledTimes(1);
+    expect(result.current.adminRepoActivity).toEqual({ repos: [row("a")], failed: false });
+    await settle(65_000);
+    expect(mockApi.adminRepoActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("never calls the endpoint without the opt-in, or for a non-admin who asks", async () => {
+    renderHook(() => useOverviewData({ includeAdminRuns: true, includeAdminUsers: true }));
+    renderHook(() => useOverviewData());
+    await settle(30_000);
+    expect(mockApi.adminRepoActivity).not.toHaveBeenCalled();
+    vi.mocked(useAuth).mockReturnValue(authValue(aUser));
+    const { result } = renderHook(() => useOverviewData({ includeAdminRepoActivity: true }));
+    await settle(30_000);
+    expect(mockApi.adminRepoActivity).not.toHaveBeenCalled();
+    expect(result.current.adminRepoActivity).toEqual({ repos: null, failed: false });
+  });
+
+  it("flags failed with no rows, and leaves the other data alone", async () => {
+    mockApi.adminRepoActivity.mockRejectedValue(new Error("down"));
+    const { result } = renderHook(() => useOverviewData({ includeAdminRepoActivity: true, includeAdminRuns: true }));
+    await settle();
+    expect(result.current.adminRepoActivity).toEqual({ repos: null, failed: true });
+    expect(result.current.data).not.toBeNull();
+    expect(result.current.adminRuns.failed).toBe(false);
+  });
+
+  it("drops the rows on revoke and fetches again on a re-grant", async () => {
+    mockApi.adminRepoActivity.mockResolvedValue({ repos: [row("a")] });
+    const { result, rerender } = renderHook(() => useOverviewData({ includeAdminRepoActivity: true }));
+    await settle();
+    expect(result.current.adminRepoActivity.repos).toEqual([row("a")]);
+    vi.mocked(useAuth).mockReturnValue(authValue(aUser));
+    rerender();
+    await settle();
+    expect(result.current.adminRepoActivity).toEqual({ repos: null, failed: false });
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    rerender();
+    await settle();
+    expect(mockApi.adminRepoActivity).toHaveBeenCalledTimes(2);
+    expect(result.current.adminRepoActivity.repos).toEqual([row("a")]);
   });
 });
 
