@@ -1061,6 +1061,17 @@ export class PlanRevisionReplacedError extends Error {
 export type UsableSavedRollout = { kind: "usable"; sessionId: string } | { kind: "failed"; reason?: string };
 
 /**
+ * Executor-owned A half of a credential switch. Runner must already hold model
+ * execution at a settled boundary and confirm the operation before reopenA.
+ * This does not include Runner's external drains or any replacement publication.
+ */
+export interface CodexSuspendedEpoch {
+  persistRollout(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<UsableSavedRollout>;
+  reopenA(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<void>;
+  teardown(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<boolean>;
+}
+
+/**
  * The unit M3 replaces with the Claude Agent SDK. Keeping it behind this
  * interface is what lets M2 exercise the full state machine (claim → worktree →
  * work → report) with no AI in the loop.
@@ -1068,6 +1079,7 @@ export type UsableSavedRollout = { kind: "usable"; sessionId: string } | { kind:
 export interface Executor {
   /** Strict credential-free save of the current live leg; does not stop or switch it. */
   saveUsableRollout?(): Promise<UsableSavedRollout>;
+  suspendCodexEpoch?(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<CodexSuspendedEpoch>;
   run(ctx: RunContext): Promise<ExecutorResult>;
   /** Close summary admission synchronously, then abort/join within the remaining sink deadline. */
   closeAndSettlePlanSummary?(deadlineMs?: number): Promise<void>;

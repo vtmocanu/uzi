@@ -30866,3 +30866,111 @@ describe("CodexExecutor: strict rollout currency", () => {
     }
   });
 });
+
+
+describe("CodexExecutor: suspended A boundary", () => {
+  for (const claim of [API_KEY, SUBSCRIPTION]) {
+    it(`holds and reopens the same ${claim.auth_mode} root without capture`, async () => {
+      const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+          .push(turnCompleted("completed", th, tn)));
+      const rig = makeMultiEpochRig([plan, epochResponder("th-work", "tn-work", (t, th, tn) =>
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn)))]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(claim));
+      let guards = 0;
+      const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000,
+        guard: () => { guards++; } };
+      const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+        gatePlan: async () => {
+          const transport = rig.epochs[0]!.transport;
+          const count = transport.requests.length;
+          const reaped = rig.epochs[0]!.reaped();
+          const suspended = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await suspended.persistRollout(bounds), { kind: "usable", sessionId: "th-plan" });
+          assert.equal(rig.epochs[0]!.reaped(), reaped);
+          assert.equal(transport.closes, 0);
+          assert.equal(transport.requests.length, count);
+          await suspended.reopenA(bounds);
+          await assert.rejects(suspended.reopenA(bounds), /retired Codex switch boundary/);
+          assert.equal(transport.closes, 0);
+          assert.ok(guards > 5);
+          return { kind: "approve", selection: { status: "absent" } };
+        },
+      });
+      await exec.run(ctx);
+      await assert.rejects(exec.suspendCodexEpoch(bounds), /inactive Codex switch boundary/);
+    });
+  }
+
+  it("refuses suspension while a model turn owns the epoch", async () => {
+    const entered = installerBarrier();
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", () => entered.resolve()) });
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx();
+    const running = exec.run(ctx);
+    try {
+      await entered.promise;
+      await assert.rejects(exec.suspendCodexEpoch({ signal: new AbortController().signal,
+        deadline: Date.now() + 60_000, guard() {} }), /settled live boundary/);
+      assert.equal(rig.transport.closes, 0);
+      assert.equal(rig.reaped(), 0);
+    } finally {
+      rig.transport.push(signalDone("th-current", "tn-1")).push(turnCompleted("completed", "th-current", "tn-1"));
+      await running;
+    }
+  });
+});
+
+
+it("suspended A teardown requires strict save and prevents reopening retired auth", async () => {
+  const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+    t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+      .push(turnCompleted("completed", th, tn)));
+  const rig = makeMultiEpochRig([plan]);
+  rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+  const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+  const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000, guard() {} };
+  const heldStop = new Error("test retained stop");
+  const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+    gatePlan: async () => {
+      const suspended = await exec.suspendCodexEpoch(bounds);
+      await assert.rejects(suspended.teardown(bounds), /exact saved rollout/);
+      assert.equal(rig.epochs[0]!.reaped(), 0);
+      assert.deepEqual(await suspended.persistRollout(bounds), { kind: "usable", sessionId: "th-plan" });
+      assert.equal(await suspended.teardown(bounds), true);
+      assert.ok(rig.epochs[0]!.reaped() > 0);
+      assert.ok(rig.epochs[0]!.transport.closes > 0);
+      await assert.rejects(suspended.reopenA(bounds), /credential authority retired/);
+      assert.equal(rig.providerLaunches(), 1);
+      throw heldStop;
+    },
+  });
+  await assert.rejects(exec.run(ctx), error => error === heldStop);
+});
+
+it("suspended A denies expired inspection and reopening without closing the old root", async () => {
+  const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+    t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+      .push(turnCompleted("completed", th, tn)));
+  const rig = makeMultiEpochRig([plan]);
+  let expired = false;
+  rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!,
+    inspectSession: async () => { expired = true; return "present"; },
+  } };
+  const exec = makeExecutor(rig, bindingOf(API_KEY));
+  const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000,
+    guard() { if (expired) throw new Error("expired switch"); } };
+  const heldStop = new Error("test retained stop");
+  const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+    gatePlan: async () => {
+      const suspended = await exec.suspendCodexEpoch(bounds);
+      await assert.rejects(suspended.persistRollout(bounds), /expired switch/);
+      await assert.rejects(suspended.reopenA(bounds), /expired switch/);
+      assert.equal(rig.epochs[0]!.transport.closes, 0);
+      assert.equal(rig.epochs[0]!.reaped(), 0);
+      throw heldStop;
+    },
+  });
+  await assert.rejects(exec.run(ctx), error => error === heldStop);
+});

@@ -86,7 +86,7 @@ import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { type CodexErrorClassification, CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
-import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type UsableSavedRollout, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type UsableSavedRollout, type CodexSuspendedEpoch, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
 import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
@@ -2481,6 +2481,19 @@ export class CodexExecutor implements Executor {
     return this.liveRolloutSave?.() ?? Promise.resolve({ kind: "failed", reason: "inactive_leg" });
   }
 
+  private switchAdmissionClosed = false;
+  private liveEpochSuspension?: (bounds: import("../codex-switch-coordinator.js").SwitchBounds) => Promise<CodexSuspendedEpoch>;
+
+  suspendCodexEpoch(bounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<CodexSuspendedEpoch> {
+    bounds.guard();
+    if (!this.liveEpochSuspension) return Promise.reject(new TrustedExecutionRefusal("inactive Codex switch boundary"));
+    return this.liveEpochSuspension(bounds);
+  }
+
+  private assertSwitchAdmission(): void {
+    if (this.switchAdmissionClosed) throw new TrustedExecutionRefusal("Codex switch admission closed");
+  }
+
   private beforeCaptureDrain?: () => Promise<void>;
   private captureMayHaveDrained?: () => boolean;
   private epochAdmission?: () => void;
@@ -3060,6 +3073,7 @@ export class CodexExecutor implements Executor {
 
   private async runLeg(ctx: RunContext, authority: CodexEpochAuthority): Promise<ExecutorResult> {
     this.assertCaptureAdmission();
+    this.assertSwitchAdmission();
     this.executionStarted = true;
     const setupRevision = this.captureRevision;
     this.intentFlight = undefined;
@@ -3238,7 +3252,7 @@ export class CodexExecutor implements Executor {
     const summaryResultAllowed = (): boolean => authority.isCurrent() && !lifecycleSignal.aborted
       && !ctx.cancelRequested?.() && !ctx.claimFenced?.();
     const summaryAllowed = (): boolean => this.lifetime.isOpen() && !this.captureOwners && !summaryState.closed && !this.summaryLifecycleClosed
-      && summaryResultAllowed();
+      && !this.switchAdmissionClosed && summaryResultAllowed();
     const summariesOn = isRunSummaryKind(ctx.kind);
     const prdInputP = summariesOn
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
@@ -3899,6 +3913,8 @@ export class CodexExecutor implements Executor {
       let completionAttempted = false;
       const completion = { history: new CompletionHistory(), attempted: () => completionAttempted };
       this.epochAdmission = () => {
+        authority.assertCurrent();
+        this.assertSwitchAdmission();
         this.assertCaptureAdmission();
         // Capture continuation adds this fence. Ordinary epoch startup retains its
         // established approval/installer interruption routing.
@@ -3929,6 +3945,85 @@ export class CodexExecutor implements Executor {
         this.safety = epoch.safety;
         return epoch;
       });
+
+      const suspendEpoch = async (bounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<CodexSuspendedEpoch> => {
+        bounds.guard();
+        authority.assertCurrent();
+        this.assertCaptureAdmission();
+        if (this.switchAdmissionClosed || pauseNow.activeTurnTrip || !epoch)
+          throw new TrustedExecutionRefusal("Codex switch requires a settled live boundary");
+        const captured = epoch;
+        const revision = this.captureRevision;
+        let retired = false;
+        let reopened = false;
+        let saved: string | undefined;
+        const current = (): void => {
+          bounds.guard();
+          authority.assertCurrent();
+          this.assertCaptureAdmission(revision);
+          if (this.liveEpochSuspension !== suspendEpoch || epoch !== captured ||
+              lifecycleSignal.aborted || ctx.claimFenced?.() || ctx.cancelRequested?.() ||
+              retired || reopened)
+            throw new TrustedExecutionRefusal("retired Codex switch boundary");
+        };
+        current();
+        const summaryWasClosed = this.summaryLifecycleClosed;
+        // This gate is independent of captureRevision and leaves A's root and scope intact.
+        this.switchAdmissionClosed = true;
+        const refresh = captured.harness.suspendRefreshAdmission();
+        const intentFlights = [...this.retiredIntentFlights, ...(this.intentFlight ? [this.intentFlight] : [])];
+        const planFlights = [...this.planFlights];
+        this.summaryLifecycleClosed = true;
+        for (const flight of intentFlights) flight.ctrl.abort();
+        for (const flight of planFlights) { flight.closed = true; flight.ctrl.abort(); }
+        // Each admitted producer retains ownership until it settles. An error does
+        // not detach siblings; bounds are rechecked after their complete join.
+        const drained = await Promise.allSettled([
+          refresh.drain(), settleInstall(),
+          ...[...intentFlights, ...planFlights].map(flight => flight.done),
+        ]);
+        current();
+        const failure = drained.find(result => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+        if ([...this.unverifiedEpochRegistries].some(registry => this.ownedSummaryRegistries.has(registry)))
+          throw new TrustedExecutionRefusal("summary cleanup unproven");
+        return Object.freeze({
+          persistRollout: async (nextBounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<UsableSavedRollout> => {
+            nextBounds.guard(); current();
+            const result = await saveRollout();
+            nextBounds.guard(); current();
+            if (result.kind === "usable") saved = result.sessionId;
+            return result;
+          },
+          reopenA: async (nextBounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<void> => {
+            nextBounds.guard(); current();
+            refresh.resume();
+            nextBounds.guard(); current();
+            reopened = true;
+            this.summaryLifecycleClosed = summaryWasClosed;
+            this.switchAdmissionClosed = false;
+          },
+          teardown: async (nextBounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<boolean> => {
+            nextBounds.guard(); current();
+            if (!saved || (captured.harness.rootThreadId ?? lastSessionId) !== saved)
+              throw new TrustedExecutionRefusal("Codex teardown requires exact saved rollout");
+            retired = true;
+            authority.retire();
+            // Preserve the strict copy through ordinary finally/reap handling.
+            reapedSinceLastPersist = true;
+            beforeReapPersist = Promise.resolve();
+            await captured.dispose();
+            nextBounds.guard(); bounds.guard();
+            this.lifetime.assertOpen();
+            if (lifecycleSignal.aborted || ctx.claimFenced?.() || ctx.cancelRequested?.() ||
+                epoch !== captured || this.captureRevision !== revision)
+              throw new TrustedExecutionRefusal("Codex teardown ownership changed");
+            return !this.unverifiedEpochRegistries.has(captured.registry) &&
+              this.unverifiedEpochRegistries.size === 0;
+          },
+        });
+      };
+      this.liveEpochSuspension = suspendEpoch;
 
       // Issue #1782: a refused in-turn wall park may already have reaped the provider root (the
       // runner's capture runs the Codex boundary before the owner's extension is known), which
@@ -5136,6 +5231,7 @@ export class CodexExecutor implements Executor {
       this.intentFlight?.ctrl.abort();
       for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(); }
       this.liveRolloutSave = undefined;
+      this.liveEpochSuspension = undefined;
       await this.withCaptureOwnership(async () => {
         this.beforeCaptureDrain = undefined;
         this.captureMayHaveDrained = undefined;
@@ -5932,6 +6028,7 @@ export class CodexExecutor implements Executor {
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         if (accountAdmissionActive() && (ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted))
           throw new CodexRequestFailure("parent_abort");
+        this.assertSwitchAdmission();
         this.assertCaptureAdmission(captureRevision);
         if (registry.state() !== "open") throw new CodexRequestFailure("parent_abort");
         assertResidueQuarantineOpen("provider_turn");
