@@ -661,6 +661,17 @@ describe("terminal operation engine", () => {
 });
 
 describe("terminal operation rediscovery", () => {
+  it("runs on the boot recovery pass when the gate is on, and not at all when it is off", async () => {
+    const root = mkRoot();
+    const writer = mkCoord(root).terminalOperationStore();
+    await writer.create(rec({ generation: 1 }));
+    await mkCoord(root, false).resumePending(undefined, []);
+    assert.equal((await readRec(writer, 1)).phase, "capturing", "gate off: the boot pass leaves terminal records alone");
+    await mkCoord(root).resumePending(undefined, []);
+    assert.equal((await readRec(writer, 1)).phase, "incomplete", "gate on: the boot pass rediscovers terminal records");
+  });
+
+
   it("restores every phase from disk with a new coordinator, never sending or touching git", async () => {
     const root = mkRoot();
     const writer = mkCoord(root).terminalOperationStore();

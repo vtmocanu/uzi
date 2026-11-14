@@ -363,14 +363,15 @@ its presence preserved, and retries never re-resolve it.
 
 Operation records (`agent/src/terminal-operation.ts`) live under
 `<dataDir>/terminal-preservation/<runId>/`, outside the recovery run directory.
-They are MAC-bound with a domain-separated key, merge monotonically, append
+They are MAC-bound (the recovery key over a domain-separated MAC input), merge monotonically, append
 invocations only, grow a `localBlock`, and are immutable once closed. Every
 write is validated by the decoder before it lands, so a record stays decodable.
 One operation owner at a time, and the journal lock is never held across the
 network. Before any send, the engine scans all the run's records for a
-secret latch. A `generation_bound` or `prior_tip_mismatch` response becomes a
-`conflict` record with a `server_conflict` outcome. The secret latch is written
-before the flagged commits are. Rediscovery never sends and never deletes: a
+secret latch. A `generation_bound` or `prior_tip_mismatch` response appends a `conflict`
+invocation and adds the `server_conflict` local block. The secret latch is written
+before the flagged commits are. Rediscovery runs on the boot recovery pass
+(gated), never sends and never deletes: a
 `capturing` or `captured` record found on restart becomes `incomplete`, with
 its private refs retained.
 
@@ -413,7 +414,12 @@ is claimed.
 - **Workers without attempt paths.** A non-Docker worker without attempt paths
   skips with `source_unknown`, and would lose `completion_final_head` once the
   gate is activated.
-- **Claude reap window.** About 22.5 s, so a short permit leaves a small lane.
+- **Egress profile.** The worker does not see an egress-profile marker on the
+  claim, so the lane passes `egressBound: false`; the exclusion holds only
+  because egress-profile runs go to the isolated lane.
+- **Reap-body window.** At most about 22.5 s (the 30 s boundary deadline less a
+  quarter-of-remaining reserve), for Claude and Codex alike, after the reap and
+  quiesce time already spent.
 - **(a1)/(a2) without held capture.** These fall back to the 120 s cap and are
   not bounded by the shutdown deadline.
 

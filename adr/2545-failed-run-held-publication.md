@@ -313,9 +313,10 @@ Worker-side, `prepareFrozenHeld` was split internally into `resolveFrozenRange`
 and `prepareOverRange`. Legacy callers see identical behaviour: same signature,
 return shape, single budget, callback order and tip-only CI check. A new
 terminal-only `prepareFrozenHeldPinned` adds an opt-in per-commit CI check and
-the scan and transport digests. With the terminal gate on, the held V2 publish
-closure first runs the terminal preservation step and keeps the hold (no held
-FINAL) unless that step is `published` or `recorded`. The gate is a
+the scan and transport digests. With the terminal gate on, the held publish
+closure runs the terminal preservation step after the legacy preparation and
+before any held create or FINAL, and keeps the hold (no held FINAL) unless that
+step is `published` or `recorded`. The gate is a
 compile-time constant that is off, so this is production-dark. See
 [ADR-4007](4007-terminal-preservation.md).
 

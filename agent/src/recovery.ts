@@ -5660,6 +5660,14 @@ export class RecoveryCoordinator {
 
   private async resumePendingPass(signal?: AbortSignal, snapshot?: RecoveryRecord[], discover = false): Promise<void> {
     const attempts = new Map<string, MaintenanceBudget>();
+    // #4007 slice B: gated, non-sending, non-mutating rediscovery of terminal-preservation records on the boot
+    // pass (capturing/captured -> incomplete). It never fails the pass; a resumable record sends only later,
+    // through the held V2 publish closure. With the gate off nothing runs.
+    if (this.terminalPreservationEnabled()) {
+      await this.resumeTerminalOperations(signal).catch((err: unknown) => {
+        this.log.warn("recovery: terminal preservation rediscovery failed", { error: errText(err) });
+      });
+    }
     try {
       const records = [...(snapshot ?? await this.snapshotBootRecords())];
       if (discover) {
