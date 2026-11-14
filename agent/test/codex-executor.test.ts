@@ -30869,6 +30869,38 @@ describe("CodexExecutor: strict rollout currency", () => {
 
 
 describe("CodexExecutor: suspended A boundary", () => {
+  for (const claim of [API_KEY, SUBSCRIPTION]) {
+    it(`reconciles captured A credentials while suspended (${claim.auth_mode})`, async () => {
+      const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+          .push(turnCompleted("completed", th, tn)));
+      const rig = makeMultiEpochRig([plan]);
+      const exec = makeExecutor(rig, bindingOf(claim));
+      const stop = new Error("held after reconcile");
+      // The caller's deadline uses a monotonic clock, not epoch time.
+      const bounds = { signal: new AbortController().signal, deadline: 400, guard() {} };
+      const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+        gatePlan: async () => {
+          const lease = await exec.suspendCodexEpoch(bounds);
+          const releases = rig.client.releaseCalls.length;
+          const refreshes = rig.client.refreshCalls.length;
+          await assert.rejects(lease.reconcileA(bounds, 0), /remaining duration/);
+          const transport = rig.epochs[0]!.transport;
+          const requests = transport.requests.length;
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          assert.equal(rig.client.releaseCalls.length - releases, claim.auth_mode === "api_key" ? 1 : 0);
+          assert.equal(rig.client.refreshCalls.length - refreshes, claim.auth_mode === "subscription" ? 1 : 0);
+          assert.equal(transport.requests.length, requests, "reconciliation does not start a model turn");
+          assert.equal(rig.epochs[0]!.reaped(), 0);
+          await lease.reopenA(bounds);
+          await assert.rejects(lease.reconcileA(bounds, 1000), /retired Codex switch boundary/);
+          throw stop;
+        },
+      });
+      await assert.rejects(exec.run(ctx), error => error === stop);
+    });
+  }
+
   for (const timing of ["before-suspend", "during-drain", "before-reopen"] as const) {
     it(`retains the gate when live auth fails ${timing}`, async () => {
       const rig = makeMultiEpochRig([epochResponder("th-plan", "tn-plan", (t, th, tn) =>

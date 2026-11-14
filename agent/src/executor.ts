@@ -1066,6 +1066,10 @@ export type UsableSavedRollout = { kind: "usable"; sessionId: string } | { kind:
  * This does not include Runner's external drains or any replacement publication.
  */
 export interface CodexSuspendedEpoch {
+  /** Complete captured A's installer/credential boundary before read-only preflight.
+   * remainingMs is computed by the caller using its SwitchBounds monotonic clock.
+   */
+  reconcileA(bounds: import("./codex-switch-coordinator.js").SwitchBounds, remainingMs: number): Promise<import("./codex/safety.js").ReconcileOutcome>;
   persistRollout(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<UsableSavedRollout>;
   reopenA(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<void>;
   teardown(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<boolean>;

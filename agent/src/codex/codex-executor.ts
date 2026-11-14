@@ -4012,6 +4012,18 @@ export class CodexExecutor implements Executor {
         if ([...this.unverifiedEpochRegistries].some(registry => this.ownedSummaryRegistries.has(registry)))
           throw new TrustedExecutionRefusal("summary cleanup unproven");
         return Object.freeze({
+          reconcileA: async (nextBounds: import("../codex-switch-coordinator.js").SwitchBounds, remainingMs: number): Promise<ReconcileOutcome> => {
+            nextBounds.guard(); current();
+            if (!Number.isFinite(remainingMs) || remainingMs <= 0)
+              throw new TrustedExecutionRefusal("Codex reconcile requires positive remaining duration");
+            // Summary producers have joined above. Use the existing installer's
+            // immutable A credential closure; SwitchBounds.deadline is not epoch time.
+            const result = await installState.reconcile(
+              { boundary: "checkpoint", deadlineMs: remainingMs }, nextBounds.signal);
+            nextBounds.guard(); current();
+            assertAuthHealthy();
+            return result;
+          },
           persistRollout: async (nextBounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<UsableSavedRollout> => {
             nextBounds.guard(); current();
             const result = await saveRollout();
