@@ -11,7 +11,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { RunRunner } from "../src/runner.js";
-import type { RunContext, SecretRemediationDecision } from "../src/executor.js";
+import { SecretRemediationStoppedError, type RunContext, type SecretRemediationDecision } from "../src/executor.js";
+import { CheckpointUnsafeCleanupError } from "../src/checkpoint-stop.js";
 import { GitCache } from "../src/git.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import {
@@ -1773,4 +1774,32 @@ it("M1 production checkpoint refuses mixed valid and invalid finding identities 
   assert.ok(observed);
   assert.ok(scanned);
   assert.deepEqual(errors, []);
+});
+
+// Issue #4313: the gate's catch order while a stop is in effect. An unsafe cleanup (a TrustedExecutionRefusal) is
+// never a clean stop, so it is rethrown unchanged; any other failure under a stop is the stop itself.
+describe("done gate catch order under a stop (issue #4313)", () => {
+  for (const failure of ["unsafe", "plain"] as const) {
+    it(`a ${failure === "unsafe" ? "CheckpointUnsafeCleanupError" : "plain error"} thrown by the fetch-back during a stop is ${failure === "unsafe" ? "rethrown, not converted" : "converted to SecretRemediationStoppedError"}`, { skip }, async () => {
+      const unsafe = new CheckpointUnsafeCleanupError("unsafe cleanup during the stop");
+      let outcome: unknown = "no throw";
+      await drive({
+        iid: 4313_900 + (failure === "unsafe" ? 0 : 1),
+        forge: "gitlab",
+        configureRunner: (runner) => {
+          (runner as unknown as { fetchBackBestEffort: unknown }).fetchBackBestEffort = async () => {
+            runner.shutdown();
+            throw failure === "unsafe" ? unsafe : new Error("plain failure");
+          };
+        },
+        body: async (ctx, gate) => {
+          commitIn(ctx.worktreePath, "ok.txt", "ordinary work\n");
+          outcome = await gate().catch((e: unknown) => e);
+        },
+      });
+      if (failure === "unsafe") assert.strictEqual(outcome, unsafe, "the unsafe-cleanup error itself, by identity");
+      else assert.ok(outcome instanceof SecretRemediationStoppedError, String(outcome));
+      assert.deepEqual(errors, []);
+    });
+  }
 });

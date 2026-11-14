@@ -76,7 +76,7 @@ import type {
   IterationParkOutcome,
   WallParkRefresh,
 } from "./executor.js";
-import { PlanRejectedError } from "./executor.js";
+import { PlanRejectedError, SecretRemediationStoppedError } from "./executor.js";
 import type { InPlaceSwitchSite } from "./executor.js";
 import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
@@ -1100,6 +1100,16 @@ function checkpointStopFields(steering: SteeringChannel, now: () => number): Omi
     authorityRevoked: () => steering.isCancelled() || steering.claimFence() !== undefined ||
       steering.pendingCredentialSwitch() !== undefined || steering.getPauseMode() === "disk",
   };
+}
+
+/** The owned-scope handles {@link RunRunner.withOwnedRemediationScope} gives its body: the bounded wait for the
+ *  source-authority transaction, the scan and path-scan sub-scopes, and a read of the scope's stop state. */
+interface RemediationScopes {
+  wait: AuthorityWait;
+  scanScope: <T>(fn: () => Promise<T>) => Promise<T>;
+  pathScope: <T>(fn: () => Promise<T>) => Promise<T>;
+  /** True once the scope's stop aborted or the policy's classifier reads a stop now. */
+  stopped: () => boolean;
 }
 
 /** Marks checked-gate failures whose escalation may be refused by held transport. */
@@ -3313,6 +3323,8 @@ export interface CheckpointTestHooks {
   beforeBusyProbe?: () => Promise<void>;
   /** Fires between the pinned secret scan and the pack of an overlay-less checkpoint publish. */
   afterCheckpointScan?: (ctx: { barePath: string; branch: string; range: CheckpointRange }) => Promise<void>;
+  /** Fires right after the done/resume remediation gate's range scan resolves, before any state write. */
+  afterRemediationGateScan?: () => void | Promise<void>;
   /** Rewrite / observe the tick's child processes (see TickSpawnerTestHooks). */
   tickSpawn?: TickSpawnerTestHooks;
   /** Observe every tick's outcome class (the same value logged as "mid-turn checkpoint tick"). */
@@ -17841,7 +17853,7 @@ export class RunRunner {
       },
       // issue #1932 D2: the pre-exit secret remediation gate, serialized with the mid-turn tick.
       secretRemediationGate: (options) =>
-        this.runGatedSink(flight, () => this.runSecretRemediationGate(flight, barePath, runnerClone, options)),
+        this.runGatedSink(flight, () => this.runSecretRemediationGateScoped(flight, barePath, runnerClone, options)),
       // issue #4258: advisory, non-terminal mid-run consumer; a no-op unless a trigger is pending.
       midRunSecretRemediation: () => flight.secretRemediation?.midRunTrigger
         ? this.runGatedSink(flight, () => this.runMidRunSecretRemediationScoped(flight, barePath, runnerClone))
@@ -20834,35 +20846,76 @@ export class RunRunner {
     barePath: string | undefined,
     runnerClone: RunnerClone,
   ): Promise<SecretRemediationDecision> {
-    const { runLog, batcher, runId } = flight;
+    const { runLog, runId } = flight;
     const proceed = { action: "proceed" as const };
     if (!flight.secretRemediation?.midRunTrigger || !barePath) return proceed;
-    const hooks = this.checkpointTestHooks;
     const deferPre = (why: string): { action: "proceed" } => {
       runLog.info("mid-run secret remediation deferred", { run_id: runId, why });
       return proceed;
     };
     if (this.tickSurvivorsRemain(flight)) return deferPre("tick_process_survived");
     if (await this.retainedBareLockRemains(flight)) return deferPre("bare_lock_retained");
+    return await this.withOwnedRemediationScope(
+      flight, barePath, runnerClone, { policy: "mid_run", label: "mid-run secret remediation" },
+      (stop, scopes) => this.runMidRunSecretRemediation(flight, barePath, runnerClone, stop, scopes),
+      (e, stop) => {
+        if (e instanceof PreservationRefusedError) throw e;
+        if (stop.aborted) return deferPre("aborted");
+        if (isCheckpointBoundaryFailure(e)) throw e;
+        return deferPre(`threw: ${errMessage(e)}`);
+      },
+    );
+  }
 
+  /**
+   * The owned abortable process scope shared by the mid-run seam (issue #4258, policy "mid_run") and the
+   * terminal done/resume gate (issue #4313, policy "terminal"). A hard stop kills the body's git/gitleaks
+   * children through `ac`; a soft stop is cooperative through `softAc`. The caller holds the sink gate
+   * (runGatedSink). This method returns (or throws) only after every child exited and lock custody ran;
+   * when a child survived its SIGKILL it keeps waiting, still inside the gate, until the group is gone.
+   * `mapError` maps a body failure while the scope is still open (it sees the scope's `stop`).
+   *
+   * "mid_run" classifies every revocation with the done-path rule (checkCheckpointStop). "terminal" is
+   * narrower: HARD on a terminal lifecycle abort with no graceful shutdown in effect, a sticky cancel, a
+   * claim fence and the shutdown deadline; SOFT on a worker graceful shutdown and a disk stop. Pause-now, a
+   * credential switch, authority-only revocation and the wall are not stops of a terminal scope.
+   */
+  private async withOwnedRemediationScope<T>(
+    flight: RunFlight,
+    barePath: string,
+    runnerClone: RunnerClone,
+    opts: { policy: "mid_run" | "terminal"; label: string },
+    body: (stop: AbortSignal, scopes: RemediationScopes) => Promise<T>,
+    mapError: (e: unknown, stop: AbortSignal) => T,
+  ): Promise<T> {
+    const { runLog, batcher, runId } = flight;
+    const { policy, label } = opts;
+    const hooks = this.checkpointTestHooks;
     const ac = new AbortController();
     const softAc = new AbortController();
     const stop = AbortSignal.any([ac.signal, softAc.signal]);
     const steering = flight.steering;
     const now = hooks?.absoluteNow ?? Date.now;
     const neverStop = new AbortController().signal;
+    const lifecycleSignal = steering.lifecycleSignal();
+    const terminalSignal = steering.terminalLifecycleSignal();
+    const authoritySignal = steering.checkpointAuthoritySignal();
+    const shutdownSignal = this.shutdownSignal.signal;
     const classify = (): "hard" | "soft" | "none" => {
       try {
+        if (policy === "terminal") {
+          const shutdown = steering.workerShutdownCheckpoint();
+          if (steering.isCancelled() || steering.claimFence() !== undefined) return "hard";
+          if (terminalSignal.aborted && !shutdown) return "hard";
+          if (shutdown || shutdownSignal.aborted || steering.getPauseMode() === "disk") return "soft";
+          return "none";
+        }
         checkCheckpointStop({ ...checkpointStopFields(steering, now), signal: neverStop });
         return steering.lifecycleSignal().aborted ? "soft" : "none";
       } catch {
         return "hard";
       }
     };
-    const lifecycleSignal = steering.lifecycleSignal();
-    const terminalSignal = steering.terminalLifecycleSignal();
-    const authoritySignal = steering.checkpointAuthoritySignal();
-    const shutdownSignal = this.shutdownSignal.signal;
     let shutdownAttached = false;
     let cancelShutdownTimer: (() => void) | undefined;
     const attachShutdown = (): void => {
@@ -20890,7 +20943,12 @@ export class RunRunner {
     // Initial state: authoritySignal is sticky for the flight (a given-up credential switch leaves it
     // aborted), so it counts only as an event, never as a standing stop.
     attachShutdown();
-    if (terminalSignal.aborted || steering.isCancelled() || steering.claimFence() !== undefined) {
+    if (policy === "terminal") {
+      // The classifier alone decides: a spent pause-now lifecycle, a given-up credential switch and the
+      // sticky authority signal are not stops of this scope.
+      if (shutdownSignal.aborted) onShutdown();
+      else onEvent();
+    } else if (terminalSignal.aborted || steering.isCancelled() || steering.claimFence() !== undefined) {
       onEvent();
       if (!stop.aborted) ac.abort();
     } else if (lifecycleSignal.aborted || shutdownSignal.aborted) {
@@ -20970,7 +21028,7 @@ export class RunRunner {
           if (await fs.lstat(p).then(() => true, (e: unknown) => (e as NodeJS.ErrnoException)?.code !== "ENOENT")) present.push(p);
         }
       } catch (e) {
-        runLog.warn("mid-run secret remediation could not list lock candidates", { run_id: runId, error: errMessage(e) });
+        runLog.warn(`${label} could not list lock candidates`, { run_id: runId, error: errMessage(e) });
       }
       blockSinkOnLocks(present);
     };
@@ -20997,23 +21055,29 @@ export class RunRunner {
             stop.removeEventListener("abort", onStop);
           });
       };
-    const scopes = {
-      wait: { ...this.authorityWait(flight), signal: AbortSignal.any([this.retainedLifecycleSignal(flight), ac.signal]) },
-      scanScope: <T>(fn: () => Promise<T>): Promise<T> => subScope(this.scanDeadlineMs())(fn),
-      pathScope: <T>(fn: () => Promise<T>): Promise<T> => subScope(this.pathScanDeadlineMs())(fn),
+    // "terminal" waits with no lifecycle signal and no cancel controller (the terminalLifecycleCaptureWait
+    // precedent): a pause-now or credential switch must not abort a lock acquisition the gate still owns.
+    // Its own stop (hard or soft) and shutdown do.
+    const scopes: RemediationScopes = {
+      wait: {
+        ...this.authorityWait(flight),
+        signal: AbortSignal.any(policy === "terminal"
+          ? [terminalSignal, shutdownSignal, ac.signal, softAc.signal]
+          : [this.retainedLifecycleSignal(flight), ac.signal]),
+      },
+      scanScope: <U>(fn: () => Promise<U>): Promise<U> => subScope(this.scanDeadlineMs())(fn),
+      pathScope: <U>(fn: () => Promise<U>): Promise<U> => subScope(this.pathScanDeadlineMs())(fn),
+      stopped: () => stop.aborted || classify() !== "none",
     };
     try {
       return await this.git.withBoundaryProcessSpawner(
         spawner.spawn,
         ac.signal,
-        () => this.runMidRunSecretRemediation(flight, barePath, runnerClone, stop, scopes),
+        () => body(stop, scopes),
         { beforeLockRelease, softSignal: softAc.signal },
       );
     } catch (e) {
-      if (e instanceof PreservationRefusedError) throw e;
-      if (stop.aborted) return deferPre("aborted");
-      if (isCheckpointBoundaryFailure(e)) throw e;
-      return deferPre(`threw: ${errMessage(e)}`);
+      return mapError(e, stop);
     } finally {
       cancelShutdownTimer?.();
       lifecycleSignal.removeEventListener("abort", onEvent);
@@ -21055,7 +21119,7 @@ export class RunRunner {
           }
           recordLocks(res);
         } else if (!acquired && waitAc.signal.aborted) {
-          runLog.warn("mid-run secret remediation lock reconcile not run", {
+          runLog.warn(`${label} lock reconcile not run`, {
             run_id: runId, reconciled: false, reason: "lock_wait_timeout",
           });
           await recordUnreconciledLocks();
@@ -21078,7 +21142,7 @@ export class RunRunner {
           if (verdict !== last) {
             last = verdict;
             const log = verdict === "stuck" ? runLog.warn : runLog.error;
-            log.call(runLog, "mid-run secret remediation waiting for a surviving process group to exit", {
+            log.call(runLog, `${label} waiting for a surviving process group to exit`, {
               run_id: runId,
               verdict,
             });
@@ -21112,26 +21176,91 @@ export class RunRunner {
    *  - trusted, all findings above every floor, attempts < cap => remediate (attempts++)
    *  - trusted, findings above the floors, attempts == cap => blocked, fail
    *
-   * Every call also clears a pending issue #4258 mid-run trigger (`state.midRunTrigger`): the
-   * done and resume gates own the decision from here, so no duplicate mid-run turn follows.
+   * Every call that reaches a decision also clears a pending issue #4258 mid-run trigger
+   * (`state.midRunTrigger`): the done and resume gates own the decision from here, so no duplicate
+   * mid-run turn follows. A call stopped by {@link SecretRemediationStoppedError} reached no decision and
+   * leaves the trigger pending.
+   *
+   * Issue #4313: the production wiring runs this under {@link runSecretRemediationGateScoped}, which passes
+   * `owned` (the scope's stop signal and handles). After a cancel, claim fence, terminal fence, graceful
+   * worker shutdown or disk stop the gate throws SecretRemediationStoppedError at its next check and changes
+   * nothing from then on, except that a trusted finding set it already holds is latched and recorded (a
+   * negative-knowledge hold for the unscanned shutdown-capture publish). Without `owned` it never stops.
    */
   private async runSecretRemediationGate(
     flight: RunFlight,
     barePath: string | undefined,
     runnerClone: RunnerClone,
     options?: { unpublishedOnly: true },
+    owned?: { stop: AbortSignal; scopes: RemediationScopes },
+  ): Promise<SecretRemediationDecision> {
+    const state = (flight.secretRemediation ??= { attempts: 0 });
+    try {
+      const decision = await this.decideSecretRemediation(flight, barePath, runnerClone, options, owned);
+      // Issue #4258: this gate (the done gate and the resume preflight) now owns the decision, so a
+      // pending mid-run trigger must not also produce a duplicate turn.
+      state.midRunTrigger = undefined;
+      return decision;
+    } catch (e) {
+      if (!(e instanceof SecretRemediationStoppedError)) state.midRunTrigger = undefined;
+      throw e;
+    }
+  }
+
+  /** Issue #4313: the terminal gate under its owned abortable scope (policy "terminal"). */
+  private async runSecretRemediationGateScoped(
+    flight: RunFlight,
+    barePath: string | undefined,
+    runnerClone: RunnerClone,
+    options?: { unpublishedOnly: true },
+  ): Promise<SecretRemediationDecision> {
+    if (!barePath) return await this.runSecretRemediationGate(flight, barePath, runnerClone, options);
+    return await this.withOwnedRemediationScope(
+      flight, barePath, runnerClone, { policy: "terminal", label: "pre-exit secret remediation" },
+      (stop, scopes) => this.runSecretRemediationGate(flight, barePath, runnerClone, options, { stop, scopes }),
+      (e, stop) => {
+        // The gate maps its own stops; a scope error surfacing here after the gate settled is one too, except
+        // the refusals that must stay visible whatever stopped the scope.
+        if (e instanceof SecretRemediationStoppedError || e instanceof PreservationRefusedError ||
+            e instanceof TrustedExecutionRefusal) throw e;
+        if (stop.aborted) throw new SecretRemediationStoppedError();
+        throw e;
+      },
+    );
+  }
+
+  private async decideSecretRemediation(
+    flight: RunFlight,
+    barePath: string | undefined,
+    runnerClone: RunnerClone,
+    options: { unpublishedOnly: true } | undefined,
+    owned: { stop: AbortSignal; scopes: RemediationScopes } | undefined,
   ): Promise<SecretRemediationDecision> {
     const { runLog, runId } = flight;
     const state = (flight.secretRemediation ??= { attempts: 0 });
-    // Issue #4258: this gate (the done gate and the resume preflight) now owns the decision, so a
-    // pending mid-run trigger must not also produce a duplicate turn.
-    state.midRunTrigger = undefined;
+    const wait = owned?.scopes.wait;
+    const stopped = (): boolean => owned !== undefined && (owned.stop.aborted || owned.scopes.stopped());
+    const throwIfStopped = (): void => {
+      if (stopped()) throw new SecretRemediationStoppedError();
+    };
+    // A stop after the gate holds a trusted finding set: latch (sync) and record it before throwing, as the
+    // mid-run seam does, because the unscanned shutdown-capture publish is held by exactly this state.
+    const stopHolding = (found: readonly SecretFinding[]): never => {
+      try {
+        this.latchRemediationFindings(flight, barePath!, runnerClone.branch, found);
+      } catch {
+        // bindingUncertain or an unreadable identity: the latch already failed closed before throwing.
+      }
+      this.recordFlaggedCommits(state, [...found], runLog);
+      throw new SecretRemediationStoppedError();
+    };
     if (state.blocked && state.blocked.length > 0) return { action: "fail" };
     if (!barePath) return { action: "proceed" };
     const branch = runnerClone.branch;
     // `authoritativeTip` is the clone tip when the fetch-back succeeded and matches the tracking tip
     // (the scan itself was untrusted but the tip is real); undefined in the stale-tip / thrown case.
     const failOrProceed = async (why: string, authoritativeTip?: string): Promise<SecretRemediationDecision> => {
+      throwIfStopped();
       if (flight.remediationRestrictions?.pending || (state.known && state.known.length > 0)) {
         state.blocked = state.known;
         runLog.warn("pre-exit secret scan could not be trusted after a known finding; failing", { run_id: runId, why });
@@ -21148,6 +21277,8 @@ export class RunRunner {
         } catch {
           reachable = undefined;
         }
+        // A stop that killed the ancestry child reads as "unreadable" above: it must not become `blocked`.
+        throwIfStopped();
         if (reachable === undefined || reachable.length > 0) {
           state.blocked = reachable && reachable.length > 0 ? reachable : (state.flaggedFindings ?? []);
           runLog.warn("pre-exit secret scan untrusted with a flagged commit still reachable (or unreadable); failing", {
@@ -21164,14 +21295,23 @@ export class RunRunner {
       return { action: "proceed" };
     };
     try {
-      const fetched = await this.fetchBackBestEffort(barePath, runnerClone.path, branch, flight, runLog);
+      const fetched = await this.fetchBackBestEffort(barePath, runnerClone.path, branch, flight, runLog,
+        {}, undefined, wait);
       const cloneTip = await this.git.branchTip(runnerClone.path, branch);
       const trackTip = await this.git.trackingTip(barePath, branch);
       if (fetched.kind === "refused") throw new PreservationRefusedError();
+      throwIfStopped();
       if (fetched.kind !== "updated" || cloneTip === null || trackTip === null || cloneTip !== trackTip) {
         return await failOrProceed("tracking_tip_stale");
       }
-      const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip, options);
+      const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip,
+        owned ? { ...options, scanScope: owned.scopes.scanScope } : options);
+      await this.checkpointTestHooks?.afterRemediationGateScan?.();
+      // Straight after the scan and before any state write or proceed. A trusted finding set is held first.
+      if (stopped()) {
+        if (scanned.trusted && scanned.findings.length > 0) stopHolding(scanned.findings);
+        throw new SecretRemediationStoppedError();
+      }
       // An advisory first-turn check must neither scan published history nor clear
       // prior findings when there is no unpublished range to inspect.
       if (!scanned.trusted && scanned.publishedOnly) return { action: "proceed" };
@@ -21182,8 +21322,10 @@ export class RunRunner {
         // A flagged commit still in the tip's ancestry is NOT cleared, even when a floor exclusion
         // (possibly a local-only bridge) hid it from this range: keep it known.
         const still = await this.reachableFlaggedFindings(state, barePath, cloneTip);
+        throwIfStopped();
         if (still.length === 0) {
-          await this.persistRemediationScan(flight, barePath, branch, range.tipSha, []);
+          await this.persistRemediationScan(flight, barePath, branch, range.tipSha, [], undefined, wait);
+          throwIfStopped();
           state.known = undefined;
           state.cleanTip = range.tipSha;
           return { action: "proceed" };
@@ -21197,7 +21339,8 @@ export class RunRunner {
         state.known = findings;
         state.everKnown = true;
       }
-      await this.persistRemediationRestrictions(flight, barePath, branch, range.tipSha, findings);
+      await this.persistRemediationRestrictions(flight, barePath, branch, range.tipSha, findings, wait);
+      if (stopped()) stopHolding(findings);
       this.recordFlaggedCommits(state, findings, runLog);
       if (state.overflow) {
         state.known = findings;
@@ -21208,12 +21351,16 @@ export class RunRunner {
       // issue #1932 D6(c): a committed filename can itself be a secret. Scan the raw path list with
       // gitleaks before rendering anything; an untrusted or flagging scan withholds EVERY path on
       // every surface (prompt, feed, failure_reason, log).
-      const withholdPaths = await this.withholdPathsFor(findings);
+      const withholdPaths = await this.withholdPathsFor(findings, owned?.scopes.pathScope);
+      // A stopped path scan reads as "untrusted" (withhold): that must not be written as the gate's answer.
+      if (stopped()) stopHolding(findings);
       state.withholdPaths = withholdPaths;
       state.everKnown = true;
       // An "unknown" ancestry (a git error) counts as at-floor, the conservative answer: never ask
       // for a rewrite of possibly published history.
-      const atFloor = (await this.classifyFindingFloors(flight, barePath, findings, floorCandidates)) !== "above";
+      const floorVerdict = await this.classifyFindingFloors(flight, barePath, findings, floorCandidates);
+      if (stopped()) stopHolding(findings);
+      const atFloor = floorVerdict !== "above";
       state.known = findings;
       if (atFloor) {
         // Not remediable (already reachable from a durable floor): no rewrite turn. `known` stays
@@ -21230,7 +21377,8 @@ export class RunRunner {
         runLog.warn("pre-exit secret scan: remediation attempts exhausted; failing", { run_id: runId });
         return { action: "fail" };
       }
-      await this.persistRemediationScan(flight, barePath, branch, range.tipSha, findings, "pre-exit");
+      await this.persistRemediationScan(flight, barePath, branch, range.tipSha, findings, "pre-exit", wait);
+      if (stopped()) stopHolding(findings);
       state.attempts++;
       // An ancestor-verified floor: the checkpoint floor when it is one of the range's scan floors,
       // else the range's exclude SHA.
@@ -21263,8 +21411,14 @@ export class RunRunner {
         }),
       };
     } catch (e) {
-      if (isCheckpointBoundaryFailure(e)) throw e;
       if (e instanceof PreservationRefusedError) throw e;
+      // An unsafe cleanup (a CheckpointUnsafeCleanupError is one) and any trusted-execution refusal stay
+      // visible even when a stop is in effect: neither is a clean stop.
+      if (e instanceof TrustedExecutionRefusal) throw e;
+      if (e instanceof SecretRemediationStoppedError) throw e;
+      // A scope abort surfaces as GitBoundaryAbortError / CheckpointSoftDeadlineError or as a failed child.
+      if (stopped()) throw new SecretRemediationStoppedError();
+      if (isCheckpointBoundaryFailure(e)) throw e;
       return await failOrProceed(`gate_threw: ${errMessage(e)}`);
     }
   }

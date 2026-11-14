@@ -774,3 +774,72 @@ describe("SdkExecutor mid-run secret remediation seam (Issue #4258)", () => {
     }
   });
 });
+
+// Issue #4313: the done gate and the resume preflight can be stopped before they reach a decision
+// (SecretRemediationStoppedError). The executor routes the control that stopped them and never finalizes.
+describe("SdkExecutor routes a stopped secret remediation gate (Issue #4313)", () => {
+  type Control = "terminal" | "cancel" | "disk" | "unexplained";
+  const controls: Control[] = ["terminal", "cancel", "disk", "unexplained"];
+  /** The control arrives only while the gate runs (`arm()` is called from the stubbed gate). */
+  const armable = (control: Control): { fields: Partial<RunContext>; arm: () => void } => {
+    const terminal = new AbortController();
+    let armed = false;
+    return {
+      arm: () => { armed = true; if (control === "terminal") terminal.abort(); },
+      fields: {
+        ...(control === "terminal" ? { terminalLifecycleSignal: terminal.signal } : {}),
+        ...(control === "cancel" ? { cancelRequested: () => armed } : {}),
+        ...(control === "disk" ? { pauseModeRequested: () => (armed ? "disk" as const : null) } : {}),
+      },
+    };
+  };
+  const expectRoute = (control: Control) => (error: unknown): boolean =>
+    control === "disk"
+      ? error instanceof Error && error.constructor.name === "DiskParkSignal"
+      : error instanceof Error && /cancel/i.test(error.message);
+
+  for (const control of controls) {
+    it(`done gate stopped (${control}): routes the control, no checkpoint, no completion attempt, no further turn`, async () => {
+      const { queryFn, prompts } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+      const checkpoints: unknown[] = [];
+      let attempts = 0;
+      let codeCalls = 0;
+      const { SecretRemediationStoppedError } = await import("../src/executor.js");
+      const c = armable(control);
+      await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+        kind: "issue",
+        completionInterlock: true,
+        recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
+        checkpoint: async (o) => { checkpoints.push(o); },
+        codeCrossCheckGate: async () => { codeCalls++; return { action: "proceed" }; },
+        secretRemediationGate: async () => { c.arm(); throw new SecretRemediationStoppedError(); },
+        ...c.fields,
+      })), expectRoute(control));
+      assert.equal(prompts.length, 2, "no turn after the stopped gate");
+      assert.equal(checkpoints.length, 0, "no done checkpoint");
+      assert.equal(attempts, 0, "no completion attempt");
+      assert.equal(codeCalls, 0, "no code gate");
+    });
+
+    it(`resume preflight stopped (${control}): routes the control and dispatches no model work`, async () => {
+      const { queryFn, prompts } = fakeTurns([[resultSuccess()]]);
+      const { SecretRemediationStoppedError } = await import("../src/executor.js");
+      const c = armable(control);
+      await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+        kind: "issue", resumed: true, sessionId: "sess-1", planApproved: true, approvedPlan: "approved",
+        config: { max_iterations: 1, iteration_park_version: 1 }, parkForIteration: async () => "parked",
+        secretRemediationGate: async () => { c.arm(); throw new SecretRemediationStoppedError(); },
+        ...c.fields,
+      })), expectRoute(control));
+      assert.equal(prompts.length, 0);
+    });
+  }
+
+  it("any other gate error still propagates unchanged (not converted to a cancel)", async () => {
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+      kind: "issue",
+      secretRemediationGate: async () => { throw new Error("boom-4313"); },
+    })), /boom-4313/);
+  });
+});
