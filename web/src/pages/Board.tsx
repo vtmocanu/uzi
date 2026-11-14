@@ -21,9 +21,8 @@ import {
 import { errorMessage } from "../lib/apiError";
 import { hasAnthropicToken, hasAnyCodexCredential, isCodexUsable } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
-import { startRunWithCredential } from "../lib/startRun";
-import { INHERIT_SELECTION, type CredentialSelection } from "../lib/credentialOverride";
-import { bothHarnessesUsable, INHERIT_HARNESS, type HarnessSelection } from "../lib/harnessSelection";
+import { DEFAULT_RUN_START_OPTIONS, startRunWithOptions, type RunStartOptions } from "../lib/startRun";
+import type { HarnessSelection } from "../lib/harnessSelection";
 import {
   isAccountCooldownWaiting,
   effectiveRunStatus,
@@ -71,6 +70,7 @@ import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import { COLUMN_ACCENTS } from "./board/shared";
 import { IssueCard } from "./board/IssueCard";
+import { RunOptionsDialog } from "../components/RunOptionsDialog";
 import { CreateIssueForm } from "./board/CreateIssueForm";
 import { IssuesFilter } from "./board/IssuesFilter";
 import { ColumnSettings } from "./board/ColumnSettings";
@@ -402,24 +402,19 @@ export function Board() {
   // PRD #1429 M4a, D3: harness-aware credential facts alongside hasToken.
   const [codexUsable, setCodexUsable] = useState(false);
   const [hasCodexCredential, setHasCodexCredential] = useState(false);
-  // PRD #1429 M4a review Fix 1: the viewer's own default_harness, so each card's
-  // effective-Codex gate can mirror D11 rule 2 (a usable default wins on an untouched
-  // "inherit" pick) exactly as IssueView's start dialog does.
+  // PRD #1429 M4a review Fix 1: the viewer's own default_harness, so the Run options
+  // dialog's effective-Codex gate can mirror D11 rule 2 (a usable default wins on an
+  // untouched "inherit" pick) exactly as on the issue page.
   const [defaultHarness, setDefaultHarness] = useState<Harness | null>(null);
-  // PRD #1247 M7: the viewer's Anthropic tokens (for the per-card token picker) and the
-  // per-card credential choice (keyed by issue iid). A card the user has not touched
-  // defaults to inherit — the run follows the worker binding.
+  // PRD #1247 M7: the viewer's Anthropic tokens, for the Run options dialog's token row.
   const [tokens, setTokens] = useState<SecretMeta[]>([]);
-  const [cardCredential, setCardCredential] = useState<Record<number, CredentialSelection>>({});
-  // PRD #1429 M4a: the per-card harness choice (keyed by issue iid), mirroring
-  // cardCredential above. A card the user has not touched defaults to inherit.
-  const [cardHarness, setCardHarness] = useState<Record<number, HarnessSelection>>({});
-  // PRD #1247: cardCredential is keyed only by issue iid, and the route swaps :id without
-  // remounting the component, so a per-card pin from repo A would otherwise reapply to a
-  // same-iid card in repo B. Clear it on a repo change (no-op at mount).
+  // PRD #3250 M2: the issue whose Run options dialog is open (null = closed). The board
+  // mounts ONE dialog, keyed by iid, never inside the draggable card (D9); the per-card
+  // harness and token maps it replaced are gone, so a choice lives only while its dialog
+  // is open. A repo change closes it (the route swaps :id without remounting).
+  const [optionsIid, setOptionsIid] = useState<number | null>(null);
   useEffect(() => {
-    setCardCredential({});
-    setCardHarness({});
+    setOptionsIid(null);
   }, [repoId]);
   // The viewer's runs on this repo blocked on their approval — drives the
   // attention strip above the columns.
@@ -553,8 +548,8 @@ export function Board() {
         api.listWorkers(),
         api.listSecrets(),
         api.listRuns({ repoId, view: "summary" }),
-        // PRD #1429 M4a review Fix 1: the viewer's own default_harness, mirroring
-        // IssueView's start dialog so a card's effective-Codex gate agrees with it.
+        // PRD #1429 M4a review Fix 1: the viewer's own default_harness, so the board's
+        // Run options dialog resolves the effective harness as the issue page does.
         api.getMySettings(),
       ]);
       if (sourceEpochRef.current !== sourceEpoch || repoIdRef.current !== repoId) return;
@@ -565,7 +560,7 @@ export function Board() {
       setCodexUsable(isCodexUsable(secrets, settings.codex_account_mode));
       setHasCodexCredential(hasAnyCodexCredential(secrets));
       setDefaultHarness(settings.default_harness);
-      // PRD #1247 M7: keep the Anthropic tokens for the per-card token picker.
+      // PRD #1247 M7: keep the Anthropic tokens for the Run options dialog's token row.
       setTokens(secrets.filter((s) => s.kind === "anthropic_token"));
       // issue #750: classify from the EFFECTIVE status, not the raw one. A run
       // re-planning after a revise keeps status === "awaiting_approval" server-side, but
@@ -652,24 +647,49 @@ export function Board() {
     return Promise.all([poll(), loadPreconditions()]);
   }, 10000, repoId);
 
-  const startRun = async (card: CardData) => {
+  // The board's harness-availability facts, shared by one-click Start run and the Run
+  // options dialog (the precondition poll keeps them live while the dialog is open).
+  const startFacts = { claudeUsable: hasToken, codexUsable, defaultHarness };
+  const cardGate = (card: CardData, harness: HarnessSelection) =>
+    startRunGate({
+      closed: card.closed,
+      hasWorker,
+      claudeUsable: hasToken,
+      codexUsable,
+      hasCodexCredential,
+      harness,
+      activeRunExists: hasActiveRun(card.latest_run),
+    });
+
+  // startRun creates a run for the card through the shared helper, which builds the body
+  // from the options once and preserves it across the open-MR force retry (issue #856).
+  // One-click Start run passes the defaults and surfaces errors on the board banner; the
+  // Run options dialog passes its choices and its own error/settle callbacks, so a refusal
+  // shows inside the dialog, which stays open. onSettled keeps Board's pre-#1247
+  // behaviour: clear the starting flag and re-read preconditions.
+  const startRun = async (
+    card: CardData,
+    options: RunStartOptions = DEFAULT_RUN_START_OPTIONS,
+    ui: { onError: (msg: string) => void; onSettled?: () => void } = { onError: (msg) => setError(msg) },
+  ) => {
     setError("");
     setStarting(card.iid);
-    // The shared helper carries this card's chosen credential override AND harness
-    // (both default inherit) and preserves them across the open-MR force retry (issue
-    // #856). onSettled keeps Board's pre-#1247 behaviour: clear the starting flag and
-    // re-read preconditions.
-    await startRunWithCredential(repoId, card.iid, cardCredential[card.iid] ?? INHERIT_SELECTION, {
+    await startRunWithOptions(repoId, card.iid, options, startFacts, {
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
-      onCreated: (runId) => navigate(`/runs/${encodeURIComponent(runId)}`),
-      onError: (msg) => setError(msg),
+      onCreated: (runId) => {
+        setOptionsIid(null);
+        navigate(`/runs/${encodeURIComponent(runId)}`);
+      },
+      onError: ui.onError,
       onSettled: () => {
         setStarting(null);
         loadPreconditions();
+        ui.onSettled?.();
       },
-    }, cardHarness[card.iid] ?? INHERIT_HARNESS);
+    });
   };
+  const optionsCard = optionsIid == null ? undefined : board?.cards.find((c) => c.iid === optionsIid);
 
   // Fix CI (PRD #6): queue a plan-gated ci_fix run for a failed pipeline's ref.
   // The server enforces the "no active fix / branch free" preconditions and returns
@@ -1535,30 +1555,10 @@ export function Board() {
                           }
                         : undefined
                     }
-                    gate={startRunGate({
-                      closed: card.closed,
-                      hasWorker,
-                      claudeUsable: hasToken,
-                      codexUsable,
-                      hasCodexCredential,
-                      harness: cardHarness[card.iid] ?? INHERIT_HARNESS,
-                      activeRunExists: hasActiveRun(card.latest_run),
-                    })}
+                    gate={cardGate(card, "inherit")}
                     starting={starting === card.iid}
                     onStart={() => startRun(card)}
-                    tokens={tokens}
-                    credential={cardCredential[card.iid] ?? INHERIT_SELECTION}
-                    onCredentialChange={(sel) =>
-                      setCardCredential((prev) => ({ ...prev, [card.iid]: sel }))
-                    }
-                    showHarnessPicker={bothHarnessesUsable(hasToken, codexUsable)}
-                    harness={cardHarness[card.iid] ?? INHERIT_HARNESS}
-                    onHarnessChange={(h) =>
-                      setCardHarness((prev) => ({ ...prev, [card.iid]: h }))
-                    }
-                    claudeUsable={hasToken}
-                    codexUsable={codexUsable}
-                    defaultHarness={defaultHarness}
+                    onOptions={() => setOptionsIid(card.iid)}
                     fixCiBusy={card.pipeline != null && fixingRef === card.pipeline.ref}
                     onFixCi={() => card.pipeline && fixCi(card.pipeline.ref)}
                     uziLabel={uziLabel}
@@ -1657,6 +1657,21 @@ export function Board() {
           );
         })}
       </div>
+
+      {/* PRD #3250 M2: the board's ONE Run options dialog, keyed by iid so each issue
+          opens on defaults. It closes on its own if the card leaves the board. */}
+      {optionsCard && (
+        <RunOptionsDialog
+          key={optionsCard.iid}
+          issueIid={optionsCard.iid}
+          issueTitle={optionsCard.title}
+          facts={startFacts}
+          gate={(harness) => cardGate(optionsCard, harness)}
+          tokens={tokens}
+          onStart={(options, ui) => startRun(optionsCard, options, ui)}
+          onClose={() => setOptionsIid(null)}
+        />
+      )}
 
       {/* No role/aria-live here any more (S5): the always-mounted sr-only region above
           owns announcing, and leaving them on this one would announce every toast

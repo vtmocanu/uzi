@@ -6,16 +6,9 @@ import { useAsyncData } from "../lib/useAsyncData";
 import { hasAnthropicToken, hasAnyCodexCredential, isCodexUsable } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
 import { firstStartIso } from "../lib/runDuration";
-import { startRunWithCredential } from "../lib/startRun";
-import { INHERIT_SELECTION, type CredentialSelection } from "../lib/credentialOverride";
-import {
-  bothHarnessesUsable,
-  effectiveHarnessIsCodex,
-  INHERIT_HARNESS,
-  type HarnessSelection,
-} from "../lib/harnessSelection";
-import { TokenPicker } from "../components/TokenPicker";
-import { HarnessPicker } from "../components/HarnessPicker";
+import { DEFAULT_RUN_START_OPTIONS, startRunWithOptions, type RunStartOptions } from "../lib/startRun";
+import type { HarnessSelection } from "../lib/harnessSelection";
+import { RunOptionsDialog, type RunOptionsStartCallbacks } from "../components/RunOptionsDialog";
 import { activeRunInHistory, effectiveRunStatus, historyShowsParkLabel, parkLabel, isStoppedRun, isRejectedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { chipLabels } from "../lib/labelChips";
@@ -24,7 +17,7 @@ import { Markdown } from "../components/Markdown";
 import { MrChip } from "../components/MrChip";
 import { forgePlatform } from "../lib/forgeNoun";
 import { formatDuration } from "../components/RunEvent";
-import { Alert, Badge, Button, Card, Field } from "../components/ui";
+import { Alert, Badge, Button, Card } from "../components/ui";
 import { ClockIcon } from "../components/icons";
 import { ScheduleModal } from "../components/ScheduleModal";
 import { useAuth } from "../auth/AuthContext";
@@ -85,16 +78,13 @@ export function IssueView() {
   const [promoting, setPromoting] = useState(false);
   // PRD #241: the "Schedule…" entry point, pre-pinned to this issue.
   const [scheduling, setScheduling] = useState(false);
-  // PRD #1247 M7: the token the run will spend, chosen before Start run. Default
-  // inherit (shown explicitly) so an untouched start follows the worker binding.
-  const [credential, setCredential] = useState<CredentialSelection>(INHERIT_SELECTION);
-  // PRD #1429 M4a: the harness the run will start on, chosen before Start run. Default
-  // inherit (the picker is shown only when both harnesses are usable — D2), so an
-  // untouched start follows the server's D11 resolver exactly as before this milestone.
-  const [harness, setHarness] = useState<HarnessSelection>(INHERIT_HARNESS);
+  // PRD #3250 M2: whether the Run options dialog is open. Start run stays one click with
+  // defaults; the harness, token, model and effort choices live in that dialog (mounted
+  // once here, keyed by iid), replacing the inline harness and token pickers.
+  const [optionsOpen, setOptionsOpen] = useState(false);
   // PRD #1247: this component is reused across route-param changes without remounting (the
-  // data effect below keys on [repoId, iidNum] and refetches), so reset the picked
-  // credential to inherit when the route identity changes (no-op at mount). Issue #961
+  // data effect below keys on [repoId, iidNum] and refetches), so close the Run options
+  // dialog when the route identity changes (no-op at mount). Issue #961
   // item 4a: the same reset drops a start/promote error, so it cannot bleed onto the next
   // issue — a route change, not every refetch, is what makes that error stale. Issue #1727
   // review: it also drops the previous issue and its busy flags, so while the next issue
@@ -106,8 +96,7 @@ export function IssueView() {
     setIssue(null);
     setStarting(false);
     setPromoting(false);
-    setCredential(INHERIT_SELECTION);
-    setHarness(INHERIT_HARNESS);
+    setOptionsOpen(false);
     setActionError("");
   }, [repoId, iidNum]);
   // Unmount ends every attempt too, so a late outcome never triggers a reload.
@@ -157,18 +146,14 @@ export function IssueView() {
   const hasCodexCredential = data?.hasCodexCredential ?? false;
   const tokens = data?.tokens ?? [];
   const defaultHarness = data?.defaultHarness ?? null;
-  // D2: the harness control appears only when BOTH harnesses are usable — a
-  // single-harness user (Claude-only or Codex-only) sees no picker at all.
-  const showHarnessPicker = bothHarnessesUsable(hasToken, codexUsable);
-  // Fix 2 (M4a review): gate the Anthropic TokenPicker on the EFFECTIVE harness, not the
-  // raw picker selection — a Codex-only user never sees the harness picker (showHarnessPicker
-  // is false), so `harness` stays "inherit" even though the run WILL resolve to Codex. Fix 1
-  // (M4a review follow-up): also thread the viewer's default_harness, so a BOTH-usable user
-  // who set a Codex default (Run Defaults) and leaves the picker on "inherit" gets the same
-  // hide — touching the Anthropic picker in that case 422s (D11 rule 2 resolves them to Codex).
-  const startingOnCodex = effectiveHarnessIsCodex(harness, hasToken, codexUsable, defaultHarness);
+  // The harness-availability facts shared by one-click Start run and the Run options dialog.
+  const startFacts = { claudeUsable: hasToken, codexUsable, defaultHarness };
 
-  const startRun = async () => {
+  // startRun creates the run through the shared helper, which builds the body from the
+  // options once and preserves it across the open-MR force retry (issue #856). One-click
+  // Start run passes the defaults and surfaces errors on the page banner; the Run options
+  // dialog passes its choices and callbacks, so a refusal shows inside the dialog.
+  const startRun = async (options: RunStartOptions = DEFAULT_RUN_START_OPTIONS, ui?: RunOptionsStartCallbacks) => {
     if (!issue) return;
     // Act only on the issue the route shows: this render's repoId paired with the issue
     // it holds must be the current route identity, or the click would start a run on a
@@ -179,23 +164,27 @@ export function IssueView() {
     const live = () => routeKeyRef.current === attemptKey && routeGenRef.current === attemptGen;
     setActionError("");
     setStarting(true);
-    // The shared helper carries the chosen credential override AND harness, and
-    // preserves both across the open-MR force retry (issue #856). onSettled clears the
-    // starting flag and reloads the run history, but leaves the error onError just set
-    // on screen (issue #1727): the next attempt clears it above.
-    await startRunWithCredential(repoId, issue.iid, credential, {
+    // onSettled clears the starting flag and reloads the run history, but leaves the
+    // error onError just set on screen (issue #1727): the next attempt clears it above.
+    await startRunWithOptions(repoId, issue.iid, options, startFacts, {
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
-      onCreated: (runId) => navigate(`/runs/${encodeURIComponent(runId)}`),
+      onCreated: (runId) => {
+        setOptionsOpen(false);
+        navigate(`/runs/${encodeURIComponent(runId)}`);
+      },
       onError: (msg) => {
-        if (live()) setActionError(msg);
+        if (!live()) return;
+        if (ui) ui.onError(msg);
+        else setActionError(msg);
       },
       onSettled: () => {
         if (!live()) return;
         setStarting(false);
+        ui?.onSettled();
         reload();
       },
-    }, harness);
+    });
   };
 
   // PRD #764, #767 M5. The detail page drives its Start/Promote affordance off the
@@ -235,17 +224,19 @@ export function IssueView() {
     }
   };
 
-  const gate = issue
-    ? startRunGate({
-        closed: issue.closed,
-        hasWorker,
-        claudeUsable: hasToken,
-        codexUsable,
-        hasCodexCredential,
-        harness,
-        activeRunExists: activeRunInHistory(runs),
-      })
-    : null;
+  const gateFor = (harness: HarnessSelection) =>
+    issue
+      ? startRunGate({
+          closed: issue.closed,
+          hasWorker,
+          claudeUsable: hasToken,
+          codexUsable,
+          hasCodexCredential,
+          harness,
+          activeRunExists: activeRunInHistory(runs),
+        })
+      : null;
+  const gate = gateFor("inherit");
 
   return (
     <div className="space-y-5">
@@ -423,53 +414,42 @@ export function IssueView() {
               be noise. Keyed on eligibility (PRD #196 M4), so a runnable `bug` issue
               DOES show Start run. */}
           {!issue.closed && isEligible && gate && (
-            <div className="flex flex-wrap items-end gap-3">
-              {/* PRD #1429 M4a: choose the harness the run starts on, shown ONLY when
-                  both harnesses are usable (D2) — a single-harness user never sees this
-                  redundant picker. */}
-              {showHarnessPicker && (
-                <Field label="Harness" htmlFor="start-run-harness">
-                  <HarnessPicker
-                    id="start-run-harness"
-                    label="Harness for this run"
-                    className="h-9 w-40 text-sm"
-                    value={harness}
-                    onChange={setHarness}
-                    disabled={starting}
-                  />
-                </Field>
-              )}
-              {/* PRD #1247 M7: choose the token the run spends before starting it. Inherit
-                  (the default, shown explicitly) follows the worker's binding. Hidden when
-                  the run will EFFECTIVELY start on Codex — an explicit pick, OR (M4a review
-                  fix) a Codex-only user whose picker is hidden but who WILL resolve to Codex
-                  implicitly — a Codex run spends a Codex credential, never an Anthropic one,
-                  so the picker would be noise (and using it would 422). */}
-              {!startingOnCodex && (
-                <Field label="Anthropic token" htmlFor="start-run-token">
-                  <TokenPicker
-                    id="start-run-token"
-                    label="Anthropic token for this run"
-                    className="h-9 w-56 text-sm"
-                    value={credential}
-                    onChange={setCredential}
-                    tokens={tokens}
-                    disabled={!gate.enabled || starting}
-                  />
-                </Field>
-              )}
-              <div>
+            // PRD #3250 M2 (user decision P1): Start run stays one click with defaults; the
+            // secondary Options button opens the Run options dialog under the same gate.
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
                 <Button
                   variant={gate.enabled ? "primary" : "ghost"}
                   disabled={!gate.enabled || starting}
                   title={gate.enabled ? "Queue an agent run for this issue" : gate.reason}
-                  onClick={startRun}
+                  onClick={() => startRun()}
                 >
                   {starting ? "Starting…" : "Start run"}
                 </Button>
-                {!gate.enabled && <p className="mt-1 text-xs text-faint">{gate.reason}</p>}
+                <Button
+                  variant="secondary"
+                  disabled={!gate.enabled || starting}
+                  aria-label={`Run options for #${issue.iid}`}
+                  title={gate.enabled ? "Choose the harness, token, model or effort for this run" : gate.reason}
+                  onClick={() => setOptionsOpen(true)}
+                >
+                  Options
+                </Button>
               </div>
+              {!gate.enabled && <p className="mt-1 text-xs text-faint">{gate.reason}</p>}
             </div>
+          )}
+          {optionsOpen && issue && !issue.closed && isEligible && (
+            <RunOptionsDialog
+              key={issue.iid}
+              issueIid={issue.iid}
+              issueTitle={issue.title}
+              facts={startFacts}
+              gate={(harness) => gateFor(harness) ?? { enabled: false, reason: "" }}
+              tokens={tokens}
+              onStart={(options, ui) => startRun(options, ui)}
+              onClose={() => setOptionsOpen(false)}
+            />
           )}
 
           <Card className="space-y-3">

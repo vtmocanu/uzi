@@ -92,7 +92,7 @@ import type {
   EgressProfileWriteInput,
   ForgeConfig,
   ForgeConnection,
-  Harness,
+  RunStartBody,
   HealthDoc,
   HostedConfig,
   IncidentalFinding,
@@ -1271,26 +1271,21 @@ const realApi = {
       docker,
     }),
 
-  createRun: (
-    repoId: string,
-    issueIid: number,
-    force?: boolean,
-    // PRD #1247 M7: the per-run Anthropic credential override. Sent ONLY when the user
-    // picked a non-inherit value (the caller passes undefined for inherit), so an inherit
-    // run's body is byte-identical to a pre-#1247 create and the run follows the worker
-    // binding. The write shape mirrors the Go create handler ({mode, secret_id?}).
-    credentialOverride?: { mode: string; secret_id?: string },
-    // PRD #1429 M4a: the explicit harness choice. Sent ONLY when the user picked one
-    // (lib/harnessSelection.ts's runHarnessBody returns undefined for "inherit"), so an
-    // inherit start is byte-identical to a pre-M4a create and the server's D11 resolver
-    // picks implicitly.
-    harness?: Harness,
-  ) =>
+  // PRD #3250 M2: `start` is the object lib/startRun.ts's runStartBody builds (the one
+  // builder): it already omits every Default value and every value whose dialog row is
+  // hidden, so each key here is sent only when present. An empty object (one-click Start
+  // run) yields `{issue_iid}` alone, byte-identical to the pre-#1247 create; the key order
+  // (issue_iid, force, credential_override, harness, then model, effort) is kept so a
+  // body that predates the dialog serializes exactly as before. `force` (issue #856) is
+  // the open-MR overwrite retry, which re-sends the same `start`.
+  createRun: (repoId: string, issueIid: number, start: RunStartBody, force?: boolean) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, {
       issue_iid: issueIid,
       ...(force ? { force: true } : {}),
-      ...(credentialOverride ? { credential_override: credentialOverride } : {}),
-      ...(harness ? { harness } : {}),
+      ...(start.credential_override ? { credential_override: start.credential_override } : {}),
+      ...(start.harness ? { harness: start.harness } : {}),
+      ...(start.model !== undefined ? { model: start.model } : {}),
+      ...(start.effort !== undefined ? { effort: start.effort } : {}),
     }),
   /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
   createCIFixRun: (repoId: string, ref: string) =>

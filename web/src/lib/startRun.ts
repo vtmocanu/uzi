@@ -1,22 +1,90 @@
-// Shared start-run flow for the two create sites (IssueView, Board), so the
-// credential-override plumbing and the open-MR force-retry live in ONE place
-// (PRD #1247 M7). The two pages keep their own state/settle behaviour via the
-// handler callbacks; this owns only the create → open-MR confirm → force-retry
-// control flow.
+// Shared start-run flow for the two create sites (IssueView, Board), so the start-option
+// body shaping and the open-MR force-retry live in ONE place (PRD #1247 M7, PRD #3250
+// M2). The two pages keep their own state/settle behaviour via the handler callbacks;
+// this owns only the options → body → create → open-MR confirm → force-retry flow.
 //
-// The force-retry preservation is structural: the chosen override is captured once
-// in the `createAndOpen` closure below, so the retry after the user confirms the
-// open-MR overwrite re-sends the SAME override rather than dropping it.
+// The force-retry preservation is structural: the body is built ONCE in
+// startRunWithOptions below and captured in the `createAndOpen` closure, so the retry after
+// the user confirms the open-MR overwrite re-sends the SAME harness, token, model and
+// effort rather than dropping any of them.
 
-import { api, ApiError, isOpenMRConflict, openMRConflictMRIID } from "./api";
+import { api, ApiError, isOpenMRConflict, openMRConflictMRIID, type Harness, type RunStartBody } from "./api";
 import { errorMessage } from "./apiError";
-import { type CredentialSelection, runCredentialBody } from "./credentialOverride";
-import { type HarnessSelection, runHarnessBody } from "./harnessSelection";
+import { type CredentialSelection, INHERIT_SELECTION, runCredentialBody } from "./credentialOverride";
+import {
+  bothHarnessesUsable,
+  effectiveHarnessIsCodex,
+  INHERIT_HARNESS,
+  type HarnessSelection,
+  runHarnessBody,
+} from "./harnessSelection";
+
+// RunStartOptions is everything a person can choose when starting one issue run (PRD
+// #3250 module 6): the Run options dialog edits one of these, and one-click Start run
+// sends DEFAULT_RUN_START_OPTIONS. "" for model or effort means Default (the claim-time
+// setting applies). #3151 adds its Automation fields here and to runStartBody.
+export interface RunStartOptions {
+  harness: HarnessSelection;
+  credential: CredentialSelection;
+  model: string;
+  effort: string;
+}
+
+export const DEFAULT_RUN_START_OPTIONS: RunStartOptions = {
+  harness: INHERIT_HARNESS,
+  credential: INHERIT_SELECTION,
+  model: "",
+  effort: "",
+};
+
+// RunStartFacts are the page's harness-availability facts, refreshed by the board's 10 s
+// precondition poll. They decide which dialog rows are shown, and so which values the
+// builder may send.
+export interface RunStartFacts {
+  claudeUsable: boolean;
+  codexUsable: boolean;
+  defaultHarness: Harness | null;
+}
+
+// startRunRows answers which rows of the Run options dialog are visible for these options
+// and facts, and the harness the run will effectively start on. The harness picker shows
+// only when both harnesses are usable (D2); a hidden picker contributes "inherit". The
+// Anthropic token row hides when the run will effectively start on Codex.
+export function startRunRows(options: RunStartOptions, facts: RunStartFacts) {
+  const showHarness = bothHarnessesUsable(facts.claudeUsable, facts.codexUsable);
+  const harness = showHarness ? options.harness : INHERIT_HARNESS;
+  const startsOnCodex = effectiveHarnessIsCodex(harness, facts.claudeUsable, facts.codexUsable, facts.defaultHarness);
+  return {
+    showHarness,
+    // The selection that is actually in effect (a hidden picker's stale value is not).
+    harness,
+    showToken: !startsOnCodex,
+    effectiveHarness: (startsOnCodex ? "codex" : "claude") as Harness,
+  };
+}
+
+// runStartBody is the ONE body builder (PRD #3250 module 6). It omits every Default value
+// and every value whose row is hidden for the effective harness: the token when the run
+// will start on Codex, and the harness when its picker is not shown. A poll that hides a
+// row therefore drops its value here instead of resetting the dialog. The default options
+// build `{}`, so one-click Start run sends today's body.
+export function runStartBody(options: RunStartOptions, facts: RunStartFacts): RunStartBody {
+  const rows = startRunRows(options, facts);
+  const body: RunStartBody = {};
+  const credential = rows.showToken ? runCredentialBody(options.credential) : undefined;
+  if (credential) body.credential_override = credential;
+  const harness = rows.showHarness ? runHarnessBody(options.harness) : undefined;
+  if (harness) body.harness = harness;
+  if (options.model !== "") body.model = options.model;
+  if (options.effort !== "") body.effort = options.effort;
+  return body;
+}
 
 export interface StartRunHandlers {
   // Navigate to the created run (each site encodeURIComponent-guards the id itself).
   onCreated: (runId: string) => void;
-  // Surface a start error on the page banner.
+  // Surface a start error (the page banner for one-click Start, the dialog's alert region
+  // when started from Run options).
   onError: (message: string) => void;
   // Runs on every non-navigating outcome (declined confirm, forced-retry failure,
   // plain failure). Each site clears its own `starting` flag and reloads here. It runs
@@ -24,35 +92,20 @@ export interface StartRunHandlers {
   onSettled: () => void;
 }
 
-// startRunWithCredential creates a run for (repoId, issueIid) carrying the chosen
-// credential override AND harness selection (PRD #1429 M4a), and — on an open-MR
-// conflict (issue #856) — confirms the overwrite and retries with force AND the same
-// override/harness. inherit sends neither field (runCredentialBody/runHarnessBody both
-// return undefined for their inherit state), so an untouched start is byte-identical to
-// the pre-#1247/pre-M4a body and the run follows the worker binding / the server's D11
-// resolver. `harness` defaults to "inherit" so every existing caller (before the harness
-// picker existed) needs no change.
-export async function startRunWithCredential(
+// startRunWithOptions creates a run for (repoId, issueIid) carrying the options' body and,
+// on an open-MR conflict (issue #856), confirms the overwrite and retries with force and
+// the same body.
+export async function startRunWithOptions(
   repoId: string,
   issueIid: number,
-  selection: CredentialSelection,
+  options: RunStartOptions,
+  facts: RunStartFacts,
   handlers: StartRunHandlers,
-  harness: HarnessSelection = "inherit",
 ): Promise<void> {
-  const override = runCredentialBody(selection);
-  const harnessChoice = runHarnessBody(harness);
+  const body = runStartBody(options, facts);
   const createAndOpen = async (force?: boolean) => {
-    // `override`/`harnessChoice` are captured here, so the force-retry below re-sends
-    // them unchanged. Each inherit choice (undefined) drops its own trailing argument
-    // rather than passing an explicit `undefined`, so a start that touches neither
-    // control is byte-identical to the pre-#1247/pre-M4a call (both the wire body AND
-    // the call arity, which existing tests pin exactly).
-    const { run } =
-      harnessChoice === undefined
-        ? override === undefined
-          ? await api.createRun(repoId, issueIid, force)
-          : await api.createRun(repoId, issueIid, force, override)
-        : await api.createRun(repoId, issueIid, force, override, harnessChoice);
+    // `body` is captured here, so the force-retry below re-sends it unchanged.
+    const { run } = force ? await api.createRun(repoId, issueIid, body, true) : await api.createRun(repoId, issueIid, body);
     handlers.onCreated(run.id);
   };
   try {
@@ -60,7 +113,7 @@ export async function startRunWithCredential(
   } catch (err) {
     // issue_has_open_mr: a completed prior run still owns an open MR. Compose a
     // web-specific confirm naming the MR (no --force jargon); confirm, then retry with
-    // force — preserving the override.
+    // force, preserving the body.
     if (isOpenMRConflict(err) && err instanceof ApiError) {
       const mr = openMRConflictMRIID(err);
       const detail = mr != null ? `an open merge request (!${mr})` : "an open merge request";

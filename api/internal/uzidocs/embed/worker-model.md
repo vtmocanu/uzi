@@ -124,8 +124,10 @@ read-only [effective settings](./configuration.md#effective-settings) view
 
 You can choose the model (and, see [Reasoning effort](./worker-effort.md#a-run-level-effort),
 the effort) for one run when you create it: `uzi run create --model <id>`, or
-an optional `"model"` string on `POST /api/repos/{id}/runs` (the web Start run
-button sends neither; a web Run options dialog is not available yet). The
+an optional `"model"` string on `POST /api/repos/{id}/runs`, or **Options**
+beside **Start run** on a board card or issue page (see
+[Board](./board.md#starting-a-run-with-options); one-click Start run sends
+neither). The
 choice is stored on the run and shown with the source **this run**
 (`model_source: run_override` in `uzi run get --json`).
 

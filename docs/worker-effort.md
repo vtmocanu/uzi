@@ -24,8 +24,10 @@ the run's effort. Other users and the shared lead template are unaffected.
 
 Choose the effort for a single run when you create it: `uzi run create
 --effort <level>` (`low`, `medium`, `high`, `xhigh` or `max`), or an optional
-`"effort"` string on `POST /api/repos/{id}/runs`. The web Start run button
-sends none (a web Run options dialog is not available yet). It is checked
+`"effort"` string on `POST /api/repos/{id}/runs`, or **Options** beside
+**Start run** on the board or issue page (see
+[Board](./board.md#starting-a-run-with-options); one-click Start run sends
+none). It is checked
 for shape at create (otherwise 400, no whitespace allowed), stored on the run
 with the source **this run** (`effort_source: run_override`), and frozen:
 requeues, reclaims and resumes keep it, and later changes to your Settings do

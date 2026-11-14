@@ -575,65 +575,109 @@ describe("IssueView Start gate (PRD #764)", () => {
     await waitFor(() => expect(startBtn().disabled).toBe(false));
   });
 
-  // PRD #1429 M4a, D2: the harness picker appears ONLY when the user has a usable
-  // credential for BOTH harnesses — a single-harness (Claude-only) user's flow stays
-  // byte-identical to today, with no redundant picker.
-  it("hides the harness picker for a Claude-only user (today's flow, unchanged)", async () => {
+  // PRD #3250 M2: Start run stays one click; the harness and token pickers moved into the
+  // Run options dialog, opened by the secondary Options button. The rows keep their PRD
+  // #1429 gates (D2, Fix 1, Fix 2), now asserted inside the dialog.
+  const openOptions = async () => {
+    await screen.findByText("A small typo fix");
+    const button = await screen.findByRole("button", { name: "Run options for #7" });
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    button.focus();
+    fireEvent.click(button);
+    return { button, dialog: screen.getByRole("dialog", { name: "Run options for #7" }) };
+  };
+  const bothUsable = () => [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" as const }];
+
+  it("renders no inline pickers; Options sits beside one-click Start run", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: bothUsable() });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    await screen.findByRole("button", { name: /start run/i });
+    expect(screen.getByRole("button", { name: "Run options for #7" }).textContent).toBe("Options");
+    expect(screen.queryByLabelText(/Harness/)).toBeNull();
+    expect(screen.queryByLabelText(/Anthropic token/)).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("one-click Start run sends the empty start object (today's body)", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: bothUsable() });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    mockApi.createRun.mockResolvedValue({ run: { id: "run-1" } as unknown as Run });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    const start = (await screen.findByRole("button", { name: /start run/i })) as HTMLButtonElement;
+    await waitFor(() => expect(start.disabled).toBe(false));
+    fireEvent.click(start);
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalled());
+    expect(mockApi.createRun.mock.calls).toEqual([["repo-1", 7, {}]]);
+  });
+
+  it("puts Options under the same gate as Start run", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    await screen.findByText("A small typo fix");
+    const options = (await screen.findByRole("button", { name: "Run options for #7" })) as HTMLButtonElement;
+    expect(options.disabled).toBe(true);
+    expect((screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("hides the Harness row for a Claude-only user; the token row shows", async () => {
     setAuth();
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
     mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
     renderIssueView();
 
-    await screen.findByText("A small typo fix");
-    await screen.findByRole("button", { name: /start run/i });
-    expect(screen.queryByLabelText("Harness for this run")).toBeNull();
-    // The Anthropic picker is still there — unaffected by the harness feature.
-    expect(screen.getByLabelText("Anthropic token for this run")).toBeTruthy();
+    const { dialog } = await openOptions();
+    expect(within(dialog).queryByLabelText("Harness")).toBeNull();
+    expect(within(dialog).getByLabelText("Anthropic token")).toBeTruthy();
   });
 
-  it("shows the harness picker once BOTH harnesses are usable, defaulting to inherit", async () => {
+  it("shows the Harness row once BOTH harnesses are usable, defaulting to inherit, with the token row", async () => {
     setAuth();
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
-    mockApi.listSecrets.mockResolvedValue({
-      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
-    });
+    mockApi.listSecrets.mockResolvedValue({ secrets: bothUsable() });
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
     renderIssueView();
 
-    await screen.findByText("A small typo fix");
-    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
-    expect(picker.value).toBe("inherit");
+    const { dialog } = await openOptions();
+    expect((within(dialog).getByLabelText("Harness") as HTMLSelectElement).value).toBe("inherit");
+    // Usage-free inherit with both usable resolves to Claude, so the token row stays.
+    expect(within(dialog).getByLabelText("Anthropic token")).toBeTruthy();
   });
 
-  it("sends the picked harness on Start and hides the Anthropic picker once Codex is chosen", async () => {
+  it("keyboard only: open, pick Codex, start; the token row hides and the harness rides the body", async () => {
     setAuth();
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
-    mockApi.listSecrets.mockResolvedValue({
-      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
-    });
+    mockApi.listSecrets.mockResolvedValue({ secrets: bothUsable() });
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
     mockApi.createRun.mockResolvedValue({ run: { id: "run-codex-1" } as unknown as Run });
     renderIssueView();
 
-    await screen.findByText("A small typo fix");
-    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
-    fireEvent.change(picker, { target: { value: "codex" } });
-    // Once harness=codex is chosen, the Anthropic picker (irrelevant to a Codex run) hides.
-    expect(screen.queryByLabelText("Anthropic token for this run")).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: /start run/i }));
+    const { dialog } = await openOptions();
+    const harness = within(dialog).getByLabelText("Harness") as HTMLSelectElement;
+    harness.focus();
+    fireEvent.change(harness, { target: { value: "codex" } });
+    expect(within(dialog).queryByLabelText("Anthropic token")).toBeNull();
+    const start = within(dialog).getByRole("button", { name: "Start run" });
+    start.focus();
+    fireEvent.click(start);
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalled());
-    expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 7, undefined, undefined, "codex");
+    expect(mockApi.createRun.mock.calls).toEqual([["repo-1", 7, { harness: "codex" }]]);
   });
 
-  // Fix 2 (M4a review): a Codex-only user never sees the harness picker (only one
-  // harness is usable — D2), so `harness` stays "inherit". Gating the Anthropic
-  // TokenPicker on the raw picker value alone left it visible for this user even though
-  // the run WILL resolve to Codex — using it 422s. Paired with the positive control
-  // below (a Claude-only / both-usable user DOES see it) so this is not a vacuous
-  // "never renders" assertion.
-  it("hides the Anthropic token picker for a Codex-only user, even with no explicit harness pick", async () => {
+  it("hides both the Harness and the token rows for a Codex-only user", async () => {
     setAuth();
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
     mockApi.listSecrets.mockResolvedValue({
@@ -642,58 +686,15 @@ describe("IssueView Start gate (PRD #764)", () => {
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
     renderIssueView();
 
-    await screen.findByText("A small typo fix");
-    await screen.findByRole("button", { name: /start run/i });
-    // Single-harness user: no redundant harness picker either (D2).
-    expect(screen.queryByLabelText("Harness for this run")).toBeNull();
-    expect(screen.queryByLabelText("Anthropic token for this run")).toBeNull();
+    const { dialog } = await openOptions();
+    expect(within(dialog).queryByLabelText("Harness")).toBeNull();
+    expect(within(dialog).queryByLabelText("Anthropic token")).toBeNull();
   });
 
-  // Positive control for the case above: a Claude-only user (the pre-existing,
-  // single-harness flow) still sees the Anthropic picker — the fix must not hide it
-  // universally.
-  it("still shows the Anthropic token picker for a Claude-only user", async () => {
+  it("hides the token row for a both-usable user whose default_harness is codex", async () => {
     setAuth();
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
-    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
-    renderIssueView();
-
-    await screen.findByText("A small typo fix");
-    expect(await screen.findByLabelText("Anthropic token for this run")).toBeTruthy();
-  });
-
-  // Positive control: a both-usable user with the harness picker left on inherit (the
-  // untouched default) also still sees the Anthropic picker. The usage-free resolver
-  // answer for inherit with both usable is Claude; creation of an eligible implicit issue
-  // run may pick by weekly limits instead (#3845), so hiding it here would be wrong.
-  it("still shows the Anthropic token picker for a both-usable user on the untouched inherit default", async () => {
-    setAuth();
-    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
-    mockApi.listSecrets.mockResolvedValue({
-      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
-    });
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
-    renderIssueView();
-
-    await screen.findByText("A small typo fix");
-    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
-    expect(picker.value).toBe("inherit");
-    expect(screen.getByLabelText("Anthropic token for this run")).toBeTruthy();
-  });
-
-  // Fix 1 (M4a review follow-up, D11 rule 2): a both-usable user who set a Codex
-  // default_harness (Run Defaults) and leaves the picker on the untouched "inherit"
-  // default must ALSO have the Anthropic picker hidden — the run resolves to Codex via
-  // D11 rule 2 (a usable default wins), and touching the Anthropic picker would 422.
-  // Paired with the positive control directly above (both-usable, no default, still
-  // shows the picker) so this is not a vacuous "never renders" assertion.
-  it("hides the Anthropic token picker for a both-usable user whose default_harness is codex", async () => {
-    setAuth();
-    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
-    mockApi.listSecrets.mockResolvedValue({
-      secrets: [aToken(), { ...aToken(), id: "sec-codex", kind: "openai_api_key" }],
-    });
+    mockApi.listSecrets.mockResolvedValue({ secrets: bothUsable() });
     mockApi.getMySettings.mockResolvedValue({
       settings: {
         harness_overflow_enabled: false,
@@ -713,13 +714,42 @@ describe("IssueView Start gate (PRD #764)", () => {
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
     renderIssueView();
 
-    await screen.findByText("A small typo fix");
-    // The harness picker still shows (both are usable — D2) and stays on the untouched
-    // "inherit" default...
-    const picker = (await screen.findByLabelText("Harness for this run")) as HTMLSelectElement;
-    expect(picker.value).toBe("inherit");
-    // ...but the Anthropic picker is hidden: D11 rule 2 resolves this inherit pick to Codex.
-    expect(screen.queryByLabelText("Anthropic token for this run")).toBeNull();
+    const { dialog } = await openOptions();
+    expect((within(dialog).getByLabelText("Harness") as HTMLSelectElement).value).toBe("inherit");
+    // D11 rule 2 resolves this inherit pick to Codex.
+    expect(within(dialog).queryByLabelText("Anthropic token")).toBeNull();
+  });
+
+  it("Escape closes the dialog and restores focus to Options", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    renderIssueView();
+
+    const { button, dialog } = await openOptions();
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(button);
+  });
+
+  it("a 422 shows inside the dialog, which stays open with its choices", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+    const text = "opus cannot run on this harness; choose a Claude model";
+    mockApi.createRun.mockRejectedValueOnce(new ApiError(422, text, { code: "model_incompatible_with_harness", harness: "claude" }));
+    renderIssueView();
+
+    const { dialog } = await openOptions();
+    fireEvent.change(within(dialog).getByLabelText("Reasoning effort"), { target: { value: "xhigh" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start run" }));
+    await waitFor(() => expect(within(dialog).getByRole("alert").textContent).toBe(text));
+    expect(mockApi.createRun.mock.calls).toEqual([["repo-1", 7, { effort: "xhigh" }]]);
+    expect((within(dialog).getByLabelText("Reasoning effort") as HTMLSelectElement).value).toBe("xhigh");
+    // The page banner stays clear: the refusal belongs to the dialog.
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
   });
 
   // Issue #856 M3: a completed prior run that still owns an open MR makes the
@@ -769,8 +799,8 @@ describe("IssueView Start gate (PRD #764)", () => {
     expect(confirmMsg).toContain("Start a new run anyway?");
     expect(confirmMsg).not.toContain("--force");
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
-    expect(mockApi.createRun.mock.calls[0]).toEqual(["repo-1", 7, undefined]);
-    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 7, true]);
+    expect(mockApi.createRun.mock.calls[0]).toEqual(["repo-1", 7, {}]);
+    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 7, {}, true]);
     await screen.findByText("run page");
     confirmSpy.mockRestore();
   });
@@ -817,7 +847,7 @@ describe("IssueView Start gate (PRD #764)", () => {
     // cleared (button re-enabled). Like Board, the forced-retry failure now stays on
     // screen (issue #1727): settlement and its reload no longer wipe it.
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
-    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 7, true]);
+    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 7, {}, true]);
     await waitFor(() => expect(startBtn().disabled).toBe(false));
     expect(screen.getByText("boom while forcing")).toBeTruthy();
     confirmSpy.mockRestore();
@@ -1190,7 +1220,7 @@ describe("IssueView — an action outcome cannot land on the next issue (#1727)"
     await screen.findByText("Issue A");
     await waitFor(() => expect(startBtn().disabled).toBe(false));
     fireEvent.click(startBtn());
-    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 7, undefined));
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 7, {}));
 
     fireEvent.click(screen.getByRole("button", { name: "go to B" }));
     await screen.findByText("Issue B");
@@ -1504,7 +1534,7 @@ describe("IssueView — the picked credential resets on issue navigation (PRD #1
     );
   }
 
-  it("returns the token picker to inherit after navigating to another issue", async () => {
+  it("closes Run options and returns the token to inherit after navigating to another issue", async () => {
     setAuth();
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
     mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
@@ -1533,19 +1563,27 @@ describe("IssueView — the picked credential resets on issue navigation (PRD #1
     );
 
     await screen.findByText("Issue A");
-    // Pin the token for issue A (the user CHANGING the selection).
-    const pickerA = screen.getByLabelText("Anthropic token for this run") as HTMLSelectElement;
+    // Pin the token for issue A in its Run options dialog (the user CHANGING the selection).
+    fireEvent.click(await screen.findByRole("button", { name: "Run options for #7" }));
+    const pickerA = within(screen.getByRole("dialog", { name: "Run options for #7" })).getByLabelText(
+      "Anthropic token",
+    ) as HTMLSelectElement;
     const opt = (await within(pickerA).findByRole("option", { name: /console-key/ })) as HTMLOptionElement;
     fireEvent.change(pickerA, { target: { value: opt.value } });
     expect(pickerA.value).toBe("sec-1");
 
-    // Navigate to issue B (same route element, no remount).
+    // Navigate to issue B (same route element, no remount): the dialog closes.
     fireEvent.click(screen.getByRole("button", { name: "go to B" }));
     await screen.findByText("Issue B");
+    expect(screen.queryByRole("dialog")).toBeNull();
 
-    // The pin must not carry over: issue B's picker seeds back to inherit. On the old code
-    // the `credential` state survives the route change and this reads "sec-1".
-    const pickerB = screen.getByLabelText("Anthropic token for this run") as HTMLSelectElement;
+    // The pin must not carry over: issue B's dialog opens on inherit.
+    const optionsB = (await screen.findByRole("button", { name: "Run options for #8" })) as HTMLButtonElement;
+    await waitFor(() => expect(optionsB.disabled).toBe(false));
+    fireEvent.click(optionsB);
+    const pickerB = within(screen.getByRole("dialog", { name: "Run options for #8" })).getByLabelText(
+      "Anthropic token",
+    ) as HTMLSelectElement;
     await waitFor(() => expect(pickerB.value).toBe("mode:inherit"));
   });
 });

@@ -106,13 +106,13 @@ describe("?mock=codex-only makes Codex the account's active harness (PRD #1429 M
 
   it("a newly created run implicitly resolves to codex (D11: the only usable harness)", async () => {
     setScenario("codex-only");
-    const { run } = await mockApi.createRun("repo-uzi", 31);
+    const { run } = await mockApi.createRun("repo-uzi", 31, {});
     expect(run.harness).toBe("codex");
   });
 
   it("an EXPLICIT harness choice is never overridden by the scenario (D2: explicit never falls back)", async () => {
     setScenario("codex-only");
-    const { run } = await mockApi.createRun("repo-uzi", 29, undefined, undefined, "claude");
+    const { run } = await mockApi.createRun("repo-uzi", 29, { harness: "claude" });
     expect(run.harness).toBe("claude");
   });
 });

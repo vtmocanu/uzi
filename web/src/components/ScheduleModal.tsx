@@ -461,7 +461,7 @@ export function ScheduleModal({
   // this schedule fires WILL resolve to Codex implicitly. Fix 1 (M4a review follow-up):
   // also thread the owner's CURRENT default_harness (an edit-time hint only — the real
   // resolution happens at fire time), so a both-usable owner with a usable Codex/Claude
-  // default (D11 rule 2) sees the same hide/show IssueView's start dialog would.
+  // default (D11 rule 2) sees the same hide/show the Run options dialog would.
   const scheduleStartsOnCodex = effectiveHarnessIsCodex(
     harnessSel,
     claudeUsableForHarness,

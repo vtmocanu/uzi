@@ -158,172 +158,6 @@ describe("IssueCard — the forge title carries no format characters (#124)", ()
   });
 });
 
-// PRD #1429 M4a: the per-card harness picker, direct-rendered (mirrors the credential
-// picker's own direct-render coverage above/below). It is opt-in via TWO props
-// (showHarnessPicker + onHarnessChange, mirroring onCredentialChange's opt-in), so a
-// card the board has not wired for it renders exactly as before this milestone.
-describe("IssueCard — per-card harness picker (PRD #1429 M4a)", () => {
-  it("renders no harness control when showHarnessPicker is false (default)", () => {
-    renderCard();
-    expect(screen.queryByLabelText(/Harness for #/)).toBeNull();
-  });
-
-  it("renders the picker only when BOTH showHarnessPicker and onHarnessChange are supplied", () => {
-    render(
-      <MemoryRouter>
-        <IssueCard
-          card={aCard()}
-          repoId="repo-1"
-          chips={[]}
-          laneLabel="Backlog"
-          canMoveUp={false}
-          canMoveDown={false}
-          onMoveUp={vi.fn()}
-          onMoveDown={vi.fn()}
-          insertionEdge={null}
-          gate={{ enabled: true, reason: "" }}
-          starting={false}
-          onStart={vi.fn()}
-          showHarnessPicker
-          harness="inherit"
-          onHarnessChange={vi.fn()}
-          fixCiBusy={false}
-          onFixCi={vi.fn()}
-          uziLabel="uzi"
-          isEligible
-          canPromote={false}
-          promoting={false}
-          onPromote={vi.fn()}
-          onDragStart={vi.fn()}
-          onDragEnd={vi.fn()}
-          dimmed={false}
-        />
-      </MemoryRouter>,
-    );
-    expect(screen.getByLabelText("Harness for #7")).toBeTruthy();
-  });
-
-  it("hides the Anthropic token picker once this card's harness is explicitly codex", () => {
-    render(
-      <MemoryRouter>
-        <IssueCard
-          card={aCard()}
-          repoId="repo-1"
-          chips={[]}
-          laneLabel="Backlog"
-          canMoveUp={false}
-          canMoveDown={false}
-          onMoveUp={vi.fn()}
-          onMoveDown={vi.fn()}
-          insertionEdge={null}
-          gate={{ enabled: true, reason: "" }}
-          starting={false}
-          onStart={vi.fn()}
-          tokens={[]}
-          credential={{ mode: "inherit" }}
-          onCredentialChange={vi.fn()}
-          showHarnessPicker
-          harness="codex"
-          onHarnessChange={vi.fn()}
-          fixCiBusy={false}
-          onFixCi={vi.fn()}
-          uziLabel="uzi"
-          isEligible
-          canPromote={false}
-          promoting={false}
-          onPromote={vi.fn()}
-          onDragStart={vi.fn()}
-          onDragEnd={vi.fn()}
-          dimmed={false}
-        />
-      </MemoryRouter>,
-    );
-    expect(screen.getByLabelText("Harness for #7")).toBeTruthy();
-    expect(screen.queryByLabelText("Anthropic token for #7")).toBeNull();
-  });
-
-  // Fix 2 (M4a review): a Codex-only card (showHarnessPicker false — D2, so `harness`
-  // stays the "inherit" default) still hides the Anthropic token picker, because
-  // codexUsable/claudeUsable name Codex as the effective harness even without an
-  // explicit pick.
-  it("hides the Anthropic token picker for a Codex-only card with no harness picker shown", () => {
-    render(
-      <MemoryRouter>
-        <IssueCard
-          card={aCard()}
-          repoId="repo-1"
-          chips={[]}
-          laneLabel="Backlog"
-          canMoveUp={false}
-          canMoveDown={false}
-          onMoveUp={vi.fn()}
-          onMoveDown={vi.fn()}
-          insertionEdge={null}
-          gate={{ enabled: true, reason: "" }}
-          starting={false}
-          onStart={vi.fn()}
-          tokens={[]}
-          credential={{ mode: "inherit" }}
-          onCredentialChange={vi.fn()}
-          claudeUsable={false}
-          codexUsable
-          fixCiBusy={false}
-          onFixCi={vi.fn()}
-          uziLabel="uzi"
-          isEligible
-          canPromote={false}
-          promoting={false}
-          onPromote={vi.fn()}
-          onDragStart={vi.fn()}
-          onDragEnd={vi.fn()}
-          dimmed={false}
-        />
-      </MemoryRouter>,
-    );
-    // Single-harness card: no harness picker (showHarnessPicker defaults false).
-    expect(screen.queryByLabelText(/Harness for #/)).toBeNull();
-    expect(screen.queryByLabelText("Anthropic token for #7")).toBeNull();
-  });
-
-  // Positive control for the case above: the pre-existing default props (claudeUsable
-  // defaults true, codexUsable defaults false) still show the Anthropic picker — the
-  // fix must not hide it universally.
-  it("still shows the Anthropic token picker on the pre-existing (Claude-usable) default props", () => {
-    render(
-      <MemoryRouter>
-        <IssueCard
-          card={aCard()}
-          repoId="repo-1"
-          chips={[]}
-          laneLabel="Backlog"
-          canMoveUp={false}
-          canMoveDown={false}
-          onMoveUp={vi.fn()}
-          onMoveDown={vi.fn()}
-          insertionEdge={null}
-          gate={{ enabled: true, reason: "" }}
-          starting={false}
-          onStart={vi.fn()}
-          tokens={[]}
-          credential={{ mode: "inherit" }}
-          onCredentialChange={vi.fn()}
-          fixCiBusy={false}
-          onFixCi={vi.fn()}
-          uziLabel="uzi"
-          isEligible
-          canPromote={false}
-          promoting={false}
-          onPromote={vi.fn()}
-          onDragStart={vi.fn()}
-          onDragEnd={vi.fn()}
-          dimmed={false}
-        />
-      </MemoryRouter>,
-    );
-    expect(screen.getByLabelText("Anthropic token for #7")).toBeTruthy();
-  });
-});
-
 // Issue #562. A title carrying a long unbreakable token (e.g. an env-var assignment)
 // overflowed the fixed w-72 lane because the title <Link> could neither wrap nor shrink.
 // jsdom does no layout, so pixel overflow is unassertable here; the enforceable unit-level
@@ -2206,8 +2040,8 @@ describe("Board — non-uzi issues (PRD #764)", () => {
     expect(confirmMsg).not.toContain("--force");
     // Retried with force === true, and the run page opened.
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
-    expect(mockApi.createRun.mock.calls[0]).toEqual(["repo-1", 1, undefined]);
-    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 1, true]);
+    expect(mockApi.createRun.mock.calls[0]).toEqual(["repo-1", 1, {}]);
+    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 1, {}, true]);
     await screen.findByText("run page");
     confirmSpy.mockRestore();
   });
@@ -2254,7 +2088,7 @@ describe("Board — non-uzi issues (PRD #764)", () => {
     // Retried with force === true, that retry failed, so the toast shows the retry
     // error and the starting state is cleared (button re-enabled).
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalledTimes(2));
-    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 1, true]);
+    expect(mockApi.createRun.mock.calls[1]).toEqual(["repo-1", 1, {}, true]);
     await screen.findByText("boom while forcing");
     await waitFor(() => {
       const start2 = within(cardOf("issue one")).getByRole("button", {
@@ -3229,11 +3063,12 @@ describe("Board — hide-empty defaults on + left-anchored toolbar (PRD #1208)",
   });
 });
 
-// PRD #1247 (CodeRabbit finding [5]). Board is REUSED across a :id route change without
-// remounting (the same trap the sortMode/hideEmpty re-read effects document), and
-// cardCredential is keyed ONLY by issue iid — so without a reset a per-card pin on repo A's
-// card silently reapplies to a same-iid card on repo B. A repo change must clear the map.
-describe("Board — per-card credential resets on a repo change (PRD #1247)", () => {
+// PRD #1247 (CodeRabbit finding [5]), PRD #3250 M2. Board is REUSED across a :id route
+// change without remounting (the same trap the sortMode/hideEmpty re-read effects
+// document), and the Run options dialog is keyed ONLY by issue iid, so a choice made for
+// repo A's card must never reapply to a same-iid card on repo B. A repo change closes the
+// dialog, and reopening it starts from defaults.
+describe("Board — Run options choices reset on a repo change (PRD #1247, #3250)", () => {
   function installStorage(): Map<string, string> {
     const m = new Map<string, string>();
     Object.defineProperty(window, "localStorage", {
@@ -3344,12 +3179,14 @@ describe("Board — per-card credential resets on a repo change (PRD #1247)", ()
       </MemoryRouter>,
     );
 
-  it("clears a per-card pin when the route swaps to another repo", async () => {
+  it("closes the dialog and drops a pinned token when the route swaps to another repo", async () => {
     renderBoard();
     await screen.findByText("issue A");
 
-    // Pin the token on repo A's card #1 (the user CHANGING the per-card selection).
-    const pickerA = screen.getByLabelText("Anthropic token for #1") as HTMLSelectElement;
+    // Pin the token for repo A's card #1 in its Run options dialog.
+    fireEvent.click(await screen.findByRole("button", { name: "Run options for #1" }));
+    const dialogA = screen.getByRole("dialog", { name: "Run options for #1" });
+    const pickerA = within(dialogA).getByLabelText("Anthropic token") as HTMLSelectElement;
     const opt = (await within(pickerA).findByRole("option", { name: /console-key/ })) as HTMLOptionElement;
     fireEvent.change(pickerA, { target: { value: opt.value } });
     expect(pickerA.value).toBe("sec-1");
@@ -3357,19 +3194,22 @@ describe("Board — per-card credential resets on a repo change (PRD #1247)", ()
     // Swap :id without remounting — repo B has a same-iid (1) card.
     fireEvent.click(screen.getByRole("button", { name: "go repo 2" }));
     await screen.findByText("issue B");
+    expect(screen.queryByRole("dialog")).toBeNull();
 
-    // The pin from repo A must NOT carry over: card #1 on repo B seeds back to inherit.
-    // On the old code (no reset) cardCredential[1] survives and this reads "sec-1".
-    const pickerB = screen.getByLabelText("Anthropic token for #1") as HTMLSelectElement;
+    // Reopening for repo B's card #1 starts from defaults: the pin did not carry over.
+    fireEvent.click(await screen.findByRole("button", { name: "Run options for #1" }));
+    const pickerB = within(screen.getByRole("dialog", { name: "Run options for #1" })).getByLabelText(
+      "Anthropic token",
+    ) as HTMLSelectElement;
     await waitFor(() => expect(pickerB.value).toBe("mode:inherit"));
   });
 });
 
-// PRD #1429 M4a, D2: the harness picker's show/hide gate driven end to end through the
-// full Board (not just the direct-rendered IssueCard above) — a single-harness user
-// (Claude-only, the common case) never sees the picker; a both-usable user does, and
-// picking Codex both hides the Anthropic picker and rides the create call.
-describe("Board — per-card harness picker gate (PRD #1429 M4a)", () => {
+// PRD #3250 M2 (user decision P1), driven end to end through the full Board: each card
+// keeps one-click Start run beside a secondary Options button, and Options opens the
+// board's ONE Run options dialog. The rows' show/hide gates (PRD #1429 D2, Fix 2) moved
+// from the card's inline pickers into that dialog.
+describe("Board — Run options dialog (PRD #3250 M2)", () => {
   function aBoard(): BoardData {
     return {
       repo_id: "repo-1",
@@ -3377,7 +3217,10 @@ describe("Board — per-card harness picker gate (PRD #1429 M4a)", () => {
       web_url: "https://gitlab.example.com/grp/one",
       forge_type: "gitlab",
       columns: [] as BoardData["columns"],
-      cards: [aCard({ iid: 1, title: "issue A", column: "", labels: ["uzi"], has_prd_link: false })],
+      cards: [
+        aCard({ iid: 1, title: "issue A", column: "", labels: ["uzi"], has_prd_link: false }),
+        aCard({ iid: 2, title: "issue B", column: "", labels: ["uzi"], has_prd_link: false }),
+      ],
       pipeline: null,
       bot_forge_user_id: 0,
     };
@@ -3442,43 +3285,122 @@ describe("Board — per-card harness picker gate (PRD #1429 M4a)", () => {
       </MemoryRouter>,
     );
 
-  it("hides the harness picker for a Claude-only user (today's flow, unchanged)", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+  const openOptions = async (iid = 1) => {
+    await screen.findByText("issue A");
+    const button = await screen.findByRole("button", { name: `Run options for #${iid}` });
+    // Keyboard-only path: focus the native button, then activate it (Enter and Space both
+    // click a <button>; @testing-library/user-event is not a dependency).
+    button.focus();
+    fireEvent.click(button);
+    return { button, dialog: screen.getByRole("dialog", { name: `Run options for #${iid}` }) };
+  };
+
+  it("renders no inline pickers on the cards, and one-click Start run sends today's body", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    mockApi.createRun.mockResolvedValue({ run: { id: "run-1" } as unknown as import("../lib/api").Run });
     renderBoard();
     await screen.findByText("issue A");
-    expect(screen.queryByLabelText("Harness for #1")).toBeNull();
-    expect(screen.getByLabelText("Anthropic token for #1")).toBeTruthy();
+    expect(screen.queryByLabelText(/Harness for #/)).toBeNull();
+    expect(screen.queryByLabelText(/Anthropic token for #/)).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Start run" })[0]);
+    await waitFor(() => expect(mockApi.createRun).toHaveBeenCalled());
+    // The object form, empty: runStartBody's defaults (the wire pin is startRun.wire.test.ts).
+    expect(mockApi.createRun.mock.calls).toEqual([["repo-1", 1, {}]]);
   });
 
-  it("shows the harness picker once both harnesses are usable, and picking codex hides the Anthropic picker + rides the create call", async () => {
+  it("mounts ONE dialog at the board level, outside every draggable card", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    renderBoard();
+    const { dialog } = await openOptions(2);
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(dialog.closest('[draggable="true"]')).toBeNull();
+    expect(within(dialog).getByText(/#2/)).toBeTruthy();
+  });
+
+  it("Claude-only: no Harness row, the Anthropic token row shows", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    renderBoard();
+    const { dialog } = await openOptions();
+    expect(within(dialog).queryByLabelText("Harness")).toBeNull();
+    expect(within(dialog).getByLabelText("Anthropic token")).toBeTruthy();
+    expect(within(dialog).getByLabelText("Model")).toBeTruthy();
+    expect(within(dialog).getByLabelText("Reasoning effort")).toBeTruthy();
+  });
+
+  it("Codex-only: neither the Harness nor the Anthropic token row shows", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey()] });
+    renderBoard();
+    const { dialog } = await openOptions();
+    expect(within(dialog).queryByLabelText("Harness")).toBeNull();
+    expect(within(dialog).queryByLabelText("Anthropic token")).toBeNull();
+  });
+
+  it("keyboard only: open, choose Codex and an effort, start; the body carries the choices", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
     mockApi.createRun.mockResolvedValue({ run: { id: "run-codex-card" } as unknown as import("../lib/api").Run });
     renderBoard();
-    await screen.findByText("issue A");
-
-    const picker = (await screen.findByLabelText("Harness for #1")) as HTMLSelectElement;
-    expect(picker.value).toBe("inherit");
-
-    fireEvent.change(picker, { target: { value: "codex" } });
-    expect(screen.queryByLabelText("Anthropic token for #1")).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: /start run/i }));
+    const { dialog } = await openOptions();
+    const harness = within(dialog).getByLabelText("Harness") as HTMLSelectElement;
+    harness.focus();
+    fireEvent.change(harness, { target: { value: "codex" } });
+    expect(within(dialog).queryByLabelText("Anthropic token")).toBeNull();
+    const effort = within(dialog).getByLabelText("Reasoning effort") as HTMLSelectElement;
+    effort.focus();
+    fireEvent.change(effort, { target: { value: "high" } });
+    const start = within(dialog).getByRole("button", { name: "Start run" });
+    start.focus();
+    expect(document.activeElement).toBe(start);
+    fireEvent.click(start);
     await waitFor(() => expect(mockApi.createRun).toHaveBeenCalled());
-    expect(mockApi.createRun).toHaveBeenCalledWith("repo-1", 1, undefined, undefined, "codex");
+    expect(mockApi.createRun.mock.calls).toEqual([["repo-1", 1, { harness: "codex", effort: "high" }]]);
   });
 
-  // Fix 2 (M4a review): a Codex-only card never shows the harness picker (only one
-  // harness is usable — D2), so `harness` stays "inherit". Gating the Anthropic
-  // TokenPicker on the raw picker value alone left it visible even though the card's
-  // run WILL resolve to Codex — using it 422s.
-  it("hides the Anthropic token picker for a Codex-only user, even with no explicit harness pick", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey()] });
+  it("Escape closes the dialog and restores focus to that card's Options button", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
     renderBoard();
-    await screen.findByText("issue A");
+    const { button, dialog } = await openOptions();
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Run options for #1" }));
+    expect(document.activeElement).toBe(button);
+  });
 
-    // Single-harness user: no redundant harness picker either (D2).
-    expect(screen.queryByLabelText("Harness for #1")).toBeNull();
-    expect(screen.queryByLabelText("Anthropic token for #1")).toBeNull();
+  it("shows a server refusal inside the dialog, which stays open with its choices", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    const text = "opus cannot run here; start it on the Claude harness or choose a Codex model";
+    mockApi.createRun.mockRejectedValueOnce(new ApiError(422, text, { code: "model_incompatible_with_harness", harness: "codex" }));
+    renderBoard();
+    const { dialog } = await openOptions();
+    fireEvent.change(within(dialog).getByLabelText("Model"), { target: { value: "opus" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start run" }));
+    await waitFor(() => expect(within(dialog).getByRole("alert").textContent).toBe(text));
+    expect(screen.getByRole("dialog", { name: "Run options for #1" })).toBe(dialog);
+    expect((within(dialog).getByLabelText("Model") as HTMLSelectElement).value).toBe("opus");
+    expect((within(dialog).getByRole("button", { name: "Start run" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("the board's precondition poll updates row visibility without resetting the choices", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+      renderBoard();
+      const { dialog } = await openOptions();
+      fireEvent.change(within(dialog).getByLabelText("Reasoning effort"), { target: { value: "max" } });
+      fireEvent.change(within(dialog).getByLabelText("Model"), { target: { value: "sonnet" } });
+      expect(within(dialog).getByLabelText("Harness")).toBeTruthy();
+      // The Codex key goes away; the next 10 s poll hides the Harness row.
+      mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_500);
+      });
+      await waitFor(() => expect(within(dialog).queryByLabelText("Harness")).toBeNull());
+      expect((within(dialog).getByLabelText("Reasoning effort") as HTMLSelectElement).value).toBe("max");
+      expect((within(dialog).getByLabelText("Model") as HTMLSelectElement).value).toBe("sonnet");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

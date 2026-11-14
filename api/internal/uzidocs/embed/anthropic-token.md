@@ -327,8 +327,8 @@ regardless of the worker.
 
 ### Where you can pick it
 
-- **Starting a run**: the token picker in the start dialog, or
-  `uzi run create --token <label>|auto|default|inherit`.
+- **Starting a run**: the token picker in the Run options dialog (**Options**
+  beside **Start run**), or `uzi run create --token <label>|auto|default|inherit`.
 - **A schedule**: the same picker in the schedule modal, or
   `uzi schedule create/edit --token <label>|auto|default|inherit`; every run
   the schedule fires inherits its choice.

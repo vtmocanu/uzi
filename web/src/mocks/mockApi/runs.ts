@@ -10,6 +10,7 @@ import {
   type RecoveryCustodyHolds,
   type Run,
   type RunPriority,
+  type RunStartBody,
   type RunInputKind,
   type RunListItem,
   type RunSummaryItem,
@@ -21,6 +22,7 @@ import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
 import { credentialSwitchHold } from "../../lib/credentialSwitchHold";
 import { diskWaitMode } from "../../lib/diskRecovery";
 import { isTerminalRun } from "../../lib/runStatus";
+import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import {
   LIVE_RUN_ID,
   mockAdminCodexRateLimits,
@@ -443,6 +445,40 @@ function mockAdminListRuns(params?: {
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
 
+// PRD #3250: the mock's half of the create-time start-option checks, mirroring the Go
+// handler's validateRunStartOptions and runOverrideModelHonorable (workersvc). Both halves
+// iterate fixtures/run-start-options/cases.json (mockApi.runStartOptions.test.ts here), so
+// the demo refuses exactly what the server refuses. Values are NOT trimmed.
+const RUN_START_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const RUN_START_MODEL_MAX_BYTES = 100;
+
+function runStartShapeError(start: RunStartBody): string {
+  const { model, effort } = start;
+  if (model !== undefined) {
+    if (model === "" || /\s/u.test(model)) return "model must not contain whitespace; omit it to use your default";
+    if (new TextEncoder().encode(model).length > RUN_START_MODEL_MAX_BYTES) {
+      return `model must be at most ${RUN_START_MODEL_MAX_BYTES} characters`;
+    }
+    if (/[\p{Cc}\p{Cf}\uFFFD]/u.test(model)) return "model must not contain newlines or control characters";
+  }
+  if (effort !== undefined && !RUN_START_EFFORTS.includes(effort)) {
+    return "effort must be one of low, medium, high, xhigh, max";
+  }
+  return "";
+}
+
+function runOverrideModelHonorable(harness: Harness, model: string): boolean {
+  return harness === "codex" ? CODEX_CURATED_MODELS.includes(model) : !CODEX_ROLE_MODELS.includes(model);
+}
+
+function runStartModelRefusal(harness: Harness, model: string): string {
+  if (harness === "codex") {
+    const list = [...CODEX_CURATED_MODELS].sort().join(", ");
+    return `${model} is not a model a Codex run can start with, and this run resolved to the codex harness; start it on the Claude harness or choose one of: ${list}`;
+  }
+  return `${model} cannot run on the Claude harness, and this run resolved to the claude harness; start it on the Codex harness or choose a Claude model`;
+}
+
 export const runsApi = {
   // ── Runs ────────────────────────────────────────────────────────────────────
   // Runs-in-progress count for the Runs nav badge (PRD #239). Counted LIVE from the
@@ -465,17 +501,25 @@ export const runsApi = {
   createRun: async (
     repoId: string,
     issueIid: number,
+    // PRD #3250 M2: mirror the real client's start-option object (lib/startRun.ts's
+    // runStartBody). An explicit harness is stamped verbatim (never overridden by the
+    // scenario: D2's "explicit never falls back" holds even in the mock); omitted falls
+    // through to the scenario's implicit resolution, mirroring D11 (the "codex-only"
+    // scenario has no usable Claude, so it implicitly resolves codex, same as the real
+    // server would). The credential override is stamped read-side ({mode,label}) so a demo
+    // start-with-token is visible; model and effort are checked against the shared
+    // fixtures/run-start-options cases and stamped with run_override sources.
+    start: RunStartBody = {},
     force?: boolean,
-    // PRD #1247 M7: mirror the real client's optional override arg. The mock stamps the
-    // read-side {mode,label} onto the created run so a demo start-with-token is visible.
-    credentialOverride?: { mode: string; secret_id?: string },
-    // PRD #1429 M4a: mirror the real client's optional harness arg. An explicit pick is
-    // stamped verbatim (never overridden by the scenario — D2's "explicit never falls
-    // back" holds even in the mock); omitted falls through to the scenario's implicit
-    // resolution, mirroring D11 (the "codex-only" scenario has no usable Claude, so it
-    // implicitly resolves codex, same as the real server would).
-    harness?: Harness,
   ) => {
+    // The pre-forge shape step answers before any issue lookup, like the handler.
+    const shapeError = runStartShapeError(start);
+    if (shapeError) throw new ApiError(400, shapeError);
+    const { credential_override: credentialOverride, harness: explicitHarness, model, effort } = start;
+    const harness: Harness = explicitHarness ?? (mockScenario() === "codex-only" ? "codex" : "claude");
+    if (model !== undefined && !runOverrideModelHonorable(harness, model)) {
+      throw new ApiError(422, runStartModelRefusal(harness, model), { code: "model_incompatible_with_harness", harness });
+    }
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === issueIid);
     if (!b || !card) throw new ApiError(404, "issue not found");
@@ -515,7 +559,7 @@ export const runsApi = {
       issue_iid: issueIid,
       issue_title: card.title,
       issue_description: "See the linked PRD.",
-      harness: harness ?? (mockScenario() === "codex-only" ? "codex" : "claude"),
+      harness,
       title: null,
       resume_of_run_id: null,
       status: "queued",
@@ -527,7 +571,11 @@ export const runsApi = {
       plan_cross_check_required: false,
       worker_id: null,
       branch: null,
-      model: null,
+      // PRD #3250: stamp only the supplied values; an absent setting leaves its pair null.
+      model: model ?? null,
+      model_source: model !== undefined ? "run_override" : null,
+      effort: effort ?? null,
+      effort_source: effort !== undefined ? "run_override" : null,
       override_subagent_model: false,
       mr_iid: null,
       mr_state: null,

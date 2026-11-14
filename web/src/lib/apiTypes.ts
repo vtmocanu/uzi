@@ -4444,6 +4444,19 @@ export interface CredentialOverride {
   label: string | null;
 }
 
+/** RunStartBody is the optional start-option part of POST /repos/{id}/runs (PRD #3250 M2),
+ *  shaped by lib/startRun.ts's runStartBody, the one builder. Every key is OPTIONAL and sent
+ *  only when present: an empty object is today's one-click body ({issue_iid} alone).
+ *  credential_override mirrors the Go create handler's write shape ({mode, secret_id?}),
+ *  harness is an explicit pick, and model / effort are sent verbatim (the server does not
+ *  trim them). */
+export interface RunStartBody {
+  credential_override?: { mode: string; secret_id?: string };
+  harness?: Harness;
+  model?: string;
+  effort?: string;
+}
+
 /** CredentialEpoch is one claim's credential attribution (PRD #1247 M1, D7): the
  *  generation, the token it spent (secret_id + label + select_reason, all null-tolerant for
  *  a deleted token's history), and when it was applied. claim_generation is a plain JSON

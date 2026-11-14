@@ -56,15 +56,17 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// A POINTER, so "the caller said false" and "the caller said nothing" stay
 		// distinct — a plain bool would make every existing client silently override
 		// the user's own Settings default with false the moment this field shipped.
-		// The web start button omits it and inherits the default (the user ruled
-		// against a start-run modal on 2026-07-27); the per-run toggle is
-		// PUT /api/runs/{id}/wait-on-limit.
+		// The web omits it and inherits the default: Start run stays one click (the user
+		// ruled against a start-run modal on 2026-07-27), and the optional Run options
+		// dialog (PRD #3250) carries harness, token, model and effort, not wait-on-limit.
+		// The per-run toggle is PUT /api/runs/{id}/wait-on-limit.
 		WaitOnLimit *bool `json:"wait_on_limit"`
 		// PRD #841 M2: the per-run MR-rework override for CLI and API callers. A POINTER
 		// so "the caller said false" and "the caller said nothing" stay distinct — nil
 		// leaves the run inheriting the owner default live (D1), true/false stamp an
-		// explicit override. The web start button omits it; the per-run toggle is
-		// PUT /api/runs/{id}/mr-rework.
+		// explicit override. The web omits it: Start run stays one click, and the optional
+		// Run options dialog (PRD #3250) carries harness, token, model and effort, not MR
+		// rework. The per-run toggle is PUT /api/runs/{id}/mr-rework.
 		MrReworkEnabled *bool `json:"mr_rework_enabled"`
 		// PRD #209 seeded plan: an externally-authored plan and its optional agent
 		// roster. A POINTER so absence (an ordinary run planned from the issue) stays

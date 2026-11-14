@@ -306,8 +306,31 @@ than merging into one, so the banner always names the actual action owed.
 
 Click a card's title to open it in-app: full description, its column and
 labels, and its complete run history (start time, duration, worker, MR
-link). **Start run** is available there too. GitLab stays one click away via
-the small icon next to the card's issue number.
+link). **Start run** and **Options** are available there too. GitLab stays
+one click away via the small icon next to the card's issue number.
+
+## Starting a run with options
+
+**Start run** is one click: the run uses your Settings for everything. Next
+to it, on a card and on the issue page, **Options** opens the Run options
+dialog for that one run:
+
+- **Harness**, shown only when both Claude and Codex are usable for you.
+  Changing it puts **Model** back on Default, since the two harnesses have
+  different models.
+- **Anthropic token**, hidden when the run will start on Codex.
+- **Model**: the harness's curated models, plus a custom model ID on Claude.
+  A custom ID must be a single word; a Codex model is refused on Claude.
+- **Reasoning effort**: `low` to `max`.
+
+Anything left on **Default · your settings** follows your Settings when a
+worker picks the run up. A model or effort you choose is frozen on the run:
+requeues and resumes keep it (see [Worker model](./worker-model.md#a-model-chosen-when-starting-a-run)
+and [Reasoning effort](./worker-effort.md#a-run-level-effort)). If uzi refuses
+the choice, for example a model the resolved harness cannot run, the reason
+shows in the dialog and your choices stay so you can change one and start
+again. Wait-on-limit and MR rework are not in the dialog; set them on the run
+page after it starts.
 
 ## Staying in sync
 
