@@ -1077,3 +1077,10 @@ LEFT JOIN codex_provider_account cpa
 WHERE r.id = ANY(@run_ids::uuid[])
   AND r.status = 'recovery_wait'
   AND r.recovery_wait_cause = 'codex_account_unavailable';
+
+
+-- name: LockCodexAccountForUpdateNowait :one
+-- Refresh admission serializes with switch apply before creating its intent.
+SELECT id FROM codex_provider_account
+WHERE id = @id AND user_id = @user_id
+FOR UPDATE NOWAIT;

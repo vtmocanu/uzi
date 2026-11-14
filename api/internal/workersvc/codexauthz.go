@@ -518,6 +518,7 @@ func evalCodexPersistRecoveryPredicate(in codexReleaseInputs) error {
 // caller's — this struct just proves the operation is authorized and hands over the
 // resolved coordinates.
 type CodexAuthContext struct {
+	binding   store.GetRunCodexAuthContextRow
 	Scope     CodexOpScope
 	AuthMode  string
 	UserID    uuid.UUID
@@ -568,11 +569,18 @@ func (s *Service) AuthorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 // authorizeCodexCredentialOp retains coordinates on a quarantine-only refresh refusal.
 // Those coordinates authorize only an evidence check, never credential access.
 func (s *Service) authorizeCodexCredentialOp(ctx context.Context, wkr store.Worker, runID uuid.UUID, presentedCapability string, scope CodexOpScope, deferQuarantine bool) (CodexAuthContext, error) {
-	row, err := s.codexCredentialPrelude(ctx, wkr, runID, presentedCapability, scope)
+	q, ok := s.codexStore()
+	if !ok {
+		return CodexAuthContext{}, errCodexStoreUnavailable
+	}
+	return authorizeCodexCredentialOpWithQueries(ctx, q, wkr, runID, presentedCapability, scope, deferQuarantine)
+}
+
+func authorizeCodexCredentialOpWithQueries(ctx context.Context, q codexAuthzStore, wkr store.Worker, runID uuid.UUID, presentedCapability string, scope CodexOpScope, deferQuarantine bool) (CodexAuthContext, error) {
+	row, err := codexCredentialPreludeWithQueries(ctx, q, wkr, runID, presentedCapability, scope)
 	if err != nil {
 		return CodexAuthContext{}, err
 	}
-	q, _ := s.codexStore()
 	authMode := row.CodexAuthMode.String
 	var decisionErr error
 	inputs := codexReleaseInputsFromAuthRow(row)
@@ -594,6 +602,7 @@ func (s *Service) authorizeCodexCredentialOp(ctx context.Context, wkr store.Work
 	}
 
 	authCtx := CodexAuthContext{
+		binding:  row,
 		Scope:    scope,
 		AuthMode: authMode,
 		UserID:   wkr.UserID,
@@ -626,6 +635,10 @@ func (s *Service) codexCredentialPrelude(ctx context.Context, wkr store.Worker, 
 	if !ok {
 		return store.GetRunCodexAuthContextRow{}, errCodexStoreUnavailable
 	}
+	return codexCredentialPreludeWithQueries(ctx, q, wkr, runID, presentedCapability, scope)
+}
+
+func codexCredentialPreludeWithQueries(ctx context.Context, q codexAuthzStore, wkr store.Worker, runID uuid.UUID, presentedCapability string, scope CodexOpScope) (store.GetRunCodexAuthContextRow, error) {
 	if !scope.valid() {
 		return store.GetRunCodexAuthContextRow{}, ErrCodexScopeNotApplicable
 	}

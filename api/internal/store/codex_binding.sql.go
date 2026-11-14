@@ -1057,6 +1057,25 @@ func (q *Queries) LockCodexAccountForShareNowait(ctx context.Context, arg LockCo
 	return id, err
 }
 
+const lockCodexAccountForUpdateNowait = `-- name: LockCodexAccountForUpdateNowait :one
+SELECT id FROM codex_provider_account
+WHERE id = $1 AND user_id = $2
+FOR UPDATE NOWAIT
+`
+
+type LockCodexAccountForUpdateNowaitParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Refresh admission serializes with switch apply before creating its intent.
+func (q *Queries) LockCodexAccountForUpdateNowait(ctx context.Context, arg LockCodexAccountForUpdateNowaitParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockCodexAccountForUpdateNowait, arg.ID, arg.UserID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const lockCodexAliasForShareNowait = `-- name: LockCodexAliasForShareNowait :one
 SELECT status, material_revision, provider_account_id
 FROM codex_credential_state
