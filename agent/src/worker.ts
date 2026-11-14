@@ -18,6 +18,7 @@ import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, PublicationRe
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { DindPruneController, DindPruneGate } from "./dind-prune.js";
 import type { DindMaintenanceController } from "./dind-maintenance.js";
+import type { HibernationCachePruneController } from "./hibernation-cache-prune.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState } from "./terminal-resolve.js";
 import { dataVolumeUsedFraction, StatsCollector } from "./stats.js";
 import type { DiskPressureController } from "./disk-reclaim.js";
@@ -160,6 +161,8 @@ export class Worker {
     // issue #2471 M1: the guarded-command launcher preflight, run only when the memory guard is
     // enabled. Injectable so tests need no supervisor; production launches the real probe.
     private readonly launcherPreflight: () => Promise<MemoryLauncherPreflightResult> = () => memoryLauncherPreflight(),
+    // PRD #4206: the hibernation cache prune; present only with Docker wiring and the prune flag on.
+    private readonly hibernationPrune?: HibernationCachePruneController,
   ) {
     // Existing constructor callers with a real outbox/client also reconcile after restart.
     if (!this.terminalRejections && outbox && typeof client.reportTerminalRejections === "function" &&
@@ -593,13 +596,17 @@ export class Worker {
       // controller). Its loop never throws.
       const dindPrune = this.dindPrune ? this.dindPrune.loop(signal) : Promise.resolve();
       const dindMaintenance = this.dindMaintenance?.loop(signal) ?? Promise.resolve();
+      const hibernationPrune = this.hibernationPrune?.loop(signal, async (report) => {
+        // Shutdown best effort: one last heartbeat carrying the in-flight step as unknown.
+        await this.client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, report);
+      }) ?? Promise.resolve();
       // PRD #1809 D7: the periodic disk reclaim, only when enabled. Its loop never throws.
       const diskReclaim = this.diskPressure ? this.diskPressure.loop(signal) : Promise.resolve();
       // The retained-source channel joins the same abort and shutdown lifecycle as claim loops.
       const retainedSource = this.retainedSource?.serve(signal).catch((err) => {
         this.log.warn("retained-source channel stopped", { error: errMessage(err) });
       }) ?? Promise.resolve();
-      tasks.push(settlement, dindPrune, dindMaintenance, diskReclaim, retainedSource, this.claimLoop(signal), this.chatClaimLoop(signal), this.crossCheckClaimLoop(signal));
+      tasks.push(settlement, dindPrune, dindMaintenance, hibernationPrune, diskReclaim, retainedSource, this.claimLoop(signal), this.chatClaimLoop(signal), this.crossCheckClaimLoop(signal));
       await Promise.all(tasks);
     } finally {
       // Boot/registration failures also stop and join loops already started.
@@ -1100,6 +1107,8 @@ export class Worker {
           protocolCapabilities.push("provider_policy_hold_v1");
         }
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
+        // PRD #4206: offered only when the prune is enabled and a docker host is wired (main.ts builds the controller then).
+        if (this.hibernationPrune) protocolCapabilities.push("hibernation_cache_prune_v1");
         // Issue #1324: publication_resume_v1 promises a durable local publication-intent record, so it is
         // advertised only while the outbox that holds it is usable. Without it the api never enrolls this
         // worker's runs and an ordinary finalize runs exactly as before.
@@ -1131,6 +1140,7 @@ export class Worker {
         });
         this.dindPrune?.setWorkerId(res.worker_id);
         this.dindMaintenance?.register(res.register_nonce, this.client.hasFeature("dind_maintenance_v1"));
+        this.hibernationPrune?.register(res.register_nonce);
         if (!this.finalizeRegistrationAccepted) {
           this.finalizeRegistrationAccepted = true;
           for (const { entry, identity } of offeredIdentities.slice(0, 256)) {
@@ -1203,16 +1213,24 @@ export class Worker {
         // the background when due; it never awaits a measure).
         const runDisk = this.runDisk?.current();
         if (sample && runDisk) sample.run_disk = runDisk;
+        // PRD #4206: a maintenance ACK goes first; the cache prune report waits for the next heartbeat.
+        const ack = this.dindMaintenance?.acknowledgement();
+        const hibernationReport = ack ? undefined : this.hibernationPrune?.report();
         const retaining = await this.client.heartbeat(
           sample,
           this.outboxEntries(),
           this.buildActiveSnapshot(),
-          { sample: stats.latestDindSample, ack: this.dindMaintenance?.acknowledgement() },
+          { sample: stats.latestDindSample, ack },
           // issue #2213: the quarantine latch (the client sends it only when negotiated).
           residueQuarantine(),
           this.outbox?.unusableRootReason?.(),
+          hibernationReport,
         );
         ok = true;
+        if (hibernationReport) {
+          const outcome = this.client.hibernationReportOutcome;
+          this.hibernationPrune?.reported(hibernationReport, outcome === "none" ? "failed" : outcome);
+        }
         // Heartbeat negotiation can grow or shrink support without a new incarnation.
         // Preserve maintenance identity/custody/fences; only its optional-use gate changes.
         this.dindMaintenance?.updateNegotiation(this.client.hasFeature("dind_maintenance_v1"));
@@ -1223,8 +1241,10 @@ export class Worker {
         // the prune fail closed on a stale flag.
         this.dindPrune?.recordCustody(retaining, sentAtMs);
         this.dindMaintenance?.observe(this.client.latestDindMaintenance, retaining, sentAtMs);
+        this.hibernationPrune?.observe(this.client.latestHibernationCachePrune, retaining, sentAtMs);
       } catch (err) {
         this.dindMaintenance?.observe(undefined, undefined, sentAtMs);
+        this.hibernationPrune?.observe(undefined, undefined, sentAtMs);
         this.log.warn("heartbeat failed", { error: errMessage(err) });
       }
       // PRD #1809 D5: the data volume's used fraction from THIS tick's sample, checked
@@ -1586,6 +1606,7 @@ export class Worker {
             releaseProtection?.();
             this.dindPrune?.noteActivityEnded();
             this.dindMaintenance?.noteActivityEnded();
+            this.hibernationPrune?.noteActivityEnded();
           });
         }
       } catch (err) {
@@ -1694,6 +1715,7 @@ export class Worker {
             active.delete(run);
             this.dindPrune?.noteActivityEnded();
             this.dindMaintenance?.noteActivityEnded();
+            this.hibernationPrune?.noteActivityEnded();
           });
         }
       } catch (err) {

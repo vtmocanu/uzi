@@ -883,6 +883,40 @@ export interface DindMaintenanceReadyACK extends DindMaintenance {
   resampled_epoch: number;
 }
 
+/** Heartbeat response member `hibernation_cache_prune` (PRD #4206): the api's view of the
+ *  worker's hibernation cache prune attempt. Only decoded when the worker advertised
+ *  `hibernation_cache_prune_v1`. */
+export interface HibernationCachePrune {
+  op_id: string;
+  register_nonce: string;
+  phase: "requested" | "started" | "unknown" | "settled";
+  cancel_requested: boolean;
+  reconcile_seq: number;
+}
+
+export type HibernationPruneCommand = "image_prune_dangling" | "builder_prune";
+
+export interface HibernationCachePruneStep {
+  command: HibernationPruneCommand;
+  state: "not_started" | "exited_ok" | "unknown";
+}
+
+/** Heartbeat request member `hibernation_cache_prune_report`; never sent in the same heartbeat as
+ *  a `dind_maintenance_ready_ack`. */
+export interface HibernationCachePruneReport {
+  op_id: string;
+  register_nonce: string;
+  kind: "refused" | "ready" | "result";
+  reason?: "daemon_unreachable" | "custody_stale" | "active_work" | "claim_in_flight" | "gate_not_exclusive" | "cancelled";
+  local_claims?: number;
+  local_executions?: number;
+  custody_clear?: boolean;
+  custody_checked_at?: string;
+  gate_exclusive?: boolean;
+  steps?: HibernationCachePruneStep[];
+  gate_exclusive_throughout?: boolean;
+}
+
 export interface HeartbeatRequest {
   /** Original implemented capabilities and fixed validated local limits, echoed with the
    * original canonical registration nonce once heartbeat_protocol_refresh_v1 is advertised.
@@ -896,6 +930,7 @@ export interface HeartbeatRequest {
   };
   dind_meter?: DindMeter;
   dind_maintenance_ready_ack?: DindMaintenanceReadyACK;
+  hibernation_cache_prune_report?: HibernationCachePruneReport;
   version: string;
   /** Optional container resource sample (PRD #49), same absent-optional convention
    *  as `template` on register: the worker omits it when the collector produced

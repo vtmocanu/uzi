@@ -197,8 +197,9 @@ export const execDocker: DockerExec = (argv, opts) =>
 
 /** Who may hold the claim gate closed; `open(owner)` removes only that owner's key. `retained_ops`
  *  is the operator retained-source channel (issue #1786); `terminal_maintenance` is the model-free
- *  terminal producer's writer exclusion (issue #3031). */
-export type GateOwner = "cache" | "maintenance" | "retained_ops" | "terminal_maintenance";
+ *  terminal producer's writer exclusion (issue #3031); `hibernation` is the hibernation cache prune's
+ *  exclusive hold (PRD #4206). */
+export type GateOwner = "cache" | "maintenance" | "retained_ops" | "terminal_maintenance" | "hibernation";
 
 /**
  * The claim gate the two claim loops and the prune share. A claim loop calls

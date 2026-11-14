@@ -39,6 +39,7 @@ import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { createDindVolumePrune } from "./dind-volume-prune.js";
 import { RetainedSourceServer } from "./ops/retained-source-server.js";
 import { DindMaintenanceController } from "./dind-maintenance.js";
+import { HibernationCachePruneController } from "./hibernation-cache-prune.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
 import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
 import { RunDiskSampler } from "./run-disk.js";
@@ -1024,6 +1025,16 @@ async function mainBody(): Promise<void> {
         threshold: () => client.diskPressureThreshold,
       })
     : undefined;
+  // PRD #4206: the hibernation cache prune shares the claim gate; same enablement as the pressure prune.
+  const hibernationPrune = config.dindPruneEnabled === true && config.dockerWiring.dockerHost !== undefined
+    ? new HibernationCachePruneController({
+        gate: dindGate,
+        dockerHost: config.dockerWiring.dockerHost,
+        heartbeatIntervalMs: config.heartbeatIntervalMs,
+        isIdle: () => worker?.isIdle() ?? false,
+        log,
+      })
+    : undefined;
   // A run's api status for both HOME reclaims. A 404 is the API ANSWERING not-found (the
   // run's row is gone, which is exactly what the oldest stranded HOMEs look like): return
   // undefined so a sweep SKIPS without counting it toward the outage bail; every other error
@@ -1122,6 +1133,8 @@ async function mainBody(): Promise<void> {
     dindGate,
     retainedSource,
     memory,
+    undefined,
+    hibernationPrune,
   );
 
   // Preserve shutdown ordering: revoke memory, initiate run-lane drain, then
