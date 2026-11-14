@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview repos chip</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  .ember { --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+           --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154; --brand: 251 146 60; --warn: 251 191 36; --ok: 52 211 153; --danger: 248 113 113; --accent: 96 165 250; }
+  .dawn  { --bg: 242 244 247; --surface: 255 255 255; --raised: 235 238 243; --edge: 214 219 228; --edge-strong: 174 182 196;
+           --fg: 21 26 34; --muted: 74 85 103; --faint: 95 106 130; --brand: 185 60 11; --warn: 154 74 5; --ok: 4 120 87; --danger: 185 28 28; --accent: 37 99 235; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "IBM Plex Sans", system-ui, sans-serif; background: #111; color: #ddd; }
+  .intro { padding: 20px 24px 8px; }
+  .intro h1 { font-size: 18px; margin: 0 0 6px; color: #eee; }
+  .intro p { margin: 0 0 6px; font-size: 13px; color: #aaa; line-height: 1.5; max-width: 1100px; }
+  .wbtn { font: inherit; font-size: 12px; margin-right: 6px; padding: 3px 9px; border-radius: 6px; border: 1px solid #555; background: #222; color: #ddd; cursor: pointer; }
+  .wbtn.on { border-color: #fb923c; color: #fb923c; }
+  .stage { padding: 18px 24px 40px; background: rgb(var(--bg)); color: rgb(var(--fg)); }
+  .variant-title { font-size: 15px; font-weight: 600; margin: 34px 0 4px; }
+  .variant-title:first-child { margin-top: 6px; }
+  .tag { font-weight: 500; font-size: 11px; padding: 1px 6px; border-radius: 4px; margin-left: 6px; border: 1px solid rgb(var(--edge)); color: rgb(var(--muted)); }
+  .tag.rec { color: rgb(var(--brand)); border-color: rgb(var(--brand) / .5); }
+  .tag.no { color: rgb(var(--danger)); border-color: rgb(var(--danger) / .5); }
+  .variant-note { font-size: 13px; color: rgb(var(--muted)); margin: 0 0 10px; max-width: 1080px; line-height: 1.55; }
+  .variant-note b { color: rgb(var(--fg)); font-weight: 600; }
+  .screen { display: flex; max-width: 1340px; border: 1px solid rgb(var(--edge)); border-radius: 8px; overflow: hidden; }
+  .sidebar { width: 200px; flex: none; background: rgb(var(--surface)); border-right: 1px solid rgb(var(--edge)); padding: 16px; font-size: 13px; color: rgb(var(--muted)); }
+  .sidebar div { padding: 6px 8px; border-radius: 6px; }
+  .sidebar div.on { background: rgb(var(--raised)); color: rgb(var(--fg)); }
+  main { flex: 1; min-width: 0; padding: 24px; }
+  .hdr { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px 24px; margin-bottom: 18px; }
+  .hdr b.h { display: block; font-size: 22px; font-weight: 600; }
+  .hdr .desc { display: block; margin-top: 4px; font-size: 14px; color: rgb(var(--muted)); }
+  .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; position: relative; }
+  .chip, .btn { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px; border-radius: 999px; border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); font-size: 13px; white-space: nowrap; color: rgb(var(--fg)); }
+  .btn { border-radius: 8px; font-weight: 500; }
+  .chip.open { outline: 2px solid rgb(var(--accent) / .5); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: rgb(var(--ok)); display: inline-block; }
+  kbd { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: rgb(var(--muted)); border: 1px solid rgb(var(--edge)); border-radius: 4px; padding: 0 4px; }
+  .back { font-size: 13px; font-weight: 500; color: rgb(var(--brand)); white-space: nowrap; }
+  .card { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: 14px; padding: 16px 20px; margin-bottom: 16px; }
+  .card h4 { margin: 0 0 10px; font-size: 15px; display: flex; justify-content: space-between; align-items: baseline; }
+  .card h4 small { font-weight: 400; color: rgb(var(--muted)); font-size: 13px; }
+  .card h4 a, .card a.more { font-weight: 500; font-size: 13px; color: rgb(var(--brand)); text-decoration: none; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid rgb(var(--edge)); font-size: 14px; }
+  .row .m { color: rgb(var(--muted)); font-size: 13px; }
+  .mono { font-family: "IBM Plex Mono", monospace; font-size: 13px; }
+  .stub { color: rgb(var(--faint)); font-size: 13px; }
+  .grid2 { display: grid; grid-template-columns: minmax(0, 1fr) 22.5rem; gap: 24px; align-items: start; }
+  .healthline { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: rgb(var(--muted)); margin: 0 0 16px; padding: 10px 14px; border: 1px solid rgb(var(--edge)); border-radius: 10px; background: rgb(var(--surface)); }
+  .healthline b { color: rgb(var(--fg)); font-weight: 600; }
+  /* proposal-specific */
+  .new { outline: 2px dashed rgb(var(--brand) / .7); outline-offset: 3px; border-radius: 8px; }
+  .inv { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; margin-top: 8px; font-size: 13px; color: rgb(var(--muted)); }
+  .inv a { color: rgb(var(--fg)); text-decoration: none; border-bottom: 1px dotted rgb(var(--faint)); }
+  .inv a b { font-weight: 600; }
+  .inv .sep { color: rgb(var(--faint)); }
+  .inv .yours { color: rgb(var(--faint)); }
+  .pop { position: absolute; z-index: 5; top: 40px; right: 120px; width: 360px; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: 12px; box-shadow: 0 20px 50px rgb(0 0 0 / .35); padding: 12px 16px; font-size: 13px; }
+  .pop h5 { margin: 0 0 6px; font-size: 14px; display: flex; justify-content: space-between; }
+  .pop h5 small { font-weight: 400; color: rgb(var(--faint)); }
+  .pop .r { display: flex; justify-content: space-between; padding: 6px 0; border-top: 1px solid rgb(var(--edge)); }
+  .pop .r .c { color: rgb(var(--muted)); }
+  .pop .foot { padding-top: 8px; border-top: 1px solid rgb(var(--edge)); display: flex; justify-content: space-between; }
+  .pop .foot a { color: rgb(var(--accent)); text-decoration: none; }
+  .badge { border-radius: 6px; padding: 0 6px; font-weight: 500; font-size: 12px; border: 1px solid; }
+  .b-ok { color: rgb(var(--ok)); border-color: rgb(var(--ok) / .5); background: rgb(var(--ok) / .12); }
+  .b-mut { color: rgb(var(--muted)); border-color: rgb(var(--edge-strong)); }
+  .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: 12px; padding: 14px 16px; }
+  .tile .n { font-size: 26px; font-weight: 600; }
+  .tile .l { font-size: 13px; color: rgb(var(--muted)); }
+  .qs { margin: 28px 0 0; padding: 14px 18px; border: 1px solid rgb(var(--edge)); border-radius: 10px; background: rgb(var(--surface)); font-size: 13px; line-height: 1.6; color: rgb(var(--muted)); max-width: 1080px; }
+  .qs b { color: rgb(var(--fg)); }
+  .qs ol { margin: 6px 0 0; padding-left: 20px; }
+</style>
+</head>
+<body>
+<div class="intro">
+  <h1>Overview (new): admin Repos chip after People (selected design, B2)</h1>
+  <p>Admin-only chip directly after the People chip, same shape and popover. Sample data only; names, counts and repos are not a spec.</p>
+  <p>Theme: <button class="wbtn on" data-theme="ember">Ember (dark)</button><button class="wbtn" data-theme="dawn">Dawn (light)</button></p>
+</div>
+<div class="stage ember" id="stage">
+<!-- ============ B ============ -->
+<style>
+  .pchip { display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border-radius: 999px; border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); font-size: 12px; white-space: nowrap; color: rgb(var(--fg)); }
+  .pchip b { font-weight: 600; }
+  .pchip .of { color: rgb(var(--muted)); }
+  .stack { display: inline-flex; align-items: center; }
+  .stack i { font-style: normal; width: 20px; height: 20px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 9px; font-weight: 600; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); color: rgb(var(--muted)); margin-left: -3px; box-shadow: 0 0 0 1px rgb(var(--surface)); }
+  .stack i:first-child { margin-left: 0; }
+  .stack.sq i { border-radius: 5px; }
+  .rpop { position: absolute; z-index: 5; top: 40px; right: 0; width: 360px; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: 12px; box-shadow: 0 20px 50px rgb(0 0 0 / .35); font-size: 13px; }
+  .rpop .in { padding: 12px; }
+  .rpop h3 { margin: 0; font-size: 14px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+  .rpop .help { width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgb(var(--edge)); display: inline-grid; place-items: center; font-size: 10px; color: rgb(var(--faint)); font-weight: 600; }
+  .glabel { margin: 12px 0 4px; font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: .06em; color: rgb(var(--faint)); }
+  .rli { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 3px 0; }
+  .rli .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: "IBM Plex Mono", monospace; font-size: 12px; }
+  .tpill { border-radius: 12px; padding: 1px 8px; font-size: 12px; }
+  .t-ok { color: rgb(var(--ok)); background: rgb(var(--ok) / .14); }
+  .t-warn { color: rgb(var(--warn)); background: rgb(var(--warn) / .14); }
+  .t-acc { color: rgb(var(--accent)); background: rgb(var(--accent) / .14); }
+  .ago { font-size: 12px; color: rgb(var(--muted)); }
+  .rfoot { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid rgb(var(--edge)); padding: 8px 12px; font-size: 12px; color: rgb(var(--muted)); }
+  .rfoot a { color: rgb(var(--brand)); font-weight: 500; text-decoration: none; }
+  .cmp { display: grid; grid-template-columns: repeat(3, max-content); gap: 10px 18px; align-items: center; font-size: 13px; color: rgb(var(--muted)); margin: 6px 0 14px; }
+</style>
+<div class="variant-title">B (revised). Repos chip right after People, same shape: "3 repos active of 14" <span class="tag rec">selected</span></div>
+<p class="variant-note">Mirrors the People chip: a small stack of square repo badges, <b>bold "N repos active"</b>, muted "of M", and the same 360 px popover (header sentence, ⓘ for what counts, grouped list, footer link). <b>Active</b> = the repo has a listed non-terminal run (the People chip's definition); <b>M</b> = enabled repos plus any active repo. The chip label carries the noun "repos" so it is unambiguous next to People; the aria label says "Repos: 3 active now of 14". Admin only, like People.</p>
+<div class="screen">
+  <div class="sidebar"><div class="on">Overview</div><div>Board</div><div>Runs</div><div>Repos</div><div>Agent templates</div><div>Workers</div><div>Settings</div></div>
+  <main>
+    <div class="hdr">
+      <div>
+        <b class="h">Welcome, Robin</b>
+        <span class="desc">2 decisions are waiting on you. 3 runs are executing for 2 people, 1 queued.</span>
+      </div>
+      <div class="actions">
+        <span class="chip"><span class="dot"></span>Healthy</span>
+        <span class="pchip"><span class="stack"><i>RD</i><i>AK</i><i>+1</i></span><span><b>3 active now</b> <span class="of">of 9</span></span></span>
+        <span class="pchip open new"><span class="stack sq"><i>at</i><i>bi</i><i>+1</i></span><span><b>3 repos active</b> <span class="of">of 14</span></span></span>
+        <span class="btn">Search <kbd>⌘K</kbd></span>
+        <span class="back">Back to the current Overview</span>
+        <div class="rpop">
+          <div class="in">
+            <h3>3 of 14 repos active now <span class="help" title="Active counts repos with a listed non-terminal run: chat, judge and cross-check runs are not listed, and the list stops at 500 runs. Last run includes every run kind.">i</span></h3>
+            <div class="glabel">Active now</div>
+            <div class="rli"><span class="stack sq"><i>at</i></span><span class="nm">vtmocanu/atlas-api</span><span class="tpill t-ok">2 running</span></div>
+            <div class="rli"><span class="stack sq"><i>bi</i></span><span class="nm">team-beta/billing-service</span><span class="tpill t-warn">awaiting approval</span></div>
+            <div class="rli"><span class="stack sq"><i>we</i></span><span class="nm">team-beta/web-portal</span><span class="tpill t-acc">queued</span></div>
+            <div class="glabel">Run within 7 days, nothing active</div>
+            <div class="rli"><span class="stack sq"><i>in</i></span><span class="nm">vtmocanu/infra-charts</span><span class="ago">2 days ago</span></div>
+            <div class="rli"><span class="stack sq"><i>do</i></span><span class="nm">vtmocanu/docs-site</span><span class="ago">5 days ago</span></div>
+            <div class="glabel">Idle</div>
+            <div class="ago">7 last ran 9 to 40 days ago, 2 never ran</div>
+          </div>
+          <div class="rfoot"><span></span><a href="#">Your repos</a></div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top: 300px"><h4>Needs a decision <small>2</small></h4><div class="stub">(unchanged)</div></div>
+  </main>
+</div>
+
+</div>
+<script>
+  document.querySelectorAll('.wbtn').forEach(function (b) {
+    b.addEventListener('click', function () {
+      document.querySelectorAll('.wbtn').forEach(function (x) { x.classList.remove('on'); });
+      b.classList.add('on');
+      document.getElementById('stage').className = 'stage ' + b.dataset.theme;
+    });
+  });
+</script>
+</body>
+</html>
