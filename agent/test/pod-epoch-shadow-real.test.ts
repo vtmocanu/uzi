@@ -520,3 +520,63 @@ test("#3851 the verdict and candidates do not depend on the inspection's diagnos
   assert.equal(plain.result.verdict, "eligible");
   assert.equal(plain.result.would_delete, 2);
 });
+
+// ---- #4265 m1: diagnostic-only retained work counters ----
+test("#4265 the shadow pass reports real gather and tree-walk work per phase", async () => {
+  seedThree();
+  const { result } = await shadowPass();
+  const work = result.inspection_work;
+  for (const phase of [work.census, work.shadow, work.deletion]) {
+    for (const value of Object.values(phase)) assert.ok(Number.isFinite(value) && value >= 0);
+  }
+  assert.ok(work.census.gathers >= 1, JSON.stringify(work));
+  assert.ok(work.shadow.gathers >= 1, JSON.stringify(work));
+  assert.ok(work.shadow.tree_walks >= 1, JSON.stringify(work));
+  assert.ok(work.shadow.tree_entries > 0, JSON.stringify(work));
+  assert.equal(work.deletion.gathers, 0, "the deletion phase did not run");
+});
+
+test("#4265 two passes on one GitCache keep independent counters", async () => {
+  seedThree();
+  const first = (await shadowPass()).result.inspection_work;
+  const second = (await shadowPass()).result.inspection_work;
+  assert.notEqual(first.census, second.census);
+  assert.notEqual(first.shadow, second.shadow);
+  assert.equal(second.census.gathers, first.census.gathers);
+  assert.equal(second.shadow.gathers, first.shadow.gathers);
+  assert.equal(second.shadow.tree_walks, first.shadow.tree_walks);
+  assert.equal(second.shadow.tree_entries, first.shadow.tree_entries);
+});
+
+test("#4265 nothing is counted without a sink and a sink only counts its own call", async () => {
+  seedThree();
+  let captured: InspectOptions | undefined;
+  await shadowPass({ inspect: (opts, real) => { captured ??= opts; return real(opts); } });
+  assert.ok(captured);
+  const zero = () => ({ gathers: 0, gather_ms: 0, tree_walks: 0, tree_entries: 0, tree_ms: 0 });
+  const sink = zero();
+  await git.inspectRetainedSources({ ...captured, work: undefined });
+  assert.deepEqual(sink, zero());
+  await git.inspectRetainedSources({ ...captured, work: sink });
+  assert.ok(sink.gathers >= 1, JSON.stringify(sink));
+  const counted = { ...sink, gather_ms: 0, tree_ms: 0 };
+  const settled = { ...sink };
+  await Promise.all([
+    git.inspectRetainedSources({ ...captured, work: undefined }),
+    git.inspectRetainedSources({ ...captured, work: undefined }),
+  ]);
+  assert.deepEqual(sink, settled, "calls without a sink do not touch an earlier sink");
+  assert.equal(counted.gathers, sink.gathers);
+});
+
+test("#4265 the verdict and candidates do not depend on the work counters", async () => {
+  seedThree();
+  const plain = await shadowPass();
+  const stripped = await shadowPass({ inspect: (opts, real) => real({ ...opts, work: undefined }) });
+  assert.equal(stripped.result.inspection_work.shadow.gathers, 0);
+  assert.equal(stripped.result.verdict, plain.result.verdict);
+  assert.equal(stripped.result.reason, plain.result.reason);
+  assert.deepEqual(stripped.result.list, plain.result.list);
+  assert.equal(stripped.result.would_delete, plain.result.would_delete);
+  assert.equal(stripped.result.kept, plain.result.kept);
+});

@@ -12,7 +12,8 @@ import type { AuthorityRuntime } from "./authority-runtime.js";
 import { isRunOwnershipLost } from "./client.js";
 import { parsePodEpochEvidence, assertPodEpochEvidenceBinding } from "./pod-epoch-evidence.js";
 import { openPodEpochDaemonBarrier, PodEpochDaemonError, type PodEpochDaemonGuard } from "./pod-epoch-daemon.js";
-import type { EpochScratchDiscardInput, GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector } from "./git.js";
+import type { EpochScratchDiscardInput, GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector, RetainedWorkCounters } from "./git.js";
+import { newRetainedWorkCounters } from "./git.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js";
 import { censusScratchRoot } from "./rmtree.js";
 import {
@@ -170,6 +171,9 @@ interface Verdict {
   evidence_version: 1 | 2 | null;
   observations?: { kernel: string };
   evidence_wait_ms: number;
+  /** Diagnostic only (no decision reads it): retained gather and tree-walk work per phase. Stays zero
+   *  when the git facade does not honour the `work` option. */
+  inspection_work: { census: RetainedWorkCounters; shadow: RetainedWorkCounters; deletion: RetainedWorkCounters };
   pass_ms: number;
   settlement_reserve_ms: number;
   /** M1b deletion counters (all zero while the phase does not run). Sources positively removed, and their
@@ -551,7 +555,9 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
   let settlementDeadline = Infinity;
   let guard: PodEpochDaemonGuard | undefined;
   let detachVeto = () => {};
+  const inspectionWork = { census: newRetainedWorkCounters(), shadow: newRetainedWorkCounters(), deletion: newRetainedWorkCounters() };
   const result: Verdict = {
+    inspection_work: inspectionWork,
     partial_causes: {}, verdict: "deferred", reason: "not_evaluated", examined: 0, would_delete: 0, would_delete_bytes: 0,
     would_settle: 0, by_basis: { discard: 0, strict_plain: 0 }, kept: 0, journal_extra_fields: 0,
     authority: { result: "unproven", reason: "not_evaluated" }, evidence_version: null,
@@ -718,7 +724,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     if (guard.signal.aborted) veto();
     check();
     const census = await owned(() => options.git.discoverEpochRetainedSources({
-      signal: controller.signal, deadline: hardPass - 5000, maxPhysicalPaths: 200,
+      signal: controller.signal, deadline: hardPass - 5000, maxPhysicalPaths: 200, work: inspectionWork.census,
     }), hardPass);
     check();
     result.inventory_complete = census.inventoryComplete && census.unreadable === 0;
@@ -771,7 +777,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       }
       const expected = new Set(group.paths);
       const inspected = await owned(() => options.git.inspectRetainedSources({
-        epoch: true, maxDescriptors: 200, maxPhysicalPaths: expected.size,
+        epoch: true, maxDescriptors: 200, maxPhysicalPaths: expected.size, work: inspectionWork.shadow,
         barePath: group.barePath, selector: group.selector, holds, lifecycle,
         isLivePath: () => false, signal: controller.signal, deadline: hardPass - 5000,
         budgetMs: Math.max(0, hardPass - 5000 - now()), now,
@@ -935,6 +941,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           const inspected = await owned(() => options.git.inspectRetainedSources({
             epoch: true, maxDescriptors: 200, maxPhysicalPaths: admit.groupSize, barePath: admit.barePath,
             selector: admit.selector, holds: first.holds, lifecycle: first.lifecycle, isLivePath: () => false,
+            work: inspectionWork.deletion,
             signal: controller.signal, deadline: hardPass - 5000, budgetMs: Math.max(0, hardPass - 5000 - now()), now,
             beforeTree: path => { check(); entry(); if (path !== admit.clonePath) throw new Refusal("path_set_changed"); },
           }), hardPass, true);

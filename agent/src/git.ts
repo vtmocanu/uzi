@@ -2681,7 +2681,18 @@ export interface EpochRetainedLimits {
   maxObjectStoreBytes?: number;
 }
 
+/** Diagnostic-only counters of retained-source work; no decision may read them. ms values are rounded per call. */
+export type RetainedWorkCounters = {
+  gathers: number; gather_ms: number; tree_walks: number; tree_entries: number; tree_ms: number;
+};
+
+export function newRetainedWorkCounters(): RetainedWorkCounters {
+  return { gathers: 0, gather_ms: 0, tree_walks: 0, tree_entries: 0, tree_ms: 0 };
+}
+
 export interface EpochRetainedDiscoveryOptions {
+  /** Optional diagnostic sink for gather and tree-walk work performed by this call. */
+  work?: RetainedWorkCounters;
   signal?: AbortSignal;
   /** Absolute wall-clock deadline. */
   deadline?: number;
@@ -2701,6 +2712,8 @@ export interface EpochRetainedDiscoveryResult {
 }
 
 export interface RetainedInspectOptions {
+  /** Optional diagnostic sink for gather and tree-walk work performed by this call. */
+  work?: RetainedWorkCounters;
   signal?: AbortSignal;
   /** Absolute wall-clock deadline, also covering measurement and queued locks. */
   deadline?: number;
@@ -3880,6 +3893,9 @@ export class GitCache {
   }>();
 
   // Each public invocation owns its sidecars, including concurrent calls on this cache.
+  // Diagnostic-only work sink for the active public retained call (undefined when the caller passed none).
+  private readonly retainedWorkScope = new AsyncLocalStorage<RetainedWorkCounters | undefined>();
+
   private readonly retainedCauseScope = new AsyncLocalStorage<{
     prefix: "census" | "inspection"; errors: WeakMap<object, PartialCauses>; counted: Set<unknown>;
   }>();
@@ -4645,8 +4661,8 @@ export class GitCache {
    * One streaming pass, no retries: a failed bare or exhausted cap stops sibling discovery and
    * makes every reported count a lower bound. All started filesystem work is awaited. */
   async discoverEpochRetainedSources(opts: EpochRetainedDiscoveryOptions = {}): Promise<EpochRetainedDiscoveryResult> {
-    return this.retainedCauseScope.run({ prefix: "census", errors: new WeakMap(), counted: new Set() },
-      () => this.discoverEpochRetainedSourcesScoped(opts));
+    return this.retainedWorkScope.run(opts.work, () => this.retainedCauseScope.run({ prefix: "census", errors: new WeakMap(), counted: new Set() },
+      () => this.discoverEpochRetainedSourcesScoped(opts)));
   }
 
   private async discoverEpochRetainedSourcesScoped(opts: EpochRetainedDiscoveryOptions): Promise<EpochRetainedDiscoveryResult> {
@@ -14067,6 +14083,18 @@ export class GitCache {
    * descriptors. Pure reads. Unreadable evidence is reported as `problems`, never skipped.
    */
   private async gatherRetainedUnderLock(barePath: string): Promise<GatheredBare> {
+    const sink = this.retainedWorkScope.getStore();
+    if (!sink) return this.gatherRetainedUnderLockUncounted(barePath);
+    const started = performance.now();
+    sink.gathers += 1;
+    try {
+      return await this.gatherRetainedUnderLockUncounted(barePath);
+    } finally {
+      sink.gather_ms += Math.round(performance.now() - started);
+    }
+  }
+
+  private async gatherRetainedUnderLockUncounted(barePath: string): Promise<GatheredBare> {
     await this.assertRecoveryBare(barePath);
     const list = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
     const runnerRoot = path.resolve(this.runnerRoot);
@@ -14643,6 +14671,23 @@ export class GitCache {
     root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
     skip?: (rel: string) => boolean, partialOnIoError = false,
   ): Promise<{ bytes: number; entries: number; complete: boolean; local?: MeasurementShortfall }> {
+    const sink = this.retainedWorkScope.getStore();
+    if (!sink) return this.measureAllocatedWalk(root, now, deadline, caps, causes, skip, partialOnIoError);
+    const started = performance.now();
+    sink.tree_walks += 1;
+    try {
+      const measured = await this.measureAllocatedWalk(root, now, deadline, caps, causes, skip, partialOnIoError);
+      sink.tree_entries += measured.entries;
+      return measured;
+    } finally {
+      sink.tree_ms += Math.round(performance.now() - started);
+    }
+  }
+
+  private async measureAllocatedWalk(
+    root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
+    skip?: (rel: string) => boolean, partialOnIoError = false,
+  ): Promise<{ bytes: number; entries: number; complete: boolean; local?: MeasurementShortfall }> {
     const filesystem = async <T>(action: () => Promise<T>): Promise<T> => {
       try { return await action(); }
       catch (error) { countPartialCause(causes, "measurement_filesystem_error"); throw error; }
@@ -14784,8 +14829,8 @@ export class GitCache {
    */
   async inspectRetainedSources(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
     const run = () => this.inspectRetainedSourcesScoped(opts);
-    return this.retainedCauseScope.run({ prefix: "inspection", errors: new WeakMap(), counted: new Set() },
-      () => opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run());
+    return this.retainedWorkScope.run(opts.work, () => this.retainedCauseScope.run({ prefix: "inspection", errors: new WeakMap(), counted: new Set() },
+      () => opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run()));
   }
 
   private async inspectRetainedSourcesScoped(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
