@@ -275,9 +275,10 @@ daemon error response is not evidence. **Accepted residual:** if neither arrives
 the fence and the blocker stay. There is no acknowledge or override route, and the
 worker cannot be deleted (409) while an attempt is unsettled.
 
-If a cleaning worker's Deployment or pod disappears before the controller observed
-it terminated, the fence holds indefinitely: pod absence is never evidence (the same
-residual as a `ContainerStatusUnknown` pod).
+If a cleaning worker's pod disappears before the controller observed it terminated,
+the fence holds indefinitely: pod absence is never evidence (the same residual as a
+`ContainerStatusUnknown` pod). A deleted Deployment alone does not: while the stopped
+pod is still listed, the controller reports it and the attempt settles.
 
 **Preparing deadline.** The 10 minutes are counted from when the cleanup settles
 (or from the request, if later), and do not run while an attempt is started or
@@ -318,9 +319,12 @@ the validate migration that follows it):
 1. Turn `worker_hibernation_enabled` off.
 2. Wait for every cleanup attempt to settle, not only for the workers to wake: an
    unknown attempt keeps its worker fenced and blocks this step until it clears.
-3. Run goose down past both migrations. The validate migration's Down is a no-op;
+3. Stop the api. It must stay up until step 2 completes, because it receives the
+   settlement reports, but it queries the columns the cache-cleanup migration's Down
+   drops, so it cannot keep serving during the rollback.
+4. Run goose down past both migrations. The validate migration's Down is a no-op;
    the cache-cleanup migration's Down refuses while any attempt is unsettled.
-4. Start the older image.
+5. Start the older image.
 
 Starting an older image outside this procedure is unsupported: it does not know the
 attempt, and could scale a worker down in the middle of a prune. CHECK constraints
