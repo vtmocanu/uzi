@@ -14,12 +14,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #3250 M1: migrations 00442 (effort, model_source, effort_source, the two NOT VALID CHECKs and
-// the schedule_pin backfill) and 00443 (VALIDATE both). Skipped unless UZI_TEST_DATABASE_URL points
+// PRD #3250 M1: migrations 00454 (effort, model_source, effort_source, the two NOT VALID CHECKs and
+// the schedule_pin backfill) and 00455 (VALIDATE both). Skipped unless UZI_TEST_DATABASE_URL points
 // at a throwaway Postgres.
 func TestRunStartOptionsMigrationLifecycleLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "run_start_options_migration_")
-	if err := store.MigrateTo(ctx, dsn, 441); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 453); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -102,7 +102,7 @@ func TestRunStartOptionsMigrationLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("seeded forge origins = %d (%v), want 1", forgeOrigins, err)
 	}
 
-	if err := store.MigrateTo(ctx, dsn, 442); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 454); err != nil {
 		t.Fatal(err)
 	}
 	// Up changes only the three new columns: every pre-existing column of every row, including the
@@ -177,30 +177,30 @@ func TestRunStartOptionsMigrationLifecycleLiveDB(t *testing.T) {
 	}
 	got := validated()
 	if len(got) != 2 || got["runs_model_source_check"] || got["runs_effort_source_check"] {
-		t.Fatalf("after 00442 constraints = %v, want both present and NOT VALID", got)
+		t.Fatalf("after 00454 constraints = %v, want both present and NOT VALID", got)
 	}
 	refused("model_source", "bogus", "runs_model_source_check")
 	refused("effort_source", "schedule_pin", "runs_effort_source_check")
 
-	if err := store.MigrateTo(ctx, dsn, 443); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 455); err != nil {
 		t.Fatal(err)
 	}
 	got = validated()
 	if len(got) != 2 || !got["runs_model_source_check"] || !got["runs_effort_source_check"] {
-		t.Fatalf("after 00443 constraints = %v, want both validated", got)
+		t.Fatalf("after 00455 constraints = %v, want both validated", got)
 	}
 	refused("model_source", "bogus", "runs_model_source_check")
 	refused("effort_source", "schedule_pin", "runs_effort_source_check")
 
-	// 00443's Down is a no-op: the validated constraints stay.
-	if err := store.MigrateDownTo(ctx, dsn, 442); err != nil {
+	// 00455's Down is a no-op: the validated constraints stay.
+	if err := store.MigrateDownTo(ctx, dsn, 454); err != nil {
 		t.Fatal(err)
 	}
 	if got = validated(); !got["runs_model_source_check"] || !got["runs_effort_source_check"] {
-		t.Fatalf("00443 Down changed the constraints: %v", got)
+		t.Fatalf("00455 Down changed the constraints: %v", got)
 	}
-	// 00442's Down drops the constraints and the three columns cleanly.
-	if err := store.MigrateDownTo(ctx, dsn, 441); err != nil {
+	// 00454's Down drops the constraints and the three columns cleanly.
+	if err := store.MigrateDownTo(ctx, dsn, 453); err != nil {
 		t.Fatal(err)
 	}
 	if got = validated(); len(got) != 0 {
