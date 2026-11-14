@@ -605,10 +605,23 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// without failing the heartbeat's liveness. The worker sends it only while latched
 		// and only after the register response advertised `worker_residue_quarantine`.
 		ResidueQuarantine json.RawMessage `json:"residue_quarantine"`
+		// HibernationExclusion (PRD #4208 M1) is the worker's report that it still holds, or
+		// has lost, the writer exclusion its volume inventory was taken under. Decoded strictly
+		// and rejected with a 400 when malformed, never dropped: a dropped held=false would hide
+		// the loss of the very exclusion the inventory depends on.
+		HibernationExclusion *workersvc.HibernationExclusionReport `json:"hibernation_exclusion"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	var exclusion *workersvc.HibernationExclusion
+	if req.HibernationExclusion != nil {
+		var perr error
+		if exclusion, perr = req.HibernationExclusion.Parse(); perr != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
 	}
 	// Second step: validate + clamp the isolated stats (Decision 5). A malformed or
 	// invalid sample drops to nil (columns written NULL) and the heartbeat still 200s.
@@ -701,6 +714,22 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {
 		response["dind_maintenance"] = maintenance
+	}
+	// PRD #4208 M1: the hibernation half runs in its own transaction that locks the worker row
+	// first (Service.HibernationHeartbeat), so an exclusion report is always recorded under the
+	// worker lock, never on the lockless liveness write above. Only a preparing worker with the
+	// capability is asked for an inventory; a worker that reports an exclusion is always heard.
+	if exclusion != nil || (updated.HibernationState == "preparing" && slices.Contains(updated.ProtocolCapabilities, capability.HibernationInventoryV1)) {
+		member, herr := h.wsvc.HibernationHeartbeat(r.Context(), wkr.ID, exclusion)
+		switch {
+		case errors.Is(herr, workersvc.ErrHibernationUnavailable):
+		case herr != nil:
+			slog.Error("worker heartbeat: hibernation inventory", "worker_id", wkr.ID.String(), "error", herr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		case member != nil:
+			response["hibernation_inventory"] = member
+		}
 	}
 	httpx.JSON(w, http.StatusOK, response)
 }

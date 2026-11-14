@@ -1222,6 +1222,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Use(laneWorkerRouteGuard)
 		r.Post("/register", h.WorkerRegister)
 		r.Post("/heartbeat", h.WorkerHeartbeat)
+		// PRD #4208 M1: the volume inventory a preparing worker takes before scale-down, and its
+		// last exclusion report. Identity is the bearer worker; neither is lane-allowlisted.
+		r.Post("/hibernation/inventory", h.WorkerHibernationInventory)
+		r.Post("/hibernation/exclusion-final", h.WorkerHibernationExclusionFinal)
 		r.Post("/runs/claim", h.WorkerClaim)
 		r.Post("/runs/{id}/messages", h.WorkerRunMessages)
 		// Issue #2014: per-message usage for the estimated tail of an interrupted Claude session.

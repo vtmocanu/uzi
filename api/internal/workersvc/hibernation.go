@@ -84,6 +84,23 @@ type HibernationTransition struct {
 	ResourceVersion string
 	PodUID          string
 	Reason          string
+	// The PRD #4208 M1 observation fields mirror hostedsvc.HibernationTransition: the slices are
+	// pointers so a known-empty set ([]) stays distinct from an unobserved one (absent).
+	PVCs                 []HibernationPVC
+	PodUIDs              *[]string
+	PVCUserPods          *[]string
+	DeploymentGeneration *int64
+	DeploymentReplicas   *int32
+	FenceGeneration      *int64
+}
+
+// HibernationPVC mirrors hostedsvc.HibernationPVC.
+type HibernationPVC struct {
+	Role               string
+	Name               string
+	UID                string
+	StorageClass       string
+	ClassReclaimPolicy string
 }
 
 // Transition values, equal to hostedsvc.Transition*.
@@ -92,6 +109,8 @@ const (
 	TransitionScalingDown = "scaling_down"
 	TransitionScaledDown  = "scaled_down"
 	TransitionReady       = "ready"
+	TransitionObserved    = "observed"
+	TransitionHeld        = "held"
 )
 
 // HibernationActor identifies the admin behind an audited action.
@@ -330,11 +349,19 @@ func hibernationAdvertisementFresh(adv store.GetControllerHibernationAdvertiseme
 		!adv.HibernationAdvertisedAt.Valid {
 		return false
 	}
+	return now.Sub(adv.HibernationAdvertisedAt.Time) < 2*hibernationPollInterval(adv)
+}
+
+// hibernationPollInterval is the controller's advertised poll interval clamped to
+// [hibernationPollClampMin, hibernationPollClampMax] seconds, the clamp the advertisement
+// freshness window and the inventory observation-gap bound share. An absent interval reads as
+// the maximum.
+func hibernationPollInterval(adv store.GetControllerHibernationAdvertisementRow) time.Duration {
 	poll := int64(hibernationPollClampMax)
 	if adv.PollIntervalSeconds.Valid {
 		poll = min(max(int64(adv.PollIntervalSeconds.Int32), hibernationPollClampMin), hibernationPollClampMax)
 	}
-	return now.Sub(adv.HibernationAdvertisedAt.Time) < 2*time.Duration(poll)*time.Second
+	return time.Duration(poll) * time.Second
 }
 
 // WakeWorker moves any non-none worker to waking. actor is nil for a system wake (no
@@ -382,7 +409,7 @@ func validateHibernationTransition(t *HibernationTransition) (opID uuid.UUID, po
 		return uuid.Nil, podUID, bad("op_id must be a uuid")
 	}
 	switch t.Transition {
-	case TransitionRefused, TransitionScalingDown, TransitionScaledDown, TransitionReady:
+	case TransitionRefused, TransitionScalingDown, TransitionScaledDown, TransitionReady, TransitionObserved, TransitionHeld:
 	case "":
 		return uuid.Nil, podUID, bad("transition is required")
 	default:
@@ -397,8 +424,8 @@ func validateHibernationTransition(t *HibernationTransition) (opID uuid.UUID, po
 	if len(t.ResourceVersion) > hibernationResourceVersionMax {
 		return uuid.Nil, podUID, bad("resource_version must be at most 64 bytes")
 	}
-	needsRV := t.Transition != TransitionScaledDown
-	needsPod := t.Transition == TransitionScalingDown || t.Transition == TransitionReady
+	needsRV := t.Transition != TransitionScaledDown && t.Transition != TransitionHeld
+	needsPod := t.Transition == TransitionScalingDown || t.Transition == TransitionReady || t.Transition == TransitionObserved
 	if needsRV && t.ResourceVersion == "" {
 		return uuid.Nil, podUID, bad("resource_version is required")
 	}
@@ -411,6 +438,9 @@ func validateHibernationTransition(t *HibernationTransition) (opID uuid.UUID, po
 			return uuid.Nil, podUID, bad("pod_uid must be a uuid")
 		}
 		podUID = hibernationUUID(p)
+	}
+	if err := validateObservationFields(t); err != nil {
+		return uuid.Nil, podUID, err
 	}
 	if t.Transition == TransitionRefused {
 		var tooLong bool
@@ -477,6 +507,15 @@ func (s *Service) ApplyTransition(ctx context.Context, workerID uuid.UUID, t Hib
 			default:
 				return ErrHibernationConflict
 			}
+		case TransitionObserved:
+			// The pre-mutation identity report: only before any scale-down was recorded.
+			if w.HibernationState != "preparing" || w.HibernationScalingDownAt.Valid {
+				return ErrHibernationConflict
+			}
+		case TransitionHeld:
+			if w.HibernationState != "hibernated" {
+				return ErrHibernationConflict
+			}
 		case TransitionReady:
 			switch {
 			case w.HibernationState == "waking":
@@ -490,6 +529,11 @@ func (s *Service) ApplyTransition(ctx context.Context, workerID uuid.UUID, t Hib
 			default:
 				return ErrHibernationConflict
 			}
+		}
+		// The transition is legal; record what it proves about the volume inventory, under the
+		// same row lock. A worker without an inventory row for this op behaves exactly as before.
+		if err := s.inventoryTransition(ctx, q, w, t, podUID, now); err != nil {
+			return err
 		}
 		if !changed {
 			out = w
@@ -636,6 +680,16 @@ func (s *Service) HibernationSettlePass(ctx context.Context) (int64, error) {
 			_, err := writeHibernation(ctx, q, w)
 			return err == nil, err
 		})
+
+	// 4. Inventory timeout: an awaiting inventory that never arrived. The list is only a
+	// candidate set; the locked row is re-read, so an observation that was replaced or answered
+	// in the meantime is left alone.
+	cutoffInv := pgconv.Time(now.Add(-HibernationInventoryTimeout))
+	each(list(func(q *store.Queries) ([]uuid.UUID, error) {
+		return q.ListAwaitingHibernationInventoriesOlderThan(ctx, cutoffInv)
+	}), func(q *store.Queries, w store.Worker) (bool, error) {
+		return s.timeOutInventory(ctx, q, w, now)
+	})
 
 	if len(errs) > 0 {
 		slog.Warn("worker hibernation settle pass", "errors", len(errs), "first", errs[0])

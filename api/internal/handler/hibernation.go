@@ -47,9 +47,17 @@ func (h *Handler) ControllerHibernation(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	pvcs := make([]workersvc.HibernationPVC, 0, len(body.PVCs))
+	for _, p := range body.PVCs {
+		pvcs = append(pvcs, workersvc.HibernationPVC{Role: p.Role, Name: p.Name, UID: p.UID,
+			StorageClass: p.StorageClass, ClassReclaimPolicy: p.ClassReclaimPolicy})
+	}
 	row, err := h.wsvc.ApplyTransition(r.Context(), id, workersvc.HibernationTransition{
 		OpID: body.OpID, Transition: body.Transition, DeploymentUID: body.DeploymentUID,
 		ResourceVersion: body.ResourceVersion, PodUID: body.PodUID, Reason: body.Reason,
+		PVCs: pvcs, PodUIDs: body.PodUIDs, PVCUserPods: body.PVCUserPods,
+		DeploymentGeneration: body.DeploymentGeneration, DeploymentReplicas: body.DeploymentReplicas,
+		FenceGeneration: body.FenceGeneration,
 	})
 	var verr *workersvc.HibernationValidationError
 	switch {

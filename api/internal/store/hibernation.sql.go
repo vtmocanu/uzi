@@ -199,6 +199,60 @@ func (q *Queries) GetHibernationInventoryGateForOp(ctx context.Context, arg GetH
 	return i, err
 }
 
+const getHibernationInventoryStateForWorker = `-- name: GetHibernationInventoryStateForWorker :one
+SELECT worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs,
+       register_nonce, status, invalidated_reason, scaling_down_pod_uid, fence_generation,
+       scaled_down_at, last_held_at, digest, fingerprint
+FROM worker_hibernation_inventories
+WHERE worker_id = $1
+`
+
+type GetHibernationInventoryStateForWorkerRow struct {
+	WorkerID                  uuid.UUID          `json:"worker_id"`
+	OpID                      uuid.UUID          `json:"op_id"`
+	ObservedAt                pgtype.Timestamptz `json:"observed_at"`
+	DeploymentUid             string             `json:"deployment_uid"`
+	DeploymentResourceVersion string             `json:"deployment_resource_version"`
+	PodUid                    uuid.UUID          `json:"pod_uid"`
+	Pvcs                      []byte             `json:"pvcs"`
+	RegisterNonce             pgtype.Text        `json:"register_nonce"`
+	Status                    string             `json:"status"`
+	InvalidatedReason         pgtype.Text        `json:"invalidated_reason"`
+	ScalingDownPodUid         pgtype.UUID        `json:"scaling_down_pod_uid"`
+	FenceGeneration           pgtype.Int8        `json:"fence_generation"`
+	ScaledDownAt              pgtype.Timestamptz `json:"scaled_down_at"`
+	LastHeldAt                pgtype.Timestamptz `json:"last_held_at"`
+	Digest                    pgtype.Text        `json:"digest"`
+	Fingerprint               pgtype.Text        `json:"fingerprint"`
+}
+
+// Everything the transition, register, accept and settle paths decide on, entries and receipt_keys
+// excluded so a locked transaction never drags a megabyte it does not need. Read by worker (the
+// primary key); the caller compares op_id with the worker's current hibernation_op_id.
+func (q *Queries) GetHibernationInventoryStateForWorker(ctx context.Context, workerID uuid.UUID) (GetHibernationInventoryStateForWorkerRow, error) {
+	row := q.db.QueryRow(ctx, getHibernationInventoryStateForWorker, workerID)
+	var i GetHibernationInventoryStateForWorkerRow
+	err := row.Scan(
+		&i.WorkerID,
+		&i.OpID,
+		&i.ObservedAt,
+		&i.DeploymentUid,
+		&i.DeploymentResourceVersion,
+		&i.PodUid,
+		&i.Pvcs,
+		&i.RegisterNonce,
+		&i.Status,
+		&i.InvalidatedReason,
+		&i.ScalingDownPodUid,
+		&i.FenceGeneration,
+		&i.ScaledDownAt,
+		&i.LastHeldAt,
+		&i.Digest,
+		&i.Fingerprint,
+	)
+	return i, err
+}
+
 const getHibernationWake = `-- name: GetHibernationWake :one
 SELECT run_id, worker_id, first_woken_at FROM hibernation_wakes WHERE run_id = $1
 `

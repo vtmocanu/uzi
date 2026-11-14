@@ -347,6 +347,16 @@ SELECT status, observed_at, invalidated_reason, pod_uid, register_nonce,
 FROM worker_hibernation_inventories
 WHERE worker_id = @worker_id AND op_id = @op_id;
 
+-- name: GetHibernationInventoryStateForWorker :one
+-- Everything the transition, register, accept and settle paths decide on, entries and receipt_keys
+-- excluded so a locked transaction never drags a megabyte it does not need. Read by worker (the
+-- primary key); the caller compares op_id with the worker's current hibernation_op_id.
+SELECT worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs,
+       register_nonce, status, invalidated_reason, scaling_down_pod_uid, fence_generation,
+       scaled_down_at, last_held_at, digest, fingerprint
+FROM worker_hibernation_inventories
+WHERE worker_id = @worker_id;
+
 -- name: AcceptHibernationInventory :execrows
 -- Bind the worker's echoed inventory. Zero rows means refused: the row is not awaiting, was
 -- invalidated, or belongs to another op or pod.

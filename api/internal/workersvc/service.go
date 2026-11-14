@@ -2717,6 +2717,13 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 			return store.Worker{}, "", err
 		}
 	}
+	// PRD #4208 M1: a Register is also evidence against a bound volume inventory (another pod, or
+	// the same pod's process restarting), under the same row lock.
+	if prior.HibernationState == "preparing" || prior.HibernationState == "hibernated" {
+		if err := s.inventoryOnRegister(ctx, qtx, store.Worker(row), registeredPodUID); err != nil {
+			return store.Worker{}, "", err
+		}
+	}
 	// Validate before any snapshot/FK write and capture the conservative union,
 	// including orphan phases even when there is no valid active snapshot.
 	entries, snapshotValid, err := s.validatedActiveSnapshot(store.Worker(row), snapshot, snapshotModeRegister)
