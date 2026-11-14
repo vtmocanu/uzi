@@ -20516,19 +20516,20 @@ export class RunRunner {
       if (state.overflow) return defer("overflow");
       const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip,
         { unpublishedOnly: true, scanScope: scopes.scanScope });
+      // Record ONCE, straight after a trusted result and before any later await or stop return. A pending
+      // trigger is not a publication hold: checkpointRemediationHold reads only the recorded flagged commits,
+      // so a stop (or a deferring/clearing exit below) must not drop a trusted finding. This is negative
+      // knowledge only: no turn, no attempt, no trigger change, and none of known/blocked/everKnown/cleanTip.
+      if (scanned.trusted) this.recordFlaggedCommits(state, scanned.findings, runLog);
       if (stop.aborted) return defer("aborted");
       if (!scanned.trusted) return scanned.publishedOnly ? clear() : defer(scanned.why);
+      // A fresh finding the bounded list could not hold fails closed (overflow holds publication) and defers.
+      if (state.overflow) return defer("overflow");
       const { range, floorCandidates } = scanned;
       const reach = await this.classifyFlaggedReachability(state, barePath, cloneTip);
       if (stop.aborted) return defer("aborted");
-      // A pending trigger is not a publication hold: checkpointRemediationHold consults only the recorded flagged
-      // commits. So every exit below that keeps or clears the trigger without remediating first records the
-      // fresh trusted findings (bounded, fail-closed on overflow). Recording gives no turn, spends no attempt and
-      // sets none of known/blocked/everKnown/cleanTip; unknown ancestry still authorizes no guidance.
-      if (reach.includes("unknown")) {
-        this.recordFlaggedCommits(state, scanned.findings, runLog);
-        return defer("flagged_ancestry_unknown");
-      }
+      // Unknown retained ancestry authorizes no guidance and the trigger stays; the fresh findings were recorded above.
+      if (reach.includes("unknown")) return defer("flagged_ancestry_unknown");
       const retained = state.flaggedFindings ?? [];
       // Every fresh finding is kept as is (a commit adding two secret files yields two); only
       // ancestor-reachable retained findings whose commit the fresh scan did not report are appended.
@@ -20548,30 +20549,11 @@ export class RunRunner {
       if (findings.length === 0) return clear();
       const verdict = await this.classifyFindingFloors(flight, barePath, findings, floorCandidates);
       if (stop.aborted) return defer("aborted");
-      if (verdict === "unknown" || verdict === "at_floor") {
-        // at_floor includes a local-only bridge floor, which is not published: its commit must stay held.
-        this.recordFlaggedCommits(state, scanned.findings, runLog);
-        return verdict === "unknown" ? defer("floor_ancestry_unknown") : clear();
-      }
-      if (state.attempts >= SECRET_REMEDIATION_MAX_ATTEMPTS) {
-        // No turn is left, but the trusted fresh findings still name commits the earlier record may not
-        // (a rewrite can replace a flagged commit with a divergent one that still carries the secret).
-        // Record them so checkpointRemediationHold keeps holding unscanned publications; spend nothing.
-        this.recordFlaggedCommits(state, findings, runLog);
-        return clear();
-      }
-      const cap = this.checkpointTestHooks?.flaggedCommitsCap ?? FLAGGED_COMMITS_CAP;
-      const known = new Set(state.flaggedCommits ?? []);
-      const fresh = findings.filter((f) => typeof f.commit === "string" && !known.has(f.commit.toLowerCase())).length;
-      if (known.size + fresh > cap) {
-        // Recording fills the list to its cap and sets overflow, which holds publication (fail closed).
-        this.recordFlaggedCommits(state, findings, runLog);
-        return defer("overflow");
-      }
+      if (verdict === "unknown") return defer("floor_ancestry_unknown");
+      if (verdict === "at_floor") return clear();
+      if (state.attempts >= SECRET_REMEDIATION_MAX_ATTEMPTS) return clear();
       await this.persistRemediationRestrictions(flight, barePath, branch, range.tipSha, findings, scopes.wait);
       if (stop.aborted) return defer("aborted");
-      this.recordFlaggedCommits(state, findings, runLog);
-      if (state.overflow) return defer("overflow");
       await this.persistRemediationScan(flight, barePath, branch, range.tipSha, findings, "pre-exit", scopes.wait);
       if (stop.aborted) return defer("aborted");
       const withholdPaths = await this.withholdPathsFor(findings, scopes.pathScope);

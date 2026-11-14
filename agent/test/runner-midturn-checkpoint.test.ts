@@ -5483,6 +5483,40 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
     }, { ctlHooks: { flaggedCommitsCap: 1 } });
   });
 
+  it("a stop right after the trusted rescan found a divergent commit: aborted defer, commit already recorded, an unscanned publish holds", async () => {
+    const { logger, lines } = recordingLogger();
+    await rig(4258_040, async (r) => {
+      const a = await flagAndTick(r);
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      const realScan = r.g.secretScanCheckpointRange.bind(r.g);
+      const d = await r.withStub(
+        {
+          secretScanCheckpointRange: async (...args: Parameters<typeof realScan>) => {
+            const res = await realScan(...args);
+            r.runner.shutdown(); // the stop lands the moment the trusted result exists
+            return res;
+          },
+        },
+        () => r.ctx.midRunSecretRemediation!(),
+      );
+      assert.deepEqual(d, { action: "proceed" });
+      assert.ok(
+        lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred" && (l as Record<string, unknown>).why === "aborted"),
+        "the seam deferred as aborted",
+      );
+      const s = r.state();
+      assert.ok(s.midRunTrigger, "the aborted defer keeps the trigger");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+      assert.ok(s.flaggedCommits?.includes(b), "the trusted finding was recorded before the stop return");
+      const before = r.tips.length;
+      assert.equal((await publishUnscanned(r)).published, false);
+      assert.equal(r.tips.length, before);
+    }, { log: logger });
+  });
+
   it("a local-only checkpoint floor containing the finding: at_floor clears, the commit is recorded and an unscanned publish holds", async () => {
     await rig(4258_037, async (r) => {
       commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
