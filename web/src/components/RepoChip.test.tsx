@@ -209,7 +209,7 @@ describe("RepoChip popover", () => {
     expect(hasUnsafe(chip().outerHTML)).toBe(false);
   });
 
-  it("renders a disabled-but-active repo's fallback path demo-masked, with title and badge from the masked path", () => {
+  it("renders a disabled-but-active repo's fallback path demo-masked, with path and title from the masked path (the Unknown case above pins the badge source)", () => {
     // Unsafe namespace and a non-empty repo segment: stripping gives "evilorg/xrepo", masking "demo/xrepo".
     const m = repoActivityModel({
       ownRuns: [],
@@ -220,7 +220,7 @@ describe("RepoChip popover", () => {
             status: "running",
             health: "ok",
             repo_id: "r-masked",
-            repo_path: "evil‮org/\u001bx\u0007repo",
+            repo_path: "evil\u202Eorg/\u001bx\u0007repo",
           } as RunSummaryItem,
         ],
         failed: false,

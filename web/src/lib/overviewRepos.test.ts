@@ -336,7 +336,7 @@ describe("demo masking and unsafe paths", () => {
   it("falls back to Unknown when the last segment is empty after stripping, so masking cannot promote the namespace", () => {
     const m = model({
       demo: true,
-      adminRuns: admin([run({ status: "running", repo_id: "r-1", repo_path: "org/‮" })]),
+      adminRuns: admin([run({ status: "running", repo_id: "r-1", repo_path: "org/\u202E" })]),
       repoActivity: { repos: [], failed: false },
     });
     expect(activeOf(m).repos[0]).toMatchObject({ path: "Unknown", badge: "Un" });
