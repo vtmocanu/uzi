@@ -540,9 +540,9 @@ describe("SdkExecutor attribution opt-out (issue #916)", () => {
 
     assert.strictEqual(turns.length, 2);
     // Plan turn carries the suppression...
-    assert.deepEqual(turns[0]!.options.settings, { attribution: { commit: "", pr: "" } });
+    assert.deepEqual(turns[0]!.options.settings, { attribution: { commit: "", pr: "" }, enabledPlugins: { "cc-plugin-privacy@builtin": false } });
     // ...and it cascades into the implement turn via the baseOptions spread.
-    assert.deepEqual(turns[1]!.options.settings, { attribution: { commit: "", pr: "" } });
+    assert.deepEqual(turns[1]!.options.settings, { attribution: { commit: "", pr: "" }, enabledPlugins: { "cc-plugin-privacy@builtin": false } });
   });
 
   it("explicit true → sets nothing (SDK default preserved, no settings key)", async () => {
@@ -550,8 +550,8 @@ describe("SdkExecutor attribution opt-out (issue #916)", () => {
     const probe = makeCtx({ agents: [lead, coder, reviewer], config: { attribution_enabled: true } }, approve);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
-    assert.equal(turns[0]!.options.settings, undefined);
-    assert.equal(turns[1]!.options.settings, undefined);
+    assert.deepEqual(turns[0]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
+    assert.deepEqual(turns[1]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
   });
 
   it("absent field (null config) → sets nothing (back-compat with an older server)", async () => {
@@ -559,8 +559,8 @@ describe("SdkExecutor attribution opt-out (issue #916)", () => {
     const probe = makeCtx({ agents: [lead, coder, reviewer], config: null }, approve);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
-    assert.equal(turns[0]!.options.settings, undefined);
-    assert.equal(turns[1]!.options.settings, undefined);
+    assert.deepEqual(turns[0]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
+    assert.deepEqual(turns[1]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
   });
 });
 

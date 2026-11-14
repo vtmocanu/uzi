@@ -271,6 +271,14 @@ type Config struct {
 	// flipping it changes those pods' spec hash, so it rolls every non-ephemeral docker
 	// worker.
 	WorkerDiskRecycleEnabled bool
+	// WorkerDinDBuilderPruneEnabled gates the pressure-only DinD builder-cache prune leg
+	// (issue #4291) on docker workers. DEFAULT TRUE (UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED);
+	// a set-but-unparseable value is a BOOT error, like WorkerDiskRecycleEnabled. It is
+	// SUBORDINATE to the disk-recycle master: the controller renders it independently as
+	// UZI_DIND_BUILDER_PRUNE_ENABLED, and the agent ANDs it with UZI_DIND_PRUNE_ENABLED, so
+	// disabling the master disables this leg too, while false here disables only this leg.
+	// Flipping it changes docker workers' spec hash and rolls them.
+	WorkerDinDBuilderPruneEnabled bool
 	// WorkerDiskRecycleCooldown bounds how soon after a recycle the same worker may be
 	// recycled again (UZI_WORKER_DISK_RECYCLE_COOLDOWN, default 1h). A worker back at disk
 	// pressure WITHIN the cooldown is a capacity signal (its volumes are genuinely too
@@ -420,6 +428,15 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("UZI_WORKER_DISK_RECYCLE_ENABLED=%q is not a boolean (want true or false): %w", raw, err)
 		}
 		cfg.WorkerDiskRecycleEnabled = enabled
+	}
+	// The builder-cache prune leg (issue #4291) also defaults on; a typo is a boot error.
+	cfg.WorkerDinDBuilderPruneEnabled = true
+	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED")); raw != "" {
+		enabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED=%q is not a boolean (want true or false): %w", raw, err)
+		}
+		cfg.WorkerDinDBuilderPruneEnabled = enabled
 	}
 
 	// The emergency force-roll override (PRD #422 M5). Empty defaults false; a set but

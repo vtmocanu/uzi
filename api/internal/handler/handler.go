@@ -133,7 +133,8 @@ type Handler struct {
 	productSkillsSyncing atomic.Bool
 	svc                  *forgesvc.Service
 	wsvc                 *workersvc.Service
-	heldSvc              heldPublisher // test seam for WorkerRunHeldPublication; nil = wsvc
+	heldSvc              heldPublisher     // test seam for WorkerRunHeldPublication; nil = wsvc
+	terminalSvc          terminalPublisher // test seam for WorkerRunTerminalPreservation; nil = wsvc
 	// catalogDefaults is the test seam for the settings cell's Codex catalog default read
 	// (issue #3251); nil = wsvc, and a nil wsvc reads unknown.
 	catalogDefaults codexCatalogReader
@@ -1347,6 +1348,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// at maxPackBytes. Eligibility is checked before the body is read.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/held-publication", h.WorkerRunHeldPublication)
 		r.With(h.refuseJobRuns).Post("/runs/{id}/publication-context", h.WorkerRunPublicationContext)
+
+		// Terminal preservation (issue #4007): the worker of a terminal run publishes its final work
+		// to refs/uzi-terminal/<run-id>. Same deadlines, slot pool and pack cap as the route above;
+		// the route refuses unsupported, with no write, for a worker without
+		// recovery_terminal_preservation_v1.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/terminal-preservation", h.WorkerRunTerminalPreservation)
 
 		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
 		// entry; the read half lists the run's (user, repo) memory the worker fences

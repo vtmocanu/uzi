@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 const boundedLookupRef = "refs/uzi-checkpoints/bounded"
@@ -190,6 +192,39 @@ func TestListRefTipsDiscoveryRedirects(t *testing.T) {
 				}
 			} else if err == nil || tips != nil || forbiddenRequests != 0 || lookups != 0 {
 				t.Fatalf("off-origin lookup = %v, %v; forbidden=%d lookups=%d", tips, err, forbiddenRequests, lookups)
+			}
+		})
+	}
+}
+
+// Preparation must refuse discovery that its later read-back cannot interpret, before
+// the service commits an invoke marker. A small advertisement still reaches pack validation.
+func TestPrepareTerminalAdvertisementBound(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		size int
+		want error
+	}{
+		{"small", 256, ErrTipMissing},
+		{"over", MaxRefAdvertisementBytes + 1, ErrRefAdvertisementTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := sizedAdvertisement(tc.size)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Method != http.MethodGet || req.URL.Query().Get("service") != "git-upload-pack" {
+					t.Errorf("unexpected request: %s %s", req.Method, req.URL)
+					w.WriteHeader(500)
+					return
+				}
+				w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+				_, _ = w.Write(body)
+			}))
+			defer server.Close()
+			prepared, err := PrepareTerminalPack(context.Background(), TerminalPackOptions{
+				CloneURL: server.URL + "/repo", RunID: uuid.New(), Tip: boundedLookupTip,
+			})
+			if prepared != nil || !errors.Is(err, tc.want) {
+				t.Fatalf("prepare = %v, %v; want nil and %v", prepared, err, tc.want)
 			}
 		})
 	}

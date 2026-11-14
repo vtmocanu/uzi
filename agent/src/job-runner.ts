@@ -37,6 +37,7 @@
 // A live worker cannot report `cancelled` (the api derives it from the consumed cancel input's stop
 // verdict), so an owner cancel aborts the session and reports `failed` "run cancelled".
 
+import { claudeSdkSettings } from "./sdk-plugin-policy.js";
 import type { HookInput, HookJSONOutput, Options as SdkOptions, EffortLevel, SpawnedProcess, SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
@@ -48,7 +49,6 @@ import { JobFileTimeoutError, type WorkerClient } from "./client.js";
 import type { EmittedMessage } from "./executor.js";
 import { buildFetchToolsServer, FETCH_SERVER_NAME, SOURCES_DIR } from "./fetch-tools.js";
 import {
-  BUILTIN_PLUGINS_DISABLED,
   buildIsolatedPreToolUse,
   guardIsolatedFrame,
   isolatedDisallowedTools,
@@ -453,7 +453,7 @@ export function buildJobSdkOptions(input: {
     // A product skill body is admin-approved but repo-authored text, and the plugin's skills would
     // otherwise run their inline shell (`!cmd` blocks) under bypassPermissions, past the closed tool
     // set. Always off for a job, skills or not (SDK Settings.disableSkillShellExecution).
-    settings: { disableSkillShellExecution: true },
+    settings: claudeSdkSettings({ disableSkillShellExecution: true }),
     // The load-bearing restriction: the SDK `tools` option really confines under bypassPermissions,
     // where `allowedTools` would not. `Skill` joins the list only for a job that carries skills.
     tools: [...JOB_BASE_TOOLS, ...(withSkills ? [SKILL_TOOL] : []), ...input.toolNames],
@@ -499,7 +499,7 @@ function buildLaneJobSdkOptions(
     // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
     // mentions and dispatches a leading slash command before any PreToolUse hook runs.
     verbatimPrompts: true,
-    settings: { enabledPlugins: BUILTIN_PLUGINS_DISABLED, disableSkillShellExecution: true },
+    settings: claudeSdkSettings({ disableSkillShellExecution: true }, true),
     tools: [...lane.surface.tools],
     skills: [...lane.surface.skills],
     plugins: withSkills ? [{ type: "local" as const, path: input.productSkills!.pluginPath, skipMcpDiscovery: true }] : [],
@@ -1098,7 +1098,7 @@ export class JobRunner {
     let policyReason: string | undefined;
     const pids = new Set<number>();
 
-    const options: SdkOptions = { ...args.options, abortController: session };
+    const options: SdkOptions = { ...args.options, settings: claudeSdkSettings(args.options.settings), abortController: session };
     options.spawnClaudeCodeProcess = (spawnOpts: SpawnOptions): SpawnedProcess => {
       const proc = spawnDetached(spawnOpts);
       if (typeof proc.pid === "number") pids.add(proc.pid);

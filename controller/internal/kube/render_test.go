@@ -1922,6 +1922,65 @@ func TestDindPruneEnvIsDockerOnlyAndGatedOnKnobAndEphemeral(t *testing.T) {
 	})
 }
 
+// UZI_DIND_BUILDER_PRUNE_ENABLED (issue #4291): docker workers only, always explicit, "true"
+// iff its own knob is on AND the worker is not ephemeral, rendered independently of the
+// master UZI_DIND_PRUNE_ENABLED (the agent ANDs them). Exactly one of each env appears.
+func TestDindBuilderPruneEnvIsDockerOnlyAndIndependentOfMaster(t *testing.T) {
+	count := func(c corev1.Container, name string) (string, int) {
+		v, n := "", 0
+		for _, e := range c.Env {
+			if e.Name == name {
+				v, n = e.Value, n+1
+			}
+		}
+		return v, n
+	}
+	for _, p := range dindPostures() {
+		for _, tc := range []struct {
+			name                       string
+			master, builder, ephemeral bool
+			wantPrune, wantBuilder     string
+		}{
+			{"on", true, true, false, "true", "true"},
+			{"builder off", true, false, false, "true", "false"},
+			{"master off builder on", false, true, false, "false", "true"},
+			{"both off", false, false, false, "false", "false"},
+			{"ephemeral", true, true, true, "false", "false"},
+		} {
+			t.Run(p.name+"/"+tc.name, func(t *testing.T) {
+				cfg := p.cfg
+				cfg.DinDPruneEnabled = tc.master
+				cfg.DinDBuilderPruneEnabled = tc.builder
+				w := desiredDocker("abc")
+				w.Ephemeral = tc.ephemeral
+				pod := RenderDeployment(cfg, w, testSpec(t, "base", "m")).Spec.Template.Spec
+				c := containerByName(t, pod.Containers, workerContainerName)
+				if got, n := count(c, "UZI_DIND_PRUNE_ENABLED"); n != 1 || got != tc.wantPrune {
+					t.Errorf("UZI_DIND_PRUNE_ENABLED = %q (x%d), want %q once", got, n, tc.wantPrune)
+				}
+				if got, n := count(c, "UZI_DIND_BUILDER_PRUNE_ENABLED"); n != 1 || got != tc.wantBuilder {
+					t.Errorf("UZI_DIND_BUILDER_PRUNE_ENABLED = %q (x%d), want %q once", got, n, tc.wantBuilder)
+				}
+			})
+		}
+	}
+
+	t.Run("plain worker", func(t *testing.T) {
+		cfg := dockerTestConfig()
+		cfg.DinDBuilderPruneEnabled = true
+		pod := RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+		if v, n := count(containerByName(t, pod.Containers, workerContainerName), "UZI_DIND_BUILDER_PRUNE_ENABLED"); n != 0 {
+			t.Errorf("a plain worker must carry no UZI_DIND_BUILDER_PRUNE_ENABLED, got %q", v)
+		}
+		off := testConfig()
+		on := testConfig()
+		on.DinDBuilderPruneEnabled = true
+		if SpecHashOf(off, desired("abc"), testSpec(t, "base", "m")) != SpecHashOf(on, desired("abc"), testSpec(t, "base", "m")) {
+			t.Error("the builder prune knob moved a plain worker's spec hash; it must be docker-only")
+		}
+	})
+}
+
 // --- Codex uid-split profile (PRD #1493 M1) --------------------------------
 
 // findContainer is the non-fatal sibling of containerByName: it reports presence rather
