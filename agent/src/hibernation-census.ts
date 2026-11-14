@@ -477,14 +477,45 @@ async function classifyRepos(dataDir: string, tree: Tree, node: Node, out: Gathe
     out.entries.push(makeEntry({ kind: "bare_repo", rel: child.rel,
       classification: why === "unreadable" ? "unknown" : why ? "protected" : retained?.complete === false ? "unknown" : "disposable",
       detail: why ?? (retained?.complete === false ? "retained_unread" : "cache") }));
+    unknownBareNodes(tree, child, out);
     await runnerRefs(dataDir, tree, child, retained, out);
   }
 }
 
+/** The standard bare-git layout plus the names git.ts itself creates inside a bare (uzi-owed, uzi-code-snapshots). */
+const BARE_TOP_FILES = new Set(["HEAD", "config", "description", "packed-refs", "FETCH_HEAD", "ORIG_HEAD", "shallow"]);
+const BARE_TOP_DIRS = new Set(["objects", "refs", "info", "hooks", "logs", "worktrees", "uzi-owed", "uzi-code-snapshots"]);
+/** `<name>.lock` files and the ledger compaction temp (git.ts LEDGER_COMPACT_TMP_PREFIX). */
+const BARE_TOP_TRANSIENT = /^(?:.+\.lock|config\.uzi-compact-.*)$/;
+/** Ref namespaces under refs/ that git or git.ts writes. */
+const KNOWN_REF_DIRS = new Set(["heads", "tags", "remotes", "stash",
+  "uzi-runner", "uzi-archive", "uzi-settle", "uzi-recovery-pin", "uzi-owed", "uzi-coverage", "uzi-checkpoints",
+  "uzi-materialize", "uzi-publication-floor", "uzi-cross-check", "uzi-incoming", "uzi-recovery-episode"]);
+
+/** Every node of a bare outside the known structure is its own unknown_path entry (a blocker), so residue in a bare
+ *  is never covered by the aggregate bare_repo cache entry. */
+function unknownBareNodes(tree: Tree, bare: Node, out: Gathered): void {
+  const detailOf = (n: Node): string => n.type === "dir" ? `nodes_${tree.count(n.rel)}` : n.type;
+  for (const n of tree.children(bare.rel)) {
+    const name = lastSegment(n.rel);
+    const known = (n.type === "file" && BARE_TOP_FILES.has(name)) || (n.type === "dir" && BARE_TOP_DIRS.has(name)) ||
+      (n.type === "file" && BARE_TOP_TRANSIENT.test(name));
+    if (!known) {
+      out.entries.push(makeEntry({ kind: "unknown_path", rel: n.rel, classification: "unknown", detail: detailOf(n) }));
+      continue;
+    }
+    if (name !== "refs" || n.type !== "dir") continue;
+    for (const r of tree.children(n.rel)) {
+      if (r.type === "dir" && KNOWN_REF_DIRS.has(lastSegment(r.rel))) continue;
+      out.entries.push(makeEntry({ kind: "unknown_path", rel: r.rel, classification: "unknown", detail: detailOf(r) }));
+    }
+  }
+}
+
 /** Ref namespaces whose objects are recovery or settlement state (git.ts: refs/uzi-archive, refs/uzi-settle,
- *  refs/uzi-recovery-pin, refs/uzi-owed). */
-const PROTECTED_REF_DIRS = ["uzi-archive", "uzi-settle", "uzi-recovery-pin", "uzi-owed"];
-const PROTECTED_PACKED_REF = / refs\/uzi-(?:archive|settle|recovery-pin|owed)\//;
+ *  refs/uzi-recovery-pin, refs/uzi-owed, refs/uzi-coverage). */
+const PROTECTED_REF_DIRS = ["uzi-archive", "uzi-settle", "uzi-recovery-pin", "uzi-owed", "uzi-coverage"];
+const PROTECTED_PACKED_REF = / refs\/uzi-(?:archive|settle|recovery-pin|owed|coverage)\//;
 
 /** Why a bare cache is more than a cache: owed records, a ref in a recovery namespace (loose or packed) or a code
  *  snapshot. "unreadable" when the packed refs could not be read. */

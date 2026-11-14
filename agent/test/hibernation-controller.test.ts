@@ -98,6 +98,20 @@ describe("HibernationInventoryController", () => {
     assert.deepEqual(r.c.exclusionReport(), { op_id: AWAITING.op_id, held: true });
   });
 
+  it("waits for a writer that entered before the latch: no proof, EX or census until it exits, then in order", async () => {
+    const r = rig({ settleMs: 5_000 });
+    const release = r.registry.enter("recovery_pass");
+    assert.ok(release);
+    r.c.observe(AWAITING);
+    await new Promise((res) => setTimeout(res, 120));
+    assert.deepEqual(r.events, [], "paused writer: quiescence proof, EX upgrade and census all wait");
+    assert.equal(r.registry.isLatched(), true);
+    assert.equal(r.registry.enter("late"), null, "a new writer is refused while latched");
+    release();
+    await r.c.whenIdle();
+    assert.deepEqual(r.events, ["proof latched=true gate=true", "ex", "census", "post"]);
+  });
+
   it("merges registry and census uncovered classes and posts complete=false", async () => {
     const r = rig({ census: async () => census({ uncovered: ["c1"] }) });
     r.registry.markUncovered("w1");
@@ -314,8 +328,26 @@ describe("HibernationInventoryController", () => {
     }]);
   });
 
-  it("sends nothing at shutdown when the op is not accepted, exclusion was lost, or recompute fails", async () => {
-    const pending = rig();
+  it("posts exclusion-final at shutdown right after a successful upload, before any accepted heartbeat", async () => {
+    const r = rig();
+    await feed(r, AWAITING);
+    assert.equal(r.posts.length, 1);
+    await r.c.finalizeAtShutdown();
+    assert.equal(r.finals.length, 1, "the api permits scale-down once it accepted the inventory");
+    assert.equal(r.finals[0]?.op_id, AWAITING.op_id);
+  });
+
+  it("a stale awaiting heartbeat after accepted does not undo the accepted state", async () => {
+    const r = rig();
+    await feed(r, AWAITING);
+    await feed(r, ACCEPTED);
+    await feed(r, AWAITING);
+    await r.c.finalizeAtShutdown();
+    assert.equal(r.finals.length, 1);
+  });
+
+  it("sends nothing at shutdown when the upload failed, exclusion was lost, or recompute fails", async () => {
+    const pending = rig({ census: async () => { throw new Error("boom"); } });
     await feed(pending, AWAITING);
     await pending.c.finalizeAtShutdown();
     assert.equal(pending.finals.length, 0);

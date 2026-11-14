@@ -416,6 +416,40 @@ it("a bare with a recovery ref, a packed recovery ref or a code snapshot is prot
   assert.equal(byPath(result, "repos/emptysnap.git")?.classification, "disposable");
 });
 
+it("a plain standard bare stays a disposable cache with no extra entries", async () => {
+  put("repos/std.git/HEAD", "ref: refs/heads/main\n"); put("repos/std.git/config"); put("repos/std.git/packed-refs", `${TIP} refs/heads/main\n`);
+  put("repos/std.git/config.lock"); put("repos/std.git/objects/ab/cd"); put("repos/std.git/refs/heads/main", `${TIP}\n`);
+  put("repos/std.git/refs/tags/v1", `${TIP}\n`); put("repos/std.git/refs/uzi-checkpoints/agent/issue-1", `${TIP}\n`);
+  dir("repos/std.git/hooks"); dir("repos/std.git/info"); dir("repos/std.git/logs");
+  const result = await run();
+  assert.equal(byPath(result, "repos/std.git")?.classification, "disposable");
+  assert.deepEqual(result.entries.filter(e => e.path.startsWith("repos/std.git/") && e.kind === "unknown_path"), []);
+});
+
+it("unknown residue inside a bare is its own blocking unknown entry", async () => {
+  put("repos/o.git/HEAD", "ref: refs/heads/main\n");
+  put("repos/o.git/private-backup.bin", "secret");
+  put("repos/o.git/stray-dir/file", "x");
+  put("repos/o.git/refs/weird-ns/x", `${TIP}\n`);
+  put("repos/o.git/refs/stray-file", "x");
+  const result = await run();
+  for (const p of ["repos/o.git/private-backup.bin", "repos/o.git/stray-dir", "repos/o.git/refs/weird-ns", "repos/o.git/refs/stray-file"]) {
+    const e = byPath(result, p);
+    assert.equal(e?.kind, "unknown_path", p);
+    assert.equal(e?.classification, "unknown", p);
+  }
+  assert.equal(byPath(result, "repos/o.git/HEAD"), undefined);
+});
+
+it("a refs/uzi-coverage ref (loose or packed) keeps a bare protected", async () => {
+  put("repos/cov.git/refs/uzi-coverage/run/1/abc", `${TIP}\n`);
+  put("repos/covp.git/packed-refs", `${TIP} refs/uzi-coverage/run/1/abc\n`);
+  const result = await run();
+  assert.equal(byPath(result, "repos/cov.git")?.classification, "protected");
+  assert.equal(byPath(result, "repos/covp.git")?.classification, "protected");
+  assert.deepEqual(result.entries.filter(e => e.kind === "unknown_path" && e.path.startsWith("repos/cov")), []);
+});
+
 it(".uzi-authority: lock files are disposable, any store file is unknown", async () => {
   put(".uzi-authority/worker.lock", ""); put(".uzi-authority/authority.lock", "");
   assert.equal(byPath(await run(), ".uzi-authority")?.classification, "disposable");

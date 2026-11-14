@@ -401,7 +401,8 @@ export class HibernationInventoryController {
     if (this.held && (member === null || member.op_id !== this.held.opId)) await this.release();
     if (this.fatal || member === null) return;
     if (this.held) {
-      this.held.accepted = member.phase === "accepted";
+      // Only upgrade: the api accepted at the inventory POST, so a stale awaiting heartbeat must not undo it.
+      if (member.phase === "accepted") this.held.accepted = true;
       return;
     }
     if (member.phase !== "awaiting") return;
@@ -469,6 +470,9 @@ export class HibernationInventoryController {
       const census = await d.census({ signal: this.abort.signal, deadlineMs: CENSUS_MS });
       // (f) report with the identity echo.
       await d.client.postHibernationInventory(this.buildInventory(m, census), this.abort.signal);
+      // A 2xx means the api accepted under its guarded update and may scale down at once, so a SIGTERM can
+      // arrive before any heartbeat says accepted: shutdown must still report the exclusion-final.
+      if (this.held && this.held.opId === m.op_id) this.held.accepted = true;
     } catch (err) {
       // Shutdown aborts the census and posts: hold the exclusion until exit, release nothing.
       if (this.fatal || this.stopping) return;
