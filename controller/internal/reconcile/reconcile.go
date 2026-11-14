@@ -434,8 +434,9 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 	// A worker that is preparing to hibernate or is hibernated has no pod on purpose;
 	// a roll-health row for it (even the synthetic rolling-gap one below) would show a
 	// deliberately parked worker as an upgrade in progress. Mark it reported so neither
-	// loop emits a row. A cleaning worker (an unsettled cache prune attempt) is held the same way. A waking worker is reported normally: its pod is genuinely
-	// on its way.
+	// loop emits a row. A cleaning worker (an unsettled cache prune attempt) is held
+	// the same way. A waking worker is reported normally: its pod is genuinely on its
+	// way.
 	for _, w := range desired {
 		if h := w.Hibernation; h != nil && (h.State == protocol.HibernationPreparing || h.State == protocol.HibernationHibernated || h.State == protocol.HibernationCleaning) {
 			reported[w.ID] = true

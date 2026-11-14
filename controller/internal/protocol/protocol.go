@@ -113,8 +113,8 @@ type DesiredWorker struct {
 	// token", never invent one, never clear the existing Secret on account of it,
 	// and never log this field.
 	JoinToken *string `json:"join_token"`
-	// Hibernation is set only while the worker is preparing, hibernated or waking
-	// (PRD #4205); omitted for an awake worker.
+	// Hibernation is set only while the worker is preparing, hibernated, waking or
+	// cleaning (PRD #4205, #4206); omitted for an awake worker.
 	Hibernation *Hibernation `json:"hibernation,omitempty"`
 }
 

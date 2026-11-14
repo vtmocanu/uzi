@@ -94,12 +94,16 @@ func TestCleaningStopProof(t *testing.T) {
 		proof  string
 		report bool
 	}{
-		"present and stopped":        {pods: []runtime.Object{stoppedHibPod(uid, "Error")}, proof: uid, report: true},
-		"absent uid":                 {proof: uid},
-		"running pod":                {pods: []runtime.Object{hibPod(uid, "x", true, false)}, proof: uid},
-		"container status unknown":   {pods: []runtime.Object{stoppedHibPod(uid, "ContainerStatusUnknown")}, proof: uid},
-		"different pod uid stopped":  {pods: []runtime.Object{stoppedHibPod("pod-uid-2", "Error")}, proof: uid},
-		"no proof uid asked":         {pods: []runtime.Object{stoppedHibPod(uid, "Error")}, proof: ""},
+		"present and stopped":       {pods: []runtime.Object{stoppedHibPod(uid, "Error")}, proof: uid, report: true},
+		"absent uid":                {proof: uid},
+		"running pod":               {pods: []runtime.Object{hibPod(uid, "x", true, false)}, proof: uid},
+		"container status unknown":  {pods: []runtime.Object{stoppedHibPod(uid, "ContainerStatusUnknown")}, proof: uid},
+		"different pod uid stopped": {pods: []runtime.Object{stoppedHibPod("pod-uid-2", "Error")}, proof: uid},
+		"no proof uid asked":        {pods: []runtime.Object{stoppedHibPod(uid, "Error")}, proof: ""},
+		// The proof pod is present but running while a different pod is stopped.
+		"proof running, other stopped": {pods: []runtime.Object{hibPod(uid, "x", true, false), stoppedHibPod("pod-uid-2", "Error")}, proof: uid},
+		// The proof uid does not sort first among the worker's pods.
+		"proof not first pod":        {pods: []runtime.Object{stoppedHibPod("pod-uid-9", "Error"), hibPod("pod-uid-2", "x", true, false)}, proof: "pod-uid-9", report: true},
 		"stopped match among others": {pods: []runtime.Object{stoppedHibPod(uid, "Error"), hibPod("pod-uid-3", "x", true, false)}, proof: uid, report: true},
 	}
 	for name, c := range cases {
@@ -119,12 +123,22 @@ func TestCleaningStopProof(t *testing.T) {
 				t.Fatalf("calls = %v, want one cleanup_stopped", rec.transitions())
 			}
 			got, d := rec.calls[0], hibGet(t, client)
-			want := protocol.HibernationTransition{OpID: "op-1", Transition: protocol.TransitionCleanupStopped, DeploymentUID: string(d.UID), PodUID: uid, CleanupOpID: "clean-1"}
+			want := protocol.HibernationTransition{OpID: "op-1", Transition: protocol.TransitionCleanupStopped, DeploymentUID: string(d.UID), PodUID: c.proof, CleanupOpID: "clean-1"}
 			if got != want {
 				t.Fatalf("report = %+v, want %+v", got, want)
 			}
 			noClusterWrites(t, client)
 		})
+	}
+}
+
+func TestCleaningNoReportWithoutDeployment(t *testing.T) {
+	m, _, rec := hibEnv(t, stoppedHibPod("pod-uid-1", "Error"))
+	if err := hibTick(t, m, cleaningW("pod-uid-1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("reported without a Deployment: %v", rec.transitions())
 	}
 }
 
