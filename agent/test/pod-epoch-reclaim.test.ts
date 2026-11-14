@@ -11,7 +11,7 @@ import { PodEpochDaemonError } from "../src/pod-epoch-daemon.js";
 import { WorkerClient } from "../src/client.js";
 import { buildPodEpochDeletionDeps } from "../src/main.js";
 import { nullLogger } from "./helpers.js";
-import { daemon, ENABLE_DELETION_FOR_TEST } from "./pod-epoch-reclaim-support.js";
+import { daemon, ENABLE_DELETION_FOR_TEST, perGroupInspect, singleInspect } from "./pod-epoch-reclaim-support.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
 import type { RetainedSourceEvidence } from "../src/git.js";
 import type { RecoveryHoldsResponse } from "../src/protocol.js";
@@ -42,7 +42,7 @@ function setup() {
         calls.discovery++;
         return { groups: [], inventoryComplete: true, physicalPaths: 0, overflow: 0, overflowExact: true, unreadable: 0 };
       },
-      inspectRetainedSources: async () => { calls.inspect++; throw new Error("unexpected inspection"); },
+      inspectEpochRetainedGroups: async () => { calls.inspect++; throw new Error("unexpected inspection"); },
     },
   };
   return { options, calls, parent };
@@ -84,11 +84,11 @@ function inventory(options: Options, count: number) {
   options.git.discoverEpochRetainedSources = async () => ({
     groups, inventoryComplete: true, physicalPaths: count, overflow: Math.max(0, count - 200), overflowExact: true, unreadable: 0,
   });
-  options.git.inspectRetainedSources = async opts => {
+  options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
     const group = groups.find(g => g.selector.runId === opts.selector!.runId)!;
     for (const p of group.paths) opts.beforeTree!(p);
     return { sources: group.paths.map(p => source(p, group.selector.runId, true)), partial: false, unreadable: 0, sampledAt: "" };
-  };
+  });
   return groups;
 }
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -151,10 +151,10 @@ test("invalid run identifiers remain kept without either fresh API call or inspe
     const holds: string[] = [], lifecycle: string[] = [], inspected: string[] = [];
     options.client.listRecoveryHolds = async run_id => { holds.push(run_id); return { run_id, holds: [] }; };
     options.client.getRunOwnership = async id => { lifecycle.push(id); return { status: "completed" }; };
-    const inspect = options.git.inspectRetainedSources;
-    options.git.inspectRetainedSources = async opts => {
+    const inspect = singleInspect(options.git.inspectEpochRetainedGroups);
+    options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
       inspected.push(opts.selector!.runId); return inspect(opts);
-    };
+    });
     const result = (await runPodEpochShadow(options))!;
     const valid = ["A_0-", "a".repeat(160)];
     assert.deepEqual(holds, valid); assert.deepEqual(lifecycle, valid); assert.deepEqual(inspected, valid);
@@ -290,11 +290,11 @@ test("second tree entry change clears the entire epoch even when Git catches cal
     const { options } = setup(); options.dockerHost = d.host; const groups = inventory(options, 2);
     let changed = false;
     options.ownership.matchesEntry = () => !changed;
-    options.git.inspectRetainedSources = async opts => {
+    options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
       if (opts.selector!.runId === "run1") changed = true;
       try { opts.beforeTree!(groups.find(g => g.selector.runId === opts.selector!.runId)!.paths[0]!); } catch {}
       return { sources: [source("/tree/" + opts.selector!.runId.slice(3), opts.selector!.runId)], partial: false, unreadable: 0, sampledAt: "" };
-    };
+    });
     const result = (await runPodEpochShadow(options))!;
     assert.equal(result.would_delete, 0); assert.deepEqual(result.list, []); assert.equal(result.reason, "entry_changed");
   } finally { await d.close(); }
@@ -305,11 +305,12 @@ test("daemon veto stays connected throughout held measurement and joins before h
     const { options, calls } = setup(); options.dockerHost = d.host; inventory(options, 2);
     let entered!: () => void;
     const ready = new Promise<void>(resolve => { entered = resolve; });
-    options.git.inspectRetainedSources = async opts => {
+    options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
       entered();
-      await new Promise<void>(resolve => opts.signal!.addEventListener("abort", () => resolve(), { once: true }));
+      // The batch stub is called once per group in turn: a later group sees the signal already aborted.
+      if (!opts.signal!.aborted) await new Promise<void>(resolve => opts.signal!.addEventListener("abort", () => resolve(), { once: true }));
       return { sources: [], partial: true, unreadable: 0, sampledAt: "" };
-    };
+    });
     const running = runPodEpochShadow(options); await ready;
     d.veto(); const result = (await running)!;
     assert.equal(result.would_delete, 0); assert.equal(calls.handovers, 1);
@@ -322,9 +323,9 @@ test("path drift refuses all authority and malformed fresh holds cannot qualify"
     for (const drift of [false, true]) {
       const { options } = setup(); options.dockerHost = d.host; inventory(options, 1);
       options.client.listRecoveryHolds = async () => ({ run_id: "wrong", holds: [] });
-      if (drift) options.git.inspectRetainedSources = async () => ({
+      if (drift) options.git.inspectEpochRetainedGroups = perGroupInspect(async () => ({
         sources: [source("/unexpected", "run0")], partial: false, unreadable: 0, sampledAt: "",
-      });
+      }));
       const result = (await runPodEpochShadow(options))!;
       assert.equal(result.would_delete, 0);
       if (drift) assert.equal(result.reason, "path_set_changed");
@@ -354,11 +355,11 @@ test("shutdown aborts and joins " + stage + " without handover", async () => {
     if (stage === "ownership") options.client.getRunOwnership = async (_id, opts) => {
       await hold(opts.signal); return { status: "completed" };
     };
-    if (stage === "queued_inspection" || stage === "measurement") options.git.inspectRetainedSources = async opts => {
+    if (stage === "queued_inspection" || stage === "measurement") options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
       if (stage === "measurement") opts.beforeTree!("/tree/0");
       await hold(opts.signal!);
       return { sources: [source("/tree/0", "run0")], partial: false, unreadable: 0, sampledAt: "" };
-    };
+    });
     const running = runPodEpochShadow(options);
     await ready; parent.abort(); await tick();
     assert.equal(stageSignal!.aborted, true); assert.equal(calls.handovers, 0);
@@ -382,7 +383,7 @@ test("unsafe, unmeasured, live, refused and local-record sources stay kept", asy
   const d = await daemon();
   try {
     const { options } = setup(); options.dockerHost = d.host; inventory(options, 5);
-    options.git.inspectRetainedSources = async opts => {
+    options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
       const index = Number(opts.selector!.runId.slice(3));
       const s = source("/tree/" + index, opts.selector!.runId);
       opts.beforeTree!(s.sources[0]!.clonePath);
@@ -392,7 +393,7 @@ test("unsafe, unmeasured, live, refused and local-record sources stay kept", asy
       if (index === 3) s.disposition = { kind: "refused", consumers: ["unknown"] };
       if (index === 4) s.localRecords = [{ kind: "terminal", generation: 1, name: "record", resolution: "keep" }];
       return { sources: [s], partial: false, unreadable: 0, sampledAt: "" };
-    };
+    });
     const result = (await runPodEpochShadow(options))!;
     assert.equal(result.would_delete, 0); assert.equal(result.kept, 5);
   } finally { await d.close(); }
@@ -790,8 +791,8 @@ test("a daemon veto is unproven; a daemon transport failure keeps attested with 
   const d = await daemon();
   try {
     const { options } = setup(); options.dockerHost = d.host; inventory(options, 1);
-    const inner = options.git.inspectRetainedSources;
-    options.git.inspectRetainedSources = async opts => { d.veto(); await tick(); await tick(); return inner(opts); };
+    const inner = singleInspect(options.git.inspectEpochRetainedGroups);
+    options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => { d.veto(); await tick(); await tick(); return inner(opts); });
     const result = (await runPodEpochShadow(options))!;
     assert.deepEqual(result.authority, { result: "unproven", reason: "daemon_veto" });
     assert.equal(result.would_delete, 0);
@@ -820,11 +821,11 @@ test("present and missing candidates, strict-plain basis, and the examined invar
       x => { x.sources[0]!.presence = "present"; x.presence = "unsafe"; },
       x => { x.presence = "missing"; x.sources[0]!.presence = "missing"; x.sources[0]!.allocatedBytes = 4096; },
     ];
-    options.git.inspectRetainedSources = async opts => {
+    options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
       const i = Number(opts.selector!.runId.slice(3)); const path = "/tree/" + i;
       opts.beforeTree!(path);
       return { sources: [candidateSource(path, opts.selector!.runId, table[i]!)], partial: false, unreadable: 0, sampledAt: "" };
-    };
+    });
     const result = (await runPodEpochShadow(options))!;
     assert.equal(result.verdict, "eligible");
     assert.equal(result.would_delete, 2); assert.equal(result.would_delete_bytes, 8192);
@@ -846,7 +847,7 @@ test("journal_extra_fields counts only final candidates whose source carried the
   try {
     const { options } = setup(); options.dockerHost = d.host; inventory(options, 4);
     const flagged = new Set([0, 1, 2]);
-    options.git.inspectRetainedSources = async opts => {
+    options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
       const i = Number(opts.selector!.runId.slice(3)); const path = "/tree/" + i;
       opts.beforeTree!(path);
       const s = candidateSource(path, opts.selector!.runId, x => {
@@ -855,7 +856,7 @@ test("journal_extra_fields counts only final candidates whose source carried the
       });
       if (flagged.has(i)) s.epochJournalExtraFields = true;
       return { sources: [s], partial: false, unreadable: 0, sampledAt: "" };
-    };
+    });
     const result = (await runPodEpochShadow(options))!;
     // run0 (present) and run1 (missing) are flagged candidates; run2 is flagged but kept; run3 is an
     // unflagged present candidate.
@@ -874,13 +875,13 @@ test("a flagged candidate later demoted is not counted in journal_extra_fields",
       groups: ["/bare-a", "/bare-b"].map(barePath => ({ barePath, selector: { runId: "run0", generation: 1, attempt: "attempt" }, paths: ["/tree/shared"] })),
       inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0,
     });
-    options.git.inspectRetainedSources = async opts => {
+    options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
       opts.beforeTree!("/tree/shared");
       const s = candidateSource("/tree/shared", "run0", opts.barePath === "/bare-b"
         ? x => { x.sources[0]!.allocatedBytes = 999; x.allocatedBytes = 999; } : () => {});
       s.barePath = opts.barePath!; s.epochJournalExtraFields = true;
       return { sources: [s], partial: false, unreadable: 0, sampledAt: "" };
-    };
+    });
     const result = (await runPodEpochShadow(options))!;
     assert.equal(result.would_delete, 0); assert.equal(result.kept, 1);
     assert.equal(result.journal_extra_fields, 0);
@@ -891,12 +892,12 @@ test("an invalid pass clears present and missing candidates alike", async () => 
   try {
     const { options } = setup(); options.dockerHost = d.host; const groups = inventory(options, 2);
     let changed = false; options.ownership.matchesEntry = () => !changed;
-    options.git.inspectRetainedSources = async opts => {
+    options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
       if (opts.selector!.runId === "run1") changed = true;
       try { opts.beforeTree!(groups.find(g => g.selector.runId === opts.selector!.runId)!.paths[0]!); } catch {}
       return { sources: [candidateSource("/tree/" + opts.selector!.runId.slice(3), opts.selector!.runId,
         x => { x.presence = "missing"; x.sources[0]!.presence = "missing"; })], partial: false, unreadable: 0, sampledAt: "" };
-    };
+    });
     const result = (await runPodEpochShadow(options))!;
     assert.equal(result.would_settle, 0); assert.equal(result.would_delete, 0); assert.deepEqual(result.list, []);
     assert.deepEqual(result.by_basis, { discard: 0, strict_plain: 0 });
@@ -922,10 +923,10 @@ test("a path also named by a group refused for its run ID is never a candidate",
       groups: order.map(runId => ({ barePath: "/bare", selector: { runId, generation: 1, attempt: "attempt" }, paths: ["/tree/shared"] })),
       inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0,
     });
-    options.git.inspectRetainedSources = async opts => {
+    options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
       opts.beforeTree!("/tree/shared");
       return { sources: [candidateSource("/tree/shared", opts.selector!.runId, () => {})], partial: false, unreadable: 0, sampledAt: "" };
-    };
+    });
     const result = (await runPodEpochShadow(options))!;
     assert.equal(result.verdict, "partial"); assert.equal(result.would_delete, 0); assert.equal(result.would_settle, 0);
     assert.equal(result.kept, 1, order.join()); assert.deepEqual(result.list, [], order.join());
@@ -947,12 +948,12 @@ test("one run observing one path with different bytes or basis demotes it", asyn
         groups: ["/bare-a", "/bare-b"].map(barePath => ({ barePath, selector: { runId: "run0", generation: 1, attempt: "attempt" }, paths: ["/tree/shared"] })),
         inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0,
       });
-      options.git.inspectRetainedSources = async opts => {
+      options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
         opts.beforeTree!("/tree/shared");
         const s = candidateSource("/tree/shared", "run0", opts.barePath === "/bare-b" ? tweak : () => {});
         s.barePath = opts.barePath!;
         return { sources: [s], partial: false, unreadable: 0, sampledAt: "" };
-      };
+      });
       const result = (await runPodEpochShadow(options))!;
       assert.equal(result.examined, 1); assert.equal(result.would_delete, 0);
       assert.equal(result.kept, 1); assert.deepEqual(result.list, []);
@@ -974,11 +975,11 @@ test("one path observed twice is never double counted", async () => {
         groups: table.map((_, i) => ({ barePath: "/bare", selector: { runId: "run" + i, generation: 1, attempt: "attempt" }, paths: ["/tree/shared"] })),
         inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0,
       });
-      options.git.inspectRetainedSources = async opts => {
+      options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
         opts.beforeTree!("/tree/shared");
         return { sources: [candidateSource("/tree/shared", opts.selector!.runId, table[Number(opts.selector!.runId.slice(3))]!)],
           partial: false, unreadable: 0, sampledAt: "" };
-      };
+      });
       const result = (await runPodEpochShadow(options))!;
       assert.equal(result.examined, 1, label); assert.equal(result.would_delete, 0, label);
       assert.equal(result.would_settle, 0, label); assert.equal(result.kept, 1, label); assert.deepEqual(result.list, [], label);
@@ -1004,9 +1005,9 @@ test("#3775 shadow grouping selector and legacy fallback causes preserve candida
           ...(mode === "census-empty" ? { partialCauses: {} } : {}) });
       }
       if (mode === "inspection" || mode === "inspection-empty") {
-        const inspect = options.git.inspectRetainedSources;
-        options.git.inspectRetainedSources = async opts => ({ ...await inspect(opts), partial: true,
-          ...(mode === "inspection-empty" ? { partialCauses: {} } : {}) });
+        const inspect = singleInspect(options.git.inspectEpochRetainedGroups);
+        options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => ({ ...await inspect(opts), partial: true,
+          ...(mode === "inspection-empty" ? { partialCauses: {} } : {}) }));
       }
       if (mode === "unknown") options.client.getRunOwnership = async () => ({ status: "running" });
       if (mode === "malformed-holds") options.client.listRecoveryHolds = async () => ({ run_id: "wrong", holds: [] });
@@ -1054,7 +1055,7 @@ function makeWorld(count: number, tune?: (w: any) => void) {
   world.groups = groups;
   options.git.discoverEpochRetainedSources = async () => ({
     groups, inventoryComplete: true, physicalPaths: count, overflow: 0, overflowExact: true, unreadable: 0 });
-  options.git.inspectRetainedSources = async opts => {
+  options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
     const i = Number(opts.selector!.runId.slice(3));
     const group = groups[i]!;
     for (const p of group.paths) opts.beforeTree!(p);
@@ -1063,7 +1064,7 @@ function makeWorld(count: number, tune?: (w: any) => void) {
     s.sources = group.paths.map(path => ({ ...s.sources[0]!, clonePath: path }));
     world.mutateSource(s, i);
     return { sources: [s], partial: false, unreadable: 0, sampledAt: "" };
-  };
+  });
   options.client.listRecoveryHolds = async run_id => world.holds(run_id);
   options.client.getRunOwnership = async () => world.ownership();
   const scope = {
@@ -1219,8 +1220,8 @@ test("#3851 with activation on, measured candidates proceed, a locally short par
   // A pass-wide partial inspection never enters the deletion phase.
   await withDeletion(2, w => {
     withoutSentinel(true)(w);
-    const inspect = w.options.git.inspectRetainedSources;
-    w.options.git.inspectRetainedSources = async o => ({ ...await inspect(o), partial: true });
+    const inspect = singleInspect(w.options.git.inspectEpochRetainedGroups);
+    w.options.git.inspectEpochRetainedGroups = perGroupInspect(async o => ({ ...await inspect(o), partial: true }));
   }, (w, result) => {
     noMutation(w); assert.equal(w.spies.begins, 0); assert.equal(result.verdict, "partial");
     assert.equal(result.deleted + result.settled, 0);
@@ -1310,8 +1311,8 @@ test("the reclaim phase runs only for eligible, attested, intact passes with a n
       w.options.git.discoverEpochRetainedSources = async o => ({ ...await discover(o), inventoryComplete: false, unreadable: 1 });
     }],
     ["partial inspection", w => {
-      const inspect = w.options.git.inspectRetainedSources;
-      w.options.git.inspectRetainedSources = async o => ({ ...await inspect(o), partial: true });
+      const inspect = singleInspect(w.options.git.inspectEpochRetainedGroups);
+      w.options.git.inspectEpochRetainedGroups = perGroupInspect(async o => ({ ...await inspect(o), partial: true }));
     }],
     ["unsupported filesystem", w => { w.options.ownership = { ...w.options.ownership, mode: "unsupported" }; }],
   ];
@@ -1329,8 +1330,8 @@ test("a daemon veto or an invalidated pass never starts the reclaim phase", asyn
   const d = await daemon();
   try {
     const w = deletionWorld(1); w.options.dockerHost = d.host;
-    const inner = w.options.git.inspectRetainedSources;
-    w.options.git.inspectRetainedSources = async o => { d.veto(); await tick(); await tick(); return inner(o); };
+    const inner = singleInspect(w.options.git.inspectEpochRetainedGroups);
+    w.options.git.inspectEpochRetainedGroups = perGroupInspect(async o => { d.veto(); await tick(); await tick(); return inner(o); });
     const result = (await runPodEpochShadow(w.options))!;
     noMutation(w); assert.equal(w.spies.begins, 0); assert.equal(result.authority.reason, "daemon_veto");
   } finally { await d.close(); }
@@ -1746,13 +1747,13 @@ test("a mid-deletion daemon veto stops the loop with the daemon reason and keeps
   const d = await daemon();
   try {
     const w = deletionWorld(3); w.options.dockerHost = d.host;
-    const inner = w.options.git.inspectRetainedSources;
+    const inner = singleInspect(w.options.git.inspectEpochRetainedGroups);
     let second = 0;
-    w.options.git.inspectRetainedSources = async o => {
+    w.options.git.inspectEpochRetainedGroups = perGroupInspect(async o => {
       // The deletion-phase re-inspect of run1 (its shadow inspection was the first).
       if (o.selector!.runId === "run1" && ++second === 2) { d.veto(); await tick(); await tick(); }
       return inner(o);
-    };
+    });
     const result = (await runPodEpochShadow(w.options))!;
     assert.equal(result.deleted, 1, "run0 was deleted before the veto");
     assert.equal(result.verdict, "partial"); assert.equal(result.reason, "daemon_event");
@@ -1767,13 +1768,13 @@ test("a daemon error from a guard that has not aborted still ends the pass with 
   const guard = { signal: new AbortController().signal, close: async () => {},
     assertHealthy() { if (armed) throw new PodEpochDaemonError("daemon_event"); } };
   w.options.openDaemonGuard = async () => guard;
-  const inner = w.options.git.inspectRetainedSources;
+  const inner = singleInspect(w.options.git.inspectEpochRetainedGroups);
   let second = 0;
-  w.options.git.inspectRetainedSources = async o => {
+  w.options.git.inspectEpochRetainedGroups = perGroupInspect(async o => {
     // The deletion-phase re-inspect of run1 (its shadow inspection was the first).
     if (o.selector!.runId === "run1" && ++second === 2) armed = true;
     return inner(o);
-  };
+  });
   const result = (await runPodEpochShadow(w.options))!;
   assert.equal(guard.signal.aborted, false, "the guard never aborted, so no veto listener fired");
   assert.equal(result.reason, "daemon_event");
@@ -1795,12 +1796,12 @@ test("a path observed in two groups with a different bare path or selector is de
     await withDeletion(1, w => {
       w.groups.push({ barePath: second.barePath,
         selector: { runId: second.runId ?? "run0", generation: second.generation ?? 1, attempt: second.attempt }, paths: ["/tree/0"] });
-      const inner = w.options.git.inspectRetainedSources;
-      w.options.git.inspectRetainedSources = async o => {
+      const inner = singleInspect(w.options.git.inspectEpochRetainedGroups);
+      w.options.git.inspectEpochRetainedGroups = perGroupInspect(async o => {
         const r = await inner(o);
         for (const src of r.sources) src.barePath = o.barePath!;
         return r;
-      };
+      });
     }, (w, result) => {
       noMutation(w);
       assert.equal(result.would_delete, 0, label); assert.equal(result.deleted, 0, label);

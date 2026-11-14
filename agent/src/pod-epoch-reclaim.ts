@@ -113,7 +113,7 @@ interface Options {
   ownership: PodEpochOwnership;
   consumption: { result: "fresh" | "existing" | "full"; mayEvaluate: boolean };
   dockerHost?: string;
-  git: Pick<GitCache, "discoverEpochRetainedSources" | "inspectRetainedSources">;
+  git: Pick<GitCache, "discoverEpochRetainedSources" | "inspectEpochRetainedGroups">;
   client: {
     listRecoveryHolds(runId: string, signal?: AbortSignal): Promise<RecoveryHoldsResponse>;
     getRunOwnership(runId: string, options: { signal: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
@@ -741,7 +741,18 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       for (const p of fresh) censusPaths.add(p);
       groups.push(group);
     }
+    // Maximal consecutive runs on one bare share ONE inspection (one lock, one gather). The API reads of every
+    // group in a run happen first, so a later group's reads can follow the first group's authority reads by
+    // up to K-1 extra round trips (shadow-only: the deletion phase re-reads authority before any effect).
+    type CensusGroup = (typeof census.groups)[number];
+    const runs: CensusGroup[][] = [];
     for (const group of groups) {
+      const last = runs[runs.length - 1];
+      if (last && last[0]!.barePath === group.barePath) last.push(group); else runs.push([group]);
+    }
+    for (const run of runs) {
+    const batch: Array<{ group: CensusGroup; holds: RetainedHoldsSnapshot; lifecycle: RetainedLifecycleSnapshot; expected: Set<string> }> = [];
+    for (const group of run) {
       check();
       for (const path of group.paths) examined.add(path);
       // Refuse before either API call: retained metadata is not an HTTP path authority.
@@ -775,14 +786,22 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           countPartialCause(result.partial_causes, readFailureCause(readStage, error)); partial = true;
         }
       }
-      const expected = new Set(group.paths);
-      const inspected = await owned(() => options.git.inspectRetainedSources({
-        epoch: true, maxDescriptors: 200, maxPhysicalPaths: expected.size, work: inspectionWork.shadow,
-        barePath: group.barePath, selector: group.selector, holds, lifecycle,
-        isLivePath: () => false, signal: controller.signal, deadline: hardPass - 5000,
-        budgetMs: Math.max(0, hardPass - 5000 - now()), now,
-        beforeTree: path => { check(); entry(); if (!expected.has(path)) { invalidate("path_set_changed"); stop("path_set_changed"); throw new Refusal("path_set_changed"); } },
-      }), hardPass);
+      batch.push({ group, holds, lifecycle, expected: new Set(group.paths) });
+    }
+    if (batch.length === 0) continue;
+    const inspections = await owned(() => options.git.inspectEpochRetainedGroups({
+      barePath: batch[0]!.group.barePath, maxDescriptors: 200, work: inspectionWork.shadow,
+      requests: batch.map(({ group, holds, lifecycle, expected }) => ({
+        selector: group.selector, holds, lifecycle, maxPhysicalPaths: expected.size,
+        beforeTree: (path: string) => { check(); entry(); if (!expected.has(path)) { invalidate("path_set_changed"); stop("path_set_changed"); throw new Refusal("path_set_changed"); } },
+      })),
+      isLivePath: () => false, signal: controller.signal, deadline: hardPass - 5000,
+      budgetMs: Math.max(0, hardPass - 5000 - now()), now,
+    }), hardPass);
+    // One result per request, in order; anything else is not evidence about these groups.
+    if (!Array.isArray(inspections) || inspections.length !== batch.length) { invalidate("path_set_changed"); throw new Refusal("path_set_changed"); }
+    for (const [index, { group, holds, lifecycle, expected }] of batch.entries()) {
+      const inspected = inspections[index]!;
       check(); entry();
       const actual = new Set(inspected.sources.flatMap(s => s.sources.map(p => p.clonePath)));
       const drift = actual.size !== expected.size || [...actual].some(p => !expected.has(p));
@@ -832,6 +851,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           }
         }
       }
+    }
     }
     check(); entry();
     if (partial) result.inventory_complete = false;
@@ -938,14 +958,18 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           if (!first) { assertSettled(); refusal(); if (controller.signal.aborted) { skipped = true; break; } continue; }
           // 3. entry and daemon health, then re-inspect this source: it must still be the same candidate.
           check(); entry();
-          const inspected = await owned(() => options.git.inspectRetainedSources({
-            epoch: true, maxDescriptors: 200, maxPhysicalPaths: admit.groupSize, barePath: admit.barePath,
-            selector: admit.selector, holds: first.holds, lifecycle: first.lifecycle, isLivePath: () => false,
-            work: inspectionWork.deletion,
+          const reinspected = await owned(() => options.git.inspectEpochRetainedGroups({
+            maxDescriptors: 200, barePath: admit.barePath,
+            requests: [{
+              selector: admit.selector, holds: first.holds, lifecycle: first.lifecycle, maxPhysicalPaths: admit.groupSize,
+              beforeTree: path => { check(); entry(); if (path !== admit.clonePath) throw new Refusal("path_set_changed"); },
+            }],
+            isLivePath: () => false, work: inspectionWork.deletion,
             signal: controller.signal, deadline: hardPass - 5000, budgetMs: Math.max(0, hardPass - 5000 - now()), now,
-            beforeTree: path => { check(); entry(); if (path !== admit.clonePath) throw new Refusal("path_set_changed"); },
           }), hardPass, true);
           check(); entry();
+          const inspected = Array.isArray(reinspected) && reinspected.length === 1 ? reinspected[0] : undefined;
+          if (!inspected) { assertSettled(); refusal(); continue; }
           const only = inspected.sources.length === 1 ? inspected.sources[0]! : undefined;
           const plain = only?.disposition?.kind === "local_discard" || only?.epochSettlement?.disposition.kind === "local_discard";
           if (!only || inspected.partial || inspected.unreadable !== 0 || only.runId !== runId || only.barePath !== admit.barePath ||

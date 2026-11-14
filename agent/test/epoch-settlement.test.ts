@@ -9,7 +9,7 @@ import { acquireWorkerLifetime, type WorkerLifetime } from "../src/authority-loc
 import { openAuthorityStore, type AuthorityFsOps, type SlotSnapshot } from "../src/completion-authority.js";
 import { runPodEpochShadow, PodEpochSettlementError, type PodEpochDeletionDeps } from "../src/pod-epoch-reclaim.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
-import { daemon, ENABLE_DELETION_FOR_TEST } from "./pod-epoch-reclaim-support.js";
+import { daemon, ENABLE_DELETION_FOR_TEST, perGroupInspect, singleInspect } from "./pod-epoch-reclaim-support.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { RunRunner } from "../src/runner.js";
 import { buildPodEpochDeletionDeps, buildWorkerGitCache } from "../src/main.js";
@@ -636,16 +636,16 @@ for (const fault of ["chmod", "entry cap"] as const) {
         const real = s.git;
         o.git = {
           discoverEpochRetainedSources: opts => real.discoverEpochRetainedSources(opts),
-          inspectRetainedSources: async opts => {
+          inspectEpochRetainedGroups: perGroupInspect(async opts => {
             const second = ++calls.inspections === 2;
             if (second && fault === "chmod") fs.chmodSync(locked, 0o000);
-            const result = await real.inspectRetainedSources(second && fault === "entry cap" ? { ...opts, measureCaps: { maxEntries: 1 } } : opts);
+            const result = await singleInspect(batch => real.inspectEpochRetainedGroups(batch))(second && fault === "entry cap" ? { ...opts, measureCaps: { maxEntries: 1 } } : opts);
             if (second) {
               const source = result.sources[0]!;
               reports.push({ partial: result.partial, shortfall: source.sources[0]!.measurementShortfall, bytesState: source.bytesState });
             }
             return result;
-          },
+          }),
         };
         deps.git = {
           assertNoUnsettledDeletes: () => real.assertNoUnsettledDeletes(),

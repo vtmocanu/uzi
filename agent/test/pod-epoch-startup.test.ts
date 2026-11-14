@@ -180,7 +180,7 @@ test("an undeclared runtime acquires SH, consumes the UID and yields values the 
   const verdict = await runPodEpochShadow({
     bootstrap: boundary.epochBootstrap, ownership: boundary.epochOwnership, consumption: boundary.epochConsumption,
     signal: controller.signal, readEvidence: async () => { reads++; return ""; },
-    git: { discoverEpochRetainedSources: async () => assert.fail("no census"), inspectRetainedSources: async () => assert.fail("no inspection") },
+    git: { discoverEpochRetainedSources: async () => assert.fail("no census"), inspectEpochRetainedGroups: async () => assert.fail("no inspection") },
     client: { listRecoveryHolds: async () => assert.fail("no holds"), getRunOwnership: async () => assert.fail("no ownership") },
   });
   assert.equal(reads, 0);

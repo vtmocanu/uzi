@@ -2681,7 +2681,11 @@ export interface EpochRetainedLimits {
   maxObjectStoreBytes?: number;
 }
 
-/** Diagnostic-only counters of retained-source work; no decision may read them. ms values are rounded per call. */
+/**
+ * Diagnostic-only counters of retained-source work; no decision may read them. ms values are rounded per call.
+ * A `work` sink counts everything its public call does, including GitCache calls made from the call's own
+ * callbacks (none of the pod-epoch callbacks call git today).
+ */
 export type RetainedWorkCounters = {
   gathers: number; gather_ms: number; tree_walks: number; tree_entries: number; tree_ms: number;
 };
@@ -2712,7 +2716,7 @@ export interface EpochRetainedDiscoveryResult {
 }
 
 export interface RetainedInspectOptions {
-  /** Optional diagnostic sink for gather and tree-walk work performed by this call. */
+  /** Optional diagnostic sink for gather and tree-walk work performed by this call, including GitCache calls its callbacks make. */
   work?: RetainedWorkCounters;
   signal?: AbortSignal;
   /** Absolute wall-clock deadline, also covering measurement and queued locks. */
@@ -2738,6 +2742,50 @@ export interface RetainedInspectOptions {
   budgetMs?: number;
   /** Test seam: smaller caps on the measurement walk than the defaults. */
   measureCaps?: RetainedMeasureCaps;
+}
+
+/** One epoch group of {@link GitCache.inspectEpochRetainedGroups}; each field behaves as in {@link RetainedInspectOptions}. */
+export interface EpochInspectGroupRequest {
+  selector: RetainedSourceSelector;
+  holds: RetainedHoldsSnapshot;
+  lifecycle: RetainedLifecycleSnapshot;
+  maxPhysicalPaths: number;
+  beforeTree?: (clonePath: string) => void;
+  measureCaps?: RetainedMeasureCaps;
+}
+
+export interface EpochInspectGroupsOptions {
+  /** Optional diagnostic sink for gather and tree-walk work performed by this call. */
+  work?: RetainedWorkCounters;
+  signal?: AbortSignal;
+  deadline?: number;
+  barePath: string;
+  requests: EpochInspectGroupRequest[];
+  maxDescriptors?: number;
+  epochLimits?: EpochRetainedLimits;
+  isLivePath: (clonePath: string) => boolean;
+  now?: () => number;
+  budgetMs?: number;
+}
+
+interface InspectBatchCommon {
+  epoch: boolean;
+  barePath: string | undefined;
+  maxDescriptors: number | undefined;
+  signal: AbortSignal | undefined;
+  deadline: number | undefined;
+  budgetMs: number | undefined;
+  now: (() => number) | undefined;
+  isLivePath: (clonePath: string) => boolean;
+}
+
+interface InspectBatchRequest {
+  selector: RetainedSourceSelector | undefined;
+  holds: RetainedHoldsSnapshot | undefined;
+  lifecycle: RetainedLifecycleSnapshot | undefined;
+  maxPhysicalPaths: number | undefined;
+  beforeTree: ((clonePath: string) => void) | undefined;
+  measureCaps: RetainedMeasureCaps | undefined;
 }
 
 export interface RetainedInspectResult {
@@ -3892,10 +3940,10 @@ export class GitCache {
     closureCache: { identities: Map<string, Map<string, ClosureObject>>; entries: number };
   }>();
 
-  // Each public invocation owns its sidecars, including concurrent calls on this cache.
   // Diagnostic-only work sink for the active public retained call (undefined when the caller passed none).
   private readonly retainedWorkScope = new AsyncLocalStorage<RetainedWorkCounters | undefined>();
 
+  // Each public invocation owns its sidecars, including concurrent calls on this cache.
   private readonly retainedCauseScope = new AsyncLocalStorage<{
     prefix: "census" | "inspection"; errors: WeakMap<object, PartialCauses>; counted: Set<unknown>;
   }>();
@@ -14828,34 +14876,74 @@ export class GitCache {
    * to get a disposition.
    */
   async inspectRetainedSources(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
-    const run = () => this.inspectRetainedSourcesScoped(opts);
+    const run = async () => (await this.inspectRetainedBatchScoped({
+      epoch: opts.epoch === true, barePath: opts.barePath, maxDescriptors: opts.maxDescriptors, signal: opts.signal,
+      deadline: opts.deadline, budgetMs: opts.budgetMs, now: opts.now, isLivePath: opts.isLivePath,
+    }, [{
+      selector: opts.selector, holds: opts.holds, lifecycle: opts.lifecycle, maxPhysicalPaths: opts.maxPhysicalPaths,
+      beforeTree: opts.beforeTree, measureCaps: opts.measureCaps,
+    }]))[0]!;
     return this.retainedWorkScope.run(opts.work, () => this.retainedCauseScope.run({ prefix: "inspection", errors: new WeakMap(), counted: new Set() },
       () => opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run()));
   }
 
-  private async inspectRetainedSourcesScoped(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
-    const maxDescriptors = opts.epoch ? this.retainedCap(opts.maxDescriptors, 200) : RETAINED_MAX_DESCRIPTORS;
-    const maxPhysicalPaths = opts.epoch ? this.retainedCap(opts.maxPhysicalPaths, 200) : Infinity;
-    const physicalPaths = new Set<string>();
-    const clock = opts.now ?? Date.now;
+  /**
+   * issue #4265 — epoch-only multi-request inspection of ONE bare: one bare-lock section and ONE gather
+   * serve every request, and each request is then filtered, evaluated and measured against that same
+   * snapshot with its own selector, holds, lifecycle, caps, `beforeTree` and measurement cache (a tree
+   * named by two requests is walked once per request). Results come back in request order. A bare-level
+   * stop or failure marks every request and is recorded once in each request's own `partialCauses`; a
+   * `beforeTree` binding failure in any request strips dispositions and epoch settlements from every
+   * request's sources and makes every request partial. Always runs inside the epoch limit store.
+   */
+  async inspectEpochRetainedGroups(opts: EpochInspectGroupsOptions): Promise<RetainedInspectResult[]> {
+    if (opts.requests.length === 0) return [];
+    return this.retainedWorkScope.run(opts.work, () => this.retainedCauseScope.run({ prefix: "inspection", errors: new WeakMap(), counted: new Set() },
+      () => this.epochRetained.run(this.epochLimits(opts.epochLimits), () => this.inspectRetainedBatchScoped({
+        epoch: true, barePath: opts.barePath, maxDescriptors: opts.maxDescriptors, signal: opts.signal,
+        deadline: opts.deadline, budgetMs: opts.budgetMs, now: opts.now, isLivePath: opts.isLivePath,
+      }, opts.requests.map(r => ({
+        selector: r.selector, holds: r.holds, lifecycle: r.lifecycle, maxPhysicalPaths: r.maxPhysicalPaths,
+        beforeTree: r.beforeTree, measureCaps: r.measureCaps,
+      }))))));
+  }
+
+  private async inspectRetainedBatchScoped(common: InspectBatchCommon, inputs: InspectBatchRequest[]): Promise<RetainedInspectResult[]> {
+    const epoch = common.epoch;
+    const maxDescriptors = epoch ? this.retainedCap(common.maxDescriptors, 200) : RETAINED_MAX_DESCRIPTORS;
+    const clock = common.now ?? Date.now;
     let observedNow = -Infinity;
     const now = () => (observedNow = clock());
-    const budgetMs = opts.budgetMs ?? RETAINED_INSPECT_BUDGET_MS;
+    const budgetMs = common.budgetMs ?? RETAINED_INSPECT_BUDGET_MS;
     const deadline = now() + budgetMs;
-    const operationDeadline = Math.min(opts.deadline ?? Infinity, Date.now() +
-      (opts.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS)));
-    const partialCauses: PartialCauses = {};
-    let partial = false;
-    let unreadable = 0;
+    const operationDeadline = Math.min(common.deadline ?? Infinity, Date.now() +
+      (common.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS)));
     type Evaluated = Awaited<ReturnType<GitCache["evaluateRetained"]>>;
-    const found: Array<{ g: GatheredBare; rec: GatheredRecord; ev: Evaluated }> = [];
+    type Shortfall = MeasurementShortfall;
+    const outerErrors = this.retainedCauseScope.getStore()?.errors ?? new WeakMap<object, PartialCauses>();
+    // Each request owns its cause dedup (`counted`), so one bare-level error is recorded once in EACH request,
+    // exactly as separate calls would; the detail map is shared because it is keyed by the error object.
+    const reqs = inputs.map((input) => ({
+      ...input,
+      maxPhysicalPaths: epoch ? this.retainedCap(input.maxPhysicalPaths, 200) : Infinity,
+      physicalPaths: new Set<string>(),
+      found: [] as Array<{ g: GatheredBare; rec: GatheredRecord; ev: Evaluated }>,
+      partialCauses: {} as PartialCauses,
+      partial: false,
+      unreadable: 0,
+      sources: [] as RetainedSourceEvidence[],
+      bindingCounted: false,
+      scope: { prefix: "inspection" as const, errors: outerErrors, counted: new Set<unknown>() },
+    }));
     const exhausted = (err: unknown): boolean =>
-      opts.signal?.aborted === true || now() >= deadline || Date.now() >= (opts.deadline ?? Infinity) || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
+      common.signal?.aborted === true || now() >= deadline || Date.now() >= (common.deadline ?? Infinity) || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
     // Reuse the predicate's observations: diagnostic clock reads must not consume a test clock.
-    const interruption = (): PartialCause => opts.signal?.aborted ? "inspection_interrupted" :
-      observedNow >= deadline ? "inspection_budget" : Date.now() >= (opts.deadline ?? Infinity) ? "inspection_deadline" : "inspection_interrupted";
-    const failure = (error: unknown, stopped: boolean) => this.collectRetainedCause(error, partialCauses,
-      stopped ? interruption() : "inspection_unreadable_bare");
+    const interruption = (): PartialCause => common.signal?.aborted ? "inspection_interrupted" :
+      observedNow >= deadline ? "inspection_budget" : Date.now() >= (common.deadline ?? Infinity) ? "inspection_deadline" : "inspection_interrupted";
+    const failureAll = (error: unknown, stopped: boolean) => {
+      const fallback: PartialCause = stopped ? interruption() : "inspection_unreadable_bare";
+      for (const r of reqs) this.retainedCauseScope.run(r.scope, () => this.collectRetainedCause(error, r.partialCauses, fallback));
+    };
     const byIdentity = (x: { rec: GatheredRecord }, y: { rec: GatheredRecord }): number =>
       (x.rec.runId < y.rec.runId ? -1 : x.rec.runId > y.rec.runId ? 1 : 0) ||
       (x.rec.parts[0]!.clonePath < y.rec.parts[0]!.clonePath ? -1 : x.rec.parts[0]!.clonePath > y.rec.parts[0]!.clonePath ? 1 : 0);
@@ -14863,157 +14951,177 @@ export class GitCache {
       // One recovery clock covers the bare locks (queued waits included), the gather and the
       // evaluation; exhausting it is `partial`, never a silently shorter list.
       // (An injected clock governs the budget in tests; the real-time guard then stays at the default.)
-      await this.withRecoveryOperation(opts.signal ?? new AbortController().signal, operationDeadline, async () => {
-        for (const bare of await this.retainedBares(opts.barePath)) {
+      await this.withRecoveryOperation(common.signal ?? new AbortController().signal, operationDeadline, async () => {
+        for (const bare of await this.retainedBares(common.barePath)) {
           if (now() >= deadline) {
-            countPartialCause(partialCauses, "inspection_budget");
-            partial = true;
+            for (const r of reqs) {
+              countPartialCause(r.partialCauses, "inspection_budget");
+              r.partial = true;
+            }
             break;
           }
           try {
             // Gather AND evaluate in the same critical section: the disposition is computed from the
-            // same lock-held snapshot as the descriptor it is reported with.
+            // same lock-held snapshot as the descriptor it is reported with. Every request shares the
+            // one gather.
             await this.withLock(bare, async () => {
               const g = await this.gatherRetainedUnderLock(bare);
-              const matching = g.records
-                .filter((rec) => opts.selector === undefined
-                  // The aggregate view omits an attempt a running flight is still using.
-                  ? !(rec.kind === "attempt" && rec.parts[0]!.ledgerState === "live" && opts.isLivePath(rec.parts[0]!.clonePath))
-                  : this.matchesRetainedSelector(rec, opts.selector))
-                .map((rec) => ({ g, rec }))
-                .sort(byIdentity)
-                .slice(0, maxDescriptors + 1);
-              for (const { rec } of matching) {
-                this.checkRecoveryInterruption();
-                if (opts.epoch) {
-                  const fresh = [...new Set(rec.parts.map(p => p.clonePath))].filter(p => !physicalPaths.has(p));
-                  if (found.length >= maxDescriptors || physicalPaths.size + fresh.length > maxPhysicalPaths) {
-                    countPartialCause(partialCauses, found.length >= maxDescriptors ? "inspection_descriptor_cap" : "inspection_physical_path_cap");
-                    partial = true;
-                    continue;
+              for (const r of reqs) {
+                const matching = g.records
+                  .filter((rec) => r.selector === undefined
+                    // The aggregate view omits an attempt a running flight is still using.
+                    ? !(rec.kind === "attempt" && rec.parts[0]!.ledgerState === "live" && common.isLivePath(rec.parts[0]!.clonePath))
+                    : this.matchesRetainedSelector(rec, r.selector))
+                  .map((rec) => ({ g, rec }))
+                  .sort(byIdentity)
+                  .slice(0, maxDescriptors + 1);
+                for (const { rec } of matching) {
+                  this.checkRecoveryInterruption();
+                  if (epoch) {
+                    const fresh = [...new Set(rec.parts.map(p => p.clonePath))].filter(p => !r.physicalPaths.has(p));
+                    if (r.found.length >= maxDescriptors || r.physicalPaths.size + fresh.length > r.maxPhysicalPaths) {
+                      countPartialCause(r.partialCauses, r.found.length >= maxDescriptors ? "inspection_descriptor_cap" : "inspection_physical_path_cap");
+                      r.partial = true;
+                      continue;
+                    }
+                    for (const p of fresh) r.physicalPaths.add(p);
                   }
-                  for (const p of fresh) physicalPaths.add(p);
+                  const ev = await this.evaluateRetained(g, rec, {
+                    holds: r.selector === undefined ? undefined : r.holds,
+                    ...(r.selector === undefined || r.lifecycle === undefined ? {} : { lifecycle: r.lifecycle }),
+                    isLivePath: common.isLivePath,
+                  });
+                  r.found.push({ g, rec, ev });
                 }
-                const ev = await this.evaluateRetained(g, rec, {
-                  holds: opts.selector === undefined ? undefined : opts.holds,
-                  ...(opts.selector === undefined || opts.lifecycle === undefined ? {} : { lifecycle: opts.lifecycle }),
-                  isLivePath: opts.isLivePath,
-                });
-                found.push({ g, rec, ev });
               }
             });
           } catch (err) {
             const stopped = exhausted(err);
-            failure(err, stopped);
+            failureAll(err, stopped);
             if (stopped) {
-              partial = true;
+              for (const r of reqs) r.partial = true;
               break;
             }
-            unreadable++;
+            for (const r of reqs) r.unreadable++;
             this.log.warn("retained source inspection could not read a bare", { error: gitErrorMessage(err) });
           }
         }
       });
     } catch (err) {
       const stopped = exhausted(err);
-      failure(err, stopped);
-      if (stopped) partial = true;
+      failureAll(err, stopped);
+      if (stopped) for (const r of reqs) r.partial = true;
       else {
-        unreadable++;
+        for (const r of reqs) r.unreadable++;
         this.log.warn("retained source inspection could not enumerate the bares", { error: gitErrorMessage(err) });
       }
     }
-    found.sort(byIdentity);
-    if (found.length > maxDescriptors) {
-      countPartialCause(partialCauses, "inspection_descriptor_cap");
-      partial = true;
-      found.length = maxDescriptors;
-    }
-    const sources: RetainedSourceEvidence[] = [];
-    type Shortfall = MeasurementShortfall;
-    const measurements = new Map<string, { bytes: number; complete: boolean; local?: Shortfall }>();
+    // A beforeTree binding failure in ANY request poisons the whole batch.
     let bindingFailed = false;
-    for (const { g, rec, ev } of found) {
-      const parts: RetainedSourcePart[] = [];
-      let measured = 0;
-      let unmeasured = 0;
-      let total = 0;
-      for (const p of rec.parts) {
-        let bytes: number | null = null;
-        let shortfall: Shortfall | undefined;
-        if (p.presence === "missing") bytes = 0;
-        else if (p.presence === "present") {
-          let m: { bytes: number; complete: boolean; local?: Shortfall } = { bytes: 0, complete: false };
-          try {
-            if (bindingFailed) throw new Error("retained tree binding check failed");
-            m = (opts.epoch ? measurements.get(p.clonePath) : undefined) ??
-              await this.withRecoveryOperation(opts.signal ?? new AbortController().signal, operationDeadline,
-                async () => {
-                  this.checkRecoveryInterruption();
-                  try { opts.beforeTree?.(p.clonePath); }
-                  catch (error) { bindingFailed = true; countPartialCause(partialCauses, "tree_binding_failed"); throw error; }
-                  this.checkRecoveryInterruption();
-                  const detail: PartialCauses = {};
-                  try { return await this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps, detail); }
-                  finally {
-                    // Only executed walks arrive here; cache hits bypass this callback.
-                    mergePartialCauses(partialCauses, detail);
-                  }
-                });
-            if (opts.epoch) measurements.set(p.clonePath, m);
-          } catch (error) {
-            const stopped = exhausted(error);
-            if (stopped) this.collectRetainedCause(error, partialCauses, interruption());
-            if (!stopped) unreadable++;
-          }
-          bytes = m.complete ? m.bytes : null;
-          // An epoch inspection keeps a tree-local shortfall (permission denied at the root or below, or a
-          // measurement cap) out of the pass-wide `partial`: the part stays unmeasured and the source is
-          // not byte-complete, so nothing is granted for it. Only a live signal, absolute deadline and
-          // inspection budget qualify. The budget is re-read here, and only on this local-stop path,
-          // because the walk's own check precedes its directory close and a cache hit reuses an earlier
-          // decision: a budget spent since then makes the stop pass-wide.
-          if (!m.complete) {
-            if (opts.epoch && m.local !== undefined && opts.signal?.aborted !== true && Date.now() < (opts.deadline ?? Infinity)) {
-              if (now() < deadline) shortfall = m.local;
-              else { countPartialCause(partialCauses, "inspection_budget"); partial = true; }
-            } else partial = true;
-          }
+    for (const r of reqs) {
+      await this.retainedCauseScope.run(r.scope, async () => {
+        r.found.sort(byIdentity);
+        if (r.found.length > maxDescriptors) {
+          countPartialCause(r.partialCauses, "inspection_descriptor_cap");
+          r.partial = true;
+          r.found.length = maxDescriptors;
         }
-        if (bytes === null) unmeasured++;
-        else {
-          measured++;
-          total += bytes;
+        // Per-request cache: no measurement is reused across requests.
+        const measurements = new Map<string, { bytes: number; complete: boolean; local?: Shortfall }>();
+        for (const { g, rec, ev } of r.found) {
+          const parts: RetainedSourcePart[] = [];
+          let measured = 0;
+          let unmeasured = 0;
+          let total = 0;
+          for (const p of rec.parts) {
+            let bytes: number | null = null;
+            let shortfall: Shortfall | undefined;
+            if (p.presence === "missing") bytes = 0;
+            else if (p.presence === "present") {
+              let m: { bytes: number; complete: boolean; local?: Shortfall } = { bytes: 0, complete: false };
+              try {
+                if (bindingFailed) throw new Error("retained tree binding check failed");
+                m = (epoch ? measurements.get(p.clonePath) : undefined) ??
+                  await this.withRecoveryOperation(common.signal ?? new AbortController().signal, operationDeadline,
+                    async () => {
+                      this.checkRecoveryInterruption();
+                      try { r.beforeTree?.(p.clonePath); }
+                      catch (error) {
+                        bindingFailed = true;
+                        r.bindingCounted = true;
+                        countPartialCause(r.partialCauses, "tree_binding_failed");
+                        throw error;
+                      }
+                      this.checkRecoveryInterruption();
+                      const detail: PartialCauses = {};
+                      try { return await this.measureAllocated(p.clonePath, now, deadline, r.measureCaps, detail); }
+                      finally {
+                        // Only executed walks arrive here; cache hits bypass this callback.
+                        mergePartialCauses(r.partialCauses, detail);
+                      }
+                    });
+                if (epoch) measurements.set(p.clonePath, m);
+              } catch (error) {
+                const stopped = exhausted(error);
+                if (stopped) this.collectRetainedCause(error, r.partialCauses, interruption());
+                if (!stopped) r.unreadable++;
+              }
+              bytes = m.complete ? m.bytes : null;
+              // An epoch inspection keeps a tree-local shortfall (permission denied at the root or below, or a
+              // measurement cap) out of the pass-wide `partial`: the part stays unmeasured and the source is
+              // not byte-complete, so nothing is granted for it. Only a live signal, absolute deadline and
+              // inspection budget qualify. The budget is re-read here, and only on this local-stop path,
+              // because the walk's own check precedes its directory close and a cache hit reuses an earlier
+              // decision: a budget spent since then makes the stop pass-wide.
+              if (!m.complete) {
+                if (epoch && m.local !== undefined && common.signal?.aborted !== true && Date.now() < (common.deadline ?? Infinity)) {
+                  if (now() < deadline) shortfall = m.local;
+                  else { countPartialCause(r.partialCauses, "inspection_budget"); r.partial = true; }
+                } else r.partial = true;
+              }
+            }
+            if (bytes === null) unmeasured++;
+            else {
+              measured++;
+              total += bytes;
+            }
+            parts.push({
+              clonePath: p.clonePath, attempt: p.attemptId ?? "canonical", generation: p.generation ?? "none",
+              presence: p.presence, ledgerState: p.ledgerState, live: ev.live.get(p.clonePath) ?? false, allocatedBytes: bytes,
+              ...(shortfall ? { measurementShortfall: shortfall } : {}),
+            });
+          }
+          const head = rec.parts[0]!;
+          r.sources.push({
+            barePath: g.barePath, runId: rec.runId, branch: rec.branch, key: rec.key, kind: rec.kind,
+            generation: head.generation ?? "none", attempt: head.attemptId ?? "canonical", ledgerState: head.ledgerState,
+            journalState: rec.journalState, markerState: rec.markerState,
+            presence: rec.parts.some((p) => p.presence === "unsafe") ? "unsafe"
+              : rec.parts.every((p) => p.presence === "missing") ? "missing" : "present",
+            descriptor: rec.digest, allocatedBytes: unmeasured === 0 ? total : measured === 0 ? null : total,
+            bytesState: unmeasured === 0 ? "measured" : measured === 0 ? "unknown" : "partial",
+            sources: parts, consumers: [...ev.consumers, ...ev.blockers.map((b) => `blocker:${b}`)], localRecords: ev.localRecords,
+            holds: ev.holdsView, disposition: ev.disposition,
+            ...(ev.epochSettlement ? { epochSettlement: ev.epochSettlement } : {}),
+            ...(rec.epochJournalExtraFields ? { epochJournalExtraFields: true as const } : {}),
+          });
         }
-        parts.push({
-          clonePath: p.clonePath, attempt: p.attemptId ?? "canonical", generation: p.generation ?? "none",
-          presence: p.presence, ledgerState: p.ledgerState, live: ev.live.get(p.clonePath) ?? false, allocatedBytes: bytes,
-          ...(shortfall ? { measurementShortfall: shortfall } : {}),
-        });
-      }
-      const head = rec.parts[0]!;
-      sources.push({
-        barePath: g.barePath, runId: rec.runId, branch: rec.branch, key: rec.key, kind: rec.kind,
-        generation: head.generation ?? "none", attempt: head.attemptId ?? "canonical", ledgerState: head.ledgerState,
-        journalState: rec.journalState, markerState: rec.markerState,
-        presence: rec.parts.some((p) => p.presence === "unsafe") ? "unsafe"
-          : rec.parts.every((p) => p.presence === "missing") ? "missing" : "present",
-        descriptor: rec.digest, allocatedBytes: unmeasured === 0 ? total : measured === 0 ? null : total,
-        bytesState: unmeasured === 0 ? "measured" : measured === 0 ? "unknown" : "partial",
-        sources: parts, consumers: [...ev.consumers, ...ev.blockers.map((b) => `blocker:${b}`)], localRecords: ev.localRecords,
-        holds: ev.holdsView, disposition: ev.disposition,
-        ...(ev.epochSettlement ? { epochSettlement: ev.epochSettlement } : {}),
-        ...(rec.epochJournalExtraFields ? { epochJournalExtraFields: true as const } : {}),
       });
     }
     if (bindingFailed) {
-      partial = true;
-      for (const source of sources) {
-        source.disposition = undefined;
-        delete source.epochSettlement;
+      for (const r of reqs) {
+        r.partial = true;
+        if (!r.bindingCounted) countPartialCause(r.partialCauses, "tree_binding_failed");
+        for (const source of r.sources) {
+          source.disposition = undefined;
+          delete source.epochSettlement;
+        }
       }
     }
-    return { partialCauses, sources, partial, unreadable, sampledAt: new Date(now()).toISOString() };
+    return reqs.map((r) => ({
+      partialCauses: r.partialCauses, sources: r.sources, partial: r.partial, unreadable: r.unreadable,
+      sampledAt: new Date(now()).toISOString(),
+    }));
   }
 
   /**

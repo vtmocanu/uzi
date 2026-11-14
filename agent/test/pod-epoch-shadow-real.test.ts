@@ -13,7 +13,7 @@ import { resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
-import { ENABLE_DELETION_FOR_TEST } from "./pod-epoch-reclaim-support.js";
+import { ENABLE_DELETION_FOR_TEST, perGroupInspect, singleInspect } from "./pod-epoch-reclaim-support.js";
 
 // The shadow pass over a REAL GitCache (discovery and inspection not stubbed): it may read a bare
 // holding a protected episode and a strict-plain live attempt, and must write nothing.
@@ -138,10 +138,10 @@ test("the shadow pass over a real GitCache reads a protected episode and a stric
       client: { listRecoveryHolds: async run_id => ({ run_id, holds: [] }), getRunOwnership: async () => ({ status: "completed" }) },
       git: {
         discoverEpochRetainedSources: opts => git.discoverEpochRetainedSources(opts),
-        inspectRetainedSources: async opts => {
-          const r = await git.inspectRetainedSources(opts);
-          seen.push(...r.sources);
-          return r;
+        inspectEpochRetainedGroups: async batch => {
+          const results = await git.inspectEpochRetainedGroups(batch);
+          for (const r of results) seen.push(...r.sources);
+          return results;
         },
       },
     }))!;
@@ -185,8 +185,8 @@ test("#3775 separate shadow passes on one real GitCache do not share diagnostics
     client: { getRunOwnership: async () => ({ status: "completed" }),
       listRecoveryHolds: async run_id => ({ run_id, holds: [] }) },
     git: { discoverEpochRetainedSources: opts => git.discoverEpochRetainedSources(opts),
-      inspectRetainedSources: opts => git.inspectRetainedSources({ ...opts,
-        ...(capped ? { measureCaps: { maxEntries: 1 } } : {}) }) },
+      inspectEpochRetainedGroups: batch => git.inspectEpochRetainedGroups({ ...batch,
+        requests: batch.requests.map(r => ({ ...r, ...(capped ? { measureCaps: { maxEntries: 1 } } : {}) })) }) },
   });
   try {
     const partial = (await pass())!;
@@ -243,10 +243,10 @@ for (const mode of ["entries", "opendir", "ownership", "holds", "multiple"] as c
         },
         git: {
           discoverEpochRetainedSources: opts => git.discoverEpochRetainedSources(opts),
-          inspectRetainedSources: opts => {
-            snapshots.push({ run: opts.selector!.runId, lifecycle: opts.lifecycle, holds: opts.holds });
-            return git.inspectRetainedSources({ ...opts,
-              ...(mode === "entries" && opts.selector!.runId === PLAIN_RUN ? { measureCaps: { maxEntries: 1 } } : {}) });
+          inspectEpochRetainedGroups: batch => {
+            for (const r of batch.requests) snapshots.push({ run: r.selector.runId, lifecycle: r.lifecycle, holds: r.holds });
+            return git.inspectEpochRetainedGroups({ ...batch, requests: batch.requests.map(r =>
+              mode === "entries" && r.selector.runId === PLAIN_RUN ? { ...r, measureCaps: { maxEntries: 1 } } : r) });
           },
         },
       }))!;
@@ -290,6 +290,8 @@ const RUN_B = "run-b";
 type InspectOptions = Parameters<GitCache["inspectRetainedSources"]>[0];
 type InspectResult = Awaited<ReturnType<GitCache["inspectRetainedSources"]>>;
 type ShadowOptions = Parameters<typeof runPodEpochShadow>[0];
+type BatchOptions = Parameters<GitCache["inspectEpochRetainedGroups"]>[0];
+type BatchRequest = BatchOptions["requests"][number];
 const codedError = (code: string) => Object.assign(new Error("private"), { code });
 
 /** An abandoned ledger attempt (no journal names it): a `discard`-basis candidate once its run is terminal. */
@@ -337,6 +339,8 @@ function deletionSpies() {
 async function shadowPass(tune: {
   inspect?: (opts: InspectOptions, real: (o?: InspectOptions) => Promise<InspectResult>) => Promise<InspectResult>;
   deletion?: ReturnType<typeof deletionSpies>;
+  /** Run the production batch seam (one inspection per bare run) instead of the per-group adapter; `batch` may reshape the call. */
+  production?: (batch: BatchOptions) => BatchOptions;
 } = {}) {
   const d = await daemon();
   const seen: RetainedSourceEvidence[] = [];
@@ -351,14 +355,18 @@ async function shadowPass(tune: {
       client: { getRunOwnership: async () => ({ status: "completed" }), listRecoveryHolds: async run_id => ({ run_id, holds: [] }) },
       git: {
         discoverEpochRetainedSources: opts => git.discoverEpochRetainedSources(opts),
-        inspectRetainedSources: async opts => {
+        inspectEpochRetainedGroups: tune.production ? async batch => {
+          const results = await git.inspectEpochRetainedGroups(tune.production!(batch));
+          for (const r of results) seen.push(...r.sources);
+          return results;
+        } : perGroupInspect(async opts => {
           const real = async (o: InspectOptions = opts) => {
-            const r = await git.inspectRetainedSources(o);
+            const r = await singleInspect(batch => git.inspectEpochRetainedGroups(batch))(o);
             seen.push(...r.sources);
             return r;
           };
           return tune.inspect ? tune.inspect(opts, real) : real();
-        },
+        }),
       },
       ...(tune.deletion ? { deletion: tune.deletion.deletion } : {}),
     };
@@ -553,30 +561,228 @@ test("#4265 nothing is counted without a sink and a sink only counts its own cal
   let captured: InspectOptions | undefined;
   await shadowPass({ inspect: (opts, real) => { captured ??= opts; return real(opts); } });
   assert.ok(captured);
-  const zero = () => ({ gathers: 0, gather_ms: 0, tree_walks: 0, tree_entries: 0, tree_ms: 0 });
-  const sink = zero();
-  await git.inspectRetainedSources({ ...captured, work: undefined });
-  assert.deepEqual(sink, zero());
-  await git.inspectRetainedSources({ ...captured, work: sink });
+  // The finished pass's beforeTree throws through its own check(); replay the call without it.
+  const replay: InspectOptions = { ...captured, beforeTree: undefined };
+  const sink = { gathers: 0, gather_ms: 0, tree_walks: 0, tree_entries: 0, tree_ms: 0 };
+  await git.inspectRetainedSources({ ...replay, work: sink });
   assert.ok(sink.gathers >= 1, JSON.stringify(sink));
-  const counted = { ...sink, gather_ms: 0, tree_ms: 0 };
+  assert.ok(sink.tree_walks >= 1, JSON.stringify(sink));
   const settled = { ...sink };
   await Promise.all([
-    git.inspectRetainedSources({ ...captured, work: undefined }),
-    git.inspectRetainedSources({ ...captured, work: undefined }),
+    git.inspectRetainedSources({ ...replay, work: undefined }),
+    git.inspectRetainedSources({ ...replay, work: undefined }),
   ]);
-  assert.deepEqual(sink, settled, "calls without a sink do not touch an earlier sink");
-  assert.equal(counted.gathers, sink.gathers);
+  assert.deepEqual(sink, settled, "calls without a sink do not touch an earlier sink (walks included)");
 });
 
 test("#4265 the verdict and candidates do not depend on the work counters", async () => {
   seedThree();
   const plain = await shadowPass();
   const stripped = await shadowPass({ inspect: (opts, real) => real({ ...opts, work: undefined }) });
-  assert.equal(stripped.result.inspection_work.shadow.gathers, 0);
+  // Stripping the shadow sink changes no census counter: the two passes did the same census work.
+  assert.equal(stripped.result.inspection_work.census.gathers, plain.result.inspection_work.census.gathers);
+  assert.equal(stripped.result.inspection_work.census.tree_walks, plain.result.inspection_work.census.tree_walks);
   assert.equal(stripped.result.verdict, plain.result.verdict);
   assert.equal(stripped.result.reason, plain.result.reason);
   assert.deepEqual(stripped.result.list, plain.result.list);
   assert.equal(stripped.result.would_delete, plain.result.would_delete);
   assert.equal(stripped.result.kept, plain.result.kept);
+});
+
+// ---- #4265 m2: one gather serves every group on a bare ----
+/** The number of live groups on one bare in the gather regression; the only knob of that test. */
+const BATCH_GROUPS = 24;
+
+/** N abandoned attempts of N distinct terminal runs on one bare, each clone holding a few files. */
+function seedBatchGroups(count: number): string[] {
+  return Array.from({ length: count }, (_, i) => {
+    const n = i + 1;
+    const clone = seedAbandoned(`run-batch-${n}`, `agent/issue-${7000 + n}`, `issue-${7000 + n}`, n);
+    for (const name of ["a", "b", "c"]) fs.writeFileSync(path.join(clone, name), name.repeat(100 * n));
+    return clone;
+  });
+}
+
+test("#4265 N groups on one bare cost ONE shadow gather and one walk per distinct tree", async t => {
+  const clones = seedBatchGroups(BATCH_GROUPS);
+  const started = Date.now();
+  const { result } = await shadowPass({ production: batch => batch });
+  const passMs = Date.now() - started;
+  t.diagnostic(JSON.stringify(result.inspection_work));
+  t.diagnostic(`pass_ms=${passMs} groups=${BATCH_GROUPS}`);
+  assert.equal(result.inspection_work.shadow.gathers, 1, "one inspection gather for the whole run of groups");
+  assert.equal(result.inspection_work.census.gathers, 1, "one census gather");
+  assert.equal(result.inspection_work.shadow.tree_walks, clones.length, "each distinct present path is walked once");
+  assert.equal(result.verdict, "eligible");
+  assert.deepEqual(result.partial_causes, {});
+  assert.equal(result.examined, clones.length);
+  assert.equal(result.would_delete, clones.length);
+  assert.equal(result.kept, 0);
+  assert.deepEqual(names(result.list), baseNames(...clones));
+});
+
+const READ_HOLDS: BatchRequest["holds"] = { state: "read", holds: [] };
+const TERMINAL: BatchRequest["lifecycle"] = { state: "terminal", status: "completed" };
+/** One request per census group of the real bare, in a stable order. */
+async function batchOf(over: (index: number, selector: BatchRequest["selector"], clonePath: string) => Partial<BatchRequest> = () => ({})) {
+  const census = await git.discoverEpochRetainedSources({});
+  const groups = [...census.groups].sort((x, y) => x.paths[0]! < y.paths[0]! ? -1 : x.paths[0]! > y.paths[0]! ? 1 : 0);
+  const options = (requests: BatchRequest[], extra: Partial<BatchOptions> = {}): BatchOptions =>
+    ({ barePath: groups[0]!.barePath, requests, isLivePath: () => false, ...extra });
+  const requests = groups.map((g, i): BatchRequest => ({
+    selector: g.selector, holds: READ_HOLDS, lifecycle: TERMINAL, maxPhysicalPaths: g.paths.length, ...over(i, g.selector, g.paths[0]!),
+  }));
+  return { groups, requests, options };
+}
+const sink = () => ({ gathers: 0, gather_ms: 0, tree_walks: 0, tree_entries: 0, tree_ms: 0 });
+const settled = (r: { sources: Array<{ disposition?: unknown; epochSettlement?: unknown }> }) =>
+  r.sources.filter(s => s.disposition !== undefined || s.epochSettlement !== undefined).length;
+
+test("#4265 batch: results are one per request in request order, each from the one shared snapshot", async t => {
+  seedThree();
+  const { groups, options, requests } = await batchOf();
+  const work = sink();
+  const results = await git.inspectEpochRetainedGroups(options(requests, { work }));
+  t.diagnostic(JSON.stringify(work));
+  assert.equal(results.length, groups.length);
+  assert.equal(work.gathers, 1);
+  results.forEach((r, i) => {
+    assert.equal(r.partial, false);
+    assert.equal(r.unreadable, 0);
+    assert.deepEqual(r.sources.map(s => s.sources.map(p => p.clonePath)), [groups[i]!.paths]);
+    assert.equal(r.sources[0]!.bytesState, "measured");
+  });
+  assert.deepEqual(await git.inspectEpochRetainedGroups(options([])), []);
+});
+
+test("#4265 batch (a): a binding failure in a LATER request strips every request's dispositions and makes all partial", async t => {
+  seedThree();
+  const control = await batchOf();
+  const before = await git.inspectEpochRetainedGroups(control.options(control.requests));
+  const withDisposition = before.reduce((n, r) => n + settled(r), 0);
+  assert.equal(withDisposition, 3, "control: every source carries a disposition");
+  const failing = await batchOf((i) => i === 2 ? { beforeTree: () => { throw new Error("binding failed"); } } : {});
+  const results = await git.inspectEpochRetainedGroups(failing.options(failing.requests));
+  const stillSettled = results.reduce((n, r) => n + settled(r), 0);
+  t.diagnostic(JSON.stringify({ stripped: withDisposition - stillSettled, sources: results.reduce((n, r) => n + r.sources.length, 0) }));
+  assert.equal(stillSettled, 0);
+  assert.ok(results.every(r => r.partial), "every request is partial");
+  assert.ok(results.every(r => r.partialCauses?.tree_binding_failed === 1 && r.partialCauses.inspection_unclassified === undefined),
+    JSON.stringify(results.map(r => r.partialCauses)));
+  assert.ok(results.slice(0, 2).every(r => r.sources.length === 1 && r.sources[0]!.disposition === undefined && !("epochSettlement" in r.sources[0]!)));
+});
+
+for (const mode of ["aborted", "deadline", "budget", "gather-abort", "gather-error", "evaluation-abort"] as const) {
+  test("#4265 batch (b): a bare-level " + mode + " marks every request with its own single cause", async () => {
+    seedThree();
+    const { options, requests } = await batchOf();
+    const controller = new AbortController();
+    let extra: Partial<BatchOptions> = { signal: controller.signal };
+    if (mode === "aborted") controller.abort();
+    if (mode === "deadline") extra = { deadline: Date.now() - 1 };
+    if (mode === "budget") extra = { budgetMs: 0, now: () => 5 };
+    const internals = git as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    if (mode === "gather-abort") mock.method(internals, "gatherRetainedUnderLock", async () => { controller.abort(); controller.signal.throwIfAborted(); });
+    if (mode === "gather-error") mock.method(internals, "gatherRetainedUnderLock", async () => { throw new Error("unreadable bare"); });
+    if (mode === "evaluation-abort") {
+      const evaluate = internals.evaluateRetained!.bind(git);
+      let calls = 0;
+      mock.method(internals, "evaluateRetained", async (...args: unknown[]) => {
+        if (++calls === 2) { controller.abort(); controller.signal.throwIfAborted(); }
+        return evaluate(...args);
+      });
+    }
+    const results = await git.inspectEpochRetainedGroups(options(requests, extra));
+    assert.equal(results.length, requests.length);
+    const cause = mode === "deadline" ? "inspection_deadline" : mode === "budget" ? "inspection_budget" :
+      mode === "gather-error" ? "inspection_unreadable_bare" : "inspection_interrupted";
+    for (const r of results) {
+      assert.deepEqual(r.partialCauses, { [cause]: 1 }, mode + ": " + JSON.stringify(r.partialCauses));
+      if (mode === "gather-error") { assert.equal(r.unreadable, 1); assert.equal(r.partial, false); }
+      else assert.equal(r.partial, true);
+    }
+  });
+}
+
+test("#4265 batch (c): a tree-local cap keeps the other requests measured; a deadline in a walk stops its request", async t => {
+  const { t1, t2, t3 } = seedThree();
+  const capped = await batchOf((i) => i === 1 ? { measureCaps: { maxEntries: 0 } } : {});
+  const results = await git.inspectEpochRetainedGroups(capped.options(capped.requests));
+  t.diagnostic(JSON.stringify(results.map(r => r.sources.map(s => [s.bytesState, s.disposition?.kind ?? s.epochSettlement?.disposition.kind]))));
+  assert.deepEqual(results.map(r => r.sources[0]!.bytesState), ["measured", "unknown", "measured"]);
+  assert.ok(results.every(r => !r.partial), "a tree-local shortfall is not pass-wide");
+  assert.deepEqual(results.map(r => settled(r)), [1, 1, 1]);
+  assert.deepEqual(results[1]!.partialCauses, { measurement_entry_cap: 1 });
+  assert.equal(results[1]!.sources[0]!.sources[0]!.measurementShortfall, "entry_cap");
+  assert.deepEqual(results[0]!.partialCauses, {}); assert.deepEqual(results[2]!.partialCauses, {});
+
+  // A deadline (injected clock) reached while walking the second request's tree.
+  const second = (await batchOf()).groups[1]!.paths[0]!;
+  assert.ok([t1, t2, t3].includes(second));
+  let clock = 0;
+  const open = fsp.opendir;
+  mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    const handle = await open(...args);
+    if (args[0] === second) clock = 100;
+    return handle;
+  });
+  const timed = await batchOf();
+  const stopped = await git.inspectEpochRetainedGroups(timed.options(timed.requests, { now: () => clock, budgetMs: 100 }));
+  assert.equal(stopped[0]!.partial, false, "the request measured before the stop is unaffected");
+  assert.equal(stopped[0]!.sources[0]!.bytesState, "measured");
+  assert.equal(stopped[1]!.partial, true);
+  assert.equal(stopped[1]!.partialCauses?.measurement_deadline, 1);
+  assert.equal(stopped[1]!.partialCauses?.inspection_unclassified, undefined);
+});
+
+test("#4265 batch (d): a tree named in two requests is walked once per request under each request's own caps", async t => {
+  seedThree();
+  const base = await batchOf();
+  const [first, second, third] = base.requests;
+  const requests = [first!, { ...first!, measureCaps: { maxEntries: 1 } }, second!, third!];
+  const work = sink();
+  const results = await git.inspectEpochRetainedGroups(base.options(requests, { work }));
+  // The same tree walked on its own, for the per-walk baseline.
+  const one = sink();
+  await git.inspectEpochRetainedGroups(base.options([first!], { work: one }));
+  t.diagnostic(JSON.stringify({ work, one }));
+  assert.equal(work.gathers, 1);
+  assert.equal(work.tree_walks, requests.length, "one walk per request, none reused across requests");
+  assert.equal(one.tree_walks, 1);
+  assert.equal(results[0]!.sources[0]!.bytesState, "measured");
+  assert.equal(results[1]!.sources[0]!.bytesState, "unknown", "the capped request sees its own shortfall");
+  assert.equal(results[1]!.sources[0]!.sources[0]!.measurementShortfall, "entry_cap");
+  assert.deepEqual(results[0]!.partialCauses, {});
+  assert.deepEqual(results[1]!.partialCauses, { measurement_entry_cap: 1 });
+});
+
+test("#4265 pass: a later group's binding failure yields no candidate and no deletion for any group of the batch", async t => {
+  seedThree();
+  const deletion = deletionSpies();
+  const { result } = await shadowPass({
+    deletion,
+    production: batch => ({ ...batch, requests: batch.requests.map((r, i) => i === batch.requests.length - 1 ?
+      { ...r, beforeTree: () => r.beforeTree!("/not/an/expected/path") } : r) }),
+  });
+  t.diagnostic(JSON.stringify({ verdict: result.verdict, reason: result.reason, causes: result.partial_causes, list: result.list.length }));
+  assert.notEqual(result.verdict, "eligible");
+  assert.equal(result.reason, "path_set_changed");
+  assert.deepEqual(result.list, []);
+  assert.equal(result.would_delete, 0);
+  assert.equal(result.deleted, 0);
+  assert.deepEqual(deletion.spies, { begins: 0, reserves: 0, proofs: 0, discards: 0 });
+  assert.equal(result.partial_causes.inspection_unclassified, undefined);
+});
+
+test("#4265 pass: per-group partial causes are preserved through the batch", async () => {
+  const { t1, t2, t3 } = seedThree();
+  const { result } = await shadowPass({
+    production: batch => ({ ...batch, requests: batch.requests.map(r =>
+      r.selector.attempt === attemptAt(1) || r.selector.attempt === attemptAt(2) ? { ...r, measureCaps: { maxEntries: 0 } } : r) }),
+  });
+  assert.equal(result.verdict, "eligible");
+  assert.deepEqual(result.partial_causes, { measurement_entry_cap: 2 });
+  assert.equal(result.kept, 2);
+  assert.deepEqual(names(result.list), baseNames(t3));
+  assert.ok(t1 !== t2);
 });
