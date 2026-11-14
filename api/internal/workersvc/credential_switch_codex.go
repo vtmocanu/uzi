@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -18,22 +21,25 @@ import (
 // Anthropic/default/auto selection ladder.
 type CodexSwitchPreflightRequest struct {
 	CredentialSwitchApplyRequest
-	TargetSecretID uuid.UUID
+	TargetSecretID uuid.UUID `json:"target_secret_id"`
 }
 
 // CodexSwitchPreflightResult contains decisions only, never auth material or
 // provider identity. Ready is a point-in-time observation, not apply authority.
 type CodexSwitchPreflightResult struct {
-	Outcome string
-	Reason  string
+	Outcome         string `json:"outcome"`
+	Reason          string `json:"reason,omitempty"`
+	ClaimGeneration int64  `json:"claim_generation"`
+	RegisterNonce   string `json:"register_nonce"`
+	OpID            string `json:"op_id"`
 }
 
 var errCodexSwitchRead = errors.New("codex credential switch preflight unavailable")
 
 // PreflightCodexCredentialSwitch takes the worker/run and alias/account fences
-// used by refresh admission. It always rolls back, calls no provider and opens
+// used by refresh admission. It always rolls back, calls no provider and returns
 // no credential. Apply must repeat these checks in its own transaction.
-func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.Worker, runID uuid.UUID, req CodexSwitchPreflightRequest) (CodexSwitchPreflightResult, error) {
+func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.Worker, runID uuid.UUID, req CodexSwitchPreflightRequest) (result CodexSwitchPreflightResult, retErr error) {
 	op, _, err := ValidateCredentialSwitchApplyRequest(req.CredentialSwitchApplyRequest)
 	if err != nil {
 		return CodexSwitchPreflightResult{}, err
@@ -47,11 +53,8 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 		return CodexSwitchPreflightResult{}, errCodexSwitchRead
 	}
 	gen := req.ClaimGeneration
-	child, run, tx, err := s.beginClaimMutation(ctx, wkr, runID, &gen)
+	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
-		if errors.Is(err, ErrStaleClaim) || errors.Is(err, ErrMissingClaimGeneration) || errors.Is(err, ErrRunNotOwned) {
-			return CodexSwitchPreflightResult{Outcome: ApplyOutcomeFenced}, nil
-		}
 		return CodexSwitchPreflightResult{}, errCodexSwitchRead
 	}
 	defer func() {
@@ -60,10 +63,29 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 		_ = tx.Rollback(cleanup)
 	}()
 	q := store.New(tx)
-	w, err := child.q.GetWorkerByID(ctx, wkr.ID)
+	w, err := q.GetWorkerForUpdate(ctx, wkr.ID)
 	if err != nil {
 		return CodexSwitchPreflightResult{}, errCodexSwitchRead
 	}
+	run, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{
+		ID: runID, WorkerID: pgtype.UUID{Bytes: wkr.ID, Valid: true},
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CodexSwitchPreflightResult{Outcome: ApplyOutcomeFenced}, nil
+	}
+	if err != nil {
+		return CodexSwitchPreflightResult{}, errCodexSwitchRead
+	}
+	defer func() {
+		if retErr == nil {
+			result.ClaimGeneration = run.ClaimGeneration
+			result.RegisterNonce = w.SnapshotRegisterNonce.String
+			result.OpID = uuid.UUID(run.CredentialSwitchOpID.Bytes).String()
+			if !run.CredentialSwitchOpID.Valid {
+				result.OpID = ""
+			}
+		}
+	}()
 	if !codexSwitchFence(w, run, req.CredentialSwitchApplyRequest) {
 		return CodexSwitchPreflightResult{Outcome: ApplyOutcomeFenced}, nil
 	}
@@ -92,8 +114,13 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 	if !run.CredentialSwitchGeneration.Valid || run.CredentialSwitchGeneration.Int64 != gen {
 		return refuse(applyReasonGenerationMismatch)
 	}
-	if run.PolicyPreserveRequired || run.PolicyPendingFresh || run.PolicyRefusalCount > 0 || run.PolicyRefusalTag.Valid || run.PolicyHoldCause.Valid {
+	if codexSwitchPolicyBlocked(run) {
 		return refuse("policy_refusal")
+	}
+	if !run.CodexSwitchTargetSecretID.Valid || uuid.UUID(run.CodexSwitchTargetSecretID.Bytes) != req.TargetSecretID ||
+		!run.CodexSwitchTargetGeneration.Valid || run.CodexSwitchTargetGeneration.Int64 != gen ||
+		run.CodexSwitchTargetOpID != run.CredentialSwitchOpID {
+		return refuse("target_mismatch")
 	}
 	base, err := q.ListRunCredentialEpochs(ctx, store.ListRunCredentialEpochsParams{RunID: runID, UserID: run.UserID})
 	if err != nil {
@@ -102,6 +129,16 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 	children, err := q.ListRunCredentialSwitchEpochs(ctx, store.ListRunCredentialSwitchEpochsParams{RunID: runID, UserID: run.UserID})
 	if err != nil {
 		return CodexSwitchPreflightResult{}, errCodexSwitchRead
+	}
+	hasBaseline := false
+	for _, b := range base {
+		if b.ClaimGeneration == gen {
+			hasBaseline = true
+			break
+		}
+	}
+	if !hasBaseline {
+		return refuse("baseline_missing")
 	}
 	if !codexSwitchBaselineMatches(run, base, children) {
 		return refuse("baseline_mismatch")
@@ -112,6 +149,8 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 	ids := []uuid.UUID{uuid.UUID(run.CodexSecretID.Bytes), req.TargetSecretID}
 	accounts := make([]uuid.UUID, 0, 2)
 	var oldAccount uuid.UUID
+	var targetAccount uuid.UUID
+	var targetKind string
 	for i, id := range ids {
 		if i == 1 && id == ids[0] {
 			continue
@@ -134,6 +173,12 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 		}
 		if id == req.TargetSecretID && !codexSwitchTargetUsable(meta.Kind, st.Status, st.ProviderAccountID.Valid) {
 			return refuse(applyReasonCredentialUnavail)
+		}
+		if id == req.TargetSecretID {
+			targetKind = meta.Kind
+			if st.ProviderAccountID.Valid {
+				targetAccount = uuid.UUID(st.ProviderAccountID.Bytes)
+			}
 		}
 		if id == ids[0] {
 			if st.MaterialRevision != run.CodexMaterialRevision.Int64 {
@@ -160,6 +205,8 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 		if _, err := q.LockCodexAccountForUpdateNowait(ctx, store.LockCodexAccountForUpdateNowaitParams{ID: id, UserID: run.UserID}); err != nil {
 			return codexSwitchReadFailure(err)
 		}
+	}
+	for _, id := range accounts {
 		acct, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{ID: id, UserID: run.UserID})
 		if err != nil {
 			return codexSwitchReadFailure(err)
@@ -171,15 +218,46 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 				return refuse(applyReasonCredentialChanged)
 			}
 		}
-		intents, err := q.ListUnresolvedCodexRefreshIntents(ctx, store.ListUnresolvedCodexRefreshIntentsParams{UserID: run.UserID, ProviderAccountID: id})
+		intents, err := q.LockUnresolvedCodexSwitchIntents(ctx, store.LockUnresolvedCodexSwitchIntentsParams{UserID: run.UserID, ProviderAccountID: id})
 		if err != nil {
 			return codexSwitchReadFailure(err)
+		}
+		if id == targetAccount {
+			if _, err := codexAccountKey(acct.ProviderUserID, acct.WorkspaceAccountID); err != nil {
+				return refuse(applyReasonCredentialUnavail)
+			}
+			snapshot, err := readCodexAccountSnapshot(ctx, q, store.GetCodexProviderAccountSnapshotParams{ID: id, UserID: run.UserID})
+			if err != nil {
+				return codexSwitchReadFailure(err)
+			}
+			// Use the transaction reader even for the bounded vault-conversion retry.
+			opener := *s
+			opener.q = q
+			if _, err := opener.openCodexAccountLogin(ctx, run.UserID, snapshot); err != nil {
+				return refuse(codexSwitchMaterialReason(err))
+			}
 		}
 		if !codexSwitchAccountIdle(acct, len(intents)) {
 			return refuse(applyReasonCredentialBusy)
 		}
 	}
+	if targetKind == store.KindOpenAIAPIKey {
+		plain, err := secretopen.OpenByIDOfKind(ctx, q, s.vlt, s.box, run.UserID, req.TargetSecretID, store.KindOpenAIAPIKey)
+		if err != nil {
+			return refuse(codexSwitchMaterialReason(err))
+		}
+		if strings.TrimSpace(string(plain)) == "" {
+			return refuse(applyReasonCredentialUnavail)
+		}
+	}
 	return CodexSwitchPreflightResult{Outcome: "ready"}, nil
+}
+
+func codexSwitchMaterialReason(err error) string {
+	if errors.Is(err, errVaultLocked) || errors.Is(err, secretopen.ErrVaultLocked) {
+		return applyReasonVaultLocked
+	}
+	return applyReasonCredentialUnavail
 }
 
 func codexSwitchReadFailure(err error) (CodexSwitchPreflightResult, error) {
@@ -194,7 +272,7 @@ func codexSwitchReadFailure(err error) (CodexSwitchPreflightResult, error) {
 
 func codexSwitchFence(w store.Worker, r store.Run, req CredentialSwitchApplyRequest) bool {
 	return r.Harness == harnessCodex && w.UserID == r.UserID &&
-		slices.Contains(w.ProtocolCapabilities, capability.CredentialSwitchInPlaceV1) &&
+		codexSwitchNegotiated(w) &&
 		w.SnapshotRegisterNonce.Valid && w.SnapshotRegisterNonce.String == req.RegisterNonce &&
 		r.WorkerID.Valid && uuid.UUID(r.WorkerID.Bytes) == w.ID &&
 		r.ClaimGeneration == req.ClaimGeneration && !r.ClaimReleasedAt.Valid &&
@@ -243,8 +321,18 @@ func codexSwitchBaselineMatches(r store.Run, bases []store.RunCredentialEpoch, c
 		}
 	}
 	return current.SecretID.Valid && current.SecretID == r.CodexSecretID &&
-		current.CodexAuthMode.Valid && current.CodexAuthMode == r.CodexAuthMode &&
-		current.CodexMaterialRevision.Valid && current.CodexMaterialRevision == r.CodexMaterialRevision &&
+		(!current.CodexAuthMode.Valid || current.CodexAuthMode == r.CodexAuthMode) &&
+		(!current.CodexMaterialRevision.Valid || current.CodexMaterialRevision == r.CodexMaterialRevision) &&
 		(!current.CodexAccountKey.Valid || current.CodexAccountKey == r.CodexAccountKey) &&
 		(!current.CodexClaimEpoch.Valid || current.CodexClaimEpoch.Int64 == r.CodexClaimEpoch)
+}
+
+// Both owner requests and worker preflight require the Codex protocol explicitly.
+func codexSwitchNegotiated(w store.Worker) bool {
+	return slices.Contains(w.ProtocolCapabilities, capability.CodexCredentialSwitchV1) &&
+		w.SnapshotRegisterNonce.Valid && w.SnapshotRegisterNonce.String != ""
+}
+
+func codexSwitchPolicyBlocked(r store.Run) bool {
+	return UnresolvedPolicyEpisode(r)
 }

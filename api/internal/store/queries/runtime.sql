@@ -13524,3 +13524,21 @@ UPDATE runs SET
 WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
   AND recovery_wait_cause = 'codex_idle_stall'
 RETURNING *;
+
+-- name: StampHeldCodexCredentialSwitch :execrows
+-- Pending-only: no credential_override or codex binding columns are written.
+UPDATE runs SET
+    credential_switch_requested_at = GREATEST(clock_timestamp(),
+        COALESCE(credential_switch_requested_at, '-infinity'::timestamptz) + interval '1 microsecond'),
+    credential_switch_generation = sqlc.narg('generation')::bigint
+WHERE id = @id AND user_id = @user_id AND worker_id = sqlc.narg('worker_id')::uuid
+  AND harness = 'codex' AND kind NOT IN ('job', 'cross_check')
+  AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND claim_generation = sqlc.narg('generation')::bigint AND claim_released_at IS NULL;
+
+-- name: SetPendingCodexSwitchTarget :execrows
+UPDATE runs SET codex_switch_target_secret_id = sqlc.narg('secret_id')::uuid,
+    codex_switch_target_generation = credential_switch_generation,
+    codex_switch_target_op_id = credential_switch_op_id
+WHERE id = @id AND user_id = @user_id AND credential_switch_requested_at IS NOT NULL
+  AND credential_switch_generation = sqlc.narg('generation')::bigint AND harness = 'codex';

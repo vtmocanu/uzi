@@ -1084,3 +1084,9 @@ WHERE r.id = ANY(@run_ids::uuid[])
 SELECT id FROM codex_provider_account
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE NOWAIT;
+
+-- name: LockUnresolvedCodexSwitchIntents :many
+SELECT * FROM codex_refresh_intent
+WHERE user_id = @user_id AND provider_account_id = @provider_account_id
+  AND state = 'rotating'
+FOR SHARE NOWAIT;

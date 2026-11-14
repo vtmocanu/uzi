@@ -89,6 +89,8 @@ func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 	var workerUnsupported *workersvc.CredentialSwitchWorkerUnsupportedError
 	var ownerHeld *workersvc.RunOwnerHeldError
 	switch {
+	case errors.Is(err, workersvc.ErrCodexSwitchIneligible):
+		httpx.Error(w, http.StatusUnprocessableEntity, workersvc.ErrCodexSwitchIneligible.Error())
 	case errors.Is(err, workersvc.ErrRunNotFound):
 		httpx.Error(w, http.StatusNotFound, "run not found")
 	case errors.As(err, &workerUnsupported):

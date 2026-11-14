@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -180,6 +181,10 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	harness := run.Harness
 	if harness == "" {
 		harness = harnessClaude
+	}
+
+	if harness == harnessCodex {
+		return s.requestCodexCredentialSwitch(ctx, run, mode, secretID)
 	}
 
 	// The ONE validator (D5/D9/D10): lane (409) → harness (422) → mode (404/400). It never
@@ -578,4 +583,90 @@ func (s *Service) credentialSwitchWarning(ctx context.Context, run store.Run, re
 	default:
 		return ""
 	}
+}
+
+// ErrCodexSwitchIneligible refuses queued and parked Codex switching.
+var ErrCodexSwitchIneligible = errors.New("Codex credentials can be switched only on an active, worker-held run")
+
+// requestCodexCredentialSwitch writes only a pending target. The live binding
+// remains authoritative until a separately negotiated apply commits.
+func (s *Service) requestCodexCredentialSwitch(ctx context.Context, observed store.Run, mode string, secretID *uuid.UUID) (SetRunCredentialResult, error) {
+	if observed.Status == "claimed" {
+		return SetRunCredentialResult{}, ErrCredentialSwitchClaimAssembling
+	}
+	if !applyLiveStatus(observed.Status) {
+		return SetRunCredentialResult{}, ErrCodexSwitchIneligible
+	}
+	if mode != BindModePinned || secretID == nil || *secretID == uuid.Nil {
+		return SetRunCredentialResult{}, ErrCredentialOverridePinnedNeedsSecret
+	}
+	if !observed.WorkerID.Valid || s.txBeginner == nil {
+		return SetRunCredentialResult{}, ErrCredentialSwitchNoLiveWorker
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	defer cancel()
+	child, run, tx, err := s.beginClaimMutation(ctx, store.Worker{ID: uuid.UUID(observed.WorkerID.Bytes)}, observed.ID, &observed.ClaimGeneration)
+	if err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	defer func() {
+		cleanup, done := context.WithTimeout(context.WithoutCancel(ctx), 250*time.Millisecond)
+		defer done()
+		_ = tx.Rollback(cleanup)
+	}()
+	q := store.New(tx)
+	w, err := q.GetWorkerByID(ctx, uuid.UUID(observed.WorkerID.Bytes))
+	if err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	if w.UserID != observed.UserID || run.UserID != observed.UserID || run.ClaimGeneration != observed.ClaimGeneration ||
+		run.ClaimReleasedAt.Valid || !applyLiveStatus(run.Status) || run.Kind == "job" || run.Kind == "cross_check" {
+		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+	}
+	if codexSwitchPolicyBlocked(run) {
+		return SetRunCredentialResult{}, &RunOwnerHeldError{Label: "policy hold"}
+	}
+	if !codexSwitchNegotiated(w) || !w.LastHeartbeatAt.Valid || w.LastHeartbeatAt.Time.Before(s.staleWorkerCutoff().Time) {
+		return SetRunCredentialResult{}, &CredentialSwitchWorkerUnsupportedError{WorkerID: w.ID, WorkerName: w.Name}
+	}
+	// Lock enablement and alias before writing the stamp. No provider call or
+	// reconcile is permitted in this owner request.
+	disabled, err := q.LockSecretEnablementForShareNowait(ctx, store.LockSecretEnablementForShareNowaitParams{ID: *secretID, UserID: run.UserID})
+	if err != nil {
+		return SetRunCredentialResult{}, ErrCredentialOverrideSecretNotFound
+	}
+	meta, err := q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{ID: *secretID, UserID: run.UserID})
+	if err != nil {
+		return SetRunCredentialResult{}, ErrCredentialOverrideSecretNotFound
+	}
+	alias, err := q.LockCodexAliasForShareNowait(ctx, store.LockCodexAliasForShareNowaitParams{UserSecretID: *secretID, UserID: run.UserID})
+	if err != nil || disabled || !codexSwitchTargetUsable(meta.Kind, alias.Status, alias.ProviderAccountID.Valid) {
+		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+	}
+	n, err := q.StampHeldCodexCredentialSwitch(ctx, store.StampHeldCodexCredentialSwitchParams{
+		ID: run.ID, UserID: run.UserID, WorkerID: run.WorkerID, Generation: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
+	})
+	if err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	if n != 1 {
+		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+	}
+	n, err = q.SetPendingCodexSwitchTarget(ctx, store.SetPendingCodexSwitchTargetParams{
+		ID: run.ID, UserID: run.UserID, SecretID: pgtype.UUID{Bytes: *secretID, Valid: true}, Generation: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
+	})
+	if err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	if n != 1 {
+		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+	}
+	updated, err := child.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: run.ID, UserID: run.UserID})
+	if err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SetRunCredentialResult{}, err
+	}
+	return SetRunCredentialResult{Run: updated}, nil
 }

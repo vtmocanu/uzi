@@ -5,19 +5,23 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 )
 
 // These tests exercise the service seam and compare all run/journal/message
-// state before and after; no provider client or credential opener is installed.
+// state before and after. The real local secret opener is configured; no provider client is installed.
 func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 	for _, scenario := range []string{
 		"ready", "missing baseline", "disabled target", "foreign target",
 		"stale nonce", "stale generation", "wrong operation", "released",
 		"claimed", "awaiting_approval", "awaiting_input", "awaiting_followup",
 		"policy refusal", "binding mismatch", "epoch mismatch",
+		"wrong target", "pending outcome", "policy hold", "nullable snapshots",
+		"corrupt material", "missing negotiation", "cleared target", "alias locked", "empty material",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newApplyFx(t)
+			f.env.exec("UPDATE workers SET protocol_capabilities = array_append(protocol_capabilities, $2) WHERE id = $1", f.o.workerID, capability.CodexCredentialSwitchV1)
 			run, op := f.run(t, "running")
 			old := f.env.seedStaticAPIKey(t, f.o.userID, "old-api", "old-test-key")
 			target := f.env.seedStaticAPIKey(t, f.o.userID, "new-api", "new-test-key")
@@ -29,17 +33,18 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			f.env.exec("UPDATE runs SET codex_switch_target_secret_id = $2, codex_switch_target_generation = credential_switch_generation, codex_switch_target_op_id = credential_switch_op_id WHERE id = $1", run, target)
 			req := CodexSwitchPreflightRequest{CredentialSwitchApplyRequest: f.req(op), TargetSecretID: target}
 			want, reason := "ready", ""
 			switch scenario {
 			case "missing baseline":
-				want, reason = ApplyOutcomeNotApplied, "baseline_mismatch"
+				want, reason = ApplyOutcomeNotApplied, "baseline_missing"
 			case "disabled target":
 				f.env.exec("UPDATE user_secrets SET disabled_at = now() WHERE id = $1", target)
 				want, reason = ApplyOutcomeNotApplied, applyReasonCredentialDisabled
 			case "foreign target":
 				req.TargetSecretID = uuid.New()
-				want, reason = ApplyOutcomeNotApplied, applyReasonCredentialGone
+				want, reason = ApplyOutcomeNotApplied, "target_mismatch"
 			case "stale nonce":
 				req.RegisterNonce = "stale-nonce"
 				want = ApplyOutcomeFenced
@@ -57,8 +62,45 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 				want = ApplyOutcomeFenced
 			case "awaiting_approval", "awaiting_input", "awaiting_followup":
 				f.env.exec("UPDATE runs SET status = $2 WHERE id = $1", run, scenario)
+			case "alias locked":
+				tx, err := f.env.pool.Begin(f.env.ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(context.Background()) }()
+				if _, err := tx.Exec(f.env.ctx, "SELECT user_secret_id FROM codex_credential_state WHERE user_secret_id = $1 FOR UPDATE", target); err != nil {
+					t.Fatal(err)
+				}
+				want, reason = ApplyOutcomeNotApplied, applyReasonCredentialBusy
+			case "empty material":
+				sealed, err := f.env.box.Seal([]byte("   "))
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.env.exec("UPDATE user_secrets SET ciphertext = $2 WHERE id = $1", target, sealed)
+				want, reason = ApplyOutcomeNotApplied, applyReasonCredentialUnavail
+			case "wrong target":
+				req.TargetSecretID = old
+				want, reason = ApplyOutcomeNotApplied, "target_mismatch"
+			case "pending outcome":
+				f.env.exec("UPDATE runs SET policy_outcome_id = $2, policy_preserve_required = true, policy_continuation_mode = 'same_conversation', policy_applying_worker_id = worker_id, policy_applying_generation = claim_generation, policy_source_generation = claim_generation WHERE id = $1", run, uuid.New())
+				want, reason = ApplyOutcomeNotApplied, "policy_refusal"
+			case "policy hold":
+				f.env.exec("UPDATE runs SET status = 'paused', hold_reason = 'codex_policy_hold', policy_outcome_id = $2, policy_preserve_required = true, policy_continuation_mode = 'same_conversation', policy_applying_worker_id = worker_id, policy_applying_generation = claim_generation, policy_source_generation = claim_generation WHERE id = $1", run, uuid.New())
+				want = ApplyOutcomeFenced
+			case "nullable snapshots":
+				f.env.exec("UPDATE run_credential_epochs SET codex_auth_mode = NULL, codex_material_revision = NULL WHERE run_id = $1", run)
+			case "corrupt material":
+				f.env.exec("UPDATE user_secrets SET ciphertext = $2 WHERE id = $1", target, []byte("invalid ciphertext"))
+				want, reason = ApplyOutcomeNotApplied, applyReasonCredentialUnavail
+			case "missing negotiation":
+				f.env.exec("UPDATE workers SET protocol_capabilities = array_remove(protocol_capabilities, $2) WHERE id = $1", f.o.workerID, capability.CodexCredentialSwitchV1)
+				want = ApplyOutcomeFenced
+			case "cleared target":
+				f.restamp(t, run)
+				want = ApplyOutcomeSuperseded
 			case "policy refusal":
-				f.env.exec("UPDATE runs SET policy_refusal_count = 1 WHERE id = $1", run)
+				f.env.exec("UPDATE runs SET policy_pending_fresh = true WHERE id = $1", run)
 				want, reason = ApplyOutcomeNotApplied, "policy_refusal"
 			case "binding mismatch":
 				f.env.exec("UPDATE run_credential_epochs SET codex_material_revision = codex_material_revision + 1 WHERE run_id = $1", run)
@@ -71,6 +113,9 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 			got, err := f.svc.PreflightCodexCredentialSwitch(f.env.ctx, f.worker(t), run, req)
 			if err != nil || got.Outcome != want || got.Reason != reason {
 				t.Fatalf("preflight = %+v, %v; want %s/%s", got, err, want, reason)
+			}
+			if got.ClaimGeneration != f.gen || got.RegisterNonce != applyFixtureNonce || got.OpID != f.opOf(t, run).String() {
+				t.Fatalf("missing authoritative fence: %+v", got)
 			}
 			if after := f.snap(t, run); after != before {
 				t.Fatal("preflight changed run, epochs or messages")
