@@ -357,7 +357,7 @@ test("#4265 a malformed batch result after an in-batch invalidation and the hard
       reached = true;
       try { batch.requests[0]!.beforeTree!("/not/expected"); } catch { /* the invalidation aborts the pass */ }
       time.advance(601000);
-      return [null] as never;
+      return [null, { get partialCauses(): never { throw new Error("hostile getter"); } }] as never;
     };
     await assert.rejects(runPodEpochShadow(options), PodEpochSettlementError);
     assert.ok(reached, "the batch inspection ran");
