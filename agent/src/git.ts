@@ -27416,13 +27416,17 @@ try {
    *  held the lock) logs at warn; an uncontended abort (e.g. a call under an already-aborted scope)
    *  logs at debug so a burst after a deadline does not flood warnings. Never changes the rejection. */
   private logLockWaitAbort(key: string, enqueuedAt: number, abortedBy: string): void {
-    const now = performance.now();
-    const holder = this.lockHolders.get(key);
-    const fields: Record<string, unknown> = { bare: key, waited_ms: Math.round(now - enqueuedAt), aborted_by: abortedBy };
-    if (holder) fields.holder_held_ms = Math.round(now - holder.since);
-    else fields.holder = "none";
-    if (holder) this.log.warn("bare repo lock wait aborted before acquisition", fields);
-    else this.log.debug("bare repo lock wait aborted before acquisition", fields);
+    // The caller rejects the waiter right after this returns, so a throwing logger must never
+    // strand it or replace its abort error: the diagnostic is best effort.
+    try {
+      const now = performance.now();
+      const holder = this.lockHolders.get(key);
+      const fields: Record<string, unknown> = { bare: key, waited_ms: Math.round(now - enqueuedAt), aborted_by: abortedBy };
+      if (holder) fields.holder_held_ms = Math.round(now - holder.since);
+      else fields.holder = "none";
+      if (holder) this.log.warn("bare repo lock wait aborted before acquisition", fields);
+      else this.log.debug("bare repo lock wait aborted before acquisition", fields);
+    } catch { /* diagnostic only */ }
   }
 }
 

@@ -305,6 +305,48 @@ describe("permit-scoped bare lock acquisition", () => {
       assert.equal(at(lines, 0).holder, "none");
       assert.equal(at(lines, 0).level, "debug");
     });
+
+    /** A logger whose warn and debug throw on the diagnostic line only, so other GitCache logging is unaffected. */
+    function throwingSetup(level: "warn" | "debug") {
+      const rec = recordingLogger();
+      const base = rec.logger[level];
+      let threw = 0;
+      rec.logger[level] = (m, f) => {
+        if (m === MSG) { threw++; throw new Error(`${level} logger failure`); }
+        base(m, f);
+      };
+      const cache = new GitCache(fx.dataDir, rec.logger);
+      return { cache, internals: cache as unknown as Internals, threw: () => threw };
+    }
+    /** Fails fast instead of hanging until the test timeout when a waiter is stranded. */
+    const settledWithin = <T>(p: Promise<T>): Promise<T> => Promise.race([p,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("waiter never settled")), 2000).unref())]);
+
+    it("(h) a throwing warn logger still rejects a contended waiter with its boundary abort error", async () => {
+      const { cache, internals, threw } = throwingSetup("warn");
+      const h = await hold(internals);
+      const abort = new AbortController();
+      const queued = cache.withBoundaryProcessSpawner(noSpawn, abort.signal,
+        () => internals.withLock("shared-bare", async () => "queued"));
+      abort.abort();
+      await assert.rejects(settledWithin(queued), (err: unknown) => {
+        assert.ok(err instanceof GitBoundaryAbortError);
+        assert.equal(err.message, "permit-held git lock wait aborted: boundary deadline exceeded");
+        return true;
+      });
+      assert.equal(threw(), 1, "the diagnostic was attempted");
+      h.release();
+      assert.equal(await h.done, "holder");
+    });
+
+    it("(i) a throwing debug logger still rejects an uncontended waiter with its boundary abort error", async () => {
+      const { cache, internals, threw } = throwingSetup("debug");
+      const abort = new AbortController();
+      abort.abort();
+      await assert.rejects(settledWithin(cache.withBoundaryProcessSpawner(noSpawn, abort.signal,
+        () => internals.withLock("shared-bare", async () => "never"))), GitBoundaryAbortError);
+      assert.equal(threw(), 1, "the diagnostic was attempted");
+    });
   });
 });
 
