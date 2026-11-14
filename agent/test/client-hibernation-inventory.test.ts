@@ -16,7 +16,7 @@ const wire = JSON.parse(fs.readFileSync(new URL("../../fixtures/hibernation-inve
   inventory_status_requests: Record<string, unknown>[];
   exclusion_final_request: Record<string, unknown>;
 };
-const NONCE = "11111111-2222-4333-8444-555555555555";
+const NONCE = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
 
 interface Seen { url: string; raw: string }
 let server: http.Server;
@@ -63,6 +63,15 @@ describe("hibernation_inventory heartbeat member decoding", () => {
     }
   });
 
+  it("accepts the api's real 43-character base64url register nonce", () => {
+    assert.equal(NONCE.length, 43);
+    const m = member();
+    m.register_nonce = NONCE;
+    assert.equal(decodeHibernationInventory(m)?.register_nonce, NONCE);
+    m.register_nonce = "a".repeat(128);
+    assert.equal(decodeHibernationInventory(m)?.register_nonce, "a".repeat(128));
+  });
+
   it("maps null and absent to null and every malformed variant to undefined", () => {
     assert.equal(decodeHibernationInventory(null), null);
     assert.equal(decodeHibernationInventory(undefined), null);
@@ -71,6 +80,9 @@ describe("hibernation_inventory heartbeat member decoding", () => {
     mutate((m) => { m.op_id = "nope"; });
     mutate((m) => { m.pod_uid = 7; });
     mutate((m) => { m.register_nonce = ""; });
+    mutate((m) => { m.register_nonce = "x".repeat(129); });
+    mutate((m) => { m.register_nonce = "has space"; });
+    mutate((m) => { m.register_nonce = `${NONCE}\n`; });
     mutate((m) => { m.phase = "done"; });
     mutate((m) => { delete m.deployment_resource_version; });
     mutate((m) => { m.pvcs = []; });

@@ -874,3 +874,16 @@ test("upgradeExclusive restores SH and rethrows a non-contention failure; lost S
   await assert.rejects(held.upgradeExclusive!(), /shared ownership lost/);
   assert.throws(() => held.mode, /closed/);
 });
+
+test("upgradeExclusive refuses EX on a replaced epoch inode and re-takes shared", async (t) => {
+  const f = fixture(t, { run: undefined });
+  await f.runtime.seed(S);
+  const held = await f.runtime.acquire();
+  // Out-of-band replacement between the shared acquire and the upgrade's reopen.
+  fs.renameSync(path.join(f.root, epochName), path.join(f.root, "old-lock"));
+  fs.writeFileSync(path.join(f.root, epochName), "", { mode: 0o600 });
+  fs.chownSync(path.join(f.root, epochName), process.getuid!(), process.getgid!());
+  await assert.rejects(held.upgradeExclusive!(), /inode changed/);
+  assert.equal(held.mode, "shared", "a non-fatal failure: shared ownership was re-taken");
+  held.close();
+});

@@ -5,7 +5,7 @@
       "hibernation_inventory": {
         "op_id": "55555555-5555-5555-5555-555555555555",
         "phase": "awaiting",
-        "register_nonce": "11111111-2222-4333-8444-555555555555",
+        "register_nonce": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
         "pod_uid": "66666666-6666-6666-6666-666666666666",
         "deployment_resource_version": "12340",
         "pvcs": [
@@ -19,7 +19,7 @@
       "hibernation_inventory": {
         "op_id": "55555555-5555-5555-5555-555555555555",
         "phase": "accepted",
-        "register_nonce": "11111111-2222-4333-8444-555555555555",
+        "register_nonce": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
         "pod_uid": "66666666-6666-6666-6666-666666666666",
         "deployment_resource_version": "12340",
         "pvcs": [
@@ -38,7 +38,7 @@
   },
   "inventory_request": {
     "op_id": "55555555-5555-5555-5555-555555555555",
-    "register_nonce": "11111111-2222-4333-8444-555555555555",
+    "register_nonce": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
     "pod_uid": "66666666-6666-6666-6666-666666666666",
     "deployment_resource_version": "12340",
     "pvcs": [
@@ -89,7 +89,7 @@
   },
   "inventory_request_no_docker": {
     "op_id": "55555555-5555-5555-5555-555555555555",
-    "register_nonce": "11111111-2222-4333-8444-555555555555",
+    "register_nonce": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
     "pod_uid": "66666666-6666-6666-6666-666666666666",
     "deployment_resource_version": "12340",
     "pvcs": [
@@ -110,21 +110,21 @@
   "inventory_status_requests": [
     {
       "op_id": "55555555-5555-5555-5555-555555555555",
-      "register_nonce": "11111111-2222-4333-8444-555555555555",
+      "register_nonce": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
       "pod_uid": "66666666-6666-6666-6666-666666666666",
       "status": "unsupported",
       "reason": "lane has no proven exclusion mechanism"
     },
     {
       "op_id": "55555555-5555-5555-5555-555555555555",
-      "register_nonce": "11111111-2222-4333-8444-555555555555",
+      "register_nonce": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
       "pod_uid": "66666666-6666-6666-6666-666666666666",
       "status": "exclusion_failed",
       "reason": "could not acquire the pod epoch lock exclusively"
     },
     {
       "op_id": "55555555-5555-5555-5555-555555555555",
-      "register_nonce": "11111111-2222-4333-8444-555555555555",
+      "register_nonce": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
       "pod_uid": "66666666-6666-6666-6666-666666666666",
       "status": "busy",
       "reason": "a run is active on this worker"
@@ -133,7 +133,7 @@
   "exclusion_final_request": {
     "op_id": "55555555-5555-5555-5555-555555555555",
     "pod_uid": "66666666-6666-6666-6666-666666666666",
-    "register_nonce": "11111111-2222-4333-8444-555555555555",
+    "register_nonce": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
     "held": true,
     "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

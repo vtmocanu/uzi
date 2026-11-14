@@ -367,9 +367,13 @@ function createRuntime(options = {}) {
         closed = false;
       },
       // Shared -> exclusive for the hibernation inventory (PRD #4208). Mirrors reacquireShared:
-      // there is deliberately no flock conversion, because a conversion could pass through an
-      // unlocked instant that a reclaiming peer observes as free. The descriptor is closed, the
-      // file reopened and exclusivity attempted once without waiting.
+      // there is deliberately no flock conversion. The descriptor is closed, the file reopened and
+      // exclusivity attempted once without waiting, so the lock is unlocked for an instant between
+      // the close and the reopen. That gap is accepted for the same reason as in reacquireShared:
+      // worker admission (the claim gate) is already closed for the whole of it, and `pending` makes
+      // every other operation throw, so no new work can start while the lock is not held. The
+      // reopened file must be the very inode held before (heldIdentity), so EX on a replaced inode
+      // fails like any other failure of the attempt and shared ownership is re-taken.
       //   true  -> EX held (mode is 'exclusive').
       //   false -> contended; shared ownership was re-taken (mode is still 'shared').
       // A non-contention failure of the exclusive attempt re-takes SH and then rethrows. If SH
@@ -381,6 +385,7 @@ function createRuntime(options = {}) {
         requireUnscoped();
         if (mode !== 'shared' || fd === undefined) throw new Error('shared epoch ownership required');
         pending = true;
+        const previousIdentity = heldIdentity;
         let failure;
         let upgraded = false;
         try {
@@ -390,7 +395,7 @@ function createRuntime(options = {}) {
           try {
             next = open(names.epoch);
             if (await lock(next, 'exclusive', 120000, signal, true)) {
-              heldIdentity = identity(verify(next, names.epoch));
+              heldIdentity = identity(verify(next, names.epoch, 0o600, previousIdentity));
               fd = next;
               mode = 'exclusive';
               upgraded = true;

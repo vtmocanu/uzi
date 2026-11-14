@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import { hibernationWriters } from "./hibernation-inventory.js";
 import { AuthorityLockBusy, AuthorityRefusal } from "./authority-lock.js";
 import type { AuthorityScope, AuthorityWait, RetirementHandle, RetirementView } from "./authority-runtime.js";
 import {
@@ -5198,6 +5199,12 @@ export class RecoveryCoordinator {
 
   /** Install ownership synchronously before dispatch, including reentrant shutdown from hooks. */
   private trackPass(callerSignal: AbortSignal | undefined, fn: () => Promise<void>): Promise<void> {
+    // PRD #4208: every pass writes capture records or bundles on the data volume and can outlive the
+    // run that spawned it, so it is a registered hibernation writer. Entered synchronously, before any
+    // await: refused while the writer latch is held (the heartbeat re-drive retries), and counted so
+    // the hibernation settle waits for a pass already in flight.
+    const releaseWriter = hibernationWriters.enter("recovery_pass");
+    if (!releaseWriter) return Promise.resolve();
     const signal = AbortSignal.any([this.passShutdown.signal, ...(callerSignal ? [callerSignal] : [])]);
     const pass = Promise.resolve().then(async () => {
       if (signal.aborted) return;
@@ -5215,6 +5222,7 @@ export class RecoveryCoordinator {
     this.passes.add(pass);
     return pass.finally(() => {
       this.passes.delete(pass);
+      releaseWriter();
     });
   }
 

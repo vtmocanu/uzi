@@ -310,6 +310,7 @@ import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
 import { REASON_SKILLS_PLUGIN_LOAD_FAILED } from "./plugin-errors.js";
 import { reportProofTiming } from "./report-proof-timing.js";
+import { hibernationWriters } from "./hibernation-inventory.js";
 import {
   clampUtf8Bytes,
   DECISIONS_MEMO_MAX_BYTES,
@@ -21775,11 +21776,19 @@ export class RunRunner {
     const generation = flight.claimGeneration;
     if (!Number.isSafeInteger(generation) || generation <= 0) return;
     const signal = flight.cancel.signal;
+    // PRD #4208: the detached settle journals records and outlives runActive, so it is a registered
+    // hibernation writer, entered before it detaches. Skipped while latched; the settlement sweep retries.
+    const releaseWriter = hibernationWriters.enter("live_settle");
+    if (!releaseWriter) return;
     this.detached(() => {
       void (async () => {
-        await this.settler.observeLivePublication(flight.runId, generation, publishedSha, target);
-        if (signal.aborted) return;
-        await this.settler.settleLive(flight.runId, signal);
+        try {
+          await this.settler.observeLivePublication(flight.runId, generation, publishedSha, target);
+          if (signal.aborted) return;
+          await this.settler.settleLive(flight.runId, signal);
+        } finally {
+          releaseWriter();
+        }
       })().catch((err: unknown) => {
         flight.runLog.warn("recovery settlement: live settle trigger failed (the sweep retries)", {
           run_id: flight.runId,

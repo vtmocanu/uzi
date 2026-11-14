@@ -31,7 +31,7 @@ function rig(over: Partial<HibernationDeps> = {}) {
   const registry = new HibernationWriterRegistry();
   const gate = new DindPruneGate();
   const exits: string[] = [];
-  const state = { mode: "shared" as "shared" | "exclusive", closed: false, upgrade: true as boolean | Error, reacquire: true as boolean };
+  const state = { mode: "shared" as "shared" | "exclusive", closed: false, upgrade: true as boolean | Error, reacquire: true as boolean, atShared: undefined as undefined | { gateClosed: boolean; latched: boolean } };
   const ownership = {
     get mode() { if (state.closed) throw new Error("epoch ownership closed"); return state.mode; },
     async upgradeExclusive() {
@@ -42,6 +42,7 @@ function rig(over: Partial<HibernationDeps> = {}) {
     },
     async reacquireShared() {
       events.push("sh");
+      state.atShared = { gateClosed: gate.claimsClosed(), latched: registry.isLatched() };
       if (!state.reacquire) { state.closed = true; throw new Error("sh failed"); }
       state.mode = "shared";
     },
@@ -97,11 +98,69 @@ describe("HibernationInventoryController", () => {
     assert.deepEqual(r.c.exclusionReport(), { op_id: AWAITING.op_id, held: true });
   });
 
-  it("merges registry and census uncovered classes", async () => {
+  it("merges registry and census uncovered classes and posts complete=false", async () => {
     const r = rig({ census: async () => census({ uncovered: ["c1"] }) });
     r.registry.markUncovered("w1");
     await feed(r, AWAITING);
-    assert.deepEqual((r.posts[0] as { exclusion: { uncovered: string[] } }).exclusion.uncovered, ["w1", "c1"]);
+    const body = r.posts[0] as unknown as { complete: boolean; exclusion: { uncovered: string[] } };
+    assert.deepEqual(body.exclusion.uncovered, ["w1", "c1"]);
+    assert.equal(body.complete, false, "an otherwise complete census is incomplete with uncovered writers");
+  });
+
+  it("posts complete=false for a registry-only uncovered class", async () => {
+    const r = rig();
+    r.registry.markUncovered("w1");
+    await feed(r, AWAITING);
+    assert.equal((r.posts[0] as unknown as { complete: boolean }).complete, false);
+  });
+
+  it("does not release, post a failure or exit when stopped during the census", async () => {
+    let started!: () => void;
+    const inCensus = new Promise<void>((res) => { started = res; });
+    const r = rig({
+      census: ({ signal }) => new Promise((_, reject) => {
+        started();
+        signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      }),
+    });
+    r.c.observe(AWAITING);
+    await inCensus;
+    r.c.stop();
+    await r.c.whenIdle();
+    assert.deepEqual(r.exits, []);
+    assert.equal(r.events.includes("sh"), false, "no reacquireShared on shutdown");
+    assert.equal(r.posts.length, 0);
+    assert.equal(r.gate.claimsClosed(), true);
+    assert.equal(r.registry.isLatched(), true);
+    assert.equal(r.state.mode, "exclusive");
+    // Later members (including an absent one) cannot release it either.
+    await feed(r, null);
+    assert.equal(r.events.includes("sh"), false);
+    assert.equal(r.gate.claimsClosed(), true);
+  });
+
+  it("reports held:false once after a post-EX failure releases the exclusion", async () => {
+    const r = rig({ census: async () => { throw new Error("census boom"); } });
+    await feed(r, AWAITING);
+    assert.equal((r.posts[0] as { status: string }).status, "busy");
+    assert.equal(r.state.mode, "shared");
+    assert.deepEqual(r.c.exclusionReport(), { op_id: AWAITING.op_id, held: false });
+    assert.equal(r.c.exclusionReport(), undefined, "sent once");
+  });
+
+  it("posts exclusion_failed, re-takes shared and reopens when a non-fatal EX attempt throws", async () => {
+    const r = rig();
+    r.state.upgrade = new Error("flock failed: 1");
+    await feed(r, AWAITING);
+    assert.deepEqual(r.exits, []);
+    const body = r.posts[0] as { status: string; reason: string };
+    assert.equal(body.status, "exclusion_failed");
+    assert.match(body.reason, /flock failed/);
+    assert.equal(r.events.includes("sh"), false, "the ownership layer already re-took shared itself");
+    assert.equal(r.state.mode, "shared");
+    assert.equal(r.gate.claimsClosed(), false);
+    assert.equal(r.registry.isLatched(), false);
+    assert.equal(r.c.exclusionReport(), undefined);
   });
 
   it("does nothing for a wrong pod, a wrong nonce, or an unadvertised feature", async () => {
@@ -196,6 +255,8 @@ describe("HibernationInventoryController", () => {
     await feed(r, AWAITING);
     await feed(r, null);
     assert.deepEqual(r.events.slice(-1), ["sh"]);
+    // Order: shared ownership is re-taken while the gate is still closed and the latch held.
+    assert.deepEqual(r.state.atShared, { gateClosed: true, latched: true });
     assert.equal(r.state.mode, "shared");
     assert.equal(r.gate.claimsClosed(), false);
     assert.equal(r.registry.isLatched(), false);

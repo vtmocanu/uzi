@@ -1104,8 +1104,7 @@ async function mainBody(): Promise<void> {
   // proven: the DinD lane (Docker wired, not the isolated lane) holding the pod-epoch lock in a
   // supported mode. Its presence is what advertises `hibernation_inventory_v1`. The census and the
   // fingerprint are the volume census seam: until it lands the census can never be complete.
-  if (config.dockerWiring.dockerHost !== undefined && !(config.fetcherUrl && config.fetcherCaFile) &&
-      epochOwnership && epochOwnership.mode !== "unsupported") {
+  if (hibernationParticipates(config, epochOwnership?.mode)) {
     hibernation = new HibernationInventoryController({
       registry: hibernationWriters,
       gate: dindGate,
@@ -1248,11 +1247,11 @@ async function mainBody(): Promise<void> {
   const gate = await finishShutdown();
   // PRD #4208: only now, after every other shutdown writer has joined (run lanes, outbox,
   // recoveries, the shutdown barrier), recompute the content fingerprint and report the held
-  // exclusion. Bounded well inside the 40 s termination grace: the barrier's own deadline is 35 s
-  // from the first signal, so skip when under 3 s of it remain, and otherwise cap at 15 s.
+  // exclusion. It must finish by the barrier deadline, so it is skipped when too little of that
+  // deadline remains and otherwise capped at 15 s (see hibernationFinalizeBudgetMs).
   if (hibernation) {
-    const left = shutdownDeadlineAt === undefined ? 15_000 : Math.min(15_000, shutdownDeadlineAt + 3_000 - Date.now());
-    if (left >= 3_000) {
+    const left = hibernationFinalizeBudgetMs(shutdownDeadlineAt, Date.now());
+    if (left !== undefined) {
       let timer: NodeJS.Timeout | undefined;
       await Promise.race([
         hibernation.finalizeAtShutdown(),
@@ -1267,6 +1266,29 @@ async function mainBody(): Promise<void> {
     exit_code: gate.exitCode,
     shutdown_result: gate.result,
   });
+}
+
+/**
+ * Whether this worker builds the hibernation inventory controller (and so advertises
+ * `hibernation_inventory_v1`): the DinD lane only (Docker wired, not the isolated fetcher lane)
+ * holding the pod-epoch lock in a supported mode (`ownershipMode` undefined = no epoch ownership).
+ */
+export function hibernationParticipates(
+  config: { dockerWiring: { dockerHost?: string }; fetcherUrl?: string; fetcherCaFile?: string },
+  ownershipMode: string | undefined,
+): boolean {
+  return config.dockerWiring.dockerHost !== undefined && !(config.fetcherUrl && config.fetcherCaFile) &&
+    ownershipMode !== undefined && ownershipMode !== "unsupported";
+}
+
+/**
+ * Time the shutdown hibernation finalize may take: at most 15 s and never past the shutdown barrier
+ * deadline `deadlineAt` (epoch ms; undefined = no barrier, full 15 s). Undefined when under 3 s
+ * remain, so the finalize is skipped rather than overrunning the barrier.
+ */
+export function hibernationFinalizeBudgetMs(deadlineAt: number | undefined, nowMs: number): number | undefined {
+  const left = deadlineAt === undefined ? 15_000 : Math.min(15_000, deadlineAt - nowMs);
+  return left >= 3_000 ? left : undefined;
 }
 
 // PRD #1429 M6: only auto-run `main()` when this module is the process ENTRYPOINT

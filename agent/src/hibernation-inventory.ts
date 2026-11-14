@@ -32,7 +32,12 @@
 //     finalize_sweep             worker.ts heartbeatLoop sweepPendingFinalizes
 //     hold_settled_retry         worker.ts heartbeatLoop runner.retryPendingHoldSettled
 //     recovery_redrive           worker.ts heartbeatLoop runner.resumeLiveRecoveries
-//     recovery_resume            worker.ts runLifecycle runner.resumePendingRecoveries
+//     recovery_resume            worker.ts runLifecycle runner.resumePendingRecoveries (waits for an unlatch)
+//     recovery_pass              recovery.ts Recovery.trackPass: every boot/live pass, resumeTerminalSource and
+//                                resumeTerminalEvidence (post-run capture records and bundles; outlive runActive).
+//                                Refused while latched; a refused pass is retried by the heartbeat re-drive.
+//     live_settle                runner.ts triggerLiveSettle detached observe+settleLive (journal.put; outlives
+//                                runActive). Refused while latched; the settlement sweep retries.
 //     boot_terminals             worker.ts runLifecycle resolveBootTerminals + cleanupBootCodeSnapshots
 //     settlement_sweep           worker.ts Worker.settlementLoop (publication-resume custodian: ancestry settlement)
 //     terminal_rejections        terminal-rejections.ts dispose (outbox record deletion)
@@ -47,8 +52,8 @@
 //   read-only samplers (no writes): stats collector, RunDiskSampler, memory guard sampling,
 //   retained-source reportRetained.
 //   UNCOVERED: none known. A class that cannot be wrapped must call
-//   HibernationWriterRegistry.markUncovered(name); the inventory then reports it and the api
-//   treats the inventory as invalid.
+//   HibernationWriterRegistry.markUncovered(name); the inventory then reports it, this worker
+//   posts it with complete=false, and the api also refuses to treat such an inventory as complete.
 import type { DindPruneGate } from "./dind-prune.js";
 import type { Logger } from "./log.js";
 import type { PodEpochOwnership } from "./pod-epoch-lock.js";
@@ -153,13 +158,15 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ROLES = new Set<string>(["data", "nix", "dind_data"]);
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const uuid = (v: unknown): v is string => typeof v === "string" && UUID.test(v);
+/** The api's register nonce is a 43-character base64url token, not a UUID; accept any bounded token. */
+const token = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
 const bounded = (v: unknown, max = 253): v is string => typeof v === "string" && v.length > 0 && v.length <= max;
 
 /** null = explicitly none (or absent); undefined = malformed, which the caller ignores. */
 export function decodeHibernationInventory(value: unknown): HibernationInventoryMember | null | undefined {
   if (value === null || value === undefined) return null;
   if (!isRecord(value)) return undefined;
-  if (!uuid(value.op_id) || !uuid(value.register_nonce) || !uuid(value.pod_uid) ||
+  if (!uuid(value.op_id) || !token(value.register_nonce) || !uuid(value.pod_uid) ||
       !bounded(value.deployment_resource_version, 64)) return undefined;
   if (value.phase !== "awaiting" && value.phase !== "accepted") return undefined;
   const raw = value.pvcs;
@@ -338,6 +345,10 @@ export class HibernationInventoryController {
   private held?: { opId: string; ex: boolean; accepted: boolean; nonce: string; podUid: string };
   private failure?: { opId: string; at: number };
   private fatal = false;
+  /** Shutdown began: the exclusion is held until the process exits and is never released. */
+  private stopping = false;
+  /** An op whose exclusion was dropped after a post-EX failure: `held:false` is sent once. */
+  private pendingRelease?: string;
 
   constructor(private readonly deps: HibernationDeps) {
     this.now = deps.now ?? Date.now;
@@ -361,7 +372,12 @@ export class HibernationInventoryController {
   /** The `hibernation_exclusion` heartbeat member, or undefined when there is nothing to report. */
   exclusionReport(): HibernationExclusionReport | undefined {
     const h = this.held;
-    if (!h?.ex) return undefined;
+    if (!h?.ex) {
+      const opId = this.pendingRelease;
+      if (opId === undefined) return undefined;
+      this.pendingRelease = undefined;
+      return { op_id: opId, held: false };
+    }
     return { op_id: h.opId, held: this.intact() };
   }
 
@@ -387,6 +403,7 @@ export class HibernationInventoryController {
   }
 
   private async apply(member: HibernationInventoryMember | null): Promise<void> {
+    if (this.stopping && this.held && (member === null || member.op_id !== this.held.opId)) return;
     if (this.held && (member === null || member.op_id !== this.held.opId)) await this.release();
     if (this.fatal || member === null) return;
     if (this.held) {
@@ -399,6 +416,7 @@ export class HibernationInventoryController {
     if (!podUid || member.pod_uid !== podUid || member.register_nonce !== this.deps.client.currentRegisterNonce()) return;
     if (this.failure && this.failure.opId === member.op_id &&
         this.now() - this.failure.at < (this.deps.retryAfterMs ?? RETRY_AFTER_MS)) return;
+    if (this.stopping) return;
     await this.start(member);
   }
 
@@ -458,17 +476,22 @@ export class HibernationInventoryController {
       // (f) report with the identity echo.
       await d.client.postHibernationInventory(this.buildInventory(m, census), this.abort.signal);
     } catch (err) {
-      if (this.fatal) return;
+      // Shutdown aborts the census and posts: hold the exclusion until exit, release nothing.
+      if (this.fatal || this.stopping) return;
       this.failure = { opId: m.op_id, at: this.now() };
       const status: Status = err instanceof StatusFailure ? err.status : "busy";
       const reason = err instanceof StatusFailure ? err.message : `inventory failed: ${errMessage(err)}`;
+      const hadExclusion = this.held?.ex === true;
       await this.release();
+      if (hadExclusion && !this.fatal) this.pendingRelease = m.op_id;
       await this.postStatus(m, status, reason);
     }
   }
 
   private buildInventory(m: HibernationInventoryMember, census: CensusResult): InventoryRequest {
-    let complete = census.complete;
+    const uncovered = [...this.deps.registry.uncovered(), ...census.uncovered];
+    // An uncovered writer class means the inventory cannot be proven complete (the api enforces it too).
+    let complete = census.complete && uncovered.length === 0;
     let entries = census.entries;
     let docker = census.docker;
     if (entries.length > MAX_ENTRIES) { entries = entries.slice(0, MAX_ENTRIES); complete = false; }
@@ -479,7 +502,7 @@ export class HibernationInventoryController {
       complete, entries, fingerprint: census.fingerprint, digest: census.digest, docker,
       exclusion: {
         lane: "dind", mechanism: "epoch_ex+latch+quiescence",
-        uncovered: [...this.deps.registry.uncovered(), ...census.uncovered],
+        uncovered,
       },
     });
     let body = build();
@@ -497,7 +520,7 @@ export class HibernationInventoryController {
   /** Reacquire SH, then reopen the gate and unlatch. A failed SH re-take keeps the gate closed and exits. */
   private async release(): Promise<void> {
     const h = this.held;
-    if (!h) return;
+    if (!h || this.stopping) return;
     const d = this.deps;
     if (h.ex) {
       try {
@@ -540,6 +563,6 @@ export class HibernationInventoryController {
     }
   }
 
-  /** Cancel in-flight census and posts (shutdown). Does not release the exclusion. */
-  stop(): void { this.abort.abort(); }
+  /** Cancel in-flight census and posts (shutdown). From here nothing releases the exclusion: it is held until exit. */
+  stop(): void { this.stopping = true; this.abort.abort(); }
 }

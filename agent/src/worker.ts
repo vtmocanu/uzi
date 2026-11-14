@@ -553,7 +553,7 @@ export class Worker {
       // journaled bundle bytes with NO forge PAT. Fire-and-forget and fully swallowed — a
       // resume failure must never block the claim loops, and the source stays protected by
       // the journal + the server custody hold regardless.
-      void asWriter("recovery_resume", () => this.runner.resumePendingRecoveries(signal, bootRecoveries)).catch((err) => {
+      void asWriterWhenOpen("recovery_resume", () => this.runner.resumePendingRecoveries(signal, bootRecoveries), signal).catch((err) => {
         this.log.warn("recovery: restart resume sweep failed", { error: errMessage(err) });
       });
       // PRD #1391 M2: admit any spill tail a crash may have lost, then drain the outbox
@@ -1230,8 +1230,10 @@ export class Worker {
         // the prune fail closed on a stale flag.
         this.dindPrune?.recordCustody(retaining, sentAtMs);
         this.dindMaintenance?.observe(this.client.latestDindMaintenance, retaining, sentAtMs);
+        // A successful heartbeat that no longer negotiates the feature is an explicit "none" (null,
+        // not undefined), so an active hold releases instead of leaking; a failed one stays unknown.
         this.hibernation?.observe(this.client.hasFeature("hibernation_inventory_v1")
-          ? this.client.latestHibernationInventory : undefined);
+          ? this.client.latestHibernationInventory : null);
       } catch (err) {
         this.dindMaintenance?.observe(undefined, undefined, sentAtMs);
         this.hibernation?.observe(undefined);
