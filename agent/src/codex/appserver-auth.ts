@@ -71,6 +71,8 @@ export type CodexAppServerAuthConfig =
 export interface CodexAuthSuspensionLease {
   /** Join exchanges started before suspension, including raw bridge settlement. */
   drain(): Promise<void>;
+  /** Assert the session can still authorize live execution; drain alone only joins owners. */
+  assertHealthy(): void;
   /** Idempotent; cannot reopen a closed or poisoned session. */
   resume(): void;
 }
@@ -250,6 +252,10 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     const started = [...this.exchangeTasks];
     return {
       drain: async () => { await Promise.all(started); },
+      assertHealthy: () => {
+        if (this.interceptedClosed || this.state === "poisoned" || this.interceptedFailure !== undefined)
+          throw transportError("codex authentication request admission is closed");
+      },
       resume: () => {
         if (this.suspension !== token) return;
         this.suspension = undefined;

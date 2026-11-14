@@ -139,6 +139,38 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 }
 
 describe("Codex auth reversible suspension", () => {
+  it("reports poison after draining a failed in-flight bridge without changing stale resume", async () => {
+    const entered = deferred<void>();
+    const result = deferred<ServerVerifiedCodexAuthTokens>();
+    const auth = subscription({ refresh: () => { entered.resolve(); return result.promise; } });
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    const request = auth.handleServerRequest(transport, refreshRequest(1));
+    const rejected = assert.rejects(request);
+    await entered.promise;
+    const lease = auth.suspendRefreshAdmission();
+    result.resolve({ accessToken: "", accountId: "" });
+    await lease.drain();
+    await rejected;
+    assert.throws(() => lease.assertHealthy(), /admission is closed/);
+    assert.doesNotThrow(() => { lease.resume(); lease.resume(); });
+    await assert.rejects(auth.authenticate(transport), /session is poisoned/);
+  });
+
+  it("reports poison acquired after a healthy drain", async () => {
+    const auth = subscription({ refresh: async () => REFRESHED });
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    const lease = auth.suspendRefreshAdmission();
+    await lease.drain();
+    lease.assertHealthy();
+    await assert.rejects(auth.handleServerRequest(transport, {
+      ...refreshRequest(1), params: { unexpected: true },
+    }));
+    assert.throws(() => lease.assertHealthy(), /admission is closed/);
+    assert.doesNotThrow(() => lease.resume());
+  });
+
   it("drains started work separately from queued callbacks and resumes the same session", async () => {
     const started = deferred<void>();
     const result = deferred<ServerVerifiedCodexAuthTokens>();

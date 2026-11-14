@@ -30869,6 +30869,85 @@ describe("CodexExecutor: strict rollout currency", () => {
 
 
 describe("CodexExecutor: suspended A boundary", () => {
+  for (const timing of ["before-suspend", "during-drain", "before-reopen"] as const) {
+    it(`retains the gate when live auth fails ${timing}`, async () => {
+      const rig = makeMultiEpochRig([epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+          .push(turnCompleted("completed", th, tn)))]);
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const entered = installerBarrier();
+      let fail!: () => void;
+      const failed = new Promise<never>((_resolve, reject) => { fail = () => reject(new Error("bridge failed")); });
+      rig.client.refreshCodex = async () => { entered.resolve(); return failed; };
+      const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000, guard() {} };
+      const stop = new Error("retained test stop");
+      const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => {
+        const transport = rig.epochs[0]!.transport;
+        const turns = transport.turnStartCount;
+        if (timing === "during-drain") {
+          transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+            requestId: 91, params: { reason: "unauthorized", previousAccountId: null } });
+          await entered.promise;
+          const suspension = exec.suspendCodexEpoch(bounds);
+          transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+            requestId: 93, params: { invalid: true } });
+          fail();
+          await assert.rejects(suspension, error => error instanceof TrustedExecutionRefusal);
+        } else {
+          const suspended = timing === "before-reopen" ? await exec.suspendCodexEpoch(bounds) : undefined;
+          transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+            requestId: 92, params: { invalid: true } });
+          await new Promise<void>(resolve => setImmediate(resolve));
+          if (suspended) await assert.rejects(suspended.reopenA(bounds), error => error instanceof TrustedExecutionRefusal);
+          else await assert.rejects(exec.suspendCodexEpoch(bounds), error => error instanceof TrustedExecutionRefusal);
+        }
+        await assert.rejects(exec.suspendCodexEpoch(bounds), /settled live boundary/);
+        assert.equal(transport.turnStartCount, turns);
+        assert.equal(rig.providerLaunches(), 1);
+        assert.equal(rig.epochs[0]!.reaped(), 0);
+        throw stop;
+      } });
+      await assert.rejects(exec.run(ctx), error => error === stop);
+    });
+  }
+  it("reopens a verified ordinary-reaped held epoch without overwriting the saved home", async () => {
+    let worked = false;
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", (t, th, tn) => {
+      if (worked) t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      else {
+        worked = true;
+        t.push(agentMessage("work", th)).push(turnCompleted("completed", th, tn));
+      }
+    }) });
+    let saves = 0;
+    rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!,
+      persist: async () => { saves++; return { files: 1, bytes: 20 }; },
+      inspectSession: async () => "present",
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000, guard() {} };
+    let checked = false;
+    const { ctx } = makeCtx({ reportIteration: async () => ({ pauseRequested: worked && !checked }), parkForPause: async () => {
+      await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      const count = saves;
+      assert.equal(rig.providerLaunches(), 1);
+      const internals = exec as unknown as { captureRevision: number };
+      const revision = internals.captureRevision;
+      assert.ok(rig.reaped() > 0);
+      const suspended = await exec.suspendCodexEpoch(bounds);
+      assert.deepEqual(await suspended.persistRollout(bounds), { kind: "usable", sessionId: "th-current" });
+      await suspended.reopenA(bounds);
+      assert.equal(internals.captureRevision, revision);
+      assert.equal(saves, count);
+      assert.equal(rig.providerLaunches(), 1, "preflight never starts another A root");
+      checked = true;
+      return false;
+    } });
+    await exec.run(ctx);
+    assert.equal(checked, true);
+    assert.equal(rig.providerLaunches(), 2, "reopened A uses normal epoch recreation");
+  });
+
   for (const claim of [API_KEY, SUBSCRIPTION]) {
     it(`holds and reopens the same ${claim.auth_mode} root without capture`, async () => {
       const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>

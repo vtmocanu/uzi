@@ -3970,7 +3970,30 @@ export class CodexExecutor implements Executor {
         const summaryWasClosed = this.summaryLifecycleClosed;
         // This gate is independent of captureRevision and leaves A's root and scope intact.
         this.switchAdmissionClosed = true;
-        const refresh = captured.harness.suspendRefreshAdmission();
+        // Ordinary checkpoint reap has already saved A and closed its transport. Only
+        // that closed epoch with every root reaped may bypass live auth health checks.
+        const alreadyReaped = reapedSinceLastPersist;
+        const assertReaped = (): void => {
+          if (!reapedSinceLastPersist || !["closed", "disposed"].includes(captured.registry.state()) ||
+              captured.registry.isPoisoned() || captured.registry.hasUnreapedBoundaryRoot() ||
+              captured.registry.pendingLaunchCount() !== 0 || captured.registry.inFlightCallbackCount() !== 0)
+            throw new TrustedExecutionRefusal("Codex reaped boundary cleanup unproven");
+        };
+        let refresh: import("./appserver-auth.js").CodexAuthSuspensionLease | undefined;
+        const assertAuthHealthy = (): void => {
+          try {
+            if (alreadyReaped) assertReaped();
+            else refresh!.assertHealthy();
+          } catch {
+            throw new TrustedExecutionRefusal("Codex live authentication is unavailable");
+          }
+        };
+        try {
+          if (alreadyReaped) assertReaped();
+          else refresh = captured.harness.suspendRefreshAdmission();
+        } catch {
+          throw new TrustedExecutionRefusal("Codex authentication suspension refused");
+        }
         const intentFlights = [...this.retiredIntentFlights, ...(this.intentFlight ? [this.intentFlight] : [])];
         const planFlights = [...this.planFlights];
         this.summaryLifecycleClosed = true;
@@ -3979,10 +4002,11 @@ export class CodexExecutor implements Executor {
         // Each admitted producer retains ownership until it settles. An error does
         // not detach siblings; bounds are rechecked after their complete join.
         const drained = await Promise.allSettled([
-          refresh.drain(), settleInstall(),
+          refresh?.drain(), settleInstall(),
           ...[...intentFlights, ...planFlights].map(flight => flight.done),
         ]);
         current();
+        assertAuthHealthy();
         const failure = drained.find(result => result.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
         if ([...this.unverifiedEpochRegistries].some(registry => this.ownedSummaryRegistries.has(registry)))
@@ -3997,8 +4021,9 @@ export class CodexExecutor implements Executor {
           },
           reopenA: async (nextBounds: import("../codex-switch-coordinator.js").SwitchBounds): Promise<void> => {
             nextBounds.guard(); current();
-            refresh.resume();
+            refresh?.resume();
             nextBounds.guard(); current();
+            assertAuthHealthy();
             reopened = true;
             this.summaryLifecycleClosed = summaryWasClosed;
             this.switchAdmissionClosed = false;

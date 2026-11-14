@@ -1278,7 +1278,15 @@ export class CodexHarness implements RunHarness {
     if (this.closed || this.appServerAuth === undefined) {
       throw new Error("codex authentication suspension is unavailable");
     }
-    return this.appServerAuth.suspendRefreshAdmission();
+    const lease = this.appServerAuth.suspendRefreshAdmission();
+    return {
+      drain: () => lease.drain(),
+      assertHealthy: () => {
+        if (this.closed) throw new Error("codex authentication suspension is unavailable");
+        lease.assertHealthy();
+      },
+      resume: () => lease.resume(),
+    };
   }
 
   private async closeOwned(): Promise<void> {
