@@ -30,7 +30,7 @@ type updatePromptState struct {
 	// latches only when a modal is shown, so it fires at most once per `uzi tui`.
 	showing          bool
 	shownThisSession bool
-	// sel is the highlighted choice index into updateChoices() (which varies by owner).
+	// sel is the highlighted choice index into updateChoices() (which varies by owner and formula readiness).
 	sel int
 	// latestVersion / latestName / latestNotesURL are the server-authored release facts copied
 	// off buildInfoMsg.latest. They are UNTRUSTED (D7) and drawn only through cellText /
@@ -126,8 +126,9 @@ func (m *tuiModel) maybeShowUpdatePrompt(latest, latestRC *apitypes.LatestReleas
 		owner = ""
 	}
 	// The brew action is offered only once the OWNING formula's tap tag reaches the offered
-	// release (#4314): `brew upgrade` of a formula still pinned to an older tag would
-	// reinstall what is already there. The owner's formula fact is used, never the chosen
+	// release (#4314): `brew upgrade` of a formula still pinned to an older tag would install
+	// at most that older release, so post-upgrade verification would fail ("requested ... was
+	// not reached"). The owner's formula fact is used, never the chosen
 	// channel's (an RC-owned binary offered a newer stable still upgrades uzi-cli-rc).
 	ready := false
 	if owner != "" && formulas != nil {
@@ -335,7 +336,7 @@ func isStableTag(tag string) bool {
 type updateChoice int
 
 const (
-	updateChoiceUpdateNow updateChoice = iota // brew users only
+	updateChoiceUpdateNow updateChoice = iota // brew owners whose formula carries the offer (offersBrewUpgrade)
 	updateChoiceNotNow
 	updateChoiceDismiss
 )
