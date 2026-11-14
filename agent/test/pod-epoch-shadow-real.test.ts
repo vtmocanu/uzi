@@ -579,6 +579,8 @@ test("#4265 the verdict and candidates do not depend on the work counters", asyn
   seedThree();
   const plain = await shadowPass();
   const stripped = await shadowPass({ inspect: (opts, real) => real({ ...opts, work: undefined }) });
+  assert.ok(plain.result.inspection_work.shadow.gathers > 0);
+  assert.equal(stripped.result.inspection_work.shadow.gathers, 0);
   // Stripping the shadow sink changes no census counter: the two passes did the same census work.
   assert.equal(stripped.result.inspection_work.census.gathers, plain.result.inspection_work.census.gathers);
   assert.equal(stripped.result.inspection_work.census.tree_walks, plain.result.inspection_work.census.tree_walks);
@@ -670,6 +672,56 @@ test("#4265 batch (a): a binding failure in a LATER request strips every request
   assert.ok(results.every(r => r.partialCauses?.tree_binding_failed === 1 && r.partialCauses.inspection_unclassified === undefined),
     JSON.stringify(results.map(r => r.partialCauses)));
   assert.ok(results.slice(0, 2).every(r => r.sources.length === 1 && r.sources[0]!.disposition === undefined && !("epochSettlement" in r.sources[0]!)));
+});
+
+/** Three abandoned attempts plus one strict-plain live attempt on one bare; the strict-plain group sorts before the last. */
+async function seedMixedBare() {
+  seedThree();
+  await seedStrictPlain();
+  const mixed = await batchOf();
+  const strict = mixed.requests.findIndex(r => r.selector.runId === PLAIN_RUN);
+  return { ...mixed, strict };
+}
+const comparable = (r: RetainedSourceEvidence) => ({ disposition: r.disposition, epochSettlement: r.epochSettlement });
+
+test("#4265 batch (a2): a binding failure in a LATER request strips a strict-plain epoch settlement of an EARLIER request", async t => {
+  const { requests, options, strict } = await seedMixedBare();
+  assert.ok(strict >= 0 && strict < requests.length - 1, "the strict-plain request is neither absent nor the last");
+  const control = await git.inspectEpochRetainedGroups(options(requests));
+  assert.deepEqual(control[strict]!.sources[0]!.epochSettlement, { basis: "strict_plain", disposition: { kind: "local_discard" } });
+  const failing = requests.map((r, i) => i === requests.length - 1 ? { ...r, beforeTree: () => { throw new Error("binding failed"); } } : r);
+  const results = await git.inspectEpochRetainedGroups(options(failing));
+  t.diagnostic(JSON.stringify({ stripped: control.reduce((n, r) => n + settled(r), 0) - results.reduce((n, r) => n + settled(r), 0) }));
+  const source = results[strict]!.sources[0]!;
+  assert.equal(source.epochSettlement, undefined, "the earlier strict-plain source lost its epoch settlement");
+  assert.equal(source.disposition, undefined);
+  assert.ok(results.every(r => r.partial && r.sources.every(s => s.disposition === undefined && s.epochSettlement === undefined)));
+});
+
+test("#4265 batch (e): each request is evaluated with its OWN holds snapshot and lifecycle", async () => {
+  const { requests, options, strict } = await seedMixedBare();
+  const barePath = options([]).barePath;
+  const single = async (r: BatchRequest) => (await git.inspectRetainedSources({
+    epoch: true, barePath, selector: r.selector, holds: r.holds, lifecycle: r.lifecycle,
+    maxPhysicalPaths: r.maxPhysicalPaths, isLivePath: () => false,
+  })).sources[0]!;
+  const control = await git.inspectEpochRetainedGroups(options(requests));
+  const variants: Array<{ name: string; index: number; over: Partial<BatchRequest> }> = [
+    { name: "an open hold", index: requests.length - 1, over: { holds: { state: "read", holds: [{ id: "h1", generation: 1 }] } } },
+    { name: "a non-terminal lifecycle on the strict-plain run", index: strict, over: { lifecycle: { state: "not_terminal", status: "running" } } },
+  ];
+  assert.ok(strict > 0 && strict < requests.length, "the odd requests are never the first");
+  for (const v of variants) {
+    const varied = requests.map((r, i) => i === v.index ? { ...r, ...v.over } : r);
+    const expected = comparable(await single(varied[v.index]!));
+    assert.notDeepEqual(expected, comparable(control[v.index]!.sources[0]!), v.name + ": the single call must differ from the control");
+    const results = await git.inspectEpochRetainedGroups(options(varied));
+    assert.deepEqual(comparable(results[v.index]!.sources[0]!), expected, v.name + ": the varied request matches its single-call result");
+    results.forEach((r, i) => {
+      if (i !== v.index) assert.deepEqual(comparable(r.sources[0]!), comparable(control[i]!.sources[0]!), v.name + ": neighbour " + i + " is unchanged");
+    });
+    assert.equal(results[0]!.sources[0]!.disposition?.kind, "local_discard", "a neighbour keeps local_discard");
+  }
 });
 
 for (const mode of ["aborted", "deadline", "budget", "gather-abort", "gather-error", "evaluation-abort"] as const) {

@@ -332,6 +332,21 @@ test("path drift refuses all authority and malformed fresh holds cannot qualify"
     }
   } finally { await d.close(); }
 });
+test("#4265 a batch inspection returning the wrong number of results invalidates the pass and admits no candidate", async () => {
+  const d = await daemon();
+  try {
+    const { options } = setup(); options.dockerHost = d.host; inventory(options, 2);
+    const inner = options.git.inspectEpochRetainedGroups;
+    let requested = 0;
+    options.git.inspectEpochRetainedGroups = async batch => { requested = batch.requests.length; return (await inner(batch)).slice(1); };
+    const result = (await runPodEpochShadow(options))!;
+    assert.equal(requested, 2, "both groups of the bare were sent as one batch");
+    assert.equal(result.reason, "path_set_changed");
+    assert.notEqual(result.verdict, "eligible");
+    assert.equal(result.would_delete, 0);
+    assert.deepEqual(result.list, []);
+  } finally { await d.close(); }
+});
 for (const stage of ["discovery", "holds", "ownership", "queued_inspection", "measurement"] as const)
 test("shutdown aborts and joins " + stage + " without handover", async () => {
   const d = await daemon();
@@ -1707,6 +1722,20 @@ test("#3851 a deletion re-inspection that is locally short but not partial refus
     assert.deepEqual(w.spies.discards.map(x => x.opts.epochProof.input.paths), [["/tree/1"]]);
     assert.ok(w.spies.reserved.every(run => run !== "run0"), "no reservation was taken for the refused source");
     assert.ok(w.spies.ended.every(e => !e.paths.includes("/tree/0")));
+  });
+});
+
+test("#4265 a deletion re-inspection that returns no result keeps the source through refusal and deletes nothing", async () => {
+  await withDeletion(1, w => {
+    const inner = w.options.git.inspectEpochRetainedGroups;
+    let calls = 0;
+    // Call 1 is the shadow inspection; call 2 is the pre-delete re-inspection of the single admitted source.
+    w.options.git.inspectEpochRetainedGroups = async batch => ++calls === 2 ? [] : inner(batch);
+  }, (w, result) => {
+    assert.equal(result.would_delete, 1, "the shadow pass admitted the candidate");
+    assert.equal(result.kept_after_refusal, 1);
+    assert.equal(result.deleted, 0);
+    noMutation(w);
   });
 });
 

@@ -742,8 +742,8 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       groups.push(group);
     }
     // Maximal consecutive runs on one bare share ONE inspection (one lock, one gather). The API reads of every
-    // group in a run happen first, so a later group's reads can follow the first group's authority reads by
-    // up to K-1 extra round trips (shadow-only: the deletion phase re-reads authority before any effect).
+    // group in a run happen first (each round trip is a lifecycle read then a holds read), so the gather can
+    // follow group 1's authority reads by up to K-1 extra API round trips (shadow-only; deletion re-reads authority).
     type CensusGroup = (typeof census.groups)[number];
     const runs: CensusGroup[][] = [];
     for (const group of groups) {
