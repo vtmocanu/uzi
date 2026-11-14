@@ -282,6 +282,7 @@ describe("credential switch state reports carry op_id", () => {
 });
 
 describe("Codex switch wire contract", () => {
+  const codexRegistered = (url: string) => registered(url, ["credential_switch_in_place_v1", "codex_credential_switch_v1"]);
   const features = [...FEATURES, "codex_credential_switch_apply_v1"];
   const registration = { worker_id: "w", register_nonce: "nonce-1", protocol_features: features };
   const apiKey = { auth_mode: "api_key", access_token: SECRET, capability: "epoch.secret" };
@@ -292,7 +293,7 @@ describe("Codex switch wire contract", () => {
     it(`decodes complete ${auth.auth_mode} auth and current epoch coordinates`, async () => {
       const s = await server(() => json(200, applied(auth)), registration);
       try {
-        const got = await (await registered(s.url)).applyCredentialSwitch("run-1", REQ);
+        const got = await (await codexRegistered(s.url)).applyCredentialSwitch("run-1", REQ);
         assert.deepEqual(got, { kind: "codex_applied", codex: auth, capabilityEpoch: 9, ordinal: 3, messageSeq: 42, replay: false });
         assert.equal(s.posts.length, 1);
       } finally { await s.close(); }
@@ -317,21 +318,21 @@ describe("Codex switch wire contract", () => {
     for (const body of invalid) {
       const s = await server(() => json(200, body), registration);
       try {
-        const got = await (await registered(s.url)).applyCredentialSwitch("run-1", REQ);
+        const got = await (await codexRegistered(s.url)).applyCredentialSwitch("run-1", REQ);
         assert.equal(got.kind, "uncertain");
         assert.ok(!JSON.stringify(got).includes(SECRET));
         assert.equal(s.posts.length, 1);
       } finally { await s.close(); }
     }
     const s = await server(() => json(200, applied(apiKey)));
-    try { assert.equal((await (await registered(s.url)).applyCredentialSwitch("run-1", REQ)).kind, "uncertain"); }
+    try { assert.equal((await (await codexRegistered(s.url)).applyCredentialSwitch("run-1", REQ)).kind, "uncertain"); }
     finally { await s.close(); }
   });
 
   it("classifies a truncated auth response as uncertain and does not retry", async () => {
     const s = await server(() => ({ status: 200, body: JSON.stringify(applied(subscription)).slice(0, -2) }), registration);
     try {
-      const got = await (await registered(s.url)).applyCredentialSwitch("run-1", REQ);
+      const got = await (await codexRegistered(s.url)).applyCredentialSwitch("run-1", REQ);
       assert.equal(got.kind, "uncertain");
       assert.ok(!JSON.stringify(got).includes(SECRET));
       assert.equal(s.posts.length, 1);
@@ -341,7 +342,7 @@ describe("Codex switch wire contract", () => {
   it("preflight sends explicit target and returns server current coordinates", async () => {
     const s = await server(() => json(200, { outcome: "ready", claim_generation: 8, register_nonce: "current", op_id: "current-op" }), registration);
     try {
-      const got = await (await registered(s.url)).preflightCodexCredentialSwitch("run/1", { ...REQ, targetSecretId: "target" });
+      const got = await (await codexRegistered(s.url)).preflightCodexCredentialSwitch("run/1", { ...REQ, targetSecretId: "target" });
       assert.deepEqual(got, { kind: "ready", claimGeneration: 8, registerNonce: "current", opId: "current-op" });
       assert.deepEqual(s.posts, [{ path: "/api/worker/runs/run%2F1/credential-switch/codex/preflight",
         body: { claim_generation: 7, register_nonce: "nonce-1", op_id: "op-1", target_secret_id: "target" } }]);
@@ -368,7 +369,7 @@ describe("Codex switch wire contract", () => {
     });
     await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
     try {
-      const c = await registered(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`);
+      const c = await codexRegistered(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`);
       const cancel = new AbortController();
       const pending = c.preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }, cancel.signal);
       await received;
@@ -393,7 +394,7 @@ describe("Codex switch wire contract", () => {
     ]) {
       const s = await server(() => json(200, body), registration);
       try {
-        const got = await (await registered(s.url)).preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" });
+        const got = await (await codexRegistered(s.url)).preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" });
         assert.equal(got.kind, "uncertain");
         assert.ok(!JSON.stringify(got).includes(SECRET));
       } finally { await s.close(); }
@@ -403,11 +404,11 @@ describe("Codex switch wire contract", () => {
   it("preflight requires the server feature and fails closed on response loss", async () => {
     const s = await server(() => json(200, {}));
     try {
-      await assert.rejects((await registered(s.url)).preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }), /requires/);
+      await assert.rejects((await codexRegistered(s.url)).preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }), /requires/);
       assert.equal(s.posts.length, 0);
     } finally { await s.close(); }
     const lost = await server(() => json(200, {}), registration);
-    const c = await registered(lost.url);
+    const c = await codexRegistered(lost.url);
     await lost.close();
     assert.deepEqual(await c.preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }),
       { kind: "uncertain", detail: "preflight_unavailable" });
@@ -418,9 +419,87 @@ describe("Codex switch wire contract", () => {
       const reason = outcome === "not_applied" || outcome === "refused_committed" ? { reason: "target_moved" } : {};
       const s = await server(() => json(200, { outcome, claim_generation: 0, register_nonce: "", op_id: "", ...reason }), registration);
       try {
-        assert.deepEqual(await (await registered(s.url)).preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }),
+        assert.deepEqual(await (await codexRegistered(s.url)).preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }),
           { kind: outcome, claimGeneration: 0, registerNonce: "", opId: "", ...reason });
       } finally { await s.close(); }
     }
   });
+});
+
+describe("independent Codex switch negotiation", () => {
+  const cap = "codex_credential_switch_v1";
+  const feature = "codex_credential_switch_apply_v1";
+  for (const caps of [[], [cap], ["credential_switch_in_place_v1"], [cap, "credential_switch_in_place_v1"]]) {
+    for (const features of [[], [feature], ["credential_switch_apply_v1"], [feature, "credential_switch_apply_v1"]]) {
+      it(`negotiates independently caps=${caps} features=${features}`, async () => {
+        const s = await server(() => json(200, { outcome: "superseded" }),
+          { worker_id: "w", register_nonce: "nonce-1", protocol_features: features });
+        try {
+          const c = await registered(s.url, caps);
+          const codex = caps.includes(cap) && features.includes(feature);
+          const claude = caps.includes("credential_switch_in_place_v1") && features.includes("credential_switch_apply_v1");
+          assert.equal(c.supportsInPlaceCodexCredentialSwitch(), codex);
+          assert.equal(c.supportsInPlaceCredentialSwitch(), claude);
+          if (codex) await c.preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" });
+          else await assert.rejects(c.preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }), /requires/);
+          if (codex || claude) assert.deepEqual(await c.applyCredentialSwitch("r", REQ), { kind: "superseded" });
+          else await assert.rejects(c.applyCredentialSwitch("r", REQ), /requires/);
+          assert.equal(s.posts.length, Number(codex) + Number(codex || claude));
+          await c.register("t", undefined, undefined, undefined, []);
+          assert.equal(c.supportsInPlaceCodexCredentialSwitch(), false);
+          assert.equal(c.supportsInPlaceCredentialSwitch(), false);
+        } finally { await s.close(); }
+      });
+    }
+  }
+
+  it("keeps the operation on a Codex hold report", async () => {
+    const s = await server(() => json(200, { run: { status: "running" }, disposition: "held" }),
+      { worker_id: "w", register_nonce: "nonce-1", protocol_features: [feature, "credential_switch_hold"] });
+    try {
+      await (await registered(s.url, [cap])).reportState("r", { status: "credential_switch_held", claim_generation: 7, op_id: "op-1" });
+      assert.deepEqual(s.posts.map(p => p.body), [{ status: "credential_switch_held", claim_generation: 7, op_id: "op-1", register_nonce: "nonce-1" }]);
+    } finally { await s.close(); }
+  });
+
+  for (const status of ["credential_switch_failed", "credential_switch_uncertain"]) {
+    it(`${status} preserves exact Codex operation and nonce without Claude feature`, async () => {
+      const s = await server(() => json(200, { run: { status: "running" } }),
+        { worker_id: "w", register_nonce: "nonce-1", protocol_features: [feature] });
+      try {
+        const c = await registered(s.url, [cap]);
+        await c.reportState("r", { status, claim_generation: 7, op_id: "op-1" } as PlanCrossCheckStateRequest);
+        assert.deepEqual(s.posts.map(p => p.body), [{ status, claim_generation: 7, op_id: "op-1", register_nonce: "nonce-1" }]);
+      } finally { await s.close(); }
+    });
+    it(`${status} never downgrades after strict-decode refusal`, async () => {
+      const s = await server(() => json(400, { error: 'json: unknown field "op_id"' }),
+        { worker_id: "w", register_nonce: "nonce-1", protocol_features: [feature] });
+      try {
+        const c = await registered(s.url, [cap]);
+        await assert.rejects(c.reportState("r", { status, claim_generation: 7, op_id: "op-1" } as PlanCrossCheckStateRequest));
+        assert.deepEqual(s.posts.map(p => p.body), [{ status, claim_generation: 7, op_id: "op-1", register_nonce: "nonce-1" }]);
+      } finally { await s.close(); }
+    });
+    it(`${status} refuses invalid operation coordinates`, async () => {
+      const s = await server(() => json(200, { run: { status: "running" } }),
+        { worker_id: "w", register_nonce: "nonce-1", protocol_features: [feature] });
+      try {
+        const c = await registered(s.url, [cap]);
+        for (const coords of [{ claim_generation: 0, op_id: "op-1" }, { claim_generation: 7, op_id: "" }]) {
+          await assert.rejects(c.reportState("r", { status, ...coords } as PlanCrossCheckStateRequest), ReportPreconditionError);
+        }
+        assert.equal(s.posts.length, 0);
+      } finally { await s.close(); }
+    });
+    it(`${status} refuses missing Codex registration nonce`, async () => {
+      const s = await server(() => json(200, { run: { status: "running" } }),
+        { worker_id: "w", protocol_features: [feature] });
+      try {
+        const c = await registered(s.url, [cap]);
+        await assert.rejects(c.reportState("r", { status, claim_generation: 7, op_id: "op-1" } as PlanCrossCheckStateRequest), ReportPreconditionError);
+        assert.equal(s.posts.length, 0);
+      } finally { await s.close(); }
+    });
+  }
 });

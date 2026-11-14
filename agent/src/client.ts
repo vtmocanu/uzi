@@ -1361,6 +1361,8 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
 /** Issue #4201: the api serves the in-place credential switch apply route and op-fenced reports. */
 const CREDENTIAL_SWITCH_APPLY_FEATURE = "credential_switch_apply_v1";
+const CODEX_CREDENTIAL_SWITCH_APPLY_FEATURE = "codex_credential_switch_apply_v1";
+const CODEX_CREDENTIAL_SWITCH_CAPABILITY = "codex_credential_switch_v1";
 /** Issue #4201: the protocol capability a worker advertises to use the in-place apply route. */
 const CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY = "credential_switch_in_place_v1";
 
@@ -1685,6 +1687,7 @@ export class WorkerClient {
   private hasCredentialSwitchCapability = false;
   /** Issue #4201: whether THIS registration advertised credential_switch_in_place_v1. */
   private hasInPlaceCredentialSwitchCapability = false;
+  private hasCodexCredentialSwitchCapability = false;
   /** Issue #3859: set when this registration's api proved (strict-decode 400) it cannot decode
    *  `registration_evidence`. Sticky until the next register(); a heartbeat feature refresh does
    *  not reopen it, which is why it is not simply dropFeature(). */
@@ -2035,6 +2038,7 @@ export class WorkerClient {
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     this.hasInPlaceCredentialSwitchCapability = originalCapabilities?.includes(CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY) ?? false;
+    this.hasCodexCredentialSwitchCapability = originalCapabilities?.includes(CODEX_CREDENTIAL_SWITCH_CAPABILITY) ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
     this.hasBindinglessHoldCapability = originalCapabilities?.includes("recovery_bindingless_closed_v1") ?? false;
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
@@ -2083,10 +2087,15 @@ export class WorkerClient {
     return this.hasInPlaceCredentialSwitchCapability && this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE);
   }
 
+  /** Requires this registration's Codex capability and the server's Codex apply feature. */
+  supportsInPlaceCodexCredentialSwitch(): boolean {
+    return this.hasCodexCredentialSwitchCapability && this.hasFeature(CODEX_CREDENTIAL_SWITCH_APPLY_FEATURE);
+  }
+
   /** One read-only attempt. No response body or auth is retained on failure. */
   async preflightCodexCredentialSwitch(runId: string, req: CodexSwitchPreflightRequest, signal?: AbortSignal): Promise<CodexSwitchPreflightResult> {
-    if (!this.hasFeature("codex_credential_switch_apply_v1"))
-      throw new Error("Codex switch preflight requires codex_credential_switch_apply_v1");
+    if (!this.supportsInPlaceCodexCredentialSwitch())
+      throw new Error("Codex switch preflight requires codex_credential_switch_v1 and codex_credential_switch_apply_v1");
     let res: Response;
     let raw: Buffer;
     try {
@@ -2124,11 +2133,12 @@ export class WorkerClient {
    * Classification is strict: `route_absent` only for chi's default text/plain `404 page not found`;
    * the exact run-not-owned JSON 404 is `fenced`; everything unrecognised is `uncertain`, because the
    * server may have committed. Never echoes a response body or the token. Callers must check
-   * supportsInPlaceCredentialSwitch() first; calling without it is a programming error.
+   * supportsInPlaceCredentialSwitch() or supportsInPlaceCodexCredentialSwitch() first. The shared
+   * request has no harness discriminator; either independently negotiated lane authorizes it.
    */
   async applyCredentialSwitch(runId: string, req: CredentialSwitchApplyRequest): Promise<CredentialSwitchApplyResult> {
-    if (!this.supportsInPlaceCredentialSwitch())
-      throw new Error("applyCredentialSwitch requires the credential_switch_in_place_v1 capability and the credential_switch_apply_v1 feature; check supportsInPlaceCredentialSwitch() first");
+    if (!this.supportsInPlaceCredentialSwitch() && !this.supportsInPlaceCodexCredentialSwitch())
+      throw new Error("applyCredentialSwitch requires supportsInPlaceCredentialSwitch() or supportsInPlaceCodexCredentialSwitch() negotiation");
     const body: Record<string, unknown> = {
       claim_generation: req.claimGeneration, register_nonce: req.registerNonce, op_id: req.opId,
     };
@@ -2917,17 +2927,17 @@ export class WorkerClient {
       // Issue #4201: fenced on the current registration and on the switch operation; never
       // downgraded or retried unqualified, because an api without the feature cannot decode it.
       const nonce = this.registerNonce;
-      if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE) || !nonce ||
+      if ((!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE) && !this.supportsInPlaceCodexCredentialSwitch()) || !nonce ||
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
           typeof body.op_id !== "string" || body.op_id === "")
-        throw new ReportPreconditionError("credential switch uncertain report requires the credential_switch_apply_v1 feature, a registration nonce, a positive claim_generation and an op_id");
+        throw new ReportPreconditionError("credential switch uncertain report requires the Claude apply feature or Codex negotiation, a registration nonce, a positive claim_generation and an op_id");
       return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     if (body.op_id !== undefined) {
       if (body.status !== "credential_switch_failed" && body.status !== "credential_switch_held")
         throw new Error("op_id is only valid on credential switch failed, held and uncertain reports");
       // An api without the feature strict-decodes the report: keep the pre-#4201 shape for it.
-      if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE)) {
+      if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE) && !this.supportsInPlaceCodexCredentialSwitch()) {
         const { op_id: _opId, ...withoutOp } = body;
         body = withoutOp;
       } else if (body.status === "credential_switch_failed") {
@@ -2936,6 +2946,13 @@ export class WorkerClient {
         const nonce = this.registerNonce;
         if (!nonce) throw new ReportPreconditionError("credential switch failed report with an op_id requires a registration nonce");
         body = { ...body, register_nonce: nonce };
+        if (this.supportsInPlaceCodexCredentialSwitch()) {
+          if (typeof body.op_id !== "string" || body.op_id === "" ||
+              !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0)
+            throw new ReportPreconditionError("Codex switch failed report requires a positive claim_generation and an op_id");
+          // Codex operation clears must retain their fences through strict-decode refusal.
+          return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+        }
       }
     }
     if (body.source_publication !== undefined) {
