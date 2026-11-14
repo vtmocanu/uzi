@@ -1347,6 +1347,11 @@ describe("lead Go build-cache cleanup rule (issue #4346)", () => {
     "keep the warm cache",
     "re-arm that trigger only after a fresh reading below 70%",
     "not an enforced cap",
+    "use successful fresh readings",
+    "a shared or independent consumer is known or suspected, skip and report",
+    "do not repeat solely because the same filesystem-pressure episode stays at or above 75%",
+    "then a later reading at or above 75%",
+    "in the run's progress notes (your status messages to the run)",
     "Fresh cache growth to at least 12 GiB may independently trigger another attempt",
     // Ownership.
     "`go env GOCACHE` in the same tool environment that built the code",
