@@ -241,7 +241,7 @@
       "automerge": false
     },
     {
-      "description": "Keep root/deploy compose, mirrored LiveDB CI, chart simple mode and both packaged-proof PostgreSQL defaults on one tested tag and digest (#2622, #4275). The m3b paths trigger packaged-proof PR coverage; scripts/check-postgres-pin-parity.sh rejects partial bumps.",
+      "description": "Keep root/deploy compose, the workflow-level mirrored CI pin shared by both LiveDB jobs, chart simple mode and both packaged-proof PostgreSQL defaults on one tested tag and digest (#2622, #4275). The m3b paths trigger packaged-proof PR coverage; scripts/check-postgres-pin-parity.sh rejects partial bumps.",
       "matchDepNames": ["postgres", "mirror.gcr.io/library/postgres"],
       "groupName": "postgres"
     }
