@@ -53,6 +53,9 @@ func TestStatusReportConsumerContract(t *testing.T) {
 	if got.PollIntervalSeconds != 10 {
 		t.Errorf("PollIntervalSeconds = %d, want 10", got.PollIntervalSeconds)
 	}
+	if got.Hibernation != 1 {
+		t.Errorf("Hibernation = %d, want 1 (PRD #4205 protocol version)", got.Hibernation)
+	}
 	if got.ReportedAt.IsZero() {
 		t.Error("ReportedAt did not decode; it is display-only but it must still arrive")
 	}

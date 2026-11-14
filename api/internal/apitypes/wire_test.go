@@ -958,6 +958,10 @@ var workerDTOKeys = []string{
 	// Issue #3142: when the api first gated this worker's run-lane claims for lost memory
 	// authority (api clock). Null when not gated; overlaid from an in-process tracker.
 	"memory_authority_lost_at",
+	// PRD #4205: worker hibernation lifecycle. hibernation_state is always present;
+	// the reason, hibernated_at, wake_requested_at and wake_error are null outside the
+	// state that sets them. Display-only for the workers UI.
+	"hibernation_state", "hibernation_reason", "hibernated_at", "wake_requested_at", "wake_error",
 }
 
 func TestWorkerDTOTags(t *testing.T) {
@@ -1414,6 +1418,14 @@ func TestRecoveryArchiveSummaryDTOTags(t *testing.T) {
 		"preparing", "uploading", "available", "needs_action", "expired", "discarded")
 	assertTags(t, "RecoveryArchiveSummaryDTO", RecoveryArchiveSummaryDTO{},
 		"supported", "legacy", "has_open_hold", "counts", "archives")
+	// admin_debug_read is omitempty (issue #4198): present only on an admin run debug read.
+	assertTags(t, "RecoveryArchiveSummaryDTO(admin debug)", RecoveryArchiveSummaryDTO{AdminDebugRead: true},
+		"supported", "legacy", "has_open_hold", "counts", "archives", "admin_debug_read")
+}
+
+func TestRunInputsEnvelopeDTOTags(t *testing.T) {
+	assertTags(t, "RunInputsEnvelopeDTO", RunInputsEnvelopeDTO{}, "inputs")
+	assertTags(t, "RunInputsEnvelopeDTO(admin debug)", RunInputsEnvelopeDTO{AdminDebugRead: true}, "inputs", "admin_debug_read")
 }
 
 // The worker-facing archive RPC shapes (M3 consumes; mirrored in agent/src/protocol.ts).

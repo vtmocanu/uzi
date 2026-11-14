@@ -7,6 +7,7 @@ import type { OutgoingMessage, StateAck, PlanCrossCheckReconciliation } from "./
 import type { PayloadRedactor, TextRedactor } from "./redact.js";
 import { clampUtf8Bytes } from "./decisions-memo.js";
 import { emptyCounts, countsTotal, sanitizePayload, sanitizeText } from "./sanitize.js";
+import { oldCumulativeFromModelUsage } from "./old-cumulative.js";
 import { UsageRecorder } from "./usage-recorder.js";
 import { errMessage, sleep } from "./util.js";
 
@@ -191,6 +192,8 @@ function tombstone(item: Buffered, event: TombstoneEvent, reason: string, redact
   if (item.msg.agent !== undefined) msg.agent = item.msg.agent;
   if (item.msg.agent_instance !== undefined) msg.agent_instance = item.msg.agent_instance;
   if (item.msg.agent_label !== undefined) msg.agent_label = item.msg.agent_label;
+  // The marker takes the original's seq, so it stays in the original's credential epoch.
+  if (item.msg.credential_epoch_ordinal !== undefined) msg.credential_epoch_ordinal = item.msg.credential_epoch_ordinal;
   return { msg, bytes: messageBytes(msg), tombstoned: true };
 }
 
@@ -202,6 +205,10 @@ export interface PermanentFailureInfo {
 }
 
 export interface MessageBatcherOptions {
+  /** Issue #4201: whether `credential_switch_apply_v1` is negotiated with the api. Read at each emit;
+   *  a frame's `credentialEpochOrdinal` reaches the wire only while this answers true AND the ordinal
+   *  is above 0, so an older api never receives the field. Absent ⇒ never stamped. */
+  credentialEpochsNegotiated?: () => boolean;
   /**
    * Called ONCE when the breaker trips. It must not travel through the batcher:
    * `concat` is order-preserving, so an emitted explanation queues behind the
@@ -311,11 +318,39 @@ export interface CandidateTransportReservation {
   cancel(): void;
 }
 
+/** Why a credential-switch hold could not be prepared. */
+export interface CredentialSwitchHoldPreparation {
+  prepared: boolean;
+  reason?: "cancelled" | "spilled" | "outbox_undrained" | "unflushed" | "usage_unconfirmed" | "unavailable" | "overflow";
+}
+
+/** Issue #4201: a counted-once hold on sequence assignment around an in-place credential switch.
+ *  Modelled on {@link CandidateTransportReservation}, but it leaves the already-numbered buffer to
+ *  flush normally: only NEW emits are held, unnumbered, until the apply's server seq is known. */
+export interface CredentialSwitchHold {
+  /** Flush what is already numbered and prove the transport is empty. Safe to repeat after a
+   *  retryable failure; the hold stays open until released or cancelled. */
+  prepare(deadlineMs?: number, signal?: AbortSignal): Promise<CredentialSwitchHoldPreparation>;
+  /** After a successful apply: number the held frames from `messageSeq` + 1 (the server's apply
+   *  frame already owns `messageSeq`). False, with the hold still open, when refused. */
+  release(opts: { messageSeq: number }): boolean;
+  /** Nothing was applied: number the held frames from the current tail and resume. */
+  cancel(): void;
+}
+
+interface SwitchHoldState {
+  state: "open" | "prepared" | "done";
+  held: { msg: Omit<OutgoingMessage, "seq">; bytes: number; tombstoned: boolean }[];
+  bytes: number;
+}
+
 /** Cap on the seqs {@link MessageBatcher.tombstonedSeqs} remembers. */
 const MAX_TOMBSTONE_SEQS = 1024;
 
 export class MessageBatcher {
   private reservation: TransportReservation | undefined;
+  private switchHold: SwitchHoldState | undefined;
+  private readonly credentialEpochsNegotiated: () => boolean;
   private buffer: Buffered[] = [];
   /** Consecutive FAILED flushes; drives the backoff delay and resets on any 2xx. */
   private consecutiveFailures = 0;
@@ -392,11 +427,33 @@ export class MessageBatcher {
     this.redact = redact ?? ((p) => p);
     this.redactText = redactText ?? ((s) => s);
     this.permanentFailureHandler = opts.onPermanentFailure;
+    this.credentialEpochsNegotiated = opts.credentialEpochsNegotiated ?? (() => false);
     this.outbox = opts.outbox;
     this.generation = opts.generation ?? 0;
     this.transientTripMs = opts.transientTripMs ?? TRANSIENT_TRIP_MS;
     this.spillBufferBytes = opts.spillBufferBytes ?? 2 * 1024 * 1024;
     this.usage = new UsageRecorder({ client, runId, claimGeneration: this.generation, log });
+  }
+
+  /** The newest session-cumulative `modelUsage` reading as an old_cumulative map (see
+   *  oldCumulativeFromModelUsage); undefined before any such result frame and after a fresh session. */
+  private sessionCumulative: Record<string, number> | undefined;
+
+  /** The last known cumulative reading of the current session, for the in-place credential switch's
+   *  apply. Informational only. */
+  lastSessionCumulative(): Record<string, number> | undefined {
+    return this.sessionCumulative === undefined ? undefined : { ...this.sessionCumulative };
+  }
+
+  private captureSessionCumulative(msg: EmittedMessage): void {
+    const p = msg.payload;
+    if (p["event"] === "init" && p["fresh_session"] === true) {
+      // A new session starts a new cumulative count.
+      this.sessionCumulative = undefined;
+    } else if (p["event"] === "result" && p["usage_basis"] === "session_cumulative" &&
+        (msg.kind === "status" || msg.kind === "error")) {
+      this.sessionCumulative = oldCumulativeFromModelUsage(p["modelUsage"], this.log);
+    }
   }
 
   emit(msg: EmittedMessage): void {
@@ -417,7 +474,8 @@ export class MessageBatcher {
       });
       return;
     }
-    if (!this.reservation) this.seq += 1;
+    this.captureSessionCumulative(msg);
+    if (!this.reservation && !this.switchHold) this.seq += 1;
     // SANITIZE BEFORE REDACT, and the order is a security property, not a style
     // choice. The redactors are exact-substring matchers (`redact.ts`), so a secret
     // carrying an embedded NUL does not match and survives redaction — and
@@ -445,6 +503,8 @@ export class MessageBatcher {
       out.payload["plan_md"] = clampUtf8Bytes(full, 32_768);
       out.payload["truncated"] = out.payload["plan_md"] !== full;
     }
+    if (msg.credentialEpochOrdinal !== undefined && msg.credentialEpochOrdinal > 0 &&
+        this.credentialEpochsNegotiated()) out.credential_epoch_ordinal = msg.credentialEpochOrdinal;
     if (msg.agent !== undefined) out.agent = this.redactText(sanitizeText(msg.agent, counts));
     // PRD #99: copied the same way as `agent` — present only when the frame had
     // them, so the API's pgText("") maps absence to SQL NULL rather than "".
@@ -483,7 +543,8 @@ export class MessageBatcher {
         max_message_bytes: MAX_MESSAGE_BYTES,
       });
       item = tombstone(item, "message_truncated", "the api cannot accept a message this large", this.redactText);
-      this.recordTombstone(out.seq);
+      // A held frame has no seq yet; releaseSwitchHold records its tombstone once it is numbered.
+      if (!this.switchHold) this.recordTombstone(out.seq);
     }
     // Every outgoing run message passes through here — the single chokepoint for
     // dumping raw frames to the operator's `docker logs` at debug level (PRD #11
@@ -505,6 +566,15 @@ export class MessageBatcher {
       const { seq: _seq, ...held } = item.msg;
       r.held.push({ msg: held, bytes });
       r.bytes += bytes;
+      return;
+    }
+    if (this.switchHold) {
+      const h = this.switchHold;
+      const bytes = item.bytes + 10; // room for the eventual signed32-bit seq
+      if (h.bytes + bytes > this.spillBufferBytes) throw new Error("credential switch hold refused an event");
+      const { seq: _seq, ...held } = item.msg;
+      h.held.push({ msg: held, bytes, tombstoned: item.tombstoned === true });
+      h.bytes += bytes;
       return;
     }
     // PRD #1391 M2: while SPILLED, cap the in-memory buffer. A message that would push
@@ -561,7 +631,7 @@ export class MessageBatcher {
    * ACK ends the attempt and retains the reservation and original replay.
    */
   reserveCandidateTransport(): CandidateTransportReservation {
-    if (this.reservation || this.closed || this.tripped ||
+    if (this.reservation || this.switchHold || this.closed || this.tripped ||
       !Number.isSafeInteger(this.generation) || this.generation <= 0 ||
       !Number.isInteger(this.seq) || this.seq < 0 || this.seq > 0x7fffffff)
       throw new Error("candidate transport cannot be reserved");
@@ -607,6 +677,88 @@ export class MessageBatcher {
           leadLastSeq: r.submitted ? cursor : Math.max(cursor, r.tail) });
       },
     };
+  }
+
+  /** Issue #4201: stop numbering new frames until an in-place credential switch resolves. Refused
+   *  (throws) when a candidate reservation or another hold exists, or the batcher is closed or
+   *  tripped. New emits are buffered unnumbered under the reservation byte cap (an emit past it
+   *  throws, as a reservation's does). */
+  holdForCredentialSwitch(): CredentialSwitchHold {
+    if (this.reservation || this.switchHold || this.closed || this.tripped ||
+        !Number.isInteger(this.seq) || this.seq < 0 || this.seq > 0x7fffffff)
+      throw new Error("credential switch hold cannot be taken");
+    const h: SwitchHoldState = { state: "open", held: [], bytes: 0 };
+    this.switchHold = h;
+    const live = (): boolean => this.switchHold === h && h.state !== "done";
+    return {
+      prepare: async (deadlineMs = 3000, signal) => {
+        if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0)
+          throw new RangeError("credential switch deadline must be a nonnegative safe integer");
+        if (!live()) return { prepared: false, reason: "cancelled" };
+        const expiry = AbortSignal.any([AbortSignal.timeout(Math.max(0, Math.min(deadlineMs, 30_000))),
+          ...(signal ? [signal] : [])]);
+        const refusal = await this.proveSwitchTransport(deadlineMs, expiry, live);
+        if (refusal) return { prepared: false, reason: refusal };
+        h.state = "prepared";
+        return { prepared: true };
+      },
+      release: ({ messageSeq }) => {
+        if (!live() || h.state !== "prepared" || this.closed || this.tripped ||
+            this.reservation || this.buffer.length !== 0 || this.pendingRangeFirst !== undefined ||
+            !Number.isSafeInteger(messageSeq) || messageSeq < this.seq || messageSeq > 0x7fffffff ||
+            messageSeq + h.held.length > 0x7fffffff) return false;
+        this.seq = messageSeq;
+        this.endSwitchHold(h);
+        return true;
+      },
+      cancel: () => { if (live()) this.endSwitchHold(h); },
+    };
+  }
+
+  /** Number the held frames from the current tail, hand them to the buffer and end the hold. */
+  private endSwitchHold(h: SwitchHoldState): void {
+    for (const item of h.held) {
+      const msg: OutgoingMessage = { ...item.msg, seq: ++this.seq };
+      if (item.tombstoned) this.recordTombstone(msg.seq);
+      this.buffer.push({ msg, bytes: messageBytes(msg), ...(item.tombstoned ? { tombstoned: true } : {}) });
+    }
+    h.held = [];
+    h.state = "done";
+    if (this.switchHold === h) this.switchHold = undefined;
+    if (this.buffer.length) this.scheduleFlush();
+  }
+
+  /** The refusal reason, or undefined when everything numbered so far is delivered and the outbox
+   *  and usage tail are empty. Flush attempts that make no progress are bounded. */
+  private async proveSwitchTransport(
+    deadlineMs: number, expiry: AbortSignal, live: () => boolean,
+  ): Promise<CredentialSwitchHoldPreparation["reason"] | undefined> {
+    const unavailable = (): boolean => expiry.aborted || !live() || this.closed || this.tripped ||
+      this.reservation !== undefined || this.outbox?.isDisabled() === true;
+    try {
+      await this.inFlight;
+      if (unavailable()) return live() ? "unavailable" : "cancelled";
+      if (this.spilled) return "spilled";
+      if (!await this.usage.drainConfirmed(Math.min(deadlineMs, 3000), expiry)) return "usage_unconfirmed";
+      let failed = 0;
+      while (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) {
+        if (unavailable()) return live() ? "unavailable" : "cancelled";
+        if (this.spilled) return "spilled";
+        const before = this.buffer.length + this.pendingRangeWidth();
+        await this.flushMessages(expiry);
+        await this.inFlight;
+        if (this.buffer.length + this.pendingRangeWidth() < before) continue;
+        if (++failed >= CLOSE_MAX_FAILED_ATTEMPTS) return "unflushed";
+      }
+      if (unavailable()) return live() ? "unavailable" : "cancelled";
+      if (this.spilled) return "spilled";
+      if (this.outbox?.hasUndrainedMessages(this.runId)) return "outbox_undrained";
+      if (!await this.usage.drainConfirmed(Math.min(deadlineMs, 3000), expiry)) return "usage_unconfirmed";
+      if (unavailable()) return live() ? "unavailable" : "cancelled";
+      return undefined;
+    } catch {
+      return "unavailable";
+    }
   }
 
   private releaseReservation(r: TransportReservation, p: PlanCrossCheckReconciliation): boolean {
@@ -1568,6 +1720,9 @@ export class MessageBatcher {
    * close cannot outlive the owning boundary on an independent HTTP timeout. */
   async close(signal?: AbortSignal): Promise<void> {
     this.closed = true;
+    // Issue #4201: a switch hold still open at close (a fence or option A stop) releases its frames at
+    // the current tail, so they drain like any other buffered frame.
+    if (this.switchHold) this.endSwitchHold(this.switchHold);
     if (this.reservation) {
       const r = this.reservation;
       r.state = "failed";

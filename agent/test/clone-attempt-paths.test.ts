@@ -1,4 +1,7 @@
 import { codexRig } from "./runner-codex-sinks-fixture.js";
+import { CredentialSwitchOpLedger } from "../src/credential-switch-op-ledger.js";
+import { freshClaim, newApi, until } from "./gate-revision-harness.js";
+import type { ApplyScript } from "./fake-api.js";
 import { acquireWorkerLifetime } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { openAuthorityStore } from "../src/completion-authority.js";
@@ -527,6 +530,80 @@ describe("issue #1783 M2 P-seed: a wired worker seeds <key>.attempt-<id>, an unw
     assert.equal(seen?.worktree, canonicalFor(iid));
     assert.equal(seen?.journalRaw, JSON.stringify({ runId: claim.run_id, clonePath: canonicalFor(iid) }));
     assert.deepEqual(seen?.ledger, []);
+  });
+
+  // Issue #4201 regression. A RUNNING Claude run that gets a credential switch used to release its claim, and
+  // the reclaim then seeded a fresh `<key>.attempt-<id>` (the session dropped: cwd_changed_attempt_path). The
+  // in-place apply keeps the attempt directory. Both halves run: `route_absent` is the api not serving the
+  // apply route (today's release path), `applied` is the in-place switch.
+  it("issue #4201: a switch on a running run releases and reseeds on route_absent, and keeps its attempt dir on applied", async () => {
+    const NONCE = "n".repeat(43);
+    const NEW_TOKEN = ["sk-ant-oat01-", "REGRESSION-0123456789"].join("");
+    const attemptDirs = (): string[] =>
+      fs.existsSync(runnerRepoDir()) ? fs.readdirSync(runnerRepoDir()).filter((n) => n.includes(".attempt-")).sort() : [];
+    /** One run: the executor asks for the switch while running; `after` is what the reclaim's executor sees. */
+    async function run(outcome: ApplyScript) {
+      newApi();
+      client.protocolFeatures = [...client.protocolFeatures, "credential_switch_hold", "credential_switch_apply_v1"];
+      (client as unknown as { registerNonce: string }).registerNonce = NONCE;
+      (client as unknown as { hasInPlaceCredentialSwitchCapability: boolean }).hasInPlaceCredentialSwitchCapability = true;
+      const claim = freshClaim(1);
+      const runId = claim.run_id;
+      api.scriptApply(runId, outcome);
+      const worktrees: string[] = [];
+      let outcomeSeen = "";
+      const factory: ExecutorFactory = (id) => ({
+        homeDir: path.join(homeDir, id),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            worktrees.push(ctx.worktreePath);
+            if (worktrees.length > 1) throw new Error("stop after observing the reclaim");
+            // Committed work the release's capture fetches back (real git, as the park test does).
+            fs.writeFileSync(path.join(ctx.worktreePath, "WORK.txt"), "committed work\n");
+            execFileSync("git", ["-C", ctx.worktreePath, "add", "WORK.txt"], { env: GIT_ENV, stdio: "pipe" });
+            execFileSync("git", ["-C", ctx.worktreePath, ...IDENT, "commit", "-m", "work"], { env: GIT_ENV, stdio: "pipe" });
+            if (outcome.outcome === "route_absent") api.overrideStateStatus(runId, "queued"); // the release requeues
+            api.requestCredentialSwitch(runId, 1, "op-1");
+            assert.ok(await until(() => ctx.signal?.aborted === true, 10_000), "the switch aborted ctx.signal");
+            outcomeSeen = String(await ctx.attemptCredentialSwitch!({ site: "implement_turn", laneSettled: true }));
+            if (outcomeSeen === "released") return { branch: ctx.branch, switchReleased: true };
+            worktrees.push(ctx.worktreePath); // the same run, after the apply
+            return { branch: ctx.branch, reportOnly: true, summary: "continued in place" };
+          },
+        },
+      });
+      await wired(factory, { credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir) }).execute(claim);
+      const afterFirst = attemptDirs();
+      let reclaim: string | undefined;
+      if (outcomeSeen === "released") {
+        api.overrideStateStatus(runId, "running");
+        api.setInputClaimGeneration(runId, 2);
+        api.setOwnershipStatus(runId, "running", 2);
+        await wired(factory, { credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir) })
+          .execute({ ...claim, session_id: randomUUID(), claim_generation: 2 });
+        reclaim = worktrees[1];
+      }
+      const states = api.states.filter((x) => x.runId === runId).map((x) => x.body.status);
+      const reasons = api.messages(runId).map((m) => (m.payload as { reason?: string }).reason).filter(Boolean);
+      return { outcomeSeen, worktrees, afterFirst, reclaim, states, reasons };
+    }
+
+    // Base behaviour: the apply route is absent, so the run releases; the reclaim reseeds a fresh attempt path.
+    const base = await run({ outcome: "route_absent" });
+    assert.equal(base.outcomeSeen, "released");
+    assert.ok(base.states.includes("credential_switch"), `released: ${base.states.join(",")}`);
+    assert.ok(base.reclaim && base.reclaim !== base.worktrees[0], "the reclaim runs in a fresh attempt path");
+    assert.ok(parseAttemptPath(base.reclaim!, path.join(fx.dataDir, "runner")), "which is a <key>.attempt-<id> path");
+    assert.ok(base.reasons.includes("cwd_changed_attempt_path"), `the feed says why: ${JSON.stringify(base.reasons)}`);
+
+    // With the in-place switch: the same attempt dir, no release, no lineage break.
+    const fixed = await run({ outcome: "applied", token: NEW_TOKEN });
+    assert.equal(fixed.outcomeSeen, "applied");
+    assert.ok(!fixed.states.includes("credential_switch"), `no release: ${fixed.states.join(",")}`);
+    assert.deepEqual(fixed.worktrees.length, 2, "the executor continued in the run's own attempt dir");
+    assert.equal(fixed.worktrees[0], fixed.worktrees[1], "the same attempt dir before and after the apply");
+    assert.ok(!fixed.reasons.includes("cwd_changed_attempt_path"), "no lineage break");
+    assert.ok(fixed.states.includes("completed"), fixed.states.join(","));
   });
 });
 

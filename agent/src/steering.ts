@@ -216,6 +216,12 @@ export interface CredentialSwitchHold {
 
 /** The sticky pause mode (see SteeringChannel.getPauseMode): an owner `milestone`/`now` pause, the
  *  sweep's `wall` park (PRD #1497), the worker-local `disk` stop (PRD #1809 D4), or none. */
+/** What can revoke the checkpoint-authority controller (SteeringChannel.revokedBy). */
+type StopRevoker = "switch" | "fence" | "shutdown" | "disk" | "cancel" | "terminal";
+
+/** Settled switch op ids remembered for the late-poll guard. */
+const SETTLED_OPS_MAX = 16;
+
 export type PauseMode = "milestone" | "now" | "wall" | "disk" | null;
 
 export class PauseNowSignal extends Error {
@@ -499,7 +505,7 @@ export class SteeringChannel {
   /** Why the flight ended from this channel (a given-up receipt or a fenced claim): a park
    *  armed after that rejects at once instead of waiting on a poll loop that has stopped. */
   private flightEnded: Error | undefined;
-  private readonly receiptWaiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+  private readonly receiptWaiters: Array<{ resolve: () => void; reject: (err: Error) => void; switchOutcome: boolean }> = [];
   private readonly receiptDeadlineMs: number;
   /** Why this flight was fenced (released | stale), once it was; the runner then stops quietly. */
   private fence: string | undefined;
@@ -608,7 +614,7 @@ export class SteeringChannel {
    *  APPLIED inputs) see the follow-up, verdict or answer that caused the report. Rejects with
    *  InputReceiptError once the receipt is given up, so no guarded report goes out as if the
    *  input were applied. */
-  async awaitReceiptSettlement(signal?: AbortSignal): Promise<void> {
+  async awaitReceiptSettlement(signal?: AbortSignal, opts?: { switchOutcome?: boolean }): Promise<void> {
     if (this.receiptFailure) throw this.receiptFailure;
     if (!this.receiptPending()) return;
     // Abort-aware: a cancel, pause or switch trip (the shared controller) or the report's own
@@ -630,6 +636,7 @@ export class SteeringChannel {
       const waiter = {
         resolve: () => { done(); resolve(); },
         reject: (err: Error) => { done(); reject(err); },
+        switchOutcome: opts?.switchOutcome === true,
       };
       const onAbort = (): void => {
         const i = this.receiptWaiters.indexOf(waiter);
@@ -694,6 +701,20 @@ export class SteeringChannel {
     for (const w of this.receiptWaiters.splice(0)) w.resolve();
   }
 
+  /** Issue #4201: an in-place switch refused an applied receipt and its ids were parked until the switch settles. A
+   *  parked id no longer counts as pending, so a waiting report would otherwise resolve with its input unapplied (a
+   *  `running` report would then be refused by the server's question guard). Only the switch's own outcome reports
+   *  (credential_switch_failed, _held, _uncertain, and the v1 release) may go on; every other waiter is rejected into
+   *  the switch path. Needed because a give-up leaves the cancel controller spent, so a second switch's trip cannot
+   *  abort the waiters the way an applied settle's fresh controller does. */
+  private rejectNonSwitchWaiters(): void {
+    const own: typeof this.receiptWaiters = [];
+    for (const w of this.receiptWaiters.splice(0)) {
+      if (w.switchOutcome) own.push(w); else w.reject(new CredentialSwitchSignal());
+    }
+    this.receiptWaiters.push(...own);
+  }
+
   private releaseHeld(): void {
     this.held = undefined;
     this.applyFailures = 0;
@@ -730,7 +751,7 @@ export class SteeringChannel {
     this.log.warn("steering: input receipt claim is fenced; ending this flight", { run_id: this.runId, reason });
     const signal = new ClaimFencedSignal(reason);
     this.fence = reason;
-    this.shutdownStop.abort(signal);
+    this.revokeStop("fence", signal);
     this.flightEnded = signal;
     this.ready = undefined;
     this.releaseHeld();
@@ -742,7 +763,7 @@ export class SteeringChannel {
       // Install the fence first: observing cancellation grants no report or custody authority.
       if (reason === "terminal_cancelled") this.onCancel?.();
     } finally {
-      try { if (!this.cancel.signal.aborted) this.cancel.abort(signal); }
+      try { this.abortCancel(signal); }
       finally {
         this.abortLifecycle(signal);
         this.rejectParkedWaiters(signal);
@@ -769,6 +790,18 @@ export class SteeringChannel {
           // Hold: latch, keep the batch unapplied (rearm returns it to the ready lane), reject nobody.
           for (const id of this.held.ids) if (!this.heldForSwitch.includes(id)) this.heldForSwitch.push(id);
           this.maybeTripCredentialSwitch(this.claimGeneration);
+          this.releaseHeld();
+          return;
+        }
+        if (reason === "switch_pending" && this.inPlaceSwitchContext()) {
+          // In place: the claim stays and the apply or give-up settles the switch. Keep the batch unapplied (APPLIED
+          // removes a row from replay), reject nobody and trip nothing. While the switch is pending the ids wait in
+          // heldForSwitch (settleCredentialSwitch returns them to the ready lane); once it is settled they are ready
+          // for the next poll's APPLIED.
+          if (this.pendingSwitch !== undefined) {
+            for (const id of this.held.ids) if (!this.heldForSwitch.includes(id)) this.heldForSwitch.push(id);
+            this.rejectNonSwitchWaiters();
+          } else this.markReady([...this.held.ids]);
           this.releaseHeld();
           return;
         }
@@ -1149,6 +1182,23 @@ export class SteeringChannel {
       this.endFencedFlight(reason!);
       return "stop";
     }
+    if (reason === "switch_pending" && this.inPlaceSwitchContext()) {
+      // In place (see inPlaceSwitchContext): reject nobody, trip nothing. A still-pending switch parks the ids (the
+      // settle returns them to the ready lane); a settled one keeps them ready and retries after the poll interval.
+      this.log.warn("steering: an in-place switch refused an applied receipt; keeping the inputs unapplied until it settles", {
+        run_id: this.runId,
+        count,
+      });
+      if (this.pendingSwitch !== undefined) {
+        this.parkReady(ids);
+        if (ids.some((id) => this.takenApproveIds.has(id))) this.approveRefusedBySwitch = true;
+        this.rejectNonSwitchWaiters();
+        this.settleWaiters();
+        return "continue";
+      }
+      this.settleWaiters();
+      return "retry";
+    }
     if (reason === "switch_pending" && !reviseBatch) {
       // Only a revise batch is accepted under a pending switch. Park these ids (state v): a switch
       // that gives up (rearmCredentialSwitch) moves them back to the ready lane, a release leaves
@@ -1209,6 +1259,15 @@ export class SteeringChannel {
       return "stop";
     }
     return "retry";
+  }
+
+  /** Issue #4201: whether a switch_pending refusal of an APPLIED belongs to an IN-PLACE switch: the pending switch carries
+   *  an op id, or this flight already settled an in-place op at the current claim generation (a late refusal that raced
+   *  the stamp clear). The switch signal of an in-place switch always arrives with its op id through the GET or ack, so
+   *  such a refusal must neither reject the waiting reports (that would turn an in-place give-up into a retained stop)
+   *  nor trip a switch (a phantom op-less one would take the v1 release). v1 (no op id, nothing settled) is unchanged. */
+  private inPlaceSwitchContext(): boolean {
+    return this.pendingSwitch?.opId !== undefined || this.inPlaceSettledGeneration === this.claimGeneration;
   }
 
   /** Move ready ids to the parked set (state v). */
@@ -1343,7 +1402,7 @@ export class SteeringChannel {
     if (this.cancelled || this.delivered) return Promise.resolve();
     if (this.deliveryOutcome) return Promise.reject(this.deliveryOutcome);
     if (this.flightEnded) return Promise.reject(this.flightEnded);
-    if (this.pendingSwitchGeneration !== undefined) return Promise.reject(new CredentialSwitchSignal());
+    if (this.pendingSwitch !== undefined) return Promise.reject(new CredentialSwitchSignal());
     return new Promise<void>((resolve, reject) => {
       const done = (): void => {
         signal?.removeEventListener("abort", onAbort);
@@ -1488,7 +1547,17 @@ export class SteeringChannel {
     return this.terminalLifecycle.signal;
   }
 
-  private readonly shutdownStop = new AbortController();
+  /** The checkpoint-authority controller. Replaceable (not readonly): an applied in-place switch whose
+   *  ONLY revoker was the switch itself re-arms it (settleCredentialSwitch). Readers must fetch
+   *  checkpointAuthoritySignal() at use time and never cache the signal. */
+  private shutdownStop = new AbortController();
+  /** Every cause that has revoked shutdownStop. A re-arm happens only when this is exactly {"switch"}. */
+  private readonly revokedBy = new Set<StopRevoker>();
+
+  private revokeStop(cause: StopRevoker, reason?: unknown): void {
+    this.revokedBy.add(cause);
+    if (!this.shutdownStop.signal.aborted) this.shutdownStop.abort(reason);
+  }
 
   /** Revocation fence also fires for disk/switch delivery after a cooperative pause. */
   checkpointAuthoritySignal(): AbortSignal {
@@ -1508,19 +1577,23 @@ export class SteeringChannel {
   ownershipRepairAuthority(): boolean {
     return !this.lifecycleEnded && !this.terminalLifecycle.signal.aborted && !this.shutdownStop.signal.aborted &&
       this.flightEnded === undefined && this.receiptFailure === undefined && !this.cancelled &&
-      this.fence === undefined && this.pendingSwitchGeneration === undefined && this.pauseMode !== "disk" &&
+      this.fence === undefined && this.pendingSwitch === undefined && this.pauseMode !== "disk" &&
       this.shutdownCheckpoint === undefined;
   }
 
   /** Stop execution with existing reasons while preserving the shutdown sink's separate stop signal. */
   workerShutdown(deadlineAt: number): GracefulShutdownCheckpoint {
     if (this.shutdownCheckpoint) return this.shutdownCheckpoint;
+    // The checkpoint captures this controller's signal, so a shutdown keeps it for good even when it
+    // has not been aborted yet: it is never re-armed.
+    this.revokedBy.add("shutdown");
     if (this.lifecycleEnded || this.terminalLifecycle.signal.aborted || this.cancelled ||
-        this.flightEnded || this.pendingSwitchGeneration !== undefined || this.pauseMode === "disk" ||
+        this.flightEnded || this.pendingSwitch !== undefined || this.pauseMode === "disk" ||
         (this.cancel.signal.aborted &&
-          !(this.cancel.signal.reason instanceof PauseNowSignal))) this.shutdownStop.abort();
+          !(this.cancel.signal.reason instanceof PauseNowSignal) &&
+          !this.isSettledSwitchSignal(this.cancel.signal.reason))) this.revokeStop("shutdown");
     this.shutdownCheckpoint = Object.freeze({ stopSignal: this.shutdownStop.signal, deadlineAt });
-    this.cancel.abort();
+    this.abortCancel();
     this.terminalLifecycle.abort();
     this.lifecycleEnded = true;
     this.lifecycle.abort();
@@ -1528,7 +1601,7 @@ export class SteeringChannel {
   }
 
   abortLifecycle(reason?: unknown, terminal = true): void {
-    if (terminal || reason instanceof CredentialSwitchSignal) this.shutdownStop.abort(reason);
+    if (terminal || reason instanceof CredentialSwitchSignal) this.revokeStop(terminal ? "terminal" : "switch", reason);
     if (terminal && !(reason instanceof PauseNowSignal)) this.terminalLifecycle.abort(reason);
     if (terminal) this.lifecycleEnded = true;
     if (!this.lifecycle.signal.aborted) this.lifecycle.abort(reason);
@@ -1541,7 +1614,7 @@ export class SteeringChannel {
       !this.lifecycleEnded &&
       (this.lifecycle.signal.reason instanceof PauseNowSignal ||
         this.lifecycle.signal.reason instanceof CredentialSwitchSignal) &&
-      !this.cancelled && !this.flightEnded && this.pendingSwitchGeneration === undefined &&
+      !this.cancelled && !this.flightEnded && this.pendingSwitch === undefined &&
       this.pauseMode !== "disk"
     ) this.lifecycle = new AbortController();
   }
@@ -1551,9 +1624,23 @@ export class SteeringChannel {
    *  no-op), read by the runner (pendingCredentialSwitch) so enterCredentialSwitch knows which
    *  generation it is releasing. Never reset within a flight: the flight ends (release or give-up)
    *  the moment it is set. */
-  private pendingSwitchGeneration: number | undefined;
+  private pendingSwitch: { generation: number; opId?: string } | undefined;
+  /** Issue #4201: ops already settled (applied, gave up or cleared), last SETTLED_OPS_MAX. A late poll
+   *  that still carries one (it raced the apply commit) is ignored. */
+  private readonly settledOps = new Set<string>();
+  /** Issue #4201: the claim generation at which this flight last settled an in-place op (applied, gave up or cleared).
+   *  settledOps alone has no generation; with pendingSwitch it tells a late receipt refusal that the switch is an
+   *  in-place one, so it is never turned into a phantom op-less switch. */
+  private inPlaceSettledGeneration: number | undefined;
+  /** CredentialSwitchSignal abort reasons whose switch settled: the signal is spent, not a stop. */
+  private readonly settledSwitchSignals = new WeakSet<object>();
+  private readonly cancelReplacedListeners = new Set<(signal: AbortSignal) => void>();
+  /** The first stop reason that reached the shared cancel controller while a pending switch was
+   *  outstanding and a switch signal had spent it (abortCancel); an applied settle replays it onto the fresh controller (issue #4201 review BN1). */
+  private deferredCancelAbort: { reason: unknown } | undefined;
+  private latchedSwitchOpId: string | undefined;
   /** PRD #1247 M5b (MAJOR-6 rework): while > 0, a matching credential_switch signal is DEFERRED —
-   *  maybeTripCredentialSwitch returns WITHOUT setting pendingSwitchGeneration and WITHOUT aborting,
+   *  maybeTripCredentialSwitch returns WITHOUT setting pendingSwitch and WITHOUT aborting,
    *  so the signal (which rides every poll) is honored at the NEXT trip point after the window ends.
    *  The executor opens this window around a plan-REVISION planning turn, whose new plan is not yet
    *  persisted. Since issue #1604 a release mid-turn is recoverable (the revise stays unapplied until
@@ -1624,8 +1711,9 @@ export class SteeringChannel {
     private readonly runId: string,
     private readonly pollMs: number,
     private readonly log: Logger,
-    /** Aborted when a `cancel` input arrives; wired to the executor's ctx.signal. */
-    private readonly cancel: AbortController,
+    /** Aborted when a `cancel` input arrives; wired to the executor's ctx.signal. Replaced (not
+     *  readonly) by an applied in-place switch: see cancelSignal(). */
+    private cancel: AbortController,
     opts: SteeringOptions = {},
   ) {
     this.sleepFn = opts.sleep ?? sleep;
@@ -1712,9 +1800,9 @@ export class SteeringChannel {
   requestDiskStop(): void {
     if (this.pauseMode === "disk") return;
     this.pauseMode = "disk";
-    this.shutdownStop.abort();
+    this.revokeStop("disk");
     const signal = new PauseNowSignal();
-    if (!this.cancel.signal.aborted) this.cancel.abort(signal);
+    this.abortCancel(signal);
     this.abortLifecycle(signal);
     this.pauseNowInterrupt?.();
   }
@@ -1741,7 +1829,7 @@ export class SteeringChannel {
    * The runner installs its maintenance budget before aborting model/lifecycle listeners. */
   markCancelled(): void {
     this.cancelled = true;
-    this.shutdownStop.abort();
+    this.revokeStop("cancel");
   }
 
   /** One bounded input observation for a refused capture disposition. Receipt-mode
@@ -1820,7 +1908,32 @@ export class SteeringChannel {
    *  enterCredentialSwitch knows which generation it is releasing (it equals this claim's
    *  generation by construction — maybeTripCredentialSwitch fires only on a generation match). */
   pendingCredentialSwitch(): number | undefined {
-    return this.pendingSwitchGeneration;
+    return this.pendingSwitch?.generation;
+  }
+
+  /** Issue #4201: the pending switch's generation and op id (the op id is absent on a v1 server's
+   *  signal), or undefined when none is pending. */
+  pendingCredentialSwitchOp(): { generation: number; opId?: string } | undefined {
+    return this.pendingSwitch ? { ...this.pendingSwitch } : undefined;
+  }
+
+  /** Issue #4201: the lifecycle (cancel) signal steering currently aborts. After an applied in-place
+   *  switch it is a fresh signal; read it at use time and never cache it. */
+  cancelSignal(): AbortSignal {
+    return this.cancel.signal;
+  }
+
+  /** Issue #4201: `cb` runs with the fresh signal each time an applied switch replaces the cancel
+   *  controller, so the runner can re-wire whatever listened to the spent one. Returns an unsubscribe. */
+  onCancelSignalReplaced(cb: (signal: AbortSignal) => void): () => void {
+    this.cancelReplacedListeners.add(cb);
+    return () => { this.cancelReplacedListeners.delete(cb); };
+  }
+
+  /** Issue #4201: whether `reason` is the abort reason of a switch that has settled in place, so a
+   *  guard that treats a spent shared cancel controller as a stop can leave it out. */
+  isSettledSwitchSignal(reason: unknown): boolean {
+    return typeof reason === "object" && reason !== null && this.settledSwitchSignals.has(reason);
   }
 
   /** Issue #3974: true once an owner cancel was committed while a credential switch was withheld.
@@ -1832,7 +1945,7 @@ export class SteeringChannel {
   /** Issue #3974: the predicate under which the api withholds every input row behind a switch
    *  signal, so a queued owner cancel cannot reach this worker through GET inputs. */
   private withheldSwitchCancelEligible(generation: number | undefined): boolean {
-    return generation === this.claimGeneration && this.pendingSwitchGeneration === undefined &&
+    return generation === this.claimGeneration && this.pendingSwitch === undefined &&
       (this.holdActive() || this.switchDeferDepth > 0) && !this.cancelled && this.fence === undefined &&
       !this.terminalLifecycle.signal.aborted;
   }
@@ -1844,7 +1957,7 @@ export class SteeringChannel {
     this.markCancelled();
     try { this.onCancel?.(); }
     finally {
-      try { if (!this.cancel.signal.aborted) this.cancel.abort(); }
+      try { this.abortCancel(); }
       finally { this.abortLifecycle(); }
     }
   }
@@ -1883,14 +1996,14 @@ export class SteeringChannel {
   }
 
   /** PRD #1247 M5b (BLOCKING-3 rework): re-arm the credential-switch trip after a give-up whose
-   *  stamp-clear the server POSITIVELY confirmed. Clears pendingSwitchGeneration so a LATER
+   *  stamp-clear the server POSITIVELY confirmed. Clears pendingSwitch so a LATER
    *  same-generation switch signal — a re-request the owner makes on the STILL-OPEN claim, whose
    *  generation is pinned to claim_generation for the claim's lifetime — can trip again. Without
    *  it the once-only guard in maybeTripCredentialSwitch permanently drops every subsequent signal
    *  for that claim. Call it ONLY after a CONFIRMED clear on a give-up-continue, never on a
    *  retain-and-stop (where the server stamp may still be pending). */
   rearmCredentialSwitch(): void {
-    this.pendingSwitchGeneration = undefined;
+    this.pendingSwitch = undefined;
     // Issue #1604: the claim stays active and the switch is cleared, so the plan-gate inputs a
     // pending switch refused are due their APPLIED again.
     this.approveRefusedBySwitch = false;
@@ -1898,10 +2011,71 @@ export class SteeringChannel {
     if (this.heldForSwitch.length > 0) this.markReady(this.heldForSwitch.splice(0));
   }
 
+  /** Issue #4201: the in-place rearm. Records `opId` as settled (so a late poll that still carries it
+   *  is ignored), clears the pending switch and runs rearmCredentialSwitch's body. On "applied" only,
+   *  and only when the switch was the SOLE revoker of the checkpoint authority, a fresh controller
+   *  replaces the revoked one; a fence, shutdown, disk stop, cancel or terminal abort keeps it revoked.
+   *  rearmLifecycle stays the runner's call after the sink. */
+  settleCredentialSwitch(opId: string, outcome: "applied" | "gave_up" | "cleared"): void {
+    this.settledOps.delete(opId);
+    this.settledOps.add(opId);
+    this.inPlaceSettledGeneration = this.claimGeneration;
+    while (this.settledOps.size > SETTLED_OPS_MAX) {
+      const oldest = this.settledOps.values().next().value as string;
+      this.settledOps.delete(oldest);
+    }
+    const spent = this.cancel.signal;
+    const spentBySwitch = spent.aborted && spent.reason instanceof CredentialSwitchSignal;
+    if (spentBySwitch) this.settledSwitchSignals.add(spent.reason);
+    this.rearmCredentialSwitch();
+    // An AbortController cannot be reset, so every `!cancel.signal.aborted` guard (fence, disk stop,
+    // cancel, pause now/wall, a later switch trip) would silently drop its reason on the spent one.
+    // Replace it, then tell the runner so it follows the new signal (cancelSignal()).
+    // A stop that landed while the spent controller carried the pending switch (a cancel, fence, disk
+    // stop, shutdown or a newer switch) was deferred by abortCancel; it aborts the fresh controller at
+    // once, so replacing the controller never erases it (issue #4201 review BN1).
+    const deferred = this.deferredCancelAbort;
+    this.deferredCancelAbort = undefined;
+    let replaced = false;
+    if (spentBySwitch && outcome === "applied") {
+      this.cancel = new AbortController();
+      if (deferred) this.cancel.abort(deferred.reason);
+      replaced = true;
+    }
+    if (outcome === "applied" && this.revokedBy.size === 1 && this.revokedBy.has("switch")) {
+      this.shutdownStop = new AbortController();
+      this.revokedBy.clear();
+    }
+    // Notify last, each listener isolated: a throwing listener must not skip the re-arm above or the
+    // listeners after it.
+    if (replaced) {
+      for (const cb of this.cancelReplacedListeners) {
+        try { cb(this.cancel.signal); } catch { /* a listener failure is the listener's own */ }
+      }
+    }
+  }
+
+  /** Abort the shared cancel controller with `reason`. While a switch is pending and the controller is
+   *  already spent by a CredentialSwitchSignal (this switch's, or an earlier settled one's), the first
+   *  non-switch reason is kept, and an applied settle aborts the fresh controller with it
+   *  (settleCredentialSwitch). Any settle clears it. */
+  private abortCancel(reason?: unknown): void {
+    const s = this.cancel.signal;
+    if (!s.aborted) {
+      this.cancel.abort(reason);
+      return;
+    }
+    // Any switch signal counts, settled or not: a second switch that trips on a controller still spent
+    // by an earlier (settled) op's signal is pending, and its applied settle replaces the controller.
+    // The trip's own signal is not a stop to replay.
+    if (this.pendingSwitch !== undefined && s.reason instanceof CredentialSwitchSignal &&
+        !(reason instanceof CredentialSwitchSignal) && this.deferredCancelAbort === undefined) this.deferredCancelAbort = { reason };
+  }
+
   /** A hold changes behaviour only while no switch is pending: with one pending, every path runs as
    *  it does without a hold. */
   private holdActive(): boolean {
-    return this.switchHoldDepth > 0 && this.pendingSwitchGeneration === undefined;
+    return this.switchHoldDepth > 0 && this.pendingSwitch === undefined;
   }
 
   /** Whether a switch hold (holdCredentialSwitch) is open on this channel. Production never calls it: the
@@ -1929,8 +2103,10 @@ export class SteeringChannel {
         this.switchHoldDepth--;
         if (this.switchHoldDepth > 0) return;
         const generation = this.latchedSwitchGeneration;
+        const opId = this.latchedSwitchOpId;
         this.latchedSwitchGeneration = undefined;
-        if (service && generation !== undefined) this.maybeTripCredentialSwitch(generation);
+        this.latchedSwitchOpId = undefined;
+        if (service && generation !== undefined) this.maybeTripCredentialSwitch(generation, opId);
       },
     };
   }
@@ -1941,8 +2117,8 @@ export class SteeringChannel {
    *  and the defer window — so the two transports compose (a switch trips at most once, whichever the
    *  ack or a poll observes first) and a failing /inputs poll can no longer disable the advertised
    *  secondary transport. */
-  tripCredentialSwitch(generation: number): void {
-    this.maybeTripCredentialSwitch(generation);
+  tripCredentialSwitch(generation: number, opId?: string): void {
+    this.maybeTripCredentialSwitch(generation, opId);
   }
 
   /** PRD #1247 M5b (MAJOR-6): open a defer window — a matching credential_switch signal is held
@@ -2060,7 +2236,7 @@ export class SteeringChannel {
     // Issue #1604: a switch that tripped with no waiter parked (a switch deferred across a revision
     // turn trips as soon as the window closes, before this gate wait is armed) releases the claim
     // here, so the idempotency guard can never swallow it.
-    if (this.pendingSwitchGeneration !== undefined) return Promise.reject(new CredentialSwitchSignal());
+    if (this.pendingSwitch !== undefined) return Promise.reject(new CredentialSwitchSignal());
     return new Promise<PlanVerdict>((resolve, reject) => {
       const done = (): void => {
         signal?.removeEventListener("abort", onAbort);
@@ -2105,7 +2281,7 @@ export class SteeringChannel {
     // Issue #1673: the poll loop has stopped for good, so a new park would never be serviced.
     if (this.flightEnded) return Promise.reject(this.flightEnded);
     // Issue #1604: see awaitGateEvent — a switch that tripped with no waiter parked.
-    if (this.pendingSwitchGeneration !== undefined) return Promise.reject(new CredentialSwitchSignal());
+    if (this.pendingSwitch !== undefined) return Promise.reject(new CredentialSwitchSignal());
     return new Promise<AnswerVerdict>((resolve, reject) => {
       this.answerWaiter = { questionId, resolve, reject };
     });
@@ -2367,7 +2543,7 @@ export class SteeringChannel {
     // Issue #1673: the poll loop has stopped for good, so a new park would never be serviced.
     if (this.flightEnded) return Promise.reject(this.flightEnded);
     // Issue #1604: see awaitGateEvent — a switch that tripped with no waiter parked.
-    if (this.pendingSwitchGeneration !== undefined) return Promise.reject(new CredentialSwitchSignal());
+    if (this.pendingSwitch !== undefined) return Promise.reject(new CredentialSwitchSignal());
     return new Promise<FollowUpOutcome>((resolve, reject) => {
       this.followUpWaiter = { resolve, reject, idleMs, parkedAt: this.now() };
     });
@@ -2604,7 +2780,7 @@ export class SteeringChannel {
    * ONLY when the generation matches THIS claim's (`this.claimGeneration`): a signal carrying a
    * DIFFERENT generation targets a superseded claim (the run was already reclaimed under a newer
    * generation) and MUST be ignored — acting on it would release a claim that is not this flight's.
-   * IDEMPOTENT: fires exactly once per pending switch (the `pendingSwitchGeneration` guard), so the
+   * IDEMPOTENT: fires exactly once per pending switch (the `pendingSwitch` guard), so the
    * continuous idle poll does not re-abort every tick.
    *
    * On a match it does three things, covering every shape a held-state run can be in when the
@@ -2617,24 +2793,35 @@ export class SteeringChannel {
    *      case — a run at the plan gate / a question / a follow-up park has NO live SDK turn to
    *      abort, so the awaited promise itself must reject to release the flight).
    */
-  private maybeTripCredentialSwitch(generation: number): void {
+  private maybeTripCredentialSwitch(generation: number, opId?: string): void {
     // Issue #3974: an owner cancel was committed under a withheld switch; never enter the switch.
     if (this.withheldSwitchCancelCommitted) return;
     if (generation !== this.claimGeneration) return; // a stale signal for a superseded claim
+    // Issue #4201: a signal for an op that already settled (it raced the apply commit) is spent.
+    if (opId !== undefined && this.settledOps.has(opId)) return;
+    // Issue #4201: any new signal for this generation (deferred or not) ends the window in which a switch_pending
+    // refusal can still be a settled op's stale stamp; from here a refusal belongs to the new switch.
+    this.inPlaceSettledGeneration = undefined;
     // A switch hold (holdCredentialSwitch): latch the generation and return BEFORE anything is
     // aborted, so the flight looks exactly like one that has not yet polled the stamp. The hold's
     // service-close replays this call at depth 0.
     if (this.holdActive()) {
       this.latchedSwitchGeneration = generation;
+      this.latchedSwitchOpId = opId;
       return;
     }
-    this.shutdownStop.abort();
+    this.revokeStop("switch", new CredentialSwitchSignal());
     // PRD #1247 M5b (MAJOR-6): inside a defer window (a plan-revision planning turn), DEFER — do NOT
-    // set pendingSwitchGeneration and do NOT abort. The signal rides every poll, so it trips at the
+    // set pendingSwitch and do NOT abort. The signal rides every poll, so it trips at the
     // next poll after the window closes (the gate wait), by which point the revised plan is persisted.
     if (this.switchDeferDepth > 0) return;
-    if (this.pendingSwitchGeneration !== undefined) return; // already tripped once — idempotent
-    this.pendingSwitchGeneration = generation;
+    if (this.pendingSwitch !== undefined) {
+      // Already tripped once — idempotent. A NEWER op while one is pending replaces the pending op id
+      // (what a `superseded` apply waits for) without aborting again (#4095).
+      if (opId !== undefined && opId !== this.pendingSwitch.opId) this.pendingSwitch = { generation, opId };
+      return;
+    }
+    this.pendingSwitch = opId === undefined ? { generation } : { generation, opId };
     // A taken approve refused during a hold becomes urgent only now that the switch is pending.
     if (this.parkedReady.some((id) => this.takenApproveIds.has(id)) ||
         this.heldForSwitch.some((id) => this.takenApproveIds.has(id))) this.approveRefusedBySwitch = true;
@@ -2643,7 +2830,7 @@ export class SteeringChannel {
     // pause. The abort reason is a CredentialSwitchSignal so the executor's cancel listener routes
     // it to REASON_CREDENTIAL_SWITCH, not REASON_CANCELLED.
     const signal = new CredentialSwitchSignal();
-    if (!this.cancel.signal.aborted) this.cancel.abort(signal);
+    this.abortCancel(signal);
     // A confirmed give-up can continue on this claim; the runner rearms after marker cleanup.
     this.abortLifecycle(signal, false);
     this.credentialSwitchInterrupt?.();
@@ -2793,7 +2980,7 @@ export class SteeringChannel {
         this.pauseMode = mode;
         if (mode === "now" || mode === "wall") {
           const signal = new PauseNowSignal();
-          if (!this.cancel.signal.aborted) this.cancel.abort(signal);
+          this.abortCancel(signal);
           this.abortLifecycle(signal, false);
           this.pauseNowInterrupt?.();
         }
@@ -2958,7 +3145,8 @@ export class SteeringChannel {
           // PRD #1247 M5b: the credential-switch signal rides EVERY inputs response (incl. an
           // empty one). It is not an input row — it is the server's "a switch is pending for the
           // current claim" fact — and acting on it releases the claim.
-          if (credentialSwitch) this.maybeTripCredentialSwitch(credentialSwitch.generation);
+          if (credentialSwitch) this.maybeTripCredentialSwitch(credentialSwitch.generation, credentialSwitch.op_id);
+          else this.inPlaceSettledGeneration = undefined; // no stamp is pending any more: a refusal cannot be a stale one
           // Issue #3974: a withheld switch hides every input row, cancel included; one probe per poll.
           if (credentialSwitch && this.withheldSwitchCancelEligible(credentialSwitch.generation)) {
             await this.probeWithheldSwitchCancel(credentialSwitch.generation);

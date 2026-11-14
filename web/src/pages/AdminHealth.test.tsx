@@ -17,7 +17,7 @@ import { StrictMode } from "react";
 
 import { AdminHealth } from "./AdminHealth";
 import { likelyCause } from "../components/WorkerUpgradeBadge";
-import { api, type AdminWorker, type HealthDoc } from "../lib/api";
+import { api, ApiError, type AdminWorker, type HealthDoc } from "../lib/api";
 import {
   ownerOnlyDoc,
   ownerOnlyWaitingOwnerId,
@@ -31,10 +31,10 @@ import {
 } from "../mocks/data/health";
 
 // The page reads GET /api/admin/health (via the shared useAdminHealth hook, used by both the
-// page and AdminShell's tab pip) and GET /api/admin/workers. Mock only those two.
+// page and AdminShell's tab pip) and GET /api/admin/workers, plus the hibernate/wake writes.
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
-  return { ...actual, api: { getAdminHealth: vi.fn(), adminListWorkers: vi.fn() } };
+  return { ...actual, api: { getAdminHealth: vi.fn(), adminListWorkers: vi.fn(), adminHibernateWorker: vi.fn(), adminWakeWorker: vi.fn() } };
 });
 const mockApi = vi.mocked(api);
 
@@ -188,7 +188,7 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
 
   it("shows both Codex pricing reasons and operator docs without blocking work", async () => {
     const doc = healthySilentDoc();
-    expect(doc.checks).toHaveLength(23);
+    expect(doc.checks).toHaveLength(24);
     const pricing = doc.checks.find((c) => c.id === "pricing.codex")!;
     pricing.severity = "warn";
     pricing.summary = "2 Codex models lack usable pricing";
@@ -214,8 +214,8 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(container.querySelector('[role="alert"], [role="status"]')).toBeNull();
     expect(screen.queryByRole("heading", { name: /blocking|attention/ })).toBeNull();
     expect(attentionIds(container)).toEqual([]);
-    // Every check's shape carries its word; all 23 read OK, none Warn/Danger.
-    expect(screen.getAllByText("OK").length).toBe(23);
+    // Every check's shape carries its word; all 24 read OK, none Warn/Danger.
+    expect(screen.getAllByText("OK").length).toBe(24);
     expect(screen.queryByText(/^(Warn|Danger|Unknown)$/)).toBeNull();
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
@@ -472,11 +472,11 @@ describe("AdminHealth — copy feedback lifecycle", () => {
 describe("AdminHealth — All checks inventory (M4)", () => {
   it("counts: header and per-group status, na excluded from every denominator", async () => {
     await renderHealth(healthySilentDoc());
-    expect(screen.getByText("23 of 23 passing")).toBeTruthy();
-    // workers (6, fleet.rundisk, fleet.quarantine and fleet.memory_authority included), queue (2), control (4),
+    expect(screen.getByText("24 of 24 passing")).toBeTruthy();
+    // workers (7, fleet.hibernation_wake, fleet.rundisk, fleet.quarantine and fleet.memory_authority included), queue (2), control (4),
     // integrations (3), housekeeping (8, maintenance.active included).
     // Exact per-string tallies: integrations reads "all 3 passing", control "all 4 passing".
-    expect(screen.getAllByText("all 6 passing").length).toBe(1);
+    expect(screen.getAllByText("all 7 passing").length).toBe(1);
     expect(screen.getByText("all 8 passing")).toBeTruthy();
     expect(screen.getAllByText("all 2 passing").length).toBe(1);
     expect(screen.getAllByText("all 3 passing").length).toBe(1);
@@ -486,8 +486,8 @@ describe("AdminHealth — All checks inventory (M4)", () => {
 
   it("incident: attention groups read 'K of N need attention'", async () => {
     await renderHealth(incidentDoc());
-    expect(screen.getByText("19 of 23 passing")).toBeTruthy();
-    expect(screen.getByText("2 of 6 need attention")).toBeTruthy(); // workers: fleet.rundisk, fleet.quarantine and fleet.memory_authority stay ok
+    expect(screen.getByText("20 of 24 passing")).toBeTruthy();
+    expect(screen.getByText("2 of 7 need attention")).toBeTruthy(); // workers: fleet.rundisk, fleet.quarantine and fleet.memory_authority stay ok
     expect(screen.getByText("1 of 2 need attention")).toBeTruthy(); // queue
     expect(screen.getByText("1 of 3 need attention")).toBeTruthy(); // integrations
     expect(screen.getByText("all 4 passing")).toBeTruthy(); // control
@@ -555,27 +555,27 @@ describe("AdminHealth — All checks inventory (M4)", () => {
   it("na (no hosted workers): N/A chips with their word, 'not applicable' in the counts, still all clear", async () => {
     await renderHealth(noHostedWorkersDoc());
     expect(screen.getByText("All systems normal.")).toBeTruthy();
-    // fleet.roll, controller.report, db.size and slack.socket are N/A (never green, never gone).
-    expect(screen.getAllByText("N/A").length).toBe(4);
-    expect(screen.getByText("19 of 19 passing, 4 not applicable")).toBeTruthy();
-    expect(screen.getByText("all 5 passing, 1 not applicable")).toBeTruthy(); // workers (fleet.rundisk, fleet.quarantine and fleet.memory_authority apply)
+    // fleet.roll, fleet.hibernation_wake, controller.report, db.size and slack.socket are N/A (never green, never gone).
+    expect(screen.getAllByText("N/A").length).toBe(5);
+    expect(screen.getByText("19 of 19 passing, 5 not applicable")).toBeTruthy();
+    expect(screen.getByText("all 5 passing, 2 not applicable")).toBeTruthy(); // workers (fleet.rundisk, fleet.quarantine and fleet.memory_authority apply)
     expect(screen.getAllByText("all 2 passing, 1 not applicable").length).toBe(1); // integrations
     expect(screen.getAllByText("all 2 passing, 2 not applicable").length).toBe(1); // control
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
 
   it("a group with both attention and N/A checks counts N/A out of the denominator", async () => {
-    // Workers group on the no-hosted fixture: fleet.roll N/A, fleet.capacity (now danger),
+    // Workers group on the no-hosted fixture: fleet.roll and fleet.hibernation_wake N/A, fleet.capacity (now danger),
     // fleet.disk, fleet.rundisk, fleet.quarantine and fleet.memory_authority OK. Applicable = 5, so "1 of 5", never "1 of 6".
     await renderHealth(withSeverity(noHostedWorkersDoc(), { "fleet.capacity": "danger" }));
-    expect(screen.getByText("1 of 5 need attention, 1 not applicable")).toBeTruthy();
+    expect(screen.getByText("1 of 5 need attention, 2 not applicable")).toBeTruthy();
     expect(screen.queryByText(/^1 of 6 need attention/)).toBeNull();
   });
 
   it("a group whose checks are all N/A reads 'not applicable'", async () => {
     await renderHealth(withSeverity(noHostedWorkersDoc(), { "forge.ciwatch": "na", "forge.sync": "na" }));
     expect(screen.getByText("not applicable")).toBeTruthy();
-    expect(screen.getByText("17 of 17 passing, 6 not applicable")).toBeTruthy();
+    expect(screen.getByText("17 of 17 passing, 7 not applicable")).toBeTruthy();
   });
 
   it("no interactive element is nested inside another", async () => {
@@ -672,7 +672,8 @@ it("keeps offline fleet manual attribution beside automatic fences and blocking 
   expect(row.querySelector("time")?.getAttribute("datetime")).toBe("2026-10-21T12:00:00.000Z");
   expect(within(row).getByText("worker: ImagePullBackOff")).toBeTruthy();
   expect(within(row).getByText("roll blocked")).toBeTruthy();
-  expect(row.querySelectorAll("button, input")).toHaveLength(0);
+  // No cordon control; the only control is the hibernate action (PRD #4205).
+  expect(Array.from(row.querySelectorAll("button, input"), (el) => el.getAttribute("aria-label"))).toEqual(["Hibernate manual-fleet"]);
   expect(row.querySelector("b")).toBeNull();
 });
 
@@ -879,5 +880,84 @@ describe("AdminHealth — Fleet card (M5)", () => {
     await waitFor(() => expect(mockApi.adminListWorkers.mock.calls.length).toBeGreaterThan(calls));
     expect(within(fleetCard()).getByTitle("w-kept")).toBeTruthy();
     expect(within(fleetCard()).queryByText("No workers across any user.")).toBeNull();
+  });
+});
+
+describe("AdminHealth — Fleet card hibernation (PRD #4205)", () => {
+  const hib = (over: Partial<AdminWorker>) => fleetWorker({ kind: "hosted", ephemeral: false, busy: false, active_runs: 0, draining_since: null, manual_cordoned_at: null, ...over });
+
+  it("shows a hibernated worker as hibernated, not offline or cordoned, with the wake error as text", async () => {
+    await renderHealth(healthySilentDoc(), [hib({
+      name: "sleepy", status: "offline", effective_cordoned: true, hibernation_state: "hibernated",
+      wake_error: "<b>pod did not start</b>\u202e",
+    })]);
+    const row = await fleetRow("sleepy");
+    expect(within(row).getByText("hibernated")).toBeTruthy();
+    expect(within(row).queryByText("offline")).toBeNull();
+    expect(within(row).queryByText("intake fenced")).toBeNull();
+    expect(within(row).queryByText("cordoned")).toBeNull();
+    expect(within(row).getByText("Wake failed: <b>pod did not start</b>")).toBeTruthy();
+    expect(within(row).getByText("wake failed").getAttribute("title")).toBe("<b>pod did not start</b>");
+    expect(row.querySelector("b")).toBeNull();
+  });
+
+  it.each([
+    ["preparing", "hibernating"],
+    ["hibernated", "hibernated"],
+    ["waking", "waking"],
+  ] as const)("labels the %s state as %s and offers Wake only", async (state, label) => {
+    await renderHealth(healthySilentDoc(), [hib({ name: "w-state", status: "offline", hibernation_state: state })]);
+    const row = await fleetRow("w-state");
+    expect(within(row).getByText(label)).toBeTruthy();
+    expect(within(row).getByRole("button", { name: "Wake w-state" })).toBeTruthy();
+    expect(within(row).queryByRole("button", { name: "Hibernate w-state" })).toBeNull();
+  });
+
+  it("offers no Hibernate for an external or ephemeral worker", async () => {
+    await renderHealth(healthySilentDoc(), [
+      hib({ name: "ext-w", kind: "external" }),
+      hib({ id: "w-eph", name: "eph-w", ephemeral: true }),
+    ]);
+    const ext = await fleetRow("ext-w");
+    const eph = await fleetRow("eph-w");
+    expect(ext.querySelectorAll("button")).toHaveLength(0);
+    expect(eph.querySelectorAll("button")).toHaveLength(0);
+  });
+
+  it("hibernates, disables the button while pending, then refreshes the fleet", async () => {
+    let finish!: (v: { worker_id: string; state: "hibernated"; op_id: string }) => void;
+    mockApi.adminHibernateWorker.mockReturnValue(new Promise((r) => (finish = r)));
+    await renderHealth(healthySilentDoc(), [hib({ id: "w-h", name: "idle-w" })]);
+    const row = await fleetRow("idle-w");
+    fireEvent.click(within(row).getByRole("button", { name: "Hibernate idle-w" }));
+    await waitFor(() => expect((within(row).getByRole("button", { name: "Hibernate idle-w" }) as HTMLButtonElement).disabled).toBe(true));
+    expect(mockApi.adminHibernateWorker).toHaveBeenCalledWith("w-h");
+    const calls = mockApi.adminListWorkers.mock.calls.length;
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [hib({ id: "w-h", name: "idle-w", status: "offline", hibernation_state: "hibernated" })] });
+    await act(async () => finish({ worker_id: "w-h", state: "hibernated", op_id: "op" }));
+    await waitFor(() => expect(mockApi.adminListWorkers.mock.calls.length).toBeGreaterThan(calls));
+    const after = await fleetRow("idle-w");
+    expect(await within(after).findByText("hibernated")).toBeTruthy();
+    expect(within(after).getByRole("button", { name: "Wake idle-w" })).toBeTruthy();
+  });
+
+  it("shows the mapped refusal inline for a 409 and keeps the worker row", async () => {
+    mockApi.adminHibernateWorker.mockRejectedValue(
+      new ApiError(409, "worker cannot be hibernated", { error: "worker cannot be hibernated", reason_code: "busy" }),
+    );
+    await renderHealth(healthySilentDoc(), [hib({ name: "busy-w" })]);
+    const row = await fleetRow("busy-w");
+    fireEvent.click(within(row).getByRole("button", { name: "Hibernate busy-w" }));
+    const alert = await within(row).findByRole("alert");
+    expect(alert.textContent).toBe("The worker is busy with runs. Wait for it to go idle.");
+    expect((within(row).getByRole("button", { name: "Hibernate busy-w" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("wakes a hibernated worker", async () => {
+    mockApi.adminWakeWorker.mockResolvedValue({ worker_id: "w-z", state: "waking", op_id: "op" });
+    await renderHealth(healthySilentDoc(), [hib({ id: "w-z", name: "zzz", status: "offline", hibernation_state: "hibernated" })]);
+    const row = await fleetRow("zzz");
+    fireEvent.click(within(row).getByRole("button", { name: "Wake zzz" }));
+    await waitFor(() => expect(mockApi.adminWakeWorker).toHaveBeenCalledWith("w-z"));
   });
 });

@@ -115,6 +115,26 @@ func (c *HTTPClient) RecoveryHolds(ctx context.Context) (apitypes.RecoveryCustod
 	return out.RecoveryCustodyHoldsDTO, nil
 }
 
+// RecoveryHoldsScoped fetches another user's holds (?user=) or one run's holds (?run=) under
+// admin run debug (issue #4198). Exactly one selector is sent, URL-escaped; both or neither is a
+// usage error before any request.
+func (c *HTTPClient) RecoveryHoldsScoped(ctx context.Context, userID, runID string) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	var path string
+	switch {
+	case userID != "" && runID == "":
+		path = "/api/recovery/holds?user=" + url.QueryEscape(userID)
+	case runID != "" && userID == "":
+		path = "/api/recovery/holds?run=" + url.QueryEscape(runID)
+	default:
+		return apitypes.RecoveryCustodyHoldsDTO{}, Exitf(ExitUsage, "exactly one of a user id and a run id is required")
+	}
+	var out recoveryHoldsWire
+	if err := c.get(ctx, path, &out); err != nil {
+		return apitypes.RecoveryCustodyHoldsDTO{}, err
+	}
+	return out.RecoveryCustodyHoldsDTO, nil
+}
+
 // DiscardRecoveryHold discards ONE exact owner-owned open custody hold (PRD #1349 M5, D7/D9).
 // It ALWAYS sends ?confirm=discard — the server's only mutating form — so the human
 // confirmation (`uzi run discard`'s interactive prompt or --yes) is what precedes this call,

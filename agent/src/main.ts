@@ -18,6 +18,7 @@ import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
+import { CredentialSwitchOpLedger } from "./credential-switch-op-ledger.js";
 import { RunRunner, type ExecutorFactory, type RunExecution, type RunExecutorAddress, type RunnerOptions } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
@@ -76,6 +77,16 @@ export function buildWorkerGitCache(
     authority: authority.hooks,
     authorityRequired: true,
   });
+}
+
+/**
+ * Issue #4201: the ONE write-ahead ledger for the in-place credential switch on `dataDir` (its per-run lock
+ * and entry cache live in the instance, so every runner of this process shares this one). The worker
+ * advertises credential_switch_in_place_v1 unconditionally, so a RunRunner built without this ledger would
+ * advertise the apply route and silently run the v1 release path: startup passes this result to the runner.
+ */
+export function buildCredentialSwitchLedger(dataDir: string): NonNullable<RunnerOptions["credentialSwitchLedger"]> {
+  return new CredentialSwitchOpLedger(dataDir);
 }
 
 /** The publication fixture is inert outside the stub lane and its exclusive sentinel. */
@@ -821,6 +832,8 @@ async function mainBody(): Promise<void> {
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     authority,
     maintenanceExclusion,
+    // Issue #4201: the ONE write-ahead ledger for the in-place credential switch on this data dir.
+    credentialSwitchLedger: buildCredentialSwitchLedger(config.dataDir),
     memoryRuntime: memory,
     // issue #3639: the guard timing the memory-receipt gate derives its sample wait from.
     ...(memoryGuardTiming ? { memoryGuardTiming } : {}),

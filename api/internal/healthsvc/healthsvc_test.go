@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -52,6 +53,8 @@ type fakeStore struct {
 	capacityRows           []store.ListOwnersWaitingNoCapacityRow
 	capacityErr            error
 	capacityQueries        atomic.Int32
+	capacityParams         []store.ListOwnersWaitingNoCapacityParams
+	capacityParamsMu       sync.Mutex
 	waitingQueries         atomic.Int32
 	waitingRows            []store.ListWaitingWorkerRunsRow
 	waitingErr             error
@@ -106,7 +109,10 @@ func (f *fakeStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, 
 	f.workerQueries.Add(1)
 	return f.workers, f.workersErr
 }
-func (f *fakeStore) ListOwnersWaitingNoCapacity(context.Context, store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
+func (f *fakeStore) ListOwnersWaitingNoCapacity(_ context.Context, arg store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {
+	f.capacityParamsMu.Lock()
+	f.capacityParams = append(f.capacityParams, arg)
+	f.capacityParamsMu.Unlock()
 	f.capacityQueries.Add(1)
 	return f.capacityRows, f.capacityErr
 }
@@ -1186,9 +1192,9 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
 	// fleet.quarantine and issue #3142 adds fleet.memory_authority (workers); pricing.codex follows release.check, db.size follows db and
-	// recovery.storage follows custody.holds, making 23 with agentsource.update after release.check and maintenance.active after schedules.paused (PRD #3454).
+	// recovery.storage follows custody.holds, fleet.hibernation_wake (PRD #4205 M6) follows fleet.memory_authority, making 24 with agentsource.update after release.check and maintenance.active after schedules.paused (PRD #3454).
 	wantIDs := []string{
-		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "queue.waiting", "queue.undispatched",
+		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "fleet.hibernation_wake", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
 		"schedules.paused", "maintenance.active", "board.drift", "custody.holds", "recovery.storage", "release.check", "agentsource.update", "pricing.codex",
 	}

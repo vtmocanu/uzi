@@ -697,6 +697,16 @@ for variant in wrong-generation wrong-order two-captures missing-id extra-claim 
   custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' wait_same_claim_capture_resume R 2 0
 done
 
+# Issue #4198: `uzi run recovery <run> --json` may end with one {"unattached":true} element that
+# carries captures whose hold is not listed. It has no generation, so it must neither disturb the
+# exact generation join nor stand in for a missing capture.
+capture_fixture guarded
+uzi_cli() { echo '[{"generation":2,"captures":[{"id":"capture","state":"available"}]},{"run_id":"R","unattached":true,"captures":[{"id":"other","state":"available"}]}]'; }
+custody_case "an unattached element after the hold element is ignored" pass 'exact generation 2 captured' wait_same_claim_capture_resume R 2 0
+uzi_cli() { echo '[{"run_id":"R","unattached":true,"captures":[{"id":"capture","state":"available"}]}]'; }
+custody_case "an unattached-only listing is not the generation's capture" fail 'lacks the exact G+1' wait_same_claim_capture_resume R 2 0
+uzi_cli() { echo '[{"generation":2,"captures":[{"id":"capture","state":"available"}]}]'; }
+
 # #3644 independent restore: the production log sequence, in production order (agent/src/runner.ts
 # "run claimed", agent/src/git.ts "runner clone: seeding" with seeded_from restore_pin, runner.ts
 # "independent restore seeded", then the admission line), and no bundle upload.

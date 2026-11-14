@@ -9,6 +9,11 @@ import { mockAdmin } from "./users";
 
 export const mockWorkers: Worker[] = [
   {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     // Healthy busy retention: unpublished work alone needs no owner decision.
     retaining_unpublished_work: true,
     custody_decisions_needed: 0,
@@ -58,6 +63,11 @@ export const mockWorkers: Worker[] = [
     draining_since: null,
   },
   {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     // Declared jvm at issuance but the running image is base → drift badge demo.
     id: "w-ci",
     name: "ci-runner-1",
@@ -105,6 +115,11 @@ export const mockWorkers: Worker[] = [
     draining_since: null,
   },
   {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     // PRD #113 M5: the FAILED upgrade. Present so the demo can show the failed-worker
     // strip, the likely-cause copy and the copy-kubectl-command button — a state the
     // product ships and the demo could not previously reach, which meant a browser pass
@@ -164,6 +179,11 @@ export const mockWorkers: Worker[] = [
     draining_since: null,
   },
   {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     // Un-quota'd / cgroup-v1 host → process fallback: no known limit (absolute mem,
     // no percentage bar) and the "worker process only" label.
     // Idle after retaining unpublished committed work: the owner must decide
@@ -219,6 +239,11 @@ export const mockWorkers: Worker[] = [
     draining_since: null,
   },
   {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     // A hosted worker (PRD #58): the controller runs this one in the cluster. Seeded
     // ONLINE with a live sample so the hosted + docker badges are seen on a realistic
     // row rather than on a permanently-pending one — and so the demo starts at 1 of
@@ -271,6 +296,11 @@ export const mockWorkers: Worker[] = [
     draining_since: null,
   },
   {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     // The #365 scenario (PRD #496): online, one free slot (1/2), cordoned for a roll
     // (so also `outdated`), so it claims nothing new. It shows the `draining` label
     // beside the amber outdated badge — demonstrating the pill is visually distinct
@@ -319,6 +349,11 @@ export const mockWorkers: Worker[] = [
     draining_since: minsAgo(6),
   },
   {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     // An idle cordoned worker (no runs in flight) → shows the `cordoned` label.
     id: "w-cordon-idle",
     name: "base.s-4d7a",
@@ -362,6 +397,11 @@ export const mockWorkers: Worker[] = [
     draining_since: minsAgo(20),
   },
   {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     // PRD #2006 M2: a LEASED ephemeral worker. Its run finished 48 minutes ago, and the
     // api keeps it online and idle for the rest of its 2h lease so a same-branch
     // follow-up run can reuse it warm. Shows the `ephemeral` badge plus
@@ -424,6 +464,11 @@ export const mockAdminWorkers: AdminWorker[] = [
   // Include the owner-decision case in the admin demo as well.
   { ...mockWorkers[3], owner_email: mockAdmin.email, disk_pressure_volumes: [], cleanup_pending: false },
   {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     // A cap-2 worker running both slots → "2/2 runs" badge demo (PRD #42), and a
     // near-limit cgroup sample → danger-tone CPU + memory bars (≥95%).
     id: "w-mira",
@@ -469,4 +514,53 @@ export const mockAdminWorkers: AdminWorker[] = [
     disk_pressure_volumes: [],
     cleanup_pending: false,
   },
+  // Worker hibernation (PRD #4205): a persistent hosted worker scaled down on purpose. It
+  // reads offline by heartbeat but is neither broken nor cordoned, and the failed last wake
+  // shows the wake-error indicator.
+  {
+    // Idle and online: the Hibernate button is offered, and succeeds once the switch is on.
+    ...hostedPersistentBase(),
+    id: "w-hib-idle",
+    name: "base.m-2f90",
+    owner_email: "mira@uzi.local",
+    disk_pressure_volumes: [],
+    cleanup_pending: false,
+  },
+  {
+    ...hostedPersistentBase(),
+    id: "w-hib-asleep",
+    name: "base.m-5c3d",
+    status: "offline",
+    last_heartbeat_at: minsAgo(95),
+    online_since: null,
+    effective_cordoned: true,
+    hibernation_state: "hibernated",
+    hibernation_reason: "idle overnight",
+    hibernated_at: minsAgo(94),
+    wake_error: "pod did not become ready: image pull backoff",
+    owner_email: "mira@uzi.local",
+    disk_pressure_volumes: [],
+    cleanup_pending: false,
+  },
+  {
+    ...hostedPersistentBase(),
+    id: "w-hib-waking",
+    name: "base.m-8e41",
+    status: "offline",
+    last_heartbeat_at: minsAgo(3),
+    online_since: null,
+    effective_cordoned: true,
+    hibernation_state: "waking",
+    hibernation_reason: "idle overnight",
+    hibernated_at: minsAgo(180),
+    wake_requested_at: minsAgo(1),
+    owner_email: mockAdmin.email,
+    disk_pressure_volumes: [],
+    cleanup_pending: false,
+  },
 ];
+
+function hostedPersistentBase(): Worker {
+  const base = mockWorkers.find((w) => w.id === "w-hosted-eu")!;
+  return { ...base, busy: false, active_runs: 0, stats_cpu_pct: null, stats_mem_bytes: null, stats_mem_limit_bytes: null, stats_source: null };
+}

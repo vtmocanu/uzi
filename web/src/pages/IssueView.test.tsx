@@ -485,6 +485,11 @@ describe("IssueView autopilot badge (PRD #102 review M-1)", () => {
 // A worker and an Anthropic token, the facts a runnable Start needs (shared by the
 // Start gate suite and the #1727 navigation suite).
 const aWorker = (): Worker => ({
+  hibernation_state: "none",
+  hibernation_reason: null,
+  hibernated_at: null,
+  wake_requested_at: null,
+  wake_error: null,
   id: "w1",
   name: "laptop",
   status: "online",
@@ -1415,6 +1420,11 @@ describe("IssueView — a first-visit outcome cannot land on a return visit (#17
 
 describe("IssueView — the picked credential resets on issue navigation (PRD #1247)", () => {
   const aWorker = (): Worker => ({
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     id: "w1",
     name: "laptop",
     status: "online",

@@ -21,6 +21,7 @@ func TestAgentSourceRequestClaimClauseSitesPinned(t *testing.T) {
 	guards := map[string]int{}
 	for _, block := range strings.Split(string(raw), "\n-- name: ")[1:] {
 		name := strings.Fields(block)[0]
+		block = expandPlacementFunction(t, block)
 		if n := len(clause.FindAllString(block, -1)); n > 0 {
 			clauses[name] = n
 		}

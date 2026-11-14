@@ -47,15 +47,20 @@ type InputReceiptResult struct {
 // receiptInactiveReason reports why this worker's claim generation cannot consume inputs,
 // or "" when it can. A terminal run keeps its worker_id and generation, and a requeued run
 // keeps worker_id for affinity, so status is part of the fence: an ACK in flight across a
-// completion or a requeue must not mark a late cancel or verdict delivered.
-func receiptInactiveReason(run store.LockRunForInputReceiptRow, wkr store.Worker, generation int64) string {
+// completion or a requeue must not mark a late cancel or verdict delivered. A pending credential
+// switch makes the claim inactive (ReceiptSwitchPending), except for the ACK of an in-place worker
+// (inPlaceSwitchDrains): it keeps its claim and drains /inputs normally, so the ACK of what it drained
+// must land. APPLIED and DISCARD stay refused under the stamp: an APPLIED row leaves the replay list, so
+// it must wait until the switch has settled in place, or an answer buffered in memory would be lost
+// when the switch ends in a hold, a pause or a crash instead.
+func receiptInactiveReason(run store.LockRunForInputReceiptRow, wkr store.Worker, generation int64, mode receiptMode) string {
 	switch {
 	case !run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID || run.ClaimGeneration != generation,
 		terminalStatuses[run.Status], run.Status == "queued", run.Kind == "cross_check" && run.ClaimGeneration == 0:
 		return ReceiptStale
 	case run.ClaimReleasedAt.Valid:
 		return ReceiptReleased
-	case run.CredentialSwitchRequestedAt.Valid && run.CredentialSwitchGeneration.Valid && run.CredentialSwitchGeneration.Int64 == generation:
+	case run.CredentialSwitchRequestedAt.Valid && run.CredentialSwitchGeneration.Valid && run.CredentialSwitchGeneration.Int64 == generation && (mode != receiptAck || !inPlaceSwitchDrains(wkr)):
 		return ReceiptSwitchPending
 	}
 	return ""
@@ -122,7 +127,7 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	if laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
 		return InputReceiptResult{}, ErrRunNotOwned
 	}
-	reason := receiptInactiveReason(run, wkr, generation)
+	reason := receiptInactiveReason(run, wkr, generation, mode)
 	active := reason == ""
 	conflict := &InputReceiptConflictError{Reason: reason}
 	rows, err := q.ListInputReceiptRows(ctx, store.ListInputReceiptRowsParams{RunID: runID, Ids: ids})

@@ -147,7 +147,7 @@ else
 fi
 
 # Issue #2665: a ready server exposes the public Docker/Go seams without waiting
-# for real LiveDB tests. Each scenario is bounded to seven package calls plus the
+# for real LiveDB tests. Each scenario is bounded to eight package calls plus the
 # optional handler call; a failed scenario is recorded without blocking siblings.
 READYBIN="$TMP/ready-bin"
 mkdir -p "$READYBIN"
@@ -262,7 +262,7 @@ assert_case() {
 }
 
 # Explicit expected order, independent of the runner's PKGS array.
-expected_pkgs=(store handler forgesvc schedsvc workersvc recovery poller)
+expected_pkgs=(store handler forgesvc schedsvc workersvc recovery poller hostedsvc)
 for scenario in success optional retained-missing-run retained-missing-closure-run retained-missing-pass retained-top-skip retained-sub-skip retained-go-fail go-fail no-tests missing-ok top-skip sub-skip; do
   case_dir="$TMP/$scenario"
   mkdir -p "$case_dir"
@@ -306,8 +306,8 @@ for scenario in success optional retained-missing-run retained-missing-closure-r
   case "$scenario" in
     success|optional)
       assert_case "successful sweep exits zero" test "$rc" -eq 0
-      assert_case "aggregate log contains all seven passes" \
-        grep -qF 'LiveDB: 7 passed, 0 skipped' "$case_dir/output"
+      assert_case "aggregate log contains all eight passes" \
+        grep -qF 'LiveDB: 8 passed, 0 skipped' "$case_dir/output"
       assert_case "success banner appears" grep -qF 'Store integration tests passed.' "$case_dir/output"
       assert_case "successful log files removed" \
         test -z "$(find "$case_dir" -name '*-log.*' -print)"
@@ -338,7 +338,7 @@ for scenario in success optional retained-missing-run retained-missing-closure-r
           ;;
         top-skip|sub-skip)
           assert_case "aggregate guard retains and rejects an early skip at any depth" \
-            grep -qF 'LiveDB: 7 passed, 1 skipped' "$case_dir/output"
+            grep -qF 'LiveDB: 8 passed, 1 skipped' "$case_dir/output"
           ;;
       esac
       ;;
@@ -428,14 +428,14 @@ for scenario in checkpoint-success checkpoint-disabled checkpoint-go-fail checkp
     fi
     calls="$(wc -l < "$case_dir/go.log")"
     if [ "$enabled" = 1 ]; then
-      assert_case "normal seven packages plus checkpoint leg" test "$calls" -eq 8
+      assert_case "normal eight packages plus checkpoint leg" test "$calls" -eq 9
       assert_case "checkpoint command bounded, uncached, serialized, race-enabled" \
         grep -Fq "$(printf '\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t15m\t-run\t^TestTaskCheckpointCrossWorkerRecoveryE2E$\t./internal/workersvc/...')" "$case_dir/go.log"
       proof_log="$(awk '/^Task checkpoint recovery proof log: / {print $NF}' "$case_dir/output")"
       assert_case "checkpoint log retained" test -f "$proof_log"
       case "$proof_log" in "$ROOT/.uzi/scratch/"*) rm -f "$proof_log" ;; esac
     else
-      assert_case "non-1 value leaves seven-package sweep unchanged" test "$calls" -eq 7
+      assert_case "non-1 value leaves eight-package sweep unchanged" test "$calls" -eq 8
     fi
   done
 done

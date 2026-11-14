@@ -10,6 +10,8 @@ import { formatAgo } from "../lib/rateLimits";
 import { stripUnsafeChars } from "../lib/safeText";
 import { WorkerDiskLine, WorkerStatGauges, diskDangerPct, hasStats, runHomeSize } from "./WorkerStats";
 import { HELD_WORK_HREF } from "./HeldWorkCard";
+import { isHibernating } from "../lib/workerHibernation";
+import { WorkerStatusBadge } from "./WorkerStatusBadge";
 import { WorkerCordonBadge } from "./WorkerCordonBadge";
 import { EPHEMERAL_WORKER_TITLE, WorkerLeaseNote } from "./WorkerLeaseBadge";
 import { WorkerMemoryAuthorityBadge } from "./WorkerMemoryAuthorityBadge";
@@ -76,6 +78,7 @@ export function CapacityRail({ workers, runs, now }: { workers: Worker[]; runs: 
 function Exclusions({ slots }: { slots: CapacitySlots }) {
   const parts: string[] = [];
   if (slots.excludedOffline > 0) parts.push(`${slots.excludedOffline} offline`);
+  if (slots.excludedHibernated > 0) parts.push(`${slots.excludedHibernated} hibernated`);
   if (slots.excludedUnknownCap > 0) parts.push(`${slots.excludedUnknownCap} with no advertised slot cap`);
   if (parts.length === 0 && slots.overCap === 0) return null;
   return (
@@ -249,9 +252,7 @@ function WorkerRow({ worker: w, runs, now }: { worker: Worker; runs: RunSummaryI
         <summary className="flex cursor-pointer list-none items-center gap-2 rounded-sm py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/60 [&::-webkit-details-marker]:hidden">
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
             <div className="flex flex-wrap items-center gap-2">
-              <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
-                {w.status}
-              </Badge>
+              <WorkerStatusBadge worker={w} />
               <WorkerCordonBadge worker={w} />
               <WorkerRunBadge worker={w} hideIdleCrossChecks />
               <WorkerQuarantineBadge worker={w} nowMs={now} />
@@ -283,7 +284,7 @@ function WorkerRow({ worker: w, runs, now }: { worker: Worker; runs: RunSummaryI
               </div>
             </div>
           )}
-          {offline && hasStats(w) && <p>Last known readings. Not counted in run slots while offline.</p>}
+          {offline && hasStats(w) && <p>Last known readings. Not counted in run slots while {isHibernating(w) ? "hibernated" : "offline"}.</p>}
           <HostedRuns worker={w} runs={runs} />
           {(workerTakesNoNewRuns(w) || note) && (
             <p>{[workerTakesNoNewRuns(w) && "Takes no new runs.", note && `${note}.`].filter(Boolean).join(" ")}</p>

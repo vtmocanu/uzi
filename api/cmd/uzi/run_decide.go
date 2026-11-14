@@ -45,8 +45,10 @@ func newRunDecideCmd(env Env, gf *globalFlags) *cobra.Command {
 			"  --accept <ids> --reason <text>  accept the named criterion ids (comma-separated) as-is; they " +
 			"remain unmet in the PR warning, not passed acceptance. Refused when all milestones are done.\n\n" +
 			"Partial and accept irreversibly change this frozen contract; neither fixes a commit-history hold. " +
-			"For unpublished history without Stop, continue with SHA-specific guidance for the lead to reword " +
-			"its own unpublished commits. For published history or Stop, cancel and manually deliver preserved work.\n\n" +
+			"Without Stop, continue with SHA-specific guidance for the lead to reword its own commits only when " +
+			"no offending commit (including any the feed only counts beyond its listed SHAs) is reachable from the " +
+			"run branch on the forge or a published checkpoint ref. Otherwise, or with Stop, continue cannot clear " +
+			"the hold (finalize restores published commits as ancestors): cancel and manually deliver preserved work.\n\n" +
 			"--guidance is valid only with --continue; --reason is required with --partial/--accept. A " +
 			"partial/accept sends the run's CURRENT contract revision, which the server fences: a stale " +
 			"revision (someone else already decided) is a 409 (exit 5). A run that is NOT completion-blocked " +

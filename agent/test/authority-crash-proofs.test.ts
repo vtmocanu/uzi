@@ -2,14 +2,13 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import fsp from "node:fs/promises";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
 import { acquireWorkerLifetime } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { openAuthorityStore, type SlotSnapshot } from "../src/completion-authority.js";
 import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext } from "../src/git.js";
-import { agentRoot, makeTmp, testLockOptions } from "./authority-test-support.js";
+import { agentRoot, fifoDir, makeTmp, readFifoBounded, testLockOptions, writeFifoBounded } from "./authority-test-support.js";
 import type { Barrier, ChildConfig } from "./fixtures/authority-crash-child.js";
 import { makeFixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed } from "./helpers.js";
@@ -47,6 +46,8 @@ interface Child {
   kill(): Promise<void>;
   /** Every stdout line the worker has printed, in order (the queue `line()` consumes is a subset). */
   seen: string[];
+  /** Subscribe to every later stdout line without consuming the `line()` queue; returns the unsubscribe. */
+  onLine(listener: (line: string) => void): () => void;
 }
 
 function spawnChild(t: TestContext, config: ChildConfig): Child {
@@ -58,6 +59,8 @@ function spawnChild(t: TestContext, config: ChildConfig): Child {
   const queue: string[] = [];
   const waiters: Array<{ resolve(line: string): void; reject(error: Error): void }> = [];
   const seen: string[] = [];
+  const listeners = new Set<(line: string) => void>();
+  proc.stdin!.on("error", () => { /* EPIPE: the worker is gone or its stdin is closed */ });
   let buffer = "";
   proc.stdout!.on("data", (chunk: Buffer) => {
     buffer += chunk.toString("utf8");
@@ -65,6 +68,7 @@ function spawnChild(t: TestContext, config: ChildConfig): Child {
       const next = buffer.slice(0, i);
       buffer = buffer.slice(i + 1);
       seen.push(next);
+      for (const listener of listeners) listener(next);
       const waiter = waiters.shift();
       if (waiter) waiter.resolve(next); else queue.push(next);
     }
@@ -77,6 +81,7 @@ function spawnChild(t: TestContext, config: ChildConfig): Child {
   t.after(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL"); });
   return {
     proc, exited, seen,
+    onLine: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     line: () => queue.length > 0 ? Promise.resolve(queue.shift()!)
       : closed ? Promise.reject(new Error("child exited before reporting"))
       : new Promise<string>((resolve, reject) => waiters.push({ resolve, reject })),
@@ -91,18 +96,27 @@ function spawnChild(t: TestContext, config: ChildConfig): Child {
 interface Rig extends Barrier { dir: string }
 
 function makeBarrier(t: TestContext): Rig {
-  const dir = makeTmp(t, "m4-barrier-");
-  const rig = { dir, armed: path.join(dir, "armed"), go: path.join(dir, "go"), done: path.join(dir, "done"), pid: path.join(dir, "pid") };
-  for (const fifo of [rig.armed, rig.go, rig.done]) execFileSync("mkfifo", [fifo]);
-  return rig;
+  const fifos = fifoDir(t, "m4-barrier-", ["armed", "go", "done"], { pidFile: true });
+  return { dir: fifos.dir, armed: fifos.path("armed"), go: fifos.path("go"), done: fifos.path("done"), pid: fifos.pid! };
+}
+
+/** The wall-clock bound on every wait for a held helper. It only turns a hang into a named failure; nothing waits on it. */
+const BARRIER_BOUND_MS = 60_000;
+
+/** Non-consuming wait for the first stdout line (already seen or later) satisfying `pred`. */
+function watch(worker: Child, pred: (line: string) => boolean): Promise<string> {
+  const earlier = worker.seen.find(pred);
+  if (earlier !== undefined) return Promise.resolve(earlier);
+  return new Promise<string>((resolve) => {
+    const stop = worker.onLine((line) => { if (pred(line)) { stop(); resolve(line); } });
+  });
 }
 
 /** Block until the helper (the real rm / git child, wrapped in the barrier) reports it is waiting; returns its pid. */
-async function armed(rig: Rig, worker: Child): Promise<number> {
-  const said = await Promise.race([
-    fsp.readFile(rig.armed, "utf8"),
+async function armed(rig: Rig, worker: Child, ...raceWith: Promise<never>[]): Promise<number> {
+  const said = await readFifoBounded(rig.armed, BARRIER_BOUND_MS, "the armed barrier",
     worker.exited.then(({ code, signal }) => { throw new Error(`worker exited (${code ?? signal}) before the barrier was armed`); }),
-  ]);
+    ...raceWith);
   assert.equal(said.trim(), "armed");
   const pid = Number(fs.readFileSync(rig.pid, "utf8").trim());
   assert.ok(Number.isInteger(pid) && pid > 1);
@@ -111,8 +125,8 @@ async function armed(rig: Rig, worker: Child): Promise<number> {
 
 /** Release the barrier and wait for the helper to report its exit status. */
 async function release(rig: Rig): Promise<string> {
-  await fsp.writeFile(rig.go, "go\n");
-  return (await fsp.readFile(rig.done, "utf8")).trim();
+  await writeFifoBounded(rig.go, "go\n", BARRIER_BOUND_MS, "the go barrier");
+  return (await readFifoBounded(rig.done, BARRIER_BOUND_MS, "the done barrier")).trim();
 }
 
 function alive(pid: number): boolean {
@@ -137,16 +151,6 @@ async function gone(pid: number, observe: (pid: number) => boolean = alive, budg
     live = observe(pid);
   }
   assert.equal(live, false, "the helper process is gone");
-}
-
-/** Unblock a helper a failed test left parked on its FIFO, by the exact pid the helper wrote. */
-function reapHelper(t: TestContext, rig: Rig): void {
-  t.after(() => {
-    try {
-      const pid = Number(fs.readFileSync(rig.pid, "utf8").trim());
-      if (Number.isInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, "SIGKILL");
-    } catch { /* never armed */ }
-  });
 }
 
 async function slotOf(rt: AuthorityRuntime, target: string): Promise<SlotSnapshot | null> {
@@ -220,7 +224,6 @@ test("proof 1: a detached runner-uid delete outlives its SIGKILLed owner; the su
   const rig = makeBarrier(t);
   const worker = spawnChild(t, { scenario: "delete", dataDir, token: TOKEN, bare, barrier: rig,
     branch: BR_A, key: "issue-5101", runId: RUN_A });
-  reapHelper(t, rig);
   assert.equal(await worker.line(), "W", "the child holds the worker lifetime lock");
   const helperPid = await armed(rig, worker);
   assert.ok(alive(helperPid), "the real detached rm helper exists and waits at the barrier before walking");
@@ -336,7 +339,6 @@ test("proof 2: a delayed expected-SHA update-ref -d outlives its SIGKILLed owner
   const rig = makeBarrier(t);
   const worker = spawnChild(t, { scenario: "cleanup", dataDir: g.dataDir, token: TOKEN, bare: g.bare, barrier: rig,
     pauseAtDelete: 1, ...g.config });
-  reapHelper(t, rig);
   assert.equal(await worker.line(), "W");
   const helperPid = await armed(rig, worker);
   assert.equal(refSha(g.bare, g.coverageRef), g.coverage.sha, "the real update-ref -d child has not acted yet");
@@ -421,8 +423,6 @@ test("proof 3: while P1 holds W, P2 (same dir, symlinked parent, trailing slash)
   const { dataDir, bare, a } = await twoClones(t);
   const rig1 = makeBarrier(t);
   const rig2 = makeBarrier(t);
-  reapHelper(t, rig1);
-  reapHelper(t, rig2);
   const p1 = spawnChild(t, { scenario: "delete", dataDir, token: TOKEN, bare, barrier: rig1, branch: BR_A, key: "issue-5101", runId: RUN_A });
   assert.equal(await p1.line(), "W", "P1 holds W");
   const helperPid = await armed(rig1, p1);
@@ -486,14 +486,12 @@ async function until(worker: Child, done: (line: string) => boolean): Promise<st
 }
 
 function makeFifo(t: TestContext): string {
-  const fifo = path.join(makeTmp(t, "m4066-fifo-"), "fifo");
-  execFileSync("mkfifo", [fifo]);
-  return fifo;
+  return fifoDir(t, "m4066-fifo-", ["fifo"]).path("fifo");
 }
 
 /** Release a barrier without waiting for the helper's exit status (the git wrapper execs git, so it reports none). */
 async function releaseGo(rig: Rig): Promise<void> {
-  await fsp.writeFile(rig.go, "go\n");
+  await writeFifoBounded(rig.go, "go\n", BARRIER_BOUND_MS, "the go barrier");
 }
 
 /** Try to take A on `dataDir` from a separate process (W is held by the worker, so A is probed at the kernel lock). */
@@ -518,8 +516,6 @@ async function lateWorker(t: TestContext, extra: Partial<ChildConfig>): Promise<
   const { dataDir, bare, a, b } = await twoClones(t);
   const rig1 = makeBarrier(t);
   const rig2 = makeBarrier(t);
-  reapHelper(t, rig1);
-  reapHelper(t, rig2);
   const worker = spawnChild(t, { scenario: "late-queue", dataDir, token: TOKEN, bare, barrier: rig1, barrier2: rig2,
     branch: BR_A, key: "issue-5101", runId: RUN_A, branch2: BR_B, key2: "issue-5102", runId2: RUN_B, ...GATE_LATE, ...extra });
   await until(worker, (line) => line === "READY");
@@ -560,7 +556,7 @@ test("issue #4066 (a1): a settlement queued while the drain is paused after its 
   assert.equal(await release(rig2), "0", "the second held rm exits while the drain is paused");
   await until(worker, (line) => line === "CLOSED:2"); // its late close is queued behind the spliced one
   await sigterm(worker);
-  await fsp.writeFile(holdGo, "go\n"); // the paused drain continues; its spliced entry is applied, the queued one is not
+  await writeFifoBounded(holdGo, "go\n", BARRIER_BOUND_MS, "the holdGo FIFO"); // the paused drain continues; its spliced entry is applied, the queued one is not
   const exit = await worker.exited;
 
   const slotB = await persistedSlot(dataDir, b);
@@ -579,7 +575,7 @@ test("issue #4066 (a2): a late settlement queued behind a raw A holder is applie
   assert.equal(await release(rig1), "0");
   await until(worker, (line) => line === "QUEUED-WARN"); // the idle drain's bounded wait for A expired: the settlement stays queued
   await sigterm(worker);
-  await fsp.writeFile(holdGo, "go\n"); // the raw holder releases
+  await writeFifoBounded(holdGo, "go\n", BARRIER_BOUND_MS, "the holdGo FIFO"); // the raw holder releases
   const exit = await worker.exited;
 
   const slot = await persistedSlot(dataDir, a);
@@ -605,7 +601,6 @@ test("issue #4066 (a3): a settlement whose apply failed once and was re-queued i
 test("issue #4066 (c): a late close that fires inside an open transaction keeps A held until its settlement write finishes", { timeout: 120_000 }, async (t) => {
   const { dataDir, bare, a } = await twoClones(t);
   const rig = makeBarrier(t);
-  reapHelper(t, rig);
   const writeGo = makeFifo(t);
   const worker = spawnChild(t, { scenario: "late-close-inline", dataDir, token: TOKEN, bare, barrier: rig, writeGo,
     branch: BR_A, key: "issue-5101", runId: RUN_A, rmTimeoutMs: 100, shutdownBudgetMs: 1_000 });
@@ -627,7 +622,7 @@ test("issue #4066 (c): a late close that fires inside an open transaction keeps 
   assert.equal(worker.proc.exitCode, null, "the worker is still alive");
 
   // (iii) releasing the write barrier lets the settlement become durable; the shutdown still exits 1.
-  await fsp.writeFile(writeGo, "go\n");
+  await writeFifoBounded(writeGo, "go\n", BARRIER_BOUND_MS, "the writeGo FIFO");
   const exit = await worker.exited;
   const slot = await persistedSlot(dataDir, a);
   assert.equal(slot?.pending?.status, "settled_failed");
@@ -638,7 +633,6 @@ test("issue #4066 (c): a late close that fires inside an open transaction keeps 
 test("issue #4066 (c) SIGKILL variant: killed while the inline settlement write is paused before rename, the successor still refuses the footprint", { timeout: 120_000 }, async (t) => {
   const { dataDir, bare, a } = await twoClones(t);
   const rig = makeBarrier(t);
-  reapHelper(t, rig);
   const writeGo = makeFifo(t);
   const worker = spawnChild(t, { scenario: "late-close-inline", dataDir, token: TOKEN, bare, barrier: rig, writeGo,
     branch: BR_A, key: "issue-5101", runId: RUN_A, rmTimeoutMs: 100, shutdownBudgetMs: 1_000 });
@@ -650,7 +644,8 @@ test("issue #4066 (c) SIGKILL variant: killed while the inline settlement write 
   await assert.rejects(rt.withTransaction(() => reseedA(git, bare)), /unresolved pending footprint/);
 });
 
-test("issue #4066 (b): a held recovery-pin continuation is joined before the seal, and admission after the seal is refused", { timeout: 120_000 }, async (t) => {
+/** A fresh bare with the archived recovery pin of `runId` generation 1 anchored on origin/main. */
+async function pinnedBare(t: TestContext, runId: string): Promise<{ dataDir: string; bare: string; sourceSha: string }> {
   const fx = makeFixture();
   t.after(() => fx.cleanup());
   const dataDir = fs.realpathSync(fx.dataDir);
@@ -659,14 +654,32 @@ test("issue #4066 (b): a held recovery-pin continuation is joined before the sea
   fs.chmodSync(path.dirname(bare), 0o700);
   fs.chmodSync(bare, 0o700);
   const sourceSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
-  const runId = "40664066-1111-2222-3333-444444444444";
   assert.equal(await plain.anchorRecoveryHead(bare, runId, 1, sourceSha), true);
+  return { dataDir, bare, sourceSha };
+}
+
+/** Like armed(), but a cleanup that settles first fails by name: its update-ref child will then never exist. */
+async function armedPin(rig: Rig, worker: Child): Promise<number> {
+  const settledFirst = watch(worker, (line) => line.startsWith("CLEANUP:")).then((line): never => {
+    throw new assert.AssertionError({ message: `cleanup settled before its update-ref child was armed: ${line}` });
+  });
+  settledFirst.catch(() => undefined); // the cleanup settles at the end of every run; only the race above may observe it
+  return armed(rig, worker, settledFirst);
+}
+
+/** The pin cleanup's deadline passes on the worker's manual clock, once its child is held; the worker reports it. */
+async function passDeadline(worker: Child): Promise<void> {
+  worker.proc.stdin!.write("advance\n");
+  await until(worker, (line) => line === "DEADLINE-PASSED");
+}
+
+async function heldPinContinuationIsJoined(t: TestContext, runId: string, pin: { deadlineMs: number; eligibleStallMs?: number }): Promise<void> {
+  const { dataDir, bare, sourceSha } = await pinnedBare(t, runId);
   const rig = makeBarrier(t);
-  reapHelper(t, rig);
   const worker = spawnChild(t, { scenario: "pin-cleanup", dataDir, token: TOKEN, bare, barrier: rig, shutdownBudgetMs: 10_000,
-    wrapDir: makeTmp(t, "m4066-wrap-"), pin: { runId, generation: 1, sourceSha, deadlineMs: 3_000 } });
-  await armed(rig, worker); // the real `git update-ref --stdin` child exists and is held before Git runs
-  await until(worker, (line) => line === "DEADLINE-PASSED"); // the caller's deadline passed with the child in flight
+    wrapDir: makeTmp(t, "m4066-wrap-"), pin: { runId, generation: 1, sourceSha, ...pin } });
+  await armedPin(rig, worker); // the real `git update-ref --stdin` child exists and is held before Git runs
+  await passDeadline(worker); // the caller's deadline passed with the child in flight
   await sigterm(worker);
   assert.ok(!worker.seen.some((line) => line === "PHASE:sealed" || line === "PHASE:final_drain_started"),
     "nothing sealed or drained while the pin child is held");
@@ -681,6 +694,16 @@ test("issue #4066 (b): a held recovery-pin continuation is joined before the sea
   const slot = await persistedSlot(dataDir, bare);
   assert.notEqual(slot?.pending?.status, "running", "the pin continuation settled its record");
   assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-recovery-pin/${runId}/1`]), sourceSha, "the aborted delete left the recovery pin on its source");
+}
+
+test("issue #4066 (b): a held recovery-pin continuation is joined before the seal, and admission after the seal is refused", { timeout: 120_000 }, async (t) => {
+  await heldPinContinuationIsJoined(t, "40664066-1111-2222-3333-444444444444", { deadlineMs: 20_000 });
+});
+
+test("issue #4066 (b) controlled variant: a cleanup whose pre-spawn phase outlasts the wall-clock budget still reaches its held child", { timeout: 120_000 }, async (t) => {
+  // The first isEligible call (before the child exists) stalls the worker 2.5 s of real time, past the 2 s budget the
+  // cleanup would have had on the real clock. The manual clock keeps the deadline in front of it.
+  await heldPinContinuationIsJoined(t, "40664066-1111-2222-3333-555555555555", { deadlineMs: 2_000, eligibleStallMs: 2_500 });
 });
 
 test("issue #4066 (b): a held unsettled runner-uid delete is joined before the seal; its late close is applied by the final drain", { timeout: 120_000 }, async (t) => {
@@ -771,7 +794,7 @@ test("issue #4066 deadline, holder released late (B): the join completes, the qu
   await until(worker, (line) => line === "QUEUED-WARN");
   await sigterm(worker);
   await firstDecision(worker);
-  await fsp.writeFile(holdGo, "go\n"); // the holder releases after the deadline
+  await writeFifoBounded(holdGo, "go\n", BARRIER_BOUND_MS, "the holdGo FIFO"); // the holder releases after the deadline
   const exit = await worker.exited;
 
   assert.equal(exit.code, 1);
@@ -784,23 +807,14 @@ test("issue #4066 deadline, holder released late (B): the join completes, the qu
 });
 
 test("issue #4066 deadline, pin continuation pending: the result is logged while it is pending, nothing is sealed, and after the join the late settle stays queued (exit 1)", { timeout: 120_000 }, async (t) => {
-  const fx = makeFixture();
-  t.after(() => fx.cleanup());
-  const dataDir = fs.realpathSync(fx.dataDir);
-  const plain = new GitCache(dataDir, nullLogger(), undefined);
-  const bare = await plain.ensureClone(fx.originPath);
-  fs.chmodSync(path.dirname(bare), 0o700);
-  fs.chmodSync(bare, 0o700);
-  const sourceSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
   const runId = "40664066-5555-6666-7777-888888888888";
-  assert.equal(await plain.anchorRecoveryHead(bare, runId, 1, sourceSha), true);
+  const { dataDir, bare, sourceSha } = await pinnedBare(t, runId);
   const rig = makeBarrier(t);
-  reapHelper(t, rig);
   const worker = spawnChild(t, { scenario: "pin-cleanup", dataDir, token: TOKEN, bare, barrier: rig, shutdownBudgetMs: 500,
-    wrapDir: makeTmp(t, "m4066-wrap-"), pin: { runId, generation: 1, sourceSha, deadlineMs: 3_000 } });
+    wrapDir: makeTmp(t, "m4066-wrap-"), pin: { runId, generation: 1, sourceSha, deadlineMs: 20_000 } });
   t.after(() => t.diagnostic(`worker output:\n${worker.seen.join("\n")}`));
-  await armed(rig, worker);
-  await until(worker, (line) => line === "DEADLINE-PASSED");
+  await armedPin(rig, worker);
+  await passDeadline(worker);
   await sigterm(worker);
   const decision = await firstDecision(worker);
   assert.equal(decision.fields.result, "incomplete");
@@ -818,23 +832,14 @@ test("issue #4066 deadline, pin continuation pending: the result is logged while
 });
 
 test("issue #4066 unjoined git child: a pin-cleanup child killed by a signal never settles; incomplete with open_settlement, exit 1, the successor still refuses", { timeout: 120_000 }, async (t) => {
-  const fx = makeFixture();
-  t.after(() => fx.cleanup());
-  const dataDir = fs.realpathSync(fx.dataDir);
-  const plain = new GitCache(dataDir, nullLogger(), undefined);
-  const bare = await plain.ensureClone(fx.originPath);
-  fs.chmodSync(path.dirname(bare), 0o700);
-  fs.chmodSync(bare, 0o700);
-  const sourceSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
   const runId = "40664066-9999-aaaa-bbbb-cccccccccccc";
-  assert.equal(await plain.anchorRecoveryHead(bare, runId, 1, sourceSha), true);
+  const { dataDir, bare, sourceSha } = await pinnedBare(t, runId);
   const rig = makeBarrier(t);
-  reapHelper(t, rig);
   const worker = spawnChild(t, { scenario: "pin-cleanup", dataDir, token: TOKEN, bare, barrier: rig, shutdownBudgetMs: 2_000,
-    wrapDir: makeTmp(t, "m4066-wrap-"), pin: { runId, generation: 1, sourceSha, deadlineMs: 3_000 } });
+    wrapDir: makeTmp(t, "m4066-wrap-"), pin: { runId, generation: 1, sourceSha, deadlineMs: 20_000 } });
   t.after(() => t.diagnostic(`worker output:\n${worker.seen.join("\n")}`));
-  const childPid = await armed(rig, worker); // the real `git update-ref --stdin` child, held before Git runs
-  await until(worker, (line) => line === "DEADLINE-PASSED");
+  const childPid = await armedPin(rig, worker); // the real `git update-ref --stdin` child, held before Git runs
+  await passDeadline(worker);
   await sigterm(worker);
   process.kill(childPid, "SIGKILL"); // killed by a signal: no real exit status, so the continuation cannot settle
   const exit = await worker.exited;

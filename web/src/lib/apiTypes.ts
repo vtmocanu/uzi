@@ -1378,6 +1378,10 @@ export interface AppSettings {
   // users can still individually opt in on the Workers page. Web-only surfacing — the
   // key already round-trips through GET/PUT /admin/settings.
   ephemeral_workers_enabled: string;
+  // Worker hibernation instance switch (PRD #4205): "true"/"false", default "false".
+  // Turning it off wakes every hibernated worker (at most 10 per pass); waking
+  // never depends on it. Optional so older responses and fixtures still type-check.
+  worker_hibernation_enabled?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
   // Per-owner custody admission limit: whole number 1..1000, default "8". Lowering it blocks future claims only.
@@ -2831,6 +2835,14 @@ export interface Worker {
   manual_cordoned_by_label?: string | null;
   manual_cordon_reason?: string | null;
   effective_cordoned?: boolean;
+  // Worker hibernation (PRD #4205), always sent. Check hibernation_state before
+  // upgrade_status or cordon state: a non-"none" worker reports upgrade_status "unknown" and
+  // is never outdated/rolling.
+  hibernation_state: "none" | "preparing" | "hibernated" | "waking";
+  hibernation_reason: string | null;
+  hibernated_at: string | null;
+  wake_requested_at: string | null;
+  wake_error: string | null;
   // Omitted when absent, invalid or older than the API's independent receipt TTL.
   roll_pacing?: WorkerRollPacing;
   id: string;
@@ -3074,6 +3086,13 @@ export interface Worker {
 
 /** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */
 export type BindMode = "default" | "pinned" | "auto";
+
+/** 200 body of POST /admin/workers/{id}/hibernate and /wake (PRD #4205). */
+export interface HibernationResult {
+  worker_id: string;
+  state: "none" | "preparing" | "hibernated" | "waking";
+  op_id?: string;
+}
 
 export interface AdminWorker extends Worker {
   owner_email: string;
@@ -4402,6 +4421,34 @@ export interface CredentialEpoch {
   label: string | null;
   select_reason: string | null;
   applied_at: string;
+  /** 0 (or absent on an older API) for a claim's base epoch; n >= 1 for the nth in-place
+   *  switch inside that claim generation (issue #4201). Order epochs by
+   *  (claim_generation, ordinal). */
+  ordinal?: number;
+  /** Seq of the run's credential_switch message for an in-place switch; omitted for a base epoch. */
+  message_seq?: number;
+  /** The epoch's own spend; omitted when the run recorded none. */
+  usage?: CredentialEpochUsage;
+}
+
+/** CredentialSwitchMessagePayload is the body of a `credential_switch` run message (PRD #1247
+ *  M9; api/internal/workersvc/secretchoice.go). label is user-authored (null when unlabelled);
+ *  ordinal is n >= 1 for the nth in-place switch in a claim (issue #4201) and absent on a
+ *  claim-time switch. */
+export interface CredentialSwitchMessagePayload {
+  label: string | null;
+  select_reason: string;
+  secret_id: string;
+  ordinal?: number;
+}
+
+/** CredentialEpochUsage is one credential epoch's spend (issue #4201). */
+export interface CredentialEpochUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_usd: number;
 }
 
 // RunActivity is the server-derived "now" line for a run (PRD #1064 D3): who is acting,
@@ -4604,6 +4651,21 @@ export type RunSummaryItem = Omit<
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"
 >;
+
+/** The GET /api/runs/{id}/inputs response (Go RunInputsEnvelopeDTO, issue #4198): the steer
+ *  queue plus, only on an admin run debug read of another user's run, admin_debug_read=true. */
+export interface RunInputsEnvelope {
+  inputs: SteerInput[];
+  admin_debug_read?: boolean;
+}
+
+/** The GET /api/admin/runs?state=all response (Go AdminRunsDebugDTO, issue #4198 admin run
+ *  debug listing): summary rows of every status, newest first. runs is always an array on the
+ *  wire; truncated is true when more matching runs existed than the server's row cap. */
+export interface AdminRunsDebug {
+  runs: RunSummaryItem[];
+  truncated: boolean;
+}
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
 // Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
@@ -5899,6 +5961,8 @@ export interface RecoveryArchiveSummary {
   has_open_hold: boolean;
   counts: RecoveryArchiveStateCounts;
   archives: RecoveryArchive[];
+  /** True only on an admin run debug read of another user's run (issue #4198); omitted otherwise. */
+  admin_debug_read?: boolean;
 }
 
 // ── Owner-facing custody holds (PRD #1349 M1) ─────────────────────────────────
@@ -6007,6 +6071,8 @@ export interface HeldPublications {
 export interface RecoveryCustodyHolds {
   aggregate: RecoveryCustodyAggregate;
   holds: RecoveryCustodyHold[];
+  /** Whose holds these are; present only when the request named ?user= or ?run= (admin run debug). */
+  owner_id?: string;
 }
 
 /** Explicit owner consent; null binds legacy runs with no completion contract. */

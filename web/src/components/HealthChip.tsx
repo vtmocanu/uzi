@@ -1,19 +1,20 @@
 // Compact instance-health chip for the /overview/next header (PRD #3878). Admin-only by
 // construction: it reads the ONE shared HealthStatusProvider, whose doc is null for a
 // non-admin (no fetch) and before the first load, and the chip then renders nothing.
-// It mirrors the severity HealthOverviewCard shows, in one line. While every check passes it
-// is a plain link to the Health tab. While anything needs attention it is a popover trigger
-// (issue #4166): the panel lists EVERY attention check with the same row the Overview card
-// draws, and ends with an Open health link. The open/close model, focus handling and panel
-// follow PeopleChip. If the last attention item clears while the panel is open, the panel
-// closes and focus moves to the link the chip has become.
+// It mirrors HealthOverviewCard's severity in one line and always opens a popover (#4281).
+// Attention rows use the card's shared row (#4166); passing checks appear by area. The
+// footer's Open health link reaches the full Health tab. Live verdict changes keep the
+// popover open and move focus only if the previously focused item disappeared.
 
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { attentionChecks, healthVerdict } from "../lib/healthView";
+import { formatAgo } from "../lib/rateLimits";
 import { useHealthStatus } from "../lib/useAdminHealth";
+import { useNow } from "../lib/useNow";
 import { HealthCheckRow } from "./HealthCheckRow";
+import { HealthPassingChecks } from "./HealthPassingChecks";
 import { SeverityBadge } from "./healthSeverity";
 
 const CHIP_CLASS =
@@ -25,13 +26,40 @@ export function HealthChip() {
   const hostRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const linkRef = useRef<HTMLAnchorElement>(null);
-  // Pending click-away refocus frame, cancelled on unmount and on a live clear.
+  // Pending click-away refocus frame, cancelled on unmount.
   const refocusRaf = useRef(0);
+  const focusedPanelItem = useRef<HTMLElement | null>(null);
   const panelId = useId();
+  // Age the checked time even if the health provider's fetch stalls. This is only a clock;
+  // it neither polls nor changes the health document.
+  const now = useNow(10_000);
 
   const attention = doc ? attentionChecks(doc) : [];
   const passing = doc != null && attention.length === 0;
+
+  // Remember which item held focus. A removed focused node can drop document.activeElement to
+  // <body> before a layout effect can inspect it; a focus move outside the dialog clears this
+  // ref, so a background health refresh never steals the user's new focus.
+  useEffect(() => {
+    if (!open) return;
+    const trackFocus = (event: FocusEvent) => {
+      const target = event.target;
+      focusedPanelItem.current = target instanceof HTMLElement && panelRef.current?.contains(target) ? target : null;
+    };
+    document.addEventListener("focusin", trackFocus);
+    return () => {
+      document.removeEventListener("focusin", trackFocus);
+      focusedPanelItem.current = null;
+    };
+  }, [open]);
+  useLayoutEffect(() => {
+    if (!open) return;
+    const oldFocus = focusedPanelItem.current;
+    const panel = panelRef.current;
+    if (oldFocus && !oldFocus.isConnected && panel && !panel.contains(document.activeElement)) {
+      panel.focus({ preventScroll: true });
+    }
+  }, [doc, passing, open]);
 
   const close = useCallback((returnFocus: boolean) => {
     setOpen(false);
@@ -114,16 +142,6 @@ export function HealthChip() {
     };
   }, [open, close]);
 
-  // Live clear: the panel was open and the last attention item went away. The chip has already
-  // rendered as the link in this commit, so move focus to it. Gated on `open`, so a poll that
-  // clears attention while the panel is closed never moves focus.
-  useEffect(() => {
-    if (!passing || !open) return;
-    setOpen(false);
-    if (refocusRaf.current) cancelAnimationFrame(refocusRaf.current);
-    linkRef.current?.focus({ preventScroll: true });
-  }, [passing, open]);
-
   useEffect(
     () => () => {
       if (refocusRaf.current) cancelAnimationFrame(refocusRaf.current);
@@ -139,15 +157,9 @@ export function HealthChip() {
     : healthVerdict(doc).title;
   // Same severity the card colours by: danger, otherwise warn for any attention item.
   const severity = passing ? "ok" : doc.status === "danger" ? "danger" : "warn";
-
-  if (passing) {
-    return (
-      <Link ref={linkRef} to="/admin/health" aria-label={`System health: ${text}`} className={CHIP_CLASS}>
-        <SeverityBadge severity={severity} />
-        <span className="min-w-0 truncate">{text}</span>
-      </Link>
-    );
-  }
+  const checkedAt = Date.parse(doc.checked_at);
+  const checked = Number.isFinite(checkedAt) ? `checked ${formatAgo(doc.checked_at, now)}` : null;
+  const passingChecks = doc.checks.filter((c) => c.severity === "ok");
 
   return (
     <div ref={hostRef} className="relative inline-block min-w-0 max-w-full">
@@ -178,13 +190,33 @@ export function HealthChip() {
           <div className="space-y-3 p-3">
             <div className="flex min-w-0 flex-wrap items-center gap-2">
               <SeverityBadge severity={severity} />
-              <h3 className="text-sm font-semibold text-fg">System health: {healthVerdict(doc).title}</h3>
+              <h3 className="text-sm font-semibold text-fg">
+                System health: {passing ? `all ${applicable} ${applicable === 1 ? "check" : "checks"} passing` : healthVerdict(doc).title}
+              </h3>
+              {checked && <span className="ml-auto text-xs tabular-nums text-faint">{checked}</span>}
             </div>
-            <ul className="space-y-1.5">
-              {attention.map((c) => (
-                <HealthCheckRow key={c.id} check={c} twoColumnDetails />
-              ))}
-            </ul>
+            {passing ? (
+              <>
+                <HealthPassingChecks checks={passingChecks} />
+                {doc.counts.na > 0 && <p className="text-xs text-faint">{doc.counts.na} not applicable</p>}
+              </>
+            ) : (
+              <>
+                <ul data-health-attention-list className="space-y-1.5">
+                  {attention.map((c) => (
+                    <HealthCheckRow key={c.id} check={c} twoColumnDetails />
+                  ))}
+                </ul>
+                {passingChecks.length > 0 && (
+                  <details className="border-t border-edge pt-2 text-xs text-muted">
+                    <summary className="cursor-pointer rounded-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand">
+                      {passingChecks.length} other {passingChecks.length === 1 ? "check" : "checks"} passing
+                    </summary>
+                    <div className="mt-2"><HealthPassingChecks checks={passingChecks} /></div>
+                  </details>
+                )}
+              </>
+            )}
           </div>
           <div className="sticky bottom-0 flex items-center justify-end border-t border-edge bg-raised px-3 py-2">
             <Link to="/admin/health" className="shrink-0 text-sm text-info hover:underline">

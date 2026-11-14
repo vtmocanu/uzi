@@ -179,6 +179,36 @@ describe("OverviewNext issue work line", () => {
     expect(bays[0].top).toBeGreaterThanOrEqual(Math.max(...rects.map((r) => r.bottom)));
   });
 
+  it("fits completion tags and the longest Building caption at desktop and phone widths", async () => {
+    for (const width of [1280, 400]) {
+      cleanup();
+      await page.viewport(width, 900);
+      mockApi.listRuns.mockResolvedValue({ runs: [
+        aRun({ id: "checking", status: "running", issue_iid: 4198, completion_phase: "checking" }),
+        aRun({ id: "reworking", status: "running", issue_iid: 4201, completion_phase: "reworking" }),
+        aRun({ id: "both", status: "running", issue_iid: 4230, completion_phase: "checking", cross_check_active: "code" }),
+        aRun({ id: "plain", status: "running", issue_iid: 4209 }),
+      ] });
+      render(
+        <MemoryRouter initialEntries={["/overview/next"]}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8"><OverviewNext /></main>
+        </MemoryRouter>,
+      );
+      const card = await screen.findByRole("region", { name: "Issue work" });
+      const building = card.querySelector<HTMLElement>('[data-stage="building"]')!;
+      await expect.poll(() => building.textContent ?? "").toContain("1 building · 2 checking completion · 1 reworking");
+      await document.fonts.ready;
+      const edge = building.getBoundingClientRect().right;
+      for (const label of ["#4198", "#4201", "#4230"]) {
+        const chip = within(building).getByText(label);
+        expect(chip.getBoundingClientRect().right, `${label} at ${width}px`).toBeLessThanOrEqual(edge + 1);
+      }
+      const caption = within(building).getByText("1 building · 2 checking completion · 1 reworking");
+      expect(caption.getBoundingClientRect().right).toBeLessThanOrEqual(edge + 1);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+    }
+  });
+
   for (const width of [400, 320]) {
     it(`stacks the line vertically at ${width}px with no horizontal overflow`, async () => {
       await page.viewport(width, 900);
@@ -1450,9 +1480,9 @@ describe("OverviewNext health chip popover", () => {
     return screen.findByRole("button", { name: /System health/ });
   }
 
-  async function mountInColumn(width: number, sidebarWidth: number) {
+  async function mountInColumn(width: number, sidebarWidth: number, passing = false) {
     await page.viewport(width, 900);
-    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    mockApi.getAdminHealth.mockResolvedValue(passing ? healthySilentDoc() : overviewNextDoc());
     render(
       <MemoryRouter initialEntries={["/overview/next"]}>
         <div style={{ paddingLeft: sidebarWidth }}>
@@ -1475,6 +1505,45 @@ describe("OverviewNext health chip popover", () => {
     const p = panel.getBoundingClientRect();
     return Math.max(Math.abs(p.left - c.left), Math.abs(p.right - c.right));
   };
+
+  it("opens a passing panel across the content column, with four desktop areas", async () => {
+    const passingDoc = healthySilentDoc();
+    const chip = await mountInColumn(1280, 240, true);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    await expect.poll(() => edgeError(panel)).toBeLessThanOrEqual(1);
+    expect(within(panel).getByText(`System health: all ${passingDoc.checks.length - passingDoc.counts.na} checks passing`)).toBeTruthy();
+    const grid = panel.querySelector<HTMLElement>("[data-health-passing-grid]")!;
+    expect(getComputedStyle(grid).gridTemplateColumns.split(" ")).toHaveLength(4);
+    expect(within(panel).getByRole("link", { name: "Open health" }).getAttribute("href")).toBe("/admin/health");
+  });
+
+  it("keeps the passing panel as a one-column bottom sheet at 400px", async () => {
+    const chip = await mountInColumn(400, 0, true);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    const r = panel.getBoundingClientRect();
+    expect(Math.abs(r.left - 16)).toBeLessThanOrEqual(1);
+    expect(Math.abs(window.innerWidth - r.right - 16)).toBeLessThanOrEqual(1);
+    expect(getComputedStyle(panel.querySelector<HTMLElement>("[data-health-passing-grid]")!).gridTemplateColumns.split(" ")).toHaveLength(1);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+  });
+
+  it("opens and closes the passing-check disclosure with Enter and Space", async () => {
+    const attentionDoc = overviewNextDoc();
+    const chip = await mountInColumn(1280, 240);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    const passingCount = attentionDoc.checks.filter((check) => check.severity === "ok").length;
+    const summary = within(panel).getByText(`${passingCount} other checks passing`) as HTMLElement;
+    const details = summary.closest("details")!;
+    expect(details.open).toBe(false);
+    summary.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(details.open).toBe(true);
+    await userEvent.keyboard(" ");
+    expect(details.open).toBe(false);
+  });
 
   it("spans the content column at sm+ with the sidebar expanded or collapsed", async () => {
     for (const [width, sidebar] of [

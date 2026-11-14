@@ -851,10 +851,19 @@
   "credential_epochs": [
     {
       "claim_generation": 1,
+      "ordinal": 1,
       "secret_id": "x",
       "label": "x",
       "select_reason": "x",
-      "applied_at": "2020-01-02T03:04:05Z"
+      "applied_at": "2020-01-02T03:04:05Z",
+      "message_seq": 1,
+      "usage": {
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "cache_read_tokens": 1,
+        "cache_creation_tokens": 1,
+        "cost_usd": 1.5
+      }
     }
   ],
   "outcome_pending": {

@@ -73,6 +73,9 @@ type RecoveryArchiveSummaryDTO struct {
 	HasOpenHold bool                          `json:"has_open_hold"`
 	Counts      RecoveryArchiveStateCountsDTO `json:"counts"`
 	Archives    []RecoveryArchiveDTO          `json:"archives"`
+	// AdminDebugRead is true only on an admin run debug read of another user's run
+	// (issue #4198); omitted otherwise.
+	AdminDebugRead bool `json:"admin_debug_read,omitempty"`
 }
 
 // ── Worker-facing archive RPC (PRD #1296 M3 consumes; frozen here, D8) ────────────────
@@ -432,6 +435,10 @@ type RecoveryCustodyAggregateDTO struct {
 type RecoveryCustodyHoldsDTO struct {
 	Aggregate RecoveryCustodyAggregateDTO `json:"aggregate"`
 	Holds     []RecoveryCustodyHoldDTO    `json:"holds"`
+	// OwnerID names whose holds these are. Set only when the request named a ?user= or ?run=
+	// scope (admin run debug); omitted on the plain own-holds listing so that response is
+	// unchanged.
+	OwnerID string `json:"owner_id,omitempty"`
 }
 
 // RecoveryReconcileRequest names the saved archive identity for one ended generation.

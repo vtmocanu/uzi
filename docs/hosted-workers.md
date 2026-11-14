@@ -123,6 +123,118 @@ when the scheduler reports a verified CPU/memory shortage. Capacity blockage
 requires waiting, a smaller worker, or added capacity; Pending claims alone do
 not establish storage health. See [Worker versions and upgrades](worker-upgrades.md).
 
+## Hibernation
+
+An admin can put an idle persistent hosted worker to sleep. **Hibernating** scales
+the worker's Deployment to 0 replicas and frees its CPU and memory. The worker
+row, its join-token Secret and all its volumes are kept, so waking it brings back
+the same worker with its cache and data. Ephemeral, compose and local workers are
+never hibernated.
+
+Hibernation is off by default. An admin turns it on with
+[`worker_hibernation_enabled`](./admin-settings.md#worker-hibernation).
+
+Admins hibernate and wake a worker with the **Hibernate** and **Wake** buttons in
+**Admin → Health**, in the **Fleet, all users** table (see
+[Admin health](admin-health.md)). Both are web-only (cookie session plus CSRF);
+the CLI's admin tokens are read-only, so there is no CLI verb to hibernate or
+wake. Waking is never gated by the setting.
+
+A worker passes through these states:
+
+| State | Meaning |
+|---|---|
+| `hibernating` | Preparing: the controller is checking the worker is safe to scale down. |
+| `hibernated` | The Deployment is at 0 replicas. |
+| `waking` | A wake was requested; the Deployment is scaling back up. |
+
+Hibernate is refused, with a reason, when the worker:
+
+- has any assigned run that is not terminal;
+- has an open recovery custody hold;
+- is under a manual or controller cordon, or in a maintenance or DinD phase;
+- has no registered pod identity;
+- is named by the wake of a queued run that is still waiting for it (code
+  `pending_wake_demand`; the wake row is kept until the run leaves the queue, so a
+  run is never stranded);
+- or the controller has not advertised hibernation support recently.
+
+The controller can still refuse after the request is accepted (a roll marker or
+reservation, a disk-pressure recycle, DinD maintenance, a busy worker, or a layout
+migration). If nothing was scaled down, a refusal returns the worker to normal.
+Preparation that does not finish within 10 minutes is withdrawn into a wake.
+
+A wake completes only when the new pod registers (or the original pod is still
+alive). A wake not confirmed within 15 minutes records `wake_error` on the worker
+("wake not confirmed within 15m"), shown as a wake error. The worker stays waking, and the error clears once
+the wake settles.
+
+A wake from zero replicas waits until the old pod has fully stopped, meaning every
+container (init and ephemeral included) has terminated. A pod whose containers are
+still running or stopping holds the wake, including a `Failed` (evicted) pod that is
+still being killed and a pod that is still terminating. A `Succeeded` or `Failed` pod
+kept only by a finalizer, with every container terminated, does not hold it. A container
+whose end Kubernetes could not confirm (terminated with reason `ContainerStatusUnknown`,
+which does not prove the process died) or that is still waiting, for example one that
+never left init, counts as not stopped. Such a pod, typically eviction residue, holds
+the wake: after 15 minutes the worker records `wake_error`, and the wake keeps waiting
+until the pod is removed. Another stuck case is a pod on an unreachable node: it keeps its last running
+container statuses, so it holds the wake, and the wake may not recover until the node
+or the pod object is removed.
+
+Force-deleting such a pod removes the API object but does not prove its containers
+stopped. They may still hold the worker's ReadWriteOnce data volume, and the wake would
+then start a new pod beside them. Before force-deleting, confirm the node is really down
+(powered off or fenced from its storage); otherwise recover the node so kubelet can
+finish the shutdown. The wake proceeds on the first controller tick after the pod is
+gone.
+
+A hibernated worker wakes when an admin presses **Wake**, when the setting is turned
+off (every hibernated or still-hibernating worker, ten per sweep), or on demand. On
+demand means a queued run of any kind, chat, judge and cross-check included, that no
+online worker of its owner can claim but that a hibernated or still-hibernating worker of
+the same owner could claim once awake. The sweeper wakes one such worker per run, the one
+asleep longest, and a worker already waking is preferred, so one woken worker serves every
+run it is eligible for and no sibling is woken. A still-hibernating worker with demand is
+withdrawn into a wake. A queued run that only a full (saturated) online worker could take
+waits as before and does not wake anything. Demand wakes work whether
+`worker_hibernation_enabled` and `ephemeral_workers_enabled` are on or off, and run before
+ephemeral provisioning on the same sweep, so sleeping capacity is used first. While the
+wake is not older than 15 minutes (counted from the first wake of that run) no ephemeral
+worker is provisioned for that run; a run the woken worker cannot serve is unaffected, and
+after 15 minutes provisioning proceeds as today.
+
+**Health.** While a run waits for a waking worker, its owner sees the reason "your
+worker is waking from hibernation". The `fleet.capacity` check treats a wake younger
+than 15 minutes as transient. Admins get an instance-scoped **Admin → Health** check,
+`fleet.hibernation_wake`, that warns when a wake failed or is not confirmed within 15
+minutes (it lists up to 10 workers); see [Admin health](admin-health.md).
+
+Status shows in `uzi worker list` and `uzi admin workers`; see
+[CLI](./cli.md#hibernated-workers). The design is in
+[PRD #4205](../prds/4205-worker-hibernation-sleep-wake.md).
+
+### Downgrading
+
+Operators rolling back past this feature, in order:
+
+1. Turn `worker_hibernation_enabled` off.
+2. Wait until no worker is `hibernating`, `hibernated` or `waking`. The sweeper
+   wakes at most 10 workers per pass.
+3. Stop the api. Rolling back 00441 is a no-op and 00440 drops `fn_placement_admitting_workers`, which
+   this api's ephemeral provisioning and demand-wake queries call, so this api
+   cannot keep serving once 00440 is down. Expect a brief outage window.
+4. Roll back migrations 00441, then 00440, then 00439, then 00438. Down of 00438 refuses
+   while any worker is not awake; Down of 00439 drops the wake records, which
+   are transient demand memory, without refusing. The rollbacks
+   briefly take exclusive locks (00438 on the workers table; 00439 on the runs
+   and workers tables), so do them in a quiet window.
+5. Start the older api. An older api cannot claim runs on the new schema, so it
+   only runs once all four migrations are rolled back.
+
+If the controller is rolled back mid-operation, affected workers stay fenced in
+`waking` until a hibernation-capable controller returns.
+
 ## Pod shutdown grace
 
 Worker pods render `terminationGracePeriodSeconds: 40`. On a stop, the worker joins its own already-authorized authority settlements and logs one `worker_shutdown_result` line within 35 s of the first signal; the extra 5 s is margin (the result is described in [Configuration](./configuration.md)). The field is part of the pod spec, so upgrading the controller changes the pod spec hash once and every hosted worker rolls once through the existing paced roll ([ADR-1470](../adr/1470-paced-hosted-worker-rolls.md)). If a worker stops on its own and its shutdown is `incomplete` (exit 1), the container restarts in the live pod, and the roll health view may briefly name that terminated container (exit 1) as the blocking one; a pod being deleted by the roll is normally not shown. An `incomplete` result never certifies anything: any unresolved record keeps its protections (a successor still refuses it), while a write already started may still complete after the diagnostic. Hosted end-to-end acceptance is pending.

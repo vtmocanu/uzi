@@ -60,6 +60,12 @@ type rollEntry struct {
 	claim              *corev1.PersistentVolumeClaim
 	rawReservation     bool
 	migrationHeldDrift bool
+	// hibernation marks a worker whose desired hibernation state is set (PRD #4205).
+	// It stays in rollTick.entries so its snapshot evidence (marker, reservation,
+	// blocked) is readable through rollFrom, but it takes no part in pool grouping,
+	// admission, canary, slots or coverage: a parked worker is neither a roll
+	// participant nor a coverage provider.
+	hibernation bool
 }
 type rollTick struct {
 	entries   map[string]*rollEntry
@@ -117,6 +123,13 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		t.entries[w.ID] = e
 		namespaces[ns] = append(namespaces[ns], e)
 		t.outcomes[w.ID] = &protocol.Pacing{State: "waiting_evidence", TargetImage: workerImage(target), TargetVersion: targetVersion(m.cfg, workerImage(target))}
+		if w.Hibernation != nil {
+			// Excluded from every roll decision below (see rollEntry.hibernation). The
+			// placeholder outcome is "completed", which PacingOutcomes never exports, so
+			// a parked worker carries no pacing signal.
+			e.hibernation = true
+			t.outcomes[w.ID].State = "completed"
+		}
 	}
 	for ns, entries := range namespaces {
 		if err := m.rollSnapshot(ctx, ns, entries); err != nil {
@@ -137,11 +150,14 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		}
 	}
 	for _, e := range t.entries {
-		if e.blocked != "" || e.marker == nil || !e.marker.Completed || e.dep == nil {
+		if e.hibernation || e.blocked != "" || e.marker == nil || !e.marker.Completed || e.dep == nil {
 			continue
 		}
 		pending, drift := false, e.drift
 		for _, peer := range t.entries {
+			if peer.hibernation {
+				continue
+			}
 			c, ok := coverageOf(peer.w, peer.ns)
 			drift = drift || (ok && c.Owner == e.marker.Coverage.Owner && c.Lane == e.marker.Coverage.Lane && peer.drift)
 			if peer.marker != nil && !peer.marker.Completed && coverageKey(peer.marker.Coverage) == coverageKey(e.marker.Coverage) {
@@ -163,6 +179,9 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	}
 	pools := map[string][]*rollEntry{}
 	for _, e := range t.entries {
+		if e.hibernation {
+			continue
+		}
 		m.releasePressureHold(ctx, t, e)
 		if firstProvision(e) {
 			e.admitted = true
@@ -254,7 +273,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		return order[i].ID < order[j].ID
 	})
 	for _, e := range t.entries {
-		if strings.Contains(e.blocked, "unconfirmed") {
+		if !e.hibernation && strings.Contains(e.blocked, "unconfirmed") {
 			t.uncertain[coverageKey(e.coverage)] = true
 			t.errors = append(t.errors, fmt.Errorf("worker %s: %s; re-observe and re-poll required", e.w.ID, e.blocked))
 		}
@@ -763,7 +782,7 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 	// can supply it; an admitted old pod or unresolved replacement cannot.
 	population, usable := 0, false
 	for _, e := range t.entries {
-		if e.coverage.Owner != candidate.coverage.Owner || e.ns != candidate.ns {
+		if e.hibernation || e.coverage.Owner != candidate.coverage.Owner || e.ns != candidate.ns {
 			continue
 		}
 		population++
@@ -785,7 +804,7 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 		return true
 	}
 	for _, e := range t.entries {
-		if e.ns != candidate.ns || !covers(e.w, candidate.coverage) || e.blocked != "" || t.unavailable[e.w.ID] {
+		if e.hibernation || e.ns != candidate.ns || !covers(e.w, candidate.coverage) || e.blocked != "" || t.unavailable[e.w.ID] {
 			continue
 		}
 		if e == candidate || (e.admitted && (e.drift || (!m.currentUsable(t, e) && !m.promoted(t, e)))) {
@@ -809,7 +828,7 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 func (m *Materializer) coverageBlocker(t *rollTick, candidate *rollEntry) (string, string) {
 	peers := []*rollEntry{}
 	for _, peer := range t.entries {
-		if peer != candidate && peer.ns == candidate.ns && peer.coverage.Owner == candidate.coverage.Owner {
+		if peer != candidate && !peer.hibernation && peer.ns == candidate.ns && peer.coverage.Owner == candidate.coverage.Owner {
 			peers = append(peers, peer)
 		}
 	}
@@ -1430,6 +1449,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 			e.o.DeploymentResourceVersion = e.dep.ResourceVersion
 			e.o.SpecHash = e.dep.Spec.Template.Annotations[AnnotationSpecHash]
 			e.o.DeploymentNodeSelector = e.dep.Spec.Template.Spec.NodeSelector
+			applyDeploymentHibernationEvidence(&e.o, e.dep)
 			e.marker, err = decodeRoll(e.dep.Annotations[annotationRoll])
 			if err != nil {
 				e.blocked = err.Error()
@@ -1488,6 +1508,9 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 			failure = replicaFailureReason(e.dep)
 		}
 		e.o.RunnerLayout = observeRunnerLayout(e.w.ID, e.pods)
+		// The snapshot is newer than Observe's lists; the hibernation arm reads pod
+		// absence and readiness from this refreshed view.
+		applyPodEvidence(&e.o, e.pods)
 		health := deriveRollHealth(current, e.target.Spec.Template.Annotations[AnnotationSpecHash], failure, m.now())
 		if e.o.Roll.Phase != protocol.PhaseStuck || e.o.Roll.PodPhase != string(corev1.ClaimPending) {
 			e.o.Roll = health

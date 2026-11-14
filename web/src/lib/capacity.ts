@@ -5,6 +5,7 @@
 
 import type { Worker } from "./api";
 import { stripUnsafeChars } from "./safeText";
+import { hibernationState, isHibernating } from "./workerHibernation";
 
 export interface CapacitySlots {
   inUse: number;
@@ -16,6 +17,8 @@ export interface CapacitySlots {
   /** Runs reported beyond a worker's advertised cap; never part of a segment. */
   overCap: number;
   excludedOffline: number;
+  /** Hibernated or waking workers: scaled down on purpose, so neither capacity nor an outage. */
+  excludedHibernated: number;
   excludedUnknownCap: number;
 }
 
@@ -23,6 +26,7 @@ export interface CapacitySlots {
  *  a hosted worker mid-upgrade. The optional cordon fields read as "not cordoned" when absent. */
 export function workerTakesNoNewRuns(w: Worker): boolean {
   return (
+    isHibernating(w) ||
     w.draining_since != null ||
     w.manual_cordoned_at != null ||
     w.effective_cordoned === true ||
@@ -41,8 +45,13 @@ export function rollNote(w: Worker): string | null {
 }
 
 export function capacitySlots(workers: Worker[]): CapacitySlots {
-  const out: CapacitySlots = { inUse: 0, closed: 0, open: 0, total: 0, overCap: 0, excludedOffline: 0, excludedUnknownCap: 0 };
+  const out: CapacitySlots = { inUse: 0, closed: 0, open: 0, total: 0, overCap: 0, excludedOffline: 0, excludedHibernated: 0, excludedUnknownCap: 0 };
   for (const w of workers) {
+    const hs = hibernationState(w);
+    if (hs === "hibernated" || hs === "waking") {
+      out.excludedHibernated++;
+      continue;
+    }
     if (w.status !== "online") {
       out.excludedOffline++;
       continue;

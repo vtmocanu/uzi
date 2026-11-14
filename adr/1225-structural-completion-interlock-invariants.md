@@ -299,6 +299,12 @@ For an unpublished declared/owner-partial history refusal without Stop,
 owner continue guidance can name the SHAs and ask the lead to reword its own
 unpublished commits. The guard does not rewrite offending messages or
 force-push to repair a refusal.
+Amendment (AI-synced 2026-11-13, #4268): "unpublished" means no offending
+commit, including any the feed only counts beyond its five listed SHAs, is
+reachable from the run branch as published on the forge or from a published
+checkpoint ref. The finalize bridge re-parents published checkpoint floors into
+the push candidate, so a reword of such a commit cannot clear the hold; that
+case takes the cancel and manual delivery route below.
 For published history or Stop, cancel and manually deliver preserved work
 through existing recovery. Stop resumes directly into finalization with no
 lead turn; partial/accept cannot repair history. Plain resume is refused for

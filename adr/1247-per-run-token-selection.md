@@ -139,7 +139,7 @@ proof stays fail-closed:
 
 1. An API without the `credential_switch_hold` protocol feature (rollout skew): the worker
    sends neither hold report.
-2. A hold report that is refused, or unconfirmed after one retry and an ownership read.
+2. A v1 (op-less) hold report that is refused, or unconfirmed after one retry and an ownership read. An in-place (op-carrying) held or uncertain report instead retries transient failures (transport, 5xx, 408, 429) on a capped exponential backoff, with an ownership read from the fifth attempt, until it is confirmed, refused, the claim goes stale or ownership is lost, or a lifecycle stop arrives; any other failure ends it unconfirmed with work and custody kept (ADR-4201 D5).
 3. A retained flight whose ownership read shows `awaiting_*`.
 
 Also, `SetRunCredential` checks the fence before it writes the override and the resume
@@ -150,3 +150,7 @@ the next reclaim.
 ## Linked from ARCHITECTURE.md
 
 Linked from ARCHITECTURE.md's run-lane credential paragraph (the `claimSecretID` description, just above the Run lifecycle section), per repo convention.
+
+## Amendment 2026-11-13 — #4201: Seam 2 no longer holds for in-place workers
+
+Seam 2 ("a switch happens only at a claim boundary") describes the release/reclaim path, which is now the path for workers **without** the capability `credential_switch_in_place_v1`. A worker that negotiated it, against an api serving `credential_switch_apply_v1`, switches a live run's token in place through one fenced, idempotent apply route, with the same worker, claim generation and working directory. The generation fence and the override ladder (Seam 1) are unchanged. The #3181 settling/unsettled hold-state semantics are unchanged, but their admission changed: the hold now also accepts `awaiting_*` runs when an op id is given, it is op-fenced, it writes the hold-identity columns, and it refuses the unfenced form from apply-negotiated workers. See [ADR-4201](4201-in-place-credential-switch.md) for the apply route, the epoch attribution, the recovery narrowing, the residuals and the checklist for removing the v1 path (m3b, not done).

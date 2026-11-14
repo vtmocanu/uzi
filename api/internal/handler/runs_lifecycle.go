@@ -680,7 +680,19 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	if epochs, err := h.wsvc.RunCredentialEpochs(r.Context(), run.ID, run.UserID); err != nil {
 		slog.Error("list run credential epochs", "run_id", run.ID, "error", err)
 	} else {
-		dto.CredentialEpochs = credentialEpochsToDTO(epochs)
+		// Issue #4201: the in-place switch epochs and the per-epoch usage legs. Best-effort like the
+		// journal itself: a failed read degrades to the base epochs without usage.
+		switches, swErr := h.wsvc.RunCredentialSwitchEpochs(r.Context(), run.ID, run.UserID)
+		if swErr != nil {
+			slog.Error("list run credential switch epochs", "run_id", run.ID, "error", swErr)
+			switches = nil
+		}
+		legs, legErr := h.wsvc.RunUsageByCredentialEpoch(r.Context(), run.ID)
+		if legErr != nil {
+			slog.Error("list run usage by credential epoch", "run_id", run.ID, "error", legErr)
+			legs = nil
+		}
+		dto.CredentialEpochs = credentialEpochsToDTO(epochs, switches, legs)
 		// PRD #1247 Step A (D14): credentialSwitchState derives credential_switch purely from
 		// the run row. Since issue #1422 the reclaimed generation's epoch write clears the
 		// switch stamp in the DB, so a switch applied after that landed already reads null.
@@ -1223,10 +1235,12 @@ func runDeepLink(baseURL string, runID uuid.UUID) string {
 
 // ListRunInputs returns a run's follow_up steer queue (newest-first) with delivery
 // status (PRD #95). RequireUser (so a CLI token works — Decision 8) and OWNER-ONLY:
-// the run is resolved via GetRunByIDForUser, so a non-owner — including an admin_ro
-// token on another user's run — gets 404, never an error banner. This closes a real
-// read leak (follow-ups are never mirrored into run_messages). A non-owner viewer's
-// queue card therefore renders empty/silent.
+// the run is resolved via GetRunByIDForUser, so a non-owner gets 404, never an error
+// banner. This closes a real read leak (follow-ups are never mirrored into
+// run_messages). A non-owner viewer's queue card therefore renders empty/silent.
+// The one exception is admin run debug (UZI_ADMIN_RUN_DEBUG): a live admin's admin_ro
+// CLI token may read a foreign non-chat run's queue, audited once; any other caller,
+// a cookie session included, still gets 404.
 func (h *Handler) ListRunInputs(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -1238,11 +1252,29 @@ func (h *Handler) ListRunInputs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := h.wsvc.ListFollowUpInputs(r.Context(), user.ID, id)
-	if err != nil {
-		if errors.Is(err, workersvc.ErrRunNotFound) {
+	debug := false
+	if errors.Is(err, workersvc.ErrRunNotFound) {
+		run, actor, tokenID, ok := h.adminRunDebugForeignRun(w, r, id, "list run inputs")
+		if !ok {
+			return
+		}
+		if run.Kind == "chat" {
 			httpx.Error(w, http.StatusNotFound, "run not found")
 			return
 		}
+		rows, err = h.wsvc.ListFollowUpInputs(r.Context(), run.UserID, id)
+		if err != nil {
+			if errors.Is(err, workersvc.ErrRunNotFound) {
+				httpx.Error(w, http.StatusNotFound, "run not found")
+				return
+			}
+			slog.Error("list run inputs: admin debug", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		debug = true
+		auditRunDebugRead(r, actor, tokenID, adminRunDebugRouteInputs, id, run.UserID)
+	} else if err != nil {
 		slog.Error("list run inputs", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -1251,7 +1283,7 @@ func (h *Handler) ListRunInputs(w http.ResponseWriter, r *http.Request) {
 	for _, i := range rows {
 		out = append(out, steerInputToDTO(i))
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"inputs": out})
+	httpx.JSON(w, http.StatusOK, apitypes.RunInputsEnvelopeDTO{Inputs: out, AdminDebugRead: debug})
 }
 
 // codexPoolUnavailableCode is the typed, nonsecret reason a refused Codex start carries beside the

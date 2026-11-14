@@ -999,9 +999,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// CreateRunInput's auth — no token spend, no forge write.
 				r.Post("/{id}/dispatch", h.DispatchTaskRun)
 				// Steer queue (PRD #95): the run's follow_up inputs with delivery status.
-				// Owner-only (GetRunByIDForUser) — a non-owner, incl. admin_ro, gets 404,
-				// closing a leak (follow-ups are never in run_messages). RequireUser so
-				// `uzi run inputs` reads it from a CLI token.
+				// Owner-only (GetRunByIDForUser) — a non-owner gets 404, closing a leak
+				// (follow-ups are never in run_messages); the one exception is admin run
+				// debug (UZI_ADMIN_RUN_DEBUG: a live admin's admin_ro Bearer, audited).
+				// RequireUser so `uzi run inputs` reads it from a CLI token.
 				r.Get("/{id}/inputs", h.ListRunInputs)
 				// Judge surfacing (PRD #46 M4 / Decision 21): read the review, plus the
 				// active judge run for the target (PRD #119 M1) — owner-or-admin,
@@ -1085,13 +1086,15 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Durable recovery archive — owner side (PRD #1296 M2, D6/D7). RequireUser
 				// (browser cookie OR uzc_/uza_ Bearer) so both the web run page and the CLI
 				// reach it. Each handler resolves ownership through h.wsvc.GetRun (owner-only,
-				// admin refused) exactly like ListRunInputs — NOT GetRunForViewer — then the
-				// recovery service's own owner-scoped queries. Download streams decrypted bytes
+				// admin refused, except the audited admin run debug read on the list route)
+				// exactly like ListRunInputs — NOT GetRunForViewer — then the recovery
+				// service's own owner-scoped queries. Download streams decrypted bytes
 				// with private/no-store/nosniff + a server-generated filename and no redirect.
 				r.Get("/{id}/archives", h.ListRecoveryArchives)
 				// Source log of a profile-bound research run (PRD #1906 M3). Same RequireUser
 				// group and the same strict GetRun owner-or-404 gate as the archives above, so
-				// `uzi run fetches` reaches it from a uzc_ Bearer and an admin is refused.
+				// `uzi run fetches` reaches it from a uzc_ Bearer and an admin is refused
+				// unless the admin run debug predicate holds (admin_ro Bearer, flag on).
 				r.Get("/{id}/fetches", h.ListRunFetches)
 				r.Get("/{id}/archives/{captureID}/download", h.DownloadRecoveryArchive)
 				r.Delete("/{id}/archives/{captureID}", h.DiscardRecoveryArchive)
@@ -1145,8 +1148,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// Owner recovery custody holds — owner-wide list + aggregate (PRD #1349 M5, D7).
 		// RequireUser (session cookie OR uzc_/uza_ Bearer) so the web board/Workers surface
 		// and the `uzi run recovery` CLI both reach it, mirroring how the owner archive routes
-		// gate ownership. Owner-scoped in SQL by the caller's user id — NO run scope (this is
-		// the owner-wide list; the exact-hold DISCARD is the DELETE under /runs above).
+		// gate ownership. Owner-scoped in SQL by the caller's user id; an optional ?user= or
+		// ?run= names another owner or one run, served to other owners only under the admin
+		// run debug predicate (the exact-hold DISCARD is the DELETE under /runs above).
 		r.Group(func(r chi.Router) {
 			r.Use(h.requireUser())
 			r.Get("/recovery/holds", h.ListRecoveryHolds)
@@ -1224,6 +1228,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// NOT lane-allowlisted: an isolated-lane run is not a Claude run-lane flight that posts it.
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
+		// Issue #4201: the in-place Claude credential switch apply. The response carries the
+		// plaintext token, the service resolves and decrypts a credential per call, and the worker
+		// retries on a lost response, so it rides the per-worker limiter.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/credential-switch/apply", h.WorkerCredentialSwitchApply)
 		// Bounded local lifecycle outcome, like /state and memory outcomes: no rate
 		// limiter or upstream I/O. Strict 17 KiB decoding and worker/run fences apply.
 		r.Post("/runs/{id}/policy-hold", h.WorkerRunPolicyHold)
@@ -1530,6 +1538,9 @@ func (h *Handler) mountControllerRoutes(r chi.Router) {
 		// drains before rolling; distinct from the display-only status report.
 		r.Post("/workers/{workerID}/drain", h.ControllerCordonWorker)
 		r.Post("/workers/{workerID}/dind-maintenance", h.ControllerDindMaintenance)
+		// Hibernation control-write (PRD #4205): the controller reports each step of a
+		// hibernate or wake operation, bound to the op id and validated by the state machine.
+		r.Post("/workers/{workerID}/hibernation", h.ControllerHibernation)
 		// Uncordon control-write (issue #458). Clears draining_since when drift was
 		// reverted so the worker resumes claiming; same path, different method.
 		r.Delete("/workers/{workerID}/drain", h.ControllerUncordonWorker)

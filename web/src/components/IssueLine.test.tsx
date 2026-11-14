@@ -136,6 +136,27 @@ describe("IssueLine", () => {
     );
   });
 
+  it("shows completion tags ahead of a code cross-check, including another user's run", () => {
+    const other = theirs(aRun({ id: "other", issue_iid: 4230, status: "running", completion_phase: "checking", cross_check_active: "code" }));
+    mount([
+      aRun({ id: "check", issue_iid: 4198, status: "running", completion_phase: "checking" }),
+      aRun({ id: "rework", issue_iid: 4201, status: "running", completion_phase: "reworking" }),
+      aRun({ id: "plain", issue_iid: 4209, status: "running" }),
+    ], [other], { scope: "all" });
+    const building = station(/^Building/);
+    expect(building.textContent).toContain("1 building · 2 checking completion · 1 reworking");
+    expect(within(building).getByText("#4198").textContent).toBe("#4198 checking completion");
+    expect(within(within(building).getByText("#4198")).getByText("checking completion").className).not.toContain("bg-info");
+    expect(within(building).getByText("#4198").getAttribute("title")).toBe("Checking completion");
+    expect(within(building).getByText("#4201").textContent).toBe("#4201 reworking milestones");
+    expect(within(building).getByText("#4201").getAttribute("title")).toBe("Reworking unmet milestones");
+    const combined = within(building).getByText("#4230");
+    expect(combined.textContent).toBe("#4230 checking completion");
+    expect(combined.getAttribute("title")).toBe("mira@uzi.local · Checking completion; code cross-check also running (advisory)");
+    expect(within(combined).queryByText("cross-checking")).toBeNull();
+    expect(within(building).getByText("#4209").textContent).toBe("#4209");
+  });
+
   it("tags a claimed run under plan check in Queued, the tooltip naming the check", () => {
     mount([aRun({ id: "q", issue_iid: 4044, status: "claimed", cross_check_active: "plan" })]);
     const chip = within(station(/^Queued/)).getByText("#4044");

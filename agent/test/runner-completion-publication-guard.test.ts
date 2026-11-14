@@ -96,8 +96,8 @@ describe("M3 publication-start completion guard", () => {
       assert.equal(api.completionHoldRequests.length, 1);
       assert.equal(api.completionHoldRequests[0]!.body.claim_generation, 7);
       const holdCopy = JSON.stringify(api.messages(claim.run_id));
-      assert.match(holdCopy, /choose continue.*lead to reword/);
-      assert.match(holdCopy, /published history or a Stop, cancel/);
+      assert.match(holdCopy, /Continue with guidance naming the SHAs for the lead to reword/);
+      assert.match(holdCopy, /Otherwise, or with a Stop, cancel and deliver/);
       noPublish(claim.run_id);
       assert.ok(fs.existsSync(worktreeDirFor(IID)));
       const guards = api.states.slice(checkpoint).filter(s => s.runId === claim.run_id && guardOnly(s.body as unknown as Record<string, unknown>));

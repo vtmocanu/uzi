@@ -989,6 +989,68 @@ WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
 ORDER BY r.created_at DESC
 LIMIT 500;
 
+-- name: ListRunsAdminDebug :many
+-- Issue #4198: the admin run debug listing. Runs in EVERY status (terminal included),
+-- newest first (created_at, then id as the tiebreak), across all users or one @user_id,
+-- optionally created at or after @since, excluding chat, judge, and cross-check runs.
+-- The caller asks for one row more than it serves so it can report truncation.
+-- Keep in step with ListActiveRunsAll (select list, joins, cross-check flags) and
+-- ListRunsForUser (has_available_capture).
+SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
+       c.forge_type,
+       i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
+       -- ListRunsForUser), so the admin overview pill and the claim order agree.
+       -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
+       fn_run_priority_class(r.kind, r.priority, r.created_at < @background_grace_cutoff) AS priority_class,
+       -- issue #1418: the capture half of the read-path landing_state; the same expression as ListRunsForUser.
+       (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available'))::boolean AS has_available_capture,
+       -- issue #4082: live plan / code cross-check presence; the same two correlated EXISTS
+       -- as ListRunsForUser (see its comment for the source queries they must stay in step with).
+       (EXISTS (
+           SELECT 1 FROM cross_checks cc
+           JOIN runs lead ON lead.id = cc.lead_run_id
+           WHERE lead.id = r.id AND (lead.plan_cross_check_required OR lead.plan_cross_check_gated)
+             -- mirrors runkind.PlanCrossCheckable, which health.go applies in Go
+             AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework')
+             AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
+             AND cc.lead_claim_generation = lead.claim_generation
+             AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
+             AND cc.deadline_at > now()
+       ))::boolean AS has_live_plan_cross_check,
+       (EXISTS (
+           SELECT 1
+           FROM runs lead
+           JOIN cross_checks cc ON cc.lead_run_id = lead.id
+           JOIN runs child ON child.id = cc.checker_run_id
+           WHERE lead.id = r.id AND lead.status = 'running'
+            AND lead.code_cross_check_required AND NOT lead.report_only
+            AND lead.fix_verdict IS DISTINCT FROM 'not_code'
+            AND lead.claim_released_at IS NULL AND cc.lead_claim_generation = lead.claim_generation
+            AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework','task')
+            AND lead.harness IN ('claude','codex')
+            AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
+            AND cc.deadline_at > now()
+            AND child.target_run_id = lead.id AND child.kind = 'cross_check'
+            AND child.user_id = lead.user_id AND child.worker_id = lead.worker_id
+            AND child.harness IN ('claude','codex') AND child.harness <> lead.harness
+            AND child.harness = cc.checker_harness
+            AND child.status IN ('queued','claimed','running')
+       ))::boolean AS has_live_code_cross_check
+FROM runs r
+-- PRD #1908: LEFT JOINs so a repo-less JOB run (repo_id NULL) is listed with NULL repo_path and
+-- forge_type (see ListRunsForUser).
+LEFT JOIN repos rp ON rp.id = r.repo_id
+LEFT JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
+LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
+LEFT JOIN workers w ON w.id = r.worker_id
+JOIN users u ON u.id = r.user_id
+WHERE r.kind NOT IN ('chat', 'judge', 'cross_check')
+  AND (sqlc.narg(user_id)::uuid IS NULL OR r.user_id = sqlc.narg(user_id)::uuid)
+  AND (sqlc.narg(since)::timestamptz IS NULL OR r.created_at >= sqlc.narg(since)::timestamptz)
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT @max_rows;
+
 -- name: ListAllWorkers :many
 -- Admin Agents-status: every worker with owner email plus the same two derived
 -- signals as ListWorkersByUser (PRD #42 Decision 10): busy is the ANY-kind
@@ -1171,6 +1233,8 @@ WITH checker_template_pins AS MATERIALIZED (
       -- NULL is unrestricted; the deadline includes the account's recovery spread.
       AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
       AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
+        -- Hibernation (PRD #4205) fences every claim, resume-pinned runs included.
+        AND c.hibernation_state = 'none'
         AND (fn_worker_accepts_new_intake(c)
              OR r.worker_id = c.id))
       AND r.kind <> 'chat' AND NOT r.cross_check_lane
@@ -2309,11 +2373,100 @@ ORDER BY e.claim_generation ASC;
 -- 'credential_switch' run message. pgx.ErrNoRows means there is NO prior epoch (a first claim), so
 -- no switch. NOT owner-scoped: the caller is inside the claim transaction with the run row locked,
 -- and this reads the run's OWN journal by run_id — the owner-scoped read is ListRunCredentialEpochs.
-SELECT run_id, claim_generation, secret_id, label, select_reason, applied_at
-FROM run_credential_epochs
-WHERE run_id = @run_id AND claim_generation < @claim_generation
-ORDER BY claim_generation DESC
+--
+-- Issue #4201: in-place applies journal child epochs in run_credential_switch_epochs, so the
+-- candidates are the union of both tables and the winner is the highest (generation, ordinal);
+-- a base epoch has ordinal 0. The output shape is unchanged.
+SELECT run_id, claim_generation, secret_id, label, select_reason, applied_at FROM (
+    SELECT b.run_id, b.claim_generation, 0 AS ordinal, b.secret_id, b.label, b.select_reason, b.applied_at
+    FROM run_credential_epochs b
+    WHERE b.run_id = @run_id AND b.claim_generation < @claim_generation
+    UNION ALL
+    SELECT c.run_id, c.claim_generation, c.ordinal, c.secret_id, c.label, c.select_reason, c.applied_at
+    FROM run_credential_switch_epochs c
+    WHERE c.run_id = @run_id AND c.claim_generation < @claim_generation
+) e
+ORDER BY claim_generation DESC, ordinal DESC
 LIMIT 1;
+
+-- name: RecordCodexCredentialEpoch :exec
+-- Issue #4201: the Codex claim's journal row without RecordRunCredentialEpoch's settled_switch CTE
+-- (Codex never takes the Claude held-switch path, so it must not clear a Claude switch stamp).
+-- Idempotent on the claim.
+INSERT INTO run_credential_epochs (run_id, claim_generation, secret_id, label, select_reason, applied_at)
+VALUES (@run_id, @claim_generation, sqlc.narg('secret_id'), sqlc.narg('label'), sqlc.narg('select_reason'), now())
+ON CONFLICT (run_id, claim_generation) DO NOTHING;
+
+-- name: InsertRunCredentialSwitchEpoch :one
+-- Issue #4201: journal one in-place applied switch. The ordinal is the next free one for the
+-- (run, generation); op_id is UNIQUE, so a retry of the same operation hits the unique violation
+-- (the caller reads it back with GetRunCredentialSwitchEpochByOp first). The caller holds the run
+-- row lock, which serializes concurrent ordinal computation.
+INSERT INTO run_credential_switch_epochs (
+    run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
+    label, select_reason, message_seq, old_cumulative)
+SELECT @run_id, @claim_generation::bigint,
+       (SELECT COALESCE(max(ordinal), 0) + 1 FROM run_credential_switch_epochs
+         WHERE run_id = @run_id AND claim_generation = @claim_generation::bigint),
+       @op_id, sqlc.narg('worker_id'), sqlc.narg('secret_id'), @secret_enablement_rev,
+       sqlc.narg('label'), sqlc.narg('select_reason'), @message_seq, sqlc.narg('old_cumulative')
+RETURNING run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
+          label, select_reason, message_seq, old_cumulative, applied_at;
+
+-- name: GetRunCredentialSwitchEpochByOp :one
+SELECT run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
+       label, select_reason, message_seq, old_cumulative, applied_at
+FROM run_credential_switch_epochs
+WHERE op_id = @op_id AND run_id = @run_id;
+
+-- name: MaxCommittedCredentialEpochOrdinal :one
+-- Highest applied child-epoch ordinal for the claim, 0 when none.
+SELECT COALESCE(max(ordinal), 0)::int FROM run_credential_switch_epochs
+WHERE run_id = @run_id AND claim_generation = @claim_generation;
+
+-- name: ClearCredentialSwitchStampByOp :execrows
+-- Issue #4201: withdraw the pending switch stamp, but only if it is still the operation named.
+UPDATE runs
+SET credential_switch_requested_at = NULL,
+    credential_switch_generation = NULL,
+    updated_at = now()
+WHERE id = @id AND credential_switch_op_id = @op_id;
+
+-- name: LockAnthropicSecretForApply :one
+-- Issue #4201: share-lock the Anthropic token an in-place apply is about to use, so a concurrent
+-- disable, rotate or delete (which take FOR UPDATE) waits for the apply transaction. NOWAIT: the
+-- apply already holds the worker and run rows, and a delete holds the secret row and then needs
+-- those rows for its ON DELETE SET NULL cascade, so waiting here would deadlock; a held row returns
+-- 55P03 and the caller rolls back and retries (the claim side's rule, see
+-- LockSecretEnablementForShareNowait).
+SELECT id, user_id, kind, label, ciphertext, sealed_with, disabled_at, anthropic_rejected_at, enablement_rev
+FROM user_secrets
+WHERE id = @id AND user_id = @user_id AND kind = 'anthropic_token'
+FOR SHARE NOWAIT;
+
+-- name: StampWorkerCredentialSwitchApplyNonce :exec
+UPDATE workers SET credential_switch_apply_nonce = @nonce WHERE id = @id;
+
+-- name: ListRunCredentialSwitchEpochs :many
+-- Owner-scoped child epochs for one run, oldest first (the sibling of ListRunCredentialEpochs).
+SELECT e.run_id, e.claim_generation, e.ordinal, e.op_id, e.worker_id, e.secret_id,
+       e.secret_enablement_rev, e.label, e.select_reason, e.message_seq, e.old_cumulative, e.applied_at
+FROM run_credential_switch_epochs e
+JOIN runs r ON r.id = e.run_id
+WHERE e.run_id = @run_id AND r.user_id = @user_id
+ORDER BY e.claim_generation ASC, e.ordinal ASC;
+
+-- name: ListRunUsageByCredentialEpoch :many
+-- Issue #4201: the raw run_usage legs of one run with their epoch attribution, for Go-side
+-- telescoping per (claim_generation, credential_epoch_ordinal). Same columns the run_usage_totals
+-- view (00244) folds over: model, lineage_epoch, lineage_index, usage_basis, tokens and cost.
+SELECT run_id, session_id, model, lineage_epoch, lineage_index, usage_basis, claim_generation,
+       credential_epoch_ordinal, input_tokens, cache_read_tokens, cache_creation_tokens,
+       output_tokens, cost_usd, cost_status
+FROM run_usage
+WHERE run_id = @run_id
+ORDER BY claim_generation ASC NULLS FIRST, credential_epoch_ordinal ASC NULLS FIRST,
+         model ASC, lineage_index ASC, lineage_epoch ASC;
 
 -- name: SetRunCredentialOverride :execrows
 -- Write the per-run credential override columns for `uzi run set-token` (PRD #1247 M4,
@@ -4873,6 +5026,13 @@ UPDATE runs SET
     -- beginClaimMutation's worker lock, so status_since orders with the lock.
     status_since                   = clock_timestamp(),
     hold_reason                    = 'credential_switch_settling',
+    -- Issue #4201: hold identity. SET-list column refs read the OLD row, so this captures the op id
+    -- of the stamp being consumed here (the trigger nulls runs.credential_switch_op_id with the stamp).
+    -- The identity columns are nulled by trigger when hold_reason leaves the two switch holds.
+    credential_switch_hold_op_id          = runs.credential_switch_op_id,
+    credential_switch_hold_generation     = @generation::bigint,
+    credential_switch_hold_worker_id      = @worker_id,
+    credential_switch_hold_register_nonce = @register_nonce::text,
     credential_switch_requested_at = NULL,
     credential_switch_generation   = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -4880,10 +5040,15 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.worker_id = @worker_id
   AND runs.claim_generation = @generation
   AND runs.claim_released_at IS NULL
-  AND runs.status = 'running'
+  -- Issue #4201: an op-fenced hold (in-place apply) may also park a run in an awaiting_* state; the
+  -- legacy un-fenced caller stays running-only.
+  AND (runs.status = 'running'
+       OR (sqlc.narg('op_id')::uuid IS NOT NULL
+           AND runs.status IN ('awaiting_approval', 'awaiting_input', 'awaiting_followup')))
   AND runs.kind NOT IN ('job', 'cross_check')
   AND runs.credential_switch_requested_at IS NOT NULL
   AND runs.credential_switch_generation = @generation
+  AND (sqlc.narg('op_id')::uuid IS NULL OR runs.credential_switch_op_id = sqlc.narg('op_id')::uuid)
   -- Incarnation: the reporting process must be the CURRENT registration. An old incarnation's
   -- delayed hold, queued on the worker lock behind a re-registration that kept this run at the
   -- same claim_generation, carries the superseded nonce and is refused here.
@@ -4947,7 +5112,11 @@ WHERE r.id = sqlc.arg('run_id')::uuid AND r.status = 'paused'
 UPDATE runs SET
     credential_override_mode       = @mode,
     credential_override_secret_id  = @secret_id,
-    credential_switch_requested_at = now(),
+    -- Strictly increasing per run (issue #4201): the credential_switch_op_id trigger mints a new op id
+    -- whenever this value changes, so a restamp inside one transaction (now() would repeat) must
+    -- still differ from the previous stamp. Production does not read the minted id here; the worker
+    -- learns it from the stamp via the run's own row (GetRunCredentialSwitchOpID is a test read).
+    credential_switch_requested_at = GREATEST(clock_timestamp(), COALESCE(credential_switch_requested_at, '-infinity'::timestamptz) + interval '1 microsecond'),
     credential_switch_generation   = @generation,
     updated_at                     = now()
 WHERE id = @id
@@ -4956,6 +5125,43 @@ WHERE id = @id
   AND claim_generation = @generation
   AND claim_released_at IS NULL
   AND status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup');
+
+-- name: SetRunCredentialSwitchUncertainHold :execrows
+-- Issue #4201: the worker's credential_switch_uncertain report. An in-place apply whose outcome the
+-- worker cannot prove (the response was lost, or the swap failed after the server committed) parks the
+-- run PAUSED so the owner decides, rather than letting the session keep spending a token the server
+-- may or may not have recorded. running / awaiting_* -> paused, NON-TERMINAL. hold_reason stays NULL
+-- (an ordinary owner-style pause: Resume works), the worker_id, session_id, open_question_id and gate
+-- state are kept, pause_requested_at / pause_mode are NOT touched (a pending owner pause survives), and
+-- nothing is banked (ResumePausedRun banks the paused gap once, from the status_since written here).
+-- A pending wall or reserve pause is excluded: that park belongs to the worker's own park path and the
+-- caller answers it with a distinct refusal. The switch stamp is NOT cleared: a still-pending stamp
+-- is the evidence that the operation never committed.
+--
+-- THE WHERE IS THE FENCE: reporting worker, reported generation, an UNRELEASED claim, a live status,
+-- a kind that can pause, no existing hold, the operation named by op_id (a stamp pending for it at this
+-- generation, or a committed child epoch for it in this run and generation) and the current
+-- registration incarnation.
+UPDATE runs SET
+    status       = 'paused',
+    -- clock_timestamp() for the same register-floor ordering reason as HoldCredentialSwitchUnsettled.
+    status_since = clock_timestamp(),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at   = now()
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @generation::bigint
+  AND runs.claim_released_at IS NULL
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+  AND runs.kind NOT IN ('job', 'cross_check')
+  AND runs.hold_reason IS NULL
+  AND NOT (runs.pause_requested_at IS NOT NULL AND runs.pause_mode IN ('wall', 'reserve'))
+  AND ((runs.credential_switch_requested_at IS NOT NULL
+        AND runs.credential_switch_generation = @generation::bigint
+        AND runs.credential_switch_op_id = @op_id::uuid)
+       OR EXISTS (SELECT 1 FROM run_credential_switch_epochs e
+                  WHERE e.run_id = runs.id AND e.claim_generation = @generation::bigint AND e.op_id = @op_id::uuid))
+  AND EXISTS (SELECT 1 FROM workers w
+              WHERE w.id = runs.worker_id AND w.snapshot_register_nonce = @register_nonce::text);
 
 -- name: ClearCredentialSwitchByWorker :execrows
 -- PRD #1247 M5 (D3/D14): a bounded capture-failure give-up (a credential_switch_failed worker
@@ -4967,11 +5173,25 @@ UPDATE runs
 SET credential_switch_requested_at = NULL,
     credential_switch_generation = NULL,
     updated_at = now()
-WHERE id = @id
-  AND worker_id = @worker_id
-  AND claim_generation = @generation
-  AND claim_released_at IS NULL
-  AND credential_switch_requested_at IS NOT NULL;
+WHERE runs.id = @id
+  AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @generation
+  AND runs.claim_released_at IS NULL
+  AND runs.credential_switch_requested_at IS NOT NULL
+  -- Issue #4201: optional op fence. NULL keeps the pre-existing "any pending stamp" behaviour.
+  AND (sqlc.narg('op_id')::uuid IS NULL OR runs.credential_switch_op_id = sqlc.narg('op_id')::uuid)
+  -- Issue #4201: the op-carrying form is also fenced to the CURRENT registration incarnation, like
+  -- SetRunCredentialSwitchUncertainHold: a delayed give-up from a superseded incarnation clears nothing.
+  -- The op-less v1 form (op_id NULL) carries no nonce and is not fenced here.
+  AND (sqlc.narg('op_id')::uuid IS NULL
+       OR EXISTS (SELECT 1 FROM workers w
+                  WHERE w.id = runs.worker_id AND w.snapshot_register_nonce = sqlc.narg('register_nonce')::text));
+
+-- name: GetRunCredentialSwitchOpID :one
+-- Issue #4201: the operation id the credential_switch_op_id trigger minted for the run's pending
+-- switch stamp (NULL when no stamp is pending). StampHeldCredentialSwitch stays :execrows; the
+-- caller reads the id back in the same transaction.
+SELECT credential_switch_op_id FROM runs WHERE id = @id;
 
 -- name: ClearPauseRequest :execrows
 -- Clear a pending pause request WITHOUT parking (PRD #1190 M1), for the worker's
@@ -8966,8 +9186,8 @@ RETURNING runs.id, runs.user_id, runs.status;
 -- run_messages.claim_generation -> run_credential_epochs). A legacy caller (NULL narg) stores NULL,
 -- byte-identical to before, and the fence behaviour is unchanged (the WHERE still reads the narg).
 WITH ins AS (
-    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload, claim_generation)
-    SELECT @run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload, sqlc.narg('claim_generation')::bigint
+    INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload, claim_generation, credential_epoch_ordinal)
+    SELECT @run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload, sqlc.narg('claim_generation')::bigint, sqlc.narg('credential_epoch_ordinal')::int
     -- PRD #1497 M1 (D16): claim_released_at IS NULL is REQUIRED even for a generation-less (legacy)
     -- report, so a released OLD flight persists nothing whether or not it stamps a generation; a live
     -- claim still honours a NULL generation (the compatibility contract). ClaimRun clears the flag,
@@ -9141,7 +9361,7 @@ ORDER BY s.seq DESC NULLS LAST;
 -- ListRunMessagesForWorkerPage's, in the same order the ALTER TABLE adds them.
 -- Diverge and sqlc mints per-query Row types for BOTH, breaking workersvc.Store's
 -- []store.RunMessage contract (a compile error at cmd/server/main.go).
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation, credential_epoch_ordinal
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
@@ -9153,7 +9373,7 @@ ORDER BY seq ASC;
 -- Column order is IDENTICAL to ListRunMessagesAfter so the row stays
 -- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
 -- in the same order the ALTER TABLE adds them — see that query's note.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation, credential_epoch_ordinal
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC
@@ -9168,7 +9388,7 @@ LIMIT @lim;
 -- the row stays store.RunMessage. New columns must be APPENDED to ALL THREE of these
 -- queries in the same order the ALTER TABLE adds them — see ListRunMessagesAfter's
 -- note. Diverge and sqlc mints a per-query Row type, breaking that []store.RunMessage.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation, credential_epoch_ordinal
 FROM run_messages
 WHERE run_id = @run_id AND seq < @before_seq
 ORDER BY seq DESC
@@ -9227,10 +9447,10 @@ LIMIT @lim;
 -- never its evidence — the frame stamp on run_messages is the evidence.
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,
-    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, usage_basis, lineage_index, claim_generation, updated_at
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, usage_basis, lineage_index, claim_generation, credential_epoch_ordinal, updated_at
 ) VALUES (
     @run_id, @session_id, @model, @lineage_epoch,
-    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, @usage_basis, @lineage_index, sqlc.narg('claim_generation')::bigint, now()
+    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, @usage_basis, @lineage_index, sqlc.narg('claim_generation')::bigint, sqlc.narg('credential_epoch_ordinal')::int, now()
 )
 ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
@@ -9253,6 +9473,8 @@ ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     -- Provenance is set-once: keep an established non-null generation, never clobber it with a
     -- later same-leg frame's EXCLUDED (M9, D7). A NULL existing value adopts EXCLUDED.
     claim_generation      = COALESCE(run_usage.claim_generation, EXCLUDED.claim_generation),
+    -- Issue #4201: the epoch ordinal is provenance too, set-once like claim_generation.
+    credential_epoch_ordinal = COALESCE(run_usage.credential_epoch_ordinal, EXCLUDED.credential_epoch_ordinal),
     cost_status           = CASE
                                 WHEN run_usage.cost_status = EXCLUDED.cost_status THEN run_usage.cost_status
                                 ELSE 'unreported'
@@ -9798,7 +10020,7 @@ ORDER BY u.id;
 -- ListRunMessagesAfter so sqlc keeps returning store.RunMessage. status carries both
 -- the `init` markers CountRunInitFramesBefore counts and the success result frames;
 -- error carries a failed turn's result frame. This is a few dozen rows per run.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation, credential_epoch_ordinal
 FROM run_messages
 WHERE run_id = @run_id AND kind IN ('status', 'error', 'progress_note', 'summary_usage')
 ORDER BY seq ASC;
@@ -9892,7 +10114,7 @@ WHERE r.id = @id AND r.user_id = @user_id AND r.kind NOT IN ('judge', 'job', 'cr
 -- Column order matches the table (see ListRunMessagesAfter) so the row stays
 -- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
 -- in the same order the ALTER TABLE adds them — see that query's note.
-SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label, claim_generation, credential_epoch_ordinal
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC
@@ -11278,7 +11500,8 @@ SELECT w.id,
        COALESCE(codex_admission_run_eligible_at(run.id) <= now(), true)::boolean AS admission_eligible,
        (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))::boolean AS strict_candidate,
        fn_worker_accepts_new_intake(w)::boolean AS accepts_intake,
-       w.maintenance_fenced AS hard_fenced,
+       -- Hibernation (PRD #4205) fences every claim like ClaimRun does, own-worker pins included.
+       (w.maintenance_fenced OR w.hibernation_state <> 'none') AS hard_fenced,
        (w.draining_since IS NOT NULL OR w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling')) AS automatic_hold,
        w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason,
        rh.pacing, rh.pacing_observed_at, rh.blocking_reason, rh.phase,
@@ -11816,6 +12039,7 @@ WITH checker_template_pins AS MATERIALIZED (
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+LEFT JOIN checker_template_pins ctp ON ctp.user_id = r.user_id
 WHERE r.status = 'queued'
   -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, so a new
   -- ephemeral worker could never serve it (ClaimRun bars it and the reaper removes the worker).
@@ -11871,86 +12095,25 @@ WHERE r.status = 'queued'
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
   AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
 
+  -- PRD #4205 M5: the per-worker placement block (capabilities, protocol, lane, lease and
+  -- cross-check predicates) lives in fn_placement_admitting_workers so the hibernation wake-demand
+  -- query evaluates the SAME predicates. This caller keeps the availability conjuncts the function
+  -- deliberately omits: online, not maintenance-fenced, awake, accepting intake (or the cross-check
+  -- own-worker arm).
   AND NOT EXISTS (
-      SELECT 1 FROM workers w
-      WHERE w.user_id = r.user_id
-        AND w.status = 'online'
+      SELECT 1
+      FROM fn_placement_admitting_workers(
+              r, ctp.codex_model,
+              @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz,
+              @ephemeral_lease::interval,
+              fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]),
+              @codex_curated_models::text[]) adm
+      JOIN workers w ON w.id = adm.worker_id
+      WHERE w.status = 'online'
         AND NOT w.maintenance_fenced
+        AND w.hibernation_state = 'none'
         AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
-        AND (r.kind = 'cross_check' OR NOT w.ephemeral
-             -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
-             -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
-             -- provisioned for.
-             OR (fn_ephemeral_lease_admits(
-                    w.lease_since, w.lease_repo_id, w.lease_branch, NOT fn_worker_accepts_new_intake(w),
-                    @ephemeral_lease::interval, now(),
-                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false))
-                 -- The lease admits only runs outside the isolated lane.
-                 AND NOT w.isolated_lane))
-        -- Protocol requirements apply to persistent and leased workers alike.
-        AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
-                      OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
-      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
-      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
-      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, the side row's worker_id (not runs.worker_id, which resume writers clear); a NULL side worker_id is held. No affinity-ceiling release.
-      AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL AND pc.worker_id IS DISTINCT FROM w.id)
-        AND (r.completion_contract_version IS NULL
-                      OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
-        -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
-        -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
-        -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
-        AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
-        AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
-        AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
-      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
-                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
-                 AND (r.completion_contract_version IS NULL
-                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
-                 AND (
-                     NOT (
-                         r.harness = 'codex'
-                         AND r.kind NOT IN ('judge', 'chat')
-                         AND r.review_target_run_id IS NULL
-                         AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
-                                        ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY(@codex_curated_models::text[])),
-                             false)
-                     )
-                     OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
-                 )
-        AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
-             OR 'cross_check_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
-             OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
-             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
-             OR 'cross_check_owner_steering_v1' = ANY(w.protocol_capabilities))
-        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
-             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
-      AND (r.kind <> 'cross_check' OR EXISTS (
-          SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
-          WHERE protocol_check.checker_run_id = r.id
-            AND protocol_check.lead_run_id = r.target_run_id AND protocol_lead.user_id = r.user_id
-            AND protocol_lead.kind <> 'cross_check' AND protocol_check.stage IN ('plan','code')
-            AND protocol_check.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = protocol_check.lead_run_id AND latest.stage = protocol_check.stage)
-            AND ((protocol_check.stage = 'plan' AND protocol_check.verdict = 'pending') OR (protocol_check.stage = 'code' AND protocol_check.outcome = 'pending' AND protocol_check.interrupted_at IS NULL AND 'cross_check_code_v1' = ANY(w.protocol_capabilities) AND 'cross_check_lane_v1' = ANY(w.protocol_capabilities))) AND protocol_check.deadline_at > now()
-            AND (protocol_lead.status IN ('claimed','running') OR (protocol_check.stage = 'code' AND protocol_lead.status = 'awaiting_followup' AND protocol_lead.kind = 'task' AND protocol_lead.interactive)) AND protocol_lead.claim_released_at IS NULL
-            AND protocol_lead.claim_generation = protocol_check.lead_claim_generation
-            AND (protocol_check.round = 1 OR (protocol_check.automatic_rounds_enabled
-                AND protocol_check.round <= protocol_check.automatic_revision_limit + 1
-                AND 'cross_check_rounds_v1' = ANY(w.protocol_capabilities)))
-      ))
-      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL))) OR 'cross_check_pins_v1' = ANY(w.protocol_capabilities))
-        AND r.required_capabilities <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
   )
   -- The job arm: a job is placeable ONLY on an online, non-draining, non-ephemeral, NON-docker
   -- worker advertising 'job_runner_v1' (ClaimRun's non-bypassable job-runner clause). Only a job
@@ -12124,6 +12287,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND NOT w.maintenance_fenced
+        AND w.hibernation_state = 'none'
         AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
@@ -12210,6 +12374,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND NOT w.maintenance_fenced
+        AND w.hibernation_state = 'none'
         AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
@@ -12901,6 +13066,17 @@ WHERE r.health = 'waiting_worker'
   -- genuine-wait flag after both holds end. A NULL health_reason must stay included,
   -- hence the COALESCE.
   AND NOT COALESCE(r.health_reason LIKE 'waiting until %', false)
+  -- PRD #4205 M6: a run whose recorded wake names a worker that is still waking, inside
+  -- @wake_timeout of the FIRST wake, is a transient wait for a worker coming back, not a capacity
+  -- gap. Past the timeout (or once the worker's wake failed) it counts again.
+  AND NOT EXISTS (
+      SELECT 1 FROM hibernation_wakes hw
+      JOIN workers hww ON hww.id = hw.worker_id
+      WHERE hw.run_id = r.id
+        AND hww.hibernation_state = 'waking'
+        AND hww.wake_error IS NULL
+        AND hw.first_woken_at > now() - @wake_timeout::interval
+  )
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id

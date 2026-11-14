@@ -87,6 +87,9 @@ const (
 	// provisioner fires for a run only when BOTH are true. Admin-writable with a
 	// compiled-in default; no seeded row (an absent row synthesizes to the default).
 	KeyEphemeralWorkersEnabled = "ephemeral_workers_enabled"
+	// Worker hibernation (PRD #4205): a bool ("true"/"false"). Off by default, so the
+	// feature is a strict no-op on a fresh instance and on upgrade.
+	KeyWorkerHibernationEnabled = "worker_hibernation_enabled"
 	// Run-health detector keys (PRD #47). health_enabled is a bool ("true"/"false");
 	// the seconds thresholds are integer seconds validated as {0} ∪ [60, 86400] — 0
 	// disables that one signal, and the upper bound stops a fat-fingered value silently
@@ -353,6 +356,8 @@ const (
 	// fresh instance and on upgrade. Both this instance kill-switch and the per-user
 	// opt-in (users.ephemeral_workers_enabled) must be true before anything provisions.
 	DefaultEphemeralWorkersEnabled = "false"
+	// PRD #4205: hibernation is opt-in.
+	DefaultWorkerHibernationEnabled = "false"
 	// PRD #69. Judge enforcement is OFF by default: the per-user opt-in gate stands
 	// until an admin flips this on, so the feature is a strict no-op on upgrade.
 	DefaultJudgeEnforceAll = "false"
@@ -521,7 +526,8 @@ var Defaults = map[string]string{
 	KeyGithubProjectSyncEnabled: DefaultGithubProjectSyncEnabled,
 	// PRD #529 M2 ephemeral worker auto-provisioning kill-switch. Same no-seeded-row
 	// pattern as the judge keys: an absent row synthesizes to the default (off).
-	KeyEphemeralWorkersEnabled: DefaultEphemeralWorkersEnabled,
+	KeyEphemeralWorkersEnabled:  DefaultEphemeralWorkersEnabled,
+	KeyWorkerHibernationEnabled: DefaultWorkerHibernationEnabled,
 	// PRD #362 Decision 8 run-summary model. Same no-seeded-row pattern as the judge
 	// keys: an absent row synthesizes to DefaultSummaryModel ("haiku"), so All/AdminView
 	// surface it to the settings page on every instance and no migration seeds it.

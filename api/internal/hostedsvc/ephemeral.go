@@ -375,6 +375,20 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 		return false, err
 	}
 
+	// PRD #4205 M5 (D9): a run whose recorded demand wake still covers it (its worker is waking,
+	// admitted for this run, and the first wake is younger than the wake timeout) must not also
+	// get an ephemeral worker. This is the one boundary all three triggers (capability gap,
+	// saturation, isolated lane) share. Plain snapshot read; a failure fails closed (the next
+	// pass retries), and a suppressed run is skipped, not counted.
+	suppressed, err := p.wakeSuppressesProvision(ctx, qtx, runID)
+	if err != nil {
+		return false, err
+	}
+	if suppressed {
+		slog.Debug("ephemeral provisioner: a hibernation wake covers the run; skipping", "run_id", runID)
+		return false, nil
+	}
+
 	// PRD #3454: re-check intake admission under the lock, before any count/evict/token/create.
 	// The demand queries filter at selection time, but the pause can be enabled between selection
 	// and here. Plain snapshot read (no row lock). A vanished run is skipped; any other error

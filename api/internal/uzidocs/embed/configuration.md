@@ -73,6 +73,7 @@ A new component, one per deployment, the only thing in uzi holding a kube-API cr
 | `UZI_API_URL` | — (required) | The api's base URL, as the controller itself dials it (the release namespace's short Service name is fine here). |
 | `UZI_CONTROLLER_TOKEN_FILE` | — (required) | Path to the controller's own bearer credential, file-mounted like the worker's join token and for the same reason: an env-borne secret is readable via `/proc/<pid>/environ`. |
 | `UZI_API_CA_FILE` | — (optional) | PEM bundle to verify the api's TLS certificate against, pinned exclusively (not additive to the system roots). Required in practice whenever `UZI_API_URL` is `https://`. |
+| `UZI_WORKER_EXTRA_CA_FILE` | — (optional) | PEM bundle hosted workers trust on top of the api's CA, for private-CA hosts the worker and the Claude Code CLI call over HTTPS (an Anthropic-compatible LLM gateway, a self-hosted forge's API). Appended after the api CA in each worker's Secret. Requires `UZI_API_CA_FILE`; at most 512 KiB; a file holding no certificate refuses to boot. Workers verify the api with the same bundle, so it is also trusted for the worker-to-api connection, not only outbound hosts. It does not change git's or the toolchain's OpenSSL trust. Under the uid split the CLI cannot read it; without it, setting this adds `UZI_CLI_CA_FILE` to the worker pod template, which can roll workers (a roll does not rewrite an existing worker's Secret). Read at boot and written when a worker is created, so a change needs a controller restart and reaches new workers. Chart: `workers.extraCA`. |
 | `UZI_WORKER_NAMESPACE` | — (required) | The dedicated namespace hosted workers render into — empty of everything else by design (see [ARCHITECTURE.md](../ARCHITECTURE.md#worker-controller-k8s-only)). |
 | `UZI_WORKER_DEPLOYMENT_LABELS` / `UZI_WORKER_DEPLOYMENT_ANNOTATIONS` | — (optional) | JSON objects of extra labels / annotations on every worker Deployment's own metadata (not the pod template, so no roll). For admission policies that key on workload metadata. A label the controller stamps (`app.kubernetes.io/name`, `component`, `managed-by`) and any `uzi.dev/` key are refused at boot. Every update the controller sends to a worker Deployment carries them, so an existing worker picks them up at its next update. Chart: `workloadLabels` / `workloadAnnotations`. |
 | `UZI_WORKER_SERVICE_ACCOUNT` | — (required) | The workers' own zero-permission ServiceAccount (no token automount). |
@@ -259,6 +260,25 @@ Registration controls and PAT least-privilege verification. See [auth-design.md]
 | `UZI_REGISTRATION_ENABLED` | `true` | Registration kill-switch. When `false`, `POST /api/auth/register` returns `403` and the SPA replaces the register form with a "registration is disabled" notice; login is unaffected. Unlike the tuning knobs above, a **malformed** value (not a boolean) **refuses to start** — this is a security control, so a typo fails loud rather than silently defaulting to open. The seed admin (`UZI_SEED_EMAIL`) is created out-of-band and is never gated by this. |
 | `UZI_ALLOWED_EMAIL_DOMAINS` | — (empty = all) | Comma-separated registration email-domain allowlist, matched case-insensitively, **exact match only** (no subdomain wildcards: `a.example.com` does not match `example.com`). Empty/unset allows every domain (today's open behavior; the compose demo stays zero-config). A rejected domain returns `403` with the allowed list named. The domain is taken from the parsed address, so display-name forms (`Alice <alice@example.com>`) are handled correctly. The seed admin is **exempt** — an allowlist that excludes your own seed email never causes a bootstrap lockout. |
 | `UZI_PRIVILEGE_CHECK_INTERVAL` | `24h` | Cadence of the background PAT least-privilege re-check sweep (Go duration). When enabled (`> 0`), the sweep runs a boot pass shortly after start — back-filling never-checked (grandfathered) connections so an over-privileged token surfaces without waiting a full interval — then re-checks on the interval. `0` **disables the sweep entirely, including that boot pass**: it is the one duration knob where `0` is honored, not treated as "unset". With `0`, a never-checked connection therefore stays `unchecked` until its owner runs the on-demand "Check privileges" button — only the save-time check (which blocks an over-privileged token at connect) still runs regardless. A negative or otherwise malformed value falls back to the default. |
+
+### Admin run debug (issue #4198)
+
+The steer queue is otherwise owner-only ([PRD #95](../prds/done/95-activity-pane-v2.md) Decision 8). This is the deployment's opt-in exception for debugging other users' runs from the CLI. It is read-only.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_ADMIN_RUN_DEBUG` | `false` | Chart: `api.adminRunDebug.enabled`. **Off by default.** When on, a request authenticated by a Bearer CLI token whose stored scope is `admin_ro` (a `uza_` token) and that belongs to a live admin may read another user's run **inputs** (steer queue; a foreign chat run still 404s), **archive metadata**, **fetches**, **recovery holds** (`GET /api/recovery/holds?user=<uuid>` or `?run=<run-id>`, exactly one) and an all-states run listing (`GET /api/admin/runs?state=all`, optionally `user` and `since`; every status, newest first, at most 500 rows with a `truncated` flag, chat, judge and cross-check runs excluded). `state`, `user` or `since` without the flag and token get `403` naming the prerequisites. Cookies and `uzc_` tokens never qualify, and admin-ness is read live, so demotion applies on the next request. On the chart, set it only through `api.adminRunDebug.enabled` (a real boolean); setting `UZI_ADMIN_RUN_DEBUG` in `api.config` or `api.secretEnv` fails the render. |
+
+What stays denied on a foreign run, flag or not: every write, archive download and `uzi run export`. Inputs and archives responses served this way carry `admin_debug_read: true`. See [cli.md](./cli.md#admin-run-debug-reading-other-users-runs) for the commands.
+
+Each newly authorized cross-user read writes one Info log line, `admin run debug read`, before the response is sent. Owner reads log nothing new. Fields:
+
+- every line: `actor_user_id`, `token_id`, `route`;
+- per-run reads (`route` is `runs.inputs`, `runs.archives` or `runs.fetches`): `run_id`, `owner_id`;
+- holds by user (`route` `recovery.holds`): `target_owner_id`; holds by run: `target_owner_id` and `run_id`;
+- the listing (`route` `admin.runs`): `owner_filter` (a user UUID or `all`), `since` (only when given), `returned`.
+
+The line never carries credentials, input bodies, fetch URLs or archive bytes.
 
 ## OIDC single sign-on (PRD #45)
 

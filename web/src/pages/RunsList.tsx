@@ -48,6 +48,7 @@ import { useNow } from "../lib/rateLimits";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
+import { WorkerStatusBadge } from "../components/WorkerStatusBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { AdminWorkerResources } from "../components/AdminWorkerResources";
 import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
@@ -802,9 +803,7 @@ export function RunsList() {
                           template drift
                         </Badge>
                       )}
-                      <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
-                        {w.status}
-                      </Badge>
+                      <WorkerStatusBadge worker={w} />
                       <AdminWorkerResources worker={w} />
                       <WorkerCordonBadge worker={w} />
                       <WorkerRunBadge worker={w} hideIdleCrossChecks />

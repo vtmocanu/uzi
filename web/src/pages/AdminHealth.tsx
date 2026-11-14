@@ -40,6 +40,9 @@ import { attentionChecks, healthVerdict, isAttention } from "../lib/healthView";
 import { formatAgo, useNow } from "../lib/rateLimits";
 import { stripUnsafeChars } from "../lib/safeText";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { WorkerStatusBadge } from "../components/WorkerStatusBadge";
+import { WorkerHibernationControls } from "../components/WorkerHibernationControls";
+import { isHibernating } from "../lib/workerHibernation";
 import { WorkerCordonMetadata } from "../components/WorkerCordonMetadata";
 import { useHealthStatus } from "../lib/useAdminHealth";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
@@ -568,7 +571,7 @@ function FleetCard() {
                 </td>
               </tr>
             ) : (
-              workers.map((w) => <FleetRow key={w.id} worker={w} demo={demo} />)
+              workers.map((w) => <FleetRow key={w.id} worker={w} demo={demo} onChanged={() => void load()} />)
             )}
           </tbody>
         </table>
@@ -577,12 +580,13 @@ function FleetCard() {
   );
 }
 
-function FleetRow({ worker: w, demo }: { worker: AdminWorker; demo: boolean }) {
+function FleetRow({ worker: w, demo, onChanged }: { worker: AdminWorker; demo: boolean; onChanged: () => void }) {
   // The worker name and the upgrade detail are server-sanitized at write time. Strip them
   // again on the way to a `title=` attribute: an attribute is a sink a rendered-text sweep
   // misses, so a bidi override there could reorder how the tooltip reads (issue #124).
   const name = stripUnsafeChars(w.name);
   const upgrade = upgradePresentation(w.upgrade_status);
+  const wakeError = isHibernating(w) ? stripUnsafeChars(w.wake_error ?? "").trim() : "";
 
   return (
     <tr>
@@ -596,9 +600,12 @@ function FleetRow({ worker: w, demo }: { worker: AdminWorker; demo: boolean }) {
       <td className="px-4 py-3">
         {/* Online reads ok, anything else neutral: an upgrade failure is the Upgrade column's
             danger badge, not a second danger signal here. */}
-        <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
-          {w.status}
-        </Badge>
+        <div className="flex flex-wrap gap-1">
+          <WorkerStatusBadge worker={w} />
+        </div>
+        {/* Plain text, never HTML: the server message is sanitized, and stripped again here. */}
+        {wakeError && <p className="mt-1 max-w-xs whitespace-normal text-xs text-danger">Wake failed: {wakeError}</p>}
+        <WorkerHibernationControls worker={w} onChanged={onChanged} />
       </td>
       <td className="px-4 py-3">
         <AdminWorkerResources worker={w} diskOnly />

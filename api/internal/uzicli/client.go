@@ -72,10 +72,15 @@ type Client interface {
 	// re-judge in flight over an existing verdict).
 	RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, *apitypes.JudgeSkipDTO, error)
 	// RunInputs returns a run's follow_up steer queue (newest-first) with delivery
-	// status (PRD #95). Owner-only server-side (GetRunByIDForUser): a non-owner —
-	// including an admin_ro token on another user's run — gets a 404 →
-	// *ExitError{ExitNotFound}, never another user's steer text.
+	// status (PRD #95). Owner-only server-side (GetRunByIDForUser): a non-owner gets a
+	// 404 → *ExitError{ExitNotFound}, never another user's steer text. The one exception
+	// is admin run debug (server flag UZI_ADMIN_RUN_DEBUG): a live admin's admin_ro (uza_)
+	// token may read a foreign non-chat run's queue, read-only and audited.
 	RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error)
+	// RunInputsMeta is RunInputs plus the response's admin_debug_read marker: true only when
+	// the server served another user's queue under admin run debug (issue #4198), so a
+	// caller can keep the view read-only. A server predating the marker reports false.
+	RunInputsMeta(ctx context.Context, id string) ([]apitypes.SteerInputDTO, bool, error)
 	// RunLeadConfigHistory returns every recorded lead model/effort row of a run, newest claim
 	// generation first (PRD #3244 M3): GET /api/runs/{id}/lead-config. Owner-or-admin server-side;
 	// another user's run is a 404 -> *ExitError{ExitNotFound}. A run with no lead agent yields an
@@ -256,6 +261,13 @@ type Client interface {
 	// AdminListRunSummaries is AdminListRuns' compact projection
 	// (GET /api/admin/runs?view=summary, issue #2661), polled by the admin TUI board.
 	AdminListRunSummaries(ctx context.Context) ([]apitypes.RunSummaryItemDTO, error)
+	// AdminListRunsDebug is the admin run debug listing (issue #4198): GET
+	// /api/admin/runs?state=all[&user=<uuid>][&since=<RFC3339>], summary rows of every
+	// status, newest first, with Truncated set when the server's row cap cut the list. The
+	// server needs UZI_ADMIN_RUN_DEBUG plus an admin_ro (uza_) token, else 403 -> ExitAuth.
+	// An older server ignores the query and answers with its active-runs listing, which
+	// is refused here with a clear error rather than shown as if it were everything.
+	AdminListRunsDebug(ctx context.Context, userID, since string) (apitypes.AdminRunsDebugDTO, error)
 	AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error)
 	// AdminHealth reads the admin health document (PRD #1484 M3): GET
 	// /api/admin/health, in the admin READ group (RequireUser + RequireAdminRO), so a
@@ -748,8 +760,9 @@ type Client interface {
 	CreateCIFixRun(ctx context.Context, repoID, ref string) (CreatedRunResult, error)
 	// RecoveryArchives returns a run's owner-scoped durable-recovery summary — metadata
 	// ONLY, never raw bytes (PRD #1296 D6/D7): GET /api/runs/{id}/archives. RequireUser
-	// and strict owner-or-404 server-side (an admin viewing a foreign run is refused,
-	// mirroring ListRunInputs), so a uzc_/uza_ CLI token reaches its OWN runs and nobody
+	// and owner-or-404 server-side (an admin viewing a foreign run is refused, mirroring
+	// ListRunInputs, unless the admin run debug predicate holds: an admin_ro token with
+	// UZI_ADMIN_RUN_DEBUG on), so a uzc_ CLI token reaches its OWN runs and nobody
 	// else's. A run with no captures returns a zero-value summary (Supported=false,
 	// Archives=[]), which the run-detail summary renders as an honest "none/unsupported"
 	// rather than a false claim of an available archive.
@@ -778,6 +791,11 @@ type Client interface {
 	// token reaches its OWN holds and nobody else's. `uzi run recovery <run-id>` narrows the
 	// returned list to one run client-side. Holds is always a JSON array (never null).
 	RecoveryHolds(ctx context.Context) (apitypes.RecoveryCustodyHoldsDTO, error)
+	// RecoveryHoldsScoped reads another user's holds (?user=<uuid>) or the holds of one run
+	// (?run=<uuid>) under admin run debug (issue #4198); exactly one of userID and runID must
+	// be non-empty. The response's OwnerID names whose holds they are and is empty from a
+	// server that predates the feature (which ignores the query and answers owner-wide).
+	RecoveryHoldsScoped(ctx context.Context, userID, runID string) (apitypes.RecoveryCustodyHoldsDTO, error)
 	// DiscardRecoveryHold discards ONE exact owner-owned open custody hold (PRD #1349 M5,
 	// D7/D9): DELETE /api/runs/{runID}/recovery-holds/{holdID}?confirm=discard. The
 	// ?confirm=discard field is REQUIRED (the server's only mutating form) and this method

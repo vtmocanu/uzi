@@ -31,6 +31,12 @@ func (f *workerNavFake) RunInputs(ctx context.Context, id string) ([]apitypes.St
 	return f.FakeClient.RunInputs(ctx, id)
 }
 
+// RunInputsMeta is what the TUI's ownership probe calls, so it is counted like RunInputs.
+func (f *workerNavFake) RunInputsMeta(ctx context.Context, id string) ([]apitypes.SteerInputDTO, bool, error) {
+	f.inputs++
+	return f.FakeClient.RunInputsMeta(ctx, id)
+}
+
 // Execute finite commands only; stream readers and scheduled ticks are excluded.
 func workerNavFinite(t *testing.T, m tuiModel, cmd tea.Cmd) tuiModel {
 	t.Helper()

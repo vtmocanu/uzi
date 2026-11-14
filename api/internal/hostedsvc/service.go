@@ -277,6 +277,12 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			dw.DrainingReason = &v
 		}
 		dw.EffectiveCordoned = row.EffectiveCordoned
+		// Only a worker that is not awake carries the field, so an awake worker's wire
+		// shape is unchanged for a controller that predates hibernation (PRD #4205).
+		// A zero or inconsistent row (empty state, or no op id) carries no object.
+		if row.HibernationOpID.Valid && (row.HibernationState == "preparing" || row.HibernationState == "hibernated" || row.HibernationState == "waking") {
+			dw.Hibernation = &Hibernation{State: row.HibernationState, OpID: uuid.UUID(row.HibernationOpID.Bytes).String()}
+		}
 		if row.ManualCordonedAt.Valid {
 			t := row.ManualCordonedAt.Time
 			dw.ManualCordonedAt = &t

@@ -75,7 +75,7 @@ func TestRunRecoveryCaptureDetailsAttribution(t *testing.T) {
 	for _, quiet := range []bool{false, true} {
 		var out, stderr bytes.Buffer
 		err := renderRunRecovery(Env{Stdout: &out, Stderr: &stderr}, &globalFlags{quiet: quiet},
-			"run\nwith\ttabs", holds, []apitypes.RecoveryArchiveDTO{b, legacy, a}, nil)
+			"run\nwith\ttabs", holds, []apitypes.RecoveryArchiveDTO{b, legacy, a}, nil, false, false)
 		if err != nil {
 			t.Fatal(err)
 		}

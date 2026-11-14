@@ -338,13 +338,26 @@ completion projection cannot be confirmed. The feed names up to five
 offending SHAs and a remaining count, or reports unreadable messages without
 a SHA. Unknown projection uses fixed copy without commit content.
 
-1. For unpublished commits on a declared or owner-partial run without Stop,
-   use `uzi run decide <id> --continue --guidance "<text>"`. Name the SHAs
-   and ask the lead to reword its own unpublished commits. The worker does
-   not rewrite history or force-push.
-2. For published history or a Stop directive, cancel and manually deliver
-   the preserved work through the recovery paths on this page. Stop resumes
-   into finalization without another lead turn. Partial and accept decisions
+1. When no offending commit is reachable from published history, on a
+   declared or owner-partial run without Stop, use
+   `uzi run decide <id> --continue --guidance "<text>"`. Name the SHAs and
+   ask the lead to reword its own unpublished commits. The worker does not
+   rewrite history or force-push. Published history is the run branch as it
+   exists on the forge and any [published checkpoint ref](#published-checkpoint-refs),
+   not the local candidate; mid-run checkpoints count. Check each offending
+   SHA with `git merge-base --is-ancestor <sha> <published tip>` in a full
+   (non-shallow) clone holding both commits: exit 0 means published; exit 1
+   means unpublished only when the history is complete; an error or
+   unavailable history means unknown, so treat it as published. When the
+   feed shows a remaining count, the listed SHAs alone cannot settle this:
+   check every commit in the default-branch..candidate range or cancel.
+2. For an offending commit reachable from published history, a Stop
+   directive, or a hold that returns after a reword, cancel and manually
+   deliver the preserved work with corrected messages through the recovery
+   paths on this page. Continue cannot clear such a hold, because finalize
+   re-parents published checkpoint floors into the push candidate and the
+   push-time rescan refuses the same commit again. Stop resumes into
+   finalization without another lead turn. Partial and accept decisions
    cannot repair commit history.
 3. Check the available recovery evidence before replacing the worker.
    Pre-push holds skip remote checkpoint publication. If bounded capture
@@ -407,7 +420,10 @@ without requesting a hold when the API lacks the `credential_switch_hold` protoc
 feature or the retained flight's ownership reads `awaiting_*`. A refused hold report
 also stops the flight without a hold.
 
-If a hold report stays unconfirmed after one retry and an ownership read, the hold
+If a hold report stays unconfirmed (for a v1 report, after one retry and an
+ownership read; an in-place report retries transient failures on a capped backoff
+until it is confirmed, refused, the claim goes stale or a lifecycle stop arrives,
+and any other failure ends it unconfirmed at once), the hold
 may already exist on the server. After its own operations join, the worker still
 sends the fenced settlement acknowledgement, with bounded heartbeat retries if
 delivery is uncertain. If the hold never applied, that acknowledgement changes

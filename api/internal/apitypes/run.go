@@ -1173,12 +1173,32 @@ type CredentialOverrideDTO struct {
 // Nullable — the FK nulls it when the token is deleted, exactly as RunDTO.AnthropicSecretID
 // does, so a historical epoch legitimately carries a label with no id. Owner-or-admin scoped
 // like the rest of this DTO, so exposing the per-epoch id here is consistent with that field.
+//
+// Issue #4201 adds the in-generation epochs an in-place token switch opens. Ordinal is 0 for the
+// claim's base epoch (one per generation) and n >= 1 for the nth switch applied inside that
+// generation; a consumer orders epochs by (claim_generation, ordinal). MessageSeq is the seq of the
+// run's credential_switch message for an applied switch (null for a base epoch). Usage is the
+// epoch's own spend, computed by telescoping the run's usage legs, and is omitted when the run has
+// recorded none.
 type CredentialEpochDTO struct {
-	ClaimGeneration int64     `json:"claim_generation"`
-	SecretID        *string   `json:"secret_id"`
-	Label           *string   `json:"label"`
-	SelectReason    *string   `json:"select_reason"`
-	AppliedAt       time.Time `json:"applied_at"`
+	ClaimGeneration int64                    `json:"claim_generation"`
+	Ordinal         int32                    `json:"ordinal"`
+	SecretID        *string                  `json:"secret_id"`
+	Label           *string                  `json:"label"`
+	SelectReason    *string                  `json:"select_reason"`
+	AppliedAt       time.Time                `json:"applied_at"`
+	MessageSeq      *int32                   `json:"message_seq,omitempty"`
+	Usage           *CredentialEpochUsageDTO `json:"usage,omitempty"`
+}
+
+// CredentialEpochUsageDTO is one credential epoch's spend (issue #4201). The fields mean what the
+// run's usage totals mean (tokens by kind, cost in USD), restricted to the legs the epoch opened.
+type CredentialEpochUsageDTO struct {
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CostUSD             float64 `json:"cost_usd"`
 }
 
 // RunSummaryItemDTO is the compact run row served by GET /api/runs?view=summary and
@@ -2607,6 +2627,15 @@ type SteerInputDTO struct {
 	InclusionReported bool       `json:"inclusion_reported"`
 }
 
+// RunInputsEnvelopeDTO is the GET /api/runs/{id}/inputs response: the steer queue under
+// "inputs" (always a JSON array, never null on the real wire) and, only on an admin run debug
+// read of another user's run (issue #4198), admin_debug_read=true so a client can mark the
+// view read-only. The marker is omitted otherwise, so an owner's response is unchanged.
+type RunInputsEnvelopeDTO struct {
+	Inputs         []SteerInputDTO `json:"inputs"`
+	AdminDebugRead bool            `json:"admin_debug_read,omitempty"`
+}
+
 // RunEventDTO is one /api/ws frame: the live-channel counterpart to the REST
 // reads above, shared by the web, the hub that emits it, and the uzi CLI.
 //
@@ -2762,4 +2791,12 @@ func (r *RunSummaryItemDTO) UnmarshalJSON(data []byte) error {
 	wire.RecoveryRetryNotBeforePresent = len(timing.Retry) > 0
 	*r = RunSummaryItemDTO(wire)
 	return nil
+}
+
+// AdminRunsDebugDTO is the GET /api/admin/runs?state=all response (issue #4198 admin run
+// debug listing): the summary rows of every status, newest first, and whether more matching
+// runs existed than the server's row cap. Runs is always a JSON array, never null.
+type AdminRunsDebugDTO struct {
+	Runs      []RunSummaryItemDTO `json:"runs"`
+	Truncated bool                `json:"truncated"`
 }

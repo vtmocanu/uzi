@@ -21,7 +21,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { sessionTranscriptResolvable } from "../src/sdk-session.js";
+import { sessionTranscriptResolvable, isResumeTranscriptIncompatible } from "../src/sdk-session.js";
 
 const SID = "11111111-2222-3333-4444-555555555555";
 
@@ -106,5 +106,21 @@ describe("sessionTranscriptResolvable (issue #105)", () => {
     } finally {
       fs.chmodSync(home, 0o700);
     }
+  });
+});
+
+// Issue #4201 m2d: the allowlist of transcript-incompatibility failures that a post-switch resume refusal
+// may answer with a fresh session. Auth, billing, policy, transport and partial failures are not on it.
+describe("isResumeTranscriptIncompatible (issue #4201)", () => {
+  it("accepts the CLI's pre-model session-resolution failure, bare or wrapped", () => {
+    assert.equal(isResumeTranscriptIncompatible(new Error("No conversation found with session ID: 1234")), true);
+    assert.equal(isResumeTranscriptIncompatible(new Error("agent run failed: No conversation found with session ID: abc")), true);
+    assert.equal(isResumeTranscriptIncompatible(new Error("outer", { cause: new Error("No conversation found with session ID: x") })), true);
+  });
+  it("rejects every other failure and non-errors", () => {
+    for (const message of ["401 Unauthorized", "provider error: 402 billing", "usage policy violation", "ECONNRESET", "rate limited", "agent run failed: unknown"])
+      assert.equal(isResumeTranscriptIncompatible(new Error(message)), false, message);
+    assert.equal(isResumeTranscriptIncompatible("No conversation found with session ID: x"), false, "only Error instances");
+    assert.equal(isResumeTranscriptIncompatible(undefined), false);
   });
 });

@@ -45,6 +45,9 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Get("/workers", h.AdminListWorkers)
 			// gzip: the all-users active run list is large, key-repetitive JSON (same
 			// reasoning as the owner /runs list in handler.go); transparent to clients.
+			// Issue #4198: ?state=all[&user=][&since=] switches this handler to the all-states debug
+			// listing; it additionally needs UZI_ADMIN_RUN_DEBUG and an admin_ro Bearer token
+			// (checked in the handler, 403 otherwise). Without those keys the response is unchanged.
 			r.With(chimw.Compress(5)).Get("/runs", h.AdminListRuns)
 			// Admin "All users" judge aggregate reads (PRD #1184 M1): every user's judge
 			// recommendations deduped by (category, target) with attribution hidden, plus the
@@ -164,6 +167,11 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// RequireAdmin, target from the path, never the body.
 			r.Put("/users/{id}/ci-autofix", h.SetUserCIAutofixEnabled)
 			r.Put("/settings", h.UpdateSettings)
+			// Worker hibernation (PRD #4205): admin-only sleep and wake of a persistent hosted
+			// worker. Cookie-only so a uza_ Bearer 401s and CSRF applies; the actor is the
+			// session user and the target comes from the path.
+			r.Post("/workers/{id}/hibernate", h.AdminHibernateWorker)
+			r.Post("/workers/{id}/wake", h.AdminWakeWorker)
 			// Instance maintenance (PRD #3454): cookie-only like settings, so an admin read
 			// token is refused and CSRF applies; the actor is the session user.
 			r.Put("/maintenance", h.AdminPutMaintenance)

@@ -44,6 +44,7 @@ func sampleStatusReport() StatusReport {
 		Kind: "fleet", ReportedAt: time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC),
 		PollIntervalSeconds: 10,
 		WorkerImageTag:      "0.11.7",
+		Hibernation:         1,
 		Workers: []WorkerStatus{
 			{
 				// The motivating incident, in fixture form: an init container wedged in
