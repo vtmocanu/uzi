@@ -318,6 +318,11 @@ first step, a **dry run**: **no volume is deleted**, and no setting turns deleti
   capture replicated on the worker, an active publication-resume custodian, a
   manual cordon, draining, maintenance). A terminal run or a released hold is
   not a receipt.
+- **Pressure-only builder leg.** When this leg is configured, the inventory reports
+  the uncovered writer `dind_builder` and is incomplete. This includes the default
+  Docker prune configuration. Its client can close before the daemon has finished
+  pruning, so local child settlement cannot prove writer exclusion. Pressure
+  cleanup continues with its existing behavior; the volumes remain protected.
 - **Conditional only.** A worker that nothing blocks is reported as "would retire
   only after M2 verifies": the volumes' actual PV reclaim policy, and that no
   other pod mounted them between the controller's observations (only sampled in

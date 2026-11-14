@@ -53,7 +53,9 @@
 //   reclaim, stale job workspaces, retire-scratch inspection, the Codex orphan reaper.
 //   read-only samplers (no writes): stats collector, RunDiskSampler, memory guard sampling,
 //   retained-source reportRetained.
-//   UNCOVERED: none known. A class that cannot be wrapped must call
+//   UNCOVERED: dind_builder when the pressure-only builder leg is configured. Its daemon
+//   operation can outlive client settlement; the constructor marks it uncovered for the process.
+//   A class that cannot be wrapped must call
 //   HibernationWriterRegistry.markUncovered(name); the inventory then reports it, this worker
 //   posts it with complete=false, and the api also refuses to treat such an inventory as complete.
 import type { DindPruneGate } from "./dind-prune.js";
