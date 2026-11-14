@@ -405,14 +405,35 @@ publication fails or a human has touched the request in between:
 
 ## Fixing a publication hold
 
-For a declared or owner-partial run whose offending commits are still
+For a declared or owner-partial run whose offending commits are all still
 unpublished, choose **Continue** and give guidance naming the logged SHAs:
 ask the lead to reword its own unpublished commits in the next turn. The
 guard does not rewrite offending messages or force-push to repair a refusal.
 Partial and accept decisions cannot fix commit history.
 
-If the history was already published, or the run has a Stop directive,
-cancel and manually deliver the preserved work through
+Unpublished means that no offending commit is reachable from published
+history: the run branch as it exists on the forge (not the run's local
+candidate) and any [published checkpoint ref](run-recovery.md#published-checkpoint-refs).
+Mid-run checkpoints publish too, so a commit can be published before any pull
+request exists. To check, find the checkpoint ref and its tip with
+`uzi run recovery <run-id>`, fetch the forge branch and that ref, and run
+`git merge-base --is-ancestor <sha> <published tip>` for each offending SHA
+against each published tip, in a full (non-shallow) clone holding both
+commits. Exit 0 means the commit is published. Exit 1 means it is not
+reachable only when the history is complete; in a shallow or partial clone
+it can be wrong. Any error, or history you cannot fetch, means unknown:
+treat the commit as published. The feed lists at most five SHAs plus a remaining
+count; when a count appears, the listed SHAs alone cannot settle this, so
+check every commit in the default-branch..candidate range or cancel.
+
+If an offending commit is reachable from published history, Continue cannot
+clear the hold: the finalize bridge re-parents published checkpoint floors
+into the push candidate as ancestors, so the push-time rescan finds the same
+commit and refuses again. If the hold returns after a reword, the same
+applies.
+
+In those cases, or if the run has a Stop directive, cancel and manually
+deliver the preserved work with corrected messages through
 [run recovery](run-recovery.md#completion-publication-holds). A Stop resumes
 directly into finalization without another lead turn.
 

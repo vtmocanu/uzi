@@ -1077,6 +1077,8 @@ export interface GitCacheOptions {
     closeWaitMs?: number;
     lstat?: (p: string) => Promise<Stats>;
   };
+  /** Test-only: the clock and timers of cleanupArchivedRecoveryPin (issue #4091). Production never passes it. */
+  archivedPinClockForTest?: { now(): number; schedule(fn: () => void, ms: number): () => void };
   /** issue #1783 M3 — test-only fs seam for the canonical-path free (freeCanonicalClonePath):
    *  `lstat` replaces the validation lstat of the repo dir and the canonical path, `rename` the
    *  quarantine rename, `residueUuid` the residue name's uuid. Production never passes it. */
@@ -4895,6 +4897,7 @@ export class GitCache {
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
   private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
+  private readonly archivedPinClock: NonNullable<GitCacheOptions["archivedPinClockForTest"]>;
   private readonly terminalRecordProtection: GitCacheOptions["terminalRecordProtection"];
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
   private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
@@ -4938,6 +4941,10 @@ export class GitCache {
     this.chainMaxDiffBytes = opts.checkpointChainBounds?.maxDiffBytes ?? CHECKPOINT_CHAIN_MAX_DIFF_BYTES;
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
+    this.archivedPinClock = opts.archivedPinClockForTest ?? {
+      now: () => Date.now(),
+      schedule: (fn, ms) => { const handle = setTimeout(fn, ms); return () => clearTimeout(handle); },
+    };
     this.canonicalFreeSeam = opts.canonicalFree;
     this.wipCaptureSeam = opts.wipCapture;
     this.reposRoot = path.join(dataDir, "repos");
@@ -8716,15 +8723,16 @@ export class GitCache {
         (input.deadline !== undefined && !Number.isFinite(input.deadline))) {
       return { state: "retained", reason: "invalid_identity" };
     }
-    const deadline = Math.min(Date.now() + 30_000, input.deadline ?? Infinity);
+    const clock = this.archivedPinClock;
+    const deadline = Math.min(clock.now() + 30_000, input.deadline ?? Infinity);
     const stop = new AbortController();
     const abort = () => stop.abort();
     input.signal?.addEventListener("abort", abort, { once: true });
     if (input.signal?.aborted) abort();
-    const timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
+    const cancelTimer = clock.schedule(abort, Math.max(0, deadline - clock.now()));
     const check = (): void => {
       if (input.signal?.aborted) refuse("cancelled");
-      if (Date.now() >= deadline || stop.signal.aborted) refuse("deadline");
+      if (clock.now() >= deadline || stop.signal.aborted) refuse("deadline");
     };
     // Racing only bounds the caller's wait. Every continuation checks again, so a late filesystem
     // completion cannot enter a Git mutation. Locks remain held until that continuation settles.
@@ -8801,7 +8809,7 @@ export class GitCache {
       const isBareProbe = cwd !== root;
       const child = await this.spawnGit(cwd,
         [...(isBareProbe ? ["--git-dir", cwd] : []), "--no-replace-objects", ...args], stdin, {
-        timeoutMs: deadline - Date.now(), stderrMaxBytes: 65536, cancelOnAbandon: true,
+        timeoutMs: deadline - clock.now(), stderrMaxBytes: 65536, cancelOnAbandon: true,
         env: { GIT_CONFIG_GLOBAL: "/dev/null", ...(isBareProbe && pinCommonDir ? { GIT_COMMON_DIR: cwd } : {}) },
       });
       activeChildren.add(child.exited);
@@ -8995,7 +9003,7 @@ export class GitCache {
             `option no-deref\ndelete ${ref} ${input.sourceSha}\nprepare\n`, {
               // The native timeout is only a backstop past the caller deadline: the teardown below gets
               // PREPARED_ABORT_GRACE_MS to let Git exit on its own before anything sends SIGTERM.
-              keepStdinOpen: true, timeoutMs: Math.max(1, deadline - Date.now()) + PREPARED_ABORT_GRACE_MS,
+              keepStdinOpen: true, timeoutMs: Math.max(1, deadline - clock.now()) + PREPARED_ABORT_GRACE_MS,
               stderrMaxBytes: 65536, cancelOnAbandon: true,
               env: { GIT_CONFIG_GLOBAL: "/dev/null", GIT_COMMON_DIR: chosen.bare },
             }).catch(async (): Promise<never> => {
@@ -9093,12 +9101,12 @@ export class GitCache {
             if (committed) child.cancel();
             else {
               sendAbort();
-              let graceTimer: ReturnType<typeof setTimeout> | undefined;
+              let cancelGrace: (() => void) | undefined;
               const exitedInGrace = await Promise.race([
                 child.exited.then(() => true, () => true),
-                new Promise<boolean>(resolve => { graceTimer = setTimeout(() => resolve(false), PREPARED_ABORT_GRACE_MS); }),
+                new Promise<boolean>(resolve => { cancelGrace = clock.schedule(() => resolve(false), PREPARED_ABORT_GRACE_MS); }),
               ]);
-              clearTimeout(graceTimer);
+              cancelGrace?.();
               if (!exitedInGrace) child.cancel();
             }
             const code = await child.exited;
@@ -9140,10 +9148,10 @@ export class GitCache {
       const reasons: Reason[] = ["invalid_identity", "unsafe_metadata", "ambiguous", "scan_limit",
         "target_changed", "ineligible", "cancelled", "deadline", "git_failure"];
       return { state: "retained", reason: input.signal?.aborted ? "cancelled" :
-        Date.now() >= deadline ? "deadline" : reasons.includes(message as Reason) ? message as Reason : "unsafe_metadata" };
+        clock.now() >= deadline ? "deadline" : reasons.includes(message as Reason) ? message as Reason : "unsafe_metadata" };
     } finally {
       if (!attemptSettled) { continuationCounted = true; this.abandonedPinContinuations += 1; }
-      clearTimeout(timer);
+      cancelTimer();
       input.signal?.removeEventListener("abort", abort);
       await Promise.all(activeChildren);
     }

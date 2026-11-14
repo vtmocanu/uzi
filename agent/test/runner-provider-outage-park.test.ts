@@ -1,4 +1,5 @@
 import { describe, it, type TestContext } from "node:test";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import assert from "node:assert/strict";
@@ -55,6 +56,12 @@ interface Scenario {
   clock?: ReturnType<typeof virtualBoundaryClock>;
   afterIdleReport?: () => Promise<void>;
   wrapIdleRefusal?: boolean;
+  /** Real heartbeat snapshot registry handed to the runner as `activeRuns`. */
+  activeRuns?: ActiveRunRegistry;
+  /** Runs inside the executor turn, after the work commit and before the provider error. */
+  duringTurn?: () => void;
+  /** Runs at the start of the recovery checkpoint publish (inside the capture region). */
+  beforePublish?: () => void;
 }
 
 interface Rig {
@@ -83,6 +90,7 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
     fs.writeFileSync(path.join(runHome, "session"), "transcript", "utf8");
     commitInTree(ctx.worktreePath, "WORK.txt", scenario.work ?? "work before the outage\n");
     for (let i = 0; i < (scenario.turns ?? 0); i++) await ctx.onModelTurnSettled?.(1);
+    scenario.duringTurn?.();
     thrown = true;
     throw error();
   };
@@ -141,6 +149,7 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
   }
   const runner = runnerWith(factory, gitlab, undefined, nullLogger(), {
     recovery: coord, recoveryRetryMs: 5,
+    ...(scenario.activeRuns ? { activeRuns: scenario.activeRuns } : {}),
     quiesceRun: async req => {
       if (harness !== "codex" || !scenario.failReap || req.site !== "recovery_provider_settle")
         return quiesceRunAttempt(req);
@@ -162,6 +171,12 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
       };
     },
   });
+  if (scenario.beforePublish) {
+    const hook = scenario.beforePublish;
+    const r = runner as unknown as { publishCheckpointBestEffort: (...a: unknown[]) => Promise<boolean> };
+    const publish = r.publishCheckpointBestEffort.bind(runner);
+    r.publishCheckpointBestEffort = (...a: unknown[]) => { hook(); return publish(...a); };
+  }
   if (harness === "codex" && scenario.failReap) {
     const settle = runner["settleCaptureRequest"].bind(runner);
     runner["settleCaptureRequest"] = async (...args) => {
@@ -1294,6 +1309,97 @@ describe("3506 dual marker provider wire precedence", () => {
       assert.ok(notices.some(text => text.startsWith("paused following silence after a provider-reported rate limit or transport retry;")));
       assert.ok(notices.some(text => text.includes(scenario.held ? "waits for its owner to resume it" : "resumes automatically")));
       if (scenario.held) assert.ok(!notices.some(text => text.includes("resumes automatically")));
+    });
+  });
+});
+
+// Issue #3630. These tests prove ONLY the worker side, against the fake API: after a Codex recovery
+// "retained stop" (an unknown park ACK, or an expired capture episode) the worker drops the run from
+// the heartbeat active-run snapshot, so the server's missing-snapshot reconciliation can act. They do
+// not exercise that server-side reconciliation.
+describe("3630 retained stop leaves the heartbeat snapshot", () => {
+  const feature = "recovery_cause_codex_idle_stall_v1";
+  const listed = (registry: ActiveRunRegistry, runId: string) => registry.build().active.some(e => e.run_id === runId);
+
+  it("3630 unknown park ACK (disposition started, no ACK) drops the run from the snapshot", async t => {
+    await withHome(async home => {
+      client.protocolFeatures = ["claim_generation_fence", feature];
+      const clock = virtualBoundaryClock();
+      t.mock.method(Date, "now", clock.now);
+      const activeRuns = new ActiveRunRegistry();
+      const claim = gitlabClaim(36301, { claim_generation: 3 });
+      let hasDuringTurn: boolean | undefined, listedDuringTurn: boolean | undefined;
+      const rig = rigFor("codex", { clock, turns: 2, activeRuns,
+        error: () => new TransientRecoveryError("idle", { idleStallKind: "productive" }),
+        duringTurn: () => { hasDuringTurn = activeRuns.has(claim.run_id); listedDuringTurn = listed(activeRuns, claim.run_id); },
+      }, home);
+      let posts = 0;
+      const stop = api.dropStatesWhen(claim.run_id, body => body.recovery_cause === "codex_idle_stall" && ++posts > 1);
+      const spied = rig.runner as unknown as { newCaptureEpisode: (...a: unknown[]) => unknown; withCaptureDisposition: (...a: unknown[]) => unknown };
+      const episodeSpy = t.mock.method(spied, "newCaptureEpisode");
+      const dispositionSpy = t.mock.method(spied, "withCaptureDisposition");
+      api.afterPersistState(claim.run_id, body => body.recovery_cause === "codex_idle_stall", "drop");
+      t.mock.method(rig.runner as unknown as { waitRecoveryRetry: () => Promise<void> }, "waitRecoveryRetry",
+        async () => { clock.advance(130_000); });
+      try { await rig.runner.execute(claim); } finally { stop(); }
+
+      assert.equal(hasDuringTurn, true, "control: the run is registered during its turn");
+      assert.equal(listedDuringTurn, true, "control: the heartbeat snapshot lists the run during its turn");
+      // The retry loop ends because the held capture's healthy deadline passes, NOT because the
+      // episode deadline does: the join must reach its dispositionStarted arm, never the
+      // expired-episode arm.
+      assert.equal(episodeSpy.mock.callCount(), 1, "exactly one capture episode for the run");
+      // The first disposition runs inside the held capture region (persisted as the first park POST);
+      // the join must not re-enter a second, join-time disposition after the unknown ACK.
+      assert.equal(dispositionSpy.mock.callCount(), 0, "no join-time disposition after the unknown ACK");
+      const episode = episodeSpy.mock.calls[0]!.result as { healthyDeadlineAt: number; deadlineAt: number };
+      const joinedAt = clock.now();
+      assert.ok(episode.healthyDeadlineAt <= joinedAt && joinedAt < episode.deadlineAt,
+        `join must occur after the healthy deadline and before the episode deadline (elapsed ${joinedAt - episode.healthyDeadlineAt}ms past healthy, ${episode.deadlineAt - joinedAt}ms before deadline)`);
+      assert.equal(posts, 3, "one logical park disposition, retained by every bounded client attempt");
+      assert.equal(parks(claim.run_id).length, 1, "at most one applied park");
+      assert.equal(activeRuns.has(claim.run_id), false);
+      assert.equal(listed(activeRuns, claim.run_id), false, "the snapshot omits the retained-stop run");
+      assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed"].includes(s.body.status ?? "")));
+      const settledStates = api.states.length;
+      clock.advance(240_000);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(api.states.length, settledStates, "no further capture or report after the client attempts end");
+      assert.equal(posts, 3);
+    });
+  });
+
+  it("3630 expired capture episode before any disposition drops the run from the snapshot", async t => {
+    await withHome(async home => {
+      client.protocolFeatures = ["claim_generation_fence", feature];
+      const clock = virtualBoundaryClock();
+      t.mock.method(Date, "now", clock.now);
+      const activeRuns = new ActiveRunRegistry();
+      const claim = gitlabClaim(36302, { claim_generation: 3 });
+      let listedDuringTurn: boolean | undefined, advanced = false;
+      const rig = rigFor("codex", { clock, turns: 2, activeRuns,
+        error: () => new TransientRecoveryError("idle", { idleStallKind: "productive" }),
+        duringTurn: () => { listedDuringTurn = listed(activeRuns, claim.run_id); },
+        // Local capture is verified; the episode deadline passes before any park disposition starts.
+        beforePublish: () => { if (!advanced) { advanced = true; clock.advance(240_000); } },
+      }, home);
+      const spied = rig.runner as unknown as { newCaptureEpisode: (...a: unknown[]) => unknown; withCaptureDisposition: (...a: unknown[]) => unknown };
+      const episodeSpy = t.mock.method(spied, "newCaptureEpisode");
+      const dispositionSpy = t.mock.method(spied, "withCaptureDisposition");
+      await rig.runner.execute(claim);
+
+      assert.equal(advanced, true, "the clock was advanced inside the capture region");
+      assert.equal(episodeSpy.mock.callCount(), 1, "exactly one capture episode for the run (no renewed episode)");
+      assert.equal(dispositionSpy.mock.callCount(), 0, "no park disposition was attempted");
+      assert.equal(listedDuringTurn, true, "control: the heartbeat snapshot lists the run during its turn");
+      assert.equal(parks(claim.run_id).length, 0, "no park disposition was started");
+      assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed"].includes(s.body.status ?? "")));
+      assert.equal(activeRuns.has(claim.run_id), false);
+      assert.equal(listed(activeRuns, claim.run_id), false, "the snapshot omits the expired-episode run");
+      const settledStates = api.states.length;
+      clock.advance(240_000);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(api.states.length, settledStates, "no renewed capture or report episode");
     });
   });
 });

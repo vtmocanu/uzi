@@ -29,6 +29,12 @@ if [ "${1:-}" = repo ] && [ "${2:-}" = view ]; then
   exit 0
 fi
 if [ "${1:-}" = api ]; then
+  # Diagnostic quota reads are not commit-resolution attempts and must not advance
+  # the transient-resolution fixture's counter.
+  if [ "${2:-}" = rate_limit ]; then
+    echo '{"resources":{"core":{"limit":5000,"remaining":10,"reset":2000000010},"graphql":{"limit":5000,"remaining":10,"reset":2000000020}}}'
+    exit 0
+  fi
   [ "$MODE" != missing ] || exit 1
   if [ "$MODE" = resolve-transient ]; then
     n=0; [ -f "$API_COUNT" ] && n=$(cat "$API_COUNT")
@@ -311,10 +317,11 @@ bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2 > "
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "one transient commit-resolution failure did not recover, rc=$rc: $(cat "$WORK/resolve-transient.out")"
-[ "$(grep -c '^api ' "$CALLS")" -eq 2 ] || fail "commit resolution did not make exactly two attempts: $(cat "$CALLS")"
+[ "$(grep -c '^api repos/test/repo/commits/' "$CALLS")" -eq 2 ] || fail "commit resolution did not make exactly two attempts: $(cat "$CALLS")"
 grep -Fq 'retrying in 2s' "$WORK/resolve-transient.out" \
   || fail "transient commit-resolution failure did not announce its retry: $(cat "$WORK/resolve-transient.out")"
 grep -q '^run list ' "$CALLS" || fail "resolved SHA never entered the polling loop"
+[ "$(grep -c '^api rate_limit$' "$CALLS")" -eq 1 ] || fail "transient failure missing its one quota diagnosis"
 
 : > "$CALLS"
 MODE=missing; export MODE
@@ -325,8 +332,9 @@ set -e
 [ "$rc" -eq 3 ] || fail "unknown full SHA did not fail fast with exit 3, rc=$rc: $(cat "$WORK/missing.out")"
 grep -Fq "did not resolve to a commit" "$WORK/missing.out" \
   || fail "unknown full SHA omitted the resolution error: $(cat "$WORK/missing.out")"
-[ "$(grep -c '^api ' "$CALLS")" -eq 2 ] || fail "unknown full SHA did not exhaust exactly two resolution attempts: $(cat "$CALLS")"
+[ "$(grep -c '^api repos/test/repo/commits/' "$CALLS")" -eq 2 ] || fail "unknown full SHA did not exhaust exactly two resolution attempts: $(cat "$CALLS")"
 if grep -q '^run list ' "$CALLS"; then fail "unknown full SHA entered the polling loop"; fi
+[ "$(grep -c '^api rate_limit$' "$CALLS")" -eq 2 ] || fail "failed resolutions missing their quota diagnoses"
 
 : > "$CALLS"
 set +e

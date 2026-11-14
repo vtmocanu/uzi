@@ -650,9 +650,12 @@ A few worth knowing:
   contract and cannot fix a commit-history publication hold. A separately
   approved milestone reconciliation reset can replace the contract and
   clear ceilings/decisions, but preserves stored non-closing intent.
-  For unpublished history without Stop, use continue with SHA-specific
-  guidance for the lead to reword its own unpublished commits. For published
-  history or Stop, cancel and manually deliver
+  Without Stop, use continue with SHA-specific guidance for the lead to
+  reword its own commits only when no offending commit (including any the
+  feed only counts beyond its listed SHAs) is reachable from the run branch
+  on the forge or a published checkpoint ref. Otherwise, or with Stop,
+  continue cannot clear the hold: finalize restores published commits as
+  ancestors. Cancel and manually deliver
   [preserved work](run-recovery.md#completion-publication-holds).
   Ordinary answers, non-closing declarations and auto-approval waive no work.
   `--json` emits the resumed run object.

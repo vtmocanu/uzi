@@ -2050,6 +2050,8 @@ export function composeHistoryRewrittenReason(publishedTip: string): string {
  * pointer to where retained work, if any, is listed (held publication, ADR-2545, then recovery),
  * without claiming the work exists. The terminal `failure_reason` is composed separately and never
  * carries the pointer. A run id that is not a UUID is shown as `<run-id>`. Exported for a direct test.
+ * Issue #4268: the held closing route is fixed text (no commit text); continue applies only when no
+ * offending commit is reachable from published history, which the finalize bridge re-parents back.
  */
 export function composePrepushRefusalStatus(
   kind: "closing" | "unknown" | "context", failureReason: string, holdEligible: boolean,
@@ -2059,7 +2061,7 @@ export function composePrepushRefusalStatus(
     ? holdEligible
       ? "Completion state could not be confirmed before push; the run is held for the owner."
       : "Completion state could not be confirmed before push; publication stopped."
-    : `${failureReason}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history.${holdEligible ? " For unpublished history on a run without a Stop, choose continue with guidance for the lead to reword its own commits; for published history or a Stop, cancel and deliver the preserved work with corrected messages." : ""}`;
+    : `${failureReason}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history.${holdEligible ? " Continue with guidance naming the SHAs for the lead to reword its own commits only if no offending commit, including any counted as more, is reachable from the run branch as published on the forge or from a published checkpoint ref (see uzi run recovery); when some are only counted, the listed SHAs alone cannot show that. Otherwise, or with a Stop, cancel and deliver the preserved work with corrected messages: finalize restores published commits as ancestors, so continue cannot clear the hold." : ""}`;
   if (!refresh) return text;
   const id = RUN_ID_RE.test(runId) ? runId : "<run-id>";
   return `${text}${text.endsWith(".") ? " " : ". "}Retained work, if any, is listed by uzi run held ${id} or uzi run recovery ${id}.`;
@@ -3420,6 +3422,11 @@ export interface RunnerOptions {
    *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. The finalize
    *  boundary uses its own deadline (`codexFinalizeBoundaryDeadlineMs`, issue #1900). */
   codexBoundaryDeadlineMs?: number;
+  /** TEST-ONLY (issue #4069): the worker-memory hold/closing budget (preparePreservation, the exhausted-allowance
+   *  hold, and the feedback batcher close). Defaults to `codexBoundaryDeadlineMs`; a test shortens it without also
+   *  bounding the unrelated launch remediation rounds that `codexBoundaryDeadlineMs` governs. A non-positive value
+   *  falls back to the default. */
+  memoryHoldDeadlineMs?: number;
   /** TEST-ONLY (issue #3980): shortens the 60s deadline `prepareGateCheckpoint` enforces on a Claude
    *  changed-plan gate checkpoint. A non-positive or non-finite value falls back to 60s. */
   gateCheckpointDeadlineMs?: number;
@@ -3656,6 +3663,8 @@ export class RunRunner {
   private readonly heldSeamCancelObserveMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
+  /** issue #4069: see RunnerOptions.memoryHoldDeadlineMs. */
+  private readonly memoryHoldDeadlineMs: number;
   private readonly gateCheckpointDeadlineMs: number;
   /** issue #2969: the predecessor FINAL pass budget (constants unless a test shortens them). */
   private readonly predecessorFinalBudget: { successorPrepAllowanceMs: number; actionCapMs: number; settlementMarginMs: number };
@@ -3959,6 +3968,10 @@ export class RunRunner {
     this.switchSupersedeWaitMs =
       typeof opts.switchSupersedeWaitMs === "number" && Number.isFinite(opts.switchSupersedeWaitMs) &&
       opts.switchSupersedeWaitMs >= 0 ? opts.switchSupersedeWaitMs : SWITCH_SUPERSEDE_WAIT_MS;
+    this.memoryHoldDeadlineMs =
+      opts.memoryHoldDeadlineMs && opts.memoryHoldDeadlineMs > 0
+        ? opts.memoryHoldDeadlineMs
+        : this.codexBoundaryDeadlineMs;
     this.gateCheckpointDeadlineMs =
       typeof opts.gateCheckpointDeadlineMs === "number" && Number.isFinite(opts.gateCheckpointDeadlineMs) &&
       opts.gateCheckpointDeadlineMs > 0 ? opts.gateCheckpointDeadlineMs : 60_000;
@@ -14059,7 +14072,7 @@ export class RunRunner {
         const memory = flight.workerMemory;
         if (memory && (memory.hold || memory.feedback.size)) {
           // Cleanup owns a fresh budget even when the feedback/capture deadline expired.
-          const deadline = Date.now() + this.codexBoundaryDeadlineMs;
+          const deadline = Date.now() + this.memoryHoldDeadlineMs;
           memory.closingDeadline = deadline;
           const expiry = AbortSignal.timeout(Math.max(0, deadline - Date.now()));
           const signal = args[0] ? AbortSignal.any([args[0], expiry]) : expiry;
@@ -26250,7 +26263,7 @@ export class RunRunner {
         if (captured.flight !== flight || memory.hold) return;
         this.retainWorkerMemoryCustody(flight);
         memory.hold = Object.freeze({ context: captured,
-          deadline: Date.now() + this.codexBoundaryDeadlineMs,
+          deadline: Date.now() + this.memoryHoldDeadlineMs,
           humanRevision: memory.revisionContext === captured,
           origin: this.memoryHoldOrigin(flight),
           interventionIds: Object.freeze([result.intervention_id]) });
@@ -26261,7 +26274,7 @@ export class RunRunner {
         await this.joinWorkerMemory(this.startWorkerMemoryPreservation(flight),
           Math.min(memory.hold.deadline, Date.now() + remainingMs), signal);
       },
-      preservationBudgetMs: this.codexBoundaryDeadlineMs,
+      preservationBudgetMs: this.memoryHoldDeadlineMs,
     });
     memory.context = context;
     // A persisted exhausted allowance has no new victim or outcome. Capture the
@@ -26269,7 +26282,7 @@ export class RunRunner {
     // original owner operation used by pressure-triggered preservation.
     if (runtime.commands.remaining(context) === 0) {
       this.retainWorkerMemoryCustody(flight);
-      memory.hold = Object.freeze({ context, deadline: Date.now() + this.codexBoundaryDeadlineMs,
+      memory.hold = Object.freeze({ context, deadline: Date.now() + this.memoryHoldDeadlineMs,
         humanRevision: memory.revisionContext === context, origin: this.memoryHoldOrigin(flight),
         interventionIds: Object.freeze([]) });
       this.retireWorkerMemory(flight);

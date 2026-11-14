@@ -55,6 +55,9 @@
 #  - A genuine `gh` failure (bad PR number, auth, no network) is not swallowed: it
 #    surfaces as ERROR and exits 3 (the documented usage/gh-error code), rather than
 #    masquerading as an empty read that retries to the timeout code 2.
+# GitHub quota handback (all modes): exit 12, RESULT=gh_rate_limited,
+# GH_RATE_LIMIT_RESOURCE/RESET/RESET_AT and GH_RETRY_AT (reset + 5s).
+# Re-arm after GH_RETRY_AT; this is never readiness or unknown-streak exhaustion.
 set -uo pipefail
 
 # Shared `gh pr checks` classifier — sourced (not copied) so a state-policy edit
@@ -62,6 +65,8 @@ set -uo pipefail
 _LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/pr-checks-classify.sh
 . "$_LIB_DIR/lib/pr-checks-classify.sh"
+# shellcheck source=lib/gh-ratelimit.sh
+. "$_LIB_DIR/lib/gh-ratelimit.sh"
 
 PRS=(); INTERVAL=120; MAX_TICKS=40; WAIT_CR=0
 while [ $# -gt 0 ]; do
@@ -121,9 +126,11 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
           exit 1
         fi
         echo "[tick $tick] #$pr: a fail cleared on re-query (stale read); continuing"
+        gh_rate_limit_stop
         all_green=0; line="$line #$pr:pending(re-query)"
         ;;
       ERROR)
+        gh_rate_limit_stop
         # A hard gh failure (its stderr was printed by pr_verdict). Confirm once so a
         # transient blip does not abort the whole batch watch, then exit 3.
         if [ "$(pr_verdict "$pr" | head -1)" = "ERROR" ]; then
