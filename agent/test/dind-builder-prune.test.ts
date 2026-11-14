@@ -957,30 +957,24 @@ describe("real child", () => {
 describe("builder-prune child fixture", () => {
   // Regression for the main CI flake (run 43631560241): the tests poll existsSync(stateFile)
   // and then JSON.parse it, so the fixture must never expose a created-but-unwritten file.
-  // The pause hook holds the fixture between creating and writing; a non-atomic write is
-  // then observed empty on every run, an atomic temp-file + rename never is.
+  // The gate holds the fixture after it has created its file and before it writes it; while
+  // it is held, a non-atomic write leaves an empty state file, an atomic one leaves none.
   it("never exposes a partially written state file", async () => {
-    const stateFile = join(scratch(), "state.json");
+    const dir = scratch();
+    const stateFile = join(dir, "state.json");
+    const gate = join(dir, "gate");
     const child = spawn(process.execPath, [CHILD, "env", stateFile], {
-      env: { ...process.env, DIND_PRUNE_FIXTURE_STATE_PAUSE_MS: "400" },
+      env: { ...process.env, DIND_PRUNE_FIXTURE_STATE_GATE: gate },
       stdio: "ignore",
     });
-    let exited = false;
-    const done = new Promise<void>((resolve) => child.on("exit", () => { exited = true; resolve(); }));
-    let partialReads = 0;
-    while (!exited) {
-      if (existsSync(stateFile)) {
-        try {
-          JSON.parse(readFileSync(stateFile, "utf8"));
-        } catch {
-          partialReads++;
-        }
-      }
-      await new Promise((r) => setTimeout(r, 5));
+    const done = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
+    try {
+      await waitFor(() => existsSync(`${gate}.opened`), "fixture holding its state write");
+      assert.equal(existsSync(stateFile), false, "state file visible before its content was written");
+    } finally {
+      writeFileSync(`${gate}.release`, "");
     }
-    await done;
-    assert.equal(child.exitCode, 0);
-    assert.equal(partialReads, 0, "state file was observed before its content was written");
+    assert.equal(await done, 0);
     assert.doesNotThrow(() => JSON.parse(readFileSync(stateFile, "utf8")));
   });
 });

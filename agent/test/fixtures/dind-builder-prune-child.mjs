@@ -20,20 +20,28 @@
 // {"child":pid,"grandchild":pid} to <stateFile> once the grandchild exists.
 
 import { spawn } from "node:child_process";
-import { appendFileSync, closeSync, openSync, renameSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, openSync, renameSync, writeFileSync } from "node:fs";
 
 const [mode, stateFile] = process.argv.slice(2);
 // The tests poll for the state file's existence and then parse it, so it must appear
 // complete: write a sibling temp file and rename it into place (atomic on one filesystem).
-// DIND_PRUNE_FIXTURE_STATE_PAUSE_MS (tests only) pauses between creating and writing the
-// file, widening the window a non-atomic write would expose.
-const statePauseMs = Number(process.env.DIND_PRUNE_FIXTURE_STATE_PAUSE_MS ?? 0);
+// DIND_PRUNE_FIXTURE_STATE_GATE=<path> (tests only) holds the write between creating and
+// filling the file: it touches <path>.opened, then waits for <path>.release (30 s cap).
+const stateGate = process.env.DIND_PRUNE_FIXTURE_STATE_GATE;
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const writeState = (value) => {
   const tmp = `${stateFile}.tmp-${process.pid}`;
   const fd = openSync(tmp, "wx");
-  if (statePauseMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, statePauseMs);
-  writeSync(fd, JSON.stringify(value));
-  closeSync(fd);
+  try {
+    if (stateGate) {
+      writeFileSync(`${stateGate}.opened`, "");
+      const deadline = Date.now() + 30_000;
+      while (!existsSync(`${stateGate}.release`) && Date.now() < deadline) sleepSync(10);
+    }
+    writeFileSync(fd, JSON.stringify(value));
+  } finally {
+    closeSync(fd);
+  }
   renameSync(tmp, stateFile);
 };
 if (stateFile) appendFileSync(`${stateFile}.spawns`, `${mode}\n`);
