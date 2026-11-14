@@ -55,6 +55,9 @@ func TestParseFormulaTag(t *testing.T) {
 		{"trailing rc suffix", formulaSrc("v1.2.3-rc.1.extra"), false, ""},
 		{"beta tag", formulaSrc("v1.2.3-beta.1"), false, ""},
 		{"no v prefix", formulaSrc("1.2.3"), false, ""},
+		{"second url after a lone CR", formulaSrc("v1.2.3") + "  desc \"x\"\r  url \"https://example.test/other.tar.gz\"\n", false, ""},
+		{"invalid utf-8", "# caf\xff\n" + formulaSrc("v1.2.3"), false, ""},
+		{"crlf line endings", strings.ReplaceAll(formulaSrc("v1.2.3"), "\n", "\r\n"), true, "v1.2.3"},
 		{"unicode-indented second url", formulaSrc("v1.2.3") + " url \"https://example.test/y\"\n", false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

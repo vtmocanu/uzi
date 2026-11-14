@@ -3,9 +3,14 @@ package releasecheck
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Port of scripts/brew-tap-guard.py. Formula source is read as text, never executed.
+//
+// Like the script's read_text(encoding="utf-8"), parseFormulaTag refuses invalid
+// UTF-8 and applies universal newlines (\r\n and a lone \r both end a line) before
+// matching, so a url line after a lone \r is counted as a line of its own.
 //
 // Deliberate divergence: Python's \s (str patterns) also matches \v, \x1c-\x1f,
 // \x85 and Unicode spaces, while RE2's \s is only [\t\n\f\r ]. spaceClass widens
@@ -26,6 +31,10 @@ var (
 // layout is ambiguous or the tag is not a strict stable or RC uzi tag. stableOnly
 // (the uzi-cli formula) additionally rejects an RC tag.
 func parseFormulaTag(src string, stableOnly bool) (string, bool) {
+	if !utf8.ValidString(src) {
+		return "", false
+	}
+	src = strings.ReplaceAll(strings.ReplaceAll(src, "\r\n", "\n"), "\r", "\n")
 	urls := formulaURLRe.FindAllStringSubmatch(src, -1)
 	if len(urls) != 1 ||
 		len(formulaAnyURL.FindAllStringIndex(src, -1)) != 1 ||
