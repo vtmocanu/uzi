@@ -315,3 +315,90 @@ test("a supposedly applied op whose stamp remains is held before B publication",
   assert.equal((await coordinateCodexSwitch(f.o)).kind, "codex_owner_paused");
   assert.ok(!f.events.includes("register") && !f.events.includes("root"));
 });
+
+
+for (const change of ["pending", "owned", "nonce", "generation"] as const)
+  test("clear response reconciles " + change + " before any A turn", async () => {
+    const f = fixture();
+    f.o.preflight.probe = async p => p.opId === "op"
+      ? { kind: "not_applied", reason: "vault_locked", ...p } : { kind: "ready", ...p };
+    f.o.preflight.confirmFailedClear = async () => {
+      f.authority.pending = change === "pending" ? { ...f.o.initial, opId: "new", revision: 2 } : undefined;
+      if (change === "owned") f.authority.owned = false;
+      if (change === "nonce") f.authority.registerNonce = "new-nonce";
+      if (change === "generation") f.authority.claimGeneration++;
+      return true;
+    };
+    assert.equal((await coordinateCodexSwitch(f.o)).kind, change === "pending" ? "codex_resumed_B" : "codex_fenced");
+    assert.ok(!f.events.includes("A"));
+    assert.deepEqual([...f.journal], change === "pending" ? ["new"] : []);
+  });
+
+for (const barrier of ["before-teardown", "after-teardown", "after-clear"] as const)
+  test("successors share ten second budget at " + barrier, async () => {
+    const f = fixture(); let time = 0; let reads = 0;
+    const deadlines: number[] = [];
+    f.o.now = () => time;
+    const successor = () => { f.authority.pending = { ...f.o.initial, opId: "new", revision: 2 }; };
+    const reconcile = f.o.reconcile;
+    f.o.reconcile = async b => {
+      if (++reads === 4 && barrier === "before-teardown") successor();
+      return reconcile(b);
+    };
+    f.o.teardown = async () => {
+      f.events.push("reap");
+      if (barrier === "after-teardown") successor();
+      return true;
+    };
+    f.o.preflight.confirmFailedClear = async () => { successor(); return true; };
+    f.o.preflight.probe = async (p, b) => {
+      deadlines.push(b.deadline);
+      if (p.opId === "op") {
+        time += 9000;
+        return barrier === "after-clear" ? { kind: "not_applied", reason: "vault_locked", ...p } : { kind: "ready", ...p };
+      }
+      assert.equal(b.deadline - time, 1000);
+      time += 1000;
+      b.signal.throwIfAborted();
+      if (time >= b.deadline) throw new Error("deadline");
+      return { kind: "ready", ...p };
+    };
+    assert.equal((await coordinateCodexSwitch(f.o)).kind,
+      barrier === "after-teardown" ? "codex_owner_paused" : "codex_retained_stop");
+    assert.deepEqual(deadlines, [10000, 10000]);
+    assert.equal(time, 10000);
+    assert.equal(f.events.includes("reap"), barrier === "after-teardown");
+    assert.ok(!f.events.includes("A") && !f.events.includes("apply"));
+    if (barrier === "after-teardown") assert.equal(f.holds[0]?.opId, "new");
+  });
+
+for (const mode of ["transport", "busy", "clear-transport"] as const)
+  test("shared budget preserves bounded " + mode + " retries", async () => {
+    const f = fixture(); let time = 0; let probes = 0; let clears = 0;
+    f.o.now = () => time;
+    f.o.preflight.delay = async (ms, b) => {
+      assert.equal(b.deadline, 10000); time += ms;
+    };
+    f.o.preflight.probe = async (p, b) => {
+      assert.equal(b.deadline, 10000); probes++;
+      if (mode === "transport") throw Error("transport");
+      return { kind: "not_applied", reason: mode === "busy" ? "credential_busy" : "vault_locked", ...p };
+    };
+    f.o.preflight.confirmFailedClear = async (_p, _r, b) => {
+      assert.equal(b.deadline, 10000); clears++;
+      throw Error("clear transport");
+    };
+    assert.equal((await coordinateCodexSwitch(f.o)).kind, "codex_retained_stop");
+    assert.equal(probes, mode === "transport" ? 3 : mode === "busy" ? 6 : 1);
+    assert.equal(clears, mode === "transport" ? 0 : 1);
+    assert.ok(time <= 10000);
+    assert.ok(!f.events.includes("reap") && !f.events.includes("apply") && !f.events.includes("A"));
+  });
+
+test("deadline exhausted by old probe retains A before teardown", async () => {
+  const f = fixture(); let time = 0;
+  f.o.now = () => time;
+  f.o.preflight.probe = async p => { time = 10000; return { kind: "ready", ...p }; };
+  assert.equal((await coordinateCodexSwitch(f.o)).kind, "codex_retained_stop");
+  assert.ok(!f.events.includes("reap") && !f.events.includes("apply") && !f.events.includes("A"));
+});

@@ -32,6 +32,7 @@ export interface CodexSwitchCoordinatorOptions {
   /** Must positively attest a credential-free, usable rollout, never a partial write. */
   persistRollout(bounds: SwitchBounds): Promise<{ kind: "usable"; sessionId: string } | { kind: "failed" }>;
   drainAndSuspend(bounds: SwitchBounds): Promise<void>;
+  /** Recheck bounds.guard() immediately before reopening A and after any awaited effect. */
   reopenA(operation: CodexSwitchOperation, bounds: SwitchBounds): Promise<void>;
   /** True only after root AND descendants are proven reaped. */
   teardown(bounds: SwitchBounds): Promise<boolean>;
@@ -117,6 +118,7 @@ export async function coordinateCodexSwitch(o: CodexSwitchCoordinatorOptions): P
       await call(() => o.reopenA(current, b));
       return outcome("codex_continued_A");
     }
+    const preDeadline = Math.min(o.deadline, o.now() + 10_000);
     const seen = new Set([current.opId]);
     // Serial successors share the same deadline and sticky teardown proof. No sibling work.
     for (let attempts = 0; attempts < 32; attempts++) {
@@ -128,7 +130,6 @@ export async function coordinateCodexSwitch(o: CodexSwitchCoordinatorOptions): P
       }
       if (!a.routeAvailable || !a.ledgerAvailable)
         return teardownBegan ? await pause() : outcome("codex_retained_stop");
-      const preDeadline = Math.min(o.deadline, o.now() + 10_000);
       const pb: SwitchBounds = { signal: o.signal, deadline: preDeadline, guard() {
         b.guard(); if (o.now() >= preDeadline) throw new Error("stopped");
       } };
@@ -149,6 +150,9 @@ export async function coordinateCodexSwitch(o: CodexSwitchCoordinatorOptions): P
       if (pre.kind === "continued_A") {
         if (teardownBegan) return await pause();
         current = Object.freeze({ ...pre.operation });
+        const afterClear = await authority();
+        // Keep A gated while the loop validates any successor against current.
+        if (afterClear.pending !== undefined) continue;
         await call(() => o.reopenA(current, b));
         return outcome("codex_continued_A");
       }
