@@ -154,6 +154,33 @@ func TestClaimRunOverrideEffortBeatsRuntimeAndUnsetClaudeLiveDB(t *testing.T) {
 	}
 }
 
+// TestClaimRunOverrideEffortAcrossRequeueToRuntimeClaudeLiveDB: a frozen xhigh survives the owner
+// switching to `runtime` between a requeue and the reclaim, while a sibling without a frozen effort
+// follows the switch (no default_effort key at all).
+func TestClaimRunOverrideEffortAcrossRequeueToRuntimeClaudeLiveDB(t *testing.T) {
+	fx := newCDFix(t)
+	fx.env.exec(`UPDATE users SET default_effort = 'low' WHERE id = $1`, fx.userID)
+	frozen := fx.queuedRun(t, "issue")
+	setRunStartOptions(fx.env, frozen, nil, nil, "xhigh", "run_override")
+	requireEffort(t, fx.claimPayload(t), "xhigh", "run_override")
+
+	fx.env.exec(`UPDATE users SET default_effort = 'runtime' WHERE id = $1`, fx.userID)
+	requeueClaimed(fx.env, frozen)
+	p := fx.claimPayload(t)
+	if p.RunID != frozen.String() {
+		t.Fatalf("reclaimed %s, want %s", p.RunID, frozen)
+	}
+	requireEffort(t, p, "xhigh", "run_override")
+
+	fx.env.exec(`UPDATE runs SET status = 'cancelled', status_since = now(), finished_at = now() WHERE id = $1`, frozen)
+	sibling := fx.queuedRun(t, "issue")
+	p = fx.claimPayload(t)
+	if p.RunID != sibling.String() {
+		t.Fatalf("claimed %s, want the sibling %s", p.RunID, sibling)
+	}
+	requireNoDefaultEffortKey(t, "unfrozen sibling", p.Config)
+}
+
 // TestClaimIncompatibleSchedulePinStillFallsBackLiveDB: the schedule-pin lane is unchanged: an
 // incompatible pin falls back to the lane with the visible note and the lane's own source.
 func TestClaimIncompatibleSchedulePinStillFallsBackLiveDB(t *testing.T) {
@@ -281,6 +308,37 @@ func TestClaimRunOverrideCodexLiveDB(t *testing.T) {
 			t.Fatalf("default_model = %v / %v", deref(p.Config.DefaultModel), deref(p.Config.DefaultModelSource))
 		}
 	})
+	t.Run("frozen effort beats runtime and survives a change across requeue", func(t *testing.T) {
+		env := setupCodexLiveDB(t)
+		fx := newCodexClaimFix(t, env, false)
+		env.exec(`UPDATE users SET default_codex_effort = 'runtime' WHERE id = $1`, fx.userID)
+		setRunStartOptions(env, fx.runID, nil, nil, "xhigh", "run_override")
+		p, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), nil)
+		if err != nil || p == nil {
+			t.Fatalf("Claim = (%v, %v)", p != nil, err)
+		}
+		requireEffort(t, p, "xhigh", "run_override")
+
+		env.exec(`UPDATE users SET default_codex_effort = 'low' WHERE id = $1`, fx.userID)
+		requeueClaimed(env, fx.runID)
+		p, err = fx.svc.Claim(env.ctx, fx.claimant(t, true), nil)
+		if err != nil || p == nil || p.RunID != fx.runID.String() {
+			t.Fatalf("reclaim = (%v, %v), want the same run", p != nil, err)
+		}
+		requireEffort(t, p, "xhigh", "run_override")
+
+		// A sibling run without a frozen effort follows the owner's changed setting.
+		env.exec(`UPDATE runs SET status = 'cancelled', status_since = now(), finished_at = now() WHERE id = $1`, fx.runID)
+		sibling := env.seedCodexRun(t, fx.userID, fx.workerB, fx.repoID)
+		if err := fx.svc.FreezeCodexBinding(env.ctx, fx.userID, sibling, fx.aliasID, codexAuthModeSubscription); err != nil {
+			t.Fatalf("FreezeCodexBinding: %v", err)
+		}
+		sp, err := fx.svc.assembleClaim(env.ctx, fx.claimant(t, true), mustRun(t, env, sibling))
+		if err != nil {
+			t.Fatal(err)
+		}
+		requireEffort(t, sp, "low", "user_default")
+	})
 	for _, tc := range []struct {
 		name, setting, value string
 		model, effort        any
@@ -314,6 +372,11 @@ func TestClaimRunOverrideCodexLiveDB(t *testing.T) {
 			if r.Status != "queued" || r.WorkerID.Valid || r.HoldReason.String != HoldReasonRunOverrideUnavailable {
 				t.Fatalf("resumed: status=%s worker=%v hold=%v", r.Status, r.WorkerID, r.HoldReason)
 			}
+			// The next claim parks it again with a second message.
+			if p, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), nil); err != nil || p != nil {
+				t.Fatalf("reclaim = (%v, %v), want an idle claim", p != nil, err)
+			}
+			requireOverrideHeld(t, env, fx.runID, fx.workerB, 2, tc.setting, tc.value)
 		})
 	}
 }
