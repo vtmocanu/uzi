@@ -752,6 +752,35 @@ describe("IssueView Start gate (PRD #764)", () => {
     expect(screen.getAllByRole("alert")).toHaveLength(1);
   });
 
+  // The issue can be closed on the forge, or lose its uzi label, after the page loaded.
+  // A Start from the dialog is then refused, and the settle reload returns the issue
+  // closed or ineligible: the dialog must stay mounted (Board's rule) so the refusal is
+  // seen there, with the choices kept, rather than vanishing with the Options button.
+  it.each([
+    ["closed", { closed: true, state: "closed" }],
+    ["ineligible", { labels: ["documentation"] }],
+  ] as const)("a refusal stays visible in the dialog when the reload returns the issue %s", async (_name, after) => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue
+      .mockResolvedValueOnce({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) })
+      .mockResolvedValue({ issue: anIssue({ ...after, has_prd_link: false } as Partial<IssueDetail>) });
+    const text = "issue #7 is not uzi's to run: it is closed or no longer carries the uzi label";
+    mockApi.createRun.mockRejectedValueOnce(new ApiError(422, text));
+    renderIssueView();
+
+    const { dialog } = await openOptions();
+    fireEvent.change(within(dialog).getByLabelText("Reasoning effort"), { target: { value: "xhigh" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start run" }));
+    // The settle reload has landed: the page no longer offers Start or Options.
+    await waitFor(() => expect(mockApi.getIssue).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Run options for #7" })).toBeNull());
+    const still = screen.getByRole("dialog", { name: "Run options for #7" });
+    expect(within(still).getByRole("alert").textContent).toBe(text);
+    expect((within(still).getByLabelText("Reasoning effort") as HTMLSelectElement).value).toBe("xhigh");
+  });
+
   // Issue #856 M3: a completed prior run that still owns an open MR makes the
   // server refuse a fresh run with a coded 409 (issue_has_open_mr). Start catches
   // it, confirms (the message names the MR), and retries with force on confirm.

@@ -44,8 +44,9 @@ const MODEL_MAX_BYTES = 100;
 // (it answers 400 or 422 and the dialog shows that text), but these are the refusals a
 // person can see coming: an empty or whitespace-bearing "Other" entry (the server does not
 // trim a start-time model), a control or format character, a model over the byte bound,
-// a Codex role model on Claude (C's guard), and a non-curated model on Codex.
-function modelProblem(model: string, custom: boolean, harness: Harness): string {
+// a Codex role model on Claude (C's guard), and a non-curated model on Codex. The "start
+// the run on Codex" remedy is offered only when the Harness row is shown (canSwitchHarness).
+function modelProblem(model: string, custom: boolean, harness: Harness, canSwitchHarness: boolean): string {
   if (model === "") return custom ? "Enter a model ID, or choose Default." : "";
   if (/\s/u.test(model)) return "A model ID is a single word with no spaces.";
   const shape = modelFieldWarning(model);
@@ -54,7 +55,9 @@ function modelProblem(model: string, custom: boolean, harness: Harness): string 
     return `Model is too long (max ${MODEL_MAX_BYTES} bytes); use a shorter alias or model ID.`;
   }
   if (harness === "claude" && CODEX_ROLE_MODELS.includes(model)) {
-    return `${model} is a Codex model. Choose a Claude model, or start the run on Codex.`;
+    return canSwitchHarness
+      ? `${model} is a Codex model. Choose a Claude model, or start the run on Codex.`
+      : `${model} is a Codex model. Choose a Claude model.`;
   }
   if (harness === "codex" && !CODEX_CURATED_MODELS.includes(model)) {
     return `${model} is not a Codex model. Choose one from the list, or Default.`;
@@ -116,7 +119,7 @@ export function RunOptionsDialog({
 
   const rows = startRunRows(options, facts);
   const startGate = gate(rows.harness);
-  const modelError = modelProblem(options.model, modelCustom, rows.effectiveHarness);
+  const modelError = modelProblem(options.model, modelCustom, rows.effectiveHarness, rows.showHarness);
   const canStart = startGate.enabled && modelError === "" && !submitting;
 
   const patch = (next: Partial<RunStartOptions>) => setOptions((prev) => ({ ...prev, ...next }));

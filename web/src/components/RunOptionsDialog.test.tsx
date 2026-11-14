@@ -141,10 +141,20 @@ describe("RunOptionsDialog model entry", () => {
   });
 
   it.each(CODEX_ROLE_MODELS)("a Codex role id (%s) in Claude's Other disables Start run", (id) => {
-    const { dialog } = mount();
+    const { dialog } = mount({ facts: BOTH });
     chooseOther(dialog, id);
     expect(startButton(dialog).disabled).toBe(true);
     expect(within(dialog).getByText(`${id} is a Codex model. Choose a Claude model, or start the run on Codex.`)).toBeTruthy();
+  });
+
+  it("Claude-only (no Harness row): the Codex-id error offers no impossible switch to Codex", () => {
+    const id = CODEX_ROLE_MODELS[0];
+    const { dialog } = mount({ facts: CLAUDE_ONLY });
+    expect(field(dialog, "Harness")).toBeNull();
+    chooseOther(dialog, id);
+    expect(startButton(dialog).disabled).toBe(true);
+    expect(within(dialog).getByText(`${id} is a Codex model. Choose a Claude model.`)).toBeTruthy();
+    expect(within(dialog).queryByText(/start the run on Codex/)).toBeNull();
   });
 
   it("a well-formed custom Claude id starts with that exact value", () => {

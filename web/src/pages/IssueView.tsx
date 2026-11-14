@@ -439,7 +439,12 @@ export function IssueView() {
               {!gate.enabled && <p className="mt-1 text-xs text-faint">{gate.reason}</p>}
             </div>
           )}
-          {optionsOpen && issue && !issue.closed && isEligible && (
+          {/* Mounted on the open flag alone (Board's rule), not on closed/eligible: the
+              Options button above is offered only under the start gate, but a refused
+              Start reloads the issue, and if it came back closed or ineligible a stricter
+              mount would unmount the dialog with the refusal unseen. The dialog's own gate
+              and the server refusal explain the reason inside it, choices kept. */}
+          {optionsOpen && issue && (
             <RunOptionsDialog
               key={issue.iid}
               issueIid={issue.iid}
