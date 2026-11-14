@@ -12303,7 +12303,8 @@ export class GitCache {
    * shape stage (Node bytes, before anything is charged) and again by the object-store topology (Git's own parse)
    * before the worktree stage starts, and every file of it is re-checked at its end.
    */
-  private async automaticContentPreserved(epoch: EpochDiscardProofState): Promise<boolean> {
+  private async automaticContentPreserved(epoch: EpochDiscardProofState,
+    out?: { head?: string; trackedPaths?: Set<string> }): Promise<boolean> {
     const automatic: AutomaticPreservation = { roots: [], checkLive: () => this.checkEpochDiscardLive(epoch) };
     const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
     const cwd = epoch.paths[0]!;
@@ -12377,10 +12378,75 @@ export class GitCache {
         await read(() => fs.realpath(cwd)) === cwd;
       if (stillReal) await ownGitDir();
       await automatic.finalStoreCheck?.();
+      // Read-only callers (proveEpochWorktreeContent) ask for what the proof established: the HEAD it verified
+      // and the index paths it hashed. Written only on success, so a refusal leaves `out` empty.
+      if (stillReal && out && automatic.shape) {
+        out.head = head;
+        out.trackedPaths = new Set(automatic.shape.index.entries.map(entry => entry.path.toString("latin1")));
+      }
       return stillReal;
     } catch (error) {
       if (error instanceof AutomaticCompletenessUnknown) throw error;
       return false;
+    }
+  }
+
+  /**
+   * Read-only exposure of {@link automaticContentPreserved} for the hibernation census (PRD #4208): the very same
+   * proof, run under the very same epoch limits and native read scope, that never trusts the index stat cache and
+   * refuses assume-valid, skip-worktree and every other index flag. It mutates nothing and mints no discard
+   * authority; the caller owns the exclusive reclaim scope it passes in.
+   *
+   * `proven` is the proof's verdict. When it is true and the clone is present, `head` is the HEAD that the proof
+   * verified and `trackedPaths` the raw index paths it hashed (each decoded as latin1, one character per byte, so a
+   * caller keying a lstat walk the same way compares exactly). A refusal, an exceeded bound or an unaccounted-for
+   * indirection input is `proven: false` with a fixed `reason`; an aborted signal, an exhausted deadline or a
+   * lost exclusion is thrown, never reported as a verdict.
+   */
+  async proveEpochWorktreeContent(input: {
+    scope: PodEpochReclaimScope;
+    barePath: string;
+    selector: RetainedSourceSelector;
+    clonePath: string;
+    signal: AbortSignal;
+    deadline: number;
+    checkLive?: () => void;
+  }): Promise<{ proven: boolean; trackedPaths: Set<string> | null; head: string | null;
+    reason?: "invalid_input" | "content_unproven" | "completeness_unknown" }> {
+    const unproven = (reason: "invalid_input" | "content_unproven" | "completeness_unknown") =>
+      ({ proven: false, trackedPaths: null, head: null, reason });
+    const scope = input.scope;
+    if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped", "assertSettled", "finish"]
+      .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function")) return unproven("invalid_input");
+    if (typeof input.selector?.runId !== "string" || !/^[A-Za-z0-9_-]{1,160}$/.test(input.selector.runId) ||
+        typeof input.barePath !== "string" || !path.isAbsolute(input.barePath) || path.resolve(input.barePath) !== input.barePath ||
+        typeof input.clonePath !== "string" || !path.isAbsolute(input.clonePath) || path.resolve(input.clonePath) !== input.clonePath ||
+        !(input.signal instanceof AbortSignal) || !Number.isFinite(input.deadline) || input.deadline <= Date.now())
+      return unproven("invalid_input");
+    const state: EpochDiscardProofState = Object.freeze({
+      selector: Object.freeze({ runId: input.selector.runId, generation: input.selector.generation, attempt: input.selector.attempt }),
+      barePath: input.barePath, paths: Object.freeze([input.clonePath]), confirm: "0".repeat(64),
+      expectedRawJournal: Object.freeze([""]), scope, checkLive: input.checkLive ?? (() => {}),
+      beforeEffect: async () => { throw new Error("read-only worktree proof has no effect"); },
+      signal: input.signal, deadline: input.deadline,
+    });
+    this.checkEpochDiscardLive(state);
+    const proof = Object.freeze({}) as EpochDiscardProof;
+    this.epochDiscardProofs.set(proof, state);
+    const out: { head?: string; trackedPaths?: Set<string> } = {};
+    try {
+      const verdict = await this.epochRetained.run(this.epochLimits(), () =>
+        this.withEpochNativeReads(proof, () => this.automaticContentPreserved(state, out)));
+      // The proof turns every failure, an abort or the deadline included, into false: a lost exclusion or an
+      // expired deadline is an error for the caller, not a verdict about the clone.
+      this.checkEpochDiscardLive(state);
+      if (!verdict) return unproven("content_unproven");
+      return { proven: true, trackedPaths: out.trackedPaths ?? null, head: out.head ?? null };
+    } catch (error) {
+      if (error instanceof AutomaticCompletenessUnknown) return unproven("completeness_unknown");
+      throw error;
+    } finally {
+      this.epochDiscardProofs.delete(proof);
     }
   }
 

@@ -132,7 +132,7 @@ export interface ExclusionFinalRequest extends IdentityEcho {
   fingerprint: string;
 }
 
-// ---- census interface (U4b implements it) ------------------------------------------------------
+// ---- census interface (implemented in hibernation-census.ts) ------------------------------------------------------
 
 export interface CensusResult {
   complete: boolean;
@@ -145,12 +145,6 @@ export interface CensusResult {
 export type HibernationCensus = (opts: { signal: AbortSignal; deadlineMs: number }) => Promise<CensusResult>;
 export type HibernationFingerprint = (opts: { signal?: AbortSignal; deadlineMs: number }) =>
   Promise<{ digest: string; fingerprint: string }>;
-
-/** Placeholder census until the volume census lands: it can never report a complete inventory. */
-export const notImplementedCensus: HibernationCensus = async () => ({
-  complete: false, entries: [], fingerprint: "", digest: "", docker: null, uncovered: ["census_not_implemented"],
-});
-export const notImplementedFingerprint: HibernationFingerprint = async () => ({ digest: "", fingerprint: "" });
 
 // ---- decoding -----------------------------------------------------------------------------------
 

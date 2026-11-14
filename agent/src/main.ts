@@ -9,8 +9,10 @@ import { AuthorityRuntime } from "./authority-runtime.js";
 import { createLogger, type Logger } from "./log.js";
 import { startMainWatchdog } from "./main-watchdog.js";
 import {
-  hibernationWriters, HibernationInventoryController, notImplementedCensus, notImplementedFingerprint,
+  hibernationWriters, HibernationInventoryController,
 } from "./hibernation-inventory.js";
+import { createHibernationCensus } from "./hibernation-census.js";
+import { scratchLayout } from "./pod-epoch-scratch.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { WorkerClient, RequestError } from "./client.js";
@@ -966,8 +968,9 @@ async function mainBody(): Promise<void> {
   // The job lane (PRD #1908 M4): a slim runner for `job` claims, the repo-less run kind. Its
   // per-run workspaces live under `<dataDir>/jobs`, outside the clone and attempt roots. Under
   // UZI_E2E_EXECUTOR=stub the model call is the stub job queryFn (no live Anthropic).
+  const jobsRoot = path.join(config.dataDir, "jobs");
   const jobRunner = new JobRunner(client, log, {
-    jobsRoot: path.join(config.dataDir, "jobs"),
+    jobsRoot,
     secretPaths: workerSecretDenyPaths(config.workerTokenFile),
     joinToken: config.workerToken,
     activeRuns,
@@ -1105,6 +1108,17 @@ async function mainBody(): Promise<void> {
   // supported mode. Its presence is what advertises `hibernation_inventory_v1`. The census and the
   // fingerprint are the volume census seam: until it lands the census can never be complete.
   if (hibernationParticipates(config, epochOwnership?.mode)) {
+    // The volume census (hibernation-census.ts): top-level names come from the same config the writers use, the worker's
+    // own TMPDIR is the one live directory the fingerprint does not walk, and the scratch root is the shipped layout's.
+    const scratch = scratchLayout(process.env);
+    const volumeCensus = createHibernationCensus({
+      dataDir: config.dataDir,
+      layout: { outbox: path.basename(config.outboxDataDir), agentHome: path.basename(sdkHomeRoot), jobs: path.basename(jobsRoot) },
+      volatileDirs: process.env.TMPDIR ? [process.env.TMPDIR] : [],
+      ...("refused" in scratch ? {} : { scratchRoot: scratch.root }),
+      ...(config.dockerWiring.dockerHost !== undefined ? { dockerHost: config.dockerWiring.dockerHost } : {}),
+      git, client, ownership: epochOwnership,
+    });
     hibernation = new HibernationInventoryController({
       registry: hibernationWriters,
       gate: dindGate,
@@ -1114,8 +1128,8 @@ async function mainBody(): Promise<void> {
       podUid: () => process.env.UZI_POD_UID,
       isIdle: () => worker?.isIdle() ?? false,
       proof: () => terminalMaintenanceProof(3, config.dockerWiring.dockerHost),
-      census: notImplementedCensus,
-      recomputeFingerprint: notImplementedFingerprint,
+      census: volumeCensus.census,
+      recomputeFingerprint: volumeCensus.fingerprint,
       fatalExit: (reason) => {
         log.error("uzi-agent exiting", { cause: reason, phase: lifecyclePhase, exit_code: 1 });
         process.exit(1);
