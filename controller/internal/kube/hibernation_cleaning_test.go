@@ -132,13 +132,31 @@ func TestCleaningStopProof(t *testing.T) {
 	}
 }
 
-func TestCleaningNoReportWithoutDeployment(t *testing.T) {
-	m, _, rec := hibEnv(t, stoppedHibPod("pod-uid-1", "Error"))
+// The settlement rule is the exact stopped pod uid in a complete pod list; a gone
+// Deployment must not suppress the proof (the api treats deployment_uid as optional for
+// cleanup_stopped).
+func TestCleaningReportsStoppedProofWithoutDeployment(t *testing.T) {
+	m, client, rec := hibEnv(t, stoppedHibPod("pod-uid-1", "Error"))
+	if err := hibTick(t, m, cleaningW("pod-uid-1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("calls = %v, want one cleanup_stopped", rec.transitions())
+	}
+	want := protocol.HibernationTransition{OpID: "op-1", Transition: protocol.TransitionCleanupStopped, PodUID: "pod-uid-1", CleanupOpID: "clean-1"}
+	if rec.calls[0] != want {
+		t.Fatalf("report = %+v, want %+v", rec.calls[0], want)
+	}
+	noClusterWrites(t, client)
+}
+
+func TestCleaningNoReportWithoutDeploymentWhenPodAbsent(t *testing.T) {
+	m, _, rec := hibEnv(t)
 	if err := hibTick(t, m, cleaningW("pod-uid-1", 1)); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.calls) != 0 {
-		t.Fatalf("reported without a Deployment: %v", rec.transitions())
+		t.Fatalf("reported with no Deployment and no proof pod: %v", rec.transitions())
 	}
 }
 

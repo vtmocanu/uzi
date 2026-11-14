@@ -414,10 +414,14 @@ func validateHibernationTransition(t *HibernationTransition) (opID, cleanupOpID 
 	default:
 		return uuid.Nil, uuid.Nil, podUID, bad("unknown transition")
 	}
+	// cleanup_stopped is optional on the Deployment uid: its proof is the exact stopped pod
+	// uid, and the Deployment may be gone while that pod is still listed. If present it must
+	// still be a uuid. Every other transition requires it.
 	if t.DeploymentUID == "" {
-		return uuid.Nil, uuid.Nil, podUID, bad("deployment_uid is required")
-	}
-	if _, perr := uuid.Parse(t.DeploymentUID); perr != nil {
+		if t.Transition != TransitionCleanupStopped {
+			return uuid.Nil, uuid.Nil, podUID, bad("deployment_uid is required")
+		}
+	} else if _, perr := uuid.Parse(t.DeploymentUID); perr != nil {
 		return uuid.Nil, uuid.Nil, podUID, bad("deployment_uid must be a uuid")
 	}
 	if len(t.ResourceVersion) > hibernationResourceVersionMax {
