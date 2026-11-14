@@ -229,8 +229,9 @@ first step, a **dry run**: **no volume is deleted**, and no setting turns deleti
   inventory only when it matches that identity and the worker's current
   registration, and the worker must keep writers excluded until the pod is gone.
   Workers hibernated before this release, workers without the capability, and
-  the plain and isolated lanes have no usable inventory, so they are always
-  blocked (their volumes are retained).
+  the plain and isolated lanes have no usable inventory, so they are blocked
+  once past the retirement period (until then they are not yet eligible), and
+  their volumes are retained.
 - **What blocks.** An incomplete, invalid or unproven inventory; a protected,
   unknown or unrecoverable source; a source that needs a receipt (for example a
   failed run's tracking ref) without a valid, unexpired capture of its latest

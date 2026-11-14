@@ -112,7 +112,8 @@ func TestAdminHealthHibernationRetirementCapLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := fetch()
-	if c.Severity != "warn" || !strings.Contains(c.Summary, "Dry run: no volumes are deleted") || !strings.Contains(c.Summary, "evaluated 50 of 51 (oldest first)") {
+	if c.Severity != "warn" || !strings.Contains(c.Summary, "Dry run: no volumes are deleted") || !strings.HasSuffix(c.Summary, " This check evaluated 50 of 51 (oldest first).") ||
+		strings.Contains(c.Summary, "shown") {
 		t.Fatalf("51 eligible workers = %q %q, want warn naming the cap", c.Severity, c.Summary)
 	}
 	if len(c.Evidence) == 0 {

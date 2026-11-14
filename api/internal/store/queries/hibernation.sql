@@ -468,7 +468,7 @@ ORDER BY 1;
 
 -- name: ListValidCaptureReceipts :many
 -- (run_id, source_sha) pairs for which an available, manifest-bound, unexpired capture of exactly
--- that source exists, and whose thin-bundle prerequisites (when any) have an exactly bound, still-pinned closure (the rule
+-- that source exists for the worker's own user (another user's capture never satisfies the entry), and whose thin-bundle prerequisites (when any) have an exactly bound, still-pinned closure (the rule
 -- ProtectFinalClosureCapture applies).
 SELECT DISTINCT want.run_id::uuid AS run_id, want.source_sha::text AS source_sha
 FROM (
@@ -479,7 +479,8 @@ FROM (
     WHERE cardinality(@run_ids::uuid[]) = cardinality(@source_shas::text[])
 ) AS want
 JOIN recovery_captures c ON c.run_id = want.run_id AND c.source_sha = want.source_sha
-WHERE c.state = 'available'
+WHERE c.user_id = @user_id::uuid
+  AND c.state = 'available'
   AND c.manifest_bound
   AND c.expires_at > now()
   AND (

@@ -802,7 +802,7 @@ func (s *Service) checkFleetHibernationRetirement(ctx context.Context) apitypes.
 	c.Summary = fmt.Sprintf("%s %d of %d evaluated worker(s) are blocked past the retirement period; %d would retire only after M2 verifies the PV reclaim policy and pod exclusion.",
 		dryRun, blocked, rep.Evaluated, conditional)
 	if capped {
-		c.Summary += fmt.Sprintf(" Only the first %d are shown: evaluated %d of %d (oldest first).", rep.Evaluated, rep.Evaluated, rep.Total)
+		c.Summary += fmt.Sprintf(" This check evaluated %d of %d (oldest first).", rep.Evaluated, rep.Total)
 	}
 	ordered := slices.Clone(rep.Verdicts)
 	slices.SortStableFunc(ordered, func(a, b workersvc.RetirementVerdict) int {

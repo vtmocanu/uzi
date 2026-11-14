@@ -39,6 +39,20 @@ func receiptEntry(kind, path string, run uuid.UUID, tip, content string) Invento
 	return e
 }
 
+func unprovenEntry(kind, path, classification string) InventoryEntry {
+	e := retEntry(kind, path, classification)
+	e.ContentState = sp("unproven_worktree_bytes")
+	return e
+}
+
+// goneEntry is what the agent sends for a source whose directory is missing: disposable, a
+// source_gone detail and no content state.
+func goneEntry(kind, path string) InventoryEntry {
+	e := retEntry(kind, path, "disposable")
+	e.Detail = sp("source_gone")
+	return e
+}
+
 // retOpts flips one fact of the positive fixture before the chain is driven.
 type retOpts struct {
 	entries  func(f *retFx) []InventoryEntry
@@ -179,6 +193,23 @@ func TestHibernationRetirementPositiveIsConditionalLiveDB(t *testing.T) {
 	}
 }
 
+// A source whose directory is gone holds no bytes: the agent reports it disposable with a
+// source_gone detail and no content state, and every worktree-like kind is treated alike.
+func TestHibernationRetirementGoneSourceIsNotABlockerLiveDB(t *testing.T) {
+	for _, kind := range []string{"canonical_clone", "retained_attempt", "worktree"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newRetFx(t, func(o *retOpts) {
+				o.entries = func(f *retFx) []InventoryEntry {
+					return append(f.goodEntries(), goneEntry(kind, "/data/runner/g-r/gone"))
+				}
+			})
+			if v := f.verdict(); v.Outcome != RetirementConditionalRetire || v.BlockerCount != 0 {
+				t.Fatalf("verdict = %+v, want conditional_retire with no blockers", v)
+			}
+		})
+	}
+}
+
 func TestHibernationRetirementGuardsLiveDB(t *testing.T) {
 	type guard struct {
 		name   string
@@ -282,6 +313,34 @@ func TestHibernationRetirementGuardsLiveDB(t *testing.T) {
 			return receiptEntry("worktree", "/data/runner/g-r/issue-7", f.runA, retTipA, "unproven_worktree_bytes")
 		})}},
 		{name: "disposable clone without proven content", code: BlockerUncoveredWorktreeBytes, opts: []func(*retOpts){entries(one(retEntry("canonical_clone", "/data/runner/g-r/issue-8", "disposable")))}},
+		{name: "unproven bytes on a disposable retained attempt", code: BlockerUncoveredWorktreeBytes, opts: []func(*retOpts){entries(one(unprovenEntry("retained_attempt", "/data/runner/g-r/issue-10.attempt-1", "disposable")))}},
+		{name: "unproven bytes on an unknown clone", code: BlockerUncoveredWorktreeBytes, opts: []func(*retOpts){entries(one(unprovenEntry("canonical_clone", "/data/runner/g-r/issue-11", "unknown")))}},
+		{name: "a worktree receipt on a ref content state", code: BlockerUncoveredWorktreeBytes, opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
+			return receiptEntry("worktree", "/data/runner/g-r/issue-12", f.runA, retTipA, "ref")
+		})}},
+		{name: "a retained attempt receipt on a ref content state", code: BlockerUncoveredWorktreeBytes, opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
+			return receiptEntry("retained_attempt", "/data/runner/g-r/issue-13.attempt-1", f.runA, retTipA, "ref")
+		})}},
+		{name: "a runner ref receipt on a content_proven state", code: BlockerUncoveredWorktreeBytes, opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
+			return receiptEntry("runner_ref", "refs/uzi-runner/agent/issue-14", f.runA, retTipA, "content_proven")
+		})}},
+		{name: "a capture of another user does not satisfy the receipt", code: BlockerNoReceipt, opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
+			r, other := f.run(), uuid.New()
+			f.env.exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, other, "ret-"+other.String()+"@e2e")
+			hold := uuid.New()
+			f.env.exec(`INSERT INTO recovery_custody_holds (id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity)
+			            VALUES ($1,$2,$3,$4,1,'open',$5,'fixture')`, hold, f.user, f.repo, r, uuid.New())
+			f.env.exec(`INSERT INTO recovery_captures
+			            (id,hold_id,run_id,user_id,original_worker_identity,source_sha,idempotency_key,state,manifest_bound,expires_at)
+			            VALUES ($1,$2,$3,$4,'fixture',$5,$6,'available',true,now()+interval '1 hour')`,
+				uuid.New(), hold, r, other, retTipA, uuid.NewString())
+			// The fixture cleanup deletes holds only for its own user; drop the foreign capture first.
+			f.t.Cleanup(func() {
+				f.env.exec(`DELETE FROM recovery_captures WHERE user_id = $1`, other)
+				f.env.exec(`DELETE FROM users WHERE id = $1`, other)
+			})
+			return receiptEntry("runner_ref", "refs/uzi-runner/agent/issue-15", r, retTipA, "ref")
+		})}},
 		{name: "docker container", code: BlockerDindState, source: "docker:containers", opts: []func(*retOpts){func(o *retOpts) {
 			o.docker = func(d *InventoryDocker) {
 				d.Containers = []InventoryDockerContainer{{ID: "c0ffee", State: "exited", Name: "build"}}

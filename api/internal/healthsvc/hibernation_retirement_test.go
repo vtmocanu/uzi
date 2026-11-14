@@ -104,6 +104,17 @@ func TestHibernationRetirementCheck(t *testing.T) {
 	}
 }
 
+// The cap sentence states only what the evaluator did; evidence is capped separately at
+// maxQuarantineEvidence, so the summary must not claim a count of "shown" workers.
+func TestHibernationRetirementCapSummaryMakesNoShownClaim(t *testing.T) {
+	rep := workersvc.RetirementReport{Total: 51, Evaluated: 50, Verdicts: []workersvc.RetirementVerdict{conditionalVerdict(uuid.New())}}
+	got := retirementSvc(rep, nil).checkFleetHibernationRetirement(context.Background())
+	const want = " This check evaluated 50 of 51 (oldest first)."
+	if !strings.HasSuffix(got.Summary, want) || strings.Contains(got.Summary, "shown") || strings.Contains(got.Summary, "Only the first") {
+		t.Fatalf("summary = %q, want it to end with %q and make no shown-count claim", got.Summary, want)
+	}
+}
+
 func TestHibernationRetirementEvidenceBoundsAndSanitizes(t *testing.T) {
 	var verdicts []workersvc.RetirementVerdict
 	for range 30 {

@@ -423,9 +423,15 @@ func TestHibernationInventoryEvaluatorReadsLiveDB(t *testing.T) {
 	}
 	runs := []uuid.UUID{valid, valid, runExpired, runUnbound, runPending, runPrereq, pinned.run, absent.run, notPinned.run, badSHAs.run, badSum.run}
 	shas := []string{shaOK, shaOther, shaOK, shaOK, shaOK, shaOK, shaClosure, shaClosure, shaClosure, shaClosure, shaClosure}
-	pairs, err := f.q.ListValidCaptureReceipts(f.ctx, store.ListValidCaptureReceiptsParams{RunIds: runs, SourceShas: shas})
-	if err != nil {
-		t.Fatal(err)
+	// The query is scoped to one user; the closure fixtures each belong to their own user, so ask once
+	// per owner and join the answers.
+	var pairs []store.ListValidCaptureReceiptsRow
+	for _, owner := range []uuid.UUID{f.userID, pinned.user, absent.user, notPinned.user, badSHAs.user, badSum.user} {
+		got, err := f.q.ListValidCaptureReceipts(f.ctx, store.ListValidCaptureReceiptsParams{UserID: owner, RunIds: runs, SourceShas: shas})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pairs = append(pairs, got...)
 	}
 	want := map[uuid.UUID]bool{valid: true, pinned.run: true}
 	if !mismatched["prerequisite_shas"] {
@@ -443,7 +449,7 @@ func TestHibernationInventoryEvaluatorReadsLiveDB(t *testing.T) {
 		}
 	}
 	// Mismatched array lengths pair nothing.
-	if got, err := f.q.ListValidCaptureReceipts(f.ctx, store.ListValidCaptureReceiptsParams{RunIds: []uuid.UUID{valid, valid}, SourceShas: []string{shaOK}}); err != nil || len(got) != 0 {
+	if got, err := f.q.ListValidCaptureReceipts(f.ctx, store.ListValidCaptureReceiptsParams{UserID: f.userID, RunIds: []uuid.UUID{valid, valid}, SourceShas: []string{shaOK}}); err != nil || len(got) != 0 {
 		t.Fatalf("mismatched lengths paired a prefix: %v, %v", got, err)
 	}
 }

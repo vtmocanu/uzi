@@ -753,7 +753,8 @@ FROM (
     WHERE cardinality($1::uuid[]) = cardinality($2::text[])
 ) AS want
 JOIN recovery_captures c ON c.run_id = want.run_id AND c.source_sha = want.source_sha
-WHERE c.state = 'available'
+WHERE c.user_id = $3::uuid
+  AND c.state = 'available'
   AND c.manifest_bound
   AND c.expires_at > now()
   AND (
@@ -771,6 +772,7 @@ ORDER BY 1, 2
 type ListValidCaptureReceiptsParams struct {
 	RunIds     []uuid.UUID `json:"run_ids"`
 	SourceShas []string    `json:"source_shas"`
+	UserID     uuid.UUID   `json:"user_id"`
 }
 
 type ListValidCaptureReceiptsRow struct {
@@ -779,10 +781,10 @@ type ListValidCaptureReceiptsRow struct {
 }
 
 // (run_id, source_sha) pairs for which an available, manifest-bound, unexpired capture of exactly
-// that source exists, and whose thin-bundle prerequisites (when any) have an exactly bound, still-pinned closure (the rule
+// that source exists for the worker's own user (another user's capture never satisfies the entry), and whose thin-bundle prerequisites (when any) have an exactly bound, still-pinned closure (the rule
 // ProtectFinalClosureCapture applies).
 func (q *Queries) ListValidCaptureReceipts(ctx context.Context, arg ListValidCaptureReceiptsParams) ([]ListValidCaptureReceiptsRow, error) {
-	rows, err := q.db.Query(ctx, listValidCaptureReceipts, arg.RunIds, arg.SourceShas)
+	rows, err := q.db.Query(ctx, listValidCaptureReceipts, arg.RunIds, arg.SourceShas, arg.UserID)
 	if err != nil {
 		return nil, err
 	}

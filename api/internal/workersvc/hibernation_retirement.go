@@ -135,6 +135,7 @@ type retirementEntry struct {
 	RunID          *string `json:"run_id"`
 	Tip            *string `json:"tip"`
 	ContentState   *string `json:"content_state"`
+	Detail         *string `json:"detail"`
 }
 
 type retirementPVC struct {
@@ -264,7 +265,7 @@ func (s *Service) EvaluateHibernationRetirement(ctx context.Context) (Retirement
 
 		// Guards 4 and 5: every entry, the receipts and the docker state.
 		if ev.inv != nil && ev.inv.Status == InventoryAccepted {
-			valid, err := validReceipts(ctx, q, ev.entries)
+			valid, err := validReceipts(ctx, q, c.UserID, ev.entries)
 			if err != nil {
 				return report, err
 			}
@@ -389,7 +390,7 @@ func inventoryGuards(inv *store.WorkerHibernationInventory, entryErr bool, c sto
 
 // validReceipts looks up the (run, tip) pairs of the worker's needs_receipt entries: one call, equal
 // length arrays, an empty result when the worker has none.
-func validReceipts(ctx context.Context, q *store.Queries, entries []retirementEntry) (map[[2]string]bool, error) {
+func validReceipts(ctx context.Context, q *store.Queries, userID uuid.UUID, entries []retirementEntry) (map[[2]string]bool, error) {
 	var runs []uuid.UUID
 	var tips []string
 	seen := map[[2]string]bool{}
@@ -409,7 +410,7 @@ func validReceipts(ctx context.Context, q *store.Queries, entries []retirementEn
 	if len(runs) == 0 {
 		return out, nil
 	}
-	rows, err := q.ListValidCaptureReceipts(ctx, store.ListValidCaptureReceiptsParams{RunIds: runs, SourceShas: tips})
+	rows, err := q.ListValidCaptureReceipts(ctx, store.ListValidCaptureReceiptsParams{UserID: userID, RunIds: runs, SourceShas: tips})
 	if err != nil {
 		return nil, err
 	}
@@ -431,14 +432,29 @@ func entryBlocker(e retirementEntry, valid map[[2]string]bool) (code, source str
 	if e.ContentState != nil && !slices.Contains(retirementContentStates, *e.ContentState) {
 		return BlockerProtectedSource, where
 	}
-	proven := e.ContentState != nil && *e.ContentState == "content_proven"
+	state := ""
+	if e.ContentState != nil {
+		state = *e.ContentState
+	}
+	// Unproven worktree bytes block whatever the classification or kind says.
+	if state == "unproven_worktree_bytes" {
+		return BlockerUncoveredWorktreeBytes, where
+	}
+	worktreeLike := e.Kind == "canonical_clone" || e.Kind == "retained_attempt" || e.Kind == "worktree"
 	switch e.Classification {
 	case "disposable":
-		if (e.Kind == "canonical_clone" || e.Kind == "worktree") && !proven {
+		// A source the agent found missing holds no bytes; any present worktree needs its content proven.
+		gone := e.Detail != nil && *e.Detail == "source_gone"
+		if worktreeLike && !gone && state != "content_proven" {
 			return BlockerUncoveredWorktreeBytes, where
 		}
 	case "needs_receipt":
-		if e.ContentState == nil || (*e.ContentState != "content_proven" && *e.ContentState != "ref") {
+		// A runner ref is content-addressed (state ref); every other kind needs proven content.
+		wantState := "content_proven"
+		if e.Kind == "runner_ref" {
+			wantState = "ref"
+		}
+		if state != wantState {
 			return BlockerUncoveredWorktreeBytes, where
 		}
 		if e.RunID == nil || e.Tip == nil {
