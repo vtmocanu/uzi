@@ -18,7 +18,7 @@ function propertyName(node: ts.PropertyName): string | undefined {
 function inspect(source: ts.SourceFile): string[] {
   const aliases = new Set(["SdkOptions"]);
   const importedPolicy = new Set<string>();
-  const queryNames = new Set(["queryFn", "defaultQueryFn"]);
+  const queryNames = new Set(["query", "queryFn", "defaultQueryFn"]);
   source.forEachChild(node => {
     if (!ts.isImportDeclaration(node) || !ts.isStringLiteral(node.moduleSpecifier)) return;
     const bindings = node.importClause?.namedBindings;
@@ -100,6 +100,7 @@ it("a future builder without the policy and a later settings overwrite are detec
     const samples = [
       { name: "missing", text: 'const future: SdkOptions = { settingSources: [] };', error: /shared builtin-plugin/ },
       { name: "inline-query", text: 'queryFn({ prompt: "diagnostic", options: {} });', error: /shared builtin-plugin/ },
+      { name: "namespace-query", text: 'import * as SDK from "@anthropic-ai/claude-agent-sdk"; SDK.query({ prompt: "diagnostic", options: {} });', error: /shared builtin-plugin/ },
       { name: "overwrite", text: 'import { claudeSdkSettings } from "./sdk-plugin-policy.js"; const future: SdkOptions = { settingSources: [], settings: claudeSdkSettings() }; future.settings = {};', error: /do not overwrite/ },
       { name: "present", text: 'import { claudeSdkSettings } from "./sdk-plugin-policy.js"; const future: SdkOptions = { settingSources: [], settings: claudeSdkSettings() };', error: undefined },
     ];
