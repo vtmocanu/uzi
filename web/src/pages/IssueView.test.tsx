@@ -314,26 +314,6 @@ it.each([["paused", "Codex policy hold"], ["queued", "queued"], ["completed", "c
   if (status !== "paused") expect(screen.queryByText("Codex policy hold")).toBeNull();
 });
 
-// Issue #3250: only codex_policy_hold and the new run-override hold print the park label in a
-// history row; every other pre-existing hold keeps the de-underscored status word.
-it.each([
-  ["provider_unavailable", "provider unavailable"],
-  ["iteration_budget_exhausted", "iteration budget_exhausted"],
-  ["credential_disabled", "credential disabled"],
-  ["credentials_reset", "credentials reset"],
-  ["base_attestation_missing", "base attestation_missing"],
-  ["repo_agent_source_unavailable", "repo agent_source_unavailable"],
-  ["credential_switch_settling", "credential switch_settling"],
-  ["credential_switch_unsettled", "credential switch_unsettled"],
-  ["run_override_unavailable", "model choice unavailable: owner hold"],
-] as const)("history label for a paused run held on %s", async (hold, label) => {
-  setAuth();
-  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
-  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "paused", hold_reason: hold })] });
-  renderIssueView();
-  expect(await screen.findByText(label)).toBeTruthy();
-});
-
 // issue #2004: a resumed run's started_at is reset to the last leg, so the history row's
 // duration must span from first_started_at to finished_at.
 describe("IssueView run history — duration spans from first start (#2004)", () => {

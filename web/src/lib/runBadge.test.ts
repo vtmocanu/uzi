@@ -12,13 +12,6 @@ import {
   isAwaitingFollowup,
   isAwaitingInput,
   isHealthFlaggableStatus,
-  isNonCompletionHold,
-  completionPanelEarlyReturn,
-  completionPanelHeld,
-  historyShowsParkLabel,
-  offersOwnerActionsLink,
-  NON_COMPLETION_HOLDS,
-  isOwnerResumableHold,
   isMaintenanceQueued,
   isReserveQueued,
   reserveQueueText,
@@ -43,7 +36,6 @@ import {
 } from "./runBadge";
 import boundFixture from "../../../fixtures/api-contract/run.custody_run_hold_bound.json";
 import { RUN_STATUS_TONES } from "../components/ui";
-import holdPresentation from "../../../fixtures/hold-reasons/presentation.json";
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { isTerminalRun, TERMINAL_RUN_STATUSES } from "./runStatus";
 import type { LatestRun, Run, RunStatus, StopKind } from "./api";
@@ -1699,59 +1691,4 @@ it.each([
   expect(badge).toMatchObject({ label, tone: "warning", pulse: false });
   expect(badge.kind === "badge" && badge.title).not.toMatch(/requeues|episode|Used:|Remaining:/);
   expect(effectiveRunStatus({ ...input, status: "running" })).toBe("running");
-});
-
-// Issue #3250: the non-completion hold set is one table (NON_COMPLETION_HOLDS) pinned against
-// fixtures/hold-reasons/presentation.json, which the Go CLI test reads too.
-describe("non-completion holds (fixtures/hold-reasons/presentation.json)", () => {
-  it("every fixture row agrees on predicates, tone, label and overlay", () => {
-    let visited = 0;
-    for (const c of holdPresentation) {
-      visited++;
-      expect([c.reason, isNonCompletionHold(c.reason)]).toEqual([c.reason, c.non_completion]);
-      expect([c.reason, isOwnerResumableHold(c.reason)]).toEqual([c.reason, c.owner_resumable]);
-      expect([c.reason, runStatusTone(c.reason, null)]).toEqual([c.reason, c.tone]);
-      expect([c.reason, RUN_STATUS_TONES[c.reason]?.tone]).toEqual([c.reason, c.tone]);
-      const held = { status: "paused", hold_reason: c.reason };
-      expect([c.reason, effectiveRunStatus(held)]).toEqual([c.reason, c.reason]);
-      expect([c.reason, parkLabel(held)]).toEqual([c.reason, c.web_label]);
-      // Per-surface behavior of each pre-existing reason, pinned (the old sites disagreed on membership).
-      expect([c.reason, completionPanelEarlyReturn(held)]).toEqual([c.reason, c.completion_panel_early_return]);
-      expect([c.reason, historyShowsParkLabel(held)]).toEqual([c.reason, c.history_park_label]);
-      expect([c.reason, offersOwnerActionsLink(held)]).toEqual([c.reason, c.owner_actions_link]);
-      const heldPaused = completionPanelHeld(held);
-      const heldQueued = completionPanelHeld({ status: "queued", hold_reason: c.reason });
-      expect([c.reason, heldPaused, heldQueued]).toEqual([
-        c.reason,
-        c.completion_panel_held_deny === "never",
-        c.completion_panel_held_deny !== "always",
-      ]);
-    }
-    expect(visited).toBe(holdPresentation.length);
-    expect(visited).toBeGreaterThan(0);
-    // The table and the fixture name the same reasons, so neither can grow alone.
-    expect(Object.keys(NON_COMPLETION_HOLDS).sort()).toEqual(holdPresentation.map((c) => c.reason).sort());
-  });
-
-  it("a hold_reason on a non-paused run is not overlaid, and unlisted holds are not in the set", () => {
-    expect(effectiveRunStatus({ status: "running", hold_reason: "run_override_unavailable" })).toBe("running");
-    for (const r of ["completion_blocked", "budget_exhausted", "weekly_reserve", "provider_outage", "", null, undefined]) {
-      expect(isNonCompletionHold(r)).toBe(false);
-      expect(isOwnerResumableHold(r)).toBe(false);
-    }
-  });
-
-  it("run_override_unavailable is a static warning badge that needs the owner", () => {
-    const b = runBadge(run({ status: "paused", hold_reason: "run_override_unavailable" }), NOW);
-    expect(b).toMatchObject({
-      kind: "badge",
-      label: "model choice unavailable: owner hold",
-      tone: "warning",
-      pulse: false,
-    });
-    expect(needsHumanAttention("run_override_unavailable")).toBe(true);
-    // The credential holds clear by Enable or a credential add, so they are not a needs-you state.
-    expect(needsHumanAttention("credential_disabled")).toBe(false);
-    expect(needsHumanAttention("credentials_reset")).toBe(false);
-  });
 });

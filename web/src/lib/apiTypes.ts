@@ -1190,8 +1190,6 @@ export interface LatestRun {
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
   // 'iteration_budget_exhausted' is a nonterminal owner hold: "Iteration limit reached".
   // Resume grants a fresh finite allowance; Extend adds wall time without resuming; Cancel ends it.
-  // 'run_override_unavailable' (issue #3250) reads "model choice unavailable: owner hold". The set of
-  // these non-completion holds is NON_COMPLETION_HOLDS in lib/runBadge.ts.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
   owner_name: string;
@@ -4260,11 +4258,6 @@ export interface Run {
    *  'iteration_budget_exhausted' is a nonterminal iteration hold: owner Resume or Cancel,
    *  never completed-scope Stop. Extend wall time first only when remaining wall is spent;
    *  Extend leaves it paused, and credential changes never retry it automatically.
-   *  Issue #3250: 'run_override_unavailable' is a nonterminal owner hold: the run's chosen model
-   *  or effort cannot run on its harness; owner Resume retries, or Cancel.
-   *  The non-completion holds (every value above except 'completion_blocked' and
-   *  'budget_exhausted') form one set, NON_COMPLETION_HOLDS in lib/runBadge.ts, which owns their
-   *  tone, label and owner-resumability (fixtures/hold-reasons/presentation.json).
    *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and

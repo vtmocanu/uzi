@@ -14,7 +14,7 @@ import {
 import { Link } from "react-router-dom";
 import { forgeWaitLabel } from "../lib/forgeCooldown";
 import { diskWaitLabel } from "../lib/diskRecovery";
-import { effectiveRunStatus, NON_COMPLETION_HOLD_LABEL_MAP, NON_COMPLETION_HOLD_TONES } from "../lib/runBadge";
+import { effectiveRunStatus } from "../lib/runBadge";
 import type { RunHealth, RunProgress } from "../lib/apiTypes";
 import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
 
@@ -546,15 +546,25 @@ export const RUN_STATUS_TONES: Record<
   completion_checking: { tone: "info", pulse: true },
   completion_reworking: { tone: "info", pulse: true },
   completion_blocked: { tone: "warning" },
-  /** The server holds that are not completion states (credential_disabled, credentials_reset,
-   *  provider_unavailable, codex_policy_hold, base_attestation_missing, repo_agent_source_unavailable,
-   *  the token-switch holds, iteration_budget_exhausted, run_override_unavailable): raw status
-   *  "paused", overlaid by effectiveRunStatus from hold_reason. Tone and label come from
-   *  NON_COMPLETION_HOLDS (runBadge.ts), the single source. Static warning, NOT the owner-pause
-   *  info tone and not pulsing: none does work until the owner (or an Enable) clears it. */
-  ...NON_COMPLETION_HOLD_TONES,
-  // Provider outage is a recovery_wait cause, not a hold: it retries on its own.
+  /** PRD #1732 D14: a run the server parked because a credential it needs is disabled
+   *  (raw status "paused", overlaid by effectiveRunStatus from hold_reason). Warn like the
+   *  other involuntary holds, NOT the owner-pause info tone, and not pulsing: it does no
+   *  work until the credential is enabled. Label below. */
+  credential_disabled: { tone: "warning" },
+  /** PRD #3989 M3: parked after an account reset deleted every credential; warns like credential_disabled. */
+  credentials_reset: { tone: "warning" },
+  // Provider holds are parked: owner attention and outage retry share a static warning.
+  iteration_budget_exhausted: { tone: "warning" },
+  provider_unavailable: { tone: "warning" },
+  codex_policy_hold: { tone: "warning" },
+  // Issue #3194: a --require-base run held because its adopted work is not attested to the planned base.
+  base_attestation_missing: { tone: "warning" },
+  repo_agent_source_unavailable: { tone: "warning" },
   provider_outage: { tone: "warning" },
+  // Issue #3181: token-switch holds (raw "paused", overlaid from hold_reason). Static warning:
+  // the owner's decision is pending (unsettled) or waits on the worker finishing (settling).
+  credential_switch_settling: { tone: "warning" },
+  credential_switch_unsettled: { tone: "warning" },
   completed: { tone: "ok" },
   /** issue #1418: a StatusPill-ONLY pseudo-status for a `failed` run whose committed work
    *  is human-landable (server-derived landing_state === "needs_landing"). RunsList/RunView
@@ -614,10 +624,19 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   completion_checking: "Checking completion",
   completion_reworking: "Reworking unmet milestones",
   completion_blocked: "Completion blocked",
-  // The non-completion hold labels come from NON_COMPLETION_HOLDS (runBadge.ts), the same
-  // table runBadge's PARK_LABELS reads, so the pill and the board badge cannot diverge.
-  ...NON_COMPLETION_HOLD_LABEL_MAP,
+  // PRD #1732: kept in step with runBadge's matching label.
+  credential_disabled: "waiting: credential disabled",
+  credentials_reset: "waiting: credentials were reset",
+  // Kept in step with runBadge's parked wording by the label-agreement test.
+  iteration_budget_exhausted: "Iteration limit reached",
+  provider_unavailable: "provider unavailable: owner hold",
+  codex_policy_hold: "Codex policy hold",
+  base_attestation_missing: "base unverified: owner hold",
+  repo_agent_source_unavailable: "repo agents unreadable: owner hold",
   provider_outage: "waiting for provider",
+  // Issue #3181: kept in step with runBadge's parked wording by the label-agreement test.
+  credential_switch_settling: "settling: token switch",
+  credential_switch_unsettled: "held: token switch",
 };
 
 // A running or live completion row may attach its server estimate to the status pill.

@@ -61,22 +61,6 @@ it.each([
   const link = screen.queryByRole("link", { name: "View owner actions" });
   expect(link?.getAttribute("href") ?? null).toBe(linked ? "/runs/A" : null);
 });
-// Issue #3250: a pre-existing hold that never linked to the owner actions still does not; only the
-// new run-override hold joins the linked ones.
-it.each([
-  ["repo_agent_source_unavailable", "Current: repo agents unreadable: owner hold", false],
-  ["codex_policy_hold", "Current: Codex policy hold", false],
-  ["base_attestation_missing", "Current: base unverified: owner hold", false],
-  ["credential_disabled", "Current: waiting: credential disabled", false],
-  ["credentials_reset", "Current: waiting: credentials were reset", false],
-  ["run_override_unavailable", "Current: model choice unavailable: owner hold", true],
-] as const)("LastRun owner-actions link for hold %s is %s", async (hold, current, linked) => {
-  vi.mocked(api.getRun).mockResolvedValueOnce({ run: { ...mockRuns[0], id: "A", status: "paused", hold_reason: hold } });
-  renderDetail(startedFire("A"));
-  await act(async () => {});
-  expect(screen.getByText(current)).toBeTruthy();
-  expect(screen.queryByRole("link", { name: "View owner actions" }) !== null).toBe(linked);
-});
 it.each([404, 403])("LastRun current read refusal %s stays unknown without retries", async (status) => {
   vi.mocked(api.getRun).mockRejectedValueOnce(new ApiError(status, "Refused"));
   renderDetail(startedFire("A"));

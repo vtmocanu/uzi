@@ -4012,11 +4012,6 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `HOLD` row reading `repo agents unreadable`; resume the run with
   `uzi run resume <id>` once the repository can be fetched, or cancel it. See
   [Repo agents](repo-agents.md#which-revision-is-read).
-  A `paused` run can also be **held because its chosen model or effort cannot
-  run on its harness** (`hold_reason: run_override_unavailable`): `run get`
-  prints a `HOLD` row reading `model choice unavailable`, and `run wait` and
-  `run logs --follow` print the same notice. Resume the run with
-  `uzi run resume <id>` to retry, or cancel it.
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for

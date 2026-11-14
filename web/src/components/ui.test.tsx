@@ -330,17 +330,6 @@ describe("StatusPill", () => {
     // Not pulsing — a failed run is terminal, not live work.
     expect(pill.querySelector(".animate-pulse")).toBeNull();
   });
-
-  it("renders a paused run held on run_override_unavailable as a static warning 'model choice unavailable: owner hold' (issue #3250)", () => {
-    // The raw status is paused; effectiveRunStatus overlays the hold so the pill does not read
-    // as the owner's info-toned "paused". The word comes from NON_COMPLETION_HOLDS, the table the
-    // board badge reads, so the two surfaces cannot drift.
-    const { container } = render(<StatusPill status="run_override_unavailable" />);
-    const pill = container.firstElementChild as HTMLElement;
-    expect(container.textContent?.trim()).toBe("model choice unavailable: owner hold");
-    expect(pill.className).toContain("text-warn");
-    expect(pill.querySelector(".animate-pulse")).toBeNull();
-  });
 });
 
 describe("Select", () => {

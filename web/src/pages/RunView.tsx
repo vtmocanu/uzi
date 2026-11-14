@@ -61,10 +61,6 @@ import {
   queuedBlockerPrecedesCodexAdmission,
   isStoppedRun,
   isRejectedRun,
-  isNonCompletionHold,
-  holdOffersGenericResume,
-  completionPanelEarlyReturn,
-  completionPanelHeld,
   milestoneBadge,
   mrChipState,
   mrChipSuffix,
@@ -475,12 +471,12 @@ function policyBlocksContinuation(run: Run): boolean {
 // never durability across workers. Policy cases have their own presentation.
 export function CompletionStatePanel({ run }: { run: Run }) {
   if (policyBlocksContinuation(run)) return null;
-  // A non-completion hold (NON_COMPLETION_HOLDS: credential, provider, token-switch,
-  // base-attestation, repo-agent source, iteration, run-override ...) is not a completion state;
-  // its own badge, panel and announcement cover it.
-  if (completionPanelEarlyReturn(run)) return null;
+  if (run.status === "paused" && (run.hold_reason === "provider_unavailable" || run.hold_reason === "iteration_budget_exhausted")) return null;
   const phase = run.completion_phase ?? "";
-  const held = completionPanelHeld(run);
+  // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
+  // Token-switch, base-attestation and repo-agent source holds have their own panels.
+  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "credentials_reset" && run.hold_reason !== "provider_unavailable" &&
+    run.hold_reason !== "base_attestation_missing" && run.hold_reason !== "repo_agent_source_unavailable" && credentialSwitchHold(run) === null;
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
   const attempts = run.completion_attempts ?? 0;
@@ -958,9 +954,14 @@ export function PausedPanel({
     run.status !== "paused" ||
     policyBlocksContinuation(run) ||
     run.hold_reason === "completion_blocked" ||
-    // Every non-completion hold has its own panel or Resume gating (NON_COMPLETION_HOLDS),
-    // except the ones the generic Resume applies to (run_override_unavailable).
-    (isNonCompletionHold(run.hold_reason) && !holdOffersGenericResume(run.hold_reason))
+    run.hold_reason === "credential_disabled" ||
+    run.hold_reason === "credentials_reset" ||
+    run.hold_reason === "provider_unavailable" ||
+    run.hold_reason === "iteration_budget_exhausted" ||
+    // Issue #3181: the token-switch holds have their own panel and Resume gating.
+    credentialSwitchHold(run) !== null ||
+    run.hold_reason === "base_attestation_missing" ||
+    run.hold_reason === "repo_agent_source_unavailable"
   )
     return null;
 
@@ -2556,8 +2557,6 @@ export function RunView() {
               ? "base_attestation_missing"
             : run?.status === "paused" && run.hold_reason === "repo_agent_source_unavailable"
               ? "repo_agent_source_unavailable"
-            : run?.status === "paused" && run.hold_reason === "run_override_unavailable"
-              ? "run_override_unavailable"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -2626,8 +2625,6 @@ export function RunView() {
               ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
             : parkKey === "repo_agent_source_unavailable"
               ? "The repository's agent definitions could not be read. The agent was not started. Only the run owner can Resume when the revision is available, or Cancel. There is no automatic retry."
-            : parkKey === "run_override_unavailable"
-              ? "Model choice unavailable. The run's chosen model or effort cannot run on its harness. The run waits for its owner: Resume to retry, or Cancel."
             : parkKey === "iteration_budget_exhausted:spent"
               ? "Iteration limit reached. The remaining wall budget is spent. Extend time, then explicitly Resume, or Cancel. Extend leaves the run paused."
             : parkKey === "iteration_budget_exhausted"
@@ -2825,10 +2822,20 @@ export function RunView() {
                   + the "Completion blocked" StatusPill cover it. */}
               {!policyBlocked && run.status === "paused" &&
                 run.hold_reason !== "completion_blocked" &&
-                // The non-completion holds (NON_COMPLETION_HOLDS) have their own panel (an
-                // Enable, a credential add, the token-switch refusal inline) or are refused by
-                // the server; only run_override_unavailable offers this generic Resume.
-                (!isNonCompletionHold(run.hold_reason) || holdOffersGenericResume(run.hold_reason)) &&
+                // PRD #1732: a credential_disabled hold resumes on Enable (its panel), and a
+                // plain Resume would only park it again.
+                run.hold_reason !== "credential_disabled" &&
+                // PRD #3989 M3: the server refuses Resume (409) for a credentials_reset hold; it
+                // resumes on its own once a credential is added.
+                run.hold_reason !== "credentials_reset" &&
+                run.hold_reason !== "provider_unavailable" &&
+                run.hold_reason !== "iteration_budget_exhausted" &&
+                // Issue #3181: the token-switch holds offer Resume in their own panel, which
+                // shows the server's settling refusal inline.
+                credentialSwitchHold(run) === null &&
+                // Issue #3194: Resume is refused by the server for a base-attestation hold.
+                run.hold_reason !== "base_attestation_missing" &&
+                run.hold_reason !== "repo_agent_source_unavailable" &&
                 (canSteer ? (
                   <Button
                     size="sm"

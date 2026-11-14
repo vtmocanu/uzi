@@ -254,7 +254,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				holdKey := workerHoldNoticeKey(run)
 				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait ||
-					(run.Status == statusPaused && holdAnnouncesEntry(strOr(run.HoldReason, ""))) {
+					isIterationHold(run) || isCredentialDisabledHold(run) || isCredentialsResetHold(run) || isProviderUnavailableHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run) {
 					if parkedIn != holdKey {
 						parkedIn = holdKey
 						// pool_wait and recovery_wait are the sibling silences limit_wait is
@@ -266,7 +266,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 						// hold to another is announced as the new hold.
 						switch run.Status {
 						case statusPaused:
-							if !isCredentialDisabledHold(run) {
+							if isIterationHold(run) || isProviderUnavailableHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run) || isCredentialsResetHold(run) {
 								_, _ = fmt.Fprintf(env.Stderr, "run %s %s; still following\n", cellText(args[0]), pausedHoldNotice(run))
 								break
 							}

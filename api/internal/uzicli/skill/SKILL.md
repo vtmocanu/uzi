@@ -496,9 +496,7 @@ uzi version
   always works) or `credential_switch_unsettled` (the worker finished its own operations
   but the run's processes were not proven stopped; work and custody stay on that worker;
   Resume requeues on the newly chosen token and the next claim re-proves quiescence fail
-  closed, or Cancel); or a run-override hold, `hold_reason` `run_override_unavailable` (the
-  run's chosen model or effort cannot run on its harness; the notice reads `model choice
-  unavailable`; owner Resume retries, or Cancel); or the weekly usage reserve, `hold_reason` `weekly_reserve` (the credential the
+  closed, or Cancel); or the weekly usage reserve, `hold_reason` `weekly_reserve` (the credential the
   run spends reached the owner's weekly threshold; it releases by itself once usage drops below it,
   and `uzi run resume <id>` overrides the reserve until the next weekly reset, printing
   `Resumed <id>: queued (overrides the weekly usage reserve until the next weekly reset).`);
