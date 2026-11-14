@@ -10,6 +10,16 @@ import {
   api, assistant, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, resultOk, runnerWith, worktreeDirFor,
 } from "./runner-harness.js";
 import { newApi, row, send } from "./gate-revision-harness.js";
+import type { SummaryRunner } from "../src/summary-runner.js";
+
+// The executor's default SummaryRunner runs the plan and intent summaries through the real SDK,
+// which spawns the bundled claude CLI (it leaves claude-<uid> and cc-socks in TMPDIR and fails the
+// tmpdir leak guard on Linux CI). The summaries are not under test here.
+const NO_EXECUTOR_SUMMARIES = {
+  async generateIntentSummary(): Promise<string | null> { return null; },
+  async generatePlanSummary(): Promise<null> { return null; },
+} as unknown as SummaryRunner;
+
 
 installHarness();
 
@@ -157,6 +167,7 @@ describe("issue #4201 AC10: a live credential switch continues the flight in pla
     };
     const sdk = new SdkExecutor(nullLogger(), homeDir, {
       queryFn: scriptedQuery([planTurn, hangTurn(requestSwitch), doneTurn], turns), client,
+      summaryRunner: NO_EXECUTOR_SUMMARIES,
     } as ConstructorParameters<typeof SdkExecutor>[2]);
     api.onState(runId, (b) => {
       if (b.status === "awaiting_approval") send(runId, row("approve_plan"));

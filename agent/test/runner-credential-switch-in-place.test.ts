@@ -30,6 +30,15 @@ import { SummaryRunner } from "../src/summary-runner.js";
 import { RetainedRecoveryStop } from "../src/runner.js";
 import { codexRig, FakeCodexExecutor } from "./runner-codex-sinks-fixture.js";
 
+// The executor's default SummaryRunner runs the plan and intent summaries through the real SDK,
+// which spawns the bundled claude CLI (it leaves claude-<uid> and cc-socks in TMPDIR and fails the
+// tmpdir leak guard on Linux CI). The summaries are not under test here.
+const NO_EXECUTOR_SUMMARIES = {
+  async generateIntentSummary(): Promise<string | null> { return null; },
+  async generatePlanSummary(): Promise<null> { return null; },
+} as unknown as SummaryRunner;
+
+
 installHarness();
 
 // Issue #4201 m2c: the in-place credential switch through the REAL Runner, a real SdkExecutor and a
@@ -266,7 +275,7 @@ async function scenario(setup: Setup) {
       });
       break;
   }
-  const sdk = new SdkExecutor(runLogger, homeDir, { queryFn: scriptedQuery(turnScripts, turns), client });
+  const sdk = new SdkExecutor(runLogger, homeDir, { queryFn: scriptedQuery(turnScripts, turns), client, summaryRunner: NO_EXECUTOR_SUMMARIES });
   const attemptDir = path.dirname(worktreeDirFor(claim.issue_iid as number));
   const attempts = (): string[] =>
     fs.existsSync(attemptDir) ? fs.readdirSync(attemptDir).filter((n) => n.includes(".attempt-")) : [];
@@ -758,7 +767,7 @@ describe("issue #4201 m2c: apply outcomes other than applied", () => {
         // The release requeues the run, so only from here do state acks say `queued`.
         api.overrideStateStatus(claim.run_id, "queued");
         api.requestCredentialSwitch(claim.run_id, GEN, "op-1");
-      }), doneTurn()], turns), client,
+      }), doneTurn()], turns), client, summaryRunner: NO_EXECUTOR_SUMMARIES,
     });
     api.onState(claim.run_id, (b) => { if (b.status === "awaiting_approval") send(claim.run_id, row("approve_plan")); });
     const { gitlab } = fakeGitlab();
@@ -1155,7 +1164,7 @@ describe("issue #4201 m2c rework: the in-place route is closed without the negot
       queryFn: scriptedQuery([planTurn(), hangTurn(() => {
         api.overrideStateStatus(claim.run_id, "queued");
         api.requestCredentialSwitch(claim.run_id, GEN, "op-1"); // the signal carries an op id
-      }), doneTurn()], []), client,
+      }), doneTurn()], []), client, summaryRunner: NO_EXECUTOR_SUMMARIES,
     });
     api.onState(claim.run_id, (b) => { if (b.status === "awaiting_approval") send(claim.run_id, row("approve_plan")); });
     const { gitlab } = fakeGitlab();
@@ -1499,7 +1508,7 @@ describe("issue #4201 m2d: a prologue that ends discards the latched switch", ()
     api.requestCredentialSwitch(runId, GEN, "op-1");
     api.scriptApply(runId, { outcome: "applied", token: NEW_TOKEN });
     const turns: TurnRecord[] = [];
-    const sdk = new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery([planTurn(), doneTurn()], turns), client });
+    const sdk = new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery([planTurn(), doneTurn()], turns), client, summaryRunner: NO_EXECUTOR_SUMMARIES });
     const { gitlab } = fakeGitlab();
     const r = runnerWith(() => ({ executor: sdk }), gitlab, undefined, nullLogger(), {
       recoveryRetryMs: 1, planApprovalTimeoutMs: 20_000, credentialSwitchLedger: new CredentialSwitchOpLedger(fx.dataDir), quiesceRun: async () => CLEAN,
