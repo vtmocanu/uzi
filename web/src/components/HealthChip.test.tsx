@@ -54,6 +54,8 @@ function refresh(view: ReturnType<typeof mount>, doc: HealthDoc | null) {
 const chip = () => screen.getByRole("button", { name: /^System health:/ });
 const dialog = () => screen.getByRole("dialog", { name: "System health" });
 const frame = () => act(() => new Promise<void>((r) => requestAnimationFrame(() => r())));
+const applicableCount = (doc: HealthDoc) => doc.checks.length - doc.counts.na;
+const passingCount = (doc: HealthDoc) => doc.checks.filter((check) => check.severity === "ok").length;
 
 describe("HealthChip popover", () => {
   it("opens a dialog with the verdict, structured rows, since and Open health", () => {
@@ -116,8 +118,9 @@ describe("HealthChip popover", () => {
     const view = mount(overviewNextDoc());
     fireEvent.click(chip());
     dialog();
-    refresh(view, healthySilentDoc());
-    expect(within(dialog()).getByText("System health: all 23 checks passing")).toBeTruthy();
+    const passingDoc = healthySilentDoc();
+    refresh(view, passingDoc);
+    expect(within(dialog()).getByText(`System health: all ${applicableCount(passingDoc)} checks passing`)).toBeTruthy();
     expect(chip().getAttribute("aria-expanded")).toBe("true");
     expect(screen.queryByRole("link", { name: /^System health:/ })).toBeNull();
   });
@@ -147,12 +150,12 @@ describe("HealthChip popover", () => {
     const doc = overviewNextDoc();
     const view = mount(doc);
     fireEvent.click(chip());
-    const summary = within(dialog()).getByText("22 other checks passing");
+    const summary = within(dialog()).getByText(`${passingCount(doc)} other checks passing`);
     const disclosure = summary.closest("details")!;
     expect(disclosure.open).toBe(false);
     fireEvent.click(summary);
     expect(disclosure.open).toBe(true);
-    expect(disclosure.querySelectorAll("[data-passing-check]")).toHaveLength(22);
+    expect(disclosure.querySelectorAll("[data-passing-check]")).toHaveLength(passingCount(doc));
     expect(within(dialog()).getByText(doc.checks.find((c) => c.severity === "warn")!.title)).toBeTruthy();
 
     const allWarn = healthySilentDoc();
@@ -164,9 +167,10 @@ describe("HealthChip popover", () => {
   });
 
   it("keeps focus inside the open dialog when a live transition removes its focused item", () => {
-    const view = mount(overviewNextDoc());
+    const doc = overviewNextDoc();
+    const view = mount(doc);
     fireEvent.click(chip());
-    const summary = within(dialog()).getByText("22 other checks passing");
+    const summary = within(dialog()).getByText(`${passingCount(doc)} other checks passing`);
     (summary as HTMLElement).focus();
     refresh(view, healthySilentDoc());
     expect(document.activeElement).toBe(dialog());
@@ -206,9 +210,10 @@ describe("HealthChip popover", () => {
     fireEvent.click(chip());
     const other = screen.getByRole("button", { name: "elsewhere" });
     other.focus();
-    refresh(view, healthySilentDoc());
+    const passingDoc = healthySilentDoc();
+    refresh(view, passingDoc);
     expect(document.activeElement).toBe(other);
-    expect(within(dialog()).getByText("System health: all 23 checks passing")).toBeTruthy();
+    expect(within(dialog()).getByText(`System health: all ${applicableCount(passingDoc)} checks passing`)).toBeTruthy();
   });
 
   it("lists every attention check while the Overview card caps at three", () => {
@@ -285,10 +290,11 @@ describe("HealthChip when nothing needs attention", () => {
     expect(trigger.getAttribute("aria-haspopup")).toBe("dialog");
     fireEvent.click(trigger);
     const panel = dialog();
-    expect(within(panel).getByText("System health: all 23 checks passing")).toBeTruthy();
-    expect(panel.querySelectorAll("[data-passing-check]")).toHaveLength(doc.counts.ok);
+    expect(within(panel).getByText(`System health: all ${applicableCount(doc)} checks passing`)).toBeTruthy();
+    expect(panel.querySelectorAll("[data-passing-check]")).toHaveLength(passingCount(doc));
     expect(within(panel).getByRole("link", { name: "Open health" }).getAttribute("href")).toBe("/admin/health");
-    expect(within(panel).getByRole("region", { name: "Workers" })).toBeTruthy();
+    const workers = within(panel).getByRole("region", { name: "Workers" });
+    expect(within(workers).getByText("Hibernation wakes")).toBeTruthy();
     expect(within(panel).getByRole("region", { name: "Releases and pricing" })).toBeTruthy();
     expect(within(panel).queryByRole("region", { name: "Other" })).toBeNull();
   });
@@ -301,7 +307,7 @@ describe("HealthChip when nothing needs attention", () => {
     mount(doc);
     fireEvent.click(chip());
     const panel = dialog();
-    expect(panel.querySelectorAll("[data-passing-check]")).toHaveLength(23);
+    expect(panel.querySelectorAll("[data-passing-check]")).toHaveLength(passingCount(doc));
     expect(within(panel).queryByText("Worker image roll")).toBeNull();
     expect(within(panel).getByText("1 not applicable")).toBeTruthy();
     expect(within(within(panel).getByRole("region", { name: "Other" })).getByText("Future check")).toBeTruthy();

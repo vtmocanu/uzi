@@ -1507,11 +1507,12 @@ describe("OverviewNext health chip popover", () => {
   };
 
   it("opens a passing panel across the content column, with four desktop areas", async () => {
+    const passingDoc = healthySilentDoc();
     const chip = await mountInColumn(1280, 240, true);
     await userEvent.click(chip);
     const panel = await screen.findByRole("dialog", { name: "System health" });
     await expect.poll(() => edgeError(panel)).toBeLessThanOrEqual(1);
-    expect(within(panel).getByText("System health: all 23 checks passing")).toBeTruthy();
+    expect(within(panel).getByText(`System health: all ${passingDoc.checks.length - passingDoc.counts.na} checks passing`)).toBeTruthy();
     const grid = panel.querySelector<HTMLElement>("[data-health-passing-grid]")!;
     expect(getComputedStyle(grid).gridTemplateColumns.split(" ")).toHaveLength(4);
     expect(within(panel).getByRole("link", { name: "Open health" }).getAttribute("href")).toBe("/admin/health");
@@ -1529,10 +1530,12 @@ describe("OverviewNext health chip popover", () => {
   });
 
   it("opens and closes the passing-check disclosure with Enter and Space", async () => {
+    const attentionDoc = overviewNextDoc();
     const chip = await mountInColumn(1280, 240);
     await userEvent.click(chip);
     const panel = await screen.findByRole("dialog", { name: "System health" });
-    const summary = within(panel).getByText("22 other checks passing") as HTMLElement;
+    const passingCount = attentionDoc.checks.filter((check) => check.severity === "ok").length;
+    const summary = within(panel).getByText(`${passingCount} other checks passing`) as HTMLElement;
     const details = summary.closest("details")!;
     expect(details.open).toBe(false);
     summary.focus();
