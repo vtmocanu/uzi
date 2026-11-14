@@ -98,8 +98,12 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 	var reqCount atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqCount.Add(1)
-		if got := r.Header.Get("Accept"); got != "application/vnd.github+json" {
-			t.Errorf("Accept = %q, want application/vnd.github+json", got)
+		wantAccept := "application/vnd.github+json"
+		if strings.HasPrefix(r.URL.Path, "/repos/vtmocanu/homebrew-tap/") {
+			wantAccept = "application/vnd.github.raw+json"
+		}
+		if got := r.Header.Get("Accept"); got != wantAccept {
+			t.Errorf("Accept for %s = %q, want %q", r.URL.Path, got, wantAccept)
 		}
 		if got := r.Header.Get("Authorization"); got != "" {
 			t.Errorf("unauthenticated path sent Authorization = %q, want empty", got)
@@ -128,8 +132,8 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 	if res.Status != statusOK {
 		t.Fatalf("Status = %q, want %q (msg=%q)", res.Status, statusOK, res.Message)
 	}
-	if reqCount.Load() != 2 {
-		t.Errorf("server saw %d requests, want 2", reqCount.Load())
+	if reqCount.Load() != 4 {
+		t.Errorf("server saw %d requests, want 4 (latest, RC page, two formulas)", reqCount.Load())
 	}
 	if res.Facts.LatestTag != "v0.15.0" {
 		t.Errorf("Facts.LatestTag = %q, want v0.15.0", res.Facts.LatestTag)

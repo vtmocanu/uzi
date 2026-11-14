@@ -30,7 +30,7 @@ type updatePromptState struct {
 	// latches only when a modal is shown, so it fires at most once per `uzi tui`.
 	showing          bool
 	shownThisSession bool
-	// sel is the highlighted choice index into updateChoices() (which varies by owner).
+	// sel is the highlighted choice index into updateChoices() (which varies by owner and formula readiness).
 	sel int
 	// latestVersion / latestName / latestNotesURL are the server-authored release facts copied
 	// off buildInfoMsg.latest. They are UNTRUSTED (D7) and drawn only through cellText /
@@ -46,6 +46,8 @@ type updatePromptState struct {
 	brewPending bool
 	latest      *apitypes.LatestReleaseDTO
 	latestRC    *apitypes.LatestReleaseDTO
+	// formulas is the tap's per-formula installed tag from the same /api/version response (nil = unknown).
+	formulas *apitypes.HomebrewFormulasDTO
 	// pendingUpgrade / upgradeArgv are the foreground-exit hand-off (D1): "Update now" sets
 	// these and quits, and newTUICmd's RunE runs env.Brew(true, upgradeArgv...) after p.Run().
 	pendingUpgrade   bool
@@ -75,11 +77,11 @@ type updatePromptState struct {
 // readout already uses — so "cmp < 0" (CLI strictly behind) is exactly UpdateAvailable's
 // "latest strictly newer than running", IsValid-guarded so a `dev`/malformed version reads
 // as "not behind" rather than a false prompt.
-func (m *tuiModel) maybeShowUpdatePrompt(latest, latestRC *apitypes.LatestReleaseDTO) tea.Cmd {
+func (m *tuiModel) maybeShowUpdatePrompt(latest, latestRC *apitypes.LatestReleaseDTO, formulas *apitypes.HomebrewFormulasDTO) tea.Cmd {
 	p := &m.updatePrompt
-	p.latest, p.latestRC = latest, latestRC
+	p.latest, p.latestRC, p.formulas = latest, latestRC, formulas
 	if !m.skewCheck || !m.showVersion {
-		m.setUpdateCandidate("", "")
+		m.setUpdateCandidate("", "", false)
 		return nil
 	}
 	if !p.brewKnown {
@@ -112,18 +114,34 @@ func (m *tuiModel) maybeShowUpdatePrompt(latest, latestRC *apitypes.LatestReleas
 		}
 	}
 	if chosen == nil {
-		m.setUpdateCandidate("", "")
+		m.setUpdateCandidate("", "", false)
 		return nil
 	}
 	if cmp, ok := uzicli.CompareServerVersion(version, chosen.Version); !ok || cmp >= 0 {
-		m.setUpdateCandidate("", "")
+		m.setUpdateCandidate("", "", false)
 		return nil
 	}
 	owner := p.owner
 	if !allowedFormula(owner) {
 		owner = ""
 	}
-	m.setUpdateCandidate(owner, chosen.Version)
+	// The brew action is offered only once the OWNING formula's tap tag reaches the offered
+	// release (#4314): `brew upgrade` of a formula still pinned to an older tag would install
+	// at most that older release, so post-upgrade verification would fail ("requested ... was
+	// not reached"). The owner's formula fact is used, never the chosen
+	// channel's (an RC-owned binary offered a newer stable still upgrades uzi-cli-rc).
+	ready := false
+	if owner != "" && formulas != nil {
+		ownerTag := formulas.UziCLI
+		if owner == "uzi-cli-rc" {
+			ownerTag = formulas.UziCLIRC
+		}
+		if wellFormedReleaseTag(ownerTag) {
+			cmp, ok := uzicli.CompareServerVersion(ownerTag, chosen.Version)
+			ready = ok && cmp >= 0
+		}
+	}
+	m.setUpdateCandidate(owner, chosen.Version, ready)
 	p.latestVersion, p.latestName, p.latestNotesURL, p.security = chosen.Version, chosen.Name, chosen.NotesURL, chosen.Security
 	if owner == "" {
 		m.showUpdateCandidate()
@@ -136,16 +154,36 @@ func (m *tuiModel) maybeShowUpdatePrompt(latest, latestRC *apitypes.LatestReleas
 	return m.installedVersionCmd()
 }
 
-func (m *tuiModel) setUpdateCandidate(owner, target string) {
+// wellFormedReleaseTag reports whether a formula tag is a full MAJOR.MINOR.PATCH semver
+// (optionally v-prefixed, with prerelease/metadata). x/mod's shorthand forms such as
+// "v0.85" are valid semver but are not a tag the tap would publish, so they read as unknown.
+func wellFormedReleaseTag(tag string) bool {
+	if tag == "" || strings.TrimSpace(tag) != tag {
+		return false
+	}
+	core := strings.TrimPrefix(tag, "v")
+	if i := strings.IndexAny(core, "-+"); i >= 0 {
+		core = core[:i]
+	}
+	if strings.Count(core, ".") != 2 {
+		return false
+	}
+	_, ok := uzicli.CompareServerVersion(tag, tag)
+	return ok
+}
+
+// setUpdateCandidate records the offered (owner, target, ready) triple; a change to any of
+// the three is a new candidate. ready is whether the owning formula already installs target.
+func (m *tuiModel) setUpdateCandidate(owner, target string, ready bool) {
 	p := &m.updatePrompt
-	if p.candidate.owner == owner && p.candidate.target == target {
+	if p.candidate.owner == owner && p.candidate.target == target && p.candidate.ready == ready {
 		return
 	}
 	// An offer still open when a newer target arrives was never answered: let the new
 	// candidate re-show it once its own checks pass, instead of the session latch hiding it.
 	reopen := p.showing && target != ""
 	p.generation++
-	p.candidate = updateCandidate{owner: owner, target: target, generation: p.generation}
+	p.candidate = updateCandidate{owner: owner, target: target, ready: ready, generation: p.generation}
 	p.installedVersion = ""
 	p.showing = false
 	if reopen {
@@ -166,7 +204,9 @@ func (m *tuiModel) showUpdateCandidate() {
 
 type updateCandidate struct {
 	owner, target string
-	generation    uint64
+	// ready: the owning formula's tap tag has reached target, so `brew upgrade` can install it.
+	ready      bool
+	generation uint64
 }
 type installedVersionMsg struct {
 	candidate updateCandidate
@@ -296,15 +336,22 @@ func isStableTag(tag string) bool {
 type updateChoice int
 
 const (
-	updateChoiceUpdateNow updateChoice = iota // brew users only
+	updateChoiceUpdateNow updateChoice = iota // brew owners whose formula carries the offer (offersBrewUpgrade)
 	updateChoiceNotNow
 	updateChoiceDismiss
 )
 
-// updateChoices is the ordered choice list for the current variant: a brew user gets the
-// "Update now" action first; a non-brew user gets only "Not now" / "Don't remind me".
+// offersBrewUpgrade reports whether the modal may offer "Update now": a proven brew owner
+// whose owning formula already installs the offered release (#4314).
+func (m tuiModel) offersBrewUpgrade() bool {
+	return m.updatePrompt.owner != "" && m.updatePrompt.candidate.ready
+}
+
+// updateChoices is the ordered choice list for the current variant: a brew user whose
+// formula has the release gets the "Update now" action first; everyone else gets only
+// "Not now" / "Don't remind me".
 func (m tuiModel) updateChoices() []updateChoice {
-	if m.updatePrompt.owner != "" {
+	if m.offersBrewUpgrade() {
 		return []updateChoice{updateChoiceUpdateNow, updateChoiceNotNow, updateChoiceDismiss}
 	}
 	return []updateChoice{updateChoiceNotNow, updateChoiceDismiss}
@@ -359,6 +406,10 @@ func (m tuiModel) selectUpdateChoice(choices []updateChoice) (tea.Model, tea.Cmd
 	}
 	switch choices[m.updatePrompt.sel] {
 	case updateChoiceUpdateNow:
+		if !m.offersBrewUpgrade() { // defensive: the choice is never listed in this state
+			m.updatePrompt.showing = false
+			return m, nil
+		}
 		m.updatePrompt.pendingUpgrade = true
 		m.updatePrompt.upgradeArgv = []string{"upgrade", "vtmocanu/tap/" + m.updatePrompt.owner}
 		m.updatePrompt.offeredTarget = m.updatePrompt.latestVersion
@@ -436,9 +487,10 @@ func (m tuiModel) renderUpdatePrompt() string {
 
 	lines := []string{eyebrow, versionLine, bodyLine}
 
-	// Non-brew info variant: the release-notes URL instead of an Update-now action (UNTRUSTED,
-	// renderer.Plain). A brew user gets the action row instead, so the URL is omitted there.
-	if m.updatePrompt.owner == "" {
+	// Info variant: the release-notes URL instead of an Update-now action (UNTRUSTED,
+	// renderer.Plain), shown whenever the brew upgrade is not offered (unknown owner, or the
+	// owning formula has not caught up yet). A ready brew user gets the action row instead.
+	if !m.offersBrewUpgrade() {
 		if url := m.renderer.Plain(m.updatePrompt.latestNotesURL, updatePromptTextCap); url != "" {
 			notes := "Release notes: " + url
 			if !ascii {

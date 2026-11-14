@@ -6,7 +6,8 @@ audience: user
 
 # Update checks
 
-uzi periodically asks GitHub for the newest `vtmocanu/uzi` release and tells you
+uzi periodically asks GitHub for the newest `vtmocanu/uzi` release (and which release
+each Homebrew tap formula currently carries) and tells you
 when this instance has fallen behind — no more finding out by manually checking
 GitHub. The check runs **server-side**, on the api, every `UZI_RELEASE_CHECK_INTERVAL`
 (default `6h`); the browser and the CLI never call GitHub themselves, they only read
@@ -80,6 +81,25 @@ failures, polling and opt-outs.
 The check clears its cached RC fact when no candidate remains in the published
 release list, as happens after stable promotion prunes superseded RC entries.
 
+### Homebrew formula reads and the Update now gate
+
+The tap can lag the GitHub release, so after a successful release fetch the check
+also reads the two formulas in `vtmocanu/homebrew-tap` (`Formula/uzi-cli.rb` and
+`Formula/uzi-cli-rc.rb`, branch `main`) from `api.github.com` with the same guarded
+client, and records the uzi tag each one installs. A formula that cannot be read or
+parsed is recorded as unknown. `GET /api/version` exposes the result as the optional
+`homebrew_formulas` object (`uzi_cli`, `uzi_cli_rc`), omitted when checks are off,
+no check has run, or both are unknown; `uzi version --json` carries it under
+`server`. `latest`, `latest_rc` and `update_available` are unchanged.
+
+The `uzi tui` prompt offers "Update now" only once the formula that owns the running
+binary installs the offered version or newer. An RC-owned install offered a newer
+stable is gated on `uzi-cli-rc`. Otherwise, including when the formula is behind,
+unknown, or the server is older and omits the field, the prompt shows release
+notes only. The facts are as fresh as the last check, so a formula that catches up
+appears on the next check, not instantly. See [the TUI update
+prompt](cli.md#startup-an-available-update) for the dismissal consequences.
+
 ## Air-gapped and privacy installs
 
 Two independent admin toggles, both **on by default**, both editable at runtime from
@@ -120,10 +140,12 @@ retain the master opt-out and make no release-check request.
 
 ## Rate limits and the optional token
 
-GitHub's unauthenticated REST API allows 60 requests/hour per IP. One instance
-polling every 6 hours is trivially inside that, but every instance sharing an egress
-IP (a NAT'd fleet) shares the same budget. If you run several instances behind one
-IP, or want a shorter interval, set `UZI_RELEASE_CHECK_TOKEN` to a GitHub token —
+GitHub's unauthenticated REST API allows 60 requests/hour per IP. Each check makes
+up to four calls (latest release, release list, and the two tap formula files), so at the
+one-minute minimum interval that is 240 requests/hour, well over the unauthenticated
+limit. One instance polling every 6 hours is trivially inside it, but every instance
+sharing an egress IP (a NAT'd fleet) shares the same budget. If you run several
+instances behind one IP, or want a shorter interval, set `UZI_RELEASE_CHECK_TOKEN` to a GitHub token —
 it raises the ceiling to 5,000 requests/hour and is stored as a write-only secret,
 never shown again once saved. It is not needed at the default cadence.
 

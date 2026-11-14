@@ -21,6 +21,10 @@
     "notes_url": "x",
     "security": true
   },
+  "homebrew_formulas": {
+    "uzi_cli": "x",
+    "uzi_cli_rc": "x"
+  },
   "update_available": true,
   "far_behind": true
 }

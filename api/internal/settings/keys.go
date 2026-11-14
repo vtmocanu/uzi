@@ -261,6 +261,10 @@ const (
 	KeyReleaseRCBody        = "release_rc_body"
 	KeyReleaseRCNotesURL    = "release_rc_notes_url"
 	KeyReleaseRCPublishedAt = "release_rc_published_at"
+	// Engine-managed (absent from Defaults): the uzi tag each Homebrew tap formula
+	// installs; "" when unknown (issue #4314).
+	KeyReleaseFormulaStableTag = "release_formula_uzi_cli_tag"
+	KeyReleaseFormulaRCTag     = "release_formula_uzi_cli_rc_tag"
 	// KeyReleaseBannerSnoozeTag records the release tag an admin snoozed the escalation
 	// banner for (PRD #836 M6). Engine/admin-written via the snooze endpoint's
 	// UpsertAppSetting — kept OUT of Defaults (like the remote-fact keys) and never
