@@ -1030,6 +1030,7 @@ describe("Repos chip (issue #4334)", () => {
   it("gives a non-admin no chip and never calls the endpoint", async () => {
     await mount();
     await settle(30_000);
+    expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^Repos:/ })).toBeNull();
     expect(mockApi.adminRepoActivity).not.toHaveBeenCalled();
   });

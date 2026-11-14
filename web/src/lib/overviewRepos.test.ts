@@ -333,6 +333,15 @@ describe("demo masking and unsafe paths", () => {
     expect(hasUnsafe(row.path)).toBe(false);
   });
 
+  it("falls back to Unknown when the last segment is empty after stripping, so masking cannot promote the namespace", () => {
+    const m = model({
+      demo: true,
+      adminRuns: admin([run({ status: "running", repo_id: "r-1", repo_path: "org/‮" })]),
+      repoActivity: { repos: [], failed: false },
+    });
+    expect(activeOf(m).repos[0]).toMatchObject({ path: "Unknown", badge: "Un" });
+  });
+
   it("strips control characters with demo off and falls back to Unknown when nothing is left", () => {
     const m = model({
       adminRuns: admin([

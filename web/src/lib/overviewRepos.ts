@@ -56,7 +56,10 @@ export interface RepoActivityModel {
 // The text shown for a repo: the read's path when the repo is in it, else the run's own
 // repo_path. Always stripped of control and bidi characters, then demo-masked.
 function displayPath(raw: string, demo: boolean): string {
-  const clean = maskRepoPath(stripUnsafeChars(raw), demo).trim();
+  const stripped = stripUnsafeChars(raw);
+  // An empty last segment must not let maskRepoPath's filter(Boolean) promote the namespace to the repo name.
+  if ((stripped.split("/").pop() ?? "").trim() === "") return "Unknown";
+  const clean = maskRepoPath(stripped, demo).trim();
   return clean === "" ? "Unknown" : clean;
 }
 

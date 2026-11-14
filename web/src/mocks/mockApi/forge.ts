@@ -555,14 +555,6 @@ export const forgeApi = {
     repoToolProfiles.set(repoId, cleaned);
     return delay({ packages: cleaned });
   },
-  // PRD #66 M9 (D8): the admin cross-user blocked-repos list. DERIVED from the shared,
-  // mutable repos state (not a static deep-copy) joined with mockBlockedRepoMeta for the
-  // owner/reasons the wire Repo doesn't carry — so an Allow or Revoke on that shared
-  // state (setRepoGuardrailOverride / clearRepoGuardrailOverride) round-trips into this
-  // list, and the repo an admin allows here actually exists in the mutation's target.
-  // block_messages is never null (always []), matching the server contract. Typed as
-  // the AdminBlockedRepos envelope — the mock is a second implementation of that wire
-  // contract, so the annotation keeps the two shapes in lockstep.
   // Issue #4334: the admin repo-activity read, DERIVED from the shared repos state and the
   // mock runs like the real endpoint: every enabled repo plus every disabled repo with a
   // listed non-terminal run (no chat, judge or cross-check kinds), each with the newest
@@ -592,6 +584,14 @@ export const forgeApi = {
         })),
     });
   },
+  // PRD #66 M9 (D8): the admin cross-user blocked-repos list. DERIVED from the shared,
+  // mutable repos state (not a static deep-copy) joined with mockBlockedRepoMeta for the
+  // owner/reasons the wire Repo doesn't carry — so an Allow or Revoke on that shared
+  // state (setRepoGuardrailOverride / clearRepoGuardrailOverride) round-trips into this
+  // list, and the repo an admin allows here actually exists in the mutation's target.
+  // block_messages is never null (always []), matching the server contract. Typed as
+  // the AdminBlockedRepos envelope — the mock is a second implementation of that wire
+  // contract, so the annotation keeps the two shapes in lockstep.
   adminListBlockedRepos: async (): Promise<AdminBlockedRepos> =>
     delay({
       checks_unknown: false,

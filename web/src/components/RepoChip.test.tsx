@@ -184,7 +184,8 @@ describe("RepoChip popover", () => {
   });
 
   it("renders a disabled-but-active repo's unsafe path only from the sanitized, masked fallback", () => {
-    const evil = "evil\u202Eorg/\u001bx\u0007repo";
+    // The last segment is all unsafe characters: the raw path's badge is "?", the sanitized fallback's is "Un".
+    const evil = "evil\u202Eorg/\u202E\u001b\u0007";
     const m = repoActivityModel({
       ownRuns: [],
       adminRuns: {
@@ -200,10 +201,10 @@ describe("RepoChip popover", () => {
     renderChip(m);
     open();
     const row = within(dialog()).getAllByRole("listitem")[0];
-    const pathEl = within(row).getByText("demo/xrepo");
-    expect(pathEl.getAttribute("title")).toBe("demo/xrepo");
-    expect(row.textContent).toBe("xrdemo/xrepo1 running");
-    expect(chip().textContent).toContain("xr");
+    const pathEl = within(row).getByText("Unknown");
+    expect(pathEl.getAttribute("title")).toBe("Unknown");
+    expect(row.textContent).toBe("UnUnknown1 running");
+    expect(chip().textContent).toContain("Un");
     expect(hasUnsafe(dialog().innerHTML)).toBe(false);
     expect(hasUnsafe(chip().outerHTML)).toBe(false);
   });
