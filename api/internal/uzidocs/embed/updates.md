@@ -141,7 +141,7 @@ retain the master opt-out and make no release-check request.
 ## Rate limits and the optional token
 
 GitHub's unauthenticated REST API allows 60 requests/hour per IP. Each check makes
-four calls (latest release, release list, and the two tap formula files), so at the
+up to four calls (latest release, release list, and the two tap formula files), so at the
 one-minute minimum interval that is 240 requests/hour, well over the unauthenticated
 limit. One instance polling every 6 hours is trivially inside it, but every instance
 sharing an egress IP (a NAT'd fleet) shares the same budget. If you run several

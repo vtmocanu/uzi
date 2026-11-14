@@ -68,11 +68,11 @@ The api's runtime egress must reach `api.github.com`. A k8s NetworkPolicy or egr
 
 ## Amendment 2026-11-14 (#4314): tap formula reads
 
-The check now also reads the two Homebrew tap formulas, `Formula/uzi-cli.rb` and `Formula/uzi-cli-rc.rb` on `main` of `vtmocanu/homebrew-tap`, so the TUI can tell whether a release is installable yet (the tap can lag the GitHub Release, which corrects the "tap and release move together" assumption in the Consequences above).
+The check now also reads the two Homebrew tap formulas, `Formula/uzi-cli.rb` and `Formula/uzi-cli-rc.rb` on `main` of `vtmocanu/homebrew-tap`, so the TUI can tell whether a release is installable yet (the tap can lag the GitHub Release, which corrects the "tap and release move together" assumption recorded in PRD #1251's resolved facts).
 
 - **A second constant repo, same host and guarded client.** The paths are compile-time constants on `api.github.com`; there is still no user input in any request URL, so the forge/agent-source SSRF allowlists remain bypassed for the same reason as D8. Redirects are refused and the response is capped at 256 KiB.
 - **Token scrub.** The optional `UZI_RELEASE_CHECK_TOKEN` is sent as before and scrubbed from errors; it is never serialized.
-- **Strict validation before persistence.** The uzi tag is parsed from the formula's single `url` line pointing at `vtmocanu/uzi` archive tags, with the same rules as `scripts/brew-tap-guard.py` (the stable formula must carry a stable tag). Only a validated tag is stored.
+- **Strict validation before persistence.** The uzi tag is parsed from the formula's single `url` line pointing at `vtmocanu/uzi` archive tags, with rules ported from `scripts/brew-tap-guard.py` (the Go port only ever rejects more) (the stable formula must carry a stable tag). Only a validated tag is stored.
 - **Failures degrade to unknown.** Any fetch or parse failure stores an empty value, and the reads run only after the stable release fetch succeeds. `GET /api/version` exposes the result as the optional `homebrew_formulas` object, omitted when both are unknown.
 - **Use.** The TUI offers "Update now" only once the formula that owns the running binary installs the offered version or newer; otherwise it shows release notes only.
 - **Rate-limit cost.** Each check now makes four GitHub calls instead of two, so the one-minute minimum interval is 240 requests/hour against the 60/hour unauthenticated limit; short intervals need a token. See [docs/updates.md](../docs/updates.md).
