@@ -17,6 +17,8 @@ import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
 import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
+import { WorkerStatusBadge } from "../components/WorkerStatusBadge";
+import { isHibernating } from "../lib/workerHibernation";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerCordonMetadata } from "../components/WorkerCordonMetadata";
 import { WorkerCordonControls } from "../components/WorkerCordonControls";
@@ -886,9 +888,13 @@ export function WorkersSettings() {
                               {cap}
                             </Badge>
                           ))}
-                          <Badge tone="neutral" dot title="Worker heartbeat status; does not verify forge reachability.">
-                            {w.status}
-                          </Badge>
+                          {isHibernating(w) ? (
+                            <WorkerStatusBadge worker={w} />
+                          ) : (
+                            <Badge tone="neutral" dot title="Worker heartbeat status; does not verify forge reachability.">
+                              {w.status}
+                            </Badge>
+                          )}
                           <WorkerCordonBadge worker={w} />
                           <WorkerQuarantineBadge worker={w} />
                           <WorkerMemoryAuthorityBadge worker={w} />

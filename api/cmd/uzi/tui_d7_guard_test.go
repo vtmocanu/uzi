@@ -177,6 +177,11 @@ var d7UntrustedFields = []string{
 	// guarded above (shared with Milestone.Title) and is likewise drawn through Plain.
 	"SourceBranch",
 	"TargetBranch",
+	// Worker hibernation text (PRD #4205): the api bounds and sanitizes both, but they are
+	// operator/controller-authored free text. WakeError is drawn in workerAttention (detail
+	// view) through renderer.Plain; HibernationReason is not drawn and stays as a tripwire.
+	"WakeError",
+	"HibernationReason",
 	"PathWithNamespace",
 	// WebURL is the PR's forge URL, drawn only as an OSC-8 hyperlink target via oscLink
 	// (pullLink, https-gated). Like IssueWebURL it stays here as a tripwire for any DIRECT

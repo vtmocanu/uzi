@@ -12,9 +12,9 @@
 #     quota that lets four workers through here.
 #
 # Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, applies the
-# real goose migrations, seeds fixtures, and runs every *LiveDB test in the seven
-# packages that carry one (store, handler, forgesvc, schedsvc, workersvc, recovery, poller -- the
-# list on the `go test` line below; ci.yml runs this script once, via
+# real goose migrations, seeds fixtures, and runs every *LiveDB test in the eight
+# packages that carry one (store, handler, forgesvc, schedsvc, workersvc, recovery, poller,
+# hostedsvc -- the list on the `go test` line below; ci.yml runs this script once, via
 # `task test:codex-refresh-lostreply-e2e`, for both CI contexts).
 # Isolated: unique container + published loopback port, torn down on exit; never
 # touches the user's own stacks or DBs.
@@ -150,6 +150,7 @@ PKGS=(
   ./internal/workersvc/...
   ./internal/recovery/...
   ./internal/poller/...
+  ./internal/hostedsvc/...
 )
 # EXPLICIT XXXXXX template, NOT `mktemp -t <name>`: GNU coreutils rejects a `-t`
 # template with too few X's (it needs >=3 consecutive; this one had none) with "too

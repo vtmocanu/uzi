@@ -497,7 +497,21 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 // the TUI worker view (tui_workers.go, through renderer.Plain). The raw
 // draining_since, ephemeral, memory_authority_lost_at and residue_quarantine_* fields also ride along in `--json`
 // untouched, so scripting keys off them rather than parsing this annotation.
+//
+// Worker hibernation (PRD #4205) takes precedence over everything above: a worker whose
+// hibernation_state is not "none" reads `hibernating` (preparing), `hibernated` or `waking`
+// (plus ` (wake error)` when a wake past its timeout failed), never offline, cordoned or
+// outdated. The manual-cordon marker is the one exception: it is kept after the hibernation
+// label (`hibernated · cordoned (manual)`). The wake_error text itself is never put in a table cell.
 func statusCell(w apitypes.WorkerDTO) string {
+	if h := hibernationLabel(w); h != "" {
+		// The manual cordon is an operator decision that outlives the hibernation label, so it
+		// keeps its marker (the TUI and web show it beside the state too).
+		if w.ManualCordonedAt != nil {
+			h += " · cordoned (manual)"
+		}
+		return h
+	}
 	s := w.Status
 	if w.EffectiveCordoned && w.ManualCordonedAt == nil && w.DrainingSince == nil {
 		s += " · intake fenced"
@@ -841,4 +855,22 @@ func bindModeCell(w apitypes.WorkerDTO) string {
 		return cellText(*w.AnthropicSecretLabel)
 	}
 	return w.AnthropicBindMode
+}
+
+// hibernationLabel is the display word for a worker's hibernation_state, or "" when the
+// worker is not hibernating. It reads only the closed enum and whether wake_error is set.
+func hibernationLabel(w apitypes.WorkerDTO) string {
+	var label string
+	switch w.HibernationState {
+	case "preparing":
+		label = "hibernating"
+	case "hibernated", "waking":
+		label = w.HibernationState
+	default:
+		return ""
+	}
+	if w.WakeError != nil && *w.WakeError != "" {
+		label += " (wake error)"
+	}
+	return label
 }

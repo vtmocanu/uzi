@@ -1,6 +1,6 @@
 # PRD #4205: Worker hibernation: sleep and wake a persistent hosted worker
 
-**Epic**: #4204. **Status**: Draft. **Blocked by**: none.
+**Epic**: #4204. **Status**: Implemented (M1, M2); live hosted-k8s acceptance pending. **Blocked by**: none.
 
 ## Problem
 
@@ -90,7 +90,7 @@ A new hibernation module owns the state machine:
 **Authoritative transitions.** Controller status reports stay display-only: by contract, the `StatusReport` comment in `protocol.go` says no claim, heartbeat or register path reads them, and `handler.go:1507` agrees. Lifecycle transitions instead use a dedicated control-write route, `POST /api/controller/workers/{workerID}/hibernation`.
 
 - **Mounting:** next to `drain` and `dind-maintenance` (`handler.go:1511-1512`), in the same pattern as `api/internal/handler/controller_dind_maintenance.go`, with `DisallowUnknownFields`.
-- **Request body:** `{op_id, transition, deployment_uid, pod_uid?, reason?}`.
+- **Request body:** `{op_id, transition, deployment_uid, pod_uid?, resource_version?, reason?}`.
 - **Transitions:**
   - `refused`: the controller found a roll marker, pacing entry, disk-pressure recycle or DinD maintenance in flight, and carries the reason.
     - The api reverts to `none` only when the refusal is proven pre-patch: no `scaling_down` was sent and the resourceVersion is unchanged since admission.
@@ -126,7 +126,7 @@ A new hibernation module owns the state machine:
   - A ForceRoll does not scale up.
   - A missing Deployment is created at replicas 0.
   - No roll marker or pacing slot is taken.
-- **`waking`:** one `patchFor` write applies the current template and replicas 1. Then report `ready` with the Ready pod's UID.
+- **`waking`:** a Deployment at replicas 0 (or absent) is held there until one complete pod list shows every old pod either gone or fully stopped: a terminating pod still holds the wake, and a Succeeded or Failed pod (e.g. evicted) stops holding it only once every container status (regular, init and ephemeral) is terminated, because the phase alone is not evidence; a Succeeded or Failed pod retained only by a finalizer with all containers terminated does not hold (D27). Then one `patchFor` write applies the current template and replicas 1. Then report `ready` with the Ready pod's UID. A Deployment still at replicas 1 (a wake before any scale-down) gets the same write at once and keeps its pod.
 - It never deletes the worker's PVCs or Secret.
 - **Pacing and roll health.**
   - Hibernated and preparing workers are left out of the `planRoll` pools and coverage (`roll_pacing.go` ~181-238).
@@ -182,8 +182,8 @@ A new hibernation module owns the state machine:
   - A stale op id is rejected.
   - Each illegal transition is refused.
   - Demand while `preparing` withdraws the hibernation, in both cases:
-    - before `scaled_down`, where the same pod UID settles without a new pod;
-    - after `scaled_down`, where only a new pod UID settles.
+    - before `scaling_down` is recorded, where the same pod UID settles without a new pod;
+    - once `scaling_down` is recorded (with or without `scaled_down`), where only a new pod UID settles.
   - The wake pass runs before ephemeral provisioning and suppresses a duplicate ephemeral worker only for the demanding run, within the timeout from its first wake.
   - A run needing another capability is not suppressed.
   - Repeated passes do not wake a sibling.
@@ -207,7 +207,7 @@ A new hibernation module owns the state machine:
   - An ambiguous patch result is resolved by re-reading the Deployment before `ready` is sent.
   - After a restart, state is rebuilt from the snapshot and the annotations.
   - PVCs and the Secret survive.
-  - Waking patches replicas to 1.
+  - Waking patches replicas to 1, but from replicas 0 or an absent Deployment only once a complete pod list shows every old pod gone or fully stopped (a Succeeded or Failed pod, e.g. an evicted one, stops holding it only when every regular, init and ephemeral container status is terminated; a finalizer-retained Succeeded or Failed pod with all containers terminated does not hold it; a `ContainerStatusUnknown` termination counts as not stopped); a failed pod list holds the wake.
   - Follow the existing materializer recycle tests.
 - **Contract.** The poll-wire golden is re-recorded (never hand-authored) and both module contract tests run with `-count=1`.
 - **Web.** Vitest for the settings card, the Workers buttons and the status chip, covering a refusal message.
@@ -247,3 +247,20 @@ A live hosted-k8s check (hibernate, wake on demand, PVCs intact) is filed as a l
 - **D11. Settle on Register.** Register is row-locked and nonce-rotating. A heartbeat cannot identify the new pod.
 - **D8. Transitions go through a dedicated controller route, not the status report.** Status reports are display-only today, and lifecycle authority must be validated per op. A stale Kubernetes mutation is fenced by resourceVersion-conditioned patches. Convergence alone could interrupt a worker after it has claimed a run. Claims stay fenced until earlier mutations are resolved.
 - **D9. Wake suppression is per run.** Owner-wide suppression would starve runs needing another capability, and it would wake siblings repeatedly.
+- **D12. Controls live on Admin → Health (AI decision, 2026-11-13).** Admin → Workers did not exist (PRD #4212 is Draft), so the controls sit in the "Fleet, all users" table and move with #4212.
+- **D13. Roll admission and cordon (AI decision, 2026-11-13).** Waking workers are also excluded from roll admission, and workers in any state but `none` read `effective_cordoned`.
+- **D14. Audit scope (AI decision, 2026-11-13).** The audit table records only admin hibernate and wake. System transitions are on the row (`hibernation_reason`) and in logs.
+- **D15. Pre-patch proof for `refused` (AI decision, 2026-11-13).** The controller writes a unique annotation-only fence patch, which advances the resourceVersion, and refuses only when the fenced object lacks the op annotation. This stands in for "resourceVersion unchanged since admission", which the api never learns. `resource_version` carries the fence resourceVersion.
+- **D16. Roll evidence (AI decision, 2026-11-13).** Hibernating workers stay in the roll snapshot so reservation and marker evidence is readable, and are excluded after it. Preparing fails closed on any roll evidence, and a missing Deployment under roll evidence is neither created nor refused.
+- **D17. Re-entrant audit table (AI decision, 2026-11-13).** Down keeps it, and a re-Up validates it only when it pre-existed.
+- **D18. Op scoping (AI decision, 2026-11-13).** Resets are op-scoped and settle evidence is op-bound. A Register while preparing re-targets the admission pod until a scale-down is recorded.
+- **D19. Demand-wake recording (AI decision, 2026-11-13).** One transaction: worker lock, run `FOR SHARE`, insert `ON CONFLICT DO NOTHING`, transition. A commit error is an unknown outcome resolved by the next pass. This is atomicity only, with no storage-durability claim.
+- **D20. One wake per pending run (AI decision, 2026-11-13).** The wake row is kept until the run leaves the queue while its worker is waking or has settled awake, so a settled worker that cannot take the run never causes a sibling wake. A row whose worker is hibernated or preparing again is deleted and the run is demand again (the approved stale-row recovery). Hibernate is refused (`pending_wake_demand`) while a queued run's wake names the worker, so that recovery path is rare and a run is never stranded. (Revised 2026-11-13 in the cross-check repair.)
+- **D21. Provisioning suppression (AI decision, 2026-11-13).** Applied at the shared `provisionOne` boundary for all triggers, only while the worker is waking and within 15 minutes of the first wake.
+- **D22. Shared placement (AI decision, 2026-11-13).** The placement predicate is extracted into the set-returning inlinable function `fn_placement_admitting_workers`. The demand query adds `fn_worker_can_claim` and `fn_forge_origin_eligible`. Documented divergences from `ClaimRun`: custody-admission limit, recovery spread, released nonce, pending overflow, weekly reserve and Codex quarantine.
+- **D23. Candidate selection (AI decision, 2026-11-13).** Candidates include an already-waking worker (with no failed wake), so one woken worker serves several runs. A sleeper pre-filter keeps the pass cheap when nothing hibernates, and the scan is `LIMIT`ed to the ephemeral batch.
+- **D24. Chat continue (AI decision, 2026-11-13).** It loses its pin to a hibernated worker, and demand wakes one.
+- **D25. Downgrade (AI decision, 2026-11-13).** Disable, wait until all workers are awake, stop the api, Down 00441, 00440, 00439, then 00438, and start the older api. An older api cannot claim on the new schema.
+- **D26. LiveDB sweep (AI decision, 2026-11-13).** `hostedsvc` is added to the LiveDB sweep list.
+- **D27. Quick wake holds at zero (AI decision, 2026-11-13; MR review).** A wake that finds the Deployment at replicas 0 (or absent) keeps it there until a complete pod list shows none of the worker's pods, terminating ones included, and only then restores replicas 1. A pod in phase Succeeded or Failed (an evicted pod, which a ReplicaSet at zero leaves in place) stops holding the wake only once every container status (regular, init and ephemeral) is terminated; the phase alone is not evidence, because Kubernetes eviction publishes Failed before it kills the containers. The `scaled_down` step of `preparing` is left as it was and still waits for every pod, so a leftover evicted pod keeps the worker preparing until the preparing deadline withdraws it to waking, where it no longer blocks once all its containers are terminated. Known limit: Kubernetes keeps such a pod until its terminated-pod GC threshold, so each later hibernate of that worker repeats this 10-minute preparing-then-wake detour until the pod is deleted (no worse than before, when the wake stuck for good). Restoring at once could let the admission pod survive the scale-down, and once `scaling_down` is recorded settlement never accepts that pod, so the worker stayed `waking` for good. The settlement guard is unchanged. A scale-down that landed but whose `scaling_down` report was lost now also forces a replacement pod, which settles through ready plus Register. Only an explicit 0 holds: nil replicas (a real apiserver defaults it to 1) restores at once. Rows already stuck under the earlier controller are not repaired, because the feature was never released.
+  - **Amendment (AI-synced 2026-11-13).** Terminal-phase pods hold the wake until every container status (regular, init, ephemeral) is terminated, with no missing statuses; a termination with reason `ContainerStatusUnknown` (end never observed; it does not prove the process died, ADR-1470) counts as not stopped. Residual (AI-synced 2026-11-13): eviction residue with an unknown container status holds the wake until the api's 15-minute wake timeout records `wake_error`, and keeps holding it until the pod is removed; an admin may force-delete the stale pod only after confirming its node is down or fenced from its storage. A Succeeded or Failed pod retained only by a finalizer with complete evidence does not hold it. Terminal-phase pods are also excluded from the ready and live-pod evidence. Caveat: the controller cannot see the containers of a pod whose object was force-deleted, so an operator must confirm the node is down or fenced from its storage before force-deleting a pod that holds a wake (see `docs/hosted-workers.md`). An unreachable node's pod keeps its last running statuses and holds the wake (the api's 15-minute wake timeout records a wake error) until the node or the pod object is removed. Known trade-off: a pod evicted before its init finished keeps non-terminated statuses and holds the wake the same way; the hold fails closed rather than risk a second writer on the ReadWriteOnce volume.

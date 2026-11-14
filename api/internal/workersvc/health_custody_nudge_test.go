@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -222,5 +223,32 @@ func TestHealthNonCustodyQueuedReasonStillNudges(t *testing.T) {
 	}
 	if !w.HealthNotifiedAt.Valid {
 		t.Fatal("health_notified_at not stamped for a real (non-custody) per-run nudge")
+	}
+}
+
+// TestHealthWakingFromHibernationNoNudge: a queued run waiting on its owner's waking hibernated
+// worker gets the waking reason written and broadcast, but no per-run Slack nudge and no
+// cooldown stamp (an expected, transient wait).
+func TestHealthWakingFromHibernationNoNudge(t *testing.T) {
+	r := runRow("queued")
+	r.StatusSince = ago(15 * time.Minute)
+	fs := &healthFakeStore{
+		active:     []store.ListActiveRunsForHealthRow{r},
+		wakingRuns: map[uuid.UUID]bool{r.ID: true},
+	}
+	svc := healthSvc(fs, defaultHealthSettings())
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String != reasonWakingFromHibernation {
+		t.Fatalf("reason = %q, want %q", w.HealthReason.String, reasonWakingFromHibernation)
+	}
+	if w.HealthNotifiedAt.Valid {
+		t.Fatalf("health_notified_at = %v, want NULL", w.HealthNotifiedAt)
+	}
+	if len(b.healthNudges) != 1 || b.healthNudges[0] {
+		t.Fatalf("broadcast nudge = %v, want [false]", b.healthNudges)
 	}
 }

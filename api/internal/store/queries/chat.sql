@@ -98,6 +98,8 @@ WHERE id = (
     SELECT r.id FROM runs r
     WHERE r.user_id = @user_id
       AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
+        -- Hibernation (PRD #4205) fences every claim, resume-pinned runs included.
+        AND c.hibernation_state = 'none'
         AND (fn_worker_accepts_new_intake(c)
              OR r.worker_id = c.id))
       AND r.kind = 'chat'

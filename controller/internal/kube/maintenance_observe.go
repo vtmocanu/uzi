@@ -150,6 +150,9 @@ func (m *Materializer) maintenanceObservation(ctx context.Context, id, ns string
 		}
 	}
 	o.PodsKnown, o.WorkerPodCount, o.ReadyPodUID = true, 0, ""
+	// Not recounted here: zero means "every pod holds the wake", so a wake read from this
+	// observation would hold (fail closed) rather than inherit a stale count.
+	o.TerminalPodCount, o.StoppedPodCount = 0, 0
 	var current []corev1.Pod
 	for _, pod := range pods {
 		// Count worker-labelled pods and any pod mounting the data root, even if

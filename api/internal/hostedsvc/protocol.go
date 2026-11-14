@@ -139,7 +139,38 @@ type DesiredWorker struct {
 	// recovery is a rotation. Both are the controller's cue to reconcile the worker
 	// WITHOUT touching its Secret, never to invent or clear one.
 	JoinToken *string `json:"join_token"`
+	// Hibernation is set only while the worker is preparing, hibernated or waking
+	// (PRD #4205); omitted for an awake worker.
+	Hibernation *Hibernation `json:"hibernation,omitempty"`
 }
+
+// Hibernation is a worker's hibernation state as the controller sees it (PRD #4205).
+// State is one of preparing|hibernated|waking; the api sends the field only when the
+// worker is not awake, so a nil Hibernation means "awake" and an old controller that
+// does not know the field behaves exactly as before.
+type Hibernation struct {
+	State string `json:"state"`
+	OpID  string `json:"op_id"`
+}
+
+// HibernationTransition is the body the controller reports for one step of a
+// hibernation or wake operation (PRD #4205). The transition names are a closed set.
+type HibernationTransition struct {
+	OpID            string `json:"op_id"`
+	Transition      string `json:"transition"`
+	DeploymentUID   string `json:"deployment_uid"`
+	ResourceVersion string `json:"resource_version,omitempty"`
+	PodUID          string `json:"pod_uid,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+}
+
+// HibernationTransition.Transition values.
+const (
+	TransitionRefused     = "refused"
+	TransitionScalingDown = "scaling_down"
+	TransitionScaledDown  = "scaled_down"
+	TransitionReady       = "ready"
+)
 
 // ---------------------------------------------------------------------------
 // Status report (controller -> api), PRD #113 M4. The api's half of the wire.
@@ -170,6 +201,9 @@ type StatusReport struct {
 	PollIntervalSeconds int            `json:"poll_interval_seconds"`
 	WorkerImageTag      string         `json:"worker_image_tag"`
 	Workers             []WorkerStatus `json:"workers"`
+	// Hibernation is the highest hibernation protocol version this controller speaks
+	// (PRD #4205); omitted by a controller that predates the feature.
+	Hibernation int `json:"hibernation,omitempty"`
 }
 
 // WorkerStatus is one hosted worker's roll health as it arrives on the wire.

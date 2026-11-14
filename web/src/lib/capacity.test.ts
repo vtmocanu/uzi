@@ -8,7 +8,7 @@ const online = (active: number, cap: number | null, over = {}) =>
 describe("capacitySlots", () => {
   it("counts in-use and open slots for plain online workers", () => {
     expect(capacitySlots([online(2, 2), online(1, 4)])).toEqual({
-      inUse: 3, closed: 0, open: 3, total: 6, overCap: 0, excludedOffline: 0, excludedUnknownCap: 0,
+      inUse: 3, closed: 0, open: 3, total: 6, overCap: 0, excludedOffline: 0, excludedHibernated: 0, excludedUnknownCap: 0,
     });
   });
 
@@ -29,7 +29,22 @@ describe("capacitySlots", () => {
 
   it("excludes an offline worker whatever its cap", () => {
     const s = capacitySlots([aWorker({ status: "offline", active_runs: 1, max_concurrent_runs: 4 })]);
-    expect(s).toEqual({ inUse: 0, closed: 0, open: 0, total: 0, overCap: 0, excludedOffline: 1, excludedUnknownCap: 0 });
+    expect(s).toEqual({ inUse: 0, closed: 0, open: 0, total: 0, overCap: 0, excludedOffline: 1, excludedHibernated: 0, excludedUnknownCap: 0 });
+  });
+
+  it("excludes hibernated and waking workers from capacity and counts them apart from offline", () => {
+    const s = capacitySlots([
+      online(0, 4, { status: "offline", hibernation_state: "hibernated" }),
+      online(0, 3, { status: "online", hibernation_state: "waking" }),
+      online(1, 2),
+    ]);
+    expect(s).toEqual({ inUse: 1, closed: 0, open: 1, total: 2, overCap: 0, excludedOffline: 0, excludedHibernated: 2, excludedUnknownCap: 0 });
+  });
+
+  it("closes the spare slots of a worker that is still preparing to hibernate", () => {
+    const s = capacitySlots([online(0, 2, { hibernation_state: "preparing" })]);
+    expect(s).toMatchObject({ closed: 2, open: 0, total: 2, excludedHibernated: 0 });
+    expect(workerTakesNoNewRuns(online(0, 2, { hibernation_state: "preparing" }))).toBe(true);
   });
 
   it("reports runs beyond the cap as over-cap, never as a segment", () => {
@@ -39,7 +54,7 @@ describe("capacitySlots", () => {
 
   it("excludes an online worker with a null, non-finite or negative cap", () => {
     const s = capacitySlots([online(1, null), online(1, Number.NaN), online(1, -2), online(1, Infinity)]);
-    expect(s).toEqual({ inUse: 0, closed: 0, open: 0, total: 0, overCap: 0, excludedOffline: 0, excludedUnknownCap: 4 });
+    expect(s).toEqual({ inUse: 0, closed: 0, open: 0, total: 0, overCap: 0, excludedOffline: 0, excludedHibernated: 0, excludedUnknownCap: 4 });
   });
 
   it("ignores dedicated cross-check lanes but counts legacy ones already inside active_runs", () => {
@@ -51,7 +66,7 @@ describe("capacitySlots", () => {
   });
 
   it("is all zero for no workers", () => {
-    expect(capacitySlots([])).toEqual({ inUse: 0, closed: 0, open: 0, total: 0, overCap: 0, excludedOffline: 0, excludedUnknownCap: 0 });
+    expect(capacitySlots([])).toEqual({ inUse: 0, closed: 0, open: 0, total: 0, overCap: 0, excludedOffline: 0, excludedHibernated: 0, excludedUnknownCap: 0 });
   });
 
   it("never yields a negative figure, even for negative active_runs", () => {

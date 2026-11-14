@@ -5,13 +5,16 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -118,6 +121,20 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 		if err := h.q.UpsertControllerReport(r.Context(), pgconv.Time(observedAt)); err != nil {
 			slog.Error("controller status: advancing controller-report singleton", "error", err)
 		}
+		// PRD #4205: record the hibernation protocol version and poll interval beside it
+		// (version 0 is an honest "this controller does not speak it"). Best-effort like
+		// the write above; admission refuses on a missing or stale advertisement.
+		// Only a fleet report speaks for the advertisement: a readiness report carries
+		// Hibernation 0 by construction and must not overwrite a fleet report's value.
+		if req.Kind != "" && req.Kind != "fleet" {
+			// readiness: leave the stored advertisement untouched
+		} else if err := h.q.UpsertControllerHibernationAdvertisement(r.Context(), store.UpsertControllerHibernationAdvertisementParams{
+			AdvertisedAt:        pgconv.Time(observedAt),
+			HibernationVersion:  pgtype.Int4{Int32: clampInt32(req.Hibernation), Valid: true},
+			PollIntervalSeconds: pgtype.Int4{Int32: clampInt32(req.PollIntervalSeconds), Valid: true},
+		}); err != nil {
+			slog.Error("controller status: recording hibernation advertisement", "error", err)
+		}
 	}
 
 	var accepted, dropped int
@@ -204,4 +221,15 @@ func sanitizeSelfReportedPtr(s *string) *string {
 	}
 	out := sanitizeSelfReported(*s, maxSelfReportedBytes)
 	return &out
+}
+
+// clampInt32 bounds a controller-supplied count to the non-negative int32 range.
+func clampInt32(v int) int32 {
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int32(v)
 }

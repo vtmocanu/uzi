@@ -14,10 +14,21 @@ type WorkerDTO struct {
 	ManualCordonedByLabel *string                  `json:"manual_cordoned_by_label"`
 	ManualCordonReason    *string                  `json:"manual_cordon_reason"`
 	EffectiveCordoned     bool                     `json:"effective_cordoned"`
-	RollPacing            json.RawMessage          `json:"roll_pacing,omitempty"`
-	ID                    string                   `json:"id"`
-	Name                  string                   `json:"name"`
-	Status                string                   `json:"status"`
+	// HibernationState (PRD #4205) is "none", "preparing", "hibernated" or "waking" and is
+	// always present. Every display surface reads it before upgrade_status or cordon state:
+	// a non-"none" worker is never reported as outdated, upgrading or rolling.
+	HibernationState string `json:"hibernation_state"`
+	// HibernationReason is the admin's sanitized reason; HibernatedAt is when the pod was
+	// confirmed absent; WakeRequestedAt is when a wake began; WakeError is the bounded
+	// reason a wake past worker_wake_timeout has not completed. All null when not set.
+	HibernationReason *string         `json:"hibernation_reason"`
+	HibernatedAt      *time.Time      `json:"hibernated_at"`
+	WakeRequestedAt   *time.Time      `json:"wake_requested_at"`
+	WakeError         *string         `json:"wake_error"`
+	RollPacing        json.RawMessage `json:"roll_pacing,omitempty"`
+	ID                string          `json:"id"`
+	Name              string          `json:"name"`
+	Status            string          `json:"status"`
 	// Kind is "external" (a worker its owner runs by hand) or "hosted" (one the
 	// controller runs in the cluster, PRD #58). HostedSize is the preset name (s/m/l/l-highmem),
 	// null for an external worker. Together they are what lets the UI mark hosted

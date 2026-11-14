@@ -185,7 +185,7 @@ func (q *Queries) LockFrozenQueuedCustodyHolds(ctx context.Context, arg LockFroz
 }
 
 const lockStaleQueuedCustodyWorkers = `-- name: LockStaleQueuedCustodyWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason FROM workers w
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid FROM workers w
 WHERE w.id = ANY($1::uuid[])
   AND (w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < $2::timestamptz)
 ORDER BY w.id FOR UPDATE OF w
@@ -281,6 +281,20 @@ func (q *Queries) LockStaleQueuedCustodyWorkers(ctx context.Context, arg LockSta
 			&i.ManualCordonedBy,
 			&i.ManualCordonedByLabel,
 			&i.ManualCordonReason,
+			&i.HibernationState,
+			&i.HibernationOpID,
+			&i.HibernationRequestedAt,
+			&i.HibernatedAt,
+			&i.WakeRequestedAt,
+			&i.WakeError,
+			&i.HibernationReason,
+			&i.HibernationAdmissionPodUid,
+			&i.HibernationScalingDownAt,
+			&i.WakeReadyOpID,
+			&i.WakeReadyPodUid,
+			&i.WakeReadyResourceVersion,
+			&i.WakeRegisterOpID,
+			&i.WakeRegisterPodUid,
 		); err != nil {
 			return nil, err
 		}

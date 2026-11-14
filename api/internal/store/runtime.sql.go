@@ -1050,7 +1050,7 @@ WITH checker_template_pins AS MATERIALIZED (
           AND r.status = 'queued' AND r.user_id = $3
     ) owners
 ), claimant AS MATERIALIZED (
-    SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason FROM workers WHERE id = $1 FOR UPDATE
+    SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid FROM workers WHERE id = $1 FOR UPDATE
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id,
            r.policy_pending_fresh,
@@ -1080,6 +1080,8 @@ WITH checker_template_pins AS MATERIALIZED (
       -- NULL is unrestricted; the deadline includes the account's recovery spread.
       AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
       AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
+        -- Hibernation (PRD #4205) fences every claim, resume-pinned runs included.
+        AND c.hibernation_state = 'none'
         AND (fn_worker_accepts_new_intake(c)
              OR r.worker_id = c.id))
       AND r.kind <> 'chat' AND NOT r.cross_check_lane
@@ -2789,7 +2791,8 @@ SELECT w.id,
        COALESCE(codex_admission_run_eligible_at(run.id) <= now(), true)::boolean AS admission_eligible,
        (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), $2::timestamptz, $3::timestamptz))::boolean AS strict_candidate,
        fn_worker_accepts_new_intake(w)::boolean AS accepts_intake,
-       w.maintenance_fenced AS hard_fenced,
+       -- Hibernation (PRD #4205) fences every claim like ClaimRun does, own-worker pins included.
+       (w.maintenance_fenced OR w.hibernation_state <> 'none') AS hard_fenced,
        (w.draining_since IS NOT NULL OR w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling')) AS automatic_hold,
        w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason,
        rh.pacing, rh.pacing_observed_at, rh.blocking_reason, rh.phase,
@@ -5165,7 +5168,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid
 `
 
 type CreateWorkerParams struct {
@@ -5283,6 +5286,20 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.ManualCordonedBy,
 		&i.ManualCordonedByLabel,
 		&i.ManualCordonReason,
+		&i.HibernationState,
+		&i.HibernationOpID,
+		&i.HibernationRequestedAt,
+		&i.HibernatedAt,
+		&i.WakeRequestedAt,
+		&i.WakeError,
+		&i.HibernationReason,
+		&i.HibernationAdmissionPodUid,
+		&i.HibernationScalingDownAt,
+		&i.WakeReadyOpID,
+		&i.WakeReadyPodUid,
+		&i.WakeReadyResourceVersion,
+		&i.WakeRegisterOpID,
+		&i.WakeRegisterPodUid,
 	)
 	return i, err
 }
@@ -8859,7 +8876,7 @@ func (q *Queries) GetUnconsumedCompletionPermit(ctx context.Context, arg GetUnco
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -8940,12 +8957,26 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.ManualCordonedBy,
 		&i.ManualCordonedByLabel,
 		&i.ManualCordonReason,
+		&i.HibernationState,
+		&i.HibernationOpID,
+		&i.HibernationRequestedAt,
+		&i.HibernatedAt,
+		&i.WakeRequestedAt,
+		&i.WakeError,
+		&i.HibernationReason,
+		&i.HibernationAdmissionPodUid,
+		&i.HibernationScalingDownAt,
+		&i.WakeReadyOpID,
+		&i.WakeReadyPodUid,
+		&i.WakeReadyResourceVersion,
+		&i.WakeRegisterOpID,
+		&i.WakeRegisterPodUid,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -9031,12 +9062,26 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.ManualCordonedBy,
 		&i.ManualCordonedByLabel,
 		&i.ManualCordonReason,
+		&i.HibernationState,
+		&i.HibernationOpID,
+		&i.HibernationRequestedAt,
+		&i.HibernatedAt,
+		&i.WakeRequestedAt,
+		&i.WakeError,
+		&i.HibernationReason,
+		&i.HibernationAdmissionPodUid,
+		&i.HibernationScalingDownAt,
+		&i.WakeReadyOpID,
+		&i.WakeReadyPodUid,
+		&i.WakeReadyResourceVersion,
+		&i.WakeRegisterOpID,
+		&i.WakeRegisterPodUid,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -9118,12 +9163,26 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.ManualCordonedBy,
 		&i.ManualCordonedByLabel,
 		&i.ManualCordonReason,
+		&i.HibernationState,
+		&i.HibernationOpID,
+		&i.HibernationRequestedAt,
+		&i.HibernatedAt,
+		&i.WakeRequestedAt,
+		&i.WakeError,
+		&i.HibernationReason,
+		&i.HibernationAdmissionPodUid,
+		&i.HibernationScalingDownAt,
+		&i.WakeReadyOpID,
+		&i.WakeReadyPodUid,
+		&i.WakeReadyResourceVersion,
+		&i.WakeRegisterOpID,
+		&i.WakeRegisterPodUid,
 	)
 	return i, err
 }
 
 const getWorkerForUpdate = `-- name: GetWorkerForUpdate :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason FROM workers WHERE id = $1 FOR UPDATE
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid FROM workers WHERE id = $1 FOR UPDATE
 `
 
 // PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
@@ -9209,12 +9268,26 @@ func (q *Queries) GetWorkerForUpdate(ctx context.Context, id uuid.UUID) (Worker,
 		&i.ManualCordonedBy,
 		&i.ManualCordonedByLabel,
 		&i.ManualCordonReason,
+		&i.HibernationState,
+		&i.HibernationOpID,
+		&i.HibernationRequestedAt,
+		&i.HibernatedAt,
+		&i.WakeRequestedAt,
+		&i.WakeError,
+		&i.HibernationReason,
+		&i.HibernationAdmissionPodUid,
+		&i.HibernationScalingDownAt,
+		&i.WakeReadyOpID,
+		&i.WakeReadyPodUid,
+		&i.WakeReadyResourceVersion,
+		&i.WakeRegisterOpID,
+		&i.WakeRegisterPodUid,
 	)
 	return i, err
 }
 
 const getWorkerProjectionForOwner = `-- name: GetWorkerProjectionForOwner :one
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -9275,98 +9348,112 @@ type GetWorkerProjectionForOwnerParams struct {
 }
 
 type GetWorkerProjectionForOwnerRow struct {
-	ID                       uuid.UUID          `json:"id"`
-	UserID                   uuid.UUID          `json:"user_id"`
-	Name                     string             `json:"name"`
-	TokenHash                []byte             `json:"token_hash"`
-	Status                   string             `json:"status"`
-	LastHeartbeatAt          pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version                  pgtype.Text        `json:"version"`
-	CreatedAt                pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared         pgtype.Text        `json:"template_declared"`
-	TemplateReported         pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns        pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct              pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes            pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes       pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource              pgtype.Text        `json:"stats_source"`
-	Kind                     string             `json:"kind"`
-	HostedSize               pgtype.Text        `json:"hosted_size"`
-	HostedGeneration         int64              `json:"hosted_generation"`
-	DockerEnabled            pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID        pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicBindMode        string             `json:"anthropic_bind_mode"`
-	OnlineSince              pgtype.Timestamptz `json:"online_since"`
-	DrainingSince            pgtype.Timestamptz `json:"draining_since"`
-	Capabilities             []string           `json:"capabilities"`
-	Ephemeral                bool               `json:"ephemeral"`
-	EphemeralRunID           pgtype.UUID        `json:"ephemeral_run_id"`
-	StatsDiskNixBytes        pgtype.Int8        `json:"stats_disk_nix_bytes"`
-	StatsDiskNixTotalBytes   pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
-	StatsDiskDataBytes       pgtype.Int8        `json:"stats_disk_data_bytes"`
-	StatsDiskDataTotalBytes  pgtype.Int8        `json:"stats_disk_data_total_bytes"`
-	StatsDiskPressureStreak  int32              `json:"stats_disk_pressure_streak"`
-	ProtocolCapabilities     []string           `json:"protocol_capabilities"`
-	SnapshotEpoch            int64              `json:"snapshot_epoch"`
-	SnapshotRegisterNonce    pgtype.Text        `json:"snapshot_register_nonce"`
-	PendingOverflow          bool               `json:"pending_overflow"`
-	PendingOverflowUntil     pgtype.Timestamptz `json:"pending_overflow_until"`
-	StatsDiskDindBytes       pgtype.Int8        `json:"stats_disk_dind_bytes"`
-	StatsDiskDindTotalBytes  pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
-	StatsDiskDindInodes      pgtype.Int8        `json:"stats_disk_dind_inodes"`
-	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
-	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
-	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
-	IsolatedLane             bool               `json:"isolated_lane"`
-	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
-	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
-	LeaseBranch              pgtype.Text        `json:"lease_branch"`
-	DindRegisterFloor        pgtype.Timestamptz `json:"dind_register_floor"`
-	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
-	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
-	DindPressureStreak       int32              `json:"dind_pressure_streak"`
-	DindMeterOver            bool               `json:"dind_meter_over"`
-	DindBelowThreshold       bool               `json:"dind_below_threshold"`
-	MaintenanceOwnsDrain     bool               `json:"maintenance_owns_drain"`
-	NixPressure              bool               `json:"nix_pressure"`
-	DataPressure             bool               `json:"data_pressure"`
-	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
-	MaintenanceNonce         string             `json:"maintenance_nonce"`
-	MaintenancePhase         string             `json:"maintenance_phase"`
-	MaintenanceDeploymentUid string             `json:"maintenance_deployment_uid"`
-	MaintenancePvcUid        string             `json:"maintenance_pvc_uid"`
-	MaintenanceRegisterNonce string             `json:"maintenance_register_nonce"`
-	MaintenanceFenced        bool               `json:"maintenance_fenced"`
-	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
-	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
-	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
-	MaxCrossCheckSlots       pgtype.Int4        `json:"max_cross_check_slots"`
-	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
-	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
-	DrainingReason           pgtype.Text        `json:"draining_reason"`
-	ManualCordonedAt         pgtype.Timestamptz `json:"manual_cordoned_at"`
-	ManualCordonedBy         pgtype.UUID        `json:"manual_cordoned_by"`
-	ManualCordonedByLabel    pgtype.Text        `json:"manual_cordoned_by_label"`
-	ManualCordonReason       pgtype.Text        `json:"manual_cordon_reason"`
-	AnthropicSecretLabel     pgtype.Text        `json:"anthropic_secret_label"`
-	Busy                     bool               `json:"busy"`
-	ActiveRuns               int64              `json:"active_runs"`
-	ActiveCrossChecks        int64              `json:"active_cross_checks"`
-	RetainingUnpublishedWork bool               `json:"retaining_unpublished_work"`
-	RollPhase                pgtype.Text        `json:"roll_phase"`
-	RollPhaseSince           pgtype.Timestamptz `json:"roll_phase_since"`
-	RollPodPhase             pgtype.Text        `json:"roll_pod_phase"`
-	RollBlockingContainer    pgtype.Text        `json:"roll_blocking_container"`
-	RollBlockingReason       pgtype.Text        `json:"roll_blocking_reason"`
-	RollBlockingKind         pgtype.Text        `json:"roll_blocking_kind"`
-	RollRestartCount         pgtype.Int4        `json:"roll_restart_count"`
-	RollLastExitCode         pgtype.Int4        `json:"roll_last_exit_code"`
-	RollObservedAt           pgtype.Timestamptz `json:"roll_observed_at"`
-	RollUpgradingSince       pgtype.Timestamptz `json:"roll_upgrading_since"`
-	RollPacing               []byte             `json:"roll_pacing"`
-	RollPacingObservedAt     pgtype.Timestamptz `json:"roll_pacing_observed_at"`
-	RollWorkerImageTag       pgtype.Text        `json:"roll_worker_image_tag"`
+	ID                         uuid.UUID          `json:"id"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	Name                       string             `json:"name"`
+	TokenHash                  []byte             `json:"token_hash"`
+	Status                     string             `json:"status"`
+	LastHeartbeatAt            pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version                    pgtype.Text        `json:"version"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared           pgtype.Text        `json:"template_declared"`
+	TemplateReported           pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns          pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct                pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes              pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes         pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource                pgtype.Text        `json:"stats_source"`
+	Kind                       string             `json:"kind"`
+	HostedSize                 pgtype.Text        `json:"hosted_size"`
+	HostedGeneration           int64              `json:"hosted_generation"`
+	DockerEnabled              pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID          pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode          string             `json:"anthropic_bind_mode"`
+	OnlineSince                pgtype.Timestamptz `json:"online_since"`
+	DrainingSince              pgtype.Timestamptz `json:"draining_since"`
+	Capabilities               []string           `json:"capabilities"`
+	Ephemeral                  bool               `json:"ephemeral"`
+	EphemeralRunID             pgtype.UUID        `json:"ephemeral_run_id"`
+	StatsDiskNixBytes          pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes     pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes         pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes    pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak    int32              `json:"stats_disk_pressure_streak"`
+	ProtocolCapabilities       []string           `json:"protocol_capabilities"`
+	SnapshotEpoch              int64              `json:"snapshot_epoch"`
+	SnapshotRegisterNonce      pgtype.Text        `json:"snapshot_register_nonce"`
+	PendingOverflow            bool               `json:"pending_overflow"`
+	PendingOverflowUntil       pgtype.Timestamptz `json:"pending_overflow_until"`
+	StatsDiskDindBytes         pgtype.Int8        `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes    pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes        pgtype.Int8        `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes   pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
+	StatsDiskDataInodes        pgtype.Int8        `json:"stats_disk_data_inodes"`
+	StatsDiskDataTotalInodes   pgtype.Int8        `json:"stats_disk_data_total_inodes"`
+	IsolatedLane               bool               `json:"isolated_lane"`
+	LeaseSince                 pgtype.Timestamptz `json:"lease_since"`
+	LeaseRepoID                pgtype.UUID        `json:"lease_repo_id"`
+	LeaseBranch                pgtype.Text        `json:"lease_branch"`
+	DindRegisterFloor          pgtype.Timestamptz `json:"dind_register_floor"`
+	DindMeterEpoch             int64              `json:"dind_meter_epoch"`
+	DindMeterAt                pgtype.Timestamptz `json:"dind_meter_at"`
+	DindPressureStreak         int32              `json:"dind_pressure_streak"`
+	DindMeterOver              bool               `json:"dind_meter_over"`
+	DindBelowThreshold         bool               `json:"dind_below_threshold"`
+	MaintenanceOwnsDrain       bool               `json:"maintenance_owns_drain"`
+	NixPressure                bool               `json:"nix_pressure"`
+	DataPressure               bool               `json:"data_pressure"`
+	MaintenanceID              pgtype.UUID        `json:"maintenance_id"`
+	MaintenanceNonce           string             `json:"maintenance_nonce"`
+	MaintenancePhase           string             `json:"maintenance_phase"`
+	MaintenanceDeploymentUid   string             `json:"maintenance_deployment_uid"`
+	MaintenancePvcUid          string             `json:"maintenance_pvc_uid"`
+	MaintenanceRegisterNonce   string             `json:"maintenance_register_nonce"`
+	MaintenanceFenced          bool               `json:"maintenance_fenced"`
+	MaintenanceReadyAck        bool               `json:"maintenance_ready_ack"`
+	MaintenanceAckAt           pgtype.Timestamptz `json:"maintenance_ack_at"`
+	MaintenanceActivityFloor   pgtype.Timestamptz `json:"maintenance_activity_floor"`
+	MaxCrossCheckSlots         pgtype.Int4        `json:"max_cross_check_slots"`
+	RegisteredPodUid           pgtype.UUID        `json:"registered_pod_uid"`
+	RollHeartbeatAt            pgtype.Timestamptz `json:"roll_heartbeat_at"`
+	DrainingReason             pgtype.Text        `json:"draining_reason"`
+	ManualCordonedAt           pgtype.Timestamptz `json:"manual_cordoned_at"`
+	ManualCordonedBy           pgtype.UUID        `json:"manual_cordoned_by"`
+	ManualCordonedByLabel      pgtype.Text        `json:"manual_cordoned_by_label"`
+	ManualCordonReason         pgtype.Text        `json:"manual_cordon_reason"`
+	HibernationState           string             `json:"hibernation_state"`
+	HibernationOpID            pgtype.UUID        `json:"hibernation_op_id"`
+	HibernationRequestedAt     pgtype.Timestamptz `json:"hibernation_requested_at"`
+	HibernatedAt               pgtype.Timestamptz `json:"hibernated_at"`
+	WakeRequestedAt            pgtype.Timestamptz `json:"wake_requested_at"`
+	WakeError                  pgtype.Text        `json:"wake_error"`
+	HibernationReason          pgtype.Text        `json:"hibernation_reason"`
+	HibernationAdmissionPodUid pgtype.UUID        `json:"hibernation_admission_pod_uid"`
+	HibernationScalingDownAt   pgtype.Timestamptz `json:"hibernation_scaling_down_at"`
+	WakeReadyOpID              pgtype.UUID        `json:"wake_ready_op_id"`
+	WakeReadyPodUid            pgtype.UUID        `json:"wake_ready_pod_uid"`
+	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
+	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
+	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
+	AnthropicSecretLabel       pgtype.Text        `json:"anthropic_secret_label"`
+	Busy                       bool               `json:"busy"`
+	ActiveRuns                 int64              `json:"active_runs"`
+	ActiveCrossChecks          int64              `json:"active_cross_checks"`
+	RetainingUnpublishedWork   bool               `json:"retaining_unpublished_work"`
+	RollPhase                  pgtype.Text        `json:"roll_phase"`
+	RollPhaseSince             pgtype.Timestamptz `json:"roll_phase_since"`
+	RollPodPhase               pgtype.Text        `json:"roll_pod_phase"`
+	RollBlockingContainer      pgtype.Text        `json:"roll_blocking_container"`
+	RollBlockingReason         pgtype.Text        `json:"roll_blocking_reason"`
+	RollBlockingKind           pgtype.Text        `json:"roll_blocking_kind"`
+	RollRestartCount           pgtype.Int4        `json:"roll_restart_count"`
+	RollLastExitCode           pgtype.Int4        `json:"roll_last_exit_code"`
+	RollObservedAt             pgtype.Timestamptz `json:"roll_observed_at"`
+	RollUpgradingSince         pgtype.Timestamptz `json:"roll_upgrading_since"`
+	RollPacing                 []byte             `json:"roll_pacing"`
+	RollPacingObservedAt       pgtype.Timestamptz `json:"roll_pacing_observed_at"`
+	RollWorkerImageTag         pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
 // Same diagnostics as ListWorkersByUser, bounded by the owner and worker primary key.
@@ -9448,6 +9535,20 @@ func (q *Queries) GetWorkerProjectionForOwner(ctx context.Context, arg GetWorker
 		&i.ManualCordonedBy,
 		&i.ManualCordonedByLabel,
 		&i.ManualCordonReason,
+		&i.HibernationState,
+		&i.HibernationOpID,
+		&i.HibernationRequestedAt,
+		&i.HibernatedAt,
+		&i.WakeRequestedAt,
+		&i.WakeError,
+		&i.HibernationReason,
+		&i.HibernationAdmissionPodUid,
+		&i.HibernationScalingDownAt,
+		&i.WakeReadyOpID,
+		&i.WakeReadyPodUid,
+		&i.WakeReadyResourceVersion,
+		&i.WakeRegisterOpID,
+		&i.WakeRegisterPodUid,
 		&i.AnthropicSecretLabel,
 		&i.Busy,
 		&i.ActiveRuns,
@@ -9581,7 +9682,7 @@ UPDATE workers SET
     END,
     updated_at            = now()
 WHERE id = $23
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid
 `
 
 type HeartbeatWorkerParams struct {
@@ -9719,6 +9820,20 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.ManualCordonedBy,
 		&i.ManualCordonedByLabel,
 		&i.ManualCordonReason,
+		&i.HibernationState,
+		&i.HibernationOpID,
+		&i.HibernationRequestedAt,
+		&i.HibernatedAt,
+		&i.WakeRequestedAt,
+		&i.WakeError,
+		&i.HibernationReason,
+		&i.HibernationAdmissionPodUid,
+		&i.HibernationScalingDownAt,
+		&i.WakeReadyOpID,
+		&i.WakeReadyPodUid,
+		&i.WakeReadyResourceVersion,
+		&i.WakeRegisterOpID,
+		&i.WakeRegisterPodUid,
 	)
 	return i, err
 }
@@ -11616,7 +11731,7 @@ func (q *Queries) ListActiveRunsForWorkers(ctx context.Context, workerIds []uuid
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -11778,6 +11893,20 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.ManualCordonedBy,
 			&i.Worker.ManualCordonedByLabel,
 			&i.Worker.ManualCordonReason,
+			&i.Worker.HibernationState,
+			&i.Worker.HibernationOpID,
+			&i.Worker.HibernationRequestedAt,
+			&i.Worker.HibernatedAt,
+			&i.Worker.WakeRequestedAt,
+			&i.Worker.WakeError,
+			&i.Worker.HibernationReason,
+			&i.Worker.HibernationAdmissionPodUid,
+			&i.Worker.HibernationScalingDownAt,
+			&i.Worker.WakeReadyOpID,
+			&i.Worker.WakeReadyPodUid,
+			&i.Worker.WakeReadyResourceVersion,
+			&i.Worker.WakeRegisterOpID,
+			&i.Worker.WakeRegisterPodUid,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.ActiveCrossChecks,
@@ -12354,18 +12483,30 @@ WHERE r.health = 'waiting_worker'
   -- genuine-wait flag after both holds end. A NULL health_reason must stay included,
   -- hence the COALESCE.
   AND NOT COALESCE(r.health_reason LIKE 'waiting until %', false)
+  -- PRD #4205 M6: a run whose recorded wake names a worker that is still waking, inside
+  -- @wake_timeout of the FIRST wake, is a transient wait for a worker coming back, not a capacity
+  -- gap. Past the timeout (or once the worker's wake failed) it counts again.
+  AND NOT EXISTS (
+      SELECT 1 FROM hibernation_wakes hw
+      JOIN workers hww ON hww.id = hw.worker_id
+      WHERE hw.run_id = r.id
+        AND hww.hibernation_state = 'waking'
+        AND hww.wake_error IS NULL
+        AND hw.first_woken_at > now() - $2::interval
+  )
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND fn_worker_accepts_new_intake(w)
         AND w.last_heartbeat_at IS NOT NULL
-        AND w.last_heartbeat_at >= $2
+        AND w.last_heartbeat_at >= $3
   )
 ORDER BY CASE WHEN isfinite(r.health_since) THEN 0 ELSE 1 END, r.health_since, r.id
 `
 
 type ListOwnersWaitingNoCapacityParams struct {
 	RollReason      string             `json:"roll_reason"`
+	WakeTimeout     pgtype.Interval    `json:"wake_timeout"`
 	HeartbeatCutoff pgtype.Timestamptz `json:"heartbeat_cutoff"`
 }
 
@@ -12397,7 +12538,7 @@ type ListOwnersWaitingNoCapacityRow struct {
 // Expected plan cross-check waits are excluded:
 // an owned check finishing is not a lead waiting for worker admission.
 func (q *Queries) ListOwnersWaitingNoCapacity(ctx context.Context, arg ListOwnersWaitingNoCapacityParams) ([]ListOwnersWaitingNoCapacityRow, error) {
-	rows, err := q.db.Query(ctx, listOwnersWaitingNoCapacity, arg.RollReason, arg.HeartbeatCutoff)
+	rows, err := q.db.Query(ctx, listOwnersWaitingNoCapacity, arg.RollReason, arg.WakeTimeout, arg.HeartbeatCutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -13906,6 +14047,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND NOT w.maintenance_fenced
+        AND w.hibernation_state = 'none'
         AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), $4::timestamptz, $5::timestamptz))
@@ -13992,6 +14134,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND NOT w.maintenance_fenced
+        AND w.hibernation_state = 'none'
         AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), $4::timestamptz, $5::timestamptz))
@@ -14257,6 +14400,7 @@ WITH checker_template_pins AS MATERIALIZED (
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+LEFT JOIN checker_template_pins ctp ON ctp.user_id = r.user_id
 WHERE r.status = 'queued'
   -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, so a new
   -- ephemeral worker could never serve it (ClaimRun bars it and the reaper removes the worker).
@@ -14312,86 +14456,25 @@ WHERE r.status = 'queued'
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
   AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]))
 
+  -- PRD #4205 M5: the per-worker placement block (capabilities, protocol, lane, lease and
+  -- cross-check predicates) lives in fn_placement_admitting_workers so the hibernation wake-demand
+  -- query evaluates the SAME predicates. This caller keeps the availability conjuncts the function
+  -- deliberately omits: online, not maintenance-fenced, awake, accepting intake (or the cross-check
+  -- own-worker arm).
   AND NOT EXISTS (
-      SELECT 1 FROM workers w
-      WHERE w.user_id = r.user_id
-        AND w.status = 'online'
+      SELECT 1
+      FROM fn_placement_admitting_workers(
+              r, ctp.codex_model,
+              $5::timestamptz, $6::timestamptz,
+              $7::interval,
+              fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]),
+              $8::text[]) adm
+      JOIN workers w ON w.id = adm.worker_id
+      WHERE w.status = 'online'
         AND NOT w.maintenance_fenced
+        AND w.hibernation_state = 'none'
         AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
-        AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), $5::timestamptz, $6::timestamptz))
-        AND (r.kind = 'cross_check' OR NOT w.ephemeral
-             -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
-             -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
-             -- provisioned for.
-             OR (fn_ephemeral_lease_admits(
-                    w.lease_since, w.lease_repo_id, w.lease_branch, NOT fn_worker_accepts_new_intake(w),
-                    $7::interval, now(),
-                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]) OR COALESCE(w.docker_enabled, false))
-                 -- The lease admits only runs outside the isolated lane.
-                 AND NOT w.isolated_lane))
-        -- Protocol requirements apply to persistent and leased workers alike.
-        AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
-                      OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
-      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
-      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
-      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, the side row's worker_id (not runs.worker_id, which resume writers clear); a NULL side worker_id is held. No affinity-ceiling release.
-      AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL AND pc.worker_id IS DISTINCT FROM w.id)
-        AND (r.completion_contract_version IS NULL
-                      OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
-        -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
-        -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
-        -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
-        AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
-        AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
-        AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
-      AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
-                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
-                 AND (r.completion_contract_version IS NULL
-                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
-                 AND (
-                     NOT (
-                         r.harness = 'codex'
-                         AND r.kind NOT IN ('judge', 'chat')
-                         AND r.review_target_run_id IS NULL
-                         AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY($8::text[]) THEN r.model
-                                        ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
-                                  = ANY($8::text[])),
-                             false)
-                     )
-                     OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
-                 )
-        AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
-             OR 'cross_check_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
-             OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
-             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
-        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
-             OR 'cross_check_owner_steering_v1' = ANY(w.protocol_capabilities))
-        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
-             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
-      AND (r.kind <> 'cross_check' OR EXISTS (
-          SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
-          WHERE protocol_check.checker_run_id = r.id
-            AND protocol_check.lead_run_id = r.target_run_id AND protocol_lead.user_id = r.user_id
-            AND protocol_lead.kind <> 'cross_check' AND protocol_check.stage IN ('plan','code')
-            AND protocol_check.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = protocol_check.lead_run_id AND latest.stage = protocol_check.stage)
-            AND ((protocol_check.stage = 'plan' AND protocol_check.verdict = 'pending') OR (protocol_check.stage = 'code' AND protocol_check.outcome = 'pending' AND protocol_check.interrupted_at IS NULL AND 'cross_check_code_v1' = ANY(w.protocol_capabilities) AND 'cross_check_lane_v1' = ANY(w.protocol_capabilities))) AND protocol_check.deadline_at > now()
-            AND (protocol_lead.status IN ('claimed','running') OR (protocol_check.stage = 'code' AND protocol_lead.status = 'awaiting_followup' AND protocol_lead.kind = 'task' AND protocol_lead.interactive)) AND protocol_lead.claim_released_at IS NULL
-            AND protocol_lead.claim_generation = protocol_check.lead_claim_generation
-            AND (protocol_check.round = 1 OR (protocol_check.automatic_rounds_enabled
-                AND protocol_check.round <= protocol_check.automatic_revision_limit + 1
-                AND 'cross_check_rounds_v1' = ANY(w.protocol_capabilities)))
-      ))
-      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL))) OR 'cross_check_pins_v1' = ANY(w.protocol_capabilities))
-        AND r.required_capabilities <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
   )
   -- The job arm: a job is placeable ONLY on an online, non-draining, non-ephemeral, NON-docker
   -- worker advertising 'job_runner_v1' (ClaimRun's non-bypassable job-runner clause). Only a job
@@ -14685,7 +14768,7 @@ func (q *Queries) ListWorkerPendingSince(ctx context.Context, workerID uuid.UUID
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -14742,98 +14825,112 @@ ORDER BY w.created_at ASC
 `
 
 type ListWorkersByUserRow struct {
-	ID                       uuid.UUID          `json:"id"`
-	UserID                   uuid.UUID          `json:"user_id"`
-	Name                     string             `json:"name"`
-	TokenHash                []byte             `json:"token_hash"`
-	Status                   string             `json:"status"`
-	LastHeartbeatAt          pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version                  pgtype.Text        `json:"version"`
-	CreatedAt                pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared         pgtype.Text        `json:"template_declared"`
-	TemplateReported         pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns        pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct              pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes            pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes       pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource              pgtype.Text        `json:"stats_source"`
-	Kind                     string             `json:"kind"`
-	HostedSize               pgtype.Text        `json:"hosted_size"`
-	HostedGeneration         int64              `json:"hosted_generation"`
-	DockerEnabled            pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID        pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicBindMode        string             `json:"anthropic_bind_mode"`
-	OnlineSince              pgtype.Timestamptz `json:"online_since"`
-	DrainingSince            pgtype.Timestamptz `json:"draining_since"`
-	Capabilities             []string           `json:"capabilities"`
-	Ephemeral                bool               `json:"ephemeral"`
-	EphemeralRunID           pgtype.UUID        `json:"ephemeral_run_id"`
-	StatsDiskNixBytes        pgtype.Int8        `json:"stats_disk_nix_bytes"`
-	StatsDiskNixTotalBytes   pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
-	StatsDiskDataBytes       pgtype.Int8        `json:"stats_disk_data_bytes"`
-	StatsDiskDataTotalBytes  pgtype.Int8        `json:"stats_disk_data_total_bytes"`
-	StatsDiskPressureStreak  int32              `json:"stats_disk_pressure_streak"`
-	ProtocolCapabilities     []string           `json:"protocol_capabilities"`
-	SnapshotEpoch            int64              `json:"snapshot_epoch"`
-	SnapshotRegisterNonce    pgtype.Text        `json:"snapshot_register_nonce"`
-	PendingOverflow          bool               `json:"pending_overflow"`
-	PendingOverflowUntil     pgtype.Timestamptz `json:"pending_overflow_until"`
-	StatsDiskDindBytes       pgtype.Int8        `json:"stats_disk_dind_bytes"`
-	StatsDiskDindTotalBytes  pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
-	StatsDiskDindInodes      pgtype.Int8        `json:"stats_disk_dind_inodes"`
-	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
-	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
-	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
-	IsolatedLane             bool               `json:"isolated_lane"`
-	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
-	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
-	LeaseBranch              pgtype.Text        `json:"lease_branch"`
-	DindRegisterFloor        pgtype.Timestamptz `json:"dind_register_floor"`
-	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
-	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
-	DindPressureStreak       int32              `json:"dind_pressure_streak"`
-	DindMeterOver            bool               `json:"dind_meter_over"`
-	DindBelowThreshold       bool               `json:"dind_below_threshold"`
-	MaintenanceOwnsDrain     bool               `json:"maintenance_owns_drain"`
-	NixPressure              bool               `json:"nix_pressure"`
-	DataPressure             bool               `json:"data_pressure"`
-	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
-	MaintenanceNonce         string             `json:"maintenance_nonce"`
-	MaintenancePhase         string             `json:"maintenance_phase"`
-	MaintenanceDeploymentUid string             `json:"maintenance_deployment_uid"`
-	MaintenancePvcUid        string             `json:"maintenance_pvc_uid"`
-	MaintenanceRegisterNonce string             `json:"maintenance_register_nonce"`
-	MaintenanceFenced        bool               `json:"maintenance_fenced"`
-	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
-	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
-	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
-	MaxCrossCheckSlots       pgtype.Int4        `json:"max_cross_check_slots"`
-	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
-	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
-	DrainingReason           pgtype.Text        `json:"draining_reason"`
-	ManualCordonedAt         pgtype.Timestamptz `json:"manual_cordoned_at"`
-	ManualCordonedBy         pgtype.UUID        `json:"manual_cordoned_by"`
-	ManualCordonedByLabel    pgtype.Text        `json:"manual_cordoned_by_label"`
-	ManualCordonReason       pgtype.Text        `json:"manual_cordon_reason"`
-	AnthropicSecretLabel     pgtype.Text        `json:"anthropic_secret_label"`
-	Busy                     bool               `json:"busy"`
-	ActiveRuns               int64              `json:"active_runs"`
-	ActiveCrossChecks        int64              `json:"active_cross_checks"`
-	RetainingUnpublishedWork bool               `json:"retaining_unpublished_work"`
-	RollPhase                pgtype.Text        `json:"roll_phase"`
-	RollPhaseSince           pgtype.Timestamptz `json:"roll_phase_since"`
-	RollPodPhase             pgtype.Text        `json:"roll_pod_phase"`
-	RollBlockingContainer    pgtype.Text        `json:"roll_blocking_container"`
-	RollBlockingReason       pgtype.Text        `json:"roll_blocking_reason"`
-	RollBlockingKind         pgtype.Text        `json:"roll_blocking_kind"`
-	RollRestartCount         pgtype.Int4        `json:"roll_restart_count"`
-	RollLastExitCode         pgtype.Int4        `json:"roll_last_exit_code"`
-	RollObservedAt           pgtype.Timestamptz `json:"roll_observed_at"`
-	RollUpgradingSince       pgtype.Timestamptz `json:"roll_upgrading_since"`
-	RollPacing               []byte             `json:"roll_pacing"`
-	RollPacingObservedAt     pgtype.Timestamptz `json:"roll_pacing_observed_at"`
-	RollWorkerImageTag       pgtype.Text        `json:"roll_worker_image_tag"`
+	ID                         uuid.UUID          `json:"id"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	Name                       string             `json:"name"`
+	TokenHash                  []byte             `json:"token_hash"`
+	Status                     string             `json:"status"`
+	LastHeartbeatAt            pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version                    pgtype.Text        `json:"version"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared           pgtype.Text        `json:"template_declared"`
+	TemplateReported           pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns          pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct                pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes              pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes         pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource                pgtype.Text        `json:"stats_source"`
+	Kind                       string             `json:"kind"`
+	HostedSize                 pgtype.Text        `json:"hosted_size"`
+	HostedGeneration           int64              `json:"hosted_generation"`
+	DockerEnabled              pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID          pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode          string             `json:"anthropic_bind_mode"`
+	OnlineSince                pgtype.Timestamptz `json:"online_since"`
+	DrainingSince              pgtype.Timestamptz `json:"draining_since"`
+	Capabilities               []string           `json:"capabilities"`
+	Ephemeral                  bool               `json:"ephemeral"`
+	EphemeralRunID             pgtype.UUID        `json:"ephemeral_run_id"`
+	StatsDiskNixBytes          pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes     pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes         pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes    pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak    int32              `json:"stats_disk_pressure_streak"`
+	ProtocolCapabilities       []string           `json:"protocol_capabilities"`
+	SnapshotEpoch              int64              `json:"snapshot_epoch"`
+	SnapshotRegisterNonce      pgtype.Text        `json:"snapshot_register_nonce"`
+	PendingOverflow            bool               `json:"pending_overflow"`
+	PendingOverflowUntil       pgtype.Timestamptz `json:"pending_overflow_until"`
+	StatsDiskDindBytes         pgtype.Int8        `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes    pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes        pgtype.Int8        `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes   pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
+	StatsDiskDataInodes        pgtype.Int8        `json:"stats_disk_data_inodes"`
+	StatsDiskDataTotalInodes   pgtype.Int8        `json:"stats_disk_data_total_inodes"`
+	IsolatedLane               bool               `json:"isolated_lane"`
+	LeaseSince                 pgtype.Timestamptz `json:"lease_since"`
+	LeaseRepoID                pgtype.UUID        `json:"lease_repo_id"`
+	LeaseBranch                pgtype.Text        `json:"lease_branch"`
+	DindRegisterFloor          pgtype.Timestamptz `json:"dind_register_floor"`
+	DindMeterEpoch             int64              `json:"dind_meter_epoch"`
+	DindMeterAt                pgtype.Timestamptz `json:"dind_meter_at"`
+	DindPressureStreak         int32              `json:"dind_pressure_streak"`
+	DindMeterOver              bool               `json:"dind_meter_over"`
+	DindBelowThreshold         bool               `json:"dind_below_threshold"`
+	MaintenanceOwnsDrain       bool               `json:"maintenance_owns_drain"`
+	NixPressure                bool               `json:"nix_pressure"`
+	DataPressure               bool               `json:"data_pressure"`
+	MaintenanceID              pgtype.UUID        `json:"maintenance_id"`
+	MaintenanceNonce           string             `json:"maintenance_nonce"`
+	MaintenancePhase           string             `json:"maintenance_phase"`
+	MaintenanceDeploymentUid   string             `json:"maintenance_deployment_uid"`
+	MaintenancePvcUid          string             `json:"maintenance_pvc_uid"`
+	MaintenanceRegisterNonce   string             `json:"maintenance_register_nonce"`
+	MaintenanceFenced          bool               `json:"maintenance_fenced"`
+	MaintenanceReadyAck        bool               `json:"maintenance_ready_ack"`
+	MaintenanceAckAt           pgtype.Timestamptz `json:"maintenance_ack_at"`
+	MaintenanceActivityFloor   pgtype.Timestamptz `json:"maintenance_activity_floor"`
+	MaxCrossCheckSlots         pgtype.Int4        `json:"max_cross_check_slots"`
+	RegisteredPodUid           pgtype.UUID        `json:"registered_pod_uid"`
+	RollHeartbeatAt            pgtype.Timestamptz `json:"roll_heartbeat_at"`
+	DrainingReason             pgtype.Text        `json:"draining_reason"`
+	ManualCordonedAt           pgtype.Timestamptz `json:"manual_cordoned_at"`
+	ManualCordonedBy           pgtype.UUID        `json:"manual_cordoned_by"`
+	ManualCordonedByLabel      pgtype.Text        `json:"manual_cordoned_by_label"`
+	ManualCordonReason         pgtype.Text        `json:"manual_cordon_reason"`
+	HibernationState           string             `json:"hibernation_state"`
+	HibernationOpID            pgtype.UUID        `json:"hibernation_op_id"`
+	HibernationRequestedAt     pgtype.Timestamptz `json:"hibernation_requested_at"`
+	HibernatedAt               pgtype.Timestamptz `json:"hibernated_at"`
+	WakeRequestedAt            pgtype.Timestamptz `json:"wake_requested_at"`
+	WakeError                  pgtype.Text        `json:"wake_error"`
+	HibernationReason          pgtype.Text        `json:"hibernation_reason"`
+	HibernationAdmissionPodUid pgtype.UUID        `json:"hibernation_admission_pod_uid"`
+	HibernationScalingDownAt   pgtype.Timestamptz `json:"hibernation_scaling_down_at"`
+	WakeReadyOpID              pgtype.UUID        `json:"wake_ready_op_id"`
+	WakeReadyPodUid            pgtype.UUID        `json:"wake_ready_pod_uid"`
+	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
+	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
+	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
+	AnthropicSecretLabel       pgtype.Text        `json:"anthropic_secret_label"`
+	Busy                       bool               `json:"busy"`
+	ActiveRuns                 int64              `json:"active_runs"`
+	ActiveCrossChecks          int64              `json:"active_cross_checks"`
+	RetainingUnpublishedWork   bool               `json:"retaining_unpublished_work"`
+	RollPhase                  pgtype.Text        `json:"roll_phase"`
+	RollPhaseSince             pgtype.Timestamptz `json:"roll_phase_since"`
+	RollPodPhase               pgtype.Text        `json:"roll_pod_phase"`
+	RollBlockingContainer      pgtype.Text        `json:"roll_blocking_container"`
+	RollBlockingReason         pgtype.Text        `json:"roll_blocking_reason"`
+	RollBlockingKind           pgtype.Text        `json:"roll_blocking_kind"`
+	RollRestartCount           pgtype.Int4        `json:"roll_restart_count"`
+	RollLastExitCode           pgtype.Int4        `json:"roll_last_exit_code"`
+	RollObservedAt             pgtype.Timestamptz `json:"roll_observed_at"`
+	RollUpgradingSince         pgtype.Timestamptz `json:"roll_upgrading_since"`
+	RollPacing                 []byte             `json:"roll_pacing"`
+	RollPacingObservedAt       pgtype.Timestamptz `json:"roll_pacing_observed_at"`
+	RollWorkerImageTag         pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
 // Worker list for the owning user. Three derived signals (PRD #42 Decision 10):
@@ -14942,6 +15039,20 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.ManualCordonedBy,
 			&i.ManualCordonedByLabel,
 			&i.ManualCordonReason,
+			&i.HibernationState,
+			&i.HibernationOpID,
+			&i.HibernationRequestedAt,
+			&i.HibernatedAt,
+			&i.WakeRequestedAt,
+			&i.WakeError,
+			&i.HibernationReason,
+			&i.HibernationAdmissionPodUid,
+			&i.HibernationScalingDownAt,
+			&i.WakeReadyOpID,
+			&i.WakeReadyPodUid,
+			&i.WakeReadyResourceVersion,
+			&i.WakeRegisterOpID,
+			&i.WakeRegisterPodUid,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -19530,7 +19641,7 @@ SET protocol_capabilities = ARRAY(
     max_concurrent_runs = GREATEST(workers.max_concurrent_runs, $2::integer),
     max_cross_check_slots = GREATEST(workers.max_cross_check_slots, $3::integer)
 WHERE id = $4 AND snapshot_register_nonce = $5::text
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid
 `
 
 type RefreshWorkerProtocolParams struct {
@@ -19627,6 +19738,20 @@ func (q *Queries) RefreshWorkerProtocol(ctx context.Context, arg RefreshWorkerPr
 		&i.ManualCordonedBy,
 		&i.ManualCordonedByLabel,
 		&i.ManualCordonReason,
+		&i.HibernationState,
+		&i.HibernationOpID,
+		&i.HibernationRequestedAt,
+		&i.HibernatedAt,
+		&i.WakeRequestedAt,
+		&i.WakeError,
+		&i.HibernationReason,
+		&i.HibernationAdmissionPodUid,
+		&i.HibernationScalingDownAt,
+		&i.WakeReadyOpID,
+		&i.WakeReadyPodUid,
+		&i.WakeReadyResourceVersion,
+		&i.WakeRegisterOpID,
+		&i.WakeRegisterPodUid,
 	)
 	return i, err
 }
@@ -19722,7 +19847,7 @@ WITH prev AS (
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since    = NULL,
@@ -19776,7 +19901,7 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid FROM upd
 `
 
 type RegisterWorkerParams struct {
@@ -19792,80 +19917,94 @@ type RegisterWorkerParams struct {
 }
 
 type RegisterWorkerRow struct {
-	ID                       uuid.UUID          `json:"id"`
-	UserID                   uuid.UUID          `json:"user_id"`
-	Name                     string             `json:"name"`
-	TokenHash                []byte             `json:"token_hash"`
-	Status                   string             `json:"status"`
-	LastHeartbeatAt          pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version                  pgtype.Text        `json:"version"`
-	CreatedAt                pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared         pgtype.Text        `json:"template_declared"`
-	TemplateReported         pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns        pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct              pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes            pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes       pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource              pgtype.Text        `json:"stats_source"`
-	Kind                     string             `json:"kind"`
-	HostedSize               pgtype.Text        `json:"hosted_size"`
-	HostedGeneration         int64              `json:"hosted_generation"`
-	DockerEnabled            pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID        pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicBindMode        string             `json:"anthropic_bind_mode"`
-	OnlineSince              pgtype.Timestamptz `json:"online_since"`
-	DrainingSince            pgtype.Timestamptz `json:"draining_since"`
-	Capabilities             []string           `json:"capabilities"`
-	Ephemeral                bool               `json:"ephemeral"`
-	EphemeralRunID           pgtype.UUID        `json:"ephemeral_run_id"`
-	StatsDiskNixBytes        pgtype.Int8        `json:"stats_disk_nix_bytes"`
-	StatsDiskNixTotalBytes   pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
-	StatsDiskDataBytes       pgtype.Int8        `json:"stats_disk_data_bytes"`
-	StatsDiskDataTotalBytes  pgtype.Int8        `json:"stats_disk_data_total_bytes"`
-	StatsDiskPressureStreak  int32              `json:"stats_disk_pressure_streak"`
-	ProtocolCapabilities     []string           `json:"protocol_capabilities"`
-	SnapshotEpoch            int64              `json:"snapshot_epoch"`
-	SnapshotRegisterNonce    pgtype.Text        `json:"snapshot_register_nonce"`
-	PendingOverflow          bool               `json:"pending_overflow"`
-	PendingOverflowUntil     pgtype.Timestamptz `json:"pending_overflow_until"`
-	StatsDiskDindBytes       pgtype.Int8        `json:"stats_disk_dind_bytes"`
-	StatsDiskDindTotalBytes  pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
-	StatsDiskDindInodes      pgtype.Int8        `json:"stats_disk_dind_inodes"`
-	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
-	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
-	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
-	IsolatedLane             bool               `json:"isolated_lane"`
-	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
-	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
-	LeaseBranch              pgtype.Text        `json:"lease_branch"`
-	DindRegisterFloor        pgtype.Timestamptz `json:"dind_register_floor"`
-	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
-	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
-	DindPressureStreak       int32              `json:"dind_pressure_streak"`
-	DindMeterOver            bool               `json:"dind_meter_over"`
-	DindBelowThreshold       bool               `json:"dind_below_threshold"`
-	MaintenanceOwnsDrain     bool               `json:"maintenance_owns_drain"`
-	NixPressure              bool               `json:"nix_pressure"`
-	DataPressure             bool               `json:"data_pressure"`
-	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
-	MaintenanceNonce         string             `json:"maintenance_nonce"`
-	MaintenancePhase         string             `json:"maintenance_phase"`
-	MaintenanceDeploymentUid string             `json:"maintenance_deployment_uid"`
-	MaintenancePvcUid        string             `json:"maintenance_pvc_uid"`
-	MaintenanceRegisterNonce string             `json:"maintenance_register_nonce"`
-	MaintenanceFenced        bool               `json:"maintenance_fenced"`
-	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
-	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
-	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
-	MaxCrossCheckSlots       pgtype.Int4        `json:"max_cross_check_slots"`
-	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
-	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
-	DrainingReason           pgtype.Text        `json:"draining_reason"`
-	ManualCordonedAt         pgtype.Timestamptz `json:"manual_cordoned_at"`
-	ManualCordonedBy         pgtype.UUID        `json:"manual_cordoned_by"`
-	ManualCordonedByLabel    pgtype.Text        `json:"manual_cordoned_by_label"`
-	ManualCordonReason       pgtype.Text        `json:"manual_cordon_reason"`
+	ID                         uuid.UUID          `json:"id"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	Name                       string             `json:"name"`
+	TokenHash                  []byte             `json:"token_hash"`
+	Status                     string             `json:"status"`
+	LastHeartbeatAt            pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version                    pgtype.Text        `json:"version"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared           pgtype.Text        `json:"template_declared"`
+	TemplateReported           pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns          pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct                pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes              pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes         pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource                pgtype.Text        `json:"stats_source"`
+	Kind                       string             `json:"kind"`
+	HostedSize                 pgtype.Text        `json:"hosted_size"`
+	HostedGeneration           int64              `json:"hosted_generation"`
+	DockerEnabled              pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID          pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode          string             `json:"anthropic_bind_mode"`
+	OnlineSince                pgtype.Timestamptz `json:"online_since"`
+	DrainingSince              pgtype.Timestamptz `json:"draining_since"`
+	Capabilities               []string           `json:"capabilities"`
+	Ephemeral                  bool               `json:"ephemeral"`
+	EphemeralRunID             pgtype.UUID        `json:"ephemeral_run_id"`
+	StatsDiskNixBytes          pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes     pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes         pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes    pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak    int32              `json:"stats_disk_pressure_streak"`
+	ProtocolCapabilities       []string           `json:"protocol_capabilities"`
+	SnapshotEpoch              int64              `json:"snapshot_epoch"`
+	SnapshotRegisterNonce      pgtype.Text        `json:"snapshot_register_nonce"`
+	PendingOverflow            bool               `json:"pending_overflow"`
+	PendingOverflowUntil       pgtype.Timestamptz `json:"pending_overflow_until"`
+	StatsDiskDindBytes         pgtype.Int8        `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes    pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes        pgtype.Int8        `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes   pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
+	StatsDiskDataInodes        pgtype.Int8        `json:"stats_disk_data_inodes"`
+	StatsDiskDataTotalInodes   pgtype.Int8        `json:"stats_disk_data_total_inodes"`
+	IsolatedLane               bool               `json:"isolated_lane"`
+	LeaseSince                 pgtype.Timestamptz `json:"lease_since"`
+	LeaseRepoID                pgtype.UUID        `json:"lease_repo_id"`
+	LeaseBranch                pgtype.Text        `json:"lease_branch"`
+	DindRegisterFloor          pgtype.Timestamptz `json:"dind_register_floor"`
+	DindMeterEpoch             int64              `json:"dind_meter_epoch"`
+	DindMeterAt                pgtype.Timestamptz `json:"dind_meter_at"`
+	DindPressureStreak         int32              `json:"dind_pressure_streak"`
+	DindMeterOver              bool               `json:"dind_meter_over"`
+	DindBelowThreshold         bool               `json:"dind_below_threshold"`
+	MaintenanceOwnsDrain       bool               `json:"maintenance_owns_drain"`
+	NixPressure                bool               `json:"nix_pressure"`
+	DataPressure               bool               `json:"data_pressure"`
+	MaintenanceID              pgtype.UUID        `json:"maintenance_id"`
+	MaintenanceNonce           string             `json:"maintenance_nonce"`
+	MaintenancePhase           string             `json:"maintenance_phase"`
+	MaintenanceDeploymentUid   string             `json:"maintenance_deployment_uid"`
+	MaintenancePvcUid          string             `json:"maintenance_pvc_uid"`
+	MaintenanceRegisterNonce   string             `json:"maintenance_register_nonce"`
+	MaintenanceFenced          bool               `json:"maintenance_fenced"`
+	MaintenanceReadyAck        bool               `json:"maintenance_ready_ack"`
+	MaintenanceAckAt           pgtype.Timestamptz `json:"maintenance_ack_at"`
+	MaintenanceActivityFloor   pgtype.Timestamptz `json:"maintenance_activity_floor"`
+	MaxCrossCheckSlots         pgtype.Int4        `json:"max_cross_check_slots"`
+	RegisteredPodUid           pgtype.UUID        `json:"registered_pod_uid"`
+	RollHeartbeatAt            pgtype.Timestamptz `json:"roll_heartbeat_at"`
+	DrainingReason             pgtype.Text        `json:"draining_reason"`
+	ManualCordonedAt           pgtype.Timestamptz `json:"manual_cordoned_at"`
+	ManualCordonedBy           pgtype.UUID        `json:"manual_cordoned_by"`
+	ManualCordonedByLabel      pgtype.Text        `json:"manual_cordoned_by_label"`
+	ManualCordonReason         pgtype.Text        `json:"manual_cordon_reason"`
+	HibernationState           string             `json:"hibernation_state"`
+	HibernationOpID            pgtype.UUID        `json:"hibernation_op_id"`
+	HibernationRequestedAt     pgtype.Timestamptz `json:"hibernation_requested_at"`
+	HibernatedAt               pgtype.Timestamptz `json:"hibernated_at"`
+	WakeRequestedAt            pgtype.Timestamptz `json:"wake_requested_at"`
+	WakeError                  pgtype.Text        `json:"wake_error"`
+	HibernationReason          pgtype.Text        `json:"hibernation_reason"`
+	HibernationAdmissionPodUid pgtype.UUID        `json:"hibernation_admission_pod_uid"`
+	HibernationScalingDownAt   pgtype.Timestamptz `json:"hibernation_scaling_down_at"`
+	WakeReadyOpID              pgtype.UUID        `json:"wake_ready_op_id"`
+	WakeReadyPodUid            pgtype.UUID        `json:"wake_ready_pod_uid"`
+	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
+	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
+	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -20003,6 +20142,20 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.ManualCordonedBy,
 		&i.ManualCordonedByLabel,
 		&i.ManualCordonReason,
+		&i.HibernationState,
+		&i.HibernationOpID,
+		&i.HibernationRequestedAt,
+		&i.HibernatedAt,
+		&i.WakeRequestedAt,
+		&i.WakeError,
+		&i.HibernationReason,
+		&i.HibernationAdmissionPodUid,
+		&i.HibernationScalingDownAt,
+		&i.WakeReadyOpID,
+		&i.WakeReadyPodUid,
+		&i.WakeReadyResourceVersion,
+		&i.WakeRegisterOpID,
+		&i.WakeRegisterPodUid,
 	)
 	return i, err
 }
@@ -27237,7 +27390,7 @@ SET anthropic_secret_id = $1,
     anthropic_bind_mode = $2,
     updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid
 `
 
 type SetWorkerAnthropicSecretParams struct {
@@ -27352,6 +27505,20 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.ManualCordonedBy,
 		&i.ManualCordonedByLabel,
 		&i.ManualCordonReason,
+		&i.HibernationState,
+		&i.HibernationOpID,
+		&i.HibernationRequestedAt,
+		&i.HibernatedAt,
+		&i.WakeRequestedAt,
+		&i.WakeError,
+		&i.HibernationReason,
+		&i.HibernationAdmissionPodUid,
+		&i.HibernationScalingDownAt,
+		&i.WakeReadyOpID,
+		&i.WakeReadyPodUid,
+		&i.WakeReadyResourceVersion,
+		&i.WakeRegisterOpID,
+		&i.WakeRegisterPodUid,
 	)
 	return i, err
 }

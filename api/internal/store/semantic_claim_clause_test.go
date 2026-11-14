@@ -37,6 +37,7 @@ func TestSemanticClaimClausesPinnedPerQuery(t *testing.T) {
 		got, strays, codex := map[string]int{}, map[string]int{}, map[string]int{}
 		for _, block := range strings.Split(string(raw), "\n-- name: ")[1:] {
 			name := strings.Fields(block)[0]
+			block = expandPlacementFunction(t, block)
 			if n := len(c.re.FindAllString(block, -1)); n > 0 {
 				got[name] = n
 			}

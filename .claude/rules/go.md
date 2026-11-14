@@ -87,7 +87,7 @@ Same token-not-annotation mechanism as `+goose`, with GitLab as the parser.
 - `go test ./...` does not cover them: they skip silently without `UZI_TEST_DATABASE_URL`.
 - Run the ordinary gate with that variable unset; exporting it there turns them red, because package binaries race one shared database and truncate mid-flight.
 - Run the sweep via `./e2e/run-store-it.sh`, or by hand with `-p 1`. `-p 1` is load-bearing, not a speed knob: without it you get nondeterministic reds that look like a regression in whatever you just touched.
-- The sweep runs only the packages it enumerates; a `*LiveDB` test in any other package runs nowhere while its skip message claims otherwise. The one list, `PKGS` in `e2e/run-store-it.sh` (CI runs that script, not a copy), carries seven: `store`, `handler`, `forgesvc`, `schedsvc`, `workersvc`, `recovery`, `poller`.
+- The sweep runs only the packages it enumerates; a `*LiveDB` test in any other package runs nowhere while its skip message claims otherwise. The one list, `PKGS` in `e2e/run-store-it.sh` (CI runs that script, not a copy), carries eight: `store`, `handler`, `forgesvc`, `schedsvc`, `workersvc`, `recovery`, `poller`, `hostedsvc`.
 - A `*LiveDB` test in a new package is a one-list edit, `PKGS` in `./e2e/run-store-it.sh`; CI runs that script once for both the `test-api-store-it` and `test-codex-refresh-lostreply-e2e` contexts. The skip message is a claim about that list: do not write it before it is true.
 - Fixtures share one database across packages, so a fixed literal in a `UNIQUE` column (`workers.token_hash` bit here) passes alone and fails once another package inserted it first. Derive per-test uniqueness from a fresh `uuid.New()`, as `handler/hosted_provision_livedb_test.go` documents.
 

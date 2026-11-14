@@ -14,7 +14,7 @@ func TestCrossCheckCombinedSQLMirrorParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blocks := namedQueryBlocks(string(raw))
+	blocks := expandedQueryBlocks(t, string(raw))
 	diagnostic := blocks["CountOnlineWorkersClaimableForRun"]
 	if strings.Count(diagnostic, "fn_cross_check_child_eligible(jsonb_populate_record(w, '{\"maintenance_fenced\":false}'::jsonb), run, false,") != 1 {
 		t.Fatal("manual diagnostic must clear only the hard fence for static suitability")

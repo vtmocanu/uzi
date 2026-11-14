@@ -331,8 +331,11 @@ type CodexRefreshIntent struct {
 }
 
 type ControllerReportStatus struct {
-	ID         int16              `json:"id"`
-	ObservedAt pgtype.Timestamptz `json:"observed_at"`
+	ID                      int16              `json:"id"`
+	ObservedAt              pgtype.Timestamptz `json:"observed_at"`
+	HibernationVersion      pgtype.Int4        `json:"hibernation_version"`
+	HibernationAdvertisedAt pgtype.Timestamptz `json:"hibernation_advertised_at"`
+	PollIntervalSeconds     pgtype.Int4        `json:"poll_interval_seconds"`
 }
 
 type CrossCheck struct {
@@ -529,6 +532,12 @@ type HealthEpisodeNotice struct {
 	EpisodeID  uuid.UUID          `json:"episode_id"`
 	UserID     uuid.UUID          `json:"user_id"`
 	NotifiedAt pgtype.Timestamptz `json:"notified_at"`
+}
+
+type HibernationWake struct {
+	RunID        uuid.UUID          `json:"run_id"`
+	WorkerID     uuid.UUID          `json:"worker_id"`
+	FirstWokenAt pgtype.Timestamptz `json:"first_woken_at"`
 }
 
 type HostedWorkerToken struct {
@@ -1896,80 +1905,94 @@ type VaultBrowserSlot struct {
 }
 
 type Worker struct {
-	ID                       uuid.UUID          `json:"id"`
-	UserID                   uuid.UUID          `json:"user_id"`
-	Name                     string             `json:"name"`
-	TokenHash                []byte             `json:"token_hash"`
-	Status                   string             `json:"status"`
-	LastHeartbeatAt          pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version                  pgtype.Text        `json:"version"`
-	CreatedAt                pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared         pgtype.Text        `json:"template_declared"`
-	TemplateReported         pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns        pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct              pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes            pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes       pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource              pgtype.Text        `json:"stats_source"`
-	Kind                     string             `json:"kind"`
-	HostedSize               pgtype.Text        `json:"hosted_size"`
-	HostedGeneration         int64              `json:"hosted_generation"`
-	DockerEnabled            pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID        pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicBindMode        string             `json:"anthropic_bind_mode"`
-	OnlineSince              pgtype.Timestamptz `json:"online_since"`
-	DrainingSince            pgtype.Timestamptz `json:"draining_since"`
-	Capabilities             []string           `json:"capabilities"`
-	Ephemeral                bool               `json:"ephemeral"`
-	EphemeralRunID           pgtype.UUID        `json:"ephemeral_run_id"`
-	StatsDiskNixBytes        pgtype.Int8        `json:"stats_disk_nix_bytes"`
-	StatsDiskNixTotalBytes   pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
-	StatsDiskDataBytes       pgtype.Int8        `json:"stats_disk_data_bytes"`
-	StatsDiskDataTotalBytes  pgtype.Int8        `json:"stats_disk_data_total_bytes"`
-	StatsDiskPressureStreak  int32              `json:"stats_disk_pressure_streak"`
-	ProtocolCapabilities     []string           `json:"protocol_capabilities"`
-	SnapshotEpoch            int64              `json:"snapshot_epoch"`
-	SnapshotRegisterNonce    pgtype.Text        `json:"snapshot_register_nonce"`
-	PendingOverflow          bool               `json:"pending_overflow"`
-	PendingOverflowUntil     pgtype.Timestamptz `json:"pending_overflow_until"`
-	StatsDiskDindBytes       pgtype.Int8        `json:"stats_disk_dind_bytes"`
-	StatsDiskDindTotalBytes  pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
-	StatsDiskDindInodes      pgtype.Int8        `json:"stats_disk_dind_inodes"`
-	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
-	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
-	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
-	IsolatedLane             bool               `json:"isolated_lane"`
-	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
-	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
-	LeaseBranch              pgtype.Text        `json:"lease_branch"`
-	DindRegisterFloor        pgtype.Timestamptz `json:"dind_register_floor"`
-	DindMeterEpoch           int64              `json:"dind_meter_epoch"`
-	DindMeterAt              pgtype.Timestamptz `json:"dind_meter_at"`
-	DindPressureStreak       int32              `json:"dind_pressure_streak"`
-	DindMeterOver            bool               `json:"dind_meter_over"`
-	DindBelowThreshold       bool               `json:"dind_below_threshold"`
-	MaintenanceOwnsDrain     bool               `json:"maintenance_owns_drain"`
-	NixPressure              bool               `json:"nix_pressure"`
-	DataPressure             bool               `json:"data_pressure"`
-	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
-	MaintenanceNonce         string             `json:"maintenance_nonce"`
-	MaintenancePhase         string             `json:"maintenance_phase"`
-	MaintenanceDeploymentUid string             `json:"maintenance_deployment_uid"`
-	MaintenancePvcUid        string             `json:"maintenance_pvc_uid"`
-	MaintenanceRegisterNonce string             `json:"maintenance_register_nonce"`
-	MaintenanceFenced        bool               `json:"maintenance_fenced"`
-	MaintenanceReadyAck      bool               `json:"maintenance_ready_ack"`
-	MaintenanceAckAt         pgtype.Timestamptz `json:"maintenance_ack_at"`
-	MaintenanceActivityFloor pgtype.Timestamptz `json:"maintenance_activity_floor"`
-	MaxCrossCheckSlots       pgtype.Int4        `json:"max_cross_check_slots"`
-	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
-	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
-	DrainingReason           pgtype.Text        `json:"draining_reason"`
-	ManualCordonedAt         pgtype.Timestamptz `json:"manual_cordoned_at"`
-	ManualCordonedBy         pgtype.UUID        `json:"manual_cordoned_by"`
-	ManualCordonedByLabel    pgtype.Text        `json:"manual_cordoned_by_label"`
-	ManualCordonReason       pgtype.Text        `json:"manual_cordon_reason"`
+	ID                         uuid.UUID          `json:"id"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	Name                       string             `json:"name"`
+	TokenHash                  []byte             `json:"token_hash"`
+	Status                     string             `json:"status"`
+	LastHeartbeatAt            pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version                    pgtype.Text        `json:"version"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared           pgtype.Text        `json:"template_declared"`
+	TemplateReported           pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns          pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct                pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes              pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes         pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource                pgtype.Text        `json:"stats_source"`
+	Kind                       string             `json:"kind"`
+	HostedSize                 pgtype.Text        `json:"hosted_size"`
+	HostedGeneration           int64              `json:"hosted_generation"`
+	DockerEnabled              pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID          pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode          string             `json:"anthropic_bind_mode"`
+	OnlineSince                pgtype.Timestamptz `json:"online_since"`
+	DrainingSince              pgtype.Timestamptz `json:"draining_since"`
+	Capabilities               []string           `json:"capabilities"`
+	Ephemeral                  bool               `json:"ephemeral"`
+	EphemeralRunID             pgtype.UUID        `json:"ephemeral_run_id"`
+	StatsDiskNixBytes          pgtype.Int8        `json:"stats_disk_nix_bytes"`
+	StatsDiskNixTotalBytes     pgtype.Int8        `json:"stats_disk_nix_total_bytes"`
+	StatsDiskDataBytes         pgtype.Int8        `json:"stats_disk_data_bytes"`
+	StatsDiskDataTotalBytes    pgtype.Int8        `json:"stats_disk_data_total_bytes"`
+	StatsDiskPressureStreak    int32              `json:"stats_disk_pressure_streak"`
+	ProtocolCapabilities       []string           `json:"protocol_capabilities"`
+	SnapshotEpoch              int64              `json:"snapshot_epoch"`
+	SnapshotRegisterNonce      pgtype.Text        `json:"snapshot_register_nonce"`
+	PendingOverflow            bool               `json:"pending_overflow"`
+	PendingOverflowUntil       pgtype.Timestamptz `json:"pending_overflow_until"`
+	StatsDiskDindBytes         pgtype.Int8        `json:"stats_disk_dind_bytes"`
+	StatsDiskDindTotalBytes    pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
+	StatsDiskDindInodes        pgtype.Int8        `json:"stats_disk_dind_inodes"`
+	StatsDiskDindTotalInodes   pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
+	StatsDiskDataInodes        pgtype.Int8        `json:"stats_disk_data_inodes"`
+	StatsDiskDataTotalInodes   pgtype.Int8        `json:"stats_disk_data_total_inodes"`
+	IsolatedLane               bool               `json:"isolated_lane"`
+	LeaseSince                 pgtype.Timestamptz `json:"lease_since"`
+	LeaseRepoID                pgtype.UUID        `json:"lease_repo_id"`
+	LeaseBranch                pgtype.Text        `json:"lease_branch"`
+	DindRegisterFloor          pgtype.Timestamptz `json:"dind_register_floor"`
+	DindMeterEpoch             int64              `json:"dind_meter_epoch"`
+	DindMeterAt                pgtype.Timestamptz `json:"dind_meter_at"`
+	DindPressureStreak         int32              `json:"dind_pressure_streak"`
+	DindMeterOver              bool               `json:"dind_meter_over"`
+	DindBelowThreshold         bool               `json:"dind_below_threshold"`
+	MaintenanceOwnsDrain       bool               `json:"maintenance_owns_drain"`
+	NixPressure                bool               `json:"nix_pressure"`
+	DataPressure               bool               `json:"data_pressure"`
+	MaintenanceID              pgtype.UUID        `json:"maintenance_id"`
+	MaintenanceNonce           string             `json:"maintenance_nonce"`
+	MaintenancePhase           string             `json:"maintenance_phase"`
+	MaintenanceDeploymentUid   string             `json:"maintenance_deployment_uid"`
+	MaintenancePvcUid          string             `json:"maintenance_pvc_uid"`
+	MaintenanceRegisterNonce   string             `json:"maintenance_register_nonce"`
+	MaintenanceFenced          bool               `json:"maintenance_fenced"`
+	MaintenanceReadyAck        bool               `json:"maintenance_ready_ack"`
+	MaintenanceAckAt           pgtype.Timestamptz `json:"maintenance_ack_at"`
+	MaintenanceActivityFloor   pgtype.Timestamptz `json:"maintenance_activity_floor"`
+	MaxCrossCheckSlots         pgtype.Int4        `json:"max_cross_check_slots"`
+	RegisteredPodUid           pgtype.UUID        `json:"registered_pod_uid"`
+	RollHeartbeatAt            pgtype.Timestamptz `json:"roll_heartbeat_at"`
+	DrainingReason             pgtype.Text        `json:"draining_reason"`
+	ManualCordonedAt           pgtype.Timestamptz `json:"manual_cordoned_at"`
+	ManualCordonedBy           pgtype.UUID        `json:"manual_cordoned_by"`
+	ManualCordonedByLabel      pgtype.Text        `json:"manual_cordoned_by_label"`
+	ManualCordonReason         pgtype.Text        `json:"manual_cordon_reason"`
+	HibernationState           string             `json:"hibernation_state"`
+	HibernationOpID            pgtype.UUID        `json:"hibernation_op_id"`
+	HibernationRequestedAt     pgtype.Timestamptz `json:"hibernation_requested_at"`
+	HibernatedAt               pgtype.Timestamptz `json:"hibernated_at"`
+	WakeRequestedAt            pgtype.Timestamptz `json:"wake_requested_at"`
+	WakeError                  pgtype.Text        `json:"wake_error"`
+	HibernationReason          pgtype.Text        `json:"hibernation_reason"`
+	HibernationAdmissionPodUid pgtype.UUID        `json:"hibernation_admission_pod_uid"`
+	HibernationScalingDownAt   pgtype.Timestamptz `json:"hibernation_scaling_down_at"`
+	WakeReadyOpID              pgtype.UUID        `json:"wake_ready_op_id"`
+	WakeReadyPodUid            pgtype.UUID        `json:"wake_ready_pod_uid"`
+	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
+	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
+	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
 }
 
 type WorkerActiveRun struct {
@@ -1999,6 +2022,18 @@ type WorkerCordonEvent struct {
 	Action     string             `json:"action"`
 	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
 	Reason     pgtype.Text        `json:"reason"`
+}
+
+type WorkerHibernationEvent struct {
+	ID         uuid.UUID          `json:"id"`
+	OwnerID    uuid.UUID          `json:"owner_id"`
+	WorkerID   uuid.UUID          `json:"worker_id"`
+	ActorID    uuid.UUID          `json:"actor_id"`
+	ActorLabel string             `json:"actor_label"`
+	Action     string             `json:"action"`
+	OpID       uuid.UUID          `json:"op_id"`
+	Reason     pgtype.Text        `json:"reason"`
+	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
 }
 
 type WorkerPendingOutcomeIdentity struct {
