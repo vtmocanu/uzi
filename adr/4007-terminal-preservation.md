@@ -1,6 +1,6 @@
 # ADR-4007: a run's terminal work is preserved under its own forge ref namespace, separate from held work and checkpoint retention
 
-**Status**: Accepted (slice A implemented API-side and dark: no shipped worker advertises the capability, so no ref is created, no gate fires and the sweep lists no rows; slice B is in progress (partial, dark), slices C to E and the retirement switch are deferred, see below)
+**Status**: Accepted (slice A implemented API-side and dark: no shipped worker advertises the capability, so no ref is created, no gate fires and the sweep lists no rows; slice B is partially built and dark: the worker producer exists behind a compile-time-off gate and runs nowhere in production, slices C to E and the retirement switch are deferred, see below)
 **Date**: 2026-11-13
 **Issue**: [vtmocanu/uzi#4007](https://github.com/vtmocanu/uzi/issues/4007)
 **Refs**: #4007, #2545, #1810, #1867, #2507, #1296
@@ -208,7 +208,8 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
 
 - **B**: worker capture and publication (the caller of the route), omission
   detection, and teaching the agent decoders the two new completion reasons.
-  B must not advertise `recovery_terminal_preservation_v1` before D's owner
+  B is partially built and production-dark (see "Slice B (partially built,
+  production-dark)" below); the remainder is deferred. B must not advertise `recovery_terminal_preservation_v1` before D's owner
   escape for removal-blocking refs lands.
 - **C**: reclaim and custody.
 - **C/D**: retirement enablement: a consumer-admission fence, a complete
@@ -218,12 +219,15 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
 - **E**: fleet rollout.
 - **Purge** of finished rows.
 
-### Slice B (partial, in progress)
+### Slice B (partially built, production-dark)
 
-Slice B is the worker half: the producer that calls the route. It is being
-delivered partially and production-dark; this section states its planned
-contract and supersedes the Deferred "B" bullet for the parts it scopes in.
-Nothing below runs in production.
+Slice B is the worker half: the producer that calls the route. It is built
+partially and is production-dark: the code below exists and is tested with
+fakes and real Git, but it is behind a compile-time-off gate, so none of it
+runs in production and nothing here is shipped behaviour. This section
+supersedes the Deferred "B" bullet for the parts it scopes in. Passive decoding
+of the two new completion reasons is the one part that is not gated (see
+"Protocol decoding").
 
 - **Gate.** One compile-time constant, `TERMINAL_PRESERVATION_ENABLED = false`
   in `agent/src/terminal-preservation.ts`, is the first check of every new
@@ -246,8 +250,12 @@ Nothing below runs in production.
   stash, a linked worktree, and incomplete private refs after a crash. B
   deletes nothing; removal of incomplete private refs is slice C's.
 - **Still deferred.** The T4 shared excluded-origin fence, D's owner escape
-  with CLI, one-worker activation and startup disable, retirement (T3),
-  reclaim and custody (C), fleet rollout (E) and hosted acceptance.
+  with CLI (including clearing a `localBlock`), one-worker activation and
+  startup disable (including upgrade-time pending journals), retirement (T3),
+  reclaim and custody (C, including G12), fleet rollout (E), hosted
+  acceptance, the named follow-up "#4007 slice B2-contracts" (the kept labels'
+  output-contract analysis and the G7 callers) and the #4001 predecessor
+  exclusion.
 
 #### Source universe and the feasibility gate (M3)
 
@@ -319,8 +327,95 @@ real `RecoveryCoordinator`.
   universe does not read dirty content), and egress binding (the claim carries
   no egress marker, so it is a caller-supplied input).
 
-The remaining sections of slice B (capture, preparation, records and
-callers) are filled in as they land.
+#### Protocol decoding
+
+The agent decodes `terminal_preservation_pending` and
+`terminal_preservation_refused` as completion-release refusals at three sites,
+and the strict route client (`publishTerminalPreservation` in
+`agent/src/client.ts`) decodes the route's responses. Decoding is passive: it
+needs no gate and starts no work. Retryable refusal reasons are unknown, not
+final; only `published` at the tip or `recorded` is a final outcome.
+
+#### Capture (`GitCache.captureTerminalSnapshot`)
+
+Capture runs bounded pre-staging refusals before any object is written. A
+credential-path denylist is defence in depth only; the control is the secret
+scan over the published range. Dirty work is committed through a private index
+(the clone's `.git/index`, HEAD, branch and other refs are untouched), and the
+staged tree is validated before the commit. Capture refuses a symlinked
+objects directory, a `commondir`, and foreign alternates (only a bare-pointing
+alternate is admitted). The snapshot's parent must be on
+`refs/uzi-runner/<branch>` in the bare. The result is fetched into the bare
+through a staging ref (`refs/uzi-incoming/<uuid>`) and then pinned at a
+private ref `refs/uzi-terminal-local/<run>/g<gen>` (in the clone while
+transient, in the bare once private), and a post-fetch reachable-object check
+runs. `buildTerminalAggregate` builds the aggregate over the captured roots.
+
+#### Pinned preparation
+
+`prepareFrozenHeldPinned` (see ADR-2545 amendment) prepares over a frozen
+range: it takes an opt-in `perCommitCi` check (`changedCiPathsPerCommit`,
+under a cumulative budget) and returns the scan digest and transport digest
+(`terminalScanDigest`, `terminalTransportDigest`). The range is persisted with
+its presence preserved, and retries never re-resolve it.
+
+#### Operation records and the ordered engine
+
+Operation records (`agent/src/terminal-operation.ts`) live under
+`<dataDir>/terminal-preservation/<runId>/`, outside the recovery run directory.
+They are MAC-bound with a domain-separated key, merge monotonically, append
+invocations only, grow a `localBlock`, and are immutable once closed. Every
+write is validated by the decoder before it lands, so a record stays decodable.
+One operation owner at a time, and the journal lock is never held across the
+network. Before any send, the engine scans all the run's records for a
+secret latch. A `generation_bound` or `prior_tip_mismatch` response becomes a
+`conflict` record with a `server_conflict` outcome. The secret latch is written
+before the flagged commits are. Rediscovery never sends and never deletes: a
+`capturing` or `captured` record found on restart becomes `incomplete`, with
+its private refs retained.
+
+#### Callers
+
+All callers sit behind the gate. The in-lane send and the head decision run in
+`finishCommittedPublish`, and `journalTerminalReport` runs in place. The
+reap-body seat is bounded by its permit, with a proportional reserve (the
+lane's cap is 120 s, the reserve is 30 s or a quarter of the permit, whichever
+is smaller, and a window under 5 s starts nothing). The completion head is
+attached only for a `published` or `recorded` manifest root. A held V2
+replay/resume runs inside `inventorySourceBoundary` before any held FINAL; a
+non-final outcome keeps the hold and no hold is reopened.
+
+#### Failure model and what is not claimed
+
+The failure model is process crash only. No storage or power-loss durability
+is claimed.
+
+#### Named gaps and kept classes (not shipped)
+
+- **G5, G7 (excluded sends).** Permanent failure, `rate_limited`, cancel,
+  iteration cancel and owner cancel have no in-lane seat and are not
+  preserved. Deferred to "#4007 slice B2-contracts".
+- **G8.** The capture-scope allowlist is not defined.
+- **G9.** A present non-current attempt clone is kept, not proved.
+- **G10.** Held replay roots not reachable from the frozen source are kept.
+- **G11.** Clone-local refs that are not ancestors of HEAD, stashes and linked
+  worktrees are kept.
+- **G12.** Incomplete private refs are retained until slice C removes them.
+- **Foreign-owner over-conservatism.** See the known limits under the
+  feasibility gate.
+- **Unreferenced objects.** A malicious pack can leave unreferenced objects in
+  the bare. The shared fetch-back class is pre-existing in `fetchAgentBranch`
+  and is tracked separately.
+- **Untracked directories.** Replay refuses clones with untracked directories,
+  because dirty extents use plain status.
+- **Dirty snapshot not in the manifest.** The dirty snapshot is in the
+  published tip but is not declared in the manifest.
+- **Workers without attempt paths.** A non-Docker worker without attempt paths
+  skips with `source_unknown`, and would lose `completion_final_head` once the
+  gate is activated.
+- **Claude reap window.** About 22.5 s, so a short permit leaves a small lane.
+- **(a1)/(a2) without held capture.** These fall back to the 120 s cap and are
+  not bounded by the shutdown deadline.
 
 ### Review corrections: preparation and a proven local no-send
 
