@@ -4,8 +4,9 @@
 // built here once the worker is quiescent and holds the pod-epoch lock exclusively:
 //   - the census: a bounded, lstat-only walk of the whole data volume, every node classified into one of the
 //     entry kinds below, plus the Docker daemon's inventory on the DinD lane;
-//   - the shutdown fingerprint: the same census recomputed under a deadline, so the api can compare the digest
-//     and fingerprint of the volume at hibernation with the volume at termination.
+//   - the shutdown fingerprint: ONLY the walk fingerprint recomputed under a deadline (no discovery, holds, content
+//     proofs or Docker), reported with the digest of the accepted census, so the api compares the volume at
+//     hibernation with the volume at termination and server-side state cannot make an untouched volume differ.
 //
 // WHAT IS CLASSIFIED (the shared vocabulary with the api evaluator; every value matches ^[a-z0-9_:.-]{1,64}$)
 //   kind            runtime_lock outbox agent_home jobs lost_found bare_repo runner_ref worktree canonical_clone
@@ -25,11 +26,9 @@
 //   agent-home/                  agent_home: disposable only when empty, else unknown (main.ts sdkHomeRoot)
 //   jobs/                        jobs: disposable only when empty, else unknown (main.ts jobsRoot)
 //   lost+found/                  lost_found: disposable only when empty, else unknown (the filesystem's own)
-//   .uzi-authority/              runtime_lock, disposable: worker.lock and authority.lock plus the authenticated
-//                                authority store (enrollment, heads, slots, boundaries) that is bound to this
-//                                volume's own storage id and is re-enrolled on a fresh volume. JUDGEMENT CALL (the
-//                                plan names only the lock files): the store describes sources of this volume, and
-//                                every source it could describe is classified on its own below.
+//   .uzi-authority/              runtime_lock: disposable only when it holds nothing but the lock files worker.lock
+//                                and authority.lock; the authenticated authority store (enrollment, heads, slots,
+//                                boundaries) is unknown (the plan names only the lock files as disposable)
 //   .uzi-epoch.lock, .uzi-epoch-consumed, .uzi-pod-entry
 //                                runtime_lock, disposable (the pod-epoch lock and its ledger, pod-epoch-init.cjs)
 //
@@ -47,9 +46,9 @@
 // `complete: false`. The fingerprint is taken from a final walk after every classification step, so it describes
 // the volume the proofs actually saw.
 //
-// VOLATILE DIRECTORIES: the worker's own TMPDIR (a live writer the worker itself drives, the same one the scratch
-// reclaim never removes) is recorded as a bare node: its children are not walked and its own times are not in the
-// fingerprint, otherwise the census's own temporary files would change it. It is classified `disposable`.
+// THE WORKER'S OWN TMPDIR is walked and fingerprinted like everything else (no directory is exempt). In the split
+// layout it is `runner/.tmp/uzi-worker`: empty is disposable, any content is unknown (fail closed). In the single
+// layout it IS the scratch root (`runner/.tmp`), whose leaves are classified by the scratch classifier.
 import { createHash } from "node:crypto";
 import { promises as fsp, type BigIntStats } from "node:fs";
 import http from "node:http";
@@ -81,11 +80,16 @@ const MAX_DISPLAY_PATH = 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA40 = /^[0-9a-f]{40}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
-/** C0, DEL, C1, the Arabic letter mark, zero-width and directional marks, line/paragraph separators, bidi controls. */
-// oxlint-disable-next-line no-control-regex -- the control and bidi characters are exactly what is being matched
-const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb]/;
+/** The Unicode categories the api rejects: controls (Cc), format characters (Cf: soft hyphen, bidi and zero-width
+ *  marks, Arabic number signs, tag characters), line and paragraph separators (Zl, Zp). */
+const UNSAFE_CHARS = /\p{Cc}|\p{Cf}|\p{Zl}|\p{Zp}/u;
 const RECOVERY_STORES = new Set(["recovery", "recovery-maintenance", "recovery-settlement", "recovery-archive"]);
+/** Pure runtime markers with no data value, all written by templates/pod-epoch-init.cjs: `.uzi-epoch.lock` (the flock
+ *  target), `.uzi-epoch-consumed` (names.ledger: the consumed pod-uid ledger) and `.uzi-pod-entry` (names.record, written
+ *  by writeRecord: the current and previous pod uid). Each is re-initialised on a fresh volume. */
 const RUNTIME_FILES = new Set([".uzi-epoch.lock", ".uzi-epoch-consumed", ".uzi-pod-entry"]);
+/** The only files of `.uzi-authority/` that are disposable (authority-lock.ts); the authenticated store beside them is not. */
+const AUTHORITY_LOCK_FILES = new Set(["worker.lock", "authority.lock"]);
 
 export interface CensusLimits {
   /** Nodes the walk may record before the census is incomplete (default 500,000). */
@@ -98,8 +102,9 @@ export interface HibernationCensusDeps {
   dataDir: string;
   /** Top-level directory names under dataDir, from config.outboxDataDir and main.ts's agent-home and jobs roots. */
   layout: { outbox: string; agentHome: string; jobs: string };
-  /** Absolute directories whose children are never walked (the worker's own TMPDIR), when inside dataDir. */
-  volatileDirs?: readonly string[];
+  /** The worker's own TMPDIR (absolute), when inside dataDir. It is walked and fingerprinted; in the split layout a
+   *  non-empty one is unknown. */
+  workerTmpDirs?: readonly string[];
   /** The scratch reclaim's root for runner leaves (scratchLayout(env).root), when the layout is the shipped one. */
   scratchRoot?: string;
   dockerHost?: string;
@@ -139,7 +144,7 @@ const typeOf = (st: BigIntStats): Node["type"] =>
   st.isDirectory() ? "dir" : st.isSymbolicLink() ? "symlink" : st.isFile() ? "file" : "other";
 
 async function walkVolume(dataDir: string, opts: {
-  maxNodes: number; walkMs: number; volatile: ReadonlySet<string>; signal: AbortSignal; retain: boolean;
+  maxNodes: number; walkMs: number; signal: AbortSignal; retain: boolean;
 }): Promise<Walk> {
   const root = Buffer.from(path.resolve(dataDir));
   const started = Date.now();
@@ -148,14 +153,14 @@ async function walkVolume(dataDir: string, opts: {
   let complete = true;
   const rootStat = await fsp.lstat(root, { bigint: true });
   if (!rootStat.isDirectory()) throw new Error("data root is not a directory");
-  const record = (rel: Buffer, st: BigIntStats, volatile: boolean): void => {
+  const record = (rel: Buffer, st: BigIntStats): void => {
     const key = rel.toString("latin1");
-    const line = volatile ? `${key}\0\0\0\0\0` : `${key}\0${st.ino}\0${st.size}\0${st.mtimeNs}\0${st.ctimeNs}`;
+    const line = `${key}\0${st.ino}\0${st.size}\0${st.mtimeNs}\0${st.ctimeNs}`;
     lines.push(line);
     if (opts.retain) nodes.push({ rel: key, type: typeOf(st), size: Number(st.size), ctimeMs: Number(st.ctimeNs / 1_000_000n),
       uid: Number(st.uid), line });
   };
-  record(Buffer.from("."), rootStat, false);
+  record(Buffer.from("."), rootStat);
   const stack: Array<{ abs: Buffer; rel: Buffer | undefined; size: bigint }> = [{ abs: root, rel: undefined, size: rootStat.size }];
   let visited = 0;
   // A small directory (its own size is a bound on its entry count) is read in one call, which is several times faster than
@@ -189,11 +194,11 @@ async function walkVolume(dataDir: string, opts: {
         let st: BigIntStats;
         try { st = await fsp.lstat(abs, { bigint: true }); }
         catch { complete = false; continue; }
-        const volatile = st.isDirectory() && opts.volatile.has(rel.toString("latin1"));
-        record(rel, st, volatile);
-        if (!st.isDirectory() || volatile) continue;
-        // A directory on another device is a mount boundary: it is recorded, never entered, and the census is incomplete.
+        record(rel, st);
+        // A node on another device (a mounted directory, a bind-mounted file) is a mount boundary: it is recorded, never
+        // entered, and the census is incomplete.
         if (st.dev !== rootStat.dev) { complete = false; continue; }
+        if (!st.isDirectory()) continue;
         stack.push({ abs, rel, size: st.size });
       }
     } catch (error) {
@@ -323,24 +328,26 @@ export function createHibernationCensus(deps: HibernationCensusDeps): Hibernatio
   const dataDir = path.resolve(deps.dataDir);
   const maxNodes = deps.limits?.maxNodes ?? MAX_NODES;
   const walkMs = deps.limits?.walkMs ?? WALK_MS;
-  const volatile = new Set<string>();
-  for (const dir of deps.volatileDirs ?? []) {
+  const workerTmp = new Set<string>();
+  for (const dir of deps.workerTmpDirs ?? []) {
     const rel = path.relative(dataDir, path.resolve(dir));
-    if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) volatile.add(rel);
+    if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) workerTmp.add(Buffer.from(rel, "utf8").toString("latin1"));
   }
+  /** The digest of the last accepted census: the shutdown report carries it, never a recomputed one. */
+  let censusDigest: string | undefined;
 
   const run = async (opts: { signal?: AbortSignal; deadlineMs: number }): Promise<CensusResult> => {
     const startedAt = Date.now();
     const deadline = startedAt + opts.deadlineMs;
     const signal = AbortSignal.any([AbortSignal.timeout(opts.deadlineMs), ...(opts.signal ? [opts.signal] : [])]);
     const out: Gathered = { entries: [], complete: true, uncovered: new Set(), retained: { sources: [], complete: true } };
-    const walk = await walkVolume(dataDir, { maxNodes, walkMs, volatile, signal, retain: true });
+    const walk = await walkVolume(dataDir, { maxNodes, walkMs, signal, retain: true });
     if (!walk.complete) out.complete = false;
     const tree = new Tree(walk.nodes);
-    await classifyTop(deps, dataDir, tree, volatile, out, signal, deadline);
+    await classifyTop(deps, dataDir, tree, workerTmp, out, signal, deadline);
     unsafeNames(tree, out);
     // The fingerprint is the volume AFTER every proof ran: anything the census itself changed shows up here.
-    const after = await walkVolume(dataDir, { maxNodes, walkMs, volatile, signal, retain: false });
+    const after = await walkVolume(dataDir, { maxNodes, walkMs, signal, retain: false });
     if (!after.complete) out.complete = false;
     if (after.fingerprint !== walk.fingerprint) { out.complete = false; out.uncovered.add("volume_changed_during_census"); }
     const docker = await dockerInventory(deps.dockerHost, signal, out);
@@ -348,10 +355,19 @@ export function createHibernationCensus(deps: HibernationCensusDeps): Hibernatio
   };
 
   return {
-    census: (opts) => run(opts),
+    census: async (opts) => {
+      const result = await run(opts);
+      censusDigest = result.digest;
+      return result;
+    },
+    // Only the walk: discovery, holds, content proofs and Docker are server-side or process state that can differ on an
+    // untouched volume. The digest is the one stored from the accepted census.
     fingerprint: async (opts) => {
-      const result = await run({ ...(opts.signal ? { signal: opts.signal } : {}), deadlineMs: opts.deadlineMs });
-      return { digest: result.digest, fingerprint: result.fingerprint };
+      if (censusDigest === undefined) throw new Error("no census to attest");
+      const signal = AbortSignal.any([AbortSignal.timeout(opts.deadlineMs), ...(opts.signal ? [opts.signal] : [])]);
+      const walk = await walkVolume(dataDir, { maxNodes, walkMs, signal, retain: false });
+      if (!walk.complete) throw new Error("fingerprint walk incomplete");
+      return { digest: censusDigest, fingerprint: walk.fingerprint };
     },
   };
 }
@@ -384,6 +400,7 @@ function finish(out: Gathered, fingerprint: string, docker: DockerInventory | nu
 function unsafeNames(tree: Tree, out: Gathered): void {
   let listed = 0;
   let skipPrefix: string | undefined;
+  const already = new Set(out.entries.map(e => e.path));
   for (const n of tree.nodes) {
     if (n.rel === ".") continue;
     if (skipPrefix !== undefined && n.rel.startsWith(skipPrefix)) continue;
@@ -394,11 +411,13 @@ function unsafeNames(tree: Tree, out: Gathered): void {
     if (text !== undefined && !UNSAFE_CHARS.test(text)) continue;
     if (++listed > MAX_UNSAFE_NAME_ENTRIES) { out.complete = false; return; }
     skipPrefix = `${n.rel}/`;
+    // A node an earlier phase already listed (its own entry is unknown/unsafe_name too) is not listed twice.
+    if (already.has(show(n.rel).text)) continue;
     out.entries.push(makeEntry({ kind: "unknown_path", rel: n.rel, classification: "unknown", detail: "unsafe_name" }));
   }
 }
 
-async function classifyTop(deps: HibernationCensusDeps, dataDir: string, tree: Tree, volatile: ReadonlySet<string>,
+async function classifyTop(deps: HibernationCensusDeps, dataDir: string, tree: Tree, workerTmp: ReadonlySet<string>,
   out: Gathered, signal: AbortSignal, deadline: number): Promise<void> {
   const { layout } = deps;
   // The retained sources come first: the repos phase binds refs to them and the runner phase skips what they claim.
@@ -408,7 +427,7 @@ async function classifyTop(deps: HibernationCensusDeps, dataDir: string, tree: T
     const aggregate = (kind: string, classification: string, detail: string) =>
       out.entries.push(makeEntry({ kind, rel: name, classification, detail }));
     if (name === "runner") {
-      if (node.type === "dir") await remainingRunner(deps, dataDir, tree, node, claimed, volatile, out, signal, deadline);
+      if (node.type === "dir") await remainingRunner(deps, dataDir, tree, node, claimed, workerTmp, out, signal, deadline);
       else out.entries.push(makeEntry({ kind: "unknown_path", rel: name, classification: "unknown", detail: node.type }));
       continue;
     }
@@ -429,7 +448,9 @@ async function classifyTop(deps: HibernationCensusDeps, dataDir: string, tree: T
       const c = classifyEmptyOr(tree, node, "unknown");
       aggregate("lost_found", c.classification, c.detail);
     } else if (name === ".uzi-authority" && node.type === "dir") {
-      aggregate("runtime_lock", "disposable", "authority_store");
+      const locksOnly = tree.descendants(name).every(n => n.type === "file" && AUTHORITY_LOCK_FILES.has(lastSegment(n.rel)) &&
+        n.rel === `${name}/${lastSegment(n.rel)}`);
+      aggregate("runtime_lock", locksOnly ? "disposable" : "unknown", locksOnly ? "lock_files" : "authority_store");
     } else if (RUNTIME_FILES.has(name) && node.type === "file") {
       aggregate("runtime_lock", "disposable", "epoch_runtime");
     } else {
@@ -452,12 +473,34 @@ async function classifyRepos(dataDir: string, tree: Tree, node: Node, out: Gathe
         detail: child.type === "dir" ? `nodes_${tree.count(child.rel)}` : child.type }));
       continue;
     }
-    const owed = tree.children(`${child.rel}/uzi-owed`).length > 0;
+    const why = await protectedBareReason(dataDir, tree, child);
     out.entries.push(makeEntry({ kind: "bare_repo", rel: child.rel,
-      classification: owed ? "protected" : retained?.complete === false ? "unknown" : "disposable",
-      detail: owed ? "owed_records" : retained?.complete === false ? "retained_unread" : "cache" }));
+      classification: why === "unreadable" ? "unknown" : why ? "protected" : retained?.complete === false ? "unknown" : "disposable",
+      detail: why ?? (retained?.complete === false ? "retained_unread" : "cache") }));
     await runnerRefs(dataDir, tree, child, retained, out);
   }
+}
+
+/** Ref namespaces whose objects are recovery or settlement state (git.ts: refs/uzi-archive, refs/uzi-settle,
+ *  refs/uzi-recovery-pin, refs/uzi-owed). */
+const PROTECTED_REF_DIRS = ["uzi-archive", "uzi-settle", "uzi-recovery-pin", "uzi-owed"];
+const PROTECTED_PACKED_REF = / refs\/uzi-(?:archive|settle|recovery-pin|owed)\//;
+
+/** Why a bare cache is more than a cache: owed records, a ref in a recovery namespace (loose or packed) or a code
+ *  snapshot. "unreadable" when the packed refs could not be read. */
+async function protectedBareReason(dataDir: string, tree: Tree, bare: Node): Promise<string | undefined> {
+  if (tree.children(`${bare.rel}/uzi-owed`).length > 0) return "owed_records";
+  if (tree.children(`${bare.rel}/uzi-code-snapshots`).length > 0) return "code_snapshots";
+  for (const dir of PROTECTED_REF_DIRS) {
+    if (tree.descendants(`${bare.rel}/refs/${dir}`).some(n => n.type !== "dir")) return "recovery_refs";
+  }
+  const packed = tree.byRel.get(`${bare.rel}/packed-refs`);
+  if (!packed) return undefined;
+  if (packed.type !== "file" || packed.size > MAX_PACKED_REFS_BYTES) return "unreadable";
+  try {
+    const text = await fsp.readFile(absBytes(dataDir, packed.rel), "latin1");
+    return text.split("\n").some(line => PROTECTED_PACKED_REF.test(line)) ? "recovery_refs" : undefined;
+  } catch { return "unreadable"; }
 }
 
 interface RefRead { name: string; tip: string | undefined; why?: string }
@@ -605,7 +648,18 @@ async function classifyRetained(deps: HibernationCensusDeps, dataDir: string, tr
           const partRel = rel(part.clonePath);
           if (partRel === undefined) { out.complete = false; continue; }
           claimed.add(partRel);
-          claimed.add(rel(path.join(path.dirname(part.clonePath), `.uzi-skills-${path.basename(part.clonePath)}`)) ?? "");
+          // The `.uzi-skills-<clone>` sibling is claimed (the runner phase skips it) and listed here: its bytes are
+          // unknown unless it is empty, and nothing is listed when it is absent.
+          const skillsRel = rel(path.join(path.dirname(part.clonePath), `.uzi-skills-${path.basename(part.clonePath)}`));
+          if (skillsRel !== undefined) {
+            claimed.add(skillsRel);
+            const skills = tree.byRel.get(skillsRel);
+            if (skills) {
+              const c = classifyEmptyOr(tree, skills, "unknown");
+              out.entries.push(makeEntry({ kind: "unknown_path", rel: skillsRel, classification: c.classification,
+                detail: c.classification === "disposable" ? "skills_empty" : "skills_not_empty" }));
+            }
+          }
           const kind = src.kind === "canonical" ? "canonical_clone" : src.kind === "protected" ? "journal" : "retained_attempt";
           if (part.presence === "missing") {
             out.entries.push(makeEntry({ kind, rel: partRel, classification: verdict.recoverable ? "disposable" : verdict.classification,
@@ -683,9 +737,9 @@ function unaccountedNodes(tree: Tree, cloneRel: string, tracked: ReadonlySet<str
 }
 
 async function remainingRunner(deps: HibernationCensusDeps, dataDir: string, tree: Tree, runner: Node, claimed: ReadonlySet<string>,
-  volatile: ReadonlySet<string>, out: Gathered, signal: AbortSignal, deadline: number): Promise<void> {
+  workerTmp: ReadonlySet<string>, out: Gathered, signal: AbortSignal, deadline: number): Promise<void> {
   for (const top of tree.children(runner.rel)) {
-    if (top.rel === `${runner.rel}/.tmp`) { await classifyScratch(deps, dataDir, tree, top, volatile, out, signal, deadline); continue; }
+    if (top.rel === `${runner.rel}/.tmp`) { await classifyScratch(deps, dataDir, tree, top, workerTmp, out, signal, deadline); continue; }
     if (top.type !== "dir") {
       out.entries.push(makeEntry({ kind: "unknown_path", rel: top.rel, classification: "unknown", detail: top.type }));
       continue;
@@ -713,7 +767,7 @@ const KEPT_AS: Record<KeptReason, string> = {
   protected_record: "protected", bind_referenced: "protected", held_open: "protected", cap: "unknown",
 };
 
-async function classifyScratch(deps: HibernationCensusDeps, dataDir: string, tree: Tree, tmp: Node, volatile: ReadonlySet<string>,
+async function classifyScratch(deps: HibernationCensusDeps, dataDir: string, tree: Tree, tmp: Node, workerTmp: ReadonlySet<string>,
   out: Gathered, signal: AbortSignal, deadline: number): Promise<void> {
   const entry = (rel: string, classification: string, detail: string) =>
     out.entries.push(makeEntry({ kind: "runner_scratch", rel, classification, detail }));
@@ -724,8 +778,14 @@ async function classifyScratch(deps: HibernationCensusDeps, dataDir: string, tre
   })();
   if (rootRel === undefined) out.uncovered.add("scratch_layout_unavailable");
   const leafRoot = rootRel !== undefined ? tree.byRel.get(rootRel) : undefined;
-  for (const child of tree.children(tmp.rel)) {
-    if (volatile.has(child.rel)) { entry(child.rel, "disposable", "worker_tmpdir"); continue; }
+  // Single layout: the scratch root IS runner/.tmp (and the worker's TMPDIR), so its children are leaves, classified below.
+  for (const child of leafRoot?.rel === tmp.rel ? [] : tree.children(tmp.rel)) {
+    if (workerTmp.has(child.rel)) {
+      // The worker's own TMPDIR (split layout) is walked and fingerprinted; only an empty directory is disposable.
+      const empty = child.type === "dir" && tree.count(child.rel) === 0;
+      entry(child.rel, empty ? "disposable" : "unknown", empty ? "worker_tmpdir_empty" : "worker_tmpdir_not_empty");
+      continue;
+    }
     if (child.rel === rootRel) continue;
     // Not the runner's leaf root and not the worker's own TMPDIR: nobody here claims it.
     if (child.rel !== leafRoot?.rel) entry(child.rel, tree.count(child.rel) === 0 && child.type === "dir" ? "disposable" : "unknown",

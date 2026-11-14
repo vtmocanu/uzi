@@ -356,11 +356,14 @@ function createRuntime(options = {}) {
         requireUnscoped();
         if (mode !== 'exclusive') return;
         // Deliberately no conversion: admission must remain closed across this gap.
+        const previousIdentity = heldIdentity;
         io.closeSync(fd);
         fd = undefined;
         closed = true;
         const next = open(names.epoch);
-        try { await lock(next, 'shared', 120000, signal); verify(next, names.epoch); }
+        // The re-taken SH must be the very inode held before (as in upgradeExclusive): a replaced
+        // inode throws with the handle left closed, never adopted as the new lock file.
+        try { await lock(next, 'shared', 120000, signal); heldIdentity = identity(verify(next, names.epoch, 0o600, previousIdentity)); }
         catch (error) { io.closeSync(next); throw error; }
         fd = next;
         mode = 'shared';

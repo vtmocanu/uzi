@@ -190,3 +190,19 @@ it("a failed lifecycle read makes the source unknown and the census incomplete",
   assert.equal(result.complete, false);
   assert.equal(attemptEntries(result)[0]?.classification, "unknown");
 });
+
+it("a .uzi-skills-<clone> sibling with a payload is listed unknown; an empty one is disposable; an absent one lists nothing", async () => {
+  const skills = path.join(path.dirname(clonePath), `.uzi-skills-${path.basename(clonePath)}`);
+  const skillsRel = path.relative(fx.dataDir, skills);
+  assert.equal((await census()).entries.some(e => e.path === skillsRel), false, "absent: nothing listed");
+  fs.mkdirSync(skills);
+  const emptied = (await census()).entries.find(e => e.path === skillsRel);
+  assert.equal(emptied?.classification, "disposable");
+  fs.writeFileSync(path.join(skills, "payload"), "bytes that no other entry covers");
+  const result = await census();
+  const entry = result.entries.find(e => e.path === skillsRel);
+  assert.equal(entry?.kind, "unknown_path", JSON.stringify(result.entries));
+  assert.equal(entry?.classification, "unknown");
+  assert.equal(entry?.detail, "skills_not_empty");
+  assert.equal(result.entries.filter(e => e.path === skillsRel).length, 1);
+});

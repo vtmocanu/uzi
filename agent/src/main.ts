@@ -1105,16 +1105,16 @@ async function mainBody(): Promise<void> {
   notifyRetained = () => { void retainedSource.reportRetained(); };
   // PRD #4208 M1: the hibernation inventory participates only where an exclusion mechanism is
   // proven: the DinD lane (Docker wired, not the isolated lane) holding the pod-epoch lock in a
-  // supported mode. Its presence is what advertises `hibernation_inventory_v1`. The census and the
-  // fingerprint are the volume census seam: until it lands the census can never be complete.
+  // supported mode. Its presence is what advertises `hibernation_inventory_v1`. The census seam walks the
+  // whole data volume (hibernation-census.ts); the shutdown seam recomputes only the walk fingerprint.
   if (hibernationParticipates(config, epochOwnership?.mode)) {
     // The volume census (hibernation-census.ts): top-level names come from the same config the writers use, the worker's
-    // own TMPDIR is the one live directory the fingerprint does not walk, and the scratch root is the shipped layout's.
+    // own TMPDIR is walked like everything else (a non-empty one is unknown), and the scratch root is the shipped layout's.
     const scratch = scratchLayout(process.env);
     const volumeCensus = createHibernationCensus({
       dataDir: config.dataDir,
       layout: { outbox: path.basename(config.outboxDataDir), agentHome: path.basename(sdkHomeRoot), jobs: path.basename(jobsRoot) },
-      volatileDirs: process.env.TMPDIR ? [process.env.TMPDIR] : [],
+      workerTmpDirs: process.env.TMPDIR ? [process.env.TMPDIR] : [],
       ...("refused" in scratch ? {} : { scratchRoot: scratch.root }),
       ...(config.dockerWiring.dockerHost !== undefined ? { dockerHost: config.dockerWiring.dockerHost } : {}),
       git, client, ownership: epochOwnership,

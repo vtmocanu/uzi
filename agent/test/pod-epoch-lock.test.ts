@@ -875,6 +875,19 @@ test("upgradeExclusive restores SH and rethrows a non-contention failure; lost S
   assert.throws(() => held.mode, /closed/);
 });
 
+test("reacquireShared on a replaced epoch inode is refused and the handle stays closed", async (t) => {
+  const f = fixture(t, { run: undefined });
+  await f.runtime.seed(S);
+  const held = await f.runtime.acquire();
+  assert.equal(await held.upgradeExclusive!(), true);
+  // Out-of-band replacement while exclusive ownership is held, before the shared re-take.
+  fs.renameSync(path.join(f.root, epochName), path.join(f.root, "old-lock"));
+  fs.writeFileSync(path.join(f.root, epochName), "", { mode: 0o600 });
+  fs.chownSync(path.join(f.root, epochName), process.getuid!(), process.getgid!());
+  await assert.rejects(held.reacquireShared(), /inode changed/);
+  assert.throws(() => held.mode, /closed/, "the handle never adopts the new inode");
+});
+
 test("upgradeExclusive on a replaced epoch inode refuses EX and the re-taken SH: shared ownership lost", async (t) => {
   const f = fixture(t, { run: undefined });
   await f.runtime.seed(S);

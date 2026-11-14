@@ -9,8 +9,7 @@ import type { InventoryEntry } from "../src/hibernation-inventory.js";
 const TOKEN = /^[a-z0-9_:.-]{1,64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const TIP = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-// oxlint-disable-next-line no-control-regex -- the control and bidi characters are exactly what is being matched
-const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb]/;
+const UNSAFE = /\p{Cc}|\p{Cf}|\p{Zl}|\p{Zp}/u;
 const KINDS = new Set(["runtime_lock", "outbox", "agent_home", "jobs", "lost_found", "bare_repo", "runner_ref", "worktree",
   "canonical_clone", "retained_attempt", "journal", "unsettled_op", "runner_scratch", "unknown_path"]);
 const CLASSES = new Set(["disposable", "needs_receipt", "protected", "unknown", "unrecoverable"]);

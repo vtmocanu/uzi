@@ -151,6 +151,7 @@ it("the fingerprint changes when a file is rewritten with the same size and a re
   const stamp = 1_700_000_000; // whole seconds: the restored mtime is exact to the nanosecond
   fs.utimesSync(file, stamp, stamp);
   const seams = build();
+  await seams.census({ signal: new AbortController().signal, deadlineMs: 60_000 });
   const before = await seams.fingerprint({ deadlineMs: 60_000 });
   const again = await seams.fingerprint({ deadlineMs: 60_000 });
   assert.deepEqual(again, before, "an untouched volume is stable");
@@ -198,11 +199,13 @@ it("a control, bidi or non-UTF-8 name is escaped and unknown", async () => {
 
 it("an entry count over the cap truncates, keeps blockers and is incomplete", async () => {
   for (let i = 0; i < 10_050; i++) fs.mkdirSync(path.join(dataDir, `d${String(i).padStart(5, "0")}`));
-  dir("jobs");
+  // An empty agent-home is disposable and sorts before every blocker: only blockers-first ranking drops it.
+  dir("agent-home");
   const result = await run();
   assert.equal(result.complete, false);
   assert.ok(result.entries.length <= 10_000);
   assert.ok(result.entries.every(e => e.classification === "unknown"));
+  assert.equal(byPath(result, "agent-home"), undefined);
 });
 
 it("an unsettled runner delete is a protected unsettled_op", async () => {
@@ -313,11 +316,12 @@ it("runner scratch: protected records and foreign names block; ordinary leaves a
   put("runner/.tmp/odd/f");
   const result = await run({
     scratchRoot,
-    volatileDirs: [path.join(dataDir, "runner/.tmp/uzi-worker")],
+    workerTmpDirs: [path.join(dataDir, "runner/.tmp/uzi-worker")],
     git: fakeGit({ collectEpochScratchProtectedPaths: async () => ({ state: "read", paths: [path.join(scratchRoot, "leaf-b", "x")] }) }),
   });
-  assert.equal(byPath(result, "runner/.tmp/uzi-worker")?.classification, "disposable");
-  assert.equal(byPath(result, "runner/.tmp/uzi-worker")?.detail, "worker_tmpdir");
+  // Fail closed: the worker's own TMPDIR holds content here, so it is unknown rather than disposable.
+  assert.equal(byPath(result, "runner/.tmp/uzi-worker")?.classification, "unknown");
+  assert.equal(byPath(result, "runner/.tmp/uzi-worker")?.detail, "worker_tmpdir_not_empty");
   assert.equal(byPath(result, "runner/.tmp/uzi-runner/leaf-b")?.classification, "protected");
   assert.equal(byPath(result, "runner/.tmp/uzi-runner/leaf-b")?.detail, "protected_record");
   const agg = byPath(result, "runner/.tmp/uzi-runner");
@@ -327,14 +331,132 @@ it("runner scratch: protected records and foreign names block; ordinary leaves a
   assert.ok(result.entries.every(e => e.kind === "runner_scratch"), JSON.stringify(result.entries));
 });
 
-it("the worker's own TMPDIR does not move the fingerprint", async () => {
-  put("runner/.tmp/uzi-worker/a", "1");
+it("the worker's own TMPDIR is in the fingerprint; empty is disposable", async () => {
+  dir("runner/.tmp/uzi-worker");
   const tmp = path.join(dataDir, "runner/.tmp/uzi-worker");
-  const seams = build({ volatileDirs: [tmp] });
+  const seams = build({ workerTmpDirs: [tmp] });
+  const first = await seams.census({ signal: new AbortController().signal, deadlineMs: 60_000 });
+  assert.equal(byPath(first, "runner/.tmp/uzi-worker")?.classification, "disposable");
+  assert.equal(byPath(first, "runner/.tmp/uzi-worker")?.detail, "worker_tmpdir_empty");
   const before = await seams.fingerprint({ deadlineMs: 60_000 });
   fs.writeFileSync(path.join(tmp, "b"), "2");
-  fs.rmSync(path.join(tmp, "a"));
-  assert.deepEqual(await seams.fingerprint({ deadlineMs: 60_000 }), before);
+  assert.notEqual((await seams.fingerprint({ deadlineMs: 60_000 })).fingerprint, before.fingerprint);
+});
+
+it("single layout: the scratch root is the worker TMPDIR; its content is walked, fingerprinted and never 'empty'", async () => {
+  const root = path.join(dataDir, "runner/.tmp");
+  dir("runner/.tmp");
+  const seams = build({ scratchRoot: root, workerTmpDirs: [root] });
+  const census = () => seams.census({ signal: new AbortController().signal, deadlineMs: 60_000 });
+  const empty = await census();
+  assert.equal(byPath(empty, "runner/.tmp")?.detail, "empty");
+  const emptyPrint = (await seams.fingerprint({ deadlineMs: 60_000 })).fingerprint;
+  put("runner/.tmp/leaf/f", "aaaa");
+  put("runner/.tmp/stray", "loose");
+  const full = await census();
+  assertWireEntries(full.entries);
+  assert.notEqual(byPath(full, "runner/.tmp")?.detail, "empty");
+  assert.equal(byPath(full, "runner/.tmp")?.detail, "leaves_1");
+  assert.equal(byPath(full, "runner/.tmp/stray")?.classification, "unknown", "a loose file in the scratch root blocks");
+  assert.equal(full.entries.filter(e => e.path === "runner/.tmp/leaf").length, 0, "an ordinary leaf is aggregated, not listed twice");
+  const before = (await seams.fingerprint({ deadlineMs: 60_000 })).fingerprint;
+  assert.notEqual(before, emptyPrint);
+  const file = path.join(root, "leaf/f");
+  const stamp = fs.statSync(file);
+  fs.writeFileSync(file, "bbbb");
+  fs.utimesSync(file, stamp.atime, stamp.mtime);
+  assert.notEqual((await seams.fingerprint({ deadlineMs: 60_000 })).fingerprint, before, "a rewrite under the scratch root moves the fingerprint");
+});
+
+it("the shutdown fingerprint walks only the volume: server-side or scope changes leave the digest and fingerprint alone", async () => {
+  put("outbox/m.json", "aaaa");
+  dir("runner/r");
+  let discoveries = 0;
+  let scopeOk = true;
+  const seams = build({
+    git: fakeGit({
+      discoverEpochRetainedSources: async () => {
+        discoveries++;
+        return { groups: [], inventoryComplete: scopeOk, physicalPaths: 0, overflow: 0, overflowExact: true, unreadable: 0 };
+      },
+    }),
+  });
+  const accepted = await seams.census({ signal: new AbortController().signal, deadlineMs: 60_000 });
+  assert.equal(accepted.complete, true);
+  assert.equal(discoveries, 1);
+  scopeOk = false; // a rerun census would now read as incomplete with different entries: none of it is on the volume
+  const final = await seams.fingerprint({ deadlineMs: 60_000 });
+  assert.equal(final.digest, accepted.digest);
+  assert.equal(final.fingerprint, accepted.fingerprint);
+  assert.equal(discoveries, 1, "no discovery, holds or content proofs at shutdown");
+  fs.writeFileSync(path.join(dataDir, "outbox/m.json"), "bbbbb");
+  const changed = await seams.fingerprint({ deadlineMs: 60_000 });
+  assert.notEqual(changed.fingerprint, accepted.fingerprint);
+  assert.equal(changed.digest, accepted.digest);
+});
+
+it("the shutdown fingerprint refuses without an accepted census", async () => {
+  await assert.rejects(build().fingerprint({ deadlineMs: 60_000 }), /no census/);
+});
+
+it("a bare with a recovery ref, a packed recovery ref or a code snapshot is protected", async () => {
+  for (const ns of ["uzi-archive/run/g1", "uzi-settle/run/h/source", "uzi-recovery-pin/x", "uzi-owed/run/abc"]) {
+    put(`repos/loose-${ns.split("/")[0]}.git/refs/${ns}`, `${TIP}\n`);
+  }
+  put("repos/packed.git/packed-refs", `# pack-refs\n${TIP} refs/uzi-archive/run/g2\n`);
+  put("repos/snap.git/uzi-code-snapshots/snap1", "x");
+  dir("repos/plain.git"); dir("repos/emptysnap.git/uzi-code-snapshots");
+  put("repos/plain.git/packed-refs", `${TIP} refs/heads/main\n`);
+  const result = await run();
+  for (const p of ["repos/loose-uzi-archive.git", "repos/loose-uzi-settle.git", "repos/loose-uzi-recovery-pin.git",
+    "repos/loose-uzi-owed.git", "repos/packed.git", "repos/snap.git"]) {
+    assert.equal(byPath(result, p)?.classification, "protected", p);
+  }
+  assert.equal(byPath(result, "repos/plain.git")?.classification, "disposable");
+  assert.equal(byPath(result, "repos/emptysnap.git")?.classification, "disposable");
+});
+
+it(".uzi-authority: lock files are disposable, any store file is unknown", async () => {
+  put(".uzi-authority/worker.lock", ""); put(".uzi-authority/authority.lock", "");
+  assert.equal(byPath(await run(), ".uzi-authority")?.classification, "disposable");
+  put(".uzi-authority/boundaries/abc.json", "{}");
+  const result = await run();
+  assert.equal(byPath(result, ".uzi-authority")?.classification, "unknown");
+  assert.equal(byPath(result, ".uzi-authority")?.detail, "authority_store");
+});
+
+it("a top-level unsafe name is listed once", async () => {
+  fs.mkdirSync(path.join(dataDir, "bad\u001bname"));
+  const result = await run();
+  assert.equal(result.entries.filter(e => e.path === "bad%1Bname").length, 1, JSON.stringify(result.entries));
+});
+
+it("format and separator characters (soft hyphen, tag characters, Arabic number sign, line separator) are escaped and unknown", async () => {
+  for (const name of ["soft\u00adhyphen", "tag\u{e0041}char", "arabic\u0600sign", "ls\u2028sep", "ps\u2029sep", "mongol\u180evs"]) {
+    fs.mkdirSync(path.join(dataDir, name));
+  }
+  const result = await run();
+  assert.equal(result.entries.length, 6, JSON.stringify(result.entries));
+  for (const e of result.entries) {
+    assert.ok(e.path.includes("%"), e.path);
+    assert.equal(e.classification, "unknown");
+    assert.equal(e.detail, "unsafe_name");
+  }
+});
+
+it("an unreadable directory makes the census incomplete", { skip: process.getuid?.() === 0 ? "root ignores directory modes" : false }, async () => {
+  put("outbox/sealed/f");
+  const sealed = path.join(dataDir, "outbox/sealed");
+  fs.chmodSync(sealed, 0o000);
+  try {
+    assert.equal((await run()).complete, false);
+  } finally { fs.chmodSync(sealed, 0o755); }
+});
+
+it("a walk over its time budget is incomplete", async () => {
+  for (let i = 0; i < 600; i++) put(`outbox/f${i}`);
+  const result = await run({ limits: { walkMs: -1 } });
+  assert.equal(result.complete, false);
 });
 
 it("a volume that changes while the census runs is incomplete", async () => {
@@ -362,7 +484,7 @@ it("an incomplete discovery makes the census incomplete", async () => {
   assert.equal(result.complete, false);
 });
 
-it("the fingerprint recompute throws at its deadline instead of returning a value", async () => {
+it("the census throws at its deadline and the fingerprint walk throws when aborted, instead of returning a value", async () => {
   const seams = build({
     git: fakeGit({
       discoverEpochRetainedSources: (opts) => new Promise((_resolve, reject) => {
@@ -371,7 +493,10 @@ it("the fingerprint recompute throws at its deadline instead of returning a valu
     }),
   });
   dir("runner/r");
-  await assert.rejects(seams.fingerprint({ deadlineMs: 50 }));
+  await assert.rejects(seams.census({ signal: new AbortController().signal, deadlineMs: 50 }));
+  const accepted = build();
+  await accepted.census({ signal: new AbortController().signal, deadlineMs: 60_000 });
+  await assert.rejects(accepted.fingerprint({ signal: AbortSignal.abort(), deadlineMs: 60_000 }));
 });
 
 it("reports stopped containers and anonymous volumes from the Docker daemon, read-only", async () => {
