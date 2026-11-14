@@ -2684,7 +2684,8 @@ export interface EpochRetainedLimits {
 /**
  * Diagnostic-only counters of retained-source work; no decision may read them. ms values are rounded per call.
  * A `work` sink counts everything its public call does, including GitCache calls made from the call's own
- * callbacks (none of the pod-epoch callbacks call git today).
+ * callbacks, except a nested retained inspect/discover call, which installs its own (possibly absent) sink.
+ * None of the pod-epoch callbacks call git today.
  */
 export type RetainedWorkCounters = {
   gathers: number; gather_ms: number; tree_walks: number; tree_entries: number; tree_ms: number;
@@ -2716,7 +2717,7 @@ export interface EpochRetainedDiscoveryResult {
 }
 
 export interface RetainedInspectOptions {
-  /** Optional diagnostic sink for gather and tree-walk work performed by this call, including GitCache calls its callbacks make. */
+  /** Optional diagnostic sink for gather and tree-walk work performed by this call, including GitCache calls its callbacks make (a nested retained inspect/discover call uses its own sink). */
   work?: RetainedWorkCounters;
   signal?: AbortSignal;
   /** Absolute wall-clock deadline, also covering measurement and queued locks. */
