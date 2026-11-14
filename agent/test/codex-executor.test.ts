@@ -100,7 +100,7 @@ import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
 import type { OutgoingMessage, WorkerRunMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import { REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
-import { PlanRejectedError, PlanRevisionReplacedError, type RunContext, type EmittedMessage, type Executor, type WallParkOutcome, type SecretRemediationDecision } from "../src/executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, SecretRemediationStoppedError, type RunContext, type EmittedMessage, type Executor, type WallParkOutcome, type SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal, SteeringChannel, followUpRunes, MAX_FOLLOW_UP_BATCH_RUNES } from "../src/steering.js";
 import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
 import * as m2Runner from "./runner-harness.js";
@@ -108,6 +108,9 @@ import { followSuccessfulPush as m2FollowPush } from "./publication-fixture.js";
 import { shutdownContentProof } from "./shutdown-3101-content-fixture.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { makeTickDriver, writeStallShim, type StallMode } from "./stall-gitleaks-shim.js";
+import { acquireWorkerLifetime, type FlockResult } from "../src/authority-lock.js";
+import { AuthorityRuntime } from "../src/authority-runtime.js";
+import { testLockOptions } from "./authority-test-support.js";
 import { closingDirectiveFor as m2ClosingDirective } from "../src/pr-description.js";
 import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
@@ -18933,6 +18936,81 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       assert.equal(codeCalls, 0, "no code gate after secret failure");
     });
   }
+
+  // Issue #4313: the gate was stopped before it reached a decision (SecretRemediationStoppedError).
+  // Codex takes its cancel route for every stop, whether or not a control explains it, and never
+  // finalizes; any other gate error propagates unchanged.
+  describe("a stopped secret-remediation gate (issue #4313)", () => {
+    // Each control becomes visible only while the gate is running, as a real stop does.
+    const controls: Record<string, () => { during: () => void; overrides: Record<string, unknown> }> = {
+      "sticky cancel": () => { let on = false; return { during: () => { on = true; }, overrides: { cancelRequested: () => on } }; },
+      "claim fence": () => { let on = false; return { during: () => { on = true; }, overrides: { claimFenced: () => on } }; },
+      "terminal lifecycle signal": () => {
+        const ac = new AbortController();
+        return { during: () => ac.abort(new Error("terminal")), overrides: { terminalLifecycleSignal: ac.signal } };
+      },
+      "no control explains it": () => ({ during: () => {}, overrides: {} }),
+    };
+    for (const [label, make] of Object.entries(controls)) {
+      it(`done gate, ${label}: throws run cancelled, no persist, no completion attempt, no further turn`, async () => {
+        const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+        const checkpoints: unknown[] = [];
+        let attempts = 0;
+        let codeCalls = 0;
+        const control = make();
+        const { ctx } = makeCtx({
+          kind: "issue", completionInterlock: true,
+          recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
+          checkpoint: async (o) => { checkpoints.push(o); },
+          secretRemediationGate: async () => { control.during(); throw new SecretRemediationStoppedError(); },
+          codeCrossCheckGate: async () => { codeCalls++; return { action: "proceed" }; },
+          ...control.overrides,
+        });
+        await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#4313 done stop"),
+          (e: unknown) => e instanceof Error && e.message === "run cancelled");
+        assert.equal(turnTexts(rig.epochs[0]!.transport).length, 1, "no further turn");
+        assert.deepEqual(checkpoints, []);
+        assert.equal(attempts, 0);
+        assert.equal(codeCalls, 0);
+      });
+
+      it(`resume preflight, ${label}: throws run cancelled before any model turn`, async () => {
+        const rig = makeMultiEpochRig([script("th-1", [() => [agentMessage("work")]])]);
+        let checks = 0;
+        const control = make();
+        const { ctx } = makeCtx({
+          kind: "issue", resumed: true, sessionId: null,
+          config: { max_iterations: 2, iteration_park_version: 1 },
+          reportIteration: async () => ({ completionAttempts: 0 }), parkForIteration: async () => "parked",
+          secretRemediationGate: async options => {
+            checks++;
+            assert.deepEqual(options, { unpublishedOnly: true });
+            control.during();
+            throw new SecretRemediationStoppedError();
+          },
+          ...control.overrides,
+        });
+        await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#4313 preflight stop"),
+          (e: unknown) => e instanceof Error && e.message === "run cancelled");
+        assert.equal(checks, 1, "the preflight is not retried");
+        assert.equal(rig.epochs.flatMap(epoch => turnTexts(epoch.transport)).length, 0);
+      });
+    }
+
+    it("a different gate error propagates unchanged from the done gate and the preflight", async () => {
+      const boom = new Error("gate exploded");
+      const doneRig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+      const { ctx: doneCtx } = makeCtx({ kind: "issue", secretRemediationGate: async () => { throw boom; } });
+      await assert.rejects(withTimeout(makeExecutor(doneRig, bindingOf(SUBSCRIPTION)).run(doneCtx), 5000, "#4313 done error"), e => e === boom);
+      const rig = makeMultiEpochRig([script("th-1", [() => [agentMessage("work")]])]);
+      const { ctx } = makeCtx({
+        kind: "issue", resumed: true, sessionId: null, config: { max_iterations: 2, iteration_park_version: 1 },
+        reportIteration: async () => ({ completionAttempts: 0 }), parkForIteration: async () => "parked",
+        secretRemediationGate: async () => { throw boom; },
+      });
+      await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#4313 preflight error"), e => e === boom);
+    });
+  });
 });
 
 // ================================================================================
@@ -31185,5 +31263,369 @@ describe("issue #4258 real CodexExecutor + RunRunner over the scoped seam", { sk
     } finally {
       await h.cleanup(execution);
     }
+  });
+});
+
+// ── issue #4313 — the done gate and the resume preflight under the real CodexExecutor + RunRunner ──
+//
+// The runner bounds ctx.secretRemediationGate by an owned run-lifecycle scope. A cancel or a worker
+// shutdown ends a stalled scan child or a pending wait for source authority A promptly and the gate throws
+// SecretRemediationStoppedError; the Codex executor turns that into its own cancel route (REASON_CANCEL),
+// which the runner reads as a cancel or as a shutdown interruption. Pause-now never stops the gate.
+//
+// Credential switch: Codex has no such control, so there is nothing to assert. Evidence:
+//   grep -rn "CredentialSwitchSignal\|attemptCredentialSwitch" agent/src/codex  -> no match.
+describe("issue #4313 real CodexExecutor + RunRunner over the done gate and resume preflight", { skip: NEEDS_PROCFS }, () => {
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+  const REWRITE_PROMPT = /not published yet|rewrite the commit|history rewrite/i;
+  const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const groupAlive = (pid: number): boolean => { try { process.kill(-pid, 0); return true; } catch { return false; } };
+  const killAll = (pids: number[]): void => {
+    for (const pid of pids) for (const t of [-pid, pid]) { try { process.kill(t, "SIGKILL"); } catch { /* gone */ } }
+  };
+  const bounded = <T>(p: Promise<T>, ms: number, label: string): Promise<T> => withTimeout(p, ms, label);
+  const sleepMs = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
+  const waitUntil = async (pred: () => boolean, ms: number, label: string): Promise<void> => {
+    const end = Date.now() + ms;
+    while (!pred()) {
+      if (Date.now() > end) throw new Error(`${label} did not happen within ${ms}ms`);
+      await sleepMs(10);
+    }
+  };
+  const scriptTurns = (th: string, turns: Array<(th: string, tn: string) => CodexNotification[]>): Responder => (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "turn/start") {
+      const tn = `tn-${th}-${c.turnStartCount}`;
+      if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      for (const note of turns[Math.min(c.turnStartCount, turns.length) - 1]?.(th, tn) ?? []) c.transport.push(note);
+      c.transport.push(turnCompleted("completed", th, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const allTurnTexts = (rig: MultiRig): string[] => rig.epochs.flatMap(e => e.transport.requests
+    .filter(r => r.method === "turn/start")
+    .map(r => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? ""));
+
+  type Kind = "done" | "resume";
+  type Site = "range" | "path" | "fetch" | "persist";
+  type Control = "none" | "pause" | "cancel" | "shutdown";
+
+  /** Stands in for the lock layer's private flock spawn. */
+  function spawnFlock(args: string[], fd: number | undefined, _signal: AbortSignal | undefined, timeoutMs: number): Promise<FlockResult> {
+    return new Promise((resolve, reject) => {
+      const child = spawn("/usr/bin/flock", args, {
+        stdio: ["ignore", "pipe", "pipe", ...(fd === undefined ? [] : [fd])], env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } });
+      let output = "";
+      child.stdout!.on("data", (c: Buffer) => { output += c.toString("utf8"); });
+      child.stderr!.on("data", (c: Buffer) => { output += c.toString("utf8"); });
+      const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+      child.once("error", reject);
+      child.once("close", (code) => { clearTimeout(timer); resolve({ code: code ?? 2, output }); });
+    });
+  }
+
+  interface Observation {
+    gateError: unknown;
+    decision: { action: string } | undefined;
+    pendingAfterControl: boolean;
+    elapsedMs: number;
+    childAliveAtSettle: boolean;
+    pids: number[];
+    state: Record<string, unknown> | undefined;
+    survivors: unknown[];
+    sinkHeld: boolean;
+    turns: string[];
+    statuses: string[];
+    end: Record<string, unknown> | undefined;
+    nonTerminal: boolean;
+    runOutcome: unknown;
+    executorError: unknown;
+    lines: unknown[];
+  }
+
+  async function gateRun(o: { iid: number; kind: Kind; site: Site; control: Control }): Promise<Observation> {
+    await fs.mkdir(path.resolve("../.uzi/scratch"), { recursive: true });
+    const scratch = await fs.mkdtemp(path.resolve("../.uzi/scratch/4313-codex-"));
+    const stall = writeStallShim(scratch);
+    const drv = makeTickDriver({ scanDeadlineMs: 60_000 });
+    const lockSite = o.site === "fetch" || o.site === "persist";
+    const api = new FakeApi("codex-4313");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const { logger, lines } = recordingLogger();
+    const client = new WorkerClient(url, "codex-4313", "test", logger, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+    client.protocolFeatures = ["run_checkpoint_durability"];
+    client.publishCheckpoint = async (_run, _tip, pack) => {
+      for await (const _chunk of pack) { /* drain */ }
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/test" } };
+    };
+
+    // The production authority stack over the data dir. While armed, the non-blocking A attempt answers
+    // "held elsewhere", so every acquisition pends in the lock layer's own retry delay, honouring its
+    // wait signal and timeout as production does.
+    let armed = false;
+    let acquisitions = 0;
+    let rt: AuthorityRuntime | undefined;
+    let git: GitCache;
+    if (lockSite) {
+      const real = testLockOptions().run ?? spawnFlock;
+      const run = (args: string[], fd: number | undefined, signal: AbortSignal | undefined, timeoutMs: number): Promise<FlockResult> => {
+        if (armed && args[0] === "-x" && args.includes("-n")) return Promise.resolve({ code: 200, output: "" });
+        return real(args, fd, signal, timeoutMs);
+      };
+      const dataDir = await fs.realpath(fx.dataDir);
+      const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions({ run }));
+      rt = new AuthorityRuntime({ lifetime, workerToken: "unit-gate-4313", timeoutMs: 5000 });
+      const original = rt.withTransaction.bind(rt) as (fn: unknown, wait?: unknown) => Promise<unknown>;
+      (rt as unknown as { withTransaction: typeof original }).withTransaction = (fn, wait) => {
+        if (armed) acquisitions++;
+        return original(fn, wait);
+      };
+      git = new GitCache(dataDir, logger, undefined, testGitCacheOptions({
+        authority: rt.hooks, authorityRequired: true, gitleaksBin: defaultGitleaksShim() }));
+    } else {
+      git = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions({ gitleaksBin: stall.bin }));
+    }
+
+    const stallMode: StallMode = o.site === "range" ? "stall-git" : o.site === "path" ? "stall-stdin" : "pass";
+    const withSecret = o.site !== "fetch";
+    let ctxRef: RunContext | undefined;
+    const plant = (tree: string): void => {
+      const file = withSecret ? "cfg.env" : "ok.txt";
+      writeFileSync(path.join(tree, file), withSecret ? "TOKEN=" + "gh" + "p_" + randomUUID().replace(/-/g, "") + "abcd\n" : "ordinary work\n");
+      for (const args of [["add", "-A"], [...IDENT, "commit", "-m", "work " + file]]) {
+        const r = spawnSync("/usr/bin/git", ["-C", tree, ...args], { encoding: "utf8" });
+        assert.equal(r.status, 0, r.stderr);
+      }
+      stall.setMode(stallMode);
+    };
+    const plan = (th: string, tn: string) => [toolCall(800, "submit_plan", { plan_md: "# Plan\n- do it", milestones: [] }, th, tn, "plan-1")];
+    const finishPlant = (th: string, tn: string) => { plant(ctxRef!.worktreePath); return [signalDone(th, tn)]; };
+    const finish = (th: string, tn: string) => [signalDone(th, tn)];
+    // A resume whose provider transcript is not on this worker re-plans first (the runner logs
+    // resume_lineage_break), so both kinds spend one plan turn; the resume preflight runs right after it.
+    const rig = makeMultiEpochRig([scriptTurns("th-1", [plan]), scriptTurns("th-1", [o.kind === "done" ? finishPlant : finish, finish, finish])]);
+    const launchEffect = rig.deps.launchEffectRoot!;
+    rig.deps = { ...rig.deps, boundaryDeadlineMs: 60_000,
+      launchEffectRoot: async (spec, deadline) => {
+        const handle = await launchEffect(spec, deadline);
+        const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+          ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+        if (argv[0] !== "/usr/bin/git" && argv[0] !== "/usr/local/bin/gitleaks") return handle;
+        const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+        const timer = setTimeout(() => child.kill(), deadline);
+        const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+          child.once("error", error => { clearTimeout(timer); reject(error); });
+          child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+        });
+        return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+          waitChild: async () => exited, dispose: async ms => { await exited; return handle.dispose(ms); } };
+      } };
+    const claim = makeClaim({
+      issue_iid: o.iid,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      auto_approve: true,
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+      ...(o.kind === "resume" ? {
+        kind: "issue", claim_generation: 7, session_id: "th-1", plan_approved: true, plan_md: "# Plan\n- do it",
+        config: { iteration_park_version: 1, max_iterations: 3 },
+      } : {}),
+    });
+    const executor = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION), logger);
+
+    let gateCalls = 0;
+    let gateError: unknown;
+    let decision: { action: string } | undefined;
+    let gateSettledAt = 0;
+    let childAliveAtSettle = false;
+    let executorError: unknown;
+    const runInner = executor.run.bind(executor);
+    executor.run = async ctx => {
+      ctxRef = ctx;
+      const orig = ctx.secretRemediationGate!;
+      ctx.secretRemediationGate = async options => {
+        const first = ++gateCalls === 1;
+        if (first && o.site === "fetch") armed = true;
+        try {
+          const d = await orig(options);
+          if (first) decision = d;
+          return d;
+        } catch (e) {
+          if (first) gateError = e;
+          throw e;
+        } finally {
+          if (first) {
+            gateSettledAt = Date.now();
+            childAliveAtSettle = stall.pids().some(pid => alive(pid) || groupAlive(pid));
+          }
+        }
+      };
+      if (o.kind === "resume") plant(ctx.worktreePath);
+      try {
+        return await runInner(ctx);
+      } catch (e) {
+        executorError = e;
+        throw e;
+      }
+    };
+
+    const hooks = { ...drv.options.checkpointTestHooks,
+      ...(o.site === "persist" ? { afterRemediationGateScan: () => { armed = true; } } : {}) };
+    const runner = new RunRunner(client, git, () => ({ executor, homeDir: path.join(fx.dataDir, "4313-home") }), logger, 20, undefined, {
+      pollMs: 5, recoveryRetryMs: 5, gitlab: fakeGitlab().gitlab, ...drv.options, checkpointTestHooks: hooks,
+      ...(rt ? { authority: rt, teardownTestDeps: portableTeardownTestDeps } : {}),
+      quiesceRun: async () => ({
+        process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+        docker: { state: "not_wired", removed: [], detail: "not wired" },
+      }),
+    });
+    // The attempt-bound clone paths give the flight an attempt id, so the restriction writes take A.
+    if (lockSite) Object.assign(runner, { attemptPaths: true });
+    let flight: { secretRemediation?: Record<string, unknown>; survivingTickGroups: unknown[]; sinkGate: { isHeld(): boolean };
+      steering: { getPauseMode(): unknown } } | undefined;
+    const internals = runner as unknown as { runSecretRemediationGate: (f: never, ...rest: unknown[]) => Promise<unknown> };
+    const origGate = internals.runSecretRemediationGate.bind(runner);
+    internals.runSecretRemediationGate = (f, ...rest) => { flight = f; return origGate(f, ...rest); };
+
+    let execution: Promise<unknown> | undefined;
+    try {
+      execution = runner.execute(claim);
+      const settled = execution.then(() => undefined, (e: unknown) => e);
+      const diag = () => lines.map(l => JSON.stringify(l)).join("\n");
+      await bounded(Promise.race([
+        waitUntil(() => (lockSite ? acquisitions > 0 : stall.pids().length > 0), 40_000, "the gate's wait"),
+        settled.then(e => { throw new Error("run ended before the gate waited: " + String(e) + "\n" + diag()); })]), 45_000, "gate wait");
+      const pids = stall.pids();
+      const t0 = Date.now();
+      let pendingAfterControl = false;
+      let runOutcome: unknown;
+      if (o.control === "cancel") api.appendInputs(claim.run_id, [{ id: 4313, kind: "cancel" }]);
+      else if (o.control === "shutdown") runner.shutdown();
+      else if (o.control === "pause") {
+        api.appendInputs(claim.run_id, [{ id: 4313, kind: "pause", body: "now" }]);
+        await bounded(waitUntil(() => flight!.steering.getPauseMode() === "now", 10_000, "pause-now recorded"), 11_000, "pause");
+      }
+      if (o.control === "none" || o.control === "pause") {
+        // Hold A a while longer: the gate must still be waiting (not stopped, not decided).
+        await sleepMs(700);
+        pendingAfterControl = gateSettledAt === 0;
+        armed = false;
+        await bounded(waitUntil(() => gateSettledAt > 0, 15_000, "the gate deciding once A is free"), 16_000, "gate decide");
+        // What the run does after the decision is not this test's subject: let it run briefly, then stop it.
+        const early = await Promise.race([settled, sleepMs(5_000).then(() => "running" as const)]);
+        if (early === "running") runner.shutdown();
+        runOutcome = await bounded(settled, 30_000, "execute() settling");
+      } else {
+        await bounded(waitUntil(() => gateSettledAt > 0, 15_000, "the gate ending after the stop"), 16_000, "gate stop");
+        armed = false;
+        runOutcome = await bounded(settled, 30_000, "execute() settling after the stop");
+      }
+      const states = api.states.map(x => x.body);
+      return {
+        gateError, decision, pendingAfterControl, elapsedMs: gateSettledAt - t0, childAliveAtSettle, pids,
+        state: flight?.secretRemediation, survivors: flight?.survivingTickGroups ?? [], sinkHeld: flight?.sinkGate.isHeld() ?? false,
+        turns: allTurnTexts(rig),
+        statuses: api.messages(claim.run_id).filter(m => m.kind === "status").map(m => String(m.payload.text)),
+        end: states.at(-1) as Record<string, unknown> | undefined,
+        nonTerminal: !states.some(b => b.status === "failed" || b.status === "completed"),
+        runOutcome, executorError, lines,
+      };
+    } finally {
+      try {
+        stall.setMode("pass");
+        armed = false;
+        killAll([...stall.pids(), ...drv.pids]);
+        runner.shutdown();
+        if (execution) await bounded(execution.catch(() => undefined), 20_000, "run cleanup");
+      } finally {
+        killAll([...stall.pids(), ...drv.pids]);
+        await api.close();
+        fx.cleanup();
+        await fs.rm(scratch, { recursive: true, force: true });
+      }
+    }
+  }
+
+  const iidOf = (kind: Kind, site: Site, control: Control): number =>
+    4313_700 + (kind === "done" ? 0 : 100) + ["range", "path", "fetch", "persist"].indexOf(site) * 10 +
+    ["none", "pause", "cancel", "shutdown"].indexOf(control);
+
+  const assertQuietStop = (obs: Observation, label: string): void => {
+    assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `${label}: the gate threw SecretRemediationStoppedError (${String(obs.gateError)})`);
+    assert.equal(obs.runOutcome, undefined, `${label}: execute() resolved normally, not with a rejection`);
+    assert.ok(obs.executorError instanceof Error && obs.executorError.message === "run cancelled",
+      `${label}: the executor routed the stop as its cancel reason (${String(obs.executorError)})`);
+    assert.ok(obs.elapsedMs < 15_000, `${label}: the gate ended ${obs.elapsedMs}ms after the stop`);
+    assert.equal(obs.state?.attempts, 0, `${label}: no attempt was spent`);
+    assert.equal(obs.state?.blocked, undefined, `${label}: nothing was blocked`);
+    assert.equal(obs.state?.cleanTip, undefined, `${label}: no clean tip was recorded`);
+    assert.deepEqual(obs.survivors, []);
+    assert.equal(obs.sinkHeld, false, `${label}: the sink gate was released`);
+    assert.ok(obs.turns.every(t => !REWRITE_PROMPT.test(t)), `${label}: no rewrite guidance was prompted`);
+    assert.deepEqual(obs.statuses.filter(t => /returning to the lead|pre-exit secret scan flagged/.test(t)), [], `${label}: nothing was emitted`);
+  };
+  const assertStopRoute = (obs: Observation, control: Control, label: string): void => {
+    if (control === "cancel") {
+      assert.equal(obs.end?.status, "failed", label);
+      assert.equal(obs.end?.failure_reason, "run cancelled", `${label}: the executor's cancel route`);
+    } else {
+      assert.equal(obs.nonTerminal, true, `${label}: a worker shutdown leaves the run non-terminal for recovery`);
+    }
+  };
+
+  // (a) a stalled gate child, under a cancel and under a worker shutdown.
+  for (const kind of ["done", "resume"] as const) {
+    for (const site of ["range", "path"] as const) {
+      for (const control of ["cancel", "shutdown"] as const) {
+        it(`${kind} gate: ${site} scan stalled, then ${control}: ends promptly, child gone, normal route`, { timeout: 120_000 }, async () => {
+          const label = `${kind}/${site}/${control}`;
+          const obs = await gateRun({ iid: iidOf(kind, site, control), kind, site, control });
+          assertQuietStop(obs, label);
+          assert.equal(obs.childAliveAtSettle, false, `${label}: the stalled child was gone before the gate settled`);
+          assert.ok(obs.pids.length > 0);
+          for (const pid of obs.pids) {
+            assert.equal(alive(pid), false, `${label}: child ${pid} exited`);
+            assert.equal(groupAlive(pid), false, `${label}: child group ${pid} is gone`);
+          }
+          assert.equal(obs.turns.length, kind === "done" ? 2 : 1, `${label}: no provider turn after the stalled gate (the plan turn, plus the work turn for the done gate)`);
+          assertStopRoute(obs, control, label);
+        });
+      }
+    }
+  }
+
+  // (b) a pending wait for source authority A.
+  for (const site of ["fetch", "persist"] as const) {
+    const expected = site === "fetch" ? "proceed" : "remediate";
+    for (const control of ["none", "pause"] as const) {
+      it(`done gate, ${site} wait, ${control === "none" ? "no control (baseline)" : control}: waits for A and decides ${expected}, not stopped`, { timeout: 120_000 }, async () => {
+        const obs = await gateRun({ iid: iidOf("done", site, control), kind: "done", site, control });
+        assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), `not stopped (${String(obs.gateError)})`);
+        assert.equal(obs.pendingAfterControl, true, "the gate was still waiting for A after the control arrived");
+        assert.equal(obs.decision?.action, expected, `decision (${String(obs.gateError)})`);
+        if (site === "fetch") assert.equal(obs.state?.attempts, 0, "no attempt was spent");
+        else assert.ok((obs.state?.attempts as number) >= 1, "the remediate decision spent its attempt");
+      });
+    }
+    for (const control of ["cancel", "shutdown"] as const) {
+      it(`done gate, ${site} wait: ${control} aborts the pending acquisition promptly (positive control)`, { timeout: 120_000 }, async () => {
+        const obs = await gateRun({ iid: iidOf("done", site, control), kind: "done", site, control });
+        assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `stopped (${String(obs.gateError)})`);
+        assert.ok(obs.elapsedMs < 15_000, `the gate ended ${obs.elapsedMs}ms after the ${control}`);
+        assert.equal(obs.state?.attempts, 0, "no attempt was spent");
+        assert.equal(obs.runOutcome, undefined);
+        assert.ok(obs.executorError instanceof Error && obs.executorError.message === "run cancelled",
+          `the executor routed the stop as its cancel reason (${String(obs.executorError)})`);
+        assertStopRoute(obs, control, `done/${site}/${control}`);
+      });
+    }
+  }
+
+  it("resume preflight, fetch-back wait, pause-now: waits for A and proceeds, not stopped", { timeout: 120_000 }, async () => {
+    const obs = await gateRun({ iid: iidOf("resume", "fetch", "pause"), kind: "resume", site: "fetch", control: "pause" });
+    assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), String(obs.gateError));
+    assert.equal(obs.pendingAfterControl, true, "the preflight was still waiting for A after the control arrived");
+    assert.equal(obs.decision?.action, "proceed", "the decision is the no-pause one (a clean fetch-back proceeds)");
   });
 });
