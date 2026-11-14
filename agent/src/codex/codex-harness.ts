@@ -122,7 +122,7 @@ import {
   validatePolicyRefusal,
 } from "../provider-policy-refusal.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
-import type { CodexAppServerAuthMode, CodexAppServerAuthSession } from "./appserver-auth.js";
+import type { CodexAuthSuspensionLease, CodexAppServerAuthMode, CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import { CodexTransportError, isProviderTurnMethod, type CodexNotification, type CodexTransport } from "./transport.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -1204,6 +1204,14 @@ export class CodexHarness implements RunHarness {
     this.registry.retainCleanup(completion);
     void this.closeOwned().then(resolve, reject);
     return completion;
+  }
+
+  /** Reversible preflight fence; retirement still uses close(). */
+  suspendRefreshAdmission(): CodexAuthSuspensionLease {
+    if (this.closed || this.appServerAuth === undefined) {
+      throw new Error("codex authentication suspension is unavailable");
+    }
+    return this.appServerAuth.suspendRefreshAdmission();
   }
 
   private async closeOwned(): Promise<void> {

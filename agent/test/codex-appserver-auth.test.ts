@@ -138,6 +138,99 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
   }
 }
 
+describe("Codex auth reversible suspension", () => {
+  it("drains started work separately from queued callbacks and resumes the same session", async () => {
+    const started = deferred<void>();
+    const result = deferred<ServerVerifiedCodexAuthTokens>();
+    let sends = 0;
+    let refreshSignal: AbortSignal | undefined;
+    const auth = subscription({ refresh: ({ signal }) => {
+      sends += 1;
+      refreshSignal = signal;
+      started.resolve();
+      return sends === 1 ? result.promise : Promise.resolve(REFRESHED);
+    } });
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    const first = auth.handleServerRequest(transport, refreshRequest(1));
+    await started.promise;
+    const lease = auth.suspendRefreshAdmission();
+    assert.throws(() => auth.suspendRefreshAdmission(), /already suspended/);
+    const queued = auth.handleServerRequest(transport, refreshRequest(2));
+    assert.equal(sends, 1);
+    assert.equal(refreshSignal?.aborted, false);
+    result.resolve(REFRESHED);
+    await lease.drain();
+    await first;
+    assert.equal(responses(transport).length, 1);
+    assert.equal(sends, 1);
+    lease.resume();
+    lease.resume();
+    await queued;
+    await auth.authenticate(transport);
+    await auth.handleServerRequest(transport, refreshRequest(3));
+    assert.equal(sends, 3);
+    assert.equal(transport.closes, 0);
+    await auth.drainInterceptedRequests();
+  });
+
+  it("owns pumped queued callbacks through close and stale resume cannot reopen", async () => {
+    let sends = 0;
+    const auth = subscription({ refresh: async () => { sends += 1; return REFRESHED; } });
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    const lease = auth.suspendRefreshAdmission();
+    assert.equal(transport.emitServerRequest(refreshRequest(1)), true);
+    await lease.drain();
+    assert.equal(sends, 0);
+    auth.closeAdmissionAndCancel();
+    lease.resume();
+    await auth.drainInterceptedRequests();
+    assert.equal(sends, 0);
+    assert.ok("error" in (responses(transport)[0]!.response as object));
+    await assert.rejects(auth.authenticate(transport), /admission is closed/);
+    await assert.rejects(auth.handleServerRequest(transport, refreshRequest(2)), /admission is closed/);
+    assert.equal(sends, 0);
+  });
+
+  it("interrupts a queued callback on cancellation without poisoning", async () => {
+    let sends = 0;
+    const auth = subscription({ refresh: async () => { sends += 1; return REFRESHED; } });
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    const lease = auth.suspendRefreshAdmission();
+    const controller = new AbortController();
+    const queued = auth.handleServerRequest(transport, refreshRequest(1), controller.signal);
+    controller.abort();
+    await queued;
+    await lease.drain();
+    assert.equal(sends, 0);
+    assert.ok("error" in (responses(transport)[0]!.response as object));
+    lease.resume();
+    await auth.handleServerRequest(transport, refreshRequest(2));
+    assert.equal(sends, 1);
+    assert.equal(transport.closes, 0);
+  });
+
+  it("validates malformed and api-key requests before queuing", async () => {
+    for (const apiKey of [false, true]) {
+      let sends = 0;
+      const auth = apiKey
+        ? createCodexAppServerAuth({ mode: "api_key", apiKey: "test-key" })
+        : subscription({ refresh: async () => { sends += 1; return REFRESHED; } });
+      const transport = new FakeTransport();
+      await auth.authenticate(transport);
+      const lease = auth.suspendRefreshAdmission();
+      const request = apiKey ? refreshRequest(1) : { ...refreshRequest(1), params: { reason: "invalid" } };
+      assert.equal(transport.emitServerRequest(request), true);
+      await assert.rejects(auth.drainInterceptedRequests(), CodexAppServerAuthError);
+      lease.resume();
+      assert.equal(sends, 0);
+      assert.equal(transport.closes, 1);
+    }
+  });
+});
+
 describe("Codex app-server auth: pinned startup ordering and modes", () => {
   it("checks delivery admission synchronously and retains the operation after refusal", async () => {
     let admitted = true;
