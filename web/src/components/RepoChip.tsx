@@ -1,4 +1,4 @@
-// The Repos chip for the /overview/next header (issue #4334, admins only; the page decides
+// The Repos chip for the new Overview header (/dashboard) (issue #4334, admins only; the page decides
 // whether to mount it). A compact "N repos active of M" trigger with a badge stack opens a
 // popover listing which repos have listed active work, which ran in the last week and how
 // many are idle. All figures come from the pure repoActivityModel; this component only draws
