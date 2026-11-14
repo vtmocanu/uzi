@@ -23,6 +23,7 @@
 // finalizes each turn (resume, the shared abort controller, the pid-recording spawn)
 // and runs the query.
 
+import { claudeSdkSettings } from "./sdk-plugin-policy.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import type {
   Options as SdkOptions,
@@ -228,9 +229,8 @@ export interface ClaudeTurnConfig {
 const RUN_LANE_DISALLOWED_TOOLS = [...ASYNC_DEFERRAL_TOOLS, "AskUserQuestion"] as const;
 
 /**
- * Assemble the per-turn `SdkOptions` from the owner-computed ingredients. Keys are in
- * EXACTLY the insertion order the owner's literal used before the M2 extraction, so a
- * snapshot/stringify comparison in the frozen tests still matches byte-for-byte.
+ * Assemble the per-turn `SdkOptions` from the owner-computed ingredients. Existing fields
+ * keep their order; inline settings merge the worker's builtin-plugin denials with attribution.
  */
 export function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
   const options: SdkOptions = {
@@ -244,6 +244,7 @@ export function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
     // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
     // mentions and dispatches a leading slash command before any PreToolUse hook runs.
     verbatimPrompts: true,
+    settings: claudeSdkSettings(config.attributionSettings),
     plugins: [
       { type: "local", path: config.skillsPluginPath, skipMcpDiscovery: true },
     ],
@@ -263,7 +264,6 @@ export function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
   };
   if (config.model) options.model = config.model;
   if (config.effort) options.effort = config.effort;
-  if (config.attributionSettings) options.settings = config.attributionSettings;
   if (config.guardedCommand) {
     options.toolAliases = { Bash: GUARDED_COMMAND_TOOL };
     options.disallowedTools = [...RUN_LANE_DISALLOWED_TOOLS, "Bash", "Monitor"];
@@ -378,7 +378,7 @@ export class ClaudeHarness implements RunHarness {
     if (request.signal.aborted) sdkAbort.abort();
     else request.signal.addEventListener("abort", onOwnerAbort, { once: true });
 
-    const turnOptions: SdkOptions = { ...base, abortController: sdkAbort };
+    const turnOptions: SdkOptions = { ...base, settings: claudeSdkSettings(base.settings), abortController: sdkAbort };
     // issue #2014 (D1): the CLI never forwards a subagent's stream_events (its partial-message
     // emitter pins parent_tool_use_id to null and its nested-progress path takes only assistant and
     // user frames), so a text-only or thinking-only subagent message is visible ONLY as a forwarded
