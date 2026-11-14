@@ -458,11 +458,10 @@ async function finishAndSend(deps: TerminalOperationDeps, input: TerminalOperati
   if (!deps.boundaryValid()) return kept("boundary_invalid");
   const invoked = await store.invoke(input.runId, input.generation, iso(deps));
   if (invoked.kind !== "invoked") return kept(invoked.kind === "blocked" ? invoked.reason : `invoke_${invoked.kind}`);
-  // The boundary can lapse while `invoke` is in flight: nothing is sent, and the lapse is latched so no resume sends.
-  if (!deps.boundaryValid()) {
-    await store.addLocalBlock(input.runId, input.generation, ["boundary_lost"]);
-    return kept("boundary_lost");
-  }
+  // The boundary can lapse while `invoke` is in flight: nothing is sent. The lapse is NOT latched: nothing left the
+  // worker, and a later resume re-proves universe, coverage, digests and its own boundary before it may send the
+  // identical request (bounded by MAX_INVOCATIONS). A run-wide block here would strand the run's custody for good.
+  if (!deps.boundaryValid()) return kept("boundary_lost");
   const req: TerminalPreservationRequest = {
     generation: input.generation, tip: rec.tip!, ...(rec.priorTip !== undefined ? { prior_tip: rec.priorTip } : {}),
     manifest: rec.manifest!, disposition: "preserve", ...(pack.length > 0 ? { pack: pack.toString("base64") } : {}),

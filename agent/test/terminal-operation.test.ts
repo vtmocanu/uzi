@@ -697,20 +697,21 @@ describe("terminal operation final authority", () => {
     assert.deepEqual((await readRec(real)).invocations.map(i => i.outcome), ["invoked", "published"]);
   });
 
-  it("a boundary lost while invoke is in flight sends nothing and latches boundary_lost", async () => {
+  it("a boundary lost while invoke is in flight sends nothing, latches no block, and a later resume may send", async () => {
+    let lapses = 1;
     const coord = mkCoord(mkRoot());
     const h = harness(coord);
     const real = h.deps.store;
-    h.deps.store = { ...real, invoke: async (r, g, at) => { const out = await real.invoke(r, g, at); h.boundary = false; return out; },
+    h.deps.store = { ...real, invoke: async (r, g, at) => { const out = await real.invoke(r, g, at); if (lapses-- > 0) h.boundary = false; return out; },
       read: real.read.bind(real), create: real.create.bind(real), update: real.update.bind(real), addLocalBlock: real.addLocalBlock.bind(real) };
     assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "boundary_lost" });
     assert.equal(h.sends.length, 0);
     const r = await readRec(real);
     assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked"]);
-    assert.deepEqual(r.localBlock, ["boundary_lost"]);
+    assert.deepEqual(r.localBlock, [], "a lapse before any send must not block the run");
     h.boundary = true;
-    assert.deepEqual(await runTerminalOperation(h.deps, input("resume")), { outcome: "kept", reason: "local_block" });
-    assert.equal(h.sends.length, 0);
+    await runTerminalOperation(h.deps, input("resume"));
+    assert.equal(h.sends.length, 1, "the resume re-proves and sends the identical request once");
   });
 
   it("a boundary lost during the send records the receipt but returns no authority", async () => {
