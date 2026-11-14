@@ -16,8 +16,8 @@ import {
   FailedRunsBlock, TopCauses, SinceLastFailedRun, SegmentedToggle, WindowToggle, Th, Td, hasRecordedUsage, USAGE_SCOPE_NOTE,
 } from "./usageParts";
 
-// PRD #3881: the Overview preview's one Usage card. A You / All users scope toggle (admins
-// only) and the window toggle switch one set of figures, instead of the current Overview's
+// PRD #3881: the default Overview's one Usage card. A You / All users scope toggle (admins
+// only) and the window toggle switch one set of figures, instead of the classic Overview's
 // side-by-side columns; the All users scope adds a By user table below. The admin's scope
 // choice is remembered per browser (#4052). The By user table ends in one combined bar per row:
 // its length is the user's share of the factory's cost, its colours their Claude / Codex runs (#4227).

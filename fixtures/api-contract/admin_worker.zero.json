@@ -9,6 +9,7 @@
   "hibernated_at": null,
   "wake_requested_at": null,
   "wake_error": null,
+  "hibernation_cleanup": null,
   "id": "",
   "name": "",
   "status": "",

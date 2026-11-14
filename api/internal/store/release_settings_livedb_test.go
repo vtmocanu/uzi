@@ -44,6 +44,8 @@ func TestReleaseSettingsLiveDB(t *testing.T) {
 		settings.KeyReleaseRCBody,
 		settings.KeyReleaseRCNotesURL,
 		settings.KeyReleaseRCPublishedAt,
+		settings.KeyReleaseFormulaStableTag,
+		settings.KeyReleaseFormulaRCTag,
 	}
 	clear := func() {
 		if _, err := q.DeleteAppSettings(ctx, keys); err != nil {

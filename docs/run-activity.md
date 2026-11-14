@@ -518,7 +518,7 @@ line as a `NOW` row — see [the CLI docs](./cli.md#commands).
 
 ## Progress estimate
 
-Live issue runs show a progress percent on the web dashboard and runs list,
+Live issue runs show a progress percent on the web Overview and runs list,
 on the TUI board and in `uzi run get`, so you can tell at a glance how far
 along a run is without opening it. The server derives it from the run's
 frozen milestone list: `11% + 89% × completed / total`, capped at 99% until
@@ -550,10 +550,10 @@ the estimates fell within 2x of the actual time remaining.
 
 Where it appears:
 
-- **Web** (dashboard and runs list rows): running and live completion status pills show
+- **Web** (Overview and runs list rows): running and live completion status pills show
   their label with a percentage, for example `running · 70%`, and a static fill
   at every width beside the milestone badge.
-  Waiting and stalled flags remain separate. On the Dashboard those flags are
+  Waiting and stalled flags remain separate. On Overview run rows those flags are
   hidden at phone widths; the health badge remains visible and the runs list
   keeps the flags.
 - **TUI board**: one progress cell combines the milestone micro-bar with the
@@ -653,7 +653,7 @@ inert plain text: control and format characters are stripped when the API
 ingests it, and it is capped at 120 characters.
 
 **When it shows.** Only on the single-run read (the run page, `uzi run get`,
-the TUI detail), never on the dashboard, runs list or TUI board. It needs the
+the TUI detail), never on the Overview, runs list or TUI board. It needs the
 progress state to be a percent (currently an executing, healthy issue run
 with a frozen milestone list), an active milestone, and the Now summary
 enabled both by the admin switch and in the run owner's settings.

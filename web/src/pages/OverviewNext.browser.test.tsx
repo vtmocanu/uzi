@@ -6,10 +6,12 @@ import "@fontsource/ibm-plex-sans/latin-600.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cdp, page, userEvent } from "vitest/browser";
 import { cleanup, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
+import { Dashboard } from "./Dashboard";
+import { AppShell } from "../components/AppShell";
 import { api } from "../lib/api";
-import { healthySilentDoc, overviewNextDoc } from "../mocks/data";
+import { healthySilentDoc, incidentDoc, overviewNextDoc } from "../mocks/data";
 import { overviewNextOwnerWorkers } from "../mocks/data/overviewNext";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 import { useAuth } from "../auth/AuthContext";
@@ -34,6 +36,15 @@ vi.mock("../lib/api", async (importOriginal) => {
       getRecoveryHolds: vi.fn(),
       getAdminHealth: vi.fn(),
       listUsers: vi.fn(),
+      workerUpgradeSummary: vi.fn(),
+      getJudgeStats: vi.fn(),
+      runsInProgressCount: vi.fn(),
+      listSchedules: vi.fn(),
+      getFindingsStats: vi.fn(),
+      getMyRateLimits: vi.fn(),
+      getMyCodexRateLimits: vi.fn(),
+      getMySettings: vi.fn(),
+      version: vi.fn(),
     },
   };
 });
@@ -77,6 +88,15 @@ beforeEach(() => {
   mockApi.getUsage.mockResolvedValue(emptySelf());
   mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
   mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
+  mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 0, target_release: "0.6.0" });
+  mockApi.getJudgeStats.mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 });
+  mockApi.runsInProgressCount.mockResolvedValue({ count: 0 });
+  mockApi.listSchedules.mockResolvedValue([]);
+  mockApi.getFindingsStats.mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 });
+  mockApi.getMyRateLimits.mockResolvedValue({ status: "no_token" } as never);
+  mockApi.getMyCodexRateLimits.mockResolvedValue({ accounts: [] } as never);
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null } } as never);
+  mockApi.version.mockResolvedValue({ version: "9.9.9-test", founded: "2026-07-03" } as never);
   mockApi.listUsers.mockResolvedValue({ users: [] });
   mockApi.getRecoveryHolds.mockResolvedValue({
     aggregate: { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
@@ -89,11 +109,45 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("promoted Overview routes in the real shell (PRD #3877 M1)", () => {
+  const follows = (a: Node, b: Node) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+
+  async function mountAt(path: string) {
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <AppShell>
+          <Routes>
+            <Route path="/dashboard" element={<OverviewNext />} />
+            <Route path="/overview/classic" element={<Dashboard />} />
+          </Routes>
+        </AppShell>
+      </MemoryRouter>,
+    );
+    const header = await screen.findByRole("heading", { name: /Welcome/ });
+    const banner = await screen.findByRole("alert", { name: "Instance health" });
+    return { header, banner };
+  }
+
+  it("places the banner after the default header and before the classic header", async () => {
+    await page.viewport(1280, 900);
+    mockApi.getAdminHealth.mockResolvedValue(incidentDoc());
+
+    const promoted = await mountAt("/dashboard");
+    expect(follows(promoted.header, promoted.banner)).toBe(true);
+    expect(follows(promoted.banner, screen.getByRole("region", { name: "Issue work" }))).toBe(true);
+
+    cleanup();
+    const classic = await mountAt("/overview/classic");
+    expect(follows(classic.banner, classic.header)).toBe(true);
+    expect(screen.getByRole("link", { name: "Overview", current: "page" })).toBeTruthy();
+  });
+});
+
 describe("OverviewNext at 400px", () => {
   it("stacks its cards inside the viewport with no horizontal scroll", async () => {
     await page.viewport(400, 900);
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -150,7 +204,7 @@ describe("OverviewNext issue work line", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -190,7 +244,7 @@ describe("OverviewNext issue work line", () => {
         aRun({ id: "plain", status: "running", issue_iid: 4209 }),
       ] });
       render(
-        <MemoryRouter initialEntries={["/overview/next"]}>
+        <MemoryRouter initialEntries={["/dashboard"]}>
           <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8"><OverviewNext /></main>
         </MemoryRouter>,
       );
@@ -247,7 +301,7 @@ describe("OverviewNext issue work line", () => {
         ],
       });
       render(
-        <MemoryRouter initialEntries={["/overview/next"]}>
+        <MemoryRouter initialEntries={["/dashboard"]}>
           <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
             <OverviewNext />
           </main>
@@ -413,7 +467,7 @@ describe("OverviewNext issue work scope switch", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -568,7 +622,7 @@ describe("OverviewNext issue work cross-check tags", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -813,7 +867,7 @@ describe("OverviewNext capacity rail", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -890,7 +944,7 @@ describe("OverviewNext capacity rail worker rows", () => {
       runs: [aRun({ id: "run-mr-rework", status: "running", issue_iid: 77, issue_title: "Rework the cost cap" })],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -976,7 +1030,7 @@ describe("OverviewNext held work card", () => {
       holds: [],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -1065,7 +1119,7 @@ describe("OverviewNext decision card layout", () => {
   async function mountCard(runs: ReturnType<typeof aRun>[]) {
     mockApi.listRuns.mockResolvedValue({ runs });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -1327,7 +1381,7 @@ describe("OverviewNext People chip", () => {
 
   async function mountChip() {
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -1471,7 +1525,7 @@ describe("OverviewNext health chip popover", () => {
   function mountChip() {
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -1484,7 +1538,7 @@ describe("OverviewNext health chip popover", () => {
     await page.viewport(width, 900);
     mockApi.getAdminHealth.mockResolvedValue(passing ? healthySilentDoc() : overviewNextDoc());
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <div style={{ paddingLeft: sidebarWidth }}>
           <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
             <div data-page-content-column className="mx-auto w-full max-w-[68rem]">
@@ -1643,7 +1697,7 @@ describe("OverviewNext health chip popover", () => {
       mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
       // The shell's lg sidebar is a fixed 240px aside beside <main> (AppShell lg:pl-60).
       render(
-        <MemoryRouter initialEntries={["/overview/next"]}>
+        <MemoryRouter initialEntries={["/dashboard"]}>
           <div style={{ paddingLeft: 240 }}>
             <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
               {/* AppShell's content column bounds the actions beside the fixed sidebar. A
@@ -1678,7 +1732,7 @@ describe("OverviewNext health chip popover", () => {
     await page.viewport(1280, 900);
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <CommandMenuContext.Provider value={{ open: () => {} }}>
             <OverviewNext />

@@ -32,6 +32,17 @@ const releasePath = "/repos/vtmocanu/uzi/releases/latest"
 // its separate 4 MiB cap leaves room for full release-note bodies.
 const releasesPath = "/repos/vtmocanu/uzi/releases?per_page=20"
 
+// The two Homebrew tap formulas whose uzi tag the check reports (issue #4314).
+// Constant paths on the same GitHub API host; Accept application/vnd.github.raw+json
+// returns the file source rather than the contents JSON envelope.
+const (
+	formulaStablePath = "/repos/vtmocanu/homebrew-tap/contents/Formula/uzi-cli.rb?ref=main"
+	formulaRCPath     = "/repos/vtmocanu/homebrew-tap/contents/Formula/uzi-cli-rc.rb?ref=main"
+
+	acceptJSON       = "application/vnd.github+json"
+	acceptRawContent = "application/vnd.github.raw+json"
+)
+
 // baseURL is the fetch base; overridable by tests only (see defaultBaseURL).
 var baseURL = defaultBaseURL
 
@@ -42,6 +53,8 @@ const (
 	// releases carries every release body, so give it a separate bounded 4 MiB.
 	maxReleaseBodyBytes     = 1 << 20 // 1 MiB
 	maxReleaseListBodyBytes = 4 << 20 // 4 MiB
+	// maxFormulaBodyBytes bounds one formula source read; a real formula is ~2 KiB.
+	maxFormulaBodyBytes = 256 << 10 // 256 KiB
 )
 
 // githubRelease is the subset of each GitHub release payload the check reads.
@@ -106,31 +119,9 @@ func fetchLatestRC(ctx context.Context, client *http.Client, token string) (gith
 }
 
 func fetchJSON(ctx context.Context, client *http.Client, token, path string, dest any, maxBytes int64) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+	body, err := fetchBody(ctx, client, token, path, acceptJSON, maxBytes)
 	if err != nil {
 		return err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return scrubToken(err, token)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("release check: unexpected status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
-	if err != nil {
-		return fmt.Errorf("release check: read response: %w", scrubToken(err, token))
-	}
-	if int64(len(body)) > maxBytes {
-		return fmt.Errorf("release check: response exceeds %d MiB", maxBytes/(1<<20))
 	}
 	if strings.TrimSpace(string(body)) == "null" {
 		return errors.New("release check: null response")
@@ -139,6 +130,50 @@ func fetchJSON(ctx context.Context, client *http.Client, token, path string, des
 		return fmt.Errorf("release check: decode response: %w", err)
 	}
 	return nil
+}
+
+// fetchFormula GETs one tap formula's raw source, bounded by maxFormulaBodyBytes.
+func fetchFormula(ctx context.Context, client *http.Client, token, path string) (string, error) {
+	body, err := fetchBody(ctx, client, token, path, acceptRawContent, maxFormulaBodyBytes)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+// fetchBody is the shared guarded GET: the given Accept, the optional bearer token
+// (scrubbed from errors), a 200-only status check and a maxBytes read cap.
+func fetchBody(ctx context.Context, client *http.Client, token, path, accept string, maxBytes int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", accept)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, scrubToken(err, token)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("release check: unexpected status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("release check: read response: %w", scrubToken(err, token))
+	}
+	if int64(len(body)) > maxBytes {
+		if maxBytes >= 1<<20 {
+			return nil, fmt.Errorf("release check: response exceeds %d MiB", maxBytes/(1<<20))
+		}
+		return nil, fmt.Errorf("release check: response exceeds %d KiB", maxBytes/(1<<10))
+	}
+	return body, nil
 }
 
 // scrubToken removes the token from an error message defensively. A transport error

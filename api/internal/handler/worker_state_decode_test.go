@@ -50,6 +50,7 @@ type stateRequestMinusGateRevision struct {
 	RequireRunning              bool                               `json:"require_running,omitempty"`
 	CompletionFinalHead         *string                            `json:"completion_final_head,omitempty"`
 	State                       string                             `json:"status"`
+	OpID                        *string                            `json:"op_id,omitempty"`
 	ClarificationSettlement     *workersvc.ClarificationSettlement `json:"clarification_settlement,omitempty"`
 	ClaimGeneration             *int64                             `json:"claim_generation"`
 	MessagesThroughSeq          *int64                             `json:"messages_through_seq"`

@@ -41,30 +41,31 @@ var checkMeta = map[string]struct {
 	title string
 	doc   string
 }{
-	"fleet.roll":             {"instance", groupWorkers, "Worker image roll", "worker-upgrades"},
-	"fleet.capacity":         {"owner", groupWorkers, "Worker capacity", "hosted-workers"},
-	"fleet.disk":             {"owner", groupWorkers, "Worker disk", "hosted-workers"},
-	"fleet.rundisk":          {"owner", groupWorkers, "Run disk size", "hosted-workers"},
-	"fleet.quarantine":       {"owner", groupWorkers, "Worker residue quarantine", "hosted-workers"},
-	"fleet.memory_authority": {"owner", groupWorkers, "Worker memory authority", "hosted-workers"},
-	"fleet.hibernation_wake": {"instance", groupWorkers, "Hibernation wakes", "hosted-workers"},
-	"queue.waiting":          {"owner", groupQueue, "Runs waiting for a worker", ""},
-	"queue.undispatched":     {"owner", groupQueue, "Undispatched task runs", ""},
-	"controller.report":      {"instance", groupControl, "Controller reporting", "hosted-workers"},
-	"db":                     {"instance", groupControl, "Database", ""},
-	"db.size":                {"instance", groupControl, "Database size", "admin-health"},
-	"loops":                  {"instance", groupControl, "Background loops", ""},
-	"forge.sync":             {"owner", groupIntegrations, "Forge issue sync", ""},
-	"forge.ciwatch":          {"owner", groupIntegrations, "CI watch capacity", ""},
-	"slack.socket":           {"owner", groupIntegrations, "Slack socket", ""},
-	"schedules.paused":       {"owner", groupHousekeeping, "Paused schedules", ""},
-	"maintenance.active":     {"instance", groupHousekeeping, "Maintenance mode", "instance-maintenance"},
-	"board.drift":            {"owner", groupHousekeeping, "Board drift", ""},
-	"custody.holds":          {"owner", groupHousekeeping, "Recovery custody holds", ""},
-	"recovery.storage":       {"owner", groupHousekeeping, "Recovery storage", ""},
-	"release.check":          {"owner", groupHousekeeping, "Upstream release", ""},
-	"agentsource.update":     {"instance", groupHousekeeping, "Agent source update", "agent-source"},
-	"pricing.codex":          {"instance", groupHousekeeping, "Codex price coverage", "admin-health"},
+	"fleet.roll":                {"instance", groupWorkers, "Worker image roll", "worker-upgrades"},
+	"fleet.capacity":            {"owner", groupWorkers, "Worker capacity", "hosted-workers"},
+	"fleet.disk":                {"owner", groupWorkers, "Worker disk", "hosted-workers"},
+	"fleet.rundisk":             {"owner", groupWorkers, "Run disk size", "hosted-workers"},
+	"fleet.quarantine":          {"owner", groupWorkers, "Worker residue quarantine", "hosted-workers"},
+	"fleet.memory_authority":    {"owner", groupWorkers, "Worker memory authority", "hosted-workers"},
+	"fleet.hibernation_wake":    {"instance", groupWorkers, "Hibernation wakes", "hosted-workers"},
+	"fleet.hibernation_cleanup": {"instance", groupWorkers, "Hibernation cache cleanup", "hosted-workers"},
+	"queue.waiting":             {"owner", groupQueue, "Runs waiting for a worker", ""},
+	"queue.undispatched":        {"owner", groupQueue, "Undispatched task runs", ""},
+	"controller.report":         {"instance", groupControl, "Controller reporting", "hosted-workers"},
+	"db":                        {"instance", groupControl, "Database", ""},
+	"db.size":                   {"instance", groupControl, "Database size", "admin-health"},
+	"loops":                     {"instance", groupControl, "Background loops", ""},
+	"forge.sync":                {"owner", groupIntegrations, "Forge issue sync", ""},
+	"forge.ciwatch":             {"owner", groupIntegrations, "CI watch capacity", ""},
+	"slack.socket":              {"owner", groupIntegrations, "Slack socket", ""},
+	"schedules.paused":          {"owner", groupHousekeeping, "Paused schedules", ""},
+	"maintenance.active":        {"instance", groupHousekeeping, "Maintenance mode", "instance-maintenance"},
+	"board.drift":               {"owner", groupHousekeeping, "Board drift", ""},
+	"custody.holds":             {"owner", groupHousekeeping, "Recovery custody holds", ""},
+	"recovery.storage":          {"owner", groupHousekeeping, "Recovery storage", ""},
+	"release.check":             {"owner", groupHousekeeping, "Upstream release", ""},
+	"agentsource.update":        {"instance", groupHousekeeping, "Agent source update", "agent-source"},
+	"pricing.codex":             {"instance", groupHousekeeping, "Codex price coverage", "admin-health"},
 }
 
 // base returns a check DTO pre-filled with the id's fixed metadata and a non-nil (empty)
@@ -744,6 +745,52 @@ func (s *Service) checkFleetHibernationWake(now time.Time, workers []store.ListA
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Worker", Value: n})
 	}
 	c.Action = strPtr("Runs queued for a hibernated worker are not starting. Check the worker's pod and the controller logs; `uzi admin workers --json` shows wake_error.")
+	if !oldest.IsZero() {
+		c.Since = sincePtr(oldest)
+	}
+	return c
+}
+
+// checkFleetHibernationCleanup (PRD #4206) is danger when a hosted worker's hibernation cache
+// prune settlement is unknown (cleanup_phase "unknown"): the claim fence stays until that
+// attempt's own evidence settles it, and there is no acknowledge route. It reads the worker
+// list Evaluate already holds. `na` when no hosted workers are configured. The summary is fixed
+// text; evidence is the count plus at most maxQuarantineEvidence sanitized worker names. Since
+// is the oldest cleanup_unknown_at.
+func (s *Service) checkFleetHibernationCleanup(workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
+	c := s.base("fleet.hibernation_cleanup")
+	if !s.hostedConfigured(workers) {
+		c.Severity = sevNA
+		c.Summary = "No hosted workers are configured on this deployment."
+		return c
+	}
+	var names []string
+	var oldest time.Time
+	for _, row := range workers {
+		w := row.Worker
+		if w.CleanupPhase != workersvc.CleanupPhaseUnknown {
+			continue
+		}
+		names = append(names, orDash(safe(w.Name)))
+		if w.CleanupUnknownAt.Valid && (oldest.IsZero() || w.CleanupUnknownAt.Time.Before(oldest)) {
+			oldest = w.CleanupUnknownAt.Time
+		}
+	}
+	if len(names) == 0 {
+		c.Severity = sevOK
+		c.Summary = "No hosted worker has an unsettled hibernation cache cleanup."
+		return c
+	}
+	c.Severity = sevDanger
+	c.Summary = "Some hosted workers have a hibernation cache cleanup whose outcome is unknown; their claim fence stays in place."
+	c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Workers", Value: fmt.Sprintf("%d", len(names))})
+	for i, n := range names {
+		if i == maxQuarantineEvidence {
+			break
+		}
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Worker", Value: n})
+	}
+	c.Action = strPtr("The claim fence stays until the worker's prune settlement is confirmed by its own evidence: a late result from the same worker process, or the controller observing that attempt's pod terminated. There is no acknowledge route. Deleting the stuck pod only helps if the controller observes it terminated before it disappears.")
 	if !oldest.IsZero() {
 		c.Since = sincePtr(oldest)
 	}

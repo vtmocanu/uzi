@@ -42,7 +42,7 @@ import { stripUnsafeChars } from "../lib/safeText";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerStatusBadge } from "../components/WorkerStatusBadge";
 import { WorkerHibernationControls } from "../components/WorkerHibernationControls";
-import { isHibernating } from "../lib/workerHibernation";
+import { hibernationCleanupText, isHibernating } from "../lib/workerHibernation";
 import { WorkerCordonMetadata } from "../components/WorkerCordonMetadata";
 import { useHealthStatus } from "../lib/useAdminHealth";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
@@ -587,6 +587,7 @@ function FleetRow({ worker: w, demo, onChanged }: { worker: AdminWorker; demo: b
   const name = stripUnsafeChars(w.name);
   const upgrade = upgradePresentation(w.upgrade_status);
   const wakeError = isHibernating(w) ? stripUnsafeChars(w.wake_error ?? "").trim() : "";
+  const cleanup = hibernationCleanupText(w);
 
   return (
     <tr>
@@ -605,6 +606,11 @@ function FleetRow({ worker: w, demo, onChanged }: { worker: AdminWorker; demo: b
         </div>
         {/* Plain text, never HTML: the server message is sanitized, and stripped again here. */}
         {wakeError && <p className="mt-1 max-w-xs whitespace-normal text-xs text-danger">Wake failed: {wakeError}</p>}
+        {cleanup && (
+          <p className={`mt-1 max-w-xs whitespace-normal text-xs ${w.hibernation_cleanup?.state === "unknown" ? "text-danger" : "text-muted"}`}>
+            {cleanup}
+          </p>
+        )}
         <WorkerHibernationControls worker={w} onChanged={onChanged} />
       </td>
       <td className="px-4 py-3">

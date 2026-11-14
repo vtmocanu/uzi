@@ -16,6 +16,10 @@ import (
 //     processes were not proven stopped; the work and custody stay on that worker. Owner
 //     Resume (requeues on the newly chosen token; the next claim re-proves quiescence fail
 //     closed) or Cancel.
+//
+// A worker that applies a switch in place (issue #4201) opens these holds without ever releasing
+// its claim: the hold is the only state the owner sees, so the copy below names the hold and the
+// owner's next step and says nothing about a released claim or a reclaim.
 const (
 	holdCredentialSwitchSettling  = "credential_switch_settling"  //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 	holdCredentialSwitchUnsettled = "credential_switch_unsettled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.

@@ -319,7 +319,10 @@ A few worth knowing:
   without a reachable server. Under `--json` the CLI's version stays top-level
   and the server's nests under `server`, leaving existing parsers untouched;
   fields the server did not stamp are omitted rather than sent empty, so an
-  absent `server.commit` means "unknown", never "empty".
+  absent `server.commit` means "unknown", never "empty". When the server's
+  release check has read the Homebrew tap, `server.homebrew_formulas`
+  (`uzi_cli`, `uzi_cli_rc`) carries each formula's tag; it is omitted when the
+  check is off, has not run, or both are unknown.
 - **`uzi tui` also surfaces an available update, unprompted.** Where `version`
   only tells you on request, the TUI checks at every startup and shows a modal
   when this binary is behind the latest published release — see [Startup: an
@@ -2031,7 +2034,10 @@ and, when an upgrade is still needed, shows a modal on top of the board. If the
 formula-owned installed CLI already meets the offered release, it shows a restart
 hint instead. A stable `uzi-cli` install checks stable releases; an `uzi-cli-rc`
 install checks the newer of the latest stable and latest release candidate, while
-staying on its opt-in formula. A stable install needing an upgrade looks like this:
+staying on its opt-in formula. A Homebrew install is offered the "Update now"
+action only once its own formula carries the release (see the first bullet below);
+until then the modal shows release notes only. A stable install whose formula
+carries the release looks like this:
 
 ```
 ▲ Update available
@@ -2048,7 +2054,19 @@ A newer release is available.
   the running binary: `brew upgrade vtmocanu/tap/uzi-cli` for stable or
   `brew upgrade vtmocanu/tap/uzi-cli-rc` for the RC channel, even when it currently
   runs a stable version. These tap-qualified targets select uzi's stable and opt-in
-  RC formulae. Choosing it exits the TUI and runs Homebrew in the foreground, so
+  RC formulae. The action appears only once that **owning** formula installs the
+  offered version or newer, as last read by the server's release check (every
+  `UZI_RELEASE_CHECK_INTERVAL`, default `6h`; see [Update checks](updates.md)). An
+  RC-owned install offered a newer stable is gated on `uzi-cli-rc`, not `uzi-cli`.
+  When the formula is behind, unreadable or unknown, or the server is older and does
+  not report formula versions, the prompt shows release notes only (Not now / Don't
+  remind me, plus `Release notes: <url>`). The tap can lag the GitHub release, so
+  this avoids offering an upgrade Homebrew cannot yet perform. Two consequences:
+  "Not now" on a notes-only prompt is not reopened later in that session when the
+  formula catches up, and "Don't remind me for `<version>`" also suppresses a later
+  Update now for that version. A ready offer is not a promise: `brew upgrade` uses
+  your local tap clone and your Homebrew auto-update settings, so it can still end
+  in the not-reached message below. Choosing it exits the TUI and runs Homebrew in the foreground, so
   the source-build output and any failure stay visible. It does not force a tap
   refresh: Homebrew inherits `HOMEBREW_AUTO_UPDATE_SECS` and
   `HOMEBREW_NO_AUTO_UPDATE` from your environment. A zero exit from Homebrew is
@@ -3067,7 +3085,8 @@ A [hibernated](hosted-workers.md#hibernation) hosted worker shows `hibernating`,
 `uzi admin workers`; a wake not confirmed in time shows `(wake error)` after it, and a manual
 cordon keeps its ` · cordoned (manual)` marker after the state.
 `--json` carries `hibernation_state`, `hibernation_reason`, `hibernated_at`,
-`wake_requested_at` and `wake_error`. `uzi tui` shows the state too. There is no
+`wake_requested_at` and `wake_error`, and `hibernation_cleanup` (`{state, outcome, reason}`, the
+[cache cleanup](hosted-workers.md#cache-cleanup-before-sleep) before sleep). `uzi tui` shows the state too. There is no
 write verb: hibernating and waking are web-only admin actions.
 
 `uzi run get` gains four rows, each emitted only when the server has
@@ -4013,6 +4032,20 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   registration (the refusal lifts on the worker's acknowledgement, a stale
   heartbeat, worker removal or re-registration), and `run cancel` always works; see
   [Credential-switch holds](run-recovery.md#credential-switch-holds).
+  `settling` means the worker is still finishing its own operations; `unsettled`
+  means it finished them but did not prove the run's processes stopped (nothing
+  was applied, and the next claim re-proves that). They are distinct states;
+  the only change between them is `settling` to `unsettled`, when the worker acknowledges.
+  On a worker with in-place switching, `run set-token` on a live Claude run
+  switches the token without releasing the claim (same worker, same working
+  directory; it resumes the same session where the provider allows, otherwise
+  a fresh session in the same directory with a `resume_lineage_break` notice,
+  reason `credential_switch_resume_refused`).
+  If the worker cannot prove whether that switch took effect, the run is
+  `paused` with no hold reason and a `credential_switch_uncertain` message in
+  the run feed (posted by the worker):
+  `uzi run resume <id>` re-resolves the token from the run's current choice
+  and continues. See [Paused after an uncertain token switch](./run-pause.md#paused-after-an-uncertain-token-switch).
   A `paused` run created with `--require-base` can also be **held because
   its kept work is not attested** (`hold_reason: base_attestation_missing`):
   it continued its own work, but no checkpoint proves that work was produced

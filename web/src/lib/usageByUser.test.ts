@@ -234,7 +234,7 @@ describe("failureAgo", () => {
   });
 });
 
-describe("the current Overview's UsageCard", () => {
+describe("the classic Overview's UsageCard", () => {
   const mount = (admin: AdminUsage) =>
     render(createElement(MemoryRouter, null, createElement(UsageCard, {
       self: admin.factory, admin, window: "lifetime", onWindowChange: () => {},

@@ -1,4 +1,4 @@
-// The People chip for the /overview/next header (issue #4042, admins only; the page decides
+// The People chip for the default Overview header (issue #4042, admins only; the page decides
 // whether to mount it). A compact "N active now of M" trigger with an avatar stack opens a
 // popover listing who is doing what, who signed in recently and the week's usage. All figures
 // come from the pure peopleModel; this component only draws it. The open/close model, focus

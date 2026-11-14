@@ -282,6 +282,18 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 		// A zero or inconsistent row (empty state, or no op id) carries no object.
 		if row.HibernationOpID.Valid && (row.HibernationState == "preparing" || row.HibernationState == "hibernated" || row.HibernationState == "waking") {
 			dw.Hibernation = &Hibernation{State: row.HibernationState, OpID: uuid.UUID(row.HibernationOpID.Bytes).String()}
+			// PRD #4206: an unsettled cache prune attempt hides preparing and waking behind
+			// "cleaning". The stop-proof pod uid is sent only when the settlement is unknown.
+			if (row.HibernationState == "preparing" || row.HibernationState == "waking") && row.CleanupOpID.Valid &&
+				(row.CleanupPhase == workersvc.CleanupPhaseRequested || row.CleanupPhase == workersvc.CleanupPhaseStarted ||
+					row.CleanupPhase == workersvc.CleanupPhaseUnknown) {
+				c := &HibernationCleanup{OpID: uuid.UUID(row.CleanupOpID.Bytes).String(), ReconcileSeq: row.CleanupReconcileSeq}
+				if row.CleanupPhase == workersvc.CleanupPhaseUnknown && row.CleanupPodUid.Valid {
+					c.StopProofPodUID = uuid.UUID(row.CleanupPodUid.Bytes).String()
+				}
+				dw.Hibernation.State = HibernationCleaning
+				dw.Hibernation.Cleanup = c
+			}
 		}
 		if row.ManualCordonedAt.Valid {
 			t := row.ManualCordonedAt.Time

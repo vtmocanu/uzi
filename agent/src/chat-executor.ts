@@ -29,6 +29,7 @@
 // that feeds `nextUserMessage` (steering's await-follow-up primitive, Decision 2)
 // is Phase 2; Phase 1 injects it from the ChatRunner/tests.
 
+import { claudeSdkSettings } from "./sdk-plugin-policy.js";
 import fs from "node:fs/promises";
 import type { Options as SdkOptions, EffortLevel, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { EmittedMessage } from "./executor.js";
@@ -274,6 +275,7 @@ export function buildChatSdkOptions(input: {
     // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
     // mentions and dispatches a leading slash command before any PreToolUse hook runs.
     verbatimPrompts: true,
+    settings: claudeSdkSettings(),
     // The load-bearing base-set restriction (Decision 6): read-only investigation
     // tools + the M3 uzi MCP tool names, and NOTHING else — this holds under
     // bypassPermissions where allowedTools would not.
@@ -466,7 +468,7 @@ export class ChatExecutor {
       else ctx.signal.addEventListener("abort", onCancel, { once: true });
     }
 
-    const options: SdkOptions = { ...baseOptions, abortController: abort };
+    const options: SdkOptions = { ...baseOptions, settings: claudeSdkSettings(baseOptions.settings), abortController: abort };
     if (resumeId) options.resume = resumeId;
     else delete options.resume;
     options.spawnClaudeCodeProcess = (spawnOpts: SpawnOptions): SpawnedProcess => {

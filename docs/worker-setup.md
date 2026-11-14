@@ -117,8 +117,8 @@ Both persist across Compose restarts. To refresh the nix store, first run `docke
 
 ## Resource stats and sizing
 
-Once a worker is running, **Settings → Workers** and the Dashboard's "Worker load"
-card show live CPU, memory, and disk gauges, self-reported by the worker from its
+Once a worker is running, the **Workers** page, the new Overview's Capacity rail,
+and the classic Overview's "Worker load" card show live CPU, memory, and disk gauges, self-reported by the worker from its
 own cgroup and filesystem on every heartbeat. A worker under real load (running
 the e2e suite) reported `cpu 1%` / `mem 0.1/4 GiB` / `disk 7.1/20 GiB` — a small,
 honest number, since the SDK subprocess and git were mostly idle between tool
@@ -507,6 +507,13 @@ did), so an api restart shows the worker as not
 quarantined until its next heartbeat. Any run can cause a quarantine by leaving
 such a process behind, so on a shared worker a restart is the cost of that.
 Credentials a process could read before it was detected are not revoked.
+
+## Hibernation cache prune capability
+
+A Docker-capable worker with the pressure prune enabled also advertises
+`hibernation_cache_prune_v1`, which lets the api run the
+[cache prune before hibernation](hosted-workers.md#cache-cleanup-before-sleep) on it.
+Without it the worker is not pruned and hibernates as before.
 
 ## Lost memory authority
 

@@ -322,6 +322,24 @@ export class TickSpawner {
       .map((t) => ({ pgid: t.pid, identity: t.identity, killConfirmed: t.killConfirmed }));
   }
 
+  /**
+   * Issue #4258: the lock paths a signalled, not-yet-reconciled child could have left behind, for a
+   * caller whose {@link reconcileLocks} could not run. NON-mutating: it unlinks nothing and marks no
+   * child reconciled, so a later reconcile still has its full evidence. The caller stats each path.
+   */
+  async unreconciledLockCandidates(): Promise<string[]> {
+    const bare = this.opts.barePath;
+    if (!bare) return [];
+    const pending = this.all.filter((t) => !t.reconciled && t.signalled);
+    if (pending.length === 0) return [];
+    this.bareReal ??= await fs.realpath(bare).catch(() => bare);
+    const toReal = (p: string): string =>
+      this.bareReal && p.startsWith(bare) ? path.join(this.bareReal, p.slice(bare.length)) : p;
+    const out = new Set<string>((await candidateLockPaths(bare, this.opts.branch)).map(toReal));
+    for (const t of pending) for (const h of t.held ?? []) out.add(h.path);
+    return [...out];
+  }
+
   /** True when any child had to be signalled by a cancellation (so lock reconcile is due). */
   cancelledAny(): boolean {
     return this.all.some((t) => t.signalled);

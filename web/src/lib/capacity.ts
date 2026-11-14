@@ -1,4 +1,4 @@
-// Run-slot capacity for the Overview preview's Capacity rail (PRD #3880 M1). Pure: it reads
+// Run-slot capacity for the default Overview's Capacity rail (PRD #3880 M1). Pure: it reads
 // each worker's advertised run lane (active_runs against max_concurrent_runs) and nothing
 // else. "Open" is advertised spare capacity, never a promise that a run will be claimed:
 // credentials, cordons and admission still decide that.

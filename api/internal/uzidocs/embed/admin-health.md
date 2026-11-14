@@ -41,12 +41,12 @@ It surfaces six ways:
   anything needs attention, red when any check is danger and amber
   otherwise; its accessible label names each severity ("3 health checks need
   attention: 2 danger, 1 warning").
-- **Overview**, for an admin: a self-hiding card beside the custody-hold
-  alert. When every check passes it collapses to one quiet line ("System
-  health: all N checks passing"); otherwise it shows the verdict and the top
-  three attention items, including each item's evidence and docs link,
-  with one Open health link to the Health tab. It makes no request at all
-  for a non-admin.
+- **Overview**, for an admin: a health chip in the page header opens a popover.
+  When every check passes it lists them by area; otherwise it shows every
+  attention item with its evidence and docs link, plus a disclosure for passing
+  checks. The popover has an Open health link. During the short classic-Overview
+  soak, `/overview/classic` still has the older self-hiding health card beside
+  its custody alert. Neither page makes an admin-health request for a non-admin.
 - **An app-wide Danger banner**, admins only, shown while `blocking` is
   `true`. It carries the instance-blocker verdict, the first instance danger
   check's own summary, an Open health link, and **Snooze 1 h** — per admin, per danger
@@ -62,7 +62,7 @@ It surfaces six ways:
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
   admin, selects checks with server-supplied `scope: instance` and severity
   `danger`. The current instance checks are `db`, `db.size`, `controller.report`,
-  `loops`, `fleet.roll`, `fleet.hibernation_wake`, `maintenance.active`,
+  `loops`, `fleet.roll`, `fleet.hibernation_wake`, `fleet.hibernation_cleanup`, `maintenance.active`,
   `agentsource.update` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains instance infrastructure even when the hosted
   workers belong to a single owner.
 
@@ -200,7 +200,8 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
 | `fleet.quarantine` | Whether any worker has latched a [residue quarantine](worker-setup.md#quarantined-worker) (an unreadable, unattributed runner-uid process was found, so it claims nothing until its container restarts) | any worker with a fresh heartbeat reports a quarantine; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it latched and the run that detected it (the worker's reported cause is not shown here: read `residue_quarantine_cause` in `uzi admin workers --json` or the worker view in `uzi tui`) | — | — |
 | `fleet.memory_authority` | Whether any worker has lost [memory authority](worker-setup.md#lost-memory-authority) (the api withholds guard-bound runs from it until its container restarts) | any worker with a fresh heartbeat has a gated claim recorded; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it was first gated | — | — |
-| `fleet.hibernation_wake` | Whether a [hibernated worker's wake](hosted-workers.md#hibernation) failed or is not confirmed (scope `instance`) | a wake failed, or is not confirmed within 15 minutes; the evidence names at most 10 workers (the first evidence row, `Workers`, carries the full count) | — | — |
+| `fleet.hibernation_wake` | Whether a [hibernated worker's wake](hosted-workers.md#hibernation) failed or is not confirmed (scope `instance`) | a wake failed, or is not confirmed within 15 minutes; the evidence names at most 10 workers (the first evidence row, `Workers`, carries the full count) | — | `na` when no hosted workers are configured |
+| `fleet.hibernation_cleanup` | Whether a [hibernating worker's cache cleanup](hosted-workers.md#cache-cleanup-before-sleep) has an unknown settlement, which keeps the worker's claims fenced (scope `instance`) | — | any attempt's settlement is unknown; it stays until the same attempt reports or the controller observes its pod stopped, and blocks the worker's delete | `na` when no hosted workers are configured |
 
 `fleet.quarantine` reads the worker's own heartbeat report, which the api keeps in
 memory only. A worker without a fresh heartbeat is skipped (`fleet.capacity`

@@ -19,6 +19,9 @@
 SELECT w.id,
        w.user_id, w.capabilities, w.protocol_capabilities, w.version,
        w.status, w.last_heartbeat_at, w.hibernation_state, w.hibernation_op_id,
+       -- Hibernation cache prune attempt (PRD #4206): the controller projects state 'cleaning' while
+       -- the phase is requested/started/unknown, and needs the stop-proof coordinates when unknown.
+       w.cleanup_phase, w.cleanup_op_id, w.cleanup_pod_uid, w.cleanup_reconcile_seq,
        w.snapshot_register_nonce, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason,
        -- Checker eligibility by slot family, matching fn_cross_check_child_eligible:
        -- ordinary_coverage is the legacy run-slot fallback, NOT ordinary-job support.

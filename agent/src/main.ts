@@ -18,6 +18,7 @@ import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
+import { CredentialSwitchOpLedger } from "./credential-switch-op-ledger.js";
 import { RunRunner, type ExecutorFactory, type RunExecution, type RunExecutorAddress, type RunnerOptions } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
@@ -37,8 +38,10 @@ import { Worker } from "./worker.js";
 import { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { createDindVolumePrune } from "./dind-volume-prune.js";
+import { createDindBuilderPrune } from "./dind-builder-prune.js";
 import { RetainedSourceServer } from "./ops/retained-source-server.js";
 import { DindMaintenanceController } from "./dind-maintenance.js";
+import { HibernationCachePruneController } from "./hibernation-cache-prune.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
 import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
 import { RunDiskSampler } from "./run-disk.js";
@@ -76,6 +79,16 @@ export function buildWorkerGitCache(
     authority: authority.hooks,
     authorityRequired: true,
   });
+}
+
+/**
+ * Issue #4201: the ONE write-ahead ledger for the in-place credential switch on `dataDir` (its per-run lock
+ * and entry cache live in the instance, so every runner of this process shares this one). The worker
+ * advertises credential_switch_in_place_v1 unconditionally, so a RunRunner built without this ledger would
+ * advertise the apply route and silently run the v1 release path: startup passes this result to the runner.
+ */
+export function buildCredentialSwitchLedger(dataDir: string): NonNullable<RunnerOptions["credentialSwitchLedger"]> {
+  return new CredentialSwitchOpLedger(dataDir);
 }
 
 /** The publication fixture is inert outside the stub lane and its exclusive sentinel. */
@@ -821,6 +834,8 @@ async function mainBody(): Promise<void> {
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     authority,
     maintenanceExclusion,
+    // Issue #4201: the ONE write-ahead ledger for the in-place credential switch on this data dir.
+    credentialSwitchLedger: buildCredentialSwitchLedger(config.dataDir),
     memoryRuntime: memory,
     // issue #3639: the guard timing the memory-receipt gate derives its sample wait from.
     ...(memoryGuardTiming ? { memoryGuardTiming } : {}),
@@ -1007,11 +1022,14 @@ async function mainBody(): Promise<void> {
   // issue #3891: the pressure-only anonymous-volume leg rides on the same enablement
   // predicate and runs inside the controller's loop; it only reads the gate and needs no
   // idle probe or custody (it runs on busy and custody-held workers by design).
+  // issue #4291: the BuildKit regular-cache leg is the third such leg; it additionally needs
+  // UZI_DIND_BUILDER_PRUNE_ENABLED (absent means on) and likewise only reads the gate.
   const dindPrune = createDindPrune(config, {
     gate: dindGate,
     isIdle: () => worker?.isIdle() ?? false,
     log,
     volumeLeg: createDindVolumePrune(config, { gate: dindGate, log }),
+    builderLeg: createDindBuilderPrune(config, { gate: dindGate, log }),
   });
   if (dindPrune) log.info("dind prune enabled", { docker_host_wired: true });
   const dindMaintenance = config.dockerWiring.dockerHost !== undefined
@@ -1022,6 +1040,16 @@ async function mainBody(): Promise<void> {
         isIdle: () => worker?.isIdle() ?? false,
         log,
         threshold: () => client.diskPressureThreshold,
+      })
+    : undefined;
+  // PRD #4206: the hibernation cache prune shares the claim gate; same enablement as the pressure prune.
+  const hibernationPrune = config.dindPruneEnabled === true && config.dockerWiring.dockerHost !== undefined
+    ? new HibernationCachePruneController({
+        gate: dindGate,
+        dockerHost: config.dockerWiring.dockerHost,
+        heartbeatIntervalMs: config.heartbeatIntervalMs,
+        isIdle: () => worker?.isIdle() ?? false,
+        log,
       })
     : undefined;
   // A run's api status for both HOME reclaims. A 404 is the API ANSWERING not-found (the
@@ -1122,6 +1150,8 @@ async function mainBody(): Promise<void> {
     dindGate,
     retainedSource,
     memory,
+    undefined,
+    hibernationPrune,
   );
 
   // Preserve shutdown ordering: revoke memory, initiate run-lane drain, then

@@ -764,17 +764,17 @@ func TestHeldPublishSlotsBounded(t *testing.T) {
 	svc := New(nil, nil, Params{})
 	var releases []func()
 	for i := 0; i < heldPublishMaxConcurrent; i++ {
-		rel, ok := svc.AcquireHeldPublishSlot()
+		rel, ok := svc.AcquireHeldPublishSlot(uuid.New())
 		if !ok {
 			t.Fatalf("slot %d refused below the cap", i)
 		}
 		releases = append(releases, rel)
 	}
-	if _, ok := svc.AcquireHeldPublishSlot(); ok {
+	if _, ok := svc.AcquireHeldPublishSlot(uuid.New()); ok {
 		t.Fatal("slot granted over the cap")
 	}
 	releases[0]()
-	rel, ok := svc.AcquireHeldPublishSlot()
+	rel, ok := svc.AcquireHeldPublishSlot(uuid.New())
 	if !ok {
 		t.Fatal("no slot after a release")
 	}

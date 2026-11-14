@@ -224,7 +224,7 @@ function seed(): MockState {
     }
   }
   // ?mock=overview-calm (PRD #3878): the viewer has active runs but nothing needs a decision,
-  // so the Overview preview's decision card stays hidden. Drop every own run that could list
+  // so the default Overview's decision card stays hidden. Drop every own run that could list
   // as one: a plan/question wait, a parked run, or a finished run with a pull request. (The
   // mock graph cannot import lib/overview, so mockApi.overviewCalm.test.ts checks the result
   // against overviewDecisions.)

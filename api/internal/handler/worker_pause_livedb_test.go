@@ -511,7 +511,7 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 			if tc.name == "wall_request" && !strings.Contains(rec.Body.String(), `"reason":"wall_pending"`) {
 				t.Fatalf("wall disposition missing: %s", rec.Body.String())
 			}
-			if tc.name == "credential_switch" && !strings.Contains(rec.Body.String(), `"credential_switch":{"generation":4}`) {
+			if tc.name == "credential_switch" && !strings.Contains(rec.Body.String(), `"credential_switch":{"generation":4,"op_id":"`) {
 				t.Fatalf("switch disposition missing: %s", rec.Body.String())
 			}
 			var n int

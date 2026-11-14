@@ -200,7 +200,7 @@ async function capture(cli: string, outPath: string): Promise<void> {
   const sdk = await import("@anthropic-ai/claude-agent-sdk") as unknown as { query: SdkQueryFn };
   const repoRoot = path.resolve(import.meta.dirname, "../..");
   const sdkVersion = (JSON.parse(await fs.readFile(path.resolve(import.meta.dirname, "../node_modules/@anthropic-ai/claude-agent-sdk/package.json"), "utf8")) as { version: string }).version;
-  assert.equal(sdkVersion, "0.3.316", "the fixture file name pins SDK 0.3.316; rename it when the SDK is bumped");
+  assert.equal(sdkVersion, "0.3.319", "the fixture file name pins SDK 0.3.319; rename it when the SDK is bumped");
   const scratch = path.join(repoRoot, ".uzi/scratch");
   await fs.mkdir(scratch, { recursive: true });
   const root = await fs.mkdtemp(path.join(scratch, "so-probe-"));
@@ -328,4 +328,4 @@ const [mode, cli, out] = process.argv.slice(2);
 if (mode !== "capture" && mode !== "verify") throw new Error("usage: claude-structured-output.probe.ts capture|verify <absolute CLI path> [out path]");
 if (!cli || !path.isAbsolute(cli)) throw new Error("an explicit absolute native CLI path is required");
 if (mode === "verify") await verify(cli);
-else await capture(cli, out ? path.resolve(out) : path.resolve(import.meta.dirname, "fixtures/claude-structured-output-0.3.316.json"));
+else await capture(cli, out ? path.resolve(out) : path.resolve(import.meta.dirname, "fixtures/claude-structured-output-0.3.319.json"));

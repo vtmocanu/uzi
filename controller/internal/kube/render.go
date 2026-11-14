@@ -538,6 +538,13 @@ type RenderConfig struct {
 	// so one knob governs every automatic reclaim. Docker-only, so it never touches a
 	// plain worker's spec/hash.
 	DinDPruneEnabled bool
+	// DinDBuilderPruneEnabled gates the pressure-only builder-cache prune leg (issue #4291).
+	// Rendered as UZI_DIND_BUILDER_PRUNE_ENABLED on docker workers only — "true" iff this
+	// is set AND the worker is not ephemeral, else "false". Rendered independently of
+	// DinDPruneEnabled: the agent ANDs the two, so the master still disables this leg.
+	// Wired from UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED. Docker-only, so it never touches a
+	// plain worker's spec/hash.
+	DinDBuilderPruneEnabled bool
 	// ServiceAccountName is the workers' own zero-permission SA. It carries the
 	// imagePullSecrets (so the controller need not know about Harbor) and its token is
 	// never automounted.
@@ -1234,6 +1241,14 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			prune = "true"
 		}
 		env = append(env, corev1.EnvVar{Name: "UZI_DIND_PRUNE_ENABLED", Value: prune})
+
+		// The builder-cache prune leg gate (issue #4291): same docker-only, always-explicit,
+		// non-ephemeral rule, rendered independently of the master above (the agent ANDs them).
+		builderPrune := "false"
+		if cfg.DinDBuilderPruneEnabled && !w.Ephemeral {
+			builderPrune = "true"
+		}
+		env = append(env, corev1.EnvVar{Name: "UZI_DIND_BUILDER_PRUNE_ENABLED", Value: builderPrune})
 	}
 
 	// The Codex command sandbox mode (PRD #1493 M1), worker container only. Normalize an

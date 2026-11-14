@@ -16,6 +16,7 @@ import { GUARDED_COMMAND_DESCRIPTION } from "../src/claude-command/server.js";
 import { GUARDED_COMMAND_SERVER, GUARDED_COMMAND_TOOL } from "../src/claude-command/grants.js";
 import { ASYNC_DEFERRAL_TOOLS, NESTED_AGENT_TOOL } from "../src/guardrails.js";
 import { CLAUDE_GUARDED_COMMAND_APPEND, CLAUDE_LONG_COMMAND_APPEND } from "../src/prompt.js";
+import { SecretSet } from "../src/redact.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // Issue #2471 M3: the SDK executor's guard wiring, driven through a fake SDK query.
@@ -1077,5 +1078,43 @@ describe("guarded commands after a declined or refused pause (#4090)", () => {
     assert.equal(seen.length, 1, "the tripped turn never reached the provider");
     assert.deepEqual(texts.map((t) => t.includes(LAUNCHED)), [true], String(texts));
     assert.equal(runner.launches.n, 1);
+  });
+});
+
+// Issue #4201: the lane reads a SecretSet live, so a token published by an in-place credential
+// switch after the lane was built is scrubbed from a guarded command's output.
+describe("guarded command secrets as a growable set (#4201)", () => {
+  // Deliberately not token-shaped: a provider-shaped value would be scrubbed by pattern, not by the set.
+  const SWITCHED = "switched-credential-value-0001";
+
+  it("a secret added to the set after the lane was constructed is redacted from the command result", async () => {
+    const set = new SecretSet(["dummy-join-token-do-not-scan-2222"]);
+    const texts: string[] = [];
+    let executor!: SdkExecutor;
+    const attempt = async (id: string): Promise<string> => {
+      const lane = (executor as unknown as { guardLane: ClaudeCommandLane }).guardLane;
+      (lane as unknown as { launch: () => Promise<never> }).launch = async () => { throw new Error(`sentinel-launch ${SWITCHED}`); };
+      await (lane.hook as (input: unknown) => Promise<unknown>)({
+        hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: TOOL_INPUT, tool_use_id: id,
+      });
+      const result = await lane.handle(TOOL_INPUT, { _meta: { "claudecode/toolUseId": id } });
+      return result.content.map((c) => c.text ?? "").join("");
+    };
+    const { queryFn } = fakeTurns([
+      (_signal) => (async function* () {
+        texts.push(await attempt("toolu_before"));
+        set.add(SWITCHED); // the in-place switch publishes its token mid-run
+        texts.push(await attempt("toolu_after"));
+        yield submitPlan("plan");
+        yield resultSuccess();
+      })(),
+      [signalDone(), resultSuccess()],
+    ]);
+    executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    await executor.run(makeCtx({ capturedMemory: liveCapture().capture, guardedCommandSecrets: set }));
+    assert.equal(texts.length, 2);
+    assert.ok(texts[0]!.includes(`Command could not be started: sentinel-launch ${SWITCHED}`), `before: ${texts[0]}`);
+    assert.ok(texts[1]!.includes("Command could not be started: sentinel-launch ***REDACTED***"), `after: ${texts[1]}`);
+    assert.ok(!texts[1]!.includes(SWITCHED));
   });
 });

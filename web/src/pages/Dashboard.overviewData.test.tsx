@@ -103,9 +103,9 @@ describe("Dashboard on the shared overview data hook", () => {
     expect(mockApi.adminListRuns).not.toHaveBeenCalled();
   });
 
-  it("links to the preview Overview and renders the same Recent runs", async () => {
+  it("links to the new default Overview and renders the same Recent runs", async () => {
     await mountDashboard();
-    expect(screen.getByRole("link", { name: "Try the new Overview" }).getAttribute("href")).toBe("/overview/next");
+    expect(screen.getByRole("link", { name: "Go to the new Overview" }).getAttribute("href")).toBe("/dashboard");
     expect(screen.getByText("Recent runs")).toBeTruthy();
     expect(screen.getByText("Live run row")).toBeTruthy();
   });

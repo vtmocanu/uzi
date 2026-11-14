@@ -118,6 +118,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		EffectiveCordoned:     !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase, HibernationState: w.HibernationState}),
 		HibernationState:      hibernationStateWire(w.HibernationState),
 		HibernationReason:     textPtrValue(w.HibernationReason.Valid, w.HibernationReason.String),
+		HibernationCleanup:    hibernationCleanupDTO(w.CleanupPhase, w.HibernationCleanup, w.HibernationCleanupReason),
 		HibernatedAt:          timePtr(w.HibernatedAt.Valid, w.HibernatedAt.Time),
 		WakeRequestedAt:       timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
 		WakeError:             textPtrValue(w.WakeError.Valid, w.WakeError.String),
@@ -172,6 +173,26 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 	}
 }
 
+// hibernationCleanupDTO projects the cleanup columns; nil when no attempt was made and no
+// outcome is recorded. requested and started both read as "cleaning".
+func hibernationCleanupDTO(phase string, outcome, reason pgtype.Text) *apitypes.HibernationCleanupDTO {
+	if (phase == "" || phase == workersvc.CleanupPhaseNone) && !outcome.Valid {
+		return nil
+	}
+	state := phase
+	switch phase {
+	case workersvc.CleanupPhaseRequested, workersvc.CleanupPhaseStarted:
+		state = "cleaning"
+	case "":
+		state = workersvc.CleanupPhaseNone
+	}
+	return &apitypes.HibernationCleanupDTO{
+		State:         state,
+		Outcome:       textPtrValue(outcome.Valid, outcome.String),
+		CleanupReason: textPtrValue(reason.Valid, reason.String),
+	}
+}
+
 // hibernationStateWire maps the column to the wire enum; an empty value reads as "none".
 func hibernationStateWire(state string) string {
 	if state == "" {
@@ -203,6 +224,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		EffectiveCordoned:     !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase, HibernationState: w.HibernationState}),
 		HibernationState:      hibernationStateWire(w.HibernationState),
 		HibernationReason:     textPtrValue(w.HibernationReason.Valid, w.HibernationReason.String),
+		HibernationCleanup:    hibernationCleanupDTO(w.CleanupPhase, w.HibernationCleanup, w.HibernationCleanupReason),
 		HibernatedAt:          timePtr(w.HibernatedAt.Valid, w.HibernatedAt.Time),
 		WakeRequestedAt:       timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
 		WakeError:             textPtrValue(w.WakeError.Valid, w.WakeError.String),
@@ -875,6 +897,10 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, workersvc.ErrWorkerNotFound):
 			httpx.Error(w, http.StatusNotFound, "worker not found")
+		case errors.Is(err, workersvc.ErrWorkerHibernationCleanupUnsettled):
+			// PRD #4206: the hibernation cache prune keeps the worker's claim fence until its
+			// settlement is confirmed; deleting the row would drop that fence.
+			httpx.Error(w, http.StatusConflict, "this worker is still reclaiming its Docker cache for hibernation; wait for the cleanup to settle before removing it")
 		case errors.As(err, &custody):
 			// PRD #1296 M4 (D3): a worker still holding an OPEN custody hold is refused
 			// with a DISTINCT 409 from the active-runs case above — deleting it cascades

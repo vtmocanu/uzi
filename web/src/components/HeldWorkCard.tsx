@@ -1,7 +1,7 @@
-// The Overview preview's Held work card (PRD #3880 M2): the owner's custody capacity and holds
-// as three always-present figures, with the same headline and tone as the Dashboard's custody
+// The default Overview's Held work card (PRD #3880 M2): the owner's custody capacity and holds
+// as three always-present figures, with the same headline and tone as the classic page's custody
 // alert when custodyAlertView says there is something to say. It replaces CustodyBoardAlert on
-// the preview, so the alert's own request is gone: the holds arrive as a prop from
+// the default page, so the alert's own request is gone: the holds arrive as a prop from
 // useOverviewData. A "Review held work" link appears only when a hold needs a decision.
 
 import { Link } from "react-router-dom";

@@ -18,7 +18,7 @@ import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
 import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
 import { WorkerStatusBadge } from "../components/WorkerStatusBadge";
-import { isHibernating } from "../lib/workerHibernation";
+import { hibernationCleanupText, isHibernating } from "../lib/workerHibernation";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerCordonMetadata } from "../components/WorkerCordonMetadata";
 import { WorkerCordonControls } from "../components/WorkerCordonControls";
@@ -905,6 +905,9 @@ export function WorkersSettings() {
                       </div>
 
                       <WorkerCordonMetadata worker={w} />
+                      {hibernationCleanupText(w) && (
+                        <p className="mt-1 text-xs text-muted">{hibernationCleanupText(w)}</p>
+                      )}
                       {w.forge_origin_cooldowns?.map((cooldown, index) => <ForgeOriginStatus key={index} cooldown={cooldown} />)}
                       <p className="mt-1 text-xs text-muted">Forge reachability is unverified. Cooldown advice is a bounded snapshot; missing origins do not prove health.</p>
                       {(w.forge_origin_cooldowns?.length ?? 0) >= 32 && <p className="mt-1 text-xs text-muted">Showing up to 32 origins for this worker; additional origins may be omitted.</p>}

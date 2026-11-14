@@ -1,0 +1,79 @@
+# shellcheck shell=bash
+# Spike #4291 helpers. Host daemon: only pull/create/start/exec/inspect/cp/rm -fv OWN container.
+readonly ROOTFUL_IMAGE='docker:29-dind@sha256:5efed980cba3fc126cf54e21a5a6ff8849d05b6e0623d6e7612f48e9cd6cd17e'
+readonly ROOTLESS_IMAGE='docker:29-dind-rootless@sha256:e17fa54c2ffd511d8407c746eec77f7814e6f74fe20caf822dad1870599984c0'
+readonly FIXTURE_IMAGE='alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6'
+readonly LABEL=bpspike.owner
+readonly inner_path='/spike/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+POSTURE=${POSTURE:?}
+token="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+NAME="bpspike-$token"
+OUT=${OUT:?}
+mkdir -p "$OUT"
+echo "$NAME" >> "$OUT/../containers-created.txt"
+attempted=0
+log() { printf '[%s +%ss] %s\n' "$(date -u +%H:%M:%S)" "$SECONDS" "$*"; }
+outer() { local cap=$1; shift; timeout --kill-after=2s "${cap}s" docker "$@"; }
+if [[ $POSTURE == rootful ]]; then
+  SOCK=unix:///var/run/docker.sock; EXECUSER=0
+else
+  SOCK=unix:///run/user/1000/docker.sock; EXECUSER=1000
+fi
+cli() { local cap=$1; shift
+  outer "$cap" exec -u "$EXECUSER" "$NAME" env -i PATH="$inner_path" HOME=/spike/home DOCKER_CONFIG=/spike/cfg \
+    docker --host "$SOCK" "$@"; }
+clisi() { local cap=$1; shift  # with stdin
+  outer "$cap" exec -i -u "$EXECUSER" "$NAME" env -i PATH="$inner_path" HOME=/spike/home DOCKER_CONFIG=/spike/cfg \
+    docker --host "$SOCK" "$@"; }
+sh_in() { local cap=$1; shift; outer "$cap" exec -u "$EXECUSER" "$NAME" sh -c "$*"; }
+cleanup() {
+  local rc=$? owner
+  trap - EXIT
+  if ((attempted)); then
+    if owner=$(timeout 10s docker inspect --format "{{index .Config.Labels \"$LABEL\"}}" "$NAME"); then
+      if [[ $owner == "$token" ]]; then
+        timeout 60s docker rm -fv "$NAME" >/dev/null && log "CLEANUP removed $NAME" || log "CLEANUP FAILED $NAME"
+      else log "CLEANUP ownership mismatch $NAME"; fi
+    else log "CLEANUP cannot inspect $NAME (maybe never created)"; fi
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+
+start_daemon() {
+  local -a extra=("$@")
+  attempted=1
+  if [[ $POSTURE == rootful ]]; then
+    outer 30 create --name "$NAME" --label "$LABEL=$token" --privileged --network bridge -e DOCKER_TLS_CERTDIR= \
+      -v /var/lib/docker "$ROOTFUL_IMAGE" dockerd --host=unix:///var/run/docker.sock "${extra[@]}" >/dev/null || return 1
+  else
+    outer 30 create --name "$NAME" --label "$LABEL=$token" --privileged --network bridge -e DOCKER_TLS_CERTDIR= \
+      -v /home/rootless/.local/share/docker "$ROOTLESS_IMAGE" "${extra[@]}" >/dev/null || return 1
+  fi
+  outer 30 start "$NAME" >/dev/null || return 1
+  outer 20 cp /usr/bin/docker "$NAME:/opt/docker-client" || return 1
+  outer 20 cp /usr/libexec/docker/cli-plugins/docker-buildx "$NAME:/opt/docker-buildx" || return 1
+  outer 20 exec -u 0 "$NAME" sh -c 'mkdir -p /spike/bin /spike/cfg/cli-plugins /spike/home /spike/ctx &&
+    mv /opt/docker-client /spike/bin/docker && mv /opt/docker-buildx /spike/cfg/cli-plugins/docker-buildx &&
+    chmod 755 /spike/bin/docker /spike/cfg/cli-plugins/docker-buildx && chown -R '"$EXECUSER:$EXECUSER"' /spike' || return 1
+  local i
+  for ((i = 0; i < 60; i++)); do
+    if cli 5 info >/dev/null 2>&1; then log "daemon ready after $i probes"; return 0; fi
+    sleep 1
+  done
+  log "daemon NOT ready"; outer 10 logs --tail 60 "$NAME" 2>&1 | sed 's/^/  dockerd| /'
+  return 1
+}
+versions() {
+  log "client path: $(sh_in 5 'PATH='"$inner_path"' command -v docker')"
+  cli 10 version --format 'client={{.Client.Version}} clientAPI={{.Client.APIVersion}} server={{.Server.Version}} serverAPI={{.Server.APIVersion}} serverMinAPI={{.Server.MinAPIVersion}} commit={{.Server.GitCommit}}'
+  cli 10 buildx version
+  cli 10 info --format 'driver={{.Driver}} rootless={{range .SecurityOptions}}{{.}} {{end}} containerdStore={{.DriverStatus}}'
+  cli 10 buildx ls
+}
+# du snapshot: JSON lines of records -> $OUT/du-<label>.json ; also text
+du_snap() { local label=$1
+  cli 60 buildx du --format json > "$OUT/du-$label.json" 2> "$OUT/du-$label.err"; local rc=$?
+  cli 60 buildx du > "$OUT/du-$label.txt" 2>&1
+  log "du[$label] rc=$rc total-line: $(grep -i '^total' "$OUT/du-$label.txt" | tr -s ' ')"
+}

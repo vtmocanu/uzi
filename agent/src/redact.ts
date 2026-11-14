@@ -124,3 +124,39 @@ export function makeRedactor(secrets: Array<string | undefined | null>): Payload
   };
   return (payload) => walk(payload) as Record<string, unknown>;
 }
+
+/**
+ * A growable secret registry (issue #4201). An in-place credential switch publishes a NEW OAuth
+ * token mid-run, after the flight's redactors were built, so the flight needs redactors that read
+ * the current list. `text` and `payload` are stable function identities (safe to hand out once)
+ * that always scrub every secret added so far. The same 8-char floor and invisible-run handling as
+ * makeTextRedactor / makeRedactor apply; `add` is idempotent. A secret is never removed.
+ */
+export class SecretSet {
+  private list: string[] = [];
+  private currentText: TextRedactor = (s) => s;
+  private currentPayload: PayloadRedactor = (payload) => payload;
+  readonly text: TextRedactor = (s) => this.currentText(s);
+  readonly payload: PayloadRedactor = (payload) => this.currentPayload(payload);
+
+  constructor(initial: Array<string | null | undefined>) {
+    this.list = [...new Set(usableSecrets(initial))];
+    this.rebuild();
+  }
+
+  add(secret: string): void {
+    if (typeof secret !== "string" || secret.length < MIN_SECRET_LEN || this.list.includes(secret)) return;
+    this.list.push(secret);
+    this.rebuild();
+  }
+
+  /** The usable secrets added so far (a copy). */
+  values(): readonly string[] {
+    return [...this.list];
+  }
+
+  private rebuild(): void {
+    this.currentText = makeTextRedactor(this.list);
+    this.currentPayload = makeRedactor(this.list);
+  }
+}

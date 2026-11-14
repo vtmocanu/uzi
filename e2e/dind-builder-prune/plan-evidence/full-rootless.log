@@ -1,0 +1,355 @@
+[17:24:02 +0s] posture=rootless container=bpspike-ff97fac50e14ffb2
+[17:24:19 +17s] daemon ready after 14 probes
+[17:24:19 +17s] client path: /spike/bin/docker
+client=29.9.2 clientAPI=1.56 server=29.8.0 serverAPI=1.56 serverMinAPI=1.40 commit=3ce5872
+github.com/docker/buildx v0.38.1 0dbe87f36ed472fe36b6796c3f70b4210a731fc5
+driver=overlayfs rootless=name=seccomp,profile=builtin name=rootless name=cgroupns  containerdStore=[[driver-type io.containerd.snapshotter.v1]]
+NAME/NODE     DRIVER/ENDPOINT   STATUS    BUILDKIT   PLATFORMS
+default*      docker                                 
+ \_ default    \_ default       running   v0.33.0    linux/amd64 (+4)
+===== CHECK 1a: EXACT production argv on a fresh-cache daemon
+--- records [fresh] (ID type shared inuse size lastUsed(UTC) created description)
+du[fresh] Reclaimable: 0B Total: 0B 
+>>> PRUNE[exact-fresh] argv: docker builder prune -f --filter type=regular --filter until=24h --max-used-space 4GiB
+    | Total:	0B
+>>> PRUNE[exact-fresh] rc=0
+===== PHASE A fixtures (no image tagged; base not pre-pulled)
+[17:24:24 +22s] build[held] rc=0 (22-19s)
+[17:24:25 +23s] build[ctrl] rc=0 (23-22s)
+[17:24:25 +23s] build[recent] rc=0 (23-23s)
+[17:24:26 +24s] build[cm] rc=0 (24-23s)
+--- records [built] (ID type shared inuse size lastUsed(UTC) created description)
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+t5o8kdwpf8gqcs9b1wp4hrdrj	regular	shared=false	inuse=false	1.06MB	17:24:24.270	17:24:23.942	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+v8bmsdejg601troia71z4g0q8	regular	shared=false	inuse=false	1.06MB	17:24:25.167	17:24:24.808	mount / from exec /bin/sh -c echo spike-ctrlold && dd if=/dev/urandom 
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:24:25.907	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:24:25.911	17:24:25.508	local source for context
+x0zrtndbedq7r8bnkgf08ifpn	regular	shared=false	inuse=false	1.06MB	17:24:25.917	17:24:25.597	mount / from exec /bin/sh -c echo spike-recent && dd if=/dev/urandom o
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.572	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+s3smd6ahue0dll6y88q7popek	regular	shared=false	inuse=false	12.9MB	17:24:26.638	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+n8ujl5ynszb4hrpcm8vw8glec	regular	shared=false	inuse=false	16.4kB	17:24:26.648	17:24:26.304	mount / from exec /bin/sh -c echo spike-cm && dd if=/dev/urandom of=/c
+du[built] Reclaimable: 18.29MB Total: 18.29MB 
+[17:24:27 +25s] held build started pid=821611
+[17:24:28 +26s] held build reached RUN sleep step: #5 CACHED
+    hold-log| #5 CACHED
+--- records [during-hold-early] (ID type shared inuse size lastUsed(UTC) created description)
+kcs37cjmip0k3favqwwk7m4v5*	regular	shared=false	inuse=true	8.19kB		17:24:27.283	local source for dockerfile
+xnxq2of17mlhuo9zri9x3u2wk*	regular	shared=false	inuse=true	4.1kB		17:24:27.328	local source for context
+wn9tyhokvz18dvw6uv8v5wp1a*	regular	shared=false	inuse=true	0B		17:24:27.393	mount / from exec /bin/sh -c echo spike-hold && sleep 80
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+egm2ezjdyd0r7m535vqfiereo*	regular	shared=false	inuse=true	1.06MB	17:24:24.268	17:24:24.211	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+v8bmsdejg601troia71z4g0q8	regular	shared=false	inuse=false	1.06MB	17:24:25.167	17:24:24.808	mount / from exec /bin/sh -c echo spike-ctrlold && dd if=/dev/urandom 
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:24:25.907	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:24:25.911	17:24:25.508	local source for context
+x0zrtndbedq7r8bnkgf08ifpn	regular	shared=false	inuse=false	1.06MB	17:24:25.917	17:24:25.597	mount / from exec /bin/sh -c echo spike-recent && dd if=/dev/urandom o
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+s3smd6ahue0dll6y88q7popek*	regular	shared=false	inuse=true	12.9MB	17:24:26.638	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+n8ujl5ynszb4hrpcm8vw8glec	regular	shared=false	inuse=false	16.4kB	17:24:26.648	17:24:26.304	mount / from exec /bin/sh -c echo spike-cm && dd if=/dev/urandom of=/c
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+du[during-hold-early] Reclaimable: 4.297MB Total: 18.3MB 
+[17:25:03 +61s] build[recent-bump] rc=0 (61-61s)
+[17:25:04 +62s] build[young] rc=0 (62-61s)
+--- records [before-P1] (ID type shared inuse size lastUsed(UTC) created description)
+kcs37cjmip0k3favqwwk7m4v5*	regular	shared=false	inuse=true	8.19kB		17:24:27.283	local source for dockerfile
+xnxq2of17mlhuo9zri9x3u2wk*	regular	shared=false	inuse=true	4.1kB		17:24:27.328	local source for context
+wn9tyhokvz18dvw6uv8v5wp1a*	regular	shared=false	inuse=true	0B		17:24:27.393	mount / from exec /bin/sh -c echo spike-hold && sleep 80
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+egm2ezjdyd0r7m535vqfiereo*	regular	shared=false	inuse=true	1.06MB	17:24:24.268	17:24:24.211	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+v8bmsdejg601troia71z4g0q8	regular	shared=false	inuse=false	1.06MB	17:24:25.167	17:24:24.808	mount / from exec /bin/sh -c echo spike-ctrlold && dd if=/dev/urandom 
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+s3smd6ahue0dll6y88q7popek*	regular	shared=false	inuse=true	12.9MB	17:24:26.638	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+n8ujl5ynszb4hrpcm8vw8glec	regular	shared=false	inuse=false	16.4kB	17:24:26.648	17:24:26.304	mount / from exec /bin/sh -c echo spike-cm && dd if=/dev/urandom of=/c
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:25:03.760	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:25:03.763	17:24:25.508	local source for context
+x0zrtndbedq7r8bnkgf08ifpn	regular	shared=false	inuse=false	1.06MB	17:25:03.766	17:24:25.597	mount / from exec /bin/sh -c echo spike-recent && dd if=/dev/urandom o
+lsbswayucyl8li6kblnh9iq4b	source.local	shared=false	inuse=false	4.1kB	17:25:04.333	17:25:04.039	local source for context
+stvsns9mweta7hprs3zc18vo3	regular	shared=false	inuse=false	1.06MB	17:25:04.339	17:25:04.069	mount / from exec /bin/sh -c echo spike-young && dd if=/dev/urandom of
+dlhb3l2t9xjp39i1w02qnn6ct	source.local	shared=false	inuse=false	8.19kB	17:25:04.345	17:25:03.994	local source for dockerfile
+du[before-P1] Reclaimable: 5.374MB Total: 19.38MB 
+===== CHECK 1b: EXACT production argv with data present (all records < 24h, usage << 4GiB)
+>>> PRUNE[exact-loaded] argv: docker builder prune -f --filter type=regular --filter until=24h --max-used-space 4GiB
+    | Total:	0B
+>>> PRUNE[exact-loaded] rc=0
+--- records [after-exact-loaded] (ID type shared inuse size lastUsed(UTC) created description)
+kcs37cjmip0k3favqwwk7m4v5*	regular	shared=false	inuse=true	8.19kB		17:24:27.283	local source for dockerfile
+xnxq2of17mlhuo9zri9x3u2wk*	regular	shared=false	inuse=true	4.1kB		17:24:27.328	local source for context
+wn9tyhokvz18dvw6uv8v5wp1a*	regular	shared=false	inuse=true	0B		17:24:27.393	mount / from exec /bin/sh -c echo spike-hold && sleep 80
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+egm2ezjdyd0r7m535vqfiereo*	regular	shared=false	inuse=true	1.06MB	17:24:24.268	17:24:24.211	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+v8bmsdejg601troia71z4g0q8	regular	shared=false	inuse=false	1.06MB	17:24:25.167	17:24:24.808	mount / from exec /bin/sh -c echo spike-ctrlold && dd if=/dev/urandom 
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+s3smd6ahue0dll6y88q7popek*	regular	shared=false	inuse=true	12.9MB	17:24:26.638	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+n8ujl5ynszb4hrpcm8vw8glec	regular	shared=false	inuse=false	16.4kB	17:24:26.648	17:24:26.304	mount / from exec /bin/sh -c echo spike-cm && dd if=/dev/urandom of=/c
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:25:03.760	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:25:03.763	17:24:25.508	local source for context
+x0zrtndbedq7r8bnkgf08ifpn	regular	shared=false	inuse=false	1.06MB	17:25:03.766	17:24:25.597	mount / from exec /bin/sh -c echo spike-recent && dd if=/dev/urandom o
+lsbswayucyl8li6kblnh9iq4b	source.local	shared=false	inuse=false	4.1kB	17:25:04.333	17:25:04.039	local source for context
+stvsns9mweta7hprs3zc18vo3	regular	shared=false	inuse=false	1.06MB	17:25:04.339	17:25:04.069	mount / from exec /bin/sh -c echo spike-young && dd if=/dev/urandom of
+dlhb3l2t9xjp39i1w02qnn6ct	source.local	shared=false	inuse=false	8.19kB	17:25:04.345	17:25:03.994	local source for dockerfile
+du[after-exact-loaded] Reclaimable: 5.374MB Total: 19.38MB 
+===== CHECKS 1,2,3,4,6a: SCALED prune (until=30s, cap=1MB below usage) while hold is running
+[17:25:12 +70s] hold build still running at prune time (t=+46s since hold start)
+>>> PRUNE[P1-scaled] argv: docker builder prune -f --filter type=regular --filter until=30s --max-used-space 1MB
+    | ID						RECLAIMABLE	SIZE		LAST ACCESSED
+    | v8bmsdejg601troia71z4g0q8*              	true 		1.065MB   	47 seconds ago
+    | n8ujl5ynszb4hrpcm8vw8glec*              	true 	16.38kB   	45 seconds ago
+    | Total:	1.081MB
+>>> PRUNE[P1-scaled] rc=0
+--- records [after-P1] (ID type shared inuse size lastUsed(UTC) created description)
+kcs37cjmip0k3favqwwk7m4v5*	regular	shared=false	inuse=true	8.19kB		17:24:27.283	local source for dockerfile
+xnxq2of17mlhuo9zri9x3u2wk*	regular	shared=false	inuse=true	4.1kB		17:24:27.328	local source for context
+wn9tyhokvz18dvw6uv8v5wp1a*	regular	shared=false	inuse=true	0B		17:24:27.393	mount / from exec /bin/sh -c echo spike-hold && sleep 80
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+egm2ezjdyd0r7m535vqfiereo*	regular	shared=false	inuse=true	1.06MB	17:24:24.268	17:24:24.211	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+s3smd6ahue0dll6y88q7popek*	regular	shared=false	inuse=true	12.9MB	17:24:26.638	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:25:03.760	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:25:03.763	17:24:25.508	local source for context
+x0zrtndbedq7r8bnkgf08ifpn	regular	shared=false	inuse=false	1.06MB	17:25:03.766	17:24:25.597	mount / from exec /bin/sh -c echo spike-recent && dd if=/dev/urandom o
+lsbswayucyl8li6kblnh9iq4b	source.local	shared=false	inuse=false	4.1kB	17:25:04.333	17:25:04.039	local source for context
+stvsns9mweta7hprs3zc18vo3	regular	shared=false	inuse=false	1.06MB	17:25:04.339	17:25:04.069	mount / from exec /bin/sh -c echo spike-young && dd if=/dev/urandom of
+dlhb3l2t9xjp39i1w02qnn6ct	source.local	shared=false	inuse=false	8.19kB	17:25:04.345	17:25:03.994	local source for dockerfile
+du[after-P1] Reclaimable: 4.293MB Total: 18.3MB 
+HOLD_BUILD_RC=0
+    hold-log| #4 CACHED
+    hold-log| 
+    hold-log| #6 [3/3] RUN echo spike-hold && sleep 80
+    hold-log| #6 DONE 80.2s
+--- records [after-hold] (ID type shared inuse size lastUsed(UTC) created description)
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:25:03.760	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:25:03.763	17:24:25.508	local source for context
+x0zrtndbedq7r8bnkgf08ifpn	regular	shared=false	inuse=false	1.06MB	17:25:03.766	17:24:25.597	mount / from exec /bin/sh -c echo spike-recent && dd if=/dev/urandom o
+lsbswayucyl8li6kblnh9iq4b	source.local	shared=false	inuse=false	4.1kB	17:25:04.333	17:25:04.039	local source for context
+stvsns9mweta7hprs3zc18vo3	regular	shared=false	inuse=false	1.06MB	17:25:04.339	17:25:04.069	mount / from exec /bin/sh -c echo spike-young && dd if=/dev/urandom of
+dlhb3l2t9xjp39i1w02qnn6ct	source.local	shared=false	inuse=false	8.19kB	17:25:04.345	17:25:03.994	local source for dockerfile
+ukl2h4p7k2knvr14hjp1tk0ra	source.local	shared=false	inuse=false	8.19kB	17:25:47.652	17:24:27.271	local source for dockerfile
+s3smd6ahue0dll6y88q7popek	regular	shared=false	inuse=false	12.9MB	17:25:47.654	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+egm2ezjdyd0r7m535vqfiereo	regular	shared=false	inuse=false	1.06MB	17:25:47.657	17:24:24.211	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+wn9tyhokvz18dvw6uv8v5wp1a	regular	shared=false	inuse=false	16.4kB	17:25:47.659	17:24:27.393	mount / from exec /bin/sh -c echo spike-hold && sleep 80
+y0uwtnuiqnzsgjvvvst0ppi68	source.local	shared=false	inuse=false	4.1kB	17:25:47.661	17:24:27.321	local source for context
+du[after-hold] Reclaimable: 18.32MB Total: 18.32MB 
+===== CHECK 2 follow-up: same SCALED prune after the hold released
+>>> PRUNE[P1b-scaled] argv: docker builder prune -f --filter type=regular --filter until=30s --max-used-space 1MB
+    | ID						RECLAIMABLE	SIZE		LAST ACCESSED
+    | stvsns9mweta7hprs3zc18vo3*              	true 		1.065MB   	43 seconds ago
+    | x0zrtndbedq7r8bnkgf08ifpn*              	true 	1.065MB   	44 seconds ago
+    | Total:	2.13MB
+>>> PRUNE[P1b-scaled] rc=0
+--- records [after-P1b] (ID type shared inuse size lastUsed(UTC) created description)
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:25:03.760	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:25:03.763	17:24:25.508	local source for context
+lsbswayucyl8li6kblnh9iq4b	source.local	shared=false	inuse=false	4.1kB	17:25:04.333	17:25:04.039	local source for context
+dlhb3l2t9xjp39i1w02qnn6ct	source.local	shared=false	inuse=false	8.19kB	17:25:04.345	17:25:03.994	local source for dockerfile
+ukl2h4p7k2knvr14hjp1tk0ra	source.local	shared=false	inuse=false	8.19kB	17:25:47.652	17:24:27.271	local source for dockerfile
+s3smd6ahue0dll6y88q7popek	regular	shared=false	inuse=false	12.9MB	17:25:47.654	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+egm2ezjdyd0r7m535vqfiereo	regular	shared=false	inuse=false	1.06MB	17:25:47.657	17:24:24.211	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+wn9tyhokvz18dvw6uv8v5wp1a	regular	shared=false	inuse=false	16.4kB	17:25:47.659	17:24:27.393	mount / from exec /bin/sh -c echo spike-hold && sleep 80
+y0uwtnuiqnzsgjvvvst0ppi68	source.local	shared=false	inuse=false	4.1kB	17:25:47.661	17:24:27.321	local source for context
+du[after-P1b] Reclaimable: 16.19MB Total: 16.19MB 
+===== CHECK 6b/6c: cap behaviour
+[17:25:49 +107s] build[capF] rc=0 (107-106s)
+[17:25:53 +111s] build[capG] rc=0 (111-110s)
+--- records [before-P2] (ID type shared inuse size lastUsed(UTC) created description)
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:25:03.760	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:25:03.763	17:24:25.508	local source for context
+lsbswayucyl8li6kblnh9iq4b	source.local	shared=false	inuse=false	4.1kB	17:25:04.333	17:25:04.039	local source for context
+dlhb3l2t9xjp39i1w02qnn6ct	source.local	shared=false	inuse=false	8.19kB	17:25:04.345	17:25:03.994	local source for dockerfile
+ukl2h4p7k2knvr14hjp1tk0ra	source.local	shared=false	inuse=false	8.19kB	17:25:47.652	17:24:27.271	local source for dockerfile
+egm2ezjdyd0r7m535vqfiereo	regular	shared=false	inuse=false	1.06MB	17:25:47.657	17:24:24.211	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+wn9tyhokvz18dvw6uv8v5wp1a	regular	shared=false	inuse=false	16.4kB	17:25:47.659	17:24:27.393	mount / from exec /bin/sh -c echo spike-hold && sleep 80
+y0uwtnuiqnzsgjvvvst0ppi68	source.local	shared=false	inuse=false	4.1kB	17:25:47.661	17:24:27.321	local source for context
+qdbwxv02j7j3sqmamaaggpexr	source.local	shared=false	inuse=false	8.19kB	17:25:49.219	17:25:48.822	local source for dockerfile
+l3notw1txt5xdyiq7vdvunhc6	regular	shared=false	inuse=false	2.11MB	17:25:49.224	17:25:48.958	mount / from exec /bin/sh -c echo spike-capF && dd if=/dev/urandom of=
+23q1j994qssvwweetgw15twzq	source.local	shared=false	inuse=false	4.1kB	17:25:49.228	17:25:48.887	local source for context
+fmnn6ak5ywaecx0t49p06ln4o	source.local	shared=false	inuse=false	8.19kB	17:25:53.044	17:25:52.550	local source for dockerfile
+iun6k9q4wivs8l3izwom9zpxy	source.local	shared=false	inuse=false	4.1kB	17:25:53.048	17:25:52.605	local source for context
+s3smd6ahue0dll6y88q7popek	regular	shared=false	inuse=false	12.9MB	17:25:53.051	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+vz8sajod1tkayre7bgr3mei52	regular	shared=false	inuse=false	2.11MB	17:25:53.058	17:25:52.685	mount / from exec /bin/sh -c echo spike-capG && dd if=/dev/urandom of=
+du[before-P2] Reclaimable: 20.44MB Total: 20.44MB 
+>>> PRUNE[P2-capabove] argv: docker builder prune -f --filter type=regular --filter until=30s --max-used-space 4GiB
+    | Total:	0B
+>>> PRUNE[P2-capabove] rc=0
+--- records [after-P2] (ID type shared inuse size lastUsed(UTC) created description)
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:25:03.760	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:25:03.763	17:24:25.508	local source for context
+lsbswayucyl8li6kblnh9iq4b	source.local	shared=false	inuse=false	4.1kB	17:25:04.333	17:25:04.039	local source for context
+dlhb3l2t9xjp39i1w02qnn6ct	source.local	shared=false	inuse=false	8.19kB	17:25:04.345	17:25:03.994	local source for dockerfile
+ukl2h4p7k2knvr14hjp1tk0ra	source.local	shared=false	inuse=false	8.19kB	17:25:47.652	17:24:27.271	local source for dockerfile
+egm2ezjdyd0r7m535vqfiereo	regular	shared=false	inuse=false	1.06MB	17:25:47.657	17:24:24.211	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+wn9tyhokvz18dvw6uv8v5wp1a	regular	shared=false	inuse=false	16.4kB	17:25:47.659	17:24:27.393	mount / from exec /bin/sh -c echo spike-hold && sleep 80
+y0uwtnuiqnzsgjvvvst0ppi68	source.local	shared=false	inuse=false	4.1kB	17:25:47.661	17:24:27.321	local source for context
+qdbwxv02j7j3sqmamaaggpexr	source.local	shared=false	inuse=false	8.19kB	17:25:49.219	17:25:48.822	local source for dockerfile
+l3notw1txt5xdyiq7vdvunhc6	regular	shared=false	inuse=false	2.11MB	17:25:49.224	17:25:48.958	mount / from exec /bin/sh -c echo spike-capF && dd if=/dev/urandom of=
+23q1j994qssvwweetgw15twzq	source.local	shared=false	inuse=false	4.1kB	17:25:49.228	17:25:48.887	local source for context
+fmnn6ak5ywaecx0t49p06ln4o	source.local	shared=false	inuse=false	8.19kB	17:25:53.044	17:25:52.550	local source for dockerfile
+iun6k9q4wivs8l3izwom9zpxy	source.local	shared=false	inuse=false	4.1kB	17:25:53.048	17:25:52.605	local source for context
+s3smd6ahue0dll6y88q7popek	regular	shared=false	inuse=false	12.9MB	17:25:53.051	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+vz8sajod1tkayre7bgr3mei52	regular	shared=false	inuse=false	2.11MB	17:25:53.058	17:25:52.685	mount / from exec /bin/sh -c echo spike-capG && dd if=/dev/urandom of=
+du[after-P2] Reclaimable: 20.44MB Total: 20.44MB 
+[17:26:26 +144s] du Total=20.44MB (~20440000 bytes); P3 cap=19440000 bytes
+>>> PRUNE[P3-capjustbelow] argv: docker builder prune -f --filter type=regular --filter until=30s --max-used-space 19440000
+    | ID						RECLAIMABLE	SIZE		LAST ACCESSED
+    | wn9tyhokvz18dvw6uv8v5wp1a*              	true 		16.38kB   	39 seconds ago
+    | l3notw1txt5xdyiq7vdvunhc6*              	true 	2.114MB   	37 seconds ago
+    | Total:	2.13MB
+>>> PRUNE[P3-capjustbelow] rc=0
+--- records [after-P3] (ID type shared inuse size lastUsed(UTC) created description)
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:25:03.760	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:25:03.763	17:24:25.508	local source for context
+lsbswayucyl8li6kblnh9iq4b	source.local	shared=false	inuse=false	4.1kB	17:25:04.333	17:25:04.039	local source for context
+dlhb3l2t9xjp39i1w02qnn6ct	source.local	shared=false	inuse=false	8.19kB	17:25:04.345	17:25:03.994	local source for dockerfile
+ukl2h4p7k2knvr14hjp1tk0ra	source.local	shared=false	inuse=false	8.19kB	17:25:47.652	17:24:27.271	local source for dockerfile
+egm2ezjdyd0r7m535vqfiereo	regular	shared=false	inuse=false	1.06MB	17:25:47.657	17:24:24.211	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+y0uwtnuiqnzsgjvvvst0ppi68	source.local	shared=false	inuse=false	4.1kB	17:25:47.661	17:24:27.321	local source for context
+qdbwxv02j7j3sqmamaaggpexr	source.local	shared=false	inuse=false	8.19kB	17:25:49.219	17:25:48.822	local source for dockerfile
+23q1j994qssvwweetgw15twzq	source.local	shared=false	inuse=false	4.1kB	17:25:49.228	17:25:48.887	local source for context
+fmnn6ak5ywaecx0t49p06ln4o	source.local	shared=false	inuse=false	8.19kB	17:25:53.044	17:25:52.550	local source for dockerfile
+iun6k9q4wivs8l3izwom9zpxy	source.local	shared=false	inuse=false	4.1kB	17:25:53.048	17:25:52.605	local source for context
+s3smd6ahue0dll6y88q7popek	regular	shared=false	inuse=false	12.9MB	17:25:53.051	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+vz8sajod1tkayre7bgr3mei52	regular	shared=false	inuse=false	2.11MB	17:25:53.058	17:25:52.685	mount / from exec /bin/sh -c echo spike-capG && dd if=/dev/urandom of=
+du[after-P3] Reclaimable: 18.31MB Total: 18.31MB 
+===== CHECK 5: tagged image (PHASE B)
+[17:26:28 +146s] build[keep] rc=0 (146-145s)
+[17:26:28 +146s] build[scr] rc=0 (146-146s)
+[17:26:29 +147s] build[ctrl2] rc=0 (147-146s)
+IMAGE               ID             DISK USAGE   CONTENT SIZE   EXTRA
+spike/keep:latest   fd5e3712d989       12.9MB         3.85MB        
+--- records [before-P4] (ID type shared inuse size lastUsed(UTC) created description)
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:25:03.760	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:25:03.763	17:24:25.508	local source for context
+lsbswayucyl8li6kblnh9iq4b	source.local	shared=false	inuse=false	4.1kB	17:25:04.333	17:25:04.039	local source for context
+dlhb3l2t9xjp39i1w02qnn6ct	source.local	shared=false	inuse=false	8.19kB	17:25:04.345	17:25:03.994	local source for dockerfile
+ukl2h4p7k2knvr14hjp1tk0ra	source.local	shared=false	inuse=false	8.19kB	17:25:47.652	17:24:27.271	local source for dockerfile
+egm2ezjdyd0r7m535vqfiereo	regular	shared=false	inuse=false	1.06MB	17:25:47.657	17:24:24.211	mount / from exec /bin/sh -c echo spike-held && dd if=/dev/urandom of=
+y0uwtnuiqnzsgjvvvst0ppi68	source.local	shared=false	inuse=false	4.1kB	17:25:47.661	17:24:27.321	local source for context
+qdbwxv02j7j3sqmamaaggpexr	source.local	shared=false	inuse=false	8.19kB	17:25:49.219	17:25:48.822	local source for dockerfile
+23q1j994qssvwweetgw15twzq	source.local	shared=false	inuse=false	4.1kB	17:25:49.228	17:25:48.887	local source for context
+fmnn6ak5ywaecx0t49p06ln4o	source.local	shared=false	inuse=false	8.19kB	17:25:53.044	17:25:52.550	local source for dockerfile
+iun6k9q4wivs8l3izwom9zpxy	source.local	shared=false	inuse=false	4.1kB	17:25:53.048	17:25:52.605	local source for context
+vz8sajod1tkayre7bgr3mei52	regular	shared=false	inuse=false	2.11MB	17:25:53.058	17:25:52.685	mount / from exec /bin/sh -c echo spike-capG && dd if=/dev/urandom of=
+1sty1yhsyb8inqmwza2skpyh3	source.local	shared=false	inuse=false	8.19kB	17:26:28.470	17:26:27.891	local source for dockerfile
+pxlevap70bva8axr9gbgyaj0j	source.local	shared=false	inuse=false	4.1kB	17:26:28.474	17:26:27.933	local source for context
+ni08y0rlpb0rvx07rpzf11gtx	regular	shared=true	inuse=false	20.6kB	17:26:28.475	17:26:28.195	mount / from exec /bin/sh -c echo spike-keep > /proof
+konc8qurdfw2s5l5s9gewlk1o	source.local	shared=false	inuse=false	1.05MB	17:26:28.824	17:26:28.743	local source for context
+k4shkd6w7e3oqhgypo60p54qg	source.local	shared=false	inuse=false	8.19kB	17:26:28.827	17:26:28.699	local source for dockerfile
+lsnxd8mt4ki4dgb8feykl8za8	source.local	shared=false	inuse=false	4.1kB	17:26:28.831	17:26:28.719	local source for context
+zq6p4jtzy8m9b8uft0cfr2zv1	regular	shared=false	inuse=false	1.05MB	17:26:28.834	17:26:28.773	[1/1] COPY blob /blob
+pntfcsofqm7azg3pe2v9o1zl1	source.local	shared=false	inuse=false	4.1kB	17:26:29.425	17:26:29.099	local source for context
+6sg2ehbitrgebww8czd4vk9e1	regular	shared=false	inuse=false	1.06MB	17:26:29.429	17:26:29.159	mount / from exec /bin/sh -c echo spike-ctrl2 && dd if=/dev/urandom of
+wlf4z6z5a4n21e8da3q65o8q8	source.local	shared=false	inuse=false	8.19kB	17:26:29.431	17:26:29.055	local source for dockerfile
+s3smd6ahue0dll6y88q7popek	regular	shared=true	inuse=false	12.9MB	17:26:29.433	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+du[before-P4] Shared: 12.95MB Private: 8.585MB Reclaimable: 21.54MB Total: 21.54MB 
+>>> PRUNE[P4-scaled] argv: docker builder prune -f --filter type=regular --filter until=30s --max-used-space 1MB
+    | ID						RECLAIMABLE	SIZE		LAST ACCESSED
+    | vz8sajod1tkayre7bgr3mei52*              	true 		2.114MB   	About a minute ago
+    | zq6p4jtzy8m9b8uft0cfr2zv1*              	true 	1.053MB   	34 seconds ago
+    | 6sg2ehbitrgebww8czd4vk9e1*              	true 	1.065MB   	33 seconds ago
+    | egm2ezjdyd0r7m535vqfiereo               	true 	1.065MB   	About a minute ago
+    | Total:	5.296MB
+>>> PRUNE[P4-scaled] rc=0
+--- records [after-P4] (ID type shared inuse size lastUsed(UTC) created description)
+8fmmcooutnuk5ir5bgw924ayr	source.local	shared=false	inuse=false	8.19kB	17:24:24.266	17:24:21.832	local source for dockerfile
+wfxw0cdmc29awqifneu4js86z	source.local	shared=false	inuse=false	4.1kB	17:24:24.276	17:24:23.417	local source for context
+rp8y49cecavg8cjgkj27453oa	source.local	shared=false	inuse=false	8.19kB	17:24:25.154	17:24:24.597	local source for dockerfile
+oqtzwqeyp3ecicyw2ikem7vx6	source.local	shared=false	inuse=false	4.1kB	17:24:25.174	17:24:24.691	local source for context
+cy6vprdaragi5v66r8dvucueu	source.local	shared=false	inuse=false	8.19kB	17:24:26.631	17:24:26.190	local source for dockerfile
+9oyi4n6q6m5l52hlc1lke7fec	source.local	shared=false	inuse=false	4.1kB	17:24:26.637	17:24:26.249	local source for context
+p7q9gldu7t9n02vtnxt1c3o2p	exec.cachemount	shared=false	inuse=false	2.1MB	17:24:26.762	17:24:26.326	cached mount /c from exec /bin/sh -c echo spike-cm && dd if=/dev/urand
+fk5wilk51zhxb6kauh6hlwwtc	source.local	shared=false	inuse=false	8.19kB	17:25:03.760	17:24:25.436	local source for dockerfile
+pl8nj7epay0toa4ntilvgj6bk	source.local	shared=false	inuse=false	4.1kB	17:25:03.763	17:24:25.508	local source for context
+lsbswayucyl8li6kblnh9iq4b	source.local	shared=false	inuse=false	4.1kB	17:25:04.333	17:25:04.039	local source for context
+dlhb3l2t9xjp39i1w02qnn6ct	source.local	shared=false	inuse=false	8.19kB	17:25:04.345	17:25:03.994	local source for dockerfile
+ukl2h4p7k2knvr14hjp1tk0ra	source.local	shared=false	inuse=false	8.19kB	17:25:47.652	17:24:27.271	local source for dockerfile
+y0uwtnuiqnzsgjvvvst0ppi68	source.local	shared=false	inuse=false	4.1kB	17:25:47.661	17:24:27.321	local source for context
+qdbwxv02j7j3sqmamaaggpexr	source.local	shared=false	inuse=false	8.19kB	17:25:49.219	17:25:48.822	local source for dockerfile
+23q1j994qssvwweetgw15twzq	source.local	shared=false	inuse=false	4.1kB	17:25:49.228	17:25:48.887	local source for context
+fmnn6ak5ywaecx0t49p06ln4o	source.local	shared=false	inuse=false	8.19kB	17:25:53.044	17:25:52.550	local source for dockerfile
+iun6k9q4wivs8l3izwom9zpxy	source.local	shared=false	inuse=false	4.1kB	17:25:53.048	17:25:52.605	local source for context
+1sty1yhsyb8inqmwza2skpyh3	source.local	shared=false	inuse=false	8.19kB	17:26:28.470	17:26:27.891	local source for dockerfile
+pxlevap70bva8axr9gbgyaj0j	source.local	shared=false	inuse=false	4.1kB	17:26:28.474	17:26:27.933	local source for context
+ni08y0rlpb0rvx07rpzf11gtx	regular	shared=true	inuse=false	20.6kB	17:26:28.475	17:26:28.195	mount / from exec /bin/sh -c echo spike-keep > /proof
+konc8qurdfw2s5l5s9gewlk1o	source.local	shared=false	inuse=false	1.05MB	17:26:28.824	17:26:28.743	local source for context
+k4shkd6w7e3oqhgypo60p54qg	source.local	shared=false	inuse=false	8.19kB	17:26:28.827	17:26:28.699	local source for dockerfile
+lsnxd8mt4ki4dgb8feykl8za8	source.local	shared=false	inuse=false	4.1kB	17:26:28.831	17:26:28.719	local source for context
+pntfcsofqm7azg3pe2v9o1zl1	source.local	shared=false	inuse=false	4.1kB	17:26:29.425	17:26:29.099	local source for context
+wlf4z6z5a4n21e8da3q65o8q8	source.local	shared=false	inuse=false	8.19kB	17:26:29.431	17:26:29.055	local source for dockerfile
+s3smd6ahue0dll6y88q7popek	regular	shared=true	inuse=false	12.9MB	17:26:29.433	17:24:23.479	pulled from docker.io/library/alpine:3.24@sha256:294b683cb724975bec925
+du[after-P4] Shared: 12.95MB Private: 3.289MB Reclaimable: 16.24MB Total: 16.24MB 
+IMAGE               ID             DISK USAGE   CONTENT SIZE   EXTRA
+spike/keep:latest   fd5e3712d989       12.9MB         3.85MB        
+IMAGE_LS_RC=0
+spike-keep
+RUN_KEEP_RC=0
+RUN_TRUE_RC=0
+===== EXACT production argv, final
+>>> PRUNE[exact-final] argv: docker builder prune -f --filter type=regular --filter until=24h --max-used-space 4GiB
+    | Total:	0B
+>>> PRUNE[exact-final] rc=0
+[17:27:05 +183s] posture rootless done in 183s
+[17:27:05 +183s] CLEANUP removed bpspike-ff97fac50e14ffb2

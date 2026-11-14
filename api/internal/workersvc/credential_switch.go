@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"time"
 
+	"slices"
+
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -116,6 +120,13 @@ func (s *Service) releaseCredentialSwitch(ctx context.Context, owned store.Run, 
 		// cannot fence to an exact claim, so this is an invalid report (→ 400), not a silent no-op.
 		return store.Run{}, false, fmt.Errorf("%w: credential_switch requires claim_generation", ErrInvalidState)
 	}
+	// Issue #4201 m3a: a worker whose CURRENT registration negotiated in-place apply never releases
+	// a claim for a switch; the v1 release is refused with nothing written.
+	if retired, err := s.applyNegotiated(ctx, wkr.ID); err != nil {
+		return store.Run{}, false, err
+	} else if retired {
+		return owned, false, ErrCredentialSwitchReleaseRetired
+	}
 	gen := *req.ClaimGeneration
 	rows, err := s.q.ReleaseCredentialSwitch(ctx, store.ReleaseCredentialSwitchParams{
 		ID:         owned.ID,
@@ -178,7 +189,9 @@ func (s *Service) releaseCredentialSwitch(ctx context.Context, owned store.Run, 
 //   - non-zero → re-read, emit a best-effort observability note (the note NEVER fails the report;
 //     the stamp CLEAR is the load-bearing behavior), and return (run, true, nil).
 //
-// ACCEPTED TRADEOFF (matches pause_failed): the clear carries no per-request discriminator, so a
+// The op-carrying form additionally requires the current registration nonce (see the clear below).
+//
+// ACCEPTED TRADEOFF (matches pause_failed, for the op-less v1 form): the clear carries no per-request discriminator, so a
 // lost-ack REDELIVERY of a give-up at the same still-held claim generation can clear a switch the
 // owner RE-REQUESTED in the window between the first give-up and the redelivery — the re-request is
 // silently withdrawn and the owner re-issues it. This mirrors ClearPauseRequest / pause_failed
@@ -193,10 +206,24 @@ func (s *Service) failCredentialSwitch(ctx context.Context, owned store.Run, wkr
 		return store.Run{}, false, fmt.Errorf("%w: credential_switch_failed requires claim_generation", ErrInvalidState)
 	}
 	gen := *req.ClaimGeneration
+	opID, err := optionalSwitchOpID(req.OpID, stateCredentialSwitchFailed)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	// The op-carrying form is fenced to the current registration incarnation (issue #4201), like
+	// credential_switch_uncertain: a superseded, missing or malformed nonce matches 0 rows below (the
+	// ordinary not-applied 409 that writes nothing; a NULL nonce never equals the stored one). The op-less
+	// v1 form carries none.
+	var registerNonce pgtype.Text
+	if opID.Valid && validHoldRegisterNonce(req.RegisterNonce) {
+		registerNonce = pgtype.Text{String: req.RegisterNonce, Valid: true}
+	}
 	rows, err := s.q.ClearCredentialSwitchByWorker(ctx, store.ClearCredentialSwitchByWorkerParams{
-		ID:         owned.ID,
-		WorkerID:   pgconv.UUID(wkr.ID),
-		Generation: gen,
+		ID:            owned.ID,
+		WorkerID:      pgconv.UUID(wkr.ID),
+		Generation:    gen,
+		OpID:          opID,
+		RegisterNonce: registerNonce,
 	})
 	if err != nil {
 		return store.Run{}, false, err
@@ -238,6 +265,8 @@ func (s *Service) failCredentialSwitch(ctx context.Context, owned store.Run, wkr
 const (
 	holdReasonCredentialSwitchSettling  = "credential_switch_settling"     //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 	holdReasonCredentialSwitchUnsettled = "credential_switch_unsettled"    //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	stateCredentialSwitchFailed         = "credential_switch_failed"       //nolint:gosec // G101: a worker state-report VOCABULARY value (the wire enum), not a credential.
+	stateCredentialSwitchUncertain      = "credential_switch_uncertain"    //nolint:gosec // G101: a worker state-report VOCABULARY value (the wire enum), not a credential.
 	stateCredentialSwitchHeld           = "credential_switch_held"         //nolint:gosec // G101: a worker state-report VOCABULARY value (the wire enum), not a credential.
 	stateCredentialSwitchHoldSettled    = "credential_switch_hold_settled" //nolint:gosec // G101: a worker state-report VOCABULARY value (the wire enum), not a credential.
 )
@@ -273,6 +302,45 @@ func (s *Service) runHoldSettling(ctx context.Context, runID uuid.UUID) (bool, e
 	})
 }
 
+// ErrCredentialSwitchReleaseRetired refuses a v1 credential_switch release, or an un-fenced
+// credential_switch_held, from a worker whose current registration negotiated in-place apply
+// (issue #4201 m3a). Nothing was written. The handler answers 409 with reason
+// "credential_switch_release_retired". A negotiated agent never sends either: for a switch it cannot
+// apply in place it takes the owner pause or the op-fenced hold instead.
+var ErrCredentialSwitchReleaseRetired = errors.New("credential switch release is retired for an in-place apply worker")
+
+// CredentialSwitchApplyFeature is the /protocol feature this api advertises for in-place apply.
+const CredentialSwitchApplyFeature = "credential_switch_apply_v1" //nolint:gosec // G101: a protocol feature VOCABULARY name, not a credential.
+
+// stampApplyNonce stamps workers.credential_switch_apply_nonce with the registration nonce when the
+// worker advertised credential_switch_in_place_v1 and this api serves CredentialSwitchApplyFeature
+// (always, so only the capability is checked). It returns the column value for the registered row.
+// An older api replica's registration rewrites snapshot_register_nonce without stamping, which
+// leaves the two differing, so applyNegotiated reads false and the v1 reports stay accepted.
+func (s *Service) stampApplyNonce(ctx context.Context, q interface {
+	StampWorkerCredentialSwitchApplyNonce(ctx context.Context, arg store.StampWorkerCredentialSwitchApplyNonceParams) error
+}, workerID uuid.UUID, protocolCaps []string, nonce string) (pgtype.Text, error) {
+	if !slices.Contains(protocolCaps, capability.CredentialSwitchInPlaceV1) {
+		return pgtype.Text{}, nil
+	}
+	v := pgconv.TextOrNull(nonce)
+	if err := q.StampWorkerCredentialSwitchApplyNonce(ctx, store.StampWorkerCredentialSwitchApplyNonceParams{ID: workerID, Nonce: v}); err != nil {
+		return pgtype.Text{}, err
+	}
+	return v, nil
+}
+
+// applyNegotiated reports whether the worker's CURRENT registration negotiated in-place apply:
+// credential_switch_apply_nonce equals snapshot_register_nonce.
+func (s *Service) applyNegotiated(ctx context.Context, workerID uuid.UUID) (bool, error) {
+	w, err := s.q.GetWorkerByID(ctx, workerID)
+	if err != nil {
+		return false, err
+	}
+	return w.CredentialSwitchApplyNonce.Valid && w.SnapshotRegisterNonce.Valid &&
+		w.CredentialSwitchApplyNonce.String == w.SnapshotRegisterNonce.String, nil
+}
+
 // holdCredentialSwitch applies the credential_switch_held report (issue #3181): the worker could
 // not prove its local release settled, so instead of releasing the claim the run is PAUSED with
 // hold_reason credential_switch_settling. One fenced statement (HoldCredentialSwitchUnsettled)
@@ -291,8 +359,23 @@ func (s *Service) holdCredentialSwitch(ctx context.Context, owned store.Run, wkr
 		return store.Run{}, false, fmt.Errorf("%w: %s requires register_nonce", ErrInvalidState, stateCredentialSwitchHeld)
 	}
 	gen := *req.ClaimGeneration
+	opID, err := optionalSwitchOpID(req.OpID, stateCredentialSwitchHeld)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	// Issue #4201 m3a: for an apply-negotiated registration only an op-fenced hold is accepted. The
+	// fenced statement below admits it only when op_id is the pending runs.credential_switch_op_id,
+	// and the replay branch only when the persisted hold identity matches (holdIdentityMatches), so
+	// the one shape left to refuse here is the un-fenced v1 hold. Nothing is written.
+	if !opID.Valid {
+		if retired, err := s.applyNegotiated(ctx, wkr.ID); err != nil {
+			return store.Run{}, false, err
+		} else if retired {
+			return owned, false, ErrCredentialSwitchReleaseRetired
+		}
+	}
 	rows, err := s.q.HoldCredentialSwitchUnsettled(ctx, store.HoldCredentialSwitchUnsettledParams{
-		ID: owned.ID, WorkerID: pgconv.UUID(wkr.ID), Generation: gen, RegisterNonce: req.RegisterNonce,
+		ID: owned.ID, WorkerID: pgconv.UUID(wkr.ID), Generation: gen, RegisterNonce: req.RegisterNonce, OpID: opID,
 	})
 	if err != nil {
 		return store.Run{}, false, err
@@ -308,12 +391,133 @@ func (s *Service) holdCredentialSwitch(ctx context.Context, owned store.Run, wkr
 		if err != nil {
 			return store.Run{}, false, err
 		}
-		return cur, current && isCredentialSwitchHold(cur, gen), nil
+		if !current {
+			return cur, false, nil
+		}
+		if !opID.Valid {
+			// No op id: the pre-#4201 replay, exactly as before.
+			return cur, isCredentialSwitchHold(cur, gen), nil
+		}
+		// With an op id a replay must prove the hold on record was written for THIS operation,
+		// generation, worker and incarnation. Without that, a hold from another operation (or an
+		// owner pause that happens to share the hold reason) would answer a report it never saw.
+		return cur, isCredentialSwitchHold(cur, gen) && holdIdentityMatches(cur, opID, gen, wkr.ID, req.RegisterNonce), nil
 	}
 	if s.bcast != nil {
 		s.bcast.PublishState(owned.ID, cur.Status)
 	}
 	return cur, true, nil
+}
+
+// holdIdentityMatches reports whether the run's recorded credential-switch hold identity (the four
+// credential_switch_hold_* columns HoldCredentialSwitchUnsettled writes) names exactly this
+// operation, generation, worker and registration nonce, and the run's own claim is at that generation.
+func holdIdentityMatches(r store.Run, op pgtype.UUID, gen int64, workerID uuid.UUID, nonce string) bool {
+	return r.CredentialSwitchHoldOpID.Valid && r.CredentialSwitchHoldOpID.Bytes == op.Bytes &&
+		r.CredentialSwitchHoldGeneration.Valid && r.CredentialSwitchHoldGeneration.Int64 == gen &&
+		r.ClaimGeneration == gen &&
+		r.CredentialSwitchHoldWorkerID.Valid && uuid.UUID(r.CredentialSwitchHoldWorkerID.Bytes) == workerID &&
+		r.CredentialSwitchHoldRegisterNonce.Valid && r.CredentialSwitchHoldRegisterNonce.String == nonce
+}
+
+// optionalSwitchOpID parses the optional op_id a credential-switch report carries. Absent is the
+// pre-#4201 unfenced form (an invalid pgtype.UUID, which the fenced queries read as NULL); a present
+// value must be a UUID or the report is invalid (a 400, not a silent unfenced fallback).
+func optionalSwitchOpID(op *string, state string) (pgtype.UUID, error) {
+	if op == nil {
+		return pgtype.UUID{}, nil
+	}
+	id, err := uuid.Parse(*op)
+	if err != nil {
+		return pgtype.UUID{}, fmt.Errorf("%w: %s op_id is not a UUID", ErrInvalidState, state)
+	}
+	return pgconv.UUID(id), nil
+}
+
+// ErrCredentialSwitchUncertainParkPending refuses a credential_switch_uncertain report because the
+// run has a pending wall or reserve pause (issue #4201): that park belongs to the worker's own park
+// path, so the worker takes it instead of the uncertain hold. Nothing was written. The handler answers
+// 409 with reason "park_pending".
+var ErrCredentialSwitchUncertainParkPending = errors.New("a wall or reserve pause is pending for this run")
+
+// uncertainCredentialSwitch applies the credential_switch_uncertain report (issue #4201): the worker
+// cannot prove whether an in-place credential apply took effect, so the run PAUSES for the owner to
+// decide (one fenced statement, SetRunCredentialSwitchUncertainHold: reporting worker, generation,
+// unreleased claim, live status, current registration nonce, and the named operation either still
+// pending or journaled as a child epoch). hold_reason stays NULL, the worker, session and open
+// question are kept, a pending owner pause is left alone and nothing is banked.
+//
+// A 0-row result re-reads the run. A pending wall/reserve pause is the distinct
+// ErrCredentialSwitchUncertainParkPending. An idempotent replay (paused, no hold reason, same
+// generation, worker and current incarnation, operation still pending or journaled) converges to
+// applied; anything else is applied=false (the handler's ordinary 409).
+//
+// The `credential_switch_uncertain` feed message is NOT written here: the worker emits it itself
+// through its own batcher, at a seq it owns, so it cannot collide with the worker's live frames.
+func (s *Service) uncertainCredentialSwitch(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest) (store.Run, bool, error) {
+	if req.ClaimGeneration == nil {
+		return store.Run{}, false, fmt.Errorf("%w: %s requires claim_generation", ErrInvalidState, stateCredentialSwitchUncertain)
+	}
+	opID, err := optionalSwitchOpID(req.OpID, stateCredentialSwitchUncertain)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	if !opID.Valid {
+		return store.Run{}, false, fmt.Errorf("%w: %s requires op_id", ErrInvalidState, stateCredentialSwitchUncertain)
+	}
+	if !validHoldRegisterNonce(req.RegisterNonce) {
+		// A missing or malformed nonce matches no registration: nothing is written and the worker gets the
+		// ordinary not-applied 409 (re-read worker-scoped so it learns the run's real state).
+		cur, rerr := s.runOwnedByWorker(ctx, owned.ID, wkr)
+		return cur, false, rerr
+	}
+	gen := *req.ClaimGeneration
+	op := uuid.UUID(opID.Bytes)
+	rows, err := s.q.SetRunCredentialSwitchUncertainHold(ctx, store.SetRunCredentialSwitchUncertainHoldParams{
+		ID: owned.ID, WorkerID: pgconv.UUID(wkr.ID), Generation: gen, OpID: op, RegisterNonce: req.RegisterNonce,
+	})
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	cur, err := s.runOwnedByWorker(ctx, owned.ID, wkr)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	if rows > 0 {
+		if s.bcast != nil {
+			s.bcast.PublishState(owned.ID, cur.Status)
+		}
+		return cur, true, nil
+	}
+	current, err := s.currentRegisterNonce(ctx, wkr.ID, req.RegisterNonce)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	if !current || cur.ClaimGeneration != gen || cur.ClaimReleasedAt.Valid {
+		return cur, false, nil
+	}
+	if cur.PauseRequestedAt.Valid && (cur.PauseMode.String == "wall" || cur.PauseMode.String == "reserve") &&
+		slices.Contains([]string{"running", "awaiting_approval", "awaiting_input", "awaiting_followup"}, cur.Status) &&
+		!cur.HoldReason.Valid {
+		return cur, false, ErrCredentialSwitchUncertainParkPending
+	}
+	if cur.Status != "paused" || cur.HoldReason.Valid {
+		return cur, false, nil
+	}
+	stampPending := cur.CredentialSwitchRequestedAt.Valid && cur.CredentialSwitchGeneration.Valid &&
+		cur.CredentialSwitchGeneration.Int64 == gen && cur.CredentialSwitchOpID.Valid &&
+		uuid.UUID(cur.CredentialSwitchOpID.Bytes) == op
+	if stampPending {
+		return cur, true, nil
+	}
+	child, err := s.q.GetRunCredentialSwitchEpochByOp(ctx, store.GetRunCredentialSwitchEpochByOpParams{OpID: op, RunID: owned.ID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return cur, false, nil
+	}
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	return cur, child.ClaimGeneration == gen, nil
 }
 
 // settleCredentialSwitchHold applies the credential_switch_hold_settled acknowledgement (issue
