@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -230,15 +231,11 @@ func cleanInventoryText(field, s string, max int, required bool) error {
 }
 
 // unsafeInventoryRune reports the runes worker-written text may not carry: C0 and C1 controls, DEL
-// and the Unicode bidirectional controls, which can reorder or hide text in a terminal or a UI.
+// and the Unicode line and paragraph separators (Zl, Zp) and format characters (Cf: the bidirectional
+// controls, zero-width characters, the byte order mark, the soft hyphen), which can reorder, split or
+// hide text in a terminal or a UI.
 func unsafeInventoryRune(r rune) bool {
-	switch {
-	case r < 0x20, r >= 0x7f && r <= 0x9f:
-		return true
-	case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069, r == 0x200e, r == 0x200f, r == 0x061c:
-		return true
-	}
-	return false
+	return r < 0x20 || (r >= 0x7f && r <= 0x9f) || unicode.In(r, unicode.Zl, unicode.Zp, unicode.Cf)
 }
 
 // cleanStoredInventoryText is cleanInventoryText plus the control and bidi rejection that applies to
@@ -248,7 +245,7 @@ func cleanStoredInventoryText(field, s string, max int, required bool) error {
 		return err
 	}
 	if strings.IndexFunc(s, unsafeInventoryRune) >= 0 {
-		return inventoryBad("%s must not contain control or bidirectional characters", field)
+		return inventoryBad("%s must not contain control, separator or format characters", field)
 	}
 	return nil
 }
@@ -464,9 +461,11 @@ func (r *InventoryRequest) PrepareInventory() (HibernationInventoryReport, error
 	return HibernationInventoryReport{
 		OpID: op, PodUID: pod, RegisterNonce: r.RegisterNonce,
 		DeploymentResourceVersion: r.DeploymentResourceVersion, PVCs: sortedPVCRefs(r.PVCs),
-		// A lane other than dind, or any uncovered writer, means the inventory cannot claim to be complete.
-		Complete: *r.Complete && x.Lane == "dind" && len(x.Uncovered) == 0, Uncovered: uncoveredJSON,
-		Entries: entries, ReceiptKeys: receipts,
+		// Only the dind lane under the full epoch+latch+quiescence mechanism with no uncovered writer
+		// may claim a complete inventory.
+		Complete:  *r.Complete && x.Lane == "dind" && x.Mechanism == "epoch_ex+latch+quiescence" && len(x.Uncovered) == 0,
+		Uncovered: uncoveredJSON,
+		Entries:   entries, ReceiptKeys: receipts,
 		Digest: r.Digest, Fingerprint: r.Fingerprint, Lane: x.Lane, Mechanism: x.Mechanism,
 	}, nil
 }

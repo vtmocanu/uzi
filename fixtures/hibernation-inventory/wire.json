@@ -49,21 +49,21 @@
     "complete": true,
     "entries": [
       {
-        "kind": "attempt_tree",
+        "kind": "retained_attempt",
         "path": "/data/runner/g-r/issue-7.attempt-a1",
-        "classification": "retained_recoverable",
+        "classification": "needs_receipt",
         "run_id": "99999999-9999-4999-8999-999999999991",
         "tip": "0123456789abcdef0123456789abcdef01234567",
-        "content_state": "clean"
+        "content_state": "content_proven"
       },
       {
-        "kind": "bare_repository",
+        "kind": "bare_repo",
         "path": "/data/runner/g-r/.bare",
         "classification": "protected",
         "detail": "refs/uzi-runner/agent/issue-7"
       },
       {
-        "kind": "unclassified",
+        "kind": "unknown_path",
         "path": "/data/runner/stray",
         "classification": "unknown"
       }

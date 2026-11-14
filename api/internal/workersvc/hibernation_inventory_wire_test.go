@@ -345,7 +345,8 @@ func TestInventoryRejectsUnsafeTextAndVocabulary(t *testing.T) {
 	}
 	entry := func(m map[string]any) map[string]any { return m["entries"].([]any)[0].(map[string]any) }
 	excl := func(m map[string]any) map[string]any { return m["exclusion"].(map[string]any) }
-	bad := []string{"a\x01b", "a\nb", "a\tb", "a\x7fb", "a\u0085b", "a\u009fb", "a\u202eb", "a\u2066b", "a\u2069b", "a\u200eb", "a\u200fb", "a\u061cb"}
+	bad := []string{"a\x01b", "a\nb", "a\tb", "a\x7fb", "a\u0085b", "a\u009fb", "a\u202eb", "a\u2066b", "a\u2069b", "a\u200eb", "a\u200fb", "a\u061cb",
+		"a\u2028b", "a\u2029b", "a\u200bb", "a\ufeffb", "a\u00adb"}
 	fields := map[string]func(m map[string]any, v string){
 		"path":           func(m map[string]any, v string) { entry(m)["path"] = v },
 		"kind":           func(m map[string]any, v string) { entry(m)["kind"] = v },
@@ -416,5 +417,28 @@ func TestInventoryUncoveredForcesIncomplete(t *testing.T) {
 	}
 	if rep := prep(t, "plain", []any{}); rep.Complete {
 		t.Fatal("plain lane kept complete")
+	}
+}
+
+// A complete inventory needs the dind lane AND the full exclusion mechanism: dind under "none" is
+// forced incomplete.
+func TestInventoryDindWithoutMechanismIsIncomplete(t *testing.T) {
+	fx := loadInventoryFixture(t)
+	var m map[string]any
+	if err := json.Unmarshal(fx["inventory_request"], &m); err != nil {
+		t.Fatal(err)
+	}
+	m["exclusion"] = map[string]any{"lane": "dind", "mechanism": "none", "uncovered": []any{}}
+	raw, _ := json.Marshal(m)
+	var req InventoryRequest
+	if err := invStrictDecode(t, raw, &req); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := req.PrepareInventory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Complete {
+		t.Fatal("dind lane with mechanism none kept complete")
 	}
 }

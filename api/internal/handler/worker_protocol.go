@@ -607,10 +607,10 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		ResidueQuarantine json.RawMessage `json:"residue_quarantine"`
 		// HibernationExclusion (PRD #4208 M1) is the worker's report that it still holds, or
 		// has lost, the writer exclusion its volume inventory was taken under. A malformed member
-		// is answered 400 rather than dropped, so a dropped held=false cannot hide the loss of the
-		// exclusion the inventory depends on. The consequence for the worker: the whole heartbeat
-		// is refused (400), so the agent's strip-and-retry fallback resends it without its
-		// extension members and the liveness is not lost.
+		// is answered 400 rather than dropped. The whole heartbeat is refused, so the agent's
+		// strip-and-retry fallback resends it without its extension members: a held=false can be
+		// dropped there and liveness is kept. The consequence is an unproven exclusion, not a hidden
+		// one: no exclusion-final follows, so the inventory is never confirmed as still held.
 		HibernationExclusion *workersvc.HibernationExclusionReport `json:"hibernation_exclusion"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
