@@ -124,6 +124,21 @@ describe("assembleAgents", () => {
     }
   });
 
+  it("issue #4346: every composed subagent prompt forbids `go clean` and routes pressure to the lead", () => {
+    const rule = "Never run `go clean` in any form; report Go build cache or disk pressure to the lead, who decides on cleanup.";
+    assert.ok(!reviewer.prompt_body.includes("go clean"), "precondition: the raw reviewer body does not mention go clean");
+    const emptyBodied: AgentTemplate = { ...reviewer, name: "blank", prompt_body: "" };
+    const { subagents } = assembleAgents([reviewer, emptyBodied]);
+    for (const name of ["reviewer", "blank"]) {
+      const flatPrompt = subagents[name]?.prompt?.replace(/\s+/g, " ") ?? "";
+      assert.ok(flatPrompt.includes(rule), `${name}: carries the go clean prohibition`);
+      // The lead-only cleanup permission must never reach a subagent.
+      for (const leadOnly of ["completed validation-wave boundary", "Run `go clean -cache` only"]) {
+        assert.ok(!flatPrompt.includes(leadOnly), `subagent prompt carries lead-only ${JSON.stringify(leadOnly)}`);
+      }
+    }
+  });
+
   it("blocks nested Agent spawning, the workflow-signal MCP server, and the memory MCP server on every subagent", () => {
     // PRD #43 M2 + PRD #90: disallowedTools denies nested Agent spawning, the run's
     // signal server (mcp__uzi → submit_plan/signal_done), AND the memory server

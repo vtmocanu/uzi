@@ -169,6 +169,54 @@ const LEAD_EXPORT_SLOT_RULE = [
   "Never reassign a slot until the dispatch that held it has returned.",
 ].join("\n");
 
+/**
+ * Issue #4346: a run's Go build cache can grow by tens of GiB inside one long implement
+ * turn, between ADR-1809's turn-boundary trim and its hard threshold. This is ADVISORY,
+ * model-dependent lead behaviour (PRD #1809 already advised `go clean -cache` at milestone
+ * boundaries): no hard bound, no worker-enforced quiet point, no worker deletion authority,
+ * and no D13/D20 exclusion proof (PRD #2013). Settlement is the lead's own bookkeeping of
+ * returned dispatches and recorded exit statuses, never process inspection. ADR-1598: on
+ * Codex, GOCACHE is the adopted per-run cache outside the per-command HOME, so the filesystem
+ * read is the one holding the resolved GOCACHE. In the runtime append so a customized lead
+ * carries it on both harnesses; the subagent half is SUBAGENT_GO_CLEAN_RULE.
+ */
+const LEAD_GO_CACHE_RULE = [
+  "Go build cache under disk pressure (advisory; not an enforced cap or a predicted next-wave",
+  "working-set bound). Act only at a completed validation-wave boundary, before dispatching",
+  "another wave, and only when every subagent, tool command and child process you started",
+  "anywhere in this run that could use this cache has returned with a recorded exit status and",
+  "settled, including survivors from earlier waves. A returned dispatch is not proof that its",
+  "build children settled. If settlement is unknown, or a shared or independent consumer is",
+  "known or suspected, skip and report; do not inspect other processes to manufacture proof.",
+  "Launch no new cache consumer until the cleanup command settles.",
+  "Condition: use successful fresh readings of the verified run-owned cache and the filesystem",
+  "holding it (for example `du -sk` on the resolved `GOCACHE` and `df -P` on that path). Clean",
+  "when allocated `GOCACHE` bytes are at least 12 GiB, or that filesystem is at least 75% used.",
+  "A missing, failed or partial reading is unknown, not zero and not a trigger; below both",
+  "thresholds keep the warm cache. After one cleanup attempt, do not repeat solely because the",
+  "same filesystem-pressure episode stays at or above 75%: re-arm that trigger only after a fresh",
+  "reading below 70%, then a later reading at or above 75%. Fresh cache growth to at least",
+  "12 GiB may independently trigger another attempt at a settled boundary. Keep stable export",
+  "slots and warm reuse within a wave.",
+  "Ownership: before cleaning, resolve `go env GOCACHE` in the same tool environment that built",
+  "the code and confirm by its canonical path that it is this run's own cache, with no explicit",
+  "shared or external override and no `GOCACHEPROG` backend. On Codex, `GOCACHE` legitimately",
+  "points at the run's adopted per-run cache outside the per-command HOME; do not require it to",
+  "sit inside HOME. If ownership is unknown, keep the cache and say so.",
+  "Action: Run `go clean -cache` only: never `-modcache`, never a manual `rm`, never another",
+  "run's paths, and never reset `HOME` or `GOCACHE`. Report the cleanup and the before/after",
+  "size in the run's progress notes (your status messages to the run); report a failed",
+  "cleanup as failed, never disguised.",
+  "Validation is unchanged: prefer the plan's focused named-package or `-run` checks, and send",
+  "full suites to exact-head CI only where the approved plan already says so. Never narrow a",
+  "required check, drop `-race`, or waive a frozen acceptance criterion because of this rule.",
+  "Subagents never run `go clean`; they report cache or disk pressure to you.",
+].join("\n");
+
+/** Issue #4346: the subagent half of LEAD_GO_CACHE_RULE; only the lead decides on cleanup. */
+const SUBAGENT_GO_CLEAN_RULE =
+  "Never run `go clean` in any form; report Go build cache or disk pressure to the lead, who decides on cleanup.";
+
 /** Shared across customized leads and every subagent on both harnesses. Issue #3721: owner-only
  *  items are plan sections, never milestones, so a run no longer parks at completion for them. */
 const COMPLETION_DELIVERY_GUIDANCE = [
@@ -201,6 +249,7 @@ const LEAD_GUARDRAIL_PREFIX = [
   "You are the lead agent for a software task in an isolated git worktree.",
   RUN_SCRATCH_GUIDANCE,
   LEAD_EXPORT_SLOT_RULE,
+  LEAD_GO_CACHE_RULE,
   COMMAND_LIFETIME_RULE,
   WORKER_TOOLBOX_RULE,
   "Work only inside the checked-out worktree and make local commits on the",
@@ -494,6 +543,7 @@ export const WORKER_RUNTIME_APPEND = [
   "Do not run your own `npm ci` / `npm install`: `npm ci` deletes `node_modules` before",
   "reinstalling, and either command races that background install. If a targeted test",
   "fails on a missing module, report it rather than installing.",
+  SUBAGENT_GO_CLEAN_RULE,
   COMMAND_LIFETIME_RULE,
   WORKER_TOOLBOX_RULE,
 ].join("\n");
