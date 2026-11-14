@@ -832,7 +832,7 @@ func TestTerminalSweepRetireLiveDB(t *testing.T) {
 
 	// A no_pr row (neither issue nor merge request) has no closure signal: it retires only by age, from
 	// its FIRST publication. The observation clock is shifted through afterObserve, since the database
-	// clock cannot be moved and first_published_at cannot be rewritten (the 00442 trigger).
+	// clock cannot be moved and first_published_at cannot be rewritten (the 00448 trigger).
 	shiftObservation := func(f *sweepFix, d time.Duration) {
 		f.svc.terminal.afterObserve = func(at *time.Time) { *at = at.Add(d) }
 	}

@@ -52,7 +52,7 @@ const (
 	terminalUnknownRetryAfter = time.Hour
 	terminalLiveRecheck       = time.Hour
 
-	// terminalMaxManifestBytes mirrors the 00443 manifest CHECK (octet_length(manifest::text)).
+	// terminalMaxManifestBytes mirrors the 00449 manifest CHECK (octet_length(manifest::text)).
 	terminalMaxManifestBytes = 262144
 )
 

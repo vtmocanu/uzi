@@ -1,6 +1,6 @@
 -- Issue #4007: a terminal run's preservation ref refs/uzi-terminal/<run-id>
 -- (run_terminal_preservations) and the per-generation contribution records pushed into it
--- (run_terminal_contributions), migrations 00442 and 00443. The guard triggers enforce the state
+-- (run_terminal_contributions), migrations 00448 and 00449. The guard triggers enforce the state
 -- machines; every writer is a CAS on the expected state, so a lost race reads as 0 rows.
 -- Lock order, wherever more than one is taken: worker, run, hold, preservation, contribution.
 

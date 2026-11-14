@@ -14,7 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #4007 slice A, M1: migrations 00442-00445. Every test stands its own database, so the
+// Issue #4007 slice A, M1: migrations 00448-00451. Every test stands its own database, so the
 // CHECKs, the guard triggers and the widened reason CHECK are executed by real statements. A
 // guard-refused change is a silent zero-row write (RETURN NULL), a failed CHECK or FK is an error
 // naming its constraint, and the tests tell the two apart.
@@ -489,7 +489,7 @@ func TestTerminalPreservationGuardLiveDB(t *testing.T) {
 func TestTerminalContributionGuardLiveDB(t *testing.T) {
 	f := newTermFixture(t, "term_contrib_")
 	p := f.insertPreservation(f.newRun())
-	// The prepared -> invoked marker needs its preservation publishing (migration 00443), so every
+	// The prepared -> invoked marker needs its preservation publishing (migration 00449), so every
 	// contribution below that is built past prepared shares this publishing preservation.
 	f.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, p.ID)
 	gen := int64(0)
@@ -839,7 +839,7 @@ func TestTerminalPreservationRollbackLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `UPDATE recovery_custody_holds SET completed_publication_reason='terminal_preservation_refused' WHERE id=$1`, f.hold)
 	mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds ENABLE TRIGGER completed_publication_hold_guard`)
 
-	if err := store.MigrateDownTo(ctx, dsn, 441); err == nil {
+	if err := store.MigrateDownTo(ctx, dsn, 447); err == nil {
 		t.Fatal("Down accepted a live terminal preservation")
 	}
 	var applied bool
@@ -850,7 +850,7 @@ func TestTerminalPreservationRollbackLiveDB(t *testing.T) {
 	// Retire the ref's row: a finished preservation no longer blocks the rollback.
 	ft.mustRows(1, `UPDATE run_terminal_preservations SET state='retiring', `+termRetireStamp+` WHERE id=$1`, live.ID, termTipA)
 	ft.mustRows(1, `UPDATE run_terminal_preservations SET state='deleted', live_run_id=NULL, deleted_at=now() WHERE id=$1`, live.ID)
-	if err := store.MigrateDownTo(ctx, dsn, 441); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 447); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
 	var objects int
@@ -892,7 +892,7 @@ func termRefusal(t *testing.T, err error, want string, pool interface {
 		WHERE relname IN ('run_terminal_preservations','run_terminal_contributions') AND relkind = 'r'`).Scan(&tables); qerr != nil {
 		t.Fatalf("count tables: %v", qerr)
 	}
-	// 442 alone leaves one table, the other cases two.
+	// 448 alone leaves one table, the other cases two.
 	if tables == 0 {
 		t.Fatal("a refused Down dropped the tables")
 	}
@@ -901,34 +901,34 @@ func termRefusal(t *testing.T, err error, want string, pool interface {
 // Each Down's own refusal fires, reached through the migration that owns it: a Down below it runs
 // first, so the rows are inserted only after the later migrations are rolled back.
 func TestTerminalPreservationRollbackRefusalsLiveDB(t *testing.T) {
-	// 00442: a pointer-bearing preservation with no contribution (00443 would not refuse it).
-	t.Run("00442 refuses a live pointer", func(t *testing.T) {
-		ctx, dsn, pool := heldMigratedPool(t, "term_rb442_")
+	// 00448: a pointer-bearing preservation with no contribution (00449 would not refuse it).
+	t.Run("00448 refuses a live pointer", func(t *testing.T) {
+		ctx, dsn, pool := heldMigratedPool(t, "term_rb448_")
 		f := heldNewHoldFixture(ctx, t, pool, false, "failed", nil)
 		ft := &termFixture{heldFixture: f, ctx: ctx, q: store.New(pool), t: t}
-		if err := store.MigrateDownTo(ctx, dsn, 442); err != nil {
-			t.Fatalf("Down to 442: %v", err)
+		if err := store.MigrateDownTo(ctx, dsn, 448); err != nil {
+			t.Fatalf("Down to 448: %v", err)
 		}
 		p := ft.insertPreservation(f.run)
 		ft.mustRows(1, `UPDATE run_terminal_preservations SET state='publishing', live_run_id=run_id WHERE id=$1`, p.ID)
-		termRefusal(t, store.MigrateDownTo(ctx, dsn, 441), "run_terminal_preservations has live rows", pool)
+		termRefusal(t, store.MigrateDownTo(ctx, dsn, 447), "run_terminal_preservations has live rows", pool)
 		// Dropping the pointer is what unblocks it: the refusal was the only obstacle.
 		// The guard reads run_terminal_contributions, already rolled back: clear the pointer past it.
 		mustExec(ctx, t, pool, `ALTER TABLE run_terminal_preservations DISABLE TRIGGER run_terminal_preservation_guard`)
 		ft.mustRows(1, `UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE id=$1`, p.ID)
-		if err := store.MigrateDownTo(ctx, dsn, 441); err != nil {
+		if err := store.MigrateDownTo(ctx, dsn, 447); err != nil {
 			t.Fatalf("Down after the pointer was cleared: %v", err)
 		}
 	})
 
-	// 00443: no pointer anywhere, but a push that may have created the ref.
+	// 00449: no pointer anywhere, but a push that may have created the ref.
 	for _, state := range []string{"invoked", "publish_unknown"} {
-		t.Run("00443 refuses an "+state+" contribution", func(t *testing.T) {
-			ctx, dsn, pool := heldMigratedPool(t, "term_rb443_")
+		t.Run("00449 refuses an "+state+" contribution", func(t *testing.T) {
+			ctx, dsn, pool := heldMigratedPool(t, "term_rb449_")
 			f := heldNewHoldFixture(ctx, t, pool, false, "failed", nil)
 			ft := &termFixture{heldFixture: f, ctx: ctx, q: store.New(pool), t: t}
-			if err := store.MigrateDownTo(ctx, dsn, 443); err != nil {
-				t.Fatalf("Down to 443: %v", err)
+			if err := store.MigrateDownTo(ctx, dsn, 449); err != nil {
+				t.Fatalf("Down to 449: %v", err)
 			}
 			p := ft.insertPreservation(f.run)
 			c := ft.insertContribution(p, 1, termTipA, nil)
@@ -937,17 +937,17 @@ func TestTerminalPreservationRollbackRefusalsLiveDB(t *testing.T) {
 			if state == "publish_unknown" {
 				ft.mustRows(1, `UPDATE run_terminal_contributions SET state='publish_unknown' WHERE id=$1`, c.ID)
 			}
-			termRefusal(t, store.MigrateDownTo(ctx, dsn, 442), "run_terminal_contributions has live rows", pool)
+			termRefusal(t, store.MigrateDownTo(ctx, dsn, 448), "run_terminal_contributions has live rows", pool)
 			ft.mustRows(1, `UPDATE run_terminal_contributions SET state='refused', refusal_reason='create_refused' WHERE id=$1`, c.ID)
-			// The preservation still bears its live pointer, which the 00443 Down also refuses on.
+			// The preservation still bears its live pointer, which the 00449 Down also refuses on.
 			ft.mustRows(1, `UPDATE run_terminal_preservations SET state='not_published', live_run_id=NULL WHERE id=$1`, p.ID)
-			if err := store.MigrateDownTo(ctx, dsn, 442); err != nil {
+			if err := store.MigrateDownTo(ctx, dsn, 448); err != nil {
 				t.Fatalf("Down after the contribution was refused: %v", err)
 			}
 		})
 	}
 
-	// 00444 runs first on a full rollback: its refusal must stop it before the reasons are cleared.
+	// 00450 runs first on a full rollback: its refusal must stop it before the reasons are cleared.
 	for name, arrange := range map[string]func(ft *termFixture, run uuid.UUID){
 		"a live pointer": func(ft *termFixture, run uuid.UUID) {
 			p := ft.insertPreservation(run)
@@ -960,8 +960,8 @@ func TestTerminalPreservationRollbackRefusalsLiveDB(t *testing.T) {
 			ft.mustRows(1, `UPDATE run_terminal_contributions SET state='invoked', create_invoked_at=now() WHERE id=$1`, c.ID)
 		},
 	} {
-		t.Run("00444 refuses "+name+" before clearing the reasons", func(t *testing.T) {
-			ctx, dsn, pool := heldMigratedPool(t, "term_rb444_")
+		t.Run("00450 refuses "+name+" before clearing the reasons", func(t *testing.T) {
+			ctx, dsn, pool := heldMigratedPool(t, "term_rb450_")
 			f := heldNewHoldFixture(ctx, t, pool, false, "failed", nil)
 			ft := &termFixture{heldFixture: f, ctx: ctx, q: store.New(pool), t: t}
 			arrange(ft, f.run)
@@ -969,7 +969,7 @@ func TestTerminalPreservationRollbackRefusalsLiveDB(t *testing.T) {
 			mustExec(ctx, t, pool, `UPDATE recovery_custody_holds SET completed_publication_reason='terminal_preservation_refused' WHERE id=$1`, f.hold)
 			mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds ENABLE TRIGGER completed_publication_hold_guard`)
 
-			termRefusal(t, store.MigrateDownTo(ctx, dsn, 441), "has live rows", pool)
+			termRefusal(t, store.MigrateDownTo(ctx, dsn, 447), "has live rows", pool)
 			var reason *string
 			if err := pool.QueryRow(ctx, `SELECT completed_publication_reason FROM recovery_custody_holds WHERE id=$1`, f.hold).Scan(&reason); err != nil ||
 				reason == nil || *reason != "terminal_preservation_refused" {
@@ -979,7 +979,7 @@ func TestTerminalPreservationRollbackRefusalsLiveDB(t *testing.T) {
 	}
 }
 
-// The 00444 Down must clear the new reasons on a hold that carries a merged-predecessor discard
+// The 00450 Down must clear the new reasons on a hold that carries a merged-predecessor discard
 // binding, which merged_predecessor_discard_guard rejects any change to unless it is disabled.
 func TestTerminalPreservationRollbackBoundHoldLiveDB(t *testing.T) {
 	ctx, dsn, pool := heldMigratedPool(t, "term_rbbind_")
@@ -993,7 +993,7 @@ func TestTerminalPreservationRollbackBoundHoldLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds ENABLE TRIGGER completed_publication_hold_guard`)
 	mustExec(ctx, t, pool, `ALTER TABLE recovery_custody_holds ENABLE TRIGGER merged_predecessor_discard_guard`)
 
-	if err := store.MigrateDownTo(ctx, dsn, 441); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 447); err != nil {
 		t.Fatalf("Down with a bound hold: %v", err)
 	}
 	var reason *string
