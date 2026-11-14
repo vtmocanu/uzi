@@ -1044,6 +1044,8 @@ type CheckpointBodyOutcome =
 /** issue #1597 M2: how long a durable sink waits for a surviving tick process group before it
  *  proceeds anyway (and logs the residual). */
 const SURVIVOR_SINK_WAIT_MS = 2_000;
+/** Issue #4258: bound on WAITING for the bare lock in the mid-run seam's cleanup (never on a started reconcile). */
+const MID_RUN_LOCK_RECONCILE_WAIT_MS = 10_000;
 
 /** Most runs whose announced-heads ledger a worker remembers (oldest evicted). */
 const OWED_ANNOUNCED_RUNS = 256;
@@ -3208,7 +3210,12 @@ interface RunFlight {
    *  of them that is an ancestor of the tip.
    *  `overflow` =
    *  the flagged-commit list hit its cap, after which D5 fails closed and every checkpoint publish
-   *  is held. */
+   *  is held.
+   *  `midRunTrigger` (issue #4258) = a CONTENT-FREE pending hint (no findings, rules or paths): the
+   *  mid-turn checkpoint scan saw a trusted finding whose every commit is above the floors. Only
+   *  `runMidRunSecretRemediation` consumes it, at an admitted work-turn boundary, and it revalidates
+   *  everything from scratch (the stored tip never scans or authorizes anything). `midRunSeq` numbers
+   *  observations; a newer arming replaces an older pending one. The done gate clears it. */
   secretRemediation?: {
     attempts: number;
     known?: SecretFinding[];
@@ -3219,6 +3226,8 @@ interface RunFlight {
     everKnown?: boolean;
     withholdPaths?: boolean;
     overflow?: boolean;
+    midRunTrigger?: { observation: number; tip: string };
+    midRunSeq?: number;
   };
 }
 
@@ -3309,6 +3318,8 @@ export interface CheckpointTestHooks {
   onTickOutcome?: (outcome: string) => void;
   /** SIGTERM → SIGKILL grace for a cancelled tick child (default 2s). */
   tickKillGraceMs?: number;
+  /** Bound on the mid-run seam cleanup's wait to ACQUIRE the bare lock (default 10s). */
+  midRunLockReconcileWaitMs?: number;
   /** The checkpoint secret-scan deadline (default CHECKPOINT_SCAN_TIMEOUT_MS, 60s). */
   scanDeadlineMs?: number;
   /** Override FLAGGED_COMMITS_CAP (the per-run flagged-commit list cap) so a test can reach overflow. */
@@ -17828,6 +17839,10 @@ export class RunRunner {
       // issue #1932 D2: the pre-exit secret remediation gate, serialized with the mid-turn tick.
       secretRemediationGate: (options) =>
         this.runGatedSink(flight, () => this.runSecretRemediationGate(flight, barePath, runnerClone, options)),
+      // issue #4258: advisory, non-terminal mid-run consumer; a no-op unless a trigger is pending.
+      midRunSecretRemediation: () => flight.secretRemediation?.midRunTrigger
+        ? this.runGatedSink(flight, () => this.runMidRunSecretRemediationScoped(flight, barePath, runnerClone))
+        : Promise.resolve({ action: "proceed" as const }),
       ...(claim.code_cross_check_required === true
         && isCodePublishingKind(claim.kind ?? "issue") ? {
         codeCrossCheckGate: async (completion: { interlocked: boolean; reportOnly?: boolean; repairAvailable?: boolean; notCode?: boolean; confirmedEmptyPrompt?: boolean }) => {
@@ -20341,23 +20356,24 @@ export class RunRunner {
   }
 
   private async persistRemediationRestrictions(flight: RunFlight, barePath: string, branch: string,
-    tip: string, findings: readonly SecretFinding[]): Promise<void> {
+    tip: string, findings: readonly SecretFinding[], wait?: AuthorityWait): Promise<void> {
     const flaggedOIDs = this.latchRemediationFindings(flight, barePath, branch, findings);
     if (flaggedOIDs === undefined) return;
     const source = this.remediationSource(flight);
     await this.inFlightAuthority(flight, () => this.git.recordRemediationRestrictions(barePath, branch,
       { runId: source.runId, clonePath: source.clonePath!, attemptId: source.attemptId! },
-      { trusted: true, tip, flaggedOIDs }), this.authorityWait(flight));
+      { trusted: true, tip, flaggedOIDs }), wait ?? this.authorityWait(flight));
   }
 
   private async persistRemediationScan(flight: RunFlight, barePath: string, branch: string,
-    tip: string, findings: readonly SecretFinding[], origin?: "checkpoint-pending" | "pre-exit"): Promise<void> {
+    tip: string, findings: readonly SecretFinding[], origin?: "checkpoint-pending" | "pre-exit",
+    wait?: AuthorityWait): Promise<void> {
     const flaggedOIDs = this.latchRemediationFindings(flight, barePath, branch, findings);
     if (flaggedOIDs === undefined) return;
     const source = this.remediationSource(flight);
     await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(barePath, branch,
       { runId: source.runId, clonePath: source.clonePath!, attemptId: source.attemptId! },
-      { trusted: true, tip, flaggedOIDs, ...(origin ? { origin } : {}) }), this.authorityWait(flight));
+      { trusted: true, tip, flaggedOIDs, ...(origin ? { origin } : {}) }), wait ?? this.authorityWait(flight));
   }
 
   /**
@@ -20429,6 +20445,7 @@ export class RunRunner {
         if (scan.trusted) {
           this.latchRemediationFindings(flight, barePath, branch, scan.findings);
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
+          await this.noteMidRunTrigger(flight, barePath, range.tipSha, scan.findings, scanScope);
           await this.persistRemediationScan(flight, barePath, branch, range.tipSha, scan.findings, "checkpoint-pending");
         }
         // D6(c) on this log surface too: a committed filename can itself be a secret. The path
@@ -20465,11 +20482,14 @@ export class RunRunner {
    * gitleaks; true (withhold EVERY path on every surface) when that scan is untrusted or flags any
    * path (fail closed).
    */
-  private async withholdPathsFor(findings: readonly SecretFinding[]): Promise<boolean> {
+  private async withholdPathsFor(
+    findings: readonly SecretFinding[],
+    pathScope?: <T>(fn: () => Promise<T>) => Promise<T>,
+  ): Promise<boolean> {
     try {
-      const pathScan = await this.git.scanPatchForSecrets(
+      const pathScan = await (pathScope ?? ((fn) => fn()))(() => this.git.scanPatchForSecrets(
         findings.map((f) => (typeof f.file === "string" ? f.file : "")).join("\n"),
-      );
+      ));
       return !pathScan.trusted || pathScan.findings.length > 0;
     } catch {
       return true;
@@ -20490,7 +20510,7 @@ export class RunRunner {
     barePath: string,
     branch: string,
     expectedTip: string,
-    options?: { explicitTip?: boolean; unpublishedOnly?: boolean },
+    options?: { explicitTip?: boolean; unpublishedOnly?: boolean; scanScope?: <T>(fn: () => Promise<T>) => Promise<T> },
   ): Promise<
     | { trusted: true; range: CheckpointRange; findings: SecretFinding[]; floorCandidates: string[] }
     | { trusted: false; why: string; publishedOnly?: true }
@@ -20498,12 +20518,7 @@ export class RunRunner {
     // PUBLISHED-ONLY floors: never a bare flight.checkpointFloor (it can be a local-only bridge that
     // contains a flagged commit). lastAttemptedCheckpointRefTip is an ambiguous publish and counts as
     // published; lastCheckpointRefTip stays an ancestor-checked floor (resolveCheckpointRange).
-    const floorCandidates = [
-      ...(flight.publishedRealTips ?? []),
-      flight.lastAttemptedCheckpointRefTip,
-      flight.publishedTip,
-      flight.lastCheckpointRefTip,
-    ].filter((f): f is string => typeof f === "string" && /^[0-9a-f]{40}$/.test(f));
+    const floorCandidates = this.remediationFloorCandidates(flight);
     const range = await this.git.resolveCheckpointRange(barePath, branch, {
       defaultBranch: flight.checkpointDefaultBranch,
       confirmedTip: flight.lastCheckpointRefTip,
@@ -20514,9 +20529,82 @@ export class RunRunner {
     if (options?.unpublishedOnly && (range.tipSha === range.excludeSha || range.scanFloorShas?.includes(range.tipSha))) {
       return { trusted: false, why: "published_only", publishedOnly: true };
     }
-    const scan = await this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() });
+    const scan = await (options?.scanScope ?? ((fn) => fn()))(() =>
+      this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() }));
     if (!scan.trusted) return { trusted: false, why: scan.reason ?? "scan_untrusted" };
     return { trusted: true, range, findings: scan.findings, floorCandidates };
+  }
+
+  /** The published-only floor SHAs (40-hex) shared by every remediation scan and the floor classifier. */
+  private remediationFloorCandidates(flight: RunFlight): string[] {
+    return [
+      ...(flight.publishedRealTips ?? []),
+      flight.lastAttemptedCheckpointRefTip,
+      flight.publishedTip,
+      flight.lastCheckpointRefTip,
+    ].filter((f): f is string => typeof f === "string" && /^[0-9a-f]{40}$/.test(f));
+  }
+
+  /**
+   * Shared floor classifier for the done gate and the mid-run trigger. `at_floor` wins only when a
+   * finding is PROVEN an ancestor of a published floor (or of a local-only bridge `checkpointFloor`
+   * that is not a published tip) or has no 40-hex commit; `unknown` when no finding is proven at a
+   * floor but some ancestry could not be determined; otherwise `above`. The done gate maps
+   * `unknown` to at-floor (never ask for a rewrite of possibly published history).
+   */
+  private async classifyFindingFloors(
+    flight: RunFlight,
+    barePath: string,
+    findings: readonly SecretFinding[],
+    floorCandidates: readonly string[],
+  ): Promise<"above" | "at_floor" | "unknown"> {
+    let unknown = false;
+    for (const f of findings) {
+      if (typeof f.commit !== "string" || !/^[0-9a-f]{40}$/i.test(f.commit)) return "at_floor";
+      const findingCommit = f.commit.toLowerCase();
+      const floors = [...floorCandidates];
+      // A local-only bridge checkpoint floor (not a published tip) that already contains the finding:
+      // the finalize bridge re-adds it over any rewrite, so a remediation turn would be futile.
+      const localFloor = flight.checkpointFloor;
+      if (
+        typeof localFloor === "string" &&
+        !(flight.publishedRealTips ?? []).includes(localFloor) &&
+        localFloor !== flight.publishedTip
+      ) floors.push(localFloor);
+      for (const floor of floors) {
+        const rel = await this.git.ancestry(barePath, findingCommit, floor);
+        if (rel === "ancestor") return "at_floor";
+        if (rel !== "divergent") unknown = true;
+      }
+    }
+    return unknown ? "unknown" : "above";
+  }
+
+  /**
+   * Issue #4258: record a content-free pending mid-run trigger when a trusted mid-turn finding set is
+   * provably ABOVE every floor. Arms nothing on at-floor, unknown ancestry, overflow or any throw,
+   * and never throws.
+   */
+  private async noteMidRunTrigger(
+    flight: RunFlight,
+    barePath: string,
+    tip: string,
+    findings: readonly SecretFinding[],
+    scanScope?: <T>(fn: () => Promise<T>) => Promise<T>,
+  ): Promise<void> {
+    try {
+      const state = flight.secretRemediation;
+      if (!state || state.overflow) return;
+      if (findings.length === 0 || findings.some((f) => typeof f.commit !== "string" || !/^[0-9a-f]{40}$/i.test(f.commit))) return;
+      const verdict = await (scanScope ?? ((fn) => fn()))(() =>
+        this.classifyFindingFloors(flight, barePath, findings, this.remediationFloorCandidates(flight)));
+      if (verdict !== "above") return;
+      const seq = (state.midRunSeq ?? 0) + 1;
+      state.midRunSeq = seq;
+      state.midRunTrigger = { observation: seq, tip };
+    } catch (e) {
+      flight.runLog.warn("mid-run remediation trigger not armed", { run_id: flight.runId, error: errMessage(e) });
+    }
   }
 
   /** The same resolved floors protect model launch, successor admission and publication. */
@@ -20580,6 +20668,418 @@ export class RunRunner {
     return out;
   }
 
+  /** Issue #4258: per retained flagged commit, its ancestry against `tip` (tri-state, index-aligned). */
+  private async classifyFlaggedReachability(
+    state: NonNullable<RunFlight["secretRemediation"]>,
+    barePath: string,
+    tip: string,
+  ): Promise<Array<"ancestor" | "divergent" | "unknown">> {
+    const out: Array<"ancestor" | "divergent" | "unknown"> = [];
+    for (const commit of state.flaggedCommits ?? []) out.push(await this.git.ancestry(barePath, commit, tip));
+    return out;
+  }
+
+  /**
+   * Issue #4258 — the NON-TERMINAL mid-run consumer (`RunContext.midRunSecretRemediation`). Returns only
+   * proceed or remediate; never fail, and it never sets `blocked`, `known`, `everKnown` or `cleanTip`.
+   * It revalidates from scratch (fresh fetch-back, tip agreement, restriction certainty, fresh scan);
+   * the trigger's stored tip is never used. Anything uncertain DEFERS: the trigger is kept, no turn is given and no attempt
+   * is spent, and the done gate stays the authority. The seam runs under the owned `stop` scope of
+   * {@link runMidRunSecretRemediationScoped}: a cancel, claim fence or worker shutdown stops its git/gitleaks work,
+   * and an aborted seam defers ("aborted") with the trigger kept, no attempt spent and nothing emitted.
+   * If `persistRemediationScan` throws after the
+   * restrictions and flaggedCommits were recorded, that recorded state stays, which fails closed. Shares `attempts` with the done gate.
+   */
+  private async runMidRunSecretRemediation(
+    flight: RunFlight,
+    barePath: string | undefined,
+    runnerClone: RunnerClone,
+    stop: AbortSignal,
+    scopes: {
+      wait: AuthorityWait;
+      scanScope: <T>(fn: () => Promise<T>) => Promise<T>;
+      pathScope: <T>(fn: () => Promise<T>) => Promise<T>;
+    },
+  ): Promise<SecretRemediationDecision> {
+    const { runLog, runId } = flight;
+    const state = flight.secretRemediation;
+    const proceed = { action: "proceed" as const };
+    if (!state?.midRunTrigger || !barePath) return proceed;
+    const defer = (why: string): { action: "proceed" } => {
+      runLog.info("mid-run secret remediation deferred", { run_id: runId, why });
+      return proceed;
+    };
+    // A stopped seam never clears the trigger: the revalidation did not complete.
+    const clear = (): { action: "proceed" } => {
+      if (stop.aborted) return defer("aborted");
+      state.midRunTrigger = undefined;
+      return proceed;
+    };
+    if (state.blocked && state.blocked.length > 0) return clear();
+    const branch = runnerClone.branch;
+    try {
+      const fetched = await this.fetchBackBestEffort(barePath, runnerClone.path, branch, flight, runLog,
+        {}, undefined, scopes.wait);
+      const cloneTip = await this.git.branchTip(runnerClone.path, branch);
+      const trackTip = await this.git.trackingTip(barePath, branch);
+      if (fetched.kind === "refused") throw new PreservationRefusedError();
+      if (stop.aborted) return defer("aborted");
+      if (fetched.kind !== "updated" || cloneTip === null || trackTip === null || cloneTip !== trackTip) return defer("tracking_tip_stale");
+      const pending = flight.remediationRestrictions?.pending;
+      if (pending?.bindingUncertain || pending?.requireDenial) return defer("restriction_uncertain");
+      if (state.overflow) return defer("overflow");
+      const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip,
+        { unpublishedOnly: true, scanScope: scopes.scanScope });
+      // Record ONCE, straight after a trusted result and before any later await or stop return. A pending
+      // trigger is not a publication hold: checkpointRemediationHold reads only the recorded flagged commits,
+      // so a stop (or a deferring/clearing exit below) must not drop a trusted finding. This is negative
+      // knowledge only: no turn, no attempt, no trigger change, and none of known/blocked/everKnown/cleanTip.
+      if (scanned.trusted) this.recordFlaggedCommits(state, scanned.findings, runLog);
+      if (stop.aborted) return defer("aborted");
+      if (!scanned.trusted) return scanned.publishedOnly ? clear() : defer(scanned.why);
+      // A fresh finding the bounded list could not hold fails closed (overflow holds publication) and defers.
+      if (state.overflow) return defer("overflow");
+      const { range, floorCandidates } = scanned;
+      const reach = await this.classifyFlaggedReachability(state, barePath, cloneTip);
+      if (stop.aborted) return defer("aborted");
+      // Unknown retained ancestry authorizes no guidance and the trigger stays; the fresh findings were recorded above.
+      if (reach.includes("unknown")) return defer("flagged_ancestry_unknown");
+      const retained = state.flaggedFindings ?? [];
+      // Every fresh finding is kept as is (a commit adding two secret files yields two); only
+      // ancestor-reachable retained findings whose commit the fresh scan did not report are appended.
+      const findings: SecretFinding[] = [...scanned.findings];
+      const seen = new Set<string>();
+      for (const f of scanned.findings) if (typeof f.commit === "string") seen.add(f.commit.toLowerCase());
+      reach.forEach((r, i) => {
+        const f = retained[i];
+        if (r !== "ancestor" || !f) return;
+        const key = typeof f.commit === "string" ? f.commit.toLowerCase() : undefined;
+        if (key !== undefined) {
+          if (seen.has(key)) return;
+          seen.add(key);
+        }
+        findings.push(f);
+      });
+      if (findings.length === 0) return clear();
+      // The range's resolved floors (default-branch tip, scan floors, pack excludes) protect a finding here too.
+      const verdict = await this.classifyFindingFloors(flight, barePath, findings,
+        this.remediationRangeFloors(range, floorCandidates));
+      if (stop.aborted) return defer("aborted");
+      if (verdict === "unknown") return defer("floor_ancestry_unknown");
+      if (verdict === "at_floor") return clear();
+      if (state.attempts >= SECRET_REMEDIATION_MAX_ATTEMPTS) return clear();
+      await this.persistRemediationRestrictions(flight, barePath, branch, range.tipSha, findings, scopes.wait);
+      if (stop.aborted) return defer("aborted");
+      await this.persistRemediationScan(flight, barePath, branch, range.tipSha, findings, "pre-exit", scopes.wait);
+      if (stop.aborted) return defer("aborted");
+      const withholdPaths = await this.withholdPathsFor(findings, scopes.pathScope);
+      // No await separates this check from the attempt spend, the trigger clear and the emit below.
+      if (stop.aborted) return defer("aborted");
+      state.attempts++;
+      const floorSha =
+        flight.checkpointFloor &&
+        (flight.publishedRealTips ?? []).includes(flight.checkpointFloor) &&
+        range.scanFloorShas?.includes(flight.checkpointFloor)
+          ? flight.checkpointFloor
+          : range.excludeSha;
+      const renderOpts = { redact: flight.redactText, withholdPaths };
+      state.midRunTrigger = undefined;
+      flight.batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `mid-run checkpoint secret scan flagged ${findings.length} finding(s) (rule ${renderRuleIds(findings)}); returning to the lead to rewrite the commit (attempt ${state.attempts} of ${SECRET_REMEDIATION_MAX_ATTEMPTS})`,
+        },
+      });
+      runLog.info("mid-run checkpoint secret scan flagged commits above the checkpoint floor; returning to the lead", {
+        run_id: runId,
+        attempt: state.attempts,
+        findings: findings.slice(0, 20).map((f) => renderSecretFinding(f, renderOpts)),
+      });
+      return {
+        action: "remediate",
+        followUp: buildSecretRemediationFollowUp(findings, {
+          ...renderOpts,
+          floorSha,
+          attempt: state.attempts,
+          maxAttempts: SECRET_REMEDIATION_MAX_ATTEMPTS,
+          phase: "mid-run",
+        }),
+      };
+    } catch (e) {
+      if (e instanceof PreservationRefusedError) throw e;
+      if (stop.aborted) return defer("aborted");
+      if (isCheckpointBoundaryFailure(e)) throw e;
+      return defer(`threw: ${errMessage(e)}`);
+    }
+  }
+
+  /**
+   * Issue #4258: the owned process scope around {@link runMidRunSecretRemediation}, built like the
+   * mid-turn tick (startMidTurnTicker). A hard stop (cancel, claim fence, shutdown deadline) kills the
+   * seam's git/gitleaks children through `ac`; a soft stop (graceful lifecycle abort) is cooperative
+   * through `softAc`. Either one makes the revalidation defer ("aborted"). The caller holds the sink gate
+   * (runGatedSink), and this method returns only after every child exited and lock custody ran; when a
+   * child survived its SIGKILL it keeps waiting, still inside the gate, until the group is gone.
+   */
+  private async runMidRunSecretRemediationScoped(
+    flight: RunFlight,
+    barePath: string | undefined,
+    runnerClone: RunnerClone,
+  ): Promise<SecretRemediationDecision> {
+    const { runLog, batcher, runId } = flight;
+    const proceed = { action: "proceed" as const };
+    if (!flight.secretRemediation?.midRunTrigger || !barePath) return proceed;
+    const hooks = this.checkpointTestHooks;
+    const deferPre = (why: string): { action: "proceed" } => {
+      runLog.info("mid-run secret remediation deferred", { run_id: runId, why });
+      return proceed;
+    };
+    if (this.tickSurvivorsRemain(flight)) return deferPre("tick_process_survived");
+    if (await this.retainedBareLockRemains(flight)) return deferPre("bare_lock_retained");
+
+    const ac = new AbortController();
+    const softAc = new AbortController();
+    const stop = AbortSignal.any([ac.signal, softAc.signal]);
+    const steering = flight.steering;
+    const now = hooks?.absoluteNow ?? Date.now;
+    const neverStop = new AbortController().signal;
+    const classify = (): "hard" | "soft" | "none" => {
+      try {
+        checkCheckpointStop({ ...checkpointStopFields(steering, now), signal: neverStop });
+        return steering.lifecycleSignal().aborted ? "soft" : "none";
+      } catch {
+        return "hard";
+      }
+    };
+    const lifecycleSignal = steering.lifecycleSignal();
+    const terminalSignal = steering.terminalLifecycleSignal();
+    const authoritySignal = steering.checkpointAuthoritySignal();
+    const shutdownSignal = this.shutdownSignal.signal;
+    let shutdownAttached = false;
+    let cancelShutdownTimer: (() => void) | undefined;
+    const attachShutdown = (): void => {
+      if (shutdownAttached) return;
+      const shutdown = steering.workerShutdownCheckpoint();
+      if (!shutdown) return;
+      shutdownAttached = true;
+      cancelShutdownTimer = this.setTimer(() => ac.abort(), Math.max(0, shutdown.deadlineAt - now()));
+    };
+    const onEvent = (): void => {
+      attachShutdown();
+      const verdict = classify();
+      if (verdict === "hard") ac.abort();
+      else if (verdict === "soft") softAc.abort();
+    };
+    // The worker's own shutdown must bound the seam even when the steering classification reads "none".
+    const onShutdown = (): void => {
+      onEvent();
+      if (!stop.aborted) softAc.abort();
+    };
+    lifecycleSignal.addEventListener("abort", onEvent, { once: true });
+    terminalSignal.addEventListener("abort", onEvent, { once: true });
+    authoritySignal.addEventListener("abort", onEvent, { once: true });
+    shutdownSignal.addEventListener("abort", onShutdown, { once: true });
+    // Initial state: authoritySignal is sticky for the flight (a given-up credential switch leaves it
+    // aborted), so it counts only as an event, never as a standing stop.
+    attachShutdown();
+    if (terminalSignal.aborted || steering.isCancelled() || steering.claimFence() !== undefined) {
+      onEvent();
+      if (!stop.aborted) ac.abort();
+    } else if (lifecycleSignal.aborted || shutdownSignal.aborted) {
+      onShutdown();
+    }
+
+    const spawner = new TickSpawner({
+      signal: ac.signal,
+      barePath,
+      branch: runnerClone.branch,
+      log: runLog,
+      ...(hooks?.tickKillGraceMs !== undefined ? { killGraceMs: hooks.tickKillGraceMs } : {}),
+      ...(hooks?.tickSpawn ? { hooks: hooks.tickSpawn } : {}),
+    });
+    let survivedHere = false;
+    const recordSurvivors = (): void => {
+      const survivors = spawner.survivors();
+      if (survivors.length === 0) return;
+      survivedHere = true;
+      runLog.warn("mid-turn checkpoint: a tick process group survived its SIGKILL; blocking the sink", {
+        run_id: runId,
+        pgids: survivors.map((g) => g.pgid),
+      });
+      const wasBlocked = flight.retainedBareLocks.length > 0 || flight.survivingTickGroups.length > 0;
+      for (const g of survivors) {
+        if (!flight.survivingTickGroups.some((x) => x.pgid === g.pgid)) flight.survivingTickGroups.push(g);
+      }
+      if (!wasBlocked) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: "mid-turn checkpoint sink blocked: a checkpoint process survived being stopped" },
+        });
+      }
+    };
+    const blockSinkOnLocks = (paths: readonly string[]): void => {
+      if (paths.length === 0) return;
+      const wasBlocked = flight.retainedBareLocks.length > 0 || flight.survivingTickGroups.length > 0;
+      for (const p of paths) {
+        if (!flight.retainedBareLocks.includes(p)) flight.retainedBareLocks.push(p);
+      }
+      if (!wasBlocked) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: "mid-turn checkpoint sink blocked: a git lock file remains in the worker repository" },
+        });
+      }
+    };
+    const recordLocks = (res: { removed: string[]; retained: RetainedLock[] }): void => {
+      for (const p of res.removed) {
+        runLog.info("mid-turn checkpoint removed a lock file its cancelled child provably owned", { run_id: runId, path: p });
+      }
+      if (res.retained.length === 0) return;
+      runLog.warn("mid-turn checkpoint retained a git lock file in the worker bare", {
+        run_id: runId,
+        retained: res.retained.map((r) => ({
+          path: r.path,
+          dev: r.dev,
+          ino: r.ino,
+          size: r.size,
+          mtime_ms: r.mtimeMs,
+          pre_spawn: r.preSpawn,
+          reason: r.reason,
+          argv_class: r.argvClass,
+        })),
+      });
+      blockSinkOnLocks(res.retained.map((r) => r.path));
+    };
+    // The reconcile result was never obtained (not run, or it threw before returning): fail closed on every
+    // lock path that exists now. A reconcile that returned is recorded through recordLocks instead.
+    const recordUnreconciledLocks = async (): Promise<void> => {
+      const present: string[] = [];
+      try {
+        for (const p of await spawner.unreconciledLockCandidates()) {
+          // Only ENOENT proves absence; any other lstat failure (EACCES, EIO) may hide a live lock, so keep it.
+          if (await fs.lstat(p).then(() => true, (e: unknown) => (e as NodeJS.ErrnoException)?.code !== "ENOENT")) present.push(p);
+        }
+      } catch (e) {
+        runLog.warn("mid-run secret remediation could not list lock candidates", { run_id: runId, error: errMessage(e) });
+      }
+      blockSinkOnLocks(present);
+    };
+    // Settle + reconcile while the per-bare lock is still held, as the tick does.
+    const beforeLockRelease = async (key: string): Promise<void> => {
+      if (key !== barePath || !stop.aborted) return;
+      await spawner.settled();
+      recordSurvivors();
+      recordLocks(await spawner.reconcileLocks());
+    };
+    // A sub-scope aborted by the seam's stop and, for the range scan only, by the scan deadline.
+    const subScope = (deadlineMs?: number) =>
+      <T>(fn: () => Promise<T>): Promise<T> => {
+        const sub = new AbortController();
+        const onStop = (): void => sub.abort();
+        if (stop.aborted) sub.abort();
+        else stop.addEventListener("abort", onStop, { once: true });
+        const cancel = deadlineMs === undefined ? undefined : this.setTimer(() => sub.abort(), deadlineMs);
+        return this.git
+          .withBoundaryProcessSpawner(spawner.scoped(sub.signal), sub.signal, fn, { beforeLockRelease })
+          .finally(() => {
+            cancel?.();
+            stop.removeEventListener("abort", onStop);
+          });
+      };
+    const scopes = {
+      wait: { ...this.authorityWait(flight), signal: AbortSignal.any([this.retainedLifecycleSignal(flight), ac.signal]) },
+      scanScope: <T>(fn: () => Promise<T>): Promise<T> => subScope(this.scanDeadlineMs())(fn),
+      pathScope: <T>(fn: () => Promise<T>): Promise<T> => subScope()(fn),
+    };
+    try {
+      return await this.git.withBoundaryProcessSpawner(
+        spawner.spawn,
+        ac.signal,
+        () => this.runMidRunSecretRemediation(flight, barePath, runnerClone, stop, scopes),
+        { beforeLockRelease, softSignal: softAc.signal },
+      );
+    } catch (e) {
+      if (e instanceof PreservationRefusedError) throw e;
+      if (stop.aborted) return deferPre("aborted");
+      if (isCheckpointBoundaryFailure(e)) throw e;
+      return deferPre(`threw: ${errMessage(e)}`);
+    } finally {
+      cancelShutdownTimer?.();
+      lifecycleSignal.removeEventListener("abort", onEvent);
+      terminalSignal.removeEventListener("abort", onEvent);
+      authoritySignal.removeEventListener("abort", onEvent);
+      shutdownSignal.removeEventListener("abort", onShutdown);
+      // Full settlement before the gate is released: every child exited, then lock custody.
+      await spawner.settled();
+      recordSurvivors();
+      if (spawner.cancelledAny()) {
+        // Only the WAIT for the bare lock is bounded: the first act of the lock callback cancels the
+        // timer, so a started reconcile (fs-only) is never interrupted by it.
+        const waitAc = new AbortController();
+        const cancelWait = this.setTimer(() => waitAc.abort(), hooks?.midRunLockReconcileWaitMs ?? MID_RUN_LOCK_RECONCILE_WAIT_MS);
+        let acquired = false;
+        let res: { removed: string[]; retained: RetainedLock[] } | undefined;
+        let failure: unknown;
+        try {
+          res = await this.git.withRecoveryOperation(waitAc.signal, Infinity, () =>
+            this.git.withBareLock(barePath, async () => {
+              acquired = true;
+              cancelWait();
+              // Kept outside the wrappers: a rejection after this point (the lock's or the recovery
+              // operation's post-action interruption check) must not discard the recorded evidence.
+              res = await spawner.reconcileLocks();
+              return res;
+            }));
+        } catch (e) {
+          failure = e;
+        } finally {
+          cancelWait();
+        }
+        if (res) {
+          // The reconcile ran to completion; a later wrapper failure only needs to be reported.
+          if (failure !== undefined) {
+            runLog.warn("mid-turn checkpoint lock reconcile failed", {
+              run_id: runId, reconciled: true, error: errMessage(failure),
+            });
+          }
+          recordLocks(res);
+        } else if (!acquired && waitAc.signal.aborted) {
+          runLog.warn("mid-run secret remediation lock reconcile not run", {
+            run_id: runId, reconciled: false, reason: "lock_wait_timeout",
+          });
+          await recordUnreconciledLocks();
+        } else {
+          runLog.warn("mid-turn checkpoint lock reconcile failed", {
+            run_id: runId, reconciled: false, error: errMessage(failure),
+          });
+          await recordUnreconciledLocks();
+        }
+      }
+      // A surviving group may still be running: the seam does not return (and the sink gate stays
+      // held) until it is gone. Unbounded by design: each awaitTickSurvivorsGone round re-sends a
+      // checked SIGKILL and logs its own line; this seam adds one line per verdict change. Unlike
+      // other sinks it never proceeds on "stuck" or "unconfirmed".
+      if (survivedHere) {
+        let last: "stuck" | "unconfirmed" | undefined;
+        for (;;) {
+          const verdict = await this.awaitTickSurvivorsGone(flight);
+          if (verdict === "gone") break;
+          if (verdict !== last) {
+            last = verdict;
+            const log = verdict === "stuck" ? runLog.warn : runLog.error;
+            log.call(runLog, "mid-run secret remediation waiting for a surviving process group to exit", {
+              run_id: runId,
+              verdict,
+            });
+          }
+        }
+      }
+    }
+  }
+
   /**
    * issue #1932 D2 — the pre-exit secret remediation gate (`RunContext.secretRemediationGate`).
    * Called by the executor at the done point, BEFORE any done checkpoint. Credential-free only
@@ -20603,6 +21103,9 @@ export class RunRunner {
    *    push_secret_blocked
    *  - trusted, all findings above every floor, attempts < cap => remediate (attempts++)
    *  - trusted, findings above the floors, attempts == cap => blocked, fail
+   *
+   * Every call also clears a pending issue #4258 mid-run trigger (`state.midRunTrigger`): the
+   * done and resume gates own the decision from here, so no duplicate mid-run turn follows.
    */
   private async runSecretRemediationGate(
     flight: RunFlight,
@@ -20612,6 +21115,9 @@ export class RunRunner {
   ): Promise<SecretRemediationDecision> {
     const { runLog, runId } = flight;
     const state = (flight.secretRemediation ??= { attempts: 0 });
+    // Issue #4258: this gate (the done gate and the resume preflight) now owns the decision, so a
+    // pending mid-run trigger must not also produce a duplicate turn.
+    state.midRunTrigger = undefined;
     if (state.blocked && state.blocked.length > 0) return { action: "fail" };
     if (!barePath) return { action: "proceed" };
     const branch = runnerClone.branch;
@@ -20697,32 +21203,9 @@ export class RunRunner {
       const withholdPaths = await this.withholdPathsFor(findings);
       state.withholdPaths = withholdPaths;
       state.everKnown = true;
-      let atFloor = false;
-      for (const f of findings) {
-        let reachable = typeof f.commit !== "string" || !/^[0-9a-f]{40}$/i.test(f.commit);
-        const findingCommit = typeof f.commit === "string" ? f.commit.toLowerCase() : "";
-        for (const floor of floorCandidates) {
-          if (reachable) break;
-          // Tri-state: an "unknown" ancestry (a git error) counts as at-floor, the conservative
-          // answer: never ask for a rewrite of possibly published history.
-          reachable = (await this.git.ancestry(barePath, findingCommit, floor)) !== "divergent";
-        }
-        // A local-only bridge checkpoint floor (not a published tip) that already contains the finding:
-        // the finalize bridge re-adds it over any rewrite, so a remediation turn would be futile.
-        const localFloor = flight.checkpointFloor;
-        if (
-          !reachable &&
-          typeof localFloor === "string" &&
-          !(flight.publishedRealTips ?? []).includes(localFloor) &&
-          localFloor !== flight.publishedTip
-        ) {
-          reachable = (await this.git.ancestry(barePath, findingCommit, localFloor)) !== "divergent";
-        }
-        if (reachable) {
-          atFloor = true;
-          break;
-        }
-      }
+      // An "unknown" ancestry (a git error) counts as at-floor, the conservative answer: never ask
+      // for a rewrite of possibly published history.
+      const atFloor = (await this.classifyFindingFloors(flight, barePath, findings, floorCandidates)) !== "above";
       state.known = findings;
       if (atFloor) {
         // Not remediable (already reachable from a durable floor): no rewrite turn. `known` stays

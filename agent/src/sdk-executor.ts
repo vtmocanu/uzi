@@ -3521,6 +3521,23 @@ export class SdkExecutor implements Executor {
           // A switch/pause/wall arriving during the await still goes through the
           // ordinary turn's interruption checks before any model event.
         }
+        // Issue #4258: the advisory mid-run secret remediation seam, only at a boundary no control
+        // owns and no system text owns (a clarification answer or verdict text in followUp, which
+        // also covers a resume-preflight remediate just above, or a completion rework). The trigger
+        // stays pending for a later boundary otherwise. A terminal fence, sticky cancel or disk stop
+        // arriving during the await is stopped by the explicit post-await checks below; pause,
+        // wall, credential switch and shutdown are routed by the turn's own interruption checks
+        // before any model event. Remediate replaces this turn's prompt and adds no turn.
+        // An exhausted wall (armWall trips it before the next dispatch) must not spend an attempt
+        // on guidance no turn would carry.
+        if (!ctx.interactive && !state.tripReason && state.wallRemainingMs > 0 && followUp === undefined &&
+            !completionRework && ctx.midRunSecretRemediation) {
+          const decision = await ctx.midRunSecretRemediation();
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          throwIfDiskStop(ctx);
+          if (decision.action === "remediate") followUp = decision.followUp;
+        }
         const reworkForTurn = completionRework;
         completionRework = undefined;
         if (repeatingContract && reworkForTurn?.answered) drive.approvedContractSuperseded = true;

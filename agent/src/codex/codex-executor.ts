@@ -4564,6 +4564,23 @@ export class CodexExecutor implements Executor {
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
           if (decision?.action === "remediate") completionFollowUp = decision.followUp;
         }
+        // Issue #4258: the advisory mid-run secret remediation seam. Only at a boundary no
+        // interruption owns and no system text owns (a clarification answer, completion rework or
+        // code repair, which also covers a resume-preflight remediate just above); otherwise the
+        // trigger stays pending. A sticky cancel, terminal fence or terminal lifecycle signal
+        // (which a real worker shutdown also aborts) arriving during the await is stopped by the
+        // explicit post-await check below. Pause, wall and switch are routed by the turn's own
+        // interruption checks (driveCodexTurn's start-of-turn pendingInterruption check) before any
+        // model event. Remediate replaces this turn's prompt and adds no turn. The
+        // completion-contract guidance append below fires only when completionAnswered, so it
+        // does not apply here.
+        if (!ctx.interactive && clarificationPrompt === undefined && completionFollowUp === undefined &&
+            ctx.midRunSecretRemediation &&
+            this.pendingInterruption(ctx, pauseNow, wall) === undefined) {
+          const decision = await ctx.midRunSecretRemediation();
+          if (ctx.cancelRequested?.() || ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted) throw new Error(REASON_CANCEL);
+          if (decision.action === "remediate") completionFollowUp = decision.followUp;
+        }
         let systemFollowUp = clarificationPrompt ?? completionFollowUp;
         if (repeatingContract && completionAnswered) approvedContractSuperseded = true;
         if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {

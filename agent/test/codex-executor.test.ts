@@ -107,6 +107,7 @@ import * as m2Runner from "./runner-harness.js";
 import { followSuccessfulPush as m2FollowPush } from "./publication-fixture.js";
 import { shutdownContentProof } from "./shutdown-3101-content-fixture.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
+import { makeTickDriver, writeStallShim, type StallMode } from "./stall-gitleaks-shim.js";
 import { closingDirectiveFor as m2ClosingDirective } from "../src/pr-description.js";
 import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
@@ -18438,6 +18439,326 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
     }
   }
 
+  // Issue #4258 m2: the advisory, non-terminal mid-run seam ctx.midRunSecretRemediation. It is called
+  // only at an admitted work-turn boundary: not interactive, no interruption pending, no system text
+  // (clarification answer, completion rework, code repair, resume preflight) owning the turn.
+  // Codex has no credential-switch seam (no onCredentialSwitch), so the controls honoured at the
+  // boundary are cancel, shutdown (a plain signal abort), owner pause-now and wall.
+  describe("mid-run secret remediation seam (issue #4258)", () => {
+    const MID = "MIDRUN-REMEDIATE-MARKER: rewrite the flagged commit";
+    const work: TurnScript = () => [agentMessage("working")];
+    const finish: TurnScript = (th, tn) => [done(91, th, tn)];
+    const sentOf = (rig: ReturnType<typeof makeMultiEpochRig>): string[] => rig.epochs.flatMap(epoch => turnTexts(epoch.transport));
+    /** Stays `proceed` until a work turn was dispatched (a latched trigger), then remediates `times` times. */
+    const midSeam = (rig: ReturnType<typeof makeMultiEpochRig>, times = 1) => {
+      const seenAt: number[] = [];
+      let left = times;
+      return {
+        seenAt,
+        seam: async (): Promise<SecretRemediationDecision> => {
+          const sent = sentOf(rig).length;
+          seenAt.push(sent);
+          if (sent >= 1 && left > 0) { left--; return { action: "remediate", followUp: MID }; }
+          return { action: "proceed" };
+        },
+      };
+    };
+    const base = { kind: "issue" as const, config: { max_iterations: 8 } };
+
+    it("remediate owns exactly the next boundary's turn without signal_done; the first boundary only asks", async () => {
+      const rig = makeMultiEpochRig([script("th-1", [work, work, finish])]);
+      const mid = midSeam(rig);
+      const { ctx } = makeCtx({ ...base, midRunSecretRemediation: mid.seam });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#4258 remediate");
+      const texts = sentOf(rig);
+      assert.equal(texts.length, 3, "no extra turn");
+      assert.equal(texts[0]!.includes(MID), false);
+      assert.equal(texts[1]!.includes(MID), true);
+      assert.equal(texts[2]!.includes(MID), false);
+      assert.equal(mid.seenAt[0], 0);
+    });
+
+    it("an owner follow-up queued at that boundary rides the following turn, receipt after it", async () => {
+      const rig = makeMultiEpochRig([script("th-1", [work, work, finish])]);
+      const mid = midSeam(rig);
+      const OWNER = "OWNER-FOLLOWUP-MARKER-4258";
+      let pulled = false;
+      const included: number[] = [];
+      const sentAtReceipt: number[] = [];
+      const { ctx } = makeCtx({
+        ...base, midRunSecretRemediation: mid.seam,
+        pullFollowUps: () => (sentOf(rig).length >= 1 && !pulled ? (pulled = true, [{ id: 7, body: OWNER }]) : []),
+        followUpIncluded: id => { included.push(id); sentAtReceipt.push(sentOf(rig).length); },
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#4258 owner follow-up");
+      const texts = sentOf(rig);
+      assert.equal(texts.length, 3);
+      assert.ok(texts[1]!.includes(MID) && !texts[1]!.includes(OWNER), "system guidance owns its turn; the follow-up waits");
+      assert.ok(texts[2]!.includes(OWNER));
+      assert.deepEqual(included, [7]);
+      assert.deepEqual(sentAtReceipt, [3]);
+    });
+
+    it("proceed leaves every prompt identical to a run without the seam", async () => {
+      const plain = makeMultiEpochRig([script("th-1", [work, work, finish])]);
+      await withTimeout(makeExecutor(plain, bindingOf(SUBSCRIPTION)).run(makeCtx(base).ctx), 5000, "#4258 plain");
+      const rig = makeMultiEpochRig([script("th-1", [work, work, finish])]);
+      let calls = 0;
+      const { ctx } = makeCtx({ ...base, midRunSecretRemediation: async () => { calls++; return { action: "proceed" }; } });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#4258 proceed");
+      assert.ok(calls >= 2);
+      assert.deepEqual(sentOf(rig), sentOf(plain));
+    });
+
+    it("an interactive run never calls the seam", async () => {
+      const rig = makeMultiEpochRig([script("th-1", [work, finish])]);
+      let calls = 0;
+      const { ctx } = makeCtx({ ...base, interactive: true, midRunSecretRemediation: async () => { calls++; return { action: "remediate", followUp: MID }; } });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#4258 interactive");
+      assert.equal(calls, 0);
+      assert.ok(sentOf(rig).every(text => !text.includes(MID)));
+      const control = makeMultiEpochRig([script("th-1", [work, finish])]);
+      let controlCalls = 0;
+      await withTimeout(makeExecutor(control, bindingOf(SUBSCRIPTION)).run(makeCtx({
+        ...base, midRunSecretRemediation: async () => { controlCalls++; return { action: "proceed" }; },
+      }).ctx), 5000, "#4258 interactive control");
+      assert.ok(controlCalls >= 1, "control: the same shape non-interactively consults the seam");
+    });
+
+    type Control = "cancel" | "shutdown" | "pause" | "wall";
+    function controlRig(control: Control): { overrides: Partial<RunContext>; fire: () => void } {
+      const abort = new AbortController();
+      let cancelled = false;
+      let mode: "now" | "wall" | null = null;
+      let interrupt: (() => void) | undefined;
+      return {
+        overrides: {
+          signal: abort.signal,
+          cancelRequested: () => cancelled,
+          pauseModeRequested: () => mode,
+          onPauseNow: cb => { interrupt = cb; },
+          parkForPause: async () => true,
+          parkForWall: async () => "parked",
+        },
+        fire: () => {
+          if (control === "cancel") { cancelled = true; abort.abort(new Error("cancel")); }
+          else if (control === "shutdown") abort.abort(new Error("shutdown"));
+          else if (control === "pause") { mode = "now"; assert.ok(interrupt); interrupt(); }
+          else { mode = "wall"; abort.abort(new PauseNowSignal()); }
+        },
+      };
+    }
+    const settle = async (control: Control, running: Promise<unknown>): Promise<void> => {
+      if (control === "cancel" || control === "shutdown") await assert.rejects(running, /cancel|shutdown/i);
+      else {
+        const result = await running as { walled?: unknown; pausedAt?: unknown };
+        assert.ok(control === "wall" ? result.walled : result.pausedAt);
+      }
+    };
+    for (const control of ["cancel", "shutdown", "pause", "wall"] as const) {
+      it(`${control} pending at the boundary is honoured and the seam is not called there`, async () => {
+        const rig = makeMultiEpochRig([script("th-1", [work, work, finish])]);
+        const ctl = controlRig(control);
+        let reports = 0;
+        let before = 0;
+        const after: number[] = [];
+        const { ctx } = makeCtx({
+          ...base, ...ctl.overrides,
+          reportIteration: async () => { if (++reports === 2) ctl.fire(); return { completionAttempts: 0 }; },
+          midRunSecretRemediation: async () => {
+            if (reports >= 2) after.push(sentOf(rig).length); else before++;
+            return sentOf(rig).length >= 1 ? { action: "remediate", followUp: MID } : { action: "proceed" };
+          },
+        });
+        await settle(control, withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `#4258 ${control}`));
+        assert.ok(before >= 1, "control: the seam is consulted at an uncontrolled boundary");
+        assert.deepEqual(after, []);
+        assert.ok(sentOf(rig).every(text => !text.includes(MID)));
+      });
+
+      it(`${control} arriving during the seam's await wins before any model event`, async () => {
+        const rig = makeMultiEpochRig([script("th-1", [work, work, finish])]);
+        const ctl = controlRig(control);
+        let entered!: () => void;
+        const inSeam = new Promise<void>(resolve => { entered = resolve; });
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        const { ctx } = makeCtx({
+          ...base, ...ctl.overrides,
+          midRunSecretRemediation: async () => {
+            if (sentOf(rig).length === 0) return { action: "proceed" };
+            entered();
+            await gate;
+            return { action: "remediate", followUp: MID };
+          },
+        });
+        const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `#4258 ${control} in await`);
+        await Promise.race([inSeam, running.then(() => assert.fail("the seam was never called"), () => assert.fail("the seam was never called"))]);
+        ctl.fire();
+        release();
+        await settle(control, running);
+        assert.equal(sentOf(rig).length, 1, "only the first work turn ran");
+        assert.ok(sentOf(rig).every(text => !text.includes(MID)));
+      });
+    }
+
+    for (const decision of [{ action: "remediate", followUp: MID }, { action: "proceed" }] as SecretRemediationDecision[]) {
+    it(`a sticky cancel flipped only during the seam's await (${decision.action}) stops the run before any turn or follow-up pull`, async () => {
+      const rig = makeMultiEpochRig([script("th-1", [work, work, finish])]);
+      let cancelled = false;
+      let pullsAfter = 0;
+      let entered!: () => void;
+      const inSeam = new Promise<void>(resolve => { entered = resolve; });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const { ctx } = makeCtx({
+        ...base,
+        cancelRequested: () => cancelled,
+        pullFollowUps: () => { if (cancelled) pullsAfter++; return []; },
+        midRunSecretRemediation: async () => {
+          if (sentOf(rig).length === 0) return { action: "proceed" };
+          entered();
+          await gate;
+          return decision;
+        },
+      });
+      const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#4258 sticky cancel in await");
+      const settled = running.then(() => undefined, () => undefined);
+      await Promise.race([inSeam, settled.then(() => assert.fail("the seam was never called"))]);
+      cancelled = true; // sticky flag only: the signal is never aborted
+      release();
+      await assert.rejects(running, /cancel/i);
+      assert.equal(sentOf(rig).length, 1, "only the first work turn ran");
+      assert.ok(sentOf(rig).every(text => !text.includes(MID)));
+      assert.equal(pullsAfter, 0, "the owner follow-up queue is untouched after the cancel");
+    });
+    }
+
+    const terminalCases: Array<{ name: string; wire: () => { during: () => void; overrides: Partial<RunContext> } }> = [
+      {
+        name: "a terminal fence",
+        wire: () => { let fenced = false; return { during: () => { fenced = true; }, overrides: { claimFenced: () => fenced } }; },
+      },
+      {
+        name: "a terminal lifecycle signal",
+        wire: () => {
+          const lifecycle = new AbortController();
+          return { during: () => lifecycle.abort(new Error("terminal")), overrides: { terminalLifecycleSignal: lifecycle.signal } };
+        },
+      },
+    ];
+    for (const stop of terminalCases) {
+      for (const decision of [{ action: "remediate", followUp: MID }, { action: "proceed" }] as SecretRemediationDecision[]) {
+        it(`${stop.name} arriving during the seam's await (${decision.action}) stops the run before any further turn or follow-up pull`, async () => {
+          const rig = makeMultiEpochRig([script("th-1", [work, work, finish])]);
+          const wired = stop.wire();
+          let fired = false;
+          let pullsAfter = 0;
+          let entered!: () => void;
+          const inSeam = new Promise<void>(resolve => { entered = resolve; });
+          let release!: () => void;
+          const gate = new Promise<void>(resolve => { release = resolve; });
+          const { ctx } = makeCtx({
+            ...base, ...wired.overrides,
+            pullFollowUps: () => { if (fired) pullsAfter++; return []; },
+            midRunSecretRemediation: async () => {
+              if (sentOf(rig).length === 0) return { action: "proceed" };
+              entered();
+              await gate;
+              return decision;
+            },
+          });
+          const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `#4258 ${stop.name} in await`);
+          const settled = running.then(() => undefined, () => undefined);
+          await Promise.race([inSeam, settled.then(() => assert.fail("the seam was never called"))]);
+          fired = true;
+          wired.during();
+          release();
+          await assert.rejects(running);
+          assert.equal(sentOf(rig).length, 1, "only the first work turn ran");
+          assert.ok(sentOf(rig).every(text => !text.includes(MID)));
+          assert.equal(pullsAfter, 0, "the owner follow-up queue is untouched after the stop");
+        });
+      }
+    }
+
+    const askTurn: TurnScript = (th, tn) => [toolCall(21, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, "c-ask-21")];
+    const owners: Array<{ name: string; epochs: (rig?: never) => Responder[]; ctx: () => Partial<RunContext>; marker?: string }> = [
+      {
+        name: "a clarification answer",
+        epochs: () => [script("th-1", [askTurn, work, work, finish])],
+        ctx: () => ({ askUser: async () => ({ kind: "answer", answers: ["CLARIFY-ANSWER-MARKER"] }) }),
+        marker: "CLARIFY-ANSWER-MARKER",
+      },
+      {
+        // The ask turn also checkpoints, so the loop-top boundary carries clarificationPrompt.
+        name: "a checkpointed clarification answer",
+        epochs: () => [
+          script("th-1", [(th, tn, n) => [toolCall(20, "checkpoint", {}, th, tn, "c-cp-20"), ...askTurn(th, tn, n)]]),
+          script("th-1", [work, work, finish]),
+        ],
+        ctx: () => ({
+          checkpoint: async () => {},
+          askUser: async () => ({ kind: "answer", answers: ["CLARIFY-CKPT-MARKER"] }),
+        }),
+        marker: "CLARIFY-CKPT-MARKER",
+      },
+      {
+        name: "a completion rework",
+        epochs: () => [script("th-1", [finish]), script("th-1", [work, work, finish])],
+        ctx: () => {
+          let attempts = 0;
+          return {
+            completionInterlock: true, checkpoint: async () => {},
+            recordCompletionAttempt: async () => ({ unmet: ++attempts === 1 ? ["M1"] : [], attemptCount: attempts }),
+          };
+        },
+      },
+      {
+        name: "a code-repair follow-up",
+        epochs: () => [script("th-1", [finish]), script("th-1", [work, work, finish])],
+        ctx: () => {
+          let checks = 0;
+          return { codeCrossCheckGate: async () => (++checks === 1 ? { action: "repair" as const, followUp: "REPAIR-MARKER-4258" } : { action: "proceed" as const }) };
+        },
+        marker: "REPAIR-MARKER-4258",
+      },
+    ];
+    for (const owner of owners) {
+      it(`${owner.name} owns the turn, the seam is not called that boundary, and the trigger stays pending`, async () => {
+        const rig = makeMultiEpochRig(owner.epochs());
+        const mid = midSeam(rig);
+        const { ctx } = makeCtx({ ...base, ...owner.ctx(), midRunSecretRemediation: mid.seam });
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `#4258 ${owner.name}`);
+        const texts = sentOf(rig);
+        if (owner.marker) assert.ok(texts[1]!.includes(owner.marker), "the system text owns the first boundary's turn");
+        assert.equal(texts[1]!.includes(MID), false);
+        assert.equal(mid.seenAt.includes(1), false, "not called at the boundary the text owns");
+        assert.ok(mid.seenAt.includes(2), "the pending trigger is consumed at the next free boundary");
+        assert.equal(texts[2]!.includes(MID), true);
+      });
+    }
+
+    it("a resume preflight remediate at the same boundary suppresses the mid-run call there only", async () => {
+      const rig = makeMultiEpochRig([script("th-1", [work, work])]);
+      const PRE = "PREFLIGHT-REMEDIATE-MARKER";
+      const seenAt: number[] = [];
+      const { ctx } = makeCtx({
+        kind: "issue", resumed: true, sessionId: null,
+        config: { max_iterations: 2, iteration_park_version: 1 },
+        reportIteration: async () => ({ completionAttempts: 0 }), parkForIteration: async () => "parked",
+        secretRemediationGate: async () => ({ action: "remediate", followUp: PRE }),
+        midRunSecretRemediation: async () => { seenAt.push(sentOf(rig).length); return { action: "remediate", followUp: MID }; },
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#4258 preflight");
+      const texts = sentOf(rig);
+      assert.equal(texts.length, 2);
+      assert.ok(texts[0]!.includes(PRE) && !texts[0]!.includes(MID));
+      assert.deepEqual(seenAt, [1]);
+      assert.ok(texts[1]!.includes(MID));
+    });
+  });
+
   for (const interlocked of [false, true]) {
     it(`code repair recreates epoch with persisted session before both done paths: ${interlocked}`, async () => {
       const rig = makeMultiEpochRig([
@@ -30656,4 +30977,213 @@ it("policy initial planning refuses a backlog that could exclude the latest Resu
     assert.equal(rig.transport.turnStartCount, 0, "do not plan from a prefix that may omit the latest correction");
     assert.deepEqual(included, [], "overflow is never acknowledged as model inclusion");
   }
+});
+
+// ── issue #4258 — the scoped mid-run seam under the real CodexExecutor ───────────────────────────
+//
+// A real CodexExecutor (fake provider transport) inside a real RunRunner. A tick arms the mid-run
+// trigger, then the executor's first work-turn boundary runs the REAL seam: against a stalled gitleaks
+// child a cancel or a worker shutdown must return it promptly (proceed), kill the child, and leave the
+// executor on its own stop route with no provider turn and no rewrite guidance. The remediate control
+// proves the same scope opens and returns the guidance under Codex.
+describe("issue #4258 real CodexExecutor + RunRunner over the scoped seam", { skip: NEEDS_PROCFS }, () => {
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+  const GUIDANCE = /not published yet, so publication of your work is withheld/;
+  const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const groupAlive = (pid: number): boolean => { try { process.kill(-pid, 0); return true; } catch { return false; } };
+  const killAll = (pids: number[]): void => {
+    for (const pid of pids) for (const t of [-pid, pid]) { try { process.kill(t, "SIGKILL"); } catch { /* gone */ } }
+  };
+  const bounded = <T>(p: Promise<T>, ms: number, label: string): Promise<T> => withTimeout(p, ms, label);
+  const waitUntil = async (pred: () => boolean, ms: number, label: string): Promise<void> => {
+    const end = Date.now() + ms;
+    while (!pred()) {
+      if (Date.now() > end) throw new Error(`${label} did not happen within ${ms}ms`);
+      await new Promise(r => setTimeout(r, 10));
+    }
+  };
+  // A multi-turn scripted provider: turn N pushes turns[N-1]'s frames, then completes.
+  const scriptTurns = (th: string, turns: Array<(th: string, tn: string) => CodexNotification[]>): Responder => (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "turn/start") {
+      const tn = `tn-${th}-${c.turnStartCount}`;
+      if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      for (const note of turns[Math.min(c.turnStartCount, turns.length) - 1]?.(th, tn) ?? []) c.transport.push(note);
+      c.transport.push(turnCompleted("completed", th, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  /** Every dispatched implementation turn's prompt (the plan turn runs in the first epoch). */
+  const turnTexts = (rig: MultiRig): string[] => rig.epochs.flatMap(e => e.transport.requests
+    .filter(r => r.method === "turn/start")
+    .map(r => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "")).slice(1);
+
+  type Scenario = { stage: "range" | "path"; stop: "cancel" | "shutdown" } | { stage: "remediate" };
+
+  async function harness(iid: number, sc: Scenario) {
+    await fs.mkdir(path.resolve("../.uzi/scratch"), { recursive: true });
+    const scratch = await fs.mkdtemp(path.resolve("../.uzi/scratch/4258-codex-"));
+    const stall = writeStallShim(scratch);
+    const drv = makeTickDriver({ scanDeadlineMs: 60_000 });
+    const api = new FakeApi("codex-4258");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const { logger, lines } = recordingLogger();
+    const client = new WorkerClient(url, "codex-4258", "test", logger, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+    client.protocolFeatures = ["run_checkpoint_durability"];
+    const tips: string[] = [];
+    client.publishCheckpoint = async (_run, tip, pack) => {
+      for await (const _chunk of pack) { /* drain */ }
+      tips.push(tip);
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/test" } };
+    };
+    const plan = (th: string, tn: string) => [toolCall(800, "submit_plan", { plan_md: "# Plan\n- do it",
+      milestones: [{ id: "m1", title: "Milestone 1" }] }, th, tn, "plan-1")];
+    const finish = (th: string, tn: string) => [signalDone(th, tn)];
+    const rig = makeMultiEpochRig([scriptTurns("th-1", [plan]), scriptTurns("th-1", [finish, finish, finish])]);
+    const launchEffect = rig.deps.launchEffectRoot!;
+    rig.deps = { ...rig.deps, boundaryDeadlineMs: 60_000,
+      launchEffectRoot: async (spec, deadline) => {
+        const handle = await launchEffect(spec, deadline);
+        const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+          ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+        if (argv[0] !== "/usr/bin/git" && argv[0] !== "/usr/local/bin/gitleaks") return handle;
+        const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+        const timer = setTimeout(() => child.kill(), deadline);
+        const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+          child.once("error", error => { clearTimeout(timer); reject(error); });
+          child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+        });
+        return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+          waitChild: async () => exited, dispose: async ms => { await exited; return handle.dispose(ms); } };
+      } };
+    const claim = makeClaim({
+      issue_iid: iid,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      auto_approve: true,
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+    });
+    const executor = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION), logger);
+    const decisions: SecretRemediationDecision[] = [];
+    const armed = (() => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; })();
+    let calls = 0;
+    const mode: StallMode = sc.stage === "range" ? "stall-git" : sc.stage === "path" ? "stall-stdin" : "pass";
+    const run = executor.run.bind(executor);
+    executor.run = async ctx => {
+      const orig = ctx.midRunSecretRemediation!;
+      ctx.midRunSecretRemediation = async () => {
+        // The first boundary: a committed secret and one tick arm the trigger, then the seam runs.
+        if (++calls === 1) {
+          const wt = ctx.worktreePath;
+          await fs.writeFile(path.join(wt, "cfg.env"), "TOKEN=" + "gh" + "p_" + randomUUID().replace(/-/g, "") + "abcd\n");
+          for (const args of [["add", "-A"], [...IDENT, "commit", "-m", "work cfg.env"]]) {
+            const r = spawnSync("/usr/bin/git", ["-C", wt, ...args], { encoding: "utf8" });
+            assert.equal(r.status, 0, r.stderr);
+          }
+          assert.equal(await bounded(drv.fire(), 20_000, "the arming tick"), "secret_found");
+          stall.setMode(mode);
+        }
+        armed.resolve();
+        const d = await orig();
+        decisions.push(d);
+        return d;
+      };
+      return run(ctx);
+    };
+    const git = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions({ gitleaksBin: stall.bin }));
+    const runner = new RunRunner(client, git, () => ({ executor, homeDir: path.join(fx.dataDir, "4258-home") }), logger, 20, undefined, {
+      pollMs: 5, recoveryRetryMs: 5, gitlab: fakeGitlab().gitlab, ...drv.options,
+      quiesceRun: async () => ({
+        process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+        docker: { state: "not_wired", removed: [], detail: "not wired" },
+      }),
+    });
+    let flight: { survivingTickGroups: unknown[]; secretRemediation?: { attempts: number; midRunTrigger?: unknown }; sinkGate: { isHeld(): boolean } } | undefined;
+    const internals = runner as unknown as { scanCheckpointForPublish: (f: never, ...rest: unknown[]) => Promise<unknown> };
+    const origScan = internals.scanCheckpointForPublish.bind(runner);
+    internals.scanCheckpointForPublish = (f, ...rest) => { flight = f; return origScan(f, ...rest); };
+    const stopRun = (): void => {
+      if (sc.stage === "remediate") return;
+      if (sc.stop === "cancel") api.appendInputs(claim.run_id, [{ id: 4258, kind: "cancel" }]);
+      else runner.shutdown();
+    };
+    const cleanup = async (execution?: Promise<unknown>): Promise<void> => {
+      try {
+        stall.setMode("pass");
+        killAll([...stall.pids(), ...drv.pids]);
+        runner.shutdown();
+        if (execution) await bounded(execution.catch(() => undefined), 20_000, "run cleanup");
+      } finally {
+        killAll([...stall.pids(), ...drv.pids]);
+        await api.close();
+        fx.cleanup();
+        await fs.rm(scratch, { recursive: true, force: true });
+      }
+    };
+    return { api, claim, runner, stall, decisions, armed, lines, rig, tips, stopRun, cleanup, flight: () => flight!, drv };
+  }
+
+  for (const stage of ["range", "path"] as const) {
+    for (const stop of ["cancel", "shutdown"] as const) {
+      it(`${stage} scan stalled, then ${stop}: the seam returns proceed, the child is gone and the run takes its stop route`, { timeout: 90_000 }, async () => {
+        const h = await harness(4258_300 + (stage === "range" ? 0 : 10) + (stop === "cancel" ? 0 : 1), { stage, stop });
+        let execution: Promise<unknown> | undefined;
+        try {
+          execution = h.runner.execute(h.claim);
+          const settled = execution.then(() => undefined, (e: unknown) => e);
+          await bounded(Promise.race([waitUntil(() => h.stall.pids().length > 0, 40_000, "the seam's scan child to stall"),
+            settled.then(e => { throw new Error("run ended before the seam stalled: " + String(e) + h.lines.map(l => JSON.stringify(l)).join("\n")); })]), 45_000, "stall");
+          const pids = h.stall.pids();
+          assert.equal(h.decisions.length, 0, "the seam is still waiting on the stalled scan");
+          const t0 = Date.now();
+          h.stopRun();
+          const outcome = await bounded(settled, 20_000, "execute() settling after the stop");
+          assert.equal(outcome, undefined, `execute() resolved normally after the ${stop}, not with a rejection`);
+          assert.ok(Date.now() - t0 < 10_000, `the run settled ${Date.now() - t0}ms after the stop`);
+          assert.deepEqual(h.decisions, [{ action: "proceed" }]);
+          for (const pid of pids) {
+            assert.equal(alive(pid), false, `scan child ${pid} exited`);
+            assert.equal(groupAlive(pid), false, `scan child group ${pid} is gone`);
+          }
+          assert.deepEqual(h.flight().survivingTickGroups, []);
+          assert.ok(h.flight().secretRemediation?.midRunTrigger, "the trigger is kept");
+          assert.equal(h.flight().secretRemediation?.attempts, 0);
+          assert.equal(h.flight().sinkGate.isHeld(), false);
+          assert.deepEqual(turnTexts(h.rig), [], "no provider turn was dispatched, so no guidance was prompted");
+          assert.deepEqual(h.api.messages(h.claim.run_id).filter(m => m.kind === "status" && /returning to the lead/.test(String(m.payload.text))), []);
+          assert.ok(h.lines.some(l => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred" && (l as Record<string, unknown>).why === "aborted"));
+          const end = h.api.states.map(x => x.body).at(-1);
+          if (stop === "cancel") {
+            assert.equal(end?.status, "failed");
+            assert.equal(end?.failure_reason, "run cancelled", "the executor's cancel route");
+          } else {
+            assert.ok(!h.api.states.some(x => x.body.status === "failed" || x.body.status === "completed"), "a worker shutdown leaves the run non-terminal for recovery");
+          }
+        } finally {
+          await h.cleanup(execution);
+        }
+      });
+    }
+  }
+
+  it("control, no stop: the scope opens under Codex, the seam returns remediate and the next turn prompt carries the guidance", { timeout: 90_000 }, async () => {
+    const h = await harness(4258_330, { stage: "remediate" });
+    let execution: Promise<unknown> | undefined;
+    try {
+      execution = h.runner.execute(h.claim);
+      await bounded(execution.catch(() => undefined), 60_000, "the run ending");
+      assert.equal(h.decisions[0]?.action, "remediate");
+      const first = h.decisions[0]!;
+      if (first.action !== "remediate") return;
+      assert.match(first.followUp, GUIDANCE);
+      assert.match(first.followUp, /attempt 1 of 2/);
+      assert.equal(h.stall.pids().length, 0, "nothing stalled");
+      const texts = turnTexts(h.rig);
+      assert.match(texts[0] ?? "", GUIDANCE, "the guidance replaced the first turn's prompt");
+      assert.ok(h.lines.some(l => (l as Record<string, unknown>).msg === "mid-run checkpoint secret scan flagged commits above the checkpoint floor; returning to the lead"));
+    } finally {
+      await h.cleanup(execution);
+    }
+  });
 });
