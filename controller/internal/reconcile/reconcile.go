@@ -134,7 +134,11 @@ type ObservedWorker struct {
 	// shutdown evidence). Read only by the hibernation wake hold; zero (unset) means
 	// "every pod holds the wake", which fails closed.
 	StoppedPodCount int
-	ReadyPodUID     string
+	// StoppedPodUIDs is the set of pod uids for which podStopped holds (PRD #4206): the
+	// per-pod form of StoppedPodCount, read only by the hibernation cleaning stop proof.
+	// Nil means no pod is proven stopped.
+	StoppedPodUIDs map[string]bool
+	ReadyPodUID    string
 	// Hibernation evidence (PRD #4205), all read fresh each tick: nothing about a
 	// hibernation step is remembered across ticks.
 	//
@@ -430,10 +434,10 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 	// A worker that is preparing to hibernate or is hibernated has no pod on purpose;
 	// a roll-health row for it (even the synthetic rolling-gap one below) would show a
 	// deliberately parked worker as an upgrade in progress. Mark it reported so neither
-	// loop emits a row. A waking worker is reported normally: its pod is genuinely
+	// loop emits a row. A cleaning worker (an unsettled cache prune attempt) is held the same way. A waking worker is reported normally: its pod is genuinely
 	// on its way.
 	for _, w := range desired {
-		if h := w.Hibernation; h != nil && (h.State == protocol.HibernationPreparing || h.State == protocol.HibernationHibernated) {
+		if h := w.Hibernation; h != nil && (h.State == protocol.HibernationPreparing || h.State == protocol.HibernationHibernated || h.State == protocol.HibernationCleaning) {
 			reported[w.ID] = true
 		}
 	}

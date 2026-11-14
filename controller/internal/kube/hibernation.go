@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"sync/atomic"
@@ -106,6 +107,7 @@ func applyPodEvidence(o *reconcile.ObservedWorker, pods []corev1.Pod) {
 	o.StoppedPodCount = 0
 	o.ReadyPodUID, o.LivePodUID = "", ""
 	o.WorkerPodUIDs = nil
+	o.StoppedPodUIDs = nil
 	for _, p := range pods {
 		if p.UID != "" {
 			o.WorkerPodUIDs = append(o.WorkerPodUIDs, string(p.UID))
@@ -114,6 +116,12 @@ func applyPodEvidence(o *reconcile.ObservedWorker, pods []corev1.Pod) {
 			o.TerminalPodCount++
 			if podStopped(p) {
 				o.StoppedPodCount++
+				if p.UID != "" {
+					if o.StoppedPodUIDs == nil {
+						o.StoppedPodUIDs = map[string]bool{}
+					}
+					o.StoppedPodUIDs[string(p.UID)] = true
+				}
 			}
 			continue
 		}
@@ -215,6 +223,8 @@ func (m *Materializer) reconcileHibernation(ctx context.Context, w protocol.Desi
 		return m.hibernateHold(ctx, w, obs, ns, spec)
 	case protocol.HibernationWaking:
 		return m.hibernateWake(ctx, w, obs, ns, spec)
+	case protocol.HibernationCleaning:
+		return m.hibernateCleaning(ctx, w, obs)
 	default:
 		m.log.Warn("unknown hibernation state; doing nothing (fail closed)", "worker_id", w.ID, "state", h.State)
 		return nil
@@ -512,4 +522,55 @@ func (m *Materializer) hibernateWake(ctx context.Context, w protocol.DesiredWork
 		OpID: op, Transition: protocol.TransitionReady,
 		DeploymentUID: obs.DeploymentUID, ResourceVersion: obs.DeploymentResourceVersion, PodUID: obs.ReadyPodUID,
 	})
+}
+
+// cleanupReportKey is the in-memory record of the last cleanup_stopped this process sent
+// for a worker: one per (cleanup op, reconcile seq). A restart may resend once; the api
+// treats a repeat as idempotent or a 409.
+type cleanupReportKey struct {
+	cleanupOp string
+	seq       int32
+}
+
+// hibernateCleaning handles a worker whose hibernation cache prune attempt is unsettled
+// (PRD #4206). It writes nothing to the cluster: no refusal check, no scale patch, no
+// template patch, and no Deployment create. A missing Deployment is deliberately NOT
+// created here, even at zero replicas (hibernateHold would): the attempt may be mid-wake,
+// and a create at the wrong replica count races the pod whose settlement is unknown. The
+// PVCs were already ensured by the caller, and nothing is deleted. Its one output is the
+// stop proof.
+func (m *Materializer) hibernateCleaning(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker) error {
+	c := w.Hibernation.Cleanup
+	if c == nil || c.OpID == "" || c.StopProofPodUID == "" {
+		return nil
+	}
+	// Absence is never evidence: the exact uid must be present in a complete pod list and
+	// proven stopped (terminal phase and every container terminated, not ContainerStatusUnknown).
+	if !obs.PodsKnown || !obs.StoppedPodUIDs[c.StopProofPodUID] || !slices.Contains(obs.WorkerPodUIDs, c.StopProofPodUID) {
+		return nil
+	}
+	// The api requires the Deployment uid on every transition.
+	if !obs.HasDeployment || obs.DeploymentUID == "" {
+		return nil
+	}
+	key := cleanupReportKey{cleanupOp: c.OpID, seq: c.ReconcileSeq}
+	m.cleanupMu.Lock()
+	done := m.cleanupReported[w.ID] == key
+	m.cleanupMu.Unlock()
+	if done {
+		return nil
+	}
+	if err := m.reportHibernation(ctx, w, protocol.HibernationTransition{
+		OpID: w.Hibernation.OpID, Transition: protocol.TransitionCleanupStopped,
+		DeploymentUID: obs.DeploymentUID, PodUID: c.StopProofPodUID, CleanupOpID: c.OpID,
+	}); err != nil {
+		return err
+	}
+	m.cleanupMu.Lock()
+	if m.cleanupReported == nil {
+		m.cleanupReported = map[string]cleanupReportKey{}
+	}
+	m.cleanupReported[w.ID] = key
+	m.cleanupMu.Unlock()
+	return nil
 }

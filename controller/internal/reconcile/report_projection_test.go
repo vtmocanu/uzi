@@ -278,13 +278,15 @@ func TestTickOmitsRollHealthRowsForPreparingAndHibernatedWorkers(t *testing.T) {
 	m := &pacingMaterializer{
 		fakeMaterializer: fakeMaterializer{observed: []ObservedWorker{
 			{ID: "w-prep", Roll: RollHealth{Phase: protocol.PhaseRolling}},
+			{ID: "w-clean", Roll: RollHealth{Phase: protocol.PhaseRolling}},
 			{ID: "w-wake", Roll: RollHealth{Phase: protocol.PhaseRolling, TargetImage: "img-wake"}},
 		}},
-		outcomes: map[string]*protocol.Pacing{"w-hib": pacing, "w-prep": pacing, "w-wake": pacing},
+		outcomes: map[string]*protocol.Pacing{"w-hib": pacing, "w-prep": pacing, "w-wake": pacing, "w-clean": pacing},
 	}
 	poller := &fakePoller{resp: protocol.PollResponse{Workers: []protocol.DesiredWorker{
 		{ID: "w-prep", Hibernation: &protocol.Hibernation{State: protocol.HibernationPreparing, OpID: "o1"}},
 		{ID: "w-hib", Hibernation: &protocol.Hibernation{State: protocol.HibernationHibernated, OpID: "o2"}},
+		{ID: "w-clean", Hibernation: &protocol.Hibernation{State: protocol.HibernationCleaning, OpID: "o4", Cleanup: &protocol.HibernationCleanup{OpID: "c1"}}},
 		{ID: "w-wake", Hibernation: &protocol.Hibernation{State: protocol.HibernationWaking, OpID: "o3"}},
 	}}}
 	l := New(poller, m, client, 10*time.Second, "tag", slog.New(slog.NewTextHandler(io.Discard, nil)))
