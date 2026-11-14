@@ -349,7 +349,7 @@ WHERE worker_id = @worker_id AND op_id = @op_id;
 
 -- name: AcceptHibernationInventory :execrows
 -- Bind the worker's echoed inventory. Zero rows means refused: the row is not awaiting, was
--- invalidated, or belongs to another op.
+-- invalidated, or belongs to another op or pod.
 UPDATE worker_hibernation_inventories SET
     status = 'accepted',
     register_nonce = @register_nonce::text,
@@ -362,6 +362,7 @@ UPDATE worker_hibernation_inventories SET
     lane = sqlc.narg('lane')::text,
     mechanism = sqlc.narg('mechanism')::text
 WHERE worker_id = @worker_id AND op_id = @op_id
+  AND pod_uid = @pod_uid::uuid
   AND status = 'awaiting' AND invalidated_reason IS NULL;
 
 -- name: SetHibernationInventoryStatus :execrows
@@ -384,13 +385,14 @@ WHERE worker_id = @worker_id AND op_id = @op_id;
 UPDATE worker_hibernation_inventories SET
     scaling_down_pod_uid = COALESCE(scaling_down_pod_uid, sqlc.narg('scaling_down_pod_uid')::uuid),
     fence_generation = COALESCE(fence_generation, sqlc.narg('fence_generation')::bigint),
-    last_held_at = COALESCE(sqlc.narg('last_held_at')::timestamptz, last_held_at)
+    last_held_at = GREATEST(last_held_at, sqlc.narg('last_held_at')::timestamptz)
 WHERE worker_id = @worker_id AND op_id = @op_id;
 
 -- name: RecordHibernationInventoryScaledDown :execrows
+-- scaled_down_at is set once; last_held_at never moves backwards.
 UPDATE worker_hibernation_inventories SET
-    scaled_down_at = @scaled_down_at::timestamptz,
-    last_held_at = COALESCE(sqlc.narg('last_held_at')::timestamptz, last_held_at)
+    scaled_down_at = COALESCE(scaled_down_at, @scaled_down_at::timestamptz),
+    last_held_at = GREATEST(last_held_at, sqlc.narg('last_held_at')::timestamptz)
 WHERE worker_id = @worker_id AND op_id = @op_id;
 
 -- name: RecordHibernationInventoryHeld :execrows
@@ -400,10 +402,11 @@ UPDATE worker_hibernation_inventories SET
 WHERE worker_id = @worker_id AND op_id = @op_id;
 
 -- name: RecordHibernationExclusionFinal :execrows
+-- Set once: the first final report sticks.
 UPDATE worker_hibernation_inventories SET
-    exclusion_final_at = @at::timestamptz,
-    exclusion_final_digest = @digest::text,
-    exclusion_final_fingerprint = @fingerprint::text
+    exclusion_final_at = COALESCE(exclusion_final_at, @at::timestamptz),
+    exclusion_final_digest = COALESCE(exclusion_final_digest, @digest::text),
+    exclusion_final_fingerprint = COALESCE(exclusion_final_fingerprint, @fingerprint::text)
 WHERE worker_id = @worker_id AND op_id = @op_id;
 
 -- name: ListAwaitingHibernationInventoriesOlderThan :many
@@ -450,12 +453,15 @@ ORDER BY 1;
 
 -- name: ListValidCaptureReceipts :many
 -- (run_id, source_sha) pairs for which an available, manifest-bound, unexpired capture of exactly
--- that source exists, and whose thin-bundle prerequisites (when any) have a pinned closure.
+-- that source exists, and whose thin-bundle prerequisites (when any) have an exactly bound, still-pinned closure (the rule
+-- ProtectFinalClosureCapture applies).
 SELECT DISTINCT want.run_id::uuid AS run_id, want.source_sha::text AS source_sha
 FROM (
     SELECT r.run_id, s.source_sha
     FROM unnest(@run_ids::uuid[]) WITH ORDINALITY AS r(run_id, n)
     JOIN unnest(@source_shas::text[]) WITH ORDINALITY AS s(source_sha, n) ON s.n = r.n
+    -- Mismatched array lengths pair nothing rather than silently pairing a prefix.
+    WHERE cardinality(@run_ids::uuid[]) = cardinality(@source_shas::text[])
 ) AS want
 JOIN recovery_captures c ON c.run_id = want.run_id AND c.source_sha = want.source_sha
 WHERE c.state = 'available'
@@ -465,7 +471,9 @@ WHERE c.state = 'available'
     COALESCE(cardinality(c.prerequisite_shas), 0) = 0
     OR EXISTS (
         SELECT 1 FROM recovery_prerequisite_closures pc
-        WHERE pc.capture_id = c.id AND pc.state = 'pinned'
+        WHERE pc.capture_id = c.id AND pc.hold_id = c.hold_id AND pc.state = 'pinned'
+          AND pc.absent_since IS NULL AND pc.checksum = c.checksum
+          AND pc.prerequisite_shas = c.prerequisite_shas
     )
   )
 ORDER BY 1, 2;

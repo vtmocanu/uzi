@@ -25,6 +25,7 @@ UPDATE worker_hibernation_inventories SET
     lane = $8::text,
     mechanism = $9::text
 WHERE worker_id = $10 AND op_id = $11
+  AND pod_uid = $12::uuid
   AND status = 'awaiting' AND invalidated_reason IS NULL
 `
 
@@ -40,10 +41,11 @@ type AcceptHibernationInventoryParams struct {
 	Mechanism     pgtype.Text        `json:"mechanism"`
 	WorkerID      uuid.UUID          `json:"worker_id"`
 	OpID          uuid.UUID          `json:"op_id"`
+	PodUid        uuid.UUID          `json:"pod_uid"`
 }
 
 // Bind the worker's echoed inventory. Zero rows means refused: the row is not awaiting, was
-// invalidated, or belongs to another op.
+// invalidated, or belongs to another op or pod.
 func (q *Queries) AcceptHibernationInventory(ctx context.Context, arg AcceptHibernationInventoryParams) (int64, error) {
 	result, err := q.db.Exec(ctx, acceptHibernationInventory,
 		arg.RegisterNonce,
@@ -57,6 +59,7 @@ func (q *Queries) AcceptHibernationInventory(ctx context.Context, arg AcceptHibe
 		arg.Mechanism,
 		arg.WorkerID,
 		arg.OpID,
+		arg.PodUid,
 	)
 	if err != nil {
 		return 0, err
@@ -686,6 +689,8 @@ FROM (
     SELECT r.run_id, s.source_sha
     FROM unnest($1::uuid[]) WITH ORDINALITY AS r(run_id, n)
     JOIN unnest($2::text[]) WITH ORDINALITY AS s(source_sha, n) ON s.n = r.n
+    -- Mismatched array lengths pair nothing rather than silently pairing a prefix.
+    WHERE cardinality($1::uuid[]) = cardinality($2::text[])
 ) AS want
 JOIN recovery_captures c ON c.run_id = want.run_id AND c.source_sha = want.source_sha
 WHERE c.state = 'available'
@@ -695,7 +700,9 @@ WHERE c.state = 'available'
     COALESCE(cardinality(c.prerequisite_shas), 0) = 0
     OR EXISTS (
         SELECT 1 FROM recovery_prerequisite_closures pc
-        WHERE pc.capture_id = c.id AND pc.state = 'pinned'
+        WHERE pc.capture_id = c.id AND pc.hold_id = c.hold_id AND pc.state = 'pinned'
+          AND pc.absent_since IS NULL AND pc.checksum = c.checksum
+          AND pc.prerequisite_shas = c.prerequisite_shas
     )
   )
 ORDER BY 1, 2
@@ -712,7 +719,8 @@ type ListValidCaptureReceiptsRow struct {
 }
 
 // (run_id, source_sha) pairs for which an available, manifest-bound, unexpired capture of exactly
-// that source exists, and whose thin-bundle prerequisites (when any) have a pinned closure.
+// that source exists, and whose thin-bundle prerequisites (when any) have an exactly bound, still-pinned closure (the rule
+// ProtectFinalClosureCapture applies).
 func (q *Queries) ListValidCaptureReceipts(ctx context.Context, arg ListValidCaptureReceiptsParams) ([]ListValidCaptureReceiptsRow, error) {
 	rows, err := q.db.Query(ctx, listValidCaptureReceipts, arg.RunIds, arg.SourceShas)
 	if err != nil {
@@ -908,9 +916,9 @@ func (q *Queries) LockRunForShare(ctx context.Context, id uuid.UUID) (string, er
 
 const recordHibernationExclusionFinal = `-- name: RecordHibernationExclusionFinal :execrows
 UPDATE worker_hibernation_inventories SET
-    exclusion_final_at = $1::timestamptz,
-    exclusion_final_digest = $2::text,
-    exclusion_final_fingerprint = $3::text
+    exclusion_final_at = COALESCE(exclusion_final_at, $1::timestamptz),
+    exclusion_final_digest = COALESCE(exclusion_final_digest, $2::text),
+    exclusion_final_fingerprint = COALESCE(exclusion_final_fingerprint, $3::text)
 WHERE worker_id = $4 AND op_id = $5
 `
 
@@ -922,6 +930,7 @@ type RecordHibernationExclusionFinalParams struct {
 	OpID        uuid.UUID          `json:"op_id"`
 }
 
+// Set once: the first final report sticks.
 func (q *Queries) RecordHibernationExclusionFinal(ctx context.Context, arg RecordHibernationExclusionFinalParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordHibernationExclusionFinal,
 		arg.At,
@@ -961,7 +970,7 @@ const recordHibernationInventoryScaleDown = `-- name: RecordHibernationInventory
 UPDATE worker_hibernation_inventories SET
     scaling_down_pod_uid = COALESCE(scaling_down_pod_uid, $1::uuid),
     fence_generation = COALESCE(fence_generation, $2::bigint),
-    last_held_at = COALESCE($3::timestamptz, last_held_at)
+    last_held_at = GREATEST(last_held_at, $3::timestamptz)
 WHERE worker_id = $4 AND op_id = $5
 `
 
@@ -990,8 +999,8 @@ func (q *Queries) RecordHibernationInventoryScaleDown(ctx context.Context, arg R
 
 const recordHibernationInventoryScaledDown = `-- name: RecordHibernationInventoryScaledDown :execrows
 UPDATE worker_hibernation_inventories SET
-    scaled_down_at = $1::timestamptz,
-    last_held_at = COALESCE($2::timestamptz, last_held_at)
+    scaled_down_at = COALESCE(scaled_down_at, $1::timestamptz),
+    last_held_at = GREATEST(last_held_at, $2::timestamptz)
 WHERE worker_id = $3 AND op_id = $4
 `
 
@@ -1002,6 +1011,7 @@ type RecordHibernationInventoryScaledDownParams struct {
 	OpID         uuid.UUID          `json:"op_id"`
 }
 
+// scaled_down_at is set once; last_held_at never moves backwards.
 func (q *Queries) RecordHibernationInventoryScaledDown(ctx context.Context, arg RecordHibernationInventoryScaledDownParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordHibernationInventoryScaledDown,
 		arg.ScaledDownAt,

@@ -18,16 +18,19 @@ CREATE TABLE worker_hibernation_inventories (
     deployment_resource_version text NOT NULL CHECK (char_length(deployment_resource_version) <= 256),
     pod_uid uuid NOT NULL,
     -- Array of {role,name,uid,storage_class,class_reclaim_policy}.
-    pvcs jsonb NOT NULL CHECK (jsonb_typeof(pvcs) = 'array'),
+    pvcs jsonb NOT NULL CHECK (jsonb_typeof(pvcs) = 'array' AND octet_length(pvcs::text) <= 16384),
     register_nonce text CHECK (char_length(register_nonce) <= 256),
     received_at timestamptz,
     status text NOT NULL CHECK (status IN ('awaiting','accepted','unsupported','exclusion_failed',
         'busy','timed_out','no_capability','closed_by_scale_down','identity_changed')),
     status_reason text CHECK (char_length(status_reason) <= 512),
     complete boolean,
+    -- The 1 MiB bound is on jsonb's PRINTED form (entries::text), which is not the stored form: the
+    -- api must bound the stored form itself and map a 23514 here to a client error.
     entries jsonb CHECK (entries IS NULL
         OR (jsonb_typeof(entries) = 'array' AND octet_length(entries::text) <= 1048576)),
-    receipt_keys jsonb CHECK (receipt_keys IS NULL OR jsonb_typeof(receipt_keys) = 'array'),
+    receipt_keys jsonb CHECK (receipt_keys IS NULL
+        OR (jsonb_typeof(receipt_keys) = 'array' AND octet_length(receipt_keys::text) <= 1048576)),
     digest text CHECK (char_length(digest) <= 128),
     fingerprint text CHECK (char_length(fingerprint) <= 128),
     lane text CHECK (char_length(lane) <= 64),
@@ -56,4 +59,6 @@ CREATE INDEX worker_hibernation_inventories_awaiting_idx
     ON worker_hibernation_inventories (observed_at, worker_id) WHERE status = 'awaiting';
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
+
 DROP TABLE worker_hibernation_inventories;

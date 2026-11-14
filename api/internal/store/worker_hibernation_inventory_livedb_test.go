@@ -56,7 +56,7 @@ func (f *invFixture) observe(status string) store.WorkerHibernationInventory {
 
 func (f *invFixture) acceptParams(entries string) store.AcceptHibernationInventoryParams {
 	return store.AcceptHibernationInventoryParams{
-		WorkerID: f.worker, OpID: f.op, RegisterNonce: "nonce", ReceivedAt: invTS(time.Now()), Complete: true,
+		WorkerID: f.worker, OpID: f.op, PodUid: f.pod, RegisterNonce: "nonce", ReceivedAt: invTS(time.Now()), Complete: true,
 		Entries: []byte(entries), ReceiptKeys: []byte(`[]`), Digest: strings.Repeat("b", 64), Fingerprint: strings.Repeat("a", 64),
 		Lane:      pgtype.Text{String: "dind", Valid: true},
 		Mechanism: pgtype.Text{String: "epoch_ex+latch+quiescence", Valid: true},
@@ -70,6 +70,11 @@ func TestHibernationInventoryLifecycleLiveDB(t *testing.T) {
 	first := f.observe("awaiting")
 	if first.Status != "awaiting" || first.Entries != nil || first.InvalidatedReason.Valid {
 		t.Fatalf("fresh row = %+v", first)
+	}
+	wrongPod := f.acceptParams(`[]`)
+	wrongPod.PodUid = uuid.New()
+	if n, err := f.q.AcceptHibernationInventory(f.ctx, wrongPod); err != nil || n != 0 {
+		t.Fatalf("accept for another pod = %d, %v; want 0 rows", n, err)
 	}
 	if n, err := f.q.AcceptHibernationInventory(f.ctx, f.acceptParams(`[{"kind":"attempt_tree"}]`)); err != nil || n != 1 {
 		t.Fatalf("first accept = %d, %v; want 1 row", n, err)
@@ -150,15 +155,32 @@ func TestHibernationInventoryLifecycleLiveDB(t *testing.T) {
 	if !got.LastHeldAt.Time.Equal(heldAt.Add(time.Minute)) {
 		t.Fatalf("held moved last_held_at backwards: %v", got.LastHeldAt.Time)
 	}
-	scaledAt := time.Now().Truncate(time.Microsecond)
-	if n, err := f.q.RecordHibernationInventoryScaledDown(f.ctx, store.RecordHibernationInventoryScaledDownParams{WorkerID: f.worker, OpID: f.op, ScaledDownAt: invTS(scaledAt)}); err != nil || n != 1 {
-		t.Fatalf("scaled down = %d, %v", n, err)
-	}
-	if n, err := f.q.RecordHibernationExclusionFinal(f.ctx, store.RecordHibernationExclusionFinalParams{WorkerID: f.worker, OpID: f.op, At: invTS(scaledAt), Digest: strings.Repeat("b", 64), Fingerprint: strings.Repeat("a", 64)}); err != nil || n != 1 {
-		t.Fatalf("exclusion final = %d, %v", n, err)
-	}
+	// A scale-down carrying an older last_held_at must not move it back (checked above via scale(podB)
+	// being later; check an earlier one now).
+	scale(podB, 7, heldAt.Add(-time.Hour))
 	got, _ = f.q.GetHibernationInventoryForOp(f.ctx, store.GetHibernationInventoryForOpParams{WorkerID: f.worker, OpID: f.op})
-	if !got.ScaledDownAt.Time.Equal(scaledAt) || !got.LastHeldAt.Time.Equal(heldAt.Add(time.Minute)) || got.ExclusionFinalDigest.String != strings.Repeat("b", 64) || !got.ExclusionFinalAt.Valid {
+	if !got.LastHeldAt.Time.Equal(heldAt.Add(time.Minute)) {
+		t.Fatalf("scale-down moved last_held_at backwards: %v", got.LastHeldAt.Time)
+	}
+	scaledAt := time.Now().Truncate(time.Microsecond)
+	scaledDown := func(at, held time.Time) {
+		t.Helper()
+		if n, err := f.q.RecordHibernationInventoryScaledDown(f.ctx, store.RecordHibernationInventoryScaledDownParams{WorkerID: f.worker, OpID: f.op, ScaledDownAt: invTS(at), LastHeldAt: invTS(held)}); err != nil || n != 1 {
+			t.Fatalf("scaled down = %d, %v", n, err)
+		}
+	}
+	scaledDown(scaledAt, heldAt.Add(-time.Hour))
+	scaledDown(scaledAt.Add(time.Hour), heldAt.Add(-2*time.Hour)) // second report: scaled_down_at sticks
+	final := func(at time.Time, digest, fp string) {
+		t.Helper()
+		if n, err := f.q.RecordHibernationExclusionFinal(f.ctx, store.RecordHibernationExclusionFinalParams{WorkerID: f.worker, OpID: f.op, At: invTS(at), Digest: digest, Fingerprint: fp}); err != nil || n != 1 {
+			t.Fatalf("exclusion final = %d, %v", n, err)
+		}
+	}
+	final(scaledAt, strings.Repeat("b", 64), strings.Repeat("a", 64))
+	final(scaledAt.Add(time.Hour), strings.Repeat("c", 64), strings.Repeat("d", 64)) // first final sticks
+	got, _ = f.q.GetHibernationInventoryForOp(f.ctx, store.GetHibernationInventoryForOpParams{WorkerID: f.worker, OpID: f.op})
+	if !got.ScaledDownAt.Time.Equal(scaledAt) || !got.LastHeldAt.Time.Equal(heldAt.Add(time.Minute)) || got.ExclusionFinalDigest.String != strings.Repeat("b", 64) || got.ExclusionFinalFingerprint.String != strings.Repeat("a", 64) || !got.ExclusionFinalAt.Time.Equal(scaledAt) {
 		t.Fatalf("scaled-down / final columns = %+v", got)
 	}
 
@@ -342,9 +364,7 @@ func TestHibernationInventoryEvaluatorReadsLiveDB(t *testing.T) {
 			id, hold, run, f.userID, f.worker, source, uuid.NewString(), state, bound, replica, expires)
 		return id
 	}
-	// A local replica row needs the retention columns the 00322 trigger checks; try the plain form.
-	rep := capture(sha, other, "1 hour", true, "available")
-	_ = rep
+	capture(sha, other, "1 hour", true, "available")
 	got, err = f.q.ListWorkersWithLocalReplicaCaptures(f.ctx, both)
 	only("local replica captures", got, err, other)
 
@@ -364,63 +384,71 @@ func TestHibernationInventoryEvaluatorReadsLiveDB(t *testing.T) {
 	}
 	shaOK, shaOther := strings.Repeat("1", 40), strings.Repeat("2", 40)
 	capFor(valid, shaOK, "available", "1 hour", true, nil)
-	runExpired, runUnbound, runPending, runPrereq, runPrereqPinned := f.run2(), f.run2(), f.run2(), f.run2(), f.run2()
+	runExpired, runUnbound, runPending, runPrereq := f.run2(), f.run2(), f.run2(), f.run2()
 	capFor(runExpired, shaOK, "available", "-1 hour", true, nil)
 	capFor(runUnbound, shaOK, "available", "1 hour", false, nil)
 	capFor(runPending, shaOK, "uploading", "1 hour", true, nil)
 	capFor(runPrereq, shaOK, "available", "1 hour", true, []string{strings.Repeat("9", 40)})
-	pinnedCapture := capFor(runPrereqPinned, shaOK, "available", "1 hour", true, []string{strings.Repeat("9", 40)})
-	f.pinClosure(pinnedCapture, runPrereqPinned, strings.Repeat("9", 40))
-	runs := []uuid.UUID{valid, valid, runExpired, runUnbound, runPending, runPrereq, runPrereqPinned}
-	shas := []string{shaOK, shaOther, shaOK, shaOK, shaOK, shaOK, shaOK}
+
+	// Closure-bearing captures reach "pinned" through the production path (insert, invoke, pin).
+	// The shared fixture's capture is source_sha repeat('a',40) with two prerequisite shas.
+	shaClosure := strings.Repeat("a", 40)
+	pinned := prerequisiteNew(t, f.ctx, f.pool)
+	prerequisitePin(t, f.ctx, pinned)
+	absent := prerequisiteNew(t, f.ctx, f.pool)
+	prerequisitePin(t, f.ctx, absent)
+	n, err := f.q.RecordPrerequisiteAbsence(f.ctx, store.RecordPrerequisiteAbsenceParams{ID: absent.closure.ID, PassID: prerequisiteAudit(t, f.ctx, absent)})
+	prerequisiteRows(t, 1, n, err)                 // pinned, absent_since now set
+	notPinned := prerequisiteNew(t, f.ctx, f.pool) // closure still pending
+	badSHAs := prerequisiteNew(t, f.ctx, f.pool)
+	prerequisitePin(t, f.ctx, badSHAs)
+	badSum := prerequisiteNew(t, f.ctx, f.pool)
+	prerequisitePin(t, f.ctx, badSum)
+	// A real path cannot make the closure disagree with its capture, so rewrite the capture's side
+	// of the binding directly. If the schema forbids it, that is itself the guarantee and the
+	// mismatch is unreachable; the test then records that instead of passing vacuously.
+	mismatched := map[string]bool{}
+	for name, q := range map[string]struct {
+		f   prerequisiteFixture
+		sql string
+	}{
+		"prerequisite_shas": {badSHAs, `UPDATE recovery_captures SET prerequisite_shas=ARRAY[repeat('b',40)] WHERE id=$1`},
+		"checksum":          {badSum, `UPDATE recovery_captures SET checksum=repeat('e',64) WHERE id=$1`},
+	} {
+		if _, err := f.pool.Exec(f.ctx, q.sql, q.f.capture); err != nil {
+			t.Logf("capture %s cannot be changed after pinning (%v): mismatch unreachable", name, err)
+			continue
+		}
+		mismatched[name] = true
+	}
+	runs := []uuid.UUID{valid, valid, runExpired, runUnbound, runPending, runPrereq, pinned.run, absent.run, notPinned.run, badSHAs.run, badSum.run}
+	shas := []string{shaOK, shaOther, shaOK, shaOK, shaOK, shaOK, shaClosure, shaClosure, shaClosure, shaClosure, shaClosure}
 	pairs, err := f.q.ListValidCaptureReceipts(f.ctx, store.ListValidCaptureReceiptsParams{RunIds: runs, SourceShas: shas})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[uuid.UUID]bool{valid: true, runPrereqPinned: true}
+	want := map[uuid.UUID]bool{valid: true, pinned.run: true}
+	if !mismatched["prerequisite_shas"] {
+		want[badSHAs.run] = true
+	}
+	if !mismatched["checksum"] {
+		want[badSum.run] = true
+	}
 	if len(pairs) != len(want) {
 		t.Fatalf("receipts = %+v, want exactly runs %v", pairs, want)
 	}
 	for _, p := range pairs {
-		if !want[p.RunID] || p.SourceSha != shaOK {
+		if !want[p.RunID] || (p.SourceSha != shaOK && p.SourceSha != shaClosure) {
 			t.Fatalf("unexpected receipt %+v", p)
 		}
+	}
+	// Mismatched array lengths pair nothing.
+	if got, err := f.q.ListValidCaptureReceipts(f.ctx, store.ListValidCaptureReceiptsParams{RunIds: []uuid.UUID{valid, valid}, SourceShas: []string{shaOK}}); err != nil || len(got) != 0 {
+		t.Fatalf("mismatched lengths paired a prefix: %v, %v", got, err)
 	}
 }
 
 func (f *invFixture) run2() uuid.UUID { return f.queuedRun() }
-
-// pinClosure inserts a pinned prerequisite closure for a capture through the same state the
-// production writer ends in; the guard trigger only allows a pending insert, so it is created
-// pending and walked to pinned with the trigger bypassed for the fixture.
-func (f *invFixture) pinClosure(capture, run uuid.UUID, prereq string) {
-	f.t.Helper()
-	var hold uuid.UUID
-	if err := f.pool.QueryRow(f.ctx, `SELECT hold_id FROM recovery_captures WHERE id=$1`, capture).Scan(&hold); err != nil {
-		f.t.Fatal(err)
-	}
-	tx, err := f.pool.Begin(f.ctx)
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-	for _, sql := range []string{
-		`SET LOCAL session_replication_role = replica`,
-	} {
-		if _, err := tx.Exec(f.ctx, sql); err != nil {
-			f.t.Fatalf("cannot bypass the closure guard trigger (needs a superuser test database): %v", err)
-		}
-	}
-	if _, err := tx.Exec(f.ctx, `INSERT INTO recovery_prerequisite_closures
-		(capture_id,hold_id,run_id,user_id,repo_id,live_run_id,checksum,prerequisite_shas,pin_ref,state,invoked_at,invoked_deadline,pin_tip,connection_id,forge_kind,normalized_base_url,project_id,default_branch)
-		VALUES ($1,$2,$3,$4,$5,$3,repeat('a',64),$6,'refs/uzi-prereq/'||$8::text,'pinned',now(),now()+interval '1 hour',repeat('b',40),$7,'gitlab','https://forge.e2e',1,'main')`,
-		capture, hold, run, f.userID, f.repoID, []string{prereq}, uuid.New(), capture.String()); err != nil {
-		f.t.Fatalf("insert pinned closure: %v", err)
-	}
-	if err := tx.Commit(f.ctx); err != nil {
-		f.t.Fatal(err)
-	}
-}
 
 func TestHibernationInventoryPublicationResumeLiveDB(t *testing.T) {
 	f := newInvFixture(t)
