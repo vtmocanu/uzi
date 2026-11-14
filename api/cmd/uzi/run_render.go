@@ -690,12 +690,6 @@ func weeklyReserveAction(r apitypes.RunDTO) string {
 	return "resumes when usage drops below the threshold; override: uzi run resume " + cellText(r.ID)
 }
 
-// isBaseAttestationHold reports whether r is held because its kept work carries no
-// `--require-base` attestation (issue #3194: status paused, hold_reason base_attestation_missing).
-func isBaseAttestationHold(r apitypes.RunDTO) bool {
-	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdBaseAttestation
-}
-
 // baseAttestationAction is the owner's next step for a base_attestation_missing hold (issue
 // #3194). The server refuses resume and extend, so it names only the recovery verbs.
 func baseAttestationAction(r apitypes.RunDTO) string {
