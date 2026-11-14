@@ -86,7 +86,7 @@ import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { type CodexErrorClassification, CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
-import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type UsableSavedRollout, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
 import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
@@ -1943,7 +1943,7 @@ export interface CodexExecutorDeps {
    *  `persist` is used before every provider-root reap and at terminal to capture the
    *  live session subset; `remove` is NO LONGER called by the executor (the runner's
    *  runHome lifecycle owns store removal — preserve on park, remove on terminal). */
-  readonly sessionStore?: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist">;
+  readonly sessionStore?: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist"> & Partial<Pick<typeof CodexSessionStore, "inspectSession">>;
   /** The shared tool-provisioning step (PRD #18). Production uses the real
    *  {@link provisionRunTools}; a unit test injects a stub so no real devbox/nix install
    *  runs. The resolved `toolEnv` is folded into the credential-free command env
@@ -2163,6 +2163,8 @@ interface ProviderEpoch {
   readonly buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker;
   /** Persist THIS epoch's credential-free session subset into the shared store (best-effort). */
   persistSession(): Promise<void>;
+  /** Strict copy errors propagate; an unlaunched epoch leaves the saved generation untouched. */
+  persistUsableSession(): Promise<void>;
   /** Full teardown of an ABANDONED epoch on recreation (quiesce + reap + disposeTools the
    *  registry, WITHOUT the token-eviction hook, then close the harness/fileop). */
   dispose(): Promise<void>;
@@ -2473,6 +2475,12 @@ export class CodexExecutor implements Executor {
   }
   private readonly epochSafeties = new Map<ExecutionRegistry, CodexExecutionSafetyImpl>();
   private readonly completedCaptures = new WeakMap<ExecutionRegistry, CompletedCredentialFreeCapture>();
+  private liveRolloutSave?: () => Promise<UsableSavedRollout>;
+
+  saveUsableRollout(): Promise<UsableSavedRollout> {
+    return this.liveRolloutSave?.() ?? Promise.resolve({ kind: "failed", reason: "inactive_leg" });
+  }
+
   private beforeCaptureDrain?: () => Promise<void>;
   private captureMayHaveDrained?: () => boolean;
   private epochAdmission?: () => void;
@@ -2863,7 +2871,7 @@ export class CodexExecutor implements Executor {
   private readonly provisionRoot: string;
   private readonly opts: CodexExecutorOptions;
   private readonly deps: CodexExecutorDeps;
-  private readonly sessionStore: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist">;
+  private readonly sessionStore: Pick<typeof CodexSessionStore, "adopt" | "inspect" | "remove" | "persist" | "inspectSession">;
   /** issue #1783 (R0): the supervisor pids of the provider roots this executor launched and has
    *  not yet cleanly reaped/disposed (see {@link recordedRootPids}). */
   private readonly providerRootPids = new Map<number, RecordedRoot>();
@@ -2890,6 +2898,7 @@ export class CodexExecutor implements Executor {
       inspect: (...args) => this.lifetime.admit(() => sessions.inspect(...args)),
       remove: (...args) => this.lifetime.admit(() => sessions.remove(...args)),
       persist: (...args) => this.lifetime.admit(() => sessions.persist(...args)),
+      inspectSession: (...args) => this.lifetime.admit(() => sessions.inspectSession?.(...args) ?? Promise.resolve("unknown" as const)),
     };
   }
 
@@ -3828,6 +3837,36 @@ export class CodexExecutor implements Executor {
       // cross-worker resume) or starts a fresh session. `lastSessionId` tracks the most recent
       // turn's session id so a recreated epoch resumes the RIGHT thread.
       let lastSessionId = ctx.sessionId ?? undefined;
+      const saveRollout = (): Promise<UsableSavedRollout> => {
+        const captured = epoch;
+        const sessionId = captured?.harness.rootThreadId ?? lastSessionId;
+        const revision = this.captureRevision;
+        const pending = beforeReapPersist;
+        const saved = reapedSinceLastPersist;
+        const guard = (): void => {
+          authority.assertCurrent();
+          this.assertCaptureAdmission(revision);
+          if (this.liveRolloutSave !== saveRollout || epoch !== captured || lifecycleSignal.aborted
+            || ctx.claimFenced?.() || ctx.cancelRequested?.()) throw new Error("retired rollout save");
+        };
+        return this.withCaptureOwnership(async (): Promise<UsableSavedRollout> => {
+          try {
+            guard();
+            if (!captured || !sessionId) return { kind: "failed", reason: "missing_session" };
+            if (pending) await pending;
+            guard();
+            if (!saved && !reapedSinceLastPersist) await captured.persistUsableSession();
+            guard();
+            const presence = await this.sessionStore.inspectSession(storeDir, sessionId);
+            guard();
+            return presence === "present" ? { kind: "usable", sessionId }
+              : { kind: "failed", reason: "session_unavailable" };
+          } catch {
+            return { kind: "failed", reason: "save_unproven" };
+          }
+        });
+      };
+      this.liveRolloutSave = saveRollout;
       const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
       const wall: RunWall = { remainingMs: wallMs, maxServedMs: wallMs, claimMs: wallMs };
       let silentRevision: { cause: TransientRecoveryError; needsRebuild: boolean; checkedAt: number; ownerWaiting?: boolean } | undefined;
@@ -5086,6 +5125,7 @@ export class CodexExecutor implements Executor {
       this.provisionAbort?.abort();
       this.intentFlight?.ctrl.abort();
       for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(); }
+      this.liveRolloutSave = undefined;
       await this.withCaptureOwnership(async () => {
         this.beforeCaptureDrain = undefined;
         this.captureMayHaveDrained = undefined;
@@ -5598,6 +5638,16 @@ export class CodexExecutor implements Executor {
         // Issue #1782: an epoch recreated after a refused wall park persists nothing until its
         // provider has launched and adopted the session, so an unpopulated home never replaces the
         // generation persisted before the park.
+        persistUsableSession: async (): Promise<void> => {
+          await settleDepsInstall();
+          authority.assertCurrent();
+          this.assertCaptureAdmission(revision);
+          // An unlaunched replacement may only inspect the prior saved generation.
+          if (!launched) return;
+          await this.sessionStore.persist(codexHome, storeDir);
+          authority.assertCurrent();
+          this.assertCaptureAdmission(revision);
+        },
         persistSession: async (): Promise<void> => {
           await settleDepsInstall();
           if (opts.persistAfterLaunchOnly && !launched) return;

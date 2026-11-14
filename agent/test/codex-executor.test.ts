@@ -21,7 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { CodexSessionStore } from "../src/codex/session-state.js";
+import { CodexSessionStore, DEFAULT_SESSION_STORE_BOUNDS } from "../src/codex/session-state.js";
 import { fakeGitHub, fakeGitlab } from "./runner-harness.js";
 import { realProcfsSkip } from "./real-procfs.js";
 import { newRunAttempt } from "../src/run-quiescence.js";
@@ -30655,4 +30655,145 @@ it("policy initial planning refuses a backlog that could exclude the latest Resu
     assert.equal(rig.transport.turnStartCount, 0, "do not plan from a prefix that may omit the latest correction");
     assert.deepEqual(included, [], "overflow is never acknowledged as model inclusion");
   }
+});
+
+describe("CodexExecutor: strict saved rollout seam", () => {
+  for (const mode of ["present", "empty", "mismatch", "unavailable", "fault", "missing-inspector"] as const) {
+    it(`strict save ${mode} keeps the live provider untouched`, async () => {
+      const entered = installerBarrier();
+      const rig = makeRig({ responder: epochResponder("th-current", "tn-1", () => entered.resolve()) });
+      let saves = 0;
+      const inspected: string[] = [];
+      rig.deps = { ...rig.deps, sessionStore: {
+        ...rig.deps.sessionStore!,
+        persist: async () => {
+          saves++;
+          if (mode === "fault") throw new Error("injected copy failure");
+          return { files: mode === "empty" ? 0 : 1, bytes: 20 };
+        },
+        inspectSession: mode === "missing-inspector" ? undefined : async (_dir, id) => {
+          inspected.push(id);
+          return mode === "present" ? "present" : mode === "unavailable" ? "unknown" : "absent";
+        },
+      } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      assert.equal((await exec.saveUsableRollout()).kind, "failed");
+      const { ctx } = makeCtx();
+      const running = exec.run(ctx);
+      try {
+        await entered.promise;
+        const requests = rig.transport.requests.length;
+        const result = await exec.saveUsableRollout();
+        assert.deepEqual(result.kind === "usable" ? result : { kind: result.kind },
+          mode === "present" ? { kind: "usable", sessionId: "th-current" } : { kind: "failed" });
+        assert.equal(saves, 1);
+        assert.deepEqual(inspected, mode === "fault" || mode === "missing-inspector" ? [] : ["th-current"]);
+        assert.equal(rig.reaped(), 0);
+        assert.equal(rig.disposed(), 0);
+        assert.equal(rig.transport.closes, 0);
+        assert.equal(rig.transport.requests.length, requests, "save performs no auth apply or provider RPC");
+      } finally {
+        rig.transport.push(signalDone("th-current", "tn-1")).push(turnCompleted("completed", "th-current", "tn-1"));
+        await running;
+      }
+      assert.equal((await exec.saveUsableRollout()).kind, "failed");
+    });
+  }
+
+  it("strict save inspects the pre-reap generation without overwriting it", async () => {
+    let worked = false;
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", (t, th, tn) => {
+      worked = true;
+      t.push(agentMessage("work", th)).push(turnCompleted("completed", th, tn));
+    }) });
+    let saves = 0;
+    let checked = false;
+    rig.deps = { ...rig.deps, sessionStore: {
+      ...rig.deps.sessionStore!,
+      persist: async () => { saves++; return { files: 1, bytes: 20 }; },
+      inspectSession: async (_dir, id) => { assert.equal(id, "th-current"); return "present"; },
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx({ reportIteration: async () => ({ pauseRequested: worked }), parkForPause: async () => {
+      const count = saves;
+      assert.ok(count > 0);
+      assert.deepEqual(await exec.saveUsableRollout(), { kind: "usable", sessionId: "th-current" });
+      assert.equal(saves, count, "pre-reap save owns the saved generation");
+      checked = true;
+      return true;
+    } });
+    await exec.run(ctx);
+    assert.equal(checked, true);
+  });
+});
+
+describe("CodexExecutor: strict rollout real session store", () => {
+  for (const mode of ["present", "empty", "mismatch", "fault"] as const) {
+    it(`strict real store ${mode}`, async () => {
+      const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/strict-rollout-"));
+      const source = path.join(dir, "source"), store = path.join(dir, "store");
+      const sessionId = "12345678-1234-1234-1234-123456789abc";
+      const otherId = "12345678-1234-1234-1234-123456789def";
+      await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+      if (mode !== "empty") await fs.writeFile(path.join(source, "sessions", `rollout-${mode === "mismatch" ? otherId : sessionId}.jsonl`), "{}\n");
+      await fs.writeFile(path.join(source, "auth.json"), "provider-material-canary");
+      const entered = installerBarrier();
+      const rig = makeRig({ responder: epochResponder(sessionId, "tn-1", () => entered.resolve()) });
+      rig.deps = { ...rig.deps, sessionStore: {
+        ...rig.deps.sessionStore!,
+        persist: () => CodexSessionStore.persist(source, store, mode === "fault" ? { bounds: { ...DEFAULT_SESSION_STORE_BOUNDS, maxFileBytes: 1 } } : undefined),
+        inspectSession: (_dir, id) => CodexSessionStore.inspectSession(store, id),
+      } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const { ctx } = makeCtx();
+      const running = exec.run(ctx);
+      try {
+        await entered.promise;
+        const result = await exec.saveUsableRollout();
+        assert.equal(result.kind, mode === "present" ? "usable" : "failed");
+        assert.equal(rig.reaped(), 0);
+        assert.equal(rig.transport.closes, 0);
+        if (mode === "present") {
+          const adopted = path.join(dir, "adopted");
+          await fs.mkdir(adopted);
+          await CodexSessionStore.adopt(store, adopted);
+          await assert.rejects(fs.access(path.join(adopted, "auth.json")));
+          assert.equal(await fs.readFile(path.join(adopted, "sessions", `rollout-${sessionId}.jsonl`), "utf8"), "{}\n");
+        }
+      } finally {
+        rig.transport.push(signalDone(sessionId, "tn-1")).push(turnCompleted("completed", sessionId, "tn-1"));
+        await running;
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("CodexExecutor: strict rollout currency", () => {
+  it("rejects inspection completed after the captured authority is fenced", async () => {
+    const entered = installerBarrier(), inspecting = installerBarrier(), release = installerBarrier();
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", () => entered.resolve()) });
+    let fenced = false;
+    rig.deps = { ...rig.deps, sessionStore: {
+      ...rig.deps.sessionStore!,
+      inspectSession: async () => { inspecting.resolve(); await release.promise; return "present"; },
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx({ claimFenced: () => fenced });
+    const running = exec.run(ctx);
+    try {
+      await entered.promise;
+      const saving = exec.saveUsableRollout();
+      await inspecting.promise;
+      fenced = true;
+      release.resolve();
+      assert.equal((await saving).kind, "failed");
+      assert.equal(rig.reaped(), 0);
+    } finally {
+      fenced = false;
+      release.resolve();
+      rig.transport.push(signalDone("th-current", "tn-1")).push(turnCompleted("completed", "th-current", "tn-1"));
+      await running;
+    }
+  });
 });

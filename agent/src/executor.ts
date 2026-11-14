@@ -1057,12 +1057,17 @@ export class PlanRevisionReplacedError extends Error {
   }
 }
 
+/** A proven exact-thread rollout in the credential-free local session store. */
+export type UsableSavedRollout = { kind: "usable"; sessionId: string } | { kind: "failed"; reason?: string };
+
 /**
  * The unit M3 replaces with the Claude Agent SDK. Keeping it behind this
  * interface is what lets M2 exercise the full state machine (claim → worktree →
  * work → report) with no AI in the loop.
  */
 export interface Executor {
+  /** Strict credential-free save of the current live leg; does not stop or switch it. */
+  saveUsableRollout?(): Promise<UsableSavedRollout>;
   run(ctx: RunContext): Promise<ExecutorResult>;
   /** Close summary admission synchronously, then abort/join within the remaining sink deadline. */
   closeAndSettlePlanSummary?(deadlineMs?: number): Promise<void>;
