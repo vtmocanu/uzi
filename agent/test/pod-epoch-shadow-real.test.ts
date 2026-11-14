@@ -813,8 +813,9 @@ test("#4265 pass: a later group's binding failure yields no candidate and no del
   const deletion = deletionSpies();
   const { result } = await shadowPass({
     deletion,
+    // The first group also carries a tree-local cap, so its own cause must survive the later refusal.
     production: batch => ({ ...batch, requests: batch.requests.map((r, i) => i === batch.requests.length - 1 ?
-      { ...r, beforeTree: () => r.beforeTree!("/not/an/expected/path") } : r) }),
+      { ...r, beforeTree: () => r.beforeTree!("/not/an/expected/path") } : i === 0 ? { ...r, measureCaps: { maxEntries: 0 } } : r) }),
   });
   t.diagnostic(JSON.stringify({ verdict: result.verdict, reason: result.reason, causes: result.partial_causes, list: result.list.length }));
   assert.notEqual(result.verdict, "eligible");
@@ -824,6 +825,9 @@ test("#4265 pass: a later group's binding failure yields no candidate and no del
   assert.equal(result.deleted, 0);
   assert.deepEqual(deletion.spies, { begins: 0, reserves: 0, proofs: 0, discards: 0 });
   assert.equal(result.partial_causes.inspection_unclassified, undefined);
+  // Per-group diagnostics survive the refusal: the earlier group's own cap and the batch-wide binding failure.
+  assert.equal(result.partial_causes.measurement_entry_cap, 1);
+  assert.equal(result.partial_causes.tree_binding_failed, 3);
 });
 
 test("#4265 pass: per-group partial causes are preserved through the batch", async () => {

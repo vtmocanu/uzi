@@ -789,7 +789,12 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       batch.push({ group, holds, lifecycle, expected: new Set(group.paths) });
     }
     if (batch.length === 0) continue;
-    const inspections = await owned(() => options.git.inspectEpochRetainedGroups({
+    // Kept so a pass invalidated inside the batch (owned() then rethrows the abort) still reports each group's causes.
+    let returned: Awaited<ReturnType<Options["git"]["inspectEpochRetainedGroups"]>> | undefined;
+    const keepDiagnostics = () => {
+      if (invalid && Array.isArray(returned)) for (const inspected of returned) mergePartialCauses(result.partial_causes, inspected.partialCauses);
+    };
+    const inspections = await owned(async () => returned = await options.git.inspectEpochRetainedGroups({
       barePath: batch[0]!.group.barePath, maxDescriptors: 200, work: inspectionWork.shadow,
       requests: batch.map(({ group, holds, lifecycle, expected }) => ({
         selector: group.selector, holds, lifecycle, maxPhysicalPaths: expected.size,
@@ -797,9 +802,12 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       })),
       isLivePath: () => false, signal: controller.signal, deadline: hardPass - 5000,
       budgetMs: Math.max(0, hardPass - 5000 - now()), now,
-    }), hardPass);
+    }), hardPass).catch((error: unknown) => { keepDiagnostics(); throw error; });
     // One result per request, in order; anything else is not evidence about these groups.
     if (!Array.isArray(inspections) || inspections.length !== batch.length) { invalidate("path_set_changed"); throw new Refusal("path_set_changed"); }
+    // The batch already invalidated the pass (a binding failure or veto inside it): keep every group's diagnostics
+    // before the refusal below. Diagnostic only; the refusal and the empty candidate set are unchanged.
+    keepDiagnostics();
     for (const [index, { group, holds, lifecycle, expected }] of batch.entries()) {
       const inspected = inspections[index]!;
       check(); entry();
