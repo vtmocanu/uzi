@@ -2084,7 +2084,7 @@ export class WorkerClient {
   }
 
   /** One read-only attempt. No response body or auth is retained on failure. */
-  async preflightCodexCredentialSwitch(runId: string, req: CodexSwitchPreflightRequest): Promise<CodexSwitchPreflightResult> {
+  async preflightCodexCredentialSwitch(runId: string, req: CodexSwitchPreflightRequest, signal?: AbortSignal): Promise<CodexSwitchPreflightResult> {
     if (!this.hasFeature("codex_credential_switch_apply_v1"))
       throw new Error("Codex switch preflight requires codex_credential_switch_apply_v1");
     let res: Response;
@@ -2094,9 +2094,10 @@ export class WorkerClient {
         claim_generation: req.claimGeneration, register_nonce: req.registerNonce, op_id: req.opId,
         target_secret_id: req.targetSecretId,
         ...(req.oldCumulative !== undefined ? { old_cumulative: req.oldCumulative } : {}),
-      });
+      }, this.httpTimeoutMs, signal);
       raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true);
     } catch { return { kind: "uncertain", detail: "preflight_unavailable" }; }
+    if (signal?.aborted) return { kind: "uncertain", detail: "preflight_unavailable" };
     if (res.status !== 200) return { kind: "uncertain", detail: `http_${res.status}` };
     const out = parseJSONRecord(raw.toString("utf8"));
     const invalid = (): CodexSwitchPreflightResult => ({ kind: "uncertain", detail: "malformed_preflight" });

@@ -348,6 +348,42 @@ describe("Codex switch wire contract", () => {
     } finally { await s.close(); }
   });
 
+  it("cancels an in-flight preflight without later success or response secrets", async () => {
+    let respond!: () => void;
+    let arrived!: () => void;
+    const received = new Promise<void>((resolve) => { arrived = resolve; });
+    const srv = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        if (req.url === "/api/worker/register") {
+          res.end(JSON.stringify(registration));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.flushHeaders();
+        respond = () => res.end(JSON.stringify({ outcome: "ready", claim_generation: 7,
+          register_nonce: "n", op_id: "op", token: SECRET }));
+        arrived();
+      });
+    });
+    await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    try {
+      const c = await registered(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`);
+      const cancel = new AbortController();
+      const pending = c.preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }, cancel.signal);
+      await received;
+      cancel.abort(new Error(SECRET));
+      const result = await pending;
+      assert.deepEqual(result, { kind: "uncertain", detail: "preflight_unavailable" });
+      respond();
+      assert.deepEqual(await pending, result);
+      assert.ok(!JSON.stringify(result).includes(SECRET));
+    } finally {
+      srv.closeAllConnections();
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
+  });
+
   it("strict preflight rejects auth and partial or invalid decisions without leaking", async () => {
     const base = { outcome: "ready", claim_generation: 7, register_nonce: "n", op_id: "op" };
     for (const body of [
