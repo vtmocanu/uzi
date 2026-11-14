@@ -1,10 +1,10 @@
 # PRD #3786: Operator setup imports an existing Codex login
 
 **Issue**: [#3786](https://github.com/vtmocanu/uzi/issues/3786)
-**Status**: Draft, design proposed by the maintainers for the reporter to review and implement
+**Status**: Draft; design by the maintainers, open to implementation by the reporter or the maintainers
 **Priority**: Normal
 **Created**: 2026-11-02
-**Depends on**: PRD #3760 (the `/server setup` command, design in PR #3782). This PRD adds one step to that command and cannot ship before it.
+**Depends on**: PRD #3760 (the `/server setup` command, landed in PR #3782). This PRD adds one step to that command.
 **Related**: #3760 (original ask), PRD #1147 (Codex credentials), PRD #32 (per-user vault), `docs/codex-credentials.md`, `docs/vault-threat-model.md`
 
 ## Problem
@@ -71,17 +71,17 @@ Invariant: the web endpoints' status codes, bodies and side effects are unchange
 
 ### M1: Prefactor, shared Codex credential creation
 Extract the operation; the handler calls it. No behaviour change.
-- **Blocked by**: none (can land before PRD #3760's setup command)
+- **Blocked by**: none
 - **Acceptance**: handler tests unchanged and green; new service tests for default selection, create-only collision and transactional rollback; `task gate:api` green.
 
 ### M2: `setup` saves a Codex login
 The flags, single-stdin rule, preflight unlock, report states, docs (operator setup page and `docs/codex-credentials.md`), for Compose and Kubernetes.
-- **Blocked by**: M1, and PRD #3760's setup command merged
+- **Blocked by**: M1
 - **Acceptance**: the three acceptance examples pass in the live-DB test, plus the regression list above; `task gate:api` green.
 
 ### Landing obligations
 - `task docs:sync` after `docs/*.md` edits; CHANGELOG fragment.
-- Add the Codex step to the live `acceptance` issue filed for PRD #3760 (fresh Compose host and Kubernetes via `kubectl exec -i`), including that the login links once the API's poller runs.
+- Maintainer live acceptance of the Codex step on a fresh Compose host and on Kubernetes (via `kubectl exec -i`), together with the outstanding #3760 acceptance, including that the login links once the API's poller runs.
 
 ## Decision Log
 
@@ -96,3 +96,4 @@ The flags, single-stdin rule, preflight unlock, report states, docs (operator se
 9. **At most one stdin source.** Several secret inputs cannot share stdin; refusing up front keeps the parse unambiguous.
 10. **Unlock in preflight.** A wrong password or missing wrapper must not surface after forge and repo writes. Rejected: unlocking lazily at the Codex step.
 11. **Codex subscription login only.** An API key has no staged verification, so `saved_pending_verification` would misdescribe it. Rejected: importing `openai_api_key` in this PRD.
+12. **Not auto-eligible.** The shared create path keeps the schema default `auto_eligible = false`, so an imported login does not join Codex account auto-select. Opting it in stays an owner action in the existing credential settings. (2026-11-14)
