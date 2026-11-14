@@ -5,6 +5,6 @@
   "tip": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "state": "refused",
   "preservation_state": "live",
-  "disposition": "preserve",
+  "disposition": "preserved",
   "reason": "send_suppressed"
 }

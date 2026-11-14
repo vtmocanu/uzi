@@ -3456,6 +3456,11 @@ export const TERMINAL_REASONS = [
   "foreign_tip", "authority_changed",
 ] as const;
 export type TerminalReason = (typeof TERMINAL_REASONS)[number];
+/** Reasons a non-200 can carry that the server never stores or lists in the vocabulary fixture. */
+export type TerminalWireOnlyReason = "busy" | "stale_claim" | "missing_claim_generation" | "invalid_request";
+export type TerminalWireReason = TerminalReason | TerminalWireOnlyReason;
+/** The stored run_terminal_contributions.disposition values; the request's "preserve" is never echoed. */
+export type TerminalResponseDisposition = "preserved" | "closed_issue_abandoned" | "closed_pr_abandoned";
 
 export interface TerminalPreservationResponse {
   preservation_id: string;
@@ -3464,7 +3469,7 @@ export interface TerminalPreservationResponse {
   tip: string;
   state: TerminalContributionState;
   preservation_state: string;
-  disposition: string;
+  disposition: TerminalResponseDisposition;
   reason?: TerminalReason;
 }
 

@@ -4,6 +4,6 @@
   "ref": "refs/uzi-terminal/11111111-1111-4111-8111-111111111111",
   "tip": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "state": "recorded",
-  "preservation_state": "live",
-  "disposition": "preserve"
+  "preservation_state": "not_published",
+  "disposition": "closed_issue_abandoned"
 }

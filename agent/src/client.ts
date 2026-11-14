@@ -93,6 +93,8 @@ import {
   TERMINAL_REASONS,
   type TerminalPreservationRequest,
   type TerminalPreservationResponse,
+  type TerminalWireReason,
+  type TerminalResponseDisposition,
   type PlanCrossCheckReconciliation,
   type StateRequest,
   type UserInput,
@@ -3698,10 +3700,11 @@ export class WorkerClient {
     let body: unknown;
     try { body = JSON.parse(text); } catch { body = undefined; }
     if (res.status !== 200) {
-      const reason = isRecord(body) && typeof body.reason === "string" ? body.reason : undefined;
-      if (reason !== undefined && (TERMINAL_WIRE_ONLY_REASONS.has(reason) || TERMINAL_REASONS.some(r => r === reason)))
-        return { kind: "refused", reason, httpStatus: res.status };
-      return { kind: "unknown", cause: "http_status", httpStatus: res.status };
+      const reason = isRecord(body) && typeof body.reason === "string" ? terminalWireReason(body.reason) : undefined;
+      if (reason === undefined) return { kind: "unknown", cause: "http_status", httpStatus: res.status };
+      if (terminalReasonStatus(reason) !== res.status) return { kind: "unknown", cause: "malformed_response", httpStatus: res.status };
+      if (TERMINAL_RETRYABLE_REASONS.has(reason)) return { kind: "unknown", cause: "retryable", reason, httpStatus: res.status };
+      return { kind: "refused", reason, httpStatus: res.status };
     }
     const response = decodeTerminalPreservationResponse(body, runId);
     if (!response) return { kind: "unknown", cause: "malformed_response", httpStatus: 200 };
@@ -6477,6 +6480,32 @@ const TERMINAL_PRESERVATION_TIMEOUT_MS = 330_000;
 const TERMINAL_PRESERVATION_RESPONSE_MAX_BYTES = 16 * 1024;
 const TERMINAL_WIRE_ONLY_REASONS: ReadonlySet<string> =
   new Set(["busy", "stale_claim", "missing_claim_generation", "invalid_request"]);
+// Reasons the worker may retry as is; they are publish_unknown, never a refusal of the work.
+const TERMINAL_RETRYABLE_REASONS: ReadonlySet<string> =
+  new Set(["busy", "forge_unavailable", "publication_in_flight", "authority_changed"]);
+// The statuses writeTerminalError (api handler) pairs with each reason; anything else is a contradiction.
+const TERMINAL_422_REASONS: ReadonlySet<string> = new Set(["unsupported", "manifest_invalid", "pack_invalid",
+  "tip_missing", "not_descendant", "root_unreachable", "tree_mismatch", "walk_too_large"]);
+function terminalReasonStatus(reason: TerminalWireReason): number {
+  if (TERMINAL_422_REASONS.has(reason)) return 422;
+  switch (reason) {
+    case "pack_too_large": return 413;
+    case "forge_unavailable": return 503;
+    case "busy": return 429;
+    case "invalid_request": return 400;
+    default: return 409;
+  }
+}
+function terminalWireReason(value: string): TerminalWireReason | undefined {
+  return TERMINAL_REASONS.find(r => r === value) ??
+    (TERMINAL_WIRE_ONLY_REASONS.has(value) ? value as TerminalWireReason : undefined);
+}
+// The run_terminal_contributions.disposition CHECK (migration 00449) and its pairing with state.
+const TERMINAL_RESPONSE_DISPOSITIONS: readonly TerminalResponseDisposition[] =
+  ["preserved", "closed_issue_abandoned", "closed_pr_abandoned"];
+// The refusal_reason CHECK: the only reasons a 200 can carry, and only on a refused state.
+const TERMINAL_STORED_REFUSAL_REASONS: ReadonlySet<string> =
+  new Set(["create_refused", "update_refused", "foreign_tip", "send_suppressed"]);
 const TERMINAL_RESPONSE_KEYS: ReadonlySet<string> = new Set([
   "preservation_id", "contribution_id", "ref", "tip", "state", "preservation_state", "disposition", "reason",
 ]);
@@ -6485,8 +6514,9 @@ const TERMINAL_RESPONSE_KEYS: ReadonlySet<string> = new Set([
  *  (`published`) or the server durably recorded it as abandoned (`recorded`); everything ambiguous is `unknown`. */
 export type TerminalPreservationResult =
   | { kind: "final"; outcome: "published" | "recorded"; response: TerminalPreservationResponse }
-  | { kind: "refused"; reason: string; httpStatus: number }
-  | { kind: "unknown"; cause: "malformed_response" | "transport" | "aborted" | "http_status" | "not_final"; httpStatus?: number };
+  | { kind: "refused"; reason: TerminalWireReason; httpStatus: number }
+  | { kind: "unknown"; cause: "malformed_response" | "transport" | "aborted" | "http_status" | "not_final"; httpStatus?: number }
+  | { kind: "unknown"; cause: "retryable"; reason: TerminalWireReason; httpStatus: number };
 
 /** Strict decode of the 200 body; undefined on any defect (unknown field, state, reason, bad tip or ref). */
 // The run_terminal_preservations state CHECK (migration 00448): a value outside it is malformed.
@@ -6498,13 +6528,18 @@ function decodeTerminalPreservationResponse(value: unknown, runId: string): Term
   const state = TERMINAL_CONTRIBUTION_STATES.find(s => s === value.state);
   const reason = value.reason === undefined ? undefined : TERMINAL_REASONS.find(r => r === value.reason);
   if (!state || (value.reason !== undefined && !reason) || !/^[0-9a-f]{40}$/.test(String(value.tip))) return undefined;
-  if (value.ref !== `refs/uzi-terminal/${runId}` || value.disposition !== "preserve") return undefined;
+  if (value.ref !== `refs/uzi-terminal/${runId}`) return undefined;
+  const disposition = TERMINAL_RESPONSE_DISPOSITIONS.find(d => d === value.disposition);
+  // recorded <=> an abandonment disposition (run_terminal_contributions_recorded_check).
+  if (!disposition || (state === "recorded") !== (disposition !== "preserved")) return undefined;
+  // A reason belongs to a refused state and is one of the stored refusal reasons.
+  if (reason !== undefined && (state !== "refused" || !TERMINAL_STORED_REFUSAL_REASONS.has(reason))) return undefined;
   const preservation_id = str("preservation_id"), contribution_id = str("contribution_id"),
     preservation_state = str("preservation_state");
   if (!preservation_id || !contribution_id || !preservation_state ||
       !TERMINAL_PRESERVATION_STATES.has(preservation_state)) return undefined;
   return { preservation_id, contribution_id, ref: value.ref, tip: value.tip as string, state,
-    preservation_state, disposition: "preserve", ...(reason ? { reason } : {}) };
+    preservation_state, disposition, ...(reason ? { reason } : {}) };
 }
 
 const TERMINAL_REJECTION_RESPONSE_MAX_BYTES = 128 * 1024;

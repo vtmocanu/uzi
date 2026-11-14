@@ -148,11 +148,17 @@ describe("publishTerminalPreservation", () => {
     assert.deepEqual(await publish(), { kind: "unknown", cause: "malformed_response", httpStatus: 200 });
   });
 
-  it("recorded is final", async () => {
-    answer = () => Response.json(response("recorded"));
-    const r = await publish();
-    assert.equal(r.kind, "final");
-    if (r.kind === "final") assert.equal(r.outcome, "recorded");
+  for (const name of ["recorded", "recorded-pr"]) {
+    it(`${name} (server-shaped abandonment) is final`, async () => {
+      const body = read<TerminalPreservationResponse>(`response.${name}.json`);
+      answer = () => Response.json(body);
+      assert.deepEqual(await publish(), { kind: "final", outcome: "recorded", response: body });
+    });
+  }
+  it("recorded fixtures carry the stored abandonment dispositions", () => {
+    assert.equal(response("recorded").disposition, "closed_issue_abandoned");
+    assert.equal(response("recorded-pr").disposition, "closed_pr_abandoned");
+    assert.equal(response("published").disposition, "preserved");
   });
 
   it("refused state with a known reason is refused", async () => {
@@ -175,7 +181,8 @@ describe("publishTerminalPreservation", () => {
     });
   }
 
-  for (const name of ["unknown-state", "unknown-reason", "bad-sha", "extra-field"]) {
+  for (const name of ["unknown-state", "unknown-reason", "bad-sha", "extra-field",
+    "request-disposition", "recorded-preserved", "preserved-closed"]) {
     it(`invalid response ${name} is unknown/malformed`, async () => {
       answer = () => Response.json(read(`invalid/response.${name}.json`));
       assert.deepEqual(await publish(), { kind: "unknown", cause: "malformed_response", httpStatus: 200 });
@@ -190,6 +197,8 @@ describe("publishTerminalPreservation", () => {
       JSON.stringify({ ...base, ref: "refs/heads/main" }),
       JSON.stringify(missing),
       JSON.stringify({ ...base, disposition: "discard" }),
+      JSON.stringify({ ...base, disposition: "preserve" }),
+      JSON.stringify({ ...base, disposition: "closed_pr_abandoned" }),
       JSON.stringify([]),
       "not json",
       JSON.stringify({ ...base, preservation_state: "x".repeat(20 * 1024) }),
@@ -199,23 +208,54 @@ describe("publishTerminalPreservation", () => {
     }
   });
 
+  const RETRYABLE = ["publication_in_flight", "authority_changed", "forge_unavailable"];
   for (const [reason, { status_class }] of Object.entries(reasons)) {
+    if (RETRYABLE.includes(reason)) {
+      it(`HTTP ${status_class} ${reason} is unknown/retryable, never refused`, async () => {
+        answer = () => Response.json({ error: "x", reason }, { status: Number(status_class), headers: { "Retry-After": "30" } });
+        assert.deepEqual(await publish(), { kind: "unknown", cause: "retryable", reason, httpStatus: Number(status_class) });
+      });
+      continue;
+    }
     it(`HTTP ${status_class} ${reason} is refused with that reason`, async () => {
       answer = () => Response.json({ error: "terminal preservation refused", reason }, { status: Number(status_class) });
       assert.deepEqual(await publish(), { kind: "refused", reason, httpStatus: Number(status_class) });
     });
   }
 
-  it("wire-only reasons are refused", async () => {
-    for (const [status, reason] of [[429, "busy"], [409, "stale_claim"], [409, "missing_claim_generation"], [400, "invalid_request"]] as const) {
+  it("wire-only reasons: busy is retryable, the rest refused", async () => {
+    answer = () => Response.json({ error: "x", reason: "busy" }, { status: 429 });
+    assert.deepEqual(await publish(), { kind: "unknown", cause: "retryable", reason: "busy", httpStatus: 429 });
+    for (const [status, reason] of [[409, "stale_claim"], [409, "missing_claim_generation"], [400, "invalid_request"]] as const) {
       answer = () => Response.json({ error: "x", reason }, { status });
       assert.deepEqual(await publish(), { kind: "refused", reason, httpStatus: status });
     }
   });
 
-  it("503 forge_unavailable with Retry-After is refused", async () => {
-    answer = () => Response.json({ error: "x", reason: "forge_unavailable" }, { status: 503, headers: { "Retry-After": "30" } });
-    assert.deepEqual(await publish(), { kind: "refused", reason: "forge_unavailable", httpStatus: 503 });
+  it("a status that does not match the reason's mapping is unknown/malformed", async () => {
+    for (const [status, reason] of [[409, "pack_too_large"], [422, "foreign_tip"], [409, "forge_unavailable"],
+      [503, "authority_changed"], [202, "unsupported"], [409, "busy"], [409, "invalid_request"]] as const) {
+      answer = () => Response.json({ error: "x", reason }, { status });
+      assert.deepEqual(await publish(), { kind: "unknown", cause: "malformed_response", httpStatus: status }, `${status} ${reason}`);
+    }
+  });
+
+  it("a 200 reason is allowed only on refused, and only a stored refusal reason", async () => {
+    const bad: Array<[string, unknown]> = [
+      ["reason on published", { ...response("published"), reason: "send_suppressed" }],
+      ["reason on recorded", { ...response("recorded"), reason: "send_suppressed" }],
+      ["reason on invoked", { ...response("invoked"), reason: "forge_unavailable" }],
+      ["refused with a wire-only reason", { ...response("refused"), reason: "forge_unavailable" }],
+      ["refused with a non-stored vocabulary reason", { ...response("refused"), reason: "authority_changed" }],
+    ];
+    for (const [label, body] of bad) {
+      answer = () => Response.json(body);
+      assert.deepEqual(await publish(), { kind: "unknown", cause: "malformed_response", httpStatus: 200 }, label);
+    }
+    for (const reason of ["create_refused", "update_refused", "foreign_tip", "send_suppressed"]) {
+      answer = () => Response.json({ ...response("refused"), reason });
+      assert.deepEqual(await publish(), { kind: "refused", reason, httpStatus: 200 });
+    }
   });
 
   it("an HTTP error without a known reason is unknown", async () => {
