@@ -33,7 +33,7 @@ const ACQUIRE_BOUND_MS = 60_000;
 /** A started projection older than this since ready was sent is not trusted to start work. */
 const START_WINDOW_MS = 45_000;
 /** The api's bound on the age of the custody evidence in a ready report. */
-const CUSTODY_MAX_AGE_MS = 45_000;
+const CUSTODY_MAX_AGE_MS = 40_000;
 
 /** The only two commands a step may run, in order. */
 const STEPS: readonly { readonly command: HibernationPruneCommand; readonly argv: readonly string[] }[] = Object.freeze([
@@ -41,6 +41,9 @@ const STEPS: readonly { readonly command: HibernationPruneCommand; readonly argv
   Object.freeze({ command: "builder_prune" as const, argv: DIND_PRUNE_ARGV.pruneBuildCache }),
 ]);
 for (const step of STEPS) assertDockerArgvAllowed(step.argv);
+
+/** Refusal reasons the api treats as evidence of lost custody or active work (it withdraws). */
+const SAFETY_REASONS: ReadonlySet<Reason> = new Set<Reason>(["custody_stale", "active_work", "claim_in_flight", "gate_not_exclusive"]);
 
 const RANK = { requested: 1, started: 2, unknown: 3, settled: 4 } as const;
 
@@ -82,6 +85,8 @@ interface Attempt {
   readyDropped: boolean;
   refusal?: Reason;
   refusalDone: boolean;
+  /** The decline reason was a safety reason: any not_started result reports throughout=false. */
+  safetyDecline?: boolean;
   result?: { steps: HibernationCachePruneStep[]; throughout: boolean };
   resultSeq?: number;
   pendingSeq?: number;
@@ -220,7 +225,7 @@ export class HibernationCachePruneController {
     a.disposition = "declined";
     a.tombstoned = true;
     a.refusalDone = true; // the api is past requested: a refusal can only be rejected
-    a.result = { steps: notStarted(), throughout: this.exclusive(a) };
+    a.result = { steps: notStarted(), throughout: !a.safetyDecline && this.exclusive(a) };
   }
 
   private onSettled(a: Attempt): void {
@@ -266,7 +271,7 @@ export class HibernationCachePruneController {
     if (!this.deps.isIdle()) { this.lastBusyAt = this.now(); return "active_work"; }
     const c = this.custody;
     const age = c ? this.now() - c.sentAt : Infinity;
-    // The api accepts custody evidence up to 45s old, whatever the heartbeat interval.
+    // The api accepts custody evidence up to 45s old; keep a 5s margin under it.
     const maxAge = Math.min(2 * this.deps.heartbeatIntervalMs, CUSTODY_MAX_AGE_MS);
     if (!c || c.retaining !== false || age < 0 || age > maxAge || c.sentAt <= this.lastBusyAt) {
       return "custody_stale";
@@ -274,19 +279,22 @@ export class HibernationCachePruneController {
     return undefined;
   }
 
-  /** Once a ready may have reached the api (sent and not known dropped by a 409) it may already
-   *  have committed started, where a refusal can only be rejected: decline silently and let the
-   *  started/unknown projection carry a not_started result instead. */
+  /** Always sends the refusal. If the api is still requested it settles at once (a safety reason
+   *  withdraws the hibernation). If a possibly delivered ready already committed started, the
+   *  refusal gets a 409 and is dropped, and the started/unknown projection carries a not_started
+   *  result instead, with gate_exclusive_throughout=false for a safety reason. */
   private refuse(a: Attempt, reason: Reason): void {
     a.disposition = "declined";
     a.tombstoned = true;
-    if (a.readySentAt !== undefined && !a.readyDropped) { a.refusalDone = true; return; }
+    if (SAFETY_REASONS.has(reason)) a.safetyDecline = true;
     a.refusal = reason;
   }
 
-  /** Reports every step not_started; the gate stays held until settled/none, like any result. */
+  /** Reports every step not_started; the gate stays held until settled/none, like any result. A
+   *  safety reason for not executing is reported as a non-exclusive gate so the api withdraws. */
   private declineWithResult(a: Attempt): void {
     a.disposition = "declined";
+    if (this.unsafe(a) !== undefined) a.safetyDecline = true;
     this.notStartedResult(a);
   }
 
@@ -338,7 +346,7 @@ export class HibernationCachePruneController {
       const reason = this.unsafe(a);
       if (reason) {
         this.refuse(a, reason);
-        return a.refusal ? { ...base, kind: "refused", reason } : undefined;
+        return { ...base, kind: "refused", reason };
       }
       a.readySentAt = this.now();
       return {

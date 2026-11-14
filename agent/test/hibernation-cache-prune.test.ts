@@ -651,30 +651,57 @@ describe("hibernation cache prune: a ready whose heartbeat response was lost", (
     return h;
   }
 
-  it("never refuses after a possibly delivered ready, reports not_started on started and again on unknown, then releases on settled", async () => {
+  it("refuses after a possibly delivered ready, a 409 drops it, then a not_started result with throughout false on started and unknown, then releases on settled", async () => {
     const h = await lostReady();
-    assert.equal(h.ctl.report(), undefined, "no refused after a possibly delivered ready");
+    const refused = h.ctl.report();
+    assert.deepEqual({ kind: refused?.kind, reason: refused?.reason }, { kind: "refused", reason: "custody_stale" });
+    h.ctl.reported(refused!, "dropped"); // the api already committed started
+    assert.equal(h.ctl.report(), undefined);
     h.hb(h.proj("started", { reconcile_seq: 2 }));
     await flush();
     const first = h.ctl.report();
-    assert.deepEqual(resultOf(first), { steps: ["image_prune_dangling:not_started", "builder_prune:not_started"], throughout: true });
+    assert.deepEqual(resultOf(first), { steps: ["image_prune_dangling:not_started", "builder_prune:not_started"], throughout: false });
     h.ctl.reported(first!, "sent");
     assert.equal(h.ctl.report(), undefined);
     h.advance(11 * 60_000);
     h.hb(h.proj("unknown", { reconcile_seq: 3 }));
-    assert.deepEqual(resultOf(h.ctl.report()), { steps: ["image_prune_dangling:not_started", "builder_prune:not_started"], throughout: true });
+    assert.deepEqual(resultOf(h.ctl.report()), { steps: ["image_prune_dangling:not_started", "builder_prune:not_started"], throughout: false });
     assert.ok(h.gate.onlyHeldBy("hibernation"), "held until settled");
     h.hb(h.proj("settled", { reconcile_seq: 4 }));
     assert.equal(h.gate.claimsClosed(), false);
     assert.equal(h.calls.filter((c) => c.kind === "step").length, 0);
   });
 
-  it("a cancel observed after a possibly delivered ready is not refused either", async () => {
+  it("a ready that never reached the api: the refusal is sent, the api settles, the gate is released and nothing ran", async () => {
+    const h = await lostReady();
+    const refused = h.ctl.report();
+    assert.equal(refused?.kind, "refused");
+    h.ctl.reported(refused!, "sent"); // api still requested: accepted, settles at once
+    assert.equal(h.ctl.report(), undefined);
+    h.hb(h.proj("settled", { reconcile_seq: 2 }));
+    assert.equal(h.gate.claimsClosed(), false);
+    assert.equal(h.ctl.report(), undefined);
+    assert.equal(h.calls.filter((c) => c.kind === "step").length, 0);
+  });
+
+  it("a cancel observed after a possibly delivered ready is refused as cancelled and the later result keeps throughout true", async () => {
     const h = await lostReady();
     h.hb(h.proj("requested", { cancel_requested: true }));
-    assert.equal(h.ctl.report(), undefined);
+    const refused = h.ctl.report();
+    assert.deepEqual({ kind: refused?.kind, reason: refused?.reason }, { kind: "refused", reason: "cancelled" });
+    h.ctl.reported(refused!, "dropped");
     h.hb(h.proj("started", { reconcile_seq: 2, cancel_requested: true }));
-    assert.deepEqual(resultOf(h.ctl.report()).steps, ["image_prune_dangling:not_started", "builder_prune:not_started"]);
+    assert.deepEqual(resultOf(h.ctl.report()), { steps: ["image_prune_dangling:not_started", "builder_prune:not_started"], throughout: true });
+  });
+
+  it("a safety decline on started after a delivered ready reports throughout false", async () => {
+    const h = harness();
+    await h.toReady();
+    h.state.idle = false; // active work appears before the start
+    h.hb(h.proj("started", { reconcile_seq: 2 }));
+    await flush();
+    assert.deepEqual(resultOf(h.ctl.report()), { steps: ["image_prune_dangling:not_started", "builder_prune:not_started"], throughout: false });
+    assert.equal(h.calls.filter((c) => c.kind === "step").length, 0);
   });
 
   it("a refusal the api rejected as already started is followed by a not_started result", async () => {
@@ -712,24 +739,24 @@ describe("hibernation cache prune: custody age and the gate seam", () => {
     return { ctl, proj, hb, advance: (ms: number) => { time += ms; }, steps: () => 0 };
   }
 
-  it("clamps the accepted custody age to the api's 45s even with a 30s heartbeat interval", async () => {
+  it("clamps the accepted custody age to 40s (5s under the api's 45s) even with a 30s heartbeat interval", async () => {
     const h = withInterval(30_000);
     h.hb(h.proj("requested"));
     await h.ctl.tick();
     h.hb(h.proj("requested"));
     await h.ctl.tick();
-    h.advance(46_000);
+    h.advance(41_000);
     const r = h.ctl.report();
     assert.deepEqual({ kind: r?.kind, reason: r?.reason }, { kind: "refused", reason: "custody_stale" });
   });
 
-  it("still readies with 30s heartbeats when the custody evidence is within 45s", async () => {
+  it("still readies with 30s heartbeats when the custody evidence is within 40s", async () => {
     const h = withInterval(30_000);
     h.hb(h.proj("requested"));
     await h.ctl.tick();
     h.hb(h.proj("requested"));
     await h.ctl.tick();
-    h.advance(40_000);
+    h.advance(39_000);
     assert.equal(h.ctl.report()?.kind, "ready");
   });
 
