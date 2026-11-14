@@ -3,8 +3,11 @@
 // admin, the health chip) above the app-wide banner stack. The classic page stays linked
 // at /overview/classic until M2 retires it.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { api, type TemplateAllocation } from "../lib/api";
+import { agentCountModel } from "../lib/agentCounts";
+import { AgentsChip } from "../components/AgentsChip";
 import { overviewScope, ISSUE_WORK_SCOPE_KEY, USAGE_SCOPE_KEY } from "../lib/prefs";
 import { executingPeople, peopleModel } from "../lib/overviewPeople";
 import { useAuth } from "../auth/AuthContext";
@@ -62,6 +65,35 @@ export function OverviewNext() {
   // The admin's remembered Issue work scope (#4052); written only on a click, so a scope
   // forced to "you" while the admin list loads never overwrites the saved choice.
   const [issueScope, setIssueScope] = useState(() => overviewScope.get(ISSUE_WORK_SCOPE_KEY));
+
+  // The Agents chip's allocation read: once on mount, never polled, separate from
+  // useOverviewData so the Dashboard's requests are untouched. StrictMode (main.tsx) replays
+  // effects in development; the ref keeps that to one request. A failure, even a synchronous
+  // throw, resolves null and hides only the chip.
+  // Keyed to the viewer: a different signed-in user drops the previous viewer's request and
+  // reads their own allocations (the counts join on the viewer's id).
+  const allocRequest = useRef<{ viewerId: string; request: Promise<TemplateAllocation[] | null> } | null>(null);
+  const [allocations, setAllocations] = useState<TemplateAllocation[] | null>(null);
+  const viewerId = user?.id ?? null;
+  useEffect(() => {
+    if (viewerId === null) return;
+    if (allocRequest.current?.viewerId !== viewerId) {
+      if (allocRequest.current !== null) setAllocations(null);
+      allocRequest.current = { viewerId, request: Promise.resolve()
+      .then(() => api.getTemplateAllocations())
+      .then(
+        (r) => r.templates,
+        () => null,
+      ) };
+    }
+    let cancelled = false;
+    void allocRequest.current.request.then((a) => {
+      if (!cancelled) setAllocations(a);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [viewerId]);
 
   if (!user) return null;
 
@@ -123,6 +155,10 @@ export function OverviewNext() {
         demo,
       })
     : null;
+  // The Agents chip's model: every user. Needs both the mount-only allocations and the core
+  // templates read, so it appears once both have landed.
+  const agentCounts =
+    allocations && data ? agentCountModel(allocations, data.agentTemplates, { isAdmin, viewerId: user.id }) : null;
   const showUsageByUser = () => {
     setUsageScope("all");
     overviewScope.set(USAGE_SCOPE_KEY, "all");
@@ -143,6 +179,7 @@ export function OverviewNext() {
               {isAdmin && <HealthChip />}
               {people && <PeopleChip model={people} onShowUsageByUser={showUsageByUser} />}
               {repos && <RepoChip model={repos} />}
+              {agentCounts && <AgentsChip model={agentCounts} />}
               {commandMenu && (
                 <Button variant="secondary" size="sm" onClick={commandMenu.open} aria-keyshortcuts={commandShortcutKeys()}>
                   <SearchIcon aria-hidden="true" />

@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
 // PRD #3877 M1: the default Overview at /dashboard, with the old page at /overview/classic.
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { CommandMenuContext } from "../components/CommandMenuContext";
 import { Dashboard } from "./Dashboard";
-import { api } from "../lib/api";
+import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import { healthySilentDoc, overviewNextDoc } from "../mocks/data";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
@@ -29,6 +30,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       getAdminHealth: vi.fn(),
       listUsers: vi.fn(),
       adminRepoActivity: vi.fn(),
+      getTemplateAllocations: vi.fn(),
     },
   };
 });
@@ -49,6 +51,7 @@ beforeEach(() => {
   mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
   mockApi.listRepos.mockResolvedValue({ repos: [] });
   mockApi.listAgentTemplates.mockResolvedValue({ templates: [] });
+  mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
   mockApi.listConnections.mockResolvedValue({ connections: [] });
   mockApi.getUsage.mockResolvedValue(emptySelf());
@@ -1105,5 +1108,147 @@ describe("OverviewNext Search button", () => {
   it("renders no Search button without a command menu (page mounted outside the shell)", async () => {
     await mount();
     expect(screen.queryByRole("button", { name: /^Search/ })).toBeNull();
+  });
+});
+
+// #4335: the Agents chip sits after the People chip and before Search, for every user.
+describe("OverviewNext Agents chip", () => {
+  const tmpl = (id: string, name: string, scope: AgentTemplate["scope"], userId: string | null = null): AgentTemplate => ({
+    id,
+    name,
+    scope,
+    description: "",
+    model: null,
+    codex_model: null,
+    tools: null,
+    prompt_body: "body",
+    is_builtin: scope === "builtin",
+    user_id: scope === "user" ? userId : null,
+    updated_by: null,
+    differs_from_builtin: false,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  });
+  const alloc = (t: AgentTemplate, effective: boolean, globalDefault = t.scope !== "user"): TemplateAllocation => ({
+    id: t.id,
+    name: t.name,
+    description: "",
+    scope: t.scope,
+    is_builtin: t.is_builtin,
+    global_default: globalDefault,
+    my_override: null,
+    effective,
+  });
+
+  // Three builtins (two on), one global (on), the viewer's own (on) and another user's (dropped).
+  const rows = [
+    tmpl("b1", "coder", "builtin"),
+    tmpl("b2", "tester", "builtin"),
+    tmpl("b3", "lead", "builtin"),
+    tmpl("g1", "release", "global"),
+    tmpl("m1", "mine", "user", aUser.id),
+    tmpl("o1", "theirs", "user", "someone-else"),
+  ];
+  const allocations = [
+    alloc(rows[0], true),
+    alloc(rows[1], true),
+    alloc(rows[2], false),
+    alloc(rows[3], true),
+    alloc(rows[4], true),
+    alloc(rows[5], true),
+  ];
+  const agentsChip = () => screen.getByRole("button", { name: /^Agents:/ });
+  const before = (a: Element, b: Element) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+
+  function mountWithMenu(strict = false) {
+    const page = (
+      <MemoryRouter>
+        <CommandMenuContext.Provider value={{ open: vi.fn() }}>
+          <OverviewNext />
+        </CommandMenuContext.Provider>
+      </MemoryRouter>
+    );
+    return render(strict ? <StrictMode>{page}</StrictMode> : page);
+  }
+
+  it("follows the health and People chips and precedes Search for an admin", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    mountWithMenu();
+    await settle();
+    const health = screen.getByRole("button", { name: /^System health:/ });
+    const people = screen.getByRole("button", { name: /^People:/ });
+    const search = screen.getByRole("button", { name: /^Search/ });
+    expect(before(health, people)).toBe(true);
+    expect(before(people, agentsChip())).toBe(true);
+    expect(before(agentsChip(), search)).toBe(true);
+  });
+
+  it("renders for a non-admin before Search, with no People chip", async () => {
+    mountWithMenu();
+    await settle();
+    expect(screen.queryByRole("button", { name: /^People:/ })).toBeNull();
+    expect(before(agentsChip(), screen.getByRole("button", { name: /^Search/ }))).toBe(true);
+  });
+
+  it("counts from the core templates read joined with the allocations", async () => {
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
+    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
+    mountWithMenu();
+    await settle();
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 4 in your runs of 5");
+    fireEvent.click(agentsChip());
+    const dialog = screen.getByRole("dialog", { name: "Agents in your runs" });
+    expect(within(dialog).getByRole("heading", { name: "4 of 5 agents ride your runs" })).toBeTruthy();
+    expect(within(dialog).queryByText("Admin only")).toBeNull();
+  });
+
+  it("shows the admin-only global defaults count for an admin", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
+    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
+    mountWithMenu();
+    await settle();
+    fireEvent.click(agentsChip());
+    // builtin x3 and global x1 are defaults; the viewer's own row is not.
+    expect(screen.getByText("Global defaults for new users").nextElementSibling?.textContent).toBe("4");
+  });
+
+  it("hides only the chip when the allocations read fails", async () => {
+    mockApi.getTemplateAllocations.mockRejectedValue(new Error("down"));
+    mountWithMenu();
+    await settle();
+    await settle(10_000);
+    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: /^Agents:/ })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Search/ })).toBeTruthy();
+    expect(screen.getByText("Live run row")).toBeTruthy();
+  });
+
+  it("hides only the chip when the allocations call throws synchronously", async () => {
+    mockApi.getTemplateAllocations.mockImplementation(() => {
+      throw new Error("x");
+    });
+    mountWithMenu();
+    await settle();
+    expect(screen.queryByRole("button", { name: /^Agents:/ })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Search/ })).toBeTruthy();
+    expect(screen.getByText("Live run row")).toBeTruthy();
+  });
+
+  it("reads the allocations once under StrictMode and never again while the page polls", async () => {
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
+    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
+    mountWithMenu(true);
+    await settle();
+    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
+    expect(agentsChip()).toBeTruthy();
+    const runsBefore = mockApi.listRuns.mock.calls.length;
+    await settle(10_000);
+    await settle(30_000);
+    expect(mockApi.listRuns.mock.calls.length).toBeGreaterThan(runsBefore);
+    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
   });
 });

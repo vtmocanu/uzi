@@ -4,7 +4,7 @@
 // admins additionally toggle which builtin/global templates are global defaults.
 // Anyone can author a private ("Mine") agent; admins can also publish globals.
 
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
@@ -75,7 +75,6 @@ export function Agents() {
     () => agentCountModel(allocations, templates, { isAdmin, viewerId: user?.id ?? "" }),
     [allocations, templates, isAdmin, user?.id],
   );
-  const scopeSummary = counts.byScope.map((s) => `${s.total} ${s.label.toLowerCase()}`).join(" · ");
 
   // Replace-set writes: the PUT fully replaces the half it carries, so each
   // toggle recomputes the whole set from current state and changes just one entry.
@@ -135,12 +134,14 @@ export function Agents() {
                   <b className="font-semibold text-fg">{counts.inRuns}</b>{" "}
                   {counts.inRuns === 1 ? "rides" : "ride"} your runs
                 </span>
-                {scopeSummary && (
-                  <>
+                {counts.byScope.map((s) => (
+                  <Fragment key={s.scope}>
                     <SummarySep />
-                    <span>{scopeSummary}</span>
-                  </>
-                )}
+                    <span>
+                      {s.total} {s.label.toLowerCase()}
+                    </span>
+                  </Fragment>
+                ))}
                 {counts.globalDefaults !== undefined && (
                   <>
                     <SummarySep />
