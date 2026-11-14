@@ -117,8 +117,8 @@ Both persist across Compose restarts. To refresh the nix store, first run `docke
 
 ## Resource stats and sizing
 
-Once a worker is running, **Settings → Workers** and the Dashboard's "Worker load"
-card show live CPU, memory, and disk gauges, self-reported by the worker from its
+Once a worker is running, the **Workers** page, the new Overview's Capacity rail,
+and the classic Overview's "Worker load" card show live CPU, memory, and disk gauges, self-reported by the worker from its
 own cgroup and filesystem on every heartbeat. A worker under real load (running
 the e2e suite) reported `cpu 1%` / `mem 0.1/4 GiB` / `disk 7.1/20 GiB` — a small,
 honest number, since the SDK subprocess and git were mostly idle between tool

@@ -93,7 +93,7 @@ describe("OverviewNext at 400px", () => {
   it("stacks its cards inside the viewport with no horizontal scroll", async () => {
     await page.viewport(400, 900);
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -150,7 +150,7 @@ describe("OverviewNext issue work line", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -190,7 +190,7 @@ describe("OverviewNext issue work line", () => {
         aRun({ id: "plain", status: "running", issue_iid: 4209 }),
       ] });
       render(
-        <MemoryRouter initialEntries={["/overview/next"]}>
+        <MemoryRouter initialEntries={["/dashboard"]}>
           <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8"><OverviewNext /></main>
         </MemoryRouter>,
       );
@@ -247,7 +247,7 @@ describe("OverviewNext issue work line", () => {
         ],
       });
       render(
-        <MemoryRouter initialEntries={["/overview/next"]}>
+        <MemoryRouter initialEntries={["/dashboard"]}>
           <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
             <OverviewNext />
           </main>
@@ -413,7 +413,7 @@ describe("OverviewNext issue work scope switch", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -568,7 +568,7 @@ describe("OverviewNext issue work cross-check tags", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -813,7 +813,7 @@ describe("OverviewNext capacity rail", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -890,7 +890,7 @@ describe("OverviewNext capacity rail worker rows", () => {
       runs: [aRun({ id: "run-mr-rework", status: "running", issue_iid: 77, issue_title: "Rework the cost cap" })],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -976,7 +976,7 @@ describe("OverviewNext held work card", () => {
       holds: [],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -1065,7 +1065,7 @@ describe("OverviewNext decision card layout", () => {
   async function mountCard(runs: ReturnType<typeof aRun>[]) {
     mockApi.listRuns.mockResolvedValue({ runs });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -1327,7 +1327,7 @@ describe("OverviewNext People chip", () => {
 
   async function mountChip() {
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -1471,7 +1471,7 @@ describe("OverviewNext health chip popover", () => {
   function mountChip() {
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -1484,7 +1484,7 @@ describe("OverviewNext health chip popover", () => {
     await page.viewport(width, 900);
     mockApi.getAdminHealth.mockResolvedValue(passing ? healthySilentDoc() : overviewNextDoc());
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <div style={{ paddingLeft: sidebarWidth }}>
           <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
             <div data-page-content-column className="mx-auto w-full max-w-[68rem]">
@@ -1643,7 +1643,7 @@ describe("OverviewNext health chip popover", () => {
       mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
       // The shell's lg sidebar is a fixed 240px aside beside <main> (AppShell lg:pl-60).
       render(
-        <MemoryRouter initialEntries={["/overview/next"]}>
+        <MemoryRouter initialEntries={["/dashboard"]}>
           <div style={{ paddingLeft: 240 }}>
             <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
               {/* AppShell's content column bounds the actions beside the fixed sidebar. A
@@ -1678,7 +1678,7 @@ describe("OverviewNext health chip popover", () => {
     await page.viewport(1280, 900);
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <CommandMenuContext.Provider value={{ open: () => {} }}>
             <OverviewNext />

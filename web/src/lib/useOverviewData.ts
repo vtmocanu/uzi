@@ -1,5 +1,5 @@
-// The Overview's data loading, shared by Dashboard and the /overview/next preview
-// (PRD #3878): the first load, the 10 s runs/workers poll and the 30 s usage poll that
+// The Overview's data loading, shared by the classic and default pages (PRD #3878, #3877):
+// the first load, the 10 s runs/workers poll and the 30 s usage poll that
 // used to live in Dashboard.tsx, moved here unchanged so the two pages cannot drift in
 // what they fetch or how they poll.
 

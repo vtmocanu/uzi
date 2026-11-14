@@ -136,19 +136,25 @@ function dangerAndAttention(): HealthDoc {
   return doc;
 }
 
-// The Overview preview page: its header goes through InShellHeader. The runs page has none.
-function PreviewPage() {
+// The default Overview puts its header through InShellHeader; the classic page keeps its header in the page.
+function DefaultOverviewPage() {
   return <>
     <InShellHeader><h1>Hdr</h1></InShellHeader>
-    <p>preview content</p>
+    <p>new overview content</p>
     <Link to="/runs">Go to runs</Link>
+  </>;
+}
+function ClassicPage() {
+  return <>
+    <h1>Classic Hdr</h1>
+    <p>classic content</p>
   </>;
 }
 function RunsPage() {
   return <>
     <h1>Runs page</h1>
     <p>runs content</p>
-    <Link to="/overview/next">Go to overview</Link>
+    <Link to="/dashboard">Go to overview</Link>
   </>;
 }
 async function mountAt(path: string) {
@@ -156,7 +162,8 @@ async function mountAt(path: string) {
     <MemoryRouter initialEntries={[path]}>
       <AppShell>
         <Routes>
-          <Route path="/overview/next" element={<PreviewPage />} />
+          <Route path="/dashboard" element={<DefaultOverviewPage />} />
+          <Route path="/overview/classic" element={<ClassicPage />} />
           <Route path="/runs" element={<RunsPage />} />
         </Routes>
       </AppShell>
@@ -174,15 +181,24 @@ const attention = () => screen.queryByRole("status", { name: "Admin health atten
 const follows = (a: Node, b: Node) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
 
 describe("AppShell banner stack and header slot (PRD #3878)", () => {
-  it("renders the page header ABOVE the one banner stack on /overview/next", async () => {
+  it("renders the page header ABOVE the one banner stack on /dashboard", async () => {
     mockApi.getAdminHealth.mockResolvedValue(dangerAndAttention());
-    await mountAt("/overview/next");
+    await mountAt("/dashboard");
     const header = screen.getByRole("heading", { name: "Hdr" });
     expect(screen.getAllByRole("alert", { name: "Instance health" })).toHaveLength(1);
     expect(screen.getAllByRole("status", { name: "Admin health attention" })).toHaveLength(1);
     expect(follows(header, danger()!)).toBe(true);
     expect(follows(danger()!, attention()!)).toBe(true);
-    expect(follows(attention()!, screen.getByText("preview content"))).toBe(true);
+    expect(follows(attention()!, screen.getByText("new overview content"))).toBe(true);
+  });
+
+  it("renders the classic Overview header below the same banner stack", async () => {
+    mockApi.getAdminHealth.mockResolvedValue(dangerAndAttention());
+    await mountAt("/overview/classic");
+    expect(screen.getAllByRole("alert", { name: "Instance health" })).toHaveLength(1);
+    expect(screen.getAllByRole("status", { name: "Admin health attention" })).toHaveLength(1);
+    expect(follows(danger()!, attention()!)).toBe(true);
+    expect(follows(attention()!, screen.getByRole("heading", { name: "Classic Hdr" }))).toBe(true);
   });
 
   it("renders the stack once, above the content and in the same order, on /runs", async () => {
@@ -194,7 +210,7 @@ describe("AppShell banner stack and header slot (PRD #3878)", () => {
     expect(follows(attention()!, screen.getByRole("heading", { name: "Runs page" }))).toBe(true);
   });
 
-  it("keeps a danger snooze across navigation to /overview/next before any poll confirms it", async () => {
+  it("keeps a danger snooze across navigation to /dashboard before any poll confirms it", async () => {
     mockApi.getAdminHealth.mockResolvedValue(dangerAndAttention());
     mockApi.snoozeAdminHealth.mockResolvedValue({ episode_id: "b1f0c2ep", snoozed_until: "2099-01-01T00:00:00Z" });
     await mountAt("/runs");
@@ -210,7 +226,7 @@ describe("AppShell banner stack and header slot (PRD #3878)", () => {
     expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(1);
   });
 
-  it("still shows the danger banner on /overview/next after a rejected snooze", async () => {
+  it("still shows the danger banner on /dashboard after a rejected snooze", async () => {
     mockApi.getAdminHealth.mockResolvedValue(dangerAndAttention());
     mockApi.snoozeAdminHealth.mockRejectedValue(new Error("write failed"));
     await mountAt("/runs");
@@ -221,7 +237,7 @@ describe("AppShell banner stack and header slot (PRD #3878)", () => {
     expect(follows(screen.getByRole("heading", { name: "Hdr" }), danger()!)).toBe(true);
   });
 
-  it("keeps an attention dismissal across /runs, /overview/next and back", async () => {
+  it("keeps an attention dismissal across /runs, /dashboard and back", async () => {
     mockApi.getAdminHealth.mockResolvedValue(dangerAndAttention());
     await mountAt("/runs");
     await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Dismiss Recovery storage" })); });
@@ -249,11 +265,11 @@ describe("AppShell banner stack and header slot (PRD #3878)", () => {
     });
     const locked = () => screen.queryAllByRole("alert").filter((el) => /Vault locked/.test(el.textContent ?? ""));
 
-    it("renders the vault-locked banner once, after the portalled header, on /overview/next", async () => {
-      await mountAt("/overview/next");
+    it("renders the vault-locked banner once, after the portalled header, on /dashboard", async () => {
+      await mountAt("/dashboard");
       expect(locked()).toHaveLength(1);
       expect(follows(screen.getByRole("heading", { name: "Hdr" }), locked()[0])).toBe(true);
-      expect(follows(locked()[0], screen.getByText("preview content"))).toBe(true);
+      expect(follows(locked()[0], screen.getByText("new overview content"))).toBe(true);
     });
 
     it("renders the vault-locked banner once, before the page content, on /runs", async () => {

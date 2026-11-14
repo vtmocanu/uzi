@@ -1,7 +1,7 @@
-// The Overview preview at /overview/next (PRD #3878): the same data as Dashboard through
+// The default Overview at /dashboard (PRD #3877 M1): the same data as the classic page through
 // the shared useOverviewData hook, with a header that carries a status sentence (and, for an
-// admin, the health chip) above the app-wide banner stack. It is a preview route, linked
-// from and back to the current Overview at /dashboard.
+// admin, the health chip) above the app-wide banner stack. The classic page stays linked
+// at /overview/classic until M2 retires it.
 
 import { useState } from "react";
 import { Link } from "react-router-dom";
@@ -139,8 +139,8 @@ export function OverviewNext() {
                   </kbd>
                 </Button>
               )}
-              <Link to="/dashboard" className="text-sm font-medium text-brand hover:text-brand-hover">
-                Back to the current Overview
+              <Link to="/overview/classic" className="text-sm font-medium text-brand hover:text-brand-hover">
+                Back to the old Overview
               </Link>
             </>
           }

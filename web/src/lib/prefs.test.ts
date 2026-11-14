@@ -155,7 +155,7 @@ describe("selectedForge (issue #578)", () => {
   });
 });
 
-// #4052: the remembered You / All users scope of the Overview preview's cards.
+// #4052: the remembered You / All users scope of the default Overview's cards.
 describe("overviewScope", () => {
   const KEY = "uzi.overviewIssueWorkScope";
 

@@ -150,7 +150,7 @@ export function maintenanceDoc(): HealthDoc {
 }
 
 // overview-next (PRD #3878): one owner warning that opts into the admin attention banner,
-// so the Overview preview shows that banner and a non-passing health chip.
+// so the default Overview shows that banner and a non-passing health chip.
 export function overviewNextDoc(): HealthDoc {
   return doc(
     build({

@@ -27,7 +27,7 @@ function costShares(totals: number[], factoryTotal: number): number[] {
 // Each row's displayed cost share (whole percents summing to 100) from the rows' recorded
 // dollar costs and the factory's. Rank uses unrounded cost; shares use integer microdollars.
 // undefined when the factory recorded no cost, so callers show "—" instead of a fabricated 0%.
-// Shared by the current Overview's per-user table and the preview's By user table.
+// Shared by the classic Overview's per-user table and the default Overview's By user table.
 export function costShareRows(rowCosts: number[], factoryCost: number): number[] | undefined {
   const factoryMicroUSD = Math.round(factoryCost * 1e6);
   if (factoryMicroUSD <= 0) return undefined;

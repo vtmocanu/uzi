@@ -482,8 +482,8 @@ volume before a cold move is allowed.
 ## Disk self-heal
 
 A hosted worker also reports its disk usage now — the same CPU/memory gauges
-in **Settings → Workers** and the Dashboard's "Worker load" card gain a Disk
-bar per volume (`/nix`, `/data`); see [Resource stats and
+on the **Workers** page, the new Overview's Capacity rail, and the classic
+Overview's "Worker load" card gain a Disk bar per volume (`/nix`, `/data`); see [Resource stats and
 sizing](./worker-setup.md#resource-stats-and-sizing).
 
 Automatic recycle handles these cases:

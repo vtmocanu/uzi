@@ -1,4 +1,4 @@
-// The Overview preview's "Needs your decision" card (PRD #3878 M2, regrouped by #4041): the
+// The default Overview's "Needs your decision" card (PRD #3878 M2, regrouped by #4041): the
 // viewer's own plan reviews, questions, owner-action parks and open pull requests, held work
 // first and PRs last. Several items of one kind (and every open PR) collapse into one group row
 // that previews three and expands in place, each item keeping its own action. Self-hiding when

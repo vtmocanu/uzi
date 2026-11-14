@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-// PRD #3878 M1: the /overview/next preview page.
+// PRD #3877 M1: the default Overview at /dashboard, with the old page at /overview/classic.
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -77,7 +77,7 @@ async function settle(ms = 0) {
   });
 }
 
-async function mount(page: "next" | "dashboard" = "next") {
+async function mount(page: "next" | "classic" = "next") {
   const view = render(<MemoryRouter>{page === "next" ? <OverviewNext /> : <Dashboard />}</MemoryRouter>);
   await settle();
   return view;
@@ -102,12 +102,12 @@ describe("OverviewNext for a non-admin", () => {
     expect(screen.queryByRole("button", { name: /System health/ })).toBeNull();
   });
 
-  it("links back to the current Overview, and Dashboard links here", async () => {
+  it("links to the classic Overview, which links back to the new default", async () => {
     await mount();
-    expect(screen.getByRole("link", { name: "Back to the current Overview" }).getAttribute("href")).toBe("/dashboard");
+    expect(screen.getByRole("link", { name: "Back to the old Overview" }).getAttribute("href")).toBe("/overview/classic");
     cleanup();
-    await mount("dashboard");
-    expect(screen.getByRole("link", { name: "Try the new Overview" }).getAttribute("href")).toBe("/overview/next");
+    await mount("classic");
+    expect(screen.getByRole("link", { name: "Go to the new Overview" }).getAttribute("href")).toBe("/dashboard");
   });
 
   it("lists only the viewer's active runs, with the empty state when there are none", async () => {
@@ -254,11 +254,11 @@ describe("Capacity rail", () => {
     expect(within(rail).getAllByText("No stats reported")).toHaveLength(2);
   });
 
-  it("keeps Worker load on /dashboard", async () => {
+  it("keeps Worker load on the classic Overview", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [aWorker({ stats_cpu_pct: 10, stats_mem_bytes: 1024, stats_source: "cgroup" })],
     });
-    await mount("dashboard");
+    await mount("classic");
     expect(screen.getByText("Worker load")).toBeTruthy();
   });
 });
@@ -269,7 +269,7 @@ describe("carried-over sections take the same inputs as Dashboard", () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [aWorker({ id: "h1", kind: "hosted", status: "offline", upgrade_status: "capacity_blocked" })],
     });
-    await mount("dashboard");
+    await mount("classic");
     const onDashboard = screen.getByRole("status", { name: "Your hosted workers" }).textContent;
     expect(onDashboard).toContain("Your hosted workers cannot start right now.");
     cleanup();
@@ -324,7 +324,7 @@ describe("Held work card", () => {
       aggregate: heldAggregate({ open_holds: 1, admission_counted_holds: 1, decision_needed: 1 }),
       holds: [],
     });
-    await mount("dashboard");
+    await mount("classic");
     const alert = screen.getByRole("status", { name: "Held work" });
     const dashboardHeadline = within(alert).getByRole("heading").textContent;
     expect(alert.textContent).toContain("2 runs waiting to recover");
@@ -442,7 +442,7 @@ describe("Held work card", () => {
   });
 
   it("does not fetch holds on Dashboard beyond its own alert", async () => {
-    await mount("dashboard");
+    await mount("classic");
     expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(1);
   });
 });
@@ -990,7 +990,7 @@ describe("OverviewNext Search button", () => {
     const health = screen.getByRole("button", { name: /^System health:/ });
     const people = screen.getByRole("button", { name: /^People:/ });
     const search = screen.getByRole("button", { name: /^Search/ });
-    const back = screen.getByRole("link", { name: "Back to the current Overview" });
+    const back = screen.getByRole("link", { name: "Back to the old Overview" });
     const before = (a: Element, b: Element) =>
       (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
     expect(before(health, people)).toBe(true);

@@ -2053,10 +2053,11 @@ holds keeps resuming; once that one run alone holds the limit, it is not started
 (a per-run bound that applies even when you are below the owner limit; discard or settle
 that run's own holds to free it).
 When the owner limit is reached, or when any of your queued runs has reached its own
-hold limit while you are still below the owner limit, the dashboard shows a full-width alert beneath the page
-heading with your custody admission unit use, how many held sources need a decision, how
+hold limit while you are still below the owner limit, the new Overview's **Held work** card
+shows your custody admission unit use, how many held sources need a decision, how
 many runs are blocked, and, when at least one hold needs a decision, a
-**Review held work** button; if you connected Slack, then when the owner limit is
+**Review held work** link. During the classic-Overview soak, the old page keeps its
+full-width alert beneath the heading. If you connected Slack, then when the owner limit is
 reached you also get one coalesced direct message per blocked episode (not one
 per run) carrying your open-hold and blocked-run counts, a link to the surface,
 and the exact discard command. A queued run that reaches its own bound instead gets

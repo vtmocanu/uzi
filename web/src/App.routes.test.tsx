@@ -18,7 +18,7 @@
 import { Component, type ReactElement, type ReactNode } from "react";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 
 // Populated by beforeAll from the mock-mode module graph. Never import these
 // statically — see the file header.
@@ -172,6 +172,48 @@ describe("mock-mode route smoke", () => {
     unmount();
     cleanup();
   });
+});
+
+function RouteLocation() {
+  const { pathname, search, hash } = useLocation();
+  return <output data-testid="route-location">{pathname + search + hash}</output>;
+}
+
+describe("Overview promotion (PRD #3877 M1)", () => {
+  it("renders the new Overview at /dashboard", async () => {
+    await mockApi.login("vlad@uzi.local", "x");
+    const { holder, container, unmount } = await mountRoute("/dashboard");
+    expectRenderedCleanly("promoted /dashboard", holder, container);
+    expect(await screen.findByRole("region", { name: "Issue work" })).toBeTruthy();
+    unmount();
+    cleanup();
+  }, 30000);
+
+  it("keeps the old Overview one click away at /overview/classic", async () => {
+    await mockApi.login("vlad@uzi.local", "x");
+    const { holder, container, unmount } = await mountRoute("/overview/classic");
+    expectRenderedCleanly("classic /overview/classic", holder, container);
+    expect(await screen.findByText("Agent templates")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Go to the new Overview" }).getAttribute("href")).toBe("/dashboard");
+    unmount();
+    cleanup();
+  }, 30000);
+
+  it("redirects the preview bookmark to /dashboard with query and hash intact", async () => {
+    await mockApi.login("vlad@uzi.local", "x");
+    const { unmount } = render(
+      <MemoryRouter initialEntries={["/overview/next?mock=overview-next#x"]}>
+        <AuthProvider>
+          <App />
+          <RouteLocation />
+        </AuthProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByTestId("route-location").textContent).toBe("/dashboard?mock=overview-next#x"));
+    expect(await screen.findByRole("region", { name: "Issue work" })).toBeTruthy();
+    unmount();
+    cleanup();
+  }, 30000);
 });
 
 // The route smoke test above mounts each param route at its `sample` and only

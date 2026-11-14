@@ -41,12 +41,12 @@ It surfaces six ways:
   anything needs attention, red when any check is danger and amber
   otherwise; its accessible label names each severity ("3 health checks need
   attention: 2 danger, 1 warning").
-- **Overview**, for an admin: a self-hiding card beside the custody-hold
-  alert. When every check passes it collapses to one quiet line ("System
-  health: all N checks passing"); otherwise it shows the verdict and the top
-  three attention items, including each item's evidence and docs link,
-  with one Open health link to the Health tab. It makes no request at all
-  for a non-admin.
+- **Overview**, for an admin: a health chip in the page header opens a popover.
+  When every check passes it lists them by area; otherwise it shows every
+  attention item with its evidence and docs link, plus a disclosure for passing
+  checks. The popover has an Open health link. During the short classic-Overview
+  soak, `/overview/classic` still has the older self-hiding health card beside
+  its custody alert. Neither page makes an admin-health request for a non-admin.
 - **An app-wide Danger banner**, admins only, shown while `blocking` is
   `true`. It carries the instance-blocker verdict, the first instance danger
   check's own summary, an Open health link, and **Snooze 1 h** — per admin, per danger
