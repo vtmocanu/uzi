@@ -2127,8 +2127,11 @@ type Service struct {
 	// heldDeleteFn is the held cleanup's CAS delete (default pushbroker.Delete); heldCleanupHook,
 	// when set, runs inside the cleanup transaction after the run lock and before any forge call
 	// (test fault injection). Both belong to SweepHeldPublications (held_cleanup.go).
-	heldDeleteFn       func(ctx context.Context, o pushbroker.DeleteOptions) error
-	heldCleanupHook    func(stage string)
+	heldDeleteFn    func(ctx context.Context, o pushbroker.DeleteOptions) error
+	heldCleanupHook func(stage string)
+	// terminal holds the terminal-preservation route's broker seams and fault-injection points
+	// (terminal_preservation.go); its zero value uses the pushbroker functions.
+	terminal           terminalHooks
 	salvageLeadPending bool
 	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
 	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.

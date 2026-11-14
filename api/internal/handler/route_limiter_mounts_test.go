@@ -952,6 +952,8 @@ var wantRouteMounts = []routeMount{
 	// Issue #2545 step A: the failed run's held-work upload. Worker-authenticated, no per-user
 	// limiter; a process-wide slot cap bounds it instead (AcquireHeldPublishSlot).
 	{"POST", "/api/worker/runs/{id}/held-publication", noLimiter},
+	// Issue #4007: the terminal-preservation upload, worker-authenticated and unlimited like the held-work upload above.
+	{"POST", "/api/worker/runs/{id}/terminal-preservation", noLimiter},
 	{"POST", "/api/worker/runs/{id}/review", noLimiter},
 	// PRD #400 M4a: the review run's diff-findings POST. Worker-authenticated, no per-user
 	// limiter, matching the judge's worker review POST above it.

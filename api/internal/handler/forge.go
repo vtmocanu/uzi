@@ -494,6 +494,18 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 		h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, held)
 		return
 	}
+	// Issue #4007: a pointer-bearing terminal preservation keeps refs/uzi-terminal/<run-id> on the
+	// forge and needs the connection's credential to retire it. Refuse with a 409 naming the refs.
+	terminal, err := h.q.CountLiveTerminalPreservationsForConnection(r.Context(), store.CountLiveTerminalPreservationsForConnectionParams{ConnectionID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count terminal refs for connection delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if terminal > 0 {
+		h.writeConnectionTerminalConflict(r.Context(), w, id, user.ID, terminal)
+		return
+	}
 	prerequisites, err := h.q.CountLivePrerequisiteClosuresForConnection(r.Context(), store.CountLivePrerequisiteClosuresForConnectionParams{ConnectionID: id, UserID: user.ID})
 	if err != nil {
 		slog.Error("count prerequisite closures for connection delete", "error", err)
@@ -515,6 +527,11 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 		// Same race for a held publication recorded between its count and this delete.
 		if isHeldRestrict(err) {
 			h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
+		// Same race for a terminal preservation recorded between its count and this delete.
+		if isTerminalRestrict(err) {
+			h.writeConnectionTerminalConflict(r.Context(), w, id, user.ID, -1)
 			return
 		}
 		if isPrerequisiteRestrict(err) {
@@ -946,6 +963,17 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		h.writeRepoHeldConflict(r.Context(), w, id, user.ID, held)
 		return
 	}
+	// Issue #4007: the same guard for a pointer-bearing terminal preservation ref of one of the repo's runs.
+	terminal, err := h.q.CountLiveTerminalPreservationsForRepo(r.Context(), store.CountLiveTerminalPreservationsForRepoParams{RepoID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count terminal refs for repo delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if terminal > 0 {
+		h.writeRepoTerminalConflict(r.Context(), w, id, user.ID, terminal)
+		return
+	}
 	prerequisites, err := h.q.CountLivePrerequisiteClosuresForRepo(r.Context(), store.CountLivePrerequisiteClosuresForRepoParams{RepoID: id, UserID: user.ID})
 	if err != nil {
 		slog.Error("count prerequisite closures for repo delete", "error", err)
@@ -968,6 +996,10 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		}
 		if isHeldRestrict(err) {
 			h.writeRepoHeldConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
+		if isTerminalRestrict(err) {
+			h.writeRepoTerminalConflict(r.Context(), w, id, user.ID, -1)
 			return
 		}
 		if isPrerequisiteRestrict(err) {
@@ -1203,6 +1235,97 @@ func writeHeldConflict(w http.ResponseWriter, what string, count int64, rows []h
 			"Remove the %s after the block lifts", what, count, named, what),
 		"held_refs":  refs,
 		"held_count": count,
+	})
+}
+
+// terminalRefListCap bounds how many live terminal preservations a removal 409 names; the total
+// is always reported in terminal_count.
+const terminalRefListCap = 5
+
+// terminalRestrictConstraint is run_terminal_preservations' live pointer FK (migration 00448).
+// The handlers match it by name so only a terminal restriction maps to the terminal 409.
+const terminalRestrictConstraint = "run_terminal_preservations_live_run_id_fkey"
+
+// isTerminalRestrict reports whether err is the foreign-key violation (23503) raised when a delete
+// cascades onto a run that a pointer-bearing terminal preservation still points at.
+func isTerminalRestrict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == terminalRestrictConstraint
+}
+
+// terminalConflictRow is one pointer-bearing terminal preservation a removal 409 names.
+type terminalConflictRow struct {
+	RunID uuid.UUID
+	State string
+	Ref   string
+}
+
+// writeRepoTerminalConflict writes the repo-removal terminal-preservation 409 (owner-scoped).
+// count < 0 means the guard raced: the count is re-read so the response still reports a total.
+func (h *Handler) writeRepoTerminalConflict(ctx context.Context, w http.ResponseWriter, repoID, userID uuid.UUID, count int64) {
+	if count < 0 {
+		n, err := h.q.CountLiveTerminalPreservationsForRepo(ctx, store.CountLiveTerminalPreservationsForRepoParams{RepoID: repoID, UserID: userID})
+		if err != nil {
+			slog.Error("count terminal refs for repo delete", "error", err)
+		}
+		count = n
+	}
+	rows, err := h.q.ListLiveTerminalRefsForRepo(ctx, store.ListLiveTerminalRefsForRepoParams{RepoID: repoID, UserID: userID, Lim: terminalRefListCap})
+	if err != nil {
+		slog.Error("list terminal refs for repo delete", "error", err)
+	}
+	named := make([]terminalConflictRow, 0, len(rows))
+	for _, row := range rows {
+		named = append(named, terminalConflictRow{RunID: row.RunID, State: row.State, Ref: row.Ref})
+	}
+	writeTerminalConflict(w, "repo", count, named)
+}
+
+// writeConnectionTerminalConflict is writeRepoTerminalConflict for a forge connection removal.
+func (h *Handler) writeConnectionTerminalConflict(ctx context.Context, w http.ResponseWriter, connID, userID uuid.UUID, count int64) {
+	if count < 0 {
+		n, err := h.q.CountLiveTerminalPreservationsForConnection(ctx, store.CountLiveTerminalPreservationsForConnectionParams{ConnectionID: connID, UserID: userID})
+		if err != nil {
+			slog.Error("count terminal refs for connection delete", "error", err)
+		}
+		count = n
+	}
+	rows, err := h.q.ListLiveTerminalRefsForConnection(ctx, store.ListLiveTerminalRefsForConnectionParams{ConnectionID: connID, UserID: userID, Lim: terminalRefListCap})
+	if err != nil {
+		slog.Error("list terminal refs for connection delete", "error", err)
+	}
+	named := make([]terminalConflictRow, 0, len(rows))
+	for _, row := range rows {
+		named = append(named, terminalConflictRow{RunID: row.RunID, State: row.State, Ref: row.Ref})
+	}
+	writeTerminalConflict(w, "connection", count, named)
+}
+
+// writeTerminalConflict writes the removal 409 for pointer-bearing terminal preservations. what
+// is "repo" or "connection", count the total number of such rows, rows the (at most
+// terminalRefListCap) rows named. terminal_refs lists every named refs/uzi-terminal ref;
+// terminal_count is the total. A lookup that failed or raced still refuses: the count is floored
+// at the number of rows named, and at 1.
+func writeTerminalConflict(w http.ResponseWriter, what string, count int64, rows []terminalConflictRow) {
+	refs := make([]string, 0, len(rows))
+	parts := make([]string, 0, len(rows)+1)
+	for _, row := range rows {
+		refs = append(refs, row.Ref)
+		parts = append(parts, row.Ref+" ("+row.State+")")
+	}
+	count = max(count, int64(len(rows)), 1)
+	named := ""
+	if len(parts) > 0 {
+		if int64(len(rows)) < count {
+			parts = append(parts, fmt.Sprintf("and %d more", count-int64(len(rows))))
+		}
+		named = " (" + strings.Join(parts, "; ") + ")"
+	}
+	httpx.JSON(w, http.StatusConflict, map[string]any{
+		"error": fmt.Sprintf("this %s has %d terminal-preservation ref(s) of finished runs still on the forge%s; "+
+			"a ref clears when its retirement completes against the forge, so remove the %s after the block lifts", what, count, named, what),
+		"terminal_refs":  refs,
+		"terminal_count": count,
 	})
 }
 
