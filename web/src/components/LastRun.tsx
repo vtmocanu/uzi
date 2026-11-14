@@ -16,8 +16,7 @@ import { scheduleSkipReasonLabel } from "../lib/scheduleSkipReasons";
 import type { LastFireStarted, LastFire, LastFireSkip, Schedule, ScheduleSkipReason } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import { api, type Run } from "../lib/api";
-import { credentialSwitchHold } from "../lib/credentialSwitchHold";
-import { parkLabel } from "../lib/runBadge";
+import { offersOwnerActionsLink, parkLabel } from "../lib/runBadge";
 
 // Outcomes use the fire-time snapshot, including after the selector has been edited.
 export function labelRemovalOutcome(run: LastFireStarted): string | null {
@@ -165,8 +164,7 @@ function CurrentStartedRun({ runId }: { runId: string }) {
   return <span className="text-[11.5px] text-muted">
     {current?.run ? `Current: ${parkLabel(current.run)}` : current?.unavailable ? "Current state unavailable" : "Loading current state…"}
     {current?.run && (
-      (current.run.status === "paused" && (current.run.hold_reason === "provider_unavailable" || current.run.hold_reason === "iteration_budget_exhausted")) ||
-      credentialSwitchHold(current.run) !== null) &&
+      offersOwnerActionsLink(current.run)) &&
       <Link className="ml-2 underline" to={`/runs/${runId}`}>View owner actions</Link>}
   </span>;
 }
