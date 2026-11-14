@@ -77,8 +77,8 @@ func TestAdminHealthAuthLiveDB(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
 		t.Fatalf("decode health doc: %v (body %s)", err, rec.Body.String())
 	}
-	if len(doc.Checks) != 24 {
-		t.Fatalf("health doc carries %d checks, want the 24 checks (fleet.hibernation_wake from PRD #4205 M6 + 11 M1 + controller.report, loops, forge.ciwatch from M2 + forge.sync from M3 + fleet.rundisk from PRD #1809 M6 + fleet.quarantine from issue #2213 + fleet.memory_authority from issue #3142 + pricing.codex from PRD #2560 + db.size from issue #2623 + recovery.storage + agentsource.update + maintenance.active from PRD #3454)\nbody: %s", len(doc.Checks), rec.Body.String())
+	if len(doc.Checks) != 25 {
+		t.Fatalf("health doc carries %d checks, want the 25 checks (fleet.hibernation_cleanup from PRD #4206 + fleet.hibernation_wake from PRD #4205 M6 + 11 M1 + controller.report, loops, forge.ciwatch from M2 + forge.sync from M3 + fleet.rundisk from PRD #1809 M6 + fleet.quarantine from issue #2213 + fleet.memory_authority from issue #3142 + pricing.codex from PRD #2560 + db.size from issue #2623 + recovery.storage + agentsource.update + maintenance.active from PRD #3454)\nbody: %s", len(doc.Checks), rec.Body.String())
 	}
 	foundUpdate := false
 	for i, c := range doc.Checks {

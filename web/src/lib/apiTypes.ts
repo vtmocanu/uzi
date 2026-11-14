@@ -2827,6 +2827,12 @@ export interface ForgeOriginCooldown {
   surfaces?: string[];
 }
 
+export interface WorkerHibernationCleanup {
+  state: "none" | "cleaning" | "unknown" | "settled";
+  outcome: "pruned" | "skipped" | "failed" | null;
+  reason: string | null;
+}
+
 export interface Worker {
   forge_origin_cooldowns?: ForgeOriginCooldown[];
   // Optional for compatibility with APIs predating manual owner cordons.
@@ -2843,6 +2849,9 @@ export interface Worker {
   hibernated_at: string | null;
   wake_requested_at: string | null;
   wake_error: string | null;
+  // Hibernation cache cleanup (PRD #4206). The key is always sent by a current api, null when
+  // no attempt was made; optional here for older APIs and bare fixtures.
+  hibernation_cleanup?: WorkerHibernationCleanup | null;
   // Omitted when absent, invalid or older than the API's independent receipt TTL.
   roll_pacing?: WorkerRollPacing;
   id: string;

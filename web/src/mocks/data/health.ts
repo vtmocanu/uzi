@@ -19,6 +19,7 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "fleet.quarantine", scope: "owner", group: "workers", title: "Worker residue quarantine", doc: "hosted-workers" },
   { id: "fleet.memory_authority", scope: "owner", group: "workers", title: "Worker memory authority", doc: "hosted-workers" },
   { id: "fleet.hibernation_wake", scope: "instance", group: "workers", title: "Hibernation wakes", doc: "hosted-workers" },
+  { id: "fleet.hibernation_cleanup", scope: "instance", group: "workers", title: "Hibernation cache cleanup", doc: "hosted-workers" },
   { id: "queue.waiting", scope: "owner", group: "queue", title: "Runs waiting for a worker", doc: null },
   { id: "queue.undispatched", scope: "owner", group: "queue", title: "Undispatched task runs", doc: null },
   { id: "controller.report", scope: "instance", group: "control", title: "Controller reporting", doc: "hosted-workers" },
@@ -47,6 +48,7 @@ const OK_SUMMARY: Record<string, string> = {
   "fleet.quarantine": "No worker reports a residue quarantine.",
   "fleet.memory_authority": "No worker has lost memory authority.",
   "fleet.hibernation_wake": "No hosted worker has a failed or overdue wake.",
+  "fleet.hibernation_cleanup": "No hosted worker has an unsettled hibernation cache cleanup.",
   "queue.waiting": "No run is waiting for a worker.",
   "queue.undispatched": "No task run is stuck undispatched.",
   "controller.report": "The controller is reporting.",
@@ -317,6 +319,7 @@ export function noHostedWorkersDoc(): HealthDoc {
     build({
       "fleet.roll": { severity: "na", summary: "No hosted workers are configured on this deployment." },
       "fleet.hibernation_wake": { severity: "na", summary: "No hosted workers are configured on this deployment." },
+      "fleet.hibernation_cleanup": { severity: "na", summary: "No hosted workers are configured on this deployment." },
       "controller.report": {
         severity: "na",
         summary: "No hosted workers are configured, so the controller does not report.",

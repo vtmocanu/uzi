@@ -182,6 +182,9 @@ var d7UntrustedFields = []string{
 	// view) through renderer.Plain; HibernationReason is not drawn and stays as a tripwire.
 	"WakeError",
 	"HibernationReason",
+	// HibernationCleanupDTO.CleanupReason (PRD #4206): the bounded cleanup reason code for a
+	// skipped or failed hibernation cache cleanup. Not drawn in the tui; a tripwire only.
+	"CleanupReason",
 	"PathWithNamespace",
 	// WebURL is the PR's forge URL, drawn only as an OSC-8 hyperlink target via oscLink
 	// (pullLink, https-gated). Like IssueWebURL it stays here as a tripwire for any DIRECT

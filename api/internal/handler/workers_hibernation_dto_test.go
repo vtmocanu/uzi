@@ -34,3 +34,48 @@ func TestWorkerDTOHibernationFields(t *testing.T) {
 		t.Fatalf("zero worker: %+v", zero)
 	}
 }
+
+func TestWorkerDTOHibernationCleanup(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	txt := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
+	cases := []struct {
+		name                   string
+		w                      store.Worker
+		wantNil                bool
+		state, outcome, reason string
+	}{
+		{name: "none without outcome", w: store.Worker{CleanupPhase: "none"}, wantNil: true},
+		{name: "empty phase without outcome", w: store.Worker{}, wantNil: true},
+		{name: "requested is cleaning", w: store.Worker{CleanupPhase: "requested"}, state: "cleaning"},
+		{name: "started is cleaning", w: store.Worker{CleanupPhase: "started"}, state: "cleaning"},
+		{name: "unknown", w: store.Worker{CleanupPhase: "unknown"}, state: "unknown"},
+		{name: "settled pruned", w: store.Worker{CleanupPhase: "settled", HibernationCleanup: txt("pruned")}, state: "settled", outcome: "pruned"},
+		{name: "none with skipped outcome", w: store.Worker{CleanupPhase: "none", HibernationCleanup: txt("skipped"), HibernationCleanupReason: txt("unsupported")}, state: "none", outcome: "skipped", reason: "unsupported"},
+		{name: "settled failed", w: store.Worker{CleanupPhase: "settled", HibernationCleanup: txt("failed"), HibernationCleanupReason: txt("interrupted")}, state: "settled", outcome: "failed", reason: "interrupted"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			c.w.Kind, c.w.Status = "hosted", "offline"
+			dto := workerDTOFromWorker(c.w, 0, false, "", "0.84.0", "0.84.0", now, now)
+			if c.wantNil {
+				if dto.HibernationCleanup != nil {
+					t.Fatalf("want nil, got %+v", *dto.HibernationCleanup)
+				}
+				return
+			}
+			got := dto.HibernationCleanup
+			if got == nil || got.State != c.state {
+				t.Fatalf("state: %+v want %q", got, c.state)
+			}
+			str := func(p *string) string {
+				if p == nil {
+					return ""
+				}
+				return *p
+			}
+			if str(got.Outcome) != c.outcome || str(got.CleanupReason) != c.reason {
+				t.Fatalf("outcome/reason: %+v", got)
+			}
+		})
+	}
+}

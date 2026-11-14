@@ -530,6 +530,11 @@ memory park sends and the reference its next claim presents. With an old api or
 an old worker there is no receipt and no reference, and the park stays
 unqualified (see [Run recovery](run-recovery.md)).
 
+A Docker-capable worker with the pressure prune enabled also advertises
+`hibernation_cache_prune_v1`, which lets the api run the
+[cache prune before hibernation](hosted-workers.md#cache-cleanup-before-sleep) on it.
+Without it the worker is not pruned and hibernates as before.
+
 **Releasing it.** Restart the worker's container (the pod, for a
 [hosted worker](hosted-workers.md)). Only a fresh registration restores
 authority; a heartbeat never does, and there is no self-restart or retry.

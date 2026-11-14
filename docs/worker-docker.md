@@ -129,6 +129,26 @@ deferral, a pending maintenance drain, and insufficient relief are distinct
 conditions. The investigation measured disposable fixtures; hosted reclaimed
 bytes remain unmeasured. Cache and maintenance thresholds are unchanged.
 
+### Hibernation cache prune
+
+When an admin [hibernates](./hosted-workers.md#cache-cleanup-before-sleep) a
+Docker-capable hosted worker, the worker runs one more cache prune before it scales
+to 0 (#4206). It is a third, separate mechanism:
+
+- **Commands.** Exactly `docker image prune -f` then `docker builder prune -f`, the
+  same frozen argv as the pressure prune. It never runs volume, container or system
+  prune, and never enters a maintenance stop or recycle phase.
+- **Trigger.** The hibernation itself, with no 85% threshold. It needs the
+  `hibernation_cache_prune_v1` capability, advertised only where the pressure prune
+  is enabled (`workers.diskRecycleEnabled`, default on).
+- **Fencing.** Unlike the pressure prune, it holds the claim gate exclusively under
+  a server-issued attempt id and runs only after the api confirms the start. Unlike
+  DinD maintenance, it has no stop or recycle phase and its result is
+  per-attempt, not per-volume.
+- **Failure.** If its settlement is unknown the worker stays fenced; see
+  [Hosted workers](./hosted-workers.md#cache-cleanup-before-sleep) for outcomes and
+  the evidence that clears it.
+
 ### Pressure-only anonymous-volume prune
 
 A worker that is always busy or custody-held never reaches the cache prune or

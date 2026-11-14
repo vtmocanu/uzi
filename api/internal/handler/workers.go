@@ -118,6 +118,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		EffectiveCordoned:     !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase, HibernationState: w.HibernationState}),
 		HibernationState:      hibernationStateWire(w.HibernationState),
 		HibernationReason:     textPtrValue(w.HibernationReason.Valid, w.HibernationReason.String),
+		HibernationCleanup:    hibernationCleanupDTO(w.CleanupPhase, w.HibernationCleanup, w.HibernationCleanupReason),
 		HibernatedAt:          timePtr(w.HibernatedAt.Valid, w.HibernatedAt.Time),
 		WakeRequestedAt:       timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
 		WakeError:             textPtrValue(w.WakeError.Valid, w.WakeError.String),
@@ -172,6 +173,26 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 	}
 }
 
+// hibernationCleanupDTO projects the cleanup columns; nil when no attempt was made and no
+// outcome is recorded. requested and started both read as "cleaning".
+func hibernationCleanupDTO(phase string, outcome, reason pgtype.Text) *apitypes.HibernationCleanupDTO {
+	if (phase == "" || phase == workersvc.CleanupPhaseNone) && !outcome.Valid {
+		return nil
+	}
+	state := phase
+	switch phase {
+	case workersvc.CleanupPhaseRequested, workersvc.CleanupPhaseStarted:
+		state = "cleaning"
+	case "":
+		state = workersvc.CleanupPhaseNone
+	}
+	return &apitypes.HibernationCleanupDTO{
+		State:         state,
+		Outcome:       textPtrValue(outcome.Valid, outcome.String),
+		CleanupReason: textPtrValue(reason.Valid, reason.String),
+	}
+}
+
 // hibernationStateWire maps the column to the wire enum; an empty value reads as "none".
 func hibernationStateWire(state string) string {
 	if state == "" {
@@ -203,6 +224,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		EffectiveCordoned:     !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase, HibernationState: w.HibernationState}),
 		HibernationState:      hibernationStateWire(w.HibernationState),
 		HibernationReason:     textPtrValue(w.HibernationReason.Valid, w.HibernationReason.String),
+		HibernationCleanup:    hibernationCleanupDTO(w.CleanupPhase, w.HibernationCleanup, w.HibernationCleanupReason),
 		HibernatedAt:          timePtr(w.HibernatedAt.Valid, w.HibernatedAt.Time),
 		WakeRequestedAt:       timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
 		WakeError:             textPtrValue(w.WakeError.Valid, w.WakeError.String),

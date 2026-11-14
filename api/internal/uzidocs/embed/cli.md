@@ -3049,7 +3049,8 @@ A [hibernated](hosted-workers.md#hibernation) hosted worker shows `hibernating`,
 `uzi admin workers`; a wake not confirmed in time shows `(wake error)` after it, and a manual
 cordon keeps its ` · cordoned (manual)` marker after the state.
 `--json` carries `hibernation_state`, `hibernation_reason`, `hibernated_at`,
-`wake_requested_at` and `wake_error`. `uzi tui` shows the state too. There is no
+`wake_requested_at` and `wake_error`, and `hibernation_cleanup` (`{state, outcome, reason}`, the
+[cache cleanup](hosted-workers.md#cache-cleanup-before-sleep) before sleep). `uzi tui` shows the state too. There is no
 write verb: hibernating and waking are web-only admin actions.
 
 `uzi run get` gains four rows, each emitted only when the server has

@@ -260,6 +260,24 @@ describe("WorkersSettings — hibernation chip (PRD #4205)", () => {
   });
 });
 
+describe("WorkersSettings — hibernation cache cleanup (PRD #4206)", () => {
+  it("shows the cleanup outcome on the owner's row and nothing for a worker without one", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({ id: "w-s", name: "skipper", status: "offline", hibernation_state: "hibernated", hibernation_cleanup: { state: "settled", outcome: "skipped", reason: "daemon_unreachable" } }),
+        aWorker({ id: "w-c", name: "cleaner", status: "offline", hibernation_state: "preparing", hibernation_cleanup: { state: "cleaning", outcome: null, reason: null } }),
+        aWorker({ id: "w-n", name: "plain-one", status: "offline", hibernation_cleanup: null }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("skipper");
+    const row = (name: string) => screen.getByText(name).closest("li")!;
+    expect(within(row("skipper")).getByText("cleanup skipped: Docker was not reachable")).toBeTruthy();
+    expect(within(row("cleaner")).getByText("cleaning up")).toBeTruthy();
+    expect(row("plain-one").textContent).not.toMatch(/cleanup|cache pruned|cleaning up/);
+  });
+});
+
 describe("WorkersSettings — always-visible worker-setup guide link (PRD #57 M2)", () => {
   it("renders the worker-setup guide link in the page header", async () => {
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });

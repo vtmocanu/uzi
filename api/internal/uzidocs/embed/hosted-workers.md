@@ -214,6 +214,73 @@ Status shows in `uzi worker list` and `uzi admin workers`; see
 [CLI](./cli.md#hibernated-workers). The design is in
 [PRD #4205](../prds/4205-worker-hibernation-sleep-wake.md).
 
+### Cache cleanup before sleep
+
+A [Docker-capable](worker-docker.md) worker runs one cache prune while it is
+`hibernating`, before the Deployment scales to 0. It removes only what the daemon
+can rebuild: `docker image prune -f` (dangling images) and `docker builder prune -f`
+(build cache). It never removes containers, volumes, `/data` content or run
+directories, and it has no disk-pressure precondition. It is separate from the
+[pressure prune and DinD maintenance](worker-docker.md#hibernation-cache-prune).
+
+The cleanup needs a worker that advertises the `hibernation_cache_prune_v1`
+capability. A worker without it (an older image, or `workers.diskRecycleEnabled:
+false`, which also turns off the pressure prune) is not pruned and shows
+"cleanup skipped: unsupported"; it still hibernates. Workers that are not
+Docker-capable have no cleanup and show nothing.
+
+**Start fence.** The worker runs a command only after the api confirms the attempt
+has started. The api confirms only while the worker is `hibernating`, no
+cancellation is pending, and both the api (no non-terminal run, no open custody
+hold, no pending wake demand) and the worker's own fresh report (no local claims or
+executions, custody clear, the claim gate held exclusively) show it idle. Claims stay
+fenced until the attempt settles, however the hibernation ends.
+
+**Outcomes.** The Workers row shows:
+
+| Shows | Meaning |
+|---|---|
+| `cleaning up` | The attempt is requested or running. |
+| `cache pruned` | The prune ran and finished. |
+| `cleanup skipped: <reason>` | No command ran (for example `unsupported`, `daemon_unreachable`, `cancelled`, `worker_restarted`, `custody_stale`, `active_work`, `claim_in_flight`, `gate_not_exclusive`). |
+| `cleanup interrupted` | The controller observed that the attempt's pod stopped before a result arrived. |
+| `cleanup settlement unknown` | A command may have run, and nothing yet shows how it ended. |
+
+A refusal for **custody, active work or a non-exclusive claim gate** (or a failed
+re-check of those at settlement) withdraws the hibernation into a wake, with the
+reason recorded. A refusal because the Docker daemon was unreachable, or a
+cancelled attempt, does not: the worker hibernates and shows the reason. An admin
+wake, demand for the worker, or the preparing deadline only requests cancellation of
+an unsettled attempt; they never reopen claims. A cancelled attempt that never
+started settles at once as skipped; a started one stops before its next command.
+
+**Unknown settlement.** An attempt becomes unknown when its result is not reported
+within 10 minutes of starting, a command's end could not be confirmed, or the worker
+re-registers while the attempt was started. The worker stays fenced (`hibernating`,
+or `waking` after an admin wake) and an admin sees the
+`fleet.hibernation_cleanup` check in [Admin health](admin-health.md). The api asks
+for reconciliation at most every 5 minutes. Only two things clear it:
+
+- a late result from the same worker process that was told to start (the same
+  attempt id and registration);
+- the controller observing the attempt's own pod still present and fully stopped
+  (the Workers row then shows `cleanup interrupted`).
+
+A pod that has disappeared, a new pod or registration, a later prune, or a
+daemon error response is not evidence. **Accepted residual:** if neither arrives,
+the fence and the blocker stay. There is no acknowledge or override route, and the
+worker cannot be deleted (409) while an attempt is unsettled.
+
+**Preparing deadline.** The 10 minutes are counted from when the cleanup settles
+(or from the request, if later), and do not run while an attempt is started or
+unknown; a worker whose attempt is only requested is still withdrawn at the
+deadline.
+
+The Codex command cache (`/var/cache/uzi-codex-cmd`) is an `emptyDir`, so it is
+freed when the pod stops and needs no cleanup step.
+
+The design is in [PRD #4206](../prds/4206-worker-hibernation-cache-cleanup.md).
+
 ### Downgrading
 
 Operators rolling back past this feature, in order:
@@ -234,6 +301,21 @@ Operators rolling back past this feature, in order:
 
 If the controller is rolled back mid-operation, affected workers stay fenced in
 `waking` until a hibernation-capable controller returns.
+
+The [cache cleanup](#cache-cleanup-before-sleep) adds a further ordering. The api is a
+hard singleton (`Recreate`), so there is no old and new api side by side. To roll
+back past the hibernation cache-cleanup migration:
+
+1. Turn `worker_hibernation_enabled` off.
+2. Wait for every cleanup attempt to settle, not only for the workers to wake: an
+   unknown attempt keeps its worker fenced and blocks this step until it clears.
+3. Run that migration's Down, which refuses while any attempt is unsettled.
+4. Start the older image.
+
+Starting an older image outside this procedure is unsupported: it does not know the
+attempt, and could scale a worker down in the middle of a prune. CHECK constraints
+on the worker row refuse an old-code write that would reopen claims during an
+unsettled attempt, so such a write fails instead of silently dropping the fence.
 
 ## Pod shutdown grace
 
