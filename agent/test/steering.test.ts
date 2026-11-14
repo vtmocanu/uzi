@@ -2845,6 +2845,19 @@ describe("SteeringChannel — in-place credential switch ops (#4201)", { timeout
     assert.equal(interrupts(), 2);
   });
 
+  it("preserves known held targets and fills missing held targets for the same op", () => {
+    for (const first of [undefined, "target-1"]) {
+      const { ch } = make();
+      const hold = ch.holdCredentialSwitch();
+      ch.tripCredentialSwitch(GEN, "op-held", first);
+      ch.tripCredentialSwitch(GEN, "op-held", "target-1");
+      ch.tripCredentialSwitch(GEN, "op-held");
+      ch.tripCredentialSwitch(GEN, "op-held", "other-target");
+      hold.close({ service: true });
+      assert.deepEqual(ch.pendingCredentialSwitchOp(), { generation: GEN, opId: "op-held", targetSecretId: "target-1" });
+    }
+  });
+
   it("carries a held target through service and discards it on non-service close", () => {
     const { ch } = make();
     const discarded = ch.holdCredentialSwitch();

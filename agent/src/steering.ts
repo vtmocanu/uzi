@@ -2811,9 +2811,11 @@ export class SteeringChannel {
     // aborted, so the flight looks exactly like one that has not yet polled the stamp. The hold's
     // service-close replays this call at depth 0.
     if (this.holdActive()) {
+      const sameOp = this.latchedSwitchGeneration === generation && this.latchedSwitchOpId === opId;
       this.latchedSwitchGeneration = generation;
       this.latchedSwitchOpId = opId;
-      this.latchedSwitchTargetSecretId = targetSecretId;
+      if (!sameOp || this.latchedSwitchTargetSecretId === undefined)
+        this.latchedSwitchTargetSecretId = targetSecretId;
       return;
     }
     this.revokeStop("switch", new CredentialSwitchSignal());
