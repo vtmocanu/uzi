@@ -6,6 +6,8 @@
  * one-worker activation. Until then every entry point added by later milestones begins with the
  * `terminalPreservationEnabled()` check on RunRunner / RecoveryCoordinator and does nothing.
  */
+import type { TerminalOperationDeps } from "./terminal-operation.js";
+
 export const TERMINAL_PRESERVATION_ENABLED: boolean = false;
 
 /**
@@ -14,6 +16,18 @@ export const TERMINAL_PRESERVATION_ENABLED: boolean = false;
  */
 export interface TerminalPreservationTestHooks {
   label?: string;
+  /** Worker id used when the client has no registered incarnation. */
+  workerId?: string;
+  /** Attempt id used when the flight has none (a worker without attempt paths). */
+  attemptId?: string;
+  /** Lane sub-deadline cap and permit reserve (ms); the lane's own defaults otherwise. */
+  capMs?: number;
+  reserveMs?: number;
+  /** Replacement engine effects (capture, prepare, send, store, ...) for one instance. */
+  deps?: Partial<Pick<TerminalOperationDeps, "store" | "owner" | "universe" | "capture" | "aggregate" | "prepare" | "coverage" |
+    "recheck" | "send">>;
+  store?: TerminalOperationDeps["store"];
+  owner?: TerminalOperationDeps["owner"];
 }
 
 /** The single gate decision: the compile-time constant, or a test override injected at construction. */

@@ -3,8 +3,8 @@ import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { terminalPreservationActive, type TerminalPreservationTestHooks } from "./terminal-preservation.js";
 import {
-  canonicalTerminalJson, decodeTerminalRecord, isTerminalGeneration, isTerminalRunId, mergeTerminalRecord, TERMINAL_RECORD_MAX_BYTES,
-  type TerminalDelta, type TerminalInvokeResult, type TerminalOperationRecord, type TerminalOperationStore,
+  canonicalTerminalJson, decodeTerminalRecord, isTerminalGeneration, isTerminalRunId, mergeTerminalRecord, runTerminalOperation, TERMINAL_RECORD_MAX_BYTES,
+  type TerminalDelta, type TerminalManifest, type TerminalOperationDeps, type TerminalOperationResult, type TerminalInvokeResult, type TerminalOperationRecord, type TerminalOperationStore,
   type TerminalReadResult, type TerminalRediscovery, type TerminalUpdateResult,
 } from "./terminal-operation.js";
 import { AuthorityLockBusy, AuthorityRefusal } from "./authority-lock.js";
@@ -15,7 +15,8 @@ import {
 import type { ExclusionRefusal, MaintenanceExclusion, MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { MaintenanceResources as M1MaintenanceResources, RecoveryMaintenance, type MaintenanceAdmission } from "./recovery-maintenance.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
-import { prepareFrozenHeld, validFrozenHeldPolicy, type FrozenHeldPolicy, type HeldGit } from "./frozen-held.js";
+import { prepareFrozenHeld, prepareFrozenHeldPinned, validFrozenHeldPolicy, type FrozenHeldPolicy, type HeldGit, type TerminalDigestGit } from "./frozen-held.js";
+import { checkManifestCoverage, readTerminalSourceUniverse, type TerminalUniverse } from "./terminal-inventory.js";
 // Durable run recovery: worker capture, authenticated journal, and model-free
 // restart-safe upload (PRD #1296 M3, decisions D1/D3/D5/D6/D9).
 //
@@ -1499,6 +1500,10 @@ export function canonicalJson(value: unknown): string {
 // keyed FIFO mutex for local journal IO only; one worker process owns each data directory.
 const recoveryJournalLocks = new RunDiskLocks();
 
+/** The optional git seams a terminal-preservation replay needs; a producer without them refuses (no send). */
+type TerminalReplayGit = RecoveryBundleProducer & TerminalDigestGit & Partial<Pick<GitCache, "listRunBares" |
+  "readTerminalAttribution" | "readTerminalCloneLocalRefs" | "commitTreeOid" | "worktreeStatus">>;
+
 /**
  * The persistent, authenticated durable-recovery coordinator (PRD #1296 M3).
  *
@@ -1746,6 +1751,185 @@ export class RecoveryCoordinator {
     }
     return out;
   }
+
+  // ── #4007 slice B M6-V: guarded replay of a frozen open held record (production-dark) ──
+
+  /** The frozen attempt this replay is about: the completing source when the record names one, else the single present
+   *  clone of the record's branch. Undefined when no usable binding exists. */
+  private async terminalReplayCurrent(record: RecoveryRecord, barePath: string, git: TerminalReplayGit,
+    signal: AbortSignal): Promise<{ attemptId: string; clonePath: string; identity: string } | undefined> {
+    let clonePath: string | undefined, attemptId: string | undefined;
+    const source = record.completionSource;
+    if (source?.clonePath !== undefined && source.attemptId !== undefined) {
+      clonePath = source.clonePath; attemptId = source.attemptId;
+    } else {
+      const inv = await git.readInventoryCloneHeads!(barePath, record.runId, { cloneIdentity: true });
+      if (inv.kind !== "verified") return undefined;
+      const mine = inv.clones.filter(c => c.branch === record.branch);
+      if (mine.length !== 1) return undefined;
+      const attr = await git.readTerminalAttribution!(barePath, record.runId, { signal, deadline: Date.now() + 30_000 });
+      if (attr.kind !== "verified") return undefined;
+      const hits = attr.attempts.filter(a => a.clonePath === mine[0]!.clonePath);
+      if (hits.length !== 1) return undefined;
+      clonePath = hits[0]!.clonePath; attemptId = hits[0]!.attemptId;
+    }
+    try {
+      const st = await fs.lstat(clonePath);
+      if (!st.isDirectory() || st.isSymbolicLink()) return undefined;
+      return { attemptId, clonePath, identity: `${st.dev}:${st.ino}` };
+    } catch { return undefined; }
+  }
+
+  /** Bounded measure of the frozen clone's uncommitted bytes for a `cold_dirty` extent; undefined when unmeasurable. */
+  private async terminalReplayDirtyExtents(clonePath: string, git: TerminalReplayGit): Promise<{ files: number; bytes: number } | undefined> {
+    const lines = await git.worktreeStatus!(clonePath);
+    if (lines === null || lines.length > 4096) return undefined;
+    let bytes = 0;
+    for (const line of lines) {
+      const rel = line.slice(3);
+      if (line.length < 4 || rel.startsWith("\"") || rel.includes(" -> ") || rel.split("/").some(s => s === ".." || s === "")) return undefined;
+      try {
+        const st = await fs.lstat(path.join(clonePath, rel));
+        if (st.isDirectory()) return undefined;
+        bytes += st.size;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+      }
+    }
+    return Number.isSafeInteger(bytes) ? { files: lines.length, bytes } : undefined;
+  }
+
+  /** The newest tip this worker durably recorded for an earlier generation of the run; "unknown" refuses. */
+  private async terminalReplayPriorTip(runId: string, generation: number,
+    store: TerminalOperationStore): Promise<{ tip?: string } | "unknown"> {
+    if (generation > 65) return "unknown";
+    let tip: string | undefined;
+    for (let g = 1; g < generation; g++) {
+      const res = await store.read(runId, g);
+      if (res.kind === "absent") continue;
+      if (res.kind !== "ok") return "unknown";
+      const rec = res.record;
+      const final = rec.invocations.some(i => i.outcome === "published" || i.outcome === "recorded");
+      if (final && rec.tip) tip = rec.tip;
+      else if (rec.invocations.length > 0) return "unknown";
+    }
+    return { tip };
+  }
+
+  /**
+   * One terminal preservation operation for a frozen OPEN guarded hold, run inside the inventory source boundary
+   * (`prove` is that boundary's proof). It never reopens a hold and never captures new work: the frozen sourceSha is
+   * the tip, the universe must be exactly the frozen attempt with every root reachable from it, and the only abandoned
+   * extent is the frozen clone's measurable uncommitted bytes.
+   */
+  private async runGuardedTerminalPreservation(record: RecoveryRecord, input: { barePath: string; signal?: AbortSignal },
+    ctx: { failOrigin?: string; prove: () => Promise<boolean> }): Promise<TerminalOperationResult> {
+    const kept = (reason: string): TerminalOperationResult => ({ outcome: "kept", reason });
+    if (!this.terminalPreservationEnabled()) return kept("disabled");
+    const { runId, generation, heldPolicy: policy, exactHoldBinding: binding, coverageContext } = record;
+    const git = this.git as TerminalReplayGit;
+    const client = this.client as RecoveryArchiveClient & { publishTerminalPreservation?: WorkerClient["publishTerminalPreservation"] };
+    if (generation === undefined || !policy || !binding || !coverageContext || !client.publishTerminalPreservation ||
+        !client.getExactRecoveryHold || !git.listRunBares || !git.readInventoryCloneHeads || !git.readTerminalAttribution ||
+        !git.readTerminalCloneLocalRefs || !git.commitTreeOid || !git.worktreeStatus || !git.ancestry) return kept("seams_unavailable");
+    const signal = input.signal ?? new AbortController().signal;
+    const barePath = input.barePath;
+    let workerId: string;
+    try {
+      const exact = await this.recoveryRPC(() => client.getExactRecoveryHold!(runId, generation, binding, maintenanceSignal(input.signal)));
+      if (!exact || exact.run_id !== runId || exact.generation !== generation || exact.hold_id !== binding.holdId ||
+          exact.repo_id !== binding.repoId || exact.inventory_guarded !== true || exact.state !== "open" ||
+          typeof exact.original_worker_id !== "string" || exact.original_worker_id.length === 0) return kept("hold_unproved");
+      workerId = exact.original_worker_id;
+    } catch { MaintenanceBudget.current()?.check(); return kept("hold_unproved"); }
+    const current0 = await this.terminalReplayCurrent(record, barePath, git, signal).catch(() => undefined);
+    if (!current0) return kept("universe_current_missing");
+    const store = this.terminalOperationStore();
+    const prior = await this.terminalReplayPriorTip(runId, generation, store);
+    if (prior === "unknown") return kept("prior_tip_unknown");
+    const existing = await store.read(runId, generation);
+    const mode = existing.kind === "ok" && existing.record.phase === "prepared" ? "resume" : "initial";
+    const boundary = { open: true };
+    let proved: Extract<TerminalUniverse, { kind: "proved" }> | undefined;
+    const pinned = git as HeldGit & TerminalDigestGit;
+    const deps: TerminalOperationDeps = {
+      enabled: () => this.terminalPreservationEnabled(),
+      store,
+      owner: this.terminalOperationOwner(runId, generation),
+      failureFirst: () => policy.blocked ? "secret_remediation_pending"
+        : ctx.failOrigin === "push_secret_blocked" || ctx.failOrigin === "worker_residue_blocked" ? ctx.failOrigin
+        : residueQuarantine() !== undefined ? "residue_quarantine" : undefined,
+      universe: async () => {
+        proved = undefined;
+        const current = await this.terminalReplayCurrent(record, barePath, git, signal).catch(() => undefined);
+        if (!current) return { kind: "unproved", reason: "current_missing" };
+        const universe = await readTerminalSourceUniverse({ git: git as unknown as Parameters<typeof readTerminalSourceUniverse>[0]["git"], recovery: this, runId, current, signal, deadline: Date.now() + 30_000 });
+        if (universe.kind !== "proved") return universe;
+        if (universe.sources.length !== 1 || universe.sources[0]!.attemptId !== current.attemptId) {
+          return { kind: "unproved", reason: "non_current_clone_present" };
+        }
+        for (const root of universe.roots) {
+          if (root.commit !== record.sourceSha && await ownedRecoveryIO(() => git.ancestry!(barePath, root.commit, record.sourceSha)) !== "ancestor") {
+            // G10: a root the frozen tip does not contain would be left out of the pack.
+            return { kind: "unproved", reason: "g10_unreachable_root" };
+          }
+        }
+        proved = universe;
+        return universe;
+      },
+      capture: async onPhase => {
+        const universe = proved;
+        if (!universe) return { kind: "refused", reason: "universe_unavailable" };
+        const source = universe.sources[0]!;
+        const roots: TerminalManifest["roots"] = [];
+        for (const root of universe.roots) {
+          const tree = await git.commitTreeOid!(barePath, root.commit);
+          if (!tree) return { kind: "refused", reason: "tree_unreadable" };
+          roots.push({ source_id: source.sourceId, attempt_id: source.attemptId, commit: root.commit, tree });
+        }
+        const refs = { cloneRef: `clone:${path.basename(source.clonePath)}@${source.head}`, bareRef: `bare:${path.basename(barePath)}@${record.sourceSha}` };
+        await onPhase("capturing", refs);
+        const extents = await this.terminalReplayDirtyExtents(source.clonePath, git);
+        if (!extents) return { kind: "refused", reason: "dirty_unmeasurable" };
+        await onPhase("captured", { ...refs, commit: source.head });
+        return { kind: "ok", base: record.sourceSha, extraRoots: [], manifest: {
+          run_id: runId, generation, worker_id: workerId, roots,
+          abandoned: extents.files > 0 ? [{ class: "cold_dirty", source_id: source.sourceId, extents }] : [],
+        } };
+      },
+      aggregate: async ({ base, extraRoots }) => extraRoots.length === 0 ? { tip: base } : { refused: "extra_roots" },
+      prepare: async (range, expectDigests, tip) => {
+        if (tip !== record.sourceSha) return { reason: "tip_mismatch" };
+        if (!pinned.resolveCheckpointRange || !pinned.secretScanCheckpointRange || !pinned.ancestry ||
+            !pinned.rangeTouchesWorkflows || !pinned.changedFilesNoRenames || !pinned.checkpointPack) return { reason: "preparation_unavailable" };
+        try {
+          return await prepareFrozenHeldPinned({
+            git: pinned, barePath, branch: record.branch, sourceSha: record.sourceSha, policy, deadlineMs: 30_000,
+            perCommitCi: true, ciTarget: coverageContext.defaultIdentity.sha, expectDigests,
+            remediationHold: async () => !await this.restrictionsAllowCapturedC(record),
+          }, range);
+        } catch { MaintenanceBudget.current()?.check(); return { reason: "preparation_failed" }; }
+      },
+      coverage: (universe, manifest) => checkManifestCoverage(universe, manifest, { currentFlight: false }),
+      recheck: async () => {
+        if (!await ctx.prove()) return "boundary_unproved";
+        if (!await this.restrictionsAllowCapturedC(record)) return "restrictions";
+        const latest = await this.readLatest(record);
+        if (latest.kind !== "ok" || latest.record.heldPolicy?.blocked !== false) return "secret_remediation_pending";
+        return residueQuarantine() !== undefined ? "residue_quarantine" : undefined;
+      },
+      boundaryValid: () => boundary.open && !input.signal?.aborted,
+      send: (req, sendSignal) => client.publishTerminalPreservation!(runId, req, sendSignal),
+      now: () => this.now(),
+    };
+    try {
+      return await runTerminalOperation(deps, {
+        runId, workerId, generation, authorityClass: "open_guarded_hold", clonePath: current0.clonePath,
+        ...(prior.tip !== undefined ? { priorTip: prior.tip } : {}), mode, signal: input.signal,
+      });
+    } finally { boundary.open = false; }
+  }
+
   private readonly onForgetJournalLockedForTest: RecoveryCoordinatorOptions["onForgetJournalLockedForTest"];
   private readonly onOperatorDisposeStepForTest: RecoveryCoordinatorOptions["onOperatorDisposeStepForTest"];
   private readonly operatorSourceEvidence: RecoveryCoordinatorOptions["operatorSourceEvidence"];
@@ -3782,6 +3966,15 @@ export class RecoveryCoordinator {
       hold = await this.heldOperationState(record, input.signal);
       if (hold !== "open") { result = hold === "settled" ? "settled" : "kept"; return; }
       if (input.signal?.aborted || residueQuarantine() !== undefined) { result = "kept"; return; }
+      // #4007 slice B M6-V: with the gate on, the work is preserved before any held FINAL can be minted this pass.
+      if (this.terminalPreservationEnabled()) {
+        if (!await this.restrictionsAllowCapturedC(record)) { result = "kept"; return; }
+        const tp = await this.runGuardedTerminalPreservation(record, input, { failOrigin: terminal?.fail_origin, prove });
+        if (tp.outcome === "kept" && tp.reason === "secret_found") {
+          record = await this.writeExistingRecord(record, cur => ({ ...cur, heldPolicy: { ...cur.heldPolicy!, blocked: true } }));
+        }
+        if (tp.outcome !== "published" && tp.outcome !== "recorded") { result = "kept"; return; }
+      }
       // V2 reconciles lost create answers before any retry. V1 retains its legacy
       // archive fallback, whose FINAL supplies the generation settlement authority.
       if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: true }));

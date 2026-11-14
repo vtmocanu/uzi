@@ -56,7 +56,7 @@ export function classifyTerminalOutput(facts: TerminalOutputFacts): TerminalOutp
 
 export type TerminalUnprovedReason =
   | "unknown_read" | "thrown" | "foreign_owner" | "predecessor" | "join_contradiction" | "duplicate"
-  | "record_outside_universe" | "foreign_bare" | "cap" | "deadline" | "local_ref" | "non_current_clone_present"
+  | "record_outside_universe" | "foreign_bare" | "cap" | "deadline" | "local_ref" | "non_current_clone_present" | "g10_unreachable_root"
   | "current_missing" | "identity_mismatch" | "ledger_attempt_clone_missing";
 
 export interface TerminalSource {
