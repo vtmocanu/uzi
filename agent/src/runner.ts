@@ -21243,13 +21243,17 @@ export class RunRunner {
     const throwIfStopped = (): void => {
       if (stopped()) throw new SecretRemediationStoppedError();
     };
-    // A stop after the gate holds a trusted finding set: latch (sync) and record it before throwing, as the
-    // mid-run seam does, because the unscanned shutdown-capture publish is held by exactly this state.
+    // A stop after the gate holds a trusted finding set: latch (sync) and record it before throwing. The mid-run
+    // seam only records; here the latch matters too, because checkpointRemediationHold reads the latched
+    // restrictions (when present) for the unscanned shutdown-capture publish.
     const stopHolding = (found: readonly SecretFinding[]): never => {
       try {
         this.latchRemediationFindings(flight, barePath!, runnerClone.branch, found);
-      } catch {
-        // bindingUncertain or an unreadable identity: the latch already failed closed before throwing.
+      } catch (e) {
+        // A refusal (nothing was latched: the flight's source use ended, or a trusted-execution refusal) stays
+        // visible. The identity errors latchRemediationFindings throws are thrown AFTER it latched, so they
+        // are swallowed: the latch already holds and the stop still has to be reported.
+        if (e instanceof TrustedExecutionRefusal || e instanceof AuthorityRefusal) throw e;
       }
       this.recordFlaggedCommits(state, [...found], runLog);
       throw new SecretRemediationStoppedError();

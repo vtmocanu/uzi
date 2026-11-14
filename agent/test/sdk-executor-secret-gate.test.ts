@@ -835,6 +835,18 @@ describe("SdkExecutor routes a stopped secret remediation gate (Issue #4313)", (
     });
   }
 
+  it("a stopped done gate with both a disk stop and a cancel requested routes as cancel", async () => {
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    let armed = false;
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+      kind: "issue",
+      cancelRequested: () => armed,
+      pauseModeRequested: () => (armed ? "disk" as const : null),
+      secretRemediationGate: async () => { armed = true; throw new SecretRemediationStoppedError(); },
+    })), (error: unknown) => error instanceof Error && error.constructor.name !== "DiskParkSignal" && /cancel/i.test(error.message));
+  });
+
   it("any other gate error still propagates unchanged (not converted to a cancel)", async () => {
     const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
     await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({

@@ -6407,7 +6407,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
   const sdkMsg = (content: unknown[]) => sdkAssistant(content);
   const SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
   type Site = "fetch" | "persist";
-  type Control = "none" | "pause" | "switch" | "cancel" | "shutdown";
+  type Control = "none" | "pause" | "switch" | "cancel" | "shutdown" | "scan-shutdown";
 
   /** Stands in for the lock layer's private flock spawn on a util-linux host. */
   function spawnFlock(args: string[], fd: number | undefined, _signal: AbortSignal | undefined, timeoutMs: number): Promise<FlockResult> {
@@ -6460,6 +6460,10 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
     states: Array<Record<string, unknown>>;
     final: string | undefined;
     flight: Record<string, unknown>;
+    secretSha: string;
+    publishCount: number;
+    statuses: string[];
+    prompts: string[];
   }
 
   async function lockedGate(o: { iid: number; kind: "done" | "resume"; site: Site; control: Control }): Promise<LockObservation> {
@@ -6471,7 +6475,8 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
     // the pending acquisition is the restriction write. The fetch site arms it when the gate is entered.
     const ctl = control({
       scanDeadlineMs: 60_000,
-      ...(o.site === "persist" ? { afterRemediationGateScan: () => auth.arm() } : {}),
+      ...(o.control === "scan-shutdown" ? { afterRemediationGateScan: () => { runnerRef!.shutdown(); } }
+        : o.site === "persist" ? { afterRemediationGateScan: () => auth.arm() } : {}),
     });
     const claim = o.kind === "done"
       ? gitlabClaim(o.iid, { auto_approve: true })
@@ -6486,13 +6491,17 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
     let gateError: unknown;
     let decision: { action: string } | undefined;
     let gateSettledAt = 0;
+    let secretSha = "";
+    const prompts: string[] = [];
     const work = (tree: string): void => {
-      commitIn(tree, secret ? "cfg.env" : "ok.txt", secret ? `TOKEN=${runtimeSecret()}\n` : "ordinary work\n");
+      secretSha = commitIn(tree, secret ? "cfg.env" : "ok.txt", secret ? `TOKEN=${runtimeSecret()}\n` : "ordinary work\n");
     };
     const queryFn: SdkQueryFn = (params) => {
       const turn = ++turns;
       return (async function* () {
-        for await (const _m of params.prompt) { /* drain */ }
+        let text = "";
+        for await (const m of params.prompt) text += JSON.stringify(m);
+        prompts.push(text);
         // A resume whose transcript is not on this worker re-plans first (the attempt-path rig drops it).
         if (turn === 1 && (o.kind === "done" || !ctxRef!.planApproved)) {
           yield sdkMsg([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: "# Plan\n- do it", milestones: [] } }]);
@@ -6583,7 +6592,8 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
     try {
       exec = runner.execute(claim);
       const settled = exec.then(() => undefined, (e: unknown) => e);
-      await bounded(waitFor(() => auth.acquisitions.length > 0, 30_000), 31_000, "the gate's pending acquisition of A", "lock");
+      if (o.control === "scan-shutdown") await bounded(waitFor(() => gateSettledAt > 0, 30_000), 31_000, "the gate to settle", "gate");
+      else await bounded(waitFor(() => auth.acquisitions.length > 0, 30_000), 31_000, "the gate's pending acquisition of A", "lock");
       const steering = flight!.steering as { getPauseMode(): unknown; pendingCredentialSwitch(): unknown };
       const t0 = Date.now();
       if (o.control === "pause") {
@@ -6592,10 +6602,13 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
       } else if (o.control === "switch") {
         api.requestCredentialSwitch(claim.run_id, 1);
         await bounded(waitFor(() => switchDelivered, 10_000), 11_000, "the switch to be delivered", "control");
-      } else if (o.control === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      } else if (o.control === "scan-shutdown") { /* the hook already stopped the worker */ }
+      else if (o.control === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
       else if (o.control === "shutdown") runnerRef.shutdown();
       let pendingAfterControl = false;
-      if (o.control === "none" || o.control === "pause" || o.control === "switch") {
+      if (o.control === "scan-shutdown") {
+        auth.disarm();
+      } else if (o.control === "none" || o.control === "pause" || o.control === "switch") {
         // Hold A for a while longer: the gate must still be waiting (not stopped, not decided).
         await sleepMs(700);
         pendingAfterControl = gateSettledAt === 0;
@@ -6616,16 +6629,17 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
         attempts: f.secretRemediation?.attempts, thrown,
         states: api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body as unknown as Record<string, unknown>),
         final: finalStatus(claim.run_id), flight: flight!,
+        secretSha, publishCount: pub.count(), statuses: statusTexts(claim.run_id), prompts,
       };
     } finally {
       client.getInputs = realGetInputs;
       auth.disarm();
       await settleAndClean({ ctl, runners: [runner], running: [exec], restore: pub.restore, paths: [tmp] });
-          }
+    }
   }
 
   const iidOf = (kind: "done" | "resume", site: Site, control: Control): number =>
-    4313_500 + (kind === "done" ? 0 : 100) + (site === "fetch" ? 0 : 20) + ["none", "pause", "switch", "cancel", "shutdown"].indexOf(control);
+    4313_500 + (kind === "done" ? 0 : 100) + (site === "fetch" ? 0 : 20) + ["none", "pause", "switch", "cancel", "shutdown", "scan-shutdown"].indexOf(control);
 
   // One scenario per test: each builds its own authority stack, and a worker lifetime has no release.
   for (const site of ["fetch", "persist"] as const) {
@@ -6640,7 +6654,6 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
         if (site === "fetch") assert.equal(obs.attempts, 0, "no attempt was spent");
         else assert.ok((obs.attempts as number) >= 1, "the remediate decision spent its attempt");
         assert.ok(obs.thrown.every((e) => !(e instanceof Error && /secret remediation gate stopped/.test(e.message))), "no stop error reached the executor");
-        console.log(`# 4313 d ${site}/${control}: end states ${obs.states.map((x) => String(x.status)).join(",")} final=${String(obs.final)} thrown=${obs.thrown.map((e) => (e as Error).constructor.name + ":" + (e as Error).message).join("|")}`);
       });
     }
 
@@ -6656,6 +6669,24 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
       });
     }
   }
+
+  it("attempt-path rig: a trusted scan result, then a shutdown before any state write, keeps the latch and withholds the shutdown-capture publish", { timeout: 120_000 }, async () => {
+    const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    const obs = await lockedGate({ iid: iidOf("done", "persist", "scan-shutdown"), kind: "done", site: "persist", control: "scan-shutdown" });
+    assert.ok(obs.gateError instanceof SecretRemediationStoppedError, String(obs.gateError));
+    const f = obs.flight as {
+      remediationRestrictions?: { pending?: { requiredOIDs: string[] } };
+      secretRemediation?: Record<string, unknown> & { flaggedCommits?: string[] };
+    };
+    assert.ok(f.remediationRestrictions?.pending?.requiredOIDs.includes(obs.secretSha), "the latch holds the secret commit");
+    assert.deepEqual(f.secretRemediation?.flaggedCommits, [obs.secretSha]);
+    assert.equal(f.secretRemediation?.attempts, 0, "no attempt was spent");
+    for (const k of ["known", "cleanTip", "withholdPaths", "blocked", "everKnown"]) assert.equal(f.secretRemediation?.[k], undefined, `${k} unchanged`);
+    assert.ok(obs.prompts.every((p) => !/not published yet|rewrite the commit|history rewrite/i.test(p)), "no rewrite guidance");
+    assert.deepEqual(obs.statuses.filter((x) => /returning to the lead|pre-exit secret scan flagged/.test(x)), [], "nothing emitted");
+    assert.equal(obs.publishCount, 0, "the flagged history was never published");
+    assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal");
+  });
 
   it("resume preflight, fetch-back wait, pause-now: waits for A and proceeds, not stopped", { timeout: 120_000 }, async () => {
     const { SecretRemediationStoppedError } = await import("../src/executor.js");
