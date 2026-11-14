@@ -31088,7 +31088,8 @@ describe("issue #4258 real CodexExecutor + RunRunner over the scoped seam", { sk
           assert.equal(h.decisions.length, 0, "the seam is still waiting on the stalled scan");
           const t0 = Date.now();
           h.stopRun();
-          await bounded(settled, 20_000, "execute() settling after the stop");
+          const outcome = await bounded(settled, 20_000, "execute() settling after the stop");
+          assert.equal(outcome, undefined, `execute() resolved normally after the ${stop}, not with a rejection`);
           assert.ok(Date.now() - t0 < 10_000, `the run settled ${Date.now() - t0}ms after the stop`);
           assert.deepEqual(h.decisions, [{ action: "proceed" }]);
           for (const pid of pids) {

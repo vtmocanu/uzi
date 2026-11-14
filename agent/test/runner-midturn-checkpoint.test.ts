@@ -5277,6 +5277,54 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
     });
   });
 
+  // The default-branch tip is a scan floor of the checkpoint range, not a published tip. A retained flagged
+  // commit that the default branch now contains is public history: the seam must classify it against the
+  // range's resolved floors, as the checkpoint and publish paths do, and ask for no rewrite.
+  it("a retained flagged commit already under the default-branch floor: no guidance, no attempt, still held", async () => {
+    const out = await rig(4258_050, async (r) => {
+      const c1 = await flagAndTick(r);
+      const armed = r.state().midRunTrigger;
+      assert.ok(armed);
+      commitIn(r.ctx.worktreePath, "later-a.txt", "a\n");
+      commitIn(r.ctx.worktreePath, "later-b.txt", "b\n");
+      // The seam's fetch-back runs clone -> bare, so the default branch is advanced on the bare itself.
+      gitIn(r.bare, ["update-ref", "refs/remotes/origin/main", c1]);
+      assert.equal(ancestryOf(r.bare, c1, "refs/remotes/origin/main"), "ancestor");
+      const d = await r.ctx.midRunSecretRemediation!();
+      assert.deepEqual(d, { action: "proceed" }, "no rewrite guidance for a commit the default branch contains");
+      const s = r.state();
+      assert.equal(s.attempts, 0, "no attempt was spent");
+      assert.equal(s.midRunTrigger, undefined, "the trigger is cleared");
+      assert.ok(s.flaggedCommits!.includes(c1), "the flagged commit stays recorded");
+      untouched(s);
+      commitIn(r.ctx.worktreePath, "later-c.txt", "c\n");
+      assert.equal(await r.tick(), "secret_remediation_pending", "an unscanned publication attempt is still held");
+      assert.equal(r.tips.length, 0, "nothing was uploaded");
+    });
+    assert.deepEqual(statusTexts(out.claimRunId).filter((t) => /returning to the lead/.test(t)), []);
+  });
+
+  it("a retained commit under the default floor beside a fresh secret above every floor: the trigger clears with no turn, and both stay recorded and held", async () => {
+    await rig(4258_051, async (r) => {
+      const c1 = await flagAndTick(r);
+      commitIn(r.ctx.worktreePath, "later-a.txt", "a\n");
+      gitIn(r.bare, ["update-ref", "refs/remotes/origin/main", c1]);
+      const c2 = commitIn(r.ctx.worktreePath, "second.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(c2);
+      const d = await r.ctx.midRunSecretRemediation!();
+      // Accepted behaviour: classifyFindingFloors returns at_floor as soon as ANY finding is at a floor, so
+      // the fresh C2 is recorded (negative knowledge, held at publication) but earns no turn here.
+      assert.deepEqual(d, { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.attempts, 0);
+      assert.equal(s.midRunTrigger, undefined);
+      assert.ok(s.flaggedCommits!.includes(c1) && s.flaggedCommits!.includes(c2), "both commits are recorded");
+      untouched(s);
+      assert.equal(await r.tick(), "secret_remediation_pending", "publication stays held");
+      assert.equal(r.tips.length, 0);
+    });
+  });
+
   // gitleaks reports an empty File for any name git must quote (control bytes, bidi, other
   // non-ASCII), so the runner-level names here are plain ASCII that the report keeps. Control/bidi
   // escaping itself is pinned in secret-finding-render.test.ts. A secret-shaped path in the scan makes
@@ -5669,6 +5717,127 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
       assert.deepEqual(statusTexts(out.claimRunId).filter((t) => /returning to the lead/.test(t)), []);
     });
 
+    // The seam's cleanup reconciles a cancelled child's lock files under the bare lock. Only the WAIT for that
+    // lock is bounded: another holder must not pin the seam (and the sink gate), and a reconcile that already
+    // started is never cut off or relabelled as a lock-wait timeout.
+    describe("the cleanup's wait for the bare lock is bounded", () => {
+      const BOUND_MS = 500;
+      const logged = (lines: unknown[], msg: string): Array<Record<string, unknown>> =>
+        (lines as Array<Record<string, unknown>>).filter((l) => l.msg === msg);
+      const NOT_RUN = "mid-run secret remediation lock reconcile not run";
+      const FAILED = "mid-turn checkpoint lock reconcile failed";
+      const REMOVED = "mid-turn checkpoint removed a lock file its cancelled child provably owned";
+      const RETAINED = "mid-turn checkpoint retained a git lock file in the worker bare";
+      const SINK_BLOCKED = "mid-turn checkpoint sink blocked: a git lock file remains in the worker repository";
+
+      /** Stall the seam's scan child, then cancel the run once `afterStall` has set up its scenario. */
+      async function lockScenario(iid: number, hooks: Record<string, unknown>, body: (c: {
+        r: Rig; seam: Promise<unknown>; lockFile: string; stop: () => number;
+      }) => Promise<void>): Promise<{ lines: unknown[]; runId: string }> {
+        const tmp = scratchDir(`4258-lock-${iid}`);
+        const stall = writeStallShim(tmp);
+        const { logger, lines } = recordingLogger();
+        let runId = "";
+        try {
+          ({ claimRunId: runId } = await rig(iid, async (r) => {
+            try {
+              await flagAndTick(r);
+              stall.setMode("stall-git");
+              const seam = r.ctx.midRunSecretRemediation!();
+              seam.catch(() => undefined);
+              await bounded(Promise.resolve().then(() => waitFor(() => stall.pids().length > 0, WAIT_MS)), WAIT_MS + 1_000, "the scan child to stall", "stall");
+              const lockFile = path.join(r.bare, "shallow.lock");
+              await body({ r, seam, lockFile, stop: () => { const t0 = Date.now(); stopRun(r, "cancel"); return t0; } });
+              fs.rmSync(lockFile, { force: true });
+            } finally {
+              stall.setMode("pass");
+              await killAndReap(stall.pids()).catch(() => undefined);
+            }
+          }, { gitleaksBin: stall.bin, log: logger, ctlHooks: { ...stallHooks, midRunLockReconcileWaitMs: BOUND_MS, ...hooks } }));
+        } finally {
+          await killAndReap(stall.pids()).catch(() => undefined);
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+        return { lines, runId };
+      }
+      const retainedHas = (r: Rig, file: string): boolean => {
+        const kept = r.flight().retainedBareLocks as string[];
+        return kept.includes(file) || kept.includes(fs.realpathSync(file));
+      };
+
+      it("another holder of the bare lock cannot pin the seam: it returns within the bound, reconcile never runs, the lock file stays blocking", { timeout: 90_000 }, async () => {
+        let reconciles = 0;
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let holder: Promise<void> | undefined;
+        let atReturn = -1;
+        let elapsed = Infinity;
+        const { lines, runId } = await lockScenario(4258_300, { tickSpawn: { beforeReconcile: async () => { reconciles++; } } }, async ({ r, seam, lockFile, stop }) => {
+          try {
+            holder = r.g.withBareLock(r.bare, async () => { await held; });
+            holder.catch(() => undefined);
+            fs.writeFileSync(lockFile, "x");
+            const t0 = stop();
+            const d = await bounded(seam, BOUND_MS + 8_000, "the seam resolving while another holder owns the bare lock", "mid-run seam");
+            elapsed = Date.now() - t0;
+            atReturn = reconciles;
+            assert.deepEqual(d, { action: "proceed" });
+            assert.ok(retainedHas(r, lockFile), "the lock file that may belong to the unreconciled child blocks the sink");
+            assert.ok(r.state().midRunTrigger, "the trigger is kept");
+            assert.equal(r.state().attempts, 0);
+            assert.equal((r.flight().sinkGate as { isHeld(): boolean }).isHeld(), false, "the sink gate was released");
+          } finally {
+            release();
+            await holder;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          assert.equal(reconciles, atReturn, "no reconcile ran after the holder released the lock");
+        });
+        assert.ok(elapsed < BOUND_MS + 5_000, `the seam returned ${elapsed}ms after the stop`);
+        const notRun = logged(lines, NOT_RUN);
+        assert.equal(notRun.length, 1, "the unreconciled outcome was logged once");
+        assert.equal(notRun[0]!.reconciled, false);
+        assert.equal(notRun[0]!.reason, "lock_wait_timeout");
+        assert.deepEqual(logged(lines, REMOVED), [], "no lock file was removed");
+        assert.deepEqual(logged(lines, FAILED), []);
+        assert.equal(statusTexts(runId).filter((t) => t === SINK_BLOCKED).length, 1, "the sink-blocked status was emitted once");
+      });
+
+      it("an acquired reconcile that outlasts the bound completes and is recorded, never labelled a timeout", { timeout: 90_000 }, async () => {
+        let delayed = 0;
+        const { lines } = await lockScenario(4258_301, {
+          tickSpawn: { beforeReconcile: async () => { delayed++; await new Promise((resolve) => setTimeout(resolve, BOUND_MS * 3)); } },
+        }, async ({ r, seam, lockFile, stop }) => {
+          fs.writeFileSync(lockFile, "x");
+          stop();
+          const d = await bounded(seam, BOUND_MS + 15_000, "the seam resolving after a slow reconcile", "mid-run seam");
+          assert.deepEqual(d, { action: "proceed" });
+          assert.ok(delayed >= 1, "the reconcile ran its delayed hook");
+          assert.ok(retainedHas(r, lockFile), "the reconcile's own retained evidence was recorded");
+        });
+        assert.deepEqual(logged(lines, NOT_RUN), [], "never labelled a lock-wait timeout");
+        assert.deepEqual(logged(lines, FAILED), []);
+        assert.equal(logged(lines, RETAINED).length, 1, "the reconcile result was recorded");
+      });
+
+      it("an acquired reconcile that rejects after the bound is recorded as failed (not a timeout) and keeps the lock file blocking", { timeout: 90_000 }, async () => {
+        const { lines } = await lockScenario(4258_302, {
+          tickSpawn: { beforeReconcile: async () => { await new Promise((resolve) => setTimeout(resolve, BOUND_MS * 3)); throw new Error("reconcile boom"); } },
+        }, async ({ r, seam, lockFile, stop }) => {
+          fs.writeFileSync(lockFile, "x");
+          stop();
+          const d = await bounded(seam, BOUND_MS + 15_000, "the seam resolving after a failing reconcile", "mid-run seam");
+          assert.deepEqual(d, { action: "proceed" });
+          assert.ok(retainedHas(r, lockFile), "the failed reconcile left its candidate lock file blocking");
+        });
+        assert.deepEqual(logged(lines, NOT_RUN), [], "never labelled a lock-wait timeout");
+        const failed = logged(lines, FAILED);
+        assert.ok(failed.length >= 1);
+        assert.equal(failed.at(-1)!.reconciled, false);
+        assert.match(String(failed.at(-1)!.error), /reconcile boom/);
+      });
+    });
+
     it("a surviving process group keeps the seam open and the sink gate held until it is gone", { timeout: 90_000 }, async () => {
       const tmp = scratchDir("4258-survivor");
       const stall = writeStallShim(tmp);
@@ -5817,7 +5986,8 @@ describe("issue #4258 real SdkExecutor + RunRunner: a stop during the stalled se
           const t0 = Date.now();
           if (stop === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
           else runner.shutdown();
-          await bounded(settled, 20_000, "execute() settling after the stop", "run");
+          const outcome = await bounded(settled, 20_000, "execute() settling after the stop", "run");
+          assert.equal(outcome, undefined, `execute() resolved normally after the ${stop}, not with a rejection`);
           const elapsed = Date.now() - t0;
           if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
           assert.ok(elapsed < 10_000, `the run settled ${elapsed}ms after the stop`);

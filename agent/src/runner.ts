@@ -1044,6 +1044,8 @@ type CheckpointBodyOutcome =
 /** issue #1597 M2: how long a durable sink waits for a surviving tick process group before it
  *  proceeds anyway (and logs the residual). */
 const SURVIVOR_SINK_WAIT_MS = 2_000;
+/** Issue #4258: bound on WAITING for the bare lock in the mid-run seam's cleanup (never on a started reconcile). */
+const MID_RUN_LOCK_RECONCILE_WAIT_MS = 10_000;
 
 /** Most runs whose announced-heads ledger a worker remembers (oldest evicted). */
 const OWED_ANNOUNCED_RUNS = 256;
@@ -3316,6 +3318,8 @@ export interface CheckpointTestHooks {
   onTickOutcome?: (outcome: string) => void;
   /** SIGTERM → SIGKILL grace for a cancelled tick child (default 2s). */
   tickKillGraceMs?: number;
+  /** Bound on the mid-run seam cleanup's wait to ACQUIRE the bare lock (default 10s). */
+  midRunLockReconcileWaitMs?: number;
   /** The checkpoint secret-scan deadline (default CHECKPOINT_SCAN_TIMEOUT_MS, 60s). */
   scanDeadlineMs?: number;
   /** Override FLAGGED_COMMITS_CAP (the per-run flagged-commit list cap) so a test can reach overflow. */
@@ -20757,7 +20761,9 @@ export class RunRunner {
         findings.push(f);
       });
       if (findings.length === 0) return clear();
-      const verdict = await this.classifyFindingFloors(flight, barePath, findings, floorCandidates);
+      // The range's resolved floors (default-branch tip, scan floors, pack excludes) protect a finding here too.
+      const verdict = await this.classifyFindingFloors(flight, barePath, findings,
+        this.remediationRangeFloors(range, floorCandidates));
       if (stop.aborted) return defer("aborted");
       if (verdict === "unknown") return defer("floor_ancestry_unknown");
       if (verdict === "at_floor") return clear();
@@ -20913,6 +20919,20 @@ export class RunRunner {
         });
       }
     };
+    const blockSinkOnLocks = (paths: readonly string[]): void => {
+      if (paths.length === 0) return;
+      const wasBlocked = flight.retainedBareLocks.length > 0 || flight.survivingTickGroups.length > 0;
+      for (const p of paths) {
+        if (!flight.retainedBareLocks.includes(p)) flight.retainedBareLocks.push(p);
+      }
+      if (!wasBlocked) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: "mid-turn checkpoint sink blocked: a git lock file remains in the worker repository" },
+        });
+      }
+    };
     const recordLocks = (res: { removed: string[]; retained: RetainedLock[] }): void => {
       for (const p of res.removed) {
         runLog.info("mid-turn checkpoint removed a lock file its cancelled child provably owned", { run_id: runId, path: p });
@@ -20931,17 +20951,19 @@ export class RunRunner {
           argv_class: r.argvClass,
         })),
       });
-      const wasBlocked = flight.retainedBareLocks.length > 0 || flight.survivingTickGroups.length > 0;
-      for (const r of res.retained) {
-        if (!flight.retainedBareLocks.includes(r.path)) flight.retainedBareLocks.push(r.path);
+      blockSinkOnLocks(res.retained.map((r) => r.path));
+    };
+    // The reconcile did not run (or did not finish): fail closed on every lock path that exists now.
+    const recordUnreconciledLocks = async (): Promise<void> => {
+      const present: string[] = [];
+      try {
+        for (const p of await spawner.unreconciledLockCandidates()) {
+          if (await fs.lstat(p).then(() => true, () => false)) present.push(p);
+        }
+      } catch (e) {
+        runLog.warn("mid-run secret remediation could not list lock candidates", { run_id: runId, error: errMessage(e) });
       }
-      if (!wasBlocked) {
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: { text: "mid-turn checkpoint sink blocked: a git lock file remains in the worker repository" },
-        });
-      }
+      blockSinkOnLocks(present);
     };
     // Settle + reconcile while the per-bare lock is still held, as the tick does.
     const beforeLockRelease = async (key: string): Promise<void> => {
@@ -20992,13 +21014,37 @@ export class RunRunner {
       await spawner.settled();
       recordSurvivors();
       if (spawner.cancelledAny()) {
-        const res = await this.git
-          .withBareLock(barePath, () => spawner.reconcileLocks())
-          .catch((e: unknown) => {
-            runLog.warn("mid-turn checkpoint lock reconcile failed", { run_id: runId, error: errMessage(e) });
-            return { removed: [], retained: [] };
+        // Only the WAIT for the bare lock is bounded: the first act of the lock callback cancels the
+        // timer, so a started reconcile (fs-only) is never interrupted by it.
+        const waitAc = new AbortController();
+        const cancelWait = this.setTimer(() => waitAc.abort(), hooks?.midRunLockReconcileWaitMs ?? MID_RUN_LOCK_RECONCILE_WAIT_MS);
+        let acquired = false;
+        let res: { removed: string[]; retained: RetainedLock[] } | undefined;
+        let failure: unknown;
+        try {
+          res = await this.git.withRecoveryOperation(waitAc.signal, Infinity, () =>
+            this.git.withBareLock(barePath, async () => {
+              acquired = true;
+              cancelWait();
+              return spawner.reconcileLocks();
+            }));
+        } catch (e) {
+          failure = e;
+        } finally {
+          cancelWait();
+        }
+        if (res) recordLocks(res);
+        else if (!acquired && waitAc.signal.aborted) {
+          runLog.warn("mid-run secret remediation lock reconcile not run", {
+            run_id: runId, reconciled: false, reason: "lock_wait_timeout",
           });
-        recordLocks(res);
+          await recordUnreconciledLocks();
+        } else {
+          runLog.warn("mid-turn checkpoint lock reconcile failed", {
+            run_id: runId, reconciled: false, error: errMessage(failure),
+          });
+          await recordUnreconciledLocks();
+        }
       }
       // A surviving group may still be running: the seam does not return (and the sink gate stays
       // held) until it is gone. Unbounded by design: each awaitTickSurvivorsGone round re-sends a
