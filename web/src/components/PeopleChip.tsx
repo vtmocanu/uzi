@@ -1,11 +1,12 @@
 // The People chip for the default Overview header (issue #4042, admins only; the page decides
 // whether to mount it). A compact "N active now of M" trigger with an avatar stack opens a
 // popover listing who is doing what, who signed in recently and the week's usage. All figures
-// come from the pure peopleModel; this component only draws it. The open/close model, focus
-// handling and absolute panel follow ExtendTimePopover.
+// come from the pure peopleModel; this component only draws it. The shared chip hook and
+// panel preserve its original focus and bottom-sheet behaviour.
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { idleText, type ActivePerson, type PeopleModel } from "../lib/overviewPeople";
+import { ChipPopoverPanel } from "./ChipPopoverPanel";
+import { useChipPopover } from "./useChipPopover";
 import { cx } from "./ui";
 
 const INFO_TEXT =
@@ -63,51 +64,7 @@ function headerText(active: PeopleModel["active"], total: number | null): string
 }
 
 export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; onShowUsageByUser: () => void }) {
-  const [open, setOpen] = useState(false);
-  const hostRef = useRef<HTMLDivElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  // Pending click-away refocus frame, cancelled only on unmount (see ExtendTimePopover).
-  const refocusRaf = useRef(0);
-  const panelId = useId();
-
-  // keydown has no focus default action, so returning focus synchronously on Escape wins.
-  const close = useCallback((returnFocus: boolean) => {
-    setOpen(false);
-    if (returnFocus) triggerRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    panelRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close(true);
-    };
-    const onDown = (e: MouseEvent) => {
-      if (hostRef.current && !hostRef.current.contains(e.target as Node)) {
-        setOpen(false);
-        // The native mousedown moves focus to <body> after this handler, so refocus a frame later,
-        // but only when focus was left on nothing: a control the user clicked keeps it.
-        refocusRaf.current = requestAnimationFrame(() => {
-          const a = document.activeElement;
-          if (a == null || a === document.body) triggerRef.current?.focus({ preventScroll: true });
-        });
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    document.addEventListener("mousedown", onDown);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.removeEventListener("mousedown", onDown);
-    };
-  }, [open, close]);
-
-  useEffect(
-    () => () => {
-      if (refocusRaf.current) cancelAnimationFrame(refocusRaf.current);
-    },
-    [],
-  );
+  const { open, setOpen, hostRef, panelRef, triggerRef, panelId, close } = useChipPopover();
 
   const { active, total, signedIn, idle, week, usageAction } = model;
   if (active.state === "loading") return null;
@@ -154,17 +111,10 @@ export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; o
         </span>
       </button>
       {open && (
-        <div
+        <ChipPopoverPanel
           id={panelId}
-          ref={panelRef}
-          role="dialog"
-          aria-label="People using uzi"
-          tabIndex={-1}
-          // Desktop: below the chip, right edge aligned to it. Below sm the header actions can wrap
-          // so the chip may sit anywhere horizontally; the panel then becomes a bottom sheet: fixed
-          // with a 1rem inset on the sides and bottom, and a max height of the viewport minus the
-          // two 1rem insets, so it always fits whatever the chip's position. No measuring needed.
-          className="absolute right-0 top-full z-30 mt-2 max-h-[70vh] w-[min(360px,calc(100vw-32px))] overflow-y-auto rounded-xl border border-edge bg-raised text-left shadow-2xl outline-hidden max-sm:fixed max-sm:inset-x-4 max-sm:bottom-4 max-sm:top-auto max-sm:mt-0 max-sm:max-h-[calc(100dvh-2rem)] max-sm:w-auto"
+          panelRef={panelRef}
+          label="People using uzi"
         >
           <div className="space-y-3 p-3">
             <div className="flex items-start justify-between gap-2">
@@ -254,7 +204,7 @@ export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; o
               </button>
             )}
           </div>
-        </div>
+        </ChipPopoverPanel>
       )}
     </div>
   );

@@ -1,13 +1,14 @@
 // The Agents chip for the new Overview header (/dashboard) (#4335), shown to every user. A compact
 // "K agents in your runs of N" trigger opens a popover with the per-scope breakdown and, for an
 // admin, the global-default count. All figures come from the pure agentCountModel; this
-// component only draws it. The open/close model, focus handling and absolute panel follow
-// PeopleChip.
+// component only draws it. The shared chip hook and panel keep its focus and sheet
+// behaviour aligned with PeopleChip.
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { AgentCountModel } from "../lib/agentCounts";
+import { ChipPopoverPanel } from "./ChipPopoverPanel";
 import { BotIcon } from "./icons";
+import { useChipPopover } from "./useChipPopover";
 
 const INFO_TEXT =
   "Agents toggled on under In my runs on the Agents page. A run can still pick repo agents or exclude some at its plan gate.";
@@ -26,51 +27,7 @@ function Row({ label, value }: { label: string; value: string }) {
 }
 
 export function AgentsChip({ model }: { model: AgentCountModel }) {
-  const [open, setOpen] = useState(false);
-  const hostRef = useRef<HTMLDivElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  // Pending click-away refocus frame, cancelled only on unmount (see PeopleChip).
-  const refocusRaf = useRef(0);
-  const panelId = useId();
-
-  // keydown has no focus default action, so returning focus synchronously on Escape wins.
-  const close = useCallback((returnFocus: boolean) => {
-    setOpen(false);
-    if (returnFocus) triggerRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    panelRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close(true);
-    };
-    const onDown = (e: MouseEvent) => {
-      if (hostRef.current && !hostRef.current.contains(e.target as Node)) {
-        setOpen(false);
-        // The native mousedown moves focus to <body> after this handler, so refocus a frame later,
-        // but only when focus was left on nothing: a control the user clicked keeps it.
-        refocusRaf.current = requestAnimationFrame(() => {
-          const a = document.activeElement;
-          if (a == null || a === document.body) triggerRef.current?.focus({ preventScroll: true });
-        });
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    document.addEventListener("mousedown", onDown);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.removeEventListener("mousedown", onDown);
-    };
-  }, [open, close]);
-
-  useEffect(
-    () => () => {
-      if (refocusRaf.current) cancelAnimationFrame(refocusRaf.current);
-    },
-    [],
-  );
+  const { open, setOpen, hostRef, panelRef, triggerRef, panelId, close } = useChipPopover();
 
   const { total, inRuns, byScope, globalDefaults } = model;
 
@@ -100,15 +57,10 @@ export function AgentsChip({ model }: { model: AgentCountModel }) {
         </span>
       </button>
       {open && (
-        <div
+        <ChipPopoverPanel
           id={panelId}
-          ref={panelRef}
-          role="dialog"
-          aria-label="Agents in your runs"
-          tabIndex={-1}
-          // Desktop: below the chip, right edge aligned to it. Below sm the panel becomes a bottom
-          // sheet: fixed with a 1rem inset on the sides and bottom (see PeopleChip).
-          className="absolute right-0 top-full z-30 mt-2 max-h-[70vh] w-[min(360px,calc(100vw-32px))] overflow-y-auto rounded-xl border border-edge bg-raised text-left shadow-2xl outline-hidden max-sm:fixed max-sm:inset-x-4 max-sm:bottom-4 max-sm:top-auto max-sm:mt-0 max-sm:max-h-[calc(100dvh-2rem)] max-sm:w-auto"
+          panelRef={panelRef}
+          label="Agents in your runs"
         >
           <div className="space-y-3 p-3">
             <div className="flex items-start justify-between gap-2">
@@ -150,7 +102,7 @@ export function AgentsChip({ model }: { model: AgentCountModel }) {
               Manage agents
             </Link>
           </div>
-        </div>
+        </ChipPopoverPanel>
       )}
     </div>
   );
