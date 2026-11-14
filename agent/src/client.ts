@@ -1706,6 +1706,14 @@ export class WorkerClient {
 
   private latestDindMaintenanceValue: DindMaintenance | null | undefined;
   private latestHibernationInventoryValue: HibernationInventoryMember | null | undefined;
+  private hibernationExclusionReceipt?: { report: HibernationExclusionReport; opId: string; held: boolean };
+
+  /** Exact-input receipt: another concurrent heartbeat must not acknowledge this report.
+   *  A lost receipt can cause a harmless resend; an omitted/stripped report never gets one. */
+  hibernationExclusionDelivered(report: HibernationExclusionReport): boolean {
+    const receipt = this.hibernationExclusionReceipt;
+    return receipt?.report === report && receipt.opId === report.op_id && receipt.held === report.held;
+  }
 
   /** Latest heartbeat's `hibernation_inventory` (PRD #4208): null = none, undefined = unknown or malformed. */
   get latestHibernationInventory(): HibernationInventoryMember | null | undefined {
@@ -2013,6 +2021,7 @@ export class WorkerClient {
     this.latestDindMaintenanceValue = undefined;
     this.latestHibernationCachePruneValue = undefined;
     this.hibernationReportOutcomeValue = "none";
+    this.hibernationExclusionReceipt = undefined;
     this.hibernationPruneAdvertised = false;
     this.registerNonce = undefined;
     this.registrationEvidenceDropped = false;
@@ -2240,6 +2249,7 @@ export class WorkerClient {
     this.latestDindMaintenanceValue = undefined;
     this.latestHibernationCachePruneValue = undefined;
     this.hibernationReportOutcomeValue = "none";
+    this.hibernationExclusionReceipt = undefined;
     this.latestHibernationInventoryValue = undefined;
     const body: HeartbeatRequest & { hibernation_exclusion?: HibernationExclusionReport } = { version: this.version };
     if (this.hasFeature("heartbeat_outbox_root_unusable")) body.outbox_root_unusable = outboxRootUnusable ?? null;
@@ -2304,11 +2314,17 @@ export class WorkerClient {
         register_nonce: this.registerNonce,
       };
     }
+    const recordExclusionDelivery = (sent: HeartbeatRequest & { hibernation_exclusion?: HibernationExclusionReport }): void => {
+      const packet = sent.hibernation_exclusion;
+      this.hibernationExclusionReceipt = packet && hibernationExclusion
+        ? { report: hibernationExclusion, opId: packet.op_id, held: packet.held } : undefined;
+    };
     const includeExtension = body.protocol_refresh !== undefined || includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
       body.dind_maintenance_ready_ack !== undefined || body.hibernation_cache_prune_report !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined || includeHibernation;
     try {
       try {
         const sent = await this.postHeartbeat(body);
+        recordExclusionDelivery(body);
         if (body.hibernation_cache_prune_report) this.hibernationReportOutcomeValue = "sent";
         return sent;
       } catch (err) {
@@ -2316,7 +2332,9 @@ export class WorkerClient {
         if (body.outbox_root_unusable !== undefined && isStrictDecodeError(err)) {
           delete body.outbox_root_unusable;
           this.dropFeature("heartbeat_outbox_root_unusable");
-          return await this.postHeartbeat(body);
+          const sent = await this.postHeartbeat(body);
+          recordExclusionDelivery(body);
+          return sent;
         }
         // A stale ACK gets one ACK-free resync; sibling extensions remain intact.
         // Any failure of that request reaches the usual strict-decode fallback below.
@@ -2328,6 +2346,7 @@ export class WorkerClient {
         const droppedReport = resync.hibernation_cache_prune_report !== undefined;
         delete resync.hibernation_cache_prune_report;
         const resynced = await this.postHeartbeat(resync);
+        recordExclusionDelivery(resync);
         if (droppedReport) this.hibernationReportOutcomeValue = "dropped";
         return resynced;
       }
@@ -2346,6 +2365,7 @@ export class WorkerClient {
       const stripped: HeartbeatRequest = { version: this.version };
       if (stats) stripped.stats = stats;
       const retaining = await this.postHeartbeat(stripped, false);
+      recordExclusionDelivery(stripped);
       this.clearFeatures();
       this.log.warn(
         "heartbeat extension rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",

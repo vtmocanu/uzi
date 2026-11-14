@@ -310,6 +310,9 @@ first step, a **dry run**: **no volume is deleted**, and no setting turns deleti
   the plain and isolated lanes have no usable inventory, so they are blocked
   once past the retirement period (until then they are not yet eligible), and
   their volumes are retained.
+- **Heartbeat failures.** A transient inventory-heartbeat error keeps the worker's
+  writer exclusion in place. Reports that exclusion was lost are retried until
+  acknowledged; compatibility retries that omit the report do not acknowledge it.
 - **What blocks.** An incomplete, invalid or unproven inventory; a protected,
   unknown or unrecoverable source; a source that needs a receipt (for example a
   failed run's tracking ref) without a valid, unexpired capture of its latest

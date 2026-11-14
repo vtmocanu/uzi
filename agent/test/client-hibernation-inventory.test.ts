@@ -24,18 +24,25 @@ let client: WorkerClient;
 let features: string[];
 let heartbeatReply: unknown;
 let seen: Seen[];
+let heartbeatStatuses: number[];
 
 beforeEach(async () => {
   features = ["hibernation_inventory_v1"];
   heartbeatReply = wire.heartbeat_response_member.awaiting;
   seen = [];
+  heartbeatStatuses = [];
   server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
       const url = req.url ?? "";
       seen.push({ url, raw: Buffer.concat(chunks).toString("utf8") });
-      res.writeHead(200, { "Content-Type": "application/json" });
+      const status = url.endsWith("/heartbeat") ? heartbeatStatuses.shift() ?? 200 : 200;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      if (status !== 200) {
+        res.end(JSON.stringify({ error: status === 400 ? "invalid request body" : "fixture failure" }));
+        return;
+      }
       if (url.endsWith("/register")) {
         res.end(JSON.stringify({ worker_id: "w1", protocol_features: features, register_nonce: NONCE }));
       } else if (url.endsWith("/heartbeat")) {
@@ -140,6 +147,59 @@ describe("hibernation heartbeat integration", () => {
     await client.register("w");
     await client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, undefined, report);
     assert.equal(seen.at(-1)!.raw, '{"version":"0.1.0-test"}');
+  });
+
+  it("records delivery only when this exact exclusion report rode a 2xx", async () => {
+    await client.register("w");
+    const report = { ...wire.heartbeat_request_member.hibernation_exclusion, held: false };
+    heartbeatStatuses = [500];
+    await assert.rejects(client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, undefined, report));
+    assert.equal(client.hibernationExclusionDelivered(report), false);
+    await client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, undefined, report);
+    assert.equal(client.hibernationExclusionDelivered(report), true);
+    assert.equal(client.hibernationExclusionDelivered({ ...report }), false, "another call's report is not acknowledged");
+    const bodies = seen.filter((s) => s.url.endsWith("/heartbeat")).map((s) => JSON.parse(s.raw));
+    assert.deepEqual(bodies.map((b) => b.hibernation_exclusion), [report, report]);
+    await client.heartbeat();
+    assert.equal(client.hibernationExclusionDelivered(report), false, "receipts reset each heartbeat");
+  });
+
+  it("does not record delivery for an unnegotiated or stripped report", async () => {
+    const report = { ...wire.heartbeat_request_member.hibernation_exclusion, held: false };
+    features = [];
+    await client.register("w");
+    await client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, undefined, report);
+    assert.equal(client.hibernationExclusionDelivered(report), false);
+    features = ["hibernation_inventory_v1"];
+    await client.register("w");
+    heartbeatStatuses = [400, 200];
+    await client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, undefined, report);
+    assert.equal(client.hibernationExclusionDelivered(report), false);
+    assert.equal(JSON.parse(seen.at(-1)!.raw).hibernation_exclusion, undefined);
+  });
+
+  it("records an exclusion preserved by a 409 resync", async () => {
+    await client.register("w", undefined, undefined, undefined, ["hibernation_cache_prune_v1"]);
+    const report = { ...wire.heartbeat_request_member.hibernation_exclusion, held: false };
+    const cleanup = { op_id: NONCE, register_nonce: NONCE, kind: "refused" as const, reason: "cancelled" as const };
+    heartbeatStatuses = [409, 200];
+    await client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, cleanup, report);
+    assert.equal(client.hibernationExclusionDelivered(report), true);
+    const body = JSON.parse(seen.at(-1)!.raw);
+    assert.deepEqual(body.hibernation_exclusion, report);
+    assert.equal(body.hibernation_cache_prune_report, undefined);
+  });
+
+  it("records an exclusion preserved when only a diagnostic is stripped", async () => {
+    features.push("heartbeat_outbox_root_unusable");
+    await client.register("w");
+    const report = { ...wire.heartbeat_request_member.hibernation_exclusion, held: false };
+    heartbeatStatuses = [400, 200];
+    await client.heartbeat(undefined, undefined, undefined, undefined, undefined, "unreadable", undefined, report);
+    assert.equal(client.hibernationExclusionDelivered(report), true);
+    const body = JSON.parse(seen.at(-1)!.raw);
+    assert.deepEqual(body.hibernation_exclusion, report);
+    assert.equal(body.outbox_root_unusable, undefined);
   });
 
   it("posts fixture-shaped bodies to the inventory and exclusion-final paths", async () => {

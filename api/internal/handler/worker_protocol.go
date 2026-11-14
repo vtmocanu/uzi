@@ -760,14 +760,11 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(herr, workersvc.ErrHibernationUnavailable):
 		case herr != nil:
 			slog.Error("worker heartbeat: hibernation inventory", "worker_id", wkr.ID.String(), "error", herr)
-			// Liveness is already committed, so the hibernation half is best effort: the member is
-			// omitted and the worker asks again on its next beat. The one exception is a report that
-			// the exclusion was lost (held=false): it is recorded in the same transaction as the
-			// member, so after a failure it may not be recorded, and the worker must resend it.
-			if exclusion != nil && !exclusion.Held {
-				httpx.Error(w, http.StatusInternalServerError, "internal error")
-				return
-			}
+			// Liveness is already committed, but omission in a 200 would tell the worker to
+			// release its exclusion. Fail the heartbeat so it keeps the observation unknown
+			// and retries any exclusion report instead of acknowledging evidence we lost.
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
 		case member != nil:
 			response["hibernation_inventory"] = member
 		}

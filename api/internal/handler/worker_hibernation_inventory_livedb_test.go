@@ -592,23 +592,32 @@ func TestWorkerHibernationInventoryUncoveredAndTextLiveDB(t *testing.T) {
 	})
 }
 
-// The hibernation half of a heartbeat is best effort once liveness has committed: a failure there
-// omits the member. Only a lost-exclusion report, recorded in that same transaction, must be resent.
-func TestWorkerHeartbeatHibernationFailureIsBestEffortLiveDB(t *testing.T) {
+// A failed inventory transaction must not look like an explicit absent member: the worker
+// keeps its exclusion on a failed heartbeat, and retries any lost-exclusion report. Liveness
+// has already committed independently.
+func TestWorkerHeartbeatHibernationFailurePreservesExclusionLiveDB(t *testing.T) {
 	op := "55555555-5555-5555-5555-555555555555"
 	f := newInvRouteFx(t)
 	f.observe()
+	if rec := f.post(invPath, f.fx["inventory_request"], true); rec.Code != http.StatusOK {
+		t.Fatalf("inventory = %d", rec.Code)
+	}
 	// A stored pvcs value the member builder cannot decode makes HibernationHeartbeat fail.
 	cliMustExec(t, f.pool, `UPDATE worker_hibernation_inventories SET pvcs = '[1]'::jsonb WHERE worker_id = $1`, f.id)
 	for name, body := range map[string]string{
 		"plain": `{"version":"v"}`,
 		"held":  `{"hibernation_exclusion":{"op_id":"` + op + `","held":true}}`,
 	} {
+		cliMustExec(t, f.pool, `UPDATE workers SET last_heartbeat_at = '2000-01-01'::timestamptz WHERE id = $1`, f.id)
 		rec := f.heartbeat(body)
+		var committed bool
+		if err := f.pool.QueryRow(context.Background(), `SELECT last_heartbeat_at > '2000-01-02'::timestamptz FROM workers WHERE id = $1`, f.id).Scan(&committed); err != nil || !committed {
+			t.Fatalf("%s: liveness did not commit before the inventory error: %v", name, err)
+		}
 		var resp map[string]json.RawMessage
 		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-		if _, ok := resp["hibernation_inventory"]; rec.Code != http.StatusOK || ok {
-			t.Errorf("%s: heartbeat = %d, member present=%v", name, rec.Code, ok)
+		if _, ok := resp["hibernation_inventory"]; rec.Code != http.StatusInternalServerError || ok {
+			t.Errorf("%s: heartbeat = %d, member present=%v; want 500", name, rec.Code, ok)
 		}
 	}
 	// A lost-exclusion report that fails with the member build is not acknowledged and not recorded

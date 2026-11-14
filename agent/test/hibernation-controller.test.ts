@@ -165,13 +165,20 @@ describe("HibernationInventoryController", () => {
     assert.equal(r.gate.claimsClosed(), true);
   });
 
-  it("reports held:false once after a post-EX failure releases the exclusion", async () => {
+  it("retries held:false until delivery is acknowledged after a post-EX failure", async () => {
     const r = rig({ census: async () => { throw new Error("census boom"); } });
     await feed(r, AWAITING);
     assert.equal((r.posts[0] as { status: string }).status, "busy");
     assert.equal(r.state.mode, "shared");
-    assert.deepEqual(r.c.exclusionReport(), { op_id: AWAITING.op_id, held: false });
-    assert.equal(r.c.exclusionReport(), undefined, "sent once");
+    const lost = { op_id: AWAITING.op_id, held: false };
+    assert.deepEqual(r.c.exclusionReport(), lost);
+    assert.deepEqual(r.c.exclusionReport(), lost, "a failed or omitted send must not consume it");
+    r.c.acknowledgeExclusion({ op_id: OTHER.op_id, held: false });
+    assert.deepEqual(r.c.exclusionReport(), lost, "an old op's receipt cannot clear this report");
+    r.c.acknowledgeExclusion({ op_id: AWAITING.op_id, held: true });
+    assert.deepEqual(r.c.exclusionReport(), lost, "a held receipt cannot acknowledge a loss");
+    r.c.acknowledgeExclusion(lost);
+    assert.equal(r.c.exclusionReport(), undefined);
   });
 
   it("posts exclusion_failed, re-takes shared and reopens when a non-fatal EX attempt throws", async () => {

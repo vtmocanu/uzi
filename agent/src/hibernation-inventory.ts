@@ -345,7 +345,7 @@ export class HibernationInventoryController {
   private fatal = false;
   /** Shutdown began: the exclusion is held until the process exits and is never released. */
   private stopping = false;
-  /** An op whose exclusion was dropped after a post-EX failure: `held:false` is sent once. */
+  /** An op whose exclusion was dropped after a post-EX failure: `held:false` repeats until delivery is acknowledged. */
   private pendingRelease?: string;
 
   constructor(private readonly deps: HibernationDeps) {
@@ -369,14 +369,17 @@ export class HibernationInventoryController {
 
   /** The `hibernation_exclusion` heartbeat member, or undefined when there is nothing to report. */
   exclusionReport(): HibernationExclusionReport | undefined {
+    // A loss is sticky until the exact report is acknowledged by a successful send. Merely
+    // asking for it, failing a heartbeat, or stripping the extension is not delivery.
+    const opId = this.pendingRelease;
+    if (opId !== undefined) return { op_id: opId, held: false };
     const h = this.held;
-    if (!h?.ex) {
-      const opId = this.pendingRelease;
-      if (opId === undefined) return undefined;
-      this.pendingRelease = undefined;
-      return { op_id: opId, held: false };
-    }
-    return { op_id: h.opId, held: this.intact() };
+    return h?.ex ? { op_id: h.opId, held: this.intact() } : undefined;
+  }
+
+  /** Called only after the client confirms this report rode a successful heartbeat. */
+  acknowledgeExclusion(report: HibernationExclusionReport): void {
+    if (!report.held && this.pendingRelease === report.op_id) this.pendingRelease = undefined;
   }
 
   private ownershipMode(): string | undefined {

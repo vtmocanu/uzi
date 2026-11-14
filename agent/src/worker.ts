@@ -1228,6 +1228,7 @@ export class Worker {
         // PRD #4206: a maintenance ACK goes first; the cache prune report waits for the next heartbeat.
         const ack = this.dindMaintenance?.acknowledgement();
         const hibernationReport = ack ? undefined : this.hibernationPrune?.report();
+        const hibernationExclusion = this.hibernation?.exclusionReport();
         const retaining = await this.client.heartbeat(
           sample,
           this.outboxEntries(),
@@ -1237,9 +1238,12 @@ export class Worker {
           residueQuarantine(),
           this.outbox?.unusableRootReason?.(),
           hibernationReport,
-          this.hibernation?.exclusionReport(),
+          hibernationExclusion,
         );
         ok = true;
+        if (hibernationExclusion && this.client.hibernationExclusionDelivered(hibernationExclusion)) {
+          this.hibernation?.acknowledgeExclusion(hibernationExclusion);
+        }
         if (hibernationReport) {
           const outcome = this.client.hibernationReportOutcome;
           this.hibernationPrune?.reported(hibernationReport, outcome === "none" ? "failed" : outcome);
