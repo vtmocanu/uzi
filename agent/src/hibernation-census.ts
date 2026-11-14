@@ -484,16 +484,19 @@ async function classifyRepos(dataDir: string, tree: Tree, node: Node, out: Gathe
 
 /** The standard bare-git layout plus the names git.ts itself creates inside a bare (uzi-owed, uzi-code-snapshots). */
 const BARE_TOP_FILES = new Set(["HEAD", "config", "description", "packed-refs", "FETCH_HEAD", "ORIG_HEAD", "shallow"]);
-const BARE_TOP_DIRS = new Set(["objects", "refs", "info", "hooks", "logs", "worktrees", "uzi-owed", "uzi-code-snapshots"]);
+const BARE_TOP_DIRS = new Set(["objects", "refs", "info", "hooks", "logs", "uzi-owed", "uzi-code-snapshots"]);
 /** `<name>.lock` files and the ledger compaction temp (git.ts LEDGER_COMPACT_TMP_PREFIX). */
 const BARE_TOP_TRANSIENT = /^(?:.+\.lock|config\.uzi-compact-.*)$/;
 /** Ref namespaces under refs/ that git or git.ts writes. */
 const KNOWN_REF_DIRS = new Set(["heads", "tags", "remotes", "stash",
   "uzi-runner", "uzi-archive", "uzi-settle", "uzi-recovery-pin", "uzi-owed", "uzi-coverage", "uzi-checkpoints",
-  "uzi-materialize", "uzi-publication-floor", "uzi-cross-check", "uzi-incoming", "uzi-recovery-episode"]);
+  "uzi-materialize", "uzi-publication-floor", "uzi-cross-check", "uzi-incoming", "uzi-recovery-episode",
+  // Scratch namespaces git.ts deletes in a finally; a crash can leave them, and their objects came from the forge.
+  "uzi-workflow-target", "uzi-secret-scan-floor"]);
 
-/** Every node of a bare outside the known structure is its own unknown_path entry (a blocker), so residue in a bare
- *  is never covered by the aggregate bare_repo cache entry. */
+/** Every top-level node of a bare outside the known structure, and every refs/<namespace> outside the known
+ *  namespaces, is its own unknown_path entry (a blocker). Deeper residue (inside info/, hooks/ or objects/) and
+ *  packed refs in unknown namespaces are not inspected and ride with the aggregate bare_repo entry. */
 function unknownBareNodes(tree: Tree, bare: Node, out: Gathered): void {
   const detailOf = (n: Node): string => n.type === "dir" ? `nodes_${tree.count(n.rel)}` : n.type;
   for (const n of tree.children(bare.rel)) {
@@ -514,8 +517,11 @@ function unknownBareNodes(tree: Tree, bare: Node, out: Gathered): void {
 
 /** Ref namespaces whose objects are recovery or settlement state (git.ts: refs/uzi-archive, refs/uzi-settle,
  *  refs/uzi-recovery-pin, refs/uzi-owed, refs/uzi-coverage). */
-const PROTECTED_REF_DIRS = ["uzi-archive", "uzi-settle", "uzi-recovery-pin", "uzi-owed", "uzi-coverage"];
-const PROTECTED_PACKED_REF = / refs\/uzi-(?:archive|settle|recovery-pin|owed|coverage)\//;
+// uzi-recovery-episode pins captured, unpushed recovery work and is never cleaned up; uzi-cross-check pins a
+// local-only code snapshot. Both are protected (fail closed), even though that can keep a bare protected for good.
+const PROTECTED_REF_DIRS = ["uzi-archive", "uzi-settle", "uzi-recovery-pin", "uzi-owed", "uzi-coverage",
+  "uzi-recovery-episode", "uzi-cross-check"];
+const PROTECTED_PACKED_REF = / refs\/uzi-(?:archive|settle|recovery-pin|owed|coverage|recovery-episode|cross-check)\//;
 
 /** Why a bare cache is more than a cache: owed records, a ref in a recovery namespace (loose or packed) or a code
  *  snapshot. "unreadable" when the packed refs could not be read. */

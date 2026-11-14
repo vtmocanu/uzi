@@ -450,6 +450,20 @@ it("a refs/uzi-coverage ref (loose or packed) keeps a bare protected", async () 
   assert.deepEqual(result.entries.filter(e => e.kind === "unknown_path" && e.path.startsWith("repos/cov")), []);
 });
 
+it("recovery-episode and cross-check refs keep a bare protected; a worktrees dir and crash-left scratch refs do not hide", async () => {
+  put("repos/ep.git/refs/uzi-recovery-episode/run/tip", `${TIP}\n`);
+  put("repos/epp.git/packed-refs", `${TIP} refs/uzi-recovery-episode/run/tip\n`);
+  put("repos/cc.git/refs/uzi-cross-check/x", `${TIP}\n`);
+  put("repos/wt.git/worktrees/w/index", "staged");
+  put("repos/sc.git/refs/uzi-workflow-target/u", `${TIP}\n`);
+  put("repos/sc.git/refs/uzi-secret-scan-floor/main", `${TIP}\n`);
+  const result = await run();
+  for (const p of ["repos/ep.git", "repos/epp.git", "repos/cc.git"]) assert.equal(byPath(result, p)?.classification, "protected", p);
+  assert.equal(byPath(result, "repos/wt.git/worktrees")?.classification, "unknown");
+  assert.equal(byPath(result, "repos/sc.git")?.classification, "disposable");
+  assert.deepEqual(result.entries.filter(e => e.kind === "unknown_path" && e.path.startsWith("repos/sc.git")), []);
+});
+
 it(".uzi-authority: lock files are disposable, any store file is unknown", async () => {
   put(".uzi-authority/worker.lock", ""); put(".uzi-authority/authority.lock", "");
   assert.equal(byPath(await run(), ".uzi-authority")?.classification, "disposable");

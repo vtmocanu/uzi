@@ -11,6 +11,8 @@ import { nullLogger } from "./helpers.js";
 // PRD #4208 M1: production entry points of writer classes the wiring test does not drive (dind_prune is in
 // hibernation-wiring, recovery_pass in hibernation-recovery-writers, live_settle in runner-recovery-settlement).
 // Each runs through its real entry with the process-wide registry latched and must not start its write pass.
+// Not driven here (their entries need the full boot, terminal-rejection or retained-source harness): recovery_resume,
+// boot_terminals, terminal_rejections and retained_ops.
 
 const HOST = "tcp://127.0.0.1:2375";
 
