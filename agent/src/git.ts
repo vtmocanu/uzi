@@ -23236,7 +23236,7 @@ try {
         env.GIT_ALTERNATE_OBJECT_DIRECTORIES = JSON.stringify(proof.alternate);
       }
       child = await this.spawnGit(path.dirname(outPath),
-        ["--no-replace-objects", ...(proof ? ["-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false", "-c", "advice.graftFileDeprecated=false",
+        ["--no-replace-objects", ...(proof ? ["-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false",
           "-c", "core.fsmonitor=false"] : []), "index-pack", "--strict", "--no-rev-index", "--index-version=2",
           "-o", outPath, staged.path], undefined,
         { env, trustedExecutable: true, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096,

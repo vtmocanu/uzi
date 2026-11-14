@@ -277,9 +277,13 @@ Record binding. A record binds to the proved source (the current present
 attempt) when it is on the same branch and its `bareDir` equals the current
 bare's directory name. A record without a `bareDir` binds only when exactly one
 bare exists (it then cannot belong to another bare) and the branch matches. A
-record that matches only an absent or retired attempt is accepted only when its
-`sourceSha` is an explicit root of the universe (the head or an owed root);
-otherwise it is `record_outside_universe`.
+record not bound to the current source is accepted only when its `sourceSha`
+is an explicit root of the universe (the head or an owed root) and it matches
+another ledger attempt of the run by branch and by the bare that attempt lives
+in; otherwise it is `record_outside_universe`. Only records bound to the
+current source contribute generations. The abandoned-entry duplicate check
+keys on class and source, so one source may carry both an `ignored` and a
+`cold_dirty` entry.
 
 The inventory and the attribution are read under separate bare-lock
 acquisitions, so the universe is two snapshots, not one. The later in-boundary

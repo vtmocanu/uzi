@@ -223,7 +223,7 @@ describe("readTerminalCloneLocalRefs", () => {
     assert.deepEqual(await rig.cache.readTerminalCloneLocalRefs(c.clone, c.head), { ok: false, reason: "not_ancestor" });
   });
 
-  it("is not fooled by a commit-graph written over forged grafts", async () => {
+  it("a commit-graph cannot be written over forged grafts, so the walk still refuses (core.commitGraph=false is defence in depth, not covered here)", async () => {
     const rig = new Rig();
     const c = await clone(rig);
     git(c.clone, "checkout", "-b", "side", c.a);
@@ -443,9 +443,12 @@ describe("readTerminalSourceUniverse", () => {
     const retired = await rig.attempt(bare, { state: "retired", journal: false, present: false, branch: "gone" });
     const current = await rig.attempt(bare);
     assert.ok(retired.attemptId);
-    const rec = (sourceSha: string) => ({ captureId: "c1", branch: "gone", bareDir: path.basename(second), sourceSha, generation: 1 });
+    const rec = (sourceSha: string, dir = path.basename(bare)) => ({ captureId: "c1", branch: "gone", bareDir: dir, sourceSha, generation: 1 });
     assert.equal(unproved(await rig.universe(current, { recovery: fakeRecovery([rec("f".repeat(40))]) })).reason, "record_outside_universe");
     assert.equal((await rig.universe(current, { recovery: fakeRecovery([rec(current.head)]) })).kind, "proved");
+    // The retired attempt lives in the first bare: a record naming the second bare does not bind to it.
+    assert.equal(unproved(await rig.universe(current, { recovery: fakeRecovery([rec(current.head, path.basename(second))]) })).reason,
+      "record_outside_universe");
   });
 
   it("refuses a live attempt whose clone vanished, but allows a retired one with an owed root", async () => {

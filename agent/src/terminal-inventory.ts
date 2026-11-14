@@ -224,12 +224,15 @@ export async function readTerminalSourceUniverse(input: TerminalUniverseInput): 
       // attempt is accepted solely when its sourceSha is an explicit root of the universe (the head or an owed root).
       const sameBranch = record.branch === currentSource.branch;
       const bareMatches = record.bareDir !== undefined ? record.bareDir === path.basename(currentSource.bare) : bares.length === 1;
-      const absentOk = attemptsAll.some(a => a.branch === record.branch) && explicitRoots.has(record.sourceSha);
-      if (!(sameBranch && bareMatches) && !absentOk) throw new Unproved("record_outside_universe", `record ${record.captureId}`);
+      const recordBare = (bare: string) => record.bareDir !== undefined ? record.bareDir === path.basename(bare) : bares.length === 1;
+      const boundToCurrent = sameBranch && bareMatches;
+      const absentOk = !boundToCurrent && explicitRoots.has(record.sourceSha) &&
+        attemptsAll.some(a => a.attemptId !== currentSource.attemptId && a.branch === record.branch && recordBare(a.bare));
+      if (!boundToCurrent && !absentOk) throw new Unproved("record_outside_universe", `record ${record.captureId}`);
       if (record.bundlePath !== undefined && path.basename(record.bundlePath) !== `${record.captureId}.bundle`) {
         throw new Unproved("record_outside_universe", `bundle of ${record.captureId}`);
       }
-      if (record.branch === currentSource.branch && record.generation !== undefined) generations.add(record.generation);
+      if (boundToCurrent && record.generation !== undefined) generations.add(record.generation);
     }
     currentSource.recordGenerations = [...generations].sort((a, b) => a - b);
 
