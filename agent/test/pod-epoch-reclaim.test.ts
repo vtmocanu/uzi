@@ -347,6 +347,22 @@ test("#4265 a batch inspection returning the wrong number of results invalidates
     assert.deepEqual(result.list, []);
   } finally { await d.close(); }
 });
+test("#4265 a malformed batch result after an in-batch invalidation and the hard limit still ends fatally", async () => {
+  const d = await daemon();
+  try {
+    const { options } = setup(); options.dockerHost = d.host; inventory(options, 1);
+    const time = clock(options);
+    let reached = false;
+    options.git.inspectEpochRetainedGroups = async batch => {
+      reached = true;
+      try { batch.requests[0]!.beforeTree!("/not/expected"); } catch { /* the invalidation aborts the pass */ }
+      time.advance(601000);
+      return [null] as never;
+    };
+    await assert.rejects(runPodEpochShadow(options), PodEpochSettlementError);
+    assert.ok(reached, "the batch inspection ran");
+  } finally { await d.close(); }
+});
 for (const stage of ["discovery", "holds", "ownership", "queued_inspection", "measurement"] as const)
 test("shutdown aborts and joins " + stage + " without handover", async () => {
   const d = await daemon();
