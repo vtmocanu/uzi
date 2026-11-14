@@ -35,6 +35,48 @@ func TestWorkerDTOHibernationFields(t *testing.T) {
 	}
 }
 
+// The owner /workers list builds DTOs from store.ListWorkersByUserRow, a separate path from
+// workerDTOFromWorker; it must project the cleanup columns too.
+func TestWorkerDTOFromRowHibernationCleanup(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	txt := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
+	cases := []struct {
+		name                   string
+		row                    store.ListWorkersByUserRow
+		wantNil                bool
+		state, outcome, reason string
+	}{
+		{name: "none is null", row: store.ListWorkersByUserRow{CleanupPhase: "none"}, wantNil: true},
+		{name: "started is cleaning", row: store.ListWorkersByUserRow{CleanupPhase: "started"}, state: "cleaning"},
+		{name: "settled skipped unsupported", row: store.ListWorkersByUserRow{CleanupPhase: "settled", HibernationCleanup: txt("skipped"), HibernationCleanupReason: txt("unsupported")}, state: "settled", outcome: "skipped", reason: "unsupported"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			c.row.Kind, c.row.Status = "hosted", "offline"
+			dto := workerDTOFromRow(c.row, "0.84.0", "0.84.0", now, now)
+			got := dto.HibernationCleanup
+			if c.wantNil {
+				if got != nil {
+					t.Fatalf("want nil, got %+v", *got)
+				}
+				return
+			}
+			if got == nil || got.State != c.state {
+				t.Fatalf("state: %+v want %q", got, c.state)
+			}
+			str := func(p *string) string {
+				if p == nil {
+					return ""
+				}
+				return *p
+			}
+			if str(got.Outcome) != c.outcome || str(got.CleanupReason) != c.reason {
+				t.Fatalf("outcome/reason: %+v", got)
+			}
+		})
+	}
+}
+
 func TestWorkerDTOHibernationCleanup(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	txt := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }

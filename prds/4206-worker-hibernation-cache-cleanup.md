@@ -41,7 +41,7 @@ Acceptance examples:
   - A command whose settlement is unknown (interrupted, timed out at 10 min, or worker lost mid-command) **keeps the claim fence**. The worker stays `preparing`, and an Admin health blocker is raised. It neither proceeds to scale-down nor reopens claims until settlement is confirmed. An admin wake, demand withdrawal or PRD #4205's `preparing` deadline may request cancellation of the prune, but claims stay fenced until its settlement is confirmed.
   - Settlement evidence that reveals custody or active work re-runs PRD #4205's admission check, which withdraws the hibernation on failure.
 - **Records.** The outcome is recorded on the worker row (`hibernation_cleanup`: `pruned` / `skipped` / `failed`, plus a reason) and shown on Admin → Workers.
-- **Protocol additions.** The trigger is a new value on an existing protocol field. The api/agent protocol mirrors and the poll-wire golden change together. The worker image must support it: gate it behind a new worker capability (`api/internal/capability`). An older worker skips cleanup with the reason `unsupported`.
+- **Protocol additions.** The trigger is a new value on an existing protocol field. (Superseded for the agent by D7: the agent protocol uses the sibling `hibernation_cache_prune` heartbeat field, and the controller sees the new `cleaning` state value.) The api/agent protocol mirrors and the poll-wire golden change together. The worker image must support it: gate it behind a new worker capability (`api/internal/capability`). An older worker skips cleanup with the reason `unsupported`.
 
 ## Testing decisions
 
@@ -73,7 +73,7 @@ Acceptance: examples 1-3.
 
 ## Decision Log
 
-- **D1. Reuse the server-fenced DinD maintenance path** rather than the pressure loop, which usually prunes nothing on a quiet worker. The other rejected alternative was a new prune command, which would duplicate the fencing.
+- **D1. Reuse the server-fenced DinD maintenance path** (annotation: it reuses that path's fencing and identity mechanisms, not its wire kind; see D7 for the sibling heartbeat field and the controller's `cleaning` state) rather than the pressure loop, which usually prunes nothing on a quiet worker. The other rejected alternative was a new prune command, which would duplicate the fencing.
 - **D2. A settled refusal does not block hibernation; an unsettled operation does.** Hibernation's value, freed CPU and memory, stands without the prune. But scaling down, or reopening claims, while a destructive command's settlement is unknown would break the fence the prune relies on.
 - **D3. No attempt-tree deletion.** #3329's writer-exclusion constraint stands. A woken pod uses the existing pod-epoch reclaim path.
 - **D4. Unknown settlement is cleared only by identity-bound evidence about the same attempt (owner decision, 2026-11-14).** Evidence is a late result carrying the same op id and the same stored register nonce, or the controller observing that attempt's own pod (the uid recorded at start) present and fully terminated, which settles as `failed` / `interrupted`. Reconciliation is automatic, requested at most every 5 minutes. Rejected: treating a new pod uid or DinD epoch as proof (a replacement says nothing about the old daemon client); treating a later prune that succeeds or is refused as proof (it is a different command); an admin acknowledge route (it would let a person reopen claims on a guess).

@@ -508,6 +508,13 @@ quarantined until its next heartbeat. Any run can cause a quarantine by leaving
 such a process behind, so on a shared worker a restart is the cost of that.
 Credentials a process could read before it was detected are not revoked.
 
+## Hibernation cache prune capability
+
+A Docker-capable worker with the pressure prune enabled also advertises
+`hibernation_cache_prune_v1`, which lets the api run the
+[cache prune before hibernation](hosted-workers.md#cache-cleanup-before-sleep) on it.
+Without it the worker is not pruned and hibernates as before.
+
 ## Lost memory authority
 
 A guard-enabled worker can lose memory authority mid-life: the api stops
@@ -529,11 +536,6 @@ The worker also advertises `memory_park_settlement_v1`, only together with
 memory park sends and the reference its next claim presents. With an old api or
 an old worker there is no receipt and no reference, and the park stays
 unqualified (see [Run recovery](run-recovery.md)).
-
-A Docker-capable worker with the pressure prune enabled also advertises
-`hibernation_cache_prune_v1`, which lets the api run the
-[cache prune before hibernation](hosted-workers.md#cache-cleanup-before-sleep) on it.
-Without it the worker is not pruned and hibernates as before.
 
 **Releasing it.** Restart the worker's container (the pod, for a
 [hosted worker](hosted-workers.md)). Only a fresh registration restores
