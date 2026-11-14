@@ -43,6 +43,12 @@ func showingUpdateModel(t *testing.T, up updatePromptState) tuiModel {
 	return m
 }
 
+// readyCandidate is the candidate state in which the owning formula already installs the
+// offered release, so the modal offers the brew "Update now" action.
+func readyCandidate(owner string) updateCandidate {
+	return updateCandidate{owner: owner, ready: true}
+}
+
 // brewRec records the (foreground, args) of each Env.Brew call and returns canned results
 // per subcommand, so brew detection and the upgrade hand-off are asserted without forking brew.
 type brewRec struct {
@@ -227,7 +233,7 @@ func TestUpdatePromptShowsOncePerSession(t *testing.T) {
 
 func TestUpdatePromptRenderNormal(t *testing.T) {
 	withVersion(t, "v0.83.0")
-	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli"})
+	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", candidate: readyCandidate("uzi-cli")})
 	out := m.View().Content
 	stripped := stripANSI(out)
 	for _, want := range []string{
@@ -332,6 +338,7 @@ func TestUpdatePromptRenderReleaseName(t *testing.T) {
 									}
 									// Also retain the brew action for each channel.
 									m.updatePrompt.owner = channel.owner
+									m.updatePrompt.candidate = readyCandidate(channel.owner)
 									if got := stripANSI(m.View().Content); !strings.Contains(got, "brew upgrade vtmocanu/tap/"+channel.owner) {
 										t.Errorf("prompt missing brew action\n%s", got)
 									}
@@ -347,7 +354,7 @@ func TestUpdatePromptRenderReleaseName(t *testing.T) {
 
 func TestUpdatePromptRenderSecurityBand(t *testing.T) {
 	withVersion(t, "v0.83.0")
-	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", security: true})
+	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", candidate: readyCandidate("uzi-cli"), security: true})
 	out := m.View().Content
 	if !strings.Contains(stripANSI(out), "Security update") {
 		t.Errorf("security variant must be worded as a security update\n%s", stripANSI(out))
@@ -380,7 +387,7 @@ func TestUpdatePromptRenderNonBrewInfo(t *testing.T) {
 
 func TestUpdatePromptSelectedRowStyling(t *testing.T) {
 	withVersion(t, "v0.83.0")
-	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", sel: 0})
+	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", candidate: readyCandidate("uzi-cli"), sel: 0})
 	out := m.View().Content
 	cursor := paintSeg(m.pal.tungsten, m.pal.selBg, true, "▸ ")
 	if !strings.Contains(out, cursor) {
@@ -390,7 +397,7 @@ func TestUpdatePromptSelectedRowStyling(t *testing.T) {
 
 func TestUpdatePromptRenderAsciiFallback(t *testing.T) {
 	withVersion(t, "v0.83.0")
-	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", security: true})
+	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", candidate: readyCandidate("uzi-cli"), security: true})
 	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 	m = next.(tuiModel)
 	out := m.View().Content
@@ -494,6 +501,13 @@ func TestBrewOwnerAndPromptChannels(t *testing.T) {
 			}
 			if tc.rc != "" {
 				msg.latestRC = &apitypes.LatestReleaseDTO{Version: tc.rc}
+			}
+			// The owning formula has the offered release, so the brew action is offered.
+			switch tc.owner {
+			case "uzi-cli":
+				msg.formulas = &apitypes.HomebrewFormulasDTO{UziCLI: tc.want}
+			case "uzi-cli-rc":
+				msg.formulas = &apitypes.HomebrewFormulasDTO{UziCLIRC: tc.want}
 			}
 			next, cmd := m.Update(msg)
 			m = next.(tuiModel)
@@ -608,7 +622,7 @@ func TestBrewOwnerSymlinkAndBoundary(t *testing.T) {
 
 func TestUpdatePromptUpdateNowArmsForegroundUpgrade(t *testing.T) {
 	withVersion(t, "v0.83.0")
-	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", sel: 0})
+	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", candidate: readyCandidate("uzi-cli"), sel: 0})
 	next, cmd := m.updatePromptKey(keyEnter)
 	m = next.(tuiModel)
 	if !m.updatePrompt.pendingUpgrade {
@@ -632,7 +646,7 @@ func TestUpdatePromptDismissPersists(t *testing.T) {
 	withVersion(t, "v0.83.0")
 	store := uzicli.NewStore(t.TempDir())
 	const url = "https://uzi.example"
-	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli"})
+	m := showingUpdateModel(t, updatePromptState{latestVersion: "v0.85.0", owner: "uzi-cli", candidate: readyCandidate("uzi-cli")})
 	m.store, m.serverURL = store, url
 	// Move to the "Don't remind me" choice (index 2 for a brew user) and select it.
 	m = press(t, m, keyDown)
@@ -738,4 +752,173 @@ func settleObservation(m tuiModel, cmd tea.Cmd) tuiModel {
 		m = settleObservation(next.(tuiModel), follow)
 	}
 	return m
+}
+
+// ---- Formula-gated brew action (#4314) ---------------------------------------------------
+
+const notesV085 = "https://github.com/vtmocanu/uzi/releases/tag/v0.85.0"
+
+func hasChoice(m tuiModel, want updateChoice) bool {
+	for _, c := range m.updateChoices() {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestUpdatePromptBrewOwnerWithoutFormulaFactOffersNotesOnly is the baseline-compatible
+// regression: a brew owner offered a release whose formula fact is not known must not get
+// "Update now", only the release notes.
+func TestUpdatePromptBrewOwnerWithoutFormulaFactOffersNotesOnly(t *testing.T) {
+	withVersion(t, "v0.83.0")
+	m := updatePromptModel(t)
+	m.updatePrompt.owner = "uzi-cli"
+	next, _ := settledUpdate(m, buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.85.0", NotesURL: notesV085}})
+	m = next.(tuiModel)
+	if !m.updatePrompt.showing || m.updatePrompt.latestVersion != "v0.85.0" {
+		t.Fatalf("precondition: modal showing=%v latestVersion=%q, want showing v0.85.0", m.updatePrompt.showing, m.updatePrompt.latestVersion)
+	}
+	if hasChoice(m, updateChoiceUpdateNow) {
+		t.Fatalf("Update now offered without a formula fact: %v", m.updateChoices())
+	}
+	if out := stripANSI(m.View().Content); !strings.Contains(out, "Release notes: "+notesV085) {
+		t.Fatalf("notes-only variant missing the release-notes URL\n%s", out)
+	}
+}
+
+func formulaPrompt(t *testing.T, current, owner string, latest *apitypes.LatestReleaseDTO, formulas *apitypes.HomebrewFormulasDTO) tuiModel {
+	t.Helper()
+	withVersion(t, current)
+	m := updatePromptModel(t)
+	m.updatePrompt.owner = owner
+	next, _ := settledUpdate(m, buildInfoMsg{latest: latest, formulas: formulas})
+	return next.(tuiModel)
+}
+
+func stableV085() *apitypes.LatestReleaseDTO {
+	return &apitypes.LatestReleaseDTO{Version: "v0.85.0", NotesURL: notesV085}
+}
+
+func assertNotesOnly(t *testing.T, m tuiModel) {
+	t.Helper()
+	if !m.updatePrompt.showing {
+		t.Fatal("modal must still show (notes-only)")
+	}
+	if hasChoice(m, updateChoiceUpdateNow) {
+		t.Fatalf("Update now must not be offered: %v", m.updateChoices())
+	}
+	if out := stripANSI(m.View().Content); !strings.Contains(out, "Release notes: "+notesV085) {
+		t.Fatalf("missing release notes line\n%s", out)
+	}
+	next, _ := m.updatePromptKey(keyEnter)
+	if got := next.(tuiModel); got.updatePrompt.pendingUpgrade || len(got.updatePrompt.upgradeArgv) != 0 {
+		t.Fatalf("enter on the first choice armed an upgrade: %v", got.updatePrompt.upgradeArgv)
+	}
+}
+
+func TestUpdatePromptOwningFormulaBehindOffersNotesOnly(t *testing.T) {
+	m := formulaPrompt(t, "v0.83.0", "uzi-cli", stableV085(), &apitypes.HomebrewFormulasDTO{UziCLI: "v0.84.0"})
+	assertNotesOnly(t, m)
+}
+
+func TestUpdatePromptOwningFormulaReachedOffersBrewUpgrade(t *testing.T) {
+	for _, tc := range []struct {
+		name, owner, tag string
+		formulas         apitypes.HomebrewFormulasDTO
+		argv             string
+	}{
+		{"stable equal", "uzi-cli", "v0.85.0", apitypes.HomebrewFormulasDTO{UziCLI: "v0.85.0"}, "upgrade vtmocanu/tap/uzi-cli"},
+		{"stable newer", "uzi-cli", "v0.85.0", apitypes.HomebrewFormulasDTO{UziCLI: "v0.86.0"}, "upgrade vtmocanu/tap/uzi-cli"},
+		{"rc owner equal", "uzi-cli-rc", "v0.85.0", apitypes.HomebrewFormulasDTO{UziCLIRC: "v0.85.0"}, "upgrade vtmocanu/tap/uzi-cli-rc"},
+		{"rc owner newer", "uzi-cli-rc", "v0.85.0", apitypes.HomebrewFormulasDTO{UziCLIRC: "v0.86.0-rc.1"}, "upgrade vtmocanu/tap/uzi-cli-rc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := formulaPrompt(t, "v0.83.0", tc.owner, stableV085(), &tc.formulas)
+			if !m.updatePrompt.showing {
+				t.Fatal("modal must show")
+			}
+			if ch := m.updateChoices(); len(ch) != 3 || ch[0] != updateChoiceUpdateNow {
+				t.Fatalf("choices = %v, want Update now first", ch)
+			}
+			next, _ := m.updatePromptKey(keyEnter)
+			m = next.(tuiModel)
+			if got := strings.Join(m.updatePrompt.upgradeArgv, " "); got != tc.argv || !m.updatePrompt.pendingUpgrade {
+				t.Fatalf("argv = %q pending=%v, want %q", got, m.updatePrompt.pendingUpgrade, tc.argv)
+			}
+		})
+	}
+}
+
+// An RC-owned binary offered a newer stable is gated on uzi_cli_rc (the owning formula), not
+// on the stable formula that carries the chosen release.
+func TestUpdatePromptRCOwnerGatedOnOwningFormulaNotChannel(t *testing.T) {
+	withVersion(t, "v0.87.0-rc.10")
+	m := updatePromptModel(t)
+	m.updatePrompt.owner = "uzi-cli-rc"
+	next, _ := settledUpdate(m, buildInfoMsg{
+		latest:   &apitypes.LatestReleaseDTO{Version: "v0.90.0", NotesURL: notesV085},
+		formulas: &apitypes.HomebrewFormulasDTO{UziCLI: "v0.90.0", UziCLIRC: "v0.87.0-rc.10"},
+	})
+	m = next.(tuiModel)
+	if m.updatePrompt.latestVersion != "v0.90.0" {
+		t.Fatalf("precondition: chosen = %q", m.updatePrompt.latestVersion)
+	}
+	if !m.updatePrompt.showing || hasChoice(m, updateChoiceUpdateNow) {
+		t.Fatalf("showing=%v choices=%v, want notes-only", m.updatePrompt.showing, m.updateChoices())
+	}
+	if out := stripANSI(m.View().Content); !strings.Contains(out, "Release notes: "+notesV085) {
+		t.Fatalf("missing release notes\n%s", out)
+	}
+	next, _ = m.updatePromptKey(keyEnter)
+	if got := next.(tuiModel); got.updatePrompt.pendingUpgrade || len(got.updatePrompt.upgradeArgv) != 0 {
+		t.Fatalf("armed an upgrade: %v", got.updatePrompt.upgradeArgv)
+	}
+}
+
+func TestUpdatePromptUnusableFormulaFactOffersNotesOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		formulas *apitypes.HomebrewFormulasDTO
+	}{
+		{"nil formulas", nil},
+		{"empty owner tag", &apitypes.HomebrewFormulasDTO{UziCLIRC: "v0.90.0"}},
+		{"short tag", &apitypes.HomebrewFormulasDTO{UziCLI: "v0.85"}},
+		{"dev tag", &apitypes.HomebrewFormulasDTO{UziCLI: "dev"}},
+		{"leading-zero rc tag", &apitypes.HomebrewFormulasDTO{UziCLI: "v0.85.0-rc.01"}},
+		{"padded tag", &apitypes.HomebrewFormulasDTO{UziCLI: " v0.85.0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertNotesOnly(t, formulaPrompt(t, "v0.83.0", "uzi-cli", stableV085(), tc.formulas))
+		})
+	}
+}
+
+// Readiness arriving while the modal is open swaps notes-only for the Update now variant.
+func TestUpdatePromptReadinessFlipWhileShowingOffersUpdateNow(t *testing.T) {
+	m := formulaPrompt(t, "v0.83.0", "uzi-cli", stableV085(), &apitypes.HomebrewFormulasDTO{UziCLI: "v0.84.0"})
+	assertNotesOnly(t, m)
+	next, _ := settledUpdate(m, buildInfoMsg{latest: stableV085(), formulas: &apitypes.HomebrewFormulasDTO{UziCLI: "v0.85.0"}})
+	m = next.(tuiModel)
+	if !m.updatePrompt.showing {
+		t.Fatal("modal must be showing after the readiness flip")
+	}
+	if ch := m.updateChoices(); len(ch) != 3 || ch[0] != updateChoiceUpdateNow {
+		t.Fatalf("choices = %v, want Update now first", ch)
+	}
+}
+
+// The once-per-session latch survives a readiness change: a modal answered with "Not now"
+// stays closed when the formula catches up later.
+func TestUpdatePromptNotNowThenReadinessFlipDoesNotReopen(t *testing.T) {
+	m := formulaPrompt(t, "v0.83.0", "uzi-cli", stableV085(), &apitypes.HomebrewFormulasDTO{UziCLI: "v0.84.0"})
+	m = press(t, m, keyEsc)
+	if m.updatePrompt.showing {
+		t.Fatal("esc must close the modal")
+	}
+	next, _ := settledUpdate(m, buildInfoMsg{latest: stableV085(), formulas: &apitypes.HomebrewFormulasDTO{UziCLI: "v0.85.0"}})
+	m = next.(tuiModel)
+	if m.updatePrompt.showing {
+		t.Fatal("a readiness flip must not reopen a modal the user already answered")
+	}
 }

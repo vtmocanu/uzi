@@ -185,6 +185,9 @@ type buildInfoMsg struct {
 	version  string
 	latest   *apitypes.LatestReleaseDTO
 	latestRC *apitypes.LatestReleaseDTO
+	// formulas carries the tag each Homebrew tap formula currently installs (nil = unknown).
+	// It gates the "Update now" action on the OWNING formula's tag (#4314).
+	formulas *apitypes.HomebrewFormulasDTO
 	err      error
 }
 
@@ -815,7 +818,7 @@ func (m tuiModel) fetchBuildInfoCmd() tea.Cmd {
 	return func() tea.Msg {
 		info, err := c.BuildInfo(ctx)
 		// Carry both release facts verbatim from the decoded response; nil stays nil.
-		return buildInfoMsg{version: info.Version, latest: info.Latest, latestRC: info.LatestRC, err: err}
+		return buildInfoMsg{version: info.Version, latest: info.Latest, latestRC: info.LatestRC, formulas: info.HomebrewFormulas, err: err}
 	}
 }
 
@@ -1360,7 +1363,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// The asynchronous owner probe resolves before channel selection and latching.
-		cmd := m.maybeShowUpdatePrompt(msg.latest, msg.latestRC)
+		cmd := m.maybeShowUpdatePrompt(msg.latest, msg.latestRC, msg.formulas)
 		return m, cmd
 
 	case installedVersionMsg:
@@ -1372,7 +1375,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updatePrompt.owner = msg.owner
 		m.updatePrompt.brewKnown = true
 		m.updatePrompt.brewPending = false
-		cmd := m.maybeShowUpdatePrompt(m.updatePrompt.latest, m.updatePrompt.latestRC)
+		cmd := m.maybeShowUpdatePrompt(m.updatePrompt.latest, m.updatePrompt.latestRC, m.updatePrompt.formulas)
 		return m, cmd
 
 	case detailRunMsg:
