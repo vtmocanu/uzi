@@ -218,6 +218,38 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
 - **E**: fleet rollout.
 - **Purge** of finished rows.
 
+### Slice B (partial, in progress)
+
+Slice B is the worker half: the producer that calls the route. It is
+delivered partially and production-dark. Nothing below runs in production.
+
+- **Gate.** One compile-time constant, `TERMINAL_PRESERVATION_ENABLED = false`
+  in `agent/src/terminal-preservation.ts`, is the first check of every new
+  entry point, before any inventory, quiescence, Git, private ref, record,
+  HTTP or completion-head work. Only a constructor-only test option enables
+  it; `main` never passes it. No config, env, chart, server feature or agent
+  input reaches it, and the worker does not advertise
+  `recovery_terminal_preservation_v1`. `TERMINAL_ORIGIN_ADMISSION_ENABLED`
+  is untouched.
+- **Narrowed scope.** Only `branch_source` runs (issue, mr_rework and
+  self_improve without an egress profile) are preserved. Every other kind
+  gets an output-contract label and is kept unchanged. A label is not the
+  contract analysis: the report-ACK and no-push proofs for the kept kinds,
+  and the terminal sends with no in-lane seat (permanent failure,
+  rate-limited, cancel, iteration cancel, owner cancel), are deferred to the
+  named follow-up "#4007 slice B2-contracts".
+- **Kept, not proved.** A retained predecessor (writer exclusion is #4001's),
+  a present non-current attempt clone, a held replay root not reachable from
+  the frozen source, a clone-local ref that is not an ancestor of HEAD, a
+  stash, a linked worktree, and incomplete private refs after a crash. B
+  deletes nothing; removal of incomplete private refs is slice C's.
+- **Still deferred.** The T4 shared excluded-origin fence, D's owner escape
+  with CLI, one-worker activation and startup disable, retirement (T3),
+  reclaim and custody (C), fleet rollout (E) and hosted acceptance.
+
+The remaining sections of slice B (capture, preparation, records and
+callers) are filled in as they land.
+
 ### Review corrections: preparation and a proven local no-send
 
 Terminal preparation checks the existing 1 MiB discovery limit before fetching
