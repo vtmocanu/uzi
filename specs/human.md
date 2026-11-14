@@ -1894,6 +1894,14 @@ Design record: issue #4078 (epic #3873); target mock `prds/mockups/3873-overview
 - Expanded, a worker shows tone-coloured gauges (CPU, memory, each disk volume) instead of the one-line stats; "No stats reported" stays, with a disk line when only disk is reported, and offline readings are dimmed as last known. "On this worker" (offline: "Last reported", dimmed) lists the worker's reported runs excluding pending outcomes, titled and linked when among the viewer's own loaded runs, else a short run id, with phase and HOME size from the worker's run_disk (top 5, largest first; "at least" when truncated). Worker-reported text is sanitized. (AI-synced 2026-11-08)
 - Notes add the ephemeral explanation, the warm-lease end, "Review held work" when held work needs a decision, and a restart hint when memory authority is lost, beside the existing "Takes no new runs" and roll note. The footer reads "v<version> · up <uptime>" online and "v<version> · last seen <ago>" or "never seen" offline; missing parts are omitted, and nothing shows when all are missing. No API change; the Workers page and `/overview/classic` are unchanged by #4078. (AI-synced 2026-11-14)
 
+## Feature #4335 — Overview preview, Agents chip and Agents page count
+
+Design record: issue #4335 (epic #3873); target mock `prds/mockups/3873-overview-agents-count.html`.
+
+- One shared count backs both surfaces: builtin and global agent templates plus the viewer's own private ("Mine") templates; another user's private templates never count, for an admin too, and the lead counts. "Ride your runs" counts templates toggled on under In my runs, minus a private template shadowed by a builtin or global of the same name (the rule behind the Agents page's shadowed badge). (AI-synced 2026-11-14)
+- The Agents page shows one summary line under its description: total, how many ride your runs, per-scope totals (zero scopes omitted) and, for admins only, the global-default count; hidden while loading and on a load error. (AI-synced 2026-11-14)
+- Every user gets an Agents chip on the new Overview header before Search, after the admin-only People and Repos chips: "K agents in your runs of N", opening a popover with per-scope totals and "on" counts, an admin-only global-defaults row and a Manage agents link. Its allocation read is made once, never polled, and a failure hides only the chip; the old Overview makes no new request. (AI-synced 2026-11-14)
+
 ## Feature #4209: Primary work run counts in usage
 
 Design record: issue #4209 (epic #3873).
