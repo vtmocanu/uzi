@@ -20838,6 +20838,13 @@ try {
     // shared fetch-back class pre-exists in fetchAgentBranch and is tracked separately.
     const alternatesClean = async (): Promise<boolean> => {
       const info = path.join(clonePath, ".git", "objects", "info");
+      // Git resolves a relative alternates line against the REAL objects directory: refuse a
+      // symlinked objects or info directory so the path we resolve is the path git resolves.
+      for (const dir of [path.join(clonePath, ".git", "objects"), info]) {
+        const st = await fs.lstat(dir).catch(() => undefined);
+        if (st && (!st.isDirectory() || st.isSymbolicLink())) return false;
+        if (!st && dir !== info) return false;
+      }
       try {
         const http = await fs.lstat(path.join(info, "http-alternates"));
         if (!http.isFile() || http.size !== 0) return false;

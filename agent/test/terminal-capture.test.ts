@@ -288,6 +288,20 @@ describe("captureTerminalSnapshot", () => {
     assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
   });
 
+  test("a symlinked objects directory is refused, so a relative alternates line cannot resolve elsewhere", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "x");
+    const objects = path.join(f.root, ".git", "objects");
+    const moved = path.join(path.dirname(f.root), "moved-objects", "deep", "objects");
+    await fs.mkdir(path.dirname(moved), { recursive: true });
+    await fs.rename(objects, moved);
+    await fs.symlink(moved, objects);
+    const result = await f.capture({ onPhase: async (p) => { f.calls.push(p); } });
+    assert.deepEqual(result, { kind: "refused", reason: "alternates_present" });
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
+  });
+
   test("alternates with an extra line or an http-alternates entry are refused", async (t) => {
     const f = await fixture(t);
     await f.write("new.txt", "x");
