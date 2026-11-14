@@ -444,8 +444,9 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "inputs <run-id>",
 		Short: "List a run's steer queue (follow-ups) with delivery status",
 		Long: "List the steer queue sent to a run (PRD #95, #634), newest first, each with its " +
-			"KIND and state plus a relative age. Owner-only: a read-only admin token gets 404 on " +
-			"another user's run.\n\n" +
+			"KIND and state plus a relative age. Owner-only: another user's run is a 404, except " +
+			"that a live admin's admin_ro (uza_) token may read it when the server runs with " +
+			"UZI_ADMIN_RUN_DEBUG (read-only, audited).\n\n" +
 			"The queue lists two kinds. A follow-up (kind='follow_up') carries a delivery state — " +
 			"queued (the worker has not received it yet), received (the worker has it), routed " +
 			"(steering has acted on it), included in a prompt (the turn carrying it reached the model), " +
@@ -468,7 +469,7 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			list, err := c.RunInputs(cmd.Context(), args[0])
 			if err != nil {
-				return err
+				return hintOnForeignReadRefusal(env, err)
 			}
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {

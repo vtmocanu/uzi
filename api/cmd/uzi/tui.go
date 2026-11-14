@@ -1517,7 +1517,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.runID != m.detail.runID || msg.gen != m.detail.gen {
 			return m, nil
 		}
-		m.detail.steer.access = steerAccessFor(m.detail.run, msg.err)
+		m.detail.steer.access = steerAccessForInputs(m.detail.run, msg)
 		if msg.err == nil {
 			m.detail.steer.queue = msg.inputs
 		}

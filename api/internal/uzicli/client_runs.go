@@ -211,13 +211,18 @@ func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.Review
 }
 
 func (c *HTTPClient) RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error) {
-	var env struct {
-		Inputs []apitypes.SteerInputDTO `json:"inputs"`
-	}
+	inputs, _, err := c.RunInputsMeta(ctx, id)
+	return inputs, err
+}
+
+// RunInputsMeta decodes the typed envelope so the admin_debug_read marker (issue #4198) rides
+// along with the queue.
+func (c *HTTPClient) RunInputsMeta(ctx context.Context, id string) ([]apitypes.SteerInputDTO, bool, error) {
+	var env apitypes.RunInputsEnvelopeDTO
 	if err := c.get(ctx, "/api/runs/"+url.PathEscape(id)+"/inputs", &env); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return env.Inputs, nil
+	return env.Inputs, env.AdminDebugRead, nil
 }
 
 func (c *HTTPClient) RunLeadConfigHistory(ctx context.Context, id string) (apitypes.LeadConfigHistoryDTO, error) {

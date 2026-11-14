@@ -79,10 +79,15 @@ type steerState2 struct {
 // ListFollowUpInputs resolves ownership with `s.GetRun(ctx, userID, runID)`
 // (service.go:2128-2132) and SubmitInput's FIRST statement is the same
 // `s.GetRun(ctx, userID, runID)` (service.go:2239) — one function, not two that agree.
-// So RunInputs succeeding is not an approximation of "may steer": it is the same
-// predicate the write will evaluate, evaluated by the same code. A client-side id
+// So RunInputs succeeding (without the admin_debug_read marker, see below) is not an
+// approximation of "may steer": it is the same predicate the write will evaluate,
+// evaluated by the same code. A client-side id
 // comparison would be a SECOND copy of that rule, free to drift from it — the exact
 // failure D6 exists to prevent.
+//
+// One exception (issue #4198): under the admin run debug flag a non-owner admin's uza_
+// token can READ the queue, so a 200 there is not proof of write access. A debug-served 200
+// carries admin_debug_read, and steerAccessForInputs maps it to steerNotOwner.
 //
 // A 404 here means "not the owner" rather than "no such run", because the run has
 // already loaded through the viewer path by this point: visibility is established, so
@@ -308,6 +313,21 @@ type runInputsMsg struct {
 	runID  string
 	inputs []apitypes.SteerInputDTO
 	err    error
+	// adminDebug is the response's admin_debug_read marker: the queue is another user's, served
+	// read-only under admin run debug (issue #4198).
+	adminDebug bool
+}
+
+// steerAccessForInputs is steerAccessFor for a probe result that may carry the admin run debug
+// marker. A 200 under admin debug proves the server let a non-owner READ the queue, not that the
+// write would be accepted (every steer verb stays owner-only), so it downgrades steerAllowed to
+// steerNotOwner. The chat and terminal verdicts keep precedence.
+func steerAccessForInputs(run apitypes.RunDTO, msg runInputsMsg) steerAccess {
+	access := steerAccessFor(run, msg.err)
+	if access == steerAllowed && msg.adminDebug {
+		return steerNotOwner
+	}
+	return access
 }
 
 // gateRevisionOf is the plan-gate revision a verdict on run is bound to (PRD #1795 D5): the
@@ -334,8 +354,8 @@ func (m tuiModel) submitSteerCmd(kind, body string, expectedGateRevision *int64)
 func (m tuiModel) fetchInputsCmd(runID string) tea.Cmd {
 	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	return func() tea.Msg {
-		in, err := c.RunInputs(ctx, runID)
-		return runInputsMsg{runID: runID, gen: gen, inputs: in, err: err}
+		in, adminDebug, err := c.RunInputsMeta(ctx, runID)
+		return runInputsMsg{runID: runID, gen: gen, inputs: in, err: err, adminDebug: adminDebug}
 	}
 }
 

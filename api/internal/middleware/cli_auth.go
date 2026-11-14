@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -108,9 +109,33 @@ func RequireUser(q CLIUserStore, cfg config.Config, hooks ...BrowserAuthHook) fu
 			}
 
 			ctx := ContextWithUser(r.Context(), user)
+			ctx = withCLICredential(ctx, CLICredential{TokenID: row.ID, Scope: row.Scope})
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// cliCredentialKey is the context key for the CLICredential. The value 3 does not
+// collide with userKey (0), workerKey (1) or v1PrincipalKey (2).
+const cliCredentialKey ctxKey = 3
+
+// CLICredential is the stored identity of the Bearer CLI token that authenticated
+// a request: the token row id and its STORED scope (never the token prefix or any
+// request header). It is set only on the Bearer branch of RequireUser.
+type CLICredential struct {
+	TokenID uuid.UUID
+	Scope   string
+}
+
+func withCLICredential(ctx context.Context, c CLICredential) context.Context {
+	return context.WithValue(ctx, cliCredentialKey, c)
+}
+
+// CLICredentialFromContext returns the Bearer CLI credential RequireUser stored,
+// or false for a cookie-authenticated (or unauthenticated) request.
+func CLICredentialFromContext(ctx context.Context) (CLICredential, bool) {
+	c, ok := ctx.Value(cliCredentialKey).(CLICredential)
+	return c, ok
 }
 
 // RequireAdminRO gates a route to admin users, for the CLI's admin READ verbs
@@ -118,10 +143,10 @@ func RequireUser(q CLIUserStore, cfg config.Config, hooks ...BrowserAuthHook) fu
 //
 // It is deliberately JUST a user.IsAdmin check on the context user — identical in
 // shape to RequireAdmin — because RequireUser has ALREADY reduced any non-admin_ro
-// CLI token to IsAdmin=false. Re-checking `scope` here would force RequireUser to
-// export scope into the context and would be a second mechanism that can drift from
-// the masking. One mechanism, one place: the ceiling lives in RequireUser, the gate
-// reads its result.
+// CLI token to IsAdmin=false. The stored scope is exported separately through
+// CLICredentialFromContext for handlers that must key on it (the admin run debug
+// reads); this gate does not use it, so there is no second masking mechanism to
+// drift. The ceiling lives in RequireUser, the gate reads its result.
 func RequireAdminRO(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, ok := UserFromContext(r.Context())

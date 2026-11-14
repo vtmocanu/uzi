@@ -23,7 +23,9 @@ import (
 // source log, every fetch attempt allowed or refused, oldest first. RequireUser (cookie or
 // uzc_/uza_ Bearer) so `uzi run fetches` reaches it; STRICT owner-or-404 through
 // h.wsvc.GetRun, like the recovery archives (an admin viewing a foreign run is refused
-// too). A run that never fetched has an empty list.
+// too, unless the admin run debug predicate holds: a live admin's admin_ro CLI token with
+// UZI_ADMIN_RUN_DEBUG on reads it, audited once). A run that never fetched has an empty
+// list.
 //
 // Keyset-paginated, because a log can hold up to fetch_max_run_attempts rows: ?limit= is
 // 1..fetchctl.FetchesPageSize (default that, larger values clamped to it), ?after= is the
@@ -47,14 +49,23 @@ func (h *Handler) ListRunFetches(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	var (
+		debugRun   store.Run
+		debugActor store.User
+		debugToken uuid.UUID
+		debug      bool
+	)
 	if _, err := h.wsvc.GetRun(r.Context(), user.ID, runID); err != nil {
-		if errors.Is(err, workersvc.ErrRunNotFound) {
-			httpx.Error(w, http.StatusNotFound, "run not found")
+		if !errors.Is(err, workersvc.ErrRunNotFound) {
+			slog.Error("run fetches: get run", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		slog.Error("run fetches: get run", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
+		run, actor, tokenID, ok := h.adminRunDebugForeignRun(w, r, runID, "run fetches")
+		if !ok {
+			return
+		}
+		debugRun, debugActor, debugToken, debug = run, actor, tokenID, true
 	}
 	limit := int32(fetchctl.FetchesPageSize)
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
@@ -116,6 +127,9 @@ func (h *Handler) ListRunFetches(w http.ResponseWriter, r *http.Request) {
 			FinishedAt:  f.FinishedAt.Time,
 			CreatedAt:   f.CreatedAt.Time,
 		})
+	}
+	if debug {
+		auditRunDebugRead(r, debugActor, debugToken, adminRunDebugRouteFetches, runID, debugRun.UserID)
 	}
 	httpx.JSON(w, http.StatusOK, out)
 }

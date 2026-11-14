@@ -4624,6 +4624,21 @@ export type RunSummaryItem = Omit<
   | "capability_provenance" | "lead_config" | "created_issues"
 >;
 
+/** The GET /api/runs/{id}/inputs response (Go RunInputsEnvelopeDTO, issue #4198): the steer
+ *  queue plus, only on an admin run debug read of another user's run, admin_debug_read=true. */
+export interface RunInputsEnvelope {
+  inputs: SteerInput[];
+  admin_debug_read?: boolean;
+}
+
+/** The GET /api/admin/runs?state=all response (Go AdminRunsDebugDTO, issue #4198 admin run
+ *  debug listing): summary rows of every status, newest first. runs is always an array on the
+ *  wire; truncated is true when more matching runs existed than the server's row cap. */
+export interface AdminRunsDebug {
+  runs: RunSummaryItem[];
+  truncated: boolean;
+}
+
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
 // Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
 // spending a token has no usage row but must still count. All counts are always
@@ -5918,6 +5933,8 @@ export interface RecoveryArchiveSummary {
   has_open_hold: boolean;
   counts: RecoveryArchiveStateCounts;
   archives: RecoveryArchive[];
+  /** True only on an admin run debug read of another user's run (issue #4198); omitted otherwise. */
+  admin_debug_read?: boolean;
 }
 
 // ── Owner-facing custody holds (PRD #1349 M1) ─────────────────────────────────
@@ -6026,6 +6043,8 @@ export interface HeldPublications {
 export interface RecoveryCustodyHolds {
   aggregate: RecoveryCustodyAggregate;
   holds: RecoveryCustodyHold[];
+  /** Whose holds these are; present only when the request named ?user= or ?run= (admin run debug). */
+  owner_id?: string;
 }
 
 /** Explicit owner consent; null binds legacy runs with no completion contract. */

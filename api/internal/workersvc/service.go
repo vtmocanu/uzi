@@ -595,6 +595,7 @@ type Store interface {
 	// view once per run row.
 	ListRunUsageTotalsForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.RunUsageTotal, error)
 	ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error)
+	ListRunsAdminDebug(ctx context.Context, arg store.ListRunsAdminDebugParams) ([]store.ListRunsAdminDebugRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
 	// GetRunOwnershipByWorker is RunOwnership's read: GetRunOwnedByWorker's row plus the
@@ -8425,10 +8426,11 @@ func (s *Service) ListRunMessages(ctx context.Context, userID, runID uuid.UUID, 
 
 // ListFollowUpInputs returns a run's follow_up steer queue (newest-first, uncapped)
 // for the web/CLI queue (PRD #95). GetRun resolves owner-or-404 FIRST, so a non-owner
-// — including an admin_ro token on another user's run — gets ErrRunNotFound and the
-// handler 404s. This is strict owner-only (matching the follow-up WRITE), NOT the
-// owner-or-admin view: follow-ups are never in run_messages, so an owner-or-admin read
-// here would leak another user's steer text.
+// gets ErrRunNotFound for a run it does not own. This is strict owner-only (matching the
+// follow-up WRITE), NOT the owner-or-admin view: follow-ups are never in run_messages, so
+// an owner-or-admin read here would leak another user's steer text. The only cross-user
+// read is the handler's admin run debug path, which passes the run's owner as userID
+// after its own predicate and audit.
 func (s *Service) ListFollowUpInputs(ctx context.Context, userID, runID uuid.UUID) ([]store.RunUserInput, error) {
 	if _, err := s.GetRun(ctx, userID, runID); err != nil {
 		return nil, err
@@ -8541,6 +8543,18 @@ func (s *Service) ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow
 // (admin), excluding chat, judge, and cross-check runs.
 func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRunsAllRow, error) {
 	return s.q.ListActiveRunsAll(ctx, s.activeRunsPriorityCutoff())
+}
+
+// ListRunsAdminDebug returns up to maxRows runs of every status across all users (or
+// one user when userID is non-nil), newest first, optionally created at or after since,
+// excluding chat, judge, and cross-check runs (issue #4198 admin run debug listing).
+func (s *Service) ListRunsAdminDebug(ctx context.Context, userID *uuid.UUID, since *time.Time, maxRows int32) ([]store.ListRunsAdminDebugRow, error) {
+	return s.q.ListRunsAdminDebug(ctx, store.ListRunsAdminDebugParams{
+		BackgroundGraceCutoff: s.activeRunsPriorityCutoff(),
+		UserID:                pgconv.UUIDPtr(userID),
+		Since:                 pgconv.TimePtr(since),
+		MaxRows:               maxRows,
+	})
 }
 
 // activeRunsPriorityCutoff builds the ListActiveRunsAll @background_grace_cutoff param

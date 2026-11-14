@@ -30,7 +30,9 @@ func newRunFetchesCmd(env Env, gf *globalFlags) *cobra.Command {
 			"research), oldest first: when it started, whether it was allowed or refused and " +
 			"why, the upstream HTTP status, the bytes returned, the content type, the URL " +
 			"asked for and the URL the content came from after redirects.\n\n" +
-			"Owner-only: another user's run reads as not found (exit 4). A run that never " +
+			"Owner-only: another user's run reads as not found (exit 4), except that a live admin's " +
+			"admin_ro (uza_) token may read it when the server runs with UZI_ADMIN_RUN_DEBUG " +
+			"(read-only, audited). A run that never " +
 			"fetched shows no rows. Long URLs are cut in the table; --json prints them whole, " +
 			"with each file's sha256.",
 		Args: cobra.ExactArgs(1),
@@ -41,7 +43,7 @@ func newRunFetchesCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			dto, err := allRunFetches(cmd.Context(), c, args[0])
 			if err != nil {
-				return err
+				return hintOnForeignReadRefusal(env, err)
 			}
 			return renderRunFetches(env.printer(gf), dto)
 		},

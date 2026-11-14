@@ -223,6 +223,17 @@ api:
   # LATER than we warn, so DO NOT "align" the two — the gap is intentional (reviewer
   # note, PRD Decision context).
   diskPressureThreshold: 0.90
+  # Admin run debug reads (issue #4198). When enabled, a LIVE admin using a Bearer uza_
+  # CLI token whose stored scope is admin_ro can read other users' runs' debug data
+  # through the CLI: steer inputs, recovery capture metadata, fetch logs, recovery
+  # holds, and an all-states admin run listing. All read-only. A browser cookie or a
+  # uzc_ token never qualifies, and admin-ness is re-read live on every request. Each
+  # newly authorized cross-user read writes one audit log line, "admin run debug read".
+  # OFF by default. Rendering it sets UZI_ADMIN_RUN_DEBUG=true in the api ConfigMap.
+  # UZI_ADMIN_RUN_DEBUG is reserved to this value: setting it in api.config or
+  # api.secretEnv fails the render, whatever the value.
+  adminRunDebug:
+    enabled: false
   resources:
     # Requests sized to a live fleet's steady state (~107m CPU / ~280Mi measured
     # 2026-10-06 with 8 hosted workers); running above its request

@@ -34,6 +34,19 @@ func (f *FakeClient) AdminListRunSummaries(context.Context) ([]apitypes.RunSumma
 	return summariesOf(f.AdminRuns), nil
 }
 
+// AdminListRunsDebug records the (user, since) filters and returns AdminRunsDebugResult
+// (AdminRunsDebugErr, then the blanket Err, win).
+func (f *FakeClient) AdminListRunsDebug(_ context.Context, userID, since string) (apitypes.AdminRunsDebugDTO, error) {
+	f.AdminListRunsDebugCalls = append(f.AdminListRunsDebugCalls, AdminListRunsDebugCall{UserID: userID, Since: since})
+	if f.AdminRunsDebugErr != nil {
+		return apitypes.AdminRunsDebugDTO{}, f.AdminRunsDebugErr
+	}
+	if f.Err != nil {
+		return apitypes.AdminRunsDebugDTO{}, f.Err
+	}
+	return f.AdminRunsDebugResult, nil
+}
+
 func (f *FakeClient) AdminHealth(context.Context) (apitypes.HealthDocDTO, error) {
 	if f.Err != nil {
 		return apitypes.HealthDocDTO{}, f.Err

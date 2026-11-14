@@ -23,6 +23,7 @@ func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 		{"runtime", "CountInProgressRunsForUser", 1, ""},
 		{"runtime", "ListRunsForUser", 1, ""},
 		{"runtime", "ListActiveRunsAll", 1, ""},
+		{"runtime", "ListRunsAdminDebug", 1, ""},
 		{"runtime", "ListAllWorkers", 1, ""},
 		{"runtime", "ClaimRun", 5, "selection and harness gates retain legacy children; load sites are separately pinned"},
 		{"runtime", "RunHasPendingOutcomeLease", 1, "pending outcome fence applies to children"},
