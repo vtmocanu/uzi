@@ -288,6 +288,14 @@ describe("captureTerminalSnapshot", () => {
     assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
   });
 
+  test("a planted commondir is refused as a clone shape", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "x");
+    await fs.writeFile(path.join(f.root, ".git", "commondir"), "../../elsewhere\n");
+    assert.deepEqual(await f.capture(), { kind: "refused", reason: "clone_shape" });
+    assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
+  });
+
   test("a symlinked objects directory is refused, so a relative alternates line cannot resolve elsewhere", async (t) => {
     const f = await fixture(t);
     await f.write("new.txt", "x");

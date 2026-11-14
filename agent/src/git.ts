@@ -20881,6 +20881,8 @@ try {
       // Clone shape and configuration that would redirect or extend the staging.
       const dotGit = await fs.lstat(path.join(clonePath, ".git")).catch(() => undefined);
       if (!dotGit?.isDirectory()) return refused("clone_shape");
+      // A commondir file redirects every object and ref read to another store.
+      if (await fs.lstat(path.join(clonePath, ".git", "commondir")).then(() => true, () => false)) return refused("clone_shape");
       if (!(await alternatesClean())) return refused("alternates_present");
       for (const row of rows(await git(["config", "--local", "--null", "--list"]), 100_000, "config_cap")) {
         // A valueless boolean key (`key\0` with no newline) is the whole row, never "".
