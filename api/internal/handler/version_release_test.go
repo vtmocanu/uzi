@@ -203,3 +203,48 @@ func TestVersionReleaseSecurityInLatest(t *testing.T) {
 		t.Error("latest.security = false for a ### Security body, want true")
 	}
 }
+
+// TestVersionHomebrewFormulas: the tap formula tags ride /api/version under the same
+// gate as `latest`, and the object is omitted when neither tag is known.
+func TestVersionHomebrewFormulas(t *testing.T) {
+	enabled := store.AppSetting{Key: settings.KeyReleaseCheckEnabled, Value: "true"}
+	checked := store.AppSetting{Key: settings.KeyReleaseCheckedAt, Value: "2026-08-29T10:00:00Z"}
+	latest := store.AppSetting{Key: settings.KeyReleaseLatestTag, Value: "v0.12.0"}
+
+	t.Run("both present", func(t *testing.T) {
+		h := releaseVersionHandler("0.11.0", enabled, checked, latest,
+			store.AppSetting{Key: settings.KeyReleaseFormulaStableTag, Value: "v0.12.0"},
+			store.AppSetting{Key: settings.KeyReleaseFormulaRCTag, Value: "v0.13.0-rc.2"},
+		)
+		body := getVersion(t, h)
+		if got, want := string(body["homebrew_formulas"]), `{"uzi_cli":"v0.12.0","uzi_cli_rc":"v0.13.0-rc.2"}`; got != want {
+			t.Fatalf("homebrew_formulas = %s, want %s", got, want)
+		}
+	})
+	t.Run("one unknown", func(t *testing.T) {
+		h := releaseVersionHandler("0.11.0", enabled, checked, latest,
+			store.AppSetting{Key: settings.KeyReleaseFormulaStableTag, Value: ""},
+			store.AppSetting{Key: settings.KeyReleaseFormulaRCTag, Value: "v0.13.0-rc.2"},
+		)
+		if got, want := string(getVersion(t, h)["homebrew_formulas"]), `{"uzi_cli_rc":"v0.13.0-rc.2"}`; got != want {
+			t.Fatalf("homebrew_formulas = %s, want %s", got, want)
+		}
+	})
+	t.Run("nil when both empty", func(t *testing.T) {
+		h := releaseVersionHandler("0.11.0", enabled, checked, latest)
+		wantAbsent(t, getVersion(t, h), "homebrew_formulas")
+	})
+	t.Run("nil when disabled", func(t *testing.T) {
+		h := releaseVersionHandler("0.11.0",
+			store.AppSetting{Key: settings.KeyReleaseCheckEnabled, Value: "false"}, checked, latest,
+			store.AppSetting{Key: settings.KeyReleaseFormulaStableTag, Value: "v0.12.0"},
+		)
+		wantAbsent(t, getVersion(t, h), "homebrew_formulas")
+	})
+	t.Run("nil when never checked", func(t *testing.T) {
+		h := releaseVersionHandler("0.11.0", enabled,
+			store.AppSetting{Key: settings.KeyReleaseFormulaStableTag, Value: "v0.12.0"},
+		)
+		wantAbsent(t, getVersion(t, h), "homebrew_formulas")
+	})
+}

@@ -3831,6 +3831,10 @@ export class GitCache {
   readonly recoveryArchiveRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
+  /** The current holder of each `locks` key, keyed the same way: an identity token whose `since`
+   *  (performance.now()) is when that holder acquired the lock. Diagnostic only: a waiter that aborts
+   *  before acquisition logs how long the holder had held it. Set and cleared inside withLock's `run`. */
+  private readonly lockHolders = new Map<string, { since: number }>();
   /** Per-key warning timestamps, bounded by LRU eviction and reset on restart.
    * These throttle diagnostics only and confer no deletion authority. */
   private readonly retentionWarnings = new Map<string, number>();
@@ -27282,8 +27286,13 @@ try {
    * A permit-scoped caller waiting behind another run observes its hard or soft abort
    * promptly and forfeits its slot without running `fn`. The stored chain still
    * waits for the prior holder before it settles, so a cancelled waiter can never
-   * let a later mutation overtake the holder and violate serialization. */
+   * let a later mutation overtake the holder and violate serialization.
+   *
+   * `key` is a bare filesystem path (never a URL): a waiter that aborts before acquisition logs it
+   * as `bare`, with how long it waited, how long the current holder had held the lock and which
+   * signal fired. The rejection itself is unchanged. */
   private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal, restrictionProgress?: RemediationRestrictionProgress): Promise<T> {
+    const enqueuedAt = performance.now();
     const prev = this.locks.get(key) ?? Promise.resolve();
     const boundary = this.boundaryProcesses.getStore();
     let recovery: ReturnType<typeof this.recoveryOperation>;
@@ -27319,6 +27328,15 @@ try {
       settled = true;
       if (restrictionProgress) restrictionProgress.cause = "pre_read_unavailable";
       removeAbortListener();
+      // Same precedence as the rejection below: caller signal, then the scope members in the order of
+      // `signals`, then the soft deadline. This names the signal that fired, not the root cause: a
+      // caller signal aborted with the soft deadline's reason (e.g. the gate checkpoint) logs "caller".
+      this.logLockWaitAbort(key, enqueuedAt, signal?.aborted ? "caller"
+        : boundary?.signal.aborted ? "boundary"
+        : recovery?.signal.aborted ? "recovery"
+        : report?.signal.aborted ? "report"
+        : scope?.signal.aborted ? "maintenance_budget"
+        : "soft_deadline");
       rejectResult(signal?.aborted ? new Error(GIT_LOCK_WAIT_ABORT_MESSAGE) : scope?.signal.aborted
         ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE, undefined, boundary?.capture?.signal)
         : new CheckpointSoftDeadlineError());
@@ -27343,47 +27361,72 @@ try {
         return;
       }
       started = true;
-      if (restrictionProgress) restrictionProgress.acquired = true;
-      removeAbortListener();
-      let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+      const holder = { since: performance.now() };
+      this.lockHolders.set(key, holder);
       try {
-        // The bare lock is already held here (started = true above), so a failure is post-acquisition
-        // and must stay sticky (#4191): it is never classified as pre-read unavailability.
+        if (restrictionProgress) restrictionProgress.acquired = true;
+        removeAbortListener();
+        let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+        try {
+          // The bare lock is already held here (started = true above), so a failure is post-acquisition
+          // and must stay sticky (#4191): it is never classified as pre-read unavailability.
+          try { this.checkRecoveryInterruption(); }
+          catch (error) {
+            if (restrictionProgress) restrictionProgress.cause = "unknown";
+            throw error;
+          }
+          const value = await fn();
+          try { this.checkRecoveryInterruption(); }
+          catch (error) {
+            if (restrictionProgress) restrictionProgress.cause = "post_read_expiry";
+            throw error;
+          }
+          outcome = { ok: true, value };
+        } catch (error) {
+          outcome = { ok: false, error };
+        }
+        // issue #1597 M2: a scope's pre-release hook runs while this lock is STILL held (the chain
+        // below does not advance until `run` returns), so a cancelled tick can settle its children and
+        // reconcile lock files before any other bare mutation starts. It never fails the op.
+        if (boundary?.beforeLockRelease) {
+          await boundary.beforeLockRelease(key).catch(() => undefined);
+        }
         try { this.checkRecoveryInterruption(); }
         catch (error) {
-          if (restrictionProgress) restrictionProgress.cause = "unknown";
-          throw error;
+          if (restrictionProgress?.started) restrictionProgress.cause = "post_read_expiry";
+          outcome = { ok: false, error };
         }
-        const value = await fn();
-        try { this.checkRecoveryInterruption(); }
-        catch (error) {
-          if (restrictionProgress) restrictionProgress.cause = "post_read_expiry";
-          throw error;
-        }
-        outcome = { ok: true, value };
-      } catch (error) {
-        outcome = { ok: false, error };
+        settled = true;
+        if (outcome.ok) resolveResult(outcome.value);
+        else rejectResult(outcome.error);
+      } finally {
+        // Diagnostic holder entry: cleared after beforeLockRelease (the lock is held through it), in the same
+        // tick the result is published, and even if the post-acquisition body throws.
+        if (this.lockHolders.get(key) === holder) this.lockHolders.delete(key);
       }
-      // issue #1597 M2: a scope's pre-release hook runs while this lock is STILL held (the chain
-      // below does not advance until `run` returns), so a cancelled tick can settle its children and
-      // reconcile lock files before any other bare mutation starts. It never fails the op.
-      if (boundary?.beforeLockRelease) {
-        await boundary.beforeLockRelease(key).catch(() => undefined);
-      }
-      try { this.checkRecoveryInterruption(); }
-      catch (error) {
-        if (restrictionProgress?.started) restrictionProgress.cause = "post_read_expiry";
-        outcome = { ok: false, error };
-      }
-      settled = true;
-      if (outcome.ok) resolveResult(outcome.value);
-      else rejectResult(outcome.error);
     };
     const next = prev.then(run, run);
     // Keep the serialization chain alive but swallow its stored result so one
     // failed mutation does not poison every later op on the same repo.
     this.locks.set(key, next.catch(() => undefined));
     return result;
+  }
+
+  /** The one diagnostic for a withLock waiter that aborted before acquiring `key`. Contended (a holder
+   *  held the lock) logs at warn; an uncontended abort (e.g. a call under an already-aborted scope)
+   *  logs at debug so a burst after a deadline does not flood warnings. Never changes the rejection. */
+  private logLockWaitAbort(key: string, enqueuedAt: number, abortedBy: string): void {
+    // The caller rejects the waiter right after this returns, so a throwing logger must never
+    // strand it or replace its abort error: the diagnostic is best effort.
+    try {
+      const now = performance.now();
+      const holder = this.lockHolders.get(key);
+      const fields: Record<string, unknown> = { bare: key, waited_ms: Math.round(now - enqueuedAt), aborted_by: abortedBy };
+      if (holder) fields.holder_held_ms = Math.round(now - holder.since);
+      else fields.holder = "none";
+      if (holder) this.log.warn("bare repo lock wait aborted before acquisition", fields);
+      else this.log.debug("bare repo lock wait aborted before acquisition", fields);
+    } catch { /* diagnostic only */ }
   }
 }
 

@@ -1840,6 +1840,12 @@ export interface BuildInfo {
     notes_url?: string;
     security?: boolean;
   };
+  // Uzi tag each public Homebrew tap formula installs; an absent key means
+  // unknown. Not consumed by the web (the CLI reads it).
+  homebrew_formulas?: {
+    uzi_cli?: string;
+    uzi_cli_rc?: string;
+  };
   update_available?: boolean;
   far_behind?: boolean;
 }
