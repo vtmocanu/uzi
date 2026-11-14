@@ -634,6 +634,19 @@ describe("terminal operation engine", () => {
     assert.equal((await runTerminalOperation(harness(restarted).deps, input("resume"))).outcome, "kept");
   });
 
+  it("a malformed or oversized flagged-commit list never costs the secret latch", async () => {
+    const root = mkRoot();
+    const h = harness(mkCoord(root));
+    const many = Array.from({ length: 300 }, (_, i) => i.toString(16).padStart(40, "a"));
+    h.prepareResult = () => ({ reason: "secret_found", flaggedCommits: ["abc123", ...many] });
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "secret_found" });
+    assert.equal(h.sends.length, 0);
+    const r = await readRec(mkCoord(root).terminalOperationStore());
+    assert.deepEqual(r.localBlock, ["secret_found"]);
+    assert.ok(r.flaggedCommits.length <= 256 && !r.flaggedCommits.includes("abc123"));
+    assert.equal(r.phase, "closed");
+  });
+
   it("a corrupt sibling record blocks a send (fail closed)", async () => {
     const root = mkRoot();
     const coord = mkCoord(root);

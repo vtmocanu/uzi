@@ -417,7 +417,15 @@ async function resume(deps: TerminalOperationDeps, input: TerminalOperationInput
 async function prepareFailure(deps: TerminalOperationDeps, input: TerminalOperationInput,
   failed: Extract<PrepareOutcome, { reason: string }>, fresh: boolean): Promise<TerminalOperationResult> {
   if (failed.reason !== "secret_found") return fresh ? markIncomplete(deps, input, `prepare_${failed.reason}`) : kept(`prepare_${failed.reason}`);
-  const latched = await deps.store.addLocalBlock(input.runId, input.generation, ["secret_found"], failed.flaggedCommits ?? []);
+  // The block is written on its own first, so a malformed or oversized flagged-commit list can never cost the latch;
+  // the flagged commits follow as a best-effort, normalised second write. A block that does not persist is reported as
+  // such (the caller still latches the flight in memory) rather than silently treated as recorded.
+  const latched = await deps.store.addLocalBlock(input.runId, input.generation, ["secret_found"]);
+  if (latched.kind !== "ok") return kept("secret_found_unlatched");
+  const room = Math.max(0, MAX_FLAGGED - latched.record.flaggedCommits.length);
+  const flagged = [...new Set((failed.flaggedCommits ?? []).filter(sha => SHA_RE.test(sha)))]
+    .filter(sha => !latched.record.flaggedCommits.includes(sha)).slice(0, room);
+  if (flagged.length > 0) await deps.store.addLocalBlock(input.runId, input.generation, ["secret_found"], flagged);
   if (latched.kind === "ok" && !terminalInvoked(latched.record) && latched.record.phase !== "closed" &&
       latched.record.phase !== "incomplete") {
     await deps.store.update(input.runId, input.generation, {

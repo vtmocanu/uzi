@@ -1631,7 +1631,7 @@ export class RecoveryCoordinator {
     const readable = (record: TerminalOperationRecord): boolean => decodeTerminalRecord(JSON.parse(JSON.stringify(record))) !== undefined;
     const failure = (error: unknown): { kind: "error"; reason: string } =>
       ({ kind: "error", reason: error instanceof PredecessorAuthorityLost ? "authority_lost" : error instanceof Error ? error.message.slice(0, 120) : "write_failed" });
-    const mutate =async (runId: string, generation: number, delta: TerminalDelta): Promise<TerminalUpdateResult> => {
+    const mutate = async (runId: string, generation: number, delta: TerminalDelta): Promise<TerminalUpdateResult> => {
       if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
       if (!valid(runId, generation)) return { kind: "error", reason: "invalid_id" };
       try {
