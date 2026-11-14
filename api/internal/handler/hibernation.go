@@ -50,6 +50,7 @@ func (h *Handler) ControllerHibernation(w http.ResponseWriter, r *http.Request) 
 	row, err := h.wsvc.ApplyTransition(r.Context(), id, workersvc.HibernationTransition{
 		OpID: body.OpID, Transition: body.Transition, DeploymentUID: body.DeploymentUID,
 		ResourceVersion: body.ResourceVersion, PodUID: body.PodUID, Reason: body.Reason,
+		CleanupOpID: body.CleanupOpID,
 	})
 	var verr *workersvc.HibernationValidationError
 	switch {

@@ -508,6 +508,13 @@ quarantined until its next heartbeat. Any run can cause a quarantine by leaving
 such a process behind, so on a shared worker a restart is the cost of that.
 Credentials a process could read before it was detected are not revoked.
 
+## Hibernation cache prune capability
+
+A Docker-capable worker with the pressure prune enabled also advertises
+`hibernation_cache_prune_v1`, which lets the api run the
+[cache prune before hibernation](hosted-workers.md#cache-cleanup-before-sleep) on it.
+Without it the worker is not pruned and hibernates as before.
+
 ## Lost memory authority
 
 A guard-enabled worker can lose memory authority mid-life: the api stops

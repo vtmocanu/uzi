@@ -42,6 +42,12 @@ func sampleHibernationTransitions() []HibernationTransition {
 			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12348",
 			PodUID: "66666666-6666-6666-6666-666666666666",
 		},
+		{
+			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionCleanupStopped,
+			DeploymentUID: "77777777-7777-7777-7777-777777777777",
+			PodUID:        "66666666-6666-6666-6666-666666666666",
+			CleanupOpID:   "88888888-8888-8888-8888-888888888888",
+		},
 	}
 }
 
@@ -77,6 +83,8 @@ func TestHibernationTransitionLiterals(t *testing.T) {
 		{TransitionScalingDown, "scaling_down"},
 		{TransitionScaledDown, "scaled_down"},
 		{TransitionReady, "ready"},
+		{TransitionCleanupStopped, "cleanup_stopped"},
+		{HibernationCleaning, "cleaning"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("transition literal = %q, want %q", tc.got, tc.want)
