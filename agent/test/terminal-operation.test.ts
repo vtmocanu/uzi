@@ -270,6 +270,147 @@ describe("terminal operation merge", () => {
   });
 });
 
+describe("terminal operation bounds, closure and authority", () => {
+  const probes: Array<[string, TerminalDelta]> = [
+    ["closedReason over the decoder bound", { closedReason: "x".repeat(300) }],
+    ["more verdicts than the decoder allows", { verdicts: Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`v${i}`, "ok"])) }],
+    ["an empty localBlock string", { addLocalBlock: [""] }],
+  ];
+  for (const [name, delta] of probes) {
+    it(`${name}: the merge and the store refuse it, write nothing and leave the record readable`, async () => {
+      assert.equal(mergeReason(rec(), delta), "bound");
+      const root = mkRoot();
+      const store = mkCoord(root).terminalOperationStore();
+      await store.create(rec());
+      const before = fs.readFileSync(recFile(root), "utf8");
+      assert.deepEqual(await store.update(RUN, 1, delta), { kind: "rejected", reason: "bound" });
+      assert.equal(fs.readFileSync(recFile(root), "utf8"), before);
+      assert.deepEqual(fs.readdirSync(tpDir(root)), ["g1.json"]);
+      assert.equal((await store.read(RUN, 1)).kind, "ok");
+    });
+  }
+
+  it("an injected reason is clamped to [a-z0-9_] and a safe length before it is persisted", async () => {
+    const root = mkRoot();
+    const h = harness(mkCoord(root));
+    h.deps.aggregate = async () => ({ refused: "Bad Reason! " + "Z".repeat(600) });
+    const res = await runTerminalOperation(h.deps, input());
+    assert.equal(res.outcome, "kept");
+    const r = await readRec(h.deps.store);
+    assert.equal(r.phase, "incomplete");
+    assert.match(r.closedReason!, /^[a-z0-9_]{1,200}$/);
+    assert.ok(r.closedReason!.startsWith("aggregate_bad_reason_"));
+    assert.equal(h.sends.length, 0);
+  });
+
+  it("a server refusal reason is clamped before it lands in the invocation history", async () => {
+    const h = harness(mkCoord(mkRoot()));
+    h.sendResult = async () => ({ kind: "refused", reason: ("Weird Reason " + "y".repeat(600)) as never, httpStatus: 422 });
+    await runTerminalOperation(h.deps, input());
+    const r = await readRec(h.deps.store);
+    assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked", "refused"]);
+    assert.match(r.invocations[1]!.reason!, /^[a-z0-9_]{1,200}$/);
+  });
+
+  it("a closed record accepts no delta at all", () => {
+    const closed = preparedRec({ phase: "closed", closedReason: "published", invocations: [inv("invoked"), inv("published")] });
+    for (const d of [{ closedReason: "other" }, { verdicts: { x: "y" } }, { tip: B }, { tip: A }, { addLocalBlock: ["x"] },
+      { addFlaggedCommits: [A] }, { appendInvocations: [inv("refused")] }, { phase: "prepared" as const }] as TerminalDelta[]) {
+      assert.equal(mergeReason(closed, d), "closed", JSON.stringify(d));
+    }
+    assert.equal(mustMerge(closed, {}).phase, "closed");
+    assert.equal(mustMerge(closed, { phase: "closed", addLocalBlock: [], verdicts: {} }).phase, "closed");
+  });
+
+  it("a closed secret_found reason alone (no block, no flagged commit) still blocks every send of the run", async () => {
+    const root = mkRoot();
+    const store = mkCoord(root).terminalOperationStore();
+    await store.create(preparedRec());
+    await store.create(rec({ generation: 2, phase: "closed", closedReason: "secret_found" }));
+    assert.deepEqual(await store.invoke(RUN, 1, "2026-01-01T00:00:00.000Z"), { kind: "blocked", reason: "secret_found" });
+    assert.deepEqual((await readRec(store, 1)).invocations, []);
+  });
+
+  it("two runs racing the first write both succeed and leave a real shared root", async () => {
+    const RUN2 = "22222222-2222-4222-8222-222222222222";
+    for (let i = 0; i < 5; i++) {
+      const root = mkRoot();
+      const a = mkCoord(root).terminalOperationStore(), b = mkCoord(root).terminalOperationStore();
+      const [x, y] = await Promise.all([a.create(rec()), b.create(rec({ runId: RUN2 }))]);
+      assert.equal(x.kind, "created");
+      assert.equal(y.kind, "created");
+      const st = fs.lstatSync(path.join(root, "terminal-preservation"));
+      assert.ok(st.isDirectory() && !st.isSymbolicLink());
+      assert.equal((await a.read(RUN, 1)).kind, "ok");
+      assert.equal((await b.read(RUN2, 1)).kind, "ok");
+    }
+  });
+
+  it("a symlinked shared root is never written through", async () => {
+    const root = mkRoot();
+    fs.mkdirSync(path.join(root, "elsewhere"));
+    fs.symlinkSync(path.join(root, "elsewhere"), path.join(root, "terminal-preservation"));
+    const res = await mkCoord(root).terminalOperationStore().create(rec());
+    assert.notEqual(res.kind, "created");
+    assert.deepEqual(fs.readdirSync(path.join(root, "elsewhere")), []);
+  });
+
+  const lostScope = (coord: RecoveryCoordinator, live: () => boolean) =>
+    <T>(fn: () => Promise<T>): Promise<T> =>
+      (coord as unknown as { predecessorScope: { run: <R>(s: unknown, f: () => R) => R } }).predecessorScope.run({ ended: false, live }, fn);
+
+  it("a lost predecessor scope writes nothing: not on create, not on invoke", async () => {
+    const root = mkRoot();
+    const coord = mkCoord(root);
+    const store = coord.terminalOperationStore();
+    const created = await lostScope(coord, () => false)(() => store.create(rec()));
+    assert.deepEqual(created, { kind: "error", reason: "authority_lost" });
+    assert.equal(fs.existsSync(path.join(root, "terminal-preservation")), false);
+    await store.create(preparedRec());
+    const before = fs.readFileSync(recFile(root), "utf8");
+    const res = await lostScope(coord, () => false)(() => store.invoke(RUN, 1, "2026-01-01T00:00:00.000Z"));
+    assert.deepEqual(res, { kind: "error", reason: "authority_lost" });
+    assert.equal(fs.readFileSync(recFile(root), "utf8"), before);
+  });
+
+  it("authority lost between the temp write and the rename publishes nothing and removes the temp file", async () => {
+    const root = mkRoot();
+    const coord = mkCoord(root);
+    let calls = 0;
+    const res = await lostScope(coord, () => ++calls < 2)(() => coord.terminalOperationStore().create(rec()));
+    assert.deepEqual(res, { kind: "error", reason: "authority_lost" });
+    assert.deepEqual(fs.readdirSync(tpDir(root)), []);
+  });
+});
+
+describe("terminal operation resume identity", () => {
+  async function leftPrepared(): Promise<H> {
+    const h = harness(mkCoord(mkRoot()));
+    h.boundary = false;
+    await runTerminalOperation(h.deps, input());
+    h.boundary = true;
+    return h;
+  }
+  const cases: Array<[string, (h: H) => void, { workerId?: string; priorTip?: string }]> = [
+    ["scan digest", h => { h.prepareResult = () => ({ pack: Buffer.from("p"), range: { tipSha: A, excludeSha: B }, digests: { scan: "other", transport: "t" } }); }, {}],
+    ["transport digest", h => { h.prepareResult = () => ({ pack: Buffer.from("p"), range: { tipSha: A, excludeSha: B }, digests: { scan: "s", transport: "other" } }); }, {}],
+    ["range", h => { h.prepareResult = () => ({ pack: Buffer.from("p"), range: { tipSha: A, excludeSha: C }, digests: { scan: "s", transport: "t" } }); }, {}],
+    ["manifest worker", () => undefined, { workerId: "w2" }],
+    ["prior tip", () => undefined, { priorTip: C }],
+  ];
+  for (const [name, arrange, over] of cases) {
+    it(`a ${name} mismatch on resume sends nothing and invokes nothing`, async () => {
+      const h = await leftPrepared();
+      arrange(h);
+      const resumeInput = { ...input("resume"), ...over };
+      const res = await runTerminalOperation(h.deps, resumeInput);
+      assert.deepEqual(res, { outcome: "kept", reason: "digest_mismatch" });
+      assert.equal(h.sends.length, 0);
+      assert.deepEqual((await readRec(h.deps.store)).invocations, []);
+    });
+  }
+});
+
 describe("terminal operation engine", () => {
   it("publishes through the approved order and closes the record", async () => {
     const root = mkRoot();
@@ -547,6 +688,15 @@ describe("terminal operation rediscovery", () => {
     const again = await fresh.resumeTerminalOperations();
     assert.equal(again.incomplete, 0);
     assert.deepEqual(again.resumePending.map(p => p.generation), [3, 4]);
+  });
+
+  it("processes the lowest generations first when a run has more records than the per-run cap", async () => {
+    const root = mkRoot();
+    const store = mkCoord(root).terminalOperationStore();
+    for (let g = 1; g <= 70; g++) await store.create(preparedRec({ generation: g }));
+    const res = await mkCoord(root).resumeTerminalOperations();
+    assert.equal(res.truncated, true);
+    assert.deepEqual(res.resumePending.map(p => p.generation), Array.from({ length: 64 }, (_, i) => i + 1));
   });
 
   it("does nothing when the root is absent", async () => {

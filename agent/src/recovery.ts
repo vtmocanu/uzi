@@ -1569,6 +1569,8 @@ export class RecoveryCoordinator {
   /** Durable write: parents created 0700 with the new dir and its parent synced, temp O_EXCL|O_NOFOLLOW 0600, file
    *  fsync, rename, directory fsync. The caller holds the run's journal lock. */
   private async terminalWriteUnlocked(record: TerminalOperationRecord): Promise<void> {
+    // Same authority chokepoint as writeRecordUnlocked: a lost predecessor scope writes nothing.
+    this.assertPredecessorAuthority();
     const raw = JSON.stringify({ ...record, mac: this.terminalMac(record) });
     const sync = async (dir: string) => {
       const h = await fs.open(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -1580,7 +1582,12 @@ export class RecoveryCoordinator {
         if (!(await fs.lstat(dir)).isDirectory()) throw new Error("terminal operation: unsafe directory");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        await fs.mkdir(dir, { mode: 0o700 });
+        // The shared root is created by whichever run writes first: losing that race (EEXIST) is success, provided
+        // the winner left a real directory, never a symlink or file.
+        try { await fs.mkdir(dir, { mode: 0o700 }); } catch (mkdirError) {
+          if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+        }
+        if (!(await fs.lstat(dir)).isDirectory()) throw new Error("terminal operation: unsafe directory");
         await sync(dir); await sync(parent);
       }
       parent = dir;
@@ -1589,7 +1596,8 @@ export class RecoveryCoordinator {
     const file = await fs.open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try {
       try { await file.writeFile(raw); await file.sync(); } finally { await file.close(); }
-      await fs.rename(tmp, dst);
+      // The scope can die during the awaited IO above: recheck immediately before publishing.
+      await ownedRecoveryIO(async () => { this.assertPredecessorAuthority(); await fs.rename(tmp, dst); });
     } catch (error) {
       await fs.unlink(tmp).catch(() => undefined);
       throw error;
@@ -1619,7 +1627,11 @@ export class RecoveryCoordinator {
    *  gate off every method does nothing and creates nothing. */
   terminalOperationStore(): TerminalOperationStore {
     const valid = (runId: string, generation: number) => isTerminalRunId(runId) && isTerminalGeneration(generation);
-    const mutate = async (runId: string, generation: number, delta: TerminalDelta): Promise<TerminalUpdateResult> => {
+    /** Nothing is written unless the record passes the strict reader's decoder (so a write can never wedge the run). */
+    const readable = (record: TerminalOperationRecord): boolean => decodeTerminalRecord(JSON.parse(JSON.stringify(record))) !== undefined;
+    const failure = (error: unknown): { kind: "error"; reason: string } =>
+      ({ kind: "error", reason: error instanceof PredecessorAuthorityLost ? "authority_lost" : error instanceof Error ? error.message.slice(0, 120) : "write_failed" });
+    const mutate =async (runId: string, generation: number, delta: TerminalDelta): Promise<TerminalUpdateResult> => {
       if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
       if (!valid(runId, generation)) return { kind: "error", reason: "invalid_id" };
       try {
@@ -1628,11 +1640,12 @@ export class RecoveryCoordinator {
           if (cur.kind !== "ok") return cur;
           const merged = mergeTerminalRecord(cur.record, delta);
           if (!merged.ok) return { kind: "rejected", reason: merged.reason };
+          if (!readable(merged.record)) return { kind: "rejected", reason: "bound" };
           await this.terminalWriteUnlocked(merged.record);
           return { kind: "ok", record: merged.record };
         });
       } catch (error) {
-        return { kind: "error", reason: error instanceof Error ? error.message.slice(0, 120) : "write_failed" };
+        return failure(error);
       }
     };
     return {
@@ -1642,7 +1655,7 @@ export class RecoveryCoordinator {
       },
       create: async (record) => {
         if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
-        if (!valid(record.runId, record.generation) || !decodeTerminalRecord(JSON.parse(JSON.stringify(record)))) return { kind: "error", reason: "invalid_record" };
+        if (!valid(record.runId, record.generation) || !readable(record)) return { kind: "error", reason: "invalid_record" };
         try {
           return await this.withJournalLock(record.runId, async () => {
             if ((await this.terminalReadUnlocked(record.runId, record.generation)).kind !== "absent") return { kind: "exists" as const };
@@ -1650,7 +1663,7 @@ export class RecoveryCoordinator {
             return { kind: "created" as const, record };
           });
         } catch (error) {
-          return { kind: "error", reason: error instanceof Error ? error.message.slice(0, 120) : "write_failed" };
+          return failure(error);
         }
       },
       update: mutate,
@@ -1661,17 +1674,19 @@ export class RecoveryCoordinator {
         if (!valid(runId, generation)) return { kind: "error", reason: "invalid_id" };
         try {
           return await this.withJournalLock(runId, async (): Promise<TerminalInvokeResult> => {
+            this.assertPredecessorAuthority();
             const cur = await this.terminalReadUnlocked(runId, generation);
             if (cur.kind !== "ok") return cur;
             const blocked = await this.terminalRunBlockedUnlocked(runId);
             if (blocked !== undefined) return { kind: "blocked", reason: blocked };
             const merged = mergeTerminalRecord(cur.record, { appendInvocations: [{ at, outcome: "invoked" }] });
             if (!merged.ok) return { kind: "rejected", reason: merged.reason };
+            if (!readable(merged.record)) return { kind: "rejected", reason: "bound" };
             await this.terminalWriteUnlocked(merged.record);
             return { kind: "invoked", record: merged.record };
           });
         } catch (error) {
-          return { kind: "error", reason: error instanceof Error ? error.message.slice(0, 120) : "write_failed" };
+          return failure(error);
         }
       },
     };
@@ -1706,6 +1721,7 @@ export class RecoveryCoordinator {
         if (!(await fs.lstat(this.terminalRunDir(runId))).isDirectory()) { out.corrupt++; continue; }
         files = (await fs.readdir(this.terminalRunDir(runId))).filter(n => /^g[1-9][0-9]*\.json$/.test(n));
       } catch { out.corrupt++; continue; }
+      files.sort((a, b) => Number(a.slice(1, -5)) - Number(b.slice(1, -5)));
       if (files.length > 64) { files = files.slice(0, 64); out.truncated = true; }
       for (const name of files) {
         if (over()) { out.truncated = true; break; }

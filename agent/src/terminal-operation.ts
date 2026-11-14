@@ -165,6 +165,14 @@ export type TerminalMergeResult = { ok: true; record: TerminalOperationRecord } 
  */
 export function mergeTerminalRecord(current: TerminalOperationRecord, delta: TerminalDelta): TerminalMergeResult {
   const no = (reason: string): TerminalMergeResult => ({ ok: false, reason });
+  // Append-only history ends at close: any non-empty delta against a closed record is refused (an empty one, or a
+  // restatement of the closed phase, stays an idempotent no-op).
+  if (current.phase === "closed") {
+    const nonEmpty = IDENTITY_KEYS.some(k => delta[k] !== undefined) || (delta.phase !== undefined && delta.phase !== "closed") ||
+      (delta.appendInvocations?.length ?? 0) > 0 || (delta.addLocalBlock?.length ?? 0) > 0 ||
+      (delta.addFlaggedCommits?.length ?? 0) > 0 || Object.keys(delta.verdicts ?? {}).length > 0 || delta.closedReason !== undefined;
+    if (nonEmpty) return no("closed");
+  }
   const next: TerminalOperationRecord = {
     ...current, verdicts: { ...current.verdicts }, flaggedCommits: [...current.flaggedCommits],
     invocations: [...current.invocations], localBlock: [...current.localBlock],
@@ -184,7 +192,6 @@ export function mergeTerminalRecord(current: TerminalOperationRecord, delta: Ter
   const addBlock = (b: string) => { if (!next.localBlock.includes(b)) next.localBlock.push(b); };
   for (const b of delta.addLocalBlock ?? []) addBlock(b);
   const appended = delta.appendInvocations ?? [];
-  if (appended.length > 0 && current.phase === "closed") return no("closed");
   for (const inv of appended) {
     if (inv.outcome === "invoked") {
       if (next.localBlock.length > 0) return no("local_block");
@@ -210,6 +217,8 @@ export function mergeTerminalRecord(current: TerminalOperationRecord, delta: Ter
     if (!terminalFinalOutcome(next) && terminalInvoked(next)) return no("close_requires_final");
     if (!terminalFinalOutcome(next) && next.closedReason === undefined) return no("close_requires_reason");
   }
+  // The merge enforces the same bounds the strict reader does, so it can never produce a record its own reader rejects.
+  if (!decodeTerminalRecord(JSON.parse(JSON.stringify(next)))) return no("bound");
   return { ok: true, record: next };
 }
 
@@ -291,6 +300,9 @@ export interface TerminalOperationInput {
 }
 
 const kept = (reason: string): TerminalOperationResult => ({ outcome: "kept", reason });
+/** Clamp an injected or server-supplied reason to `[a-z0-9_]` and a length well inside the record's string bounds before
+ *  it can reach a persisted field. */
+const reasonToken = (reason: string): string => reason.toLowerCase().replace(/[^a-z0-9_]+/g, "_").slice(0, 120) || "unknown";
 const iso = (deps: TerminalOperationDeps): string => new Date(deps.now()).toISOString();
 
 function finalResult(record: TerminalOperationRecord): TerminalOperationResult {
@@ -335,8 +347,9 @@ async function proveUniverse(deps: TerminalOperationDeps): Promise<{ ok: true; u
 
 /** Mark a capture-phase record incomplete (never from prepared or later); a rejection is not an error. */
 async function markIncomplete(deps: TerminalOperationDeps, input: TerminalOperationInput, reason: string): Promise<TerminalOperationResult> {
-  await deps.store.update(input.runId, input.generation, { phase: "incomplete", closedReason: reason });
-  return kept(reason);
+  const clamped = reasonToken(reason);
+  await deps.store.update(input.runId, input.generation, { phase: "incomplete", closedReason: clamped });
+  return kept(clamped);
 }
 
 async function initial(deps: TerminalOperationDeps, input: TerminalOperationInput): Promise<TerminalOperationResult> {
@@ -389,6 +402,13 @@ async function resume(deps: TerminalOperationDeps, input: TerminalOperationInput
   if (!cov.ok) return kept(`coverage_${cov.reason}`);
   const prepared = await deps.prepare(range, { scan: rec.scanDigest, transport: rec.transportDigest }, rec.tip);
   if (!("pack" in prepared)) return prepareFailure(deps, input, prepared, false);
+  // The re-prepared pack must be the one the record describes, and the request rebuilt from the record must name this
+  // operation: any difference sends nothing.
+  const m = rec.manifest;
+  if (prepared.digests.scan !== rec.scanDigest || prepared.digests.transport !== rec.transportDigest ||
+      serializeCheckpointRange(prepared.range) !== rec.range ||
+      m.run_id !== input.runId || m.generation !== input.generation || m.worker_id !== input.workerId ||
+      (input.priorTip !== undefined && input.priorTip !== rec.priorTip)) return kept("digest_mismatch");
   return finishAndSend(deps, input, rec, prepared.pack);
 }
 
@@ -440,14 +460,16 @@ async function finishAndSend(deps: TerminalOperationDeps, input: TerminalOperati
   }
   if (result.kind === "refused") {
     const conflict = result.reason === "generation_bound" || result.reason === "prior_tip_mismatch";
+    // A non-conflict server refusal after `invoke` leaves the record prepared and resumable (the next resume may send
+    // again); the loop is bounded by MAX_INVOCATIONS, after which every append is rejected as `bound`.
     await store.update(input.runId, input.generation, {
-      appendInvocations: [{ at, outcome: conflict ? "conflict" : "refused", reason: result.reason }],
+      appendInvocations: [{ at, outcome: conflict ? "conflict" : "refused", reason: reasonToken(result.reason) }],
       ...(conflict ? { addLocalBlock: ["server_conflict"] } : {}),
     });
     return kept(result.reason);
   }
   const reason = result.cause === "retryable" ? result.reason : result.cause;
-  await store.update(input.runId, input.generation, { appendInvocations: [{ at, outcome: "publish_unknown", reason }] });
+  await store.update(input.runId, input.generation, { appendInvocations: [{ at, outcome: "publish_unknown", reason: reasonToken(reason) }] });
   return { outcome: "unknown", reason };
 }
 
