@@ -140,6 +140,7 @@ func TestReleaseCheckDefaults(t *testing.T) {
 		KeyReleaseCheckToken,
 		KeyReleaseLatestTag, KeyReleaseLatestName, KeyReleaseLatestBody,
 		KeyReleaseNotesURL, KeyReleasePublishedAt, KeyReleaseCheckedAt,
+		KeyReleaseFormulaStableTag, KeyReleaseFormulaRCTag,
 	}
 	for _, k := range absent {
 		if _, in := Defaults[k]; in {
@@ -245,6 +246,8 @@ func TestReleaseCheckAccessors(t *testing.T) {
 		row(KeyReleaseLatestTag, "v0.15.0"),
 		row(KeyReleaseNotesURL, "https://example.test/r"),
 		row(KeyReleaseBannerSnoozeTag, "v0.15.0"),
+		row(KeyReleaseFormulaStableTag, "v0.14.0"),
+		row(KeyReleaseFormulaRCTag, "v0.15.0-rc.2"),
 	}}, time.Minute)
 	st, err := cFacts.ReleaseStatus(context.Background())
 	if err != nil {
@@ -252,6 +255,9 @@ func TestReleaseCheckAccessors(t *testing.T) {
 	}
 	if st.LatestTag != "v0.15.0" || st.NotesURL != "https://example.test/r" {
 		t.Errorf("ReleaseStatus = %+v, want tag/notes populated", st)
+	}
+	if st.FormulaStableTag != "v0.14.0" || st.FormulaRCTag != "v0.15.0-rc.2" {
+		t.Errorf("ReleaseStatus formula tags = %q/%q, want v0.14.0/v0.15.0-rc.2", st.FormulaStableTag, st.FormulaRCTag)
 	}
 	if st.BannerSnoozeTag != "v0.15.0" {
 		t.Errorf("ReleaseStatus.BannerSnoozeTag = %q, want v0.15.0", st.BannerSnoozeTag)

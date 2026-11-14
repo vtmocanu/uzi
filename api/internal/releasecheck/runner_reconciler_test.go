@@ -36,8 +36,8 @@ func TestScheduledReconcilerOutcomes(t *testing.T) {
 		{name: "disabled"},
 		{name: "enable read error", enabled: true, enableErr: errors.New("read failed")},
 		{name: "stable failure", enabled: true, stableFail: true, requests: 1},
-		{name: "success", enabled: true, requests: 2, persisted: true},
-		{name: "RC failure", enabled: true, rcFail: true, requests: 2, persisted: true},
+		{name: "success", enabled: true, requests: 4, persisted: true},
+		{name: "RC failure", enabled: true, rcFail: true, requests: 4, persisted: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var requests atomic.Int64
@@ -152,7 +152,7 @@ func TestScheduledCheckRefreshesRealCache(t *testing.T) {
 	if err != nil || stamp != now.Format(time.RFC3339) {
 		t.Fatalf("post-check checked-at=%q, %v", stamp, err)
 	}
-	if requests.Load() != 2 {
-		t.Fatalf("HTTP requests=%d, want 2", requests.Load())
+	if requests.Load() != 4 {
+		t.Fatalf("HTTP requests=%d, want 4 (latest, RC page, two formulas)", requests.Load())
 	}
 }

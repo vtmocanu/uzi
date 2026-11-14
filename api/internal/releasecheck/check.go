@@ -47,7 +47,11 @@ type Facts struct {
 	Body          string
 	NotesURL      string
 	PublishedAt   string // RFC3339
-	CheckedAt     string // RFC3339, from the reconciler's clock
+	// FormulaStableTag / FormulaRCTag are the uzi tags the Homebrew tap formulas
+	// install, "" when unknown (fetch failure or an unparseable formula).
+	FormulaStableTag string
+	FormulaRCTag     string
+	CheckedAt        string // RFC3339, from the reconciler's clock
 }
 
 // Result summarizes one check pass. A stable success with an RC fetch failure
@@ -95,7 +99,8 @@ func NewReconciler(st Store, set SettingsReader, now func() time.Time, logger *s
 //   - master toggle OFF → Status "disabled", NO http call, persist NOTHING.
 //   - stable fetch/parse error → Status "error", token-scrubbed message, persist NOTHING
 //     (the last-good facts survive so the SPA keeps showing the previous release).
-//   - stable success → fetch one RC page, persist stable facts and RC facts on RC
+//   - stable success → also read the two tap formulas (each failure writes "" for
+//     that formula only), then fetch one RC page, persist stable facts and RC facts on RC
 //     success (clearing RC keys when absent), then invalidate the cache. An RC
 //     failure preserves prior RC keys and returns an error after stable persistence.
 //
@@ -133,6 +138,8 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 	}
 
 	rc, rcErr := fetchLatestRC(ctx, r.client, token)
+	formulaStable := r.formulaTag(ctx, token, formulaStablePath, true)
+	formulaRC := r.formulaTag(ctx, token, formulaRCPath, false)
 	facts := Facts{
 		LatestTag:     rel.TagName,
 		LatestName:    rel.Name,
@@ -145,6 +152,9 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 		RCBody:        rc.Body,
 		RCNotesURL:    rc.HTMLURL,
 		RCPublishedAt: rc.PublishedAt,
+
+		FormulaStableTag: formulaStable,
+		FormulaRCTag:     formulaRC,
 	}
 
 	// Publish the stable facts and, on RC success, the RC facts in one transaction.
@@ -156,6 +166,9 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 		{Key: settings.KeyReleaseNotesURL, Value: facts.NotesURL},
 		{Key: settings.KeyReleasePublishedAt, Value: facts.PublishedAt},
 		{Key: settings.KeyReleaseCheckedAt, Value: facts.CheckedAt},
+		// Formula tags are always written; "" means unknown (any fetch/parse failure).
+		{Key: settings.KeyReleaseFormulaStableTag, Value: facts.FormulaStableTag},
+		{Key: settings.KeyReleaseFormulaRCTag, Value: facts.FormulaRCTag},
 	}
 	if rcErr == nil {
 		writes = append(writes,
@@ -175,4 +188,21 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 		return Result{Status: statusError, Facts: facts, Partial: true, Message: "stable release updated; RC fetch failed: " + rcErr.Error()}, nil
 	}
 	return Result{Status: statusOK, Facts: facts}, nil
+}
+
+// formulaTag fetches one tap formula and returns the uzi tag it installs, or "" on
+// any failure (transport, non-200, redirect, oversize, malformed). Each formula is
+// independent: a failure is logged (token-scrubbed) and never fails the check.
+func (r *Reconciler) formulaTag(ctx context.Context, token, path string, stableOnly bool) string {
+	src, err := fetchFormula(ctx, r.client, token, path)
+	if err != nil {
+		r.logger.Warn("releasecheck: fetch tap formula", "path", path, "error", err)
+		return ""
+	}
+	tag, ok := parseFormulaTag(src, stableOnly)
+	if !ok {
+		r.logger.Warn("releasecheck: tap formula has no recognizable uzi tag", "path", path)
+		return ""
+	}
+	return tag
 }

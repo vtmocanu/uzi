@@ -899,6 +899,12 @@ func (h *Handler) attachReleaseInfo(ctx context.Context, info *apitypes.BuildInf
 			Security:    releasecheck.Security(st.RCBody),
 		}
 	}
+	if st.FormulaStableTag != "" || st.FormulaRCTag != "" {
+		info.HomebrewFormulas = &apitypes.HomebrewFormulasDTO{
+			UziCLI:   st.FormulaStableTag,
+			UziCLIRC: st.FormulaRCTag,
+		}
+	}
 	ua := releasecheck.UpdateAvailable(h.version, st.LatestTag)
 	info.UpdateAvailable = &ua
 	fb := releasecheck.FarBehind(h.version, st.LatestTag, st.PublishedAt, h.clock())

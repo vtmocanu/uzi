@@ -85,6 +85,11 @@ type BuildInfoDTO struct {
 	Latest *LatestReleaseDTO `json:"latest,omitempty"`
 	// LatestRC is the newest published release candidate from the last successful RC scan.
 	LatestRC *LatestReleaseDTO `json:"latest_rc,omitempty"`
+	// HomebrewFormulas is the uzi tag each public vtmocanu/homebrew-tap formula
+	// currently installs (issue #4314), so a client can tell whether `brew upgrade`
+	// can reach a release yet. Omitted under the same gate as Latest (check enabled
+	// and run) and when neither tag is known.
+	HomebrewFormulas *HomebrewFormulasDTO `json:"homebrew_formulas,omitempty"`
 	// UpdateAvailable / FarBehind are the read-time derivations over Latest + the
 	// running Version (PRD #836 M3). *bool, NOT a bare bool: a bare bool with omitempty
 	// collapses false ("checked, up to date") into "never checked", exactly the
@@ -93,6 +98,14 @@ type BuildInfoDTO struct {
 	// are nil whenever Latest is nil (no check has run, or the feature is disabled).
 	UpdateAvailable *bool `json:"update_available,omitempty"`
 	FarBehind       *bool `json:"far_behind,omitempty"`
+}
+
+// HomebrewFormulasDTO carries the uzi tags the tap's stable (uzi-cli) and RC
+// (uzi-cli-rc) formulas install. An empty value means unknown (that formula could
+// not be read or parsed on the last check), never "none".
+type HomebrewFormulasDTO struct {
+	UziCLI   string `json:"uzi_cli,omitempty"`
+	UziCLIRC string `json:"uzi_cli_rc,omitempty"`
 }
 
 // LatestReleaseDTO is the newest upstream release's public coordinates, nested under
