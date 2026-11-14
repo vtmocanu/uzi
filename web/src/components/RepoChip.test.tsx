@@ -208,6 +208,40 @@ describe("RepoChip popover", () => {
     expect(hasUnsafe(dialog().innerHTML)).toBe(false);
     expect(hasUnsafe(chip().outerHTML)).toBe(false);
   });
+
+  it("renders a disabled-but-active repo's fallback path demo-masked, with title and badge from the masked path", () => {
+    // Unsafe namespace and a non-empty repo segment: stripping gives "evilorg/xrepo", masking "demo/xrepo".
+    const m = repoActivityModel({
+      ownRuns: [],
+      adminRuns: {
+        runs: [
+          {
+            id: "r-2",
+            status: "running",
+            health: "ok",
+            repo_id: "r-masked",
+            repo_path: "evil‮org/\u001bx\u0007repo",
+          } as RunSummaryItem,
+        ],
+        failed: false,
+        lastOkAt: 0,
+      },
+      viewerEmail: "me@x.io",
+      repoActivity: { repos: [], failed: false },
+      now: Date.parse("2026-11-08T12:00:00Z"),
+      demo: true,
+    });
+    renderChip(m);
+    open();
+    const row = within(dialog()).getAllByRole("listitem")[0];
+    const pathEl = within(row).getByText("demo/xrepo");
+    expect(pathEl.getAttribute("title")).toBe("demo/xrepo");
+    expect(row.textContent).toBe("xrdemo/xrepo1 running");
+    expect(chip().textContent).toContain("xr");
+    expect(dialog().textContent).not.toContain("org");
+    expect(hasUnsafe(dialog().innerHTML)).toBe(false);
+    expect(hasUnsafe(chip().outerHTML)).toBe(false);
+  });
 });
 
 describe("RepoChip keyboard and focus", () => {
