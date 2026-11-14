@@ -534,6 +534,19 @@ func TestHibernationInventoryInvalidatorsLiveDB(t *testing.T) {
 			f.hibernatedHeld()
 			f.must(f.afterExitT(TransitionHeld, func(tr *HibernationTransition) { g := seven + 5; tr.DeploymentGeneration = &g }))
 		}},
+		{"replacement deployment uid on scaling_down", InvalidatedDeploymentChanged, func(f *invFx) {
+			f.accepted()
+			f.must(f.scalingDownT(func(tr *HibernationTransition) { tr.DeploymentUID = uuid.NewString() }))
+		}},
+		{"replacement deployment uid on scaled_down", InvalidatedDeploymentChanged, func(f *invFx) {
+			f.accepted()
+			f.must(f.scalingDownT())
+			f.must(f.afterExitT(TransitionScaledDown, func(tr *HibernationTransition) { tr.DeploymentUID = uuid.NewString() }))
+		}},
+		{"replacement deployment uid while held", InvalidatedDeploymentChanged, func(f *invFx) {
+			f.hibernatedHeld()
+			f.must(f.afterExitT(TransitionHeld, func(tr *HibernationTransition) { tr.DeploymentUID = uuid.NewString() }))
+		}},
 		{"scaled_down without a fence", InvalidatedScaleDownPodUnproven, func(f *invFx) {
 			f.accepted()
 			f.must(f.afterExitT(TransitionScaledDown))

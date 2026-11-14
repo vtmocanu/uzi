@@ -840,7 +840,7 @@ func retirementEvidenceValue(v workersvc.RetirementVerdict) string {
 	case workersvc.RetirementConditionalRetire:
 		return retirementConditionalSentence + classPolicyText(v)
 	case workersvc.RetirementBlocked:
-		return blocker
+		return blocker + unverifiedClassPolicyText(v)
 	case workersvc.RetirementCancelled:
 		return "cancelled: wake requested"
 	case workersvc.RetirementNotYetEligible:
@@ -848,7 +848,7 @@ func retirementEvidenceValue(v workersvc.RetirementVerdict) string {
 		if blocker != "" {
 			out += "; " + blocker
 		}
-		return out
+		return out + unverifiedClassPolicyText(v)
 	}
 	return safe(v.Outcome)
 }
@@ -877,6 +877,15 @@ func classPolicyText(v workersvc.RetirementVerdict) string {
 		text += " (flagged)"
 	}
 	return "; class policy " + text
+}
+
+// unverifiedClassPolicyText is the class policy proxy for a row that is not conditional_retire,
+// worded so the reader does not take the class policy for the actual PV's reclaim policy.
+func unverifiedClassPolicyText(v workersvc.RetirementVerdict) string {
+	if text := classPolicyText(v); text != "" {
+		return text + ", actual PV unverified"
+	}
+	return ""
 }
 
 func retirementRemaining(d time.Duration) string {

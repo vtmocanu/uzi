@@ -461,7 +461,7 @@ func entryBlocker(e retirementEntry, valid map[[2]string]bool) (code, source str
 			return BlockerNoReceipt, where
 		}
 		if !valid[[2]string{strings.ToLower(*e.RunID), *e.Tip}] {
-			return BlockerNoReceipt, *e.RunID
+			return BlockerNoReceipt, where + " run " + *e.RunID
 		}
 	default:
 		// protected, unknown, unrecoverable and any word this api does not know.

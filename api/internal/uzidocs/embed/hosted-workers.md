@@ -243,8 +243,9 @@ first step, a **dry run**: **no volume is deleted**, and no setting turns deleti
 - **Conditional only.** A worker that nothing blocks is reported as "would retire
   only after M2 verifies": the volumes' actual PV reclaim policy, and that no
   other pod mounted them between the controller's observations (only sampled in
-  M1). The StorageClass reclaim policy is shown as a proxy and `Retain` is
-  flagged, because deleting a claim whose PV is `Retain` frees nothing. M2 must
+  M1). The StorageClass reclaim policy is shown as a proxy on every row that is not
+  cancelled (blocked and not-yet-eligible rows say "actual PV unverified"), and
+  `Retain` is flagged, because deleting a claim whose PV is `Retain` frees nothing. M2 must
   verify both before it may delete anything.
 - **Where it shows.** The instance-scoped `fleet.hibernation_retirement` check in
   **Admin → Health** lists at most 10 workers and evaluates at most 50 per

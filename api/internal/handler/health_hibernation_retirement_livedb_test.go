@@ -137,3 +137,67 @@ func TestAdminHealthHibernationRetirementCapLiveDB(t *testing.T) {
 		t.Fatalf("50 eligible workers = %q %q, want ok", c.Severity, c.Summary)
 	}
 }
+
+// PRD #4208 M1 (V24): three real evaluator outcomes rendered by the mounted admin-health endpoint,
+// not hand-built verdicts. Example 2 is a blocked worker past the period whose retained source has no
+// receipt; example 3 is a waking worker whose older op's inventory was accepted; the third row is a
+// worker nothing blocks.
+func TestAdminHealthHibernationRetirementExamplesLiveDB(t *testing.T) {
+	h, router, pool := cliLiveDB(t)
+	ctx := context.Background()
+	h.wsvc.SetTxBeginner(pool)
+	clock := time.Now()
+	h.now = func() time.Time { return clock }
+	admin := cliSeedUser(t, pool, true)
+	token := cliMintToken(t, pool, admin, clitoken.ScopeAdminRO)
+	var existing int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM workers WHERE hibernation_state IN ('hibernated','waking')`).Scan(&existing); err != nil {
+		t.Fatal(err)
+	}
+	if existing != 0 {
+		t.Skipf("%d unrelated hibernated workers share this database", existing)
+	}
+
+	// ret-1 (newest) stays conditional, ret-2 is blocked, ret-3 (oldest) is waking.
+	seedEligibleHibernated(t, ctx, h, admin, 3)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM workers WHERE name LIKE 'ret-%' AND user_id = $1`, admin)
+	})
+	run := uuid.New()
+	entries := `[{"kind":"runner_ref","path":"refs/uzi-runner/agent/issue-3","classification":"needs_receipt","run_id":"` + run.String() +
+		`","tip":"` + strings.Repeat("a", 40) + `","content_state":"ref"}]`
+	mustExecT(ctx, t, h.pool, `UPDATE worker_hibernation_inventories SET entries = $2::jsonb
+		WHERE worker_id = (SELECT id FROM workers WHERE name = 'ret-2' AND user_id = $1)`, admin, entries)
+	mustExecT(ctx, t, h.pool, `UPDATE workers SET hibernation_state = 'waking', hibernation_op_id = gen_random_uuid(), wake_requested_at = now()
+		WHERE name = 'ret-3' AND user_id = $1`, admin)
+	short := func(name string) string {
+		var id string
+		if err := pool.QueryRow(ctx, `SELECT left(id::text, 8) FROM workers WHERE name = $1 AND user_id = $2`, name, admin).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	clock = clock.Add(time.Minute)
+	c := fetchRetirementCheck(t, router, token)
+	if c.Severity != "warn" {
+		t.Fatalf("severity = %q (%s), want warn for the blocked worker", c.Severity, c.Summary)
+	}
+	want := map[string]string{
+		short("ret-1"): retirementConditionalText + "; class policy Delete",
+		short("ret-2"): "blocked by no_receipt (runner_ref:refs/uzi-runner/agent/issue-3 run " + run.String() + "); class policy Delete, actual PV unverified",
+		short("ret-3"): "cancelled: wake requested",
+	}
+	got := map[string]string{}
+	for _, e := range c.Evidence {
+		got[e.Label] = e.Value
+	}
+	if len(got) != len(want) {
+		t.Fatalf("evidence = %+v, want exactly %d rows", c.Evidence, len(want))
+	}
+	for label, value := range want {
+		if got[label] != value {
+			t.Fatalf("evidence %s = %q, want %q", label, got[label], value)
+		}
+	}
+}

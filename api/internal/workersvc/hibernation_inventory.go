@@ -133,7 +133,11 @@ func (s *Service) inventoryTransition(ctx context.Context, q *store.Queries, w s
 		fence = pgtype.Int8{Int64: *t.FenceGeneration, Valid: true}
 	}
 	resend := inv.FenceGeneration.Valid
-	var changed, unprovenFence bool
+	// A replacement Deployment can reach the same generation and zero replicas, so the generation
+	// fence alone cannot tell it from the one the inventory was observed on: the Deployment UID
+	// (always present on the wire, see validateHibernationTransition) must equal the observed one.
+	changed := t.DeploymentUID != inv.DeploymentUid
+	var unprovenFence bool
 	switch t.Transition {
 	case TransitionScalingDown:
 		if fence.Valid {
@@ -150,7 +154,7 @@ func (s *Service) inventoryTransition(ctx context.Context, q *store.Queries, w s
 	default:
 		unprovenFence = !fence.Valid || !inv.ScalingDownPodUid.Valid
 		if fence.Valid {
-			changed = t.DeploymentGeneration == nil || *t.DeploymentGeneration != fence.Int64
+			changed = changed || t.DeploymentGeneration == nil || *t.DeploymentGeneration != fence.Int64
 		}
 		changed = changed || t.DeploymentReplicas == nil || *t.DeploymentReplicas != 0
 	}

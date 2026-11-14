@@ -39,10 +39,21 @@ func blockedVerdict(id uuid.UUID, code, source string) workersvc.RetirementVerdi
 		Blockers: []workersvc.RetirementBlocker{{Code: code, Source: source}}, BlockerCount: 1}
 }
 
+// withPolicies attaches the class reclaim policy claims the way the evaluator flags them.
+func withPolicies(v workersvc.RetirementVerdict, policies ...workersvc.ClaimReclaimPolicy) workersvc.RetirementVerdict {
+	v.ClassPolicies = policies
+	for _, p := range policies {
+		v.Retain = v.Retain || p.Policy == "Retain"
+		v.Unknown = v.Unknown || p.Policy == "unknown"
+	}
+	return v
+}
+
 func TestHibernationRetirementCheck(t *testing.T) {
 	a, b, c := uuid.New(), uuid.New(), uuid.New()
 	del := workersvc.ClaimReclaimPolicy{Role: "data", Policy: "Delete"}
 	retain := workersvc.ClaimReclaimPolicy{Role: "dind_data", Policy: "Retain"}
+	unknownPolicy := workersvc.ClaimReclaimPolicy{Role: "data", Policy: "unknown"}
 	notYet := workersvc.RetirementVerdict{WorkerID: b, Outcome: workersvc.RetirementNotYetEligible, Remaining: 3*24*time.Hour + 5*time.Hour,
 		Blockers: []workersvc.RetirementBlocker{{Code: "no_receipt", Source: "run-x"}}, BlockerCount: 1}
 	tests := []struct {
@@ -65,6 +76,14 @@ func TestHibernationRetirementCheck(t *testing.T) {
 			map[string]string{c.String()[:8]: "blocked by no_receipt (run-1)"}},
 		{"a not yet eligible blocked worker does not warn", workersvc.RetirementReport{Total: 1, Evaluated: 1, Verdicts: []workersvc.RetirementVerdict{notYet}}, nil, sevOK, nil,
 			map[string]string{b.String()[:8]: "not yet eligible: 3d5h left; blocked by no_receipt (run-x)"}},
+		{"blocked row carries the class policy proxy unverified", workersvc.RetirementReport{Total: 1, Evaluated: 1, Verdicts: []workersvc.RetirementVerdict{withPolicies(blockedVerdict(c, "no_receipt", "run-1"), del)}}, nil, sevWarn, nil,
+			map[string]string{c.String()[:8]: "blocked by no_receipt (run-1); class policy Delete, actual PV unverified"}},
+		{"blocked row flags Retain", workersvc.RetirementReport{Total: 1, Evaluated: 1, Verdicts: []workersvc.RetirementVerdict{withPolicies(blockedVerdict(c, "no_receipt", "run-1"), retain)}}, nil, sevWarn, nil,
+			map[string]string{c.String()[:8]: "blocked by no_receipt (run-1); class policy Retain (flagged), actual PV unverified"}},
+		{"blocked row flags an unknown policy", workersvc.RetirementReport{Total: 1, Evaluated: 1, Verdicts: []workersvc.RetirementVerdict{withPolicies(blockedVerdict(c, "no_receipt", "run-1"), unknownPolicy)}}, nil, sevWarn, nil,
+			map[string]string{c.String()[:8]: "blocked by no_receipt (run-1); class policy unknown (flagged), actual PV unverified"}},
+		{"not yet eligible row carries the class policy proxy unverified", workersvc.RetirementReport{Total: 1, Evaluated: 1, Verdicts: []workersvc.RetirementVerdict{withPolicies(notYet, del)}}, nil, sevOK, nil,
+			map[string]string{b.String()[:8]: "not yet eligible: 3d5h left; blocked by no_receipt (run-x); class policy Delete, actual PV unverified"}},
 		{"cancelled", workersvc.RetirementReport{Total: 1, Evaluated: 1, Verdicts: []workersvc.RetirementVerdict{{WorkerID: a, Outcome: workersvc.RetirementCancelled}}}, nil, sevOK, nil,
 			map[string]string{a.String()[:8]: "cancelled: wake requested"}},
 		{"warn when more workers exist than are evaluated", workersvc.RetirementReport{Total: 51, Evaluated: 50, Verdicts: []workersvc.RetirementVerdict{conditionalVerdict(a, del)}}, nil, sevWarn,

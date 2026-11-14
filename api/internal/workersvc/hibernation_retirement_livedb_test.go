@@ -293,17 +293,17 @@ func TestHibernationRetirementGuardsLiveDB(t *testing.T) {
 		{name: "needs_receipt without a capture", code: BlockerNoReceipt, opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
 			return receiptEntry("runner_ref", "refs/uzi-runner/agent/issue-3", f.run(), retTipA, "ref")
 		})}},
-		{name: "needs_receipt with an expired capture", code: BlockerNoReceipt, opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
+		{name: "needs_receipt with an expired capture", code: BlockerNoReceipt, source: "runner_ref:refs/uzi-runner/agent/issue-4 run ", opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
 			r := f.run()
 			f.capture(r, retTipA, "available", "-1 hour", true)
 			return receiptEntry("runner_ref", "refs/uzi-runner/agent/issue-4", r, retTipA, "ref")
 		})}},
-		{name: "needs_receipt with a capture of another tip", code: BlockerNoReceipt, opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
+		{name: "needs_receipt with a capture of another tip", code: BlockerNoReceipt, source: "runner_ref:refs/uzi-runner/agent/issue-5 run ", opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
 			r := f.run()
 			f.capture(r, retTipB, "available", "1 hour", true)
 			return receiptEntry("runner_ref", "refs/uzi-runner/agent/issue-5", r, retTipA, "ref")
 		})}},
-		{name: "terminal run and released hold but no receipt", code: BlockerNoReceipt, opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
+		{name: "terminal run and released hold but no receipt", code: BlockerNoReceipt, source: "runner_ref:refs/uzi-runner/agent/issue-6 run ", opts: []func(*retOpts){entries(func(f *retFx) InventoryEntry {
 			r := f.run()
 			f.env.exec(`INSERT INTO recovery_custody_holds (id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity)
 			            VALUES ($1,$2,$3,$4,1,'released',$5,'fixture')`, uuid.New(), f.user, f.repo, r, uuid.New())
