@@ -69,6 +69,31 @@ func TestRunCreateStartChoiceUsageErrorsSendNothing(t *testing.T) {
 	}
 }
 
+// TestRunCreateStartChoiceUsageErrorPrecedesTokenLookup: a --token label is resolved with a
+// ListSecrets request, so an invalid --model/--effort must be refused before that lookup:
+// zero requests reach the server.
+func TestRunCreateStartChoiceUsageErrorPrecedesTokenLookup(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"unexpected request"}`))
+	}))
+	defer srv.Close()
+	for _, bad := range [][]string{{"--effort", "ultra"}, {"--model", "a b"}} {
+		requests = 0
+		args := append([]string{"run", "create", "--repo", "p1", "--issue", "42", "--token", "my-token"}, bad...)
+		_, errb, code := runCLI(t, httpEnv(srv), args...)
+		if code != uzicli.ExitUsage {
+			t.Errorf("%q: exit = %d, want %d (usage); stderr %q", bad, code, uzicli.ExitUsage, errb)
+		}
+		if requests != 0 {
+			t.Errorf("%q: %d request(s) sent before the usage error", bad, requests)
+		}
+	}
+}
+
 // TestRunCreateStartChoiceWireBody pins the HTTP body: the keys ride only when passed and the
 // values are not trimmed or altered; a usage error makes zero requests; a 422 prints the
 // server's error text.

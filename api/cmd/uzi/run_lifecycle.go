@@ -34,19 +34,21 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			c, err := env.client(gf)
-			if err != nil {
-				return err
-			}
-			credOverride, err := credentialOverrideFlag(cmd, c)
-			if err != nil {
-				return err
-			}
+			// The pure flag checks run before the client and the --token label lookup
+			// (a ListSecrets request), so their usage errors precede any request.
 			harness, err := runHarnessFlag(cmd)
 			if err != nil {
 				return err
 			}
 			model, effort, err := runStartChoiceFlags(cmd)
+			if err != nil {
+				return err
+			}
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			credOverride, err := credentialOverrideFlag(cmd, c)
 			if err != nil {
 				return err
 			}
