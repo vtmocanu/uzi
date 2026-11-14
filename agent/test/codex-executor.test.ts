@@ -31147,3 +31147,164 @@ it("suspended A denies expired inspection and reopening without closing the old 
   });
   await assert.rejects(exec.run(ctx), error => error === heldStop);
 });
+
+describe("CodexExecutor: replacement B boundary", () => {
+  for (const oldClaim of [SUBSCRIPTION, API_KEY]) {
+    for (const outcome of ["resume", "refuse-fresh", "refuse-preserve", "partial-init", "invalid-metadata"] as const) {
+      it(`${oldClaim.auth_mode} to B: ${outcome}`, async () => {
+        const binding = bindingOf({ ...(oldClaim.auth_mode === "subscription" ? API_KEY : SUBSCRIPTION),
+          capability: "B-capability", access_token: "B-token",
+          ...(oldClaim.auth_mode === "api_key" ? { generation: 20, chatgpt_account_id: "B-account" } : {}) });
+        const events: string[] = [];
+        const savedId = "12345678-1234-1234-1234-123456789abc";
+        const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/replacement-B-"));
+        const source = path.join(dir, "source"), store = path.join(dir, "store");
+        await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+        await fs.writeFile(path.join(source, "sessions", `rollout-${savedId}.jsonl`), "{}\n");
+        await fs.writeFile(path.join(source, "auth.json"), "A-auth-canary");
+        await fs.writeFile(path.join(source, "unapproved.txt"), "not a session");
+        await CodexSessionStore.persist(source, store);
+        const adoptedHomes: string[] = [];
+        const plan = epochResponder(savedId, "tn-plan", (t, th, tn) =>
+          t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
+            .push(turnCompleted("completed", th, tn)));
+        const rig = makeMultiEpochRig([plan, epochResponder(savedId, "tn-B", () => {})]);
+        const a = rig.epochs[0]!, b = rig.epochs[1]!;
+        const reap = a.root.reap;
+        a.root.reap = async ms => { const result = await reap(ms); events.push("A-reaped"); return result; };
+        rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!,
+          inspect: async () => "present",
+          inspectSession: async (_dir, id) => CodexSessionStore.inspectSession(store, id),
+          persist: async () => CodexSessionStore.persist(source, store),
+          adopt: async (_dir, home) => {
+            // The injected provider owns synthetic homes. Map each to an isolated real
+            // destination to exercise the production store's allowlist at the launch seam.
+            const dest = path.join(dir, `adopted-${adoptedHomes.length}`);
+            adoptedHomes.push(home);
+            await fs.mkdir(dest);
+            const result = await CodexSessionStore.adopt(store, dest);
+            assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
+            await assert.rejects(fs.access(path.join(dest, "auth.json")));
+            await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
+            return result;
+          },
+        } };
+        const release = rig.client.releaseCodex.bind(rig.client);
+        let bReleases = 0;
+        rig.client.releaseCodex = async (run, req) => {
+          if (req.capability === binding.capability) {
+            assert.ok(events.includes("A-reaped"), "B release follows A reap"); bReleases++;
+            return { access_token: "B-released-token" };
+          }
+          return release(run, req);
+        };
+        const refresh = rig.client.refreshCodex.bind(rig.client);
+        const observedB: number[] = [];
+        rig.client.refreshCodex = async (run, req) => {
+          if (req.capability === binding.capability) {
+            assert.ok(events.includes("A-reaped"), "B refresh follows A reap");
+            observedB.push(req.observed_generation);
+            return { access_token: "B-refreshed-token", generation: 21 + observedB.length,
+              chatgpt_account_id: "B-account", outcome: "advanced" };
+          }
+          return refresh(run, req);
+        };
+        const request = b.transport.request.bind(b.transport);
+        b.transport.request = async (method, params, opts) => {
+          events.push(method);
+          if (method === "account/login/start") {
+            assert.ok(events.includes("A-reaped"));
+            assert.equal(rec(params).type, binding.authMode === "api_key" ? "apiKey" : "chatgptAuthTokens");
+            assert.equal(rec(params)[binding.authMode === "api_key" ? "apiKey" : "accessToken"], "B-released-token");
+            if (binding.authMode === "subscription") assert.equal(rec(params).chatgptAccountId, "B-account");
+          }
+          if (method === "thread/resume") {
+            assert.equal(rec(params).threadId, savedId);
+            if (outcome === "partial-init") return { thread: {} } as never;
+            if (outcome.startsWith("refuse")) throw new CodexTransportError({
+              category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)",
+            });
+          }
+          return request(method, params, opts);
+        };
+        const exec = makeExecutor(rig, bindingOf(oldClaim));
+        const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+        const stop = new Error("B held proof complete");
+        const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined, sessionId: savedId,
+          preserveConversation: outcome === "refuse-preserve",
+          gatePlan: async () => {
+            const lease = await exec.suspendCodexEpoch(bounds);
+            assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+            assert.deepEqual(await lease.persistRollout(bounds), { kind: "usable", sessionId: savedId });
+            assert.equal(await lease.teardown(bounds), true);
+            await assert.rejects(lease.reopenA(bounds), /retired/);
+            await assert.rejects(lease.reconcileA(bounds, 1000), /retired/);
+            const bundle = { binding, capabilityEpoch: 41, ordinal: 1, messageSeq: 7 };
+            await assert.rejects(lease.finishB(bounds), /admission refused/);
+            if (outcome === "invalid-metadata") {
+              for (const invalid of [{ ...bundle, ordinal: 41 }, { ...bundle, capabilityEpoch: 0 }])
+                await assert.rejects(lease.publishB(invalid, bounds), /metadata invalid/);
+              assert.equal(rig.providerLaunches(), 1);
+              await assert.rejects(lease.restartAndResume(savedId, bounds), /preparation refused/);
+              assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+              throw stop;
+            }
+            await lease.publishB(bundle, bounds);
+            await assert.rejects(lease.publishB(bundle, bounds), /publication refused/);
+            await assert.rejects(exec.suspendCodexEpoch(bounds), /settled live boundary/);
+            await assert.rejects(lease.restartAndResume("wrong-thread", bounds), /preparation refused/);
+            if (outcome === "partial-init") {
+              await assert.rejects(lease.restartAndResume(savedId, bounds), /returned no thread id/);
+              await assert.rejects(lease.finishB(bounds), /admission refused/);
+              assert.equal(b.transport.turnStartCount, 0);
+              assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+              throw stop;
+            }
+            assert.deepEqual(await lease.restartAndResume(savedId, bounds),
+              { kind: outcome === "resume" ? "resumed" : "confirmed_resume_refusal" });
+            assert.notEqual(rig.launchRoots[0], rig.launchRoots[1], "B has fresh CODEX_HOME root");
+            assert.equal(adoptedHomes.length, 2);
+            assert.notEqual(adoptedHomes[0], adoptedHomes[1], "distinct adoption homes");
+            assert.notEqual(a.transport, b.transport);
+            assert.equal(b.transport.turnStartCount, 0, "preparation sends no model turn");
+            assert.ok(events.indexOf("account/login/start") < events.indexOf("thread/resume"));
+            await assert.rejects(lease.reconcileA(bounds, 1000), /retired/);
+            await assert.rejects(lease.reopenA(bounds), /retired/);
+            if (outcome !== "resume") {
+              await assert.rejects(lease.finishB(bounds), /admission refused/);
+              assert.equal(b.transport.threadStartCount, 0, "refusal requires explicit fallback");
+              if (outcome === "refuse-preserve") {
+                await assert.rejects(lease.startFreshLineage(bounds), /provider_resume_rejected/);
+                assert.equal(b.transport.threadStartCount, 0);
+                assert.equal(b.transport.turnStartCount, 0);
+                throw stop;
+              }
+              await lease.startFreshLineage(bounds);
+              assert.equal(b.transport.threadStartCount, 1);
+              assert.ok(emitted.some(m => m.payload.event === "resume_lineage_break"));
+            }
+            assert.equal(b.transport.turnStartCount, 0, "fresh fallback also stays gated");
+            await lease.finishB(bounds);
+            const next = await exec.suspendCodexEpoch(bounds);
+            const oldRequests = a.transport.requests.length;
+            const releases = bReleases, refreshes = observedB.length;
+            assert.deepEqual(await next.reconcileA(bounds, 1000), { kind: "ready" });
+            assert.equal(a.transport.requests.length, oldRequests);
+            if (binding.authMode === "subscription") {
+              assert.equal(observedB.length, refreshes + 1);
+              assert.equal(observedB[0], 20, "B starts with its own generation");
+              for (let i = 1; i < observedB.length; i++)
+                assert.equal(observedB[i], 21 + i, "B reconciliation retains the committed generation");
+            } else assert.equal(bReleases, releases + 1);
+            await assert.rejects(lease.reconcileA(bounds, 1000), /retired/);
+            await assert.rejects(lease.publishB(bundle, bounds), /publication refused/);
+            assert.equal(b.transport.turnStartCount, 0);
+            throw stop;
+          },
+        });
+        try { await assert.rejects(exec.run(ctx), error => error === stop); }
+        finally { await fs.rm(dir, { recursive: true, force: true }); }
+      });
+    }
+  }
+});

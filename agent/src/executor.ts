@@ -1063,7 +1063,7 @@ export type UsableSavedRollout = { kind: "usable"; sessionId: string } | { kind:
 /**
  * Executor-owned A half of a credential switch. Runner must already hold model
  * execution at a settled boundary and confirm the operation before reopenA.
- * This does not include Runner's external drains or any replacement publication.
+ * Runner owns external drains, server fences and atomic batcher/claim publication.
  */
 export interface CodexSuspendedEpoch {
   /** Complete captured A's installer/credential boundary before read-only preflight.
@@ -1073,6 +1073,10 @@ export interface CodexSuspendedEpoch {
   persistRollout(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<UsableSavedRollout>;
   reopenA(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<void>;
   teardown(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<boolean>;
+  publishB(bundle: Readonly<import("./codex-switch-coordinator.js").CodexSwitchBundle>, bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<void>;
+  restartAndResume(sessionId: string, bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<import("./codex-switch-coordinator.js").CodexRestartResult>;
+  startFreshLineage(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<void>;
+  finishB(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<void>;
 }
 
 /**
