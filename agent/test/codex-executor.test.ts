@@ -33,6 +33,8 @@ const NEEDS_PROCFS = !HAS_PROCFS ? "needs Linux procfs (/proc/self/fd in src/cod
 
 import {
   CodexExecutor,
+  createCodexEpochAuthority,
+  createRunLaneInstallerReconcile,
   makeProductionLaunchAdviceRoot,
   FailClosedExecutor,
   CodexAdviceCredentialBridge,
@@ -25116,8 +25118,8 @@ describe("2833 Codex inline summaries", () => {
     });
   }
 
-  it("2833 forwards original subscription claim identity to intent and plan summaries", async () => {
-    const rawCodex = { ...SUBSCRIPTION, claim_metadata: "original subscription claim" };
+  it("M2 derives intent and plan credentials from captured authority despite competing raw claim", async () => {
+    const rawCodex = { ...API_KEY, claim_metadata: "competing raw claim" };
     const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
       t.push(toolCall(98, "submit_plan", { plan_md: "Raw claim plan" }, th, tn, "plan"))
         .push(turnCompleted("completed", th, tn)));
@@ -25139,46 +25141,57 @@ describe("2833 Codex inline summaries", () => {
       summaryRunner, summaryClaimCodex: rawCodex,
     }).run(ctx);
     assert.equal(inputs.length, 2);
-    for (const input of inputs) assert.equal(input.claim?.secrets.codex, rawCodex);
+    for (const input of inputs) {
+      assert.deepEqual(input.claim?.secrets.codex, SUBSCRIPTION);
+      assert.ok(Object.isFrozen(input.claim?.secrets.codex));
+    }
     assert.equal((inputs[1] as PlanSummaryInput).planMd, "Raw claim plan");
   });
 
-  for (const rawCodex of [null, { ...SUBSCRIPTION, chatgpt_plan_type: "unsupported" }]) {
-    it(`2833 present malformed raw claim ${JSON.stringify(rawCodex)} fails closed with valid executor binding`, async () => {
-      const { rig, intents, plans } = summaryRig();
-      let adviceCalls = 0;
-      let fallbackCalls = 0;
-      const runner = new SummaryRunner(noopLog, {
-        homeRoot: path.resolve("../.uzi/scratch"), modelTimeoutMs: 1000,
-        queryFn: (() => { fallbackCalls++; throw new Error("unexpected Claude fallback"); }) as
-          import("../src/sdk-executor.js").SdkQueryFn,
-        codexAdviceHarnessFactory: (async () => { adviceCalls++; throw new Error("unexpected advice"); }) as
-          import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory,
-      });
-      const results: unknown[] = [];
-      const summaryRunner = {
-        generateIntentSummary: async (input: IntentSummaryInput) => {
-          const intent = await runner.generateIntentSummary(input);
-          results.push(intent);
-          results.push(await runner.generatePlanSummary({ ...input, planMd: "Plan." }));
-          return intent;
-        },
-        generatePlanSummary: runner.generatePlanSummary.bind(runner),
-      };
-      const { ctx } = makeCtx({ reportIteration: async () => {
-        await waitForSummary(() => results.length === 2, "fail-closed summary passes");
-      } });
-      const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, {
-        summaryRunner, summaryClaimCodex: rawCodex,
-      }).run(ctx);
-      assert.equal(result.branch, ctx.branch);
-      assert.deepEqual(results, [null, null]);
-      assert.equal(adviceCalls, 0);
-      assert.equal(fallbackCalls, 0);
-      assert.deepEqual(intents, []);
-      assert.deepEqual(plans, []);
+  it("M2 installer reconcile keeps each explicit authority and fences old closures", async () => {
+    const first = createCodexEpochAuthority(bindingOf(API_KEY));
+    const second = createCodexEpochAuthority(bindingOf({ ...API_KEY, capability: "second-capability" }));
+    const seen: string[] = [];
+    const client = {
+      refreshCodex: async () => { throw new Error("API-key reconcile must not refresh"); },
+      releaseCodex: async (_run: string, request: { capability: string }) => {
+        seen.push(request.capability);
+        return { auth_mode: "api_key" as const, access_token: "released-key" };
+      },
+    };
+    const credentials = (authority: typeof first) => ({
+      runId: "run", client, binding: authority.binding,
+      committed: authority.committedGeneration, assertCurrent: authority.assertCurrent,
+      registerToken: () => {},
     });
-  }
+    const installer = createRunLaneInstallerReconcile(new AbortController().signal, credentials(first));
+    const next = installer.forCredentials(credentials(second));
+    const signal = new AbortController().signal;
+    assert.equal((await next(RECONCILE_REQ, signal)).kind, "ready");
+    assert.equal((await installer.reconcile(RECONCILE_REQ, signal)).kind, "ready");
+    assert.deepEqual(seen, [second.binding.capability, first.binding.capability]);
+    first.retire();
+    await assert.rejects(installer.reconcile(RECONCILE_REQ, signal), /credential authority retired/);
+    assert.equal((await next(RECONCILE_REQ, signal)).kind, "ready");
+    assert.deepEqual(seen, [second.binding.capability, first.binding.capability, second.binding.capability]);
+  });
+
+  it("M2 authority freezes explicit identity, isolates generation cells and fences retirement", () => {
+    const first = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
+    const second = createCodexEpochAuthority(bindingOf(API_KEY));
+    assert.deepEqual(first.claim, SUBSCRIPTION);
+    assert.deepEqual(second.claim, API_KEY);
+    assert.ok(Object.isFrozen(first));
+    assert.ok(Object.isFrozen(first.binding));
+    assert.ok(Object.isFrozen(first.claim));
+    first.committedGeneration.value = 99;
+    assert.equal(second.committedGeneration.value, undefined);
+    first.retire();
+    assert.equal(first.isCurrent(), false);
+    assert.throws(first.assertCurrent, /credential authority retired/);
+    second.assertCurrent();
+    assert.deepEqual(first.claim, SUBSCRIPTION);
+  });
 
   for (const raw of [SUBSCRIPTION, API_KEY]) {
     it(`2833 ${raw.auth_mode} real SummaryRunner reaches advice factory with fixed pins`, async () => {

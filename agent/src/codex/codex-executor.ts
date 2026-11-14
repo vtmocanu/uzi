@@ -145,7 +145,7 @@ import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimCodexSecrets, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
 import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -929,15 +929,12 @@ export function createRunLaneInstallerReconcile(
     registerToken: (token: string) => void;
     committed?: CodexCommittedGenerationCell;
     isVaultLocked?: () => boolean;
+    assertCurrent?: () => void;
   },
   timeoutNow?: () => number,
   abort = new AbortController(),
   verifyOwnedInstallerProof: () => boolean = () => true,
 ) {
-  const credentialReconcile = buildRunLaneReconcile(
-    credentials.runId, credentials.client, credentials.binding, credentials.registerToken,
-    credentials.committed, credentials.isVaultLocked, lifecycleSignal,
-  );
   const state: {
     abort: AbortController;
     cancellation: AbortSignal;
@@ -969,37 +966,51 @@ export function createRunLaneInstallerReconcile(
       if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
   };
-  const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
-    const now = request.checkpointStop?.now ?? Date.now;
-    const cause = request.gracefulShutdownCheckpoint;
-    const deadlineAt = Math.min(now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
-    const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
-    const cancellation = AbortSignal.any([signal, authoritySignal,
-      ...[request.checkpointStop?.signal].filter((s): s is AbortSignal => s !== undefined),
-      ...[cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
-    const refused = (): ReconcileOutcome => ({ kind: "blocked", errors: [{
-      category: cause ? (authoritySignal.aborted ? "authorization" : "timeout") : "protocol",
-      message: cause && authoritySignal.aborted ? "codex dependency install reconcile refused: lifecycle cancelled"
-        : "codex dependency install did not settle before reconcile",
-    }] });
-    const remaining = () => Math.max(0, Math.min(deadlineAt - now(),
-      cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity));
-    if (cause && cancellation.aborted) return refused();
-    if (!await settle(deadlineAt, cancellation, remaining)) {
-      if (request.checkpointStop?.signal.aborted && !signal.aborted && remaining() > 0) {
-        // Cleanup ignores cooperative/lifecycle cancellation only; it grants no
-        // credential authority. The original hard deadline still bounds the join.
-        const cleanupSignal = AbortSignal.any([signal,
-          ...[cause?.stopSignal, cause ? MaintenanceBudget.signal() : undefined]
-            .filter((s): s is AbortSignal => s !== undefined)]);
-        if (!await settle(deadlineAt, cleanupSignal, remaining)) return refused();
-        return credentialReconcile({ ...request, deadlineMs: remaining() }, signal);
+  const forCredentials = (input: typeof credentials): ReconcileBeforeBoundary => {
+    const captured = Object.freeze({ ...input });
+    const capturedReconcile = buildRunLaneReconcile(
+      captured.runId, captured.client, captured.binding, captured.registerToken,
+      captured.committed, captured.isVaultLocked, lifecycleSignal,
+    );
+    const credentialReconcile: ReconcileBeforeBoundary = async (request, signal) => {
+      captured.assertCurrent?.();
+      const result = await capturedReconcile(request, signal);
+      captured.assertCurrent?.();
+      return result;
+    };
+    const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
+      const now = request.checkpointStop?.now ?? Date.now;
+      const cause = request.gracefulShutdownCheckpoint;
+      const deadlineAt = Math.min(now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
+      const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
+      const cancellation = AbortSignal.any([signal, authoritySignal,
+        ...[request.checkpointStop?.signal].filter((s): s is AbortSignal => s !== undefined),
+        ...[cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
+      const refused = (): ReconcileOutcome => ({ kind: "blocked", errors: [{
+        category: cause ? (authoritySignal.aborted ? "authorization" : "timeout") : "protocol",
+        message: cause && authoritySignal.aborted ? "codex dependency install reconcile refused: lifecycle cancelled"
+          : "codex dependency install did not settle before reconcile",
+      }] });
+      const remaining = () => Math.max(0, Math.min(deadlineAt - now(),
+        cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity));
+      if (cause && cancellation.aborted) return refused();
+      if (!await settle(deadlineAt, cancellation, remaining)) {
+        if (request.checkpointStop?.signal.aborted && !signal.aborted && remaining() > 0) {
+          // Cleanup ignores cooperative/lifecycle cancellation only; it grants no
+          // credential authority. The original hard deadline still bounds the join.
+          const cleanupSignal = AbortSignal.any([signal,
+            ...[cause?.stopSignal, cause ? MaintenanceBudget.signal() : undefined]
+              .filter((s): s is AbortSignal => s !== undefined)]);
+          if (!await settle(deadlineAt, cleanupSignal, remaining)) return refused();
+          return credentialReconcile({ ...request, deadlineMs: remaining() }, signal);
+        }
+        return refused();
       }
-      return refused();
-    }
-    return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - now()) }, signal);
+      return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - now()) }, signal);
+    };
+    return reconcile;
   };
-  return Object.assign(state, { settle, reconcile });
+  return Object.assign(state, { settle, reconcile: forCredentials(credentials), forCredentials });
 }
 
 /**
@@ -1987,7 +1998,7 @@ export interface CodexExecutorOptions {
   /** Abort join bound, default 3000 ms; capture additionally caps it to its remaining deadline. */
   readonly summarySettleMs?: number;
   readonly codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
-  /** Original summary claim block, validated by SummaryRunner; undefined uses the standalone binding. */
+  /** Legacy construction input; credentials are always derived from the captured binding. */
   readonly summaryClaimCodex?: unknown;
   readonly binding: CodexBinding;
   readonly client: WorkerClient;
@@ -2036,6 +2047,32 @@ export interface CodexExecutorOptions {
 }
 
 // ─── The per-epoch provider bundle + shared executor-claim context (m4) ─────────
+/** Credential identity is fixed across provider-root recreations, never rebound in place. */
+export function createCodexEpochAuthority(input: CodexBinding) {
+  const binding = Object.freeze({ ...input });
+  const claim: Readonly<ClaimCodexSecrets> = Object.freeze({
+    auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
+    ...(binding.authMode === "subscription" ? {
+      generation: binding.generation, chatgpt_account_id: binding.chatgptAccountId,
+      chatgpt_plan_type: null,
+    } : {}),
+  } as ClaimCodexSecrets);
+  const committedGeneration: CodexCommittedGenerationCell = {
+    value: binding.authMode === "subscription" ? binding.generation : undefined,
+  };
+  let retired = false;
+  return Object.freeze({
+    binding, claim, committedGeneration,
+    isCurrent: (): boolean => !retired,
+    assertCurrent: (): void => {
+      if (retired) throw new TrustedExecutionRefusal("codex credential authority retired");
+    },
+    retire: (): void => { retired = true; },
+  });
+}
+
+type CodexEpochAuthority = ReturnType<typeof createCodexEpochAuthority>;
+
 /**
  * PRD #1171 m4: state shared by every provider epoch inside ONE executor claim leg. Closed over
  * once in `run()` and passed to every {@link CodexExecutor.startProviderEpoch} so a recreated epoch reuses
@@ -2045,9 +2082,9 @@ export interface CodexExecutorOptions {
  * an owned HOME are minted anew per epoch.
  */
 interface EpochSharedContext {
+  readonly authority: CodexEpochAuthority;
   readonly repoInstructions?: string;
   readonly provider: CodexProviderConfig;
-  readonly binding: CodexBinding;
   readonly worktreePath: string;
   readonly storeDir: string;
   readonly homeRoot: string;
@@ -2065,7 +2102,6 @@ interface EpochSharedContext {
    *  redactor never sees these) AND of the claim secrets (`ctx.redactText`), so neither can leave
    *  an unredacted prefix straddling the bound's cut. */
   readonly scrubProjected: (s: string) => string;
-  readonly committedGeneration: CodexCommittedGenerationCell;
   /** Issue #1789: the run-scoped vault-lock latch the run-lane refresh bridge reports into. */
   readonly vaultLock: CodexVaultLockState;
   readonly launchEffectRoot: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>;
@@ -2989,7 +3025,8 @@ export class CodexExecutor implements Executor {
     this.assertCaptureAdmission();
     if (this.runActive) throw new TrustedExecutionRefusal("codex run already active");
     this.runActive = true;
-    const operation = this.opts.binding.authMode === "subscription" && !ctx.prepareCodexRootDispatch
+    const authority = createCodexEpochAuthority(this.opts.binding);
+    const operation = authority.binding.authMode === "subscription" && !ctx.prepareCodexRootDispatch
       ? acquireCodexOperationScope(this.opts.client, ctx.runId, ctx.claimGeneration ?? 0, {}, undefined, undefined, this.log) : undefined;
     operation?.own();
     if (operation) ctx = { ...ctx,
@@ -2997,11 +3034,11 @@ export class CodexExecutor implements Executor {
       prepareCodexRootDispatch: (signal, check, kind = "root") => operation.prepare(kind,
         AbortSignal.any([signal, ...[ctx.terminalLifecycleSignal].filter((s): s is AbortSignal => !!s)]), check),
     };
-    try { return await this.runLeg(ctx); }
+    try { return await this.runLeg(ctx, authority); }
     finally { operation?.close(); this.runActive = false; }
   }
 
-  private async runLeg(ctx: RunContext): Promise<ExecutorResult> {
+  private async runLeg(ctx: RunContext, authority: CodexEpochAuthority): Promise<ExecutorResult> {
     this.assertCaptureAdmission();
     this.executionStarted = true;
     const setupRevision = this.captureRevision;
@@ -3020,7 +3057,7 @@ export class CodexExecutor implements Executor {
     this.deferredFinal = undefined;
     // Everything that needs the worktree is built at the TOP of run() (the executor is
     // constructed before the claim's worktree exists).
-    const binding = this.opts.binding;
+    const { binding, committedGeneration } = authority;
     // The packaged-only loopback seam must override both halves of the app-server
     // provider selection. config.toml names the custom HTTP provider in launcher.ts,
     // while thread/start carries this object and would otherwise override it back to
@@ -3093,13 +3130,6 @@ export class CodexExecutor implements Executor {
       if (!token || releasedTokens.has(token)) return;
       this.log.addSecret(token);
       releasedTokens.add(token);
-    };
-    // (m1) The run's ONE shared committed observed-generation cell, SHARED across every epoch: the
-    // app-server refresh bridge (during a turn) and the boundary reconcile (at a sink) of EVERY
-    // epoch read/write it, so a generation advanced under epoch N carries into epoch N+1. Neither
-    // keeps a private copy. Subscription seeds it from the binding; api_key never refreshes.
-    const committedGeneration: CodexCommittedGenerationCell = {
-      value: binding.authMode === "subscription" ? binding.generation : undefined,
     };
 
     // A SINGLE terminal try/finally spanning ALL provider epochs. `epoch` holds the CURRENT
@@ -3185,23 +3215,16 @@ export class CodexExecutor implements Executor {
       for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(lifecycleSignal.reason); }
     };
     lifecycleSignal.addEventListener("abort", intentAbort, { once: true });
-    const summaryResultAllowed = (): boolean => !lifecycleSignal.aborted
+    const summaryResultAllowed = (): boolean => authority.isCurrent() && !lifecycleSignal.aborted
       && !ctx.cancelRequested?.() && !ctx.claimFenced?.();
     const summaryAllowed = (): boolean => this.lifetime.isOpen() && !this.captureOwners && !summaryState.closed && !this.summaryLifecycleClosed
       && summaryResultAllowed();
-    const summaryBinding = {
-      auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
-      ...(binding.authMode === "subscription" ? {
-        generation: binding.generation, chatgpt_account_id: binding.chatgptAccountId,
-        chatgpt_plan_type: null,
-      } : {}),
-    };
     const summariesOn = isRunSummaryKind(ctx.kind);
     const prdInputP = summariesOn
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
     const summaryInputs = async () => ({
       claim: { run_id: ctx.runId, claim_generation: ctx.claimGeneration, secrets: {
-        codex: this.opts.summaryClaimCodex !== undefined ? this.opts.summaryClaimCodex : summaryBinding,
+        codex: authority.claim,
       } },
       token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
       issueBody: ctx.issueDescription, prdText: (await prdInputP)?.prdText,
@@ -3271,7 +3294,8 @@ export class CodexExecutor implements Executor {
     const installState = createRunLaneInstallerReconcile(
       lifecycleSignal,
       {
-        runId: ctx.runId, client: this.opts.client, binding: this.opts.binding, registerToken,
+        runId: ctx.runId, client: this.opts.client, binding, registerToken,
+        assertCurrent: authority.assertCurrent,
         committed: committedGeneration, isVaultLocked: () => pauseNow.vaultLock.latched,
       },
       this.deps.timeoutNow,
@@ -3736,7 +3760,7 @@ export class CodexExecutor implements Executor {
       const shared: EpochSharedContext = {
         repoInstructions,
         provider,
-        binding,
+        authority,
         vaultLock: pauseNow.vaultLock,
         settleDepsInstall: settleInstall,
         worktreePath,
@@ -3767,7 +3791,6 @@ export class CodexExecutor implements Executor {
         // Issue #1583: BOTH secret sets are scrubbed before a projection is bounded — the claim
         // secrets (ctx.redactText, the batcher's set) and the runtime-released Codex tokens.
         scrubProjected: (s: string): string => claimRedact(makeTextRedactor([...releasedTokens])(s)),
-        committedGeneration,
         launchEffectRoot,
         spawnBoundaryRoot,
         boundaryProcessSpawner,
@@ -5224,11 +5247,13 @@ export class CodexExecutor implements Executor {
       throw new TrustedExecutionRefusal("captured memory run identity mismatch");
     }
     const {
-      provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
-      commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
+      provider, authority, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
+      commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, launchEffectRoot,
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, onTerminalDispose, accountant, scrubProjected,
       commandCache, lifecycleSignal, selection, vaultLock, settleDepsInstall, repoInstructions,
     } = shared;
+    const { binding, committedGeneration } = authority;
+    authority.assertCurrent();
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
     // owner/group/mode/directory-type immediately before each credentialed provider root. The
@@ -5281,7 +5306,7 @@ export class CodexExecutor implements Executor {
       // login (the token flows over `account/login/start`, NEVER the launcher env).
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
-      const initialToken = await this.releaseInitialCredential(ctx, registerToken, committedGeneration, lifecycleSignal, revision);
+      const initialToken = await this.releaseInitialCredential(ctx, binding, registerToken, committedGeneration, lifecycleSignal, revision, authority.assertCurrent);
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
 
@@ -5292,13 +5317,15 @@ export class CodexExecutor implements Executor {
         ? {
             mode: "subscription",
             initial: { accessToken: initialToken, accountId: binding.chatgptAccountId },
-            assertRefreshAdmission: () => this.assertCaptureAdmission(revision),
+            assertRefreshAdmission: () => { authority.assertCurrent(); this.assertCaptureAdmission(revision); },
             bridge: this.lifetimeBoundRefreshBridge(buildAppServerRefreshBridge(ctx.runId, {
               refreshCodex: async (...args) => {
                 await this.settleOwnedSummariesBeforeCredentials();
                 this.assertCaptureAdmission(revision);
+                authority.assertCurrent();
                 const result = await this.lifetime.admit(() => this.opts.client.refreshCodex(...args));
                 this.assertCaptureAdmission(revision);
+                authority.assertCurrent();
                 return result;
               },
             }, binding, committedGeneration, registerToken, () => vaultLock.onVaultLocked())),
@@ -6417,12 +6444,13 @@ export class CodexExecutor implements Executor {
    */
   private async releaseInitialCredential(
     ctx: RunContext,
+    binding: CodexBinding,
     registerToken: (token: string) => void,
     committed: CodexCommittedGenerationCell,
     signal: AbortSignal,
     revision: number,
+    assertCurrent: () => void,
   ): Promise<string> {
-    const binding = this.opts.binding;
     const expected = binding.authMode === "subscription"
       ? {
           authMode: "subscription" as const,
@@ -6433,6 +6461,7 @@ export class CodexExecutor implements Executor {
     const attempts = Math.max(1, Math.floor(this.deps.initialCredentialAttempts ?? 6));
     const baseDelay = Math.max(0, this.deps.initialCredentialBaseDelayMs ?? 2000);
     const checkAbort = (): void => {
+      assertCurrent();
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
       if (signal.aborted) throw new CodexRequestFailure("parent_abort");
