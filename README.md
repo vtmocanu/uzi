@@ -7,6 +7,7 @@
   <a href="https://github.com/vtmocanu/uzi/actions/workflows/deadcode-nightly.yml"><img src="https://github.com/vtmocanu/uzi/actions/workflows/deadcode-nightly.yml/badge.svg?branch=main" alt="Nightly deadcode"></a>
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status: alpha">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome">
+  <a href="https://join.slack.com/t/uzi-dark-factory/shared_invite/zt-4eppr0sf5-LTvGru83gPhpVGwFgllt8w"><img src="https://img.shields.io/badge/Slack-join%20the%20community-4A154B?logo=slack&logoColor=white" alt="Join uzi on Slack"></a>
   <a href="https://github.com/vtmocanu/uzi/stargazers"><img src="https://img.shields.io/github/stars/vtmocanu/uzi" alt="GitHub stars"></a>
 </p>
 
