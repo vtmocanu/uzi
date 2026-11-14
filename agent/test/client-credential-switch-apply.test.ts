@@ -170,6 +170,8 @@ describe("credential switch signal op_id", () => {
     for (const [cs, want] of [
       [{ generation: 4, op_id: "op-9" }, { generation: 4, op_id: "op-9" }],
       [{ generation: 4 }, { generation: 4 }],
+      [{ generation: 4, op_id: "op", target_secret_id: "target" }, { generation: 4, op_id: "op", target_secret_id: "target" }],
+      [{ generation: 4, target_secret_id: 12 }, { generation: 4 }],
       [{ generation: 4, op_id: 12 }, { generation: 4 }],
     ] as const) {
       const s = await server(() => json(200, { inputs: [], credential_switch: cs }));
@@ -181,10 +183,10 @@ describe("credential switch signal op_id", () => {
   });
 
   it("parses op_id from the /state ack", async () => {
-    const s = await server(() => json(200, { run: { status: "running" }, credential_switch: { generation: 4, op_id: "op-9" } }));
+    const s = await server(() => json(200, { run: { status: "running" }, credential_switch: { generation: 4, op_id: "op-9", target_secret_id: "target" } }));
     try {
       const ack = await (await registered(s.url)).reportState("run-1", { status: "running", claim_generation: 4 });
-      assert.deepEqual(ack.credentialSwitch, { generation: 4, op_id: "op-9" });
+      assert.deepEqual(ack.credentialSwitch, { generation: 4, op_id: "op-9", target_secret_id: "target" });
     } finally { await s.close(); }
   });
 });
@@ -276,5 +278,113 @@ describe("credential switch state reports carry op_id", () => {
       await assert.rejects((await registered(s.url)).reportState("run-1", report("running", { op_id: "op-1" })), /op_id/);
       assert.equal(s.posts.length, 0);
     } finally { await s.close(); }
+  });
+});
+
+describe("Codex switch wire contract", () => {
+  const features = [...FEATURES, "codex_credential_switch_apply_v1"];
+  const registration = { worker_id: "w", register_nonce: "nonce-1", protocol_features: features };
+  const apiKey = { auth_mode: "api_key", access_token: SECRET, capability: "epoch.secret" };
+  const subscription = { ...apiKey, auth_mode: "subscription", generation: 0, chatgpt_account_id: "account", chatgpt_plan_type: null };
+  const applied = (codex: unknown) => ({ outcome: "applied", codex, capability_epoch: 9, ordinal: 3, message_seq: 42, replay: false });
+
+  for (const auth of [apiKey, subscription]) {
+    it(`decodes complete ${auth.auth_mode} auth and current epoch coordinates`, async () => {
+      const s = await server(() => json(200, applied(auth)), registration);
+      try {
+        const got = await (await registered(s.url)).applyCredentialSwitch("run-1", REQ);
+        assert.deepEqual(got, { kind: "codex_applied", codex: auth, capabilityEpoch: 9, ordinal: 3, messageSeq: 42, replay: false });
+        assert.equal(s.posts.length, 1);
+      } finally { await s.close(); }
+    });
+  }
+
+  it("rejects partial, mixed, invalid and unnegotiated auth without retaining secrets", async () => {
+    const invalid = [
+      applied({ ...apiKey, capability: "" }),
+      applied({ ...apiKey, access_token: " " }),
+      applied({ ...subscription, generation: -1 }),
+      applied({ ...subscription, chatgpt_account_id: "" }),
+      applied({ ...subscription, chatgpt_plan_type: "pro" }),
+      applied({ ...apiKey, generation: 0 }),
+      applied({ ...subscription, generation: undefined }),
+      { ...applied(apiKey), capability_epoch: 0 },
+      { ...applied(apiKey), ordinal: 0 },
+      { ...applied(apiKey), message_seq: 0 },
+      { ...applied(apiKey), replay: undefined },
+      { ...applied(apiKey), token: SECRET },
+    ];
+    for (const body of invalid) {
+      const s = await server(() => json(200, body), registration);
+      try {
+        const got = await (await registered(s.url)).applyCredentialSwitch("run-1", REQ);
+        assert.equal(got.kind, "uncertain");
+        assert.ok(!JSON.stringify(got).includes(SECRET));
+        assert.equal(s.posts.length, 1);
+      } finally { await s.close(); }
+    }
+    const s = await server(() => json(200, applied(apiKey)));
+    try { assert.equal((await (await registered(s.url)).applyCredentialSwitch("run-1", REQ)).kind, "uncertain"); }
+    finally { await s.close(); }
+  });
+
+  it("classifies a truncated auth response as uncertain and does not retry", async () => {
+    const s = await server(() => ({ status: 200, body: JSON.stringify(applied(subscription)).slice(0, -2) }), registration);
+    try {
+      const got = await (await registered(s.url)).applyCredentialSwitch("run-1", REQ);
+      assert.equal(got.kind, "uncertain");
+      assert.ok(!JSON.stringify(got).includes(SECRET));
+      assert.equal(s.posts.length, 1);
+    } finally { await s.close(); }
+  });
+
+  it("preflight sends explicit target and returns server current coordinates", async () => {
+    const s = await server(() => json(200, { outcome: "ready", claim_generation: 8, register_nonce: "current", op_id: "current-op" }), registration);
+    try {
+      const got = await (await registered(s.url)).preflightCodexCredentialSwitch("run/1", { ...REQ, targetSecretId: "target" });
+      assert.deepEqual(got, { kind: "ready", claimGeneration: 8, registerNonce: "current", opId: "current-op" });
+      assert.deepEqual(s.posts, [{ path: "/api/worker/runs/run%2F1/credential-switch/codex/preflight",
+        body: { claim_generation: 7, register_nonce: "nonce-1", op_id: "op-1", target_secret_id: "target" } }]);
+    } finally { await s.close(); }
+  });
+
+  it("strict preflight rejects auth and partial or invalid decisions without leaking", async () => {
+    const base = { outcome: "ready", claim_generation: 7, register_nonce: "n", op_id: "op" };
+    for (const body of [
+      { ...base, codex: subscription }, { ...base, token: SECRET },
+      { ...base, claim_generation: -1 }, { ...base, op_id: undefined },
+      { ...base, outcome: "applied" }, { ...base, outcome: "not_applied", reason: "" },
+    ]) {
+      const s = await server(() => json(200, body), registration);
+      try {
+        const got = await (await registered(s.url)).preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" });
+        assert.equal(got.kind, "uncertain");
+        assert.ok(!JSON.stringify(got).includes(SECRET));
+      } finally { await s.close(); }
+    }
+  });
+
+  it("preflight requires the server feature and fails closed on response loss", async () => {
+    const s = await server(() => json(200, {}));
+    try {
+      await assert.rejects((await registered(s.url)).preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }), /requires/);
+      assert.equal(s.posts.length, 0);
+    } finally { await s.close(); }
+    const lost = await server(() => json(200, {}), registration);
+    const c = await registered(lost.url);
+    await lost.close();
+    assert.deepEqual(await c.preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }),
+      { kind: "uncertain", detail: "preflight_unavailable" });
+  });
+
+  it("preflight retains fenced zero coordinates and refusal reasons", async () => {
+    for (const outcome of ["fenced", "superseded", "not_applied", "refused_committed"]) {
+      const reason = outcome === "not_applied" || outcome === "refused_committed" ? { reason: "target_moved" } : {};
+      const s = await server(() => json(200, { outcome, claim_generation: 0, register_nonce: "", op_id: "", ...reason }), registration);
+      try {
+        assert.deepEqual(await (await registered(s.url)).preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }),
+          { kind: outcome, claimGeneration: 0, registerNonce: "", opId: "", ...reason });
+      } finally { await s.close(); }
+    }
   });
 });

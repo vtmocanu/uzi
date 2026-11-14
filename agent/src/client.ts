@@ -4,7 +4,7 @@ import {
   type PolicyRecoveryVerifiedRequest, type PolicyRecoveryVerifiedReply,
 } from "./protocol.js";
 import { decodeCodexOperationDecision, validCodexOperationRequest } from "./codex-operation-admission.js";
-import type { CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
+import type { ClaimCodexSecrets, CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
 import { selectCodexBinding } from "./codex/select.js";
 import { createHash } from "node:crypto";
@@ -803,9 +803,13 @@ export class SanitizedPrDescriptionFields {
 // minted as a frozen SanitizedPrDescriptionFields instance and the size is rebuilt frozen. None is exported: minting from arbitrary input stays
 // inside this module, on HTTP response bodies only.
 
-/** Issue #4201: the credential_switch signal is `{generation, op_id?}`; v1 servers omit op_id. */
-function credentialSwitchSignal(cs: { generation: number; op_id?: unknown }): { generation: number; op_id?: string } {
-  return typeof cs.op_id === "string" && cs.op_id !== "" ? { generation: cs.generation, op_id: cs.op_id } : { generation: cs.generation };
+/** Optional switch coordinates are retained only when nonempty strings. */
+function credentialSwitchSignal(cs: { generation: number; op_id?: unknown; target_secret_id?: unknown }): { generation: number; op_id?: string; target_secret_id?: string } {
+  return {
+    generation: cs.generation,
+    ...(typeof cs.op_id === "string" && cs.op_id !== "" ? { op_id: cs.op_id } : {}),
+    ...(typeof cs.target_secret_id === "string" && cs.target_secret_id !== "" ? { target_secret_id: cs.target_secret_id } : {}),
+  };
 }
 
 function parseJSONRecord(text: string): Record<string, unknown> | undefined {
@@ -1370,9 +1374,34 @@ export interface CredentialSwitchApplyRequest {
   oldCumulative?: unknown;
 }
 
+export interface CodexSwitchPreflightRequest extends CredentialSwitchApplyRequest {
+  targetSecretId: string;
+}
+
+/** Server's current coordinates; ready is an observation, never apply authority. */
+export type CodexSwitchPreflightResult =
+  | { kind: "ready" | "superseded" | "fenced"; claimGeneration: number; registerNonce: string; opId: string }
+  | { kind: "not_applied" | "refused_committed"; reason: string; claimGeneration: number; registerNonce: string; opId: string }
+  | { kind: "uncertain"; detail: string };
+
+function decodeSwitchCodex(raw: unknown): ClaimCodexSecrets | undefined {
+  if (!isRecord(raw) || typeof raw.access_token !== "string" || raw.access_token.trim() === "" ||
+      typeof raw.capability !== "string" || raw.capability.trim() === "") return undefined;
+  if (raw.auth_mode === "api_key" && hasExactKeys(raw, ["auth_mode", "access_token", "capability"]))
+    return { auth_mode: "api_key", access_token: raw.access_token, capability: raw.capability };
+  if (raw.auth_mode === "subscription" &&
+      hasExactKeys(raw, ["auth_mode", "access_token", "capability", "generation", "chatgpt_account_id", "chatgpt_plan_type"]) &&
+      validGeneration(raw.generation) && typeof raw.chatgpt_account_id === "string" &&
+      raw.chatgpt_account_id.trim() !== "" && raw.chatgpt_plan_type === null)
+    return { auth_mode: "subscription", access_token: raw.access_token, capability: raw.capability,
+      generation: raw.generation, chatgpt_account_id: raw.chatgpt_account_id, chatgpt_plan_type: null };
+  return undefined;
+}
+
 /** Raw classification of one apply call. Never carries a response body; `detail` is a fixed label. */
 export type CredentialSwitchApplyResult =
   | { kind: "applied"; token: string; ordinal: number; messageSeq: number; replay: boolean }
+  | { kind: "codex_applied"; codex: ClaimCodexSecrets; capabilityEpoch: number; ordinal: number; messageSeq: number; replay: boolean }
   | { kind: "superseded" }
   | { kind: "fenced" }
   | { kind: "not_applied"; reason: string }
@@ -2054,6 +2083,41 @@ export class WorkerClient {
     return this.hasInPlaceCredentialSwitchCapability && this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE);
   }
 
+  /** One read-only attempt. No response body or auth is retained on failure. */
+  async preflightCodexCredentialSwitch(runId: string, req: CodexSwitchPreflightRequest): Promise<CodexSwitchPreflightResult> {
+    if (!this.hasFeature("codex_credential_switch_apply_v1"))
+      throw new Error("Codex switch preflight requires codex_credential_switch_apply_v1");
+    let res: Response;
+    let raw: Buffer;
+    try {
+      res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/credential-switch/codex/preflight`, {
+        claim_generation: req.claimGeneration, register_nonce: req.registerNonce, op_id: req.opId,
+        target_secret_id: req.targetSecretId,
+        ...(req.oldCumulative !== undefined ? { old_cumulative: req.oldCumulative } : {}),
+      });
+      raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true);
+    } catch { return { kind: "uncertain", detail: "preflight_unavailable" }; }
+    if (res.status !== 200) return { kind: "uncertain", detail: `http_${res.status}` };
+    const out = parseJSONRecord(raw.toString("utf8"));
+    const invalid = (): CodexSwitchPreflightResult => ({ kind: "uncertain", detail: "malformed_preflight" });
+    if (!out || !validGeneration(out.claim_generation) || typeof out.register_nonce !== "string" || typeof out.op_id !== "string")
+      return invalid();
+    const coords = { claimGeneration: out.claim_generation, registerNonce: out.register_nonce, opId: out.op_id };
+    const keys = ["outcome", "claim_generation", "register_nonce", "op_id"];
+    switch (out.outcome) {
+      case "ready":
+      case "superseded":
+      case "fenced":
+        return hasExactKeys(out, keys) ? { kind: out.outcome, ...coords } : invalid();
+      case "not_applied":
+      case "refused_committed":
+        return hasExactKeys(out, [...keys, "reason"]) && typeof out.reason === "string" &&
+          out.reason.length > 0 && out.reason.length <= APPLY_REASON_MAX
+          ? { kind: out.outcome, reason: out.reason, ...coords } : invalid();
+      default: return invalid();
+    }
+  }
+
   /**
    * POST /worker/runs/:id/credential-switch/apply (issue #4201). One attempt, never retried here.
    * Classification is strict: `route_absent` only for chi's default text/plain `404 page not found`;
@@ -2098,6 +2162,15 @@ export class WorkerClient {
     switch (out.outcome) {
       case "applied": {
         const { ordinal, message_seq: messageSeq, replay } = out;
+        if (Object.hasOwn(out, "codex") || Object.hasOwn(out, "capability_epoch")) {
+          const codex = decodeSwitchCodex(out.codex);
+          if (!this.hasFeature("codex_credential_switch_apply_v1") ||
+              !hasExactKeys(out, ["outcome", "codex", "capability_epoch", "ordinal", "message_seq", "replay"]) ||
+              !codex || !isInt(out.capability_epoch) || out.capability_epoch <= 0 ||
+              !isInt(ordinal) || ordinal <= 0 || !isInt(messageSeq) || messageSeq <= 0 || typeof replay !== "boolean")
+            return uncertain("malformed_codex_applied");
+          return { kind: "codex_applied", codex, capabilityEpoch: out.capability_epoch, ordinal, messageSeq, replay };
+        }
         // Trim once here: rebindCredential writes the trimmed value into the env, so the secret set, the
         // log registry and every other sink must see that same value.
         const token = typeof out.token === "string" ? out.token.trim() : out.token;
@@ -4162,7 +4235,7 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number; op_id?: string }; receipts?: boolean; nowSummary?: boolean }> {
+  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number; op_id?: string; target_secret_id?: string }; receipts?: boolean; nowSummary?: boolean }> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const epoch = this.inputObservationEpoch;
@@ -5977,7 +6050,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   budgetExhausted?: boolean;
   reason?: string;
   recoveryRetryNotBefore?: string | null;
-  credentialSwitch?: { generation: number; op_id?: string };
+  credentialSwitch?: { generation: number; op_id?: string; target_secret_id?: string };
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
   credentialSwitchHeld?: boolean;
@@ -6075,7 +6148,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       budgetExhausted?: boolean;
       reason?: string;
       recoveryRetryNotBefore?: string | null;
-      credentialSwitch?: { generation: number; op_id?: string };
+      credentialSwitch?: { generation: number; op_id?: string; target_secret_id?: string };
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
       credentialSwitchHeld?: boolean;
