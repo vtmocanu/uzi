@@ -100,6 +100,10 @@ export function ForgeSettings() {
   // link, distinct from the plain string errors above.
   const [connectViolations, setConnectViolations] = useState<string[] | null>(null);
   const [connecting, setConnecting] = useState(false);
+  // Issue #412: the explicit opt-in to rotate an existing connection's credential.
+  // Off by default, because the form reads as "add a repo" and an implicit rotate
+  // used to destroy the stored token.
+  const [replaceCredential, setReplaceCredential] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [checkingId, setCheckingId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -144,8 +148,9 @@ export function ForgeSettings() {
     resetMessages();
     setConnecting(true);
     try {
-      const { connection } = await api.createConnection(baseUrl, token, forgeType);
+      const { connection } = await api.createConnection(baseUrl, token, forgeType, replaceCredential);
       setToken("");
+      setReplaceCredential(false);
       setNotice(`Connected as ${maskUsername(connection.bot_username, "bot", demo)}.`);
       await reload();
     } catch (err) {
@@ -153,6 +158,14 @@ export function ForgeSettings() {
         const body = err.body as { violations?: string[] } | null;
         setError(err.message);
         setConnectViolations(body?.violations ?? []);
+      } else if (err instanceof ApiError && err.status === 409) {
+        // Issue #412: a connection to this host already exists. The API refuses to
+        // rotate it implicitly, because this form reads as "add a repo" and a
+        // re-submit used to destroy the stored credential. Say what actually
+        // happened and what the two real options are, rather than a generic error.
+        setError(
+          "A connection to this forge already exists. To use another repository, enable it on the existing connection below. To replace this connection's credential, use Replace credential.",
+        );
       } else {
         setError(errorMessage(err, "Connect failed"));
       }
@@ -346,6 +359,14 @@ export function ForgeSettings() {
               onChange={(e) => setToken(e.target.value)}
             />
           </Field>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={replaceCredential}
+              onChange={(e) => setReplaceCredential(e.target.checked)}
+            />
+            Replace the existing connection's credential
+          </label>
           <Button type="submit" disabled={connecting || !baseUrl || !forgeType || !token}>
             {connecting ? "Verifying…" : "Connect"}
           </Button>
