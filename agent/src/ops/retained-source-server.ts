@@ -448,7 +448,7 @@ export class RetainedSourceServer {
   ): Promise<{ ok: boolean; op: "resolve-local-record"; result: ResolveLocalRecordResult }> {
     const now = this.deps.now ?? Date.now;
     const sleep = this.deps.sleep ?? ((ms: number) => realSleep(ms));
-    if (gate.heldBy("terminal_maintenance") || gate.heldBy("hibernation")) return this.resolveRefusal("worker_not_idle");
+    if (gate.heldBy("terminal_maintenance") || gate.heldBy("hibernation") || gate.heldBy("hibernation_inventory")) return this.resolveRefusal("worker_not_idle");
     // PRD #4208: a latched worker (hibernation inventory) refuses, like any other busy refusal.
     const writer = hibernationWriters.enter("retained_ops");
     if (!writer) return this.resolveRefusal("worker_not_idle");
@@ -621,7 +621,7 @@ export class RetainedSourceServer {
     const sleep = this.deps.sleep ?? ((ms: number) => realSleep(ms));
     // 2. Close the claim gate. From here until the finally, only `retained_ops` is ours to reopen.
     // Never alongside the #3031 terminal producer's writer exclusion.
-    if (gate.heldBy("terminal_maintenance") || gate.heldBy("hibernation")) return this.refusal("worker_not_idle");
+    if (gate.heldBy("terminal_maintenance") || gate.heldBy("hibernation") || gate.heldBy("hibernation_inventory")) return this.refusal("worker_not_idle");
     const writer = hibernationWriters.enter("retained_ops");
     if (!writer) return this.refusal("worker_not_idle");
     gate.close("retained_ops");
