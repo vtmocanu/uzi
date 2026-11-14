@@ -1109,6 +1109,73 @@ export class CodexHarness implements RunHarness {
     return this.activePolicyAdmission;
   }
 
+  /**
+   * Authenticate an owned root and establish its thread without admitting model work.
+   * Switch callers must supply the saved resume id. Only an explicit allowFresh permits
+   * thread/start; the caller owns the decision after a confirmed resume refusal.
+   * This does not read notifications, report initialization, or invoke callbacks.
+   */
+  async prepareRootAndThread(
+    request: RunTurnRequest,
+    options: { allowFresh?: boolean } = {},
+  ): Promise<string> {
+    this.registry.assertWorkAdmission();
+    if (this.closed) throw new CodexHarnessError({ category: "transport", message: "codex harness is closed" });
+    request.signal.throwIfAborted();
+    if (request.resumeSessionId === undefined && options.allowFresh !== true)
+      throw new PolicyContinuationRejected("session_missing");
+    const rendered = this.render(request);
+    if (!await this.prepareThread(request, rendered))
+      throw new CodexHarnessError({ category: "transport", message: "codex thread preparation stopped" });
+    request.signal.throwIfAborted();
+    if (this.stopRequested)
+      throw new CodexHarnessError({ category: "transport", message: "codex thread preparation stopped" });
+    return this.threadId!;
+  }
+
+  private async prepareThread(request: RunTurnRequest, rendered: RenderedCodexRun): Promise<boolean> {
+    this.currentModel = rendered.lead.model ?? this.provider.model;
+    if (request.signal.aborted || this.stopRequested) return false;
+    // 1. Ensure the provider root + transport (launched once, reused after).
+    await this.ensureRoot(request.signal);
+    if (request.signal.aborted || this.stopRequested) {
+      return false;
+    }
+    const transport = this.transport;
+    const notes = this.notes;
+    if (!transport || !notes) {
+      throw new CodexHarnessError({ category: "protocol", message: "codex provider root is unavailable after launch" });
+    }
+
+    // 2. Start (or resume) the thread with the explicit untrusted / doc-max config —
+    //    and NEVER a hook-trust bypass. Reused across turns once established.
+    if (this.threadId === undefined) {
+      // The single authoritative fresh-thread branch: a preserve-only turn with no session to resume
+      // must re-hold, never start a new conversation (no thread/start is sent).
+      if (request.preserveConversation === true && request.resumeSessionId === undefined) {
+        // Only the claim's one-claim Fresh allowance may start a conversation, exactly once: it is spent
+        // BEFORE thread/start, so a failure after the send can never admit a second new conversation.
+        const allowance = request.policyFreshAllowance;
+        if (allowance === undefined) throw new PolicyContinuationRejected("session_missing");
+        // A spent allowance means a thread/start may already have been sent: do not assert none started.
+        if (allowance.remaining !== 1) throw new PolicyContinuationRejected("fresh_start_uncertain");
+        allowance.remaining = 0;
+      }
+      const resumed = request.resumeSessionId !== undefined;
+      this.resumedRoot = resumed;
+      this.threadId = resumed
+        ? await this.resumeThread(transport, request, rendered)
+        : await this.startThread(transport, rendered, request.signal);
+      // PRD #1332 C4a: capture the ROOT thread->model mapping the moment the thread id is
+      // known. The model is the immutable configured root model (currentModel); a resumed
+      // thread baselines at its pre-resume cumulative rather than zero.
+      this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
+      this.runtimeConfigPending = true;
+    }
+
+    return true;
+  }
+
   startTurn(request: RunTurnRequest): HarnessTurn {
     this.registry.assertWorkAdmission();
     if (this.closed) {
@@ -1324,43 +1391,12 @@ export class CodexHarness implements RunHarness {
         this.turnClosed = true;
         return;
       }
-      // 1. Ensure the provider root + transport (launched once, reused after).
-      await this.ensureRoot(request.signal);
-      if (request.signal.aborted || this.stopRequested) {
+      if (!await this.prepareThread(request, rendered)) {
         this.turnClosed = true;
         return;
       }
-      const transport = this.transport;
-      const notes = this.notes;
-      if (!transport || !notes) {
-        throw new CodexHarnessError({ category: "protocol", message: "codex provider root is unavailable after launch" });
-      }
-
-      // 2. Start (or resume) the thread with the explicit untrusted / doc-max config —
-      //    and NEVER a hook-trust bypass. Reused across turns once established.
-      if (this.threadId === undefined) {
-        // The single authoritative fresh-thread branch: a preserve-only turn with no session to resume
-        // must re-hold, never start a new conversation (no thread/start is sent).
-        if (request.preserveConversation === true && request.resumeSessionId === undefined) {
-          // Only the claim's one-claim Fresh allowance may start a conversation, exactly once: it is spent
-          // BEFORE thread/start, so a failure after the send can never admit a second new conversation.
-          const allowance = request.policyFreshAllowance;
-          if (allowance === undefined) throw new PolicyContinuationRejected("session_missing");
-          // A spent allowance means a thread/start may already have been sent: do not assert none started.
-          if (allowance.remaining !== 1) throw new PolicyContinuationRejected("fresh_start_uncertain");
-          allowance.remaining = 0;
-        }
-        const resumed = request.resumeSessionId !== undefined;
-        this.resumedRoot = resumed;
-        this.threadId = resumed
-          ? await this.resumeThread(transport, request, rendered)
-          : await this.startThread(transport, rendered, request.signal);
-        // PRD #1332 C4a: capture the ROOT thread->model mapping the moment the thread id is
-        // known. The model is the immutable configured root model (currentModel); a resumed
-        // thread baselines at its pre-resume cumulative rather than zero.
-        this.accountant.registerThread(this.threadId, this.currentModel ?? this.provider.model, resumed);
-        this.runtimeConfigPending = true;
-      }
+      const transport = this.transport!;
+      const notes = this.notes!;
 
       // PRD #3247 M2: advisory catalog probe, before the abort check so a stop during it is honoured.
       await this.runCatalogProbe(abortPromise, request.signal);
@@ -1370,8 +1406,11 @@ export class CodexHarness implements RunHarness {
         this.turnClosed = true;
         return;
       }
-      this.activeTurnId = await this.startTurnRpc(transport, this.threadId, rendered, request.signal, request.rootDispatch,
-        () => { if (this.resumedRoot) attemptedResumedRoot = this.threadId; });
+      const threadId = this.threadId;
+      if (threadId === undefined)
+        throw new CodexHarnessError({ category: "protocol", message: "codex prepared thread is unavailable" });
+      this.activeTurnId = await this.startTurnRpc(transport, threadId, rendered, request.signal, request.rootDispatch,
+        () => { if (this.resumedRoot) attemptedResumedRoot = threadId; });
       // PRD #3244: report only once turn/start was accepted, so `codex_sent` never describes a turn
       // that was cancelled or refused before dispatch.
       if (this.runtimeConfigPending) {
@@ -1839,7 +1878,8 @@ export class CodexHarness implements RunHarness {
       throw new CodexResumeError();
     }
     const id = res?.thread?.id;
-    if (typeof id !== "string" || id.length === 0) throw new CodexResumeError();
+    if (typeof id !== "string" || id.trim().length === 0)
+      throw new CodexHarnessError({ category: "protocol", message: "codex thread/resume returned no thread id" });
     this.threadResponse = { model: res.model, reasoningEffort: res.reasoningEffort };
     return id;
   }

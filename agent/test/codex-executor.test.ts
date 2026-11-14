@@ -5286,16 +5286,20 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     assert.equal(emitted.filter((m) => m.payload.event === "resume_lineage_break").length, 0);
   });
 
-  it("falls back when thread/resume returns no thread id", async () => {
+  it("retains lineage when thread/resume returns no thread id", async () => {
     const rig = makeRig();
     rig.transport.requestOverride = (c) => c.method === "thread/resume"
       ? Promise.resolve({ thread: {} })
       : undefined;
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
     const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread" });
-    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "resume without id fallback");
-    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/start").length, 1);
-    assert.ok(emitted.some((m) => m.payload.event === "resume_lineage_break"));
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "incomplete resume reply"),
+      /codex thread\/resume returned no thread id/,
+    );
+    assert.equal(rig.transport.requests.filter((r) => r.method === "thread/start").length, 0);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 0);
+    assert.equal(emitted.filter((m) => m.payload.event === "resume_lineage_break").length, 0);
   });
 
   for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
