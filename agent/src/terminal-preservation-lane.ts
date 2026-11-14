@@ -28,6 +28,8 @@ import {
 /** Upper bound of one lane operation, and the permit time kept back for the run's own terminal work. */
 const TERMINAL_LANE_CAP_MS = 120_000;
 const TERMINAL_LANE_RESERVE_MS = 30_000;
+/** The smallest usable window: a permit that leaves less starts nothing. */
+const TERMINAL_LANE_MIN_MS = 5_000;
 /** fail_origins that forbid any preservation. */
 const TERMINAL_LANE_EXCLUDED_ORIGINS: ReadonlySet<string> = new Set(["push_secret_blocked", "worker_residue_blocked"]);
 
@@ -127,9 +129,13 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
   if (!workerId) return result(label, "kept", "worker_unknown");
 
   const cap = env.hooks?.capMs ?? TERMINAL_LANE_CAP_MS;
-  const reserve = env.hooks?.reserveMs ?? TERMINAL_LANE_RESERVE_MS;
-  const sub = env.remainingMs === undefined ? cap : Math.min(cap, env.remainingMs - reserve);
-  if (!(sub > 0)) return result(label, "kept", "deadline");
+  // The reserve is proportional to the permit, so a short permit (the 30 s Codex boundary) keeps a usable window; an
+  // unknown permit remainder runs under the cap alone. A window below the minimum starts nothing.
+  const permitMs = env.remainingMs;
+  const reserve = permitMs === undefined ? 0
+    : Math.min(env.hooks?.reserveMs ?? TERMINAL_LANE_RESERVE_MS, Math.floor(permitMs / 4));
+  const sub = permitMs === undefined ? cap : Math.min(cap, permitMs - reserve);
+  if (!(sub > 0) || (permitMs !== undefined && sub < Math.min(TERMINAL_LANE_MIN_MS, cap))) return result(label, "kept", "deadline");
   const deadlineAt = env.now() + sub;
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), sub);
@@ -145,6 +151,7 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
     const boundaryValid = (): boolean => !abort.signal.aborted && env.now() < deadlineAt && quiesced;
     const left = (): number => Math.max(1, deadlineAt - env.now());
     let proved: Extract<TerminalUniverse, { kind: "proved" }> | undefined;
+    let preparedTip: string | undefined;
     const cloneRef = `refs/uzi-terminal-local/${flight.runId}/g${flight.claimGeneration}`;
 
     const base: TerminalOperationDeps = {
@@ -201,12 +208,19 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
         return "pack" in out ? out : { ...out, ...(out.reason === "secret_found" ? { flaggedCommits: flagged } : {}) };
       },
       coverage: (universe, manifest) => checkManifestCoverage(universe, manifest, { currentFlight: true }),
-      recheck: async () => firstFailure(env, body),
+      // The late gate before the send: the latches and the policy again, then the remediation hold against the prepared tip
+      // (a hold that appeared after prepare must stop the send).
+      recheck: async () => firstFailure(env, body) ?? (preparedTip !== undefined && await env.remediationHold(preparedTip)
+        ? "secret_remediation_pending" : undefined),
       boundaryValid,
       send: (req, signal) => env.client.publishTerminalPreservation(flight.runId, req, signal),
       now: () => env.now(),
     };
-    const deps: TerminalOperationDeps = { ...base, ...env.hooks?.deps };
+    const merged: TerminalOperationDeps = { ...base, ...env.hooks?.deps };
+    // Record the tip the engine prepares (hooked or real) so the late recheck can test the hold against it.
+    const deps: TerminalOperationDeps = {
+      ...merged, prepare: (range, expectDigests, tip) => { preparedTip = tip; return merged.prepare(range, expectDigests, tip); },
+    };
     const op = await runTerminalOperation(deps, {
       runId: flight.runId, workerId, generation: flight.claimGeneration, authorityClass: "current_flight",
       clonePath, mode: "initial", signal: abort.signal,
@@ -224,5 +238,8 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
 
 function firstFailure(env: TerminalLaneEnv, body: TerminalLaneBody): string | undefined {
   if (body.fail_origin !== undefined && TERMINAL_LANE_EXCLUDED_ORIGINS.has(body.fail_origin)) return body.fail_origin;
-  return env.failureFirst();
+  const latched = env.failureFirst();
+  if (latched !== undefined) return latched;
+  // Active secret remediation refuses before any universe read, capture or record (and again before the send).
+  return env.policy().blocked ? "secret_remediation_pending" : undefined;
 }

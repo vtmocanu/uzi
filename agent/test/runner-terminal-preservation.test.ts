@@ -222,11 +222,95 @@ describe("terminal-preservation lane (#4007 slice B)", () => {
     assert.equal(r.sends, 0);
   });
 
-  it("a permit with less than the reserve left never starts", async () => {
-    const r = rig({ env: { remainingMs: 10_000 } });
+  it("a permit too short to leave a usable window (4 s) never starts: kept deadline, no capture, no record", async () => {
+    const r = rig({ env: { remainingMs: 4_000 } });
     const out = await preserveInLane(r.env, r.flight, body);
+    assert.equal(out.outcome, "kept");
     assert.equal(out.reason, "deadline");
     assert.equal(r.order.length, 0);
+    assert.equal(r.sends, 0);
+    assert.equal(r.store.record, undefined);
+  });
+
+  it("a Codex-shaped 30 s permit runs under a sub-deadline of at most permit minus the proportional reserve", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let entered!: () => void;
+    const inSend = new Promise<void>(res => { entered = res; });
+    let sendSignal: AbortSignal | undefined;
+    const r = rig({
+      env: { remainingMs: 30_000 },
+      send: async signal => {
+        sendSignal = signal;
+        entered();
+        await new Promise<void>(res => { if (signal!.aborted) res(); else signal!.addEventListener("abort", () => res(), { once: true }); });
+        return { kind: "unknown", cause: "aborted" };
+      },
+    });
+    const run = preserveInLane(r.env, r.flight, body);
+    await inSend;
+    t.mock.timers.tick(22_499);
+    assert.equal(sendSignal!.aborted, false, "reserve = min(30 s, 30 s / 4) leaves 22.5 s");
+    t.mock.timers.tick(2);
+    assert.equal(sendSignal!.aborted, true, "the send is aborted no later than permit minus reserve");
+    const out = await run;
+    assert.equal(out.outcome, "unknown");
+    assert.equal(r.store.record?.invocations.at(-1)?.outcome, "publish_unknown");
+    assert.equal(terminalHeadAdmitted(r.flight, A), false);
+  });
+
+  it("a permit abort mid-send on a 30 s permit aborts the send: publish_unknown, no head", async () => {
+    const permit = new AbortController();
+    const r = rig({
+      env: { signal: permit.signal, remainingMs: 30_000 },
+      send: async signal => {
+        permit.abort();
+        assert.equal(signal!.aborted, true);
+        return { kind: "unknown", cause: "aborted" };
+      },
+    });
+    const out = await preserveInLane(r.env, r.flight, body);
+    assert.equal(out.outcome, "unknown");
+    assert.equal(r.store.record?.invocations.at(-1)?.outcome, "publish_unknown");
+    assert.equal(terminalHeadAdmitted(r.flight, A), false);
+  });
+
+  it("active secret remediation refuses before any universe read, capture or record", async () => {
+    let reads = 0;
+    const r = rig({ env: { policy: () => ({ version: 1, blocked: true, everKnown: true, flaggedCommits: [], ciGlobs: null, extraFloors: [] }) } });
+    const universe = r.env.hooks!.deps!.universe!;
+    r.env.hooks!.deps!.universe = async (...a) => { reads++; return universe(...a); };
+    const out = await preserveInLane(r.env, r.flight, body);
+    assert.equal(out.outcome, "kept");
+    assert.equal(out.reason, "secret_remediation_pending");
+    assert.equal(reads, 0);
+    assert.equal(r.order.length, 0);
+    assert.equal(r.store.record, undefined);
+    assert.equal(terminalHeadAdmitted(r.flight, A), false);
+  });
+
+  it("a remediation hold that appears after prepare stops the send", async () => {
+    let held = false;
+    const r = rig({
+      env: { remediationHold: async () => held },
+      prepare: async () => { held = true; return { pack: Buffer.from("pack"), range: { tipSha: A, excludeSha: C }, digests: { scan: "s", transport: "t" } }; },
+    });
+    delete r.env.hooks!.deps!.recheck; // exercise the lane's own late gate, not the hooked one
+    const out = await preserveInLane(r.env, r.flight, body);
+    assert.equal(out.outcome, "kept");
+    assert.equal(r.sends, 0);
+    assert.equal(terminalHeadAdmitted(r.flight, A), false);
+  });
+
+  it("a policy that turns blocked after prepare stops the send", async () => {
+    let blocked = false;
+    const r = rig({
+      env: { policy: () => ({ version: 1, blocked, everKnown: false, flaggedCommits: [], ciGlobs: null, extraFloors: [] }) },
+      prepare: async () => { blocked = true; return { pack: Buffer.from("pack"), range: { tipSha: A, excludeSha: C }, digests: { scan: "s", transport: "t" } }; },
+    });
+    delete r.env.hooks!.deps!.recheck;
+    const out = await preserveInLane(r.env, r.flight, body);
+    assert.equal(out.outcome, "kept");
+    assert.equal(r.sends, 0);
   });
 
   it("an unknown permit remainder uses the cap and runs", async () => {
@@ -350,6 +434,7 @@ interface Driven {
   quiesced: number;
   order: string[];
   lane: unknown[];
+  sites: Array<{ signal?: AbortSignal; deadlineAt?: number; at: number }>;
 }
 
 async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
@@ -364,7 +449,7 @@ async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
   api.setRegisterProtocolFeatures(["claim_generation_fence", "recovery_inventory_v1", feature, "terminal_rejection_report",
     ...(kind === "mr_rework" ? ["refresh_publication_context_v1"] : [])]);
   const registration = await client.register("tp-lane", undefined, undefined, undefined, ["claim_generation_fence", "recovery_inventory_v1", feature]);
-  const out: Driven = { completed: [], failed: [], finalHead: "", sends: 0, withBoundaryCalls: [], quiesced: 0, order: [], lane: [] };
+  const out: Driven = { completed: [], failed: [], finalHead: "", sends: 0, withBoundaryCalls: [], quiesced: 0, order: [], lane: [], sites: [] };
   let open = true;
   client.getRunOwnership = async () => ({
     status: api.states.some(s => s.body.status === "completed") ? "completed" : "running",
@@ -440,7 +525,7 @@ async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
   const quiesce = t.mock.method(r as unknown as { quiesceOrBlockSink: (...a: unknown[]) => Promise<void> }, "quiesceOrBlockSink");
   const lane = r as unknown as { preserveTerminalInLane: (...a: unknown[]) => Promise<unknown> };
   const realLane = lane.preserveTerminalInLane.bind(r);
-  t.mock.method(lane, "preserveTerminalInLane", async (...a: unknown[]) => { const res = await realLane(...a); out.lane.push(res); return res; });
+  t.mock.method(lane, "preserveTerminalInLane", async (...a: unknown[]) => { out.sites.push({ ...(a[3] as object), at: Date.now() }); const res = await realLane(...a); out.lane.push(res); return res; });
   const originalFetch = globalThis.fetch;
   t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
@@ -546,6 +631,15 @@ describe("terminal preservation through a full execute", { concurrency: false },
       assert.equal(on.quiesced, 2, "the reap already proved quiescence: no extra proof");
       assert.deepEqual(on.withBoundaryCalls, BOUNDARIES.failed[h]);
     });
+
+    it(`${harness}: the reap-body lane call carries the boundary deadline${codex ? " and the permit signal" : ""}`, async t => {
+      const on = await drive(t, { codex, failRun: "agent exploded" });
+      const site = on.sites[0]!;
+      assert.equal(typeof site.deadlineAt, "number", "the reap body passes the boundary deadline, not the 120 s cap");
+      const window = site.deadlineAt! - site.at;
+      assert.ok(window > 0 && window <= 30_000, `deadline window ${window} ms is within the 30 s boundary`);
+      if (codex) assert.ok(site.signal instanceof AbortSignal, "the Codex permit signal reaches the lane");
+    });
   }
 
   it("a typed phasePublish failure keeps its typed failure and the lane runs in place, once", async t => {
@@ -560,13 +654,13 @@ describe("terminal preservation through a full execute", { concurrency: false },
 
 describe("terminal preservation adapter predicates (gate on, real RunRunner method)", () => {
   type Adapter = { preserveTerminalInLane(claim: unknown, flight: unknown, body: unknown, site: unknown): Promise<{ outcome: string; reason?: string }> };
-  function adapter(): { r: Adapter; sends: () => number; flight: (over?: Record<string, unknown>) => Record<string, unknown>; claim: unknown } {
-    let sends = 0;
+  function adapter(): { r: Adapter; sends: () => number; reads: () => number; flight: (over?: Record<string, unknown>) => Record<string, unknown>; claim: unknown } {
+    let sends = 0, reads = 0;
     const r = runner({ run: async () => ({}) } as never, fakeGitlab().gitlab, "tp-adapter-key", {
       terminalPreservationTestOverride: {
         workerId: "w1", attemptId: "at1", store: memStore(), owner: fn => fn(),
         deps: {
-          universe: async () => ({ kind: "proved", sources: [], roots: [], universeDigest: "u" }),
+          universe: async () => { reads++; return { kind: "proved", sources: [], roots: [], universeDigest: "u" }; },
           capture: async onPhase => {
             await onPhase("capturing", { cloneRef: "x", bareRef: "x" });
             await onPhase("captured", { cloneRef: "x", bareRef: "x" });
@@ -584,7 +678,7 @@ describe("terminal preservation adapter predicates (gate on, real RunRunner meth
       attemptId: "at1", iterationParkState: "none", policyHold: undefined, completionSendAttempted: false,
       completionHoldOutcome: "none", runLog: { info: () => undefined }, ...over,
     });
-    return { r, sends: () => sends, flight, claim: { repo: { default_branch: "main" } } };
+    return { r, sends: () => sends, reads: () => reads, flight, claim: { repo: { default_branch: "main" } } };
   }
   const site = { quiesce: false, site: "t" };
 
@@ -613,6 +707,25 @@ describe("terminal preservation adapter predicates (gate on, real RunRunner meth
       assert.equal(a.sends(), 0);
     });
   }
+
+  it("refuses on active secret remediation before any universe read", async () => {
+    const a = adapter();
+    const out = await a.r.preserveTerminalInLane(a.claim, a.flight({ remediationRestrictions: {} }), { status: "completed" }, site);
+    assert.equal(out.outcome, "kept");
+    assert.equal(out.reason, "secret_remediation_pending");
+    assert.equal(a.reads(), 0);
+    assert.equal(a.sends(), 0);
+  });
+
+  it("a permit deadline 4 s away starts nothing; one 30 s away runs", async () => {
+    const short = adapter();
+    const out = await short.r.preserveTerminalInLane(short.claim, short.flight(), { status: "completed" }, { ...site, deadlineAt: Date.now() + 4_000 });
+    assert.equal(out.reason, "deadline");
+    assert.equal(short.reads(), 0);
+    const long = adapter();
+    const ok = await long.r.preserveTerminalInLane(long.claim, long.flight(), { status: "completed" }, { ...site, deadlineAt: Date.now() + 30_000 });
+    assert.equal(ok.outcome, "published");
+  });
 
   for (const [name, over, reason] of [
     ["a ci_fix run", { runKind: "ci_fix" }, "not_branch_source"],

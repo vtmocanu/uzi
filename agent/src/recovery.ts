@@ -3970,7 +3970,7 @@ export class RecoveryCoordinator {
       if (this.terminalPreservationEnabled()) {
         if (!await this.restrictionsAllowCapturedC(record)) { result = "kept"; return; }
         const tp = await this.runGuardedTerminalPreservation(record, input, { failOrigin: terminal?.fail_origin, prove });
-        if (tp.outcome === "kept" && tp.reason === "secret_found") {
+        if (tp.outcome === "kept" && (tp.reason === "secret_found" || tp.reason === "secret_found_unlatched")) {
           record = await this.writeExistingRecord(record, cur => ({ ...cur, heldPolicy: { ...cur.heldPolicy!, blocked: true } }));
         }
         if (tp.outcome !== "published" && tp.outcome !== "recorded") { result = "kept"; return; }

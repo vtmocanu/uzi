@@ -4156,6 +4156,8 @@ export class RunRunner {
     const failureFirst = (): string | undefined => {
       const mapped = typeof body.failure_reason === "string" ? failOriginForReason(body.failure_reason) : undefined;
       if (mapped === "push_secret_blocked" || mapped === "worker_residue_blocked") return mapped;
+      // Defensive: the only writer of flight.secretBlocked is the terminal lane itself (a secret finding latches it); active
+      // remediation is refused by the lane's own policy().blocked gate, which also runs before any universe read.
       if (flight.secretBlocked === true) return "secret_blocked";
       if (residueQuarantine() !== undefined) return "residue_quarantined";
       return undefined;
@@ -4171,10 +4173,12 @@ export class RunRunner {
       if (flight.permanentFailureReap !== undefined) return "permanent_failure_reap";
       return undefined;
     };
+    let defaultBranch = claim.repo.default_branch?.trim() || undefined;
+    if (defaultBranch === undefined && flight.barePath) defaultBranch = (await this.git.defaultBranchName(flight.barePath).catch(() => undefined)) || undefined;
     return preserveInLane({
       git: this.git, recovery: this.recovery, client: this.client, hooks,
       workerId: this.client.memoryIncarnation?.worker_id ?? hooks?.workerId,
-      defaultBranch: claim.repo.default_branch ?? undefined, egressBound: false,
+      defaultBranch: defaultBranch || "main", egressBound: false,
       skip, failureFirst, policy: () => this.frozenHeldPolicy(flight),
       remediationHold: sha => this.checkpointRemediationHold(flight, flight.barePath!, sha, false),
       ciHold: sha => this.ciConfigGuardVerdict(flight, flight.barePath!, sha, "terminal preservation"),
@@ -23126,15 +23130,18 @@ export class RunRunner {
       // reap + Docker teardown) before any credentialed settle may run. A surviving or
       // unattributable run-owned process throws RunResidueBlockedError: the settle is skipped, the
       // hold (custody) stays open and the clone + journal are kept (preserveRecoveryClone).
+      // The lane runs inside this boundary permit: it gets the permit's signal and the boundary's absolute deadline.
+      const reapDeadlineAt = Date.now() + this.codexBoundaryDeadlineMs;
       await this.reapForSink(
         flight.executor,
         { boundary, deadlineMs: this.codexBoundaryDeadlineMs },
-        async () => {
+        async permit => {
           // The reap itself is the point. The credentialed settle runs OUTSIDE the
           // boundary (mirroring the park path), after the provider root is reaped.
           // #4007 slice B (production-dark): the reap proved quiescence, so the lane skips its own proof.
           if (this.terminalPreservationEnabled() && failure !== undefined && flight.permanentFailureReap === undefined)
-            await this.preserveTerminalInLane(claim, flight, { status: "failed", ...failure }, { quiesce: false, site: "terminal_preservation" });
+            await this.preserveTerminalInLane(claim, flight, { status: "failed", ...failure },
+              { quiesce: false, site: "terminal_preservation", deadlineAt: reapDeadlineAt, ...(permit?.signal ? { signal: permit.signal } : {}) });
         },
         flight,
       );

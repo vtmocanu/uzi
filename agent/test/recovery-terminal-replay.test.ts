@@ -43,7 +43,7 @@ async function rig(opts: { gate: boolean; boundary?: "pass" | "refuse"; heldBind
     restrictionsBlockedFromHoldRead: Infinity, holdReads: 0, dirty: [] as string[] | null,
     terminal: [] as TerminalPreservationRequest[], terminalResult: FINAL as TerminalPreservationResult,
     order: [] as string[], publishHeld: 0, releases: 0, boundaryRefused: opts.boundary === "refuse",
-    boundaryProofCalls: 0,
+    boundaryProofCalls: 0, findings: [] as Array<{ commit: string }>, scanCalls: 0, findingsFromCall: 1,
   };
   const candidates = [{ sha: H, pinRef: "refs/owed/a", contexts: [structuredClone(context)] }] as OwedCandidate[];
   const exactHold = () => s.hold === "unknown" ? undefined : ({
@@ -80,7 +80,7 @@ async function rig(opts: { gate: boolean; boundary?: "pass" | "refuse"; heldBind
     readRemediationRestrictionFacts: async () => ({
       enrolled: false, blocked: s.holdReads >= s.restrictionsBlockedFromHoldRead, roots: [], flaggedOIDs: [], fingerprint: "unenrolled" }),
     resolveCheckpointRange: async (_b: string, _br: string, o: { tipSha: string }) => { s.order.push("range"); return { tipSha: o.tipSha, excludeSha: "e".repeat(40) }; },
-    secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }),
+    secretScanCheckpointRange: async () => ({ trusted: true, findings: ++s.scanCalls >= s.findingsFromCall ? s.findings : [] }),
     rangeTouchesWorkflows: async () => "clean",
     changedFilesNoRenames: async () => [],
     changedCiPathsPerCommit: async () => [],
@@ -162,6 +162,27 @@ describe("M6-V guarded replay of a frozen open held record", () => {
       assert.equal(f.s.publishHeld, 0);
     } finally { await f.close(); }
   });
+
+  for (const unlatched of [false, true]) {
+    it(`a secret finding (${unlatched ? "latch write fails: secret_found_unlatched" : "latched"}) blocks the held policy and sends nothing`, async () => {
+      const f = await rig();
+      try {
+        f.s.findings = [{ commit: H }];
+        f.s.findingsFromCall = 2; // the held preparation scans clean first; the terminal preparation then finds
+        if (unlatched) {
+          const real = f.coordinator.terminalOperationStore();
+          f.coordinator.terminalOperationStore = () => ({ ...real, addLocalBlock: async () => ({ kind: "error", reason: "write_failed" }) });
+        }
+        await f.operate();
+        assert.equal(f.s.scanCalls >= 2, true, "the terminal preparation scanned");
+        assert.equal(f.s.terminal.length, 0);
+        assert.equal(f.s.publishHeld, 0);
+        const latest = await (f.coordinator as unknown as { readLatest(r: RecoveryRecord): Promise<{ kind: string; record: RecoveryRecord }> }).readLatest(f.record);
+        assert.equal(latest.kind, "ok");
+        assert.equal(latest.record.heldPolicy?.blocked, true, "the frozen policy is blocked once a secret finding is reported");
+      } finally { await f.close(); }
+    });
+  }
 
   const notFinal: Array<[string, TerminalPreservationResult]> = [
     ["unknown transport", { kind: "unknown", cause: "transport" }],
