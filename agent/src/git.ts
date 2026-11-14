@@ -20742,8 +20742,10 @@ try {
    *  4. staging on a PRIVATE index (`GIT_INDEX_FILE` under the runner tmp, removed in `finally`);
    *  5. staged validation against the enumeration (set, modes, sizes), then `write-tree` and a
    *     deterministic `commit-tree` on HEAD, proven by a tree-diff backstop;
-   *  6. record-first transfer: `onPhase("capturing")`, create-only clone ref, worker-uid file://
-   *     fetch into a unique bare staging ref (no `+`), validation, CAS-create of the bare's same-named ref
+   *  6. parent-in-bare precondition (HEAD reachable from the bare's `refs/uzi-runner/<branch>`), then
+   *     record-first transfer: `onPhase("capturing")`, create-only clone ref, worker-uid file://
+   *     fetch (negotiating against that ref) into a unique bare staging ref (no `+`), validation incl. a
+   *     reachable-object check against the staged diff, CAS-create of the bare's same-named ref
    *     from it, staging-ref delete, CAS-delete of the clone ref, `onPhase("captured")`.
    * A failure after the clone ref exists returns `refused` and leaves refs as they are; the bare ref is
    * never deleted here. `deadlineMs` is a duration budget for the whole call.
@@ -20821,21 +20823,50 @@ try {
     const sameInvariants = (a: Awaited<ReturnType<typeof invariants>>, b: Awaited<ReturnType<typeof invariants>>): boolean =>
       a.head === b.head && a.symbolic === b.symbolic && a.refs === b.refs && a.index === b.index;
 
-    // An agent-planted alternates file would make the worker-uid fetch import objects from another object
-    // store. Any entry that is not an empty regular file, or that cannot be read, refuses. Residual TOCTOU:
-    // the clone is agent-writable, so a file planted between this check and the fetch's object read is only
-    // caught by the re-check after the fetch (the staging ref is then dropped; imported objects stay
-    // unreferenced in the bare until its gc).
+    // The worker-uid fetch has upload-pack read the agent-controlled clone, which could serve objects from a
+    // foreign store the worker can read. Two controls bound that. (a) Alternates: `clone --shared` runner
+    // clones legitimately carry `objects/info/alternates` naming the bare's own objects directory, so that
+    // single line (resolved against the clone's objects directory) and an empty file are the only accepted
+    // shapes; `http-alternates` must be absent or empty; anything else, or an unreadable entry, refuses.
+    // (b) The snapshot's only parent (the clone HEAD) must already be reachable in the bare from
+    // `refs/uzi-runner/<branch>`, the fetched-back agent branch, so negotiation can bound the transfer to
+    // snapshot-new objects, and the reachable-object check below accepts nothing but the snapshot commit,
+    // its trees and the blobs of the validated staged diff before the final ref exists.
+    // Residual: the clone is agent-writable, so an alternates file or a symlinked foreign pack or loose object
+    // planted after the checks can still make upload-pack import unreferenced objects into the bare object
+    // store; none is reachable from any ref this code creates (the staging ref is dropped on refusal). That
+    // shared fetch-back class pre-exists in fetchAgentBranch and is tracked separately.
     const alternatesClean = async (): Promise<boolean> => {
-      for (const name of ["alternates", "http-alternates"]) {
-        try {
-          const st = await fs.lstat(path.join(clonePath, ".git", "objects", "info", name));
-          if (!st.isFile() || st.size !== 0) return false;
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
-        }
+      const info = path.join(clonePath, ".git", "objects", "info");
+      try {
+        const http = await fs.lstat(path.join(info, "http-alternates"));
+        if (!http.isFile() || http.size !== 0) return false;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
       }
-      return true;
+      try {
+        const file = path.join(info, "alternates");
+        const st = await fs.lstat(file);
+        if (!st.isFile() || st.size > 4096) return false;
+        if (st.size === 0) return true;
+        const line = (await fs.readFile(file, "utf8")).trim();
+        if (line === "") return true;
+        if (/[\r\n\0]/.test(line)) return false;
+        const allowed = new Set([path.resolve(opts.barePath, "objects")]);
+        const real = await fs.realpath(path.join(opts.barePath, "objects")).catch(() => undefined);
+        if (real) allowed.add(real);
+        return allowed.has(path.resolve(path.dirname(info), line));
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "ENOENT";
+      }
+    };
+    const bareEnv = { ...gitEnv(), ...PROOF_READ_ENV };
+    // Bare-side read on the original-object view (no replace refs, grafts, commit-graph or multi-pack-index).
+    const bareRead = async (args: string[], maxBuffer = 1 << 20, input?: string): Promise<string> => {
+      const result = await this.execScoped("git", withDir(opts.barePath, [
+        "-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false", "--no-replace-objects", ...args,
+      ]), { env: bareEnv, timeout: left(), maxBuffer, ...(input === undefined ? {} : { input }) });
+      return result.stdout;
     };
 
     let privateIndex: string | undefined;
@@ -20974,6 +21005,21 @@ try {
       if (opts.reprove && !(await opts.reprove())) return refused("reprove_failed");
       if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
 
+      // The parent must already be reachable in the bare from the fetched-back agent branch (no fetch yet).
+      const branchMatch = /^refs\/heads\/(.+)$/.exec(before.symbolic);
+      if (!branchMatch) return refused("parent_not_in_bare");
+      const runnerRef = `refs/uzi-runner/${branchMatch[1]}`;
+      try {
+        await bareRead(["cat-file", "-e", `${head}^{commit}`]);
+        await bareRead(["merge-base", "--is-ancestor", head, runnerRef]);
+      } catch (err) {
+        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+        if (err instanceof TerminalSnapshotRefusal) throw err;
+        return refused("parent_not_in_bare");
+      }
+      const newBlobs = new Set(live.map((r) => r.oid));
+      const maxTrees = wipDirectoryCount(staged.map((r) => r.path));
+
       // 6. Record-first transfer. From the clone ref's creation on, a failure leaves refs as they are.
       try { await opts.onPhase?.("capturing", { cloneRef, bareRef, commit }); }
       catch { return refused("phase_callback_failed"); }
@@ -20997,12 +21043,35 @@ try {
         try {
           await this.runGit(opts.barePath, [
             "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags", "--no-write-fetch-head",
-            `file://${clonePath}`, `${cloneRef}:${stage}`,
+            `--negotiation-tip=${runnerRef}`, `file://${clonePath}`, `${cloneRef}:${stage}`,
           ]);
           const landed = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage])).trim();
           if (landed !== commit) fail("bare_transfer_mismatch");
           if ((await this.runGit(opts.barePath, ["--no-replace-objects", "cat-file", "-t", commit])).trim() !== "commit") fail("bare_transfer_mismatch");
           if (!(await alternatesClean())) fail("alternates_present");
+          // Everything the snapshot reaches beyond the fetched-back branch: the commit, trees (at most one
+          // per touched directory) and blobs of the validated staged diff; any other object refuses.
+          const cap = 1 + newBlobs.size + maxTrees;
+          let listed: string;
+          try {
+            listed = await bareRead(["rev-list", "--objects", "--no-object-names", commit, "--not", runnerRef], (cap + 1) * 41 + 4096);
+          } catch (err) {
+            if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+            return fail(isBoundOverflow(err) ? "foreign_object" : "object_verify_failed");
+          }
+          const oids = listed.split("\n").filter((l) => l !== "");
+          if (oids.length > cap || oids.some((o) => !SHA40_RE.test(o))) fail("foreign_object");
+          const kinds = (await bareRead(["cat-file", "--batch-check=%(objecttype) %(objectname)"], 1 << 20, oids.join("\n") + "\n"))
+            .split("\n").filter((l) => l !== "");
+          if (kinds.length !== oids.length) fail("foreign_object");
+          let commits = 0, trees = 0;
+          for (const line of kinds) {
+            const [type, oid] = line.split(" ") as [string, string];
+            if (type === "commit" && oid === commit) commits++;
+            else if (type === "tree") trees++;
+            else if (type !== "blob" || !newBlobs.has(oid)) fail("foreign_object");
+          }
+          if (commits !== 1 || trees > maxTrees) fail("foreign_object");
           if (present !== commit) await this.runGit(opts.barePath, ["update-ref", bareRef, commit, ""]);
           if ((await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim() !== commit) fail("bare_transfer_mismatch");
         } finally {

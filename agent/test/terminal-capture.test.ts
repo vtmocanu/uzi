@@ -42,6 +42,8 @@ async function fixture(t: test.TestContext, opts: { ignore?: string } = {}) {
   const head = g("rev-parse", "HEAD");
   g("update-ref", "refs/uzi-runner/main", head);
   g("update-ref", "refs/uzi-checkpoints/agent/issue-1", head);
+  // Production shape after fetchAgentBranch: the clone HEAD is reachable from the bare's runner ref.
+  run(bare, "update-ref", "refs/uzi-runner/main", head);
   const git = new GitCache(dir, nullLogger());
   t.after(async () => {
     if (previousTmp === undefined) delete process.env.UZI_RUNNER_TMPDIR; else process.env.UZI_RUNNER_TMPDIR = previousTmp;
@@ -257,14 +259,96 @@ describe("captureTerminalSnapshot", () => {
     assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
   });
 
-  test("a planted alternates file is refused before any phase or ref", async (t) => {
+  const foreignStore = async (f: Awaited<ReturnType<typeof fixture>>) => {
+    const foreign = path.join(f.dir, "foreign");
+    await fs.mkdir(foreign);
+    run(foreign, "init", "-q", "--bare");
+    return foreign;
+  };
+
+  test("a clone --shared runner clone (alternates naming the bare's objects) captures", async (t) => {
+    const f = await fixture(t);
+    const shared = path.join(f.dir, "runner", "repo", "shared");
+    execFileSync("/usr/bin/git", ["clone", "-q", "--shared", f.bare, shared], { env: gitEnv });
+    assert.equal((await fs.readFile(path.join(shared, ".git", "objects", "info", "alternates"), "utf8")).trim().length > 0, true);
+    await fs.writeFile(path.join(shared, "new.txt"), "shared work\n");
+    const result = await f.git.captureTerminalSnapshot(shared, { runId: "run-1", generation: 2, deadlineMs: 60_000, barePath: f.bare });
+    assert.equal(result.kind, "captured", JSON.stringify(result));
+    if (result.kind === "captured") assert.equal(run(f.bare, "show", `${result.root}:new.txt`), "shared work");
+  });
+
+  test("alternates naming a foreign store are refused before any phase or ref", async (t) => {
     const f = await fixture(t);
     await f.write("new.txt", "x");
-    await fs.writeFile(path.join(f.root, ".git", "objects", "info", "alternates"), `${path.join(f.bare, "objects")}\n`);
+    const foreign = await foreignStore(f);
+    await fs.writeFile(path.join(f.root, ".git", "objects", "info", "alternates"), `${path.join(foreign, "objects")}\n`);
     const result = await f.capture({ onPhase: async (p) => { f.calls.push(p); } });
     assert.deepEqual(result, { kind: "refused", reason: "alternates_present" });
     assert.deepEqual(f.calls, []);
     assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
+  });
+
+  test("alternates with an extra line or an http-alternates entry are refused", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "x");
+    const foreign = await foreignStore(f);
+    const info = path.join(f.root, ".git", "objects", "info");
+    await fs.writeFile(path.join(info, "alternates"), `${path.join(f.bare, "objects")}\n${path.join(foreign, "objects")}\n`);
+    assert.deepEqual(await f.capture(), { kind: "refused", reason: "alternates_present" });
+    await fs.rm(path.join(info, "alternates"));
+    await fs.writeFile(path.join(info, "http-alternates"), "https://example.invalid/objects\n");
+    assert.deepEqual(await f.capture(), { kind: "refused", reason: "alternates_present" });
+  });
+
+  test("a HEAD that is not reachable from the bare's runner ref is refused before any fetch or ref", async (t) => {
+    const f = await fixture(t);
+    run(f.bare, "update-ref", "-d", "refs/uzi-runner/main");
+    await f.write("new.txt", "x");
+    const result = await f.capture({ onPhase: async (p) => { f.calls.push(p); } });
+    assert.deepEqual(result, { kind: "refused", reason: "parent_not_in_bare" });
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.refsOf(f.root).includes("uzi-terminal-local"), false);
+    assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
+    assert.equal(f.refsOf(f.bare).includes("uzi-incoming"), false);
+  });
+
+  test("a forged HEAD carrying a foreign blob through a symlinked loose object is refused and nothing foreign lands", async (t) => {
+    const f = await fixture(t);
+    const foreign = await foreignStore(f);
+    const blob = execFileSync("/usr/bin/git", ["-C", foreign, "hash-object", "-w", "--stdin"], { env: gitEnv, input: "foreign secret\n", encoding: "utf8" }).trim();
+    const loose = path.join(foreign, "objects", blob.slice(0, 2), blob.slice(2));
+    await fs.mkdir(path.join(f.root, ".git", "objects", blob.slice(0, 2)), { recursive: true });
+    await fs.symlink(loose, path.join(f.root, ".git", "objects", blob.slice(0, 2), blob.slice(2)));
+    const baseTree = f.g("rev-parse", "HEAD^{tree}");
+    const tree = execFileSync("/usr/bin/git", ["-C", f.root, "mktree"], {
+      env: gitEnv, encoding: "utf8", input: f.g("ls-tree", baseTree) + `\n100644 blob ${blob}\tevil.txt\n`,
+    }).trim();
+    const forged = f.g("commit-tree", tree, "-p", f.head, "-m", "forged");
+    f.g("update-ref", "refs/heads/main", forged);
+    f.g("reset", "-q", "--hard", forged);
+    await f.write("new.txt", "x");
+    const result = await f.capture();
+    assert.deepEqual(result, { kind: "refused", reason: "parent_not_in_bare" });
+    assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false, "the final ref is absent");
+    assert.equal(f.refsOf(f.bare).includes("uzi-incoming"), false);
+    assert.throws(() => run(f.bare, "cat-file", "-e", blob), "the foreign blob never reached the bare");
+  });
+
+  test("a clone ref swapped to a commit with an extra blob lands nothing", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "x");
+    const result = await f.capture({ seam: { afterCloneRef: async () => {
+      await fs.writeFile(path.join(f.root, "extra.txt"), "extra\n");
+      f.g("add", "extra.txt");
+      const extraTree = f.g("write-tree");
+      f.g("reset", "-q", "extra.txt");
+      await fs.rm(path.join(f.root, "extra.txt"));
+      run(f.root, "update-ref", f.ref, f.g("commit-tree", extraTree, "-p", f.head, "-m", "swapped"));
+    } } });
+    assert.equal(result.kind, "refused", JSON.stringify(result));
+    assert.match((result as { reason: string }).reason, /^(foreign_object|bare_transfer_mismatch)$/);
+    assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false, "the final ref is absent");
+    assert.equal(f.refsOf(f.bare).includes("uzi-incoming"), false);
   });
 
   test("an empty alternates file is harmless", async (t) => {
@@ -277,8 +361,9 @@ describe("captureTerminalSnapshot", () => {
   test("alternates planted after the clone ref exists are refused and no bare ref lands", async (t) => {
     const f = await fixture(t);
     await f.write("new.txt", "x");
+    const foreign = await foreignStore(f);
     const result = await f.capture({ seam: { afterCloneRef: async () => {
-      await fs.writeFile(path.join(f.root, ".git", "objects", "info", "alternates"), `${path.join(f.bare, "objects")}\n`);
+      await fs.writeFile(path.join(f.root, ".git", "objects", "info", "alternates"), `${path.join(foreign, "objects")}\n`);
     } } });
     assert.deepEqual(result, { kind: "refused", reason: "alternates_present" });
     assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
