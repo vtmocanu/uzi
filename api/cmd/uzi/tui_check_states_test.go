@@ -128,6 +128,33 @@ func TestTUICompletionBlockedWordFitsNarrowBoard(t *testing.T) {
 	}
 }
 
+func TestTUICompletionBlockedNeedsYouBandAndSummary(t *testing.T) {
+	blocked := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{
+		ID: "blocked-1", Kind: "issue", Status: statusPaused, CompletionPhase: "blocked",
+		HoldReason: checkPtr("completion_blocked"), IssueTitle: "Owner decision needed",
+	}}
+	ordinary := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{
+		ID: "paused-1", Kind: "issue", Status: statusPaused, IssueTitle: "Owner paused it",
+	}}
+	if got := runBandOf(blocked); got != bandNeedsYou {
+		t.Errorf("completion-blocked band = %d, want NEEDS YOU", got)
+	}
+	if got := runBandOf(ordinary); got != bandFloor {
+		t.Errorf("ordinary paused band = %d, want ON THE FLOOR", got)
+	}
+	rows := []apitypes.RunListItemDTO{blocked, ordinary}
+	m := tuiTestModel(t, &uzicli.FakeClient{Runs: rows}, "")
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: rows})
+	m = next.(tuiModel)
+	view := stripANSI(m.View().Content)
+	if !strings.Contains(view, "NEEDS YOU · 1") || !strings.Contains(view, "ON THE FLOOR · 1") {
+		t.Errorf("band counts did not split the owner decision from an ordinary pause:\n%s", view)
+	}
+	if summary := stripANSI(m.boardSummary()); !strings.Contains(summary, "‖ 1") || strings.Contains(summary, "⚑ 1") {
+		t.Errorf("board summary = %q, want a distinct completion-block count", summary)
+	}
+}
+
 func TestTUICompletionAndCrossCheckAsciiBoardAndDetail(t *testing.T) {
 	run := apitypes.RunDTO{ID: "check-001", Kind: "issue", Status: "running", CompletionPhase: "reworking",
 		CrossCheckActive: checkPtr("code"), CompletionUnmet: []string{"m3\x1b[2J\u202e"}, CompletionAttempts: 2}

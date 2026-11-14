@@ -2337,7 +2337,9 @@ The floor state word distinguishes `checking`, `reworking`, `compl blocked`,
 `NO_COLOR`. A run's detail names its completion phase and any live plan or
 advisory code cross-check on separate lines; `uzi run get` prints a
 `CROSS_CHECK` row while either check is live. The detail read refreshes this
-presence from the server rather than keeping a board snapshot.
+presence from the server rather than keeping a board snapshot. A held
+completion-blocked run appears under NEEDS YOU and has its own `‖ N` count in
+the floor summary, since it needs an owner decision.
 
 The floor summary, workers list and worker detail share one request chain,
 polling every 5s while any is visible, including an unfocused top pane.

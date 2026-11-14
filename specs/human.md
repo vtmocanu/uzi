@@ -1917,7 +1917,7 @@ Design record: issue #4209 (epic #3873).
 
 Design record: issue #4345 (Overview epic #3873, TUI parity).
 
-- The floor's one state word and single-cell glyph show checking completion, reworking unmet milestones, a blocked completion hold, a live plan or code cross-check, and a plan-gate revise, block, or unavailable reason. Existing human stops, stalled health, account cooldown, and a revising plan keep precedence. Completion wins over a simultaneous advisory code check on the row; detail shows both. (AI-synced 2026-11-14)
+- The floor's one state word and single-cell glyph show checking completion, reworking unmet milestones, a blocked completion hold, a live plan or code cross-check, and a plan-gate revise, block, or unavailable reason. Existing human stops, stalled health, account cooldown, and a revising plan keep precedence. Completion wins over a simultaneous advisory code check on the row; detail shows both. A completion-blocked hold belongs in NEEDS YOU and adds a distinct `‖ N` summary count (maintainer decision 2026-11-14). (AI-synced 2026-11-14)
 - The single-run API detail read carries the same live `cross_check_active` presence as the lists, so direct TUI entry and refresh do not depend on a board snapshot. The run detail names each applicable fact; `uzi run get` prints `CROSS_CHECK` while live. Unmet milestone ids are sanitized. (AI-synced 2026-11-14)
 
 ## Demo mode branding

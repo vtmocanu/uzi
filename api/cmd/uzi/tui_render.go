@@ -417,7 +417,7 @@ func checkRunState(r apitypes.RunDTO, isRevising bool) (glyph, word, tone string
 			return "⚑", "xchk n/a", "warn"
 		}
 	}
-	if r.Status == statusPaused && r.CompletionPhase == "blocked" {
+	if isCompletionBlockedTUI(r) {
 		return "‖", "compl blocked", "danger"
 	}
 	if r.Status == "running" {
