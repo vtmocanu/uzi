@@ -249,15 +249,16 @@ export interface CatalogDefault {
  *  source_labels of fixtures/model-settings/contract.json. */
 type EffectiveModelSource =
   | "user_default" | "instance_default" | "builtin" | "schedule_pin" | "template"
-  | "cross_check_pin" | "cross_check_worker_default";
+  | "cross_check_pin" | "cross_check_worker_default" | "run_override";
 type EffectiveEffortSource =
-  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default";
+  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default" | "run_override";
 type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create" | "same_as_run";
 type EffectiveCredentialSource =
   | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
 type EffectiveRefusal =
   | "no_credential_for_harness" | "no_usable_credential" | "credential_disabled" | "credential_not_found"
-  | "credential_override_harness_unsupported" | "credential_override_invalid";
+  | "credential_override_harness_unsupported" | "credential_override_invalid"
+  | "model_incompatible_with_harness";
 type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
 type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
 type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
@@ -343,6 +344,11 @@ export interface StartPreviewCredentialOverride {
 export interface StartPreviewRequest {
   harness: string | null;
   credential_override: StartPreviewCredentialOverride | null;
+  /** PRD #3250: the start-time model, shape-checked like run create (no trim). A model opts the
+   *  run out of automatic harness selection. Omit for the default. */
+  model?: string | null;
+  /** PRD #3250: the start-time reasoning effort (low, medium, high, xhigh or max). Omit for the default. */
+  effort?: string | null;
 }
 
 /** One harness a creation-time policy might choose, computed as if it were chosen. A refused
@@ -352,6 +358,9 @@ export interface StartPreviewAlternative {
   credential: Credential | null;
   refusal: EffectiveRefusal | null;
   refusal_detail: EffectiveRefusalDetail | null;
+  /** Present only when the request carried that choice (source run_override). */
+  worker_model?: ModelSettingCell;
+  worker_effort?: EffortSettingCell;
 }
 
 /** The start-preview response. When the harness is chosen at creation, `credential` is null and
@@ -363,6 +372,10 @@ export interface StartPreview {
   refusal: EffectiveRefusal | null;
   refusal_detail: EffectiveRefusalDetail | null;
   credential: Credential | null;
+  /** Present only when the request carried that choice and the harness is decided (source
+   *  run_override, effort mode explicit); with an undecided harness each alternative carries its own. */
+  worker_model?: ModelSettingCell;
+  worker_effort?: EffortSettingCell;
   alternatives?: StartPreviewAlternative[];
 }
 

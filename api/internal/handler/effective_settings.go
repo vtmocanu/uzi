@@ -54,6 +54,7 @@ const (
 	refusalCredentialNotFound     = "credential_not_found"      //nolint:gosec // G101: refusal-reason token, not a secret
 	refusalOverrideUnsupported    = "credential_override_harness_unsupported"
 	refusalOverrideInvalid        = "credential_override_invalid"
+	refusalModelIncompatible      = "model_incompatible_with_harness"
 	detailCredentialDisabled      = "credential_disabled" //nolint:gosec // G101: refusal-reason token, not a secret
 )
 
@@ -517,12 +518,17 @@ func (h *Handler) PreviewStartSettings(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "credential_override must have a mode of inherit, auto, default or pinned and a valid secret_id")
 		return
 	}
+	// The same shape step create runs (no trim, exact validators), before any prediction.
+	if msg := validateRunStartOptions(req.Model, req.Effort); msg != "" {
+		httpx.Error(w, http.StatusBadRequest, msg)
+		return
+	}
 	if h.wsvc == nil {
 		slog.Error("start preview: no worker service")
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	dto, err := h.buildStartPreview(r.Context(), user.ID, explicit, override)
+	dto, err := h.buildStartPreview(r.Context(), user.ID, explicit, override, req.Model, req.Effort)
 	if err != nil {
 		slog.Error("start preview", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -534,10 +540,16 @@ func (h *Handler) PreviewStartSettings(w http.ResponseWriter, r *http.Request) {
 // buildStartPreview predicts the harness with the override in the creation context (any non-inherit
 // override makes the creation-time policies ineligible), then validates the override against the
 // resulting harness, or, when the harness is chosen at creation, against each alternative.
-func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, explicit *workersvc.Harness, ov *previewOverride) (apitypes.StartPreviewDTO, error) {
+//
+// A start-time model opts the run out of the creation-time harness policies (D22), exactly as create
+// passes it in the creation origin; effort never touches the origin, so an effort-only request can
+// still leave the harness undecided. The model and effort cells come from the claim's own resolver
+// (PredictRunOverrideLead); an incompatible model is the model_incompatible_with_harness refusal.
+func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, explicit *workersvc.Harness, ov *previewOverride, model, effort *string) (apitypes.StartPreviewDTO, error) {
 	dto := apitypes.StartPreviewDTO{Version: apitypes.EffectiveSettingsVersion}
 	origin := workersvc.IssueStartOrigin()
 	origin.AnthropicOverride = ov != nil && ov.Mode != workersvc.CredentialOverrideModeInherit
+	origin.Model = model
 	out, err := h.predictStart(ctx, userID, explicit, origin)
 	if err != nil {
 		return dto, err
@@ -558,6 +570,15 @@ func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, expli
 			return dto, nil
 		}
 		dto.Credential = cred
+		cells, err := h.runOverrideCells(ctx, userID, pred.Harness, model, effort)
+		if err != nil {
+			return dto, err
+		}
+		if cells.refused.Token != "" {
+			dto.Refusal, dto.RefusalDetail = cells.refused.ptrs()
+			return dto, nil
+		}
+		dto.WorkerModel, dto.WorkerEffort = cells.model, cells.effort
 		return dto, nil
 	}
 
@@ -589,12 +610,66 @@ func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, expli
 		}
 		alt.Credential = cred
 		alt.Refusal, alt.RefusalDetail = ref.ptrs()
+		if ref.Token == "" {
+			cells, err := h.runOverrideCells(ctx, userID, hn, model, effort)
+			if err != nil {
+				return dto, err
+			}
+			if cells.refused.Token != "" {
+				alt.Credential = nil
+				alt.Refusal, alt.RefusalDetail = cells.refused.ptrs()
+			}
+			alt.WorkerModel, alt.WorkerEffort = cells.model, cells.effort
+		}
 		dto.Alternatives = append(dto.Alternatives, alt)
 	}
 	if ref := commonAlternativeRefusal(dto.Alternatives); ref.Token != "" {
 		dto.Refusal, dto.RefusalDetail = ref.ptrs()
 	}
 	return dto, nil
+}
+
+// runOverrideResult is the start-time model and effort cells on one harness, or the refusal that
+// replaces them. A nil cell is a choice the request did not carry.
+type runOverrideResult struct {
+	model   *apitypes.ModelSettingCellDTO
+	effort  *apitypes.EffortSettingCellDTO
+	refused refusal
+}
+
+// runOverrideCells predicts a start-time model and effort on harness hn through the claim's own
+// resolver. An incompatible model is a refusal, never a different model.
+func (h *Handler) runOverrideCells(ctx context.Context, userID uuid.UUID, hn workersvc.Harness, model, effort *string) (runOverrideResult, error) {
+	var out runOverrideResult
+	if model == nil && effort == nil {
+		return out, nil
+	}
+	lead, err := h.wsvc.PredictRunOverrideLead(ctx, userID, hn, model, effort, false)
+	if err != nil {
+		return out, fmt.Errorf("predict run override lead %s: %w", hn, err)
+	}
+	if u := lead.Unhonorable; u != nil {
+		if u.Setting != "model" {
+			// Effort is shape-checked before prediction, so only a model can be unhonorable here.
+			return out, fmt.Errorf("predict run override lead %s: unexpected unhonorable %s", hn, u.Setting)
+		}
+		out.refused = refusal{Token: refusalModelIncompatible}
+		return out, nil
+	}
+	if model != nil {
+		out.model = &apitypes.ModelSettingCellDTO{
+			Harness: string(hn), Model: model, DefaultModel: lead.DefaultModel, DefaultSource: lead.DefaultModelSource,
+			ResolvedModel: lead.Model, Source: lead.ModelSource,
+		}
+	}
+	if effort != nil {
+		def := agenttmpl.ResolveHarnessEffort(string(hn), nil)
+		out.effort = &apitypes.EffortSettingCellDTO{
+			Harness: string(hn), Effort: lead.Effort, DefaultEffort: def.Level, DefaultSource: def.Source,
+			ResolvedEffort: lead.Effort, Source: lead.EffortSource, Mode: agenttmpl.EffortModeExplicit,
+		}
+	}
+	return out, nil
 }
 
 // commonAlternativeRefusal is the top-level refusal of a chosen-at-create start-preview response

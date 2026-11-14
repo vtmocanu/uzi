@@ -803,7 +803,7 @@ function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undef
 // Absent and null request members mean the same choice, so key on the normalized triple.
 function previewRequestKey(r: StartPreviewRequest): string {
   const o = r.credential_override;
-  return JSON.stringify([r.harness ?? null, o?.mode ?? null, o?.secret_id ?? null]);
+  return JSON.stringify([r.harness ?? null, o?.mode ?? null, o?.secret_id ?? null, r.model ?? null, r.effort ?? null]);
 }
 
 // A draft's absent and null harness and model mean the same choice, but an absent

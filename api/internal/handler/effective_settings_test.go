@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -248,7 +249,21 @@ func previewRequest(body string) *http.Request {
 func TestStartPreviewRejectsMalformedRequests(t *testing.T) {
 	huge := `{"harness":null,"credential_override":{"mode":"pinned","secret_id":"` + strings.Repeat("a", startPreviewBodyLimit) + `"}}`
 	cases := map[string]string{ //nolint:gosec // G101: malformed request-body fixtures keyed by case name, not secrets
-		"unknown field":            `{"harness":null,"credential_override":null,"model":"opus"}`,
+		"unknown field": `{"harness":null,"credential_override":null,"label":"opus"}`,
+		// PRD #3250: model and effort are shape-checked exactly like run create (no trim).
+		"empty model":              `{"model":""}`,
+		"blank model":              `{"model":"   "}`,
+		"leading space":            `{"model":" opus"}`,
+		"trailing space":           `{"model":"opus "}`,
+		"interior space":           `{"model":"op us"}`,
+		"101 byte model":           `{"model":"` + strings.Repeat("a", 101) + `"}`,
+		"bidi control model":       "{\"model\":\"opus\u202e\"}",
+		"model wrong type":         `{"model":7}`,
+		"upper case effort":        `{"effort":"HIGH"}`,
+		"unknown effort":           `{"effort":"ultra"}`,
+		"padded effort":            `{"effort":" high"}`,
+		"empty effort":             `{"effort":""}`,
+		"effort wrong type":        `{"effort":["high"]}`,
 		"unknown nested field":     `{"credential_override":{"mode":"auto","label":"x"}}`,
 		"trailing value":           `{"harness":null} {"harness":null}`,
 		"oversize body":            huge,
@@ -323,5 +338,25 @@ func TestEffectiveSettingsStoreErrorIs500WithNoPartialBody(t *testing.T) {
 		if body := strings.TrimSpace(rec.Body.String()); body != `{"error":"internal error"}` {
 			t.Errorf("%s: body %q, want only the generic error envelope", name, body)
 		}
+	}
+}
+
+// TestStartPreviewBodyBoundAdmitsALongestModel: the 1 KiB body bound still admits the largest
+// well-formed request, a 100-byte model with every other member present (PRD #3250 section 8).
+func TestStartPreviewBodyBoundAdmitsALongestModel(t *testing.T) {
+	model := strings.Repeat("m", 100)
+	body := `{"harness":"codex","credential_override":{"mode":"pinned","secret_id":"` + uuid.NewString() + `"},"model":"` + model + `","effort":"xhigh"}`
+	if len(body) >= startPreviewBodyLimit {
+		t.Fatalf("test body is %d bytes, not under the %d byte bound", len(body), startPreviewBodyLimit)
+	}
+	var req apitypes.StartPreviewRequest
+	if err := httpx.DecodeJSONStrictBounded(previewRequest(body), &req, startPreviewBodyLimit); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if req.Model == nil || *req.Model != model || req.Effort == nil || *req.Effort != "xhigh" {
+		t.Fatalf("decoded model/effort = %v / %v", req.Model, req.Effort)
+	}
+	if msg := validateRunStartOptions(req.Model, req.Effort); msg != "" {
+		t.Fatalf("a 100-byte model and xhigh were refused: %s", msg)
 	}
 }

@@ -39,6 +39,8 @@ var modelSettingLabels = map[[2]string]string{
 	{"model", "cross_check_worker_default"}:     "worker default",
 	{"effort", "cross_check_pin"}:               "checker pin",
 	{"effort", "cross_check_default"}:           "cross-check default",
+	{"model", "run_override"}:                   "this run",
+	{"effort", "run_override"}:                  "this run",
 	{"harness", "run_override"}:                 "your choice for this run",
 	{"harness", "schedule_pin"}:                 "schedule pin",
 	{"harness", "user_default"}:                 "your default harness",

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -301,6 +302,9 @@ type LeadPrediction struct {
 	EffortSource string
 	// Subagents is nil for a review.
 	Subagents *SubagentPrediction
+	// Unhonorable is set when a start-time run_override model or effort cannot run on Harness; every
+	// other field is then unset (the claim would park the run, never substitute).
+	Unhonorable *RunOverrideUnhonorable
 }
 
 // leadPredictStore is the read surface PredictLead needs beyond the Store interface.
@@ -316,6 +320,39 @@ type leadPredictStore interface {
 // with the lead template's pins) decides, and an empty claim model falls to the worker default
 // (agenttmpl.ResolveWorkerDefaultModel). frozenModel is a schedule's frozen run model.
 func (s *Service) PredictLead(ctx context.Context, userID uuid.UUID, harness Harness, frozenModel *string, overrideSubagent bool, review bool) (LeadPrediction, error) {
+	return s.predictLead(ctx, userID, harness, leadRunChoice{model: frozenModel}, overrideSubagent, review)
+}
+
+// PredictRunOverrideLead is PredictLead for a manual start that carries a start-time model and/or
+// effort (PRD #3250): both are frozen onto the run with source run_override, so resolveLeadSettings
+// decides them exactly as a claim of that run would. A model the harness cannot run is not replaced:
+// the result carries Unhonorable. A nil argument is simply absent.
+func (s *Service) PredictRunOverrideLead(ctx context.Context, userID uuid.UUID, harness Harness, model, effort *string, overrideSubagent bool) (LeadPrediction, error) {
+	return s.predictLead(ctx, userID, harness, leadRunChoice{model: model, effort: effort, runOverride: true}, overrideSubagent, false)
+}
+
+// leadRunChoice is the run-frozen model and effort a lead prediction starts from. runOverride marks
+// them as a start-time choice (source run_override); otherwise a model is a schedule pin.
+type leadRunChoice struct {
+	model, effort *string
+	runOverride   bool
+}
+
+func (c leadRunChoice) apply(in *LeadSettingsInput) {
+	in.RunModel = pgconv.TextOrNull(derefString(c.model))
+	if !c.runOverride {
+		return
+	}
+	if in.RunModel.Valid {
+		in.RunModelSource = pgtype.Text{String: string(leadcfg.ModelSourceRunOverride), Valid: true}
+	}
+	if c.effort != nil {
+		in.RunEffort = pgtype.Text{String: *c.effort, Valid: true}
+		in.RunEffortSource = pgtype.Text{String: string(leadcfg.EffortSourceRunOverride), Valid: true}
+	}
+}
+
+func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Harness, choice leadRunChoice, overrideSubagent bool, review bool) (LeadPrediction, error) {
 	if review {
 		model := agenttmpl.ClaudeTaskReviewModel
 		if harness == HarnessCodex {
@@ -344,9 +381,12 @@ func (s *Service) PredictLead(ctx context.Context, userID uuid.UUID, harness Har
 	}
 	tClaude, tCodex := textPtr(row.TemplateModel), textPtr(row.TemplateCodexModel)
 
-	settings := resolveLeadSettings(LeadSettingsInput{
-		Harness: harness, RunModel: pgconv.TextOrNull(derefString(frozenModel)), LaneModel: lane, UserEffort: effort,
-	})
+	in := LeadSettingsInput{Harness: harness, LaneModel: lane, UserEffort: effort}
+	choice.apply(&in)
+	settings := resolveLeadSettings(in)
+	if settings.Unhonorable != nil {
+		return LeadPrediction{Harness: harness, Unhonorable: settings.Unhonorable}, nil
+	}
 	out := LeadPrediction{
 		Harness: harness, LaneModel: textPtr(lane), UserEffort: textPtr(effort),
 		Effort: settings.Effort, EffortSource: string(settings.EffortSource),

@@ -16,6 +16,30 @@
     "fixed_at": "x",
     "auth_mode": "x"
   },
+  "worker_model": {
+    "harness": "x",
+    "model": "x",
+    "default_model": "x",
+    "default_source": "x",
+    "resolved_model": "x",
+    "source": "x"
+  },
+  "worker_effort": {
+    "harness": "x",
+    "effort": "x",
+    "default_effort": "x",
+    "default_source": "x",
+    "resolved_effort": "x",
+    "source": "x",
+    "mode": "x",
+    "catalog_default": {
+      "state": "x",
+      "effort": "x",
+      "model": "x",
+      "runtime_version": "x",
+      "observed_at": "2020-01-02T03:04:05Z"
+    }
+  },
   "alternatives": [
     {
       "harness": "x",
@@ -26,7 +50,31 @@
         "auth_mode": "x"
       },
       "refusal": "x",
-      "refusal_detail": "x"
+      "refusal_detail": "x",
+      "worker_model": {
+        "harness": "x",
+        "model": "x",
+        "default_model": "x",
+        "default_source": "x",
+        "resolved_model": "x",
+        "source": "x"
+      },
+      "worker_effort": {
+        "harness": "x",
+        "effort": "x",
+        "default_effort": "x",
+        "default_source": "x",
+        "resolved_effort": "x",
+        "source": "x",
+        "mode": "x",
+        "catalog_default": {
+          "state": "x",
+          "effort": "x",
+          "model": "x",
+          "runtime_version": "x",
+          "observed_at": "2020-01-02T03:04:05Z"
+        }
+      }
     }
   ]
 }
