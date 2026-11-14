@@ -281,7 +281,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
         signal?.addEventListener("abort", wake, { once: true });
       });
     }
-    if (queued && (this.interceptedClosed || this.state === "poisoned" || signal?.aborted)) {
+    if (this.interceptedClosed || this.state === "poisoned" || (queued && signal?.aborted)) {
       this.safeErrorResponse(transport, requestId, REFRESH_FAILED_CODE, "codex authentication refresh unavailable");
       return;
     }

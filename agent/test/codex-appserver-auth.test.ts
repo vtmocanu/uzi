@@ -193,6 +193,66 @@ describe("Codex auth reversible suspension", () => {
     assert.equal(sends, 0);
   });
 
+  for (const pendingStartup of [false, true]) {
+    it(`rejects a pumped pre-suspension callback after close (pending startup: ${pendingStartup})`, async () => {
+      let sends = 0;
+      const login = deferred<unknown>();
+      const loginEntered = deferred<void>();
+      const auth = subscription({ refresh: async () => { sends += 1; return REFRESHED; } });
+      const transport = new FakeTransport((method, params) => {
+        if (method === "account/login/start" && pendingStartup) {
+          loginEntered.resolve();
+          return login.promise;
+        }
+        return defaultResponder(method, params);
+      });
+      const startup = auth.authenticate(transport);
+      if (pendingStartup) await loginEntered.promise;
+      else await startup;
+      // No suspension at admission: even a resolved startup yields in the pump.
+      assert.equal(transport.emitServerRequest(refreshRequest(1)), true);
+      const lease = auth.suspendRefreshAdmission();
+      auth.closeAdmissionAndCancel();
+      lease.resume();
+      lease.resume();
+      login.resolve({ type: "chatgptAuthTokens" });
+      await startup;
+      await auth.drainInterceptedRequests();
+      await lease.drain();
+      assert.equal(sends, 0);
+      assert.ok("error" in (responses(transport)[0]!.response as object));
+      await assert.rejects(auth.authenticate(transport), /admission is closed/);
+      await assert.rejects(auth.handleServerRequest(transport, refreshRequest(2)), /admission is closed/);
+      assert.equal(sends, 0, "stale resume cannot reopen terminal admission");
+    });
+  }
+
+  it("holds a startup-pumped callback through suspension until resume", async () => {
+    const login = deferred<unknown>();
+    const loginEntered = deferred<void>();
+    const entered = deferred<void>();
+    let sends = 0;
+    const auth = subscription({ refresh: async () => { sends += 1; entered.resolve(); return REFRESHED; } });
+    const transport = new FakeTransport((method, params) => {
+      if (method === "account/login/start") { loginEntered.resolve(); return login.promise; }
+      return defaultResponder(method, params);
+    });
+    const startup = auth.authenticate(transport);
+    await loginEntered.promise;
+    assert.equal(transport.emitServerRequest(refreshRequest(1)), true);
+    const lease = auth.suspendRefreshAdmission();
+    login.resolve({ type: "chatgptAuthTokens" });
+    await startup;
+    await lease.drain();
+    assert.equal(sends, 0);
+    assert.equal(responses(transport).length, 0);
+    lease.resume();
+    await entered.promise;
+    await auth.drainInterceptedRequests();
+    assert.equal(sends, 1);
+    assert.ok("result" in (responses(transport)[0]!.response as object));
+  });
+
   it("interrupts a queued callback on cancellation without poisoning", async () => {
     let sends = 0;
     const auth = subscription({ refresh: async () => { sends += 1; return REFRESHED; } });
@@ -604,6 +664,9 @@ describe("Codex app-server auth: intercepted request ownership", () => {
     const poisoned = deferred<void>();
     const close = transport.close.bind(transport);
     transport.close = () => { poisoned.resolve(); return close(); };
+    const lease = auth.suspendRefreshAdmission();
+    let leaseDrained = false;
+    const leaseDrain = lease.drain().then(() => { leaseDrained = true; });
     auth.closeAdmissionAndCancel();
     const drain = auth.drainInterceptedRequests();
     let drained = false;
@@ -621,22 +684,28 @@ describe("Codex app-server auth: intercepted request ownership", () => {
     // That event is independent of the still-owned raw bridge promise.
     await poisoned.promise;
     assert.equal(drained, false, "raw bridge still owns drain after cancellation grace");
+    assert.equal(leaseDrained, false, "lease drain retains raw ownership after handler cancellation grace");
     raw.resolve(REFRESHED);
     await checked;
+    await leaseDrain;
+    assert.equal(leaseDrained, true, "lease drain resolves only after raw settlement");
     await assert.rejects(auth.drainInterceptedRequests(), /did not settle after cancellation/);
   });
 
   it("retains malformed-response poison accepted immediately before close", async () => {
+    const entered = deferred<void>();
+    const raw = deferred<ServerVerifiedCodexAuthTokens>();
     const auth = subscription({
-      refresh: async () => ({ accessToken: "", accountId: "" }),
+      refresh: () => { entered.resolve(); return raw.promise; },
     });
     const transport = new FakeTransport();
     await auth.authenticate(transport);
     assert.equal(transport.emitServerRequest(refreshRequest(1)), true);
 
-    // Close in the same synchronous turn, before the intercepted task resumes after its
-    // startup await. The later invalid response is still a protocol poison, not an
-    // expected transport/startup cancellation.
+    await entered.promise;
+    // The raw exchange has started. Settle its response before cancellation, then close
+    // before the response continuation validates it: the late validation must poison.
+    raw.resolve({ accessToken: "", accountId: "" });
     auth.closeAdmissionAndCancel();
     await transport.close();
     await assert.rejects(auth.drainInterceptedRequests(), (error: unknown) => {
