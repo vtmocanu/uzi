@@ -1993,6 +1993,8 @@ export function composeHistoryRewrittenReason(publishedTip: string): string {
  * pointer to where retained work, if any, is listed (held publication, ADR-2545, then recovery),
  * without claiming the work exists. The terminal `failure_reason` is composed separately and never
  * carries the pointer. A run id that is not a UUID is shown as `<run-id>`. Exported for a direct test.
+ * Issue #4268: the held closing route is fixed text (no commit text); continue applies only when no
+ * offending commit is reachable from published history, which the finalize bridge re-parents back.
  */
 export function composePrepushRefusalStatus(
   kind: "closing" | "unknown" | "context", failureReason: string, holdEligible: boolean,
@@ -2002,7 +2004,7 @@ export function composePrepushRefusalStatus(
     ? holdEligible
       ? "Completion state could not be confirmed before push; the run is held for the owner."
       : "Completion state could not be confirmed before push; publication stopped."
-    : `${failureReason}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history.${holdEligible ? " For unpublished history on a run without a Stop, choose continue with guidance for the lead to reword its own commits; for published history or a Stop, cancel and deliver the preserved work with corrected messages." : ""}`;
+    : `${failureReason}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history.${holdEligible ? " Continue with guidance naming the SHAs for the lead to reword its own commits only if no offending commit, including any counted as more, is reachable from the run branch as published on the forge or from a published checkpoint ref (see uzi run recovery); when some are only counted, the listed SHAs alone cannot show that. Otherwise, or with a Stop, cancel and deliver the preserved work with corrected messages: finalize restores published commits as ancestors, so continue cannot clear the hold." : ""}`;
   if (!refresh) return text;
   const id = RUN_ID_RE.test(runId) ? runId : "<run-id>";
   return `${text}${text.endsWith(".") ? " " : ". "}Retained work, if any, is listed by uzi run held ${id} or uzi run recovery ${id}.`;
