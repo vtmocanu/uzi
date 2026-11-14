@@ -966,6 +966,7 @@ var wantRouteMounts = []routeMount{
 	// Issue #4201: the in-place credential switch apply rides proposalLimiter.PerWorkerMiddleware
 	// (per-WORKER), which this per-USER probe reads as noLimiter.
 	{"POST", "/api/worker/runs/{id}/credential-switch/apply", noLimiter},
+	{"POST", "/api/worker/runs/{id}/credential-switch/codex/preflight", noLimiter},
 	// Bounded local lifecycle report, no forge/provider I/O; both actual router
 	// chains are also pinned by TestPolicyHoldRouteHasNoRateLimiter.
 	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},

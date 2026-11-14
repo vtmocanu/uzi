@@ -156,10 +156,10 @@ const CredentialSwitchV1 = "credential_switch_v1" //nolint:gosec // G101: a capa
 // protocol, which such a worker also speaks and falls back to), so the api drains /inputs for a
 // pending switch only for a worker that registered this one; a v1-only worker keeps the
 // signal-and-no-drain contract.
+const CredentialSwitchInPlaceV1 = "credential_switch_in_place_v1" //nolint:gosec // G101: a capability VOCABULARY name, not a credential — a protocol token stored in workers.protocol_capabilities, never a secret.
+
 // CodexCredentialSwitchV1 negotiates pending-only Codex switch requests.
 const CodexCredentialSwitchV1 = "codex_credential_switch_v1"
-
-const CredentialSwitchInPlaceV1 = "credential_switch_in_place_v1" //nolint:gosec // G101: a capability VOCABULARY name, not a credential — a protocol token stored in workers.protocol_capabilities, never a secret.
 
 // WallParkV1 is the PROTOCOL capability a worker self-reports (PRD #1497 M1, D13) to declare it
 // implements the wall-clock PARK protocol — it drops its turn on a system 'wall' pause input,

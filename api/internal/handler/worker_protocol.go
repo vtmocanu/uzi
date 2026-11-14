@@ -1764,6 +1764,36 @@ func (h *Handler) WorkerCredentialSwitchApply(w http.ResponseWriter, r *http.Req
 	httpx.JSON(w, http.StatusOK, res)
 }
 
+// WorkerCodexSwitchPreflight returns only a bounded, point-in-time decision.
+// It never grants authority and does not advertise the unfinished apply feature.
+func (h *Handler) WorkerCodexSwitchPreflight(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	var req workersvc.CodexSwitchPreflightRequest
+	if err := httpx.DecodeJSONStrictBounded(r, &req, maxCredentialSwitchApplyBody); err != nil {
+		httpx.RespondDecodeError(w, err, "invalid request body")
+		return
+	}
+	res, err := h.wsvc.PreflightCodexCredentialSwitch(r.Context(), wkr, runID, req)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrInvalidApplyRequest) || errors.Is(err, workersvc.ErrCredentialOverridePinnedNeedsSecret) {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		} else {
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusOK, res)
+}
+
 // workerStateAck builds the state-report ack body: the run DTO plus, when a held-state switch is
 // pending for the run's CURRENT claim, the worker-facing credential_switch signal (PRD #1247 M5,
 // D3/D4). It is shared by the 200 ack and the ORDINARY not-applied 409 ack — both hand back a run

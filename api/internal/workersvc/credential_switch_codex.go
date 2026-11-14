@@ -40,8 +40,7 @@ var errCodexSwitchRead = errors.New("codex credential switch preflight unavailab
 // used by refresh admission. It always rolls back, calls no provider and returns
 // no credential. Apply must repeat these checks in its own transaction.
 func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.Worker, runID uuid.UUID, req CodexSwitchPreflightRequest) (result CodexSwitchPreflightResult, retErr error) {
-	op, _, err := ValidateCredentialSwitchApplyRequest(req.CredentialSwitchApplyRequest)
-	if err != nil {
+	if _, _, err := ValidateCredentialSwitchApplyRequest(req.CredentialSwitchApplyRequest); err != nil {
 		return CodexSwitchPreflightResult{}, err
 	}
 	if req.TargetSecretID == uuid.Nil {
@@ -52,7 +51,6 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 	if s.txBeginner == nil {
 		return CodexSwitchPreflightResult{}, errCodexSwitchRead
 	}
-	gen := req.ClaimGeneration
 	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return CodexSwitchPreflightResult{}, errCodexSwitchRead
@@ -76,6 +74,19 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 	if err != nil {
 		return CodexSwitchPreflightResult{}, errCodexSwitchRead
 	}
+	return s.validateCodexSwitchLocked(ctx, q, w, run, req)
+}
+
+// validateCodexSwitchLocked provides validation for preflight and future apply. The caller holds
+// worker then run locks in a READ COMMITTED transaction. This validator only
+// reads material and takes bounded NOWAIT alias/account/intent locks; it never
+// starts a transaction or calls a provider.
+func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Queries, w store.Worker, run store.Run, req CodexSwitchPreflightRequest) (result CodexSwitchPreflightResult, retErr error) {
+	op, _, err := ValidateCredentialSwitchApplyRequest(req.CredentialSwitchApplyRequest)
+	if err != nil {
+		return CodexSwitchPreflightResult{}, err
+	}
+	gen, runID := req.ClaimGeneration, run.ID
 	defer func() {
 		if retErr == nil {
 			result.ClaimGeneration = run.ClaimGeneration
@@ -276,7 +287,19 @@ func codexSwitchFence(w store.Worker, r store.Run, req CredentialSwitchApplyRequ
 		w.SnapshotRegisterNonce.Valid && w.SnapshotRegisterNonce.String == req.RegisterNonce &&
 		r.WorkerID.Valid && uuid.UUID(r.WorkerID.Bytes) == w.ID &&
 		r.ClaimGeneration == req.ClaimGeneration && !r.ClaimReleasedAt.Valid &&
-		applyLiveStatus(r.Status) && r.Kind != "job" && r.Kind != "cross_check"
+		applyLiveStatus(r.Status) && codexSwitchLaneEligible(r)
+}
+
+// These lanes have no worker coordinator for an in-place Codex switch.
+func codexSwitchLaneEligible(r store.Run) bool {
+	if r.ReviewTargetRunID.Valid {
+		return false
+	}
+	switch r.Kind {
+	case "chat", "judge", "self_improve", "job", "cross_check":
+		return false
+	}
+	return true
 }
 
 func codexSwitchTargetUsable(kind, status string, linked bool) bool {

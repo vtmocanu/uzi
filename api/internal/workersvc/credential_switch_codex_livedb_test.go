@@ -6,13 +6,15 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // These tests exercise the service seam and compare all run/journal/message
 // state before and after. The real local secret opener is configured; no provider client is installed.
 func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 	for _, scenario := range []string{
-		"ready", "missing baseline", "disabled target", "foreign target",
+		"ready", "locked vault", "subscription", "missing baseline", "disabled target", "foreign target",
 		"stale nonce", "stale generation", "wrong operation", "released",
 		"claimed", "awaiting_approval", "awaiting_input", "awaiting_followup",
 		"policy refusal", "binding mismatch", "epoch mismatch",
@@ -25,6 +27,9 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 			run, op := f.run(t, "running")
 			old := f.env.seedStaticAPIKey(t, f.o.userID, "old-api", "old-test-key")
 			target := f.env.seedStaticAPIKey(t, f.o.userID, "new-api", "new-test-key")
+			if scenario == "subscription" {
+				target = f.env.seedLinkedSubscription(t, f.o.userID, "subscription-target", codexToken("target-access"), codexToken("target-refresh"))
+			}
 			if err := f.svc.FreezeCodexBinding(f.env.ctx, f.o.userID, run, old, codexAuthModeAPIKey); err != nil {
 				t.Fatal(err)
 			}
@@ -37,6 +42,17 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 			req := CodexSwitchPreflightRequest{CredentialSwitchApplyRequest: f.req(op), TargetSecretID: target}
 			want, reason := "ready", ""
 			switch scenario {
+			case "locked vault":
+				vlt := vault.NewPostgres(f.env.box, f.env.pool)
+				f.svc.SetVault(vlt)
+				enrollCodexProtectedVault(t, f.env, vlt, f.o.userID, codexVaultLockedTestPassword)
+				sealed, err := vlt.Seal(f.env.ctx, f.o.userID, store.KindOpenAIAPIKey, []byte("locked-target-key"), vault.SealForUse)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.env.exec("UPDATE user_secrets SET ciphertext=$2, sealed_with=$3 WHERE id=$1", target, sealed.Ciphertext, sealed.SealedWith)
+				vlt.Lock(f.o.userID)
+				want, reason = ApplyOutcomeNotApplied, applyReasonVaultLocked
 			case "missing baseline":
 				want, reason = ApplyOutcomeNotApplied, "baseline_missing"
 			case "disabled target":

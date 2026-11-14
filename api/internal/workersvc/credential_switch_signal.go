@@ -18,6 +18,8 @@ type CredentialSwitchSignal struct {
 	// failed and uncertain reports so each is fenced to this exact request. Omitted when the stamp
 	// carries no id (an older row), which a v1 worker never reads.
 	OpID string `json:"op_id,omitempty"`
+	// TargetSecretID is a pending selector, never committed authority or auth.
+	TargetSecretID string `json:"target_secret_id,omitempty"`
 }
 
 // PendingCredentialSwitchSignal returns the signal for the worker holding the run's CURRENT
@@ -39,6 +41,11 @@ func PendingCredentialSwitchSignal(run store.Run) *CredentialSwitchSignal {
 	sig := &CredentialSwitchSignal{Generation: run.ClaimGeneration}
 	if run.CredentialSwitchOpID.Valid {
 		sig.OpID = uuid.UUID(run.CredentialSwitchOpID.Bytes).String()
+	}
+	if run.Harness == harnessCodex && run.CredentialSwitchOpID.Valid && run.CodexSwitchTargetOpID.Valid && run.CodexSwitchTargetSecretID.Valid &&
+		run.CodexSwitchTargetGeneration == run.CredentialSwitchGeneration &&
+		run.CodexSwitchTargetOpID == run.CredentialSwitchOpID {
+		sig.TargetSecretID = uuid.UUID(run.CodexSwitchTargetSecretID.Bytes).String()
 	}
 	return sig
 }

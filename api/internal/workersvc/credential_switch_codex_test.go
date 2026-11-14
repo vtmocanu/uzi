@@ -104,3 +104,17 @@ func TestCodexSwitchPolicyFence(t *testing.T) {
 		t.Fatal("empty episode blocked")
 	}
 }
+
+func TestCodexSwitchOwnerLaneRefusals(t *testing.T) {
+	var svc Service
+	for _, kind := range []string{"chat", "judge", "self_improve", "job", "cross_check", "task"} {
+		run := store.Run{Status: "running", Kind: kind}
+		if kind == "task" {
+			run.ReviewTargetRunID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+		}
+		_, err := svc.requestCodexCredentialSwitch(context.Background(), run, BindModePinned, nil)
+		if !errors.Is(err, ErrCredentialOverrideLaneNotSwitchable) {
+			t.Fatalf("%s: got %v, want lane refusal", kind, err)
+		}
+	}
+}

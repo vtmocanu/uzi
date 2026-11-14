@@ -597,6 +597,9 @@ func (s *Service) requestCodexCredentialSwitch(ctx context.Context, observed sto
 	if !applyLiveStatus(observed.Status) {
 		return SetRunCredentialResult{}, ErrCodexSwitchIneligible
 	}
+	if !codexSwitchLaneEligible(observed) {
+		return SetRunCredentialResult{}, ErrCredentialOverrideLaneNotSwitchable
+	}
 	if mode != BindModePinned || secretID == nil || *secretID == uuid.Nil {
 		return SetRunCredentialResult{}, ErrCredentialOverridePinnedNeedsSecret
 	}
@@ -622,6 +625,9 @@ func (s *Service) requestCodexCredentialSwitch(ctx context.Context, observed sto
 	if w.UserID != observed.UserID || run.UserID != observed.UserID || run.ClaimGeneration != observed.ClaimGeneration ||
 		run.ClaimReleasedAt.Valid || !applyLiveStatus(run.Status) || run.Kind == "job" || run.Kind == "cross_check" {
 		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+	}
+	if !codexSwitchLaneEligible(run) {
+		return SetRunCredentialResult{}, ErrCredentialOverrideLaneNotSwitchable
 	}
 	if codexSwitchPolicyBlocked(run) {
 		return SetRunCredentialResult{}, &RunOwnerHeldError{Label: "policy hold"}
