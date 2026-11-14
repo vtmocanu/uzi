@@ -7911,6 +7911,10 @@ type SeededPlan struct {
 // schedule's, none otherwise. A run_override model is checked against the resolved harness inside
 // the create transaction; effort, when present, is stamped with effort_source run_override.
 func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, modelSrc modelSource, effort *string, overrideSubagentModel bool, force bool, seed *SeededPlan, requested *AgentSelection, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+	// PRD #3250: an effort is stored only as an exact canonical level, whichever caller supplied it.
+	if effort != nil && !validRunEffort(*effort) {
+		return store.Run{}, ErrInvalidRunEffort
+	}
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.

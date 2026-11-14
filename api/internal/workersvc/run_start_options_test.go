@@ -1,9 +1,12 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 // TestRunOverrideModelHonorable pins the run_override predicate (PRD #3250): stricter than
@@ -51,7 +54,7 @@ func TestRunOverrideModelHonorable(t *testing.T) {
 
 func TestModelIncompatibleErrorText(t *testing.T) {
 	codex := &ModelIncompatibleError{Model: "opus", Harness: HarnessCodex}
-	want := "opus is not a Codex model, and this run resolved to the codex harness; start it on the Claude harness or choose one of: gpt-5.6-sol, gpt-6-astra, gpt-6-sol, gpt-6.1-sol"
+	want := "opus is not a model a Codex run can start with, and this run resolved to the codex harness; start it on the Claude harness or choose one of: gpt-5.6-sol, gpt-6-astra, gpt-6-sol, gpt-6.1-sol"
 	if got := codex.Error(); got != want {
 		t.Errorf("codex text = %q, want %q", got, want)
 	}
@@ -61,5 +64,22 @@ func TestModelIncompatibleErrorText(t *testing.T) {
 	}
 	if !errors.Is(codex, ErrModelIncompatibleWithHarness) {
 		t.Error("ModelIncompatibleError must match ErrModelIncompatibleWithHarness")
+	}
+}
+
+// TestCreateRunRefusesInvalidEffort pins the service-side effort guard: whichever caller reaches
+// createRun, an effort that is not exactly a canonical level is refused before any write.
+func TestCreateRunRefusesInvalidEffort(t *testing.T) {
+	for _, e := range []string{"", "HIGH", "ultra", " high", "high\x1b[2J"} {
+		e := e
+		_, err := (&Service{}).createRun(context.Background(), uuid.New(), uuid.New(), 1, "manual", "", false, nil, nil, nil, modelSourceNone, &e, false, false, nil, nil, nil, nil, nil)
+		if !errors.Is(err, ErrInvalidRunEffort) {
+			t.Errorf("effort %q: err = %v, want ErrInvalidRunEffort", e, err)
+		}
+	}
+	for _, e := range []string{"low", "medium", "high", "xhigh", "max"} {
+		if !validRunEffort(e) {
+			t.Errorf("effort %q must be valid", e)
+		}
 	}
 }

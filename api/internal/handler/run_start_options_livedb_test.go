@@ -464,6 +464,18 @@ func TestRunStartCredentialRefusalsKeepPrecedenceLiveDB(t *testing.T) {
 			t.Errorf("a refusal must leave no run row")
 		}
 	})
+	t.Run("malformed secret_id keeps its 400 over an explicit-harness model refusal", func(t *testing.T) {
+		f := newRunStartFixture(ctx, t)
+		repoID, path := f.seedIssue(ctx, t, 7)
+		rec := bearerReqBody(f.router, http.MethodPost, path, cliMintToken(t, f.pool, f.owner, clitoken.ScopeUser),
+			`{"issue_iid":7,"harness":"codex","model":"opus","credential_override":{"mode":"pinned","secret_id":"not-a-uuid"}}`)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "credential_override.secret_id must be a valid uuid") {
+			t.Fatalf("status = %d body %s, want the secret_id 400", rec.Code, rec.Body.String())
+		}
+		if len(f.runRows(ctx, t, repoID)) != 0 {
+			t.Errorf("a refusal must leave no run row")
+		}
+	})
 	t.Run("pinned secret that does not exist", func(t *testing.T) {
 		f := newRunStartFixture(ctx, t)
 		repoID, path := f.seedIssue(ctx, t, 7)

@@ -52,6 +52,16 @@ func effortSourceFor(effort *string) pgtype.Text {
 	return pgtype.Text{String: effortSourceRunOverride, Valid: true}
 }
 
+// ErrInvalidRunEffort refuses a start-time effort outside agenttmpl.EffortLevels. The handler's shape
+// step rejects it first; createRun re-checks so no caller can persist an unvalidated effort.
+var ErrInvalidRunEffort = errors.New("effort must be one of low, medium, high, xhigh, max")
+
+// validRunEffort reports whether effort is exactly one of the canonical levels (no trimming).
+func validRunEffort(effort string) bool {
+	e, err := agenttmpl.ValidateEffort(effort)
+	return err == nil && e != "" && e == effort
+}
+
 // ErrModelIncompatibleWithHarness is the sentinel a run-start model refusal matches: the chosen
 // run_override model cannot be served by the harness the create resolved to.
 var ErrModelIncompatibleWithHarness = errors.New("model is incompatible with the run's harness")
@@ -67,7 +77,7 @@ type ModelIncompatibleError struct {
 // curated set so it cannot drift.
 func (e *ModelIncompatibleError) Error() string {
 	if e.Harness == HarnessCodex {
-		return fmt.Sprintf("%s is not a Codex model, and this run resolved to the codex harness; start it on the Claude harness or choose one of: %s",
+		return fmt.Sprintf("%s is not a model a Codex run can start with, and this run resolved to the codex harness; start it on the Claude harness or choose one of: %s",
 			e.Model, strings.Join(codexCuratedModelsSlice(), ", "))
 	}
 	return fmt.Sprintf("%s cannot run on the Claude harness, and this run resolved to the claude harness; start it on the Codex harness or choose a Claude model", e.Model)
@@ -78,10 +88,10 @@ func (e *ModelIncompatibleError) Is(target error) bool {
 }
 
 // RunOverrideModelHonorable reports whether harness can serve a start-time run_override model.
-// It is exported for the handler's fast-fail beside the authoritative in-transaction check. It is
-// stricter than harnessModelCompatible, which keeps screening schedule pins: a blank or
-// whitespace-bearing value is never honorable, Claude refuses every Codex role id
-// (gpt-6-luna included), and Codex accepts only the curated set.
+// It is exported for the handler's fast-fail beside the authoritative in-transaction check.
+// Schedule pins keep harnessModelCompatible. On Claude both refuse every Codex role id; this
+// predicate additionally refuses a blank, whitespace-bearing or ValidateModel-invalid value
+// (harnessModelCompatible trims and accepts blank), and Codex accepts only the curated set.
 func RunOverrideModelHonorable(harness Harness, model string) bool {
 	return runOverrideModelHonorable(harness, model)
 }

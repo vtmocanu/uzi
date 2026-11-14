@@ -157,18 +157,6 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// PRD #3250: shape-check the start-time model/effort before any forge read, then fast-fail an
-	// explicit harness that cannot serve the model (D11 cannot fall back from an explicit one). The
-	// authoritative check, on the harness the create resolves to, runs inside the create transaction.
-	if msg := validateRunStartOptions(req.Model, req.Effort); msg != "" {
-		httpx.Error(w, http.StatusBadRequest, msg)
-		return
-	}
-	if req.Model != nil && explicit != nil && !workersvc.RunOverrideModelHonorable(*explicit, *req.Model) {
-		h.writeModelIncompatible(w, &workersvc.ModelIncompatibleError{Model: *req.Model, Harness: *explicit})
-		return
-	}
-
 	// PRD #1429 M2 (D5): thread the RAW credential override (mode + optional secret id) down into
 	// the create path. It is validated through the one validator against the D11-RESOLVED harness
 	// INSIDE the create transaction (createRunAtomic) — not against a pre-transaction guess — so an
@@ -188,6 +176,19 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			secretID = &id
 		}
 		rawOverride = &workersvc.RawCredentialOverride{Mode: req.CredentialOverride.Mode, SecretID: secretID}
+	}
+
+	// PRD #3250: shape-check the start-time model/effort before any forge read (after the
+	// credential-override parse above, so its malformed-secret_id 400 keeps precedence), then fast-fail an
+	// explicit harness that cannot serve the model (D11 cannot fall back from an explicit one). The
+	// authoritative check, on the harness the create resolves to, runs inside the create transaction.
+	if msg := validateRunStartOptions(req.Model, req.Effort); msg != "" {
+		httpx.Error(w, http.StatusBadRequest, msg)
+		return
+	}
+	if req.Model != nil && explicit != nil && !workersvc.RunOverrideModelHonorable(*explicit, *req.Model) {
+		h.writeModelIncompatible(w, &workersvc.ModelIncompatibleError{Model: *req.Model, Harness: *explicit})
+		return
 	}
 
 	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
@@ -458,6 +459,8 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, workersvc.ErrBranchInUse):
 		// Issue #1626: an active ci_fix OR mr_rework on agent/issue-<iid> holds the branch.
 		httpx.Error(w, http.StatusConflict, "a CI-fix or MR-rework run is already working this issue's branch; cancel it before starting an issue run")
+	case errors.Is(err, workersvc.ErrInvalidRunEffort):
+		httpx.Error(w, http.StatusBadRequest, "effort must be one of low, medium, high, xhigh, max")
 	case errors.Is(err, workersvc.ErrModelIncompatibleWithHarness):
 		// PRD #3250: the run's resolved harness cannot serve the chosen run_override model.
 		var mie *workersvc.ModelIncompatibleError
