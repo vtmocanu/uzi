@@ -8,7 +8,7 @@ SET LOCAL lock_timeout = '5s';
 -- there is deliberately no pairing CHECK between a value and its source.
 -- Added NOT VALID so the CHECK validation scan does not run under the ACCESS EXCLUSIVE lock the
 -- ADD COLUMN holds; a NOT VALID CHECK is still enforced on new writes and on the backfill UPDATE
--- below. 00443 validates both in its own transaction (SHARE UPDATE EXCLUSIVE). The backfill UPDATE
+-- below. 00455 validates both in its own transaction (SHARE UPDATE EXCLUSIVE). The backfill UPDATE
 -- itself does scan runs (rewriting only rows with a model) while that lock is held; the api is a
 -- Recreate singleton migrating at boot, so this lengthens boot, not live traffic.
 ALTER TABLE runs
