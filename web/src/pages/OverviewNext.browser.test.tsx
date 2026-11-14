@@ -1554,8 +1554,12 @@ describe("OverviewNext Repos chip", () => {
     delete document.documentElement.dataset.font;
   });
 
+  // 641 and 650 are where the header actions wrap in this fixture and the chip starts its own row
+  // at the left edge, so a right-aligned panel would hang off the left of the viewport.
   for (const [width, height] of [
     [1280, 900],
+    [641, 900],
+    [650, 900],
     [400, 900],
   ] as const) {
     it(`opens inside the viewport and closes on Escape back to the chip at ${width}x${height}`, async () => {

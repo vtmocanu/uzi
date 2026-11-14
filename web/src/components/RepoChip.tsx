@@ -4,7 +4,7 @@
 // many are idle. All figures come from the pure repoActivityModel; this component only draws
 // it. The open/close model, focus handling and panel are a parallel copy of PeopleChip's.
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { repoIdleText, type ActiveRepo, type RepoActivityModel } from "../lib/overviewRepos";
 import { cx } from "./ui";
@@ -66,6 +66,7 @@ function headerText(active: Active, total: number | null): string {
 
 export function RepoChip({ model }: { model: RepoActivityModel }) {
   const [open, setOpen] = useState(false);
+  const [alignLeft, setAlignLeft] = useState(false);
   const hostRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -78,6 +79,14 @@ export function RepoChip({ model }: { model: RepoActivityModel }) {
     setOpen(false);
     if (returnFocus) triggerRef.current?.focus();
   }, []);
+
+  // Decided on open: a right-aligned panel needs the trigger's right edge to leave room for the
+  // panel width plus a 16px margin; otherwise align to the trigger's left edge.
+  useLayoutEffect(() => {
+    if (!open || !triggerRef.current) return;
+    const panelWidth = Math.min(360, window.innerWidth - 32);
+    setAlignLeft(triggerRef.current.getBoundingClientRect().right < panelWidth + 16);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -162,9 +171,14 @@ export function RepoChip({ model }: { model: RepoActivityModel }) {
           role="dialog"
           aria-label="Repos in uzi"
           tabIndex={-1}
-          // Desktop: below the chip, right edge aligned to it. Below sm the panel becomes a bottom
-          // sheet (fixed, 1rem insets), so it fits wherever the wrapped header puts the chip.
-          className="absolute right-0 top-full z-30 mt-2 max-h-[70vh] w-[min(360px,calc(100vw-32px))] overflow-y-auto rounded-xl border border-edge bg-raised text-left shadow-2xl outline-hidden max-sm:fixed max-sm:inset-x-4 max-sm:bottom-4 max-sm:top-auto max-sm:mt-0 max-sm:max-h-[calc(100dvh-2rem)] max-sm:w-auto"
+          // Desktop: below the chip, right edge aligned to it, or left edge when the chip sits too
+          // close to the viewport's left edge (a wrapped header) for a right-aligned panel to fit.
+          // Below sm the panel becomes a bottom sheet (fixed, 1rem insets), so it fits anywhere.
+          className={cx(
+            "absolute top-full z-30 mt-2 max-h-[70vh]",
+            alignLeft ? "sm:left-0" : "sm:right-0",
+            " w-[min(360px,calc(100vw-32px))] overflow-y-auto rounded-xl border border-edge bg-raised text-left shadow-2xl outline-hidden max-sm:fixed max-sm:inset-x-4 max-sm:bottom-4 max-sm:top-auto max-sm:mt-0 max-sm:max-h-[calc(100dvh-2rem)] max-sm:w-auto",
+          )}
         >
           <div className="space-y-3 p-3">
             <div className="flex items-start justify-between gap-2">
