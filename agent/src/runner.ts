@@ -1,6 +1,7 @@
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
 import { RESUME_LINEAGE_BREAK_EVENT } from "./harness-messages.js";
+import { terminalPreservationActive, type TerminalPreservationTestHooks } from "./terminal-preservation.js";
 import { validatePolicyHoldRequest } from "./protocol.js";
 import { checkpointCoordinatesForClaim, type CheckpointCoordinates } from "./checkpoint-coordinates.js";
 import { prepareCIEvidence, validateCIRepairClaim, type PreparedCIEvidence } from "./ci-evidence.js";
@@ -3341,6 +3342,9 @@ export interface CheckpointTestHooks {
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
   codexOperationWaitPolicy?: CodexOperationWaitPolicy;
+  /** TEST-ONLY, constructor-only (#4007 slice B): turns the production-dark terminal-preservation gate on for this
+   *  instance. Never passed by main.ts or worker.ts; see terminal-preservation.ts. */
+  terminalPreservationTestOverride?: TerminalPreservationTestHooks;
   /** issue #3404 M2 U3: the completion-authority runtime. Every runner path that reaches a hooked
    *  GitCache effect opens its transaction through it, BEFORE any C/S/J/B it takes; the flight's
    *  executor is bound to its clone through it. Absent (unit tests): legacy behaviour. */
@@ -3800,6 +3804,13 @@ export class RunRunner {
   private readonly shutdownSignal = new AbortController();
   /** PRD #1809 D6 (N3): see RunnerOptions.dataVolumeReclaimWaitMs. */
   private readonly dataVolumeReclaimWaitMs: number;
+  private readonly terminalPreservationTestOverride: TerminalPreservationTestHooks | undefined;
+
+  /** #4007 slice B production-dark gate: the first statement of every terminal-preservation entry point. Not private
+   *  only because no production caller exists yet (noUnusedLocals would reject an unread private member). */
+  terminalPreservationEnabled(): boolean {
+    return terminalPreservationActive(this.terminalPreservationTestOverride);
+  }
 
   constructor(
     private readonly client: WorkerClient,
@@ -3815,6 +3826,7 @@ export class RunRunner {
     opts: RunnerOptions = {},
   ) {
     this.authority = opts.authority;
+    this.terminalPreservationTestOverride = opts.terminalPreservationTestOverride;
     this.restoreIdentity = opts.restoreIdentity;
     this.independentRestore = opts.independentRestore !== false;
     this.restoreSkipExecutionComparison = opts.restoreSkipExecutionComparison === true;

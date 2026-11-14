@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import { terminalPreservationActive, type TerminalPreservationTestHooks } from "./terminal-preservation.js";
 import { AuthorityLockBusy, AuthorityRefusal } from "./authority-lock.js";
 import type { AuthorityScope, AuthorityWait, RetirementHandle, RetirementView } from "./authority-runtime.js";
 import {
@@ -951,6 +952,9 @@ function receiptMatches(observed: RecoveryExactHold, request: NonNullable<Recove
 }
 
 export interface RecoveryCoordinatorOptions {
+  /** TEST-ONLY, constructor-only (#4007 slice B): turns the production-dark terminal-preservation gate on for this
+   *  instance. Never passed by main.ts or worker.ts; see terminal-preservation.ts. */
+  terminalPreservationTestOverride?: TerminalPreservationTestHooks;
   /** Test seam (never set in production): awaited inside the journal lock of an operator resolution, before its expectation. */
   onForgetJournalLockedForTest?: () => void | Promise<void>;
   /** Test seam (never set in production): awaited immediately before and after every unlink and the final rmdir of an
@@ -1500,6 +1504,13 @@ const recoveryJournalLocks = new RunDiskLocks();
  */
 export class RecoveryCoordinator {
   private readonly authority: AuthorityScope | undefined;
+  private readonly terminalPreservationTestOverride: TerminalPreservationTestHooks | undefined;
+
+  /** #4007 slice B production-dark gate: the first statement of every terminal-preservation entry point. Not private
+   *  only because no production caller exists yet (noUnusedLocals would reject an unread private member). */
+  terminalPreservationEnabled(): boolean {
+    return terminalPreservationActive(this.terminalPreservationTestOverride);
+  }
   private readonly onForgetJournalLockedForTest: RecoveryCoordinatorOptions["onForgetJournalLockedForTest"];
   private readonly onOperatorDisposeStepForTest: RecoveryCoordinatorOptions["onOperatorDisposeStepForTest"];
   private readonly operatorSourceEvidence: RecoveryCoordinatorOptions["operatorSourceEvidence"];
@@ -1711,6 +1722,7 @@ export class RecoveryCoordinator {
 
   constructor(opts: RecoveryCoordinatorOptions) {
     this.authority = opts.authority;
+    this.terminalPreservationTestOverride = opts.terminalPreservationTestOverride;
     this.onForgetJournalLockedForTest = opts.onForgetJournalLockedForTest;
     this.onOperatorDisposeStepForTest = opts.onOperatorDisposeStepForTest;
     this.operatorSourceEvidence = opts.operatorSourceEvidence;
