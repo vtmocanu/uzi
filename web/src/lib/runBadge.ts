@@ -16,7 +16,6 @@ import type {
 import { forgeWaitLabel, forgeWaitMode, forgeWaitPhase } from "./forgeCooldown";
 import { diskWaitLabel, diskWaitMode, diskWaitDescription } from "./diskRecovery";
 import { isTerminalRun } from "./runStatus";
-import { credentialSwitchHold } from "./credentialSwitchHold";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
 import { formatCountdown } from "./limitWait";
 import { stripDisplayCell, stripUnsafeChars } from "./safeText";
@@ -151,11 +150,101 @@ export function isRevisingRun(run: { status: string; is_revising?: boolean }): b
   return run.status === "awaiting_approval" && run.is_revising === true;
 }
 
+// NON_COMPLETION_HOLDS is the single source for the server holds that are NOT completion
+// states: the run's hold_reason names why a `paused` run waits, and each of these has its own
+// presentation (badge, panel, announcement) instead of the Completion state panel. Every
+// consumer (the StatusPill tone/label maps, effectiveRunStatus, needsHumanAttention, the
+// overview park table, RunView's completion-panel and Resume gating) reads this table via the
+// predicates below; fixtures/hold-reasons/presentation.json pins tone, label and
+// owner-resumability against the Go CLI's copy of the same set.
+//   - ownerResumable: the owner can Resume (or otherwise retry) it; false means it resolves on
+//     its own or by another action (Enable a credential, add one, recover the work, a policy
+//     decision).
+//   - attention: counts toward needsHumanAttention (a needs-you state).
+//   - afterCompletionPhase: effectiveRunStatus overlays it AFTER the completion_phase switch,
+//     so a live completion phase wins; false overlays it ahead of that switch.
+//   - genericResume: the run header's generic Resume button is offered (every other hold has
+//     its own panel or is refused by the server).
+// The remaining fields keep each pre-existing reason's per-surface behavior exactly as it was
+// before the set existed (the sites disagreed on membership, so the differences are explicit):
+//   - completionEarlyReturn: while paused, CompletionStatePanel renders nothing at all.
+//   - heldDeny: whether CompletionStatePanel's "held" test excludes the reason: "always",
+//     "paused" (only while status is paused, the token-switch holds) or "never".
+//   - historyParkLabel: IssueView history rows print parkLabel for a paused run.
+//   - ownerActionsLink: LastRun links "View owner actions" for a paused run.
+export const NON_COMPLETION_HOLDS = {
+  credential_disabled: { tone: "warning", label: "waiting: credential disabled", ownerResumable: false, attention: false, afterCompletionPhase: true, genericResume: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  credentials_reset: { tone: "warning", label: "waiting: credentials were reset", ownerResumable: false, attention: false, afterCompletionPhase: true, genericResume: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  provider_unavailable: { tone: "warning", label: "provider unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: false, ownerActionsLink: true },
+  codex_policy_hold: { tone: "warning", label: "Codex policy hold", ownerResumable: false, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: false, heldDeny: "never", historyParkLabel: true, ownerActionsLink: false },
+  base_attestation_missing: { tone: "warning", label: "base unverified: owner hold", ownerResumable: false, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  repo_agent_source_unavailable: { tone: "warning", label: "repo agents unreadable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  credential_switch_settling: { tone: "warning", label: "settling: token switch", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: false, heldDeny: "paused", historyParkLabel: false, ownerActionsLink: true },
+  credential_switch_unsettled: { tone: "warning", label: "held: token switch", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: false, heldDeny: "paused", historyParkLabel: false, ownerActionsLink: true },
+  iteration_budget_exhausted: { tone: "warning", label: "Iteration limit reached", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: true, heldDeny: "never", historyParkLabel: false, ownerActionsLink: true },
+  // Issue #3250: the run's chosen model or effort cannot run on its harness; the owner resumes to retry.
+  run_override_unavailable: { tone: "warning", label: "model choice unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: true, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: true, ownerActionsLink: true },
+} as const;
+
+type NonCompletionHold = keyof typeof NON_COMPLETION_HOLDS;
+
+function holdEntry(reason: string | null | undefined) {
+  return reason != null && Object.prototype.hasOwnProperty.call(NON_COMPLETION_HOLDS, reason)
+    ? NON_COMPLETION_HOLDS[reason as NonCompletionHold]
+    : null;
+}
+
+export function isNonCompletionHold(reason: string | null | undefined): boolean {
+  return holdEntry(reason) !== null;
+}
+
+export function completionPanelEarlyReturn(run: { status: string; hold_reason?: string | null }): boolean {
+  return run.status === "paused" && holdEntry(run.hold_reason)?.completionEarlyReturn === true;
+}
+
+// completionPanelHeld: CompletionStatePanel's "held" test, true for any hold_reason the panel
+// itself explains (completion_blocked, budget_exhausted, weekly_reserve, unknown values).
+export function completionPanelHeld(run: { status: string; hold_reason?: string | null }): boolean {
+  if (run.hold_reason == null) return false;
+  const deny = holdEntry(run.hold_reason)?.heldDeny ?? "never";
+  return !(deny === "always" || (deny === "paused" && run.status === "paused"));
+}
+
+export function historyShowsParkLabel(run: { status: string; hold_reason?: string | null }): boolean {
+  return run.status === "paused" && holdEntry(run.hold_reason)?.historyParkLabel === true;
+}
+
+export function offersOwnerActionsLink(run: { status: string; hold_reason?: string | null }): boolean {
+  return run.status === "paused" && holdEntry(run.hold_reason)?.ownerActionsLink === true;
+}
+
+export function isOwnerResumableHold(reason: string | null | undefined): boolean {
+  return holdEntry(reason)?.ownerResumable === true;
+}
+
+// holdOffersGenericResume: the paused run header's generic Resume button applies. False for
+// every hold that is not a non-completion hold's generic case (completion_blocked and the
+// weekly-reserve pause are handled by the caller).
+export function holdOffersGenericResume(reason: string | null | undefined): boolean {
+  return holdEntry(reason)?.genericResume === true;
+}
+
+// The tone and label maps StatusPill spreads into RUN_STATUS_TONES / RUN_STATUS_LABELS.
+export const NON_COMPLETION_HOLD_TONES: Record<string, { tone: BadgeTone }> = Object.fromEntries(
+  Object.entries(NON_COMPLETION_HOLDS).map(([k, v]) => [k, { tone: v.tone }]),
+);
+const NON_COMPLETION_HOLD_LABELS = Object.fromEntries(
+  Object.entries(NON_COMPLETION_HOLDS).map(([k, v]) => [k, v.label]),
+) as { [K in NonCompletionHold]: string };
+export const NON_COMPLETION_HOLD_LABEL_MAP: Record<string, string> = NON_COMPLETION_HOLD_LABELS;
+export const NON_COMPLETION_HOLD_REASONS: string[] = Object.keys(NON_COMPLETION_HOLDS);
+
 // PARK_LABELS is today's wording for each parked (held, not working) effective status:
 // the single source runBadge's pills and the PRD #2602 progress cell's parked text both
 // use, so the board badge and the progress cell can never name one park two ways. The
 // paused pill prefixes its "‖" glyph at the call site; the progress cell prints the bare
-// label as screen-reader text, since the pill beside it already shows the park.
+// label as screen-reader text, since the pill beside it already shows the park. The
+// non-completion hold labels come from NON_COMPLETION_HOLDS.
 const PARK_LABELS = {
   limit_wait: "limit wait",
   pool_wait: "waiting for pool",
@@ -172,17 +261,9 @@ const PARK_LABELS = {
   worker_memory_pressure: "memory pressure: owner hold",
   anthropic_spend_limit: "spend limit: owner hold",
   paused: "paused",
-  credential_disabled: "waiting: credential disabled",
-  credentials_reset: "waiting: credentials were reset",
-  iteration_budget_exhausted: "Iteration limit reached",
-  provider_unavailable: "provider unavailable: owner hold",
-  codex_policy_hold: "Codex policy hold",
-  base_attestation_missing: "base unverified: owner hold",
-  repo_agent_source_unavailable: "repo agents unreadable: owner hold",
   provider_outage: "waiting for provider",
   completion_blocked: "Completion blocked",
-  credential_switch_settling: "settling: token switch",
-  credential_switch_unsettled: "held: token switch",
+  ...NON_COMPLETION_HOLD_LABELS,
 } as const;
 
 // parkLabel names a parked run's hold in today's words (PRD #2602 rule 3: "surfaces keep
@@ -219,17 +300,13 @@ export function effectiveRunStatus(
   },
 ): string {
   // The applied policy hold takes precedence over a retained completion marker.
-  if (run.status === "paused" && run.hold_reason === "codex_policy_hold") return "codex_policy_hold";
-  if (run.status === "paused" && run.hold_reason === "iteration_budget_exhausted") return "iteration_budget_exhausted";
-  if (run.status === "paused" && run.hold_reason === "provider_unavailable") return "provider_unavailable";
-  // Issue #3181: the token-switch holds sit in raw "paused" (shared with the owner pause), so
-  // they are overlaid like the provider hold to name what the run is actually waiting on.
-  const switchHold = credentialSwitchHold(run);
-  if (switchHold) return `credential_switch_${switchHold}`;
-  // Issue #3194: a --require-base run whose adopted work no checkpoint attests to the planned
-  // base. Server-held (raw status "paused"), so overlaid like the other holds.
-  if (run.status === "paused" && run.hold_reason === "base_attestation_missing") return "base_attestation_missing";
-  if (run.status === "paused" && run.hold_reason === "repo_agent_source_unavailable") return "repo_agent_source_unavailable";
+  // The non-completion holds (NON_COMPLETION_HOLDS) sit in raw "paused" (shared with the owner
+  // pause), so each is overlaid to name what the run is actually waiting on: the policy hold,
+  // the iteration and provider holds, the issue #3181 token-switch holds, the issue #3194
+  // base-attestation hold, the repo-agent source hold and the issue #3250 run-override hold.
+  // credential_disabled / credentials_reset overlay after the completion_phase switch below.
+  const early = run.status === "paused" ? holdEntry(run.hold_reason) : null;
+  if (early !== null && !early.afterCompletionPhase) return run.hold_reason as string;
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "provider_outage") return "provider_outage";
   if (isPlanningRun(run)) return "planning";
   if (isRevisingRun(run)) return "revising";
@@ -255,9 +332,8 @@ export function effectiveRunStatus(
   // surface whose projection carries hold_reason can tell: the full Run (RunView/RunsList)
   // and the board card's LatestRun (the server's board projection sends hold_reason on every
   // card, so runBadge meets this key too).
-  if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
-  // PRD #3989 M3: parked because an admin reset the owner's account deleted every credential.
-  if (run.status === "paused" && run.hold_reason === "credentials_reset") return "credentials_reset";
+  // PRD #3989 M3: credentials_reset (an admin reset deleted every credential) overlays the same way.
+  if (early !== null && early.afterCompletionPhase) return run.hold_reason as string;
   // Integrity refusal is always owner-held, even if a malformed DTO carries a retry stamp.
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_adoption_failed") return "retained_recovery_adoption_failed";
   // Owner-only, no timer: the claimed flight was never witnessed, so the server released the
@@ -401,10 +477,11 @@ export function runStatusTone(
   if (status === "completion_checking" || status === "completion_reworking") return "info";
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
-  if (status === "iteration_budget_exhausted") return "warning";
-  if (status === "credential_disabled" || status === "credentials_reset" || status === "provider_unavailable" || status === "codex_policy_hold" || status === "base_attestation_missing" || status === "repo_agent_source_unavailable" || status === "provider_outage") return "warning";
-  // Issue #3181: both token-switch holds wait on something outside the run; warn, never danger.
-  if (status === "credential_switch_settling" || status === "credential_switch_unsettled") return "warning";
+  // Every non-completion hold (NON_COMPLETION_HOLDS: the credential, provider, policy,
+  // attestation, token-switch, iteration and run-override holds) wait on something outside the
+  // run; warn, never danger.
+  if (isNonCompletionHold(status)) return NON_COMPLETION_HOLDS[status as NonCompletionHold].tone;
+  if (status === "provider_outage") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
     return "warning";
   // PRD #517: an interactive run parked awaiting the owner's next follow-up.
@@ -826,6 +903,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "repo_agent_source_unavailable":
       return { kind: "badge", label: PARK_LABELS.repo_agent_source_unavailable, tone: "warning", pulse: false,
         title: "The repo agents could not be read at the run's recorded default-branch revision, so the agent was not started. Open the run to Resume once the repository can be fetched, or Cancel." };
+    case "run_override_unavailable":
+      return { kind: "badge", label: PARK_LABELS.run_override_unavailable, tone: "warning", pulse: false,
+        title: "The run's chosen model or effort cannot run on its harness. The run waits for its owner; open the run to Resume and retry, or Cancel." };
     case "provider_outage":
       return { kind: "badge", label: PARK_LABELS.provider_outage, tone: "warning", pulse: false,
         title: "Provider outage. Open the run for park count, streak start and next retry." };
@@ -1252,12 +1332,6 @@ export function needsHumanAttention(status: string): boolean {
     status === "worker_requeue_exhausted" ||
     status === "worker_memory_pressure" ||
     status === "anthropic_spend_limit" ||
-    status === "iteration_budget_exhausted" ||
-    status === "provider_unavailable" ||
-    status === "codex_policy_hold" ||
-    status === "credential_switch_settling" ||
-    status === "credential_switch_unsettled" ||
-    status === "base_attestation_missing" ||
-    status === "repo_agent_source_unavailable"
+    holdEntry(status)?.attention === true
   );
 }

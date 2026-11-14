@@ -133,7 +133,54 @@ const (
 	// below the threshold (or the setting is cleared); `uzi run resume` overrides it until the next
 	// weekly reset.
 	holdWeeklyReserve = "weekly_reserve"
+	// holdRunOverrideUnavailable (issue #3250) holds a run whose chosen model or effort cannot run on
+	// its harness. The owner resumes to retry, or cancels.
+	holdRunOverrideUnavailable = "run_override_unavailable"
 )
+
+// nonCompletionHold is one row of nonCompletionHolds.
+//   - ownerResumable: the owner can Resume (retry) the hold; false for the ones that clear another
+//     way (Enable or add a credential, recover the kept work, a policy decision).
+//   - announcesEntry: `run wait` and `run get`/`run logs --follow` print a one-line notice when a
+//     run enters the hold. It keeps each pre-existing reason's behavior from before the set existed
+//     (codex_policy_hold and repo_agent_source_unavailable never announced on entry).
+type nonCompletionHold struct {
+	ownerResumable bool
+	announcesEntry bool
+}
+
+// nonCompletionHolds is the single source for the server holds that are NOT completion states
+// (the Go twin of NON_COMPLETION_HOLDS in web/src/lib/runBadge.ts; fixtures/hold-reasons/
+// presentation.json pins both). weekly_reserve, budget_exhausted and completion_blocked are
+// deliberately absent.
+var nonCompletionHolds = map[string]nonCompletionHold{
+	holdCredentialDisabled:        {ownerResumable: false, announcesEntry: true},
+	holdCredentialsReset:          {ownerResumable: false, announcesEntry: true},
+	holdProviderUnavailable:       {ownerResumable: true, announcesEntry: true},
+	holdCodexPolicy:               {ownerResumable: false, announcesEntry: false},
+	holdBaseAttestation:           {ownerResumable: false, announcesEntry: true},
+	holdRepoAgentSource:           {ownerResumable: true, announcesEntry: false},
+	holdCredentialSwitchSettling:  {ownerResumable: true, announcesEntry: true},
+	holdCredentialSwitchUnsettled: {ownerResumable: true, announcesEntry: true},
+	holdIterationExhausted:        {ownerResumable: true, announcesEntry: true},
+	holdRunOverrideUnavailable:    {ownerResumable: true, announcesEntry: true},
+}
+
+// isNonCompletionHold reports whether reason is one of the nonCompletionHolds.
+func isNonCompletionHold(reason string) bool {
+	_, ok := nonCompletionHolds[reason]
+	return ok
+}
+
+// holdAnnouncesEntry reports whether entering the hold prints a notice in wait and follow.
+func holdAnnouncesEntry(reason string) bool {
+	return nonCompletionHolds[reason].announcesEntry
+}
+
+// isOwnerResumableHold reports whether reason is a non-completion hold the owner can Resume.
+func isOwnerResumableHold(reason string) bool {
+	return nonCompletionHolds[reason].ownerResumable
+}
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls
 // /api/runs/{id}/messages?after=<seq>. REST polling ships instead of a WebSocket

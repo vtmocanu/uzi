@@ -620,7 +620,9 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
 	case holdRepoAgentSource:
-		clauses = append(clauses, "resume once the repository can be fetched: uzi run resume "+cellText(r.ID))
+		clauses = append(clauses, repoAgentSourceAction(r))
+	case holdRunOverrideUnavailable:
+		clauses = append(clauses, runOverrideAction)
 	case holdWeeklyReserve:
 		clauses = append(clauses, weeklyReserveAction(r))
 	}
@@ -653,12 +655,22 @@ func holdReasonLabel(reason string) string {
 		return "base not attested"
 	case holdRepoAgentSource:
 		return "repo agents unreadable"
+	case holdRunOverrideUnavailable:
+		return "model choice unavailable"
 	case holdWeeklyReserve:
 		return "weekly usage reserve"
 	default:
 		return cellText(reason)
 	}
 }
+
+// repoAgentSourceAction is the owner's next step for a repo_agent_source_unavailable hold.
+func repoAgentSourceAction(r apitypes.RunDTO) string {
+	return "resume once the repository can be fetched: uzi run resume " + cellText(r.ID)
+}
+
+// runOverrideAction is the owner's next step for a run_override_unavailable hold (issue #3250).
+const runOverrideAction = "the run's chosen model or effort cannot run on its harness; resume to retry or cancel"
 
 // weeklyReserveAction is the owner's next step for a weekly_reserve hold (PRD #3522): the run resumes
 // by itself when usage falls below the threshold, and `uzi run resume` overrides the reserve until the
@@ -763,6 +775,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, credential switch unsettled; " + credentialSwitchAction(r)
 	case holdBaseAttestation:
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
+	case holdRunOverrideUnavailable:
+		return holdReasonLabel(reason) + " · " + runOverrideAction
 	case holdWeeklyReserve:
 		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
 	default:
