@@ -403,7 +403,8 @@ function PoweredBy({
 }
 
 function isNavActive(pathname: string, href: string): boolean {
-  return pathname === href || pathname.startsWith(href + "/");
+  return (pathname === "/overview/classic" && href === "/dashboard")
+    || pathname === href || pathname.startsWith(href + "/");
 }
 
 // forgeIcon picks a board entry's glyph from its connection's forge type

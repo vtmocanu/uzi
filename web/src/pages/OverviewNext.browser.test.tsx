@@ -6,10 +6,12 @@ import "@fontsource/ibm-plex-sans/latin-600.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cdp, page, userEvent } from "vitest/browser";
 import { cleanup, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
+import { Dashboard } from "./Dashboard";
+import { AppShell } from "../components/AppShell";
 import { api } from "../lib/api";
-import { healthySilentDoc, overviewNextDoc } from "../mocks/data";
+import { healthySilentDoc, incidentDoc, overviewNextDoc } from "../mocks/data";
 import { overviewNextOwnerWorkers } from "../mocks/data/overviewNext";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 import { useAuth } from "../auth/AuthContext";
@@ -34,6 +36,15 @@ vi.mock("../lib/api", async (importOriginal) => {
       getRecoveryHolds: vi.fn(),
       getAdminHealth: vi.fn(),
       listUsers: vi.fn(),
+      workerUpgradeSummary: vi.fn(),
+      getJudgeStats: vi.fn(),
+      runsInProgressCount: vi.fn(),
+      listSchedules: vi.fn(),
+      getFindingsStats: vi.fn(),
+      getMyRateLimits: vi.fn(),
+      getMyCodexRateLimits: vi.fn(),
+      getMySettings: vi.fn(),
+      version: vi.fn(),
     },
   };
 });
@@ -77,6 +88,15 @@ beforeEach(() => {
   mockApi.getUsage.mockResolvedValue(emptySelf());
   mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
   mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
+  mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 0, target_release: "0.6.0" });
+  mockApi.getJudgeStats.mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 });
+  mockApi.runsInProgressCount.mockResolvedValue({ count: 0 });
+  mockApi.listSchedules.mockResolvedValue([]);
+  mockApi.getFindingsStats.mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 });
+  mockApi.getMyRateLimits.mockResolvedValue({ status: "no_token" } as never);
+  mockApi.getMyCodexRateLimits.mockResolvedValue({ accounts: [] } as never);
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null } } as never);
+  mockApi.version.mockResolvedValue({ version: "9.9.9-test", founded: "2026-07-03" } as never);
   mockApi.listUsers.mockResolvedValue({ users: [] });
   mockApi.getRecoveryHolds.mockResolvedValue({
     aggregate: { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
@@ -87,6 +107,40 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("promoted Overview routes in the real shell (PRD #3877 M1)", () => {
+  const follows = (a: Node, b: Node) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+
+  async function mountAt(path: string) {
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <AppShell>
+          <Routes>
+            <Route path="/dashboard" element={<OverviewNext />} />
+            <Route path="/overview/classic" element={<Dashboard />} />
+          </Routes>
+        </AppShell>
+      </MemoryRouter>,
+    );
+    const header = await screen.findByRole("heading", { name: /Welcome/ });
+    const banner = await screen.findByRole("alert", { name: "Instance health" });
+    return { header, banner };
+  }
+
+  it("places the banner after the default header and before the classic header", async () => {
+    await page.viewport(1280, 900);
+    mockApi.getAdminHealth.mockResolvedValue(incidentDoc());
+
+    const promoted = await mountAt("/dashboard");
+    expect(follows(promoted.header, promoted.banner)).toBe(true);
+    expect(follows(promoted.banner, screen.getByRole("region", { name: "Issue work" }))).toBe(true);
+
+    cleanup();
+    const classic = await mountAt("/overview/classic");
+    expect(follows(classic.banner, classic.header)).toBe(true);
+    expect(screen.getByRole("link", { name: "Overview", current: "page" })).toBeTruthy();
+  });
 });
 
 describe("OverviewNext at 400px", () => {
