@@ -31388,6 +31388,160 @@ describe("CodexExecutor: replacement B boundary", () => {
 });
 
 describe("CodexExecutor credential switch continuation", () => {
+  for (const cancel of [false, true]) {
+    it("repair held revision gate preserves candidate and settlement; cancel=" + cancel, async () => {
+      let gates = 0, switches = 0, cancelled = false;
+      const seen: unknown[][] = [];
+      let plans = 0;
+      const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (t, th, tn) =>
+        t.push(toolCall(++plans, "submit_plan", { plan_md: "candidate " + plans }, th, tn, "plan-" + plans))
+          .push(turnCompleted("completed", th, tn))) });
+      const { ctx } = makeCtx({
+        planApproved: false, approvedPlan: undefined,
+        cancelRequested: () => cancelled,
+        gatePlan: async (...args) => {
+          if (++gates === 1) return { kind: "revise", feedback: "tighten", inputId: 77 };
+          seen.push(args);
+          if (gates === 2) throw new CredentialSwitchSignal();
+          return { kind: "reject", reason: "revision proof complete" };
+        },
+        attemptCodexCredentialSwitch: async request => {
+          assert.equal(request.site, "plan_gate_revision");
+          switches++; cancelled = cancel; return "continued_A";
+        },
+      });
+      await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx),
+        cancel ? /cancel/ : /revision proof complete/);
+      assert.equal(switches, 1);
+      assert.equal(seen.length, cancel ? 1 : 2);
+      assert.equal(seen[0]![3], 77);
+      if (!cancel) {
+        assert.strictEqual(seen[0]![0], seen[1]![0]);
+        assert.strictEqual(seen[0]![1], seen[1]![1]);
+        assert.equal(seen[1]![3], 77);
+        assert.strictEqual(seen[0]![4], seen[1]![4]);
+      }
+    });
+
+    it("repair held park callback retains exact boundary; cancel=" + cancel, async () => {
+      let calls = 0, cancelled = false, switches = 0;
+      const seen: unknown[] = [];
+      const fixture = dependencyWaitCallbacks({ eligible: true });
+      const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (t, th, tn) =>
+        t.push(toolCall(1, "park_run", {}, th, tn, "park")).push(turnCompleted("completed", th, tn))) });
+      const { ctx } = makeCtx({
+        ...fixture.callbacks, kind: "issue", completionInterlock: true, parkRunSupported: true,
+        cancelRequested: () => cancelled,
+        requestParkRun: async at => {
+          seen.push(at);
+          if (++calls === 1) throw new CredentialSwitchSignal();
+          return { kind: "paused" };
+        },
+        attemptCodexCredentialSwitch: async () => { switches++; cancelled = cancel; return "continued_A"; },
+      });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (cancel) await assert.rejects(run, /cancel/);
+      else assert.ok((await run).pausedAt);
+      assert.equal(switches, 1);
+      assert.equal(calls, cancel ? 1 : 2);
+      if (!cancel) assert.strictEqual(seen[0], seen[1]);
+    });
+  }
+
+  it("repair first trip retains a switch arriving during turn settlement", async () => {
+    let interrupt!: () => void;
+    let handlers = 0, second = false;
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/interrupt" && !second) { second = true; interrupt(); }
+      if (c.method === "turn/start") {
+        if (c.turnStartCount > 1) {
+          assert.equal(handlers, 2, "both switches handled before another turn");
+          c.transport.push(signalDone()).push(turnCompleted("completed"));
+        }
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    const { ctx } = makeCtx({
+      onCredentialSwitch: cb => { interrupt = cb; },
+      attemptCodexCredentialSwitch: async () => { handlers++; return "continued_A"; },
+    });
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount === 1, "A turn");
+    interrupt();
+    await withTimeout(run, 5000, "settling switch");
+    assert.equal(second, true);
+    assert.equal(handlers, 2);
+  });
+
+  for (const branch of ["lead", "stall"] as const) {
+    for (const fresh of [false, true]) {
+    it("repair completion " + branch + " preserves prepared " + (fresh ? "fresh_B" : "resumed_B"), async () => {
+      let questions = 0, attempts = 0, switches = 0;
+      const candidates: unknown[] = [];
+      const fixture = dependencyWaitCallbacks({ eligible: true });
+      const a: Responder = c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (branch === "lead") c.transport.push(toolCall(1, "signal_done",
+            { owner_decision_requested: { reason: "Need decision" } }, "th-1", "tn-1", "done"));
+          else if (c.turnStartCount === 1) c.transport.push(toolCall(1, "report_progress", dependencyWaitProgress, "th-1", "tn-1", "progress"));
+          else c.transport.push(agentMessage("waiting"));
+          c.transport.push(turnCompleted("completed"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      };
+      const baseB = epochResponder("th-1", "tn-B", (t, th, tn) =>
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn)));
+      const b: Responder = c => {
+        if (fresh && c.method === "thread/resume") throw new CodexTransportError({
+          category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)",
+        });
+        if (c.method === "turn/start") assert.match(JSON.stringify(c.params), /OWNER-REPAIR/);
+        return baseB(c);
+      };
+      const rig = makeMultiEpochRig([a, b]);
+      rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!, inspectSession: async () => "present" } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const { ctx } = makeCtx({
+        ...fixture.callbacks, kind: "issue", interactive: false, completionInterlock: true,
+        checkpoint: async opts => { if (opts?.reap) await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {}); },
+        recordCompletionAttempt: async () => ({ unmet: ++attempts === 1 ? ["m2"] : [], attemptCount: attempts }),
+        askCompletionQuestion: async unmet => {
+          candidates.push(unmet);
+          if (++questions === 1) throw new CredentialSwitchSignal();
+          return { outcome: "continue", guidance: "OWNER-REPAIR" };
+        },
+        attemptCodexCredentialSwitch: async () => {
+          switches++;
+          const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+          const lease = await exec.suspendCodexEpoch(bounds);
+          assert.deepEqual(await lease.reconcileA(bounds, 1000), { kind: "ready" });
+          await lease.persistRollout(bounds);
+          assert.equal(await lease.teardown(bounds), true);
+          await lease.publishB({ binding: bindingOf(API_KEY), capabilityEpoch: 41, ordinal: 1, messageSeq: 7 }, bounds);
+          const resumed = await lease.restartAndResume("th-1", bounds);
+          if (fresh) {
+            assert.equal(resumed.kind, "confirmed_resume_refusal");
+            await lease.startFreshLineage(bounds);
+          }
+          await lease.finishB(bounds);
+          return fresh ? "fresh_B" : "resumed_B";
+        },
+      });
+      await withTimeout(exec.run(ctx), 5000, "completion B");
+      assert.equal(questions, 2);
+      assert.strictEqual(candidates[0], candidates[1]);
+      assert.equal(switches, 1);
+      assert.equal(attempts, 2);
+      assert.equal(rig.providerLaunches(), 2);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+    });
+    }
+  }
+
   for (const hooked of [false, true]) {
     it(hooked ? "continues A on the same implement epoch" : "preserves an unhandled switch signal", async () => {
       let interrupt: (() => void) | undefined;
@@ -31411,7 +31565,7 @@ describe("CodexExecutor credential switch continuation", () => {
       const outcome = running.then(value => ({ value }), error => ({ error }));
       await waitFor(() => rig.transport.turnStartCount === 1, "first turn");
       controller.abort(original);
-      interrupt?.();
+      interrupt?.(); // SteeringChannel emits this paired notification for the same request.
       const settled = await withTimeout(outcome, 3000, "switch settles");
       if (hooked) {
         assert.ok("value" in settled);
@@ -31495,7 +31649,7 @@ describe("CodexExecutor credential switch continuation", () => {
         askUser: async questions => {
           candidates.push(questions);
           if (++calls === 1) throw original;
-          return { kind: "answered", answers: ["target A"] };
+          return { kind: "answer", answers: ["target A"] };
         },
         gatePlan: async plan => {
           candidates.push(plan);

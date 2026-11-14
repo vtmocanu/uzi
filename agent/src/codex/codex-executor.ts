@@ -5213,6 +5213,7 @@ export class CodexExecutor implements Executor {
             }
             break;
           }
+          const completionEpoch = epoch;
           const { unmet, head, worktreeFingerprint } = await recordAttempt(
             result.milestonesCompleted ?? [], declaredNonClosing);
           if (unmet.length === 0) {
@@ -5309,8 +5310,8 @@ export class CodexExecutor implements Executor {
             ctx.completionInterlock === true && isIssueRun && !ctx.interactive);
           completionAnswered = answer !== undefined;
           if (iteration >= maxIterations) pendingIterationExhaustion = true;
-          // Re-check the fresh ACK's cap before exhaustion or any new provider epoch.
-          epochNeedsRecreate = true;
+          // Recreate only the epoch reaped for this attempt; a held switch may have prepared B.
+          epochNeedsRecreate = epoch === completionEpoch;
           continue;
         }
         // Issue #3139: a worker-initiated no-progress stall. An eligible run (interlocked issue run,
@@ -5350,9 +5351,10 @@ export class CodexExecutor implements Executor {
             });
             // completionStallStreak and lastCompletionFingerprint stay untouched: this attempt is not
             // a lead completion attempt.
+            const completionEpoch = epoch;
             const { unmet } = await recordAttempt([]);
-            epochNeedsRecreate = true;
             const decision = await retryHeldSwitch("ask_user", async () => ctx.askCompletionQuestion?.(unmet, { kind: "no_progress_stall" }));
+            epochNeedsRecreate = epoch === completionEpoch;
             if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
             if (decision?.outcome === "continue") {
               completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones,
@@ -6133,6 +6135,7 @@ export class CodexExecutor implements Executor {
       if (tripReason === undefined) {
         tripReason = reason;
         tripToken = pauseNow.capture();
+        if (reason === REASON_SWITCH) this.captureSwitch(ctx, pauseNow);
         if (reason === REASON_IDLE) tripRetryClassification = harness.retryClassification;
         turnAbort.abort();
       }
@@ -6144,7 +6147,15 @@ export class CodexExecutor implements Executor {
     // pause) trips REASON_PAUSE, not REASON_CANCEL, so the run-lane can route a `wall` pause to the
     // capture-first wall park instead of cancelling the run at its time limit (D2). Every other abort
     // (a steering cancel, a shutdown) has the default reason and stays REASON_CANCEL, unchanged.
-    const onCancel = (): void => trip(reasonForSignal(ctx.signal));
+    const onCancel = (): void => {
+      const reason = reasonForSignal(ctx.signal);
+      // Steering aborts its shared signal before invoking the same request's
+      // re-armable callback. Let that synchronous callback assign the generation
+      // before capturing the first trip. Signal-only callers still trip in this
+      // microtask; a later notification during settlement remains a new request.
+      if (reason === REASON_SWITCH) queueMicrotask(() => trip(reason));
+      else trip(reason);
+    };
     // Issue #2099: the prelude's three checks live in pendingInterruption (shared with the transient
     // retry gate); evaluated first, they have no side effects.
     const pendingAtStart = this.pendingInterruption(ctx, pauseNow, wall);
