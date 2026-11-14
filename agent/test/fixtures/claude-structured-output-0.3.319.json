@@ -1,5 +1,5 @@
 {
-  "_provenance": "real frames from @anthropic-ai/claude-agent-sdk 0.3.316 / native CLI 2.1.316, recorded 2026-11-10 by test/claude-structured-output.probe.ts capture; model turns scripted by a loopback Anthropic Messages stub because no Anthropic credential is available in the worker; production buildClaudeCrossCheckOptions (model passed through its own argument; the code session also passes an allow-all recording toolBudgetHook) with probe-local outputFormat (PLAN/CODE_VERDICT_SCHEMA), probe-local abortController with a 60 s timeout, probe-local replacement of only the matcher-less tool gate (allows exactly StructuredOutput, delegates the rest), probe-local init latch opening after a carrier-aware init check, env changed only by ANTHROPIC_BASE_URL (+ auth used) and HOME, pathToClaudeCodeExecutable set; auth: the production CLAUDE_CODE_OAUTH_TOKEN placeholder was accepted against the stub; spawnClaudeCodeProcess left as built; ids/timestamps/paths normalized; repeat with: node --import tsx test/claude-structured-output.probe.ts capture <absolute CLI path>",
+  "_provenance": "real frames from @anthropic-ai/claude-agent-sdk 0.3.319 / native CLI 2.1.319, recorded 2026-11-14 by test/claude-structured-output.probe.ts capture; model turns scripted by a loopback Anthropic Messages stub because no Anthropic credential is available in the worker; production buildClaudeCrossCheckOptions (model passed through its own argument; the code session also passes an allow-all recording toolBudgetHook) with probe-local outputFormat (PLAN/CODE_VERDICT_SCHEMA), probe-local abortController with a 60 s timeout, probe-local replacement of only the matcher-less tool gate (allows exactly StructuredOutput, delegates the rest), probe-local init latch opening after a carrier-aware init check, env changed only by ANTHROPIC_BASE_URL (+ auth used) and HOME, pathToClaudeCodeExecutable set; auth: the production CLAUDE_CODE_OAUTH_TOKEN placeholder was accepted against the stub; spawnClaudeCodeProcess left as built; ids/timestamps/paths normalized; repeat with: node --import tsx test/claude-structured-output.probe.ts capture <absolute CLI path>",
   "sessions": {
     "plan_retry": {
       "stage": "plan",
@@ -57,7 +57,7 @@
             "reload-plugins"
           ],
           "apiKeySource": "none",
-          "claude_code_version": "2.1.316",
+          "claude_code_version": "2.1.319",
           "output_style": "default",
           "agents": [
             "claude",
@@ -82,7 +82,8 @@
             "mcp_read_resource_v1",
             "mcp_tool_ui_meta_v1",
             "ui_surface_v1",
-            "mcp_call_result_not_for_model_v1"
+            "mcp_call_result_not_for_model_v1",
+            "mcp_call_check_permissions_v1"
           ],
           "analytics_disabled": true,
           "product_feedback_disabled": true,
@@ -97,6 +98,7 @@
           "fast_mode_disabled_reason": "sdk_opt_in_required",
           "per_turn_effort_active": false,
           "ultrathink_available": false,
+          "ultrathink_typed_raises": false,
           "view_mode": "default"
         },
         {
@@ -556,7 +558,7 @@
             "reload-plugins"
           ],
           "apiKeySource": "none",
-          "claude_code_version": "2.1.316",
+          "claude_code_version": "2.1.319",
           "output_style": "default",
           "agents": [
             "claude",
@@ -581,7 +583,8 @@
             "mcp_read_resource_v1",
             "mcp_tool_ui_meta_v1",
             "ui_surface_v1",
-            "mcp_call_result_not_for_model_v1"
+            "mcp_call_result_not_for_model_v1",
+            "mcp_call_check_permissions_v1"
           ],
           "analytics_disabled": true,
           "product_feedback_disabled": true,
@@ -596,6 +599,7 @@
           "fast_mode_disabled_reason": "sdk_opt_in_required",
           "per_turn_effort_active": false,
           "ultrathink_available": false,
+          "ultrathink_typed_raises": false,
           "view_mode": "default"
         },
         {
@@ -1078,7 +1082,7 @@
             "reload-plugins"
           ],
           "apiKeySource": "none",
-          "claude_code_version": "2.1.316",
+          "claude_code_version": "2.1.319",
           "output_style": "default",
           "agents": [
             "claude",
@@ -1103,7 +1107,8 @@
             "mcp_read_resource_v1",
             "mcp_tool_ui_meta_v1",
             "ui_surface_v1",
-            "mcp_call_result_not_for_model_v1"
+            "mcp_call_result_not_for_model_v1",
+            "mcp_call_check_permissions_v1"
           ],
           "analytics_disabled": true,
           "product_feedback_disabled": true,
@@ -1118,6 +1123,7 @@
           "fast_mode_disabled_reason": "sdk_opt_in_required",
           "per_turn_effort_active": false,
           "ultrathink_available": false,
+          "ultrathink_typed_raises": false,
           "view_mode": "default"
         },
         {

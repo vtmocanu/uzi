@@ -26,6 +26,7 @@
 // last assignment so no earlier key can override it. The fetch credential is never in it:
 // the fetch tool runs in this process (fetch-tools.ts).
 
+import { claudeSdkSettings } from "./sdk-plugin-policy.js";
 import { chunkedTimeout } from "./chunked-timeout.js";
 import path from "node:path";
 
@@ -91,7 +92,7 @@ const PINNED_BUILTIN_AGENTS: ReadonlySet<string> = new Set(["claude", "general-p
 const PINNED_BUILTIN_SKILLS: ReadonlySet<string> = new Set(["doctor"]);
 
 /** The SDK's end-turn tool for `outputFormat: {type: "json_schema"}`, recorded in
- *  test/fixtures/claude-structured-output-0.3.316.json (init tools and assistant tool_use name). */
+ *  test/fixtures/claude-structured-output-0.3.319.json (init tools and assistant tool_use name). */
 export const STRUCTURED_OUTPUT_CARRIER = "StructuredOutput" as const;
 
 /**
@@ -121,9 +122,6 @@ const RESEARCH_SURFACE: IsolationSurface = {
   plugins: [],
   skills: [],
 };
-
-/** The builtin plugins the pinned CLI loads unless they are disabled through settings. */
-export const BUILTIN_PLUGINS_DISABLED = { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false };
 
 const REASON_INIT_PENDING = "denied: the isolated session's tool set has not been verified yet";
 const REASON_TOOL_NOT_ALLOWED = "denied: this tool is not in the isolated run's fixed tool set";
@@ -396,7 +394,7 @@ export function buildIsolatedSdkOptions(input: {
     // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
     // mentions and dispatches a leading slash command before any PreToolUse hook runs.
     verbatimPrompts: true,
-    settings: { enabledPlugins: BUILTIN_PLUGINS_DISABLED },
+    settings: claudeSdkSettings({}, true),
     tools: [...RESEARCH_SURFACE.tools],
     disallowedTools: isolatedDisallowedTools(RESEARCH_SURFACE),
     mcpServers: { [FETCH_SERVER_NAME]: input.fetchServer },

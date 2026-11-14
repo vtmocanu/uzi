@@ -324,6 +324,50 @@ func TestLoadParsesTheDiskRecyclePolicy(t *testing.T) {
 	})
 }
 
+// The builder-cache prune leg (issue #4291): defaults true when unset or blank, parses
+// with strconv.ParseBool, and a set-but-unparseable value is a boot error.
+func TestLoadParsesTheDinDBuilderPruneToggle(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		set   bool
+		value string
+		want  bool
+	}{
+		{"unset", false, "", true},
+		{"blank", true, "  ", true},
+		{"true", true, "true", true},
+		{"false", true, "false", false},
+		{"1", true, "1", true},
+		{"0", true, "0", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://uzi.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+			if tc.set {
+				t.Setenv("UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED", tc.value)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.WorkerDinDBuilderPruneEnabled != tc.want {
+				t.Errorf("WorkerDinDBuilderPruneEnabled = %v, want %v", cfg.WorkerDinDBuilderPruneEnabled, tc.want)
+			}
+		})
+	}
+
+	t.Run("an unparseable value is a boot error", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED", "yes-please")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED", err)
+		}
+	})
+}
+
 // A malformed or non-positive knob falls back to the default rather than failing
 // boot: these are tuning values, not security controls, which is the same split the
 // api's config package draws.

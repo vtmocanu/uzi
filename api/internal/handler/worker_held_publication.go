@@ -49,7 +49,7 @@ var (
 // heldPublisher is the workersvc surface the route uses; *workersvc.Service satisfies it, and a
 // test Handler can set heldSvc to a fake without a database.
 type heldPublisher interface {
-	AcquireHeldPublishSlot() (release func(), ok bool)
+	AcquireHeldPublishSlot(workerID uuid.UUID) (release func(), ok bool)
 	HeldPublishGate(ctx context.Context, wkr store.Worker, runID uuid.UUID, req workersvc.HeldPublishRequest) (*workersvc.HeldPublishResult, error)
 	PublishHeld(ctx context.Context, wkr store.Worker, runID uuid.UUID, req workersvc.HeldPublishRequest, pack []byte) (workersvc.HeldPublishResult, error)
 }
@@ -101,7 +101,7 @@ func (h *Handler) WorkerRunHeldPublication(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	release, ok := svc.AcquireHeldPublishSlot()
+	release, ok := svc.AcquireHeldPublishSlot(wkr.ID)
 	if !ok {
 		w.Header().Set("Retry-After", "5")
 		httpx.ErrorReason(w, http.StatusTooManyRequests, "held publication uploads are busy", "busy")

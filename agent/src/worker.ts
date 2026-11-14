@@ -119,8 +119,8 @@ export class Worker {
     // issue #1759 M3: the DinD prune controller, present only on a docker worker with
     // UZI_DIND_PRUNE_ENABLED=true (createDindPrune). Its gate pauses BOTH claim loops while
     // a prune holds it; the heartbeat feeds it the custody flag; run() starts its loop.
-    // Issue #3891: that loop also runs the optional anonymous-volume leg, which ignores
-    // idleness and custody and never holds the gate.
+    // Issue #3891: that loop also runs the optional anonymous-volume leg, and issue #4291's
+    // BuildKit regular-cache leg; both ignore idleness and custody and never hold the gate.
     private readonly dindPrune?: DindPruneController,
     // PRD #1809 D5/D7: the disk-pressure controller, present when UZI_DISK_RECLAIM or
     // UZI_DISK_ADMISSION is on. The heartbeat feeds it each data-volume sample, the run lane
@@ -987,6 +987,12 @@ export class Worker {
           // is safe to land now. An image WITHOUT this flag keeps working on legacy claims, and the
           // held-state `set-token` verb 409s naming the worker.
           "credential_switch_v1",
+          // Issue #4201: this image applies a pending Claude credential switch IN PLACE (proof before
+          // apply, the write-ahead op ledger, the post-apply seq rebase, the epoch ordinal on every frame)
+          // instead of releasing the claim. Advertised LAST of the m2 changes: once the api sees it, it
+          // keeps draining /inputs while a switch is pending, which only a worker that handles the
+          // switch in place can take.
+          "credential_switch_in_place_v1",
           // #2944: generation-stamped checkpoint/input/memory requests and fresh-transcript
           // checkpoint restoration. Distinct from the API feature milestone_reconciliation_v1.
           "milestone_reconciliation_claim_v1",

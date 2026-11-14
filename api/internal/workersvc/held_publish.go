@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -105,12 +106,27 @@ type heldReader interface {
 	GetHeldPublicationByRunGeneration(context.Context, store.GetHeldPublicationByRunGenerationParams) (store.RunHeldPublication, error)
 }
 
-// AcquireHeldPublishSlot takes one of the process-wide step-A slots without waiting. The caller
-// takes it before the gate and the body read, and calls release when the request is finished.
-func (s *Service) AcquireHeldPublishSlot() (release func(), ok bool) {
+// AcquireHeldPublishSlot reserves one shared held/terminal upload slot without waiting.
+// A worker may hold at most one slot. The authenticated worker ID is supplied by the
+// handler before the gate and body read; its deferred release covers every exit path.
+func (s *Service) AcquireHeldPublishSlot(workerID uuid.UUID) (release func(), ok bool) {
+	s.heldSlotsMu.Lock()
+	defer s.heldSlotsMu.Unlock()
+	if _, busy := s.heldSlotWorkers[workerID]; busy {
+		return nil, false
+	}
 	select {
 	case s.heldSlots <- struct{}{}:
-		return func() { <-s.heldSlots }, true
+		s.heldSlotWorkers[workerID] = struct{}{}
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				s.heldSlotsMu.Lock()
+				defer s.heldSlotsMu.Unlock()
+				delete(s.heldSlotWorkers, workerID)
+				<-s.heldSlots
+			})
+		}, true
 	default:
 		return nil, false
 	}

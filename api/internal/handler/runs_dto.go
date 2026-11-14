@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -147,28 +148,79 @@ func decodeLatestUnmet(raw []byte) []string {
 // label and select_reason are all null-tolerant so a deleted token's history stays readable;
 // secret_id is mapped INDEPENDENTLY of label (the FK nulls the id on a delete while the
 // snapshotted label stays), exactly as runToDTO maps the run-level id/label pair.
-func credentialEpochsToDTO(rows []store.RunCredentialEpoch) []apitypes.CredentialEpochDTO {
-	out := make([]apitypes.CredentialEpochDTO, 0, len(rows))
+func credentialEpochsToDTO(rows []store.RunCredentialEpoch, switches []store.RunCredentialSwitchEpoch, usage []store.ListRunUsageByCredentialEpochRow) []apitypes.CredentialEpochDTO {
+	out := make([]apitypes.CredentialEpochDTO, 0, len(rows)+len(switches))
+	keys := make([]epochKey, 0, cap(out))
 	for _, e := range rows {
 		dto := apitypes.CredentialEpochDTO{
 			ClaimGeneration: e.ClaimGeneration,
 			AppliedAt:       e.AppliedAt.Time,
 		}
-		if e.SecretID.Valid {
-			s := uuid.UUID(e.SecretID.Bytes).String()
-			dto.SecretID = &s
-		}
-		if e.Label.Valid {
-			l := e.Label.String
-			dto.Label = &l
-		}
-		if e.SelectReason.Valid {
-			sr := e.SelectReason.String
-			dto.SelectReason = &sr
-		}
+		setEpochSecret(&dto, e.SecretID, e.Label, e.SelectReason)
 		out = append(out, dto)
+		keys = append(keys, epochKey{generation: e.ClaimGeneration})
 	}
-	return out
+	// Issue #4201: the in-generation epochs in-place switches opened, interleaved after their
+	// generation's base epoch (oldest first by (generation, ordinal)).
+	for _, e := range switches {
+		dto := apitypes.CredentialEpochDTO{
+			ClaimGeneration: e.ClaimGeneration,
+			Ordinal:         e.Ordinal,
+			AppliedAt:       e.AppliedAt.Time,
+		}
+		setEpochSecret(&dto, e.SecretID, e.Label, e.SelectReason)
+		seq := e.MessageSeq
+		dto.MessageSeq = &seq
+		out = append(out, dto)
+		keys = append(keys, epochKey{generation: e.ClaimGeneration, ordinal: e.Ordinal})
+	}
+	order := make([]int, len(out))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int {
+		switch {
+		case keys[a].less(keys[b]):
+			return -1
+		case keys[b].less(keys[a]):
+			return 1
+		}
+		return 0
+	})
+	sorted := make([]apitypes.CredentialEpochDTO, 0, len(out))
+	known := make(map[epochKey]bool, len(out))
+	for _, i := range order {
+		sorted = append(sorted, out[i])
+		known[keys[i]] = true
+	}
+	if len(usage) > 0 {
+		perEpoch, _ := telescopeCredentialEpochUsage(usage, known)
+		for i := range sorted {
+			u := perEpoch[epochKey{generation: sorted[i].ClaimGeneration, ordinal: sorted[i].Ordinal}]
+			sorted[i].Usage = &apitypes.CredentialEpochUsageDTO{
+				InputTokens: u.input, OutputTokens: u.output, CacheReadTokens: u.cacheRead,
+				CacheCreationTokens: u.cacheCreation, CostUSD: float64(u.costMicros) / 1e6,
+			}
+		}
+	}
+	return sorted
+}
+
+// setEpochSecret maps an epoch's secret id, label and select reason, each null-tolerant and mapped
+// INDEPENDENTLY of the others.
+func setEpochSecret(dto *apitypes.CredentialEpochDTO, secretID pgtype.UUID, label, selectReason pgtype.Text) {
+	if secretID.Valid {
+		s := uuid.UUID(secretID.Bytes).String()
+		dto.SecretID = &s
+	}
+	if label.Valid {
+		l := label.String
+		dto.Label = &l
+	}
+	if selectReason.Valid {
+		sr := selectReason.String
+		dto.SelectReason = &sr
+	}
 }
 
 // credentialSwitchState derives RunDTO.credential_switch from the run row (PRD #1247

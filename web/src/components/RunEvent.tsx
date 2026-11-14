@@ -23,12 +23,14 @@ import { parseAnswerPayload, parseQuestionsForDisplay } from "../lib/runQuestion
 import { FindingCard } from "./FindingCard";
 import { PlanMissingCard } from "./PlanMissingCard";
 import { parseDraftPlanCapture } from "./DraftPlanCapture";
+import { CREDENTIAL_SWITCH_UNCERTAIN_TEXT, describeCredentialSwitch } from "../lib/credentialSwitchFeed";
 
 // Terse, per-kind rendering of a run's event stream — one readable line per
 // event instead of a JSON dump. Kinds come from agent/src/sdk-messages.ts (the
 // SDK mapping) plus the runner's own worker emissions:
 //   text | thinking | tool_use | tool_result | status | error | plan
 //   | limit_wait | limit_hit (PRD #35)
+//   | credential_switch | credential_switch_uncertain (PRD #1247 M9, issue #4201)
 // Anything else falls through to a muted unknown-kind line (RunMessage.kind is a
 // free string; the raw frame is always available in the worker's debug log).
 //
@@ -1301,6 +1303,20 @@ export const RunEventRow = memo(function RunEventRow({
         />
       );
     }
+    // PRD #1247 M9 / issue #4201: the server's token-switch record. An in-place switch
+    // (ordinal >= 1) kept the run's worker and working directory; one without an ordinal is
+    // a claim-time switch. The status-style MetaLine is the same escaped React-text sink
+    // `status` uses; the label is sanitized in describeCredentialSwitch.
+    case "credential_switch":
+      return <MetaLine text={describeCredentialSwitch(msg.payload)} />;
+    // Issue #4201: the switch outcome could not be established, so the run parked as a
+    // plain owner pause. Warn-toned like a limit park; fixed copy, nothing interpolated.
+    case "credential_switch_uncertain":
+      return (
+        <div className="rounded-md border border-warn/40 bg-warn/10 px-2 py-1 text-xs text-warn" data-testid="credential-switch-uncertain">
+          {CREDENTIAL_SWITCH_UNCERTAIN_TEXT}
+        </div>
+      );
     default:
       return <UnrenderableRow kind={msg.kind} rec={rec} />;
   }

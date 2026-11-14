@@ -122,6 +122,29 @@ import type { Logger } from "./log.js";
  *  session id we can look up, and is never joined onto a path. */
 const SESSION_ID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
+/**
+ * Issue #4201: the allowlist of turn failures that say the CLI could not resolve the transcript it was
+ * asked to resume (a transcript-incompatibility), as opposed to a provider, auth, billing, policy or
+ * transport failure. After an in-place credential switch the executor restarts the same session, and
+ * the new credential's account can refuse it; a failure on this list, with NO model evidence for the
+ * turn, is safe to answer with one fresh session in the same cwd (nothing processed the prompt).
+ * Each entry is a verified CLI message (see the header: the local pre-network resolution failure).
+ * Extend it only with a message that is observed from the CLI before any model call.
+ */
+const TRANSCRIPT_INCOMPATIBLE: readonly RegExp[] = [
+  /No conversation found with session ID/i,
+];
+
+/** Whether `error` (or a cause up to a small depth) is an allowlisted transcript-incompatibility failure. */
+export function isResumeTranscriptIncompatible(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
+    if (TRANSCRIPT_INCOMPATIBLE.some((re) => re.test(current instanceof Error ? current.message : ""))) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 /** ENOENT/ENOTDIR are the two ways the filesystem says "not there"; everything else
  *  is a failure to look, which must not be read as an answer. */
 function isNotFound(err: unknown): boolean {

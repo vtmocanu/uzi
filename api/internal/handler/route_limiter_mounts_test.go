@@ -950,8 +950,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},
 	{"POST", "/api/worker/runs/{id}/publish", noLimiter},
 	// Issue #2545 step A: the failed run's held-work upload. Worker-authenticated, no per-user
-	// limiter; a process-wide slot cap bounds it instead (AcquireHeldPublishSlot).
+	// limiter; shared global and per-worker slots bound it (AcquireHeldPublishSlot).
 	{"POST", "/api/worker/runs/{id}/held-publication", noLimiter},
+	// Issue #4007: the terminal-preservation upload, worker-authenticated and unlimited like the held-work upload above.
+	{"POST", "/api/worker/runs/{id}/terminal-preservation", noLimiter},
 	{"POST", "/api/worker/runs/{id}/review", noLimiter},
 	// PRD #400 M4a: the review run's diff-findings POST. Worker-authenticated, no per-user
 	// limiter, matching the judge's worker review POST above it.
@@ -963,6 +965,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
 	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
+	// Issue #4201: the in-place credential switch apply rides proposalLimiter.PerWorkerMiddleware
+	// (per-WORKER), which this per-USER probe reads as noLimiter.
+	{"POST", "/api/worker/runs/{id}/credential-switch/apply", noLimiter},
 	// Bounded local lifecycle report, no forge/provider I/O; both actual router
 	// chains are also pinned by TestPolicyHoldRouteHasNoRateLimiter.
 	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},

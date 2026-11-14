@@ -44,7 +44,7 @@ type fakeHeldSvc struct {
 
 func newFakeHeldSvc() *fakeHeldSvc { return &fakeHeldSvc{slotOK: true} }
 
-func (f *fakeHeldSvc) AcquireHeldPublishSlot() (func(), bool) {
+func (f *fakeHeldSvc) AcquireHeldPublishSlot(_ uuid.UUID) (func(), bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.slotOK {

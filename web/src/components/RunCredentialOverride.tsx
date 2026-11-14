@@ -16,6 +16,7 @@ import {
   isCredentialSwitchRefusedLane,
   setTokenBody,
 } from "../lib/credentialOverride";
+import { selectReasonText } from "../lib/credentialSwitchFeed";
 import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import { isTerminalRun } from "../lib/runStatus";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
@@ -35,10 +36,11 @@ function overrideText(o: CredentialOverride): string {
 }
 
 // RunCredentialOverride renders the run's chosen override (mode + label) and, when the
-// DTO still reports one, the pending held-state switch. An applied switch is cleared
-// server-side (the reclaim's epoch write clears the stamp in the DB, issue #1422, and
-// Step A suppresses rows stamped before that landed), so this renders exactly what the
-// DTO says: a null credential_switch shows no badge (the lingering-stamp fixture).
+// DTO still reports one, the pending switch. An applied switch is cleared server-side
+// (the in-place apply, or an older worker's re-claim, writes the epoch and clears the
+// stamp, issues #1422 and #4201; Step A suppresses rows stamped before that landed), so
+// this renders exactly what the DTO says: a null credential_switch shows no badge (the
+// lingering-stamp fixture).
 export function RunCredentialOverride({
   run,
 }: {
@@ -63,38 +65,17 @@ export function RunCredentialOverride({
         </Badge>
       )}
       {sw === "requested" && (
-        <Badge tone="warning" dot title="A token switch was requested and has not been applied to a claim yet.">
+        <Badge tone="warning" dot title="A token switch was requested and has not been applied yet.">
           switch pending
         </Badge>
       )}
       {sw === "released" && (
-        <Badge tone="warning" dot title="The holding worker released its claim; the run awaits reclaim on the new token.">
+        <Badge tone="warning" dot title="An older worker released its claim to switch tokens; the run awaits re-claim on the new token.">
           switch released
         </Badge>
       )}
     </>
   );
-}
-
-// selectReasonText maps the server's select_reason enum to short human copy; an unknown
-// or null reason falls back to the raw value (or nothing), never invents meaning.
-function selectReasonText(reason: string | null): string {
-  switch (reason) {
-    case "override_pinned":
-      return "pinned by override";
-    case "override_auto":
-      return "auto-selected by override";
-    case "override_default":
-      return "default by override";
-    case "auto":
-      return "auto-selected";
-    case "default":
-      return "default token";
-    case "pinned":
-      return "pinned token";
-    default:
-      return reason ?? "";
-  }
 }
 
 // CredentialEpochList renders the applied-switch history — one row per claim, oldest
@@ -111,11 +92,13 @@ export function CredentialEpochList({ epochs }: { epochs?: CredentialEpoch[] }) 
           const reason = selectReasonText(e.select_reason);
           const when = new Date(e.applied_at).toLocaleString();
           return (
-            <li key={e.claim_generation} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+            <li key={`${e.claim_generation}.${e.ordinal ?? 0}`} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
               <span className="font-medium" title={safe || "unknown token"} aria-label={safe || "unknown token"}>
                 {safe || "unknown token"}
               </span>
               {reason && <span className="text-muted">· {reason}</span>}
+              {(e.ordinal ?? 0) >= 1 && <span className="text-muted">· switched in place</span>}
+              {e.usage && <span className="text-faint tabular-nums">· ${e.usage.cost_usd.toFixed(2)}</span>}
               <span className="text-faint tabular-nums">· {when}</span>
             </li>
           );
@@ -185,8 +168,10 @@ export function SwitchTokenAction({
   const switchHold = credentialSwitchHold(run);
 
   // A held or running run has a live claim, so switching interrupts it (losing at most
-  // the in-flight step); a queued run has no claim yet, so the choice just applies to
-  // its first claim.
+  // the in-flight step). The worker applies the new token in place on the same claim and
+  // working directory (issue #4201); an older worker releases and re-claims instead, and an
+  // outcome it cannot establish parks the run as a plain owner pause. A queued run has no
+  // claim yet, so the choice just applies to its first claim.
   // A run held on credential_disabled (PRD #1732) holds no claim either: its claim was
   // never delivered, so switching interrupts nothing.
   // A token-switch hold (issue #3181) continues no model execution, but its processes may still
@@ -247,7 +232,9 @@ export function SwitchTokenAction({
           )}
           {willInterrupt && (
             <p className="text-[11px] text-warn">
-              Switching now interrupts the run — it loses at most the in-flight step, then continues on the new token.
+              Switching now stops the in-flight step, then continues the run in place on the new token, without
+              restarting it. An older worker may release and re-claim the run instead. If the switch cannot be
+              confirmed, the run pauses until you resume it.
             </p>
           )}
           <div className="flex flex-wrap gap-2">

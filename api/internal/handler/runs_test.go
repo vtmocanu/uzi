@@ -259,6 +259,17 @@ func (s *runsStore) ListRunCredentialEpochs(_ context.Context, _ store.ListRunCr
 	return s.credentialEpochs, nil
 }
 
+// ListRunCredentialSwitchEpochs and ListRunUsageByCredentialEpoch back GetRun's issue #4201
+// enrichment (in-place switch epochs and their per-epoch usage); empty here, so GetRun reads the
+// base journal alone.
+func (s *runsStore) ListRunCredentialSwitchEpochs(_ context.Context, _ store.ListRunCredentialSwitchEpochsParams) ([]store.RunCredentialSwitchEpoch, error) {
+	return nil, nil
+}
+
+func (s *runsStore) ListRunUsageByCredentialEpoch(_ context.Context, _ uuid.UUID) ([]store.ListRunUsageByCredentialEpochRow, error) {
+	return nil, nil
+}
+
 // HeartbeatWorker lets a test seed the in-memory outbox tracker through the public
 // Service.Heartbeat entry point (PRD #1391): Heartbeat records the outbox depth before
 // this liveness write, so returning the bare worker is enough for the record to land.

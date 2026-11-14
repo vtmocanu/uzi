@@ -279,6 +279,11 @@ spec:
             # values.yaml (workers.diskRecycleEnabled: true) and is always rendered.
             - name: UZI_WORKER_DISK_RECYCLE_ENABLED
               value: {{ .Values.workers.diskRecycleEnabled | quote }}
+            # Issue #4291: the pressure-only DinD builder-cache prune leg, subordinate to the
+            # master above (the agent ANDs them). Always explicit, never `with`-gated, so an
+            # explicit false is honoured; the default lives in values.yaml.
+            - name: UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED
+              value: {{ .Values.workers.dindBuilderPruneEnabled | quote }}
             # The PVC-age thrash guard (Decision D6): a worker back at pressure within
             # this cooldown is a CAPACITY signal (working set exceeds nixSize) — it is
             # capacity-warned and skipped, not recycled again. An ordinary Go duration.

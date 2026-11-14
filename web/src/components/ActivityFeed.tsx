@@ -23,6 +23,7 @@ import {
 import { ChevronRightIcon } from "./icons";
 import { cx } from "./ui";
 import { parseDraftPlanCapture } from "./DraftPlanCapture";
+import { isInPlaceSwitch } from "../lib/credentialSwitchFeed";
 
 // Each agent gets a stable accent so consecutive blocks are scannable — the
 // same role that avatars + status colors play on a chat message list.
@@ -383,6 +384,12 @@ function agentOneLiner(latest: RunMessage | undefined, detail?: PlanCrossCheckSu
       const t = (latest.payload as { text?: string } | null)?.text ?? "";
       return truncate(t.trim(), 80) || "Finalized at the scope ceiling";
     }
+    // Issue #4201. Fixed phrases, like the limit_* cases: the lane header never carries the
+    // user-authored token label.
+    case "credential_switch":
+      return isInPlaceSwitch(latest.payload) ? "Switched token in place" : "Switched token";
+    case "credential_switch_uncertain":
+      return "Paused: token switch unconfirmed";
     default:
       return "";
   }
@@ -860,7 +867,10 @@ export function ActivityFeed({
         // usage-limit park — the run stops taking new milestones and nothing else on
         // the page says so at the moment it happens. Announce it so a screen-reader
         // user is not left in silence at the cap.
-        mm.kind === "steer_ack"
+        mm.kind === "steer_ack" ||
+        // Issue #4201: an unconfirmed token switch parks the run for its owner; announce it
+        // like a usage-limit park.
+        mm.kind === "credential_switch_uncertain"
       )
         meaningful = mm;
     }
@@ -895,7 +905,9 @@ export function ActivityFeed({
                       // context, so it interpolates nothing from the payload.
                       meaningful.kind === "steer_ack"
                       ? "Run finalized at the operator scope ceiling"
-                      : describeStatus(meaningful.payload);
+                      : meaningful.kind === "credential_switch_uncertain"
+                        ? "Run paused: the token switch could not be confirmed"
+                        : describeStatus(meaningful.payload);
     }
 
     if (terminal && !seen.terminal) next = "Run finished";

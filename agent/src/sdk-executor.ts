@@ -40,7 +40,7 @@ import type {
   SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { buildCIEvidenceServer, CI_EVIDENCE_SERVER, ciEvidencePrompt, withCIEvidenceAgents } from "./ci-evidence-tools.js";
-import type { Executor, ExecutorResult, RunContext, WallParkOutcome } from "./executor.js";
+import type { Executor, ExecutorResult, InPlaceSwitchSite, RunContext, WallParkOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
 import { resolveLeadRequest, type LeadRequest, type PhaseEntry } from "./lead-config-report.js";
 import { toLeadObservation } from "./runtime-observation.js";
@@ -135,6 +135,8 @@ import type {
   TurnStreamEnd,
 } from "./harness.js";
 import { evidencesModelProcessing } from "./harness.js";
+import { RESUME_LINEAGE_BREAK_EVENT } from "./harness-messages.js";
+import { isResumeTranscriptIncompatible } from "./sdk-session.js";
 import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead } from "./executor.js";
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { errMessage } from "./util.js";
@@ -321,6 +323,14 @@ export class ProviderTransientError extends Error {
 // on purpose: a self-inflicted kill can recur on resume, so this never joins the uncapped
 // recovery_wait park; exhaustion fails the run exactly as before.
 const CLI_SIGNAL_DEATH_MAX_RETRIES = 2;
+
+/** Issue #4201: the lineage-break reason when a resume is refused after an applied in-place switch. */
+const CREDENTIAL_SWITCH_RESUME_REFUSED = "credential_switch_resume_refused";
+/** Issue #4201: prepended to the prompt of the one fresh-session restart, which has lost the session's history. */
+const RESUME_REFUSED_PROMPT_NOTE =
+  "Note: your earlier session could not be resumed after a credential switch, so this is a fresh session " +
+  "in the same working directory. Your work so far is in the tree and the branch; re-read the plan and " +
+  "the current state before continuing.\n\n";
 // issue #1656: how long, and how often, to poll for a dead CLI's process group to be gone
 // after the group SIGKILL, before a resume. Past the deadline the run fails closed.
 const CLI_GROUP_REAP_CONFIRM_MS = 1_000;
@@ -820,6 +830,18 @@ interface RunDrive {
   observedEntries?: Set<string>;
   refreshCodeCrossCheckTools?: () => Promise<void>;
   tripReason?: string;
+  /** Issue #4201: the first failure of a guarded lane quiesce, recorded independently of the
+   *  first-wins carrier (tripCarrier drops it while a switch trip is already held). The in-place
+   *  switch needs it: a lane that did not settle is unproven quiescence. */
+  laneSettlementFailure?: Error;
+  /** Issue #4201: the shared SDK env object (also the guarded lane's cliEnv); an applied switch
+   *  rewrites CLAUDE_CODE_OAUTH_TOKEN in place so the next spawn carries the new token. */
+  credentialEnv?: { CLAUDE_CODE_OAUTH_TOKEN?: string };
+  /** Issue #4201: re-attach the ctx.signal abort listener after an applied switch replaced the
+   *  (spent) signal. Installed by phaseSetup. */
+  reattachSignal?: () => void;
+  /** Issue #4201: the carrier's own copy of the run's token, kept in step with the credential. */
+  rebindDrive?: (token: string) => void;
   /** Issue #4090: sticky for the run. Set when a cancel/pause/switch interrupt landed while another
    *  trip was held, so first-wins dropped it. A declined or refused park then keeps the aborted
    *  ctx.signal fencing guarded commands instead of consuming it in front of the lost stop. */
@@ -850,6 +872,16 @@ interface RunDrive {
   /** Issue #3174: sessions that showed model evidence, across the attempts of one logical turn.
    *  Plan-phase turns add to it too; the implement loop replaces it before each implement turn. */
   turnEvidencedSessions: Set<string>;
+  /** Issue #4201: armed by an applied in-place switch; the first resumed turn after it consumes the flag
+   *  (resume refusal: a fresh init session, or an allowlisted transcript-incompatibility with no model
+   *  evidence, restarts in a fresh session in the same cwd). */
+  postSwitchResume?: boolean;
+  /** Issue #4201: whether the resume-refused lineage break was already emitted for the latest applied switch. */
+  resumeRefusalEmitted?: boolean;
+  /** Issue #4201: whether the most recent driveTurn was the one that consumed `postSwitchResume`, and
+   *  whether it showed model evidence. Read by driveTurnWithEmptyRecovery's refusal arm. */
+  lastTurnPostSwitch?: boolean;
+  lastTurnModelEvidence?: boolean;
 }
 
 /**
@@ -1342,6 +1374,14 @@ export class SdkExecutor implements Executor {
     finally { clearTimeout(timer); }
   }
 
+  /** Issue #4201: set by the first guarded-lane quiesce failure (see `laneSettlementProven`). */
+  private laneUnsettled = false;
+
+  /** Issue #4201: the executor-side proof for the runner's escaped-signal arm (Executor.laneSettlementProven). */
+  laneSettlementProven(): boolean {
+    return !this.laneUnsettled && !(this.guardLane?.poisoned ?? false);
+  }
+
   /**
    * issue #3181: join, without bound, what this executor already runs: the guarded lane disposal
    * killAgentTree started and the background deps install. Starts, aborts and kills nothing. Never
@@ -1414,7 +1454,10 @@ export class SdkExecutor implements Executor {
     this.planCandidate = candidate;
     return planMd => {
       if (candidate.flight) return candidate.flight.done;
-      const token = ctx.oauthToken?.trim();
+      // Issue #4201: one credential snapshot at the call's start; the pass uses its token and its usage
+      // frame carries its ordinal, even when an in-place switch lands while it runs.
+      const cred = this.credentialFor(ctx, ctx.oauthToken ?? "");
+      const token = cred.token.trim();
       if (!isRunSummaryKind(ctx.kind) || !token || !this.client || !prdInputP ||
           lifecycle.closed || generation !== this.planGeneration) return Promise.resolve();
       // Own the flight before the first await, including a repeated storage callback.
@@ -1451,7 +1494,8 @@ export class SdkExecutor implements Executor {
               if (owned.delivered || owned.abandoned || this.planFlight !== owned
                 || generation !== this.planGeneration || ctx.claimFenced?.()) return;
               owned.delivered = true;
-              ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: usage } });
+              ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: usage },
+                ...(cred.ordinal > 0 ? { credentialEpochOrdinal: cred.ordinal } : {}) });
             },
           });
           if (!result || !allowed()) return;
@@ -1525,6 +1569,7 @@ export class SdkExecutor implements Executor {
         liveState = state;
         if (ctx.terminalLifecycleSignal?.aborted || ctx.claimFenced?.()) onTerminal();
       });
+      drive.state.rebindDrive = (token) => { drive.oauthToken = token; };
       try {
         const early = await this.phasePlanGate(ctx, drive);
         if (early !== undefined) return (summaryResult = early);
@@ -2137,10 +2182,22 @@ export class SdkExecutor implements Executor {
       depsAbort.abort();
     };
     const onSignal = (): void => tripFromSignal(true);
+    let attachedSignal = ctx.signal;
     if (ctx.signal) {
       if (ctx.signal.aborted) tripFromSignal(false);
       else ctx.signal.addEventListener("abort", onSignal, { once: true });
     }
+    // Issue #4201: an applied in-place switch replaces the spent ctx.signal with a fresh one; this
+    // moves the cancel/pause/switch listener onto it (an already-aborted fresh signal trips at once).
+    state.reattachSignal = (): void => {
+      const live = ctx.signal;
+      if (!live || live === attachedSignal) return;
+      attachedSignal?.removeEventListener("abort", onSignal);
+      attachedSignal = live;
+      if (live.aborted) tripFromSignal(false);
+      else live.addEventListener("abort", onSignal, { once: true });
+    };
+    state.credentialEnv = env;
     // Issue #4090: a re-armable interrupt is a drop when it lands on another held trip, unless it
     // is the synchronous pair of the ctx.signal abort just processed.
     const onInterrupt = (reason: string): void => {
@@ -2420,12 +2477,14 @@ export class SdkExecutor implements Executor {
           delivered: false,
         };
         this.intentFlight = flight;
+        // Issue #4201: one credential snapshot at the call's start (see the plan summary).
+        const cred = this.credentialFor(ctx, oauthToken);
         flight.done = (async () => {
           try {
             const prd = await prdInputP!;
             if (flight.abandoned || flight.ctrl.signal.aborted || ctx.claimFenced?.() || ctx.cancelRequested?.()) return;
             const summary = await this.summaryRunner.generateIntentSummary({
-              token: oauthToken,
+              token: cred.token,
               model: ctx.summaryModel ?? "",
               issueTitle: ctx.issueTitle,
               issueBody: ctx.issueDescription,
@@ -2434,7 +2493,8 @@ export class SdkExecutor implements Executor {
               onUsage: (u) => {
                 if (this.intentFlight !== flight || flight.delivered || flight.abandoned || ctx.claimFenced?.()) return;
                 flight.delivered = true;
-                ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "intent", model_usage: u } });
+                ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "intent", model_usage: u },
+                  ...(cred.ordinal > 0 ? { credentialEpochOrdinal: cred.ordinal } : {}) });
               },
             });
             if (summary && this.intentFlight === flight && !flight.abandoned && !flight.ctrl.signal.aborted
@@ -2590,7 +2650,7 @@ export class SdkExecutor implements Executor {
         // Only for an UNAPPROVED plan (the runner guards the same condition): a plan approved by the
         // server but re-planned here (its session is gone) has no pending gate verdict to read.
         if (ctx.planApproved !== true && ctx.approvedPlan?.trim() && ctx.takeResumedGateEvent) {
-          const step = await this.runThroughSwitch(ctx, state, () => ctx.takeResumedGateEvent!(ctx.signal));
+          const step = await this.runThroughSwitch(ctx, state, () => ctx.takeResumedGateEvent!(ctx.signal), undefined, { site: "gate_resumed" });
           if ("released" in step) return { branch: ctx.branch, switchReleased: true };
           pending = step.value;
         }
@@ -2669,7 +2729,7 @@ export class SdkExecutor implements Executor {
               if (err instanceof CredentialSwitchSignal && planResume === undefined) planResume = state.lastTurnSessionId;
               throw err;
             }
-          });
+          }, undefined, { site: "plan_turn" });
           if ("released" in planStep) return { branch: ctx.branch, switchReleased: true };
           const plan = planStep.value;
           resumeId = plan.sessionId ?? resumeId;
@@ -2707,7 +2767,7 @@ export class SdkExecutor implements Executor {
           const g0 = await this.runThroughSwitch(ctx, state, () =>
             ctx.gatePlan!(approvedPlan, gateMilestones, onPlanPersisted, undefined, semanticSubmission),
 
-            ctx.continueExistingPlanGate, { reopenPlanSummary: true },
+            ctx.continueExistingPlanGate, { site: "plan_gate", reopenPlanSummary: true },
           );
           if ("released" in g0) return { branch: ctx.branch, switchReleased: true };
           verdict = g0.value;
@@ -2767,7 +2827,7 @@ export class SdkExecutor implements Executor {
             });
             const gExhausted = await this.runThroughSwitch(ctx, state, () =>
               ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles, semanticSubmission),
-              ctx.continueExistingPlanGate,
+              ctx.continueExistingPlanGate, { site: "plan_gate_exhausted" },
             );
             if ("released" in gExhausted) return { branch: ctx.branch, switchReleased: true };
             verdict = gExhausted.value;
@@ -2804,7 +2864,7 @@ export class SdkExecutor implements Executor {
           // memo block on the plain issue/rework path: announce where it is actually placed.
           if (resumeId === undefined && !isCIFix && !isSelfImprove && announceDecisionsMemo(ctx))
             decisionsMemoPlaced = true;
-          const sourceStep = await this.runThroughSwitch(ctx, state, reportPlanSource);
+          const sourceStep = await this.runThroughSwitch(ctx, state, reportPlanSource, undefined, { site: "plan_source" });
           if ("released" in sourceStep) return { branch: ctx.branch, switchReleased: true };
           const runRevisionTurn = () =>
             this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget, !automatic);
@@ -2838,7 +2898,7 @@ export class SdkExecutor implements Executor {
               settles,
               semanticSubmission,
             ),
-            ctx.continueExistingPlanGate, { reopenPlanSummary: true },
+            ctx.continueExistingPlanGate, { site: "plan_gate_revision", reopenPlanSummary: true },
           );
           if ("released" in gRev) return { branch: ctx.branch, switchReleased: true };
           verdict = gRev.value;
@@ -3180,7 +3240,7 @@ export class SdkExecutor implements Executor {
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
           throwIfDiskStop(ctx);
           if (state.tripReason) throw this.tripError(state);
-        });
+        }, undefined, { site: "implement_ready" });
         if ("released" in ready) { switchReleased = true; return true; }
         // Capture is outside the switch retry wrapper. Once entered, a switch
         // is deferred by the park ACK; a give-up must never re-enter capture.
@@ -3696,7 +3756,7 @@ export class SdkExecutor implements Executor {
                 if (await handlePauseNow(at)) return { kind: "paused" } as const;
               }
             }
-          });
+          }, undefined, { site: "question_reentry" });
           if ("released" in step) { switchReleased = true; return { kind: "paused" }; }
           return step.value;
         };
@@ -3848,6 +3908,7 @@ export class SdkExecutor implements Executor {
             // askUserOrContinue — keep waiting), never a terminal failure.
             const askStep = await this.runThroughSwitch(ctx, state, () =>
               this.askUserOrContinue(ctx, asked, budget.asked, parkAt, ctx.requestParkRun ? requestPark : undefined),
+              undefined, { site: "ask_user" },
             );
             if ("released" in askStep) {
               switchReleased = true;
@@ -3894,13 +3955,16 @@ export class SdkExecutor implements Executor {
           //   - no hook wired (stub/test executor) → re-throw, byte-identical to the pre-fix behaviour
           //     (the runner's outer catch is then the safety net).
           if (err instanceof CredentialSwitchSignal) {
-            const outcome = await this.attemptCredentialSwitch(ctx);
+            const outcome = await this.attemptCredentialSwitch(ctx, state, "implement_turn");
             if (outcome === "released") {
               switchReleased = true;
               break;
             }
-            if (outcome === "gave_up") {
+            if (outcome === "gave_up" || outcome === "applied") {
               this.throwIfTerminal(ctx);
+              // Issue #4201: an applied switch restarts the turn exactly as a give-up does (same
+              // resumeId and cwd through prepareInPlaceRestart), on the new token.
+              if (outcome === "applied") this.rebindCredential(ctx, state);
               this.clearTrip(state);
               this.markSwitchSignalSpent(ctx);
               throwIfDiskStop(ctx);
@@ -4071,6 +4135,7 @@ export class SdkExecutor implements Executor {
             // previously untested. `ctx.awaitFollowUp` is guaranteed present by the guard above.
             const followUpStep = await this.runThroughSwitch(ctx, state, () =>
               ctx.awaitFollowUp!(followupIdleMs),
+              undefined, { site: "follow_up" },
             );
             if ("released" in followUpStep) {
               switchReleased = true;
@@ -4755,11 +4820,61 @@ export class SdkExecutor implements Executor {
    * settled. Residual: such a pass is cancelled, so its summary is not posted on a later give-up
    * (usage it reports before the settle bound is still emitted).
    */
-  private async attemptCredentialSwitch(ctx: RunContext): Promise<"released" | "gave_up" | undefined> {
+  private async attemptCredentialSwitch(
+    ctx: RunContext, state: RunDrive, site: InPlaceSwitchSite,
+  ): Promise<"released" | "gave_up" | "applied" | undefined> {
     if (!ctx.attemptCredentialSwitch) return undefined;
     await this.waitIntentSummary();
     await this.closeAndSettlePlanSummary();
-    return ctx.attemptCredentialSwitch();
+    // Issue #4201: the executor-side half of the quiescence proof. The lane failure is read from
+    // the independent record, never from the first-wins carrier.
+    const laneSettled = state.laneSettlementFailure === undefined && !(this.guardLane?.poisoned ?? false);
+    return ctx.attemptCredentialSwitch({ site, laneSettled });
+  }
+
+  /** Issue #4201: the run's credential as of this call (token and epoch ordinal). Read once at a consumer's
+   *  start. A stub context without a holder keeps the token it was given at the base epoch. */
+  private credentialFor(ctx: RunContext, fallbackToken: string): { token: string; ordinal: number } {
+    const live = ctx.credential?.();
+    return live ? { token: live.token, ordinal: live.ordinal } : { token: fallbackToken, ordinal: 0 };
+  }
+
+  /** Issue #4201: tell the feed (and the worker log) that the switch's resume was refused and the run
+   *  continues in a fresh session in the same working directory, so the lineage break is attributed. */
+  private emitCredentialResumeRefused(ctx: RunContext, state: RunDrive, epoch: number): void {
+    // At most once per applied switch, whichever arm (a fresh init, or a refused resume) sees the refusal first.
+    if (state.resumeRefusalEmitted === true) return;
+    state.resumeRefusalEmitted = true;
+    this.log.info("resume session refused after a credential switch: continuing in a fresh session in the same working directory", {
+      run_id: ctx.runId, reason: CREDENTIAL_SWITCH_RESUME_REFUSED, event: RESUME_LINEAGE_BREAK_EVENT,
+    });
+    ctx.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: "the credential switch was applied, but the earlier session could not be resumed on the new credential — " +
+          "continuing in a fresh session in the same working directory WITHOUT its earlier context; the work is in the tree",
+        event: RESUME_LINEAGE_BREAK_EVENT,
+        reason: CREDENTIAL_SWITCH_RESUME_REFUSED,
+      },
+      ...(epoch > 0 ? { credentialEpochOrdinal: epoch } : {}),
+    });
+  }
+
+  /**
+   * Issue #4201: after an APPLIED in-place switch, point every copy of the run's token at the new
+   * credential: ctx.oauthToken, the shared SDK env object (which the guarded lane launches from),
+   * the drive carrier, and the abort listener (the old ctx.signal is spent).
+   */
+  private rebindCredential(ctx: RunContext, state: RunDrive): void {
+    const token = (ctx.credential?.().token ?? ctx.oauthToken)?.trim();
+    if (!token) return;
+    ctx.oauthToken = token;
+    state.postSwitchResume = true;
+    state.resumeRefusalEmitted = false;
+    if (state.credentialEnv) state.credentialEnv.CLAUDE_CODE_OAUTH_TOKEN = token;
+    state.rebindDrive?.(token);
+    state.reattachSignal?.();
   }
 
   private markSwitchSignalSpent(ctx: RunContext): void {
@@ -4804,8 +4919,8 @@ export class SdkExecutor implements Executor {
     ctx: RunContext,
     state: RunDrive,
     run: () => Promise<T>,
-    continueWait?: (otherwise: () => Promise<T>) => Promise<T>,
-    options?: { reopenPlanSummary?: boolean },
+    continueWait: ((otherwise: () => Promise<T>) => Promise<T>) | undefined,
+    options: { site: InPlaceSwitchSite; reopenPlanSummary?: boolean },
   ): Promise<{ value: T } | { released: true }> {
     let attempt = run;
     for (;;) {
@@ -4814,16 +4929,17 @@ export class SdkExecutor implements Executor {
         return { value: await attempt() };
       } catch (err) {
         if (!(err instanceof CredentialSwitchSignal)) throw err;
-        const outcome = await this.attemptCredentialSwitch(ctx);
+        const outcome = await this.attemptCredentialSwitch(ctx, state, options.site);
         if (outcome === "released") return { released: true };
-        if (outcome === "gave_up") {
+        if (outcome === "gave_up" || outcome === "applied") {
           this.throwIfTerminal(ctx);
+          if (outcome === "applied") this.rebindCredential(ctx, state);
           this.clearTrip(state);
           this.markSwitchSignalSpent(ctx);
           // PRD #1809 D4: a `disk` stop that landed during the switch attempt lost its trip to the
           // switch's; it parks now instead of re-running the wait.
           throwIfDiskStop(ctx);
-          if (options?.reopenPlanSummary) this.reopenPlanSummary(ctx);
+          if (options.reopenPlanSummary) this.reopenPlanSummary(ctx);
           const guardedRun = (): Promise<T> => {
             this.throwIfTerminal(ctx);
             return run();
@@ -5038,6 +5154,14 @@ export class SdkExecutor implements Executor {
     // Issue #3174: recorded on entry so a pre-dispatch trip, which skips the finally below, leaves
     // this attempt's requested session rather than an earlier attempt's.
     state.lastTurnSessionId = resumeId;
+    // Issue #4201: the first turn after an applied in-place switch spends the flag, whether or not it
+    // resumes a session; only a turn that did ask to resume is watched for a refused resume, so a later
+    // unrelated fresh init or transcript error is never attributed to the switch.
+    const armed = state.postSwitchResume === true;
+    if (armed) state.postSwitchResume = false;
+    const postSwitchResume = armed && resumeId !== undefined;
+    state.lastTurnPostSwitch = postSwitchResume;
+    state.lastTurnModelEvidence = false;
     // A trip may already be pending (e.g. a cancel that landed during the gate).
     if (state.tripReason) throw this.tripError(state);
 
@@ -5049,6 +5173,10 @@ export class SdkExecutor implements Executor {
     state.currentChild = {};
 
     let idleTimer: NodeJS.Timeout | undefined;
+    // Issue #4201: the credential epoch this whole turn runs under, snapshotted once at turn start.
+    // An applied switch cannot happen mid-turn (it needs a trip and a restart), so every frame of
+    // the turn carries one ordinal; the base epoch (0) stays the absent field on the wire.
+    const epoch = ctx.credential?.().ordinal ?? 0;
     // Issue #2471: the guarded command lane of this run (undefined unless guard-bound).
     const lane = this.guardLane;
     const outstandingTools = new Set<string>();
@@ -5208,6 +5336,9 @@ export class SdkExecutor implements Executor {
           markObserved?.();
           if (event.sessionId) initSessionId = event.sessionId;
           if (event.freshSession === true) freshInit = true;
+          // Issue #4201 (a): the SDK started a fresh session instead of resuming the one the switch
+          // continued (ADR-1562 fresh_session). The turn already runs in a fresh session in the same cwd.
+          if (event.freshSession === true && postSwitchResume) this.emitCredentialResumeRefused(ctx, state, epoch);
         } else if (event.sessionId && !(event.kind === "frame" && event.origin.kind === "subagent")) {
           turnSessionId = event.sessionId;
         }
@@ -5233,7 +5364,7 @@ export class SdkExecutor implements Executor {
             { run_id: ctx.runId, kind: d.frameKind },
           );
         }
-        for (const em of reduction.messages) ctx.emit(em);
+        for (const em of reduction.messages) ctx.emit(epoch > 0 ? { ...em, credentialEpochOrdinal: epoch } : em);
         if (event.kind === "initialized" && event.pluginErrors && event.pluginErrors.length > 0) {
           this.onPluginLoadErrors(ctx, state, event.pluginErrors);
           // A skills run tripped above: stop now rather than let the turn work without them.
@@ -5323,6 +5454,7 @@ export class SdkExecutor implements Executor {
       // Issue #3174: every exit, trips included, records the session this attempt ran.
       const ranSession = resumableSessionId();
       state.lastTurnSessionId = ranSession;
+      state.lastTurnModelEvidence = sawModelEvidence;
       if (sawModelEvidence && ranSession !== undefined) state.turnEvidencedSessions.add(ranSession);
       if (idleTimer) clearTimeout(idleTimer);
       this.disarmWall(state);
@@ -5337,7 +5469,12 @@ export class SdkExecutor implements Executor {
         try {
           await lane.quiesce(GUARDED_LANE_QUIESCE_MS);
         } catch (err) {
-          this.tripCarrier(state, err instanceof Error ? err : new Error(errMessage(err)));
+          const failure = err instanceof Error ? err : new Error(errMessage(err));
+          // Issue #4201: recorded apart from the first-wins carrier, which keeps an earlier switch
+          // trip and would otherwise lose this failure.
+          state.laneSettlementFailure ??= failure;
+          this.laneUnsettled = true;
+          this.tripCarrier(state, failure);
         }
       }
     }
@@ -5417,6 +5554,8 @@ export class SdkExecutor implements Executor {
     // issue #1656: resumes spent on foreign CLI signal deaths in THIS turn. Declared outside
     // runOnce so the provider/empty-turn retries below can neither reset nor extend it.
     let signalDeathRetries = 0;
+    // Issue #4201 (b): the one restart a refused post-switch resume is allowed.
+    let resumeRefusalSpent = false;
     // issue #3179: the latest attempt ended with an event-free stream (cleared by every other
     // outcome), so the exhaustion throw and the retry notice describe the FINAL attempt.
     let lastEventFree: EventFreeStreamError | undefined;
@@ -5426,9 +5565,12 @@ export class SdkExecutor implements Executor {
     // original hook (whose once-only latch already fired).
     let lastSuffix = "";
     let replayAfterEventFree = false;
+    // Whether the original hook has run (its once-only latch fired), so a replay of lastSuffix is owed.
+    let hookConsulted = false;
     const dispatchHook = beforeDispatch
       ? (input: string): string => {
           if (replayAfterEventFree) return input + lastSuffix;
+          hookConsulted = true;
           const out = beforeDispatch(input);
           lastSuffix = out.startsWith(input) ? out.slice(input.length) : "";
           return out;
@@ -5521,6 +5663,21 @@ export class SdkExecutor implements Executor {
             });
             // Re-drive at once. The wall is not reset: driveTurn re-arms it with the remaining
             // budget and trips an already-spent one before any SDK call.
+            continue;
+          }
+          // Issue #4201 (b): the first resumed turn after an applied in-place switch failed with an
+          // allowlisted transcript-incompatibility and NO model evidence (nothing processed the prompt):
+          // restart ONCE with the resume unset, in the same cwd. Any other failure (auth, billing, policy,
+          // transport, partial) takes the ordinary path below, unchanged.
+          if (!resumeRefusalSpent && state.lastTurnPostSwitch === true && state.lastTurnModelEvidence === false &&
+              resumeId !== undefined && isResumeTranscriptIncompatible(err)) {
+            resumeRefusalSpent = true;
+            resumeId = undefined;
+            // The refused attempt may have consumed beforeDispatch's once-only suffix (the interrupted-calls
+            // note, issue #3179): the restart re-sends exactly what that dispatch appended.
+            replayAfterEventFree = hookConsulted;
+            prompt = RESUME_REFUSED_PROMPT_NOTE + prompt;
+            this.emitCredentialResumeRefused(ctx, state, ctx.credential?.().ordinal ?? 0);
             continue;
           }
           // Any genuine (non-transient) failure fails the run, exactly as before.

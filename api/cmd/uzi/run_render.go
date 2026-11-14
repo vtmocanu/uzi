@@ -1816,6 +1816,11 @@ func selectReasonText(reason autoselect.Reason, headroom *int) string {
 		// to the default (rendered "default").
 		return "run-default"
 	}
+	// A Codex claim's binding epoch (issue #4201). Not in autoselect's vocabulary: only the
+	// epoch journal records it, so it is matched on the wire string here.
+	if string(reason) == "codex_binding" {
+		return "Codex binding"
+	}
 	return string(reason)
 }
 
@@ -1905,10 +1910,30 @@ func credentialEpochRows(r apitypes.RunDTO) [][]string {
 	if !credentialHistoryHasSwitch(r.CredentialEpochs) {
 		return nil
 	}
-	rows := make([][]string, 0, len(r.CredentialEpochs)+1)
-	rows = append(rows, []string{"TOKEN_HISTORY", itoa(len(r.CredentialEpochs)) + " claims"})
+	// In-place switch epochs (ordinal >= 1) share their claim's generation, so "claims" counts
+	// distinct generations and the switches are tallied apart (issue #4201).
+	gens := make(map[int64]bool, len(r.CredentialEpochs))
+	switches := 0
 	for _, e := range r.CredentialEpochs {
-		rows = append(rows, []string{"  gen " + strconv.FormatInt(e.ClaimGeneration, 10), credentialEpochCell(e)})
+		gens[e.ClaimGeneration] = true
+		if e.Ordinal >= 1 {
+			switches++
+		}
+	}
+	summary := itoa(len(gens)) + " claims"
+	if switches == 1 {
+		summary += ", 1 in-place switch"
+	} else if switches > 1 {
+		summary += ", " + itoa(switches) + " in-place switches"
+	}
+	rows := make([][]string, 0, len(r.CredentialEpochs)+1)
+	rows = append(rows, []string{"TOKEN_HISTORY", summary})
+	for _, e := range r.CredentialEpochs {
+		gen := "  gen " + strconv.FormatInt(e.ClaimGeneration, 10)
+		if e.Ordinal >= 1 {
+			gen += "." + strconv.FormatInt(int64(e.Ordinal), 10)
+		}
+		rows = append(rows, []string{gen, credentialEpochCell(e)})
 	}
 	return rows
 }
@@ -1951,7 +1976,11 @@ func credentialEpochCell(e apitypes.CredentialEpochDTO) string {
 	if e.SelectReason != nil && *e.SelectReason != "" {
 		cell += " — " + selectReasonText(autoselect.Reason(*e.SelectReason), nil)
 	}
-	return cell + " · " + e.AppliedAt.UTC().Format(time.RFC3339)
+	cell += " · " + e.AppliedAt.UTC().Format(time.RFC3339)
+	if e.Usage != nil {
+		cell += " · $" + strconv.FormatFloat(e.Usage.CostUSD, 'f', 2, 64)
+	}
+	return cell
 }
 
 // renderMessage prints one run message, hiding accounting evidence in human mode.
@@ -1982,6 +2011,8 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 	// Diagnostics use that sanitizer too; other payloads keep the generic row.
 	if line, ok := activityMessageLine(m.Kind, m.Payload); ok {
 		payload = capCell(cellText(line), 200)
+	} else if line, ok := credentialSwitchMessageLine(m.Kind, m.Payload); ok {
+		payload = line
 	} else if m.Kind == "status" {
 		var diagnostic struct {
 			Event string  `json:"event"`
@@ -1995,6 +2026,33 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 	}
 	p.Printf("#%-4d %-16s %-*s %s\n", m.Seq, m.Kind, actorCellWidth, actorCell(m), payload)
 	return nil
+}
+
+// credentialSwitchMessageLine renders the two in-place credential-switch feed messages (issue #4201).
+// A `credential_switch` message carrying an ordinal is an applied in-place switch ("switched in place
+// to <label>"); one without it is the claim path's message and keeps the generic payload row. A
+// `credential_switch_uncertain` message is the owner pause for an outcome the worker could not prove.
+// The label is USER-AUTHORED, so it goes through the same capCell(cellText(...)) composition as every
+// other worker-bound cell; the uncertain text is fixed and reads nothing from the payload.
+func credentialSwitchMessageLine(kind string, raw json.RawMessage) (string, bool) {
+	switch kind {
+	case "credential_switch":
+		var p struct {
+			Label   *string `json:"label"`
+			Ordinal int32   `json:"ordinal"`
+		}
+		if json.Unmarshal(raw, &p) != nil || p.Ordinal <= 0 {
+			return "", false
+		}
+		label := "another token"
+		if p.Label != nil && cellText(*p.Label) != "" {
+			label = cellText(*p.Label)
+		}
+		return capCell("switched in place to "+label, 200), true
+	case "credential_switch_uncertain":
+		return "token switch outcome unknown; run paused; resume to retry", true
+	}
+	return "", false
 }
 
 // actorCellWidth bounds the human table's actor column. The payload column beside

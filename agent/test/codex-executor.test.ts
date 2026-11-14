@@ -995,11 +995,15 @@ describe("M3 actual runner memory Codex delivery", () => {
       }
       let captured: CapturedMemoryContext | undefined;
       const settlements: unknown[] = [];
+      // issue #4293: executor entry is the owner prologue's readiness event (see awaitOwnerExecutorEntry).
+      let enterExecutor!: () => void;
+      const executorEntered = new Promise<void>(resolve => { enterExecutor = resolve; });
       const delivery: Executor = {
         get safety() { return executor.safety; },
         sandboxesCommands: executor.sandboxesCommands,
         recordedRootPids: () => executor.recordedRootPids(),
         run: async ctx => {
+          enterExecutor();
           captured = ctx.capturedMemory?.();
           assert.ok(captured, "actual RunRunner supplies trusted captured memory before Codex admission");
           return executor.run(ctx);
@@ -1044,14 +1048,36 @@ describe("M3 actual runner memory Codex delivery", () => {
         // rounds keep the full 5s boundary (issue #4069).
         { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000,
           memoryHoldDeadlineMs: lateCapture ? 500 : late ? 1500 : 5000 });
+      // issue #4293 controlled reproduction (retry mode): hold the owner prologue's first ensureClone and, while
+      // held, move only the launch wait's clock past its 3000ms budget, modelling a CPU-starved prologue. A launch
+      // wait anchored at execute times out here; one anchored at executor entry does not. Runner deadlines are
+      // untouched: the skew applies to launchNow alone, which is real time plus the skew, never a frozen counter.
+      let launchSkew = 0, prologueHeld = false;
+      const launchNow = () => Date.now() + launchSkew;
+      if (mode === "retry") {
+        const ensureCloneOriginal = m2Runner.git.ensureClone.bind(m2Runner.git);
+        t.mock.method(m2Runner.git, "ensureClone", async (...args: Parameters<typeof ensureCloneOriginal>) => {
+          if (!prologueHeld) {
+            prologueHeld = true;
+            launchSkew = 3001;
+            await new Promise<void>(resolve => setImmediate(resolve));
+          }
+          return ensureCloneOriginal(...args);
+        });
+      }
       const running = runner.execute(f.claim);
       let duplicate: Promise<void> | undefined;
       // Rescue only our fake roots/transport, never host processes. Owner waits allow 6s;
       // the 10s rescue settles execution even when an assertion fails before normal cleanup.
-      const rescue = setTimeout(() => { finishes.forEach(finish => finish()); transport.end(); }, 10000);
+      // issue #4293: armed at executor entry; before it there are no fake roots and the transport is unused.
+      let rescue: ReturnType<typeof setTimeout> | undefined;
       const response = (id: number) => transport.responses.find(r => r.requestId === id)?.response;
       try {
-        await waitFor(() => modelLaunches === 1 && !!finishModel, "real default command launch");
+        await awaitOwnerExecutorEntry(executorEntered, running, t.signal,
+          () => `owner log: ${JSON.stringify(ownerLog.lines)}`);
+        rescue = setTimeout(() => { finishes.forEach(finish => finish()); transport.end(); }, 10000);
+        if (mode === "retry") assert.equal(prologueHeld, true, "controlled reproduction held the owner prologue");
+        await waitFor(() => modelLaunches === 1 && !!finishModel, "real default command launch", 3000, launchNow);
         // Enrollment follows launch/observe; pressure remains high until the monitor selects it.
         f.pressure(950);
         await waitFor(() => !!response(23961), "original broker callback");
@@ -1671,6 +1697,30 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
 function tick(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
+/** issue #4293: the M3 owner's RunRunner prologue runs ~80 sequential real git subprocesses before executor.run,
+ *  so its duration is CPU-bound and not a fixed-budget property. It is gated by an event (executor entry), with
+ *  the owner run settling first or the test's abort signal as the failure paths; no wall-clock poll, no timer. */
+async function awaitOwnerExecutorEntry(entered: Promise<void>, running: Promise<void>, signal: AbortSignal,
+  diagnostics: () => string): Promise<void> {
+  const label = "owner executor entry before real default command launch";
+  let onAbort: (() => void) | undefined;
+  try {
+    await Promise.race([
+      entered,
+      running.then(
+        () => { throw new Error(`owner run settled before ${label}; ${diagnostics()}`); },
+        error => { throw new Error(`owner run failed before ${label}: ${String(error)}; ${diagnostics()}`); }),
+      new Promise<never>((_, reject) => {
+        onAbort = () => reject(new Error(`test aborted waiting for ${label}; ${diagnostics()}`));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 async function waitFor(cond: () => boolean, label: string, ms = 3000, now: () => number = () => Date.now()): Promise<void> {
   const start = now();
   while (!cond()) {

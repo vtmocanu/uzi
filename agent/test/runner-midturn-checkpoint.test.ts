@@ -4068,7 +4068,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
       let owedSha = "";
       const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
       const worktreeStatus = g.worktreeStatus.bind(g);
-      let switchOutcome: "gave_up" | "released" | undefined;
+      let switchOutcome: "gave_up" | "released" | "applied" | undefined;
       let runner: RunRunner | undefined;
       try {
         runner = mkRunner(g, turn(async (ctx) => {

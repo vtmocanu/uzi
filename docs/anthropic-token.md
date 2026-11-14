@@ -342,9 +342,16 @@ regardless of the worker.
   run picks the choice up at its next claim; a run parked on
   [a usage limit, a pooled-token wait, or a transient recovery
   park](run-limit-wait.md) promotes straight back to `queued`; a running run
-  or one held at the plan gate switches when the worker next releases its
-  claim, losing at most the step in flight (the run page says so before you
-  confirm). Switching to a token that looks tight can warn instead of refuse
+  or one held at the plan gate switches in one of two ways. On a worker
+  that supports **in-place switching** (and an api that serves it), the run
+  keeps its worker, claim and working directory: the worker proves its own
+  processes stopped, gets the new token from one fenced step, and restarts
+  the agent on it, resuming the same session where the provider allows. If the
+  provider refuses that session, the run continues in a fresh session in the
+  same directory and the feed notes the break (`resume_lineage_break`, reason
+  `credential_switch_resume_refused`). An older worker releases its claim at
+  the next opportunity instead, losing at most the step in flight (the run
+  page says so before you confirm); the next claim then carries the token. Switching to a token that looks tight can warn instead of refuse
   — see [Claude rate limits](rate-limits.md).
 
   A run parked on an owner hold (for example worker memory pressure, worker
@@ -355,7 +362,7 @@ regardless of the worker.
   A run that still carries [retained recovery work](run-recovery.md) takes a
   stricter route. Before it reports the switch, the worker first proves the
   run's own processes stopped, within a bounded allowance. If that is
-  proven, the switch releases as above. If it is not, the run is **held for
+  proven, the switch goes ahead as above. If it is not, the run is **held for
   you** instead (`paused`, `credential_switch_settling` then
   `credential_switch_unsettled`) and nothing is released until you choose
   Resume or Cancel; see [Credential-switch holds](run-recovery.md#credential-switch-holds).
@@ -363,13 +370,32 @@ regardless of the worker.
   reporting a terminal state and the run stays non-terminal: an API without
   the `credential_switch_hold` protocol feature (mixed-version rollout), a
   hold report the API refuses or that stays unconfirmed after one retry and
-  an ownership read, and a retained flight whose ownership read shows the run
+  an ownership read (this is the v1, op-less path; an in-place, op-carrying
+  held or uncertain report instead retries transient failures, meaning
+  transport errors, 5xx, 408 and 429, on a capped exponential backoff, with an
+  ownership read from the fifth attempt, until it is confirmed, refused, the
+  claim goes stale or the run is stopped, and any other failure ends it
+  unconfirmed with work and custody kept), and a retained flight whose
+  ownership read shows the run
   at an `awaiting_*` gate. An unconfirmed report may already have applied; the
   worker still acknowledges it after its own operations join, as described in
   [Credential-switch holds](run-recovery.md#credential-switch-holds).
   In each case, the next claim's predecessor proof still
   fails closed. In a narrow race a refused `set-token` can still save the
   token you chose.
+
+  **When an in-place switch cannot be confirmed.** The worker proved its
+  processes stopped, but it cannot tell whether the new token took effect (the
+  reply was lost, or the token can no longer be handed out). It does not guess
+  and does not go back to the old token: the run **pauses for you** with no
+  hold reason and a `credential_switch_uncertain` message in its feed (the
+  worker posts it, so you see it in the run feed). Choose
+  **Resume** (`uzi run resume <run-id>`); Resume re-reads the token from the
+  run's current choice, so whatever `set-token` last set is the token that
+  runs. See [Paused after an uncertain token switch](run-pause.md#paused-after-an-uncertain-token-switch).
+  Per-epoch usage in the run view is computed from the usage the run
+  reported while each token was active; usage reported on a side channel
+  that carries no epoch is not attributed to a token.
 
   **Known limitation on a cross-check human gate.** If the run is held at a
   [Plan cross-check](cross-check.md) human gate (a gated check, or a required

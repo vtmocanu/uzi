@@ -128,6 +128,9 @@ func TestSemanticWorkerWritesUseWorkerLimiter(t *testing.T) {
 	want["/api/worker/runs/{id}/memory/settlement"] = false
 	// The write-ahead publication intent endpoint shares the per-worker proposal bucket.
 	want["/api/worker/runs/{id}/publication-intent"] = false
+	// The in-place credential switch apply (issue #4201) returns a plaintext token and decrypts a
+	// credential per call, so it rides the same per-worker bucket.
+	want["/api/worker/runs/{id}/credential-switch/apply"] = false
 	budget := 0
 	for i, name := range limiterNames {
 		if name == limProposal {

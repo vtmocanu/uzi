@@ -472,6 +472,12 @@ export const mockDoneMessages: RunMessage[] = [
   dm("tool_use", "lead", { id: "tu-5", name: "Agent", input: { subagent_type: "Explore", description: "map the remaining render paths" } }, 198),
   dm("tool_result", "lead", { tool_use_id: "tu-5", content: "denied by guardrail: only the run's assembled subagents may be invoked", is_error: true }, 198),
   dm("text", "lead", { text: "I'll use the researcher subagent instead." }, 197),
+  // Issue #4201: the owner switched the token mid-run and the worker applied it IN PLACE
+  // (ordinal 1: same claim, same worker and working directory). Payload keys mirror the
+  // server's credentialSwitchMessagePayload. A second switch could not be confirmed, so the
+  // run parked as a plain owner pause until the owner resumed it.
+  dm("credential_switch", null, { label: "console-key", select_reason: "override_pinned", secret_id: "sec-console-key", ordinal: 1 }, 196),
+  dm("credential_switch_uncertain", null, {}, 194),
   dm("text", "reviewer", { text: "Pairing is by id, orphan results render standalone, and the cap keeps folding correct at the boundary. One nit: memoize the index. Approved after that.", model: "claude-opus-4-8", usage: { input_tokens: 18_900, cache_read_input_tokens: 149_700, cache_creation_input_tokens: 0, output_tokens: 7_600 } }, 195),
   dm("tool_use", "coder", { id: "tu-6", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 192),
   dm("tool_result", "coder", { tool_use_id: "tu-6", content: "ok" }, 192),
