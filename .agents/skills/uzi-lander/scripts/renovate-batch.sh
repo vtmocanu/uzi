@@ -88,12 +88,19 @@ report() {
 }
 stop() { report; echo "renovate-batch: stopped at #$1: $2; inspect $DIR (no later PR attempted)" >&2; exit 4; }
 skip() { SKIPPED+=("$1"); REASONS+=("SKIP_REASON_$1=$2"); }
-# A skip is safe only when the tree is exactly where the PR started.
+# A skip is safe only when the tree is exactly where the PR started. Every read must succeed:
+# a failed lookup is "not verified", never "absent".
+gitpath_absent() {
+  local p
+  p=$(git -C "$DIR" rev-parse --git-path "$1" 2>/dev/null) && [ -n "$p" ] || return 1
+  case "$p" in /*) ;; *) p="$DIR/$p";; esac
+  [ ! -e "$p" ]
+}
 verified_at() {
-  [ "$(git -C "$DIR" rev-parse HEAD 2>/dev/null)" = "$1" ] || return 1
-  [ -z "$(git -C "$DIR" status --porcelain --untracked-files=all 2>/dev/null || echo dirty)" ] || return 1
-  ! git -C "$DIR" rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1 || return 1
-  [ ! -e "$(git -C "$DIR" rev-parse --git-path sequencer)" ]
+  local h st
+  h=$(git -C "$DIR" rev-parse --verify HEAD 2>/dev/null) && [ "$h" = "$1" ] || return 1
+  st=$(git -C "$DIR" status --porcelain --untracked-files=all 2>/dev/null) && [ -z "$st" ] || return 1
+  gitpath_absent CHERRY_PICK_HEAD && gitpath_absent sequencer
 }
 
 for n in "${PRS[@]}"; do

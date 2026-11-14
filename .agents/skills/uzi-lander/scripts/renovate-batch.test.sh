@@ -59,6 +59,7 @@ cat > "$WORK/bin/git" <<STUB
 case " \$* " in
   *" cherry-pick --abort "*) [ -n "\${INJECT_ABORT_FAIL:-}" ] && exit 1; [ -n "\${INJECT_ABORT_NOOP:-}" ] && exit 0 ;;
   *" rev-list --reverse "*) [ -n "\${INJECT_REVLIST_FAIL:-}" ] && case " \$* " in *"\$INJECT_REVLIST_FAIL"*) exit 1;; esac ;;
+  *" rev-parse --git-path sequencer "*) [ -n "\${INJECT_GITPATH_FAIL:-}" ] && exit 1 ;;
   *" worktree add "*)
     "$REAL_GIT" "\$@" || exit \$?
     [ -n "\${INJECT_MOVE_MAIN:-}" ] && "$REAL_GIT" -C "$WORK/repo" update-ref refs/remotes/origin/main "\$INJECT_MOVE_MAIN"
@@ -145,5 +146,12 @@ rc=0; out=$(INJECT_ABORT_NOOP=1 run --branch chore/b6 --dir "$WORK/b6" 11 13 14 
 grep -qF 'stopped at #13: cherry-pick conflict, rollback not verified' <<<"$out" || fail "case7 reason: $out"
 [ "$(cat "$WORK/b6/lock.txt")" = 'c 1' ] || fail "case7 #14 attempted on uncertain state"
 refs_ok case7
+
+# 8. A failed verification read (after a real, successful abort) is not a verified rollback.
+rc=0; out=$(INJECT_GITPATH_FAIL=1 run --branch chore/b7 --dir "$WORK/b7" 11 13 14 2>&1) || rc=$?
+[ "$rc" = 4 ] || fail "case8 rc=$rc: $out"
+grep -qF 'stopped at #13: cherry-pick conflict, rollback not verified' <<<"$out" || fail "case8 reason: $out"
+[ "$(cat "$WORK/b7/lock.txt")" = 'c 1' ] || fail "case8 #14 attempted on unverified state"
+refs_ok case8
 
 echo "renovate-batch.test.sh: ok"
