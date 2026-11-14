@@ -60,6 +60,54 @@ func (q *Queries) AdminListDockerAllowlistRepos(ctx context.Context, dockerRepoA
 	return items, nil
 }
 
+const adminListEnabledRepoActivity = `-- name: AdminListEnabledRepoActivity :many
+SELECT r.id, r.path_with_namespace, r.enabled,
+  (SELECT max(ru.created_at) FROM runs ru WHERE ru.repo_id = r.id)::timestamptz AS last_run_at
+FROM repos r
+WHERE r.enabled OR EXISTS (SELECT 1 FROM runs a WHERE a.repo_id = r.id
+  AND a.status NOT IN ('completed','failed','cancelled') AND a.kind NOT IN ('chat','judge','cross_check'))
+ORDER BY r.path_with_namespace, r.id
+`
+
+type AdminListEnabledRepoActivityRow struct {
+	ID                uuid.UUID          `json:"id"`
+	PathWithNamespace string             `json:"path_with_namespace"`
+	Enabled           bool               `json:"enabled"`
+	LastRunAt         pgtype.Timestamptz `json:"last_run_at"`
+}
+
+// Issue #4334: the admin cross-user repo-activity list. UNSCOPED (admin-only,
+// gated in the handler, precedent AdminListReposWithPrivilege). Returns every repo
+// that is enabled OR has a listed-active run, i.e. a non-terminal run whose kind is
+// not chat/judge/cross_check. That predicate mirrors the listed-active filter of
+// ListActiveRunsAll in runtime.sql, minus its LIMIT 500, so the count is exact.
+// last_run_at is the newest runs.created_at of any kind (NULL when the repo never
+// ran).
+func (q *Queries) AdminListEnabledRepoActivity(ctx context.Context) ([]AdminListEnabledRepoActivityRow, error) {
+	rows, err := q.db.Query(ctx, adminListEnabledRepoActivity)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AdminListEnabledRepoActivityRow{}
+	for rows.Next() {
+		var i AdminListEnabledRepoActivityRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.PathWithNamespace,
+			&i.Enabled,
+			&i.LastRunAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const adminListReposWithPrivilege = `-- name: AdminListReposWithPrivilege :many
 SELECT r.id, r.path_with_namespace, r.enabled,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,

@@ -222,7 +222,7 @@ var limiterNames = [...]string{
 // Issue #3251 adds POST /api/worker/runs/{id}/codex-catalog-default (noLimiter, like lead-config).
 // PRD #4205 adds POST /api/admin/workers/{id}/hibernate, POST /api/admin/workers/{id}/wake and
 // POST /api/controller/workers/{workerID}/hibernation (all noLimiter), making the table 411 rows
-// (len(wantRouteMounts) at that change).
+// (len(wantRouteMounts) at that change). Issue #4334 adds GET /api/admin/repo-activity (noLimiter), making it 412 rows.
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -370,6 +370,8 @@ var wantRouteMounts = []routeMount{
 	// PRD #66 M9 (D8): the admin cross-user blocked-repos list reads the STORED
 	// privilege_report (no forge call) → noLimiter.
 	{"GET", "/api/admin/blocked-repos", noLimiter},
+	// Issue #4334: the admin repo-activity read is a DB-only cross-user list, like blocked-repos.
+	{"GET", "/api/admin/repo-activity", noLimiter},
 	// PRD #66 M3: the live guardrail impact scan carries the per-user forge budget,
 	// like POST /{id}/privilege-check — it makes the same class of upstream forge
 	// reads (2 + 2×repos), so it draws from the forge pocket rather than none.
