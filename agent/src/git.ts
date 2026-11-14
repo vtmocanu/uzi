@@ -20743,7 +20743,8 @@ try {
    *  5. staged validation against the enumeration (set, modes, sizes), then `write-tree` and a
    *     deterministic `commit-tree` on HEAD, proven by a tree-diff backstop;
    *  6. record-first transfer: `onPhase("capturing")`, create-only clone ref, worker-uid file://
-   *     fetch into the bare's same-named ref (no `+`), CAS-delete of the clone ref, `onPhase("captured")`.
+   *     fetch into a unique bare staging ref (no `+`), validation, CAS-create of the bare's same-named ref
+   *     from it, staging-ref delete, CAS-delete of the clone ref, `onPhase("captured")`.
    * A failure after the clone ref exists returns `refused` and leaves refs as they are; the bare ref is
    * never deleted here. `deadlineMs` is a duration budget for the whole call.
    */
@@ -20755,6 +20756,8 @@ try {
         !Number.isSafeInteger(opts.generation) || opts.generation < 1 ||
         !Number.isFinite(opts.deadlineMs) || opts.deadlineMs <= 0 ||
         typeof opts.barePath !== "string" || !path.isAbsolute(opts.barePath)) return refused("invalid_input");
+    // Same containment fetchAgentBranch applies: only a worker-selected runner clone reaches the transport.
+    if (!isWithinPath(clonePath, path.resolve(this.runnerRoot))) return refused("clone_outside_runner_root");
     const deadlineAt = Date.now() + opts.deadlineMs;
     const left = (): number => {
       if (opts.signal?.aborted) fail("aborted");
@@ -20818,13 +20821,33 @@ try {
     const sameInvariants = (a: Awaited<ReturnType<typeof invariants>>, b: Awaited<ReturnType<typeof invariants>>): boolean =>
       a.head === b.head && a.symbolic === b.symbolic && a.refs === b.refs && a.index === b.index;
 
+    // An agent-planted alternates file would make the worker-uid fetch import objects from another object
+    // store. Any entry that is not an empty regular file, or that cannot be read, refuses. Residual TOCTOU:
+    // the clone is agent-writable, so a file planted between this check and the fetch's object read is only
+    // caught by the re-check after the fetch (the staging ref is then dropped; imported objects stay
+    // unreferenced in the bare until its gc).
+    const alternatesClean = async (): Promise<boolean> => {
+      for (const name of ["alternates", "http-alternates"]) {
+        try {
+          const st = await fs.lstat(path.join(clonePath, ".git", "objects", "info", name));
+          if (!st.isFile() || st.size !== 0) return false;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+        }
+      }
+      return true;
+    };
+
     let privateIndex: string | undefined;
     try {
       // Clone shape and configuration that would redirect or extend the staging.
       const dotGit = await fs.lstat(path.join(clonePath, ".git")).catch(() => undefined);
       if (!dotGit?.isDirectory()) return refused("clone_shape");
+      if (!(await alternatesClean())) return refused("alternates_present");
       for (const row of rows(await git(["config", "--local", "--null", "--list"]), 100_000, "config_cap")) {
-        const key = row.slice(0, Math.max(0, row.indexOf("\n"))).toLowerCase();
+        // A valueless boolean key (`key\0` with no newline) is the whole row, never "".
+        const nl = row.indexOf("\n");
+        const key = (nl < 0 ? row : row.slice(0, nl)).toLowerCase();
         if (key === "core.worktree" || key.startsWith("include.") || key.startsWith("includeif.") ||
             key === "core.sparsecheckout" || key === "core.splitindex" || key === "index.sparse" ||
             (key === "core.bare" && row.slice(key.length + 1) !== "false")) return refused("config_refused");
@@ -20836,7 +20859,7 @@ try {
 
       // 1. Enumeration before any staging.
       const status = rows(await git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none", "--no-renames"],
-        { overflow: "entry_cap" }), WIP_CAPTURE_MAX_ENTRIES, "entry_cap");
+        { overflow: "entry_cap" }), opts.caps?.maxEntries ?? WIP_CAPTURE_MAX_ENTRIES, "entry_cap");
       type Entry = { kind: "file" | "exec" | "symlink" | "absent"; size: number; untracked: boolean };
       const entries = new Map<string, Entry>();
       let totalBytes = 0;
@@ -20865,7 +20888,7 @@ try {
         if (kind !== "symlink" && st.size > WIP_CAPTURE_MAX_FILE_BYTES) return refused("oversized");
         if (terminalCredentialPath(rel, opts.workerTokenFile, clonePath)) return refused("credential_path");
         totalBytes += st.size;
-        if (totalBytes > CHECKPOINT_SCAN_MAX_TOTAL_BYTES) return refused("total_bytes");
+        if (totalBytes > (opts.caps?.maxTotalBytes ?? CHECKPOINT_SCAN_MAX_TOTAL_BYTES)) return refused("total_bytes");
         entries.set(rel, { kind, size: st.size, untracked: x === "?" && y === "?" });
       }
       if (entries.size > 0) {
@@ -20966,14 +20989,31 @@ try {
       await this.withLock(opts.barePath, async () => {
         const present = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim();
         if (present !== "" && present !== commit) fail("bare_ref_conflict");
+        if (!(await alternatesClean())) fail("alternates_present");
         left();
-        await this.runGit(opts.barePath, [
-          "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags", "--no-write-fetch-head",
-          `file://${clonePath}`, `${cloneRef}:${bareRef}`,
-        ]);
-        const landed = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim();
-        if (landed !== commit) fail("bare_transfer_mismatch");
-        if ((await this.runGit(opts.barePath, ["--no-replace-objects", "cat-file", "-t", commit])).trim() !== "commit") fail("bare_transfer_mismatch");
+        // Fetch into a unique staging ref (ours by uuid), validate it, and only then create the final ref by CAS,
+        // so a clone ref swapped after validation never lands an unvalidated commit in the final ref.
+        const stage = `refs/uzi-incoming/${randomUUID()}`;
+        try {
+          await this.runGit(opts.barePath, [
+            "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags", "--no-write-fetch-head",
+            `file://${clonePath}`, `${cloneRef}:${stage}`,
+          ]);
+          const landed = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage])).trim();
+          if (landed !== commit) fail("bare_transfer_mismatch");
+          if ((await this.runGit(opts.barePath, ["--no-replace-objects", "cat-file", "-t", commit])).trim() !== "commit") fail("bare_transfer_mismatch");
+          if (!(await alternatesClean())) fail("alternates_present");
+          if (present !== commit) await this.runGit(opts.barePath, ["update-ref", bareRef, commit, ""]);
+          if ((await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim() !== commit) fail("bare_transfer_mismatch");
+        } finally {
+          // Only the staging ref is dropped, never the final ref.
+          const staged = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage]).catch(() => "")).trim();
+          if (staged !== "") {
+            await this.runGit(opts.barePath, ["update-ref", "-d", stage, staged]).catch((cleanup: unknown) => {
+              this.log.warn("terminal snapshot staging ref cleanup failed", { error: gitErrorMessage(cleanup) });
+            });
+          }
+        }
       });
       await git(["update-ref", "-d", cloneRef, commit]);
       if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
@@ -21113,9 +21153,12 @@ try {
 
   /** For every commit of `<tip> ^<exclude> ^<scan floors>` (merges included, at most 1000), the paths that differ
    *  between `targetSha` and that commit (`diff --no-renames --name-only`), so an intermediate commit a later one
-   *  reverts is still reported. Null on any failure, the deadline, or more commits than the cap. */
+   *  reverts is still reported. Null on any failure, the deadline, more commits than the cap, or more retained
+   *  path bytes (16 MiB) or paths (100k) in total than the budget. With `flag`, the first commit whose paths it
+   *  accepts ends the walk and is returned alone. `caps` is test-only. */
   async changedCiPathsPerCommit(barePath: string, range: CheckpointRange, targetSha: string,
-    opts: { deadlineMs: number }): Promise<Array<{ commit: string; paths: string[] }> | null> {
+    opts: { deadlineMs: number; flag?: (paths: string[]) => boolean; caps?: { totalBytes?: number; totalPaths?: number } },
+  ): Promise<Array<{ commit: string; paths: string[] }> | null> {
     const revs = this.terminalRangeRevs(range);
     if (!revs || !SHA40_RE.test(targetSha) || !Number.isFinite(opts?.deadlineMs) || opts.deadlineMs <= 0) return null;
     const deadlineAt = Date.now() + opts.deadlineMs;
@@ -21128,13 +21171,21 @@ try {
       const commits = listed.stdout.split("\n").filter((l) => l !== "");
       if (commits.length > TERMINAL_CI_MAX_COMMITS || commits.some((c) => !SHA40_RE.test(c))) return null;
       const result: Array<{ commit: string; paths: string[] }> = [];
+      const byteCap = opts.caps?.totalBytes ?? TERMINAL_CI_MAX_TOTAL_BYTES;
+      const pathCap = opts.caps?.totalPaths ?? TERMINAL_CI_MAX_TOTAL_PATHS;
+      let totalBytes = 0, totalPaths = 0;
       for (const commit of commits) {
         if (remaining() <= 0) return null;
         const diff = await this.execScoped("git", withDir(barePath, [...pins, "diff", "--no-renames", "--name-only", "-z", targetSha, commit]),
           { env, timeout: Math.max(1, remaining()), maxBuffer: 16 * 1024 * 1024 });
         const out = diff.stdout;
-        result.push({ commit, paths: out === "" ? [] : out.endsWith("\0") ? out.slice(0, -1).split("\0") : [] });
         if (out !== "" && !out.endsWith("\0")) return null;
+        const paths = out === "" ? [] : out.slice(0, -1).split("\0");
+        if (opts.flag?.(paths)) return [{ commit, paths }];
+        totalBytes += Buffer.byteLength(out, "utf8");
+        totalPaths += paths.length;
+        if (totalBytes > byteCap || totalPaths > pathCap) return null;
+        result.push({ commit, paths });
       }
       return result;
     } catch (err) {
@@ -28190,6 +28241,8 @@ export interface TerminalSnapshotOptions {
   reprove?: () => Promise<boolean>;
   /** Test-only seams; production never passes them. */
   seam?: { beforeStaging?: () => Promise<void>; afterCloneRef?: () => Promise<void> };
+  /** Test-only lowered caps; production never passes them. */
+  caps?: { maxEntries?: number; maxTotalBytes?: number };
 }
 export type TerminalSnapshotResult =
   | { kind: "clean"; root: string; tree: string; ignored: { files: number; bytes: number } }
@@ -28209,12 +28262,19 @@ const TERMINAL_AGGREGATE_MAX_MERGES = CHECKPOINT_SCAN_MAX_MERGES;
 const TERMINAL_AGGREGATE_MAX_ROOTS = 63;
 /** Commits one changedCiPathsPerCommit call will examine. */
 const TERMINAL_CI_MAX_COMMITS = 1000;
+/** Cumulative retained path bytes and path count across one changedCiPathsPerCommit call. */
+const TERMINAL_CI_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
+const TERMINAL_CI_MAX_TOTAL_PATHS = 100_000;
+// The credential denylist is defence in depth: the secret scan over the published range is the control.
 const TERMINAL_CREDENTIAL_BASENAMES = new Set([
   "auth.json", ".credentials.json", ".claude.json", ".netrc", ".git-credentials",
   "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+  ".npmrc", ".pypirc", ".env",
 ]);
 const TERMINAL_CREDENTIAL_SUFFIXES = [".pem", ".key", ".p12", ".pfx"];
 const TERMINAL_CREDENTIAL_DIRS = new Set([".ssh", ".aws", ".gnupg"]);
+/** Credential files named by their last two (or three) path segments. */
+const TERMINAL_CREDENTIAL_TAILS = [".docker/config.json", ".kube/config", ".config/gh/hosts.yml"];
 /** Pins every terminal-snapshot git carries (the captureMaintenanceWip set plus the proof-read walk pins). */
 const TERMINAL_GIT_PINS: readonly string[] = [
   "--no-replace-objects", "--no-optional-locks",
@@ -28234,6 +28294,10 @@ function terminalCredentialPath(rel: string, workerTokenFile: string | undefined
   const parts = rel.split("/");
   const base = parts[parts.length - 1]!.toLowerCase();
   if (TERMINAL_CREDENTIAL_BASENAMES.has(base)) return true;
+  // Backup copies of denylisted names (auth.json.bak, .env.bak).
+  if (base.endsWith(".bak") && TERMINAL_CREDENTIAL_BASENAMES.has(base.slice(0, -4))) return true;
+  const lowered = parts.map((p) => p.toLowerCase()).join("/");
+  if (TERMINAL_CREDENTIAL_TAILS.some((tail) => lowered === tail || lowered.endsWith(`/${tail}`))) return true;
   if (TERMINAL_CREDENTIAL_SUFFIXES.some((s) => base.endsWith(s))) return true;
   if (parts.slice(0, -1).some((p) => TERMINAL_CREDENTIAL_DIRS.has(p.toLowerCase()))) return true;
   if (workerTokenFile) {

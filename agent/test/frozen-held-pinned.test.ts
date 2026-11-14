@@ -183,6 +183,24 @@ it("pinned: perCommitCi catches an intermediate-commit CI change; default stays 
   assert.ok("pack" in await pin(fake({ calls: [], perCommit: [{ commit: tip, paths: ["src/a.ts"] }] }), range, { perCommitCi: true, ciTarget: floor }, pol));
 });
 
+it("pinned: perCommitCi hands the walk a predicate over the policy globs", async () => {
+  const pol = { ...base, ciGlobs: [".github/**"] };
+  const g = fake({ calls: [] }) as unknown as Record<string, unknown>;
+  let seen: ((paths: string[]) => boolean) | undefined;
+  g.changedCiPathsPerCommit = async (_b: string, _r: unknown, _t: string, o: { flag?: (paths: string[]) => boolean }) => { seen = o.flag; return []; };
+  assert.ok("pack" in await pin(g as unknown as HeldGit, range, { perCommitCi: true, ciTarget: floor }, pol));
+  assert.ok(seen, "a predicate is passed");
+  assert.equal(seen!([".github/workflows/x.yml"]), true);
+  assert.equal(seen!(["src/a.ts"]), false);
+});
+
+it("pinned: a supplied range whose tip is not the source is refused before any scan", async () => {
+  const calls: string[] = [];
+  const r = await pin(fake({ calls }), { ...range, tipSha: "c".repeat(40) });
+  assert.deepEqual(r, { reason: "range_tip_mismatch" });
+  assert.deepEqual(calls, []);
+});
+
 it("range serialization round-trips and distinguishes absent from empty", () => {
   const withEmpty: CheckpointRange = { tipSha: tip, excludeSha: tip, packExcludeShas: [], defaultBlobSha: floor, scanFloorShas: [floor] };
   const back = parseCheckpointRange(serializeCheckpointRange(withEmpty));

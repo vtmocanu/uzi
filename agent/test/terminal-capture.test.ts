@@ -24,8 +24,9 @@ async function fixture(t: test.TestContext, opts: { ignore?: string } = {}) {
   await fs.mkdir(tmp);
   const previousTmp = process.env.UZI_RUNNER_TMPDIR;
   process.env.UZI_RUNNER_TMPDIR = tmp;
-  const root = path.join(dir, "clone");
-  await fs.mkdir(root);
+  // GitCache(dir) roots runner clones at <dir>/runner.
+  const root = path.join(dir, "runner", "repo", "clone");
+  await fs.mkdir(root, { recursive: true });
   const g = (...args: string[]) => run(root, ...args);
   g("init", "-q", "-b", "main");
   for (const [k, v] of [["user.name", "fixture"], ["user.email", "fixture@example.com"], ["commit.gpgsign", "false"],
@@ -118,7 +119,8 @@ describe("captureTerminalSnapshot", () => {
     assert.deepEqual(f.calls, []);
   });
 
-  for (const name of [".netrc", "auth.json", ".credentials.json", ".claude.json", ".git-credentials", "id_rsa", "id_ed25519", "cert.pem", "deploy.key", "sub/.netrc"]) {
+  for (const name of [".netrc", "auth.json", ".credentials.json", ".claude.json", ".git-credentials", "id_rsa", "id_ed25519", "cert.pem", "deploy.key", "sub/.netrc",
+    ".npmrc", ".pypirc", ".env", "auth.json.bak", ".docker/config.json", ".kube/config", ".config/gh/hosts.yml"]) {
     test(`credential path ${name} is refused before any staging`, async (t) => {
       const f = await fixture(t);
       await f.write("tracked.txt", "changed\n");
@@ -198,7 +200,7 @@ describe("captureTerminalSnapshot", () => {
     run(nested, "-c", "user.name=a", "-c", "user.email=a@b.c", "add", "x");
     run(nested, "-c", "user.name=a", "-c", "user.email=a@b.c", "commit", "-q", "-m", "n");
     const result = await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } });
-    assert.equal(result.kind, "refused");
+    assert.deepEqual(result, { kind: "refused", reason: "unsafe_path" });
     assert.deepEqual(f.calls, []);
   });
 
@@ -214,8 +216,82 @@ describe("captureTerminalSnapshot", () => {
     run(f.root, "commit", "-q", "-m", "gitlink");
     await fs.writeFile(path.join(nested, "x"), "dirty");
     const result = await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } });
-    assert.equal(result.kind, "refused");
+    assert.deepEqual(result, { kind: "refused", reason: "unsafe_type" });
     assert.deepEqual(f.calls, []);
+  });
+
+  test("a tracked file replaced by a fifo is refused as an unsafe type", async (t) => {
+    const f = await fixture(t);
+    await fs.rm(path.join(f.root, "tracked.txt"));
+    execFileSync("mkfifo", [path.join(f.root, "tracked.txt")]);
+    const result = await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } });
+    assert.deepEqual(result, { kind: "refused", reason: "unsafe_type" });
+    assert.deepEqual(f.calls, []);
+  });
+
+  test("lowered entry and total-byte caps refuse before staging", async (t) => {
+    const f = await fixture(t);
+    await f.write("a.txt", "aaaaaaaaaaaaaaaaaaaa");
+    await f.write("b.txt", "b");
+    await f.write("c.txt", "c");
+    const seam = { beforeStaging: async () => { f.calls.push("staging"); } };
+    assert.deepEqual(await f.capture({ seam, caps: { maxEntries: 2 } }), { kind: "refused", reason: "entry_cap" });
+    assert.deepEqual(await f.capture({ seam, caps: { maxTotalBytes: 10 } }), { kind: "refused", reason: "total_bytes" });
+    assert.deepEqual(f.calls, []);
+  });
+
+  test("a valueless boolean core.sparseCheckout key is refused as configuration", async (t) => {
+    const f = await fixture(t);
+    await fs.appendFile(path.join(f.root, ".git", "config"), "[core]\n\tsparseCheckout\n");
+    await f.write("new.txt", "x");
+    assert.deepEqual(await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } }), { kind: "refused", reason: "config_refused" });
+    assert.deepEqual(f.calls, []);
+  });
+
+  test("a clone outside the runner root never reaches the transport", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "x");
+    const elsewhere = new GitCache(path.join(f.dir, "elsewhere"), nullLogger());
+    const result = await elsewhere.captureTerminalSnapshot(f.root, { runId: "run-1", generation: 2, deadlineMs: 60_000, barePath: f.bare });
+    assert.deepEqual(result, { kind: "refused", reason: "clone_outside_runner_root" });
+    assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
+  });
+
+  test("a planted alternates file is refused before any phase or ref", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "x");
+    await fs.writeFile(path.join(f.root, ".git", "objects", "info", "alternates"), `${path.join(f.bare, "objects")}\n`);
+    const result = await f.capture({ onPhase: async (p) => { f.calls.push(p); } });
+    assert.deepEqual(result, { kind: "refused", reason: "alternates_present" });
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
+  });
+
+  test("an empty alternates file is harmless", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "x");
+    await fs.writeFile(path.join(f.root, ".git", "objects", "info", "alternates"), "");
+    assert.equal((await f.capture()).kind, "captured");
+  });
+
+  test("alternates planted after the clone ref exists are refused and no bare ref lands", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "x");
+    const result = await f.capture({ seam: { afterCloneRef: async () => {
+      await fs.writeFile(path.join(f.root, ".git", "objects", "info", "alternates"), `${path.join(f.bare, "objects")}\n`);
+    } } });
+    assert.deepEqual(result, { kind: "refused", reason: "alternates_present" });
+    assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
+    assert.equal(f.refsOf(f.bare).includes("uzi-incoming"), false);
+  });
+
+  test("a clone ref swapped after validation lands nothing in the final bare ref and leaves no staging ref", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "x");
+    const result = await f.capture({ seam: { afterCloneRef: async () => { run(f.root, "update-ref", f.ref, f.head); } } });
+    assert.deepEqual(result, { kind: "refused", reason: "bare_transfer_mismatch" });
+    assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false, "the final ref was never created");
+    assert.equal(f.refsOf(f.bare).includes("uzi-incoming"), false, "only our own staging ref was dropped");
   });
 
   test("record-first: capturing precedes the clone ref, captured follows the transfer", async (t) => {
@@ -235,6 +311,7 @@ describe("captureTerminalSnapshot", () => {
     assert.equal(seen[0]!.commit, result.root);
     assert.equal(run(f.bare, "rev-parse", f.ref), result.root);
     assert.equal(f.refsOf(f.root).includes("uzi-terminal-local"), false, "the clone ref is deleted after the transfer");
+    assert.equal(f.refsOf(f.bare).includes("uzi-incoming"), false, "the staging ref is deleted");
   });
 
   test("a failure after the clone ref exists is refused and leaves the refs as they are", async (t) => {
@@ -409,6 +486,31 @@ describe("terminal digests and per-commit CI paths", () => {
     assert.deepEqual(byCommit.get(c), ["other.txt"]);
     assert.equal(await f.git.changedCiPathsPerCommit(bare, range, "nothex", { deadlineMs: 30_000 }), null);
     assert.equal(await f.git.changedCiPathsPerCommit(path.join(f.dir, "missing.git"), range, a, { deadlineMs: 30_000 }), null);
+  });
+
+  test("per-commit CI paths enforce a cumulative budget and stop early on a flagged commit", async (t) => {
+    const f = await fixture(t);
+    const base = f.g("rev-parse", "HEAD");
+    for (let i = 0; i < 5; i++) {
+      for (let j = 0; j < 3; j++) await f.write(`d${i}/f${j}.txt`, "x\n");
+      f.g("add", "-A"); f.g("commit", "-q", "-m", `c${i}`);
+    }
+    const tip = f.g("rev-parse", "HEAD");
+    const bare = path.join(f.dir, "many.git");
+    execFileSync("/usr/bin/git", ["clone", "-q", "--bare", f.root, bare], { env: gitEnv });
+    const range: CheckpointRange = { tipSha: tip, excludeSha: base };
+    // Each commit differs from base by 3, 6, ... 15 paths: 45 retained in total.
+    const all = await f.git.changedCiPathsPerCommit(bare, range, base, { deadlineMs: 30_000 });
+    assert.equal(all?.reduce((n, r) => n + r.paths.length, 0), 45);
+    assert.equal(await f.git.changedCiPathsPerCommit(bare, range, base, { deadlineMs: 30_000, caps: { totalPaths: 44 } }), null);
+    assert.equal((await f.git.changedCiPathsPerCommit(bare, range, base, { deadlineMs: 30_000, caps: { totalPaths: 45 } }))?.length, 5);
+    assert.equal(await f.git.changedCiPathsPerCommit(bare, range, base, { deadlineMs: 30_000, caps: { totalBytes: 100 } }), null);
+    // A flagged commit ends the walk and is returned alone, even when the budget would have been exceeded later.
+    const flagged = await f.git.changedCiPathsPerCommit(bare, range, base, {
+      deadlineMs: 30_000, caps: { totalPaths: 1 }, flag: (paths) => paths.length > 0,
+    });
+    assert.deepEqual(flagged?.map((r) => r.commit), [tip]);
+    assert.equal(flagged?.[0]?.paths.length, 15);
   });
 
   test("digest helpers agree with the pack the same range produces", async (t) => {

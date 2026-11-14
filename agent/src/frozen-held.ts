@@ -49,7 +49,7 @@ export interface TerminalDigestGit {
   terminalScanDigest?(barePath: string, range: CheckpointRange, opts: { deadlineMs: number }): Promise<string | null>;
   terminalTransportDigest?(pack: Buffer, opts: { deadlineMs: number }): Promise<string | null>;
   changedCiPathsPerCommit?(barePath: string, range: CheckpointRange, targetSha: string,
-    opts: { deadlineMs: number }): Promise<Array<{ commit: string; paths: string[] }> | null>;
+    opts: { deadlineMs: number; flag?: (paths: string[]) => boolean }): Promise<Array<{ commit: string; paths: string[] }> | null>;
 }
 
 interface OverRangeOpts {
@@ -78,6 +78,8 @@ export async function prepareFrozenHeldPinned(
   range: CheckpointRange | "resolve",
 ): Promise<{ pack: Buffer; range: CheckpointRange; digests: { scan: string; transport: string } } | { reason: string; range?: CheckpointRange }> {
   const run = async () => {
+    // A supplied range comes only from a worker-persisted record of this same function; its tip must be the source.
+    if (range !== "resolve" && range.tipSha !== input.sourceSha) return { reason: "range_tip_mismatch" };
     const r = range === "resolve" ? await resolveFrozenRange(input) : range;
     if (!r) return { reason: "range_unresolved" };
     const out = await prepareOverRange(input, r, {
@@ -141,7 +143,10 @@ async function prepareOverRange(input: FrozenHeldInput, range: CheckpointRange, 
     if (flagCIConfigPathsRaw(paths, policy.ciGlobs).length) return { reason: "ci_config_guard" };
     if (opts.perCommitCi) {
       if (!opts.ciTarget || !dg.changedCiPathsPerCommit) return { reason: "ci_config_unknown" };
-      const per = await dg.changedCiPathsPerCommit(barePath, range, opts.ciTarget, { deadlineMs: deadlineMs() });
+      const globs = policy.ciGlobs;
+      const per = await dg.changedCiPathsPerCommit(barePath, range, opts.ciTarget, {
+        deadlineMs: deadlineMs(), flag: (paths) => flagCIConfigPathsRaw(paths, globs).length > 0,
+      });
       check();
       if (per === null) return { reason: "ci_config_unknown" };
       for (const c of per) if (flagCIConfigPathsRaw(c.paths, policy.ciGlobs).length) return { reason: "ci_config_guard" };
