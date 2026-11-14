@@ -148,6 +148,36 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     await check("run_extension_cap_seconds", { run_extension_cap_seconds: "3600" }, "3600");
     await check("custody_hold_limit", { custody_hold_limit: "12" }, "12");
     await check("custody_hold_limit", { custody_hold_limit: " 1000 " }, " 1000 ");
+    // PRD #4207: automatic hibernation and its idle threshold (bounds inclusive).
+    expect((await api.getSettings()).settings).toMatchObject({
+      worker_hibernation_auto: "false",
+      worker_hibernation_idle_after: "336h",
+    });
+    await check("worker_hibernation_auto", { worker_hibernation_auto: "true" }, "true");
+    for (const ok of ["1h", "2160h", "60m", "3600s", "3600000ms", "+1h", "1h30m", "1.5h", "720h"]) {
+      await check("worker_hibernation_idle_after", { worker_hibernation_idle_after: ok }, ok);
+    }
+  });
+
+  it("refuses invalid automatic-hibernation values with the server's messages", async () => {
+    const api = await reload();
+    await expect(api.updateSettings({ worker_hibernation_auto: "yes" })).rejects.toMatchObject({
+      status: 400,
+      message: 'worker_hibernation_auto: must be "true" or "false"',
+    });
+    for (const bad of ["", "336", "14d", "h", "1h-", "1x"]) {
+      await expect(api.updateSettings({ worker_hibernation_idle_after: bad })).rejects.toMatchObject({
+        status: 400,
+        message: 'worker_hibernation_idle_after: must be a duration like "336h"',
+      });
+    }
+    for (const bad of ["0", "0s", "-1h", "59m", "59m59s", "2160h1s", "2161h", "9000h"]) {
+      await expect(api.updateSettings({ worker_hibernation_idle_after: bad })).rejects.toMatchObject({
+        status: 400,
+        message: "worker_hibernation_idle_after: must be between 1h and 2160h",
+      });
+    }
+    expect((await api.getSettings()).settings.worker_hibernation_idle_after).toBe("336h");
   });
 
   it("still 400s on invalid values for those keys", async () => {
