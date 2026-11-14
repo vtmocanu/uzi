@@ -51,9 +51,9 @@ func TestCodexPendingSwitchReceiptDrainLiveDB(t *testing.T) {
 	if _, err := f.svc.ApplyInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{id}); !errors.As(err, &conflict) || conflict.Reason != ReceiptSwitchPending {
 		t.Fatal("pending follow-up APPLIED was not fenced", err)
 	}
-	// Existing verdict-specific DISCARD exceptions do not apply to follow_up.
-	if _, err := f.svc.DiscardInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{id}); !errors.As(err, &conflict) || conflict.Reason != ReceiptSwitchPending {
-		t.Fatal("pending follow-up DISCARD was not fenced", err)
+	// Follow-ups are not discardable; retain the existing verdict-only contract.
+	if _, err := f.svc.DiscardInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{id}); !errors.Is(err, ErrInputReceiptInvalid) {
+		t.Fatal("follow-up DISCARD did not retain its invalid-input contract", err)
 	}
 	if !replayed() {
 		t.Fatal("ACK removed a pending control from replay")
@@ -84,13 +84,25 @@ func TestCodexPendingSwitchReceiptDrainLiveDB(t *testing.T) {
 	if _, err := f.svc.AckInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{id}); err != nil {
 		t.Fatal(err)
 	}
+	var freshID int64
+	if err := f.env.pool.QueryRow(f.env.ctx, "INSERT INTO run_user_inputs(run_id,kind,body) VALUES($1,'follow_up','fresh pending control') RETURNING id", run).Scan(&freshID); err != nil {
+		t.Fatal(err)
+	}
 	f.oldReplicaRegister(t, "receipt-older-replica")
 	stale, err := f.svc.ConsumeInputs(f.env.ctx, f.worker(t), run)
 	if err != nil || stale.CredentialSwitch == nil || len(stale.Inputs) != 0 {
 		t.Fatal("stale registration drained pending controls", err)
 	}
-	if _, err := f.svc.AckInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{id}); !errors.As(err, &conflict) || conflict.Reason != ReceiptSwitchPending {
-		t.Fatal("stale Codex ACK accepted", err)
+	retried, err := f.svc.AckInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{id})
+	if err != nil || retried.Active || retried.Reason != ReceiptSwitchPending {
+		t.Fatal("owned ACK did not retain its inactive idempotent contract", err)
+	}
+	if _, err := f.svc.AckInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{freshID}); !errors.As(err, &conflict) || conflict.Reason != ReceiptSwitchPending {
+		t.Fatal("stale registration accepted a fresh Codex ACK", err)
+	}
+	var unconsumed bool
+	if err := f.env.pool.QueryRow(f.env.ctx, "SELECT consumed_at IS NULL FROM run_user_inputs WHERE id=$1", freshID).Scan(&unconsumed); err != nil || !unconsumed {
+		t.Fatal("stale registration consumed the fresh pending control", err)
 	}
 	if !replayed() {
 		t.Fatal("stale registration lost buffered control")
