@@ -967,14 +967,32 @@ describe("builder-prune child fixture", () => {
       env: { ...process.env, DIND_PRUNE_FIXTURE_STATE_GATE: gate },
       stdio: "ignore",
     });
-    const done = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
+    const done = new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code) => resolve(code));
+    });
+    let code: number | null = null;
+    let failure: unknown;
     try {
       await waitFor(() => existsSync(`${gate}.opened`), "fixture holding its state write");
       assert.equal(existsSync(stateFile), false, "state file visible before its content was written");
-    } finally {
-      writeFileSync(`${gate}.release`, "");
+    } catch (error) {
+      failure = error;
     }
-    assert.equal(await done, 0);
+    // Always release and join the owned child before scratch cleanup; if the release itself
+    // fails, stop the child instead. The first failure (the assertion above) is the one reported.
+    try {
+      writeFileSync(`${gate}.release`, "");
+    } catch {
+      child.kill("SIGKILL");
+    }
+    try {
+      code = await done;
+    } catch (error) {
+      failure ??= error;
+    }
+    if (failure !== undefined) throw failure;
+    assert.equal(code, 0);
     assert.doesNotThrow(() => JSON.parse(readFileSync(stateFile, "utf8")));
   });
 });
