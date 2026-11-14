@@ -159,7 +159,7 @@ const CredentialSwitchV1 = "credential_switch_v1" //nolint:gosec // G101: a capa
 const CredentialSwitchInPlaceV1 = "credential_switch_in_place_v1" //nolint:gosec // G101: a capability VOCABULARY name, not a credential — a protocol token stored in workers.protocol_capabilities, never a secret.
 
 // CodexCredentialSwitchV1 negotiates pending-only Codex switch requests.
-const CodexCredentialSwitchV1 = "codex_credential_switch_v1"
+const CodexCredentialSwitchV1 = "codex_credential_switch_v1" //nolint:gosec // G101: public protocol vocabulary, not a credential.
 
 // WallParkV1 is the PROTOCOL capability a worker self-reports (PRD #1497 M1, D13) to declare it
 // implements the wall-clock PARK protocol — it drops its turn on a system 'wall' pause input,

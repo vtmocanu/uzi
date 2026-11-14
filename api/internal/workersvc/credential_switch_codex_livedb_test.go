@@ -24,7 +24,7 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			f := newApplyFx(t)
 			f.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities = array_append(protocol_capabilities, $2) WHERE id = $1", f.o.workerID, capability.CodexCredentialSwitchV1)
-			run, op := f.run(t, "running")
+			run, _ := f.run(t, "running")
 			old := f.env.seedStaticAPIKey(t, f.o.userID, "old-api", "old-test-key")
 			target := f.env.seedStaticAPIKey(t, f.o.userID, "new-api", "new-test-key")
 			if scenario == "subscription" {
@@ -41,7 +41,7 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 			if _, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, run, BindModePinned, &target); err != nil {
 				t.Fatal(err)
 			}
-			op = f.opOf(t, run)
+			op := f.opOf(t, run)
 			req := CodexSwitchPreflightRequest{CredentialSwitchApplyRequest: f.req(op), TargetSecretID: target}
 			want, reason := "ready", ""
 			switch scenario {

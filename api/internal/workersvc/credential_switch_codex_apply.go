@@ -102,7 +102,7 @@ func (s *Service) applyCodexSwitchLocked(ctx context.Context, q *store.Queries, 
 		return CredentialSwitchApplyResult{}, err
 	}
 	if !ins.Inserted {
-		return CredentialSwitchApplyResult{}, errors.New("Codex switch message sequence occupied")
+		return CredentialSwitchApplyResult{}, errors.New("codex switch message sequence occupied")
 	}
 	n, err = q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{
 		ID: run.ID, Seq: seq, ClaimGeneration: pgconv.Int8Ptr(&run.ClaimGeneration),

@@ -586,7 +586,7 @@ func (s *Service) credentialSwitchWarning(ctx context.Context, run store.Run, re
 }
 
 // ErrCodexSwitchIneligible refuses queued and parked Codex switching.
-var ErrCodexSwitchIneligible = errors.New("Codex credentials can be switched only on an active, worker-held run")
+var ErrCodexSwitchIneligible = errors.New("codex credentials can be switched only on an active, worker-held run")
 
 // requestCodexCredentialSwitch writes only a pending target. The live binding
 // remains authoritative until a separately negotiated apply commits.
