@@ -302,6 +302,9 @@ func (s *Service) applyCredentialSwitchOnce(ctx context.Context, wkr store.Worke
 		if prior.ClaimGeneration != gen || !prior.WorkerID.Valid || uuid.UUID(prior.WorkerID.Bytes) != wkr.ID {
 			return fenced, nil
 		}
+		if run.Harness == harnessCodex {
+			return CredentialSwitchApplyResult{Outcome: ApplyOutcomeRefusedCommitted, Reason: applyReasonCredentialChanged}, nil
+		}
 		return s.replayCredentialSwitchApply(ctx, qtx, run, prior)
 	case !errors.Is(err, pgx.ErrNoRows):
 		return CredentialSwitchApplyResult{}, err
@@ -314,6 +317,12 @@ func (s *Service) applyCredentialSwitchOnce(ctx context.Context, wkr store.Worke
 			return CredentialSwitchApplyResult{Outcome: ApplyOutcomeSuperseded}, nil
 		}
 		return CredentialSwitchApplyResult{Outcome: ApplyOutcomeNotApplied, Reason: applyReasonNoPendingSwitch}, nil
+	}
+
+	// Codex binding rewrites require a dedicated fenced SQL primitive. Until
+	// that exists, never let a Codex run enter the Anthropic selection ladder.
+	if run.Harness == harnessCodex {
+		return CredentialSwitchApplyResult{Outcome: ApplyOutcomeNotApplied, Reason: applyReasonCredentialUnavail}, nil
 	}
 
 	// Step 3: fresh apply.
