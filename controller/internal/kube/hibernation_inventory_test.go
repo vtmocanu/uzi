@@ -202,19 +202,19 @@ func TestObservedUnknownPolicyWhenClaimHasNoClass(t *testing.T) {
 
 func TestInventoryGateHoldsWhenPodsUnknown(t *testing.T) {
 	// Pod list failing: pods not known.
-	m2, client2, rec2 := hibEnv(t, hibDeployment(1, ""), hibPod("pod-uid-1", "x", true, false))
-	client2.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+	m, client, rec := hibEnv(t, hibDeployment(1, ""), hibPod("pod-uid-1", "x", true, false))
+	client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apierrors.NewServiceUnavailable("down")
 	})
-	if err := hibTick(t, m2, hibGateW(protocol.HibernationPreparing, "op-1", protocol.InventoryGateObserve)); err != nil {
+	if err := hibTick(t, m, hibGateW(protocol.HibernationPreparing, "op-1", protocol.InventoryGateObserve)); err != nil {
 		t.Fatal(err)
 	}
 	// A failed pod list also removes the roll evidence, so the existing fail-closed
 	// refusal may fire; what must never happen is an observed report or a scale-down.
-	if hasTransition(rec2, protocol.TransitionObserved) || replicaPatches(client2) != 0 {
-		t.Fatalf("pods-unknown tick reported %v / patched", rec2.transitions())
+	if hasTransition(rec, protocol.TransitionObserved) || replicaPatches(client) != 0 {
+		t.Fatalf("pods-unknown tick reported %v / patched", rec.transitions())
 	}
-	assertNothingDeleted(t, client2)
+	assertNothingDeleted(t, client)
 }
 
 func TestScaledDownEncodesAnEmptyPodSet(t *testing.T) {
@@ -346,15 +346,27 @@ func TestScaleDownProceedsWhenNoClaimObserved(t *testing.T) {
 }
 
 // Pods known but none exist: nothing to inventory, so the scale-down proceeds without an
-// observed report.
+// observed report, even though claims exist (so only the pod guard decides).
 func TestScaleDownProceedsWhenNoPodAtAll(t *testing.T) {
-	rec := &hibRec{fakeCordoner: &fakeCordoner{}}
-	m, client := newMatWithCordoner(t, rec, hibDeployment(1, ""))
+	m, client, rec := hibEnv(t, hibDeployment(1, ""))
 	if err := hibTick(t, m, hibGateW(protocol.HibernationPreparing, "op-1", protocol.InventoryGateObserve)); err != nil {
 		t.Fatal(err)
 	}
 	if hasTransition(rec, protocol.TransitionObserved) || replicaPatches(client) != 1 {
 		t.Fatalf("no-pod tick reported %v, replica patches %d", rec.transitions(), replicaPatches(client))
+	}
+	assertNothingDeleted(t, client)
+}
+
+// Under the await gate the api already holds an observed row for this op, so a tick that
+// lists no pod must hold: no scale-down without the permit and no observed report.
+func TestAwaitGateHoldsWhenNoPodAtAll(t *testing.T) {
+	m, client, rec := hibEnv(t, hibDeployment(1, ""))
+	if err := hibTick(t, m, hibGateW(protocol.HibernationPreparing, "op-1", protocol.InventoryGateAwait)); err != nil {
+		t.Fatal(err)
+	}
+	if hasTransition(rec, protocol.TransitionObserved) || replicaPatches(client) != 0 {
+		t.Fatalf("await no-pod tick reported %v, replica patches %d", rec.transitions(), replicaPatches(client))
 	}
 	assertNothingDeleted(t, client)
 }

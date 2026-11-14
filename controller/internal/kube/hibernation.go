@@ -372,13 +372,19 @@ func (m *Materializer) hibernatePreparing(ctx context.Context, w protocol.Desire
 			if !obs.PodsKnown {
 				return nil // a one-tick unknown; the preparing deadline bounds a persistent one
 			}
-			// With pods known but no pod at all, or no claim observed, there is nothing to
-			// inventory: the gate is ignored and today's scale-down proceeds below (the api
-			// has no row for this op and the evaluator keeps the volumes).
 			if pod := boundPodUID(obs); pod != "" {
 				if pvcs := m.inventoryPVCs(ctx, obs); len(pvcs) > 0 {
 					return m.reportObserved(ctx, w, obs, pod, pvcs)
 				}
+			}
+			// Pods known but no pod at all, or no claim observed. Under observe nothing has
+			// been reported yet, so there is nothing to inventory: the gate is ignored and
+			// today's scale-down proceeds below. Under await the api already holds an
+			// observed row for this op and has not permitted, so hold with no patch; the
+			// api's settle pass times an awaiting row out to timed_out and the gate then
+			// permits, which bounds the hold.
+			if g == protocol.InventoryGateAwait {
+				return nil
 			}
 		}
 		got, stale, err := m.conditionedPatch(ctx, ns, obs, name,
