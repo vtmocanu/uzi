@@ -334,7 +334,8 @@ describe("attempt contract", () => {
     const gate = new SpyGate();
     const h = harness({ gate });
     await h.step();
-    await h.step();
+    assert.equal(await h.step(), "completed");
+    assert.deepEqual(h.calls.map((call) => call.argv), [FROZEN]);
     assert.deepEqual(gate.calls, []);
     assert.equal(gate.generation(), 0);
     assert.equal(gate.claimsClosed(), false);
@@ -634,13 +635,15 @@ describe("loop (fake exec)", () => {
 
   it("never rejects when the logger throws", async () => {
     const h = harness();
-    h.state.readThrows = true;
+    let meterReads = 0;
+    let loggerCalls = 0;
+    const throwFromLogger = () => { loggerCalls++; throw new Error("logger broke"); };
     const leg = new DindBuilderPruneController({
       dockerHost: HOST,
       workerName: "w1",
       gate: h.gate,
-      log: { warn: () => { throw new Error("logger broke"); }, info: () => { throw new Error("logger broke"); } } as never,
-      readSample: () => { throw new Error("meter exploded"); },
+      log: { warn: throwFromLogger, info: throwFromLogger } as never,
+      readSample: () => { meterReads++; throw new Error("meter exploded"); },
       sleep: async () => { await new Promise((r) => setImmediate(r)); },
       pluginPath: PLUGIN,
     });
@@ -649,6 +652,9 @@ describe("loop (fake exec)", () => {
     await new Promise((r) => setTimeout(r, 10));
     controller.abort();
     await done;
+    assert.ok(meterReads > 0, "the loop reached the throwing meter reader");
+    assert.ok(loggerCalls > 0, "the loop reached the throwing logger");
+    assert.equal(loggerCalls, meterReads, "each meter failure attempted its warning");
   });
 });
 
