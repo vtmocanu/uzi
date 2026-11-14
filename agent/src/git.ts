@@ -20732,6 +20732,425 @@ try {
   }
 
   /**
+   * Terminal-preservation snapshot of a runner clone's working tree, production-dark. Every git child
+   * runs as the runner uid on {@link TERMINAL_GIT_PINS} / {@link TERMINAL_GIT_ENV}; the clone's real
+   * `.git/index`, HEAD, branch and every other ref (the `refs/uzi-terminal-local/` namespace aside)
+   * are proven unchanged before and after. Phases, in order:
+   *  1. bounded enumeration of changed paths BEFORE any staging (refusals touch no index);
+   *  2. bounded ignored-file extents (counted, never captured);
+   *  3. a clean tree returns the HEAD commit with no index or ref write;
+   *  4. staging on a PRIVATE index (`GIT_INDEX_FILE` under the runner tmp, removed in `finally`);
+   *  5. staged validation against the enumeration (set, modes, sizes), then `write-tree` and a
+   *     deterministic `commit-tree` on HEAD, proven by a tree-diff backstop;
+   *  6. record-first transfer: `onPhase("capturing")`, create-only clone ref, worker-uid file://
+   *     fetch into the bare's same-named ref (no `+`), CAS-delete of the clone ref, `onPhase("captured")`.
+   * A failure after the clone ref exists returns `refused` and leaves refs as they are; the bare ref is
+   * never deleted here. `deadlineMs` is a duration budget for the whole call.
+   */
+  async captureTerminalSnapshot(clonePath: string, opts: TerminalSnapshotOptions): Promise<TerminalSnapshotResult> {
+    const refused = (reason: string): TerminalSnapshotResult => ({ kind: "refused", reason });
+    const fail = (reason: string): never => { throw new TerminalSnapshotRefusal(reason); };
+    if (!path.isAbsolute(clonePath) || path.resolve(clonePath) !== clonePath || Buffer.byteLength(clonePath, "utf8") > 4096 ||
+        !opts || typeof opts.runId !== "string" || !TERMINAL_RUN_ID_RE.test(opts.runId) ||
+        !Number.isSafeInteger(opts.generation) || opts.generation < 1 ||
+        !Number.isFinite(opts.deadlineMs) || opts.deadlineMs <= 0 ||
+        typeof opts.barePath !== "string" || !path.isAbsolute(opts.barePath)) return refused("invalid_input");
+    const deadlineAt = Date.now() + opts.deadlineMs;
+    const left = (): number => {
+      if (opts.signal?.aborted) fail("aborted");
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= 0) fail("deadline");
+      return remaining;
+    };
+    const cloneRef = `refs/uzi-terminal-local/${opts.runId}/g${opts.generation}`;
+    const bareRef = cloneRef;
+    const git = async (args: string[], extra: { env?: NodeJS.ProcessEnv; input?: string; overflow?: string } = {}): Promise<string> => {
+      const timeoutMs = left();
+      try {
+        return await this.runGitAsRunner(clonePath, [...TERMINAL_GIT_PINS, ...args], {
+          timeoutMs, env: { ...TERMINAL_GIT_ENV, ...extra.env },
+          ...(extra.input === undefined ? {} : { input: extra.input }),
+        });
+      } catch (err) {
+        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError) throw err;
+        if (extra.overflow && isBoundOverflow(err)) return fail(extra.overflow);
+        return fail("git_failed");
+      }
+    };
+    const runnerNode = async (script: string, arg: string, fixedTimeoutMs?: number): Promise<string> => {
+      const timeoutMs = fixedTimeoutMs ?? Math.min(left(), 30_000);
+      const env = unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() });
+      const tmp = runnerTmpdir();
+      if (tmp) env.TMPDIR = tmp;
+      const wrapped = this.boundaryProcesses.getStore()
+        ? { command: process.execPath, args: ["-e", script, arg] }
+        : runnerCommand(process.execPath, ["-e", script, arg]);
+      try {
+        const result = await this.execScoped(wrapped.command, wrapped.args, { cwd: "/", env, timeout: timeoutMs, maxBuffer: 4096 }, "command");
+        if (result.stderr) return fail("helper_failed");
+        return result.stdout;
+      } catch (err) {
+        if (err instanceof TerminalSnapshotRefusal || err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError) throw err;
+        return fail("helper_failed");
+      }
+    };
+    const indexHash = async (): Promise<string> => {
+      const out = await runnerNode(
+        `const fs=require("fs"),c=require("crypto");try{process.stdout.write(c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))}catch(e){process.stdout.write(e.code==="ENOENT"?"absent":"error")}`,
+        path.join(clonePath, ".git", "index"));
+      if (!/^([0-9a-f]{64}|absent)$/.test(out)) return fail("index_unreadable");
+      return out;
+    };
+    const rows = (raw: string, cap: number, reason: string): string[] => {
+      const list = raw === "" ? [] : raw.endsWith("\0") ? raw.slice(0, -1).split("\0") : fail("unparseable");
+      if (list.length > cap) fail(reason);
+      if (raw.includes("�")) fail("unparseable");
+      return list;
+    };
+    const invariants = async () => {
+      const head = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      const symbolic = (await git(["rev-parse", "--symbolic-full-name", "HEAD"])).trim();
+      const refs = (await git(["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"]))
+        .split("\n").filter((l) => l !== "" && !l.startsWith("refs/uzi-terminal-local/")).join("\n");
+      if (!SHA40_RE.test(head)) fail("head_unreadable");
+      return { head, symbolic, refs, index: await indexHash() };
+    };
+    const sameInvariants = (a: Awaited<ReturnType<typeof invariants>>, b: Awaited<ReturnType<typeof invariants>>): boolean =>
+      a.head === b.head && a.symbolic === b.symbolic && a.refs === b.refs && a.index === b.index;
+
+    let privateIndex: string | undefined;
+    try {
+      // Clone shape and configuration that would redirect or extend the staging.
+      const dotGit = await fs.lstat(path.join(clonePath, ".git")).catch(() => undefined);
+      if (!dotGit?.isDirectory()) return refused("clone_shape");
+      for (const row of rows(await git(["config", "--local", "--null", "--list"]), 100_000, "config_cap")) {
+        const key = row.slice(0, Math.max(0, row.indexOf("\n"))).toLowerCase();
+        if (key === "core.worktree" || key.startsWith("include.") || key.startsWith("includeif.") ||
+            key === "core.sparsecheckout" || key === "core.splitindex" || key === "index.sparse" ||
+            (key === "core.bare" && row.slice(key.length + 1) !== "false")) return refused("config_refused");
+      }
+      if ((await git(["rev-parse", "--shared-index-path"])).trim() !== "") return refused("config_refused");
+      const before = await invariants();
+      const head = before.head;
+      const headTree = (await git(["rev-parse", "--verify", `${head}^{tree}`])).trim();
+
+      // 1. Enumeration before any staging.
+      const status = rows(await git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none", "--no-renames"],
+        { overflow: "entry_cap" }), WIP_CAPTURE_MAX_ENTRIES, "entry_cap");
+      type Entry = { kind: "file" | "exec" | "symlink" | "absent"; size: number; untracked: boolean };
+      const entries = new Map<string, Entry>();
+      let totalBytes = 0;
+      for (const row of status) {
+        const m = /^(.)(.) ([\s\S]+)$/.exec(row);
+        if (!m) return refused("unparseable");
+        const [, x, y, rel] = m as unknown as [string, string, string, string];
+        if (x === "U" || y === "U" || (x === "A" && y === "A") || (x === "D" && y === "D") || "RC!".includes(x) || "RC!".includes(y)) return refused("unsupported_status");
+        if (!wipPathValid(rel) || rel.endsWith("/") || entries.has(rel)) return refused("unsafe_path");
+        if (rel === ".uzi/scratch" || rel.startsWith(".uzi/scratch/")) return refused("scratch_not_ignored");
+        let st: Stats | undefined;
+        try { st = await fs.lstat(path.join(clonePath, rel)); }
+        catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return refused("unsized"); }
+        if (entries.size % 1024 === 0) left();
+        if (!st) {
+          if (x !== "D" && y !== "D") return refused("vanished");
+          entries.set(rel, { kind: "absent", size: 0, untracked: false });
+          continue;
+        }
+        if (x === "?" && y === "?" && st.isDirectory()) return refused("nested_repository");
+        let kind: Entry["kind"];
+        if (st.isSymbolicLink()) kind = "symlink";
+        else if (st.isFile()) kind = (st.mode & 0o100) !== 0 ? "exec" : "file";
+        else return refused("unsafe_type");
+        if (WIP_CORE_FILE_RE.test(path.posix.basename(rel))) return refused("core_file");
+        if (kind !== "symlink" && st.size > WIP_CAPTURE_MAX_FILE_BYTES) return refused("oversized");
+        if (terminalCredentialPath(rel, opts.workerTokenFile, clonePath)) return refused("credential_path");
+        totalBytes += st.size;
+        if (totalBytes > CHECKPOINT_SCAN_MAX_TOTAL_BYTES) return refused("total_bytes");
+        entries.set(rel, { kind, size: st.size, untracked: x === "?" && y === "?" });
+      }
+      if (entries.size > 0) {
+        const attrs = (await git(["check-attr", "-z", "--stdin", "filter"], { input: [...entries.keys()].join("\0") + "\0" })).split("\0");
+        if (attrs[attrs.length - 1] === "") attrs.pop();
+        if (attrs.length !== entries.size * 3) return refused("attr_unreadable");
+        for (let i = 0; i < attrs.length; i += 3) {
+          if (!entries.has(attrs[i]!) || attrs[i + 1] !== "filter") return refused("attr_unreadable");
+          if (attrs[i + 2] !== "unspecified" && attrs[i + 2] !== "unset") return refused("filter_attribute");
+        }
+      }
+
+      // 2. Ignored extents: counted with their own caps, never captured.
+      const ignoredPaths = rows(await git(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], { overflow: "ignored_cap" }),
+        TERMINAL_IGNORED_MAX_ENTRIES, "ignored_cap");
+      let ignoredBytes = 0;
+      for (let i = 0; i < ignoredPaths.length; i++) {
+        if (i % 1024 === 0) left();
+        const st = await fs.lstat(path.join(clonePath, ignoredPaths[i]!)).catch(() => undefined);
+        if (st?.isFile()) ignoredBytes += st.size;
+      }
+      const ignored = { files: ignoredPaths.length, bytes: ignoredBytes };
+
+      // 3. Clean: no index or ref write.
+      if (entries.size === 0) {
+        if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
+        return { kind: "clean", root: head, tree: headTree, ignored };
+      }
+
+      // 4. Private-index staging.
+      await opts.seam?.beforeStaging?.();
+      left();
+      privateIndex = path.join(runnerTmpdir() || os.tmpdir(), `uzi-term-idx-${randomUUID()}`);
+      const indexEnv = { GIT_INDEX_FILE: privateIndex };
+      await git(["read-tree", head], { env: indexEnv });
+      await git(["add", "-A"], { env: indexEnv });
+
+      // 5. Staged validation against the enumeration, then the commit.
+      const rawStaged = await git(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames", head], { env: indexEnv });
+      const staged = terminalParseRaw(rawStaged);
+      if (!staged || staged.length > WIP_CAPTURE_MAX_ENTRIES) return refused("staged_unparseable");
+      const stagedPaths = new Set<string>();
+      for (const row of staged) {
+        const info = entries.get(row.path);
+        if (!info || stagedPaths.has(row.path)) return refused("staged_set_mismatch");
+        stagedPaths.add(row.path);
+        if (row.status === "D") { if (row.mode !== "000000" || info.kind !== "absent") return refused("staged_set_mismatch"); continue; }
+        const expectedMode = info.kind === "file" ? "100644" : info.kind === "exec" ? "100755" : info.kind === "symlink" ? "120000" : "";
+        if (row.mode !== "100644" && row.mode !== "100755" && row.mode !== "120000") return refused("staged_mode");
+        if (row.mode !== expectedMode) return refused("staged_mode");
+      }
+      for (const [rel, info] of entries) if (info.untracked && !stagedPaths.has(rel)) return refused("staged_set_mismatch");
+      const live = staged.filter((r) => r.status !== "D");
+      const sizes = await this.wipBlobSizes(clonePath, live.map((r) => r.oid)).catch(() => fail("staged_unsized"));
+      let stagedTotal = 0;
+      for (const row of live) {
+        const size = sizes.get(row.oid)!;
+        if (size > WIP_CAPTURE_MAX_FILE_BYTES) return refused("staged_oversized");
+        if (size !== entries.get(row.path)!.size) return refused("staged_size_changed");
+        stagedTotal += size;
+      }
+      if (stagedTotal > CHECKPOINT_SCAN_MAX_TOTAL_BYTES) return refused("staged_total_bytes");
+      if (staged.length === 0) return refused("staged_empty");
+      if (opts.reprove && !(await opts.reprove())) return refused("reprove_failed");
+
+      const tree = (await git(["write-tree"], { env: indexEnv })).trim();
+      if (!SHA40_RE.test(tree)) return refused("tree_unreadable");
+      if (tree === headTree) return refused("staged_empty");
+      const when = "2000-01-01T00:00:00Z";
+      const subject = `uzi terminal snapshot ${opts.runId} g${opts.generation}`;
+      const commit = (await git(["commit-tree", tree, "-p", head, "-m", subject], { env: {
+        GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+        GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+        GIT_AUTHOR_DATE: when, GIT_COMMITTER_DATE: when,
+      } })).trim();
+      if (!SHA40_RE.test(commit)) return refused("commit_unreadable");
+      const identity = `${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
+      if (await git(["cat-file", "-p", commit]) !== `tree ${tree}\nparent ${head}\nauthor ${identity}\ncommitter ${identity}\n\n${subject}\n`)
+        return refused("commit_mismatch");
+      // Backstop: the commit's own tree-diff against HEAD is exactly the validated staged diff.
+      if (await git(["diff-tree", "-r", "--raw", "-z", "--no-abbrev", "--no-renames", head, commit]) !== rawStaged)
+        return refused("backstop_mismatch");
+      if (opts.reprove && !(await opts.reprove())) return refused("reprove_failed");
+      if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
+
+      // 6. Record-first transfer. From the clone ref's creation on, a failure leaves refs as they are.
+      try { await opts.onPhase?.("capturing", { cloneRef, bareRef, commit }); }
+      catch { return refused("phase_callback_failed"); }
+      left();
+      try { await git(["update-ref", cloneRef, commit, ""]); }
+      catch (err) {
+        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError) throw err;
+        // A retry of the same capture finds its own deterministic commit already pinned.
+        const current = (await git(["for-each-ref", "--format=%(objectname)", cloneRef]).catch(() => "")).trim();
+        if (current !== commit) return refused("clone_ref_exists");
+      }
+      await opts.seam?.afterCloneRef?.();
+      await this.withLock(opts.barePath, async () => {
+        const present = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim();
+        if (present !== "" && present !== commit) fail("bare_ref_conflict");
+        left();
+        await this.runGit(opts.barePath, [
+          "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags", "--no-write-fetch-head",
+          `file://${clonePath}`, `${cloneRef}:${bareRef}`,
+        ]);
+        const landed = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim();
+        if (landed !== commit) fail("bare_transfer_mismatch");
+        if ((await this.runGit(opts.barePath, ["--no-replace-objects", "cat-file", "-t", commit])).trim() !== "commit") fail("bare_transfer_mismatch");
+      });
+      await git(["update-ref", "-d", cloneRef, commit]);
+      if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
+      try { await opts.onPhase?.("captured", { cloneRef, bareRef, commit }); }
+      catch { return refused("phase_callback_failed"); }
+      return { kind: "captured", root: commit, parent: head, tree, ignored };
+    } catch (err) {
+      if (err instanceof TerminalSnapshotRefusal) return refused(err.reason);
+      if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+      this.log.warn("terminal snapshot failed (refused)", { cwd: clonePath, error: gitErrorMessage(err) });
+      return refused("error");
+    } finally {
+      if (privateIndex) {
+        // The private index (and any lock a killed git left) is runner-owned: remove it as the runner, past the deadline.
+        for (const leftover of [privateIndex, `${privateIndex}.lock`]) {
+          await runnerNode(`try{require("fs").rmSync(process.argv[1],{force:true})}catch{process.exitCode=1}`, leftover, 15_000)
+            .catch((cleanup: unknown) => {
+              this.log.warn("terminal snapshot private index cleanup failed", { error: gitErrorMessage(cleanup) });
+            });
+        }
+      }
+    }
+  }
+
+  /**
+   * Chain `extraRoots` under `base` as two-parent "ours" merges built bare-side: every link carries
+   * base's tree, takes the previous link as first parent and one extra root as second parent, with a
+   * deterministic identity. Refuses when a root is missing from the bare, when `existingMerges` plus
+   * the roots exceed the checkpoint merge budget (32) or the roots exceed 63. No extra roots returns
+   * `base` with no write. Otherwise the result is pinned at `refs/uzi-terminal-local/<runId>/g<gen>`
+   * by compare-and-swap: created when absent, or moved from `base` (the captured snapshot commit).
+   */
+  async buildTerminalAggregate(barePath: string, input: {
+    base: string; extraRoots: string[]; runId: string; generation: number; existingMerges?: number;
+  }): Promise<{ tip: string } | { refused: string }> {
+    const existing = input.existingMerges ?? 0;
+    if (!SHA40_RE.test(input.base) || !Array.isArray(input.extraRoots) || !input.extraRoots.every((r) => SHA40_RE.test(r)) ||
+        !TERMINAL_RUN_ID_RE.test(input.runId) || !Number.isSafeInteger(input.generation) || input.generation < 1 ||
+        !Number.isSafeInteger(existing) || existing < 0) return { refused: "invalid_input" };
+    const roots = [...new Set(input.extraRoots)].filter((r) => r !== input.base);
+    if (roots.length === 0) return { tip: input.base };
+    if (roots.length > TERMINAL_AGGREGATE_MAX_ROOTS || existing + roots.length > TERMINAL_AGGREGATE_MAX_MERGES) return { refused: "merge_budget" };
+    const ref = `refs/uzi-terminal-local/${input.runId}/g${input.generation}`;
+    try {
+      return await this.withLock(barePath, async () => {
+        const kind = async (sha: string): Promise<string> =>
+          (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", sha]).catch(() => "")).trim();
+        for (const sha of [input.base, ...roots]) if (await kind(sha) !== "commit") return { refused: "root_missing" };
+        const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${input.base}^{tree}`])).trim();
+        if (!SHA40_RE.test(tree)) return { refused: "tree_unreadable" };
+        let tip = input.base;
+        for (let i = 0; i < roots.length; i++) {
+          tip = (await this.runSynthesisGit(barePath, [
+            "--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", tip, "-p", roots[i]!,
+            "-m", `uzi terminal aggregate ${input.runId} g${input.generation} link ${i}`,
+          ], {
+            GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+            GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+            GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+          })).trim();
+          if (!SHA40_RE.test(tip)) return { refused: "commit_unreadable" };
+        }
+        const current = (await this.runGit(barePath, ["for-each-ref", "--format=%(objectname)", ref])).trim();
+        if (current === tip) return { tip };
+        if (current !== "" && current !== input.base) return { refused: "ref_conflict" };
+        await this.runGit(barePath, ["update-ref", ref, tip, current === "" ? "" : current]);
+        if ((await this.runGit(barePath, ["for-each-ref", "--format=%(objectname)", ref])).trim() !== tip) return { refused: "pin_mismatch" };
+        return { tip };
+      });
+    } catch (err) {
+      if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+      this.log.warn("terminal aggregate failed (refused)", { barePath, error: gitErrorMessage(err) });
+      return { refused: "error" };
+    }
+  }
+
+  /** sha256 hex over the sorted unique OIDs `rev-list --objects <tip> ^<exclude> ^<each scan floor>` reaches, on the
+   *  proof-read view (no replace refs, grafts, commit-graph or multi-pack-index). Null past the checkpoint scan
+   *  object cap, the deadline, or on any failure. */
+  async terminalScanDigest(barePath: string, range: CheckpointRange, opts: { deadlineMs: number }): Promise<string | null> {
+    const revs = this.terminalRangeRevs(range);
+    if (!revs || !Number.isFinite(opts?.deadlineMs) || opts.deadlineMs <= 0) return null;
+    try {
+      const out = await this.execScoped("git", withDir(barePath, [
+        "-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false",
+        "rev-list", "--objects", "--no-object-names", ...revs,
+      ]), { env: { ...gitEnv(), ...PROOF_READ_ENV, GIT_SHALLOW_FILE: "/dev/null" }, timeout: Math.max(1, Math.floor(opts.deadlineMs)),
+        maxBuffer: (CHECKPOINT_SCAN_MAX_OBJECTS + 1) * 41 + 4096 });
+      const oids = new Set<string>();
+      for (const line of out.stdout.split("\n")) {
+        if (line === "") continue;
+        if (!SHA40_RE.test(line)) return null;
+        oids.add(line);
+        if (oids.size > CHECKPOINT_SCAN_MAX_OBJECTS) return null;
+      }
+      return createHash("sha256").update([...oids].sort().join("\n")).digest("hex");
+    } catch (err) {
+      if (err instanceof GitBoundaryAbortError || isCheckpointBoundaryFailure(err)) throw err;
+      return null;
+    }
+  }
+
+  /** sha256 hex over the sorted OIDs a pack carries, read in a fresh scratch directory outside any repository
+   *  (`index-pack <file>` then `show-index`). Touches no repo; null on any failure or the deadline. */
+  async terminalTransportDigest(pack: Buffer, opts: { deadlineMs: number }): Promise<string | null> {
+    if (!Buffer.isBuffer(pack) || !Number.isFinite(opts?.deadlineMs) || opts.deadlineMs <= 0) return null;
+    const deadlineAt = Date.now() + opts.deadlineMs;
+    let dir: string | undefined;
+    try {
+      const parent = process.env.TMPDIR || os.tmpdir();
+      dir = await fs.mkdtemp(path.join(parent, "uzi-term-pack-"));
+      const env = { ...gitEnv(), GIT_CEILING_DIRECTORIES: parent };
+      const packFile = path.join(dir, "in.pack"), idxFile = path.join(dir, "in.idx");
+      await fs.writeFile(packFile, pack, { mode: 0o600 });
+      const remaining = (): number => Math.max(1, deadlineAt - Date.now());
+      await this.execScoped("git", ["index-pack", "-o", idxFile, packFile], { env, cwd: dir, timeout: remaining(), maxBuffer: 1 << 20 });
+      const idx = await fs.readFile(idxFile);
+      const shown = await this.execScoped("git", ["show-index"], {
+        env, cwd: dir, timeout: remaining(), maxBuffer: (CHECKPOINT_SCAN_MAX_OBJECTS * 4 + 1) * 90, input: idx,
+      });
+      const oids: string[] = [];
+      for (const line of shown.stdout.split("\n")) {
+        if (line === "") continue;
+        const m = /^\d+ ([0-9a-f]{40})(?: |$)/.exec(line);
+        if (!m) return null;
+        oids.push(m[1]!);
+      }
+      if (oids.length === 0) return null;
+      return createHash("sha256").update([...new Set(oids)].sort().join("\n")).digest("hex");
+    } catch (err) {
+      if (err instanceof GitBoundaryAbortError || isCheckpointBoundaryFailure(err)) throw err;
+      return null;
+    } finally {
+      if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /** For every commit of `<tip> ^<exclude> ^<scan floors>` (merges included, at most 1000), the paths that differ
+   *  between `targetSha` and that commit (`diff --no-renames --name-only`), so an intermediate commit a later one
+   *  reverts is still reported. Null on any failure, the deadline, or more commits than the cap. */
+  async changedCiPathsPerCommit(barePath: string, range: CheckpointRange, targetSha: string,
+    opts: { deadlineMs: number }): Promise<Array<{ commit: string; paths: string[] }> | null> {
+    const revs = this.terminalRangeRevs(range);
+    if (!revs || !SHA40_RE.test(targetSha) || !Number.isFinite(opts?.deadlineMs) || opts.deadlineMs <= 0) return null;
+    const deadlineAt = Date.now() + opts.deadlineMs;
+    const remaining = (): number => deadlineAt - Date.now();
+    const env = { ...gitEnv(), ...PROOF_READ_ENV, GIT_SHALLOW_FILE: "/dev/null" };
+    const pins = ["-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false"];
+    try {
+      const listed = await this.execScoped("git", withDir(barePath, [...pins, "rev-list", ...revs]),
+        { env, timeout: Math.max(1, remaining()), maxBuffer: (TERMINAL_CI_MAX_COMMITS + 1) * 41 + 4096 });
+      const commits = listed.stdout.split("\n").filter((l) => l !== "");
+      if (commits.length > TERMINAL_CI_MAX_COMMITS || commits.some((c) => !SHA40_RE.test(c))) return null;
+      const result: Array<{ commit: string; paths: string[] }> = [];
+      for (const commit of commits) {
+        if (remaining() <= 0) return null;
+        const diff = await this.execScoped("git", withDir(barePath, [...pins, "diff", "--no-renames", "--name-only", "-z", targetSha, commit]),
+          { env, timeout: Math.max(1, remaining()), maxBuffer: 16 * 1024 * 1024 });
+        const out = diff.stdout;
+        result.push({ commit, paths: out === "" ? [] : out.endsWith("\0") ? out.slice(0, -1).split("\0") : [] });
+        if (out !== "" && !out.endsWith("\0")) return null;
+      }
+      return result;
+    } catch (err) {
+      if (err instanceof GitBoundaryAbortError || isCheckpointBoundaryFailure(err)) throw err;
+      return null;
+    }
+  }
+
+  /** `<tip> ^<exclude> ^<floors>` for a fully valid range, else undefined. */
+  private terminalRangeRevs(range: CheckpointRange): string[] | undefined {
+    const floors = range?.scanFloorShas ?? [];
+    if (!range || !SHA40_RE.test(range.tipSha) || !SHA40_RE.test(range.excludeSha) || floors.some((f) => !SHA40_RE.test(f))) return undefined;
+    return [range.tipSha, `^${range.excludeSha}`, ...floors.map((f) => `^${f}`)];
+  }
+
+  /**
    * Issue #281 / CodeRabbit #655: the porcelain read for the no-progress detector's
    * worktree fingerprint. Identical git invocation and runner-uid rationale as
    * planChangedFiles, but returns `null` on a failed read instead of `[]`, so an
@@ -27750,6 +28169,92 @@ function wipPathValid(value: string): boolean {
     }
   }
   return true;
+}
+
+// ---- Terminal-preservation snapshot (captureTerminalSnapshot and its siblings) ----
+
+/** Options of {@link GitCache.captureTerminalSnapshot}. */
+export interface TerminalSnapshotOptions {
+  runId: string;
+  generation: number;
+  /** Duration budget (ms) for the whole call. */
+  deadlineMs: number;
+  signal?: AbortSignal;
+  /** Basename (and exact path, when inside the clone) of the worker token file; never captured. */
+  workerTokenFile?: string;
+  /** Bare repository the snapshot is transferred into. */
+  barePath: string;
+  /** Record-first hook: "capturing" runs before the clone ref exists, "captured" after the transfer settled. */
+  onPhase?: (phase: "capturing" | "captured", info: { cloneRef: string; bareRef: string; commit?: string }) => Promise<void>;
+  /** Post-runner-git re-proof supplied by the caller's flight context; false refuses. */
+  reprove?: () => Promise<boolean>;
+  /** Test-only seams; production never passes them. */
+  seam?: { beforeStaging?: () => Promise<void>; afterCloneRef?: () => Promise<void> };
+}
+export type TerminalSnapshotResult =
+  | { kind: "clean"; root: string; tree: string; ignored: { files: number; bytes: number } }
+  | { kind: "captured"; root: string; parent: string; tree: string; ignored: { files: number; bytes: number } }
+  | { kind: "refused"; reason: string };
+
+/** A refusal carrying a stable, path-free reason. Never thrown past the public methods below. */
+class TerminalSnapshotRefusal extends Error {
+  constructor(readonly reason: string) { super(`terminal snapshot refused: ${reason}`); }
+}
+/** Run and generation naming: the ref `refs/uzi-terminal-local/<runId>/g<generation>` must be a plain ref. */
+const TERMINAL_RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** Bound on ignored-file listings, separate from the changed-path cap. */
+const TERMINAL_IGNORED_MAX_ENTRIES = 200_000;
+/** Aggregate budget (see buildTerminalAggregate): merges per chain, and extra roots per call. */
+const TERMINAL_AGGREGATE_MAX_MERGES = CHECKPOINT_SCAN_MAX_MERGES;
+const TERMINAL_AGGREGATE_MAX_ROOTS = 63;
+/** Commits one changedCiPathsPerCommit call will examine. */
+const TERMINAL_CI_MAX_COMMITS = 1000;
+const TERMINAL_CREDENTIAL_BASENAMES = new Set([
+  "auth.json", ".credentials.json", ".claude.json", ".netrc", ".git-credentials",
+  "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+]);
+const TERMINAL_CREDENTIAL_SUFFIXES = [".pem", ".key", ".p12", ".pfx"];
+const TERMINAL_CREDENTIAL_DIRS = new Set([".ssh", ".aws", ".gnupg"]);
+/** Pins every terminal-snapshot git carries (the captureMaintenanceWip set plus the proof-read walk pins). */
+const TERMINAL_GIT_PINS: readonly string[] = [
+  "--no-replace-objects", "--no-optional-locks",
+  "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+  "-c", "core.ignoreStat=false", "-c", "core.checkStat=default",
+  "-c", "core.trustctime=true", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
+  "-c", "commit.gpgsign=false", "-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false",
+  "-c", `core.hooksPath=${EMPTY_GIT_HOOKS_DIR}`,
+];
+/** Env for every terminal-snapshot git: no replace refs, no grafts, no shallow file, no optional locks. */
+const TERMINAL_GIT_ENV: NodeJS.ProcessEnv = {
+  ...PROOF_READ_ENV, GIT_OPTIONAL_LOCKS: "0", GIT_SHALLOW_FILE: "/dev/null",
+};
+
+/** Whether a changed path names a credential a snapshot must never carry. */
+function terminalCredentialPath(rel: string, workerTokenFile: string | undefined, clonePath: string): boolean {
+  const parts = rel.split("/");
+  const base = parts[parts.length - 1]!.toLowerCase();
+  if (TERMINAL_CREDENTIAL_BASENAMES.has(base)) return true;
+  if (TERMINAL_CREDENTIAL_SUFFIXES.some((s) => base.endsWith(s))) return true;
+  if (parts.slice(0, -1).some((p) => TERMINAL_CREDENTIAL_DIRS.has(p.toLowerCase()))) return true;
+  if (workerTokenFile) {
+    if (base === path.posix.basename(workerTokenFile).toLowerCase()) return true;
+    if (path.join(clonePath, rel) === path.resolve(workerTokenFile)) return true;
+  }
+  return false;
+}
+
+/** Parse `diff --raw -z --no-abbrev --no-renames` into rows; undefined on any deviation. */
+function terminalParseRaw(out: string): Array<{ path: string; status: string; mode: string; oid: string }> | undefined {
+  const toks = out.split("\0");
+  if (toks[toks.length - 1] === "") toks.pop();
+  if (toks.length % 2 !== 0) return undefined;
+  const res: Array<{ path: string; status: string; mode: string; oid: string }> = [];
+  for (let i = 0; i < toks.length; i += 2) {
+    const m = /^:\d{6} (\d{6}) [0-9a-f]{40} ([0-9a-f]{40}) ([AMDT])$/.exec(toks[i]!);
+    if (!m) return undefined;
+    res.push({ path: toks[i + 1]!, status: m[3]!, mode: m[1]!, oid: m[2]! });
+  }
+  return res;
 }
 
 /** Distinct directories (the root included) touched by resolving every path's ancestors. */
