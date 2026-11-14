@@ -1050,7 +1050,7 @@ WITH checker_template_pins AS MATERIALIZED (
           AND r.status = 'queued' AND r.user_id = $3
     ) owners
 ), claimant AS MATERIALIZED (
-    SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce FROM workers WHERE id = $1 FOR UPDATE
+    SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at FROM workers WHERE id = $1 FOR UPDATE
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id,
            r.policy_pending_fresh,
@@ -5221,7 +5221,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at
 `
 
 type CreateWorkerParams struct {
@@ -5353,6 +5353,7 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.CredentialSwitchApplyNonce,
 		&i.HibernationCleanup,
 		&i.HibernationCleanupReason,
 		&i.CleanupOpID,
@@ -5366,7 +5367,6 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.CleanupCancelRequested,
 		&i.CleanupReconcileSeq,
 		&i.CleanupReconciledAt,
-		&i.CredentialSwitchApplyNonce,
 	)
 	return i, err
 }
@@ -9037,7 +9037,7 @@ func (q *Queries) GetUnconsumedCompletionPermit(ctx context.Context, arg GetUnco
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -9132,6 +9132,7 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.CredentialSwitchApplyNonce,
 		&i.HibernationCleanup,
 		&i.HibernationCleanupReason,
 		&i.CleanupOpID,
@@ -9145,13 +9146,12 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.CleanupCancelRequested,
 		&i.CleanupReconcileSeq,
 		&i.CleanupReconciledAt,
-		&i.CredentialSwitchApplyNonce,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -9251,6 +9251,7 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.CredentialSwitchApplyNonce,
 		&i.HibernationCleanup,
 		&i.HibernationCleanupReason,
 		&i.CleanupOpID,
@@ -9264,13 +9265,12 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.CleanupCancelRequested,
 		&i.CleanupReconcileSeq,
 		&i.CleanupReconciledAt,
-		&i.CredentialSwitchApplyNonce,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -9366,6 +9366,7 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.CredentialSwitchApplyNonce,
 		&i.HibernationCleanup,
 		&i.HibernationCleanupReason,
 		&i.CleanupOpID,
@@ -9379,13 +9380,12 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.CleanupCancelRequested,
 		&i.CleanupReconcileSeq,
 		&i.CleanupReconciledAt,
-		&i.CredentialSwitchApplyNonce,
 	)
 	return i, err
 }
 
 const getWorkerForUpdate = `-- name: GetWorkerForUpdate :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce FROM workers WHERE id = $1 FOR UPDATE
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at FROM workers WHERE id = $1 FOR UPDATE
 `
 
 // PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
@@ -9485,6 +9485,7 @@ func (q *Queries) GetWorkerForUpdate(ctx context.Context, id uuid.UUID) (Worker,
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.CredentialSwitchApplyNonce,
 		&i.HibernationCleanup,
 		&i.HibernationCleanupReason,
 		&i.CleanupOpID,
@@ -9498,13 +9499,12 @@ func (q *Queries) GetWorkerForUpdate(ctx context.Context, id uuid.UUID) (Worker,
 		&i.CleanupCancelRequested,
 		&i.CleanupReconcileSeq,
 		&i.CleanupReconciledAt,
-		&i.CredentialSwitchApplyNonce,
 	)
 	return i, err
 }
 
 const getWorkerProjectionForOwner = `-- name: GetWorkerProjectionForOwner :one
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid, w.hibernation_cleanup, w.hibernation_cleanup_reason, w.cleanup_op_id, w.cleanup_phase, w.cleanup_register_nonce, w.cleanup_pod_uid, w.cleanup_requested_at, w.cleanup_started_at, w.cleanup_unknown_at, w.cleanup_settled_at, w.cleanup_cancel_requested, w.cleanup_reconcile_seq, w.cleanup_reconciled_at, w.credential_switch_apply_nonce,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid, w.credential_switch_apply_nonce, w.hibernation_cleanup, w.hibernation_cleanup_reason, w.cleanup_op_id, w.cleanup_phase, w.cleanup_register_nonce, w.cleanup_pod_uid, w.cleanup_requested_at, w.cleanup_started_at, w.cleanup_unknown_at, w.cleanup_settled_at, w.cleanup_cancel_requested, w.cleanup_reconcile_seq, w.cleanup_reconciled_at,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -9653,6 +9653,7 @@ type GetWorkerProjectionForOwnerRow struct {
 	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
 	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
 	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
+	CredentialSwitchApplyNonce pgtype.Text        `json:"credential_switch_apply_nonce"`
 	HibernationCleanup         pgtype.Text        `json:"hibernation_cleanup"`
 	HibernationCleanupReason   pgtype.Text        `json:"hibernation_cleanup_reason"`
 	CleanupOpID                pgtype.UUID        `json:"cleanup_op_id"`
@@ -9666,7 +9667,6 @@ type GetWorkerProjectionForOwnerRow struct {
 	CleanupCancelRequested     bool               `json:"cleanup_cancel_requested"`
 	CleanupReconcileSeq        int32              `json:"cleanup_reconcile_seq"`
 	CleanupReconciledAt        pgtype.Timestamptz `json:"cleanup_reconciled_at"`
-	CredentialSwitchApplyNonce pgtype.Text        `json:"credential_switch_apply_nonce"`
 	AnthropicSecretLabel       pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                       bool               `json:"busy"`
 	ActiveRuns                 int64              `json:"active_runs"`
@@ -9780,6 +9780,7 @@ func (q *Queries) GetWorkerProjectionForOwner(ctx context.Context, arg GetWorker
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.CredentialSwitchApplyNonce,
 		&i.HibernationCleanup,
 		&i.HibernationCleanupReason,
 		&i.CleanupOpID,
@@ -9793,7 +9794,6 @@ func (q *Queries) GetWorkerProjectionForOwner(ctx context.Context, arg GetWorker
 		&i.CleanupCancelRequested,
 		&i.CleanupReconcileSeq,
 		&i.CleanupReconciledAt,
-		&i.CredentialSwitchApplyNonce,
 		&i.AnthropicSecretLabel,
 		&i.Busy,
 		&i.ActiveRuns,
@@ -9927,7 +9927,7 @@ UPDATE workers SET
     END,
     updated_at            = now()
 WHERE id = $23
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at
 `
 
 type HeartbeatWorkerParams struct {
@@ -10079,6 +10079,7 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.CredentialSwitchApplyNonce,
 		&i.HibernationCleanup,
 		&i.HibernationCleanupReason,
 		&i.CleanupOpID,
@@ -10092,7 +10093,6 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.CleanupCancelRequested,
 		&i.CleanupReconcileSeq,
 		&i.CleanupReconciledAt,
-		&i.CredentialSwitchApplyNonce,
 	)
 	return i, err
 }
@@ -12082,7 +12082,7 @@ func (q *Queries) ListActiveRunsForWorkers(ctx context.Context, workerIds []uuid
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid, w.hibernation_cleanup, w.hibernation_cleanup_reason, w.cleanup_op_id, w.cleanup_phase, w.cleanup_register_nonce, w.cleanup_pod_uid, w.cleanup_requested_at, w.cleanup_started_at, w.cleanup_unknown_at, w.cleanup_settled_at, w.cleanup_cancel_requested, w.cleanup_reconcile_seq, w.cleanup_reconciled_at, w.credential_switch_apply_nonce,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid, w.credential_switch_apply_nonce, w.hibernation_cleanup, w.hibernation_cleanup_reason, w.cleanup_op_id, w.cleanup_phase, w.cleanup_register_nonce, w.cleanup_pod_uid, w.cleanup_requested_at, w.cleanup_started_at, w.cleanup_unknown_at, w.cleanup_settled_at, w.cleanup_cancel_requested, w.cleanup_reconcile_seq, w.cleanup_reconciled_at,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -12258,6 +12258,7 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.WakeReadyResourceVersion,
 			&i.Worker.WakeRegisterOpID,
 			&i.Worker.WakeRegisterPodUid,
+			&i.Worker.CredentialSwitchApplyNonce,
 			&i.Worker.HibernationCleanup,
 			&i.Worker.HibernationCleanupReason,
 			&i.Worker.CleanupOpID,
@@ -12271,7 +12272,6 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.CleanupCancelRequested,
 			&i.Worker.CleanupReconcileSeq,
 			&i.Worker.CleanupReconciledAt,
-			&i.Worker.CredentialSwitchApplyNonce,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.ActiveCrossChecks,
@@ -15622,7 +15622,7 @@ func (q *Queries) ListWorkerPendingSince(ctx context.Context, workerID uuid.UUID
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid, w.hibernation_cleanup, w.hibernation_cleanup_reason, w.cleanup_op_id, w.cleanup_phase, w.cleanup_register_nonce, w.cleanup_pod_uid, w.cleanup_requested_at, w.cleanup_started_at, w.cleanup_unknown_at, w.cleanup_settled_at, w.cleanup_cancel_requested, w.cleanup_reconcile_seq, w.cleanup_reconciled_at, w.credential_switch_apply_nonce,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid, w.credential_switch_apply_nonce, w.hibernation_cleanup, w.hibernation_cleanup_reason, w.cleanup_op_id, w.cleanup_phase, w.cleanup_register_nonce, w.cleanup_pod_uid, w.cleanup_requested_at, w.cleanup_started_at, w.cleanup_unknown_at, w.cleanup_settled_at, w.cleanup_cancel_requested, w.cleanup_reconcile_seq, w.cleanup_reconciled_at,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -15767,6 +15767,7 @@ type ListWorkersByUserRow struct {
 	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
 	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
 	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
+	CredentialSwitchApplyNonce pgtype.Text        `json:"credential_switch_apply_nonce"`
 	HibernationCleanup         pgtype.Text        `json:"hibernation_cleanup"`
 	HibernationCleanupReason   pgtype.Text        `json:"hibernation_cleanup_reason"`
 	CleanupOpID                pgtype.UUID        `json:"cleanup_op_id"`
@@ -15780,7 +15781,6 @@ type ListWorkersByUserRow struct {
 	CleanupCancelRequested     bool               `json:"cleanup_cancel_requested"`
 	CleanupReconcileSeq        int32              `json:"cleanup_reconcile_seq"`
 	CleanupReconciledAt        pgtype.Timestamptz `json:"cleanup_reconciled_at"`
-	CredentialSwitchApplyNonce pgtype.Text        `json:"credential_switch_apply_nonce"`
 	AnthropicSecretLabel       pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                       bool               `json:"busy"`
 	ActiveRuns                 int64              `json:"active_runs"`
@@ -15921,6 +15921,7 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.WakeReadyResourceVersion,
 			&i.WakeRegisterOpID,
 			&i.WakeRegisterPodUid,
+			&i.CredentialSwitchApplyNonce,
 			&i.HibernationCleanup,
 			&i.HibernationCleanupReason,
 			&i.CleanupOpID,
@@ -15934,7 +15935,6 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.CleanupCancelRequested,
 			&i.CleanupReconcileSeq,
 			&i.CleanupReconciledAt,
-			&i.CredentialSwitchApplyNonce,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -20651,7 +20651,7 @@ SET protocol_capabilities = ARRAY(
     max_concurrent_runs = GREATEST(workers.max_concurrent_runs, $2::integer),
     max_cross_check_slots = GREATEST(workers.max_cross_check_slots, $3::integer)
 WHERE id = $4 AND snapshot_register_nonce = $5::text
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at
 `
 
 type RefreshWorkerProtocolParams struct {
@@ -20762,6 +20762,7 @@ func (q *Queries) RefreshWorkerProtocol(ctx context.Context, arg RefreshWorkerPr
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.CredentialSwitchApplyNonce,
 		&i.HibernationCleanup,
 		&i.HibernationCleanupReason,
 		&i.CleanupOpID,
@@ -20775,7 +20776,6 @@ func (q *Queries) RefreshWorkerProtocol(ctx context.Context, arg RefreshWorkerPr
 		&i.CleanupCancelRequested,
 		&i.CleanupReconcileSeq,
 		&i.CleanupReconciledAt,
-		&i.CredentialSwitchApplyNonce,
 	)
 	return i, err
 }
@@ -20871,7 +20871,7 @@ WITH prev AS (
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since    = NULL,
@@ -20925,7 +20925,7 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at FROM upd
 `
 
 type RegisterWorkerParams struct {
@@ -21029,6 +21029,7 @@ type RegisterWorkerRow struct {
 	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
 	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
 	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
+	CredentialSwitchApplyNonce pgtype.Text        `json:"credential_switch_apply_nonce"`
 	HibernationCleanup         pgtype.Text        `json:"hibernation_cleanup"`
 	HibernationCleanupReason   pgtype.Text        `json:"hibernation_cleanup_reason"`
 	CleanupOpID                pgtype.UUID        `json:"cleanup_op_id"`
@@ -21042,7 +21043,6 @@ type RegisterWorkerRow struct {
 	CleanupCancelRequested     bool               `json:"cleanup_cancel_requested"`
 	CleanupReconcileSeq        int32              `json:"cleanup_reconcile_seq"`
 	CleanupReconciledAt        pgtype.Timestamptz `json:"cleanup_reconciled_at"`
-	CredentialSwitchApplyNonce pgtype.Text        `json:"credential_switch_apply_nonce"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -21194,6 +21194,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.CredentialSwitchApplyNonce,
 		&i.HibernationCleanup,
 		&i.HibernationCleanupReason,
 		&i.CleanupOpID,
@@ -21207,7 +21208,6 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.CleanupCancelRequested,
 		&i.CleanupReconcileSeq,
 		&i.CleanupReconciledAt,
-		&i.CredentialSwitchApplyNonce,
 	)
 	return i, err
 }
@@ -28547,7 +28547,7 @@ SET anthropic_secret_id = $1,
     anthropic_bind_mode = $2,
     updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at, credential_switch_apply_nonce
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at
 `
 
 type SetWorkerAnthropicSecretParams struct {
@@ -28676,6 +28676,7 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.CredentialSwitchApplyNonce,
 		&i.HibernationCleanup,
 		&i.HibernationCleanupReason,
 		&i.CleanupOpID,
@@ -28689,7 +28690,6 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.CleanupCancelRequested,
 		&i.CleanupReconcileSeq,
 		&i.CleanupReconciledAt,
-		&i.CredentialSwitchApplyNonce,
 	)
 	return i, err
 }

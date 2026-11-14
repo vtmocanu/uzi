@@ -2060,6 +2060,7 @@ type Worker struct {
 	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
 	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
 	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
+	CredentialSwitchApplyNonce pgtype.Text        `json:"credential_switch_apply_nonce"`
 	HibernationCleanup         pgtype.Text        `json:"hibernation_cleanup"`
 	HibernationCleanupReason   pgtype.Text        `json:"hibernation_cleanup_reason"`
 	CleanupOpID                pgtype.UUID        `json:"cleanup_op_id"`
@@ -2073,7 +2074,6 @@ type Worker struct {
 	CleanupCancelRequested     bool               `json:"cleanup_cancel_requested"`
 	CleanupReconcileSeq        int32              `json:"cleanup_reconcile_seq"`
 	CleanupReconciledAt        pgtype.Timestamptz `json:"cleanup_reconciled_at"`
-	CredentialSwitchApplyNonce pgtype.Text        `json:"credential_switch_apply_nonce"`
 }
 
 type WorkerActiveRun struct {
