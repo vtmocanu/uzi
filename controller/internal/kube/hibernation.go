@@ -369,7 +369,17 @@ func (m *Materializer) hibernatePreparing(ctx context.Context, w protocol.Desire
 		// the identity report is sent every tick instead (the api treats an identical
 		// re-send as idempotent). An empty gate is today's behaviour.
 		if g := w.Hibernation.InventoryGate; g == protocol.InventoryGateObserve || g == protocol.InventoryGateAwait {
-			return m.reportObserved(ctx, w, obs)
+			if !obs.PodsKnown {
+				return nil // a one-tick unknown; the preparing deadline bounds a persistent one
+			}
+			// With pods known but no pod at all, or no claim observed, there is nothing to
+			// inventory: the gate is ignored and today's scale-down proceeds below (the api
+			// has no row for this op and the evaluator keeps the volumes).
+			if pod := boundPodUID(obs); pod != "" {
+				if pvcs := m.inventoryPVCs(ctx, obs); len(pvcs) > 0 {
+					return m.reportObserved(ctx, w, obs, pod, pvcs)
+				}
+			}
 		}
 		got, stale, err := m.conditionedPatch(ctx, ns, obs, name,
 			map[string]any{"annotations": map[string]any{annotationHibernationOp: op}},
@@ -507,16 +517,9 @@ func (m *Materializer) inventoryPVCs(ctx context.Context, obs reconcile.Observed
 }
 
 // reportObserved sends the pre-mutation identity report for an inventory-gated scale-down.
-// It sends nothing while the pod list is unread or no pod uid is known, and never patches.
-func (m *Materializer) reportObserved(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker) error {
-	pod := boundPodUID(obs)
-	if !obs.PodsKnown || pod == "" {
-		return nil
-	}
-	pvcs := m.inventoryPVCs(ctx, obs)
-	if len(pvcs) == 0 {
-		return nil // no claim observed: hold this tick rather than report an empty inventory
-	}
+// The caller has established that the pod list was read and that pod and pvcs are non-empty;
+// it never patches.
+func (m *Materializer) reportObserved(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, pod string, pvcs []protocol.HibernationPVC) error {
 	t := protocol.HibernationTransition{
 		OpID: w.Hibernation.OpID, Transition: protocol.TransitionObserved,
 		DeploymentUID: obs.DeploymentUID, ResourceVersion: obs.DeploymentResourceVersion, PodUID: pod,
