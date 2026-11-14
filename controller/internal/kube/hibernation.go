@@ -549,10 +549,8 @@ func (m *Materializer) hibernateCleaning(ctx context.Context, w protocol.Desired
 	if !obs.PodsKnown || !obs.StoppedPodUIDs[c.StopProofPodUID] || !slices.Contains(obs.WorkerPodUIDs, c.StopProofPodUID) {
 		return nil
 	}
-	// The api requires the Deployment uid on every transition.
-	if !obs.HasDeployment || obs.DeploymentUID == "" {
-		return nil
-	}
+	// The Deployment uid is sent when observed and empty otherwise: the api accepts a
+	// cleanup_stopped without it, so a gone Deployment never suppresses the pod proof.
 	key := cleanupReportKey{cleanupOp: c.OpID, seq: c.ReconcileSeq}
 	m.cleanupMu.Lock()
 	done := m.cleanupReported[w.ID] == key
