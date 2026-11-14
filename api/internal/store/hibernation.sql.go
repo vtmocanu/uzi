@@ -1244,7 +1244,7 @@ type UpsertHibernationInventoryObservedParams struct {
 }
 
 // ---------------------------------------------------------------------------
-// PRD #4208 M1: worker_hibernation_inventories (migration 00448).
+// PRD #4208 M1: worker_hibernation_inventories (migration 00454).
 // Every write to worker_hibernation_inventories runs in a transaction that already holds the
 // workers row lock (GetWorkerForUpdate); lock order workers -> inventory. The reads below that
 // take a worker-id list are batched and unlocked: they feed the dry-run report, which only
