@@ -20789,7 +20789,9 @@ export class RunRunner {
         recordLocks(res);
       }
       // A surviving group may still be running: the seam does not return (and the sink gate stays
-      // held) until it is gone. Deliberately unbounded; one log line per verdict change.
+      // held) until it is gone. Unbounded by design: each awaitTickSurvivorsGone round re-sends a
+      // checked SIGKILL and logs its own line; this seam adds one line per verdict change. Unlike
+      // other sinks it never proceeds on "stuck" or "unconfirmed".
       if (survivedHere) {
         let last: "stuck" | "unconfirmed" | undefined;
         for (;;) {

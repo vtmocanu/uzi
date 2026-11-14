@@ -30765,6 +30765,7 @@ describe("issue #4258 real CodexExecutor + RunRunner over the scoped seam", { sk
   type Scenario = { stage: "range" | "path"; stop: "cancel" | "shutdown" } | { stage: "remediate" };
 
   async function harness(iid: number, sc: Scenario) {
+    await fs.mkdir(path.resolve("../.uzi/scratch"), { recursive: true });
     const scratch = await fs.mkdtemp(path.resolve("../.uzi/scratch/4258-codex-"));
     const stall = writeStallShim(scratch);
     const drv = makeTickDriver({ scanDeadlineMs: 60_000 });

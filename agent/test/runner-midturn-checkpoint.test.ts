@@ -5494,6 +5494,28 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
       }
     }
 
+    it("a boundary failure thrown after the stop is a deferral (aborted), not a rethrow", { timeout: 90_000 }, async () => {
+      const { logger, lines } = recordingLogger();
+      const out = await rig(4258_140, async (r) => {
+        await flagAndTick(r);
+        const d = await bounded(r.withFetchBack(async () => {
+          stopRun(r, "shutdown");
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          throw Object.assign(new Error("boundary failure after the stop"), { checkpointBoundary: "hard" });
+        }, () => r.ctx.midRunSecretRemediation!()), WAIT_MS, "the seam resolving", "mid-run seam");
+        assert.deepEqual(d, { action: "proceed" });
+        assert.ok(r.state().midRunTrigger, "the trigger is kept");
+        assert.equal(r.state().attempts, 0, "no attempt was spent");
+        assert.equal(gateHeld(r), false, "the sink gate was released");
+      }, { log: logger });
+      if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+      assert.ok(
+        lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred" && (l as Record<string, unknown>).why === "aborted"),
+        "the seam logged an aborted deferral",
+      );
+      assert.deepEqual(statusTexts(out.claimRunId).filter((t) => /returning to the lead/.test(t)), []);
+    });
+
     it("a surviving process group keeps the seam open and the sink gate held until it is gone", { timeout: 90_000 }, async () => {
       const tmp = scratchDir("4258-survivor");
       const stall = writeStallShim(tmp);
