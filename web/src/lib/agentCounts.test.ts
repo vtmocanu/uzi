@@ -110,6 +110,15 @@ describe("agentCountModel", () => {
     expect(m.byScope.map((s) => s.scope)).toEqual(["builtin"]);
   });
 
+  it("shadows a user row by a shared template that has no allocation row (matches the page badge)", () => {
+    const templates = [tmpl("g1", "coder", "global"), tmpl("u1", "coder", "user")];
+    const allocs = [alloc("u1", "coder", "user", { effective: true })];
+    const m = agentCountModel(allocs, templates, { isAdmin: false, viewerId: VIEWER });
+    expect(m.total).toBe(1);
+    expect(m.inRuns).toBe(0);
+    expect(isShadowedTemplate(templates[1], sharedTemplateNames(templates))).toBe(true);
+  });
+
   it("drops allocations with no matching template", () => {
     const templates = [tmpl("b1", "coder", "builtin")];
     const allocs = [alloc("b1", "coder", "builtin"), alloc("ghost", "ghost", "builtin")];

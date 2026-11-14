@@ -60,7 +60,10 @@ export function agentCountModel(
     population.push({ scope: t.scope, name: t.name, alloc });
   }
 
-  const shared = sharedTemplateNames(population);
+  // Shared names come from every template, not only allocation-backed rows, so a builtin or
+  // global that lacks an allocation row (two separate reads) still shadows exactly as the
+  // Agents page badge does.
+  const shared = sharedTemplateNames(templates);
   const stats = new Map<AgentTemplateScope, { total: number; inRuns: number }>();
   let inRuns = 0;
   for (const row of population) {
