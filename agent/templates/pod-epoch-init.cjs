@@ -366,6 +366,55 @@ function createRuntime(options = {}) {
         mode = 'shared';
         closed = false;
       },
+      // Shared -> exclusive for the hibernation inventory (PRD #4208). Mirrors reacquireShared:
+      // there is deliberately no flock conversion, because a conversion could pass through an
+      // unlocked instant that a reclaiming peer observes as free. The descriptor is closed, the
+      // file reopened and exclusivity attempted once without waiting.
+      //   true  -> EX held (mode is 'exclusive').
+      //   false -> contended; shared ownership was re-taken (mode is still 'shared').
+      // A non-contention failure of the exclusive attempt re-takes SH and then rethrows. If SH
+      // itself cannot be re-taken the handle is closed and the call throws 'epoch shared
+      // ownership lost': the caller must treat that as fatal and exit, never continue lockless.
+      // While the gap is open `pending` makes every other operation throw, but `mode` keeps
+      // answering (the previous 'shared') so a concurrent reader never throws mid-transition.
+      async upgradeExclusive() {
+        requireUnscoped();
+        if (mode !== 'shared' || fd === undefined) throw new Error('shared epoch ownership required');
+        pending = true;
+        let failure;
+        let upgraded = false;
+        try {
+          io.closeSync(fd);
+          fd = undefined;
+          let next;
+          try {
+            next = open(names.epoch);
+            if (await lock(next, 'exclusive', 120000, signal, true)) {
+              heldIdentity = identity(verify(next, names.epoch));
+              fd = next;
+              mode = 'exclusive';
+              upgraded = true;
+              return true;
+            }
+          } catch (error) { failure = error; }
+          if (next !== undefined && !upgraded) {
+            try { io.closeSync(next); } catch (error) { failure ??= error; }
+          }
+          let shared;
+          try {
+            shared = open(names.epoch);
+            await lock(shared, 'shared', 120000, signal);
+            heldIdentity = identity(verify(shared, names.epoch));
+            fd = shared;
+          } catch (error) {
+            if (shared !== undefined) { try { io.closeSync(shared); } catch { /* already failing */ } }
+            closed = true;
+            throw new Error('epoch shared ownership lost: ' + (error?.message ?? error));
+          }
+          if (failure) throw failure;
+          return false;
+        } finally { pending = false; }
+      },
       close() {
         requireUnscoped();
         closed = true;

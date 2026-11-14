@@ -3,6 +3,7 @@ import type { Outbox, TerminalAuthenticationObservation } from "./outbox.js";
 import type { Logger } from "./log.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import { sleep } from "./util.js";
+import { asWriter } from "./hibernation-inventory.js";
 
 /** Diagnostic reconciliation owns no lease or recovery authority. Its only inventory is one
  * physical page; failed transports advance that page and retry on the next durable scan. */
@@ -102,7 +103,7 @@ export class TerminalRejectionCoordinator {
               }
               if (!this.supported() || signal.aborted) break;
               try {
-                await this.dispose(first.runId, first.generation!, workerId, group, signal);
+                await asWriter("terminal_rejections", () => this.dispose(first.runId, first.generation!, workerId, group, signal));
               } catch {
                 // Keep physical evidence on lock, filesystem, or transport failure.
               }

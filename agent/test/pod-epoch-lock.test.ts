@@ -821,3 +821,56 @@ test("single-uid runtime scratch is restored and bootstrap npm overrides do not 
   assert.equal(environment.npm_config_ignore_scripts, undefined);
   assert.equal(environment.TSX_DISABLE_CACHE, undefined);
 });
+
+test("upgradeExclusive takes EX when uncontended and keeps mode readable", async (t) => {
+  const f = fixture(t, { run: undefined }); // real util-linux flock
+  await f.runtime.seed(S);
+  const held = await f.runtime.acquire();
+  assert.equal(held.mode, "shared");
+  assert.ok(held.upgradeExclusive);
+  const pendingUpgrade = held.upgradeExclusive();
+  assert.equal(held.mode, "shared", "a concurrent mode reader never throws mid-transition");
+  assert.equal(await pendingUpgrade, true);
+  assert.equal(held.mode, "exclusive");
+  assert.ok(held.beginReclaim, "exclusive ownership can open a reclaim scope");
+  await assert.rejects(held.upgradeExclusive(), /shared epoch ownership required/);
+  await held.reacquireShared();
+  assert.equal(held.mode, "shared");
+  held.close();
+});
+
+test("upgradeExclusive fails and keeps SH while another descriptor holds shared", async (t) => {
+  const f = fixture(t, { run: undefined });
+  await f.runtime.seed(S);
+  const held = await f.runtime.acquire();
+  const peer = await f.runtime.acquire();
+  assert.equal(await held.upgradeExclusive!(), false);
+  assert.equal(held.mode, "shared");
+  // Shared is genuinely held again: a third party cannot take EX.
+  peer.close();
+  const third = await f.runtime.acquire({ firstMode: "exclusive" });
+  assert.equal(third.mode, "shared", "EX stays unavailable while the upgrade's SH is held");
+  third.close();
+  // And the handle is still usable: it can upgrade once the peers are gone.
+  assert.equal(await held.upgradeExclusive!(), true);
+  held.close();
+});
+
+test("upgradeExclusive restores SH and rethrows a non-contention failure; lost SH closes the handle", async (t) => {
+  let mode: "fail" | "busy" | "ok" = "ok";
+  const f = fixture(t, { run: async (args) => {
+    if (args[0] === "--version") return version;
+    if (mode === "fail" && args[0] === "-x") return { code: 1, output: "" };
+    if (mode === "busy" && args[0] === "-x") return { code: 200, output: "" };
+    if (mode === "busy" && args[0] === "-s") return { code: 1, output: "" };
+    return { code: 0, output: "" };
+  } });
+  await f.runtime.seed(S);
+  const held = await f.runtime.acquire();
+  mode = "fail";
+  await assert.rejects(held.upgradeExclusive!(), /flock failed: 1/);
+  assert.equal(held.mode, "shared");
+  mode = "busy";
+  await assert.rejects(held.upgradeExclusive!(), /shared ownership lost/);
+  assert.throws(() => held.mode, /closed/);
+});

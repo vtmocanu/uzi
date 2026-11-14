@@ -38,6 +38,7 @@ import type { DescribeLocalRecordsResult, OperatorRequestSignals, ResolveLocalRe
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "../protocol.js";
 import { RUN_TERMINAL_STATUSES } from "../recovery-settlement.js";
 import { errMessage, sleep as realSleep } from "../util.js";
+import { hibernationWriters } from "../hibernation-inventory.js";
 
 /** Protocol constants. The self-contained client (retained-source.mjs) duplicates them on purpose
  *  (it imports nothing from the worker); retained-source-client-packaging.test.ts asserts they agree. */
@@ -447,7 +448,10 @@ export class RetainedSourceServer {
   ): Promise<{ ok: boolean; op: "resolve-local-record"; result: ResolveLocalRecordResult }> {
     const now = this.deps.now ?? Date.now;
     const sleep = this.deps.sleep ?? ((ms: number) => realSleep(ms));
-    if (gate.heldBy("terminal_maintenance")) return this.resolveRefusal("worker_not_idle");
+    if (gate.heldBy("terminal_maintenance") || gate.heldBy("hibernation")) return this.resolveRefusal("worker_not_idle");
+    // PRD #4208: a latched worker (hibernation inventory) refuses, like any other busy refusal.
+    const writer = hibernationWriters.enter("retained_ops");
+    if (!writer) return this.resolveRefusal("worker_not_idle");
     gate.close("retained_ops");
     // The gate reopens only after the coordinator call returned (settled), never on a deadline or a
     // client disconnect: the coordinator's own deadline is cooperative and it owns the work until then.
@@ -476,6 +480,7 @@ export class RetainedSourceServer {
       return { ok: result.kind === "retired", op: "resolve-local-record", result };
     } finally {
       gate.open("retained_ops");
+      writer();
     }
   }
 
@@ -616,7 +621,9 @@ export class RetainedSourceServer {
     const sleep = this.deps.sleep ?? ((ms: number) => realSleep(ms));
     // 2. Close the claim gate. From here until the finally, only `retained_ops` is ours to reopen.
     // Never alongside the #3031 terminal producer's writer exclusion.
-    if (gate.heldBy("terminal_maintenance")) return this.refusal("worker_not_idle");
+    if (gate.heldBy("terminal_maintenance") || gate.heldBy("hibernation")) return this.refusal("worker_not_idle");
+    const writer = hibernationWriters.enter("retained_ops");
+    if (!writer) return this.refusal("worker_not_idle");
     gate.close("retained_ops");
     try {
       // 3. Wait for in-flight claims to drain (a claim stays counted until its run is in the active set).
@@ -675,6 +682,7 @@ export class RetainedSourceServer {
     } finally {
       // 8. The boundary was released by withRetainedSourceBoundary; reopen only our own gate owner.
       gate.open("retained_ops");
+      writer();
     }
   }
 

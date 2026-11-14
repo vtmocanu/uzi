@@ -16,6 +16,13 @@ export interface PodEpochOwnership {
   matchesEntry(current: string, previous: string): boolean;
   /** Admission stays closed until this resolves; closes EX before opening SH. */
   reacquireShared(): Promise<void>;
+  /**
+   * Shared -> exclusive, for the hibernation inventory. Resolves true holding EX, or false with
+   * shared ownership re-taken when contended; a non-contention failure re-takes SH and rethrows.
+   * Throws 'epoch shared ownership lost' (and closes the handle) only when SH could not be
+   * re-taken: the caller must exit. Absent on legacy implementations.
+   */
+  upgradeExclusive?(): Promise<boolean>;
   close(): void;
 }
 

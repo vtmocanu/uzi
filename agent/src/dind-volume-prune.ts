@@ -54,6 +54,7 @@ import {
 import type { Config } from "./config.js";
 import type { Logger } from "./log.js";
 import { errMessage, sleep as abortableSleep } from "./util.js";
+import { asWriter } from "./hibernation-inventory.js";
 
 /** The server-version query is cheap; a hung daemon must not hold the attempt long. */
 const VERSION_TIMEOUT_MS = 30_000;
@@ -233,7 +234,7 @@ export class DindVolumePruneController {
   async loop(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
-        await this.tick(signal);
+        await asWriter("dind_volume_prune", () => this.tick(signal));
       } catch (err) {
         try {
           this.log.warn("dind-volume-prune: evaluation failed", { error: boundedText(errMessage(err)) });

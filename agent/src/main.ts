@@ -8,6 +8,9 @@ import { establishProcessBoundary } from "./restore-boundary.js";
 import { AuthorityRuntime } from "./authority-runtime.js";
 import { createLogger, type Logger } from "./log.js";
 import { startMainWatchdog } from "./main-watchdog.js";
+import {
+  hibernationWriters, HibernationInventoryController, notImplementedCensus, notImplementedFingerprint,
+} from "./hibernation-inventory.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { WorkerClient, RequestError } from "./client.js";
@@ -428,6 +431,8 @@ async function mainBody(): Promise<void> {
   // protected startup access. Runtime shutdown hooks are installed once built.
   const controller = new AbortController();
   let shutdownRuntime: (() => void) | undefined;
+  // PRD #4208: the hibernation inventory controller (DinD lane with epoch participation only).
+  let hibernation: HibernationInventoryController | undefined;
   // issue #4066: the shutdown budget starts at the FIRST signal, or at barrier entry when no signal came; a repeated
   // signal resets nothing. The observer is
   // armed with a lazily bound snapshot: the authority runtime (and the git cache) may not exist yet at an early signal.
@@ -1095,6 +1100,30 @@ async function mainBody(): Promise<void> {
     isIdle: () => worker?.isIdle() ?? false,
   });
   notifyRetained = () => { void retainedSource.reportRetained(); };
+  // PRD #4208 M1: the hibernation inventory participates only where an exclusion mechanism is
+  // proven: the DinD lane (Docker wired, not the isolated lane) holding the pod-epoch lock in a
+  // supported mode. Its presence is what advertises `hibernation_inventory_v1`. The census and the
+  // fingerprint are the volume census seam: until it lands the census can never be complete.
+  if (config.dockerWiring.dockerHost !== undefined && !(config.fetcherUrl && config.fetcherCaFile) &&
+      epochOwnership && epochOwnership.mode !== "unsupported") {
+    hibernation = new HibernationInventoryController({
+      registry: hibernationWriters,
+      gate: dindGate,
+      client,
+      ownership: epochOwnership,
+      laneSupported: true,
+      podUid: () => process.env.UZI_POD_UID,
+      isIdle: () => worker?.isIdle() ?? false,
+      proof: () => terminalMaintenanceProof(3, config.dockerWiring.dockerHost),
+      census: notImplementedCensus,
+      recomputeFingerprint: notImplementedFingerprint,
+      fatalExit: (reason) => {
+        log.error("uzi-agent exiting", { cause: reason, phase: lifecyclePhase, exit_code: 1 });
+        process.exit(1);
+      },
+      log,
+    });
+  }
   worker = new Worker(
     config,
     client,
@@ -1122,11 +1151,14 @@ async function mainBody(): Promise<void> {
     dindGate,
     retainedSource,
     memory,
+    undefined,
+    hibernation,
   );
 
   // Preserve shutdown ordering: revoke memory, initiate run-lane drain, then
   // abort loops. The early signal handler also cancels startup lock waits.
   shutdownRuntime = () => {
+    hibernation?.stop();
     if (shutdownDeadlineAt !== undefined) authority.beginShutdown(shutdownDeadlineAt);
     void worker.shutdownMemory();
     runner.shutdown();
@@ -1214,6 +1246,20 @@ async function mainBody(): Promise<void> {
   lifecyclePhase = "worker";
   await worker.run(controller.signal);
   const gate = await finishShutdown();
+  // PRD #4208: only now, after every other shutdown writer has joined (run lanes, outbox,
+  // recoveries, the shutdown barrier), recompute the content fingerprint and report the held
+  // exclusion. Bounded well inside the 40 s termination grace: the barrier's own deadline is 35 s
+  // from the first signal, so skip when under 3 s of it remain, and otherwise cap at 15 s.
+  if (hibernation) {
+    const left = shutdownDeadlineAt === undefined ? 15_000 : Math.min(15_000, shutdownDeadlineAt + 3_000 - Date.now());
+    if (left >= 3_000) {
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        hibernation.finalizeAtShutdown(),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, left); }),
+      ]).finally(() => clearTimeout(timer));
+    }
+  }
   lifecyclePhase = "stopped";
   log.info("uzi-agent stopped", {
     cause: shutdownSignal ? "signal" : "worker_returned",

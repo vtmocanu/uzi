@@ -23,6 +23,13 @@ import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { DindMeterSample } from "./dind-meter.js";
+import {
+  decodeHibernationInventory,
+  type ExclusionFinalRequest,
+  type HibernationExclusionReport,
+  type HibernationInventoryBody,
+  type HibernationInventoryMember,
+} from "./hibernation-inventory.js";
 import { isHarnessEffort } from "./harness.js";
 import type { Logger } from "./log.js";
 import type { ResidueQuarantineState } from "./residue-quarantine.js";
@@ -1620,6 +1627,32 @@ export class WorkerClient {
   private registrationReport: Omit<NonNullable<HeartbeatRequest["protocol_refresh"]>, "register_nonce"> | undefined;
 
   private latestDindMaintenanceValue: DindMaintenance | null | undefined;
+  private latestHibernationInventoryValue: HibernationInventoryMember | null | undefined;
+
+  /** Latest heartbeat's `hibernation_inventory` (PRD #4208): null = none, undefined = unknown or malformed. */
+  get latestHibernationInventory(): HibernationInventoryMember | null | undefined {
+    return this.latestHibernationInventoryValue;
+  }
+
+  /** The current registration's nonce (the original register response), or undefined before register. */
+  currentRegisterNonce(): string | undefined {
+    return this.registerNonce;
+  }
+
+  /** PRD #4208: report the inventory, or one of its refusal statuses. Needs `hibernation_inventory_v1`. */
+  async postHibernationInventory(body: HibernationInventoryBody, signal?: AbortSignal): Promise<void> {
+    if (!this.hasFeature("hibernation_inventory_v1")) throw new Error("hibernation inventory feature unavailable");
+    await this.postJSON(`${WORKER_API_PREFIX}/hibernation/inventory`, body, this.httpTimeoutMs, signal, 64 * 1024);
+  }
+
+  /** PRD #4208: the shutdown-time exclusion proof. A short bounded post; the caller sends nothing on failure. */
+  async postHibernationExclusionFinal(
+    body: ExclusionFinalRequest, opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+  ): Promise<void> {
+    if (!this.hasFeature("hibernation_inventory_v1")) throw new Error("hibernation inventory feature unavailable");
+    await this.postJSON(`${WORKER_API_PREFIX}/hibernation/exclusion-final`, body,
+      opts.timeoutMs ?? this.httpTimeoutMs, opts.signal, 64 * 1024);
+  }
 
   /** Latest heartbeat observation: null means known none; undefined means unknown. */
   get latestDindMaintenance(): DindMaintenance | null | undefined {
@@ -2001,6 +2034,7 @@ export class WorkerClient {
     for (const owned of this.codexAdmission.values()) owned.reporter.seal();
     this.revokeMemoryAuthority();
     this.latestDindMaintenanceValue = undefined;
+    this.latestHibernationInventoryValue = undefined;
   }
 
   /** Drop ONE negotiated feature (PRD #1733), where {@link clearFeatures} drops the whole set:
@@ -2023,9 +2057,11 @@ export class WorkerClient {
     maintenance?: { sample?: DindMeterSample | null; ack?: DindMaintenanceReadyACK },
     quarantine?: ResidueQuarantineState,
     outboxRootUnusable?: "symlink" | "unreadable",
+    hibernationExclusion?: HibernationExclusionReport,
   ): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
-    const body: HeartbeatRequest = { version: this.version };
+    this.latestHibernationInventoryValue = undefined;
+    const body: HeartbeatRequest & { hibernation_exclusion?: HibernationExclusionReport } = { version: this.version };
     if (this.hasFeature("heartbeat_outbox_root_unusable")) body.outbox_root_unusable = outboxRootUnusable ?? null;
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
@@ -2056,6 +2092,9 @@ export class WorkerClient {
         body.dind_maintenance_ready_ack = { ...maintenance.ack, register_nonce: this.registerNonce };
       }
     }
+    // PRD #4208: the writer-exclusion report rides only when negotiated and the controller has one.
+    const includeHibernation = this.hasFeature("hibernation_inventory_v1") && hibernationExclusion !== undefined;
+    if (includeHibernation) body.hibernation_exclusion = { op_id: hibernationExclusion.op_id, held: hibernationExclusion.held };
     // issue #2213: the residue quarantine latch rides the heartbeat ONLY while latched and ONLY when
     // the api advertised `worker_residue_quarantine`, so an older api sees a byte-identical wire.
     const includeQuarantine = this.hasFeature("worker_residue_quarantine") && quarantine !== undefined;
@@ -2079,7 +2118,8 @@ export class WorkerClient {
       };
     }
     const includeExtension = body.protocol_refresh !== undefined || includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
-      body.dind_maintenance_ready_ack !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined;
+      body.dind_maintenance_ready_ack !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined ||
+      includeHibernation;
     try {
       try {
         return await this.postHeartbeat(body);
@@ -2135,6 +2175,7 @@ export class WorkerClient {
    */
   private async postHeartbeat(body: HeartbeatRequest, applyAdverts = true): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
+    this.latestHibernationInventoryValue = undefined;
     const path = `${WORKER_API_PREFIX}/heartbeat`;
     const res = await this.fetchRaw("POST", path, body);
     if (!res.ok) throw await this.toError("POST", path, res);
@@ -2167,6 +2208,11 @@ export class WorkerClient {
     if (this.hasFeature("dind_maintenance_v1")) {
       this.latestDindMaintenanceValue = decodeDindMaintenance(
         (decoded as { dind_maintenance?: unknown }).dind_maintenance,
+      );
+    }
+    if (this.hasFeature("hibernation_inventory_v1")) {
+      this.latestHibernationInventoryValue = decodeHibernationInventory(
+        (decoded as { hibernation_inventory?: unknown }).hibernation_inventory,
       );
     }
     const worker = (decoded as { worker?: unknown }).worker;
