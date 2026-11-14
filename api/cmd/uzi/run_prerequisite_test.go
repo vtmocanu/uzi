@@ -72,7 +72,7 @@ func TestPrerequisiteSharedCases(t *testing.T) {
 			env := Env{Stdout: &out, Stderr: &stderr}
 			// Closed/completed holds retain all capture metadata too.
 			holds := []apitypes.RecoveryCustodyHoldDTO{{ID: "hold-1", State: "released"}}
-			if err := renderRunRecovery(env, &globalFlags{}, recoveryHeldRunID, holds, summary.Archives, nil); err != nil {
+			if err := renderRunRecovery(env, &globalFlags{}, recoveryHeldRunID, holds, summary.Archives, nil, false, false); err != nil {
 				t.Fatal(err)
 			}
 			fc := &uzicli.FakeClient{RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: holds}, RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{recoveryHeldRunID: summary}}
@@ -170,7 +170,7 @@ func TestPrerequisiteRecoveryJSONPreservesMetadata(t *testing.T) {
 	var out, stderr bytes.Buffer
 	env := Env{Stdout: &out, Stderr: &stderr}
 	holds := []apitypes.RecoveryCustodyHoldDTO{{ID: "h", State: "released"}, {ID: "empty", State: "discarded"}}
-	if err := renderRunRecovery(env, &globalFlags{json: true}, recoveryHeldRunID, holds, []apitypes.RecoveryArchiveDTO{a, b, {ID: "foreign", HoldID: "other"}}, nil); err != nil {
+	if err := renderRunRecovery(env, &globalFlags{json: true}, recoveryHeldRunID, holds, []apitypes.RecoveryArchiveDTO{a, b, {ID: "foreign", HoldID: "other"}}, nil, false, false); err != nil {
 		t.Fatal(err)
 	}
 	start := strings.Index(out.String(), "\"captures\":")

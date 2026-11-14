@@ -34,6 +34,9 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   "HOME",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
+  // The CLI's extra CA bundle (UZI_CLI_CA_FILE below). Worker-set; a provisioned var must
+  // never point the CLI's TLS trust at a file of its choosing.
+  "NODE_EXTRA_CA_CERTS",
   // Not a credential — the mandatory browser launch flag (see the base env below).
   // provision.ts's allowlist does not emit AGENT_BROWSER_ARGS today, so this is not a
   // live conflict; protecting it keeps the --no-sandbox guarantee durable against
@@ -171,6 +174,11 @@ export function buildSdkEnv(
   // Issue #3907: browser discovery points at the uzi-chromium wrapper, set AFTER the fold
   // (and protected above) so a provisioned var can neither redirect nor drop it.
   Object.assign(env, BROWSER_DISCOVERY_ENV);
+  // The operator's extra CA (UZI_CLI_CA_FILE, set by the controller only when
+  // workers.extraCA is configured and the uid split is off) reaches the CLI, so a
+  // private-CA host it calls (an Anthropic-compatible gateway) verifies. A path to public
+  // CA material, not a secret. Set AFTER the fold (and protected above).
+  if (process.env.UZI_CLI_CA_FILE) env.NODE_EXTRA_CA_CERTS = process.env.UZI_CLI_CA_FILE;
   // issue #1783 (R2): the attempt marker, set AFTER the fold (and protected above) so a
   // provisioned var can neither forge nor clear it. Absent attempt ⇒ no key at all.
   if (attempt) {

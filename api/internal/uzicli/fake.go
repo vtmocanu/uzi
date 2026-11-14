@@ -740,6 +740,20 @@ type FakeClient struct {
 	DiscardHoldCalls    []DiscardHoldCall
 	DiscardHoldErr      error
 
+	// Admin run debug (issue #4198). RecoveryHoldsScopedResult/Err back RecoveryHoldsScoped and
+	// RecoveryHoldsScopedCalls records each selector; AdminRunsDebugResult/Err back
+	// AdminListRunsDebug and AdminListRunsDebugCalls records each filter pair;
+	// RunInputsAdminDebug[id]=true makes RunInputsMeta report the admin_debug_read marker and
+	// RunInputsMetaCalls counts calls.
+	RecoveryHoldsScopedResult apitypes.RecoveryCustodyHoldsDTO
+	RecoveryHoldsScopedErr    error
+	RecoveryHoldsScopedCalls  []RecoveryHoldsScopedCall
+	AdminRunsDebugResult      apitypes.AdminRunsDebugDTO
+	AdminRunsDebugErr         error
+	AdminListRunsDebugCalls   []AdminListRunsDebugCall
+	RunInputsAdminDebug       map[string]bool
+	RunInputsMetaCalls        int
+
 	// Owner held-publication list + early expiry (issue #2545). HeldPublicationsResult backs
 	// HeldPublications and HeldExpireResult backs ExpireHeldPublications; HeldErr wins over the
 	// blanket Err. HeldExpireCalls records each run id expired IN ORDER, so a CLI test proves NO
@@ -769,6 +783,18 @@ type LabelCall struct {
 }
 
 var _ Client = (*FakeClient)(nil)
+
+// RecoveryHoldsScopedCall is one RecoveryHoldsScoped selector.
+type RecoveryHoldsScopedCall struct {
+	UserID string
+	RunID  string
+}
+
+// AdminListRunsDebugCall is one AdminListRunsDebug filter pair.
+type AdminListRunsDebugCall struct {
+	UserID string
+	Since  string
+}
 
 // FindingIssueDraft records the evidence id and returns its canned draft, or a not-found exit
 // when FindingDrafts has no entry for it.

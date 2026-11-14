@@ -299,6 +299,30 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 /etc/uzi/ca
 {{- end -}}
 
+{{- define "uzi.controllerWorkerExtraCADir" -}}
+/etc/uzi/worker-extra-ca
+{{- end -}}
+
+{{- /*
+  uzi.workerExtraCAConfigMap: the ConfigMap holding workers.extraCA, or empty when no
+  extra CA is configured. Inline pem wins a chart-owned name; both set is refused.
+*/ -}}
+{{- define "uzi.workerExtraCAConfigMap" -}}
+{{- $ca := .Values.workers.extraCA | default dict -}}
+{{- $cm := $ca.configMap | default dict -}}
+{{- if and $ca.pem $cm.name -}}
+{{- fail "workers.extraCA: set pem OR configMap.name, not both" -}}
+{{- end -}}
+{{- if and (or $ca.pem $cm.name) (not .Values.api.tls.enabled) -}}
+{{- fail "workers.extraCA needs api.tls.enabled: the extra CA rides the bundle workers verify the api with" -}}
+{{- end -}}
+{{- if $ca.pem -}}
+{{- printf "%s-worker-extra-ca" (include "uzi.fullname" .) -}}
+{{- else if $cm.name -}}
+{{- $cm.name -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "uzi.controllerFetcherCADir" -}}
 /etc/uzi/fetcher-ca
 {{- end -}}
@@ -952,7 +976,7 @@ true
   = true.
 */ -}}
 {{- define "uzi.apiConfigMapEnabled" -}}
-{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs (.Values.issueTracker).allowedBaseURLs .Values.releaseCheck (include "uzi.apiHostingEnabled" .) (include "uzi.dbStorageCapacityBytes" .)) -}}
+{{- if and .Values.api.enabled (or .Values.api.config .Values.forge.allowedBaseURLs (.Values.issueTracker).allowedBaseURLs (.Values.api.adminRunDebug).enabled .Values.releaseCheck (include "uzi.apiHostingEnabled" .) (include "uzi.dbStorageCapacityBytes" .)) -}}
 true
 {{- end -}}
 {{- end -}}

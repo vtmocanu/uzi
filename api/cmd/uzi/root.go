@@ -214,10 +214,16 @@ type globalFlags struct {
 // Main builds the command tree, runs it, prints any error to stderr, and maps
 // the result to a process exit code.
 func Main(env Env, args []string) int {
+	return mainContext(context.Background(), env, args)
+}
+
+// mainContext is Main with an explicit command context, so a test can cancel a running command
+// and still read the error line Main prints.
+func mainContext(ctx context.Context, env Env, args []string) int {
 	env.Args = args
 	root := newRootCmd(env)
 	root.SetArgs(args)
-	err := root.Execute()
+	err := root.ExecuteContext(ctx)
 	if err != nil {
 		// CellText, and this one line covers more untrusted text than any other in the
 		// CLI (#180): statusError folds the server's {"error": "..."} body verbatim into

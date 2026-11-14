@@ -1025,6 +1025,9 @@ jobs:
       - name: Render and assert workloadLabels and workloadAnnotations
         # Offline (strips the CNPG subchart); unset, set, owned-label, non-string and reserved-key refusals.
         run: task render:workload-metadata-check
+      - name: Render and assert workers.extraCA
+        # Offline (strips the CNPG subchart); default, inline pem, existing ConfigMap, both refused.
+        run: task render:extra-ca-check
       - name: Docker-tier fail-guards
         run: |
           # (1) docker on + NetworkPolicy off + no acknowledge -> MUST refuse to render.

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -48,15 +49,45 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
+	var runsAll bool
+	var runsUser, runsSince string
 	runs := &cobra.Command{
 		Use:   "runs",
-		Short: "List active runs across the factory (newest 500)",
-		Long:  "List the newest 500 non-terminal runs across all users, excluding chat, judge, and cross-check runs.",
-		Args:  cobra.NoArgs,
+		Short: "List active runs across the factory (newest 500), or every run with --all",
+		Long: "List the newest 500 non-terminal runs across all users, excluding chat, judge, and cross-check runs.\n\n" +
+			"--all lists runs of every status instead (admin run debug, read-only, audited), newest first, " +
+			"capped at 500: narrow with --user <uuid> (one owner) and --since <RFC3339> (created at or after). " +
+			"It needs the server flag UZI_ADMIN_RUN_DEBUG and an admin_ro (uza_) token. --json then emits " +
+			"the {runs, truncated} envelope.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Flag presence, not value, decides: an explicitly empty --user or --since (e.g. an
+			// unset shell variable) is a usage error, never a silent widening to all owners.
+			userSet, sinceSet := cmd.Flags().Changed("user"), cmd.Flags().Changed("since")
+			if !runsAll {
+				if userSet || sinceSet {
+					return uzicli.Exitf(uzicli.ExitUsage, "--user and --since need --all")
+				}
+			} else {
+				if userSet {
+					id, err := uuid.Parse(runsUser)
+					if err != nil {
+						return uzicli.Exitf(uzicli.ExitUsage, "invalid --user %q: a user UUID is required", cellText(runsUser))
+					}
+					runsUser = id.String()
+				}
+				if sinceSet {
+					if _, err := time.Parse(time.RFC3339, runsSince); err != nil {
+						return uzicli.Exitf(uzicli.ExitUsage, "invalid --since %q: an RFC3339 time such as 2026-01-02T15:04:05Z is required", cellText(runsSince))
+					}
+				}
+			}
 			c, err := env.client(gf)
 			if err != nil {
 				return err
+			}
+			if runsAll {
+				return runAdminRunsAll(cmd, env, gf, c, runsUser, runsSince)
 			}
 			rs, err := c.AdminListRuns(cmd.Context())
 			if err != nil {
@@ -66,13 +97,12 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(rs)
 			}
-			rows := make([][]string, 0, len(rs))
-			for _, r := range rs {
-				rows = append(rows, []string{r.ID, strOr(r.OwnerEmail, "-"), r.Kind, r.TriggerSource, runStatusCell(r), runTitle(r.RunDTO)})
-			}
-			return p.Table([]string{"ID", "OWNER", "KIND", "TRIGGER", "STATUS", "TITLE"}, rows)
+			return renderAdminRunRows(p, rs)
 		},
 	}
+	runs.Flags().BoolVar(&runsAll, "all", false, "list runs of every status (admin run debug; needs UZI_ADMIN_RUN_DEBUG on the server)")
+	runs.Flags().StringVar(&runsUser, "user", "", "with --all: only this owner's runs (user UUID)")
+	runs.Flags().StringVar(&runsSince, "since", "", "with --all: only runs created at or after this RFC3339 time")
 
 	workers := &cobra.Command{
 		Use:   "workers",
@@ -1082,4 +1112,41 @@ func tsCell(t *time.Time) string {
 		return "-"
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+// renderAdminRunRows prints the admin runs table shared by the active listing and --all.
+func renderAdminRunRows(p *uzicli.Printer, rs []apitypes.RunListItemDTO) error {
+	rows := make([][]string, 0, len(rs))
+	for _, r := range rs {
+		rows = append(rows, []string{r.ID, strOr(r.OwnerEmail, "-"), r.Kind, r.TriggerSource, runStatusCell(r), runTitle(r.RunDTO)})
+	}
+	return p.Table([]string{"ID", "OWNER", "KIND", "TRIGGER", "STATUS", "TITLE"}, rows)
+}
+
+// adminRunsTruncatedNote is the stderr line printed when --all hit the server's row cap.
+const adminRunsTruncatedNote = "note: showing the newest 500 runs; narrow with --user or --since"
+
+// runAdminRunsAll is `uzi admin runs --all`: the admin run debug listing. A refused read (403
+// without the flag or token) keeps the server's message in the returned error and adds the
+// prerequisites hint on stderr.
+func runAdminRunsAll(cmd *cobra.Command, env Env, gf *globalFlags, c uzicli.Client, userID, since string) error {
+	out, err := c.AdminListRunsDebug(cmd.Context(), userID, since)
+	if err != nil {
+		return hintOnForeignReadRefusal(env, err)
+	}
+	p := env.printer(gf)
+	if out.Runs == nil {
+		out.Runs = []apitypes.RunSummaryItemDTO{}
+	}
+	if out.Truncated {
+		_, _ = fmt.Fprintln(env.Stderr, adminRunsTruncatedNote)
+	}
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(out)
+	}
+	rs := make([]apitypes.RunListItemDTO, 0, len(out.Runs))
+	for _, s := range out.Runs {
+		rs = append(rs, s.ListItem())
+	}
+	return renderAdminRunRows(p, rs)
 }
