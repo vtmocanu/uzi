@@ -92,6 +92,8 @@ export interface CodexAppServerAuthSession {
   drainInterceptedRequests(): Promise<void>;
   /** Synchronously suspend new exchanges. Overlapping leases are refused. */
   suspendRefreshAdmission(): CodexAuthSuspensionLease;
+  /** After root reap proof, close admission without cancelling shared refresh and join all owners. */
+  settleReapedAuth(): Promise<void>;
   /** Permanently close auth admission and cancel an active refresh. Drain separately,
    *  after the owner closes transport and rejects any pending startup RPC. */
   closeAdmissionAndCancel(): void;
@@ -262,6 +264,19 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
         this.wakeAdmissionWaiters();
       },
     };
+  }
+
+  async settleReapedAuth(): Promise<void> {
+    this.interceptedClosed = true;
+    this.wakeAdmissionWaiters();
+    // Startup may itself add raw bridge ownership. Join it before the final owner
+    // drain. Closure wakes queued callbacks to refuse rather than start exchanges.
+    await Promise.allSettled([this.startup]);
+    // Admission is permanently closed; only already-started owners can remain.
+    // Failures do not skip sibling owners, and raw bridges retain actual settlement.
+    while (this.interceptedTasks.size > 0 || this.exchangeTasks.size > 0) {
+      await Promise.allSettled([...this.interceptedTasks, ...this.exchangeTasks]);
+    }
   }
 
   private wakeAdmissionWaiters(): void {

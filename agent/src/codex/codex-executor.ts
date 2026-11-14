@@ -3975,7 +3975,7 @@ export class CodexExecutor implements Executor {
         const alreadyReaped = reapedSinceLastPersist;
         const assertReaped = (): void => {
           if (!reapedSinceLastPersist || !["closed", "disposed"].includes(captured.registry.state()) ||
-              captured.registry.isPoisoned() || captured.registry.hasUnreapedBoundaryRoot() ||
+              captured.registry.isPoisoned() || !captured.registry.allRegisteredRootsReaped() ||
               captured.registry.pendingLaunchCount() !== 0 || captured.registry.inFlightCallbackCount() !== 0)
             throw new TrustedExecutionRefusal("Codex reaped boundary cleanup unproven");
         };
@@ -4002,7 +4002,7 @@ export class CodexExecutor implements Executor {
         // Each admitted producer retains ownership until it settles. An error does
         // not detach siblings; bounds are rechecked after their complete join.
         const drained = await Promise.allSettled([
-          refresh?.drain(), settleInstall(),
+          alreadyReaped ? captured.harness.settleReapedAuth() : refresh?.drain(), settleInstall(),
           ...[...intentFlights, ...planFlights].map(flight => flight.done),
         ]);
         current();

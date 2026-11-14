@@ -139,6 +139,37 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 }
 
 describe("Codex auth reversible suspension", () => {
+  it("settles reaped auth without cancelling shared refresh or releasing queued exchanges", async () => {
+    const entered = deferred<void>();
+    const raw = deferred<ServerVerifiedCodexAuthTokens>();
+    let sends = 0;
+    let signal: AbortSignal | undefined;
+    const auth = subscription({ refresh: request => {
+      sends++;
+      signal = request.signal;
+      entered.resolve();
+      return raw.promise;
+    } });
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    transport.emitServerRequest(refreshRequest(1));
+    await entered.promise;
+    const lease = auth.suspendRefreshAdmission();
+    transport.emitServerRequest(refreshRequest(2));
+    let settled = false;
+    const settlement = auth.settleReapedAuth().then(() => { settled = true; });
+    await Promise.resolve();
+    assert.equal(settled, false);
+    assert.equal(signal?.aborted, false);
+    assert.equal(sends, 1);
+    raw.resolve(REFRESHED);
+    await settlement;
+    lease.resume();
+    lease.resume();
+    await assert.rejects(auth.handleServerRequest(transport, refreshRequest(3)), /admission is closed/);
+    assert.equal(sends, 1);
+  });
+
   it("reports poison after draining a failed in-flight bridge without changing stale resume", async () => {
     const entered = deferred<void>();
     const result = deferred<ServerVerifiedCodexAuthTokens>();
@@ -715,11 +746,17 @@ describe("Codex app-server auth: intercepted request ownership", () => {
     // The intercepted handler closes transport after observing the sticky poison.
     // That event is independent of the still-owned raw bridge promise.
     await poisoned.promise;
+    let reapedSettled = false;
+    const reapedSettlement = auth.settleReapedAuth().then(() => { reapedSettled = true; });
+    await Promise.resolve();
+    assert.equal(reapedSettled, false, "reaped auth still owns the raw bridge after wrapper cancellation");
     assert.equal(drained, false, "raw bridge still owns drain after cancellation grace");
     assert.equal(leaseDrained, false, "lease drain retains raw ownership after handler cancellation grace");
     raw.resolve(REFRESHED);
     await checked;
     await leaseDrain;
+    await reapedSettlement;
+    assert.equal(reapedSettled, true);
     assert.equal(leaseDrained, true, "lease drain resolves only after raw settlement");
     await assert.rejects(auth.drainInterceptedRequests(), /did not settle after cancellation/);
   });

@@ -314,6 +314,11 @@ export class ExecutionRegistry {
     return this.roots.some(record => record.root.kind === "boundary_action" && !record.reaped);
   }
 
+  /** Affirmative reap evidence for provider, command and boundary roots alike. */
+  allRegisteredRootsReaped(): boolean {
+    return this.roots.every(record => record.reaped);
+  }
+
   pendingLaunchCount(): number {
     return this.launches.size;
   }

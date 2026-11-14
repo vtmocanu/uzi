@@ -1289,6 +1289,11 @@ export class CodexHarness implements RunHarness {
     };
   }
 
+  /** Caller must first prove every registered root has reaped. */
+  async settleReapedAuth(): Promise<void> {
+    await this.appServerAuth?.settleReapedAuth();
+  }
+
   private async closeOwned(): Promise<void> {
     this.closed = true;
     this.turnClosed = true;

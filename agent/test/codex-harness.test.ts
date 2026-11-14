@@ -5146,6 +5146,7 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
       authenticate: async () => {},
       handleServerRequest: async () => false,
       suspendRefreshAdmission: () => { throw new Error("unexpected auth suspension"); },
+      settleReapedAuth: async () => {},
       drainInterceptedRequests: () => Promise.reject(boom),
       closeAdmissionAndCancel: () => {},
     };

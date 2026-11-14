@@ -30910,7 +30910,58 @@ describe("CodexExecutor: suspended A boundary", () => {
       await assert.rejects(exec.run(ctx), error => error === stop);
     });
   }
-  it("reopens a verified ordinary-reaped held epoch without overwriting the saved home", async () => {
+  it("refuses suspension while the provider reap is still pending", async () => {
+    let worked = false;
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", (t, th, tn) => {
+      if (worked) t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      else {
+        worked = true;
+        t.push(agentMessage("work", th)).push(turnCompleted("completed", th, tn));
+      }
+    }) });
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const reaping = new Promise<void>(resolve => { entered = resolve; });
+    const reap = rig.root.reap.bind(rig.root);
+    rig.root.reap = async ms => { entered(); await pending; return reap(ms); };
+
+    rig.deps = { ...rig.deps, sessionStore: { ...rig.deps.sessionStore!,
+      persist: async () => ({ files: 1, bytes: 20 }),
+      inspectSession: async () => "present",
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const bounds = { signal: new AbortController().signal, deadline: Date.now() + 60_000, guard() {} };
+    let checked = false;
+    const stop = new Error("pending reap refusal observed");
+    const { ctx } = makeCtx({ reportIteration: async () => ({ pauseRequested: worked && !checked }), parkForPause: async () => {
+      const boundary = exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      await reaping;
+      try {
+        await assert.rejects(exec.suspendCodexEpoch(bounds), error => error instanceof TrustedExecutionRefusal);
+      } finally { release(); await boundary; }
+      assert.equal(rig.providerLaunches(), 1, "refusal never starts another A root");
+      assert.ok(rig.reaped() > 0);
+      checked = true;
+      throw stop;
+    } });
+    await assert.rejects(exec.run(ctx), error => error === stop);
+    assert.equal(checked, true);
+    assert.equal(rig.providerLaunches(), 1);
+  });
+  it("reopens a verified ordinary-reaped held epoch without overwriting the saved home", async (t) => {
+    let authJoins = 0;
+    let releaseAuthJoin!: () => void;
+    let enteredAuthJoin!: () => void;
+    const blockedAuthJoin = new Promise<void>(resolve => { releaseAuthJoin = resolve; });
+    const authJoinEntered = new Promise<void>(resolve => { enteredAuthJoin = resolve; });
+    const settle = CodexHarness.prototype.settleReapedAuth;
+    t.mock.method(CodexHarness.prototype, "settleReapedAuth", async function(this: CodexHarness) {
+      authJoins++;
+      enteredAuthJoin();
+      await blockedAuthJoin;
+      return settle.call(this);
+    });
     let worked = false;
     const rig = makeRig({ responder: epochResponder("th-current", "tn-1", (t, th, tn) => {
       if (worked) t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
@@ -30934,7 +30985,18 @@ describe("CodexExecutor: suspended A boundary", () => {
       const internals = exec as unknown as { captureRevision: number };
       const revision = internals.captureRevision;
       assert.ok(rig.reaped() > 0);
-      const suspended = await exec.suspendCodexEpoch(bounds);
+      let suspensionReturned = false;
+      const suspending = exec.suspendCodexEpoch(bounds).then(value => { suspensionReturned = true; return value; });
+      let suspended!: Awaited<typeof suspending>;
+      await authJoinEntered;
+      try {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(suspensionReturned, false, "suspension must await the auth owner join");
+      } finally {
+        releaseAuthJoin();
+        suspended = await suspending;
+      }
+      assert.equal(authJoins, 1, "completed root reap must still join authentication ownership");
       assert.deepEqual(await suspended.persistRollout(bounds), { kind: "usable", sessionId: "th-current" });
       await suspended.reopenA(bounds);
       assert.equal(internals.captureRevision, revision);

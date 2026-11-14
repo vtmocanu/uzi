@@ -550,6 +550,7 @@ describe("CodexAdviceHarness: kind + a text advice pass", () => {
       authenticate: async () => {},
       handleServerRequest: async () => false,
       suspendRefreshAdmission: () => { throw new Error("unexpected auth suspension"); },
+      settleReapedAuth: async () => {},
       closeAdmissionAndCancel: () => {},
       drainInterceptedRequests: async () => {
         drains += 1;
@@ -898,6 +899,7 @@ describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
         authenticate: async () => {},
         handleServerRequest: async () => false,
       suspendRefreshAdmission: () => { throw new Error("unexpected auth suspension"); },
+      settleReapedAuth: async () => {},
         closeAdmissionAndCancel() { steps.push("cancel"); throw new Error("cancel failed"); },
         drainInterceptedRequests: async () => {
           if (++drains === 1) return;
@@ -929,6 +931,7 @@ describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
       authenticate: async () => {},
       handleServerRequest: async () => false,
       suspendRefreshAdmission: () => { throw new Error("unexpected auth suspension"); },
+      settleReapedAuth: async () => {},
       drainInterceptedRequests: async () => { throw new Error("auth drain failed"); },
       closeAdmissionAndCancel() {},
     };
@@ -946,6 +949,7 @@ describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
       authenticate: async () => {},
       handleServerRequest: async () => false,
       suspendRefreshAdmission: () => { throw new Error("unexpected auth suspension"); },
+      settleReapedAuth: async () => {},
       drainInterceptedRequests: async () => {
         drains += 1;
         if (drains > 1) throw new Error("cleanup drain failed");
@@ -968,6 +972,7 @@ describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
       authenticate: async () => {},
       handleServerRequest: async () => false,
       suspendRefreshAdmission: () => { throw new Error("unexpected auth suspension"); },
+      settleReapedAuth: async () => {},
       drainInterceptedRequests: async () => { throw new Error("cleanup drain failed"); },
       closeAdmissionAndCancel() {},
     };
