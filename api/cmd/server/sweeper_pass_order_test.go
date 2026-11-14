@@ -48,3 +48,24 @@ func TestHibernationWakePassRunsBeforeEphemeralProvision(t *testing.T) {
 		t.Fatal("worker_hibernation_wake must be listed BEFORE ephemeral_workers_provision (PRD #4205 M5)")
 	}
 }
+
+// TestHibernationAutoPassRunsBetweenSettleAndWake pins issue #4207: the automatic hibernation pass
+// must be listed after worker_hibernation_settle (a wake settled this tick has stamped its grace
+// anchor) and before worker_hibernation_wake. A source-order scan of the inline pass slice in
+// main.go, like its siblings above.
+func TestHibernationAutoPassRunsBetweenSettleAndWake(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(src)
+	settle := strings.Index(text, `Name: "worker_hibernation_settle"`)
+	auto := strings.Index(text, `Name: "worker_hibernation_auto"`)
+	wake := strings.Index(text, `Name: "worker_hibernation_wake"`)
+	if settle < 0 || auto < 0 || wake < 0 {
+		t.Fatalf("pass names not found in main.go (settle %d, auto %d, wake %d); update this test if they were renamed", settle, auto, wake)
+	}
+	if !(settle < auto && auto < wake) {
+		t.Fatal("worker_hibernation_auto must be listed after worker_hibernation_settle and before worker_hibernation_wake (issue #4207)")
+	}
+}

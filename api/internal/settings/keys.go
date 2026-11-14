@@ -90,6 +90,12 @@ const (
 	// Worker hibernation (PRD #4205): a bool ("true"/"false"). Off by default, so the
 	// feature is a strict no-op on a fresh instance and on upgrade.
 	KeyWorkerHibernationEnabled = "worker_hibernation_enabled"
+	// Automatic hibernation of idle workers (issue #4207): a bool, off by default. It only
+	// acts while worker_hibernation_enabled is also on.
+	KeyWorkerHibernationAuto = "worker_hibernation_auto"
+	// How long a worker must have no run activity before the automatic pass hibernates it: a
+	// Go duration in [1h, 2160h], default 14 days.
+	KeyWorkerHibernationIdleAfter = "worker_hibernation_idle_after"
 	// Run-health detector keys (PRD #47). health_enabled is a bool ("true"/"false");
 	// the seconds thresholds are integer seconds validated as {0} ∪ [60, 86400] — 0
 	// disables that one signal, and the upper bound stops a fat-fingered value silently
@@ -362,6 +368,9 @@ const (
 	DefaultEphemeralWorkersEnabled = "false"
 	// PRD #4205: hibernation is opt-in.
 	DefaultWorkerHibernationEnabled = "false"
+	// Issue #4207: automatic hibernation is opt-in, after 14 days idle.
+	DefaultWorkerHibernationAuto      = "false"
+	DefaultWorkerHibernationIdleAfter = "336h"
 	// PRD #69. Judge enforcement is OFF by default: the per-user opt-in gate stands
 	// until an admin flips this on, so the feature is a strict no-op on upgrade.
 	DefaultJudgeEnforceAll = "false"
@@ -530,8 +539,10 @@ var Defaults = map[string]string{
 	KeyGithubProjectSyncEnabled: DefaultGithubProjectSyncEnabled,
 	// PRD #529 M2 ephemeral worker auto-provisioning kill-switch. Same no-seeded-row
 	// pattern as the judge keys: an absent row synthesizes to the default (off).
-	KeyEphemeralWorkersEnabled:  DefaultEphemeralWorkersEnabled,
-	KeyWorkerHibernationEnabled: DefaultWorkerHibernationEnabled,
+	KeyEphemeralWorkersEnabled:    DefaultEphemeralWorkersEnabled,
+	KeyWorkerHibernationEnabled:   DefaultWorkerHibernationEnabled,
+	KeyWorkerHibernationAuto:      DefaultWorkerHibernationAuto,
+	KeyWorkerHibernationIdleAfter: DefaultWorkerHibernationIdleAfter,
 	// PRD #362 Decision 8 run-summary model. Same no-seeded-row pattern as the judge
 	// keys: an absent row synthesizes to DefaultSummaryModel ("haiku"), so All/AdminView
 	// surface it to the settings page on every instance and no migration seeds it.

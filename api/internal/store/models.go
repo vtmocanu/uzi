@@ -2074,6 +2074,10 @@ type Worker struct {
 	CleanupCancelRequested     bool               `json:"cleanup_cancel_requested"`
 	CleanupReconcileSeq        int32              `json:"cleanup_reconcile_seq"`
 	CleanupReconciledAt        pgtype.Timestamptz `json:"cleanup_reconciled_at"`
+	LastWakeSettledAt          pgtype.Timestamptz `json:"last_wake_settled_at"`
+	HibernationBlockedReason   pgtype.Text        `json:"hibernation_blocked_reason"`
+	HibernationBlockedAt       pgtype.Timestamptz `json:"hibernation_blocked_at"`
+	HibernationBlockedSince    pgtype.Timestamptz `json:"hibernation_blocked_since"`
 }
 
 type WorkerActiveRun struct {

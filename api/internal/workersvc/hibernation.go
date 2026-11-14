@@ -112,6 +112,18 @@ type HibernationSettings interface {
 	WorkerHibernationEnabled(ctx context.Context) (bool, error)
 }
 
+// HibernationAutoSettings is the settings view of the automatic idle-worker pass (issue
+// #4207). *settings.Cache satisfies it.
+type HibernationAutoSettings interface {
+	HibernationSettings
+	WorkerHibernationAuto(ctx context.Context) (bool, error)
+	WorkerHibernationIdleAfter(ctx context.Context) (time.Duration, error)
+}
+
+// SetHibernationAutoSettings wires the automatic pass's settings reader. Call once at startup.
+// Without it HibernationAutoPass does nothing.
+func (s *Service) SetHibernationAutoSettings(r HibernationAutoSettings) { s.hibernationAuto = r }
+
 // SetHibernationSettings wires the settings reader. Call once at startup.
 func (s *Service) SetHibernationSettings(r HibernationSettings) { s.hibernationSettings = r }
 
@@ -147,6 +159,10 @@ func writeHibernation(ctx context.Context, q *store.Queries, w store.Worker) (st
 		CleanupCancelRequested:     w.CleanupCancelRequested,
 		CleanupReconcileSeq:        w.CleanupReconcileSeq,
 		CleanupReconciledAt:        w.CleanupReconciledAt,
+		LastWakeSettledAt:          w.LastWakeSettledAt,
+		HibernationBlockedReason:   w.HibernationBlockedReason,
+		HibernationBlockedAt:       w.HibernationBlockedAt,
+		HibernationBlockedSince:    w.HibernationBlockedSince,
 		ID:                         w.ID,
 	})
 }
@@ -211,6 +227,10 @@ func (s *Service) trySettle(w *store.Worker, now time.Time) bool {
 	if settled {
 		w.HibernationState = "none"
 		w.WakeError = pgtype.Text{}
+		// Grace anchor for automatic hibernation (issue #4207): a worker that just woke is not
+		// re-hibernated until it has been idle for the full threshold again. The blocked
+		// columns are left as they are.
+		w.LastWakeSettledAt = pgconv.Time(now)
 	}
 	return settled
 }
@@ -258,17 +278,7 @@ func (s *Service) HibernateWorker(ctx context.Context, actor HibernationActor, w
 		} else if code != "" {
 			return &HibernationRefusal{Code: code}
 		}
-		op := uuid.New()
-		w.HibernationState = "preparing"
-		w.HibernationOpID = hibernationUUID(op)
-		w.HibernationRequestedAt = pgconv.Time(now)
-		w.HibernatedAt = pgtype.Timestamptz{}
-		w.WakeRequestedAt = pgtype.Timestamptz{}
-		w.HibernationAdmissionPodUid = w.RegisteredPodUid
-		w.HibernationScalingDownAt = pgtype.Timestamptz{}
-		w.HibernationReason = pgtype.Text{}
-		clearWakeEvidence(&w)
-		issueCleanupAttempt(&w, now)
+		op := admitHibernation(&w, now, "")
 		row, err := writeHibernation(ctx, q, w)
 		if err != nil {
 			return err
@@ -280,6 +290,40 @@ func (s *Service) HibernateWorker(ctx context.Context, actor HibernationActor, w
 		})
 	})
 	return out, err
+}
+
+// admitHibernation applies the none -> preparing admission to a locked row that already passed
+// hibernateRefusal and returns the new op id. It is shared by the manual path (empty reason)
+// and the automatic pass (issue #4207), so both write the same hibernation and cleanup
+// columns; both clear the automatic pass's blocked columns, since the worker is no longer
+// blocked from hibernating.
+func admitHibernation(w *store.Worker, now time.Time, reason string) uuid.UUID {
+	op := uuid.New()
+	w.HibernationState = "preparing"
+	w.HibernationOpID = hibernationUUID(op)
+	w.HibernationRequestedAt = pgconv.Time(now)
+	w.HibernatedAt = pgtype.Timestamptz{}
+	w.WakeRequestedAt = pgtype.Timestamptz{}
+	w.HibernationAdmissionPodUid = w.RegisteredPodUid
+	w.HibernationScalingDownAt = pgtype.Timestamptz{}
+	w.HibernationReason = pgconv.TextOrNull(reason)
+	w.HibernationBlockedReason = pgtype.Text{}
+	w.HibernationBlockedAt = pgtype.Timestamptz{}
+	w.HibernationBlockedSince = pgtype.Timestamptz{}
+	clearWakeEvidence(w)
+	issueCleanupAttempt(w, now)
+	return op
+}
+
+// noteHibernationBlocked records reason as the worker's automatic-hibernation blocker: the
+// sighting time is now, and the since time restarts only when the reason changes. It mirrors
+// SetWorkerHibernationBlocked for a row that is written whole by writeHibernation.
+func noteHibernationBlocked(w *store.Worker, reason string, now time.Time) {
+	if !w.HibernationBlockedReason.Valid || w.HibernationBlockedReason.String != reason || !w.HibernationBlockedSince.Valid {
+		w.HibernationBlockedSince = pgconv.Time(now)
+	}
+	w.HibernationBlockedReason = pgconv.TextOrNull(reason)
+	w.HibernationBlockedAt = pgconv.Time(now)
 }
 
 func actorLabel(a HibernationActor) string {
@@ -502,6 +546,11 @@ func (s *Service) ApplyTransition(ctx context.Context, workerID uuid.UUID, t Hib
 				// Positively refused before any patch: restore none directly.
 				w.HibernationState = "none"
 				w.HibernationReason = pgconv.TextOrNull(t.Reason)
+				// Issue #4207: the controller declined the hibernation. Record it so the
+				// automatic pass backs off for HibernationAutoRefusalCooldown instead of
+				// asking again every minute. The after-scale-down branch below wakes the
+				// worker and needs no marker: its settle stamps the grace anchor.
+				noteHibernationBlocked(&w, BlockedControllerRefused, now)
 			} else {
 				moveToWaking(&w, now, t.Reason)
 			}

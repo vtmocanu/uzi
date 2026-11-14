@@ -421,6 +421,9 @@ var inventoryQueryFiles = []string{
 	"intake_pause.sql",
 	// Issue #4007 slice A — the terminal preservation store
 	"terminal_preservation.sql",
+	// Issue #4207 — automatic hibernation of idle workers (its own file: the rest of
+	// hibernation.sql is not inventoried)
+	"hibernation_auto.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -1141,6 +1144,12 @@ var queryInventory = []queryPin{
 	{"GetTerminalRetireBlocker", "terminal_preservation.sql", "TestTerminalSweepRetireLiveDB",
 		"../workersvc: the independent protections re-checked under the run lock; asserts each keeps the ref and " +
 			"writes its typed reason"},
+	{"GetWorkerIdleness", "hibernation_auto.sql", "TestHibernationAutoIdlenessLiveDB",
+		"issue #4207; reached through svc.HibernationAutoPass (../workersvc); the test asserts the count and anchor for every run kind and status, including a run that finished just now"},
+	{"ListAutoHibernationCandidates", "hibernation_auto.sql", "TestHibernationAutoCandidateOrderingLiveDB",
+		"issue #4207; reached through svc.HibernationAutoPass (../workersvc); the test asserts a pile of recently blocked workers cannot starve a clean one"},
+	{"SetWorkerHibernationBlocked", "hibernation_auto.sql", "TestHibernationAutoRefusalRecordedLiveDB",
+		"issue #4207; reached through svc.HibernationAutoPass (../workersvc); the test asserts the recorded reason, the since-on-change rule and the clear on admission"},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)
