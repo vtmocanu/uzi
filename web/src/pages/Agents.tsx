@@ -10,6 +10,7 @@ import { useAuth } from "../auth/AuthContext";
 import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
+import { agentCountModel, isShadowedTemplate, sharedTemplateNames } from "../lib/agentCounts";
 import {
   isLeadTemplateName,
   provenanceBadgeKind,
@@ -68,10 +69,13 @@ export function Agents() {
   // claim drops it (shared precedence, PRD #18 M7), so it never reaches a run even
   // when toggled on. Surface it so the toggle isn't silently a no-op — the fix is
   // to rename. Shared names are always visible, so this set is exact.
-  const sharedNames = useMemo(
-    () => new Set(templates.filter((t) => t.scope !== "user").map((t) => t.name)),
-    [templates],
+  const sharedNames = useMemo(() => sharedTemplateNames(templates), [templates]);
+
+  const counts = useMemo(
+    () => agentCountModel(allocations, templates, { isAdmin, viewerId: user?.id ?? "" }),
+    [allocations, templates, isAdmin, user?.id],
   );
+  const scopeSummary = counts.byScope.map((s) => `${s.total} ${s.label.toLowerCase()}`).join(" · ");
 
   // Replace-set writes: the PUT fully replaces the half it carries, so each
   // toggle recomputes the whole set from current state and changes just one entry.
@@ -116,11 +120,37 @@ export function Agents() {
         title="Agents"
         description={
           <>
-            Agent templates render to Claude Code subagent files. Toggle which ride your runs
+            Agent templates define the lead and the subagents your runs use. Toggle which ride your runs
             {isAdmin
               ? "; admins publish globals and set the defaults everyone starts from."
               : "; author your own private agents anytime."}{" "}
             See the <DocLink slug={DOC_AGENT_TEMPLATES}>agent templates</DocLink> guide.
+            {!loading && !loadError && (
+              <span data-testid="agents-summary" className="mt-2 flex flex-wrap gap-x-2 gap-y-1 text-sm text-muted">
+                <b className="font-semibold text-fg">
+                  {counts.total} {counts.total === 1 ? "agent" : "agents"}
+                </b>
+                <SummarySep />
+                <span>
+                  <b className="font-semibold text-fg">{counts.inRuns}</b>{" "}
+                  {counts.inRuns === 1 ? "rides" : "ride"} your runs
+                </span>
+                {scopeSummary && (
+                  <>
+                    <SummarySep />
+                    <span>{scopeSummary}</span>
+                  </>
+                )}
+                {counts.globalDefaults !== undefined && (
+                  <>
+                    <SummarySep />
+                    <span>
+                      {counts.globalDefaults} global {counts.globalDefaults === 1 ? "default" : "defaults"}
+                    </span>
+                  </>
+                )}
+              </span>
+            )}
           </>
         }
         actions={
@@ -166,7 +196,7 @@ export function Agents() {
                       template={t}
                       alloc={allocById.get(t.id)}
                       isAdmin={isAdmin}
-                      shadowed={t.scope === "user" && sharedNames.has(t.name)}
+                      shadowed={isShadowedTemplate(t, sharedNames)}
                       busy={busy}
                       onToggleMine={setMyOverride}
                       onToggleGlobal={setGlobalDefault}
@@ -180,6 +210,11 @@ export function Agents() {
       )}
     </div>
   );
+}
+
+// The summary line's separator: real text, so the line reads "4 agents · 2 ride your runs".
+function SummarySep() {
+  return <span className="text-faint"> · </span>;
 }
 
 function AgentRow({
