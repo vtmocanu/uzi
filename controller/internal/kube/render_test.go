@@ -1023,6 +1023,74 @@ func TestSecretCarriesTheTokenAndRelaysTheCA(t *testing.T) {
 	}
 }
 
+// An operator's extra CA is appended to the api's CA in the same Secret entry, never
+// replacing it: Node reads ONE NODE_EXTRA_CA_CERTS file, so a worker that got only the
+// extra CA could no longer verify the api it claims runs from.
+func TestSecretAppendsTheExtraCAAfterTheAPICA(t *testing.T) {
+	api := "-----BEGIN CERTIFICATE-----\napi-ca\n-----END CERTIFICATE-----"
+	extra := "-----BEGIN CERTIFICATE-----\nextra-ca\n-----END CERTIFICATE-----\n"
+	cfg := testConfig()
+	cfg.APICAPEM, cfg.ExtraCAPEM = []byte(api), []byte(extra)
+	if got := string(RenderSecret(cfg, desired("abc"), "uzw_t").Data["ca.crt"]); got != api+"\n"+extra {
+		t.Fatalf("ca.crt = %q, want the api CA then the extra CA", got)
+	}
+
+	// Extra CA alone (api TLS off): it is the whole bundle and NODE_EXTRA_CA_CERTS points at it.
+	only := testConfig()
+	only.ExtraCAPEM = []byte(extra)
+	if got := string(RenderSecret(only, desired("abc"), "uzw_t").Data["ca.crt"]); got != extra {
+		t.Fatalf("ca.crt = %q, want the extra CA alone", got)
+	}
+	var found string
+	for _, e := range RenderDeployment(only, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "NODE_EXTRA_CA_CERTS" {
+			found = e.Value
+		}
+	}
+	if found != "/run/secrets/ca.crt" {
+		t.Errorf("NODE_EXTRA_CA_CERTS = %q with only an extra CA, want the relayed bundle's path", found)
+	}
+}
+
+// The Claude CLI gets the bundle (UZI_CLI_CA_FILE) only when an extra CA exists and the uid
+// split is off: the CLI never dials the api, and under the split it runs as a uid that
+// cannot read the Secret file.
+func TestCLICAFileOnlyWithAnExtraCAAndNoUIDSplit(t *testing.T) {
+	cliCA := func(cfg RenderConfig) string {
+		for _, e := range RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Containers[0].Env {
+			if e.Name == "UZI_CLI_CA_FILE" {
+				return e.Value
+			}
+		}
+		return ""
+	}
+	cfg := testConfig()
+	cfg.APICAPEM = []byte("api")
+	if got := cliCA(cfg); got != "" {
+		t.Errorf("api CA only: UZI_CLI_CA_FILE = %q, want unset", got)
+	}
+	cfg.ExtraCAPEM = []byte("extra")
+	if got := cliCA(cfg); got != "/run/secrets/ca.crt" {
+		t.Errorf("extra CA: UZI_CLI_CA_FILE = %q, want the bundle path", got)
+	}
+	cfg.UIDSplit = true
+	if got := cliCA(cfg); got != "" {
+		t.Errorf("uid split: UZI_CLI_CA_FILE = %q, want unset", got)
+	}
+}
+
+// An isolated lane worker never takes the uid split (its CLI runs as the worker uid and can
+// read the Secret file), so workers.uidSplit must not withhold the CLI's extra CA from it.
+func TestCLICAFileOnIsolatedLaneEvenWithUIDSplit(t *testing.T) {
+	cfg := laneTestConfig()
+	cfg.APICAPEM = []byte("api")
+	cfg.ExtraCAPEM = []byte("extra")
+	cfg.UIDSplit = true
+	if got := envMap(laneWorkerContainer(t, cfg, desiredIsolated("abc")))["UZI_CLI_CA_FILE"]; got != "/run/secrets/ca.crt" {
+		t.Errorf("isolated lane + uid split: UZI_CLI_CA_FILE = %q, want the bundle path", got)
+	}
+}
+
 func TestWorkerEnvDefaultsToSingleRunCap(t *testing.T) {
 	// testConfig() leaves MaxConcurrentRuns at its zero value, which must still render
 	// "1" — the default cap, so any RenderConfig{} built in a test keeps working. The

@@ -1,0 +1,18 @@
+{{- $extra := .Values.workers.extraCA | default dict }}
+{{- if and .Values.workers.enabled .Values.workers.controller.enabled $extra.pem }}
+{{- /*
+  workers.extraCA.pem: the inline extra CA bundle the controller relays to hosted
+  workers after the api's CA (see values.yaml). Release namespace, read by the
+  controller pod only.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "uzi.workerExtraCAConfigMap" . }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+data:
+  ca.crt: |
+    {{- $extra.pem | nindent 4 }}
+{{- end }}

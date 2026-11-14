@@ -470,6 +470,33 @@ workers:
   # and supplies a pre-created api.tls.secretName. It exists so that deviation is
   # VISIBLE in the values file that chose it, instead of being an inherited default.
   allowPlaintextAPI: false
+  # An extra CA bundle every hosted worker trusts ON TOP of the api's own CA, for
+  # private-CA hosts the worker's Node process and the Claude Code CLI call over HTTPS:
+  # an Anthropic-compatible LLM gateway, or a self-hosted GitHub Enterprise / GitLab /
+  # Forgejo API. The controller appends it to the api CA in each worker's Secret. It does
+  # not change git's or the toolchain's OpenSSL trust, so a private-CA forge still fails
+  # at git clone. Needs api.tls.enabled. Under workers.uidSplit the CLI runs as another
+  # uid that cannot read the Secret, so it covers the worker process only (isolated-lane
+  # workers never take the split, so their CLI still gets it).
+  # Workers verify the api with the same bundle, so the extra CA is ALSO trusted for the
+  # worker-to-api connection, not only for outbound hosts: a broad corporate root here
+  # can vouch for the api too. Prefer the narrowest CA that covers your hosts.
+  # Set ONE of the two:
+  #   pem: the bundle inline; the chart writes it into a ConfigMap.
+  #   configMap: an existing ConfigMap in the RELEASE namespace (e.g. a trust-manager
+  #     Bundle target), by name and key.
+  # Like the api CA, it is written into a worker's Secret when the worker is created:
+  # adding or changing it reaches new workers, so reprovision existing ones. The
+  # controller reads it at boot; an inline pem change restarts the controller, an edit
+  # to an existing ConfigMap needs a controller restart. Without workers.uidSplit,
+  # turning it on also adds UZI_CLI_CA_FILE to the worker pod template, which can start
+  # paced worker rolls; a roll does not rewrite an existing worker's Secret, so
+  # reprovisioning is still what delivers the CA to it.
+  extraCA:
+    pem: ""
+    configMap:
+      name: ""
+      key: ca.crt
   # The DEDICATED namespace, which must contain NOTHING but hosted workers. A Role
   # that can create pods in a namespace can mount any Secret and impersonate any
   # ServiceAccount in it — RBAC cannot scope `create` by label — so this namespace's
