@@ -1,6 +1,7 @@
 // Claude advice query construction and terminal metadata. model-pass.ts owns the
 // existing timeout, ephemeral HOME lifecycle and text-returning compatibility API.
 
+import { claudeSdkSettings } from "./sdk-plugin-policy.js";
 import type { HookInput, HookJSONOutput, Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import { spawnDetached } from "./sdk-spawn.js";
 import { buildSdkEnv } from "./sdk-env.js";
@@ -234,6 +235,7 @@ export class ClaudeAdviceHarness implements AdviceHarness {
       // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
       // mentions and dispatches a leading slash command before any PreToolUse hook runs.
       verbatimPrompts: true,
+      settings: claudeSdkSettings(),
       systemPrompt: request.systemPrompt,
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
