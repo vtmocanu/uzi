@@ -106,6 +106,7 @@ import * as m2Runner from "./runner-harness.js";
 import { followSuccessfulPush as m2FollowPush } from "./publication-fixture.js";
 import { shutdownContentProof } from "./shutdown-3101-content-fixture.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
+import { makeTickDriver, writeStallShim, type StallMode } from "./stall-gitleaks-shim.js";
 import { closingDirectiveFor as m2ClosingDirective } from "../src/pr-description.js";
 import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
@@ -30719,4 +30720,211 @@ it("policy initial planning refuses a backlog that could exclude the latest Resu
     assert.equal(rig.transport.turnStartCount, 0, "do not plan from a prefix that may omit the latest correction");
     assert.deepEqual(included, [], "overflow is never acknowledged as model inclusion");
   }
+});
+
+// ── issue #4258 — the scoped mid-run seam under the real CodexExecutor ───────────────────────────
+//
+// A real CodexExecutor (fake provider transport) inside a real RunRunner. A tick arms the mid-run
+// trigger, then the executor's first work-turn boundary runs the REAL seam: against a stalled gitleaks
+// child a cancel or a worker shutdown must return it promptly (proceed), kill the child, and leave the
+// executor on its own stop route with no provider turn and no rewrite guidance. The remediate control
+// proves the same scope opens and returns the guidance under Codex.
+describe("issue #4258 real CodexExecutor + RunRunner over the scoped seam", { skip: NEEDS_PROCFS }, () => {
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+  const GUIDANCE = /not published yet, so publication of your work is withheld/;
+  const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const groupAlive = (pid: number): boolean => { try { process.kill(-pid, 0); return true; } catch { return false; } };
+  const killAll = (pids: number[]): void => {
+    for (const pid of pids) for (const t of [-pid, pid]) { try { process.kill(t, "SIGKILL"); } catch { /* gone */ } }
+  };
+  const bounded = <T>(p: Promise<T>, ms: number, label: string): Promise<T> => withTimeout(p, ms, label);
+  const waitUntil = async (pred: () => boolean, ms: number, label: string): Promise<void> => {
+    const end = Date.now() + ms;
+    while (!pred()) {
+      if (Date.now() > end) throw new Error(`${label} did not happen within ${ms}ms`);
+      await new Promise(r => setTimeout(r, 10));
+    }
+  };
+  // A multi-turn scripted provider: turn N pushes turns[N-1]'s frames, then completes.
+  const scriptTurns = (th: string, turns: Array<(th: string, tn: string) => CodexNotification[]>): Responder => (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "turn/start") {
+      const tn = `tn-${th}-${c.turnStartCount}`;
+      if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      for (const note of turns[Math.min(c.turnStartCount, turns.length) - 1]?.(th, tn) ?? []) c.transport.push(note);
+      c.transport.push(turnCompleted("completed", th, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  /** Every dispatched implementation turn's prompt (the plan turn runs in the first epoch). */
+  const turnTexts = (rig: MultiRig): string[] => rig.epochs.flatMap(e => e.transport.requests
+    .filter(r => r.method === "turn/start")
+    .map(r => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "")).slice(1);
+
+  type Scenario = { stage: "range" | "path"; stop: "cancel" | "shutdown" } | { stage: "remediate" };
+
+  async function harness(iid: number, sc: Scenario) {
+    const scratch = await fs.mkdtemp(path.resolve("../.uzi/scratch/4258-codex-"));
+    const stall = writeStallShim(scratch);
+    const drv = makeTickDriver({ scanDeadlineMs: 60_000 });
+    const api = new FakeApi("codex-4258");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const { logger, lines } = recordingLogger();
+    const client = new WorkerClient(url, "codex-4258", "test", logger, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+    client.protocolFeatures = ["run_checkpoint_durability"];
+    const tips: string[] = [];
+    client.publishCheckpoint = async (_run, tip, pack) => {
+      for await (const _chunk of pack) { /* drain */ }
+      tips.push(tip);
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/test" } };
+    };
+    const plan = (th: string, tn: string) => [toolCall(800, "submit_plan", { plan_md: "# Plan\n- do it",
+      milestones: [{ id: "m1", title: "Milestone 1" }] }, th, tn, "plan-1")];
+    const finish = (th: string, tn: string) => [signalDone(th, tn)];
+    const rig = makeMultiEpochRig([scriptTurns("th-1", [plan]), scriptTurns("th-1", [finish, finish, finish])]);
+    const launchEffect = rig.deps.launchEffectRoot!;
+    rig.deps = { ...rig.deps, boundaryDeadlineMs: 60_000,
+      launchEffectRoot: async (spec, deadline) => {
+        const handle = await launchEffect(spec, deadline);
+        const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+          ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+        if (argv[0] !== "/usr/bin/git" && argv[0] !== "/usr/local/bin/gitleaks") return handle;
+        const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+        const timer = setTimeout(() => child.kill(), deadline);
+        const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+          child.once("error", error => { clearTimeout(timer); reject(error); });
+          child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+        });
+        return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+          waitChild: async () => exited, dispose: async ms => { await exited; return handle.dispose(ms); } };
+      } };
+    const claim = makeClaim({
+      issue_iid: iid,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      auto_approve: true,
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+    });
+    const executor = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION), logger);
+    const decisions: SecretRemediationDecision[] = [];
+    const armed = (() => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; })();
+    let calls = 0;
+    const mode: StallMode = sc.stage === "range" ? "stall-git" : sc.stage === "path" ? "stall-stdin" : "pass";
+    const run = executor.run.bind(executor);
+    executor.run = async ctx => {
+      const orig = ctx.midRunSecretRemediation!;
+      ctx.midRunSecretRemediation = async () => {
+        // The first boundary: a committed secret and one tick arm the trigger, then the seam runs.
+        if (++calls === 1) {
+          const wt = ctx.worktreePath;
+          await fs.writeFile(path.join(wt, "cfg.env"), "TOKEN=" + "gh" + "p_" + randomUUID().replace(/-/g, "") + "abcd\n");
+          for (const args of [["add", "-A"], [...IDENT, "commit", "-m", "work cfg.env"]]) {
+            const r = spawnSync("/usr/bin/git", ["-C", wt, ...args], { encoding: "utf8" });
+            assert.equal(r.status, 0, r.stderr);
+          }
+          assert.equal(await bounded(drv.fire(), 20_000, "the arming tick"), "secret_found");
+          stall.setMode(mode);
+        }
+        armed.resolve();
+        const d = await orig();
+        decisions.push(d);
+        return d;
+      };
+      return run(ctx);
+    };
+    const git = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions({ gitleaksBin: stall.bin }));
+    const runner = new RunRunner(client, git, () => ({ executor, homeDir: path.join(fx.dataDir, "4258-home") }), logger, 20, undefined, {
+      pollMs: 5, recoveryRetryMs: 5, gitlab: fakeGitlab().gitlab, ...drv.options,
+      quiesceRun: async () => ({
+        process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+        docker: { state: "not_wired", removed: [], detail: "not wired" },
+      }),
+    });
+    let flight: { survivingTickGroups: unknown[]; secretRemediation?: { attempts: number; midRunTrigger?: unknown }; sinkGate: { isHeld(): boolean } } | undefined;
+    const internals = runner as unknown as { scanCheckpointForPublish: (f: never, ...rest: unknown[]) => Promise<unknown> };
+    const origScan = internals.scanCheckpointForPublish.bind(runner);
+    internals.scanCheckpointForPublish = (f, ...rest) => { flight = f; return origScan(f, ...rest); };
+    const stopRun = (): void => {
+      if (sc.stage === "remediate") return;
+      if (sc.stop === "cancel") api.appendInputs(claim.run_id, [{ id: 4258, kind: "cancel" }]);
+      else runner.shutdown();
+    };
+    const cleanup = async (execution?: Promise<unknown>): Promise<void> => {
+      try {
+        stall.setMode("pass");
+        killAll([...stall.pids(), ...drv.pids]);
+        runner.shutdown();
+        if (execution) await bounded(execution.catch(() => undefined), 20_000, "run cleanup");
+      } finally {
+        killAll([...stall.pids(), ...drv.pids]);
+        await api.close();
+        fx.cleanup();
+        await fs.rm(scratch, { recursive: true, force: true });
+      }
+    };
+    return { api, claim, runner, stall, decisions, armed, lines, rig, tips, stopRun, cleanup, flight: () => flight!, drv };
+  }
+
+  for (const stage of ["range", "path"] as const) {
+    for (const stop of ["cancel", "shutdown"] as const) {
+      it(`${stage} scan stalled, then ${stop}: the seam returns proceed, the child is gone and the run takes its stop route`, { timeout: 90_000 }, async () => {
+        const h = await harness(4258_300 + (stage === "range" ? 0 : 10) + (stop === "cancel" ? 0 : 1), { stage, stop });
+        let execution: Promise<unknown> | undefined;
+        try {
+          execution = h.runner.execute(h.claim);
+          const settled = execution.then(() => undefined, (e: unknown) => e);
+          await bounded(Promise.race([waitUntil(() => h.stall.pids().length > 0, 40_000, "the seam's scan child to stall"),
+            settled.then(e => { throw new Error("run ended before the seam stalled: " + String(e) + h.lines.map(l => JSON.stringify(l)).join("\n")); })]), 45_000, "stall");
+          const pids = h.stall.pids();
+          assert.equal(h.decisions.length, 0, "the seam is still waiting on the stalled scan");
+          const t0 = Date.now();
+          h.stopRun();
+          await bounded(settled, 20_000, "execute() settling after the stop");
+          assert.ok(Date.now() - t0 < 10_000, `the run settled ${Date.now() - t0}ms after the stop`);
+          assert.deepEqual(h.decisions, [{ action: "proceed" }]);
+          for (const pid of pids) {
+            assert.equal(alive(pid), false, `scan child ${pid} exited`);
+            assert.equal(groupAlive(pid), false, `scan child group ${pid} is gone`);
+          }
+          assert.deepEqual(h.flight().survivingTickGroups, []);
+          assert.ok(h.flight().secretRemediation?.midRunTrigger, "the trigger is kept");
+          assert.equal(h.flight().secretRemediation?.attempts, 0);
+          assert.equal(h.flight().sinkGate.isHeld(), false);
+          assert.deepEqual(turnTexts(h.rig), [], "no provider turn was dispatched, so no guidance was prompted");
+          assert.deepEqual(h.api.messages(h.claim.run_id).filter(m => m.kind === "status" && /returning to the lead/.test(String(m.payload.text))), []);
+          assert.ok(h.lines.some(l => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred" && (l as Record<string, unknown>).why === "aborted"));
+          const end = h.api.states.map(x => x.body).at(-1);
+          if (stop === "cancel") {
+            assert.equal(end?.status, "failed");
+            assert.equal(end?.failure_reason, "run cancelled", "the executor's cancel route");
+          } else {
+            assert.ok(!h.api.states.some(x => x.body.status === "failed" || x.body.status === "completed"), "a worker shutdown leaves the run non-terminal for recovery");
+          }
+        } finally {
+          await h.cleanup(execution);
+        }
+      });
+    }
+  }
+
+  it("control, no stop: the scope opens under Codex, the seam returns remediate and the next turn prompt carries the guidance", { timeout: 90_000 }, async () => {
+    const h = await harness(4258_330, { stage: "remediate" });
+    let execution: Promise<unknown> | undefined;
+    try {
+      execution = h.runner.execute(h.claim);
+      await bounded(execution.catch(() => undefined), 60_000, "the run ending");
+      assert.equal(h.decisions[0]?.action, "remediate");
+      const first = h.decisions[0]!;
+      if (first.action !== "remediate") return;
+      assert.match(first.followUp, GUIDANCE);
+      assert.match(first.followUp, /attempt 1 of 2/);
+      assert.equal(h.stall.pids().length, 0, "nothing stalled");
+      const texts = turnTexts(h.rig);
+      assert.match(texts[0] ?? "", GUIDANCE, "the guidance replaced the first turn's prompt");
+      assert.ok(h.lines.some(l => (l as Record<string, unknown>).msg === "mid-run checkpoint secret scan flagged commits above the checkpoint floor; returning to the lead"));
+    } finally {
+      await h.cleanup(execution);
+    }
+  });
 });

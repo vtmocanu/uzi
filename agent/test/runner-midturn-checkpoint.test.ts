@@ -10,7 +10,8 @@ import path from "node:path";
 import { PassThrough, type Readable } from "node:stream";
 import type { ExecutorFactory, RunnerOptions } from "../src/runner.js";
 import { RunRunner } from "../src/runner.js";
-import type { RunContext } from "../src/executor.js";
+import type { Executor, RunContext } from "../src/executor.js";
+import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { BoundaryPermit, BoundaryProcessRequest, CodexExecutionSafety } from "../src/harness.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import { codexRig } from "./runner-codex-sinks-fixture.js";
@@ -18,6 +19,7 @@ import { GitCache } from "../src/git.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { defaultGitleaksShim, shimCalls, writeGitleaksShim as writeShim } from "./gitleaks-shim.js";
+import { writeStallShim } from "./stall-gitleaks-shim.js";
 import { realProcfsSkip } from "./real-procfs.js";
 import { makeScratchRoot } from "./fixture-repo.js";
 import type { Logger } from "../src/log.js";
@@ -30,6 +32,8 @@ import {
   fx,
   gitlabClaim,
   installHarness,
+  assistant as sdkAssistant,
+  resultOk as sdkResultOk,
   isAlive,
 } from "./runner-harness.js";
 
@@ -4881,6 +4885,7 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
     ctx: RunContext;
     ctl: Ctl;
     g: GitCache;
+    runner: RunRunner;
     bare: string;
     flight: () => MFlight;
     state: () => RState;
@@ -4915,10 +4920,13 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
   async function rig(
     iid: number,
     body: (r: Rig) => Promise<void>,
-    opts: { executorTail?: boolean; seed?: (f: MFlight) => void; log?: Logger } = {},
+    opts: {
+      executorTail?: boolean; seed?: (f: MFlight) => void; log?: Logger;
+      gitleaksBin?: string; ctlHooks?: Parameters<typeof control>[0];
+    } = {},
   ): Promise<{ claimRunId: string; tips: string[]; violations: string[] }> {
-    const ctl = control();
-    const g = mkGit(fx.dataDir);
+    const ctl = control(opts.ctlHooks);
+    const g = mkGit(fx.dataDir, opts.gitleaksBin);
     const tips: string[] = [];
     const violations: string[] = [];
     const flagged: string[] = [];
@@ -4938,7 +4946,7 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
         run: async (ctx: RunContext) => {
           await recordingTurnErrors(async () => {
             const r: Rig = {
-              ctx, ctl, g, bare, tips, violations, flagged,
+              ctx, ctl, g, runner, bare, tips, violations, flagged,
               flight: () => { assert.ok(captured, "a checkpoint scan captured the flight"); return captured; },
               state: () => { assert.ok(captured?.secretRemediation, "remediation state exists"); return captured.secretRemediation; },
               tick: () => { ctl.advance(INTERVAL_MS + 1); return ctl.fire(); },
@@ -5412,4 +5420,260 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
       assert.notEqual(second.tip, first.tip);
     });
   });
+
+  // ── a stop (cancel / worker shutdown) bounds the seam by its owned process scope ──────────────
+  //
+  // The gitleaks stand-in STALLS like a real long-running child (no test-side release): the seam can
+  // only return promptly if the stop kills it. Scan deadline and stall are both far above the wait
+  // bound, so an unscoped seam fails these by a bounded timeout, never by hanging the suite.
+  describe("a stop aborts a stalled scan child and defers (aborted)", () => {
+    const WAIT_MS = 15_000;
+    const stallHooks = { scanDeadlineMs: 60_000 };
+    const gateHeld = (r: Rig): boolean => (r.flight().sinkGate as { isHeld(): boolean }).isHeld();
+    const stopRun = (r: Rig, stop: "cancel" | "shutdown"): void => {
+      if (stop === "cancel") api.setInputs(r.flight().runId as string, [{ id: 1, kind: "cancel" }]);
+      else r.runner.shutdown();
+    };
+
+    for (const stage of ["range", "path"] as const) {
+      for (const stop of ["cancel", "shutdown"] as const) {
+        it(`${stage} scan stalled, then ${stop}: resolves proceed promptly, child and group gone, trigger kept`, { timeout: 90_000 }, async () => {
+          const tmp = scratchDir(`4258-${stage}-${stop}`);
+          const stall = writeStallShim(tmp);
+          const { logger, lines } = recordingLogger();
+          const iid = 4258_100 + (stage === "range" ? 0 : 10) + (stop === "cancel" ? 0 : 1);
+          let elapsed = Infinity;
+          try {
+            const out = await rig(iid, async (r) => {
+              try {
+                await flagAndTick(r);
+                stall.setMode(stage === "range" ? "stall-git" : "stall-stdin");
+                const p = r.ctx.midRunSecretRemediation!();
+                let settled = false;
+                p.then(() => { settled = true; }, () => { settled = true; });
+                await bounded(Promise.resolve().then(() => waitFor(() => stall.pids().length > 0, WAIT_MS)), WAIT_MS + 1_000, "the scan child to stall", "stall");
+                const pids = stall.pids();
+                assert.ok(pids.every((pid) => isAlive(pid)), "the scan child is running");
+                assert.equal(settled, false, "the seam waits on the stalled scan");
+                const t0 = Date.now();
+                stopRun(r, stop);
+                const d = await bounded(p, WAIT_MS, "the seam resolving after the stop", "mid-run seam");
+                elapsed = Date.now() - t0;
+                assert.deepEqual(d, { action: "proceed" });
+                for (const pid of pids) {
+                  assert.equal(isAlive(pid), false, `scan child ${pid} exited`);
+                  assert.equal(groupAlive(pid), false, `scan child group ${pid} is gone`);
+                }
+                assert.deepEqual(r.flight().survivingTickGroups, []);
+                assert.ok(r.state().midRunTrigger, "the trigger is kept");
+                assert.equal(r.state().attempts, 0, "no attempt was spent");
+                assert.equal(gateHeld(r), false, "the sink gate was released");
+                untouched(r.state());
+              } finally {
+                stall.setMode("pass"); // the run's own finalize scan must not stall too
+                await killAndReap(stall.pids()).catch(() => undefined);
+              }
+            }, { gitleaksBin: stall.bin, ctlHooks: stallHooks, log: logger });
+            if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+            assert.ok(elapsed < 10_000, `the seam returned ${elapsed}ms after the stop`);
+            assert.ok(
+              lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred" && (l as Record<string, unknown>).why === "aborted"),
+              "the seam logged an aborted deferral",
+            );
+            assert.deepEqual(statusTexts(out.claimRunId).filter((t) => /returning to the lead/.test(t)), []);
+            assert.deepEqual(out.tips, [], "nothing was published");
+            assert.deepEqual(out.violations, []);
+            // The stub executor returns normally after the deferral, so the run ends at finalize with the
+            // flagged commit still reachable: the done contract, not a remediation turn.
+            assertPushSecretBlocked(out.claimRunId);
+          } finally {
+            await killAndReap(stall.pids()).catch(() => undefined);
+            fs.rmSync(tmp, { recursive: true, force: true });
+          }
+        });
+      }
+    }
+
+    it("a surviving process group keeps the seam open and the sink gate held until it is gone", { timeout: 90_000 }, async () => {
+      const tmp = scratchDir("4258-survivor");
+      const stall = writeStallShim(tmp);
+      const { logger, lines } = recordingLogger();
+      const selected = new Set<number>();
+      const kills: number[] = [];
+      let forceAlive = true;
+      let selecting = false; // only the seam's stalled scan child is modelled as a survivor, not the arming tick's
+      try {
+        await rig(4258_130, async (r) => {
+          try {
+            await flagAndTick(r);
+            stall.setMode("stall-git");
+            selecting = true;
+            const p = r.ctx.midRunSecretRemediation!();
+            let settled = false;
+            p.then(() => { settled = true; }, () => { settled = true; });
+            await waitFor(() => stall.pids().length > 0, WAIT_MS);
+            stopRun(r, "cancel");
+            // The real child dies; only the group probe is forced to keep reporting it alive.
+            await waitFor(() => lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation waiting for a surviving process group to exit"), 40_000);
+            const pgid = stall.pids()[0]!;
+            assert.equal(settled, false, "the seam has not returned while a group survives");
+            assert.equal(gateHeld(r), true, "the sink gate is still held");
+            assert.deepEqual((r.flight().survivingTickGroups as Array<{ pgid: number }>).map((g) => g.pgid), [pgid]);
+            const before = kills.length;
+            await waitFor(() => kills.length >= before + 1, WAIT_MS);
+            assert.equal(settled, false, "still waiting after another round of re-sent SIGKILL");
+            assert.equal(gateHeld(r), true, "the sink gate is still held after another round");
+            forceAlive = false;
+            const d = await bounded(p, WAIT_MS, "the seam returning once the group is gone", "mid-run seam");
+            assert.deepEqual(d, { action: "proceed" });
+            assert.deepEqual(r.flight().survivingTickGroups, []);
+            assert.ok(r.state().midRunTrigger, "the trigger is kept");
+            assert.equal(r.state().attempts, 0);
+            assert.equal(gateHeld(r), false, "the sink gate was released once the group was gone");
+          } finally {
+            forceAlive = false;
+            stall.setMode("pass");
+            await killAndReap(stall.pids()).catch(() => undefined);
+          }
+        }, {
+          gitleaksBin: stall.bin,
+          log: logger,
+          ctlHooks: {
+            ...stallHooks,
+            tickSpawn: {
+              groupAlive: (pid) => (forceAlive && selected.has(pid) ? true : undefined),
+              signalGroup: (pid, sig) => {
+                if (sig === "SIGKILL" && selected.has(pid)) kills.push(pid);
+                return undefined;
+              },
+              onSpawn: (pid, argv) => { if (selecting && argv[0] === stall.bin) selected.add(pid); },
+            },
+          },
+        });
+      } finally {
+        await killAndReap(stall.pids()).catch(() => undefined);
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+// ── issue #4258 — the scoped seam under the real Claude executor ──────────────────────────────────
+//
+// A real SdkExecutor (fake query function) inside a real RunRunner: turn 2 commits a secret and fires
+// a tick (the trigger arms); at the next boundary the real seam stalls on a gitleaks child and a cancel
+// or a worker shutdown arrives. The seam must return promptly, the executor must take its normal stop
+// route (no third turn, so no remediation guidance is ever prompted), and the child must be gone.
+describe("issue #4258 real SdkExecutor + RunRunner: a stop during the stalled seam", () => {
+  const sdkMsg = (content: unknown[]) => sdkAssistant(content);
+  for (const stage of ["range", "path"] as const) {
+    for (const stop of ["cancel", "shutdown"] as const) {
+      it(`${stage} scan stalled, then ${stop}: the run takes its normal stop route and the child is gone`, { timeout: 90_000 }, async () => {
+        const tmp = scratchDir(`4258-sdk-${stage}-${stop}`);
+        const stall = writeStallShim(tmp);
+        const ctl = control({ scanDeadlineMs: 60_000 });
+        const g = mkGit(fx.dataDir, stall.bin);
+        const claim = gitlabClaim(4258_200 + (stage === "range" ? 0 : 10) + (stop === "cancel" ? 0 : 1), { auto_approve: true });
+        const pub = stubPublish(async (_n, _tip, pack) => { await drain(pack); return LANDED; });
+        const prompts: string[] = [];
+        let turns = 0;
+        let ctxRef: RunContext | undefined;
+        const decisions: unknown[] = [];
+        let captured: Record<string, unknown> | undefined;
+        const queryFn: SdkQueryFn = (params) => {
+          const turn = ++turns;
+          return (async function* () {
+            let text = "";
+            for await (const m of params.prompt) text += JSON.stringify(m);
+            prompts.push(text);
+            if (turn === 1) {
+              yield sdkMsg([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: "# Plan\n- do it", milestones: [] } }]);
+              yield sdkResultOk();
+              return;
+            }
+            try {
+              if (turn === 2) {
+                const sha = commitIn(ctxRef!.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+                assert.ok(sha);
+                ctl.advance(INTERVAL_MS + 1);
+                assert.equal(await bounded(ctl.fire(), TEARDOWN_MS, "the arming tick"), "secret_found");
+                stall.setMode(stage === "range" ? "stall-git" : "stall-stdin");
+              }
+            } catch (e) {
+              turnErrors.push(e);
+              throw e;
+            }
+            yield sdkMsg([{ type: "text", text: "working" }]);
+            yield sdkResultOk();
+          })();
+        };
+        // The runner removes the agent home on teardown: keep it apart from the shim's directory.
+        const agentHome = fs.mkdtempSync(path.join(tmp, "home-"));
+        const sdk = new SdkExecutor(nullLogger(), agentHome, { queryFn });
+        const executor: Executor = {
+          run: async (ctx) => {
+            ctxRef = ctx;
+            const orig = ctx.midRunSecretRemediation!;
+            ctx.midRunSecretRemediation = async () => {
+              const d = await orig();
+              decisions.push(d);
+              return d;
+            };
+            return sdk.run(ctx);
+          },
+          closeAndSettlePlanSummary: (d) => sdk.closeAndSettlePlanSummary(d),
+          killAgentTree: () => sdk.killAgentTree(),
+          reapAttributedProcesses: () => sdk.reapAttributedProcesses(),
+        };
+        const { logger, lines } = recordingLogger();
+        const runner = mkRunner(g, () => ({ executor, homeDir: agentHome }), ctl, {}, logger);
+        const internals = runner as unknown as { scanCheckpointForPublish: (f: Record<string, unknown>, ...rest: unknown[]) => Promise<unknown> };
+        const origScan = internals.scanCheckpointForPublish.bind(runner);
+        internals.scanCheckpointForPublish = (f, ...rest) => { captured = f; return origScan(f, ...rest); };
+        let exec: Promise<unknown> | undefined;
+        try {
+          exec = runner.execute(claim);
+          const settled = exec.then(() => undefined, (e: unknown) => e);
+          await bounded(Promise.resolve().then(() => waitFor(() => stall.pids().length > 0, 30_000)), 31_000, "the seam's scan child to stall", "stall");
+          const pids = stall.pids();
+          // Earlier boundaries (trigger not armed yet) returned proceed at once; the stalled one has not.
+          const before = decisions.length;
+          assert.ok(decisions.every((d) => (d as { action: string }).action === "proceed"));
+          const t0 = Date.now();
+          if (stop === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+          else runner.shutdown();
+          await bounded(settled, 20_000, "execute() settling after the stop", "run");
+          const elapsed = Date.now() - t0;
+          if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+          assert.ok(elapsed < 10_000, `the run settled ${elapsed}ms after the stop`);
+          assert.equal(decisions.length, before + 1, "the stalled boundary's seam call resolved");
+          assert.deepEqual(decisions.at(-1), { action: "proceed" });
+          for (const pid of pids) {
+            assert.equal(isAlive(pid), false, `scan child ${pid} exited`);
+            assert.equal(groupAlive(pid), false, `scan child group ${pid} is gone`);
+          }
+          const flight = captured as { survivingTickGroups: unknown[]; secretRemediation?: { attempts: number; midRunTrigger?: unknown }; sinkGate: { isHeld(): boolean } };
+          assert.deepEqual(flight.survivingTickGroups, []);
+          assert.ok(flight.secretRemediation?.midRunTrigger, "the trigger is kept");
+          assert.equal(flight.secretRemediation?.attempts, 0);
+          assert.equal(flight.sinkGate.isHeld(), false);
+          assert.equal(turns, 2, "no provider turn was dispatched after the stalled boundary");
+          assert.ok(prompts.every((p) => !/not published yet|rewrite the commit|history rewrite/i.test(p)), "no remediation guidance was ever prompted");
+          assert.deepEqual(statusTexts(claim.run_id).filter((t) => /returning to the lead/.test(t)), []);
+          assert.ok(lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred" && (l as Record<string, unknown>).why === "aborted"));
+          const end = api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body).at(-1);
+          if (stop === "cancel") {
+            assert.equal(end?.status, "failed");
+            assert.equal(end?.failure_reason, "run cancelled", "the executor's cancel route");
+          } else {
+            assert.equal(finalStatus(claim.run_id), undefined, "a worker shutdown leaves the run non-terminal for recovery");
+          }
+        } finally {
+          stall.setMode("pass");
+          await killAndReap(stall.pids()).catch(() => undefined);
+          await settleAndClean({ ctl, runners: [runner], running: [exec], restore: pub.restore, paths: [tmp] });
+        }
+      });
+    }
+  }
 });
