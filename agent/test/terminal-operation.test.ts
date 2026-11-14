@@ -1,0 +1,571 @@
+import { afterEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import { RecoveryCoordinator } from "../src/recovery.js";
+import {
+  mergeTerminalRecord,
+  runTerminalOperation,
+  type TerminalDelta,
+  type TerminalManifest,
+  type TerminalOperationDeps,
+  type TerminalOperationRecord,
+  type TerminalOperationStore,
+  type PrepareOutcome,
+} from "../src/terminal-operation.js";
+import { serializeCheckpointRange } from "../src/terminal-range.js";
+import type { TerminalPreservationRequest } from "../src/protocol.js";
+import type { TerminalPreservationResult } from "../src/client.js";
+import { FakeRecoveryClient, FakeRecoveryGit } from "./codex-reap-fixture.js";
+import { nullLogger } from "./helpers.js";
+
+const RUN = "11111111-1111-4111-8111-111111111111";
+const TOKEN = "terminal-operation-test-worker-token-0123456789";
+const A = "a".repeat(40), B = "b".repeat(40), C = "c".repeat(40);
+const RANGE = serializeCheckpointRange({ tipSha: A, excludeSha: B });
+const MANIFEST: TerminalManifest = {
+  run_id: RUN, generation: 1, worker_id: "w1",
+  roots: [{ source_id: "s1", attempt_id: "at1", commit: A, tree: B }], abandoned: [],
+};
+
+const roots: string[] = [];
+afterEach(() => { for (const r of roots.splice(0)) fs.rmSync(r, { recursive: true, force: true }); });
+
+function mkRoot(): string {
+  const r = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-tp-op-"));
+  roots.push(r);
+  return r;
+}
+
+class SpyGit extends FakeRecoveryGit {
+  calls: string[] = [];
+}
+function spyOnAll<T extends object>(target: T, sink: string[]): T {
+  return new Proxy(target, {
+    get(t, prop, recv) {
+      const v = Reflect.get(t, prop, recv);
+      if (typeof v === "function") return (...args: unknown[]) => { sink.push(String(prop)); return (v as (...a: unknown[]) => unknown).apply(t, args); };
+      return v;
+    },
+  });
+}
+
+function mkCoord(root: string, on = true, spy?: string[]): RecoveryCoordinator {
+  const git = spy ? spyOnAll(new SpyGit(), spy) : new FakeRecoveryGit();
+  const client = spy ? spyOnAll(new FakeRecoveryClient(), spy) : new FakeRecoveryClient();
+  return new RecoveryCoordinator({
+    client, git, log: nullLogger(), recoveryRoot: path.join(root, "recovery"), workerToken: TOKEN,
+    ...(on ? { terminalPreservationTestOverride: {} } : {}),
+  });
+}
+
+const tpDir = (root: string, run = RUN) => path.join(root, "terminal-preservation", run);
+const recFile = (root: string, gen = 1) => path.join(tpDir(root), `g${gen}.json`);
+
+function rec(over: Partial<TerminalOperationRecord> = {}): TerminalOperationRecord {
+  return {
+    runId: RUN, workerId: "w1", generation: 1, authorityClass: "current_flight", universeDigest: "u1",
+    verdicts: {}, cloneRef: "refs/uzi-terminal-local/x/g1", bareRef: "refs/uzi-terminal-local/x/g1", clonePath: "/c",
+    flaggedCommits: [], phase: "capturing", invocations: [], localBlock: [], ...over,
+  };
+}
+const preparedRec = (over: Partial<TerminalOperationRecord> = {}) => rec({
+  phase: "prepared", manifest: MANIFEST, tip: A, range: RANGE, scanDigest: "s", transportDigest: "t", ...over,
+});
+const inv = (outcome: "invoked" | "published" | "recorded" | "publish_unknown" | "refused" | "conflict", reason?: string) =>
+  ({ at: "2026-01-01T00:00:00.000Z", outcome, ...(reason ? { reason } : {}) });
+
+function mustMerge(cur: TerminalOperationRecord, d: TerminalDelta): TerminalOperationRecord {
+  const r = mergeTerminalRecord(cur, d);
+  assert.ok(r.ok, r.ok ? "" : r.reason);
+  return r.record;
+}
+function mergeReason(cur: TerminalOperationRecord, d: TerminalDelta): string {
+  const r = mergeTerminalRecord(cur, d);
+  assert.ok(!r.ok, "expected rejection");
+  return r.ok ? "" : r.reason;
+}
+
+// ---- harness for the engine --------------------------------------------------------------------------------
+
+interface H {
+  sends: TerminalPreservationRequest[];
+  captures: number;
+  prepares: Array<{ range: unknown; expect: unknown }>;
+  failure: string | undefined;
+  late: string | undefined;
+  boundary: boolean;
+  prepareResult: () => PrepareOutcome;
+  sendResult: () => Promise<TerminalPreservationResult>;
+  deps: TerminalOperationDeps;
+}
+function harness(coord: RecoveryCoordinator, generation = 1): H {
+  const h: H = {
+    sends: [], captures: 0, prepares: [], failure: undefined, late: undefined, boundary: true,
+    prepareResult: () => ({ pack: Buffer.from("pack"), range: { tipSha: A, excludeSha: B }, digests: { scan: "s", transport: "t" } }),
+    sendResult: async () => ({ kind: "final", outcome: "published", response: {} as never }),
+    deps: undefined as never,
+  };
+  h.deps = {
+    enabled: () => coord.terminalPreservationEnabled(),
+    store: coord.terminalOperationStore(),
+    owner: coord.terminalOperationOwner(RUN, generation),
+    failureFirst: () => h.failure,
+    universe: async () => ({ kind: "proved", sources: [], roots: [], universeDigest: "u1" }),
+    capture: async (onPhase) => {
+      h.captures++;
+      await onPhase("capturing", { cloneRef: "refs/c", bareRef: "refs/c" });
+      await onPhase("captured", { cloneRef: "refs/c", bareRef: "refs/c", commit: A });
+      return { kind: "ok", base: A, extraRoots: [], manifest: { ...MANIFEST, generation } };
+    },
+    aggregate: async ({ base }) => ({ tip: base }),
+    prepare: async (range, expect) => { h.prepares.push({ range, expect }); return h.prepareResult(); },
+    coverage: () => ({ ok: true }),
+    recheck: async () => h.late,
+    boundaryValid: () => h.boundary,
+    send: async (req) => { h.sends.push(req); return h.sendResult(); },
+    now: () => 1_700_000_000_000,
+  };
+  return h;
+}
+const input = (mode: "initial" | "resume" = "initial", generation = 1) => ({
+  runId: RUN, workerId: "w1", generation, authorityClass: "current_flight" as const, clonePath: "/c", mode,
+});
+const readRec = async (store: TerminalOperationStore, gen = 1): Promise<TerminalOperationRecord> => {
+  const r = await store.read(RUN, gen);
+  assert.equal(r.kind, "ok");
+  return (r as { record: TerminalOperationRecord }).record;
+};
+const gate = () => { let open!: () => void; const p = new Promise<void>(r => { open = r; }); return { p, open }; };
+const tick = () => new Promise<void>(r => setImmediate(r));
+async function until(cond: () => boolean): Promise<void> {
+  for (let i = 0; i < 1000 && !cond(); i++) await new Promise<void>(r => setTimeout(r, 5));
+  assert.ok(cond(), "condition never held");
+}
+
+describe("terminal operation storage", () => {
+  it("lives in the sibling root and never in the recovery run directory", async () => {
+    const root = mkRoot();
+    const recoveryRun = path.join(root, "recovery", RUN);
+    fs.mkdirSync(recoveryRun, { recursive: true });
+    fs.writeFileSync(path.join(recoveryRun, "cap1.json"), "{}");
+    const count = () => fs.readdirSync(recoveryRun).filter(n => n.endsWith(".json")).length;
+    const before = count();
+    const store = mkCoord(root).terminalOperationStore();
+    assert.equal((await store.create(rec())).kind, "created");
+    assert.equal((await store.update(RUN, 1, { phase: "captured" })).kind, "ok");
+    assert.equal(count(), before);
+    assert.deepEqual(fs.readdirSync(recoveryRun).sort(), ["cap1.json"]);
+    assert.ok(fs.existsSync(recFile(root)));
+    assert.equal(path.dirname(path.dirname(path.dirname(recFile(root)))), root);
+    assert.equal(fs.statSync(tpDir(root)).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(path.join(root, "terminal-preservation")).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(recFile(root)).mode & 0o777, 0o600);
+    assert.deepEqual(fs.readdirSync(tpDir(root)), ["g1.json"]);
+  });
+
+  it("round-trips, authenticates, and keeps absent, corrupt and oversize distinct", async () => {
+    const root = mkRoot();
+    const store = mkCoord(root).terminalOperationStore();
+    assert.equal((await store.read(RUN, 1)).kind, "absent");
+    const created = await store.create(preparedRec());
+    assert.equal(created.kind, "created");
+    assert.deepEqual(await readRec(store), preparedRec());
+    assert.equal((await store.create(rec())).kind, "exists");
+    // A second coordinator (same token) reads it; a different token does not.
+    assert.deepEqual(await readRec(mkCoord(root).terminalOperationStore()), preparedRec());
+    const other = new RecoveryCoordinator({
+      client: new FakeRecoveryClient(), git: new FakeRecoveryGit(), log: nullLogger(),
+      recoveryRoot: path.join(root, "recovery"), workerToken: TOKEN + "x", terminalPreservationTestOverride: {},
+    });
+    assert.equal((await other.terminalOperationStore().read(RUN, 1)).kind, "corrupt");
+    // Tamper: change a field without the MAC.
+    const file = recFile(root);
+    const good = fs.readFileSync(file, "utf8");
+    fs.writeFileSync(file, good.replace('"phase":"prepared"', '"phase":"closed"'));
+    assert.equal((await store.read(RUN, 1)).kind, "corrupt");
+    fs.writeFileSync(file, "not json");
+    assert.equal((await store.read(RUN, 1)).kind, "corrupt");
+    // Oversize.
+    fs.writeFileSync(file, good + " ".repeat(300 * 1024));
+    assert.equal((await store.read(RUN, 1)).kind, "corrupt");
+    // A symlinked record file is refused even when its target is a perfectly valid record.
+    fs.writeFileSync(path.join(root, "elsewhere.json"), good);
+    fs.rmSync(file);
+    fs.symlinkSync(path.join(root, "elsewhere.json"), file);
+    assert.equal((await store.read(RUN, 1)).kind, "corrupt");
+    // Restored bytes read fine again; absent generation is still absent.
+    fs.rmSync(file);
+    fs.writeFileSync(file, good);
+    assert.equal((await store.read(RUN, 1)).kind, "ok");
+    assert.equal((await store.read(RUN, 2)).kind, "absent");
+  });
+
+  it("refuses an invalid run id or generation before touching the filesystem", async () => {
+    const root = mkRoot();
+    const store = mkCoord(root).terminalOperationStore();
+    assert.equal((await store.update("../evil", 1, { phase: "captured" })).kind, "error");
+    assert.equal((await store.update(RUN, 0, { phase: "captured" })).kind, "error");
+    assert.equal((await store.create(rec({ runId: "../x" }))).kind, "error");
+    assert.equal(fs.existsSync(path.join(root, "terminal-preservation")), false);
+  });
+});
+
+describe("terminal operation merge", () => {
+  it("invocations are append-only and invoked needs a prepared, unblocked, open record", () => {
+    const p = preparedRec();
+    const a = mustMerge(p, { appendInvocations: [inv("invoked")] });
+    const b = mustMerge(a, { appendInvocations: [inv("publish_unknown", "transport")] });
+    assert.deepEqual(b.invocations.map(i => i.outcome), ["invoked", "publish_unknown"]);
+    assert.deepEqual(p.invocations, []);
+    assert.equal(mergeReason(rec(), { appendInvocations: [inv("invoked")] }), "not_prepared");
+    assert.equal(mergeReason(preparedRec({ localBlock: ["x"] }), { appendInvocations: [inv("invoked")] }), "local_block");
+    assert.equal(mergeReason(preparedRec({ phase: "closed", invocations: [inv("published")] }), { appendInvocations: [inv("refused")] }), "closed");
+  });
+
+  it("localBlock and flagged commits only grow, and a conflict adds server_conflict", () => {
+    const a = mustMerge(rec(), { addLocalBlock: ["a"], addFlaggedCommits: [A] });
+    const b = mustMerge(a, { addLocalBlock: ["b", "a"], addFlaggedCommits: [A, B] });
+    assert.deepEqual(b.localBlock, ["a", "b"]);
+    assert.deepEqual(b.flaggedCommits, [A, B]);
+    const c = mustMerge(mustMerge(preparedRec(), { appendInvocations: [inv("invoked")] }), { appendInvocations: [inv("conflict", "generation_bound")] });
+    assert.deepEqual(c.localBlock, ["server_conflict"]);
+    assert.equal(c.phase, "prepared");
+  });
+
+  it("the phase never moves backward; incomplete only from capture; closed is terminal", () => {
+    assert.equal(mergeReason(preparedRec(), { phase: "captured" }), "phase_regression");
+    assert.equal(mergeReason(preparedRec(), { phase: "incomplete" }), "incomplete_only_from_capture");
+    assert.equal(mergeReason(rec({ phase: "incomplete" }), { phase: "captured" }), "phase_regression");
+    assert.equal(mergeReason(rec({ phase: "incomplete" }), { phase: "closed", closedReason: "x" }), "phase_regression");
+    assert.equal(mergeReason(rec({ phase: "captured" }), { phase: "prepared" }), "prepared_incomplete");
+    assert.equal(mergeReason(preparedRec({ phase: "closed", closedReason: "x" }), { phase: "prepared" }), "closed");
+    assert.equal(mustMerge(rec(), { phase: "captured" }).phase, "captured");
+    assert.equal(mustMerge(rec({ phase: "captured" }), { phase: "incomplete" }).phase, "incomplete");
+    // Closed with no change is idempotent.
+    const closed = preparedRec({ phase: "closed", closedReason: "published", invocations: [inv("invoked"), inv("published")] });
+    assert.equal(mustMerge(closed, { phase: "closed" }).phase, "closed");
+  });
+
+  it("identity fields are immutable once set", () => {
+    const p = preparedRec();
+    assert.equal(mergeReason(p, { tip: B }), "identity_changed");
+    assert.equal(mergeReason(mustMerge(p, { priorTip: C }), { priorTip: B }), "identity_changed");
+    assert.equal(mergeReason(p, { range: serializeCheckpointRange({ tipSha: A, excludeSha: C }) }), "identity_changed");
+    assert.equal(mergeReason(p, { manifest: { ...MANIFEST, worker_id: "other" } }), "identity_changed");
+    assert.equal(mergeReason(p, { scanDigest: "z" }), "identity_changed");
+    assert.equal(mustMerge(p, { tip: A }).tip, A);
+  });
+
+  it("closes only after a final outcome, or as refused when positively uninvoked", () => {
+    assert.equal(mergeReason(preparedRec(), { phase: "closed" }), "close_requires_reason");
+    assert.equal(mergeReason(preparedRec({ invocations: [inv("invoked")] }), { phase: "closed", closedReason: "refused" }), "close_requires_final");
+    assert.equal(mergeReason(preparedRec({ invocations: [inv("invoked")] }),
+      { phase: "closed", closedReason: "r", appendInvocations: [inv("refused", "update_refused")] }), "close_requires_final");
+    assert.equal(mergeReason(preparedRec({ invocations: [inv("invoked"), inv("publish_unknown")] }), { phase: "closed", closedReason: "x" }), "close_requires_final");
+    assert.equal(mustMerge(preparedRec(), { phase: "closed", closedReason: "secret_found", appendInvocations: [inv("refused", "secret_found")] }).phase, "closed");
+    assert.equal(mustMerge(preparedRec({ invocations: [inv("invoked")] }), { phase: "closed", appendInvocations: [inv("recorded")] }).phase, "closed");
+  });
+});
+
+describe("terminal operation engine", () => {
+  it("publishes through the approved order and closes the record", async () => {
+    const root = mkRoot();
+    const coord = mkCoord(root);
+    const h = harness(coord);
+    const res = await runTerminalOperation(h.deps, input());
+    assert.deepEqual(res, { outcome: "published", tip: A, manifest: { ...MANIFEST, generation: 1 } });
+    assert.equal(h.sends.length, 1);
+    assert.equal(h.sends[0]!.tip, A);
+    assert.equal(h.sends[0]!.pack, Buffer.from("pack").toString("base64"));
+    const r = await readRec(h.deps.store);
+    assert.equal(r.phase, "closed");
+    assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked", "published"]);
+    assert.equal(r.range, RANGE);
+    // A duplicate in the lane takes the idempotent path: no second send.
+    const again = await runTerminalOperation(h.deps, input());
+    assert.equal(again.outcome, "published");
+    assert.equal(h.sends.length, 1);
+  });
+
+  it("gate off: engine and rediscovery do nothing and create nothing", async () => {
+    const root = mkRoot();
+    const coord = mkCoord(root, false);
+    const h = harness(coord);
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "disabled" });
+    assert.equal(h.captures, 0);
+    assert.equal(h.sends.length, 0);
+    assert.deepEqual(await coord.resumeTerminalOperations(), { resumePending: [], incomplete: 0, corrupt: 0, truncated: false });
+    assert.equal((await coord.terminalOperationStore().create(rec())).kind, "disabled");
+    assert.equal((await coord.terminalOperationStore().update(RUN, 1, { phase: "captured" })).kind, "disabled");
+    assert.equal(fs.existsSync(path.join(root, "terminal-preservation")), false);
+    assert.throws(() => coord.terminalOperationOwner(RUN, 1)(async () => 1));
+  });
+
+  for (const reason of ["push_secret_blocked", "worker_residue_blocked"]) {
+    it(`failure-first ${reason}: zero writes, zero sends`, async () => {
+      const root = mkRoot();
+      const h = harness(mkCoord(root));
+      h.failure = reason;
+      assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason });
+      assert.equal(h.captures, 0);
+      assert.equal(h.sends.length, 0);
+      assert.equal(fs.existsSync(path.join(root, "terminal-preservation")), false);
+    });
+  }
+
+  it("a late failure before any invocation closes refused/local_failure_late and never sends", async () => {
+    const root = mkRoot();
+    const h = harness(mkCoord(root));
+    h.late = "secret_remediation_pending";
+    const res = await runTerminalOperation(h.deps, input());
+    assert.equal(res.outcome, "kept");
+    assert.equal(h.sends.length, 0);
+    const r = await readRec(h.deps.store);
+    assert.equal(r.phase, "closed");
+    assert.equal(r.closedReason, "local_failure_late");
+    assert.deepEqual(r.invocations.map(i => [i.outcome, i.reason]), [["refused", "local_failure_late"]]);
+    assert.ok(r.localBlock.includes("local_failure_late"));
+  });
+
+  it("the same late failure after an earlier invocation latches without closing", async () => {
+    const root = mkRoot();
+    const h = harness(mkCoord(root));
+    h.sendResult = async () => ({ kind: "unknown", cause: "transport" });
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "unknown", reason: "transport" });
+    h.late = "worker_residue";
+    const res = await runTerminalOperation(h.deps, input("resume"));
+    assert.equal(res.outcome, "kept");
+    assert.equal(h.sends.length, 1);
+    const r = await readRec(h.deps.store);
+    assert.equal(r.phase, "prepared");
+    assert.ok(r.localBlock.includes("local_failure_late"));
+    assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked", "publish_unknown"]);
+  });
+
+  it("the first send of a positively uninvoked prepared record is allowed through resume", async () => {
+    const root = mkRoot();
+    const h = harness(mkCoord(root));
+    h.boundary = false;
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "boundary_invalid" });
+    assert.equal(h.sends.length, 0);
+    assert.deepEqual((await readRec(h.deps.store)).invocations, []);
+    // Initial mode never adopts an existing non-final record.
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "existing_record" });
+    h.boundary = true;
+    const res = await runTerminalOperation(h.deps, input("resume"));
+    assert.equal(res.outcome, "published");
+    assert.equal(h.sends.length, 1);
+    // Resume reran preparation over the persisted range with the persisted digests.
+    assert.deepEqual(h.prepares.at(-1), { range: { tipSha: A, excludeSha: B }, expect: { scan: "s", transport: "t" } });
+  });
+
+  it("resume refuses a missing or non-prepared record", async () => {
+    const h = harness(mkCoord(mkRoot()));
+    assert.deepEqual(await runTerminalOperation(h.deps, input("resume")), { outcome: "kept", reason: "not_resumable" });
+    assert.equal(h.sends.length, 0);
+  });
+
+  for (const reason of ["generation_bound", "prior_tip_mismatch"] as const) {
+    it(`${reason} after invoke records a conflict and a local block, never closes`, async () => {
+      const h = harness(mkCoord(mkRoot()));
+      h.sendResult = async () => ({ kind: "refused", reason, httpStatus: 409 });
+      assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason });
+      const r = await readRec(h.deps.store);
+      assert.equal(r.phase, "prepared");
+      assert.ok(r.localBlock.includes("server_conflict"));
+      assert.deepEqual(r.invocations.map(i => [i.outcome, i.reason]), [["invoked", undefined], ["conflict", reason]]);
+      // And it blocks any later send.
+      assert.equal((await runTerminalOperation(h.deps, input("resume"))).outcome, "kept");
+      assert.equal(h.sends.length, 1);
+    });
+  }
+
+  it("another server refusal after invoke appends refused but never closes", async () => {
+    const h = harness(mkCoord(mkRoot()));
+    h.sendResult = async () => ({ kind: "refused", reason: "update_refused", httpStatus: 422 });
+    await runTerminalOperation(h.deps, input());
+    const r = await readRec(h.deps.store);
+    assert.equal(r.phase, "prepared");
+    assert.equal(r.localBlock.length, 0);
+    assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked", "refused"]);
+  });
+
+  it("a latch recorded during an in-flight send stops the next send", async () => {
+    const root = mkRoot();
+    const coord = mkCoord(root);
+    const h = harness(coord);
+    const sendGate = gate();
+    h.sendResult = async () => { await sendGate.p; return { kind: "unknown", cause: "transport" }; };
+    const running = runTerminalOperation(h.deps, input());
+    await until(() => h.sends.length === 1);
+    // The latch writer takes only the journal lock, so it lands while the owner lane is held by the send.
+    const latched = await h.deps.store.addLocalBlock(RUN, 1, ["secret_found"], [C]);
+    assert.equal(latched.kind, "ok");
+    sendGate.open();
+    assert.deepEqual(await running, { outcome: "unknown", reason: "transport" });
+    const r = await readRec(h.deps.store);
+    assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked", "publish_unknown"]);
+    assert.deepEqual(r.localBlock, ["secret_found"]);
+    h.sendResult = async () => ({ kind: "final", outcome: "published", response: {} as never });
+    assert.deepEqual(await runTerminalOperation(h.deps, input("resume")), { outcome: "kept", reason: "local_block" });
+    assert.equal(h.sends.length, 1);
+  });
+
+  it("writers from the same older record in either order keep both the outcome and the block", async () => {
+    for (const order of ["outcome-first", "block-first"] as const) {
+      const root = mkRoot();
+      const coord = mkCoord(root);
+      const store = coord.terminalOperationStore();
+      await store.create(preparedRec({ invocations: [inv("invoked")] }));
+      const outcome = () => store.update(RUN, 1, { appendInvocations: [inv("publish_unknown", "transport")] });
+      const block = () => store.addLocalBlock(RUN, 1, ["secret_found"], [C]);
+      if (order === "outcome-first") { await outcome(); await block(); } else { await block(); await outcome(); }
+      const r = await readRec(store);
+      assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked", "publish_unknown"], order);
+      assert.deepEqual(r.localBlock, ["secret_found"], order);
+      assert.deepEqual(r.flaggedCommits, [C], order);
+    }
+  });
+
+  it("resume versus an in-lane duplicate: the owner serializes and the second takes the idempotent path", async () => {
+    const root = mkRoot();
+    const coord = mkCoord(root);
+    const h = harness(coord);
+    h.boundary = false;
+    await runTerminalOperation(h.deps, input());
+    h.boundary = true;
+    const sendGate = gate();
+    h.sendResult = async () => { await sendGate.p; return { kind: "final", outcome: "published", response: {} as never }; };
+    const first = runTerminalOperation(h.deps, input("resume"));
+    await until(() => h.sends.length === 1);
+    const second = runTerminalOperation(h.deps, input("resume"));
+    await tick(); await tick();
+    assert.equal(h.sends.length, 1);
+    sendGate.open();
+    assert.equal((await first).outcome, "published");
+    assert.equal((await second).outcome, "published");
+    assert.equal(h.sends.length, 1);
+    assert.deepEqual((await readRec(h.deps.store)).invocations.map(i => i.outcome), ["invoked", "published"]);
+  });
+
+  it("replay versus rediscovery in either order overwrites neither the uncertainty nor a newer block", async () => {
+    for (const order of ["replay-first", "rediscovery-first", "concurrent"] as const) {
+      const root = mkRoot();
+      const store = mkCoord(root).terminalOperationStore();
+      await store.create(preparedRec({ invocations: [inv("invoked")] }));
+      const fresh = mkCoord(root);
+      const replay = () => store.update(RUN, 1, { appendInvocations: [inv("publish_unknown", "transport")] });
+      const block = () => store.addLocalBlock(RUN, 1, ["secret_found"]);
+      const rediscover = () => fresh.resumeTerminalOperations();
+      if (order === "replay-first") { await replay(); await rediscover(); await block(); }
+      else if (order === "rediscovery-first") { await rediscover(); await block(); await replay(); }
+      else await Promise.all([replay(), rediscover(), block()]);
+      const r = await readRec(store);
+      assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked", "publish_unknown"], order);
+      assert.deepEqual(r.localBlock, ["secret_found"], order);
+      assert.equal(r.phase, "prepared", order);
+    }
+  });
+
+  it("a secret finding from preparation latches, closes the uninvoked record, survives restart and blocks later runs", async () => {
+    const root = mkRoot();
+    const h = harness(mkCoord(root));
+    h.prepareResult = () => ({ reason: "secret_found", flaggedCommits: [C] });
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "secret_found" });
+    assert.equal(h.sends.length, 0);
+    // New coordinator instance: nothing in memory.
+    const restarted = mkCoord(root);
+    const r = await readRec(restarted.terminalOperationStore());
+    assert.deepEqual(r.localBlock, ["secret_found"]);
+    assert.deepEqual(r.flaggedCommits, [C]);
+    assert.equal(r.phase, "closed");
+    assert.equal(r.closedReason, "secret_found");
+    // A later generation whose scanner now says clean still never sends.
+    const h2 = harness(restarted, 2);
+    const res = await runTerminalOperation(h2.deps, input("initial", 2));
+    assert.equal(res.outcome, "kept");
+    assert.equal(h2.sends.length, 0);
+    assert.deepEqual((await readRec(h2.deps.store, 2)).invocations, []);
+    // A resume of the same record is also refused.
+    assert.equal((await runTerminalOperation(harness(restarted).deps, input("resume"))).outcome, "kept");
+  });
+
+  it("a corrupt sibling record blocks a send (fail closed)", async () => {
+    const root = mkRoot();
+    const coord = mkCoord(root);
+    const store = coord.terminalOperationStore();
+    await store.create(rec({ generation: 3, phase: "closed", closedReason: "x" }));
+    fs.writeFileSync(path.join(tpDir(root), "g3.json"), "garbage");
+    const h = harness(coord);
+    const res = await runTerminalOperation(h.deps, input());
+    assert.equal(res.outcome, "kept");
+    assert.equal(h.sends.length, 0);
+  });
+});
+
+describe("terminal operation rediscovery", () => {
+  it("restores every phase from disk with a new coordinator, never sending or touching git", async () => {
+    const root = mkRoot();
+    const writer = mkCoord(root).terminalOperationStore();
+    await writer.create(rec({ generation: 1 }));
+    await writer.create(rec({ generation: 2 }));
+    await writer.update(RUN, 2, { phase: "captured" });
+    await writer.create(rec({ generation: 3 }));
+    await writer.update(RUN, 3, { phase: "prepared", manifest: MANIFEST, tip: A, range: RANGE, scanDigest: "s", transportDigest: "t" });
+    await writer.create(rec({ generation: 4 }));
+    await writer.update(RUN, 4, { phase: "prepared", manifest: MANIFEST, tip: A, range: RANGE, scanDigest: "s", transportDigest: "t" });
+    await writer.update(RUN, 4, { appendInvocations: [inv("invoked")] });
+    await writer.create(preparedRec({ generation: 5, invocations: [inv("invoked"), inv("published")], phase: "closed", closedReason: "published" }));
+    await writer.create(preparedRec({ generation: 6, localBlock: ["secret_found"] }));
+    await writer.create(rec({ generation: 7 }));
+    fs.writeFileSync(path.join(tpDir(root), "g7.json"), "garbage");
+    const before = fs.readFileSync(path.join(tpDir(root), "g5.json"), "utf8");
+
+    const spy: string[] = [];
+    const fresh = mkCoord(root, true, spy);
+    const res = await fresh.resumeTerminalOperations();
+    assert.equal(res.incomplete, 2);
+    assert.equal(res.corrupt, 1);
+    assert.deepEqual(res.resumePending.map(p => p.generation), [3, 4]);
+    assert.deepEqual(spy, [], "rediscovery must not call git or the client");
+    const store = fresh.terminalOperationStore();
+    for (const g of [1, 2]) {
+      const r = await readRec(store, g);
+      assert.equal(r.phase, "incomplete");
+      assert.equal(r.cloneRef, "refs/uzi-terminal-local/x/g1");
+      assert.equal(r.bareRef, "refs/uzi-terminal-local/x/g1");
+      assert.equal(r.clonePath, "/c");
+    }
+    assert.equal((await readRec(store, 3)).phase, "prepared");
+    assert.deepEqual((await readRec(store, 4)).invocations.map(i => i.outcome), ["invoked"]);
+    assert.equal(fs.readFileSync(path.join(tpDir(root), "g5.json"), "utf8"), before);
+    assert.equal(fs.readFileSync(path.join(tpDir(root), "g7.json"), "utf8"), "garbage");
+    // Idempotent on a second pass.
+    const again = await fresh.resumeTerminalOperations();
+    assert.equal(again.incomplete, 0);
+    assert.deepEqual(again.resumePending.map(p => p.generation), [3, 4]);
+  });
+
+  it("does nothing when the root is absent", async () => {
+    const root = mkRoot();
+    assert.deepEqual(await mkCoord(root).resumeTerminalOperations(), { resumePending: [], incomplete: 0, corrupt: 0, truncated: false });
+    assert.equal(fs.existsSync(path.join(root, "terminal-preservation")), false);
+  });
+
+  it("skips a capture-phase record whose lane is held by a live operation", async () => {
+    const root = mkRoot();
+    const coord = mkCoord(root);
+    await coord.terminalOperationStore().create(rec());
+    const lane = gate();
+    const held = coord.terminalOperationOwner(RUN, 1)(async () => { await lane.p; });
+    await tick();
+    const res = await coord.resumeTerminalOperations();
+    assert.equal(res.incomplete, 0);
+    assert.equal((await readRec(coord.terminalOperationStore())).phase, "capturing");
+    lane.open();
+    await held;
+  });
+});

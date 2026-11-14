@@ -2,6 +2,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { terminalPreservationActive, type TerminalPreservationTestHooks } from "./terminal-preservation.js";
+import {
+  canonicalTerminalJson, decodeTerminalRecord, isTerminalGeneration, isTerminalRunId, mergeTerminalRecord, TERMINAL_RECORD_MAX_BYTES,
+  type TerminalDelta, type TerminalInvokeResult, type TerminalOperationRecord, type TerminalOperationStore,
+  type TerminalReadResult, type TerminalRediscovery, type TerminalUpdateResult,
+} from "./terminal-operation.js";
 import { AuthorityLockBusy, AuthorityRefusal } from "./authority-lock.js";
 import type { AuthorityScope, AuthorityWait, RetirementHandle, RetirementView } from "./authority-runtime.js";
 import {
@@ -1510,6 +1515,220 @@ export class RecoveryCoordinator {
    *  only because no production caller exists yet (noUnusedLocals would reject an unread private member). */
   terminalPreservationEnabled(): boolean {
     return terminalPreservationActive(this.terminalPreservationTestOverride);
+  }
+
+  // ── #4007 slice B: terminal operation records (production-dark; every entry point checks the gate first) ──
+
+  private terminalRoot(): string { return path.join(path.dirname(this.recoveryRoot), "terminal-preservation"); }
+  private terminalRunDir(runId: string): string { return path.join(this.terminalRoot(), runId); }
+  private terminalFile(runId: string, generation: number): string { return path.join(this.terminalRunDir(runId), `g${generation}.json`); }
+
+  private terminalMac(record: TerminalOperationRecord): string {
+    if (!this.key) throw new Error("recovery: MAC key unavailable");
+    return createHmac("sha256", this.key).update("terminal-operation-v1\n" + canonicalTerminalJson(record)).digest("hex");
+  }
+
+  /** Authenticated read of one record; the caller holds the run's journal lock. Distinguishes absent from corrupt. */
+  private async terminalReadUnlocked(runId: string, generation: number): Promise<TerminalReadResult> {
+    if (!this.key) return { kind: "corrupt" };
+    for (const dir of [this.terminalRoot(), this.terminalRunDir(runId)]) {
+      try {
+        const st = await fs.lstat(dir);
+        if (!st.isDirectory()) return { kind: "corrupt" };
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "corrupt" };
+      }
+    }
+    let handle: FileHandle;
+    try {
+      handle = await fs.open(this.terminalFile(runId, generation), constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "corrupt" };
+    }
+    try {
+      const st = await handle.stat();
+      if (!st.isFile() || st.size > TERMINAL_RECORD_MAX_BYTES || st.size === 0) return { kind: "corrupt" };
+      const buf = Buffer.alloc(st.size);
+      const { bytesRead } = await handle.read(buf, 0, st.size, 0);
+      if (bytesRead !== st.size) return { kind: "corrupt" };
+      const parsed: unknown = JSON.parse(buf.toString("utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "corrupt" };
+      const { mac, ...body } = parsed as Record<string, unknown>;
+      const record = decodeTerminalRecord(body);
+      if (!record || typeof mac !== "string" || record.runId !== runId || record.generation !== generation) return { kind: "corrupt" };
+      const want = Buffer.from(this.terminalMac(record), "hex"), got = Buffer.from(mac, "hex");
+      if (want.length !== got.length || !timingSafeEqual(want, got)) return { kind: "corrupt" };
+      return { kind: "ok", record };
+    } catch {
+      return { kind: "corrupt" };
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
+  /** Durable write: parents created 0700 with the new dir and its parent synced, temp O_EXCL|O_NOFOLLOW 0600, file
+   *  fsync, rename, directory fsync. The caller holds the run's journal lock. */
+  private async terminalWriteUnlocked(record: TerminalOperationRecord): Promise<void> {
+    const raw = JSON.stringify({ ...record, mac: this.terminalMac(record) });
+    const sync = async (dir: string) => {
+      const h = await fs.open(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try { await h.sync(); } finally { await h.close(); }
+    };
+    let parent = path.dirname(this.terminalRoot());
+    for (const dir of [this.terminalRoot(), this.terminalRunDir(record.runId)]) {
+      try {
+        if (!(await fs.lstat(dir)).isDirectory()) throw new Error("terminal operation: unsafe directory");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        await fs.mkdir(dir, { mode: 0o700 });
+        await sync(dir); await sync(parent);
+      }
+      parent = dir;
+    }
+    const dst = this.terminalFile(record.runId, record.generation), tmp = `${dst}.${randomUUID()}.tmp`;
+    const file = await fs.open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      try { await file.writeFile(raw); await file.sync(); } finally { await file.close(); }
+      await fs.rename(tmp, dst);
+    } catch (error) {
+      await fs.unlink(tmp).catch(() => undefined);
+      throw error;
+    }
+    await sync(this.terminalRunDir(record.runId));
+  }
+
+  /** Whether any record of the run carries a local block, a flagged commit or a secret closure; corrupt or excessive
+   *  state counts as blocked. The caller holds the run's journal lock. */
+  private async terminalRunBlockedUnlocked(runId: string): Promise<string | undefined> {
+    let names: string[];
+    try { names = await fs.readdir(this.terminalRunDir(runId)); } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "record_unreadable";
+    }
+    const files = names.filter(n => /^g[1-9][0-9]*\.json$/.test(n));
+    if (files.length > 64) return "too_many_records";
+    for (const name of files) {
+      const res = await this.terminalReadUnlocked(runId, Number(name.slice(1, -5)));
+      if (res.kind === "corrupt") return "record_corrupt";
+      if (res.kind === "ok" && (res.record.localBlock.length > 0 || res.record.flaggedCommits.length > 0 ||
+          res.record.closedReason === "secret_found")) return res.record.localBlock[0] ?? "secret_found";
+    }
+    return undefined;
+  }
+
+  /** The durable terminal operation records. Reads and writes are brief and take only the run's journal lock; with the
+   *  gate off every method does nothing and creates nothing. */
+  terminalOperationStore(): TerminalOperationStore {
+    const valid = (runId: string, generation: number) => isTerminalRunId(runId) && isTerminalGeneration(generation);
+    const mutate = async (runId: string, generation: number, delta: TerminalDelta): Promise<TerminalUpdateResult> => {
+      if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
+      if (!valid(runId, generation)) return { kind: "error", reason: "invalid_id" };
+      try {
+        return await this.withJournalLock(runId, async (): Promise<TerminalUpdateResult> => {
+          const cur = await this.terminalReadUnlocked(runId, generation);
+          if (cur.kind !== "ok") return cur;
+          const merged = mergeTerminalRecord(cur.record, delta);
+          if (!merged.ok) return { kind: "rejected", reason: merged.reason };
+          await this.terminalWriteUnlocked(merged.record);
+          return { kind: "ok", record: merged.record };
+        });
+      } catch (error) {
+        return { kind: "error", reason: error instanceof Error ? error.message.slice(0, 120) : "write_failed" };
+      }
+    };
+    return {
+      read: async (runId, generation) => {
+        if (!this.terminalPreservationEnabled() || !valid(runId, generation)) return { kind: "absent" };
+        return this.withJournalLock(runId, () => this.terminalReadUnlocked(runId, generation));
+      },
+      create: async (record) => {
+        if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
+        if (!valid(record.runId, record.generation) || !decodeTerminalRecord(JSON.parse(JSON.stringify(record)))) return { kind: "error", reason: "invalid_record" };
+        try {
+          return await this.withJournalLock(record.runId, async () => {
+            if ((await this.terminalReadUnlocked(record.runId, record.generation)).kind !== "absent") return { kind: "exists" as const };
+            await this.terminalWriteUnlocked(record);
+            return { kind: "created" as const, record };
+          });
+        } catch (error) {
+          return { kind: "error", reason: error instanceof Error ? error.message.slice(0, 120) : "write_failed" };
+        }
+      },
+      update: mutate,
+      addLocalBlock: (runId, generation, reasons, flaggedCommits) =>
+        mutate(runId, generation, { addLocalBlock: reasons, ...(flaggedCommits?.length ? { addFlaggedCommits: flaggedCommits } : {}) }),
+      invoke: async (runId, generation, at): Promise<TerminalInvokeResult> => {
+        if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
+        if (!valid(runId, generation)) return { kind: "error", reason: "invalid_id" };
+        try {
+          return await this.withJournalLock(runId, async (): Promise<TerminalInvokeResult> => {
+            const cur = await this.terminalReadUnlocked(runId, generation);
+            if (cur.kind !== "ok") return cur;
+            const blocked = await this.terminalRunBlockedUnlocked(runId);
+            if (blocked !== undefined) return { kind: "blocked", reason: blocked };
+            const merged = mergeTerminalRecord(cur.record, { appendInvocations: [{ at, outcome: "invoked" }] });
+            if (!merged.ok) return { kind: "rejected", reason: merged.reason };
+            await this.terminalWriteUnlocked(merged.record);
+            return { kind: "invoked", record: merged.record };
+          });
+        } catch (error) {
+          return { kind: "error", reason: error instanceof Error ? error.message.slice(0, 120) : "write_failed" };
+        }
+      },
+    };
+  }
+
+  /** The operation owner lane for one run generation: held by the producer across its whole operation. Latch writers
+   *  never take it (they use the journal lock only), so they can land while a send is in flight. */
+  terminalOperationOwner(runId: string, generation: number): <T>(fn: () => Promise<T>) => Promise<T> {
+    return <T>(fn: () => Promise<T>): Promise<T> => {
+      if (!this.terminalPreservationEnabled()) throw new Error("terminal preservation disabled");
+      return runCaptureCycle(`terminal:${runId}:g${generation}`, "wait", fn);
+    };
+  }
+
+  /**
+   * Restart rediscovery from disk only: capturing/captured records become `incomplete` (record and refs retained);
+   * prepared records are returned for a later caller to resume. Never sends, never touches git or the source.
+   */
+  async resumeTerminalOperations(signal?: AbortSignal): Promise<TerminalRediscovery> {
+    const out: TerminalRediscovery = { resumePending: [], incomplete: 0, corrupt: 0, truncated: false };
+    if (!this.terminalPreservationEnabled() || !this.key) return out;
+    const deadline = this.now() + 30_000;
+    const over = () => signal?.aborted === true || this.now() > deadline;
+    let runs: string[];
+    try { runs = (await fs.readdir(this.terminalRoot())).filter(isTerminalRunId).sort(); } catch { return out; }
+    if (runs.length > 4096) { runs = runs.slice(0, 4096); out.truncated = true; }
+    const store = this.terminalOperationStore();
+    for (const runId of runs) {
+      if (over()) { out.truncated = true; break; }
+      let files: string[];
+      try {
+        if (!(await fs.lstat(this.terminalRunDir(runId))).isDirectory()) { out.corrupt++; continue; }
+        files = (await fs.readdir(this.terminalRunDir(runId))).filter(n => /^g[1-9][0-9]*\.json$/.test(n));
+      } catch { out.corrupt++; continue; }
+      if (files.length > 64) { files = files.slice(0, 64); out.truncated = true; }
+      for (const name of files) {
+        if (over()) { out.truncated = true; break; }
+        const generation = Number(name.slice(1, -5));
+        const res = await store.read(runId, generation);
+        if (res.kind === "absent") continue;
+        if (res.kind === "corrupt") {
+          out.corrupt++;
+          this.log.warn("terminal preservation: corrupt operation record kept", { runId, generation });
+          continue;
+        }
+        const rec = res.record;
+        if (rec.phase === "capturing" || rec.phase === "captured") {
+          // A live operation holds the lane; only an idle one is restart residue.
+          const cycle = await runCaptureCycle(`terminal:${runId}:g${generation}`, "skip",
+            () => store.update(runId, generation, { phase: "incomplete", closedReason: "restart_incomplete" }));
+          if (cycle.ran && cycle.value.kind === "ok") out.incomplete++;
+        } else if (rec.phase === "prepared" && rec.localBlock.length === 0) {
+          out.resumePending.push({ runId, generation, record: rec });
+        }
+      }
+    }
+    return out;
   }
   private readonly onForgetJournalLockedForTest: RecoveryCoordinatorOptions["onForgetJournalLockedForTest"];
   private readonly onOperatorDisposeStepForTest: RecoveryCoordinatorOptions["onOperatorDisposeStepForTest"];
