@@ -24,6 +24,7 @@ import { LimitReachedError } from "../src/limit.js";
 import type { ReadOnlyModelPassOpts } from "../src/model-pass.js";
 import type { Milestone, MilestoneProgress } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
 
 const MIN = 60_000;
 
@@ -102,6 +103,7 @@ function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../sr
   const clock = new FakeClock();
   const emitted: EmittedMessage[] = [];
   const calls: PassCall[] = [];
+  const factoryCalls: NonNullable<ReadOnlyModelPassOpts["codex"]>[] = [];
   const warns: string[] = [];
   const st = {
     enabled: over.enabled ?? true,
@@ -120,7 +122,7 @@ function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../sr
       kind: over.kind ?? "issue",
       claude: over.codex ? false : (over.claude ?? true),
       ...(over.codex
-        ? { codex: { runId: "run-1", binding: { authMode: "api_key", capability: "cap" } as never, buildHarness: (() => { throw new Error("the controller must go through runPass"); }) as never } }
+        ? { codex: { runId: "run-1", binding: { authMode: "api_key", accessToken: "A-token", capability: "cap" } as never, claimGeneration: 7, buildHarness: ((params: NonNullable<ReadOnlyModelPassOpts["codex"]>) => { factoryCalls.push(params); return Promise.resolve({} as never); }) as never } }
         : {}),
     },
     emit: (m) => void emitted.push(m),
@@ -142,7 +144,7 @@ function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../sr
   };
   const c = new NowSummaryController(deps);
   const notes = (): Record<string, unknown>[] => emitted.filter((m) => m.kind === "progress_note").map((m) => m.payload);
-  return { c, clock, st, calls, emitted, notes, warns };
+  return { c, clock, st, calls, emitted, notes, warns, deps, factoryCalls };
 }
 
 /** Start the controller with milestone m1 active. */
@@ -1038,6 +1040,224 @@ describe("NowSummaryController: review-rework behaviours", () => {
 // Issue #4201 m2d: each call snapshots the run's credential at its START. It uses that token and every frame
 // it posts (the note, or the usage-only note) carries that epoch ordinal, even when an in-place switch
 // publishes a newer credential while the call is in flight.
+describe("NowSummaryController: Codex switch suspension", () => {
+  const bundle = (mode: "api_key" | "subscription" = "subscription") => ({
+    ordinal: 1, capabilityEpoch: 91, messageSeq: 12,
+    binding: {
+      authMode: mode, accessToken: "B-token", capability: "B-cap",
+      ...(mode === "subscription" ? { generation: 8, chatgptAccountId: "B-account", chatgptPlanType: null } : {}),
+    } as NonNullable<ReadOnlyModelPassOpts["codex"]>["binding"],
+  });
+
+  it("permits the switch-owned lifecycle stop but never a pause or terminal stop", async () => {
+    for (const replace of [false, true]) {
+      const h = harness({ codex: true });
+      await running(h);
+      h.st.life.abort(new CredentialSwitchSignal());
+      const lease = h.c.suspendCodexSwitch({ signal: new AbortController().signal, remainingMs: 50 });
+      assert.deepEqual(await lease.drained, { kind: "drained" });
+      if (replace) {
+        assert.equal(lease.publishB(bundle()), true);
+        assert.equal(lease.finishB(), true);
+      } else assert.equal(lease.reopenA(), true);
+      h.c.observeFrame(toolUse("reviewer", "Read", { file_path: "next" }));
+      await h.clock.advance(NOW_MIN_INTERVAL_MS);
+      assert.equal(h.calls.length, 1, "the interrupted lifecycle still blocks model admission");
+      h.st.life = new AbortController();
+      h.c.observeSetting();
+      await h.clock.advance(0);
+      assert.equal(h.calls.length, 2);
+      assert.equal(h.calls[1]!.opts.codex!.binding.accessToken, replace ? "B-token" : "A-token");
+      h.calls[1]!.resolve("settled");
+      await settle();
+      await h.c.stop();
+    }
+    for (const reason of [new PauseNowSignal(), new Error("terminal stop")]) {
+      const h = harness({ codex: true });
+      h.st.life.abort(reason);
+      const lease = h.c.suspendCodexSwitch({ signal: new AbortController().signal, remainingMs: 50 });
+      await lease.drained;
+      assert.equal(lease.reopenA(), false);
+      assert.equal(lease.publishB(bundle()), false);
+      await h.c.stop();
+    }
+  });
+
+  it("snapshots initial authority and refuses missing factories or malformed initial bindings", async () => {
+    const h = harness({ codex: true });
+    for (const codex of [
+      { ...h.deps.claim.codex!, buildHarness: undefined },
+      { ...h.deps.claim.codex!, claimGeneration: undefined },
+      { ...h.deps.claim.codex!, claimGeneration: 0 },
+      { ...h.deps.claim.codex!, runId: "" },
+      { ...h.deps.claim.codex!, binding: { ...h.deps.claim.codex!.binding, accessToken: "" } },
+    ]) {
+      const c = new NowSummaryController({ ...h.deps, claim: { ...h.deps.claim, codex: codex as never } });
+      assert.throws(() => c.suspendCodexSwitch({ signal: new AbortController().signal, remainingMs: 50 }));
+    }
+    h.deps.claim.codex = { ...h.deps.claim.codex!, runId: "mutated", claimGeneration: 999 };
+    await running(h);
+    assert.equal(h.calls[0]!.opts.codex!.runId, "run-1");
+    assert.equal(h.calls[0]!.opts.codex!.claimGeneration, 7);
+  });
+
+  it("cancel after publication and stop after publication both prevent finishB", async () => {
+    for (const stop of [false, true]) {
+      const h = harness({ codex: true });
+      const cancel = new AbortController();
+      const lease = h.c.suspendCodexSwitch({ signal: cancel.signal, remainingMs: 50 });
+      await lease.drained;
+      assert.equal(lease.publishB(bundle()), true);
+      if (stop) await h.c.stop();
+      else cancel.abort();
+      assert.equal(lease.finishB(), false);
+      assert.equal(lease.reopenA(), false);
+      assert.equal(getEventListeners(cancel.signal, "abort").length, 0);
+      assert.equal(h.clock.pendingTimers, 0);
+    }
+  });
+
+  it("cancellation cannot authorize A or B, even after raw settlement", async () => {
+    const h = harness({ codex: true, ignoreAbort: true });
+    await running(h);
+    const cancel = new AbortController();
+    const lease = h.c.suspendCodexSwitch({ signal: cancel.signal, remainingMs: 50 });
+    cancel.abort();
+    assert.deepEqual(await lease.drained, { kind: "cancelled" });
+    assert.equal(getEventListeners(cancel.signal, "abort").length, 0);
+    assert.equal(h.clock.pendingTimers, 0);
+    h.calls[0]!.resolve("late");
+    await settle();
+    assert.equal(lease.reopenA(), false);
+    assert.equal(lease.publishB(bundle()), false);
+    assert.equal(lease.finishB(), false);
+    assert.throws(() => h.c.suspendCodexSwitch({ signal: cancel.signal, remainingMs: 50 }));
+  });
+
+  it("a raw call settling within the duration proves drain and can reopen identical A", async () => {
+    const h = harness({ codex: true, ignoreAbort: true });
+    await running(h);
+    const initial = h.calls[0]!.opts.codex!;
+    const signal = new AbortController().signal;
+    const lease = h.c.suspendCodexSwitch({ signal, remainingMs: 50 });
+    assert.equal(lease.reopenA(), false);
+    assert.equal(lease.publishB(bundle()), false);
+    h.calls[0]!.resolve("aborted text");
+    assert.deepEqual(await lease.drained, { kind: "drained" });
+    assert.equal(h.clock.pendingTimers, 0);
+    assert.equal(getEventListeners(signal, "abort").length, 0);
+    assert.equal(lease.reopenA(), true);
+    assert.equal(lease.reopenA(), false);
+    h.c.observeFrame(toolUse("reviewer", "Read", { file_path: "next" }));
+    await h.clock.advance(NOW_MIN_INTERVAL_MS);
+    assert.equal(h.calls[1]!.opts.codex!.binding, initial.binding);
+    assert.equal(h.calls[1]!.opts.codex!.buildHarness, initial.buildHarness);
+    assert.equal(h.notes().length, 0);
+  });
+
+  it("publication retains nested callback holds, switches whole authority both directions, and retires late A callbacks", async () => {
+    for (const firstMode of ["api_key", "subscription"] as const) {
+      const h = harness({ codex: true, ignoreAbort: true });
+      // A first switch supplies a subscription A for the reverse direction.
+      if (firstMode === "subscription") {
+        const seed = h.c.suspendCodexSwitch({ signal: new AbortController().signal, remainingMs: 50 });
+        await seed.drained;
+        assert.equal(seed.publishB(bundle()), true);
+        assert.equal(seed.finishB(), true);
+      }
+      await running(h);
+      const a = h.calls[0]!;
+      const old = a.opts.codex!;
+      let release!: () => void;
+      const ctx = { attemptCredentialSwitch: () => new Promise<void>((r) => { release = r; }) };
+      holdContextCallbacks(ctx as unknown as RunContext, h.c);
+      const held = ctx.attemptCredentialSwitch();
+      const lease = h.c.suspendCodexSwitch({ signal: new AbortController().signal, remainingMs: 50 });
+      a.opts.onUsage?.(usage(1, 2));
+      a.resolve("A text");
+      assert.deepEqual(await lease.drained, { kind: "drained" });
+      const b = { ...bundle(firstMode === "api_key" ? "subscription" : "api_key"), ordinal: firstMode === "subscription" ? 2 : 1 };
+      assert.equal(lease.publishB(b), true);
+      assert.equal(lease.reopenA(), false);
+      assert.equal(lease.publishB(b), false);
+      const count = h.emitted.length;
+      a.opts.onUsage?.(usage(99, 99));
+      assert.equal(h.emitted.length, count);
+      h.c.observeFrame(toolUse("reviewer", "Read", { file_path: "B-work" }));
+      await h.clock.advance(NOW_MIN_INTERVAL_MS);
+      assert.equal(h.calls.length, 1, "publication keeps admission closed");
+      assert.equal(lease.finishB(), true);
+      await h.clock.advance(0);
+      assert.equal(h.calls.length, 1, "the held callback still blocks admission");
+      release();
+      await held;
+      await h.clock.advance(0);
+      const next = h.calls[1]!;
+      assert.equal(next.opts.codex!.binding.accessToken, "B-token");
+      assert.equal(next.opts.codex!.binding.authMode, b.binding.authMode);
+      assert.notEqual(next.opts.codex!.binding, old.binding);
+      assert.equal(Object.isFrozen(next.opts.codex!.binding), true);
+      assert.equal(next.opts.codex!.runId, old.runId);
+      assert.equal(next.opts.codex!.claimGeneration, old.claimGeneration);
+      assert.equal(next.opts.codex!.buildHarness, old.buildHarness);
+      await next.opts.codex!.buildHarness(next.opts.codex!);
+      assert.equal(h.factoryCalls.length, 1);
+      assert.equal(h.factoryCalls[0]!.binding.accessToken, "B-token");
+      assert.equal(h.factoryCalls[0]!.binding.authMode, b.binding.authMode);
+      assert.equal(h.factoryCalls[0]!.claimGeneration, 7);
+      assert.equal((next.opts.codex as unknown as { capabilityEpoch: number }).capabilityEpoch, 91);
+      next.opts.onUsage?.(usage(3, 4));
+      next.resolve("B work");
+      await settle();
+      assert.equal(h.emitted.at(-1)!.credentialEpochOrdinal, b.ordinal);
+    }
+  });
+
+  it("refuses invalid metadata and Claude, and stop wins over a pending or drained lease", async () => {
+    assert.throws(() => harness().c.suspendCodexSwitch({ signal: new AbortController().signal, remainingMs: 50 }));
+    for (const pending of [false, true]) {
+      const h = harness({ codex: true, ignoreAbort: true });
+      if (pending) await running(h);
+      const lease = h.c.suspendCodexSwitch({ signal: new AbortController().signal, remainingMs: 50 });
+      assert.throws(() => h.c.suspendCodexSwitch({ signal: new AbortController().signal, remainingMs: 50 }));
+      if (!pending) {
+        await lease.drained;
+        for (const bad of [
+          { ...bundle(), ordinal: 0 }, { ...bundle(), ordinal: 2 },
+          { ...bundle(), capabilityEpoch: 0 }, { ...bundle(), capabilityEpoch: NaN },
+          { ...bundle(), messageSeq: 0 }, { ...bundle(), messageSeq: NaN },
+          { ...bundle(), binding: { ...bundle().binding, accessToken: "" } },
+        ]) assert.equal(lease.publishB(bad), false);
+      }
+      const stopped = h.c.stop();
+      if (pending) await h.clock.advance(NOW_STOP_BOUND_MS);
+      await stopped;
+      assert.deepEqual(await lease.drained, { kind: pending ? "stopped" : "drained" });
+      assert.equal(lease.reopenA(), false);
+      assert.equal(lease.publishB(bundle()), false);
+      assert.equal(lease.finishB(), false);
+      if (pending) {
+        h.calls[0]!.resolve("late");
+        await settle();
+      }
+    }
+  });
+
+  it("never treats timeout of an unfinished raw call as drain proof", async () => {
+    const h = harness({ codex: true, ignoreAbort: true });
+    await running(h);
+    const lease = h.c.suspendCodexSwitch({ signal: new AbortController().signal, remainingMs: 50 });
+    assert.equal(h.calls[0]!.opts.signal!.aborted, true);
+    await h.clock.advance(50);
+    assert.deepEqual(await lease.drained, { kind: "timeout" });
+    assert.equal(lease.reopenA(), false);
+    h.calls[0]!.resolve("late A");
+    await settle();
+    assert.equal(lease.reopenA(), false);
+    assert.equal(h.clock.pendingTimers, 0);
+  });
+});
+
 describe("NowSummaryController: credential epoch attribution (issue #4201)", () => {
   it("a call started before an apply and settled after it keeps the old token and the base epoch", async () => {
     const cred = { token: "old-token", ordinal: 0 };
