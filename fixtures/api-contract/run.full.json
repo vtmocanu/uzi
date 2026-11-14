@@ -850,6 +850,11 @@
   "credential_switch": "x",
   "credential_epochs": [
     {
+      "codex_auth_mode": "x",
+      "codex_material_revision": 1,
+      "codex_account_key": "x",
+      "codex_account_id": "x",
+      "codex_claim_epoch": 1,
       "claim_generation": 1,
       "ordinal": 1,
       "secret_id": "x",

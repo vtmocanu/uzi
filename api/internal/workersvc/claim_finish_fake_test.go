@@ -309,3 +309,7 @@ func TestFinishRunClaimRetryHonoursCancel(t *testing.T) {
 		t.Fatalf("attempts=%d failed=%v, want one attempt and no write", fs.claimFinishBegins, fs.claimFailed)
 	}
 }
+
+func (t *fakeClaimFinishTx) RecordCodexCredentialEpoch(context.Context, store.RecordCodexCredentialEpochParams) error {
+	return nil
+}

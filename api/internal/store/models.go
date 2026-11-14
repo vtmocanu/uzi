@@ -1368,27 +1368,37 @@ type RunCompletionPermit struct {
 }
 
 type RunCredentialEpoch struct {
-	RunID           uuid.UUID          `json:"run_id"`
-	ClaimGeneration int64              `json:"claim_generation"`
-	SecretID        pgtype.UUID        `json:"secret_id"`
-	Label           pgtype.Text        `json:"label"`
-	SelectReason    pgtype.Text        `json:"select_reason"`
-	AppliedAt       pgtype.Timestamptz `json:"applied_at"`
+	RunID                 uuid.UUID          `json:"run_id"`
+	ClaimGeneration       int64              `json:"claim_generation"`
+	SecretID              pgtype.UUID        `json:"secret_id"`
+	Label                 pgtype.Text        `json:"label"`
+	SelectReason          pgtype.Text        `json:"select_reason"`
+	AppliedAt             pgtype.Timestamptz `json:"applied_at"`
+	CodexAuthMode         pgtype.Text        `json:"codex_auth_mode"`
+	CodexMaterialRevision pgtype.Int8        `json:"codex_material_revision"`
+	CodexAccountKey       pgtype.Text        `json:"codex_account_key"`
+	CodexAccountID        pgtype.Text        `json:"codex_account_id"`
+	CodexClaimEpoch       pgtype.Int8        `json:"codex_claim_epoch"`
 }
 
 type RunCredentialSwitchEpoch struct {
-	RunID               uuid.UUID          `json:"run_id"`
-	ClaimGeneration     int64              `json:"claim_generation"`
-	Ordinal             int32              `json:"ordinal"`
-	OpID                uuid.UUID          `json:"op_id"`
-	WorkerID            pgtype.UUID        `json:"worker_id"`
-	SecretID            pgtype.UUID        `json:"secret_id"`
-	SecretEnablementRev int64              `json:"secret_enablement_rev"`
-	Label               pgtype.Text        `json:"label"`
-	SelectReason        pgtype.Text        `json:"select_reason"`
-	MessageSeq          int32              `json:"message_seq"`
-	OldCumulative       []byte             `json:"old_cumulative"`
-	AppliedAt           pgtype.Timestamptz `json:"applied_at"`
+	RunID                 uuid.UUID          `json:"run_id"`
+	ClaimGeneration       int64              `json:"claim_generation"`
+	Ordinal               int32              `json:"ordinal"`
+	OpID                  uuid.UUID          `json:"op_id"`
+	WorkerID              pgtype.UUID        `json:"worker_id"`
+	SecretID              pgtype.UUID        `json:"secret_id"`
+	SecretEnablementRev   int64              `json:"secret_enablement_rev"`
+	Label                 pgtype.Text        `json:"label"`
+	SelectReason          pgtype.Text        `json:"select_reason"`
+	MessageSeq            int32              `json:"message_seq"`
+	OldCumulative         []byte             `json:"old_cumulative"`
+	AppliedAt             pgtype.Timestamptz `json:"applied_at"`
+	CodexAuthMode         pgtype.Text        `json:"codex_auth_mode"`
+	CodexMaterialRevision pgtype.Int8        `json:"codex_material_revision"`
+	CodexAccountKey       pgtype.Text        `json:"codex_account_key"`
+	CodexAccountID        pgtype.Text        `json:"codex_account_id"`
+	CodexClaimEpoch       pgtype.Int8        `json:"codex_claim_epoch"`
 }
 
 type RunDecisionMemo struct {

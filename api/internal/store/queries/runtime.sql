@@ -2359,7 +2359,8 @@ SET secret_id     = EXCLUDED.secret_id,
 -- epoch, oldest generation first, for the run-detail DTO's credential_epochs and for the
 -- M1 live-DB attribution test. Owner-scoped through the run join so a caller cannot read
 -- another user's journal.
-SELECT e.run_id, e.claim_generation, e.secret_id, e.label, e.select_reason, e.applied_at
+SELECT e.run_id, e.claim_generation, e.secret_id, e.label, e.select_reason, e.applied_at,
+       e.codex_auth_mode, e.codex_material_revision, e.codex_account_key, e.codex_account_id, e.codex_claim_epoch
 FROM run_credential_epochs e
 JOIN runs r ON r.id = e.run_id
 WHERE e.run_id = @run_id AND r.user_id = @user_id
@@ -2390,11 +2391,18 @@ ORDER BY claim_generation DESC, ordinal DESC
 LIMIT 1;
 
 -- name: RecordCodexCredentialEpoch :exec
--- Issue #4201: the Codex claim's journal row without RecordRunCredentialEpoch's settled_switch CTE
--- (Codex never takes the Claude held-switch path, so it must not clear a Claude switch stamp).
--- Idempotent on the claim.
-INSERT INTO run_credential_epochs (run_id, claim_generation, secret_id, label, select_reason, applied_at)
-VALUES (@run_id, @claim_generation, sqlc.narg('secret_id'), sqlc.narg('label'), sqlc.narg('select_reason'), now())
+-- Called under the exact-mint run lock, before the claim payload is released.
+-- Reuse the base epoch (ordinal 0); never touch the Anthropic switch stamp.
+INSERT INTO run_credential_epochs (
+    run_id, claim_generation, secret_id, label, select_reason, applied_at,
+    codex_auth_mode, codex_material_revision, codex_account_key, codex_account_id, codex_claim_epoch)
+SELECT @run_id, @claim_generation, sqlc.narg('secret_id'), sqlc.narg('label'),
+       sqlc.narg('select_reason'), now(), r.codex_auth_mode, r.codex_material_revision,
+       r.codex_account_key,
+       CASE WHEN r.codex_auth_mode = 'subscription'
+            THEN r.codex_account_key::jsonb ->> 1 END,
+       r.codex_claim_epoch
+FROM runs r WHERE r.id = @run_id AND r.harness = 'codex'
 ON CONFLICT (run_id, claim_generation) DO NOTHING;
 
 -- name: InsertRunCredentialSwitchEpoch :one
@@ -2411,11 +2419,13 @@ SELECT @run_id, @claim_generation::bigint,
        @op_id, sqlc.narg('worker_id'), sqlc.narg('secret_id'), @secret_enablement_rev,
        sqlc.narg('label'), sqlc.narg('select_reason'), @message_seq, sqlc.narg('old_cumulative')
 RETURNING run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
-          label, select_reason, message_seq, old_cumulative, applied_at;
+          label, select_reason, message_seq, old_cumulative, applied_at,
+          codex_auth_mode, codex_material_revision, codex_account_key, codex_account_id, codex_claim_epoch;
 
 -- name: GetRunCredentialSwitchEpochByOp :one
 SELECT run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
-       label, select_reason, message_seq, old_cumulative, applied_at
+       label, select_reason, message_seq, old_cumulative, applied_at,
+       codex_auth_mode, codex_material_revision, codex_account_key, codex_account_id, codex_claim_epoch
 FROM run_credential_switch_epochs
 WHERE op_id = @op_id AND run_id = @run_id;
 
@@ -2450,7 +2460,8 @@ UPDATE workers SET credential_switch_apply_nonce = @nonce WHERE id = @id;
 -- name: ListRunCredentialSwitchEpochs :many
 -- Owner-scoped child epochs for one run, oldest first (the sibling of ListRunCredentialEpochs).
 SELECT e.run_id, e.claim_generation, e.ordinal, e.op_id, e.worker_id, e.secret_id,
-       e.secret_enablement_rev, e.label, e.select_reason, e.message_seq, e.old_cumulative, e.applied_at
+       e.secret_enablement_rev, e.label, e.select_reason, e.message_seq, e.old_cumulative, e.applied_at,
+       e.codex_auth_mode, e.codex_material_revision, e.codex_account_key, e.codex_account_id, e.codex_claim_epoch
 FROM run_credential_switch_epochs e
 JOIN runs r ON r.id = e.run_id
 WHERE e.run_id = @run_id AND r.user_id = @user_id

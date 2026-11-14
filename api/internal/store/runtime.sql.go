@@ -6763,6 +6763,15 @@ type GetPriorRunCredentialEpochParams struct {
 	ClaimGeneration int64     `json:"claim_generation"`
 }
 
+type GetPriorRunCredentialEpochRow struct {
+	RunID           uuid.UUID          `json:"run_id"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	SecretID        pgtype.UUID        `json:"secret_id"`
+	Label           pgtype.Text        `json:"label"`
+	SelectReason    pgtype.Text        `json:"select_reason"`
+	AppliedAt       pgtype.Timestamptz `json:"applied_at"`
+}
+
 // The epoch IMMEDIATELY BEFORE @claim_generation for a run (PRD #1247 M9, task c step 5): the
 // highest-generation epoch strictly below the current claim's generation. recordRunCredential
 // consults it to detect an APPLIED credential switch — if a prior epoch exists AND its secret_id
@@ -6774,9 +6783,9 @@ type GetPriorRunCredentialEpochParams struct {
 // Issue #4201: in-place applies journal child epochs in run_credential_switch_epochs, so the
 // candidates are the union of both tables and the winner is the highest (generation, ordinal);
 // a base epoch has ordinal 0. The output shape is unchanged.
-func (q *Queries) GetPriorRunCredentialEpoch(ctx context.Context, arg GetPriorRunCredentialEpochParams) (RunCredentialEpoch, error) {
+func (q *Queries) GetPriorRunCredentialEpoch(ctx context.Context, arg GetPriorRunCredentialEpochParams) (GetPriorRunCredentialEpochRow, error) {
 	row := q.db.QueryRow(ctx, getPriorRunCredentialEpoch, arg.RunID, arg.ClaimGeneration)
-	var i RunCredentialEpoch
+	var i GetPriorRunCredentialEpochRow
 	err := row.Scan(
 		&i.RunID,
 		&i.ClaimGeneration,
@@ -7743,7 +7752,8 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 
 const getRunCredentialSwitchEpochByOp = `-- name: GetRunCredentialSwitchEpochByOp :one
 SELECT run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
-       label, select_reason, message_seq, old_cumulative, applied_at
+       label, select_reason, message_seq, old_cumulative, applied_at,
+       codex_auth_mode, codex_material_revision, codex_account_key, codex_account_id, codex_claim_epoch
 FROM run_credential_switch_epochs
 WHERE op_id = $1 AND run_id = $2
 `
@@ -7769,6 +7779,11 @@ func (q *Queries) GetRunCredentialSwitchEpochByOp(ctx context.Context, arg GetRu
 		&i.MessageSeq,
 		&i.OldCumulative,
 		&i.AppliedAt,
+		&i.CodexAuthMode,
+		&i.CodexMaterialRevision,
+		&i.CodexAccountKey,
+		&i.CodexAccountID,
+		&i.CodexClaimEpoch,
 	)
 	return i, err
 }
@@ -10791,7 +10806,8 @@ SELECT $1, $2::bigint,
        $3, $4, $5, $6,
        $7, $8, $9, $10
 RETURNING run_id, claim_generation, ordinal, op_id, worker_id, secret_id, secret_enablement_rev,
-          label, select_reason, message_seq, old_cumulative, applied_at
+          label, select_reason, message_seq, old_cumulative, applied_at,
+          codex_auth_mode, codex_material_revision, codex_account_key, codex_account_id, codex_claim_epoch
 `
 
 type InsertRunCredentialSwitchEpochParams struct {
@@ -10838,6 +10854,11 @@ func (q *Queries) InsertRunCredentialSwitchEpoch(ctx context.Context, arg Insert
 		&i.MessageSeq,
 		&i.OldCumulative,
 		&i.AppliedAt,
+		&i.CodexAuthMode,
+		&i.CodexMaterialRevision,
+		&i.CodexAccountKey,
+		&i.CodexAccountID,
+		&i.CodexClaimEpoch,
 	)
 	return i, err
 }
@@ -12996,7 +13017,8 @@ func (q *Queries) ListReplayRunInputs(ctx context.Context, runID uuid.UUID) ([]L
 }
 
 const listRunCredentialEpochs = `-- name: ListRunCredentialEpochs :many
-SELECT e.run_id, e.claim_generation, e.secret_id, e.label, e.select_reason, e.applied_at
+SELECT e.run_id, e.claim_generation, e.secret_id, e.label, e.select_reason, e.applied_at,
+       e.codex_auth_mode, e.codex_material_revision, e.codex_account_key, e.codex_account_id, e.codex_claim_epoch
 FROM run_credential_epochs e
 JOIN runs r ON r.id = e.run_id
 WHERE e.run_id = $1 AND r.user_id = $2
@@ -13028,6 +13050,11 @@ func (q *Queries) ListRunCredentialEpochs(ctx context.Context, arg ListRunCreden
 			&i.Label,
 			&i.SelectReason,
 			&i.AppliedAt,
+			&i.CodexAuthMode,
+			&i.CodexMaterialRevision,
+			&i.CodexAccountKey,
+			&i.CodexAccountID,
+			&i.CodexClaimEpoch,
 		); err != nil {
 			return nil, err
 		}
@@ -13041,7 +13068,8 @@ func (q *Queries) ListRunCredentialEpochs(ctx context.Context, arg ListRunCreden
 
 const listRunCredentialSwitchEpochs = `-- name: ListRunCredentialSwitchEpochs :many
 SELECT e.run_id, e.claim_generation, e.ordinal, e.op_id, e.worker_id, e.secret_id,
-       e.secret_enablement_rev, e.label, e.select_reason, e.message_seq, e.old_cumulative, e.applied_at
+       e.secret_enablement_rev, e.label, e.select_reason, e.message_seq, e.old_cumulative, e.applied_at,
+       e.codex_auth_mode, e.codex_material_revision, e.codex_account_key, e.codex_account_id, e.codex_claim_epoch
 FROM run_credential_switch_epochs e
 JOIN runs r ON r.id = e.run_id
 WHERE e.run_id = $1 AND r.user_id = $2
@@ -13076,6 +13104,11 @@ func (q *Queries) ListRunCredentialSwitchEpochs(ctx context.Context, arg ListRun
 			&i.MessageSeq,
 			&i.OldCumulative,
 			&i.AppliedAt,
+			&i.CodexAuthMode,
+			&i.CodexMaterialRevision,
+			&i.CodexAccountKey,
+			&i.CodexAccountID,
+			&i.CodexClaimEpoch,
 		); err != nil {
 			return nil, err
 		}
@@ -20079,8 +20112,16 @@ func (q *Queries) ReconcileRunMR(ctx context.Context, arg ReconcileRunMRParams) 
 }
 
 const recordCodexCredentialEpoch = `-- name: RecordCodexCredentialEpoch :exec
-INSERT INTO run_credential_epochs (run_id, claim_generation, secret_id, label, select_reason, applied_at)
-VALUES ($1, $2, $3, $4, $5, now())
+INSERT INTO run_credential_epochs (
+    run_id, claim_generation, secret_id, label, select_reason, applied_at,
+    codex_auth_mode, codex_material_revision, codex_account_key, codex_account_id, codex_claim_epoch)
+SELECT $1, $2, $3, $4,
+       $5, now(), r.codex_auth_mode, r.codex_material_revision,
+       r.codex_account_key,
+       CASE WHEN r.codex_auth_mode = 'subscription'
+            THEN r.codex_account_key::jsonb ->> 1 END,
+       r.codex_claim_epoch
+FROM runs r WHERE r.id = $1 AND r.harness = 'codex'
 ON CONFLICT (run_id, claim_generation) DO NOTHING
 `
 
@@ -20092,9 +20133,8 @@ type RecordCodexCredentialEpochParams struct {
 	SelectReason    pgtype.Text `json:"select_reason"`
 }
 
-// Issue #4201: the Codex claim's journal row without RecordRunCredentialEpoch's settled_switch CTE
-// (Codex never takes the Claude held-switch path, so it must not clear a Claude switch stamp).
-// Idempotent on the claim.
+// Called under the exact-mint run lock, before the claim payload is released.
+// Reuse the base epoch (ordinal 0); never touch the Anthropic switch stamp.
 func (q *Queries) RecordCodexCredentialEpoch(ctx context.Context, arg RecordCodexCredentialEpochParams) error {
 	_, err := q.db.Exec(ctx, recordCodexCredentialEpoch,
 		arg.RunID,

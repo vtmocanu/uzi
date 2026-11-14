@@ -34,6 +34,17 @@ const finishRunClaimAttempts = 3
 // finishRunClaimRetryDelay is the pause between those attempts. A var so a test can shrink it.
 var finishRunClaimRetryDelay = 75 * time.Millisecond
 
+// A baseline failure is recoverable only after an explicit successful rollback.
+// Commit errors never receive this marker, even if a subsequent read finds no row.
+type codexBaselineRolledBack struct {
+	cause error
+	epoch int64
+	hash  []byte
+}
+
+func (e *codexBaselineRolledBack) Error() string { return e.cause.Error() }
+func (e *codexBaselineRolledBack) Unwrap() error { return e.cause }
+
 type codexMintedClaimError struct {
 	cause error
 	epoch int64
@@ -51,6 +62,7 @@ type claimRecoveryIdentity struct {
 // claimFinishQueries is the statement surface of finishRunClaim's exact-claim transaction.
 // *store.Queries bound to the pgx transaction satisfies it.
 type claimFinishQueries interface {
+	RecordCodexCredentialEpoch(context.Context, store.RecordCodexCredentialEpochParams) error
 	GetRunOwnedByWorkerForUpdate(ctx context.Context, arg store.GetRunOwnedByWorkerForUpdateParams) (store.Run, error)
 	LockCodexAliasForShareNowait(ctx context.Context, arg store.LockCodexAliasForShareNowaitParams) (store.LockCodexAliasForShareNowaitRow, error)
 	LockCodexAccountForShareNowait(ctx context.Context, arg store.LockCodexAccountForShareNowaitParams) (uuid.UUID, error)
@@ -197,6 +209,23 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 			}
 			return out, nil
 		}
+		var baseline *codexBaselineRolledBack
+		if errors.As(err, &baseline) {
+			// One fresh settlement transaction, fenced by the original exact mint.
+			// A moved identity is idle; failure here is returned without further retries.
+			cause := &codexMintedClaimError{
+				cause: fmt.Errorf("%w: codex baseline recording failed", errCredentialUnavailable),
+				epoch: baseline.epoch, hash: baseline.hash,
+			}
+			_, status, settleErr := s.finishRunClaimTx(ctx, run, nil, cause, false, identity)
+			if settleErr != nil {
+				return nil, errors.Join(err, settleErr)
+			}
+			if status == "failed" {
+				s.notify(run.ID, "failed")
+			}
+			return nil, err
+		}
 		if errors.Is(err, errClaimRecoveryNoTx) && assemblyErr != nil {
 			return nil, fmt.Errorf("%w: %w", err, assemblyErr)
 		}
@@ -242,7 +271,7 @@ func claudeCheckerClaimError(run store.Run, err error) error {
 // finishRunClaimTx is one attempt of finishRunClaim's transaction. It returns the payload to
 // deliver (nil for idle) and the status it committed that the caller must publish ("failed"
 // for a terminal failure, "paused" for the credential_disabled park, "" otherwise), or an
-// error after which nothing was committed.
+// error. A commit error can be ambiguous and must never trigger settlement.
 func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *ClaimPayload, assemblyErr error, transient bool, identity claimRecoveryIdentity) (*ClaimPayload, string, error) {
 	q, err := s.beginClaimFinish(ctx)
 	if err != nil {
@@ -480,6 +509,14 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			decision, origin = serr, "provisioning_failed"
 			holdClass, transient = false, false
 		} else {
+			if locked.Harness == harnessCodex && payload != nil && payload.Secrets.Codex != nil {
+				if err := recordCodexEpoch(ctx, q, locked); err != nil {
+					if rollbackErr := q.Rollback(ctx); rollbackErr != nil {
+						return nil, "", errors.Join(err, rollbackErr)
+					}
+					return nil, "", &codexBaselineRolledBack{cause: err, epoch: epoch, hash: hash}
+				}
+			}
 			if err := q.Commit(ctx); err != nil {
 				return nil, "", err
 			}

@@ -1181,14 +1181,19 @@ type CredentialOverrideDTO struct {
 // epoch's own spend, computed by telescoping the run's usage legs, and is omitted when the run has
 // recorded none.
 type CredentialEpochDTO struct {
-	ClaimGeneration int64                    `json:"claim_generation"`
-	Ordinal         int32                    `json:"ordinal"`
-	SecretID        *string                  `json:"secret_id"`
-	Label           *string                  `json:"label"`
-	SelectReason    *string                  `json:"select_reason"`
-	AppliedAt       time.Time                `json:"applied_at"`
-	MessageSeq      *int32                   `json:"message_seq,omitempty"`
-	Usage           *CredentialEpochUsageDTO `json:"usage,omitempty"`
+	CodexAuthMode         *string                  `json:"codex_auth_mode,omitempty"`
+	CodexMaterialRevision *int64                   `json:"codex_material_revision,omitempty"`
+	CodexAccountKey       *string                  `json:"codex_account_key,omitempty"`
+	CodexAccountID        *string                  `json:"codex_account_id,omitempty"`
+	CodexClaimEpoch       *int64                   `json:"codex_claim_epoch,omitempty"`
+	ClaimGeneration       int64                    `json:"claim_generation"`
+	Ordinal               int32                    `json:"ordinal"`
+	SecretID              *string                  `json:"secret_id"`
+	Label                 *string                  `json:"label"`
+	SelectReason          *string                  `json:"select_reason"`
+	AppliedAt             time.Time                `json:"applied_at"`
+	MessageSeq            *int32                   `json:"message_seq,omitempty"`
+	Usage                 *CredentialEpochUsageDTO `json:"usage,omitempty"`
 }
 
 // CredentialEpochUsageDTO is one credential epoch's spend (issue #4201). The fields mean what the
