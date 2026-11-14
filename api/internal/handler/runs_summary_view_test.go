@@ -17,7 +17,10 @@ import (
 // Issue #2661: GET /api/runs and /api/admin/runs accept ?view=summary, which drops the four
 // heavy detail keys from every row and changes nothing else.
 
-var summaryHeavyKeys = []string{"plan_md", "repo_agents", "repo_agent_source_commit", "issue_description", "preserved_patch"}
+// The run-start choice keys (PRD #3250) are omitted from the summary too: a deliberate wire
+// decision pinned by apitypes.summaryOmitted, not a size cut.
+var summaryHeavyKeys = []string{"plan_md", "repo_agents", "repo_agent_source_commit", "issue_description", "preserved_patch",
+	"effort", "model_source", "effort_source"}
 
 // heavyRun is a store.Run with all four heavy fields populated, so the default view really
 // carries them and a leaked key in the summary view is detectable.
