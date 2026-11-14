@@ -123,7 +123,10 @@ protected; committed-only coverage cannot discharge unproven residue.
   and a 30 s answer grace. The write deadline is their 300 s sum. The worker's
   per-request timeout for this route alone is 330 s
   (`HELD_PUBLICATION_TIMEOUT_MS`, `agent/src/client.ts`). At most four
-  requests are in flight process-wide (429 `busy` otherwise).
+  requests are in flight process-wide (429 `busy` otherwise). Hardening
+  (2026-11-14): held-work and terminal-preservation uploads share an additional
+  limit of one in-flight request per authenticated worker. Both reservations
+  release together when request handling ends; the existing busy response is unchanged.
   Clarification (#4140): that 330 s is narrowed only by budgets, slot
   deadlines and cancellation the enclosing scope already holds. The worker's
   own frozen-preparation clock (30 s on a background recovery pass, the scan

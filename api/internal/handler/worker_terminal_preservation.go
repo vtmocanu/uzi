@@ -47,7 +47,7 @@ var terminalTipRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // terminalPublisher is the workersvc surface the route uses; *workersvc.Service satisfies it, and a
 // test Handler can set terminalSvc to a fake without a database.
 type terminalPublisher interface {
-	AcquireHeldPublishSlot() (release func(), ok bool)
+	AcquireHeldPublishSlot(workerID uuid.UUID) (release func(), ok bool)
 	TerminalPreservationGate(ctx context.Context, wkr store.Worker, runID uuid.UUID) error
 	PublishTerminal(ctx context.Context, wkr store.Worker, runID uuid.UUID, req workersvc.TerminalPublishRequest) (workersvc.TerminalPublishResult, error)
 }
@@ -81,7 +81,7 @@ func (h *Handler) WorkerRunTerminalPreservation(w http.ResponseWriter, r *http.R
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	release, ok := svc.AcquireHeldPublishSlot()
+	release, ok := svc.AcquireHeldPublishSlot(wkr.ID)
 	if !ok {
 		w.Header().Set("Retry-After", "5")
 		httpx.ErrorReason(w, http.StatusTooManyRequests, "terminal preservation uploads are busy", "busy")

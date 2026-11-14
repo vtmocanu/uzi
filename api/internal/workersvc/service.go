@@ -2115,13 +2115,16 @@ type Service struct {
 	// heldPrepareFn / heldSendFn / heldListFn are step A's broker seams (issue #2545): the
 	// read-only pack pre-verify, the single create-only push and the reconcile listing. They
 	// default to pushbroker.PrepareHeldPack, SendHeldCreate and ListRefTips (set in New); tests
-	// stub them with a fake forge. heldSlots is the process-wide step-A semaphore.
+	// stub them with a fake forge. heldSlots is the shared publication semaphore;
+	// heldSlotsMu protects each worker reservation together with its global slot.
 	// heldOutcomeHook, when set, runs inside tx2 before its commit (fault injection).
 	heldPrepareFn      func(ctx context.Context, o pushbroker.HeldPackOptions) (*pushbroker.PreparedHeldPack, error)
 	heldSendFn         func(ctx context.Context, p *pushbroker.PreparedHeldPack) (pushbroker.HeldCreateOutcome, error)
 	heldListFn         func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
 	prerequisite       *prerequisiteRuntime
 	heldSlots          chan struct{}
+	heldSlotsMu        sync.Mutex
+	heldSlotWorkers    map[uuid.UUID]struct{}
 	heldBeforeSendHook func()
 	heldOutcomeHook    func() error
 	// heldDeleteFn is the held cleanup's CAS delete (default pushbroker.Delete); heldCleanupHook,
@@ -2486,6 +2489,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		heldListFn:           pushbroker.ListRefTips,
 		heldDeleteFn:         pushbroker.Delete,
 		heldSlots:            make(chan struct{}, heldPublishMaxConcurrent),
+		heldSlotWorkers:      make(map[uuid.UUID]struct{}, heldPublishMaxConcurrent),
 		prerequisite:         newPrerequisiteRuntime(),
 		createRefFn:          pushbroker.CreateRef,
 		listRefTipsFn:        pushbroker.ListRefTips,
