@@ -80,6 +80,10 @@ describe("terminal preservation gate (#4007 slice B, production-dark)", () => {
           terminalPreservationTestOverride: {},
         });
         assert.equal(withOverride.terminalPreservationEnabled(), true);
+        // The runner's own coordinator shares the gate in both directions.
+        const coordOf = (r: RunRunner) => (r as unknown as { recovery: RecoveryCoordinator }).recovery;
+        assert.equal(coordOf(runner).terminalPreservationEnabled(), false);
+        assert.equal(coordOf(withOverride).terminalPreservationEnabled(), true);
       }
       const coord = new RecoveryCoordinator({
         client: new FakeRecoveryClient(),
@@ -112,6 +116,14 @@ describe("terminal preservation gate (#4007 slice B, production-dark)", () => {
       if (f === gatePath) continue;
       const text = fs.readFileSync(f, "utf8");
       assert.ok(!/TERMINAL_PRESERVATION_ENABLED\s*=[^=]/.test(text), `${path.basename(f)} must not assign the gate`);
+    }
+    // Only the two declaring classes may name the override: no helper elsewhere can build options
+    // that main.ts or worker.ts spread in.
+    const allowed = new Set([path.join(SRC_DIR, "runner.ts"), path.join(SRC_DIR, "recovery.ts")]);
+    for (const f of srcFiles()) {
+      if (allowed.has(f)) continue;
+      assert.ok(!fs.readFileSync(f, "utf8").includes("terminalPreservationTestOverride"),
+        `${path.relative(SRC_DIR, f)} must not name the test override`);
     }
     const gate = fs.readFileSync(gatePath, "utf8");
     assert.match(gate, /export const TERMINAL_PRESERVATION_ENABLED: boolean = false;/);

@@ -3855,6 +3855,8 @@ export class RunRunner {
       opts.recovery ??
       new RecoveryCoordinator({
         ...(opts.authority ? { authority: opts.authority } : {}),
+        // #4007 slice B: one gate for the runner and its coordinator (test-only; main never sets it).
+        ...(opts.terminalPreservationTestOverride ? { terminalPreservationTestOverride: opts.terminalPreservationTestOverride } : {}),
         client: this.client,
         git: this.git,
         log: this.log,
