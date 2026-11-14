@@ -428,19 +428,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// claimUsers maps a PVC claim name to the uids of every pod in the namespace, labelled
 	// or not, that mounts it: a writer the worker's own label never shows (hibernation
 	// volume inventory, PRD #4208).
-	claimUsers := map[string][]string{}
+	claimUsers := claimUsersOf(pods.Items)
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.UID != "" {
-			seen := map[string]bool{}
-			for _, v := range p.Spec.Volumes {
-				if v.PersistentVolumeClaim == nil || seen[v.PersistentVolumeClaim.ClaimName] {
-					continue
-				}
-				seen[v.PersistentVolumeClaim.ClaimName] = true
-				claimUsers[v.PersistentVolumeClaim.ClaimName] = append(claimUsers[v.PersistentVolumeClaim.ClaimName], string(p.UID))
-			}
-		}
 		id, ours := IsOurs(p.Labels)
 		if !ours {
 			m.flagUnmanagedPod(p.Name, ns)
@@ -499,6 +489,28 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		o.Roll.TargetImage = targetImages[id]
 	}
 	return nil
+}
+
+// claimUsersOf maps a PVC claim name to the uids of every pod in the list that mounts it.
+// The roll snapshot derives the PVC-user set with it from the same list that supplies
+// WorkerPodUIDs, so one report's pod set and PVC-user set never come from two reads.
+func claimUsersOf(pods []corev1.Pod) map[string][]string {
+	users := map[string][]string{}
+	for i := range pods {
+		p := &pods[i]
+		if p.UID == "" {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, v := range p.Spec.Volumes {
+			if v.PersistentVolumeClaim == nil || seen[v.PersistentVolumeClaim.ClaimName] {
+				continue
+			}
+			seen[v.PersistentVolumeClaim.ClaimName] = true
+			users[v.PersistentVolumeClaim.ClaimName] = append(users[v.PersistentVolumeClaim.ClaimName], string(p.UID))
+		}
+	}
+	return users
 }
 
 // pvcUserPodUIDs returns the sorted, de-duplicated uids of the pods that mount any of the

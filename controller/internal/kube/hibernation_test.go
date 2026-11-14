@@ -68,7 +68,7 @@ func hibPod(uid string, hash string, ready, terminating bool) *corev1.Pod {
 	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: "pod-" + uid, Namespace: testConfig().Namespace, UID: types.UID(uid), Labels: objectLabels("w1"),
 		Annotations: map[string]string{AnnotationSpecHash: hash},
-	}}
+	}, Spec: corev1.PodSpec{Volumes: []corev1.Volume{hibClaimVolume(dataPVCName("w1"))}}}
 	if ready {
 		p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 	}
@@ -77,6 +77,17 @@ func hibPod(uid string, hash string, ready, terminating bool) *corev1.Pod {
 		p.DeletionTimestamp = &now
 	}
 	return p
+}
+
+func hibClaimVolume(claim string) corev1.Volume {
+	return corev1.Volume{Name: "v-" + claim, VolumeSource: corev1.VolumeSource{
+		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim}}}
+}
+
+// hibStray is an unlabelled pod (invisible to the worker's label) mounting the given claim.
+func hibStray(uid, claim string) *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "stray-" + uid, Namespace: testConfig().Namespace, UID: types.UID(uid)},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{hibClaimVolume(claim)}}}
 }
 
 func hibW(state, op string) protocol.DesiredWorker {

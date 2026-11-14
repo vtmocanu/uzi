@@ -513,10 +513,14 @@ func (m *Materializer) reportObserved(ctx context.Context, w protocol.DesiredWor
 	if !obs.PodsKnown || pod == "" {
 		return nil
 	}
+	pvcs := m.inventoryPVCs(ctx, obs)
+	if len(pvcs) == 0 {
+		return nil // no claim observed: hold this tick rather than report an empty inventory
+	}
 	t := protocol.HibernationTransition{
 		OpID: w.Hibernation.OpID, Transition: protocol.TransitionObserved,
 		DeploymentUID: obs.DeploymentUID, ResourceVersion: obs.DeploymentResourceVersion, PodUID: pod,
-		PVCs: m.inventoryPVCs(ctx, obs),
+		PVCs: pvcs,
 	}
 	setObservationFacts(&t, obs)
 	return m.reportHibernation(ctx, w, t)

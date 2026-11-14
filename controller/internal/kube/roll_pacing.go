@@ -1514,6 +1514,9 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 		// The snapshot is newer than Observe's lists; the hibernation arm reads pod
 		// absence and readiness from this refreshed view.
 		applyPodEvidence(&e.o, e.pods)
+		// PodsKnown was just set from this list, so the PVC-user set comes from it too
+		// (Observe's own pod list may have failed and left it unset).
+		e.o.PVCUserPodUIDs = pvcUserPodUIDs(claimUsersOf(pods), e.w.ID)
 		health := deriveRollHealth(current, e.target.Spec.Template.Annotations[AnnotationSpecHash], failure, m.now())
 		if e.o.Roll.Phase != protocol.PhaseStuck || e.o.Roll.PodPhase != string(corev1.ClaimPending) {
 			e.o.Roll = health
