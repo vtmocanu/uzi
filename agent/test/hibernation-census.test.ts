@@ -454,11 +454,12 @@ it("recovery-episode and cross-check refs keep a bare protected; a worktrees dir
   put("repos/ep.git/refs/uzi-recovery-episode/run/tip", `${TIP}\n`);
   put("repos/epp.git/packed-refs", `${TIP} refs/uzi-recovery-episode/run/tip\n`);
   put("repos/cc.git/refs/uzi-cross-check/x", `${TIP}\n`);
+  put("repos/ccp.git/packed-refs", `${TIP} refs/uzi-cross-check/x\n`);
   put("repos/wt.git/worktrees/w/index", "staged");
   put("repos/sc.git/refs/uzi-workflow-target/u", `${TIP}\n`);
   put("repos/sc.git/refs/uzi-secret-scan-floor/main", `${TIP}\n`);
   const result = await run();
-  for (const p of ["repos/ep.git", "repos/epp.git", "repos/cc.git"]) assert.equal(byPath(result, p)?.classification, "protected", p);
+  for (const p of ["repos/ep.git", "repos/epp.git", "repos/cc.git", "repos/ccp.git"]) assert.equal(byPath(result, p)?.classification, "protected", p);
   assert.equal(byPath(result, "repos/wt.git/worktrees")?.classification, "unknown");
   assert.equal(byPath(result, "repos/sc.git")?.classification, "disposable");
   assert.deepEqual(result.entries.filter(e => e.kind === "unknown_path" && e.path.startsWith("repos/sc.git")), []);

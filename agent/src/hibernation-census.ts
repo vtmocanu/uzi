@@ -516,9 +516,10 @@ function unknownBareNodes(tree: Tree, bare: Node, out: Gathered): void {
 }
 
 /** Ref namespaces whose objects are recovery or settlement state (git.ts: refs/uzi-archive, refs/uzi-settle,
- *  refs/uzi-recovery-pin, refs/uzi-owed, refs/uzi-coverage). */
-// uzi-recovery-episode pins captured, unpushed recovery work and is never cleaned up; uzi-cross-check pins a
-// local-only code snapshot. Both are protected (fail closed), even though that can keep a bare protected for good.
+ *  refs/uzi-recovery-pin, refs/uzi-owed, refs/uzi-coverage, refs/uzi-recovery-episode, refs/uzi-cross-check). */
+// uzi-recovery-episode pins captured, unpushed recovery work and is removed only by an explicit retained-recovery
+// discard (never by generation cleanup); uzi-cross-check pins a local-only code snapshot until it is retired. Both are
+// protected (fail closed), even though an undiscarded episode keeps its bare protected.
 const PROTECTED_REF_DIRS = ["uzi-archive", "uzi-settle", "uzi-recovery-pin", "uzi-owed", "uzi-coverage",
   "uzi-recovery-episode", "uzi-cross-check"];
 const PROTECTED_PACKED_REF = / refs\/uzi-(?:archive|settle|recovery-pin|owed|coverage|recovery-episode|cross-check)\//;
