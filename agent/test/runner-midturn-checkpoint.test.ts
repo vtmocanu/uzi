@@ -5836,6 +5836,40 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
         assert.equal(failed.at(-1)!.reconciled, false);
         assert.match(String(failed.at(-1)!.error), /reconcile boom/);
       });
+
+      it("a rejection after a completed reconcile still records its retained lock and blocks the sink, never labelled a timeout", { timeout: 90_000 }, async () => {
+        const { lines, runId } = await lockScenario(4258_303, {}, async ({ r, seam, lockFile, stop }) => {
+          const g = r.g as unknown as { withRecoveryOperation: (...a: unknown[]) => Promise<unknown> };
+          const orig = g.withRecoveryOperation;
+          let armed = false;
+          let injected = 0;
+          g.withRecoveryOperation = function (this: unknown, ...args: unknown[]) {
+            const p = orig.apply(this, args);
+            // Only the seam cleanup's unbounded-budget call after the stop: the action runs fully, then rejects.
+            if (!armed || args[1] !== Infinity) return p;
+            injected++;
+            return p.then(() => { throw new Error("post-acquire boom"); });
+          };
+          try {
+            fs.writeFileSync(lockFile, "x");
+            armed = true;
+            stop();
+            const d = await bounded(seam, BOUND_MS + 15_000, "the seam resolving after a post-reconcile failure", "mid-run seam");
+            assert.deepEqual(d, { action: "proceed" });
+            assert.ok(injected >= 1, "the post-acquire failure was injected");
+            assert.ok(retainedHas(r, lockFile), "the reconciled retained lock is recorded despite the later rejection");
+          } finally {
+            g.withRecoveryOperation = orig;
+          }
+        });
+        assert.deepEqual(logged(lines, NOT_RUN), [], "never labelled a lock-wait timeout");
+        assert.equal(logged(lines, RETAINED).length, 1, "the reconcile result was recorded");
+        assert.equal(statusTexts(runId).filter((t) => t === SINK_BLOCKED).length, 1, "the sink-blocked status was emitted");
+        const failed = logged(lines, FAILED);
+        assert.ok(failed.length >= 1);
+        assert.equal(failed.at(-1)!.reconciled, true);
+        assert.match(String(failed.at(-1)!.error), /post-acquire boom/);
+      });
     });
 
     it("a surviving process group keeps the seam open and the sink gate held until it is gone", { timeout: 90_000 }, async () => {

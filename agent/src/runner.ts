@@ -20953,7 +20953,8 @@ export class RunRunner {
       });
       blockSinkOnLocks(res.retained.map((r) => r.path));
     };
-    // The reconcile did not run (or did not finish): fail closed on every lock path that exists now.
+    // The reconcile result was never obtained (not run, or it threw before returning): fail closed on every
+    // lock path that exists now. A reconcile that returned is recorded through recordLocks instead.
     const recordUnreconciledLocks = async (): Promise<void> => {
       const present: string[] = [];
       try {
@@ -21026,15 +21027,25 @@ export class RunRunner {
             this.git.withBareLock(barePath, async () => {
               acquired = true;
               cancelWait();
-              return spawner.reconcileLocks();
+              // Kept outside the wrappers: a rejection after this point (the lock's or the recovery
+              // operation's post-action interruption check) must not discard the recorded evidence.
+              res = await spawner.reconcileLocks();
+              return res;
             }));
         } catch (e) {
           failure = e;
         } finally {
           cancelWait();
         }
-        if (res) recordLocks(res);
-        else if (!acquired && waitAc.signal.aborted) {
+        if (res) {
+          // The reconcile ran to completion; a later wrapper failure only needs to be reported.
+          if (failure !== undefined) {
+            runLog.warn("mid-turn checkpoint lock reconcile failed", {
+              run_id: runId, reconciled: true, error: errMessage(failure),
+            });
+          }
+          recordLocks(res);
+        } else if (!acquired && waitAc.signal.aborted) {
           runLog.warn("mid-run secret remediation lock reconcile not run", {
             run_id: runId, reconciled: false, reason: "lock_wait_timeout",
           });
