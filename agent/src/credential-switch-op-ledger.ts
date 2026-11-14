@@ -279,7 +279,7 @@ export type LedgerApplyResult = (CredentialSwitchApplyResult & { priorAmbiguous?
 /**
  * The `not_applied` reasons that prove the op can NEVER commit (api credential_switch_apply.go): answered after
  * the server's replay check, for an op that can never become applicable again. `no_pending_switch`: the op is
- * not the pending one, and every new stamp mints a fresh op id (migration 00438 trigger). `generation_mismatch`:
+ * not the pending one, and every new stamp mints a fresh op id (migration 00442 trigger). `generation_mismatch`:
  * permanent because the stamp generation is fixed per op (the only writer that sets the op id sets the stamp
  * generation with it; the other stamp writer only keeps or nulls the stamp), and the step-0 fence plus the
  * increment-only runs.claim_generation rule out a delayed send landing at another generation. Every other

@@ -1,6 +1,6 @@
 -- +goose Up
--- Issue #4201: the run_credential_switch_epochs.secret_id foreign key, apart from 00442 so that no
--- migration holds a lock on runs while it waits on user_secrets (see 00442). The table is new and
+-- Issue #4201: the run_credential_switch_epochs.secret_id foreign key, apart from 00446 so that no
+-- migration holds a lock on runs while it waits on user_secrets (see 00446). The table is new and
 -- empty, so the constraint validates instantly; this locks only that table and user_secrets.
 SET LOCAL lock_timeout = '5s';
 ALTER TABLE run_credential_switch_epochs

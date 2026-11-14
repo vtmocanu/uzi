@@ -1,8 +1,8 @@
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
--- Issue #4201. The ordinal columns and the worker nonce are in 00439..00441, one busy table per
+-- Issue #4201. The ordinal columns and the worker nonce are in 00443..00445, one busy table per
 -- migration; this file only creates the table, whose run_id foreign key locks runs. The secret_id
--- foreign key (which locks user_secrets) is 00443: holding runs while waiting on user_secrets cycles
+-- foreign key (which locks user_secrets) is 00447: holding runs while waiting on user_secrets cycles
 -- with a token delete, whose ON DELETE SET NULL cascade takes them in the other order.
 --
 -- The in-place Claude credential switch apply journals each applied switch as a
@@ -17,7 +17,7 @@ CREATE TABLE run_credential_switch_epochs (
     ordinal integer NOT NULL CHECK (ordinal >= 1),
     op_id uuid NOT NULL UNIQUE,
     worker_id uuid,
-    secret_id uuid, -- FK to user_secrets added in 00443 (one busy parent table per migration)
+    secret_id uuid, -- FK to user_secrets added in 00447 (one busy parent table per migration)
     secret_enablement_rev bigint NOT NULL,
     label text,
     select_reason text,

@@ -78,7 +78,7 @@ func (f *switchOpFixture) op(t *testing.T, id uuid.UUID) pgtype.UUID {
 
 func TestCredentialSwitchOpIDTriggerLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "switch_op_")
-	if err := store.MigrateTo(ctx, dsn, 437); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 441); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -90,7 +90,7 @@ func TestCredentialSwitchOpIDTriggerLiveDB(t *testing.T) {
 	stamped, plain := pre.run(t, "running"), pre.run(t, "running")
 	mustExec(ctx, t, pool, "UPDATE runs SET credential_switch_requested_at=now(), credential_switch_generation=1 WHERE id=$1", stamped)
 	pool.Close()
-	if err := store.MigrateTo(ctx, dsn, 443); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 447); err != nil {
 		t.Fatal(err)
 	}
 	f := newSwitchOpFixture(t, dsn, ctx)
