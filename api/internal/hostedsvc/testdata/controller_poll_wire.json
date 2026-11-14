@@ -73,8 +73,9 @@
       "generation": 4,
       "join_token": null,
       "hibernation": {
-        "state": "hibernated",
-        "op_id": "55555555-5555-5555-5555-555555555555"
+        "state": "preparing",
+        "op_id": "55555555-5555-5555-5555-555555555555",
+        "inventory_gate": "await"
       }
     },
     {

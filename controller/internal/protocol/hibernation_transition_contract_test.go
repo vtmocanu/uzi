@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -42,8 +43,39 @@ func sampleHibernationTransitions() []HibernationTransition {
 			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12348",
 			PodUID: "66666666-6666-6666-6666-666666666666",
 		},
+		{
+			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionObserved,
+			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12340",
+			PodUID: "66666666-6666-6666-6666-666666666666",
+			PVCs: []HibernationPVC{
+				{Role: PVCRoleData, Name: "uzi-hw-data", UID: "88888888-8888-8888-8888-888888888881", StorageClass: "fast", ClassReclaimPolicy: ReclaimPolicyDelete},
+				{Role: PVCRoleNix, Name: "uzi-hw-nix", UID: "88888888-8888-8888-8888-888888888882", ClassReclaimPolicy: ReclaimPolicyUnknown},
+				{Role: PVCRoleDindData, Name: "uzi-hw-dind", UID: "88888888-8888-8888-8888-888888888883", StorageClass: "slow", ClassReclaimPolicy: ReclaimPolicyRetain},
+			},
+			PodUIDs:              &[]string{"66666666-6666-6666-6666-666666666666"},
+			PVCUserPods:          &[]string{},
+			DeploymentGeneration: ptr(int64(7)),
+			DeploymentReplicas:   ptr(int32(1)),
+		},
+		{
+			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionScalingDown,
+			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12347",
+			PodUID: "66666666-6666-6666-6666-666666666666", FenceGeneration: ptr(int64(9)),
+		},
+		{
+			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionScaledDown,
+			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12349",
+			PodUID: "66666666-6666-6666-6666-666666666666", PodUIDs: &[]string{},
+		},
+		{
+			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionHeld,
+			DeploymentUID: "77777777-7777-7777-7777-777777777777",
+			PodUID:        "66666666-6666-6666-6666-666666666666",
+		},
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
 
 func TestHibernationTransitionWireContract(t *testing.T) {
 	got, err := json.MarshalIndent(sampleHibernationTransitions(), "", "  ")
@@ -77,9 +109,39 @@ func TestHibernationTransitionLiterals(t *testing.T) {
 		{TransitionScalingDown, "scaling_down"},
 		{TransitionScaledDown, "scaled_down"},
 		{TransitionReady, "ready"},
+		{TransitionObserved, "observed"},
+		{TransitionHeld, "held"},
+		{InventoryGateObserve, "observe"},
+		{InventoryGateAwait, "await"},
+		{InventoryGatePermit, "permit"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("transition literal = %q, want %q", tc.got, tc.want)
 		}
+	}
+}
+
+// A known-empty set and an unobserved one are different facts: a nil pointer is omitted, a
+// pointer to an empty slice encodes as [].
+func TestHibernationTransitionPodUIDsPresence(t *testing.T) {
+	absent, err := json.Marshal(HibernationTransition{OpID: "o", Transition: TransitionScaledDown})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(absent), "pod_uids") || strings.Contains(string(absent), "pvc_user_pods") {
+		t.Errorf("nil pointer slices must be omitted: %s", absent)
+	}
+	empty, err := json.Marshal(HibernationTransition{OpID: "o", Transition: TransitionScaledDown, PodUIDs: &[]string{}, PVCUserPods: &[]string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(empty), `"pod_uids":[]`) || !strings.Contains(string(empty), `"pvc_user_pods":[]`) {
+		t.Errorf("pointer to an empty slice must encode []: %s", empty)
+	}
+}
+
+func TestHibernationProtocolVersion(t *testing.T) {
+	if HibernationProtocolVersion != 2 {
+		t.Errorf("HibernationProtocolVersion = %d, want 2 (PRD #4208 M1 inventory)", HibernationProtocolVersion)
 	}
 }

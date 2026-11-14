@@ -1,0 +1,141 @@
+{
+  "_doc": "PRD #4208 M1 worker-side wire contract for the volume inventory taken while a hosted worker is preparing to hibernate. Shared by the api tests (U2) and the agent client tests (U4): the api must decode every *_request and emit every *_response_member byte-compatibly, and the agent must produce and consume exactly these shapes. Identity values (op_id, pod_uid, register_nonce, deployment_resource_version, pvc uids) are echoed from the api's heartbeat response and must match the controller-observed values.",
+  "heartbeat_response_member": {
+    "awaiting": {
+      "hibernation_inventory": {
+        "op_id": "55555555-5555-5555-5555-555555555555",
+        "phase": "awaiting",
+        "register_nonce": "11111111-2222-4333-8444-555555555555",
+        "pod_uid": "66666666-6666-6666-6666-666666666666",
+        "deployment_resource_version": "12340",
+        "pvcs": [
+          {"role": "data", "name": "uzi-hw-data", "uid": "88888888-8888-8888-8888-888888888881"},
+          {"role": "nix", "name": "uzi-hw-nix", "uid": "88888888-8888-8888-8888-888888888882"},
+          {"role": "dind_data", "name": "uzi-hw-dind", "uid": "88888888-8888-8888-8888-888888888883"}
+        ]
+      }
+    },
+    "accepted": {
+      "hibernation_inventory": {
+        "op_id": "55555555-5555-5555-5555-555555555555",
+        "phase": "accepted",
+        "register_nonce": "11111111-2222-4333-8444-555555555555",
+        "pod_uid": "66666666-6666-6666-6666-666666666666",
+        "deployment_resource_version": "12340",
+        "pvcs": [
+          {"role": "data", "name": "uzi-hw-data", "uid": "88888888-8888-8888-8888-888888888881"},
+          {"role": "nix", "name": "uzi-hw-nix", "uid": "88888888-8888-8888-8888-888888888882"},
+          {"role": "dind_data", "name": "uzi-hw-dind", "uid": "88888888-8888-8888-8888-888888888883"}
+        ]
+      }
+    }
+  },
+  "heartbeat_request_member": {
+    "hibernation_exclusion": {
+      "op_id": "55555555-5555-5555-5555-555555555555",
+      "held": true
+    }
+  },
+  "inventory_request": {
+    "op_id": "55555555-5555-5555-5555-555555555555",
+    "register_nonce": "11111111-2222-4333-8444-555555555555",
+    "pod_uid": "66666666-6666-6666-6666-666666666666",
+    "deployment_resource_version": "12340",
+    "pvcs": [
+      {"role": "data", "name": "uzi-hw-data", "uid": "88888888-8888-8888-8888-888888888881"},
+      {"role": "nix", "name": "uzi-hw-nix", "uid": "88888888-8888-8888-8888-888888888882"},
+      {"role": "dind_data", "name": "uzi-hw-dind", "uid": "88888888-8888-8888-8888-888888888883"}
+    ],
+    "complete": true,
+    "entries": [
+      {
+        "kind": "attempt_tree",
+        "path": "/data/runner/g-r/issue-7.attempt-a1",
+        "classification": "retained_recoverable",
+        "run_id": "99999999-9999-4999-8999-999999999991",
+        "tip": "0123456789abcdef0123456789abcdef01234567",
+        "content_state": "clean"
+      },
+      {
+        "kind": "bare_repository",
+        "path": "/data/runner/g-r/.bare",
+        "classification": "protected",
+        "detail": "refs/uzi-runner/agent/issue-7"
+      },
+      {
+        "kind": "unclassified",
+        "path": "/data/runner/stray",
+        "classification": "unknown"
+      }
+    ],
+    "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "docker": {
+      "containers": [
+        {"id": "c0ffee000001", "state": "exited", "name": "build-1"}
+      ],
+      "volumes": [
+        {"name": "cache-vol", "anonymous": false},
+        {"name": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "anonymous": true}
+      ],
+      "images_count": 3,
+      "build_cache_bytes": 1048576
+    },
+    "exclusion": {
+      "lane": "dind",
+      "mechanism": "epoch_ex+latch+quiescence",
+      "uncovered": []
+    }
+  },
+  "inventory_request_no_docker": {
+    "op_id": "55555555-5555-5555-5555-555555555555",
+    "register_nonce": "11111111-2222-4333-8444-555555555555",
+    "pod_uid": "66666666-6666-6666-6666-666666666666",
+    "deployment_resource_version": "12340",
+    "pvcs": [
+      {"role": "data", "name": "uzi-hw-data", "uid": "88888888-8888-8888-8888-888888888881"},
+      {"role": "nix", "name": "uzi-hw-nix", "uid": "88888888-8888-8888-8888-888888888882"}
+    ],
+    "complete": true,
+    "entries": [],
+    "fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "docker": null,
+    "exclusion": {
+      "lane": "plain",
+      "mechanism": "none",
+      "uncovered": ["plain_lane_has_no_exclusion"]
+    }
+  },
+  "inventory_status_requests": [
+    {
+      "op_id": "55555555-5555-5555-5555-555555555555",
+      "register_nonce": "11111111-2222-4333-8444-555555555555",
+      "pod_uid": "66666666-6666-6666-6666-666666666666",
+      "status": "unsupported",
+      "reason": "lane has no proven exclusion mechanism"
+    },
+    {
+      "op_id": "55555555-5555-5555-5555-555555555555",
+      "register_nonce": "11111111-2222-4333-8444-555555555555",
+      "pod_uid": "66666666-6666-6666-6666-666666666666",
+      "status": "exclusion_failed",
+      "reason": "could not acquire the pod epoch lock exclusively"
+    },
+    {
+      "op_id": "55555555-5555-5555-5555-555555555555",
+      "register_nonce": "11111111-2222-4333-8444-555555555555",
+      "pod_uid": "66666666-6666-6666-6666-666666666666",
+      "status": "busy",
+      "reason": "a run is active on this worker"
+    }
+  ],
+  "exclusion_final_request": {
+    "op_id": "55555555-5555-5555-5555-555555555555",
+    "pod_uid": "66666666-6666-6666-6666-666666666666",
+    "register_nonce": "11111111-2222-4333-8444-555555555555",
+    "held": true,
+    "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

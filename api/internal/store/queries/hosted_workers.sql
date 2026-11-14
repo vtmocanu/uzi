@@ -96,9 +96,14 @@ SELECT w.id,
            SELECT 1 FROM recovery_custody_holds h
            WHERE h.live_worker_id = w.id AND h.state = 'open'
        ))::boolean AS custody_held,
+       -- inventory_status (PRD #4208 M1): the status of the inventory row for the worker's CURRENT
+       -- hibernation op, NULL when there is none (an awake worker, or an op with no observation yet).
+       -- Only the status leaves the table here; never the entries.
+       i.status AS inventory_status,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
+LEFT JOIN worker_hibernation_inventories i ON i.worker_id = w.id AND i.op_id = w.hibernation_op_id
 WHERE w.kind = 'hosted'
 ORDER BY w.created_at ASC, w.id ASC
 LIMIT 513;

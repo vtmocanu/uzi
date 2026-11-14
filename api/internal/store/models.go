@@ -2036,6 +2036,36 @@ type WorkerHibernationEvent struct {
 	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
 }
 
+type WorkerHibernationInventory struct {
+	WorkerID                  uuid.UUID          `json:"worker_id"`
+	OpID                      uuid.UUID          `json:"op_id"`
+	ObservedAt                pgtype.Timestamptz `json:"observed_at"`
+	DeploymentUid             string             `json:"deployment_uid"`
+	DeploymentResourceVersion string             `json:"deployment_resource_version"`
+	PodUid                    uuid.UUID          `json:"pod_uid"`
+	Pvcs                      []byte             `json:"pvcs"`
+	RegisterNonce             pgtype.Text        `json:"register_nonce"`
+	ReceivedAt                pgtype.Timestamptz `json:"received_at"`
+	Status                    string             `json:"status"`
+	StatusReason              pgtype.Text        `json:"status_reason"`
+	Complete                  pgtype.Bool        `json:"complete"`
+	Entries                   []byte             `json:"entries"`
+	ReceiptKeys               []byte             `json:"receipt_keys"`
+	Digest                    pgtype.Text        `json:"digest"`
+	Fingerprint               pgtype.Text        `json:"fingerprint"`
+	Lane                      pgtype.Text        `json:"lane"`
+	Mechanism                 pgtype.Text        `json:"mechanism"`
+	InvalidatedReason         pgtype.Text        `json:"invalidated_reason"`
+	InvalidatedAt             pgtype.Timestamptz `json:"invalidated_at"`
+	ScalingDownPodUid         pgtype.UUID        `json:"scaling_down_pod_uid"`
+	FenceGeneration           pgtype.Int8        `json:"fence_generation"`
+	ScaledDownAt              pgtype.Timestamptz `json:"scaled_down_at"`
+	LastHeldAt                pgtype.Timestamptz `json:"last_held_at"`
+	ExclusionFinalAt          pgtype.Timestamptz `json:"exclusion_final_at"`
+	ExclusionFinalDigest      pgtype.Text        `json:"exclusion_final_digest"`
+	ExclusionFinalFingerprint pgtype.Text        `json:"exclusion_final_fingerprint"`
+}
+
 type WorkerPendingOutcomeIdentity struct {
 	WorkerID        uuid.UUID          `json:"worker_id"`
 	RunID           uuid.UUID          `json:"run_id"`

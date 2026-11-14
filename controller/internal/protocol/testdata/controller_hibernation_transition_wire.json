@@ -32,5 +32,62 @@
     "deployment_uid": "77777777-7777-7777-7777-777777777777",
     "resource_version": "12348",
     "pod_uid": "66666666-6666-6666-6666-666666666666"
+  },
+  {
+    "op_id": "55555555-5555-5555-5555-555555555555",
+    "transition": "observed",
+    "deployment_uid": "77777777-7777-7777-7777-777777777777",
+    "resource_version": "12340",
+    "pod_uid": "66666666-6666-6666-6666-666666666666",
+    "pvcs": [
+      {
+        "role": "data",
+        "name": "uzi-hw-data",
+        "uid": "88888888-8888-8888-8888-888888888881",
+        "storage_class": "fast",
+        "class_reclaim_policy": "Delete"
+      },
+      {
+        "role": "nix",
+        "name": "uzi-hw-nix",
+        "uid": "88888888-8888-8888-8888-888888888882",
+        "class_reclaim_policy": "unknown"
+      },
+      {
+        "role": "dind_data",
+        "name": "uzi-hw-dind",
+        "uid": "88888888-8888-8888-8888-888888888883",
+        "storage_class": "slow",
+        "class_reclaim_policy": "Retain"
+      }
+    ],
+    "pod_uids": [
+      "66666666-6666-6666-6666-666666666666"
+    ],
+    "pvc_user_pods": [],
+    "deployment_generation": 7,
+    "deployment_replicas": 1
+  },
+  {
+    "op_id": "55555555-5555-5555-5555-555555555555",
+    "transition": "scaling_down",
+    "deployment_uid": "77777777-7777-7777-7777-777777777777",
+    "resource_version": "12347",
+    "pod_uid": "66666666-6666-6666-6666-666666666666",
+    "fence_generation": 9
+  },
+  {
+    "op_id": "55555555-5555-5555-5555-555555555555",
+    "transition": "scaled_down",
+    "deployment_uid": "77777777-7777-7777-7777-777777777777",
+    "resource_version": "12349",
+    "pod_uid": "66666666-6666-6666-6666-666666666666",
+    "pod_uids": []
+  },
+  {
+    "op_id": "55555555-5555-5555-5555-555555555555",
+    "transition": "held",
+    "deployment_uid": "77777777-7777-7777-7777-777777777777",
+    "pod_uid": "66666666-6666-6666-6666-666666666666"
   }
 ]

@@ -289,3 +289,183 @@ SELECT EXISTS (
       AND w.hibernation_state = 'waking'
       AND w.wake_error IS NULL
 )::boolean AS waking;
+
+-- ---------------------------------------------------------------------------
+-- PRD #4208 M1: worker_hibernation_inventories (migration 00448).
+-- Every write to worker_hibernation_inventories runs in a transaction that already holds the
+-- workers row lock (GetWorkerForUpdate); lock order workers -> inventory. The reads below that
+-- take a worker-id list are batched and unlocked: they feed the dry-run report, which only
+-- reports and never deletes anything.
+-- ---------------------------------------------------------------------------
+
+-- name: UpsertHibernationInventoryObserved :one
+-- Start (or restart) the inventory for the worker's current op: every column is replaced and the
+-- inventory and validity columns are NULLed, so a new op never inherits an older op's entries.
+INSERT INTO worker_hibernation_inventories (
+    worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, status
+) VALUES (
+    @worker_id, @op_id, @observed_at, @deployment_uid, @deployment_resource_version, @pod_uid, @pvcs::jsonb, @status::text
+)
+ON CONFLICT (worker_id) DO UPDATE SET
+    op_id = EXCLUDED.op_id,
+    observed_at = EXCLUDED.observed_at,
+    deployment_uid = EXCLUDED.deployment_uid,
+    deployment_resource_version = EXCLUDED.deployment_resource_version,
+    pod_uid = EXCLUDED.pod_uid,
+    pvcs = EXCLUDED.pvcs,
+    status = EXCLUDED.status,
+    register_nonce = NULL,
+    received_at = NULL,
+    status_reason = NULL,
+    complete = NULL,
+    entries = NULL,
+    receipt_keys = NULL,
+    digest = NULL,
+    fingerprint = NULL,
+    lane = NULL,
+    mechanism = NULL,
+    invalidated_reason = NULL,
+    invalidated_at = NULL,
+    scaling_down_pod_uid = NULL,
+    fence_generation = NULL,
+    scaled_down_at = NULL,
+    last_held_at = NULL,
+    exclusion_final_at = NULL,
+    exclusion_final_digest = NULL,
+    exclusion_final_fingerprint = NULL
+RETURNING *;
+
+-- name: GetHibernationInventoryForOp :one
+-- The full row, entries included, for the evaluator and the accept path.
+SELECT * FROM worker_hibernation_inventories
+WHERE worker_id = @worker_id AND op_id = @op_id;
+
+-- name: GetHibernationInventoryGateForOp :one
+-- The narrow row the poll snapshot and the settle gate read. Never selects entries.
+SELECT status, observed_at, invalidated_reason, pod_uid, register_nonce,
+       deployment_resource_version, pvcs
+FROM worker_hibernation_inventories
+WHERE worker_id = @worker_id AND op_id = @op_id;
+
+-- name: AcceptHibernationInventory :execrows
+-- Bind the worker's echoed inventory. Zero rows means refused: the row is not awaiting, was
+-- invalidated, or belongs to another op.
+UPDATE worker_hibernation_inventories SET
+    status = 'accepted',
+    register_nonce = @register_nonce::text,
+    received_at = @received_at::timestamptz,
+    complete = @complete::boolean,
+    entries = @entries::jsonb,
+    receipt_keys = @receipt_keys::jsonb,
+    digest = @digest::text,
+    fingerprint = @fingerprint::text,
+    lane = sqlc.narg('lane')::text,
+    mechanism = sqlc.narg('mechanism')::text
+WHERE worker_id = @worker_id AND op_id = @op_id
+  AND status = 'awaiting' AND invalidated_reason IS NULL;
+
+-- name: SetHibernationInventoryStatus :execrows
+-- A worker-reported non-inventory status, a timeout, a missing capability or a scale-down that
+-- closed the window. Only an awaiting row moves.
+UPDATE worker_hibernation_inventories SET
+    status = @status::text,
+    status_reason = sqlc.narg('status_reason')::text
+WHERE worker_id = @worker_id AND op_id = @op_id AND status = 'awaiting';
+
+-- name: InvalidateHibernationInventory :execrows
+-- Monotonic: the first reason and timestamp stick.
+UPDATE worker_hibernation_inventories SET
+    invalidated_reason = COALESCE(invalidated_reason, @reason::text),
+    invalidated_at = COALESCE(invalidated_at, @at::timestamptz)
+WHERE worker_id = @worker_id AND op_id = @op_id;
+
+-- name: RecordHibernationInventoryScaleDown :execrows
+-- The controller reported scaling_down for this pod. The first pod uid and fence generation stick.
+UPDATE worker_hibernation_inventories SET
+    scaling_down_pod_uid = COALESCE(scaling_down_pod_uid, sqlc.narg('scaling_down_pod_uid')::uuid),
+    fence_generation = COALESCE(fence_generation, sqlc.narg('fence_generation')::bigint),
+    last_held_at = COALESCE(sqlc.narg('last_held_at')::timestamptz, last_held_at)
+WHERE worker_id = @worker_id AND op_id = @op_id;
+
+-- name: RecordHibernationInventoryScaledDown :execrows
+UPDATE worker_hibernation_inventories SET
+    scaled_down_at = @scaled_down_at::timestamptz,
+    last_held_at = COALESCE(sqlc.narg('last_held_at')::timestamptz, last_held_at)
+WHERE worker_id = @worker_id AND op_id = @op_id;
+
+-- name: RecordHibernationInventoryHeld :execrows
+-- The worker reported it still holds exclusion. Never moves the stamp backwards.
+UPDATE worker_hibernation_inventories SET
+    last_held_at = GREATEST(COALESCE(last_held_at, @last_held_at::timestamptz), @last_held_at::timestamptz)
+WHERE worker_id = @worker_id AND op_id = @op_id;
+
+-- name: RecordHibernationExclusionFinal :execrows
+UPDATE worker_hibernation_inventories SET
+    exclusion_final_at = @at::timestamptz,
+    exclusion_final_digest = @digest::text,
+    exclusion_final_fingerprint = @fingerprint::text
+WHERE worker_id = @worker_id AND op_id = @op_id;
+
+-- name: ListAwaitingHibernationInventoriesOlderThan :many
+-- Candidates for the settle pass timeout; the pass re-checks on the locked row.
+SELECT worker_id FROM worker_hibernation_inventories
+WHERE status = 'awaiting' AND observed_at < @cutoff::timestamptz
+ORDER BY worker_id;
+
+-- name: CountHibernationRetirementCandidates :one
+SELECT count(*) FROM workers
+WHERE hibernation_state IN ('hibernated', 'waking') AND kind = 'hosted' AND NOT ephemeral;
+
+-- name: ListHibernationRetirementCandidates :many
+SELECT id, user_id, hibernation_state, hibernation_op_id, hibernated_at, manual_cordoned_at,
+       draining_since, maintenance_fenced, maintenance_phase, kind, docker_enabled, isolated_lane
+FROM workers
+WHERE hibernation_state IN ('hibernated', 'waking') AND kind = 'hosted' AND NOT ephemeral
+ORDER BY hibernated_at ASC NULLS LAST, id ASC
+LIMIT @row_limit::int;
+
+-- name: ListWorkersWithLocalReplicaCaptures :many
+-- Workers named as the local replica of some recovery capture.
+SELECT DISTINCT local_replica_worker_id::uuid AS worker_id FROM recovery_captures
+WHERE local_replica_worker_id = ANY(@worker_ids::uuid[])
+ORDER BY 1;
+
+-- name: ListWorkersWithActivePublicationResumeCustody :many
+SELECT DISTINCT worker_id::uuid AS worker_id FROM run_publication_resume
+WHERE state = 'active' AND worker_id = ANY(@worker_ids::uuid[])
+ORDER BY 1;
+
+-- name: ListWorkersWithOpenCustodyHolds :many
+-- The same predicate as WorkerHasOpenCustodyHold, batched.
+SELECT DISTINCT live_worker_id::uuid AS worker_id FROM recovery_custody_holds
+WHERE state = 'open' AND live_worker_id = ANY(@worker_ids::uuid[])
+ORDER BY 1;
+
+-- name: ListWorkersWithNonTerminalRuns :many
+-- The same predicate as CountWorkerNonTerminalRuns (without its user scope), batched.
+SELECT DISTINCT worker_id::uuid AS worker_id FROM runs
+WHERE worker_id = ANY(@worker_ids::uuid[])
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY 1;
+
+-- name: ListValidCaptureReceipts :many
+-- (run_id, source_sha) pairs for which an available, manifest-bound, unexpired capture of exactly
+-- that source exists, and whose thin-bundle prerequisites (when any) have a pinned closure.
+SELECT DISTINCT want.run_id::uuid AS run_id, want.source_sha::text AS source_sha
+FROM (
+    SELECT r.run_id, s.source_sha
+    FROM unnest(@run_ids::uuid[]) WITH ORDINALITY AS r(run_id, n)
+    JOIN unnest(@source_shas::text[]) WITH ORDINALITY AS s(source_sha, n) ON s.n = r.n
+) AS want
+JOIN recovery_captures c ON c.run_id = want.run_id AND c.source_sha = want.source_sha
+WHERE c.state = 'available'
+  AND c.manifest_bound
+  AND c.expires_at > now()
+  AND (
+    COALESCE(cardinality(c.prerequisite_shas), 0) = 0
+    OR EXISTS (
+        SELECT 1 FROM recovery_prerequisite_closures pc
+        WHERE pc.capture_id = c.id AND pc.state = 'pinned'
+    )
+  )
+ORDER BY 1, 2;

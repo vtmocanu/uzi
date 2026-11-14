@@ -425,6 +425,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		{"refresh_publication_context_v1"},
 		{"completion_semantic_publication_v1"}, // PRD #1230 D4: independent of completion_non_closing_v1; advertises the semantic coverage park report
 		{"dind_maintenance_v1"},
+		{capability.HibernationInventoryV1}, // PRD #4208 M1: this api binds a worker's pre-scale-down volume inventory (the heartbeat's hibernation_inventory and hibernation_exclusion members)
 		{"worker_memory_pressure_v1"},
 		{"memory_park_settlement_v1"},        // issue #3639: this api accepts the memory-park settlement receipt and answers the claim body's memory_park_reference
 		{"worker_memory_authority_claim_v1"}, // issue #3142: this api accepts the run-lane claim body's memory_authority member

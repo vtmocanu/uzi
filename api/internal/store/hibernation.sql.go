@@ -12,6 +12,70 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acceptHibernationInventory = `-- name: AcceptHibernationInventory :execrows
+UPDATE worker_hibernation_inventories SET
+    status = 'accepted',
+    register_nonce = $1::text,
+    received_at = $2::timestamptz,
+    complete = $3::boolean,
+    entries = $4::jsonb,
+    receipt_keys = $5::jsonb,
+    digest = $6::text,
+    fingerprint = $7::text,
+    lane = $8::text,
+    mechanism = $9::text
+WHERE worker_id = $10 AND op_id = $11
+  AND status = 'awaiting' AND invalidated_reason IS NULL
+`
+
+type AcceptHibernationInventoryParams struct {
+	RegisterNonce string             `json:"register_nonce"`
+	ReceivedAt    pgtype.Timestamptz `json:"received_at"`
+	Complete      bool               `json:"complete"`
+	Entries       []byte             `json:"entries"`
+	ReceiptKeys   []byte             `json:"receipt_keys"`
+	Digest        string             `json:"digest"`
+	Fingerprint   string             `json:"fingerprint"`
+	Lane          pgtype.Text        `json:"lane"`
+	Mechanism     pgtype.Text        `json:"mechanism"`
+	WorkerID      uuid.UUID          `json:"worker_id"`
+	OpID          uuid.UUID          `json:"op_id"`
+}
+
+// Bind the worker's echoed inventory. Zero rows means refused: the row is not awaiting, was
+// invalidated, or belongs to another op.
+func (q *Queries) AcceptHibernationInventory(ctx context.Context, arg AcceptHibernationInventoryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, acceptHibernationInventory,
+		arg.RegisterNonce,
+		arg.ReceivedAt,
+		arg.Complete,
+		arg.Entries,
+		arg.ReceiptKeys,
+		arg.Digest,
+		arg.Fingerprint,
+		arg.Lane,
+		arg.Mechanism,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const countHibernationRetirementCandidates = `-- name: CountHibernationRetirementCandidates :one
+SELECT count(*) FROM workers
+WHERE hibernation_state IN ('hibernated', 'waking') AND kind = 'hosted' AND NOT ephemeral
+`
+
+func (q *Queries) CountHibernationRetirementCandidates(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countHibernationRetirementCandidates)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteHibernationWake = `-- name: DeleteHibernationWake :execrows
 DELETE FROM hibernation_wakes WHERE run_id = $1 AND worker_id = $2
 `
@@ -45,6 +109,90 @@ func (q *Queries) GetControllerHibernationAdvertisement(ctx context.Context) (Ge
 	row := q.db.QueryRow(ctx, getControllerHibernationAdvertisement)
 	var i GetControllerHibernationAdvertisementRow
 	err := row.Scan(&i.HibernationVersion, &i.HibernationAdvertisedAt, &i.PollIntervalSeconds)
+	return i, err
+}
+
+const getHibernationInventoryForOp = `-- name: GetHibernationInventoryForOp :one
+SELECT worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, register_nonce, received_at, status, status_reason, complete, entries, receipt_keys, digest, fingerprint, lane, mechanism, invalidated_reason, invalidated_at, scaling_down_pod_uid, fence_generation, scaled_down_at, last_held_at, exclusion_final_at, exclusion_final_digest, exclusion_final_fingerprint FROM worker_hibernation_inventories
+WHERE worker_id = $1 AND op_id = $2
+`
+
+type GetHibernationInventoryForOpParams struct {
+	WorkerID uuid.UUID `json:"worker_id"`
+	OpID     uuid.UUID `json:"op_id"`
+}
+
+// The full row, entries included, for the evaluator and the accept path.
+func (q *Queries) GetHibernationInventoryForOp(ctx context.Context, arg GetHibernationInventoryForOpParams) (WorkerHibernationInventory, error) {
+	row := q.db.QueryRow(ctx, getHibernationInventoryForOp, arg.WorkerID, arg.OpID)
+	var i WorkerHibernationInventory
+	err := row.Scan(
+		&i.WorkerID,
+		&i.OpID,
+		&i.ObservedAt,
+		&i.DeploymentUid,
+		&i.DeploymentResourceVersion,
+		&i.PodUid,
+		&i.Pvcs,
+		&i.RegisterNonce,
+		&i.ReceivedAt,
+		&i.Status,
+		&i.StatusReason,
+		&i.Complete,
+		&i.Entries,
+		&i.ReceiptKeys,
+		&i.Digest,
+		&i.Fingerprint,
+		&i.Lane,
+		&i.Mechanism,
+		&i.InvalidatedReason,
+		&i.InvalidatedAt,
+		&i.ScalingDownPodUid,
+		&i.FenceGeneration,
+		&i.ScaledDownAt,
+		&i.LastHeldAt,
+		&i.ExclusionFinalAt,
+		&i.ExclusionFinalDigest,
+		&i.ExclusionFinalFingerprint,
+	)
+	return i, err
+}
+
+const getHibernationInventoryGateForOp = `-- name: GetHibernationInventoryGateForOp :one
+SELECT status, observed_at, invalidated_reason, pod_uid, register_nonce,
+       deployment_resource_version, pvcs
+FROM worker_hibernation_inventories
+WHERE worker_id = $1 AND op_id = $2
+`
+
+type GetHibernationInventoryGateForOpParams struct {
+	WorkerID uuid.UUID `json:"worker_id"`
+	OpID     uuid.UUID `json:"op_id"`
+}
+
+type GetHibernationInventoryGateForOpRow struct {
+	Status                    string             `json:"status"`
+	ObservedAt                pgtype.Timestamptz `json:"observed_at"`
+	InvalidatedReason         pgtype.Text        `json:"invalidated_reason"`
+	PodUid                    uuid.UUID          `json:"pod_uid"`
+	RegisterNonce             pgtype.Text        `json:"register_nonce"`
+	DeploymentResourceVersion string             `json:"deployment_resource_version"`
+	Pvcs                      []byte             `json:"pvcs"`
+}
+
+// The narrow row the poll snapshot and the settle gate read. Never selects entries.
+func (q *Queries) GetHibernationInventoryGateForOp(ctx context.Context, arg GetHibernationInventoryGateForOpParams) (GetHibernationInventoryGateForOpRow, error) {
+	row := q.db.QueryRow(ctx, getHibernationInventoryGateForOp, arg.WorkerID, arg.OpID)
+	var i GetHibernationInventoryGateForOpRow
+	err := row.Scan(
+		&i.Status,
+		&i.ObservedAt,
+		&i.InvalidatedReason,
+		&i.PodUid,
+		&i.RegisterNonce,
+		&i.DeploymentResourceVersion,
+		&i.Pvcs,
+	)
 	return i, err
 }
 
@@ -178,6 +326,118 @@ func (q *Queries) InsertWorkerHibernationEvent(ctx context.Context, arg InsertWo
 		arg.OccurredAt,
 	)
 	return err
+}
+
+const invalidateHibernationInventory = `-- name: InvalidateHibernationInventory :execrows
+UPDATE worker_hibernation_inventories SET
+    invalidated_reason = COALESCE(invalidated_reason, $1::text),
+    invalidated_at = COALESCE(invalidated_at, $2::timestamptz)
+WHERE worker_id = $3 AND op_id = $4
+`
+
+type InvalidateHibernationInventoryParams struct {
+	Reason   string             `json:"reason"`
+	At       pgtype.Timestamptz `json:"at"`
+	WorkerID uuid.UUID          `json:"worker_id"`
+	OpID     uuid.UUID          `json:"op_id"`
+}
+
+// Monotonic: the first reason and timestamp stick.
+func (q *Queries) InvalidateHibernationInventory(ctx context.Context, arg InvalidateHibernationInventoryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, invalidateHibernationInventory,
+		arg.Reason,
+		arg.At,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const listAwaitingHibernationInventoriesOlderThan = `-- name: ListAwaitingHibernationInventoriesOlderThan :many
+SELECT worker_id FROM worker_hibernation_inventories
+WHERE status = 'awaiting' AND observed_at < $1::timestamptz
+ORDER BY worker_id
+`
+
+// Candidates for the settle pass timeout; the pass re-checks on the locked row.
+func (q *Queries) ListAwaitingHibernationInventoriesOlderThan(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listAwaitingHibernationInventoriesOlderThan, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var worker_id uuid.UUID
+		if err := rows.Scan(&worker_id); err != nil {
+			return nil, err
+		}
+		items = append(items, worker_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listHibernationRetirementCandidates = `-- name: ListHibernationRetirementCandidates :many
+SELECT id, user_id, hibernation_state, hibernation_op_id, hibernated_at, manual_cordoned_at,
+       draining_since, maintenance_fenced, maintenance_phase, kind, docker_enabled, isolated_lane
+FROM workers
+WHERE hibernation_state IN ('hibernated', 'waking') AND kind = 'hosted' AND NOT ephemeral
+ORDER BY hibernated_at ASC NULLS LAST, id ASC
+LIMIT $1::int
+`
+
+type ListHibernationRetirementCandidatesRow struct {
+	ID                uuid.UUID          `json:"id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	HibernationState  string             `json:"hibernation_state"`
+	HibernationOpID   pgtype.UUID        `json:"hibernation_op_id"`
+	HibernatedAt      pgtype.Timestamptz `json:"hibernated_at"`
+	ManualCordonedAt  pgtype.Timestamptz `json:"manual_cordoned_at"`
+	DrainingSince     pgtype.Timestamptz `json:"draining_since"`
+	MaintenanceFenced bool               `json:"maintenance_fenced"`
+	MaintenancePhase  string             `json:"maintenance_phase"`
+	Kind              string             `json:"kind"`
+	DockerEnabled     pgtype.Bool        `json:"docker_enabled"`
+	IsolatedLane      bool               `json:"isolated_lane"`
+}
+
+func (q *Queries) ListHibernationRetirementCandidates(ctx context.Context, rowLimit int32) ([]ListHibernationRetirementCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listHibernationRetirementCandidates, rowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListHibernationRetirementCandidatesRow{}
+	for rows.Next() {
+		var i ListHibernationRetirementCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.HibernationState,
+			&i.HibernationOpID,
+			&i.HibernatedAt,
+			&i.ManualCordonedAt,
+			&i.DrainingSince,
+			&i.MaintenanceFenced,
+			&i.MaintenancePhase,
+			&i.Kind,
+			&i.DockerEnabled,
+			&i.IsolatedLane,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listHibernationWakeDemand = `-- name: ListHibernationWakeDemand :many
@@ -420,6 +680,59 @@ func (q *Queries) ListStalePreparingWorkerIDs(ctx context.Context, cutoff pgtype
 	return items, nil
 }
 
+const listValidCaptureReceipts = `-- name: ListValidCaptureReceipts :many
+SELECT DISTINCT want.run_id::uuid AS run_id, want.source_sha::text AS source_sha
+FROM (
+    SELECT r.run_id, s.source_sha
+    FROM unnest($1::uuid[]) WITH ORDINALITY AS r(run_id, n)
+    JOIN unnest($2::text[]) WITH ORDINALITY AS s(source_sha, n) ON s.n = r.n
+) AS want
+JOIN recovery_captures c ON c.run_id = want.run_id AND c.source_sha = want.source_sha
+WHERE c.state = 'available'
+  AND c.manifest_bound
+  AND c.expires_at > now()
+  AND (
+    COALESCE(cardinality(c.prerequisite_shas), 0) = 0
+    OR EXISTS (
+        SELECT 1 FROM recovery_prerequisite_closures pc
+        WHERE pc.capture_id = c.id AND pc.state = 'pinned'
+    )
+  )
+ORDER BY 1, 2
+`
+
+type ListValidCaptureReceiptsParams struct {
+	RunIds     []uuid.UUID `json:"run_ids"`
+	SourceShas []string    `json:"source_shas"`
+}
+
+type ListValidCaptureReceiptsRow struct {
+	RunID     uuid.UUID `json:"run_id"`
+	SourceSha string    `json:"source_sha"`
+}
+
+// (run_id, source_sha) pairs for which an available, manifest-bound, unexpired capture of exactly
+// that source exists, and whose thin-bundle prerequisites (when any) have a pinned closure.
+func (q *Queries) ListValidCaptureReceipts(ctx context.Context, arg ListValidCaptureReceiptsParams) ([]ListValidCaptureReceiptsRow, error) {
+	rows, err := q.db.Query(ctx, listValidCaptureReceipts, arg.RunIds, arg.SourceShas)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListValidCaptureReceiptsRow{}
+	for rows.Next() {
+		var i ListValidCaptureReceiptsRow
+		if err := rows.Scan(&i.RunID, &i.SourceSha); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWakingWorkerIDs = `-- name: ListWakingWorkerIDs :many
 SELECT id FROM workers WHERE hibernation_state = 'waking' ORDER BY id
 `
@@ -472,6 +785,114 @@ func (q *Queries) ListWorkersToWakeOnDisable(ctx context.Context, maxRows int32)
 	return items, nil
 }
 
+const listWorkersWithActivePublicationResumeCustody = `-- name: ListWorkersWithActivePublicationResumeCustody :many
+SELECT DISTINCT worker_id::uuid AS worker_id FROM run_publication_resume
+WHERE state = 'active' AND worker_id = ANY($1::uuid[])
+ORDER BY 1
+`
+
+func (q *Queries) ListWorkersWithActivePublicationResumeCustody(ctx context.Context, workerIds []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkersWithActivePublicationResumeCustody, workerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var worker_id uuid.UUID
+		if err := rows.Scan(&worker_id); err != nil {
+			return nil, err
+		}
+		items = append(items, worker_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkersWithLocalReplicaCaptures = `-- name: ListWorkersWithLocalReplicaCaptures :many
+SELECT DISTINCT local_replica_worker_id::uuid AS worker_id FROM recovery_captures
+WHERE local_replica_worker_id = ANY($1::uuid[])
+ORDER BY 1
+`
+
+// Workers named as the local replica of some recovery capture.
+func (q *Queries) ListWorkersWithLocalReplicaCaptures(ctx context.Context, workerIds []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkersWithLocalReplicaCaptures, workerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var worker_id uuid.UUID
+		if err := rows.Scan(&worker_id); err != nil {
+			return nil, err
+		}
+		items = append(items, worker_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkersWithNonTerminalRuns = `-- name: ListWorkersWithNonTerminalRuns :many
+SELECT DISTINCT worker_id::uuid AS worker_id FROM runs
+WHERE worker_id = ANY($1::uuid[])
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY 1
+`
+
+// The same predicate as CountWorkerNonTerminalRuns (without its user scope), batched.
+func (q *Queries) ListWorkersWithNonTerminalRuns(ctx context.Context, workerIds []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkersWithNonTerminalRuns, workerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var worker_id uuid.UUID
+		if err := rows.Scan(&worker_id); err != nil {
+			return nil, err
+		}
+		items = append(items, worker_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkersWithOpenCustodyHolds = `-- name: ListWorkersWithOpenCustodyHolds :many
+SELECT DISTINCT live_worker_id::uuid AS worker_id FROM recovery_custody_holds
+WHERE state = 'open' AND live_worker_id = ANY($1::uuid[])
+ORDER BY 1
+`
+
+// The same predicate as WorkerHasOpenCustodyHold, batched.
+func (q *Queries) ListWorkersWithOpenCustodyHolds(ctx context.Context, workerIds []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkersWithOpenCustodyHolds, workerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var worker_id uuid.UUID
+		if err := rows.Scan(&worker_id); err != nil {
+			return nil, err
+		}
+		items = append(items, worker_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockRunForShare = `-- name: LockRunForShare :one
 SELECT status FROM runs WHERE id = $1 FOR SHARE
 `
@@ -483,6 +904,115 @@ func (q *Queries) LockRunForShare(ctx context.Context, id uuid.UUID) (string, er
 	var status string
 	err := row.Scan(&status)
 	return status, err
+}
+
+const recordHibernationExclusionFinal = `-- name: RecordHibernationExclusionFinal :execrows
+UPDATE worker_hibernation_inventories SET
+    exclusion_final_at = $1::timestamptz,
+    exclusion_final_digest = $2::text,
+    exclusion_final_fingerprint = $3::text
+WHERE worker_id = $4 AND op_id = $5
+`
+
+type RecordHibernationExclusionFinalParams struct {
+	At          pgtype.Timestamptz `json:"at"`
+	Digest      string             `json:"digest"`
+	Fingerprint string             `json:"fingerprint"`
+	WorkerID    uuid.UUID          `json:"worker_id"`
+	OpID        uuid.UUID          `json:"op_id"`
+}
+
+func (q *Queries) RecordHibernationExclusionFinal(ctx context.Context, arg RecordHibernationExclusionFinalParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordHibernationExclusionFinal,
+		arg.At,
+		arg.Digest,
+		arg.Fingerprint,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordHibernationInventoryHeld = `-- name: RecordHibernationInventoryHeld :execrows
+UPDATE worker_hibernation_inventories SET
+    last_held_at = GREATEST(COALESCE(last_held_at, $1::timestamptz), $1::timestamptz)
+WHERE worker_id = $2 AND op_id = $3
+`
+
+type RecordHibernationInventoryHeldParams struct {
+	LastHeldAt pgtype.Timestamptz `json:"last_held_at"`
+	WorkerID   uuid.UUID          `json:"worker_id"`
+	OpID       uuid.UUID          `json:"op_id"`
+}
+
+// The worker reported it still holds exclusion. Never moves the stamp backwards.
+func (q *Queries) RecordHibernationInventoryHeld(ctx context.Context, arg RecordHibernationInventoryHeldParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordHibernationInventoryHeld, arg.LastHeldAt, arg.WorkerID, arg.OpID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordHibernationInventoryScaleDown = `-- name: RecordHibernationInventoryScaleDown :execrows
+UPDATE worker_hibernation_inventories SET
+    scaling_down_pod_uid = COALESCE(scaling_down_pod_uid, $1::uuid),
+    fence_generation = COALESCE(fence_generation, $2::bigint),
+    last_held_at = COALESCE($3::timestamptz, last_held_at)
+WHERE worker_id = $4 AND op_id = $5
+`
+
+type RecordHibernationInventoryScaleDownParams struct {
+	ScalingDownPodUid pgtype.UUID        `json:"scaling_down_pod_uid"`
+	FenceGeneration   pgtype.Int8        `json:"fence_generation"`
+	LastHeldAt        pgtype.Timestamptz `json:"last_held_at"`
+	WorkerID          uuid.UUID          `json:"worker_id"`
+	OpID              uuid.UUID          `json:"op_id"`
+}
+
+// The controller reported scaling_down for this pod. The first pod uid and fence generation stick.
+func (q *Queries) RecordHibernationInventoryScaleDown(ctx context.Context, arg RecordHibernationInventoryScaleDownParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordHibernationInventoryScaleDown,
+		arg.ScalingDownPodUid,
+		arg.FenceGeneration,
+		arg.LastHeldAt,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordHibernationInventoryScaledDown = `-- name: RecordHibernationInventoryScaledDown :execrows
+UPDATE worker_hibernation_inventories SET
+    scaled_down_at = $1::timestamptz,
+    last_held_at = COALESCE($2::timestamptz, last_held_at)
+WHERE worker_id = $3 AND op_id = $4
+`
+
+type RecordHibernationInventoryScaledDownParams struct {
+	ScaledDownAt pgtype.Timestamptz `json:"scaled_down_at"`
+	LastHeldAt   pgtype.Timestamptz `json:"last_held_at"`
+	WorkerID     uuid.UUID          `json:"worker_id"`
+	OpID         uuid.UUID          `json:"op_id"`
+}
+
+func (q *Queries) RecordHibernationInventoryScaledDown(ctx context.Context, arg RecordHibernationInventoryScaledDownParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordHibernationInventoryScaledDown,
+		arg.ScaledDownAt,
+		arg.LastHeldAt,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const runHasWakingHibernationWake = `-- name: RunHasWakingHibernationWake :one
@@ -506,6 +1036,35 @@ func (q *Queries) RunHasWakingHibernationWake(ctx context.Context, runID uuid.UU
 	return waking, err
 }
 
+const setHibernationInventoryStatus = `-- name: SetHibernationInventoryStatus :execrows
+UPDATE worker_hibernation_inventories SET
+    status = $1::text,
+    status_reason = $2::text
+WHERE worker_id = $3 AND op_id = $4 AND status = 'awaiting'
+`
+
+type SetHibernationInventoryStatusParams struct {
+	Status       string      `json:"status"`
+	StatusReason pgtype.Text `json:"status_reason"`
+	WorkerID     uuid.UUID   `json:"worker_id"`
+	OpID         uuid.UUID   `json:"op_id"`
+}
+
+// A worker-reported non-inventory status, a timeout, a missing capability or a scale-down that
+// closed the window. Only an awaiting row moves.
+func (q *Queries) SetHibernationInventoryStatus(ctx context.Context, arg SetHibernationInventoryStatusParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setHibernationInventoryStatus,
+		arg.Status,
+		arg.StatusReason,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const upsertControllerHibernationAdvertisement = `-- name: UpsertControllerHibernationAdvertisement :exec
 INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds)
 VALUES (1, $1, $2, $1, $3)
@@ -527,6 +1086,107 @@ type UpsertControllerHibernationAdvertisementParams struct {
 func (q *Queries) UpsertControllerHibernationAdvertisement(ctx context.Context, arg UpsertControllerHibernationAdvertisementParams) error {
 	_, err := q.db.Exec(ctx, upsertControllerHibernationAdvertisement, arg.AdvertisedAt, arg.HibernationVersion, arg.PollIntervalSeconds)
 	return err
+}
+
+const upsertHibernationInventoryObserved = `-- name: UpsertHibernationInventoryObserved :one
+
+INSERT INTO worker_hibernation_inventories (
+    worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, status
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7::jsonb, $8::text
+)
+ON CONFLICT (worker_id) DO UPDATE SET
+    op_id = EXCLUDED.op_id,
+    observed_at = EXCLUDED.observed_at,
+    deployment_uid = EXCLUDED.deployment_uid,
+    deployment_resource_version = EXCLUDED.deployment_resource_version,
+    pod_uid = EXCLUDED.pod_uid,
+    pvcs = EXCLUDED.pvcs,
+    status = EXCLUDED.status,
+    register_nonce = NULL,
+    received_at = NULL,
+    status_reason = NULL,
+    complete = NULL,
+    entries = NULL,
+    receipt_keys = NULL,
+    digest = NULL,
+    fingerprint = NULL,
+    lane = NULL,
+    mechanism = NULL,
+    invalidated_reason = NULL,
+    invalidated_at = NULL,
+    scaling_down_pod_uid = NULL,
+    fence_generation = NULL,
+    scaled_down_at = NULL,
+    last_held_at = NULL,
+    exclusion_final_at = NULL,
+    exclusion_final_digest = NULL,
+    exclusion_final_fingerprint = NULL
+RETURNING worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, register_nonce, received_at, status, status_reason, complete, entries, receipt_keys, digest, fingerprint, lane, mechanism, invalidated_reason, invalidated_at, scaling_down_pod_uid, fence_generation, scaled_down_at, last_held_at, exclusion_final_at, exclusion_final_digest, exclusion_final_fingerprint
+`
+
+type UpsertHibernationInventoryObservedParams struct {
+	WorkerID                  uuid.UUID          `json:"worker_id"`
+	OpID                      uuid.UUID          `json:"op_id"`
+	ObservedAt                pgtype.Timestamptz `json:"observed_at"`
+	DeploymentUid             string             `json:"deployment_uid"`
+	DeploymentResourceVersion string             `json:"deployment_resource_version"`
+	PodUid                    uuid.UUID          `json:"pod_uid"`
+	Pvcs                      []byte             `json:"pvcs"`
+	Status                    string             `json:"status"`
+}
+
+// ---------------------------------------------------------------------------
+// PRD #4208 M1: worker_hibernation_inventories (migration 00448).
+// Every write to worker_hibernation_inventories runs in a transaction that already holds the
+// workers row lock (GetWorkerForUpdate); lock order workers -> inventory. The reads below that
+// take a worker-id list are batched and unlocked: they feed the dry-run report, which only
+// reports and never deletes anything.
+// ---------------------------------------------------------------------------
+// Start (or restart) the inventory for the worker's current op: every column is replaced and the
+// inventory and validity columns are NULLed, so a new op never inherits an older op's entries.
+func (q *Queries) UpsertHibernationInventoryObserved(ctx context.Context, arg UpsertHibernationInventoryObservedParams) (WorkerHibernationInventory, error) {
+	row := q.db.QueryRow(ctx, upsertHibernationInventoryObserved,
+		arg.WorkerID,
+		arg.OpID,
+		arg.ObservedAt,
+		arg.DeploymentUid,
+		arg.DeploymentResourceVersion,
+		arg.PodUid,
+		arg.Pvcs,
+		arg.Status,
+	)
+	var i WorkerHibernationInventory
+	err := row.Scan(
+		&i.WorkerID,
+		&i.OpID,
+		&i.ObservedAt,
+		&i.DeploymentUid,
+		&i.DeploymentResourceVersion,
+		&i.PodUid,
+		&i.Pvcs,
+		&i.RegisterNonce,
+		&i.ReceivedAt,
+		&i.Status,
+		&i.StatusReason,
+		&i.Complete,
+		&i.Entries,
+		&i.ReceiptKeys,
+		&i.Digest,
+		&i.Fingerprint,
+		&i.Lane,
+		&i.Mechanism,
+		&i.InvalidatedReason,
+		&i.InvalidatedAt,
+		&i.ScalingDownPodUid,
+		&i.FenceGeneration,
+		&i.ScaledDownAt,
+		&i.LastHeldAt,
+		&i.ExclusionFinalAt,
+		&i.ExclusionFinalDigest,
+		&i.ExclusionFinalFingerprint,
+	)
+	return i, err
 }
 
 const workerHasOpenCustodyHold = `-- name: WorkerHasOpenCustodyHold :one
