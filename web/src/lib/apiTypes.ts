@@ -4421,6 +4421,34 @@ export interface CredentialEpoch {
   label: string | null;
   select_reason: string | null;
   applied_at: string;
+  /** 0 (or absent on an older API) for a claim's base epoch; n >= 1 for the nth in-place
+   *  switch inside that claim generation (issue #4201). Order epochs by
+   *  (claim_generation, ordinal). */
+  ordinal?: number;
+  /** Seq of the run's credential_switch message for an in-place switch; omitted for a base epoch. */
+  message_seq?: number;
+  /** The epoch's own spend; omitted when the run recorded none. */
+  usage?: CredentialEpochUsage;
+}
+
+/** CredentialSwitchMessagePayload is the body of a `credential_switch` run message (PRD #1247
+ *  M9; api/internal/workersvc/secretchoice.go). label is user-authored (null when unlabelled);
+ *  ordinal is n >= 1 for the nth in-place switch in a claim (issue #4201) and absent on a
+ *  claim-time switch. */
+export interface CredentialSwitchMessagePayload {
+  label: string | null;
+  select_reason: string;
+  secret_id: string;
+  ordinal?: number;
+}
+
+/** CredentialEpochUsage is one credential epoch's spend (issue #4201). */
+export interface CredentialEpochUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_usd: number;
 }
 
 // RunActivity is the server-derived "now" line for a run (PRD #1064 D3): who is acting,

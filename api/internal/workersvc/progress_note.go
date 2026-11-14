@@ -287,20 +287,21 @@ func foldPrefixedModelUsage(ctx context.Context, q usageFoldQuerier, run store.R
 		}
 		costStatus, costUSD := resolveProgressNoteCost(run.Harness, model, mu)
 		if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
-			RunID:               run.ID,
-			SessionID:           sessionID,
-			Model:               truncateRunes(prefix+model, maxUsageModelRunes),
-			LineageEpoch:        m.Seq,
-			InputTokens:         nonNegTokens(mu.InputTokens),
-			CacheReadTokens:     nonNegTokens(mu.CacheReadInputTokens),
-			CacheCreationTokens: nonNegTokens(mu.CacheCreationInputTokens),
-			OutputTokens:        nonNegTokens(mu.OutputTokens),
-			CostUsd:             costUSD,
-			Harness:             run.Harness,
-			CostStatus:          costStatus,
-			UsageBasis:          usageBasisPerLeg,
-			LineageIndex:        0,
-			ClaimGeneration:     pgconv.Int8Ptr(m.ClaimGeneration),
+			RunID:                  run.ID,
+			SessionID:              sessionID,
+			Model:                  truncateRunes(prefix+model, maxUsageModelRunes),
+			LineageEpoch:           m.Seq,
+			InputTokens:            nonNegTokens(mu.InputTokens),
+			CacheReadTokens:        nonNegTokens(mu.CacheReadInputTokens),
+			CacheCreationTokens:    nonNegTokens(mu.CacheCreationInputTokens),
+			OutputTokens:           nonNegTokens(mu.OutputTokens),
+			CostUsd:                costUSD,
+			Harness:                run.Harness,
+			CostStatus:             costStatus,
+			UsageBasis:             usageBasisPerLeg,
+			LineageIndex:           0,
+			ClaimGeneration:        pgconv.Int8Ptr(m.ClaimGeneration),
+			CredentialEpochOrdinal: pgconv.Int4Ptr32(m.CredentialEpochOrdinal),
 		}); err != nil {
 			return fmt.Errorf("fold %s usage (run %s, model %s): %w", what, run.ID, model, err)
 		}

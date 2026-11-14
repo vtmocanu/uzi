@@ -22,7 +22,10 @@ import (
 func (e codexTestEnv) countRunCredentialEpochs(t *testing.T, runID uuid.UUID) int {
 	t.Helper()
 	var n int
-	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_credential_epochs WHERE run_id = $1`, runID).Scan(&n); err != nil {
+	// Issue #4201: a Codex claim journals its own binding epoch (select_reason codex_binding). The
+	// assertions that use this count are about CLAUDE attribution, so that row is excluded here;
+	// TestRecordCodexEpochIdempotentLiveDB (credential_switch_apply_livedb_test.go) pins the Codex row itself.
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_credential_epochs WHERE run_id = $1 AND select_reason IS DISTINCT FROM 'codex_binding'`, runID).Scan(&n); err != nil {
 		t.Fatalf("count run_credential_epochs: %v", err)
 	}
 	return n
@@ -124,6 +127,27 @@ func TestAssembleClaimCodexBothCredentialsNoAnthropicEpochLiveDB(t *testing.T) {
 	}
 	if n := env.countRunCredentialEpochs(t, f.runID); n != 0 {
 		t.Fatalf("run_credential_epochs rows = %d, want 0 (a Codex claim must never attribute the Anthropic token, even when one exists)", n)
+	}
+	// Issue #4201: the Codex claim journals its own binding epoch, once, and a re-assembly is idempotent.
+	codexRows := func() (n int, secret *uuid.UUID) {
+		t.Helper()
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*), max(secret_id::text)::uuid FROM run_credential_epochs
+		    WHERE run_id = $1 AND select_reason = 'codex_binding'`, f.runID).Scan(&n, &secret); err != nil {
+			t.Fatal(err)
+		}
+		return n, secret
+	}
+	if n, secret := codexRows(); n != 1 || secret == nil || *secret != uuid.UUID(run.CodexSecretID.Bytes) {
+		t.Fatalf("codex_binding epoch rows = %d secret %v, want exactly one for the bound Codex secret", n, secret)
+	}
+	if _, err := svc.assembleClaim(env.ctx, f.wkr, run); err != nil {
+		t.Fatalf("second assembleClaim: %v", err)
+	}
+	if n, _ := codexRows(); n != 1 {
+		t.Fatalf("codex_binding epoch rows after a re-assembly = %d, want 1 (idempotent)", n)
+	}
+	if got := mustRun(t, env, f.runID); got.AnthropicSecretID.Valid && got.AnthropicSecretID != run.AnthropicSecretID {
+		t.Fatalf("a Codex claim must not touch runs.anthropic_secret_id: %v", got.AnthropicSecretID)
 	}
 }
 

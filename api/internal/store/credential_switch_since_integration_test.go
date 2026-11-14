@@ -84,4 +84,27 @@ func TestGetLatestCredentialSwitchSinceLiveDB(t *testing.T) {
 	if got := switchLabel(t, payload); got != "token-newest" {
 		t.Fatalf("payload label = %q, want token-newest", got)
 	}
+
+	// Issue #4201: an in-place apply writes the SAME kind ('credential_switch', credentialSwitchMessageKind
+	// in workersvc) with an extra "ordinal" field, and the query selects by kind alone, so the apply's
+	// message is indistinguishable from a held-switch one: it is returned when it was created after the
+	// park-cycle anchor and excluded when it predates it (an in-place apply happens while the run is
+	// running, so a LATER park cycle's anchor excludes it, and it never re-attributes the resume DM).
+	insertApply := func(seq int32, at time.Duration, label string) {
+		mustExec(ctx, t, f.pool,
+			`INSERT INTO run_messages (run_id, seq, kind, payload, created_at)
+			 VALUES ($1, $2, 'credential_switch', $3, $4)`,
+			f.runID, seq, []byte(`{"label":"`+label+`","select_reason":"run_pinned","secret_id":"x","ordinal":2}`), base.Add(at))
+	}
+	insertApply(12, 20*time.Minute, "token-inplace")
+	payload, err = f.q.GetLatestCredentialSwitchSince(ctx, store.GetLatestCredentialSwitchSinceParams{RunID: f.runID, Since: ts(10 * time.Minute)})
+	if err != nil {
+		t.Fatalf("in-place apply message after the anchor: %v", err)
+	}
+	if got := switchLabel(t, payload); got != "token-inplace" {
+		t.Fatalf("payload label = %q, want token-inplace (newest by seq, same kind as a held switch)", got)
+	}
+	if _, err := f.q.GetLatestCredentialSwitchSince(ctx, store.GetLatestCredentialSwitchSinceParams{RunID: f.runID, Since: ts(25 * time.Minute)}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("in-place apply message before a later park anchor: want ErrNoRows, got %v", err)
+	}
 }

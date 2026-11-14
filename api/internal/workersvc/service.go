@@ -1030,6 +1030,9 @@ type Store interface {
 	// credential_switch_unsettled behind the incarnation fence; CredentialSwitchHoldSettling is
 	// the fence ResumePausedRun refuses on, as a read.
 	HoldCredentialSwitchUnsettled(ctx context.Context, arg store.HoldCredentialSwitchUnsettledParams) (int64, error)
+	// StampWorkerCredentialSwitchApplyNonce records, at registration, that the registration with
+	// this nonce negotiated in-place credential apply (issue #4201 m3a); see applyNegotiated.
+	StampWorkerCredentialSwitchApplyNonce(ctx context.Context, arg store.StampWorkerCredentialSwitchApplyNonceParams) error
 	SettleCredentialSwitchHold(ctx context.Context, arg store.SettleCredentialSwitchHoldParams) (int64, error)
 	CredentialSwitchHoldSettling(ctx context.Context, arg store.CredentialSwitchHoldSettlingParams) (bool, error)
 	// SettleRunClarificationToGate / GetClarificationGateSettlementReplay are the issue #3985
@@ -1407,6 +1410,15 @@ type Store interface {
 	// RunCredentialEpochs service method.
 	RecordRunCredentialEpoch(ctx context.Context, arg store.RecordRunCredentialEpochParams) error
 	ListRunCredentialEpochs(ctx context.Context, arg store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error)
+	// Issue #4201 (in-place credential switch): the child-epoch journal, the per-frame epoch
+	// ordinal ceiling the append path clamps against, the Codex claim's epoch row, the
+	// credential_switch_uncertain park and the per-epoch usage legs the run view telescopes.
+	GetRunCredentialSwitchEpochByOp(ctx context.Context, arg store.GetRunCredentialSwitchEpochByOpParams) (store.RunCredentialSwitchEpoch, error)
+	ListRunCredentialSwitchEpochs(ctx context.Context, arg store.ListRunCredentialSwitchEpochsParams) ([]store.RunCredentialSwitchEpoch, error)
+	ListRunUsageByCredentialEpoch(ctx context.Context, runID uuid.UUID) ([]store.ListRunUsageByCredentialEpochRow, error)
+	MaxCommittedCredentialEpochOrdinal(ctx context.Context, arg store.MaxCommittedCredentialEpochOrdinalParams) (int32, error)
+	RecordCodexCredentialEpoch(ctx context.Context, arg store.RecordCodexCredentialEpochParams) error
+	SetRunCredentialSwitchUncertainHold(ctx context.Context, arg store.SetRunCredentialSwitchUncertainHoldParams) (int64, error)
 	// SetRunCredentialOverride writes the per-run override columns for `uzi run set-token`
 	// (PRD #1247 M4, D4): the FIRST write in every writable-state branch of the verb,
 	// before the state-specific transition. Both params are nullable (inherit clears
@@ -2022,6 +2034,14 @@ type Service struct {
 	// read and before its transaction begins. TEST-ONLY: unexported and nil in production; a test
 	// uses it to move the run in that window and prove the switch is refused.
 	beforeCredentialSwitchTx func()
+	// afterApplySecretLock runs in ApplyCredentialSwitch right after the chosen token row is
+	// share-locked, before the transaction continues. TEST-ONLY: unexported and nil in production; the
+	// rotation-race test parks the apply here while a concurrent rotation tries to take the row.
+	afterApplySecretLock func()
+	// beforeApplySecretLock runs in ApplyCredentialSwitch right before the chosen token row is
+	// share-locked (NOWAIT), once per attempt. TEST-ONLY: unexported and nil in production; the
+	// busy-row tests hold or release a competing lock here.
+	beforeApplySecretLock func()
 	// leaseClaimProbe, when set by a test, is told the outcome of every claim that ran through a
 	// lease: whether ClaimRun admitted a run through it and whether the rebind applied. TEST-ONLY:
 	// nil in production.
@@ -2657,6 +2677,9 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 		if err != nil {
 			return store.Worker{}, "", err
 		}
+		if row.CredentialSwitchApplyNonce, err = s.stampApplyNonce(ctx, s.q, wkr.ID, protocolCaps, nonce); err != nil {
+			return store.Worker{}, "", err
+		}
 		// The snapshot is never persisted here, but a valid finalize list still applies via s.q.
 		if err := runAttested(s.q); err != nil {
 			return store.Worker{}, "", err
@@ -2707,6 +2730,9 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	// (b) Rotate the nonce + reset the epoch (folded into RegisterWorker's update).
 	row, err := qtx.RegisterWorker(ctx, regParams)
 	if err != nil {
+		return store.Worker{}, "", err
+	}
+	if row.CredentialSwitchApplyNonce, err = s.stampApplyNonce(ctx, qtx, wkr.ID, protocolCaps, nonce); err != nil {
 		return store.Worker{}, "", err
 	}
 	// PRD #4205: a Register against a waking worker is settlement evidence; against a
@@ -4050,6 +4076,13 @@ type IncomingMessage struct {
 	// folds; the refold reads each frame's PERSISTED run_messages.claim_generation. nil = legacy /
 	// unknown (a pre-feature frame, or a legacy worker's unfenced batch), folded as NULL provenance.
 	ClaimGeneration *int64 `json:"-"`
+	// CredentialEpochOrdinal is the in-generation credential switch epoch the frame was produced
+	// under (issue #4201, feature credential_switch_apply_v1): 0 or absent is the claim's base
+	// epoch, n>=1 the nth applied in-place switch. The append path stores it as sent unless it
+	// names an epoch the server has not committed for the claim, in which case the frame is
+	// permanently unattributed (-1). The fold copies it onto run_usage and the refold reads the
+	// persisted run_messages value back, so the two never disagree.
+	CredentialEpochOrdinal *int32 `json:"credential_epoch_ordinal,omitempty"`
 }
 
 // resultUsagePayload is the subset of a terminal result frame's payload the fold
@@ -4168,7 +4201,12 @@ type StateRequest struct {
 	RequireRunning bool `json:"require_running,omitempty"`
 	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
 	CompletionFinalHead *string `json:"completion_final_head,omitempty"`
-	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|credential_switch_failed|credential_switch_held|credential_switch_hold_settled|clarification_settled|completed|failed
+	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|credential_switch_failed|credential_switch_held|credential_switch_hold_settled|credential_switch_uncertain|clarification_settled|completed|failed
+	// OpID is the credential-switch operation id (issue #4201, feature credential_switch_apply_v1)
+	// the credential_switch_failed, credential_switch_held and credential_switch_uncertain reports
+	// are fenced to. Optional on the first two (absent keeps the pre-#4201 unfenced behaviour),
+	// required on the third. httpx.DecodeJSON rejects unknown fields, so it MUST exist here.
+	OpID *string `json:"op_id,omitempty"`
 	// ClarificationSettlement (issue #3985, feature clarification_revision_settlement_v1) names the
 	// answered question, the pending human revise and the gate revision a clarification_settled
 	// report settles back to awaiting_approval. It is valid only on, and required by,
@@ -4701,7 +4739,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// not nest beneath the generic state fence on another connection.
 	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed" ||
 		req.State == stateCredentialSwitchHeld || req.State == stateCredentialSwitchHoldSettled ||
-		req.State == stateClarificationSettled) {
+		req.State == stateCredentialSwitchUncertain || req.State == stateClarificationSettled) {
 		locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
 		if err != nil {
 			return owned, false, err
@@ -4805,6 +4843,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if req.State == stateCredentialSwitchHoldSettled {
 		return s.settleCredentialSwitchHold(ctx, owned, wkr, req)
+	}
+	if req.State == stateCredentialSwitchUncertain {
+		return s.uncertainCredentialSwitch(ctx, owned, wkr, req)
 	}
 	if req.State == stateClarificationSettled {
 		return s.settleClarificationToGate(ctx, owned, wkr, req)
@@ -6449,6 +6490,14 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 	return result, nil
 }
 
+// inPlaceSwitchDrains reports whether a pending credential switch leaves the worker's /inputs
+// draining normally: the worker registered the in-place capability AND uses the receipts path
+// (the only drain that is a read-only replay, so a drain the worker never applies loses nothing).
+func inPlaceSwitchDrains(wkr store.Worker) bool {
+	return slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchInPlaceV1) &&
+		slices.Contains(wkr.ProtocolCapabilities, capability.InputReceiptsV1)
+}
+
 func (s *Service) consumeInputsLocked(ctx context.Context, wkr store.Worker, runID uuid.UUID) (ConsumeInputsResult, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
@@ -6459,10 +6508,14 @@ func (s *Service) consumeInputsLocked(ctx context.Context, wkr store.Worker, run
 			RunID: run.ID, Generation: run.ClaimGeneration,
 		}}, nil
 	}
-	if sig := PendingCredentialSwitchSignal(run); sig != nil {
+	sig := PendingCredentialSwitchSignal(run)
+	if sig != nil && !inPlaceSwitchDrains(wkr) {
 		// Pending switch: signal + no drain, so a racing answer/follow-up survives for the reclaim.
 		return ConsumeInputsResult{CredentialSwitch: sig}, nil
 	}
+	// Issue #4201: an in-place worker (inPlaceSwitchDrains) keeps its claim through the switch, so
+	// there is no reclaim for the inputs to wait for. It falls through to the read-only receipts
+	// replay below and the signal rides alongside the inputs.
 	if run.ClaimReleasedAt.Valid {
 		// Released-but-not-reclaimed: claim_released_at is set by ReleaseCredentialSwitch (a credential
 		// switch released this claim) OR by ParkRunsAtWall (PRD #1497: the server parked the run at its
@@ -6481,7 +6534,7 @@ func (s *Service) consumeInputsLocked(ctx context.Context, wkr store.Worker, run
 		for _, row := range rows {
 			out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
 		}
-		return ConsumeInputsResult{Inputs: out, Receipts: true, OwnerID: run.UserID}, nil
+		return ConsumeInputsResult{Inputs: out, Receipts: true, OwnerID: run.UserID, CredentialSwitch: sig}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {
@@ -8568,6 +8621,18 @@ func (s *Service) activeRunsPriorityCutoff() pgtype.Timestamptz {
 // pgx.ErrNoRows for a run with no usage — the caller renders that as "no usage".
 func (s *Service) RunUsageTotal(ctx context.Context, runID uuid.UUID) (store.GetRunUsageTotalRow, error) {
 	return s.q.GetRunUsageTotal(ctx, runID)
+}
+
+// RunCredentialSwitchEpochs returns the in-generation epochs in-place switches opened in one run
+// (issue #4201), owner-scoped, oldest first.
+func (s *Service) RunCredentialSwitchEpochs(ctx context.Context, runID, userID uuid.UUID) ([]store.RunCredentialSwitchEpoch, error) {
+	return s.q.ListRunCredentialSwitchEpochs(ctx, store.ListRunCredentialSwitchEpochsParams{RunID: runID, UserID: userID})
+}
+
+// RunUsageByCredentialEpoch returns a run's raw usage legs with their epoch attribution, for the
+// run view's per-epoch telescoping (issue #4201). The caller has already established ownership.
+func (s *Service) RunUsageByCredentialEpoch(ctx context.Context, runID uuid.UUID) ([]store.ListRunUsageByCredentialEpochRow, error) {
+	return s.q.ListRunUsageByCredentialEpoch(ctx, runID)
 }
 
 // RunCredentialEpochs returns one run's applied-switch attribution journal, oldest

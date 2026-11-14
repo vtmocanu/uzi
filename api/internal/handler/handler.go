@@ -1228,6 +1228,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// NOT lane-allowlisted: an isolated-lane run is not a Claude run-lane flight that posts it.
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
+		// Issue #4201: the in-place Claude credential switch apply. The response carries the
+		// plaintext token, the service resolves and decrypts a credential per call, and the worker
+		// retries on a lost response, so it rides the per-worker limiter.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/credential-switch/apply", h.WorkerCredentialSwitchApply)
 		// Bounded local lifecycle outcome, like /state and memory outcomes: no rate
 		// limiter or upstream I/O. Strict 17 KiB decoding and worker/run fences apply.
 		r.Post("/runs/{id}/policy-hold", h.WorkerRunPolicyHold)

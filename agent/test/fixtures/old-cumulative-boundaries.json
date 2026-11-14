@@ -1,0 +1,443 @@
+{
+ "cases": [
+  {
+   "name": "basic two models sorted",
+   "modelUsage": {
+    "claude-b": {
+     "inputTokens": 5,
+     "outputTokens": 6,
+     "cacheReadInputTokens": 7,
+     "cacheCreationInputTokens": 8,
+     "costUSD": 1.5
+    },
+    "claude-a": {
+     "inputTokens": 1,
+     "outputTokens": 2
+    }
+   },
+   "expected": {
+    "claude-a.inputTokens": 1,
+    "claude-a.outputTokens": 2,
+    "claude-b.cacheCreationInputTokens": 8,
+    "claude-b.cacheReadInputTokens": 7,
+    "claude-b.inputTokens": 5,
+    "claude-b.outputTokens": 6
+   }
+  },
+  {
+   "name": "MAX_SAFE_INTEGER kept",
+   "modelUsage": {
+    "m": {
+     "inputTokens": 9007199254740991
+    }
+   },
+   "expected": {
+    "m.inputTokens": 9007199254740991
+   }
+  },
+  {
+   "name": "MAX_SAFE_INTEGER plus one dropped",
+   "modelUsage": {
+    "m": {
+     "inputTokens": 9007199254740992
+    }
+   },
+   "expected": null
+  },
+  {
+   "name": "19 digit value dropped",
+   "modelUsage": {
+    "m": {
+     "inputTokens": 1234567890123456800
+    }
+   },
+   "expected": null
+  },
+  {
+   "name": "negative fractional and string dropped, sibling kept",
+   "modelUsage": {
+    "m": {
+     "inputTokens": -1,
+     "outputTokens": 1.5,
+     "cacheReadInputTokens": "3",
+     "cacheCreationInputTokens": 4
+    }
+   },
+   "expected": {
+    "m.cacheCreationInputTokens": 4
+   }
+  },
+  {
+   "name": "200 byte key kept",
+   "modelUsage": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+     "inputTokens": 1
+    }
+   },
+   "expected": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.inputTokens": 1
+   }
+  },
+  {
+   "name": "201 byte key skipped",
+   "modelUsage": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+     "inputTokens": 1
+    }
+   },
+   "expected": null
+  },
+  {
+   "name": "multibyte key under 200 characters but over 200 bytes skipped",
+   "modelUsage": {
+    "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé": {
+     "inputTokens": 1
+    }
+   },
+   "expected": null
+  },
+  {
+   "name": "multibyte key of exactly 200 bytes kept",
+   "modelUsage": {
+    "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé": {
+     "inputTokens": 1
+    }
+   },
+   "expected": {
+    "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé.inputTokens": 1
+   }
+  },
+  {
+   "name": "capped at 64 entries in sorted order",
+   "modelUsage": {
+    "m00": {
+     "inputTokens": 0
+    },
+    "m01": {
+     "inputTokens": 1
+    },
+    "m02": {
+     "inputTokens": 2
+    },
+    "m03": {
+     "inputTokens": 3
+    },
+    "m04": {
+     "inputTokens": 4
+    },
+    "m05": {
+     "inputTokens": 5
+    },
+    "m06": {
+     "inputTokens": 6
+    },
+    "m07": {
+     "inputTokens": 7
+    },
+    "m08": {
+     "inputTokens": 8
+    },
+    "m09": {
+     "inputTokens": 9
+    },
+    "m10": {
+     "inputTokens": 10
+    },
+    "m11": {
+     "inputTokens": 11
+    },
+    "m12": {
+     "inputTokens": 12
+    },
+    "m13": {
+     "inputTokens": 13
+    },
+    "m14": {
+     "inputTokens": 14
+    },
+    "m15": {
+     "inputTokens": 15
+    },
+    "m16": {
+     "inputTokens": 16
+    },
+    "m17": {
+     "inputTokens": 17
+    },
+    "m18": {
+     "inputTokens": 18
+    },
+    "m19": {
+     "inputTokens": 19
+    },
+    "m20": {
+     "inputTokens": 20
+    },
+    "m21": {
+     "inputTokens": 21
+    },
+    "m22": {
+     "inputTokens": 22
+    },
+    "m23": {
+     "inputTokens": 23
+    },
+    "m24": {
+     "inputTokens": 24
+    },
+    "m25": {
+     "inputTokens": 25
+    },
+    "m26": {
+     "inputTokens": 26
+    },
+    "m27": {
+     "inputTokens": 27
+    },
+    "m28": {
+     "inputTokens": 28
+    },
+    "m29": {
+     "inputTokens": 29
+    },
+    "m30": {
+     "inputTokens": 30
+    },
+    "m31": {
+     "inputTokens": 31
+    },
+    "m32": {
+     "inputTokens": 32
+    },
+    "m33": {
+     "inputTokens": 33
+    },
+    "m34": {
+     "inputTokens": 34
+    },
+    "m35": {
+     "inputTokens": 35
+    },
+    "m36": {
+     "inputTokens": 36
+    },
+    "m37": {
+     "inputTokens": 37
+    },
+    "m38": {
+     "inputTokens": 38
+    },
+    "m39": {
+     "inputTokens": 39
+    },
+    "m40": {
+     "inputTokens": 40
+    },
+    "m41": {
+     "inputTokens": 41
+    },
+    "m42": {
+     "inputTokens": 42
+    },
+    "m43": {
+     "inputTokens": 43
+    },
+    "m44": {
+     "inputTokens": 44
+    },
+    "m45": {
+     "inputTokens": 45
+    },
+    "m46": {
+     "inputTokens": 46
+    },
+    "m47": {
+     "inputTokens": 47
+    },
+    "m48": {
+     "inputTokens": 48
+    },
+    "m49": {
+     "inputTokens": 49
+    },
+    "m50": {
+     "inputTokens": 50
+    },
+    "m51": {
+     "inputTokens": 51
+    },
+    "m52": {
+     "inputTokens": 52
+    },
+    "m53": {
+     "inputTokens": 53
+    },
+    "m54": {
+     "inputTokens": 54
+    },
+    "m55": {
+     "inputTokens": 55
+    },
+    "m56": {
+     "inputTokens": 56
+    },
+    "m57": {
+     "inputTokens": 57
+    },
+    "m58": {
+     "inputTokens": 58
+    },
+    "m59": {
+     "inputTokens": 59
+    },
+    "m60": {
+     "inputTokens": 60
+    },
+    "m61": {
+     "inputTokens": 61
+    },
+    "m62": {
+     "inputTokens": 62
+    },
+    "m63": {
+     "inputTokens": 63
+    },
+    "m64": {
+     "inputTokens": 64
+    },
+    "m65": {
+     "inputTokens": 65
+    },
+    "m66": {
+     "inputTokens": 66
+    },
+    "m67": {
+     "inputTokens": 67
+    },
+    "m68": {
+     "inputTokens": 68
+    },
+    "m69": {
+     "inputTokens": 69
+    }
+   },
+   "expected": {
+    "m00.inputTokens": 0,
+    "m01.inputTokens": 1,
+    "m02.inputTokens": 2,
+    "m03.inputTokens": 3,
+    "m04.inputTokens": 4,
+    "m05.inputTokens": 5,
+    "m06.inputTokens": 6,
+    "m07.inputTokens": 7,
+    "m08.inputTokens": 8,
+    "m09.inputTokens": 9,
+    "m10.inputTokens": 10,
+    "m11.inputTokens": 11,
+    "m12.inputTokens": 12,
+    "m13.inputTokens": 13,
+    "m14.inputTokens": 14,
+    "m15.inputTokens": 15,
+    "m16.inputTokens": 16,
+    "m17.inputTokens": 17,
+    "m18.inputTokens": 18,
+    "m19.inputTokens": 19,
+    "m20.inputTokens": 20,
+    "m21.inputTokens": 21,
+    "m22.inputTokens": 22,
+    "m23.inputTokens": 23,
+    "m24.inputTokens": 24,
+    "m25.inputTokens": 25,
+    "m26.inputTokens": 26,
+    "m27.inputTokens": 27,
+    "m28.inputTokens": 28,
+    "m29.inputTokens": 29,
+    "m30.inputTokens": 30,
+    "m31.inputTokens": 31,
+    "m32.inputTokens": 32,
+    "m33.inputTokens": 33,
+    "m34.inputTokens": 34,
+    "m35.inputTokens": 35,
+    "m36.inputTokens": 36,
+    "m37.inputTokens": 37,
+    "m38.inputTokens": 38,
+    "m39.inputTokens": 39,
+    "m40.inputTokens": 40,
+    "m41.inputTokens": 41,
+    "m42.inputTokens": 42,
+    "m43.inputTokens": 43,
+    "m44.inputTokens": 44,
+    "m45.inputTokens": 45,
+    "m46.inputTokens": 46,
+    "m47.inputTokens": 47,
+    "m48.inputTokens": 48,
+    "m49.inputTokens": 49,
+    "m50.inputTokens": 50,
+    "m51.inputTokens": 51,
+    "m52.inputTokens": 52,
+    "m53.inputTokens": 53,
+    "m54.inputTokens": 54,
+    "m55.inputTokens": 55,
+    "m56.inputTokens": 56,
+    "m57.inputTokens": 57,
+    "m58.inputTokens": 58,
+    "m59.inputTokens": 59,
+    "m60.inputTokens": 60,
+    "m61.inputTokens": 61,
+    "m62.inputTokens": 62,
+    "m63.inputTokens": 63
+   }
+  },
+  {
+   "name": "empty object is undefined",
+   "modelUsage": {},
+   "expected": null
+  },
+  {
+   "name": "model id with NUL skipped, sibling kept",
+   "modelUsage": {
+    "a\u0000b": {
+     "inputTokens": 1
+    },
+    "ok": {
+     "inputTokens": 2
+    }
+   },
+   "expected": {
+    "ok.inputTokens": 2
+   }
+  },
+  {
+   "name": "model id with tab skipped",
+   "modelUsage": {
+    "a\tb": {
+     "inputTokens": 1
+    }
+   },
+   "expected": null
+  },
+  {
+   "name": "model id with DEL skipped",
+   "modelUsage": {
+    "ab": {
+     "inputTokens": 1
+    }
+   },
+   "expected": null
+  }
+ ],
+ "violations": [
+  {
+   "name": "19 digit value",
+   "raw": "{\"m.inputTokens\":1234567890123456789}"
+  },
+  {
+   "name": "201 byte key",
+   "raw": "{\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\":1}"
+  },
+  {
+   "name": "65 entries",
+   "raw": "{\"k0\":0,\"k1\":1,\"k2\":2,\"k3\":3,\"k4\":4,\"k5\":5,\"k6\":6,\"k7\":7,\"k8\":8,\"k9\":9,\"k10\":10,\"k11\":11,\"k12\":12,\"k13\":13,\"k14\":14,\"k15\":15,\"k16\":16,\"k17\":17,\"k18\":18,\"k19\":19,\"k20\":20,\"k21\":21,\"k22\":22,\"k23\":23,\"k24\":24,\"k25\":25,\"k26\":26,\"k27\":27,\"k28\":28,\"k29\":29,\"k30\":30,\"k31\":31,\"k32\":32,\"k33\":33,\"k34\":34,\"k35\":35,\"k36\":36,\"k37\":37,\"k38\":38,\"k39\":39,\"k40\":40,\"k41\":41,\"k42\":42,\"k43\":43,\"k44\":44,\"k45\":45,\"k46\":46,\"k47\":47,\"k48\":48,\"k49\":49,\"k50\":50,\"k51\":51,\"k52\":52,\"k53\":53,\"k54\":54,\"k55\":55,\"k56\":56,\"k57\":57,\"k58\":58,\"k59\":59,\"k60\":60,\"k61\":61,\"k62\":62,\"k63\":63,\"k64\":64}"
+  }
+ ]
+}
