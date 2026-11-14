@@ -1040,6 +1040,23 @@ export interface AdminBlockedRepos {
   requests: GuardrailOverrideRequest[];
 }
 
+// RepoActivity is one row of GET /api/admin/repo-activity (issue #4334): a repo's id, forge
+// path, whether it is enabled and when its newest run of any kind was created (null when it
+// has never run). `path_with_namespace` is user-controlled: sanitize before rendering.
+export interface RepoActivity {
+  id: string;
+  path_with_namespace: string;
+  enabled: boolean;
+  last_run_at: string | null;
+}
+
+// AdminRepoActivity is the GET /api/admin/repo-activity envelope: every enabled repo plus
+// every disabled repo that has a listed non-terminal run. The handler always sends an array
+// (never null), so an empty list is "no repos", not "unknown".
+export interface AdminRepoActivity {
+  repos: RepoActivity[];
+}
+
 // EgressProfileWarning is a note about a stored host entry of an egress profile (PRD
 // #1906 Decision 4), mirroring apitypes.EgressProfileWarningDTO. Codes:
 // "multi_publisher_override" (a multi-publisher host admitted by an explicit override),

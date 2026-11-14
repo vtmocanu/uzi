@@ -1371,6 +1371,11 @@ func TestAdminDockerAllowlistDTOTags(t *testing.T) {
 	assertTags(t, "AdminDockerAllowlistReposDTO", AdminDockerAllowlistReposDTO{}, "repos")
 }
 
+func TestAdminRepoActivityDTOTags(t *testing.T) {
+	assertTags(t, "AdminRepoActivityDTO", AdminRepoActivityDTO{}, "repos")
+	assertTags(t, "RepoActivityDTO", RepoActivityDTO{}, "id", "path_with_namespace", "enabled", "last_run_at")
+}
+
 func TestAdminBlockedReposDTOTags(t *testing.T) {
 	assertTags(t, "AdminBlockedReposDTO", AdminBlockedReposDTO{}, "repos", "checks_unknown",
 		// PRD #1432: the pending cross-user override-request queue, non-omitempty

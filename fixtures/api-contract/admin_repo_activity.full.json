@@ -1,0 +1,10 @@
+{
+  "repos": [
+    {
+      "id": "x",
+      "path_with_namespace": "x",
+      "enabled": true,
+      "last_run_at": "2020-01-02T03:04:05Z"
+    }
+  ]
+}
