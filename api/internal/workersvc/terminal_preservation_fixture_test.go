@@ -18,7 +18,7 @@ import (
 // fixtures/terminal-preservation/completion-reasons.json is the list the worker decoder
 // (agent/src/client.ts decodeCompletedPublicationReason) is pinned to.
 func TestTerminalPreservationFixtureCompletionReasons(t *testing.T) {
-	b, err := os.ReadFile("../../../fixtures/terminal-preservation/completion-reasons.json") //nolint:gosec // G304: fixed repo-relative test fixture path
+	b, err := os.ReadFile("../../../fixtures/terminal-preservation/completion-reasons.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,8 +35,10 @@ func TestTerminalPreservationFixtureCompletionReasons(t *testing.T) {
 // TestTerminalPreservationFixtureMatchesServerResult ties each shared response fixture to the
 // server: it builds the stored rows the fixture describes, runs terminalResult over them, maps the
 // result onto the handler's DTO the way handler.WorkerRunTerminalPreservation does, and requires the
-// JSON to equal the fixture. A change to the disposition, state, reason or ref the server derives
-// reddens this test, so the worker (pinned to the same fixtures) cannot drift from the server.
+// JSON to equal the fixture. A change inside terminalResult (the disposition, state, reason or ref
+// it echoes) reddens this test. It rebuilds the rows and the handler's DTO mapping itself, so a
+// change to the handler mapping or to which state/disposition terminalBind stores is not caught
+// here (the 00449 CHECKs bound the latter).
 func TestTerminalPreservationFixtureMatchesServerResult(t *testing.T) {
 	const (
 		runID  = "11111111-1111-4111-8111-111111111111"
@@ -75,7 +77,7 @@ func TestTerminalPreservationFixtureMatchesServerResult(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			raw, err := os.ReadFile("../../../fixtures/terminal-preservation/response." + tc.fixture + ".json") //nolint:gosec // G304: fixed repo-relative test fixture path
+			raw, err := os.ReadFile("../../../fixtures/terminal-preservation/response." + tc.fixture + ".json")
 			if err != nil {
 				t.Fatal(err)
 			}
