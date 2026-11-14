@@ -535,7 +535,10 @@ RETURNING *;
 SELECT * FROM workers WHERE id = @id FOR UPDATE;
 
 -- name: DeleteWorkerForUser :execrows
-DELETE FROM workers WHERE id = @id AND user_id = @user_id;
+-- A worker whose hibernation cache prune attempt is unsettled (PRD #4206) is not deleted: its
+-- claim fence is the only thing that proves the prune cannot race new work.
+DELETE FROM workers WHERE id = @id AND user_id = @user_id
+  AND cleanup_phase NOT IN ('requested', 'started', 'unknown');
 
 -- name: CountWorkerNonTerminalRuns :one
 -- Deletion guard: a worker holding a non-terminal run may not be deleted. The FK

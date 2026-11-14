@@ -617,6 +617,9 @@ type fakeStore struct {
 	listActiveErr      error
 	deleteWorkerRows   int64
 	deleteWorkerParams *store.DeleteWorkerForUserParams
+	// deleteWorkerRow is the row GetWorkerByIDForUser serves after a 0-row delete (PRD #4206: the
+	// guard that tells "not found" from "hibernation cleanup unsettled"); nil reads as no row.
+	deleteWorkerRow *store.Worker
 	// PRD #529 M4 ephemeral teardown: delEphemeralRuns is the rows-affected the fake
 	// reports (defaults to 0); delEphemeralArg captures the run id passed, nil until the
 	// teardown query is reached — so a test can assert the SetState hook fired (or did
@@ -1909,6 +1912,12 @@ func (f *fakeStore) ListWorkerNonTerminalRuns(_ context.Context, arg store.ListW
 func (f *fakeStore) DeleteWorkerForUser(_ context.Context, arg store.DeleteWorkerForUserParams) (int64, error) {
 	f.deleteWorkerParams = &arg
 	return f.deleteWorkerRows, nil
+}
+func (f *fakeStore) GetWorkerByIDForUser(context.Context, store.GetWorkerByIDForUserParams) (store.Worker, error) {
+	if f.deleteWorkerRow == nil {
+		return store.Worker{}, pgx.ErrNoRows
+	}
+	return *f.deleteWorkerRow, nil
 }
 func (f *fakeStore) DeleteEphemeralWorkerForRun(_ context.Context, arg store.DeleteEphemeralWorkerForRunParams) (int64, error) {
 	f.delEphemeralArg = &arg.RunID
@@ -5416,6 +5425,27 @@ func TestDeleteWorkerNotFoundWhenNoRowDeleted(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	if err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New()); err != ErrWorkerNotFound {
 		t.Fatalf("err = %v, want ErrWorkerNotFound", err)
+	}
+}
+
+// PRD #4206: a delete that matched no row because the worker's hibernation cache prune is
+// unsettled is a 409-class error, not a not-found; a settled or absent attempt stays not-found.
+func TestDeleteWorkerRefusedWhileCleanupUnsettled(t *testing.T) {
+	for _, tc := range []struct {
+		phase string
+		want  error
+	}{
+		{CleanupPhaseRequested, ErrWorkerHibernationCleanupUnsettled},
+		{CleanupPhaseStarted, ErrWorkerHibernationCleanupUnsettled},
+		{CleanupPhaseUnknown, ErrWorkerHibernationCleanupUnsettled},
+		{CleanupPhaseSettled, ErrWorkerNotFound},
+		{CleanupPhaseNone, ErrWorkerNotFound},
+	} {
+		fs := &fakeStore{deleteWorkerRows: 0, deleteWorkerRow: &store.Worker{CleanupPhase: tc.phase}}
+		err := New(fs, newBox(t), testParams()).DeleteWorker(context.Background(), uuid.New(), uuid.New())
+		if !errors.Is(err, tc.want) {
+			t.Fatalf("phase %s: err = %v, want %v", tc.phase, err, tc.want)
+		}
 	}
 }
 

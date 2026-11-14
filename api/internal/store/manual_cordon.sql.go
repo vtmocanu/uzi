@@ -18,7 +18,7 @@ UPDATE workers SET manual_cordoned_at = clock_timestamp(),
  manual_cordon_reason = $3::text, updated_at = now()
 WHERE id = $4 AND user_id = $5 AND NOT ephemeral
  AND kind IN ('hosted','external') AND manual_cordoned_at IS NULL
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at
 `
 
 type CordonWorkerForOwnerParams struct {
@@ -127,12 +127,25 @@ func (q *Queries) CordonWorkerForOwner(ctx context.Context, arg CordonWorkerForO
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.HibernationCleanup,
+		&i.HibernationCleanupReason,
+		&i.CleanupOpID,
+		&i.CleanupPhase,
+		&i.CleanupRegisterNonce,
+		&i.CleanupPodUid,
+		&i.CleanupRequestedAt,
+		&i.CleanupStartedAt,
+		&i.CleanupUnknownAt,
+		&i.CleanupSettledAt,
+		&i.CleanupCancelRequested,
+		&i.CleanupReconcileSeq,
+		&i.CleanupReconciledAt,
 	)
 	return i, err
 }
 
 const getWorkerForOwnerForUpdate = `-- name: GetWorkerForOwnerForUpdate :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid FROM workers WHERE id = $1 AND user_id = $2 FOR UPDATE
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at FROM workers WHERE id = $1 AND user_id = $2 FOR UPDATE
 `
 
 type GetWorkerForOwnerForUpdateParams struct {
@@ -232,6 +245,19 @@ func (q *Queries) GetWorkerForOwnerForUpdate(ctx context.Context, arg GetWorkerF
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.HibernationCleanup,
+		&i.HibernationCleanupReason,
+		&i.CleanupOpID,
+		&i.CleanupPhase,
+		&i.CleanupRegisterNonce,
+		&i.CleanupPodUid,
+		&i.CleanupRequestedAt,
+		&i.CleanupStartedAt,
+		&i.CleanupUnknownAt,
+		&i.CleanupSettledAt,
+		&i.CleanupCancelRequested,
+		&i.CleanupReconcileSeq,
+		&i.CleanupReconciledAt,
 	)
 	return i, err
 }
@@ -267,7 +293,7 @@ UPDATE workers SET manual_cordoned_at = NULL, manual_cordoned_by = NULL,
  manual_cordoned_by_label = NULL, manual_cordon_reason = NULL, updated_at = now()
 WHERE id = $1 AND user_id = $2 AND NOT ephemeral
  AND manual_cordoned_at IS NOT NULL
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at
 `
 
 type UncordonWorkerForOwnerParams struct {
@@ -367,6 +393,19 @@ func (q *Queries) UncordonWorkerForOwner(ctx context.Context, arg UncordonWorker
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.HibernationCleanup,
+		&i.HibernationCleanupReason,
+		&i.CleanupOpID,
+		&i.CleanupPhase,
+		&i.CleanupRegisterNonce,
+		&i.CleanupPodUid,
+		&i.CleanupRequestedAt,
+		&i.CleanupStartedAt,
+		&i.CleanupUnknownAt,
+		&i.CleanupSettledAt,
+		&i.CleanupCancelRequested,
+		&i.CleanupReconcileSeq,
+		&i.CleanupReconciledAt,
 	)
 	return i, err
 }

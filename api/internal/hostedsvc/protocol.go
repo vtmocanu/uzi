@@ -145,13 +145,32 @@ type DesiredWorker struct {
 }
 
 // Hibernation is a worker's hibernation state as the controller sees it (PRD #4205).
-// State is one of preparing|hibernated|waking; the api sends the field only when the
+// State is one of preparing|hibernated|waking|cleaning; the api sends the field only when the
 // worker is not awake, so a nil Hibernation means "awake" and an old controller that
 // does not know the field behaves exactly as before.
+//
+// "cleaning" (PRD #4206) is sent while a hibernation cache prune attempt is unsettled, whether
+// the database state is preparing or waking. The controller must neither scale down nor reopen
+// claims for it, and an old controller fails closed on the unknown state. Cleanup is set exactly
+// when State is "cleaning".
 type Hibernation struct {
-	State string `json:"state"`
-	OpID  string `json:"op_id"`
+	State   string              `json:"state"`
+	OpID    string              `json:"op_id"`
+	Cleanup *HibernationCleanup `json:"cleanup,omitempty"`
 }
+
+// HibernationCleanup is the unsettled cache prune attempt as the controller sees it (PRD #4206).
+// StopProofPodUID is sent only while the attempt's settlement is unknown: it names the pod that
+// ran the attempt, and the controller reports a cleanup_stopped transition once, per ReconcileSeq,
+// when that exact pod is observed present and stopped. Pod absence is never evidence.
+type HibernationCleanup struct {
+	OpID            string `json:"op_id"`
+	StopProofPodUID string `json:"stop_proof_pod_uid,omitempty"`
+	ReconcileSeq    int32  `json:"reconcile_seq"`
+}
+
+// HibernationCleaning is the Hibernation.State sent while a cache prune attempt is unsettled.
+const HibernationCleaning = "cleaning"
 
 // HibernationTransition is the body the controller reports for one step of a
 // hibernation or wake operation (PRD #4205). The transition names are a closed set.
@@ -162,6 +181,8 @@ type HibernationTransition struct {
 	ResourceVersion string `json:"resource_version,omitempty"`
 	PodUID          string `json:"pod_uid,omitempty"`
 	Reason          string `json:"reason,omitempty"`
+	// CleanupOpID names the cache prune attempt a cleanup_stopped transition is about (PRD #4206).
+	CleanupOpID string `json:"cleanup_op_id,omitempty"`
 }
 
 // HibernationTransition.Transition values.
@@ -170,6 +191,9 @@ const (
 	TransitionScalingDown = "scaling_down"
 	TransitionScaledDown  = "scaled_down"
 	TransitionReady       = "ready"
+	// TransitionCleanupStopped reports that the pod of an unknown cache prune attempt was observed
+	// present and stopped (PRD #4206).
+	TransitionCleanupStopped = "cleanup_stopped"
 )
 
 // ---------------------------------------------------------------------------

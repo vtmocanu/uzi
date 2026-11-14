@@ -591,6 +591,9 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		OutboxRootUnusable      json.RawMessage                    `json:"outbox_root_unusable"`
 		DindMeter               json.RawMessage                    `json:"dind_meter"`
 		DindMaintenanceReadyACK *workersvc.DindMaintenanceReadyACK `json:"dind_maintenance_ready_ack"`
+		// HibernationCachePruneReport (PRD #4206) is the agent's report on its hibernation
+		// cache prune attempt, a sibling of the maintenance ACK and never a kind inside it.
+		HibernationCachePruneReport *workersvc.HibernationCachePruneReport `json:"hibernation_cache_prune_report"`
 		// ActiveSnapshot is the worker's active-run snapshot (PRD #1390 M2a), its OWN isolated
 		// json.RawMessage like Stats/Outbox and for the same reason: a malformed body must drop
 		// the snapshot WITHOUT failing the heartbeat's liveness. The worker sends it only when
@@ -700,6 +703,29 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {
 		response["dind_maintenance"] = maintenance
+	}
+	if slices.Contains(updated.ProtocolCapabilities, capability.HibernationCachePruneV1) {
+		// The report is applied in its own transaction after the heartbeat committed, and the
+		// field is built from the row that transaction committed, so an agent never reads a
+		// phase older than its own report. Any stale or mismatched report is a 409.
+		committed := updated
+		if rep := req.HibernationCachePruneReport; rep != nil {
+			row, repErr := h.wsvc.ReportHibernationCachePrune(r.Context(), wkr.ID, *rep)
+			if errors.Is(repErr, workersvc.ErrHibernationCleanupConflict) {
+				httpx.Error(w, http.StatusConflict, "hibernation cache prune precondition failed")
+				return
+			}
+			if repErr != nil {
+				slog.Error("worker heartbeat: hibernation cache prune report", "worker_id", wkr.ID.String(), "error", repErr)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			committed = row
+		}
+		response["hibernation_cache_prune"] = workersvc.HibernationCachePruneFromWorker(committed)
+	} else if req.HibernationCachePruneReport != nil {
+		httpx.Error(w, http.StatusConflict, "hibernation cache prune precondition failed")
+		return
 	}
 	httpx.JSON(w, http.StatusOK, response)
 }

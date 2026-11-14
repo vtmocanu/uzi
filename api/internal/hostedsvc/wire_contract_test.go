@@ -124,6 +124,16 @@ func samplePollResponse() PollResponse {
 			},
 			Hibernation: &Hibernation{State: "waking", OpID: "66666666-6666-6666-6666-666666666666"},
 		},
+		{
+			// An unsettled hibernation cache prune attempt (PRD #4206): state cleaning with the
+			// cleanup block; the stop-proof pod uid rides the wire only while settlement is unknown.
+			ID:       "99999999-9999-9999-9999-999999999999",
+			Template: "base", Size: "m", Generation: 1, Docker: true,
+			DiskPressureVolumes: []string{},
+			Hibernation: &Hibernation{State: HibernationCleaning, OpID: "66666666-6666-6666-6666-666666666666", Cleanup: &HibernationCleanup{
+				OpID: "88888888-8888-8888-8888-888888888888", StopProofPodUID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", ReconcileSeq: 2,
+			}},
+		},
 	}}
 }
 

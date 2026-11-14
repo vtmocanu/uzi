@@ -180,6 +180,34 @@ func (q *Queries) InsertWorkerHibernationEvent(ctx context.Context, arg InsertWo
 	return err
 }
 
+const listHibernationCleanupWorkerIDs = `-- name: ListHibernationCleanupWorkerIDs :many
+SELECT id FROM workers
+WHERE cleanup_phase IN ('started', 'unknown')
+ORDER BY id
+`
+
+// Candidates for the cleanup reconcile step (PRD #4206): started attempts that may have timed out
+// and unknown attempts due a reconcile bump. The pass re-checks every predicate on the locked row.
+func (q *Queries) ListHibernationCleanupWorkerIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listHibernationCleanupWorkerIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listHibernationWakeDemand = `-- name: ListHibernationWakeDemand :many
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
@@ -396,10 +424,14 @@ func (q *Queries) ListStaleHibernationWakes(ctx context.Context, maxRows int32) 
 const listStalePreparingWorkerIDs = `-- name: ListStalePreparingWorkerIDs :many
 SELECT id FROM workers
 WHERE hibernation_state = 'preparing' AND hibernation_requested_at < $1
+  AND cleanup_phase NOT IN ('started', 'unknown')
+  AND (cleanup_settled_at IS NULL OR cleanup_settled_at < $1)
 ORDER BY id
 `
 
-// Candidates only: the pass re-checks the predicate on the locked row.
+// Candidates only: the pass re-checks the predicate on the locked row. The deadline is measured
+// from the later of the request and the cleanup settlement, and is suspended while an attempt is
+// started or unknown (PRD #4206).
 func (q *Queries) ListStalePreparingWorkerIDs(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listStalePreparingWorkerIDs, cutoff)
 	if err != nil {
@@ -578,9 +610,22 @@ UPDATE workers SET
     wake_ready_pod_uid = $11,
     wake_ready_resource_version = $12,
     wake_register_op_id = $13,
-    wake_register_pod_uid = $14
-WHERE id = $15
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid
+    wake_register_pod_uid = $14,
+    hibernation_cleanup = $15,
+    hibernation_cleanup_reason = $16,
+    cleanup_op_id = $17,
+    cleanup_phase = $18::text,
+    cleanup_register_nonce = $19,
+    cleanup_pod_uid = $20,
+    cleanup_requested_at = $21,
+    cleanup_started_at = $22,
+    cleanup_unknown_at = $23,
+    cleanup_settled_at = $24,
+    cleanup_cancel_requested = $25::boolean,
+    cleanup_reconcile_seq = $26::int,
+    cleanup_reconciled_at = $27
+WHERE id = $28
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at
 `
 
 type WriteWorkerHibernationParams struct {
@@ -598,6 +643,19 @@ type WriteWorkerHibernationParams struct {
 	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
 	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
 	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
+	HibernationCleanup         pgtype.Text        `json:"hibernation_cleanup"`
+	HibernationCleanupReason   pgtype.Text        `json:"hibernation_cleanup_reason"`
+	CleanupOpID                pgtype.UUID        `json:"cleanup_op_id"`
+	CleanupPhase               string             `json:"cleanup_phase"`
+	CleanupRegisterNonce       pgtype.Text        `json:"cleanup_register_nonce"`
+	CleanupPodUid              pgtype.UUID        `json:"cleanup_pod_uid"`
+	CleanupRequestedAt         pgtype.Timestamptz `json:"cleanup_requested_at"`
+	CleanupStartedAt           pgtype.Timestamptz `json:"cleanup_started_at"`
+	CleanupUnknownAt           pgtype.Timestamptz `json:"cleanup_unknown_at"`
+	CleanupSettledAt           pgtype.Timestamptz `json:"cleanup_settled_at"`
+	CleanupCancelRequested     bool               `json:"cleanup_cancel_requested"`
+	CleanupReconcileSeq        int32              `json:"cleanup_reconcile_seq"`
+	CleanupReconciledAt        pgtype.Timestamptz `json:"cleanup_reconciled_at"`
 	ID                         uuid.UUID          `json:"id"`
 }
 
@@ -623,6 +681,19 @@ func (q *Queries) WriteWorkerHibernation(ctx context.Context, arg WriteWorkerHib
 		arg.WakeReadyResourceVersion,
 		arg.WakeRegisterOpID,
 		arg.WakeRegisterPodUid,
+		arg.HibernationCleanup,
+		arg.HibernationCleanupReason,
+		arg.CleanupOpID,
+		arg.CleanupPhase,
+		arg.CleanupRegisterNonce,
+		arg.CleanupPodUid,
+		arg.CleanupRequestedAt,
+		arg.CleanupStartedAt,
+		arg.CleanupUnknownAt,
+		arg.CleanupSettledAt,
+		arg.CleanupCancelRequested,
+		arg.CleanupReconcileSeq,
+		arg.CleanupReconciledAt,
 		arg.ID,
 	)
 	var i Worker
@@ -715,6 +786,19 @@ func (q *Queries) WriteWorkerHibernation(ctx context.Context, arg WriteWorkerHib
 		&i.WakeReadyResourceVersion,
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
+		&i.HibernationCleanup,
+		&i.HibernationCleanupReason,
+		&i.CleanupOpID,
+		&i.CleanupPhase,
+		&i.CleanupRegisterNonce,
+		&i.CleanupPodUid,
+		&i.CleanupRequestedAt,
+		&i.CleanupStartedAt,
+		&i.CleanupUnknownAt,
+		&i.CleanupSettledAt,
+		&i.CleanupCancelRequested,
+		&i.CleanupReconcileSeq,
+		&i.CleanupReconciledAt,
 	)
 	return i, err
 }

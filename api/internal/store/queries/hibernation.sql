@@ -20,7 +20,20 @@ UPDATE workers SET
     wake_ready_pod_uid = sqlc.narg('wake_ready_pod_uid'),
     wake_ready_resource_version = sqlc.narg('wake_ready_resource_version'),
     wake_register_op_id = sqlc.narg('wake_register_op_id'),
-    wake_register_pod_uid = sqlc.narg('wake_register_pod_uid')
+    wake_register_pod_uid = sqlc.narg('wake_register_pod_uid'),
+    hibernation_cleanup = sqlc.narg('hibernation_cleanup'),
+    hibernation_cleanup_reason = sqlc.narg('hibernation_cleanup_reason'),
+    cleanup_op_id = sqlc.narg('cleanup_op_id'),
+    cleanup_phase = @cleanup_phase::text,
+    cleanup_register_nonce = sqlc.narg('cleanup_register_nonce'),
+    cleanup_pod_uid = sqlc.narg('cleanup_pod_uid'),
+    cleanup_requested_at = sqlc.narg('cleanup_requested_at'),
+    cleanup_started_at = sqlc.narg('cleanup_started_at'),
+    cleanup_unknown_at = sqlc.narg('cleanup_unknown_at'),
+    cleanup_settled_at = sqlc.narg('cleanup_settled_at'),
+    cleanup_cancel_requested = @cleanup_cancel_requested::boolean,
+    cleanup_reconcile_seq = @cleanup_reconcile_seq::int,
+    cleanup_reconciled_at = sqlc.narg('cleanup_reconciled_at')
 WHERE id = @id
 RETURNING *;
 
@@ -51,9 +64,20 @@ ON CONFLICT (id) DO UPDATE SET
     poll_interval_seconds = EXCLUDED.poll_interval_seconds;
 
 -- name: ListStalePreparingWorkerIDs :many
--- Candidates only: the pass re-checks the predicate on the locked row.
+-- Candidates only: the pass re-checks the predicate on the locked row. The deadline is measured
+-- from the later of the request and the cleanup settlement, and is suspended while an attempt is
+-- started or unknown (PRD #4206).
 SELECT id FROM workers
 WHERE hibernation_state = 'preparing' AND hibernation_requested_at < @cutoff
+  AND cleanup_phase NOT IN ('started', 'unknown')
+  AND (cleanup_settled_at IS NULL OR cleanup_settled_at < @cutoff)
+ORDER BY id;
+
+-- name: ListHibernationCleanupWorkerIDs :many
+-- Candidates for the cleanup reconcile step (PRD #4206): started attempts that may have timed out
+-- and unknown attempts due a reconcile bump. The pass re-checks every predicate on the locked row.
+SELECT id FROM workers
+WHERE cleanup_phase IN ('started', 'unknown')
 ORDER BY id;
 
 -- name: ListWakingWorkerIDs :many

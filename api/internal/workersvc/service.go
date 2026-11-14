@@ -7769,11 +7769,17 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 		}
 		return &WorkerHasCustodyError{Holds: holds, List: list}
 	}
+	// PRD #4206: an unsettled hibernation cache prune keeps its claim fence until settled, and the
+	// delete query repeats the predicate so a concurrent attempt cannot slip past this read.
 	n, err := s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
 	if err != nil {
 		return err
 	}
 	if n == 0 {
+		cur, gerr := s.q.GetWorkerByIDForUser(ctx, store.GetWorkerByIDForUserParams{ID: workerID, UserID: userID})
+		if gerr == nil && cleanupUnsettled(cur.CleanupPhase) {
+			return &WorkerHibernationCleanupUnsettledError{Phase: cur.CleanupPhase}
+		}
 		return ErrWorkerNotFound
 	}
 	// The worker is gone; drop its last-known outbox depth (PRD #1391 M5) so a

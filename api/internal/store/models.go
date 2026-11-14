@@ -1993,6 +1993,19 @@ type Worker struct {
 	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
 	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
 	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
+	HibernationCleanup         pgtype.Text        `json:"hibernation_cleanup"`
+	HibernationCleanupReason   pgtype.Text        `json:"hibernation_cleanup_reason"`
+	CleanupOpID                pgtype.UUID        `json:"cleanup_op_id"`
+	CleanupPhase               string             `json:"cleanup_phase"`
+	CleanupRegisterNonce       pgtype.Text        `json:"cleanup_register_nonce"`
+	CleanupPodUid              pgtype.UUID        `json:"cleanup_pod_uid"`
+	CleanupRequestedAt         pgtype.Timestamptz `json:"cleanup_requested_at"`
+	CleanupStartedAt           pgtype.Timestamptz `json:"cleanup_started_at"`
+	CleanupUnknownAt           pgtype.Timestamptz `json:"cleanup_unknown_at"`
+	CleanupSettledAt           pgtype.Timestamptz `json:"cleanup_settled_at"`
+	CleanupCancelRequested     bool               `json:"cleanup_cancel_requested"`
+	CleanupReconcileSeq        int32              `json:"cleanup_reconcile_seq"`
+	CleanupReconciledAt        pgtype.Timestamptz `json:"cleanup_reconciled_at"`
 }
 
 type WorkerActiveRun struct {

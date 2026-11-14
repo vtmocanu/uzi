@@ -84,6 +84,9 @@ type HibernationTransition struct {
 	ResourceVersion string
 	PodUID          string
 	Reason          string
+	// CleanupOpID names the hibernation cache prune attempt a cleanup_stopped transition is
+	// about (PRD #4206); it is empty for every other transition.
+	CleanupOpID string
 }
 
 // Transition values, equal to hostedsvc.Transition*.
@@ -92,6 +95,9 @@ const (
 	TransitionScalingDown = "scaling_down"
 	TransitionScaledDown  = "scaled_down"
 	TransitionReady       = "ready"
+	// TransitionCleanupStopped reports that the controller positively observed the pod of an
+	// unknown cache prune attempt stopped (PRD #4206).
+	TransitionCleanupStopped = "cleanup_stopped"
 )
 
 // HibernationActor identifies the admin behind an audited action.
@@ -128,6 +134,19 @@ func writeHibernation(ctx context.Context, q *store.Queries, w store.Worker) (st
 		WakeReadyResourceVersion:   w.WakeReadyResourceVersion,
 		WakeRegisterOpID:           w.WakeRegisterOpID,
 		WakeRegisterPodUid:         w.WakeRegisterPodUid,
+		HibernationCleanup:         w.HibernationCleanup,
+		HibernationCleanupReason:   w.HibernationCleanupReason,
+		CleanupOpID:                w.CleanupOpID,
+		CleanupPhase:               w.CleanupPhase,
+		CleanupRegisterNonce:       w.CleanupRegisterNonce,
+		CleanupPodUid:              w.CleanupPodUid,
+		CleanupRequestedAt:         w.CleanupRequestedAt,
+		CleanupStartedAt:           w.CleanupStartedAt,
+		CleanupUnknownAt:           w.CleanupUnknownAt,
+		CleanupSettledAt:           w.CleanupSettledAt,
+		CleanupCancelRequested:     w.CleanupCancelRequested,
+		CleanupReconcileSeq:        w.CleanupReconcileSeq,
+		CleanupReconciledAt:        w.CleanupReconciledAt,
 		ID:                         w.ID,
 	})
 }
@@ -145,9 +164,14 @@ func clearWakeEvidence(w *store.Worker) {
 // fresh wake_requested_at, cleared wake evidence and error; the admission pod uid and
 // scaling_down_at are KEPT because settlement depends on them. A row already waking is
 // left exactly as it is. It reports whether the row changed.
+//
+// A cache prune attempt that is not settled is never abandoned here (PRD #4206): a requested
+// attempt has run nothing and settles at once as skipped/cancelled; a started or unknown one only
+// has cancellation requested, and keeps fencing claims until its settlement is confirmed.
 func moveToWaking(w *store.Worker, now time.Time, reason string) bool {
+	cancelled := requestCleanupCancel(w, now)
 	if w.HibernationState == "waking" {
-		return false
+		return cancelled
 	}
 	w.HibernationState = "waking"
 	w.HibernationOpID = hibernationUUID(uuid.New())
@@ -161,7 +185,8 @@ func moveToWaking(w *store.Worker, now time.Time, reason string) bool {
 
 // trySettle moves a waking row to none when the recorded evidence satisfies a
 // settlement rule. Writing the replica count is never enough: it needs the controller's
-// ready transition for the current op.
+// ready transition for the current op. It never settles while a cache prune attempt is
+// unsettled (PRD #4206): that attempt's claim fence outlives the wake.
 //
 //	(a) the original pod never stopped: ready names the admission pod, no scaling_down was
 //	    ever recorded, and the worker heartbeat is fresh;
@@ -169,7 +194,7 @@ func moveToWaking(w *store.Worker, now time.Time, reason string) bool {
 //	    same pod uid, which differs from the admission pod. A heartbeat carries no pod
 //	    identity and never settles this case.
 func (s *Service) trySettle(w *store.Worker, now time.Time) bool {
-	if w.HibernationState != "waking" || !w.HibernationOpID.Valid || !w.WakeReadyOpID.Valid ||
+	if w.HibernationState != "waking" || cleanupUnsettled(w.CleanupPhase) || !w.HibernationOpID.Valid || !w.WakeReadyOpID.Valid ||
 		w.WakeReadyOpID.Bytes != w.HibernationOpID.Bytes || !w.WakeReadyPodUid.Valid {
 		return false
 	}
@@ -243,6 +268,7 @@ func (s *Service) HibernateWorker(ctx context.Context, actor HibernationActor, w
 		w.HibernationScalingDownAt = pgtype.Timestamptz{}
 		w.HibernationReason = pgtype.Text{}
 		clearWakeEvidence(&w)
+		issueCleanupAttempt(&w, now)
 		row, err := writeHibernation(ctx, q, w)
 		if err != nil {
 			return err
@@ -372,63 +398,73 @@ func (s *Service) WakeWorker(ctx context.Context, actor *HibernationActor, worke
 }
 
 // validateHibernationTransition validates t and rewrites t.Reason to its sanitized form.
-func validateHibernationTransition(t *HibernationTransition) (opID uuid.UUID, podUID pgtype.UUID, err error) {
+func validateHibernationTransition(t *HibernationTransition) (opID, cleanupOpID uuid.UUID, podUID pgtype.UUID, err error) {
 	bad := func(msg string) error { return &HibernationValidationError{Msg: msg} }
 	if t.OpID == "" {
-		return uuid.Nil, podUID, bad("op_id is required")
+		return uuid.Nil, uuid.Nil, podUID, bad("op_id is required")
 	}
 	opID, perr := uuid.Parse(t.OpID)
 	if perr != nil {
-		return uuid.Nil, podUID, bad("op_id must be a uuid")
+		return uuid.Nil, uuid.Nil, podUID, bad("op_id must be a uuid")
 	}
 	switch t.Transition {
-	case TransitionRefused, TransitionScalingDown, TransitionScaledDown, TransitionReady:
+	case TransitionRefused, TransitionScalingDown, TransitionScaledDown, TransitionReady, TransitionCleanupStopped:
 	case "":
-		return uuid.Nil, podUID, bad("transition is required")
+		return uuid.Nil, uuid.Nil, podUID, bad("transition is required")
 	default:
-		return uuid.Nil, podUID, bad("unknown transition")
+		return uuid.Nil, uuid.Nil, podUID, bad("unknown transition")
 	}
 	if t.DeploymentUID == "" {
-		return uuid.Nil, podUID, bad("deployment_uid is required")
+		return uuid.Nil, uuid.Nil, podUID, bad("deployment_uid is required")
 	}
 	if _, perr := uuid.Parse(t.DeploymentUID); perr != nil {
-		return uuid.Nil, podUID, bad("deployment_uid must be a uuid")
+		return uuid.Nil, uuid.Nil, podUID, bad("deployment_uid must be a uuid")
 	}
 	if len(t.ResourceVersion) > hibernationResourceVersionMax {
-		return uuid.Nil, podUID, bad("resource_version must be at most 64 bytes")
+		return uuid.Nil, uuid.Nil, podUID, bad("resource_version must be at most 64 bytes")
 	}
-	needsRV := t.Transition != TransitionScaledDown
-	needsPod := t.Transition == TransitionScalingDown || t.Transition == TransitionReady
+	needsRV := t.Transition != TransitionScaledDown && t.Transition != TransitionCleanupStopped
+	needsPod := t.Transition == TransitionScalingDown || t.Transition == TransitionReady || t.Transition == TransitionCleanupStopped
 	if needsRV && t.ResourceVersion == "" {
-		return uuid.Nil, podUID, bad("resource_version is required")
+		return uuid.Nil, uuid.Nil, podUID, bad("resource_version is required")
 	}
 	if needsPod && t.PodUID == "" {
-		return uuid.Nil, podUID, bad("pod_uid is required")
+		return uuid.Nil, uuid.Nil, podUID, bad("pod_uid is required")
 	}
 	if t.PodUID != "" {
 		p, perr := uuid.Parse(t.PodUID)
 		if perr != nil {
-			return uuid.Nil, podUID, bad("pod_uid must be a uuid")
+			return uuid.Nil, uuid.Nil, podUID, bad("pod_uid must be a uuid")
 		}
 		podUID = hibernationUUID(p)
+	}
+	if t.Transition == TransitionCleanupStopped {
+		if t.CleanupOpID == "" {
+			return uuid.Nil, uuid.Nil, podUID, bad("cleanup_op_id is required")
+		}
+		c, perr := uuid.Parse(t.CleanupOpID)
+		if perr != nil {
+			return uuid.Nil, uuid.Nil, podUID, bad("cleanup_op_id must be a uuid")
+		}
+		cleanupOpID = c
 	}
 	if t.Transition == TransitionRefused {
 		var tooLong bool
 		if t.Reason, tooLong = sanitizeHibernationText(t.Reason); t.Reason == "" {
-			return uuid.Nil, podUID, bad("reason is required")
+			return uuid.Nil, uuid.Nil, podUID, bad("reason is required")
 		}
 		if tooLong {
-			return uuid.Nil, podUID, bad("reason must be at most 500 characters")
+			return uuid.Nil, uuid.Nil, podUID, bad("reason must be at most 500 characters")
 		}
 	}
-	return opID, podUID, nil
+	return opID, cleanupOpID, podUID, nil
 }
 
 // ApplyTransition applies one controller-reported step. A malformed request is a
 // *HibernationValidationError; a stale op id or an illegal transition is
 // ErrHibernationConflict and leaves the row unchanged.
 func (s *Service) ApplyTransition(ctx context.Context, workerID uuid.UUID, t HibernationTransition) (store.Worker, error) {
-	opID, podUID, err := validateHibernationTransition(&t)
+	opID, cleanupOpID, podUID, err := validateHibernationTransition(&t)
 	if err != nil {
 		return store.Worker{}, err
 	}
@@ -439,7 +475,21 @@ func (s *Service) ApplyTransition(ctx context.Context, workerID uuid.UUID, t Hib
 		}
 		now := s.now()
 		changed := false
+		// Every transition that would scale the pod down or reopen claims is refused while a
+		// cache prune attempt is unsettled: the controller reports them from stale desired state.
 		switch t.Transition {
+		case TransitionRefused, TransitionScalingDown, TransitionScaledDown:
+			if cleanupUnsettled(w.CleanupPhase) {
+				return ErrHibernationConflict
+			}
+		}
+		switch t.Transition {
+		case TransitionCleanupStopped:
+			c, err := applyCleanupStopped(&w, now, cleanupOpID, podUID)
+			if err != nil {
+				return err
+			}
+			changed = c
 		case TransitionRefused:
 			if w.HibernationState != "preparing" {
 				return ErrHibernationConflict
@@ -510,24 +560,33 @@ func (s *Service) ApplyTransition(ctx context.Context, workerID uuid.UUID, t Hib
 // it only retargets the admission pod (see below). It runs inside the Register
 // transaction, which already holds the row lock via GetWorkerForUpdate; w is the
 // post-RegisterWorker row.
+//
+// The cache prune attempt (PRD #4206) is handled FIRST, before the preparing early return and
+// before trySettle, and everything lands in one writeHibernation: a worker that re-registers
+// with a new nonce can no longer be the process the attempt was bound to.
 func (s *Service) settleRegisteredWaking(ctx context.Context, q *store.Queries, w store.Worker, podUID pgtype.UUID) error {
+	now := s.now()
+	cleanupChanged := noteCleanupRegistered(&w, now)
 	if w.HibernationState == "preparing" {
 		// The pod that was live at admission is gone (a pod that Registers while the
 		// worker is still preparing is its replacement): track the live pod, or rule (a)
 		// of trySettle could never match the pod the controller later reports ready.
 		// Once scaling_down is recorded the controller has fenced that pod, so the
 		// admission pod is final; and a Register without a pod identity has nothing to track.
-		if !podUID.Valid || w.HibernationScalingDownAt.Valid || (w.HibernationAdmissionPodUid.Valid && w.HibernationAdmissionPodUid.Bytes == podUID.Bytes) {
+		if podUID.Valid && !w.HibernationScalingDownAt.Valid &&
+			(!w.HibernationAdmissionPodUid.Valid || w.HibernationAdmissionPodUid.Bytes != podUID.Bytes) {
+			w.HibernationAdmissionPodUid = podUID
+			cleanupChanged = true
+		}
+		if !cleanupChanged {
 			return nil
 		}
-		w.HibernationAdmissionPodUid = podUID
 		_, err := writeHibernation(ctx, q, w)
 		return err
 	}
 	if w.HibernationState != "waking" {
 		return nil
 	}
-	now := s.now()
 	if !podUID.Valid {
 		w.WakeError = pgconv.TextOrNull("worker registered without pod identity")
 	} else {
@@ -584,12 +643,24 @@ func (s *Service) HibernationSettlePass(ctx context.Context) (int64, error) {
 	}
 	now := s.now()
 
+	// 0. Cache prune attempts (PRD #4206): time out a started attempt that never reported, and pace the
+	// reconciliation requests for unknown ones.
+	each(list(func(q *store.Queries) ([]uuid.UUID, error) { return q.ListHibernationCleanupWorkerIDs(ctx) }),
+		func(q *store.Queries, w store.Worker) (bool, error) {
+			if !reconcileCleanup(&w, now) {
+				return false, nil
+			}
+			_, err := writeHibernation(ctx, q, w)
+			return err == nil, err
+		})
+
 	// 1. Preparation deadline.
 	cutoff := pgconv.Time(now.Add(-HibernationPreparingDeadline))
 	each(list(func(q *store.Queries) ([]uuid.UUID, error) { return q.ListStalePreparingWorkerIDs(ctx, cutoff) }),
 		func(q *store.Queries, w store.Worker) (bool, error) {
 			if w.HibernationState != "preparing" || !w.HibernationRequestedAt.Valid ||
-				now.Sub(w.HibernationRequestedAt.Time) < HibernationPreparingDeadline {
+				preparingDeadlineStart(w).Add(HibernationPreparingDeadline).After(now) ||
+				w.CleanupPhase == CleanupPhaseStarted || w.CleanupPhase == CleanupPhaseUnknown {
 				return false, nil
 			}
 			moveToWaking(&w, now, "preparation deadline")

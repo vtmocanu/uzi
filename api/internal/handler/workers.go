@@ -875,6 +875,10 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, workersvc.ErrWorkerNotFound):
 			httpx.Error(w, http.StatusNotFound, "worker not found")
+		case errors.Is(err, workersvc.ErrWorkerHibernationCleanupUnsettled):
+			// PRD #4206: the hibernation cache prune keeps the worker's claim fence until its
+			// settlement is confirmed; deleting the row would drop that fence.
+			httpx.Error(w, http.StatusConflict, "this worker is still reclaiming its Docker cache for hibernation; wait for the cleanup to settle before removing it")
 		case errors.As(err, &custody):
 			// PRD #1296 M4 (D3): a worker still holding an OPEN custody hold is refused
 			// with a DISTINCT 409 from the active-runs case above — deleting it cascades

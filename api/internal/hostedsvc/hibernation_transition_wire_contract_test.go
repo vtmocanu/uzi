@@ -51,6 +51,12 @@ func TestHibernationTransitionConsumerContract(t *testing.T) {
 			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12348",
 			PodUID: "66666666-6666-6666-6666-666666666666",
 		},
+		{
+			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionCleanupStopped,
+			DeploymentUID: "77777777-7777-7777-7777-777777777777",
+			PodUID:        "66666666-6666-6666-6666-666666666666",
+			CleanupOpID:   "88888888-8888-8888-8888-888888888888",
+		},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("decoded %d bodies, want %d", len(got), len(want))
@@ -68,7 +74,7 @@ func TestHibernationTransitionConsumerContract(t *testing.T) {
 	if string(again)+"\n" != string(raw) {
 		t.Errorf("api re-marshal differs from the controller's golden.\n got:\n%s\nwant:\n%s", again, raw)
 	}
-	for tr, lit := range map[string]string{TransitionRefused: "refused", TransitionScalingDown: "scaling_down", TransitionScaledDown: "scaled_down", TransitionReady: "ready"} {
+	for tr, lit := range map[string]string{TransitionRefused: "refused", TransitionScalingDown: "scaling_down", TransitionScaledDown: "scaled_down", TransitionReady: "ready", TransitionCleanupStopped: "cleanup_stopped"} {
 		if tr != lit {
 			t.Errorf("transition literal = %q, want %q", tr, lit)
 		}
