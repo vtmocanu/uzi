@@ -970,7 +970,7 @@ export function createRunLaneInstallerReconcile(
     const captured = Object.freeze({ ...input });
     const capturedReconcile = buildRunLaneReconcile(
       captured.runId, captured.client, captured.binding, captured.registerToken,
-      captured.committed, captured.isVaultLocked, lifecycleSignal,
+      captured.committed, captured.isVaultLocked, lifecycleSignal, captured.assertCurrent,
     );
     const credentialReconcile: ReconcileBeforeBoundary = async (request, signal) => {
       captured.assertCurrent?.();
@@ -1048,10 +1048,12 @@ export function buildRunLaneReconcile(
   committed: CodexCommittedGenerationCell = { value: binding.authMode === "subscription" ? binding.generation : undefined },
   isVaultLocked?: () => boolean,
   lifecycleSignal?: AbortSignal,
+  assertCurrent?: () => void,
 ): ReconcileBeforeBoundary {
   let operation: { capability: string; operation_id: string; observed_generation: number } | undefined;
   let operationUncertain = false;
   return async (request: BoundaryRequest, boundarySignal: AbortSignal): Promise<ReconcileOutcome> => {
+    assertCurrent?.();
     const now = request.checkpointStop?.now ?? Date.now;
     const cause = request.gracefulShutdownCheckpoint;
     const deadlineAt = Math.min(now() + request.deadlineMs, cause?.deadlineAt ?? Infinity);
@@ -1111,6 +1113,7 @@ export function buildRunLaneReconcile(
         // At most two HTTP attempts, immediate reconciliation in this same flight. A refusal
         // ends the loop; ambiguity/contended alone admits the second attempt.
         for (let attempt = 0; attempt < 2; attempt++) {
+          assertCurrent?.();
           if (authoritySignal?.aborted) return blocked();
           if (expired()) return blocked(uncertain ? "refresh_unknown" : undefined);
           try {
@@ -1118,6 +1121,9 @@ export function buildRunLaneReconcile(
               runId, { ...frozenOperation },
               { authMode: "subscription", chatgptAccountId: binding.chatgptAccountId }, signal,
             );
+            // Retirement cannot settle the retained operation or publish its late result.
+            try { assertCurrent?.(); }
+            catch (error) { operationUncertain = true; throw error; }
             // Cancellation can arrive with the response; it still precedes any new authority.
             if (authoritySignal?.aborted) return blocked();
             if (expired()) {
@@ -1131,6 +1137,8 @@ export function buildRunLaneReconcile(
             operationUncertain = false;
             return { kind: "ready" };
           } catch (err) {
+            try { assertCurrent?.(); }
+            catch (error) { operationUncertain = true; throw error; }
             if (authoritySignal?.aborted) return blocked();
             if (codexDeferralReason(err) === "vault_locked") {
               return { kind: "blocked", errors: [{ category: "authorization",
@@ -1158,17 +1166,20 @@ export function buildRunLaneReconcile(
         return blocked("refresh_unknown");
       }
       // api_key: ZERO refresh; a fresh release re-authorizes only (no subscription fallback).
+      assertCurrent?.();
       const res = await client.releaseCodex(
         runId,
         { capability: binding.capability },
         { authMode: "api_key" },
         signal,
       );
+      assertCurrent?.();
       if (authoritySignal?.aborted) return blocked();
       if (expired()) return blocked();
       registerToken(res.access_token);
       return { kind: "ready" };
     } catch (err) {
+      assertCurrent?.();
       if (authoritySignal?.aborted) return blocked();
       // Fail CLOSED with a bounded, secret-free reason (authMode is safe to name). The op id and
       // observed generation are DELIBERATELY left intact so a retried boundary reuses them.
@@ -3222,13 +3233,18 @@ export class CodexExecutor implements Executor {
     const summariesOn = isRunSummaryKind(ctx.kind);
     const prdInputP = summariesOn
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
-    const summaryInputs = async () => ({
-      claim: { run_id: ctx.runId, claim_generation: ctx.claimGeneration, secrets: {
-        codex: authority.claim,
-      } },
-      token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
-      issueBody: ctx.issueDescription, prdText: (await prdInputP)?.prdText,
-    });
+    const summaryInputs = async () => {
+      authority.assertCurrent();
+      const prdText = (await prdInputP)?.prdText;
+      authority.assertCurrent();
+      return {
+        claim: { run_id: ctx.runId, claim_generation: ctx.claimGeneration, secrets: {
+          codex: authority.claim,
+        } },
+        token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
+        issueBody: ctx.issueDescription, prdText,
+      };
+    };
     // Invalidate the current plan-summary flight and latched result. Does not reopen
     // summaryLifecycleClosed; returns the new generation.
     const supersedePlanSummary = (): number => {

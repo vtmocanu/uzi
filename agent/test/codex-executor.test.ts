@@ -25176,6 +25176,42 @@ describe("2833 Codex inline summaries", () => {
     assert.deepEqual(seen, [second.binding.capability, first.binding.capability, second.binding.capability]);
   });
 
+  for (const claim of [API_KEY, SUBSCRIPTION]) {
+    it(`M2 ${claim.auth_mode} retirement denies a pending credential response without losing its join`, async () => {
+      const authority = createCodexEpochAuthority(bindingOf(claim));
+      const originalGeneration = authority.committedGeneration.value;
+      const registered: string[] = [];
+      let calls = 0;
+      let resolveResponse!: (value: { access_token: string; generation: number; outcome: string }) => void;
+      const response = new Promise<{ access_token: string; generation: number; outcome: string }>(resolve => {
+        resolveResponse = resolve;
+      });
+      let started!: () => void;
+      const entered = new Promise<void>(resolve => { started = resolve; });
+      const exchange = async () => { calls++; started(); return response; };
+      const installer = createRunLaneInstallerReconcile(new AbortController().signal, {
+        runId: "run", client: { releaseCodex: exchange, refreshCodex: exchange } as never,
+        binding: authority.binding, committed: authority.committedGeneration,
+        assertCurrent: authority.assertCurrent, registerToken: token => registered.push(token),
+      });
+      let settled = false;
+      const pending = installer.reconcile(RECONCILE_REQ, RECONCILE_SIGNAL);
+      const rejected = assert.rejects(pending, /credential authority retired/);
+      void pending.then(() => { settled = true; }, () => { settled = true; });
+      await entered;
+      authority.retire();
+      await Promise.resolve();
+      assert.equal(settled, false, "retirement retains the in-flight provider join");
+      assert.equal(calls, 1);
+      resolveResponse({ access_token: "late-credential", generation: 99, outcome: "advanced" });
+      await rejected;
+      assert.deepEqual(registered, [], "late credentials never enter the redactor");
+      assert.equal(authority.committedGeneration.value, originalGeneration, "late response never advances authority");
+      await assert.rejects(installer.reconcile(RECONCILE_REQ, RECONCILE_SIGNAL), /credential authority retired/);
+      assert.equal(calls, 1, "retired authority never sends a retry or another exchange");
+    });
+  }
+
   it("M2 authority freezes explicit identity, isolates generation cells and fences retirement", () => {
     const first = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
     const second = createCodexEpochAuthority(bindingOf(API_KEY));
