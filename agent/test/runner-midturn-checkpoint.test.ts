@@ -5389,6 +5389,30 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
     }, { seed: (f) => { f.secretRemediation ??= { attempts: 2 }; f.secretRemediation.attempts = 2; } });
   });
 
+  it("an exhausted cap with a divergent rewrite still carrying the secret: the new commit is recorded and an unscanned publish holds", async () => {
+    await rig(4258_035, async (r) => {
+      const a = await flagAndTick(r);
+      assert.ok(r.state().midRunTrigger);
+      assert.deepEqual(r.state().flaggedCommits, [a]);
+      // The lead rewrites the flagged commit into a divergent one that still carries a secret.
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.attempts, 2);
+      untouched(s);
+      assert.ok(s.flaggedCommits?.includes(b), "the fresh trusted finding is recorded at the cap");
+      // An unscanned publication path (no fresh scan runs here) must not ship the new flagged commit.
+      const outcome = await (r.runner as unknown as {
+        publishCheckpointOutcome: (f: unknown, bare: string, branch: string) => Promise<unknown>;
+      }).publishCheckpointOutcome(r.flight(), r.bare, r.ctx.branch);
+      assert.equal((outcome as { published: boolean }).published, false);
+      assert.equal(r.tips.length, 0, "no candidate containing the flagged commit was uploaded");
+    }, { seed: (f) => { f.secretRemediation ??= { attempts: 2 }; f.secretRemediation.attempts = 2; } });
+  });
+
   it("the done gate clears a pending trigger, so no duplicate turn follows", async () => {
     await rig(4258_032, async (r) => {
       await flagAndTick(r);

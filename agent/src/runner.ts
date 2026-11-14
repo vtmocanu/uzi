@@ -20543,7 +20543,13 @@ export class RunRunner {
       if (stop.aborted) return defer("aborted");
       if (verdict === "unknown") return defer("floor_ancestry_unknown");
       if (verdict === "at_floor") return clear();
-      if (state.attempts >= SECRET_REMEDIATION_MAX_ATTEMPTS) return clear();
+      if (state.attempts >= SECRET_REMEDIATION_MAX_ATTEMPTS) {
+        // No turn is left, but the trusted fresh findings still name commits the earlier record may not
+        // (a rewrite can replace a flagged commit with a divergent one that still carries the secret).
+        // Record them so checkpointRemediationHold keeps holding unscanned publications; spend nothing.
+        this.recordFlaggedCommits(state, findings, runLog);
+        return clear();
+      }
       const cap = this.checkpointTestHooks?.flaggedCommitsCap ?? FLAGGED_COMMITS_CAP;
       const known = new Set(state.flaggedCommits ?? []);
       const fresh = findings.filter((f) => typeof f.commit === "string" && !known.has(f.commit.toLowerCase())).length;
