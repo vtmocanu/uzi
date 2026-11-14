@@ -302,9 +302,10 @@ SELECT EXISTS (
 -- Start (or restart) the inventory for the worker's current op: every column is replaced and the
 -- inventory and validity columns are NULLed, so a new op never inherits an older op's entries.
 INSERT INTO worker_hibernation_inventories (
-    worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, status
+    worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, status, status_reason
 ) VALUES (
-    @worker_id, @op_id, @observed_at, @deployment_uid, @deployment_resource_version, @pod_uid, @pvcs::jsonb, @status::text
+    @worker_id, @op_id, @observed_at, @deployment_uid, @deployment_resource_version, @pod_uid, @pvcs::jsonb, @status::text,
+    sqlc.narg('status_reason')::text
 )
 ON CONFLICT (worker_id) DO UPDATE SET
     op_id = EXCLUDED.op_id,
@@ -314,9 +315,9 @@ ON CONFLICT (worker_id) DO UPDATE SET
     pod_uid = EXCLUDED.pod_uid,
     pvcs = EXCLUDED.pvcs,
     status = EXCLUDED.status,
+    status_reason = EXCLUDED.status_reason,
     register_nonce = NULL,
     received_at = NULL,
-    status_reason = NULL,
     complete = NULL,
     entries = NULL,
     receipt_keys = NULL,
@@ -324,6 +325,7 @@ ON CONFLICT (worker_id) DO UPDATE SET
     fingerprint = NULL,
     lane = NULL,
     mechanism = NULL,
+    uncovered = NULL,
     invalidated_reason = NULL,
     invalidated_at = NULL,
     scaling_down_pod_uid = NULL,
@@ -370,7 +372,8 @@ UPDATE worker_hibernation_inventories SET
     digest = @digest::text,
     fingerprint = @fingerprint::text,
     lane = sqlc.narg('lane')::text,
-    mechanism = sqlc.narg('mechanism')::text
+    mechanism = sqlc.narg('mechanism')::text,
+    uncovered = sqlc.narg('uncovered')::jsonb
 WHERE worker_id = @worker_id AND op_id = @op_id
   AND pod_uid = @pod_uid::uuid
   AND status = 'awaiting' AND invalidated_reason IS NULL;
@@ -420,10 +423,12 @@ UPDATE worker_hibernation_inventories SET
 WHERE worker_id = @worker_id AND op_id = @op_id;
 
 -- name: ListAwaitingHibernationInventoriesOlderThan :many
--- Candidates for the settle pass timeout; the pass re-checks on the locked row.
-SELECT worker_id FROM worker_hibernation_inventories
-WHERE status = 'awaiting' AND observed_at < @cutoff::timestamptz
-ORDER BY worker_id;
+-- Candidates for the settle pass timeout; the pass re-checks on the locked row. Only a row of the
+-- worker's CURRENT op is listed, so a stale-op row is not re-listed on every pass.
+SELECT i.worker_id FROM worker_hibernation_inventories i
+JOIN workers w ON w.id = i.worker_id AND w.hibernation_op_id = i.op_id
+WHERE i.status = 'awaiting' AND i.observed_at < @cutoff::timestamptz
+ORDER BY i.worker_id;
 
 -- name: CountHibernationRetirementCandidates :one
 SELECT count(*) FROM workers

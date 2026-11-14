@@ -282,7 +282,7 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 		// A zero or inconsistent row (empty state, or no op id) carries no object.
 		if row.HibernationOpID.Valid && (row.HibernationState == "preparing" || row.HibernationState == "hibernated" || row.HibernationState == "waking") {
 			dw.Hibernation = &Hibernation{State: row.HibernationState, OpID: uuid.UUID(row.HibernationOpID.Bytes).String()}
-			dw.Hibernation.InventoryGate = inventoryGate(row.HibernationState, row.InventoryStatus)
+			dw.Hibernation.InventoryGate = inventoryGate(row.HibernationState, row.InventoryStatus, row.HibernationScalingDownAt)
 		}
 		if row.ManualCordonedAt.Valid {
 			t := row.ManualCordonedAt.Time
@@ -402,12 +402,16 @@ func (s *Service) Uncordon(ctx context.Context, workerID uuid.UUID, reason ...st
 // inventory still being taken means await, and every other status (accepted, or a recorded reason
 // the inventory will not come: timed out, no capability, closed by scale-down, identity changed,
 // unsupported, exclusion failed, busy) permits the scale-down. It reads the recorded status only,
-// never the clock: the settle pass is what moves a stale awaiting row to timed_out.
-func inventoryGate(state string, status pgtype.Text) string {
+// never the clock: the settle pass is what moves a stale awaiting row to timed_out. A worker whose
+// scale-down is already recorded always permits, whatever the row says (or lacks): the gate only
+// holds a scale-down back, never undoes one in flight, so an inventory can never wedge hibernation.
+func inventoryGate(state string, status pgtype.Text, scalingDownAt pgtype.Timestamptz) string {
 	if state != "preparing" {
 		return ""
 	}
 	switch {
+	case scalingDownAt.Valid:
+		return InventoryGatePermit
 	case !status.Valid:
 		return InventoryGateObserve
 	case status.String == "awaiting":

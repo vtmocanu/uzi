@@ -606,9 +606,11 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// and only after the register response advertised `worker_residue_quarantine`.
 		ResidueQuarantine json.RawMessage `json:"residue_quarantine"`
 		// HibernationExclusion (PRD #4208 M1) is the worker's report that it still holds, or
-		// has lost, the writer exclusion its volume inventory was taken under. Decoded strictly
-		// and rejected with a 400 when malformed, never dropped: a dropped held=false would hide
-		// the loss of the very exclusion the inventory depends on.
+		// has lost, the writer exclusion its volume inventory was taken under. A malformed member
+		// is answered 400 rather than dropped, so a dropped held=false cannot hide the loss of the
+		// exclusion the inventory depends on. The consequence for the worker: the whole heartbeat
+		// is refused (400), so the agent's strip-and-retry fallback resends it without its
+		// extension members and the liveness is not lost.
 		HibernationExclusion *workersvc.HibernationExclusionReport `json:"hibernation_exclusion"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
@@ -725,8 +727,14 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(herr, workersvc.ErrHibernationUnavailable):
 		case herr != nil:
 			slog.Error("worker heartbeat: hibernation inventory", "worker_id", wkr.ID.String(), "error", herr)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
+			// Liveness is already committed, so the hibernation half is best effort: the member is
+			// omitted and the worker asks again on its next beat. The one exception is a report that
+			// the exclusion was lost (held=false): it is recorded in the same transaction as the
+			// member, so after a failure it may not be recorded, and the worker must resend it.
+			if exclusion != nil && !exclusion.Held {
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
 		case member != nil:
 			response["hibernation_inventory"] = member
 		}

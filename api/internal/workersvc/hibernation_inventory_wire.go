@@ -63,6 +63,16 @@ const (
 var (
 	hex64Re  = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	tipHexRe = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+	// inventoryTokenRe is the conservative charset of the worker-chosen vocabulary words (entry
+	// kind, classification and content_state). The agent's set is not frozen in the contract, so a
+	// charset, not an enum, is enforced.
+	inventoryTokenRe = regexp.MustCompile(`^[a-z0-9_:.-]{1,64}$`)
+)
+
+// inventoryLanes and inventoryMechanisms are the exclusion vocabulary the agent sends.
+var (
+	inventoryLanes      = []string{"dind", "plain", "isolated"}
+	inventoryMechanisms = []string{"epoch_ex+latch+quiescence", "none"}
 )
 
 // HibernationPVCRef is the identity of one volume as the worker echoes it: the only three fields
@@ -140,6 +150,7 @@ type HibernationInventoryReport struct {
 	DeploymentResourceVersion string
 	PVCs                      []HibernationPVCRef
 	Complete                  bool
+	Uncovered                 []byte
 	Entries                   []byte
 	ReceiptKeys               []byte
 	Digest                    string
@@ -214,6 +225,41 @@ func cleanInventoryText(field, s string, max int, required bool) error {
 		return inventoryBad("%s must be at most %d bytes", field, max)
 	case strings.ContainsRune(s, 0) || !utf8.ValidString(s):
 		return inventoryBad("%s must be valid text", field)
+	}
+	return nil
+}
+
+// unsafeInventoryRune reports the runes worker-written text may not carry: C0 and C1 controls, DEL
+// and the Unicode bidirectional controls, which can reorder or hide text in a terminal or a UI.
+func unsafeInventoryRune(r rune) bool {
+	switch {
+	case r < 0x20, r >= 0x7f && r <= 0x9f:
+		return true
+	case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069, r == 0x200e, r == 0x200f, r == 0x061c:
+		return true
+	}
+	return false
+}
+
+// cleanStoredInventoryText is cleanInventoryText plus the control and bidi rejection that applies to
+// every worker-written string the inventory stores.
+func cleanStoredInventoryText(field, s string, max int, required bool) error {
+	if err := cleanInventoryText(field, s, max, required); err != nil {
+		return err
+	}
+	if strings.IndexFunc(s, unsafeInventoryRune) >= 0 {
+		return inventoryBad("%s must not contain control or bidirectional characters", field)
+	}
+	return nil
+}
+
+// cleanInventoryToken is cleanStoredInventoryText restricted to the conservative token charset.
+func cleanInventoryToken(field, s string) error {
+	if err := cleanStoredInventoryText(field, s, 64, true); err != nil {
+		return err
+	}
+	if !inventoryTokenRe.MatchString(s) {
+		return inventoryBad("%s must match [a-z0-9_:.-]{1,64}", field)
 	}
 	return nil
 }
@@ -365,19 +411,33 @@ func (r *InventoryRequest) PrepareInventory() (HibernationInventoryReport, error
 	if x == nil {
 		return out, inventoryBad("exclusion is required")
 	}
-	if err := cleanInventoryText("exclusion.lane", x.Lane, 64, true); err != nil {
+	if err := cleanStoredInventoryText("exclusion.lane", x.Lane, 64, true); err != nil {
 		return out, err
 	}
-	if err := cleanInventoryText("exclusion.mechanism", x.Mechanism, 128, true); err != nil {
+	if !slices.Contains(inventoryLanes, x.Lane) {
+		return out, inventoryBad("exclusion.lane must be dind, plain or isolated")
+	}
+	if err := cleanStoredInventoryText("exclusion.mechanism", x.Mechanism, 128, true); err != nil {
 		return out, err
+	}
+	if !slices.Contains(inventoryMechanisms, x.Mechanism) {
+		return out, inventoryBad("exclusion.mechanism is not a known mechanism")
 	}
 	if len(x.Uncovered) > 64 {
 		return out, inventoryBad("exclusion.uncovered must have at most 64 items")
 	}
 	for _, u := range x.Uncovered {
-		if err := cleanInventoryText("exclusion.uncovered", u, 128, true); err != nil {
+		if err := cleanStoredInventoryText("exclusion.uncovered", u, 128, true); err != nil {
 			return out, err
 		}
+	}
+	uncovered := x.Uncovered
+	if uncovered == nil {
+		uncovered = []string{}
+	}
+	uncoveredJSON, err := json.Marshal(uncovered)
+	if err != nil {
+		return out, err
 	}
 	entries, err := json.Marshal(r.Entries)
 	if err != nil {
@@ -404,19 +464,21 @@ func (r *InventoryRequest) PrepareInventory() (HibernationInventoryReport, error
 	return HibernationInventoryReport{
 		OpID: op, PodUID: pod, RegisterNonce: r.RegisterNonce,
 		DeploymentResourceVersion: r.DeploymentResourceVersion, PVCs: sortedPVCRefs(r.PVCs),
-		Complete: *r.Complete, Entries: entries, ReceiptKeys: receipts,
+		// A lane other than dind, or any uncovered writer, means the inventory cannot claim to be complete.
+		Complete: *r.Complete && x.Lane == "dind" && len(x.Uncovered) == 0, Uncovered: uncoveredJSON,
+		Entries: entries, ReceiptKeys: receipts,
 		Digest: r.Digest, Fingerprint: r.Fingerprint, Lane: x.Lane, Mechanism: x.Mechanism,
 	}, nil
 }
 
 func validateInventoryEntry(e *InventoryEntry) error {
-	if err := cleanInventoryText("entry kind", e.Kind, 64, true); err != nil {
+	if err := cleanInventoryToken("entry kind", e.Kind); err != nil {
 		return err
 	}
-	if err := cleanInventoryText("entry path", e.Path, inventoryPathMax, true); err != nil {
+	if err := cleanStoredInventoryText("entry path", e.Path, inventoryPathMax, true); err != nil {
 		return err
 	}
-	if err := cleanInventoryText("entry classification", e.Classification, 64, true); err != nil {
+	if err := cleanInventoryToken("entry classification", e.Classification); err != nil {
 		return err
 	}
 	if e.RunID != nil {
@@ -431,12 +493,12 @@ func validateInventoryEntry(e *InventoryEntry) error {
 		return inventoryBad("entry tip must be 40 or 64 lowercase hex characters")
 	}
 	if e.ContentState != nil {
-		if err := cleanInventoryText("entry content_state", *e.ContentState, 64, true); err != nil {
+		if err := cleanInventoryToken("entry content_state", *e.ContentState); err != nil {
 			return err
 		}
 	}
 	if e.Detail != nil {
-		if err := cleanInventoryText("entry detail", *e.Detail, inventoryDetailMax, false); err != nil {
+		if err := cleanStoredInventoryText("entry detail", *e.Detail, inventoryDetailMax, false); err != nil {
 			return err
 		}
 	}
@@ -543,7 +605,9 @@ func storedPVCRefs(raw []byte) ([]HibernationPVCRef, error) {
 // validateObservationFields validates the PRD #4208 M1 transition fields, whichever transition
 // carries them. `observed` additionally requires the volumes.
 func validateObservationFields(t *HibernationTransition) error {
-	if t.Transition == TransitionObserved || len(t.PVCs) > 0 {
+	// An `observed` with no volumes is recorded (as unsupported), never refused: the inventory must
+	// not be able to block a hibernation. Volumes, when present, must still be well formed.
+	if len(t.PVCs) > 0 {
 		refs := make([]HibernationPVCRef, 0, len(t.PVCs))
 		for _, p := range t.PVCs {
 			refs = append(refs, HibernationPVCRef{Role: p.Role, Name: p.Name, UID: p.UID})
@@ -562,18 +626,20 @@ func validateObservationFields(t *HibernationTransition) error {
 	}
 	for _, set := range []struct {
 		name string
-		v    *[]string
-	}{{"pod_uids", t.PodUIDs}, {"pvc_user_pods", t.PVCUserPods}} {
-		if set.v == nil {
+		v    **[]string
+	}{{"pod_uids", &t.PodUIDs}, {"pvc_user_pods", &t.PVCUserPods}} {
+		if *set.v == nil {
 			continue
 		}
-		if len(*set.v) > hibernationPodSetMax {
-			return inventoryBad("%s must have at most %d entries", set.name, hibernationPodSetMax)
-		}
-		for _, u := range *set.v {
+		for _, u := range **set.v {
 			if _, err := uuid.Parse(u); err != nil {
 				return inventoryBad("%s entries must be uuids", set.name)
 			}
+		}
+		// A set over the cap is unobserved, not an error: dropping it records pod_set_unproven and
+		// the transition still applies.
+		if len(**set.v) > hibernationPodSetMax {
+			*set.v = nil
 		}
 	}
 	return nil

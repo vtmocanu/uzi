@@ -241,12 +241,16 @@ func (s *Service) inventoryObserved(ctx context.Context, q *store.Queries, w sto
 		same = err == nil && sameUIDsByRole(stored, refs)
 	}
 	if !same {
-		status := InventoryAwaiting
+		status, statusReason := InventoryAwaiting, ""
 		switch {
 		case ok && inv.Status == InventoryAccepted:
 			// An accepted inventory was bound to another identity: the evidence is not replaced
 			// silently, and the gate no longer holds the scale-down back.
 			status = InventoryIdentityChanged
+		case len(refs) == 0:
+			// No volumes to inventory: recorded with a status the gate permits, never an error, so
+			// the inventory cannot block the hibernation.
+			status, statusReason = InventoryUnsupported, "no_pvcs_observed"
 		case !slices.Contains(w.ProtocolCapabilities, capability.HibernationInventoryV1):
 			status = InventoryNoCapability
 		}
@@ -257,7 +261,7 @@ func (s *Service) inventoryObserved(ctx context.Context, q *store.Queries, w sto
 		if _, err := q.UpsertHibernationInventoryObserved(ctx, store.UpsertHibernationInventoryObservedParams{
 			WorkerID: w.ID, OpID: w.HibernationOpID.Bytes, ObservedAt: pgconv.Time(now),
 			DeploymentUid: t.DeploymentUID, DeploymentResourceVersion: t.ResourceVersion,
-			PodUid: pod.Bytes, Pvcs: pvcs, Status: status,
+			PodUid: pod.Bytes, Pvcs: pvcs, Status: status, StatusReason: pgconv.TextOrNull(statusReason),
 		}); err != nil {
 			return err
 		}
@@ -305,7 +309,11 @@ func (s *Service) inventoryOnRegister(ctx context.Context, q *store.Queries, w s
 			reason = InvalidatedProcessRestarted
 		}
 	case InventoryAwaiting:
-		if w.HibernationState == "preparing" && pod.Valid && pod.Bytes != inv.PodUid {
+		switch {
+		case w.HibernationState != "preparing":
+		case !pod.Valid:
+			reason = InvalidatedPodSetUnproven
+		case pod.Bytes != inv.PodUid:
 			reason = InvalidatedOtherPod
 		}
 	}
@@ -357,6 +365,10 @@ func (s *Service) AcceptHibernationInventory(ctx context.Context, workerID uuid.
 		if err != nil {
 			return err
 		}
+		// The pod the worker registered as must be the pod the observation bound.
+		if !w.RegisteredPodUid.Valid || w.RegisteredPodUid.Bytes != rep.PodUID {
+			return ErrHibernationConflict
+		}
 		stored, err := storedPVCRefs(inv.Pvcs)
 		if err != nil || inv.DeploymentResourceVersion != rep.DeploymentResourceVersion || !slices.Equal(stored, sortedPVCRefs(rep.PVCs)) {
 			return ErrHibernationConflict
@@ -364,7 +376,7 @@ func (s *Service) AcceptHibernationInventory(ctx context.Context, workerID uuid.
 		n, err := q.AcceptHibernationInventory(ctx, store.AcceptHibernationInventoryParams{
 			RegisterNonce: rep.RegisterNonce, ReceivedAt: pgconv.Time(s.now()), Complete: rep.Complete,
 			Entries: rep.Entries, ReceiptKeys: rep.ReceiptKeys, Digest: rep.Digest, Fingerprint: rep.Fingerprint,
-			Lane: pgconv.TextOrNull(rep.Lane), Mechanism: pgconv.TextOrNull(rep.Mechanism),
+			Lane: pgconv.TextOrNull(rep.Lane), Mechanism: pgconv.TextOrNull(rep.Mechanism), Uncovered: rep.Uncovered,
 			WorkerID: w.ID, OpID: rep.OpID, PodUid: rep.PodUID,
 		})
 		if err != nil {

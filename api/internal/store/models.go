@@ -2055,6 +2055,7 @@ type WorkerHibernationInventory struct {
 	Fingerprint               pgtype.Text        `json:"fingerprint"`
 	Lane                      pgtype.Text        `json:"lane"`
 	Mechanism                 pgtype.Text        `json:"mechanism"`
+	Uncovered                 []byte             `json:"uncovered"`
 	InvalidatedReason         pgtype.Text        `json:"invalidated_reason"`
 	InvalidatedAt             pgtype.Timestamptz `json:"invalidated_at"`
 	ScalingDownPodUid         pgtype.UUID        `json:"scaling_down_pod_uid"`

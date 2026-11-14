@@ -23,9 +23,10 @@ UPDATE worker_hibernation_inventories SET
     digest = $6::text,
     fingerprint = $7::text,
     lane = $8::text,
-    mechanism = $9::text
-WHERE worker_id = $10 AND op_id = $11
-  AND pod_uid = $12::uuid
+    mechanism = $9::text,
+    uncovered = $10::jsonb
+WHERE worker_id = $11 AND op_id = $12
+  AND pod_uid = $13::uuid
   AND status = 'awaiting' AND invalidated_reason IS NULL
 `
 
@@ -39,6 +40,7 @@ type AcceptHibernationInventoryParams struct {
 	Fingerprint   string             `json:"fingerprint"`
 	Lane          pgtype.Text        `json:"lane"`
 	Mechanism     pgtype.Text        `json:"mechanism"`
+	Uncovered     []byte             `json:"uncovered"`
 	WorkerID      uuid.UUID          `json:"worker_id"`
 	OpID          uuid.UUID          `json:"op_id"`
 	PodUid        uuid.UUID          `json:"pod_uid"`
@@ -57,6 +59,7 @@ func (q *Queries) AcceptHibernationInventory(ctx context.Context, arg AcceptHibe
 		arg.Fingerprint,
 		arg.Lane,
 		arg.Mechanism,
+		arg.Uncovered,
 		arg.WorkerID,
 		arg.OpID,
 		arg.PodUid,
@@ -116,7 +119,7 @@ func (q *Queries) GetControllerHibernationAdvertisement(ctx context.Context) (Ge
 }
 
 const getHibernationInventoryForOp = `-- name: GetHibernationInventoryForOp :one
-SELECT worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, register_nonce, received_at, status, status_reason, complete, entries, receipt_keys, digest, fingerprint, lane, mechanism, invalidated_reason, invalidated_at, scaling_down_pod_uid, fence_generation, scaled_down_at, last_held_at, exclusion_final_at, exclusion_final_digest, exclusion_final_fingerprint FROM worker_hibernation_inventories
+SELECT worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, register_nonce, received_at, status, status_reason, complete, entries, receipt_keys, digest, fingerprint, lane, mechanism, uncovered, invalidated_reason, invalidated_at, scaling_down_pod_uid, fence_generation, scaled_down_at, last_held_at, exclusion_final_at, exclusion_final_digest, exclusion_final_fingerprint FROM worker_hibernation_inventories
 WHERE worker_id = $1 AND op_id = $2
 `
 
@@ -148,6 +151,7 @@ func (q *Queries) GetHibernationInventoryForOp(ctx context.Context, arg GetHiber
 		&i.Fingerprint,
 		&i.Lane,
 		&i.Mechanism,
+		&i.Uncovered,
 		&i.InvalidatedReason,
 		&i.InvalidatedAt,
 		&i.ScalingDownPodUid,
@@ -414,12 +418,14 @@ func (q *Queries) InvalidateHibernationInventory(ctx context.Context, arg Invali
 }
 
 const listAwaitingHibernationInventoriesOlderThan = `-- name: ListAwaitingHibernationInventoriesOlderThan :many
-SELECT worker_id FROM worker_hibernation_inventories
-WHERE status = 'awaiting' AND observed_at < $1::timestamptz
-ORDER BY worker_id
+SELECT i.worker_id FROM worker_hibernation_inventories i
+JOIN workers w ON w.id = i.worker_id AND w.hibernation_op_id = i.op_id
+WHERE i.status = 'awaiting' AND i.observed_at < $1::timestamptz
+ORDER BY i.worker_id
 `
 
-// Candidates for the settle pass timeout; the pass re-checks on the locked row.
+// Candidates for the settle pass timeout; the pass re-checks on the locked row. Only a row of the
+// worker's CURRENT op is listed, so a stale-op row is not re-listed on every pass.
 func (q *Queries) ListAwaitingHibernationInventoriesOlderThan(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listAwaitingHibernationInventoriesOlderThan, cutoff)
 	if err != nil {
@@ -1155,9 +1161,10 @@ func (q *Queries) UpsertControllerHibernationAdvertisement(ctx context.Context, 
 const upsertHibernationInventoryObserved = `-- name: UpsertHibernationInventoryObserved :one
 
 INSERT INTO worker_hibernation_inventories (
-    worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, status
+    worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, status, status_reason
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7::jsonb, $8::text
+    $1, $2, $3, $4, $5, $6, $7::jsonb, $8::text,
+    $9::text
 )
 ON CONFLICT (worker_id) DO UPDATE SET
     op_id = EXCLUDED.op_id,
@@ -1167,9 +1174,9 @@ ON CONFLICT (worker_id) DO UPDATE SET
     pod_uid = EXCLUDED.pod_uid,
     pvcs = EXCLUDED.pvcs,
     status = EXCLUDED.status,
+    status_reason = EXCLUDED.status_reason,
     register_nonce = NULL,
     received_at = NULL,
-    status_reason = NULL,
     complete = NULL,
     entries = NULL,
     receipt_keys = NULL,
@@ -1177,6 +1184,7 @@ ON CONFLICT (worker_id) DO UPDATE SET
     fingerprint = NULL,
     lane = NULL,
     mechanism = NULL,
+    uncovered = NULL,
     invalidated_reason = NULL,
     invalidated_at = NULL,
     scaling_down_pod_uid = NULL,
@@ -1186,7 +1194,7 @@ ON CONFLICT (worker_id) DO UPDATE SET
     exclusion_final_at = NULL,
     exclusion_final_digest = NULL,
     exclusion_final_fingerprint = NULL
-RETURNING worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, register_nonce, received_at, status, status_reason, complete, entries, receipt_keys, digest, fingerprint, lane, mechanism, invalidated_reason, invalidated_at, scaling_down_pod_uid, fence_generation, scaled_down_at, last_held_at, exclusion_final_at, exclusion_final_digest, exclusion_final_fingerprint
+RETURNING worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, register_nonce, received_at, status, status_reason, complete, entries, receipt_keys, digest, fingerprint, lane, mechanism, uncovered, invalidated_reason, invalidated_at, scaling_down_pod_uid, fence_generation, scaled_down_at, last_held_at, exclusion_final_at, exclusion_final_digest, exclusion_final_fingerprint
 `
 
 type UpsertHibernationInventoryObservedParams struct {
@@ -1198,6 +1206,7 @@ type UpsertHibernationInventoryObservedParams struct {
 	PodUid                    uuid.UUID          `json:"pod_uid"`
 	Pvcs                      []byte             `json:"pvcs"`
 	Status                    string             `json:"status"`
+	StatusReason              pgtype.Text        `json:"status_reason"`
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,6 +1228,7 @@ func (q *Queries) UpsertHibernationInventoryObserved(ctx context.Context, arg Up
 		arg.PodUid,
 		arg.Pvcs,
 		arg.Status,
+		arg.StatusReason,
 	)
 	var i WorkerHibernationInventory
 	err := row.Scan(
@@ -1240,6 +1250,7 @@ func (q *Queries) UpsertHibernationInventoryObserved(ctx context.Context, arg Up
 		&i.Fingerprint,
 		&i.Lane,
 		&i.Mechanism,
+		&i.Uncovered,
 		&i.InvalidatedReason,
 		&i.InvalidatedAt,
 		&i.ScalingDownPodUid,

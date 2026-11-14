@@ -2,12 +2,14 @@ package workersvc
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -564,6 +566,14 @@ func TestHibernationInventoryInvalidatorsLiveDB(t *testing.T) {
 			f.hibernatedHeld()
 			f.register(f.id, &f.other)
 		}},
+		{"register without a pod while awaiting", InvalidatedPodSetUnproven, func(f *invFx) {
+			f.observed()
+			f.register(f.id, nil)
+		}},
+		{"register without a pod after accept", InvalidatedPodSetUnproven, func(f *invFx) {
+			f.accepted()
+			f.register(f.id, nil)
+		}},
 		{"process restarted", InvalidatedProcessRestarted, func(f *invFx) {
 			f.accepted()
 			f.register(f.id, &f.pod)
@@ -760,4 +770,135 @@ func TestHibernationHeartbeatMemberLiveDB(t *testing.T) {
 			t.Fatalf("accept with the current nonce: %v", err)
 		}
 	})
+}
+
+func uuidList(n int) *[]string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = uuid.NewString()
+	}
+	return &out
+}
+
+// The inventory is evidence only: nothing it receives may stop a hibernation transition.
+func TestHibernationInventoryNeverBlocksTransitionsLiveDB(t *testing.T) {
+	t.Run("observed with an over-cap pod set records pod_set_unproven", func(t *testing.T) {
+		f := newInvFx(t)
+		f.must(f.observedT(func(tr *HibernationTransition) { tr.PodUIDs = uuidList(hibernationPodSetMax + 1) }))
+		if got := f.inv().Status; got != InventoryAwaiting {
+			t.Fatalf("status = %q", got)
+		}
+		f.wantInvalid(InvalidatedPodSetUnproven)
+		// The doomed row is not offered, so it ages out to timed_out, which the gate permits.
+		if m := f.heartbeat(nil); m != nil {
+			t.Fatalf("member for a doomed row: %+v", m)
+		}
+		f.env.exec(`UPDATE worker_hibernation_inventories SET observed_at = now() - interval '4 minutes' WHERE worker_id = $1`, f.id)
+		if _, err := f.svc.HibernationSettlePass(f.env.ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.inv().Status; got != InventoryTimedOut {
+			t.Fatalf("status = %q, want timed_out", got)
+		}
+	})
+	t.Run("observed with an over-cap pvc user set", func(t *testing.T) {
+		f := newInvFx(t)
+		f.must(f.observedT(func(tr *HibernationTransition) { tr.PVCUserPods = uuidList(hibernationPodSetMax + 1) }))
+		f.wantInvalid(InvalidatedPodSetUnproven)
+	})
+	t.Run("scaling_down with an over-cap pod set still applies", func(t *testing.T) {
+		f := newInvFx(t)
+		f.observed()
+		f.must(f.scalingDownT(func(tr *HibernationTransition) { tr.PodUIDs = uuidList(hibernationPodSetMax + 1) }))
+		if !f.row(f.id).HibernationScalingDownAt.Valid {
+			t.Fatal("the scale-down was not applied")
+		}
+		f.wantInvalid(InvalidatedPodSetUnproven)
+	})
+	t.Run("observed without volumes is recorded as unsupported", func(t *testing.T) {
+		f := newInvFx(t)
+		f.must(f.observedT(func(tr *HibernationTransition) { tr.PVCs = nil }))
+		row := f.inv()
+		if row.Status != InventoryUnsupported || row.StatusReason.String != "no_pvcs_observed" {
+			t.Fatalf("row = %q %q", row.Status, row.StatusReason.String)
+		}
+		if err := f.accept(f.report()); !errors.Is(err, ErrHibernationConflict) {
+			t.Fatalf("accept on an unsupported row: %v", err)
+		}
+		// A repeat of the same report keeps the row.
+		f.must(f.observedT(func(tr *HibernationTransition) { tr.PVCs = nil }))
+		if got := f.inv().Status; got != InventoryUnsupported {
+			t.Fatalf("status = %q", got)
+		}
+	})
+}
+
+// The accept binds only when the worker registered as the pod the observation named.
+func TestHibernationInventoryAcceptNeedsRegisteredPodLiveDB(t *testing.T) {
+	f := newInvFx(t)
+	f.observed()
+	f.env.exec(`UPDATE workers SET registered_pod_uid = $2 WHERE id = $1`, f.id, f.other)
+	if err := f.accept(f.report()); !errors.Is(err, ErrHibernationConflict) {
+		t.Fatalf("accept from an unregistered pod: %v", err)
+	}
+	f.env.exec(`UPDATE workers SET registered_pod_uid = NULL WHERE id = $1`, f.id)
+	if err := f.accept(f.report()); !errors.Is(err, ErrHibernationConflict) {
+		t.Fatalf("accept with no registered pod: %v", err)
+	}
+	if got := f.inv().Status; got != InventoryAwaiting {
+		t.Fatalf("status = %q", got)
+	}
+	f.env.exec(`UPDATE workers SET registered_pod_uid = $2 WHERE id = $1`, f.id, f.pod)
+	if err := f.accept(f.report()); err != nil {
+		t.Fatalf("accept from the registered pod: %v", err)
+	}
+}
+
+// The observation gap is three advertised poll intervals: just under is valid, just over is not.
+func TestHibernationInventoryGapBoundaryLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ago    string
+		reason string
+	}{
+		{"just under 3x", "25 seconds", ""},
+		{"just over 3x", "35 seconds", InvalidatedObservationGap},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newInvFx(t)
+			f.advertise(1, 10, 0)
+			f.hibernatedHeld()
+			f.env.exec(`UPDATE worker_hibernation_inventories SET last_held_at = now() - $2::interval WHERE worker_id = $1`, f.id, tc.ago)
+			f.must(f.afterExitT(TransitionHeld))
+			if tc.reason == "" {
+				f.wantValid()
+			} else {
+				f.wantInvalid(tc.reason)
+			}
+		})
+	}
+}
+
+// The settle pass lists only rows of the worker's current op.
+func TestHibernationInventoryStaleOpNotListedLiveDB(t *testing.T) {
+	f := newInvFx(t)
+	f.observed()
+	f.env.exec(`UPDATE worker_hibernation_inventories SET observed_at = now() - interval '4 minutes' WHERE worker_id = $1`, f.id)
+	cutoff := pgtype.Timestamptz{Time: time.Now().Add(-HibernationInventoryTimeout), Valid: true}
+	ids, err := f.env.q.ListAwaitingHibernationInventoriesOlderThan(f.env.ctx, cutoff)
+	if err != nil || !slices.Contains(ids, f.id) {
+		t.Fatalf("current-op row not listed: %v %v", ids, err)
+	}
+	f.env.exec(`UPDATE worker_hibernation_inventories SET op_id = $2 WHERE worker_id = $1`, f.id, uuid.New())
+	ids, err = f.env.q.ListAwaitingHibernationInventoriesOlderThan(f.env.ctx, cutoff)
+	if err != nil || slices.Contains(ids, f.id) {
+		t.Fatalf("stale-op row listed: %v %v", ids, err)
+	}
+	if _, err := f.svc.HibernationSettlePass(f.env.ctx); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT status FROM worker_hibernation_inventories WHERE worker_id = $1`, f.id).Scan(&status); err != nil || status != InventoryAwaiting {
+		t.Fatalf("stale-op row touched: %q %v", status, err)
+	}
 }

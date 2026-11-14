@@ -35,6 +35,11 @@ CREATE TABLE worker_hibernation_inventories (
     fingerprint text CHECK (char_length(fingerprint) <= 128),
     lane text CHECK (char_length(lane) <= 64),
     mechanism text CHECK (char_length(mechanism) <= 128),
+    -- The exclusion's uncovered list as the worker reported it. A non-empty list, or a lane other
+    -- than dind, forces complete = false; the list is kept so the evidence is not discarded.
+    uncovered jsonb CHECK (uncovered IS NULL
+        OR (jsonb_typeof(uncovered) = 'array' AND jsonb_array_length(uncovered) <= 64
+            AND octet_length(uncovered::text) <= 16384)),
     invalidated_reason text CHECK (invalidated_reason IN ('other_pod','pod_set_unproven',
         'deployment_changed','observation_gap','process_restarted','exclusion_lost',
         'written_after_inventory','identity_changed','scale_down_pod_unproven')),

@@ -3,6 +3,7 @@ package hostedsvc
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -57,6 +58,25 @@ func TestPollMapsInventoryGate(t *testing.T) {
 			}
 			if h.InventoryGate != tc.want {
 				t.Fatalf("gate = %q, want %q", h.InventoryGate, tc.want)
+			}
+		})
+	}
+	// A scale-down already recorded must never be held back by the gate, whatever the row says.
+	for _, st := range []string{"-", "awaiting"} {
+		t.Run("preparing with scaling_down_at set permits, row "+st, func(t *testing.T) {
+			row := store.ListHostedWorkersForControllerRow{ID: uuid.New(), UserID: uuid.New(),
+				HostedSize: pgtype.Text{String: "m", Valid: true}, TemplateDeclared: pgtype.Text{String: "base", Valid: true},
+				HostedGeneration: 1, HibernationState: "preparing",
+				HibernationOpID:          pgtype.UUID{Bytes: uuid.New(), Valid: true},
+				HibernationScalingDownAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, InventoryStatus: status(st)}
+			stub := newFakeStore()
+			stub.workers = []store.ListHostedWorkersForControllerRow{row}
+			response, err := newTestService(t, stub).Poll(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := response.Workers[0].Hibernation.InventoryGate; got != InventoryGatePermit {
+				t.Fatalf("gate = %q, want permit", got)
 			}
 		})
 	}

@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -55,6 +57,13 @@ func newInvRouteFx(t *testing.T) *invRouteFx {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The worker's register nonce is whatever bounded token the fixture carries.
+	var inv struct {
+		Nonce string `json:"register_nonce"`
+	}
+	if err := json.Unmarshal(fx["inventory_request"], &inv); err != nil || inv.Nonce == "" {
+		t.Fatalf("fixture nonce: %q %v", inv.Nonce, err)
+	}
 	f := &invRouteFx{t: t, pool: pool, h: h, token: token, id: uuid.New(), fx: fx,
 		router: h.WorkerRoutes(mw.NewLimiter(1_000_000, time.Hour, nil))}
 	// Identity is the fixture's, so the fixture bodies bind without edits.
@@ -62,7 +71,7 @@ func newInvRouteFx(t *testing.T) *invRouteFx {
 			registered_pod_uid, protocol_capabilities, snapshot_register_nonce, hibernation_state, hibernation_op_id, hibernation_requested_at)
 		VALUES ($1, $2, 'inv', $3, 'online', now(), 'hosted', 'm', 'base', $4, ARRAY[$5]::text[], $6, 'preparing', $7, now())`,
 		f.id, owner, hash, uuid.MustParse("66666666-6666-6666-6666-666666666666"), capability.HibernationInventoryV1,
-		"11111111-2222-4333-8444-555555555555", uuid.MustParse("55555555-5555-5555-5555-555555555555"))
+		inv.Nonce, uuid.MustParse("55555555-5555-5555-5555-555555555555"))
 	return f
 }
 
@@ -485,5 +494,135 @@ func TestControllerObservedAndHeldRoutesLiveDB(t *testing.T) {
 	}
 	if rec := f.controller(path, `{"op_id":"`+*op+`","transition":"held","deployment_uid":"`+deploy+`","pod_uids":["nope"]}`, true); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad pod set = %d", rec.Code)
+	}
+}
+
+// The accept binds to the nonce Register really minted (43-character base64url), not a fixture value.
+func TestWorkerHibernationInventoryAfterRealRegisterLiveDB(t *testing.T) {
+	f := newInvRouteFx(t)
+	f.observe()
+	ctx := context.Background()
+	wkr, err := store.New(f.pool).GetWorkerByID(ctx, f.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := uuid.MustParse("66666666-6666-6666-6666-666666666666")
+	if _, _, err := f.h.wsvc.RegisterWithCrossCheckSlots(ctx, wkr, "v1", "", nil, nil, nil,
+		[]string{capability.HibernationInventoryV1}, nil, pod); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	var nonce string
+	if err := f.pool.QueryRow(ctx, `SELECT snapshot_register_nonce FROM workers WHERE id = $1`, f.id).Scan(&nonce); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := base64.RawURLEncoding.DecodeString(nonce); err != nil || len(nonce) != 43 || len(raw) != 32 {
+		t.Fatalf("minted nonce %q (len %d): %v", nonce, len(nonce), err)
+	}
+	rec := f.heartbeat(`{"version":"v"}`)
+	var resp struct {
+		Member *workersvc.HibernationInventoryMember `json:"hibernation_inventory"`
+	}
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &resp) != nil || resp.Member == nil || resp.Member.RegisterNonce != nonce {
+		t.Fatalf("heartbeat = %d %s", rec.Code, rec.Body)
+	}
+	rec = f.post(invPath, f.mutated("inventory_request", map[string]any{"register_nonce": nonce}), true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("inventory with the minted nonce = %d %s", rec.Code, rec.Body)
+	}
+	if st, reason, _ := f.row(); st != "accepted" || reason != nil {
+		t.Fatalf("row = %q %v", st, reason)
+	}
+}
+
+// An uncovered writer, or a lane other than dind, is stored as an incomplete inventory and the
+// uncovered list is kept; unsafe worker text and unknown vocabulary are refused.
+func TestWorkerHibernationInventoryUncoveredAndTextLiveDB(t *testing.T) {
+	t.Run("uncovered forces complete=false and is persisted", func(t *testing.T) {
+		f := newInvRouteFx(t)
+		f.observe()
+		body := f.mutated("inventory_request", map[string]any{"exclusion": map[string]any{
+			"lane": "dind", "mechanism": "epoch_ex+latch+quiescence", "uncovered": []string{"host_bind_writer"}}})
+		if rec := f.post(invPath, body, true); rec.Code != http.StatusOK {
+			t.Fatalf("inventory = %d %s", rec.Code, rec.Body)
+		}
+		var complete bool
+		var uncovered string
+		if err := f.pool.QueryRow(context.Background(),
+			`SELECT complete, uncovered::text FROM worker_hibernation_inventories WHERE worker_id = $1`, f.id).Scan(&complete, &uncovered); err != nil {
+			t.Fatal(err)
+		}
+		if complete || uncovered != `["host_bind_writer"]` {
+			t.Fatalf("complete=%v uncovered=%s", complete, uncovered)
+		}
+	})
+	t.Run("the fixture's covered dind inventory stays complete", func(t *testing.T) {
+		f := newInvRouteFx(t)
+		f.observe()
+		if rec := f.post(invPath, f.fx["inventory_request"], true); rec.Code != http.StatusOK {
+			t.Fatalf("inventory = %d %s", rec.Code, rec.Body)
+		}
+		var complete bool
+		var uncovered string
+		_ = f.pool.QueryRow(context.Background(),
+			`SELECT complete, uncovered::text FROM worker_hibernation_inventories WHERE worker_id = $1`, f.id).Scan(&complete, &uncovered)
+		if !complete || uncovered != "[]" {
+			t.Fatalf("complete=%v uncovered=%s", complete, uncovered)
+		}
+	})
+	t.Run("unsafe text and unknown vocabulary are 400", func(t *testing.T) {
+		f := newInvRouteFx(t)
+		f.observe()
+		entry := func(k, v string) []map[string]any {
+			return []map[string]any{{"kind": "attempt_tree", "path": "/data/x", "classification": "protected", k: v}}
+		}
+		for name, body := range map[string][]byte{
+			"bidi in path":       f.mutated("inventory_request", map[string]any{"entries": entry("path", "/data/a\u202eb")}),
+			"control in detail":  f.mutated("inventory_request", map[string]any{"entries": entry("detail", "a\u0007b")}),
+			"bad classification": f.mutated("inventory_request", map[string]any{"entries": entry("classification", "Not Allowed")}),
+			"unknown lane": f.mutated("inventory_request", map[string]any{"exclusion": map[string]any{
+				"lane": "sideways", "mechanism": "none", "uncovered": []string{}}}),
+		} {
+			if rec := f.post(invPath, body, true); rec.Code != http.StatusBadRequest {
+				t.Errorf("%s = %d %s", name, rec.Code, rec.Body)
+			}
+		}
+		if st, _, _ := f.row(); st != "awaiting" {
+			t.Fatalf("a refused body moved the row to %q", st)
+		}
+	})
+}
+
+// The hibernation half of a heartbeat is best effort once liveness has committed: a failure there
+// omits the member. Only a lost-exclusion report, recorded in that same transaction, must be resent.
+func TestWorkerHeartbeatHibernationFailureIsBestEffortLiveDB(t *testing.T) {
+	op := "55555555-5555-5555-5555-555555555555"
+	f := newInvRouteFx(t)
+	f.observe()
+	// A stored pvcs value the member builder cannot decode makes HibernationHeartbeat fail.
+	cliMustExec(t, f.pool, `UPDATE worker_hibernation_inventories SET pvcs = '[1]'::jsonb WHERE worker_id = $1`, f.id)
+	for name, body := range map[string]string{
+		"plain": `{"version":"v"}`,
+		"held":  `{"hibernation_exclusion":{"op_id":"` + op + `","held":true}}`,
+	} {
+		rec := f.heartbeat(body)
+		var resp map[string]json.RawMessage
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		if _, ok := resp["hibernation_inventory"]; rec.Code != http.StatusOK || ok {
+			t.Errorf("%s: heartbeat = %d, member present=%v", name, rec.Code, ok)
+		}
+	}
+	// A lost-exclusion report that fails with the member build is not acknowledged and not recorded
+	// (the accepted row is offered, so its undecodable pvcs fail the transaction).
+	g := newInvRouteFx(t)
+	g.observe()
+	if rec := g.post(invPath, g.fx["inventory_request"], true); rec.Code != http.StatusOK {
+		t.Fatalf("inventory = %d", rec.Code)
+	}
+	cliMustExec(t, g.pool, `UPDATE worker_hibernation_inventories SET pvcs = '[1]'::jsonb WHERE worker_id = $1`, g.id)
+	if rec := g.heartbeat(`{"hibernation_exclusion":{"op_id":"` + op + `","held":false}}`); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("lost-exclusion heartbeat = %d, want 500 so the worker resends", rec.Code)
+	}
+	if _, reason, _ := g.row(); reason != nil {
+		t.Fatalf("a failed transaction left reason %q", *reason)
 	}
 }

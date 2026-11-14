@@ -58,7 +58,8 @@ func TestInventoryFixtureRequestsDecodeAndPrepare(t *testing.T) {
 			if rep.OpID.String() != "55555555-5555-5555-5555-555555555555" || rep.PodUID.String() != "66666666-6666-6666-6666-666666666666" {
 				t.Fatalf("identity not carried: %+v", rep)
 			}
-			if rep.RegisterNonce != "11111111-2222-4333-8444-555555555555" || rep.DeploymentResourceVersion != "12340" {
+			// The nonce is whatever bounded token the fixture carries (the api mints a 43-character base64url value).
+			if rep.RegisterNonce != req.RegisterNonce || rep.RegisterNonce == "" || len(rep.RegisterNonce) > inventoryTokenMax || rep.DeploymentResourceVersion != "12340" {
 				t.Fatalf("nonce / resource version not carried: %+v", rep)
 			}
 			var entries []map[string]any
@@ -276,15 +277,10 @@ func TestValidateObservedAndHeldTransitions(t *testing.T) {
 	if _, _, err := validateHibernationTransition(&held); err != nil {
 		t.Fatalf("good held (no resource version, no pod): %v", err)
 	}
-	many := make([]string, hibernationPodSetMax+1)
-	for i := range many {
-		many[i] = uuid.NewString()
-	}
 	empty := []string{}
 	for name, mutate := range map[string]func(t *HibernationTransition){
 		"no pod uid":          func(t *HibernationTransition) { t.PodUID = "" },
 		"no resource version": func(t *HibernationTransition) { t.ResourceVersion = "" },
-		"no pvcs":             func(t *HibernationTransition) { t.PVCs = nil },
 		"four pvcs":           func(t *HibernationTransition) { t.PVCs = append(t.PVCs, pvc("dind_data", "u3"), pvc("data", "u4")) },
 		"bad role":            func(t *HibernationTransition) { t.PVCs[0].Role = "x" },
 		"dup role":            func(t *HibernationTransition) { t.PVCs[1].Role = "data" },
@@ -294,8 +290,6 @@ func TestValidateObservedAndHeldTransitions(t *testing.T) {
 		"missing reclaim":     func(t *HibernationTransition) { t.PVCs[0].ClassReclaimPolicy = "" },
 		"pod set not uuid":    func(t *HibernationTransition) { x := []string{"nope"}; t.PodUIDs = &x },
 		"pvc pods not uuid":   func(t *HibernationTransition) { x := []string{"nope"}; t.PVCUserPods = &x },
-		"too many pods":       func(t *HibernationTransition) { t.PodUIDs = &many },
-		"too many pvc pods":   func(t *HibernationTransition) { t.PVCUserPods = &many },
 	} {
 		tr := good()
 		mutate(&tr)
@@ -303,10 +297,124 @@ func TestValidateObservedAndHeldTransitions(t *testing.T) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}
+	// The inventory must never block a hibernation: an over-cap set is dropped (unobserved), and an
+	// observed without volumes is valid (the service records it as unsupported).
+	many := make([]string, hibernationPodSetMax+1)
+	for i := range many {
+		many[i] = uuid.NewString()
+	}
+	tr = good()
+	tr.PodUIDs, tr.PVCUserPods = &many, &many
+	if _, _, err := validateHibernationTransition(&tr); err != nil {
+		t.Fatalf("over-cap pod sets: %v", err)
+	}
+	if tr.PodUIDs != nil || tr.PVCUserPods != nil {
+		t.Fatalf("over-cap pod sets kept: %v %v", tr.PodUIDs, tr.PVCUserPods)
+	}
+	tr = good()
+	tr.PVCs = nil
+	if _, _, err := validateHibernationTransition(&tr); err != nil {
+		t.Fatalf("observed without pvcs: %v", err)
+	}
 	// A known-empty pod set is valid and distinct from an absent one.
 	tr = good()
 	tr.PodUIDs, tr.PVCUserPods = &empty, &empty
 	if _, _, err := validateHibernationTransition(&tr); err != nil {
 		t.Fatalf("empty pod sets: %v", err)
+	}
+}
+
+// Worker-written text is stored, so controls, DEL and bidi controls are refused, and the
+// vocabulary fields are constrained.
+func TestInventoryRejectsUnsafeTextAndVocabulary(t *testing.T) {
+	fx := loadInventoryFixture(t)
+	prepare := func(t *testing.T, mutate func(m map[string]any)) error {
+		t.Helper()
+		var m map[string]any
+		if err := json.Unmarshal(fx["inventory_request"], &m); err != nil {
+			t.Fatal(err)
+		}
+		mutate(m)
+		raw, _ := json.Marshal(m)
+		var req InventoryRequest
+		if err := invStrictDecode(t, raw, &req); err != nil {
+			t.Fatal(err)
+		}
+		_, err := req.PrepareInventory()
+		return err
+	}
+	entry := func(m map[string]any) map[string]any { return m["entries"].([]any)[0].(map[string]any) }
+	excl := func(m map[string]any) map[string]any { return m["exclusion"].(map[string]any) }
+	bad := []string{"a\x01b", "a\nb", "a\tb", "a\x7fb", "a\u0085b", "a\u009fb", "a\u202eb", "a\u2066b", "a\u2069b", "a\u200eb", "a\u200fb", "a\u061cb"}
+	fields := map[string]func(m map[string]any, v string){
+		"path":           func(m map[string]any, v string) { entry(m)["path"] = v },
+		"kind":           func(m map[string]any, v string) { entry(m)["kind"] = v },
+		"classification": func(m map[string]any, v string) { entry(m)["classification"] = v },
+		"detail":         func(m map[string]any, v string) { entry(m)["detail"] = v },
+		"content_state":  func(m map[string]any, v string) { entry(m)["content_state"] = v },
+		"lane":           func(m map[string]any, v string) { excl(m)["lane"] = v },
+		"mechanism":      func(m map[string]any, v string) { excl(m)["mechanism"] = v },
+		"uncovered":      func(m map[string]any, v string) { excl(m)["uncovered"] = []any{v} },
+	}
+	for field, set := range fields {
+		for _, v := range bad {
+			if err := prepare(t, func(m map[string]any) { set(m, v) }); !isValidationError(err) {
+				t.Errorf("%s %q: err = %v", field, v, err)
+			}
+		}
+	}
+	for name, mutate := range map[string]func(m map[string]any){
+		"unknown lane":          func(m map[string]any) { excl(m)["lane"] = "sideways" },
+		"unknown mechanism":     func(m map[string]any) { excl(m)["mechanism"] = "magic" },
+		"upper-case kind":       func(m map[string]any) { entry(m)["kind"] = "Attempt" },
+		"spaced classification": func(m map[string]any) { entry(m)["classification"] = "a b" },
+		"slashed content state": func(m map[string]any) { entry(m)["content_state"] = "a/b" },
+		"over-long kind":        func(m map[string]any) { entry(m)["kind"] = strings.Repeat("a", 65) },
+		"too many uncovered":    func(m map[string]any) { excl(m)["uncovered"] = make([]any, 65) },
+	} {
+		if err := prepare(t, mutate); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	// Ordinary unicode text and every lane / mechanism the agent sends stay valid.
+	if err := prepare(t, func(m map[string]any) {
+		entry(m)["path"] = "/data/runner/h\u00e9llo \u4e16\u754c"
+		excl(m)["lane"] = "isolated"
+		excl(m)["mechanism"] = "none"
+	}); err != nil {
+		t.Fatalf("valid text rejected: %v", err)
+	}
+}
+
+// An uncovered writer, or a lane other than dind, can never leave the inventory complete, and
+// the reported uncovered list is kept.
+func TestInventoryUncoveredForcesIncomplete(t *testing.T) {
+	fx := loadInventoryFixture(t)
+	prep := func(t *testing.T, lane string, uncovered []any) HibernationInventoryReport {
+		t.Helper()
+		var m map[string]any
+		if err := json.Unmarshal(fx["inventory_request"], &m); err != nil {
+			t.Fatal(err)
+		}
+		m["exclusion"] = map[string]any{"lane": lane, "mechanism": "epoch_ex+latch+quiescence", "uncovered": uncovered}
+		raw, _ := json.Marshal(m)
+		var req InventoryRequest
+		if err := invStrictDecode(t, raw, &req); err != nil {
+			t.Fatal(err)
+		}
+		rep, err := req.PrepareInventory()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rep
+	}
+	if rep := prep(t, "dind", []any{}); !rep.Complete || string(rep.Uncovered) != "[]" {
+		t.Fatalf("covered dind: complete=%v uncovered=%s", rep.Complete, rep.Uncovered)
+	}
+	if rep := prep(t, "dind", []any{"x_writer"}); rep.Complete || string(rep.Uncovered) != `["x_writer"]` {
+		t.Fatalf("uncovered dind: complete=%v uncovered=%s", rep.Complete, rep.Uncovered)
+	}
+	if rep := prep(t, "plain", []any{}); rep.Complete {
+		t.Fatal("plain lane kept complete")
 	}
 }
