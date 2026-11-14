@@ -338,7 +338,7 @@ test("#4265 a batch inspection returning the wrong number of results invalidates
     const { options } = setup(); options.dockerHost = d.host; inventory(options, 2);
     const inner = options.git.inspectEpochRetainedGroups;
     let requested = 0;
-    options.git.inspectEpochRetainedGroups = async batch => { requested = batch.requests.length; return (await inner(batch)).slice(1); };
+    options.git.inspectEpochRetainedGroups = async batch => { requested = batch.requests.length; return (await inner(batch)).slice(0, -1); };
     const result = (await runPodEpochShadow(options))!;
     assert.equal(requested, 2, "both groups of the bare were sent as one batch");
     assert.equal(result.reason, "path_set_changed");
