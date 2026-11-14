@@ -1,4 +1,5 @@
-import { afterEach, describe, it } from "node:test";
+import { afterEach, describe, it, mock } from "node:test";
+import fsp from "node:fs/promises";
 import { establishTrackingOwnership } from "./publication-fixture.js";
 import { AsyncResource } from "node:async_hooks";
 import assert from "node:assert/strict";
@@ -5801,6 +5802,39 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
         assert.deepEqual(logged(lines, REMOVED), [], "no lock file was removed");
         assert.deepEqual(logged(lines, FAILED), []);
         assert.equal(statusTexts(runId).filter((t) => t === SINK_BLOCKED).length, 1, "the sink-blocked status was emitted once");
+      });
+
+      it("a non-ENOENT lstat failure on a candidate lock keeps it blocking the sink (only ENOENT proves absence)", { timeout: 90_000 }, async () => {
+        const realLstat = fsp.lstat.bind(fsp);
+        let injected = 0;
+        let armed = false;
+        let target = "";
+        const stub = mock.method(fsp, "lstat", (async (p: Parameters<typeof fsp.lstat>[0], ...rest: unknown[]) => {
+          if (armed && path.basename(String(p)) === target) {
+            injected++;
+            throw Object.assign(new Error("EACCES: permission denied, lstat"), { code: "EACCES" });
+          }
+          return (realLstat as (...a: unknown[]) => Promise<unknown>)(p, ...rest);
+        }) as unknown as typeof fsp.lstat);
+        let runId = "";
+        try {
+          // The reconcile rejects, so the seam cleanup falls back to recordUnreconciledLocks (the lstat probe).
+          const hooks = { tickSpawn: { beforeReconcile: async () => { throw new Error("reconcile boom"); } } };
+          ({ runId } = await lockScenario(4258_304, hooks, async ({ r, seam, lockFile, stop }) => {
+            fs.writeFileSync(lockFile, "x");
+            target = path.basename(lockFile);
+            armed = true;
+            stop();
+            const d = await bounded(seam, BOUND_MS + 15_000, "the seam resolving with an unreadable lock path", "mid-run seam");
+            armed = false;
+            assert.deepEqual(d, { action: "proceed" });
+            assert.ok(injected >= 1, "the EACCES stub fired for the lock path");
+            assert.ok(retainedHas(r, lockFile), "an lstat failure other than ENOENT keeps the lock path blocking");
+          }));
+        } finally {
+          stub.mock.restore();
+        }
+        assert.ok(statusTexts(runId).includes(SINK_BLOCKED), "the sink-blocked status was emitted");
       });
 
       it("an acquired reconcile that outlasts the bound completes and is recorded, never labelled a timeout", { timeout: 90_000 }, async () => {

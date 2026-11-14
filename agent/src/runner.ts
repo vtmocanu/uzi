@@ -20959,7 +20959,8 @@ export class RunRunner {
       const present: string[] = [];
       try {
         for (const p of await spawner.unreconciledLockCandidates()) {
-          if (await fs.lstat(p).then(() => true, () => false)) present.push(p);
+          // Only ENOENT proves absence; any other lstat failure (EACCES, EIO) may hide a live lock, so keep it.
+          if (await fs.lstat(p).then(() => true, (e: unknown) => (e as NodeJS.ErrnoException)?.code !== "ENOENT")) present.push(p);
         }
       } catch (e) {
         runLog.warn("mid-run secret remediation could not list lock candidates", { run_id: runId, error: errMessage(e) });
