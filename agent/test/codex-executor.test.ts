@@ -18577,7 +18577,7 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       await Promise.race([inSeam, settled.then(() => assert.fail("the seam was never called"))]);
       cancelled = true; // sticky flag only: the signal is never aborted
       release();
-      await assert.rejects(running, /cancel/i);
+      await assert.rejects(running, { name: "Error", message: "run cancelled" });
       assert.equal(sentOf(rig).length, 1, "only the first work turn ran");
       assert.ok(sentOf(rig).every(text => !text.includes(MID)));
       assert.equal(pullsAfter, 0, "the owner follow-up queue is untouched after the cancel");
@@ -18624,7 +18624,7 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
           fired = true;
           wired.during();
           release();
-          await assert.rejects(running);
+          await assert.rejects(running, { name: "Error", message: "run cancelled" });
           assert.equal(sentOf(rig).length, 1, "only the first work turn ran");
           assert.ok(sentOf(rig).every(text => !text.includes(MID)));
           assert.equal(pullsAfter, 0, "the owner follow-up queue is untouched after the stop");
