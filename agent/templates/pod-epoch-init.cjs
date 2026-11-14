@@ -373,7 +373,9 @@ function createRuntime(options = {}) {
       // worker admission (the claim gate) is already closed for the whole of it, and `pending` makes
       // every other operation throw, so no new work can start while the lock is not held. The
       // reopened file must be the very inode held before (heldIdentity), so EX on a replaced inode
-      // fails like any other failure of the attempt and shared ownership is re-taken.
+      // fails like any other failure of the attempt and shared ownership is re-taken. The re-taken
+      // shared descriptor is held to the same identity: a replaced inode there is 'epoch shared
+      // ownership lost' (fatal), not an adopted new lock file.
       //   true  -> EX held (mode is 'exclusive').
       //   false -> contended; shared ownership was re-taken (mode is still 'shared').
       // A non-contention failure of the exclusive attempt re-takes SH and then rethrows. If SH
@@ -409,7 +411,9 @@ function createRuntime(options = {}) {
           try {
             shared = open(names.epoch);
             await lock(shared, 'shared', 120000, signal);
-            heldIdentity = identity(verify(shared, names.epoch));
+            // The re-taken SH must be the very inode held before the attempt, like the EX verify: a
+            // replaced inode here is lost shared ownership (fatal), never silently adopted.
+            heldIdentity = identity(verify(shared, names.epoch, 0o600, previousIdentity));
             fd = shared;
           } catch (error) {
             if (shared !== undefined) { try { io.closeSync(shared); } catch { /* already failing */ } }

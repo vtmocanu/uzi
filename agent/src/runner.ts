@@ -21777,7 +21777,10 @@ export class RunRunner {
     if (!Number.isSafeInteger(generation) || generation <= 0) return;
     const signal = flight.cancel.signal;
     // PRD #4208: the detached settle journals records and outlives runActive, so it is a registered
-    // hibernation writer, entered before it detaches. Skipped while latched; the settlement sweep retries.
+    // hibernation writer, entered before it detaches. Refused while latched. The sweep only settles legs
+    // already journaled, so a refused trigger does not retry itself: the live leg for this publication
+    // is observed by a later publication or at terminal ancestry settlement, so custody release may be
+    // delayed. No work is lost.
     const releaseWriter = hibernationWriters.enter("live_settle");
     if (!releaseWriter) return;
     this.detached(() => {

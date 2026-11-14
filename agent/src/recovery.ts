@@ -5201,8 +5201,9 @@ export class RecoveryCoordinator {
   private trackPass(callerSignal: AbortSignal | undefined, fn: () => Promise<void>): Promise<void> {
     // PRD #4208: every pass writes capture records or bundles on the data volume and can outlive the
     // run that spawned it, so it is a registered hibernation writer. Entered synchronously, before any
-    // await: refused while the writer latch is held (the heartbeat re-drive retries), and counted so
-    // the hibernation settle waits for a pass already in flight.
+    // await, and counted so the hibernation settle waits for a pass already in flight. A pass refused
+    // while the writer latch is held does nothing: its records stay journaled for the next boot pass
+    // or heartbeat re-drive. No equivalence between the live re-drive and the terminal pass is claimed.
     const releaseWriter = hibernationWriters.enter("recovery_pass");
     if (!releaseWriter) return Promise.resolve();
     const signal = AbortSignal.any([this.passShutdown.signal, ...(callerSignal ? [callerSignal] : [])]);

@@ -875,7 +875,7 @@ test("upgradeExclusive restores SH and rethrows a non-contention failure; lost S
   assert.throws(() => held.mode, /closed/);
 });
 
-test("upgradeExclusive refuses EX on a replaced epoch inode and re-takes shared", async (t) => {
+test("upgradeExclusive on a replaced epoch inode refuses EX and the re-taken SH: shared ownership lost", async (t) => {
   const f = fixture(t, { run: undefined });
   await f.runtime.seed(S);
   const held = await f.runtime.acquire();
@@ -883,7 +883,6 @@ test("upgradeExclusive refuses EX on a replaced epoch inode and re-takes shared"
   fs.renameSync(path.join(f.root, epochName), path.join(f.root, "old-lock"));
   fs.writeFileSync(path.join(f.root, epochName), "", { mode: 0o600 });
   fs.chownSync(path.join(f.root, epochName), process.getuid!(), process.getgid!());
-  await assert.rejects(held.upgradeExclusive!(), /inode changed/);
-  assert.equal(held.mode, "shared", "a non-fatal failure: shared ownership was re-taken");
-  held.close();
+  await assert.rejects(held.upgradeExclusive!(), /shared ownership lost: .*inode changed/);
+  assert.throws(() => held.mode, /closed/, "fatal: the handle is closed, never adopted onto the new inode");
 });
