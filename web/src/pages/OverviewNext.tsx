@@ -44,7 +44,15 @@ import { useCommandMenu } from "../components/CommandMenuContext";
 import { SearchIcon } from "../components/icons";
 import { commandShortcutKeys, commandShortcutLabel } from "../lib/platform";
 
+// Remounted per signed-in user: every read on the page (the core load, the admin reads and the
+// Agents chip's allocations) belongs to one viewer, so a different user never sees, or joins
+// against, the previous viewer's data. A same-user session refresh keeps the mount.
 export function OverviewNext() {
+  const { user } = useAuth();
+  return <OverviewNextPage key={user?.id ?? "signed-out"} />;
+}
+
+function OverviewNextPage() {
   const commandMenu = useCommandMenu();
   const demo = useDemoMode();
   const { user } = useAuth();
@@ -70,30 +78,24 @@ export function OverviewNext() {
   // useOverviewData so the Dashboard's requests are untouched. StrictMode (main.tsx) replays
   // effects in development; the ref keeps that to one request. A failure, even a synchronous
   // throw, resolves null and hides only the chip.
-  // Keyed to the viewer: a different signed-in user drops the previous viewer's request and
-  // reads their own allocations (the counts join on the viewer's id).
-  const allocRequest = useRef<{ viewerId: string; request: Promise<TemplateAllocation[] | null> } | null>(null);
+  // One viewer per mount (see OverviewNext above), so this read never outlives its viewer.
+  const allocRequest = useRef<Promise<TemplateAllocation[] | null> | null>(null);
   const [allocations, setAllocations] = useState<TemplateAllocation[] | null>(null);
-  const viewerId = user?.id ?? null;
   useEffect(() => {
-    if (viewerId === null) return;
-    if (allocRequest.current?.viewerId !== viewerId) {
-      if (allocRequest.current !== null) setAllocations(null);
-      allocRequest.current = { viewerId, request: Promise.resolve()
+    allocRequest.current ??= Promise.resolve()
       .then(() => api.getTemplateAllocations())
       .then(
         (r) => r.templates,
         () => null,
-      ) };
-    }
+      );
     let cancelled = false;
-    void allocRequest.current.request.then((a) => {
+    void allocRequest.current.then((a) => {
       if (!cancelled) setAllocations(a);
     });
     return () => {
       cancelled = true;
     };
-  }, [viewerId]);
+  }, []);
 
   if (!user) return null;
 

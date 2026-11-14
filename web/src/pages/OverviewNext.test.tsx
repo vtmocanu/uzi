@@ -1254,19 +1254,27 @@ describe("OverviewNext Agents chip", () => {
     expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
   });
 
-  it("reads the allocations again for a different signed-in viewer, never showing the previous viewer's counts", async () => {
-    mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
+  it("re-reads every viewer-scoped list for a different signed-in viewer of the same role, never joining the previous viewer's data", async () => {
+    // Viewer A (aUser) sees the shared templates plus "mine"; viewer B, also a non-admin, sees the
+    // shared templates plus "b-own", which A's list never contains.
+    const userB = { ...aUser, id: "user-b" };
+    const shared = rows.slice(0, 4);
+    const bOwn = tmpl("bown", "b-own", "user", userB.id);
+    const aTemplates = [...shared, rows[4]];
+    const bTemplates = [...shared, bOwn];
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: aTemplates });
+    mockApi.getTemplateAllocations.mockResolvedValue({ templates: aTemplates.map((t) => alloc(t, true)) });
     const view = mountWithMenu();
     await settle();
-    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 4 in your runs of 5");
-    const other = { ...aUser, id: "someone-else" };
-    vi.mocked(useAuth).mockReturnValue(authValue(other));
-    // For the other viewer the population is the four shared templates plus their own "theirs";
-    // their read has only "theirs" on, so a stale first read would still say 4.
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 in your runs of 5");
+
+    // The session switches to B without a signed-out render in between (AuthContext.applySession).
+    let releaseB: (v: { templates: AgentTemplate[] }) => void = () => {};
+    mockApi.listAgentTemplates.mockReturnValue(new Promise((r) => (releaseB = r)));
     mockApi.getTemplateAllocations.mockResolvedValue({
-      templates: allocations.map((a) => ({ ...a, effective: a.id === "o1" })),
+      templates: bTemplates.map((t) => alloc(t, t.id === "bown")),
     });
+    vi.mocked(useAuth).mockReturnValue(authValue(userB));
     view.rerender(
       <MemoryRouter>
         <CommandMenuContext.Provider value={{ open: vi.fn() }}>
@@ -1275,7 +1283,11 @@ describe("OverviewNext Agents chip", () => {
       </MemoryRouter>,
     );
     await settle();
-    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(2);
+    // B's templates have not arrived: no chip, and never A's "5 in your runs".
+    expect(screen.queryByRole("button", { name: /^Agents:/ })).toBeNull();
+    releaseB({ templates: bTemplates });
+    await settle();
     expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 1 in your runs of 5");
+    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(2);
   });
 });
