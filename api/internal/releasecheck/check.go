@@ -99,8 +99,8 @@ func NewReconciler(st Store, set SettingsReader, now func() time.Time, logger *s
 //   - master toggle OFF → Status "disabled", NO http call, persist NOTHING.
 //   - stable fetch/parse error → Status "error", token-scrubbed message, persist NOTHING
 //     (the last-good facts survive so the SPA keeps showing the previous release).
-//   - stable success → also read the two tap formulas (each failure writes "" for
-//     that formula only), then fetch one RC page, persist stable facts and RC facts on RC
+//   - stable success → fetch one RC page and read the two tap formulas (each formula
+//     failure writes "" for that formula only), persist stable facts and RC facts on RC
 //     success (clearing RC keys when absent), then invalidate the cache. An RC
 //     failure preserves prior RC keys and returns an error after stable persistence.
 //

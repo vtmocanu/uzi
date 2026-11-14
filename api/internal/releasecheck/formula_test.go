@@ -152,7 +152,16 @@ func TestCheckForUpdateWritesFormulaTags(t *testing.T) {
 // A ready check followed by a failure of one formula writes "" for that formula only,
 // and leaves Status / Latest* / RC* exactly as in the all-good run.
 func TestCheckForUpdateFormulaFailureIsolated(t *testing.T) {
-	oversized := serve(strings.Repeat("a", maxFormulaBodyBytes+1))
+	// A VALID formula padded past the cap with a trailing comment, so only the size
+	// cap (never the parser) can turn it into "".
+	oversized := func(which string) http.HandlerFunc {
+		tag := "v2.0.0"
+		if which == "rc" {
+			tag = "v2.1.0-rc.1"
+		}
+		src := formulaSrc(tag)
+		return serve(src + "# " + strings.Repeat("a", maxFormulaBodyBytes+1-len(src)) + "\n")
+	}
 	redirect := func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/elsewhere", http.StatusFound)
 	}
@@ -160,14 +169,26 @@ func TestCheckForUpdateFormulaFailureIsolated(t *testing.T) {
 		"404":       status(http.StatusNotFound),
 		"403":       status(http.StatusForbidden),
 		"redirect":  redirect,
-		"oversized": oversized,
 		"malformed": serve("not a formula"),
+	}
+	// The padded body must still parse on its own: the cap, not the parser, rejects it.
+	for _, which := range []string{"stable", "rc"} {
+		probe := httptest.NewRecorder()
+		oversized(which)(probe, nil)
+		if _, ok := parseFormulaTag(probe.Body.String(), which == "stable"); !ok {
+			t.Fatalf("oversized %s fixture does not parse; it would not isolate the size cap", which)
+		}
 	}
 	newFormulaServer(t, serve(formulaSrc("v2.0.0")), serve(formulaSrc("v2.1.0-rc.1")), false)
 	base := runCheck(t, newFakeStore(nil))
 
+	cases := map[string]func(which string) http.HandlerFunc{"oversized": oversized}
 	for name, bad := range failures {
+		cases[name] = func(string) http.HandlerFunc { return bad }
+	}
+	for name, mk := range cases {
 		for _, which := range []string{"stable", "rc"} {
+			bad := mk(which)
 			t.Run(name+"/"+which, func(t *testing.T) {
 				good := serve(formulaSrc("v2.0.0"))
 				goodRC := serve(formulaSrc("v2.1.0-rc.1"))
@@ -203,6 +224,20 @@ func TestCheckForUpdateFormulaFailureIsolated(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// The uzi-cli formula is read with stableOnly: an RC tag there is unknown, while the
+// same RC tag on the uzi-cli-rc formula is accepted.
+func TestCheckForUpdateStableFormulaRejectsRCTag(t *testing.T) {
+	newFormulaServer(t, serve(formulaSrc("v2.1.0-rc.1")), serve(formulaSrc("v2.1.0-rc.1")), false)
+	st := newFakeStore(nil)
+	runCheck(t, st)
+	if got := st.values[settings.KeyReleaseFormulaStableTag]; got != "" {
+		t.Errorf("stable formula key = %q, want \"\" (RC tag on uzi-cli)", got)
+	}
+	if got := st.values[settings.KeyReleaseFormulaRCTag]; got != "v2.1.0-rc.1" {
+		t.Errorf("rc formula key = %q, want v2.1.0-rc.1", got)
 	}
 }
 
