@@ -976,7 +976,7 @@ function splitNulRecords(buf: Buffer): Buffer[] | undefined {
 }
 /** Wall-clock ceiling on the preserved_patch scan (the patch is already byte-capped by
  *  REVIEW_DIFF_MAX_BYTES, so gitleaks stdin finishes in well under a second in practice). */
-const PATCH_SCAN_TIMEOUT_MS = 2 * 60_000;
+export const PATCH_SCAN_TIMEOUT_MS = 2 * 60_000;
 
 export type BoundaryProcessSpawner = (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
 

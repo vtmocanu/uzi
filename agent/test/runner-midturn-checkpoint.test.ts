@@ -5696,6 +5696,66 @@ describe("issue #4258 mid-run secret remediation consumer", () => {
       }
     }
 
+    // No stop here: the path scan's own deadline must kill the stalled child. The range-scan deadline is
+    // far above the wait bound and the shim stalls for 120s, so an unbounded path scope fails this by the
+    // bounded wait, not by hanging the suite. An aborted path scan is fail-closed: every path is withheld.
+    it("path scan stalled with no stop: its own deadline kills the child and the seam remediates with every path withheld", { timeout: 90_000 }, async () => {
+      const PATH_DEADLINE_MS = 1_500;
+      const tmp = scratchDir("4258-path-deadline");
+      const stall = writeStallShim(tmp);
+      const { logger, lines } = recordingLogger();
+      let elapsed = Infinity;
+      let followUp = "";
+      try {
+        const out = await rig(4258_120, async (r) => {
+          try {
+            await flagAndTick(r);
+            stall.setMode("stall-stdin");
+            const t0 = Date.now();
+            const p = r.ctx.midRunSecretRemediation!();
+            p.catch(() => undefined);
+            const d = await bounded(p, WAIT_MS, "the seam resolving after the path-scan deadline", "mid-run seam");
+            elapsed = Date.now() - t0;
+            assert.equal(d.action, "remediate");
+            if (d.action !== "remediate") return;
+            followUp = d.followUp;
+            assert.ok(followUp.includes("[path withheld]"), followUp);
+            assert.ok(!followUp.includes("cfg.env"), "the flagged path was withheld, not reported");
+            const pids = stall.pids();
+            assert.ok(pids.length > 0, "the path scan child ran");
+            for (const pid of pids) {
+              assert.equal(isAlive(pid), false, `scan child ${pid} exited`);
+              assert.equal(groupAlive(pid), false, `scan child group ${pid} is gone`);
+            }
+            assert.deepEqual(r.flight().survivingTickGroups, []);
+            assert.equal(gateHeld(r), false, "the sink gate was released");
+            assert.equal(r.state().attempts, 1, "the attempt was spent");
+            assert.equal(r.state().midRunTrigger, undefined, "the trigger was cleared");
+            untouched(r.state());
+          } finally {
+            stall.setMode("pass");
+            await killAndReap(stall.pids()).catch(() => undefined);
+          }
+        }, { gitleaksBin: stall.bin, ctlHooks: { scanDeadlineMs: 60_000, pathScanDeadlineMs: PATH_DEADLINE_MS }, log: logger });
+        if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+        assert.ok(elapsed >= PATH_DEADLINE_MS - 200 && elapsed < PATH_DEADLINE_MS + 10_000, `the seam returned ${elapsed}ms after starting`);
+        assert.ok(followUp.length > 0);
+        // A deadline expiry is not a stop: no aborted deferral, and nothing was published.
+        assert.ok(
+          !lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred"),
+          "a deadline expiry is not a deferral",
+        );
+        assert.deepEqual(out.tips, [], "nothing was published");
+        assert.deepEqual(out.violations, []);
+        // The stub executor returns after the remediate decision, so the run ends at finalize with the
+        // flagged commit still reachable: the done contract, as in the stop cases above.
+        assertPushSecretBlocked(out.claimRunId);
+      } finally {
+        await killAndReap(stall.pids()).catch(() => undefined);
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
     it("a boundary failure thrown after the stop is a deferral (aborted), not a rethrow", { timeout: 90_000 }, async () => {
       const { logger, lines } = recordingLogger();
       const out = await rig(4258_140, async (r) => {

@@ -279,6 +279,7 @@ import {
   classifyPlanningCaptureError,
   classifyGitStderr,
   newTrackingAttemptToken,
+  PATCH_SCAN_TIMEOUT_MS,
 } from "./git.js";
 import {
   buildCheckEnv,
@@ -3322,6 +3323,8 @@ export interface CheckpointTestHooks {
   midRunLockReconcileWaitMs?: number;
   /** The checkpoint secret-scan deadline (default CHECKPOINT_SCAN_TIMEOUT_MS, 60s). */
   scanDeadlineMs?: number;
+  /** The mid-run seam's path-scan (scanPatchForSecrets) deadline (default PATCH_SCAN_TIMEOUT_MS, 2min). */
+  pathScanDeadlineMs?: number;
   /** Override FLAGGED_COMMITS_CAP (the per-run flagged-commit list cap) so a test can reach overflow. */
   flaggedCommitsCap?: number;
   /** Observe the flight bookkeeping right after a confirmed PINNED publish. */
@@ -19788,6 +19791,10 @@ export class RunRunner {
     return this.checkpointTestHooks?.scanDeadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS;
   }
 
+  private pathScanDeadlineMs(): number {
+    return this.checkpointTestHooks?.pathScanDeadlineMs ?? PATCH_SCAN_TIMEOUT_MS;
+  }
+
   /**
    * issue #1597 M2 (review item 8) — does a lock file a cancelled tick RETAINED still exist? The
    * retention is sticky only while the file is there: a sibling run's momentary packed-refs.lock (or
@@ -20974,7 +20981,8 @@ export class RunRunner {
       recordSurvivors();
       recordLocks(await spawner.reconcileLocks());
     };
-    // A sub-scope aborted by the seam's stop and, for the range scan only, by the scan deadline.
+    // A sub-scope aborted by the seam's stop and by its own scan deadline (the range scan's, or the
+    // path scan's). A deadline expiry aborts only the scope's children; it is not a stop.
     const subScope = (deadlineMs?: number) =>
       <T>(fn: () => Promise<T>): Promise<T> => {
         const sub = new AbortController();
@@ -20992,7 +21000,7 @@ export class RunRunner {
     const scopes = {
       wait: { ...this.authorityWait(flight), signal: AbortSignal.any([this.retainedLifecycleSignal(flight), ac.signal]) },
       scanScope: <T>(fn: () => Promise<T>): Promise<T> => subScope(this.scanDeadlineMs())(fn),
-      pathScope: <T>(fn: () => Promise<T>): Promise<T> => subScope()(fn),
+      pathScope: <T>(fn: () => Promise<T>): Promise<T> => subScope(this.pathScanDeadlineMs())(fn),
     };
     try {
       return await this.git.withBoundaryProcessSpawner(
