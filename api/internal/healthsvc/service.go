@@ -307,6 +307,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkFleetRunDisk(ctx, now, workers),
 		s.checkFleetQuarantine(now, workers),
 		s.checkFleetMemoryAuthority(now, workers),
+		s.checkFleetHibernationWake(now, workers),
 		waiting,
 		s.checkQueueUndispatched(ctx, now),
 		controllerReport,

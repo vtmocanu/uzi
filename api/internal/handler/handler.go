@@ -1534,6 +1534,9 @@ func (h *Handler) mountControllerRoutes(r chi.Router) {
 		// drains before rolling; distinct from the display-only status report.
 		r.Post("/workers/{workerID}/drain", h.ControllerCordonWorker)
 		r.Post("/workers/{workerID}/dind-maintenance", h.ControllerDindMaintenance)
+		// Hibernation control-write (PRD #4205): the controller reports each step of a
+		// hibernate or wake operation, bound to the op id and validated by the state machine.
+		r.Post("/workers/{workerID}/hibernation", h.ControllerHibernation)
 		// Uncordon control-write (issue #458). Clears draining_since when drift was
 		// reverted so the worker resumes claiming; same path, different method.
 		r.Delete("/workers/{workerID}/drain", h.ControllerUncordonWorker)

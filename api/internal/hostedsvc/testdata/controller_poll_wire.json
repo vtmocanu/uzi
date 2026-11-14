@@ -71,7 +71,11 @@
       "ephemeral": true,
       "custody_held": false,
       "generation": 4,
-      "join_token": null
+      "join_token": null,
+      "hibernation": {
+        "state": "hibernated",
+        "op_id": "55555555-5555-5555-5555-555555555555"
+      }
     },
     {
       "id": "33333333-3333-3333-3333-333333333333",
@@ -98,7 +102,11 @@
       "ephemeral": false,
       "custody_held": false,
       "generation": 1,
-      "join_token": null
+      "join_token": null,
+      "hibernation": {
+        "state": "waking",
+        "op_id": "66666666-6666-6666-6666-666666666666"
+      }
     }
   ]
 }

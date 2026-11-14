@@ -44,6 +44,7 @@ func TestRepoAgentSourceRequiredStampedOnEveryRunInsert(t *testing.T) {
 		}
 		for _, block := range strings.Split(string(raw), "\n-- name: ")[1:] {
 			name := strings.Fields(block)[0]
+			block = expandPlacementFunction(t, block)
 			loc := insert.FindStringIndex(block)
 			if loc == nil {
 				continue
@@ -172,6 +173,7 @@ func TestRepoAgentSourceClaimClauseCountPinned(t *testing.T) {
 	got := map[string]int{}
 	for _, block := range strings.Split(string(raw), "\n-- name: ")[1:] {
 		name := strings.Fields(block)[0]
+		block = expandPlacementFunction(t, block)
 		n := len(clause.FindAllString(block, -1))
 		if n > 0 {
 			got[name] = n

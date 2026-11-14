@@ -103,6 +103,9 @@ func fenceMigrationCoverage(t *rollTick, frozen rollCoverage) {
 	t.migrationFences[migrationLane(frozen)] = true
 	t.uncertain[coverageKey(frozen)] = true
 	for _, e := range t.entries {
+		if e.hibernation {
+			continue
+		}
 		c := e.coverage
 		if c.Lane == "" {
 			c, _ = coverageOf(e.w, e.ns)
@@ -115,7 +118,7 @@ func fenceMigrationCoverage(t *rollTick, frozen rollCoverage) {
 
 func (m *Materializer) migrationCover(t *rollTick, candidate *rollEntry) bool {
 	for _, peer := range t.entries {
-		if peer == candidate || peer.ns != candidate.ns || t.pollDrained[peer.w.ID] || peer.w.DrainingSince != nil || peer.w.DrainingReason != nil ||
+		if peer == candidate || peer.hibernation || peer.ns != candidate.ns || t.pollDrained[peer.w.ID] || peer.w.DrainingSince != nil || peer.w.DrainingReason != nil ||
 			peer.blocked != "" || migrationLaneFenced(t, peer.coverage) || t.uncertain[coverageKey(peer.coverage)] ||
 			!covers(peer.w, candidate.coverage) || (peer.admitted && peer.drift) {
 			continue
@@ -166,7 +169,7 @@ func (m *Materializer) selectMigrationDrains(ctx context.Context, t *rollTick, d
 	// Fence the entire physical owner/lane, even across overlapping capability keys.
 	ordinaryUncertain := map[string]bool{}
 	for _, e := range t.entries {
-		if t.uncertain[coverageKey(e.coverage)] {
+		if !e.hibernation && t.uncertain[coverageKey(e.coverage)] {
 			ordinaryUncertain[migrationLane(e.coverage)] = true
 		}
 	}

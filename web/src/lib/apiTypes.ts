@@ -1378,6 +1378,10 @@ export interface AppSettings {
   // users can still individually opt in on the Workers page. Web-only surfacing — the
   // key already round-trips through GET/PUT /admin/settings.
   ephemeral_workers_enabled: string;
+  // Worker hibernation instance switch (PRD #4205): "true"/"false", default "false".
+  // Turning it off wakes every hibernated worker (at most 10 per pass); waking
+  // never depends on it. Optional so older responses and fixtures still type-check.
+  worker_hibernation_enabled?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
   // Per-owner custody admission limit: whole number 1..1000, default "8". Lowering it blocks future claims only.
@@ -2831,6 +2835,14 @@ export interface Worker {
   manual_cordoned_by_label?: string | null;
   manual_cordon_reason?: string | null;
   effective_cordoned?: boolean;
+  // Worker hibernation (PRD #4205), always sent. Check hibernation_state before
+  // upgrade_status or cordon state: a non-"none" worker reports upgrade_status "unknown" and
+  // is never outdated/rolling.
+  hibernation_state: "none" | "preparing" | "hibernated" | "waking";
+  hibernation_reason: string | null;
+  hibernated_at: string | null;
+  wake_requested_at: string | null;
+  wake_error: string | null;
   // Omitted when absent, invalid or older than the API's independent receipt TTL.
   roll_pacing?: WorkerRollPacing;
   id: string;
@@ -3074,6 +3086,13 @@ export interface Worker {
 
 /** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */
 export type BindMode = "default" | "pinned" | "auto";
+
+/** 200 body of POST /admin/workers/{id}/hibernate and /wake (PRD #4205). */
+export interface HibernationResult {
+  worker_id: string;
+  state: "none" | "preparing" | "hibernated" | "waking";
+  op_id?: string;
+}
 
 export interface AdminWorker extends Worker {
   owner_email: string;

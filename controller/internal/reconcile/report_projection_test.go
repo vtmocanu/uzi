@@ -80,6 +80,7 @@ func TestTickProjectsRollHealthOntoStatusWire(t *testing.T) {
         "reported_at": "2026-10-05T10:11:12.789Z",
 		"poll_interval_seconds": 37,
 		"worker_image_tag": "controller-target",
+		"hibernation": 1,
 		"workers": [
 			{
 				"id": "worker-stuck",
@@ -149,6 +150,7 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
         "reported_at": "2026-10-05T12:00:00Z",
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
+		"hibernation": 1,
 		"workers": [{
 			"id": "worker-transition",
 			"phase": "stuck",
@@ -180,6 +182,7 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
         "reported_at": "2026-10-05T12:00:23Z",
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
+		"hibernation": 1,
 		"workers": [{
 			"id": "worker-transition",
 			"phase": "settled",
@@ -203,6 +206,7 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
         "reported_at": "2026-10-05T12:00:46Z",
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
+		"hibernation": 1,
 		"workers": []
 	}`)
 }
@@ -263,4 +267,42 @@ func assertStatusWire(t *testing.T, reports <-chan capturedStatusWire, expected 
 	if !reflect.DeepEqual(actualJSON, expectedJSON) {
 		t.Fatalf("status JSON mismatch\ngot: %s\nwant: %s", got.body, expected)
 	}
+}
+
+// PRD #4205: a worker that is preparing to hibernate or hibernated has no pod on
+// purpose, so it gets no roll-health row from either loop (neither the observed-pod
+// loop nor the synthetic rolling-gap loop). A waking worker is reported normally.
+func TestTickOmitsRollHealthRowsForPreparingAndHibernatedWorkers(t *testing.T) {
+	client, reports := statusWireClient(t)
+	pacing := &protocol.Pacing{State: "waiting_evidence", TargetImage: "registry.example/uzi/agent-base:t"}
+	m := &pacingMaterializer{
+		fakeMaterializer: fakeMaterializer{observed: []ObservedWorker{
+			{ID: "w-prep", Roll: RollHealth{Phase: protocol.PhaseRolling}},
+			{ID: "w-wake", Roll: RollHealth{Phase: protocol.PhaseRolling, TargetImage: "img-wake"}},
+		}},
+		outcomes: map[string]*protocol.Pacing{"w-hib": pacing, "w-prep": pacing, "w-wake": pacing},
+	}
+	poller := &fakePoller{resp: protocol.PollResponse{Workers: []protocol.DesiredWorker{
+		{ID: "w-prep", Hibernation: &protocol.Hibernation{State: protocol.HibernationPreparing, OpID: "o1"}},
+		{ID: "w-hib", Hibernation: &protocol.Hibernation{State: protocol.HibernationHibernated, OpID: "o2"}},
+		{ID: "w-wake", Hibernation: &protocol.Hibernation{State: protocol.HibernationWaking, OpID: "o3"}},
+	}}}
+	l := New(poller, m, client, 10*time.Second, "tag", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	l.now = func() time.Time { return time.Date(2026, 10, 5, 10, 0, 0, 0, time.UTC) }
+	if err := l.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	assertStatusWire(t, reports, `{
+		"kind": "fleet",
+		"reported_at": "2026-10-05T10:00:00Z",
+		"poll_interval_seconds": 10,
+		"worker_image_tag": "tag",
+		"hibernation": 1,
+		"workers": [{
+			"id": "w-wake", "phase": "rolling", "phase_since": null, "target_image": "img-wake",
+			"pod_phase": "", "blocking_container": null, "blocking_reason": null,
+			"restart_count": 0, "last_exit_code": null,
+			"pacing": {"state": "waiting_evidence", "target_image": "registry.example/uzi/agent-base:t", "target_version": ""}
+		}]
+	}`)
 }

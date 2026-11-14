@@ -42,6 +42,7 @@ import { JudgeSettingsCard } from "./adminSettings/JudgeSettingsCard";
 import { CustodyHoldLimitCard } from "./adminSettings/CustodyHoldLimitCard";
 import { HostedWorkerQuotaCard } from "./adminSettings/HostedWorkerQuotaCard";
 import { EphemeralWorkersCard } from "./adminSettings/EphemeralWorkersCard";
+import { WorkerHibernationCard } from "./adminSettings/WorkerHibernationCard";
 import { UpdatesSettingsCard } from "./adminSettings/UpdatesSettingsCard";
 import { MaintenanceCard } from "./adminSettings/MaintenanceCard";
 import { SummarySettingsCard } from "./adminSettings/SummarySettingsCard";
@@ -308,6 +309,7 @@ export function AdminSettings() {
           { id: "review-bots", label: "Review bots" },
           { id: "hosted-worker-quota", label: "Hosted worker quota" },
           { id: "ephemeral-workers", label: "Ephemeral workers" },
+          { id: "worker-hibernation", label: "Worker hibernation" },
           { id: "capability-scheduling", label: "Capability scheduling" },
           { id: "completion-interlock", label: "Completion check" },
           { id: "fetch-caps", label: "Research fetch caps" },
@@ -611,6 +613,12 @@ export function AdminSettings() {
       {!loading && saved && (
         <section id="ephemeral-workers" className="scroll-mt-6">
           <EphemeralWorkersCard settings={saved} onSaved={applyResponse} />
+        </section>
+      )}
+
+      {!loading && saved && (
+        <section id="worker-hibernation" className="scroll-mt-6">
+          <WorkerHibernationCard settings={saved} onSaved={applyResponse} />
         </section>
       )}
 

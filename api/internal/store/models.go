@@ -331,8 +331,11 @@ type CodexRefreshIntent struct {
 }
 
 type ControllerReportStatus struct {
-	ID         int16              `json:"id"`
-	ObservedAt pgtype.Timestamptz `json:"observed_at"`
+	ID                      int16              `json:"id"`
+	ObservedAt              pgtype.Timestamptz `json:"observed_at"`
+	HibernationVersion      pgtype.Int4        `json:"hibernation_version"`
+	HibernationAdvertisedAt pgtype.Timestamptz `json:"hibernation_advertised_at"`
+	PollIntervalSeconds     pgtype.Int4        `json:"poll_interval_seconds"`
 }
 
 type CrossCheck struct {
@@ -529,6 +532,12 @@ type HealthEpisodeNotice struct {
 	EpisodeID  uuid.UUID          `json:"episode_id"`
 	UserID     uuid.UUID          `json:"user_id"`
 	NotifiedAt pgtype.Timestamptz `json:"notified_at"`
+}
+
+type HibernationWake struct {
+	RunID        uuid.UUID          `json:"run_id"`
+	WorkerID     uuid.UUID          `json:"worker_id"`
+	FirstWokenAt pgtype.Timestamptz `json:"first_woken_at"`
 }
 
 type HostedWorkerToken struct {
@@ -1992,6 +2001,20 @@ type Worker struct {
 	ManualCordonedBy           pgtype.UUID        `json:"manual_cordoned_by"`
 	ManualCordonedByLabel      pgtype.Text        `json:"manual_cordoned_by_label"`
 	ManualCordonReason         pgtype.Text        `json:"manual_cordon_reason"`
+	HibernationState           string             `json:"hibernation_state"`
+	HibernationOpID            pgtype.UUID        `json:"hibernation_op_id"`
+	HibernationRequestedAt     pgtype.Timestamptz `json:"hibernation_requested_at"`
+	HibernatedAt               pgtype.Timestamptz `json:"hibernated_at"`
+	WakeRequestedAt            pgtype.Timestamptz `json:"wake_requested_at"`
+	WakeError                  pgtype.Text        `json:"wake_error"`
+	HibernationReason          pgtype.Text        `json:"hibernation_reason"`
+	HibernationAdmissionPodUid pgtype.UUID        `json:"hibernation_admission_pod_uid"`
+	HibernationScalingDownAt   pgtype.Timestamptz `json:"hibernation_scaling_down_at"`
+	WakeReadyOpID              pgtype.UUID        `json:"wake_ready_op_id"`
+	WakeReadyPodUid            pgtype.UUID        `json:"wake_ready_pod_uid"`
+	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
+	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
+	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
 	CredentialSwitchApplyNonce pgtype.Text        `json:"credential_switch_apply_nonce"`
 }
 
@@ -2022,6 +2045,18 @@ type WorkerCordonEvent struct {
 	Action     string             `json:"action"`
 	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
 	Reason     pgtype.Text        `json:"reason"`
+}
+
+type WorkerHibernationEvent struct {
+	ID         uuid.UUID          `json:"id"`
+	OwnerID    uuid.UUID          `json:"owner_id"`
+	WorkerID   uuid.UUID          `json:"worker_id"`
+	ActorID    uuid.UUID          `json:"actor_id"`
+	ActorLabel string             `json:"actor_label"`
+	Action     string             `json:"action"`
+	OpID       uuid.UUID          `json:"op_id"`
+	Reason     pgtype.Text        `json:"reason"`
+	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
 }
 
 type WorkerPendingOutcomeIdentity struct {

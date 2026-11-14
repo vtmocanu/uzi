@@ -73,6 +73,11 @@ const mockApi = vi.mocked(api);
 
 function aWorker(over: Partial<Worker> = {}): Worker {
   return {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",

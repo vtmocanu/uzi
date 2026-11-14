@@ -76,7 +76,7 @@ func TestTickMergesFleetReportInSinglePOST(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := protocol.StatusReport{
-				Kind: "fleet", ReportedAt: now, PollIntervalSeconds: 37, WorkerImageTag: "target-tag",
+				Kind: "fleet", ReportedAt: now, PollIntervalSeconds: 37, WorkerImageTag: "target-tag", Hibernation: protocol.HibernationProtocolVersion,
 				Workers: []protocol.WorkerStatus{
 					{ID: "stuck", Phase: protocol.PhaseStuck, PhaseSince: &since, TargetImage: "old-image", PodPhase: "Pending", BlockingContainer: strPtr("seed-nix"), BlockingReason: strPtr("CrashLoopBackOff"), RestartCount: 7, LastExitCode: &exit, Pacing: m.outcomes["stuck"]},
 					{ID: "settled", Phase: protocol.PhaseSettled, TargetImage: "retained-image", PodPhase: "Running", Pacing: m.outcomes["settled"]},

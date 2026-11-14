@@ -48,5 +48,6 @@
       "restart_count": 0,
       "last_exit_code": null
     }
-  ]
+  ],
+  "hibernation": 1
 }

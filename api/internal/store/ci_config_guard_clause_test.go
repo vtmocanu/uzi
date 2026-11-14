@@ -8,7 +8,9 @@ import (
 )
 
 // TestCIConfigGuardClaimClauseCountPinned pins where the standalone ci_config_guard_v1 claim
-// clause (PRD #2865) lives in queries/runtime.sql: it must sit at every site that mirrors the
+// clause (PRD #2865) lives in queries/runtime.sql: ListUnplaceableQueuedRunsForEphemeral executes
+// its copy from fn_placement_admitting_workers (migration 00440), so expandPlacementFunction appends
+// that body to each call site before counting. It must sit at every site that mirrors the
 // completion_interlock_v1 claim clause for ordinary runs, and nowhere else. A new mirror of the
 // claim gate that forgets the clause (or a stray copy) changes this table. The live-DB tests in
 // workersvc prove the clause's behaviour at each site; this guards the set of sites.
@@ -26,6 +28,7 @@ func TestCIConfigGuardClaimClauseCountPinned(t *testing.T) {
 	interlocks := map[string]int{}
 	for _, block := range strings.Split(string(raw), "\n-- name: ")[1:] {
 		name := strings.Fields(block)[0]
+		block = expandPlacementFunction(t, block)
 		if n := len(clause.FindAllString(block, -1)); n > 0 {
 			got[name] = n
 		}

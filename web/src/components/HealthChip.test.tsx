@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
-// Issue #4166: the health chip is a link while everything passes and a popover trigger while
-// anything needs attention. The shared health hook is mocked with a mutable document so a
-// rerender stands in for the provider's next poll.
+// Issues #4166 and #4281: the health chip always opens the popover. The shared health hook is
+// mocked with a mutable document so a rerender stands in for the provider's next poll.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -29,6 +28,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   current = null;
   vi.clearAllMocks();
 });
@@ -112,15 +112,14 @@ describe("HealthChip popover", () => {
     expect(document.activeElement).toBe(chip());
   });
 
-  it("closes and focuses the link when the last attention item clears while open", () => {
+  it("keeps the panel open when the last attention item clears", () => {
     const view = mount(overviewNextDoc());
     fireEvent.click(chip());
     dialog();
     refresh(view, healthySilentDoc());
-    expect(screen.queryByRole("dialog")).toBeNull();
-    const link = screen.getByRole("link", { name: /^System health:/ });
-    expect(link.getAttribute("href")).toBe("/admin/health");
-    expect(document.activeElement).toBe(link);
+    expect(within(dialog()).getByText("System health: all 23 checks passing")).toBeTruthy();
+    expect(chip().getAttribute("aria-expanded")).toBe("true");
+    expect(screen.queryByRole("link", { name: /^System health:/ })).toBeNull();
   });
 
   it("does not steal focus when attention clears while closed", () => {
@@ -136,12 +135,80 @@ describe("HealthChip popover", () => {
   it("re-renders the open panel from a refreshed document", () => {
     const view = mount(overviewNextDoc());
     fireEvent.click(chip());
-    expect(within(dialog()).queryByText("Paused schedules")).toBeNull();
+    expect(within(dialog().querySelector<HTMLElement>("[data-health-attention-list]")!).queryByText("Paused schedules")).toBeNull();
     refresh(view, degradedDoc());
-    const d = dialog();
-    expect(within(d).getByText("CI watch capacity")).toBeTruthy();
-    expect(within(d).getByText("Paused schedules")).toBeTruthy();
-    expect(within(d).queryByText("Recovery storage")).toBeNull();
+    const attention = dialog().querySelector<HTMLElement>("[data-health-attention-list]")!;
+    expect(within(attention).getByText("CI watch capacity")).toBeTruthy();
+    expect(within(attention).getByText("Paused schedules")).toBeTruthy();
+    expect(within(attention).queryByText("Recovery storage")).toBeNull();
+  });
+
+  it("shows a collapsed passing-check disclosure beside attention, and omits it at zero", () => {
+    const doc = overviewNextDoc();
+    const view = mount(doc);
+    fireEvent.click(chip());
+    const summary = within(dialog()).getByText("22 other checks passing");
+    const disclosure = summary.closest("details")!;
+    expect(disclosure.open).toBe(false);
+    fireEvent.click(summary);
+    expect(disclosure.open).toBe(true);
+    expect(disclosure.querySelectorAll("[data-passing-check]")).toHaveLength(22);
+    expect(within(dialog()).getByText(doc.checks.find((c) => c.severity === "warn")!.title)).toBeTruthy();
+
+    const allWarn = healthySilentDoc();
+    for (const check of allWarn.checks) check.severity = "warn";
+    allWarn.counts = { ...allWarn.counts, ok: 0, warn: allWarn.checks.length };
+    allWarn.status = "warn";
+    refresh(view, allWarn);
+    expect(dialog().querySelector("details")).toBeNull();
+  });
+
+  it("keeps focus inside the open dialog when a live transition removes its focused item", () => {
+    const view = mount(overviewNextDoc());
+    fireEvent.click(chip());
+    const summary = within(dialog()).getByText("22 other checks passing");
+    (summary as HTMLElement).focus();
+    refresh(view, healthySilentDoc());
+    expect(document.activeElement).toBe(dialog());
+    const check = dialog().querySelector<HTMLElement>("[data-passing-check]")!;
+    // The names are deliberately outside the tab order. Simulate a programmatic focus on a
+    // soon-to-be-removed item to keep the defensive live-transition focus path covered.
+    check.tabIndex = -1;
+    check.focus();
+    refresh(view, overviewNextDoc());
+    expect(document.activeElement).toBe(dialog());
+  });
+
+  it("recovers focus when an attention refresh removes the passing-check disclosure", () => {
+    const doc = healthySilentDoc();
+    for (const check of doc.checks.slice(1)) check.severity = "warn";
+    doc.counts = { ...doc.counts, ok: 1, warn: doc.checks.length - 1 };
+    doc.status = "warn";
+    const view = mount(doc);
+    fireEvent.click(chip());
+    const summary = within(dialog()).getByText("1 other check passing");
+    summary.focus();
+    expect(document.activeElement).toBe(summary);
+
+    const next = {
+      ...doc,
+      checks: doc.checks.map((check) => ({ ...check, severity: "warn" as const })),
+      counts: { ...doc.counts, ok: 0, warn: doc.checks.length },
+    };
+    refresh(view, next);
+    expect(dialog().querySelector("details")).toBeNull();
+    expect(document.activeElement).toBe(dialog());
+  });
+
+  it("does not steal outside focus on a live pass/warn transition", () => {
+    render(<button type="button">elsewhere</button>);
+    const view = mount(overviewNextDoc());
+    fireEvent.click(chip());
+    const other = screen.getByRole("button", { name: "elsewhere" });
+    other.focus();
+    refresh(view, healthySilentDoc());
+    expect(document.activeElement).toBe(other);
+    expect(within(dialog()).getByText("System health: all 23 checks passing")).toBeTruthy();
   });
 
   it("lists every attention check while the Overview card caps at three", () => {
@@ -152,7 +219,7 @@ describe("HealthChip popover", () => {
     doc.counts = { ...doc.counts, ok: doc.counts.ok - 5, warn: 5 };
     mount(doc);
     fireEvent.click(chip());
-    expect(within(dialog()).getAllByRole("listitem")).toHaveLength(5);
+    expect(within(dialog().querySelector<HTMLElement>("[data-health-attention-list]")!).getAllByRole("listitem")).toHaveLength(5);
     cleanup();
     current = doc;
     render(
@@ -211,12 +278,62 @@ describe("HealthChip popover", () => {
 });
 
 describe("HealthChip when nothing needs attention", () => {
-  it("is a plain link with no popover semantics", () => {
-    mount(healthySilentDoc());
-    const link = screen.getByRole("link", { name: /^System health:/ });
-    expect(link.getAttribute("href")).toBe("/admin/health");
-    expect(link.hasAttribute("aria-expanded")).toBe(false);
-    expect(screen.queryByRole("button")).toBeNull();
+  it("opens a passing panel with every applicable check and the Open health link", () => {
+    const doc = healthySilentDoc();
+    mount(doc);
+    const trigger = chip();
+    expect(trigger.getAttribute("aria-haspopup")).toBe("dialog");
+    fireEvent.click(trigger);
+    const panel = dialog();
+    expect(within(panel).getByText("System health: all 23 checks passing")).toBeTruthy();
+    expect(panel.querySelectorAll("[data-passing-check]")).toHaveLength(doc.counts.ok);
+    expect(within(panel).getByRole("link", { name: "Open health" }).getAttribute("href")).toBe("/admin/health");
+    expect(within(panel).getByRole("region", { name: "Workers" })).toBeTruthy();
+    expect(within(panel).getByRole("region", { name: "Releases and pricing" })).toBeTruthy();
+    expect(within(panel).queryByRole("region", { name: "Other" })).toBeNull();
+  });
+
+  it("omits na checks, names their count, and groups a future check under Other", () => {
+    const doc = healthySilentDoc();
+    doc.checks[0].severity = "na";
+    doc.checks.push({ ...doc.checks[1], id: "future.check", title: "Future check" });
+    doc.counts = { ...doc.counts, na: 1 };
+    mount(doc);
+    fireEvent.click(chip());
+    const panel = dialog();
+    expect(panel.querySelectorAll("[data-passing-check]")).toHaveLength(23);
+    expect(within(panel).queryByText("Worker image roll")).toBeNull();
+    expect(within(panel).getByText("1 not applicable")).toBeTruthy();
+    expect(within(within(panel).getByRole("region", { name: "Other" })).getByText("Future check")).toBeTruthy();
+  });
+
+  it("ages the checked time without a new health document and omits an invalid time", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-13T12:00:05Z"));
+    const doc = healthySilentDoc();
+    doc.checked_at = "2026-11-13T12:00:00Z";
+    const view = mount(doc);
+    fireEvent.click(chip());
+    expect(dialog().textContent).toContain("checked 5s ago");
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(dialog().textContent).toContain("checked 15s ago");
+    doc.checked_at = "invalid";
+    refresh(view, { ...doc });
+    expect(dialog().textContent).not.toContain("checked");
+  });
+
+  it("strips bidi and control characters from the actual summary title attribute", () => {
+    const doc = healthySilentDoc();
+    doc.checks[0].summary = "safe\u202E\u0001 summary";
+    mount(doc);
+    fireEvent.click(chip());
+    const item = within(dialog()).getByText(doc.checks[0].title);
+    expect(item.getAttribute("title")).toBe("safe summary");
+    expect(item.hasAttribute("tabindex")).toBe(false);
+    const srSummary = item.closest("li")!.querySelector(".sr-only")!;
+    expect(srSummary.textContent).toBe(": safe summary");
+    expect(item.getAttribute("title")).not.toContain("\u202E");
+    expect(item.getAttribute("title")).not.toContain("\u0001");
   });
 
   it("renders nothing without a document", () => {

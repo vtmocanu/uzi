@@ -599,6 +599,8 @@ func run() error {
 	// profile-bound run says provisioning is off, rather than waiting on a lane worker that the
 	// provisioner will never create.
 	wsvc.SetEphemeralSettings(settingsCache)
+	// Worker hibernation kill-switch (PRD #4205): admission and the disable-wake pass read it.
+	wsvc.SetHibernationSettings(settingsCache)
 	// Issue #1965: a profile-bound run on a deployment without the lane says so instead of waiting.
 	wsvc.SetIsolatedLaneEnabled(cfg.IsolatedLaneEnabled())
 	// PRD #2006: lease entry on a worker-reported terminal and lease-arm claims (0 disables).
@@ -807,6 +809,17 @@ func run() error {
 		Lease: cfg.EphemeralLease,
 	})
 
+	// PRD #4205 M5: the demand-wake pass. Shares the claim knobs ClaimRun uses so its demand query
+	// agrees with what a woken worker could claim.
+	hibernationWaker := hostedsvc.NewHibernationWaker(q, wsvc, settingsCache, hostedsvc.HibernationWakerConfig{
+		WorkerAffinityGrace:     cfg.WorkerAffinityGrace,
+		WorkerStaleRequeueGrace: cfg.WorkerStaleRequeueGrace,
+		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
+		WorkerHeartbeatStale:    cfg.WorkerHeartbeatStale,
+		BackgroundGrace:         cfg.WorkerBackgroundGrace,
+		Lease:                   cfg.EphemeralLease,
+	})
+
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,
 		sweeper.Pass{
 			Name: "vault_browser_slots_expired",
@@ -891,6 +904,21 @@ func run() error {
 		// and concurrency-safe. Rides this ticker like the passes above rather than a
 		// goroutine of its own. Flag-off footprint is one settings read: the pass returns
 		// immediately unless the instance kill-switch (ephemeral_workers_enabled) is on.
+		// Worker hibernation settle pass (PRD #4205): withdraws overdue preparations, paces
+		// wakes after the setting is switched off, settles waking workers and flags an
+		// unconfirmed wake. Unconditional: waking a sleeper never depends on the setting.
+		sweeper.Pass{
+			Name: "worker_hibernation_settle",
+			Run:  wsvc.HibernationSettlePass,
+		},
+		// Hibernation demand wake (PRD #4205 M5): wakes a sleeping worker for a queued run no online
+		// worker can claim. It MUST run BEFORE ephemeral_workers_provision so sleeping capacity is
+		// used first and provisioning sees the recorded wake that suppresses a duplicate worker.
+		// Unconditional: it runs whatever ephemeral_workers_enabled and worker_hibernation_enabled say.
+		sweeper.Pass{
+			Name: "worker_hibernation_wake",
+			Run:  hibernationWaker.WakePass,
+		},
 		sweeper.Pass{
 			Name: "ephemeral_workers_provision",
 			Run:  ephemeralProv.ProvisionPass,

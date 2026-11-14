@@ -312,6 +312,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		o.DeploymentUID = string(d.UID)
 		o.DeploymentResourceVersion = d.ResourceVersion
 		o.DeploymentTerminating = d.DeletionTimestamp != nil
+		applyDeploymentHibernationEvidence(o, d)
 		for _, c := range d.Status.Conditions {
 			if c.Type == appsv1.DeploymentReplicaFailure && c.Status == corev1.ConditionTrue {
 				capacityEvidence.blocked[id] = true
@@ -376,7 +377,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			}
 		case nixPVCName(id):
 			o.HasNixPVC = true // exists-in-ANY-state (UNCHANGED)
-			if !terminating {  // never source size or mint time from a Terminating PVC
+			nixClaim := claimObservationOf(ns, id, p)
+			o.NixClaim = &nixClaim // any state, Terminating included
+			if !terminating {      // never source size or mint time from a Terminating PVC
 				sz := p.Spec.Resources.Requests[corev1.ResourceStorage]
 				o.NixPVCSize = &sz // live nix size; nil while absent OR Terminating
 				t := p.CreationTimestamp.Time
@@ -409,7 +412,8 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// Unselected, for the same reason as the two lists above: a label selector would
 	// make the unmanaged-pod check below structurally blind to exactly what it looks
 	// for. Pods inherit the pod template's labels, so IsOurs works on them unchanged.
-	// Pod-list failure preserves legacy provisioning and reporting behaviour.
+	// Pod-list failure preserves legacy provisioning and reporting behaviour, except that
+	// a hibernation wake is held (hibernateWake) until a list succeeds.
 	// PodsKnown stays false. Fenced DinD maintenance rechecks pods through
 	// maintenanceObservation and waits on any read failure.
 	pods, err := m.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
@@ -430,15 +434,10 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		}
 		byWorker[id] = append(byWorker[id], *p)
 		capacityEvidence.pods[id] = append(capacityEvidence.pods[id], *p)
-		o := get(id)
-		o.WorkerPodCount++
-		if p.DeletionTimestamp == nil && p.UID != "" && p.Annotations[AnnotationSpecHash] == o.SpecHash {
-			for _, c := range p.Status.Conditions {
-				if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-					o.ReadyPodUID = string(p.UID)
-				}
-			}
-		}
+		get(id) // a pod-only worker still enters the observed set
+	}
+	for id, ps := range byWorker {
+		applyPodEvidence(get(id), ps)
 	}
 	for _, o := range byID {
 		if o.Namespace == ns {
@@ -651,6 +650,16 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 	for _, w := range order {
 		obs := observedByID[w.ID]
 		e := tick.entries[w.ID]
+		if e != nil && e.hibernation {
+			// A hibernating worker is outside every roll pool, so the coverage
+			// uncertainty and admission gates below say nothing about it: its own
+			// conditioned writes carry the safety. It still reads its snapshot evidence
+			// through rollFrom.
+			if err := m.reconcileWorker(ctx, w, e.o); err != nil {
+				errs = append(errs, fmt.Errorf("worker %s: %w", w.ID, err))
+			}
+			continue
+		}
 		if e != nil {
 			key := coverageKey(e.coverage)
 			if uncertain[key] || migrationLaneFenced(tick, e.coverage) {
@@ -880,6 +889,35 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	return errors.Join(errs...)
 }
 
+// ensurePVCs creates each of the worker's claims the observation says is missing,
+// treating AlreadyExists as success. It never deletes or resizes anything.
+func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) error {
+	for _, pvc := range RenderPVCs(m.cfg, w, spec) {
+		switch pvc.Name {
+		case dataPVCName(w.ID):
+			if obs.HasDataPVC {
+				continue
+			}
+		case nixPVCName(w.ID):
+			if obs.HasNixPVC {
+				continue
+			}
+		case dindDataPVCName(w.ID):
+			if obs.HasDinDDataPVC {
+				continue
+			}
+		}
+		created, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create pvc %s: %w", pvc.Name, err)
+		}
+		if err == nil && pvc.Name == dindDataPVCName(w.ID) {
+			m.recordEpochMint(ctx, w.ID, created)
+		}
+	}
+	return nil
+}
+
 // withinRecycleCooldown reports whether the worker's disk volumes were minted too
 // recently to recycle again (PRD #837 M4). It takes the YOUNGEST CreationTimestamp of
 // the target volumes: a recent mint of EITHER means a recent recycle, and using the
@@ -959,6 +997,24 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		}
 	}
 
+	// Hibernation (PRD #4205) owns the worker entirely while its desired state is set:
+	// it must run before DinD maintenance and both recycle arms below, none of which
+	// may scale a parked worker or delete its volumes. The claims are still created if
+	// missing, and the Secret above is never touched.
+	if w.Hibernation != nil {
+		if err := m.ensurePVCs(ctx, w, obs, ns, spec); err != nil {
+			return err
+		}
+		// A worker with no Deployment is placed only over claims live at the render
+		// size (deploymentPlacementBlocked), so an undersized retained claim must be
+		// grown in place first. Size-only and upward: no claim is ever deleted or
+		// recycled on a hibernation path.
+		if legacy && !obs.HasDeployment {
+			m.expandClaimsFor(ctx, w, obs, ns, spec, true)
+		}
+		return m.reconcileHibernation(ctx, w, obs, ns, spec)
+	}
+
 	// Deferring durable data recycling does not defer DinD maintenance.
 	// Reconcile has already logged the deferral before image admission.
 	dockerDataPressure := legacy && m.recycle.Enabled && !w.Ephemeral && !w.CustodyHeld &&
@@ -1025,28 +1081,8 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// The dind data root (issue #224 M-a) is a THIRD claim, and only for a docker worker:
 	// RenderPVCs emits it only when w.Docker, so this loop never sees it for a plain one
 	// and its gate cannot mis-fire there.
-	for _, pvc := range RenderPVCs(m.cfg, w, spec) {
-		switch pvc.Name {
-		case dataPVCName(w.ID):
-			if obs.HasDataPVC {
-				continue
-			}
-		case nixPVCName(w.ID):
-			if obs.HasNixPVC {
-				continue
-			}
-		case dindDataPVCName(w.ID):
-			if obs.HasDinDDataPVC {
-				continue
-			}
-		}
-		created, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create pvc %s: %w", pvc.Name, err)
-		}
-		if err == nil && pvc.Name == dindDataPVCName(w.ID) {
-			m.recordEpochMint(ctx, w.ID, created)
-		}
+	if err := m.ensurePVCs(ctx, w, obs, ns, spec); err != nil {
+		return err
 	}
 
 	// Size-only PVC expansion (issue #3890): never touches the Deployment, the pod
@@ -1081,10 +1117,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		// suppresses the recreate — /data has no size, so its liveness is the gate. dataBlocking
 		// is false when /data is ABSENT (first-provision) or LIVE (steady state), so neither is
 		// affected; it fires only for a present-but-Terminating /data volume.
-		nixLiveAtSize := obs.NixPVCSize != nil && obs.NixPVCSize.Cmp(spec.NixSize) >= 0
-		dataBlocking := obs.HasDataPVC && !obs.DataPVCLive // present but Terminating
-		dindBlocking := w.Docker && obs.HasDinDDataPVC && !obs.DinDPVCLive
-		if (obs.HasNixPVC && !nixLiveAtSize) || dataBlocking || dindBlocking {
+		if deploymentPlacementBlocked(w, obs, spec) {
 			return nil
 		}
 		_, err := m.client.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{})
@@ -1215,6 +1248,12 @@ func (m *Materializer) withOperatorMetadata(meta map[string]any) map[string]any 
 // workers.tolerations); see templateForMergePatch. liveSelector is the observed
 // template's selector.
 func patchFor(dep *appsv1.Deployment, liveSelector map[string]string) ([]byte, error) {
+	return patchForWithAnnotations(dep, liveSelector, nil)
+}
+
+// patchForWithAnnotations is patchFor that also sets Deployment-object annotations
+// (metadata, not the pod template) in the same conditioned write.
+func patchForWithAnnotations(dep *appsv1.Deployment, liveSelector map[string]string, annotations map[string]string) ([]byte, error) {
 	tmpl, err := templateForMergePatch(dep.Spec.Template, liveSelector)
 	if err != nil {
 		return nil, err
@@ -1222,10 +1261,18 @@ func patchFor(dep *appsv1.Deployment, liveSelector map[string]string) ([]byte, e
 	meta := map[string]any{"uid": dep.UID, "resourceVersion": dep.ResourceVersion}
 	// The operator's Deployment metadata reaches an existing worker on its next drift
 	// roll. A merge patch adds and updates keys; one dropped from the values stays until
-	// the worker is reprovisioned.
+	// the worker is reprovisioned. The caller's annotations (the hibernation op) are
+	// written in the same conditioned patch and win over a same-named operator key.
 	meta["labels"] = dep.Labels
-	if len(dep.Annotations) > 0 {
-		meta["annotations"] = dep.Annotations
+	merged := make(map[string]string, len(dep.Annotations)+len(annotations))
+	for k, v := range dep.Annotations {
+		merged[k] = v
+	}
+	for k, v := range annotations {
+		merged[k] = v
+	}
+	if len(merged) > 0 {
+		meta["annotations"] = merged
 	}
 	patch := map[string]any{
 		"metadata": meta,

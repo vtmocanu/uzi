@@ -220,6 +220,9 @@ var limiterNames = [...]string{
 // owner-or-admin read like /review), making it 389 rows. Issue #3811 adds the two owner-only
 // cross-check history reads, making it 391 rows. The earlier history figures above were not re-tallied.
 // Issue #3251 adds POST /api/worker/runs/{id}/codex-catalog-default (noLimiter, like lead-config).
+// PRD #4205 adds POST /api/admin/workers/{id}/hibernate, POST /api/admin/workers/{id}/wake and
+// POST /api/controller/workers/{workerID}/hibernation (all noLimiter), making the table 411 rows
+// (len(wantRouteMounts) at that change).
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -743,6 +746,9 @@ var wantRouteMounts = []routeMount{
 	// limiter — like the poll and status routes above.
 	{"POST", "/api/controller/workers/{workerID}/drain", noLimiter},
 	{"POST", "/api/controller/workers/{workerID}/dind-maintenance", noLimiter},
+	// PRD #4205: controller hibernation report. Fleet-scoped controller-only route behind
+	// RequireController, no per-user credential, so no per-user limiter — like /drain above.
+	{"POST", "/api/controller/workers/{workerID}/hibernation", noLimiter},
 	// Controller uncordon control-write (issue #458): same fleet-scoped controller-only
 	// route (same path, DELETE) behind RequireController, so no per-user limiter either.
 	{"DELETE", "/api/controller/workers/{workerID}/drain", noLimiter},
@@ -1007,6 +1013,11 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/admin/judge/recommendations/disposition", noLimiter},
 	{"PUT", "/api/admin/settings", noLimiter},
 	{"PUT", "/api/admin/maintenance", noLimiter},
+	// PRD #4205: admin hibernate/wake — cookie-only admin DB state transitions
+	// (wsvc.HibernateWorker/WakeWorker), no forge/kube call and no token spend; the controller
+	// acts later via its poll → noLimiter, like PUT /api/admin/maintenance.
+	{"POST", "/api/admin/workers/{id}/hibernate", noLimiter},
+	{"POST", "/api/admin/workers/{id}/wake", noLimiter},
 	{"PUT", "/api/admin/users/{id}/ci-autofix", noLimiter},
 	// PRD #1976 M1: allow one site list for a product — a cookie-only admin DB write → noLimiter.
 	{"PUT", "/api/admin/products/{id}/egress-profiles/{name}", noLimiter},

@@ -222,6 +222,10 @@ type UpgradeInput struct {
 	// process start is a free proxy for "a release just happened" and needs no column.
 	Now          time.Time
 	APIStartedAt time.Time
+	// Hibernation is workers.hibernation_state ("", "none", "preparing", "hibernated",
+	// "waking"). Any value but ""/"none" takes precedence over every roll and version
+	// row: a hibernating worker is not outdated, upgrading or rolling (PRD #4205).
+	Hibernation string
 }
 
 // UpgradeParams are the durations the table compares against. Named fields following
@@ -370,6 +374,12 @@ func ClassifyUpgradeWithTarget(in UpgradeInput, p UpgradeParams) (status, detail
 
 func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail string, resolvedTarget string) {
 	p = p.withDefaults()
+	if IsPodless(in.Hibernation) {
+		// Precedence: any non-none hibernation state first, waking included. "unknown" raises
+		// no upgrade alert, and the detail names the state; the DTO carries hibernation_state
+		// for display surfaces. A wake that fails is reported by fleet.hibernation_wake.
+		return UpgradeStatusUnknown, "worker is " + hibernationLabel(in.Hibernation), in.CPVersion
+	}
 	hosted := in.Kind == "hosted"
 	s := in.Signal
 
@@ -468,6 +478,21 @@ func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail
 		return UpgradeStatusUpgrading, "roll in progress (unconfirmed — no controller signal)", target
 	}
 	return status, detail, target
+}
+
+// IsPodless reports whether a workers.hibernation_state value means the worker is outside the
+// roll and version machinery: preparing (being scaled down), hibernated, or waking (its pod is
+// still coming up, so it has no settled version to check). A failed wake is reported by
+// fleet.hibernation_wake, not by the roll or upgrade classifiers.
+func IsPodless(state string) bool {
+	return state != "" && state != "none"
+}
+
+func hibernationLabel(state string) string {
+	if state == "preparing" {
+		return "hibernating"
+	}
+	return state
 }
 
 // isBehind reports whether reported is a usable version strictly below target. Used by

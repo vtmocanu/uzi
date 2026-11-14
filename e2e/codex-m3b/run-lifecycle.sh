@@ -38,7 +38,7 @@
 #   UZI_M3B_SKIP_BUILD   set to 1 to reuse an existing worker image (skip docker build)
 #   UZI_M3B_BUILD_NETWORK optional build-step network: default, host, or none (runtime unchanged)
 #   UZI_M3B_TEST_TIMEOUT outer watchdog seconds            (default: 600 offline, 1200 live)
-#   CDR_M3B_PG_IMAGE     throwaway Postgres image          (default: postgres:17)
+#   CDR_M3B_PG_IMAGE     throwaway Postgres image          (default: shared pinned PostgreSQL image)
 #   CDR_M3B_API_PORT     port the api container binds/advertises (default: 8080)
 #   UZI_CODEX_PROOF_STRICT  set to 1 to also fail on any skipped, todo or missing test (offline
 #                        only): node --test passes a skipped test or describe with rc 0, so the
@@ -61,7 +61,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 IMAGE="${UZI_M3B_IMAGE:-uzi-agent-m3b:base}"
 DOCKERFILE="${UZI_M3B_DOCKERFILE:-agent/templates/base/Dockerfile}"
 TIMEOUT="${UZI_M3B_TEST_TIMEOUT:-600}"
-PG_IMAGE="${CDR_M3B_PG_IMAGE:-postgres:17}"
+PG_IMAGE="${CDR_M3B_PG_IMAGE:-postgres:17@sha256:846a7ddaa67a4b354ae1d21087b683901aa6113a4ed626d3787cfbf6c85e3e07}"
 API_PORT="${CDR_M3B_API_PORT:-8080}"
 BUILD_NETWORK="${UZI_M3B_BUILD_NETWORK:-}"
 BUILD_NETWORK_ARGS=()

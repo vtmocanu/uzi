@@ -1,15 +1,17 @@
 import { needsAttention } from "../../components/WorkerUpgradeBadge";
-import type { BindMode, Worker } from "../../lib/api";
+import type { BindMode, HibernationResult, Worker } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { healthyFleetWorkers, incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
 import { overviewNextOwnerWorkers } from "../data/overviewNext";
 import { minsAgo } from "../data/time";
-import { delay, mockScenario, requireSession } from "./shared";
+import { delay, mockScenario, requireAdmin, requireSession } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): setWorkerBindMode
 // resolves a token label against the secrets roster, and secrets' deleteAnthropicTokenById
 // unbinds workers pinned to a deleted token. Both reads are inside function bodies and no
 // module-level initializer crosses the modules, so the cycle cannot throw at import.
 import { secrets } from "./secrets";
+// workers ↔ settings is a third cycle: hibernate reads the instance switch inside its body only.
+import { appSettings } from "./settings";
 // runs ↔ workers is a second import cycle (runs → secrets → workers); deleteWorker reads
 // runsApi only inside its body, so no module-level initializer crosses the modules.
 import { runsApi } from "./runs";
@@ -45,13 +47,22 @@ function ownerWorkers(): Worker[] {
   return workers;
 }
 
+// Hibernation transitions made through the mock admin routes, keyed by worker id.
+type HibernationFields = Pick<Worker, "hibernation_state" | "hibernation_reason" | "hibernated_at" | "wake_requested_at" | "wake_error">;
+const hibernationStates = new Map<string, HibernationFields>();
+
 function projectedWorker<T extends Worker>(w: T): T {
+  const hib = hibernationStates.get(w.id);
+  const base = hib
+    ? { ...w, ...hib, effective_cordoned: hib.hibernation_state !== "none" ? true : w.effective_cordoned }
+    : w;
   const manual = manualStates.get(w.id);
-  if (!manual) return { ...w };
+  if (!manual) return { ...base };
   const { priorEffective, ...tuple } = manual;
   return {
-    ...w, ...tuple,
-    effective_cordoned: !!tuple.manual_cordoned_at || !!w.draining_since || priorEffective,
+    ...base, ...tuple,
+    effective_cordoned: !!tuple.manual_cordoned_at || !!w.draining_since || priorEffective ||
+      (hib?.hibernation_state ?? w.hibernation_state) !== "none",
   };
 }
 
@@ -153,7 +164,48 @@ function changeManualCordon(id: string, cordon: boolean, reason?: string): { wor
   return { worker: projectedWorker(source) };
 }
 
+function hibernationRefusal(code: string): ApiError {
+  return new ApiError(409, "worker cannot be hibernated", { error: "worker cannot be hibernated", reason_code: code });
+}
+
+// Mirrors the api's admin hibernate/wake routes. Hibernate settles straight to "hibernated"
+// (the controller's scale-down is not modelled); wake settles to "waking".
+function changeHibernation(id: string, hibernate: boolean, reason?: string): HibernationResult {
+  requireAdmin();
+  const source = [...ownerWorkers(), ...mockAdminWorkers].find((w) => w.id === id);
+  if (!source) throw new ApiError(404, "no such worker");
+  const current = projectedWorker(source);
+  const opId = `op-${id}-${Date.now()}`;
+  if (hibernate) {
+    if (appSettings.worker_hibernation_enabled !== "true") throw hibernationRefusal("setting_off");
+    if (current.kind !== "hosted" || current.ephemeral) throw hibernationRefusal("not_persistent_hosted");
+    if (current.hibernation_state !== "none") throw hibernationRefusal("already_hibernating");
+    if (current.busy || current.active_runs > 0) throw hibernationRefusal("busy");
+    hibernationStates.set(id, {
+      hibernation_state: "hibernated",
+      hibernation_reason: manualText(reason ?? "", 200) || null,
+      hibernated_at: new Date().toISOString(),
+      wake_requested_at: null,
+      wake_error: null,
+    });
+    return { worker_id: id, state: "hibernated", op_id: opId };
+  }
+  if (current.hibernation_state === "none") {
+    throw new ApiError(409, "worker is not hibernating", { error: "worker is not hibernating", reason_code: "not_hibernating" });
+  }
+  hibernationStates.set(id, {
+    hibernation_state: "waking",
+    hibernation_reason: current.hibernation_reason,
+    hibernated_at: current.hibernated_at,
+    wake_requested_at: new Date().toISOString(),
+    wake_error: null,
+  });
+  return { worker_id: id, state: "waking", op_id: opId };
+}
+
 export const workersApi = {
+  adminHibernateWorker: async (id: string, reason?: string) => delay(changeHibernation(id, true, reason)),
+  adminWakeWorker: async (id: string, reason?: string) => delay(changeHibernation(id, false, reason)),
   // PRD #113 M6. Computed LIVE from the demo worker list rather than hardcoded, so the
   // badge actually clears when a worker is deleted — web-ux needs to see it appear AND
   // clear, and a constant would only ever show the first half.
@@ -223,6 +275,11 @@ export const workersApi = {
       anthropic_secret_label: null,
       anthropic_bind_mode: "default" as const,
       draining_since: null,
+      hibernation_state: "none" as const,
+      hibernation_reason: null,
+      hibernated_at: null,
+      wake_requested_at: null,
+      wake_error: null,
     };
     workers.push(w);
     const token = `uzi_wk_${Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join("")}`;
@@ -356,6 +413,11 @@ export const workersApi = {
       anthropic_secret_label: null,
       anthropic_bind_mode: "default" as const,
       draining_since: null,
+      hibernation_state: "none" as const,
+      hibernation_reason: null,
+      hibernated_at: null,
+      wake_requested_at: null,
+      wake_error: null,
     };
     workers.push(w);
     // { worker } and NOTHING ELSE. Do not mint a token here the way createWorker does

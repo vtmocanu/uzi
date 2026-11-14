@@ -6,8 +6,8 @@ audience: operator
 
 # Admin health
 
-Admin health ([PRD #1484](../prds/done/1484-admin-health-tab.md)) is a read-only,
-admin-only diagnostic of what uzi itself can tell about its own ability to run
+Admin health ([PRD #1484](../prds/done/1484-admin-health-tab.md)) is an admin-only
+diagnostic of what uzi itself can tell about its own ability to run
 work: worker rolls and capacity, the queue, the controller's own liveness,
 background loops, the database, integrations, and a handful of housekeeping
 signals. It exists because, before this, an admin had no instance-level way to
@@ -31,7 +31,11 @@ It surfaces six ways:
     default, showing a chip per check; a check that needs attention links up
     to its item, and expanding a group lists each check's own summary;
   - **Fleet, all users**: a cross-user table (owner, worker, status, version,
-    upgrade, blocking reason, last seen).
+    upgrade, blocking reason, last seen). It is read-only except for the
+    worker [hibernation](./hosted-workers.md#hibernation) controls: a
+    Hibernate button on an idle persistent hosted worker, a Wake button on a
+    hibernating, hibernated or waking one, a status chip for each of those
+    states, and the last wake failure. A refused hibernate shows its reason.
 
   The sidebar Admin nav item and the tab itself carry a count pill when
   anything needs attention, red when any check is danger and amber
@@ -58,8 +62,8 @@ It surfaces six ways:
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
   admin, selects checks with server-supplied `scope: instance` and severity
   `danger`. The current instance checks are `db`, `db.size`, `controller.report`,
-  `loops`, `fleet.roll`, `agentsource.update` and `pricing.codex`; the rest are
-  `owner`. `fleet.roll` remains instance infrastructure even when the hosted
+  `loops`, `fleet.roll`, `fleet.hibernation_wake`, `maintenance.active`,
+  `agentsource.update` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains instance infrastructure even when the hosted
   workers belong to a single owner.
 
   Episodes follow `blocking`: the opening evaluation sends nothing, and the
@@ -196,6 +200,7 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
 | `fleet.quarantine` | Whether any worker has latched a [residue quarantine](worker-setup.md#quarantined-worker) (an unreadable, unattributed runner-uid process was found, so it claims nothing until its container restarts) | any worker with a fresh heartbeat reports a quarantine; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it latched and the run that detected it (the worker's reported cause is not shown here: read `residue_quarantine_cause` in `uzi admin workers --json` or the worker view in `uzi tui`) | — | — |
 | `fleet.memory_authority` | Whether any worker has lost [memory authority](worker-setup.md#lost-memory-authority) (the api withholds guard-bound runs from it until its container restarts) | any worker with a fresh heartbeat has a gated claim recorded; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it was first gated | — | — |
+| `fleet.hibernation_wake` | Whether a [hibernated worker's wake](hosted-workers.md#hibernation) failed or is not confirmed (scope `instance`) | a wake failed, or is not confirmed within 15 minutes; the evidence names at most 10 workers (the first evidence row, `Workers`, carries the full count) | — | — |
 
 `fleet.quarantine` reads the worker's own heartbeat report, which the api keeps in
 memory only. A worker without a fresh heartbeat is skipped (`fleet.capacity`

@@ -8,7 +8,8 @@ import type { Worker } from "../lib/api";
 import { WorkerStatLine, hasStats } from "./WorkerStats";
 import { WorkerCordonBadge } from "./WorkerCordonBadge";
 import { WorkerRunBadge } from "./WorkerRunBadge";
-import { Badge, Card, SectionTitle } from "./ui";
+import { WorkerStatusBadge } from "./WorkerStatusBadge";
+import { Card, SectionTitle } from "./ui";
 
 export function WorkerLoadCard({ workers }: { workers: Worker[] }) {
   if (!workers.some(hasStats)) return null;
@@ -26,9 +27,7 @@ export function WorkerLoadCard({ workers }: { workers: Worker[] }) {
           .map((w) => (
             <li key={w.id} className="flex items-center justify-between gap-3 py-2">
               <div className="flex min-w-0 items-center gap-2">
-                <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
-                  {w.status}
-                </Badge>
+                <WorkerStatusBadge worker={w} />
                 <WorkerCordonBadge worker={w} />
                 <WorkerRunBadge worker={w} hideIdleCrossChecks />
                 <span className="truncate text-sm font-medium text-fg">{w.name}</span>

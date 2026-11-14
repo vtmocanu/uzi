@@ -8,7 +8,7 @@ import { isTerminalRun, type RunSummaryItem } from "./api";
 import { planCrossCheckGateLabel } from "./crossCheckGate";
 import { openPrs, parkDisposition } from "./overview";
 import type { AdminRunsState } from "./useOverviewData";
-import { isAccountCooldownWaiting, isPlanningRun, isRevisingRun, parkLabel } from "./runBadge";
+import { effectiveRunStatus, isAccountCooldownWaiting, isPlanningRun, isRevisingRun, parkLabel } from "./runBadge";
 import { runKindLabel } from "./runKind";
 import { stripUnsafeChars } from "./safeText";
 
@@ -95,16 +95,17 @@ export function runRef(run: Pick<RunSummaryItem, "issue_iid" | "kind">): string 
   return run.issue_iid != null ? `#${run.issue_iid}` : stripUnsafeChars(runKindLabel(run.kind));
 }
 
-export interface CrossCheckTag {
+export interface IssueLineTag {
   text: string;
-  tone: "check" | "warn" | "danger";
+  tone: "check" | "warn" | "danger" | "info";
   title: string;
+  pulse?: boolean;
 }
 
 // The small tag a run's chip carries when a cross-check is live or has gated the plan
 // review. At the review stage a recorded gate reason wins; otherwise the live-check field
 // decides. An absent field (older API) or no reason gives no tag.
-export function crossCheckTag(run: RunSummaryItem, stage: IssueStage): CrossCheckTag | null {
+export function crossCheckTag(run: RunSummaryItem, stage: IssueStage): IssueLineTag | null {
   const reason = run.plan_cross_check_gate_reason;
   if (stage === "review" && typeof reason === "string" && reason !== "") {
     const title = planCrossCheckGateLabel(reason);
@@ -119,6 +120,48 @@ export function crossCheckTag(run: RunSummaryItem, stage: IssueStage): CrossChec
     return { text: "cross-checking", tone: "check", title: "Code cross-check in progress (advisory, does not block)" };
   }
   return null;
+}
+
+// Use the one server-derived completion phase through the same effective-status mapping as
+// the Runs list and pill. Building is the only station that can carry these live phases.
+function buildingCompletion(run: RunSummaryItem): "checking" | "reworking" | null {
+  const status = effectiveRunStatus(run);
+  if (status === "completion_checking") return "checking";
+  if (status === "completion_reworking") return "reworking";
+  return null;
+}
+
+export function issueLineTag(run: RunSummaryItem, stage: IssueStage): IssueLineTag | null {
+  const completion = stage === "building" ? buildingCompletion(run) : null;
+  if (completion) {
+    const checking = completion === "checking";
+    const title = checking ? "Checking completion" : "Reworking unmet milestones";
+    return {
+      text: checking ? "checking completion" : "reworking milestones",
+      tone: "info",
+      pulse: true,
+      title: run.cross_check_active === "code" ? `${title}; code cross-check also running (advisory)` : title,
+    };
+  }
+  return crossCheckTag(run, stage);
+}
+
+function buildingCaption(list: LineEntry[]): string {
+  if (list.length === 0) return "Nothing building";
+  let checking = 0;
+  let reworking = 0;
+  for (const entry of list) {
+    const phase = buildingCompletion(entry.run);
+    if (phase === "checking") checking++;
+    if (phase === "reworking") reworking++;
+  }
+  if (checking === 0 && reworking === 0) return "Implement, review, validate";
+  const parts = [
+    [list.length - checking - reworking, "building"],
+    [checking, "checking completion"],
+    [reworking, "reworking"],
+  ] as const;
+  return parts.filter(([count]) => count > 0).map(([count, label]) => `${count} ${label}`).join(" · ");
 }
 
 // Why a parked run waits, in the words the status pill uses.
@@ -244,7 +287,7 @@ export function issueLineModel(input: {
       queued: entries.queued.length ? "Claiming a slot" : "Queue empty",
       planning: entries.planning.length ? "Lead drafting a plan" : "Nothing planning",
       review: gateCaption(entries.review),
-      building: entries.building.length ? "Implement, review, validate" : "Nothing building",
+      building: buildingCaption(entries.building),
       askingTitle: asking.title,
       asking: asking.sub,
       parked: parked.sub,

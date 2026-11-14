@@ -30,6 +30,13 @@ func (c *Cache) EphemeralWorkersEnabled(ctx context.Context) (bool, error) {
 	return c.boolSetting(ctx, KeyEphemeralWorkersEnabled)
 }
 
+// WorkerHibernationEnabled reports whether admins may hibernate persistent hosted
+// workers (PRD #4205). Stored as "true"/"false"; a malformed value falls back to the
+// compiled-in default (false).
+func (c *Cache) WorkerHibernationEnabled(ctx context.Context) (bool, error) {
+	return c.boolSetting(ctx, KeyWorkerHibernationEnabled)
+}
+
 // HostedWorkerQuota returns the per-user hosted-worker quota (PRD #58 Decision 8);
 // 0 means self-service provisioning is disabled.
 //
