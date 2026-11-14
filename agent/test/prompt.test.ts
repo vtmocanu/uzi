@@ -41,6 +41,7 @@ import {
   SECRET_FIXTURE_HYGIENE_APPEND,
   LEAD_GATE_SEQUENCING_APPEND,
   LEAD_FAST_CHECK_APPEND,
+  WORKER_RUNTIME_APPEND,
 } from "../src/prompt.js";
 import { isSeededOwnerPlan, SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -1320,6 +1321,62 @@ describe("lead export-slot assignment (issue #2013)", () => {
       for (const phrase of SLOT_PHRASES) assert.ok(sp.append.includes(phrase), `missing ${JSON.stringify(phrase)}`);
     });
   }
+});
+
+// Issue #4346: a run's Go build cache can grow by tens of GiB inside one long implement
+// turn, so the lead may clear its OWN cache at a settled validation-wave boundary. The
+// rule rides the runtime append (LEAD_GUARDRAIL_PREFIX), so builtin and customized leads
+// on both harnesses carry it. Phrases are asserted on whitespace-normalized text, not
+// byte-exact prose.
+describe("lead Go build-cache cleanup rule (issue #4346)", () => {
+  const flat = (s: string): string => s.replace(/\s+/g, " ");
+  const SUBAGENT_GO_CLEAN_RULE = "Never run `go clean` in any form; report Go build cache or disk pressure to the lead, who decides on cleanup.";
+  const CACHE_RULE_PHRASES = [
+    // When: settled boundary, including earlier-wave survivors, no new consumer until settled.
+    "completed validation-wave boundary",
+    "including survivors from earlier waves",
+    "A returned dispatch is not proof that its build children settled",
+    "skip and report",
+    "Launch no new cache consumer until the cleanup command settles",
+    // Condition: thresholds, unknown readings, hysteresis.
+    "at least 12 GiB",
+    "at least 75% used",
+    "unknown, not zero and not a trigger",
+    "keep the warm cache",
+    "re-arm that trigger only after a fresh reading below 70%",
+    "not an enforced cap",
+    // Ownership.
+    "`go env GOCACHE` in the same tool environment that built the code",
+    "no `GOCACHEPROG` backend",
+    "If ownership is unknown, keep the cache and say so",
+    "do not require it to sit inside HOME",
+    // Action.
+    "Run `go clean -cache` only",
+    "never `-modcache`",
+    "never a manual `rm`",
+    "report a failed cleanup as failed",
+    // Validation unchanged.
+    "Never narrow a required check, drop `-race`, or waive a frozen acceptance criterion",
+    "Subagents never run `go clean`",
+  ];
+  const cases = [
+    ["builtin lead, claude", undefined, { harness: "claude" }],
+    ["customized lead, claude", "custom lead prompt", { harness: "claude" }],
+    ["builtin lead, codex", undefined, { harness: "codex" }],
+    ["customized lead, codex", "custom lead prompt", { harness: "codex" }],
+    ["builtin lead, seeded", undefined, { harness: "claude", seeded: true }],
+  ] as const;
+  for (const [label, body, opts] of cases) {
+    it(`${label}: the composed system prompt carries the cache rule`, () => {
+      const append = flat(buildLeadSystemPrompt(body, opts).append);
+      for (const phrase of CACHE_RULE_PHRASES) assert.ok(append.includes(phrase), `missing ${JSON.stringify(phrase)}`);
+      // The subagent-only prohibition is not part of the lead's composition.
+      assert.ok(!append.includes(SUBAGENT_GO_CLEAN_RULE), "lead append must not carry the subagent prohibition");
+    });
+  }
+  it("the subagent prohibition is total and rides the subagent runtime append", () => {
+    assert.ok(flat(WORKER_RUNTIME_APPEND).includes(SUBAGENT_GO_CLEAN_RULE));
+  });
 });
 
 describe("buildLeadSystemPrompt", () => {

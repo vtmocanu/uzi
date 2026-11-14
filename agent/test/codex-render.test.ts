@@ -551,6 +551,15 @@ describe("renderCodexRun — prompts", () => {
     }
   });
 
+  it("issue #4346: every Codex subagent prompt forbids `go clean`", () => {
+    const rule = "Never run `go clean` in any form; report Go build cache or disk pressure to the lead, who decides on cleanup.";
+    const rendered = renderCodexRun(runRequest({ agents: { a: agent(), b: agent({ prompt: "BODY" }) } }));
+    assert.equal(rendered.perRolePrompts.size, 2);
+    for (const prompt of rendered.perRolePrompts.values()) {
+      assert.ok(prompt.replace(/\s+/g, " ").includes(rule), "carries the go clean prohibition");
+    }
+  });
+
   it("threads the lead system + user prompt verbatim", () => {
     const run = renderCodexRun(runRequest({ systemPrompt: "SYS", prompt: "USR" }));
     const lead: RenderedCodexPrompts = run.leadPrompt;
