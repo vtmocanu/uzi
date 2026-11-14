@@ -1,7 +1,7 @@
-// The Overview preview at /overview/next (PRD #3878): the same data as Dashboard through
+// The default Overview at /dashboard (PRD #3877 M1): the same data as the classic page through
 // the shared useOverviewData hook, with a header that carries a status sentence (and, for an
-// admin, the health chip) above the app-wide banner stack. It is a preview route, linked
-// from and back to the current Overview at /dashboard.
+// admin, the health chip) above the app-wide banner stack. The classic page stays linked
+// at /overview/classic until M2 retires it.
 
 import { useState } from "react";
 import { Link } from "react-router-dom";
@@ -33,6 +33,8 @@ import { HeldWorkCard } from "../components/HeldWorkCard";
 import { HealthPlatformLine } from "../components/HealthPlatformLine";
 import { HealthChip } from "../components/HealthChip";
 import { PeopleChip } from "../components/PeopleChip";
+import { RepoChip } from "../components/RepoChip";
+import { repoActivityModel } from "../lib/overviewRepos";
 import { InShellHeader } from "../components/PageHeaderSlot";
 import { Button, PageHeader } from "../components/ui";
 import { useCommandMenu } from "../components/CommandMenuContext";
@@ -43,11 +45,13 @@ export function OverviewNext() {
   const commandMenu = useCommandMenu();
   const demo = useDemoMode();
   const { user } = useAuth();
-  const { data, usageWindow, changeUsageWindow, adminRuns, adminUsers, holds, holdsFailed } = useOverviewData({
-    includeAdminRuns: true,
-    includeRecoveryHolds: true,
-    includeAdminUsers: true,
-  });
+  const { data, usageWindow, changeUsageWindow, adminRuns, adminUsers, adminRepoActivity, holds, holdsFailed } =
+    useOverviewData({
+      includeAdminRuns: true,
+      includeRecoveryHolds: true,
+      includeAdminUsers: true,
+      includeAdminRepoActivity: true,
+    });
   const now = useNow(30_000);
   // The Usage card's scope is owned here so the People chip's "Usage by user" can switch it to
   // All users; focusByUser is the counter that tells the card to move focus to By user.
@@ -108,6 +112,17 @@ export function OverviewNext() {
         demo,
       })
     : null;
+  // The Repos chip's model: admins only, from the same run rows plus the one-shot repo-activity read.
+  const repos = isAdmin
+    ? repoActivityModel({
+        ownRuns,
+        adminRuns,
+        viewerEmail: user.email,
+        repoActivity: adminRepoActivity,
+        now,
+        demo,
+      })
+    : null;
   const showUsageByUser = () => {
     setUsageScope("all");
     overviewScope.set(USAGE_SCOPE_KEY, "all");
@@ -127,6 +142,7 @@ export function OverviewNext() {
             <>
               {isAdmin && <HealthChip />}
               {people && <PeopleChip model={people} onShowUsageByUser={showUsageByUser} />}
+              {repos && <RepoChip model={repos} />}
               {commandMenu && (
                 <Button variant="secondary" size="sm" onClick={commandMenu.open} aria-keyshortcuts={commandShortcutKeys()}>
                   <SearchIcon aria-hidden="true" />
@@ -139,8 +155,8 @@ export function OverviewNext() {
                   </kbd>
                 </Button>
               )}
-              <Link to="/dashboard" className="text-sm font-medium text-brand hover:text-brand-hover">
-                Back to the current Overview
+              <Link to="/overview/classic" className="text-sm font-medium text-brand hover:text-brand-hover">
+                Back to the old Overview
               </Link>
             </>
           }

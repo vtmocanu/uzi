@@ -47,7 +47,9 @@ const HIST_TITLES = [
   "Fix double-count in phase folding",
   "Prune completed judge meta-runs",
 ] as const;
-const HIST_REPOS = ["repo-uzi", "repo-atlas", "repo-payments"] as const;
+// repo-payments is left out on purpose: it is the guardrail-blocked repo and never ran, so the
+// Overview Repos chip's "never ran" idle count has a real row in the demo (issue #4334).
+const HIST_REPOS = ["repo-uzi", "repo-atlas"] as const;
 const HIST_WORKERS = ["w-laptop", "w-ci", "w-nas", "w-hosted-eu", "w-mira"] as const;
 
 function histRun(i: number, minsBack: number): Run {
@@ -235,7 +237,9 @@ export const mockOtherUserRuns: Run[] = [
     // (PRD #32), and with own rows filtered out the waiting-for-unlock badge has no
     // business on this list at all.
     id: "run-andrei-queued",
-    repo_id: "repo-uzi",
+    // A DISABLED repo (repo-www) with a non-terminal run: the Overview Repos chip lists a
+    // disabled repo only while it has listed active work (issue #4334).
+    repo_id: "repo-www",
     issue_iid: 77,
     issue_title: "Add retry budget to the seed sync",
     issue_description: "Another user's queued run — factory-card demo fixture.",
@@ -472,6 +476,12 @@ export const mockDoneMessages: RunMessage[] = [
   dm("tool_use", "lead", { id: "tu-5", name: "Agent", input: { subagent_type: "Explore", description: "map the remaining render paths" } }, 198),
   dm("tool_result", "lead", { tool_use_id: "tu-5", content: "denied by guardrail: only the run's assembled subagents may be invoked", is_error: true }, 198),
   dm("text", "lead", { text: "I'll use the researcher subagent instead." }, 197),
+  // Issue #4201: the owner switched the token mid-run and the worker applied it IN PLACE
+  // (ordinal 1: same claim, same worker and working directory). Payload keys mirror the
+  // server's credentialSwitchMessagePayload. A second switch could not be confirmed, so the
+  // run parked as a plain owner pause until the owner resumed it.
+  dm("credential_switch", null, { label: "console-key", select_reason: "override_pinned", secret_id: "sec-console-key", ordinal: 1 }, 196),
+  dm("credential_switch_uncertain", null, {}, 194),
   dm("text", "reviewer", { text: "Pairing is by id, orphan results render standalone, and the cap keeps folding correct at the boundary. One nit: memoize the index. Approved after that.", model: "claude-opus-4-8", usage: { input_tokens: 18_900, cache_read_input_tokens: 149_700, cache_creation_input_tokens: 0, output_tokens: 7_600 } }, 195),
   dm("tool_use", "coder", { id: "tu-6", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 192),
   dm("tool_result", "coder", { tool_use_id: "tu-6", content: "ok" }, 192),

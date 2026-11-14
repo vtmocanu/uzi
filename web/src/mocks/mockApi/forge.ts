@@ -1,5 +1,6 @@
 import type {
   AdminBlockedRepos,
+  AdminRepoActivity,
   AgentSource,
   AdminDockerAllowlistRepos,
   GuardrailOverrideRequest,
@@ -23,6 +24,8 @@ import {
   mockRepos,
   mockToolAllowlist,
 } from "../data";
+import { isTerminalRun } from "../../lib/runStatus";
+import { state } from "../store";
 import { delay, requireAdmin, requireSession } from "./shared";
 // settings → workers → secrets has no runtime edge back to forge. Read settings
 // only inside the method, after module initialization, to use the current value.
@@ -551,6 +554,35 @@ export const forgeApi = {
     const cleaned = [...new Set(packages)].sort();
     repoToolProfiles.set(repoId, cleaned);
     return delay({ packages: cleaned });
+  },
+  // Issue #4334: the admin repo-activity read, DERIVED from the shared repos state and the
+  // mock runs like the real endpoint: every enabled repo plus every disabled repo with a
+  // listed non-terminal run (no chat, judge or cross-check kinds), each with the newest
+  // created_at of ANY run kind, null when it never ran. Always an array, never null.
+  adminRepoActivity: async (): Promise<AdminRepoActivity> => {
+    requireAdmin();
+    const all = [...state.runs.values()];
+    const listedActive = new Set(
+      all
+        .filter((r) => !["chat", "judge", "cross_check"].includes(r.kind) && !isTerminalRun(r.status))
+        .map((r) => r.repo_id),
+    );
+    const lastRun = new Map<string, string>();
+    for (const r of all) {
+      if (r.repo_id == null) continue;
+      const prev = lastRun.get(r.repo_id);
+      if (prev === undefined || r.created_at > prev) lastRun.set(r.repo_id, r.created_at);
+    }
+    return delay({
+      repos: repos
+        .filter((r) => r.enabled || listedActive.has(r.id))
+        .map((r) => ({
+          id: r.id,
+          path_with_namespace: r.path_with_namespace,
+          enabled: r.enabled,
+          last_run_at: lastRun.get(r.id) ?? null,
+        })),
+    });
   },
   // PRD #66 M9 (D8): the admin cross-user blocked-repos list. DERIVED from the shared,
   // mutable repos state (not a static deep-copy) joined with mockBlockedRepoMeta for the

@@ -128,11 +128,14 @@ describe("RunCredentialOverride — override + pending switch", () => {
   it("renders the pending-switch badge for a requested switch", () => {
     render(<RunCredentialOverride run={run({ credential_switch: "requested" })} />);
     expect(screen.getByText("switch pending")).toBeTruthy();
+    expect(screen.getByTitle("A token switch was requested and has not been applied yet.")).toBeTruthy();
   });
 
   it("renders the released-switch badge for a released switch", () => {
     render(<RunCredentialOverride run={run({ credential_switch: "released" })} />);
     expect(screen.getByText("switch released")).toBeTruthy();
+    // Issue #4201: only an older worker releases and re-claims; a current one switches in place.
+    expect(screen.getByTitle("An older worker released its claim to switch tokens; the run awaits re-claim on the new token.")).toBeTruthy();
   });
 
   it("shows NO stale switch badge once the DTO reports credential_switch null (lingering-stamp)", () => {
@@ -161,6 +164,30 @@ describe("CredentialEpochList", () => {
     expect(screen.getByText("default")).toBeTruthy();
     expect(screen.getByText("console-key")).toBeTruthy();
     expect(screen.getByText(/pinned by override/)).toBeTruthy();
+  });
+
+  it("renders an in-place switch epoch beside its claim's base epoch, with Codex binding copy and usage", () => {
+    const { container } = render(
+      <CredentialEpochList
+        epochs={[
+          { claim_generation: 1, ordinal: 0, secret_id: "sec-a", label: "codex-a", select_reason: "codex_binding", applied_at: "2026-01-01T10:00:00Z" },
+          {
+            claim_generation: 1,
+            ordinal: 1,
+            message_seq: 7,
+            secret_id: "sec-b",
+            label: "codex-b",
+            select_reason: "codex_binding",
+            applied_at: "2026-01-01T11:00:00Z",
+            usage: { input_tokens: 1, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 1.5 },
+          },
+        ]}
+      />,
+    );
+    expect(container.querySelectorAll("li")).toHaveLength(2);
+    expect(screen.getAllByText(/Codex binding/)).toHaveLength(2);
+    expect(screen.getAllByText(/switched in place/)).toHaveLength(1);
+    expect(screen.getByText(/\$1\.50/)).toBeTruthy();
   });
 
   it("routes a user-authored label through sanitizeLabel and onto its title/aria-label", () => {
@@ -235,8 +262,14 @@ describe("SwitchTokenAction — switching + D6 warning", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Switch token" }));
-    // The interrupt caveat is shown for a live (running) run.
-    expect(screen.getByText(/loses at most the in-flight step/)).toBeTruthy();
+    // The interrupt caveat is shown for a live (running) run (issue #4201): the switch applies
+    // in place without restarting the run, an older worker may still release and re-claim it,
+    // and an unconfirmed outcome pauses the run for the owner. Nothing promises a fresh attempt.
+    const caveat = screen.getByText(/Switching now stops the in-flight step/).textContent ?? "";
+    expect(caveat).toMatch(/continues the run in place on the new token, without restarting it\./);
+    expect(caveat).toMatch(/An older worker may release and re-claim the run instead\./);
+    expect(caveat).toMatch(/If the switch cannot be confirmed, the run pauses until you resume it\./);
+    expect(caveat).not.toMatch(/fresh attempt|restarts/);
 
     // Pin a token, then confirm the switch.
     const select = screen.getByLabelText("Switch this run's Anthropic token") as HTMLSelectElement;
@@ -335,7 +368,7 @@ describe("SwitchTokenAction — credential-switch holds", () => {
     // The switch is enabled, so nothing says it only "becomes available" later.
     expect(document.body.textContent).not.toMatch(/becomes available/);
     // Nothing is running to interrupt from the owner's point of view; no interrupt promise.
-    expect(screen.queryByText(/Switching now interrupts the run/)).toBeNull();
+    expect(screen.queryByText(/Switching now stops the in-flight step/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Switch to this token" }));
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(REFUSAL));
     expect(onSwitched).not.toHaveBeenCalled();
@@ -345,13 +378,13 @@ describe("SwitchTokenAction — credential-switch holds", () => {
     render(<SwitchTokenAction run={run({ status: "paused", hold_reason: "credential_switch_unsettled" })} canSteer tokens={[token()]} />);
     fireEvent.click(screen.getByRole("button", { name: "Switch token" }));
     expect(screen.getByText("Switching resumes this held run on the chosen token.")).toBeTruthy();
-    expect(screen.queryByText(/Switching now interrupts the run/)).toBeNull();
+    expect(screen.queryByText(/Switching now stops the in-flight step/)).toBeNull();
   });
 
   it("an owner pause keeps the interrupt caveat (control)", () => {
     render(<SwitchTokenAction run={run({ status: "paused", hold_reason: null })} canSteer tokens={[token()]} />);
     fireEvent.click(screen.getByRole("button", { name: "Switch token" }));
-    expect(screen.getByText(/Switching now interrupts the run/)).toBeTruthy();
+    expect(screen.getByText(/Switching now stops the in-flight step/)).toBeTruthy();
     expect(screen.queryByText("Switching resumes this held run on the chosen token.")).toBeNull();
   });
 });

@@ -222,8 +222,9 @@ var limiterNames = [...]string{
 // Issue #3251 adds POST /api/worker/runs/{id}/codex-catalog-default (noLimiter, like lead-config).
 // PRD #4205 adds POST /api/admin/workers/{id}/hibernate, POST /api/admin/workers/{id}/wake and
 // POST /api/controller/workers/{workerID}/hibernation (all noLimiter), making the table 411 rows
-// (len(wantRouteMounts) at that change). PRD #4208 M1 adds POST /api/worker/hibernation/inventory
-// and POST /api/worker/hibernation/exclusion-final (both noLimiter), making it 413 rows.
+// (len(wantRouteMounts) at that change). Issue #4334 adds GET /api/admin/repo-activity (noLimiter); re-tallied at that change,
+// len(wantRouteMounts) is 414 (the earlier figures above were not re-tallied).
+// PRD #4208 adds the two noLimiter inventory/exclusion-final routes, making 416 rows.
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -371,6 +372,8 @@ var wantRouteMounts = []routeMount{
 	// PRD #66 M9 (D8): the admin cross-user blocked-repos list reads the STORED
 	// privilege_report (no forge call) → noLimiter.
 	{"GET", "/api/admin/blocked-repos", noLimiter},
+	// Issue #4334: the admin repo-activity read is a DB-only cross-user list, like blocked-repos.
+	{"GET", "/api/admin/repo-activity", noLimiter},
 	// PRD #66 M3: the live guardrail impact scan carries the per-user forge budget,
 	// like POST /{id}/privilege-check — it makes the same class of upstream forge
 	// reads (2 + 2×repos), so it draws from the forge pocket rather than none.
@@ -954,8 +957,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},
 	{"POST", "/api/worker/runs/{id}/publish", noLimiter},
 	// Issue #2545 step A: the failed run's held-work upload. Worker-authenticated, no per-user
-	// limiter; a process-wide slot cap bounds it instead (AcquireHeldPublishSlot).
+	// limiter; shared global and per-worker slots bound it (AcquireHeldPublishSlot).
 	{"POST", "/api/worker/runs/{id}/held-publication", noLimiter},
+	// Issue #4007: the terminal-preservation upload, worker-authenticated and unlimited like the held-work upload above.
+	{"POST", "/api/worker/runs/{id}/terminal-preservation", noLimiter},
 	{"POST", "/api/worker/runs/{id}/review", noLimiter},
 	// PRD #400 M4a: the review run's diff-findings POST. Worker-authenticated, no per-user
 	// limiter, matching the judge's worker review POST above it.
@@ -967,6 +972,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
 	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
+	// Issue #4201: the in-place credential switch apply rides proposalLimiter.PerWorkerMiddleware
+	// (per-WORKER), which this per-USER probe reads as noLimiter.
+	{"POST", "/api/worker/runs/{id}/credential-switch/apply", noLimiter},
 	// Bounded local lifecycle report, no forge/provider I/O; both actual router
 	// chains are also pinned by TestPolicyHoldRouteHasNoRateLimiter.
 	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},

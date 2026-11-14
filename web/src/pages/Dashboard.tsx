@@ -26,7 +26,7 @@ export function Dashboard() {
   const demo = useDemoMode();
   const { user } = useAuth();
   // The data loading and both polls live in useOverviewData, shared with the
-  // /overview/next preview. Dashboard asks for no admin runs, so it sends exactly the
+  // /dashboard default. Classic asks for no admin runs, so it sends exactly the
   // requests it always has.
   const { data, usageWindow, changeUsageWindow } = useOverviewData();
   // PRD #1064 M3: a slow clock to age the board cards' "now" line client-side. Declared
@@ -67,8 +67,8 @@ export function Dashboard() {
         title={`Welcome${user.display_name ? `, ${maskName(user.display_name, demo)}` : ""}`}
         description="The factory floor at a glance."
         actions={
-          <Link to="/overview/next" className="text-sm font-medium text-brand hover:text-brand-hover">
-            Try the new Overview
+          <Link to="/dashboard" className="text-sm font-medium text-brand hover:text-brand-hover">
+            Go to the new Overview
           </Link>
         }
       />

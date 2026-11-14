@@ -244,6 +244,11 @@ export type RunState =
   /** issue #3181: the worker's acknowledgement that the held flight's owned operations have
    *  joined (hold_reason credential_switch_unsettled). Same fences as the hold report. */
   | "credential_switch_hold_settled"
+  /** Issue #4201: an in-place apply whose outcome the worker could not determine after proven
+   *  quiescence (`{status:"credential_switch_uncertain", claim_generation, register_nonce, op_id}`,
+   *  feature credential_switch_apply_v1). The server parks the run as a plain owner pause
+   *  (hold_reason NULL), custody kept; the worker starts neither token. */
+  | "credential_switch_uncertain"
   /** Issue #3985: a plan cross-check run whose lead asked a clarification after a HUMAN
    *  revise_plan verdict has the owner's answer; the run returns to awaiting_approval with the
    *  revise still pending (an answer is never plan approval). Carries `clarification_settlement`
@@ -386,7 +391,11 @@ export type MessageKind =
    *  (Decision 8). Emitted by the runner instead of `paused`; the run stays running. Payload
    *  `{ text: string }` — the human-readable reason, WORKER-authored (the server carries none
    *  on the pause_failed report). A free-form run_messages kind. */
-  | "pause_failed";
+  | "pause_failed"
+  /** Issue #4201: the worker's own feed line for an in-place credential switch whose outcome it could
+   *  not establish (option A, an owner pause). Payload `{ op_id, generation }`. Worker-emitted through
+   *  the batcher so it takes a seq the worker owns; the api writes no such message. */
+  | "credential_switch_uncertain";
 
 /** run_user_inputs.kind (PRD #4 §Schema; PRD #41 adds `revise_plan` — the user asks
  *  for a new plan version at the gate, body = their feedback text; PRD #88 adds
@@ -883,6 +892,40 @@ export interface DindMaintenanceReadyACK extends DindMaintenance {
   resampled_epoch: number;
 }
 
+/** Heartbeat response member `hibernation_cache_prune` (PRD #4206): the api's view of the
+ *  worker's hibernation cache prune attempt. Only decoded when the worker advertised
+ *  `hibernation_cache_prune_v1`. */
+export interface HibernationCachePrune {
+  op_id: string;
+  register_nonce: string;
+  phase: "requested" | "started" | "unknown" | "settled";
+  cancel_requested: boolean;
+  reconcile_seq: number;
+}
+
+export type HibernationPruneCommand = "image_prune_dangling" | "builder_prune";
+
+export interface HibernationCachePruneStep {
+  command: HibernationPruneCommand;
+  state: "not_started" | "exited_ok" | "unknown";
+}
+
+/** Heartbeat request member `hibernation_cache_prune_report`; never sent in the same heartbeat as
+ *  a `dind_maintenance_ready_ack`. */
+export interface HibernationCachePruneReport {
+  op_id: string;
+  register_nonce: string;
+  kind: "refused" | "ready" | "result";
+  reason?: "daemon_unreachable" | "custody_stale" | "active_work" | "claim_in_flight" | "gate_not_exclusive" | "cancelled";
+  local_claims?: number;
+  local_executions?: number;
+  custody_clear?: boolean;
+  custody_checked_at?: string;
+  gate_exclusive?: boolean;
+  steps?: HibernationCachePruneStep[];
+  gate_exclusive_throughout?: boolean;
+}
+
 export interface HeartbeatRequest {
   /** Original implemented capabilities and fixed validated local limits, echoed with the
    * original canonical registration nonce once heartbeat_protocol_refresh_v1 is advertised.
@@ -896,6 +939,7 @@ export interface HeartbeatRequest {
   };
   dind_meter?: DindMeter;
   dind_maintenance_ready_ack?: DindMaintenanceReadyACK;
+  hibernation_cache_prune_report?: HibernationCachePruneReport;
   version: string;
   /** Optional container resource sample (PRD #49), same absent-optional convention
    *  as `template` on register: the worker omits it when the collector produced
@@ -2694,6 +2738,10 @@ export interface OutgoingMessage {
    *  `task_description`. Absent whenever the SDK frame omits that field. */
   agent_label?: string;
   payload: Record<string, unknown>;
+  /** Issue #4201 (feature credential_switch_apply_v1): the in-generation credential epoch the frame
+   *  was produced under; absent or 0 is the claim's base epoch, n>=1 the nth applied in-place switch.
+   *  Sent only when the feature is negotiated. */
+  credential_epoch_ordinal?: number;
 }
 
 export interface MessagesRequest {
@@ -3523,7 +3571,7 @@ export interface StateAck {
    *  when a switch is pending for the claim the worker still holds; the `generation` is the one the
    *  worker must release at. Absent otherwise. M5b (MINOR-7) trips the switch off it — the
    *  reportState closure calls steering.tripCredentialSwitch(generation). */
-  credentialSwitch?: { generation: number };
+  credentialSwitch?: { generation: number; op_id?: string };
   /** PRD #1247 M5b: true when the /state ack carried the top-level `disposition: "stale_claim"`
    *  (a 409) — a held-state switch RELEASED this claim, or a reclaim SUPERSEDED it, so the old
    *  flight must STOP without further reports. Absent otherwise. The reportState closure throws
@@ -3540,6 +3588,8 @@ export interface StateAck {
   credentialSwitchHeld?: boolean;
   /** issue #3181: true when the 200 ack carried `disposition: "hold_settled"`. */
   credentialSwitchHoldSettled?: boolean;
+  /** Issue #4201: true when the 200 ack carried `disposition: "uncertain"` (the uncertain report applied). */
+  credentialSwitchUncertain?: boolean;
   /** Issue #3985: true when the 200 ack carried `disposition: "clarification_settled"`. */
   clarificationSettled?: boolean;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
@@ -3584,7 +3634,7 @@ export interface InputsResponse {
    *  continuously) — so the worker holding the current claim learns a switch was requested. Present
    *  only when a switch is pending for this claim; omitted otherwise. M5b trips the switch off it —
    *  the runner's inputs poll calls steering.maybeTripCredentialSwitch(generation). */
-  credential_switch?: { generation: number };
+  credential_switch?: { generation: number; op_id?: string };
   /** PRD #2603: the run's effective "Now summary" setting (admin switch AND the owner's user
    *  setting). Absent means OFF: a new worker against an older api, or a reply that took an
    *  early return, never spends tokens on a summary. */

@@ -1,5 +1,5 @@
-// Pure helpers shared by the two Overview pages (Dashboard and the /overview/next
-// preview, PRD #3878). Nothing here fetches or renders.
+// Pure helpers shared by the default and classic Overview pages (PRD #3878, #3877).
+// Nothing here fetches or renders.
 
 import {
   isTerminalRun,

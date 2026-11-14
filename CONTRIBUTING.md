@@ -1,5 +1,25 @@
 # Contributing to uzi
 
+## Discuss the design first for larger changes
+
+For anything beyond a small fix (a new feature, a change to how credentials,
+runs or workers behave, a new setting, or work that touches several components),
+open an issue before writing code:
+
+1. Describe the problem and the approach you propose, including the main
+   architecture choices and what you considered and rejected.
+2. Wait until we agree on the design in the issue. We may suggest a different
+   shape, or fold it into existing plans.
+3. Then open the PR, linked to the issue.
+
+This saves you from building something we then have to ask you to rework, and
+it lets us agree on the architecture before anyone invests in the code. Small
+fixes, typos and documentation corrections can go straight to a PR.
+
+**Slack (optional).** For faster back-and-forth while you work out a design, join
+our community Slack; the invite link is in the [README](README.md). Decisions
+still land in the issue so everyone can follow them.
+
 ## Keep the repository clean of internal data
 
 This repository is open source. Treat every tracked file as world-readable, and
@@ -23,9 +43,11 @@ Please do not commit, in code, tests, docs, comments, or fixtures:
   demo personas. Single-name fixtures such as `alice@example.com` are fine.
 - **Internal repository or organization paths, image registries, storage
   buckets, or robot and service-account names.**
-- **Real credentials of any shape.** Test tokens must be obviously fake and carry
-  a `gitleaks:allow` marker or a recognizable canary. The secret scanner runs in
-  CI.
+- **Real credentials of any shape.** Assemble secret-shaped test values at
+  runtime (for example `"glpat-" + "notAReal" + "012345678901"`) rather than
+  storing complete token literals: `gitleaks:allow` does not bypass GitHub Push
+  Protection, which rejects the whole push. The secret scanner and a
+  token-literal check run in CI.
 
 Cluster-specific operational values (real hosts and CIDRs) belong in a private
 deployment repository, not here. The in-repo `deploy/values/` keeps only a

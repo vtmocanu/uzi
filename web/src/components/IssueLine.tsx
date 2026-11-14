@@ -1,4 +1,4 @@
-// The Overview preview's "Issue work" card (PRD #3879): the issue lifecycle drawn as a line
+// The default Overview's "Issue work" card (PRD #3879): the issue lifecycle drawn as a line
 // of five stations (Queued, Planning, Plan review as a gate, Building, PR open) with three
 // bays under it (Asking you, Parked, Other work). Each station and bay is a toggle that
 // reports the stage the viewer picked; the page owns that state. Counts and captions come

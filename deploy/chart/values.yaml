@@ -681,7 +681,17 @@ workers:
   #   The same flag also enables the pressure-only anonymous-volume prune leg (issue
   #   #3891) on busy or custody-held workers; false disables that leg too, along with
   #   PVC recycle and the cache prune (it is not leg-only).
+  #   It likewise disables the pressure-only builder-cache prune leg (issue #4291,
+  #   see dindBuilderPruneEnabled below).
   diskRecycleEnabled: true
+  # dindBuilderPruneEnabled: default-on switch for the pressure-only builder-cache
+  #   prune leg (issue #4291): `docker builder prune -f --filter type=regular
+  #   --filter until=24h --max-used-space 4GiB`, run on busy or custody-held docker
+  #   workers. Subordinate to diskRecycleEnabled: false there disables this leg too.
+  #   Setting this false disables only this leg. Flipping it changes docker worker
+  #   pods' spec hash, so they roll through the normal safe drift roll. Strict boolean
+  #   (a string or null refuses to render); always sent explicitly.
+  dindBuilderPruneEnabled: true
   # diskRecycleCooldown: the PVC-age thrash guard (Decision D6). A worker back at pressure
   #   within this window is a CAPACITY problem (working set exceeds nixSize) — it is
   #   capacity-warned and skipped, not recycled in a loop. An ordinary Go duration

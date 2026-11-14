@@ -1616,7 +1616,7 @@ describe("JobRunner product skills (PRD #1909 M6)", () => {
     assert.deepStrictEqual(seen.options!.tools, ["Read", "Write", "Glob", "Grep", "mcp__job__submit_job_result"]);
     assert.deepStrictEqual(seen.options!.skills, [], "[] switches skills off; omitting the key would not");
     assert.strictEqual(seen.options!.plugins, undefined);
-    assert.deepStrictEqual(seen.options!.settings, { disableSkillShellExecution: true });
+    assert.deepStrictEqual(seen.options!.settings, { disableSkillShellExecution: true, enabledPlugins: { "cc-plugin-privacy@builtin": false } });
     assert.ok(!String(seen.options!.systemPrompt).includes("PRODUCT SKILLS"));
   });
 
@@ -1641,7 +1641,7 @@ describe("JobRunner product skills (PRD #1909 M6)", () => {
     assert.deepStrictEqual(o.settingSources, []);
     // A skill body is repo-authored text: its inline shell (`!cmd` blocks) must never execute
     // under bypassPermissions.
-    assert.deepStrictEqual(o.settings, { disableSkillShellExecution: true });
+    assert.deepStrictEqual(o.settings, { disableSkillShellExecution: true, enabledPlugins: { "cc-plugin-privacy@builtin": false } });
     assert.match(skillMd, /name: "brand-voice"/);
     assert.match(skillMd, /Be brief\./);
     assert.ok(pluginInWorkspace, "the plugin dir is a sibling of work/, inside the workspace root");
@@ -1769,7 +1769,7 @@ describe("JobRunner lane mode: profile-bound jobs (PRD #1976)", () => {
       assert.deepStrictEqual(o.skills, []);
       assert.deepStrictEqual(o.settingSources, []);
       assert.strictEqual(o.strictMcpConfig, true);
-      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false }, disableSkillShellExecution: true });
+      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false, "cc-plugin-privacy@builtin": false }, disableSkillShellExecution: true });
       for (const banned of ["Bash", "WebFetch", "WebSearch", "Agent", "Task", "Skill", "MultiEdit", "NotebookEdit"]) {
         assert.ok((o.disallowedTools ?? []).includes(banned), `${banned} is disallowed`);
         assert.ok(!(o.tools as string[]).includes(banned));
@@ -1783,7 +1783,7 @@ describe("JobRunner lane mode: profile-bound jobs (PRD #1976)", () => {
       assert.deepStrictEqual(o.skills, ["uzi:brand-voice"]);
       assert.deepStrictEqual(o.plugins, [{ type: "local", path: "/data/jobs/run/.uzi-skills-work", skipMcpDiscovery: true }]);
       assert.ok(!(o.disallowedTools ?? []).includes("Skill"));
-      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false }, disableSkillShellExecution: true });
+      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false, "cc-plugin-privacy@builtin": false }, disableSkillShellExecution: true });
     });
 
     it("keeps the Glob/Grep escape guard and the sources/ write guard on", async () => {

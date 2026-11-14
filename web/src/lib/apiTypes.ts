@@ -1040,6 +1040,23 @@ export interface AdminBlockedRepos {
   requests: GuardrailOverrideRequest[];
 }
 
+// RepoActivity is one row of GET /api/admin/repo-activity (issue #4334): a repo's id, forge
+// path, whether it is enabled and when its newest run of any kind was created (null when it
+// has never run). `path_with_namespace` is user-controlled: sanitize before rendering.
+export interface RepoActivity {
+  id: string;
+  path_with_namespace: string;
+  enabled: boolean;
+  last_run_at: string | null;
+}
+
+// AdminRepoActivity is the GET /api/admin/repo-activity envelope: every enabled repo plus
+// every disabled repo that has a listed non-terminal run. The handler always sends an array
+// (never null), so an empty list is "no repos", not "unknown".
+export interface AdminRepoActivity {
+  repos: RepoActivity[];
+}
+
 // EgressProfileWarning is a note about a stored host entry of an egress profile (PRD
 // #1906 Decision 4), mirroring apitypes.EgressProfileWarningDTO. Codes:
 // "multi_publisher_override" (a multi-publisher host admitted by an explicit override),
@@ -1839,6 +1856,12 @@ export interface BuildInfo {
     published_at?: string;
     notes_url?: string;
     security?: boolean;
+  };
+  // Uzi tag each public Homebrew tap formula installs; an absent key means
+  // unknown. Not consumed by the web (the CLI reads it).
+  homebrew_formulas?: {
+    uzi_cli?: string;
+    uzi_cli_rc?: string;
   };
   update_available?: boolean;
   far_behind?: boolean;
@@ -2827,6 +2850,12 @@ export interface ForgeOriginCooldown {
   surfaces?: string[];
 }
 
+export interface WorkerHibernationCleanup {
+  state: "none" | "cleaning" | "unknown" | "settled";
+  outcome: "pruned" | "skipped" | "failed" | null;
+  reason: string | null;
+}
+
 export interface Worker {
   forge_origin_cooldowns?: ForgeOriginCooldown[];
   // Optional for compatibility with APIs predating manual owner cordons.
@@ -2843,6 +2872,9 @@ export interface Worker {
   hibernated_at: string | null;
   wake_requested_at: string | null;
   wake_error: string | null;
+  // Hibernation cache cleanup (PRD #4206). The key is always sent by a current api, null when
+  // no attempt was made; optional here for older APIs and bare fixtures.
+  hibernation_cleanup?: WorkerHibernationCleanup | null;
   // Omitted when absent, invalid or older than the API's independent receipt TTL.
   roll_pacing?: WorkerRollPacing;
   id: string;
@@ -4421,6 +4453,34 @@ export interface CredentialEpoch {
   label: string | null;
   select_reason: string | null;
   applied_at: string;
+  /** 0 (or absent on an older API) for a claim's base epoch; n >= 1 for the nth in-place
+   *  switch inside that claim generation (issue #4201). Order epochs by
+   *  (claim_generation, ordinal). */
+  ordinal?: number;
+  /** Seq of the run's credential_switch message for an in-place switch; omitted for a base epoch. */
+  message_seq?: number;
+  /** The epoch's own spend; omitted when the run recorded none. */
+  usage?: CredentialEpochUsage;
+}
+
+/** CredentialSwitchMessagePayload is the body of a `credential_switch` run message (PRD #1247
+ *  M9; api/internal/workersvc/secretchoice.go). label is user-authored (null when unlabelled);
+ *  ordinal is n >= 1 for the nth in-place switch in a claim (issue #4201) and absent on a
+ *  claim-time switch. */
+export interface CredentialSwitchMessagePayload {
+  label: string | null;
+  select_reason: string;
+  secret_id: string;
+  ordinal?: number;
+}
+
+/** CredentialEpochUsage is one credential epoch's spend (issue #4201). */
+export interface CredentialEpochUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_usd: number;
 }
 
 // RunActivity is the server-derived "now" line for a run (PRD #1064 D3): who is acting,

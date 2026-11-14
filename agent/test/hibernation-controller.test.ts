@@ -60,7 +60,7 @@ function rig(over: Partial<HibernationDeps> = {}) {
     podUid: () => AWAITING.pod_uid,
     isIdle: () => true,
     proof: async () => {
-      events.push(`proof latched=${registry.isLatched()} gate=${gate.heldBy("hibernation")}`);
+      events.push(`proof latched=${registry.isLatched()} gate=${gate.heldBy("hibernation_inventory")}`);
       return true;
     },
     census: async () => { events.push("census"); return census(); },
@@ -76,6 +76,18 @@ function rig(over: Partial<HibernationDeps> = {}) {
 const feed = async (r: ReturnType<typeof rig>, m: HibernationInventoryMember | null) => { r.c.observe(m); await r.c.whenIdle(); };
 
 describe("HibernationInventoryController", () => {
+  it("does not inventory or release the gate of an unsettled cache prune", async () => {
+    const r = rig({ settleMs: 20 });
+    r.gate.close("hibernation"); // #4206 retains its own owner until its attempt settles.
+    await feed(r, AWAITING);
+    assert.equal(r.posts[0] && "status" in r.posts[0] ? r.posts[0].status : undefined, "busy");
+    assert.equal(r.events.includes("ex"), false);
+    assert.equal(r.events.includes("census"), false);
+    await feed(r, null);
+    assert.equal(r.gate.onlyHeldBy("hibernation"), true, "inventory release must preserve cleanup's fence");
+    assert.equal(r.state.mode, "shared");
+  });
+
   it("runs latch, settle, proof, EX, census, post in order and holds", async () => {
     const r = rig();
     await feed(r, AWAITING);
@@ -300,7 +312,7 @@ describe("HibernationInventoryController", () => {
     await feed(r, null);
     assert.deepEqual(r.exits, ["hibernation_reacquire_shared_failed"]);
     assert.equal(r.gate.claimsClosed(), true);
-    assert.equal(r.gate.heldBy("hibernation"), true);
+    assert.equal(r.gate.heldBy("hibernation_inventory"), true);
   });
 
   it("reports held:false after exclusion is lost or the latch is broken", async () => {
@@ -313,7 +325,7 @@ describe("HibernationInventoryController", () => {
     r.registry.unlatch();
     assert.equal(r.c.exclusionReport()?.held, false);
     r.registry.latch();
-    r.gate.open("hibernation");
+    r.gate.open("hibernation_inventory");
     assert.equal(r.c.exclusionReport()?.held, false);
   });
 

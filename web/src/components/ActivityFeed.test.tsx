@@ -1402,6 +1402,29 @@ describe("ActivityFeed — scope-cap steer_ack (PRD #634)", () => {
   });
 });
 
+// Issue #4201: a token switch whose outcome could not be established parks the run as a
+// plain owner pause. That park must reach the polite live region, with fixed text.
+describe("ActivityFeed — unconfirmed token switch (issue #4201)", () => {
+  const region = () => document.querySelector('[aria-live="polite"]') as HTMLElement;
+
+  it("announces credential_switch_uncertain with FIXED text", () => {
+    renderFeed(
+      [
+        m(1, "status", { event: "init", model: "claude-opus-4-8" }, "lead"),
+        m(2, "credential_switch", { label: "console-key", select_reason: "override_pinned", secret_id: "s", ordinal: 1 }, "worker"),
+        m(3, "credential_switch_uncertain", { text: "<img src=x onerror=alert(1)>" }, "worker"),
+      ],
+      { status: "paused" },
+    );
+    const text = region().textContent ?? "";
+    expect(text).toBe("Run paused: the token switch could not be confirmed");
+    expect(document.body.textContent).toContain("Switched in place to “console-key” (pinned by override)");
+    expect(document.body.textContent).toContain("Could not confirm the token switch. The run is paused until you resume it.");
+    expect(document.body.textContent).not.toContain("unrenderable");
+    expect(document.body.textContent).not.toContain("onerror");
+  });
+});
+
 // ── Lead context-window meter (PRD #516) ──────────────────────────────────────
 // A lead assistant frame that co-carries `payload.context` (window FILL) alongside
 // `payload.usage`, exactly as the agent attaches it. `agent_instance` stays null so the

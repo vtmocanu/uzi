@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-// PRD #3878 M1: the /overview/next preview page.
+// PRD #3877 M1: the default Overview at /dashboard, with the old page at /overview/classic.
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -28,6 +28,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       getRecoveryHolds: vi.fn(),
       getAdminHealth: vi.fn(),
       listUsers: vi.fn(),
+      adminRepoActivity: vi.fn(),
     },
   };
 });
@@ -37,7 +38,7 @@ const mockApi = vi.mocked(api);
 const admin = { ...aUser, is_admin: true };
 
 // Every endpoint a non-admin must never reach.
-const adminEndpoints = () => [mockApi.adminListRuns, mockApi.getAdminUsage, mockApi.getAdminHealth, mockApi.listUsers];
+const adminEndpoints = () => [mockApi.adminListRuns, mockApi.getAdminUsage, mockApi.getAdminHealth, mockApi.listUsers, mockApi.adminRepoActivity];
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -55,6 +56,7 @@ beforeEach(() => {
   mockApi.adminListRuns.mockResolvedValue({ runs: [] });
   mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
   mockApi.listUsers.mockResolvedValue({ users: [] });
+  mockApi.adminRepoActivity.mockResolvedValue({ repos: [] });
   mockApi.getRecoveryHolds.mockResolvedValue(noHolds());
 });
 
@@ -77,7 +79,7 @@ async function settle(ms = 0) {
   });
 }
 
-async function mount(page: "next" | "dashboard" = "next") {
+async function mount(page: "next" | "classic" = "next") {
   const view = render(<MemoryRouter>{page === "next" ? <OverviewNext /> : <Dashboard />}</MemoryRouter>);
   await settle();
   return view;
@@ -102,12 +104,12 @@ describe("OverviewNext for a non-admin", () => {
     expect(screen.queryByRole("button", { name: /System health/ })).toBeNull();
   });
 
-  it("links back to the current Overview, and Dashboard links here", async () => {
+  it("links to the classic Overview, which links back to the new default", async () => {
     await mount();
-    expect(screen.getByRole("link", { name: "Back to the current Overview" }).getAttribute("href")).toBe("/dashboard");
+    expect(screen.getByRole("link", { name: "Back to the old Overview" }).getAttribute("href")).toBe("/overview/classic");
     cleanup();
-    await mount("dashboard");
-    expect(screen.getByRole("link", { name: "Try the new Overview" }).getAttribute("href")).toBe("/overview/next");
+    await mount("classic");
+    expect(screen.getByRole("link", { name: "Go to the new Overview" }).getAttribute("href")).toBe("/dashboard");
   });
 
   it("lists only the viewer's active runs, with the empty state when there are none", async () => {
@@ -254,11 +256,11 @@ describe("Capacity rail", () => {
     expect(within(rail).getAllByText("No stats reported")).toHaveLength(2);
   });
 
-  it("keeps Worker load on /dashboard", async () => {
+  it("keeps Worker load on the classic Overview", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [aWorker({ stats_cpu_pct: 10, stats_mem_bytes: 1024, stats_source: "cgroup" })],
     });
-    await mount("dashboard");
+    await mount("classic");
     expect(screen.getByText("Worker load")).toBeTruthy();
   });
 });
@@ -269,7 +271,7 @@ describe("carried-over sections take the same inputs as Dashboard", () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [aWorker({ id: "h1", kind: "hosted", status: "offline", upgrade_status: "capacity_blocked" })],
     });
-    await mount("dashboard");
+    await mount("classic");
     const onDashboard = screen.getByRole("status", { name: "Your hosted workers" }).textContent;
     expect(onDashboard).toContain("Your hosted workers cannot start right now.");
     cleanup();
@@ -324,7 +326,7 @@ describe("Held work card", () => {
       aggregate: heldAggregate({ open_holds: 1, admission_counted_holds: 1, decision_needed: 1 }),
       holds: [],
     });
-    await mount("dashboard");
+    await mount("classic");
     const alert = screen.getByRole("status", { name: "Held work" });
     const dashboardHeadline = within(alert).getByRole("heading").textContent;
     expect(alert.textContent).toContain("2 runs waiting to recover");
@@ -442,7 +444,7 @@ describe("Held work card", () => {
   });
 
   it("does not fetch holds on Dashboard beyond its own alert", async () => {
-    await mount("dashboard");
+    await mount("classic");
     expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(1);
   });
 });
@@ -973,9 +975,70 @@ describe("People chip (issue #4042)", () => {
   });
 });
 
+describe("Repos chip (issue #4334)", () => {
+  const chip = () => screen.getByRole("button", { name: /^Repos:/ });
+  const dialog = () => within(screen.getByRole("dialog", { name: "Repos in uzi" }));
+  const day = 24 * 3_600_000;
+  const repoRun = (id: string, over: Record<string, unknown>) => aRun({ id, owner_email: "mira@uzi.local", ...over });
+
+  function seedRepos() {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        repoRun("a-1", { status: "running", repo_id: "repo-a", repo_path: "org/alpha" }),
+        repoRun("b-1", { status: "queued", repo_id: "repo-off", repo_path: "org/disabled" }),
+        repoRun("c-1", { status: "completed", repo_id: "repo-c", repo_path: "org/charlie" }),
+      ],
+    });
+    mockApi.adminRepoActivity.mockResolvedValue({
+      repos: [
+        { id: "repo-a", path_with_namespace: "org/alpha", enabled: true, last_run_at: new Date(Date.now() - 60_000).toISOString() },
+        { id: "repo-c", path_with_namespace: "org/charlie", enabled: true, last_run_at: new Date(Date.now() - 2 * day).toISOString() },
+        { id: "repo-n", path_with_namespace: "org/never", enabled: true, last_run_at: null },
+      ],
+    });
+  }
+
+  it("counts active repos against the total, including an active disabled repo the read lacks", async () => {
+    seedRepos();
+    await mount();
+    expect(chip().getAttribute("aria-label")).toBe("Repos: 2 active now of 4");
+    await act(async () => {
+      fireEvent.click(chip());
+    });
+    expect(dialog().getByText("org/disabled")).toBeTruthy();
+    expect(dialog().getByText("Run within 7 days, nothing active")).toBeTruthy();
+    expect(dialog().getByText("2d ago")).toBeTruthy();
+    expect(dialog().getByText("1 never ran")).toBeTruthy();
+  });
+
+  it("reads the repo list once, not on the polls", async () => {
+    seedRepos();
+    await mount();
+    await settle(65_000);
+    expect(mockApi.adminRepoActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the active count and drops the total when the read fails", async () => {
+    seedRepos();
+    mockApi.adminRepoActivity.mockRejectedValue(new Error("down"));
+    await mount();
+    expect(chip().getAttribute("aria-label")).toBe("Repos: 2 active now");
+  });
+
+  it("gives a non-admin no chip and never calls the endpoint", async () => {
+    await mount();
+    await settle(30_000);
+    expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Repos:/ })).toBeNull();
+    expect(mockApi.adminRepoActivity).not.toHaveBeenCalled();
+  });
+});
+
 // PRD #3875 M1: the Search button in the header opens the shell's command menu.
 describe("OverviewNext Search button", () => {
-  it("follows the health and People chips, before the Back link", async () => {
+  it("follows the health, People and Repos chips, before the Back link", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     render(
@@ -989,12 +1052,14 @@ describe("OverviewNext Search button", () => {
 
     const health = screen.getByRole("button", { name: /^System health:/ });
     const people = screen.getByRole("button", { name: /^People:/ });
+    const repos = screen.getByRole("button", { name: /^Repos:/ });
     const search = screen.getByRole("button", { name: /^Search/ });
-    const back = screen.getByRole("link", { name: "Back to the current Overview" });
+    const back = screen.getByRole("link", { name: "Back to the old Overview" });
     const before = (a: Element, b: Element) =>
       (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
     expect(before(health, people)).toBe(true);
-    expect(before(people, search)).toBe(true);
+    expect(before(people, repos)).toBe(true);
+    expect(before(repos, search)).toBe(true);
     expect(before(search, back)).toBe(true);
   });
 

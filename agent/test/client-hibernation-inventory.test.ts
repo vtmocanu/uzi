@@ -119,16 +119,26 @@ describe("hibernation heartbeat integration", () => {
     assert.equal(client.latestHibernationInventory, undefined);
   });
 
+  it("sends cleanup and inventory exclusion as separate negotiated heartbeat fields", async () => {
+    await client.register("w", undefined, undefined, undefined, ["hibernation_cache_prune_v1"]);
+    const cleanup = { op_id: NONCE, register_nonce: NONCE, kind: "result" as const, steps: [] };
+    const exclusion = wire.heartbeat_request_member.hibernation_exclusion;
+    await client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, cleanup, exclusion);
+    const body = JSON.parse(seen.at(-1)!.raw);
+    assert.deepEqual(body.hibernation_cache_prune_report, cleanup);
+    assert.deepEqual(body.hibernation_exclusion, exclusion);
+  });
+
   it("sends hibernation_exclusion only with the feature and a report", async () => {
     await client.register("w");
     const report = wire.heartbeat_request_member.hibernation_exclusion;
-    await client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, report);
+    await client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, undefined, report);
     assert.deepEqual(JSON.parse(seen.at(-1)!.raw), { version: "0.1.0-test", ...wire.heartbeat_request_member });
     await client.heartbeat();
     assert.equal(seen.at(-1)!.raw, '{"version":"0.1.0-test"}');
     features = [];
     await client.register("w");
-    await client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, report);
+    await client.heartbeat(undefined, undefined, undefined, undefined, undefined, undefined, undefined, report);
     assert.equal(seen.at(-1)!.raw, '{"version":"0.1.0-test"}');
   });
 

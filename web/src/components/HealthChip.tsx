@@ -1,4 +1,4 @@
-// Compact instance-health chip for the /overview/next header (PRD #3878). Admin-only by
+// Compact instance-health chip for the default Overview header (PRD #3878, #3877). Admin-only by
 // construction: it reads the ONE shared HealthStatusProvider, whose doc is null for a
 // non-admin (no fetch) and before the first load, and the chip then renders nothing.
 // It mirrors HealthOverviewCard's severity in one line and always opens a popover (#4281).

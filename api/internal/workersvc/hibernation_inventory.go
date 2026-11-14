@@ -345,7 +345,7 @@ func (s *Service) timeOutInventory(ctx context.Context, q *store.Queries, w stor
 // nothing is written.
 func boundAwaitingInventory(ctx context.Context, q *store.Queries, w store.Worker, op, pod uuid.UUID, nonce string) (store.GetHibernationInventoryStateForWorkerRow, error) {
 	var none store.GetHibernationInventoryStateForWorkerRow
-	if w.Kind != "hosted" || w.Ephemeral || w.HibernationState != "preparing" || w.HibernationScalingDownAt.Valid ||
+	if cleanupUnsettled(w.CleanupPhase) || w.Kind != "hosted" || w.Ephemeral || w.HibernationState != "preparing" || w.HibernationScalingDownAt.Valid ||
 		!w.HibernationOpID.Valid || w.HibernationOpID.Bytes != op ||
 		!w.SnapshotRegisterNonce.Valid || w.SnapshotRegisterNonce.String != nonce {
 		return none, ErrHibernationConflict
@@ -467,7 +467,7 @@ func (s *Service) HibernationHeartbeat(ctx context.Context, workerID uuid.UUID, 
 				}
 			}
 		}
-		if w.HibernationState != "preparing" || !slices.Contains(w.ProtocolCapabilities, capability.HibernationInventoryV1) || !w.SnapshotRegisterNonce.Valid {
+		if cleanupUnsettled(w.CleanupPhase) || w.HibernationState != "preparing" || !slices.Contains(w.ProtocolCapabilities, capability.HibernationInventoryV1) || !w.SnapshotRegisterNonce.Valid {
 			return nil
 		}
 		gate, err := q.GetHibernationInventoryGateForOp(ctx, store.GetHibernationInventoryGateForOpParams{WorkerID: w.ID, OpID: op})

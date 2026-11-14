@@ -294,6 +294,23 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
 
   }
 
+  it("M1 Now runner Codex with the production claim shape (empty anthropic_oauth_token) still posts the Now note", async () => {
+    // A real Codex claim carries "" for the Anthropic token (api claim_assembly), so no credential holder exists.
+    const claim = claimFor(2607, { kind: "issue", secrets: { ...CODEX_SECRETS, anthropic_oauth_token: "" } });
+    api.nowSummary.set(claim.run_id, true);
+    const rec = { builds: [] as unknown[], requests: [] as AdviceRequest[] };
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
+    try {
+      await runnerFor(workingExecutor(() => notesOf(claim.run_id).length > 0), { homeRoot, queryFn: summaryQuery([]), codexAdviceHarnessFactory: lunaFactory(rec) }).execute(claim);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+    const notes = notesOf(claim.run_id);
+    assert.equal(notes.length, 1, "the Codex Now note posts without an Anthropic credential holder");
+    assert.equal((notes[0]!.payload as Record<string, unknown>).text, "Running the api gate for the docs milestone");
+    assert.equal(rec.requests.length, 1);
+  });
+
   it("M1 Now runner judge is excluded by the shared eligibility predicate", async () => {
     const { isRunSummaryKind } = await import("../src/run-kind.js");
     assert.equal(isRunSummaryKind("judge"), false);

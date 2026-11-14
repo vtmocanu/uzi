@@ -270,11 +270,11 @@ func TestValidateObservedAndHeldTransitions(t *testing.T) {
 			PVCs: []HibernationPVC{pvc("data", "u1"), pvc("nix", "u2")}, PodUIDs: &pods, PVCUserPods: &pods}
 	}
 	tr := good()
-	if _, _, err := validateHibernationTransition(&tr); err != nil {
+	if _, _, _, err := validateHibernationTransition(&tr); err != nil {
 		t.Fatalf("good observed: %v", err)
 	}
 	held := HibernationTransition{OpID: op, Transition: TransitionHeld, DeploymentUID: dep}
-	if _, _, err := validateHibernationTransition(&held); err != nil {
+	if _, _, _, err := validateHibernationTransition(&held); err != nil {
 		t.Fatalf("good held (no resource version, no pod): %v", err)
 	}
 	empty := []string{}
@@ -293,7 +293,7 @@ func TestValidateObservedAndHeldTransitions(t *testing.T) {
 	} {
 		tr := good()
 		mutate(&tr)
-		if _, _, err := validateHibernationTransition(&tr); !isValidationError(err) {
+		if _, _, _, err := validateHibernationTransition(&tr); !isValidationError(err) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}
@@ -305,7 +305,7 @@ func TestValidateObservedAndHeldTransitions(t *testing.T) {
 	}
 	tr = good()
 	tr.PodUIDs, tr.PVCUserPods = &many, &many
-	if _, _, err := validateHibernationTransition(&tr); err != nil {
+	if _, _, _, err := validateHibernationTransition(&tr); err != nil {
 		t.Fatalf("over-cap pod sets: %v", err)
 	}
 	if tr.PodUIDs != nil || tr.PVCUserPods != nil {
@@ -313,13 +313,13 @@ func TestValidateObservedAndHeldTransitions(t *testing.T) {
 	}
 	tr = good()
 	tr.PVCs = nil
-	if _, _, err := validateHibernationTransition(&tr); err != nil {
+	if _, _, _, err := validateHibernationTransition(&tr); err != nil {
 		t.Fatalf("observed without pvcs: %v", err)
 	}
 	// A known-empty pod set is valid and distinct from an absent one.
 	tr = good()
 	tr.PodUIDs, tr.PVCUserPods = &empty, &empty
-	if _, _, err := validateHibernationTransition(&tr); err != nil {
+	if _, _, _, err := validateHibernationTransition(&tr); err != nil {
 		t.Fatalf("empty pod sets: %v", err)
 	}
 }

@@ -18,6 +18,7 @@
 // The SDK child runs through spawnDetached (the runner uid under the uid split, a process-group
 // kill on abort) with a full-replacement env.
 
+import { claudeSdkSettings } from "./sdk-plugin-policy.js";
 import path from "node:path";
 import { CODE_COVERAGE_LIMITS } from "./code-cross-check-coverage.js";
 import type { ActivitySettle, CheckActivityRecorder } from "./cross-check-activity.js";
@@ -29,7 +30,6 @@ import type { SdkQueryFn } from "./sdk-executor.js";
 import { CODE_VERDICT_SCHEMA, PLAN_VERDICT_SCHEMA, codeCrossCheckBrief, codeCrossCheckBriefWithGuidance, codeGuidanceOf, crossCheckBrief, crossCheckPrompt, CrossCheckMalformedError, validateCodeFindings, validateVerdict } from "./codex/cross-check.js";
 import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 import {
-  BUILTIN_PLUGINS_DISABLED,
   buildIsolatedPreToolUse,
   checkIsolatedInit,
   guardIsolatedFrameRefusal,
@@ -170,7 +170,7 @@ export function buildClaudeCrossCheckOptions(input: {
     // Issue #1563: deliver the prompt as written. The CLI otherwise expands `@path`
     // mentions and dispatches a leading slash command before any PreToolUse hook runs.
     verbatimPrompts: true,
-    settings: { enabledPlugins: BUILTIN_PLUGINS_DISABLED },
+    settings: claudeSdkSettings({}, true),
     tools: [...surface.tools],
     disallowedTools: isolatedDisallowedTools(surface),
     mcpServers: {},

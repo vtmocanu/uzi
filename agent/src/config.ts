@@ -294,9 +294,19 @@ export interface Config {
    * (see dind-prune.ts `createDindPrune`). The same flag and predicate also enable issue
    * #3891's pressure-only anonymous-volume leg (dind-volume-prune.ts
    * `createDindVolumePrune`), which unlike the cache prune also runs on a busy or
-   * custody-held worker.
+   * custody-held worker. It is also the master switch for issue #4291's pressure-only
+   * BuildKit regular-cache leg (dind-builder-prune.ts `createDindBuilderPrune`), which
+   * additionally needs {@link Config.dindBuilderPruneEnabled}.
    */
   dindPruneEnabled: boolean;
+  /**
+   * issue #4291: the builder-cache leg's own switch (UZI_DIND_BUILDER_PRUNE_ENABLED). Absent
+   * means ON, so an older controller that never renders it still gets the leg under the
+   * master switch; exactly "true" is on; any other value, "" and "false" included, is off.
+   * The leg runs only when {@link Config.dindPruneEnabled} is also true and a dockerHost is
+   * wired (see dind-builder-prune.ts `createDindBuilderPrune`).
+   */
+  dindBuilderPruneEnabled: boolean;
   /**
    * PRD #1391 M1: the worker-owned authenticated message outbox tree, rooted at
    * `<dataDir>/outbox`. When the api is unreachable the batcher spills run
@@ -701,6 +711,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dockerReadyTimeoutMs: duration(env, "UZI_DOCKER_READY_TIMEOUT", "30s"),
     // issue #1759 M3: exact "true" only (the controller renders "true"/"false").
     dindPruneEnabled: env.UZI_DIND_PRUNE_ENABLED === "true",
+    dindBuilderPruneEnabled:
+      env.UZI_DIND_BUILDER_PRUNE_ENABLED === undefined || env.UZI_DIND_BUILDER_PRUNE_ENABLED === "true",
     // Worker outbox (PRD #1391 M1). The tree is a fixed sibling of the recovery
     // journal under /data; the two byte quotas and the retention window are the
     // operator-tunable bounds. positiveInt keeps the byte knobs plain positive

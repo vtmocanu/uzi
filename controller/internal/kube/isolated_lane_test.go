@@ -232,7 +232,7 @@ func TestIsolatedWorkerNeverGetsDinDOrPrivilege(t *testing.T) {
 				}
 			}
 			env := envMap(pod.Containers[0])
-			for _, k := range []string{"DOCKER_HOST", "TMPDIR", "UZI_DIND_PRUNE_ENABLED"} {
+			for _, k := range []string{"DOCKER_HOST", "TMPDIR", "UZI_DIND_PRUNE_ENABLED", "UZI_DIND_BUILDER_PRUNE_ENABLED"} {
 				if _, ok := env[k]; ok {
 					t.Errorf("an isolated worker carries the docker env %s", k)
 				}

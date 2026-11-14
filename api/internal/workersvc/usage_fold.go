@@ -444,6 +444,9 @@ func (s *Service) appendMessagesLocked(ctx context.Context, wkr store.Worker, ru
 	// maxStored is the high-water mark of what ACTUALLY reached the table,
 	// including rows the insert deduplicated (rows == 0 means this (run_id, seq)
 	// was already persisted by an earlier delivery — stored is stored).
+	if err := s.clampCredentialEpochOrdinals(ctx, run, msgs); err != nil {
+		return obs, err
+	}
 	var maxStored int32
 	var insertErr error
 	inserted := make([]IncomingMessage, 0, len(msgs))
@@ -460,6 +463,8 @@ func (s *Service) appendMessagesLocked(ctx context.Context, wkr store.Worker, ru
 			// unconditionally; a present generation gates the insert on the run still being at
 			// that generation with an unreleased claim.
 			ClaimGeneration: pgconv.Int8Ptr(effectiveClaimGen),
+			// Issue #4201: the clamped in-generation switch epoch (clampCredentialEpochOrdinals).
+			CredentialEpochOrdinal: pgconv.Int4Ptr32(m.CredentialEpochOrdinal),
 		})
 		if err != nil {
 			// The ONLY classified error on this path. See the tripwire on
@@ -789,6 +794,9 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 				// keeps an established non-null provenance, so a straggler re-delivery never
 				// re-attributes an already-attributed leg. nil ⇒ NULL provenance (legacy frame).
 				ClaimGeneration: pgconv.Int8Ptr(m.ClaimGeneration),
+				// Issue #4201: the in-generation switch epoch of the frame. Set-once provenance
+				// in UpsertRunUsage, like claim_generation.
+				CredentialEpochOrdinal: pgconv.Int4Ptr32(m.CredentialEpochOrdinal),
 			}); err != nil {
 				return fmt.Errorf("fold run usage (run %s, model %s): %w", run.ID, model, err)
 			}
@@ -980,4 +988,50 @@ func onlyUsageSideChannel(msgs []IncomingMessage) bool {
 		}
 	}
 	return true
+}
+
+// unattributedCredentialEpoch is the credential_epoch_ordinal stored for a frame whose claimed
+// epoch the server cannot vouch for (issue #4201): its usage belongs to no committed switch epoch
+// and the run view reports it in the unattributed bucket instead of guessing.
+const unattributedCredentialEpoch int32 = -1
+
+// clampCredentialEpochOrdinals rewrites each message's CredentialEpochOrdinal to what the append
+// path may store. It runs under the claim mutation's run lock, the same lock the apply holds while
+// it commits an epoch, so the ceiling it reads cannot move underneath the batch: a frame is stored
+// at its sent ordinal only when that epoch is already committed for the run's current generation,
+// otherwise -1 (permanently unattributed, with a warning). An absent ordinal stays absent, and a
+// chat run (which never switches in place) never attributes.
+func (s *Service) clampCredentialEpochOrdinals(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
+	var ceiling *int32
+	for i := range msgs {
+		m := &msgs[i]
+		if m.CredentialEpochOrdinal == nil {
+			continue
+		}
+		if run.Kind == runkind.Chat {
+			m.CredentialEpochOrdinal = nil
+			continue
+		}
+		sent := *m.CredentialEpochOrdinal
+		if sent == 0 {
+			continue
+		}
+		if sent > 0 {
+			if ceiling == nil {
+				n, err := s.q.MaxCommittedCredentialEpochOrdinal(ctx, store.MaxCommittedCredentialEpochOrdinalParams{RunID: run.ID, ClaimGeneration: run.ClaimGeneration})
+				if err != nil {
+					return fmt.Errorf("max committed credential epoch ordinal: %w", err)
+				}
+				ceiling = &n
+			}
+			if sent <= *ceiling {
+				continue
+			}
+		}
+		slog.Warn("workersvc: worker message names an uncommitted credential epoch; storing it unattributed",
+			"run_id", run.ID.String(), "seq", m.Seq, "generation", run.ClaimGeneration, "sent_ordinal", sent)
+		un := unattributedCredentialEpoch
+		m.CredentialEpochOrdinal = &un
+	}
+	return nil
 }

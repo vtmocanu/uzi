@@ -1060,6 +1060,7 @@ function reconciliationFlight(runId: string) {
     steering: {
       isCancelled: () => control.cancelled, claimFence: () => control.fence,
       lifecycleSignal: () => lifecycle.signal, terminalLifecycleSignal: () => lifecycle.signal,
+      isSettledSwitchSignal: () => false,
     },
   };
 }

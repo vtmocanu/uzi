@@ -13,8 +13,11 @@ type graceCase struct {
 	name string
 	cfg  RenderConfig
 	w    protocol.DesiredWorker
-	// baseHash is specHash(podTemplate(...)) for this exact fixed config at commit
-	// f943b2590f760ea186aa39355b362f20e66fd21e, before the grace period was set.
+	// baseHash is specHash(podTemplate(...)) for this exact fixed config with the
+	// grace period unset. The plain and ephemeral rows are unchanged since commit
+	// f943b2590f760ea186aa39355b362f20e66fd21e (before the grace period was set);
+	// the docker row was re-baselined for #4291's new always-explicit docker-only
+	// UZI_DIND_BUILDER_PRUNE_ENABLED env.
 	baseHash string
 }
 
@@ -23,7 +26,7 @@ func graceCases() []graceCase {
 	ephemeral.Ephemeral = true
 	return []graceCase{
 		{"plain", testConfig(), desired("w1"), "62873a66420e91e389056f04007450d8d5340e9f8ca8b8e86bd0c56339922d46"},
-		{"docker", dockerTestConfig(), desiredDocker("w1"), "405f77daac7790c3fc992cef8ff19eb7bae2df7d165c5339266560ae26b1c9c7"},
+		{"docker", dockerTestConfig(), desiredDocker("w1"), "2a73202367435560d8b135909eac17f1aaa1106807e33b0b7f234647e3ad0d72"},
 		{"ephemeral", testConfig(), ephemeral, "62873a66420e91e389056f04007450d8d5340e9f8ca8b8e86bd0c56339922d46"},
 	}
 }

@@ -10,8 +10,8 @@ import type { aggregateDisclosure } from "../lib/costStatus";
 import { cx } from "./ui";
 import type { UsageWindow } from "./UsageCards";
 
-// Presentation pieces shared by the current Overview's UsageCard (UsageCards.tsx) and the
-// Overview preview's OverviewUsageCard, so the two cannot drift before PRD #3877.
+// Presentation pieces shared by the classic Overview's UsageCard (UsageCards.tsx) and the
+// default Overview's OverviewUsageCard during the bounded #3877 soak.
 
 // Issue #4209: run counts and failure rates cover primary work; tokens and cost also include
 // helper runs. One literal for both Usage cards, rendered under the KPI grid.
@@ -108,7 +108,7 @@ export function FailedRunsBlock({ outcomes, personal, framed = true }: { outcome
   );
 }
 
-// "inline" is the current Overview's one-line summary; "list" is the preview's top-3 rows
+// "inline" is the classic Overview's one-line summary; "list" is the default page's top-3 rows
 // with a bar per cause and an "other causes" total.
 export function TopCauses({ outcomes, personal, variant = "inline" }: { outcomes: RunOutcomes; personal: boolean; variant?: "inline" | "list" }) {
   const causes = Object.entries(outcomes.fail_origins)
@@ -239,8 +239,8 @@ export function WindowToggle({ value, onChange, className, steadyWidth }: { valu
   return <SegmentedToggle label="Usage reporting period" options={WINDOW_OPTIONS} value={value} onChange={onChange} className={className} steadyWidth={steadyWidth} />;
 }
 
-// Table cells for both per-user tables. "current" is the current Overview's PerUserUsageTable
-// (unchanged markup); "preview" is the Overview preview's By user table (PRD #3881), whose
+// Table cells for both per-user tables. "current" is the classic Overview's PerUserUsageTable
+// (unchanged markup); "preview" is the default Overview's By user table (PRD #3881), whose
 // first column names its row.
 type TableVariant = "current" | "preview";
 

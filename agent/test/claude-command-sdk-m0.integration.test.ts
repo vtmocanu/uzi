@@ -203,6 +203,7 @@ interface ScenarioResult {
   queryError?: string;
   queryEndAt?: number;
   initVersion?: string;
+  initPlugins?: unknown;
   extra: Record<string, unknown>;
 }
 
@@ -363,7 +364,10 @@ async function runScenario(sc: Scenario, roots: string[]): Promise<ScenarioResul
   }
   try {
     for await (const m of query({ prompt: token, options })) {
-      if (m.type === "system" && m.subtype === "init") r.initVersion = (m as { claude_code_version?: string }).claude_code_version;
+      if (m.type === "system" && m.subtype === "init") {
+        r.initVersion = (m as { claude_code_version?: string }).claude_code_version;
+        r.initPlugins = (m as { plugins?: unknown }).plugins;
+      }
     }
   } catch (err) {
     r.queryError = String(err);
@@ -516,9 +520,12 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
     result("1-cli", { sdkInit: lead.initVersion });
     // A bump of either pin invalidates this proof: re-run M0 for the new SDK before changing the pins.
     const sdkPkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "node_modules", "@anthropic-ai", "claude-agent-sdk", "package.json"), "utf8")) as { version: string };
-    assert.equal(sdkPkg.version, "0.3.316", "installed SDK package version changed: re-run M0 for the new SDK");
-    assert.equal(lead.initVersion, "2.1.316", "bundled CLI version changed: re-run M0 for the new SDK");
+    assert.equal(sdkPkg.version, "0.3.319", "installed SDK package version changed: re-run M0 for the new SDK");
+    assert.equal(lead.initVersion, "2.1.319", "bundled CLI version changed: re-run M0 for the new SDK");
     for (const r of [lead, inherit, explicit]) {
+      assert.ok(Array.isArray(r.initPlugins), `${r.name}: init plugin metadata is present`);
+      assert.ok(!r.initPlugins.some((p: { name?: string; source?: string }) =>
+        p.name === "cc-plugin-privacy" || p.source === "cc-plugin-privacy@builtin"), `${r.name}: the vendor privacy builtin is disabled`);
       result("1-offered", {
         scenario: r.name,
         leadOffered: r.offered.lead,

@@ -7,6 +7,7 @@ import type { Executor } from "../src/executor.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
 import { nullLogger } from "./helpers.js";
+import { SecretSet } from "../src/redact.js";
 import { api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -140,7 +141,7 @@ test("a Claude claim on a guard-bound runner is enrolled; a missing memory field
     assert.equal(calls, 1);
     assert.equal(typeof accessor, "function");
     assert.equal(typeof subscribe, "function");
-    assert.ok(Array.isArray(secrets) && secrets.includes(f.claim.secrets.forge_pat), "the run's redaction secrets ride the ctx");
+    assert.ok(secrets instanceof SecretSet && secrets.values().includes(f.claim.secrets.forge_pat), "the run's redaction secrets ride the ctx");
   } finally { await f.memory.stop(); }
 });
 

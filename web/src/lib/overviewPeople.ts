@@ -1,4 +1,4 @@
-// Pure model for the Overview preview's People chip (admins, issue #4042). Nothing here
+// Pure model for the default Overview's People chip (admins, issue #4042). Nothing here
 // fetches or renders. The roster is a "who is doing what" read over the admin run list, the
 // user list and the usage aggregate; every source can fail on its own, so each part of the
 // model degrades independently instead of guessing.

@@ -125,6 +125,10 @@ type Materializer struct {
 	// claimEvent. Process-local and best-effort: a restart merely re-logs once.
 	claimLogMu sync.Mutex
 	claimLog   map[string]string
+	// cleanupReported dedups cleanup_stopped reports per worker (PRD #4206); process-local,
+	// so a restart may resend once.
+	cleanupMu       sync.Mutex
+	cleanupReported map[string]cleanupReportKey
 	// now is the clock seam for roll-health's age arm (PRD #113 M3). A bare
 	// time.Now() at the comparison site would make stuckAge testable only by
 	// sleeping for ten minutes. Defaulted in New; overridden directly by tests,

@@ -1,4 +1,4 @@
-// The Overview preview's Runs card (PRD #3878 M3): the viewer's own active runs ("Yours")
+// The default Overview's Runs card (PRD #3878 M3, promoted by #3877): the viewer's own active runs ("Yours")
 // and, for an admin, every other user's active runs ("Other users (admin)"). Other users'
 // rows are read-only: OverviewRunRow carries no action buttons, and the decision card never
 // reads these rows.

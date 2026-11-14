@@ -20,9 +20,11 @@
 | #4042 (issue) | Admin People chip: how many people are active now, with a who-is-doing-what popover; target mock `prds/mockups/3873-overview-people-chip.html` | #3881 |
 | #4078 (issue) | Capacity rail: richer worker rows (gauges, problem badges on the collapsed row, runs on the worker, version and uptime); target mock `prds/mockups/3873-overview-worker-rows.html` | #4042 (same page and fixtures) |
 | #4082 (issue) | Issue work: cross-check state in the run chip ("cross-checking", "cross-check: revise / blocked / unavailable"); target mock `prds/mockups/3873-overview-issue-work-crosscheck.html` | #4078 (same page and fixtures) |
-| #3877 (`prds/3877-overview-promote.md`) | Promote the new Overview to `/dashboard` and retire the old one | #3878, #3879, #3880, #3881, #4052, #4041, #4040, #4042, #4078, #4082, and the maintainer's trial verdict |
+| #4334 (issue) | Admin Repos chip after People: "N repos active of M" with a People-style popover; target mock committed by its PR (3873-overview-repos-chip.html) | #3877 M1 (landing order) |
+| #4335 (issue) | Agent count: a summary line on the Agents page and an Agents chip after Repos; target mock committed by its PR (3873-overview-agents-count.html) | #4334 (landing order) |
+| #3877 (`prds/3877-overview-promote.md`) | Promote the new Overview to `/dashboard` (M1), then retire the old one before the next stable (M2) | Verdict recorded 2026-11-14 (promote, with a soak). M2: M1, #4334, #4335 |
 
-Every child edits the preview page, so run them one at a time, in this order: #3878, #3880, #3879, #3881, #4052, #4041, #4040, #4042, #4078, #4082, #3876; #3875 any time after #3880; #3877 last.
+The preview-era children landed serially in this order: #3878, #3880, #3879, #3881, #4052, #4041, #4040, #4042, #4078, #4082, #3876; #3875 any time after #3880. Then land in this order: **#3877 M1 → #4334 → #4335 → #3877 M2**; the in-flight #4334 and #4335 branches rebase onto M1 (the page moves from `/overview/next` to `/dashboard`) before they merge.
 
 ## Mock contract (applies to every child PRD)
 
@@ -194,11 +196,11 @@ Build from what exists; do not re-implement these. The original anchors were che
 - **D21** ci_fix and mr_rework runs sit in Other work: they maintain an existing PR, they are not issue lifecycle stages.
 - **D22** Shadow markers: `data-attention` on the decisions card, `data-live` on the issue-work card.
 - **D23** The per-user provider split counts runs by harness, the same population as Runs; a cost split would need per-model cost attribution and is out of scope.
-- **D24** The new Overview lives at `/overview/next`, linked both ways with the current Overview, until #3877.
+- **D24** The new Overview lives at `/overview/next`, linked both ways with the current Overview, until #3877. #3877 M1 moves it to `/dashboard` and the old page to `/overview/classic` (linked both ways) until M2 retires the old page.
 
 ## Open decisions
 
-1. After the trial: promote the preview and delete the old Overview (B), or keep both behind a per-user setting (C)? Decided at #3877.
+1. ~~After the trial: promote the preview and delete the old Overview (B), or keep both behind a per-user setting (C)?~~ Decided 2026-11-14 (maintainer, recorded on #3873): B, promote with a short soak (#3877 M1 default, M2 retire before the next stable).
 Resolved since the issue was filed: ci_fix and mr_rework placement (D21), Shadow markers (D22), provider split by runs (D23), banners Overview-only (D20), Cmd K on every signed-in page with the button on the Overview only (D19).
 
 ## Inspiration (patterns borrowed, not visuals)

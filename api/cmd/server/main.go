@@ -977,6 +977,15 @@ func run() error {
 			Name: "held_publication",
 			Run:  wsvc.SweepHeldPublications,
 		},
+		// Terminal preservation (issue #4007): reconcile of unknown publications and stale-bound rows
+		// for the refs/uzi-terminal refs; its retire lane is compiled in but disabled
+		// (terminalRetirementEnabled). ALWAYS registered and effect-inert when nothing is due: one
+		// bounded, indexed due-row query, no credential resolution, no forge call, no row write.
+		// It never touches run_held_publications, which SweepHeldPublications alone owns.
+		sweeper.Pass{
+			Name: "terminal_preservation",
+			Run:  wsvc.SweepTerminalPreservations,
+		},
 		// Prerequisite closure always advances existing rows, regardless of admission knobs.
 		// Its extra share before run liveness is at most a 10s pass plus a 5s in-flight
 		// durable outcome tail (15s), independent of WorkerHeartbeatStale and RunTimeout.

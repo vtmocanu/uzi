@@ -18,6 +18,15 @@
 import type { EmittedMessage } from "./executor.js";
 import type { HarnessAttribution, HarnessItem } from "./harness.js";
 
+/** PRD #332 / issue #334 — the `run_usage` lineage-break marker. Tagged onto the
+ *  worker slog line AND the run-feed status payload emitted when a resume is DROPPED
+ *  and the runner starts a FRESH SDK session (the ONLY path that breaks run_usage
+ *  resume-lineage). Low-cardinality and stable so a maintainer can aggregate its
+ *  frequency — e.g. `count(*) from run_messages where payload->>'event' =
+ *  'resume_lineage_break'` — to decide whether #332's deferred Option B is worth a
+ *  schema+protocol change. Renaming this literal silently breaks that aggregation. */
+export const RESUME_LINEAGE_BREAK_EVENT = "resume_lineage_break";
+
 /** The lead runs on the main thread; subagents carry a `subagent_type`. */
 const LEAD = "lead";
 

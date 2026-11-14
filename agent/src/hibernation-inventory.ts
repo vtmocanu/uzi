@@ -7,7 +7,7 @@
 // else); every other lane has no proven exclusion mechanism and keeps its volumes.
 //
 // Exclusion = epoch lock EX + writer latch + quiescence:
-//   - the claim gate is closed under the `hibernation` owner (no new run/chat/cross-check claim);
+//   - the claim gate is closed under the `hibernation_inventory` owner (no new run/chat/cross-check claim);
 //   - `HibernationWriterRegistry.latch()` makes every registered background writer refuse to start,
 //     and `settle()` waits for those already inside;
 //   - the existing trackers are used as-is: DindPruneGate.inFlightClaims(), Worker.isIdle();
@@ -17,15 +17,17 @@
 // ENUMERATED DATA-VOLUME WRITER CLASSES (registry class name -> registration site, covered by):
 //   claim gate + in-flight trackers (no registry wrap: nothing runs once the gate is closed and
 //   Worker.isIdle() is true):
-//     run lane claim loop        worker.ts Worker.claimLoop (run lane)     gate "hibernation" + runActive
-//     cross-check lane           worker.ts Worker.claimLoop (crossCheck)   gate "hibernation" + crossCheckActive
-//     chat lane                  worker.ts Worker.chatClaimLoop            gate "hibernation" + chatActive
+//     run lane claim loop        worker.ts Worker.claimLoop (run lane)     gate "hibernation_inventory" + runActive
+//     cross-check lane           worker.ts Worker.claimLoop (crossCheck)   gate "hibernation_inventory" + crossCheckActive
+//     chat lane                  worker.ts Worker.chatClaimLoop            gate "hibernation_inventory" + chatActive
 //     judge / review / job /     claimed through the run lane above        runActive (isIdle)
 //       isolated / ci_fix runs
 //     checkpoint ticks, publication, recovery capture, fetch-back, run HOME/outbox spill of a live
 //       run                      inside runner.execute                     runActive (isIdle)
 //     terminal_maintenance       maintenance-exclusion.ts run()            refuses while gate.claimsClosed(); held
 //                                                                          owner is checked in the idle probe
+//     hibernation cache prune    hibernation-cache-prune.ts               distinct gate owner "hibernation";
+//                                                                          inventory requires sole gate ownership
 //   registry classes (HibernationWriterRegistry.enter at the start of each pass):
 //     outbox_drain               worker.ts Worker.drainOutbox (boot drain + every heartbeat)
 //     terminal_sweep             worker.ts heartbeatLoop sweepPendingTerminals
@@ -381,7 +383,7 @@ export class HibernationInventoryController {
 
   private intact(): boolean {
     return this.held !== undefined && this.held.ex && this.ownershipMode() === "exclusive" &&
-      this.deps.registry.isLatched() && this.deps.gate.heldBy("hibernation");
+      this.deps.registry.isLatched() && this.deps.gate.heldBy("hibernation_inventory");
   }
 
   private async drain(): Promise<void> {
@@ -437,11 +439,11 @@ export class HibernationInventoryController {
     // (a) latch writers and close the claim gate.
     this.held = { opId: m.op_id, ex: false, accepted: false, nonce: m.register_nonce, podUid: m.pod_uid };
     d.registry.latch();
-    d.gate.close("hibernation");
+    d.gate.close("hibernation_inventory");
     try {
       // (b) settle in-flight writers, bounded.
       const quiet = () => d.isIdle() && d.gate.inFlightClaims() === 0 &&
-        !d.gate.heldBy("terminal_maintenance") && !d.gate.heldBy("retained_ops");
+        d.gate.onlyHeldBy("hibernation_inventory");
       try {
         await d.registry.settle(d.settleMs ?? SETTLE_MS, this.abort.signal, quiet);
       } catch (err) {
@@ -530,7 +532,7 @@ export class HibernationInventoryController {
         return;
       }
     }
-    d.gate.open("hibernation");
+    d.gate.open("hibernation_inventory");
     d.registry.unlatch();
     this.held = undefined;
   }

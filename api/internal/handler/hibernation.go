@@ -55,7 +55,8 @@ func (h *Handler) ControllerHibernation(w http.ResponseWriter, r *http.Request) 
 	row, err := h.wsvc.ApplyTransition(r.Context(), id, workersvc.HibernationTransition{
 		OpID: body.OpID, Transition: body.Transition, DeploymentUID: body.DeploymentUID,
 		ResourceVersion: body.ResourceVersion, PodUID: body.PodUID, Reason: body.Reason,
-		PVCs: pvcs, PodUIDs: body.PodUIDs, PVCUserPods: body.PVCUserPods,
+		CleanupOpID: body.CleanupOpID,
+		PVCs:        pvcs, PodUIDs: body.PodUIDs, PVCUserPods: body.PVCUserPods,
 		DeploymentGeneration: body.DeploymentGeneration, DeploymentReplicas: body.DeploymentReplicas,
 		FenceGeneration: body.FenceGeneration,
 	})

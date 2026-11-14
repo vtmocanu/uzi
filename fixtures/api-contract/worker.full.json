@@ -21,6 +21,11 @@
   "hibernated_at": "2020-01-02T03:04:05Z",
   "wake_requested_at": "2020-01-02T03:04:05Z",
   "wake_error": "x",
+  "hibernation_cleanup": {
+    "state": "x",
+    "outcome": "x",
+    "reason": "x"
+  },
   "roll_pacing": {},
   "id": "x",
   "name": "x",

@@ -443,3 +443,47 @@ describe("the plan pass's summary_usage", () => {
     assert.equal(planUsage(probe).length, 0);
   });
 });
+
+// Issue #4201 m2d: the intent and plan passes snapshot the run's credential ONCE, at their start. The pass
+// uses that token and its summary_usage frame carries that epoch ordinal (the wire field is present only
+// above the base epoch), even when an in-place switch publishes a newer credential while it runs.
+describe("summary passes attribute their usage to the credential read at their start", () => {
+  const OLD = "dummy-oauth-token-do-not-scan-0000";
+  const NEW = "dummy-new-oauth-token-do-not-scan-9999";
+
+  /** A mutable credential view, as the runner's CredentialHolder presents it to the context. */
+  function holder(initial: { token: string; ordinal: number }) {
+    const state = { ...initial };
+    return { state, view: () => ({ ...state }), publish: (token: string, ordinal: number) => { state.token = token; state.ordinal = ordinal; } };
+  }
+
+  for (const pass of ["intent", "plan"] as const) {
+    for (const startsAt of [0, 1] as const) {
+      it(`${pass} pass started at epoch ${startsAt}: its token and ordinal survive a switch that lands while it runs`, async () => {
+        const cred = holder(startsAt === 0 ? { token: OLD, ordinal: 0 } : { token: NEW, ordinal: 1 });
+        const seen: Array<string | undefined> = [];
+        const runner = {
+          generateIntentSummary: async (input: IntentSummaryInput) => {
+            if (pass === "intent") seen.push(input.token);
+            if (pass === "intent") { cred.publish(NEW, 1); input.onUsage!(USAGE); }
+            return null;
+          },
+          generatePlanSummary: async (input: PlanSummaryInput) => {
+            if (pass === "plan") seen.push(input.token);
+            if (pass === "plan") { cred.publish(NEW, 1); input.onUsage!(USAGE); }
+            return null;
+          },
+        } as unknown as SummaryRunner;
+        const callingPlanSummary: RunContext["gatePlan"] = async (plan, _m, generate) => (await generate?.(plan), approve);
+        const probe = makeCtx({ credential: cred.view, gatePlan: callingPlanSummary });
+        await newExec(spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]), runner).run(probe.ctx);
+        const frames = probe.usage().filter((m) => m.payload["pass"] === pass);
+        assert.equal(frames.length, 1, "one usage frame for the pass");
+        const expectedToken = startsAt === 0 ? OLD : NEW;
+        assert.ok(seen.every((t) => t === expectedToken), `every pass used the start-of-call token: ${JSON.stringify(seen)}`);
+        if (startsAt === 0) assert.equal(frames[0]!.credentialEpochOrdinal, undefined, "an old-epoch pass keeps the base epoch even though it settled after the apply");
+        else assert.equal(frames[0]!.credentialEpochOrdinal, 1);
+      });
+    }
+  }
+});

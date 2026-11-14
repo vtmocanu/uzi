@@ -40,7 +40,7 @@ function worker(hibernation: HibernationInventoryController | undefined, client:
     {} as JudgeRunner, {} as ReviewRunner, nullLogger(), () => ({ ok: true, missing: [] }),
     undefined, undefined, undefined, undefined, undefined, undefined, undefined,
     () => collector, undefined, undefined, undefined,
-    undefined, undefined, undefined, undefined, undefined, undefined, hibernation,
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, hibernation,
   );
   const loops = w as unknown as {
     registerWithRetry(signal: AbortSignal): Promise<void>;

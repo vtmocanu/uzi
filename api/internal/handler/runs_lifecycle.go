@@ -680,7 +680,19 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	if epochs, err := h.wsvc.RunCredentialEpochs(r.Context(), run.ID, run.UserID); err != nil {
 		slog.Error("list run credential epochs", "run_id", run.ID, "error", err)
 	} else {
-		dto.CredentialEpochs = credentialEpochsToDTO(epochs)
+		// Issue #4201: the in-place switch epochs and the per-epoch usage legs. Best-effort like the
+		// journal itself: a failed read degrades to the base epochs without usage.
+		switches, swErr := h.wsvc.RunCredentialSwitchEpochs(r.Context(), run.ID, run.UserID)
+		if swErr != nil {
+			slog.Error("list run credential switch epochs", "run_id", run.ID, "error", swErr)
+			switches = nil
+		}
+		legs, legErr := h.wsvc.RunUsageByCredentialEpoch(r.Context(), run.ID)
+		if legErr != nil {
+			slog.Error("list run usage by credential epoch", "run_id", run.ID, "error", legErr)
+			legs = nil
+		}
+		dto.CredentialEpochs = credentialEpochsToDTO(epochs, switches, legs)
 		// PRD #1247 Step A (D14): credentialSwitchState derives credential_switch purely from
 		// the run row. Since issue #1422 the reclaimed generation's epoch write clears the
 		// switch stamp in the DB, so a switch applied after that landed already reads null.

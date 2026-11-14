@@ -267,19 +267,39 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID 
 	}
 
 	tok, err := secretopen.OpenByID(ctx, s.q, s.vlt, s.box, userID, meta.ID)
+	if err != nil {
+		return claimCred{}, mapAnthropicOpenError(err)
+	}
+	return claimCred{ID: meta.ID, Label: meta.Label, Token: tok}, nil
+}
+
+// mapAnthropicOpenError maps a secretopen failure to the claim lane's domain errors, so the
+// claim open (openAnthropic) and the in-place apply's in-transaction open (openAnthropicSealed)
+// classify the same failure the same way. A nil error stays nil.
+func mapAnthropicOpenError(err error) error {
 	switch {
 	case err == nil:
-		return claimCred{ID: meta.ID, Label: meta.Label, Token: tok}, nil
+		return nil
 	case errors.Is(err, secretopen.ErrVaultLocked):
-		return claimCred{}, errVaultLocked
+		return errVaultLocked
 	case errors.Is(err, secretopen.ErrNoSecret):
-		return claimCred{}, errNoModelCredential
+		return errNoModelCredential
 	case errors.Is(err, secretopen.ErrUndecryptable):
-		return claimCred{}, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
+		return fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
 	default:
 		// A DB lookup/internal error, surfaced verbatim (carries no secret bytes).
-		return claimCred{}, err
+		return err
 	}
+}
+
+// openAnthropicSealed decrypts the ciphertext of ONE Anthropic token row the caller already holds
+// (a locked row read inside a transaction), dispatching on that row's sealed_with: 'master' and
+// 'master_aad' open under the process box, 'dek' needs the owner's vault unlocked (errVaultLocked
+// otherwise). Unlike openAnthropic it reads nothing, so it cannot decrypt a row other than the
+// one whose bytes it is given.
+func (s *Service) openAnthropicSealed(userID uuid.UUID, sealedWith string, ciphertext []byte) ([]byte, error) {
+	tok, err := secretopen.OpenSealed(s.vlt, s.box, userID, store.KindAnthropicToken, sealedWith, ciphertext)
+	return tok, mapAnthropicOpenError(err)
 }
 
 // recordRunCredential persists WHICH credential a claim spent, on the run it was
@@ -302,10 +322,7 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 	// because there is no reading behind those choices; NULL also on D14's retry,
 	// where the credential actually spent is the fallback and the measured headroom
 	// described the one that would not open.
-	headroom := pgtype.Int2{}
-	if choice.headroom != nil {
-		headroom = pgtype.Int2{Int16: *choice.headroom, Valid: true}
-	}
+	headroom := headroomParam(choice)
 	// The RUN-LANE claim path (emitSwitchMessage) emits a 'credential_switch' run message on an
 	// APPLIED token switch, ATOMICALLY with the credential write + epoch journal, so the message
 	// and the journal can never disagree about which token this claim spends (PRD #1247 M9, D7/D14).
@@ -320,6 +337,15 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 		return run.LastSeq, nil
 	}
 	return s.recordRunCredentialTx(ctx, run, cred, choice, headroom)
+}
+
+// headroomParam is the raw headroom of a pick as the SetRunAnthropicSecret parameter (NULL for every
+// lane without a reading behind its choice).
+func headroomParam(choice secretChoice) pgtype.Int2 {
+	if choice.headroom == nil {
+		return pgtype.Int2{}
+	}
+	return pgtype.Int2{Int16: *choice.headroom, Valid: true}
 }
 
 // credentialWriter is the two-statement credential-record surface shared by the transactional
@@ -391,6 +417,9 @@ type credentialSwitchMessagePayload struct {
 	Label        *string `json:"label"`
 	SelectReason string  `json:"select_reason"`
 	SecretID     string  `json:"secret_id"`
+	// Ordinal is the in-generation switch epoch an in-place apply opened (issue #4201); omitted on
+	// the claim path's message, whose epoch is the claim's base.
+	Ordinal int32 `json:"ordinal,omitempty"`
 }
 
 // pendingSwitchBroadcast carries the just-inserted switch message out of the transaction so the

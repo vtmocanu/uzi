@@ -419,6 +419,8 @@ var inventoryQueryFiles = []string{
 	"findings.sql",
 	// PRD #3454 instance maintenance mode
 	"intake_pause.sql",
+	// Issue #4007 slice A — the terminal preservation store
+	"terminal_preservation.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -1072,6 +1074,73 @@ var queryInventory = []queryPin{
 	{"ListRunQueueReasons", "intake_pause.sql", "TestQueueReasonLiveDB",
 		"../handler: runs_dto.go batch lookup behind the run reads; asserts queue_reason for queued " +
 			"runs while paused and its absence once lifted. Also called from workersvc/jobs.go"},
+	// Issue #4007 slice A, M1: the terminal preservation store. Later milestones add their writers.
+	{"HasOpenGuardedHoldForWorker", "terminal_preservation.sql", "TestTerminalPreservationGateLiveDB",
+		"../workersvc: the TerminalPreservationGate hold predicate; asserts an open guarded hold of this worker " +
+			"passes and a run with no hold of this worker is refused with no write"},
+	{"InsertTerminalPreservation", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the insert-or-load contract on a repeated insert"},
+	{"GetTerminalPreservationByRun", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the ref and lifetime of the loaded row"},
+	{"InsertTerminalContribution", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the prepared and recorded births and the nullable hold and prior tip"},
+	{"GetTerminalContributionByRunGeneration", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the generation selects its own row"},
+	{"ListTerminalContributionsForRun", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the newest-generation-first order"},
+	{"ListTerminalPreservationsDue", "terminal_preservation.sql", "TestTerminalPreservationDueListLiveDB",
+		"direct call; asserts the state filter, the future exclusion, the (next_check_at, id) order and the limit"},
+	{"CountLiveTerminalPreservationsForRepo", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: the DELETE /api/repos/{id} pre-check; asserts a pointer-bearing row blocks and a bound row does not"},
+	{"ListLiveTerminalRefsForRepo", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: names the refs/uzi-terminal ref in the repo-removal 409"},
+	{"CountLiveTerminalPreservationsForConnection", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: the DELETE /api/forge/connections/{id} pre-check"},
+	{"ListLiveTerminalRefsForConnection", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: names the refs/uzi-terminal ref in the connection-removal 409"},
+	// Issue #4007 slice A, M3: the worker route's writers. Each is a CAS on the expected state.
+	{"GetTerminalPreservationForUpdate", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the locked read returns the run's preservation"},
+	// Issue #4007 slice A, M5: the completed-publication gate's authoritative reads.
+	{"GetTerminalPreservationForShare", "terminal_preservation.sql", "TestCompletedPublicationTerminalGateLiveDB",
+		"../workersvc: verifyCompletedPublication takes it FOR SHARE before the contribution; the gate cases pass through it"},
+	{"GetTerminalContributionForShare", "terminal_preservation.sql", "TestCompletedPublicationTerminalGateLiveDB",
+		"../workersvc: the pending, refused, published, recorded and other-generation cases decide the hold release"},
+	{"MarkTerminalPreservationPublishing", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the live pointer is set and a wrong expected state or tip changes no row"},
+	{"MarkTerminalPreservationNotPublished", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts bound -> not_published once and a refused repeat"},
+	{"SettleTerminalPreservationLive", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the tip advance needs a published contribution and the old tip, and first_published_at is kept"},
+	{"SettleTerminalPreservationRefused", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts back to live with a tip, to not_published without one, and refusal while a push may exist"},
+	{"ScheduleTerminalPreservationCheck", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the single-row scheduling write"},
+	{"MarkTerminalContributionInvoked", "terminal_preservation.sql", "TestTerminalInvokeVersusNotPublishedLiveDB",
+		"direct and two-session; asserts the marker needs a publishing preservation in both interleavings"},
+	{"RecordTerminalContributionPublished", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts invoked and publish_unknown -> published and a wrong expected state changes no row"},
+	{"RecordTerminalContributionRefused", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts a refusal needs its reason and the expected state"},
+	{"RecordTerminalContributionUnknown", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts invoked -> publish_unknown once"},
+	// Issue #4007 slice A, M4: the sweep's lanes (reconcile, stale-bound, retire).
+	{"GetTerminalSweepClock", "terminal_preservation.sql", "TestTerminalSweepRetireLiveDB",
+		"../workersvc: the retire observation's database-clock stamp; asserts a stale observation is discarded " +
+			"with no write and a fresh one retires"},
+	{"DeferTerminalPreservation", "terminal_preservation.sql", "TestTerminalSweepReconcileLiveDB",
+		"../workersvc: the sweep's backoff and skip write; asserts attempts and next_check_at move on a listing error " +
+			"and the state does not"},
+	{"MarkTerminalPreservationAbandoned", "terminal_preservation.sql", "TestTerminalSweepReconcileLiveDB",
+		"../workersvc: a foreign tip found by the reconcile lane; asserts publishing -> abandoned, the pointer cleared " +
+			"and the ref never deleted"},
+	{"MarkTerminalPreservationRetiring", "terminal_preservation.sql", "TestTerminalSweepRetireLiveDB",
+		"../workersvc: tx-R1; asserts the stamped decision, and no row for a stale observation or a moved tip"},
+	{"MarkTerminalPreservationDeleted", "terminal_preservation.sql", "TestTerminalSweepRetireIrrevocableLiveDB",
+		"../workersvc: tx-R2; asserts retiring -> deleted with the pointer cleared and deleted_at set"},
+	{"GetTerminalRetireBlocker", "terminal_preservation.sql", "TestTerminalSweepRetireLiveDB",
+		"../workersvc: the independent protections re-checked under the run lock; asserts each keeps the ref and " +
+			"writes its typed reason"},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)

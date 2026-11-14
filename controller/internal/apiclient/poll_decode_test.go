@@ -35,8 +35,15 @@ func TestDecodePollAcceptsSharedEvidenceGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodePoll rejected the API's evidence-bearing golden: %v", err)
 	}
-	if len(got.Workers) != 3 {
-		t.Fatalf("decoded %d workers, want 3", len(got.Workers))
+	if len(got.Workers) != 4 {
+		t.Fatalf("decoded %d workers, want 4", len(got.Workers))
+	}
+	cleaning := got.Workers[3].Hibernation
+	if cleaning == nil || cleaning.Cleanup == nil ||
+		cleaning.Cleanup.OpID != "88888888-8888-8888-8888-888888888888" ||
+		cleaning.Cleanup.StopProofPodUID != "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" ||
+		cleaning.Cleanup.ReconcileSeq != 2 {
+		t.Fatalf("decodePoll lost the cleaning cleanup block: %+v", cleaning)
 	}
 	evidence := got.Workers[0].RollEvidence
 	if evidence == nil || !evidence.Registered || evidence.OrdinaryCoverage || !evidence.CheckerCoverage {

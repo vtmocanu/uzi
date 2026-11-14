@@ -44,6 +44,12 @@ func sampleHibernationTransitions() []HibernationTransition {
 			PodUID: "66666666-6666-6666-6666-666666666666",
 		},
 		{
+			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionCleanupStopped,
+			DeploymentUID: "77777777-7777-7777-7777-777777777777",
+			PodUID:        "66666666-6666-6666-6666-666666666666",
+			CleanupOpID:   "88888888-8888-8888-8888-888888888888",
+		},
+		{
 			OpID: "55555555-5555-5555-5555-555555555555", Transition: TransitionObserved,
 			DeploymentUID: "77777777-7777-7777-7777-777777777777", ResourceVersion: "12340",
 			PodUID: "66666666-6666-6666-6666-666666666666",
@@ -109,6 +115,8 @@ func TestHibernationTransitionLiterals(t *testing.T) {
 		{TransitionScalingDown, "scaling_down"},
 		{TransitionScaledDown, "scaled_down"},
 		{TransitionReady, "ready"},
+		{TransitionCleanupStopped, "cleanup_stopped"},
+		{HibernationCleaning, "cleaning"},
 		{TransitionObserved, "observed"},
 		{TransitionHeld, "held"},
 		{InventoryGateObserve, "observe"},

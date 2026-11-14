@@ -139,7 +139,7 @@ Self and Admin usage retain recorded partial dollars from incomplete runs,
 and disclose incompleteness, e.g. "+ 2 runs without a cost estimate and
 1 unreported run". The tooltip says "Runs without a cost estimate: tokens
 only" and "Unreported runs: cost incomplete; recorded partial costs
-included". The dashboard heading is "Cost (API-equivalent)"; the per-user
+included". The Overview Usage card labels this figure "Cost (API-equivalent)"; the per-user
 table ranks by recorded API-equivalent cost. Cost share is each user's share
 of recorded factory cost in the selected period, unavailable when that cost
 is zero. Incomplete-cost disclosures also apply to these shares.

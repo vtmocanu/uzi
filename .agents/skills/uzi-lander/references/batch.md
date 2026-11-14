@@ -47,7 +47,7 @@ Watch several PRs' CI at once with `S/watch-prs-ci.sh <PR> [<PR>...]` in the bac
 ## 3. Order the green batch
 
 **Our PRs first, the routine Renovate minor/patch batch last** (most green patches
-automerge in the weekly window; one still open is landed here: references/renovate.md). Renovate rebases its own PRs
+automerge in the weekly window; the ones still open are landed here, batched into one PR when CI-sufficient: references/renovate.md). Renovate rebases its own PRs
 only in its Saturday-morning window, so landing ours first keeps them fresh for the next window (between
 windows they stay stale or conflicting: references/renovate.md); the reverse re-stales
 ours against the new deps. It also isolates dependency breakage (features settled, then deps)
@@ -84,7 +84,7 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
 - **Per PR**: review lane done; one green PR CI run on the reviewed pushed head (its base may be
   stale); `MERGEABLE` (no conflict); migrations renumbered and `task check:migration-numbering`
   run locally. A PR adding a migration or touching data integrity also needs the
-  `test-codex-refresh-lostreply-e2e` job's `LiveDB: N passed, 0 skipped` line on that head (SKILL.md step 5).
+  `LiveDB: N passed, 0 skipped` line from both `test-livedb-workersvc` and `test-codex-refresh-lostreply-e2e` on that head (SKILL.md step 5).
 - **Batch**: 4-5 PRs, one per area. Two `agent/**` PRs may pair when their tests and jobs
   are separable. If both touch the worker image or packaged runtime, dispatch
   `gh workflow run codex-packaged-proof.yml --ref main` after both merge, confirm the run's

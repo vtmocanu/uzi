@@ -13,6 +13,9 @@
 {{- if not (kindIs "bool" $epochReclaim.retireScratchOutcomes) -}}
 {{- fail "workers.epochReclaim.retireScratchOutcomes must be a boolean" -}}
 {{- end -}}
+{{- if not (kindIs "bool" .Values.workers.dindBuilderPruneEnabled) -}}
+{{- fail "workers.dindBuilderPruneEnabled must be a boolean" -}}
+{{- end -}}
 {{- $runtime := .Values.workers.docker.podEpochReclaim.runtime -}}
 {{- if not (and (kindIs "string" $runtime) (has $runtime (list "" "containerd-runc" "crio-crun"))) -}}
 {{- fail "workers.docker.podEpochReclaim.runtime must be empty, containerd-runc or crio-crun" -}}

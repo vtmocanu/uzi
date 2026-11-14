@@ -961,7 +961,7 @@ var workerDTOKeys = []string{
 	// PRD #4205: worker hibernation lifecycle. hibernation_state is always present;
 	// the reason, hibernated_at, wake_requested_at and wake_error are null outside the
 	// state that sets them. Display-only for the workers UI.
-	"hibernation_state", "hibernation_reason", "hibernated_at", "wake_requested_at", "wake_error",
+	"hibernation_state", "hibernation_reason", "hibernated_at", "wake_requested_at", "wake_error", "hibernation_cleanup",
 }
 
 func TestWorkerDTOTags(t *testing.T) {
@@ -1369,6 +1369,11 @@ func TestAdminDockerAllowlistDTOTags(t *testing.T) {
 	assertTags(t, "AdminDockerAllowlistRepoDTO", AdminDockerAllowlistRepoDTO{},
 		"id", "path_with_namespace", "enabled", "owner_email", "connection_id", "forge_type", "base_url")
 	assertTags(t, "AdminDockerAllowlistReposDTO", AdminDockerAllowlistReposDTO{}, "repos")
+}
+
+func TestAdminRepoActivityDTOTags(t *testing.T) {
+	assertTags(t, "AdminRepoActivityDTO", AdminRepoActivityDTO{}, "repos")
+	assertTags(t, "RepoActivityDTO", RepoActivityDTO{}, "id", "path_with_namespace", "enabled", "last_run_at")
 }
 
 func TestAdminBlockedReposDTOTags(t *testing.T) {

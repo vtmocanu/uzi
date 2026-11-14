@@ -5,6 +5,16 @@ import (
 	"time"
 )
 
+// HibernationCleanupDTO is the wire view of a worker's hibernation cache cleanup attempt.
+// State is "none", "cleaning" (requested or started), "unknown" (settlement not yet
+// confirmed) or "settled". Outcome is "pruned", "skipped" or "failed" once recorded, else
+// null; Reason is the bounded reason code for a skipped or failed outcome, else null.
+type HibernationCleanupDTO struct {
+	State         string  `json:"state"`
+	Outcome       *string `json:"outcome"`
+	CleanupReason *string `json:"reason"`
+}
+
 // WorkerDTO is the browser/CLI view of a worker.
 type WorkerDTO struct {
 	// Optional advisory owner projection; absent on older APIs or unavailable reads.
@@ -21,14 +31,18 @@ type WorkerDTO struct {
 	// HibernationReason is the admin's sanitized reason; HibernatedAt is when the pod was
 	// confirmed absent; WakeRequestedAt is when a wake began; WakeError is the bounded
 	// reason a wake past worker_wake_timeout has not completed. All null when not set.
-	HibernationReason *string         `json:"hibernation_reason"`
-	HibernatedAt      *time.Time      `json:"hibernated_at"`
-	WakeRequestedAt   *time.Time      `json:"wake_requested_at"`
-	WakeError         *string         `json:"wake_error"`
-	RollPacing        json.RawMessage `json:"roll_pacing,omitempty"`
-	ID                string          `json:"id"`
-	Name              string          `json:"name"`
-	Status            string          `json:"status"`
+	HibernationReason *string    `json:"hibernation_reason"`
+	HibernatedAt      *time.Time `json:"hibernated_at"`
+	WakeRequestedAt   *time.Time `json:"wake_requested_at"`
+	WakeError         *string    `json:"wake_error"`
+	// HibernationCleanup (PRD #4206) is the Docker cache cleanup attempt that ran, or is
+	// running, at hibernation. The key is always present; null when no attempt was made and
+	// no outcome is recorded.
+	HibernationCleanup *HibernationCleanupDTO `json:"hibernation_cleanup"`
+	RollPacing         json.RawMessage        `json:"roll_pacing,omitempty"`
+	ID                 string                 `json:"id"`
+	Name               string                 `json:"name"`
+	Status             string                 `json:"status"`
 	// Kind is "external" (a worker its owner runs by hand) or "hosted" (one the
 	// controller runs in the cluster, PRD #58). HostedSize is the preset name (s/m/l/l-highmem),
 	// null for an external worker. Together they are what lets the UI mark hosted

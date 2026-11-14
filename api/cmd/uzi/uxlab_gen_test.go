@@ -62,6 +62,35 @@ func step(m tuiModel, msg tea.Msg) tuiModel {
 	return next.(tuiModel)
 }
 
+// updatePromptScene drives the real update-prompt path for a brew-owned (uzi-cli) v0.83.0
+// binary offered v0.85.0 while the tap's uzi-cli formula installs formulaTag. The offline
+// installed-version probe reports the still-older running version, so the modal shows
+// instead of the restart hint. The package-level version stamp is restored on return.
+func updatePromptScene(dark bool, formulaTag string) string {
+	oldVersion := version
+	version = "v0.83.0"
+	defer func() { version = oldVersion }()
+	m := uxModel(&uzicli.FakeClient{}, "", dark)
+	m.skewCheck, m.showVersion = true, true
+	m.updatePrompt.owner, m.updatePrompt.brewKnown = "uzi-cli", true
+	m.installedVersion = func(string) (string, error) { return "v0.83.0", nil }
+	next, cmd := m.Update(buildInfoMsg{
+		version: "v0.85.0",
+		latest: &apitypes.LatestReleaseDTO{
+			Version:  "v0.85.0",
+			Name:     "Calmer board footer",
+			NotesURL: "https://github.com/vtmocanu/uzi/releases/tag/v0.85.0",
+		},
+		formulas: &apitypes.HomebrewFormulasDTO{UziCLI: formulaTag},
+	})
+	m = next.(tuiModel)
+	if cmd != nil {
+		// Run the installed-version probe offline and feed its result back.
+		m = step(m, cmd())
+	}
+	return m.View().Content
+}
+
 // key drives one keypress through the real key path (no *testing.T dependency, unlike the
 // sibling press helper).
 func key(m tuiModel, k string) tuiModel {
@@ -120,6 +149,10 @@ func TestGenerateUXLabFrames(t *testing.T) {
 			m.updatePrompt.installedVersion = "v0.85.0"
 			return m.View().Content
 		},
+		// The startup update prompt for a brew-owned stable binary (#4314): the owning formula
+		// is still at v0.84.0 (notes only) vs already at the offered v0.85.0 (Update now).
+		"update-prompt-brew-notes":      func(d bool) string { return updatePromptScene(d, "v0.84.0") },
+		"update-prompt-brew-ready":      func(d bool) string { return updatePromptScene(d, "v0.85.0") },
 		"board-admin":                   boardAdmin,
 		"board-filter":                  func(d bool) string { return boardFilter(d, now) },
 		"board-planning":                func(d bool) string { return boardPlanning(d, now) },

@@ -4,6 +4,7 @@
 
 import type { Worker } from "./api";
 import { ApiError } from "./apiError";
+import { stripUnsafeChars } from "./safeText";
 
 export type HibernationState = "none" | "preparing" | "hibernated" | "waking";
 
@@ -49,4 +50,39 @@ export function hibernationErrorMessage(err: unknown, fallback: string): string 
   if (!(err instanceof ApiError)) return fallback;
   const code = (err.body as { reason_code?: unknown } | null)?.reason_code;
   return (err.status === 409 && typeof code === "string" && REFUSALS[code]) || err.message || fallback;
+}
+
+// Friendly words for the closed reason codes of api/internal/workersvc/hibernation_cleanup.go.
+// An unknown code (a newer api) shows its sanitized text rather than being dropped.
+const CLEANUP_REASONS: Record<string, string> = {
+  unsupported: "this worker cannot prune its Docker cache",
+  daemon_unreachable: "Docker was not reachable",
+  custody_stale: "work custody could not be confirmed",
+  active_work: "the worker had active work",
+  claim_in_flight: "a run was being claimed",
+  gate_not_exclusive: "the worker was not idle",
+  cancelled: "hibernation was cancelled",
+  worker_restarted: "the worker restarted",
+  interrupted: "the worker was interrupted",
+  custody_hold: "the worker holds unpublished work",
+  pending_wake_demand: "a queued run needed the worker",
+  maintenance_active: "Docker maintenance was running",
+};
+
+/** Short admin/owner text for the worker's hibernation cache cleanup, or null when there is
+ *  nothing to show. Exact strings: "cleanup skipped: <reason>", "cache pruned", "cleanup
+ *  interrupted", "cleaning up", "cleanup settlement unknown". The reason is sanitized. */
+export function hibernationCleanupText(w: Pick<Worker, "hibernation_cleanup">): string | null {
+  const c = w.hibernation_cleanup;
+  if (!c) return null;
+  if (c.state === "cleaning") return "cleaning up";
+  if (c.state === "unknown") return "cleanup settlement unknown";
+  if (c.outcome === "pruned") return "cache pruned";
+  if (c.outcome === "failed") return "cleanup interrupted";
+  if (c.outcome === "skipped") {
+    const raw = stripUnsafeChars(c.reason ?? "").trim();
+    const reason = CLEANUP_REASONS[raw] ?? raw;
+    return reason ? `cleanup skipped: ${reason}` : "cleanup skipped";
+  }
+  return null;
 }
