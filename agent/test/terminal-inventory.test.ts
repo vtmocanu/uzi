@@ -208,6 +208,36 @@ describe("readTerminalCloneLocalRefs", () => {
     assert.deepEqual(await rig.cache.readTerminalCloneLocalRefs(c.clone, c.head), { ok: false, reason: "not_ancestor" });
   });
 
+  it("is not fooled by an info/grafts file that forges ancestry", async () => {
+    const rig = new Rig();
+    const c = await clone(rig);
+    git(c.clone, "checkout", "-b", "side", c.a);
+    await fs.writeFile(path.join(c.clone, "side.txt"), "side");
+    git(c.clone, "add", "side.txt");
+    git(c.clone, "commit", "-m", "side");
+    const side = git(c.clone, "rev-parse", "HEAD");
+    git(c.clone, "checkout", "-q", "task");
+    assert.deepEqual(await rig.cache.readTerminalCloneLocalRefs(c.clone, c.head), { ok: false, reason: "not_ancestor" });
+    await fs.mkdir(path.join(c.clone, ".git", "info"), { recursive: true });
+    await fs.writeFile(path.join(c.clone, ".git", "info", "grafts"), `${c.head} ${side}\n`);
+    assert.deepEqual(await rig.cache.readTerminalCloneLocalRefs(c.clone, c.head), { ok: false, reason: "not_ancestor" });
+  });
+
+  it("is not fooled by a commit-graph written over forged grafts", async () => {
+    const rig = new Rig();
+    const c = await clone(rig);
+    git(c.clone, "checkout", "-b", "side", c.a);
+    await fs.writeFile(path.join(c.clone, "side.txt"), "side");
+    git(c.clone, "add", "side.txt");
+    git(c.clone, "commit", "-m", "side");
+    const side = git(c.clone, "rev-parse", "HEAD");
+    git(c.clone, "checkout", "-q", "task");
+    await fs.mkdir(path.join(c.clone, ".git", "info"), { recursive: true });
+    await fs.writeFile(path.join(c.clone, ".git", "info", "grafts"), `${c.head} ${side}\n`);
+    git(c.clone, "commit-graph", "write", "--reachable");
+    assert.deepEqual(await rig.cache.readTerminalCloneLocalRefs(c.clone, c.head), { ok: false, reason: "not_ancestor" });
+  });
+
   it("refuses an unreadable clone and a malformed head", async () => {
     const rig = new Rig();
     const c = await clone(rig);
@@ -381,7 +411,103 @@ describe("readTerminalSourceUniverse", () => {
     assert.deepEqual(await rig.universe(current), { kind: "unproved", reason: "local_ref", subreason: "stash", detail: current.clonePath });
   });
 
-  it("F-gate: an inventory-guarded single-attempt issue flight is proved end to end (clean and dirty)", async () => {
+  const fakeRecovery = (records: Array<Record<string, unknown>>) =>
+    ({ readTerminalRecords: async () => ({ kind: "records", records }) });
+
+  it("binds a record only to the proved source: same branch and the current bare", async () => {
+    const rig = new Rig();
+    const bare = await rig.bare();
+    const second = await rig.bare("second.git");
+    const current = await rig.attempt(bare);
+    const rec = (over: Record<string, unknown>) => ({ captureId: "c1", branch: BRANCH, sourceSha: "f".repeat(40), generation: 1, ...over });
+    const run = (r: Record<string, unknown>) => rig.universe(current, { recovery: fakeRecovery([r]) });
+    assert.equal((await run(rec({ bareDir: path.basename(bare) }))).kind, "proved");
+    assert.equal(unproved(await run(rec({ bareDir: path.basename(second) }))).reason, "record_outside_universe");
+    // Two bares exist: a record without a bareDir cannot be placed.
+    assert.equal(unproved(await run(rec({}))).reason, "record_outside_universe");
+    assert.equal(unproved(await run(rec({ bareDir: path.basename(bare), branch: "other" }))).reason, "record_outside_universe");
+  });
+
+  it("binds a bareDir-less record when exactly one bare exists and the branch matches", async () => {
+    const rig = new Rig();
+    const bare = await rig.bare();
+    const current = await rig.attempt(bare);
+    const rec = { captureId: "c1", branch: BRANCH, sourceSha: "f".repeat(40), generation: 1 };
+    assert.equal((await rig.universe(current, { recovery: fakeRecovery([rec]) })).kind, "proved");
+  });
+
+  it("accepts a record on a retired attempt's branch only when its sourceSha is an explicit root", async () => {
+    const rig = new Rig();
+    const bare = await rig.bare();
+    const second = await rig.bare("second.git");
+    const retired = await rig.attempt(bare, { state: "retired", journal: false, present: false, branch: "gone" });
+    const current = await rig.attempt(bare);
+    assert.ok(retired.attemptId);
+    const rec = (sourceSha: string) => ({ captureId: "c1", branch: "gone", bareDir: path.basename(second), sourceSha, generation: 1 });
+    assert.equal(unproved(await rig.universe(current, { recovery: fakeRecovery([rec("f".repeat(40))]) })).reason, "record_outside_universe");
+    assert.equal((await rig.universe(current, { recovery: fakeRecovery([rec(current.head)]) })).kind, "proved");
+  });
+
+  it("refuses a live attempt whose clone vanished, but allows a retired one with an owed root", async () => {
+    const live = new Rig();
+    const liveBare = await live.bare();
+    const liveCurrent = await live.attempt(liveBare);
+    await live.attempt(liveBare, { present: false, state: "live", journal: false });
+    assert.equal(unproved(await live.universe(liveCurrent)).reason, "ledger_attempt_clone_missing");
+
+    const rig = new Rig();
+    const bare = await rig.bare();
+    const current = await rig.attempt(bare);
+    await rig.attempt(bare, { present: false, state: "retired", journal: false });
+    await rig.attempt(bare, { present: false, state: "abandoned", journal: false });
+    const parent = git(current.clonePath, "rev-parse", "HEAD~1");
+    git(current.clonePath, "push", bare, `${current.head}:refs/heads/producer`, `${parent}:refs/heads/parent`);
+    const context: PositiveOwedCandidateContext = {
+      barePath: bare, runId: RUN, generation: 1, kind: "issue", branch: BRANCH,
+      defaultIdentity: { ref: "refs/remotes/origin/main", sha: parent },
+    };
+    assert.equal((await rig.cache.updateTrackingRef(bare, BRANCH, parent, { context })).kind, "updated");
+    const universe = await rig.universe(current);
+    assert.equal(universe.kind, "proved", JSON.stringify(universe));
+    if (universe.kind !== "proved") return;
+    assert.ok(universe.roots.some(r => r.commit === parent && r.origin === "owed"));
+  });
+
+  it("refuses an lstat failure other than ENOENT as an unknown read", async () => {
+    const rig = new Rig();
+    const bare = await rig.bare();
+    const current = await rig.attempt(bare);
+    const ledgerPath = `${current.clonePath}/work.txt/under-a-file`;
+    git(bare, "config", "--local", "--add", "uzi-attempts.other.entry",
+      JSON.stringify({ attemptId: attemptId(), runId: RUN, clonePath: ledgerPath, state: "retired" }));
+    assert.equal(unproved(await rig.universe(current)).reason, "unknown_read");
+  });
+
+  it("refuses the same attempt id under two branch keys of one bare", async () => {
+    const rig = new Rig();
+    const bare = await rig.bare();
+    const current = await rig.attempt(bare);
+    git(bare, "config", "--local", "--add", "uzi-attempts.other.entry",
+      JSON.stringify({ attemptId: current.attemptId, runId: RUN, clonePath: `${current.clonePath}-x`, state: "retired" }));
+    assert.deepEqual(await rig.cache.readTerminalAttribution(bare, RUN, rig.budget()), { kind: "unknown", cause: "duplicate_attempt" });
+  });
+
+  it("refuses a journal whose attempt id differs from the ledger attempt at the same path", async () => {
+    const rig = new Rig();
+    const bare = await rig.bare();
+    const current = await rig.attempt(bare);
+    const real = rig.cache.readTerminalAttribution.bind(rig.cache);
+    const fake = rig.fake({
+      readTerminalAttribution: async (...args: Parameters<GitCache["readTerminalAttribution"]>) => {
+        const result = await real(...args);
+        return result.kind === "verified"
+          ? { ...result, journal: result.journal.map(j => ({ ...j, attemptId: attemptId() })) } : result;
+      },
+    });
+    assert.equal(unproved(await rig.universe(current, {}, fake)).reason, "join_contradiction");
+  });
+
+  it("F-gate: an inventory-guarded single-attempt issue flight is proved end to end (clean tree; an untracked file does not change the universe)", async () => {
     for (const dirty of [false, true]) {
       const rig = new Rig();
       const bare = await rig.bare();
@@ -461,6 +587,10 @@ describe("checkManifestCoverage", () => {
   it("refuses a duplicate root and a source whose head is not a manifest root", () => {
     assert.equal(reasonOf(checkManifestCoverage(universe, { roots: [...full, root(owed)], abandoned: [] }, { currentFlight: true })), "duplicate_root");
     assert.equal(reasonOf(checkManifestCoverage(universe, { roots: [root(owed)], abandoned: [] }, { currentFlight: true })), "commit_mismatch");
+  });
+  it("refuses a duplicated abandoned entry", () => {
+    const item = { class: "ignored" as const, source_id: "s1", extents: { files: 1, bytes: 1 } };
+    assert.equal(reasonOf(checkManifestCoverage(universe, { roots: full, abandoned: [item, item] }, { currentFlight: true })), "duplicate_abandoned");
   });
   it("refuses a tree mismatch against the expected trees", () => {
     const expected = new Map([[head, "t"], [owed, "other-tree"]]);

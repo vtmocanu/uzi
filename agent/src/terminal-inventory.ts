@@ -57,7 +57,7 @@ export function classifyTerminalOutput(facts: TerminalOutputFacts): TerminalOutp
 export type TerminalUnprovedReason =
   | "unknown_read" | "thrown" | "foreign_owner" | "predecessor" | "join_contradiction" | "duplicate"
   | "record_outside_universe" | "foreign_bare" | "cap" | "deadline" | "local_ref" | "non_current_clone_present"
-  | "current_missing" | "identity_mismatch";
+  | "current_missing" | "identity_mismatch" | "ledger_attempt_clone_missing";
 
 export interface TerminalSource {
   sourceId: string;
@@ -108,7 +108,7 @@ async function lstatOrAbsent(target: string): Promise<{ present: false } | { pre
     return { present: true, dir: st.isDirectory() && !st.isSymbolicLink(), identity: `${st.dev}:${st.ino}` };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return { present: false };
-    throw err;
+    throw new Unproved("unknown_read", `lstat ${(err as NodeJS.ErrnoException).code ?? "error"}`);
   }
 }
 
@@ -130,7 +130,7 @@ export async function readTerminalSourceUniverse(input: TerminalUniverseInput): 
     const bares = await git.listRunBares();
     if (bares.length > TERMINAL_UNIVERSE_MAX_BARES) throw new Unproved("cap", "bares");
     const sources: TerminalSource[] = [];
-    const attemptsAll: Array<{ attemptId: string; clonePath: string; branch: string; bare: string }> = [];
+    const attemptsAll: Array<{ attemptId: string; clonePath: string; branch: string; bare: string; state: string }> = [];
     const owedAll = new Set<string>();
 
     // The inventory is read WITHOUT a report-proof budget on purpose: under one it refuses every ledger attempt whose
@@ -149,7 +149,7 @@ export async function readTerminalSourceUniverse(input: TerminalUniverseInput): 
       const ledgerByPath = new Map<string, typeof attr.attempts>();
       for (const attempt of attr.attempts) {
         ledgerByPath.set(attempt.clonePath, [...(ledgerByPath.get(attempt.clonePath) ?? []), attempt]);
-        attemptsAll.push({ attemptId: attempt.attemptId, clonePath: attempt.clonePath, branch: attempt.branch, bare });
+        attemptsAll.push({ attemptId: attempt.attemptId, clonePath: attempt.clonePath, branch: attempt.branch, bare, state: attempt.state });
       }
       const presentPaths = new Set<string>();
       for (const clone of inv.clones) {
@@ -169,6 +169,18 @@ export async function readTerminalSourceUniverse(input: TerminalUniverseInput): 
       for (const attempt of attr.attempts) {
         const seen = await lstatOrAbsent(attempt.clonePath);
         if (seen.present && !presentPaths.has(attempt.clonePath)) throw new Unproved("join_contradiction", `ledger attempt present but unlisted ${attempt.attemptId}`);
+        // A live or reclaimed attempt whose clone vanished may have held work: refuse. A retired or abandoned attempt
+        // is allowed to be gone (it contributes only owed roots and its bare).
+        if (!seen.present && attempt.state !== "retired" && attempt.state !== "abandoned") {
+          throw new Unproved("ledger_attempt_clone_missing", `${attempt.attemptId} (${attempt.state})`);
+        }
+      }
+      // A journal row that names an attempt id must name the ledger attempt at that same path.
+      for (const row of attr.journal) {
+        const at = ledgerByPath.get(row.clonePath)?.[0];
+        if (row.attemptId !== undefined && at !== undefined && at.attemptId !== row.attemptId) {
+          throw new Unproved("join_contradiction", `journal attempt id differs from the ledger at ${path.basename(row.clonePath)}`);
+        }
       }
       // Every other attribution of the run must name a ledger attempt path.
       const named = [...attr.journal.map(j => j.clonePath), ...attr.stoppedMarkers.map(m => m.clonePath), ...attr.protected.flatMap(p => p.clonePaths)];
@@ -204,10 +216,16 @@ export async function readTerminalSourceUniverse(input: TerminalUniverseInput): 
     if (read.kind !== "records") throw new Unproved(expired() ? "deadline" : "unknown_read", "recovery records");
     if (read.records.length > TERMINAL_UNIVERSE_MAX_RECORDS) throw new Unproved("cap", "records");
     const generations = new Set<number>();
+    const explicitRoots = new Set<string>([currentSource.head, ...owedAll]);
     for (const record of read.records) {
-      const bound = attemptsAll.some(a => a.branch === record.branch &&
-        (record.bareDir === undefined || path.basename(a.bare) === record.bareDir));
-      if (!bound) throw new Unproved("record_outside_universe", `record ${record.captureId}`);
+      // Binding rule: a record binds to the proved source (the current present attempt) when it is on the same branch
+      // AND names the current bare's directory. A record without a bareDir binds only when exactly one bare exists
+      // (so it cannot belong to another bare) and the branch matches. A record that matches only an absent or retired
+      // attempt is accepted solely when its sourceSha is an explicit root of the universe (the head or an owed root).
+      const sameBranch = record.branch === currentSource.branch;
+      const bareMatches = record.bareDir !== undefined ? record.bareDir === path.basename(currentSource.bare) : bares.length === 1;
+      const absentOk = attemptsAll.some(a => a.branch === record.branch) && explicitRoots.has(record.sourceSha);
+      if (!(sameBranch && bareMatches) && !absentOk) throw new Unproved("record_outside_universe", `record ${record.captureId}`);
       if (record.bundlePath !== undefined && path.basename(record.bundlePath) !== `${record.captureId}.bundle`) {
         throw new Unproved("record_outside_universe", `bundle of ${record.captureId}`);
       }
@@ -241,7 +259,7 @@ export type TerminalCoverageResult =
   | { ok: true }
   | { ok: false; reason:
       | "missing_source" | "extra_source" | "missing_root" | "extra_root" | "duplicate_root" | "commit_mismatch"
-      | "tree_mismatch" | "unknown_abandoned_class" | "cold_dirty_current_flight"; detail: string };
+      | "tree_mismatch" | "duplicate_abandoned" | "unknown_abandoned_class" | "cold_dirty_current_flight"; detail: string };
 
 /**
  * Pure omission check of a manifest against a proved universe. Every universe source and root must be present, nothing
@@ -256,6 +274,12 @@ export function checkManifestCoverage(
 ): TerminalCoverageResult {
   const fail = (reason: Extract<TerminalCoverageResult, { ok: false }>["reason"], detail: string): TerminalCoverageResult => ({ ok: false, reason, detail });
   const bySource = new Map(universe.sources.map(s => [s.sourceId, s]));
+  const abandonedKeys = new Set<string>();
+  for (const item of manifest.abandoned) {
+    const key = `${item.class}\0${item.source_id}`;
+    if (abandonedKeys.has(key)) return fail("duplicate_abandoned", item.source_id);
+    abandonedKeys.add(key);
+  }
   const seen = new Set<string>();
   const manifestCommits = new Set<string>();
   const sourcesWithRoot = new Set<string>();

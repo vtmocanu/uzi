@@ -260,19 +260,47 @@ contradiction, duplicate, record or bundle outside the universe, foreign bare,
 cap or deadline, any present attempt clone other than the current flight's
 own, any retained predecessor, and any clone-local ref (`origin/*` included)
 that is not an ancestor of the clone HEAD, a stash or a linked worktree.
-Tracking state and reachability from bare refs are never evidence. Known
-limits:
+Tracking state and reachability from bare refs are never evidence.
+
+The clone is agent-writable, so the clone-local ref ancestry read runs in the
+hardened proof-read view: grafts (`GIT_GRAFT_FILE=/dev/null`), replace objects,
+the commit-graph and the multi-pack-index are disabled, and any `rev-list`
+stderr refuses. A forged `info/grafts` file or commit-graph cannot fake
+ancestry. A ledger attempt of the run that is not retired or abandoned and
+whose clone is gone refuses (`ledger_attempt_clone_missing`); a retired or
+abandoned attempt may be gone and contributes only owed roots and its bare. The
+same attempt ID under two branch keys of one bare, a journal attempt ID that
+differs from the ledger attempt at the same clone path, and a duplicated
+abandoned manifest entry all refuse.
+
+Record binding. A record binds to the proved source (the current present
+attempt) when it is on the same branch and its `bareDir` equals the current
+bare's directory name. A record without a `bareDir` binds only when exactly one
+bare exists (it then cannot belong to another bare) and the branch matches. A
+record that matches only an absent or retired attempt is accepted only when its
+`sourceSha` is an explicit root of the universe (the head or an owed root);
+otherwise it is `record_outside_universe`.
+
+The inventory and the attribution are read under separate bare-lock
+acquisitions, so the universe is two snapshots, not one. The later in-boundary
+recheck at freeze and before invocation (M5/M6) re-reads both.
+
+Known limits:
 
 - The attempt ledger carries no generation. A source's generation is parsed
-  from its attempt ID, and bound records report their own generations.
-- Records carry no attempt ID or clone path. A record binds by branch and bare.
+  from its attempt ID, and bound records report their own generations; a bound
+  record whose generation differs from the current attempt's is reported, not
+  refused.
+- Records carry no attempt ID or clone path. A record binds by branch, bare
+  and (for an absent attempt) an explicit root, as above.
 - The existing inventory reports any other run's attribution in the shared
   bare as a foreign owner. The universe refuses on that, so in a bare shared
   with other runs it is unproved. This is over-conservative (keep) and must be
   revisited before any activation; it is not narrowed in slice B.
 
 Feasibility gate. The test "F-gate: an inventory-guarded single-attempt issue
-flight is proved end to end (clean and dirty)" in
+flight is proved end to end (clean tree; an untracked file does not change the
+universe)" in
 `agent/test/terminal-inventory.test.ts` runs real Git, a real `GitCache` and a
 real `RecoveryCoordinator`.
 

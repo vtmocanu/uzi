@@ -16046,6 +16046,7 @@ export class GitCache {
           for (const [branch, raw] of await this.readAllAttemptLedgerRaw(barePath, entries)) {
             const parsed = parseAttemptLedgerEntry(raw);
             if (!parsed) return bad("malformed_ledger");
+            if (ledger.has(parsed.attemptId)) return bad("duplicate_attempt");
             ledger.set(parsed.attemptId, { ...parsed, branch });
           }
           const attempts = [...ledger.values()].filter(e => e.runId === runId)
@@ -16130,8 +16131,15 @@ export class GitCache {
       const all = [...shas];
       for (let i = 0; i < all.length; i += LOCAL_REF_REVLIST_CHUNK) {
         this.checkReportProof();
+        // The clone is agent-writable: ancestry is read in the hardened proof view (no grafts, no replace objects, no
+        // commit-graph or multi-pack-index) so a forged `info/grafts` or commit-graph cannot fake reachability.
+        let revStderr = "";
         const extra = await this.runGitAsRunner(clonePath,
-          ["rev-list", "--objects", "-n", "1", ...all.slice(i, i + LOCAL_REF_REVLIST_CHUNK), "--not", head], { env: NO_REPLACE_ENV });
+          ["-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false", "-c", "advice.graftFileDeprecated=false",
+            "rev-list", "--objects", "-n", "1", ...all.slice(i, i + LOCAL_REF_REVLIST_CHUNK), "--not", head],
+          { env: { ...PROOF_READ_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+            onStderr: (text) => { if (text !== "") revStderr = "x"; } });
+        if (revStderr !== "") return refuse("stderr");
         if (extra.trim() !== "") return refuse("not_ancestor");
       }
       return { ok: true };
@@ -23228,7 +23236,7 @@ try {
         env.GIT_ALTERNATE_OBJECT_DIRECTORIES = JSON.stringify(proof.alternate);
       }
       child = await this.spawnGit(path.dirname(outPath),
-        ["--no-replace-objects", ...(proof ? ["-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false",
+        ["--no-replace-objects", ...(proof ? ["-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false", "-c", "advice.graftFileDeprecated=false",
           "-c", "core.fsmonitor=false"] : []), "index-pack", "--strict", "--no-rev-index", "--index-version=2",
           "-o", outPath, staged.path], undefined,
         { env, trustedExecutable: true, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096,
