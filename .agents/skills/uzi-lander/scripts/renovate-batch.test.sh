@@ -60,6 +60,7 @@ case " \$* " in
   *" cherry-pick --abort "*) [ -n "\${INJECT_ABORT_FAIL:-}" ] && exit 1; [ -n "\${INJECT_ABORT_NOOP:-}" ] && exit 0 ;;
   *" rev-list --reverse "*) [ -n "\${INJECT_REVLIST_FAIL:-}" ] && case " \$* " in *"\$INJECT_REVLIST_FAIL"*) exit 1;; esac ;;
   *" rev-parse --git-path sequencer "*) [ -n "\${INJECT_GITPATH_FAIL:-}" ] && exit 1 ;;
+  *" show-ref --exists CHERRY_PICK_HEAD "*) [ -n "\${INJECT_SHOWREF_FAIL:-}" ] && exit 128 ;;
   *" worktree add "*)
     "$REAL_GIT" "\$@" || exit \$?
     [ -n "\${INJECT_MOVE_MAIN:-}" ] && "$REAL_GIT" -C "$WORK/repo" update-ref refs/remotes/origin/main "\$INJECT_MOVE_MAIN"
@@ -153,5 +154,12 @@ rc=0; out=$(INJECT_GITPATH_FAIL=1 run --branch chore/b7 --dir "$WORK/b7" 11 13 1
 grep -qF 'stopped at #13: cherry-pick conflict, rollback not verified' <<<"$out" || fail "case8 reason: $out"
 [ "$(cat "$WORK/b7/lock.txt")" = 'c 1' ] || fail "case8 #14 attempted on unverified state"
 refs_ok case8
+
+# 9. A failed CHERRY_PICK_HEAD ref lookup (not "absent") is not a verified rollback either.
+rc=0; out=$(INJECT_SHOWREF_FAIL=1 run --branch chore/b8 --dir "$WORK/b8" 11 13 14 2>&1) || rc=$?
+[ "$rc" = 4 ] || fail "case9 rc=$rc: $out"
+grep -qF 'stopped at #13: cherry-pick conflict, rollback not verified' <<<"$out" || fail "case9 reason: $out"
+[ "$(cat "$WORK/b8/lock.txt")" = 'c 1' ] || fail "case9 #14 attempted on unverified state"
+refs_ok case9
 
 echo "renovate-batch.test.sh: ok"
