@@ -3841,24 +3841,34 @@ export class CodexExecutor implements Executor {
         const captured = epoch;
         const sessionId = captured?.harness.rootThreadId ?? lastSessionId;
         const revision = this.captureRevision;
-        const pending = beforeReapPersist;
-        const saved = reapedSinceLastPersist;
         const guard = (): void => {
           authority.assertCurrent();
           this.assertCaptureAdmission(revision);
-          if (this.liveRolloutSave !== saveRollout || epoch !== captured || lifecycleSignal.aborted
+          if (this.liveRolloutSave !== saveRollout || epoch !== captured
+            || (captured?.harness.rootThreadId ?? lastSessionId) !== sessionId || lifecycleSignal.aborted
             || ctx.claimFenced?.() || ctx.cancelRequested?.()) throw new Error("retired rollout save");
         };
         return this.withCaptureOwnership(async (): Promise<UsableSavedRollout> => {
           try {
             guard();
             if (!captured || !sessionId) return { kind: "failed", reason: "missing_session" };
+            // Read the sink's current copy only after acquiring ownership. The ordinary
+            // sink can start independently of captureTail, including during our own copy.
+            if (!beforeReapPersist && !reapedSinceLastPersist) await captured.persistUsableSession();
+            guard();
+            const pending = beforeReapPersist;
+            const saved = reapedSinceLastPersist;
             if (pending) await pending;
-            guard();
-            if (!saved && !reapedSinceLastPersist) await captured.persistUsableSession();
-            guard();
+            const guardCopy = (): void => {
+              guard();
+              // One join is bounded; a changed copy/flag fails closed rather than retrying
+              // indefinitely or inspecting a generation whose copy is still outstanding.
+              if (beforeReapPersist !== pending || reapedSinceLastPersist !== saved
+                || (saved && !pending)) throw new Error("rollout copy changed");
+            };
+            guardCopy();
             const presence = await this.sessionStore.inspectSession(storeDir, sessionId);
-            guard();
+            guardCopy();
             return presence === "present" ? { kind: "usable", sessionId }
               : { kind: "failed", reason: "session_unavailable" };
           } catch {

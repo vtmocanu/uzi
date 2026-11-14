@@ -30700,6 +30700,71 @@ describe("CodexExecutor: strict saved rollout seam", () => {
     });
   }
 
+  it("strict save queued before pre-reap copy waits for the current generation", async () => {
+    const entered = installerBarrier(), inspecting = installerBarrier(), releaseInspection = installerBarrier();
+    const copying = installerBarrier(), releaseCopy = installerBarrier();
+    const parked = installerBarrier(), releasePark = installerBarrier();
+    const rig = makeRig({ responder: epochResponder("th-current", "tn-1", () => entered.resolve()) });
+    let saves = 0, inspections = 0, generation = "old", worked = false;
+    rig.deps = { ...rig.deps, sessionStore: {
+      ...rig.deps.sessionStore!,
+      persist: async () => {
+        if (++saves === 2) {
+          copying.resolve();
+          await releaseCopy.promise;
+          generation = "current";
+        }
+        return { files: 1, bytes: 20 };
+      },
+      inspectSession: async (_dir, id) => {
+        assert.equal(id, "th-current");
+        if (++inspections === 1) {
+          inspecting.resolve();
+          await releaseInspection.promise;
+        } else {
+          assert.equal(generation, "current", "exact inspection must wait for true pre-reap copy settlement");
+        }
+        return "present";
+      },
+    } };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx({
+      reportIteration: async () => ({ pauseRequested: worked }),
+      parkForPause: async () => { parked.resolve(); await releasePark.promise; return true; },
+    });
+    const running = exec.run(ctx);
+    let first: ReturnType<typeof exec.saveUsableRollout> | undefined;
+    let queued: ReturnType<typeof exec.saveUsableRollout> | undefined;
+    try {
+      await entered.promise;
+      first = exec.saveUsableRollout();
+      await inspecting.promise;
+      queued = exec.saveUsableRollout();
+      worked = true;
+      rig.transport.push(agentMessage("work", "th-current")).push(turnCompleted("completed", "th-current", "tn-1"));
+      await copying.promise;
+      releaseInspection.resolve();
+      let settled = false;
+      void queued.then(() => { settled = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(inspections, 1, "queued exact inspection cannot read the previous generation");
+      assert.equal(settled, false, "queued save must join the current copy");
+      releaseCopy.resolve();
+      assert.deepEqual(await queued, { kind: "usable", sessionId: "th-current" });
+      assert.equal((await first).kind, "failed", "a copy started during inspection invalidates that observation");
+      assert.equal(inspections, 2, "the queued save performs its own exact inspection after settlement");
+      assert.equal(saves, 2, "never overwrite the pre-reap generation from a drained source");
+      await parked.promise;
+    } finally {
+      releaseInspection.resolve();
+      releaseCopy.resolve();
+      releasePark.resolve();
+      await first;
+      await queued;
+      await running;
+    }
+  });
+
   it("strict save inspects the pre-reap generation without overwriting it", async () => {
     let worked = false;
     const rig = makeRig({ responder: epochResponder("th-current", "tn-1", (t, th, tn) => {
