@@ -134,9 +134,12 @@ export function repoActivityModel(input: {
     for (const id of activeIDs) if (!readByID.has(id)) total++;
   }
 
+  // A capped run list cannot prove a repo has nothing active: a repo whose only active run
+  // falls past the cap is absent from activeIDs, so the recent ("nothing active") and idle
+  // groups are left out rather than guessed.
   let recent: RecentRepo[] | null = null;
   let idle: IdleSummary | null = null;
-  if (active.state === "ok" && readOk) {
+  if (active.state === "ok" && readOk && !active.atLeast) {
     const found: Array<RecentRepo & { t: number }> = [];
     idle = { count: 0, minDays: null, maxDays: null, never: 0 };
     for (const r of readRepos) {

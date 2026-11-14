@@ -218,6 +218,11 @@ export function RepoChip({ model }: { model: RepoActivityModel }) {
             </div>
 
             {listFailed && <p className="text-sm text-muted">The repo list could not be read.</p>}
+            {!listFailed && active.state === "ok" && active.atLeast && total !== null && (
+              <p className="text-sm text-muted">
+                Recent and idle repos are hidden: the run list stops at 500 runs.
+              </p>
+            )}
 
             {recent != null && recent.length > 0 && (
               <div>

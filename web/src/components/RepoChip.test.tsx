@@ -167,6 +167,15 @@ describe("RepoChip popover", () => {
     expect(d.queryByText("Idle")).toBeNull();
   });
 
+  it("says recent and idle are hidden at the run-list cap", () => {
+    renderChip(model({ active: okActive({ atLeast: true }), total: 9, recent: null, idle: null, listFailed: false }));
+    open();
+    const d = within(dialog());
+    expect(d.getByText("Recent and idle repos are hidden: the run list stops at 500 runs.")).toBeTruthy();
+    expect(d.queryByText(/Run within 7 days/)).toBeNull();
+    expect(d.queryByText("Idle")).toBeNull();
+  });
+
   it("states what the count covers in the header tooltip", () => {
     renderChip(model());
     open();

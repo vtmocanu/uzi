@@ -197,6 +197,22 @@ describe("the 500-run cap", () => {
     expect(m.total).toBe(3);
   });
 
+  it("does not put a repo in recent or idle when its active run falls past the cap", () => {
+    const rows = capped([]).map((r) => ({ ...r, status: "running" as RunStatus }));
+    const m = model({
+      adminRuns: admin(rows),
+      repoActivity: {
+        repos: [repo("repo-a", "org/alpha"), repo("repo-b", "org/beta", { last_run_at: ago(60_000) })],
+        failed: false,
+      },
+    });
+    expect(activeOf(m).atLeast).toBe(true);
+    expect(activeOf(m).count).toBe(1);
+    expect(m.recent).toBeNull();
+    expect(m.idle).toBeNull();
+    expect(m.total).toBe(2);
+  });
+
   it("is not at least one run short of the cap", () => {
     const rows = capped([run({ status: "running" })]).slice(0, ADMIN_RUNS_CAP - 1);
     expect(activeOf(model({ adminRuns: admin(rows) })).atLeast).toBe(false);
