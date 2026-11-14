@@ -70,6 +70,9 @@
 #    NON-TERMINAL: any job whose status != completed.
 #  - Early-exit on the first failure is the whole point: one red job means the run
 #    cannot go green, so there is nothing to gain by waiting for the rest.
+# GitHub quota handback (all modes): exit 12, RESULT=gh_rate_limited,
+# GH_RATE_LIMIT_RESOURCE/RESET/RESET_AT and GH_RETRY_AT (reset + 5s).
+# Re-arm after GH_RETRY_AT; this is never readiness or unknown-streak exhaustion.
 set -uo pipefail
 
 RUN=""; BRANCH=""; SHA=""; WORKFLOW="ci.yml"; INTERVAL=""; MAX_TICKS=""; REPO=""; FOLLOW=0
@@ -104,6 +107,8 @@ else INTERVAL="${INTERVAL:-120}"; MAX_TICKS="${MAX_TICKS:-40}"; fi
 
 # shellcheck source=lib/sanitize.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/sanitize.sh"
+# shellcheck source=lib/gh-ratelimit.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/gh-ratelimit.sh"
 
 # gh repo flag, spliced as an array so an empty value adds no argument (zsh does not
 # word-split, and bash would pass an empty string).
@@ -127,6 +132,7 @@ if [ "$SHA_MODE" -eq 1 ]; then
   if [ -z "$repo_path" ]; then
     repo_path="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)"
     if [ -z "$repo_path" ]; then
+      gh_rate_limit_stop
       echo "watch-run-ci: could not infer OWNER/REPO to resolve --sha (pass --repo)" >&2
       exit 3
     fi
@@ -135,6 +141,7 @@ if [ "$SHA_MODE" -eq 1 ]; then
   for attempt in 1 2; do
     resolved_sha="$(gh api "repos/${repo_path}/commits/${SHA}" --jq '.sha' 2>/dev/null)"
     [[ "$resolved_sha" =~ ^[0-9A-Fa-f]{40}$ ]] && break
+    gh_rate_limit_stop
     if [ "$attempt" -lt 2 ]; then
       echo "watch-run-ci: --sha '$SHA' did not resolve on attempt $attempt/2; retrying in 2s" >&2
       sleep 2
@@ -237,6 +244,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
     # ---- --sha mode: aggregate over every run for the commit -------------------------
     runs="$(runs_for_sha)"
     if [ -z "$runs" ]; then
+      gh_rate_limit_stop
       if [ "$seen_any" -eq 1 ]; then
         echo "[tick $tick] workflow listing temporarily empty after runs were seen for sha=${SHA:0:8}; retrying"
       else
@@ -252,6 +260,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
         superseded=$((superseded+1)); echo "[tick $tick] $wname run $rid cancelled (superseded)"; continue
       fi
       if ! dump "$rid"; then
+        gh_rate_limit_stop
         gh_errs=$((gh_errs+1))
         echo "[tick $tick] gh run view failed for run $rid (consecutive failure $gh_errs): $DUMP_OUT" >&2
         if [ "$gh_errs" -ge 2 ]; then echo "gh keeps failing on run $rid; giving up (exit 3)" >&2; exit 3; fi
@@ -283,6 +292,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
             fi
             pending=1
           else
+            gh_rate_limit_stop
             pending=1
           fi
           ;;
@@ -309,6 +319,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
           branch_ref="$(printf '%s' "$BRANCH" | jq -sRr @uri)"
           if ! next_sha="$(gh api "repos/${repo_path}/commits/${branch_ref}" --jq '.sha' 2>/dev/null)" ||
              ! [[ "$next_sha" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+            gh_rate_limit_stop
             echo 'watch-run-ci: could not resolve branch head for --follow (exit 3)' >&2
             exit 3
           fi
@@ -339,7 +350,8 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
   # newer run; a rerun keeps the same id). With an explicit run id, keep it.
   cur="$RUN"
   if [ -z "$cur" ] || [ -n "$BRANCH" ]; then
-    r="$(resolve_run)"; [ -n "$r" ] && cur="$r"
+    r="$(resolve_run)" || gh_rate_limit_stop
+    [ -n "$r" ] && cur="$r"
   fi
   if [ -z "$cur" ]; then echo "[tick $tick] no run found for branch=$BRANCH workflow=$WORKFLOW; retrying"; sleep "$INTERVAL"; tick=$((tick+1)); continue; fi
 
@@ -347,6 +359,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
   # Tolerate one transient blip, then honor the documented exit 3 rather than silently
   # waiting out every tick and exiting 2.
   if ! dump "$cur"; then
+    gh_rate_limit_stop
     gh_errs=$((gh_errs+1))
     echo "[tick $tick] gh run view failed for run $cur (consecutive failure $gh_errs): $DUMP_OUT" >&2
     if [ "$gh_errs" -ge 2 ]; then echo "gh keeps failing on run $cur; giving up (exit 3)" >&2; exit 3; fi
@@ -365,6 +378,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
   if [ -n "$BRANCH" ]; then
     IFS=$'\t' read -r rstat concl < <(gh run view "${GHR[@]}" "$cur" --json status,conclusion \
       --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null) || true
+    [ -n "$rstat" ] || gh_rate_limit_stop
     [ "$rstat" = "completed" ] || concl=""
     if [ "$concl" = "cancelled" ]; then
       echo "[tick $tick] run $cur cancelled (superseded by a newer push); re-resolving next tick"
@@ -395,6 +409,8 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
         else
           echo "[tick $tick] a fail cleared on re-query (stale read); continuing"
         fi
+      else
+        gh_rate_limit_stop
       fi
       ;;
     GREEN)

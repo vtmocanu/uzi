@@ -46,12 +46,17 @@
 #   2  reset unknown (switch reviewer after an exact query; plain --wait has a ceiling)
 #   3  usage / gh error
 # With --trigger-review, a successful trigger hands control to watch-pr.sh and the final exit
-# code is its 0..10 readiness/finding contract; quota-phase failures retain the meanings above.
+# code is its readiness/finding contract (including GitHub quota exit 12); quota-phase failures retain the meanings above.
+# GitHub quota handback (all modes): exit 12, RESULT=gh_rate_limited,
+# GH_RATE_LIMIT_RESOURCE/RESET/RESET_AT and GH_RETRY_AT (reset + 5s).
+# Re-arm after GH_RETRY_AT; this is never readiness or unknown-streak exhaustion.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/cr-signal.sh
 . "$HERE/lib/cr-signal.sh"
+# shellcheck source=lib/gh-ratelimit.sh
+. "$HERE/lib/gh-ratelimit.sh"
 WATCH_PR_SCRIPT="${UZI_LANDER_WATCH_PR_SCRIPT:-$HERE/watch-pr.sh}"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
@@ -188,14 +193,14 @@ trigger_review_once() (
   fi
   trap 'rm -rf "$lock"' EXIT
   head=$(gh pr view "$PR" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null) \
-    || { echo "cannot resolve the PR head; not posting a review trigger" >&2; exit 3; }
+    || { gh_rate_limit_stop; echo "cannot resolve the PR head; not posting a review trigger" >&2; exit 3; }
   marked=""; [ -f "$marker" ] && marked=$(cat "$marker" 2>/dev/null || true)
   if [ "$marked" = "$head" ]; then
     echo "CR_REVIEW_TRIGGER=already_current_head"
     exit 0
   fi
   comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || true)
-  printf '%s' "$comments" | jq -e 'type=="array"' >/dev/null 2>&1 || { echo "cannot read the PR comments; not posting a review trigger" >&2; exit 3; }
+  printf '%s' "$comments" | jq -e 'type=="array"' >/dev/null 2>&1 || { gh_rate_limit_stop; echo "cannot read the PR comments; not posting a review trigger" >&2; exit 3; }
   recent=$(printf '%s' "$comments" | jq -r --arg asked "${asked_at:-}" '
     [.[]|select(((.user.login // "")|test("\\[bot\\]$")|not)
       and ((.body // "")|gsub("^\\s+|\\s+$";"")=="@coderabbitai review")
@@ -208,7 +213,7 @@ trigger_review_once() (
   fi
   posted_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   gh pr comment "$PR" --repo "$REPO" --body '@coderabbitai review' >/dev/null 2>&1 \
-    || { echo "could not post the CodeRabbit review trigger" >&2; exit 3; }
+    || { gh_rate_limit_stop; echo "could not post the CodeRabbit review trigger" >&2; exit 3; }
   # Read CodeRabbit's answer before recording the head: a refused trigger must stay
   # retryable, or the marker would make every later attempt report already_current_head.
   # A reply carries "review command invocation"; a refusal says "Action not completed".
@@ -217,6 +222,7 @@ trigger_review_once() (
   for _ in $(seq 1 "$TRIGGER_REPLY_POLLS"); do
     sleep 15
     comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || true)
+    printf '%s' "$comments" | jq -e 'type=="array"' >/dev/null 2>&1 || gh_rate_limit_stop
     reply=$(printf '%s' "$comments" | jq -r --arg t "$posted_at" '
       [.[]|select(.user.login=="coderabbitai[bot]" and .created_at>=$t
                   and ((.body // "")|contains("review command invocation")))]|last|.body // ""' 2>/dev/null || true)
@@ -251,6 +257,7 @@ exit_safe() {
       echo "CR_TRIGGER_RETRY=$(( TRIGGER_ATTEMPT + 1 ))"
       UZI_LANDER_CR_TRIGGER_ATTEMPT=$(( TRIGGER_ATTEMPT + 1 )) exec bash "$0" "${ORIG_ARGS[@]}"
     fi
+    [ "$trc" -ne 12 ] || exit 12
     [ "$trc" -eq 0 ] || exit 3
     echo "NEXT=watch_pr:coderabbit"
     # exec does not run this shell's EXIT trap. Drop the quota-query lock explicitly before
@@ -262,13 +269,13 @@ exit_safe() {
   exit 0
 }
 
-status=$(cr_status) || { echo "gh error resolving PR $PR on $REPO" >&2; exit 3; }
+status=$(cr_status) || { gh_rate_limit_stop; echo "gh error resolving PR $PR on $REPO" >&2; exit 3; }
 echo "CR_STATUS='${status:-absent}'"
 status_limited=0
 case "$status" in *"rate limited"*) status_limited=1;; esac
 if [ "$status_limited" -eq 0 ] && [ "$QUERY" -eq 0 ]; then echo "CR_LIMITED=0"; exit 0; fi
 
-row=$(reset_from_pr) || { echo "gh error reading PR comments" >&2; exit 3; }
+row=$(reset_from_pr) || { gh_rate_limit_stop; echo "gh error reading PR comments" >&2; exit 3; }
 reset_ts=$(printf '%s' "$row" | cut -f1); src=$(printf '%s' "$row" | cut -f2); countdown=$(printf '%s' "$row" | cut -f3)
 # --query asks for an exact live answer. Never let an inferred walkthrough timestamp satisfy it.
 if [ "$QUERY" -eq 1 ]; then reset_ts=""; src=""; countdown=""; fi
@@ -287,7 +294,7 @@ if { [ "$QUERY" -eq 1 ] || [ -z "$reset_ts" ]; } && [ "$ASK" -eq 1 ]; then
   fi
   trap 'rm -rf "$ask_lock"' EXIT
   comments_now=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || true)
-  printf '%s' "$comments_now" | jq -e 'type=="array"' >/dev/null 2>&1 || { echo "cannot read the PR comments; not posting a rate-limit query" >&2; exit 3; }
+  printf '%s' "$comments_now" | jq -e 'type=="array"' >/dev/null 2>&1 || { gh_rate_limit_stop; echo "cannot read the PR comments; not posting a rate-limit query" >&2; exit 3; }
   pending_ask=$(printf '%s' "$comments_now" | jq -r '
     ([.[]|select(((.user.login|test("\\[bot\\]$"))|not) and ((.body|gsub("^\\s+|\\s+$";""))=="@coderabbitai rate limit"))]|last) as $a
     | if $a==null then "" else
@@ -299,12 +306,12 @@ if { [ "$QUERY" -eq 1 ] || [ -z "$reset_ts" ]; } && [ "$ASK" -eq 1 ]; then
     asked_at="$pending_ask"; echo "ASK_IN_FLIGHT_SINCE=$asked_at (not posting again)"
   else
     asked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    gh pr comment "$PR" --repo "$REPO" --body '@coderabbitai rate limit' >/dev/null 2>&1 || { echo "could not post the rate-limit query" >&2; exit 3; }
+    gh pr comment "$PR" --repo "$REPO" --body '@coderabbitai rate limit' >/dev/null 2>&1 || { gh_rate_limit_stop; echo "could not post the rate-limit query" >&2; exit 3; }
     echo "ASKED_AT=$asked_at"
   fi
   for _ in $(seq 1 12); do
     sleep 15
-    row=$(reset_from_reply_after "$asked_at") || continue
+    row=$(reset_from_reply_after "$asked_at") || { gh_rate_limit_stop; continue; }
     if [ -n "$row" ]; then
       reset_ts=$(printf '%s' "$row" | cut -f1)
       src=$(printf '%s' "$row" | cut -f2)
@@ -368,7 +375,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     echo "$(date +%H:%M:%S) waiting on exact quota reset at $reset_label"
     continue
   fi
-  s=$(cr_status) || continue
+  s=$(cr_status) || { gh_rate_limit_stop; continue; }
   case "$s" in
     *"rate limited"*) echo "$(date +%H:%M:%S) still limited; reset at $reset_label" ;;
     *) echo "CR_STATUS='${s:-absent}'"; echo "CR_RESUMED=1"; exit 0 ;;
