@@ -15,7 +15,7 @@ import (
 // Pause at the private admission seam, after initial authorization but before
 // worker/run locks or intent creation. Both schedules use channel barriers.
 func TestCodexRefreshLateAdmissionLiveDB(t *testing.T) {
-	for _, mutation := range []string{"revoke", "switch"} {
+	for _, mutation := range []string{"revoke", "unbind"} {
 		t.Run(mutation, func(t *testing.T) {
 			env := setupCodexLiveDB(t)
 			fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: codexToken("new")}}
@@ -57,7 +57,7 @@ func TestCodexRefreshLateAdmissionLiveDB(t *testing.T) {
 			close(resume)
 			err = <-done
 			want := ErrCodexCapabilityEpoch
-			if mutation == "switch" {
+			if mutation == "unbind" {
 				want = ErrCodexRunNotBound
 			}
 			if !errors.Is(err, want) {
