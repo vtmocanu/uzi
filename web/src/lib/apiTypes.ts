@@ -367,7 +367,8 @@ export interface StartPreviewAlternative {
  *  `alternatives` lists Claude then Codex. A top-level `refusal` is set for a failure before a
  *  harness is decided, for a refusal on a decided harness, or when every alternative is refused for
  *  the same reason. A credential refusal leaves `credential` null; `model_incompatible_with_harness`
- *  keeps it when the server decided the harness and nulls it when the request named the harness. */
+ *  keeps it whenever the credential resolves, and is null only when, on a request that named the
+ *  harness, it superseded a credential refusal (create checks that model first). */
 export interface StartPreview {
   version: number;
   harness: HarnessValue | null;

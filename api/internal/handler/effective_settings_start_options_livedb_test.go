@@ -192,8 +192,10 @@ func TestStartPreviewRefusalPrecedenceMatchesCreateRouteLiveDB(t *testing.T) {
 			if tc.wantCode == "model_incompatible_with_harness" && created["code"] != tc.wantCode {
 				t.Fatalf("create body = %v, want code %s", created, tc.wantCode)
 			}
-			if tc.wantCode != "model_incompatible_with_harness" && created["code"] == "model_incompatible_with_harness" {
-				t.Fatalf("create body = %v, want the credential refusal, not the model one", created)
+			if tc.wantCode == "credential_disabled" &&
+				(rec.Code != http.StatusConflict || created["error"] != workersvc.ErrCredentialDisabled.Error() || created["code"] != nil) {
+				t.Fatalf("create = %d %v, want 409 %q (the credential refusal, not the model one)",
+					rec.Code, created, workersvc.ErrCredentialDisabled.Error())
 			}
 			if rows := f.runRows(ctx, t, repoID); len(rows) != 0 {
 				t.Errorf("create left %d run rows", len(rows))

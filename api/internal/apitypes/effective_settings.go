@@ -143,9 +143,9 @@ type StartPreviewAlternativeDTO struct {
 // neither marked as chosen. Refusal is set for a failure before a harness is decided, for a refusal
 // on a decided harness (a credential refusal, or the model refusal), or when every alternative is
 // refused for the same reason. Credential convention: a credential refusal leaves it null; the
-// model_incompatible_with_harness refusal keeps the credential cell when the harness was decided by
-// the server, and leaves it null when the request named the harness (create refuses that model before
-// any credential check, so the preview does too). WorkerModel and WorkerEffort are present only when
+// model_incompatible_with_harness refusal keeps the credential cell whenever the credential resolves,
+// and leaves it null only when, on a request that named the harness, it superseded a credential
+// refusal (create refuses that model before any credential check, so the preview does too). WorkerModel and WorkerEffort are present only when
 // the request carried that choice and the harness is decided (source run_override); with an undecided
 // harness only effort is answered, per alternative (a model request always decides the harness).
 type StartPreviewDTO struct {
