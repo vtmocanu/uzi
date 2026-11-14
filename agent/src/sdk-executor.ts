@@ -3528,8 +3528,10 @@ export class SdkExecutor implements Executor {
         // arriving during the await is stopped by the explicit post-await checks below; pause,
         // wall, credential switch and shutdown are routed by the turn's own interruption checks
         // before any model event. Remediate replaces this turn's prompt and adds no turn.
-        if (!ctx.interactive && !state.tripReason && followUp === undefined && !completionRework &&
-            ctx.midRunSecretRemediation) {
+        // An exhausted wall (armWall trips it before the next dispatch) must not spend an attempt
+        // on guidance no turn would carry.
+        if (!ctx.interactive && !state.tripReason && state.wallRemainingMs > 0 && followUp === undefined &&
+            !completionRework && ctx.midRunSecretRemediation) {
           const decision = await ctx.midRunSecretRemediation();
           this.throwIfTerminal(ctx);
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);

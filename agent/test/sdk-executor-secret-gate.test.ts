@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -724,5 +724,53 @@ describe("SdkExecutor mid-run secret remediation seam (Issue #4258)", () => {
     assert.ok(prompts[0]!.includes(PRE) && !prompts[0]!.includes(MID));
     assert.deepEqual(seenAt, [1], "called only at the next boundary, after the preflight text was spent");
     assert.ok(prompts[1]!.includes(MID));
+  });
+
+  it("an exhausted wall at the boundary skips the seam, so no attempt is spent and the run ends at the wall", async () => {
+    // The wall is debited as the first turn's Date.now() delta (disarmWall). The test clock is
+    // advanced by 10s inside that turn, against a 1s run_timeout_seconds, so the real wall timer
+    // (1s away) never fires in-turn: the turn completes normally and leaves wallRemainingMs <= 0
+    // with no trip latched. The next boundary is then the one the seam guard must refuse.
+    const realNow = Date.now.bind(Date);
+    let skew = 0;
+    const clock = mock.method(Date, "now", () => realNow() + skew);
+    try {
+      const turns: SDKMessage[][] = [work(), work(), finish()];
+      let i = 0;
+      const prompts: string[] = [];
+      const queryFn: SdkQueryFn = (params) => {
+        const script = turns[Math.min(i++, turns.length - 1)]!;
+        return (async function* () {
+          let text = "";
+          for await (const m of params.prompt) text += JSON.stringify(m);
+          prompts.push(text);
+          if (prompts.length === 1) skew = 10_000;
+          for (const m of script) yield m;
+        })();
+      };
+      let calls = 0;
+      let firstBoundary = 0;
+      let latched = true; // the fake's trigger/attempts state: must be untouched
+      await assert.rejects(
+        new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(runCtx({
+          config: { max_iterations: 8, run_timeout_seconds: 1 },
+          midRunSecretRemediation: async () => {
+            // The first boundary (before any turn) legitimately consults the seam: the wall is intact.
+            if (prompts.length === 0) { firstBoundary++; return { action: "proceed" }; }
+            calls++;
+            latched = false;
+            return { action: "remediate", followUp: MID };
+          },
+        })),
+        /wall-clock timeout/,
+      );
+      assert.equal(firstBoundary, 1, "control: the seam is consulted while the wall is intact");
+      assert.equal(calls, 0, "the seam must not run when the wall is already exhausted");
+      assert.equal(latched, true, "no remediation attempt was spent and the trigger was not cleared");
+      assert.equal(prompts.length, 1, "no further turn was dispatched");
+      assert.ok(prompts.every(p => !p.includes(MID)));
+    } finally {
+      clock.mock.restore();
+    }
   });
 });
