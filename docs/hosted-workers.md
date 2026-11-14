@@ -549,9 +549,9 @@ again without closing claims or consulting idle, terminal runs or custody. It
 needs the master flag and its own default-on chart value
 `workers.dindBuilderPruneEnabled: true` (a strict boolean); `false` opts out of
 this leg only. Adding the env rolls every Docker worker pod once after the
-controller upgrade, through the normal drift roll that waits for idle. Below
-4 GiB of total cache it frees nothing, and records shared with a local image are
-never pruned. See
+controller upgrade, through the normal drift roll that waits for idle unless the
+global `workers.forceRoll` is set. Below 4 GiB of total cache it frees nothing,
+and records shared with a local image are never pruned. See
 [Pressure-only builder-cache prune](./worker-docker.md#pressure-only-builder-cache-prune).
 Legacy recycle (plain nix/data; Docker Nix-only) associated with
 spec-hash/generation drift also waits indefinitely for idle. Only independent

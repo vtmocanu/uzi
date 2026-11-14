@@ -222,7 +222,7 @@ backoff and single-flight state.
   anonymous-volume leg.
 - **Rollout.** The new env changes every Docker worker's pod spec hash, so a
   controller upgrade rolls Docker workers once through the normal drift roll,
-  which waits for idle. There is no ForceRoll.
+  which waits for idle unless the global `workers.forceRoll` is set.
 - **What it does not do.** It runs on busy and custody-held workers alike. It
   never closes or opens the claim gate, never drains claims, never checks idle
   and never consults custody; it touches no image, container, volume, PVC or

@@ -275,7 +275,7 @@ and the #3891 leg. No image or volume prune is added.
   (strict boolean), rendered on Docker workers only, always explicit, `"true"` iff
   enabled and the worker is not ephemeral. Every Docker worker's pod spec hash
   moves, so a controller upgrade rolls Docker workers once via the normal drift
-  roll, which waits for idle; there is no ForceRoll. Opt-outs:
+  roll, which waits for idle unless the global `workers.forceRoll` is set. Opt-outs:
   `workers.dindBuilderPruneEnabled: false` (this leg only) or
   `workers.diskRecycleEnabled: false` (also disables PVC recycle and the other
   prunes).
