@@ -213,6 +213,9 @@ func NewWithGitLabBackoff(t Type, baseURL, token string, timeout time.Duration, 
 }
 
 func newWithGitLabBackoff(t Type, baseURL, token string, timeout time.Duration, backoff retryablehttp.Backoff) (Forge, error) {
+	if IsGitHubAppCredential(token) && t != TypeGitHub {
+		return nil, errors.New("github app: credentials require the GitHub forge type")
+	}
 	switch t {
 	case TypeGitLab:
 		if backoff != nil {

@@ -23,6 +23,8 @@ func (h *Handler) mountForgeRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 
 		r.Route("/forge/connections", func(r chi.Router) {
 			r.Post("/", h.CreateConnection)
+			// A separate path fails closed on an older API before App key material can be mistaken for a PAT.
+			r.With(forgeLimiter.PerUserMiddleware).Post("/github-app", h.CreateConnection)
 			r.Get("/", h.ListConnections)
 			// verify + projects hit the upstream forge → per-user budget.
 			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/verify", h.VerifyConnection)

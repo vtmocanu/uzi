@@ -61,6 +61,12 @@ func (r Role) AtLeast(min Role) bool { return roleRank[r] >= roleRank[min] }
 // whether it is active, and when it expires. GitLab: GET
 // /personal_access_tokens/self.
 type TokenInfo struct {
+	// GitHubApp reports that the credential is a GitHub App installation token
+	// rather than a PAT. Consumers that need App-only behaviour gate on this.
+	GitHubApp bool
+	// AppPermissions are the permission grants the App installation holds, as
+	// reported by the token-introspection endpoint. Empty for a PAT.
+	AppPermissions map[string]string
 	// Scopes are the token's granted scopes (e.g. ["api"]).
 	Scopes []string
 	// Active is true when the token is usable (not revoked, not expired).

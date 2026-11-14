@@ -6,11 +6,15 @@ package forge
 
 import (
 	"context"
+	"strconv"
 
 	gh "github.com/google/go-github/v92/github"
 )
 
 func (g *github) ProjectRole(ctx context.Context, projectID, forgeUserID int64) (Role, bool, error) {
+	if g.app != nil {
+		return g.appProjectRole(ctx, projectID)
+	}
 	// GET /repositories/{id} returns permissions COMPUTED FOR THE AUTHENTICATED USER
 	// (the bot). uzi always calls ProjectRole for the bot's own id, so the repo
 	// permissions ARE the answer (D6) — GitHub exposes no per-arbitrary-user
@@ -85,6 +89,10 @@ func roleForGitHubPermissions(p *gh.RepositoryPermissions) Role {
 //     fabricated true, never a false "safe" (D6/R1). #66 must fail-closed on it.
 //   - BotCanPush/BotCanMerge stay false (GitLab-only).
 func (g *github) DefaultBranchProtection(ctx context.Context, projectID int64, branch string, botUserID int64) (BranchProtection, error) {
+	if g.app != nil {
+		appID, _ := strconv.ParseInt(g.app.config.AppID, 10, 64)
+		return g.githubAppBranchProtection(ctx, projectID, branch, appID)
+	}
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
 		return BranchProtection{}, err

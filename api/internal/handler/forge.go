@@ -230,6 +230,10 @@ type createConnectionRequest struct {
 // capture the bot identity, then stores the PAT encrypted at rest. The token is
 // never echoed back.
 func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
+	appRoute := strings.HasSuffix(r.URL.Path, "/github-app")
+	if appRoute {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
@@ -237,8 +241,25 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req createConnectionRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	var decodeErr error
+	if appRoute {
+		decodeErr = httpx.DecodeJSONStrict(r, &req)
+	} else {
+		decodeErr = httpx.DecodeJSON(r, &req)
+	}
+	if decodeErr != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// App key envelopes must never fall through another forge PAT transport.
+	if !appRoute && forge.IsGitHubAppCredential(req.Token) {
+		w.Header().Set("Cache-Control", "no-store")
+		httpx.Error(w, http.StatusBadRequest, "use GitHub App connection endpoint")
+		return
+	}
+	if appRoute && (req.ForgeType != string(forge.TypeGitHub) || !forge.IsGitHubAppCredential(req.Token)) {
+		httpx.Error(w, http.StatusBadRequest, "a GitHub App connection is required")
 		return
 	}
 

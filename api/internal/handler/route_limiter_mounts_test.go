@@ -755,6 +755,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/chats/{id}/proposals/{pid}/confirm", limForge},
 	{"POST", "/api/chats/{id}/proposals/{pid}/dismiss", noLimiter},
 	{"POST", "/api/forge/connections/", noLimiter},
+	// The App route mints an installation token upstream, so it rides the same
+	// per-user forge budget as the other proxying routes.
+	{"POST", "/api/forge/connections/github-app", limForge},
 	{"POST", "/api/forge/connections/{id}/privilege-check", limForge},
 	{"POST", "/api/forge/connections/{id}/verify", limForge},
 	{"POST", "/api/me/cli-tokens/", noLimiter},
@@ -882,6 +885,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/codex/operation-admission", noLimiter},
 	// Authenticated, run-scoped advisory telemetry: no forge call or token spend.
 	{"POST", "/api/worker/runs/{id}/forge-clone-success", noLimiter},
+	// Rides proposalLimiter.PerWorkerMiddleware (per-WORKER), which this per-USER probe
+	// reads as noLimiter. TestSemanticWorkerWritesUseWorkerLimiter proves the bucket.
+	{"POST", "/api/worker/runs/{id}/forge/credential", noLimiter},
 	// Rides proposalLimiter.PerWorkerMiddleware (per-WORKER), which this per-USER probe reads as noLimiter.
 	{"POST", "/api/worker/runs/{id}/publication-intent", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/release", noLimiter},

@@ -1,3 +1,4 @@
+import { resolveForgeCredential } from "./forge-credentials.js";
 // Worker-performed merge-request / pull-request creation (PRD #4 §Workflow, the
 // primary directive; PRD #65 D9 generalises it to a second forge).
 //
@@ -289,7 +290,7 @@ abstract class HttpForgeClient implements ForgeClient {
     // header, and only TLS keeps it off the wire — a plaintext (or malformed) URL
     // is a hard error, never a best-effort send.
     if (!isHttps(url)) throw new ForgeError(0, "refusing to send the PAT to a non-https forge URL");
-    const headers: Record<string, string> = { ...this.authHeaders(pat) };
+    const headers: Record<string, string> = { ...this.authHeaders(resolveForgeCredential(pat) ?? "") };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     let res: FetchResponse;
     try {

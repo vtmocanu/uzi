@@ -1235,6 +1235,13 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// bounded 1 KiB local lifecycle write under the worker and run locks, no upstream I/O.
 		r.Post("/runs/{id}/policy-recovery-verified", h.WorkerRunPolicyRecoveryVerified)
 		r.Post("/runs/{id}/forge-clone-success", h.WorkerForgeCloneSuccess)
+		// GitHub App credential renewal. Bearer-only and run-scoped like the Codex
+		// bridge below: the path {id} is the sole run identity, the body carries only
+		// the claim generation, and every response is no-store. It mints an
+		// installation token; the App private key never leaves the API. It rides the
+		// per-worker proposal bucket because each call performs an upstream token
+		// exchange, the same shape as the semantic writes above.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/forge/credential", h.WorkerForgeCredential)
 		// Bound intent body-decoding and enrollment writes per worker, like the semantic candidate.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/publication-intent", h.WorkerPublicationIntent)
 		r.Post("/runs/{id}/memory/reserve", h.WorkerMemoryReserve)

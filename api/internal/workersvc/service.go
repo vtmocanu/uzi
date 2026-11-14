@@ -39,6 +39,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/ciartifacts"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgecred"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -7167,10 +7168,17 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 
 	// 5. Decrypt the bot PAT under the master box. box.Open errors carry no
 	// plaintext; wrap without exposing it (mirrors assembleClaim).
-	botPAT, err := s.box.Open(rc.TokenCiphertext)
+	botPAT, err := forgecred.Open(s.box, rc.TokenCiphertext)
 	if err != nil {
 		return PublishResult{}, fmt.Errorf("publish: bot PAT could not be decrypted")
 	}
+	// An App connection stores key material, not a usable token: exchange it for a
+	// short-lived installation token before the push.
+	pat, _, err := forge.ResolveGitCredentialWithExpiry(ctx, forge.Type(rc.ForgeType), rc.BaseUrl, string(botPAT), 20*time.Second)
+	if err != nil {
+		return PublishResult{}, fmt.Errorf("publish: forge credential unavailable")
+	}
+	botPAT = []byte(pat)
 
 	// 6. Hand the mechanical push to the go-git broker (stubbable seam). Map its
 	// benign sentinels to skips; anything else is a best-effort 5xx.
