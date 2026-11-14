@@ -694,17 +694,17 @@ type ClaimConfig struct {
 	// resolveEffortPtr (the judge lane included, best-effort) EXCEPT when the owner
 	// chose Runtime default (stored `runtime`, PRD #3247): then it is nil and omitempty
 	// drops the key so the runtime picks. A claim never carries the string `runtime`.
-	// Unlike DefaultModel there is no per-run/per-schedule freeze; the owner's
-	// per-user value is the only source (a checker child carries its frozen
-	// cross-check effort instead).
+	// A start-time run_override effort frozen onto the run (runs.effort, PRD #3250) wins over
+	// the owner's value, including `runtime`; otherwise the owner's per-user value is the only
+	// source (a checker child carries its frozen cross-check effort instead).
 	DefaultEffort *string `json:"default_effort,omitempty"`
 	// DefaultModelSource says who decided DefaultModel (a leadcfg.ModelSource token:
-	// schedule_pin or user_default today). PRD #3244: set only on a lead-lane claim
+	// run_override, schedule_pin or user_default). PRD #3244: set only on a lead-lane claim
 	// (leadcfg.LeadLane) and only when DefaultModel is shipped; never for cross-check,
 	// review, isolated-lane, judge, chat or job claims.
 	DefaultModelSource *string `json:"default_model_source,omitempty"`
 	// DefaultEffortSource says who decided DefaultEffort (a leadcfg.EffortSource token:
-	// user_default or builtin today). PRD #3244: present on every lead-lane claim, which makes
+	// run_override, user_default or builtin). PRD #3244: present on every lead-lane claim, which makes
 	// it the worker's activation signal for the lead-config reporter; absent otherwise.
 	DefaultEffortSource *string `json:"default_effort_source,omitempty"`
 	// CodexCatalogContext is the opaque catalog context (issue #3251): lowercase hex SHA-256 of

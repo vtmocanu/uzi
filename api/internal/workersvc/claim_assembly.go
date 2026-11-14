@@ -441,10 +441,19 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// records the existing visible fallback note and falls back to the lane, or the harness
 		// default when that lane is unset or dropped.
 		leadSettings = resolveLeadSettings(LeadSettingsInput{
-			Harness:   harness,
-			RunModel:  run.Model,
-			LaneModel: laneModel,
+			Harness:         harness,
+			RunModel:        run.Model,
+			RunModelSource:  run.ModelSource,
+			RunEffort:       run.Effort,
+			RunEffortSource: run.EffortSource,
+			LaneModel:       laneModel,
 		})
+		// PRD #3250: a run_override model or effort the claim cannot honor parks the run (never a
+		// fallback). Checked before any fallback note, the custom-Codex capability re-check and the
+		// late effort read, so a held run writes no harness_model_fallback line.
+		if u := leadSettings.Unhonorable; u != nil {
+			return nil, &runOverrideUnavailableError{Setting: u.Setting, Value: u.Value, Harness: u.Harness}
+		}
 		leadResolved = true
 		defaultModel = leadSettings.Model
 		if leadSettings.DroppedLaneModel.Valid {
@@ -477,9 +486,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// The run owner's per-user default reasoning effort (PRD #617). NULL now
 	// resolves to the uzi default `medium` at this sink (via resolveHarnessEffortPtr /
 	// agenttmpl.ResolveHarnessEffort, issue #1157); an explicit level is carried and
-	// the owner's `runtime` choice (PRD #3247) yields no default_effort at all. Unlike
-	// DefaultModel there is no per-schedule freeze — the owner's per-user value is the
-	// only source, except for a checker child, which carries its frozen cross-check
+	// the owner's `runtime` choice (PRD #3247) yields no default_effort at all. A start-time
+	// run_override effort frozen onto the run (runs.effort, PRD #3250) wins over the owner's value
+	// through leadEffortFor; otherwise the owner's per-user value is the only source, except for a
+	// checker child, which carries its frozen cross-check
 	// resolution (an unpinned checker is CrossCheckDefaultEffort). That checker effort
 	// is always a canonical level (validated pin or high), never `runtime`, so it
 	// passes through resolveHarnessEffortPtr unchanged and the worker's ordinary
@@ -495,12 +505,22 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	// PRD #3244: the effort column is read here, after the model block and its notes (statement
 	// order unchanged), so the effort half of the lead settings is completed now. A lead-lane claim
-	// ships resolveLeadEffort's value as DefaultEffort (nil for the owner's runtime default), so the
-	// value and its source come from one agenttmpl.ResolveHarnessEffort call.
+	// ships leadEffortFor's value as DefaultEffort (nil for the owner's runtime default), so the
+	// value and its source come from one resolver.
 	var defaultModelSource, defaultEffortSource *string
 	shippedEffort := resolveHarnessEffortPtr(harness, defaultEffort)
+	if checkerResolution == nil {
+		// PRD #3250: a frozen run_override effort ships on every non-checker claim, including the
+		// lanes the lead block skips (a Codex review). An out-of-set one parks here, before any
+		// payload exists; the lead block above already caught it for the lanes it covers.
+		eff, _, bad := leadEffortFor(harness, run.Effort, run.EffortSource, defaultEffort)
+		if bad {
+			return nil, &runOverrideUnavailableError{Setting: "effort", Value: run.Effort.String, Harness: harness}
+		}
+		shippedEffort = eff
+	}
 	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
-		leadSettings.Effort, leadSettings.EffortSource = resolveLeadEffort(harness, defaultEffort)
+		leadSettings.Effort, leadSettings.EffortSource, _ = leadEffortFor(harness, run.Effort, run.EffortSource, defaultEffort)
 		shippedEffort = leadSettings.Effort
 		es := string(leadSettings.EffortSource)
 		defaultEffortSource = &es

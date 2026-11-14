@@ -419,6 +419,8 @@ var inventoryQueryFiles = []string{
 	"findings.sql",
 	// PRD #3454 instance maintenance mode
 	"intake_pause.sql",
+	// PRD #3250: widened for the run_override_unavailable park and its message
+	"credential_disabled.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -1072,6 +1074,44 @@ var queryInventory = []queryPin{
 	{"ListRunQueueReasons", "intake_pause.sql", "TestQueueReasonLiveDB",
 		"../handler: runs_dto.go batch lookup behind the run reads; asserts queue_reason for queued " +
 			"runs while paused and its absence once lifted. Also called from workersvc/jobs.go"},
+	{"ParkCredentialDisabledRun", "credential_disabled.sql", "TestCredentialDisabledParkPromoteLiveDB",
+		"store-level park then promote; the workersvc finisher tests (TestFinishRunClaimCredentialDisabledStaleLiveDB) drive it through finishRunClaim"},
+	{"ParkRunOverrideUnavailableRun", "credential_disabled.sql", "TestClaimRunOverrideUnavailableClaudeLiveDB",
+		"../workersvc: Service.Claim -> finishRunClaim parks the exact claim; TestRunOverrideParkRestoresFreshGrantLiveDB asserts the Fresh restore and TestFinishRunOverrideNonExactClaimWritesNothingLiveDB the fence"},
+	{"InsertRunOverrideUnavailableMessage", "credential_disabled.sql", "TestClaimRunOverrideUnavailableClaudeLiveDB",
+		"../workersvc: written inside the park transaction; the test reads the message payload back, counts exactly one per park and checks runs.last_seq covers it"},
+	{"ParkCredentialDisabledChatRun", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; only the fake store in workersvc/service_test.go references it, so no live test executes it"},
+	{"ListCredentialDisabledRuns", "credential_disabled.sql", "TestCredentialDisabledWorklistCursorLiveDB",
+		"keyset paging of the held-run worklist"},
+	{"PromoteCredentialDisabledRun", "credential_disabled.sql", "TestCredentialDisabledParkPromoteLiveDB",
+		"store-level promote of a held run; the workersvc promoter tests reach it through the promoter pass"},
+	{"ReassignCredentialDisabledRun", "credential_disabled.sql", "TestCredentialPromoterLockOrderVsReassignmentLiveDB",
+		"../workersvc: reached through the owner reassignment"},
+	{"LockSecretEnablementForShareNowait", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"ListCredentialDisabledUsers", "credential_disabled.sql", "TestCredentialDisabledUsersWorklistLiveDB",
+		"the promoter sweep's owner worklist"},
+	{"LockCredentialDisabledRunForPromotion", "credential_disabled.sql", "TestCredentialPromoterTriggersLiveDB",
+		"../workersvc: the promoter's candidate lock"},
+	{"LockRunForCredentialSwitch", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"LockWorkerBindingForShare", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"LockUserJudgeBindingForShare", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"LockSecretForPromotion", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"LockDefaultAnthropicSecretForShare", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"HasEnabledAnthropicForJudgeAuto", "credential_disabled.sql", "TestCodexPooledAliasInvisibleToAnthropicReadersLiveDB",
+		"asserts the pooled Codex alias is invisible to it"},
+	{"SettleCredentialDisabledPause", "credential_disabled.sql", "TestCredentialPromoterUntimedRunsIgnoreSpentBudgetLiveDB",
+		"../workersvc: the promoter's pending-pause settle arm"},
+	{"SettleCredentialDisabledSpentBudget", "credential_disabled.sql", "TestCredentialPromoterUntimedRunsIgnoreSpentBudgetLiveDB",
+		"../workersvc: the promoter's spent-budget settle arm"},
+	{"RecordScheduleHeldFire", "credential_disabled.sql", "TestRunScheduleLastFireLiveDB",
+		"records last_fire for a held one-time schedule"},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)

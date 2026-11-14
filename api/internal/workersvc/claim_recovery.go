@@ -60,6 +60,8 @@ type claimFinishQueries interface {
 	ParkRunCodexAccountUnavailable(ctx context.Context, arg store.ParkRunCodexAccountUnavailableParams) (store.Run, error)
 	LockSecretEnablementForShareNowait(ctx context.Context, arg store.LockSecretEnablementForShareNowaitParams) (bool, error)
 	ParkCredentialDisabledRun(ctx context.Context, arg store.ParkCredentialDisabledRunParams) (int64, error)
+	ParkRunOverrideUnavailableRun(ctx context.Context, arg store.ParkRunOverrideUnavailableRunParams) (int64, error)
+	InsertRunOverrideUnavailableMessage(ctx context.Context, arg store.InsertRunOverrideUnavailableMessageParams) (int32, error)
 	GetUserCredentialsResetAt(ctx context.Context, id uuid.UUID) (pgtype.Timestamptz, error)
 	RequeueClaimAssemblyExact(ctx context.Context, arg store.RequeueClaimAssemblyExactParams) (int64, error)
 	FailClaimAssemblyExact(ctx context.Context, arg store.FailClaimAssemblyExactParams) (int64, error)
@@ -178,9 +180,10 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing) ||
 		errors.Is(assemblyErr, errReserveHeld)
 	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
-	// transient nor terminal, so it must pass this early return to reach the fenced park.
+	// transient nor terminal, so it must pass this early return to reach the fenced park. So is
+	// errRunOverrideUnavailable (PRD #3250), which parks on its own hold.
 	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
-		!errors.Is(assemblyErr, errCredentialDisabled) {
+		!errors.Is(assemblyErr, errCredentialDisabled) && !errors.Is(assemblyErr, errRunOverrideUnavailable) {
 		return nil, assemblyErr
 	}
 	for attempt := 1; ; attempt++ {
@@ -435,7 +438,13 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	holdClass = holdClass && (assemblyErr == nil || origin == "credential_unavailable" || transient) &&
 		runClaimOpenedCustody(run, true)
 	decision := assemblyErr
-	if credDisabled {
+	// PRD #3250: an unhonorable run_override model or effort is decided like the disabled credential:
+	// a distinct non-terminal park that the authority rewrite and the hold class never touch.
+	var overrideErr *runOverrideUnavailableError
+	overrideUnavailable := !credDisabled && errors.As(assemblyErr, &overrideErr)
+	if overrideUnavailable {
+		holdClass, transient = false, false
+	} else if credDisabled {
 		// A distinct non-terminal outcome: never a transient requeue, never the account
 		// park, and never rewritten into a failure by the authority rewrite below. The owner
 		// re-enabling (or reassigning) the credential resumes it through the promoter.
@@ -553,7 +562,22 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		}
 	}
 	var n int64
+	var overrideMsg []byte
+	var overrideSeq int32
 	switch {
+	case overrideUnavailable:
+		// The same exact-claim fence as the credential park below; the feed line is written under the
+		// run lock held here, so a rolled-back park leaves no message and a stale claim writes neither.
+		n, err = q.ParkRunOverrideUnavailableRun(ctx, store.ParkRunOverrideUnavailableRunParams{
+			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+		})
+		if err == nil && n == 1 {
+			var raw []byte
+			if raw, err = runOverrideUnavailablePayload(overrideErr); err == nil {
+				overrideMsg = raw
+				overrideSeq, err = q.InsertRunOverrideUnavailableMessage(ctx, store.InsertRunOverrideUnavailableMessageParams{RunID: run.ID, Payload: raw})
+			}
+		}
 	case credDisabled:
 		// Status exactly 'claimed' at this generation and worker with an unreleased claim (the
 		// query's fence, which admits any hold_reason: a resumed completion_blocked annotation
@@ -619,13 +643,16 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	if checkerEvent != nil && s.bcast != nil {
 		s.bcast.PublishMessage(checkerLead.ID, checkerSeq, "cross_check", "", "", "", checkerEvent, s.now())
 	}
+	if overrideMsg != nil && s.bcast != nil {
+		s.bcast.PublishMessage(run.ID, overrideSeq, runOverrideUnavailableKind, "", "", "", overrideMsg, s.now())
+	}
 	if expected == 1 {
 		// PRD #1810 D3: the exact hold's release committed with the outcome above; if it was
 		// the run's last open hold, a retained checkpoint of the run is now owed its delete.
 		s.SettleRetainedCheckpoint(run.ID)
 	}
 	switch {
-	case credDisabled:
+	case overrideUnavailable, credDisabled:
 		return nil, "paused", nil
 	case !holdClass && !transient:
 		return nil, "failed", nil

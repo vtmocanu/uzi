@@ -55,6 +55,73 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
   AND runs.claim_released_at IS NULL
   AND runs.status = 'claimed';
 
+-- PRD #3250: the claim finisher's park for a run whose start-time run_override model or effort the
+-- claim cannot honor (the model is not servable by the run's harness, or the effort is out of set).
+-- It is ParkCredentialDisabledRun's twin with the reason fixed: the same exact-claim fence (status
+-- 'claimed' at this worker and generation, claim unreleased), the same undelivered-claim shape
+-- (worker_id kept as affinity, claim_released_at set, capability revoked and epoch bumped, no
+-- released_worker_* pair), and the same one-claim Fresh restore (#3607 Mf) because the payload was
+-- never delivered. hold_reason is overwritten unconditionally, as there (a resumed completion_blocked
+-- annotation is superseded). No automatic promoter reads this hold: only the owner's resume
+-- (ResumePausedRun) leaves it, and the next claim parks it again until the run is replaced.
+-- name: ParkRunOverrideUnavailableRun :execrows
+WITH fresh_restored AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT r.id, 'resume', '{"policy_fresh":"restored","generation":' || r.claim_generation::text || '}'
+    FROM runs r
+    WHERE r.id = @id AND r.worker_id = @worker_id AND r.claim_generation = @claim_generation
+      AND r.claim_released_at IS NULL AND r.status = 'claimed'
+      AND r.policy_fresh_consumed_generation = @claim_generation::bigint
+      AND r.policy_fresh_confirmed_generation IS NULL AND r.policy_preserve_required
+    RETURNING 1
+)
+UPDATE runs SET
+    policy_pending_fresh = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN true ELSE runs.policy_pending_fresh END,
+    policy_fresh_consumed_generation = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN NULL ELSE runs.policy_fresh_consumed_generation END,
+    status = 'paused',
+    status_since = now(),
+    hold_reason = 'run_override_unavailable',
+    claim_released_at = now(),
+    codex_cap_hash = NULL,
+    codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @claim_generation
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'claimed';
+
+-- PRD #3250: the run feed line for a run_override_unavailable park, written in the SAME transaction
+-- as ParkRunOverrideUnavailableRun (the caller holds the run row lock). A server-authored message on
+-- a held run has no live claim, so it appends at the next free seq (past runs.last_seq and the stored
+-- maximum) and advances runs.last_seq in the same statement, as InsertCodexReadmitRunMessage does.
+-- Fenced on the hold itself; no row back (the run left the hold, or a seq collision) is
+-- pgx.ErrNoRows and the caller rolls the park back. The payload carries no secret material.
+-- name: InsertRunOverrideUnavailableMessage :one
+WITH next AS (
+    SELECT r.id,
+           GREATEST(r.last_seq,
+                    COALESCE((SELECT MAX(m.seq) FROM run_messages m WHERE m.run_id = r.id), 0)) + 1 AS seq
+    FROM runs r
+    WHERE r.id = @run_id
+      AND r.status = 'paused' AND r.hold_reason = 'run_override_unavailable'
+),
+ins AS (
+    INSERT INTO run_messages (run_id, seq, kind, payload)
+    SELECT next.id, next.seq, 'run_override_unavailable', @payload::jsonb FROM next
+    ON CONFLICT (run_id, seq) DO NOTHING
+    RETURNING seq
+),
+bump AS (
+    UPDATE runs SET last_seq = GREATEST(runs.last_seq, ins.seq)
+    FROM ins
+    WHERE runs.id = @run_id
+    RETURNING runs.id
+)
+SELECT ins.seq FROM ins;
+
 -- The chat lane's twin of ParkCredentialDisabledRun (PRD #1732 D2/D14). ClaimChatRun has no
 -- claim generation, capability or custody hold, so the fence is the claimed chat row this
 -- worker just claimed. Chat is not bindable: it parks only when the owner's default resolves to

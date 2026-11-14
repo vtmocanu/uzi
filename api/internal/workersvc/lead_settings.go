@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -9,14 +10,26 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 )
 
-// LeadSettingsInput is what the lead resolver reads: the run's harness, the model frozen onto the
-// run at create (runs.model), the owner's model lane for that harness and the owner's per-harness
-// effort column. The caller reads them; the resolver is pure.
+// LeadSettingsInput is what the lead resolver reads: the run's harness, the model and effort frozen
+// onto the run at create (runs.model / model_source, runs.effort / effort_source), the owner's model
+// lane for that harness and the owner's per-harness effort column. The caller reads them; the
+// resolver is pure.
 type LeadSettingsInput struct {
-	Harness    Harness
-	RunModel   pgtype.Text // runs.model, frozen at create
-	LaneModel  pgtype.Text // the user's lane for Harness
-	UserEffort pgtype.Text // the user's per-harness effort column
+	Harness         Harness
+	RunModel        pgtype.Text // runs.model, frozen at create
+	RunModelSource  pgtype.Text // runs.model_source: run_override, schedule_pin or NULL
+	RunEffort       pgtype.Text // runs.effort, frozen at create
+	RunEffortSource pgtype.Text // runs.effort_source: run_override or NULL
+	LaneModel       pgtype.Text // the user's lane for Harness
+	UserEffort      pgtype.Text // the user's per-harness effort column
+}
+
+// RunOverrideUnhonorable names the start-time run_override choice the claim cannot honor. It is
+// never a fallback: the claim parks the run instead of running it on something the owner did not pick.
+type RunOverrideUnhonorable struct {
+	Setting string // "model" or "effort"
+	Value   string
+	Harness Harness
 }
 
 // LeadSettings is the resolved lead model and effort with the provenance the claim ships.
@@ -35,6 +48,9 @@ type LeadSettings struct {
 	// DroppedRunModel is the (untrimmed) incompatible runs.model that was ignored, for its
 	// existing fallback note.
 	DroppedRunModel pgtype.Text
+	// Unhonorable is set when a run_override model or effort cannot be honored (model checked first).
+	// The other fields are not meaningful then, and DroppedRunModel is never set for a run_override.
+	Unhonorable *RunOverrideUnhonorable
 }
 
 // resolveLeadSettings is the one server-side home of lead precedence (PRD #3244 section 3). It is
@@ -54,7 +70,16 @@ func resolveLeadSettings(in LeadSettingsInput) LeadSettings {
 	if model.Valid {
 		out.ModelSource = leadcfg.ModelSourceUserDefault
 	}
-	if in.RunModel.Valid {
+	runOverride := in.RunModel.Valid && in.RunModelSource.Valid && in.RunModelSource.String == string(leadcfg.ModelSourceRunOverride)
+	switch {
+	case runOverride:
+		if !runOverrideModelHonorable(in.Harness, in.RunModel.String) {
+			out.Unhonorable = &RunOverrideUnhonorable{Setting: "model", Value: in.RunModel.String, Harness: in.Harness}
+			return out
+		}
+		model = in.RunModel
+		out.ModelSource = leadcfg.ModelSourceRunOverride
+	case in.RunModel.Valid:
 		if harnessModelCompatible(in.Harness, in.RunModel.String) {
 			model = in.RunModel
 			out.ModelSource = leadcfg.ModelSourceSchedulePin
@@ -66,8 +91,28 @@ func resolveLeadSettings(in LeadSettingsInput) LeadSettings {
 	if !model.Valid {
 		out.ModelSource = ""
 	}
-	out.Effort, out.EffortSource = resolveLeadEffort(in.Harness, in.UserEffort)
+	var unhonorable bool
+	out.Effort, out.EffortSource, unhonorable = leadEffortFor(in.Harness, in.RunEffort, in.RunEffortSource, in.UserEffort)
+	if unhonorable {
+		out.Unhonorable = &RunOverrideUnhonorable{Setting: "effort", Value: in.RunEffort.String, Harness: in.Harness}
+	}
 	return out
+}
+
+// leadEffortFor is the effort precedence: a start-time run_override effort that is exactly one of
+// agenttmpl.EffortLevels wins over the owner's column (including the `runtime` choice) with source
+// run_override; a run_override effort outside the set is unhonorable (the other results are then
+// meaningless); everything else is resolveLeadEffort over the owner's column.
+func leadEffortFor(harness Harness, runEffort, runEffortSource, userEffort pgtype.Text) (effort *string, source leadcfg.EffortSource, unhonorable bool) {
+	if runEffort.Valid && runEffortSource.Valid && runEffortSource.String == string(leadcfg.EffortSourceRunOverride) {
+		if !slices.Contains(agenttmpl.EffortLevels, runEffort.String) {
+			return nil, "", true
+		}
+		level := runEffort.String
+		return &level, leadcfg.EffortSourceRunOverride, false
+	}
+	effort, source = resolveLeadEffort(harness, userEffort)
+	return effort, source, false
 }
 
 // resolveLeadEffort is the single home of the lead effort value and its source. assembleClaim

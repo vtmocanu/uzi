@@ -4513,7 +4513,13 @@ WITH candidates AS MATERIALIZED (
   -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
   -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
   -- touches no policy column.
-  AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold' OR runs.policy_pending_fresh
+  -- PRD #3250: a pending Fresh grant blocks the ordinary resume EXCEPT on a run_override_unavailable
+  -- hold whose episode is resolved: that park (ParkRunOverrideUnavailableRun) restored a grant its
+  -- undelivered claim consumed, so the owner's resume may requeue it and the next claim consumes it.
+  AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold'
+           OR (runs.policy_pending_fresh
+               AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable'
+                        AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL)))
            OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
@@ -4609,7 +4615,13 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
   -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
   -- touches no policy column.
-  AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold' OR runs.policy_pending_fresh
+  -- PRD #3250: a pending Fresh grant blocks the ordinary resume EXCEPT on a run_override_unavailable
+  -- hold whose episode is resolved: that park (ParkRunOverrideUnavailableRun) restored a grant its
+  -- undelivered claim consumed, so the owner's resume may requeue it and the next claim consumes it.
+  AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold'
+           OR (runs.policy_pending_fresh
+               AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable'
+                        AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL)))
            OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'

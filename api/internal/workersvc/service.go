@@ -7917,7 +7917,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	}
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
-	// first: it is pure input validation, independent of the repo/issue gates below.
+	// with the other pure input validation, before the repo/issue gates below.
 	if len(description) > MaxIssueDescriptionBytes {
 		return store.Run{}, ErrDescriptionTooLarge
 	}

@@ -30,6 +30,48 @@ func (q *Queries) HasEnabledAnthropicForJudgeAuto(ctx context.Context, userID uu
 	return available, err
 }
 
+const insertRunOverrideUnavailableMessage = `-- name: InsertRunOverrideUnavailableMessage :one
+WITH next AS (
+    SELECT r.id,
+           GREATEST(r.last_seq,
+                    COALESCE((SELECT MAX(m.seq) FROM run_messages m WHERE m.run_id = r.id), 0)) + 1 AS seq
+    FROM runs r
+    WHERE r.id = $1
+      AND r.status = 'paused' AND r.hold_reason = 'run_override_unavailable'
+),
+ins AS (
+    INSERT INTO run_messages (run_id, seq, kind, payload)
+    SELECT next.id, next.seq, 'run_override_unavailable', $2::jsonb FROM next
+    ON CONFLICT (run_id, seq) DO NOTHING
+    RETURNING seq
+),
+bump AS (
+    UPDATE runs SET last_seq = GREATEST(runs.last_seq, ins.seq)
+    FROM ins
+    WHERE runs.id = $1
+    RETURNING runs.id
+)
+SELECT ins.seq FROM ins
+`
+
+type InsertRunOverrideUnavailableMessageParams struct {
+	RunID   uuid.UUID `json:"run_id"`
+	Payload []byte    `json:"payload"`
+}
+
+// PRD #3250: the run feed line for a run_override_unavailable park, written in the SAME transaction
+// as ParkRunOverrideUnavailableRun (the caller holds the run row lock). A server-authored message on
+// a held run has no live claim, so it appends at the next free seq (past runs.last_seq and the stored
+// maximum) and advances runs.last_seq in the same statement, as InsertCodexReadmitRunMessage does.
+// Fenced on the hold itself; no row back (the run left the hold, or a seq collision) is
+// pgx.ErrNoRows and the caller rolls the park back. The payload carries no secret material.
+func (q *Queries) InsertRunOverrideUnavailableMessage(ctx context.Context, arg InsertRunOverrideUnavailableMessageParams) (int32, error) {
+	row := q.db.QueryRow(ctx, insertRunOverrideUnavailableMessage, arg.RunID, arg.Payload)
+	var seq int32
+	err := row.Scan(&seq)
+	return seq, err
+}
+
 const listCredentialDisabledRuns = `-- name: ListCredentialDisabledRuns :many
 SELECT id, user_id, status_since FROM runs
 WHERE user_id = $1 AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset')
@@ -450,6 +492,59 @@ func (q *Queries) ParkCredentialDisabledRun(ctx context.Context, arg ParkCredent
 		arg.ID,
 		arg.WorkerID,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const parkRunOverrideUnavailableRun = `-- name: ParkRunOverrideUnavailableRun :execrows
+WITH fresh_restored AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT r.id, 'resume', '{"policy_fresh":"restored","generation":' || r.claim_generation::text || '}'
+    FROM runs r
+    WHERE r.id = $2 AND r.worker_id = $3 AND r.claim_generation = $1
+      AND r.claim_released_at IS NULL AND r.status = 'claimed'
+      AND r.policy_fresh_consumed_generation = $1::bigint
+      AND r.policy_fresh_confirmed_generation IS NULL AND r.policy_preserve_required
+    RETURNING 1
+)
+UPDATE runs SET
+    policy_pending_fresh = CASE WHEN runs.policy_fresh_consumed_generation = $1::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN true ELSE runs.policy_pending_fresh END,
+    policy_fresh_consumed_generation = CASE WHEN runs.policy_fresh_consumed_generation = $1::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN NULL ELSE runs.policy_fresh_consumed_generation END,
+    status = 'paused',
+    status_since = now(),
+    hold_reason = 'run_override_unavailable',
+    claim_released_at = now(),
+    codex_cap_hash = NULL,
+    codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = $2 AND runs.worker_id = $3
+  AND runs.claim_generation = $1
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'claimed'
+`
+
+type ParkRunOverrideUnavailableRunParams struct {
+	ClaimGeneration int64       `json:"claim_generation"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+}
+
+// PRD #3250: the claim finisher's park for a run whose start-time run_override model or effort the
+// claim cannot honor (the model is not servable by the run's harness, or the effort is out of set).
+// It is ParkCredentialDisabledRun's twin with the reason fixed: the same exact-claim fence (status
+// 'claimed' at this worker and generation, claim unreleased), the same undelivered-claim shape
+// (worker_id kept as affinity, claim_released_at set, capability revoked and epoch bumped, no
+// released_worker_* pair), and the same one-claim Fresh restore (#3607 Mf) because the payload was
+// never delivered. hold_reason is overwritten unconditionally, as there (a resumed completion_blocked
+// annotation is superseded). No automatic promoter reads this hold: only the owner's resume
+// (ResumePausedRun) leaves it, and the next claim parks it again until the run is replaced.
+func (q *Queries) ParkRunOverrideUnavailableRun(ctx context.Context, arg ParkRunOverrideUnavailableRunParams) (int64, error) {
+	result, err := q.db.Exec(ctx, parkRunOverrideUnavailableRun, arg.ClaimGeneration, arg.ID, arg.WorkerID)
 	if err != nil {
 		return 0, err
 	}
