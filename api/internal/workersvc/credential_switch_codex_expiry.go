@@ -27,6 +27,7 @@ func expireCodexSwitchOnFreshClaim(ctx context.Context, q *store.Queries, run st
 	op := uuid.UUID(run.CredentialSwitchOpID.Bytes)
 	payload, err := json.Marshal(map[string]any{
 		"outcome": ApplyOutcomeNotApplied, "reason": "expired_by_worker_loss",
+		"text":  "Credential switch was not applied: the worker was lost before it completed. The run keeps its committed credential.",
 		"op_id": op.String(), "claim_generation": run.ClaimGeneration,
 		"requested_generation": run.CredentialSwitchGeneration.Int64,
 	})
@@ -51,7 +52,7 @@ func expireCodexSwitchOnFreshClaim(ctx context.Context, q *store.Queries, run st
 			return store.Run{}, err
 		}
 		inserted, err := q.InsertRunMessage(ctx, store.InsertRunMessageParams{
-			RunID: run.ID, Seq: seq, Kind: "credential_switch", Payload: payload, ClaimGeneration: generation,
+			RunID: run.ID, Seq: seq, Kind: "text", Payload: payload, ClaimGeneration: generation,
 		})
 		if err != nil {
 			return store.Run{}, err

@@ -1345,6 +1345,10 @@ type Run struct {
 	CodexSwitchTargetSecretID         pgtype.UUID        `json:"codex_switch_target_secret_id"`
 	CodexSwitchTargetGeneration       pgtype.Int8        `json:"codex_switch_target_generation"`
 	CodexSwitchTargetOpID             pgtype.UUID        `json:"codex_switch_target_op_id"`
+	CodexSwitchTargetAuthMode         pgtype.Text        `json:"codex_switch_target_auth_mode"`
+	CodexSwitchTargetMaterialRevision pgtype.Int8        `json:"codex_switch_target_material_revision"`
+	CodexSwitchTargetAccountKey       pgtype.Text        `json:"codex_switch_target_account_key"`
+	CodexSwitchTargetAccountRevision  pgtype.Int8        `json:"codex_switch_target_account_revision"`
 }
 
 type RunCompletionAttempt struct {

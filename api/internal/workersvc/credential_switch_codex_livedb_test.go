@@ -38,7 +38,10 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			f.env.exec("UPDATE runs SET codex_switch_target_secret_id = $2, codex_switch_target_generation = credential_switch_generation, codex_switch_target_op_id = credential_switch_op_id WHERE id = $1", run, target)
+			if _, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, run, BindModePinned, &target); err != nil {
+				t.Fatal(err)
+			}
+			op = f.opOf(t, run)
 			req := CodexSwitchPreflightRequest{CredentialSwitchApplyRequest: f.req(op), TargetSecretID: target}
 			want, reason := "ready", ""
 			switch scenario {
@@ -149,8 +152,8 @@ func TestCodexSwitchApplyDoesNotUseAnthropicLiveDB(t *testing.T) {
 	}
 	before := f.snap(t, run)
 	got := f.apply(t, run, f.req(op))
-	if got.Outcome != ApplyOutcomeNotApplied || got.Token != "" {
-		t.Fatalf("Codex apply = %v", got)
+	if got.Outcome != ApplyOutcomeFenced || got.Token != "" || got.Codex != nil {
+		t.Fatalf("Claude-only worker was not fenced from Codex apply: %v", got)
 	}
 	if after := f.snap(t, run); after != before {
 		t.Fatal("unsupported Codex apply changed state")

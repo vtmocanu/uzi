@@ -81,7 +81,8 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 // worker then run locks in a READ COMMITTED transaction. This validator only
 // reads material and takes bounded NOWAIT alias/account/intent locks; it never
 // starts a transaction or calls a provider.
-func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Queries, w store.Worker, run store.Run, req CodexSwitchPreflightRequest) (result CodexSwitchPreflightResult, retErr error) {
+func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Queries, w store.Worker, run store.Run, req CodexSwitchPreflightRequest, material ...*codexSwitchMaterial) (result CodexSwitchPreflightResult, retErr error) {
+	target := codexSwitchMaterial{}
 	op, _, err := ValidateCredentialSwitchApplyRequest(req.CredentialSwitchApplyRequest)
 	if err != nil {
 		return CodexSwitchPreflightResult{}, err
@@ -133,25 +134,21 @@ func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Querie
 		run.CodexSwitchTargetOpID != run.CredentialSwitchOpID {
 		return refuse("target_mismatch")
 	}
-	base, err := q.ListRunCredentialEpochs(ctx, store.ListRunCredentialEpochsParams{RunID: runID, UserID: run.UserID})
-	if err != nil {
-		return CodexSwitchPreflightResult{}, errCodexSwitchRead
-	}
-	children, err := q.ListRunCredentialSwitchEpochs(ctx, store.ListRunCredentialSwitchEpochsParams{RunID: runID, UserID: run.UserID})
-	if err != nil {
-		return CodexSwitchPreflightResult{}, errCodexSwitchRead
-	}
-	hasBaseline := false
-	for _, b := range base {
-		if b.ClaimGeneration == gen {
-			hasBaseline = true
-			break
-		}
-	}
-	if !hasBaseline {
+	baseline, err := q.GetCodexClaimBaseline(ctx, store.GetCodexClaimBaselineParams{RunID: runID, ClaimGeneration: gen, UserID: run.UserID})
+	if errors.Is(err, pgx.ErrNoRows) {
 		return refuse("baseline_missing")
 	}
-	if !codexSwitchBaselineMatches(run, base, children) {
+	if err != nil {
+		return CodexSwitchPreflightResult{}, errCodexSwitchRead
+	}
+	latest, err := q.GetLatestCodexClaimSwitchEpoch(ctx, store.GetLatestCodexClaimSwitchEpochParams{RunID: runID, ClaimGeneration: gen, UserID: run.UserID})
+	var children []store.RunCredentialSwitchEpoch
+	if err == nil {
+		children = []store.RunCredentialSwitchEpoch{latest}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return CodexSwitchPreflightResult{}, errCodexSwitchRead
+	}
+	if !codexSwitchBaselineMatches(run, []store.RunCredentialEpoch{baseline}, children) {
 		return refuse("baseline_mismatch")
 	}
 	// Lock both aliases before either account. NOWAIT avoids the reverse order
@@ -187,6 +184,16 @@ func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Querie
 		}
 		if id == req.TargetSecretID {
 			targetKind = meta.Kind
+			target.label = meta.Label
+			target.revision = st.MaterialRevision
+			target.auth.AuthMode = codexAuthModeAPIKey
+			if meta.Kind == store.KindCodexAuth {
+				target.auth.AuthMode = codexAuthModeSubscription
+			}
+			if !run.CodexSwitchTargetAuthMode.Valid || run.CodexSwitchTargetAuthMode.String != target.auth.AuthMode ||
+				!run.CodexSwitchTargetMaterialRevision.Valid || run.CodexSwitchTargetMaterialRevision.Int64 != st.MaterialRevision {
+				return refuse("target_moved")
+			}
 			if st.ProviderAccountID.Valid {
 				targetAccount = uuid.UUID(st.ProviderAccountID.Bytes)
 			}
@@ -244,15 +251,30 @@ func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Querie
 			// Use the transaction reader even for the bounded vault-conversion retry.
 			opener := *s
 			opener.q = q
-			if _, err := opener.openCodexAccountLogin(ctx, run.UserID, snapshot); err != nil {
+			key, err := codexAccountKey(acct.ProviderUserID, acct.WorkspaceAccountID)
+			if err != nil || !run.CodexSwitchTargetAccountKey.Valid || run.CodexSwitchTargetAccountKey.String != key ||
+				!run.CodexSwitchTargetAccountRevision.Valid || run.CodexSwitchTargetAccountRevision.Int64 != acct.CredentialRevision {
+				return refuse("target_moved")
+			}
+			blob, err := opener.openCodexAccountLogin(ctx, run.UserID, snapshot)
+			if err != nil {
 				return refuse(codexSwitchMaterialReason(err))
 			}
+			target.key = pgtype.Text{String: key, Valid: true}
+			target.accountRevision = pgtype.Int8{Int64: acct.CredentialRevision, Valid: true}
+			target.auth.AccessToken = blob.AccessToken
+			g := acct.Generation
+			target.auth.Generation = &g
+			target.auth.ChatGPTAccountID = acct.WorkspaceAccountID
 		}
 		if !codexSwitchAccountIdle(acct, len(intents)) {
 			return refuse(applyReasonCredentialBusy)
 		}
 	}
 	if targetKind == store.KindOpenAIAPIKey {
+		if run.CodexSwitchTargetAccountKey.Valid || run.CodexSwitchTargetAccountRevision.Valid {
+			return refuse("target_moved")
+		}
 		plain, err := secretopen.OpenByIDOfKind(ctx, q, s.vlt, s.box, run.UserID, req.TargetSecretID, store.KindOpenAIAPIKey)
 		if err != nil {
 			return refuse(codexSwitchMaterialReason(err))
@@ -260,6 +282,13 @@ func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Querie
 		if strings.TrimSpace(string(plain)) == "" {
 			return refuse(applyReasonCredentialUnavail)
 		}
+		target.auth.AccessToken = string(plain)
+	}
+	if strings.TrimSpace(target.auth.AccessToken) == "" {
+		return refuse(applyReasonCredentialUnavail)
+	}
+	if len(material) > 0 && material[0] != nil {
+		*material[0] = target
 	}
 	return CodexSwitchPreflightResult{Outcome: "ready"}, nil
 }

@@ -122,18 +122,20 @@ type CredentialSwitchApplyRequest struct {
 // credential on an applied outcome and is NEVER logged: LogValue redacts it, so a result passed to
 // slog (as a value or pointer) prints the outcome and coordinates only.
 type CredentialSwitchApplyResult struct {
-	Outcome    string
-	Token      string
-	Ordinal    int32
-	MessageSeq int32
-	Replay     bool
-	Reason     string
+	Outcome         string
+	Token           string
+	Codex           *ClaimCodexSecrets
+	CapabilityEpoch int64
+	Ordinal         int32
+	MessageSeq      int32
+	Replay          bool
+	Reason          string
 }
 
 // LogValue implements slog.LogValuer: the token is replaced by a fixed marker.
 func (r CredentialSwitchApplyResult) LogValue() slog.Value {
 	token := ""
-	if r.Token != "" {
+	if r.Token != "" || r.Codex != nil {
 		token = "[REDACTED]"
 	}
 	return slog.GroupValue(
@@ -153,6 +155,19 @@ func (r CredentialSwitchApplyResult) GoString() string { return r.String() }
 // MarshalJSON is the wire shape. An applied outcome always states replay; the other outcomes carry
 // only outcome and, for not_applied and refused_committed, reason.
 func (r CredentialSwitchApplyResult) MarshalJSON() ([]byte, error) {
+	if r.Outcome == ApplyOutcomeApplied && r.Codex != nil {
+		if r.Codex.AccessToken == "" || r.Codex.Capability == "" || r.CapabilityEpoch <= 0 || r.Ordinal <= 0 || r.MessageSeq <= 0 {
+			return nil, errors.New("incomplete Codex apply result")
+		}
+		return json.Marshal(struct {
+			Outcome         string             `json:"outcome"`
+			Codex           *ClaimCodexSecrets `json:"codex"`
+			CapabilityEpoch int64              `json:"capability_epoch"`
+			Ordinal         int32              `json:"ordinal"`
+			MessageSeq      int32              `json:"message_seq"`
+			Replay          bool               `json:"replay"`
+		}{r.Outcome, r.Codex, r.CapabilityEpoch, r.Ordinal, r.MessageSeq, r.Replay})
+	}
 	if r.Outcome == ApplyOutcomeApplied {
 		return json.Marshal(struct {
 			Outcome    string `json:"outcome"`
@@ -287,7 +302,11 @@ func (s *Service) applyCredentialSwitchOnce(ctx context.Context, wkr store.Worke
 		return CredentialSwitchApplyResult{}, err
 	}
 	fenced := CredentialSwitchApplyResult{Outcome: ApplyOutcomeFenced}
-	if !slices.Contains(w.ProtocolCapabilities, capability.CredentialSwitchInPlaceV1) ||
+	requiredCapability := capability.CredentialSwitchInPlaceV1
+	if run.Harness == harnessCodex {
+		requiredCapability = capability.CodexCredentialSwitchV1
+	}
+	if !slices.Contains(w.ProtocolCapabilities, requiredCapability) ||
 		run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
 		!w.SnapshotRegisterNonce.Valid || w.SnapshotRegisterNonce.String != req.RegisterNonce ||
 		!run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID ||
@@ -319,10 +338,8 @@ func (s *Service) applyCredentialSwitchOnce(ctx context.Context, wkr store.Worke
 		return CredentialSwitchApplyResult{Outcome: ApplyOutcomeNotApplied, Reason: applyReasonNoPendingSwitch}, nil
 	}
 
-	// Codex binding rewrites require a dedicated fenced SQL primitive. Until
-	// that exists, never let a Codex run enter the Anthropic selection ladder.
 	if run.Harness == harnessCodex {
-		return CredentialSwitchApplyResult{Outcome: ApplyOutcomeNotApplied, Reason: applyReasonCredentialUnavail}, nil
+		return s.applyCodexSwitchLocked(ctx, qtx, tx, w, run, req, op, oldCumulative)
 	}
 
 	// Step 3: fresh apply.

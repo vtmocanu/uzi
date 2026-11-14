@@ -649,6 +649,26 @@ func (s *Service) requestCodexCredentialSwitch(ctx context.Context, observed sto
 	if err != nil || disabled || !codexSwitchTargetUsable(meta.Kind, alias.Status, alias.ProviderAccountID.Valid) {
 		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
 	}
+	authMode := codexAuthModeAPIKey
+	var accountKey pgtype.Text
+	var accountRevision pgtype.Int8
+	if alias.ProviderAccountID.Valid {
+		authMode = codexAuthModeSubscription
+		accountID := uuid.UUID(alias.ProviderAccountID.Bytes)
+		if _, err := q.LockCodexAccountForUpdateNowait(ctx, store.LockCodexAccountForUpdateNowaitParams{ID: accountID, UserID: run.UserID}); err != nil {
+			return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+		}
+		acct, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{ID: accountID, UserID: run.UserID})
+		if err != nil {
+			return SetRunCredentialResult{}, err
+		}
+		key, err := codexAccountKey(acct.ProviderUserID, acct.WorkspaceAccountID)
+		if err != nil {
+			return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+		}
+		accountKey = pgtype.Text{String: key, Valid: true}
+		accountRevision = pgtype.Int8{Int64: acct.CredentialRevision, Valid: true}
+	}
 	n, err := q.StampHeldCodexCredentialSwitch(ctx, store.StampHeldCodexCredentialSwitchParams{
 		ID: run.ID, UserID: run.UserID, WorkerID: run.WorkerID, Generation: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
 	})
@@ -659,6 +679,7 @@ func (s *Service) requestCodexCredentialSwitch(ctx context.Context, observed sto
 		return SetRunCredentialResult{}, ErrCredentialSwitchRaced
 	}
 	n, err = q.SetPendingCodexSwitchTarget(ctx, store.SetPendingCodexSwitchTargetParams{
+		AuthMode: authMode, MaterialRevision: alias.MaterialRevision, AccountKey: accountKey, AccountRevision: accountRevision,
 		ID: run.ID, UserID: run.UserID, SecretID: pgtype.UUID{Bytes: *secretID, Valid: true}, Generation: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
 	})
 	if err != nil {

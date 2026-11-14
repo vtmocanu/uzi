@@ -512,6 +512,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// a worker applies a switch in place ONLY after seeing this token, because an older api 404s
 		// the route and 400s the unknown fields and state.
 		{workersvc.CredentialSwitchApplyFeature},
+		{workersvc.CodexCredentialSwitchApplyFeature},
 		// Issue #3985: this api accepts {status:"clarification_settled", claim_generation,
 		// clarification_settlement:{question_id, revision_input_id, gate_revision}} and answers it
 		// with disposition "clarification_settled". It returns a plan cross-check run parked at
@@ -1765,7 +1766,7 @@ func (h *Handler) WorkerCredentialSwitchApply(w http.ResponseWriter, r *http.Req
 }
 
 // WorkerCodexSwitchPreflight returns only a bounded, point-in-time decision.
-// It never grants authority and does not advertise the unfinished apply feature.
+// It never grants authority; apply repeats validation in its write transaction.
 func (h *Handler) WorkerCodexSwitchPreflight(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	wkr, ok := mw.WorkerFromContext(r.Context())

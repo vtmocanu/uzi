@@ -38,7 +38,7 @@ func TestCodexFreshClaimPendingExpiryLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			if scenario == "notice failure" {
-				if _, err := tx.Exec(f.env.ctx, "ALTER TABLE run_messages ADD CONSTRAINT codex_expiry_test_refuse_notice CHECK (kind <> 'credential_switch') NOT VALID"); err != nil {
+				if _, err := tx.Exec(f.env.ctx, "ALTER TABLE run_messages ADD CONSTRAINT codex_expiry_test_refuse_notice CHECK (payload->>'reason' IS DISTINCT FROM 'expired_by_worker_loss') NOT VALID"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -76,10 +76,11 @@ func TestCodexFreshClaimPendingExpiryLiveDB(t *testing.T) {
 				}
 				var payload []byte
 				var generation int64
-				if err := tx.QueryRow(f.env.ctx, "SELECT payload, claim_generation FROM run_messages WHERE run_id=$1 AND seq=$2 AND kind='credential_switch'", id, got.LastSeq).Scan(&payload, &generation); err != nil {
+				if err := tx.QueryRow(f.env.ctx, "SELECT payload, claim_generation FROM run_messages WHERE run_id=$1 AND seq=$2 AND kind='text'", id, got.LastSeq).Scan(&payload, &generation); err != nil {
 					t.Fatal(err)
 				}
 				var notice struct {
+					Text    string `json:"text"`
 					Outcome string `json:"outcome"`
 					Reason  string `json:"reason"`
 					OpID    string `json:"op_id"`
@@ -87,7 +88,7 @@ func TestCodexFreshClaimPendingExpiryLiveDB(t *testing.T) {
 				if err := json.Unmarshal(payload, &notice); err != nil {
 					t.Fatal(err)
 				}
-				if notice.Outcome != ApplyOutcomeNotApplied || notice.Reason != "expired_by_worker_loss" ||
+				if notice.Text != "Credential switch was not applied: the worker was lost before it completed. The run keeps its committed credential." || notice.Outcome != ApplyOutcomeNotApplied || notice.Reason != "expired_by_worker_loss" ||
 					notice.OpID != op.String() || generation != f.gen+1 {
 					t.Fatal("incorrect expiry notice")
 				}
