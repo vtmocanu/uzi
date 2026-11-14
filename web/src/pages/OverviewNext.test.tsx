@@ -1111,7 +1111,7 @@ describe("OverviewNext Search button", () => {
   });
 });
 
-// #4335: the Agents chip sits after the People chip and before Search, for every user.
+// #4335: the Agents chip sits after the People and Repos chips and before Search, for every user.
 describe("OverviewNext Agents chip", () => {
   const tmpl = (id: string, name: string, scope: AgentTemplate["scope"], userId: string | null = null): AgentTemplate => ({
     id,
@@ -1171,16 +1171,18 @@ describe("OverviewNext Agents chip", () => {
     return render(strict ? <StrictMode>{page}</StrictMode> : page);
   }
 
-  it("follows the health and People chips and precedes Search for an admin", async () => {
+  it("follows the health, People and Repos chips and precedes Search for an admin", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     mountWithMenu();
     await settle();
     const health = screen.getByRole("button", { name: /^System health:/ });
     const people = screen.getByRole("button", { name: /^People:/ });
+    const repos = screen.getByRole("button", { name: /^Repos:/ });
     const search = screen.getByRole("button", { name: /^Search/ });
     expect(before(health, people)).toBe(true);
-    expect(before(people, agentsChip())).toBe(true);
+    expect(before(people, repos)).toBe(true);
+    expect(before(repos, agentsChip())).toBe(true);
     expect(before(agentsChip(), search)).toBe(true);
   });
 
@@ -1250,5 +1252,30 @@ describe("OverviewNext Agents chip", () => {
     await settle(30_000);
     expect(mockApi.listRuns.mock.calls.length).toBeGreaterThan(runsBefore);
     expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the allocations again for a different signed-in viewer, never showing the previous viewer's counts", async () => {
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
+    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
+    const view = mountWithMenu();
+    await settle();
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 4 in your runs of 5");
+    const other = { ...aUser, id: "someone-else" };
+    vi.mocked(useAuth).mockReturnValue(authValue(other));
+    // For the other viewer the population is the four shared templates plus their own "theirs";
+    // their read has only "theirs" on, so a stale first read would still say 4.
+    mockApi.getTemplateAllocations.mockResolvedValue({
+      templates: allocations.map((a) => ({ ...a, effective: a.id === "o1" })),
+    });
+    view.rerender(
+      <MemoryRouter>
+        <CommandMenuContext.Provider value={{ open: vi.fn() }}>
+          <OverviewNext />
+        </CommandMenuContext.Provider>
+      </MemoryRouter>,
+    );
+    await settle();
+    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(2);
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 1 in your runs of 5");
   });
 });

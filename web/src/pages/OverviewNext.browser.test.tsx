@@ -1930,7 +1930,7 @@ describe("OverviewNext Agents chip", () => {
       mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
       mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
       render(
-        <MemoryRouter initialEntries={["/overview/next"]}>
+        <MemoryRouter initialEntries={["/dashboard"]}>
           <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
             <OverviewNext />
           </main>

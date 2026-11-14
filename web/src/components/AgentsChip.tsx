@@ -1,4 +1,4 @@
-// The Agents chip for the /overview/next header (#4335), shown to every user. A compact
+// The Agents chip for the new Overview header (/dashboard) (#4335), shown to every user. A compact
 // "K agents in your runs of N" trigger opens a popover with the per-scope breakdown and, for an
 // admin, the global-default count. All figures come from the pure agentCountModel; this
 // component only draws it. The open/close model, focus handling and absolute panel follow
