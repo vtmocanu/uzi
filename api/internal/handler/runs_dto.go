@@ -335,6 +335,10 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// PRD #300: the per-schedule model a schedule froze onto this run at fire time.
 		// nil (NULL column) for every run that inherited the owner's per-user default.
 		Model: textPtrValue(r.Model.Valid, r.Model.String),
+		// PRD #3250: the start-time effort and the writers of the frozen model and effort.
+		Effort:       textPtrValue(r.Effort.Valid, r.Effort.String),
+		ModelSource:  textPtrValue(r.ModelSource.Valid, r.ModelSource.String),
+		EffortSource: textPtrValue(r.EffortSource.Valid, r.EffortSource.String),
 		// PRD #305: the frozen "apply model also to agents" flag; false for every run
 		// that did not opt in (the default).
 		OverrideSubagentModel: r.OverrideSubagentModel,

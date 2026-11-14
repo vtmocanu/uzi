@@ -17,16 +17,40 @@ const (
 	leadTruncatedNote         = "(later changes not recorded)"
 	leadPreClaimChipUnfixed   = "lead: model and effort resolve at claim"
 	leadPreClaimChipEffortTBD = " · effort resolves at claim"
+	leadPreClaimChipModelTBD  = "lead: model resolves at claim · "
 	leadNotRecordedChip       = "lead: not recorded"
 	leadDefaultModelText      = "default"
 	leadStatusQueued          = "queued"
+	leadStatusPaused          = "paused"
 )
 
-// LeadPreClaim is what the run itself says before any lead row exists. ModelSource names the writer of
-// Model; H's adapter sets it to schedule_pin, the only writer today.
+// LeadPreClaim is what the run itself says before any lead row exists: the model and effort chosen at
+// create. ModelSource and EffortSource name their writers (run_override or schedule_pin for the model,
+// run_override for the effort). A Model with no ModelSource is a legacy row an older binary wrote and
+// reads as schedule_pin (PRD #3250 DC-P8).
 type LeadPreClaim struct {
-	Model       string `json:"model,omitempty"`
-	ModelSource string `json:"modelSource,omitempty"`
+	Model        string `json:"model,omitempty"`
+	ModelSource  string `json:"modelSource,omitempty"`
+	Effort       string `json:"effort,omitempty"`
+	EffortSource string `json:"effortSource,omitempty"`
+}
+
+func (p LeadPreClaim) modelSource() string {
+	if p.ModelSource == "" {
+		return string(leadcfg.ModelSourceSchedulePin)
+	}
+	return p.ModelSource
+}
+
+func (p LeadPreClaim) effortSource() string {
+	if p.EffortSource == "" {
+		return string(leadcfg.EffortSourceRunOverride)
+	}
+	return p.EffortSource
+}
+
+func (p LeadPreClaim) hasRunOverride() bool {
+	return (p.Model != "" && p.modelSource() == string(leadcfg.ModelSourceRunOverride)) || p.Effort != ""
 }
 
 // LeadConfigViewInput is the neutral input of LeadConfigView; it is the JSON shape of a display_cases input.
@@ -44,17 +68,27 @@ type LeadConfigViewResult struct {
 	Lines []string
 }
 
-// LeadConfigViewInputFromRun builds the view input from a run: the pre-claim model is run.Model, whose only
-// writer today is a schedule pin.
+// LeadConfigViewInputFromRun builds the view input from a run: the pre-claim model and effort are the
+// run's create-time choice with their recorded sources; a model with a NULL source reads as schedule_pin.
 func LeadConfigViewInputFromRun(run apitypes.RunDTO) LeadConfigViewInput {
 	in := LeadConfigViewInput{
 		Status:     run.Status,
 		Harness:    run.Harness,
-		PreClaim:   LeadPreClaim{ModelSource: string(leadcfg.ModelSourceSchedulePin)},
 		LeadConfig: run.LeadConfig,
 	}
 	if run.Model != nil {
 		in.PreClaim.Model = *run.Model
+		in.PreClaim.ModelSource = string(leadcfg.ModelSourceSchedulePin)
+		if run.ModelSource != nil && *run.ModelSource != "" {
+			in.PreClaim.ModelSource = *run.ModelSource
+		}
+	}
+	if run.Effort != nil {
+		in.PreClaim.Effort = *run.Effort
+		in.PreClaim.EffortSource = string(leadcfg.EffortSourceRunOverride)
+		if run.EffortSource != nil && *run.EffortSource != "" {
+			in.PreClaim.EffortSource = *run.EffortSource
+		}
 	}
 	return in
 }
@@ -65,7 +99,9 @@ func LeadConfigView(input LeadConfigViewInput) LeadConfigViewResult {
 	if lc == nil || !lc.Applicable {
 		return LeadConfigViewResult{}
 	}
-	if input.Status == leadStatusQueued {
+	if input.Status == leadStatusQueued || (input.Status == leadStatusPaused && len(lc.Phases) == 0 && input.PreClaim.hasRunOverride()) {
+		// A run held before its first report (run_override_unavailable) shows the create-time choice
+		// as a queued run does.
 		return queuedLeadView(input)
 	}
 	if len(lc.Phases) == 0 {
@@ -77,10 +113,7 @@ func LeadConfigView(input LeadConfigViewInput) LeadConfigViewResult {
 }
 
 func queuedLeadView(input LeadConfigViewInput) LeadConfigViewResult {
-	chip := leadPreClaimChipUnfixed
-	if input.PreClaim.Model != "" {
-		chip = "lead: " + input.PreClaim.Model + leadPreClaimChipEffortTBD
-	}
+	chip := preClaimChip(input.PreClaim)
 	lines := preClaimLines(input)
 	if phases := input.LeadConfig.Phases; len(phases) > 0 {
 		_, chips := shownRows(phases)
@@ -89,12 +122,27 @@ func queuedLeadView(input LeadConfigViewInput) LeadConfigViewResult {
 	return LeadConfigViewResult{Chip: chip, Lines: append(lines, leadSubagentNote)}
 }
 
-func preClaimLines(input LeadConfigViewInput) []string {
-	if input.PreClaim.Model == "" {
-		return nil
+func preClaimChip(p LeadPreClaim) string {
+	switch {
+	case p.Model != "" && p.Effort != "":
+		return "lead: " + p.Model + " · " + p.Effort
+	case p.Model != "":
+		return "lead: " + p.Model + leadPreClaimChipEffortTBD
+	case p.Effort != "":
+		return leadPreClaimChipModelTBD + p.Effort
 	}
-	label := leadcfg.SourceLabel("model", input.PreClaim.ModelSource, input.Harness)
-	return []string{valueLine(input.PreClaim.Model, label)}
+	return leadPreClaimChipUnfixed
+}
+
+func preClaimLines(input LeadConfigViewInput) []string {
+	var lines []string
+	if p := input.PreClaim; p.Model != "" {
+		lines = append(lines, valueLine(p.Model, leadcfg.SourceLabel("model", p.modelSource(), input.Harness)))
+	}
+	if p := input.PreClaim; p.Effort != "" {
+		lines = append(lines, valueLine(p.Effort, leadcfg.SourceLabel("effort", p.effortSource(), input.Harness)))
+	}
+	return lines
 }
 
 func rowsLeadView(input LeadConfigViewInput) LeadConfigViewResult {

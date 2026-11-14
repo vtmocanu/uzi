@@ -3679,10 +3679,19 @@ export interface Run {
   trigger_source?: RunTriggerSource;
   worker_id: string | null;
   branch: string | null;
-  /** PRD #300: the per-schedule model a schedule froze onto this run at fire time;
-   *  null = the run inherited the owner's worker model (Run defaults). Applies to all
-   *  schedule targets (unlike guidance). */
+  /** The model frozen onto this run at create time: chosen when the run was started
+   *  (model_source run_override, PRD #3250) or pinned by the schedule that created it
+   *  (schedule_pin, PRD #300); null = the run inherits the owner's worker model at claim. */
   model: string | null;
+  /** PRD #3250: the reasoning effort chosen when the run was started, frozen at create;
+   *  null = the claim-time setting applies. OPTIONAL here only to avoid forcing mock-object
+   *  updates (like trigger_source); the server always sends it. */
+  effort?: string | null;
+  /** Writer of `model`: run_override or schedule_pin; null for no model and for a legacy
+   *  row (display reads a model with no source as schedule_pin). */
+  model_source?: "run_override" | "schedule_pin" | null;
+  /** Writer of `effort`: run_override; null when there is no effort. */
+  effort_source?: "run_override" | null;
   /** PRD #305: the frozen "apply model also to agents" flag; true means this run's
    *  model was applied to every subagent (overriding pins), false is the default. */
   override_subagent_model: boolean;
@@ -4632,6 +4641,8 @@ export type RunSummaryItem = Omit<
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"
+  // PRD #3250: the start-time choice is on the run page and the list, not the polling shape.
+  | "effort" | "model_source" | "effort_source"
 >;
 
 /** The GET /api/runs/{id}/inputs response (Go RunInputsEnvelopeDTO, issue #4198): the steer

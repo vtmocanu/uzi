@@ -42,6 +42,16 @@ func TestLeadConfigViewDisplayCases(t *testing.T) {
 			t.Errorf("display case %q was not visited", id)
 		}
 	}
+	// PRD #3250 DC-P1 to DC-P8 stay in the contract.
+	for _, prefix := range []string{"dcp1-", "dcp2-", "dcp3-", "dcp4-", "dcp5-", "dcp6-", "dcp7-", "dcp8-"} {
+		found := false
+		for id := range visited {
+			found = found || strings.HasPrefix(id, prefix)
+		}
+		if !found {
+			t.Errorf("no display case with prefix %q", prefix)
+		}
+	}
 }
 
 func TestLeadConfigLabelTableMatchesContract(t *testing.T) {
@@ -91,5 +101,24 @@ func TestLeadConfigViewInputFromRun(t *testing.T) {
 	}
 	if got := runpresentation.LeadConfigViewInputFromRun(apitypes.RunDTO{}); got.PreClaim.Model != "" {
 		t.Fatalf("nil model must stay empty, got %q", got.PreClaim.Model)
+	}
+}
+
+func TestLeadConfigViewInputFromRunRunStartChoice(t *testing.T) {
+	str := func(s string) *string { return &s }
+	got := runpresentation.LeadConfigViewInputFromRun(apitypes.RunDTO{
+		Model: str("opus"), ModelSource: str("run_override"), Effort: str("xhigh"), EffortSource: str("run_override"),
+	})
+	want := runpresentation.LeadPreClaim{Model: "opus", ModelSource: "run_override", Effort: "xhigh", EffortSource: "run_override"}
+	if got.PreClaim != want {
+		t.Fatalf("PreClaim = %+v, want %+v", got.PreClaim, want)
+	}
+	// DC-P8: a model with a NULL source reads as schedule_pin; an effort with no source is run_override.
+	got = runpresentation.LeadConfigViewInputFromRun(apitypes.RunDTO{Model: str("opus"), Effort: str("high")})
+	if got.PreClaim.ModelSource != "schedule_pin" || got.PreClaim.EffortSource != "run_override" {
+		t.Fatalf("NULL sources = %+v", got.PreClaim)
+	}
+	if got := runpresentation.LeadConfigViewInputFromRun(apitypes.RunDTO{}); got.PreClaim != (runpresentation.LeadPreClaim{}) {
+		t.Fatalf("no choice must leave PreClaim empty, got %+v", got.PreClaim)
 	}
 }

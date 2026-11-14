@@ -116,6 +116,7 @@ export const mockRuns: Run[] = [
     // PRD #3244 rule 2: a schedule-pinned model on a queued run reads "lead: fable · effort
     // resolves at claim".
     model: "fable",
+    model_source: "schedule_pin",
     lead_config: LEAD_CONFIG_NO_ROWS,
     override_subagent_model: false,
     forge_type: "gitlab",
@@ -1087,6 +1088,7 @@ export const mockRuns: Run[] = [
     // null = inherited the owner's Worker default). PRD #3244 rule 3: claimed with no
     // recorded rows, so the chip reads "lead: not recorded" beside the schedule pin.
     model: "fable",
+    model_source: "schedule_pin",
     lead_config: LEAD_CONFIG_NO_ROWS,
     override_subagent_model: true,
     forge_type: "gitlab",
@@ -2281,6 +2283,23 @@ mockRuns.push(
   { ...pausedBase, id: "run-provider-recovery", status: "recovery_wait", hold_reason: null,
     recovery_wait_cause: "provider_outage", provider_park_count: 3,
     provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },
+);
+// PRD #3250 run-start choice shapes (lead-config display cases DC-P1 to DC-P3, DC-P6, DC-P8), built on
+// the paused run so each has its own issue; open /runs/<id> for the chip and its tooltip.
+const startChoiceBase: Run = { ...pausedBase, status: "queued", hold_reason: null, lead_config: LEAD_CONFIG_NO_ROWS };
+mockRuns.push(
+  { ...startChoiceBase, id: "run-start-choice-both", model: "opus", model_source: "run_override",
+    effort: "xhigh", effort_source: "run_override" },
+  { ...startChoiceBase, id: "run-start-choice-effort", model: null, model_source: null,
+    effort: "xhigh", effort_source: "run_override" },
+  { ...startChoiceBase, id: "run-start-choice-model", model: "opus", model_source: "run_override",
+    effort: null, effort_source: null },
+  // DC-P6: the choice cannot run on this harness; held before any lead report.
+  { ...startChoiceBase, id: "run-start-choice-hold", status: "paused", hold_reason: "run_override_unavailable",
+    model: "opus", model_source: "run_override", effort: "xhigh", effort_source: "run_override" },
+  // DC-P8: a legacy row, a model with a NULL source, reads as a schedule pin.
+  { ...startChoiceBase, id: "run-start-choice-legacy", model: "opus", model_source: null,
+    effort: null, effort_source: null },
 );
 // Forge recovery: NULL is an owner hold; omitted timing is older-API uncertainty.
 for (const [id, status, retry] of [

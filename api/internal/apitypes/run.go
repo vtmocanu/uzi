@@ -1062,10 +1062,19 @@ type RunDTO struct {
 	// SINGLE-RUN READ ONLY, best-effort: set by GET /api/runs/{id} for lead-lane runs (leadcfg.LeadLane)
 	// and absent on every list row and on runs that have no lead agent. Display-only.
 	LeadConfig *RunLeadConfigDTO `json:"lead_config,omitempty"`
-	// Model is the model frozen onto the run at fire time by the schedule that created it
-	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
-	// read-only so a scheduled run's model is confirmable.
+	// Model is the model frozen onto the run at create time, either chosen when the run was started
+	// (ModelSource run_override, PRD #3250) or pinned by the schedule that created it (schedule_pin,
+	// PRD #300): nil means the run inherits the owner's per-user Worker default at claim. Surfaced
+	// read-only so the run's model is confirmable.
 	Model *string `json:"model"`
+	// Effort is the reasoning effort chosen when the run was started (PRD #3250), frozen at create:
+	// nil means the claim-time setting applies.
+	Effort *string `json:"effort"`
+	// ModelSource names the writer of Model: run_override or schedule_pin; nil when Model is nil and for
+	// a legacy row an older binary wrote (display treats a model with no source as schedule_pin).
+	ModelSource *string `json:"model_source"`
+	// EffortSource names the writer of Effort: run_override; nil when Effort is nil.
+	EffortSource *string `json:"effort_source"`
 	// OverrideSubagentModel is the "apply model also to agents" flag frozen onto the run
 	// at fire time by the schedule that created it (PRD #305): true means the run's model
 	// was applied to every subagent (overriding pins), false is today's default. Surfaced
@@ -1978,9 +1987,10 @@ type RunSummaryItemDTO struct {
 	HomeBytes     *int64 `json:"home_bytes,omitempty"`
 	CacheBytes    *int64 `json:"cache_bytes,omitempty"`
 	DiskTruncated bool   `json:"disk_truncated,omitempty"`
-	// Model is the model frozen onto the run at fire time by the schedule that created it
-	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
-	// read-only so a scheduled run's model is confirmable.
+	// Model is the model frozen onto the run at create time, either chosen when the run was started
+	// (ModelSource run_override, PRD #3250) or pinned by the schedule that created it (schedule_pin,
+	// PRD #300): nil means the run inherits the owner's per-user Worker default at claim. Surfaced
+	// read-only so the run's model is confirmable.
 	Model *string `json:"model"`
 	// OverrideSubagentModel is the "apply model also to agents" flag frozen onto the run
 	// at fire time by the schedule that created it (PRD #305): true means the run's model

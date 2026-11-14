@@ -841,6 +841,140 @@
         "template_claude": "opus",
         "template_codex": null
       }
+    },
+    {
+      "id": "claude-claim-model-run-override",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_model": "opus",
+        "default_model_source": "run_override",
+        "default_effort": "medium",
+        "default_effort_source": "builtin"
+      },
+      "templateModel": "fable",
+      "expect": {
+        "model": "opus",
+        "modelSource": "run_override",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": "opus",
+        "run_model_source": "run_override",
+        "user_effort": null,
+        "template_claude": "fable",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "codex-claim-model-run-override",
+      "harness": "codex",
+      "phase": "implement",
+      "config": {
+        "default_model": "gpt-6-sol",
+        "default_model_source": "run_override",
+        "default_effort": "medium",
+        "default_effort_source": "builtin"
+      },
+      "providerDefaultModel": "gpt-6.1-sol",
+      "expect": {
+        "model": "gpt-6-sol",
+        "modelSource": "run_override",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": "gpt-6-astra",
+        "run_model": "gpt-6-sol",
+        "run_model_source": "run_override",
+        "user_effort": null,
+        "template_claude": null,
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-claim-effort-run-override",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_model": "sonnet",
+        "default_model_source": "user_default",
+        "default_effort": "xhigh",
+        "default_effort_source": "run_override"
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "sonnet",
+        "modelSource": "user_default",
+        "effort": "xhigh",
+        "effortMode": "explicit",
+        "effortSource": "run_override"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": null,
+        "run_effort": "xhigh",
+        "run_effort_source": "run_override",
+        "user_effort": "low",
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-effort-only-run-override-template-model",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_effort": "xhigh",
+        "default_effort_source": "run_override"
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "opus",
+        "modelSource": "template",
+        "effort": "xhigh",
+        "effortMode": "explicit",
+        "effortSource": "run_override"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "run_effort": "xhigh",
+        "run_effort_source": "run_override",
+        "user_effort": null,
+        "template_claude": "opus",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "codex-effort-only-run-override-provider-default",
+      "harness": "codex",
+      "phase": "implement",
+      "config": {
+        "default_effort": "xhigh",
+        "default_effort_source": "run_override"
+      },
+      "providerDefaultModel": "gpt-6.1-sol",
+      "expect": {
+        "model": "gpt-6.1-sol",
+        "modelSource": "builtin",
+        "effort": "xhigh",
+        "effortMode": "explicit",
+        "effortSource": "run_override"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "run_effort": "xhigh",
+        "run_effort_source": "run_override",
+        "user_effort": null,
+        "template_claude": null,
+        "template_codex": null
+      }
     }
   ],
   "display_cases": [
@@ -2604,6 +2738,232 @@
           "xhigh: your Claude effort",
           "runtime: claude-opus-5 (Claude SDK init)",
           "effort: an unrecognized level (Claude SDK init)",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dcp1-queued-model-and-effort-run-override",
+      "input": {
+        "status": "queued",
+        "harness": "claude",
+        "preClaim": {
+          "model": "opus",
+          "modelSource": "run_override",
+          "effort": "xhigh",
+          "effortSource": "run_override"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 0,
+          "current": true,
+          "phases": []
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · xhigh",
+        "lines": [
+          "opus: this run",
+          "xhigh: this run",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dcp2-queued-effort-only-run-override",
+      "input": {
+        "status": "queued",
+        "harness": "claude",
+        "preClaim": {
+          "effort": "xhigh",
+          "effortSource": "run_override"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 0,
+          "current": true,
+          "phases": []
+        }
+      },
+      "expect": {
+        "chip": "lead: model resolves at claim · xhigh",
+        "lines": [
+          "xhigh: this run",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dcp3-queued-model-only-run-override",
+      "input": {
+        "status": "queued",
+        "harness": "claude",
+        "preClaim": {
+          "model": "opus",
+          "modelSource": "run_override"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 0,
+          "current": true,
+          "phases": []
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · effort resolves at claim",
+        "lines": [
+          "opus: this run",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dcp4-claimed-no-rows-run-override",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "model": "opus",
+          "modelSource": "run_override",
+          "effort": "xhigh",
+          "effortSource": "run_override"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 0,
+          "current": true,
+          "phases": []
+        }
+      },
+      "expect": {
+        "chip": "lead: not recorded",
+        "lines": [
+          "the worker did not record it (an older worker, or the run ended before its first lead turn)",
+          "opus: this run",
+          "xhigh: this run",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dcp5-rows-run-override-sources",
+      "input": {
+        "status": "running",
+        "harness": "claude",
+        "preClaim": {
+          "model": "opus",
+          "modelSource": "run_override",
+          "effort": "xhigh",
+          "effortSource": "run_override"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 0,
+          "current": true,
+          "phases": [
+            {
+              "phase": "implement",
+              "phase_entry": 1,
+              "seq": 1,
+              "harness": "claude",
+              "requested_model": "opus",
+              "requested_model_source": "run_override",
+              "requested_model_fixed_at": "create",
+              "requested_effort": "xhigh",
+              "requested_effort_mode": "explicit",
+              "requested_effort_source": "run_override",
+              "requested_effort_fixed_at": "create",
+              "observed_model": null,
+              "observed_model_evidence": null,
+              "observed_effort": null,
+              "observed_effort_evidence": null,
+              "truncated": false,
+              "reported_at": "2026-10-29T10:00:00Z"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · xhigh",
+        "lines": [
+          "opus: this run",
+          "xhigh: this run",
+          "runtime: not reported yet",
+          "effort: not reported yet",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dcp6-paused-run-override-unavailable-before-report",
+      "input": {
+        "status": "paused",
+        "harness": "claude",
+        "preClaim": {
+          "model": "opus",
+          "modelSource": "run_override",
+          "effort": "xhigh",
+          "effortSource": "run_override"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 0,
+          "current": true,
+          "phases": []
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · xhigh",
+        "lines": [
+          "opus: this run",
+          "xhigh: this run",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dcp7-queued-schedule-pin-regression",
+      "input": {
+        "status": "queued",
+        "harness": "claude",
+        "preClaim": {
+          "model": "fable",
+          "modelSource": "schedule_pin"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 0,
+          "current": true,
+          "phases": []
+        }
+      },
+      "expect": {
+        "chip": "lead: fable · effort resolves at claim",
+        "lines": [
+          "fable: fixed by schedule",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dcp8-queued-legacy-model-null-source",
+      "input": {
+        "status": "queued",
+        "harness": "claude",
+        "preClaim": {
+          "model": "opus"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 0,
+          "current": true,
+          "phases": []
+        }
+      },
+      "expect": {
+        "chip": "lead: opus · effort resolves at claim",
+        "lines": [
+          "opus: fixed by schedule",
           "This is the lead agent; subagents with their own pin may differ."
         ]
       }

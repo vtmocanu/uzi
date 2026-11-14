@@ -817,6 +817,9 @@
     ]
   },
   "model": "x",
+  "effort": "x",
+  "model_source": "x",
+  "effort_source": "x",
   "override_subagent_model": true,
   "priority": "x",
   "required_capabilities": [

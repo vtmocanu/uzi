@@ -12,7 +12,14 @@ import { stripUnsafeChars } from "./safeText";
 export interface LeadConfigViewInput {
   status: string;
   harness: string | null | undefined;
-  preClaim: { model?: string | null; modelSource: "schedule_pin" };
+  /** The run's create-time choice. A model with no `modelSource` reads as schedule_pin (PRD #3250
+   *  DC-P8); an effort with no `effortSource` reads as run_override. */
+  preClaim: {
+    model?: string | null;
+    modelSource?: "run_override" | "schedule_pin" | null;
+    effort?: string | null;
+    effortSource?: "run_override" | null;
+  };
   leadConfig?: RunLeadConfig | null;
 }
 
@@ -146,10 +153,27 @@ function phaseLines(p: LeadPhaseConfig, harness: string | null | undefined, pref
   return out;
 }
 
+function preClaimChip(p: LeadConfigViewInput["preClaim"]): string {
+  const model = p.model ? stripUnsafeChars(p.model) : "";
+  const effort = p.effort ? stripUnsafeChars(p.effort) : "";
+  if (model && effort) return `lead: ${model} · ${effort}`;
+  if (model) return `lead: ${model} · effort resolves at claim`;
+  if (effort) return `lead: model resolves at claim · ${effort}`;
+  return "lead: model and effort resolve at claim";
+}
+
 function preClaimLines(input: LeadConfigViewInput): string[] {
-  const model = input.preClaim.model;
-  if (!model) return [];
-  return [`${stripUnsafeChars(model)}: ${sourceLabel("model", input.preClaim.modelSource, input.harness)}`];
+  const { model, modelSource, effort, effortSource } = input.preClaim;
+  const lines: string[] = [];
+  if (model) lines.push(`${stripUnsafeChars(model)}: ${sourceLabel("model", modelSource || "schedule_pin", input.harness)}`);
+  if (effort) lines.push(`${stripUnsafeChars(effort)}: ${sourceLabel("effort", effortSource || "run_override", input.harness)}`);
+  return lines;
+}
+
+/** A run held before its first report with a start-time choice (run_override_unavailable) shows that
+ *  choice as a queued run does. */
+function hasRunOverride(p: LeadConfigViewInput["preClaim"]): boolean {
+  return (!!p.model && p.modelSource === "run_override") || !!p.effort;
 }
 
 /** Rules 1-7 of PRD #3244 section 8. An empty chip means no chip. */
@@ -170,11 +194,8 @@ export function leadConfigView(input: LeadConfigViewInput): LeadConfigView {
       : "";
 
   // Rule 2: pre-claim.
-  if (input.status === "queued") {
-    const model = input.preClaim.model;
-    const chip = model
-      ? `lead: ${stripUnsafeChars(model)} · effort resolves at claim`
-      : "lead: model and effort resolve at claim";
+  if (input.status === "queued" || (input.status === "paused" && shown.length === 0 && hasRunOverride(input.preClaim))) {
+    const chip = preClaimChip(input.preClaim);
     const lines = preClaimLines(input);
     if (summary) lines.push(`previous attempt: ${summary}`);
     lines.push(FOOTER);
@@ -197,13 +218,18 @@ export function leadConfigView(input: LeadConfigViewInput): LeadConfigView {
   return { chip: `lead: ${summary}`, lines, preClaim: false };
 }
 
-/** H's adapter: runs.model_source does not exist yet, so the pre-claim model is run.model, whose
- *  only writer is a schedule pin. */
+/** H's adapter: the pre-claim choice is the run's create-time model and effort with their recorded
+ *  sources; a model with a NULL source reads as schedule_pin (PRD #3250 DC-P8). */
 export function leadConfigViewInput(run: Run): LeadConfigViewInput {
   return {
     status: run.status,
     harness: run.harness,
-    preClaim: { model: run.model, modelSource: "schedule_pin" },
+    preClaim: {
+      model: run.model,
+      modelSource: run.model ? run.model_source ?? "schedule_pin" : null,
+      effort: run.effort ?? null,
+      effortSource: run.effort ? run.effort_source ?? "run_override" : null,
+    },
     leadConfig: run.lead_config,
   };
 }

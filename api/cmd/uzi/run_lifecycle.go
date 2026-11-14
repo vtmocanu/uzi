@@ -6,7 +6,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/cobra"
 
@@ -44,8 +46,12 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			model, effort, err := runStartChoiceFlags(cmd)
+			if err != nil {
+				return err
+			}
 			force, _ := cmd.Flags().GetBool("force")
-			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), force, seed, agentSource, credOverride, harness)
+			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), force, seed, agentSource, credOverride, harness, model, effort)
 			if err != nil {
 				return err
 			}
@@ -94,7 +100,40 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().String("harness", "",
 		"which harness this run uses: claude or codex; omit to let the server resolve it "+
 			"(your effective default, D11)")
+	// PRD #3250: the model and reasoning effort chosen for this run, frozen at create. Only
+	// sent when the flag was passed, verbatim; the server checks the model against the
+	// run's harness and refuses an incompatible pair.
+	create.Flags().String("model", "",
+		"the model this run uses (a Claude alias or model id, or a Codex model id); omit to "+
+			"use your Settings default")
+	create.Flags().String("effort", "",
+		"the reasoning effort this run uses: low, medium, high, xhigh or max; omit to use "+
+			"your Settings default")
 	return create
+}
+
+// runStartEfforts is the closed --effort set, the same levels the server accepts at create.
+var runStartEfforts = []string{"low", "medium", "high", "xhigh", "max"}
+
+// runStartChoiceFlags resolves `run create --model` / `--effort` (PRD #3250). Each value is
+// sent only when its flag was Changed, and verbatim (no trimming): "" means the flag was
+// omitted. A passed --model that is empty or contains whitespace, and a passed --effort
+// outside the closed set, are usage errors before any request; whether the model fits the
+// run's harness is the server's call (its 422 text is printed as-is).
+func runStartChoiceFlags(cmd *cobra.Command) (model, effort string, err error) {
+	if cmd.Flags().Changed("model") {
+		model, _ = cmd.Flags().GetString("model")
+		if model == "" || strings.IndexFunc(model, unicode.IsSpace) >= 0 {
+			return "", "", uzicli.Exitf(uzicli.ExitUsage, "--model must be a non-empty model id without whitespace")
+		}
+	}
+	if cmd.Flags().Changed("effort") {
+		effort, _ = cmd.Flags().GetString("effort")
+		if !slices.Contains(runStartEfforts, effort) {
+			return "", "", uzicli.Exitf(uzicli.ExitUsage, "--effort must be one of: %s", strings.Join(runStartEfforts, ", "))
+		}
+	}
+	return model, effort, nil
 }
 
 // runHarnessFlag resolves `run create --harness` into the wire value (PRD #1429 M5), the
