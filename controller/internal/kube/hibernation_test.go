@@ -178,8 +178,10 @@ func TestHibernatedWorkerIsHeldAtZeroUnderDriftForceRollAndRestart(t *testing.T)
 		if r := hibGet(t, client).Spec.Replicas; r == nil || *r != 0 {
 			t.Fatalf("forceRoll=%v: replicas = %v, want 0", forceRoll, r)
 		}
-		if len(rec.calls) != 0 {
-			t.Fatalf("hold reported %v", rec.transitions())
+		for _, c := range rec.transitions() {
+			if c != protocol.TransitionHeld {
+				t.Fatalf("hold reported %v, want only held", rec.transitions())
+			}
 		}
 		assertNothingDeleted(t, client)
 	}

@@ -89,6 +89,7 @@ func applyDeploymentHibernationEvidence(o *reconcile.ObservedWorker, d *appsv1.D
 		o.DeploymentReplicas = &r
 	}
 	o.HibernationOp = d.Annotations[annotationHibernationOp]
+	o.DeploymentMetaGeneration = d.Generation
 }
 
 // applyPodEvidence derives pod count, readiness and uids from one worker's pods (every
@@ -364,6 +365,12 @@ func (m *Materializer) hibernatePreparing(ctx context.Context, w protocol.Desire
 
 	scaled := obs.DeploymentReplicas != nil && *obs.DeploymentReplicas == 0 && obs.HibernationOp == op
 	if !scaled {
+		// Inventory gate (PRD #4208): until the api permits, the scale-down is not issued;
+		// the identity report is sent every tick instead (the api treats an identical
+		// re-send as idempotent). An empty gate is today's behaviour.
+		if g := w.Hibernation.InventoryGate; g == protocol.InventoryGateObserve || g == protocol.InventoryGateAwait {
+			return m.reportObserved(ctx, w, obs)
+		}
 		got, stale, err := m.conditionedPatch(ctx, ns, obs, name,
 			map[string]any{"annotations": map[string]any{annotationHibernationOp: op}},
 			map[string]any{"replicas": 0})
@@ -373,19 +380,22 @@ func (m *Materializer) hibernatePreparing(ctx context.Context, w protocol.Desire
 		if got.Spec.Replicas == nil || *got.Spec.Replicas != 0 || got.Annotations[annotationHibernationOp] != op {
 			return fmt.Errorf("hibernation scale-down response differs from the request")
 		}
-		pod := obs.LivePodUID
-		if pod == "" && len(obs.WorkerPodUIDs) > 0 {
-			pod = obs.WorkerPodUIDs[0]
-		}
+		pod := boundPodUID(obs)
 		if pod == "" {
 			// The api requires a pod uid on scaling_down; with no pod there is no step
 			// to report, and the next tick reaches scaled_down once pod absence is read.
 			return nil
 		}
-		return m.reportHibernation(ctx, w, protocol.HibernationTransition{
+		t := protocol.HibernationTransition{
 			OpID: op, Transition: protocol.TransitionScalingDown,
 			DeploymentUID: string(got.UID), ResourceVersion: got.ResourceVersion, PodUID: pod,
-		})
+		}
+		// The write's own generation is the fence. The pod sets ride along only when the
+		// pod list was read; omitted, the api marks the pod set unproven (fail closed).
+		fence, gen, zero := got.Generation, got.Generation, int32(0)
+		t.FenceGeneration, t.DeploymentGeneration, t.DeploymentReplicas = &fence, &gen, &zero
+		t.PodUIDs, t.PVCUserPods = podFacts(obs)
+		return m.reportHibernation(ctx, w, t)
 	}
 
 	// Scaled to zero for this op: the step finishes only when the pods are gone. A
@@ -394,24 +404,27 @@ func (m *Materializer) hibernatePreparing(ctx context.Context, w protocol.Desire
 		return nil
 	}
 	if obs.WorkerPodCount > 0 {
-		pod := obs.LivePodUID
-		if pod == "" && len(obs.WorkerPodUIDs) > 0 {
-			pod = obs.WorkerPodUIDs[0]
-		}
+		pod := boundPodUID(obs)
 		if pod == "" {
 			return nil
 		}
 		// Re-sent each tick until the pods are gone: the report is idempotent api-side,
-		// and with no local state a lost one is otherwise never repeated.
-		return m.reportHibernation(ctx, w, protocol.HibernationTransition{
+		// and with no local state a lost one is otherwise never repeated. No fence
+		// generation: only the write that scaled carries one.
+		t := protocol.HibernationTransition{
 			OpID: op, Transition: protocol.TransitionScalingDown,
 			DeploymentUID: obs.DeploymentUID, ResourceVersion: obs.DeploymentResourceVersion, PodUID: pod,
-		})
+		}
+		setObservationFacts(&t, obs)
+		return m.reportHibernation(ctx, w, t)
 	}
-	return m.reportHibernation(ctx, w, protocol.HibernationTransition{
+	// No pod remains, so PodUIDs is a known-empty set (encoded as []).
+	t := protocol.HibernationTransition{
 		OpID: op, Transition: protocol.TransitionScaledDown,
 		DeploymentUID: obs.DeploymentUID, ResourceVersion: obs.DeploymentResourceVersion,
-	})
+	}
+	setObservationFacts(&t, obs)
+	return m.reportHibernation(ctx, w, t)
 }
 
 // hibernateHold keeps a hibernated worker at zero replicas. It runs none of the roll
@@ -421,13 +434,102 @@ func (m *Materializer) hibernateHold(ctx context.Context, w protocol.DesiredWork
 	if !obs.HasDeployment {
 		return m.createHibernationDeployment(ctx, w, obs, ns, spec, 0)
 	}
-	if obs.DeploymentTerminating || (obs.DeploymentReplicas != nil && *obs.DeploymentReplicas == 0) {
+	if !obs.DeploymentTerminating && (obs.DeploymentReplicas == nil || *obs.DeploymentReplicas != 0) {
+		// A re-patch changes what the held report would describe; the next tick reports it
+		// from a fresh observation.
+		_, _, err := m.conditionedPatch(ctx, ns, obs, deploymentName(w.ID),
+			map[string]any{"annotations": map[string]any{annotationHibernationOp: op}},
+			map[string]any{"replicas": 0})
+		return err
+	}
+	// Every tick: the writer exclusion is still held. With the pod list unread nothing is
+	// sent, and the api's gap check fails closed.
+	if !obs.PodsKnown {
 		return nil
 	}
-	_, _, err := m.conditionedPatch(ctx, ns, obs, deploymentName(w.ID),
-		map[string]any{"annotations": map[string]any{annotationHibernationOp: op}},
-		map[string]any{"replicas": 0})
-	return err
+	t := protocol.HibernationTransition{
+		OpID: op, Transition: protocol.TransitionHeld,
+		DeploymentUID: obs.DeploymentUID, ResourceVersion: obs.DeploymentResourceVersion,
+	}
+	setObservationFacts(&t, obs)
+	return m.reportHibernation(ctx, w, t)
+}
+
+// setObservationFacts fills a transition's pod and PVC-user sets, the Deployment's
+// metadata.generation and its replicas from obs, which must have PodsKnown. The sets are
+// non-nil copies, so a known-empty set encodes as [].
+func setObservationFacts(t *protocol.HibernationTransition, obs reconcile.ObservedWorker) {
+	t.PodUIDs, t.PVCUserPods = podFacts(obs)
+	gen := obs.DeploymentMetaGeneration
+	t.DeploymentGeneration = &gen
+	if obs.DeploymentReplicas != nil {
+		r := *obs.DeploymentReplicas
+		t.DeploymentReplicas = &r
+	}
+}
+
+// podFacts returns copies of the worker's pod uids and PVC-user pod uids, both nil when
+// the pod list was not read (an unobserved set is omitted, never sent as empty).
+func podFacts(obs reconcile.ObservedWorker) (pods, users *[]string) {
+	if !obs.PodsKnown {
+		return nil, nil
+	}
+	p := append(make([]string, 0, len(obs.WorkerPodUIDs)), obs.WorkerPodUIDs...)
+	u := append(make([]string, 0, len(obs.PVCUserPodUIDs)), obs.PVCUserPodUIDs...)
+	return &p, &u
+}
+
+// inventoryPVCs returns one entry per existing worker claim (data, nix, and DinD data only
+// when that claim exists), each with its storage class's reclaim policy.
+func (m *Materializer) inventoryPVCs(ctx context.Context, obs reconcile.ObservedWorker) []protocol.HibernationPVC {
+	var out []protocol.HibernationPVC
+	for _, c := range []struct {
+		role  string
+		claim *reconcile.ClaimObservation
+	}{
+		{protocol.PVCRoleData, obs.DataClaim},
+		{protocol.PVCRoleNix, obs.NixClaim},
+		{protocol.PVCRoleDindData, obs.DinDClaim},
+	} {
+		if c.claim == nil {
+			continue
+		}
+		class := ""
+		if c.claim.StorageClassName != nil {
+			class = *c.claim.StorageClassName
+		}
+		out = append(out, protocol.HibernationPVC{
+			Role: c.role, Name: c.claim.Name, UID: c.claim.UID, StorageClass: class,
+			ClassReclaimPolicy: m.classReclaimPolicy(ctx, c.claim.StorageClassName),
+		})
+	}
+	return out
+}
+
+// reportObserved sends the pre-mutation identity report for an inventory-gated scale-down.
+// It sends nothing while the pod list is unread or no pod uid is known, and never patches.
+func (m *Materializer) reportObserved(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker) error {
+	pod := boundPodUID(obs)
+	if !obs.PodsKnown || pod == "" {
+		return nil
+	}
+	t := protocol.HibernationTransition{
+		OpID: w.Hibernation.OpID, Transition: protocol.TransitionObserved,
+		DeploymentUID: obs.DeploymentUID, ResourceVersion: obs.DeploymentResourceVersion, PodUID: pod,
+		PVCs: m.inventoryPVCs(ctx, obs),
+	}
+	setObservationFacts(&t, obs)
+	return m.reportHibernation(ctx, w, t)
+}
+
+func boundPodUID(obs reconcile.ObservedWorker) string {
+	if obs.LivePodUID != "" {
+		return obs.LivePodUID
+	}
+	if len(obs.WorkerPodUIDs) > 0 {
+		return obs.WorkerPodUIDs[0]
+	}
+	return ""
 }
 
 // wakeHeldForPods reports that a wake must not bring a pod up yet: the pod list was not

@@ -153,6 +153,12 @@ type ObservedWorker struct {
 	// terminal-phase pods.
 	WorkerPodUIDs []string
 	LivePodUID    string
+	// DeploymentMetaGeneration is the Deployment's metadata.generation. PVCUserPodUIDs is
+	// the sorted uid set of EVERY pod in the namespace, labelled or not, whose volumes
+	// reference one of this worker's claims (data, nix, dind-data); non-nil once PodsKnown.
+	// Both feed the hibernation volume inventory (PRD #4208).
+	DeploymentMetaGeneration int64
+	PVCUserPodUIDs           []string
 	// NixPVCSize is the observed /nix PVC's requested storage (spec.resources.requests[storage]),
 	// recorded ONLY from a LIVE (deletionTimestamp == nil) nix PVC. nil means "no live nix PVC
 	// observed" — the PVC is absent OR Terminating. M3's size-drift arm compares it against the

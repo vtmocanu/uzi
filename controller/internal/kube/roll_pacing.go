@@ -83,6 +83,9 @@ type rollTick struct {
 	// storageClasses memoises this tick's StorageClass expandability lookups
 	// (issue #3890), reset with every Reconcile because the tick is rebuilt.
 	storageClasses map[string]string
+	// reclaimPolicies memoises this tick's StorageClass reclaim-policy reads for the
+	// hibernation volume inventory (classReclaimPolicy).
+	reclaimPolicies map[string]string
 }
 type rollTickKey struct{}
 
