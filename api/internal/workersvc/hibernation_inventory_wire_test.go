@@ -67,7 +67,7 @@ func TestInventoryFixtureRequestsDecodeAndPrepare(t *testing.T) {
 				t.Fatalf("entries are not canonical JSON: %v", err)
 			}
 			if name == "inventory_request" {
-				if len(rep.PVCs) != 3 || len(entries) != 3 || rep.Lane != "dind" || rep.Mechanism != "epoch_ex+latch+quiescence" {
+				if len(rep.PVCs) != 3 || len(entries) != 5 || rep.Lane != "dind" || rep.Mechanism != "epoch_ex+latch+quiescence" {
 					t.Fatalf("full inventory not carried: pvcs=%d entries=%d lane=%q", len(rep.PVCs), len(entries), rep.Lane)
 				}
 				want := `[{"run_id":"99999999-9999-4999-8999-999999999991","tip":"0123456789abcdef0123456789abcdef01234567"}]`

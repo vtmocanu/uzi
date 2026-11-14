@@ -40,15 +40,18 @@ func (h *Handler) healthService() *healthsvc.Service {
 			var eligibility func(context.Context, time.Time, uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error)
 			var quarantine func(uuid.UUID) (workersvc.ResidueQuarantine, bool)
 			var memoryAuthority func(uuid.UUID) (time.Time, bool)
+			var retirement func(context.Context) (workersvc.RetirementReport, error)
 			if h.wsvc != nil {
 				eligibility = h.wsvc.WorkerEligibilityForHealth
 				quarantine = h.wsvc.ResidueQuarantineFor
 				memoryAuthority = h.wsvc.MemoryAuthorityLostFor
+				retirement = h.wsvc.EvaluateHibernationRetirement
 			}
 			h.healthSvc = healthsvc.New(healthsvc.Config{
 				WorkerEligibilityForHealth:   eligibility,
 				ResidueQuarantine:            quarantine,
 				MemoryAuthorityLost:          memoryAuthority,
+				HibernationRetirement:        retirement,
 				Store:                        h.q,
 				Pool:                         h.pool,
 				Settings:                     h.settings,

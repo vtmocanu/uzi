@@ -41,30 +41,31 @@ var checkMeta = map[string]struct {
 	title string
 	doc   string
 }{
-	"fleet.roll":             {"instance", groupWorkers, "Worker image roll", "worker-upgrades"},
-	"fleet.capacity":         {"owner", groupWorkers, "Worker capacity", "hosted-workers"},
-	"fleet.disk":             {"owner", groupWorkers, "Worker disk", "hosted-workers"},
-	"fleet.rundisk":          {"owner", groupWorkers, "Run disk size", "hosted-workers"},
-	"fleet.quarantine":       {"owner", groupWorkers, "Worker residue quarantine", "hosted-workers"},
-	"fleet.memory_authority": {"owner", groupWorkers, "Worker memory authority", "hosted-workers"},
-	"fleet.hibernation_wake": {"instance", groupWorkers, "Hibernation wakes", "hosted-workers"},
-	"queue.waiting":          {"owner", groupQueue, "Runs waiting for a worker", ""},
-	"queue.undispatched":     {"owner", groupQueue, "Undispatched task runs", ""},
-	"controller.report":      {"instance", groupControl, "Controller reporting", "hosted-workers"},
-	"db":                     {"instance", groupControl, "Database", ""},
-	"db.size":                {"instance", groupControl, "Database size", "admin-health"},
-	"loops":                  {"instance", groupControl, "Background loops", ""},
-	"forge.sync":             {"owner", groupIntegrations, "Forge issue sync", ""},
-	"forge.ciwatch":          {"owner", groupIntegrations, "CI watch capacity", ""},
-	"slack.socket":           {"owner", groupIntegrations, "Slack socket", ""},
-	"schedules.paused":       {"owner", groupHousekeeping, "Paused schedules", ""},
-	"maintenance.active":     {"instance", groupHousekeeping, "Maintenance mode", "instance-maintenance"},
-	"board.drift":            {"owner", groupHousekeeping, "Board drift", ""},
-	"custody.holds":          {"owner", groupHousekeeping, "Recovery custody holds", ""},
-	"recovery.storage":       {"owner", groupHousekeeping, "Recovery storage", ""},
-	"release.check":          {"owner", groupHousekeeping, "Upstream release", ""},
-	"agentsource.update":     {"instance", groupHousekeeping, "Agent source update", "agent-source"},
-	"pricing.codex":          {"instance", groupHousekeeping, "Codex price coverage", "admin-health"},
+	"fleet.roll":                   {"instance", groupWorkers, "Worker image roll", "worker-upgrades"},
+	"fleet.capacity":               {"owner", groupWorkers, "Worker capacity", "hosted-workers"},
+	"fleet.disk":                   {"owner", groupWorkers, "Worker disk", "hosted-workers"},
+	"fleet.rundisk":                {"owner", groupWorkers, "Run disk size", "hosted-workers"},
+	"fleet.quarantine":             {"owner", groupWorkers, "Worker residue quarantine", "hosted-workers"},
+	"fleet.memory_authority":       {"owner", groupWorkers, "Worker memory authority", "hosted-workers"},
+	"fleet.hibernation_wake":       {"instance", groupWorkers, "Hibernation wakes", "hosted-workers"},
+	"fleet.hibernation_retirement": {"instance", groupWorkers, "Hibernation volume retirement (dry run)", "hosted-workers"},
+	"queue.waiting":                {"owner", groupQueue, "Runs waiting for a worker", ""},
+	"queue.undispatched":           {"owner", groupQueue, "Undispatched task runs", ""},
+	"controller.report":            {"instance", groupControl, "Controller reporting", "hosted-workers"},
+	"db":                           {"instance", groupControl, "Database", ""},
+	"db.size":                      {"instance", groupControl, "Database size", "admin-health"},
+	"loops":                        {"instance", groupControl, "Background loops", ""},
+	"forge.sync":                   {"owner", groupIntegrations, "Forge issue sync", ""},
+	"forge.ciwatch":                {"owner", groupIntegrations, "CI watch capacity", ""},
+	"slack.socket":                 {"owner", groupIntegrations, "Slack socket", ""},
+	"schedules.paused":             {"owner", groupHousekeeping, "Paused schedules", ""},
+	"maintenance.active":           {"instance", groupHousekeeping, "Maintenance mode", "instance-maintenance"},
+	"board.drift":                  {"owner", groupHousekeeping, "Board drift", ""},
+	"custody.holds":                {"owner", groupHousekeeping, "Recovery custody holds", ""},
+	"recovery.storage":             {"owner", groupHousekeeping, "Recovery storage", ""},
+	"release.check":                {"owner", groupHousekeeping, "Upstream release", ""},
+	"agentsource.update":           {"instance", groupHousekeeping, "Agent source update", "agent-source"},
+	"pricing.codex":                {"instance", groupHousekeeping, "Codex price coverage", "admin-health"},
 }
 
 // base returns a check DTO pre-filled with the id's fixed metadata and a non-nil (empty)
@@ -748,6 +749,145 @@ func (s *Service) checkFleetHibernationWake(now time.Time, workers []store.ListA
 		c.Since = sincePtr(oldest)
 	}
 	return c
+}
+
+// retirementConditionalSentence is the fixed evidence value of a worker whose volumes M1 cannot
+// show to be blocked. It is deliberately not "would retire": the two facts it names are not
+// evidence M1 has. It is a constant, so it is not run through safe and its length is not bounded
+// by maxEvidenceBytes.
+const retirementConditionalSentence = "would retire only after M2 verifies: actual PV reclaim policy; no intervening pod between observations (sampled only in M1)"
+
+// checkFleetHibernationRetirement (PRD #4208 M1) is the dry run of volume retirement: it lists
+// hibernated workers whose volumes would be kept, and says which source keeps them. Nothing is
+// deleted. `na` when no worker is hibernated or waking (or no evaluator is wired), `warn` when an
+// evaluated worker past the retirement period is blocked or more workers exist than one
+// evaluation covers, else `ok`. An evaluator error degrades to `unknown`. Evidence is at most
+// maxQuarantineEvidence rows, blocked workers first; every worker-written fragment goes through safe.
+func (s *Service) checkFleetHibernationRetirement(ctx context.Context) apitypes.HealthCheckDTO {
+	c := s.base("fleet.hibernation_retirement")
+	const dryRun = "Dry run: no volumes are deleted."
+	if s.cfg.HibernationRetirement == nil {
+		c.Severity = sevNA
+		c.Summary = dryRun + " No hibernated worker is waiting for volume retirement."
+		return c
+	}
+	rep, err := s.cfg.HibernationRetirement(ctx)
+	// A service built without a transaction beginner cannot hibernate a worker at all, so there is
+	// nothing to retire: not applicable, not an unreadable signal.
+	if errors.Is(err, workersvc.ErrHibernationUnavailable) {
+		rep, err = workersvc.RetirementReport{}, nil
+	}
+	if err != nil {
+		return degradeUnknown(c, "fleet.hibernation_retirement", err)
+	}
+	if rep.Total == 0 {
+		c.Severity = sevNA
+		c.Summary = dryRun + " No hibernated worker is waiting for volume retirement."
+		return c
+	}
+	blocked, conditional := 0, 0
+	for _, v := range rep.Verdicts {
+		switch v.Outcome {
+		case workersvc.RetirementBlocked:
+			blocked++
+		case workersvc.RetirementConditionalRetire:
+			conditional++
+		}
+	}
+	capped := rep.Total > int64(workersvc.RetirementEvaluationLimit)
+	c.Severity = sevOK
+	if blocked > 0 || capped {
+		c.Severity = sevWarn
+	}
+	c.Summary = fmt.Sprintf("%s %d of %d evaluated worker(s) are blocked past the retirement period; %d would retire only after M2 verifies the PV reclaim policy and pod exclusion.",
+		dryRun, blocked, rep.Evaluated, conditional)
+	if capped {
+		c.Summary += fmt.Sprintf(" Only the first %d are shown: evaluated %d of %d (oldest first).", rep.Evaluated, rep.Evaluated, rep.Total)
+	}
+	ordered := slices.Clone(rep.Verdicts)
+	slices.SortStableFunc(ordered, func(a, b workersvc.RetirementVerdict) int {
+		return retirementRank(a) - retirementRank(b)
+	})
+	for i, v := range ordered {
+		if i == maxQuarantineEvidence {
+			break
+		}
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: safe(shortWorkerID(v.WorkerID)), Value: retirementEvidenceValue(v)})
+	}
+	if c.Severity == sevWarn {
+		c.Action = strPtr("Nothing is deleted in this release. A blocked worker keeps its volumes until the named source is resolved (for example a failed run's tracking ref with no capture, or Docker state on the data volume); `uzi admin workers --json` shows the worker.")
+	}
+	return c
+}
+
+func retirementRank(v workersvc.RetirementVerdict) int {
+	if v.Outcome == workersvc.RetirementBlocked {
+		return 0
+	}
+	return 1
+}
+
+func shortWorkerID(id uuid.UUID) string { return id.String()[:8] }
+
+// retirementEvidenceValue renders one verdict. Worker-written fragments (blocker codes and sources)
+// are re-bounded through safe.
+func retirementEvidenceValue(v workersvc.RetirementVerdict) string {
+	blocker := ""
+	if b, ok := v.FirstBlocker(); ok {
+		blocker = fmt.Sprintf("blocked by %s (%s)", safe(b.Code), safe(b.Source))
+	}
+	switch v.Outcome {
+	case workersvc.RetirementConditionalRetire:
+		return retirementConditionalSentence + classPolicyText(v)
+	case workersvc.RetirementBlocked:
+		return blocker
+	case workersvc.RetirementCancelled:
+		return "cancelled: wake requested"
+	case workersvc.RetirementNotYetEligible:
+		out := "not yet eligible: " + retirementRemaining(v.Remaining) + " left"
+		if blocker != "" {
+			out += "; " + blocker
+		}
+		return out
+	}
+	return safe(v.Outcome)
+}
+
+// classPolicyText is the class reclaim policy proxy: one policy when every claim agrees, else
+// role=policy pairs. Retain and unknown are flagged.
+func classPolicyText(v workersvc.RetirementVerdict) string {
+	if len(v.ClassPolicies) == 0 {
+		return ""
+	}
+	same := true
+	for _, p := range v.ClassPolicies {
+		same = same && p.Policy == v.ClassPolicies[0].Policy
+	}
+	var text string
+	if same {
+		text = safe(v.ClassPolicies[0].Policy)
+	} else {
+		parts := make([]string, 0, len(v.ClassPolicies))
+		for _, p := range v.ClassPolicies {
+			parts = append(parts, safe(p.Role)+"="+safe(p.Policy))
+		}
+		text = strings.Join(parts, ", ")
+	}
+	if v.Retain || v.Unknown {
+		text += " (flagged)"
+	}
+	return "; class policy " + text
+}
+
+func retirementRemaining(d time.Duration) string {
+	if d >= 24*time.Hour {
+		days := int(d / (24 * time.Hour))
+		if h := int((d % (24 * time.Hour)) / time.Hour); h > 0 {
+			return fmt.Sprintf("%dd%dh", days, h)
+		}
+		return fmt.Sprintf("%dd", days)
+	}
+	return humanDur(d)
 }
 
 // checkFleetRunDisk (PRD #1809 M6, D8) warns before one run fills a worker's data volume: any

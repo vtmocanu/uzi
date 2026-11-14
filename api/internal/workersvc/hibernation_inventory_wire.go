@@ -439,7 +439,7 @@ func (r *InventoryRequest) PrepareInventory() (HibernationInventoryReport, error
 	if err != nil {
 		return out, err
 	}
-	entries, err := json.Marshal(r.Entries)
+	entries, err := json.Marshal(append(slices.Clone(r.Entries), dockerStateEntries(r.Docker, x.Lane)...))
 	if err != nil {
 		return out, err
 	}
@@ -469,6 +469,41 @@ func (r *InventoryRequest) PrepareInventory() (HibernationInventoryReport, error
 		Entries: entries, ReceiptKeys: receipts,
 		Digest: r.Digest, Fingerprint: r.Fingerprint, Lane: x.Lane, Mechanism: x.Mechanism,
 	}, nil
+}
+
+// InventoryKindDockerState is the entry kind the api itself appends for non-empty daemon state. The
+// docker census is not persisted (the table has no column for it), so the dry-run retirement
+// evaluator reads the daemon's containers and volumes from these summary entries.
+const InventoryKindDockerState = "docker_state"
+
+// dockerStateEntries summarises the docker census as at most two protected entries: one for any
+// container (stopped included) and one for any volume (named or anonymous). Images and build cache
+// add nothing. A dind-lane inventory that carries no census at all adds an unknown entry, because
+// the absence of a report is not evidence of an empty daemon.
+func dockerStateEntries(d *InventoryDocker, lane string) []InventoryEntry {
+	entry := func(path, classification, detail string) InventoryEntry {
+		return InventoryEntry{Kind: InventoryKindDockerState, Path: path, Classification: classification, Detail: &detail}
+	}
+	if d == nil {
+		if lane == "dind" {
+			return []InventoryEntry{entry("docker:unreported", "unknown", "docker census not reported")}
+		}
+		return nil
+	}
+	var out []InventoryEntry
+	if n := len(d.Containers); n > 0 {
+		out = append(out, entry("docker:containers", "protected", fmt.Sprintf("%d container(s), any state", n)))
+	}
+	if n := len(d.Volumes); n > 0 {
+		anon := 0
+		for _, v := range d.Volumes {
+			if v.Anonymous != nil && *v.Anonymous {
+				anon++
+			}
+		}
+		out = append(out, entry("docker:volumes", "protected", fmt.Sprintf("%d volume(s), %d anonymous", n, anon)))
+	}
+	return out
 }
 
 func validateInventoryEntry(e *InventoryEntry) error {

@@ -149,7 +149,11 @@ type Config struct {
 	// memory authority (issue #3142); workersvc.Service.MemoryAuthorityLostFor satisfies it.
 	// nil reads as "nobody gated", so fleet.memory_authority is ok.
 	MemoryAuthorityLost func(workerID uuid.UUID) (time.Time, bool)
-	Store               Store
+	// HibernationRetirement is the PRD #4208 M1 dry-run retirement evaluator;
+	// workersvc.Service.EvaluateHibernationRetirement satisfies it. nil reads as "no hibernated
+	// worker", so fleet.hibernation_retirement is `na`.
+	HibernationRetirement func(context.Context) (workersvc.RetirementReport, error)
+	Store                 Store
 	// MaintenanceReadout reads the maintenance drain readout (PRD #3454), called only while
 	// maintenance is active; wired to store.ReadMaintenanceReadout over the pool. nil leaves
 	// the counts out of maintenance.active's evidence.
@@ -308,6 +312,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkFleetQuarantine(now, workers),
 		s.checkFleetMemoryAuthority(now, workers),
 		s.checkFleetHibernationWake(now, workers),
+		s.checkFleetHibernationRetirement(ctx),
 		waiting,
 		s.checkQueueUndispatched(ctx, now),
 		controllerReport,

@@ -62,7 +62,8 @@ It surfaces six ways:
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
   admin, selects checks with server-supplied `scope: instance` and severity
   `danger`. The current instance checks are `db`, `db.size`, `controller.report`,
-  `loops`, `fleet.roll`, `fleet.hibernation_wake`, `maintenance.active`,
+  `loops`, `fleet.roll`, `fleet.hibernation_wake`, `fleet.hibernation_retirement`,
+  `maintenance.active`,
   `agentsource.update` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains instance infrastructure even when the hosted
   workers belong to a single owner.
 
@@ -201,6 +202,7 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | `fleet.quarantine` | Whether any worker has latched a [residue quarantine](worker-setup.md#quarantined-worker) (an unreadable, unattributed runner-uid process was found, so it claims nothing until its container restarts) | any worker with a fresh heartbeat reports a quarantine; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it latched and the run that detected it (the worker's reported cause is not shown here: read `residue_quarantine_cause` in `uzi admin workers --json` or the worker view in `uzi tui`) | — | — |
 | `fleet.memory_authority` | Whether any worker has lost [memory authority](worker-setup.md#lost-memory-authority) (the api withholds guard-bound runs from it until its container restarts) | any worker with a fresh heartbeat has a gated claim recorded; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it was first gated | — | — |
 | `fleet.hibernation_wake` | Whether a [hibernated worker's wake](hosted-workers.md#hibernation) failed or is not confirmed (scope `instance`) | a wake failed, or is not confirmed within 15 minutes; the evidence names at most 10 workers (the first evidence row, `Workers`, carries the full count) | — | — |
+| `fleet.hibernation_retirement` | A **dry run** of [volume retirement](hosted-workers.md#volume-retirement-dry-run-m1) for workers that have been hibernated a long time (scope `instance`). Nothing is deleted: it says which workers a later release could retire and which are blocked, and why | a worker past the 21-day (504 hour) retirement period is blocked, or more than 50 workers are hibernated so only the oldest 50 were evaluated (the summary says "evaluated 50 of N (oldest first)"); each evidence row is a short worker id with `blocked by <code> (<source>)`, or, for a worker nothing blocks, a fixed sentence that it "would retire only after M2 verifies" the actual PV reclaim policy and that no pod ran between observations (flagged when the StorageClass policy is `Retain` or unknown), `not yet eligible: <time> left`, or `cancelled: wake requested`; at most 10 rows, blocked workers first | — | `na` when no worker is hibernated or waking; `unknown` when the evaluation itself fails |
 
 `fleet.quarantine` reads the worker's own heartbeat report, which the api keeps in
 memory only. A worker without a fresh heartbeat is skipped (`fleet.capacity`

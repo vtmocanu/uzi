@@ -214,6 +214,42 @@ Status shows in `uzi worker list` and `uzi admin workers`; see
 [CLI](./cli.md#hibernated-workers). The design is in
 [PRD #4205](../prds/4205-worker-hibernation-sleep-wake.md).
 
+### Volume retirement dry run (M1)
+
+A hibernated worker keeps its volumes. [PRD #4208](../prds/4208-worker-hibernation-volume-retirement.md)
+will let uzi delete the volumes of a worker that has been hibernated for 21 days
+(504 hours) when it can prove they hold nothing protected. This release ships only the
+first step, a **dry run**: **no volume is deleted**, and no setting turns deletion on.
+
+- **Inventory at hibernation.** On the Docker lane, while a worker prepares to
+  hibernate, the controller reports the identity of the pod and its volumes, and
+  the worker reports what its volumes hold: attempt trees, clones, journals and
+  tracking refs with their classification, plus any Docker container (stopped
+  included), volume (named or anonymous) or other state. The api stores the
+  inventory only when it matches that identity and the worker's current
+  registration, and the worker must keep writers excluded until the pod is gone.
+  Workers hibernated before this release, workers without the capability, and
+  the plain and isolated lanes have no usable inventory, so they are always
+  blocked (their volumes are retained).
+- **What blocks.** An incomplete, invalid or unproven inventory; a protected,
+  unknown or unrecoverable source; a source that needs a receipt (for example a
+  failed run's tracking ref) without a valid, unexpired capture of its latest
+  bytes; unproven working-tree bytes; any Docker container or volume; and the
+  worker-level refusals (non-terminal runs, an open custody hold, a recovery
+  capture replicated on the worker, an active publication-resume custodian, a
+  manual cordon, draining, maintenance). A terminal run or a released hold is
+  not a receipt.
+- **Conditional only.** A worker that nothing blocks is reported as "would retire
+  only after M2 verifies": the volumes' actual PV reclaim policy, and that no
+  other pod mounted them between the controller's observations (only sampled in
+  M1). The StorageClass reclaim policy is shown as a proxy and `Retain` is
+  flagged, because deleting a claim whose PV is `Retain` frees nothing. M2 must
+  verify both before it may delete anything.
+- **Where it shows.** The instance-scoped `fleet.hibernation_retirement` check in
+  **Admin → Health** lists at most 10 workers and evaluates at most 50 per
+  refresh, oldest first; see [Admin health](admin-health.md). A wake after the
+  inventory was taken cancels it ("cancelled: wake requested").
+
 ### Downgrading
 
 Operators rolling back past this feature, in order:
