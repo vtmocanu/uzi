@@ -1103,6 +1103,10 @@ type Store interface {
 	// RecordRunRegistrationEvidence (issue #3859) stores the worker's registration witness from
 	// its first running report. It runs BEFORE SetRunRunning and does not depend on that write.
 	RecordRunRegistrationEvidence(ctx context.Context, arg store.RecordRunRegistrationEvidenceParams) (int64, error)
+	// RecordRunCheckpointWithheld and ClearRunCheckpointWithheld (issue #4257) write the fenced,
+	// report_seq-ordered checkpoint-publication-withheld fact and return its ACK outcome.
+	RecordRunCheckpointWithheld(ctx context.Context, arg store.RecordRunCheckpointWithheldParams) (string, error)
+	ClearRunCheckpointWithheld(ctx context.Context, arg store.ClearRunCheckpointWithheldParams) (string, error)
 	// SweepTaskNeverDispatched terminalizes a kind='task' (handoff) run left queued with
 	// dispatched_at NULL past the dispatch grace window (issue #1367): the CLI never landed
 	// its push/dispatch, so ClaimRun never offers it and no other sweep touches it. Server-
@@ -4196,7 +4200,12 @@ type StateRequest struct {
 	// SetRunRunning guard refuses still leaves the witness that lets the sweep tell a departed
 	// flight from a slow one. Valid only on `running`; httpx.DecodeJSON rejects unknown fields, so
 	// the field MUST exist here or a new worker's report 400s.
-	RegistrationEvidence       *RegistrationEvidence           `json:"registration_evidence,omitempty"`
+	RegistrationEvidence *RegistrationEvidence `json:"registration_evidence,omitempty"`
+	// CheckpointPublication (issue #4257, feature checkpoint_publication_withheld_v1) is the
+	// worker's content-free report that checkpoint publication is withheld by a secret-scan
+	// restriction, or that it cleared. Valid only on `running`; recorded AFTER the status write as a
+	// fenced, server-ordered fact and never able to fail it.
+	CheckpointPublication      *CheckpointPublicationReport    `json:"checkpoint_publication,omitempty"`
 	SourcePublication          *SourcePublicationReport        `json:"source_publication,omitempty"`
 	RegisterNonce              string                          `json:"register_nonce,omitempty"`
 	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`

@@ -1,0 +1,11 @@
+{
+  "status": "running",
+  "claim_generation": 3,
+  "checkpoint_publication": {
+    "state": "withheld",
+    "since": "2026-11-14T12:00:00Z",
+    "claim_generation": 3,
+    "register_nonce": "fixture-register-nonce",
+    "report_seq": 1
+  }
+}

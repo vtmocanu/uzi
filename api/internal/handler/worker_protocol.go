@@ -469,6 +469,12 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// applied. Advertised UNCONDITIONALLY: a worker sends the object ONLY after seeing this
 		// token, because an older api's strict decoder 400s the unknown field.
 		{"run_registration_evidence_v1"},
+		// Issue #4257: this api accepts the optional checkpoint_publication object on a `running`
+		// report ({state, since, claim_generation, register_nonce, report_seq}), stores it as a
+		// fenced, server-ordered fact and answers checkpoint_publication "recorded" | "cleared" |
+		// "refused" | "unrecorded" on the ACK. Advertised UNCONDITIONALLY: a worker sends the object
+		// ONLY after seeing this token, because an older api's strict decoder 400s the unknown field.
+		{workersvc.CheckpointPublicationWithheldFeature},
 		{"recovery_cause_retained_recovery_adoption_failed"},
 		{"recovery_cause_data_volume_full"},
 		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
@@ -1583,6 +1589,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			if result.RegistrationEvidence != "" {
 				stale["registration_evidence"] = result.RegistrationEvidence
 			}
+			if result.CheckpointPublication != "" {
+				stale["checkpoint_publication"] = result.CheckpointPublication
+			}
 			httpx.JSON(w, http.StatusConflict, stale)
 		case errors.Is(err, workersvc.ErrCredentialSwitchUncertainParkPending):
 			// Issue #4201: a pending wall or reserve pause owns the park; the worker takes that one
@@ -1623,7 +1632,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 				ack["registration_evidence"] = result.RegistrationEvidence
 			}
 			httpx.JSON(w, http.StatusConflict, ack)
-		case errors.Is(err, workersvc.ErrInvalidRegistrationEvidence):
+		case errors.Is(err, workersvc.ErrInvalidRegistrationEvidence), errors.Is(err, workersvc.ErrInvalidCheckpointPublication):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrJobNeverParks):
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
@@ -1669,6 +1678,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		if result.RegistrationEvidence != "" {
 			ack["registration_evidence"] = result.RegistrationEvidence
 		}
+		if result.CheckpointPublication != "" {
+			ack["checkpoint_publication"] = result.CheckpointPublication
+		}
 		httpx.JSON(w, http.StatusConflict, ack)
 		return
 	}
@@ -1679,6 +1691,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 	}
 	if result.RegistrationEvidence != "" {
 		ack["registration_evidence"] = result.RegistrationEvidence
+	}
+	if result.CheckpointPublication != "" {
+		ack["checkpoint_publication"] = result.CheckpointPublication
 	}
 	if result.RevisionInputID != nil {
 		ack["revision_input_id"] = *result.RevisionInputID

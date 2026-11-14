@@ -11237,6 +11237,10 @@ WHERE id = @id;
 -- owner row is gone (COALESCE keeps the scan target a plain string).
 -- #3000: owner_hold_pinnable projects ClaimRun's independent draining/maintenance
 -- hold; Go applies the inclusive updated_at + affinity ceiling and reuses the owner name.
+-- Issue #4257: publication_withheld_since is the worker-reported checkpoint-publication-withheld
+-- since, projected only while the fact is still fenced to this run's current owner, claim generation,
+-- register nonce and running episode (status_since); NULL otherwise. Pure column compares plus one
+-- workers primary-key probe, and only for a run that carries a fact.
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
            (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
@@ -11340,7 +11344,14 @@ SELECT id, runs.user_id, status, auto_approve,
            WHERE rel.run_id = runs.id AND rel.claim_generation = runs.claim_generation
              AND rel.worker_id = runs.released_worker_id
              AND rel.register_nonce = runs.released_worker_nonce
-             AND rel.released_at = runs.claim_released_at))::boolean AS released_by_memory_park
+             AND rel.released_at = runs.claim_released_at))::boolean AS released_by_memory_park,
+       (CASE WHEN runs.status = 'running' AND runs.checkpoint_withheld_since IS NOT NULL
+                  AND runs.checkpoint_withheld_worker_id = runs.worker_id
+                  AND runs.checkpoint_withheld_generation = runs.claim_generation
+                  AND runs.claim_released_at IS NULL
+                  AND runs.checkpoint_withheld_status_since = runs.status_since
+                  AND EXISTS (SELECT 1 FROM workers pw WHERE pw.id = runs.worker_id AND pw.snapshot_register_nonce = runs.checkpoint_withheld_nonce)
+             THEN runs.checkpoint_withheld_since END)::timestamptz AS publication_withheld_since
 FROM runs
 LEFT JOIN codex_active_run_cooldown cooldown ON cooldown.run_id = runs.id
 LEFT JOIN codex_queued_run_admission admission

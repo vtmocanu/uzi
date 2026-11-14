@@ -96,7 +96,7 @@ type Settings interface {
 }
 
 // Health flag values. These mirror the CHECK constraint on runs.health; keep them
-// in sync with migration 00057.
+// in sync with migrations 00057, 00377 and 00454.
 const (
 	healthOK                     = "ok"
 	healthStalled                = "stalled"
@@ -105,6 +105,9 @@ const (
 	healthWaitingWorker          = "waiting_worker"
 	healthWaitingAccountCooldown = "waiting_account_cooldown"
 	healthApprovalIdle           = "approval_idle"
+	// healthPublicationWithheld (issue #4257) is a running run whose worker reported that
+	// checkpoint publication is withheld by a secret-scan restriction.
+	healthPublicationWithheld = "publication_withheld"
 )
 
 // Reason templates. FIXED, server-controlled strings: they never carry a tool name,
@@ -620,6 +623,11 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			(r.Status == "running" && isManualCordonWaitReason(reason)) {
 			nudge = false
 		}
+		// Issue #4257: Slack is out of scope for the publication-withheld flag; the state is still
+		// written and broadcast below.
+		if target == healthPublicationWithheld {
+			nudge = false
+		}
 		// PRD #3522 M3: a run leaving the reserve hold (the line was raised, the week reset) but
 		// still waiting restarts its "stuck for" clock like leaving maintenance, so the hold is not
 		// counted as time stuck; it is not nudge-eligible on that tick either (r.Health is not ok).
@@ -750,7 +758,7 @@ type liveCodeCrossCheckReader interface {
 }
 
 // runningTarget computes the flag for a running run, priority persist-looping >
-// tool-looping > live plan cross-check > live code cross-check > stalled > long tool call > silent delegation > near-timeout
+// tool-looping > live plan cross-check > live code cross-check > stalled > long tool call > silent delegation > publication withheld (issue #4257) > near-timeout
 // (Decision 3, extended by PRD #108 M4, #1170 D5, issue #2046 and issue #3950): looping is the strongest evidence of
 // pathology, and near-timeout is a budget-relative backstop that must not mask a
 // more specific signal.
@@ -939,6 +947,14 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 			}
 			return healthStalled, reasonSilentDelegation
 		}
+	}
+
+	// publication withheld (issue #4257): the worker reported, under the fence the read projection
+	// applies, that checkpoint publication is withheld by a secret-scan restriction. Below every
+	// liveness arm so a wedged run still reads as wedged, above the budget-relative near-timeout
+	// backstop. The account-cooldown branch above stays ahead of it.
+	if r.PublicationWithheldSince.Valid {
+		return healthPublicationWithheld, apitypes.ReasonCheckpointPublicationWithheld
 	}
 
 	// near timeout: active running time (wall clock since start minus paused-at-a-gate
@@ -2276,6 +2292,10 @@ func healthSince(now time.Time, target string, r store.ListActiveRunsForHealthRo
 	switch {
 	case target == healthOK:
 		return pgtype.Timestamptz{}
+	case target == healthPublicationWithheld:
+		// The clamped worker-reported since, so the pill ages from when publication was first
+		// withheld rather than from the detector's first tick.
+		return r.PublicationWithheldSince
 	case r.Health == target:
 		return r.HealthSince
 	default:

@@ -1342,6 +1342,12 @@ type Run struct {
 	CredentialSwitchHoldGeneration    pgtype.Int8        `json:"credential_switch_hold_generation"`
 	CredentialSwitchHoldWorkerID      pgtype.UUID        `json:"credential_switch_hold_worker_id"`
 	CredentialSwitchHoldRegisterNonce pgtype.Text        `json:"credential_switch_hold_register_nonce"`
+	CheckpointWithheldSince           pgtype.Timestamptz `json:"checkpoint_withheld_since"`
+	CheckpointWithheldStatusSince     pgtype.Timestamptz `json:"checkpoint_withheld_status_since"`
+	CheckpointWithheldWorkerID        pgtype.UUID        `json:"checkpoint_withheld_worker_id"`
+	CheckpointWithheldGeneration      pgtype.Int8        `json:"checkpoint_withheld_generation"`
+	CheckpointWithheldNonce           pgtype.Text        `json:"checkpoint_withheld_nonce"`
+	CheckpointWithheldReportSeq       pgtype.Int8        `json:"checkpoint_withheld_report_seq"`
 }
 
 type RunCompletionAttempt struct {
