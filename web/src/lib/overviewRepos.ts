@@ -1,4 +1,4 @@
-// Pure model for the Overview preview's Repos chip (admins, issue #4334). Nothing here
+// Pure model for the new Overview's Repos chip (admins, issue #4334). Nothing here
 // fetches or renders. "Active" is derived from the same run rows the People chip reads (the
 // viewer's own runs plus the admin run list, through peopleRows / runPart), so the two chips
 // agree on what a listed non-terminal run is; the repo total and the last-run times come from

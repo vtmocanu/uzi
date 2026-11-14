@@ -1565,7 +1565,7 @@ describe("OverviewNext Repos chip", () => {
     it(`opens inside the viewport and closes on Escape back to the chip at ${width}x${height}`, async () => {
       await page.viewport(width, height);
       render(
-        <MemoryRouter initialEntries={["/overview/next"]}>
+        <MemoryRouter initialEntries={["/dashboard"]}>
           <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
             <OverviewNext />
           </main>
