@@ -2898,6 +2898,7 @@
       "id": "dcp6-paused-run-override-unavailable-before-report",
       "input": {
         "status": "paused",
+        "holdReason": "run_override_unavailable",
         "harness": "claude",
         "preClaim": {
           "model": "opus",
@@ -2915,6 +2916,35 @@
       "expect": {
         "chip": "lead: opus · xhigh",
         "lines": [
+          "opus: this run",
+          "xhigh: this run",
+          "This is the lead agent; subagents with their own pin may differ."
+        ]
+      }
+    },
+    {
+      "id": "dcp6-paused-other-hold-no-rows-not-recorded",
+      "input": {
+        "status": "paused",
+        "holdReason": "budget_exhausted",
+        "harness": "claude",
+        "preClaim": {
+          "model": "opus",
+          "modelSource": "run_override",
+          "effort": "xhigh",
+          "effortSource": "run_override"
+        },
+        "leadConfig": {
+          "applicable": true,
+          "claim_generation": 0,
+          "current": true,
+          "phases": []
+        }
+      },
+      "expect": {
+        "chip": "lead: not recorded",
+        "lines": [
+          "the worker did not record it (an older worker, or the run ended before its first lead turn)",
           "opus: this run",
           "xhigh: this run",
           "This is the lead agent; subagents with their own pin may differ."

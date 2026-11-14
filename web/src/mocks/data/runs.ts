@@ -2285,7 +2285,7 @@ mockRuns.push(
     provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },
 );
 // PRD #3250 run-start choice shapes (lead-config display cases DC-P1 to DC-P3, DC-P6, DC-P8), built on
-// the paused run so each has its own issue; open /runs/<id> for the chip and its tooltip.
+// the paused run (they share its issue); open /runs/<id> for the chip and its tooltip.
 const startChoiceBase: Run = { ...pausedBase, status: "queued", hold_reason: null, lead_config: LEAD_CONFIG_NO_ROWS };
 mockRuns.push(
   { ...startChoiceBase, id: "run-start-choice-both", model: "opus", model_source: "run_override",

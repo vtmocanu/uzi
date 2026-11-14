@@ -12,6 +12,8 @@ import { stripUnsafeChars } from "./safeText";
 export interface LeadConfigViewInput {
   status: string;
   harness: string | null | undefined;
+  /** Why a paused run is held; only run_override_unavailable shows the pre-claim chip. */
+  holdReason?: string | null;
   /** The run's create-time choice. A model with no `modelSource` reads as schedule_pin (PRD #3250
    *  DC-P8); an effort with no `effortSource` reads as run_override. */
   preClaim: {
@@ -194,7 +196,7 @@ export function leadConfigView(input: LeadConfigViewInput): LeadConfigView {
       : "";
 
   // Rule 2: pre-claim.
-  if (input.status === "queued" || (input.status === "paused" && shown.length === 0 && hasRunOverride(input.preClaim))) {
+  if (input.status === "queued" || (input.status === "paused" && input.holdReason === "run_override_unavailable" && shown.length === 0 && hasRunOverride(input.preClaim))) {
     const chip = preClaimChip(input.preClaim);
     const lines = preClaimLines(input);
     if (summary) lines.push(`previous attempt: ${summary}`);
@@ -224,11 +226,13 @@ export function leadConfigViewInput(run: Run): LeadConfigViewInput {
   return {
     status: run.status,
     harness: run.harness,
+    holdReason: run.hold_reason ?? null,
     preClaim: {
       model: run.model,
       modelSource: run.model ? run.model_source ?? "schedule_pin" : null,
-      effort: run.effort ?? null,
-      effortSource: run.effort ? run.effort_source ?? "run_override" : null,
+      // The claim resolver honours a run effort only from run_override; any other source is absent.
+      effort: run.effort && run.effort_source === "run_override" ? run.effort : null,
+      effortSource: run.effort && run.effort_source === "run_override" ? "run_override" : null,
     },
     leadConfig: run.lead_config,
   };

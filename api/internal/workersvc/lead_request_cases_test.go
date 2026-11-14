@@ -72,7 +72,8 @@ func TestLeadRequestCasesServerPrediction(t *testing.T) {
 		t.Run(c.ID, func(t *testing.T) {
 			s := c.Server
 			text := func(p *string) pgtype.Text { return pgconv.TextOrNull(derefOr(p, "")) }
-			if s.RunModel != nil && *s.RunModel == "" || s.Lane != nil && *s.Lane == "" {
+			empty := func(p *string) bool { return p != nil && *p == "" }
+			if empty(s.RunModel) || empty(s.RunModelSource) || empty(s.RunEffort) || empty(s.RunEffortSource) || empty(s.Lane) {
 				t.Fatal("a server block must use null, not an empty string, for an unset input")
 			}
 			harness := Harness(c.Harness)

@@ -113,10 +113,15 @@ func TestLeadConfigViewInputFromRunRunStartChoice(t *testing.T) {
 	if got.PreClaim != want {
 		t.Fatalf("PreClaim = %+v, want %+v", got.PreClaim, want)
 	}
-	// DC-P8: a model with a NULL source reads as schedule_pin; an effort with no source is run_override.
+	// DC-P8: a model with a NULL source reads as schedule_pin. The claim resolver honours an effort only
+	// from run_override, so an effort with a NULL source is not shown pre-claim.
 	got = runpresentation.LeadConfigViewInputFromRun(apitypes.RunDTO{Model: str("opus"), Effort: str("high")})
-	if got.PreClaim.ModelSource != "schedule_pin" || got.PreClaim.EffortSource != "run_override" {
+	if got.PreClaim.ModelSource != "schedule_pin" || got.PreClaim.Effort != "" || got.PreClaim.EffortSource != "" {
 		t.Fatalf("NULL sources = %+v", got.PreClaim)
+	}
+	got = runpresentation.LeadConfigViewInputFromRun(apitypes.RunDTO{HoldReason: str("run_override_unavailable")})
+	if got.HoldReason != "run_override_unavailable" {
+		t.Fatalf("HoldReason = %q", got.HoldReason)
 	}
 	if got := runpresentation.LeadConfigViewInputFromRun(apitypes.RunDTO{}); got.PreClaim != (runpresentation.LeadPreClaim{}) {
 		t.Fatalf("no choice must leave PreClaim empty, got %+v", got.PreClaim)

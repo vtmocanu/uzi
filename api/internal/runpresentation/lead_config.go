@@ -22,6 +22,8 @@ const (
 	leadDefaultModelText      = "default"
 	leadStatusQueued          = "queued"
 	leadStatusPaused          = "paused"
+
+	leadHoldRunOverrideUnavailable = "run_override_unavailable"
 )
 
 // LeadPreClaim is what the run itself says before any lead row exists: the model and effort chosen at
@@ -57,6 +59,7 @@ func (p LeadPreClaim) hasRunOverride() bool {
 type LeadConfigViewInput struct {
 	Status     string                     `json:"status"`
 	Harness    string                     `json:"harness"`
+	HoldReason string                     `json:"holdReason,omitempty"`
 	PreClaim   LeadPreClaim               `json:"preClaim"`
 	LeadConfig *apitypes.RunLeadConfigDTO `json:"leadConfig,omitempty"`
 }
@@ -76,6 +79,9 @@ func LeadConfigViewInputFromRun(run apitypes.RunDTO) LeadConfigViewInput {
 		Harness:    run.Harness,
 		LeadConfig: run.LeadConfig,
 	}
+	if run.HoldReason != nil {
+		in.HoldReason = *run.HoldReason
+	}
 	if run.Model != nil {
 		in.PreClaim.Model = *run.Model
 		in.PreClaim.ModelSource = string(leadcfg.ModelSourceSchedulePin)
@@ -83,12 +89,11 @@ func LeadConfigViewInputFromRun(run apitypes.RunDTO) LeadConfigViewInput {
 			in.PreClaim.ModelSource = *run.ModelSource
 		}
 	}
-	if run.Effort != nil {
+	// The claim resolver honours a run effort only when its source is run_override, so an effort with
+	// a NULL or other source is not shown pre-claim.
+	if run.Effort != nil && run.EffortSource != nil && *run.EffortSource == string(leadcfg.EffortSourceRunOverride) {
 		in.PreClaim.Effort = *run.Effort
-		in.PreClaim.EffortSource = string(leadcfg.EffortSourceRunOverride)
-		if run.EffortSource != nil && *run.EffortSource != "" {
-			in.PreClaim.EffortSource = *run.EffortSource
-		}
+		in.PreClaim.EffortSource = *run.EffortSource
 	}
 	return in
 }
@@ -99,7 +104,7 @@ func LeadConfigView(input LeadConfigViewInput) LeadConfigViewResult {
 	if lc == nil || !lc.Applicable {
 		return LeadConfigViewResult{}
 	}
-	if input.Status == leadStatusQueued || (input.Status == leadStatusPaused && len(lc.Phases) == 0 && input.PreClaim.hasRunOverride()) {
+	if input.Status == leadStatusQueued || (input.Status == leadStatusPaused && input.HoldReason == leadHoldRunOverrideUnavailable && len(lc.Phases) == 0 && input.PreClaim.hasRunOverride()) {
 		// A run held before its first report (run_override_unavailable) shows the create-time choice
 		// as a queued run does.
 		return queuedLeadView(input)
