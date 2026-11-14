@@ -222,7 +222,8 @@ var limiterNames = [...]string{
 // Issue #3251 adds POST /api/worker/runs/{id}/codex-catalog-default (noLimiter, like lead-config).
 // PRD #4205 adds POST /api/admin/workers/{id}/hibernate, POST /api/admin/workers/{id}/wake and
 // POST /api/controller/workers/{workerID}/hibernation (all noLimiter), making the table 411 rows
-// (len(wantRouteMounts) at that change). Issue #4334 adds GET /api/admin/repo-activity (noLimiter), making it 412 rows.
+// (len(wantRouteMounts) at that change). Issue #4334 adds GET /api/admin/repo-activity (noLimiter); re-tallied at that change,
+// len(wantRouteMounts) is 414 (the earlier figures above were not re-tallied).
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //

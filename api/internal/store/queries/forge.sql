@@ -220,7 +220,7 @@ ORDER BY u.email ASC, r.path_with_namespace ASC;
 
 -- name: AdminListEnabledRepoActivity :many
 -- Issue #4334: the admin cross-user repo-activity list. UNSCOPED (admin-only,
--- gated in the handler, precedent AdminListReposWithPrivilege). Returns every repo
+-- gated by RequireAdminRO on the route, precedent AdminListReposWithPrivilege). Returns every repo
 -- that is enabled OR has a listed-active run, i.e. a non-terminal run whose kind is
 -- not chat/judge/cross_check. That predicate mirrors the listed-active filter of
 -- ListActiveRunsAll in runtime.sql, minus its LIMIT 500, so the count is exact.
